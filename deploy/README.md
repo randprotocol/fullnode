@@ -31,7 +31,10 @@ Live on chain 4 (2026-09-10): program `private_payment(1000)` deployed by A in b
 `675adeea7e4242d8dc48bf56faedb7bea14a4f832d7c8a973f942fa7dd850065`; first confidential call in block 19
 (tx `d4c75efbe141567eae72d5f639a1d444eb074d8b58a6592d95e01cd39a2364e3`), outputs `[1, 0, 25, 0, 0, 0, 0, 0]`,
 25 units paid to B. Laptop proving 21 s; droplet verifier-key warm 7 s (one-time, background); receipt and
-balance identical on A, C, D, E, F.
+balance identical on A, C, D, E, F. Further calls the same evening: a below-threshold run (block 78, outputs all
+zero, no effect, B unchanged) and a call proved and submitted entirely on observer E (79 s to prove on 2 vCPUs;
+block 105, 200 units to B). `shrugg-node verify --mode full` on F re-verified all 109 blocks including the three
+proofs in 6.9 s. B ends at 100.000000225 SHRUGG on every node.
 
 Confidential call from the laptop (private inputs never leave it):
 ```bash
