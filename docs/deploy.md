@@ -42,7 +42,8 @@ shrugg-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop
 2. Restart local validators from the new binary (`deploy/run-a.sh` after `cargo build --release`).
 3. `deploy/rebuild-vps.sh <ip>` per server, staggered so that more than 2/3 of stake stays up. A
    restart costs a node a few seconds; it resumes from its persisted head, verifies the chain, and
-   batch-syncs what it missed.
+   batch-syncs what it missed. Do not leave nodes on different builds for long: a node still on the
+   previous build cannot answer block fetches for the new one.
 
 ## Fault tests that have been run on the live testnet
 
@@ -64,3 +65,5 @@ shrugg-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop
 | `CORRUPT CHAIN` in the log at startup | nothing; the node truncated and is resyncing. To inspect first, run `shrugg-node verify` before starting |
 | node refuses to start: `already initialized with a different genesis` | the datadir belongs to another chain; use a fresh `--datadir` |
 | a validator warns it is not in the validator set | the key is not in genesis; it runs as an observer |
+| views advance but nothing commits after nodes restarted | validators are waiting for uncommitted blocks behind the newest certificate that no reachable peer holds; since `f5b8dfd` they fall back to the committed head after failed fetches (log: `falling back to the committed head QC`). Make sure every node runs the same build: the sync protocol is chain-scoped and builds cannot fetch across versions |
+| a peer keeps connecting but never helps | it may run another chain or an older build; gossip topics and the sync protocol are per chain id, so it is harmless but useless |
