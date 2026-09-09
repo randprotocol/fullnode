@@ -161,7 +161,7 @@ pub async fn start(
     };
 
     let sync = request_response::cbor::Behaviour::<SyncRequest, SyncResponse>::new(
-        [(StreamProtocol::new("/shrugg/sync/1"), ProtocolSupport::Full)],
+        [(StreamProtocol::try_from_owned(format!("/shrugg/{}/sync/1", cfg.chain_id))?, ProtocolSupport::Full)],
         request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
     );
 

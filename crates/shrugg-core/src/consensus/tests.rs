@@ -662,3 +662,47 @@ fn two_of_four_down_halts_then_recovers_without_fork() {
     sim.assert_fully_equal();
     assert!(sim.nodes[0].high_qc().view > max_qc, "chain did not resume");
 }
+
+#[test]
+fn leader_falls_back_when_high_qc_block_is_unobtainable() {
+    // A restarted validator learns (via NewView) of a QC for a block that no reachable peer
+    // holds. Without the fallback it could never propose; with it, the chain continues.
+    let mut sim = setup(4, 4);
+    for _ in 0..4 {
+        sim.step(vec![]);
+    }
+    // Take a QC for an uncommitted block from node 0's memory.
+    let ghost_qc = sim.nodes[0].high_qc().clone();
+    assert!(ghost_qc.view > 0);
+    let ghost = ghost_qc.block_hash;
+    // Every node restarts from disk: the block behind ghost_qc exists nowhere any more.
+    for i in 0..4 {
+        sim.restart(i);
+        assert!(!sim.nodes[i].has_block(&ghost), "restart must drop uncommitted blocks");
+    }
+    // Node 1 re-announces the ghost QC, as a lagging peer would.
+    let key1 = Keypair::from_seed(*sim.keys[1].seed()).unwrap();
+    let view = sim.nodes[0].view() + 1;
+    let nv = NewView::sign(view, ghost_qc.clone(), &key1);
+    for i in 0..4 {
+        let acts = sim.nodes[i].on_new_view(nv.clone()).unwrap();
+        sim.handle(i, acts);
+    }
+    assert!(sim.nodes.iter().all(|n| n.high_qc().block_hash == ghost));
+    // Fetches fail (no one has it); the node layer then calls the fallback on every replica.
+    sim.fetches.clear();
+    let before = sim.committed[0].len();
+    for _ in 0..12 {
+        for i in 0..4 {
+            let h = sim.nodes[i].high_qc().block_hash;
+            if !sim.nodes[i].has_block(&h) {
+                let acts = sim.nodes[i].fallback_high_qc(&h);
+                sim.handle(i, acts);
+            }
+        }
+        sim.step(vec![]);
+        sim.fetches.clear();
+    }
+    sim.assert_consistent();
+    assert!(sim.committed[0].len() > before, "chain did not resume after fallback");
+}

@@ -24,6 +24,8 @@ pub struct HotStuff {
     view: u64,
     high_qc: QuorumCertificate,
     locked_qc: QuorumCertificate,
+    /// QC certifying the committed head; the fallback when `high_qc`'s block is unobtainable.
+    head_qc: QuorumCertificate,
     last_voted_view: u64,
     consecutive_timeouts: u32,
     proposed_in_view: bool,
@@ -89,6 +91,7 @@ impl HotStuff {
             view,
             high_qc,
             locked_qc,
+            head_qc,
             last_voted_view,
             consecutive_timeouts: 0,
             proposed_in_view: false,
@@ -157,6 +160,31 @@ impl HotStuff {
     /// Action to arm the timer for the current view. Call once after construction.
     pub fn start(&mut self) -> Vec<Action> {
         let mut out = vec![self.schedule_timeout()];
+        self.maybe_ready_to_propose(&mut out);
+        out
+    }
+
+    /// Liveness escape hatch. If `high_qc` certifies a block this replica cannot obtain
+    /// (every peer that had it is gone or unreachable), drop back to the highest QC whose
+    /// block is known: the committed head. Safe: nothing past the head is committed, so no
+    /// committed block can be contradicted; replicas locked on the abandoned branch simply
+    /// withhold their vote until a newer QC releases their lock.
+    /// Returns actions (possibly `ReadyToPropose`); an empty vec means nothing changed.
+    pub fn fallback_high_qc(&mut self, unobtainable: &Hash) -> Vec<Action> {
+        let mut out = Vec::new();
+        if self.high_qc.block_hash != *unobtainable || self.tree.contains_key(unobtainable) {
+            return out;
+        }
+        tracing::warn!(
+            "high QC (view {}) certifies an unobtainable block {:?}; falling back to the committed head QC (view {})",
+            self.high_qc.view,
+            unobtainable,
+            self.head_qc.view
+        );
+        self.high_qc = self.head_qc.clone();
+        if self.locked_qc.view > self.head_qc.view && !self.tree.contains_key(&self.locked_qc.block_hash) {
+            self.locked_qc = self.head_qc.clone();
+        }
         self.maybe_ready_to_propose(&mut out);
         out
     }
@@ -479,6 +507,7 @@ impl HotStuff {
         let head = committed.last().expect("non-empty");
         self.committed_height = head.block.height();
         self.committed_hash = head.block.hash();
+        self.head_qc = head.qc.clone();
         self.committed_ledger = self.tree[&self.committed_hash].ledger_after.clone();
         self.prune();
         out.push(Action::Commit(committed));

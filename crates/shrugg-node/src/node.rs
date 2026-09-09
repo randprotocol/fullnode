@@ -133,7 +133,11 @@ struct Node {
     last_block_at: Instant,
     sync_inflight: Option<(PeerId, libp2p::request_response::OutboundRequestId, Instant)>,
     fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, Hash>,
+    /// Block hash -> (attempts so far, peers already asked) for by-hash fetches.
+    fetch_attempts: HashMap<Hash, (usize, Vec<PeerId>)>,
 }
+
+const MAX_FETCH_ATTEMPTS: usize = 8;
 
 pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
@@ -252,6 +256,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         last_block_at: Instant::now(),
         sync_inflight: None,
         fetch_inflight: HashMap::new(),
+        fetch_attempts: HashMap::new(),
     };
     let task = tokio::spawn(node.run(events, cmd_rx, early));
     Ok(NodeHandle { rpc_addr, network: net, listen_addrs, status, storage, address, task, rpc_task })
@@ -339,8 +344,8 @@ impl Node {
             }
             Err(ConsensusError::NotReady) => Ok(()),
             Err(ConsensusError::UnknownParent(h)) => {
-                self.fetch_block(h).await;
-                Ok(())
+                let acts = self.fetch_block(h).await;
+                self.handle_actions(acts).await
             }
             Err(e) => {
                 tracing::warn!("propose failed: {e}");
@@ -350,7 +355,8 @@ impl Node {
     }
 
     async fn handle_actions(&mut self, actions: Vec<Action>) -> Result<()> {
-        for a in actions {
+        let mut queue: std::collections::VecDeque<Action> = actions.into();
+        while let Some(a) = queue.pop_front() {
             match a {
                 Action::PersistSafety(s) => self.storage.save_safety(&s)?,
                 Action::Broadcast(m) | Action::SendTo(_, m) => {
@@ -364,7 +370,7 @@ impl Node {
                     let at = (self.last_block_at + self.cfg.block_interval).max(Instant::now());
                     self.propose_at = Some((view, at));
                 }
-                Action::FetchBlock(h) => self.fetch_block(h).await,
+                Action::FetchBlock(h) => queue.extend(self.fetch_block(h).await),
             }
         }
         Ok(())
@@ -390,6 +396,7 @@ impl Node {
         }
         self.mempool.prune(self.hs.tip_ledger());
         self.warm_new_programs(&blocks);
+        self.fetch_attempts.clear();
         Ok(())
     }
 
@@ -499,7 +506,7 @@ impl Node {
                 if self.sync_inflight.map(|s| s.1) == Some(request_id) {
                     self.sync_inflight = None;
                 }
-                self.fetch_inflight.remove(&request_id);
+                self.retry_fetch(request_id).await?;
             }
         }
         Ok(())
@@ -524,7 +531,8 @@ impl Node {
                     self.maybe_sync().await;
                 } else {
                     tracing::debug!("proposal with unknown parent {h:?}; fetching");
-                    self.fetch_block(h).await;
+                    let acts = self.fetch_block(h).await;
+                    self.handle_actions(acts).await?;
                 }
                 Ok(())
             }
@@ -555,14 +563,57 @@ impl Node {
         }
     }
 
-    async fn fetch_block(&mut self, h: Hash) {
+    /// Ask a peer for a block by hash. Peers are tried in turn: first those that have
+    /// advertised a status at or above our height (they are on our chain and current),
+    /// then any other; a peer that answers "not found" or fails is not asked again for
+    /// the same hash. Gives up after `MAX_FETCH_ATTEMPTS`.
+    async fn fetch_block(&mut self, h: Hash) -> Vec<Action> {
         if self.hs.has_block(&h) || self.fetch_inflight.values().any(|x| *x == h) {
-            return;
+            return Vec::new();
         }
-        let Some(peer) = self.peers.keys().next().copied() else { return };
+        let entry = self.fetch_attempts.entry(h).or_insert((0, Vec::new()));
+        if entry.0 >= MAX_FETCH_ATTEMPTS {
+            return self.unobtainable(h);
+        }
+        let asked = entry.1.clone();
+        let my_height = self.hs.committed_height();
+        let mut candidates: Vec<PeerId> = self
+            .peers
+            .iter()
+            .filter(|(p, s)| !asked.contains(p) && s.as_ref().map(|s| s.height >= my_height).unwrap_or(false))
+            .map(|(p, _)| *p)
+            .collect();
+        if candidates.is_empty() {
+            candidates = self.peers.keys().filter(|p| !asked.contains(p)).copied().collect();
+        }
+        let Some(peer) = candidates.first().copied() else {
+            tracing::debug!("no peer left to fetch block {h:?} from");
+            return self.unobtainable(h);
+        };
         if let Some(id) = self.net.send_sync_request(peer, SyncRequest::BlockByHash(h)).await {
             self.fetch_inflight.insert(id, h);
+            let e = self.fetch_attempts.get_mut(&h).expect("inserted above");
+            e.0 += 1;
+            e.1.push(peer);
         }
+        Vec::new()
+    }
+
+    /// No peer can supply block `h`. If consensus is waiting on it as the high QC's block,
+    /// let the replica fall back to the committed head so it can propose again.
+    fn unobtainable(&mut self, h: Hash) -> Vec<Action> {
+        self.hs.fallback_high_qc(&h)
+    }
+
+    /// A by-hash fetch came back empty or failed: try the next peer.
+    async fn retry_fetch(&mut self, request_id: libp2p::request_response::OutboundRequestId) -> Result<()> {
+        if let Some(h) = self.fetch_inflight.remove(&request_id) {
+            if !self.hs.has_block(&h) {
+                let acts = self.fetch_block(h).await;
+                self.handle_actions(acts).await?;
+            }
+        }
+        Ok(())
     }
 
     fn best_peer_height(&self) -> u64 {
@@ -598,11 +649,14 @@ impl Node {
     ) -> Result<()> {
         match response {
             SyncResponse::Block(Some(b)) => {
-                self.fetch_inflight.remove(&request_id);
+                if let Some(h) = self.fetch_inflight.remove(&request_id) {
+                    self.fetch_attempts.remove(&h);
+                }
                 self.on_consensus(ConsensusMessage::Proposal(b)).await?;
             }
             SyncResponse::Block(None) => {
-                self.fetch_inflight.remove(&request_id);
+                tracing::debug!("peer {peer} does not have a requested block; trying another");
+                self.retry_fetch(request_id).await?;
             }
             SyncResponse::Blocks(blocks) => {
                 if self.sync_inflight.map(|s| s.1) != Some(request_id) {
