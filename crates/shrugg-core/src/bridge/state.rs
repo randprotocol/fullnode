@@ -83,6 +83,8 @@ pub enum BridgeError {
     FeeExceedsAmount,
     #[error("amount does not fit in u128")]
     AmountOverflow,
+    #[error("amount is zero")]
+    ZeroAmount,
     #[error("undecodable payload")]
     BadPayload,
     #[error("attestation already consumed")]
@@ -161,6 +163,9 @@ impl BridgeState {
             Payload::Transfer(t) => {
                 if self.emitters.get(&att.body.emitter_chain) != Some(&att.body.emitter_address) {
                     return Err(BridgeError::WrongEmitter);
+                }
+                if t.token_chain != att.body.emitter_chain {
+                    return Err(BridgeError::WrongTokenChain);
                 }
                 if t.to_chain != CHAIN_RAND {
                     return Err(BridgeError::WrongToChain);
@@ -279,6 +284,9 @@ impl BridgeState {
         if fee > amount {
             return Err(BridgeError::FeeExceedsAmount);
         }
+        if amount == 0 {
+            return Err(BridgeError::ZeroAmount);
+        }
         let have = self.balance(asset, from);
         if have < amount {
             return Err(BridgeError::InsufficientAsset {
@@ -339,7 +347,7 @@ impl BridgeState {
             tx,
             height,
         };
-        self.burn_sequence += 1;
+        self.burn_sequence = self.burn_sequence.saturating_add(1);
         self.burns.insert(sequence, record.clone());
         Ok(record)
     }
@@ -348,13 +356,15 @@ impl BridgeState {
     ///
     /// ```text
     /// blake3("shrugg-bridge-state"
-    ///     || bincode(current_set, guardian_sets)
+    ///     || bincode(emitter, emitters, current_set, guardian_sets)
     ///     || merkle(blake3("shrugg-asset-balance" || asset || addr || balance BE))
     ///     || merkle(blake3("shrugg-asset-registry" || asset || chain BE || token))
     ///     || merkle(sorted spent digests)
     ///     || burn_sequence BE)
     /// ```
     ///
+    /// The outbound emitter and the source-chain emitter table are part of
+    /// the commitment: they are consensus-relevant genesis configuration.
     /// `burns` is derivable from the transaction history and is deliberately
     /// excluded. Zero balances are pruned so a never-credited holder and a
     /// drained one commit identically.
@@ -383,8 +393,13 @@ impl BridgeState {
             })
             .collect();
         let spent_leaves: Vec<Hash> = self.spent.iter().copied().collect();
-        let mut buf = bincode::serialize(&(self.current_set, &self.guardian_sets))
-            .expect("guardian sets serialize");
+        let mut buf = bincode::serialize(&(
+            self.emitter,
+            &self.emitters,
+            self.current_set,
+            &self.guardian_sets,
+        ))
+        .expect("bridge configuration and guardian sets serialize");
         buf.extend_from_slice(merkle_root(&balance_leaves).as_bytes());
         buf.extend_from_slice(merkle_root(&registry_leaves).as_bytes());
         buf.extend_from_slice(merkle_root(&spent_leaves).as_bytes());
@@ -461,7 +476,7 @@ mod hex_emitters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{guardian_address, sign_digest, GuardianSetUpgrade};
+    use crate::bridge::{guardian_address, sign_digest, GuardianSetUpgrade, TRANSFER_PAYLOAD_LEN};
     use crate::crypto::Keypair;
 
     fn key(n: u8) -> Keypair {
@@ -491,6 +506,19 @@ mod tests {
             body,
         }
         .encode()
+    }
+
+    /// A governance guardian-set upgrade to `new_index` carrying `keys`.
+    fn upgrade_body(new_index: u32, keys: Vec<GuardianKey>) -> Body {
+        Body {
+            timestamp: 100,
+            nonce: 0,
+            emitter_chain: CHAIN_RAND,
+            emitter_address: GOVERNANCE_EMITTER,
+            sequence: new_index as u64,
+            consistency_level: 0,
+            payload: Payload::GuardianSetUpgrade(GuardianSetUpgrade { new_index, keys }).encode(),
+        }
     }
 
     /// A transfer of `amount` (fee `fee`) of token `[0xaa; 32]` native to
@@ -724,5 +752,134 @@ mod tests {
             r#"{"emitter":"00","guardians":[],"emitters":{}}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn upgrade_rejects_duplicate_and_zero_guardian_keys() {
+        let (c, s) = cfg();
+        let st = BridgeState::from_config(&c);
+        let keys: Vec<GuardianKey> = s.iter().map(guardian_address).collect();
+        let mut duplicated = keys.clone();
+        duplicated[2] = duplicated[1];
+        assert_eq!(
+            st.check_attest(&attest(&s, 0, upgrade_body(1, duplicated)), 100)
+                .unwrap_err(),
+            BridgeError::DuplicateGuardian
+        );
+        let mut zeroed = keys.clone();
+        zeroed[3] = [0u8; 20];
+        assert_eq!(
+            st.check_attest(&attest(&s, 0, upgrade_body(1, zeroed)), 100)
+                .unwrap_err(),
+            BridgeError::DuplicateGuardian
+        );
+        // the same upgrade with distinct, non-zero keys clears every rung
+        assert!(st
+            .check_attest(&attest(&s, 0, upgrade_body(1, keys)), 100)
+            .is_ok());
+    }
+
+    #[test]
+    fn unknown_guardian_set_index_is_rejected() {
+        let (c, s) = cfg();
+        let st = BridgeState::from_config(&c);
+        assert_eq!(
+            st.check_attest(&attest(&s, 5, transfer_body(2, 1, 0, 1)), 1)
+                .unwrap_err(),
+            BridgeError::Verify(VerifyError::UnknownGuardianSet(5))
+        );
+    }
+
+    #[test]
+    fn undecodable_payloads_are_rejected() {
+        let (c, s) = cfg();
+        let st = BridgeState::from_config(&c);
+        let mut unknown_id = transfer_body(2, 1, 0, 1);
+        unknown_id.payload = vec![9u8; TRANSFER_PAYLOAD_LEN]; // payload id 9
+        assert_eq!(
+            st.check_attest(&attest(&s, 0, unknown_id), 1).unwrap_err(),
+            BridgeError::BadPayload
+        );
+        let mut short = transfer_body(2, 1, 0, 1);
+        short.payload.truncate(TRANSFER_PAYLOAD_LEN - 1); // a 132-byte transfer
+        assert_eq!(short.payload.len(), 132);
+        assert_eq!(
+            st.check_attest(&attest(&s, 0, short), 1).unwrap_err(),
+            BridgeError::BadPayload
+        );
+    }
+
+    #[test]
+    fn transfer_token_chain_must_match_the_emitting_chain() {
+        let (c, s) = cfg();
+        let st = BridgeState::from_config(&c);
+        let mut b = transfer_body(2, 1, 0, 1);
+        // token_chain lives at payload[65..67]: id (1) + amount (32) + token_address (32)
+        b.payload[65..67].copy_from_slice(&3u16.to_be_bytes());
+        assert_eq!(
+            st.check_attest(&attest(&s, 0, b), 1).unwrap_err(),
+            BridgeError::WrongTokenChain
+        );
+    }
+
+    #[test]
+    fn zero_amount_burn_is_rejected() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        st.apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 0, 1)), key(9).address(), 1)
+            .unwrap();
+        let asset = asset_id(2, &[0xaa; 32]);
+        assert_eq!(
+            st.check_burn(&key(1).address(), &asset, 0, 2, 0).unwrap_err(),
+            BridgeError::ZeroAmount
+        );
+        assert_eq!(
+            st.apply_burn(key(1).address(), asset, 0, 2, [0x22; 32], 0, Hash::ZERO, 1, 1_700)
+                .unwrap_err(),
+            BridgeError::ZeroAmount
+        );
+        assert_eq!(st.burn_sequence, 0);
+        assert!(st.burns.is_empty());
+        assert_eq!(st.balance(&asset, &key(1).address()), 1_000);
+    }
+
+    /// Golden vector for the spec 6.3 commitment. Changing this hash changes
+    /// consensus: every node's state root moves with it, so treat a failure
+    /// here as a hard fork, never as a test to re-baseline.
+    #[test]
+    fn root_is_pinned_for_a_fixed_state() {
+        let mut st = BridgeState::from_config(&BridgeConfig {
+            emitter: [1; 32],
+            guardians: vec![[0x11; 20], [0x22; 20]],
+            emitters: BTreeMap::from([(2u16, [2u8; 32])]),
+        });
+        let asset = asset_id(2, &[0xaa; 32]);
+        st.assets.insert(asset, (2, [0xaa; 32]));
+        st.balances.insert((asset, Address([0x33; 32])), 1_000);
+        st.spent.insert(Hash([0x44; 32]));
+        st.burn_sequence = 7;
+        assert_eq!(st.root().to_hex(), "c757e13d25a59234ca3c642f38fd53970051055a73a1db9bc63f2c0b3058b043");
+        // the emitter and the source-chain emitter table are committed too
+        let mut other_emitter = st.clone();
+        other_emitter.emitter = [9; 32];
+        assert_ne!(other_emitter.root(), st.root());
+        let mut other_emitters = st.clone();
+        other_emitters.emitters.insert(3, [3; 32]);
+        assert_ne!(other_emitters.root(), st.root());
+    }
+
+    #[test]
+    fn config_without_emitters_parses_to_an_empty_map() {
+        let json = format!(
+            r#"{{"emitter":"{}","guardians":["{}"]}}"#,
+            hex::encode([1u8; 32]),
+            hex::encode([0x11u8; 20])
+        );
+        let c: BridgeConfig = serde_json::from_str(&json).unwrap();
+        assert!(c.emitters.is_empty());
+        assert_eq!(c.emitter, [1u8; 32]);
+        assert_eq!(c.guardians, vec![[0x11u8; 20]]);
+        // and such a chain can mint nothing: no emitter is registered
+        assert!(BridgeState::from_config(&c).emitters.is_empty());
     }
 }

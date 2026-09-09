@@ -441,6 +441,35 @@ mod tests {
         assert_eq!(l.nonce(&alice.address()), 1);
     }
 
+    /// Until Task C2 wires `BridgeState` into the ledger, no chain has a
+    /// bridge, so both kinds are rejected at validation and never mutate the
+    /// ledger.
+    #[test]
+    fn bridge_kinds_are_disabled_without_a_bridge() {
+        let (mut l, alice, _, proposer) = funded();
+        let attest = Transaction::bridge_attest(&alice, 1, 0, vec![1, 2, 3], 10);
+        assert_eq!(
+            l.validate(&attest, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Disabled))
+        );
+        assert_eq!(
+            l.apply_tx(&attest, &proposer, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Disabled))
+        );
+        let burn = Transaction::bridge_burn(&alice, 1, 0, Hash::digest(b"asset"), 5, 2, [7; 32], 1, 10);
+        assert_eq!(
+            l.validate(&burn, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Disabled))
+        );
+        assert_eq!(
+            l.apply_tx(&burn, &proposer, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Disabled))
+        );
+        assert_eq!(l.balance(&alice.address()), 1_000);
+        assert_eq!(l.nonce(&alice.address()), 0);
+        assert_eq!(l.balance(&proposer), 0);
+    }
+
     #[test]
     fn validation_matrix() {
         let (l, alice, bob, _) = funded();
