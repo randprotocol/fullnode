@@ -108,6 +108,10 @@ pub struct ConsensusConfig {
     pub max_timeout: Duration,
     /// Cap on buffered blocks whose parent is unknown.
     pub max_orphans: usize,
+    /// Cap on blocks held in the speculative tree (committed head plus
+    /// uncommitted blocks). Each entry carries a full ledger clone, so an
+    /// uncapped tree is a memory-exhaustion vector.
+    pub max_tree_blocks: usize,
 }
 
 impl ConsensusConfig {
@@ -119,6 +123,7 @@ impl ConsensusConfig {
             base_timeout: Duration::from_secs(1),
             max_timeout: Duration::from_secs(8),
             max_orphans: 256,
+            max_tree_blocks: 512,
         }
     }
 }
@@ -157,4 +162,8 @@ pub enum ConsensusError {
     /// [`MAX_CLOCK_SKEW_MS`] ahead of this replica's clock.
     #[error("block timestamp {block} is more than {MAX_CLOCK_SKEW_MS} ms ahead of local time {now}")]
     TimestampTooFarAhead { block: u64, now: u64 },
+    #[error("view {view} is implausibly far ahead of the current view")]
+    ViewOutOfRange { view: u64 },
+    #[error("too many speculative blocks in memory")]
+    TreeFull,
 }

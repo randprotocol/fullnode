@@ -10,6 +10,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// How far ahead of our current view an inbound message's view may be before it is
+/// rejected. Deliberately generous (days of timed-out views): the bound exists to keep
+/// `view + 1` arithmetic away from u64 overflow and to bound speculative state, not to
+/// police legitimate catch-up, which goes through block sync and `resume`.
+const MAX_VIEW_AHEAD: u64 = 1_000_000;
+/// Cap on distinct (view, block) vote collections kept while leading.
+const MAX_PENDING_VOTE_KEYS: usize = 4096;
+/// Cap on distinct views with buffered NewView messages.
+const MAX_NEW_VIEW_KEYS: usize = 2048;
+
 struct Entry {
     block: Block,
     ledger_after: Ledger,
@@ -84,10 +94,10 @@ impl HotStuff {
         tree.insert(head_hash, Entry { block: head, ledger_after: head_ledger.clone(), receipts: Vec::new() });
         let (view, high_qc, locked_qc, last_voted_view) = match safety {
             Some(s) => {
-                let view = s.view.max(head_qc.view + 1);
+                let view = s.view.max(head_qc.view.saturating_add(1));
                 (view, head_qc.clone(), head_qc.clone(), s.last_voted_view)
             }
-            None => (head_qc.view + 1, head_qc.clone(), head_qc.clone(), 0),
+            None => (head_qc.view.saturating_add(1), head_qc.clone(), head_qc.clone(), 0),
         };
         HotStuff {
             cfg,
@@ -212,6 +222,9 @@ impl HotStuff {
         if self.tree.contains_key(&hash) {
             return Ok(out);
         }
+        if block.view() > self.view.saturating_add(MAX_VIEW_AHEAD) {
+            return Err(ConsensusError::ViewOutOfRange { view: block.view() });
+        }
         if block.height() <= self.committed_height {
             return Err(ConsensusError::Stale(block.height()));
         }
@@ -259,6 +272,9 @@ impl HotStuff {
         }
 
         // Execute on top of the parent's state.
+        if self.tree.len() >= self.cfg.max_tree_blocks {
+            return Err(ConsensusError::TreeFull);
+        }
         let mut ledger = parent.ledger_after.clone();
         let receipts = ledger.apply_block(&block, self.executor.as_ref())?;
         self.tree.insert(hash, Entry { block: block.clone(), ledger_after: ledger, receipts });
@@ -291,16 +307,23 @@ impl HotStuff {
         if !self.cfg.validators.contains(&voter) {
             return Err(ConsensusError::NotValidator);
         }
-        if !self.is_leader(vote.view + 1) {
-            return Err(ConsensusError::NotLeader);
+        if vote.view > self.view.saturating_add(MAX_VIEW_AHEAD) {
+            return Err(ConsensusError::ViewOutOfRange { view: vote.view });
         }
-        if vote.view < self.high_qc.view || vote.view + 1 < self.view {
+        // Every validator collects votes and assembles QCs locally: relaying
+        // votes only through the next leader loses the QC whenever that leader
+        // is down, which breaks finality for the whole three-view pipeline.
+        if vote.view < self.high_qc.view || vote.view.saturating_add(1) < self.view {
             return Ok(out); // stale
         }
         if !vote.verify() {
             return Err(ConsensusError::BadVote);
         }
         let key = (vote.view, vote.block_hash);
+        if self.pending_votes.len() >= MAX_PENDING_VOTE_KEYS && !self.pending_votes.contains_key(&key) {
+            tracing::warn!("vote-key bookkeeping full; dropping vote for view {}", vote.view);
+            return Ok(out);
+        }
         let votes = self.pending_votes.entry(key).or_default();
         votes.insert(voter, vote);
         let stake: u128 = votes.keys().filter_map(|a| self.cfg.validators.get(a)).map(|v| v.stake).sum();
@@ -309,8 +332,8 @@ impl HotStuff {
             self.pending_votes.remove(&key);
             self.consecutive_timeouts = 0;
             self.update_high_qc(&qc, &mut out);
-            if qc.view + 1 > self.view {
-                self.enter_view(qc.view + 1, &mut out);
+            if qc.view.saturating_add(1) > self.view {
+                self.enter_view(qc.view.saturating_add(1), &mut out);
             }
             self.maybe_ready_to_propose(&mut out);
         }
@@ -325,6 +348,9 @@ impl HotStuff {
         }
         if nv.view < self.view {
             return Ok(out);
+        }
+        if nv.view > self.view.saturating_add(MAX_VIEW_AHEAD) {
+            return Err(ConsensusError::ViewOutOfRange { view: nv.view });
         }
         if !nv.verify() {
             return Err(ConsensusError::BadNewView);
@@ -344,15 +370,16 @@ impl HotStuff {
                 let mine = NewView::sign(view, self.high_qc.clone(), key);
                 out.push(Action::Broadcast(ConsensusMessage::NewView(mine.clone())));
                 if self.is_leader(view) {
-                    self.new_views.entry(view).or_default().insert(mine.sender_address(), mine);
+                    self.record_new_view(view, mine);
                 }
             }
         }
         if !self.is_leader(view) {
             return Ok(out);
         }
-        self.new_views.entry(view).or_default().insert(sender, nv);
-        let stake: u128 = self.new_views[&view]
+        self.record_new_view(view, nv);
+        let Some(collected) = self.new_views.get(&view) else { return Ok(out) };
+        let stake: u128 = collected
             .keys()
             .filter_map(|a| self.cfg.validators.get(a))
             .map(|v| v.stake)
@@ -366,6 +393,16 @@ impl HotStuff {
         Ok(out)
     }
 
+    /// Buffer a NewView for quorum counting, bounding how many distinct views
+    /// are tracked so speculative bookkeeping stays finite.
+    fn record_new_view(&mut self, view: u64, nv: NewView) {
+        if self.new_views.len() >= MAX_NEW_VIEW_KEYS && !self.new_views.contains_key(&view) {
+            tracing::warn!("new-view bookkeeping full; dropping NewView for view {view}");
+            return;
+        }
+        self.new_views.entry(view).or_default().insert(nv.sender_address(), nv);
+    }
+
     /// Pacemaker: the timer for `view` fired.
     pub fn on_timeout(&mut self, view: u64) -> Vec<Action> {
         let mut out = Vec::new();
@@ -373,7 +410,7 @@ impl HotStuff {
             return out; // stale timer
         }
         self.consecutive_timeouts += 1;
-        let next = self.view + 1;
+        let next = self.view.saturating_add(1);
         self.enter_view(next, &mut out);
         if let Some(key) = &self.signer {
             let nv = NewView::sign(next, self.high_qc.clone(), key);
@@ -415,7 +452,12 @@ impl HotStuff {
         let mut txs = Vec::with_capacity(candidates.len());
         let me = signer.address();
         for tx in candidates {
-            if ledger.apply_tx(&tx, &me, self.executor.as_ref()).is_ok() {
+            // Apply on a trial clone: a transaction that fails part-way through
+            // must not leave the cumulative ledger dirty for the next candidate
+            // or for the state root committed to the header.
+            let mut trial = ledger.clone();
+            if trial.apply_tx(&tx, &me, self.executor.as_ref()).is_ok() {
+                ledger = trial;
                 txs.push(tx);
             }
         }
@@ -473,7 +515,7 @@ impl HotStuff {
         if self.signer.is_none() || self.proposed_in_view || !self.is_leader(self.view) {
             return;
         }
-        let have_qc = self.high_qc.view + 1 == self.view;
+        let have_qc = self.high_qc.view.saturating_add(1) == self.view;
         let have_new_views = self
             .new_views
             .get(&self.view)
@@ -508,7 +550,17 @@ impl HotStuff {
         let b1_justify = b1.block.header.justify.clone();
         let b_hash = b1_justify.block_hash;
         let Some(b) = self.tree.get(&b_hash) else { return };
-        // parent links are enforced to equal justify links, so this is a three-chain.
+        // Chained HotStuff commit rule: the QCs certifying b, b1 and b2 must sit in
+        // three consecutive views. Parent links are already enforced to equal justify
+        // links, so this is a three-chain — but without the view check two forks can
+        // ratchet past each other's locks (each new QC's justify outranks the other's
+        // lock) and finalize conflicting blocks at the same height.
+        let qc_b = b1_justify.view;
+        let qc_b1 = b2_justify.view;
+        let qc_b2 = b_star.header.justify.view;
+        if qc_b1 != qc_b.saturating_add(1) || qc_b2 != qc_b1.saturating_add(1) {
+            return;
+        }
         let target_height = b.block.height();
         if target_height <= self.committed_height {
             return;
@@ -603,14 +655,14 @@ impl HotStuff {
         self.last_voted_view = block.view();
         out.push(Action::PersistSafety(self.safety_state()));
         let vote = Vote::sign(block.view(), block.hash(), signer);
-        let next_leader = self.leader(block.view() + 1);
-        if Some(next_leader) == self.address() {
-            if let Ok(more) = self.on_vote(vote) {
-                out.extend(more);
-            }
-        } else {
-            out.push(Action::SendTo(next_leader, ConsensusMessage::Vote(vote)));
+        // Votes are broadcast and every validator assembles the QC locally
+        // (see `on_vote`). Relaying only to the next leader would strand the
+        // QC — and the finality pipeline behind it — whenever that leader is
+        // unreachable. Count our own vote immediately.
+        if let Ok(more) = self.on_vote(vote.clone()) {
+            out.extend(more);
         }
+        out.push(Action::Broadcast(ConsensusMessage::Vote(vote)));
     }
 
     /// Buffer a block whose parent is unknown. The caller receives

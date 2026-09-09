@@ -595,8 +595,15 @@ fn restart_does_not_double_vote_for_same_view() {
     // The next view's leader delivers its own vote internally (no network action), so skip it too.
     let next_leader = sim.addr_to_idx[&sim.nodes[0].leader(view + 1)];
     let victim = (0..4).find(|&i| i != li && i != next_leader).unwrap();
+    // Votes are broadcast; a SendTo from an older scheme would count too.
+    let has_vote = |acts: &[Action], view: u64| {
+        acts.iter().any(|a| match a {
+            Action::Broadcast(ConsensusMessage::Vote(v)) | Action::SendTo(_, ConsensusMessage::Vote(v)) if v.view == view => true,
+            _ => false,
+        })
+    };
     let acts = sim.nodes[victim].on_proposal(proposal.clone(), sim.now).unwrap();
-    let voted = acts.iter().any(|a| matches!(a, Action::SendTo(_, ConsensusMessage::Vote(v)) if v.view == view));
+    let voted = has_vote(&acts, view);
     assert!(voted, "victim should vote the first time");
     assert!(acts.iter().any(|a| matches!(a, Action::PersistSafety(_))), "safety must be persisted before voting");
     assert_eq!(sim.nodes[victim].safety_state().last_voted_view, view);
@@ -605,10 +612,7 @@ fn restart_does_not_double_vote_for_same_view() {
     assert_eq!(sim.nodes[victim].safety_state().last_voted_view, view, "last_voted_view survives restart");
     // Same proposal again: block is unknown to the fresh replica, but it must not vote.
     let acts = sim.nodes[victim].on_proposal(proposal, sim.now).unwrap_or_default();
-    assert!(
-        !acts.iter().any(|a| matches!(a, Action::SendTo(_, ConsensusMessage::Vote(v)) if v.view == view)),
-        "restarted node voted twice in view {view}"
-    );
+    assert!(!has_vote(&acts, view), "restarted node voted twice in view {view}");
     // A conflicting block for the same view from the same leader must also get no vote.
     let mut conflicting = sim.nodes[li].block(&sim.nodes[li].high_qc().block_hash).cloned();
     if let Some(parent) = conflicting.take() {
@@ -624,7 +628,10 @@ fn restart_does_not_double_vote_for_same_view() {
         };
         let b = Block::sign(header, vec![], &sim.keys[li]);
         let acts = sim.nodes[victim].on_proposal(b, sim.now).unwrap_or_default();
-        assert!(!acts.iter().any(|a| matches!(a, Action::SendTo(_, ConsensusMessage::Vote(_)))));
+        assert!(!acts.iter().any(|a| match a {
+            Action::Broadcast(ConsensusMessage::Vote(_)) | Action::SendTo(_, ConsensusMessage::Vote(_)) => true,
+            _ => false,
+        }));
     }
     sim.queue.clear();
 }
@@ -784,4 +791,131 @@ fn leader_falls_back_when_high_qc_block_is_unobtainable() {
     }
     sim.assert_consistent();
     assert!(sim.committed[0].len() > before, "chain did not resume after fallback");
+}
+
+// ---------------------------------------------------------------------------
+// Bounds and commit-rule regression tests
+// ---------------------------------------------------------------------------
+
+/// Drive a single-validator replica directly, proposing at chosen views.
+struct OneNode {
+    node: HotStuff,
+    now: u64,
+}
+
+fn one_node_with(cfg: ConsensusConfig, gs_block: Block, gs_ledger: crate::ledger::Ledger, key: Keypair) -> OneNode {
+    let node = HotStuff::new(cfg, Some(key), gs_block, gs_ledger, std::sync::Arc::new(StubExecutor));
+    OneNode { node, now: 0 }
+}
+
+fn one_node() -> OneNode {
+    let (cfg, gs, key) = one_node_parts();
+    one_node_with(cfg, gs.block.clone(), gs.ledger.clone(), key)
+}
+
+fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) {
+    let key = Keypair::from_seed([1; 32]).unwrap();
+    let genesis = Genesis {
+        chain_id: 1,
+        timestamp_ms: 0,
+        validators: vec![GenesisValidator { public_key: key.public_key().clone(), stake: 10 }],
+        alloc: BTreeMap::new(),
+        faucet: false,
+        confidential: true,
+        fri_profile: "production".into(),
+        bridge: None,
+    };
+    let gs = genesis.build().unwrap();
+    let cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
+    (cfg, gs, key)
+}
+
+impl OneNode {
+    fn propose(&mut self, view: u64) -> Vec<Action> {
+        self.now += 1;
+        self.node.propose(view, vec![], self.now).expect("propose")
+    }
+}
+
+fn commits(acts: &[Action]) -> bool {
+    acts.iter().any(|a| matches!(a, Action::Commit(_)))
+}
+
+#[test]
+fn commit_rule_requires_three_consecutive_views() {
+    let mut n = one_node();
+    n.node.start();
+    assert!(!commits(&n.propose(1))); // B1@1
+    assert!(!commits(&n.propose(2))); // B2@2
+    // Skip view 3: the replica times out into view 4, so the next QC chain has a gap.
+    n.node.on_timeout(3);
+    assert_eq!(n.node.view(), 4);
+    assert!(!commits(&n.propose(4))); // B3@4
+    // B4@5 closes a 3-chain over B1 with QCs at views 1, 2, 4: not consecutive,
+    // so B1 must NOT commit (the old rule committed it here).
+    assert!(!commits(&n.propose(5)), "non-consecutive three-chain committed");
+    assert_eq!(n.node.committed_height(), 0);
+    // B5@6: QCs at 2, 4, 5 over B2 — still a gap, no commit.
+    assert!(!commits(&n.propose(6)));
+    assert_eq!(n.node.committed_height(), 0);
+    // B6@7: QCs at 4, 5, 6 over B3 — consecutive, so B1..B3 commit at once.
+    assert!(commits(&n.propose(7)), "consecutive three-chain did not commit");
+    assert_eq!(n.node.committed_height(), 3);
+}
+
+#[test]
+fn messages_from_absurd_views_are_rejected() {
+    let mut sim = setup(2, 2);
+    sim.step(vec![]);
+    let view_before = sim.nodes[0].view();
+    // A NewView for u64::MAX carries a real signature and a real QC: it used to
+    // drag the replica to u64::MAX, where the next `view + 1` overflowed.
+    let nv = NewView::sign(u64::MAX, sim.nodes[0].high_qc().clone(), &sim.keys[1]);
+    assert!(matches!(sim.nodes[0].on_new_view(nv), Err(ConsensusError::ViewOutOfRange { .. })));
+    assert_eq!(sim.nodes[0].view(), view_before);
+    // A vote for u64::MAX must be rejected before any `vote.view + 1` arithmetic.
+    let v = Vote::sign(u64::MAX, Hash::digest(b"x"), &sim.keys[1]);
+    assert!(matches!(sim.nodes[0].on_vote(v), Err(ConsensusError::ViewOutOfRange { .. })));
+    // A sane NewView one view ahead is still accepted.
+    let ok = NewView::sign(view_before + 1, sim.nodes[0].high_qc().clone(), &sim.keys[1]);
+    assert!(sim.nodes[0].on_new_view(ok).is_ok());
+}
+
+#[test]
+fn one_validator_down_keeps_committing() {
+    // With votes relayed only to the next leader, a single down validator ate
+    // two QCs per four-view cycle (its own proposal's, plus the previous
+    // block's as vote collector), leaving QC runs of two that can never
+    // satisfy the three-consecutive-views commit rule: finality stalled.
+    // Broadcast votes form QCs at every live proposal, so commits proceed.
+    let mut sim = setup(4, 4);
+    for _ in 0..2 {
+        sim.step(vec![]);
+    }
+    let base = sim.committed[0].len();
+    sim.down[3] = true;
+    for _ in 0..12 {
+        sim.step(vec![]);
+    }
+    assert!(
+        sim.committed[0].len() >= base + 4,
+        "commits stalled with one validator down: base {base}, now {}",
+        sim.committed[0].len()
+    );
+    sim.assert_consistent();
+}
+
+#[test]
+fn speculative_tree_is_capped() {
+    let (mut cfg, gs, key) = one_node_parts();
+    // Cap at genesis + two speculative blocks.
+    cfg.max_tree_blocks = 3;
+    let mut n = one_node_with(cfg, gs.block.clone(), gs.ledger.clone(), key);
+    n.node.start();
+    n.propose(1);
+    n.propose(2);
+    // The tree now holds genesis + B1 + B2 and is full: the next proposal is
+    // refused before any execution or insertion.
+    let err = n.node.propose(3, vec![], 3).unwrap_err();
+    assert!(matches!(err, ConsensusError::TreeFull), "{err}");
 }
