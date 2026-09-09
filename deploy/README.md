@@ -27,6 +27,12 @@ shrugg faucet ByDkxsEfDCR5DrmDufKftvcRsgvufypnZ4SgDQzJAQ7Z        # 100 SHRUGG f
 shrugg --key deploy/node-b.key.json send 2nRdFChBXRmKoe2sQE3ZYDzvdg53QmBZJJ9iweY7hk1v 1.5
 ```
 
+Live on chain 4 (2026-09-10): program `private_payment(1000)` deployed by A in block 10, id
+`675adeea7e4242d8dc48bf56faedb7bea14a4f832d7c8a973f942fa7dd850065`; first confidential call in block 19
+(tx `d4c75efbe141567eae72d5f639a1d444eb074d8b58a6592d95e01cd39a2364e3`), outputs `[1, 0, 25, 0, 0, 0, 0, 0]`,
+25 units paid to B. Laptop proving 21 s; droplet verifier-key warm 7 s (one-time, background); receipt and
+balance identical on A, C, D, E, F.
+
 Confidential call from the laptop (private inputs never leave it):
 ```bash
 shrugg --key deploy/node-a.key.json program build --guest private_payment --arg 1000 --out pp.json

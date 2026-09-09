@@ -28,7 +28,8 @@ UNIT
 # Retire the pre-rename service if this box ran one.
 systemctl disable --now sesh-node 2>/dev/null || true; rm -f /etc/systemd/system/sesh-node.service
 systemctl daemon-reload
-systemctl enable --now shrugg-node
+systemctl enable shrugg-node
+systemctl restart shrugg-node
 sleep 3
 systemctl --no-pager status shrugg-node | head -5
 /usr/local/bin/shrugg status
