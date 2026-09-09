@@ -70,6 +70,9 @@ pub enum VerifyError {
 /// `keccak256(uncompressed_pubkey[1..])`) that produced `sig` over
 /// `digest`, or `None` if the signature is malformed or unrecoverable.
 pub fn recover_address(digest: &[u8; 32], sig: &Signature) -> Option<GuardianKey> {
+    if sig.v > 1 {
+        return None;
+    }
     let ecdsa_sig = EcdsaSignature::from_scalars(sig.r, sig.s).ok()?;
     let recid = RecoveryId::from_byte(sig.v)?;
     let verifying_key = VerifyingKey::recover_from_prehash(digest, &ecdsa_sig, recid).ok()?;
@@ -239,5 +242,111 @@ mod tests {
         buf.extend(2u16.to_be_bytes());
         buf.extend([5u8; 32]);
         assert_eq!(asset_id(2, &[5; 32]), Hash(*blake3::hash(&buf).as_bytes()));
+    }
+
+    #[test]
+    fn recover_address_rejects_v_greater_than_one() {
+        let mut sig = sign_digest(&[7; 32], 0, &[1; 32]);
+        sig.v = 2;
+        assert_eq!(recover_address(&[1; 32], &sig), None);
+    }
+
+    /// Cross-checks every signature-level vector from the shared
+    /// `tools/vectors` generator (Task B1) against `verify`. The remaining
+    /// `expect` values (`wrong_emitter`, `fee_exceeds_amount`, `replay`,
+    /// etc.) are ledger-level and are asserted in Task C2.
+    #[test]
+    fn shared_vectors_match_verify() {
+        let file: serde_json::Value =
+            serde_json::from_str(include_str!("vectors.json")).expect("vectors.json parses");
+        let now = file["now"].as_u64().expect("now");
+        const SIGNATURE_LEVEL: &[&str] = &[
+            "ok",
+            "no_quorum",
+            "index_order",
+            "index_out_of_range",
+            "bad_signature",
+            "high_s",
+            "wrong_guardian",
+            "unknown_set",
+            "set_expired",
+            "bad_version",
+        ];
+        let mut checked = 0usize;
+        for v in file["vectors"].as_array().expect("vectors array") {
+            let name = v["name"].as_str().expect("name");
+            let expect = v["expect"].as_str().expect("expect");
+            if !SIGNATURE_LEVEL.contains(&expect) {
+                continue;
+            }
+            checked += 1;
+            let bytes = hex::decode(v["attestation"].as_str().expect("attestation")).expect("hex");
+            let guardian_set_index = v["guardian_set_index"].as_u64().expect("guardian_set_index") as u32;
+            let sets = v["sets"].as_array().expect("sets");
+            let set_json = sets
+                .iter()
+                .find(|s| s["index"].as_u64().expect("index") as u32 == guardian_set_index);
+
+            if expect == "unknown_set" {
+                assert!(
+                    set_json.is_none(),
+                    "{name}: expected no set at index {guardian_set_index}"
+                );
+                continue;
+            }
+            let set_json = set_json.unwrap_or_else(|| panic!("{name}: missing set {guardian_set_index}"));
+            let keys: Vec<GuardianKey> = set_json["keys"]
+                .as_array()
+                .expect("keys")
+                .iter()
+                .map(|k| {
+                    let b = hex::decode(k.as_str().expect("key hex")).expect("hex");
+                    let arr: GuardianKey = b.try_into().expect("20-byte key");
+                    arr
+                })
+                .collect();
+            let expires_at = set_json["expires_at"].as_u64().expect("expires_at");
+            let set = GuardianSet { keys, expires_at };
+
+            let result = verify(&bytes, &set, now);
+            match expect {
+                "ok" => {
+                    let (_, d) = result.unwrap_or_else(|e| panic!("{name}: expected ok, got {e:?}"));
+                    let expected_digest = v["digest"].as_str().expect("digest");
+                    assert_eq!(hex::encode(d), expected_digest, "{name}: digest mismatch");
+                }
+                "no_quorum" => assert!(
+                    matches!(result, Err(VerifyError::Index(IndexError::NoQuorum { .. }))),
+                    "{name}: {result:?}"
+                ),
+                "index_order" => assert!(
+                    matches!(result, Err(VerifyError::Index(IndexError::IndexOrder))),
+                    "{name}: {result:?}"
+                ),
+                "index_out_of_range" => assert!(
+                    matches!(result, Err(VerifyError::Index(IndexError::IndexOutOfRange))),
+                    "{name}: {result:?}"
+                ),
+                "bad_signature" => assert!(
+                    matches!(result, Err(VerifyError::BadSignature(_))),
+                    "{name}: {result:?}"
+                ),
+                "high_s" => assert!(matches!(result, Err(VerifyError::HighS(_))), "{name}: {result:?}"),
+                "wrong_guardian" => assert!(
+                    matches!(result, Err(VerifyError::WrongGuardian(_))),
+                    "{name}: {result:?}"
+                ),
+                "set_expired" => assert!(matches!(result, Err(VerifyError::SetExpired)), "{name}: {result:?}"),
+                "bad_version" => assert!(
+                    matches!(result, Err(VerifyError::Codec(CodecError::BadVersion))),
+                    "{name}: {result:?}"
+                ),
+                other => panic!("{name}: unhandled expect {other}"),
+            }
+        }
+        assert!(
+            checked >= 10,
+            "expected at least 10 signature-level vectors, checked {checked}"
+        );
     }
 }
