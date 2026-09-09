@@ -164,7 +164,7 @@ pub fn build_traces(program: &Program, exec: &Execution, tier: Tier) -> Result<T
     let cycles = exec.cycles();
     if cycles > tier.max_cycles() { return Err(ProveError::TooManyCycles { cycles, tier }); }
     let mut counts = ByteCounts::default();
-    let cpu = cpu_trace(&exec.events, tier.cpu_height());
+    let cpu = cpu_trace(&exec.events, tier.cpu_height(), &mut counts);
     let memory = memory_trace(&exec.events, tier.mem_height(), &mut counts);
     let alu = alu_trace(&exec.events, tier.alu_height(), &mut counts);
     let byte = byte_trace(&counts);
@@ -185,6 +185,12 @@ impl Proof {
 /// right — it just needs to be a pure function of the program.
 fn program_digest(program: &Program) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (program.base_pc as u64);
+    // Length first, so the fold cannot collide two programs that differ only in how many
+    // words they have. (`hc` itself is the preprocessed Merkle root, which already commits
+    // to the padded height; this digest only seeds that commitment's salt, but there is no
+    // reason to leave it length-extendable.)
+    h ^= program.words.len() as u64;
+    h = h.wrapping_mul(0x0000_0001_0000_01b3);
     for &w in &program.words {
         h ^= w as u64;
         h = h.wrapping_mul(0x0000_0001_0000_01b3);
@@ -193,10 +199,17 @@ fn program_digest(program: &Program) -> u64 {
 }
 
 /// A `Config` whose value-MMCS salts and PCS random codewords are both seeded deterministically
-/// from `program` (and nothing else) instead of OS entropy. The program and byte tables are
-/// public data — a program-derived salt costs them no privacy — so the resulting preprocessed
+/// from `program` (and nothing else) instead of OS entropy, so that the resulting preprocessed
 /// commitment (`Machine::verifier_key`/`code_hash`) is a pure function of the program: any
-/// verifier can recompute it standalone, without having witnessed the proving session. Never
+/// verifier can recompute it standalone, without having witnessed the proving session.
+///
+/// A salt that is a function of the message is *binding but not hiding*: it is brute-forceable
+/// over any guessable program space, and two deployments of the same program produce the same
+/// `hc` and are therefore linkable. That is acceptable here only because milestone 1 is not
+/// trying to hide the program at all — `verify` takes the whole `Program` in the clear, so the
+/// verifier already holds every word (`docs/03-privacy.md`). It is *not* a claim that a
+/// program-derived salt costs nothing in general. A hiding program commitment belongs with
+/// milestone 3's in-circuit digest, where the verifier stops holding the code. Never
 /// used for the actual `prove_batch` call, whose main-trace/quotient/permutation commitments
 /// must keep fresh entropy (see `make_config`) or two proofs of the same run would be
 /// distinguishable, breaking zero-knowledge.
@@ -270,6 +283,12 @@ impl Machine {
 
     pub fn verify(&self, program: &Program, proof: &Proof) -> Result<(), VerifyError> {
         if proof.public_values.len() != crate::tables::cpu::pv::NUM { return Err(VerifyError::PublicValues); }
+        // `public_values` is deserialized from untrusted bytes as raw `u64`s, and
+        // `Val::from_u64` does not reduce: `out0` and `out0 + p` are the same field element
+        // and both verify, but they are different `to_bytes()` and different numbers to
+        // anyone reading the proof. Insist on the canonical representative so a proof has
+        // exactly one encoding of its outputs.
+        if proof.public_values.iter().any(|x| *x >= Val::ORDER_U64) { return Err(VerifyError::PublicValues); }
         if proof.public_values[crate::tables::cpu::pv::PC_ENTRY] != program.base_pc as u64 { return Err(VerifyError::PublicValues); }
         if proof.public_values[crate::tables::cpu::pv::TIER] != proof.tier.0 as u64 { return Err(VerifyError::Tier); }
         // `proof.tier` is deserialized from untrusted bytes: an attacker-supplied out-of-range

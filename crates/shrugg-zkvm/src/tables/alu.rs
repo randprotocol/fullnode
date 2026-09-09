@@ -43,6 +43,16 @@ where
         );
         let is_real = v(IS_REAL);
         b.assert_bool(is_real.clone());
+        // INVARIANT — for every `table_entry` in this crate, the count must be forced to
+        // zero wherever the message columns are unconstrained. On a padding row every op
+        // flag is zero (so the provided `op` decodes as `Add`), the limb range checks are
+        // gated on `is_real`, and every arithmetic constraint carries a flag factor — so
+        // `A`, `B` and `C` are free field elements there. Without this line `MULT` was the
+        // last free column, and a padding row provided an arbitrary `(Add, a, b, c)` tuple
+        // with arbitrary multiplicity: the CPU consumes `Add` for every ADD/ADDI, every
+        // load/store address, every JALR target and the whole slot-2 `(0, pc, imm, tgt)`
+        // lookup, so `fib(10) = 999` was provable (`tests/cheating.rs`).
+        b.assert_zero((one.clone() - is_real.clone()) * v(MULT));
         let mut sum = AB::Expr::ZERO;
         for i in 0..AluOp::COUNT { b.assert_bool(v(FLAG0 + i)); sum += v(FLAG0 + i); }
         b.assert_eq(sum, is_real.clone());

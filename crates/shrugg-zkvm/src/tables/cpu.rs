@@ -1,6 +1,6 @@
 //! One row per cycle. Fetches from PROGRAM, reads and writes through MEMORY,
 //! delegates arithmetic to ALU. The only table with public values.
-use super::{bus, program::MESSAGE_LEN, F};
+use super::{bus, byte::ByteCounts, limbs, program::MESSAGE_LEN, F};
 use crate::emulator::{CycleEvent, Syscall, ECALL_MEM_REG, SLOT_MEM, SLOT_R1, SLOT_R2, SLOT_W};
 use crate::isa::{NUM_OUTPUTS, SYS_HALT as SYS_NUM_HALT, SYS_READ_INPUT, SYS_WRITE_OUTPUT};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
@@ -20,7 +20,15 @@ pub mod col {
     pub const MEM_ADDR: usize = 27; pub const MEM_VAL: usize = 28;
     pub const SYS_HALT: usize = 29; pub const SYS_WRITE: usize = 30; pub const SYS_READ: usize = 31;
     pub const OUT_SEL0: usize = 32;
-    pub const WIDTH: usize = OUT_SEL0 + crate::isa::NUM_OUTPUTS; // 40
+    /// `WRITTEN_i` is the running count of `OUT_SEL_i` over rows `0..=this one`. It is
+    /// boolean on every row, so a slot can be written at most once (the emulator's
+    /// `DoubleWrite` rule), and because `OUT_SEL_i` is zero on padding rows the value
+    /// survives to the last row, where it says whether slot `i` was ever written.
+    pub const WRITTEN0: usize = OUT_SEL0 + crate::isa::NUM_OUTPUTS;  // 40
+    /// The four byte limbs of `MEM_ADDR` on load/store rows: what makes word alignment a
+    /// stated constraint rather than a side effect of the memory table's key ordering.
+    pub const MA0: usize = WRITTEN0 + crate::isa::NUM_OUTPUTS;       // 48
+    pub const WIDTH: usize = MA0 + 4;                                // 52
     /// Columns that must be zero on padding rows.
     pub const SELECTORS: [usize; 15] = [IS_ALU, IS_IMM, IS_BRANCH, IS_LOAD, IS_STORE, IS_JAL, IS_JALR, IS_LUI, IS_AUIPC, IS_ECALL, WRITES_RD, SYS_HALT, SYS_WRITE, SYS_READ, BR_NEG];
 }
@@ -106,6 +114,18 @@ where
         // memory
         let is_mem = v(IS_LOAD) + v(IS_STORE);
         b.assert_zero(is_mem.clone() * (v(MEM_ADDR) * four.clone() - v(ALU_OUT)));
+        // Alignment, stated. `MEM_ADDR·4 = ALU_OUT` alone is a field identity: a misaligned
+        // `ALU_OUT` just yields `MEM_ADDR = ALU_OUT·4⁻¹ mod p`, and until now that was
+        // defeated only by accident — such a key cannot be ordered in the memory table. The
+        // four byte limbs plus the `AND8` check of the top limb against `0xC0` bound
+        // `MEM_ADDR` to `[0, 2^30)`. With `ALU_OUT` already 32-bit (the ALU table's own limb
+        // range checks) the product `MEM_ADDR·4 < 2^32` cannot wrap, so the identity holds
+        // over the integers and `ALU_OUT` really is a multiple of 4.
+        let mut ma = AB::Expr::ZERO;
+        for i in 0..4 { ma += v(MA0 + i) * AB::Expr::from_u32(1 << (8 * i)); }
+        b.assert_zero(is_mem.clone() * (v(MEM_ADDR) - ma));
+        for i in 0..4 { bus::RANGE8.lookup_key(b, [v(MA0 + i)], Count::bounded(is_mem.clone(), 1)); }
+        bus::AND8.lookup_key(b, [v(MA0 + 3), AB::Expr::from_u32(0xC0), AB::Expr::ZERO], Count::bounded(is_mem.clone(), 1));
         b.assert_zero(v(IS_ECALL) * (v(MEM_ADDR) - AB::Expr::from_u32(ECALL_MEM_REG)));
         let ts = |slot: u32| v(CLK) * four.clone() + AB::Expr::from_u32(slot);
         let zero = AB::Expr::ZERO;
@@ -130,6 +150,18 @@ where
             sel_sum += s;
         }
         b.assert_eq(sel_sum, v(SYS_WRITE));
+        // Spec §3.4: an output slot no `WRITE_OUTPUT` ever selected is zero. Only the slots
+        // a `WRITE_OUTPUT` row selects are pinned above, so without this a never-written
+        // slot's `pv[OUT0 + i]` is a free public value. `WRITTEN_i` accumulates `OUT_SEL_i`;
+        // asserting it boolean on every row also caps each slot at one write. `OUT_SEL_i` is
+        // zero on every padding row (its sum is `SYS_WRITE`, a `SELECTORS` entry), so the
+        // accumulator holds its final value through the padding to the last row.
+        for i in 0..NUM_OUTPUTS {
+            b.assert_bool(v(WRITTEN0 + i));
+            b.when_first_row().assert_eq(v(WRITTEN0 + i), v(OUT_SEL0 + i));
+            b.when_transition().assert_eq(n(WRITTEN0 + i), v(WRITTEN0 + i) + n(OUT_SEL0 + i));
+            b.when_last_row().assert_zero((one.clone() - v(WRITTEN0 + i)) * pvs[pv::OUT0 + i].clone());
+        }
     }
 }
 
@@ -139,9 +171,12 @@ pub fn public_values(pc_entry: u32, tier_log2: usize, outputs: &[u32; NUM_OUTPUT
     v
 }
 
-pub fn cpu_trace(events: &[CycleEvent], height: usize) -> RowMajorMatrix<F> {
+/// `counts` receives the `RANGE8`/`AND8` lookups the alignment limbs declare, in lock-step
+/// with the interactions the AIR above evaluates.
+pub fn cpu_trace(events: &[CycleEvent], height: usize, counts: &mut ByteCounts) -> RowMajorMatrix<F> {
     assert!(events.len() < height, "cpu table needs a padding row: {} cycles, height {height}", events.len());
     let mut v = F::zero_vec(height * WIDTH);
+    let mut written = [0u32; NUM_OUTPUTS];
     for (i, e) in events.iter().enumerate() {
         let r = &mut v[i * WIDTH..(i + 1) * WIDTH];
         r[CLK] = F::from_u32(e.clk); r[PC] = F::from_u32(e.pc); r[NEXT_PC] = F::from_u32(e.next_pc); r[IS_REAL] = F::ONE;
@@ -149,12 +184,24 @@ pub fn cpu_trace(events: &[CycleEvent], height: usize) -> RowMajorMatrix<F> {
         r[A] = F::from_u32(e.a); r[B] = F::from_u32(e.b); r[C] = F::from_u32(e.c);
         r[ALU_OUT] = F::from_u32(e.alu_out); r[TGT] = F::from_u32(e.tgt);
         r[MEM_ADDR] = F::from_u32(e.mem_addr); r[MEM_VAL] = F::from_u32(e.mem_val);
+        if e.dec.is_load == 1 || e.dec.is_store == 1 {
+            let ml = limbs(e.mem_addr);
+            for k in 0..4 { r[MA0 + k] = ml[k]; counts.range8((e.mem_addr >> (8 * k)) & 0xff); }
+            counts.and8((e.mem_addr >> 24) & 0xff, 0xC0);
+        }
         match e.sys {
             Some(Syscall::Halt) => r[SYS_HALT] = F::ONE,
-            Some(Syscall::WriteOutput { slot, .. }) => { r[SYS_WRITE] = F::ONE; r[OUT_SEL0 + slot as usize] = F::ONE; }
+            Some(Syscall::WriteOutput { slot, .. }) => { r[SYS_WRITE] = F::ONE; r[OUT_SEL0 + slot as usize] = F::ONE; written[slot as usize] += 1; }
             Some(Syscall::ReadInput { .. }) => r[SYS_READ] = F::ONE,
             None => {}
         }
+        for (k, w) in written.iter().enumerate() { r[WRITTEN0 + k] = F::from_u32(*w); }
+    }
+    // The accumulator must carry its final value through the padding: the last row is where
+    // `(1 − written_i)·pv[out_i] = 0` reads it.
+    for i in events.len()..height {
+        let r = &mut v[i * WIDTH..(i + 1) * WIDTH];
+        for (k, w) in written.iter().enumerate() { r[WRITTEN0 + k] = F::from_u32(*w); }
     }
     RowMajorMatrix::new(v, WIDTH)
 }
