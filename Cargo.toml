@@ -20,6 +20,8 @@ blake3 = "1.8"
 bs58 = "0.5"
 rand = "0.8"
 zeroize = "1"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
 
 # serialization
 serde = { version = "1.0", features = ["derive"] }
