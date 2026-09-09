@@ -1,0 +1,37 @@
+[package]
+name = "shrugg-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SHRUGG full node: storage, p2p networking, sync, JSON-RPC, CLI"
+
+[[bin]]
+name = "shrugg-node"
+path = "src/main.rs"
+
+[dependencies]
+shrugg-core = { workspace = true }
+shrugg-client = { workspace = true }
+shrugg-zkvm = { workspace = true }
+blake3 = { workspace = true }
+bs58 = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+libp2p = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+rocksdb = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

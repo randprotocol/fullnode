@@ -1,0 +1,22 @@
+[package]
+name = "shrugg-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SHRUGG wallet client: JSON-RPC client library and the `shrugg` command-line wallet"
+
+[[bin]]
+name = "shrugg"
+path = "src/main.rs"
+
+[dependencies]
+shrugg-core = { workspace = true }
+shrugg-zkvm = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

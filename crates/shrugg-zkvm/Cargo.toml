@@ -1,0 +1,35 @@
+[package]
+name = "shrugg-zkvm"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+description = "Rand zkVM (RV32I under a Plonky3 batch STARK, Goldilocks) plus the SHRUGG chain executor"
+
+[lib]
+name = "shrugg_zkvm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shrugg-zkvm-demo"
+path = "src/main.rs"
+
+[dependencies]
+shrugg-core = { workspace = true }
+p3-air = "=0.7.0"
+p3-uni-stark = "=0.7.0"
+p3-batch-stark = "=0.7.0"
+p3-lookup = "=0.7.0"
+p3-goldilocks = "=0.7.0"
+p3-field = "=0.7.0"
+p3-matrix = "=0.7.0"
+p3-challenger = "=0.7.0"
+p3-commit = "=0.7.0"
+p3-fri = "=0.7.0"
+p3-dft = "=0.7.0"
+p3-merkle-tree = "=0.7.0"
+p3-symmetric = "=0.7.0"
+rand = { version = "0.10", features = ["std_rng"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { version = "1", features = ["alloc"] }

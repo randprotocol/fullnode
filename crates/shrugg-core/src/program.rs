@@ -1,0 +1,60 @@
+//! On-chain programs and call receipts.
+
+use crate::crypto::{Address, Hash};
+use serde::{Deserialize, Serialize};
+
+pub type ProgramId = Hash;
+
+/// Content address of a program: blake3 over base_pc and the code words.
+pub fn program_id(base_pc: u32, words: &[u32]) -> ProgramId {
+    let mut buf = Vec::with_capacity(4 + 4 * words.len());
+    buf.extend_from_slice(&base_pc.to_le_bytes());
+    for w in words {
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+    Hash::digest_domain(b"shrugg-program", &buf)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramRecord {
+    pub id: ProgramId,
+    pub base_pc: u32,
+    pub words: Vec<u32>,
+    /// zkVM code commitment (informational; verification uses `words`).
+    pub code_hash: Vec<u8>,
+    pub deployer: Address,
+    pub deployed_at: u64,
+}
+
+/// What a verified call proved: its gas tier and the eight public outputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallOutcome {
+    pub tier: u8,
+    pub outputs: [u32; 8],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallReceipt {
+    pub tx: Hash,
+    pub program: ProgramId,
+    pub tier: u8,
+    pub outputs: [u32; 8],
+    /// The transfer the outputs requested, if any.
+    pub effect: Option<(Address, u128)>,
+    pub height: u64,
+    pub index: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn program_id_depends_on_code_and_base_pc() {
+        let a = program_id(0, &[1, 2, 3]);
+        assert_eq!(a, program_id(0, &[1, 2, 3]));
+        assert_ne!(a, program_id(4, &[1, 2, 3]));
+        assert_ne!(a, program_id(0, &[1, 2, 4]));
+        assert_ne!(a, program_id(0, &[1, 2]));
+    }
+}

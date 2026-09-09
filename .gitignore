@@ -1,0 +1,7 @@
+/target
+/data
+/data-*
+/testnet
+*.key.json
+!deploy/*.key.json
+.git-rev

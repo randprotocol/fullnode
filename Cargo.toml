@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = ["crates/shrugg-core", "crates/shrugg-zkvm", "crates/shrugg-client", "crates/shrugg-node"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["RandProtocol Contributors"]
+
+[workspace.dependencies]
+shrugg-core = { path = "crates/shrugg-core" }
+shrugg-client = { path = "crates/shrugg-client" }
+shrugg-zkvm = { path = "crates/shrugg-zkvm" }
+
+# crypto
+crystals-dilithium = "2.0"
+blake3 = "1.8"
+bs58 = "0.5"
+rand = "0.8"
+zeroize = "1"
+
+# serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+hex = "0.4"
+
+# errors / logging
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# async / net
+tokio = { version = "1.35", features = ["full"] }
+futures = "0.3"
+libp2p = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "mdns", "identify", "kad", "request-response", "cbor", "ping", "macros"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+# storage
+rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
+
+# cli
+clap = { version = "4.4", features = ["derive", "env"] }
+
+# test
+tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 2
