@@ -34,6 +34,7 @@ fn setup(n: u8, validators: u8) -> Sim {
         faucet: false,
         confidential: true,
         fri_profile: "production".into(),
+        bridge: None,
     };
     let gs = genesis.build().unwrap();
     let cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());

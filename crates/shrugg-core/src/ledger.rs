@@ -1,6 +1,6 @@
 //! Account-based SHRUGG ledger and block application rules.
 
-use crate::bridge::BridgeError;
+use crate::bridge::{AssetId, BridgeError, BridgeState};
 use crate::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
 use crate::crypto::{merkle_root, Address, Hash};
 use crate::effect::{self, Effect, EffectError};
@@ -86,6 +86,14 @@ pub struct Ledger {
     programs: BTreeMap<ProgramId, ProgramRecord>,
     /// Height of the block being applied (recorded in `ProgramRecord::deployed_at`).
     height: u64,
+    /// Bridged-asset state, present only on chains whose genesis has a
+    /// `bridge` section. Part of the state root when present; both bridge
+    /// transaction kinds are rejected when absent.
+    bridge: Option<BridgeState>,
+    /// Timestamp of the block being applied, in unix milliseconds. Transient
+    /// like `height` (set by `apply_block`), so it is not part of the state
+    /// root or of equality; bridge validation reads it as `now` in seconds.
+    timestamp_ms: u64,
 }
 
 impl PartialEq for Ledger {
@@ -94,21 +102,22 @@ impl PartialEq for Ledger {
             && self.faucet == other.faucet
             && self.accounts == other.accounts
             && self.programs == other.programs
+            && self.bridge == other.bridge
     }
 }
 impl Eq for Ledger {}
 
 impl Ledger {
     pub fn new(chain_id: u64) -> Ledger {
-        Ledger { chain_id, faucet: false, accounts: BTreeMap::new(), programs: BTreeMap::new(), height: 0 }
+        Ledger { chain_id, ..Default::default() }
     }
 
     pub fn from_accounts(chain_id: u64, accounts: BTreeMap<Address, Account>) -> Ledger {
-        Ledger { chain_id, faucet: false, accounts, programs: BTreeMap::new(), height: 0 }
+        Ledger { chain_id, accounts, ..Default::default() }
     }
 
     pub fn from_parts(chain_id: u64, accounts: BTreeMap<Address, Account>, programs: BTreeMap<ProgramId, ProgramRecord>) -> Ledger {
-        Ledger { chain_id, faucet: false, accounts, programs, height: 0 }
+        Ledger { chain_id, accounts, programs, ..Default::default() }
     }
 
     pub fn programs(&self) -> &BTreeMap<ProgramId, ProgramRecord> {
@@ -122,6 +131,39 @@ impl Ledger {
     /// Height of the block whose transactions are being applied.
     pub fn set_height(&mut self, height: u64) {
         self.height = height;
+    }
+
+    /// Timestamp of the block whose transactions are being applied, in unix
+    /// milliseconds. Bridge validation and outbound burn messages use it, so
+    /// every ledger built from a head block must carry that block's time.
+    pub fn set_timestamp_ms(&mut self, timestamp_ms: u64) {
+        self.timestamp_ms = timestamp_ms;
+    }
+
+    /// The block time in unix seconds — `now` for guardian-set expiry and the
+    /// timestamp of outbound burn messages.
+    fn now_secs(&self) -> u64 {
+        self.timestamp_ms / 1000
+    }
+
+    /// Install (or clear) the bridge state. Genesis calls this once; storage
+    /// calls it when reloading a bridged chain.
+    pub fn set_bridge(&mut self, bridge: Option<BridgeState>) {
+        self.bridge = bridge;
+    }
+
+    /// The bridge state, or `None` on a chain without a bridge.
+    pub fn bridge(&self) -> Option<&BridgeState> {
+        self.bridge.as_ref()
+    }
+
+    pub fn bridge_mut(&mut self) -> Option<&mut BridgeState> {
+        self.bridge.as_mut()
+    }
+
+    /// `addr`'s balance of bridged asset `asset`; zero without a bridge.
+    pub fn asset_balance(&self, asset: &AssetId, addr: &Address) -> u128 {
+        self.bridge.as_ref().map_or(0, |b| b.balance(asset, addr))
     }
 
     pub fn chain_id(&self) -> u64 {
@@ -223,10 +265,15 @@ impl Ledger {
             TxKind::Call { program, proof, recipients } => {
                 Ok(Some(self.check_call(tx, program, proof, recipients, executor)?))
             }
-            // Task C2 wires `BridgeState` into the ledger; until then no chain
-            // has a bridge, so both kinds are rejected.
-            TxKind::BridgeAttest { .. } | TxKind::BridgeBurn { .. } => {
-                Err(TxError::Bridge(BridgeError::Disabled))
+            TxKind::BridgeAttest { attestation } => {
+                let bridge = self.bridge.as_ref().ok_or(BridgeError::Disabled)?;
+                bridge.check_attest(attestation, self.now_secs())?;
+                Ok(None)
+            }
+            TxKind::BridgeBurn { asset, amount, to_chain, fee, .. } => {
+                let bridge = self.bridge.as_ref().ok_or(BridgeError::Disabled)?;
+                bridge.check_burn(&sender, asset, *amount, *to_chain, *fee)?;
+                Ok(None)
             }
         }
     }
@@ -313,11 +360,22 @@ impl Ledger {
                 };
                 receipt = Some(CallReceiptData { program: *program, tier: outcome.tier, outputs: outcome.outputs, effect: applied });
             }
-            // Unreachable: `validate_inner` above rejects bridge kinds until
-            // Task C2. Returned rather than panicked so a future invariant
-            // break cannot take a node down.
-            TxKind::BridgeAttest { .. } | TxKind::BridgeBurn { .. } => {
-                return Err(TxError::Bridge(BridgeError::Disabled))
+            // Bridge kinds move bridged assets, never SHRUGG: the debit above
+            // took only the fee. `validate_inner` has already rejected them
+            // when no bridge is configured, so the state is present here.
+            TxKind::BridgeAttest { attestation } => {
+                let now = self.now_secs();
+                self.bridge
+                    .as_mut()
+                    .expect("validate_inner rejects bridge txs on a chain without a bridge")
+                    .apply_attest(attestation, sender, now)?;
+            }
+            TxKind::BridgeBurn { asset, amount, to_chain, to, fee } => {
+                let (timestamp, height) = (self.now_secs() as u32, self.height);
+                self.bridge
+                    .as_mut()
+                    .expect("validate_inner rejects bridge txs on a chain without a bridge")
+                    .apply_burn(sender, *asset, *amount, *to_chain, *to, *fee, tx.hash(), height, timestamp)?;
             }
         }
         self.credit(*fee_recipient, tx.body.fee)?;
@@ -359,6 +417,7 @@ impl Ledger {
         }
         let mut scratch = self.clone();
         scratch.set_height(block.height());
+        scratch.set_timestamp_ms(block.header.timestamp_ms);
         let data = scratch.apply_transactions(&block.transactions, &block.proposer(), executor)?;
         let computed = scratch.state_root();
         if computed != block.header.state_root {
@@ -379,7 +438,11 @@ impl Ledger {
             .collect())
     }
 
-    /// Deterministic state commitment: `blake3(accounts_root || programs_root)`.
+    /// Deterministic state commitment: `blake3(accounts_root || programs_root)`,
+    /// or `blake3(accounts_root || programs_root || bridge_root)` on a chain
+    /// with a `bridge` section. A chain without one commits exactly the 64
+    /// bytes a pre-bridge node committed.
+    ///
     /// Accounts with zero balance and zero nonce are pruned so a never-touched
     /// account and an absent one hash identically. Programs are content addressed,
     /// so their ids commit to the code.
@@ -400,9 +463,12 @@ impl Ledger {
         let program_leaves: Vec<Hash> =
             self.programs.keys().map(|id| Hash::digest_domain(b"shrugg-program-leaf", id.as_bytes())).collect();
         let programs_root = merkle_root(&program_leaves);
-        let mut buf = [0u8; 64];
-        buf[..32].copy_from_slice(accounts_root.as_bytes());
-        buf[32..].copy_from_slice(programs_root.as_bytes());
+        let mut buf = Vec::with_capacity(96);
+        buf.extend_from_slice(accounts_root.as_bytes());
+        buf.extend_from_slice(programs_root.as_bytes());
+        if let Some(bridge) = &self.bridge {
+            buf.extend_from_slice(bridge.root().as_bytes());
+        }
         Hash::digest_domain(b"shrugg-state", &buf)
     }
 }
@@ -415,6 +481,10 @@ pub fn default_executor() -> StubExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::{
+        asset_id, digest, guardian_address, sign_digest, Attestation, Body, BridgeConfig, BridgeState, GuardianKey,
+        GuardianSet, Payload, Transfer, VerifyError, CHAIN_RAND,
+    };
     use crate::crypto::Keypair;
 
     fn key(n: u8) -> Keypair {
@@ -441,11 +511,10 @@ mod tests {
         assert_eq!(l.nonce(&alice.address()), 1);
     }
 
-    /// Until Task C2 wires `BridgeState` into the ledger, no chain has a
-    /// bridge, so both kinds are rejected at validation and never mutate the
-    /// ledger.
+    /// A chain whose genesis has no `bridge` section rejects both bridge
+    /// kinds at validation, and they never mutate the ledger.
     #[test]
-    fn bridge_kinds_are_disabled_without_a_bridge() {
+    fn bridge_txs_rejected_without_bridge_section() {
         let (mut l, alice, _, proposer) = funded();
         let attest = Transaction::bridge_attest(&alice, 1, 0, vec![1, 2, 3], 10);
         assert_eq!(
@@ -628,5 +697,250 @@ mod tests {
         assert_eq!(a.state_root(), c.state_root());
         assert_eq!(Ledger::new(1).state_root(), Ledger::new(1).state_root());
         assert_ne!(Ledger::new(1).state_root(), a.state_root());
+    }
+
+    // ---- bridge -----------------------------------------------------------
+
+    /// Six guardian secrets, emitter `[1; 32]`, and chains 2..5 registered as
+    /// `{2: [2; 32], .., 5: [5; 32]}` — the same shape as the `bridge::state`
+    /// tests, so `transfer_body` bodies verify.
+    fn bridge_cfg() -> (BridgeConfig, Vec<[u8; 32]>) {
+        let secrets: Vec<[u8; 32]> = (1u8..=6).map(|i| [i; 32]).collect();
+        let config = BridgeConfig {
+            emitter: [1; 32],
+            guardians: secrets.iter().map(guardian_address).collect(),
+            emitters: (2u16..=5).map(|c| (c, [c as u8; 32])).collect(),
+        };
+        (config, secrets)
+    }
+
+    /// `funded()` plus a bridge section: `alice` (`key(1)`) is the recipient
+    /// of every `transfer_body`, and the returned secrets sign attestations.
+    fn bridged() -> (Ledger, Vec<[u8; 32]>, Keypair, Address) {
+        let (config, secrets) = bridge_cfg();
+        let alice = key(1);
+        let proposer = key(3).address();
+        let mut l = Ledger::new(1);
+        l.credit(alice.address(), 1_000).unwrap();
+        l.set_bridge(Some(BridgeState::from_config(&config)));
+        (l, secrets, alice, proposer)
+    }
+
+    /// Signs `body` with the first five secrets (quorum for a set of six).
+    fn attest(secrets: &[[u8; 32]], set_index: u32, body: Body) -> Vec<u8> {
+        let d = digest(&body.encode());
+        let signatures = (0..5).map(|i| sign_digest(&secrets[i], i as u8, &d)).collect();
+        Attestation { guardian_set_index: set_index, signatures, body }.encode()
+    }
+
+    /// A transfer of `amount` (bridge fee `fee`) of token `[0xaa; 32]` native
+    /// to `emitter_chain`, emitted by that chain's registered emitter, to
+    /// `key(1)` on `to_chain`.
+    fn transfer_body(emitter_chain: u16, amount: u128, fee: u128, to_chain: u16) -> Body {
+        Body {
+            timestamp: 1,
+            nonce: 0,
+            emitter_chain,
+            emitter_address: [emitter_chain as u8; 32],
+            sequence: 0,
+            consistency_level: 0,
+            payload: Payload::Transfer(Transfer {
+                amount: Transfer::u256_from_u128(amount),
+                token_address: [0xaa; 32],
+                token_chain: emitter_chain,
+                to: key(1).address().0,
+                to_chain,
+                fee: Transfer::u256_from_u128(fee),
+            })
+            .encode(),
+        }
+    }
+
+    #[test]
+    fn bridge_attest_mints_and_burn_emits() {
+        let (mut l, s, alice, proposer) = bridged();
+        let att = attest(&s, 0, transfer_body(2, 1_000, 10, CHAIN_RAND)); // to = alice
+        let tx = Transaction::bridge_attest(&alice, 1, 0, att, 1);
+        l.apply_tx(&tx, &proposer, &StubExecutor).unwrap();
+        let asset = asset_id(2, &[0xaa; 32]);
+        // 990 net to the recipient + the 10 bridge fee to the submitter (both alice)
+        assert_eq!(l.asset_balance(&asset, &alice.address()), 1_000);
+        assert_eq!(l.balance(&alice.address()), 999);
+        assert_eq!(l.balance(&proposer), 1);
+        assert_eq!(l.nonce(&alice.address()), 1);
+
+        let burn = Transaction::bridge_burn(&alice, 1, 1, asset, 400, 2, [0x22; 32], 5, 1);
+        l.set_timestamp_ms(1_700_000);
+        l.apply_tx(&burn, &proposer, &StubExecutor).unwrap();
+        assert_eq!(l.asset_balance(&asset, &alice.address()), 600);
+        assert_eq!(l.balance(&alice.address()), 998);
+        let rec = &l.bridge().unwrap().burns[&0];
+        assert_eq!(rec.tx, burn.hash());
+        assert_eq!(rec.height, 0);
+        // the burn message carries the block time in unix seconds
+        assert_eq!(Body::decode(&rec.body).unwrap().timestamp, 1_700);
+    }
+
+    #[test]
+    fn bridge_burn_rejections_leave_the_bridge_untouched() {
+        let (mut l, s, alice, proposer) = bridged();
+        l.apply_tx(
+            &Transaction::bridge_attest(&alice, 1, 0, attest(&s, 0, transfer_body(2, 1_000, 0, CHAIN_RAND)), 0),
+            &proposer,
+            &StubExecutor,
+        )
+        .unwrap();
+        let asset = asset_id(2, &[0xaa; 32]);
+        let before = l.bridge().unwrap().clone();
+        let unknown = Transaction::bridge_burn(&alice, 1, 1, Hash::digest(b"nope"), 1, 2, [0x22; 32], 0, 0);
+        assert_eq!(l.validate(&unknown, &StubExecutor), Err(TxError::Bridge(BridgeError::UnknownAsset)));
+        let too_much = Transaction::bridge_burn(&alice, 1, 1, asset, 1_001, 2, [0x22; 32], 0, 0);
+        assert_eq!(
+            l.apply_tx(&too_much, &proposer, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::InsufficientAsset { have: 1_000, need: 1_001 }))
+        );
+        let wrong_chain = Transaction::bridge_burn(&alice, 1, 1, asset, 1, 3, [0x22; 32], 0, 0);
+        assert_eq!(
+            l.apply_tx(&wrong_chain, &proposer, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::WrongTokenChain))
+        );
+        assert_eq!(l.bridge().unwrap(), &before);
+        assert_eq!(l.nonce(&alice.address()), 1);
+    }
+
+    #[test]
+    fn state_root_unchanged_without_bridge_and_covers_bridge_with() {
+        let (a, ..) = funded();
+        let mut b = a.clone();
+        b.set_bridge(None);
+        assert_eq!(a.state_root(), b.state_root());
+        let (mut l, s, alice, proposer) = bridged();
+        let before = l.state_root();
+        l.apply_tx(
+            &Transaction::bridge_attest(&alice, 1, 0, attest(&s, 0, transfer_body(2, 1, 0, CHAIN_RAND)), 0),
+            &proposer,
+            &StubExecutor,
+        )
+        .unwrap();
+        assert_ne!(l.state_root(), before);
+        // and a bridge section is state: the same accounts with and without it differ
+        let (c, ..) = funded();
+        let mut d = c.clone();
+        d.set_bridge(Some(BridgeState::from_config(&bridge_cfg().0)));
+        assert_ne!(c.state_root(), d.state_root());
+    }
+
+    fn hex_array<const N: usize>(s: &str) -> [u8; N] {
+        hex::decode(s).expect("hex").try_into().expect("width")
+    }
+
+    /// Cross-checks the ledger-level `expect` values of the shared
+    /// `tools/vectors` fixture (Task B1) through a real `BridgeAttest`
+    /// transaction. The signature-level ones are covered in `bridge::tests`.
+    #[test]
+    fn vectors_ledger_level() {
+        let file: serde_json::Value =
+            serde_json::from_str(include_str!("bridge/vectors.json")).expect("vectors.json parses");
+        let now = file["now"].as_u64().expect("now");
+        let config = BridgeConfig {
+            emitter: hex_array(file["rand_emitter"].as_str().expect("rand_emitter")),
+            guardians: file["guardians"]
+                .as_array()
+                .expect("guardians")
+                .iter()
+                .map(|g| hex_array::<20>(g["address"].as_str().expect("address")))
+                .collect(),
+            emitters: file["emitters"]
+                .as_object()
+                .expect("emitters")
+                .iter()
+                .map(|(chain, addr)| (chain.parse().expect("chain id"), hex_array(addr.as_str().expect("hex"))))
+                .collect(),
+        };
+        const LEDGER_LEVEL: &[&str] = &[
+            "ok",
+            "wrong_emitter",
+            "wrong_to_chain",
+            "wrong_token_chain",
+            "fee_exceeds_amount",
+            "amount_overflow",
+            "bad_payload",
+            "replay",
+            "unknown_set",
+            "set_expired",
+        ];
+        let vectors = file["vectors"].as_array().expect("vectors array");
+        let attestation_of = |v: &serde_json::Value| hex::decode(v["attestation"].as_str().expect("attestation")).expect("hex");
+        let alice = key(1);
+        let proposer = key(3).address();
+        let mut checked = 0usize;
+        for v in vectors {
+            let name = v["name"].as_str().expect("name");
+            let expect = v["expect"].as_str().expect("expect");
+            if !LEDGER_LEVEL.contains(&expect) || v["verifier_chain"].as_u64().expect("verifier_chain") != 1 {
+                continue;
+            }
+            checked += 1;
+
+            // A fresh ledger per vector, carrying that vector's guardian sets
+            // (the upgrade/grace series needs sets other than 0 installed).
+            let mut bridge = BridgeState::from_config(&config);
+            for set in v["sets"].as_array().expect("sets") {
+                let keys: Vec<GuardianKey> = set["keys"]
+                    .as_array()
+                    .expect("keys")
+                    .iter()
+                    .map(|k| hex_array::<20>(k.as_str().expect("key hex")))
+                    .collect();
+                bridge.guardian_sets.insert(
+                    set["index"].as_u64().expect("index") as u32,
+                    GuardianSet { keys, expires_at: set["expires_at"].as_u64().expect("expires_at") },
+                );
+            }
+            bridge.current_set = v["current_set"].as_u64().expect("current_set") as u32;
+            let mut l = Ledger::new(1);
+            l.credit(alice.address(), 1_000).unwrap();
+            l.set_bridge(Some(bridge));
+            l.set_timestamp_ms(now * 1_000);
+
+            // A `replay` vector is the second submission of another vector.
+            let mut nonce = 0;
+            if let Some(prior) = v["replay_of"].as_str() {
+                let first = vectors
+                    .iter()
+                    .find(|o| o["name"].as_str() == Some(prior))
+                    .unwrap_or_else(|| panic!("{name}: replay_of {prior} is not in the file"));
+                let tx = Transaction::bridge_attest(&alice, 1, nonce, attestation_of(first), 0);
+                l.apply_tx(&tx, &proposer, &StubExecutor)
+                    .unwrap_or_else(|e| panic!("{name}: replay_of {prior} did not apply: {e}"));
+                nonce += 1;
+            }
+
+            let tx = Transaction::bridge_attest(&alice, 1, nonce, attestation_of(v), 0);
+            let got = l.apply_tx(&tx, &proposer, &StubExecutor);
+            let want = match expect {
+                "ok" => {
+                    got.unwrap_or_else(|e| panic!("{name}: expected ok, got {e:?}"));
+                    assert_eq!(l.nonce(&alice.address()), nonce + 1, "{name}");
+                    continue;
+                }
+                "wrong_emitter" => BridgeError::WrongEmitter,
+                "wrong_to_chain" => BridgeError::WrongToChain,
+                "wrong_token_chain" => BridgeError::WrongTokenChain,
+                "fee_exceeds_amount" => BridgeError::FeeExceedsAmount,
+                "amount_overflow" => BridgeError::AmountOverflow,
+                "bad_payload" => BridgeError::BadPayload,
+                "replay" => BridgeError::Replay,
+                "set_expired" => BridgeError::Verify(VerifyError::SetExpired),
+                "unknown_set" => BridgeError::Verify(VerifyError::UnknownGuardianSet(
+                    v["guardian_set_index"].as_u64().expect("guardian_set_index") as u32,
+                )),
+                other => panic!("{name}: unhandled expect {other}"),
+            };
+            assert_eq!(got, Err(TxError::Bridge(want)), "{name}");
+            // a rejected attestation costs the sender nothing
+            assert_eq!(l.nonce(&alice.address()), nonce, "{name}");
+        }
+        assert!(checked >= 18, "expected at least 18 ledger-level vectors, checked {checked}");
     }
 }

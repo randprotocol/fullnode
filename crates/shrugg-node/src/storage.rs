@@ -491,6 +491,7 @@ impl Storage {
                 // Re-execute; checks the header's state root as well.
                 let mut next = ledger.clone();
                 next.set_height(h);
+                next.set_timestamp_ms(block.header.timestamp_ms);
                 let receipts = next
                     .apply_transactions(&block.transactions, &block.proposer(), executor)
                     .map_err(|e| format!("block {h} does not apply: {e}"))?;
@@ -627,6 +628,7 @@ mod tests {
             faucet: false,
             confidential: true,
             fri_profile: "test".into(),
+            bridge: None,
         }
         .build()
         .unwrap()
@@ -782,6 +784,7 @@ mod tests {
             faucet: false,
             confidential: true,
             fri_profile: "test".into(),
+            bridge: None,
         };
         let gs = gen.build().unwrap();
         let dir = tempfile::tempdir().unwrap();

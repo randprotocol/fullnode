@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::Multiaddr;
+use shrugg_core::bridge::BridgeConfig;
 use shrugg_core::genesis::{Genesis, GenesisValidator};
 use shrugg_core::{Address, Keypair, PublicKey, Transaction, UNITS_PER_SHRUGG};
 use shrugg_node::keyfile::{load_keypair, KeyFile};
@@ -57,6 +58,11 @@ enum Cmd {
         /// zkVM FRI profile: production (default) or test (fast, insecure; tests only).
         #[arg(long, default_value = "production")]
         fri_profile: String,
+        /// Enable the cross-chain bridge from a JSON file:
+        /// `{ "emitter": <64 hex>, "guardians": [<40 hex>, ...], "emitters": { "<chain id>": <64 hex> } }`.
+        /// Part of the genesis hash.
+        #[arg(long)]
+        bridge: Option<PathBuf>,
     },
     /// Initialise a data directory from a genesis file.
     Init {
@@ -145,7 +151,14 @@ async fn main() -> Result<()> {
             let id = libp2p::identity::Keypair::ed25519_from_bytes(kp.derive_subkey(b"shrugg-p2p-identity"))?;
             println!("address: {}\npublic_key: {}\npeer_id: {}", kp.address(), kp.public_key().to_hex(), id.public().to_peer_id());
         }
-        Cmd::Genesis { chain_id, validators, stake, alloc_each, allocs, out, faucet, no_confidential, fri_profile } => {
+        Cmd::Genesis { chain_id, validators, stake, alloc_each, allocs, out, faucet, no_confidential, fri_profile, bridge } => {
+            let bridge = match &bridge {
+                Some(path) => {
+                    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+                    Some(serde_json::from_str::<BridgeConfig>(&text).with_context(|| format!("parsing {}", path.display()))?)
+                }
+                None => None,
+            };
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -156,6 +169,7 @@ async fn main() -> Result<()> {
                 faucet,
                 confidential: !no_confidential,
                 fri_profile,
+                bridge,
             };
             let each = parse_amount(&alloc_each)?;
             for v in validators {
@@ -175,8 +189,16 @@ async fn main() -> Result<()> {
             let state = gen.build()?;
             std::fs::write(&out, gen.to_json())?;
             println!(
-                "wrote {} (genesis hash {}, faucet {}, confidential {}, fri {})",
-                out.display(), state.hash(), if faucet { "on" } else { "off" }, if no_confidential { "off" } else { "on" }, state.fri_profile
+                "wrote {} (genesis hash {}, faucet {}, confidential {}, fri {}, bridge {})",
+                out.display(),
+                state.hash(),
+                if faucet { "on" } else { "off" },
+                if no_confidential { "off" } else { "on" },
+                state.fri_profile,
+                match &state.bridge {
+                    Some(b) => format!("{} guardians, {} emitters", b.guardians.len(), b.emitters.len()),
+                    None => "off".into(),
+                }
             );
         }
         Cmd::Init { datadir, genesis } => {

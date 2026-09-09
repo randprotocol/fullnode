@@ -36,6 +36,30 @@ pub struct BridgeConfig {
     pub emitters: BTreeMap<u16, [u8; 32]>,
 }
 
+/// The plain-bytes twin of [`BridgeConfig`], used for the genesis
+/// commitment.
+///
+/// `BridgeConfig` serializes as human-readable hex so the genesis file is
+/// editable; `bincode` of that would commit to hex *strings*. The genesis
+/// hash commits to this struct instead, so the bytes it covers are the
+/// bytes the chain runs on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeCommit {
+    pub emitter: [u8; 32],
+    pub guardians: Vec<GuardianKey>,
+    pub emitters: BTreeMap<u16, [u8; 32]>,
+}
+
+impl From<&BridgeConfig> for BridgeCommit {
+    fn from(cfg: &BridgeConfig) -> BridgeCommit {
+        BridgeCommit {
+            emitter: cfg.emitter,
+            guardians: cfg.guardians.clone(),
+            emitters: cfg.emitters.clone(),
+        }
+    }
+}
+
 /// One outbound (Rand -> source chain) bridge message, produced by a
 /// `BridgeBurn` transaction. Guardians read these over RPC and sign
 /// [`BridgeBurnRecord::digest`]; a source-chain contract releases against

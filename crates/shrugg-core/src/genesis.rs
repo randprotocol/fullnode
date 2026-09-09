@@ -1,10 +1,11 @@
 //! Genesis configuration and derivation of the genesis block + ledger.
 
+use crate::bridge::{BridgeCommit, BridgeConfig, BridgeState, GuardianKey, CHAIN_RAND, GOVERNANCE_EMITTER};
 use crate::crypto::{Address, Hash, PublicKey, Signature};
 use crate::ledger::{Account, Ledger};
 use crate::types::{Block, BlockHeader, QuorumCertificate, Validator, ValidatorSet};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenesisValidator {
@@ -30,6 +31,13 @@ pub struct Genesis {
     /// zkVM FRI profile every node must use: "production" or "test" (tests only). Part of the genesis hash.
     #[serde(default = "default_profile")]
     pub fri_profile: String,
+    /// Cross-chain bridge: the outbound emitter, the initial guardian set, and
+    /// the registered emitter of each source chain. Part of the genesis hash
+    /// when present; omitted entirely when absent, so a bridge-less chain's
+    /// genesis file, hash, and state root are byte-for-byte what a pre-bridge
+    /// node produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<BridgeConfig>,
 }
 
 fn default_true() -> bool {
@@ -56,6 +64,8 @@ pub enum GenesisError {
     Json(#[from] serde_json::Error),
     #[error("unknown fri_profile {0} (production|test)")]
     BadFriProfile(String),
+    #[error("bad bridge config: {0}")]
+    BadBridgeConfig(String),
 }
 
 /// Everything a node derives from the genesis file.
@@ -65,6 +75,9 @@ pub struct GenesisState {
     pub faucet: bool,
     pub confidential: bool,
     pub fri_profile: String,
+    /// The genesis `bridge` section, or `None` on a chain without a bridge.
+    /// `ledger.bridge()` is the state derived from it.
+    pub bridge: Option<BridgeConfig>,
     pub validators: ValidatorSet,
     pub ledger: Ledger,
     pub block: Block,
@@ -92,6 +105,9 @@ impl Genesis {
         if !FRI_PROFILES.contains(&self.fri_profile.as_str()) {
             return Err(GenesisError::BadFriProfile(self.fri_profile.clone()));
         }
+        if let Some(bridge) = &self.bridge {
+            check_bridge(bridge)?;
+        }
         let mut vals = Vec::new();
         for v in &self.validators {
             if v.stake == 0 {
@@ -109,6 +125,7 @@ impl Genesis {
         }
         let mut ledger = Ledger::from_accounts(self.chain_id, accounts);
         ledger.set_faucet(self.faucet);
+        ledger.set_bridge(self.bridge.as_ref().map(BridgeState::from_config));
 
         // The genesis block is unsigned and has a self-referential placeholder
         // justify; its hash commits to chain id, validators, and the initial state.
@@ -119,6 +136,12 @@ impl Genesis {
         commit.push(self.faucet as u8);
         commit.push(self.confidential as u8);
         commit.extend_from_slice(self.fri_profile.as_bytes());
+        // Appended only when a bridge is configured, so a bridge-less chain's
+        // genesis hash is unchanged. `BridgeCommit` is the plain-bytes twin of
+        // `BridgeConfig`, whose own serde is hex text.
+        if let Some(bridge) = &self.bridge {
+            commit.extend_from_slice(&bincode::serialize(&BridgeCommit::from(bridge)).expect("serializes"));
+        }
         let genesis_binding = Hash::digest_domain(b"shrugg-genesis", &commit);
         let header = BlockHeader {
             height: 0,
@@ -131,8 +154,41 @@ impl Genesis {
             justify: QuorumCertificate { view: 0, block_hash: Hash::ZERO, votes: Vec::new() },
         };
         let block = Block { header, transactions: Vec::new(), signature: Signature::empty() };
-        Ok(GenesisState { chain_id: self.chain_id, faucet: self.faucet, confidential: self.confidential, fri_profile: self.fri_profile.clone(), validators, ledger, block })
+        Ok(GenesisState {
+            chain_id: self.chain_id,
+            faucet: self.faucet,
+            confidential: self.confidential,
+            fri_profile: self.fri_profile.clone(),
+            bridge: self.bridge.clone(),
+            validators,
+            ledger,
+            block,
+        })
     }
+}
+
+/// Rejects a `bridge` section a chain could not run: an empty, duplicated or
+/// zero guardian set, Rand itself registered as a source emitter, or a source
+/// emitter that collides with the governance emitter (which would let a
+/// source chain forge guardian-set upgrades).
+fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
+    let bad = |m: String| Err(GenesisError::BadBridgeConfig(m));
+    if cfg.guardians.is_empty() {
+        return bad("no guardians".into());
+    }
+    if cfg.guardians.iter().collect::<BTreeSet<&GuardianKey>>().len() != cfg.guardians.len() {
+        return bad("duplicate guardian key".into());
+    }
+    if cfg.guardians.contains(&[0u8; 20]) {
+        return bad("zero guardian key".into());
+    }
+    if cfg.emitters.contains_key(&CHAIN_RAND) {
+        return bad(format!("chain {CHAIN_RAND} is Rand itself and cannot be a source emitter"));
+    }
+    if let Some((chain, _)) = cfg.emitters.iter().find(|(_, addr)| **addr == GOVERNANCE_EMITTER) {
+        return bad(format!("emitter for chain {chain} is the governance emitter"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -150,7 +206,12 @@ mod tests {
             faucet: false,
             confidential: true,
             fri_profile: "production".into(),
+            bridge: None,
         }
+    }
+
+    fn bridge_cfg() -> BridgeConfig {
+        BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::new() }
     }
 
     #[test]
@@ -216,5 +277,57 @@ mod tests {
         let mut g = genesis(1);
         g.validators[0].stake = 0;
         assert!(matches!(g.build(), Err(GenesisError::ZeroStake(_))));
+    }
+
+    /// The live testnet genesis must keep hashing to the value `deploy/README.md`
+    /// documents: a chain without a `bridge` section is byte-for-byte what a
+    /// pre-bridge node produced. A failure here is a hard fork, not a stale
+    /// expectation.
+    #[test]
+    fn genesis_hash_unchanged_without_bridge_and_changes_with() {
+        let g = Genesis::from_json(include_str!("../../../deploy/genesis.json")).unwrap();
+        assert!(g.bridge.is_none());
+        assert_eq!(
+            g.build().unwrap().hash().to_hex(),
+            "7e6271a3aa38f11a43a6b3ad4c2262860cc8fa4b1f5c7b3b37dd6aebae01e917"
+        );
+        assert!(g.build().unwrap().ledger.bridge().is_none());
+        // ... and a bridge section moves both the genesis hash and the state root
+        let mut with = g.clone();
+        with.bridge = Some(bridge_cfg());
+        assert_ne!(with.build().unwrap().hash(), g.build().unwrap().hash());
+        assert!(with.build().unwrap().ledger.bridge().is_some());
+        assert_ne!(with.build().unwrap().ledger.state_root(), g.build().unwrap().ledger.state_root());
+        // the section survives a JSON round trip and is omitted when absent
+        assert!(!g.to_json().contains("bridge"));
+        assert_eq!(Genesis::from_json(&with.to_json()).unwrap(), with);
+    }
+
+    #[test]
+    fn bridge_section_is_validated() {
+        let bad = |cfg: BridgeConfig| {
+            let mut g = genesis(1);
+            g.bridge = Some(cfg);
+            match g.build() {
+                Err(GenesisError::BadBridgeConfig(m)) => m,
+                other => panic!("expected BadBridgeConfig, got {other:?}"),
+            }
+        };
+        assert!(bad(BridgeConfig { guardians: vec![], ..bridge_cfg() }).contains("guardian"));
+        assert!(bad(BridgeConfig { guardians: vec![[2; 20], [2; 20]], ..bridge_cfg() }).contains("duplicate"));
+        assert!(bad(BridgeConfig { guardians: vec![[0; 20]], ..bridge_cfg() }).contains("zero"));
+        assert!(bad(BridgeConfig { emitters: BTreeMap::from([(1u16, [7u8; 32])]), ..bridge_cfg() }).contains("Rand"));
+        assert!(
+            bad(BridgeConfig { emitters: BTreeMap::from([(2u16, GOVERNANCE_EMITTER)]), ..bridge_cfg() })
+                .contains("governance")
+        );
+        let mut ok = genesis(1);
+        ok.bridge = Some(BridgeConfig { emitters: BTreeMap::from([(2u16, [7u8; 32])]), ..bridge_cfg() });
+        let state = ok.build().unwrap();
+        assert_eq!(state.bridge.as_ref().unwrap().guardians, vec![[2u8; 20]]);
+        let bridge = state.ledger.bridge().unwrap();
+        assert_eq!(bridge.guardian_sets[&0].keys, vec![[2u8; 20]]);
+        assert_eq!(bridge.emitters, BTreeMap::from([(2u16, [7u8; 32])]));
+        assert_eq!(bridge.emitter, [1u8; 32]);
     }
 }

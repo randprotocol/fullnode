@@ -49,6 +49,7 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--faucet` | off | **testnet only**: enable `Mint` transactions (`shrugg_mint`, up to 100 SHRUGG per call). Part of the genesis hash |
 | `--no-confidential` | off | disable Deploy/Call transactions on this chain. Part of the genesis hash |
 | `--fri-profile <production\|test>` | `production` | zkVM FRI profile every node must use; `test` is insecure and for the test suite. Part of the genesis hash |
+| `--bridge <FILE>` | off | JSON file enabling the cross-chain bridge (see below). Part of the genesis hash |
 
 Prints the genesis hash. Every node of a chain must use a byte-identical genesis file.
 
@@ -62,9 +63,18 @@ Genesis JSON shape:
   "alloc": { "<base58 address>": 100000000000, ... },  // smallest units (1 SHRUGG = 1e9)
   "faucet": true,                                        // omit or false outside testnets
   "confidential": true,                                  // default true
-  "fri_profile": "production"                            // or "test"
+  "fri_profile": "production",                           // or "test"
+  "bridge": {                                            // omit entirely for a chain without a bridge
+    "emitter": "<64 hex>",                               // this chain's emitter address in outbound messages
+    "guardians": ["<40 hex>", ...],                      // initial guardian set (secp256k1 addresses)
+    "emitters": { "2": "<64 hex>", ... }                 // source chain id -> that chain's emitter address
+  }
 }
 ```
+
+The `--bridge <FILE>` flag takes exactly the `bridge` object above. Chain id 1 is Rand itself and may not
+appear in `emitters`; guardians must be non-empty, distinct and non-zero. A genesis without a `bridge`
+section hashes exactly as it did before the bridge existed.
 
 ### `shrugg-node init`
 

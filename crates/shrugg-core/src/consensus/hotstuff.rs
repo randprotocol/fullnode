@@ -73,6 +73,10 @@ impl HotStuff {
         if let Some(s) = &signer {
             assert!(cfg.validators.contains(&s.address()), "signer must be a validator");
         }
+        // A loaded ledger carries no block time; bridge validation against the
+        // tip would then see `now = 0` and treat every guardian set as fresh.
+        let mut head_ledger = head_ledger;
+        head_ledger.set_timestamp_ms(head.header.timestamp_ms);
         let head_hash = head.hash();
         let head_height = head.height();
         let mut tree = HashMap::new();
@@ -382,6 +386,9 @@ impl HotStuff {
         };
         let mut ledger = parent.ledger_after.clone();
         ledger.set_height(parent.block.height() + 1);
+        // Select against the time this block will carry, so a validator
+        // re-applying it through `apply_block` reaches the same verdict.
+        ledger.set_timestamp_ms(timestamp_ms);
         let mut txs = Vec::with_capacity(candidates.len());
         let me = signer.address();
         for tx in candidates {

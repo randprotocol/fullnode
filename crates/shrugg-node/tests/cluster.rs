@@ -27,6 +27,7 @@ fn genesis(validators: &[Keypair], funded: &[Keypair]) -> Genesis {
         faucet: true,
         confidential: true,
         fri_profile: "test".into(),
+        bridge: None,
     }
 }
 
