@@ -17,6 +17,8 @@ pub const MAX_RECIPIENTS: usize = 8;
 pub const MAX_ATTESTATION_BYTES: usize = 16_384;
 /// Transaction bytes per block (proofs are ~0.9 MB each).
 pub const MAX_BLOCK_BYTES: usize = 4 << 20;
+/// Transactions per block.
+pub const MAX_BLOCK_TXS: usize = 2_000;
 /// zkVM tiers (log2 of the CPU table height).
 pub const MIN_TIER: u8 = 10;
 pub const MAX_TIER: u8 = 20;

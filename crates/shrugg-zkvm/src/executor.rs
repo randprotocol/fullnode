@@ -11,7 +11,7 @@ use p3_batch_stark::{verify_batch, CommonData};
 use p3_field::PrimeCharacteristicRing;
 use shrugg_core::confidential::{ConfidentialError, ConfidentialExecutor};
 use shrugg_core::program::{CallOutcome, ProgramId, ProgramRecord};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 const KEY_CACHE: usize = 64;
@@ -19,11 +19,15 @@ const KEY_CACHE: usize = 64;
 pub struct ZkExecutor {
     machine: Machine,
     keys: Mutex<HashMap<(ProgramId, usize), Arc<CommonData<Config>>>>,
+    /// Insertion order of `keys`, for bounded FIFO eviction: evicting everything
+    /// at once (the old `clear()`) let an attacker keep the cache permanently
+    /// cold, forcing a ~2 s key computation per message on the node loop.
+    order: Mutex<VecDeque<(ProgramId, usize)>>,
 }
 
 impl ZkExecutor {
     pub fn new(profile: FriProfile) -> ZkExecutor {
-        ZkExecutor { machine: Machine::new(profile), keys: Mutex::new(HashMap::new()) }
+        ZkExecutor { machine: Machine::new(profile), keys: Mutex::new(HashMap::new()), order: Mutex::new(VecDeque::new()) }
     }
 
     pub fn profile(&self) -> FriProfile {
@@ -49,10 +53,17 @@ impl ZkExecutor {
         }
         let key = Arc::new(self.machine.verifier_key(&Self::program(record), tier));
         let mut cache = self.keys.lock().unwrap();
-        if cache.len() >= KEY_CACHE {
-            cache.clear();
+        let mut order = self.order.lock().unwrap();
+        while cache.len() >= KEY_CACHE {
+            match order.pop_front() {
+                Some(old) => {
+                    cache.remove(&old);
+                }
+                None => cache.clear(),
+            }
         }
         cache.insert(k, key.clone());
+        order.push_back(k);
         key
     }
 
@@ -78,8 +89,13 @@ impl ConfidentialExecutor for ZkExecutor {
         Ok(shrugg_core::program::program_id(base_pc, words).0.to_vec())
     }
 
+    /// Precompute the verifier keys for every tier of this program (called off
+    /// the node loop at deploy/startup). Warming only one tier left the others
+    /// cold, so the first honest call at any other tier paid ~2 s inline.
     fn warm(&self, record: &ProgramRecord) {
-        let _ = self.key_for(record, Tier(TIERS[0]));
+        for t in TIERS {
+            let _ = self.key_for(record, Tier(t));
+        }
     }
 
     fn verify_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {

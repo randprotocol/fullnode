@@ -23,7 +23,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 const SYNC_BATCH: u32 = 100;
-const MAX_TXS_PER_BLOCK: usize = 2_000;
+/// Approximate cap on a sync batch response: the request-response codec caps
+/// messages at 10 MiB, so an unbounded 100-block batch of fat blocks would be
+/// undeliverable and the requester would retry the same range forever.
+const SYNC_MAX_BYTES: usize = 8 << 20;
 
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -331,7 +334,7 @@ impl Node {
     }
 
     fn publish_status(&self) {
-        let mut s = self.status.write().unwrap();
+        let mut s = self.status.write().unwrap_or_else(|e| e.into_inner());
         s.height = self.hs.committed_height();
         s.head_hash = self.hs.committed_hash().to_hex();
         s.view = self.hs.view();
@@ -355,7 +358,7 @@ impl Node {
     }
 
     async fn propose(&mut self, view: u64) -> Result<()> {
-        let txs = self.mempool.candidates_within(self.hs.tip_ledger(), MAX_TXS_PER_BLOCK, gas::MAX_BLOCK_BYTES);
+        let txs = self.mempool.candidates_within(self.hs.tip_ledger(), gas::MAX_BLOCK_TXS, gas::MAX_BLOCK_BYTES);
         match self.hs.propose(view, txs, now_ms()) {
             Ok(acts) => {
                 self.last_block_at = Instant::now();
@@ -567,9 +570,16 @@ impl Node {
             SyncRequest::Blocks { from_height, max } => {
                 let max = max.min(SYNC_BATCH);
                 let mut out = Vec::new();
+                let mut bytes = 0usize;
                 for h in from_height..from_height.saturating_add(max as u64) {
                     match self.storage.committed_block(h) {
-                        Ok(Some(cb)) => out.push(cb),
+                        Ok(Some(cb)) => {
+                            bytes += cb.block.encode().len();
+                            if !out.is_empty() && bytes > SYNC_MAX_BYTES {
+                                break;
+                            }
+                            out.push(cb);
+                        }
                         _ => break,
                     }
                 }

@@ -39,7 +39,11 @@ fn verifies_a_real_proof_and_reports_outputs() {
     assert_eq!(out.outputs[2], 1025 - 1000, "pays the surplus");
     assert_eq!(ex.cached_keys(), 1);
     ex.warm(&rec);
-    assert_eq!(ex.cached_keys(), 1, "warm reuses the cached key");
+    assert_eq!(
+        ex.cached_keys(),
+        shrugg_zkvm::machine::TIERS.len(),
+        "warm precomputes every tier's key, reusing the cached one"
+    );
     let t = std::time::Instant::now();
     ex.verify_call(&rec, proof).unwrap();
     assert!(t.elapsed().as_millis() < 500, "cached verify took {:?}", t.elapsed());

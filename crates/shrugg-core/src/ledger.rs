@@ -72,6 +72,10 @@ pub enum BlockError {
     /// timestamps are allowed.
     #[error("block timestamp {block} is before its parent's {parent}")]
     TimestampRewind { parent: u64, block: u64 },
+    #[error("too many transactions in block")]
+    TooManyTransactions,
+    #[error("block transaction bytes exceed the per-block limit")]
+    TooLarge,
 }
 
 /// Receipt data for a call, before it is placed in a block.
@@ -314,6 +318,12 @@ impl Ledger {
             return Err(TxError::TooManyRecipients);
         }
         let record = self.programs.get(program).ok_or(TxError::UnknownProgram(*program))?;
+        // Cheap floor before the expensive part: every tier costs at least
+        // CALL_BASE, so an underpaying call is rejected without paying for
+        // proof verification (or a cold verifier-key computation).
+        if tx.body.fee < gas::CALL_BASE {
+            return Err(TxError::FeeTooLow { min: gas::CALL_BASE, fee: tx.body.fee });
+        }
         let outcome = executor.verify_call(record, proof).map_err(TxError::InvalidProof)?;
         let min = gas::call_fee(outcome.tier);
         if tx.body.fee < min {
@@ -433,6 +443,19 @@ impl Ledger {
     /// resulting state root must match the header. Ledger unchanged on error.
     /// Returns the receipts of the block's calls.
     pub fn apply_block(&mut self, block: &Block, executor: &dyn ConfidentialExecutor) -> Result<Vec<CallReceipt>, BlockError> {
+        // Size limits are a consensus rule, not only proposer policy: without
+        // them a Byzantine leader can stuff a block up to the gossip transport
+        // cap and force every replica to execute it.
+        if block.transactions.len() > gas::MAX_BLOCK_TXS {
+            return Err(BlockError::TooManyTransactions);
+        }
+        let mut bytes = 0usize;
+        for tx in &block.transactions {
+            bytes += tx.encoded_len();
+            if bytes > gas::MAX_BLOCK_BYTES {
+                return Err(BlockError::TooLarge);
+            }
+        }
         if !block.verify_signature() {
             return Err(BlockError::BadProposerSignature);
         }
