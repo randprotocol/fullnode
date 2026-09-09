@@ -254,7 +254,14 @@ mod tests {
     /// Cross-checks every signature-level vector from the shared
     /// `tools/vectors` generator (Task B1) against `verify`. The remaining
     /// `expect` values (`wrong_emitter`, `fee_exceeds_amount`, `replay`,
-    /// etc.) are ledger-level and are asserted in Task C2.
+    /// etc.) are ledger-level and are asserted in Task C2. `unknown_set` is
+    /// also ledger-level: `verify` takes an already-resolved `GuardianSet`,
+    /// not an index, so "no set at this index" is a set-*resolution*
+    /// concern that belongs to `BridgeState::check_attest` (Task C2),
+    /// which maps it to `VerifyError::UnknownGuardianSet`. Asserting it
+    /// here against the vector's own `sets` would be tautological (true by
+    /// construction of the generator), so it is intentionally not checked
+    /// in this test.
     #[test]
     fn shared_vectors_match_verify() {
         let file: serde_json::Value =
@@ -268,7 +275,6 @@ mod tests {
             "bad_signature",
             "high_s",
             "wrong_guardian",
-            "unknown_set",
             "set_expired",
             "bad_version",
         ];
@@ -287,13 +293,6 @@ mod tests {
                 .iter()
                 .find(|s| s["index"].as_u64().expect("index") as u32 == guardian_set_index);
 
-            if expect == "unknown_set" {
-                assert!(
-                    set_json.is_none(),
-                    "{name}: expected no set at index {guardian_set_index}"
-                );
-                continue;
-            }
             let set_json = set_json.unwrap_or_else(|| panic!("{name}: missing set {guardian_set_index}"));
             let keys: Vec<GuardianKey> = set_json["keys"]
                 .as_array()
