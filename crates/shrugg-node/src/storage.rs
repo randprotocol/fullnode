@@ -307,7 +307,12 @@ impl Storage {
                     TxKind::Transfer { to, .. } | TxKind::Mint { to, .. } => {
                         touched.insert(*to);
                     }
-                    TxKind::Deploy { .. } | TxKind::Call { .. } => {}
+                    // Bridge kinds touch bridged-asset balances, not SHRUGG
+                    // accounts beyond the sender; Task C2 adds their columns.
+                    TxKind::Deploy { .. }
+                    | TxKind::Call { .. }
+                    | TxKind::BridgeAttest { .. }
+                    | TxKind::BridgeBurn { .. } => {}
                 }
             }
             for r in &cb.receipts {

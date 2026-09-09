@@ -1,5 +1,6 @@
 //! Account-based SHRUGG ledger and block application rules.
 
+use crate::bridge::BridgeError;
 use crate::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
 use crate::crypto::{merkle_root, Address, Hash};
 use crate::effect::{self, Effect, EffectError};
@@ -49,6 +50,8 @@ pub enum TxError {
     InsufficientForEffect { have: u128, need: u128 },
     #[error("mint of {amount} exceeds faucet cap {cap}")]
     MintTooLarge { amount: u128, cap: u128 },
+    #[error("bridge: {0}")]
+    Bridge(#[from] BridgeError),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
@@ -220,6 +223,11 @@ impl Ledger {
             TxKind::Call { program, proof, recipients } => {
                 Ok(Some(self.check_call(tx, program, proof, recipients, executor)?))
             }
+            // Task C2 wires `BridgeState` into the ledger; until then no chain
+            // has a bridge, so both kinds are rejected.
+            TxKind::BridgeAttest { .. } | TxKind::BridgeBurn { .. } => {
+                Err(TxError::Bridge(BridgeError::Disabled))
+            }
         }
     }
 
@@ -304,6 +312,12 @@ impl Ledger {
                     Effect::None => None,
                 };
                 receipt = Some(CallReceiptData { program: *program, tier: outcome.tier, outputs: outcome.outputs, effect: applied });
+            }
+            // Unreachable: `validate_inner` above rejects bridge kinds until
+            // Task C2. Returned rather than panicked so a future invariant
+            // break cannot take a node down.
+            TxKind::BridgeAttest { .. } | TxKind::BridgeBurn { .. } => {
+                return Err(TxError::Bridge(BridgeError::Disabled))
             }
         }
         self.credit(*fee_recipient, tx.body.fee)?;

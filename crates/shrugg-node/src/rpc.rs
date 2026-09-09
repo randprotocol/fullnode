@@ -142,6 +142,13 @@ fn tx_json(t: &Transaction) -> Value {
             "recipients": recipients.iter().map(|a| a.to_base58()).collect::<Vec<_>>()
         }),
         shrugg_core::TxKind::Mint { to, amount } => json!({ "type": "mint", "to": to.to_base58(), "amount": amount.to_string() }),
+        shrugg_core::TxKind::BridgeAttest { attestation } => json!({
+            "type": "bridge_attest", "attestation": hex::encode(attestation)
+        }),
+        shrugg_core::TxKind::BridgeBurn { asset, amount, to_chain, to, fee } => json!({
+            "type": "bridge_burn", "asset": asset.to_hex(), "amount": amount.to_string(),
+            "to_chain": to_chain, "to": hex::encode(to), "fee": fee.to_string()
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),
