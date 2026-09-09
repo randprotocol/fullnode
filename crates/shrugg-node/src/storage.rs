@@ -348,11 +348,20 @@ impl Storage {
         let qc = self
             .qc_by_height(h)?
             .ok_or_else(|| StorageError::Corrupt(format!("qc for block {h} missing")))?;
-        let receipts = block
-            .transactions
-            .iter()
-            .filter_map(|tx| self.receipt(&tx.hash()).ok().flatten())
-            .collect();
+        // Every call transaction has exactly one receipt; a missing one means
+        // the receipts CF is damaged, and serving a short list would make
+        // peers reject the batch and drop us as a sync source.
+        let mut receipts = Vec::new();
+        for tx in &block.transactions {
+            match self.receipt(&tx.hash())? {
+                Some(r) => receipts.push(r),
+                None => {
+                    if matches!(tx.body.kind, shrugg_core::TxKind::Call { .. }) {
+                        return Err(StorageError::Corrupt(format!("receipt for call {} in block {h} missing", tx.hash())).into());
+                    }
+                }
+            }
+        }
         Ok(Some(CommittedBlock { block, qc, receipts }))
     }
 

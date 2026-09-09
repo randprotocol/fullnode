@@ -81,7 +81,13 @@ impl RpcError {
 }
 
 pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    let app = Router::new().route("/", post(handle)).with_state(state);
+    // Axum's default body limit is 2 MiB, but a call transaction with a
+    // near-maximum proof is larger than that once hex-encoded inside JSON.
+    let body_limit = 2 * shrugg_core::gas::MAX_PROOF_BYTES + 256 * 1024;
+    let app = Router::new()
+        .route("/", post(handle))
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     let task = tokio::spawn(async move {
@@ -254,7 +260,17 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let n: u64 = param(p, 1, "size_or_tier")?;
             let fee = match kind.as_str() {
                 "deploy" => shrugg_core::gas::deploy_fee(n as usize),
-                "call" => shrugg_core::gas::call_fee(n as u8),
+                "call" => {
+                    // Tiers are the even log2 heights 10..=20; `n as u8` alone
+                    // would silently truncate (256 became tier 0).
+                    let Ok(tier) = u8::try_from(n) else {
+                        return Err(RpcError::invalid_params("tier must be one of 10, 12, 14, 16, 18, 20"));
+                    };
+                    if !(shrugg_core::gas::MIN_TIER..=shrugg_core::gas::MAX_TIER).contains(&tier) || tier % 2 != 0 {
+                        return Err(RpcError::invalid_params("tier must be one of 10, 12, 14, 16, 18, 20"));
+                    }
+                    shrugg_core::gas::call_fee(tier)
+                }
                 _ => return Err(RpcError::invalid_params("kind must be deploy or call")),
             };
             Ok(json!(fee.to_string()))
@@ -284,11 +300,11 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         }
         "shrugg_getHead" => {
             let head = st.storage.head().map_err(RpcError::internal)?;
-            let s = st.status.read().unwrap().clone();
+            let s = st.status.read().unwrap_or_else(|e| e.into_inner()).clone();
             Ok(json!({ "height": head.height, "hash": head.hash.to_hex(), "view": s.view }))
         }
         "shrugg_syncStatus" | "shrugg_status" => {
-            let s = st.status.read().unwrap().clone();
+            let s = st.status.read().unwrap_or_else(|e| e.into_inner()).clone();
             Ok(serde_json::to_value(s).map_err(RpcError::internal)?)
         }
         "shrugg_getPeers" => {

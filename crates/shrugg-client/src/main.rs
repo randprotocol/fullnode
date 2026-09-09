@@ -177,17 +177,32 @@ fn load_key(path: &Path) -> Result<Keypair> {
 }
 
 fn write_key(path: &Path, kp: &Keypair) -> Result<()> {
-    if path.exists() {
-        anyhow::bail!("{} already exists; refusing to overwrite", path.display());
-    }
     let kf = KeyFile { seed: hex::encode(kp.seed()), address: kp.address().to_base58(), public_key: kp.public_key().to_hex() };
-    std::fs::write(path, serde_json::to_string_pretty(&kf)?)?;
+    let s = serde_json::to_string_pretty(&kf)?;
+    // create_new closes the exists-then-write race and mode(0o600) makes the
+    // file owner-only from the start: writing first and chmodding afterwards
+    // leaves the seed world-readable for a window.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("{} already exists or cannot be created; refusing to overwrite", path.display()))?;
+        f.write_all(s.as_bytes())?;
+        return Ok(());
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        if path.exists() {
+            anyhow::bail!("{} already exists; refusing to overwrite", path.display());
+        }
+        std::fs::write(path, s)?;
+        Ok(())
+    }
 }
 
 /// An attestation given as hex, or as `@path` to a file holding either hex

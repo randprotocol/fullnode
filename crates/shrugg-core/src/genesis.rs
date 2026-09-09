@@ -60,6 +60,8 @@ pub enum GenesisError {
     Overflow,
     #[error("validator {0} has zero stake")]
     ZeroStake(Address),
+    #[error("duplicate validator {0}")]
+    DuplicateValidator(Address),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("unknown fri_profile {0} (production|test)")]
@@ -109,10 +111,18 @@ impl Genesis {
             check_bridge(bridge)?;
         }
         let mut vals = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut total_stake = 0u128;
         for v in &self.validators {
             if v.stake == 0 {
                 return Err(GenesisError::ZeroStake(v.public_key.address()));
             }
+            // ValidatorSet::new would silently collapse duplicates (and the
+            // genesis hash would commit to the collapsed set): reject instead.
+            if !seen.insert(v.public_key.address()) {
+                return Err(GenesisError::DuplicateValidator(v.public_key.address()));
+            }
+            total_stake = total_stake.checked_add(v.stake).ok_or(GenesisError::Overflow)?;
             vals.push(Validator { public_key: v.public_key.clone(), stake: v.stake });
         }
         let validators = ValidatorSet::new(vals);
@@ -354,5 +364,15 @@ mod tests {
         assert_eq!(bridge.guardian_sets[&0].keys, vec![[2u8; 20]]);
         assert_eq!(bridge.emitters, BTreeMap::from([(2u16, [7u8; 32])]));
         assert_eq!(bridge.emitter, [1u8; 32]);
+    }
+
+    #[test]
+    fn rejects_duplicate_validators_and_stake_overflow() {
+        let mut g = genesis(2);
+        g.validators.push(g.validators[0].clone());
+        assert!(matches!(g.build(), Err(GenesisError::DuplicateValidator(_))));
+        let mut g = genesis(2);
+        g.validators[0].stake = u128::MAX;
+        assert!(matches!(g.build(), Err(GenesisError::Overflow)));
     }
 }
