@@ -3,7 +3,11 @@
 # Prints "up-to-date" or "updated <old> -> <new>"; exits non-zero on build failure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-git fetch origin main >/dev/null 2>&1 || { echo "fetch failed (transient network?); skipping this tick"; exit 0; }
+# bound the fetch so a hung/flaky network can't block the tick (no `timeout` on macOS; use git's own timers)
+GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=20 \
+  git -c core.sshCommand='ssh -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=3' \
+  fetch origin main >/dev/null 2>&1 \
+  || { echo "fetch failed/timed out (transient network?); skipping this tick"; exit 0; }
 LOCAL=$(git rev-parse HEAD)
 # .update-pin holds a commit to stay on (e.g. during a coordinated hard fork);
 # remove the file to resume tracking origin/main.
