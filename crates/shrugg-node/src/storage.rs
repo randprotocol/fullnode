@@ -442,6 +442,9 @@ impl Storage {
         }
 
         let mut prev_hash = gs.hash();
+        // The genesis block is the baseline for both chained checks below.
+        let mut parent_timestamp_ms = gs.block.header.timestamp_ms;
+        ledger.set_timestamp_ms(parent_timestamp_ms);
         for h in 1..=head {
             let problem = (|| -> std::result::Result<(), String> {
                 let block = self
@@ -488,7 +491,17 @@ impl Storage {
                         Err(e) => return Err(format!("tx index unreadable at block {h}: {e}")),
                     }
                 }
-                // Re-execute; checks the header's state root as well.
+                // Re-execute; checks the header's state root as well. This
+                // replay uses `apply_transactions`, not `apply_block`, so the
+                // bridged-chain rule that time never runs backwards has to be
+                // restated here rather than inherited.
+                if ledger.bridge().is_some() && block.header.timestamp_ms < parent_timestamp_ms {
+                    return Err(format!(
+                        "block {h} timestamp {} is before its parent's {parent_timestamp_ms}",
+                        block.header.timestamp_ms
+                    ));
+                }
+                parent_timestamp_ms = block.header.timestamp_ms;
                 let mut next = ledger.clone();
                 next.set_height(h);
                 next.set_timestamp_ms(block.header.timestamp_ms);

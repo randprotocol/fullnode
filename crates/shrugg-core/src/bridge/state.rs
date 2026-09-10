@@ -27,6 +27,7 @@ use crate::crypto::{merkle_root, Address, Hash};
 /// { "emitter": "<64 hex>", "guardians": ["<40 hex>"], "emitters": { "2": "<64 hex>" } }
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BridgeConfig {
     #[serde(with = "hex_bytes32")]
     pub emitter: [u8; 32],
@@ -51,11 +52,14 @@ pub struct BridgeCommit {
 }
 
 impl From<&BridgeConfig> for BridgeCommit {
+    /// Destructured on purpose: a new `BridgeConfig` field must not silently
+    /// fall out of the genesis commitment — it has to break this conversion.
     fn from(cfg: &BridgeConfig) -> BridgeCommit {
+        let BridgeConfig { emitter, guardians, emitters } = cfg;
         BridgeCommit {
-            emitter: cfg.emitter,
-            guardians: cfg.guardians.clone(),
-            emitters: cfg.emitters.clone(),
+            emitter: *emitter,
+            guardians: guardians.clone(),
+            emitters: emitters.clone(),
         }
     }
 }
@@ -164,14 +168,45 @@ impl BridgeState {
         self.balances.get(&(*asset, *addr)).copied().unwrap_or(0)
     }
 
+    /// The balances a minted transfer would produce: `amount - fee` to the
+    /// recipient and `fee` to `submitter`, accumulated when they are the same
+    /// address. Computed before any mutation, so an overflow leaves the state
+    /// untouched — and screened by `check_attest`, so `apply_attest` cannot
+    /// fail on a transfer that validated.
+    fn transfer_credits(
+        &self,
+        asset: &AssetId,
+        to: Address,
+        net: u128,
+        submitter: Address,
+        fee: u128,
+    ) -> Result<BTreeMap<Address, u128>, BridgeError> {
+        let mut credited: BTreeMap<Address, u128> = BTreeMap::new();
+        for (addr, delta) in [(to, net), (submitter, fee)] {
+            if delta == 0 {
+                continue;
+            }
+            let current = match credited.get(&addr) {
+                Some(v) => *v,
+                None => self.balance(asset, &addr),
+            };
+            let next = current.checked_add(delta).ok_or(BridgeError::Overflow)?;
+            credited.insert(addr, next);
+        }
+        Ok(credited)
+    }
+
     /// Validates an encoded attestation without mutating anything: resolve
     /// the guardian set named by the envelope, verify the quorum, decode
-    /// and check the payload, and reject an already-consumed digest.
+    /// and check the payload, screen the mint credits for overflow, and
+    /// reject an already-consumed digest.
     ///
+    /// `submitter` is the account that would keep the transfer's bridge fee;
     /// `now` is unix seconds (the ledger passes `timestamp_ms / 1000`).
     pub fn check_attest(
         &self,
         bytes: &[u8],
+        submitter: Address,
         now: u64,
     ) -> Result<(Attestation, [u8; 32], Payload), BridgeError> {
         let index = Attestation::decode(bytes)
@@ -199,6 +234,13 @@ impl BridgeState {
                 if fee > amount {
                     return Err(BridgeError::FeeExceedsAmount);
                 }
+                self.transfer_credits(
+                    &asset_id(t.token_chain, &t.token_address),
+                    Address(t.to),
+                    amount - fee,
+                    submitter,
+                    fee,
+                )?;
             }
             Payload::GuardianSetUpgrade(g) => {
                 if (att.body.emitter_chain, att.body.emitter_address)
@@ -235,7 +277,7 @@ impl BridgeState {
         submitter: Address,
         now: u64,
     ) -> Result<AttestOutcome, BridgeError> {
-        let (_, mu, payload) = self.check_attest(bytes, now)?;
+        let (_, mu, payload) = self.check_attest(bytes, submitter, now)?;
         match payload {
             Payload::Transfer(t) => {
                 let asset = asset_id(t.token_chain, &t.token_address);
@@ -243,21 +285,9 @@ impl BridgeState {
                 let fee = t.fee_u128().expect("checked by check_attest");
                 let to = Address(t.to);
                 let net = amount - fee;
-                // Compute every new balance before mutating, so an overflow
-                // leaves the state untouched. Credits to the same address
-                // (recipient == submitter) accumulate.
-                let mut credited: BTreeMap<Address, u128> = BTreeMap::new();
-                for (addr, delta) in [(to, net), (submitter, fee)] {
-                    if delta == 0 {
-                        continue;
-                    }
-                    let current = match credited.get(&addr) {
-                        Some(v) => *v,
-                        None => self.balance(&asset, &addr),
-                    };
-                    let next = current.checked_add(delta).ok_or(BridgeError::Overflow)?;
-                    credited.insert(addr, next);
-                }
+                let credited = self
+                    .transfer_credits(&asset, to, net, submitter, fee)
+                    .expect("checked by check_attest");
                 self.spent.insert(Hash(mu));
                 self.assets
                     .entry(asset)
@@ -604,29 +634,29 @@ mod tests {
         let mut b = transfer_body(2, 1, 0, 1);
         b.emitter_address = [9; 32];
         assert_eq!(
-            st.check_attest(&attest(&s, 0, b), 1).unwrap_err(),
+            st.check_attest(&attest(&s, 0, b), key(9).address(), 1).unwrap_err(),
             BridgeError::WrongEmitter
         );
         let mut b = transfer_body(2, 1, 0, 1);
         b.emitter_chain = 3; // chain-2 address presented as chain 3
         assert_eq!(
-            st.check_attest(&attest(&s, 0, b), 1).unwrap_err(),
+            st.check_attest(&attest(&s, 0, b), key(9).address(), 1).unwrap_err(),
             BridgeError::WrongEmitter
         );
         assert_eq!(
-            st.check_attest(&attest(&s, 0, transfer_body(2, 1, 0, 2)), 1)
+            st.check_attest(&attest(&s, 0, transfer_body(2, 1, 0, 2)), key(9).address(), 1)
                 .unwrap_err(),
             BridgeError::WrongToChain
         );
         assert_eq!(
-            st.check_attest(&attest(&s, 0, transfer_body(2, 1, 2, 1)), 1)
+            st.check_attest(&attest(&s, 0, transfer_body(2, 1, 2, 1)), key(9).address(), 1)
                 .unwrap_err(),
             BridgeError::FeeExceedsAmount
         );
         let mut b = transfer_body(2, 1, 0, 1);
         b.payload[1] = 1; // amount top byte
         assert_eq!(
-            st.check_attest(&attest(&s, 0, b), 1).unwrap_err(),
+            st.check_attest(&attest(&s, 0, b), key(9).address(), 1).unwrap_err(),
             BridgeError::AmountOverflow
         );
     }
@@ -708,7 +738,7 @@ mod tests {
             .encode(),
         };
         assert_eq!(
-            st.check_attest(&attest(&s, 0, up(2)), 100).unwrap_err(),
+            st.check_attest(&attest(&s, 0, up(2)), key(9).address(), 100).unwrap_err(),
             BridgeError::BadUpgradeIndex {
                 expected: 1,
                 got: 2
@@ -726,12 +756,14 @@ mod tests {
         assert!(st
             .check_attest(
                 &attest(&s, 0, transfer_body(2, 1, 0, 1)),
+                key(9).address(),
                 100 + GUARDIAN_GRACE_SECS
             )
             .is_ok());
         assert_eq!(
             st.check_attest(
                 &attest(&s, 0, transfer_body(2, 1, 0, 1)),
+                key(9).address(),
                 101 + GUARDIAN_GRACE_SECS
             )
             .unwrap_err(),
@@ -786,20 +818,20 @@ mod tests {
         let mut duplicated = keys.clone();
         duplicated[2] = duplicated[1];
         assert_eq!(
-            st.check_attest(&attest(&s, 0, upgrade_body(1, duplicated)), 100)
+            st.check_attest(&attest(&s, 0, upgrade_body(1, duplicated)), key(9).address(), 100)
                 .unwrap_err(),
             BridgeError::DuplicateGuardian
         );
         let mut zeroed = keys.clone();
         zeroed[3] = [0u8; 20];
         assert_eq!(
-            st.check_attest(&attest(&s, 0, upgrade_body(1, zeroed)), 100)
+            st.check_attest(&attest(&s, 0, upgrade_body(1, zeroed)), key(9).address(), 100)
                 .unwrap_err(),
             BridgeError::DuplicateGuardian
         );
         // the same upgrade with distinct, non-zero keys clears every rung
         assert!(st
-            .check_attest(&attest(&s, 0, upgrade_body(1, keys)), 100)
+            .check_attest(&attest(&s, 0, upgrade_body(1, keys)), key(9).address(), 100)
             .is_ok());
     }
 
@@ -808,7 +840,7 @@ mod tests {
         let (c, s) = cfg();
         let st = BridgeState::from_config(&c);
         assert_eq!(
-            st.check_attest(&attest(&s, 5, transfer_body(2, 1, 0, 1)), 1)
+            st.check_attest(&attest(&s, 5, transfer_body(2, 1, 0, 1)), key(9).address(), 1)
                 .unwrap_err(),
             BridgeError::Verify(VerifyError::UnknownGuardianSet(5))
         );
@@ -821,14 +853,14 @@ mod tests {
         let mut unknown_id = transfer_body(2, 1, 0, 1);
         unknown_id.payload = vec![9u8; TRANSFER_PAYLOAD_LEN]; // payload id 9
         assert_eq!(
-            st.check_attest(&attest(&s, 0, unknown_id), 1).unwrap_err(),
+            st.check_attest(&attest(&s, 0, unknown_id), key(9).address(), 1).unwrap_err(),
             BridgeError::BadPayload
         );
         let mut short = transfer_body(2, 1, 0, 1);
         short.payload.truncate(TRANSFER_PAYLOAD_LEN - 1); // a 132-byte transfer
         assert_eq!(short.payload.len(), 132);
         assert_eq!(
-            st.check_attest(&attest(&s, 0, short), 1).unwrap_err(),
+            st.check_attest(&attest(&s, 0, short), key(9).address(), 1).unwrap_err(),
             BridgeError::BadPayload
         );
     }
@@ -841,7 +873,7 @@ mod tests {
         // token_chain lives at payload[65..67]: id (1) + amount (32) + token_address (32)
         b.payload[65..67].copy_from_slice(&3u16.to_be_bytes());
         assert_eq!(
-            st.check_attest(&attest(&s, 0, b), 1).unwrap_err(),
+            st.check_attest(&attest(&s, 0, b), key(9).address(), 1).unwrap_err(),
             BridgeError::WrongTokenChain
         );
     }
@@ -890,6 +922,43 @@ mod tests {
         let mut other_emitters = st.clone();
         other_emitters.emitters.insert(3, [3; 32]);
         assert_ne!(other_emitters.root(), st.root());
+    }
+
+    /// A mint that would overflow a `u128` balance must be caught while
+    /// checking, so the ledger can never apply an attestation it validated
+    /// and then fail half way through.
+    #[test]
+    fn mint_overflow_is_rejected_at_check_time() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        let asset = asset_id(2, &[0xaa; 32]);
+        let (recipient, submitter) = (key(1).address(), key(9).address());
+        st.assets.insert(asset, (2, [0xaa; 32]));
+        st.balances.insert((asset, recipient), u128::MAX - 1);
+        let a = attest(&s, 0, transfer_body(2, 1_000, 10, 1));
+        assert_eq!(st.check_attest(&a, submitter, 1).unwrap_err(), BridgeError::Overflow);
+        assert_eq!(st.apply_attest(&a, submitter, 1).unwrap_err(), BridgeError::Overflow);
+        // the fee credit is screened too: here the *submitter* is the one at the ceiling
+        st.balances.insert((asset, recipient), 0);
+        st.balances.insert((asset, submitter), u128::MAX);
+        assert_eq!(st.check_attest(&a, submitter, 1).unwrap_err(), BridgeError::Overflow);
+        // nothing was consumed or credited by either rejection
+        assert!(st.spent.is_empty());
+        assert_eq!(st.balance(&asset, &recipient), 0);
+        // and the same attestation is fine once the balance has room
+        st.balances.insert((asset, submitter), 0);
+        assert!(st.check_attest(&a, submitter, 1).is_ok());
+    }
+
+    #[test]
+    fn config_rejects_unknown_fields() {
+        let json = format!(
+            r#"{{"emitter":"{}","guardians":["{}"],"emiters":{{}}}}"#,
+            hex::encode([1u8; 32]),
+            hex::encode([0x11u8; 20])
+        );
+        let err = serde_json::from_str::<BridgeConfig>(&json).unwrap_err().to_string();
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]

@@ -91,6 +91,14 @@ pub enum Action {
     PersistSafety(SafetyState),
 }
 
+/// How far ahead of a replica's own clock a proposal's timestamp may be.
+///
+/// Only enforced on chains with a bridge, where the block timestamp is
+/// consensus input (guardian-set expiry): without a bound a leader could jump
+/// forward and expire a live guardian set. Loose enough to tolerate ordinary
+/// clock drift between validators.
+pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
+
 #[derive(Clone, Debug)]
 pub struct ConsensusConfig {
     pub chain_id: u64,
@@ -145,4 +153,8 @@ pub enum ConsensusError {
     NotLeader,
     #[error("not ready to propose")]
     NotReady,
+    /// Bridged chains only: the proposal's timestamp is further than
+    /// [`MAX_CLOCK_SKEW_MS`] ahead of this replica's clock.
+    #[error("block timestamp {block} is more than {MAX_CLOCK_SKEW_MS} ms ahead of local time {now}")]
+    TimestampTooFarAhead { block: u64, now: u64 },
 }

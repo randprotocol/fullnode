@@ -64,6 +64,12 @@ pub enum BlockError {
     StateRootMismatch { computed: Hash, header: Hash },
     #[error("bad proposer signature")]
     BadProposerSignature,
+    /// Only on chains with a bridge, where the block timestamp is consensus
+    /// input (guardian-set expiry, burn message times): a leader must not be
+    /// able to rewind time and revive an expired guardian set. Equal
+    /// timestamps are allowed.
+    #[error("block timestamp {block} is before its parent's {parent}")]
+    TimestampRewind { parent: u64, block: u64 },
 }
 
 /// Receipt data for a call, before it is placed in a block.
@@ -267,7 +273,7 @@ impl Ledger {
             }
             TxKind::BridgeAttest { attestation } => {
                 let bridge = self.bridge.as_ref().ok_or(BridgeError::Disabled)?;
-                bridge.check_attest(attestation, self.now_secs())?;
+                bridge.check_attest(attestation, sender, self.now_secs())?;
                 Ok(None)
             }
             TxKind::BridgeBurn { asset, amount, to_chain, fee, .. } => {
@@ -371,6 +377,9 @@ impl Ledger {
                     .apply_attest(attestation, sender, now)?;
             }
             TxKind::BridgeBurn { asset, amount, to_chain, to, fee } => {
+                // The wire format's timestamp is a 4-byte field (spec 3.2), so
+                // the cast is the encoding's own range, not a narrowing choice:
+                // every chain verifying these messages wraps at 2106 alike.
                 let (timestamp, height) = (self.now_secs() as u32, self.height);
                 self.bridge
                     .as_mut()
@@ -414,6 +423,11 @@ impl Ledger {
         }
         if !block.verify_tx_root() {
             return Err(BlockError::TxRootMismatch);
+        }
+        // Time only constrains validity where it is consensus input, so a
+        // chain without a bridge keeps byte-identical validity rules.
+        if self.bridge.is_some() && block.header.timestamp_ms < self.timestamp_ms {
+            return Err(BlockError::TimestampRewind { parent: self.timestamp_ms, block: block.header.timestamp_ms });
         }
         let mut scratch = self.clone();
         scratch.set_height(block.height());
@@ -830,6 +844,46 @@ mod tests {
         assert_ne!(c.state_root(), d.state_root());
     }
 
+    /// An empty block on top of `ledger` at `height`, carrying `timestamp_ms`.
+    fn empty_block(ledger: &Ledger, key: &Keypair, height: u64, timestamp_ms: u64) -> Block {
+        use crate::types::{BlockHeader, QuorumCertificate};
+        let header = BlockHeader {
+            height,
+            view: height,
+            parent: Hash::ZERO,
+            proposer: key.public_key().clone(),
+            timestamp_ms,
+            tx_root: Block::tx_root(&[]),
+            state_root: ledger.state_root(),
+            justify: QuorumCertificate::genesis(Hash::ZERO),
+        };
+        Block::sign(header, Vec::new(), key)
+    }
+
+    /// A bridged chain's block time is consensus input, so it may not move
+    /// backwards; a chain without a bridge keeps the older, weaker rule.
+    #[test]
+    fn block_timestamp_may_not_rewind_on_a_bridged_chain() {
+        let proposer = key(3);
+        let (mut l, ..) = bridged();
+        l.set_timestamp_ms(1_000_000);
+        assert_eq!(
+            l.apply_block(&empty_block(&l, &proposer, 1, 999_999), &StubExecutor),
+            Err(BlockError::TimestampRewind { parent: 1_000_000, block: 999_999 })
+        );
+        // equal is allowed (the rule is non-strict), and so is moving forward
+        l.apply_block(&empty_block(&l, &proposer, 1, 1_000_000), &StubExecutor).unwrap();
+        l.apply_block(&empty_block(&l, &proposer, 2, 1_000_001), &StubExecutor).unwrap();
+        assert_eq!(
+            l.apply_block(&empty_block(&l, &proposer, 3, 1_000_000), &StubExecutor),
+            Err(BlockError::TimestampRewind { parent: 1_000_001, block: 1_000_000 })
+        );
+        // ... and a chain without a bridge accepts the very same rewind
+        let (mut plain, ..) = funded();
+        plain.set_timestamp_ms(1_000_000);
+        plain.apply_block(&empty_block(&plain, &proposer, 1, 999_999), &StubExecutor).unwrap();
+    }
+
     fn hex_array<const N: usize>(s: &str) -> [u8; N] {
         hex::decode(s).expect("hex").try_into().expect("width")
     }
@@ -941,6 +995,8 @@ mod tests {
             // a rejected attestation costs the sender nothing
             assert_eq!(l.nonce(&alice.address()), nonce, "{name}");
         }
-        assert!(checked >= 18, "expected at least 18 ledger-level vectors, checked {checked}");
+        // Exact: a vector that stops matching (a renamed `expect`, a changed
+        // `verifier_chain`) must fail here rather than quietly go unchecked.
+        assert_eq!(checked, 19, "expected 19 ledger-level vectors on chain 1");
     }
 }

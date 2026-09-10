@@ -1,9 +1,10 @@
 use super::{
     Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, NewView, SafetyState,
+    MAX_CLOCK_SKEW_MS,
 };
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, Keypair};
-use crate::ledger::Ledger;
+use crate::ledger::{BlockError, Ledger};
 use crate::types::{Block, BlockHeader, QuorumCertificate, Transaction, Vote};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -195,15 +196,17 @@ impl HotStuff {
 
     // ---- inbound -----------------------------------------------------------
 
-    pub fn on_message(&mut self, msg: ConsensusMessage) -> Result<Vec<Action>, ConsensusError> {
+    /// `now_ms` is the replica's wall clock, used only to bound how far ahead
+    /// a bridged chain's block timestamp may be (see [`MAX_CLOCK_SKEW_MS`]).
+    pub fn on_message(&mut self, msg: ConsensusMessage, now_ms: u64) -> Result<Vec<Action>, ConsensusError> {
         match msg {
-            ConsensusMessage::Proposal(b) => self.on_proposal(b),
+            ConsensusMessage::Proposal(b) => self.on_proposal(b, now_ms),
             ConsensusMessage::Vote(v) => self.on_vote(v),
             ConsensusMessage::NewView(nv) => self.on_new_view(nv),
         }
     }
 
-    pub fn on_proposal(&mut self, block: Block) -> Result<Vec<Action>, ConsensusError> {
+    pub fn on_proposal(&mut self, block: Block, now_ms: u64) -> Result<Vec<Action>, ConsensusError> {
         let mut out = Vec::new();
         let hash = block.hash();
         if self.tree.contains_key(&hash) {
@@ -238,6 +241,22 @@ impl HotStuff {
         if block.header.justify.view != parent.block.view() && !block.header.justify.is_genesis() {
             return Err(ConsensusError::BadJustify);
         }
+        // On a bridged chain the timestamp is consensus input, so it is bounded
+        // on both sides before we vote: never behind the parent (`apply_block`
+        // enforces the same rule, but rejecting here keeps an invalid proposal
+        // out of the tree without executing it), and never further than
+        // `MAX_CLOCK_SKEW_MS` ahead of this replica's clock, so a leader can
+        // neither revive an expired guardian set nor expire a live one. Chains
+        // without a bridge keep their previous validity rules exactly.
+        if parent.ledger_after.bridge().is_some() {
+            let (parent_ts, block_ts) = (parent.block.header.timestamp_ms, block.header.timestamp_ms);
+            if block_ts < parent_ts {
+                return Err(BlockError::TimestampRewind { parent: parent_ts, block: block_ts }.into());
+            }
+            if block_ts > now_ms.saturating_add(MAX_CLOCK_SKEW_MS) {
+                return Err(ConsensusError::TimestampTooFarAhead { block: block_ts, now: now_ms });
+            }
+        }
 
         // Execute on top of the parent's state.
         let mut ledger = parent.ledger_after.clone();
@@ -258,7 +277,7 @@ impl HotStuff {
         if let Some(children) = self.orphans.remove(&hash) {
             self.orphan_count -= children.len();
             for child in children {
-                if let Ok(more) = self.on_proposal(child) {
+                if let Ok(more) = self.on_proposal(child, now_ms) {
                     out.extend(more);
                 }
             }
@@ -368,13 +387,14 @@ impl HotStuff {
         out
     }
 
-    /// Build, sign and locally process a proposal for `view`. Invalid
-    /// transactions are skipped rather than failing the block.
+    /// Build, sign and locally process a proposal for `view` at wall-clock
+    /// `now_ms`. Invalid transactions are skipped rather than failing the
+    /// block.
     pub fn propose(
         &mut self,
         view: u64,
         candidates: Vec<Transaction>,
-        timestamp_ms: u64,
+        now_ms: u64,
     ) -> Result<Vec<Action>, ConsensusError> {
         let Some(signer) = &self.signer else { return Err(ConsensusError::NotReady) };
         if view != self.view || self.proposed_in_view || !self.is_leader(view) {
@@ -384,6 +404,9 @@ impl HotStuff {
         let Some(parent) = self.tree.get(&parent_hash) else {
             return Err(ConsensusError::UnknownParent(parent_hash));
         };
+        // Block time never moves backwards, whatever this leader's clock says:
+        // a lagging clock would otherwise produce a block its peers reject.
+        let timestamp_ms = now_ms.max(parent.block.header.timestamp_ms);
         let mut ledger = parent.ledger_after.clone();
         ledger.set_height(parent.block.height() + 1);
         // Select against the time this block will carry, so a validator
@@ -409,7 +432,10 @@ impl HotStuff {
         let block = Block::sign(header, txs, signer);
         self.proposed_in_view = true;
         let mut out = vec![Action::Broadcast(ConsensusMessage::Proposal(block.clone()))];
-        out.extend(self.on_proposal(block)?);
+        // The block may carry the parent's later time rather than this clock's,
+        // so feed its own time as "now": a leader never rejects the proposal it
+        // just built, and `timestamp_ms >= now_ms` makes this no weaker.
+        out.extend(self.on_proposal(block, timestamp_ms)?);
         Ok(out)
     }
 

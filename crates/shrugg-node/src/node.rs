@@ -514,7 +514,7 @@ impl Node {
 
     async fn on_consensus(&mut self, m: ConsensusMessage) -> Result<()> {
         let is_proposal = matches!(m, ConsensusMessage::Proposal(_));
-        match self.hs.on_message(m) {
+        match self.hs.on_message(m, now_ms()) {
             Ok(acts) => {
                 if is_proposal {
                     // Pace proposals from the last block seen, whoever proposed it.

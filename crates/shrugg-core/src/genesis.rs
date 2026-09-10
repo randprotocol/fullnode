@@ -182,6 +182,12 @@ fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
     if cfg.guardians.contains(&[0u8; 20]) {
         return bad("zero guardian key".into());
     }
+    if cfg.emitter == [0u8; 32] {
+        return bad("zero emitter address".into());
+    }
+    if cfg.emitter == GOVERNANCE_EMITTER {
+        return bad("emitter is the governance emitter".into());
+    }
     if cfg.emitters.contains_key(&CHAIN_RAND) {
         return bad(format!("chain {CHAIN_RAND} is Rand itself and cannot be a source emitter"));
     }
@@ -316,6 +322,8 @@ mod tests {
         assert!(bad(BridgeConfig { guardians: vec![], ..bridge_cfg() }).contains("guardian"));
         assert!(bad(BridgeConfig { guardians: vec![[2; 20], [2; 20]], ..bridge_cfg() }).contains("duplicate"));
         assert!(bad(BridgeConfig { guardians: vec![[0; 20]], ..bridge_cfg() }).contains("zero"));
+        assert!(bad(BridgeConfig { emitter: [0; 32], ..bridge_cfg() }).contains("zero emitter"));
+        assert!(bad(BridgeConfig { emitter: GOVERNANCE_EMITTER, ..bridge_cfg() }).contains("governance"));
         assert!(bad(BridgeConfig { emitters: BTreeMap::from([(1u16, [7u8; 32])]), ..bridge_cfg() }).contains("Rand"));
         assert!(
             bad(BridgeConfig { emitters: BTreeMap::from([(2u16, GOVERNANCE_EMITTER)]), ..bridge_cfg() })
