@@ -90,6 +90,13 @@ where
         // rd value
         b.assert_zero(v(IS_ALU) * (v(C) - v(ALU_OUT)));
         b.assert_zero(v(IS_LOAD) * (v(C) - v(MEM_VAL)));
+        // A store writes `b`, the value just read from `rs2` — stated, not implied. Every
+        // other use of MEM_VAL is pinned (loads through C above, WRITE_OUTPUT against the
+        // public values below, ecall rows by the memory table's read consistency), but a
+        // store's write value is a message column the bus accepts unconditionally: left
+        // unstated, a cheating witness could store a value that was never in any register
+        // and read it back through a later load as genuine memory contents.
+        b.assert_zero(v(IS_STORE) * (v(MEM_VAL) - v(B)));
         b.assert_zero((v(IS_JAL) + v(IS_JALR)) * (v(C) - v(PC) - four.clone()));
         b.assert_zero(v(IS_LUI) * (v(C) - v(IMM)));
         b.assert_zero(v(IS_AUIPC) * (v(C) - v(TGT)));

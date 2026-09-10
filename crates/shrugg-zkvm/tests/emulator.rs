@@ -24,6 +24,9 @@ fn memcpy_and_sort() {
 fn balance_check_reads_private_inputs() {
     assert_eq!(run(&guests::balance_check(1000), &[400, 250, 300, 75]).outputs[0], 1);
     assert_eq!(run(&guests::balance_check(1000), &[1, 2, 3, 4]).outputs[0], 0);
+    // u32::MAX + 2 wraps to 1: without the carry flag the bit would say "under threshold".
+    assert_eq!(run(&guests::balance_check(1000), &[u32::MAX, 2, 0, 0]).outputs[0], 1, "a wrapped sum is still over threshold");
+    assert_eq!(run(&guests::balance_check(u32::MAX), &[u32::MAX, 0, 0, 0]).outputs[0], 1, "exactly at threshold counts");
 }
 
 #[test]

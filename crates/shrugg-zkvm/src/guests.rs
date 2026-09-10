@@ -79,16 +79,23 @@ pub fn bubble_sort(values: &[u32]) -> Program {
 
 /// The confidential-computation demo: reads private inputs 0..3 (balances),
 /// sums them, and outputs only whether the sum ≥ `threshold` (1) or not (0).
+/// The sum is carry-aware: each addition records whether it wrapped, and a
+/// wrap counts as over any 32-bit threshold — the proved relation matches the
+/// stated semantics even when the true sum exceeds 2^32.
 pub fn balance_check(threshold: u32) -> Program {
     let mut a = Assembler::new(0);
-    a.extend(li(T5, 0));
+    a.extend(li(T5, 0));            // sum
+    a.extend(li(T4, 0));            // wrapped-carry flag
     for idx in 0..4 {
         a.extend(read_input(idx));
         a.push(add(T5, T5, REG_A0));
+        a.push(sltu(T2, T5, REG_A0));       // sum < addend ⟺ the add carried out
+        a.push(or(T4, T4, T2));
     }
     a.extend(li(T0, threshold as i32));
     a.push(sltu(T1, T5, T0));       // T1 = sum < threshold
     a.push(xori(T1, T1, 1));        // T1 = sum >= threshold
+    a.push(or(T1, T1, T4));         // ... or the true sum overflowed 32 bits
     a.extend(write_output(0, T1));
     a.extend(halt());
     a.assemble()

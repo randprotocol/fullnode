@@ -4,6 +4,7 @@
 //! `rejects` accepts either — and nothing else.
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_matrix::Matrix;
+use shrugg_zkvm::asm::{ops::*, Assembler};
 use shrugg_zkvm::emulator::{execute, SLOT_W};
 use shrugg_zkvm::guests;
 use shrugg_zkvm::isa::REG_A1;
@@ -262,5 +263,67 @@ fn bumping_a_byte_pow2_multiplicity_on_a_non_pow2_row_is_rejected() {
     let w = byte::col::WIDTH;
     let row = byte::row_of(200, 5); // b != 0 and a >= 32, so is_pow2 is 0 here
     t.byte.values[row * w + byte::col::M_POW2] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p, &pr) }));
+}
+
+/// The memory-path mirror of `forge_fib_output_through_an_alu_padding_row`: an honest
+/// `store 5; load; output` witness is rewritten so the `SW` delivers a value that was
+/// never in any register. Before the CPU pinned `MEM_VAL = B` on store rows, nothing tied
+/// the value sent on the MEMORY bus to the register the store reads: the bus delivered the
+/// forgery, the load read it back as genuine memory contents, and "out0 = forged" verified.
+fn forge_a_store(t: &mut Traces, forged: u32) {
+    let (wc, wm, wa) = (cpu::col::WIDTH, memory::col::WIDTH, alu::col::WIDTH);
+    let new = F::from_u32(forged);
+
+    // cpu: the store itself, the load that reads it back, the `mv a1, t1` staging the
+    // output word, and every ecall row (each reads `a1` through the memory slot).
+    for r in 0..t.cpu.height() {
+        let row = &mut t.cpu.values[r * wc..(r + 1) * wc];
+        if row[cpu::col::IS_STORE] == F::ONE { row[cpu::col::MEM_VAL] = new; }
+        if row[cpu::col::IS_LOAD] == F::ONE { row[cpu::col::MEM_VAL] = new; row[cpu::col::C] = new; }
+        if row[cpu::col::IS_ECALL] == F::ONE { row[cpu::col::MEM_VAL] = new; }
+        if row[cpu::col::IS_ALU] == F::ONE && row[cpu::col::RD] == F::from_u32(REG_A1) && row[cpu::col::RS1] == F::from_u32(6) {
+            row[cpu::col::A] = new; row[cpu::col::ALU_OUT] = new; row[cpu::col::C] = new;
+        }
+    }
+    // memory: the RAM cell, and registers t1 (the load's write, the mv's read) and a1.
+    for r in 0..t.memory.height() {
+        let row = &mut t.memory.values[r * wm..(r + 1) * wm];
+        if row[memory::col::IS_REAL] != F::ONE { continue; }
+        let ram = row[memory::col::SPACE] == F::ONE;
+        let addr = row[memory::col::ADDR];
+        if ram && addr == F::from_u32(0x400) { row[memory::col::VALUE] = new; }
+        if !ram && (addr == F::from_u32(6) || addr == F::from_u32(REG_A1)) { row[memory::col::VALUE] = new; }
+    }
+    // alu: the mv's `(Add, 5, 0, 5)` becomes `(Add, forged, 0, forged)`. The forged value
+    // must be chosen with the same byte multiset as 5 = 0x0000_0005 (e.g. 0x0500_0000), so
+    // the re-laid limbs consume exactly what the byte table already provides.
+    for r in 0..t.alu.height() {
+        let row = &mut t.alu.values[r * wa..(r + 1) * wa];
+        if row[alu::col::IS_REAL] == F::ONE && row[alu::col::FLAG0] == F::ONE
+            && row[alu::col::A] == F::from_u32(5) && row[alu::col::B] == F::ZERO && row[alu::col::C] == F::from_u32(5)
+        {
+            row[alu::col::A] = new; row[alu::col::C] = new;
+            for k in 0..3 { row[alu::col::A0 + k] = F::ZERO; row[alu::col::C0 + k] = F::ZERO; }
+            row[alu::col::A0 + 3] = F::from_u32(5); row[alu::col::C0 + 3] = F::from_u32(5);
+        }
+    }
+    t.public_values[cpu::pv::OUT0] = new;
+}
+
+#[test]
+fn storing_a_value_that_was_never_in_a_register_is_rejected() {
+    // li s0, 0x1000 ; li t0, 5 ; sw t0, 0(s0) ; lw t1, 0(s0) ; write_output(0, t1) ; halt
+    let mut a = Assembler::new(0);
+    a.extend(li(8, 0x1000)); a.extend(li(5, 5));
+    a.push(sw(8, 5, 0)); a.push(lw(6, 8, 0));
+    a.extend(write_output(0, 6)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 5);
+    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    forge_a_store(&mut t, 0x0500_0000);
+    assert_eq!(t.public_values[cpu::pv::OUT0], F::from_u32(0x0500_0000));
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p, &pr) }));
 }

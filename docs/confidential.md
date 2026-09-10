@@ -19,15 +19,23 @@ queries, 20 PoW bits.
 Measured on Apple Silicon at tier 10: prove 22 s, proof 878 KB, verify 19 ms with a cached verifier
 key (the key itself costs 2.2 s once per program and is computed in the background).
 
-**Constraint set 2 (2026-09-10, upstream fix wave through `e6dbf38`).** The vendored zkVM now
-carries four soundness fixes: ALU padding rows can no longer provide a bus tuple with arbitrary
+**Constraint set 2 (2026-09-10, upstream fix wave through `f44d58f`).** The vendored zkVM now
+carries five soundness fixes: ALU padding rows can no longer provide a bus tuple with arbitrary
 multiplicity (previously `fib(10) = 999` was provable), never-written output slots are pinned to zero
-by `WRITTEN` accumulators, `verify` rejects non-canonical public values, and load/store word
-alignment is a stated constraint (the cpu table grew from 40 to 52 columns). Proofs made under the
+by `WRITTEN` accumulators, `verify` rejects non-canonical public values, load/store word
+alignment is a stated constraint (the cpu table grew from 40 to 52 columns), and a store's `mem_val`
+is pinned to the `rs2` value it writes — left unstated, a cheating witness could store a value that
+was never in any register and read it back through a later load as genuine memory contents. The
+prover also runs the emulator up to the largest tier's cycle budget rather than a hardcoded `1 << 20`,
+so `OutOfCycles` and `TooManyCycles` agree on one limit. Proofs made under the
 old constraints do not verify under the new ones, so a node built from this commit will fail the
 startup ledger replay of chain 4 at the first block with a confidential call (block 19) and truncate
 its chain. Treat this as a hard fork: start a new chain id, or run `--verify-chain off` on nodes that
 must keep serving the old chain.
+
+The `balance_check` guest also became carry-aware (a four-balance sum that wraps mod 2^32 now counts
+as over any 32-bit threshold), which changes its program id; `private_payment` is unchanged and keeps
+the id chain 4 has deployed.
 
 ## On-chain model
 
