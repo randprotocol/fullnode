@@ -306,6 +306,10 @@ async fn main() -> Result<()> {
             let amount: u128 = amount.parse().context("amount must be an integer of bridged units")?;
             let bridge_fee: u128 = bridge_fee.parse().context("bridge fee must be an integer of bridged units")?;
             let to = shrugg_client::hex32(&to).context("invalid destination")?;
+            // Screened here as well as in `RpcClient::bridge_burn`, so a
+            // typo is caught before any network round trip: a burn cannot
+            // be undone once it is signed and committed.
+            shrugg_client::check_burn_recipient(&to, to_chain).context("invalid destination")?;
             let fee = parse_amount(&fee)?;
             let hash = rpc.bridge_burn(&kp, asset, amount, to_chain, to, bridge_fee, fee).await?;
             println!("submitted burn {hash}\n  {amount} units of {asset} to chain {to_chain}, relayer fee {bridge_fee} units");

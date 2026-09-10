@@ -1005,6 +1005,15 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+
+    /// A well-formed EVM recipient: 12 zero bytes then 20 address bytes
+    /// (spec 3.5), the shape `BridgeState::check_burn` requires for the
+    /// EVM-family chains 2, 3 and 4.
+    fn evm_to() -> [u8; 32] {
+        let mut t = [0u8; 32];
+        t[12..].copy_from_slice(&[0x22u8; 20]);
+        t
+    }
     use super::fixtures::*;
     use super::*;
     use shrugg_core::confidential::StubExecutor;
@@ -1302,7 +1311,7 @@ mod tests {
 
             // Block 2: alice burns her whole fee back out to chain 2, and a
             // second attestation credits bob again.
-            let burn = Transaction::bridge_burn(&alice, 1, 1, asset, 10, 2, [0x22; 32], 1, 1);
+            let burn = Transaction::bridge_burn(&alice, 1, 1, asset, 10, 2, evm_to(), 1, 1);
             let att2 = Transaction::bridge_attest(&alice, 1, 2, attestation(1, &bob.address(), 500, 0), 1);
             ledger.set_height(2);
             let b2 = make_block(&b1.block, &mut ledger, vec![burn.clone(), att2.clone()], &alice);

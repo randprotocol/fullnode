@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::bridge::{
-    asset_id, digest, verify, Attestation, Body, GuardianKey, GuardianSet, Payload, Transfer,
-    VerifyError, AssetId, CHAIN_RAND, GOVERNANCE_EMITTER, GUARDIAN_GRACE_SECS,
+    asset_id, digest, verify_decoded, Attestation, Body, GuardianKey, GuardianSet, Payload,
+    Transfer, VerifyError, AssetId, CHAIN_RAND, GOVERNANCE_EMITTER, GUARDIAN_GRACE_SECS,
 };
 use crate::crypto::{merkle_root, Address, Hash};
 
@@ -91,6 +91,9 @@ pub struct BridgeState {
     pub assets: BTreeMap<AssetId, (u16, [u8; 32])>,
     pub spent: BTreeSet<Hash>,
     pub burn_sequence: u64,
+    /// Every outbound burn message ever emitted, held whole in memory and
+    /// cloned on every speculative block execution: known linear growth,
+    /// to be drained into storage per block before ~100k burns (spec 6.3).
     pub burns: BTreeMap<u64, BridgeBurnRecord>,
 }
 
@@ -133,6 +136,8 @@ pub enum BridgeError {
     AmountOverflow,
     #[error("amount is zero")]
     ZeroAmount,
+    #[error("recipient is unusable on the destination chain")]
+    BadRecipient,
     #[error("undecodable payload")]
     BadPayload,
     #[error("attestation already consumed")]
@@ -284,14 +289,17 @@ impl BridgeState {
         submitter: Address,
         now: u64,
     ) -> Result<(Attestation, [u8; 32], Payload), BridgeError> {
-        let index = Attestation::decode(bytes)
-            .map_err(VerifyError::Codec)?
-            .guardian_set_index;
+        // One decode for the whole check: the envelope is parsed here and
+        // the already-decoded value handed to `verify_decoded`, which
+        // hashes the wire body bytes rather than a re-encoding.
+        let att = Attestation::decode(bytes).map_err(VerifyError::Codec)?;
+        let body_bytes = Attestation::body_bytes(bytes).map_err(VerifyError::Codec)?;
+        let index = att.guardian_set_index;
         let set = self
             .guardian_sets
             .get(&index)
             .ok_or(VerifyError::UnknownGuardianSet(index))?;
-        let (att, mu) = verify(bytes, set, now)?;
+        let mu = verify_decoded(&att, body_bytes, set, now)?;
         let payload = Payload::decode(&att.body.payload).map_err(|_| BridgeError::BadPayload)?;
         match &payload {
             Payload::Transfer(t) => {
@@ -309,6 +317,11 @@ impl BridgeState {
                 if fee > amount {
                     return Err(BridgeError::FeeExceedsAmount);
                 }
+                // Symmetry with `check_burn`: a zero-value mint consumes a
+                // digest and moves nothing, so refuse it outright.
+                if amount == 0 {
+                    return Err(BridgeError::ZeroAmount);
+                }
                 self.transfer_credits(
                     &asset_id(t.token_chain, &t.token_address),
                     Address(t.to),
@@ -322,6 +335,16 @@ impl BridgeState {
                     != (CHAIN_RAND, GOVERNANCE_EMITTER)
                 {
                     return Err(BridgeError::WrongEmitter);
+                }
+                // A rotation must be signed by the set it replaces. The
+                // grace window (spec 3.4) exists so in-flight *transfers*
+                // signed by a just-superseded set are not stranded; letting
+                // it also cover payload 2 would let a superseded set —
+                // exactly the set a rotation may be running away from —
+                // rotate the bridge again for a whole day. Parity with the
+                // Solana program and the EVM contracts.
+                if att.guardian_set_index != self.current_set {
+                    return Err(BridgeError::Verify(VerifyError::SetExpired));
                 }
                 let expected = self.current_set.saturating_add(1);
                 if g.new_index != expected {
@@ -396,19 +419,34 @@ impl BridgeState {
     }
 
     /// Validates an outbound burn: the asset must be registered, `to_chain`
-    /// must be the asset's home chain, `fee <= amount`, and `from` must
-    /// hold at least `amount`.
+    /// must be the asset's home chain, `to` must be a usable recipient on
+    /// that chain, `fee <= amount`, and `from` must hold at least
+    /// `amount`.
     pub fn check_burn(
         &self,
         from: &Address,
         asset: &AssetId,
         amount: u128,
         to_chain: u16,
+        to: &[u8; 32],
         fee: u128,
     ) -> Result<(), BridgeError> {
         let (token_chain, _) = self.assets.get(asset).ok_or(BridgeError::UnknownAsset)?;
         if to_chain != *token_chain {
             return Err(BridgeError::WrongTokenChain);
+        }
+        // The burn is one-way and irreversible once the message is signed,
+        // so screen the recipient here rather than leaving the source
+        // contract to reject the release: a zero recipient is unspendable
+        // everywhere, and on an EVM/TVM chain (2, 3, 4) `to` is a 20-byte
+        // address left-padded to 32 (spec 3.5) — a non-zero upper 12 bytes
+        // means the address was built for a different address space and
+        // `RandBridgeBase._recipient` would revert `BadRecipient`.
+        if to == &[0u8; 32] {
+            return Err(BridgeError::BadRecipient);
+        }
+        if matches!(to_chain, 2 | 3 | 4) && to[..12] != [0u8; 12] {
+            return Err(BridgeError::BadRecipient);
         }
         if fee > amount {
             return Err(BridgeError::FeeExceedsAmount);
@@ -442,7 +480,7 @@ impl BridgeState {
         height: u64,
         timestamp: u32,
     ) -> Result<BridgeBurnRecord, BridgeError> {
-        self.check_burn(&from, &asset, amount, to_chain, fee)?;
+        self.check_burn(&from, &asset, amount, to_chain, &to, fee)?;
         let (token_chain, token_address) = self.assets[&asset];
         let remaining = self.balance(&asset, &from) - amount;
         if remaining == 0 {
@@ -612,6 +650,18 @@ mod tests {
         Keypair::from_seed([n; 32]).unwrap()
     }
 
+    /// A well-formed EVM recipient: 12 zero bytes then 20 address bytes
+    /// (spec 3.5), the shape `check_burn` requires for chains 2, 3 and 4.
+    const EVM_TO: [u8; 32] = {
+        let mut t = [0u8; 32];
+        let mut i = 12;
+        while i < 32 {
+            t[i] = 0x22;
+            i += 1;
+        }
+        t
+    };
+
     /// Six guardian secrets plus a config with emitter `[1; 32]` and the
     /// four source chains registered as `{2: [2; 32], .., 5: [5; 32]}`.
     fn cfg() -> (BridgeConfig, Vec<[u8; 32]>) {
@@ -744,7 +794,7 @@ mod tests {
             .unwrap();
         let asset = asset_id(2, &[0xaa; 32]);
         let rec = st
-            .apply_burn(key(1).address(), asset, 400, 2, [0x22; 32], 5, Hash::ZERO, 12, 1_700)
+            .apply_burn(key(1).address(), asset, 400, 2, EVM_TO, 5, Hash::ZERO, 12, 1_700)
             .unwrap();
         assert_eq!(rec.sequence, 0);
         assert_eq!(st.burn_sequence, 1);
@@ -767,25 +817,25 @@ mod tests {
                 assert_eq!(t.fee_u128(), Some(5));
                 assert_eq!(
                     (t.token_chain, t.token_address, t.to_chain, t.to),
-                    (2, [0xaa; 32], 2, [0x22; 32])
+                    (2, [0xaa; 32], 2, EVM_TO)
                 );
             }
             _ => panic!(),
         }
         assert_eq!(rec.digest, digest(&rec.body));
         assert_eq!(
-            st.check_burn(&key(1).address(), &asset, 601, 2, 0).unwrap_err(),
+            st.check_burn(&key(1).address(), &asset, 601, 2, &EVM_TO, 0).unwrap_err(),
             BridgeError::InsufficientAsset {
                 have: 600,
                 need: 601
             }
         );
         assert_eq!(
-            st.check_burn(&key(1).address(), &asset, 1, 3, 0).unwrap_err(),
+            st.check_burn(&key(1).address(), &asset, 1, 3, &EVM_TO, 0).unwrap_err(),
             BridgeError::WrongTokenChain
         );
         assert_eq!(
-            st.check_burn(&key(1).address(), &Hash::ZERO, 1, 2, 0).unwrap_err(),
+            st.check_burn(&key(1).address(), &Hash::ZERO, 1, 2, &EVM_TO, 0).unwrap_err(),
             BridgeError::UnknownAsset
         );
     }
@@ -798,7 +848,7 @@ mod tests {
         let mut st = BridgeState::from_config(&c);
         st.apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 7, 1)), key(9).address(), 1)
             .unwrap();
-        st.apply_burn(key(1).address(), asset_id(2, &[0xaa; 32]), 400, 2, [0x22; 32], 5, Hash::ZERO, 12, 1_700)
+        st.apply_burn(key(1).address(), asset_id(2, &[0xaa; 32]), 400, 2, EVM_TO, 5, Hash::ZERO, 12, 1_700)
             .unwrap();
         st.apply_attest(&attest(&s, 0, upgrade_body(1, vec![[7u8; 20], [8u8; 20]])), key(9).address(), 1)
             .unwrap();
@@ -878,7 +928,7 @@ mod tests {
         let minted_root = st.root();
         assert_ne!(minted_root, empty_root);
         let asset = asset_id(2, &[0xaa; 32]);
-        st.apply_burn(key(1).address(), asset, 400, 2, [0x22; 32], 0, Hash::ZERO, 12, 1_700)
+        st.apply_burn(key(1).address(), asset, 400, 2, EVM_TO, 0, Hash::ZERO, 12, 1_700)
             .unwrap();
         let burned_root = st.root();
         assert_ne!(burned_root, minted_root);
@@ -983,17 +1033,142 @@ mod tests {
             .unwrap();
         let asset = asset_id(2, &[0xaa; 32]);
         assert_eq!(
-            st.check_burn(&key(1).address(), &asset, 0, 2, 0).unwrap_err(),
+            st.check_burn(&key(1).address(), &asset, 0, 2, &EVM_TO, 0).unwrap_err(),
             BridgeError::ZeroAmount
         );
         assert_eq!(
-            st.apply_burn(key(1).address(), asset, 0, 2, [0x22; 32], 0, Hash::ZERO, 1, 1_700)
+            st.apply_burn(key(1).address(), asset, 0, 2, EVM_TO, 0, Hash::ZERO, 1, 1_700)
                 .unwrap_err(),
             BridgeError::ZeroAmount
         );
         assert_eq!(st.burn_sequence, 0);
         assert!(st.burns.is_empty());
         assert_eq!(st.balance(&asset, &key(1).address()), 1_000);
+    }
+
+    /// Spec 3.4/3.6: the grace window covers transfer payloads only. A
+    /// payload-2 rotation must additionally carry
+    /// `guardian_set_index == current_set`, so a set that has already been
+    /// superseded cannot rotate the bridge again while its grace period
+    /// runs. Parity with the Solana program and the EVM contracts.
+    #[test]
+    fn guardian_upgrade_must_be_signed_by_the_current_set() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        // Set 1 = guardians 2..=6 plus a 7th key, so `&s[1..]` signs for it
+        // with indices 0..=4 exactly as `attest` lays them out.
+        let set1_keys: Vec<GuardianKey> = s[1..]
+            .iter()
+            .map(guardian_address)
+            .chain([guardian_address(&[7; 32])])
+            .collect();
+        st.apply_attest(
+            &attest(&s, 0, upgrade_body(1, set1_keys.clone())),
+            key(9).address(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(st.current_set, 1);
+        // Set 0 is superseded but still inside its grace window ...
+        assert!(st.guardian_sets[&0].expires_at > 100);
+        let set2_keys: Vec<GuardianKey> = (10u8..=15).map(|i| [i; 20]).collect();
+        // ... which buys it nothing on a rotation.
+        assert_eq!(
+            st.check_attest(
+                &attest(&s, 0, upgrade_body(2, set2_keys.clone())),
+                key(9).address(),
+                100
+            )
+            .unwrap_err(),
+            BridgeError::Verify(VerifyError::SetExpired)
+        );
+        // The very same upgrade signed by the current set is accepted.
+        assert_eq!(
+            st.apply_attest(
+                &attest(&s[1..], 1, upgrade_body(2, set2_keys.clone())),
+                key(9).address(),
+                100
+            )
+            .unwrap(),
+            AttestOutcome::GuardianSetUpgraded(2)
+        );
+        assert_eq!(st.current_set, 2);
+        assert_eq!(st.guardian_sets[&2].keys, set2_keys);
+        // Transfers, by contrast, still ride the grace window (spec 3.4).
+        assert!(st
+            .check_attest(
+                &attest(&s, 0, transfer_body(2, 1, 0, 1)),
+                key(9).address(),
+                100
+            )
+            .is_ok());
+    }
+
+    /// Symmetry with `check_burn`: a zero-value mint would consume a digest
+    /// and move nothing.
+    #[test]
+    fn zero_amount_transfer_is_rejected() {
+        let (c, s) = cfg();
+        let st = BridgeState::from_config(&c);
+        assert_eq!(
+            st.check_attest(&attest(&s, 0, transfer_body(2, 0, 0, 1)), key(9).address(), 1)
+                .unwrap_err(),
+            BridgeError::ZeroAmount
+        );
+        // ... and a non-zero amount over the same path still validates.
+        assert!(st
+            .check_attest(&attest(&s, 0, transfer_body(2, 1, 0, 1)), key(9).address(), 1)
+            .is_ok());
+    }
+
+    /// A burn is irreversible once guardians sign it, so an unspendable
+    /// recipient is refused before the message exists rather than left for
+    /// the source contract to reject.
+    #[test]
+    fn burn_rejects_zero_and_wrongly_shaped_recipients() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        st.apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 0, 1)), key(9).address(), 1)
+            .unwrap();
+        // A chain-5 (Solana) asset, to prove the upper-12-bytes rule is
+        // scoped to the EVM-family chains.
+        st.assets.insert(asset_id(5, &[0xbb; 32]), (5, [0xbb; 32]));
+        st.balances
+            .insert((asset_id(5, &[0xbb; 32]), key(1).address()), 1_000);
+
+        let evm = asset_id(2, &[0xaa; 32]);
+        let sol = asset_id(5, &[0xbb; 32]);
+        let holder = key(1).address();
+
+        // Zero recipient: unspendable on every chain.
+        assert_eq!(
+            st.check_burn(&holder, &evm, 1, 2, &[0u8; 32], 0).unwrap_err(),
+            BridgeError::BadRecipient
+        );
+        assert_eq!(
+            st.check_burn(&holder, &sol, 1, 5, &[0u8; 32], 0).unwrap_err(),
+            BridgeError::BadRecipient
+        );
+        // Dirty upper 12 bytes on an EVM-family chain (2, 3, 4).
+        let mut dirty = EVM_TO;
+        dirty[11] = 1;
+        assert_eq!(
+            st.check_burn(&holder, &evm, 1, 2, &dirty, 0).unwrap_err(),
+            BridgeError::BadRecipient
+        );
+        // A full 32-byte Solana pubkey is fine on chain 5.
+        assert!(st.check_burn(&holder, &sol, 1, 5, &[0x22u8; 32], 0).is_ok());
+        // ... and a left-padded address is fine on chain 2.
+        assert!(st.check_burn(&holder, &evm, 1, 2, &EVM_TO, 0).is_ok());
+        // `apply_burn` refuses it too and records nothing.
+        assert_eq!(
+            st.apply_burn(holder, evm, 1, 2, dirty, 0, Hash::ZERO, 1, 1_700)
+                .unwrap_err(),
+            BridgeError::BadRecipient
+        );
+        assert_eq!(st.burn_sequence, 0);
+        assert!(st.burns.is_empty());
+        assert_eq!(st.balance(&evm, &holder), 1_000);
     }
 
     /// Golden vector for the spec 6.3 commitment. Changing this hash changes

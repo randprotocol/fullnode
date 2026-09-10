@@ -229,6 +229,30 @@ pub struct AssetHolding {
     pub balance: u128,
 }
 
+/// Screens a burn recipient the way `BridgeState::check_burn` does, so the
+/// wallet says why before it signs rather than letting the node reject the
+/// transaction (a burn is irreversible once it lands).
+///
+/// A zero recipient is unspendable on every chain; on the EVM-family
+/// chains (2 Ethereum, 3 BSC, 4 Tron) `to` is a 20-byte address left-padded
+/// to 32 bytes (spec 3.5), so anything in the upper 12 bytes means the
+/// value was built for a different address space. Solana (5) uses the full
+/// 32 bytes.
+pub fn check_burn_recipient(to: &[u8; 32], to_chain: u16) -> Result<()> {
+    if to == &[0u8; 32] {
+        return Err(anyhow!("destination is all zeroes: nothing on chain {to_chain} could ever spend it"));
+    }
+    if matches!(to_chain, 2 | 3 | 4) && to[..12] != [0u8; 12] {
+        return Err(anyhow!(
+            "chain {to_chain} takes a 20-byte address left-padded to 32 bytes, but {} has a non-zero upper 12 bytes; \
+             pass 000000000000000000000000{}",
+            hex::encode(to),
+            hex::encode(&to[12..])
+        ));
+    }
+    Ok(())
+}
+
 /// A 32-byte value as 64 hex characters, with or without `0x`.
 pub fn hex32(s: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s)).with_context(|| format!("{s:?} is not hex"))?;
@@ -310,6 +334,9 @@ impl RpcClient {
         bridge_fee: u128,
         fee: u128,
     ) -> Result<Hash> {
+        // Before anything is signed or sent: an unspendable recipient is a
+        // one-way loss the node would reject anyway.
+        check_burn_recipient(&to, to_chain)?;
         let chain_id = self.chain_id().await?;
         let acct = self.account(&key.address()).await?;
         if acct.balance < fee {
@@ -321,5 +348,42 @@ impl RpcClient {
         }
         let tx = Transaction::bridge_burn(key, chain_id, acct.nonce, asset, amount, to_chain, to, bridge_fee, fee);
         self.send_transaction(&tx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wallet screens a burn recipient before signing, with the same
+    /// rule the ledger applies (`BridgeState::check_burn`).
+    #[test]
+    fn burn_recipient_is_screened_before_signing() {
+        let mut evm = [0u8; 32];
+        evm[12..].copy_from_slice(&[0x22u8; 20]);
+
+        // Left-padded EVM addresses are fine on 2, 3 and 4 ...
+        for chain in [2u16, 3, 4] {
+            check_burn_recipient(&evm, chain).unwrap();
+        }
+        // ... and Solana takes the full 32 bytes.
+        check_burn_recipient(&[0x22u8; 32], 5).unwrap();
+
+        // Zero is refused everywhere.
+        for chain in [2u16, 3, 4, 5] {
+            let err = check_burn_recipient(&[0u8; 32], chain).unwrap_err().to_string();
+            assert!(err.contains("all zeroes"), "{err}");
+        }
+        // A dirty upper 12 bytes is refused on the EVM-family chains, and
+        // the error names the padded form the user probably meant.
+        let mut dirty = evm;
+        dirty[11] = 1;
+        for chain in [2u16, 3, 4] {
+            let err = check_burn_recipient(&dirty, chain).unwrap_err().to_string();
+            assert!(err.contains("upper 12 bytes"), "{err}");
+            assert!(err.contains(&format!("000000000000000000000000{}", hex::encode(&dirty[12..]))), "{err}");
+        }
+        // ... but not on Solana, where all 32 bytes are the address.
+        check_burn_recipient(&dirty, 5).unwrap();
     }
 }

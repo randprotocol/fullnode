@@ -50,6 +50,8 @@ pub enum TxError {
     InsufficientForEffect { have: u128, need: u128 },
     #[error("mint of {amount} exceeds faucet cap {cap}")]
     MintTooLarge { amount: u128, cap: u128 },
+    #[error("attestation exceeds {} bytes", gas::MAX_ATTESTATION_BYTES)]
+    AttestationTooLarge,
     #[error("bridge: {0}")]
     Bridge(#[from] BridgeError),
 }
@@ -277,13 +279,21 @@ impl Ledger {
                 Ok(Some(self.check_call(tx, program, proof, recipients, executor)?))
             }
             TxKind::BridgeAttest { attestation } => {
+                // Size first, before a byte of it is parsed or a signature
+                // recovered: an attestation is bounded by its own format
+                // (a guardian set is at most 255 keys), so anything past
+                // the cap is malformed by construction and must not be
+                // allowed to buy verification work with a zero fee.
+                if attestation.len() > gas::MAX_ATTESTATION_BYTES {
+                    return Err(TxError::AttestationTooLarge);
+                }
                 let bridge = self.bridge.as_ref().ok_or(BridgeError::Disabled)?;
                 bridge.check_attest(attestation, sender, self.now_secs())?;
                 Ok(None)
             }
-            TxKind::BridgeBurn { asset, amount, to_chain, fee, .. } => {
+            TxKind::BridgeBurn { asset, amount, to_chain, to, fee } => {
                 let bridge = self.bridge.as_ref().ok_or(BridgeError::Disabled)?;
-                bridge.check_burn(&sender, asset, *amount, *to_chain, *fee)?;
+                bridge.check_burn(&sender, asset, *amount, *to_chain, to, *fee)?;
                 Ok(None)
             }
         }
@@ -431,6 +441,17 @@ impl Ledger {
         }
         // Time only constrains validity where it is consensus input, so a
         // chain without a bridge keeps byte-identical validity rules.
+        //
+        // `<`, not `<=`: this rule forbids a *rewind*, not a repeat.
+        // Equal timestamps are legal (spec 6.3) because two blocks can
+        // honestly land inside the same millisecond, and because a
+        // proposer sets `max(now, parent)` — making equality invalid would
+        // stall a chain whose clock has not ticked. The cost is the
+        // residual in spec 8: a colluding 2/3 of leaders can hold
+        // `timestamp_ms` constant, which freezes outbound burn timestamps
+        // and keeps a superseded guardian set inside its grace window
+        // indefinitely. That is a liveness-grade quorum failure, not a
+        // rule this comparison can rule out.
         if self.bridge.is_some() && block.header.timestamp_ms < self.timestamp_ms {
             return Err(BlockError::TimestampRewind { parent: self.timestamp_ms, block: block.header.timestamp_ms });
         }
@@ -499,6 +520,15 @@ pub fn default_executor() -> StubExecutor {
 
 #[cfg(test)]
 mod tests {
+
+    /// A well-formed EVM recipient: 12 zero bytes then 20 address bytes
+    /// (spec 3.5), the shape `BridgeState::check_burn` requires for the
+    /// EVM-family chains 2, 3 and 4.
+    fn evm_to() -> [u8; 32] {
+        let mut t = [0u8; 32];
+        t[12..].copy_from_slice(&[0x22u8; 20]);
+        t
+    }
     use super::*;
     use crate::bridge::{
         asset_id, digest, guardian_address, sign_digest, Attestation, Body, BridgeConfig, BridgeState, GuardianKey,
@@ -788,7 +818,7 @@ mod tests {
         assert_eq!(l.balance(&proposer), 1);
         assert_eq!(l.nonce(&alice.address()), 1);
 
-        let burn = Transaction::bridge_burn(&alice, 1, 1, asset, 400, 2, [0x22; 32], 5, 1);
+        let burn = Transaction::bridge_burn(&alice, 1, 1, asset, 400, 2, evm_to(), 5, 1);
         l.set_timestamp_ms(1_700_000);
         l.apply_tx(&burn, &proposer, &StubExecutor).unwrap();
         assert_eq!(l.asset_balance(&asset, &alice.address()), 600);
@@ -798,6 +828,26 @@ mod tests {
         assert_eq!(rec.height, 0);
         // the burn message carries the block time in unix seconds
         assert_eq!(Body::decode(&rec.body).unwrap().timestamp, 1_700);
+    }
+
+    /// The size gate runs before anything is decoded, so an oversized blob
+    /// cannot buy decode and signature-recovery work at a zero fee.
+    #[test]
+    fn oversized_attestation_is_rejected_before_verification() {
+        let (mut l, _, alice, proposer) = bridged();
+        let too_big = vec![1u8; gas::MAX_ATTESTATION_BYTES + 1];
+        let tx = Transaction::bridge_attest(&alice, 1, 0, too_big, 0);
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::AttestationTooLarge));
+        assert_eq!(l.apply_tx(&tx, &proposer, &StubExecutor), Err(TxError::AttestationTooLarge));
+        assert_eq!(l.nonce(&alice.address()), 0, "a rejected tx costs nothing");
+
+        // One byte smaller clears the gate and is judged on its contents:
+        // still garbage, but now by the verifier rather than by the length.
+        let at_limit = vec![1u8; gas::MAX_ATTESTATION_BYTES];
+        let tx = Transaction::bridge_attest(&alice, 1, 0, at_limit, 0);
+        let err = l.validate(&tx, &StubExecutor).unwrap_err();
+        assert_ne!(err, TxError::AttestationTooLarge, "{err:?}");
+        assert!(matches!(err, TxError::Bridge(BridgeError::Verify(_))), "{err:?}");
     }
 
     #[test]
@@ -811,14 +861,14 @@ mod tests {
         .unwrap();
         let asset = asset_id(2, &[0xaa; 32]);
         let before = l.bridge().unwrap().clone();
-        let unknown = Transaction::bridge_burn(&alice, 1, 1, Hash::digest(b"nope"), 1, 2, [0x22; 32], 0, 0);
+        let unknown = Transaction::bridge_burn(&alice, 1, 1, Hash::digest(b"nope"), 1, 2, evm_to(), 0, 0);
         assert_eq!(l.validate(&unknown, &StubExecutor), Err(TxError::Bridge(BridgeError::UnknownAsset)));
-        let too_much = Transaction::bridge_burn(&alice, 1, 1, asset, 1_001, 2, [0x22; 32], 0, 0);
+        let too_much = Transaction::bridge_burn(&alice, 1, 1, asset, 1_001, 2, evm_to(), 0, 0);
         assert_eq!(
             l.apply_tx(&too_much, &proposer, &StubExecutor),
             Err(TxError::Bridge(BridgeError::InsufficientAsset { have: 1_000, need: 1_001 }))
         );
-        let wrong_chain = Transaction::bridge_burn(&alice, 1, 1, asset, 1, 3, [0x22; 32], 0, 0);
+        let wrong_chain = Transaction::bridge_burn(&alice, 1, 1, asset, 1, 3, evm_to(), 0, 0);
         assert_eq!(
             l.apply_tx(&wrong_chain, &proposer, &StubExecutor),
             Err(TxError::Bridge(BridgeError::WrongTokenChain))
@@ -927,6 +977,7 @@ mod tests {
             "replay",
             "unknown_set",
             "set_expired",
+            "stale_governance_set",
         ];
         let vectors = file["vectors"].as_array().expect("vectors array");
         let attestation_of = |v: &serde_json::Value| hex::decode(v["attestation"].as_str().expect("attestation")).expect("hex");
@@ -991,6 +1042,13 @@ mod tests {
                 "bad_payload" => BridgeError::BadPayload,
                 "replay" => BridgeError::Replay,
                 "set_expired" => BridgeError::Verify(VerifyError::SetExpired),
+                // A payload-2 rotation signed by a set that is inside its
+                // grace window but is no longer current: the grace window
+                // covers transfers only (spec 3.4/3.6). The ledger reports
+                // it as the same `SetExpired` the EVM contracts report as
+                // `GuardianSetExpired` — only accept/reject is normative
+                // across verifiers, not the error code.
+                "stale_governance_set" => BridgeError::Verify(VerifyError::SetExpired),
                 "unknown_set" => BridgeError::Verify(VerifyError::UnknownGuardianSet(
                     v["guardian_set_index"].as_u64().expect("guardian_set_index") as u32,
                 )),
@@ -1002,6 +1060,6 @@ mod tests {
         }
         // Exact: a vector that stops matching (a renamed `expect`, a changed
         // `verifier_chain`) must fail here rather than quietly go unchecked.
-        assert_eq!(checked, 19, "expected 19 ledger-level vectors on chain 1");
+        assert_eq!(checked, 21, "expected 21 ledger-level vectors on chain 1");
     }
 }

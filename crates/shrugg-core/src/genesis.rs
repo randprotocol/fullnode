@@ -199,6 +199,12 @@ fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
     if let Some((chain, _)) = cfg.emitters.iter().find(|(_, addr)| **addr == GOVERNANCE_EMITTER) {
         return bad(format!("emitter for chain {chain} is the governance emitter"));
     }
+    // A zero source emitter is never a real contract, and registering one
+    // would mean any attestation naming that chain with an all-zero
+    // `emitter_address` passes the emitter binding of spec 3.8.
+    if let Some((chain, _)) = cfg.emitters.iter().find(|(_, addr)| **addr == [0u8; 32]) {
+        return bad(format!("zero emitter address for chain {chain}"));
+    }
     Ok(())
 }
 
@@ -335,6 +341,10 @@ mod tests {
         assert!(
             bad(BridgeConfig { emitters: BTreeMap::from([(2u16, GOVERNANCE_EMITTER)]), ..bridge_cfg() })
                 .contains("governance")
+        );
+        assert!(
+            bad(BridgeConfig { emitters: BTreeMap::from([(2u16, [0u8; 32])]), ..bridge_cfg() })
+                .contains("zero emitter address for chain 2")
         );
         let mut ok = genesis(1);
         ok.bridge = Some(BridgeConfig { emitters: BTreeMap::from([(2u16, [7u8; 32])]), ..bridge_cfg() });

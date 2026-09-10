@@ -123,19 +123,29 @@ fn address_from_verifying_key(key: &VerifyingKey) -> GuardianKey {
     out
 }
 
-/// Full envelope check: decode, quorum/index rule, low-s, recover each
-/// signer, compare to the set. Returns `(attestation, digest)`.
-pub fn verify(
-    bytes: &[u8],
+/// The signature half of [`verify`], over an envelope that has already
+/// been decoded: set expiry, the quorum/index rule, low-s, recover each
+/// signer and compare to the set. Returns the digest `mu`.
+///
+/// `body_bytes` must be the *wire* body — the tail of the encoded
+/// envelope, as produced by [`Attestation::body_bytes`] — not a
+/// re-encoding of `att.body`. Hashing the bytes that were actually
+/// signed keeps the digest independent of any future re-encode.
+///
+/// Split out of `verify` so a caller that must inspect the envelope
+/// before verifying it (`BridgeState::check_attest` resolves the guardian
+/// set from `guardian_set_index`) decodes the attestation exactly once.
+pub fn verify_decoded(
+    att: &Attestation,
+    body_bytes: &[u8],
     set: &GuardianSet,
     now: u64,
-) -> Result<(Attestation, [u8; 32]), VerifyError> {
-    let att = Attestation::decode(bytes).map_err(VerifyError::Codec)?;
+) -> Result<[u8; 32], VerifyError> {
     if set.expires_at != 0 && now > set.expires_at {
         return Err(VerifyError::SetExpired);
     }
     check_indices(&att.signatures, set.keys.len()).map_err(VerifyError::Index)?;
-    let d = digest(&att.body.encode());
+    let d = digest(body_bytes);
     for sig in &att.signatures {
         if !is_low_s(&sig.s) {
             return Err(VerifyError::HighS(sig.index));
@@ -145,6 +155,22 @@ pub fn verify(
             return Err(VerifyError::WrongGuardian(sig.index));
         }
     }
+    Ok(d)
+}
+
+/// Full envelope check: decode, quorum/index rule, low-s, recover each
+/// signer, compare to the set. Returns `(attestation, digest)`.
+///
+/// A thin wrapper over [`verify_decoded`]: it decodes `bytes` once and
+/// hands the wire body straight through.
+pub fn verify(
+    bytes: &[u8],
+    set: &GuardianSet,
+    now: u64,
+) -> Result<(Attestation, [u8; 32]), VerifyError> {
+    let att = Attestation::decode(bytes).map_err(VerifyError::Codec)?;
+    let body_bytes = Attestation::body_bytes(bytes).map_err(VerifyError::Codec)?;
+    let d = verify_decoded(&att, body_bytes, set, now)?;
     Ok((att, d))
 }
 
@@ -346,9 +372,12 @@ mod tests {
                 other => panic!("{name}: unhandled expect {other}"),
             }
         }
-        assert!(
-            checked >= 10,
-            "expected at least 10 signature-level vectors, checked {checked}"
+        // Exact, not a lower bound: a vector that stops matching (a renamed
+        // `expect`, a case dropped from the generator) must fail here
+        // rather than quietly leave this test covering less than it did.
+        assert_eq!(
+            checked, 23,
+            "expected 23 signature-level vectors, checked {checked}"
         );
     }
 }

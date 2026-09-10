@@ -362,6 +362,15 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A well-formed EVM recipient: 12 zero bytes then 20 address bytes
+    /// (spec 3.5), the shape `BridgeState::check_burn` requires for the
+    /// EVM-family chains 2, 3 and 4.
+    fn evm_to() -> [u8; 32] {
+        let mut t = [0u8; 32];
+        t[12..].copy_from_slice(&[0x22u8; 20]);
+        t
+    }
     use super::*;
     use crate::storage::fixtures::{attestation, bridged_asset, bridged_genesis, genesis, key, make_block, TOKEN};
     use shrugg_core::genesis::GenesisState;
@@ -484,7 +493,7 @@ mod tests {
         ledger.set_timestamp_ms(1);
         ledger.set_height(2);
         let b1 = st.storage.block_by_height(1).unwrap().unwrap();
-        let burn = Transaction::bridge_burn(&bob, 1, 0, asset, 500, 2, [0x22; 32], 5, 0);
+        let burn = Transaction::bridge_burn(&bob, 1, 0, asset, 500, 2, evm_to(), 5, 0);
         let b2 = make_block(&b1, &mut ledger, vec![burn.clone()], &alice);
         st.storage.commit(std::slice::from_ref(&b2), &ledger).unwrap();
 
