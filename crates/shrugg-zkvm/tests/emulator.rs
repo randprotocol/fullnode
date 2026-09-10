@@ -73,3 +73,41 @@ fn branch_and_shift_sign_edge_cases() {
     a.label("end"); a.extend(write_output(0, 7)); a.extend(halt());
     assert_eq!(run(&a.assemble(), &[]).outputs[0], 0xffff_ffff);
 }
+
+
+#[test]
+fn alu_mix_covers_every_op_and_jalr() {
+    let p = guests::alu_mix();
+    let e = run(&p, &[]);
+    assert!(e.halted);
+
+    // Every AluOp variant really reaches the ALU bus, `Eq` included — it has no encoding of
+    // its own, so it can only arrive through a branch.
+    let mut seen = std::collections::HashSet::new();
+    for ev in &e.events { for a in &ev.alu { seen.insert(a.op); } }
+    for op in AluOp::ALL { assert!(seen.contains(&op), "{op:?} never executed"); }
+
+    // Exactly one JALR, through a register target, linking pc + 4 and skipping one word.
+    assert_eq!(e.events.iter().filter(|ev| ev.dec.is_jalr == 1).count(), 1);
+    let j = e.events.iter().find(|ev| ev.dec.is_jalr == 1).unwrap();
+    assert_eq!(j.c, j.pc + 4, "jalr links pc + 4");
+    assert_eq!(j.next_pc, j.pc + 8, "jalr jumps over the instruction after it");
+
+    // out0 is the XOR fold of every result, recomputed here straight from the reference
+    // semantics rather than copied out of a run.
+    let (x, y) = (0xdead_beefu32, 0x0f0f_1234u32);
+    let folded: [(AluOp, u32, u32); 14] = [
+        (AluOp::Add, x, y), (AluOp::Sub, x, y), (AluOp::And, x, y), (AluOp::Or, x, y), (AluOp::Xor, x, y),
+        (AluOp::Sll, y, 12), (AluOp::Srl, x, 12), (AluOp::Sra, x, 12),
+        (AluOp::Sll, y, 20), (AluOp::Srl, x, 24), (AluOp::Sra, x, 31),
+        (AluOp::And, x, 0xffff_ff00), (AluOp::Or, x, 0x7ff), (AluOp::Xor, x, 0xffff_ffff),
+    ];
+    let acc = folded.iter().fold(0u32, |a, (op, l, r)| a ^ op.eval(*l, *r)) ^ j.c;
+    assert_eq!(e.outputs[0], acc);
+    assert_eq!(e.outputs[0], 0xd11c_8282);
+
+    // out1 counts the six compares: signed x < y, unsigned y < x, x < -1, y < ~0 — four.
+    // The `bad` and `skipped` arms both write 0x7ff, so 4 also proves neither ran.
+    assert_eq!(e.outputs[1], 4);
+    assert_eq!(e.outputs[2..], [0; 6]);
+}

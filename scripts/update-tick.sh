@@ -3,7 +3,7 @@
 # Prints "up-to-date" or "updated <old> -> <new>"; exits non-zero on build failure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-git fetch origin main >/dev/null 2>&1
+git fetch origin main >/dev/null 2>&1 || { echo "fetch failed (transient network?); skipping this tick"; exit 0; }
 LOCAL=$(git rev-parse HEAD)
 # .update-pin holds a commit to stay on (e.g. during a coordinated hard fork);
 # remove the file to resume tracking origin/main.

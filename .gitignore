@@ -5,3 +5,4 @@
 *.key.json
 !deploy/*.key.json
 .git-rev
+bin-b00bc72/
