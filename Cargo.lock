@@ -3722,6 +3722,7 @@ dependencies = [
  "serde_json",
  "shrugg-core",
  "shrugg-zkvm",
+ "tempfile",
  "tokio",
 ]
 

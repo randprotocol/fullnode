@@ -20,3 +20,6 @@ serde_json = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

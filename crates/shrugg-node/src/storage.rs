@@ -232,9 +232,16 @@ impl Storage {
     /// than seeking: bridged holdings are few, and the alternative (a second
     /// index keyed the other way round) would be state to keep consistent.
     pub fn assets_of(&self, addr: &Address) -> Result<Vec<(AssetId, u16, [u8; 32], u128)>> {
-        let Some(meta) = self.bridge_meta()? else { return Ok(Vec::new()) };
+        // One snapshot for the registry and the balances: a commit landing
+        // between the two reads could otherwise show a balance whose asset was
+        // registered by that same commit, which reads as corruption below.
+        let snap = self.db.snapshot();
+        let raw = snap.get_cf(self.cf(CF_META), META_BRIDGE_STATE.as_bytes())?;
+        let Some(meta) = raw.map(|b| bincode::deserialize::<BridgeMeta>(&b)).transpose()? else {
+            return Ok(Vec::new());
+        };
         let mut out = Vec::new();
-        for item in self.db.iterator_cf(self.cf(CF_BRIDGE_BALANCES), IteratorMode::Start) {
+        for item in snap.iterator_cf(self.cf(CF_BRIDGE_BALANCES), IteratorMode::Start) {
             let (k, v) = item?;
             let (asset, holder) = split_balance_key(k.as_ref())?;
             if holder != *addr {
@@ -482,11 +489,22 @@ impl Storage {
                             StorageError::Corrupt(format!("committed attestation does not decode: {e:?}"))
                         })?;
                         spent_digests.insert(Hash(shrugg_core::bridge::digest(&att.body.encode())));
-                        // A guardian-set upgrade moves no balances.
-                        if let Ok(Payload::Transfer(t)) = Payload::decode(&att.body.payload) {
-                            let asset = asset_id(t.token_chain, &t.token_address);
-                            bridge_touched.insert((asset, Address(t.to)));
-                            bridge_touched.insert((asset, tx.sender()));
+                        match Payload::decode(&att.body.payload) {
+                            Ok(Payload::Transfer(t)) => {
+                                let asset = asset_id(t.token_chain, &t.token_address);
+                                bridge_touched.insert((asset, Address(t.to)));
+                                bridge_touched.insert((asset, tx.sender()));
+                            }
+                            // A guardian-set upgrade moves no balances.
+                            Ok(Payload::GuardianSetUpgrade(_)) => {}
+                            // Same reasoning as the attestation above: this
+                            // decoded once already, so failing now is a torn
+                            // block. Skipping it would write no balance rows
+                            // and leave disk disagreeing with memory.
+                            Err(e) => {
+                                let m = format!("committed attestation payload does not decode: {e:?}");
+                                return Err(StorageError::Corrupt(m));
+                            }
                         }
                     }
                     TxKind::BridgeBurn { asset, .. } => {
@@ -940,8 +958,35 @@ pub(crate) mod fixtures {
         shrugg_core::bridge::asset_id(2, &TOKEN)
     }
 
+    /// A well-formed, correctly signed envelope wrapping a payload whose id
+    /// byte no version of the codec knows: the envelope decodes, the payload
+    /// does not.
+    pub(crate) fn attestation_with_undecodable_payload() -> Vec<u8> {
+        use shrugg_core::bridge::{digest, sign_digest, Attestation, Body};
+        let body = Body {
+            timestamp: 0,
+            nonce: 0,
+            emitter_chain: 2,
+            emitter_address: SOURCE_EMITTER,
+            sequence: 7,
+            consistency_level: 0,
+            payload: vec![0xff; 40],
+        };
+        let d = digest(&body.encode());
+        let secrets = guardian_secrets();
+        let signatures = (0..3u8).map(|i| sign_digest(&secrets[i as usize], i, &d)).collect();
+        Attestation { guardian_set_index: 0, signatures, body }.encode()
+    }
+
     pub(crate) fn make_block(parent: &Block, ledger: &mut Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
         ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
+        make_block_unchecked(parent, ledger, txs, k)
+    }
+
+    /// `make_block` without executing the transactions: the only way to build a
+    /// block carrying a transaction the ledger would have rejected, which is
+    /// what a torn block on disk looks like.
+    pub(crate) fn make_block_unchecked(parent: &Block, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
         let header = BlockHeader {
             height: parent.height() + 1,
             view: parent.view() + 1,
@@ -1206,6 +1251,28 @@ mod tests {
     /// The whole point of the bridge column families: whatever the ledger
     /// holds after a commit is what `load_ledger` gives back, across a reopen,
     /// and `truncate_to` puts it back to the genesis bridge state.
+    #[test]
+    fn a_committed_attestation_with_an_undecodable_payload_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let gs = bridged_genesis(1);
+        let alice = key(1);
+        let s = Storage::open(dir.path()).unwrap();
+        s.init_genesis(&gs).unwrap();
+
+        // Admission decoded this payload once, so a commit that cannot is a
+        // torn block. Treating it as "moves no balances" would write no rows
+        // and leave the snapshot disagreeing with the ledger.
+        let tx = Transaction::bridge_attest(&alice, 1, 0, attestation_with_undecodable_payload(), 1);
+        let cb = make_block_unchecked(&gs.block, &gs.ledger, vec![tx], &alice);
+        let err = s
+            .commit(std::slice::from_ref(&cb), &gs.ledger)
+            .expect_err("a payload that does not decode must not commit");
+        assert!(
+            matches!(&err, StorageError::Corrupt(m) if m.contains("payload does not decode")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn bridge_state_round_trips_through_commit_reopen_and_truncate() {
         let dir = tempfile::tempdir().unwrap();
