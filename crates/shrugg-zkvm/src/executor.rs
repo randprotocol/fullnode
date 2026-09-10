@@ -5,7 +5,7 @@
 //! are therefore cached per (program, tier).
 
 use crate::isa::{Instr, Program};
-use crate::machine::{chips, Config, FriProfile, Machine, Proof, Tier, Val, TIERS};
+use crate::machine::{chips, Backend, Config, FriProfile, Machine, Proof, Tier, Val, TIERS};
 use crate::tables::cpu::pv;
 use p3_batch_stark::{verify_batch, CommonData};
 use p3_field::PrimeCharacteristicRing;
@@ -125,8 +125,21 @@ pub fn zk_code_hash(profile: FriProfile, program: &Program) -> String {
 }
 
 /// Prover entry point for the wallet and tests. Returns (proof bytes, outputs, tier).
-pub fn prove(profile: FriProfile, program: &Program, inputs: &[u32], tier: Option<u8>) -> Result<(Vec<u8>, [u32; 8], u8), String> {
+///
+/// `backend` picks the prover implementation: `Backend::Cpu` always exists, the GPU and
+/// reference backends only in builds that enabled their feature. Every backend produces a proof
+/// the ordinary CPU verifier accepts, so nothing downstream of here changes with it. There is no
+/// fallback: a backend that cannot start (no driver, no PTX) is an error, not a silent CPU run.
+pub fn prove(
+    profile: FriProfile,
+    program: &Program,
+    inputs: &[u32],
+    tier: Option<u8>,
+    backend: Backend,
+) -> Result<(Vec<u8>, [u32; 8], u8), String> {
     let m = Machine::new(profile);
-    let (proof, exec) = m.prove(program, inputs, tier.map(|t| Tier(t as usize))).map_err(|e| format!("{e:?}"))?;
+    let (proof, exec) = m
+        .prove_with(backend, program, inputs, tier.map(|t| Tier(t as usize)))
+        .map_err(|e| format!("{e:?}"))?;
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }

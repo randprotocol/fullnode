@@ -20,3 +20,11 @@ serde_json = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+
+[features]
+default = []
+# `shrugg call --cuda` proves on an attached NVIDIA GPU. Needs a CUDA 13 toolkit at build time
+# and the sibling `circuits` checkout for the backend crate.
+cuda = ["shrugg-zkvm/cuda"]
+# The same `--cuda` path with the kernels running on the host mock driver: no GPU, no toolkit.
+mock-cuda = ["shrugg-zkvm/mock-cuda"]

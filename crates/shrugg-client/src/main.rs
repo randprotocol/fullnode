@@ -67,6 +67,9 @@ enum Cmd {
         /// Fee in SHRUGG; default: the schedule minimum for the tier.
         #[arg(long)]
         fee: Option<String>,
+        /// Prove on an attached NVIDIA GPU (requires a build with `--features cuda`).
+        #[arg(long)]
+        cuda: bool,
     },
     /// Show the receipt of a confidential call.
     Receipt { tx: String },
@@ -222,7 +225,7 @@ async fn main() -> Result<()> {
                 None => println!("unknown program"),
             }
         }
-        Cmd::Call { program, inputs, recipients, tier, fee } => {
+        Cmd::Call { program, inputs, recipients, tier, fee, cuda } => {
             let kp = load_key(&cli.key)?;
             let pid = Hash::from_hex(&program).context("invalid program id")?;
             let (base_pc, words) = rpc.program_code(&pid).await?.context("program not found on chain")?;
@@ -234,9 +237,23 @@ async fn main() -> Result<()> {
                 eprintln!("warning: chain uses the insecure test FRI profile");
             }
             let recips: Vec<Address> = recipients.iter().map(|r| Address::from_base58(r).context("invalid recipient")).collect::<Result<_>>()?;
+            // No fallback: --cuda on a build or a machine that cannot run it is an error, so a
+            // proof is never quietly produced somewhere other than where it was asked for.
+            let backend = if cuda {
+                #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
+                {
+                    shrugg_zkvm::machine::Backend::Cuda
+                }
+                #[cfg(not(any(feature = "cuda", feature = "mock-cuda")))]
+                {
+                    anyhow::bail!("built without CUDA support; rebuild shrugg with --features cuda")
+                }
+            } else {
+                shrugg_zkvm::machine::Backend::Cpu
+            };
             eprintln!("proving locally ({} inputs stay private)...", inputs.len());
             let t = std::time::Instant::now();
-            let (proof, outputs, tier) = executor::prove(profile, &prog, &inputs, tier).map_err(|e| anyhow::anyhow!(e))?;
+            let (proof, outputs, tier) = executor::prove(profile, &prog, &inputs, tier, backend).map_err(|e| anyhow::anyhow!(e))?;
             eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {:?}", t.elapsed(), proof.len(), outputs);
             let fee_units = match fee { Some(f) => parse_amount(&f)?, None => shrugg_core::gas::call_fee(tier) };
             let tx = rpc.call_program(&kp, pid, proof, recips, fee_units).await?;

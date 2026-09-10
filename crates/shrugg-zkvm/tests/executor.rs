@@ -3,7 +3,7 @@ use shrugg_core::program::{program_id, ProgramRecord};
 use shrugg_core::Keypair;
 use shrugg_zkvm::executor::{prove, ZkExecutor};
 use shrugg_zkvm::guests;
-use shrugg_zkvm::machine::FriProfile;
+use shrugg_zkvm::machine::{Backend, FriProfile};
 use std::sync::OnceLock;
 
 fn record(p: &shrugg_zkvm::isa::Program) -> ProgramRecord {
@@ -22,7 +22,7 @@ fn record(p: &shrugg_zkvm::isa::Program) -> ProgramRecord {
 /// One proof shared by every test (proving takes ~20 s).
 fn shared() -> &'static (Vec<u8>, [u32; 8], u8) {
     static P: OnceLock<(Vec<u8>, [u32; 8], u8)> = OnceLock::new();
-    P.get_or_init(|| prove(FriProfile::Test, &guests::private_payment(1000), &[400, 250, 300, 75], None).unwrap())
+    P.get_or_init(|| prove(FriProfile::Test, &guests::private_payment(1000), &[400, 250, 300, 75], None, Backend::Cpu).unwrap())
 }
 
 #[test]
@@ -72,6 +72,17 @@ fn check_program_rejects_bad_words() {
 
 #[test]
 fn private_payment_emits_no_transfer_below_threshold() {
-    let (_, outputs, _) = prove(FriProfile::Test, &guests::private_payment(2000), &[400, 250, 300, 75], None).unwrap();
+    let (_, outputs, _) = prove(FriProfile::Test, &guests::private_payment(2000), &[400, 250, 300, 75], None, Backend::Cpu).unwrap();
     assert_eq!(outputs, [0; 8]);
+}
+
+/// `prove` names the backend it runs on; `Backend::Cpu` is the same proof the other tests verify.
+#[test]
+fn prove_takes_a_backend_and_cpu_is_unchanged() {
+    let p = guests::private_payment(1000);
+    let (proof, outputs, tier) =
+        prove(FriProfile::Test, &p, &[400, 250, 300, 75], None, shrugg_zkvm::machine::Backend::Cpu).unwrap();
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let out = ex.verify_call(&record(&p), &proof).unwrap();
+    assert_eq!((out.outputs, out.tier), (outputs, tier));
 }

@@ -33,3 +33,19 @@ rand = { version = "0.10", features = ["std_rng"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 postcard = { version = "1", features = ["alloc"] }
+# The GPU backend lives in the sibling `circuits` checkout and is referenced by path, never
+# vendored: `circuits/` must sit beside `fullnode/` to build any of the features below.
+rand-zkvm-cuda = { path = "../../../circuits/rand-zkvm-cuda", optional = true }
+
+[features]
+default = []
+# The GPU backend's CPU-twin engines: the same Merkle/NTT code paths, no device needed.
+reference-backend = ["dep:rand-zkvm-cuda"]
+# `Backend::Cuda` against a real device. Pulls `cuda-core`, which needs a CUDA 13 toolkit at
+# build time.
+cuda = ["dep:rand-zkvm-cuda", "rand-zkvm-cuda/cuda"]
+# `Backend::Cuda` end to end on the mock driver: the same kernel bodies run on the host.
+# Deliberately *not* `["cuda", ...]` — `rand-zkvm-cuda/cuda` is what pulls `cuda-core`, so
+# enabling it would put a CUDA toolkit back in the way of a no-GPU test run. The two features
+# are siblings; either one turns on `Backend::Cuda`.
+mock-cuda = ["dep:rand-zkvm-cuda", "rand-zkvm-cuda/mock-driver"]

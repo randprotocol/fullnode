@@ -91,3 +91,51 @@ genesis hash, so nodes with different settings cannot join the same chain.
 `bubble_sort v...`, `balance_check threshold`, `private_payment threshold`. Any RV32I program in the
 supported subset can be deployed from a `.json` (`{ "base_pc", "words" }`) or `.bin` (raw
 little-endian words) file.
+
+## GPU proving (--cuda)
+
+Proving is the only expensive half of a confidential call, and it happens in the wallet, never on
+the chain. `shrugg call --cuda` runs the batch STARK's NTTs and Poseidon2 Merkle commitments on an
+attached NVIDIA GPU instead of the CPU. The proof is the same object either way — same public
+values, same tier, verified by the same CPU verifier — so nothing on the node changes and a chain
+cannot tell which backend produced a proof.
+
+The backend lives in the sibling repository, `circuits/rand-zkvm-cuda`, and is referenced by path
+(`../../../circuits/rand-zkvm-cuda`); it is not vendored into this repo. `circuits/` must therefore
+be checked out beside `fullnode/` to build any of the features below. `deploy/sync-zkvm.sh` prints
+the same reminder.
+
+**Building.** On a machine with a CUDA 13 toolkit, an NVIDIA driver, and the compiled PTX:
+
+```
+cargo build --release -p shrugg-client --features cuda
+shrugg call <program-id> --input 400 --input 250 --cuda
+```
+
+The flag is always accepted by the parser, so `--cuda` on a stock build fails with a message rather
+than being silently ignored. There is deliberately **no fallback**: if the GPU path cannot start,
+the call errors out and nothing is submitted, so a proof is never quietly produced somewhere other
+than where it was asked for.
+
+Two other feature flags exist for testing without hardware, neither of which needs a CUDA toolkit:
+`--features mock-cuda` runs the same `Backend::Cuda` path with the kernel bodies executing on the
+host, and `--features reference-backend` runs the backend's CPU-twin NTT and Merkle engines.
+`mock-cuda` is a sibling of `cuda`, not a superset — enabling `cuda` is what pulls in `cuda-core`
+and its toolkit requirement.
+
+**Failure modes.** Each exits non-zero and submits nothing:
+
+| Situation | Message |
+| --- | --- |
+| Built without the feature | `built without CUDA support; rebuild shrugg with --features cuda` |
+| No driver or no device | `Backend("CUDA driver: ...")` |
+| Built, driver present, PTX missing | `Backend("no PTX for the GPU kernels at <dir>/ptx/kernels.sm_80.ptx (see rand-zkvm-cuda/ptx/PTX_BUILD.md)")` |
+| Tier too large for device memory | `Backend("device allocation of N bytes failed (M bytes free); use a lower tier")` |
+
+The PTX path can be overridden with `$RAND_ZKVM_PTX`; it otherwise defaults to
+`rand-zkvm-cuda/ptx/kernels.sm_80.ptx`.
+
+**Status as of 2026-09-10.** The kernels have not been executed on real hardware, and no PTX is
+committed — `rand-zkvm-cuda/ptx/` holds only `PTX_BUILD.md`. Everything above is exercised on the
+mock driver and the CPU twins; the first run on a GPU is still ahead, so treat the `cuda` feature as
+untested on-device and expect the "no PTX" error until the kernels are compiled and committed.

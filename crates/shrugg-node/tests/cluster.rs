@@ -471,7 +471,7 @@ async fn confidential_call_moves_funds_on_every_node() {
     // Prove off-chain and call through n1 with bob as recipient 0.
     let bob = Keypair::from_seed([9; 32]).unwrap().address();
     let (proof, outputs, tier) =
-        shrugg_zkvm::executor::prove(shrugg_zkvm::machine::FriProfile::Test, &program, &[400, 250, 300, 75], None).unwrap();
+        shrugg_zkvm::executor::prove(shrugg_zkvm::machine::FriProfile::Test, &program, &[400, 250, 300, 75], None, shrugg_zkvm::machine::Backend::Cpu).unwrap();
     assert_eq!(outputs[0], 1);
     let fee = shrugg_core::gas::call_fee(tier);
     let before = n1.rpc.balance(&ks[0].address()).await.unwrap();
