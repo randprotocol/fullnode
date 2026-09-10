@@ -94,6 +94,26 @@ pub struct BridgeState {
     pub burns: BTreeMap<u64, BridgeBurnRecord>,
 }
 
+/// The small, whole-state half of a [`BridgeState`]: everything except the
+/// three collections a node stores one row at a time (`balances`, `spent`,
+/// `burns`).
+///
+/// Storage keeps this as a single `bincode` blob under one `meta` key and the
+/// three collections in column families, so a commit rewrites only the rows a
+/// block touched. Owning the split here — rather than in the node crate —
+/// keeps it in one place: a new [`BridgeState`] field has to be classified in
+/// [`BridgeState::meta`] and [`BridgeState::from_parts`] or those stop
+/// compiling.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BridgeMeta {
+    pub emitter: [u8; 32],
+    pub emitters: BTreeMap<u16, [u8; 32]>,
+    pub guardian_sets: BTreeMap<u32, GuardianSet>,
+    pub current_set: u32,
+    pub assets: BTreeMap<AssetId, (u16, [u8; 32])>,
+    pub burn_sequence: u64,
+}
+
 /// Why a bridge transaction was rejected.
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
 pub enum BridgeError {
@@ -160,6 +180,61 @@ impl BridgeState {
             guardian_sets,
             current_set: 0,
             ..Default::default()
+        }
+    }
+
+    /// The whole-state half of this bridge, for storage's single `meta` blob.
+    ///
+    /// Destructured on purpose: a new [`BridgeState`] field must be classified
+    /// as blob or column family rather than silently dropped from persistence.
+    pub fn meta(&self) -> BridgeMeta {
+        let BridgeState {
+            emitter,
+            emitters,
+            guardian_sets,
+            current_set,
+            balances: _,
+            assets,
+            spent: _,
+            burn_sequence,
+            burns: _,
+        } = self;
+        BridgeMeta {
+            emitter: *emitter,
+            emitters: emitters.clone(),
+            guardian_sets: guardian_sets.clone(),
+            current_set: *current_set,
+            assets: assets.clone(),
+            burn_sequence: *burn_sequence,
+        }
+    }
+
+    /// Rebuilds a bridge from the two halves storage keeps apart. The inverse
+    /// of [`BridgeState::meta`] plus the three row-wise collections.
+    pub fn from_parts(
+        meta: BridgeMeta,
+        balances: BTreeMap<(AssetId, Address), u128>,
+        spent: BTreeSet<Hash>,
+        burns: BTreeMap<u64, BridgeBurnRecord>,
+    ) -> BridgeState {
+        let BridgeMeta {
+            emitter,
+            emitters,
+            guardian_sets,
+            current_set,
+            assets,
+            burn_sequence,
+        } = meta;
+        BridgeState {
+            emitter,
+            emitters,
+            guardian_sets,
+            current_set,
+            balances,
+            assets,
+            spent,
+            burn_sequence,
+            burns,
         }
     }
 
@@ -713,6 +788,28 @@ mod tests {
             st.check_burn(&key(1).address(), &Hash::ZERO, 1, 2, 0).unwrap_err(),
             BridgeError::UnknownAsset
         );
+    }
+
+    /// `meta` + the three row-wise collections must reassemble the exact same
+    /// bridge — the invariant storage's column-family layout depends on.
+    #[test]
+    fn meta_and_parts_round_trip() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        st.apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 7, 1)), key(9).address(), 1)
+            .unwrap();
+        st.apply_burn(key(1).address(), asset_id(2, &[0xaa; 32]), 400, 2, [0x22; 32], 5, Hash::ZERO, 12, 1_700)
+            .unwrap();
+        st.apply_attest(&attest(&s, 0, upgrade_body(1, vec![[7u8; 20], [8u8; 20]])), key(9).address(), 1)
+            .unwrap();
+        assert!(!st.balances.is_empty() && !st.spent.is_empty() && !st.burns.is_empty());
+        // The blob itself must survive bincode, which is how storage keeps it.
+        let blob = bincode::serialize(&st.meta()).unwrap();
+        let meta: BridgeMeta = bincode::deserialize(&blob).unwrap();
+        assert_eq!(meta, st.meta());
+        let rebuilt = BridgeState::from_parts(meta, st.balances.clone(), st.spent.clone(), st.burns.clone());
+        assert_eq!(rebuilt, st);
+        assert_eq!(rebuilt.root(), st.root());
     }
 
     #[test]

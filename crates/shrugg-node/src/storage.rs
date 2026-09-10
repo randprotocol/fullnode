@@ -4,6 +4,7 @@
 //! certificates, indexes, transaction locations, touched accounts, and the head.
 
 use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB};
+use shrugg_core::bridge::{asset_id, AssetId, Attestation, BridgeBurnRecord, BridgeMeta, BridgeState, Payload};
 use shrugg_core::consensus::{CommittedBlock, SafetyState};
 use shrugg_core::genesis::GenesisState;
 use shrugg_core::confidential::ConfidentialExecutor;
@@ -19,12 +20,37 @@ const CF_ACCOUNTS: &str = "accounts";
 const CF_META: &str = "meta";
 const CF_PROGRAMS: &str = "programs";
 const CF_RECEIPTS: &str = "receipts";
-const ALL_CFS: [&str; 8] = [CF_BLOCKS, CF_QCS, CF_BLOCK_INDEX, CF_TXS, CF_ACCOUNTS, CF_META, CF_PROGRAMS, CF_RECEIPTS];
+/// `asset(32) || address(32)` -> `bincode(u128)`. A zero balance has no row,
+/// matching the bridge state root, which prunes zero balances.
+const CF_BRIDGE_BALANCES: &str = "bridge_balances";
+/// Consumed attestation digest -> empty. Membership is the whole value.
+const CF_BRIDGE_SPENT: &str = "bridge_spent";
+/// Burn sequence (big-endian u64, so the family iterates in order) ->
+/// `bincode(BridgeBurnRecord)`.
+const CF_BRIDGE_BURNS: &str = "bridge_burns";
+const ALL_CFS: [&str; 11] = [
+    CF_BLOCKS,
+    CF_QCS,
+    CF_BLOCK_INDEX,
+    CF_TXS,
+    CF_ACCOUNTS,
+    CF_META,
+    CF_PROGRAMS,
+    CF_RECEIPTS,
+    CF_BRIDGE_BALANCES,
+    CF_BRIDGE_SPENT,
+    CF_BRIDGE_BURNS,
+];
+const BRIDGE_CFS: [&str; 3] = [CF_BRIDGE_BALANCES, CF_BRIDGE_SPENT, CF_BRIDGE_BURNS];
 
 const META_HEAD_HEIGHT: &str = "head_height";
 const META_GENESIS_HASH: &str = "genesis_hash";
 const META_CHAIN_ID: &str = "chain_id";
 const META_SAFETY: &str = "safety";
+/// `bincode(BridgeMeta)`: the whole-state half of the bridge (emitter, emitter
+/// table, guardian sets, current index, asset registry, burn sequence). Its
+/// presence is what makes a chain "bridged" on disk.
+const META_BRIDGE_STATE: &str = "bridge_state";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -54,6 +80,26 @@ pub struct Storage {
 
 fn height_key(h: u64) -> [u8; 8] {
     h.to_be_bytes()
+}
+
+/// Key of a bridged-asset balance row: `asset || address`.
+fn balance_key(asset: &AssetId, addr: &Address) -> [u8; 64] {
+    let mut k = [0u8; 64];
+    k[..32].copy_from_slice(asset.as_bytes());
+    k[32..].copy_from_slice(addr.as_bytes());
+    k
+}
+
+/// The inverse of [`balance_key`].
+fn split_balance_key(k: &[u8]) -> Result<(AssetId, Address)> {
+    if k.len() != 64 {
+        return Err(StorageError::Corrupt("bridge_balances key has wrong length".into()));
+    }
+    let mut asset = [0u8; 32];
+    let mut addr = [0u8; 32];
+    asset.copy_from_slice(&k[..32]);
+    addr.copy_from_slice(&k[32..]);
+    Ok((Hash(asset), Address(addr)))
 }
 
 fn sync_opts() -> WriteOptions {
@@ -121,11 +167,119 @@ impl Storage {
         for (addr, acct) in gs.ledger.accounts() {
             batch.put_cf(self.cf(CF_ACCOUNTS), addr.as_bytes(), bincode::serialize(acct)?);
         }
+        if let Some(bridge) = gs.ledger.bridge() {
+            self.put_bridge(&mut batch, bridge)?;
+        }
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(0));
         batch.put_cf(self.cf(CF_META), META_GENESIS_HASH, genesis_hash.as_bytes());
         batch.put_cf(self.cf(CF_META), META_CHAIN_ID, gs.chain_id.to_be_bytes());
         self.db.write_opt(batch, &sync_opts())?;
         Ok(())
+    }
+
+    // ---- bridged assets --------------------------------------------------
+
+    /// Write a whole bridge state — the `meta` blob and every row of the three
+    /// families — into `batch`. Used where the state is installed wholesale
+    /// (genesis, truncation); `commit` writes only what a block touched.
+    fn put_bridge(&self, batch: &mut WriteBatch, bridge: &BridgeState) -> Result<()> {
+        batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE, bincode::serialize(&bridge.meta())?);
+        for ((asset, addr), balance) in &bridge.balances {
+            if *balance == 0 {
+                continue;
+            }
+            batch.put_cf(self.cf(CF_BRIDGE_BALANCES), balance_key(asset, addr), bincode::serialize(balance)?);
+        }
+        for digest in &bridge.spent {
+            batch.put_cf(self.cf(CF_BRIDGE_SPENT), digest.as_bytes(), []);
+        }
+        for (sequence, rec) in &bridge.burns {
+            batch.put_cf(self.cf(CF_BRIDGE_BURNS), height_key(*sequence), bincode::serialize(rec)?);
+        }
+        Ok(())
+    }
+
+    /// Delete every bridge row and the `meta` blob into `batch`.
+    fn clear_bridge(&self, batch: &mut WriteBatch) -> Result<()> {
+        for name in BRIDGE_CFS {
+            for item in self.db.iterator_cf(self.cf(name), IteratorMode::Start) {
+                let (k, _) = item?;
+                batch.delete_cf(self.cf(name), k);
+            }
+        }
+        batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE);
+        Ok(())
+    }
+
+    /// The bridge's whole-state half, or `None` on a chain without a bridge.
+    pub fn bridge_meta(&self) -> Result<Option<BridgeMeta>> {
+        match self.get_meta_raw(META_BRIDGE_STATE)? {
+            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// `addr`'s balance of bridged asset `asset` at the committed head; zero
+    /// if there is no row (or no bridge at all).
+    pub fn asset_balance(&self, asset: &AssetId, addr: &Address) -> Result<u128> {
+        Ok(self.get::<u128>(CF_BRIDGE_BALANCES, &balance_key(asset, addr))?.unwrap_or(0))
+    }
+
+    /// Every bridged asset `addr` holds a non-zero balance of, with its home
+    /// chain and token address from the registry.
+    ///
+    /// The balance key is `asset || address`, so this scans the family rather
+    /// than seeking: bridged holdings are few, and the alternative (a second
+    /// index keyed the other way round) would be state to keep consistent.
+    pub fn assets_of(&self, addr: &Address) -> Result<Vec<(AssetId, u16, [u8; 32], u128)>> {
+        let Some(meta) = self.bridge_meta()? else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_BRIDGE_BALANCES), IteratorMode::Start) {
+            let (k, v) = item?;
+            let (asset, holder) = split_balance_key(k.as_ref())?;
+            if holder != *addr {
+                continue;
+            }
+            let balance: u128 = bincode::deserialize(&v)?;
+            let (chain, token) = meta
+                .assets
+                .get(&asset)
+                .copied()
+                .ok_or_else(|| StorageError::Corrupt(format!("balance of unregistered asset {asset}")))?;
+            out.push((asset, chain, token, balance));
+        }
+        Ok(out)
+    }
+
+    /// The outbound burn message with this sequence, for guardians to sign.
+    pub fn bridge_burn(&self, sequence: u64) -> Result<Option<BridgeBurnRecord>> {
+        self.get(CF_BRIDGE_BURNS, &height_key(sequence))
+    }
+
+    /// Rebuild the bridge state from the `meta` blob plus the three families.
+    /// `None` when the blob is absent, which is how a chain without a bridge
+    /// (and only such a chain, once `init_genesis` has run) looks on disk.
+    fn load_bridge(&self) -> Result<Option<BridgeState>> {
+        let Some(meta) = self.bridge_meta()? else { return Ok(None) };
+        let mut balances = BTreeMap::new();
+        for item in self.db.iterator_cf(self.cf(CF_BRIDGE_BALANCES), IteratorMode::Start) {
+            let (k, v) = item?;
+            balances.insert(split_balance_key(k.as_ref())?, bincode::deserialize::<u128>(&v)?);
+        }
+        let mut spent = BTreeSet::new();
+        for item in self.db.iterator_cf(self.cf(CF_BRIDGE_SPENT), IteratorMode::Start) {
+            let (k, _) = item?;
+            let arr: [u8; 32] =
+                k.as_ref().try_into().map_err(|_| StorageError::Corrupt("bridge_spent key has wrong length".into()))?;
+            spent.insert(Hash(arr));
+        }
+        let mut burns = BTreeMap::new();
+        for item in self.db.iterator_cf(self.cf(CF_BRIDGE_BURNS), IteratorMode::Start) {
+            let (_, v) = item?;
+            let rec: BridgeBurnRecord = bincode::deserialize(&v)?;
+            burns.insert(rec.sequence, rec);
+        }
+        Ok(Some(BridgeState::from_parts(meta, balances, spent, burns)))
     }
 
     pub fn genesis_hash(&self) -> Result<Hash> {
@@ -236,7 +390,7 @@ impl Storage {
         Ok(self.get::<Account>(CF_ACCOUNTS, a.as_bytes())?.unwrap_or_default())
     }
 
-    /// Load every account into an in-memory ledger.
+    /// Load every account, program and bridge row into an in-memory ledger.
     pub fn load_ledger(&self) -> Result<Ledger> {
         let chain_id = self.chain_id()?;
         let mut accounts = BTreeMap::new();
@@ -255,7 +409,9 @@ impl Storage {
             let rec: ProgramRecord = bincode::deserialize(&v)?;
             programs.insert(rec.id, rec);
         }
-        Ok(Ledger::from_parts(chain_id, accounts, programs))
+        let mut ledger = Ledger::from_parts(chain_id, accounts, programs);
+        ledger.set_bridge(self.load_bridge()?);
+        Ok(ledger)
     }
 
     /// Atomically append committed blocks and the accounts they touched.
@@ -268,6 +424,13 @@ impl Storage {
         let mut expected_parent = head.hash;
         let mut batch = WriteBatch::default();
         let mut touched: BTreeSet<Address> = BTreeSet::new();
+        // Bridge rows a block's transactions can have moved. Attestations are
+        // re-decoded here rather than diffed against the previous state so a
+        // commit stays O(block), like the account path above.
+        let mut bridge_touched: BTreeSet<(AssetId, Address)> = BTreeSet::new();
+        let mut spent_digests: BTreeSet<Hash> = BTreeSet::new();
+        let mut has_bridge_tx = false;
+        let first_burn_sequence = self.bridge_meta()?.map(|m| m.burn_sequence).unwrap_or(0);
 
         for cb in blocks {
             let block = &cb.block;
@@ -307,12 +470,30 @@ impl Storage {
                     TxKind::Transfer { to, .. } | TxKind::Mint { to, .. } => {
                         touched.insert(*to);
                     }
-                    // Bridge kinds touch bridged-asset balances, not SHRUGG
-                    // accounts beyond the sender; Task C2 adds their columns.
-                    TxKind::Deploy { .. }
-                    | TxKind::Call { .. }
-                    | TxKind::BridgeAttest { .. }
-                    | TxKind::BridgeBurn { .. } => {}
+                    // Bridge kinds move bridged-asset balances, not SHRUGG
+                    // accounts beyond the sender, so they touch the bridge
+                    // families instead. A committed attestation decoded and
+                    // applied, so anything that fails to decode here would be
+                    // a torn block, not a rejected transaction; the balances
+                    // written below come from `ledger_after` either way.
+                    TxKind::BridgeAttest { attestation } => {
+                        has_bridge_tx = true;
+                        let att = Attestation::decode(attestation).map_err(|e| {
+                            StorageError::Corrupt(format!("committed attestation does not decode: {e:?}"))
+                        })?;
+                        spent_digests.insert(Hash(shrugg_core::bridge::digest(&att.body.encode())));
+                        // A guardian-set upgrade moves no balances.
+                        if let Ok(Payload::Transfer(t)) = Payload::decode(&att.body.payload) {
+                            let asset = asset_id(t.token_chain, &t.token_address);
+                            bridge_touched.insert((asset, Address(t.to)));
+                            bridge_touched.insert((asset, tx.sender()));
+                        }
+                    }
+                    TxKind::BridgeBurn { asset, .. } => {
+                        has_bridge_tx = true;
+                        bridge_touched.insert((*asset, tx.sender()));
+                    }
+                    TxKind::Deploy { .. } | TxKind::Call { .. } => {}
                 }
             }
             for r in &cb.receipts {
@@ -338,6 +519,27 @@ impl Storage {
             if rec.deployed_at >= first_height {
                 batch.put_cf(self.cf(CF_PROGRAMS), rec.id.as_bytes(), bincode::serialize(rec)?);
             }
+        }
+        if has_bridge_tx {
+            let bridge = ledger_after.bridge().ok_or_else(|| {
+                StorageError::Corrupt("committed block has a bridge transaction but the ledger has no bridge state".into())
+            })?;
+            for (asset, addr) in &bridge_touched {
+                let key = balance_key(asset, addr);
+                match bridge.balance(asset, addr) {
+                    // A drained holder has no row, so a reloaded state equals
+                    // the one in memory and commits to the same root.
+                    0 => batch.delete_cf(self.cf(CF_BRIDGE_BALANCES), key),
+                    balance => batch.put_cf(self.cf(CF_BRIDGE_BALANCES), key, bincode::serialize(&balance)?),
+                }
+            }
+            for digest in &spent_digests {
+                batch.put_cf(self.cf(CF_BRIDGE_SPENT), digest.as_bytes(), []);
+            }
+            for (sequence, rec) in bridge.burns.range(first_burn_sequence..) {
+                batch.put_cf(self.cf(CF_BRIDGE_BURNS), height_key(*sequence), bincode::serialize(rec)?);
+            }
+            batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE, bincode::serialize(&bridge.meta())?);
         }
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(expected_height - 1));
         self.db.write_opt(batch, &sync_opts())?;
@@ -537,6 +739,11 @@ impl Storage {
             check.problem = Some("accounts/programs snapshot does not match replayed chain".into());
         } else if stored.programs() != ledger.programs() {
             check.problem = Some("programs snapshot does not match replayed chain".into());
+        } else if stored.bridge() != ledger.bridge() {
+            // The state root covers most of the bridge but not the outbound
+            // burn log, which is derived from the same blocks and must be
+            // there for guardians to read; compare the whole thing.
+            check.problem = Some("bridge snapshot does not match replayed chain".into());
         }
         check.ledger = ledger;
         Ok(check)
@@ -584,6 +791,12 @@ impl Storage {
         for rec in ledger.programs().values() {
             batch.put_cf(self.cf(CF_PROGRAMS), rec.id.as_bytes(), bincode::serialize(rec)?);
         }
+        // The bridge families have no per-height key, so they are rebuilt
+        // wholesale from the replayed ledger rather than pruned.
+        self.clear_bridge(&mut batch)?;
+        if let Some(bridge) = ledger.bridge() {
+            self.put_bridge(&mut batch, bridge)?;
+        }
         for item in self.db.iterator_cf(self.cf(CF_RECEIPTS), IteratorMode::Start) {
             let (k, v) = item?;
             let keep = bincode::deserialize::<CallReceipt>(&v).map(|r| r.height <= height).unwrap_or(false);
@@ -618,20 +831,29 @@ impl Storage {
         self.db.put_cf(self.cf(CF_ACCOUNTS), addr.as_bytes(), bincode::serialize(acct)?)?;
         Ok(())
     }
+
+    /// Test hook: overwrite a bridged-asset balance to simulate snapshot
+    /// corruption. Never called by the node itself.
+    pub fn overwrite_asset_balance_for_testing(&self, asset: &AssetId, addr: &Address, balance: u128) -> Result<()> {
+        self.db.put_cf(self.cf(CF_BRIDGE_BALANCES), balance_key(asset, addr), bincode::serialize(&balance)?)?;
+        Ok(())
+    }
 }
 
+/// Fixtures shared by the storage tests and the RPC tests, which need a
+/// database holding a real bridged chain to answer against.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixtures {
     use super::*;
     use shrugg_core::confidential::StubExecutor;
     use shrugg_core::genesis::{Genesis, GenesisValidator};
     use shrugg_core::{BlockHeader, Keypair, Transaction};
 
-    fn key(n: u8) -> Keypair {
+    pub(crate) fn key(n: u8) -> Keypair {
         Keypair::from_seed([n; 32]).unwrap()
     }
 
-    fn genesis(chain_id: u64) -> GenesisState {
+    pub(crate) fn genesis(chain_id: u64) -> GenesisState {
         let k = key(1);
         Genesis {
             chain_id,
@@ -647,7 +869,78 @@ mod tests {
         .unwrap()
     }
 
-    fn make_block(parent: &Block, ledger: &mut Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
+    // ---- bridge fixtures -------------------------------------------------
+
+    /// Four guardian secrets (scalars 1..=4); quorum is `4 * 2 / 3 + 1 = 3`.
+    pub(crate) fn guardian_secrets() -> Vec<[u8; 32]> {
+        (1u8..=4)
+            .map(|i| {
+                let mut s = [0u8; 32];
+                s[31] = i;
+                s
+            })
+            .collect()
+    }
+
+    pub(crate) const SOURCE_EMITTER: [u8; 32] = [0xee; 32];
+    pub(crate) const TOKEN: [u8; 32] = [0xaa; 32];
+
+    pub(crate) fn bridge_config() -> shrugg_core::bridge::BridgeConfig {
+        shrugg_core::bridge::BridgeConfig {
+            emitter: [1u8; 32],
+            guardians: guardian_secrets().iter().map(shrugg_core::bridge::guardian_address).collect(),
+            emitters: [(2u16, SOURCE_EMITTER)].into_iter().collect(),
+        }
+    }
+
+    /// A genesis with a bridge section, funding `key(1)` for fees.
+    pub(crate) fn bridged_genesis(chain_id: u64) -> GenesisState {
+        let k = key(1);
+        Genesis {
+            chain_id,
+            timestamp_ms: 0,
+            validators: vec![GenesisValidator { public_key: k.public_key().clone(), stake: 10 }],
+            alloc: [(k.address().to_base58(), 1_000u128)].into_iter().collect(),
+            faucet: false,
+            confidential: true,
+            fri_profile: "test".into(),
+            bridge: Some(bridge_config()),
+        }
+        .build()
+        .unwrap()
+    }
+
+    /// A quorum-signed transfer attestation crediting `to` with `amount - fee`.
+    pub(crate) fn attestation(sequence: u64, to: &Address, amount: u128, fee: u128) -> Vec<u8> {
+        use shrugg_core::bridge::{digest, sign_digest, Attestation, Body, Payload, Transfer};
+        let body = Body {
+            timestamp: 0,
+            nonce: 0,
+            emitter_chain: 2,
+            emitter_address: SOURCE_EMITTER,
+            sequence,
+            consistency_level: 0,
+            payload: Payload::Transfer(Transfer {
+                amount: Transfer::u256_from_u128(amount),
+                token_address: TOKEN,
+                token_chain: 2,
+                to: *to.as_bytes(),
+                to_chain: 1,
+                fee: Transfer::u256_from_u128(fee),
+            })
+            .encode(),
+        };
+        let d = digest(&body.encode());
+        let secrets = guardian_secrets();
+        let signatures = (0..3u8).map(|i| sign_digest(&secrets[i as usize], i, &d)).collect();
+        Attestation { guardian_set_index: 0, signatures, body }.encode()
+    }
+
+    pub(crate) fn bridged_asset() -> shrugg_core::bridge::AssetId {
+        shrugg_core::bridge::asset_id(2, &TOKEN)
+    }
+
+    pub(crate) fn make_block(parent: &Block, ledger: &mut Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
         ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
         let header = BlockHeader {
             height: parent.height() + 1,
@@ -663,6 +956,14 @@ mod tests {
         let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![] };
         CommittedBlock { block, qc, receipts: Vec::new() }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+    use shrugg_core::confidential::StubExecutor;
+    use shrugg_core::Transaction;
 
     #[test]
     fn init_and_reopen_preserves_meta() {
@@ -900,6 +1201,123 @@ mod tests {
         assert_eq!(st.head().unwrap().hash, gs.hash());
         assert!(st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().is_ok());
         assert!(st.load_safety().is_ok());
+    }
+
+    /// The whole point of the bridge column families: whatever the ledger
+    /// holds after a commit is what `load_ledger` gives back, across a reopen,
+    /// and `truncate_to` puts it back to the genesis bridge state.
+    #[test]
+    fn bridge_state_round_trips_through_commit_reopen_and_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let gs = bridged_genesis(1);
+        let alice = key(1);
+        let bob = key(2);
+        let asset = bridged_asset();
+        {
+            let s = Storage::open(dir.path()).unwrap();
+            s.init_genesis(&gs).unwrap();
+            // The genesis bridge section is persisted, not just derived.
+            assert_eq!(s.load_ledger().unwrap(), gs.ledger);
+
+            let mut ledger = gs.ledger.clone();
+            // Position the ledger exactly as a replay would: `make_block`
+            // stamps every header with `timestamp_ms: 1`, and the burn record
+            // it produces carries the block height.
+            ledger.set_timestamp_ms(1);
+            ledger.set_height(1);
+            // Block 1: mint 1000 (fee 10) to bob, submitted by alice.
+            let att = Transaction::bridge_attest(&alice, 1, 0, attestation(0, &bob.address(), 1_000, 10), 1);
+            let b1 = make_block(&gs.block, &mut ledger, vec![att.clone()], &alice);
+            s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+            assert_eq!(ledger.asset_balance(&asset, &bob.address()), 990);
+            assert_eq!(ledger.asset_balance(&asset, &alice.address()), 10);
+            assert_eq!(s.load_ledger().unwrap(), ledger);
+
+            // Block 2: alice burns her whole fee back out to chain 2, and a
+            // second attestation credits bob again.
+            let burn = Transaction::bridge_burn(&alice, 1, 1, asset, 10, 2, [0x22; 32], 1, 1);
+            let att2 = Transaction::bridge_attest(&alice, 1, 2, attestation(1, &bob.address(), 500, 0), 1);
+            ledger.set_height(2);
+            let b2 = make_block(&b1.block, &mut ledger, vec![burn.clone(), att2.clone()], &alice);
+            s.commit(std::slice::from_ref(&b2), &ledger).unwrap();
+            // alice's balance hit zero, so its row must be gone, not stale
+            assert_eq!(ledger.asset_balance(&asset, &alice.address()), 0);
+            assert_eq!(ledger.asset_balance(&asset, &bob.address()), 1_490);
+            assert_eq!(ledger.bridge().unwrap().burn_sequence, 1);
+            assert_eq!(s.load_ledger().unwrap(), ledger);
+            let c = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+            assert!(c.is_ok(), "{:?}", c.problem);
+        }
+        // Reopening the database changes nothing.
+        let s = Storage::open(dir.path()).unwrap();
+        let reloaded = s.load_ledger().unwrap();
+        let bridge = reloaded.bridge().expect("bridge reloaded");
+        assert_eq!(bridge.balance(&asset, &bob.address()), 1_490);
+        assert_eq!(bridge.balance(&asset, &alice.address()), 0);
+        assert_eq!(bridge.spent.len(), 2);
+        assert_eq!(bridge.burns.len(), 1);
+        assert_eq!(bridge.burns[&0].height, 2);
+        assert_eq!(bridge.assets.get(&asset), Some(&(2u16, TOKEN)));
+
+        // The point queries the RPC layer uses agree with the reloaded state.
+        assert_eq!(s.asset_balance(&asset, &bob.address()).unwrap(), 1_490);
+        assert_eq!(s.asset_balance(&asset, &alice.address()).unwrap(), 0);
+        assert_eq!(s.assets_of(&bob.address()).unwrap(), vec![(asset, 2u16, TOKEN, 1_490u128)]);
+        assert!(s.assets_of(&alice.address()).unwrap().is_empty());
+        let meta = s.bridge_meta().unwrap().expect("bridge meta");
+        assert_eq!(meta, bridge.meta());
+        assert_eq!(meta.burn_sequence, 1);
+        let rec = s.bridge_burn(0).unwrap().expect("burn record");
+        assert_eq!((rec.sequence, rec.height), (0, 2));
+        assert_eq!(rec.digest, shrugg_core::bridge::digest(&rec.body));
+        assert_eq!(s.bridge_burn(1).unwrap(), None);
+
+        // Truncating to genesis restores the genesis bridge state exactly.
+        s.truncate_to(&gs, 0, &gs.ledger).unwrap();
+        assert_eq!(s.load_ledger().unwrap(), gs.ledger);
+        let back = s.load_ledger().unwrap().bridge().unwrap().clone();
+        assert!(back.balances.is_empty() && back.spent.is_empty() && back.burns.is_empty());
+        assert_eq!(back.burn_sequence, 0);
+        let c = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(c.is_ok(), "{:?}", c.problem);
+    }
+
+    /// A damaged bridge balance is caught by the same startup check that
+    /// catches a damaged account, and truncation repairs it.
+    #[test]
+    fn bridge_snapshot_corruption_is_detected_and_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = bridged_genesis(1);
+        s.init_genesis(&gs).unwrap();
+        let (alice, bob, asset) = (key(1), key(2), bridged_asset());
+        let mut ledger = gs.ledger.clone();
+        ledger.set_timestamp_ms(1);
+        ledger.set_height(1);
+        let att = Transaction::bridge_attest(&alice, 1, 0, attestation(0, &bob.address(), 1_000, 0), 1);
+        let b1 = make_block(&gs.block, &mut ledger, vec![att], &alice);
+        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        assert!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().is_ok());
+
+        s.overwrite_asset_balance_for_testing(&asset, &bob.address(), 1).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(!check.is_ok());
+        assert_eq!(check.last_good, 1, "only the snapshot is damaged, not the blocks");
+        // Rewriting the snapshot from the replayed ledger repairs it.
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.asset_balance(&asset, &bob.address()).unwrap(), 1_000);
+        assert!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().is_ok());
+    }
+
+    /// A chain whose genesis has no `bridge` section stores no bridge state.
+    #[test]
+    fn a_chain_without_a_bridge_loads_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis(1);
+        s.init_genesis(&gs).unwrap();
+        assert!(s.load_ledger().unwrap().bridge().is_none());
+        assert_eq!(s.load_ledger().unwrap(), gs.ledger);
     }
 
     #[test]

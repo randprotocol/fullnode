@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+use shrugg_core::bridge::AssetId;
 use shrugg_core::program::{program_id, ProgramId};
 use shrugg_core::{gas, Address, Hash, Keypair, Transaction, TxKind};
 use std::time::{Duration, Instant};
@@ -212,6 +213,113 @@ impl RpcClient {
         }
         let tx = Transaction::transfer(key, chain_id, acct.nonce, to, amount, fee);
         debug_assert!(matches!(tx.body.kind, TxKind::Transfer { .. }));
+        self.send_transaction(&tx).await
+    }
+}
+
+/// One bridged asset an address holds, as reported by `shrugg_getAssets`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetHolding {
+    pub asset: AssetId,
+    /// Chain the token is native to (2 Ethereum, 3 BSC, 4 Tron, 5 Solana).
+    pub token_chain: u16,
+    /// The token's address on its home chain, left-padded to 32 bytes.
+    pub token_address: [u8; 32],
+    /// Balance in bridged units (8 decimals).
+    pub balance: u128,
+}
+
+/// A 32-byte value as 64 hex characters, with or without `0x`.
+pub fn hex32(s: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s)).with_context(|| format!("{s:?} is not hex"))?;
+    bytes.try_into().map_err(|v: Vec<u8>| anyhow!("expected 32 bytes, got {}", v.len()))
+}
+
+/// Bridged assets. Amounts here are in bridged units — 8 decimals, not
+/// SHRUGG's 9 — so they are passed and printed as plain unit integers.
+impl RpcClient {
+    /// `addr`'s balance of one bridged asset, in units. Zero for an unknown
+    /// asset, an untouched address, or a chain without a bridge.
+    pub async fn asset_balance(&self, addr: &Address, asset: &AssetId) -> Result<u128> {
+        let v = self.call("shrugg_getAssetBalance", json!([addr.to_base58(), asset.to_hex()])).await?;
+        v.as_str().unwrap_or("0").parse().context("asset balance")
+    }
+
+    /// Every bridged asset `addr` holds a non-zero balance of.
+    pub async fn assets(&self, addr: &Address) -> Result<Vec<AssetHolding>> {
+        let v = self.call("shrugg_getAssets", json!([addr.to_base58()])).await?;
+        v.as_array()
+            .context("assets: expected an array")?
+            .iter()
+            .map(|a| {
+                Ok(AssetHolding {
+                    asset: Hash::from_hex(a["asset"].as_str().unwrap_or("")).map_err(|e| anyhow!("asset: {e}"))?,
+                    token_chain: a["token_chain"].as_u64().context("token_chain")? as u16,
+                    token_address: hex32(a["token_address"].as_str().unwrap_or(""))?,
+                    balance: a["balance"].as_str().unwrap_or("0").parse().context("balance")?,
+                })
+            })
+            .collect()
+    }
+
+    /// The chain's bridge configuration and guardian set. Always answers;
+    /// `{"enabled": false}` on a chain without a bridge.
+    pub async fn bridge_state(&self) -> Result<Value> {
+        self.call("shrugg_getBridgeState", json!([])).await
+    }
+
+    /// One outbound burn message for guardians to sign, or `None` if that
+    /// sequence has not been produced yet.
+    pub async fn bridge_burn_record(&self, sequence: u64) -> Result<Option<Value>> {
+        let v = self.call("shrugg_getBridgeBurn", json!([sequence])).await?;
+        Ok(if v.is_null() { None } else { Some(v) })
+    }
+
+    /// The asset id of a token: `blake3("shrugg-bridge-asset" || chain || address)`.
+    /// Asked of the node so the wallet and the chain cannot disagree.
+    pub async fn bridge_asset_id(&self, token_chain: u16, token_address: &[u8; 32]) -> Result<AssetId> {
+        let v = self.call("shrugg_bridgeAssetId", json!([token_chain, hex::encode(token_address)])).await?;
+        Hash::from_hex(v.as_str().unwrap_or("")).map_err(|e| anyhow!("bad asset id in reply: {e}"))
+    }
+
+    /// Submit a guardian-signed attestation: mints the bridged asset it
+    /// carries (or rotates the guardian set). `fee` is the SHRUGG transaction
+    /// fee; the bridge fee inside the attestation goes to the submitter.
+    pub async fn bridge_attest(&self, key: &Keypair, attestation: Vec<u8>, fee: u128) -> Result<Hash> {
+        let chain_id = self.chain_id().await?;
+        let acct = self.account(&key.address()).await?;
+        if acct.balance < fee {
+            return Err(anyhow!("insufficient balance for the {} SHRUGG fee", shrugg_core::format_amount(fee)));
+        }
+        let tx = Transaction::bridge_attest(key, chain_id, acct.nonce, attestation, fee);
+        self.send_transaction(&tx).await
+    }
+
+    /// Burn `amount` units of a bridged asset and emit the outbound message a
+    /// source-chain contract releases against. `bridge_fee` (in the same
+    /// bridged units, at most `amount`) is carried in that message for
+    /// whoever relays it; `fee` is the SHRUGG transaction fee.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bridge_burn(
+        &self,
+        key: &Keypair,
+        asset: AssetId,
+        amount: u128,
+        to_chain: u16,
+        to: [u8; 32],
+        bridge_fee: u128,
+        fee: u128,
+    ) -> Result<Hash> {
+        let chain_id = self.chain_id().await?;
+        let acct = self.account(&key.address()).await?;
+        if acct.balance < fee {
+            return Err(anyhow!("insufficient balance for the {} SHRUGG fee", shrugg_core::format_amount(fee)));
+        }
+        let have = self.asset_balance(&key.address(), &asset).await?;
+        if have < amount {
+            return Err(anyhow!("insufficient bridged balance: have {have} units, need {amount}"));
+        }
+        let tx = Transaction::bridge_burn(key, chain_id, acct.nonce, asset, amount, to_chain, to, bridge_fee, fee);
         self.send_transaction(&tx).await
     }
 }

@@ -11,8 +11,9 @@ virtual machine and settle on chain with a proof instead of their inputs.
 | Signatures / hashes | Dilithium2 (post-quantum) / BLAKE3; addresses are base58 of the hashed public key |
 | Networking | libp2p 0.54: TCP + Noise + Yamux, gossipsub, Kademlia + bootstrap list, mDNS on LANs, request-response block sync, ping keepalive, automatic redial |
 | Ledger | account based (nonce + balance), signed transfers with fees to the proposer, BLAKE3 Merkle state root over accounts and deployed programs |
+| Bridged assets | optional per chain: guardian-attested transfers in from Ethereum, BSC, Tron and Solana, and burn messages back out; secp256k1 quorum of more than 2/3, replay-protected by consumed digest, part of the state root |
 | Confidential computation | Rand zkVM: RV32I under a Plonky3 batch STARK (Goldilocks, Poseidon2, ZK-hiding FRI); programs deployed on chain, calls carry a proof + 8 public outputs, gas by tier, program-driven transfers |
-| Storage | one RocksDB per node with column families for blocks, certificates, indexes, accounts, programs, receipts; fsynced commits; startup integrity check with truncate-and-resync |
+| Storage | one RocksDB per node with column families for blocks, certificates, indexes, accounts, programs, receipts and bridged assets; fsynced commits; startup integrity check with truncate-and-resync |
 | Interfaces | JSON-RPC 2.0 over HTTP (`shrugg-node`), `shrugg` wallet CLI with a local prover, Rust client library |
 
 Status: an experimental testnet (see `deploy/README.md`) runs across two laptops and four cloud
@@ -24,6 +25,7 @@ servers. Not audited; not for real value.
 - [Build and test](#build-and-test)
 - [Run a node](#run-a-node)
 - [Use the wallet](#use-the-wallet)
+- [Bridged assets](#bridged-assets)
 - [Confidential computation](#confidential-computation)
 - [Operating a node](#operating-a-node)
 - [How it works](#how-it-works)
@@ -119,6 +121,56 @@ shrugg tx <hash> | shrugg block <height|hash> | shrugg head | shrugg status | sh
 Amounts are decimal SHRUGG (1 SHRUGG = 10^9 units). Fees default to 0.000001 SHRUGG and go to the
 proposer of the block that includes the transaction.
 
+## Bridged assets
+
+A chain whose genesis carries a `bridge` section can hold assets from other chains. A guardian set
+watches the source-chain contracts and signs an attestation for each lock; anyone may submit it here
+as a `bridge-mint`, which credits the recipient and pays the submitter the fee the message names.
+Going the other way, `bridge-burn` debits the holder and records an outbound message; guardians sign
+its digest and a source-chain contract releases the original token.
+
+```bash
+shrugg bridge-status                                   # guardian set, emitters, registered assets
+shrugg bridge-mint @attestation.hex                    # submit a signed attestation, keep its fee
+shrugg asset-balance <asset id>                        # in bridged units (8 decimals)
+shrugg bridge-burn <asset id> 100000000 2 <32-byte hex recipient> --bridge-fee 1000
+```
+
+Bridged amounts are 8-decimal units and are written as plain integers, unlike SHRUGG's 9-decimal
+decimal strings. Chain ids are 1 Rand, 2 Ethereum, 3 BSC, 4 Tron, 5 Solana. An asset id is
+`blake3("shrugg-bridge-asset" || token_chain BE u16 || token_address)`; `shrugg_bridgeAssetId`
+computes it for you.
+
+The bridge is genesis configuration, so every node of the chain agrees on it and it is covered by the
+genesis hash. Add it to `genesis.json` (or pass the same object to `shrugg-node genesis --bridge`):
+
+```json
+"bridge": {
+  "emitter": "65dc6defe654190f4ec95bead4cecfd2fc6ca3c1c31a54cd5b14d0f8f3e11df3",
+  "guardians": [
+    "7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+    "2b5ad5c4795c026514f8317c7a215e218dccd6cf",
+    "6813eb9362372eef6200f3b1dbc3f819671cba69",
+    "1eff47bc3a10a45d4b230b5d10e37751fe6aa718",
+    "e1ab8145f7e55dc933d51a18c793f901a3a0b276",
+    "e57bfe9f44b819898f47bf37e5af72a0783e1141"
+  ],
+  "emitters": {
+    "2": "0000000000000000000000007be73b644df28af8148b26cf1d401cc806f1c9ba",
+    "3": "000000000000000000000000869f41c8721b27cb204450760c746bcf2f25f2de",
+    "4": "0000000000000000000000008072aee1b787225cf9b2625bb2e1e26d9d24fd83",
+    "5": "1062ca1f0092139016a513c91224d0c5224ff4d2424d471f85dc58bc9d1008f0"
+  }
+}
+```
+
+`emitter` is this chain's address in the messages it emits; `guardians` are the initial set's
+20-byte secp256k1 addresses; `emitters` maps each source chain to the only contract address allowed
+to send transfers in from it. Omit the whole section and the chain has no bridge: its genesis hash,
+state root and transaction encoding are byte for byte what a pre-bridge node produced, and both
+bridge transaction kinds are rejected. The guardian set rotates through a governance attestation,
+with the old set honoured for a further day.
+
 ## Confidential computation
 
 A program is RV32I code for the Rand zkVM. You deploy it once (its content hash is its id), then
@@ -161,13 +213,14 @@ commits; `docs/deploy.md` describes the rollout and the fault tests that have be
 
 ## How it works
 
-1. A transaction (transfer, mint, deploy, or call) is signed with Dilithium2, submitted over RPC,
+1. A transaction (transfer, mint, deploy, call, or a bridge attestation/burn) is signed with Dilithium2, submitted over RPC,
    validated against the tip state, gossiped, and queued per sender by nonce.
 2. The leader of the current view proposes a block extending the highest quorum certificate it
    knows, choosing transactions by fee within a 4 MiB budget. Validators vote if the block is safe
    with respect to their lock; votes from more than 2/3 of stake form the next certificate.
 3. A block is committed once three consecutive certificates chain on top of it. Commits are one
-   fsynced RocksDB batch: blocks, certificates, indexes, touched accounts, programs, receipts.
+   fsynced RocksDB batch: blocks, certificates, indexes, touched accounts, programs, receipts, and
+   the bridged-asset rows the block moved.
 4. A node that falls behind requests committed blocks with their certificates from a peer, verifies
    every certificate, re-executes every block (including proof verification), and compares receipts
    before accepting.

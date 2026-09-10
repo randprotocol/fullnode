@@ -126,6 +126,11 @@ impl Genesis {
         let mut ledger = Ledger::from_accounts(self.chain_id, accounts);
         ledger.set_faucet(self.faucet);
         ledger.set_bridge(self.bridge.as_ref().map(BridgeState::from_config));
+        // The genesis ledger is positioned at the genesis block, so it carries
+        // that block's time structurally rather than relying on every caller
+        // (`HotStuff::resume`, `verify_chain`) to patch it in. The timestamp is
+        // transient state, not part of the state root or the genesis hash.
+        ledger.set_timestamp_ms(self.timestamp_ms);
 
         // The genesis block is unsigned and has a self-referential placeholder
         // justify; its hash commits to chain id, validators, and the initial state.
@@ -245,6 +250,8 @@ mod tests {
         let sa = a.build().unwrap();
         let sb = b.build().unwrap();
         assert_ne!(sa.hash(), sb.hash());
+        // The genesis ledger is positioned at the genesis block's time.
+        assert_eq!(sa.ledger.timestamp_ms(), sa.block.header.timestamp_ms);
         assert!(!sa.ledger.faucet_enabled());
         assert!(sb.ledger.faucet_enabled());
         assert_eq!(sa.ledger.state_root(), sb.ledger.state_root(), "faucet flag is not state");

@@ -48,6 +48,42 @@ enum Cmd {
         #[arg(long, default_value = "100")]
         amount: String,
     },
+    /// Submit a guardian-signed attestation, minting the bridged asset it carries.
+    ///
+    /// The attestation is hex, or `@path` to read it from a file (hex or raw bytes).
+    BridgeMint {
+        /// Attestation hex, or `@file`.
+        attestation: String,
+        /// SHRUGG transaction fee.
+        #[arg(long, default_value = "0.000001")]
+        fee: String,
+    },
+    /// Burn a bridged asset and emit the message a source-chain contract releases against.
+    BridgeBurn {
+        /// Asset id (64 hex); `shrugg bridge-status` lists the registered ones.
+        asset: String,
+        /// Amount in bridged units (8 decimals), as a plain integer.
+        amount: String,
+        /// Destination chain: 2 Ethereum, 3 BSC, 4 Tron, 5 Solana.
+        to_chain: u16,
+        /// Recipient on that chain, 32 bytes of hex (EVM addresses left-padded).
+        to: String,
+        /// Relayer fee carried in the message, in bridged units (at most `amount`).
+        #[arg(long, default_value = "0")]
+        bridge_fee: String,
+        /// SHRUGG transaction fee.
+        #[arg(long, default_value = "0.000001")]
+        fee: String,
+    },
+    /// Bridged-asset balance: `asset-balance <asset>` or `asset-balance <address> <asset>`.
+    AssetBalance {
+        /// An asset id, or an address when a second argument follows.
+        first: String,
+        /// The asset id, when the first argument is an address.
+        second: Option<String>,
+    },
+    /// Bridge configuration, guardian set, and registered assets.
+    BridgeStatus,
     /// Confidential programs: build, deploy, show.
     #[command(subcommand)]
     Program(ProgramCmd),
@@ -154,6 +190,39 @@ fn write_key(path: &Path, kp: &Keypair) -> Result<()> {
     Ok(())
 }
 
+/// An attestation given as hex, or as `@path` to a file holding either hex
+/// (with optional whitespace) or the raw bytes.
+fn read_attestation(arg: &str) -> Result<Vec<u8>> {
+    let text = match arg.strip_prefix('@') {
+        None => arg.to_string(),
+        Some(path) => {
+            let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+            match std::str::from_utf8(&bytes) {
+                Ok(s) if s.trim().chars().all(|c| c.is_ascii_hexdigit()) => s.to_string(),
+                // Not hex: take the file as the raw attestation.
+                _ => return Ok(bytes),
+            }
+        }
+    };
+    let text = text.trim();
+    let text = text.strip_prefix("0x").unwrap_or(text);
+    hex::decode(text).context("attestation must be hex, or @file")
+}
+
+/// Print every bridged asset an address holds, one per line.
+async fn print_holdings(rpc: &RpcClient, addr: &Address) -> Result<()> {
+    let holdings = rpc.assets(addr).await?;
+    if holdings.is_empty() {
+        println!("{addr} holds no bridged assets");
+        return Ok(());
+    }
+    println!("{addr} bridged holdings (units, 8 decimals):");
+    for h in holdings {
+        println!("  {} chain {} token {}  {}", h.asset, h.token_chain, hex::encode(h.token_address), h.balance);
+    }
+    Ok(())
+}
+
 fn pretty(v: &serde_json::Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
@@ -201,6 +270,49 @@ async fn main() -> Result<()> {
             let r = rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await?;
             let acct = rpc.account(&to).await?;
             println!("committed in block {}\nbalance: {} SHRUGG", r.height, format_amount(acct.balance));
+        }
+        Cmd::BridgeMint { attestation, fee } => {
+            let kp = load_key(&cli.key)?;
+            let bytes = read_attestation(&attestation)?;
+            let fee = parse_amount(&fee)?;
+            let hash = rpc.bridge_attest(&kp, bytes, fee).await?;
+            println!("submitted attestation {hash} (fee {} SHRUGG)", format_amount(fee));
+            let r = rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await?;
+            println!("committed in block {} (index {})", r.height, r.index);
+            print_holdings(&rpc, &kp.address()).await?;
+        }
+        Cmd::BridgeBurn { asset, amount, to_chain, to, bridge_fee, fee } => {
+            let kp = load_key(&cli.key)?;
+            let asset = Hash::from_hex(&asset).context("invalid asset id")?;
+            let amount: u128 = amount.parse().context("amount must be an integer of bridged units")?;
+            let bridge_fee: u128 = bridge_fee.parse().context("bridge fee must be an integer of bridged units")?;
+            let to = shrugg_client::hex32(&to).context("invalid destination")?;
+            let fee = parse_amount(&fee)?;
+            let hash = rpc.bridge_burn(&kp, asset, amount, to_chain, to, bridge_fee, fee).await?;
+            println!("submitted burn {hash}\n  {amount} units of {asset} to chain {to_chain}, relayer fee {bridge_fee} units");
+            let r = rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await?;
+            println!("committed in block {} (index {})", r.height, r.index);
+            let sequence = rpc.bridge_state().await?["burn_sequence"].as_u64().unwrap_or(0).saturating_sub(1);
+            match rpc.bridge_burn_record(sequence).await? {
+                Some(v) => println!("outbound message (sequence {sequence}):\n{}", pretty(&v)),
+                None => println!("outbound message not readable yet; try `shrugg bridge-status`"),
+            }
+        }
+        Cmd::AssetBalance { first, second } => {
+            let (addr, asset) = match second {
+                Some(asset) => (Address::from_base58(&first).context("invalid address")?, asset),
+                None => (load_key(&cli.key)?.address(), first),
+            };
+            let asset = Hash::from_hex(&asset).context("invalid asset id")?;
+            println!("{}", rpc.asset_balance(&addr, &asset).await?);
+        }
+        Cmd::BridgeStatus => {
+            let v = rpc.bridge_state().await?;
+            if v["enabled"].as_bool() != Some(true) {
+                println!("this chain has no bridge");
+            } else {
+                println!("{}", pretty(&v));
+            }
         }
         Cmd::Program(ProgramCmd::Build { guest, args, out }) => {
             let p = build_guest(&guest, &args)?;

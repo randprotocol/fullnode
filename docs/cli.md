@@ -146,6 +146,10 @@ Global options, accepted before or after the subcommand:
 | `balance [ADDRESS]` | | balance and nonce of `ADDRESS`, or of this wallet |
 | `send <TO> <AMOUNT>` | `--fee <SHRUGG>` (default `0.000001`), `--no-wait` | fetch nonce, check balance, sign, submit; then poll until committed (up to 60 s) and print the block height and new balance |
 | `faucet [ADDRESS]` | `--amount <SHRUGG>` (default `100`, max `100`) | testnet only: ask the node to mint to `ADDRESS` (default: this wallet), wait for the commit, print the balance. Fails with `faucet is disabled` on chains without the genesis flag |
+| `bridge-mint <ATTESTATION>` | `--fee <SHRUGG>` (default `0.000001`) | submit a guardian-signed attestation as hex, or `@path` to read it from a file (hex or raw bytes); wait for the commit and print this wallet's bridged holdings. The bridge fee inside the attestation is paid to you for submitting it |
+| `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | `--bridge-fee <units>` (default `0`), `--fee <SHRUGG>` (default `0.000001`) | burn `AMOUNT` bridged units of `ASSET` and emit the message a source-chain contract releases against. `TO_CHAIN` is 2 Ethereum, 3 BSC, 4 Tron, 5 Solana; `TO` is 32 bytes of hex (EVM and Tron addresses left-padded). `--bridge-fee` is carried in the message for whoever relays it and must not exceed `AMOUNT`. Prints the outbound message after the commit |
+| `asset-balance [ADDRESS] <ASSET>` | | balance of one bridged asset, as a plain integer of bridged units. With one argument it is the asset and the address is this wallet |
+| `bridge-status` | | this chain's emitter, source-chain emitter table, current guardian set, burn sequence and registered assets; prints `this chain has no bridge` where there is none |
 | `program build` | `--guest <fib\|memcpy\|bubble_sort\|balance_check\|private_payment>`, `--arg N` (repeatable), `--out <file>` (default `program.json`) | assemble a built-in guest to `{base_pc, words}` JSON; prints the program id |
 | `program deploy <FILE>` | `.json` or `.bin` (raw LE words) | sign a `Deploy` with the schedule fee, wait for the commit, print the program id |
 | `program show <ID>` | | deployed program metadata |
@@ -160,6 +164,23 @@ Global options, accepted before or after the subcommand:
 | `validators` | | validator set with stakes |
 
 Amounts are decimal SHRUGG strings with up to 9 decimal places (`1`, `1.5`, `.25`, `0.000000001`).
+
+Bridged assets are a separate unit: 8 decimals, not SHRUGG's 9. `bridge-burn` and `asset-balance`
+therefore take and print plain integers of bridged units, never a decimal string — `100000000` is one
+whole token. `--fee` is always the SHRUGG transaction fee; the relayer fee inside a burn message is
+`--bridge-fee`.
+
+### A bridge round trip
+
+```bash
+shrugg bridge-status                                   # the guardian set and registered assets
+shrugg bridge-mint @attestation.hex                    # guardians signed it; you submit and keep its fee
+shrugg asset-balance 8f1c...                           # your holding, in bridged units
+shrugg bridge-burn 8f1c... 100000000 2 000000000000000000000000d8da6bf2... --bridge-fee 1000
+```
+
+The asset id is `blake3("shrugg-bridge-asset" || token_chain BE u16 || token_address)`; ask the node
+for it rather than computing it by hand (`shrugg_bridgeAssetId` in docs/rpc.md).
 
 ## Key file format
 

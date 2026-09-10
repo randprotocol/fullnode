@@ -146,6 +146,11 @@ impl Ledger {
         self.timestamp_ms = timestamp_ms;
     }
 
+    /// The block time this ledger is positioned at, in unix milliseconds.
+    pub fn timestamp_ms(&self) -> u64 {
+        self.timestamp_ms
+    }
+
     /// The block time in unix seconds — `now` for guardian-set expiry and the
     /// timestamp of outbound burn messages.
     fn now_secs(&self) -> u64 {
