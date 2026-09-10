@@ -41,6 +41,8 @@ rand-zkvm-cuda = { path = "../../../circuits/rand-zkvm-cuda", optional = true }
 default = []
 # The GPU backend's CPU-twin engines: the same Merkle/NTT code paths, no device needed.
 reference-backend = ["dep:rand-zkvm-cuda"]
+# `cuda` and `mock-cuda` are mutually exclusive: enabling both is a hard `compile_error!` in
+# rand-zkvm-cuda, so the host mock can never be silently substituted for the GPU.
 # `Backend::Cuda` against a real device. Pulls `cuda-core`, which needs a CUDA 13 toolkit at
 # build time.
 cuda = ["dep:rand-zkvm-cuda", "rand-zkvm-cuda/cuda"]

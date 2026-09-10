@@ -65,8 +65,67 @@ fn backend_proof_has_the_same_shape_as_a_cpu_proof() {
     assert_eq!(a.tier, b.tier);
     assert_eq!(a.public_values, b.public_values);
     assert_eq!(a.batch.degree_bits, b.batch.degree_bits);
-    // sizes agree to within the FRI query randomness
-    assert!((a.size() as i64 - b.size() as i64).abs() < 4096, "{} vs {}", a.size(), b.size());
+
+    // The commitment set: which optional commitments are present is fixed by the batch shape
+    // (ZK on => `random`; lookups present => `permutation`), so it must match exactly.
+    assert_eq!(a.batch.commitments.permutation.is_some(), b.batch.commitments.permutation.is_some());
+    assert_eq!(a.batch.commitments.random.is_some(), b.batch.commitments.random.is_some());
+    assert_eq!(a.batch.lookup_terminals.len(), b.batch.lookup_terminals.len());
+    let present = |t: &[Option<_>]| t.iter().map(|x| x.is_some()).collect::<Vec<_>>();
+    assert_eq!(present(&a.batch.lookup_terminals), present(&b.batch.lookup_terminals));
+
+    // `BatchOpenedValues { instances: Vec<OpenedValuesWithLookups> }`, and each instance is
+    // `{ base_opened_values: OpenedValues, permutation_local, permutation_next }` with
+    // `OpenedValues { trace_local, trace_next, preprocessed_local, preprocessed_next,
+    // quotient_chunks, random }`. Every one of those lengths (and every `Option`'s presence)
+    // is determined by the AIR widths and the batch geometry, never by the FRI randomness, so
+    // the two proofs must nest identically.
+    let ai = &a.batch.opened_values.instances;
+    let bi = &b.batch.opened_values.instances;
+    assert_eq!(ai.len(), bi.len());
+    for (i, (x, y)) in ai.iter().zip(bi).enumerate() {
+        assert_eq!(x.permutation_local.len(), y.permutation_local.len(), "instance {i} permutation_local");
+        assert_eq!(x.permutation_next.len(), y.permutation_next.len(), "instance {i} permutation_next");
+        let (xo, yo) = (&x.base_opened_values, &y.base_opened_values);
+        assert_eq!(xo.trace_local.len(), yo.trace_local.len(), "instance {i} trace_local");
+        assert_eq!(
+            xo.trace_next.as_ref().map(Vec::len),
+            yo.trace_next.as_ref().map(Vec::len),
+            "instance {i} trace_next"
+        );
+        assert_eq!(
+            xo.preprocessed_local.as_ref().map(Vec::len),
+            yo.preprocessed_local.as_ref().map(Vec::len),
+            "instance {i} preprocessed_local"
+        );
+        assert_eq!(
+            xo.preprocessed_next.as_ref().map(Vec::len),
+            yo.preprocessed_next.as_ref().map(Vec::len),
+            "instance {i} preprocessed_next"
+        );
+        assert_eq!(
+            xo.quotient_chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            yo.quotient_chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            "instance {i} quotient_chunks"
+        );
+        assert_eq!(
+            xo.random.as_ref().map(Vec::len),
+            yo.random.as_ref().map(Vec::len),
+            "instance {i} random"
+        );
+    }
+
+    // Only a *relative* size check is possible. An absolute byte bound cannot work: the two
+    // proofs are salted by independent hiding-MMCS streams, so they have different transcripts,
+    // hence different FRI query indices, hence a different number of *shared* sibling hashes
+    // pruned out of the opening paths. That difference scales with the proof, not with a
+    // constant.
+    assert!(
+        (a.size() as i64 - b.size() as i64).abs() * 4 < a.size().max(b.size()) as i64,
+        "{} vs {}",
+        a.size(),
+        b.size()
+    );
 }
 
 /// `Backend::Cpu` goes through the same `prove_with` entry point and must be exactly `prove`.

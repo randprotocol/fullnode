@@ -342,6 +342,12 @@ impl Machine {
         Ok((self.prove_traces(program, &traces, tier), exec))
     }
 
+    /// NOTE: the body below is duplicated, deliberately, by `prove_on` (the generic-over-config
+    /// twin used by `Backend::Reference`/`Backend::Cuda`). The two must stay identical in every
+    /// proof-shaping respect — instance construction, the `i == 1` public-values placement, and
+    /// the `key_config`/`self.config` split between the key's prover data and `prove_batch` —
+    /// or a backend proof stops matching what the CPU verifier recomputes. Change one, change
+    /// the other.
     pub fn prove_traces(&self, program: &Program, traces: &Traces, tier: Tier) -> Proof {
         let airs = chips(program);
         let mats = traces.as_slice();
@@ -406,6 +412,12 @@ impl Machine {
     /// `key_cfg` must be seeded from `key_rngs`: the preprocessed commitment is what the
     /// verifier recomputes on the CPU via `verifier_key`, and the backend has to reproduce it
     /// exactly or verification fails at the first check.
+    ///
+    /// NOTE: this body is a deliberate duplicate of `prove_traces`'s (which cannot be generic
+    /// over `SC` because `Proof` names the CPU `Config`). Instance construction, the `i == 1`
+    /// public-values placement, and the `key_cfg`/`cfg` split must stay identical in both, or a
+    /// backend proof stops matching what the CPU verifier recomputes. Change one, change the
+    /// other.
     #[cfg(any(feature = "reference-backend", feature = "cuda", feature = "mock-cuda"))]
     fn prove_on<SC>(&self, cfg: &SC, key_cfg: &SC, program: &Program, inputs: &[u32], tier: Option<Tier>) -> Result<(Proof, Execution), ProveError>
     where
@@ -425,6 +437,10 @@ impl Machine {
         let instances: Vec<StarkInstance<'_, SC, Chip>> = airs.iter().zip(mats.iter()).enumerate().map(|(i, (air, trace))| StarkInstance {
             air, trace, public_values: if i == 1 { traces.public_values.clone() } else { vec![] },
         }).collect();
+        // `log_ext_degrees` reads `self.config.is_zk()` — the *CPU* config — not `key_cfg`'s.
+        // That is invariant, not a leak: every backend config (`reference_cfg`, `cuda_cfg`) is
+        // built on `HidingFriPcs` just as `make_config` is, so `is_zk()` is `true` for all of
+        // them and the degree bits agree with what `verify` recomputes.
         let prover_data = ProverData::from_airs_and_degrees(key_cfg, &airs, &self.log_ext_degrees(program, tier));
         // The engines panic (rather than return) on a device failure — `CudaHashEngine::ok`
         // and friends — so a backend fault must not take the caller's process down with it.

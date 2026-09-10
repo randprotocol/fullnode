@@ -133,7 +133,9 @@ and its toolkit requirement.
 | Tier too large for device memory | `Backend("device allocation of N bytes failed (M bytes free); use a lower tier")` |
 
 The PTX path can be overridden with `$RAND_ZKVM_PTX`; it otherwise defaults to
-`rand-zkvm-cuda/ptx/kernels.sm_80.ptx`.
+`rand-zkvm-cuda/ptx/kernels.sm_80.ptx`. A deployed binary must set `RAND_ZKVM_PTX`, because that
+default is an absolute path into the *build* machine's crate directory and will not exist on the
+node.
 
 **Status as of 2026-09-10.** The kernels have not been executed on real hardware, and no PTX is
 committed — `rand-zkvm-cuda/ptx/` holds only `PTX_BUILD.md`. Everything above is exercised on the
