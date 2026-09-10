@@ -6,6 +6,15 @@ pub const MAX_PROGRAM_WORDS: usize = 4096;
 pub const MAX_PROOF_BYTES: usize = 1 << 20;
 /// Largest public recipient list on a call.
 pub const MAX_RECIPIENTS: usize = 8;
+/// Largest bridge attestation accepted in a `BridgeAttest` transaction.
+///
+/// A real attestation is tiny: 6 envelope bytes, 66 per signature, a
+/// 51-byte body header and a payload of 133 bytes (transfer) or
+/// 5 + 20 * n (upgrade) — 520 bytes at the launch parameters (n = 6,
+/// quorum 5). 16 KiB still admits a quorum of well over 200 guardians,
+/// so it constrains nothing reachable while keeping an oversized blob
+/// from buying decode and signature-recovery work at a zero fee.
+pub const MAX_ATTESTATION_BYTES: usize = 16_384;
 /// Transaction bytes per block (proofs are ~0.9 MB each).
 pub const MAX_BLOCK_BYTES: usize = 4 << 20;
 /// zkVM tiers (log2 of the CPU table height).
