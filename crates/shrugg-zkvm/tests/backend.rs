@@ -49,10 +49,10 @@ fn every_guest_proves_on_the_backend_and_verifies_on_the_cpu() {
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         let expected = execute(&program, &inputs, 1 << 20).unwrap();
         assert_eq!(exec.outputs, expected.outputs, "{name}");
-        m.verify(&program, &proof).unwrap_or_else(|e| panic!("{name}: verify {e:?}"));
+        m.verify(&program.digest(), &proof).unwrap_or_else(|e| panic!("{name}: verify {e:?}"));
         let bytes = proof.to_bytes();
         let decoded: Proof = postcard::from_bytes(&bytes).unwrap();
-        m.verify(&program, &decoded).unwrap_or_else(|e| panic!("{name}: verify decoded {e:?}"));
+        m.verify(&program.digest(), &decoded).unwrap_or_else(|e| panic!("{name}: verify decoded {e:?}"));
     }
 }
 
@@ -134,5 +134,5 @@ fn cpu_backend_still_proves_and_verifies() {
     let m = Machine::new(FriProfile::Test);
     let p = guests::fib(10);
     let (proof, _) = m.prove_with(Backend::Cpu, &p, &[], None).unwrap();
-    m.verify(&p, &proof).unwrap();
+    m.verify(&p.digest(), &proof).unwrap();
 }

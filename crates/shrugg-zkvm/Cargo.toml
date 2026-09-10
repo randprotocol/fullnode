@@ -21,6 +21,11 @@ p3-uni-stark = "=0.7.0"
 p3-batch-stark = "=0.7.0"
 p3-lookup = "=0.7.0"
 p3-goldilocks = "=0.7.0"
+# M3.2: the `poseidon2` table (`tables/poseidon2.rs`) reproduces the round-constant RNG draw
+# `p3_poseidon2::Poseidon2Goldilocks`'s own construction makes, so its preprocessed trace is
+# byte-identical to `machine::permutation()`'s hashing permutation — see that table's module doc
+# comment. Not needed by the excluded note/viewing-key stack; this is a core dependency now.
+p3-poseidon2 = "=0.7.0"
 p3-field = "=0.7.0"
 p3-matrix = "=0.7.0"
 p3-challenger = "=0.7.0"

@@ -1,7 +1,7 @@
 //! Registers and RAM in one table, sorted by (space, addr, ts). Read-after-write
 //! consistency is a transition constraint; the CPU's accesses reach here through
 //! the MEMORY multiset bus.
-use super::{bus, byte::ByteCounts, limbs, F};
+use super::{bus, limbs, range::RangeCounts, F};
 use crate::emulator::CycleEvent;
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{Field, PrimeCharacteristicRing};
@@ -68,12 +68,16 @@ where
     }
 }
 
-pub fn memory_trace(events: &[CycleEvent], height: usize, counts: &mut ByteCounts) -> RowMajorMatrix<F> {
+/// M3.4: `clk_offset` is `Program::digest_rows()` — the cpu table's digest-row prefix shifts
+/// every ordinary event's own `CLK` forward by that many rows (`tables::cpu::cpu_trace`), and
+/// the `MEMORY` bus timestamps (`ts = 4*CLK + slot`) this table sends must use that same
+/// shifted `CLK` or the two sides' `(space, addr, ts, value, is_write)` tuples stop matching.
+pub fn memory_trace(events: &[CycleEvent], clk_offset: u32, height: usize, counts: &mut RangeCounts) -> RowMajorMatrix<F> {
     // (key, ts, space, addr, value, is_write)
     let mut rows: Vec<(u64, u64, u32, u32, u32, bool)> = Vec::new();
     for e in events {
         for a in &e.accesses {
-            rows.push((((a.space as u64) << KEY_SHIFT) | a.addr as u64, a.ts(e.clk) as u64, a.space, a.addr, a.value, a.is_write));
+            rows.push((((a.space as u64) << KEY_SHIFT) | a.addr as u64, a.ts(clk_offset + e.clk) as u64, a.space, a.addr, a.value, a.is_write));
         }
     }
     rows.sort_by_key(|r| (r.0, r.1));

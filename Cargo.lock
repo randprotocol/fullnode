@@ -3808,6 +3808,7 @@ dependencies = [
  "p3-lookup",
  "p3-matrix",
  "p3-merkle-tree",
+ "p3-poseidon2",
  "p3-symmetric",
  "p3-uni-stark",
  "postcard",

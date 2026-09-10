@@ -20,7 +20,12 @@ pub struct ProgramRecord {
     pub id: ProgramId,
     pub base_pc: u32,
     pub words: Vec<u32>,
-    /// zkVM code commitment (informational; verification uses `words`).
+    /// `hc`: the zkVM's in-circuit Poseidon2 program digest (`shrugg_zkvm::isa::Program::digest`),
+    /// as 8 little-endian `u32` words (32 bytes). M3.4: this is no longer merely informational —
+    /// `ZkExecutor::verify_call` decodes it back into `hc` and hands it straight to
+    /// `Machine::verify(hc, proof)`, which never sees `words` at all (the verifier holds only
+    /// the digest, `docs/confidential.md`'s "Constraint set 3" note). `ZkExecutor::check_program`
+    /// computes it at deploy time.
     pub code_hash: Vec<u8>,
     pub deployer: Address,
     pub deployed_at: u64,

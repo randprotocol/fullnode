@@ -5,6 +5,125 @@ use shrugg_zkvm::isa::*;
 
 fn run(p: &Program, inputs: &[u32]) -> Execution { execute(p, inputs, 1 << 16).unwrap() }
 
+/// M3.2: the `POSEIDON2` syscall (`guests::poseidon2_demo`, which hashes its message in place
+/// and outputs the 8-word digest) must agree with `hash::sponge_hash` — the host-side
+/// `PaddingFreeSponge<_, 8, 4, 4>` reference — for every block-boundary case: empty (no
+/// permutation, all-zero digest), one partial block, one exact full block, one full block plus
+/// a partial one, two full blocks, and a message spanning many blocks. Also checks the row
+/// count the syscall emits: 1 ecall row, `n.div_ceil(4)` absorb rows (0 when `n = 0`), and 2
+/// write-back rows — exactly what `tables::cpu`'s hash-row columns expect per call.
+#[test]
+fn poseidon2_syscall_matches_native_reference_for_various_lengths() {
+    for n in [0usize, 1, 4, 5, 8, 100] {
+        let msg: Vec<u32> = (1..=n as u32).collect();
+        let p = guests::poseidon2_demo(&msg);
+        let e = run(&p, &[]);
+        let want = shrugg_zkvm::hash::sponge_hash(&msg);
+        assert_eq!(&e.outputs[..8], &want[..], "n={n}: digest");
+        let hash_rows = e.events.iter().filter(|ev| ev.hash_row.is_some()).count();
+        assert_eq!(hash_rows, 1 + n.div_ceil(4) + 2, "n={n}: hash row count");
+    }
+}
+
+/// `n = 0` is the sponge's empty-input case: no permutation runs at all, and the digest is the
+/// all-zero state's own first 4 lanes.
+#[test]
+fn poseidon2_of_the_empty_message_is_the_all_zero_digest() {
+    assert_eq!(shrugg_zkvm::hash::sponge_hash(&[]), [0u32; 8]);
+    let e = run(&guests::poseidon2_demo(&[]), &[]);
+    assert_eq!(&e.outputs[..8], &[0u32; 8]);
+}
+
+/// `n > POSEIDON2_MAX_WORDS` is rejected before any absorption happens.
+#[test]
+fn poseidon2_over_the_word_limit_is_rejected() {
+    let mut a = Assembler::new(0);
+    a.extend(li(8, 0x1000));
+    a.extend(call_poseidon2(0x1000 / 4, (POSEIDON2_MAX_WORDS + 1) as usize));
+    a.extend(halt());
+    let err = execute(&a.assemble(), &[], 1 << 16).unwrap_err();
+    assert_eq!(err, ExecError::Poseidon2WordCount(POSEIDON2_MAX_WORDS + 1));
+}
+
+#[test]
+fn sub_word_loads_and_stores_match_the_spec() {
+    let mut a = Assembler::new(0);
+    a.extend(li(8, 0x1000)); a.extend(li(5, 0x11223344u32 as i32));
+    a.push(sw(8, 5, 0));
+    a.push(lb(6, 8, 0)); a.extend(write_output(0, 6));   // byte 0 = 0x44, sign-extends to 0x44
+    a.push(lbu(6, 8, 3)); a.extend(write_output(1, 6));  // byte 3 = 0x11
+    a.push(lh(6, 8, 2)); a.extend(write_output(2, 6));   // half at 2 = 0x1122
+    a.extend(halt());
+    let e = run(&a.assemble(), &[]);
+    assert_eq!((e.outputs[0], e.outputs[1], e.outputs[2]), (0x44, 0x11, 0x1122));
+}
+
+#[test]
+fn sub_word_signed_loads_sign_extend_and_unsigned_loads_zero_extend() {
+    let mut a = Assembler::new(0);
+    a.extend(li(8, 0x1000)); a.extend(li(5, 0xffu32 as i32));
+    a.push(sw(8, 5, 0));
+    a.push(lb(6, 8, 0)); a.extend(write_output(0, 6));   // signed: 0xff -> -1 -> 0xffff_ffff
+    a.push(lbu(6, 8, 0)); a.extend(write_output(1, 6));  // unsigned: 0xff -> 0xff
+    a.extend(li(5, 0xff00u32 as i32));
+    a.push(sw(8, 5, 4));
+    a.push(lh(6, 8, 4)); a.extend(write_output(2, 6));   // signed half: 0xff00 -> 0xffff_ff00
+    a.push(lhu(6, 8, 4)); a.extend(write_output(3, 6));  // unsigned half: 0xff00
+    a.extend(halt());
+    let e = run(&a.assemble(), &[]);
+    assert_eq!(e.outputs[0], 0xffff_ffff);
+    assert_eq!(e.outputs[1], 0xff);
+    assert_eq!(e.outputs[2], 0xffff_ff00);
+    assert_eq!(e.outputs[3], 0xff00);
+}
+
+#[test]
+fn a_sub_word_store_is_a_read_modify_write_that_leaves_other_bytes_alone() {
+    let mut a = Assembler::new(0);
+    a.extend(li(8, 0x1000)); a.extend(li(5, 0x11223344u32 as i32)); a.extend(li(6, 0xab));
+    a.push(sw(8, 5, 0));
+    a.push(sb(8, 6, 1));            // only byte 1 becomes 0xab: 0x1122ab44
+    a.push(lw(7, 8, 0)); a.extend(write_output(0, 7));
+    a.extend(halt());
+    let e = run(&a.assemble(), &[]);
+    assert_eq!(e.outputs[0], 0x1122ab44);
+}
+
+#[test]
+fn misaligned_half_load_and_store_are_rejected() {
+    // `Misaligned` carries the actual byte address (`alu_out`), matching `errors_are_reported`'s
+    // existing convention (`lw(6, 0, 2)` -> `Misaligned(2)`, not `Misaligned(0)`).
+    let mut a = Assembler::new(0); a.extend(li(8, 0x1000)); a.push(lh(6, 8, 1)); a.extend(halt());
+    assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::Misaligned(0x1001));
+    let mut a = Assembler::new(0); a.extend(li(8, 0x1000)); a.extend(li(5, 1)); a.push(sh(8, 5, 1)); a.extend(halt());
+    assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::Misaligned(0x1001));
+}
+
+#[test]
+fn misaligned_word_load_and_store_are_still_rejected() {
+    let mut a = Assembler::new(0); a.push(lw(6, 0, 2)); a.extend(halt());
+    assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::Misaligned(2));
+    let mut a = Assembler::new(0); a.extend(li(5, 1)); a.push(sw(0, 5, 2)); a.extend(halt());
+    assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::Misaligned(2));
+}
+
+#[test]
+fn byte_and_half_loads_are_never_misaligned_except_half_on_an_odd_offset() {
+    // lb/sb at every offset succeed; lh/sh only at offsets 0 and 2.
+    for off in 0..4i32 {
+        let mut a = Assembler::new(0); a.extend(li(8, 0x1000)); a.push(lb(6, 8, off)); a.extend(halt());
+        execute(&a.assemble(), &[], 100).unwrap();
+    }
+    for off in [0i32, 2] {
+        let mut a = Assembler::new(0); a.extend(li(8, 0x1000)); a.push(lh(6, 8, off)); a.extend(halt());
+        execute(&a.assemble(), &[], 100).unwrap();
+    }
+    for off in [1i32, 3] {
+        let mut a = Assembler::new(0); a.extend(li(8, 0x1000)); a.push(lh(6, 8, off)); a.extend(halt());
+        assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::Misaligned(0x1000 + off as u32));
+    }
+}
+
 #[test]
 fn fib_outputs_the_right_number() {
     let e = run(&guests::fib(20), &[]);
@@ -41,15 +160,33 @@ fn events_carry_what_the_cpu_table_needs() {
     assert_eq!(ev.accesses[2], MemAccess { space: SPACE_REG, addr: 5, slot: SLOT_W, value: 7, is_write: true });
     assert_eq!(ev.alu, vec![AluEvent { op: AluOp::Add, a: 0, b: 7, c: 7 }]);
     let ev = &e.events[1];
-    assert_eq!((ev.mem_addr, ev.mem_val), (0x40, 7));
-    assert_eq!(ev.accesses[2], MemAccess { space: SPACE_RAM, addr: 0x40, slot: SLOT_MEM, value: 7, is_write: true });
-    assert_eq!(ev.accesses.len(), 3, "no rd write for sw");
+    // `mem_val` is now the pre-store word (unwritten memory reads zero); the merged word
+    // (7) goes out separately on `SLOT_W` — a store is a read-modify-write of one word.
+    assert_eq!((ev.mem_addr, ev.mem_val), (0x40, 0));
+    assert_eq!(ev.accesses[2], MemAccess { space: SPACE_RAM, addr: 0x40, slot: SLOT_MEM, value: 0, is_write: false });
+    assert_eq!(ev.accesses[3], MemAccess { space: SPACE_RAM, addr: 0x40, slot: SLOT_W, value: 7, is_write: true });
+    assert_eq!(ev.accesses.len(), 4, "rs1 read, rs2 read, RAM read (SLOT_MEM), RAM write (SLOT_W)");
     let ev = &e.events[2];
     assert_eq!((ev.mem_addr, ev.mem_val, ev.c), (0x40, 7, 7));
     let last = e.events.last().unwrap();
     assert_eq!(last.sys, Some(Syscall::Halt));
     assert_eq!(last.mem_addr, 11);
     assert_eq!(last.accesses.len(), 3, "a7 read, a0 read, a1 read via mem slot");
+}
+
+#[test]
+fn sub_word_checksum_guest_matches_hand_computed_reference() {
+    let e = run(&guests::sub_word_checksum(), &[]);
+    assert!(e.halted);
+    // word0 = 0x7fff0281 (bytes 0x81 02 ff 7f), word1 = 0x00ff8001 (halves 0x8001 00ff).
+    assert_eq!(e.outputs[1], 0x7fff_0281);
+    assert_eq!(e.outputs[2], 0x00ff_8001);
+    // XOR fold of: LB(0)=0xffff_ff81, LBU(0)=0x81, LB(3)=0x7f, LH(4)=0xffff_8001,
+    // LHU(4)=0x8001, LH(6)=0xff, LW(0)=word0, LW(4)=word1.
+    let folded = [0xffff_ff81u32, 0x81, 0x7f, 0xffff_8001, 0x8001, 0xff, 0x7fff_0281, 0x00ff_8001];
+    let acc = folded.iter().fold(0u32, |a, x| a ^ x);
+    assert_eq!(e.outputs[0], acc);
+    assert_eq!(e.outputs[0], 0x7f00_7d00);
 }
 
 #[test]
@@ -84,11 +221,14 @@ fn alu_mix_covers_every_op_and_jalr() {
     let e = run(&p, &[]);
     assert!(e.halted);
 
-    // Every AluOp variant really reaches the ALU bus, `Eq` included — it has no encoding of
-    // its own, so it can only arrive through a branch.
+    // Every RV32I AluOp variant really reaches the ALU bus, `Eq` included — it has no
+    // encoding of its own, so it can only arrive through a branch. The M-extension variants
+    // (M2.6) are `alu_mix`'s successor's job — see `muldiv_covers_every_op`.
     let mut seen = std::collections::HashSet::new();
     for ev in &e.events { for a in &ev.alu { seen.insert(a.op); } }
-    for op in AluOp::ALL { assert!(seen.contains(&op), "{op:?} never executed"); }
+    for op in [AluOp::Add, AluOp::Sub, AluOp::And, AluOp::Or, AluOp::Xor, AluOp::Sll, AluOp::Srl, AluOp::Sra, AluOp::Slt, AluOp::Sltu, AluOp::Eq] {
+        assert!(seen.contains(&op), "{op:?} never executed");
+    }
 
     // Exactly one JALR, through a register target, linking pc + 4 and skipping one word.
     assert_eq!(e.events.iter().filter(|ev| ev.dec.is_jalr == 1).count(), 1);
@@ -113,4 +253,42 @@ fn alu_mix_covers_every_op_and_jalr() {
     // The `bad` and `skipped` arms both write 0x7ff, so 4 also proves neither ran.
     assert_eq!(e.outputs[1], 4);
     assert_eq!(e.outputs[2..], [0; 6]);
+}
+
+#[test]
+fn muldiv_covers_every_op() {
+    let p = guests::muldiv();
+    let e = run(&p, &[]);
+    assert!(e.halted);
+
+    let mut seen = std::collections::HashSet::new();
+    for ev in &e.events { for a in &ev.alu { seen.insert(a.op); } }
+    for op in [AluOp::Mul, AluOp::Mulh, AluOp::Mulhu, AluOp::Mulhsu, AluOp::Div, AluOp::Divu, AluOp::Rem, AluOp::Remu] {
+        assert!(seen.contains(&op), "{op:?} never executed");
+    }
+
+    // Recomputed straight from `AluOp::eval` — the reference semantics — not copied out of
+    // a run, mirroring `alu_mix_covers_every_op_and_jalr`'s style.
+    let neg1 = 0xffff_ffffu32;
+    let min = 0x8000_0000u32;
+    let folded: [(AluOp, u32, u32); 16] = [
+        (AluOp::Mul, 6, 7),
+        (AluOp::Mulh, neg1, neg1),
+        (AluOp::Mulhu, neg1, neg1),
+        (AluOp::Mulhsu, neg1, 7),
+        (AluOp::Divu, 6, 7),
+        (AluOp::Remu, 6, 7),
+        (AluOp::Div, neg1, 7),
+        (AluOp::Rem, neg1, 7),
+        (AluOp::Divu, 6, 0),
+        (AluOp::Remu, 6, 0),
+        (AluOp::Div, min, neg1),
+        (AluOp::Rem, min, neg1),
+        (AluOp::Div, (-4i32) as u32, 2),
+        (AluOp::Rem, (-4i32) as u32, 2),
+        (AluOp::Div, (-3i32) as u32, 10),
+        (AluOp::Rem, (-3i32) as u32, 10),
+    ];
+    let acc = folded.iter().fold(0u32, |a, (op, l, r)| a ^ op.eval(*l, *r));
+    assert_eq!(e.outputs[0], acc);
 }

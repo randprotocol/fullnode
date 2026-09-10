@@ -1,29 +1,30 @@
 //! The chain-side verifier: implements shrugg-core's executor trait with the zkVM.
 //!
-//! Verifying a proof costs ~20 ms once the verifier key for its program is known; computing
-//! that key (the preprocessed program + byte-table commitment, FRI-expanded) costs ~2 s. Keys
-//! are therefore cached per (program, tier).
+//! M3.4: the verifier no longer holds the program at all — `Machine::verify` takes `hc`, the
+//! in-circuit Poseidon2 digest of the program (`isa::Program::digest`), never `words`. The
+//! verifier key it needs is `(tier, program_log_height)`-keyed and program-*content*-independent
+//! (`Machine::verifier_key`'s own doc comment), so `Machine` already caches it end to end; there
+//! is no second, program-keyed cache to maintain here any more (see `warm`'s doc comment for
+//! what "warm" means now).
+//!
+//! Verifying a proof costs ~16-20 ms once its `(tier, program_log_height)` verifier key is
+//! known; computing that key (the range/nibble/Poseidon2-round-constant preprocessed
+//! commitment, FRI-expanded) is the dominant cost of an uncached verify (`docs/03-privacy.md`).
 
 use crate::isa::{Instr, Program};
-use crate::machine::{chips, Backend, Config, FriProfile, Machine, Proof, Tier, Val, TIERS};
+use crate::machine::{Backend, FriProfile, Machine, Proof, Tier, TIERS};
 use crate::tables::cpu::pv;
-use p3_batch_stark::{verify_batch, CommonData};
-use p3_field::PrimeCharacteristicRing;
+use crate::tables::program;
 use shrugg_core::confidential::{ConfidentialError, ConfidentialExecutor};
-use shrugg_core::program::{CallOutcome, ProgramId, ProgramRecord};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
-const KEY_CACHE: usize = 64;
+use shrugg_core::program::{CallOutcome, ProgramRecord};
 
 pub struct ZkExecutor {
     machine: Machine,
-    keys: Mutex<HashMap<(ProgramId, usize), Arc<CommonData<Config>>>>,
 }
 
 impl ZkExecutor {
     pub fn new(profile: FriProfile) -> ZkExecutor {
-        ZkExecutor { machine: Machine::new(profile), keys: Mutex::new(HashMap::new()) }
+        ZkExecutor { machine: Machine::new(profile) }
     }
 
     pub fn profile(&self) -> FriProfile {
@@ -38,27 +39,26 @@ impl ZkExecutor {
         }
     }
 
-    fn program(record: &ProgramRecord) -> Program {
-        Program { base_pc: record.base_pc, words: record.words.clone() }
+    /// Decode the `hc` (`isa::Program::digest`) a `ProgramRecord`'s `code_hash` stores — 8
+    /// little-endian `u32` words, 32 bytes total (see `check_program`). Any other length means
+    /// the record predates M3.4 or is otherwise corrupt; neither is a program this executor can
+    /// verify a call against.
+    fn hc_of(record: &ProgramRecord) -> Result<[u32; 8], ConfidentialError> {
+        if record.code_hash.len() != 32 {
+            return Err(ConfidentialError::WrongProgram);
+        }
+        let mut hc = [0u32; 8];
+        for (i, word) in hc.iter_mut().enumerate() {
+            *word = u32::from_le_bytes(record.code_hash[4 * i..4 * i + 4].try_into().unwrap());
+        }
+        Ok(hc)
     }
 
-    fn key_for(&self, record: &ProgramRecord, tier: Tier) -> Arc<CommonData<Config>> {
-        let k = (record.id, tier.0);
-        if let Some(c) = self.keys.lock().unwrap().get(&k) {
-            return c.clone();
-        }
-        let key = Arc::new(self.machine.verifier_key(&Self::program(record), tier));
-        let mut cache = self.keys.lock().unwrap();
-        if cache.len() >= KEY_CACHE {
-            cache.clear();
-        }
-        cache.insert(k, key.clone());
-        key
-    }
-
-    /// Number of cached verifier keys (for tests and status).
+    /// Number of `(tier, program_log_height)` verifier keys this executor's `Machine` currently
+    /// has cached — `Machine`'s own cache, not a second one kept here (see the module doc
+    /// comment).
     pub fn cached_keys(&self) -> usize {
-        self.keys.lock().unwrap().len()
+        self.machine.cached_keys()
     }
 }
 
@@ -73,39 +73,53 @@ impl ConfidentialExecutor for ZkExecutor {
         for (index, w) in words.iter().enumerate() {
             Instr::decode(*w).map_err(|e| ConfidentialError::BadInstruction { index, reason: format!("{e:?}") })?;
         }
-        // The on-chain code commitment is the content id; the zkVM's Poseidon2 commitment is
-        // what the verifier key holds and is computed by `warm`/`verify_call` (2 s), never here.
-        Ok(shrugg_core::program::program_id(base_pc, words).0.to_vec())
+        // M3.4: the on-chain code commitment *is* `hc` now — the exact in-circuit digest
+        // `Machine::verify` checks every call's proof against, not just an informational
+        // content id (`program_id`, a separate blake3 hash, already covers that role via
+        // `ProgramRecord.id`). Stored as 8 little-endian `u32` words (32 bytes); `hc_of` is the
+        // inverse.
+        let hc = Program { base_pc, words: words.to_vec() }.digest();
+        let mut out = Vec::with_capacity(32);
+        for w in hc {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        Ok(out)
     }
 
+    /// Precompute the verifier key(s) a call against `record` is likely to need. M3.4: the key
+    /// is `(tier, program_log_height)`, program-content-independent — every program at the same
+    /// declared height and tier shares one, so there is nothing left to warm *per program*
+    /// except its own `program_log_height` (a pure function of `record.words.len()`). Which
+    /// *tier* a call will actually declare depends on the private inputs' cycle count, not
+    /// knowable at deploy time — so, as before this milestone, this only warms the smallest
+    /// tier (`TIERS[0]`): most confidential calls on this chain are small enough to land there,
+    /// and warming every tier for every deployed program would mean also building the
+    /// Poseidon2 chip's preprocessed round-constant table at the largest tiers (`2^22` rows),
+    /// which is not the "cheap" end of `docs/03-privacy.md`'s preprocessed-commitment cost any
+    /// more. A call that lands on a larger tier still verifies correctly — it just pays the
+    /// uncached first-verify cost `warm` would otherwise have amortized.
     fn warm(&self, record: &ProgramRecord) {
-        let _ = self.key_for(record, Tier(TIERS[0]));
+        let log_height = program::program_log_height(record.words.len());
+        self.machine.verifier_key(Tier(TIERS[0]), log_height);
     }
 
     fn verify_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
         let proof: Proof = postcard::from_bytes(proof).map_err(|_| ConfidentialError::MalformedProof)?;
+        // `Machine::verify` bounds `proof.tier`/`proof.program_log_height` itself before using
+        // either to size anything — but the degree-bits pre-check right below shifts by both
+        // too, so it needs the same guard in front of it to avoid panicking on an
+        // attacker-chosen out-of-range value before ever reaching `verify`.
         if !TIERS.contains(&proof.tier.0) {
             return Err(ConfidentialError::InvalidProof("unknown tier".into()));
         }
-        if proof.public_values.len() != pv::NUM {
-            return Err(ConfidentialError::MalformedProof);
+        if !(program::MIN_LOG_HEIGHT..=program::MAX_LOG_HEIGHT).contains(&proof.program_log_height) {
+            return Err(ConfidentialError::InvalidProof("program height out of range".into()));
         }
-        if proof.public_values[pv::PC_ENTRY] != record.base_pc as u64 {
-            return Err(ConfidentialError::WrongProgram);
-        }
-        if proof.public_values[pv::TIER] != proof.tier.0 as u64 {
-            return Err(ConfidentialError::InvalidProof("tier mismatch".into()));
-        }
-        let program = Self::program(record);
-        if proof.batch.degree_bits != self.machine.log_ext_degrees_pub(&program, proof.tier) {
+        if proof.batch.degree_bits != self.machine.log_ext_degrees_pub(proof.tier, proof.program_log_height) {
             return Err(ConfidentialError::InvalidProof("degree bits".into()));
         }
-        let key = self.key_for(record, proof.tier);
-        let airs = chips(&program);
-        let pvals: Vec<Val> = proof.public_values.iter().map(|x| Val::from_u64(*x)).collect();
-        let pvs: Vec<Vec<Val>> = (0..5).map(|i| if i == 1 { pvals.clone() } else { vec![] }).collect();
-        verify_batch(&self.machine.config, &airs, &proof.batch, &pvs, &key)
-            .map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+        let hc = Self::hc_of(record)?;
+        self.machine.verify(&hc, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
         let mut outputs = [0u32; 8];
         for (i, o) in outputs.iter_mut().enumerate() {
             let v = proof.public_values[pv::OUT0 + i];
@@ -118,10 +132,13 @@ impl ConfidentialExecutor for ZkExecutor {
     }
 }
 
-/// The zkVM's own commitment to a program (Poseidon2 Merkle root of the preprocessed
-/// program and byte tables). Costs ~2 s; informational, e.g. for explorers.
-pub fn zk_code_hash(profile: FriProfile, program: &Program) -> String {
-    Machine::new(profile).code_hash(program, Tier(TIERS[0]))
+/// The zkVM's own commitment to a program: `hc`, the in-circuit Poseidon2 digest
+/// `Machine::verify` checks proofs against, as hex. M3.4: no longer `Machine`/tier-dependent —
+/// `Program::code_hash` is a pure, deterministic function of `base_pc` and the program's words;
+/// kept here (rather than just calling `program.code_hash()` at call sites) for API stability,
+/// e.g. explorers that already import it from this module.
+pub fn zk_code_hash(program: &Program) -> String {
+    program.code_hash()
 }
 
 /// Prover entry point for the wallet and tests. Returns (proof bytes, outputs, tier).

@@ -10,8 +10,8 @@ fn two_proofs_of_the_same_run_differ_and_both_verify() {
     let (b, _) = m.prove(&p, &inputs, None).unwrap();
     assert_eq!(a.public_values, b.public_values);
     assert_ne!(a.to_bytes(), b.to_bytes(), "hiding commitments must randomise the proof");
-    m.verify(&p, &a).unwrap();
-    m.verify(&p, &b).unwrap();
+    m.verify(&p.digest(), &a).unwrap();
+    m.verify(&p.digest(), &b).unwrap();
 }
 
 #[test]
