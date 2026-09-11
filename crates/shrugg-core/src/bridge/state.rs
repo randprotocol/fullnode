@@ -277,9 +277,16 @@ impl BridgeState {
     }
 
     /// Validates an encoded attestation without mutating anything: resolve
-    /// the guardian set named by the envelope, verify the quorum, decode
-    /// and check the payload, screen the mint credits for overflow, and
-    /// reject an already-consumed digest.
+    /// the guardian set named by the envelope, reject an already-consumed
+    /// digest, decode and check the payload, screen the mint credits for
+    /// overflow, and only then verify the quorum.
+    ///
+    /// Cheap before expensive: `BridgeAttest` has a zero minimum fee, so
+    /// every check that needs no signature recovery runs first. Otherwise a
+    /// replayed (public, already-consumed) or mis-addressed attestation
+    /// would buy a full quorum of secp256k1 recoveries on every node that
+    /// validates it. The accepted set is identical either way; only which
+    /// refusal is reported first changes.
     ///
     /// `submitter` is the account that would keep the transfer's bridge fee;
     /// `now` is unix seconds (the ledger passes `timestamp_ms / 1000`).
@@ -299,7 +306,10 @@ impl BridgeState {
             .guardian_sets
             .get(&index)
             .ok_or(VerifyError::UnknownGuardianSet(index))?;
-        let mu = verify_decoded(&att, body_bytes, set, now)?;
+        let mu = digest(body_bytes);
+        if self.spent.contains(&Hash(mu)) {
+            return Err(BridgeError::Replay);
+        }
         let payload = Payload::decode(&att.body.payload).map_err(|_| BridgeError::BadPayload)?;
         match &payload {
             Payload::Transfer(t) => {
@@ -359,9 +369,10 @@ impl BridgeState {
                 }
             }
         }
-        if self.spent.contains(&Hash(mu)) {
-            return Err(BridgeError::Replay);
-        }
+        // The expensive part last: set expiry, index and quorum rule, low-s,
+        // and one recovery per signature.
+        let verified = verify_decoded(&att, body_bytes, set, now)?;
+        debug_assert_eq!(verified, mu);
         Ok((att, mu, payload))
     }
 
@@ -1246,5 +1257,76 @@ mod tests {
         assert_eq!(c.guardians, vec![[0x11u8; 20]]);
         // and such a chain can mint nothing: no emitter is registered
         assert!(BridgeState::from_config(&c).emitters.is_empty());
+    }
+
+    /// `attest`, but signed by six keys outside the set, so the quorum
+    /// check can only fail: a submission rejected with any *other* error
+    /// was rejected before signature recovery ran.
+    fn misattest(set_index: u32, body: Body) -> Vec<u8> {
+        let strangers: Vec<[u8; 32]> = (11u8..=16).map(|i| [i; 32]).collect();
+        attest(&strangers, set_index, body)
+    }
+
+    /// Cheap-before-expensive (fullnode d5143a6, applied to the bridge):
+    /// everything that needs no signature recovery — replay, emitter
+    /// binding, payload shape and amounts, the rotation index — is decided
+    /// first, so a replayed or mis-addressed attestation cannot buy the
+    /// quorum's secp256k1 recoveries at the zero minimum fee. The set of
+    /// accepted attestations is unchanged; only the order of refusals is.
+    #[test]
+    fn cheap_checks_run_before_signature_recovery() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        let sub = key(9).address();
+        st.apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 10, 1)), sub, 1)
+            .unwrap();
+        // A consumed digest is public knowledge and free to resubmit.
+        assert_eq!(
+            st.check_attest(&misattest(0, transfer_body(2, 1_000, 10, 1)), sub, 1)
+                .unwrap_err(),
+            BridgeError::Replay
+        );
+        let mut b = transfer_body(2, 1, 0, 1);
+        b.emitter_address = [9; 32];
+        assert_eq!(
+            st.check_attest(&misattest(0, b), sub, 1).unwrap_err(),
+            BridgeError::WrongEmitter
+        );
+        assert_eq!(
+            st.check_attest(&misattest(0, transfer_body(2, 1, 0, 2)), sub, 1)
+                .unwrap_err(),
+            BridgeError::WrongToChain
+        );
+        assert_eq!(
+            st.check_attest(&misattest(0, transfer_body(2, 1, 2, 1)), sub, 1)
+                .unwrap_err(),
+            BridgeError::FeeExceedsAmount
+        );
+        assert_eq!(
+            st.check_attest(&misattest(0, transfer_body(2, 0, 0, 1)), sub, 1)
+                .unwrap_err(),
+            BridgeError::ZeroAmount
+        );
+        let mut b = transfer_body(2, 1, 0, 1);
+        b.payload[0] = 9; // unknown payload id
+        assert_eq!(
+            st.check_attest(&misattest(0, b), sub, 1).unwrap_err(),
+            BridgeError::BadPayload
+        );
+        let keys = vec![guardian_address(&[21; 32])];
+        assert_eq!(
+            st.check_attest(&misattest(0, upgrade_body(5, keys)), sub, 1)
+                .unwrap_err(),
+            BridgeError::BadUpgradeIndex {
+                expected: 1,
+                got: 5
+            }
+        );
+        // Well-formed and fresh: now the quorum is what fails.
+        assert!(matches!(
+            st.check_attest(&misattest(0, transfer_body(2, 1, 0, 1)), sub, 1)
+                .unwrap_err(),
+            BridgeError::Verify(VerifyError::WrongGuardian(_))
+        ));
     }
 }
