@@ -256,8 +256,9 @@ asset, not SHRUGG.
    work: the replay check against `spent` (by digest `mu`), the payload decode
    (`BridgeError::BadPayload`), the emitter check against the registered emitter for the
    emitter chain, and the payload's own field checks (token chain, asset, recipient shape).
-   Only an attestation that passes all of those reaches guardian-set resolution and
-   quorum/index/low-s/signature-recovery (`verify_decoded`). Before `273e13d` recovery ran
+   Guardian-set resolution itself (`UnknownGuardianSet`) still happens right after the decode,
+   before the replay check; it is the signature work (set expiry, index/quorum, low-s, recovery
+   in `verify_decoded`) that only an attestation passing all of the cheap checks reaches. Before `273e13d` recovery ran
    first; accepted attestations are unchanged by the reordering.
 3. `BridgeBurn`: bridge presence, then `check_burn` — registered asset -> `to_chain` matches home
    chain -> recipient shape -> `fee <= amount` -> `amount != 0` -> sufficient balance.
