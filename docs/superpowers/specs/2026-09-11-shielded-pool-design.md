@@ -94,8 +94,15 @@ plus the amounts; the public fee, burn and asset. The guest proves:
    with `asset != 0` must have `fee = 0` in this bundle and be paired with a second SHRUGG bundle
    (section 10). For the first release `asset` is always 0.
 7. `time` is copied into both output notes.
-8. The single public output is `digest = H_OUT(anchor, nf_1, nf_2, cm_1, cm_2, fee, burn, asset, time)`,
-   8 words in `OUT0..OUT7`.
+8. The single public output is
+   `digest = H(BUNDLE, anchor, nf_1, nf_2, cm_1, cm_2, fee, burn, asset, time, bad)`, 8 words in
+   `OUT0..OUT7`, a fixed 47-word preimage under its own domain tag. `bad` is the guest's taint
+   accumulator: this ISA has no in-circuit assert, so every arithmetic relation above (balance,
+   range, anchor agreement between two real inputs, per-input asset) ORs its violation into
+   `bad`, and the ledger recomputes the digest with `bad = 0`. A violated relation therefore
+   yields a digest the ledger can never reproduce. (Ruling 2026-09-11: the taint must land on a
+   word the verifier fixes itself; an earlier plan draft XORed it into `time`, which the sender
+   supplies, and a sender could have published `time ^ 1` to pass the check.)
 
 The chain recomputes `digest` from the plaintext bundle fields and compares. The proof is verified
 last, after every cheap check (section 7). `hc` must equal `hc_bundle`.
