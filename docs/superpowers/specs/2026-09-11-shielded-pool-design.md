@@ -179,9 +179,14 @@ disclosure for calls needs the inputs on chain, encrypted, bound to the proof.
 - **What stays hidden.** Everyone else sees `H_IN`, the ciphertext, and the public receipt as
   before. The bundle carrying the call already lets a party key show the call's value flow; the
   input envelope adds the computation itself.
+- **Voluntary disclosure (user decision 2026-09-11).** The chain never requires disclosure and
+  no validator, explorer or bridge holds a key. The wallet always writes the envelope, so the
+  caller keeps the ability to unmask a call later for compliance; whether to hand out a party
+  key, a per-call key, or nothing is the caller's choice at the time an auditor asks. A caller
+  who wants no disclosure path at all can pass `--no-envelope`, which forfeits that option for
+  that call permanently; the chain accepts both.
 - **Dependencies.** zkVM M4.1 (`H_IN`, salt) and the note envelope code (`viewing.rs`), both
-  existing; no zkVM change beyond M4.1. Wallet: `shrugg call` builds the envelope by default and
-  `--no-envelope` omits it (the `Call` then has no disclosure path, like today).
+  existing; no zkVM change beyond M4.1.
 
 ## 7. Validity and admission order
 
