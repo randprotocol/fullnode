@@ -309,3 +309,44 @@ impl Program {
         self.digest().iter().map(|w| format!("{w:08x}")).collect()
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadError {
+    Empty,
+    Length(usize),
+    BasePc(u32),
+    TooLong(usize),
+    Decode { index: usize, word: u32, err: DecodeError },
+}
+
+impl Program {
+    /// The M4.1 flat-binary loader: little-endian words, `base_pc % 4 == 0`, every word must
+    /// decode (`Instr::decode`, the same check `program_trace` enforces as a panic on a
+    /// hand-built `Program` — this is the friendly, `Result`-returning path in front of it).
+    /// `MAX_LOG_HEIGHT` bounds the program table's height a proof can ever declare
+    /// (`tables::program::program_log_height`'s doc comment); `pad_height(len+1,
+    /// MIN_HEIGHT)` needs `len + 1 <= 2^MAX_LOG_HEIGHT`, so `len` up to `2^MAX_LOG_HEIGHT - 1`
+    /// is the largest image this loader — or any other program construction path — can ever
+    /// turn into a provable `Program`.
+    pub fn from_flat_binary(base_pc: u32, bytes: &[u8]) -> Result<Program, LoadError> {
+        if bytes.is_empty() { return Err(LoadError::Empty); }
+        if bytes.len() % 4 != 0 { return Err(LoadError::Length(bytes.len())); }
+        if base_pc % 4 != 0 { return Err(LoadError::BasePc(base_pc)); }
+        let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let max_words = (1usize << crate::tables::program::MAX_LOG_HEIGHT) - 1;
+        if words.len() > max_words { return Err(LoadError::TooLong(words.len())); }
+        for (index, &word) in words.iter().enumerate() {
+            if let Err(err) = Instr::decode(word) { return Err(LoadError::Decode { index, word, err }); }
+        }
+        Ok(Program::new(base_pc, words))
+    }
+
+    /// The inverse: little-endian bytes of every word, `base_pc` carried only in the
+    /// `Program` itself (a flat binary has no header — the loader's caller supplies
+    /// `base_pc` out of band, exactly `guests::compiled::fib`'s `0x1000` literal does).
+    pub fn to_flat_binary(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.words.len() * 4);
+        for w in &self.words { out.extend_from_slice(&w.to_le_bytes()); }
+        out
+    }
+}

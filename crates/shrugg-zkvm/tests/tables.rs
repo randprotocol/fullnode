@@ -383,14 +383,48 @@ fn alu_fill_rejects_wrong_result() {
 use shrugg_zkvm::tables::cpu::{self, cpu_trace, public_values};
 
 #[test]
+fn input_digest_of_empty_is_not_the_zero_digest() {
+    use shrugg_zkvm::hash::input_digest;
+    assert_ne!(input_digest([0u32; 4], &[]), [0u32; 8]);
+    // Salted H_IN (controller ruling): the salt row alone (`n_in == 0` needs no separate
+    // real-input block any more) is still exactly 1 row.
+    assert_eq!(input_digest_rows_len(&[]), 1);
+}
+fn input_digest_rows_len(inputs: &[u32]) -> usize { shrugg_zkvm::hash::input_digest_rows([0u32; 4], inputs).len() }
+
+#[test]
+fn input_table_shape_and_padding() {
+    use shrugg_zkvm::tables::input::{col, input_trace};
+    let t = input_trace(&[10, 20, 30], &[0, 2, 1], 8);
+    assert_eq!(t.height(), 8);
+    for (i, (word, mult)) in [(10u32, 0u32), (20, 2), (30, 1)].iter().enumerate() {
+        let r = i * col::WIDTH;
+        assert_eq!(t.values[r + col::IDX], shrugg_zkvm::tables::F::from_u32(i as u32));
+        assert_eq!(t.values[r + col::WORD], shrugg_zkvm::tables::F::from_u32(*word));
+        assert_eq!(t.values[r + col::IS_REAL], shrugg_zkvm::tables::F::ONE);
+        assert_eq!(t.values[r + col::MULT_READ], shrugg_zkvm::tables::F::from_u32(*mult));
+    }
+    for i in 3..8 {
+        let r = i * col::WIDTH;
+        assert_eq!(t.values[r + col::IS_REAL], shrugg_zkvm::tables::F::ZERO);
+        assert_eq!(t.values[r + col::WORD], shrugg_zkvm::tables::F::ZERO);
+        assert_eq!(t.values[r + col::MULT_READ], shrugg_zkvm::tables::F::ZERO);
+        assert_eq!(t.values[r + col::IDX], shrugg_zkvm::tables::F::from_u32(i as u32));
+    }
+}
+
+#[test]
 fn cpu_trace_mirrors_events_and_pads() {
     let p = guests::fib(3);
     let e = execute(&p, &[], 10_000).unwrap();
     let mut range = RangeCounts::default();
     let mut nibble = NibbleCounts::default();
-    let t = cpu_trace(&p, &e.events, 64, &mut range, &mut nibble);
+    let t = cpu_trace(&p, &[], [0u32; 4], &e.events, 64, &mut range, &mut nibble);
     let w = cpu::col::WIDTH;
-    let dr = p.digest_rows();
+    // M4.1: ordinary events now start after both the program-digest prefix (`dr`) and the
+    // (always >= 1) input-digest prefix (`shrugg_zkvm::hash::input_digest_row_count(0) == 1`
+    // here, since this test passes no inputs).
+    let dr = p.digest_rows() + shrugg_zkvm::hash::input_digest_row_count(0);
     assert_eq!(t.height(), 64);
     // Row 0 is the first of the `dr` M3.4 digest rows; ordinary events start at row `dr`.
     assert_eq!(t.values[cpu::col::IS_DIGEST], F::ONE);
@@ -419,7 +453,7 @@ fn cpu_trace_mirrors_events_and_pads() {
     let last = &t.values[(t.height() - 1) * w..t.height() * w];
     assert_eq!(last[cpu::col::WRITTEN0], F::ONE, "slot 0 was written");
     for k in 1..8 { assert_eq!(last[cpu::col::WRITTEN0 + k], F::ZERO, "slot {k} was not"); }
-    let pv = public_values(0, 10, &e.outputs, &p.digest());
+    let pv = public_values(0, 10, &e.outputs, &p.digest(), &shrugg_zkvm::hash::input_digest([0u32; 4], &[]));
     assert_eq!(pv.len(), cpu::pv::NUM);
     assert_eq!(pv[cpu::pv::OUT0], F::from_u32(2));
 }
@@ -430,9 +464,12 @@ fn cpu_trace_limbs_and_counts_every_load_store_address() {
     let e = execute(&p, &[], 10_000).unwrap();
     let mut range = RangeCounts::default();
     let mut nibble = NibbleCounts::default();
-    let t = cpu_trace(&p, &e.events, 1 << 10, &mut range, &mut nibble);
+    let t = cpu_trace(&p, &[], [0u32; 4], &e.events, 1 << 10, &mut range, &mut nibble);
     let w = cpu::col::WIDTH;
-    let dr = p.digest_rows();
+    // M4.1: as in `cpu_trace_mirrors_events_and_pads`, ordinary events start after both the
+    // program-digest prefix and the (always >= 1) input-digest prefix.
+    let idr = shrugg_zkvm::hash::input_digest_row_count(0);
+    let dr = p.digest_rows() + idr;
     let is_mem = |i: usize| { let d = &e.events[i].dec; d.is_lb + d.is_lh + d.is_lw + d.is_sb + d.is_sh + d.is_sw == 1 };
     let is_store = |i: usize| { let d = &e.events[i].dec; d.is_sb + d.is_sh + d.is_sw == 1 };
     let mem_rows: Vec<usize> = (0..e.events.len()).filter(|i| is_mem(*i)).collect();
@@ -455,8 +492,11 @@ fn cpu_trace_limbs_and_counts_every_load_store_address() {
     // (`LEFT0`/`LEFT0+1`/`IDX0`) plus 32 more on the last one (`DHVL0..31`, the canonical
     // 8-word digest encoding). `LEFT0`/`LEFT0+1`/`IDX0`/`IDX0+1` are all four RANGE8-checked
     // on a digest row (unlike a hash row, whose `IDX0+1` uses the tighter hash-only AND4
-    // bound instead) — 4 per digest row.
-    let digest_range8 = 4 * dr + 32;
+    // bound instead) — 4 per digest row. M4.1: the input-digest prefix (`idr` rows here, always
+    // >= 1 since this test passes no inputs) pays the identical 4-per-row rate (already folded
+    // into `dr = program digest rows + idr`) plus its own 32-word `IHVL0..31` canonical
+    // encoding on its own last row — a second +32, on top of the program digest's own.
+    let digest_range8 = 4 * dr + 32 + 32;
     assert_eq!(range.range.iter().sum::<u64>() as usize, 8 * mem_rows.len() + 4 * n_stores + digest_range8);
     let nibble_total: u64 = nibble.and.iter().sum();
     assert_eq!(nibble_total as usize, 2 * mem_rows.len());
@@ -563,8 +603,8 @@ fn alu_max_constraint_degree_is_pinned() {
     // any declared program height give the same numbers. `Tier(10)`/`MIN_LOG_HEIGHT` (the
     // smallest of each) are used only because `max_constraint_degrees` needs concrete values
     // to size the tables.
-    let degrees = max_constraint_degrees(Tier(10), MIN_LOG_HEIGHT);
-    assert_eq!(degrees.len(), 7, "one degree per chip in machine::chips() order");
+    let degrees = max_constraint_degrees(Tier(10), MIN_LOG_HEIGHT, shrugg_zkvm::tables::input::MIN_LOG_HEIGHT);
+    assert_eq!(degrees.len(), 8, "one degree per chip in machine::chips() order");
 
     // program: M3.4's main-trace in-circuit decoder. Every one-hot flag pin
     // (`flag*(op-code)=0`) and field-consistency equation is at most degree 2 in the
@@ -604,6 +644,12 @@ fn alu_max_constraint_degree_is_pinned() {
     // (the table's only bus interaction) doesn't raise it further. Comfortably under the
     // degree-8 ceiling `alu`/`cpu` already sit at.
     assert_eq!(degrees[6], 4, "poseidon2 table max constraint degree");
+
+    // input: a boolean flag, an arithmetic-sequence pin, and a degree-2 provided count on the
+    // busier of its two split buses — `IS_REAL` alone on `INPUT_DIGEST` (degree 1) and
+    // `IS_REAL * MULT_READ` on `INPUT_READ` (degree 2) — no table here is anywhere close to
+    // the degree-8 ceiling.
+    assert_eq!(degrees[7], 2, "input table max constraint degree");
 }
 
 mod poseidon2_tests {

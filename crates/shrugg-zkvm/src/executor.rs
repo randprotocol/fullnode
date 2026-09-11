@@ -7,14 +7,21 @@
 //! is no second, program-keyed cache to maintain here any more (see `warm`'s doc comment for
 //! what "warm" means now).
 //!
-//! Verifying a proof costs ~16-20 ms once its `(tier, program_log_height)` verifier key is
-//! known; computing that key (the range/nibble/Poseidon2-round-constant preprocessed
-//! commitment, FRI-expanded) is the dominant cost of an uncached verify (`docs/03-privacy.md`).
+//! M4.1: the verifier key grew a third key component, `input_log_height` — the input table's
+//! declared height, exactly as `program_log_height` already was (`tables::input::input_log_height`'s
+//! doc comment mirrors `tables::program::program_log_height`'s rule). `verify_call`'s degree-bits
+//! pre-check and `warm` both bound and thread it through the same way they already did for
+//! `program_log_height`.
+//!
+//! Verifying a proof costs ~16-20 ms once its `(tier, program_log_height, input_log_height)`
+//! verifier key is known; computing that key (the range/nibble/Poseidon2-round-constant
+//! preprocessed commitment, FRI-expanded) is the dominant cost of an uncached verify
+//! (`docs/03-privacy.md`).
 
 use crate::isa::{Instr, Program};
 use crate::machine::{Backend, FriProfile, Machine, Proof, Tier, TIERS};
 use crate::tables::cpu::pv;
-use crate::tables::program;
+use crate::tables::{input, program};
 use shrugg_core::confidential::{ConfidentialError, ConfidentialExecutor};
 use shrugg_core::program::{CallOutcome, ProgramRecord};
 
@@ -95,26 +102,51 @@ impl ConfidentialExecutor for ZkExecutor {
     /// a 2-vCPU validator, so this warms the tiers real guests land on today (10, 12, 14 — the
     /// transfer guest proves at 14). A call at a larger tier still verifies; it pays the
     /// first-verify cost once per (tier, height).
+    ///
+    /// M4.1 (ruling): the key also carries `input_log_height`, but `warm` only knows the
+    /// program's word count — it has no visibility into what any future call's private-input
+    /// vector will look like, so it cannot warm "the" input height the way it warms the exact
+    /// program height. It warms two classes instead: `input::MIN_LOG_HEIGHT` (`input_log_height`
+    /// of a 0..3-word call — the smallest class the table shape has) and
+    /// `input::input_log_height(4)` (a 4-word call — what every guest this crate deploys today
+    /// actually reads: `balance_check`/`private_payment` both read exactly 4 private inputs via
+    /// `guests.rs`'s `read_input(0..3)` pattern), when that is a different class from the first
+    /// (it is: `input_log_height(0) == MIN_LOG_HEIGHT == 2`, `input_log_height(4) == 3`). A call
+    /// with a differently-sized input vector still verifies; like an unwarmed tier, it just pays
+    /// the first-verify key-build cost once per (tier, program_log_height, input_log_height).
     fn warm(&self, record: &ProgramRecord) {
         let log_height = program::program_log_height(record.words.len());
+        let smallest = input::MIN_LOG_HEIGHT;
+        let typical = input::input_log_height(4);
+        let input_heights: &[u8] = if typical == smallest { &[smallest] } else { &[smallest, typical] };
         for t in &TIERS[..3] {
-            self.machine.verifier_key(Tier(*t), log_height);
+            for &in_h in input_heights {
+                self.machine.verifier_key(Tier(*t), log_height, in_h);
+            }
         }
     }
 
     fn verify_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
         let proof: Proof = postcard::from_bytes(proof).map_err(|_| ConfidentialError::MalformedProof)?;
-        // `Machine::verify` bounds `proof.tier`/`proof.program_log_height` itself before using
-        // either to size anything — but the degree-bits pre-check right below shifts by both
-        // too, so it needs the same guard in front of it to avoid panicking on an
-        // attacker-chosen out-of-range value before ever reaching `verify`.
+        // `Machine::verify` bounds `proof.tier`/`proof.program_log_height`/`proof.input_log_height`
+        // itself before using any of them to size anything — but the degree-bits pre-check right
+        // below shifts by all three too, so it needs the same guard in front of it to avoid
+        // panicking on an attacker-chosen out-of-range value before ever reaching `verify`.
         if !TIERS.contains(&proof.tier.0) {
             return Err(ConfidentialError::InvalidProof("unknown tier".into()));
         }
         if !(program::MIN_LOG_HEIGHT..=program::MAX_LOG_HEIGHT).contains(&proof.program_log_height) {
             return Err(ConfidentialError::InvalidProof("program height out of range".into()));
         }
-        if proof.batch.degree_bits != self.machine.log_ext_degrees_pub(proof.tier, proof.program_log_height) {
+        // M4.1: `proof.input_log_height` (the input table's declared height, the H_IN commitment
+        // that table proves) is just as untrusted as `proof.program_log_height` — bound it the
+        // same way before it sizes the degree-bits pre-check or the verifier-key lookup below.
+        if !(input::MIN_LOG_HEIGHT..=input::MAX_LOG_HEIGHT).contains(&proof.input_log_height) {
+            return Err(ConfidentialError::InvalidProof("input height out of range".into()));
+        }
+        if proof.batch.degree_bits
+            != self.machine.log_ext_degrees_pub(proof.tier, proof.program_log_height, proof.input_log_height)
+        {
             return Err(ConfidentialError::InvalidProof("degree bits".into()));
         }
         let hc = Self::hc_of(record)?;
@@ -146,6 +178,12 @@ pub fn zk_code_hash(program: &Program) -> String {
 /// reference backends only in builds that enabled their feature. Every backend produces a proof
 /// the ordinary CPU verifier accepts, so nothing downstream of here changes with it. There is no
 /// fallback: a backend that cannot start (no driver, no PTX) is an error, not a silent CPU run.
+///
+/// M4.1: every path this delegates to (`Machine::prove_with` → `Machine::prove` on the CPU
+/// backend, `Machine::prove_on` for the reference/CUDA backends) draws a fresh per-proof `H_IN`
+/// salt from OS entropy internally — never `Machine::prove_salted`, which exists only for tests
+/// that need a fixed salt to check against. This entry point must keep it that way: an unsalted
+/// or reused `H_IN` is a guessable/linkable commitment to the private inputs, not a hiding one.
 pub fn prove(
     profile: FriProfile,
     program: &Program,

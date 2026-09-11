@@ -213,11 +213,11 @@ impl Tier {
 }
 
 #[derive(Clone)]
-pub enum Chip { Program(ProgramAir), Cpu(CpuAir), Memory(MemoryAir), Alu(AluAir), Range(RangeAir), Nibble(NibbleAir), Poseidon2(Poseidon2Air, usize) }
+pub enum Chip { Program(ProgramAir), Cpu(CpuAir), Memory(MemoryAir), Alu(AluAir), Range(RangeAir), Nibble(NibbleAir), Poseidon2(Poseidon2Air, usize), Input(crate::tables::input::InputAir) }
 
 impl BaseAir<Val> for Chip {
     fn width(&self) -> usize {
-        match self { Chip::Program(a) => BaseAir::<Val>::width(a), Chip::Cpu(a) => BaseAir::<Val>::width(a), Chip::Memory(a) => BaseAir::<Val>::width(a), Chip::Alu(a) => BaseAir::<Val>::width(a), Chip::Range(a) => BaseAir::<Val>::width(a), Chip::Nibble(a) => BaseAir::<Val>::width(a), Chip::Poseidon2(a, _) => BaseAir::<Val>::width(a) }
+        match self { Chip::Program(a) => BaseAir::<Val>::width(a), Chip::Cpu(a) => BaseAir::<Val>::width(a), Chip::Memory(a) => BaseAir::<Val>::width(a), Chip::Alu(a) => BaseAir::<Val>::width(a), Chip::Range(a) => BaseAir::<Val>::width(a), Chip::Nibble(a) => BaseAir::<Val>::width(a), Chip::Poseidon2(a, _) => BaseAir::<Val>::width(a), Chip::Input(a) => BaseAir::<Val>::width(a) }
     }
     fn preprocessed_width(&self) -> usize {
         match self { Chip::Program(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Range(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Nibble(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Poseidon2(a, _) => BaseAir::<Val>::preprocessed_width(a), _ => 0 }
@@ -242,7 +242,7 @@ where
     AB: AirBuilder<F = Val> + PermutationAirBuilder + InteractionBuilder,
 {
     fn eval(&self, b: &mut AB) {
-        match self { Chip::Program(a) => a.eval(b), Chip::Cpu(a) => a.eval(b), Chip::Memory(a) => a.eval(b), Chip::Alu(a) => a.eval(b), Chip::Range(a) => a.eval(b), Chip::Nibble(a) => a.eval(b), Chip::Poseidon2(a, _) => a.eval(b) }
+        match self { Chip::Program(a) => a.eval(b), Chip::Cpu(a) => a.eval(b), Chip::Memory(a) => a.eval(b), Chip::Alu(a) => a.eval(b), Chip::Range(a) => a.eval(b), Chip::Nibble(a) => a.eval(b), Chip::Poseidon2(a, _) => a.eval(b), Chip::Input(a) => a.eval(b) }
     }
 }
 
@@ -260,6 +260,7 @@ pub fn chips(tier: Tier) -> Vec<Chip> {
         Chip::Range(RangeAir),
         Chip::Nibble(NibbleAir),
         Chip::Poseidon2(Poseidon2Air, tier.poseidon2_height()),
+        Chip::Input(crate::tables::input::InputAir),
     ]
 }
 
@@ -272,10 +273,14 @@ pub struct Traces {
     /// recomputed from `self.program.height()`) so `prove_traces`/`prove_on` and the eventual
     /// `Proof` agree on exactly the value `build_traces` chose.
     pub program_log_height: u8,
+    pub input: RowMajorMatrix<Val>,
+    /// M4.1: the input table's height, as a base-2 log — the `program_log_height` doc
+    /// comment's rule, applied to `tables::input::input_log_height`.
+    pub input_log_height: u8,
 }
 impl Traces {
-    pub fn as_slice(&self) -> [&RowMajorMatrix<Val>; 7] { [&self.program, &self.cpu, &self.memory, &self.alu, &self.range, &self.nibble, &self.poseidon2] }
-    pub fn heights(&self) -> [usize; 7] { self.as_slice().map(|m| m.height()) }
+    pub fn as_slice(&self) -> [&RowMajorMatrix<Val>; 8] { [&self.program, &self.cpu, &self.memory, &self.alu, &self.range, &self.nibble, &self.poseidon2, &self.input] }
+    pub fn heights(&self) -> [usize; 8] { self.as_slice().map(|m| m.height()) }
 }
 
 #[derive(Debug)]
@@ -286,6 +291,9 @@ pub enum ProveError {
     /// `tables::program::program_trace` itself still carries as a defense-in-depth invariant
     /// for direct callers.
     ProgramTooLarge { len: usize, log_height: u8 },
+    /// M4.1: the input table's own analogue of `ProgramTooLarge` — `inputs.len()`'s declared
+    /// `tables::input::input_log_height` exceeds `tables::input::MAX_LOG_HEIGHT`.
+    InputTooLarge { len: usize, log_height: u8 },
 }
 #[derive(Debug)]
 pub enum VerifyError {
@@ -295,12 +303,27 @@ pub enum VerifyError {
     /// log_height`) and panic on an absurd shift, the same defensive pattern `Tier`'s own
     /// out-of-range check already uses.
     ProgramHeight,
+    /// M4.1: the input table's own analogue of `ProgramHeight` — `proof.input_log_height` is
+    /// outside `[tables::input::MIN_LOG_HEIGHT, tables::input::MAX_LOG_HEIGHT]`.
+    InputHeight,
 }
 
-pub fn build_traces(program: &Program, exec: &Execution, tier: Tier) -> Result<Traces, ProveError> {
+/// Draws a fresh H_IN salt from OS entropy and delegates to [`build_traces_salted`] — the
+/// direct-caller (non-`Machine`) mirror of `Machine::prove`/`Machine::prove_salted`'s own
+/// split (review round 1, M6). Most callers (`main.rs`'s demo sections included) don't need a
+/// *particular* salt, just a fresh one; use `build_traces_salted` where a fixed, reproducible
+/// H_IN is specifically needed (e.g. two traces that must be compared).
+pub fn build_traces(program: &Program, inputs: &[u32], exec: &Execution, tier: Tier) -> Result<Traces, ProveError> {
+    use rand::RngExt;
+    let salt: [u32; 4] = rand::rng().random();
+    build_traces_salted(program, inputs, salt, exec, tier)
+}
+
+pub fn build_traces_salted(program: &Program, inputs: &[u32], salt: [u32; 4], exec: &Execution, tier: Tier) -> Result<Traces, ProveError> {
     // M3.4: digest rows count as cycles too — the digest prefix is part of every proof's cpu
-    // table, not just `exec.events`.
-    let cycles = exec.cycles() + program.digest_rows();
+    // table, not just `exec.events`. M4.1: so does the input-digest prefix.
+    let input_digest_rows = crate::hash::input_digest_row_count(inputs.len());
+    let cycles = exec.cycles() + program.digest_rows() + input_digest_rows;
     if cycles > tier.max_cycles() { return Err(ProveError::TooManyCycles { cycles, tier }); }
     // M3.4 (fix): the program table's height is proof-declared, not tier-derived — see
     // `tables::program::program_log_height`'s doc comment.
@@ -308,19 +331,34 @@ pub fn build_traces(program: &Program, exec: &Execution, tier: Tier) -> Result<T
     if program_log_height > program::MAX_LOG_HEIGHT {
         return Err(ProveError::ProgramTooLarge { len: program.len(), log_height: program_log_height });
     }
+    // M4.1: the input table's height is proof-declared the same way.
+    let input_log_height = crate::tables::input::input_log_height(inputs.len());
+    if input_log_height > crate::tables::input::MAX_LOG_HEIGHT {
+        return Err(ProveError::InputTooLarge { len: inputs.len(), log_height: input_log_height });
+    }
     let mut range = RangeCounts::default();
     let mut nibble = NibbleCounts::default();
-    let cpu = cpu_trace(program, &exec.events, tier.cpu_height(), &mut range, &mut nibble);
-    let memory = memory_trace(&exec.events, program.digest_rows() as u32, tier.mem_height(), &mut range);
+    let cpu = cpu_trace(program, inputs, salt, &exec.events, tier.cpu_height(), &mut range, &mut nibble);
+    let memory = memory_trace(&exec.events, (program.digest_rows() + input_digest_rows) as u32, tier.mem_height(), &mut range);
     let alu = alu_trace(&exec.events, tier.alu_height(), &mut range, &mut nibble);
     let range_t = range_trace(&range);
     let nibble_t = nibble_trace(&nibble);
     let program_t = program_trace(program, &exec.events, 1usize << program_log_height);
+    let read_counts = crate::tables::input::read_counts(inputs.len(), &exec.events);
+    let input_t = crate::tables::input::input_trace(inputs, &read_counts, 1usize << input_log_height);
     // M3.4: the digest prefix's own permutations, in the same row order `tables::cpu`'s
     // `IS_DIGEST` rows issue them (`fill_digest_rows`) — these come *first*, since the digest
     // rows precede every ordinary cycle in the cpu table.
     let digest_blocks = crate::hash::program_digest_rows(program.base_pc, &program.words);
     let digest_events: Vec<Poseidon2Event> = digest_blocks.iter().map(|blk| {
+        let mut input = blk.state_in;
+        for k in 0..4 { if blk.active[k] { input[k] = Val::from_u32(blk.words[k]); } }
+        Poseidon2Event { input, output: blk.state_out }
+    }).collect();
+    // M4.1: the input-digest prefix's own permutations, right after the program-digest ones
+    // (matching the row order `IS_INDIGEST` rows occupy in the cpu table).
+    let indigest_blocks = crate::hash::input_digest_rows(salt, inputs);
+    let indigest_events: Vec<Poseidon2Event> = indigest_blocks.iter().map(|blk| {
         let mut input = blk.state_in;
         for k in 0..4 { if blk.active[k] { input[k] = Val::from_u32(blk.words[k]); } }
         Poseidon2Event { input, output: blk.state_out }
@@ -340,13 +378,14 @@ pub fn build_traces(program: &Program, exec: &Execution, tier: Tier) -> Result<T
         }
         _ => None,
     }).collect();
-    let all_hash_events: Vec<Poseidon2Event> = digest_events.into_iter().chain(hash_events).collect();
+    let all_hash_events: Vec<Poseidon2Event> = digest_events.into_iter().chain(indigest_events).chain(hash_events).collect();
     let poseidon2_t = poseidon2_trace(&all_hash_events, tier.poseidon2_height());
     let hc = program.digest();
+    let hin = crate::hash::input_digest(salt, inputs);
     Ok(Traces {
-        program: program_t, cpu, memory, alu, range: range_t, nibble: nibble_t, poseidon2: poseidon2_t,
-        public_values: public_values(program.base_pc, tier.0, &exec.outputs, &hc),
-        program_log_height,
+        program: program_t, cpu, memory, alu, range: range_t, nibble: nibble_t, poseidon2: poseidon2_t, input: input_t,
+        public_values: public_values(program.base_pc, tier.0, &exec.outputs, &hc, &hin),
+        program_log_height, input_log_height,
     })
 }
 
@@ -357,6 +396,9 @@ pub struct Proof {
     /// M3.4 (fix): the program table's height, declared by the prover — see `tables::program::
     /// program_log_height`'s doc comment for the rule and the soundness argument.
     pub program_log_height: u8,
+    /// M4.1: the input table's height, declared by the prover — see `tables::input::
+    /// input_log_height`'s doc comment (mirrors `program_log_height`'s rule).
+    pub input_log_height: u8,
     pub public_values: Vec<u64>,
     pub batch: BatchProof<Config>,
 }
@@ -428,24 +470,26 @@ fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
 const KEY_CACHE_CAPACITY: usize = 64;
 
 /// A bounded, FIFO-evicted cache of `Machine::verifier_key` results, keyed by `(tier.0,
-/// program_log_height)` (M3.4 fix: the program table's height is proof-declared, not
-/// tier-derived — `tables::program::program_log_height`'s doc comment — so `CommonData`'s
-/// per-instance degree-bit bookkeeping depends on it too, even though the program table has
-/// no preprocessed *columns* of its own any more). Bounded by `TIERS.len() * (MAX_LOG_HEIGHT −
-/// MIN_LOG_HEIGHT + 1)` distinct keys in the worst case — comfortably able to exceed
-/// `KEY_CACHE_CAPACITY` if a caller proves at many different program sizes, unlike the
-/// tier-only cache this replaces, so the FIFO eviction here is a real policy again, not just
-/// defense in depth.
+/// program_log_height, input_log_height)` (M3.4 fix: the program table's height is
+/// proof-declared, not tier-derived — `tables::program::program_log_height`'s doc comment —
+/// so `CommonData`'s per-instance degree-bit bookkeeping depends on it too, even though the
+/// program table has no preprocessed *columns* of its own any more; M4.1 adds the input
+/// table's own height as a third, independent key component for the same reason). Bounded by
+/// `TIERS.len() * (program::MAX_LOG_HEIGHT − program::MIN_LOG_HEIGHT + 1) *
+/// (input::MAX_LOG_HEIGHT − input::MIN_LOG_HEIGHT + 1)` distinct keys in the worst case —
+/// comfortably able to exceed `KEY_CACHE_CAPACITY` if a caller proves at many different
+/// program/input sizes, unlike the tier-only cache this replaces, so the FIFO eviction here is
+/// a real policy again, not just defense in depth.
 #[derive(Default)]
 struct KeyCache {
-    map: HashMap<(usize, u8), Arc<CommonData<Config>>>,
-    order: VecDeque<(usize, u8)>,
+    map: HashMap<(usize, u8, u8), Arc<CommonData<Config>>>,
+    order: VecDeque<(usize, u8, u8)>,
 }
 impl KeyCache {
-    fn get(&self, key: &(usize, u8)) -> Option<Arc<CommonData<Config>>> {
+    fn get(&self, key: &(usize, u8, u8)) -> Option<Arc<CommonData<Config>>> {
         self.map.get(key).cloned()
     }
-    fn insert(&mut self, key: (usize, u8), value: Arc<CommonData<Config>>) {
+    fn insert(&mut self, key: (usize, u8, u8), value: Arc<CommonData<Config>>) {
         if self.map.contains_key(&key) {
             return;
         }
@@ -464,54 +508,70 @@ pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<Ke
 impl Machine {
     pub fn new(profile: FriProfile) -> Self { Self { config: make_config(profile), profile, keys: Mutex::new(KeyCache::default()) } }
 
-    fn log_ext_degrees(&self, tier: Tier, program_log_height: u8) -> Vec<usize> {
+    fn log_ext_degrees(&self, tier: Tier, program_log_height: u8, input_log_height: u8) -> Vec<usize> {
         let zk = self.config.is_zk();
-        // Order matches `chips()`: program, cpu, memory, alu, range, nibble, poseidon2.
+        // Order matches `chips()`: program, cpu, memory, alu, range, nibble, poseidon2, input.
         let mut v = vec![program_log_height as usize + zk];
         v.extend(
             [tier.cpu_height(), tier.mem_height(), tier.alu_height(), crate::tables::range::HEIGHT, crate::tables::nibble::HEIGHT, tier.poseidon2_height()]
                 .iter().map(|h| h.trailing_zeros() as usize + zk),
         );
+        v.push(input_log_height as usize + zk);
         v
     }
 
     /// The preprocessed commitment (range + nibble tables + Poseidon2 round constants, plus
-    /// the degree-bit bookkeeping every instance needs including `program`'s) for `(tier,
-    /// program_log_height)`, cached — see `KeyCache`. M3.4: program-*content*-independent, so
-    /// this is the *verifier's* key — computable by anyone who knows the tier and the declared
-    /// program height alone, without the program itself or the proving session. Recomputing it
-    /// from scratch runs the full `ProverData::from_airs_and_degrees` preprocessing pass (in
-    /// particular building the range and nibble tables' Merkle trees every time), which is the
-    /// cost this cache exists to amortize across repeated `verify` calls at the same
-    /// `(tier, program_log_height)`.
+    /// the degree-bit bookkeeping every instance needs including `program`'s and `input`'s)
+    /// for `(tier, program_log_height, input_log_height)`, cached — see `KeyCache`. M3.4:
+    /// program-*content*-independent, so this is the *verifier's* key — computable by anyone
+    /// who knows the tier and the declared program/input heights alone, without the program or
+    /// inputs themselves or the proving session. Recomputing it from scratch runs the full
+    /// `ProverData::from_airs_and_degrees` preprocessing pass (in particular building the range
+    /// and nibble tables' Merkle trees every time), which is the cost this cache exists to
+    /// amortize across repeated `verify` calls at the same `(tier, program_log_height,
+    /// input_log_height)`.
     /// Public wrapper used by the chain executor to check a proof's degree bits.
-    pub fn log_ext_degrees_pub(&self, tier: Tier, program_log_height: u8) -> Vec<usize> { self.log_ext_degrees(tier, program_log_height) }
+    pub fn log_ext_degrees_pub(&self, tier: Tier, program_log_height: u8, input_log_height: u8) -> Vec<usize> { self.log_ext_degrees(tier, program_log_height, input_log_height) }
 
-    pub fn verifier_key(&self, tier: Tier, program_log_height: u8) -> Arc<CommonData<Config>> {
-        let key = (tier.0, program_log_height);
+    pub fn verifier_key(&self, tier: Tier, program_log_height: u8, input_log_height: u8) -> Arc<CommonData<Config>> {
+        let key = (tier.0, program_log_height, input_log_height);
         if let Some(hit) = self.keys.lock().unwrap().get(&key) {
             return hit;
         }
-        let common = Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips(tier), &self.log_ext_degrees(tier, program_log_height)).common);
+        let common = Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips(tier), &self.log_ext_degrees(tier, program_log_height, input_log_height)).common);
         self.keys.lock().unwrap().insert(key, common.clone());
         common
     }
 
-    /// Number of `(tier, program_log_height)` verifier keys currently cached.
+    /// Number of `(tier, program_log_height, input_log_height)` verifier keys currently cached.
     pub fn cached_keys(&self) -> usize { self.keys.lock().unwrap().map.len() }
 
+    /// Draws a fresh per-proof salt from OS entropy and delegates to [`Self::prove_salted`] —
+    /// see that method's doc comment (controller ruling: H_IN, `pv::IN0..7`, must be salted or
+    /// it is a guessable commitment to the private inputs). Every ordinary caller wants this;
+    /// `prove_salted` exists only for tests that need a fixed salt to check against.
     pub fn prove(&self, program: &Program, inputs: &[u32], tier: Option<Tier>) -> Result<(Proof, Execution), ProveError> {
+        use rand::RngExt;
+        let salt: [u32; 4] = rand::rng().random();
+        self.prove_salted(program, inputs, salt, tier)
+    }
+
+    /// The body of `prove`, taking the H_IN salt explicitly instead of drawing it from OS
+    /// entropy — what every backend variant (`prove_with`/`prove_on`) also threads through.
+    /// `verify(hc, proof)` does not take the salt: it never leaves the prover except folded,
+    /// non-invertibly, into `pv::IN0..7` (`hash::input_digest`'s doc comment).
+    pub fn prove_salted(&self, program: &Program, inputs: &[u32], salt: [u32; 4], tier: Option<Tier>) -> Result<(Proof, Execution), ProveError> {
         // Run up to the largest tier's cycle budget; a program that has not halted by then
         // can never be proved, so `OutOfCycles` and `TooManyCycles` agree on the limit.
         let exec = execute(program, inputs, Tier(*TIERS.last().unwrap()).max_cycles()).map_err(ProveError::Exec)?;
         let tier = match tier {
             Some(t) => t,
             None => {
-                let cycles = exec.cycles() + program.digest_rows();
+                let cycles = exec.cycles() + program.digest_rows() + crate::hash::input_digest_row_count(inputs.len());
                 Tier::for_cycles(cycles).ok_or(ProveError::NoTier(cycles))?
             }
         };
-        let traces = build_traces(program, &exec, tier)?;
+        let traces = build_traces_salted(program, inputs, salt, &exec, tier)?;
         Ok((self.prove_traces(program, &traces, tier), exec))
     }
 
@@ -549,9 +609,9 @@ impl Machine {
         // parameters, which `key_config` and `make_config` share via `build_config`); their
         // RNG state can differ freely.
         let key_cfg = key_config(self.profile);
-        let prover_data = ProverData::from_airs_and_degrees(&key_cfg, &airs, &self.log_ext_degrees(tier, traces.program_log_height));
+        let prover_data = ProverData::from_airs_and_degrees(&key_cfg, &airs, &self.log_ext_degrees(tier, traces.program_log_height, traces.input_log_height));
         let batch = prove_batch(&self.config, &instances, &prover_data);
-        Proof { tier, program_log_height: traces.program_log_height, public_values: traces.public_values.iter().map(|x| x.as_canonical_u64()).collect(), batch }
+        Proof { tier, program_log_height: traces.program_log_height, input_log_height: traces.input_log_height, public_values: traces.public_values.iter().map(|x| x.as_canonical_u64()).collect(), batch }
     }
 
     /// Prove on `backend`. `Backend::Cpu` is exactly `prove`; the other backends run the same
@@ -607,16 +667,19 @@ impl Machine {
         <SC::Pcs as p3_commit::Pcs<Challenge, Challenger>>::Commitment: Sync,
     {
         // Mirrors `prove`: run up to the largest tier's cycle budget, so `OutOfCycles` and
-        // `TooManyCycles` agree on the limit here exactly as they do on the CPU path.
+        // `TooManyCycles` agree on the limit here exactly as they do on the CPU path, and draw
+        // the same fresh-per-proof H_IN salt from OS entropy `prove`/`prove_salted` do.
+        use rand::RngExt;
+        let salt: [u32; 4] = rand::rng().random();
         let exec = execute(program, inputs, Tier(*TIERS.last().unwrap()).max_cycles()).map_err(ProveError::Exec)?;
         let tier = match tier {
             Some(t) => t,
             None => {
-                let cycles = exec.cycles() + program.digest_rows();
+                let cycles = exec.cycles() + program.digest_rows() + crate::hash::input_digest_row_count(inputs.len());
                 Tier::for_cycles(cycles).ok_or(ProveError::NoTier(cycles))?
             }
         };
-        let traces = build_traces(program, &exec, tier)?;
+        let traces = build_traces_salted(program, inputs, salt, &exec, tier)?;
         let airs = chips(tier);
         let mats = traces.as_slice();
         let instances: Vec<StarkInstance<'_, SC, Chip>> = airs.iter().zip(mats.iter()).enumerate().map(|(i, (air, trace))| StarkInstance {
@@ -626,14 +689,14 @@ impl Machine {
         // That is invariant, not a leak: every backend config (`reference_cfg`, `cuda_cfg`) is
         // built on `HidingFriPcs` just as `make_config` is, so `is_zk()` is `true` for all of
         // them and the degree bits agree with what `verify` recomputes.
-        let prover_data = ProverData::from_airs_and_degrees(key_cfg, &airs, &self.log_ext_degrees(tier, traces.program_log_height));
+        let prover_data = ProverData::from_airs_and_degrees(key_cfg, &airs, &self.log_ext_degrees(tier, traces.program_log_height, traces.input_log_height));
         // The engines panic (rather than return) on a device failure — `CudaHashEngine::ok`
         // and friends — so a backend fault must not take the caller's process down with it.
         let batch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove_batch(cfg, &instances, &prover_data)))
             .map_err(|p| ProveError::Backend(panic_message(p)))?;
         let bytes = postcard::to_allocvec(&batch).map_err(|e| ProveError::Backend(format!("proof serialise: {e}")))?;
         let batch: BatchProof<Config> = postcard::from_bytes(&bytes).map_err(|e| ProveError::Backend(format!("proof convert: {e}")))?;
-        Ok((Proof { tier, program_log_height: traces.program_log_height, public_values: traces.public_values.iter().map(|x| x.as_canonical_u64()).collect(), batch }, exec))
+        Ok((Proof { tier, program_log_height: traces.program_log_height, input_log_height: traces.input_log_height, public_values: traces.public_values.iter().map(|x| x.as_canonical_u64()).collect(), batch }, exec))
     }
 
     /// M3.4: takes `hc`, not the program — the verifier no longer holds the program at all
@@ -669,11 +732,16 @@ impl Machine {
         if !(program::MIN_LOG_HEIGHT..=program::MAX_LOG_HEIGHT).contains(&proof.program_log_height) {
             return Err(VerifyError::ProgramHeight);
         }
-        if proof.batch.degree_bits != self.log_ext_degrees(proof.tier, proof.program_log_height) { return Err(VerifyError::Tier); }
+        // M4.1: `proof.input_log_height` is untrusted the same way — reject anything outside
+        // the sane range before it sizes the input table and panics on an absurd shift.
+        if !(crate::tables::input::MIN_LOG_HEIGHT..=crate::tables::input::MAX_LOG_HEIGHT).contains(&proof.input_log_height) {
+            return Err(VerifyError::InputHeight);
+        }
+        if proof.batch.degree_bits != self.log_ext_degrees(proof.tier, proof.program_log_height, proof.input_log_height) { return Err(VerifyError::Tier); }
         let airs = chips(proof.tier);
         let pv_vals: Vec<Val> = proof.public_values.iter().map(|x| Val::from_u64(*x)).collect();
         let pvs: Vec<Vec<Val>> = (0..airs.len()).map(|i| if i == 1 { pv_vals.clone() } else { vec![] }).collect();
-        let common = self.verifier_key(proof.tier, proof.program_log_height);
+        let common = self.verifier_key(proof.tier, proof.program_log_height, proof.input_log_height);
         verify_batch(&self.config, &airs, &proof.batch, &pvs, &common).map_err(|e| VerifyError::Batch(format!("{e:?}")))
     }
 }
@@ -693,12 +761,12 @@ impl Machine {
 /// table's degree is pinned to a specific number there, with a comment on *why*; a change
 /// here should come with a matching update to those assertions and to
 /// `docs/02-tables-and-buses.md`.
-pub fn max_constraint_degrees(tier: Tier, program_log_height: u8) -> Vec<usize> {
+pub fn max_constraint_degrees(tier: Tier, program_log_height: u8, input_log_height: u8) -> Vec<usize> {
     let machine = Machine::new(FriProfile::Test);
     let key_cfg = key_config(machine.profile);
     let airs = chips(tier);
     let is_zk = machine.config.is_zk();
-    let ext_degrees = machine.log_ext_degrees(tier, program_log_height);
+    let ext_degrees = machine.log_ext_degrees(tier, program_log_height, input_log_height);
     let prover_data = ProverData::from_airs_and_degrees(&key_cfg, &airs, &ext_degrees);
     let lookup_gadget = p3_lookup::LogUpGadget::new();
     airs.iter()

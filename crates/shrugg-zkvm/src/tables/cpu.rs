@@ -136,12 +136,62 @@ pub mod col {
     pub const DHVL0: usize = DIGEST_LAST + 1;                        // 131..162
     pub const DHIMAX0: usize = DHVL0 + 32;                           // 163..166
     pub const DINV0: usize = DHIMAX0 + 4;                            // 167..170
-    pub const WIDTH: usize = DINV0 + 4;                              // 174
+    // DEVIATION from the brief (a genuine design conflict, found via self-review against an
+    // honest trace, not merely a naming/index slip): M4.1 needs the row right after the last
+    // program-digest row to be freely seedable with H_IN's own header ([0,0,0,0,IN,n_in,0,0]
+    // in `HS0..7`) — but that transition's `HS0..7` is *already* fully determined by the last
+    // digest row's own `POSEIDON2` bus interaction (`is_hash_or_digest` includes `is_digest`
+    // unconditionally, including its own last row, so `n(HS0+i)` there is pinned to the real
+    // program-digest permutation output for *every* digest row, the last one included — this
+    // is exactly what let the pre-M4.1 code read the digest's own output back out via
+    // `n(HS0..3)`). Two different, unrelated values (the real program digest vs. H_IN's fresh
+    // header) cannot both occupy the same physical `n(HS0+i)` cell — asserting both is
+    // unsatisfiable for any input, which is why even an honest witness with this design
+    // literally as brief-specified was rejected (see the report's investigation).
+    // The fix: give the *last* digest row's own permutation output a dedicated set of
+    // columns (`DPOUT0..7`, meaningful only when `DIGEST_LAST=1`) instead of reading it back
+    // via `n(HS0..7)` — the `POSEIDON2` bus lookup's `state_out` argument targets `DPOUT0+i`
+    // on the last digest row (and `n(HS0+i)` everywhere else, unchanged), and the DHVL
+    // canonical-encoding check reads `v(DPOUT0+j)` instead of `n(HS0+j)`. This frees
+    // `n(HS0..7)` at the digest-to-indigest transition for the H_IN header seed with no
+    // remaining conflict.
+    pub const DPOUT0: usize = DINV0 + 4;                             // 171..178
+    // M4.1: a second digest region, IS_INDIGEST, absorbing the committed private-input words
+    // right after the program-digest prefix ends. Mirrors IS_DIGEST's structure exactly,
+    // including reusing the shared absorb machinery (HS0..7, HV0..3, ACT0..3, HASH_LEFT,
+    // HASH_IDX, LEFT0..1, IDX0..1 — IS_DIGEST, IS_HASH and IS_INDIGEST are pairwise mutually
+    // exclusive, so all three safely share those columns) — but gets its OWN final-encoding
+    // columns (IHVL0..31/IHIMAX0..3/IINV0..3) rather than reusing DHVL0..31: DIGEST_LAST and
+    // INDIGEST_LAST are also mutually exclusive in principle, but sharing their encoding
+    // columns would require re-deriving every DHVL-gated constraint for two selectors at once
+    // for a four-column saving — not worth the added risk in a second, parallel digest region
+    // built by mirroring, not by generalizing, the first one.
+    //
+    // Two things this region needed beyond a plain mirror of IS_DIGEST, both explained where
+    // they're defined: `DPOUT0..7` (above), the last *program*-digest row's own permutation
+    // output, needed because that transition's `n(HS0..7)` is repurposed to seed H_IN's salted
+    // header instead (salted H_IN, controller ruling); and `IS_SALT` (below), marking the one
+    // indigest row whose 4 absorbed words are that fresh per-proof salt rather than committed
+    // input words. The real (non-salt) rows provide/consume on the input table's
+    // `INPUT_DIGEST` bus (review round 1, C1: split from `INPUT_READ`, which `SYS_READ` rows
+    // draw from instead, precisely so a read can never affect the digest's own count).
+    pub const IS_INDIGEST: usize = DPOUT0 + 8;
+    pub const INDIGEST_LAST: usize = IS_INDIGEST + 1;
+    /// M4.1 (salted H_IN, controller ruling): 1 on exactly the *first* indigest row (the one
+    /// entered right off `DIGEST_LAST`) — mirrors `INDIGEST_LAST`'s own "dedicated witness
+    /// column pinned to a unique structural position" pattern, at the opposite boundary. That
+    /// row's 4 absorbed words (`HV0..3`) are the fresh per-proof salt: free witness columns,
+    /// not `INPUT_DIGEST`-checked, unlike every other (real) indigest row's.
+    pub const IS_SALT: usize = INDIGEST_LAST + 1;
+    pub const IHVL0: usize = IS_SALT + 1;         // 32: byte limbs of the 8 H_IN output words
+    pub const IHIMAX0: usize = IHVL0 + 32;        // 4
+    pub const IINV0: usize = IHIMAX0 + 4;         // 4
+    pub const WIDTH: usize = IINV0 + 4;
     /// Columns that must be zero on padding rows.
-    pub const SELECTORS: [usize; 25] = [
+    pub const SELECTORS: [usize; 26] = [
         IS_ALU, IS_IMM, IS_BRANCH, IS_LB, IS_LH, IS_LW, IS_SB, IS_SH, IS_SW, SIGNED,
         IS_JAL, IS_JALR, IS_LUI, IS_AUIPC, IS_ECALL, WRITES_RD, SYS_HALT, SYS_WRITE, SYS_READ, BR_NEG,
-        SYS_HASH, IS_HASH, IS_HASH_OUT, HASH_FIN, IS_DIGEST,
+        SYS_HASH, IS_HASH, IS_HASH_OUT, HASH_FIN, IS_DIGEST, IS_INDIGEST,
     ];
 }
 pub mod pv {
@@ -149,7 +199,13 @@ pub mod pv {
     /// M3.4: the in-circuit program digest, pinned by the last digest row. Replaces the
     /// verifier-held `Program` — `Machine::verify` now checks `pv[HC0..HC7] == hc` instead.
     pub const HC0: usize = OUT0 + crate::isa::NUM_OUTPUTS;
-    pub const NUM: usize = HC0 + 8;
+    /// M4.1: `H_IN`, the in-circuit **salted** private-input commitment (controller ruling: an
+    /// unsalted H_IN is a guessable commitment to the private inputs), pinned by the last
+    /// `IS_INDIGEST` row. Not checked by `Machine::verify` against a caller-supplied value
+    /// the way `HC0..7` is against `hc` — it is a guest-visible commitment, not a
+    /// verifier-side identity check (`docs/03-privacy.md`'s M4.1 section).
+    pub const IN0: usize = HC0 + 8;
+    pub const NUM: usize = IN0 + 8; // 26
 }
 use col::*;
 
@@ -211,10 +267,16 @@ where
         let is_hash_out = v(IS_HASH_OUT);
         let is_digest = v(IS_DIGEST);
         let is_hash_any = is_hash.clone() + is_hash_out.clone();
+        let is_indigest = v(IS_INDIGEST);
+        // 1 on a genuine input-absorbing indigest row, 0 on the salt row — `is_indigest` and
+        // `IS_SALT` are both boolean with `IS_SALT` implying `is_indigest`, so this is itself a
+        // valid 0/1 selector. Hoisted here (rather than defined only where the `INPUT_DIGEST`
+        // lookup needs it, further down) so the lane-0 rule below can also use it.
+        let is_real_indigest = is_indigest.clone() - v(IS_SALT);
         // M3.4: digest rows share every "this is not an ordinary per-instruction row" gate a
         // hash row already needed (no PROGRAM fetch, no DEC/register/memory-value columns, no
         // per-slot MEMORY send) — `off_cpu` is `is_hash_any` generalized to include them.
-        let off_cpu = is_hash_any.clone() + is_digest.clone();
+        let off_cpu = is_hash_any.clone() + is_digest.clone() + is_indigest.clone();
         // MINOR (fix): explicit mutual exclusivity. Nothing else directly forbids a row
         // claiming to be *both* an absorb row and a write-back row at once; every other
         // hash-row constraint happens to be gated by one selector or the other (never by
@@ -231,6 +293,46 @@ where
         // the same gap the `is_hash · is_hash_out` case above closes.
         b.assert_zero(is_digest.clone() * is_hash.clone());
         b.assert_zero(is_digest.clone() * is_hash_out.clone());
+        b.assert_zero(is_indigest.clone() * is_hash.clone());
+        b.assert_zero(is_indigest.clone() * is_hash_out.clone());
+        b.assert_zero(is_indigest.clone() * is_digest.clone());
+        let digest_last = v(DIGEST_LAST);
+        {
+            // M4.1: IS_INDIGEST turns on exactly once, on the row right after the
+            // program-digest prefix ends (DIGEST_LAST=1's next row) — forced, not merely
+            // permitted, by the first line; the second closes re-entry once the indigest
+            // block itself has ended (is_digest is already 0 there too, so this rule only
+            // ever fires past the program-digest prefix).
+            //
+            // DEVIATION from the brief: it placed these two lines inside the pre-existing
+            // early `when_transition()` block (right after the `IS_DIGEST` contiguous-prefix
+            // check), but that block runs before `is_indigest`/`digest_last` are declared
+            // (both are defined later, alongside `is_digest`/the mutual-exclusivity asserts)
+            // — Rust requires the `let`s to precede their use. A second, separate
+            // `when_transition()` scope here (semantically identical — constraint order across
+            // separate `when_transition()` calls doesn't matter) is the minimal fix.
+            let mut t = b.when_transition();
+            t.assert_zero(digest_last.clone() * (one.clone() - n(IS_INDIGEST)));
+            t.assert_zero((one.clone() - v(IS_DIGEST)) * (one.clone() - is_indigest.clone()) * n(IS_INDIGEST));
+        }
+        // M4.1 (salted H_IN, controller ruling): `IS_SALT` — pinned to 0 wherever `is_indigest`
+        // is 0 (so it inherits the padding-row pin transitively through `is_indigest`'s own),
+        // forced to 1 on exactly the row entered right off `digest_last` (the same unique
+        // boundary `IS_INDIGEST` itself turns on at, one block above), and forced to 0 on
+        // every *other* indigest row (chained the same way `not_final_indigest`-gated rules
+        // already propagate `HASH_N` etc. — every indigest-to-indigest transition carries
+        // `IS_SALT = 0` into the next row, so only the entry row it was forced onto keeps it).
+        b.assert_bool(v(IS_SALT));
+        b.assert_zero((one.clone() - is_indigest.clone()) * v(IS_SALT));
+        {
+            let mut t = b.when_transition();
+            t.assert_zero(digest_last.clone() * (one.clone() - n(IS_SALT)));
+            let not_final_indigest_for_salt = is_indigest.clone() * n(IS_INDIGEST);
+            t.assert_zero(not_final_indigest_for_salt * n(IS_SALT));
+        }
+        // The salt row absorbs exactly 4 free words (never partial) — forcing lane 3 active
+        // cascades to lanes 0..2 via the existing contiguous-prefix rule below.
+        b.assert_zero(v(IS_SALT) * (one.clone() - v(ACT0 + 3)));
         // 1 on every row of a `POSEIDON2` row-group except its very last (the `HASH_FIN`
         // write-back row): the ecall row, every absorb row, and the first write-back row. Used
         // below to (a) carry `HASH_PTR`/`HASH_N` forward across the whole group and (b) pin
@@ -303,8 +405,18 @@ where
         // group — unconditionally, including its own last row, so the constant flows through
         // the ordinary `n(PC) = v(NEXT_PC)` chain into the first instruction row's `PC`.
         b.assert_zero(is_digest.clone() * (v(NEXT_PC) - v(PC)));
+        // DEVIATION from the brief (found via self-review against an honest trace): M4.1's
+        // indigest rows need the exact same "PC stands still, unconditionally" treatment as
+        // digest rows — the brief's steps never added it, so `PC`/`NEXT_PC` on an indigest row
+        // fell through to the general fallthrough rule below (which the brief also left
+        // un-excluded for `is_indigest`), forcing `NEXT_PC = PC + 4` on every indigest row
+        // instead of holding `PC` constant through the whole indigest region the way it does
+        // through the digest region. Without this, `PC` does not correctly carry `base_pc`
+        // from the digest prefix, through the indigest prefix, into the first instruction
+        // row's own `PC` — the same chain `is_digest`'s rule maintains for its own region.
+        b.assert_zero(is_indigest.clone() * (v(NEXT_PC) - v(PC)));
         b.assert_zero(
-            is_real.clone() * (one.clone() - v(IS_BRANCH) - v(IS_JAL) - v(IS_JALR) - continues.clone() - is_digest.clone()) * (v(NEXT_PC) - fallthrough),
+            is_real.clone() * (one.clone() - v(IS_BRANCH) - v(IS_JAL) - v(IS_JALR) - continues.clone() - is_digest.clone() - is_indigest.clone()) * (v(NEXT_PC) - fallthrough),
         );
 
         // memory: address, alignment, and the word actually in memory
@@ -460,6 +572,13 @@ where
         b.assert_zero(v(SYS_HALT) * (v(A) - AB::Expr::from_u32(SYS_NUM_HALT)));
         b.assert_zero(v(SYS_WRITE) * (v(A) - AB::Expr::from_u32(SYS_WRITE_OUTPUT)));
         b.assert_zero(v(SYS_READ) * (v(A) - AB::Expr::from_u32(SYS_READ_INPUT)));
+        // M4.1: the only constraint that pins a SYS_READ row's returned value (`C`, already
+        // written back to `a0` via the existing WRITES_RD/SYS_READ register-write path) —
+        // consumes exactly the (idx, word) pair the `input` table committed. Before this,
+        // `C` on a SYS_READ row was free (`docs/03-privacy.md`'s "existential READ_INPUT"
+        // note, now closed). Draws from `INPUT_READ`, not `INPUT_DIGEST` (review round 1, C1):
+        // a read can never affect the digest's own count.
+        bus::INPUT_READ.lookup_key(b, [v(B), v(C)], Count::bounded(v(SYS_READ), 1));
 
         // M3.2: the `POSEIDON2` ecall row. `a0` (already read into `B` every ecall row) is the
         // word pointer; `a1` (read through `MEM_VAL`, the memory slot, exactly like every other
@@ -539,7 +658,41 @@ where
         // on a digest row).
         for i in 0..4 { b.assert_bool(v(ACT0 + i)); }
         for i in 1..4 { b.assert_zero(v(ACT0 + i) * (one.clone() - v(ACT0 + i - 1))); }
+        // `is_hash`/`is_digest` rows are never legitimately empty (a `POSEIDON2` syscall with
+        // `n = 0` emits *zero* absorb rows at all — the emulator's absorb loop never runs — and
+        // a program always has at least one word), so "lane 0 always active" is a sound
+        // blanket requirement for them. `is_indigest` is deliberately left out of this same
+        // blanket rule and instead governed by two separate, more precise rules of its own:
+        // the salt row's own `IS_SALT * (1 - ACT3) = 0` (forcing it to absorb a full, genuine
+        // 4-word block — which cascades to `ACT0 = 1` there too, via the contiguous-prefix
+        // property just above), and the real (non-salt) rows'
+        // `is_real_indigest * (1 - ACT0) = 0` (review round 1, I2, right below this comment).
+        // Splitting it this way — rather than folding `is_indigest` whole into the blanket
+        // rule, which would also happen to be correct post-salt — keeps the salt row's "always
+        // a full block" invariant and the real rows' "always non-empty" invariant visibly
+        // distinct, matching how `fill_input_digest_rows` fills them for two structurally
+        // different reasons.
         b.assert_zero((is_hash.clone() + is_digest.clone()) * (one.clone() - v(ACT0)));
+        // Review round 1 (I2): the precise version of the same requirement for `is_indigest`
+        // is unconditional on *real* indigest rows — `is_real_indigest * (1 - ACT0) = 0`, not
+        // gated by `HASH_LEFT` at all. Post-salt, `hash::input_digest_rows` emits a real block
+        // only when there is at least one real word to put in it (`n.div_ceil(4)`, no `.max(1)`
+        // — the salt row alone covers "at least one permutation"), so every real indigest row
+        // is non-empty by construction and lane 0 must always be active there, exactly like
+        // `is_hash`/`is_digest`. `IS_SALT` rows are excluded (`is_real_indigest = is_indigest -
+        // IS_SALT`) since the salt row's own "always full" requirement is pinned separately.
+        //
+        // A previous, `HASH_LEFT`-gated version of this rule (`is_indigest * HASH_LEFT * (1 -
+        // ACT0) = 0`) was vacuous exactly when the last real block drains `HASH_LEFT` to 0 on
+        // a block boundary (`n_in` a multiple of 4) — a witness could then append one more,
+        // all-inactive indigest row: no rule forced its `ACT0`, its `INPUT_DIGEST` consume
+        // count was 0 either way, and the `POSEIDON2` bus still charged it a genuine extra
+        // permutation, so `H_IN` became `perm(H_honest)` — not a function of `(salt, inputs)`
+        // alone. The unconditional rule closes this: an appended real row always needs
+        // `ACT0 = 1`, so it always demands `INPUT_DIGEST` at an index the real drain chain
+        // never produces, and gets rejected there instead (`tests/cheating.rs`'s regression
+        // (h)).
+        b.assert_zero(is_real_indigest.clone() * (one.clone() - v(ACT0)));
         let active_sum = v(ACT0) + v(ACT0 + 1) + v(ACT0 + 2) + v(ACT0 + 3);
         {
             let mut t = b.when_transition();
@@ -577,7 +730,7 @@ where
         // Inactive lanes are not overwritten by the sponge: `HV_k` carries the previous
         // state's own lane `k` forward instead of a memory read (hash rows) or a
         // `PROGRAM_WORD` lookup (digest rows).
-        let is_hash_or_digest = is_hash.clone() + is_digest.clone();
+        let is_hash_or_digest = is_hash.clone() + is_digest.clone() + is_indigest.clone();
         for i in 0..4 { b.assert_zero(is_hash_or_digest.clone() * (one.clone() - v(ACT0 + i)) * (v(HV0 + i) - v(HS0 + i))); }
         // `HASH_LEFT`/`HASH_IDX` range checks (byte limbs), the same purpose `MA0..3` serves
         // for `MEM_ADDR`: without this, a wrong `HASH_LEFT`/`HASH_IDX` could only be caught via
@@ -596,7 +749,7 @@ where
         b.assert_zero(is_hash_or_digest.clone() * (v(LEFT0) + v(LEFT0 + 1) * AB::Expr::from_u32(256) - v(HASH_LEFT)));
         b.assert_zero(is_hash_or_digest.clone() * (v(IDX0) + v(IDX0 + 1) * AB::Expr::from_u32(256) - v(HASH_IDX)));
         for c in [LEFT0, LEFT0 + 1, IDX0] { bus::RANGE8.lookup_key(b, [v(c)], Count::bounded(is_hash_or_digest.clone(), 1)); }
-        bus::RANGE8.lookup_key(b, [v(IDX0 + 1)], Count::bounded(is_digest.clone(), 1));
+        bus::RANGE8.lookup_key(b, [v(IDX0 + 1)], Count::bounded(is_digest.clone() + is_indigest.clone(), 1));
         bus::AND4.lookup_key(b, [v(IDX0 + 1), AB::Expr::from_u32(3), v(IDX0 + 1)], Count::bounded(is_hash.clone(), 1));
         // The `POSEIDON2` lookup: `state_in` overwrites lanes 0..3 of the row's entering state
         // (`HS`) with this row's `HV`, keeping the capacity lanes 4..7; `state_out` is the
@@ -606,7 +759,13 @@ where
         // `HS`, i.e. the digest) *and* every digest row (M3.4; including its own last row,
         // whose `state_out` becomes `n(HS)` — pinned to `pv::HC0..HC7` below).
         let state_in: Vec<AB::Expr> = (0..8).map(|i| if i < 4 { v(HV0 + i) } else { v(HS0 + i) }).collect();
-        let state_out: Vec<AB::Expr> = (0..8).map(|i| n(HS0 + i)).collect();
+        // M4.1 (deviation, see `DPOUT0`'s doc comment): the last digest row's own output goes
+        // to the dedicated `DPOUT0..7` columns instead of `n(HS0+i)`, freeing the physical
+        // `n(HS0+i)` cell at that one transition for the H_IN header seed. Every other
+        // `is_hash_or_digest` row (every hash/indigest absorb row, and every non-last digest
+        // row) is unaffected — `digest_last` is 0 there, so this reduces to the original
+        // `n(HS0+i)` exactly.
+        let state_out: Vec<AB::Expr> = (0..8).map(|i| (one.clone() - digest_last.clone()) * n(HS0 + i) + digest_last.clone() * v(DPOUT0 + i)).collect();
         bus::POSEIDON2.lookup_key(b, state_in.into_iter().chain(state_out).collect::<Vec<_>>(), Count::bounded(is_hash_or_digest.clone(), 1));
 
         // M3.4 digest rows: `PROGRAM_WORD` lookups in place of a memory read, one per active
@@ -615,6 +774,23 @@ where
         let digest_pc = |k: u32| v(PC) + (v(HASH_IDX) * AB::Expr::from_u32(4) + AB::Expr::from_u32(k)) * AB::Expr::from_u32(4);
         for k in 0..4u32 {
             bus::PROGRAM_WORD.lookup_key(b, [digest_pc(k), v(HV0 + k as usize)], Count::bounded(is_digest.clone() * v(ACT0 + k as usize), 1));
+        }
+
+        // M4.1: indigest rows draw their 4 words per row from INPUT_DIGEST (consume), keyed by
+        // the plain running index — input indices always start at 0, so unlike
+        // PROGRAM_WORD's digest_pc there is no base offset to add. Draws from `INPUT_DIGEST`,
+        // never `INPUT_READ` (review round 1, C1): the digest's own count can never be
+        // affected by how many times (if any) a `SYS_READ` reads the same index.
+        //
+        // Salted H_IN (controller ruling, deviation from the brief for the same reason):
+        // `HASH_IDX` is seeded to 0 on the *salt* row and incremented once per row after, so a
+        // real input block's own `HASH_IDX` is one more than its position among real blocks
+        // (the salt row occupies index 0) — `indigest_idx` subtracts 1 to undo that offset.
+        // Harmless on the salt row itself: `is_real_indigest` (hoisted near `is_indigest`,
+        // above) is 0 there regardless of what `HASH_IDX - 1` evaluates to.
+        let indigest_idx = |k: u32| (v(HASH_IDX) - one.clone()) * four.clone() + AB::Expr::from_u32(k);
+        for k in 0..4u32 {
+            bus::INPUT_DIGEST.lookup_key(b, [indigest_idx(k), v(HV0 + k as usize)], Count::bounded(is_real_indigest.clone() * v(ACT0 + k as usize), 1));
         }
 
         // M3.4: the digest group's own bookkeeping — `PC` (`base_pc`) and `HASH_N` (`len`,
@@ -641,7 +817,6 @@ where
         // for every downstream use below.
         b.assert_bool(v(DIGEST_LAST));
         b.assert_zero((one.clone() - is_digest.clone()) * v(DIGEST_LAST));
-        let digest_last = v(DIGEST_LAST);
         // The final digest: `n(HS0..3)` (read below, inside `when_transition`) is the state
         // after the last digest row's own `POSEIDON2` permutation — the sponge output.
         // Encoded canonically into 8 lo/hi machine words (`DHVL0..31`, RANGE8-checked;
@@ -657,6 +832,37 @@ where
             b.assert_zero(digest_last.clone() * (pvs[pv::HC0 + k].clone() - byte_sum));
         }
         for j in 0..4usize { b.assert_bool(v(DHIMAX0 + j)); }
+
+        // M4.1: `INDIGEST_LAST`, the final `H_IN` encoding and the `pv::IN0..7` pin — the
+        // exact `DIGEST_LAST`/`DHVL0..31`/`DHIMAX0..3`/`DINV0..3` mechanism above, mirrored for
+        // the indigest region with its own encoding columns (`IHVL0..31`/`IHIMAX0..3`/
+        // `IINV0..3`) rather than reusing `DHVL0..31` (see `IS_INDIGEST`'s doc comment for why).
+        b.assert_bool(v(INDIGEST_LAST));
+        b.assert_zero((one.clone() - is_indigest.clone()) * v(INDIGEST_LAST));
+        let indigest_last = v(INDIGEST_LAST);
+        for k in 0..8 {
+            for j in 0..4 { bus::RANGE8.lookup_key(b, [v(IHVL0 + 4 * k + j)], Count::bounded(indigest_last.clone(), 1)); }
+            let byte_sum: AB::Expr = (0..4).map(|j| v(IHVL0 + 4 * k + j) * AB::Expr::from_u32(1 << (8 * j))).sum();
+            b.assert_zero(indigest_last.clone() * (pvs[pv::IN0 + k].clone() - byte_sum));
+        }
+        for j in 0..4usize { b.assert_bool(v(IHIMAX0 + j)); }
+        {
+            let mut t = b.when_transition();
+            t.assert_zero(is_indigest.clone() * (v(INDIGEST_LAST) - (one.clone() - n(IS_INDIGEST))));
+            t.assert_zero(indigest_last.clone() * n(HASH_LEFT));
+            // `two32` (the top-level binding from the `c_load` computation) was moved by that
+            // computation's own use of it — redefine locally here, harmless (see brief note).
+            let two32 = AB::Expr::from_u64(1u64 << 32);
+            for j in 0..4usize {
+                let lo = v(IHVL0 + 8 * j) + v(IHVL0 + 8 * j + 1) * AB::Expr::from_u32(1 << 8) + v(IHVL0 + 8 * j + 2) * AB::Expr::from_u32(1 << 16) + v(IHVL0 + 8 * j + 3) * AB::Expr::from_u32(1 << 24);
+                let hi = v(IHVL0 + 8 * j + 4) + v(IHVL0 + 8 * j + 5) * AB::Expr::from_u32(1 << 8) + v(IHVL0 + 8 * j + 6) * AB::Expr::from_u32(1 << 16) + v(IHVL0 + 8 * j + 7) * AB::Expr::from_u32(1 << 24);
+                t.assert_zero(indigest_last.clone() * (lo.clone() + hi.clone() * two32.clone() - n(HS0 + j)));
+                let d = hi - AB::Expr::from_u32(0xFFFF_FFFF);
+                t.assert_zero(indigest_last.clone() * (d * v(IINV0 + j) - (one.clone() - v(IHIMAX0 + j))));
+                t.assert_zero(indigest_last.clone() * v(IHIMAX0 + j) * lo);
+            }
+        }
+
         {
             let mut t = b.when_transition();
             t.assert_zero(is_digest.clone() * (v(DIGEST_LAST) - (one.clone() - n(IS_DIGEST))));
@@ -669,16 +875,69 @@ where
             // (not bare `is_digest`) is what keeps this from wrongly demanding `len` survive
             // into that row too.
             t.assert_zero(not_final_digest.clone() * (n(HASH_N) - v(HASH_N)));
-            t.assert_zero(is_digest.clone() * (v(HASH_LEFT) - active_sum.clone() - n(HASH_LEFT)));
+            // DEVIATION from the brief (a real correctness bug, found via self-review against
+            // an honest trace): the brief kept this drain rule gated by bare `is_digest`,
+            // unconditional on whether the *next* row is another digest row or (M4.1) the
+            // first indigest row. Before M4.1 that was harmless — the row after the last
+            // digest row was an ordinary row whose `HASH_LEFT` legitimately defaults to 0, so
+            // `n(HASH_LEFT) = v(HASH_LEFT) - active_sum` and "drained to 0" were the same
+            // statement. M4.1 seeds the first indigest row's `HASH_LEFT` to `n_in` (below,
+            // `digest_last.clone() * (n(HASH_LEFT) - n(HASH_N))`), a real, generally nonzero
+            // value — an unconditional drain rule on the *same* transition would force
+            // `n(HASH_LEFT) = v(HASH_LEFT) - active_sum` (0 for an honest, fully-absorbed last
+            // block) at the same time the seed forces it to `n_in`, unsatisfiable whenever
+            // `n_in > 0`. Split in two: the chain rule only when the next row is *another*
+            // digest row (`not_final_digest`); a *local* full-drain check tying the last
+            // digest row's own `active_sum` to its own `HASH_LEFT` (says nothing about the
+            // next row's column) covers the case this rule used to close via `digest_last *
+            // n(HASH_LEFT) = 0` (deleted per the brief) plus this unconditional drain rule
+            // together.
+            t.assert_zero(not_final_digest.clone() * (v(HASH_LEFT) - active_sum.clone() - n(HASH_LEFT)));
+            t.assert_zero(digest_last.clone() * (v(HASH_LEFT) - active_sum.clone()));
+            // M4.1: the first indigest row's own bookkeeping is free, pinned only here —
+            // there is no preceding ecall row (unlike a POSEIDON2 syscall) and this is not
+            // row 0 of the table (unlike the program digest's own `when_first_row` seed), so
+            // the seed lives on the transition out of the program-digest prefix instead.
+            // Capacity header [IN_DOMAIN, n_in, 0] mirrors hc's [HC_DOMAIN, base_pc, len]
+            // with one fewer real word (no base-address analogue for a flat input vector).
+            for i in [0usize, 1, 2, 3, 7] { t.assert_zero(digest_last.clone() * n(HS0 + i)); }
+            t.assert_zero(digest_last.clone() * (n(HS0 + 4) - AB::Expr::from_u32(crate::hash::IN_DOMAIN)));
+            t.assert_zero(digest_last.clone() * (n(HS0 + 5) - n(HASH_N)));
+            t.assert_zero(digest_last.clone() * n(HS0 + 6));
+            t.assert_zero(digest_last.clone() * n(HASH_IDX));
+            t.assert_zero(digest_last.clone() * (n(HASH_LEFT) - n(HASH_N)));
+            // Absorb-chain rules for the indigest region, mirroring the `not_final_digest`/
+            // `active_sum`-drain/`HASH_IDX`-increment rules this same block already carries
+            // for `is_digest`.
+            let not_final_indigest = is_indigest.clone() * n(IS_INDIGEST);
+            t.assert_zero(not_final_indigest.clone() * (n(HASH_N) - v(HASH_N)));
+            // Salted H_IN (controller ruling, deviation from the brief): the salt row's own
+            // `active_sum` (always 4, forced above) must *not* drain `HASH_LEFT` — the salt
+            // isn't a real input word, so `HASH_LEFT` (still `n_in`, seeded on this exact row)
+            // must carry through to the first real block unchanged. `indigest_drain` is
+            // `active_sum` on every real indigest row and 0 on the salt row.
+            let indigest_drain = active_sum.clone() * (one.clone() - v(IS_SALT));
+            t.assert_zero(is_indigest.clone() * (v(HASH_LEFT) - indigest_drain - n(HASH_LEFT)));
+            t.assert_zero(not_final_indigest.clone() * (n(HASH_IDX) - v(HASH_IDX) - one.clone()));
+            t.assert_zero(not_final_indigest * (one.clone() - v(ACT0 + 3)));
             t.assert_zero(not_final_digest.clone() * (n(HASH_IDX) - v(HASH_IDX) - one.clone()));
             t.assert_zero(not_final_digest * (one.clone() - v(ACT0 + 3)));
-            t.assert_zero(digest_last.clone() * n(HASH_LEFT));
+            // CRITICAL — the old `t.assert_zero(digest_last.clone() * n(HASH_LEFT));` rule is
+            // deleted here (M4.1): before M4.1 it correctly meant "the row after the program
+            // digest (the first instruction row) starts with `HASH_LEFT = 0`"; after M4.1 the
+            // row after the program digest is the *first indigest row*, whose honest
+            // `HASH_LEFT` is `n_in` (seeded above via `n(HASH_LEFT) - n(HASH_N)`), not 0 —
+            // leaving the old line in place would make an `n_in > 0` proof unconditionally
+            // unsatisfiable.
 
             let two32 = AB::Expr::from_u64(1u64 << 32);
             for j in 0..4usize {
                 let lo = v(DHVL0 + 8 * j) + v(DHVL0 + 8 * j + 1) * AB::Expr::from_u32(1 << 8) + v(DHVL0 + 8 * j + 2) * AB::Expr::from_u32(1 << 16) + v(DHVL0 + 8 * j + 3) * AB::Expr::from_u32(1 << 24);
                 let hi = v(DHVL0 + 8 * j + 4) + v(DHVL0 + 8 * j + 5) * AB::Expr::from_u32(1 << 8) + v(DHVL0 + 8 * j + 6) * AB::Expr::from_u32(1 << 16) + v(DHVL0 + 8 * j + 7) * AB::Expr::from_u32(1 << 24);
-                t.assert_zero(digest_last.clone() * (lo.clone() + hi.clone() * two32.clone() - n(HS0 + j)));
+                // M4.1 (deviation, see `DPOUT0`'s doc comment): reads `v(DPOUT0+j)` — the last
+                // digest row's own dedicated output columns — instead of `n(HS0+j)`, which
+                // M4.1 repurposes for the H_IN header seed on this exact transition.
+                t.assert_zero(digest_last.clone() * (lo.clone() + hi.clone() * two32.clone() - v(DPOUT0 + j)));
                 let d = hi - AB::Expr::from_u32(0xFFFF_FFFF);
                 t.assert_zero(digest_last.clone() * (d * v(DINV0 + j) - (one.clone() - v(DHIMAX0 + j))));
                 t.assert_zero(digest_last.clone() * v(DHIMAX0 + j) * lo);
@@ -762,10 +1021,11 @@ where
     }
 }
 
-pub fn public_values(pc_entry: u32, tier_log2: usize, outputs: &[u32; NUM_OUTPUTS], hc: &[u32; 8]) -> Vec<F> {
+pub fn public_values(pc_entry: u32, tier_log2: usize, outputs: &[u32; NUM_OUTPUTS], hc: &[u32; 8], hin: &[u32; 8]) -> Vec<F> {
     let mut v = vec![F::from_u32(pc_entry), F::from_u64(tier_log2 as u64)];
     v.extend(outputs.iter().map(|o| F::from_u32(*o)));
     v.extend(hc.iter().map(|o| F::from_u32(*o)));
+    v.extend(hin.iter().map(|o| F::from_u32(*o)));
     v
 }
 
@@ -803,6 +1063,12 @@ fn fill_digest_rows(v: &mut [F], program: &Program, range: &mut RangeCounts) {
         range.range8(i1);
         if i + 1 == n {
             r[DIGEST_LAST] = F::ONE;
+            // M4.1 (deviation, see `DPOUT0`'s doc comment): this row's own real permutation
+            // output goes into its own dedicated `DPOUT0..7` columns — `n(HS0+i)` (the
+            // physical cell at row `i+1`) now instead carries the H_IN header seed
+            // (`fill_input_digest_rows` writes it, via that function's own per-row `HS0..7`
+            // fill using `input_digest_rows`'s block-0 `state_in`).
+            for k in 0..8 { r[DPOUT0 + k] = blk.state_out[k]; }
             let digest = crate::hash::split_digest([blk.state_out[0], blk.state_out[1], blk.state_out[2], blk.state_out[3]]);
             for (k, &w) in digest.iter().enumerate() {
                 let wl = limbs(w);
@@ -817,18 +1083,74 @@ fn fill_digest_rows(v: &mut [F], program: &Program, range: &mut RangeCounts) {
             }
         }
     }
-    // The AIR's canonical-encoding pin on the last digest row reads `n(HS0..3)` — the state
-    // *entering* the row right after the digest prefix (the first instruction row, or the
-    // next digest row in the always-≥1-block case). Nothing else populates that row's `HS`
-    // (an ordinary instruction row's own event data has no notion of it), so it must be
-    // seeded here explicitly, exactly as the last digest block's own permutation output —
-    // mirroring how a hash absorb row's `state_out` becomes the *next* row's `HS` via that
-    // row's own event data (`HashRow::Absorb`'s `state_in` chain); here there is no such next
-    // event, so the digest builder writes it directly.
+}
+
+/// M4.1: fills the `1 + ⌈n_in/4⌉`-row indigest region (the salt row plus the real input
+/// blocks — `hash::input_digest_row_count`) starting at cpu-table row `offset`
+/// (`program.digest_rows()`), mirroring `fill_digest_rows` exactly with `hash::
+/// input_digest_rows`/`IS_INDIGEST`/`INDIGEST_LAST`/`IHVL0..31`/`IHIMAX0..3`/`IINV0..3` in
+/// place of `hash::program_digest_rows`/`IS_DIGEST`/`DIGEST_LAST`/`DHVL0..31`/`DHIMAX0..3`/
+/// `DINV0..3`, plus `IS_SALT` on the first (salt) row. Returns the number of rows it filled.
+fn fill_input_digest_rows(v: &mut [F], offset: usize, base_pc: u32, salt: [u32; 4], inputs: &[u32], range: &mut RangeCounts) -> usize {
+    let blocks = crate::hash::input_digest_rows(salt, inputs);
+    let n = blocks.len();
+    for (i, blk) in blocks.iter().enumerate() {
+        let r = &mut v[(offset + i) * WIDTH..(offset + i + 1) * WIDTH];
+        r[IS_INDIGEST] = F::ONE;
+        // Salted H_IN (controller ruling): block 0 is always the salt block
+        // (`hash::input_digest_rows`'s own convention) — mark it so the AIR skips its
+        // `INPUT_DIGEST` consumption (review round 1, C1: it draws from `INPUT_DIGEST` now,
+        // not the retired single `INPUT_WORD` bus) and excludes its `active_sum` from the
+        // `HASH_LEFT` drain.
+        if blk.idx == 0 { r[IS_SALT] = F::ONE; }
+        // DEVIATION from the brief (found via self-review against an honest trace, see the
+        // three matching AIR-side deviation comments in `eval` — the drain-rule split, the
+        // PC-holds-still rule, and the fallthrough-rule exclusion): this row is a genuine
+        // cycle-counted row like a program digest row, and needs the exact same `CLK`/`PC`/
+        // `NEXT_PC` bookkeeping `fill_digest_rows` gives its own rows — the brief's own
+        // `fill_input_digest_rows` snippet sets none of `IS_REAL`/`CLK`/`PC`/`NEXT_PC`, which
+        // (given the matching AIR gaps above) rejects even an honest trace.
+        r[IS_REAL] = F::ONE;
+        r[CLK] = F::from_u32((offset + i) as u32);
+        r[PC] = F::from_u32(base_pc);
+        r[NEXT_PC] = F::from_u32(base_pc);
+        r[HASH_N] = F::from_u32(inputs.len() as u32);
+        r[HASH_LEFT] = F::from_u32(blk.left_before);
+        r[HASH_IDX] = F::from_u32(blk.idx);
+        for k in 0..8 { r[HS0 + k] = blk.state_in[k]; }
+        for k in 0..4 {
+            r[ACT0 + k] = F::from_bool(blk.active[k]);
+            r[HV0 + k] = if blk.active[k] { F::from_u32(blk.words[k]) } else { blk.state_in[k] };
+        }
+        let (l0, l1) = (blk.left_before & 0xff, (blk.left_before >> 8) & 0xff);
+        r[LEFT0] = F::from_u32(l0); r[LEFT0 + 1] = F::from_u32(l1);
+        range.range8(l0); range.range8(l1);
+        let (i0, i1) = (blk.idx & 0xff, (blk.idx >> 8) & 0xff);
+        r[IDX0] = F::from_u32(i0); r[IDX0 + 1] = F::from_u32(i1);
+        range.range8(i0); range.range8(i1);
+        if i + 1 == n { r[INDIGEST_LAST] = F::ONE; }
+    }
     if let Some(last) = blocks.last() {
-        let r = &mut v[n * WIDTH..(n + 1) * WIDTH];
+        let words = crate::hash::split_digest([last.state_out[0], last.state_out[1], last.state_out[2], last.state_out[3]]);
+        let r = &mut v[(offset + n - 1) * WIDTH..(offset + n) * WIDTH];
+        for k in 0..8 {
+            let bl = limbs(words[k]);
+            for j in 0..4 { r[IHVL0 + 4 * k + j] = bl[j]; range.range8((words[k] >> (8 * j)) & 0xff); }
+        }
+        for j in 0..4usize {
+            let hi = words[2 * j + 1];
+            if hi == u32::MAX { r[IHIMAX0 + j] = F::ONE; } else {
+                let d = F::from_u32(hi) - F::from_u32(u32::MAX);
+                r[IINV0 + j] = d.inverse();
+            }
+        }
+        // Seed the row right after the indigest region (the first ordinary/instruction row)
+        // with this block's final state — the same "no next event populates this" gap
+        // `fill_digest_rows` used to close for the program-digest boundary.
+        let r = &mut v[(offset + n) * WIDTH..(offset + n + 1) * WIDTH];
         for k in 0..8 { r[HS0 + k] = last.state_out[k]; }
     }
+    n
 }
 
 /// `range`/`nibble` receive the `RANGE8`/`AND4` lookups the alignment limbs declare, in
@@ -836,20 +1158,23 @@ fn fill_digest_rows(v: &mut [F], program: &Program, range: &mut RangeCounts) {
 /// digest-row prefix (`Program::digest_rows()` rows, `hash::program_digest_rows`) — the
 /// witness's own traversal of the whole program for `hc`, distinct from `events`'ordinary
 /// per-cycle rows, which now start `digest_rows` rows later (`CLK` shifted the same amount).
-pub fn cpu_trace(program: &Program, events: &[CycleEvent], height: usize, range: &mut RangeCounts, nibble: &mut NibbleCounts) -> RowMajorMatrix<F> {
+pub fn cpu_trace(program: &Program, inputs: &[u32], salt: [u32; 4], events: &[CycleEvent], height: usize, range: &mut RangeCounts, nibble: &mut NibbleCounts) -> RowMajorMatrix<F> {
     let digest_rows = program.digest_rows();
+    let input_digest_rows = crate::hash::input_digest_row_count(inputs.len());
+    let offset = digest_rows + input_digest_rows;
     assert!(
-        digest_rows + events.len() < height,
-        "cpu table needs a padding row: {digest_rows} digest rows + {} cycles, height {height}",
+        offset + events.len() < height,
+        "cpu table needs a padding row: {digest_rows} program-digest rows + {input_digest_rows} input-digest rows + {} cycles, height {height}",
         events.len()
     );
     let mut v = F::zero_vec(height * WIDTH);
     fill_digest_rows(&mut v, program, range);
+    fill_input_digest_rows(&mut v, digest_rows, program.base_pc, salt, inputs, range);
     let mut written = [0u32; NUM_OUTPUTS];
     let mut hash_ptr_n: Option<(u32, u32)> = None;
     for (i, e) in events.iter().enumerate() {
-        let r = &mut v[(digest_rows + i) * WIDTH..(digest_rows + i + 1) * WIDTH];
-        r[CLK] = F::from_u32(digest_rows as u32 + e.clk); r[PC] = F::from_u32(e.pc); r[NEXT_PC] = F::from_u32(e.next_pc); r[IS_REAL] = F::ONE;
+        let r = &mut v[(offset + i) * WIDTH..(offset + i + 1) * WIDTH];
+        r[CLK] = F::from_u32(offset as u32 + e.clk); r[PC] = F::from_u32(e.pc); r[NEXT_PC] = F::from_u32(e.next_pc); r[IS_REAL] = F::ONE;
         for (k, f) in e.dec.to_fields().iter().enumerate() { r[DEC0 + k] = F::from_u32(*f); }
         r[A] = F::from_u32(e.a); r[B] = F::from_u32(e.b); r[C] = F::from_u32(e.c);
         r[ALU_OUT] = F::from_u32(e.alu_out); r[TGT] = F::from_u32(e.tgt);
@@ -988,7 +1313,7 @@ pub fn cpu_trace(program: &Program, events: &[CycleEvent], height: usize, range:
     }
     // The accumulator must carry its final value through the padding: the last row is where
     // `(1 − written_i)·pv[out_i] = 0` reads it.
-    for i in (digest_rows + events.len())..height {
+    for i in (offset + events.len())..height {
         let r = &mut v[i * WIDTH..(i + 1) * WIDTH];
         for (k, w) in written.iter().enumerate() { r[WRITTEN0 + k] = F::from_u32(*w); }
     }

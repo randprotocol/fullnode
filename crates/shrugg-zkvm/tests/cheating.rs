@@ -10,7 +10,7 @@ use shrugg_zkvm::asm::{ops::*, Assembler};
 use shrugg_zkvm::emulator::{execute, SLOT_W};
 use shrugg_zkvm::guests;
 use shrugg_zkvm::isa::{AluOp, Instr, REG_A0, REG_A1};
-use shrugg_zkvm::machine::{build_traces, FriProfile, Machine, Tier, Traces};
+use shrugg_zkvm::machine::{build_traces_salted, FriProfile, Machine, Tier, Traces};
 use shrugg_zkvm::tables::{alu, cpu, limbs, memory, nibble, poseidon2, program, range, F};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -74,7 +74,7 @@ fn setup() -> (Machine, shrugg_zkvm::isa::Program, Traces) {
     let m = Machine::new(FriProfile::Test);
     let p = guests::fib(10);
     let e = execute(&p, &[], 10_000).unwrap();
-    let t = build_traces(&p, &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     (m, p, t)
 }
 
@@ -369,7 +369,7 @@ fn storing_a_value_that_was_never_in_a_register_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 5);
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     forge_a_store(&mut t, 0x0500_0000);
     assert_eq!(t.public_values[cpu::pv::OUT0], F::from_u32(0x0500_0000));
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
@@ -391,7 +391,7 @@ fn bumping_range8_on_a_bitwise_rows_now_unconstrained_a_limb_is_rejected() {
     let p = a.assemble();
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     t.range.values[0x12 * range::col::WIDTH + range::col::M_RANGE] += F::ONE;
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
 }
@@ -409,7 +409,7 @@ fn bumping_range8_on_an_slt_rows_now_unconstrained_c_limb_is_rejected() {
     let p = a.assemble();
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     t.range.values[range::col::WIDTH + range::col::M_RANGE] += F::ONE;
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
 }
@@ -428,7 +428,7 @@ fn a_store_that_replaces_the_wrong_byte_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0x112233ff);
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     let w = cpu::col::WIDTH;
     // Find the SB row and corrupt MERGED to replace byte 1 instead of byte 0.
     let sb_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_SB] == F::ONE).unwrap();
@@ -451,7 +451,7 @@ fn a_load_byte_with_flipped_sign_extension_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0xffff_ffff);
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     let w = cpu::col::WIDTH;
     let lb_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_LB] == F::ONE).unwrap();
     t.cpu.values[lb_row * w + cpu::col::SGN] = F::ZERO; // flip: claim unsigned-looking zero-extend
@@ -472,7 +472,7 @@ fn a_misaligned_lh_is_rejected_by_the_air() {
     let p = a.assemble();
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     let w = cpu::col::WIDTH;
     let lw_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_LW] == F::ONE).unwrap();
     // Retag this LW row as an LH with OFF0=1 (byte offset 1 — misaligned for a half).
@@ -495,7 +495,7 @@ fn a_sb_that_changes_a_byte_outside_its_offset_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0x1122ff44);
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     let w = cpu::col::WIDTH;
     let sb_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_SB] == F::ONE).unwrap();
     // Also corrupt byte 2 (outside off=1), leaving byte 1 correct.
@@ -528,7 +528,7 @@ fn mulhu_cannot_claim_hi_equals_2_32_minus_1_for_a_small_product() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0);
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, shrugg_zkvm::isa::AluOp::Mulhu);
     let forged_carry = 0xffff_ffffu32; // would make HI = T2 + CARRY = 0xffff_ffff
@@ -561,7 +561,7 @@ fn a_small_in_range_forged_carry_on_a_mulhu_row_is_still_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0);
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, shrugg_zkvm::isa::AluOp::Mulhu);
     let forged_carry = 100u32; // < 2^24, so the CARRY-limb check alone does not catch this
@@ -592,7 +592,7 @@ fn a_remainder_not_smaller_than_the_divisor_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 2);
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, shrugg_zkvm::isa::AluOp::Remu);
     t.alu.values[row * w + alu::col::Q0] = F::from_u32(2); // quotient core: 3 -> 2
@@ -617,7 +617,7 @@ fn a_wrong_divz_on_a_nonzero_divisor_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 3);
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, shrugg_zkvm::isa::AluOp::Divu);
     t.alu.values[row * w + alu::col::DIVZ] = F::ONE; // B = 3 != 0, but claim DIVZ
@@ -656,7 +656,7 @@ fn a_mul_flag_set_on_an_otherwise_all_zero_padding_row_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let p = guests::muldiv();
     let e = execute(&p, &[], 10_000).unwrap();
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     let wa = alu::col::WIDTH;
     let pad = t.alu.height() - 1;
     assert_eq!(t.alu.values[pad * wa + alu::col::IS_REAL], F::ZERO, "last alu row is padding");
@@ -680,7 +680,7 @@ fn a_sign_flipped_mulh_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0);
-    let mut t = build_traces(&p, &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, shrugg_zkvm::isa::AluOp::Mulh);
     assert_eq!(t.alu.values[row * w + alu::col::SA], F::ONE, "A = -2 is negative");
@@ -739,7 +739,7 @@ fn setup_poseidon2(msg: &[u32]) -> (Machine, shrugg_zkvm::isa::Program, Traces) 
     let m = Machine::new(FriProfile::Test);
     let p = guests::poseidon2_demo(msg);
     let e = execute(&p, &[], 10_000).unwrap();
-    let t = build_traces(&p, &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
     (m, p, t)
 }
 
@@ -1027,5 +1027,401 @@ fn a_row_claiming_to_be_both_a_digest_and_an_absorb_row_is_rejected() {
     let (_, absorbs, _) = hash_rows(&t);
     assert_eq!(absorbs.len(), 1, "n=4 is exactly one full block");
     t.cpu.values[absorbs[0] * w + cpu::col::IS_DIGEST] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// M4.1: the input commitment — READ_INPUT bound to a committed H_IN via the new `input`
+// table and the split INPUT_DIGEST/INPUT_READ buses (review round 1, C1).
+
+/// The fixed salt every hand-tampered witness below uses — value is arbitrary, only its
+/// *consistency* with what a given `Traces` was actually built with matters.
+const TEST_SALT: [u32; 4] = [0u32; 4];
+
+fn setup_with_inputs(inputs: &[u32]) -> (Machine, shrugg_zkvm::isa::Program, Traces) {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::balance_check(1000); // reads inputs 0..3 once each
+    let e = execute(&p, inputs, 10_000).unwrap();
+    let t = build_traces_salted(&p, inputs, TEST_SALT, &e, Tier(10)).unwrap();
+    (m, p, t)
+}
+
+/// Rewrites `t`'s indigest region in place as if H_IN had only ever committed to
+/// `new_inputs` (a prefix of the original inputs `t` was built with, needing the *same*
+/// number of real indigest rows — i.e. `new_inputs.len()` and the original `n_in` fall in the
+/// same `⌈./4⌉` block), while leaving the `input` witness table (and hence the guest's own
+/// reads) completely untouched. This is the shared "shrink the digest's own declared n_in"
+/// step behind cheating tests (d) and (f): it recomputes the salt row's header, the real
+/// block's absorbed words and inactive-lane carry, `HASH_LEFT`'s own `LEFT0/LEFT0+1`
+/// byte-limb re-encoding (and the `range` table's matching multiplicity shift, since RANGE8 is
+/// exact-count accounting — leaving this out would reject on a RANGE8 imbalance instead of the
+/// intended `INPUT_DIGEST` one), the last real row's canonical `IHVL/IHIMAX/IINV` encoding,
+/// the two permutation entries in the poseidon2 table (this only holds for a guest with no
+/// `POSEIDON2` syscalls of its own, true of `guests::balance_check`, so the program digest's
+/// own permutations plus the indigest ones are the *entire* poseidon2 event list — see
+/// `machine::build_traces_salted`), and `pv::IN0..7` — everything an honest
+/// `hash::input_digest_rows(salt, new_inputs)` computation would produce — mirroring
+/// `tables::cpu::fill_input_digest_rows` by hand against an already-built `Traces`.
+fn shrink_declared_n_in(t: &mut Traces, p: &shrugg_zkvm::isa::Program, salt: [u32; 4], new_inputs: &[u32]) {
+    let w = cpu::col::WIDTH;
+    let offset = p.digest_rows();
+    let blocks = shrugg_zkvm::hash::input_digest_rows(salt, new_inputs);
+    let n = blocks.len();
+    let rw = range::col::WIDTH;
+    // RANGE8 is exact-count accounting (`RangeCounts`/`range_trace`): every RANGE8-checked
+    // byte column this loop overwrites (`LEFT0/LEFT0+1`, and — on the last row —
+    // `IHVL0..31`) changes which byte values the cpu table demands, so the `range` table's
+    // own supply must shift by the same amount, tracked generically here as (old, new) byte
+    // pairs, or a RANGE8 imbalance (not the intended INPUT_DIGEST one) rejects the witness
+    // instead.
+    let mut range_byte_edits: Vec<(u32, u32)> = Vec::new();
+    for (i, blk) in blocks.iter().enumerate() {
+        let r0 = (offset + i) * w;
+        t.cpu.values[r0 + cpu::col::HASH_N] = F::from_u32(new_inputs.len() as u32);
+        let old_left = t.cpu.values[r0 + cpu::col::HASH_LEFT].as_canonical_u64() as u32;
+        t.cpu.values[r0 + cpu::col::HASH_LEFT] = F::from_u32(blk.left_before);
+        let (old_l0, old_l1) = (old_left & 0xff, (old_left >> 8) & 0xff);
+        let (new_l0, new_l1) = (blk.left_before & 0xff, (blk.left_before >> 8) & 0xff);
+        t.cpu.values[r0 + cpu::col::LEFT0] = F::from_u32(new_l0);
+        t.cpu.values[r0 + cpu::col::LEFT0 + 1] = F::from_u32(new_l1);
+        range_byte_edits.push((old_l0, new_l0));
+        range_byte_edits.push((old_l1, new_l1));
+        for k in 0..8 { t.cpu.values[r0 + cpu::col::HS0 + k] = blk.state_in[k]; }
+        for k in 0..4 {
+            t.cpu.values[r0 + cpu::col::ACT0 + k] = F::from_bool(blk.active[k]);
+            t.cpu.values[r0 + cpu::col::HV0 + k] = if blk.active[k] { F::from_u32(blk.words[k]) } else { blk.state_in[k] };
+        }
+        if i + 1 == n {
+            let words = shrugg_zkvm::hash::split_digest([blk.state_out[0], blk.state_out[1], blk.state_out[2], blk.state_out[3]]);
+            for kk in 0..8 {
+                let old_bytes: [u32; 4] = core::array::from_fn(|j| t.cpu.values[r0 + cpu::col::IHVL0 + 4 * kk + j].as_canonical_u64() as u32);
+                let new_bl = limbs(words[kk]);
+                for j in 0..4 {
+                    let new_byte = new_bl[j].as_canonical_u64() as u32;
+                    range_byte_edits.push((old_bytes[j], new_byte));
+                    t.cpu.values[r0 + cpu::col::IHVL0 + 4 * kk + j] = new_bl[j];
+                }
+            }
+            for j in 0..4usize {
+                let hi = words[2 * j + 1];
+                if hi == u32::MAX {
+                    t.cpu.values[r0 + cpu::col::IHIMAX0 + j] = F::ONE;
+                    t.cpu.values[r0 + cpu::col::IINV0 + j] = F::ZERO;
+                } else {
+                    t.cpu.values[r0 + cpu::col::IHIMAX0 + j] = F::ZERO;
+                    t.cpu.values[r0 + cpu::col::IINV0 + j] = (F::from_u32(hi) - F::from_u32(u32::MAX)).inverse();
+                }
+            }
+            // Seed the row right after (the first ordinary instruction row) with this block's
+            // final state, exactly as `fill_input_digest_rows` does.
+            let r1 = (offset + n) * w;
+            for k in 0..8 { t.cpu.values[r1 + cpu::col::HS0 + k] = blk.state_out[k]; }
+        }
+    }
+    for (old_byte, new_byte) in range_byte_edits {
+        t.range.values[old_byte as usize * rw + range::col::M_RANGE] -= F::ONE;
+        t.range.values[new_byte as usize * rw + range::col::M_RANGE] += F::ONE;
+    }
+    // Rebuild the poseidon2 table's program-digest + indigest permutation entries — the only
+    // two event sources for a guest with no `POSEIDON2` syscalls of its own.
+    let digest_blocks = shrugg_zkvm::hash::program_digest_rows(p.base_pc, &p.words);
+    let to_events = |blocks: &[shrugg_zkvm::hash::DigestBlock]| -> Vec<poseidon2::Poseidon2Event> {
+        blocks.iter().map(|blk| {
+            let mut input = blk.state_in;
+            for k in 0..4 { if blk.active[k] { input[k] = F::from_u32(blk.words[k]); } }
+            poseidon2::Poseidon2Event { input, output: blk.state_out }
+        }).collect()
+    };
+    let all: Vec<poseidon2::Poseidon2Event> = to_events(&digest_blocks).into_iter().chain(to_events(&blocks)).collect();
+    t.poseidon2 = poseidon2::poseidon2_trace(&all, t.poseidon2.height());
+    // pv::IN0..7
+    let hin = shrugg_zkvm::hash::input_digest(salt, new_inputs);
+    for k in 0..8 { t.public_values[cpu::pv::IN0 + k] = F::from_u32(hin[k]); }
+}
+
+// (a) two reads of the same index returning different words rejects.
+#[test]
+fn two_reads_of_the_same_index_returning_different_words_is_rejected() {
+    // A tiny hand-built guest: read input[0] twice into two registers, output their XOR
+    // (0 if honest), so the second read's row is easy to locate and its C column easy to
+    // tamper independently of the first.
+    let mut a = Assembler::new(0);
+    a.extend(read_input(0));
+    a.push(mv(5, REG_A0)); // t0 = first read
+    a.extend(read_input(0));
+    a.push(xor(6, 5, REG_A0)); // t1 = t0 ^ second read (0 if honest)
+    a.extend(write_output(0, 6));
+    a.extend(halt());
+    let p = a.assemble();
+    let inputs = [7u32];
+    let e = execute(&p, &inputs, 10_000).unwrap();
+    assert_eq!(e.outputs[0], 0, "two honest reads of the same index must agree");
+    let m = Machine::new(FriProfile::Test);
+    let mut t = build_traces_salted(&p, &inputs, [0u32; 4], &e, Tier(10)).unwrap();
+    let w = cpu::col::WIDTH;
+    // Locate the second SYS_READ row (there are exactly two) and forge its returned word.
+    let read_rows: Vec<usize> = (0..t.cpu.height()).filter(|&i| t.cpu.values[i * w + cpu::col::SYS_READ] == F::ONE).collect();
+    assert_eq!(read_rows.len(), 2);
+    t.cpu.values[read_rows[1] * w + cpu::col::C] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (b) a read of a word not in the committed inputs (the input table's own row tampered)
+// rejects — the SYS_READ row's honestly-returned C no longer matches what H_IN absorbed.
+#[test]
+fn a_read_disagreeing_with_the_committed_input_word_is_rejected() {
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    let iw = shrugg_zkvm::tables::input::col::WIDTH;
+    t.input.values[0 * iw + shrugg_zkvm::tables::input::col::WORD] += F::ONE; // tamper index 0's committed word
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (c) H_IN in pv tampered rejects.
+#[test]
+fn tampering_h_in_in_public_values_is_rejected() {
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    t.public_values[cpu::pv::IN0] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (d) declaring n_in smaller than the reads rejects — I3 (review round 1): rewritten to
+// exercise the property against the split-bus design. Shrinking only the *digest's* declared
+// n_in (via `shrink_declared_n_in`, which recomputes everything the digest itself is
+// responsible for, so no *other* check trips first) while leaving the `input` table exactly
+// as built for the real 4-word vector leaves its now-unclaimed 4th real row's `IS_REAL = 1`
+// supply on `INPUT_DIGEST` unmatched — the read of that same index still succeeds fine on
+// `INPUT_READ`, which is untouched.
+#[test]
+fn declaring_n_in_smaller_than_the_reads_is_rejected() {
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]); // n_in = 4, exactly 1 real indigest row
+    shrink_declared_n_in(&mut t, &p, TEST_SALT, &[400, 250, 300]);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (f) the full C1 witness (n_in 4→3 with the 4th word still read via MULT_READ) is rejected —
+// the reviewer's exact concrete cheating witness against the pre-split single-bus design: (1)
+// shrink the digest's declared n_in (as in (d)), (2) additionally zero the orphaned input
+// row's `MULT_READ` to try to "hide" its now-unclaimed mandatory-copy slot. Under the split
+// design `MULT_READ` no longer feeds `INPUT_DIGEST` at all, so step (2) is powerless: the
+// row's `IS_REAL = 1` supply on `INPUT_DIGEST` stays unclaimed regardless.
+#[test]
+fn the_c1_witness_shrinking_n_in_while_still_reading_the_dropped_word_is_rejected() {
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    shrink_declared_n_in(&mut t, &p, TEST_SALT, &[400, 250, 300]);
+    let iw = shrugg_zkvm::tables::input::col::WIDTH;
+    t.input.values[3 * iw + shrugg_zkvm::tables::input::col::MULT_READ] = F::ZERO;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (g) an extra real input row at IDX = n_in is rejected — the "dual form" of (f): appending a
+// committed word past the digest's own declared n_in leaves an unclaimed `IS_REAL = 1` supply
+// on `INPUT_DIGEST` regardless of whether anything else claims to read it. What this witness
+// stands in for — a genuine `READ_INPUT(n_in)` — is exactly what the emulator refuses
+// (checked directly below), which is why the witness has to be built by hand.
+#[test]
+fn an_extra_real_input_row_at_idx_equal_to_n_in_is_rejected() {
+    assert!(matches!(
+        execute(&guests::balance_check(1000), &[400u32, 250, 300], 10_000),
+        Err(shrugg_zkvm::emulator::ExecError::InputIndex(3))
+    ), "a READ_INPUT past the supplied inputs is exactly what the emulator refuses");
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]); // n_in = 4
+    let iw = shrugg_zkvm::tables::input::col::WIDTH;
+    assert!(t.input.height() > 4, "spare padding rows past the 4 real ones");
+    t.input.values[4 * iw + shrugg_zkvm::tables::input::col::WORD] = F::from_u32(999);
+    t.input.values[4 * iw + shrugg_zkvm::tables::input::col::IS_REAL] = F::ONE;
+    // MULT_READ stays 0 — nothing needs to claim to read this row for INPUT_DIGEST alone
+    // (an unclaimed IS_REAL = 1 supply the digest never demands) to reject it.
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (h) I2 (review round 2, N1): the *faithful* regression — a genuinely appended, all-inactive
+// indigest row after a block-aligned n_in (n_in = 4, so HASH_LEFT is already fully drained to
+// 0 on the one real block), built so that *only* the lane-0 rule stands between it and
+// acceptance: everything else the AIR demands (INDIGEST_LAST moved to the new row, the
+// canonical H_IN encoding moved with it, the new row's own genuine POSEIDON2 permutation
+// wired into the poseidon2 table and into the row after it, the whole rest of the cpu table's
+// CLK chain shifted by one, MEMORY and RANGE8 kept exactly balanced) is made fully consistent
+// by hand. Round 1's version repurposed the very next row in place, leaving INDIGEST_LAST = 1
+// on the real row while the new row also claimed IS_INDIGEST = 1 — a shape the untouched
+// chain rule at the real→new transition (`is_indigest * (INDIGEST_LAST - (1 - n(IS_INDIGEST)))
+// = 0`) already rejects on its own, independent of the lane-0 rule, so it never actually
+// exercised I2.
+//
+// Discrimination check, run by hand against this same witness: restoring the old,
+// `HASH_LEFT`-gated rule (`is_indigest * HASH_LEFT * (1 - ACT0) = 0`) makes the witness
+// VERIFY (it's vacuous here, since the appended row's `HASH_LEFT = 0`); the current rule
+// (`is_real_indigest * (1 - ACT0) = 0`) rejects it, by that single constraint alone.
+///
+/// Builds the faithful witness described above from an honest `Traces`, mutating `t.cpu` (row
+/// insertion + CLK shift), `t.memory` (rebuilt at the shifted `CLK` offset — every access after
+/// the insertion point moves by one timestamp unit), `t.range` (RANGE8 is exact-count
+/// accounting: every byte-column value this edit changes — the moved `IHVL0..31`/new row's
+/// `LEFT0/LEFT0+1`/`IDX0/IDX0+1`, and whatever `memory_trace` itself demands at the two
+/// offsets — is tracked and applied as a delta), `t.poseidon2` (append the new row's own
+/// permutation event), and `t.public_values` (`pv::IN0..7` becomes the canonical encoding of
+/// `perm(H_honest)`, the gratuitous extra permutation's actual output).
+fn append_gratuitous_indigest_permutation(p: &shrugg_zkvm::isa::Program, inputs: &[u32], mut t: Traces) -> Traces {
+    let e = execute(p, inputs, 10_000).unwrap();
+    let w = cpu::col::WIDTH;
+    let height = t.cpu.height();
+    let real_row = p.digest_rows() + 1; // the one real indigest row (right after the salt row)
+    let insert_at = real_row + 1; // == p.digest_rows() + input_digest_row_count(inputs.len())
+
+    // The real row's own permutation output — already seeded (by `fill_input_digest_rows`)
+    // into what is, before this edit, the first ordinary instruction row's HS0..7.
+    let real_state_out: [F; 8] = core::array::from_fn(|k| t.cpu.values[insert_at * w + cpu::col::HS0 + k]);
+    let new_state_out = shrugg_zkvm::hash::permute_state(real_state_out);
+
+    let mut range_removed: Vec<u32> = Vec::new();
+    let mut range_added: Vec<u32> = Vec::new();
+
+    // The real row is no longer last: clear INDIGEST_LAST and its canonical encoding (moving
+    // to the new row below). RANGE8's demand for the old IHVL bytes disappears with it.
+    t.cpu.values[real_row * w + cpu::col::INDIGEST_LAST] = F::ZERO;
+    for kk in 0..32 {
+        let old_byte = t.cpu.values[real_row * w + cpu::col::IHVL0 + kk].as_canonical_u64() as u32;
+        range_removed.push(old_byte);
+        t.cpu.values[real_row * w + cpu::col::IHVL0 + kk] = F::ZERO;
+    }
+    for c in 0..4 {
+        t.cpu.values[real_row * w + cpu::col::IHIMAX0 + c] = F::ZERO;
+        t.cpu.values[real_row * w + cpu::col::IINV0 + c] = F::ZERO;
+    }
+
+    let real_hash_idx = t.cpu.values[real_row * w + cpu::col::HASH_IDX].as_canonical_u64() as u32;
+    let base_pc = t.cpu.values[real_row * w + cpu::col::PC];
+    let new_clk = t.cpu.values[real_row * w + cpu::col::CLK] + F::ONE;
+
+    let mut new_row = vec![F::ZERO; w];
+    new_row[cpu::col::IS_REAL] = F::ONE;
+    new_row[cpu::col::IS_INDIGEST] = F::ONE;
+    new_row[cpu::col::INDIGEST_LAST] = F::ONE;
+    new_row[cpu::col::HASH_N] = F::from_u32(4);
+    new_row[cpu::col::HASH_LEFT] = F::ZERO; // carried in — the real block already drained it
+    new_row[cpu::col::HASH_IDX] = F::from_u32(real_hash_idx + 1);
+    new_row[cpu::col::CLK] = new_clk;
+    new_row[cpu::col::PC] = base_pc;
+    new_row[cpu::col::NEXT_PC] = base_pc; // is_indigest holds PC still
+    for k in 0..8 { new_row[cpu::col::HS0 + k] = real_state_out[k]; }
+    for k in 0..4 { new_row[cpu::col::HV0 + k] = real_state_out[k]; } // ACT = 0: inactive-lane carry
+    let (l0, l1) = (0u32, 0u32); // byte limbs of HASH_LEFT = 0
+    new_row[cpu::col::LEFT0] = F::from_u32(l0);
+    new_row[cpu::col::LEFT0 + 1] = F::from_u32(l1);
+    range_added.push(l0);
+    range_added.push(l1);
+    let new_idx = real_hash_idx + 1;
+    let (i0, i1) = (new_idx & 0xff, (new_idx >> 8) & 0xff);
+    new_row[cpu::col::IDX0] = F::from_u32(i0);
+    new_row[cpu::col::IDX0 + 1] = F::from_u32(i1);
+    range_added.push(i0);
+    range_added.push(i1);
+
+    // The gratuitous extra permutation's own canonical H_IN encoding, moved here.
+    let words = shrugg_zkvm::hash::split_digest([new_state_out[0], new_state_out[1], new_state_out[2], new_state_out[3]]);
+    for kk in 0..8 {
+        let bl = limbs(words[kk]);
+        for j in 0..4 {
+            range_added.push(bl[j].as_canonical_u64() as u32);
+            new_row[cpu::col::IHVL0 + 4 * kk + j] = bl[j];
+        }
+    }
+    for j in 0..4usize {
+        let hi = words[2 * j + 1];
+        if hi == u32::MAX {
+            new_row[cpu::col::IHIMAX0 + j] = F::ONE;
+        } else {
+            new_row[cpu::col::IINV0 + j] = (F::from_u32(hi) - F::from_u32(u32::MAX)).inverse();
+        }
+    }
+
+    // Splice the new row in right after the real one, shifting every later row down by one
+    // (CLK bumped for every IS_REAL row, since one more genuine cycle now precedes them) —
+    // drop the table's very last (all-zero-plus-WRITTEN-accumulator padding) row to keep the
+    // height fixed; there are hundreds of identical padding rows to spare.
+    let mut values = Vec::with_capacity(height * w);
+    values.extend_from_slice(&t.cpu.values[..insert_at * w]);
+    values.extend_from_slice(&new_row);
+    for row in insert_at..height - 1 {
+        let mut r: Vec<F> = t.cpu.values[row * w..(row + 1) * w].to_vec();
+        if row == insert_at {
+            // The (now-shifted) first ordinary row is where the extra permutation's own
+            // output belongs: POSEIDON2's n(HS0..7) must equal permute(new_row's state_in).
+            for k in 0..8 { r[cpu::col::HS0 + k] = new_state_out[k]; }
+        }
+        if r[cpu::col::IS_REAL] == F::ONE { r[cpu::col::CLK] += F::ONE; }
+        values.extend_from_slice(&r);
+    }
+    assert_eq!(values.len(), height * w);
+    t.cpu = p3_matrix::dense::RowMajorMatrix::new(values, w);
+
+    // MEMORY: every shifted row's CLK (hence every SLOT timestamp, `ts = CLK*4 + slot`) moved
+    // by one — rebuild the whole table at the new offset (`insert_at + 1`, matching the shift
+    // above exactly) rather than hand-patching timestamps.
+    let mem_height = t.memory.height();
+    let mut old_mem_range = range::RangeCounts::default();
+    let _ = memory::memory_trace(&e.events, insert_at as u32, mem_height, &mut old_mem_range);
+    let mut new_mem_range = range::RangeCounts::default();
+    t.memory = memory::memory_trace(&e.events, (insert_at + 1) as u32, mem_height, &mut new_mem_range);
+
+    // RANGE8 is exact-count accounting: apply the cpu-side byte-demand deltas collected above,
+    // plus whatever delta the memory rebuild itself introduced (a pure CLK-offset shift should
+    // leave every same-address delta unchanged, but this is computed, not assumed).
+    let rw = range::col::WIDTH;
+    for b in range_removed { t.range.values[b as usize * rw + range::col::M_RANGE] -= F::ONE; }
+    for b in range_added { t.range.values[b as usize * rw + range::col::M_RANGE] += F::ONE; }
+    for v in 0..256usize {
+        let old_c = old_mem_range.range.get(v).copied().unwrap_or(0);
+        let new_c = new_mem_range.range.get(v).copied().unwrap_or(0);
+        if new_c > old_c { t.range.values[v * rw + range::col::M_RANGE] += F::from_u32((new_c - old_c) as u32); }
+        if old_c > new_c { t.range.values[v * rw + range::col::M_RANGE] -= F::from_u32((old_c - new_c) as u32); }
+    }
+
+    // POSEIDON2: append the new row's own genuine permutation event.
+    let digest_blocks = shrugg_zkvm::hash::program_digest_rows(p.base_pc, &p.words);
+    let indigest_blocks = shrugg_zkvm::hash::input_digest_rows(TEST_SALT, inputs);
+    let extra_block = shrugg_zkvm::hash::DigestBlock {
+        idx: new_idx,
+        left_before: 0,
+        words: [0; 4],
+        active: [false; 4],
+        state_in: real_state_out,
+        state_out: new_state_out,
+    };
+    let to_events = |blocks: &[shrugg_zkvm::hash::DigestBlock]| -> Vec<poseidon2::Poseidon2Event> {
+        blocks.iter().map(|blk| {
+            let mut input = blk.state_in;
+            for k in 0..4 { if blk.active[k] { input[k] = F::from_u32(blk.words[k]); } }
+            poseidon2::Poseidon2Event { input, output: blk.state_out }
+        }).collect()
+    };
+    let all: Vec<poseidon2::Poseidon2Event> = to_events(&digest_blocks)
+        .into_iter()
+        .chain(to_events(&indigest_blocks))
+        .chain(to_events(std::slice::from_ref(&extra_block)))
+        .collect();
+    t.poseidon2 = poseidon2::poseidon2_trace(&all, t.poseidon2.height());
+
+    // pv::IN0..7 = the canonical encoding of perm(H_honest) — the gratuitous extra
+    // permutation's actual output, exactly what an otherwise-honest prover computing H_IN off
+    // this witness would publish.
+    for k in 0..8 { t.public_values[cpu::pv::IN0 + k] = F::from_u32(words[k]); }
+
+    t
+}
+
+#[test]
+fn an_appended_all_inactive_indigest_row_after_a_block_aligned_n_in_is_rejected() {
+    let inputs = [400u32, 250, 300, 75]; // n_in = 4, one full real block
+    let (m, p, t) = setup_with_inputs(&inputs);
+    let t = append_gratuitous_indigest_permutation(&p, &inputs, t);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (e) out-of-window MULT_READ = 1 on a padding row rejects.
+#[test]
+fn a_mult_read_bumped_on_an_input_padding_row_is_rejected() {
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    let iw = shrugg_zkvm::tables::input::col::WIDTH;
+    assert!(t.input.height() > 4, "the input table has spare padding rows past the 4 real ones");
+    t.input.values[4 * iw + shrugg_zkvm::tables::input::col::MULT_READ] = F::ONE;
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
 }

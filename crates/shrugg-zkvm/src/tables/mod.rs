@@ -1,4 +1,4 @@
-//! The seven tables of the machine and the buses that connect them.
+//! The tables of the machine and the buses that connect them.
 pub mod range;
 pub mod nibble;
 pub mod program;
@@ -6,6 +6,7 @@ pub mod memory;
 pub mod alu;
 pub mod cpu;
 pub mod poseidon2;
+pub mod input;
 
 pub type F = p3_goldilocks::Goldilocks;
 
@@ -18,6 +19,18 @@ pub mod bus {
     /// separate from `PROGRAM` so a digest row's raw-word lookups never interact with an
     /// ordinary instruction fetch's multiplicity accounting.
     pub const PROGRAM_WORD: LookupBus<'static> = LookupBus::new("PROGRAM_WORD");
+    /// cpu (real indigest rows only) → input: (idx, word), count 1 per absorbed real word.
+    /// Input provides with count `IS_REAL` — the M4.1 input commitment bus, split from
+    /// `INPUT_READ` (review round 1, C1) precisely so the two consumer classes (the mandatory
+    /// digest absorption and however many times a guest actually reads an index) cannot trade
+    /// budget with each other: set equality on this bus alone forces the real `input` rows to
+    /// be exactly `{0, .., n_in-1}` with the words the digest actually absorbed, the same
+    /// argument `program`'s `MULT_WORD = VALID` makes for `PROGRAM_WORD`.
+    pub const INPUT_DIGEST: LookupBus<'static> = LookupBus::new("INPUT_DIGEST");
+    /// cpu (SYS_READ rows) → input: (idx, word), count `MULT_READ` per real row. Input
+    /// provides with count `IS_REAL * MULT_READ` — a free but LogUp-balance-checked witness
+    /// value, unrelated to `INPUT_DIGEST`'s own count now that the two are split.
+    pub const INPUT_READ: LookupBus<'static> = LookupBus::new("INPUT_READ");
     /// cpu ↔ memory: (space, addr, ts, value, is_write). Multiset equality.
     pub const MEMORY: PermutationCheckBus<'static> = PermutationCheckBus::new("MEMORY");
     /// cpu → alu: (op, a, b, c). Alu provides.

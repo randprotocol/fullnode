@@ -9,12 +9,14 @@ use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_symmetric::{CryptographicHasher, PaddingFreeSponge, Permutation};
 use std::sync::OnceLock;
 
-/// `notes::domain::HC` (= 8), inlined: `notes.rs` isn't vendored into this crate (it drags in
-/// ml-kem/chacha20poly1305 for a viewing-key stack the node has no use for yet — see
-/// `deploy/sync-zkvm.sh`'s header comment), but `program_digest` below and `tables::cpu`'s
-/// digest-row prefix both need this exact domain tag to agree. Keep in sync with
-/// `research/src/notes.rs`'s `domain::HC` by hand across a resync.
+/// `notes::domain::HC` (= 8) and `notes::domain::IN` (= 10), inlined: `notes.rs` isn't
+/// vendored into this crate (it drags in ml-kem/chacha20poly1305 for a viewing-key stack the
+/// node has no use for yet — see `deploy/sync-zkvm.sh`'s header comment), but
+/// `program_digest`/`input_digest` below and `tables::cpu`'s digest-row prefixes both need
+/// these exact domain tags to agree. Keep in sync with `research/src/notes.rs`'s `domain::HC`
+/// / `domain::IN` by hand across a resync.
 pub(crate) const HC_DOMAIN: u32 = 8;
+pub(crate) const IN_DOMAIN: u32 = 10;
 
 /// `machine::permutation()` redraws the whole round-constant RNG stream on every call; this
 /// crate's hash paths (absorbing one 32-row block per call) run it often enough — up to 1024
@@ -150,3 +152,72 @@ pub fn program_digest_rows(base_pc: u32, words: &[u32]) -> Vec<DigestBlock> {
     }
     out
 }
+
+/// H_IN (M4.1, **salted**): the in-circuit commitment to the guest's private-input vector,
+/// exactly what `tables::cpu`'s `IS_INDIGEST` rows compute and `pv::IN0..IN7` publish — the
+/// `hc`/`program_digest` mechanism, mirrored, plus a hiding salt (controller ruling, spec §2
+/// amended: an unsalted H_IN is a guessable commitment — a verifier who can enumerate
+/// candidate inputs can test them against `pv::IN0..7` directly). Capacity lanes seeded with
+/// `[IN_DOMAIN, n_in, 0]` (only two real header words, since there is no `base_pc` analogue
+/// for a flat input vector); the **first absorbed rate block is the 4 salt words** (drawn
+/// fresh per proof, `Machine::prove`), never `INPUT_DIGEST`-checked; then `⌈n_in/4⌉` blocks of
+/// the real input words. The salt block alone already costs one permutation, so `H_IN(salt,
+/// &[])` is never the all-zero digest and `n_in == 0` needs no separate "at least one block"
+/// special case — see `input_digest_row_count`.
+pub fn input_digest(salt: [u32; 4], inputs: &[u32]) -> [u32; 8] {
+    let blocks = input_digest_rows(salt, inputs);
+    let state = blocks.last().expect("input_digest_rows always returns at least the salt block").state_out;
+    split_digest([state[0], state[1], state[2], state[3]])
+}
+
+/// One `tables::cpu` `IS_INDIGEST` row's worth of absorb data — the M4.1 twin of
+/// `program_digest_rows`, reusing the same `DigestBlock` shape. Block 0 is always the salt
+/// block (`idx == 0`, all four lanes active, `words == salt`); the real input blocks follow
+/// at `idx == 1, 2, ..`, mirroring `tables::cpu`'s own `HASH_IDX` numbering (seeded to 0 on
+/// the salt row, incremented by 1 per row after).
+pub fn input_digest_rows(salt: [u32; 4], inputs: &[u32]) -> Vec<DigestBlock> {
+    let mut state = [Val::ZERO; 8];
+    state[4] = Val::from_u32(crate::hash::IN_DOMAIN);
+    state[5] = Val::from_u32(inputs.len() as u32);
+    // state[6] stays 0 — H_IN's header is [IN_DOMAIN, n_in, 0], one fewer real word than
+    // hc's [HC_DOMAIN, base_pc, len] (there is no base-address analogue here).
+    let n = inputs.len();
+    let rows = n.div_ceil(4);
+    let mut out = Vec::with_capacity(1 + rows);
+    // Block 0: the salt, unconditionally 4 active lanes, `left_before = n` (no real word has
+    // been absorbed yet — `tables::cpu`'s digest-boundary seed pins the salt row's own
+    // `HASH_LEFT` to `HASH_N`, exactly this value).
+    {
+        let state_in = state;
+        let mut merged = state;
+        for k in 0..4 { merged[k] = Val::from_u32(salt[k]); }
+        state = permute_state(merged);
+        out.push(DigestBlock { idx: 0, left_before: n as u32, words: salt, active: [true; 4], state_in, state_out: state });
+    }
+    for i in 0..rows {
+        let state_in = state;
+        let mut block_words = [0u32; 4];
+        let mut active = [false; 4];
+        let mut merged = state;
+        for k in 0..4 {
+            let idx = i * 4 + k;
+            if idx < n {
+                block_words[k] = inputs[idx];
+                active[k] = true;
+                merged[k] = Val::from_u32(inputs[idx]);
+            }
+        }
+        let left_before = (n - i * 4) as u32;
+        state = permute_state(merged);
+        out.push(DigestBlock { idx: (i + 1) as u32, left_before, words: block_words, active, state_in, state_out: state });
+    }
+    out
+}
+
+/// `1 + ⌈n_inputs/4⌉` — the number of cpu-table `IS_INDIGEST` rows `H_IN` costs to prove (the
+/// salt row plus the real input blocks), the exact `input_digest_rows(_, inputs).len()`
+/// without building the `Vec` or knowing the salt (used by `Machine::build_traces`'s
+/// cycle-budget check before the full digest is computed). The salt row makes the old
+/// `n_inputs.div_ceil(4).max(1)` "at least one block" special case redundant — the salt row
+/// alone already guarantees at least one row, even at `n_inputs == 0`.
+pub fn input_digest_row_count(n_inputs: usize) -> usize { 1 + n_inputs.div_ceil(4) }

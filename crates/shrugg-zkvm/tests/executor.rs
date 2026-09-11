@@ -41,9 +41,17 @@ fn verifies_a_real_proof_and_reports_outputs() {
     ex.warm(&rec);
     // `warm` precomputes the keys for tiers 10, 12 and 14 (the tiers real guests land on;
     // warming every tier would build the Poseidon2 chip's 2^22-row preprocessed table on a
-    // 2-vCPU validator at deploy time). The proof above already verified at tier 10, so that
-    // key is reused: three cached keys in total.
-    assert_eq!(ex.cached_keys(), 3, "warm precomputes the keys for tiers 10, 12 and 14, reusing the cached one");
+    // 2-vCPU validator at deploy time) crossed with two input-height classes (M4.1 ruling,
+    // `executor.rs`'s `warm` doc comment): `input::MIN_LOG_HEIGHT` (a 0..3-word call) and
+    // `input_log_height(4)` (a 4-word call — what `private_payment` itself reads, matching the
+    // proof already verified above at tier 10). 3 tiers * 2 input-height classes = 6 combinations;
+    // the (tier 10, input height of a 4-word call) key is already cached from the verify above
+    // and is reused, not double-counted, so six cached keys in total.
+    assert_eq!(
+        ex.cached_keys(),
+        6,
+        "warm precomputes keys for tiers 10, 12, 14 x 2 input-height classes, reusing the cached one"
+    );
     let t = std::time::Instant::now();
     ex.verify_call(&rec, proof).unwrap();
     assert!(t.elapsed().as_millis() < 500, "cached verify took {:?}", t.elapsed());

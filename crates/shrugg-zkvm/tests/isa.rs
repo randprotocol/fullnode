@@ -1,3 +1,4 @@
+use shrugg_zkvm::guests;
 use shrugg_zkvm::isa::*;
 
 #[test]
@@ -150,4 +151,55 @@ fn decoded_selectors() {
     assert_eq!((d.is_sb, d.is_sh, d.is_sw), (1, 0, 0));
     let d = Instr::Store { rs1: 2, rs2: 3, imm: 4, width: Width::Half }.decoded();
     assert_eq!((d.is_sb, d.is_sh, d.is_sw), (0, 1, 0));
+}
+
+#[test]
+fn flat_binary_round_trips_every_guest() {
+    for (name, program, _inputs) in guests::all() {
+        let bytes = program.to_flat_binary();
+        let reloaded = Program::from_flat_binary(program.base_pc, &bytes)
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(reloaded, program, "{name}: round trip changed the program");
+    }
+}
+
+#[test]
+fn flat_binary_rejects_empty() {
+    assert_eq!(Program::from_flat_binary(0, &[]), Err(LoadError::Empty));
+}
+
+#[test]
+fn flat_binary_rejects_length_not_a_multiple_of_four() {
+    assert_eq!(Program::from_flat_binary(0, &[1, 2, 3]), Err(LoadError::Length(3)));
+}
+
+#[test]
+fn flat_binary_rejects_misaligned_base_pc() {
+    let bytes = guests::fib(1).to_flat_binary();
+    assert_eq!(Program::from_flat_binary(2, &bytes), Err(LoadError::BasePc(2)));
+}
+
+#[test]
+fn flat_binary_rejects_a_program_longer_than_the_table_can_hold() {
+    let max_words = (1usize << shrugg_zkvm::tables::program::MAX_LOG_HEIGHT) - 1;
+    // One word past the ceiling — building `max_words + 1` bytes of any decodable word
+    // (`ADDI x0, x0, 0`, encoding 0x0000_0013) keeps this test about the length bound alone,
+    // not accidentally about a decode failure.
+    let bytes = vec![0x13u8, 0x00, 0x00, 0x00].repeat(max_words + 1);
+    assert_eq!(
+        Program::from_flat_binary(0, &bytes),
+        Err(LoadError::TooLong(max_words + 1))
+    );
+}
+
+#[test]
+fn flat_binary_reports_the_index_of_an_undecodable_word() {
+    // Two good words, then a raw all-ones word `Instr::decode` rejects (opcode 0x7f is not
+    // any of `OP_LUI/AUIPC/JAL/JALR/BRANCH/LOAD/STORE/ALUI/ALU/SYSTEM`).
+    let mut bytes = vec![0x13u8, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00];
+    bytes.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+    match Program::from_flat_binary(0, &bytes) {
+        Err(LoadError::Decode { index: 2, word: 0xffff_ffff, .. }) => {}
+        other => panic!("expected Decode{{index:2,..}}, got {other:?}"),
+    }
 }

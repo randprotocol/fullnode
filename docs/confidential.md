@@ -8,10 +8,11 @@ charges gas, stores a receipt, and applies the transfer the outputs request.
 
 `crates/shrugg-zkvm` (vendored from `circuits/research`, upstream `rand_zkvm`): an RV32I subset,
 plus the RV32M extension and sub-word loads/stores (constraint set 3, below), proven by a
-Plonky3 batch STARK over Goldilocks with Poseidon2 hashing and ZK-hiding FRI. Seven tables
-(program, cpu, memory, alu, range, nibble, poseidon2) connected by LogUp/permutation buses. Four
-syscalls: `read_input(i)` (private input word), `write_output(slot, word)` (one of eight public
-outputs), `poseidon2(ptr, n)` (in-place hash of `n` words), `halt`.
+Plonky3 batch STARK over Goldilocks with Poseidon2 hashing and ZK-hiding FRI. Eight tables
+(program, cpu, memory, alu, range, nibble, poseidon2, input — the last added in constraint set 4,
+below) connected by LogUp/permutation buses. Four syscalls: `read_input(i)` (private input word,
+bound since constraint set 4 to a salted commitment `H_IN`), `write_output(slot, word)` (one of
+eight public outputs), `poseidon2(ptr, n)` (in-place hash of `n` words), `halt`.
 
 Gas tiers pad the execution trace: tier `t` (10, 12, ..., 20) proves up to `2^t - 1` cycles and the
 proof reveals only the tier, never the real cycle count. Production FRI profile: blowup 8, 27
@@ -98,6 +99,78 @@ ledger replay of any chain with a confidential call proved under an older constr
 truncate its chain. Start a new chain id, or run `--verify-chain off` on nodes that must keep
 serving an old chain.
 
+**Constraint set 4 (2026-09-11, upstream 8667928: milestone 4.1).** The vendored zkVM was
+re-synced past constraint set 3 to `research`'s milestone 4.1 (compiled guests, `docs/superpowers/
+plans/2026-09-11-zkvm-m4-1.md`). The headline changes:
+
+- **`READ_INPUT` is bound to a salted commitment, `H_IN`.** Through constraint set 3, a guest's
+  `read_input(idx)` syscall returned whatever word the prover chose to supply, unconstrained —
+  nothing tied two reads of the same index together, and nothing stopped a cheating prover from
+  answering the same index differently on different cycles. An eighth table, `input` (one row per
+  committed private-input word), fixes this: every `READ_INPUT` and the digest's own mandatory
+  absorption draw `(idx, word)` from that table over two separate LogUp buses, `INPUT_DIGEST`
+  (count `IS_REAL`, the digest's sole and unconditional source) and `INPUT_READ` (count
+  `IS_REAL * MULT_READ`, `SYS_READ`'s sole source) — split, rather than shared, so the two
+  consumer classes cannot trade budget with each other (an earlier single-bus design let a
+  prover under-supply the digest's mandatory copy while a genuine read still succeeded). The cpu
+  table's `IS_INDIGEST` rows absorb the committed vector into `H_IN` the same way the existing
+  `IS_DIGEST` rows absorb the program into `hc`, published as `pv::IN0..7`. `H_IN` is **salted**
+  (four witness words, drawn fresh per proof from OS entropy, absorbed ahead of the real input
+  words) — unlike `hc`, which has no salt of its own — precisely so it is hiding as well as
+  binding: a verifier who can enumerate candidate input vectors gets nowhere testing them against
+  a published `H_IN`, since the salt never leaves the prover. `H_IN` alone makes no input word
+  public; it only makes repeated reads of the same index consistent and an out-of-range read
+  (`idx >= n_in`) unsatisfiable — a guest that wants an input word public still has to
+  `write_output` it itself. The prover must draw a fresh salt every proof (`Machine::prove`, never
+  `Machine::prove_salted` outside tests that deliberately need a fixed one to check against, or
+  hiding is lost) — `ZkExecutor`'s prover entry point (`executor::prove`) does this already, since
+  every backend it can select routes through `Machine::prove`/`Machine::prove_on`, both of which
+  draw fresh entropy internally.
+- **`pv::NUM` grew from 18 to 26**, and `Proof` gained a new field, `input_log_height: u8` — the
+  `input` table's declared height, exactly analogous to `program_log_height` (proof-declared, not
+  tier-derived; `tables::input::input_log_height`'s doc comment mirrors `tables::program::
+  program_log_height`'s rule). `Machine::verifier_key` and `log_ext_degrees` grew from a
+  `(tier, program_log_height)` 2-tuple key to a `(tier, program_log_height, input_log_height)`
+  3-tuple; the injected `log_ext_degrees_pub` wrapper and every verifier-key lookup in
+  `ZkExecutor` (`verify_call`'s degree-bits pre-check, `warm`) grew the same third argument.
+  `pv::HC0..HC7`'s offsets (10..17) are unaffected — `pv::IN0..7` (18..25) was appended after
+  them, not inserted before.
+- **A flat-binary loader, `Program::from_flat_binary`,** and real compiled guests. Through
+  constraint set 3, every guest was hand-assembled against `asm.rs`'s mnemonic helpers; M4.1 adds
+  a `riscv32im-unknown-none-elf`-targeted toolchain (upstream's `guest-sdk`/`guests-compiled/`,
+  not vendored into this crate — this crate has no use for compiling new guests at runtime, only
+  for loading an already-compiled one) and a loader that turns a flat little-endian instruction
+  image plus a base `pc` into a `Program`, rejecting anything that doesn't decode
+  (`isa::LoadError`). `guests::compiled::fib()` (mirroring upstream's module, with its
+  `include_bytes!` path adjusted for this crate's shallower layout) loads the vendored
+  `guests-compiled/bin/fib.bin` this way; `tests/e2e.rs`'s `compiled_fib_matches_the_hand_written_
+  guest` and `compiled_fib_proves_and_verifies` (vendored wholesale) exercise it end to end.
+  Measured upstream (`fib(20)`, compiled, `Tier(10)`, 136 cycles): proof size 271,600–275,889
+  bytes over three proofs (varies per proof with the hiding salt).
+- **Tiers, FRI parameters and every other table are unchanged** from constraint set 3 — this is
+  purely an input-commitment and loader addition, not a re-tune.
+
+Proofs made under constraint set 3 (or earlier) do not verify under constraint set 4 — `pv::NUM`
+grew, the batch grew from seven AIRs to eight, and `Proof` gained a field (`input_log_height`), so
+neither the public-values shape nor the wire encoding round-trips against the old one. This is the
+same hard-fork situation constraint sets 2 and 3 already documented: a node built from this commit
+will fail startup ledger replay of any chain with a confidential call proved under an older
+constraint set and truncate its chain. Start a new chain id, or run `--verify-chain off` on nodes
+that must keep serving an old chain.
+
+**Disclosure implication.** `H_IN` is a commitment, not encryption: it is binding and (thanks to
+the salt) hiding against a verifier who only ever sees the published `pv::IN0..7`, but it is not
+hiding against a party the caller chooses to show the salt and the input vector to — the same
+"binding, revocably hideable" shape as any Pedersen/Poseidon2 commitment. A caller who retains the
+salt (and the inputs) can, at any later time, open `H_IN` to a third party by handing over both —
+proving after the fact exactly which private inputs a given call used, without any further
+proving. This is a capability, not a flaw (auditability on demand, without a second proof), but it
+means "private" here means "not disclosed unless the salt-holder chooses to disclose it," not
+"provably undiscoverable" — see the shielded pool spec §6.1 for how the shielded-pool design
+budgets for this when a bundle's own note commitments and nullifiers (which have their own,
+separately-managed disclosure story) sit downstream of a call whose `H_IN` the caller could later
+open.
+
 ## On-chain model
 
 **Programs** are content addressed: `program_id = blake3("shrugg-program" || base_pc || words)`.
@@ -144,8 +217,13 @@ Anything above the minimum is a tip; all of it goes to the block proposer. Block
 
 ## Privacy
 
-Public: program id, tier, the eight outputs, caller, fee, recipient list, and (for kind 1) the
-transfer. Private: inputs, registers, memory, branches taken, cycle count (padded to the tier). Two
+Public: program id, tier, the eight outputs, caller, fee, recipient list, (for kind 1) the
+transfer, and — since constraint set 4 — the salted input commitment `H_IN` (`proof.public_values[
+IN0..IN7]`). `H_IN` being public does not make any input word public: without the salt (never
+published, never leaves the prover) it cannot be opened, so on its own it only pins two reads of
+the same input index to agree and makes an out-of-range read unsatisfiable — see "Disclosure
+implication" above for what happens if a caller later reveals the salt. Private: inputs, registers,
+memory, branches taken, cycle count (padded to the tier), and the `H_IN` salt itself. Two
 proofs of the same run are different bytes (hiding commitments), so proofs do not fingerprint inputs.
 
 ## Chains without confidential computation

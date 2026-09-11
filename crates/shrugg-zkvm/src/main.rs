@@ -37,7 +37,7 @@ fn main() {
     // M3.4: the cpu table's digest-row prefix (`Program::digest_rows()`) counts as cycles too.
     let cycles = exec.cycles() + program.digest_rows();
     let tier = Tier::for_cycles(cycles).unwrap();
-    let traces = build_traces(&program, &exec, tier).unwrap();
+    let traces = build_traces(&program, &inputs, &exec, tier).unwrap();
     println!(
         "tier {} → cpu 2^{} rows (actual {} cycles incl. {} digest rows), padding hides the rest",
         tier.0,
@@ -79,7 +79,7 @@ fn main() {
     println!("verified in {verify_ms:.1} ms with public values {:?}", proof.public_values);
 
     hr("Part 6 · Cheating provers");
-    let mut bad = build_traces(&program, &exec, tier).unwrap();
+    let mut bad = build_traces(&program, &inputs, &exec, tier).unwrap();
     bad.public_values[cpu::pv::OUT0] = F::from_u32(0);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let p = m.prove_traces(&program, &bad, tier);
