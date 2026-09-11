@@ -15,9 +15,10 @@ bound since constraint set 4 to a salted commitment `H_IN`), `write_output(slot,
 eight public outputs), `poseidon2(ptr, n)` (in-place hash of `n` words), `halt`.
 
 Gas tiers pad the execution trace: tier `t` (10, 12, ..., 20) proves up to `2^t - 1` cycles and the
-proof reveals only the tier, never the real cycle count. Production FRI profile: blowup 8, 27
-queries, 20 PoW bits (constraint set 3 below; see `docs/03-privacy.md` in the upstream `research`
-crate for the retune history).
+proof reveals only the tier, never the real cycle count. Production FRI profile: blowup 8, 80
+queries, 20 PoW bits — the whitepaper parameter table, restored in constraint set 5 (below) after
+the constraint-set-3 retune to 27 queries was found to keep the conjectured target while dropping
+the proven-soundness floor from ~86 to ~42 bits.
 
 Measured upstream on `guests::fib` at tier 10, constraint set 3: prove 3.1 s, proof 268 KB, first
 (uncached) verify 16 ms — the verifier key itself is what a cached verify amortizes away; see
@@ -157,6 +158,54 @@ same hard-fork situation constraint sets 2 and 3 already documented: a node buil
 will fail startup ledger replay of any chain with a confidential call proved under an older
 constraint set and truncate its chain. Start a new chain id, or run `--verify-chain off` on nodes
 that must keep serving an old chain.
+
+**Constraint set 5 (2026-09-12, zk-side audit fixes).** A full audit of the zkVM (AIRs, emulator,
+host prover glue, chain integration; report on branch `zk-audit-fixes-sep12`) found two **critical
+soundness holes** in the cpu table's hash row-group routing and a set of completeness/robustness
+bugs. Each finding carries a regression test; the two critical ones also carry full attack witnesses
+that verify against the pre-fix constraints and are rejected after.
+
+- **Free-standing hash rows are now gated out (critical).** Every `POSEIDON2` row-group routing
+  rule was gated on the *current* row already being inside a group; nothing constrained what may
+  *precede* an `IS_HASH` or `IS_HASH_OUT` row. A cheating prover could splice a free-standing
+  write-back pair in after any ordinary row: eight arbitrary RAM writes per pair at a free,
+  unbounded `HASH_PTR` (the ecall row's `HP0..3` range decomposition never fires there), no fetch,
+  and not even a permutation consumed — enough to plant values for later honest loads and fabricate
+  any execution with any outputs. Three transition rules close it: an absorb row may only follow
+  the ecall row or another absorb row; a write-back row may only follow the ecall row, an absorb
+  row, or the first write-back row; and nothing may follow the second write-back row.
+- **`HASH_FIN` is pinned to write-back rows (critical).** Setting it on the ecall row (or an
+  absorb row) zeroed the group's `continues` selector, detaching the rest of the group's
+  `HASH_PTR` from the ecall row's range-checked value (the same unbounded-address hole one row
+  later) and shifting the group's PC chain by one instruction. `HASH_FIN·(1 − IS_HASH_OUT) = 0`.
+- **Production FRI profile restored to the whitepaper table: 80 queries / blowup 8 / 20 grinding
+  bits.** Constraint set 3's M2.2 retune to 27 queries hit the ethSTARK *conjectured* 100-bit
+  target (`3·27+20 = 101`) but silently abandoned the *proven* proximity-gaps floor the 80-query
+  choice exists to keep (~86 proven bits at q=80/g=20, ~42 at q=27; the paper's reconciliation
+  weighs exactly this trade and keeps q=80). The profile is genesis-bound, never proof-supplied;
+  the conjectured figure at 80/20 is `3·80+20 = 260`. Proofs are larger (~3x the FRI query work of
+  constraint sets 3–4) — that is the price the paper already chose to pay.
+- **The memory table's sort key now matches the AIR's key arithmetic.** The host builder packed
+  `(space << 30) | addr` while the AIR recomputes `space·2^30 + addr`; the two disagree for RAM
+  addresses `>= 2^30` (reachable only through `POSEIDON2` absorb/write-back addresses), so an
+  honest high-address hash execution sorted wrong and could never prove. Also: the emulator
+  rejects `ptr >= 2^30` up front (`ExecError::Poseidon2Ptr`), matching the AIR's bound.
+- **Prove-time guards where failures used to be panics or opaque constraint errors:** the
+  permutation budget (`2^(t-3)` poseidon2 blocks vs up to ~`2^t` permutation-emitting rows under
+  the cycle budget) is checked with a clean `ProveError::TooManyPermutations`, and the auto-tier
+  pick (`Tier::for_workload`) fits both budgets; the digest rows' 16-bit `HASH_LEFT` caps a
+  provable program (and input vector) at 65535 words, now rejected host-side
+  (`ProgramTooLong`/`InputTooLong`, and `Program::from_flat_binary` caps at the same bound); an
+  explicit out-of-`TIERS` tier on the prove path is `ProveError::BadTier` instead of a shift
+  panic (debug) or an abort-scale allocation (release); `executor::check_program` rejects a
+  program whose `base_pc + 4·len` wraps u32 (deployable but unprovable fee waste); `Instr::encode`
+  panics on out-of-range immediates instead of silently truncating them into wrong code.
+
+Proofs made under constraint sets 3–4 do not verify under constraint set 5, in both directions:
+the new AIR constraints change what the verifier checks (old honest proofs still satisfy them,
+but the FRI query count changed, so a 27-query proof fails an 80-query verifier and vice versa).
+Same hard-fork rule as every prior constraint set: fleets run the same build; start a new chain
+id, or run `--verify-chain off` on nodes serving an old chain.
 
 **Disclosure implication.** `H_IN` is a commitment, not encryption: it is binding and (thanks to
 the salt) hiding against a verifier who only ever sees the published `pv::IN0..7`, but it is not

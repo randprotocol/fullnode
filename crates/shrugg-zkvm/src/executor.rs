@@ -77,6 +77,13 @@ impl ConfidentialExecutor for ZkExecutor {
         if words.is_empty() {
             return Err(ConfidentialError::BadInstruction { index: 0, reason: "empty program".into() });
         }
+        // A program whose `base_pc + 4·len` wraps the u32 address space can never execute
+        // past the wrap (`instr_at` refuses `pc < base_pc`, and `Program::pc_of` wraps in
+        // release) — reject it at admission rather than let a deployer pay for a program
+        // no call can ever prove.
+        if base_pc as u64 + 4 * words.len() as u64 > 1 << 32 {
+            return Err(ConfidentialError::BadInstruction { index: 0, reason: "program spans the u32 pc wrap".into() });
+        }
         for (index, w) in words.iter().enumerate() {
             Instr::decode(*w).map_err(|e| ConfidentialError::BadInstruction { index, reason: format!("{e:?}") })?;
         }

@@ -12,12 +12,16 @@ use shrugg_zkvm::machine::{FriProfile, Machine, Tier};
 /// under the pre-fix code (`Tier::program_height() = cpu_height()`, since deleted).
 ///
 /// The tier this proves at is `Tier(14)`, not `Tier(10)` (whose `cpu_height` the program's
-/// length is checked against): the ~300 digest-row permutations this program's length costs
-/// need a `poseidon2_height` budget only `Tier(14)` (or higher) provides —
-/// `Tier::poseidon2_height`'s own scaling relative to `cpu_height` is a separate, pre-existing
-/// concern this fix does not touch (see the fix report). What this test isolates is exactly
-/// the bug this fix closes: the *program table's own height* — independently confirmed below
-/// via `traces.program.height()` — tracks the program's length, not the tier, so it is not the
+/// length is checked against): the program is 1 207 words, i.e. 302 digest-row permutations
+/// plus 1 indigest-row one — 303 permutation blocks, past `Tier(10).poseidon2_height()`'s
+/// 128 (and `Tier(12)`'s 512 would actually suffice for this program; 14 is chosen with
+/// margin). `Tier::poseidon2_height`'s scaling relative to `cpu_height` is a separate
+/// concern — since the 2026-09 audit fix, `build_traces_salted` rejects a tier whose
+/// permutation budget the workload exceeds with a clean `ProveError::TooManyPermutations`,
+/// and the auto-tier pick (`Tier::for_workload`) climbs past it instead of hitting
+/// `poseidon2_trace`'s old capacity panic. What this test isolates is exactly the bug this
+/// fix closes: the *program table's own height* — independently confirmed below via
+/// `traces.program.height()` — tracks the program's length, not the tier, so it is not the
 /// thing that would have forced a larger tier here.
 #[test]
 fn a_program_much_longer_than_a_small_tiers_cpu_height_but_briefly_executed_proves() {

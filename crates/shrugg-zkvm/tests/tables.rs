@@ -151,7 +151,11 @@ fn every_legal_encoding(rng: &mut StdRng) -> Vec<u32> {
     use shrugg_zkvm::asm::ops::*;
     use shrugg_zkvm::isa::BranchCond;
     let r = |rng: &mut StdRng| -> u32 { rand_u32(rng) % 32 };
-    let imm = |rng: &mut StdRng| -> i32 { rand_u32(rng) as i32 };
+    // In-range immediates only: `Instr::encode` now *asserts* the field widths instead of
+    // silently truncating (2026-09 audit fix) — this helper used to rely on the truncation.
+    let imm = |rng: &mut StdRng| -> i32 { (rand_u32(rng) % 4096) as i32 - 2048 }; // 12-bit signed
+    let bimm = |rng: &mut StdRng| -> i32 { ((rand_u32(rng) % 8192) as i32 - 4096) & !1 }; // 13-bit signed, even
+    let jimm = |rng: &mut StdRng| -> i32 { ((rand_u32(rng) % (1 << 21)) as i32 - (1 << 20)) & !1 }; // 21-bit signed, even
     let shamt = |rng: &mut StdRng| -> u32 { rand_u32(rng) % 32 };
     let mut out = Vec::new();
     let (rd, rs1, rs2) = (r(rng), r(rng), r(rng));
@@ -169,9 +173,9 @@ fn every_legal_encoding(rng: &mut StdRng) -> Vec<u32> {
     out.push(jalr(rd, rs1, imm(rng)).encode());
     out.push(ecall().encode());
     for cond in [BranchCond::Eq, BranchCond::Ne, BranchCond::Lt, BranchCond::Ge, BranchCond::Ltu, BranchCond::Geu] {
-        out.push((Instr::Branch { cond, rs1, rs2, imm: imm(rng) as u32 }).encode());
+        out.push((Instr::Branch { cond, rs1, rs2, imm: bimm(rng) as u32 }).encode());
     }
-    out.push((Instr::Jal { rd, imm: imm(rng) as u32 }).encode());
+    out.push((Instr::Jal { rd, imm: jimm(rng) as u32 }).encode());
     out
 }
 
@@ -290,7 +294,7 @@ fn memory_trace_is_sorted_and_consistent() {
     let accesses: usize = e.events.iter().map(|c| c.accesses.len()).sum();
     let real: usize = (0..t.height()).filter(|r| t.values[r * w + memory::col::IS_REAL] == F::ONE).count();
     assert_eq!(real, accesses);
-    let key = |r: usize| t.values[r * w + memory::col::SPACE].as_canonical_u64() << 30 | t.values[r * w + memory::col::ADDR].as_canonical_u64();
+    let key = |r: usize| (t.values[r * w + memory::col::SPACE].as_canonical_u64() << 30) + t.values[r * w + memory::col::ADDR].as_canonical_u64();
     let ts = |r: usize| t.values[r * w + memory::col::TS].as_canonical_u64();
     for r in 0..real - 1 {
         assert!((key(r), ts(r)) < (key(r + 1), ts(r + 1)), "row {r} not sorted");

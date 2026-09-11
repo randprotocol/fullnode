@@ -91,7 +91,11 @@ pub mod col {
     /// active on a real absorb row).
     pub const ACT0: usize = HV0 + 4;                                 // 96..99
     /// 2: byte limbs of this row's `HASH_LEFT` (absorb rows only) — bounds it to 16 bits,
-    /// comfortably more than `POSEIDON2_MAX_WORDS = 4096` needs.
+    /// comfortably more than `POSEIDON2_MAX_WORDS = 4096` needs. Note this is also the
+    /// effective cap on a provable *program* (and private-input vector): the first digest
+    /// row's `HASH_LEFT` is the program's word count, so a `len` (likewise `n_in`) over
+    /// 65535 can never satisfy the AIR — rejected host-side (`ProveError::ProgramTooLong` /
+    /// `InputTooLong`; `Program::from_flat_binary` caps at the same bound).
     pub const LEFT0: usize = ACT0 + 4;                               // 100,101
     /// 2: byte limbs of this row's `HASH_IDX` (absorb rows only).
     pub const IDX0: usize = LEFT0 + 2;                               // 102,103
@@ -339,6 +343,18 @@ where
         // `NEXT_PC = PC` on every row but the last (PC only advances once the whole
         // instruction — all its rows — has retired).
         let continues = v(SYS_HASH) + is_hash.clone() + is_hash_out.clone() - v(HASH_FIN);
+        // CRITICAL 4 (fix): `HASH_FIN` is meaningful only on a write-back row — it marks the
+        // *second* one. Left unpinned everywhere else, setting it on the ecall row (or an
+        // absorb row) drives `continues` to 0 on that row, so the rest of the row-group's
+        // `HASH_PTR`/`HASH_N` stop being carried forward from the ecall row's range-checked
+        // values (the `HP0..3`/`HP3_HI` decomposition below, gated by `SYS_HASH`) and become
+        // free, unbounded field elements on the `MEMORY` bus — the exact mod-`p` key-aliasing
+        // hole CRITICAL 1 closed, one row later, with the absorb/write-back addresses
+        // (`HASH_PTR + 4·HASH_IDX + k`, `HASH_PTR + k + 4·HASH_FIN`) pointing wherever the
+        // witness likes. The same `continues = 0` also forces the ecall row's `NEXT_PC` to
+        // `PC + 4` via the general fallthrough rule, silently skipping one instruction.
+        // Honest traces only ever set `HASH_FIN` on the second write-back row.
+        b.assert_zero(v(HASH_FIN) * (one.clone() - v(IS_HASH_OUT)));
 
         // fetch. M3.4: digest rows are `is_real = 1` (they count as cycles) but are not an
         // ordinary instruction fetch either — excluded via `off_cpu`, same as hash rows.
@@ -650,6 +666,28 @@ where
             // absorb's `POSEIDON2` lookup — nothing else propagates it there.
             let out_continues = is_hash_out.clone() * (one.clone() - v(HASH_FIN));
             for i in 0..8 { t.assert_zero(out_continues.clone() * (n(HS0 + i) - v(HS0 + i))); }
+        }
+        {
+            let mut t = b.when_transition();
+            // CRITICAL 5 (fix): hash row-groups need *entry* gates, not just interior
+            // routing. Until these, every routing rule was gated on the *current* row
+            // already being inside a group, so nothing constrained what may *precede* an
+            // `IS_HASH` or `IS_HASH_OUT` row: a cheating prover could splice a
+            // free-standing write-back pair (or a lone absorb row) in after any ordinary
+            // row — four arbitrary RAM writes per write-back row at a free, unbounded
+            // `HASH_PTR` (the `SYS_HASH`-gated `HP0..3` decomposition never fires on such
+            // rows, and the `continues` carry-forward only ever propagates *into* a group
+            // from its own ecall row), no permutation consumed (`is_hash_or_digest`
+            // excludes `IS_HASH_OUT`), and `HV` pinned only to a free `HS`. From there:
+            // plant values that later honest loads read, and fabricate any execution.
+            // An absorb row may only follow the ecall row or another absorb row; a
+            // write-back row may only follow the ecall row (the `n = 0` case), an absorb
+            // row, or the first write-back row; and nothing may follow the *second*
+            // write-back row — the group ends there. Every honest group satisfies all
+            // three by construction.
+            t.assert_zero((one.clone() - v(SYS_HASH) - is_hash.clone()) * n(IS_HASH));
+            t.assert_zero((one.clone() - v(SYS_HASH) - is_hash.clone() - is_hash_out.clone()) * n(IS_HASH_OUT));
+            t.assert_zero(v(HASH_FIN) * n(IS_HASH_OUT));
         }
 
         // Absorb rows: `ACT0..3` is a boolean, non-increasing (contiguous-prefix) pattern —

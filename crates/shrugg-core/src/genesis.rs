@@ -318,7 +318,7 @@ mod tests {
         assert!(g.bridge.is_none());
         assert_eq!(
             g.build().unwrap().hash().to_hex(),
-            "7e6271a3aa38f11a43a6b3ad4c2262860cc8fa4b1f5c7b3b37dd6aebae01e917"
+            "3a82b0c7b6c4eb1eb1e1ba8a54b4306a883a57d46ccebce1e7adb7b5fd9ffa86"
         );
         assert!(g.build().unwrap().ledger.bridge().is_none());
         // ... and a bridge section moves both the genesis hash and the state root

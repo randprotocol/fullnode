@@ -45,6 +45,24 @@ fn poseidon2_over_the_word_limit_is_rejected() {
     assert_eq!(err, ExecError::Poseidon2WordCount(POSEIDON2_MAX_WORDS + 1));
 }
 
+/// Audit (2026-09): `ptr >= 2^30` emulates fine but can never satisfy the AIR (the cpu
+/// table bounds `HASH_PTR < 2^30` via the ecall row's `HP0..3`/`HP3_HI` decomposition), so
+/// the emulator — the crate's reference semantics — rejects it, and the boundary pointer
+/// `2^30 - 1` still runs.
+#[test]
+fn poseidon2_pointer_at_or_above_2_to_the_30_is_an_execution_error() {
+    let mut a = Assembler::new(0);
+    a.extend(call_poseidon2(1 << 30, 4)); // ptr words = 2^30
+    a.extend(halt());
+    let err = execute(&a.assemble(), &[], 1 << 16).unwrap_err();
+    assert_eq!(err, ExecError::Poseidon2Ptr(1 << 30));
+
+    let mut a = Assembler::new(0);
+    a.extend(call_poseidon2(((1u32 << 30) - 4) as i32, 4)); // absorb addresses reach 2^30 - 1, all legal
+    a.extend(halt());
+    run(&a.assemble(), &[]);
+}
+
 #[test]
 fn sub_word_loads_and_stores_match_the_spec() {
     let mut a = Assembler::new(0);

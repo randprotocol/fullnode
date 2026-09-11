@@ -15,7 +15,9 @@ pub const SYS_READ_INPUT: u32 = 2;
 /// M3.2: `a0 = ptr` (a WORD address, `MEM_ADDR`'s convention), `a1 = n` words (`0 <= n <=
 /// 4096`). Hashes the `n` words at `ptr` with the Poseidon2 sponge (rate 4, overwrite mode, no
 /// padding — see `hash::sponge_hash`) and overwrites `ptr..ptr+8` with the 8 lo/hi digest
-/// words in place.
+/// words in place. `ptr` must be `< 2^30` — the same bound the cpu AIR puts on every word
+/// address (`tables::cpu`'s `MA0..3`/`HP0..3` decompositions); the emulator rejects anything
+/// larger with `ExecError::Poseidon2Ptr`.
 pub const SYS_POSEIDON2: u32 = 3;
 /// Hard cap on `POSEIDON2`'s word count: 4096 words is 1024 absorbed blocks, comfortably
 /// within a tier's cycle budget while still bounding the emulator's per-syscall work.
@@ -163,13 +165,29 @@ fn bits(w: u32, hi: u32, lo: u32) -> u32 { (w >> lo) & ((1u32 << (hi - lo + 1)) 
 
 impl Instr {
     pub fn encode(&self) -> u32 {
-        let i_type = |imm: u32, rs1: u32, f3: u32, rd: u32, op: u32| (imm & 0xfff) << 20 | rs1 << 15 | f3 << 12 | rd << 7 | op;
+        // Every immediate is stored sign-extended in a `u32`, but the encoding fields are
+        // narrower — so an out-of-range immediate would be *silently truncated* by the
+        // `& 0xfff`/`bits(..)` masks below, producing wrong code with no error (the
+        // emulator and the AIR would then faithfully prove the misassembled program).
+        // Assert the ranges here, the one choke point where the value is still known —
+        // host-side only, matching `Assembler::label`'s own panic on a duplicate label;
+        // `decode` never calls this.
+        let i_type = |imm: u32, rs1: u32, f3: u32, rd: u32, op: u32| {
+            assert!((-2048..=2047).contains(&(imm as i32)), "I-type immediate {} does not fit 12 bits", imm as i32);
+            (imm & 0xfff) << 20 | rs1 << 15 | f3 << 12 | rd << 7 | op
+        };
         match *self {
-            Instr::Lui { rd, imm } => (imm & 0xffff_f000) | rd << 7 | OP_LUI,
-            Instr::Auipc { rd, imm } => (imm & 0xffff_f000) | rd << 7 | OP_AUIPC,
-            Instr::Jal { rd, imm } => bits(imm, 20, 20) << 31 | bits(imm, 10, 1) << 21 | bits(imm, 11, 11) << 20 | bits(imm, 19, 12) << 12 | rd << 7 | OP_JAL,
+            Instr::Lui { rd, imm } => { assert_eq!(imm & 0xfff, 0, "LUI immediate {imm:#x} has low 12 bits set"); (imm & 0xffff_f000) | rd << 7 | OP_LUI }
+            Instr::Auipc { rd, imm } => { assert_eq!(imm & 0xfff, 0, "AUIPC immediate {imm:#x} has low 12 bits set"); (imm & 0xffff_f000) | rd << 7 | OP_AUIPC }
+            Instr::Jal { rd, imm } => {
+                assert!((-(1 << 20)..=(1 << 20) - 1).contains(&(imm as i32)) && imm & 1 == 0, "JAL offset {} does not fit 21 bits", imm as i32);
+                bits(imm, 20, 20) << 31 | bits(imm, 10, 1) << 21 | bits(imm, 11, 11) << 20 | bits(imm, 19, 12) << 12 | rd << 7 | OP_JAL
+            }
             Instr::Jalr { rd, rs1, imm } => i_type(imm, rs1, 0, rd, OP_JALR),
-            Instr::Branch { cond, rs1, rs2, imm } => bits(imm, 12, 12) << 31 | bits(imm, 10, 5) << 25 | rs2 << 20 | rs1 << 15 | cond.funct3() << 12 | bits(imm, 4, 1) << 8 | bits(imm, 11, 11) << 7 | OP_BRANCH,
+            Instr::Branch { cond, rs1, rs2, imm } => {
+                assert!((-4096..=4095).contains(&(imm as i32)) && imm & 1 == 0, "branch offset {} does not fit 13 bits", imm as i32);
+                bits(imm, 12, 12) << 31 | bits(imm, 10, 5) << 25 | rs2 << 20 | rs1 << 15 | cond.funct3() << 12 | bits(imm, 4, 1) << 8 | bits(imm, 11, 11) << 7 | OP_BRANCH
+            }
             Instr::Load { rd, rs1, imm, width, signed } => {
                 let f3 = match (width, signed) {
                     (Width::Byte, true) => 0, (Width::Half, true) => 1, (Width::Word, _) => 2,
@@ -178,12 +196,16 @@ impl Instr {
                 i_type(imm, rs1, f3, rd, OP_LOAD)
             }
             Instr::Store { rs1, rs2, imm, width } => {
+                assert!((-2048..=2047).contains(&(imm as i32)), "S-type immediate {} does not fit 12 bits", imm as i32);
                 let f3 = match width { Width::Byte => 0, Width::Half => 1, Width::Word => 2 };
                 bits(imm, 11, 5) << 25 | rs2 << 20 | rs1 << 15 | f3 << 12 | bits(imm, 4, 0) << 7 | OP_STORE
             }
             Instr::AluImm { op, rd, rs1, imm } => {
                 let (f3, f7) = alu_funct(op);
-                let imm = if matches!(op, AluOp::Sll | AluOp::Srl | AluOp::Sra) { (imm & 31) | f7 << 5 } else { imm };
+                let imm = if matches!(op, AluOp::Sll | AluOp::Srl | AluOp::Sra) {
+                    assert!(imm < 32, "shift amount {imm} does not fit 5 bits");
+                    (imm & 31) | f7 << 5
+                } else { imm };
                 i_type(imm, rs1, f3, rd, OP_ALUI)
             }
             Instr::AluReg { op, rd, rs1, rs2 } => { let (f3, f7) = alu_funct(op); f7 << 25 | rs2 << 20 | rs1 << 15 | f3 << 12 | rd << 7 | OP_ALU }
@@ -293,6 +315,11 @@ impl Program {
     /// gets one permutation absorbing its domain/base_pc/len header — see `hash::program_digest`'s
     /// doc comment for why that header never gets its own row). `tables::cpu::cpu_trace`,
     /// `Machine::build_traces`'s cycle count and `Program::digest` all agree on this number.
+    /// The `max(1)` case is a *digest-function* convenience only: an empty program is
+    /// unprovable by construction — the AIR forces lane 0 active on every digest row
+    /// (`(is_hash + is_digest)·(1 − ACT0) = 0`) — and the emulator never gets that far
+    /// anyway (`instr_at` on an empty program is `BadPc`; `from_flat_binary` and the
+    /// chain's `check_program` both reject empty programs).
     pub fn digest_rows(&self) -> usize { self.words.len().div_ceil(4).max(1) }
 
     /// hc: the in-circuit program commitment (M3.4). `tables::cpu`'s digest rows compute
@@ -323,17 +350,17 @@ impl Program {
     /// The M4.1 flat-binary loader: little-endian words, `base_pc % 4 == 0`, every word must
     /// decode (`Instr::decode`, the same check `program_trace` enforces as a panic on a
     /// hand-built `Program` — this is the friendly, `Result`-returning path in front of it).
-    /// `MAX_LOG_HEIGHT` bounds the program table's height a proof can ever declare
-    /// (`tables::program::program_log_height`'s doc comment); `pad_height(len+1,
-    /// MIN_HEIGHT)` needs `len + 1 <= 2^MAX_LOG_HEIGHT`, so `len` up to `2^MAX_LOG_HEIGHT - 1`
-    /// is the largest image this loader — or any other program construction path — can ever
-    /// turn into a provable `Program`.
+    /// The size cap is **65535 words**, not the program table's `MAX_LOG_HEIGHT` shape
+    /// ceiling: the digest rows' `HASH_LEFT` (= the program's word count on the first digest
+    /// row) is a 16-bit value in the AIR (`tables::cpu`'s `LEFT0..1` byte limbs), so a longer
+    /// program can never satisfy the AIR no matter the tier — rejecting it here keeps that
+    /// from surfacing as an opaque constraint failure deep inside `prove_batch`.
     pub fn from_flat_binary(base_pc: u32, bytes: &[u8]) -> Result<Program, LoadError> {
         if bytes.is_empty() { return Err(LoadError::Empty); }
         if bytes.len() % 4 != 0 { return Err(LoadError::Length(bytes.len())); }
         if base_pc % 4 != 0 { return Err(LoadError::BasePc(base_pc)); }
         let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        let max_words = (1usize << crate::tables::program::MAX_LOG_HEIGHT) - 1;
+        let max_words = u16::MAX as usize;
         if words.len() > max_words { return Err(LoadError::TooLong(words.len())); }
         for (index, &word) in words.iter().enumerate() {
             if let Err(err) = Instr::decode(word) { return Err(LoadError::Decode { index, word, err }); }

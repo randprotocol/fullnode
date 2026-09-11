@@ -210,36 +210,35 @@ currently implemented in `crates/shrugg-core/src/consensus/hotstuff.rs`:
   next leader, only processed locally) after `SafetyState { view, high_qc, locked_qc,
   last_voted_view }` is written to RocksDB with an fsynced `put` — the vote must never leave the
   node, or count for anything locally, before that write lands.
-- **QC assembly.** In this tree, a vote is handled by `on_vote` only on the node that is the leader
-  of the *next* view — that leader alone collects votes into a QC once quorum stake is reached
-  (`on_vote` rejects a vote outright if `!self.is_leader(vote.view + 1)`). Having *every* validator
-  assemble QCs locally from gossiped votes, so the chain keeps committing even if the next leader is
-  offline, lands with the consensus-hardening merge (commits 1d24bf9, d5143a6, a44d3f4, 543d72b).
+- **QC assembly.** Every validator assembles QCs locally from gossiped votes (`on_vote` no longer
+  drops votes at non-collectors), so the chain keeps committing even if the leader of the next view
+  is offline (shipped in the consensus-hardening merge, commits 1d24bf9, d5143a6, a44d3f4; before
+  it, one down collector stalled finality). The wire cost is unchanged: votes already flooded the
+  gossip topic, they were just being discarded by the application gate.
 - **Lock and commit.** Chained three-QC rule, evaluated on each newly-processed block `b*`: `b''` is
   the block `b*.justify` certifies, `b'` is the block `b''.justify` certifies, `b` is the block
   `b'.justify` certifies. The lock advances to `b''.justify` when it is newer than the current lock;
   `b` (and every uncommitted ancestor back to the current committed head) commits once this
-  three-link chain is found and actually threads back to the committed head. This tree's rule links
-  three *QCs*, not three strictly *consecutive view numbers* — tightening it to require the three
-  certifying QCs' views to be exactly `v, v+1, v+2` (closing a conflicting-finality edge case around
-  gaps left by timed-out views) is the "three-consecutive-view commit rule" that lands with the
-  hardening merge above.
+  three-link chain is found and actually threads back to the committed head — and only if the three
+  certifying QCs are in *consecutive views* `v, v+1, v+2` (the three-consecutive-view commit rule,
+  shipped in the same hardening merge; without it, two forks could ratchet past each other's locks
+  and both finalize).
 - **Timeouts.** Base view timeout `--view-timeout-ms` (default 3,000 ms), doubling per consecutive
   timeout up to 8x, reset to zero on any progress (a QC formed or a new view entered from a peer). A
   `NewView` from a validator already in a higher view pulls a lagging node forward without it having
-  to wait out every intermediate timeout itself.
+  to wait out every intermediate timeout itself. Views are bounded (`MAX_VIEW_AHEAD` = 10⁶) and all
+  view arithmetic is saturating.
 - **Empty blocks and pacing.** The leader still proposes (an empty block, if no transactions are
   pending) so the chain keeps advancing during idle periods; proposals are paced to at least
   `--block-interval-ms` (default 1,000 ms) after the last block seen from *any* proposer, not just
   this node's own last proposal.
-- **Block limits.** See §4 — a 4 MiB / 2,000-transaction cap is enforced where the proposer builds a
-  block's candidate list, not (yet, in this tree) as a rule every validator checks when applying a
-  block it receives; making it a consensus rule closes the gap where a Byzantine leader could stuff
-  an over-limit block and force every honest replica to execute it anyway.
-- **Speculative state.** Every entry in the in-memory block tree clones the full ledger, and (in
-  this tree) the tree, the pending-vote map, and the view counter are not yet bounded against a
-  misbehaving or diverging peer; adding those bounds (a maximum tree size, capped vote/NewView maps,
-  a maximum view-ahead distance) is part of the same hardening work.
+- **Block limits.** See §4 — the 4 MiB / 2,000-transaction cap is a consensus rule: it is enforced
+  in `Ledger::apply_block` (`gas::MAX_BLOCK_BYTES` / `gas::MAX_BLOCK_TXS`), which every validator
+  runs on a received block before voting, as well as where the proposer builds a candidate list.
+- **Speculative state.** Every entry in the in-memory block tree clones the full ledger. The tree,
+  the pending-vote map, the NewView map, and the view counter are all bounded against a misbehaving
+  or diverging peer (`max_tree_blocks` = 512, 4096 pending-vote keys, 2048 NewView views,
+  `MAX_VIEW_AHEAD`); the per-entry ledger clone is a known design cost to revisit as state grows.
 
 ## 7. Storage, startup verification, hard forks
 
@@ -332,11 +331,14 @@ verification key material from this point on. `ProgramRecord` (id, base_pc, word
 deployer, deployed_at) goes into the ledger's programs map and so into `programs_root` — deployed
 programs are public, content-addressed, immutable data.
 
-Once the block commits, the node warms the verifier for the smallest tier (`TIERS[0]` = 10) at this
-program's declared table height in a background `spawn_blocking` task (`ZkExecutor::warm`), so the
-first call against it doesn't pay the full uncached-verify cost. The key is keyed on
-`(tier, program_log_height)`, not on the program's content, so this warms one shared key that every
-program of the same size and tier reuses — not a per-program cache.
+Once the block commits, the node warms the verifier for the tiers real guests land on today (10,
+12, and 14) at this program's declared table height in a background `spawn_blocking` task
+(`ZkExecutor::warm`), so the first call against it doesn't pay the full uncached-verify cost. The
+key is keyed on `(tier, program_log_height, input_log_height)`, not on the program's content, so
+this warms shared keys that every program of the same shape reuses — not a per-program cache.
+`warm` covers two input-height classes (the smallest table and the 4-word-call class the current
+guests use): six keys total, one of which a first call typically finds already built by an earlier
+verify.
 
 ### b. Prove (wallet, off-chain)
 
@@ -350,22 +352,26 @@ never the real cycle count.
 `Machine::prove` (or, behind `--cuda`, `prove_with(Backend::Cuda)` — the batch STARK's NTTs and
 Poseidon2 Merkle commitments run on an attached NVIDIA GPU instead of the CPU; there is no fallback,
 so a missing driver, missing PTX, or a tier too large for device memory is a hard error rather than
-a silent CPU run) builds seven interconstrained trace tables for this execution: `program` (now a
+a silent CPU run) builds eight interconstrained trace tables for this execution: `program` (now a
 witness, decoded in-circuit — no longer the verifier's own preprocessed copy), `cpu` (whose first
-rows are a *digest prefix* that absorbs the whole program through Poseidon2, one permutation per up
-to four words, computing `hc` as part of the trace itself), `memory`, `alu`, `range`, `nibble` (the
-old combined byte-range table split in two for a much smaller preprocessed commitment), and
-`poseidon2` (the syscall's own chip). LogUp/permutation buses tie them together (e.g. the
+rows are two *digest prefixes* that absorb the whole program and, separately, the committed private
+inputs through Poseidon2, one permutation per up to four words, computing `hc` and the salted
+`H_IN` as part of the trace itself), `memory`, `alu`, `range`, `nibble` (the
+old combined byte-range table split in two for a much smaller preprocessed commitment),
+`poseidon2` (the syscall's own chip), and `input` (one row per committed private-input word,
+feeding the `H_IN` digest and `READ_INPUT` over two split buses). LogUp/permutation buses tie
+them together (e.g. the
 `POSEIDON2` bus between `cpu`'s hash rows and the `poseidon2` chip). The private inputs — the four
 balances here — never appear in any public column; they only steer which trace rows get produced.
 FRI is run in hiding mode, so two proofs of the identical execution are different bytes — proofs
 don't fingerprint the specific inputs that produced them.
 
-The proof publishes exactly 18 public values (`tables::cpu::pv`): `PC_ENTRY` (1 word), `TIER` (1
-word), `OUT0..OUT0+7` (the eight output words), `HC0..HC0+7` (the 8-word program digest). It is
-serialized as `Proof { tier, program_log_height, public_values, batch }`, postcard-encoded — the
+The proof publishes exactly 26 public values (`tables::cpu::pv`): `PC_ENTRY` (1 word), `TIER` (1
+word), `OUT0..OUT0+7` (the eight output words), `HC0..HC0+7` (the 8-word program digest),
+`IN0..IN0+7` (the 8-word salted private-input commitment `H_IN`). It is
+serialized as `Proof { tier, program_log_height, input_log_height, public_values, batch }`, postcard-encoded — the
 same shape `TxKind::Call.proof` carries. Measured upstream on a different guest (`fib`) at tier 10
-under the current constraint set (`docs/confidential.md`): proof size 268 KB, prove time 3.1 s,
+under constraint set 3 (`docs/confidential.md`): proof size 268 KB, prove time 3.1 s,
 first (uncached) verify 16 ms. The README's own measurement of `private_payment` specifically (an
 earlier constraint set): proving ~21 s, proof ~0.9 MB, on-chain verification ~19 ms once its
 verifier key is cached (the key itself costs ~2 s to build on a laptop, ~7 s on a 2-vCPU server, and
@@ -389,18 +395,19 @@ through `Ledger::apply_block`, whose `Call` path is `Ledger::check_call` followe
 
 1. Proof size (≤ 1 MiB) and recipient-list size (≤ 8) — cheap bounds checks.
 2. The program must exist (`programs.get(program)`).
-3. `ZkExecutor::verify_call`: decode the `postcard`-encoded `Proof`; reject an out-of-range tier or
-   `program_log_height` before either is used to size anything (guarding against a panic on an
-   attacker-chosen huge shift); check the proof's declared degree bits match what `(tier,
-   program_log_height)` implies; decode `record.code_hash` back into `hc`; call
+3. `ZkExecutor::verify_call`: decode the `postcard`-encoded `Proof`; reject an out-of-range tier,
+   `program_log_height`, or `input_log_height` before any of them is used to size anything
+   (guarding against a panic on an attacker-chosen huge shift); check the proof's declared degree
+   bits match what `(tier, program_log_height, input_log_height)` implies; decode
+   `record.code_hash` back into `hc`; call
    `Machine::verify(&hc, &proof)` — the actual batch-STARK check, against a verifier key cached by
-   `(tier, program_log_height)` (shared across every program of that shape, not recomputed per
-   call).
-4. `Machine::verify` itself checks, in order: the public value count is exactly 18; every public
+   `(tier, program_log_height, input_log_height)` (shared across every program of that shape, not
+   recomputed per call).
+4. `Machine::verify` itself checks, in order: the public value count is exactly 26; every public
    value is a canonical field element (rejecting `x` and `x + p` as two encodings of one proof);
    `HC0..HC7` match the caller-supplied `hc`; `TIER` matches the proof's declared tier and that tier
-   is one of the six defined; `program_log_height` is in range; the declared degree bits match; then
-   the batch STARK verification equation itself.
+   is one of the six defined; `program_log_height` and `input_log_height` are in range; the declared
+   degree bits match; then the batch STARK verification equation itself.
 5. Back in the ledger: the call's minimum fee (`call_fee(tier)`) must be met; the eight raw `u32`
    outputs are decoded through `effect::decode` against the transaction's own `recipients` list —
    `out0` is the effect kind (0 none, 1 transfer), `out1` an index into `recipients`, `out2|out3` a
@@ -451,7 +458,8 @@ through the real executor); full mode additionally re-checks every proposer sign
 | Bad or forged proof | `ZkExecutor::verify_call` → `Machine::verify` (ledger, both mempool probe and block application) | RPC: `invalid proof: ...`; block: the transaction is dropped from a proposal, or a block containing it is rejected by every other validator |
 | Tier not one of 10/12/14/16/18/20 | `verify_call`'s pre-check, and again inside `Machine::verify` | `invalid proof: unknown tier` |
 | Declared `program_log_height` out of `[4, 22]` | same two layers | `invalid proof: program height out of range` |
-| Proof's degree bits don't match `(tier, program_log_height)` | `verify_call`'s pre-check | `invalid proof: degree bits` |
+| Declared `input_log_height` out of `[2, 20]` | same two layers | `invalid proof: input height out of range` |
+| Proof's degree bits don't match `(tier, program_log_height, input_log_height)` | `verify_call`'s pre-check | `invalid proof: degree bits` |
 | Stale/wrong program (proof's `hc` doesn't match `record.code_hash`) | `Machine::verify`'s public-value check | `invalid proof: ...` (opaque `VerifyError`, no separate error code) |
 | Unknown program id | `Ledger::check_call` | `unknown program <id>` |
 | Insufficient balance for the call's own fee | `Ledger::validate_inner`'s generic `total_cost` check | `insufficient balance: have X, need Y` |

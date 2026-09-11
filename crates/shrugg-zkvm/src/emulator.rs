@@ -64,7 +64,7 @@ pub struct Execution { pub events: Vec<CycleEvent>, pub outputs: [u32; NUM_OUTPU
 impl Execution { pub fn cycles(&self) -> usize { self.events.len() } }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecError { OutOfCycles(usize), BadPc(u32), Misaligned(u32), BadSyscall(u32), OutputSlot(u32), DoubleWrite(u32), InputIndex(u32), Poseidon2WordCount(u32) }
+pub enum ExecError { OutOfCycles(usize), BadPc(u32), Misaligned(u32), BadSyscall(u32), OutputSlot(u32), DoubleWrite(u32), InputIndex(u32), Poseidon2WordCount(u32), Poseidon2Ptr(u32) }
 
 pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<Execution, ExecError> {
     let mut regs = [0u32; 32];
@@ -145,6 +145,16 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
                 if num == SYS_POSEIDON2 {
                     let (ptr, n) = (arg0, arg1);
                     if n > POSEIDON2_MAX_WORDS { return Err(ExecError::Poseidon2WordCount(n)); }
+                    // The cpu AIR bounds `HASH_PTR` to `< 2^30` (the `HP0..3`/`HP3_HI`
+                    // decomposition on the ecall row — `MEM_ADDR`'s own `MA0..3`/`MA3_HI`
+                    // bound, checked once and carried across the row-group). A pointer at
+                    // or above that emulates fine here but can never satisfy the AIR, so by
+                    // this module's own doctrine (the emulator is the reference semantics)
+                    // the *emulator* must reject it. With `n <= POSEIDON2_MAX_WORDS` every
+                    // derived address (`ptr + 4*idx + k`, `ptr + k + 4`) then stays
+                    // `< 2^30 + 4099`, so the `wrapping_add`s below never wrap and the
+                    // memory table's `(space << 30) + addr` key stays injective.
+                    if ptr >= 1 << 30 { return Err(ExecError::Poseidon2Ptr(ptr)); }
                     // ecall row: HASH_LEFT = n, HASH_IDX = 0, HS0..7 = 0 — all pinned by the AIR
                     // directly from HASH_N/the zero sentinel, so `cpu_trace` only needs `ptr`/`n`.
                     events.push(CycleEvent {

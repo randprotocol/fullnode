@@ -203,10 +203,12 @@ pub const MESSAGE_LEN: usize = 1 + Decoded::NUM_FIELDS;
 pub const MIN_HEIGHT: usize = 16;
 pub const MIN_LOG_HEIGHT: u8 = 4; // 1 << 4 == MIN_HEIGHT
 /// Ceiling on the *declared* (proof-carried) program-table log-height (`Proof::
-/// program_log_height`) — `2^22` rows is a program of up to ~4M words, comfortably past
-/// anything this crate's guests or any conceivable RV32 program compiled for it need; a
-/// verifier rejects anything larger before it can be used to size a table and panic on an
-/// absurd shift (`machine::Machine::verify`).
+/// program_log_height`) — `2^22` rows is a program of up to ~4M words, far past anything
+/// this crate's guests or any conceivable RV32 program compiled for it need; a verifier
+/// rejects anything larger before it can be used to size a table and panic on an absurd
+/// shift (`machine::Machine::verify`). This is only the table-*shape* ceiling, not the
+/// effective program-size cap: that is the digest rows' 16-bit `HASH_LEFT` bound, 65535
+/// words (`tables::cpu`'s `LEFT0..1`; `Program::from_flat_binary` enforces it).
 pub const MAX_LOG_HEIGHT: u8 = 22;
 
 /// M3.4 (fix): the program table's height is a **proof-declared** parameter now, not a

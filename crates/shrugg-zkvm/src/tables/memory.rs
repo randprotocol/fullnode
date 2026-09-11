@@ -68,8 +68,9 @@ where
     }
 }
 
-/// M3.4: `clk_offset` is `Program::digest_rows()` — the cpu table's digest-row prefix shifts
-/// every ordinary event's own `CLK` forward by that many rows (`tables::cpu::cpu_trace`), and
+/// M3.4: `clk_offset` is `Program::digest_rows() + input_digest_rows` (M4.1: the cpu
+/// table's *two* digest-row prefixes) — the cpu table's digest-row prefixes shift every
+/// ordinary event's own `CLK` forward by that many rows (`tables::cpu::cpu_trace`), and
 /// the `MEMORY` bus timestamps (`ts = 4*CLK + slot`) this table sends must use that same
 /// shifted `CLK` or the two sides' `(space, addr, ts, value, is_write)` tuples stop matching.
 pub fn memory_trace(events: &[CycleEvent], clk_offset: u32, height: usize, counts: &mut RangeCounts) -> RowMajorMatrix<F> {
@@ -77,7 +78,17 @@ pub fn memory_trace(events: &[CycleEvent], clk_offset: u32, height: usize, count
     let mut rows: Vec<(u64, u64, u32, u32, u32, bool)> = Vec::new();
     for e in events {
         for a in &e.accesses {
-            rows.push((((a.space as u64) << KEY_SHIFT) | a.addr as u64, a.ts(clk_offset + e.clk) as u64, a.space, a.addr, a.value, a.is_write));
+            // The sort key must be computed exactly the way the AIR recomputes it —
+            // `SPACE·2^30 + ADDR` (`eval`'s `key_l`/`key_n`), i.e. `+`, not `|`. With `|`,
+            // any RAM address `>= 2^30` (reachable only through POSEIDON2 absorb/write-back
+            // addresses — `HASH_PTR < 2^30` is the AIR's bound, plus at most 4099 derived
+            // words) aliases the address with its bit 30 cleared: rows sort into an order
+            // whose in-circuit keys *decrease* across the boundary (the `dk` delta limbs then
+            // reject an honest trace), and `(1, x)` / `(1, 2^30+x)` collide into one key
+            // entirely. `+` is injective and monotone over every provable trace: register
+            // addresses are `< 32` and RAM addresses stay `< 2^31` (ordinary word addresses
+            // are `alu_out >> 2 < 2^30`; hash-derived ones `< 2^30 + 4099`).
+            rows.push((((a.space as u64) << KEY_SHIFT) + a.addr as u64, a.ts(clk_offset + e.clk) as u64, a.space, a.addr, a.value, a.is_write));
         }
     }
     rows.sort_by_key(|r| (r.0, r.1));

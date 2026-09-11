@@ -124,6 +124,10 @@ pub fn balance_check(threshold: u32) -> Program {
 
 /// Private payment: reads four private balances; if their sum >= threshold, pays recipient 0
 /// the surplus (sum - threshold); otherwise emits no effect. Only the effect words are public.
+/// Unlike `balance_check` (whose doc comment explains its carry flag), the sum here wraps mod
+/// 2^32 with no carry tracking — a wrapped total can only land *below* `threshold` and
+/// under-emit, never over-pay (and the ledger independently bounds every effect by the
+/// sender's real on-chain balance), so the wrap is safe to accept rather than track.
 pub fn private_payment(threshold: u32) -> Program {
     let mut a = Assembler::new(0);
     a.extend(li(T5, 0));

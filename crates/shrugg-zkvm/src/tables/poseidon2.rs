@@ -368,10 +368,15 @@ where
 
         // Idle rows: nothing else is constrained; MULT is forced to zero below regardless.
 
-        // Bus: on the last round row of a real block, provide [IN, next-S] with count MULT.
+        // Bus: exactly the last round row of a real block provides [IN, next-S], count one —
+        // pin `MULT` to `is_last·is_real` outright (both boolean), not merely "0 wherever it
+        // isn't needed". A free `MULT` on a real block's last round row could only ever
+        // rescale a *genuine* permutation's bus entry (the round constraints fully determine
+        // `next-S` from `IN`), so this is defense in depth, not a live hole — but a
+        // multiplicity column is exactly the kind of slack this table's own padding-row
+        // discipline exists to remove.
         let mult = v(col::MULT);
-        b.assert_zero(mult.clone() * (one.clone() - is_last.clone()));
-        b.assert_zero(mult.clone() * (one - is_real));
+        b.assert_zero(mult.clone() - is_last * is_real);
         let out: [AB::Expr; 8] = core::array::from_fn(|i| n(col::S0 + i));
         let msg: Vec<AB::Expr> = inp.into_iter().chain(out).collect();
         bus::POSEIDON2.table_entry(b, msg, mult);
@@ -452,8 +457,7 @@ pub fn poseidon2_trace(events: &[Poseidon2Event], height: usize) -> RowMajorMatr
     let n_blocks = height / BLOCK;
     assert!(
         events.len() <= n_blocks,
-        "poseidon2 table needs {} blocks for {} events, height {height}",
-        events.len(),
+        "poseidon2 table needs {n_blocks} blocks for {} events, height {height}",
         events.len()
     );
     let mut v = F::zero_vec(height * col::WIDTH);

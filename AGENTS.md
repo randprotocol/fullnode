@@ -17,6 +17,39 @@ before re-reporting suspected issues). Fixes merged into `main`:
 - `d5143a6` hardening: cheap-before-expensive checks, block size as a consensus rule
 - `a44d3f4` robustness: key file permissions, RPC limits, storage receipts, genesis validation
 
+### Zk-side audit: fixes on branch `zk-audit-fixes-sep12` (2026-09-12)
+
+A zk-focused audit (all eight AIRs, the emulator, host prover glue, chain
+integration, and the cheating-test suite) found two **critical soundness holes**
+in `tables/cpu.rs`'s hash row-group routing, plus a batch of completeness bugs:
+
+- Free-standing `IS_HASH`/`IS_HASH_OUT` rows had **no entry gate** — a cheating
+  prover could splice write-back rows anywhere, giving 4 arbitrary RAM writes per
+  row at a free, unbounded `HASH_PTR` with no permutation consumed (a total break
+  of execution integrity). Fixed with three transition gates (absorb/write-back
+  predecessors, and nothing after the second write-back row).
+- `HASH_FIN` was never pinned to write-back rows — setting it on the ecall row
+  detached the group's `HASH_PTR` from its range-checked source (the same hole,
+  one row later) and shifted the PC chain by one instruction. Fixed with
+  `HASH_FIN·(1 − IS_HASH_OUT) = 0`.
+- Both have full attack-witness regression tests in `tests/cheating.rs` that
+  **verify against the pre-fix constraints** and are rejected after (confirmed by
+  running them with the gates removed).
+- **The M2.2 FRI retune (27 queries) is reverted to the whitepaper's 80/8/20**:
+  it met the ethSTARK conjectured 100-bit target but dropped the proven
+  proximity-gaps floor to ~42 bits (vs ~86 at q=80). The paper's reconciliation
+  keeps q=80 for exactly this reason.
+- Completeness/robustness: memory-table sort key now matches the AIR's key
+  arithmetic (honest ≥2^30 hash addresses were unprovable); the emulator rejects
+  `ptr ≥ 2^30`; the poseidon2 permutation budget is a `ProveError`, not a panic
+  (auto-tier fits both budgets); the 16-bit `HASH_LEFT` cap (65 535 words) is
+  enforced host-side; prove-side tier/`base_pc`-wrap/immediate-truncation
+  guards. Docs call this **constraint set 5** — a hard fork like every set
+  before it; fleets must run the same build.
+- Also on this branch: `genesis.rs`'s pinned live-testnet hash was stale on
+  `main` (chain 4's `7e6271a3`; chain 5 is `3a82b0c7` per `deploy/README.md`) —
+  `main`'s own suite was red before this branch.
+
 ### Load-bearing consensus invariants (do not regress)
 
 - **The commit rule needs three consecutive-view QCs.** Any relaxation

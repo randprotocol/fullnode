@@ -168,6 +168,13 @@ argument FRI-based STARKs use for soundness against known attacks, not a formall
 the crate treats it the way the rest of the field does, as the working security target, and says so
 plainly (`research/docs/03-privacy.md`).
 
+> **Erratum (2026-09-12, superseded).** The 27-query retune was reverted in the 2026-09 audit wave
+> (constraint set 5, `docs/confidential.md`): it met the ethSTARK *conjectured* 100-bit target but
+> dropped the *proven* proximity-gaps floor the whitepaper's 80-query choice exists to keep (~86
+> proven bits at q=80/g=20 vs ~42 at q=27 — the paper's Part III reconciliation weighs exactly this
+> trade and keeps q=80/g=20). `Production` is once again 80 queries / 20 PoW bits / blowup 8. The
+> M2.2 paragraph above is kept as the historical record of the retune and its rationale.
+
 **M2.3 — byte table split.** The single 2^16-row preprocessed byte table was replaced by two
 256-row tables: `range` (range checks plus a powers-of-two lookup) and `nibble` (4-bit AND/OR/XOR,
 where a successful lookup is itself a range check on both operands). The byte table's fixed
@@ -230,9 +237,10 @@ degree 6). Both tables are already at the edge of the budget.
 **What remained open.** M2's original, aspirational wording included a flat-binary loader (to run
 a program compiled by an external RISC-V toolchain rather than assembled by hand against `asm.rs`)
 and a firmer binding for `READ_INPUT` than "a prover-chosen witness value, unconstrained across
-repeated reads of the same index." Neither was part of the six-task plan that was actually built,
-and both remain open, carried forward rather than blocking M2's "done" status
-(`research/docs/05-roadmap.md`). M2 shipped 81 tests total.
+repeated reads of the same index." Neither was part of the six-task plan that was actually built.
+Both later shipped as **M4.1** (2026-09-11, constraint set 4 — the loader, `guests::compiled::fib`,
+and the salted `H_IN` commitment with the `input` table; see `docs/confidential.md`). M2 shipped
+81 tests total (`research/docs/05-roadmap.md`).
 
 ## 4. M3 — a native hash and the program out of the verifier's hands (done)
 
@@ -367,10 +375,12 @@ was (`research/docs/03-privacy.md`, "`hc` is now an in-circuit digest").
 executor.rs`) computes `Program::digest()` and stores it as `ProgramRecord.code_hash` — `code_hash`
 is now the actual verification key material, 8 little-endian `u32` words, not an informational
 label (before this sync it was `blake3(program_id)` again, since the verifier used to take the
-whole program directly). `warm()` now only warms the smallest tier's verifier key, because the key
-is program-content-independent — warming every tier for every deployed program would mean building
-the Poseidon2 round-constant table at the largest tiers too, which is not the cheap end of the
-preprocessed-commitment cost any more. `hash.rs` (the host-side Poseidon2 sponge reference, used
+whole program directly). `warm()` at this sync warmed only the smallest tier's verifier key,
+because the key is program-content-independent — warming every tier for every deployed program
+would mean building the Poseidon2 round-constant table at the largest tiers too, which is not the
+cheap end of the preprocessed-commitment cost any more. (It has since grown: the hardening review
+widened it to tiers 10/12/14, and M4.1 added the two input-height classes — see
+`docs/architecture.md` §9a.) `hash.rs` (the host-side Poseidon2 sponge reference, used
 both for `hc` and the `POSEIDON2` syscall) is vendored into the node for the first time at this
 sync — it is core machinery, not viewing-key-specific — with its one dependency on the excluded
 `notes.rs` (the `HC` domain tag) patched to a local `hash::HC_DOMAIN` constant instead of pulling
@@ -415,12 +425,15 @@ measurement on record is the CPU baseline it hopes to beat — 21 s to prove `pr
 tier 10 under the production FRI profile, on the author's laptop
 (`docs/superpowers/specs/2026-09-10-cuda-prover-design.md`).
 
-## 6. M4 — compatibility (not started, not designed)
+## 6. M4 — compatibility (M4.1 shipped 2026-09-11; the EVM/sBPF interpreters are still open)
 
-M4's exit criterion is stated but nothing behind it has been built: an ERC-20 `transfer` and an SPL
-`Transfer` should each prove under the same relation the rest of this document describes
-(`research/docs/05-roadmap.md`'s M4 row). The plan, as far as it has been written down
-(`research/docs/04-guests.md`), is that neither the EVM nor sBPF ever executes natively — each
+M4's overall exit criterion is an ERC-20 `transfer` and an SPL `Transfer` each proving under the
+same relation the rest of this document describes (`research/docs/05-roadmap.md`'s M4 row).
+**M4.1 landed the first slice on 2026-09-11** (constraint set 4, `docs/confidential.md`): the
+flat-binary loader (`Program::from_flat_binary`), the first compiled guest
+(`guests::compiled::fib`), and — as part of the same sync — the salted `H_IN` input commitment and
+the eighth (`input`) table. What remains open is the interpreters themselves: neither the EVM nor
+sBPF ever executes natively — each
 becomes an interpreter compiled to RV32IM, with the target bytecode passed in as a private input,
 exactly the same "programs as data" idea §1 describes. Cheap opcodes map onto a handful of native
 RV32IM instructions each; expensive ones (`KECCAK256`, 256-bit modular arithmetic, `ECRECOVER`,
@@ -435,9 +448,9 @@ an AIR/chip. There is no `p3-keccak-air`, no `p3-poseidon2-air`, and no `p3-sha2
 reason M4 builds the EVM interpreter first — that crate is not in the vendored dependency set, so
 a Keccak coprocessor chip will have to be hand-written the same way `tables/poseidon2.rs` was, not
 imported. Two other facts bear on M4 without a design existing yet: `solana-sbpf` 0.11.1 is
-available as a dependency, and Rust 1.98.1 ships a `riscv32im-unknown-none-elf` target — but the
-flat-binary loader that would load a program built by that target is still an open item carried
-forward from M2 (§3), so neither fact yet has anywhere to plug in.
+available as a dependency, and Rust 1.98.1 ships a `riscv32im-unknown-none-elf` target — the
+M4.1 flat-binary loader (`Program::from_flat_binary`, constraint set 4) is exactly what a program
+built by that target plugs into, and `guests::compiled::fib` already exercises the path.
 
 **Rough, unmeasured cycle estimates** (`research/docs/04-guests.md` is explicit that these are
 estimates, not measurements, since no interpreter exists yet): a native RV32IM instruction costs 1
@@ -456,14 +469,15 @@ own coprocessor table rather than running through the general ALU.
 | Constraint-set-2 fix wave | constraint set 2 | **Yes** — chain 4 truncates at its first confidential call under the old rules | not recorded in the sources reviewed | none — call format unchanged; node operators need a new chain id or `--verify-chain off` |
 | M2 + M3 (FRI retune, byte-table split, sub-word memory, RV32M, Poseidon2, in-circuit `hc`) | constraint set 3 | **Yes** — same failure mode as constraint set 2 | 892 KB → 268 KB proof; 21.6 s → 3.1 s prove; 2.17 s → 16 ms first verify | `Proof` gains a `program_log_height` field (still `postcard`-encoded, still opaque to a caller); a deployed program's `code_hash` is now `hc`, not `blake3(program_id)` — this only matters to code that reads `code_hash` directly, not to a caller submitting a call |
 | CUDA backend | unchanged — same proof format, same constraint set | No | unchanged (same `Proof` type; performance only) | opt in with `--cuda` on a build compiled with `--features cuda`, and expect a hard error, never a silent CPU run, if no device is available |
-| M4 | not started | — | — | — |
+| M4.1 (salted `H_IN` + `input` table, flat-binary loader, compiled guests) | constraint set 4 | **Yes** — `pv::NUM` 18 → 26, eighth AIR, `Proof` gains `input_log_height` | same order as constraint set 3 | private inputs are now committed (salted `H_IN` in the public values); compiled flat binaries can be deployed, not just hand-assembled programs |
+| 2026-09-12 audit fixes (hash row-group gates, FRI back to 80/20, prove-time guards) | constraint set 5 | **Yes** — FRI query count 27 → 80 and new AIR constraints; old proofs fail the new verifier and vice versa | larger proofs again (~3x the FRI query work of sets 3–4); the whitepaper's 80/8/20 table is the price of the ~86-bit *proven* floor | none — call format unchanged; provers just produce 80-query proofs |
 
 ## 8. Reading order
 
 Upstream (`randprotocol/circuits/research/docs`), in the order they were written to be read:
 
 1. `01-isa.md` — the instruction set, encoding, and syscall ABI.
-2. `02-tables-and-buses.md` — the seven tables, their columns, and the buses that connect them.
+2. `02-tables-and-buses.md` — the eight tables, their columns, and the buses that connect them.
 3. `03-privacy.md` — what zero-knowledge covers here, what a proof leaks, and what `verify` checks.
 4. `04-guests.md` — the M4 plan for EVM/sBPF interpreters and coprocessor chips.
 5. `05-roadmap.md` — the milestone table, exit criteria, and the whitepaper deviation list.

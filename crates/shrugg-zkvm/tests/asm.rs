@@ -44,6 +44,46 @@ fn every_guest_decodes() {
     }
 }
 
+/// Audit (2026-09): out-of-range immediates used to be silently truncated by `encode` (`&
+/// 0xfff`, `bits(..)`) — wrong code, no error. They now panic at the choke point.
+#[test]
+#[should_panic(expected = "does not fit 12 bits")]
+fn an_out_of_range_i_type_immediate_panics_at_encode() {
+    let _ = addi(1, 1, 5000).encode();
+}
+
+#[test]
+#[should_panic(expected = "does not fit 12 bits")]
+fn an_out_of_range_store_offset_panics_at_encode() {
+    let _ = sw(1, 2, 4096).encode();
+}
+
+#[test]
+#[should_panic(expected = "does not fit 5 bits")]
+fn an_out_of_range_shift_amount_panics_at_encode() {
+    let _ = Instr::AluImm { op: AluOp::Sll, rd: 1, rs1: 2, imm: 32 }.encode();
+}
+
+/// The assembler's label path: a branch target past the 13-bit B-immediate range (±4096
+/// bytes) used to silently encode the wrong offset (even the wrong direction).
+#[test]
+#[should_panic(expected = "does not fit 13 bits")]
+fn a_branch_to_a_far_label_panics_at_assemble() {
+    let mut a = Assembler::new(0);
+    a.branch(BranchCond::Eq, 0, 0, "far");
+    for _ in 0..2000 { a.push(addi(0, 0, 0)); } // +8000 bytes: past +4095
+    a.label("far");
+    a.extend(halt());
+    let _ = a.assemble();
+}
+
+/// `lui`/`auipc` with the low 12 bits set used to have them silently masked off.
+#[test]
+#[should_panic(expected = "low 12 bits set")]
+fn a_lui_with_low_bits_set_panics_at_encode() {
+    let _ = Instr::Lui { rd: 1, imm: 0xdead_beef }.encode();
+}
+
 #[test]
 #[should_panic(expected = "at least one value")]
 fn bubble_sort_rejects_empty_input() {

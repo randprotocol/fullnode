@@ -181,10 +181,11 @@ fn flat_binary_rejects_misaligned_base_pc() {
 
 #[test]
 fn flat_binary_rejects_a_program_longer_than_the_table_can_hold() {
-    let max_words = (1usize << shrugg_zkvm::tables::program::MAX_LOG_HEIGHT) - 1;
-    // One word past the ceiling — building `max_words + 1` bytes of any decodable word
-    // (`ADDI x0, x0, 0`, encoding 0x0000_0013) keeps this test about the length bound alone,
-    // not accidentally about a decode failure.
+    // The loader's ceiling is the 16-bit `HASH_LEFT` bound (`tables::cpu`'s `LEFT0..1`),
+    // below the program table's `MAX_LOG_HEIGHT` shape ceiling. One word past it — building
+    // the bytes of any decodable word (`ADDI x0, x0, 0`, encoding 0x0000_0013) keeps this
+    // test about the length bound alone, not accidentally about a decode failure.
+    let max_words = u16::MAX as usize;
     let bytes = vec![0x13u8, 0x00, 0x00, 0x00].repeat(max_words + 1);
     assert_eq!(
         Program::from_flat_binary(0, &bytes),
