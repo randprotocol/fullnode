@@ -157,8 +157,10 @@ impl std::fmt::Display for ShieldedAddress {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitmentTree {
     next_index: u64,
-    /// `frontier[d]` is the completed left subtree at depth `d` that the next leaf's path
-    /// will use as a left sibling, if any.
+    /// `frontier[d]` is the node at depth `d` on the rightmost path that a later right child
+    /// will read as its left sibling. Between appends it may still hold a partially padded
+    /// subtree root: `append` overwrites `frontier[d]` on every leaf whose bit `d` is 0, so by
+    /// the time a leaf with bit `d` = 1 reads it, the left subtree below it is complete.
     frontier: Vec<Option<Word8>>,
     empty: Vec<Word8>,
     root: Word8,
@@ -252,7 +254,8 @@ impl FullTree {
         self.levels[DEPTH].first().copied().unwrap_or(self.empty[DEPTH])
     }
 
-    /// Sibling per level, leaf level first — the layout `notes::bundle_inputs` expects.
+    /// Sibling per level, leaf level first — the layout `notes::bundle_inputs` (in the vendored
+    /// research note layer, `shrugg_zkvm::notes`, arriving in Task 2) expects.
     pub fn path(&self, index: u64) -> Option<[Word8; DEPTH]> {
         if index >= self.len() as u64 {
             return None;

@@ -33,7 +33,8 @@ pub trait ConfidentialExecutor: Send + Sync {
     fn warm(&self, _program: &ProgramRecord) {}
     /// Poseidon2 tree-node hash `H(NODE, left || right)` — the hash `MERKLE_VERIFY` checks against.
     fn node_hash(&self, left: &Word8, right: &Word8) -> Word8;
-    /// `notes::bundle_digest(..)` over the public bundle fields with the taint word fixed to 0.
+    /// `notes::bundle_digest(..)` (in the vendored research note layer, `shrugg_zkvm::notes`,
+    /// arriving in Task 2) over the public bundle fields with the taint word fixed to 0.
     fn bundle_digest(&self, input: &BundleDigestInput) -> Word8;
     /// Cheap: decode `proof`, check its declared tier/heights/public-value canonicity, and return
     /// the digest it publishes in `OUT0..OUT7`. Verifies nothing cryptographic.

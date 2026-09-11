@@ -9,7 +9,7 @@ use crate::storage::{Storage, VerifyMode};
 use anyhow::{Context, Result};
 use libp2p::{Multiaddr, PeerId};
 use shrugg_core::bridge::BridgeState;
-use shrugg_core::confidential::{ConfidentialExecutor, DisabledExecutor};
+use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_zkvm::executor::ZkExecutor;
 use shrugg_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
 use shrugg_core::gas;
@@ -77,9 +77,9 @@ pub fn load_genesis(datadir: &std::path::Path) -> Result<GenesisState> {
 
 /// The confidential-computation executor a chain's genesis calls for.
 pub fn executor_for(gs: &GenesisState) -> Result<Arc<dyn ConfidentialExecutor>> {
-    if !gs.confidential {
-        return Ok(Arc::new(DisabledExecutor));
-    }
+    // S1: DisabledExecutor removed — the ledger gates Deploy/Call with `confidential`
+    // (Task 4 rewires this); for now the node always builds a ZkExecutor, including on a
+    // chain whose genesis sets `confidential: false`.
     let profile = ZkExecutor::profile_from_str(&gs.fri_profile)
         .with_context(|| format!("genesis fri_profile {}", gs.fri_profile))?;
     Ok(Arc::new(ZkExecutor::new(profile)))
