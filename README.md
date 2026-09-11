@@ -181,10 +181,12 @@ Full detail in `docs/architecture.md`.
 | [docs/cli.md](docs/cli.md) | every `shrugg-node` and `shrugg` command, argument, and default |
 | [docs/rpc.md](docs/rpc.md) | JSON-RPC methods, parameters, result shapes, error codes |
 | [docs/confidential.md](docs/confidential.md) | programs, calls, effects, gas, privacy |
-| [docs/architecture.md](docs/architecture.md) | consensus, ledger, storage, networking, sync, integrity check |
+| [docs/architecture.md](docs/architecture.md) | how the node works end to end: consensus, ledger, storage, networking, sync, and one confidential transaction followed from wallet to receipt |
+| [docs/zkvm-milestones.md](docs/zkvm-milestones.md) | the Rand zkVM milestone by milestone (M1–M4, CUDA backend): what was built and why |
+| [docs/bridge.md](docs/bridge.md) | the guardian bridge: trust model, wire format, guardian sets, state, transactions |
 | [docs/deploy.md](docs/deploy.md) | multi-machine and cloud deployment, rebuilds, fault tests |
 | [deploy/README.md](deploy/README.md) | the live testnet: nodes, addresses, peer ids |
-| [docs/superpowers/specs](docs/superpowers/specs) | design specs (node, confidential computation) |
+| [docs/superpowers/specs](docs/superpowers/specs) | design specs (node, confidential computation, fully shielded pool) |
 
 ## Roadmap
 
