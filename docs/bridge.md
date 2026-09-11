@@ -1,7 +1,7 @@
 # The guardian bridge — architecture
 
 > The bridge code lands on main with the `feat/bridge` merge (`543d72b`) and the hardening
-> commits that follow it; this page describes it as of `4585368`.
+> commits that follow it; this page describes it as of `273e13d` (`4585368` plus the attestation check reordering).
 
 This page assumes `docs/architecture.md`. It covers the wire format, the guardian-attestation
 model, the on-chain `BridgeState`, the two bridge transaction kinds, and the storage/RPC/wallet
@@ -252,8 +252,13 @@ asset, not SHRUGG.
    construction and "must not be allowed to buy verification work with a zero fee" — the
    repo-wide cheap-before-expensive rule (`d5143a6`) applied to the bridge.
 2. Only then is a bridge's presence checked (`BridgeError::Disabled` if none); `check_attest`
-   decodes the envelope once, resolves the guardian set, and runs
-   quorum/index/low-s/signature-recovery (`verify_decoded`) before the payload itself.
+   decodes the envelope once and, as of `273e13d`, runs every cheap check before any signature
+   work: the replay check against `spent` (by digest `mu`), the payload decode
+   (`BridgeError::BadPayload`), the emitter check against the registered emitter for the
+   emitter chain, and the payload's own field checks (token chain, asset, recipient shape).
+   Only an attestation that passes all of those reaches guardian-set resolution and
+   quorum/index/low-s/signature-recovery (`verify_decoded`). Before `273e13d` recovery ran
+   first; accepted attestations are unchanged by the reordering.
 3. `BridgeBurn`: bridge presence, then `check_burn` — registered asset -> `to_chain` matches home
    chain -> recipient shape -> `fee <= amount` -> `amount != 0` -> sufficient balance.
 
