@@ -1,7 +1,7 @@
-# Testnet: chain id 4 (SHRUGG, confidential computation)
+# Testnet: chain id 5 (SHRUGG, confidential computation, zkVM constraint set 4)
 
 Test keys only; all seeds are committed on purpose so any machine can pull and run.
-Genesis hash `7e6271a3aa38f11a43a6b3ad4c2262860cc8fa4b1f5c7b3b37dd6aebae01e917`, 100 SHRUGG per validator, **faucet enabled**, **confidential computation enabled** (production FRI profile)
+Genesis hash `3a82b0c7b6c4eb1eb1e1ba8a54b4306a883a57d46ccebce1e7adb7b5fd9ffa86`, 100 SHRUGG per validator, **faucet enabled**, **confidential computation enabled** (production FRI profile, no bridge section; fleet build commit dbea18c, constraint set 4)
 (`shrugg faucet [address]` mints up to 100 SHRUGG per call on any node). Quorum is 3 of 4 validators.
 
 | node | role | where | address | peer id |
@@ -43,6 +43,12 @@ shrugg --key deploy/node-a.key.json program deploy pp.json
 shrugg --key deploy/node-a.key.json call <program-id> --input 400 --input 250 --input 300 --input 75 --to <B address>
 ```
 
+Chain 5 (2026-09-11, cut by the Air's session, fleet joined 09:04 UTC): first confidential call on the
+constraint-set-4 zkVM committed in block 37 (prove 7.4 s on the laptop, proof 435 KB, down from 21 s / 878 KB).
+Rule for this fleet: every node runs the pinned build commit (`dbea18c`); a zkVM constraint change is a fork,
+announced by the zkVM session first, and moves the whole fleet at once with a fresh genesis. Observer E also
+hosts the RandScan explorer, which re-indexes itself on a chain id change.
+
 History: chain 1 (2 validators, SESH) and chain 2 (4 validators + 2 observers, SESH) ran on 2026-09-09;
-chain 3 followed the SESH -> SHRUGG rename and added the faucet; chain 4 (2026-09-10) adds confidential
-computation (Deploy/Call) and requires Rust 1.98.1 on every node.
+chain 3 followed the SESH -> SHRUGG rename and added the faucet; chain 4 (2026-09-10) added confidential
+computation on constraint set 2 and ended at 31,952 blocks when the fleet moved to constraint set 4.
