@@ -86,21 +86,20 @@ impl ConfidentialExecutor for ZkExecutor {
         Ok(out)
     }
 
-    /// Precompute the verifier key(s) a call against `record` is likely to need. M3.4: the key
-    /// is `(tier, program_log_height)`, program-content-independent — every program at the same
-    /// declared height and tier shares one, so there is nothing left to warm *per program*
-    /// except its own `program_log_height` (a pure function of `record.words.len()`). Which
-    /// *tier* a call will actually declare depends on the private inputs' cycle count, not
-    /// knowable at deploy time — so, as before this milestone, this only warms the smallest
-    /// tier (`TIERS[0]`): most confidential calls on this chain are small enough to land there,
-    /// and warming every tier for every deployed program would mean also building the
-    /// Poseidon2 chip's preprocessed round-constant table at the largest tiers (`2^22` rows),
-    /// which is not the "cheap" end of `docs/03-privacy.md`'s preprocessed-commitment cost any
-    /// more. A call that lands on a larger tier still verifies correctly — it just pays the
-    /// uncached first-verify cost `warm` would otherwise have amortized.
+    /// Precompute the verifier keys a call against `record` is likely to need, off the node
+    /// loop (deploy commit / startup). Since M3.4 the key is `(tier, program_log_height)` and
+    /// program-content-independent, so this warms one shared key per tier for this program's
+    /// declared height. The security review (a44d3f4) found that warming a single tier left the
+    /// first honest call at any other tier paying the uncached key cost inline; warming every
+    /// tier would build the Poseidon2 chip's preprocessed round-constant table at `2^22` rows on
+    /// a 2-vCPU validator, so this warms the tiers real guests land on today (10, 12, 14 — the
+    /// transfer guest proves at 14). A call at a larger tier still verifies; it pays the
+    /// first-verify cost once per (tier, height).
     fn warm(&self, record: &ProgramRecord) {
         let log_height = program::program_log_height(record.words.len());
-        self.machine.verifier_key(Tier(TIERS[0]), log_height);
+        for t in &TIERS[..3] {
+            self.machine.verifier_key(Tier(*t), log_height);
+        }
     }
 
     fn verify_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {

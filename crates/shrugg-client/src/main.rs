@@ -48,6 +48,42 @@ enum Cmd {
         #[arg(long, default_value = "100")]
         amount: String,
     },
+    /// Submit a guardian-signed attestation, minting the bridged asset it carries.
+    ///
+    /// The attestation is hex, or `@path` to read it from a file (hex or raw bytes).
+    BridgeMint {
+        /// Attestation hex, or `@file`.
+        attestation: String,
+        /// SHRUGG transaction fee.
+        #[arg(long, default_value = "0.000001")]
+        fee: String,
+    },
+    /// Burn a bridged asset and emit the message a source-chain contract releases against.
+    BridgeBurn {
+        /// Asset id (64 hex); `shrugg bridge-status` lists the registered ones.
+        asset: String,
+        /// Amount in bridged units (8 decimals), as a plain integer.
+        amount: String,
+        /// Destination chain: 2 Ethereum, 3 BSC, 4 Tron, 5 Solana.
+        to_chain: u16,
+        /// Recipient on that chain, 32 bytes of hex (EVM addresses left-padded).
+        to: String,
+        /// Relayer fee carried in the message, in bridged units (at most `amount`).
+        #[arg(long, default_value = "0")]
+        bridge_fee: String,
+        /// SHRUGG transaction fee.
+        #[arg(long, default_value = "0.000001")]
+        fee: String,
+    },
+    /// Bridged-asset balance: `asset-balance <asset>` or `asset-balance <address> <asset>`.
+    AssetBalance {
+        /// An asset id, or an address when a second argument follows.
+        first: String,
+        /// The asset id, when the first argument is an address.
+        second: Option<String>,
+    },
+    /// Bridge configuration, guardian set, and registered assets.
+    BridgeStatus,
     /// Confidential programs: build, deploy, show.
     #[command(subcommand)]
     Program(ProgramCmd),
@@ -144,15 +180,82 @@ fn load_key(path: &Path) -> Result<Keypair> {
 }
 
 fn write_key(path: &Path, kp: &Keypair) -> Result<()> {
-    if path.exists() {
-        anyhow::bail!("{} already exists; refusing to overwrite", path.display());
-    }
     let kf = KeyFile { seed: hex::encode(kp.seed()), address: kp.address().to_base58(), public_key: kp.public_key().to_hex() };
-    std::fs::write(path, serde_json::to_string_pretty(&kf)?)?;
+    let s = serde_json::to_string_pretty(&kf)?;
+    // create_new closes the exists-then-write race and mode(0o600) makes the
+    // file owner-only from the start: writing first and chmodding afterwards
+    // leaves the seed world-readable for a window.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("{} already exists or cannot be created; refusing to overwrite", path.display()))?;
+        f.write_all(s.as_bytes())?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        if path.exists() {
+            anyhow::bail!("{} already exists; refusing to overwrite", path.display());
+        }
+        std::fs::write(path, s)?;
+        Ok(())
+    }
+}
+
+/// An attestation given as hex, or as `@path` to a file holding either hex
+/// (with optional whitespace) or the raw bytes.
+/// Drop every space, tab and newline, so a hex dump wrapped across lines reads
+/// the same as one long line.
+fn strip_ws(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Is this text hex (however it is wrapped), rather than raw attestation bytes?
+fn looks_like_hex(s: &str) -> bool {
+    let s = strip_ws(s);
+    let s = s.strip_prefix("0x").unwrap_or(&s);
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn read_attestation(arg: &str) -> Result<Vec<u8>> {
+    let text = match arg.strip_prefix('@') {
+        None => arg.to_string(),
+        Some(path) => {
+            let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+            if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+                anyhow::bail!("{path} is empty; expected an attestation as hex or raw bytes");
+            }
+            match std::str::from_utf8(&bytes) {
+                Ok(s) if looks_like_hex(s) => s.to_string(),
+                // Not hex: take the file as the raw attestation.
+                _ => return Ok(bytes),
+            }
+        }
+    };
+    let text = strip_ws(&text);
+    let text = text.strip_prefix("0x").unwrap_or(&text);
+    if text.is_empty() {
+        anyhow::bail!("attestation is empty; expected hex bytes, or @file");
+    }
+    hex::decode(text).context("attestation must be hex, or @file")
+}
+
+/// Print every bridged asset an address holds, one per line.
+async fn print_holdings(rpc: &RpcClient, addr: &Address) -> Result<()> {
+    let holdings = rpc.assets(addr).await?;
+    if holdings.is_empty() {
+        println!("{addr} holds no bridged assets");
+        return Ok(());
+    }
+    println!("{addr} bridged holdings (units, 8 decimals):");
+    for h in holdings {
+        println!("  {} chain {} token {}  {}", h.asset, h.token_chain, hex::encode(h.token_address), h.balance);
     }
     Ok(())
 }
@@ -204,6 +307,53 @@ async fn main() -> Result<()> {
             let r = rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await?;
             let acct = rpc.account(&to).await?;
             println!("committed in block {}\nbalance: {} SHRUGG", r.height, format_amount(acct.balance));
+        }
+        Cmd::BridgeMint { attestation, fee } => {
+            let kp = load_key(&cli.key)?;
+            let bytes = read_attestation(&attestation)?;
+            let fee = parse_amount(&fee)?;
+            let hash = rpc.bridge_attest(&kp, bytes, fee).await?;
+            println!("submitted attestation {hash} (fee {} SHRUGG)", format_amount(fee));
+            let r = rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await?;
+            println!("committed in block {} (index {})", r.height, r.index);
+            print_holdings(&rpc, &kp.address()).await?;
+        }
+        Cmd::BridgeBurn { asset, amount, to_chain, to, bridge_fee, fee } => {
+            let kp = load_key(&cli.key)?;
+            let asset = Hash::from_hex(&asset).context("invalid asset id")?;
+            let amount: u128 = amount.parse().context("amount must be an integer of bridged units")?;
+            let bridge_fee: u128 = bridge_fee.parse().context("bridge fee must be an integer of bridged units")?;
+            let to = shrugg_client::hex32(&to).context("invalid destination")?;
+            // Screened here as well as in `RpcClient::bridge_burn`, so a
+            // typo is caught before any network round trip: a burn cannot
+            // be undone once it is signed and committed.
+            shrugg_client::check_burn_recipient(&to, to_chain).context("invalid destination")?;
+            let fee = parse_amount(&fee)?;
+            let hash = rpc.bridge_burn(&kp, asset, amount, to_chain, to, bridge_fee, fee).await?;
+            println!("submitted burn {hash}\n  {amount} units of {asset} to chain {to_chain}, relayer fee {bridge_fee} units");
+            let r = rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await?;
+            println!("committed in block {} (index {})", r.height, r.index);
+            let sequence = rpc.bridge_state().await?["burn_sequence"].as_u64().unwrap_or(0).saturating_sub(1);
+            match rpc.bridge_burn_record(sequence).await? {
+                Some(v) => println!("outbound message (sequence {sequence}):\n{}", pretty(&v)),
+                None => println!("outbound message not readable yet; try `shrugg bridge-status`"),
+            }
+        }
+        Cmd::AssetBalance { first, second } => {
+            let (addr, asset) = match second {
+                Some(asset) => (Address::from_base58(&first).context("invalid address")?, asset),
+                None => (load_key(&cli.key)?.address(), first),
+            };
+            let asset = Hash::from_hex(&asset).context("invalid asset id")?;
+            println!("{}", rpc.asset_balance(&addr, &asset).await?);
+        }
+        Cmd::BridgeStatus => {
+            let v = rpc.bridge_state().await?;
+            if v["enabled"].as_bool() != Some(true) {
+                println!("this chain has no bridge");
+            } else {
+                println!("{}", pretty(&v));
+            }
         }
         Cmd::Program(ProgramCmd::Build { guest, args, out }) => {
             let p = build_guest(&guest, &args)?;
@@ -291,4 +441,56 @@ async fn main() -> Result<()> {
         Cmd::Validators => println!("{}", pretty(&rpc.validators().await?)),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_attestation;
+    use std::io::Write;
+
+    fn file(bytes: &[u8]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("att");
+        std::fs::File::create(&path).unwrap().write_all(bytes).unwrap();
+        let arg = format!("@{}", path.display());
+        (dir, arg)
+    }
+
+    #[test]
+    fn inline_hex_is_read_with_or_without_the_prefix() {
+        assert_eq!(read_attestation("0a0b0c").unwrap(), vec![0x0a, 0x0b, 0x0c]);
+        assert_eq!(read_attestation("0x0a0b0c").unwrap(), vec![0x0a, 0x0b, 0x0c]);
+        // Odd digits are hex-shaped but not bytes.
+        assert!(read_attestation("0a0").is_err());
+    }
+
+    #[test]
+    fn a_hex_file_is_accepted_however_it_is_wrapped() {
+        // The docs promise a hex file works; a dump wrapped across lines is
+        // still hex, and must not be mistaken for raw bytes.
+        let (_d, arg) = file(b"0x0a0b\n0c0d\n  0e0f\n");
+        assert_eq!(read_attestation(&arg).unwrap(), vec![0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
+    }
+
+    #[test]
+    fn a_non_hex_file_is_taken_as_raw_bytes() {
+        let raw = [0x00u8, 0xff, 0x10, 0x99, 0xfe];
+        let (_d, arg) = file(&raw);
+        assert_eq!(read_attestation(&arg).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn empty_input_is_rejected_with_a_clear_error() {
+        // An empty attestation would otherwise reach the node as zero bytes
+        // and fail there with a much less useful message.
+        for arg in ["", "   ", "0x"] {
+            let e = read_attestation(arg).unwrap_err().to_string();
+            assert!(e.contains("empty"), "{arg:?}: {e}");
+        }
+        for body in [b"".as_slice(), b"  \n\t\n".as_slice()] {
+            let (_d, arg) = file(body);
+            let e = read_attestation(&arg).unwrap_err().to_string();
+            assert!(e.contains("empty"), "{e}");
+        }
+    }
 }

@@ -1,5 +1,6 @@
 //! Transactions: signed, nonce-ordered operations on the SHRUGG ledger.
 
+use crate::bridge::AssetId;
 use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
 use crate::program::ProgramId;
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,15 @@ pub enum TxKind {
     /// eight public outputs carried in the proof. `recipients` is the public list the outputs may
     /// pick a transfer target from (see `effect`).
     Call { program: ProgramId, proof: Vec<u8>, recipients: Vec<Address> },
+    /// Redeem a guardian-signed bridge attestation: mint the attested transfer or
+    /// rotate the guardian set. Anyone may submit one; the submitter keeps the
+    /// attestation's bridge fee. Only valid on chains whose genesis enables the bridge.
+    ///
+    /// Appended after `Call` (tag 4): existing tags 0..3 keep their encoding.
+    BridgeAttest { attestation: Vec<u8> },
+    /// Burn `amount` of a bridged asset and post an outbound message for the
+    /// guardians to sign, releasing on `to_chain` to `to`. Tag 5.
+    BridgeBurn { asset: AssetId, amount: u128, to_chain: u16, to: [u8; 32], fee: u128 },
 }
 
 /// The signed part of a transaction.
@@ -130,6 +140,37 @@ impl Transaction {
         Transaction::sign(TxBody { chain_id, from: key.public_key().clone(), nonce, fee, kind: TxKind::Call { program, proof, recipients } }, key)
     }
 
+    pub fn bridge_attest(key: &Keypair, chain_id: u64, nonce: u64, attestation: Vec<u8>, fee: u128) -> Transaction {
+        Transaction::sign(
+            TxBody { chain_id, from: key.public_key().clone(), nonce, fee, kind: TxKind::BridgeAttest { attestation } },
+            key,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bridge_burn(
+        key: &Keypair,
+        chain_id: u64,
+        nonce: u64,
+        asset: AssetId,
+        amount: u128,
+        to_chain: u16,
+        to: [u8; 32],
+        bridge_fee: u128,
+        fee: u128,
+    ) -> Transaction {
+        Transaction::sign(
+            TxBody {
+                chain_id,
+                from: key.public_key().clone(),
+                nonce,
+                fee,
+                kind: TxKind::BridgeBurn { asset, amount, to_chain, to, fee: bridge_fee },
+            },
+            key,
+        )
+    }
+
     /// Wire size, used for block byte accounting.
     pub fn encoded_len(&self) -> usize {
         self.encode().len()
@@ -160,7 +201,12 @@ impl Transaction {
     pub fn total_cost(&self) -> Option<u128> {
         match &self.body.kind {
             TxKind::Transfer { amount, .. } => amount.checked_add(self.body.fee),
-            TxKind::Mint { .. } | TxKind::Deploy { .. } | TxKind::Call { .. } => Some(self.body.fee),
+            // Bridge kinds move bridged assets, not SHRUGG: only the fee is debited.
+            TxKind::Mint { .. }
+            | TxKind::Deploy { .. }
+            | TxKind::Call { .. }
+            | TxKind::BridgeAttest { .. }
+            | TxKind::BridgeBurn { .. } => Some(self.body.fee),
         }
     }
 }
@@ -219,6 +265,38 @@ mod tests {
         assert_eq!(Transaction::decode(&c.encode()).unwrap(), c);
         assert_eq!(c.total_cost(), Some(7));
         assert!(c.encoded_len() > 2420 + 1312);
+    }
+
+    #[test]
+    fn bridge_kinds_are_tags_four_and_five_and_cost_only_the_fee() {
+        let k = key(1);
+        let attest = Transaction::bridge_attest(&k, 1, 0, vec![1, 2, 3], 9);
+        assert!(attest.verify_signature());
+        assert_eq!(Transaction::decode(&attest.encode()).unwrap(), attest);
+        assert_eq!(attest.total_cost(), Some(9));
+        let burn = Transaction::bridge_burn(&k, 1, 1, Hash::digest(b"asset"), 500, 2, [7; 32], 5, 11);
+        assert!(burn.verify_signature());
+        assert_eq!(Transaction::decode(&burn.encode()).unwrap(), burn);
+        assert_eq!(burn.total_cost(), Some(11));
+        // Tags are appended after Call, so tags 0..3 keep their bincode encoding.
+        let tag = |kind: &TxKind| bincode::serialize(kind).unwrap()[..4].to_vec();
+        assert_eq!(tag(&TxKind::Transfer { to: key(2).address(), amount: 1 }), vec![0, 0, 0, 0]);
+        assert_eq!(tag(&TxKind::Mint { to: key(2).address(), amount: 1 }), vec![1, 0, 0, 0]);
+        assert_eq!(tag(&TxKind::Deploy { base_pc: 0, words: vec![] }), vec![2, 0, 0, 0]);
+        assert_eq!(
+            tag(&TxKind::Call { program: Hash::ZERO, proof: vec![], recipients: vec![] }),
+            vec![3, 0, 0, 0]
+        );
+        assert_eq!(tag(&TxKind::BridgeAttest { attestation: vec![] }), vec![4, 0, 0, 0]);
+        assert_eq!(
+            tag(&TxKind::BridgeBurn { asset: Hash::ZERO, amount: 1, to_chain: 2, to: [0; 32], fee: 0 }),
+            vec![5, 0, 0, 0]
+        );
+        // AssetId, u16 and [u8; 32] carry their plain bytes in the burn encoding.
+        let burn_kind = TxKind::BridgeBurn { asset: Hash([0xab; 32]), amount: 1, to_chain: 2, to: [0xcd; 32], fee: 3 };
+        let bytes = bincode::serialize(&burn_kind).unwrap();
+        assert_eq!(bytes.len(), 4 + 32 + 16 + 2 + 32 + 16);
+        assert_eq!(&bytes[4..36], &[0xab; 32]);
     }
 
     #[test]

@@ -11,6 +11,8 @@ curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
 Conventions:
 
 - Addresses are base58 strings (32 bytes). Hashes are 64 hex characters, with or without `0x`.
+- Bridge hex fields (asset ids, emitters, guardian keys, token addresses, message bodies) are
+  lowercase hex without a `0x` prefix in results; parameters accept either form.
 - Amounts are strings of smallest units (`"1500000000"` = 1.5 SHRUGG); 1 SHRUGG = 10^9 units.
 - Heights, nonces and views are JSON integers.
 - `shrugg_client::RpcClient` (Rust) wraps every method below.
@@ -88,7 +90,9 @@ Params: `[hash]`. Result: `null` until committed, then:
 ```
 Other kinds: `{ "type": "mint", "to", "amount" }`,
 `{ "type": "deploy", "base_pc", "words_len", "program" }`,
-`{ "type": "call", "program", "proof_len", "recipients": [...] }`.
+`{ "type": "call", "program", "proof_len", "recipients": [...] }`,
+`{ "type": "bridge_attest", "attestation": "<hex>" }`,
+`{ "type": "bridge_burn", "asset", "amount", "to_chain", "to", "fee" }`.
 
 ### `shrugg_getBlockByHeight` / `shrugg_getBlockByHash`
 Params: `[height]` (integer) or `[hash]`. Result: `null` if unknown, else:
@@ -124,6 +128,54 @@ any peer has advertised.
 ### `shrugg_getPeers`
 Params: `[]`. Result: array of `{ "peer_id": "12D3KooW...", "addrs": ["/ip4/…/tcp/30303"], "connected_secs": 1241 }`.
 
+### `shrugg_getAssetBalance`
+Params: `[address, asset]` where `asset` is the 64-hex asset id. Result: balance as a string of
+bridged units (8 decimals, not SHRUGG's 9). `"0"` for an unknown asset, an address that never held
+it, or a chain without a bridge.
+
+### `shrugg_getAssets`
+Params: `[address]`. Result: every bridged asset the address holds a non-zero balance of:
+```json
+[ { "asset": "8f1c...", "token_chain": 2,
+    "token_address": "000000000000000000000000f10befe1e0794722d3baf8bfd5bdac47b2a33148",
+    "balance": "99999000" } ]
+```
+Empty on a chain without a bridge.
+
+### `shrugg_getBridgeState`
+Params: `[]`. Result on a bridged chain:
+```json
+{
+  "enabled": true,
+  "emitter": "65dc6def...",
+  "emitters": { "2": "0000...7be73b64", "3": "0000...869f41c8" },
+  "guardian_set_index": 0,
+  "guardians": ["7e5f4552091a69125d5dfcb7b8c2659029395bdf", "..."],
+  "burn_sequence": 3,
+  "assets": [ { "asset": "8f1c...", "token_chain": 2, "token_address": "0000...33148" } ]
+}
+```
+`emitter` is the Rand emitter address stamped into outbound burn messages; `emitters` maps each
+source chain id to the contract address allowed to emit transfers into this chain; `guardians` are
+the 20-byte keys of the current set, in index order; `assets` is the registry, which grows the first
+time each token is bridged in. On a chain without a bridge the result is exactly
+`{ "enabled": false }`.
+
+### `shrugg_getBridgeBurn`
+Params: `[sequence]` (integer). Result: `null` until that sequence exists, then
+```json
+{ "sequence": 0, "body_hex": "…", "digest": "…", "tx": "…", "height": 42 }
+```
+`body_hex` is the encoded Section 3.2 body of the outbound message and `digest` is
+`keccak256(keccak256(body))` — what guardians sign so a source-chain contract will release. The
+sequence of the newest message is `burn_sequence - 1` from `shrugg_getBridgeState`.
+
+### `shrugg_bridgeAssetId`
+Params: `[token_chain, token_address]` where `token_address` is 32 bytes of hex (20-byte EVM and
+Tron addresses left-padded with zeros). Result: the asset id hex,
+`blake3("shrugg-bridge-asset" || token_chain BE u16 || token_address)`. A pure function of its
+arguments, so it answers on any chain, bridge or not.
+
 ### `shrugg_getValidators`
 Params: `[]`. Result: array of `{ "address": "…", "stake": "100000" }` in leader-rotation order
 (sorted by address). The leader of view `v` is entry `v mod n`.
@@ -151,6 +203,8 @@ TxKind::Transfer { to: Address(32 bytes), amount: u128 }
 TxKind::Mint { to: Address, amount: u128 }                                      // testnet faucet only
 TxKind::Deploy { base_pc: u32, words: Vec<u32> }
 TxKind::Call { program: Hash, proof: Vec<u8>, recipients: Vec<Address> }        // proof = postcard(rand_zkvm::Proof)
+TxKind::BridgeAttest { attestation: Vec<u8> }                                   // bridged chains only
+TxKind::BridgeBurn { asset: Hash, amount: u128, to_chain: u16, to: [u8; 32], fee: u128 }
 ```
 
 Use `shrugg_core::Transaction::transfer(&keypair, chain_id, nonce, to, amount, fee)` from Rust; the

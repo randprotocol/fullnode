@@ -23,12 +23,27 @@ impl KeyFile {
 
     pub fn write(&self, path: &Path) -> Result<()> {
         let s = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, s).with_context(|| format!("writing {}", path.display()))?;
+        // Create with owner-only permissions from the start: writing first and
+        // chmodding afterwards leaves the seed world-readable for a window.
         #[cfg(unix)]
         {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("writing {}", path.display()))?;
+            f.write_all(s.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
+            // The mode above only applies to newly created files; tighten a
+            // pre-existing file's permissions too.
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
+        #[cfg(not(unix))]
+        std::fs::write(path, s).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 

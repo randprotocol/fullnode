@@ -91,6 +91,14 @@ pub enum Action {
     PersistSafety(SafetyState),
 }
 
+/// How far ahead of a replica's own clock a proposal's timestamp may be.
+///
+/// Only enforced on chains with a bridge, where the block timestamp is
+/// consensus input (guardian-set expiry): without a bound a leader could jump
+/// forward and expire a live guardian set. Loose enough to tolerate ordinary
+/// clock drift between validators.
+pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
+
 #[derive(Clone, Debug)]
 pub struct ConsensusConfig {
     pub chain_id: u64,
@@ -100,6 +108,10 @@ pub struct ConsensusConfig {
     pub max_timeout: Duration,
     /// Cap on buffered blocks whose parent is unknown.
     pub max_orphans: usize,
+    /// Cap on blocks held in the speculative tree (committed head plus
+    /// uncommitted blocks). Each entry carries a full ledger clone, so an
+    /// uncapped tree is a memory-exhaustion vector.
+    pub max_tree_blocks: usize,
 }
 
 impl ConsensusConfig {
@@ -111,6 +123,7 @@ impl ConsensusConfig {
             base_timeout: Duration::from_secs(1),
             max_timeout: Duration::from_secs(8),
             max_orphans: 256,
+            max_tree_blocks: 512,
         }
     }
 }
@@ -145,4 +158,12 @@ pub enum ConsensusError {
     NotLeader,
     #[error("not ready to propose")]
     NotReady,
+    /// Bridged chains only: the proposal's timestamp is further than
+    /// [`MAX_CLOCK_SKEW_MS`] ahead of this replica's clock.
+    #[error("block timestamp {block} is more than {MAX_CLOCK_SKEW_MS} ms ahead of local time {now}")]
+    TimestampTooFarAhead { block: u64, now: u64 },
+    #[error("view {view} is implausibly far ahead of the current view")]
+    ViewOutOfRange { view: u64 },
+    #[error("too many speculative blocks in memory")]
+    TreeFull,
 }

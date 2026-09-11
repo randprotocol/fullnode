@@ -1,13 +1,24 @@
 use super::{
     Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, NewView, SafetyState,
+    MAX_CLOCK_SKEW_MS,
 };
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, Keypair};
-use crate::ledger::Ledger;
+use crate::ledger::{BlockError, Ledger};
 use crate::types::{Block, BlockHeader, QuorumCertificate, Transaction, Vote};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// How far ahead of our current view an inbound message's view may be before it is
+/// rejected. Deliberately generous (days of timed-out views): the bound exists to keep
+/// `view + 1` arithmetic away from u64 overflow and to bound speculative state, not to
+/// police legitimate catch-up, which goes through block sync and `resume`.
+const MAX_VIEW_AHEAD: u64 = 1_000_000;
+/// Cap on distinct (view, block) vote collections kept while leading.
+const MAX_PENDING_VOTE_KEYS: usize = 4096;
+/// Cap on distinct views with buffered NewView messages.
+const MAX_NEW_VIEW_KEYS: usize = 2048;
 
 struct Entry {
     block: Block,
@@ -73,16 +84,20 @@ impl HotStuff {
         if let Some(s) = &signer {
             assert!(cfg.validators.contains(&s.address()), "signer must be a validator");
         }
+        // A loaded ledger carries no block time; bridge validation against the
+        // tip would then see `now = 0` and treat every guardian set as fresh.
+        let mut head_ledger = head_ledger;
+        head_ledger.set_timestamp_ms(head.header.timestamp_ms);
         let head_hash = head.hash();
         let head_height = head.height();
         let mut tree = HashMap::new();
         tree.insert(head_hash, Entry { block: head, ledger_after: head_ledger.clone(), receipts: Vec::new() });
         let (view, high_qc, locked_qc, last_voted_view) = match safety {
             Some(s) => {
-                let view = s.view.max(head_qc.view + 1);
+                let view = s.view.max(head_qc.view.saturating_add(1));
                 (view, head_qc.clone(), head_qc.clone(), s.last_voted_view)
             }
-            None => (head_qc.view + 1, head_qc.clone(), head_qc.clone(), 0),
+            None => (head_qc.view.saturating_add(1), head_qc.clone(), head_qc.clone(), 0),
         };
         HotStuff {
             cfg,
@@ -191,19 +206,24 @@ impl HotStuff {
 
     // ---- inbound -----------------------------------------------------------
 
-    pub fn on_message(&mut self, msg: ConsensusMessage) -> Result<Vec<Action>, ConsensusError> {
+    /// `now_ms` is the replica's wall clock, used only to bound how far ahead
+    /// a bridged chain's block timestamp may be (see [`MAX_CLOCK_SKEW_MS`]).
+    pub fn on_message(&mut self, msg: ConsensusMessage, now_ms: u64) -> Result<Vec<Action>, ConsensusError> {
         match msg {
-            ConsensusMessage::Proposal(b) => self.on_proposal(b),
+            ConsensusMessage::Proposal(b) => self.on_proposal(b, now_ms),
             ConsensusMessage::Vote(v) => self.on_vote(v),
             ConsensusMessage::NewView(nv) => self.on_new_view(nv),
         }
     }
 
-    pub fn on_proposal(&mut self, block: Block) -> Result<Vec<Action>, ConsensusError> {
+    pub fn on_proposal(&mut self, block: Block, now_ms: u64) -> Result<Vec<Action>, ConsensusError> {
         let mut out = Vec::new();
         let hash = block.hash();
         if self.tree.contains_key(&hash) {
             return Ok(out);
+        }
+        if block.view() > self.view.saturating_add(MAX_VIEW_AHEAD) {
+            return Err(ConsensusError::ViewOutOfRange { view: block.view() });
         }
         if block.height() <= self.committed_height {
             return Err(ConsensusError::Stale(block.height()));
@@ -234,8 +254,27 @@ impl HotStuff {
         if block.header.justify.view != parent.block.view() && !block.header.justify.is_genesis() {
             return Err(ConsensusError::BadJustify);
         }
+        // On a bridged chain the timestamp is consensus input, so it is bounded
+        // on both sides before we vote: never behind the parent (`apply_block`
+        // enforces the same rule, but rejecting here keeps an invalid proposal
+        // out of the tree without executing it), and never further than
+        // `MAX_CLOCK_SKEW_MS` ahead of this replica's clock, so a leader can
+        // neither revive an expired guardian set nor expire a live one. Chains
+        // without a bridge keep their previous validity rules exactly.
+        if parent.ledger_after.bridge().is_some() {
+            let (parent_ts, block_ts) = (parent.block.header.timestamp_ms, block.header.timestamp_ms);
+            if block_ts < parent_ts {
+                return Err(BlockError::TimestampRewind { parent: parent_ts, block: block_ts }.into());
+            }
+            if block_ts > now_ms.saturating_add(MAX_CLOCK_SKEW_MS) {
+                return Err(ConsensusError::TimestampTooFarAhead { block: block_ts, now: now_ms });
+            }
+        }
 
         // Execute on top of the parent's state.
+        if self.tree.len() >= self.cfg.max_tree_blocks {
+            return Err(ConsensusError::TreeFull);
+        }
         let mut ledger = parent.ledger_after.clone();
         let receipts = ledger.apply_block(&block, self.executor.as_ref())?;
         self.tree.insert(hash, Entry { block: block.clone(), ledger_after: ledger, receipts });
@@ -254,7 +293,7 @@ impl HotStuff {
         if let Some(children) = self.orphans.remove(&hash) {
             self.orphan_count -= children.len();
             for child in children {
-                if let Ok(more) = self.on_proposal(child) {
+                if let Ok(more) = self.on_proposal(child, now_ms) {
                     out.extend(more);
                 }
             }
@@ -268,16 +307,23 @@ impl HotStuff {
         if !self.cfg.validators.contains(&voter) {
             return Err(ConsensusError::NotValidator);
         }
-        if !self.is_leader(vote.view + 1) {
-            return Err(ConsensusError::NotLeader);
+        if vote.view > self.view.saturating_add(MAX_VIEW_AHEAD) {
+            return Err(ConsensusError::ViewOutOfRange { view: vote.view });
         }
-        if vote.view < self.high_qc.view || vote.view + 1 < self.view {
+        // Every validator collects votes and assembles QCs locally: relaying
+        // votes only through the next leader loses the QC whenever that leader
+        // is down, which breaks finality for the whole three-view pipeline.
+        if vote.view < self.high_qc.view || vote.view.saturating_add(1) < self.view {
             return Ok(out); // stale
         }
         if !vote.verify() {
             return Err(ConsensusError::BadVote);
         }
         let key = (vote.view, vote.block_hash);
+        if self.pending_votes.len() >= MAX_PENDING_VOTE_KEYS && !self.pending_votes.contains_key(&key) {
+            tracing::warn!("vote-key bookkeeping full; dropping vote for view {}", vote.view);
+            return Ok(out);
+        }
         let votes = self.pending_votes.entry(key).or_default();
         votes.insert(voter, vote);
         let stake: u128 = votes.keys().filter_map(|a| self.cfg.validators.get(a)).map(|v| v.stake).sum();
@@ -286,8 +332,8 @@ impl HotStuff {
             self.pending_votes.remove(&key);
             self.consecutive_timeouts = 0;
             self.update_high_qc(&qc, &mut out);
-            if qc.view + 1 > self.view {
-                self.enter_view(qc.view + 1, &mut out);
+            if qc.view.saturating_add(1) > self.view {
+                self.enter_view(qc.view.saturating_add(1), &mut out);
             }
             self.maybe_ready_to_propose(&mut out);
         }
@@ -302,6 +348,9 @@ impl HotStuff {
         }
         if nv.view < self.view {
             return Ok(out);
+        }
+        if nv.view > self.view.saturating_add(MAX_VIEW_AHEAD) {
+            return Err(ConsensusError::ViewOutOfRange { view: nv.view });
         }
         if !nv.verify() {
             return Err(ConsensusError::BadNewView);
@@ -321,15 +370,16 @@ impl HotStuff {
                 let mine = NewView::sign(view, self.high_qc.clone(), key);
                 out.push(Action::Broadcast(ConsensusMessage::NewView(mine.clone())));
                 if self.is_leader(view) {
-                    self.new_views.entry(view).or_default().insert(mine.sender_address(), mine);
+                    self.record_new_view(view, mine);
                 }
             }
         }
         if !self.is_leader(view) {
             return Ok(out);
         }
-        self.new_views.entry(view).or_default().insert(sender, nv);
-        let stake: u128 = self.new_views[&view]
+        self.record_new_view(view, nv);
+        let Some(collected) = self.new_views.get(&view) else { return Ok(out) };
+        let stake: u128 = collected
             .keys()
             .filter_map(|a| self.cfg.validators.get(a))
             .map(|v| v.stake)
@@ -343,6 +393,16 @@ impl HotStuff {
         Ok(out)
     }
 
+    /// Buffer a NewView for quorum counting, bounding how many distinct views
+    /// are tracked so speculative bookkeeping stays finite.
+    fn record_new_view(&mut self, view: u64, nv: NewView) {
+        if self.new_views.len() >= MAX_NEW_VIEW_KEYS && !self.new_views.contains_key(&view) {
+            tracing::warn!("new-view bookkeeping full; dropping NewView for view {view}");
+            return;
+        }
+        self.new_views.entry(view).or_default().insert(nv.sender_address(), nv);
+    }
+
     /// Pacemaker: the timer for `view` fired.
     pub fn on_timeout(&mut self, view: u64) -> Vec<Action> {
         let mut out = Vec::new();
@@ -350,7 +410,7 @@ impl HotStuff {
             return out; // stale timer
         }
         self.consecutive_timeouts += 1;
-        let next = self.view + 1;
+        let next = self.view.saturating_add(1);
         self.enter_view(next, &mut out);
         if let Some(key) = &self.signer {
             let nv = NewView::sign(next, self.high_qc.clone(), key);
@@ -364,13 +424,14 @@ impl HotStuff {
         out
     }
 
-    /// Build, sign and locally process a proposal for `view`. Invalid
-    /// transactions are skipped rather than failing the block.
+    /// Build, sign and locally process a proposal for `view` at wall-clock
+    /// `now_ms`. Invalid transactions are skipped rather than failing the
+    /// block.
     pub fn propose(
         &mut self,
         view: u64,
         candidates: Vec<Transaction>,
-        timestamp_ms: u64,
+        now_ms: u64,
     ) -> Result<Vec<Action>, ConsensusError> {
         let Some(signer) = &self.signer else { return Err(ConsensusError::NotReady) };
         if view != self.view || self.proposed_in_view || !self.is_leader(view) {
@@ -380,12 +441,23 @@ impl HotStuff {
         let Some(parent) = self.tree.get(&parent_hash) else {
             return Err(ConsensusError::UnknownParent(parent_hash));
         };
+        // Block time never moves backwards, whatever this leader's clock says:
+        // a lagging clock would otherwise produce a block its peers reject.
+        let timestamp_ms = now_ms.max(parent.block.header.timestamp_ms);
         let mut ledger = parent.ledger_after.clone();
         ledger.set_height(parent.block.height() + 1);
+        // Select against the time this block will carry, so a validator
+        // re-applying it through `apply_block` reaches the same verdict.
+        ledger.set_timestamp_ms(timestamp_ms);
         let mut txs = Vec::with_capacity(candidates.len());
         let me = signer.address();
         for tx in candidates {
-            if ledger.apply_tx(&tx, &me, self.executor.as_ref()).is_ok() {
+            // Apply on a trial clone: a transaction that fails part-way through
+            // must not leave the cumulative ledger dirty for the next candidate
+            // or for the state root committed to the header.
+            let mut trial = ledger.clone();
+            if trial.apply_tx(&tx, &me, self.executor.as_ref()).is_ok() {
+                ledger = trial;
                 txs.push(tx);
             }
         }
@@ -402,7 +474,10 @@ impl HotStuff {
         let block = Block::sign(header, txs, signer);
         self.proposed_in_view = true;
         let mut out = vec![Action::Broadcast(ConsensusMessage::Proposal(block.clone()))];
-        out.extend(self.on_proposal(block)?);
+        // The block may carry the parent's later time rather than this clock's,
+        // so feed its own time as "now": a leader never rejects the proposal it
+        // just built, and `timestamp_ms >= now_ms` makes this no weaker.
+        out.extend(self.on_proposal(block, timestamp_ms)?);
         Ok(out)
     }
 
@@ -440,7 +515,7 @@ impl HotStuff {
         if self.signer.is_none() || self.proposed_in_view || !self.is_leader(self.view) {
             return;
         }
-        let have_qc = self.high_qc.view + 1 == self.view;
+        let have_qc = self.high_qc.view.saturating_add(1) == self.view;
         let have_new_views = self
             .new_views
             .get(&self.view)
@@ -475,7 +550,17 @@ impl HotStuff {
         let b1_justify = b1.block.header.justify.clone();
         let b_hash = b1_justify.block_hash;
         let Some(b) = self.tree.get(&b_hash) else { return };
-        // parent links are enforced to equal justify links, so this is a three-chain.
+        // Chained HotStuff commit rule: the QCs certifying b, b1 and b2 must sit in
+        // three consecutive views. Parent links are already enforced to equal justify
+        // links, so this is a three-chain — but without the view check two forks can
+        // ratchet past each other's locks (each new QC's justify outranks the other's
+        // lock) and finalize conflicting blocks at the same height.
+        let qc_b = b1_justify.view;
+        let qc_b1 = b2_justify.view;
+        let qc_b2 = b_star.header.justify.view;
+        if qc_b1 != qc_b.saturating_add(1) || qc_b2 != qc_b1.saturating_add(1) {
+            return;
+        }
         let target_height = b.block.height();
         if target_height <= self.committed_height {
             return;
@@ -570,14 +655,14 @@ impl HotStuff {
         self.last_voted_view = block.view();
         out.push(Action::PersistSafety(self.safety_state()));
         let vote = Vote::sign(block.view(), block.hash(), signer);
-        let next_leader = self.leader(block.view() + 1);
-        if Some(next_leader) == self.address() {
-            if let Ok(more) = self.on_vote(vote) {
-                out.extend(more);
-            }
-        } else {
-            out.push(Action::SendTo(next_leader, ConsensusMessage::Vote(vote)));
+        // Votes are broadcast and every validator assembles the QC locally
+        // (see `on_vote`). Relaying only to the next leader would strand the
+        // QC — and the finality pipeline behind it — whenever that leader is
+        // unreachable. Count our own vote immediately.
+        if let Ok(more) = self.on_vote(vote.clone()) {
+            out.extend(more);
         }
+        out.push(Action::Broadcast(ConsensusMessage::Vote(vote)));
     }
 
     /// Buffer a block whose parent is unknown. The caller receives

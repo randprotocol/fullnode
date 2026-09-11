@@ -65,6 +65,24 @@ impl Mempool {
         }
         let sender = tx.sender();
         let current = ledger.nonce(&sender);
+        if tx.body.nonce < current {
+            return Err(MempoolError::Invalid(TxError::BadNonce { expected: current, actual: tx.body.nonce }));
+        }
+        if tx.body.nonce >= current + self.max_per_sender {
+            return Err(MempoolError::NonceGap { nonce: tx.body.nonce, current });
+        }
+        // Cheap admission decisions first: the probe below clones the whole
+        // ledger and validates (signature, possibly a ~20 ms STARK verify), so
+        // duplicates/full-pool/underpriced replacements must be rejected here,
+        // not after paying that cost for every gossiped transaction.
+        let replacing = self.by_sender.get(&sender).and_then(|slot| slot.get(&tx.body.nonce)).copied();
+        if let Some(existing) = replacing {
+            if tx.body.fee <= self.txs[&existing].body.fee {
+                return Err(MempoolError::ReplacementUnderpriced);
+            }
+        } else if self.txs.len() >= self.max_size {
+            return Err(MempoolError::Full);
+        }
         // Validate everything except the exact nonce match: probe against a copy of the
         // full state (accounts, programs, flags) with only this sender's nonce adjusted.
         let mut probe = ledger.clone();
@@ -73,24 +91,12 @@ impl Mempool {
             adjusted.nonce = tx.body.nonce;
             probe.set_account(sender, adjusted);
         }
-        if tx.body.nonce < current {
-            return Err(MempoolError::Invalid(TxError::BadNonce { expected: current, actual: tx.body.nonce }));
-        }
-        if tx.body.nonce >= current + self.max_per_sender {
-            return Err(MempoolError::NonceGap { nonce: tx.body.nonce, current });
-        }
         probe.validate(&tx, executor).map_err(MempoolError::Invalid)?;
 
         let slot = self.by_sender.entry(sender).or_default();
-        if let Some(existing) = slot.get(&tx.body.nonce).copied() {
-            let old_fee = self.txs[&existing].body.fee;
-            if tx.body.fee <= old_fee {
-                return Err(MempoolError::ReplacementUnderpriced);
-            }
+        if let Some(existing) = replacing {
             self.txs.remove(&existing);
             slot.remove(&tx.body.nonce);
-        } else if self.txs.len() >= self.max_size {
-            return Err(MempoolError::Full);
         }
         slot.insert(tx.body.nonce, hash);
         self.txs.insert(hash, tx);

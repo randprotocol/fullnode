@@ -27,6 +27,7 @@ fn genesis(validators: &[Keypair], funded: &[Keypair]) -> Genesis {
         faucet: true,
         confidential: true,
         fri_profile: "test".into(),
+        bridge: None,
     }
 }
 
@@ -510,4 +511,122 @@ async fn confidential_call_moves_funds_on_every_node() {
     assert!(n3.handle.storage.receipt(&ctx).unwrap().is_some());
     wait_caught_up(&n3, &[&n0, &n1, &n2], Duration::from_secs(60)).await;
     assert_chains_equal(&[&n0, &n1, &n2, &n3], &ks);
+}
+
+// ---------------------------------------------------------------------------
+// Bridge
+// ---------------------------------------------------------------------------
+
+/// The shared attestation vectors (Task B1), the same file `shrugg-core`
+/// compiles in, so a cluster mints against exactly the bytes the contracts on
+/// the other chains are tested with.
+fn vectors() -> serde_json::Value {
+    serde_json::from_str(include_str!("../../shrugg-core/src/bridge/vectors.json")).expect("vectors.json parses")
+}
+
+fn hex32(v: &serde_json::Value) -> [u8; 32] {
+    hex::decode(v.as_str().expect("hex string")).expect("hex").try_into().expect("32 bytes")
+}
+
+/// `genesis`, plus a `bridge` section built from the vectors' guardians, Rand
+/// emitter, and source-chain emitter table.
+fn bridged_genesis(validators: &[Keypair], funded: &[Keypair]) -> Genesis {
+    let file = vectors();
+    let guardians = file["guardians"]
+        .as_array()
+        .expect("guardians")
+        .iter()
+        .map(|g| hex::decode(g["address"].as_str().expect("address")).expect("hex").try_into().expect("20 bytes"))
+        .collect();
+    let emitters = file["emitters"]
+        .as_object()
+        .expect("emitters")
+        .iter()
+        .map(|(chain, addr)| (chain.parse().expect("chain id"), hex32(addr)))
+        .collect();
+    let bridge = shrugg_core::bridge::BridgeConfig { emitter: hex32(&file["rand_emitter"]), guardians, emitters };
+    Genesis { bridge: Some(bridge), ..genesis(validators, funded) }
+}
+
+/// A vector by name, as `(attestation bytes, payload)`.
+fn vector(name: &str) -> (Vec<u8>, serde_json::Value) {
+    let file = vectors();
+    let v = file["vectors"]
+        .as_array()
+        .expect("vectors")
+        .iter()
+        .find(|v| v["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("no vector named {name}"))
+        .clone();
+    (hex::decode(v["attestation"].as_str().expect("attestation")).expect("hex"), v["payload"].clone())
+}
+
+/// Mint a bridged asset from a shared vector through RPC and see it on every
+/// node, then across a restart — the storage round trip end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge_mint_reaches_every_node() {
+    init_tracing();
+    let ks = keys(2);
+    let gen = bridged_genesis(&ks, &ks);
+    let a = start_node(&ks[0], &gen, vec![], true).await;
+    let boot = vec![bootstrap_addr(&a)];
+    let b = start_node(&ks[1], &gen, boot.clone(), true).await;
+    wait_height(&[&a, &b], 2, Duration::from_secs(40)).await;
+
+    // `transfer_eth_usdt_6dp_ok`: 100000000 units of an Ethereum token, of
+    // which 1000 is the bridge fee, to the recipient in the payload. Guardian
+    // set 0 never expires, so the cluster's wall-clock block time is fine.
+    let (attestation, payload) = vector("transfer_eth_usdt_6dp_ok");
+    let token = hex32(&payload["token_address"]);
+    let asset = shrugg_core::bridge::asset_id(payload["token_chain"].as_u64().unwrap() as u16, &token);
+    let recipient = Address(hex32(&payload["to"]));
+    let amount: u128 = payload["amount"].as_str().unwrap().parse().unwrap();
+    let fee: u128 = payload["fee"].as_str().unwrap().parse().unwrap();
+    let net = amount - fee;
+
+    // The bridge is enabled and empty before the mint.
+    let state = a.rpc.bridge_state().await.unwrap();
+    assert_eq!(state["enabled"], true);
+    assert_eq!(state["guardians"].as_array().unwrap().len(), 6);
+    assert_eq!(state["burn_sequence"], 0);
+    assert_eq!(state["assets"], serde_json::json!([]));
+    assert_eq!(a.rpc.asset_balance(&recipient, &asset).await.unwrap(), 0);
+    // The node computes the same asset id the test does.
+    assert_eq!(b.rpc.bridge_asset_id(2, &token).await.unwrap(), asset);
+
+    // Submitted to B by validator 0, which keeps the bridge fee.
+    let submitter = ks[0].address();
+    let hash = b.rpc.bridge_attest(&ks[0], attestation.clone(), 1_000).await.expect("attestation accepted");
+    b.rpc.wait_for_transaction(&hash, Duration::from_secs(30)).await.unwrap();
+    for n in [&a, &b] {
+        wait_for("mint visible on every node", Duration::from_secs(30), || {
+            n.handle.storage.asset_balance(&asset, &recipient).unwrap() == net
+        })
+        .await;
+        assert_eq!(n.rpc.asset_balance(&recipient, &asset).await.unwrap(), net);
+        assert_eq!(n.rpc.asset_balance(&submitter, &asset).await.unwrap(), fee);
+        let holdings = n.rpc.assets(&recipient).await.unwrap();
+        assert_eq!(holdings.len(), 1);
+        assert_eq!((holdings[0].asset, holdings[0].token_chain, holdings[0].balance), (asset, 2, net));
+        // The asset is now registered chain-wide.
+        assert_eq!(n.rpc.bridge_state().await.unwrap()["assets"].as_array().unwrap().len(), 1);
+    }
+
+    // Replaying the same attestation is rejected before it reaches a block.
+    let err = a.rpc.bridge_attest(&ks[0], attestation, 1_000).await.unwrap_err().to_string();
+    assert!(err.contains("already consumed"), "{err}");
+    assert_chains_equal(&[&a, &b], &ks);
+
+    // Restart B: the bridged balances must come back from storage, not from a
+    // replay of the genesis section.
+    let head_before = b.handle.storage.head().unwrap().height;
+    let dir = stop(b).await;
+    let b = start_in(dir, &ks[1], boot.clone(), true).await;
+    assert!(b.handle.storage.head().unwrap().height >= head_before, "restart lost blocks");
+    assert_eq!(b.handle.storage.asset_balance(&asset, &recipient).unwrap(), net);
+    assert_eq!(b.rpc.asset_balance(&recipient, &asset).await.unwrap(), net);
+    assert_eq!(b.rpc.asset_balance(&submitter, &asset).await.unwrap(), fee);
+    assert_eq!(b.rpc.bridge_state().await.unwrap()["assets"].as_array().unwrap().len(), 1);
+    wait_caught_up(&b, &[&a], Duration::from_secs(60)).await;
+    assert_chains_equal(&[&a, &b], &ks);
 }

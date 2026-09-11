@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/shrugg-core", "crates/shrugg-zkvm", "crates/shrugg-client", "crates/shrugg-node"]
+members = ["crates/shrugg-core", "crates/shrugg-zkvm", "crates/shrugg-client", "crates/shrugg-node", "crates/bridge-codec"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ authors = ["RandProtocol Contributors"]
 shrugg-core = { path = "crates/shrugg-core" }
 shrugg-client = { path = "crates/shrugg-client" }
 shrugg-zkvm = { path = "crates/shrugg-zkvm" }
+bridge-codec = { path = "crates/bridge-codec" }
 
 # crypto
 crystals-dilithium = "2.0"
@@ -19,6 +20,8 @@ blake3 = "1.8"
 bs58 = "0.5"
 rand = "0.8"
 zeroize = "1"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
 
 # serialization
 serde = { version = "1.0", features = ["derive"] }

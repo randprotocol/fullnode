@@ -28,3 +28,6 @@ default = []
 cuda = ["shrugg-zkvm/cuda"]
 # The same `--cuda` path with the kernels running on the host mock driver: no GPU, no toolkit.
 mock-cuda = ["shrugg-zkvm/mock-cuda"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

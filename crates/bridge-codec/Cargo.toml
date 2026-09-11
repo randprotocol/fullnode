@@ -1,0 +1,9 @@
+[package]
+name = "bridge-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Rand bridge attestation wire format (no_std, no dependencies)"
+
+[dependencies]

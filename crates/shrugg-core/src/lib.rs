@@ -1,6 +1,7 @@
 //! SHRUGG chain core: cryptography, types, ledger, and HotStuff consensus.
 //! Pure logic with no I/O so it can be tested deterministically.
 
+pub mod bridge;
 pub mod confidential;
 pub mod consensus;
 pub mod crypto;
