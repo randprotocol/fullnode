@@ -77,6 +77,8 @@ pub enum TxError {
     BadDigest,
     #[error("invalid bundle proof: {0}")]
     InvalidBundleProof(ConfidentialError),
+    #[error("proposer {0} is not in the validator register")]
+    UnknownProposer(Address),
     #[error("arithmetic overflow")]
     Overflow,
 }
@@ -267,11 +269,11 @@ impl Ledger {
         &self.anchors
     }
 
-    /// A bundle may anchor to any root in the window, or to the root the tree holds right now —
-    /// the state left by earlier transactions of the block being built is a real root of the
-    /// same append-only tree, and every replica re-applying the block in order reaches it.
+    /// Spec §7 item 4: only a recorded block-end root is an anchor. A root the tree passes
+    /// through mid-block is never one, so what a prover may anchor to is exactly what a synced
+    /// node can enumerate.
     pub fn is_anchor(&self, root: &Word8) -> bool {
-        *root == self.tree.root() || self.anchors.iter().any(|(_, r)| r == root)
+        self.anchors.iter().any(|(_, r)| r == root)
     }
 
     pub fn nullifiers(&self) -> &BTreeSet<Word8> {
@@ -473,6 +475,12 @@ impl Ledger {
     ) -> Result<Option<CallReceiptData>, TxError> {
         let outcome = self.validate_inner(tx, executor)?;
         if let Some(b) = &tx.bundle {
+            // Everything that can still fail is resolved before the first mutation, so a
+            // rejected transaction leaves the ledger byte-identical. In practice the proposer
+            // is always in the register — `apply_block` rejects a block whose proposer is not,
+            // and `HotStuff::propose` runs only when this node is the leader.
+            let entry = self.validators.get(proposer).ok_or(TxError::UnknownProposer(*proposer))?;
+            let rewards = entry.rewards.checked_add(b.fee).ok_or(TxError::Overflow)?;
             for nf in &b.nullifiers {
                 self.nullifiers.insert(*nf);
             }
@@ -480,10 +488,7 @@ impl Ledger {
                 self.commitments.insert(*cm);
                 self.tree.append(*cm, executor);
             }
-            // The proposer is always a validator: `apply_block` rejects a block whose proposer
-            // is not one, and `HotStuff::propose` runs only when this node is the leader.
-            let entry = self.validators.get_mut(proposer).ok_or(TxError::Overflow)?;
-            entry.rewards = entry.rewards.checked_add(b.fee).ok_or(TxError::Overflow)?;
+            self.validators.get_mut(proposer).expect("looked up above").rewards = rewards;
         }
         let mut receipt = None;
         match &tx.action {
@@ -625,7 +630,7 @@ mod tests {
     use crate::confidential::StubExecutor;
     use crate::crypto::Keypair;
     use crate::notes::Envelope;
-    use crate::types::{Validator, ValidatorSet};
+    use crate::types::{BlockHeader, QuorumCertificate, Validator, ValidatorSet};
 
     const HC: Word8 = [11; 8];
 
@@ -670,6 +675,30 @@ mod tests {
 
     fn tx(l: &Ledger, nfs: [Word8; 2], cms: [Word8; 2]) -> Transaction {
         Transaction::shielded(7, bundle(l, nfs, cms, gas::BUNDLE_BASE), Action::None)
+    }
+
+    /// A block signed by `key`, carrying `state_root` verbatim so a test can commit to a wrong one.
+    fn signed_block(txs: Vec<Transaction>, key: &Keypair, height: u64, state_root: Hash) -> Block {
+        let header = BlockHeader {
+            height,
+            view: height,
+            parent: Hash::ZERO,
+            proposer: key.public_key().clone(),
+            timestamp_ms: 0,
+            tx_root: Block::tx_root(&txs),
+            state_root,
+            justify: QuorumCertificate::genesis(Hash::ZERO),
+        };
+        Block::sign(header, txs, key)
+    }
+
+    /// The state root `txs` leave behind when `proposer` applies them as block `height`.
+    fn root_after(l: &Ledger, txs: &[Transaction], proposer: &Address, height: u64) -> Hash {
+        let mut scratch = l.clone();
+        scratch.set_height(height);
+        scratch.apply_transactions(txs, proposer, &StubExecutor).unwrap();
+        scratch.record_anchor(height);
+        scratch.state_root()
     }
 
     #[test]
@@ -743,6 +772,7 @@ mod tests {
         );
         // existing commitment
         l.apply_tx(&tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]), &a.address(), &StubExecutor).unwrap();
+        l.record_anchor(l.height()); // the block ends; its root becomes the anchor the next tx uses
         assert_eq!(
             l.validate(&tx(&l, [[5; 8], [6; 8]], [[3; 8], [7; 8]]), &StubExecutor),
             Err(TxError::CommitmentExists([3; 8]))
@@ -779,7 +809,54 @@ mod tests {
         }
         assert_eq!(l.anchors().len(), ANCHOR_WINDOW);
         assert!(!l.is_anchor(&genesis_root), "the genesis root scrolled out after 64 blocks");
-        assert!(l.is_anchor(&l.root()));
+        assert_eq!(l.anchors().back(), Some(&(ANCHOR_WINDOW as u64, l.root())), "the last block's end root");
+        // A root the tree only passes through is not an anchor: apply one more block's worth of
+        // notes without closing the block, and a bundle anchored at the live root is rejected.
+        l.set_height(ANCHOR_WINDOW as u64 + 1);
+        l.apply_tx(&tx(&l, [[90; 8], [91; 8]], [[92; 8], [93; 8]]), &a.address(), &StubExecutor).unwrap();
+        assert!(!l.is_anchor(&l.root()), "a mid-block root is not an anchor");
+        assert_eq!(
+            l.validate(&tx(&l, [[94; 8], [95; 8]], [[96; 8], [97; 8]]), &StubExecutor),
+            Err(TxError::UnknownAnchor)
+        );
+    }
+
+    #[test]
+    fn apply_block_records_the_block_end_anchor_and_rejects_an_unknown_proposer() {
+        let mut l = ledger();
+        let (a, _) = keys();
+        let t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let good = signed_block(vec![t], &a, 1, root_after(&l, &[tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]])], &a.address(), 1));
+        assert_eq!(l.apply_block(&good, &StubExecutor).unwrap(), Vec::new());
+        assert!(l.is_spent(&[1; 8]) && l.has_commitment(&[3; 8]));
+        assert_eq!(l.anchors().back(), Some(&(1, l.root())), "the block-end root is recorded");
+        // ... and the bundle fee reached the proposer's register entry.
+        assert_eq!(l.validators()[&a.address()].rewards, gas::BUNDLE_BASE);
+        // A block signed by a key outside the register is rejected before any execution.
+        let stranger = Keypair::from_seed([9; 32]).unwrap();
+        let bad = signed_block(Vec::new(), &stranger, 2, Hash::ZERO);
+        assert_eq!(
+            l.apply_block(&bad, &StubExecutor),
+            Err(BlockError::UnknownProposer(stranger.address()))
+        );
+        // A header committing to the wrong state leaves the ledger untouched.
+        let before = l.clone();
+        let wrong = signed_block(Vec::new(), &a, 2, Hash::ZERO);
+        assert!(matches!(l.apply_block(&wrong, &StubExecutor), Err(BlockError::StateRootMismatch { .. })));
+        assert_eq!(l, before, "unchanged on error");
+        // An empty block still closes with its own anchor.
+        let empty = signed_block(Vec::new(), &a, 2, root_after(&l, &[], &a.address(), 2));
+        l.apply_block(&empty, &StubExecutor).unwrap();
+        assert_eq!(l.anchors().back(), Some(&(2, l.root())));
+        // The same rule one level down: a fee has nowhere to go if the proposer is not in the
+        // register, and the rejected transaction leaves nothing behind.
+        let before = l.clone();
+        let orphan = tx(&l, [[70; 8], [71; 8]], [[72; 8], [73; 8]]);
+        assert_eq!(
+            l.apply_tx(&orphan, &stranger.address(), &StubExecutor),
+            Err(TxError::UnknownProposer(stranger.address()))
+        );
+        assert_eq!(l, before, "unchanged on error");
     }
 
     #[test]
@@ -833,6 +910,7 @@ mod tests {
             deploy.clone(),
         );
         l.apply_tx(&ok, &a.address(), &StubExecutor).unwrap();
+        l.record_anchor(l.height());
         let id = program_id(0, &words);
         assert!(l.program(&id).is_some());
         let proof = StubExecutor::make_proof(&id, 12, [1, 2, 3, 4, 5, 6, 7, 8]);
@@ -840,6 +918,7 @@ mod tests {
         let fee = gas::BUNDLE_BASE + gas::call_fee(12);
         let t = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], fee), call.clone());
         let r = l.apply_tx(&t, &a.address(), &StubExecutor).unwrap().unwrap();
+        l.record_anchor(l.height());
         assert_eq!(r.outputs, [1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(r.tier, 12);
         let cheap = Transaction::shielded(7, bundle(&l, [[9; 8], [10; 8]], [[11; 8], [12; 8]], fee - 1), call.clone());
@@ -848,6 +927,56 @@ mod tests {
         // A fresh transaction: `t`'s nullifiers are spent by now, and `Spent` would fire first.
         let disabled = Transaction::shielded(7, bundle(&l, [[13; 8], [14; 8]], [[15; 8], [16; 8]], fee), call);
         assert_eq!(l.validate(&disabled, &StubExecutor), Err(TxError::ConfidentialDisabled));
+    }
+
+    #[test]
+    fn deploy_and_call_rejections_and_redeploy_idempotence() {
+        let mut l = ledger();
+        let (a, _) = keys();
+        // An oversized program is refused by the size cap, before any fee or code check.
+        let big = Action::Deploy { base_pc: 0, words: vec![0x13; gas::MAX_PROGRAM_WORDS + 1] };
+        let t = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE), big);
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::ProgramTooLarge));
+        // A call naming a program nobody deployed.
+        let ghost = Hash::digest(b"never deployed");
+        let unknown = Action::Call { program: ghost, proof: Vec::new() };
+        let t = Transaction::shielded(
+            7,
+            bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&unknown)),
+            unknown,
+        );
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::UnknownProgram(ghost)));
+        // Deploy two programs, then call one with the other's proof.
+        let words = vec![0x13u32; 4];
+        let other = vec![0x73u32; 4];
+        for (n, code) in [(0u32, &words), (1, &other)] {
+            let deploy = Action::Deploy { base_pc: 0, words: code.clone() };
+            let d = Transaction::shielded(
+                7,
+                bundle(&l, [[10 + n; 8], [20 + n; 8]], [[30 + n; 8], [40 + n; 8]], gas::fee_floor(&deploy)),
+                deploy,
+            );
+            l.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
+            l.record_anchor(l.height());
+        }
+        let (id, other_id) = (program_id(0, &words), program_id(0, &other));
+        let wrong_proof = StubExecutor::make_proof(&other_id, 12, [0; 8]);
+        let call = Action::Call { program: id, proof: wrong_proof };
+        let fee = gas::BUNDLE_BASE + gas::call_fee(12);
+        let t = Transaction::shielded(7, bundle(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]], fee), call);
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::InvalidProof(ConfidentialError::WrongProgram)));
+        // Redeploying the same code is a no-op: the record keeps its original height.
+        assert_eq!(l.program(&id).unwrap().deployed_at, 1);
+        l.set_height(9);
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone() };
+        let again = Transaction::shielded(
+            7,
+            bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], gas::fee_floor(&deploy)),
+            deploy,
+        );
+        l.apply_tx(&again, &a.address(), &StubExecutor).unwrap();
+        assert_eq!(l.programs().len(), 2);
+        assert_eq!(l.program(&id).unwrap().deployed_at, 1, "a redeploy does not move deployed_at");
     }
 
     #[test]

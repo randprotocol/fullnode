@@ -224,6 +224,20 @@ fn proposal_of(actions: &[Action]) -> Block {
         .expect("a proposal was broadcast")
 }
 
+/// The shielded chain reads no clock: `time` is bounded in block heights, so a replica votes on
+/// a proposal however far ahead of its own clock the header's timestamp is.
+#[test]
+fn a_proposal_far_ahead_of_the_local_clock_is_accepted() {
+    let mut sim = setup(2, 2);
+    sim.now = 1_000_000;
+    let (leader, view) = pending_leader(&sim);
+    let follower = (leader + 1) % 2;
+    let acts = sim.nodes[leader].propose(view, vec![], sim.now + 10_000_000).unwrap();
+    let block = proposal_of(&acts);
+    assert_eq!(block.header.timestamp_ms, sim.now + 10_000_000);
+    sim.nodes[follower].on_proposal(block, sim.now).expect("a far-future timestamp is not a validity rule");
+}
+
 /// A leader whose clock lags its peers still never emits a block that moves
 /// time backwards: the proposal time is `max(now, parent)`.
 #[test]
