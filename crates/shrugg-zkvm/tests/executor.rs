@@ -39,11 +39,11 @@ fn verifies_a_real_proof_and_reports_outputs() {
     assert_eq!(out.outputs[2], 1025 - 1000, "pays the surplus");
     assert_eq!(ex.cached_keys(), 1);
     ex.warm(&rec);
-    assert_eq!(
-        ex.cached_keys(),
-        shrugg_zkvm::machine::TIERS.len(),
-        "warm precomputes every tier's key, reusing the cached one"
-    );
+    // `warm` precomputes the keys for tiers 10, 12 and 14 (the tiers real guests land on;
+    // warming every tier would build the Poseidon2 chip's 2^22-row preprocessed table on a
+    // 2-vCPU validator at deploy time). The proof above already verified at tier 10, so that
+    // key is reused: three cached keys in total.
+    assert_eq!(ex.cached_keys(), 3, "warm precomputes the keys for tiers 10, 12 and 14, reusing the cached one");
     let t = std::time::Instant::now();
     ex.verify_call(&rec, proof).unwrap();
     assert!(t.elapsed().as_millis() < 500, "cached verify took {:?}", t.elapsed());
