@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN=${1:-bin-b00bc72}/shrugg-node
-DATA=data-a-7e6271a3
+DATA=data-a-3a82b0c7
 [ -d $DATA/db ] || $BIN init --datadir $DATA --genesis deploy/genesis.json
 exec $BIN run --datadir $DATA --key deploy/node-a.key.json --validator \
     --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 \

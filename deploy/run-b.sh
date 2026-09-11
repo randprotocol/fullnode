@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo build --release
 BIN=target/release/shrugg-node
-DATA=data-b-7e6271a3   # keyed on the genesis hash so a regenerated genesis gets a fresh db
+DATA=data-b-3a82b0c7   # keyed on the genesis hash so a regenerated genesis gets a fresh db
 [ -d $DATA/db ] || $BIN init --datadir $DATA --genesis deploy/genesis.json
 exec $BIN run --datadir $DATA --key deploy/node-b.key.json --validator \
     --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 \
