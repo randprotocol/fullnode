@@ -153,6 +153,41 @@ pays. Call outputs remain eight public words recorded in the receipt; effect kin
 recipient list) is deleted because there are no accounts to pay. Programs that want to move value
 compose with the pool by having the caller include the payment in the same bundle's outputs.
 
+### 6.1 Call input envelopes (viewing keys for program calls)
+
+Added 2026-09-11 at the user's request; phase S3. Today a confidential call leaves nothing on
+chain a viewing key could open: its private inputs never leave the wallet. Zcash-style
+disclosure for calls needs the inputs on chain, encrypted, bound to the proof.
+
+- **What goes on chain.** A `Call` action gains `input_envelope: CallEnvelope { kem_ct, to_sender,
+  to_auditor, body }`. `body` is the call's private input vector plus the `H_IN` salt (zkVM M4.1),
+  encrypted with ChaCha20-Poly1305 under a fresh per-call key `K_call`, with `H_IN` as the AEAD
+  associated data. `to_sender` seals `K_call` under the caller's `ovk` (the same sender path the
+  note envelope uses); `to_auditor` and `kem_ct` optionally seal it to one designated auditor
+  address with ML-KEM-768. Size cap: inputs are at most 4096 words, so `body` is at most 16 KiB
+  plus the tag; the transaction size cap in section 7 grows by that much for calls.
+- **Binding without in-circuit encryption.** The chain checks nothing about the ciphertext, as
+  with note envelopes. A holder who decrypts obtains `(salt, inputs)` and recomputes
+  `H_IN = input_digest(salt, inputs)` against the receipt's public value; a mismatch means the
+  caller published a false envelope, which the holder can prove to anyone by showing the
+  decryption. Because the proof binds `H_IN` to every `READ_INPUT`, a matching envelope is a
+  faithful transcript of what the program read.
+- **Who can open it.** A party viewing key (`nk`, via `ovk`) opens every call that party made; a
+  per-call `TxKey` (`K_call`) opens one call; the auditor address, if set, opens that call. With
+  the inputs, the program words (public) and the emulator, the holder re-runs the call and sees
+  exactly what it computed, which is the explorer's "show me this call" view under a viewing key.
+- **What stays hidden.** Everyone else sees `H_IN`, the ciphertext, and the public receipt as
+  before. The bundle carrying the call already lets a party key show the call's value flow; the
+  input envelope adds the computation itself.
+- **Voluntary disclosure (user decision 2026-09-11).** The chain never requires disclosure and
+  no validator, explorer or bridge holds a key. The wallet always writes the envelope, so the
+  caller keeps the ability to unmask a call later for compliance; whether to hand out a party
+  key, a per-call key, or nothing is the caller's choice at the time an auditor asks. A caller
+  who wants no disclosure path at all can pass `--no-envelope`, which forfeits that option for
+  that call permanently; the chain accepts both.
+- **Dependencies.** zkVM M4.1 (`H_IN`, salt) and the note envelope code (`viewing.rs`), both
+  existing; no zkVM change beyond M4.1.
+
 ## 7. Validity and admission order
 
 Cheap before expensive, in this order, in both the mempool and the ledger:
@@ -259,7 +294,7 @@ transactions are private unless the viewing key is given.
 | Z (zkVM, `circuits/research`) | looped `MERKLE_VERIFY`; the 2-in-2-out `bundle` guest with `u64` amounts, dummy inputs, fee and burn; `H_OUT` over the 9-field preimage; measured tier; vendored | M3 (done) |
 | S1 (fullnode) | notes ledger, `Bundle` transaction, admission order, storage, state root, deposits via Mint, wallet (keys, scanning, proving, `shrugg send`), RPC redaction, genesis with deposit notes, `--verify-chain` replay | Z |
 | S2 | validator register, Bond/Unbond/Withdraw, epochs, rewards, `shrugg-node genesis` seeding | S1 |
-| S3 | Deploy/Call riding on bundles (kind 1 removed), bridge as notes with the two-bundle BridgeBurn | S1, bridge merge |
+| S3 | Deploy/Call riding on bundles (kind 1 removed), call input envelopes (section 6.1), bridge as notes with the two-bundle BridgeBurn | S1, zkVM M4.1, bridge merge |
 
 Each phase is a hard fork; S1 alone is a new chain. The chain 5 fork the fleet session is
 preparing (for f1a29dd) is independent of this; the shielded chain is the fork after it.
