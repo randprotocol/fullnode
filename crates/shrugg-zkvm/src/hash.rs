@@ -9,14 +9,16 @@ use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_symmetric::{CryptographicHasher, PaddingFreeSponge, Permutation};
 use std::sync::OnceLock;
 
-/// `notes::domain::HC` (= 8) and `notes::domain::IN` (= 10), inlined: `notes.rs` isn't
-/// vendored into this crate (it drags in ml-kem/chacha20poly1305 for a viewing-key stack the
-/// node has no use for yet — see `deploy/sync-zkvm.sh`'s header comment), but
-/// `program_digest`/`input_digest` below and `tables::cpu`'s digest-row prefixes both need
-/// these exact domain tags to agree. Keep in sync with `research/src/notes.rs`'s `domain::HC`
-/// / `domain::IN` by hand across a resync.
-pub(crate) const HC_DOMAIN: u32 = 8;
-pub(crate) const IN_DOMAIN: u32 = 10;
+/// `notes::domain::HC` (= 8) and `notes::domain::IN` (= 10), inlined: `program_digest`/
+/// `input_digest` below and `tables::cpu`'s digest-row prefixes both need these exact domain
+/// tags to agree, and this patch predates `notes.rs` being vendored — it is kept rather than
+/// reversed; see `deploy/sync-zkvm.sh`'s header comment.
+///
+/// `pub`, not `pub(crate)`: `tests/shielded.rs` asserts these equal the vendored
+/// `notes::domain::HC` / `notes::domain::IN`, which is what keeps the two copies from drifting
+/// across a resync, and an integration test is a separate crate.
+pub const HC_DOMAIN: u32 = 8;
+pub const IN_DOMAIN: u32 = 10;
 
 /// `machine::permutation()` redraws the whole round-constant RNG stream on every call; this
 /// crate's hash paths (absorbing one 32-row block per call) run it often enough — up to 1024

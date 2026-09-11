@@ -35,6 +35,11 @@ p3-dft = "=0.7.0"
 p3-merkle-tree = "=0.7.0"
 p3-symmetric = "=0.7.0"
 rand = { version = "0.10", features = ["std_rng"] }
+# Shielded pool S1: the vendored note layer's envelope format (`src/viewing.rs`). Pinned to the
+# exact versions the research crate uses — an envelope sealed by a wallet must open on a node,
+# and both sides are this one implementation.
+ml-kem = "=0.3.2"
+chacha20poly1305 = "=0.11.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 postcard = { version = "1", features = ["alloc"] }

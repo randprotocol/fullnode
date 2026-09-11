@@ -124,6 +124,10 @@ pub fn balance_check(threshold: u32) -> Program {
 
 /// Private payment: reads four private balances; if their sum >= threshold, pays recipient 0
 /// the surplus (sum - threshold); otherwise emits no effect. Only the effect words are public.
+///
+/// Node-local (not upstream): the chain's own demo/test guest, deployed by `shrugg-client` and
+/// exercised by `tests/executor.rs` and the node's cluster tests. Kept across a
+/// `deploy/sync-zkvm.sh` resync because `guests.rs` is excluded from the rsync.
 pub fn private_payment(threshold: u32) -> Program {
     let mut a = Assembler::new(0);
     a.extend(li(T5, 0));
@@ -302,7 +306,13 @@ pub fn poseidon2_demo(msg: &[u32]) -> Program {
     a.assemble()
 }
 
-/// (name, program, private inputs)
+/// (name, program, private inputs) — this chain's deployed guest catalog, which the vendored
+/// `tests/{asm,backend,e2e,isa,tables}.rs` sweep over. Deliberately NOT upstream's list: it
+/// carries the node-local `private_payment` and leaves out the three guests upstream added to
+/// its own `all()` for coverage (`sub_word_checksum`, `muldiv`, `poseidon2_demo` — all three
+/// still exist above and the vendored tests that want them call them by name). Neither
+/// `transfer()` nor `bundle()` belongs here either: upstream does not list them, and both prove
+/// at tier 14, which would turn every sweeping test into a multi-minute run.
 pub fn all() -> Vec<(&'static str, Program, Vec<u32>)> {
     vec![
         ("private_payment", private_payment(1000), vec![400, 250, 300, 75]),
@@ -312,4 +322,385 @@ pub fn all() -> Vec<(&'static str, Program, Vec<u32>)> {
         ("bubble_sort", bubble_sort(&[9, 3, 0xffff_fff0, 1, 7, 3]), vec![]),
         ("balance_check", balance_check(1000), vec![400, 250, 300, 75]),
     ]
+}
+
+/// The shielded transfer: spends one note and creates one of the same amount and asset.
+///
+/// Private inputs (`notes::input`): the spend key, the spent note's fields, the created
+/// note's owner/time/randomness, and the Merkle witness (path, index) for the spent note's
+/// commitment. The guest derives `nk = H_NK(sk)` and `pk = H_PK(nk)` itself, so the spent
+/// note's owner and the created note's `from` are the address of whoever holds `sk` — that is
+/// what authenticates the sender. It recomputes `cm_in` (`NOTE_COMMIT`), proves `cm_in`'s
+/// membership in the commitment tree via `MERKLE_VERIFY` (getting `anchor`, the tree root),
+/// computes `nf` (`NULLIFY`, bound to `cm_in`, not a sender-chosen nonce) and `cm_out`
+/// (`NOTE_COMMIT`), and publishes a single 8-word output-commitment digest,
+/// `notes::output_digest(anchor, nf, cm_out, time_out)` (`notes::output::DIGEST`) — see
+/// `docs/06-viewing-keys.md`'s "Public outputs" section for why `anchor`/`nf`/`cm_out`/`time`
+/// are folded into one digest rather than published as four separate `Word8` outputs.
+///
+/// `cm_in` itself is never published (M3.3 moves it from a public output to the Merkle
+/// witness): only `anchor` is, so the chain no longer shows which commitment a transfer
+/// spent.
+pub fn transfer() -> Program {
+    use crate::asm::{copy_word8, emit_derive_keys, emit_merkle_verify, emit_note_commit, emit_nullify};
+    use crate::notes::{domain, input, output, DEPTH};
+    const BASE: u32 = 25; // s9: RAM base register, holds HEAP
+    const BIT: u32 = 26;  // s10: MERKLE_VERIFY's branch scratch
+    const PATH_PTR: u32 = 27;
+    const INDEX_WORK: u32 = 24;
+    const CTR: u32 = 23;
+    const BUF: i32 = 0x000;   // hash scratch: up to 29 words (116 bytes)
+    const INP: i32 = 0x100;   // the input::COUNT private inputs
+    const NK: i32 = 0x600;
+    const PK: i32 = 0x620;
+    const CM_IN: i32 = 0x640;
+    const NF: i32 = 0x660;
+    const CM_OUT: i32 = 0x680;
+    const ANCHOR: i32 = 0x6a0;
+    let ptr_words = |buf: i32| (HEAP + buf) / 4;
+    let inp = |i: usize| INP + 4 * i as i32;
+    let mut a = Assembler::new(0);
+    a.extend(li(BASE, HEAP));
+    // Read every private input once and keep it in RAM.
+    for i in 0..input::COUNT {
+        a.extend(read_input(i as u32));
+        a.push(sw(BASE, REG_A0, inp(i)));
+    }
+    // nk = H_NK(sk), pk = H_PK(nk) — `sk` is 8 words, so both are 9-word hashes, emitted
+    // directly rather than through a note/nullifier-shaped wrapper (`asm::emit_derive_keys`,
+    // shared with `bundle`).
+    emit_derive_keys(&mut a, BASE, T0, inp(input::SK), BUF, ptr_words(BUF), NK, PK);
+    // cm_in = NOTE_COMMIT(pk, in.from, in.amount_lo, in.amount_hi, in.asset, in.time, in.r) —
+    // assembled into a Note::WORDS-word staging area at BUF + 0x80 (past the hash scratch
+    // region).
+    const NOTE_IN: i32 = 0x080;
+    copy_word8(&mut a, BASE, T0, PK, NOTE_IN);
+    copy_word8(&mut a, BASE, T0, inp(input::IN_FROM), NOTE_IN + 32);
+    a.push(lw(T0, BASE, inp(input::IN_AMOUNT_LO))); a.push(sw(BASE, T0, NOTE_IN + 64));
+    a.push(lw(T0, BASE, inp(input::IN_AMOUNT_HI))); a.push(sw(BASE, T0, NOTE_IN + 68));
+    a.push(lw(T0, BASE, inp(input::IN_ASSET))); a.push(sw(BASE, T0, NOTE_IN + 72));
+    a.push(lw(T0, BASE, inp(input::IN_TIME))); a.push(sw(BASE, T0, NOTE_IN + 76));
+    copy_word8(&mut a, BASE, T0, inp(input::IN_R), NOTE_IN + 80);
+    emit_note_commit(&mut a, BASE, T0, NOTE_IN, BUF, ptr_words(BUF), CM_IN);
+    // anchor = MERKLE_VERIFY(cm_in, path, index) — proves cm_in is in the commitment tree.
+    a.push(lw(T1, BASE, inp(input::INDEX)));
+    emit_merkle_verify(&mut a, BASE, T0, BIT, INDEX_WORK, T1, PATH_PTR, CTR, CM_IN, inp(input::PATH), BUF, ptr_words(BUF), ANCHOR, DEPTH, "transfer_merkle");
+    // nf = NULLIFY(nk, cm_in) — bound to the commitment, so two notes can never share one.
+    emit_nullify(&mut a, BASE, T0, NK, CM_IN, BUF, ptr_words(BUF), NF);
+    // cm_out = NOTE_COMMIT(out.pk, pk, in.amount_lo, in.amount_hi, in.asset, out.time, out.r)
+    copy_word8(&mut a, BASE, T0, inp(input::OUT_PK), NOTE_IN);
+    copy_word8(&mut a, BASE, T0, PK, NOTE_IN + 32);
+    a.push(lw(T0, BASE, inp(input::IN_AMOUNT_LO))); a.push(sw(BASE, T0, NOTE_IN + 64));
+    a.push(lw(T0, BASE, inp(input::IN_AMOUNT_HI))); a.push(sw(BASE, T0, NOTE_IN + 68));
+    a.push(lw(T0, BASE, inp(input::IN_ASSET))); a.push(sw(BASE, T0, NOTE_IN + 72));
+    a.push(lw(T0, BASE, inp(input::OUT_TIME))); a.push(sw(BASE, T0, NOTE_IN + 76));
+    copy_word8(&mut a, BASE, T0, inp(input::OUT_R), NOTE_IN + 80);
+    emit_note_commit(&mut a, BASE, T0, NOTE_IN, BUF, ptr_words(BUF), CM_OUT);
+    // digest = H(OUT_DOMAIN, anchor, nf, cm_out, time_out) — the single published output.
+    a.extend(li(T0, domain::OUT as i32));
+    a.push(sw(BASE, T0, BUF));
+    copy_word8(&mut a, BASE, T0, ANCHOR, BUF + 4);
+    copy_word8(&mut a, BASE, T0, NF, BUF + 36);
+    copy_word8(&mut a, BASE, T0, CM_OUT, BUF + 68);
+    a.push(lw(T0, BASE, inp(input::OUT_TIME))); a.push(sw(BASE, T0, BUF + 100));
+    a.extend(call_poseidon2(ptr_words(BUF), 26));
+    // Publish.
+    for i in 0..8 {
+        a.push(lw(T1, BASE, BUF + 4 * i));
+        a.extend(write_output((output::DIGEST + i as usize) as u32, T1));
+    }
+    a.extend(halt());
+    a.assemble()
+}
+
+/// `NOTE_COMMIT`, standalone: hashes `msg` (`Note::WORDS` words, embedded at assembly time)
+/// as `H(CM_DOMAIN, msg)` and outputs the 8-word digest — the fixture that pins the guest's
+/// `NOTE_COMMIT` to `notes::hash(notes::domain::CM, ..)`.
+pub fn note_commit_probe(msg: &[u32; crate::notes::Note::WORDS]) -> Program {
+    use crate::asm::emit_note_commit;
+    const BASE: u32 = 25;
+    const NOTE_IN: i32 = 0x080;
+    const BUF: i32 = 0x000;
+    const CM: i32 = 0x100;
+    let mut a = Assembler::new(0);
+    a.extend(li(BASE, HEAP));
+    for (i, w) in msg.iter().enumerate() { a.extend(li(T0, *w as i32)); a.push(sw(BASE, T0, NOTE_IN + 4 * i as i32)); }
+    emit_note_commit(&mut a, BASE, T0, NOTE_IN, BUF, (HEAP + BUF) / 4, CM);
+    for i in 0..8 { a.push(lw(T1, BASE, CM + 4 * i)); a.extend(write_output(i as u32, T1)); }
+    a.extend(halt());
+    a.assemble()
+}
+
+/// The shielded pool's 2-in-2-out transfer relation
+/// (`docs/superpowers/specs/2026-09-11-shielded-pool-design.md` §4). See
+/// `docs/superpowers/plans/2026-09-11-shielded-pool-z.md` Task 3 for the full soundness
+/// argument: structural ownership/asset/output-time binding (the guest always uses its own
+/// derived `pk_self` and the bundle's own public `asset`/`time` fields, so a dishonest witness
+/// produces a `cm`/`nf` that cannot match anything real), and the `bad`-flag taint-and-corrupt
+/// mechanism for the genuinely arithmetic checks this ISA has no native assert for (both real
+/// inputs' Merkle roots agreeing with one claimed `anchor`, every amount's `< 2^63` range
+/// check, 64-bit balance conservation, per-input asset agreement with the bundle's public
+/// asset, and — nothing else in the relation compares the two inputs/outputs against each
+/// other — the same note never spent as both inputs (`nf1 == nf2`) nor the same note minted
+/// as both outputs (`cm_out1 == cm_out2`); the ledger independently rejects either duplicate
+/// again once applied, so this is defence in depth, not the only place it is caught). `bad`
+/// is a monotone OR accumulator, folded as an explicit extra word into the
+/// published digest's preimage (`notes::bundle_digest`) — never XORed into a plaintext field a
+/// sender publishes, since that would let a cheat simply republish the corrupted plaintext and
+/// have the ledger's independent recomputation agree.
+///
+/// A dummy input (`amount == 0`) skips its `MERKLE_VERIFY`/anchor/asset checks entirely; this
+/// is *unconstructible* to abuse (not merely checked), because the skip branch's own condition
+/// (`amount_lo | amount_hi == 0`) reads the exact same registers that feed the balance sum — a
+/// nonzero amount cannot both contribute value and take the skip branch.
+///
+/// Publishes `notes::bundle_digest(..)` at `output::DIGEST` (0..8), the same slot `transfer`
+/// uses (`transfer` and `bundle` are two different `hc`-pinned programs, never both live in one
+/// ledger — S1 decides which).
+pub fn bundle() -> Program {
+    use crate::asm::{copy_word8, emit_add64_carry, emit_derive_keys, emit_eq8, emit_merkle_verify, emit_note_commit, emit_nullify, emit_or_into, emit_range_check_u63, emit_stage_note};
+    use crate::notes::{bundle_input as bi, domain, output, DEPTH};
+    const BASE: u32 = 25;   // RAM base (holds HEAP), same convention as transfer()
+    const BIT: u32 = 26;    // MERKLE_VERIFY scratch
+    const PATH_PTR: u32 = 27;
+    const INDEX_WORK: u32 = 24;
+    const CTR: u32 = 23;
+    const BAD: u32 = 9;     // s1: the taint accumulator, 0 until proven otherwise, never cleared
+    const EQFOLD: u32 = 22; // emit_eq8's fold scratch
+    const T7: u32 = 21;     // extra general scratch (S0/S1/T0-T6/BASE/BIT/PATH_PTR/INDEX_WORK/CTR/EQFOLD all spoken for)
+
+    // `lw`/`sw`/`addi` immediates are genuine 12-bit signed RISC-V I-type fields
+    // (`Instr::encode`'s `i_type` masks to `imm & 0xfff`, decoded back via `sext(.., 12)`) —
+    // any offset outside `[-2048, 2047]` silently wraps. `transfer()` never had to think about
+    // this because its whole layout stays under `0x6a0` (1696); `bundle()`'s does not — the
+    // 612-word `bi::COUNT` private-input array's own last word alone reaches byte offset
+    // `4*611 = 2444` past `INP`, and the derived-value scratch (`NK`..`SUM_OUT_HI`) sits at
+    // `0xb00..0xc50` (2816..3152), both past `0x7ff`. Fix: `BASE` is loaded with
+    // `HEAP + PIVOT`, not `HEAP`, and every RAM constant below is defined already shifted by
+    // `-PIVOT` (so e.g. `ANCHOR`'s nominal `0xc00` becomes `0xc00 - PIVOT`) — every constant
+    // actually used as an `lw`/`sw`/`addi` immediate anywhere in this function then lands in
+    // `[-1536, 1612]`, comfortably inside the 12-bit window. `ptr_words` computes a real
+    // absolute word address for the `POSEIDON2` syscall's pointer argument (built via `li`,
+    // which is not immediate-width limited — see `ops::li`), so it adds `PIVOT` back rather
+    // than being shifted itself.
+    //
+    // Every region below is disjoint (checked by nominal byte range, before the `-PIVOT`
+    // shift, which preserves relative order): `BUF` needs up to 48 words = 0xc0 bytes for the
+    // final digest (`0x000..0x0c0`); `NOTE_STAGE` starts exactly where `BUF` ends (`0x0c0`,
+    // not `0x080` — `0x080` would have overlapped `BUF`'s digest-time window by 16 words) and
+    // needs `Note::WORDS` = 28 words = 0x70 bytes (`0x0c0..0x130`); `INP` starts at `0x140`
+    // (comfortably past `0x130`, not `0x100`) and needs `bi::COUNT` = 612 words = 0x990 bytes
+    // (`0x140..0xad0`), still clear of `NK` at `0x0b00`.
+    const PIVOT: i32 = 0x600;
+    const BUF: i32 = 0x000 - PIVOT;      // hash scratch: up to 48 words (192 bytes) for the final digest
+    const NOTE_STAGE: i32 = 0x0c0 - PIVOT; // Note::WORDS = 28 word staging area, reused per note
+    const INP: i32 = 0x140 - PIVOT;      // bundle_input::COUNT (612) private inputs
+    const NK: i32 = 0xb00 - PIVOT;
+    const PK: i32 = 0xb20 - PIVOT;
+    const CM_IN1: i32 = 0xb40 - PIVOT;
+    const NF1: i32 = 0xb60 - PIVOT;
+    const CM_IN2: i32 = 0xb80 - PIVOT;
+    const NF2: i32 = 0xba0 - PIVOT;
+    const CM_OUT1: i32 = 0xbc0 - PIVOT;
+    const CM_OUT2: i32 = 0xbe0 - PIVOT;
+    const ANCHOR: i32 = 0xc00 - PIVOT;
+    const ROOT_TMP: i32 = 0xc20 - PIVOT; // scratch root for whichever input's MERKLE_VERIFY runs
+    const SUM_IN_LO: i32 = 0xc40 - PIVOT; const SUM_IN_HI: i32 = 0xc44 - PIVOT;   // staged in RAM so ALU regs stay free
+    const SUM_OUT_LO: i32 = 0xc48 - PIVOT; const SUM_OUT_HI: i32 = 0xc4c - PIVOT;
+
+    let ptr_words = |buf: i32| (HEAP + PIVOT + buf) / 4;
+    let inp = |i: usize| INP + 4 * i as i32;
+    let mut a = Assembler::new(0);
+    a.extend(li(BASE, HEAP + PIVOT));
+    a.extend(li(BAD, 0));
+
+    // Read every private input once into RAM (same convention as transfer()).
+    for i in 0..bi::COUNT {
+        a.extend(read_input(i as u32));
+        a.push(sw(BASE, REG_A0, inp(i)));
+    }
+
+    // nk = H_NK(sk); pk_self = H_PK(nk) — the same `asm::emit_derive_keys` sequence transfer()
+    // opens with. `PK` is the owner slot of both inputs and the `from` of both outputs below,
+    // so every note this relation touches is tied to the private spend key read at `bi::SK`.
+    emit_derive_keys(&mut a, BASE, T0, inp(bi::SK), BUF, ptr_words(BUF), NK, PK);
+
+    // anchor := the private ANCHOR field (the wallet's claimed current tree root); every real
+    // input's MERKLE_VERIFY is checked against it via emit_eq8 + emit_or_into(BAD, ..), never
+    // overwritten by a derived root (unlike transfer(), where there is only one input and the
+    // derived root simply *is* the published anchor) — see Task 3's soundness note for why an
+    // equality-then-taint gadget, not a direct overwrite, is required once there are two
+    // independent membership checks that must agree with each other and with this value.
+    copy_word8(&mut a, BASE, T0, inp(bi::ANCHOR), ANCHOR);
+
+    // ---- input 1 ----
+    // §4 item 1, structurally: the spent note's OWNER is `PK` (= pk_self, derived above from
+    // the private spend key), never a witness word — a prover can only ever spend a note
+    // committed to its own public key. Everything else about the note comes from the witness.
+    emit_stage_note(&mut a, BASE, T0, NOTE_STAGE, PK, inp(bi::IN1_FROM), inp(bi::IN1_AMOUNT_LO), inp(bi::IN1_AMOUNT_HI), inp(bi::IN1_ASSET), inp(bi::IN1_TIME), inp(bi::IN1_R));
+    emit_note_commit(&mut a, BASE, T0, NOTE_STAGE, BUF, ptr_words(BUF), CM_IN1);
+    // amount1 != 0? — the ONLY branch condition, shared with the balance sum's own addend.
+    a.push(lw(T1, BASE, inp(bi::IN1_AMOUNT_LO)));
+    a.push(lw(T2, BASE, inp(bi::IN1_AMOUNT_HI)));
+    a.push(or(T1, T1, T2));
+    a.branch(BranchCond::Eq, T1, REG_ZERO, "bundle_in1_skip");
+    a.push(lw(T1, BASE, inp(bi::IN1_INDEX)));
+    emit_merkle_verify(&mut a, BASE, T0, BIT, INDEX_WORK, T1, PATH_PTR, CTR, CM_IN1, inp(bi::IN1_PATH), BUF, ptr_words(BUF), ROOT_TMP, DEPTH, "bundle_merkle1");
+    emit_eq8(&mut a, BASE, T0, EQFOLD, ANCHOR, ROOT_TMP, T7);
+    a.push(xori(T7, T7, 1)); // T7 := 1 iff mismatch
+    emit_or_into(&mut a, BAD, T7);
+    // Per-input asset agreement with the bundle's public asset field (gated on amount != 0 —
+    // a dummy's asset is meaningless): a real note's own historical asset free-rides into
+    // cm_in/nf unchecked by anything else in this design, so this is the one place it is
+    // checked against what the bundle claims.
+    a.push(lw(T0, BASE, inp(bi::IN1_ASSET)));
+    a.push(lw(T1, BASE, inp(bi::ASSET)));
+    a.push(xor(T0, T0, T1));
+    a.push(sltu(T0, REG_ZERO, T0)); // 1 iff they differed
+    emit_or_into(&mut a, BAD, T0);
+    a.label("bundle_in1_skip");
+    emit_nullify(&mut a, BASE, T0, NK, CM_IN1, BUF, ptr_words(BUF), NF1);
+
+    // ---- input 2 (identical shape, same `PK` owner slot) ----
+    emit_stage_note(&mut a, BASE, T0, NOTE_STAGE, PK, inp(bi::IN2_FROM), inp(bi::IN2_AMOUNT_LO), inp(bi::IN2_AMOUNT_HI), inp(bi::IN2_ASSET), inp(bi::IN2_TIME), inp(bi::IN2_R));
+    emit_note_commit(&mut a, BASE, T0, NOTE_STAGE, BUF, ptr_words(BUF), CM_IN2);
+    a.push(lw(T1, BASE, inp(bi::IN2_AMOUNT_LO)));
+    a.push(lw(T2, BASE, inp(bi::IN2_AMOUNT_HI)));
+    a.push(or(T1, T1, T2));
+    a.branch(BranchCond::Eq, T1, REG_ZERO, "bundle_in2_skip");
+    a.push(lw(T1, BASE, inp(bi::IN2_INDEX)));
+    emit_merkle_verify(&mut a, BASE, T0, BIT, INDEX_WORK, T1, PATH_PTR, CTR, CM_IN2, inp(bi::IN2_PATH), BUF, ptr_words(BUF), ROOT_TMP, DEPTH, "bundle_merkle2");
+    emit_eq8(&mut a, BASE, T0, EQFOLD, ANCHOR, ROOT_TMP, T7);
+    a.push(xori(T7, T7, 1));
+    emit_or_into(&mut a, BAD, T7);
+    a.push(lw(T0, BASE, inp(bi::IN2_ASSET)));
+    a.push(lw(T1, BASE, inp(bi::ASSET)));
+    a.push(xor(T0, T0, T1));
+    a.push(sltu(T0, REG_ZERO, T0));
+    emit_or_into(&mut a, BAD, T0);
+    a.label("bundle_in2_skip");
+    emit_nullify(&mut a, BASE, T0, NK, CM_IN2, BUF, ptr_words(BUF), NF2);
+
+    // ---- outputs: from = pk_self, asset/time = the bundle's own public fields (structural
+    // enforcement of §4 items 4/6/7 — there is no other asset/time an output's commitment
+    // could use) ----
+    emit_stage_note(&mut a, BASE, T0, NOTE_STAGE, inp(bi::OUT1_PK), PK, inp(bi::OUT1_AMOUNT_LO), inp(bi::OUT1_AMOUNT_HI), inp(bi::ASSET), inp(bi::TIME), inp(bi::OUT1_R));
+    emit_note_commit(&mut a, BASE, T0, NOTE_STAGE, BUF, ptr_words(BUF), CM_OUT1);
+
+    emit_stage_note(&mut a, BASE, T0, NOTE_STAGE, inp(bi::OUT2_PK), PK, inp(bi::OUT2_AMOUNT_LO), inp(bi::OUT2_AMOUNT_HI), inp(bi::ASSET), inp(bi::TIME), inp(bi::OUT2_R));
+    emit_note_commit(&mut a, BASE, T0, NOTE_STAGE, BUF, ptr_words(BUF), CM_OUT2);
+
+    // ---- duplicate-input / duplicate-output detection ----
+    // The same note spent as both inputs (nf1 == nf2, since a nullifier is a deterministic
+    // function of cm_in) would otherwise pass every other check with bad == 0 and a
+    // "balanced" 2x-amount output — nothing above compares the two inputs against each
+    // other. Likewise two byte-for-byte identical output notes (cm_out1 == cm_out2) mint the
+    // same commitment twice. `emit_eq8` returns 1 iff equal, so — unlike the anchor-agreement
+    // check above, which wants bad on MISMATCH and so inverts it — this ORs the equality bit
+    // straight into `bad`: bad on MATCH. The ledger (Task 4) independently rejects either
+    // duplicate again once a bundle is applied (a repeated nullifier / a repeated commitment
+    // both already fail there on their own) — this in-circuit check is defence in depth, not
+    // the only place a within-bundle duplicate is caught.
+    emit_eq8(&mut a, BASE, T0, EQFOLD, NF1, NF2, T7);
+    emit_or_into(&mut a, BAD, T7); // T7 := 1 iff nf1 == nf2 (the same note spent twice)
+    emit_eq8(&mut a, BASE, T0, EQFOLD, CM_OUT1, CM_OUT2, T7);
+    emit_or_into(&mut a, BAD, T7); // T7 := 1 iff cm_out1 == cm_out2 (the same note minted twice)
+
+    // ---- range checks: every amount (both inputs, both outputs, fee, burn) < 2^63 ----
+    for hi_off in [
+        bi::IN1_AMOUNT_HI, bi::IN2_AMOUNT_HI,
+        bi::OUT1_AMOUNT_HI, bi::OUT2_AMOUNT_HI,
+        bi::FEE_HI, bi::BURN_HI,
+    ] {
+        a.push(lw(T1, BASE, inp(hi_off)));
+        emit_range_check_u63(&mut a, T1, T2);
+        emit_or_into(&mut a, BAD, T2);
+    }
+
+    // ---- 64-bit conservation: in1 + in2 == out1 + out2 + fee + burn, no wrap ----
+    a.push(lw(T0, BASE, inp(bi::IN1_AMOUNT_LO))); a.push(sw(BASE, T0, SUM_IN_LO));
+    a.push(lw(T0, BASE, inp(bi::IN1_AMOUNT_HI))); a.push(sw(BASE, T0, SUM_IN_HI));
+    a.push(lw(T3, BASE, SUM_IN_LO)); a.push(lw(T4, BASE, SUM_IN_HI));
+    a.push(lw(T1, BASE, inp(bi::IN2_AMOUNT_LO))); a.push(lw(T2, BASE, inp(bi::IN2_AMOUNT_HI)));
+    emit_add64_carry(&mut a, T3, T4, T1, T2, T0, T5);
+    emit_or_into(&mut a, BAD, T5); // in1+in2 cannot overflow given both are <2^63, but check anyway
+    a.push(sw(BASE, T3, SUM_IN_LO)); a.push(sw(BASE, T4, SUM_IN_HI));
+
+    a.push(lw(T3, BASE, inp(bi::OUT1_AMOUNT_LO))); a.push(lw(T4, BASE, inp(bi::OUT1_AMOUNT_HI)));
+    a.push(lw(T1, BASE, inp(bi::OUT2_AMOUNT_LO))); a.push(lw(T2, BASE, inp(bi::OUT2_AMOUNT_HI)));
+    emit_add64_carry(&mut a, T3, T4, T1, T2, T0, T5);
+    emit_or_into(&mut a, BAD, T5);
+    a.push(lw(T1, BASE, inp(bi::FEE_LO))); a.push(lw(T2, BASE, inp(bi::FEE_HI)));
+    emit_add64_carry(&mut a, T3, T4, T1, T2, T0, T5);
+    emit_or_into(&mut a, BAD, T5);
+    a.push(lw(T1, BASE, inp(bi::BURN_LO))); a.push(lw(T2, BASE, inp(bi::BURN_HI)));
+    emit_add64_carry(&mut a, T3, T4, T1, T2, T0, T5);
+    emit_or_into(&mut a, BAD, T5);
+    a.push(sw(BASE, T3, SUM_OUT_LO)); a.push(sw(BASE, T4, SUM_OUT_HI));
+
+    // sums must match exactly.
+    a.push(lw(T0, BASE, SUM_IN_LO)); a.push(lw(T1, BASE, SUM_OUT_LO));
+    a.push(sub(T2, T0, T1)); // 0 iff equal
+    a.push(lw(T0, BASE, SUM_IN_HI)); a.push(lw(T1, BASE, SUM_OUT_HI));
+    a.push(sub(T3, T0, T1));
+    a.push(or(T2, T2, T3));
+    a.push(sltu(T2, REG_ZERO, T2)); // T2 := 1 iff (T2 before) != 0, i.e. sums disagree
+    emit_or_into(&mut a, BAD, T2);
+
+    // ---- digest: H(BUNDLE, anchor, nf1, nf2, cm1, cm2, fee, burn, asset, time, bad) — `bad`
+    // is an EXPLICIT extra word (notes::domain::BUNDLE), never XORed into `time` or any other
+    // plaintext-published field: `time` is plaintext the sender publishes alongside the proof,
+    // so folding `bad` into it would let a cheating sender simply publish the corrupted `time`
+    // and have the ledger's independent recomputation agree. The host reference
+    // (`notes::bundle_digest`) always hashes `bad = 0`; only a dishonest guest run ever writes
+    // a nonzero `bad` word here, which is what makes its digest fail to match any plaintext.
+    a.extend(li(T0, domain::BUNDLE as i32));
+    a.push(sw(BASE, T0, BUF));
+    copy_word8(&mut a, BASE, T0, ANCHOR, BUF + 4);
+    copy_word8(&mut a, BASE, T0, NF1, BUF + 36);
+    copy_word8(&mut a, BASE, T0, NF2, BUF + 68);
+    copy_word8(&mut a, BASE, T0, CM_OUT1, BUF + 100);
+    copy_word8(&mut a, BASE, T0, CM_OUT2, BUF + 132);
+    a.push(lw(T0, BASE, inp(bi::FEE_LO))); a.push(sw(BASE, T0, BUF + 164));
+    a.push(lw(T0, BASE, inp(bi::FEE_HI))); a.push(sw(BASE, T0, BUF + 168));
+    a.push(lw(T0, BASE, inp(bi::BURN_LO))); a.push(sw(BASE, T0, BUF + 172));
+    a.push(lw(T0, BASE, inp(bi::BURN_HI))); a.push(sw(BASE, T0, BUF + 176));
+    a.push(lw(T0, BASE, inp(bi::ASSET))); a.push(sw(BASE, T0, BUF + 180));
+    a.push(lw(T0, BASE, inp(bi::TIME))); a.push(sw(BASE, T0, BUF + 184));
+    a.push(sw(BASE, BAD, BUF + 188));
+    a.extend(call_poseidon2(ptr_words(BUF), 48)); // domain(1) + msg(47)
+    for i in 0..8 {
+        a.push(lw(T1, BASE, BUF + 4 * i));
+        a.extend(write_output((output::DIGEST + i as usize) as u32, T1));
+    }
+    a.extend(halt());
+    a.assemble()
+}
+
+/// `MERKLE_VERIFY`, standalone: `leaf`, `path` (`DEPTH` siblings, leaf to root) and `index`
+/// are embedded at assembly time; outputs the computed root — the fixture that pins the
+/// guest's `MERKLE_VERIFY` to a host-side `ledger::CommitmentTree`.
+pub fn merkle_probe(leaf: crate::notes::Word8, path: &[crate::notes::Word8; crate::notes::DEPTH], index: u32) -> Program {
+    use crate::asm::emit_merkle_verify;
+    use crate::notes::DEPTH;
+    const BASE: u32 = 25;
+    const BIT: u32 = 26;
+    const PATH_PTR: u32 = 27;
+    const INDEX_WORK: u32 = 24;
+    const CTR: u32 = 23;
+    const LEAF: i32 = 0x080;
+    const PATH: i32 = 0x0a0; // DEPTH * 8 words = 1024 bytes -> 0x0a0..0x4a0
+    const BUF: i32 = 0x000;
+    const ROOT: i32 = 0x4a0;
+    let mut a = Assembler::new(0);
+    a.extend(li(BASE, HEAP));
+    for (i, w) in leaf.iter().enumerate() { a.extend(li(T0, *w as i32)); a.push(sw(BASE, T0, LEAF + 4 * i as i32)); }
+    for (level, sib) in path.iter().enumerate() {
+        for (i, w) in sib.iter().enumerate() { a.extend(li(T0, *w as i32)); a.push(sw(BASE, T0, PATH + 32 * level as i32 + 4 * i as i32)); }
+    }
+    a.extend(li(T1, index as i32));
+    emit_merkle_verify(&mut a, BASE, T0, BIT, INDEX_WORK, T1, PATH_PTR, CTR, LEAF, PATH, BUF, (HEAP + BUF) / 4, ROOT, DEPTH, "merkle_probe");
+    for i in 0..8 { a.push(lw(T2, BASE, ROOT + 4 * i)); a.extend(write_output(i as u32, T2)); }
+    a.extend(halt());
+    a.assemble()
 }
