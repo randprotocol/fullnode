@@ -10,5 +10,5 @@ rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" \
 # The zkVM manifest has an optional path dependency on ../../../circuits/rand-zkvm-cuda; cargo needs the
 # manifest to exist even for default builds, so ship that crate's sources alongside (no GPU code is built).
 CUDA=$(cd "$(dirname "$0")/../../circuits/rand-zkvm-cuda" 2>/dev/null && pwd || true)
-if [ -n "$CUDA" ]; then rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" --exclude target "$CUDA/" root@$IP:/root/circuits/rand-zkvm-cuda/; fi
+if [ -n "$CUDA" ]; then ssh -i $KEY -o StrictHostKeyChecking=accept-new root@$IP 'mkdir -p /root/circuits/rand-zkvm-cuda'; rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" --exclude target "$CUDA/" root@$IP:/root/circuits/rand-zkvm-cuda/; fi
 $SSH "bash /root/fullnode/deploy/vps-setup.sh $NODE \"$BOOT\" $ROLE"
