@@ -213,7 +213,8 @@ mod tests {
     #[test]
     fn block_signature_and_tx_root() {
         let k = key(1);
-        let tx = Transaction::transfer(&k, 1, 0, key(2).address(), 1, 1);
+        let envelope = crate::notes::Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
+        let tx = Transaction::mint(1, [7; 8], envelope, 1, &k);
         let header = BlockHeader {
             height: 1,
             view: 1,

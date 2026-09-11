@@ -1,6 +1,5 @@
 use shrugg_core::confidential::{ConfidentialError, ConfidentialExecutor};
 use shrugg_core::program::{program_id, ProgramRecord};
-use shrugg_core::Keypair;
 use shrugg_zkvm::executor::{prove, ZkExecutor};
 use shrugg_zkvm::guests;
 use shrugg_zkvm::machine::{Backend, FriProfile};
@@ -14,7 +13,6 @@ fn record(p: &shrugg_zkvm::isa::Program) -> ProgramRecord {
         base_pc: p.base_pc,
         words: p.words.clone(),
         code_hash,
-        deployer: Keypair::from_seed([1; 32]).unwrap().address(),
         deployed_at: 0,
     }
 }

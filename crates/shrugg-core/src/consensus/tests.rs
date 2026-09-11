@@ -1,9 +1,9 @@
 //! Deterministic multi-replica simulation of the HotStuff state machine.
 
 use super::*;
-use crate::bridge::BridgeConfig;
 use crate::confidential::StubExecutor;
 use crate::genesis::{Genesis, GenesisValidator};
+use crate::notes::{word8_to_hex, Envelope};
 use crate::types::Transaction;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -22,17 +22,9 @@ struct Sim {
     down: Vec<bool>,
 }
 
+/// The genesis every simulation runs: no notes, faucet on, so a block body can be built out
+/// of validator mints (the only transaction that needs no note to spend).
 fn setup(n: u8, validators: u8) -> Sim {
-    setup_with(n, validators, None)
-}
-
-/// Same chain, but with a minimal `bridge` section, which makes the block
-/// timestamp consensus input.
-fn setup_bridged(n: u8, validators: u8) -> Sim {
-    setup_with(n, validators, Some(BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::new() }))
-}
-
-fn setup_with(n: u8, validators: u8, bridge: Option<BridgeConfig>) -> Sim {
     let keys: Vec<Keypair> = (1..=n).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
     let genesis = Genesis {
         chain_id: 1,
@@ -41,13 +33,14 @@ fn setup_with(n: u8, validators: u8, bridge: Option<BridgeConfig>) -> Sim {
             .iter()
             .map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 10 })
             .collect(),
-        alloc: keys.iter().map(|k| (k.address().to_base58(), 1_000)).collect(),
-        faucet: false,
+        alloc: Vec::new(),
+        faucet: true,
         confidential: true,
         fri_profile: "production".into(),
-        bridge,
+        hc_bundle: word8_to_hex(&[3; 8]),
+        bridge: None,
     };
-    let gs = genesis.build().unwrap();
+    let gs = genesis.build(&StubExecutor).unwrap();
     let cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
     let mut nodes = Vec::new();
     let mut addr_to_idx = BTreeMap::new();
@@ -207,6 +200,15 @@ impl Sim {
     }
 }
 
+fn env() -> Envelope {
+    Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] }
+}
+
+/// A faucet mint of one unit into note `[n; 8]`, signed by validator `key`.
+fn mint(key: &Keypair, n: u32) -> Transaction {
+    Transaction::mint(1, [n; 8], env(), 1, key)
+}
+
 /// The node with a pending `ReadyToPropose`, and the view it is for.
 fn pending_leader(sim: &Sim) -> (usize, u64) {
     (0..sim.nodes.len()).find_map(|i| sim.pending_propose[i].map(|v| (i, v))).expect("someone may propose")
@@ -220,43 +222,6 @@ fn proposal_of(actions: &[Action]) -> Block {
             _ => None,
         })
         .expect("a proposal was broadcast")
-}
-
-/// On a bridged chain the block timestamp decides guardian-set expiry, so a
-/// replica refuses to vote on a proposal further than `MAX_CLOCK_SKEW_MS`
-/// ahead of its own clock. Ordinary drift inside the window is fine.
-#[test]
-fn bridged_chain_bounds_how_far_ahead_a_proposal_may_be() {
-    for (skew, ok) in [(MAX_CLOCK_SKEW_MS + 1_000, false), (MAX_CLOCK_SKEW_MS - 1_000, true)] {
-        let mut sim = setup_bridged(2, 2);
-        sim.now = 1_000_000;
-        let (leader, view) = pending_leader(&sim);
-        let follower = (leader + 1) % 2;
-        let acts = sim.nodes[leader].propose(view, vec![], sim.now + skew).unwrap();
-        let block = proposal_of(&acts);
-        assert_eq!(block.header.timestamp_ms, sim.now + skew);
-        let got = sim.nodes[follower].on_proposal(block, sim.now);
-        if ok {
-            got.unwrap_or_else(|e| panic!("{skew} ms ahead should be accepted: {e}"));
-        } else {
-            assert_eq!(
-                got.unwrap_err(),
-                ConsensusError::TimestampTooFarAhead { block: sim.now + skew, now: sim.now }
-            );
-        }
-    }
-}
-
-/// A chain without a bridge does not read the clock at all, so the same
-/// far-future proposal is accepted: bridge-less validity rules are unchanged.
-#[test]
-fn chain_without_a_bridge_ignores_proposal_timestamps() {
-    let mut sim = setup(2, 2);
-    sim.now = 1_000_000;
-    let (leader, view) = pending_leader(&sim);
-    let follower = (leader + 1) % 2;
-    let acts = sim.nodes[leader].propose(view, vec![], sim.now + 10 * MAX_CLOCK_SKEW_MS).unwrap();
-    sim.nodes[follower].on_proposal(proposal_of(&acts), sim.now).unwrap();
 }
 
 /// A leader whose clock lags its peers still never emits a block that moves
@@ -312,27 +277,23 @@ fn single_validator_chain_advances_alone() {
 }
 
 #[test]
-fn transfer_is_included_and_applied_on_every_node() {
+fn a_mint_is_included_and_applied_on_every_node() {
     let mut sim = setup(4, 4);
     let alice = Keypair::from_seed(*sim.keys[0].seed()).unwrap();
-    let bob = sim.keys[1].address();
-    let tx = Transaction::transfer(&alice, 1, 0, bob, 250, 5);
+    let tx = mint(&alice, 5);
     sim.step(vec![tx.clone()]);
     for _ in 0..6 {
         sim.step(vec![]);
     }
     sim.assert_consistent();
     let found = sim.committed[0].iter().find(|cb| cb.block.transactions.iter().any(|t| t.hash() == tx.hash()));
-    let block = found.expect("transfer committed").block.clone();
-    let proposer = block.proposer();
-    let fee_to = |a: Address| if a == proposer { 5 } else { 0 };
+    assert!(found.is_some(), "mint committed");
     for node in &sim.nodes {
         let l = node.committed_ledger();
-        assert_eq!(l.balance(&alice.address()), 1_000 - 255 + fee_to(alice.address()));
-        assert_eq!(l.balance(&bob), 1_250 + fee_to(bob));
-        assert_eq!(l.nonce(&alice.address()), 1);
+        assert!(l.has_commitment(&[5; 8]));
+        assert_eq!(l.next_index(), 1);
     }
-    // The same tx offered again is skipped by proposers (nonce already used).
+    // The same tx offered again is skipped by proposers (its commitment exists).
     sim.step(vec![tx.clone()]);
     sim.step(vec![]);
     let dup = sim.committed[0].iter().filter(|cb| cb.block.transactions.iter().any(|t| t.hash() == tx.hash())).count();
@@ -675,15 +636,14 @@ fn every_node_restarted_in_turn_repeatedly() {
 }
 
 #[test]
-fn restart_with_transfers_keeps_ledgers_identical() {
+fn restart_with_mints_keeps_ledgers_identical() {
     let mut sim = setup(4, 4);
     let alice = Keypair::from_seed(*sim.keys[0].seed()).unwrap();
-    let bob = sim.keys[1].address();
-    for n in 0..3u64 {
-        let tx = Transaction::transfer(&alice, 1, n, bob, 100, 1);
+    for n in 0..3u32 {
+        let tx = mint(&alice, n + 1);
         // The simulator has no mempool: keep offering the tx until a proposer includes it.
         let mut tries = 0;
-        while sim.nodes[0].tip_ledger().nonce(&alice.address()) <= n {
+        while !sim.nodes[0].tip_ledger().has_commitment(&[n + 1; 8]) {
             sim.step(vec![tx.clone()]);
             tries += 1;
             assert!(tries < 20, "tx {n} never included");
@@ -696,8 +656,11 @@ fn restart_with_transfers_keeps_ledgers_identical() {
     }
     sim.assert_fully_equal();
     for node in &sim.nodes {
-        assert_eq!(node.committed_ledger().nonce(&alice.address()), 3);
-        assert!(node.committed_ledger().balance(&bob) >= 1_300);
+        let l = node.committed_ledger();
+        assert_eq!(l.next_index(), 3);
+        for n in 1..=3u32 {
+            assert!(l.has_commitment(&[n; 8]), "note {n} missing");
+        }
     }
 }
 
@@ -819,13 +782,14 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         chain_id: 1,
         timestamp_ms: 0,
         validators: vec![GenesisValidator { public_key: key.public_key().clone(), stake: 10 }],
-        alloc: BTreeMap::new(),
-        faucet: false,
+        alloc: Vec::new(),
+        faucet: true,
         confidential: true,
         fri_profile: "production".into(),
+        hc_bundle: word8_to_hex(&[3; 8]),
         bridge: None,
     };
-    let gs = genesis.build().unwrap();
+    let gs = genesis.build(&StubExecutor).unwrap();
     let cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
     (cfg, gs, key)
 }

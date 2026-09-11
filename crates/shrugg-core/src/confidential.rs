@@ -145,10 +145,9 @@ impl ConfidentialExecutor for StubExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::Keypair;
 
     fn record(id: Hash) -> ProgramRecord {
-        ProgramRecord { id, base_pc: 0, words: vec![0x13], code_hash: vec![], deployer: Keypair::from_seed([1; 32]).unwrap().address(), deployed_at: 0 }
+        ProgramRecord { id, base_pc: 0, words: vec![0x13], code_hash: vec![], deployed_at: 0 }
     }
 
     #[test]
