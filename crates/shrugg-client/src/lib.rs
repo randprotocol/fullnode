@@ -3,15 +3,57 @@
 //! Phase S1 redacted the chain: there are no accounts, no balances and no bridge, so the
 //! account-shaped and bridge-shaped calls this module used to carry are gone with the RPC
 //! methods that answered them. What remains is the chain-state surface a wallet still needs
-//! (`shrugg_getCommitments`/`getNullifiers`/`getAnchor`/`getWitness`/`getTreeInfo` land in
-//! Task 5 alongside the wallet that scans with them) plus the faucet mint the cluster tests
-//! drive their traffic with.
+//! (`shrugg_getCommitments`/`getNullifiers`/`getAnchor`/`getWitness`/`getTreeInfo`, decoded
+//! here into the `shrugg-core` types [`wallet`] scans with) plus the faucet mint the cluster
+//! tests drive their traffic with.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+use shrugg_core::notes::{word8_from_hex, Envelope, Word8, DEPTH};
 use shrugg_core::program::ProgramId;
 use shrugg_core::{Hash, Transaction};
 use std::time::{Duration, Instant};
+
+pub mod wallet;
+
+/// One leaf of the commitment tree as `shrugg_getCommitments` reports it: the leaf index, the
+/// commitment, the envelope published with it, and the block it landed in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitmentRow {
+    pub index: u64,
+    pub cm: Word8,
+    pub envelope: Envelope,
+    pub height: u64,
+}
+
+/// `shrugg_getTreeInfo`: how far a wallet still has to scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeInfo {
+    pub next_index: u64,
+    pub root: Word8,
+    pub nullifiers: u64,
+}
+
+/// A `Word8` field of an RPC reply, as 64 hex characters.
+fn word8_at(v: &Value, field: &str) -> Result<Word8> {
+    let s = v.get(field).and_then(|x| x.as_str()).with_context(|| format!("{field} missing"))?;
+    word8_from_hex(s).with_context(|| format!("{field} is not 64 hex characters"))
+}
+
+/// A hex byte string field of an RPC reply.
+fn bytes_at(v: &Value, field: &str) -> Result<Vec<u8>> {
+    let s = v.get(field).and_then(|x| x.as_str()).with_context(|| format!("{field} missing"))?;
+    hex::decode(s).with_context(|| format!("{field} is not hex"))
+}
+
+fn envelope_at(v: &Value) -> Result<Envelope> {
+    Ok(Envelope {
+        kem_ct: bytes_at(v, "kem_ct")?,
+        to_receiver: bytes_at(v, "to_receiver")?,
+        to_sender: bytes_at(v, "to_sender")?,
+        body: bytes_at(v, "body")?,
+    })
+}
 
 #[derive(Clone)]
 pub struct RpcClient {
@@ -170,35 +212,71 @@ impl RpcClient {
         self.call("shrugg_getBlockByHash", json!([h.to_hex()])).await
     }
 
-    // ---- shielded chain state (the wallet's scan surface; driven in Task 5) ----
+    // ---- shielded chain state (the wallet's scan surface) ----
 
-    /// A page of the commitment tree's leaves from `from` (a leaf index), newest last.
-    pub async fn commitments(&self, from: u64, limit: usize) -> Result<Value> {
-        self.call("shrugg_getCommitments", json!([from, limit])).await
+    /// A page of the commitment tree's leaves from leaf index `from`, oldest first. The node
+    /// caps a page at 1000 rows however large `limit` is, so a caller pages until the reply is
+    /// short or empty rather than trusting one call to return everything.
+    pub async fn commitments(&self, from: u64, limit: usize) -> Result<Vec<CommitmentRow>> {
+        let v = self.call("shrugg_getCommitments", json!([from, limit])).await?;
+        let rows = v.as_array().context("getCommitments did not return a list")?;
+        rows.iter()
+            .map(|r| {
+                Ok(CommitmentRow {
+                    index: r["index"].as_u64().context("index")?,
+                    cm: word8_at(r, "cm")?,
+                    envelope: envelope_at(r.get("envelope").context("envelope")?)?,
+                    height: r["height"].as_u64().context("height")?,
+                })
+            })
+            .collect()
     }
 
-    /// Every nullifier published from block `from_height` onwards.
-    pub async fn nullifiers(&self, from_height: u64, limit: usize) -> Result<Value> {
-        self.call("shrugg_getNullifiers", json!([from_height, limit])).await
+    /// Every nullifier published from block `from_height` onwards, as `(height, nullifier)`.
+    pub async fn nullifiers(&self, from_height: u64, limit: usize) -> Result<Vec<(u64, Word8)>> {
+        let v = self.call("shrugg_getNullifiers", json!([from_height, limit])).await?;
+        let rows = v.as_array().context("getNullifiers did not return a list")?;
+        rows.iter().map(|r| Ok((r["height"].as_u64().context("height")?, word8_at(r, "nullifier")?))).collect()
     }
 
-    /// The tree root a prover anchors against: the head's, or a specific height's.
-    pub async fn anchor(&self, height: Option<u64>) -> Result<Value> {
+    /// The tree root a prover anchors against: the head's (`None`), or a specific height's.
+    pub async fn anchor(&self, height: Option<u64>) -> Result<(u64, Word8)> {
         let params = match height {
             Some(h) => json!([h]),
             None => json!([]),
         };
-        self.call("shrugg_getAnchor", params).await
+        let v = self.call("shrugg_getAnchor", params).await?;
+        Ok((v["height"].as_u64().context("height")?, word8_at(&v, "root")?))
     }
 
-    /// The Merkle witness of leaf `index` against the current root.
-    pub async fn witness(&self, index: u64) -> Result<Value> {
-        self.call("shrugg_getWitness", json!([index])).await
+    /// The Merkle witness of leaf `index` — `(root, siblings leaf-first)`. The root is the
+    /// tree's *current* root, which is why a wallet checks it against the anchor it proved
+    /// under rather than assuming the two agree.
+    pub async fn witness(&self, index: u64) -> Result<(Word8, [Word8; DEPTH])> {
+        let v = self.call("shrugg_getWitness", json!([index])).await?;
+        if v.is_null() {
+            return Err(anyhow!("no leaf at index {index}"));
+        }
+        let root = word8_at(&v, "root")?;
+        let list = v["path"].as_array().context("path")?;
+        if list.len() != DEPTH {
+            return Err(anyhow!("witness path is {} levels, expected {DEPTH}", list.len()));
+        }
+        let mut path = [[0u32; 8]; DEPTH];
+        for (slot, w) in path.iter_mut().zip(list) {
+            *slot = word8_from_hex(w.as_str().unwrap_or_default()).context("path level is not 64 hex characters")?;
+        }
+        Ok((root, path))
     }
 
     /// `{next_index, root, nullifiers}` — enough for a wallet to know how far it has scanned.
-    pub async fn tree_info(&self) -> Result<Value> {
-        self.call("shrugg_getTreeInfo", json!([])).await
+    pub async fn tree_info(&self) -> Result<TreeInfo> {
+        let v = self.call("shrugg_getTreeInfo", json!([])).await?;
+        Ok(TreeInfo {
+            next_index: v["next_index"].as_u64().context("next_index")?,
+            root: word8_at(&v, "root")?,
+            nullifiers: v["nullifiers"].as_u64().context("nullifiers")?,
+        })
     }
 }
 
