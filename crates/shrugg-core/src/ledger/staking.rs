@@ -271,6 +271,11 @@ fn check_unbond(
     Ok(())
 }
 
+/// What an action reaching this module that it does not own gets. Only a routing mistake in
+/// [`super::Ledger::validate_inner`] can produce one, and refusing it is the safe answer: `Ok`
+/// would let a mis-routed action skip the rules of the module that does own it.
+const NOT_STAKING: TxError = TxError::UnsupportedAction("staking");
+
 /// The action step of admission (spec §7 step 7) for the three staking actions.
 pub(super) fn validate(
     ledger: &Ledger,
@@ -293,7 +298,7 @@ pub(super) fn validate(
                 return Err(TxError::CommitmentExists(cm));
             }
         }
-        _ => {}
+        _ => return Err(NOT_STAKING),
     }
     Ok(())
 }
@@ -324,7 +329,7 @@ pub(super) fn apply(
             ledger.withdraw(validator, *amount, *nonce, r, envelope, signature, tx.chain_id)?;
             ledger.append_deposit(cm, envelope.clone(), executor)?;
         }
-        _ => {}
+        _ => return Err(NOT_STAKING),
     }
     Ok(())
 }
@@ -693,6 +698,19 @@ mod tests {
         let ok = withdraw_tx(&l, 30, &v, 200, 0, [3; 8]);
         l.apply_tx(&ok, &v.address(), &StubExecutor).unwrap();
         assert!(l.validators()[&v.address()].pending.is_empty());
+    }
+
+    /// Fail closed: an action this module does not own is refused rather than waved through,
+    /// and `validate` and `apply` answer alike. Only a dispatch bug can get here, which is
+    /// exactly the case where `Ok(())` would silently skip the action's real rules.
+    #[test]
+    fn a_non_staking_action_routed_here_is_refused() {
+        let mut l = ledger(vec![entry(&key(1), MIN_STAKE, payout(1))]);
+        let t = Transaction { chain_id: CHAIN, bundle: None, action: Action::None };
+        for a in [Action::None, Action::Deploy { base_pc: 0, words: vec![0x13; 2] }] {
+            assert_eq!(validate(&l, &t, &a, &StubExecutor), Err(NOT_STAKING), "{a:?}");
+            assert_eq!(apply(&mut l, &t, &a, &StubExecutor), Err(NOT_STAKING), "{a:?}");
+        }
     }
 
     /// The nonce is per validator, not per chain: a signature never carries across keys.

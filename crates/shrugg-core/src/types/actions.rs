@@ -58,7 +58,14 @@ impl CallEnvelope {
 }
 
 /// What a validator signs to claim an address in the register: the chain and the payout
-/// address. The key itself is not in the message — it is what verifies the signature.
+/// address. The key itself is not in the message — it is what verifies the signature, so a
+/// valid signature already proves possession of `registration.public_key`.
+///
+/// The message therefore binds chain and payout only; what binds the registration to the
+/// address it is claiming is a separate rule the message cannot carry: the enclosing
+/// `Action::Bond`'s `validator` field must equal `registration.public_key.address()`, and
+/// S2's validation asserts it. Without that check a bond could register one key's payout
+/// under another key's address.
 pub fn registration_message(chain_id: u64, payout: &ShieldedAddress) -> Hash {
     let bytes = bincode::serialize(&(chain_id, payout)).expect("serializes");
     Hash::digest_domain(b"shrugg-register", &bytes)

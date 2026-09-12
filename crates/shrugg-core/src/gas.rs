@@ -50,14 +50,13 @@ pub fn fee_floor(action: &Action) -> u64 {
         Action::None => BUNDLE_BASE,
         Action::Deploy { words, .. } => BUNDLE_BASE + deploy_fee(words.len()),
         Action::Call { .. } => BUNDLE_BASE + CALL_BASE,
-        // S2/S3 scaffold: the five new actions pay the plain bundle base until their phase
-        // lands and refines the floor (staking has no proving work of its own; a bridge
-        // attestation's decode and a burn's second bundle proof are priced in S3).
-        Action::Bond { .. }
-        | Action::Unbond { .. }
-        | Action::Withdraw { .. }
-        | Action::BridgeAttest { .. }
-        | Action::BridgeBurn { .. } => BUNDLE_BASE,
+        // S2 scaffold: staking has no proving work of its own, so the plain bundle base is
+        // likely its final floor; S2 owns this arm and confirms or refines it.
+        Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. } => BUNDLE_BASE,
+        // S3 scaffold: the bundle base until S3 prices the work these buy — an attestation's
+        // decode and guardian signature recovery, and a burn's second bundle proof. S3 owns
+        // this arm, so the two phases never touch the same line.
+        Action::BridgeAttest { .. } | Action::BridgeBurn { .. } => BUNDLE_BASE,
     }
 }
 
@@ -92,12 +91,35 @@ mod tests {
         );
     }
 
-    /// S2/S3 scaffold: every new action pays exactly the bundle base, no more and no less.
+    fn env() -> crate::notes::Envelope {
+        crate::notes::Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] }
+    }
+
+    /// S2 scaffold: each staking action pays exactly the bundle base, no more and no less.
+    /// S2 owns this test and its arm of [`fee_floor`].
     #[test]
-    fn the_staking_and_bridge_actions_pay_the_bundle_base() {
-        use crate::crypto::Address;
-        use crate::notes::Envelope;
-        let env = || Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] };
+    fn the_staking_actions_pay_the_bundle_base() {
+        use crate::crypto::{Address, Signature};
+        for a in [
+            Action::Bond { validator: Address([1; 32]), amount: 1, registration: None },
+            Action::Unbond { validator: Address([1; 32]), amount: 1, nonce: 0, signature: Signature::empty() },
+            Action::Withdraw {
+                validator: Address([1; 32]),
+                amount: 1,
+                nonce: 0,
+                r: [0; 8],
+                envelope: env(),
+                signature: Signature::empty(),
+            },
+        ] {
+            assert_eq!(fee_floor(&a), BUNDLE_BASE, "{a:?}");
+        }
+    }
+
+    /// S3 scaffold: each bridge action pays exactly the bundle base, no more and no less.
+    /// S3 owns this test and its arm of [`fee_floor`].
+    #[test]
+    fn the_bridge_actions_pay_the_bundle_base() {
         let b = crate::notes::Bundle {
             anchor: [0; 8],
             nullifiers: [[0; 8], [1; 8]],
@@ -110,21 +132,6 @@ mod tests {
             proof: vec![],
         };
         for a in [
-            Action::Bond { validator: Address([1; 32]), amount: 1, registration: None },
-            Action::Unbond {
-                validator: Address([1; 32]),
-                amount: 1,
-                nonce: 0,
-                signature: crate::crypto::Signature::empty(),
-            },
-            Action::Withdraw {
-                validator: Address([1; 32]),
-                amount: 1,
-                nonce: 0,
-                r: [0; 8],
-                envelope: env(),
-                signature: crate::crypto::Signature::empty(),
-            },
             Action::BridgeAttest {
                 attestation: vec![],
                 recipient: crate::notes::ShieldedAddress { pk: [0; 8], kem_ek: vec![] },
