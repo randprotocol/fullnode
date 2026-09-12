@@ -140,7 +140,7 @@ publishes `H_NF(nk, cm)` for each input, and a second transaction spending the s
 rejected with `nullifier already spent` — no nonces, and nothing per-sender to order.
 
 **Cheap checks before expensive checks.** Verifying a bundle proof costs roughly 16–20 ms once its
-verifier key is warm (`docs/confidential.md`) and materially longer the first time. Left
+verifier key is warm (`docs/confidential.md` (and `docs/zkvm.md` for the machine itself)) and materially longer the first time. Left
 unguarded, an attacker could flood a node with syntactically-valid, cryptographically-bogus
 transactions and burn CPU on proof verification for each one. `Ledger::validate_inner` therefore
 runs the spec §7 order — size caps, chain id, shape and fee floor, anchor, time, nullifier and
