@@ -427,7 +427,7 @@ never the real cycle count.
 `Machine::prove` (or, behind `--cuda`, `prove_with(Backend::Cuda)` — the batch STARK's NTTs and
 Poseidon2 Merkle commitments run on an attached NVIDIA GPU instead of the CPU; there is no fallback,
 so a missing driver, missing PTX, or a tier too large for device memory is a hard error rather than
-a silent CPU run) builds seven interconstrained trace tables for this execution: `program` (now a
+a silent CPU run) builds eight interconstrained trace tables for this execution (`docs/zkvm.md` describes them): `program` (now a
 witness, decoded in-circuit — no longer the verifier's own preprocessed copy), `cpu` (whose first
 rows are a *digest prefix* that absorbs the whole program through Poseidon2, one permutation per up
 to four words, computing `hc` as part of the trace itself), `memory`, `alu`, `range`, `nibble` (the
@@ -438,9 +438,10 @@ balances here — never appear in any public column; they only steer which trace
 FRI is run in hiding mode, so two proofs of the identical execution are different bytes — proofs
 don't fingerprint the specific inputs that produced them.
 
-The proof publishes exactly 18 public values (`tables::cpu::pv`): `PC_ENTRY` (1 word), `TIER` (1
-word), `OUT0..OUT0+7` (the eight output words), `HC0..HC0+7` (the 8-word program digest). It is
-serialized as `Proof { tier, program_log_height, public_values, batch }`, postcard-encoded — the
+The proof publishes exactly 26 public values (`tables::cpu::pv`): `PC_ENTRY` (1 word), `TIER` (1
+word), `OUT0..OUT0+7` (the eight output words), `HC0..HC0+7` (the 8-word program digest), and
+`IN0..IN0+7` (the salted private-input commitment `H_IN`, milestone 4.1). It is serialized as
+`Proof { tier, program_log_height, input_log_height, public_values, batch }`, postcard-encoded — the
 same shape `Action::Call.proof` carries. Measured upstream on a different guest (`fib`) at tier 10
 under the current constraint set (`docs/confidential.md`): proof size 268 KB, prove time 3.1 s,
 first (uncached) verify 16 ms. The README's own measurement of `private_payment` specifically (an
@@ -544,7 +545,8 @@ through the real executor); full mode additionally re-checks every proposer sign
 
 ## 11. Pointers
 
-- `docs/confidential.md` — the zkVM's tables, syscalls, gas schedule, constraint-set history (why a
+- `docs/zkvm.md` — the zkVM's ISA, tables, syscalls and execution model.
+- `docs/confidential.md` — the on-chain call model, gas schedule, constraint-set history (why a
   zkVM upgrade is a hard fork), and the `--cuda` GPU proving path in full.
 - `docs/zkvm-milestones.md` — being written alongside this page; tracks the zkVM's milestone history
   in more detail than the constraint-set notes here.

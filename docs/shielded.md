@@ -150,7 +150,10 @@ Three things to know about spending:
   resolves it — the nullifier appeared, or the blocks the wallet has read reach past
   `time + TIME_WINDOW` (256 blocks), after which that bundle can never be admitted and the note
   is spendable again. Every `sync` reads up to the head it saw when it started, whether or not
-  those blocks spent anything, so the second condition arrives on a quiet chain too.
+  those blocks spent anything, so the second condition arrives on a quiet chain too. That head,
+  and therefore the moment a pending note clears, is whatever the node the wallet points at
+  reports: a node that lies about its head can make the wallet retry a spend the chain will
+  refuse as spent, never lose funds.
 - **The fee floor is 0.001 SHRUGG** for a transfer, plus the action's own floor for a deploy or a
   call. `shrugg fee` asks the node rather than guessing.
 
