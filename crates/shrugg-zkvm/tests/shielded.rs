@@ -102,7 +102,7 @@ fn a_bundle_proves_and_the_executor_verifies_it() {
     // Emulate first, in milliseconds, and check the witness against the core-side recompute before
     // paying for a proof: a witness the guest taints (`bad != 0`) publishes a digest no plaintext
     // can reproduce, and finding that out after the prover has run costs minutes.
-    let emulated = shrugg_zkvm::emulator::execute(&ZkExecutor::bundle_program(), &inputs, 50_000_000).unwrap();
+    let emulated = shrugg_zkvm::emulator::execute(ZkExecutor::bundle_program(), &inputs, 50_000_000).unwrap();
     assert_eq!(ex.bundle_digest(&di), emulated.outputs, "the witness is tainted or the digest preimage disagrees");
     let started = std::time::Instant::now();
     let (proof, digest, tier) = prove_bundle(FriProfile::Test, &inputs, Backend::Cpu).unwrap();
@@ -112,6 +112,6 @@ fn a_bundle_proves_and_the_executor_verifies_it() {
     assert_eq!(ex.bundle_proof_digest(&proof).unwrap(), digest);
     ex.verify_bundle(&ZkExecutor::hc_bundle(), &proof).unwrap();
     assert!(ex.verify_bundle(&[1u32; 8], &proof).is_err());
-    let e = seal_note(&vk, &me, &out1, &TxKey::random());
+    let e = seal_note(&vk, &me, &out1, &TxKey::random()).unwrap();
     assert!(e.len() <= shrugg_core::notes::MAX_ENVELOPE_BYTES);
 }

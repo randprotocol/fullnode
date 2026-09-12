@@ -19,8 +19,19 @@ pub fn address_of(vk: &ViewingKey) -> ShieldedAddress {
     ShieldedAddress { pk: a.pk, kem_ek: a.kem_ek }
 }
 
-pub fn to_research(a: &ShieldedAddress) -> viewing::Address {
-    viewing::Address { pk: a.pk, kem_ek: a.kem_ek.clone() }
+/// The research crate's `viewing::Address`. `ShieldedAddress` is a plain deserialisable record,
+/// so its `kem_ek` can be any length by the time it reaches here — an RPC parameter, a genesis
+/// file, a gossiped envelope. ML-KEM-768 encapsulation panics on a wrong-length key, so the
+/// length is checked here, once, and reported rather than aborting the node.
+pub fn to_research(a: &ShieldedAddress) -> Result<viewing::Address, String> {
+    if a.kem_ek.len() != shrugg_core::notes::KEM_EK_BYTES {
+        return Err(format!(
+            "shielded address kem_ek is {} bytes, expected {}",
+            a.kem_ek.len(),
+            shrugg_core::notes::KEM_EK_BYTES
+        ));
+    }
+    Ok(viewing::Address { pk: a.pk, kem_ek: a.kem_ek.clone() })
 }
 
 pub fn envelope_to_core(e: &viewing::Envelope) -> Envelope {
@@ -44,8 +55,8 @@ pub fn envelope_from_core(e: &Envelope) -> viewing::Envelope {
 /// Seals `note` to `to`, with a copy of `tx_key` wrapped under `sender`'s outgoing viewing key.
 /// `tx_key` must be fresh per envelope — see `viewing::TxKey`'s doc comment for why that
 /// obligation is the wallet's and cannot be enforced here.
-pub fn seal_note(sender: &ViewingKey, to: &ShieldedAddress, note: &Note, tx_key: &TxKey) -> Envelope {
-    envelope_to_core(&viewing::Envelope::seal(sender, &to_research(to), note, tx_key))
+pub fn seal_note(sender: &ViewingKey, to: &ShieldedAddress, note: &Note, tx_key: &TxKey) -> Result<Envelope, String> {
+    Ok(envelope_to_core(&viewing::Envelope::seal(sender, &to_research(to)?, note, tx_key)))
 }
 
 /// The public preimage of a bundle digest, in spec field order — the argument list
@@ -74,13 +85,16 @@ mod tests {
         let a = address_of(&vk);
         assert_eq!(a.pk, vk.pk());
         assert_eq!(a.kem_ek.len(), shrugg_core::notes::KEM_EK_BYTES);
-        assert_eq!(to_research(&a), vk.address());
+        assert_eq!(to_research(&a).unwrap(), vk.address());
+        // A wrong-length encapsulation key is an error, not a panic inside ML-KEM.
+        let short = ShieldedAddress { pk: a.pk, kem_ek: vec![0; 7] };
+        assert!(to_research(&short).unwrap_err().contains("7 bytes"));
         // The text form parses back to the same address, so a wallet can hand one out as a string.
         assert_eq!(shrugg_core::notes::ShieldedAddress::parse(&a.to_string()).unwrap(), a);
 
         let note = Note::new(vk.pk(), vk.pk(), 7, 0, 3);
         let key = TxKey::random();
-        let sealed = seal_note(&vk, &a, &note, &key);
+        let sealed = seal_note(&vk, &a, &note, &key).unwrap();
         let research = envelope_from_core(&sealed);
         assert_eq!(envelope_to_core(&research), sealed);
         assert_eq!(research.open_as_receiver(note.commitment(), &vk).map(|(_, n)| n), Some(note));

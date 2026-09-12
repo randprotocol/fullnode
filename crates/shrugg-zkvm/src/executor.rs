@@ -130,8 +130,14 @@ impl ZkExecutor {
     /// The bundle guest (`guests::bundle`), the one program every shielded-pool proof on this
     /// chain is against. Vendored verbatim from the research crate — see
     /// `tests/shielded.rs`'s `RESEARCH_HC_BUNDLE_HEX`, which pins its digest to upstream's.
-    pub fn bundle_program() -> Program {
-        crate::guests::bundle()
+    ///
+    /// Assembled once per process: `bundle_heights` below calls this on every bundle admission
+    /// (twice, in fact — `bundle_proof_digest` then `verify_bundle`), and re-running the
+    /// assembler for a 3811-word guest on each gossiped transaction is pure waste. The guest is
+    /// a compile-time constant, so a `OnceLock` is the whole of the cache invalidation story.
+    pub fn bundle_program() -> &'static Program {
+        static BUNDLE: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+        BUNDLE.get_or_init(crate::guests::bundle)
     }
 
     /// Digest of the vendored `bundle` guest — the value a genesis pins as `hc_bundle`.
@@ -315,8 +321,18 @@ pub fn prove(
 /// yields is a digest the ledger can recompute from the bundle's published plaintext
 /// (`ConfidentialExecutor::bundle_digest`); a tainted run's digest matches no such plaintext.
 pub fn prove_bundle(profile: FriProfile, inputs: &[u32], backend: Backend) -> Result<(Vec<u8>, Word8, u8), String> {
+    // The guest reads a fixed-width private-input vector (`notes::bundle_input::COUNT`); a
+    // shorter one makes the emulator read past the end and a longer one silently ignores the
+    // tail, so neither is a prove request that could ever produce an admissible bundle.
+    if inputs.len() != crate::notes::bundle_input::COUNT {
+        return Err(format!(
+            "bundle inputs must be exactly {} words, got {}",
+            crate::notes::bundle_input::COUNT,
+            inputs.len()
+        ));
+    }
     let m = Machine::new(profile);
     let program = ZkExecutor::bundle_program();
-    let (proof, exec) = m.prove_with(backend, &program, inputs, None).map_err(|e| format!("{e:?}"))?;
+    let (proof, exec) = m.prove_with(backend, program, inputs, None).map_err(|e| format!("{e:?}"))?;
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }
