@@ -322,8 +322,8 @@ quietly downgraded to one.
 
 Covered end to end by `a_call_envelope_is_opened_by_the_caller_and_the_auditor_only`
 (`crates/shrugg-node/tests/cluster.rs`), which opens the bytes a *node* served as the caller and as
-the auditor, fails to open them as a fourth wallet, and catches both a tampered transcript (the
-faithfulness check) and a tampered ciphertext (the AEAD).
+the auditor, fails to open them as a third wallet that is neither, and catches both a tampered
+transcript (the faithfulness check) and a tampered ciphertext (the AEAD).
 
 ## Chains without confidential computation
 

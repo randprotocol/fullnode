@@ -49,18 +49,36 @@ pub(super) fn validate(
             // `time` gets. A comparison, bought before an attestation buys any work.
             ledger.check_time(*time)?;
             let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
+            // The `asset` compare, bought before the quorum. The action names the index its
+            // envelope was sealed for, and `check_attest` below would not report it until after a
+            // quorum of secp256k1 recoveries — which is exactly the cost that method's own
+            // contract promises nothing unverified can buy. So the index is resolved here instead,
+            // from the wire bytes and the registry alone: one extra decode of an already
+            // size-capped attestation, no signature work, and the same two functions the mempool
+            // screens pooled attests with (`Mempool::still_applies`).
+            //
+            // Silent on anything this pair cannot answer — a rotation, bytes that do not decode,
+            // an amount no note could hold, a full registry — each of which is `check_attest`'s
+            // refusal to make and reports a better error than a mismatched index would.
+            if let Some((id, _)) = attested_transfer(attestation) {
+                if let Some(index) = bridge.deposit_index(&id) {
+                    if index != *asset {
+                        return Err(TxError::AttestAssetMismatch { expected: index, actual: *asset });
+                    }
+                }
+            }
             // The attestation's size cap ran at step 1, before this decode. `check_attest` is
             // itself ordered cheap-before-expensive: it decodes, resolves the guardian set,
             // rejects a replayed digest and checks the payload before recovering a signature.
             let checked = bridge.check_attest(attestation, ledger.now_secs()).map_err(TxError::Bridge)?;
             if let AttestPlan::Transfer(t) = checked.plan() {
-                // The index this deposit will carry, as the registry resolves it: the entry the
-                // asset already has, or the one this transaction's own registration would assign
-                // (`BridgeState::asset_entry`). The action had to name it, because the recipient's
-                // envelope is sealed against a commitment containing it — so an integer compare,
-                // before the recipient hash and before the commitment is computed, decides whether
-                // this transaction still deposits the note it was built for. Nothing here changes
-                // which asset `apply` registers; it only refuses a transaction that disagrees.
+                // Redundant by construction with the pre-screen above — both read the same asset
+                // id out of the same bytes and the same `next_index` — and kept because it is a
+                // single integer compare and it is *this* index that `apply` stamps into the note
+                // (`AttestPlan::Transfer`'s own `info.index`). If the two paths ever drifted, a
+                // deposit would land under a word the envelope was not sealed for, which is the
+                // whole failure this field exists to prevent; free is a good price for ruling it
+                // out. Nothing here changes which asset `apply` registers.
                 if t.info.index != *asset {
                     return Err(TxError::AttestAssetMismatch { expected: t.info.index, actual: *asset });
                 }
@@ -327,6 +345,15 @@ mod tests {
         ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
     }
 
+    /// The same `body` signed by five keys that are in no guardian set. Everything about it
+    /// decodes and passes every cheap check; only the quorum — the expensive half, one secp256k1
+    /// recovery per signature — can tell that it is worthless.
+    fn misattest(body: Body) -> Vec<u8> {
+        let d = digest(&body.encode());
+        let signatures = (0..5u8).map(|i| sign_digest(&[0x90 + i; 32], i, &d)).collect();
+        Attestation { guardian_set_index: 0, signatures, body }.encode()
+    }
+
     /// Signs `body` with five of the six guardian secrets (a quorum) and encodes it.
     fn attest(secrets: &[[u8; 32]], body: Body) -> Vec<u8> {
         let d = digest(&body.encode());
@@ -559,6 +586,42 @@ mod tests {
             assert!(!scratch.has_commitment(&expected_cm(1, 500, 1)), "no deposit note under asset {wrong}");
             assert!(!scratch.is_digest_spent(&mu), "and the attestation is still unconsumed");
         }
+    }
+
+    /// And it is refused *cheaply*: an attestation nobody in the guardian set signed still comes
+    /// back as a mismatched index, which is only possible if the compare happens before the quorum
+    /// is verified. `BridgeState::check_attest`'s contract is that nothing unverified buys a round
+    /// of secp256k1 recoveries, and resolving the index needs no signature work at all — the wire
+    /// bytes and the registry answer it (`attested_transfer` + `BridgeState::deposit_index`).
+    ///
+    /// The second half is what makes the first half meaningful: the *same* transaction with the
+    /// right index goes on to fail on the quorum, so the ordering is what the two answers differ
+    /// by, not some earlier refusal both would have hit.
+    #[test]
+    fn a_wrong_asset_index_is_refused_before_any_signature_recovery() {
+        let (mut l, secrets) = ledger();
+        deposit(&mut l, &secrets, 1_000, 0, 20);
+        let forged = misattest(transfer(500, 0, recipient().recipient_hash(), 1));
+        let tx = attest_tx(&l, forged, recipient(), 30);
+        assert_eq!(
+            l.validate(&naming_asset(tx.clone(), 2), &StubExecutor),
+            Err(TxError::AttestAssetMismatch { expected: 1, actual: 2 }),
+            "the index compare gets there before a single recovery"
+        );
+        assert!(
+            matches!(l.validate(&tx, &StubExecutor), Err(TxError::Bridge(BridgeError::Verify(_)))),
+            "and with the index right, the quorum is what is left to refuse it"
+        );
+        // A first sighting is screened the same way, off `next_index` rather than an entry: no
+        // registry row exists for this token, and still no signature is recovered to say so.
+        let other = misattest(transfer_of(OTHER_TOKEN, 700, 0, recipient().recipient_hash(), 2));
+        let tx = attest_tx(&l, other, recipient(), 40);
+        assert_eq!(
+            l.validate(&naming_asset(tx.clone(), 1), &StubExecutor),
+            Err(TxError::AttestAssetMismatch { expected: 2, actual: 1 }),
+            "index 1 is taken; a new token gets next_index"
+        );
+        assert!(matches!(l.validate(&tx, &StubExecutor), Err(TxError::Bridge(BridgeError::Verify(_)))));
     }
 
     /// A first sighting is the one case the index is a *prediction*: the ledger hands the token

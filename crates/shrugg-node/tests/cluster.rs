@@ -1006,6 +1006,10 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     // ---- outbound: the recipient burns part of it, through two bundles in one transaction ----
     let (burn, relayer_fee) = (2_000u64, 100u64);
     let burn_fee = wallet::burn_fee_default();
+    // Pinned here rather than taken on trust from the wallet: the floor this transaction has to
+    // clear is the bundle base once per bundle a node verifies, and a burn is the one transaction
+    // with two (spec §7 item 3). The balance assertion below would hold against a wrong default.
+    assert_eq!(burn_fee, 2 * gas::BUNDLE_BASE);
     let mut recipient_store = NoteStore::default();
     let burned = wallet::submit_burn(
         &n0.rpc,
@@ -1129,7 +1133,8 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
         let (as_auditor, _, audited) =
             call_envelope::open_call_as_auditor(&served, &served_h_in, &auditor.vk).expect("the auditor opens it");
         assert_eq!((as_auditor, audited), (key, inputs_back.clone()));
-        // A fourth wallet is served the same bytes and gets nothing out of either path.
+        // A third wallet — neither the caller nor the auditor — is served the same bytes and gets
+        // nothing out of either path.
         assert!(call_envelope::open_call_as_sender(&served, &served_h_in, &stranger.vk).is_none());
         assert!(call_envelope::open_call_as_auditor(&served, &served_h_in, &stranger.vk).is_none());
         // Nor do the two named parties open each other's part: the wrapped key is a different
