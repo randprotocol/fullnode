@@ -12,6 +12,7 @@ pub mod bridge_notes;
 pub mod call_envelope;
 pub mod staking;
 
+use crate::bridge::{BridgeError, BridgeState};
 use crate::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
 use crate::crypto::{merkle_root, Address, Hash, PublicKey};
 use crate::gas;
@@ -71,11 +72,15 @@ pub enum TxError {
     UnknownAnchor,
     #[error("bundle time {time} is outside [{}, {height}]", height.saturating_sub(TIME_WINDOW))]
     TimeOutOfWindow { time: u32, height: u64 },
-    #[error("the bundle spends the same nullifier twice")]
+    /// One bundle spends a nullifier twice, or — in a `BridgeBurn` — the fee bundle and the
+    /// asset bundle spend the same one. Both are the same double spend within one transaction.
+    #[error("the transaction spends the same nullifier twice")]
     DuplicateNullifierInBundle,
     #[error("nullifier already spent")]
     Spent(Word8),
-    #[error("the bundle creates the same commitment twice")]
+    /// As above, for output notes: a commitment appearing twice in one transaction would be
+    /// appended to the tree twice and be unspendable the second time.
+    #[error("the transaction creates the same commitment twice")]
     DuplicateCommitmentInBundle,
     #[error("commitment already in the tree")]
     CommitmentExists(Word8),
@@ -104,6 +109,23 @@ pub enum TxError {
     BadDigest,
     #[error("invalid bundle proof: {0}")]
     InvalidBundleProof(ConfidentialError),
+    /// Everything the bridge itself refuses: an unknown guardian set, a replayed digest, a
+    /// short quorum, an unregistered asset, an unusable destination (spec §10).
+    #[error("bridge: {0}")]
+    Bridge(BridgeError),
+    /// The `BridgeAttest` carries a shielded address that is not the one the guardians signed
+    /// about. Without this the submitter would choose who receives someone else's deposit.
+    #[error("the attestation names a different recipient")]
+    BridgeRecipientMismatch,
+    /// A `BridgeBurn`'s asset bundle is in the wrong asset, pays a fee, or burns the wrong
+    /// amount. All three are the same mistake — the asset bundle does not match the burn the
+    /// action declares — and all three are caught before either bundle's proof is verified.
+    #[error("the burn's asset bundle is in asset {actual}, not the declared {expected}")]
+    BurnAssetMismatch { expected: u32, actual: u32 },
+    #[error("the burn's asset bundle pays a fee of {0}; the fee is paid by the SHRUGG bundle")]
+    BurnAssetBundleFee(u64),
+    #[error("the burn's asset bundle burns {actual}, not amount + relayer fee = {expected}")]
+    BurnAmountMismatch { expected: u64, actual: u64 },
     #[error("proposer {0} is not in the validator register")]
     UnknownProposer(Address),
     #[error("arithmetic overflow")]
@@ -159,6 +181,10 @@ pub struct Ledger {
     anchors: VecDeque<(u64, Word8)>,
     validators: BTreeMap<Address, ValidatorEntry>,
     programs: BTreeMap<ProgramId, ProgramRecord>,
+    /// The public half of the bridge, present exactly when genesis has a `bridge` section
+    /// (spec §10). `None` makes the two bridge actions inadmissible and leaves the state root
+    /// with the four components a bridge-less chain has always had.
+    bridge: Option<BridgeState>,
     /// Height of the block being applied (the `time` window and `ProgramRecord::deployed_at`).
     height: u64,
     /// Timestamp of the block being applied, in unix milliseconds.
@@ -179,6 +205,7 @@ impl PartialEq for Ledger {
             && self.anchors == o.anchors
             && self.validators == o.validators
             && self.programs == o.programs
+            && self.bridge == o.bridge
     }
 }
 impl Eq for Ledger {}
@@ -209,13 +236,15 @@ impl Ledger {
             anchors,
             validators,
             programs: BTreeMap::new(),
+            bridge: None,
             height: 0,
             timestamp_ms: 0,
         }
     }
 
     /// Rebuild a ledger from stored state. The faucet and confidential switches come from
-    /// genesis, not from storage, so the caller sets them afterwards.
+    /// genesis, not from storage, so the caller sets them afterwards — and so does the bridge,
+    /// via [`Ledger::set_bridge`].
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         chain_id: u64,
@@ -238,6 +267,7 @@ impl Ledger {
             anchors: anchors.into_iter().collect(),
             validators,
             programs,
+            bridge: None,
             height: 0,
             timestamp_ms: 0,
         }
@@ -283,6 +313,28 @@ impl Ledger {
 
     pub fn timestamp_ms(&self) -> u64 {
         self.timestamp_ms
+    }
+
+    /// The block time in unix seconds, which is what the bridge measures guardian-set expiry
+    /// and burn message timestamps in.
+    pub fn now_secs(&self) -> u64 {
+        self.timestamp_ms / 1000
+    }
+
+    /// Install (or clear) the bridge state. Genesis calls this once from its `bridge` section;
+    /// a reloading node calls it with what storage held.
+    pub fn set_bridge(&mut self, bridge: Option<BridgeState>) {
+        self.bridge = bridge;
+    }
+
+    /// The bridge state, or `None` on a chain without a `bridge` section — where the two bridge
+    /// actions are inadmissible and the state root has no fifth component.
+    pub fn bridge(&self) -> Option<&BridgeState> {
+        self.bridge.as_ref()
+    }
+
+    pub fn bridge_mut(&mut self) -> Option<&mut BridgeState> {
+        self.bridge.as_mut()
     }
 
     pub fn tree(&self) -> &CommitmentTree {
@@ -352,12 +404,75 @@ impl Ledger {
         }
     }
 
-    /// Genesis only: append a deposit note without a transaction.
+    /// Append one note the chain created itself rather than accepted from a bundle: a genesis
+    /// alloc note, or the deposit note a `BridgeAttest` mints (spec §10).
     pub fn deposit(&mut self, cm: Word8, executor: &dyn ConfidentialExecutor) -> Result<u64, TxError> {
         if !self.commitments.insert(cm) {
             return Err(TxError::CommitmentExists(cm));
         }
         Ok(self.tree.append(cm, executor))
+    }
+
+    /// Write one admitted bundle's notes: nullifiers into the spent set, commitments into the
+    /// set and the tree. The write half of [`Ledger::check_bundle`], and like it, shared by the
+    /// transaction's fee bundle and a `BridgeBurn`'s asset bundle so the two cannot drift.
+    ///
+    /// Infallible by the time it runs: `check_bundle` established that none of these four
+    /// words is already present.
+    fn apply_bundle_notes(&mut self, b: &Bundle, executor: &dyn ConfidentialExecutor) {
+        for nf in &b.nullifiers {
+            self.nullifiers.insert(*nf);
+        }
+        for cm in &b.commitments {
+            self.commitments.insert(*cm);
+            self.tree.append(*cm, executor);
+        }
+    }
+
+    /// Spec §7 items 4-6 for one bundle: its anchor is live, its `time` is in the window, its
+    /// two nullifiers differ and are unspent, its two commitments differ and are new.
+    ///
+    /// Every bundle on the chain passes through here — the transaction's fee bundle above and a
+    /// `BridgeBurn`'s asset bundle in [`bridge_notes`] — so the two cannot drift apart. What is
+    /// deliberately *not* here is the shape (asset, burn, fee floor): a fee bundle and an asset
+    /// bundle differ in exactly those three fields, and each caller reports its own mismatch.
+    fn check_bundle(&self, b: &Bundle) -> Result<(), TxError> {
+        if !self.is_anchor(&b.anchor) {
+            return Err(TxError::UnknownAnchor);
+        }
+        let t = b.time as u64;
+        if t > self.height || self.height - t > TIME_WINDOW {
+            return Err(TxError::TimeOutOfWindow { time: b.time, height: self.height });
+        }
+        if b.nullifiers[0] == b.nullifiers[1] {
+            return Err(TxError::DuplicateNullifierInBundle);
+        }
+        for nf in &b.nullifiers {
+            if self.nullifiers.contains(nf) {
+                return Err(TxError::Spent(*nf));
+            }
+        }
+        if b.commitments[0] == b.commitments[1] {
+            return Err(TxError::DuplicateCommitmentInBundle);
+        }
+        for cm in &b.commitments {
+            if self.commitments.contains(cm) {
+                return Err(TxError::CommitmentExists(*cm));
+            }
+        }
+        Ok(())
+    }
+
+    /// Spec §7 items 8-9 for one bundle: the digest its proof publishes is the digest its
+    /// plaintext fields hash to, and the proof verifies against the pinned bundle guest. This
+    /// is the expensive half of admission and runs only after every cheap check of *every*
+    /// bundle in the transaction.
+    fn check_bundle_proof(&self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Result<(), TxError> {
+        let published = executor.bundle_proof_digest(&b.proof).map_err(TxError::InvalidBundleProof)?;
+        if published != executor.bundle_digest(&b.digest_input()) {
+            return Err(TxError::BadDigest);
+        }
+        executor.verify_bundle(&self.hc_bundle, &b.proof).map_err(TxError::InvalidBundleProof)
     }
 
     /// Check a transaction against the current state without applying it.
@@ -427,6 +542,10 @@ impl Ledger {
             (Some(b), false) => Some(b),
         };
         if let Some(b) = bundle {
+            // The transaction's own bundle is always the SHRUGG fee bundle and never burns:
+            // value leaves the pool through a `BridgeBurn`'s *asset* bundle, which carries the
+            // asset and the burn and is admitted by [`bridge_notes`] through the same two
+            // helpers below.
             if b.asset != 0 {
                 return Err(TxError::UnsupportedAsset(b.asset));
             }
@@ -437,32 +556,8 @@ impl Ledger {
             if b.fee < min {
                 return Err(TxError::FeeTooLow { min, fee: b.fee });
             }
-            // 4. anchor
-            if !self.is_anchor(&b.anchor) {
-                return Err(TxError::UnknownAnchor);
-            }
-            // 5. time
-            let t = b.time as u64;
-            if t > self.height || self.height - t > TIME_WINDOW {
-                return Err(TxError::TimeOutOfWindow { time: b.time, height: self.height });
-            }
-            // 6. nullifiers and commitments
-            if b.nullifiers[0] == b.nullifiers[1] {
-                return Err(TxError::DuplicateNullifierInBundle);
-            }
-            for nf in &b.nullifiers {
-                if self.nullifiers.contains(nf) {
-                    return Err(TxError::Spent(*nf));
-                }
-            }
-            if b.commitments[0] == b.commitments[1] {
-                return Err(TxError::DuplicateCommitmentInBundle);
-            }
-            for cm in &b.commitments {
-                if self.commitments.contains(cm) {
-                    return Err(TxError::CommitmentExists(*cm));
-                }
-            }
+            // 4-6. anchor, time, nullifiers and commitments
+            self.check_bundle(b)?;
         }
         // 7. action-specific cheap checks
         let mut call_record = None;
@@ -509,11 +604,7 @@ impl Ledger {
         }
         // 8-9. the bundle's digest, then its proof
         if let Some(b) = bundle {
-            let published = executor.bundle_proof_digest(&b.proof).map_err(TxError::InvalidBundleProof)?;
-            if published != executor.bundle_digest(&b.digest_input()) {
-                return Err(TxError::BadDigest);
-            }
-            executor.verify_bundle(&self.hc_bundle, &b.proof).map_err(TxError::InvalidBundleProof)?;
+            self.check_bundle_proof(b, executor)?;
         }
         // 10. the call's own proof, then its tier-dependent fee
         if let (Some(record), Action::Call { proof, .. }) = (call_record, &tx.action) {
@@ -549,13 +640,7 @@ impl Ledger {
             // is the leader.
             let entry = self.validators.get(proposer).ok_or(TxError::UnknownProposer(*proposer))?;
             let rewards = entry.rewards.checked_add(b.fee).ok_or(TxError::Overflow)?;
-            for nf in &b.nullifiers {
-                self.nullifiers.insert(*nf);
-            }
-            for cm in &b.commitments {
-                self.commitments.insert(*cm);
-                self.tree.append(*cm, executor);
-            }
+            self.apply_bundle_notes(b, executor);
             self.validators.get_mut(proposer).expect("looked up above").rewards = rewards;
         }
         let mut receipt = None;
@@ -670,9 +755,15 @@ impl Ledger {
     }
 
     /// Deterministic state commitment (spec §9):
-    /// `blake3("shrugg-state-2" || tree_root || nullifier_root || validators_root || programs_root)`.
+    /// `blake3("shrugg-state-2" || tree_root || nullifier_root || validators_root || programs_root)`,
+    /// with `|| bridge_root` appended on a chain whose genesis has a `bridge` section (spec §10).
     /// The nullifier and validator roots are BLAKE3 Merkle roots over the sorted sets; programs
     /// are content addressed, so their ids commit to the code.
+    ///
+    /// The bridge component is appended, not always present with a zero placeholder, so a
+    /// chain without a bridge commits exactly the 128 bytes phase S1 committed: turning the
+    /// bridge on is a hard fork for the chains that take it and a no-op for the ones that
+    /// do not.
     pub fn state_root(&self) -> Hash {
         let nf_leaves: Vec<Hash> = self
             .nullifiers
@@ -697,6 +788,9 @@ impl Ledger {
         buf.extend_from_slice(merkle_root(&nf_leaves).as_bytes());
         buf.extend_from_slice(merkle_root(&val_leaves).as_bytes());
         buf.extend_from_slice(merkle_root(&prog_leaves).as_bytes());
+        if let Some(bridge) = &self.bridge {
+            buf.extend_from_slice(bridge.root().as_bytes());
+        }
         Hash::digest_domain(b"shrugg-state-2", &buf)
     }
 }
@@ -1058,31 +1152,11 @@ mod tests {
         );
     }
 
-    /// S3 scaffold: the two bridge variants reach [`bridge_notes`] and are refused there. S3's
-    /// Task 2 deletes this test.
-    #[test]
-    fn the_bridge_actions_are_refused_until_phase_s3() {
-        let l = ledger();
-        let recipient = crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
-        refused_until_its_phase(
-            &l,
-            "S3",
-            112,
-            Action::BridgeAttest { attestation: vec![1; 32], recipient, r: [7; 8], envelope: env() },
-        );
-        let asset_bundle = bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], 0);
-        refused_until_its_phase(
-            &l,
-            "S3",
-            116,
-            Action::BridgeBurn { asset_bundle, asset: 1, amount: 400, relayer_fee: 100, to_chain: 2, to: [9; 32] },
-        );
-    }
-
     /// Step 1 caps every variable-length field the new actions carry, before any signature or
     /// proof work — and before the action step that would otherwise refuse them, which is what
-    /// makes the cap the error a fat transaction gets. The passing case still ends in
-    /// `UnsupportedAction`, so each assertion below shows the cap firing first.
+    /// makes the cap the error a fat transaction gets. The passing case still ends in the action
+    /// step's own refusal — `UnsupportedAction` for S2's staking, `Bridge(Disabled)` for S3's
+    /// bridge actions on this bridge-less ledger — so each assertion shows the cap firing first.
     #[test]
     fn the_new_actions_are_size_capped_at_step_one() {
         let l = ledger();
@@ -1096,8 +1170,11 @@ mod tests {
             let got = l.validate(&Transaction::shielded(7, b, action), &StubExecutor);
             match expect {
                 Err(e) => assert_eq!(got, Err(e), "n={n}"),
-                // "the cap passed": what is left is the phase refusal, not a size error.
-                Ok(()) => assert!(matches!(got, Err(TxError::UnsupportedAction(_))), "n={n}: {got:?}"),
+                // "the cap passed": what is left is the action step's refusal, not a size error.
+                Ok(()) => assert!(
+                    matches!(got, Err(TxError::UnsupportedAction(_) | TxError::Bridge(BridgeError::Disabled))),
+                    "n={n}: {got:?}"
+                ),
             }
         };
         let withdraw = |envelope: Envelope| Action::Withdraw {
@@ -1292,6 +1369,37 @@ mod tests {
         );
         assert_eq!(rebuilt.state_root(), r1);
         assert_eq!(rebuilt, l);
+    }
+
+    /// Spec §10: the bridge root is the *fifth* component, appended only on a bridged chain.
+    /// A chain without a `bridge` section hashes the same four roots phase S1 hashed, so
+    /// turning the bridge on is a hard fork for the chains that take it and nothing at all for
+    /// the ones that do not.
+    #[test]
+    fn the_bridge_root_is_appended_only_on_a_bridged_chain() {
+        use crate::bridge::{BridgeConfig, BridgeState};
+
+        let plain = ledger();
+        let unbridged = plain.state_root();
+        // The same ledger, told it has no bridge, is byte-identical — not merely equal.
+        let mut cleared = plain.clone();
+        cleared.set_bridge(None);
+        assert_eq!(cleared.state_root().as_bytes(), unbridged.as_bytes());
+
+        let config =
+            BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::from([(2u16, [9u8; 32])]) };
+        let mut bridged = plain.clone();
+        bridged.set_bridge(Some(BridgeState::from_config(&config)));
+        assert_ne!(bridged.state_root(), unbridged, "the bridge root joins the commitment");
+
+        // Bridge state is consensus state: a different guardian set is a different root.
+        let mut other = plain.clone();
+        let mut cfg2 = config.clone();
+        cfg2.guardians = vec![[3; 20]];
+        other.set_bridge(Some(BridgeState::from_config(&cfg2)));
+        assert_ne!(other.state_root(), bridged.state_root());
+        // And two ledgers whose only difference is the bridge are not the same ledger.
+        assert_ne!(other, bridged);
     }
 
     #[test]

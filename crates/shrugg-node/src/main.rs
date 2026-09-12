@@ -170,8 +170,9 @@ async fn main() -> Result<()> {
                 confidential: !no_confidential,
                 fri_profile,
                 hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
-                // `Genesis::build` rejects a bridge section outright until phase S3 puts the
-                // bridge back on the shielded chain, so this CLI offers no way to write one.
+                // `Genesis::build` accepts a `bridge` section again (S3 task 2), but the node
+                // does not yet persist bridge state across a restart — that is S3 task 3 — so
+                // this CLI still offers no way to write one.
                 bridge: None,
                 // Phase S2 adds a `--epoch-blocks` flag (and `--validator key,stake,payout`);
                 // until then every genesis this CLI writes takes the default epoch length.

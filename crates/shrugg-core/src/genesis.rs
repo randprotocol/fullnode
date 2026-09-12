@@ -1,6 +1,6 @@
 //! Genesis configuration and derivation of the genesis block + ledger.
 
-use crate::bridge::BridgeConfig;
+use crate::bridge::{BridgeCommit, BridgeConfig, BridgeState, GuardianKey, CHAIN_RAND, GOVERNANCE_EMITTER};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, PublicKey, Signature};
 use crate::ledger::Ledger;
@@ -82,7 +82,10 @@ pub struct Genesis {
     /// The `bundle` guest's program commitment, 64 hex characters: the only proof-system
     /// parameter a bundle proof is checked against. Part of the genesis hash.
     pub hc_bundle: String,
-    /// Cross-chain bridge. Rejected until phase S3 puts the bridge back on the shielded chain.
+    /// Cross-chain bridge (spec §10): the outbound emitter, the initial guardian set and the
+    /// source-chain emitters. Part of the genesis hash and of the state root when present;
+    /// omitted entirely when absent, so a bridge-less chain's genesis file, hash and state root
+    /// are byte-for-byte what phase S1 produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge: Option<BridgeConfig>,
     /// Phase S2: blocks per epoch — the validator set for epoch `e` is derived from the
@@ -181,10 +184,8 @@ impl Genesis {
         if !FRI_PROFILES.contains(&self.fri_profile.as_str()) {
             return Err(GenesisError::BadFriProfile(self.fri_profile.clone()));
         }
-        if self.bridge.is_some() {
-            return Err(GenesisError::BadBridgeConfig(
-                "bridge is not available on the shielded chain until phase S3".into(),
-            ));
+        if let Some(bridge) = &self.bridge {
+            check_bridge(bridge)?;
         }
         // S2 divides by `epoch_blocks` to get the epoch of a height; a genesis file that says
         // zero would panic every node on the first block rather than at the one place that
@@ -213,6 +214,7 @@ impl Genesis {
         let mut ledger = Ledger::new(self.chain_id, hc_bundle, &validators, executor);
         ledger.set_faucet(self.faucet);
         ledger.set_confidential(self.confidential);
+        ledger.set_bridge(self.bridge.as_ref().map(BridgeState::from_config));
         // The genesis ledger is positioned at the genesis block, so it carries that block's
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
@@ -249,6 +251,12 @@ impl Genesis {
         // is deliberately *not* here yet — it is optional until S2 makes it required, and
         // binding an optional field would split chains on a field nobody has filled in.
         commit.extend_from_slice(&self.epoch_blocks.to_be_bytes());
+        // S3: appended only when a bridge is configured, so a bridge-less chain's genesis hash
+        // is unchanged. `BridgeCommit` is the plain-bytes twin of `BridgeConfig`, whose own
+        // serde is hex text — bincode of that would commit to hex *strings*.
+        if let Some(bridge) = &self.bridge {
+            commit.extend_from_slice(&bincode::serialize(&BridgeCommit::from(bridge)).expect("serializes"));
+        }
         let genesis_binding = Hash::digest_domain(b"shrugg-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -274,6 +282,41 @@ impl Genesis {
             notes,
         })
     }
+}
+
+/// Rejects a `bridge` section a chain could not run: an empty, duplicated or zero guardian set,
+/// Rand itself registered as a source emitter, or a source emitter that collides with the
+/// governance emitter (which would let a source chain forge guardian-set upgrades).
+fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
+    let bad = |m: String| Err(GenesisError::BadBridgeConfig(m));
+    if cfg.guardians.is_empty() {
+        return bad("no guardians".into());
+    }
+    if cfg.guardians.iter().collect::<std::collections::BTreeSet<&GuardianKey>>().len() != cfg.guardians.len() {
+        return bad("duplicate guardian key".into());
+    }
+    if cfg.guardians.contains(&[0u8; 20]) {
+        return bad("zero guardian key".into());
+    }
+    if cfg.emitter == [0u8; 32] {
+        return bad("zero emitter address".into());
+    }
+    if cfg.emitter == GOVERNANCE_EMITTER {
+        return bad("emitter is the governance emitter".into());
+    }
+    if cfg.emitters.contains_key(&CHAIN_RAND) {
+        return bad(format!("chain {CHAIN_RAND} is Rand itself and cannot be a source emitter"));
+    }
+    if let Some((chain, _)) = cfg.emitters.iter().find(|(_, addr)| **addr == GOVERNANCE_EMITTER) {
+        return bad(format!("emitter for chain {chain} is the governance emitter"));
+    }
+    // A zero source emitter is never a real contract, and registering one would mean any
+    // attestation naming that chain with an all-zero `emitter_address` passes the emitter
+    // binding of spec 3.8.
+    if let Some((chain, _)) = cfg.emitters.iter().find(|(_, addr)| **addr == [0u8; 32]) {
+        return bad(format!("zero emitter address for chain {chain}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -396,15 +439,79 @@ mod tests {
         assert!(a.to_json().contains("\"confidential\": true"));
     }
 
+    fn bridge_cfg() -> BridgeConfig {
+        BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::from([(2u16, [9u8; 32])]) }
+    }
+
+    /// The hard fork phase S3 ships is opt-in per chain. A genesis without a `bridge` section
+    /// builds the chain phase S1 built, down to the bytes of the state root; one with a section
+    /// gets a fifth state-root component and a different genesis hash.
+    ///
+    /// The pinned root below is phase S1's. It must not move when the bridge is merely
+    /// *available* — only when a chain actually turns it on. (`shrugg-node`'s
+    /// `the_genesis_hash_is_pinned` guards the whole genesis binding the same way.)
     #[test]
-    fn bridge_section_is_rejected() {
-        let mut g = genesis(1);
-        g.bridge = Some(BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::new() });
-        match g.build(&StubExecutor) {
-            Err(GenesisError::BadBridgeConfig(m)) => assert!(m.contains("S3"), "{m}"),
-            other => panic!("expected BadBridgeConfig, got {other:?}"),
-        }
-        assert!(!genesis(1).to_json().contains("bridge"));
+    fn a_bridge_section_is_accepted_and_only_a_bridged_chain_changes() {
+        let plain = genesis(1);
+        let s = build(&plain);
+        assert!(s.ledger.bridge().is_none());
+        assert_eq!(
+            s.ledger.state_root().to_hex(),
+            "a90970f86e480a5777f402bf73f7eb65a811fe84df32a0bbc853b34d8f18c9a1",
+            "a chain without a bridge commits exactly what phase S1 committed"
+        );
+        assert!(!plain.to_json().contains("bridge"), "and its genesis file does not mention one");
+
+        let mut bridged = plain.clone();
+        bridged.bridge = Some(bridge_cfg());
+        let sb = build(&bridged);
+        assert!(sb.ledger.bridge().is_some());
+        assert_ne!(sb.ledger.state_root(), s.ledger.state_root(), "the bridge root is the fifth component");
+        assert_ne!(sb.hash(), s.hash(), "and the section is part of the genesis binding");
+        assert!(bridged.to_json().contains("bridge"));
+        // The initial guardian set is set 0 and is the one the file named.
+        let bridge = sb.ledger.bridge().unwrap();
+        assert_eq!(bridge.current_set, 0);
+        assert_eq!(bridge.guardian_sets[&0].keys, vec![[2u8; 20]]);
+        assert_eq!(bridge.emitters, BTreeMap::from([(2u16, [9u8; 32])]));
+        // Two chains that differ only in their guardians are different chains.
+        let mut other_guardians = bridged.clone();
+        other_guardians.bridge.as_mut().unwrap().guardians = vec![[3; 20]];
+        assert_ne!(build(&other_guardians).hash(), sb.hash());
+    }
+
+    /// A `bridge` section a chain could not safely run is refused at build time rather than at
+    /// the first attestation.
+    #[test]
+    fn an_unrunnable_bridge_section_is_refused() {
+        let bad = |f: fn(&mut BridgeConfig)| {
+            let mut g = genesis(1);
+            let mut cfg = bridge_cfg();
+            f(&mut cfg);
+            g.bridge = Some(cfg);
+            match g.build(&StubExecutor) {
+                Err(GenesisError::BadBridgeConfig(m)) => m,
+                other => panic!("expected BadBridgeConfig, got {other:?}"),
+            }
+        };
+        assert_eq!(bad(|c| c.guardians.clear()), "no guardians");
+        assert_eq!(bad(|c| c.guardians = vec![[2; 20], [2; 20]]), "duplicate guardian key");
+        assert_eq!(bad(|c| c.guardians = vec![[0; 20]]), "zero guardian key");
+        assert_eq!(bad(|c| c.emitter = [0; 32]), "zero emitter address");
+        assert_eq!(bad(|c| c.emitter = GOVERNANCE_EMITTER), "emitter is the governance emitter");
+        // Rand cannot be its own source chain: that is how governance payloads are told apart.
+        assert!(bad(|c| {
+            c.emitters.insert(CHAIN_RAND, [9; 32]);
+        })
+        .contains("is Rand itself"));
+        assert!(bad(|c| {
+            c.emitters.insert(2, GOVERNANCE_EMITTER);
+        })
+        .contains("is the governance emitter"));
+        assert!(bad(|c| {
+            c.emitters.insert(2, [0; 32]);
+        })
+        .contains("zero emitter address for chain 2"));
     }
 
     /// S2 scaffold. `epoch_blocks` defaults, is bound, and reaches the built state;
