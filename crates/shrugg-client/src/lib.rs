@@ -1,16 +1,22 @@
 //! JSON-RPC client for a SHRUGG full node, plus wallet helpers.
 //!
-//! Phase S1 redacted the chain: there are no accounts, no balances and no bridge, so the
-//! account-shaped and bridge-shaped calls this module used to carry are gone with the RPC
-//! methods that answered them. What remains is the chain-state surface a wallet still needs
-//! (`shrugg_getCommitments`/`getNullifiers`/`getAnchor`/`getWitness`/`getTreeInfo`, decoded
-//! here into the `shrugg-core` types [`wallet`] scans with) plus the faucet mint the cluster
-//! tests drive their traffic with.
+//! Phase S1 redacted the chain: there are no accounts and no balances, so the account-shaped
+//! calls this module used to carry are gone with the RPC methods that answered them. What remains
+//! is the chain-state surface a wallet still needs
+//! (`shrugg_getCommitments`/`getNullifiers`/`getAnchor`/`getWitness`/`getTreeInfo`, decoded here
+//! into the `shrugg-core` types [`wallet`] scans with) plus the faucet mint the cluster tests
+//! drive their traffic with.
+//!
+//! The bridge reads are back in phase S3 and are deliberately not account-shaped either: a
+//! bridged holding is a note like any other, so what the node can answer about the bridge is its
+//! *public* state — guardians, emitters, the asset registry, the outbound burn log — and never a
+//! balance. A wallet turns a note's `asset` word into a token through [`RpcClient::assets`].
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use shrugg_core::notes::{word8_from_hex, Envelope, Word8, DEPTH};
 use shrugg_core::program::ProgramId;
+use shrugg_core::types::CallEnvelope;
 use shrugg_core::{Hash, Transaction};
 use std::time::{Duration, Instant};
 
@@ -278,6 +284,78 @@ impl RpcClient {
             nullifiers: v["nullifiers"].as_u64().context("nullifiers")?,
         })
     }
+
+    /// The sealed transcript of a call's private inputs and the `H_IN` it is bound to, as
+    /// `shrugg_getCallEnvelope` serves them. `None` for a call that published none, for a
+    /// transaction that is not a call, and for a hash this node has no receipt for.
+    ///
+    /// The node holds no key that opens this; `shrugg_zkvm::call_envelope` does the opening, with
+    /// the `H_IN` returned here as the associated data every part of it is bound to.
+    pub async fn call_envelope(&self, tx: &Hash) -> Result<Option<(Word8, CallEnvelope)>> {
+        let v = self.call("shrugg_getCallEnvelope", json!([tx.to_hex()])).await?;
+        if v.is_null() {
+            return Ok(None);
+        }
+        let e = CallEnvelope {
+            kem_ct: bytes_at(&v, "kem_ct")?,
+            to_sender: bytes_at(&v, "to_sender")?,
+            to_auditor: bytes_at(&v, "to_auditor")?,
+            body: bytes_at(&v, "body")?,
+        };
+        Ok(Some((word8_at(&v, "h_in")?, e)))
+    }
+
+    // ---- the bridge (spec §10) ----
+
+    /// The bridge's own public state: guardians, source emitters, the asset registry, the
+    /// outbound burn sequence, and `next_index` — the index the registry would give an asset it
+    /// has not seen yet. `{"enabled": false}` on a chain without a bridge.
+    pub async fn bridge_state(&self) -> Result<Value> {
+        self.call("shrugg_getBridgeState", json!([])).await
+    }
+
+    /// The asset registry, ascending by index: what a wallet reads to turn a note's `asset` word
+    /// into a token, or a token into the index its notes carry. Empty without a bridge.
+    pub async fn assets(&self) -> Result<Vec<AssetRow>> {
+        let v = self.call("shrugg_getAssets", json!([])).await?;
+        let rows = v.as_array().context("getAssets did not return a list")?;
+        rows.iter()
+            .map(|r| {
+                Ok(AssetRow {
+                    index: r["index"].as_u64().context("index")? as u32,
+                    chain: r["chain"].as_u64().context("chain")? as u16,
+                    token: bytes_at(r, "token")?,
+                    asset_id: r["asset_id"].as_str().context("asset_id")?.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// The outbound burn message with this sequence, verbatim, for guardians to sign. `None` for
+    /// a sequence this chain has not emitted.
+    pub async fn bridge_burn(&self, sequence: u64) -> Result<Option<Value>> {
+        let v = self.call("shrugg_getBridgeBurn", json!([sequence])).await?;
+        Ok(if v.is_null() { None } else { Some(v) })
+    }
+
+    /// The 32-byte asset id of a token, as the registry keys it. Pure arithmetic on the two wire
+    /// fields, so it answers on any chain — including one whose registry has never seen the
+    /// token, which is exactly when a caller needs it.
+    pub async fn bridge_asset_id(&self, token_chain: u16, token_address: &[u8; 32]) -> Result<String> {
+        let v = self.call("shrugg_bridgeAssetId", json!([token_chain, hex::encode(token_address)])).await?;
+        Ok(v.as_str().context("bridgeAssetId did not return a hash")?.to_string())
+    }
+}
+
+/// One row of the bridge's asset registry as `shrugg_getAssets` reports it: the `asset` word that
+/// asset's notes carry, and the wire identity the guardians sign about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetRow {
+    pub index: u32,
+    pub chain: u16,
+    pub token: Vec<u8>,
+    /// The registry's key, 64 hex characters (`shrugg_bridgeAssetId` returns the same spelling).
+    pub asset_id: String,
 }
 
 /// A 32-byte value as 64 hex characters, with or without `0x`.

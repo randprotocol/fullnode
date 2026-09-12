@@ -164,15 +164,21 @@ Global options, accepted before or after the subcommand:
 | `address` | | print this wallet's `shrugg1…` shielded address |
 | `balance` | | scan the tree, save the store, print spendable value and the unspent note count |
 | `sync` | | scan without printing a balance; prints how far it got |
-| `notes` | | every note this wallet has opened: index, amount, height, `spent`, `pending` |
+| `notes` | | every note this wallet has opened: index, `asset`, amount, height, `spent`, `pending` |
+| `asset-balance [INDEX]` | | scan, then print what this wallet holds in one bridged asset, or a row per asset held; amounts are in the asset's own smallest unit |
 | `history` | | every note this wallet created for someone else, opened through its own outgoing viewing key |
 | `send <TO> <AMOUNT>` | `--fee <SHRUGG>` (default `0.001`), `--no-wait`, `--cuda` | scan, select at most two notes, prove a 2-in-2-out bundle locally, submit; waits for the commit unless `--no-wait` |
 | `faucet [ADDRESS]` | `--amount <SHRUGG>` (default `100`, max `100`) | testnet only: ask a validator node to mint into a note for `ADDRESS` (default: this wallet), wait for the commit |
 | `program build` | `--guest <fib\|memcpy\|bubble_sort\|balance_check\|private_payment>`, `--arg N` (repeatable), `--out <file>` (default `program.json`) | assemble a built-in guest to `{base_pc, words}` JSON; prints the program id |
 | `program deploy <FILE>` | `.json` or `.bin` (raw LE words), `--cuda` | pay the deploy floor through a bundle, wait for the commit, print the program id |
 | `program show <ID>` | | deployed program metadata |
-| `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--tier T`, `--fee <SHRUGG>`, `--cuda` | fetch the code from the node, prove the call locally with the chain's FRI profile, pay through a bundle, wait, print the receipt |
+| `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--tier T`, `--fee <SHRUGG>`, `--auditor <shrugg1…>`, `--no-envelope`, `--print-call-key`, `--cuda` | fetch the code from the node, prove the call locally with the chain's FRI profile, seal its input transcript, pay through a bundle, wait, print the receipt |
+| `open-call <TXHASH>` | `--call-key <hex>`, `--as-auditor` | fetch the receipt and the sealed transcript, open it, check it against the receipt's `H_IN`, re-run the program on the recovered inputs and print both sets of outputs |
 | `receipt <TX>` | | receipt of a committed call, or "no receipt" |
+| `bridge-mint <ATTESTATION>` | hex or `@path`, `--to <shrugg1…>`, `--fee <SHRUGG>`, `--no-wait`, `--cuda` | deposit a guardian-signed attestation as a note: seal the deposit's envelope for its recipient and pay through a bundle from this wallet |
+| `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | `--relayer-fee N`, `--fee <SHRUGG>` (default `0.002`), `--no-wait`, `--cuda` | burn a bridged asset to another chain: select that asset's notes for the asset bundle and SHRUGG for the fee bundle, prove **both**, submit one transaction |
+| `bridge` | | the bridge's public state: guardians, emitters, the asset registry, `next_index`, the burn sequence |
+| `bridge-message <SEQUENCE>` | | one outbound burn message, verbatim, for a guardian to sign |
 | `fee bundle` / `fee deploy <words>` / `fee call <tier>` | | minimum fee from the node's schedule |
 | `tx <HASH>` | | committed transaction with its block height and index, or "not found" |
 | `block <ID>` | | block by height (integer) or by hash (hex) |
@@ -184,8 +190,19 @@ Global options, accepted before or after the subcommand:
 Amounts are decimal SHRUGG strings with up to 9 decimal places (`1`, `1.5`, `.25`, `0.000000001`).
 
 There is no `balance <ADDRESS>`, and no way to ask about anyone else's address: a balance is a
-fact about this machine's key file, not about the chain. There are no `bridge-*` or
-`asset-balance` commands either; they return with the bridge in phase S3.
+fact about this machine's key file, not about the chain. That holds for a bridged asset too:
+`asset-balance` reads this wallet's own notes, and the `bridge-*` commands read only the bridge's
+*public* state (spec §10).
+
+A `call`'s input transcript is sealed to three keys and no more (spec §6.1): this wallet's outgoing
+viewing key, which opens every call it made; the per-call key `--print-call-key` shows, which opens
+exactly one; and the `--auditor` address, if one was named. `--no-envelope` publishes nothing, and
+then no key opens the call's inputs, ever — the transcript is the only record. `--cuda` cannot seal
+one: every backend but the CPU draws the `H_IN` salt inside the prover and never returns it.
+
+Amounts in a bridged asset are plain integers in that asset's own smallest unit, not decimal
+SHRUGG: only index 0 has this chain's nine decimals, and what a bridged token's unit means belongs
+to its source chain.
 
 `--cuda` proves on an attached NVIDIA GPU and requires a build with `--features cuda`. There is no
 fallback: a missing driver is an error rather than a silent CPU run.
@@ -199,6 +216,15 @@ shrugg faucet                                   # testnet: 100 SHRUGG into a not
 shrugg balance                                  # balance: 100 SHRUGG
 shrugg send shrugg1q9f… 1.5                     # ~100 s of local proving, then the commit
 shrugg notes                                    # the spent note, and the change note
+```
+
+### A confidential call you can open again later
+
+```bash
+shrugg program build --guest balance_check --arg 1000 --out bc.json
+shrugg program deploy bc.json                   # prints the program id
+shrugg call <id> --input 100 --input 200 --input 300 --input 400
+shrugg open-call <txhash>                       # inputs: [100, 200, 300, 400] — H_IN: faithful
 ```
 
 ### Key file formats

@@ -180,6 +180,18 @@ budgets for this when a bundle's own note commitments and nullifiers (which have
 separately-managed disclosure story) sit downstream of a call whose `H_IN` the caller could later
 open.
 
+**The call-input envelope** (spec §6.1) is that opening, made durable. A caller who keeps the salt
+in its own head has a capability it loses with the next laptop, so `shrugg call` publishes the
+`(salt, inputs)` transcript on chain by default, sealed under a fresh per-call key: wrapped to the
+caller's outgoing viewing key, and to a `--auditor` address when one is named. The chain checks only
+its size (`MAX_CALL_ENVELOPE_BYTES`); what binds it to the call is the AEAD, whose associated data
+is the receipt's `H_IN`, and what makes an opened transcript *faithful* is that it hashes back to
+that `H_IN` — `shrugg open-call` checks exactly that, then re-runs the program on the recovered
+inputs so the receipt's outputs can be read against them. `--print-call-key` prints the per-call key,
+which opens that one call and nothing else; `--no-envelope` publishes none, and then nobody — the
+caller included, once the salt is gone — can ever open the call. `--cuda` cannot seal one: every
+backend but the CPU draws the `H_IN` salt inside the prover and never returns it.
+
 ## On-chain model
 
 **Programs** are content addressed: `program_id = blake3("shrugg-program" || base_pc || words)`.
