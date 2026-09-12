@@ -143,10 +143,14 @@ How they combine matters more than the ranking:
   hard ceiling set by the slowest validator link, and it helps only once blocks are full and the
   mempool orders by fee. A modest step (8 MiB) later, not a strategy.
 
-The order stays as in §4: pruning now, with the RPC hardening work, retention of at least the
-unbonding period and an archive mode for nodes that keep the full history; aggregation as its
-own milestone after M4.4, pipelined; the cap only after the fee-ordered mempool exists and the
-fleet shows full blocks.
+**Decision (2026-09-12): aggregate at the block.** Pruning was rejected because it changes
+the trust model: a node syncing pruned history trusts finality signatures instead of proofs,
+which opens the long-range attack a proof-carrying chain does not have. Block-level
+aggregation keeps every byte a validator accepts backed by a proof and is queued as its own
+milestone (a recursive verifier guest, pipelined so consensus runs on unaggregated blocks and
+a later sealed block carries the aggregate). Until it lands, chain 6 runs at three transfers
+per block with the 4 MiB cap; the cap is revisited only after the fee-ordered mempool exists
+and the fleet shows full blocks.
 
 Related: `docs/fees.md` (why no gas), `docs/zkvm.md` §5 (the FRI profile), `docs/supply.md`
 (the value-balance audit), `docs/rpc-comparison.md`.
