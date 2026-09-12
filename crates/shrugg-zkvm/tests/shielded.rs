@@ -70,6 +70,35 @@ fn hc_bundle_is_the_vendored_guest_digest_and_domains_agree() {
     assert_eq!(notes::domain::IN, shrugg_zkvm::hash::IN_DOMAIN);
 }
 
+/// S2/S3 scaffold. `Withdraw` and `BridgeAttest` publish an amount and a blinding `r` and let
+/// the chain compute the deposit note itself, so the executor's `note_commitment` must be the
+/// vendored note's own commitment and nothing beside it — a note the chain computes that the
+/// owner's wallet cannot recognise is a note that is simply lost.
+#[test]
+fn the_executors_note_commitment_is_the_vendored_notes_own() {
+    let ex = ZkExecutor::new(FriProfile::Test);
+    // `Note::new` draws `r` itself; the chain is handed one. Same note either way.
+    let mut n = Note::new([1; 8], [0; 8], 5 * 1_000_000_000, 0, 17);
+    assert_eq!(ex.note_commitment(&n.pk, &n.from, n.amount, n.asset, n.time, &n.r), n.commitment());
+    // And the same for the hand-built note the ledger's own deposits look like.
+    n = Note { pk: [9, 8, 7, 6, 5, 4, 3, 2], from: [0; 8], amount: u64::MAX, asset: 3, time: 0, r: [7; 8] };
+    assert_eq!(ex.note_commitment(&n.pk, &n.from, n.amount, n.asset, n.time, &n.r), n.commitment());
+    // Every field is bound — in particular `r`, which is what keeps a published withdrawal
+    // amount from being a note anyone can recompute.
+    let base = ex.note_commitment(&n.pk, &n.from, n.amount, n.asset, n.time, &n.r);
+    assert_ne!(ex.note_commitment(&n.pk, &n.from, n.amount, n.asset, n.time, &[8; 8]), base);
+    assert_ne!(ex.note_commitment(&n.pk, &n.from, n.amount - 1, n.asset, n.time, &n.r), base);
+    assert_ne!(ex.note_commitment(&n.pk, &n.from, n.amount, n.asset + 1, n.time, &n.r), base);
+    assert_ne!(ex.note_commitment(&n.pk, &n.from, n.amount, n.asset, n.time + 1, &n.r), base);
+    assert_ne!(ex.note_commitment(&n.from, &n.pk, n.amount, n.asset, n.time, &n.r), base, "pk and from are not symmetric");
+    // The stub is a different function on purpose (blake3, not Poseidon2): a test that passes
+    // under the stub proves the ledger's *shape*, never the chain's actual commitments.
+    assert_ne!(
+        shrugg_core::confidential::StubExecutor.note_commitment(&n.pk, &n.from, n.amount, n.asset, n.time, &n.r),
+        base
+    );
+}
+
 /// A 1-in-1-out-with-dummies bundle proves, its digest matches the core-side recompute, and
 /// the executor verifies it (about a minute at the test profile).
 #[test]
