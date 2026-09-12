@@ -206,13 +206,16 @@ to its source chain.
 
 The one number `bridge-mint` cannot be certain of is the `asset` index of a token this chain has
 never seen: the ledger assigns it from the registry's `next_index` when the transaction is
-*applied*, and the wallet spends about 90 seconds proving the fee bundle in between. If another
-first sighting registers in that window, the deposit note carries a different `asset` word than the
-envelope was sealed against and the recipient's leaf opens under no key. So the command prints the
-note's `owner`, `time` and `r` (all already public in that transaction) for every mint, and —
-unless `--no-wait` — re-reads the committed transaction and warns with both indices if they differ,
-naming the six words the note has to be rebuilt from. A token the registry already names cannot
-move: an index is assigned once, forever.
+*applied*, and the wallet spends about 90 seconds proving the fee bundle in between. The
+transaction names the index it sealed for, and the chain refuses it if that is not the index the
+registry would give the deposit — so losing that race to another first sighting looks like
+`the attestation deposits under asset 2, and the transaction names 1` from `shrugg_sendTransaction`
+(or, if the race resolves after the transaction was pooled, a submission that never commits),
+never a note the recipient cannot open. Re-run the command and it seals and proves against the
+registry as it now stands. The command also prints the note's `owner`, `time` and `r` (all already
+public in that transaction) for every mint, so the note can be rebuilt by hand, and — unless
+`--no-wait` — re-reads the committed transaction as a check on the node that answered. A token the
+registry already names cannot move: an index is assigned once, forever.
 
 `--cuda` proves on an attached NVIDIA GPU and requires a build with `--features cuda`. There is no
 fallback: a missing driver is an error rather than a silent CPU run.

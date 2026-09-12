@@ -42,7 +42,7 @@ pub(super) fn validate(
     executor: &dyn ConfidentialExecutor,
 ) -> Result<Option<CheckedAttestation>, TxError> {
     match action {
-        Action::BridgeAttest { attestation, recipient, r, time, envelope: _ } => {
+        Action::BridgeAttest { attestation, recipient, r, time, asset, envelope: _ } => {
             // The cheapest check this action has, and the one that must run before any decode or
             // signature recovery: the deposit note is stamped with this `time` rather than the
             // apply height (see [`Action::BridgeAttest`]), so it gets the window a bundle's
@@ -54,6 +54,16 @@ pub(super) fn validate(
             // rejects a replayed digest and checks the payload before recovering a signature.
             let checked = bridge.check_attest(attestation, ledger.now_secs()).map_err(TxError::Bridge)?;
             if let AttestPlan::Transfer(t) = checked.plan() {
+                // The index this deposit will carry, as the registry resolves it: the entry the
+                // asset already has, or the one this transaction's own registration would assign
+                // (`BridgeState::asset_entry`). The action had to name it, because the recipient's
+                // envelope is sealed against a commitment containing it — so an integer compare,
+                // before the recipient hash and before the commitment is computed, decides whether
+                // this transaction still deposits the note it was built for. Nothing here changes
+                // which asset `apply` registers; it only refuses a transaction that disagrees.
+                if t.info.index != *asset {
+                    return Err(TxError::AttestAssetMismatch { expected: t.info.index, actual: *asset });
+                }
                 // The wire format has 32 bytes for a recipient and a shielded address is
                 // ~1.2 KB, so the depositor named a hash and this transaction carries the
                 // address. Without this equality the submitter would choose who receives it.
@@ -218,7 +228,7 @@ pub fn deposit_note(
     bridge: &BridgeState,
     executor: &dyn ConfidentialExecutor,
 ) -> Option<(Word8, Envelope)> {
-    let Action::BridgeAttest { attestation, recipient, r, time, envelope } = &tx.action else {
+    let Action::BridgeAttest { attestation, recipient, r, time, asset: _, envelope } = &tx.action else {
         return None;
     };
     let (asset, amount) = attested_transfer(attestation)?;
@@ -243,6 +253,8 @@ mod tests {
     const HC: Word8 = [11; 8];
     /// The canonical test token, native to chain 2, which registers as asset index 1.
     const TOKEN: [u8; 32] = [0xaa; 32];
+    /// A second token of the same chain, for the two-first-sightings race.
+    const OTHER_TOKEN: [u8; 32] = [0xbb; 32];
     /// A well-formed EVM burn destination: 12 zero bytes then 20 address bytes (spec 3.5).
     const EVM_TO: [u8; 32] = {
         let mut t = [0u8; 32];
@@ -322,9 +334,9 @@ mod tests {
         Attestation { guardian_set_index: 0, signatures, body }.encode()
     }
 
-    /// An inbound transfer of `amount` (relayer fee `fee`) of [`TOKEN`] to `to`, emitted by
+    /// An inbound transfer of `amount` (relayer fee `fee`) of `token` to `to`, emitted by
     /// chain 2's registered emitter. `sequence` distinguishes otherwise identical bodies.
-    fn transfer(amount: u128, fee: u128, to: [u8; 32], sequence: u64) -> Body {
+    fn transfer_of(token: [u8; 32], amount: u128, fee: u128, to: [u8; 32], sequence: u64) -> Body {
         Body {
             timestamp: 1,
             nonce: 0,
@@ -334,7 +346,7 @@ mod tests {
             consistency_level: 0,
             payload: Payload::Transfer(Transfer {
                 amount: Transfer::u256_from_u128(amount),
-                token_address: TOKEN,
+                token_address: token,
                 token_chain: 2,
                 to,
                 to_chain: CHAIN_RAND,
@@ -344,15 +356,45 @@ mod tests {
         }
     }
 
-    /// The transaction a relayer submits for `attestation`, naming `to` as the recipient. Its
-    /// fee bundle's four words are `seed..seed + 3`, so transactions with different seeds never
-    /// collide on a nullifier or a commitment.
+    /// [`transfer_of`] for the canonical [`TOKEN`].
+    fn transfer(amount: u128, fee: u128, to: [u8; 32], sequence: u64) -> Body {
+        transfer_of(TOKEN, amount, fee, to, sequence)
+    }
+
+    /// The `asset` word an honest submitter fills in: the index the registry says this
+    /// attestation's token deposits under, or 0 for a rotation, which deposits nothing and binds
+    /// no index.
+    fn expected_index(l: &Ledger, attestation: &[u8]) -> u32 {
+        attested_transfer(attestation)
+            .and_then(|(asset, _)| l.bridge().and_then(|b| b.deposit_index(&asset)))
+            .unwrap_or(0)
+    }
+
+    /// The transaction a relayer submits for `attestation`, naming `to` as the recipient and the
+    /// index the ledger would deposit under. Its fee bundle's four words are `seed..seed + 3`, so
+    /// transactions with different seeds never collide on a nullifier or a commitment.
     fn attest_tx(l: &Ledger, attestation: Vec<u8>, to: ShieldedAddress, seed: u32) -> Transaction {
+        let asset = expected_index(l, &attestation);
         Transaction::shielded(
             7,
             fee_bundle(l, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
-            Action::BridgeAttest { attestation, recipient: to, r: [7; 8], time: l.height() as u32, envelope: env() },
+            Action::BridgeAttest {
+                attestation,
+                recipient: to,
+                r: [7; 8],
+                time: l.height() as u32,
+                asset,
+                envelope: env(),
+            },
         )
+    }
+
+    /// The same transaction with the `asset` word overwritten — a submitter that named an index
+    /// other than the one its deposit will get.
+    fn naming_asset(mut tx: Transaction, asset: u32) -> Transaction {
+        let Action::BridgeAttest { asset: a, .. } = &mut tx.action else { panic!("an attest") };
+        *a = asset;
+        tx
     }
 
     /// Applies one attestation of `amount` to `recipient()`, registering [`TOKEN`] as asset 1.
@@ -488,6 +530,77 @@ mod tests {
         let thief = ShieldedAddress { pk: [9; 8], kem_ek: vec![6; 32] };
         let tx = attest_tx(&l, a, thief, 20);
         assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::BridgeRecipientMismatch));
+    }
+
+    /// The index a deposit is given is state, and the action has to name it: an envelope is sealed
+    /// against a commitment whose `asset` word is that index, so a transaction naming any other
+    /// index is asking the chain to append a leaf its recipient cannot open. Refused instead —
+    /// and refused without depositing the note or consuming the attestation.
+    #[test]
+    fn an_attest_with_the_wrong_asset_index_is_refused() {
+        let (mut l, secrets) = ledger();
+        deposit(&mut l, &secrets, 1_000, 0, 20);
+        // A second transfer of the same, now registered, token: index 1 for as long as the chain
+        // exists, which is what makes every other index a mistake rather than a race.
+        let a = attest(&secrets, transfer(500, 0, recipient().recipient_hash(), 1));
+        let honest = attest_tx(&l, a, recipient(), 30);
+        assert_eq!(l.validate(&honest, &StubExecutor), Ok(()));
+        let mu = honest.bridge_digests()[0];
+        for wrong in [0, 2, 9] {
+            let tx = naming_asset(honest.clone(), wrong);
+            let expected = Err(TxError::AttestAssetMismatch { expected: 1, actual: wrong });
+            assert_eq!(l.validate(&tx, &StubExecutor), expected, "asset {wrong}");
+            // The same answer from apply, and nothing the action owns was written: the scratch
+            // ledger `apply_tx` leaves behind holds no deposit note and has not consumed the
+            // digest. (Its fee bundle's own notes are written before the action step runs, by
+            // design — `apply_tx`'s caller discards the whole ledger on any error.)
+            let mut scratch = l.clone();
+            assert_eq!(scratch.apply_tx(&tx, &proposer().address(), &StubExecutor).map(|_| ()), expected);
+            assert!(!scratch.has_commitment(&expected_cm(1, 500, 1)), "no deposit note under asset {wrong}");
+            assert!(!scratch.is_digest_spent(&mu), "and the attestation is still unconsumed");
+        }
+    }
+
+    /// A first sighting is the one case the index is a *prediction*: the ledger hands the token
+    /// the registry's `next_index` as it stands when the transaction is applied. The action names
+    /// the number it sealed for, and admission holds it to exactly that — so the wallet that
+    /// loses a race to another first sighting pays a fee bundle and re-proves instead of leaving
+    /// the recipient a leaf no key opens.
+    #[test]
+    fn a_first_sighting_attest_binds_the_index_it_will_be_assigned() {
+        let (mut l, secrets) = ledger();
+        // Nothing is registered, so this transfer's note will be asset 1 (`FIRST_ASSET_INDEX`).
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let pending = attest_tx(&l, a, recipient(), 40);
+        assert_eq!(
+            l.validate(&naming_asset(pending.clone(), 2), &StubExecutor),
+            Err(TxError::AttestAssetMismatch { expected: 1, actual: 2 }),
+            "next_index + 1 is not what registration will assign"
+        );
+        assert_eq!(l.validate(&pending, &StubExecutor), Ok(()));
+
+        // Another token's first sighting commits in the window the first was being proved in, and
+        // takes index 1.
+        let other = attest(&secrets, transfer_of(OTHER_TOKEN, 700, 0, recipient().recipient_hash(), 1));
+        let winner = attest_tx(&l, other, recipient(), 50);
+        l.apply_tx(&winner, &proposer().address(), &StubExecutor).unwrap();
+        let bridge = l.bridge().unwrap();
+        assert_eq!(bridge.asset_index(&asset_id(2, &OTHER_TOKEN)), Some(1), "the race winner took 1");
+        assert_eq!(bridge.asset_index(&asset_id(2, &TOKEN)), None, "and the loser is still unregistered");
+
+        // The pending transaction named 1 and would now be given 2. This is the refusal the field
+        // exists for: without it the chain would append a note under asset 2 while the envelope
+        // was sealed for asset 1.
+        assert_eq!(
+            l.validate(&pending, &StubExecutor),
+            Err(TxError::AttestAssetMismatch { expected: 2, actual: 1 })
+        );
+        // Re-sealed and re-proved against the registry as it now stands, the same deposit lands.
+        let reproved = naming_asset(pending, 2);
+        assert_eq!(l.validate(&reproved, &StubExecutor), Ok(()));
+        l.apply_tx(&reproved, &proposer().address(), &StubExecutor).unwrap();
+        assert!(l.has_commitment(&expected_cm(1, 1_000, 2)), "the note the action named");
+        assert_eq!(l.bridge().unwrap().asset_index(&asset_id(2, &TOKEN)), Some(2));
     }
 
     /// A digest is spendable once: the same attestation resubmitted — in a fresh transaction,

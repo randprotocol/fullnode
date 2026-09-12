@@ -607,7 +607,11 @@ async fn main() -> Result<()> {
                 .context("chain height does not fit a note's time field")?;
             let (note, envelope) = wallet::deposit_note_for(&w, &recipient, d.amount, index, time)?;
             let owner = recipient.to_string();
-            let action = Action::BridgeAttest { attestation: bytes, recipient, r: note.r, time, envelope };
+            // The action names the index this envelope was sealed for, and admission refuses a
+            // mismatch (`Action::BridgeAttest`): if a competing first sighting registers while
+            // this bundle is being proved, the transaction is rejected and re-proved rather than
+            // depositing a note under an `asset` word the envelope does not match.
+            let action = Action::BridgeAttest { attestation: bytes, recipient, r: note.r, time, asset: index, envelope };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => gas::fee_floor(&action),
@@ -630,21 +634,22 @@ async fn main() -> Result<()> {
                 shrugg_core::notes::word8_to_hex(&note.r),
             );
             if !no_wait {
-                // A first sighting's index was a prediction: the ledger assigns one from the
-                // registry's `next_index` as it stands when the transaction is applied, and this
-                // wallet spent a minute and a half proving a bundle in between. If another first
-                // sighting registered in that window the note carries a different `asset` word than
-                // the envelope was sealed against, and saying so is the difference between a
-                // recoverable note and a silently lost one.
+                // Belt and braces. A first sighting's index was a prediction, but the action names
+                // it and admission refuses a transaction that disagrees with the registry, so a
+                // *committed* attest cannot have landed under another index — a lost race is a
+                // rejected submission above, not a note in the wrong asset. What is left for this
+                // to catch is a node whose registry disagrees with the one the prediction came
+                // from, which is worth a line rather than a silence.
                 let committed = rpc.call("shrugg_getTransaction", serde_json::json!([s.hash.to_hex()])).await?;
                 let landed = match wallet::deposit_index_check(index, &committed) {
                     wallet::DepositIndexCheck::Agrees => index,
                     wallet::DepositIndexCheck::Mismatch { predicted, committed } => {
                         println!(
-                            "warning: the chain deposited this note under asset {committed}, not the {predicted} \
-                             the envelope was sealed for — another first sighting registered in between.\n  \
-                             The envelope opens nothing: rebuild the note as (owner {owner}, from 0, amount {}, \
-                             asset {committed}, time {time}, r {}) and import it by hand.",
+                            "warning: this node says the deposit landed under asset {committed}, not the {predicted} \
+                             the envelope was sealed for — which admission should have refused, so treat this node's \
+                             registry as suspect.\n  \
+                             If it is right, the envelope opens nothing: rebuild the note as (owner {owner}, from 0, \
+                             amount {}, asset {committed}, time {time}, r {}) and import it by hand.",
                             d.amount,
                             shrugg_core::notes::word8_to_hex(&note.r),
                         );

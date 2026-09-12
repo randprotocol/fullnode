@@ -93,7 +93,22 @@ pub enum Action {
     /// Admission holds it to the window a bundle's `time` gets (`Ledger::check_time`), so it is
     /// recent without having to be exact, and the envelope sealed for the recipient names exactly
     /// the note the ledger will append.
-    BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, time: u32, envelope: Envelope },
+    ///
+    /// `asset` is the registry index the envelope was sealed for, and it is on the action for the
+    /// same reason `time` is: the depositor has to name the note it sealed against. For a token
+    /// the registry already holds the index is a fact, but the first sighting of a token is given
+    /// the `next_index` the registry has *when the transaction is applied* — and another first
+    /// sighting can commit while this one is being proved. Admission refuses a mismatch
+    /// (`TxError::AttestAssetMismatch`), so a lost race costs a fee bundle and a re-proof rather
+    /// than a deposit nobody can open. A rotation deposits no note and binds nothing here.
+    BridgeAttest {
+        attestation: Vec<u8>,
+        recipient: ShieldedAddress,
+        r: Word8,
+        time: u32,
+        asset: u32,
+        envelope: Envelope,
+    },
     /// Phase S3: burn `amount` of asset `asset` to a destination chain. `asset_bundle` is the
     /// second bundle of the transaction — the one spending the asset notes; the transaction's
     /// own `bundle` pays the SHRUGG fee.
@@ -294,6 +309,7 @@ mod tests {
                 recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
                 r: [5; 8],
                 time: 9,
+                asset: 1,
                 envelope: env(),
             },
         );
@@ -342,6 +358,7 @@ mod tests {
                     recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
                     r,
                     time: 9,
+                    asset: 1,
                     envelope: env(),
                 },
             )

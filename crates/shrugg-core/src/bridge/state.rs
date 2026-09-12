@@ -382,6 +382,23 @@ impl BridgeState {
         self.assets.iter().find(|(_, info)| info.index == index).map(|(asset, _)| *asset)
     }
 
+    /// The note index a deposit of `asset` would carry: the index the registry
+    /// already assigned it, or the one registration would hand a first
+    /// sighting. `None` only when every index has been handed out, which is
+    /// the one case [`BridgeState::asset_entry`] refuses a new asset in.
+    ///
+    /// Public because the answer is needed without an attestation's signature
+    /// work: a pooled `BridgeAttest` names the index its envelope was sealed
+    /// for, and the mempool has to drop it once a competing first sighting has
+    /// moved that number (`Mempool::still_applies`).
+    pub fn deposit_index(&self, asset: &AssetId) -> Option<u32> {
+        match self.assets.get(asset) {
+            Some(info) => Some(info.index),
+            None if self.next_index == u32::MAX => None,
+            None => Some(self.next_index),
+        }
+    }
+
     /// The registry entry `asset` has, or the one it would get on
     /// registration. Deterministic from state, which is what lets
     /// `check_attest` hand the ledger an index before `apply_attest` writes
@@ -389,8 +406,13 @@ impl BridgeState {
     fn asset_entry(&self, asset: &AssetId, chain: u16, token: [u8; 32]) -> Result<AssetInfo, BridgeError> {
         match self.assets.get(asset) {
             Some(info) => Ok(*info),
-            None if self.next_index == u32::MAX => Err(BridgeError::AssetRegistryFull),
-            None => Ok(AssetInfo { chain, token, index: self.next_index }),
+            // The same number [`BridgeState::deposit_index`] reports, so the
+            // index the mempool screens against is the index this assigns.
+            None => Ok(AssetInfo {
+                chain,
+                token,
+                index: self.deposit_index(asset).ok_or(BridgeError::AssetRegistryFull)?,
+            }),
         }
     }
 

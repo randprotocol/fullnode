@@ -117,6 +117,14 @@ pub enum TxError {
     /// about. Without this the submitter would choose who receives someone else's deposit.
     #[error("the attestation names a different recipient")]
     BridgeRecipientMismatch,
+    /// The `BridgeAttest` names an asset index that is not the one this deposit would be given.
+    /// Only a first sighting can reach it in practice: the index a registered asset deposits
+    /// under never changes, while a new token's is the registry's `next_index` at apply time, and
+    /// a competing first sighting moves it. Refusing costs the submitter a fee bundle and a
+    /// re-proof; accepting would append a note whose `asset` word is not the one the recipient's
+    /// envelope was sealed against, which no key of theirs opens.
+    #[error("the attestation deposits under asset {expected}, and the transaction names {actual}")]
+    AttestAssetMismatch { expected: u32, actual: u32 },
     /// A `BridgeBurn`'s asset bundle is in the wrong asset, pays a fee, or burns the wrong
     /// amount. All three are the same mistake — the asset bundle does not match the burn the
     /// action declares — and all three are caught before either bundle's proof is verified.
@@ -1218,6 +1226,7 @@ mod tests {
             recipient: recipient.clone(),
             r: [7; 8],
             time: l.height() as u32,
+            asset: 1,
             envelope,
         };
         check(208, attest(vec![1; 32], fat(MAX_ENVELOPE_BYTES)), Ok(()));

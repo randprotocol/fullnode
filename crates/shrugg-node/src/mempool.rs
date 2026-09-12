@@ -10,7 +10,7 @@
 //! (~20 ms) proof verification per gossip round.
 
 use shrugg_core::confidential::ConfidentialExecutor;
-use shrugg_core::ledger::TIME_WINDOW;
+use shrugg_core::ledger::{bridge_notes, TIME_WINDOW};
 use shrugg_core::notes::word8_to_hex;
 use shrugg_core::{Action, Hash, Ledger, Transaction, TxError, Word8};
 use std::collections::HashMap;
@@ -164,9 +164,19 @@ impl Mempool {
         // A `BridgeAttest`'s `time` goes stale by the same rule (`Ledger::check_time`), and it is
         // not the bundle's: a transaction whose attestation has aged out would be admitted here
         // and then kill the block it was offered to.
-        if let Action::BridgeAttest { time, .. } = &tx.action {
+        if let Action::BridgeAttest { attestation, time, asset, .. } = &tx.action {
             if !in_window(*time) {
                 return false;
+            }
+            // And its `asset` goes stale the same way: a pooled first sighting names the index it
+            // sealed an envelope for, and a *competing* first sighting committing in the meantime
+            // moves the index the registry would assign — which admission now refuses
+            // (`TxError::AttestAssetMismatch`). Decoding the attestation costs no signature work,
+            // and a rotation (which decodes to no transfer) binds no index.
+            if let Some((id, _)) = bridge_notes::attested_transfer(attestation) {
+                if ledger.bridge().and_then(|b| b.deposit_index(&id)) != Some(*asset) {
+                    return false;
+                }
             }
         }
         !tx.nullifiers().iter().any(|nf| ledger.is_spent(nf))
@@ -386,16 +396,22 @@ mod tests {
     /// The one attestation both relayers see: 1,000 of chain 2's token to `recipient()`,
     /// signed by a quorum of five of the six guardians.
     fn attestation(secrets: &[[u8; 32]]) -> Vec<u8> {
+        attestation_of(secrets, [0xaa; 32], 0)
+    }
+
+    /// [`attestation`] for a chosen `token` and `sequence`, so two attestations can name two
+    /// different tokens — each a first sighting racing the other for the registry's next index.
+    fn attestation_of(secrets: &[[u8; 32]], token: [u8; 32], sequence: u64) -> Vec<u8> {
         let body = Body {
             timestamp: 1,
             nonce: 0,
             emitter_chain: 2,
             emitter_address: [2; 32],
-            sequence: 0,
+            sequence,
             consistency_level: 0,
             payload: Payload::Transfer(Transfer {
                 amount: Transfer::u256_from_u128(1_000),
-                token_address: [0xaa; 32],
+                token_address: token,
                 token_chain: 2,
                 to: recipient().recipient_hash(),
                 to_chain: CHAIN_RAND,
@@ -409,10 +425,12 @@ mod tests {
     }
 
     /// One relayer's submission of `attestation`: its own fee bundle and its own blinding `r`,
-    /// so two relayers' transactions have nothing in common but the attestation itself.
+    /// so two relayers' transactions have nothing in common but the attestation itself. The
+    /// `asset` word is the index `l`'s registry would deposit under, as a wallet would fill it in.
     fn attest_tx(l: &Ledger, attestation: Vec<u8>, seed: u8) -> Transaction {
         let s = seed as u32;
         let b = fixtures::bundle(l, [nf(seed), nf(seed + 1)], [cm(seed), cm(seed + 1)], fixtures::bundle_fee());
+        let asset = fixtures::deposit_index(l, &attestation);
         Transaction::shielded(
             l.chain_id(),
             b,
@@ -421,6 +439,7 @@ mod tests {
                 recipient: recipient(),
                 r: [s; 8],
                 time: l.height() as u32,
+                asset,
                 envelope: fixtures::env(seed),
             },
         )
@@ -469,5 +488,49 @@ mod tests {
         // And removing the first releases its claim, so a genuine retry can take its place.
         m.remove(&[first.hash()]);
         assert!(m.insert(second, &l, &StubExecutor).is_ok());
+    }
+
+    /// Two *different* tokens, both seen for the first time, both predicting the registry's next
+    /// index for their deposit note. They do not conflict in the pool — different digests,
+    /// different notes — but only one of them can have index 1, and the loser's `asset` word no
+    /// longer matches what the ledger would assign it. Admission refuses that
+    /// (`TxError::AttestAssetMismatch`), so the pool has to stop offering it: the alternative is a
+    /// proposer building a block that dies on its own candidate.
+    #[test]
+    fn a_pooled_first_sighting_is_dropped_once_another_registers_its_index() {
+        let (l, secrets) = bridged_ledger();
+        let mine = attest_tx(&l, attestation_of(&secrets, [0xaa; 32], 0), 10);
+        let theirs = attest_tx(&l, attestation_of(&secrets, [0xbb; 32], 1), 20);
+        // Both name index 1 — the registry is empty, so that is what either would be given.
+        for tx in [&mine, &theirs] {
+            let Action::BridgeAttest { asset, .. } = &tx.action else { panic!("an attest") };
+            assert_eq!(*asset, 1);
+            assert_eq!(l.validate(tx, &StubExecutor), Ok(()));
+        }
+        let mut m = Mempool::new(100);
+        m.insert(mine.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&l, 10), vec![mine.clone()]);
+
+        // The other one commits. Nothing mine spends is spent and its digest is untouched, so
+        // only the moved index can drop it.
+        let mut after = l.clone();
+        after.apply_tx(&theirs, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        assert!(!after.is_digest_spent(&mine.bridge_digests()[0]));
+        assert!(mine.nullifiers().iter().all(|nf| !after.is_spent(nf)));
+        assert!(matches!(
+            after.validate(&mine, &StubExecutor),
+            Err(TxError::AttestAssetMismatch { expected: 2, actual: 1 })
+        ));
+        assert!(m.candidates(&after, 10).is_empty(), "still offered to the proposer");
+        m.prune(&after);
+        assert_eq!(m.len(), 0);
+
+        // Re-sealed and re-proved against the registry as it now stands, the same deposit is
+        // admissible again — the wallet pays for a second bundle, not a lost note.
+        let again = attest_tx(&after, attestation_of(&secrets, [0xaa; 32], 0), 30);
+        let Action::BridgeAttest { asset, .. } = &again.action else { panic!("an attest") };
+        assert_eq!(*asset, 2);
+        m.insert(again.clone(), &after, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&after, 10), vec![again]);
     }
 }

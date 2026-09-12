@@ -909,10 +909,11 @@ pub fn attested_deposit(attestation: &[u8]) -> Result<AttestedDeposit> {
 /// stands when the transaction is applied (`BridgeState::asset_entry`), and proving the fee bundle
 /// takes a minute and a half — so another first-sighting attestation committing in that window
 /// moves the index, and the note this wallet sealed an envelope for is not the note the chain
-/// appends. The recipient would be left a leaf no key of theirs opens. Hence two things a mint of a
-/// new asset must do: print `r` and `time` (both public on the wire, so printing discloses nothing)
-/// so the note is reconstructible by hand, and check the committed transaction afterwards with
-/// [`deposit_index_check`].
+/// would append. The chain refuses that transaction rather than depositing it
+/// (`TxError::AttestAssetMismatch`, against the `asset` the action names), so a lost race costs
+/// this wallet a fee bundle and a re-proof and never a note. What the prediction still buys is
+/// printing `r` and `time` (both public on the wire, so printing discloses nothing) so the note is
+/// reconstructible by hand, and [`deposit_index_check`] on the committed transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DepositIndex {
     Registered(u32),
@@ -954,6 +955,12 @@ pub enum DepositIndexCheck {
     Agrees,
     /// It did not, so the envelope opens nothing: the recipient has to rebuild the note from the
     /// `r` and `time` the mint printed, with `committed` as its `asset` word.
+    ///
+    /// Unreachable on a *committed* transaction since the action names its index: admission
+    /// refuses a mismatch outright (`TxError::AttestAssetMismatch`), so a lost race shows up as a
+    /// rejected submission, not as a deposit under the wrong index. Kept as belt and braces —
+    /// this is the one check that would catch a node whose registry disagrees with the one the
+    /// prediction was read from.
     Mismatch { predicted: u32, committed: u32 },
     /// The node cannot say: not an attest, or an attestation whose asset its registry does not hold
     /// (and a rotation, which deposits nothing).

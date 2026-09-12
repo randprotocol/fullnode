@@ -1186,9 +1186,11 @@ pub(crate) mod fixtures {
         Attestation { guardian_set_index: 0, signatures, body }.encode()
     }
 
-    /// The transaction a relayer submits for `attestation`. Its fee bundle's four words are
+    /// The transaction a relayer submits for `attestation`, naming the asset index the registry
+    /// would deposit under — what an honest wallet fills in. Its fee bundle's four words are
     /// `seed..seed + 3`, so two fixtures with different seeds never collide.
     pub(crate) fn attest_tx(ledger: &Ledger, attestation: Vec<u8>, seed: u32) -> Transaction {
+        let asset = deposit_index(ledger, &attestation);
         Transaction::shielded(
             ledger.chain_id(),
             bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
@@ -1197,9 +1199,18 @@ pub(crate) mod fixtures {
                 recipient: recipient(),
                 r: [7; 8],
                 time: ledger.height() as u32,
+                asset,
                 envelope: env(seed as u8),
             },
         )
+    }
+
+    /// The `asset` word an honest submitter fills in: the index `ledger`'s registry says this
+    /// attestation deposits under, or 0 for a rotation, which deposits nothing.
+    pub(crate) fn deposit_index(ledger: &Ledger, attestation: &[u8]) -> u32 {
+        shrugg_core::ledger::bridge_notes::attested_transfer(attestation)
+            .and_then(|(asset, _)| ledger.bridge().and_then(|b| b.deposit_index(&asset)))
+            .unwrap_or(0)
     }
 
     /// A burn of `amount` of asset index `asset` to chain 2, paying the bundle base for each of

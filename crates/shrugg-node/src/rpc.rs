@@ -306,12 +306,17 @@ fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>) -> Value {
         // are `null` for a guardian-set rotation, which deposits nothing, and on a chain whose
         // registry does not name the asset yet. The recipient is public in this transaction
         // only — the note's later spend is not.
-        Action::BridgeAttest { attestation, recipient, time, .. } => {
+        Action::BridgeAttest { attestation, recipient, time, asset, .. } => {
             let deposit = attest_deposit(attestation, bridge);
             json!({
                 "kind": "bridge_attest",
                 "attestation_len": attestation.len(),
                 "recipient": recipient.to_string(),
+                // The index the action itself names — what the recipient's envelope was sealed
+                // for — beside the one the registry resolves. Admission refuses a transaction
+                // where they differ, so on a committed attest they agree; `asset_index` is still
+                // the one to read, because it is `null` exactly when there is no deposit.
+                "asset": asset,
                 "asset_index": deposit.map(|(index, _)| index),
                 "amount": deposit.map(|(_, amount)| amount),
                 // The deposit note's own `time` word, which is what a recipient rebuilding that
@@ -1029,11 +1034,18 @@ mod tests {
             (&json!("withdraw"), &json!(v.to_base58()), &json!(9), &json!(3))
         );
 
-        let at =
-            j(Action::BridgeAttest { attestation: vec![9; 520], recipient: recipient.clone(), r: [5; 8], time: 4, envelope });
+        let at = j(Action::BridgeAttest {
+            attestation: vec![9; 520],
+            recipient: recipient.clone(),
+            r: [5; 8],
+            time: 4,
+            asset: 1,
+            envelope,
+        });
         assert_eq!(at["kind"], "bridge_attest");
         assert_eq!(at["attestation_len"], 520);
         assert_eq!(at["recipient"], recipient.to_string());
+        assert_eq!(at["asset"], 1, "the index the action names, which is a field of it");
         assert!(at["amount"].is_null(), "an attestation's amount is inside it, not on the action");
         assert!(at["asset_index"].is_null(), "and its asset index is in the registry, which there is none of");
 
@@ -1157,6 +1169,9 @@ mod tests {
         assert_eq!(action["kind"], "bridge_attest");
         assert_eq!(action["amount"], 1_000);
         assert_eq!(action["asset_index"], 1);
+        // On a committed attest the two indices agree by rule, not by luck: admission refuses a
+        // transaction whose `asset` is not the one the registry resolves.
+        assert_eq!(action["asset"], action["asset_index"]);
         assert_eq!(action["recipient"], fixtures::recipient().to_string());
         // The same transaction inside its block renders the same way.
         let block = ok(&st, "shrugg_getBlockByHeight", json!([1])).await;
