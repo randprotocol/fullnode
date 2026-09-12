@@ -13,12 +13,11 @@ pub mod call_envelope;
 pub mod staking;
 
 use crate::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
-use crate::crypto::{merkle_root, Address, Hash, PublicKey};
+use crate::crypto::{merkle_root, Address, Hash};
 use crate::gas;
-use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Word8, MAX_ENVELOPE_BYTES};
+use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Envelope, Word8, MAX_ENVELOPE_BYTES};
 use crate::program::{program_id, CallOutcome, CallReceipt, ProgramId, ProgramRecord};
 use crate::types::{Action, Block, Transaction, ValidatorSet, FAUCET_MAX_UNITS};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// How many block-end roots a bundle may anchor to (spec §7 item 4).
@@ -34,15 +33,24 @@ pub const ANCHOR_WINDOW: usize = 256;
 /// is still live.
 pub const TIME_WINDOW: u64 = 256;
 
-/// The one public register on the chain (spec §8): a validator's key, its stake, and the
-/// bundle fees credited to it as proposer. `stake` stays `u128` so the existing weighting and
-/// quorum arithmetic is unchanged; `rewards` are token units like every other amount.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ValidatorEntry {
-    pub public_key: PublicKey,
-    pub stake: u128,
-    /// Bundle fees credited to this proposer (spec §8); paid out by S2's Withdraw.
-    pub rewards: u64,
+pub use staking::{StakingError, ValidatorEntry};
+
+/// A deposit note the ledger created itself while applying a transaction, rather than accepting
+/// on the wire: S2's `Withdraw` (and S3's `BridgeAttest`) publish only a blinding and a public
+/// amount, so the commitment is computed here and is not in [`Transaction::commitments`].
+///
+/// This is transient output, like a call receipt — not consensus state, not in the state root,
+/// not compared by [`Ledger`]'s equality. `apply_transactions` clears the list when a block
+/// starts, so after `apply_block` the ledger's [`Ledger::deposits`] are exactly that block's,
+/// in the order they were appended to the tree. Storage (S2 Task 3) writes one `NoteRow` per
+/// entry at `index`, beside the notes `created_notes(tx)` already yields for the bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Deposit {
+    /// Leaf index the note was appended at.
+    pub index: u64,
+    pub cm: Word8,
+    /// The envelope the action carried, stored with the note so its owner can open it.
+    pub envelope: Envelope,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
@@ -104,6 +112,9 @@ pub enum TxError {
     InvalidBundleProof(ConfidentialError),
     #[error("proposer {0} is not in the validator register")]
     UnknownProposer(Address),
+    /// Phase S2: a `Bond`, `Unbond` or `Withdraw` the register refused (see [`StakingError`]).
+    #[error("staking: {0}")]
+    Staking(#[from] StakingError),
     #[error("arithmetic overflow")]
     Overflow,
 }
@@ -151,10 +162,15 @@ pub struct Ledger {
     anchors: VecDeque<(u64, Word8)>,
     validators: BTreeMap<Address, ValidatorEntry>,
     programs: BTreeMap<ProgramId, ProgramRecord>,
+    /// Blocks per epoch (spec §8), from genesis. Not state: like `faucet` and `confidential`,
+    /// a reloading node sets it from its genesis file.
+    epoch_blocks: u64,
     /// Height of the block being applied (the `time` window and `ProgramRecord::deployed_at`).
     height: u64,
     /// Timestamp of the block being applied, in unix milliseconds.
     timestamp_ms: u64,
+    /// Deposit notes this block's transactions made the ledger create (see [`Deposit`]).
+    deposits: Vec<Deposit>,
 }
 
 /// Equality is over consensus state only. `height` and `timestamp_ms` are the position of the
@@ -176,20 +192,18 @@ impl PartialEq for Ledger {
 impl Eq for Ledger {}
 
 impl Ledger {
-    /// An empty ledger whose only anchor is the empty tree's root at height 0.
-    pub fn new(chain_id: u64, hc_bundle: Word8, validators: &ValidatorSet, executor: &dyn ConfidentialExecutor) -> Ledger {
+    /// An empty ledger whose only anchor is the empty tree's root at height 0, with `validators`
+    /// as its register. Genesis is the one caller that seeds a register (spec §8); every later
+    /// entry arrives through a `Bond`.
+    pub fn new(
+        chain_id: u64,
+        hc_bundle: Word8,
+        validators: BTreeMap<Address, ValidatorEntry>,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Ledger {
         let tree = CommitmentTree::new(executor);
         let mut anchors = VecDeque::new();
         anchors.push_back((0, tree.root()));
-        let validators = validators
-            .iter()
-            .map(|v| {
-                (
-                    v.public_key.address(),
-                    ValidatorEntry { public_key: v.public_key.clone(), stake: v.stake, rewards: 0 },
-                )
-            })
-            .collect();
         Ledger {
             chain_id,
             hc_bundle,
@@ -201,8 +215,10 @@ impl Ledger {
             anchors,
             validators,
             programs: BTreeMap::new(),
+            epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             height: 0,
             timestamp_ms: 0,
+            deposits: Vec::new(),
         }
     }
 
@@ -230,8 +246,10 @@ impl Ledger {
             anchors: anchors.into_iter().collect(),
             validators,
             programs,
+            epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             height: 0,
             timestamp_ms: 0,
+            deposits: Vec::new(),
         }
     }
 
@@ -257,6 +275,54 @@ impl Ledger {
 
     pub fn set_confidential(&mut self, on: bool) {
         self.confidential = on;
+    }
+
+    /// Blocks per epoch (spec §8), as genesis set it.
+    pub fn epoch_blocks(&self) -> u64 {
+        self.epoch_blocks
+    }
+
+    /// Set by the node from its genesis file, like the faucet and confidential switches. Zero is
+    /// refused into 1 so `epoch` can never divide by zero on a malformed genesis.
+    pub fn set_epoch_blocks(&mut self, n: u64) {
+        self.epoch_blocks = n.max(1);
+    }
+
+    /// The epoch of the block being applied: `height / epoch_blocks`, so genesis is epoch 0.
+    pub fn epoch(&self) -> u64 {
+        self.height / self.epoch_blocks.max(1)
+    }
+
+    /// The validator set the next epoch would use if this ledger were the last block of one
+    /// (spec §8). The rule itself lives in [`staking::derive_set`].
+    pub fn derive_next_set(&self) -> ValidatorSet {
+        staking::derive_set(&self.validators)
+    }
+
+    /// Deposit notes this ledger created while applying the current block (see [`Deposit`]).
+    pub fn deposits(&self) -> &[Deposit] {
+        &self.deposits
+    }
+
+    /// Take the deposits, leaving the list empty.
+    pub fn take_deposits(&mut self) -> Vec<Deposit> {
+        std::mem::take(&mut self.deposits)
+    }
+
+    /// Append a note the ledger computed itself and record it for storage. Fails — before any
+    /// mutation — if the commitment is already in the tree.
+    pub(crate) fn append_deposit(
+        &mut self,
+        cm: Word8,
+        envelope: Envelope,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<u64, TxError> {
+        if !self.commitments.insert(cm) {
+            return Err(TxError::CommitmentExists(cm));
+        }
+        let index = self.tree.append(cm, executor);
+        self.deposits.push(Deposit { index, cm, envelope });
+        Ok(index)
     }
 
     /// Height of the block whose transactions are being applied.
@@ -399,8 +465,15 @@ impl Ledger {
             if b.asset != 0 {
                 return Err(TxError::UnsupportedAsset(b.asset));
             }
-            if b.burn != 0 {
-                return Err(TxError::UnsupportedBurn(b.burn));
+            // Phase S2: `Bond` is the one action whose bundle may burn, and it must burn exactly
+            // what it bonds — that is how value leaves the pool and becomes public stake.
+            match &tx.action {
+                Action::Bond { amount, .. } if b.burn != *amount => {
+                    return Err(StakingError::BurnMismatch { burn: b.burn, amount: *amount }.into())
+                }
+                Action::Bond { .. } => {}
+                _ if b.burn != 0 => return Err(TxError::UnsupportedBurn(b.burn)),
+                _ => {}
             }
             let min = gas::fee_floor(&tx.action);
             if b.fee < min {
@@ -563,6 +636,8 @@ impl Ledger {
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
         let mut scratch = self.clone();
+        // The deposits reported after a block are exactly that block's (see `Deposit`).
+        scratch.deposits.clear();
         let mut receipts = Vec::new();
         for (index, tx) in txs.iter().enumerate() {
             if let Some(r) =
@@ -639,11 +714,18 @@ impl Ledger {
             .validators
             .iter()
             .map(|(addr, v)| {
-                let mut buf = Vec::with_capacity(32 + 16 + 8);
+                let mut buf = Vec::with_capacity(96 + 16 * v.pending.len() + v.payout.kem_ek.len());
                 buf.extend_from_slice(addr.as_bytes());
                 buf.extend_from_slice(&v.stake.to_be_bytes());
                 buf.extend_from_slice(&v.rewards.to_be_bytes());
-                Hash::digest_domain(b"shrugg-validator-leaf", &buf)
+                buf.extend_from_slice(&v.nonce.to_be_bytes());
+                for (release_epoch, amount) in &v.pending {
+                    buf.extend_from_slice(&release_epoch.to_be_bytes());
+                    buf.extend_from_slice(&amount.to_be_bytes());
+                }
+                buf.extend_from_slice(&word8_to_bytes(&v.payout.pk));
+                buf.extend_from_slice(&v.payout.kem_ek);
+                Hash::digest_domain(b"shrugg-validator-leaf-2", &buf)
             })
             .collect();
         let prog_leaves: Vec<Hash> =
@@ -667,8 +749,8 @@ mod tests {
     use super::*;
     use crate::confidential::StubExecutor;
     use crate::crypto::Keypair;
-    use crate::notes::Envelope;
-    use crate::types::{BlockHeader, QuorumCertificate, Validator, ValidatorSet};
+    use crate::notes::{Envelope, ShieldedAddress};
+    use crate::types::{BlockHeader, QuorumCertificate};
 
     const HC: Word8 = [11; 8];
 
@@ -680,13 +762,25 @@ mod tests {
         (Keypair::from_seed([1; 32]).unwrap(), Keypair::from_seed([2; 32]).unwrap())
     }
 
+    /// A register entry for `k`: the S1 fixture's stake, with the S2 fields at their defaults.
+    fn entry(k: &Keypair, stake: u64) -> (Address, ValidatorEntry) {
+        (
+            k.address(),
+            ValidatorEntry {
+                public_key: k.public_key().clone(),
+                stake,
+                pending: Vec::new(),
+                rewards: 0,
+                payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+                nonce: 0,
+            },
+        )
+    }
+
     fn ledger() -> Ledger {
         let (a, b) = keys();
-        let set = ValidatorSet::new(vec![
-            Validator { public_key: a.public_key().clone(), stake: 10 },
-            Validator { public_key: b.public_key().clone(), stake: 10 },
-        ]);
-        let mut l = Ledger::new(7, HC, &set, &StubExecutor);
+        let register: BTreeMap<Address, ValidatorEntry> = [entry(&a, 10), entry(&b, 10)].into_iter().collect();
+        let mut l = Ledger::new(7, HC, register, &StubExecutor);
         l.set_faucet(true);
         l.set_confidential(true);
         l.set_height(1);
@@ -972,22 +1066,15 @@ mod tests {
         assert_eq!(l.validate(&disabled, &StubExecutor), Err(TxError::ConfidentialDisabled));
     }
 
-    /// S2/S3 scaffold: every new variant reaches its module and is refused there, naming the
-    /// phase that turns it on. S2 and S3 flip these one file at a time.
+    /// S3 scaffold: every variant still in a later phase reaches its module and is refused
+    /// there, naming the phase that turns it on. (S2 has landed: the three staking variants now
+    /// have rules, and their tests live in `staking.rs`.)
     #[test]
     fn the_staking_and_bridge_actions_are_refused_until_their_phase() {
         let l = ledger();
-        let payout = crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
-        let sig = crate::crypto::Signature::empty();
-        let v = Address([1; 32]);
+        let payout = ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
         let asset_bundle = bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], 0);
         let cases: Vec<(&str, Action)> = vec![
-            ("S2", Action::Bond { validator: v, amount: 5, registration: None }),
-            ("S2", Action::Unbond { validator: v, amount: 5, nonce: 0, signature: sig.clone() }),
-            (
-                "S2",
-                Action::Withdraw { validator: v, amount: 5, nonce: 0, r: [7; 8], envelope: env(), signature: sig },
-            ),
             (
                 "S3",
                 Action::BridgeAttest { attestation: vec![1; 32], recipient: payout, r: [7; 8], envelope: env() },
@@ -1124,6 +1211,50 @@ mod tests {
         );
         assert_eq!(rebuilt.state_root(), r1);
         assert_eq!(rebuilt, l);
+    }
+
+    /// The register is state: every field of the v2 validator leaf — including the two S2
+    /// additions, `pending` and `payout` — moves the state root, so two chains that disagree
+    /// about a validator's unbonding queue or where its rewards go cannot both be valid.
+    #[test]
+    fn validator_leaf_v2_changes_the_root_when_pending_or_payout_change() {
+        let k = Keypair::from_seed([1; 32]).unwrap();
+        let base = ValidatorEntry {
+            public_key: k.public_key().clone(),
+            stake: 1_000,
+            pending: Vec::new(),
+            rewards: 0,
+            payout: crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+            nonce: 0,
+        };
+        let root_of = |e: &ValidatorEntry| {
+            let register: BTreeMap<Address, ValidatorEntry> = [(k.address(), e.clone())].into_iter().collect();
+            Ledger::new(7, HC, register, &StubExecutor).state_root()
+        };
+        let r0 = root_of(&base);
+        assert_eq!(r0, root_of(&base.clone()), "deterministic");
+        let mut roots = vec![r0];
+        for changed in [
+            ValidatorEntry { stake: 1_001, ..base.clone() },
+            ValidatorEntry { rewards: 1, ..base.clone() },
+            ValidatorEntry { nonce: 1, ..base.clone() },
+            ValidatorEntry { pending: vec![(3, 10)], ..base.clone() },
+            ValidatorEntry { pending: vec![(4, 10)], ..base.clone() },
+            ValidatorEntry { pending: vec![(3, 11)], ..base.clone() },
+            ValidatorEntry { pending: vec![(3, 10), (4, 10)], ..base.clone() },
+            ValidatorEntry {
+                payout: crate::notes::ShieldedAddress { pk: [5; 8], kem_ek: vec![6; 32] },
+                ..base.clone()
+            },
+            ValidatorEntry {
+                payout: crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![7; 32] },
+                ..base.clone()
+            },
+        ] {
+            let r = root_of(&changed);
+            assert!(!roots.contains(&r), "a v2 leaf field does not reach the state root: {changed:?}");
+            roots.push(r);
+        }
     }
 
     #[test]

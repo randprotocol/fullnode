@@ -22,6 +22,12 @@ struct Sim {
     down: Vec<bool>,
 }
 
+/// A payout address for a test validator: phase S2 makes it a required genesis field, and
+/// nothing in consensus reads it — it only has to parse.
+fn payout(i: u8) -> String {
+    crate::notes::ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; crate::notes::KEM_EK_BYTES] }.to_string()
+}
+
 /// The genesis every simulation runs: no notes, faucet on, so a block body can be built out
 /// of validator mints (the only transaction that needs no note to spend).
 fn setup(n: u8, validators: u8) -> Sim {
@@ -31,7 +37,12 @@ fn setup(n: u8, validators: u8) -> Sim {
         timestamp_ms: 0,
         validators: keys[..validators as usize]
             .iter()
-            .map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 10, payout: None })
+            .enumerate()
+            .map(|(i, k)| GenesisValidator {
+                public_key: k.public_key().clone(),
+                stake: 10,
+                payout: payout(i as u8 + 1),
+            })
             .collect(),
         alloc: Vec::new(),
         faucet: true,
@@ -853,7 +864,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
     let genesis = Genesis {
         chain_id: 1,
         timestamp_ms: 0,
-        validators: vec![GenesisValidator { public_key: key.public_key().clone(), stake: 10, payout: None }],
+        validators: vec![GenesisValidator { public_key: key.public_key().clone(), stake: 10, payout: payout(1) }],
         alloc: Vec::new(),
         faucet: true,
         confidential: true,

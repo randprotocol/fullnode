@@ -3,22 +3,23 @@
 use crate::bridge::BridgeConfig;
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, PublicKey, Signature};
-use crate::ledger::Ledger;
-use crate::notes::{word8_from_hex, word8_to_bytes, Envelope, Word8};
-use crate::types::{Block, BlockHeader, QuorumCertificate, Validator, ValidatorSet};
+use crate::ledger::{Ledger, ValidatorEntry};
+use crate::notes::{word8_from_hex, word8_to_bytes, Envelope, ShieldedAddress, Word8};
+use crate::types::{Block, BlockHeader, QuorumCertificate, ValidatorSet};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenesisValidator {
     /// Hex-encoded Dilithium2 public key.
     pub public_key: PublicKey,
+    /// The register narrows this to a `u64` (spec §8), so a stake above `u64::MAX` is refused
+    /// rather than silently truncated. The field itself stays `u128` to match `ValidatorSet`.
     pub stake: u128,
-    /// Phase S2: the shielded address this validator's rewards and unbonded stake are paid to
-    /// (`shrugg1…`). Optional and *not* part of the genesis binding yet — S2 seeds the register
-    /// from it, makes it required, and binds it then. Until then a genesis carrying one builds
-    /// to exactly the same chain as one without.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payout: Option<String>,
+    /// Phase S2: the shielded address (`shrugg1…`) this validator's rewards and unbonded stake
+    /// are paid to. Required, and part of the genesis binding: it is register state, so two
+    /// nodes that disagree about it compute different state roots from the first block on.
+    pub payout: String,
 }
 
 /// The four envelope parts as hex text, so a genesis file stays readable JSON.
@@ -97,8 +98,9 @@ fn default_true() -> bool {
     true
 }
 
-/// Spec §8 / S2's `EPOCH_BLOCKS_DEFAULT`.
-pub const EPOCH_BLOCKS_DEFAULT: u64 = 1000;
+/// Spec §8: blocks per epoch unless the genesis file says otherwise. Defined by the staking
+/// rules and re-exported here, where genesis files reach it.
+pub use crate::ledger::staking::EPOCH_BLOCKS_DEFAULT;
 
 fn default_epoch_blocks() -> u64 {
     EPOCH_BLOCKS_DEFAULT
@@ -114,10 +116,12 @@ pub const FRI_PROFILES: [&str; 2] = ["production", "test"];
 pub enum GenesisError {
     #[error("no validators")]
     NoValidators,
-    #[error("stake overflow")]
-    Overflow,
     #[error("validator {0} has zero stake")]
     ZeroStake(Address),
+    #[error("validator {0} stake does not fit in the register's u64")]
+    StakeTooLarge(Address),
+    #[error("bad payout address {0}")]
+    BadPayout(String),
     #[error("duplicate validator {0}")]
     DuplicateValidator(Address),
     #[error("json: {0}")]
@@ -178,25 +182,39 @@ impl Genesis {
                 "bridge is not available on the shielded chain until phase S3".into(),
             ));
         }
-        let mut vals = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
-        let mut total_stake = 0u128;
+        // The register (spec §8) is what genesis actually seeds; the validator set for epoch 0
+        // is derived from it at the `ValidatorSet` boundary, where the stake widens again.
+        let mut register: BTreeMap<Address, ValidatorEntry> = BTreeMap::new();
         for v in &self.validators {
+            let addr = v.public_key.address();
             if v.stake == 0 {
-                return Err(GenesisError::ZeroStake(v.public_key.address()));
+                return Err(GenesisError::ZeroStake(addr));
             }
+            let stake = u64::try_from(v.stake).map_err(|_| GenesisError::StakeTooLarge(addr))?;
+            let payout =
+                ShieldedAddress::parse(&v.payout).map_err(|_| GenesisError::BadPayout(v.payout.clone()))?;
             // ValidatorSet::new would silently collapse duplicates (and the genesis hash would
             // commit to the collapsed set): reject instead.
-            if !seen.insert(v.public_key.address()) {
-                return Err(GenesisError::DuplicateValidator(v.public_key.address()));
+            if register.contains_key(&addr) {
+                return Err(GenesisError::DuplicateValidator(addr));
             }
-            total_stake = total_stake.checked_add(v.stake).ok_or(GenesisError::Overflow)?;
-            vals.push(Validator { public_key: v.public_key.clone(), stake: v.stake });
+            register.insert(
+                addr,
+                ValidatorEntry {
+                    public_key: v.public_key.clone(),
+                    stake,
+                    pending: Vec::new(),
+                    rewards: 0,
+                    payout,
+                    nonce: 0,
+                },
+            );
         }
-        let validators = ValidatorSet::new(vals);
+        let validators = ValidatorSet::from_entries(register.values().map(|e| (&e.public_key, e.stake)));
 
         let hc_bundle = word8_from_hex(&self.hc_bundle).ok_or_else(|| GenesisError::BadHcBundle(self.hc_bundle.clone()))?;
-        let mut ledger = Ledger::new(self.chain_id, hc_bundle, &validators, executor);
+        let mut ledger = Ledger::new(self.chain_id, hc_bundle, register.clone(), executor);
+        ledger.set_epoch_blocks(self.epoch_blocks);
         ledger.set_faucet(self.faucet);
         ledger.set_confidential(self.confidential);
         // The genesis ledger is positioned at the genesis block, so it carries that block's
@@ -228,13 +246,14 @@ impl Genesis {
             commit.extend_from_slice(&word8_to_bytes(cm));
             commit.extend_from_slice(&amount.to_be_bytes());
         }
-        // S2 scaffold: `epoch_blocks` is bound unconditionally, after the notes. Appending it
-        // only when it is non-default would make the binding depend on a default this file can
-        // change later; paying one hash change now (`the_genesis_hash_is_pinned`, re-pinned in
-        // the same commit) buys a binding that stays stable through S2. `GenesisValidator.payout`
-        // is deliberately *not* here yet — it is optional until S2 makes it required, and
-        // binding an optional field would split chains on a field nobody has filled in.
+        // Phase S2, after the notes: the epoch length, then every validator's payout address in
+        // address order (the order the register itself is in, not the file's, so two files that
+        // list the same validators in a different order still build the same chain).
         commit.extend_from_slice(&self.epoch_blocks.to_be_bytes());
+        for e in register.values() {
+            commit.extend_from_slice(&word8_to_bytes(&e.payout.pk));
+            commit.extend_from_slice(&e.payout.kem_ek);
+        }
         let genesis_binding = Hash::digest_domain(b"shrugg-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -283,6 +302,11 @@ mod tests {
         }
     }
 
+    /// A valid `shrugg1…` payout address, distinct per `i`.
+    fn payout(i: u8) -> String {
+        ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; crate::notes::KEM_EK_BYTES] }.to_string()
+    }
+
     fn genesis(n: u8) -> Genesis {
         let keys: Vec<Keypair> = (1..=n).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
         Genesis {
@@ -290,7 +314,12 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             validators: keys
                 .iter()
-                .map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 100, payout: None })
+                .enumerate()
+                .map(|(i, k)| GenesisValidator {
+                    public_key: k.public_key().clone(),
+                    stake: 100,
+                    payout: payout(i as u8 + 1),
+                })
                 .collect(),
             alloc: vec![note(7, 1_000_000), note(8, 2_000_000)],
             faucet: false,
@@ -393,35 +422,50 @@ mod tests {
         assert!(!genesis(1).to_json().contains("bridge"));
     }
 
-    /// S2 scaffold. `epoch_blocks` defaults, is bound, and reaches the built state;
-    /// `payout` defaults, is *not* bound, and an old genesis file still parses.
+    /// Phase S2: genesis seeds the register with each validator's payout address and fixes the
+    /// epoch length. Both are part of the genesis binding; the payout is also part of the state,
+    /// because it sits in the validator leaf the state root covers.
     #[test]
-    fn the_s2_fields_default_and_only_epoch_blocks_is_bound() {
+    fn genesis_seeds_payout_and_epoch_blocks() {
         let g = genesis(1);
         let s = build(&g);
         assert_eq!(s.epoch_blocks, EPOCH_BLOCKS_DEFAULT);
+        assert_eq!(s.ledger.epoch_blocks(), EPOCH_BLOCKS_DEFAULT, "the ledger derives epochs with it");
+
+        // The register starts as one entry per genesis validator, with the file's payout.
+        let addr = g.validators[0].public_key.address();
+        let e = &s.ledger.validators()[&addr];
+        assert_eq!(e.stake, 100, "the genesis stake, narrowed to the register's u64");
+        assert_eq!((e.rewards, e.nonce, e.pending.len()), (0, 0, 0));
+        assert_eq!(e.payout, ShieldedAddress::parse(&g.validators[0].payout).unwrap());
 
         let mut faster = g.clone();
         faster.epoch_blocks = 4;
         let sf = build(&faster);
         assert_eq!(sf.epoch_blocks, 4);
+        assert_eq!(sf.ledger.epoch_blocks(), 4);
         assert_ne!(sf.hash(), s.hash(), "epoch_blocks is part of the genesis binding");
         assert_eq!(sf.ledger.state_root(), s.ledger.state_root(), "and is not state");
 
         let mut paid = g.clone();
-        paid.validators[0].payout = Some("shrugg1abc".into());
-        assert_eq!(build(&paid).hash(), s.hash(), "payout is not bound until S2 makes it required");
+        paid.validators[0].payout = payout(9);
+        let sp = build(&paid);
+        assert_ne!(sp.hash(), s.hash(), "the payout address is bound");
+        assert_ne!(sp.ledger.state_root(), s.ledger.state_root(), "and it is state, in the validator leaf");
 
-        // A genesis file written before either field existed still parses, with the defaults.
+        // The payout is required and must be a shielded address.
+        let mut without = serde_json::to_value(&g).unwrap();
+        without["validators"][0].as_object_mut().unwrap().remove("payout");
+        assert!(Genesis::from_json(&without.to_string()).is_err(), "payout has no default");
+        let mut bad = g.clone();
+        bad.validators[0].payout = "shrugg1nonsense".into();
+        assert!(matches!(bad.build(&StubExecutor), Err(GenesisError::BadPayout(_))));
+
+        assert!(g.to_json().contains("\"payout\""));
+        assert!(g.to_json().contains("\"epoch_blocks\""));
         let mut old = serde_json::to_value(&g).unwrap();
         old.as_object_mut().unwrap().remove("epoch_blocks");
-        let parsed = Genesis::from_json(&old.to_string()).unwrap();
-        assert_eq!(parsed.epoch_blocks, EPOCH_BLOCKS_DEFAULT);
-        assert!(parsed.validators.iter().all(|v| v.payout.is_none()));
-        assert_eq!(build(&parsed).hash(), s.hash());
-        // An unset payout stays out of the file entirely.
-        assert!(!g.to_json().contains("payout"));
-        assert!(g.to_json().contains("\"epoch_blocks\""));
+        assert_eq!(Genesis::from_json(&old.to_string()).unwrap().epoch_blocks, EPOCH_BLOCKS_DEFAULT);
     }
 
     #[test]
@@ -457,8 +501,14 @@ mod tests {
         let mut g = genesis(2);
         g.validators.push(g.validators[0].clone());
         assert!(matches!(g.build(&StubExecutor), Err(GenesisError::DuplicateValidator(_))));
+        // The register holds a u64 (spec §8), so a genesis stake that cannot be one is refused
+        // here rather than silently narrowed into a different chain. (It also replaces S1's
+        // total-stake overflow check: a set of u64 stakes cannot overflow the u128 total.)
         let mut g = genesis(2);
         g.validators[0].stake = u128::MAX;
-        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::Overflow)));
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::StakeTooLarge(_))));
+        let mut g = genesis(1);
+        g.validators[0].stake = u64::MAX as u128 + 1;
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::StakeTooLarge(_))));
     }
 }

@@ -28,6 +28,20 @@ impl ValidatorSet {
         ValidatorSet { validators }
     }
 
+    /// Build a set from register entries (`(key, stake)` pairs, phase S2).
+    ///
+    /// This is the one boundary where the register's `u64` stake becomes the `u128` consensus
+    /// weight: amounts on this chain are `u64` units, while quorum and total-stake arithmetic
+    /// keeps the headroom so summing a full set can never overflow.
+    pub fn from_entries<'a>(entries: impl IntoIterator<Item = (&'a PublicKey, u64)>) -> ValidatorSet {
+        ValidatorSet::new(
+            entries
+                .into_iter()
+                .map(|(public_key, stake)| Validator { public_key: public_key.clone(), stake: stake as u128 })
+                .collect(),
+        )
+    }
+
     pub fn len(&self) -> usize {
         self.validators.len()
     }
