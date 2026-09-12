@@ -18,12 +18,18 @@ by this cut. The next fork (S2 staking + constraint set 5) is a new chain id aga
 |---|---|---|---|---|
 | A | validator | laptop, LAN 192.168.100.123 (NAT) | 2nRdFChBXRmKoe2sQE3ZYDzvdg53QmBZJJ9iweY7hk1v | 12D3KooWRbvv6T8iQz1jT5ijvPoo6CEGy3yRdiuxkUMJGUkTNq6P |
 | B | validator | 192.168.100.79 (NAT) | ByDkxsEfDCR5DrmDufKftvcRsgvufypnZ4SgDQzJAQ7Z | 12D3KooWMUjpbd6U7c6KTjVXy3121aV6JLka47dh4ZPwGjyMV8Bf |
-| C | validator | DigitalOcean 167.172.65.63 | F6rYLexPhyMmwPNqbEmyyp5FiTmtQqDgZyqScUqYY4F6 | 12D3KooWBKYD5bBRczEhzYQrN4jgfgaoGXb6PzbfdjtTjiy1SA5g |
-| D | validator | DigitalOcean 178.128.91.236 | 5tMgLSzXL8keU1vg2wtGEXRJkmfBK6GzhjNjxrCFgCaj | 12D3KooWPrdUXsVXsD3RqaV4otq35awpJgMonSfdu3u8gtq5iUYq |
-| E | observer | DigitalOcean 188.166.235.187 | CxeG7vJaxUoKBZZe8U8LGXohH2FvcCbE47AufK6Mp2jf | 12D3KooWR1nihpYk6vvdRYuq2WMGUtzDiwygytTXZJszdSnaVmDM |
-| F | observer | DigitalOcean 157.245.156.41 | DcuuZrzDSJedhFnynLFchNfYmW4UKiZT2nEKbcs2ojmJ | 12D3KooWJwsFwi9CawJrPyA7ZBT5Q6mYWmctNvLRt3SuS7SdyU6j |
+| C | validator | DigitalOcean fra1 164.90.239.200 (moved from sgp1 2026-09-12) | F6rYLexPhyMmwPNqbEmyyp5FiTmtQqDgZyqScUqYY4F6 | 12D3KooWBKYD5bBRczEhzYQrN4jgfgaoGXb6PzbfdjtTjiy1SA5g |
+| D | validator | DigitalOcean sgp1 178.128.91.236 | 5tMgLSzXL8keU1vg2wtGEXRJkmfBK6GzhjNjxrCFgCaj | 12D3KooWPrdUXsVXsD3RqaV4otq35awpJgMonSfdu3u8gtq5iUYq |
+| E | observer | DigitalOcean sgp1 188.166.235.187 (explorer) | CxeG7vJaxUoKBZZe8U8LGXohH2FvcCbE47AufK6Mp2jf | 12D3KooWR1nihpYk6vvdRYuq2WMGUtzDiwygytTXZJszdSnaVmDM |
+| F | observer | DigitalOcean nyc3 138.197.19.86 (moved from sgp1 2026-09-12) | DcuuZrzDSJedhFnynLFchNfYmW4UKiZT2nEKbcs2ojmJ | 12D3KooWJwsFwi9CawJrPyA7ZBT5Q6mYWmctNvLRt3SuS7SdyU6j |
+| lon1 | observer | DigitalOcean lon1 139.59.160.76 | 8UcsaXDSSWcC6fT3CWT89fgUvG4ubaYd61FUQHKiUDLv | 12D3KooWJFWHiHNHnBPhjVctvLQFZQo7ecfkqbVpjuArysC88ETc |
+| sfo3 | observer | DigitalOcean sfo3 24.144.89.22 | 9rex7stS6d9QxaAh5nghjaUEratKJFUAmLAoxRFmP7LM | 12D3KooWQuPiWbAy4Pk6v4phQQauKc3iUAAFyuRnG5ahZVgLSMvQ |
+| tor1 | observer | DigitalOcean tor1 146.190.243.29 | CRW3fQsuFa7YSdU5ZDrRMxQjJ4ET9kzf6hg1D8CAhoWH | 12D3KooW9qxfAEdazt4yRB2pzWbmhFPTafy1ojJ1cdJArgHrp8Z5 |
+| blr1 | observer | DigitalOcean blr1 167.71.235.108 | ASzbnFwqVnwsrN81iytkuhNbs8f93Q3h4rQjXPDUNMjU | 12D3KooWHBtRvSeR3c4FkkQRtEJ6huEeFhG9Uj46NGs8N29ZaCsP |
+| syd1 | observer | DigitalOcean syd1 170.64.226.65 | 8cHAjP3wgGDv55Ym2qZrYyu2Mvc7b86jsrN6vWcwZoJV | 12D3KooWFmqkbLxNQb1wiTHzvRj8Xh5PkVDzPXJGzQrVZJBTv9Ms |
+| atl1 | observer | DigitalOcean atl1 165.245.142.90 | BV2BfMZJo2Lpo3pR7RfAjytnFxmMhzCWxoUHhXhjT2qL | 12D3KooWSDCzHY7aTDyJxBMEGex4G4tWhfwt5ijFzCzsHP11npDw |
 
-C and D have public IPs and act as bootstrap nodes; A and B are behind NAT and dial out to them
+D and E (sgp1) and C (fra1) have public IPs and act as bootstrap nodes; the regional observers were provisioned with `deploy/provision-observer.sh` (a small droplet, prebuilt binaries, no compiler) and dial D and E; A and B are behind NAT and dial out to C and D
 (`deploy/run-a.sh`, `deploy/run-b.sh`). Full multiaddrs are in `deploy/nodes.env`.
 
 Droplets: `deploy/push-to-vps.sh <ip> <letter> "<bootstrap multiaddrs>" [validator|observer]` provisions from scratch;

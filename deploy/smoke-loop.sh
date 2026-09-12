@@ -17,7 +17,7 @@ WALLETS=${WALLETS:-$HOME/Github/randprotocol/fullnode/wallets}
 RPC=${RPC:-http://127.0.0.1:8545}
 EXPLORER=${EXPLORER:-https://randscan.org/api/v1}
 INTERVAL=${INTERVAL:-600}
-NODES=${NODES:-"c=167.172.65.63 d=178.128.91.236 e=188.166.235.187 f=157.245.156.41"}
+NODES=${NODES:-"c=164.90.239.200 d=178.128.91.236 e=188.166.235.187 f=138.197.19.86 lon1=139.59.160.76 sfo3=24.144.89.22 tor1=146.190.243.29 blr1=167.71.235.108 syd1=170.64.226.65 atl1=165.245.142.90"}
 KEY=${SSH_KEY:-$HOME/.ssh/id_ed25519}
 W1=$WALLETS/shielded-1.key.json
 W2=$WALLETS/shielded-2.key.json
