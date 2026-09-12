@@ -242,9 +242,22 @@ async fn main() -> Result<()> {
             if store.notes.is_empty() {
                 println!("no notes (run `shrugg sync`)");
             } else {
-                println!("{:>8}  {:>18}  {:>8}  {}", "index", "amount", "height", "spent");
+                // `pending` is a note this wallet has submitted a spend for without waiting for
+                // the commit: not spent, not spendable, and the next `sync` decides which.
+                println!("{:>8}  {:>18}  {:>8}  {:>7}  {}", "index", "amount", "height", "spent", "pending");
                 for n in &store.notes {
-                    println!("{:>8}  {:>18}  {:>8}  {}", n.index, format_amount(n.note.amount), n.height, n.spent);
+                    let pending = match n.pending {
+                        Some(time) => format!("since {time}"),
+                        None => "-".into(),
+                    };
+                    println!(
+                        "{:>8}  {:>18}  {:>8}  {:>7}  {}",
+                        n.index,
+                        format_amount(n.note.amount),
+                        n.height,
+                        n.spent,
+                        pending
+                    );
                 }
             }
         }

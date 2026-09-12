@@ -156,9 +156,10 @@ pub struct OwnedNote {
     pub spent: bool,
     /// Set by a `--no-wait` submission to the `time` of the bundle that spends this note: the
     /// note is not spendable, but the chain has not confirmed the spend either. A later [`scan`]
-    /// clears it once the chain answers — the nullifier appeared (`spent`), or the head has
-    /// passed `time + TIME_WINDOW`, past which that bundle can never be admitted at all
-    /// (`Ledger::validate_inner`'s time check) so the note is spendable again.
+    /// clears it once the chain answers — the nullifier appeared (`spent`), or the blocks this
+    /// wallet has actually read the nullifiers of reach past `time + TIME_WINDOW`, past which
+    /// that bundle can never be admitted at all (`Ledger::validate_inner`'s time check) so the
+    /// note is spendable again.
     #[serde(default)]
     pub pending: Option<u32>,
     pub height: u64,
@@ -367,11 +368,17 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
     store.scanned_height = store.scanned_height.max(from);
 
     // Resolve anything a `--no-wait` submission left pending, now that the chain has answered.
+    //
+    // The bound is what this scan has actually *read* — `scanned_height` is the next unread
+    // block, so every nullifier below it has been matched against this store — and not a freshly
+    // fetched head. A head runs ahead of the pages read above, so clearing against it would
+    // un-pend a note whose spend is sitting in a block the wallet has not looked at yet, and hand
+    // that note back to coin selection as if it were free.
     if store.notes.iter().any(|n| n.pending.is_some()) {
-        let (head, _) = rpc.anchor(None).await?;
+        let read_through = store.scanned_height.saturating_sub(1);
         for n in store.notes.iter_mut() {
             if let Some(time) = n.pending {
-                if n.spent || head > time as u64 + TIME_WINDOW {
+                if n.spent || read_through > time as u64 + TIME_WINDOW {
                     n.pending = None;
                 }
             }
