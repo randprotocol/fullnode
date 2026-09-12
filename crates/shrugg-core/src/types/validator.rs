@@ -72,7 +72,14 @@ impl ValidatorSet {
     }
 
     /// Round-robin leader. Hook for a future sortition beacon.
+    ///
+    /// An empty set has no leader: phase S2 lets an epoch's register derive one (every validator
+    /// below the minimum stake), and such an epoch halts rather than panicking here — no key
+    /// addresses to [`Address::ZERO`], so no proposal can pass the leader check.
     pub fn leader(&self, view: u64) -> Address {
+        if self.validators.is_empty() {
+            return Address::ZERO;
+        }
         let idx = (view % self.validators.len() as u64) as usize;
         self.validators[idx].address()
     }

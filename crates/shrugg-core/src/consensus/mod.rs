@@ -14,6 +14,8 @@ pub use hotstuff::HotStuff;
 use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
 use crate::types::{Block, QuorumCertificate, ValidatorSet, Vote};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Sent by a validator when its view times out, carrying its highest QC so
@@ -73,12 +75,68 @@ pub struct CommittedBlock {
     pub receipts: Vec<crate::program::CallReceipt>,
 }
 
+/// The validator sets of the epochs this replica has seen start, keyed by epoch (spec §8).
+///
+/// Epoch 0 is the genesis set; the set for epoch `e ≥ 1` is derived from the register as of the
+/// last block of epoch `e − 1`, and is recorded here when the first block of the epoch commits.
+/// The node persists it so replay and sync can verify a QC against the set of the epoch the
+/// certified block belonged to, without re-deriving a register it no longer holds.
+///
+/// Sets are held behind an `Arc`: a 100-validator set is over a hundred kilobytes of Dilithium2
+/// public keys, and consensus asks for one on every proposal and every vote.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EpochSets {
+    sets: BTreeMap<u64, Arc<ValidatorSet>>,
+}
+
+impl EpochSets {
+    /// The sets a chain starts with: epoch 0 is the genesis set.
+    pub fn new(genesis_set: ValidatorSet) -> EpochSets {
+        let mut sets = EpochSets::default();
+        sets.insert(0, genesis_set);
+        sets
+    }
+
+    pub fn get(&self, epoch: u64) -> Option<&ValidatorSet> {
+        self.sets.get(&epoch).map(|s| s.as_ref())
+    }
+
+    pub fn insert(&mut self, epoch: u64, set: ValidatorSet) {
+        self.sets.insert(epoch, Arc::new(set));
+    }
+
+    /// Known epochs in order, for the node to persist.
+    pub fn known(&self) -> impl Iterator<Item = (u64, &ValidatorSet)> {
+        self.sets.iter().map(|(e, s)| (*e, s.as_ref()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sets.is_empty()
+    }
+
+    /// Forget every epoch older than `oldest`, keeping epoch 0 (the genesis set, which answers
+    /// for every height below the first boundary). A replica needs only the epochs its block
+    /// tree can still reach; the durable copy is the node's, written from `RecordEpochSet`.
+    pub(crate) fn forget_before(&mut self, oldest: u64) {
+        self.sets.retain(|epoch, _| *epoch == 0 || *epoch >= oldest);
+    }
+
+    /// Shared handle to an epoch's set, the form consensus passes around.
+    pub(crate) fn shared(&self, epoch: u64) -> Option<Arc<ValidatorSet>> {
+        self.sets.get(&epoch).cloned()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Broadcast(ConsensusMessage),
     SendTo(Address, ConsensusMessage),
     /// Blocks are in height order and contiguous with the previously committed head.
     Commit(Vec<CommittedBlock>),
+    /// The first block of `epoch` committed: persist the set that epoch runs with, so a later
+    /// replay or sync can verify its QCs. Emitted immediately before the `Commit` that carries
+    /// that block.
+    RecordEpochSet(u64, ValidatorSet),
     /// Arm a timer; deliver `on_timeout(view)` when it fires.
     ScheduleTimeout { view: u64, duration: Duration },
     /// The node should gather transactions and call `propose(view, txs, now_ms)`.
@@ -94,8 +152,11 @@ pub enum Action {
 #[derive(Clone, Debug)]
 pub struct ConsensusConfig {
     pub chain_id: u64,
-    pub validators: ValidatorSet,
+    /// The set of epoch 0. Every later epoch's set is derived from the register (spec §8).
+    pub genesis_set: ValidatorSet,
     pub genesis_hash: Hash,
+    /// Blocks per epoch, from genesis: `epoch(h) = h / epoch_blocks`.
+    pub epoch_blocks: u64,
     pub base_timeout: Duration,
     pub max_timeout: Duration,
     /// Cap on buffered blocks whose parent is unknown.
@@ -107,11 +168,14 @@ pub struct ConsensusConfig {
 }
 
 impl ConsensusConfig {
-    pub fn new(chain_id: u64, validators: ValidatorSet, genesis_hash: Hash) -> ConsensusConfig {
+    /// `epoch_blocks` defaults to the protocol default; a node sets it from its genesis file,
+    /// like the timeouts.
+    pub fn new(chain_id: u64, genesis_set: ValidatorSet, genesis_hash: Hash) -> ConsensusConfig {
         ConsensusConfig {
             chain_id,
-            validators,
+            genesis_set,
             genesis_hash,
+            epoch_blocks: crate::ledger::staking::EPOCH_BLOCKS_DEFAULT,
             base_timeout: Duration::from_secs(1),
             max_timeout: Duration::from_secs(8),
             max_orphans: 256,
@@ -142,6 +206,8 @@ pub enum ConsensusError {
     Execution(#[from] crate::ledger::BlockError),
     #[error("not a validator")]
     NotValidator,
+    #[error("no validator set known for epoch {0}")]
+    UnknownEpochSet(u64),
     #[error("bad vote signature")]
     BadVote,
     #[error("bad new-view signature")]

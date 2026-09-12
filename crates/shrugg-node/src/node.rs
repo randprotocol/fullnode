@@ -9,7 +9,7 @@ use crate::storage::{Storage, VerifyMode};
 use anyhow::{Context, Result};
 use libp2p::{Multiaddr, PeerId};
 use shrugg_core::confidential::ConfidentialExecutor;
-use shrugg_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
+use shrugg_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, EpochSets, HotStuff};
 use shrugg_core::gas;
 use shrugg_core::genesis::{Genesis, GenesisState};
 use shrugg_core::{Hash, Keypair, Ledger, ShieldedAddress, Transaction, FAUCET_MAX_UNITS};
@@ -201,9 +201,12 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         None
     };
     let mut ccfg = ConsensusConfig::new(gs.chain_id, gs.validators.clone(), gs.hash());
+    ccfg.epoch_blocks = gs.epoch_blocks;
     ccfg.base_timeout = cfg.base_timeout;
     ccfg.max_timeout = cfg.max_timeout;
-    let hs = HotStuff::resume(ccfg, signer, head_block, head_qc, ledger, safety, executor.clone());
+    // Only the genesis epoch for now; loading the sets storage recorded is task 3 of phase S2.
+    let epoch_sets = EpochSets::new(gs.validators.clone());
+    let hs = HotStuff::resume(ccfg, signer, head_block, head_qc, ledger, safety, epoch_sets, executor.clone());
 
     // Network.
     let identity = key.derive_subkey(b"shrugg-p2p-identity");
@@ -430,6 +433,10 @@ impl Node {
                     self.net.broadcast(GossipMessage::Consensus(m)).await;
                 }
                 Action::Commit(blocks) => to_commit.extend(blocks),
+                // Persisting the set is task 3 of phase S2; the replica already holds it.
+                Action::RecordEpochSet(epoch, set) => {
+                    tracing::info!("epoch {epoch} starts with {} validators", set.len());
+                }
                 Action::ScheduleTimeout { view, duration } => {
                     self.timeout = Some((view, Instant::now() + duration));
                 }
@@ -803,11 +810,22 @@ impl Node {
         }
         let head = accepted.last().expect("non-empty");
         let mut ccfg = ConsensusConfig::new(self.gs.chain_id, self.gs.validators.clone(), self.gs.hash());
+        ccfg.epoch_blocks = self.gs.epoch_blocks;
         ccfg.base_timeout = self.cfg.base_timeout;
         ccfg.max_timeout = self.cfg.max_timeout;
         let signer = if self.hs.is_validator() { Some(Keypair::from_seed(self.cfg.seed)?) } else { None };
         let safety = self.hs.safety_state();
-        self.hs = HotStuff::resume(ccfg, signer, head.block.clone(), head.qc.clone(), ledger, Some(safety), self.executor.clone());
+        let epoch_sets = self.hs.epoch_sets().clone();
+        self.hs = HotStuff::resume(
+            ccfg,
+            signer,
+            head.block.clone(),
+            head.qc.clone(),
+            ledger,
+            Some(safety),
+            epoch_sets,
+            self.executor.clone(),
+        );
         self.timeout = None;
         self.propose_at = None;
         let acts = self.hs.start();
