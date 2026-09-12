@@ -132,6 +132,9 @@ pub struct CallReceiptData {
     pub program: ProgramId,
     pub tier: u8,
     pub outputs: [u32; 8],
+    /// The call's input envelope, carried through to the receipt unread (spec §6.1); see
+    /// [`call_envelope`] for the one rule the chain applies to it.
+    pub input_envelope: Option<crate::types::CallEnvelope>,
 }
 
 /// In-memory chain state: the note commitment tree, the nullifier set, the validator register
@@ -539,9 +542,14 @@ impl Ledger {
                     );
                 }
             }
-            Action::Call { program, .. } => {
+            Action::Call { program, input_envelope, .. } => {
                 let o = outcome.expect("validate_inner returns the outcome for calls");
-                receipt = Some(CallReceiptData { program: *program, tier: o.tier, outputs: o.outputs });
+                receipt = Some(CallReceiptData {
+                    program: *program,
+                    tier: o.tier,
+                    outputs: o.outputs,
+                    input_envelope: input_envelope.clone(),
+                });
             }
             a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. }) => {
                 staking::apply(self, tx, a, executor)?;
@@ -621,6 +629,7 @@ impl Ledger {
                 outputs: r.outputs,
                 height: block.height(),
                 index: index as u32,
+                input_envelope: r.input_envelope,
             })
             .collect())
     }
@@ -1049,6 +1058,54 @@ mod tests {
             let b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], fee);
             assert_eq!(l.validate(&Transaction::shielded(7, b, action), &StubExecutor), expect, "n={n}");
         }
+    }
+
+    /// The chain's other half of the call-envelope story (spec §6.1): what it does not check,
+    /// it still has to carry. The envelope travels with the call's receipt, which is how an
+    /// auditor handed a key months later finds the transcript by transaction hash — and how a
+    /// node serves `shrugg_getCallEnvelope` without re-reading the block.
+    #[test]
+    fn a_call_receipt_carries_the_envelope_its_call_published() {
+        let mut l = ledger();
+        let (a, _) = keys();
+        let words = vec![0x13u32; 4];
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone() };
+        let d = Transaction::shielded(
+            7,
+            bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)),
+            deploy,
+        );
+        l.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
+        l.record_anchor(l.height());
+        let id = program_id(0, &words);
+        let fee = gas::BUNDLE_BASE + gas::call_fee(12);
+        let envelope = crate::types::CallEnvelope {
+            kem_ct: vec![1; 1088],
+            to_sender: vec![2; 60],
+            to_auditor: vec![3; 60],
+            body: vec![4; 128],
+        };
+        let sealed = Action::Call {
+            program: id,
+            proof: StubExecutor::make_proof(&id, 12, [5; 8]),
+            input_envelope: Some(envelope.clone()),
+        };
+        let bare =
+            Action::Call { program: id, proof: StubExecutor::make_proof(&id, 12, [6; 8]), input_envelope: None };
+        let t1 = Transaction::shielded(7, bundle(&l, [[10; 8], [11; 8]], [[12; 8], [13; 8]], fee), sealed);
+        let t2 = Transaction::shielded(7, bundle(&l, [[20; 8], [21; 8]], [[22; 8], [23; 8]], fee), bare);
+        let txs = vec![t1.clone(), t2.clone()];
+        let block = signed_block(txs.clone(), &a, 2, root_after(&l, &txs, &a.address(), 2));
+        let receipts = l.apply_block(&block, &StubExecutor).unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].tx, t1.hash());
+        assert_eq!(receipts[0].input_envelope, Some(envelope), "the sealed transcript rides with the receipt");
+        assert_eq!(receipts[0].outputs, [5; 8]);
+        assert_eq!(receipts[1].tx, t2.hash());
+        assert_eq!(receipts[1].input_envelope, None, "a call made with --no-envelope stays bare");
+        // And it survives the wire: receipts are stored and served as bincode rows.
+        let back: CallReceipt = bincode::deserialize(&bincode::serialize(&receipts[0]).unwrap()).unwrap();
+        assert_eq!(back, receipts[0]);
     }
 
     #[test]

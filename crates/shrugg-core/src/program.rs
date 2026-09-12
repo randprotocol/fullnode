@@ -1,6 +1,7 @@
 //! On-chain programs and call receipts.
 
 use crate::crypto::Hash;
+use crate::types::CallEnvelope;
 use serde::{Deserialize, Serialize};
 
 pub type ProgramId = Hash;
@@ -45,6 +46,13 @@ pub struct CallReceipt {
     pub outputs: [u32; 8],
     pub height: u64,
     pub index: u32,
+    /// The call-input envelope the transaction published, if it published one (spec §6.1).
+    ///
+    /// Chain data the chain never reads: the ledger checks its size and stores it here, and a
+    /// node serves it as `shrugg_getCallEnvelope`. It lives on the receipt rather than being
+    /// re-read from the block because that is how it is asked for — by transaction hash, by
+    /// someone who was handed a viewing key or a per-call key long after the block was made.
+    pub input_envelope: Option<CallEnvelope>,
 }
 
 #[cfg(test)]

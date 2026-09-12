@@ -419,6 +419,29 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 })
                 .unwrap_or(Value::Null))
         }
+        // The sealed transcript of a call's private inputs (spec §6.1), verbatim, in hex. The
+        // node holds no key that opens it and never looks inside: it is served so that the
+        // caller's viewing key, a per-call key, or the auditor named when it was sealed can
+        // (`shrugg_zkvm::call_envelope`). `null` for a call that published none, for a
+        // transaction that is not a call, and for a hash this node has no receipt for.
+        "shrugg_getCallEnvelope" => {
+            let h = parse_hash(p, 0)?;
+            Ok(st
+                .storage
+                .receipt(&h)
+                .map_err(RpcError::internal)?
+                .and_then(|r| r.input_envelope.map(|e| (r.tx, e)))
+                .map(|(tx, e)| {
+                    json!({
+                        "tx": tx.to_hex(),
+                        "kem_ct": hex::encode(&e.kem_ct),
+                        "to_sender": hex::encode(&e.to_sender),
+                        "to_auditor": hex::encode(&e.to_auditor),
+                        "body": hex::encode(&e.body),
+                    })
+                })
+                .unwrap_or(Value::Null))
+        }
         "shrugg_estimateFee" => {
             let spec: Value = param(p, 0, "spec")?;
             let kind = spec.get("kind").and_then(|k| k.as_str()).unwrap_or_default();
@@ -750,6 +773,76 @@ mod tests {
             assert!(!text.contains(banned), "{banned} leaked into tx_json: {text}");
         }
         assert_eq!(ok(&st, "shrugg_getTransaction", json!([Hash::ZERO.to_hex()])).await, Value::Null);
+    }
+
+    /// The call-input envelope's read path (spec §6.1): a receipt carries the sealed transcript,
+    /// and one method hands it back verbatim in hex so a viewing key — never the node — can open
+    /// it. A call made without one, or a transaction that is not a call at all, is `null`.
+    #[tokio::test]
+    async fn get_call_envelope_serves_the_sealed_transcript_of_a_call() {
+        let gs = genesis_with(1, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)]);
+        let (_d, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let mut probe = gs.ledger.clone();
+
+        let words = vec![0x13u32; 4];
+        let pid = shrugg_core::program::program_id(0, &words);
+        let deploy_fee = shrugg_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: words.clone() });
+        let call_fee = shrugg_core::gas::BUNDLE_BASE + shrugg_core::gas::call_fee(12);
+        let with_bundle = |nfs: [Word8; 2], cms: [Word8; 2], fee: u64, action| {
+            let b = bundle_tx(&ledger, nfs, cms, fee).bundle.expect("bundle_tx always carries one");
+            Transaction::shielded(gs.chain_id, b, action)
+        };
+        let envelope = shrugg_core::types::CallEnvelope {
+            kem_ct: vec![0xab; 1088],
+            to_sender: vec![0xcd; 60],
+            to_auditor: vec![0xef; 60],
+            body: vec![0x12; 96],
+        };
+        let deploy = with_bundle([nf(1), nf(2)], [cm(1), cm(2)], deploy_fee, Action::Deploy { base_pc: 0, words });
+        let sealed = with_bundle(
+            [nf(3), nf(4)],
+            [cm(3), cm(4)],
+            call_fee,
+            Action::Call {
+                program: pid,
+                proof: StubExecutor::make_proof(&pid, 12, [7; 8]),
+                input_envelope: Some(envelope.clone()),
+            },
+        );
+        let bare = with_bundle(
+            [nf(5), nf(6)],
+            [cm(5), cm(6)],
+            call_fee,
+            Action::Call {
+                program: pid,
+                proof: StubExecutor::make_proof(&pid, 12, [8; 8]),
+                input_envelope: None,
+            },
+        );
+        let txs = vec![deploy.clone(), sealed.clone(), bare.clone()];
+        let mut b1 = make_block(&gs.block, &mut ledger, txs, &key(1));
+        // The receipts the ledger itself produced for that block — what a node commits.
+        b1.receipts = probe.apply_block(&b1.block, &StubExecutor).unwrap();
+        st.storage.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+
+        let v = ok(&st, "shrugg_getCallEnvelope", json!([sealed.hash().to_hex()])).await;
+        assert_eq!(v["tx"], sealed.hash().to_hex());
+        assert_eq!(v["kem_ct"], hex::encode(&envelope.kem_ct));
+        assert_eq!(v["to_sender"], hex::encode(&envelope.to_sender));
+        assert_eq!(v["to_auditor"], hex::encode(&envelope.to_auditor));
+        assert_eq!(v["body"], hex::encode(&envelope.body));
+
+        // The receipt itself still reports only the public outcome; the transcript is a
+        // separate, explicit request.
+        let r = ok(&st, "shrugg_getReceipt", json!([sealed.hash().to_hex()])).await;
+        assert_eq!((&r["program"], &r["tier"], &r["height"]), (&json!(pid.to_hex()), &json!(12), &json!(1)));
+
+        // A call that forfeited disclosure, a transaction that is not a call, and a hash the
+        // chain has never seen are all null rather than errors.
+        for h in [bare.hash(), deploy.hash(), Hash::ZERO] {
+            assert_eq!(ok(&st, "shrugg_getCallEnvelope", json!([h.to_hex()])).await, Value::Null, "{h}");
+        }
     }
 
     #[tokio::test]

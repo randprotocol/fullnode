@@ -300,6 +300,10 @@ pub fn zk_code_hash(program: &Program) -> String {
 /// salt from OS entropy internally — never `Machine::prove_salted`, which exists only for tests
 /// that need a fixed salt to check against. This entry point must keep it that way: an unsalted
 /// or reused `H_IN` is a guessable/linkable commitment to the private inputs, not a hiding one.
+///
+/// S3: a caller that will publish a call-input envelope needs the salt back and uses
+/// [`prove_call`] instead, which draws an equally fresh one on this side of `Machine`. This
+/// function stays as it is — it is the path every backend can serve.
 pub fn prove(
     profile: FriProfile,
     program: &Program,
@@ -312,6 +316,47 @@ pub fn prove(
         .prove_with(backend, program, inputs, tier.map(|t| Tier(t as usize)))
         .map_err(|e| format!("{e:?}"))?;
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
+}
+
+/// `prove` for a caller that will publish a call-input envelope: the same proof, plus the
+/// `H_IN` salt that produced it (spec §6.1, S3 Task 1).
+///
+/// The envelope's body carries `(salt, inputs)` and is sealed against the proof's public
+/// `H_IN` (`pv::IN0..7`), so whoever opens it can recompute `hash::input_digest(salt, inputs)`
+/// and see that the transcript is the one the guest was actually fed
+/// (`call_envelope::call_envelope_is_faithful`). That is only possible if the salt leaves the
+/// prover, which `Machine::prove` — drawing it internally and dropping it — does not allow;
+/// hence this entry point, which draws the same fresh OS-entropy salt itself and hands it to
+/// `Machine::prove_salted`. Freshness is still this function's job: a reused or guessable salt
+/// makes `H_IN` a guessable commitment to the private inputs, which is the whole reason M4.1
+/// salts it (`Machine::prove_salted`'s doc comment).
+///
+/// Only `Backend::Cpu` can answer: the GPU and reference paths run inside the vendored
+/// `Machine::prove_with`, which draws its own salt and never returns it. A caller proving on
+/// one of those backends must prove without an envelope (`prove`) — the chain accepts both.
+pub fn prove_call(
+    profile: FriProfile,
+    program: &Program,
+    inputs: &[u32],
+    tier: Option<u8>,
+    backend: Backend,
+) -> Result<(Vec<u8>, [u32; 8], u8, [u32; 4]), String> {
+    match backend {
+        Backend::Cpu => {
+            use rand::RngExt;
+            let salt: [u32; 4] = rand::rng().random();
+            let m = Machine::new(profile);
+            let (proof, exec) = m
+                .prove_salted(program, inputs, salt, tier.map(|t| Tier(t as usize)))
+                .map_err(|e| format!("{e:?}"))?;
+            Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8, salt))
+        }
+        #[allow(unreachable_patterns)]
+        other => Err(format!(
+            "{other:?} draws its H_IN salt inside the prover and cannot return it; \
+             prove a call that publishes an input envelope on the CPU backend"
+        )),
+    }
 }
 
 /// Wallet-side prover for a shielded bundle: proves `guests::bundle()` on `inputs` (built by
