@@ -15,7 +15,7 @@
 use super::{Ledger, TxError};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, PublicKey, Signature};
-use crate::notes::{ShieldedAddress, Word8};
+use crate::notes::{ShieldedAddress, Word8, KEM_EK_BYTES};
 use crate::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
 use crate::types::{Action, Transaction, ValidatorSet, UNITS_PER_SHRUGG};
 use serde::{Deserialize, Serialize};
@@ -184,10 +184,11 @@ impl Ledger {
         let available = check_withdraw(self, validator, amount, nonce, r, envelope, signature, chain_id)?;
         let epoch = self.epoch();
         let e = self.validators.get_mut(validator).expect("checked above");
-        // Released pending entries first, oldest first, then the rewards.
+        // Released pending entries first, oldest first, then the rewards — worked out in full
+        // before the entry is touched, so a sum that does not add up changes nothing.
         let mut want = amount;
         let mut kept = Vec::with_capacity(e.pending.len());
-        for (release_epoch, pending) in std::mem::take(&mut e.pending) {
+        for &(release_epoch, pending) in e.pending.iter() {
             if release_epoch <= epoch && want > 0 {
                 let taken = want.min(pending);
                 want -= taken;
@@ -198,10 +199,13 @@ impl Ledger {
                 kept.push((release_epoch, pending));
             }
         }
+        // `check_withdraw` proved the rewards cover whatever the queue did not, unless
+        // `released` had to saturate — in which case this is the rule that says no.
+        let rewards = e.rewards.checked_sub(want).ok_or(StakingError::Overflow)?;
         e.pending = kept;
-        e.rewards -= want; // `check_withdraw` proved rewards cover whatever the queue did not
+        e.rewards = rewards;
         e.nonce += 1;
-        Ok(available - amount)
+        Ok(available.saturating_sub(amount))
     }
 }
 
@@ -223,6 +227,12 @@ fn check_bond(
         }
         (None, Some(r)) => {
             if r.public_key.address() != *validator {
+                return Err(StakingError::BadRegistration);
+            }
+            // A payout nobody can seal a note to is not an address: the withdraw note this
+            // register entry exists to pay would be unopenable. It also keeps every entry's
+            // `payout` a fixed width, which is what makes the v2 validator leaf unambiguous.
+            if r.payout.kem_ek.len() != KEM_EK_BYTES {
                 return Err(StakingError::BadRegistration);
             }
             if !r.public_key.verify(registration_message(chain_id, &r.payout).as_bytes(), &r.signature) {
@@ -393,7 +403,7 @@ mod tests {
     }
 
     fn payout(i: u8) -> ShieldedAddress {
-        ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; 32] }
+        ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; KEM_EK_BYTES] }
     }
 
     fn env() -> Envelope {
@@ -527,6 +537,11 @@ mod tests {
         // A registration for another key than the action's validator.
         let wrong_key = bond_tx(&l, 30, &newcomer, MIN_STAKE, Some(registration(&key(3), payout(2))));
         assert_eq!(staking_err(l.validate(&wrong_key, &StubExecutor).unwrap_err()), StakingError::BadRegistration);
+
+        // A registration whose payout could never be sealed to.
+        let short = ShieldedAddress { pk: [2; 8], kem_ek: vec![2; 32] };
+        let stub = bond_tx(&l, 35, &newcomer, MIN_STAKE, Some(registration(&newcomer, short)));
+        assert_eq!(staking_err(l.validate(&stub, &StubExecutor).unwrap_err()), StakingError::BadRegistration);
 
         // A registration whose signature is for another payout address.
         let mut forged = registration(&newcomer, payout(2));
