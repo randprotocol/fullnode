@@ -11,9 +11,10 @@
 //! the process is exactly what a bundle publishes: an anchor, two nullifiers, two commitments,
 //! the fee, and two envelopes nobody but their recipients can open.
 
-use crate::RpcClient;
+use crate::{AssetRow, RpcClient};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use shrugg_core::bridge::{AssetId, Attestation, Payload};
 use shrugg_core::ledger::{bridge_notes, TIME_WINDOW};
 use shrugg_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, DEPTH};
@@ -898,6 +899,82 @@ pub fn attested_deposit(attestation: &[u8]) -> Result<AttestedDeposit> {
     Ok(AttestedDeposit { to_hash: t.to, token_chain: t.token_chain, token: t.token_address, asset, amount })
 }
 
+/// The `asset` word a deposit note will carry, and how sure a wallet can be of it.
+///
+/// [`DepositIndex::Registered`] is a fact: an index is assigned once and never changes, so a token
+/// the registry already names deposits under that index whenever the transaction lands.
+///
+/// [`DepositIndex::FirstSighting`] is a *prediction*, and the one number in a `bridge-mint` this
+/// wallet cannot be certain of. The ledger gives a new asset the registry's `next_index` as it
+/// stands when the transaction is applied (`BridgeState::asset_entry`), and proving the fee bundle
+/// takes a minute and a half — so another first-sighting attestation committing in that window
+/// moves the index, and the note this wallet sealed an envelope for is not the note the chain
+/// appends. The recipient would be left a leaf no key of theirs opens. Hence two things a mint of a
+/// new asset must do: print `r` and `time` (both public on the wire, so printing discloses nothing)
+/// so the note is reconstructible by hand, and check the committed transaction afterwards with
+/// [`deposit_index_check`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepositIndex {
+    Registered(u32),
+    FirstSighting(u32),
+}
+
+impl DepositIndex {
+    pub fn index(self) -> u32 {
+        match self {
+            DepositIndex::Registered(i) | DepositIndex::FirstSighting(i) => i,
+        }
+    }
+
+    pub fn is_first_sighting(self) -> bool {
+        matches!(self, DepositIndex::FirstSighting(_))
+    }
+}
+
+/// The index a deposit of `asset_id` will carry, from the node's own two answers: the registry
+/// (`shrugg_getAssets`) and, for a token it does not name, the `next_index` that registry would
+/// hand out (`shrugg_getBridgeState`).
+pub fn deposit_index(bridge_state: &Value, assets: &[AssetRow], asset_id: &str) -> Result<DepositIndex> {
+    if bridge_state["enabled"] != Value::Bool(true) {
+        return Err(anyhow!("this chain has no bridge"));
+    }
+    match assets.iter().find(|a| a.asset_id == asset_id) {
+        Some(a) => Ok(DepositIndex::Registered(a.index)),
+        None => {
+            let next = bridge_state["next_index"].as_u64().context("bridge state has no next_index")?;
+            Ok(DepositIndex::FirstSighting(u32::try_from(next).context("next_index does not fit an asset word")?))
+        }
+    }
+}
+
+/// What a committed `BridgeAttest` deposited under, against what the wallet predicted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepositIndexCheck {
+    /// The chain deposited under the index the envelope was sealed for.
+    Agrees,
+    /// It did not, so the envelope opens nothing: the recipient has to rebuild the note from the
+    /// `r` and `time` the mint printed, with `committed` as its `asset` word.
+    Mismatch { predicted: u32, committed: u32 },
+    /// The node cannot say: not an attest, or an attestation whose asset its registry does not hold
+    /// (and a rotation, which deposits nothing).
+    Unknown,
+}
+
+/// Check a predicted deposit index against the committed transaction, as `shrugg_getTransaction`
+/// returns it — `result.tx.action.asset_index`, which the node computes the same way the ledger
+/// does (`bridge_notes::attested_transfer` plus the registry).
+pub fn deposit_index_check(predicted: u32, tx: &Value) -> DepositIndexCheck {
+    let action = &tx["tx"]["action"];
+    if action["kind"] != Value::String("bridge_attest".into()) {
+        return DepositIndexCheck::Unknown;
+    }
+    match action["asset_index"].as_u64().and_then(|i| u32::try_from(i).ok()) {
+        None => DepositIndexCheck::Unknown,
+        Some(committed) if committed == predicted => DepositIndexCheck::Agrees,
+        Some(committed) => DepositIndexCheck::Mismatch { predicted, committed },
+    }
+}
+
 /// The deposit note a `BridgeAttest` will append, and an envelope only `recipient` can open.
 ///
 /// The commitment is not on the wire: the chain computes it from the amount the guardians signed,
@@ -1155,6 +1232,62 @@ mod tests {
         // Bytes that are not an attestation, and one that deposits nothing, are refused by name.
         assert!(attested_deposit(&[0xff; 32]).unwrap_err().to_string().contains("not a bridge attestation"));
         assert!(attested_deposit(&rotation_attestation()).unwrap_err().to_string().contains("rotation"));
+    }
+
+    /// A registered asset's index is a fact; an unregistered one's is the registry's `next_index`,
+    /// and only a prediction — the ledger assigns it when the transaction is *applied*, which is
+    /// after this wallet has spent a minute and a half proving the fee bundle.
+    #[test]
+    fn a_deposit_index_is_a_fact_for_a_registered_asset_and_a_prediction_for_a_new_one() {
+        let row = |index: u32, byte: u8| AssetRow {
+            index,
+            chain: 2,
+            token: vec![byte; 32],
+            asset_id: hex::encode([byte; 32]),
+        };
+        let assets = [row(1, 0xaa), row(2, 0xbb)];
+        let state = serde_json::json!({ "enabled": true, "next_index": 3 });
+        let id = |byte: u8| hex::encode([byte; 32]);
+
+        assert_eq!(deposit_index(&state, &assets, &id(0xaa)).unwrap(), DepositIndex::Registered(1));
+        assert_eq!(deposit_index(&state, &assets, &id(0xbb)).unwrap(), DepositIndex::Registered(2));
+        let new = deposit_index(&state, &assets, &id(0xcc)).unwrap();
+        assert_eq!(new, DepositIndex::FirstSighting(3), "the index this attestation's own registration will assign");
+        assert_eq!((new.index(), new.is_first_sighting()), (3, true));
+        assert!(!DepositIndex::Registered(1).is_first_sighting());
+
+        // A chain with no bridge cannot deposit at all, and a reply missing `next_index` is not one
+        // a note may be built from — neither is a number to guess at.
+        let err = deposit_index(&serde_json::json!({ "enabled": false }), &assets, &id(0xcc)).unwrap_err();
+        assert!(err.to_string().contains("no bridge"), "{err}");
+        assert!(deposit_index(&serde_json::json!({ "enabled": true }), &assets, &id(0xcc)).is_err());
+    }
+
+    /// The check that catches the one way a first-sighting mint can go wrong: the chain deposited
+    /// under a different index than the envelope was sealed against, because another first sighting
+    /// registered while this wallet was proving.
+    #[test]
+    fn a_committed_deposit_index_is_checked_against_the_predicted_one() {
+        let committed = |kind: &str, asset_index: serde_json::Value| {
+            serde_json::json!({ "tx": { "action": { "kind": kind, "asset_index": asset_index } } })
+        };
+        assert_eq!(deposit_index_check(3, &committed("bridge_attest", serde_json::json!(3))), DepositIndexCheck::Agrees);
+        assert_eq!(
+            deposit_index_check(3, &committed("bridge_attest", serde_json::json!(4))),
+            DepositIndexCheck::Mismatch { predicted: 3, committed: 4 },
+            "another first sighting took index 3 first"
+        );
+        // The node cannot always say, and "cannot say" is never "agrees": a rotation deposits
+        // nothing, an asset its registry does not hold renders as null, and another action is not a
+        // deposit at all.
+        for tx in [
+            committed("bridge_attest", serde_json::Value::Null),
+            committed("bridge_burn", serde_json::json!(3)),
+            serde_json::json!({ "tx": { "action": {} } }),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(deposit_index_check(3, &tx), DepositIndexCheck::Unknown, "{tx}");
+        }
     }
 
     /// The deposit note this wallet seals for has to be, word for word, the one the chain computes

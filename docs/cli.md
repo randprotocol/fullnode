@@ -175,7 +175,7 @@ Global options, accepted before or after the subcommand:
 | `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--tier T`, `--fee <SHRUGG>`, `--auditor <shrugg1…>`, `--no-envelope`, `--print-call-key`, `--cuda` | fetch the code from the node, prove the call locally with the chain's FRI profile, seal its input transcript, pay through a bundle, wait, print the receipt |
 | `open-call <TXHASH>` | `--call-key <hex>`, `--as-auditor` | fetch the receipt and the sealed transcript, open it, check it against the receipt's `H_IN`, re-run the program on the recovered inputs and print both sets of outputs |
 | `receipt <TX>` | | receipt of a committed call, or "no receipt" |
-| `bridge-mint <ATTESTATION>` | hex or `@path`, `--to <shrugg1…>`, `--fee <SHRUGG>`, `--no-wait`, `--cuda` | deposit a guardian-signed attestation as a note: seal the deposit's envelope for its recipient and pay through a bundle from this wallet |
+| `bridge-mint <ATTESTATION>` | hex or `@path`, `--to <shrugg1…>`, `--fee <SHRUGG>`, `--no-wait`, `--cuda` | deposit a guardian-signed attestation as a note: seal the deposit's envelope for its recipient and pay through a bundle from this wallet. Prints the note's `owner`, `time` and `r` every time, and on the waiting path checks the asset index the chain actually deposited under |
 | `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | `--relayer-fee N`, `--fee <SHRUGG>` (default `0.002`), `--no-wait`, `--cuda` | burn a bridged asset to another chain: select that asset's notes for the asset bundle and SHRUGG for the fee bundle, prove **both**, submit one transaction |
 | `bridge` | | the bridge's public state: guardians, emitters, the asset registry, `next_index`, the burn sequence |
 | `bridge-message <SEQUENCE>` | | one outbound burn message, verbatim, for a guardian to sign |
@@ -203,6 +203,16 @@ one: every backend but the CPU draws the `H_IN` salt inside the prover and never
 Amounts in a bridged asset are plain integers in that asset's own smallest unit, not decimal
 SHRUGG: only index 0 has this chain's nine decimals, and what a bridged token's unit means belongs
 to its source chain.
+
+The one number `bridge-mint` cannot be certain of is the `asset` index of a token this chain has
+never seen: the ledger assigns it from the registry's `next_index` when the transaction is
+*applied*, and the wallet spends about 90 seconds proving the fee bundle in between. If another
+first sighting registers in that window, the deposit note carries a different `asset` word than the
+envelope was sealed against and the recipient's leaf opens under no key. So the command prints the
+note's `owner`, `time` and `r` (all already public in that transaction) for every mint, and —
+unless `--no-wait` — re-reads the committed transaction and warns with both indices if they differ,
+naming the six words the note has to be rebuilt from. A token the registry already names cannot
+move: an index is assigned once, forever.
 
 `--cuda` proves on an attached NVIDIA GPU and requires a build with `--features cuda`. There is no
 fallback: a missing driver is an error rather than a silent CPU run.

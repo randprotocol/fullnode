@@ -588,30 +588,25 @@ async fn main() -> Result<()> {
                     if to.is_some() { "the address given" } else { "this wallet's address" }
                 );
             }
-            let bridge = rpc.bridge_state().await?;
-            if bridge["enabled"] != serde_json::json!(true) {
-                anyhow::bail!("this chain has no bridge");
-            }
-            // The index a note carries is state, so it is asked of the node: the registry's, if the
-            // asset is registered, and otherwise the index this attestation's own registration will
-            // hand out. The asset id comes from the node too, over the two wire fields the
-            // guardians signed — a disagreement with the one this wallet computed would mean the
-            // two are not speaking about the same chain.
+            // The asset id comes from the node, over the two wire fields the guardians signed — a
+            // disagreement with the one this wallet computed would mean the two are not speaking
+            // about the same chain.
             let asset_id = rpc.bridge_asset_id(d.token_chain, &d.token).await?;
             if asset_id != d.asset.to_hex() {
                 anyhow::bail!("the node computes a different asset id ({asset_id}) than this wallet ({})", d.asset.to_hex());
             }
-            let registered = rpc.assets().await?.into_iter().find(|a| a.asset_id == asset_id);
-            let index = match &registered {
-                Some(a) => a.index,
-                None => bridge["next_index"].as_u64().context("bridge state has no next_index")? as u32,
-            };
+            // The index a note carries is state, so it is asked of the node too. For a token the
+            // registry already names it is a fact; for a first sighting it is a prediction this
+            // wallet has to check afterwards (`wallet::DepositIndex`).
+            let asset = wallet::deposit_index(&rpc.bridge_state().await?, &rpc.assets().await?, &asset_id)?;
+            let index = asset.index();
             // The note is stamped with a `time` this wallet chooses, inside the window admission
             // allows, which is what makes its commitment predictable enough to seal an envelope
             // against (`Action::BridgeAttest`). The head is the freshest such time.
             let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
                 .context("chain height does not fit a note's time field")?;
             let (note, envelope) = wallet::deposit_note_for(&w, &recipient, d.amount, index, time)?;
+            let owner = recipient.to_string();
             let action = Action::BridgeAttest { attestation: bytes, recipient, r: note.r, time, envelope };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
@@ -622,15 +617,46 @@ async fn main() -> Result<()> {
             let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
-            report(&s?, "bridge attestation");
+            let s = s?;
+            report(&s, "bridge attestation");
+            // Everything the deposit note is made of, every time. `r` and `time` are already public
+            // in this transaction, so printing them discloses nothing — and they are the only way to
+            // rebuild the note by hand if the index turns out not to be the predicted one below.
             println!(
-                "deposit: {} units of asset {index}{}, note {} at time {time}",
+                "deposit: {} units of asset {index}{}\n  note {}\n  owner {owner}, from 0, time {time}, r {}",
                 d.amount,
-                if registered.is_some() { "" } else { " (first sighting — this transaction registers it)" },
+                if asset.is_first_sighting() { " (first sighting — this transaction registers it)" } else { "" },
                 shrugg_core::notes::word8_to_hex(&note.commitment()),
+                shrugg_core::notes::word8_to_hex(&note.r),
             );
             if !no_wait {
-                println!("asset {index} balance: {} units", store.balance_of(index));
+                // A first sighting's index was a prediction: the ledger assigns one from the
+                // registry's `next_index` as it stands when the transaction is applied, and this
+                // wallet spent a minute and a half proving a bundle in between. If another first
+                // sighting registered in that window the note carries a different `asset` word than
+                // the envelope was sealed against, and saying so is the difference between a
+                // recoverable note and a silently lost one.
+                let committed = rpc.call("shrugg_getTransaction", serde_json::json!([s.hash.to_hex()])).await?;
+                let landed = match wallet::deposit_index_check(index, &committed) {
+                    wallet::DepositIndexCheck::Agrees => index,
+                    wallet::DepositIndexCheck::Mismatch { predicted, committed } => {
+                        println!(
+                            "warning: the chain deposited this note under asset {committed}, not the {predicted} \
+                             the envelope was sealed for — another first sighting registered in between.\n  \
+                             The envelope opens nothing: rebuild the note as (owner {owner}, from 0, amount {}, \
+                             asset {committed}, time {time}, r {}) and import it by hand.",
+                            d.amount,
+                            shrugg_core::notes::word8_to_hex(&note.r),
+                        );
+                        committed
+                    }
+                    // Only reachable if this node cannot render the action it just committed.
+                    wallet::DepositIndexCheck::Unknown => {
+                        println!("warning: the node cannot say which asset this deposit landed under; check `shrugg tx {}`", s.hash);
+                        index
+                    }
+                };
+                println!("asset {landed} balance: {} units", store.balance_of(landed));
             }
         }
         Cmd::BridgeBurn { asset, amount, to_chain, to, relayer_fee, fee, no_wait, cuda } => {
