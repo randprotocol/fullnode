@@ -547,6 +547,7 @@ through the real executor); full mode additionally re-checks every proposer sign
 
 - `docs/zkvm.md` — the zkVM's ISA, tables, syscalls and execution model.
 - `docs/fees.md` — fees, tiers, proving cost, and why there is no gas metering.
+- `docs/block-space.md` — proof size against the block cap, throughput, chain growth, and how the number comes down.
 - `docs/confidential.md` — the on-chain call model, gas schedule, constraint-set history (why a
   zkVM upgrade is a hard fork), and the `--cuda` GPU proving path in full.
 - `docs/zkvm-milestones.md` — being written alongside this page; tracks the zkVM's milestone history
