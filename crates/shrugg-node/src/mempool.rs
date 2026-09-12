@@ -6,7 +6,10 @@
 //! they touch the same note. What replaces the old nonce bookkeeping is *conflict* tracking —
 //! the pool never holds two transactions that spend the same nullifier or create the same
 //! commitment, because at most one of them could ever be included and carrying the other only
-//! wastes the proposer's block space and a (~20 ms) proof verification per gossip round.
+//! wastes the proposer's block space and a (~20 ms) proof verification per gossip round. One of
+//! those commitments is not in the transaction at all: a `Withdraw`'s deposit note, which the
+//! ledger derives from the register, and which two withdraws can collide over just as two bundles
+//! can collide over an output.
 
 use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::notes::word8_to_hex;
@@ -25,16 +28,35 @@ pub enum MempoolError {
     Full,
 }
 
+/// A pooled transaction and the commitments it claims.
+///
+/// The claims are remembered rather than recomputed because one of them is not on the wire: the
+/// note a `Withdraw` makes the ledger create comes from the register, via
+/// `Ledger::derived_commitment`, so a transaction leaving the pool could not name it again
+/// without a ledger to hand.
+struct Pooled {
+    tx: Transaction,
+    commitments: Vec<Word8>,
+}
+
 pub struct Mempool {
-    txs: HashMap<Hash, Transaction>,
+    txs: HashMap<Hash, Pooled>,
     /// Which pooled transaction spends each nullifier — one owner per nullifier, always.
     nullifiers: HashMap<Word8, Hash>,
-    /// Which pooled transaction creates each commitment (a bundle's two output slots, or a
-    /// mint's single note). A `Withdraw`'s deposit is not here: the wire does not carry its
-    /// commitment, only the ledger can derive it, and its nonce is what keeps two of them from
-    /// both applying.
+    /// Which pooled transaction creates each commitment: a bundle's two output slots, a mint's
+    /// single note, or the deposit a `Withdraw` will make the ledger create.
     commitments: HashMap<Word8, Hash>,
     max_size: usize,
+}
+
+/// Every commitment `tx` claims: the ones it carries, plus the deposit `ledger` would derive for
+/// it. Two transactions claiming one commitment can never both be included, so the pool holds at
+/// most one of them — and for a withdraw that is also what makes a second withdraw paying the same
+/// note a conflict here rather than a transaction the proposer silently drops.
+fn claimed_commitments(tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> Vec<Word8> {
+    let mut v = tx.commitments();
+    v.extend(ledger.derived_commitment(&tx.action, executor));
+    v
 }
 
 impl Mempool {
@@ -55,7 +77,7 @@ impl Mempool {
     }
 
     pub fn get(&self, hash: &Hash) -> Option<&Transaction> {
-        self.txs.get(hash)
+        self.txs.get(hash).map(|p| &p.tx)
     }
 
     /// Validate against `ledger` (the state the next block will build on) and insert.
@@ -78,9 +100,10 @@ impl Mempool {
                 return Err(MempoolError::Conflict(nf));
             }
         }
-        for cm in tx.commitments() {
-            if self.commitments.contains_key(&cm) {
-                return Err(MempoolError::Conflict(cm));
+        let commitments = claimed_commitments(&tx, ledger, executor);
+        for cm in &commitments {
+            if self.commitments.contains_key(cm) {
+                return Err(MempoolError::Conflict(*cm));
             }
         }
         if self.txs.len() >= self.max_size {
@@ -91,10 +114,10 @@ impl Mempool {
         for nf in tx.nullifiers() {
             self.nullifiers.insert(nf, hash);
         }
-        for cm in tx.commitments() {
-            self.commitments.insert(cm, hash);
+        for cm in &commitments {
+            self.commitments.insert(*cm, hash);
         }
-        self.txs.insert(hash, tx);
+        self.txs.insert(hash, Pooled { tx, commitments });
         Ok(hash)
     }
 
@@ -111,25 +134,26 @@ impl Mempool {
     /// now exists is skipped rather than offered. The proposer's own `apply_transactions` is
     /// still the authority; this only avoids proposing a block that would fail.
     pub fn candidates_within(&self, ledger: &Ledger, max: usize, max_bytes: usize) -> Vec<Transaction> {
-        let mut ready: Vec<(&Hash, &Transaction)> =
-            self.txs.iter().filter(|(_, tx)| Self::still_applies(tx, ledger)).collect();
-        ready.sort_by(|a, b| b.1.fee().cmp(&a.1.fee()).then_with(|| a.0.cmp(b.0)));
+        let mut ready: Vec<(&Hash, &Pooled)> =
+            self.txs.iter().filter(|(_, p)| Self::still_applies(p, ledger)).collect();
+        ready.sort_by(|a, b| b.1.tx.fee().cmp(&a.1.tx.fee()).then_with(|| a.0.cmp(b.0)));
         let mut out = Vec::new();
         let mut bytes = 0usize;
-        for (_, tx) in ready.into_iter().take(max) {
-            let len = tx.encoded_len();
+        for (_, p) in ready.into_iter().take(max) {
+            let len = p.tx.encoded_len();
             if bytes + len > max_bytes {
                 break;
             }
             bytes += len;
-            out.push(tx.clone());
+            out.push(p.tx.clone());
         }
         out
     }
 
     /// The cheap half of `Ledger::validate` — everything that can go stale between insertion and
     /// the next block, and nothing that costs a proof verification.
-    fn still_applies(tx: &Transaction, ledger: &Ledger) -> bool {
+    fn still_applies(p: &Pooled, ledger: &Ledger) -> bool {
+        let tx = &p.tx;
         if let Some(b) = &tx.bundle {
             if !ledger.is_anchor(&b.anchor) || !ledger.time_in_window(b.time) {
                 return false;
@@ -142,7 +166,10 @@ impl Mempool {
                 return false;
             }
         }
-        !tx.nullifiers().iter().any(|nf| ledger.is_spent(nf)) && !tx.commitments().iter().any(|cm| ledger.has_commitment(cm))
+        // The claims include a withdraw's derived deposit, so a note someone else created in the
+        // meantime takes that withdraw out of the pool too.
+        !tx.nullifiers().iter().any(|nf| ledger.is_spent(nf))
+            && !p.commitments.iter().any(|cm| ledger.has_commitment(cm))
     }
 
     /// Forget these transactions — called with a committed block's hashes.
@@ -153,8 +180,8 @@ impl Mempool {
     }
 
     fn remove_one(&mut self, hash: &Hash) -> Option<Transaction> {
-        let tx = self.txs.remove(hash)?;
-        for nf in tx.nullifiers() {
+        let p = self.txs.remove(hash)?;
+        for nf in p.tx.nullifiers() {
             // Only withdraw the index entries this transaction owns: a conflicting one was never
             // admitted, so an entry pointing elsewhere cannot exist, but checking keeps the two
             // maps honest if that ever changes.
@@ -162,12 +189,12 @@ impl Mempool {
                 self.nullifiers.remove(&nf);
             }
         }
-        for cm in tx.commitments() {
-            if self.commitments.get(&cm) == Some(hash) {
-                self.commitments.remove(&cm);
+        for cm in &p.commitments {
+            if self.commitments.get(cm) == Some(hash) {
+                self.commitments.remove(cm);
             }
         }
-        Some(tx)
+        Some(p.tx)
     }
 
     /// Drop txs that can no longer apply on `ledger`: a nullifier spent by someone else, a
@@ -175,7 +202,7 @@ impl Mempool {
     /// that has fallen out of it. Called after every commit.
     pub fn prune(&mut self, ledger: &Ledger) {
         let stale: Vec<Hash> =
-            self.txs.iter().filter(|(_, tx)| !Self::still_applies(tx, ledger)).map(|(h, _)| *h).collect();
+            self.txs.iter().filter(|(_, p)| !Self::still_applies(p, ledger)).map(|(h, _)| *h).collect();
         for h in stale {
             self.remove_one(&h);
         }
@@ -323,8 +350,56 @@ mod tests {
         assert_eq!(m.insert(b, &l, &StubExecutor), Err(MempoolError::Full));
     }
 
-    /// A bundle-less validator action is pooled, ordered and offered exactly as a mint is. It
-    /// claims no nullifier and no commitment, so two of them are not a pool conflict: the
+    /// The fixtures' ledger with validator 1 holding more rewards than the bundle base, so it has
+    /// something to withdraw: two applied bundles, whose fees are its own as their proposer.
+    fn ledger_with_rewards() -> Ledger {
+        let mut l = ledger();
+        let v = fixtures::key(1);
+        for (height, n) in [(1u64, 30u8), (2, 34)] {
+            l.set_height(height);
+            let t = fixtures::bundle_tx(&l, [nf(n), nf(n + 1)], [cm(n), cm(n + 1)], fixtures::bundle_fee());
+            l.apply_tx(&t, &v.address(), &StubExecutor).unwrap();
+            l.record_anchor(height);
+        }
+        assert_eq!(l.released(&v.address()), 2 * fixtures::bundle_fee());
+        l
+    }
+
+    /// A `Withdraw` claims the note the *ledger* will create for it, which the wire does not
+    /// carry: without that claim the pool would hold two withdraws that pay one note, or a
+    /// withdraw beside a bundle creating the same note, and only one of each pair could ever be
+    /// included.
+    #[test]
+    fn a_withdraw_claims_the_deposit_the_ledger_will_derive() {
+        let l = ledger_with_rewards();
+        let mut m = Mempool::new(100);
+        let v = fixtures::key(1);
+        let amount = 2 * fixtures::bundle_fee();
+        let w = |nonce: u64, r: Word8| fixtures::withdraw_tx(l.chain_id(), &v, amount, nonce, l.height() as u32, r);
+
+        let first = w(0, [3; 8]);
+        let derived = l.derived_commitment(&first.action, &StubExecutor).expect("a withdraw derives one note");
+        assert!(!first.commitments().contains(&derived), "and the transaction itself does not carry it");
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+
+        // Another withdraw that would pay that same note — a different nonce, the same blinding —
+        // is a conflict, named by the note the two disagree over.
+        assert_eq!(m.insert(w(1, [3; 8]), &l, &StubExecutor), Err(MempoolError::Conflict(derived)));
+        // So is a bundle whose output slot is that note.
+        let clash = fixtures::bundle_tx(&l, [nf(1), nf(2)], [derived, cm(2)], fixtures::bundle_fee());
+        assert_eq!(m.insert(clash.clone(), &l, &StubExecutor), Err(MempoolError::Conflict(derived)));
+        // A withdraw paying a *different* note — the same nonce, a fresh blinding — is no
+        // conflict at all.
+        m.insert(w(0, [4; 8]), &l, &StubExecutor).unwrap();
+        assert_eq!(m.len(), 2);
+
+        // And removing the owner frees the note again, claim and all.
+        m.remove(&[first.hash()]);
+        m.insert(clash, &l, &StubExecutor).unwrap();
+    }
+
+    /// A bundle-less validator action is pooled, ordered and offered exactly as a mint is. An
+    /// unbond creates no note, so it claims nothing: two of them are not a pool conflict, and the
     /// register's nonce is what makes only one applicable.
     #[test]
     fn a_bundle_less_validator_action_is_pooled_like_a_mint() {

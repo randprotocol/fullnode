@@ -126,6 +126,23 @@ impl Ledger {
         })
     }
 
+    /// The deposit commitment this ledger would create for `action`, for a caller that has to
+    /// reason about the note before admission does: the mempool's conflict index, which must hold
+    /// a `Withdraw`'s note even though the wire does not carry it (only the register knows the
+    /// payout address it pays to). S3's `BridgeAttest` joins this list when it lands.
+    ///
+    /// `None` when the action creates no such note, and when this register cannot derive one — an
+    /// unknown validator, or an amount that does not cover the bundle base — both of which
+    /// [`validate`] refuses on its own.
+    pub fn derived_commitment(&self, action: &Action, executor: &dyn ConfidentialExecutor) -> Option<Word8> {
+        match action {
+            Action::Withdraw { validator, amount, time, r, .. } => {
+                withdraw_note(self, validator, *amount, *time, r, executor).ok()
+            }
+            _ => None,
+        }
+    }
+
     /// Add `amount` to `validator`'s stake, inserting the entry when `registration` is present.
     /// The bundle's `burn` is checked by admission (spec §7 step 3), not here — which is why
     /// this is crate-internal: a bond only ever arrives as an `Action::Bond` whose bundle burned
@@ -762,6 +779,9 @@ mod tests {
 
         let notes_before = l.next_index();
         let t = withdraw_tx(&v, 120 * BASE, 0, 5, [3; 8]);
+        // The note this will create, before it is created: what the mempool's conflict index
+        // claims for a withdraw, since the transaction itself does not carry the commitment.
+        let claimed = l.derived_commitment(&t.action, &StubExecutor);
         l.apply_tx(&t, &proposer, &StubExecutor).unwrap();
 
         // The note the chain created is the note its own executor computes from the register's
@@ -769,6 +789,8 @@ mod tests {
         // blinding.
         let cm = withdrawn_note(1, 120 * BASE, 5, [3; 8]);
         assert!(l.has_commitment(&cm), "the withdraw note is in the tree");
+        assert_eq!(claimed, Some(cm), "and it is the note the ledger named in advance");
+        assert_eq!(l.derived_commitment(&Action::None, &StubExecutor), None, "only a withdraw derives one");
         assert_eq!(l.next_index(), notes_before + 1, "one note, and no bundle to carry two more");
         let deposits = l.deposits();
         assert_eq!(deposits.len(), 1);

@@ -1170,6 +1170,28 @@ pub(crate) mod fixtures {
         Transaction::shielded(ledger.chain_id(), b, Action::None)
     }
 
+    /// A bundle-less `Withdraw` signed by `v` (ruling B of S2 task 3): it pays a note worth
+    /// `amount - BUNDLE_BASE` to the register's payout address at `time`, and the base to the
+    /// proposer of whichever block applies it.
+    pub(crate) fn withdraw_tx(
+        chain_id: u64,
+        v: &Keypair,
+        amount: u64,
+        nonce: u64,
+        time: u32,
+        r: Word8,
+    ) -> Transaction {
+        let envelope = env(r[0] as u8);
+        let signature = v.sign(
+            shrugg_core::withdraw_message(chain_id, &v.address(), amount, nonce, time, &r, &envelope).as_bytes(),
+        );
+        Transaction {
+            chain_id,
+            bundle: None,
+            action: Action::Withdraw { validator: v.address(), amount, nonce, time, r, envelope, signature },
+        }
+    }
+
     /// A faucet mint of `amount` to a note nobody can open; the envelope is a placeholder, which
     /// the chain never inspects.
     pub(crate) fn mint_tx(chain_id: u64, cm: Word8, amount: u64, minter: &Keypair) -> Transaction {
@@ -1442,6 +1464,80 @@ mod tests {
         let sets = s.load_epoch_sets().unwrap();
         assert_eq!(sets.get(0), Some(&gs.validators));
         assert_eq!(sets.known().count(), 1);
+    }
+
+    /// A chain whose block 2 carries a bundle *and* a `Withdraw`: the one shape in which the
+    /// ledger creates a note no transaction carries, so storage has to interleave it with the
+    /// notes the transactions do carry. Block 1's two bundles are what give the single validator
+    /// the rewards it withdraws. Nothing is committed here — each test commits it itself.
+    fn chain_with_a_withdraw() -> (tempfile::TempDir, Storage, GenesisState, [CommittedBlock; 2], Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis_with(7, vec![alloc_note(20, 5 * shrugg_core::UNITS_PER_SHRUGG)]);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let v = key(1);
+
+        let fees = vec![
+            bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee()),
+            bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee()),
+        ];
+        let b1 = make_block_voted(&gs.block, &mut ledger, fees, &v, &[&v]);
+        assert_eq!(ledger.released(&v.address()), 2 * bundle_fee(), "two fees, both this proposer's");
+
+        // The withdraw's `time` is a height the chain has reached, not the one that applies it —
+        // the node seals its envelope before that height exists (ruling A).
+        let amount = 2 * bundle_fee();
+        let time = ledger.height() as u32;
+        let txs = vec![
+            bundle_tx(&ledger, [[9; 8], [10; 8]], [[11; 8], [12; 8]], bundle_fee()),
+            withdraw_tx(gs.chain_id, &v, amount, 0, time, [13; 8]),
+        ];
+        let b2 = make_block_voted(&b1.block, &mut ledger, txs, &v, &[&v]);
+        assert_eq!(b2.deposits.len(), 1, "the withdraw's note is the block's one ledger-made deposit");
+        (dir, s, gs, [b1, b2], ledger)
+    }
+
+    /// The deposit a committed `Withdraw` made lands on disk at the leaf the ledger gave it —
+    /// after the notes of the bundle ahead of it in the block — and a ledger reloaded from those
+    /// rows has the same tree. That leaf order is a consensus fact: every node's tree has to
+    /// append the same notes in the same order, and this is the one note that is not on the wire.
+    #[test]
+    fn a_committed_withdraw_writes_its_deposit_at_the_leaf_the_ledger_named() {
+        let (_d, s, gs, blocks, ledger) = chain_with_a_withdraw();
+        let deposit = blocks[1].deposits[0].clone();
+        // The bundle ahead of the deposit carries two note slots and the withdraw carries none,
+        // so the ledger gave the deposit the last leaf of the block.
+        let on_the_wire: usize = blocks[1].block.transactions.iter().map(|t| t.commitments().len()).sum();
+        assert_eq!(on_the_wire, 2, "one bundle's two slots, and nothing from the withdraw");
+        s.commit(&blocks, &ledger, &[]).unwrap();
+        assert_eq!(deposit.index, ledger.next_index() - 1);
+        let row = s.note(deposit.index).unwrap().expect("the deposit is a note row like any other");
+        assert_eq!(row.cm, deposit.cm);
+        assert_eq!(row.envelope, deposit.envelope, "the envelope the action carried, beside its note");
+        assert_eq!(row.height, blocks[1].block.height());
+        assert_eq!(s.notes_count().unwrap(), ledger.next_index(), "no leaf written twice or skipped");
+
+        let reloaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(reloaded, ledger);
+        assert!(reloaded.has_commitment(&deposit.cm));
+        assert_eq!(s.supply().unwrap(), ledger.supply(), "the withdraw's counters are committed too");
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().problem, None);
+    }
+
+    /// And a block that reports a deposit at a leaf none of its transactions accounts for is
+    /// refused outright. Without that guard the note would be written at whatever index the block
+    /// claimed, and every later leaf would be off by one against the tree the ledger built.
+    #[test]
+    fn a_block_reporting_a_deposit_at_the_wrong_leaf_is_refused() {
+        let (_d, s, _gs, blocks, ledger) = chain_with_a_withdraw();
+        let [b1, mut b2] = blocks;
+        b2.deposits[0].index += 1;
+        let err = s.commit(&[b1, b2], &ledger, &[]).unwrap_err();
+        assert!(
+            matches!(&err, StorageError::Corrupt(m) if m.contains("no transaction of it accounts for")),
+            "{err:?}"
+        );
     }
 
     /// A chain that crosses an epoch boundary, with the epoch's set derived from the register as

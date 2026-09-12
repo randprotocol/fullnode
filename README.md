@@ -117,14 +117,20 @@ A validator that joins an existing chain registers instead of appearing in genes
 
 ```bash
 shrugg-node register --key node.key.json --payout shrugg1<payout address>   # prints a Registration (hex)
-shrugg-node unbond   1000 --key node.key.json --wallet wallet.key.json      # two epochs to release
-shrugg-node withdraw 1000 --key node.key.json --wallet wallet.key.json      # into a note at the payout address
+shrugg-node unbond   1000 --key node.key.json                               # two epochs to release
+shrugg-node withdraw 1000 --key node.key.json                               # into a note at the payout address
 ```
 
 The bond itself is a wallet transaction — it burns the stake out of shielded notes, which a node
-holds none of — and takes the hex `register` printed. `unbond` and `withdraw` are signed by the
-node's key but still ride on a bundle the wallet pays for, so they take a `--wallet` too and spend
-about a minute proving it.
+holds none of — and takes the hex `register` printed. `unbond` and `withdraw` need no wallet: they
+are signed by the node's key and carry no bundle at all, exactly as a faucet mint does, and the
+register's nonce is what keeps them from being replayed. So there is nothing to prove and each
+commits in a block's time.
+
+Their fee model is its own, for the same reason: `unbond` moves stake inside the public register
+and pays nothing at all, while `withdraw` pays the 0.001 SHRUGG bundle base out of the amount it
+withdraws, to the proposer of the block that applies it. A withdrawal of 1000 SHRUGG therefore
+creates a note worth 999.999, and an amount that cannot cover the base is refused.
 
 Each machine initialises and runs:
 

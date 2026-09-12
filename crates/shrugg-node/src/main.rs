@@ -4,7 +4,7 @@ use libp2p::Multiaddr;
 use shrugg_client::wallet;
 use shrugg_client::RpcClient;
 use shrugg_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
-use shrugg_core::notes::{word8_to_hex, ShieldedAddress};
+use shrugg_core::notes::{word8_to_hex, Envelope, ShieldedAddress};
 use shrugg_core::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
 use shrugg_core::{format_amount, parse_amount};
 use shrugg_core::{Keypair, PublicKey, UNITS_PER_SHRUGG};
@@ -45,6 +45,22 @@ fn seal_deposit(to: &ShieldedAddress, note: &Note) -> Result<GenesisNote> {
         envelope: EnvelopeHex::from_envelope(&envelope),
         amount: note.amount,
     })
+}
+
+/// The note a `withdraw` pays and the envelope that opens it, sealed to `payout` under a
+/// throwaway sender key — the same shape a genesis deposit uses (see [`seal_deposit`]).
+///
+/// `amount` is what the note is worth, i.e. the withdrawal less the bundle base. The chain never
+/// sees this note: it recomputes the commitment from the action's public fields
+/// (`ledger::staking::withdraw_note`), so these five fields have to be exactly the five the ledger
+/// hashes, or the withdraw pays a note whose envelope opens to nothing the payee can use. That
+/// agreement is what `the_cli_withdraw_note_is_the_note_the_ledger_derives` pins.
+fn sealed_withdraw_note(payout: &ShieldedAddress, amount: u64, time: u32) -> Result<(Note, Envelope)> {
+    let note = Note::new(payout.pk, [0; 8], amount, 0, time);
+    let throwaway = SpendKey::random().viewing_key();
+    let envelope = shrugg_zkvm::address::seal_note(&throwaway, payout, &note, &TxKey::random())
+        .map_err(|e| anyhow::anyhow!("sealing the payout note: {e}"))?;
+    Ok((note, envelope))
 }
 
 /// One `--validator key,stake,payout` triple. The three fields travel together because they are
@@ -416,10 +432,7 @@ async fn main() -> Result<()> {
             // applying the transaction: that height does not exist yet. Admission takes any
             // `time` within the window (256 blocks), so the head is simply the freshest one.
             let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
-            let note = Note::new(payout.pk, [0; 8], amount - base, 0, time);
-            let throwaway = SpendKey::random().viewing_key();
-            let envelope = shrugg_zkvm::address::seal_note(&throwaway, &payout, &note, &TxKey::random())
-                .map_err(|e| anyhow::anyhow!("sealing the payout note: {e}"))?;
+            let (note, envelope) = sealed_withdraw_note(&payout, amount - base, time)?;
             let signature = kp
                 .sign(withdraw_message(chain_id, &kp.address(), amount, nonce, time, &note.r, &envelope).as_bytes());
             let action = shrugg_core::Action::Withdraw {
@@ -512,6 +525,43 @@ mod tests {
         let again = pinned_genesis().build(&ex).unwrap();
         assert_ne!(again.notes[0].1, state.notes[0].1, "a fresh envelope per build");
         assert_eq!(again.hash(), state.hash());
+    }
+
+    /// The one place a note is built outside the chain and then recomputed by it: a withdraw.
+    ///
+    /// The CLI seals its envelope against a note it constructs itself, and the ledger derives the
+    /// commitment it will actually append from the action's public fields. If those two ever
+    /// disagree the withdraw still pays — into a note the payee cannot find, because the envelope
+    /// beside it opens to a different commitment. So this pins the CLI's note to
+    /// `ConfidentialExecutor::note_commitment` field for field, and checks that the payout wallet
+    /// really opens it.
+    #[test]
+    fn the_cli_withdraw_note_is_the_note_the_ledger_derives() {
+        use shrugg_core::confidential::ConfidentialExecutor;
+        let payee = SpendKey([7; 8]);
+        let payout = shrugg_zkvm::address::address_of(&payee.viewing_key());
+        let base = shrugg_core::gas::BUNDLE_BASE;
+        let amount = 5 * UNITS_PER_SHRUGG;
+        let time = 1994;
+        let (note, envelope) = sealed_withdraw_note(&payout, amount - base, time).unwrap();
+
+        // Exactly what `ledger::staking::withdraw_note` hashes: the payout key, no sender, the
+        // amount less the base, asset 0, the action's `time`, and the blinding the action carries.
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let cm = ex.note_commitment(&payout.pk, &[0; 8], amount - base, 0, time, &note.r);
+        assert_eq!(note.commitment(), cm, "the CLI's note is not the note the chain will derive");
+        // The base really is taken off here: a note for the gross amount is a different note.
+        assert_ne!(ex.note_commitment(&payout.pk, &[0; 8], amount, 0, time, &note.r), cm);
+        // And a note at another time is another note, which is why the action carries `time`.
+        assert_ne!(ex.note_commitment(&payout.pk, &[0; 8], amount - base, 0, time + 1, &note.r), cm);
+
+        // The envelope opens to that note for the payout wallet, so the payee finds it by
+        // scanning rather than by being told it exists.
+        let (_, opened) = shrugg_zkvm::address::envelope_from_core(&envelope)
+            .open_as_receiver(cm, &payee.viewing_key())
+            .expect("the payout wallet opens its own note");
+        assert_eq!(opened, note);
+        assert_eq!(opened.amount, amount - base);
     }
 
     /// Two allocations of the same amount to the same address are two different notes. A
