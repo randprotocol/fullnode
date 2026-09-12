@@ -21,7 +21,10 @@ before re-reporting suspected issues). Fixes merged into `main`:
 
 A zk-focused audit (all eight AIRs, the emulator, host prover glue, chain
 integration, and the cheating-test suite) found two **critical soundness holes**
-in `tables/cpu.rs`'s hash row-group routing, plus a batch of completeness bugs:
+in `tables/cpu.rs`'s hash row-group routing, plus a batch of completeness bugs.
+Findings: `../concerns/fullnode-zk-audit-2026-09-12.md` (severity-ordered, each
+verified against code, the two Critical items confirmed with attack witnesses
+that verify pre-fix — read it before re-reporting suspected issues).
 
 - Free-standing `IS_HASH`/`IS_HASH_OUT` rows had **no entry gate** — a cheating
   prover could splice write-back rows anywhere, giving 4 arbitrary RAM writes per

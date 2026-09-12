@@ -160,7 +160,8 @@ constraint set and truncate its chain. Start a new chain id, or run `--verify-ch
 that must keep serving an old chain.
 
 **Constraint set 5 (2026-09-12, zk-side audit fixes).** A full audit of the zkVM (AIRs, emulator,
-host prover glue, chain integration; report on branch `zk-audit-fixes-sep12`) found two **critical
+host prover glue, chain integration; report: `../concerns/fullnode-zk-audit-2026-09-12.md`,
+fixes on branch `zk-audit-fixes-sep12`) found two **critical
 soundness holes** in the cpu table's hash row-group routing and a set of completeness/robustness
 bugs. Each finding carries a regression test; the two critical ones also carry full attack witnesses
 that verify against the pre-fix constraints and are rejected after.
