@@ -541,7 +541,7 @@ through the real executor); full mode additionally re-checks every proposer sign
 | Fee below the action's floor | `Ledger::validate_inner` step 3 | `fee N below minimum M` |
 | Fee below `BUNDLE_BASE + call_fee(tier)` | `Ledger::validate_inner` step 10, after the tier is known from a successful verify | `fee N below minimum M` |
 | Bundle anchored to a root outside the window | step 4 | `anchor is not one of the last 256 roots` |
-| Bundle `time` outside `[height - 256, height]` | step 5 | `bundle time T is outside [lo, hi]` |
+| A bundle's `time`, or a bundle-less `Withdraw`'s, outside `[height - 256, height]` | step 5 | `time T is outside [lo, hi]` |
 | Note already spent (a replay, or a lost double-spend race) | step 6 | `nullifier already spent` |
 | Bundle plaintext does not match what its proof published | step 8 | `the bundle's digest is not what its proof published` |
 | Bundle proof for another guest, or invalid | step 9 (`verify_bundle` against the genesis `hc_bundle`) | `invalid bundle proof: …` |

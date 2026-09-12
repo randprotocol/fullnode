@@ -9,9 +9,8 @@
 //! wastes the proposer's block space and a (~20 ms) proof verification per gossip round.
 
 use shrugg_core::confidential::ConfidentialExecutor;
-use shrugg_core::ledger::TIME_WINDOW;
 use shrugg_core::notes::word8_to_hex;
-use shrugg_core::{Hash, Ledger, Transaction, TxError, Word8};
+use shrugg_core::{Action, Hash, Ledger, Transaction, TxError, Word8};
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
@@ -31,7 +30,9 @@ pub struct Mempool {
     /// Which pooled transaction spends each nullifier — one owner per nullifier, always.
     nullifiers: HashMap<Word8, Hash>,
     /// Which pooled transaction creates each commitment (a bundle's two output slots, or a
-    /// mint's single note).
+    /// mint's single note). A `Withdraw`'s deposit is not here: the wire does not carry its
+    /// commitment, only the ledger can derive it, and its nonce is what keeps two of them from
+    /// both applying.
     commitments: HashMap<Word8, Hash>,
     max_size: usize,
 }
@@ -130,11 +131,14 @@ impl Mempool {
     /// the next block, and nothing that costs a proof verification.
     fn still_applies(tx: &Transaction, ledger: &Ledger) -> bool {
         if let Some(b) = &tx.bundle {
-            if !ledger.is_anchor(&b.anchor) {
+            if !ledger.is_anchor(&b.anchor) || !ledger.time_in_window(b.time) {
                 return false;
             }
-            let t = b.time as u64;
-            if t > ledger.height() || ledger.height() - t > TIME_WINDOW {
+        }
+        // A bundle-less `Withdraw` carries a `time` of its own, under the same window rule — so
+        // it goes stale here the same way a bundle does (`Ledger::time_in_window`).
+        if let Action::Withdraw { time, .. } = &tx.action {
+            if !ledger.time_in_window(*time) {
                 return false;
             }
         }
@@ -317,6 +321,33 @@ mod tests {
         let b = fixtures::bundle_tx(&l, [nf(3), nf(4)], [cm(3), cm(4)], fixtures::bundle_fee());
         m.insert(a, &l, &StubExecutor).unwrap();
         assert_eq!(m.insert(b, &l, &StubExecutor), Err(MempoolError::Full));
+    }
+
+    /// A bundle-less validator action is pooled, ordered and offered exactly as a mint is. It
+    /// claims no nullifier and no commitment, so two of them are not a pool conflict: the
+    /// register's nonce is what makes only one applicable.
+    #[test]
+    fn a_bundle_less_validator_action_is_pooled_like_a_mint() {
+        let l = ledger();
+        let mut m = Mempool::new(100);
+        let v = fixtures::key(1);
+        let unbond = |amount: u64| {
+            let signature = v.sign(shrugg_core::unbond_message(l.chain_id(), &v.address(), amount, 0).as_bytes());
+            Transaction {
+                chain_id: l.chain_id(),
+                bundle: None,
+                action: Action::Unbond { validator: v.address(), amount, nonce: 0, signature },
+            }
+        };
+        let first = unbond(1000);
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&l, 10), vec![first.clone()]);
+        assert_eq!(m.insert(first.clone(), &l, &StubExecutor), Err(MempoolError::Duplicate));
+        m.insert(unbond(2000), &l, &StubExecutor).unwrap();
+        assert_eq!(m.len(), 2, "a second unbond at the same nonce is not a conflict here");
+        // And nothing about it goes stale, so a commit does not drop it.
+        m.prune(&l);
+        assert_eq!(m.len(), 2);
     }
 
     #[test]

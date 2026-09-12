@@ -79,17 +79,20 @@ pub fn unbond_message(chain_id: u64, validator: &Address, amount: u64, nonce: u6
 }
 
 /// What a validator signs to withdraw released stake and rewards into a deposit note. The
-/// blinding `r` and the envelope are in the message so the note the ledger computes is the
-/// note the validator asked for.
+/// blinding `r`, the note's `time` and the envelope are in the message so the note the ledger
+/// computes is the note the validator asked for — and, since the envelope is sealed against that
+/// exact note, the one the payout wallet can open.
+#[allow(clippy::too_many_arguments)]
 pub fn withdraw_message(
     chain_id: u64,
     validator: &Address,
     amount: u64,
     nonce: u64,
+    time: u32,
     r: &Word8,
     envelope: &Envelope,
 ) -> Hash {
-    let bytes = bincode::serialize(&(chain_id, validator, amount, nonce, r, envelope)).expect("serializes");
+    let bytes = bincode::serialize(&(chain_id, validator, amount, nonce, time, r, envelope)).expect("serializes");
     Hash::digest_domain(b"shrugg-withdraw", &bytes)
 }
 
@@ -141,14 +144,15 @@ mod tests {
         for other in [unbond_message(8, &v, 5, 1), unbond_message(7, &w, 5, 1), unbond_message(7, &v, 6, 1), unbond_message(7, &v, 5, 2)] {
             assert_ne!(other, base);
         }
-        let wbase = withdraw_message(7, &v, 5, 1, &[3; 8], &env());
+        let wbase = withdraw_message(7, &v, 5, 1, 9, &[3; 8], &env());
         for other in [
-            withdraw_message(8, &v, 5, 1, &[3; 8], &env()),
-            withdraw_message(7, &w, 5, 1, &[3; 8], &env()),
-            withdraw_message(7, &v, 6, 1, &[3; 8], &env()),
-            withdraw_message(7, &v, 5, 2, &[3; 8], &env()),
-            withdraw_message(7, &v, 5, 1, &[4; 8], &env()),
-            withdraw_message(7, &v, 5, 1, &[3; 8], &Envelope { body: vec![9], ..env() }),
+            withdraw_message(8, &v, 5, 1, 9, &[3; 8], &env()),
+            withdraw_message(7, &w, 5, 1, 9, &[3; 8], &env()),
+            withdraw_message(7, &v, 6, 1, 9, &[3; 8], &env()),
+            withdraw_message(7, &v, 5, 2, 9, &[3; 8], &env()),
+            withdraw_message(7, &v, 5, 1, 10, &[3; 8], &env()),
+            withdraw_message(7, &v, 5, 1, 9, &[4; 8], &env()),
+            withdraw_message(7, &v, 5, 1, 9, &[3; 8], &Envelope { body: vec![9], ..env() }),
         ] {
             assert_ne!(other, wbase);
         }

@@ -277,8 +277,11 @@ fn tx_json(t: &Transaction) -> Value {
         Action::Unbond { validator, amount, nonce, .. } => json!({
             "kind": "unbond", "validator": validator.to_base58(), "amount": amount, "nonce": nonce
         }),
-        Action::Withdraw { validator, amount, nonce, .. } => json!({
-            "kind": "withdraw", "validator": validator.to_base58(), "amount": amount, "nonce": nonce
+        // `time` is the note's time word, which the withdrawing node chose: public like the
+        // amount, and the one field an explorer needs to say which note this paid.
+        Action::Withdraw { validator, amount, nonce, time, .. } => json!({
+            "kind": "withdraw", "validator": validator.to_base58(), "amount": amount, "nonce": nonce,
+            "time": time
         }),
         // No amount: it is inside the attestation, which S3's bridge decoder reads. The
         // recipient is public in this transaction only — the note's later spend is not.
@@ -951,16 +954,30 @@ mod tests {
         assert_eq!(bond["amount"], 500);
         assert_eq!(bond["registered"], false);
 
-        let unbond = j(Action::Unbond { validator: v, amount: 7, nonce: 2, signature: sig.clone() });
+        // The two validator-signed actions ride bundle-less, so they are rendered as they ride.
+        let bundle_less = |action| tx_json(&Transaction { chain_id: 1, bundle: None, action });
+        let unbond = bundle_less(Action::Unbond { validator: v, amount: 7, nonce: 2, signature: sig.clone() });
+        assert!(unbond["bundle"].is_null(), "an unbond carries no bundle");
+        let unbond = unbond["action"].clone();
         assert_eq!((&unbond["kind"], &unbond["amount"], &unbond["nonce"]), (&json!("unbond"), &json!(7), &json!(2)));
         assert!(!serde_json::to_string(&unbond).unwrap().contains("signature"), "a signature is not explorer data");
 
-        let w =
-            j(Action::Withdraw { validator: v, amount: 9, nonce: 3, r: [5; 8], envelope: envelope.clone(), signature: sig });
+        let w = bundle_less(Action::Withdraw {
+            validator: v,
+            amount: 9,
+            nonce: 3,
+            time: 42,
+            r: [5; 8],
+            envelope: envelope.clone(),
+            signature: sig,
+        });
+        assert!(w["bundle"].is_null(), "a withdraw carries no bundle");
+        let w = w["action"].clone();
         assert_eq!(
-            (&w["kind"], &w["validator"], &w["amount"], &w["nonce"]),
-            (&json!("withdraw"), &json!(v.to_base58()), &json!(9), &json!(3))
+            (&w["kind"], &w["validator"], &w["amount"], &w["nonce"], &w["time"]),
+            (&json!("withdraw"), &json!(v.to_base58()), &json!(9), &json!(3), &json!(42))
         );
+        assert!(!serde_json::to_string(&w).unwrap().contains("\"r\""), "the note's blinding is not explorer data");
 
         let at = j(Action::BridgeAttest { attestation: vec![9; 520], recipient: recipient.clone(), r: [5; 8], envelope });
         assert_eq!(at["kind"], "bridge_attest");

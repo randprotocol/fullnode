@@ -15,6 +15,7 @@
 use super::{Ledger, TxError};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, PublicKey, Signature};
+use crate::gas;
 use crate::notes::{ShieldedAddress, Word8, KEM_EK_BYTES};
 use crate::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
 use crate::types::{Action, Transaction, ValidatorSet, UNITS_PER_SHRUGG};
@@ -44,7 +45,8 @@ pub struct ValidatorEntry {
     /// Unbonding amounts as `(release_epoch, amount)`, oldest first. Withdrawable once
     /// `release_epoch <= ledger.epoch()`.
     pub pending: Vec<(u64, u64)>,
-    /// Bundle fees credited to this proposer (spec §8); paid out by `Withdraw`.
+    /// Fees credited to this validator as a block proposer (spec §8): a bundle's fee, and the
+    /// base a `Withdraw` pays out of the amount it withdraws. Paid out by `Withdraw`.
     pub rewards: u64,
     /// Where `Withdraw` pays: the shielded address the deposit note is created for.
     pub payout: ShieldedAddress,
@@ -77,6 +79,8 @@ pub enum StakingError {
     ZeroAmount,
     #[error("only {available} is released, cannot withdraw {want}")]
     NothingReleased { available: u64, want: u64 },
+    #[error("withdraw of {amount} does not cover the bundle base {base}")]
+    BelowBundleBase { amount: u64, base: u64 },
     #[error("a bond's bundle must burn exactly the bonded amount: burn {burn}, amount {amount}")]
     BurnMismatch { burn: u64, amount: u64 },
     #[error("arithmetic overflow")]
@@ -185,24 +189,26 @@ impl Ledger {
 
     /// Take `amount` out of `validator`'s released pending entries and then its rewards,
     /// returning what is left released afterwards. The note itself is created by [`apply`],
-    /// which owns the executor; this is only the register's half.
+    /// which owns the executor; this is only the register's half. The whole `amount` leaves the
+    /// register: the note is worth `amount - gas::BUNDLE_BASE`, and the base goes to the block's
+    /// proposer (also in [`apply`], which is the only place that knows who that is).
     ///
-    /// `r` and `envelope` are here because the validator's signature is over them too (spec §6):
-    /// the note the chain computes has to be the note the validator asked for, so the message
-    /// binds the blinding and the envelope, and this method cannot check the signature without
-    /// them.
+    /// `time`, `r` and `envelope` are here because the validator's signature is over them too
+    /// (spec §6): the note the chain computes has to be the note the validator asked for, so the
+    /// message binds them, and this method cannot check the signature without them.
     #[allow(clippy::too_many_arguments)]
     pub fn withdraw(
         &mut self,
         validator: &Address,
         amount: u64,
         nonce: u64,
+        time: u32,
         r: &Word8,
         envelope: &crate::notes::Envelope,
         signature: &Signature,
         chain_id: u64,
     ) -> Result<u64, StakingError> {
-        let available = check_withdraw(self, validator, amount, nonce, r, envelope, signature, chain_id)?;
+        let available = check_withdraw(self, validator, amount, nonce, time, r, envelope, signature, chain_id)?;
         let epoch = self.epoch();
         let e = self.validators.get_mut(validator).expect("checked above");
         // Released pending entries first, oldest first, then the rewards — worked out in full
@@ -325,15 +331,14 @@ pub(super) fn validate(
         Action::Unbond { validator, amount, nonce, signature } => {
             check_unbond(ledger, validator, *amount, *nonce, signature, tx.chain_id)?;
         }
-        Action::Withdraw { validator, amount, nonce, r, envelope, signature } => {
-            check_withdraw(ledger, validator, *amount, *nonce, r, envelope, signature, tx.chain_id)?;
-            // The deposit the chain is about to create must be a note nobody has created yet —
-            // including the two this transaction's own bundle is about to append, which `apply`
-            // inserts before it reaches this action and which are therefore part of what its
-            // `has_commitment` sees. Checking them here keeps admission's answer and
-            // application's answer the same one.
-            let cm = withdraw_note(ledger, validator, *amount, r, executor)?;
-            if ledger.has_commitment(&cm) || tx.bundle.iter().any(|b| b.commitments.contains(&cm)) {
+        Action::Withdraw { validator, amount, nonce, time, r, envelope, signature } => {
+            check_withdraw(ledger, validator, *amount, *nonce, *time, r, envelope, signature, tx.chain_id)?;
+            // The deposit the chain is about to create must be a note nobody has created yet.
+            // Checking it here keeps admission's answer and application's answer the same one:
+            // a withdraw carries no bundle, so there is nothing else in this transaction that
+            // could append the same commitment first.
+            let cm = withdraw_note(ledger, validator, *amount, *time, r, executor)?;
+            if ledger.has_commitment(&cm) {
                 return Err(TxError::CommitmentExists(cm));
             }
         }
@@ -348,6 +353,7 @@ pub(super) fn apply(
     ledger: &mut Ledger,
     tx: &Transaction,
     action: &Action,
+    proposer: &Address,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<(), TxError> {
     match action {
@@ -357,33 +363,52 @@ pub(super) fn apply(
         Action::Unbond { validator, amount, nonce, signature } => {
             ledger.unbond(validator, *amount, *nonce, signature, tx.chain_id)?;
         }
-        Action::Withdraw { validator, amount, nonce, r, envelope, signature } => {
+        Action::Withdraw { validator, amount, nonce, time, r, envelope, signature } => {
             // Everything that can fail happens before the first mutation: the register's half
-            // is checked by `withdraw`, and the note is computed and checked here, so a refused
-            // withdraw leaves the ledger byte-identical.
-            let cm = withdraw_note(ledger, validator, *amount, r, executor)?;
+            // is checked by `withdraw`, and the note and the proposer's credit are worked out
+            // here, so a refused withdraw leaves the ledger byte-identical.
+            let cm = withdraw_note(ledger, validator, *amount, *time, r, executor)?;
             if ledger.has_commitment(&cm) {
                 return Err(TxError::CommitmentExists(cm));
             }
-            ledger.withdraw(validator, *amount, *nonce, r, envelope, signature, tx.chain_id)?;
+            // A withdraw carries no bundle, so this is where its fee is charged: the base is
+            // taken out of the amount and credited to the proposer, exactly as a bundle fee is
+            // (`Ledger::apply_tx`). In practice the proposer is always in the register —
+            // `apply_block` rejects a block whose proposer is not.
+            let rewards = ledger.validators().get(proposer).ok_or(TxError::UnknownProposer(*proposer))?.rewards;
+            let _ = rewards.checked_add(gas::BUNDLE_BASE).ok_or(TxError::Overflow)?;
+            let paid = note_amount(*amount)?;
+
+            ledger.withdraw(validator, *amount, *nonce, *time, r, envelope, signature, tx.chain_id)?;
             ledger.append_deposit(cm, envelope.clone(), executor)?;
-            // The one way value moves back from the register into the pool (see
-            // `ledger::supply`); S3's `BridgeAttest` of asset 0 would be counted the same way.
+            // Re-read rather than reuse the value above: when the proposer *is* the withdrawing
+            // validator, `withdraw` has just taken value out of this very field. It can only
+            // have shrunk, so the `checked_add` proved above still holds.
+            let e = ledger.validators.get_mut(proposer).expect("looked up above");
+            e.rewards = e.rewards.checked_add(gas::BUNDLE_BASE).ok_or(TxError::Overflow)?;
+            // What actually reached the pool is the note, not the amount: the base stayed in the
+            // register (see `ledger::supply`). S3's `BridgeAttest` of asset 0 would be counted
+            // the same way.
             ledger.supply.withdraw_deposited =
-                ledger.supply.withdraw_deposited.checked_add(*amount).ok_or(TxError::Overflow)?;
+                ledger.supply.withdraw_deposited.checked_add(paid).ok_or(TxError::Overflow)?;
         }
         _ => return Err(NOT_STAKING),
     }
     Ok(())
 }
 
-/// The deposit note a withdraw creates: the register's payout address, no sender, the public
-/// amount, the native asset, this block's height, and the blinding the action published
+/// The deposit note a withdraw creates: the register's payout address, no sender, the amount less
+/// the bundle base, the native asset, the action's own `time`, and the blinding it published
 /// (plan: "Withdraw creates a deposit note the ledger can check").
+///
+/// The `time` is the action's and not the applying block's height: the node seals the envelope
+/// against this note before it knows which block will carry the transaction, so a note bound to
+/// the apply height would be one the payout wallet cannot open by scanning.
 fn withdraw_note(
     ledger: &Ledger,
     validator: &Address,
     amount: u64,
+    time: u32,
     r: &Word8,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<Word8, TxError> {
@@ -391,7 +416,12 @@ fn withdraw_note(
         .validators()
         .get(validator)
         .ok_or(TxError::Staking(StakingError::UnknownValidator(*validator)))?;
-    Ok(executor.note_commitment(&e.payout.pk, &[0; 8], amount, 0, ledger.height() as u32, r))
+    Ok(executor.note_commitment(&e.payout.pk, &[0; 8], note_amount(amount)?, 0, time, r))
+}
+
+/// What a withdraw's note is worth: the amount, less the bundle base it pays the proposer.
+fn note_amount(amount: u64) -> Result<u64, StakingError> {
+    amount.checked_sub(gas::BUNDLE_BASE).ok_or(StakingError::BelowBundleBase { amount, base: gas::BUNDLE_BASE })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -400,17 +430,20 @@ fn check_withdraw(
     validator: &Address,
     amount: u64,
     nonce: u64,
+    time: u32,
     r: &Word8,
     envelope: &crate::notes::Envelope,
     signature: &Signature,
     chain_id: u64,
 ) -> Result<u64, StakingError> {
     signed_by(ledger, validator, nonce, signature, || {
-        withdraw_message(chain_id, validator, amount, nonce, r, envelope)
+        withdraw_message(chain_id, validator, amount, nonce, time, r, envelope)
     })?;
-    // A zero withdraw would append a note worth nothing to a tree every node carries forever.
-    if amount == 0 {
-        return Err(StakingError::ZeroAmount);
+    // The base fee comes out of the amount, so an amount that cannot cover it buys a note worth
+    // nothing — or nothing at all. This subsumes a zero withdraw, which is why there is no
+    // separate `ZeroAmount` arm here (`Unbond` still has one: it pays no fee).
+    if amount <= gas::BUNDLE_BASE {
+        return Err(StakingError::BelowBundleBase { amount, base: gas::BUNDLE_BASE });
     }
     let available = ledger.released(validator);
     if amount > available {
@@ -420,13 +453,11 @@ fn check_withdraw(
 }
 
 #[cfg(test)]
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::confidential::StubExecutor;
     use crate::crypto::{Address, Keypair, Signature};
-    use crate::gas;
+    use crate::ledger::TIME_WINDOW;
     use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8};
     use crate::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
     use crate::types::Transaction;
@@ -434,6 +465,9 @@ mod tests {
 
     const HC: Word8 = [11; 8];
     const CHAIN: u64 = 7;
+    /// The bundle base a withdraw pays out of the amount it withdraws. Every staked amount here
+    /// is a multiple of it, so a note's worth (`amount − BASE`) is readable at a glance.
+    const BASE: u64 = gas::BUNDLE_BASE;
 
     fn key(i: u8) -> Keypair {
         Keypair::from_seed([i; 32]).unwrap()
@@ -496,14 +530,25 @@ mod tests {
         tx(l, n, amount, Action::Bond { validator: validator.address(), amount, registration })
     }
 
-    fn unbond_tx(l: &Ledger, n: u32, v: &Keypair, amount: u64, nonce: u64) -> Transaction {
-        let signature = v.sign(unbond_message(CHAIN, &v.address(), amount, nonce).as_bytes());
-        tx(l, n, 0, Action::Unbond { validator: v.address(), amount, nonce, signature })
+    /// A validator-signed action rides alone, with no bundle to pay a fee from — a validator key
+    /// owns no notes (ruling B).
+    fn signed_tx(action: Action) -> Transaction {
+        Transaction { chain_id: CHAIN, bundle: None, action }
     }
 
-    fn withdraw_tx(l: &Ledger, n: u32, v: &Keypair, amount: u64, nonce: u64, r: Word8) -> Transaction {
-        let signature = v.sign(withdraw_message(CHAIN, &v.address(), amount, nonce, &r, &env()).as_bytes());
-        tx(l, n, 0, Action::Withdraw { validator: v.address(), amount, nonce, r, envelope: env(), signature })
+    fn unbond_tx(v: &Keypair, amount: u64, nonce: u64) -> Transaction {
+        let signature = v.sign(unbond_message(CHAIN, &v.address(), amount, nonce).as_bytes());
+        signed_tx(Action::Unbond { validator: v.address(), amount, nonce, signature })
+    }
+
+    fn withdraw_tx(v: &Keypair, amount: u64, nonce: u64, time: u32, r: Word8) -> Transaction {
+        let signature = v.sign(withdraw_message(CHAIN, &v.address(), amount, nonce, time, &r, &env()).as_bytes());
+        signed_tx(Action::Withdraw { validator: v.address(), amount, nonce, time, r, envelope: env(), signature })
+    }
+
+    /// The note a withdraw of `amount` at `time` pays to validator `i`'s payout address.
+    fn withdrawn_note(i: u8, amount: u64, time: u32, r: Word8) -> Word8 {
+        StubExecutor.note_commitment(&payout(i).pk, &[0; 8], amount - BASE, 0, time, &r)
     }
 
     fn staking_err(e: TxError) -> StakingError {
@@ -640,57 +685,54 @@ mod tests {
         assert_eq!(l.epoch(), 1, "height 5 with four-block epochs");
 
         let stranger = key(9);
-        let unknown = unbond_tx(&l, 10, &stranger, 10, 0);
+        let unknown = unbond_tx(&stranger, 10, 0);
         assert_eq!(
             staking_err(l.validate(&unknown, &StubExecutor).unwrap_err()),
             StakingError::UnknownValidator(stranger.address())
         );
-        let stale = unbond_tx(&l, 20, &v, 10, 7);
+        let stale = unbond_tx(&v, 10, 7);
         assert_eq!(
             staking_err(l.validate(&stale, &StubExecutor).unwrap_err()),
             StakingError::BadNonce { expected: 0, actual: 7 }
         );
         // A signature over another amount than the action carries.
-        let mut forged = unbond_tx(&l, 30, &v, 10, 0);
+        let mut forged = unbond_tx(&v, 10, 0);
         if let Action::Unbond { amount, .. } = &mut forged.action {
             *amount = 11;
         }
         assert_eq!(staking_err(l.validate(&forged, &StubExecutor).unwrap_err()), StakingError::BadSignature);
-        let greedy = unbond_tx(&l, 40, &v, MIN_STAKE + 1001, 0);
+        let greedy = unbond_tx(&v, MIN_STAKE + 1001, 0);
         assert_eq!(
             staking_err(l.validate(&greedy, &StubExecutor).unwrap_err()),
             StakingError::InsufficientStake { have: MIN_STAKE + 1000, want: MIN_STAKE + 1001 }
         );
 
-        let good = unbond_tx(&l, 50, &v, 1000, 0);
+        let good = unbond_tx(&v, 1000, 0);
         l.apply_tx(&good, &proposer, &StubExecutor).unwrap();
-        l.record_anchor(l.height());
         let e = &l.validators()[&v.address()];
         assert_eq!(e.stake, MIN_STAKE);
         assert_eq!(e.pending, vec![(1 + UNBONDING_EPOCHS, 1000)], "released two epochs from now");
         assert_eq!(e.nonce, 1, "the nonce is the replay protection");
-        // Which is exactly what makes the same signed action unusable a second time, even in a
-        // fresh bundle that has nothing spent yet.
-        let replay = unbond_tx(&l, 60, &v, 1000, 0);
+        // Which is exactly what makes the same signed action unusable a second time.
+        let replay = unbond_tx(&v, 1000, 0);
         assert_eq!(
             staking_err(l.validate(&replay, &StubExecutor).unwrap_err()),
             StakingError::BadNonce { expected: 1, actual: 0 }
         );
-        // Released value is the fees it has earned as proposer of these blocks and nothing from
-        // the unbonding queue: that amount waits for its epoch.
-        assert_eq!(l.released(&v.address()), gas::BUNDLE_BASE, "one applied bundle, one fee");
+        // Nothing is released: an unbond is free (ruling B), so no fee was earned, and the
+        // amount just queued waits for its epoch.
+        assert_eq!(l.released(&v.address()), 0, "an unbond pays no fee to anyone");
 
         // A second unbond in the same epoch joins the entry already there: `pending` is hashed
         // into the state root, so it holds one row per release epoch, not one per transaction.
-        let again = unbond_tx(&l, 70, &v, 500, 1);
+        let again = unbond_tx(&v, 500, 1);
         l.apply_tx(&again, &proposer, &StubExecutor).unwrap();
-        l.record_anchor(l.height());
         let e = &l.validators()[&v.address()];
         assert_eq!(e.pending, vec![(1 + UNBONDING_EPOCHS, 1500)], "one row, two unbonds");
         assert_eq!((e.stake, e.nonce), (MIN_STAKE - 500, 2));
 
         // A zero unbond moves nothing and is refused rather than spending a nonce and a row.
-        let nothing = unbond_tx(&l, 80, &v, 0, 2);
+        let nothing = unbond_tx(&v, 0, 2);
         assert_eq!(staking_err(l.validate(&nothing, &StubExecutor).unwrap_err()), StakingError::ZeroAmount);
 
         // The next epoch opens a new row, and what is still unreleased never exceeds the
@@ -698,7 +740,7 @@ mod tests {
         // so its release epoch is one of the next `UNBONDING_EPOCHS`.
         l.set_height(9);
         assert_eq!(l.epoch(), 2);
-        let next_epoch = unbond_tx(&l, 90, &v, 200, 2);
+        let next_epoch = unbond_tx(&v, 200, 2);
         l.apply_tx(&next_epoch, &proposer, &StubExecutor).unwrap();
         let e = &l.validators()[&v.address()];
         assert_eq!(e.pending, vec![(3, 1500), (4, 200)]);
@@ -710,68 +752,197 @@ mod tests {
     fn withdraw_pays_released_and_rewards_into_a_checkable_note() {
         let v = key(1);
         let mut e = entry(&v, MIN_STAKE, payout(1));
-        e.pending = vec![(0, 100), (5, 200)];
-        e.rewards = 50;
+        e.pending = vec![(0, 100 * BASE), (5, 200 * BASE)];
+        e.rewards = 50 * BASE;
         let mut l = ledger(vec![e, entry(&key(2), MIN_STAKE, payout(2))]);
-        // The block's proposer is another validator, so the bundle fee this transaction pays
-        // lands in *its* rewards and leaves the withdrawing validator's arithmetic alone.
+        // The block's proposer is another validator, so the base fee this withdraw pays lands in
+        // *its* rewards and leaves the withdrawing validator's arithmetic alone.
         let proposer = key(2).address();
-        assert_eq!(l.released(&v.address()), 150, "the epoch-0 pending entry plus the rewards");
+        assert_eq!(l.released(&v.address()), 150 * BASE, "the epoch-0 pending entry plus the rewards");
 
         let notes_before = l.next_index();
-        let t = withdraw_tx(&l, 10, &v, 120, 0, [3; 8]);
+        let t = withdraw_tx(&v, 120 * BASE, 0, 5, [3; 8]);
         l.apply_tx(&t, &proposer, &StubExecutor).unwrap();
 
         // The note the chain created is the note its own executor computes from the register's
-        // payout address, the public amount, the block height and the published blinding.
-        let cm = StubExecutor.note_commitment(&payout(1).pk, &[0; 8], 120, 0, 5, &[3; 8]);
+        // payout address, the amount less the base fee, the action's `time` and the published
+        // blinding.
+        let cm = withdrawn_note(1, 120 * BASE, 5, [3; 8]);
         assert!(l.has_commitment(&cm), "the withdraw note is in the tree");
-        assert_eq!(l.next_index(), notes_before + 3, "the bundle's two notes and the deposit");
+        assert_eq!(l.next_index(), notes_before + 1, "one note, and no bundle to carry two more");
         let deposits = l.deposits();
         assert_eq!(deposits.len(), 1);
         assert_eq!(deposits[0].cm, cm);
         assert_eq!(deposits[0].envelope, env(), "the envelope storage writes beside the note");
-        assert_eq!(deposits[0].index, notes_before + 2, "appended after the bundle's own notes");
+        assert_eq!(deposits[0].index, notes_before);
         // A validator that published a different `r` would have got a different note.
-        assert_ne!(cm, StubExecutor.note_commitment(&payout(1).pk, &[0; 8], 120, 0, 5, &[4; 8]));
+        assert_ne!(cm, withdrawn_note(1, 120 * BASE, 5, [4; 8]));
 
         // Released pending first, then rewards; the unreleased entry is untouched.
         let e = &l.validators()[&v.address()];
-        assert_eq!(e.pending, vec![(5, 200)]);
-        assert_eq!(e.rewards, 30);
+        assert_eq!(e.pending, vec![(5, 200 * BASE)]);
+        assert_eq!(e.rewards, 30 * BASE);
         assert_eq!(e.nonce, 1);
-        assert_eq!(l.released(&v.address()), 30);
+        assert_eq!(l.released(&v.address()), 30 * BASE);
         assert_eq!(e.stake, MIN_STAKE, "a withdraw never touches the bonded stake");
 
-        // Admission answers exactly what application would: a withdraw whose note is one of its
-        // own bundle's two outputs collides, and the collision is the refusal at admission —
-        // not something discovered after the bundle has already been written.
-        l.record_anchor(l.height());
-        let collide = StubExecutor.note_commitment(&payout(1).pk, &[0; 8], 30, 0, 5, &[9; 8]);
-        let mut t = withdraw_tx(&l, 40, &v, 30, 1, [9; 8]);
+        // Admission answers exactly what application would: a withdraw whose note is already in
+        // the tree is refused when it is admitted, not after the register has been drained.
+        let collide = withdrawn_note(1, 30 * BASE, 5, [9; 8]);
+        l.record_anchor(l.height()); // the block ends; its root is what the next bundle anchors to
+        let mut transfer = tx(&l, 40, 0, Action::None);
         {
-            let b = t.bundle.as_mut().unwrap();
+            let b = transfer.bundle.as_mut().unwrap();
             b.commitments = [collide, [43; 8]];
             b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()));
         }
+        l.apply_tx(&transfer, &proposer, &StubExecutor).unwrap();
+        let t = withdraw_tx(&v, 30 * BASE, 1, 5, [9; 8]);
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::CommitmentExists(collide)));
         let mut scratch = l.clone();
         assert_eq!(scratch.apply_tx(&t, &proposer, &StubExecutor), Err(TxError::CommitmentExists(collide)));
         assert_eq!(scratch, l, "and nothing of it is applied");
     }
 
+    /// Ruling A: the note is bound to the action's own `time`, not to the height the block
+    /// happens to apply at. The node seals the envelope before it knows that height, so an
+    /// apply-height note would be one the payout wallet cannot open by scanning.
+    #[test]
+    fn withdraw_note_uses_the_action_time_not_the_apply_height() {
+        let v = key(1);
+        let mut e = entry(&v, MIN_STAKE, payout(1));
+        e.rewards = 10 * BASE;
+        let mut l = ledger(vec![e, entry(&key(2), MIN_STAKE, payout(2))]);
+        // Behind the apply height, inside the window: what a node that sealed its envelope three
+        // blocks ago submits.
+        let time = l.height() as u32 - 3;
+        l.apply_tx(&withdraw_tx(&v, 5 * BASE, 0, time, [3; 8]), &key(2).address(), &StubExecutor).unwrap();
+
+        assert!(l.has_commitment(&withdrawn_note(1, 5 * BASE, time, [3; 8])), "the note the action's time names");
+        assert!(
+            !l.has_commitment(&withdrawn_note(1, 5 * BASE, l.height() as u32, [3; 8])),
+            "and not the one the apply height would have named"
+        );
+        assert_eq!(l.deposits()[0].cm, withdrawn_note(1, 5 * BASE, time, [3; 8]));
+    }
+
+    /// The bundle window rule of spec §7 item 5, applied to a bundle-less withdraw's own `time`.
+    #[test]
+    fn withdraw_time_outside_the_window_is_refused() {
+        let v = key(1);
+        let mut e = entry(&v, MIN_STAKE, payout(1));
+        e.rewards = 10 * BASE;
+        let mut l = ledger(vec![e]);
+        // Past the window, so both of its edges exist.
+        let h = TIME_WINDOW + 100;
+        l.set_height(h);
+        let oldest = (h - TIME_WINDOW) as u32;
+        for time in [h as u32 + 1, oldest - 1] {
+            let t = withdraw_tx(&v, 5 * BASE, 0, time, [3; 8]);
+            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time, height: h }));
+        }
+        // Exactly `height - TIME_WINDOW` is still inside it.
+        assert_eq!(l.validate(&withdraw_tx(&v, 5 * BASE, 0, oldest, [3; 8]), &StubExecutor), Ok(()));
+
+        // And the window is checked where a bundle's is — before any signature work, so a
+        // stale time costs a Dilithium verification of nothing.
+        let mut forged = withdraw_tx(&v, 5 * BASE, 0, h as u32 + 1, [3; 8]);
+        if let Action::Withdraw { signature, .. } = &mut forged.action {
+            *signature = Signature::empty();
+        }
+        assert_eq!(
+            l.validate(&forged, &StubExecutor),
+            Err(TxError::TimeOutOfWindow { time: h as u32 + 1, height: h })
+        );
+    }
+
+    /// Ruling B: both validator-signed actions ride bundle-less, exactly as a mint does, and a
+    /// bundle on either is refused by shape — with the action named, so a wallet that attached
+    /// one is told which of its transactions was wrong.
+    #[test]
+    fn unbond_or_withdraw_with_a_bundle_is_refused() {
+        let v = key(1);
+        let mut e = entry(&v, MIN_STAKE + 1000, payout(1));
+        e.rewards = 10 * BASE;
+        let l = ledger(vec![e]);
+        for (t, name) in [(unbond_tx(&v, 1000, 0), "unbond"), (withdraw_tx(&v, 5 * BASE, 0, 5, [3; 8]), "withdraw")] {
+            assert_eq!(l.validate(&t, &StubExecutor), Ok(()), "{name}: bundle-less is the shape it rides in");
+            let with_bundle = Transaction { bundle: Some(bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], 0)), ..t };
+            assert_eq!(l.validate(&with_bundle, &StubExecutor), Err(TxError::ActionCarriesBundle(name)));
+        }
+    }
+
+    /// A withdraw pays the bundle base out of the amount it withdraws (ruling B), so an amount
+    /// that cannot cover it is refused rather than creating a note worth nothing.
+    #[test]
+    fn withdraw_below_the_bundle_base_is_refused() {
+        let v = key(1);
+        let mut e = entry(&v, MIN_STAKE, payout(1));
+        e.rewards = 10 * BASE;
+        let mut l = ledger(vec![e]);
+        for amount in [0, 1, BASE] {
+            let t = withdraw_tx(&v, amount, 0, 5, [3; 8]);
+            assert_eq!(
+                staking_err(l.validate(&t, &StubExecutor).unwrap_err()),
+                StakingError::BelowBundleBase { amount, base: BASE }
+            );
+        }
+        // One unit over the base is the smallest withdraw there is: a note worth one unit.
+        l.apply_tx(&withdraw_tx(&v, BASE + 1, 0, 5, [3; 8]), &v.address(), &StubExecutor).unwrap();
+        assert!(l.has_commitment(&withdrawn_note(1, BASE + 1, 5, [3; 8])));
+    }
+
+    /// Ruling B's split: the register loses the whole amount, the note is worth all but the
+    /// bundle base, and the base lands in the block proposer's `rewards` — the same place a
+    /// bundle fee goes. The supply invariant is what ties the three together.
+    #[test]
+    fn withdraw_pays_the_bundle_base_to_the_proposer_and_the_rest_to_the_note() {
+        let v = key(1);
+        let p = key(2);
+        let mut e = entry(&v, MIN_STAKE, payout(1));
+        e.pending = vec![(0, 100 * BASE)];
+        e.rewards = 50 * BASE;
+        let mut l = ledger(vec![e, entry(&p, MIN_STAKE, payout(2))]);
+        // Nothing was ever deposited into the pool here: the whole supply is in the register, so
+        // every unit the withdraw moves has to show up on the other side of the audit.
+        let issued = 2 * MIN_STAKE + 150 * BASE;
+        l.set_genesis_supply(0, issued);
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+
+        let amount = 120 * BASE;
+        l.apply_tx(&withdraw_tx(&v, amount, 0, 5, [3; 8]), &p.address(), &StubExecutor).unwrap();
+        assert!(l.has_commitment(&withdrawn_note(1, amount, 5, [3; 8])), "the note is worth the amount less the base");
+        assert_eq!(l.validators()[&p.address()].rewards, BASE, "the base is the proposer's, like a bundle fee");
+        let w = &l.validators()[&v.address()];
+        assert_eq!((w.pending.as_slice(), w.rewards), (&[][..], 30 * BASE), "the register lost the whole amount");
+        let a = l.audit();
+        assert_eq!(a.supply.withdraw_deposited, amount - BASE, "only what reached the pool is counted");
+        assert_eq!(a.supply.fees_paid, 0, "the base never left the pool, so it is not a fee paid out of it");
+        assert_eq!(a.total_supply(), issued);
+        assert!(a.invariant_holds(), "{a:?}");
+
+        // And when the proposer *is* the withdrawing validator, the two touches compose: the
+        // register's half is taken out first, then the base is credited back in.
+        l.apply_tx(&withdraw_tx(&v, 2 * BASE, 1, 5, [4; 8]), &v.address(), &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&v.address()].rewards, 30 * BASE - 2 * BASE + BASE);
+        let a = l.audit();
+        assert_eq!(a.supply.withdraw_deposited, amount - BASE + BASE);
+        assert!(a.invariant_holds(), "{a:?}");
+        assert_eq!(a.total_supply(), issued);
+    }
+
     #[test]
     fn withdraw_rejects_unreleased_pending() {
         let v = key(1);
         let mut e = entry(&v, MIN_STAKE, payout(1));
-        e.pending = vec![(5, 200)];
+        e.pending = vec![(5, 200 * BASE)];
         let mut l = ledger(vec![e]);
         assert_eq!(l.released(&v.address()), 0);
 
-        let early = withdraw_tx(&l, 10, &v, 10, 0, [3; 8]);
+        let early = withdraw_tx(&v, 10 * BASE, 0, 5, [3; 8]);
         assert_eq!(
             staking_err(l.validate(&early, &StubExecutor).unwrap_err()),
-            StakingError::NothingReleased { available: 0, want: 10 }
+            StakingError::NothingReleased { available: 0, want: 10 * BASE }
         );
         // And a refused withdraw leaves the register, the tree and the deposits untouched.
         let before = l.clone();
@@ -782,16 +953,13 @@ mod tests {
         // Once its epoch arrives the same pending entry is spendable, up to its amount.
         l.set_height(5 * 4);
         assert_eq!(l.epoch(), 5);
-        assert_eq!(l.released(&v.address()), 200);
-        let greedy = withdraw_tx(&l, 20, &v, 201, 0, [3; 8]);
+        assert_eq!(l.released(&v.address()), 200 * BASE);
+        let greedy = withdraw_tx(&v, 200 * BASE + 1, 0, 20, [3; 8]);
         assert_eq!(
             staking_err(l.validate(&greedy, &StubExecutor).unwrap_err()),
-            StakingError::NothingReleased { available: 200, want: 201 }
+            StakingError::NothingReleased { available: 200 * BASE, want: 200 * BASE + 1 }
         );
-        // A withdraw of nothing would append a worthless note to a tree every node keeps.
-        let nothing = withdraw_tx(&l, 25, &v, 0, 0, [3; 8]);
-        assert_eq!(staking_err(l.validate(&nothing, &StubExecutor).unwrap_err()), StakingError::ZeroAmount);
-        let ok = withdraw_tx(&l, 30, &v, 200, 0, [3; 8]);
+        let ok = withdraw_tx(&v, 200 * BASE, 0, 20, [3; 8]);
         l.apply_tx(&ok, &v.address(), &StubExecutor).unwrap();
         assert!(l.validators()[&v.address()].pending.is_empty());
     }
@@ -805,7 +973,7 @@ mod tests {
         let t = Transaction { chain_id: CHAIN, bundle: None, action: Action::None };
         for a in [Action::None, Action::Deploy { base_pc: 0, words: vec![0x13; 2] }] {
             assert_eq!(validate(&l, &t, &a, &StubExecutor), Err(NOT_STAKING), "{a:?}");
-            assert_eq!(apply(&mut l, &t, &a, &StubExecutor), Err(NOT_STAKING), "{a:?}");
+            assert_eq!(apply(&mut l, &t, &a, &key(1).address(), &StubExecutor), Err(NOT_STAKING), "{a:?}");
         }
     }
 
@@ -816,9 +984,8 @@ mod tests {
         let other = key(2);
         let l = ledger(vec![entry(&v, MIN_STAKE, payout(1)), entry(&other, MIN_STAKE, payout(2))]);
         let signature = other.sign(unbond_message(CHAIN, &v.address(), 10, 0).as_bytes());
-        let t = tx(&l, 10, 0, Action::Unbond { validator: v.address(), amount: 10, nonce: 0, signature });
+        let t = signed_tx(Action::Unbond { validator: v.address(), amount: 10, nonce: 0, signature });
         assert_eq!(staking_err(l.validate(&t, &StubExecutor).unwrap_err()), StakingError::BadSignature);
-        let _ = Signature::empty();
     }
 
     /// The supply audit (`ledger::supply`) through the whole staking cycle. Every public
@@ -856,28 +1023,29 @@ mod tests {
         assert_eq!(after_bond.supply.fees_paid, fee);
         assert_eq!(after_bond.register_total, 2 * MIN_STAKE + fee);
 
-        // An unbond moves stake to `pending` inside the register: the totals do not move at all
-        // except for the new bundle's fee.
-        l.record_anchor(l.height());
-        l.apply_tx(&unbond_tx(&l, 20, &newcomer, MIN_STAKE, 0), &proposer, &StubExecutor).unwrap();
+        // An unbond moves stake to `pending` inside the register and is free (ruling B): not one
+        // of the counters moves.
+        l.apply_tx(&unbond_tx(&newcomer, MIN_STAKE, 0), &proposer, &StubExecutor).unwrap();
         let after_unbond = check(&l, "unbond");
-        assert_eq!(after_unbond.supply.fees_paid, 2 * fee);
-        assert_eq!(after_unbond.register_total, after_bond.register_total + fee);
+        assert_eq!(after_unbond.supply, after_bond.supply, "a free, bundle-less action moves no counter");
+        assert_eq!(after_unbond.register_total, after_bond.register_total);
 
         // A withdraw is the return leg: released value leaves the register and re-enters the
-        // pool as a note the chain computed itself.
+        // pool as a note the chain computed itself — all but the base fee, which stays in the
+        // register as the proposer's reward.
         l.set_height(l.epoch_blocks() * (l.epoch() + UNBONDING_EPOCHS));
-        l.record_anchor(l.height());
-        l.apply_tx(&withdraw_tx(&l, 30, &newcomer, MIN_STAKE, 1, [3; 8]), &proposer, &StubExecutor).unwrap();
+        let time = l.height() as u32;
+        l.apply_tx(&withdraw_tx(&newcomer, MIN_STAKE, 1, time, [3; 8]), &proposer, &StubExecutor).unwrap();
         let after_withdraw = check(&l, "withdraw");
-        assert_eq!(after_withdraw.supply.withdraw_deposited, MIN_STAKE);
+        assert_eq!(after_withdraw.supply.withdraw_deposited, MIN_STAKE - fee, "the note is worth all but the base");
+        assert_eq!(after_withdraw.supply.fees_paid, fee, "the base was never in the pool to be paid out of it");
         assert_eq!(after_withdraw.register_total, after_unbond.register_total - MIN_STAKE + fee);
 
         // A plain transfer moves nothing across the boundary but its fee.
         l.record_anchor(l.height());
         l.apply_tx(&tx(&l, 40, 0, Action::None), &proposer, &StubExecutor).unwrap();
         let after_transfer = check(&l, "transfer");
-        assert_eq!(after_transfer.supply.fees_paid, 4 * fee);
+        assert_eq!(after_transfer.supply.fees_paid, 2 * fee);
         assert_eq!(after_transfer.supply.burned, MIN_STAKE, "only a bond burns");
         assert_eq!(after_transfer.register_total, after_withdraw.register_total + fee);
     }

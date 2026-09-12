@@ -43,7 +43,7 @@ The node validates against the state at the tip of the chain in the order of `do
 checks, the bundle digest, the bundle proof, and for a call its own proof and tier fee — puts it
 in the mempool, and gossips it. Errors come back as code `-32000` with the reason, for example
 `nullifier already spent`, `anchor is not one of the last 256 roots`,
-`bundle time 12 is outside [244, 500]`, `fee 1000000 below minimum 2000000`,
+`time 12 is outside [244, 500]`, `fee 1000000 below minimum 2000000`,
 `the bundle's digest is not what its proof published`, `invalid bundle proof: …`,
 `unknown program …`, `already in mempool`, `conflicts with a pending transaction over <nullifier>`,
 `faucet is disabled on this chain`.
@@ -171,9 +171,12 @@ The staking (phase S2) and bridge (phase S3) actions:
 
 - `{ "kind": "bond", "validator": "<base58>", "amount": 500, "registered": false }` — `registered`
   is whether this bond carried a first-time registration.
-- `{ "kind": "unbond", "validator": "<base58>", "amount": 7, "nonce": 2 }`
-- `{ "kind": "withdraw", "validator": "<base58>", "amount": 9, "nonce": 3 }` — the deposit note's
-  blinding and envelope are not rendered.
+- `{ "kind": "unbond", "validator": "<base58>", "amount": 7, "nonce": 2 }` — rendered with
+  `"bundle": null`, as a withdraw is: both are signed by the validator's key, and the register's
+  nonce, not a bundle, is what keeps them from being replayed.
+- `{ "kind": "withdraw", "validator": "<base58>", "amount": 9, "nonce": 3, "time": 1994 }` — the
+  deposit note's blinding and envelope are not rendered. `time` is the note's time word, which the
+  withdrawing node chose; the note itself is worth `amount` less the bundle base.
 - `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>" }` — no
   amount: it is inside the attestation, which the bridge decoder reads.
 - `{ "kind": "bridge_burn", "asset": 2, "amount": 400, "relayer_fee": 100, "to_chain": 5, "to":
@@ -261,7 +264,9 @@ Params: `[]`. Result:
 The supply audit. Note values are hidden, but every crossing of the pool's boundary is public, so
 these are exact: value enters the pool as a genesis deposit, a faucet mint or a validator's
 withdraw, and leaves it as a bundle fee (into a proposer's `rewards`) or a burn (a `Bond`, into
-`stake`). `pool_value = genesis_deposited + faucet_minted + withdraw_deposited − fees_paid −
+`stake`). A withdraw's own base fee is not a crossing: `withdraw_deposited` counts the note it
+created (`amount` less the base), and the base moves from one register entry to another.
+`pool_value = genesis_deposited + faucet_minted + withdraw_deposited − fees_paid −
 burned`; `register_total` is Σ `stake + pending + rewards` over the register; `total_supply` is the
 two together, and `invariant_holds` is whether it still equals everything the chain issued
 (`genesis_deposited + genesis_staked + faucet_minted`). A false there is a bug, never a legitimate
@@ -283,8 +288,10 @@ Error responses look like `{ "jsonrpc": "2.0", "id": 1, "error": { "code": -3200
 ## The transaction on the wire
 
 `shrugg_sendTransaction` takes `bincode(Transaction)`. There is no signature over the transaction
-and no sender key: a bundle authorises itself by its proof, and the only signed action is a
-faucet mint, which carries the minting validator's key and signature inside the action.
+and no sender key: a bundle authorises itself by its proof, and an action that is signed carries
+the signature inside itself — a faucet mint the minting validator's key and signature, an `Unbond`
+or `Withdraw` the register's nonce and the validator's signature over it. Those three are also the
+only actions with `bundle: null`; every other action must carry one.
 
 ```
 Transaction { chain_id: u64, bundle: Option<Bundle>, action: Action }
@@ -300,6 +307,9 @@ Action::None                                            // a plain shielded tran
 Action::Mint { cm: Word8, envelope: Envelope, amount: u64, minter: PublicKey, signature: Signature }
 Action::Deploy { base_pc: u32, words: Vec<u32> }
 Action::Call { program: Hash, proof: Vec<u8> }          // postcard(rand_zkvm::Proof)
+Action::Unbond { validator: Address, amount: u64, nonce: u64, signature: Signature }
+Action::Withdraw { validator: Address, amount: u64, nonce: u64, time: u32, r: Word8,
+                   envelope: Envelope, signature: Signature }
 ```
 
 Encoded sizes (bincode's default configuration: fixed-width integers, 8-byte length prefixes,

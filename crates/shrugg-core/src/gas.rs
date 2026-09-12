@@ -43,16 +43,19 @@ pub fn call_fee(tier: u8) -> u64 {
 /// The floor a bundle must pay before the action's proof is verified. A call's tier-dependent
 /// part is only known once its proof has been decoded, so it is charged afterwards
 /// (`Ledger::validate`); this floor is what keeps that work from being bought for nothing.
-/// A mint carries no bundle and pays nothing.
+///
+/// An action that rides without a bundle ([`Action::bundle_less`]) has nothing to pay a fee
+/// *from*, so its floor is zero: a mint and an `Unbond` are free, and a `Withdraw` pays the base
+/// out of the amount it withdraws instead (`ledger::staking`).
 pub fn fee_floor(action: &Action) -> u64 {
     match action {
-        Action::Mint { .. } => 0,
+        Action::Mint { .. } | Action::Unbond { .. } | Action::Withdraw { .. } => 0,
         Action::None => BUNDLE_BASE,
         Action::Deploy { words, .. } => BUNDLE_BASE + deploy_fee(words.len()),
         Action::Call { .. } => BUNDLE_BASE + CALL_BASE,
-        // S2 scaffold: staking has no proving work of its own, so the plain bundle base is
-        // likely its final floor; S2 owns this arm and confirms or refines it.
-        Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. } => BUNDLE_BASE,
+        // A bond is the one staking action that rides on a bundle — the bundle is what burns the
+        // stake out of the pool — so it pays the plain base like a transfer.
+        Action::Bond { .. } => BUNDLE_BASE,
         // S3 scaffold: the bundle base until S3 prices the work these buy — an attestation's
         // decode and guardian signature recovery, and a burn's second bundle proof. S3 owns
         // this arm, so the two phases never touch the same line.
@@ -95,24 +98,27 @@ mod tests {
         crate::notes::Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] }
     }
 
-    /// S2 scaffold: each staking action pays exactly the bundle base, no more and no less.
-    /// S2 owns this test and its arm of [`fee_floor`].
+    /// A bond rides on the bundle that burns its stake, so it pays the base like a transfer; the
+    /// two validator-signed actions ride bundle-less and have nothing to pay a fee from at all.
     #[test]
-    fn the_staking_actions_pay_the_bundle_base() {
+    fn only_bond_of_the_staking_actions_pays_the_bundle_base() {
         use crate::crypto::{Address, Signature};
+        let v = Address([1; 32]);
+        assert_eq!(fee_floor(&Action::Bond { validator: v, amount: 1, registration: None }), BUNDLE_BASE);
         for a in [
-            Action::Bond { validator: Address([1; 32]), amount: 1, registration: None },
-            Action::Unbond { validator: Address([1; 32]), amount: 1, nonce: 0, signature: Signature::empty() },
+            Action::Unbond { validator: v, amount: 1, nonce: 0, signature: Signature::empty() },
             Action::Withdraw {
-                validator: Address([1; 32]),
+                validator: v,
                 amount: 1,
                 nonce: 0,
+                time: 0,
                 r: [0; 8],
                 envelope: env(),
                 signature: Signature::empty(),
             },
         ] {
-            assert_eq!(fee_floor(&a), BUNDLE_BASE, "{a:?}");
+            assert_eq!(fee_floor(&a), 0, "{a:?}");
+            assert!(a.bundle_less().is_some(), "a zero floor is only for an action with no bundle: {a:?}");
         }
     }
 

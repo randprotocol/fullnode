@@ -613,9 +613,9 @@ impl Storage {
             batch.put_cf(self.cf(CF_QCS), hk, bincode::serialize(&cb.qc)?);
             batch.put_cf(self.cf(CF_BLOCK_INDEX), hash.as_bytes(), hk);
             // The notes the ledger created itself, in append order (see `CommittedBlock`). They
-            // are interleaved with the transactions' own: a `Withdraw`'s deposit lands right
-            // after the two notes of the bundle that carried it, and each one knows the index it
-            // was given, which is what this loop checks as it goes.
+            // are interleaved with the transactions' own: a `Withdraw` carries no bundle, so its
+            // deposit is the next leaf after whatever the transaction before it appended, and
+            // each one knows the index it was given — which is what this loop checks as it goes.
             let mut deposits = cb.deposits.iter().peekable();
             for (index, tx) in block.transactions.iter().enumerate() {
                 batch.put_cf(
@@ -1461,11 +1461,8 @@ mod tests {
         let signature =
             leaving.sign(shrugg_core::unbond_message(gs.chain_id, &leaving.address(), amount, 0).as_bytes());
         let action = Action::Unbond { validator: leaving.address(), amount, nonce: 0, signature };
-        let mut b = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee())
-            .bundle
-            .expect("bundle_tx always carries one");
-        b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()));
-        let unbond = Transaction::shielded(gs.chain_id, b, action);
+        // Bundle-less and free, like every validator-signed action: the block carries it alone.
+        let unbond = Transaction { chain_id: gs.chain_id, bundle: None, action };
 
         // Block 1 is in epoch 0: led and certified by that epoch's set, both validators.
         let both = [&key(1), &key(2)];

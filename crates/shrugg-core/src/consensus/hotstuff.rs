@@ -118,7 +118,7 @@ impl HotStuff {
         // reloaded from, so RPC and the next proposal see the tip's time and — the reason this
         // matters for admission — so `validate`'s `time` window (spec §7 step 5) is measured
         // against the real head height. Without the height, every bundle submitted between a
-        // restart and the second new block is refused with `bundle time N is outside [0, 0]`.
+        // restart and the second new block is refused with `time N is outside [0, 0]`.
         let head_hash = head.hash();
         let head_height = head.height();
         let mut head_ledger = head_ledger;

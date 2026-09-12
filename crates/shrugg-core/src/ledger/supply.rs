@@ -23,6 +23,10 @@ use std::collections::BTreeMap;
 /// withdraw, and leaves it as a bundle fee (into the proposer's `rewards`) or a burn (today
 /// only a `Bond`, into `stake`). Nothing else moves value between the two, which is why
 /// [`total_supply`](Audit::total_supply) can be checked against what was ever issued.
+///
+/// A withdraw pays the bundle base to the block's proposer out of the amount it withdraws, and
+/// that half never leaves the register: only the note is counted here, and the base simply moves
+/// from one register entry to another.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Supply {
     /// Σ of the genesis deposit notes (asset 0).
@@ -36,7 +40,11 @@ pub struct Supply {
     pub genesis_staked: u64,
     /// Σ of every accepted `Mint` (the testnet faucet).
     pub faucet_minted: u64,
-    /// Σ of every accepted `Withdraw`: stake and rewards paid back into the pool as a note.
+    /// Σ of the notes accepted `Withdraw`s created: stake and rewards paid back into the pool.
+    ///
+    /// The note is worth `amount - gas::BUNDLE_BASE`, not the whole amount — the base is the fee
+    /// the withdraw pays its block's proposer, and it stays in the register — so this is what
+    /// actually crossed into the pool, which is what the invariant needs it to be.
     pub withdraw_deposited: u64,
     /// Σ of every bundle fee: value that left the pool into a proposer's `rewards`.
     pub fees_paid: u64,
@@ -134,7 +142,7 @@ mod tests {
             1_507,
             "a genesis stake is issued too, it is simply issued into the register"
         );
-        // The register holds the fee (as rewards) and the burn (as stake), less what was
+        // The register holds the fees (as rewards) and the burn (as stake), less what was
         // withdrawn back out of it.
         let register: BTreeMap<Address, ValidatorEntry> =
             [(Address([1; 32]), entry(230, vec![(3, 50)], 20))].into_iter().collect();

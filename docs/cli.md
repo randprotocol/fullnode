@@ -61,23 +61,29 @@ node of a chain must use a byte-identical genesis file.
 ### `shrugg-node register` / `unbond` / `withdraw`
 
 The three staking commands a validator operator runs (spec §8). `register` is offline apart from
-reading the chain id; the other two build a real transaction and take about a minute to prove it.
+reading the chain id; the other two submit a real transaction, which commits in a block's time —
+there is no proof to build.
 
 | command | arguments | meaning |
 |---|---|---|
 | `register` | `--key`, `--payout <shrugg1…>`, `--rpc` | print a `Registration` (hex) signed by this node's key, for a wallet to attach to the bond that registers it |
-| `unbond <amount SHRUGG>` | `--key`, `--wallet`, `--rpc`, `--fee`, `--no-wait` | move bonded stake into unbonding; withdrawable two epochs later |
-| `withdraw <amount SHRUGG>` | same | pay released stake and rewards into a note at the register's payout address |
+| `unbond <amount SHRUGG>` | `--key`, `--rpc`, `--no-wait` | move bonded stake into unbonding; withdrawable two epochs later. Free |
+| `withdraw <amount SHRUGG>` | same | pay released stake and rewards into a note at the register's payout address, less the bundle base |
 
 The bond itself is a wallet command: it burns the stake out of shielded notes, and a validator key
-owns none. For the same reason `unbond` and `withdraw` take a `--wallet` — the action is signed by
-`--key`, but the bundle carrying it pays a fee out of the wallet's notes.
+owns none. `unbond` and `withdraw` need no wallet at all — they ride without a bundle, exactly as a
+faucet mint does, and the register's nonce is their replay protection. `unbond` pays nothing;
+`withdraw` pays the 0.001 SHRUGG bundle base out of the amount it withdraws, to the proposer of
+the block that applies it, so the note it creates is worth `amount − 0.001` and an amount that
+cannot cover the base is refused.
 
 `withdraw` draws the note's blinding itself and seals the envelope to the payout address under a
 throwaway sender key, so only the payout wallet can open it. The chain computes the note's
-commitment from the height of the block that applies the transaction, which this command predicts
-as the next block and prints; a transaction that lands at a different height still creates the note
-and still pays it, but the payout wallet will not find it by scanning.
+commitment from the `time` the action carries — the head height when the command ran, which it
+prints, and which the signature binds — not from the height of the block that applies the
+transaction: the envelope is sealed before that block exists. Admission accepts any `time` within
+the 256-block window, so a withdraw that waits a few blocks for inclusion still pays a note the
+payout wallet finds by scanning.
 
 There is no `--alloc-each`: a shielded chain has no per-validator allocation, because value only
 exists as a note someone holds the spend key for. Each `--alloc` builds one deposit note with

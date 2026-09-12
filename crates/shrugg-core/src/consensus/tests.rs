@@ -509,7 +509,7 @@ fn config_of(sim: &Sim) -> ConsensusConfig {
 /// A restart hands `resume` a ledger rebuilt by `Storage::load_ledger`, which carries the state
 /// families but no position: `Ledger::from_parts` starts at height 0. `resume` must move it to
 /// the head block's height, or the mempool measures spec §7 step 5 against height 0 and refuses
-/// every bundle with `bundle time N is outside [0, 0]` until the second block after the restart.
+/// every bundle with `time N is outside [0, 0]` until the second block after the restart.
 #[test]
 fn a_ledger_resumed_at_height_h_accepts_a_bundle_timed_at_h() {
     use crate::confidential::ConfidentialExecutor;
@@ -1022,10 +1022,15 @@ fn bond_tx(l: &Ledger, n: u32, v: &Keypair, amount: u64, payout_index: u8) -> Tr
     staking_tx(l, n, amount, crate::types::Action::Bond { validator: v.address(), amount, registration: Some(registration) })
 }
 
-/// An `Unbond` of `amount` signed by `v` at its current `nonce`.
-fn unbond_tx(l: &Ledger, n: u32, v: &Keypair, amount: u64, nonce: u64) -> Transaction {
+/// An `Unbond` of `amount` signed by `v` at its current `nonce`. Bundle-less and free: a
+/// validator key owns no notes to pay a fee with.
+fn unbond_tx(v: &Keypair, amount: u64, nonce: u64) -> Transaction {
     let signature = v.sign(unbond_message(1, &v.address(), amount, nonce).as_bytes());
-    staking_tx(l, n, 0, crate::types::Action::Unbond { validator: v.address(), amount, nonce, signature })
+    Transaction {
+        chain_id: 1,
+        bundle: None,
+        action: crate::types::Action::Unbond { validator: v.address(), amount, nonce, signature },
+    }
 }
 
 impl Sim {
@@ -1126,7 +1131,7 @@ fn an_unbond_below_min_stake_drops_a_validator_next_epoch_and_the_chain_keeps_qu
     assert!(sim.gs.validators.contains(&gone));
 
     sim.step(vec![]); // block 1
-    let unbond = unbond_tx(sim.nodes[0].tip_ledger(), 20, &leaver, 1, 0);
+    let unbond = unbond_tx(&leaver, 1, 0);
     sim.step(vec![unbond.clone()]); // block 2
     let b2 = sim.block_at(0, 2);
     assert!(b2.transactions.iter().any(|t| t.hash() == unbond.hash()), "the unbond landed in block 2");
@@ -1223,7 +1228,7 @@ fn an_epoch_whose_register_empties_carries_the_previous_set_forward() {
     let leavers: Vec<Transaction> = (0..4)
         .map(|i| {
             let v = Keypair::from_seed(*sim.keys[i].seed()).unwrap();
-            unbond_tx(sim.nodes[0].tip_ledger(), 20 + i as u32 * 10, &v, 1, 0)
+            unbond_tx(&v, 1, 0)
         })
         .collect();
     sim.step(leavers); // block 2

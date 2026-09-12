@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::Multiaddr;
-use shrugg_client::wallet::{self, NoteStore, Wallet};
+use shrugg_client::wallet;
 use shrugg_client::RpcClient;
 use shrugg_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
 use shrugg_core::notes::{word8_to_hex, ShieldedAddress};
@@ -12,7 +12,6 @@ use shrugg_node::keyfile::{load_keypair, KeyFile};
 use shrugg_node::node::{self, NodeConfig};
 use shrugg_node::storage::{Storage, VerifyMode};
 use shrugg_zkvm::executor::ZkExecutor;
-use shrugg_zkvm::machine::Backend;
 use shrugg_zkvm::notes::{Note, SpendKey};
 use shrugg_zkvm::viewing::TxKey;
 use std::net::SocketAddr;
@@ -91,36 +90,20 @@ async fn register_row(rpc: &RpcClient, me: &shrugg_core::Address) -> Result<(u64
     Ok((nonce, payout))
 }
 
-/// Submit a validator-signed action on a bundle the wallet pays for, and report it.
-async fn submit_staking(args: &StakingArgs, action: shrugg_core::Action, what: &str) -> Result<()> {
+/// Submit a bundle-less validator-signed action and report where it landed.
+///
+/// There is nothing to prove and nothing to pay: the action is signed by the node's own key and
+/// the register's nonce is its replay protection, so the transaction is the action alone.
+async fn submit_staking(args: &StakingArgs, chain_id: u64, action: shrugg_core::Action, what: &str) -> Result<()> {
     let rpc = RpcClient::new(args.rpc.clone());
-    let chain_id = rpc.chain_id().await?;
-    let w = Wallet::load(&args.wallet)?;
-    let store_path = wallet::store_path(&args.wallet);
-    let mut store = NoteStore::load(&store_path);
-    let fee = match &args.fee {
-        Some(f) => parse_amount(f)?,
-        None => shrugg_core::gas::fee_floor(&action),
-    };
-    let profile = ZkExecutor::profile_from_str(
-        rpc.status().await?["fri_profile"].as_str().unwrap_or("production"),
-    )
-    .context("node reports an unknown fri profile")?;
-    let submission = wallet::submit(
-        &rpc,
-        &w,
-        &mut store,
-        None,
-        action,
-        fee,
-        profile,
-        Backend::Cpu,
-        chain_id,
-        !args.no_wait,
-    )
-    .await?;
-    store.save(&store_path)?;
-    println!("submitted {what} {}\n  fee {} SHRUGG, anchored at height {}", submission.hash, format_amount(submission.fee), submission.time);
+    let tx = shrugg_core::Transaction { chain_id, bundle: None, action };
+    let hash = rpc.send_transaction(&tx).await?;
+    if args.no_wait {
+        println!("submitted {what} {hash}");
+        return Ok(());
+    }
+    let receipt = rpc.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
+    println!("submitted {what} {hash}\n  committed in block {}", receipt.height);
     Ok(())
 }
 
@@ -241,14 +224,15 @@ enum Cmd {
         #[arg(long, default_value = "http://127.0.0.1:8545")]
         rpc: String,
     },
-    /// Move bonded stake into unbonding. Withdrawable two epochs later.
+    /// Move bonded stake into unbonding. Withdrawable two epochs later; free.
     Unbond {
         /// Amount in SHRUGG.
         amount: String,
         #[command(flatten)]
         staking: StakingArgs,
     },
-    /// Pay released stake and rewards into a note at this validator's payout address.
+    /// Pay released stake and rewards into a note at this validator's payout address, less the
+    /// bundle base the withdraw pays the block's proposer.
     Withdraw {
         /// Amount in SHRUGG.
         amount: String,
@@ -259,24 +243,18 @@ enum Cmd {
 
 /// What `unbond` and `withdraw` both need.
 ///
-/// The action is signed by the *node's* key, but it rides on a bundle like every other
-/// transaction (spec §7): something has to pay the fee, and a validator key owns no notes. So
-/// these commands take a wallet as well, and the bundle they build is a self-transfer of zero
-/// whose only purpose is to carry the action — the same shape `shrugg deploy` and `shrugg call`
-/// use. Proving it takes about a minute.
+/// Both are signed by the *node's* key and ride without a bundle, like a faucet mint: a validator
+/// key owns no notes, so there is nothing to pay a fee from and nothing to prove. An unbond is
+/// free; a withdraw pays the bundle base out of the amount it withdraws, to the proposer of the
+/// block that applies it. So neither command takes a wallet, and both return in a block's time
+/// rather than a proof's.
 #[derive(clap::Args)]
 struct StakingArgs {
     /// The validator key file: the key the register knows, and the key that signs the action.
     #[arg(long)]
     key: PathBuf,
-    /// Wallet spend-key file that pays the bundle fee.
-    #[arg(long, default_value = "wallet.key.json")]
-    wallet: PathBuf,
     #[arg(long, default_value = "http://127.0.0.1:8545")]
     rpc: String,
-    /// Fee in SHRUGG; the floor is 0.001.
-    #[arg(long)]
-    fee: Option<String>,
     /// Return once the node accepts the transaction instead of waiting for it to commit.
     #[arg(long)]
     no_wait: bool,
@@ -411,47 +389,57 @@ async fn main() -> Result<()> {
         Cmd::Unbond { amount, staking } => {
             let kp = load_keypair(&staking.key)?;
             let amount = parse_amount(&amount)?;
-            let (nonce, _) = register_row(&RpcClient::new(staking.rpc.clone()), &kp.address()).await?;
-            let chain_id = RpcClient::new(staking.rpc.clone()).chain_id().await?;
+            let rpc = RpcClient::new(staking.rpc.clone());
+            let chain_id = rpc.chain_id().await?;
+            let (nonce, _) = register_row(&rpc, &kp.address()).await?;
             let signature = kp.sign(unbond_message(chain_id, &kp.address(), amount, nonce).as_bytes());
             let action = shrugg_core::Action::Unbond { validator: kp.address(), amount, nonce, signature };
-            submit_staking(&staking, action, &format!("unbond of {} SHRUGG", format_amount(amount))).await?;
+            submit_staking(&staking, chain_id, action, &format!("unbond of {} SHRUGG", format_amount(amount))).await?;
         }
         Cmd::Withdraw { amount, staking } => {
             let kp = load_keypair(&staking.key)?;
             let amount = parse_amount(&amount)?;
+            let base = shrugg_core::gas::BUNDLE_BASE;
+            anyhow::ensure!(
+                amount > base,
+                "a withdraw pays the {} SHRUGG bundle base out of its amount, so {} SHRUGG buys no note",
+                format_amount(base),
+                format_amount(amount)
+            );
             let rpc = RpcClient::new(staking.rpc.clone());
             let chain_id = rpc.chain_id().await?;
             let (nonce, payout) = register_row(&rpc, &kp.address()).await?;
-            // The chain computes the deposit note itself, from the register's payout address,
-            // the public amount, the blinding below and **the height of the block that applies
-            // the transaction**. The envelope, which only the payee can open, has to be sealed
-            // against that same note — so the height is predicted here as the next block, and
-            // said out loud, because a transaction that lands later carries an envelope the
-            // payee's wallet cannot open. The note itself is still created and still spendable;
-            // it is the automatic discovery of it that a wrong guess costs.
-            let height = rpc.head().await?["height"].as_u64().context("head has no height")? + 1;
-            let note = Note::new(payout.pk, [0; 8], amount, 0, height as u32);
+            // The chain computes the deposit note itself, from the register's payout address, the
+            // amount less the base, the blinding below and this `time` — the head height, which
+            // the signature binds. The envelope only the payee can open is sealed against that
+            // same note here, which is why the note cannot be bound to the height that ends up
+            // applying the transaction: that height does not exist yet. Admission takes any
+            // `time` within the window (256 blocks), so the head is simply the freshest one.
+            let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
+            let note = Note::new(payout.pk, [0; 8], amount - base, 0, time);
             let throwaway = SpendKey::random().viewing_key();
             let envelope = shrugg_zkvm::address::seal_note(&throwaway, &payout, &note, &TxKey::random())
                 .map_err(|e| anyhow::anyhow!("sealing the payout note: {e}"))?;
-            let signature =
-                kp.sign(withdraw_message(chain_id, &kp.address(), amount, nonce, &note.r, &envelope).as_bytes());
+            let signature = kp
+                .sign(withdraw_message(chain_id, &kp.address(), amount, nonce, time, &note.r, &envelope).as_bytes());
             let action = shrugg_core::Action::Withdraw {
                 validator: kp.address(),
                 amount,
                 nonce,
+                time,
                 r: note.r,
                 envelope,
                 signature,
             };
             println!(
-                "paying {} SHRUGG to {}\n  note blinding r {} at predicted height {height}",
+                "withdrawing {} SHRUGG: a note worth {} SHRUGG to {}, the {} SHRUGG base to the block's proposer\n  note blinding r {} at time {time}",
                 format_amount(amount),
+                format_amount(amount - base),
                 payout,
+                format_amount(base),
                 word8_to_hex(&note.r)
             );
-            submit_staking(&staking, action, &format!("withdraw of {} SHRUGG", format_amount(amount))).await?;
+            submit_staking(&staking, chain_id, action, &format!("withdraw of {} SHRUGG", format_amount(amount))).await?;
         }
     }
     let _ = UNITS_PER_SHRUGG;

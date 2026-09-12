@@ -61,8 +61,10 @@ pub enum TxError {
     WrongChain { expected: u64, actual: u64 },
     #[error("transaction carries no bundle")]
     MissingBundle,
-    #[error("a mint must not carry a bundle")]
-    MintCarriesBundle,
+    /// The action rides without a bundle ([`Action::bundle_less`]) and this transaction attached
+    /// one anyway. Named, so a wallet hears which of its actions was built wrong.
+    #[error("a {0} must not carry a bundle")]
+    ActionCarriesBundle(&'static str),
     #[error("envelope exceeds {MAX_ENVELOPE_BYTES} bytes")]
     EnvelopeTooLarge,
     #[error("proof too large")]
@@ -79,7 +81,8 @@ pub enum TxError {
     FeeTooLow { min: u64, fee: u64 },
     #[error("anchor is not one of the last {ANCHOR_WINDOW} roots")]
     UnknownAnchor,
-    #[error("bundle time {time} is outside [{}, {height}]", height.saturating_sub(TIME_WINDOW))]
+    /// A bundle's `time`, or a bundle-less `Withdraw`'s, outside the window (spec §7 item 5).
+    #[error("time {time} is outside [{}, {height}]", height.saturating_sub(TIME_WINDOW))]
     TimeOutOfWindow { time: u32, height: u64 },
     #[error("the bundle spends the same nullifier twice")]
     DuplicateNullifierInBundle,
@@ -406,6 +409,21 @@ impl Ledger {
         self.anchors.iter().any(|(_, r)| r == root)
     }
 
+    /// Spec §7 item 5: a `time` is this height at the latest and at most [`TIME_WINDOW`] blocks
+    /// behind it. A bundle's `time` and a bundle-less `Withdraw`'s both answer to this one rule,
+    /// and the mempool re-checks it with the same function as the chain scrolls on.
+    pub fn time_in_window(&self, time: u32) -> bool {
+        let t = time as u64;
+        t <= self.height && self.height - t <= TIME_WINDOW
+    }
+
+    fn check_time(&self, time: u32) -> Result<(), TxError> {
+        if !self.time_in_window(time) {
+            return Err(TxError::TimeOutOfWindow { time, height: self.height });
+        }
+        Ok(())
+    }
+
     pub fn nullifiers(&self) -> &BTreeSet<Word8> {
         &self.nullifiers
     }
@@ -516,12 +534,11 @@ impl Ledger {
             return Err(TxError::WrongChain { expected: self.chain_id, actual: tx.chain_id });
         }
         // 3. shape and fee floor
-        let is_mint = matches!(tx.action, Action::Mint { .. });
-        let bundle: Option<&Bundle> = match (&tx.bundle, is_mint) {
-            (None, true) => None,
-            (None, false) => return Err(TxError::MissingBundle),
-            (Some(_), true) => return Err(TxError::MintCarriesBundle),
-            (Some(b), false) => Some(b),
+        let bundle: Option<&Bundle> = match (&tx.bundle, tx.action.bundle_less()) {
+            (None, Some(_)) => None,
+            (None, None) => return Err(TxError::MissingBundle),
+            (Some(_), Some(name)) => return Err(TxError::ActionCarriesBundle(name)),
+            (Some(b), None) => Some(b),
         };
         if let Some(b) = bundle {
             if b.asset != 0 {
@@ -546,10 +563,7 @@ impl Ledger {
                 return Err(TxError::UnknownAnchor);
             }
             // 5. time
-            let t = b.time as u64;
-            if t > self.height || self.height - t > TIME_WINDOW {
-                return Err(TxError::TimeOutOfWindow { time: b.time, height: self.height });
-            }
+            self.check_time(b.time)?;
             // 6. nullifiers and commitments
             if b.nullifiers[0] == b.nullifiers[1] {
                 return Err(TxError::DuplicateNullifierInBundle);
@@ -567,6 +581,12 @@ impl Ledger {
                     return Err(TxError::CommitmentExists(*cm));
                 }
             }
+        }
+        // A bundle-less `Withdraw` carries a `time` of its own — the note's, which the sealing
+        // node chose — and it is held to the same window by the same rule. Checked here, at the
+        // step a bundle's time is checked, so a stale one is refused before any signature work.
+        if let Action::Withdraw { time, .. } = &tx.action {
+            self.check_time(*time)?;
         }
         // 7. action-specific cheap checks
         let mut call_record = None;
@@ -692,7 +712,9 @@ impl Ledger {
                 receipt = Some(CallReceiptData { program: *program, tier: o.tier, outputs: o.outputs });
             }
             a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. }) => {
-                staking::apply(self, tx, a, executor)?;
+                // The proposer is passed in because a `Withdraw` pays it the bundle base out of
+                // the amount it withdraws — the one fee that does not come from a bundle.
+                staking::apply(self, tx, a, proposer, executor)?;
             }
             a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
                 bridge_notes::apply(self, tx, a, executor)?;
@@ -1098,7 +1120,7 @@ mod tests {
         assert_eq!(l.validate(&forged, &StubExecutor), Err(TxError::BadMintSignature));
         let with_bundle =
             Transaction { bundle: Some(bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE)), ..t.clone() };
-        assert_eq!(l.validate(&with_bundle, &StubExecutor), Err(TxError::MintCarriesBundle));
+        assert_eq!(l.validate(&with_bundle, &StubExecutor), Err(TxError::ActionCarriesBundle("mint")));
         let no_bundle = Transaction { chain_id: 7, bundle: None, action: Action::None };
         assert_eq!(l.validate(&no_bundle, &StubExecutor), Err(TxError::MissingBundle));
         l.set_faucet(false);
@@ -1202,8 +1224,16 @@ mod tests {
         // An envelope of exactly `body` bytes of payload, so the cap edge is exact.
         let fat = |body: usize| Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![3; body] };
         let check = |n: u32, action: Action, expect: Result<(), TxError>| {
-            let b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::fee_floor(&action));
-            let got = l.validate(&Transaction::shielded(7, b, action), &StubExecutor);
+            // Bundle-less actions are handed over as they ride; everything else gets a bundle
+            // that pays its floor, so the only thing under test is the cap.
+            let t = match action.bundle_less() {
+                Some(_) => Transaction { chain_id: 7, bundle: None, action },
+                None => {
+                    let b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::fee_floor(&action));
+                    Transaction::shielded(7, b, action)
+                }
+            };
+            let got = l.validate(&t, &StubExecutor);
             match expect {
                 Err(e) => assert_eq!(got, Err(e), "n={n}"),
                 // "the cap passed": whatever refuses this transaction next, it is not a size
@@ -1222,6 +1252,7 @@ mod tests {
             validator: v,
             amount: 5,
             nonce: 0,
+            time: 0,
             r: [7; 8],
             envelope,
             signature: sig.clone(),
