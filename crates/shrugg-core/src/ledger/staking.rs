@@ -93,9 +93,10 @@ pub enum StakingError {
 /// **The result can be empty**, and a caller must not use an empty set: `ValidatorSet::leader`
 /// takes `view % len()`. Genesis refuses a validator below [`MIN_STAKE`], so a chain cannot
 /// start empty, but every validator unbonding below it during one epoch would empty the next
-/// one. S2 Task 2 (consensus) owns the answer: when `derive_set` comes back empty, keep the
-/// previous epoch's set rather than switching to nothing. Deriving the set is not the place to
-/// decide that — this function says what the register contains, not what consensus does about it.
+/// one. Consensus answers that in `HotStuff::shared_set_for_height`: an empty derivation carries
+/// the previous epoch's set forward, so there is still a block in which to bond back in. Deriving
+/// the set is not the place to decide that — this function says what the register contains, not
+/// what consensus does about it.
 pub fn derive_set(register: &BTreeMap<Address, ValidatorEntry>) -> ValidatorSet {
     let mut eligible: Vec<(&Address, &ValidatorEntry)> =
         register.iter().filter(|(_, e)| e.stake >= MIN_STAKE).collect();

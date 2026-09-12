@@ -73,9 +73,10 @@ impl ValidatorSet {
 
     /// Round-robin leader. Hook for a future sortition beacon.
     ///
-    /// An empty set has no leader: phase S2 lets an epoch's register derive one (every validator
-    /// below the minimum stake), and such an epoch halts rather than panicking here — no key
-    /// addresses to [`Address::ZERO`], so no proposal can pass the leader check.
+    /// Panic backstop for an empty set, which has no leader. Consensus never asks: an epoch whose
+    /// register derives an empty set carries the previous epoch's set forward (see
+    /// `HotStuff::shared_set_for_height`), so this returns an address no key can hash to rather
+    /// than dividing by zero.
     pub fn leader(&self, view: u64) -> Address {
         if self.validators.is_empty() {
             return Address::ZERO;

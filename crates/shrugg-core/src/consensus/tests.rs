@@ -1212,3 +1212,65 @@ fn qcs_across_a_boundary_verify_against_their_own_epoch() {
     resumed.on_proposal(b5.clone(), sim.now).expect("block 5's justify is an epoch-1 QC");
     assert!(resumed.has_block(&b5.hash()));
 }
+
+/// Every validator unbonding below the minimum inside one epoch empties the next epoch's
+/// register. Consensus carries the previous epoch's set forward rather than switching to a set
+/// with no leader: a halted chain has no block left in which to bond back in.
+#[test]
+fn an_epoch_whose_register_empties_carries_the_previous_set_forward() {
+    let mut sim = setup_epochs(4, 4, 4);
+    sim.step(vec![]); // block 1
+    let leavers: Vec<Transaction> = (0..4)
+        .map(|i| {
+            let v = Keypair::from_seed(*sim.keys[i].seed()).unwrap();
+            unbond_tx(sim.nodes[0].tip_ledger(), 20 + i as u32 * 10, &v, 1, 0)
+        })
+        .collect();
+    sim.step(leavers); // block 2
+    assert_eq!(sim.block_at(0, 2).transactions.len(), 4, "all four unbonded in one block");
+
+    // Two more boundaries, so the fallback has to hold for an epoch derived from a fallback.
+    sim.run_to_height(13, 60);
+    sim.assert_consistent();
+
+    let mut ledger = sim.gs.ledger.clone();
+    for k in 0..3 {
+        ledger.apply_block(&sim.committed[0][k].block, &StubExecutor).expect("replay");
+    }
+    assert!(ledger.derive_next_set().is_empty(), "the register after block 3 has nobody above the minimum");
+
+    let b3 = sim.block_at(0, 3);
+    let epoch1 = sim.nodes[0].set_for_height(4, &b3.hash()).expect("epoch 1 falls back to epoch 0");
+    assert_eq!(epoch1, sim.gs.validators, "the empty derivation carries epoch 0's set forward");
+    let tip = sim.committed[0].len() as u64;
+    let last = sim.block_at(0, tip);
+    assert!(last.height() >= 12, "the chain kept committing past two more boundaries");
+    assert_eq!(sim.nodes[0].set_for_height(last.height(), &last.parent()).unwrap(), sim.gs.validators);
+}
+
+/// A block's height must be its parent's plus one before anything is derived from it. The epoch
+/// of an unchecked height is the sender's to choose, and each choice would be a register walk and
+/// a cached set keyed on a parent that never leaves the tree.
+#[test]
+fn a_block_whose_height_skips_its_parent_is_refused_before_its_epoch_is_derived() {
+    let mut sim = setup_epochs(4, 4, 4);
+    sim.step(vec![]);
+    let parent = sim.block_at(0, 1);
+    // Any key can sign its own block; the height, not the leader schedule, must be what refuses it.
+    let liar = 1usize;
+    let header = crate::types::BlockHeader {
+        height: parent.height() + 1 + 4 * 1_000_000,
+        view: sim.nodes[0].view() + 1,
+        parent: parent.hash(),
+        proposer: sim.keys[liar].public_key().clone(),
+        timestamp_ms: 1,
+        tx_root: Hash::ZERO,
+        state_root: parent.header.state_root,
+        justify: sim.nodes[0].high_qc().clone(),
+    };
+    let block = Block::sign(header, vec![], &sim.keys[liar]);
+    assert_eq!(
+        sim.nodes[0].on_proposal(block, sim.now).unwrap_err(),
+        ConsensusError::BadHeight { block: parent.height() + 1 + 4_000_000, parent: parent.height() }
+    );
+}

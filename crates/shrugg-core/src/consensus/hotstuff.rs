@@ -16,6 +16,9 @@ const MAX_VIEW_AHEAD: u64 = 1_000_000;
 const MAX_PENDING_VOTE_KEYS: usize = 4096;
 /// Cap on distinct views with buffered NewView messages.
 const MAX_NEW_VIEW_KEYS: usize = 2048;
+/// Cap on cached epoch-set derivations. Every key is a block in the tree, so this only bites if
+/// the tree cap is raised far past it.
+const MAX_DERIVED_SETS: usize = 1024;
 /// How many epochs back a replica keeps validator sets for. Blocks below the committed head are
 /// refused as stale, so nothing consensus verifies reaches further back than the committed
 /// height's own epoch; the node keeps the durable copy for replay and sync.
@@ -68,6 +71,10 @@ pub struct HotStuff {
     /// The set of `epoch(high_qc height + 1)`: the set that proposes, votes and counts NewView
     /// quorums for the block this replica would build next.
     current: Arc<ValidatorSet>,
+    /// The epoch `current` was derived for. It falls behind `epoch(high_qc height + 1)` only when
+    /// the newer set is unresolvable, which [`current_set_epoch_gap`](HotStuff::current_set_epoch_gap)
+    /// reports so callers fail closed instead of counting a quorum in the wrong epoch.
+    current_epoch: u64,
 }
 
 impl HotStuff {
@@ -149,6 +156,7 @@ impl HotStuff {
             epoch_sets,
             derived: Mutex::new(HashMap::new()),
             current,
+            current_epoch: 0,
         };
         hs.refresh_current_set();
         if let Some(s) = &hs.signer {
@@ -221,13 +229,26 @@ impl HotStuff {
             // recorded when its first block committed.
             return self.epoch_sets.shared(epoch);
         };
-        let mut derived = self.derived();
-        if let Some(cached) = derived.get(&(epoch, start)) {
-            return Some(cached.clone());
+        if let Some(cached) = self.derived().get(&(epoch, start)).cloned() {
+            return Some(cached);
         }
         // `epoch_start_parent` only returns hashes it found in the tree.
-        let set = Arc::new(self.tree[&start].ledger_after.derive_next_set());
-        derived.insert((epoch, start), set.clone());
+        let entry = &self.tree[&start];
+        let register = entry.ledger_after.derive_next_set();
+        let set = if register.is_empty() {
+            // Every validator unbonded below the minimum. Carrying the previous epoch's set
+            // forward keeps a block in which they can bond back in; an epoch with no leader is a
+            // halt nothing can end (`staking::derive_set` hands this decision here).
+            tracing::warn!("epoch {epoch} derives an empty validator set; carrying epoch {} forward", epoch - 1);
+            self.shared_set_for_height(entry.block.height(), &entry.block.parent())?
+        } else {
+            Arc::new(register)
+        };
+        let mut derived = self.derived();
+        // Bounded by the tree already (the key is a block in it), capped again as a backstop.
+        if derived.len() < MAX_DERIVED_SETS {
+            derived.insert((epoch, start), set.clone());
+        }
         Some(set)
     }
 
@@ -266,11 +287,32 @@ impl HotStuff {
     /// `high_qc` whose block this replica cannot obtain leaves the previous set in place; the
     /// fallback in [`fallback_high_qc`](Self::fallback_high_qc) is what resolves that.
     fn refresh_current_set(&mut self) {
+        // A `high_qc` certifying a block we cannot obtain says nothing about the epoch; the
+        // fallback resolves it, and `current_set_epoch_gap` reports nothing in the meantime.
         let Some(entry) = self.tree.get(&self.high_qc.block_hash) else { return };
         let next = entry.block.height() + 1;
-        if let Some(set) = self.shared_set_for_height(next, &self.high_qc.block_hash) {
-            self.current = set;
+        let epoch = self.epoch(next);
+        match self.shared_set_for_height(next, &self.high_qc.block_hash) {
+            Some(set) => {
+                self.current = set;
+                self.current_epoch = epoch;
+            }
+            None if epoch != self.current_epoch => tracing::warn!(
+                "no validator set for epoch {epoch}: still holding epoch {}'s set, so this replica \
+                 cannot admit new views or lead until the epoch's set is known",
+                self.current_epoch
+            ),
+            None => {}
         }
+    }
+
+    /// The epoch `current_set` should be for when it is not the epoch it is for — a replica that
+    /// resumed past a boundary without the recorded sets. `None` when the two agree, or when the
+    /// `high_qc` block is missing and the epoch is simply unknown.
+    fn current_set_epoch_gap(&self) -> Option<u64> {
+        let entry = self.tree.get(&self.high_qc.block_hash)?;
+        let want = self.epoch(entry.block.height() + 1);
+        (want != self.current_epoch).then_some(want)
     }
 
     pub fn leader(&self, view: u64) -> Address {
@@ -368,7 +410,17 @@ impl HotStuff {
             return Err(ConsensusError::UnknownParent(parent_hash));
         };
         let parent_height = parent.block.height();
+        let parent_view = parent.block.view();
         let grandparent = parent.block.parent();
+        // Pin the block to its parent before deriving anything from its height: the epoch of an
+        // unchecked height is attacker-chosen, and each distinct one would be a fresh register
+        // walk and a fresh cache entry keyed on a parent that never leaves the tree.
+        if block.view() <= parent_view {
+            return Err(ConsensusError::ViewNotIncreasing { block: block.view(), parent: parent_view });
+        }
+        if block.height() != parent_height + 1 {
+            return Err(ConsensusError::BadHeight { block: block.height(), parent: parent_height });
+        }
         let Some(set) = self.shared_set_for_height(block.height(), &parent_hash) else {
             return Err(ConsensusError::UnknownEpochSet(self.epoch(block.height())));
         };
@@ -385,16 +437,10 @@ impl HotStuff {
         if !block.header.justify.verify(&parent_set, &self.cfg.genesis_hash) {
             return Err(ConsensusError::BadJustify);
         }
-        let parent = &self.tree[&parent_hash];
-        if block.view() <= parent.block.view() {
-            return Err(ConsensusError::ViewNotIncreasing { block: block.view(), parent: parent.block.view() });
-        }
-        if block.height() != parent.block.height() + 1 {
-            return Err(ConsensusError::BadHeight { block: block.height(), parent: parent.block.height() });
-        }
-        if block.header.justify.view != parent.block.view() && !block.header.justify.is_genesis() {
+        if block.header.justify.view != parent_view && !block.header.justify.is_genesis() {
             return Err(ConsensusError::BadJustify);
         }
+        let parent = &self.tree[&parent_hash];
         // The shielded chain reads no clock: `time` is bounded in block heights (spec §7
         // item 5), so a block's timestamp constrains nothing a replica must agree on. A
         // proposer still never moves it backwards (see `propose`).
@@ -472,6 +518,11 @@ impl HotStuff {
 
     pub fn on_new_view(&mut self, nv: NewView) -> Result<Vec<Action>, ConsensusError> {
         let mut out = Vec::new();
+        // Admission and the quorum below are counted in `current`, so a set known to be for the
+        // wrong epoch fails closed rather than refusing legitimate senders as non-validators.
+        if let Some(epoch) = self.current_set_epoch_gap() {
+            return Err(ConsensusError::UnknownEpochSet(epoch));
+        }
         let sender = nv.sender_address();
         if !self.current.contains(&sender) {
             return Err(ConsensusError::NotValidator);
@@ -735,7 +786,11 @@ impl HotStuff {
             if self.epoch_sets.get(epoch).is_some() {
                 continue;
             }
-            let Some(set) = self.set_for_height(height, &cb.block.parent()) else { continue };
+            let Some(set) = self.set_for_height(height, &cb.block.parent()) else {
+                // The node persists this for replay; losing it means old QCs become unverifiable.
+                tracing::error!("committed block {height} starts epoch {epoch} with no derivable set");
+                continue;
+            };
             self.epoch_sets.insert(epoch, set.clone());
             recorded.push(Action::RecordEpochSet(epoch, set));
         }
