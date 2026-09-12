@@ -161,10 +161,30 @@ by length only; anyone who wants the bytes can fetch the block. Other actions:
 
 - `{ "kind": "mint", "cm": "…", "amount": 100000000000, "minter": "<validator base58>" }`
 - `{ "kind": "deploy", "program": "<program id>", "words": 412 }`
-- `{ "kind": "call", "program": "<program id>", "proof_len": 268123 }`
+- `{ "kind": "call", "program": "<program id>", "proof_len": 268123, "input_envelope_len": 1280 }`
 
-No reply from this method carries a sender, a recipient, a nonce or a transferred amount, because
-no such field exists in the stored transaction.
+`input_envelope_len` is the size of the call's encrypted input transcript, or `null` when the call
+carries none. Like every other envelope it is reported by length alone: the transcript opens for
+the caller's viewing key and the auditor, not for whoever is reading the explorer.
+
+The staking (phase S2) and bridge (phase S3) actions:
+
+- `{ "kind": "bond", "validator": "<base58>", "amount": 500, "registered": false }` — `registered`
+  is whether this bond carried a first-time registration.
+- `{ "kind": "unbond", "validator": "<base58>", "amount": 7, "nonce": 2 }`
+- `{ "kind": "withdraw", "validator": "<base58>", "amount": 9, "nonce": 3 }` — the deposit note's
+  blinding and envelope are not rendered.
+- `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>" }` — no
+  amount: it is inside the attestation, which the bridge decoder reads.
+- `{ "kind": "bridge_burn", "asset": 2, "amount": 400, "relayer_fee": 100, "to_chain": 5, "to":
+  "abab…", "asset_bundle": { …same shape as `bundle`… } }` — `to` is the 32-byte destination
+  address, hex. The asset bundle renders exactly like the fee bundle: same public fields, no more.
+
+No reply from this method carries the sender, recipient, nonce or amount of a *transfer*: no such
+field exists in a stored transfer. The staking and bridge actions above are the deliberate
+exception — a validator address, an amount and a replay nonce are public in them by design, the
+way a mint's amount is, because the validator register and the bridge's accounting are public
+(spec §8). A shielded note's later spend stays private in every case.
 
 ### `shrugg_getBlockByHeight` / `shrugg_getBlockByHash`
 Params: `[height]` (integer) or `[hash]`. Result: `null` if unknown, else:
