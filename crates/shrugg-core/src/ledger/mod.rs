@@ -445,6 +445,21 @@ impl Ledger {
         }
     }
 
+    /// Spec §7 item 5 for any `time` a transaction publishes: recent, and not in the future.
+    ///
+    /// Two things carry one — a bundle's `time`, which its proof binds the notes it creates to,
+    /// and a `BridgeAttest`'s, which the ledger stamps its deposit note with
+    /// ([`bridge_notes::validate`]) — and both are a promise about *when* that the chain has to
+    /// hold to the same window, or the two would drift apart on a chain where only one of them
+    /// was checked.
+    fn check_time(&self, time: u32) -> Result<(), TxError> {
+        let t = time as u64;
+        if t > self.height || self.height - t > TIME_WINDOW {
+            return Err(TxError::TimeOutOfWindow { time, height: self.height });
+        }
+        Ok(())
+    }
+
     /// Spec §7 items 4-6 for one bundle: its anchor is live, its `time` is in the window, its
     /// two nullifiers differ and are unspent, its two commitments differ and are new.
     ///
@@ -456,10 +471,7 @@ impl Ledger {
         if !self.is_anchor(&b.anchor) {
             return Err(TxError::UnknownAnchor);
         }
-        let t = b.time as u64;
-        if t > self.height || self.height - t > TIME_WINDOW {
-            return Err(TxError::TimeOutOfWindow { time: b.time, height: self.height });
-        }
+        self.check_time(b.time)?;
         if b.nullifiers[0] == b.nullifiers[1] {
             return Err(TxError::DuplicateNullifierInBundle);
         }
@@ -1205,6 +1217,7 @@ mod tests {
             attestation,
             recipient: recipient.clone(),
             r: [7; 8],
+            time: l.height() as u32,
             envelope,
         };
         check(208, attest(vec![1; 32], fat(MAX_ENVELOPE_BYTES)), Ok(()));

@@ -135,12 +135,12 @@ fn sync_opts() -> WriteOptions {
 /// leaf gets on disk is the index the ledger gave it.
 ///
 /// A `BridgeAttest`'s deposit is the one commitment the wire does not carry: the chain computes
-/// it from the amount the guardians signed, so this recomputes it the same way, through the
-/// ledger's own function. `bridge` is the registry that names the note's asset — absent only on
-/// a chain without a bridge, where a `BridgeAttest` is inadmissible.
+/// it from the amount the guardians signed, the `time` the action published and the asset the
+/// registry named, so this recomputes it the same way, through the ledger's own function.
+/// `bridge` is that registry — absent only on a chain without a bridge, where a `BridgeAttest`
+/// is inadmissible.
 fn created_notes(
     tx: &shrugg_core::Transaction,
-    height: u64,
     bridge: Option<&BridgeState>,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<Vec<(Word8, Envelope)>> {
@@ -161,7 +161,7 @@ fn created_notes(
             // note here is a torn block, and leaving the leaf out would put the notes family one
             // short of the tree the ledger committed to.
             if shrugg_core::ledger::bridge_notes::attested_transfer(attestation).is_some() {
-                let note = shrugg_core::ledger::bridge_notes::deposit_note(tx, bridge, height, executor)
+                let note = shrugg_core::ledger::bridge_notes::deposit_note(tx, bridge, executor)
                     .ok_or_else(|| {
                         StorageError::Corrupt(
                             "committed attestation deposits an asset the registry does not hold".into(),
@@ -684,7 +684,7 @@ impl Storage {
                 for nf in tx.nullifiers() {
                     batch.put_cf(self.cf(CF_NULLIFIERS), word8_to_bytes(&nf), hk);
                 }
-                for (cm, envelope) in created_notes(tx, block.height(), ledger_after.bridge(), executor)? {
+                for (cm, envelope) in created_notes(tx, ledger_after.bridge(), executor)? {
                     let row = NoteRow { cm, envelope, height: block.height() };
                     batch.put_cf(self.cf(CF_NOTES), height_key(next_index), bincode::serialize(&row)?);
                     next_index += 1;
@@ -1192,7 +1192,13 @@ pub(crate) mod fixtures {
         Transaction::shielded(
             ledger.chain_id(),
             bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
-            Action::BridgeAttest { attestation, recipient: recipient(), r: [7; 8], envelope: env(seed as u8) },
+            Action::BridgeAttest {
+                attestation,
+                recipient: recipient(),
+                r: [7; 8],
+                time: ledger.height() as u32,
+                envelope: env(seed as u8),
+            },
         )
     }
 
@@ -1379,7 +1385,7 @@ mod tests {
 
         // The deposit note is leaf 2 — after the fee bundle's two — and is served like any
         // other, so a wallet scanning the tree finds its bridged deposit.
-        let deposit = shrugg_core::ledger::bridge_notes::deposit_note(&att, back, 1, &StubExecutor).unwrap();
+        let deposit = shrugg_core::ledger::bridge_notes::deposit_note(&att, back, &StubExecutor).unwrap();
         let row = s.note(2).unwrap().expect("the deposit note is indexed");
         assert_eq!((row.cm, row.envelope), deposit);
         assert_eq!(row.height, 1);

@@ -42,7 +42,12 @@ pub(super) fn validate(
     executor: &dyn ConfidentialExecutor,
 ) -> Result<Option<CheckedAttestation>, TxError> {
     match action {
-        Action::BridgeAttest { attestation, recipient, r, envelope: _ } => {
+        Action::BridgeAttest { attestation, recipient, r, time, envelope: _ } => {
+            // The cheapest check this action has, and the one that must run before any decode or
+            // signature recovery: the deposit note is stamped with this `time` rather than the
+            // apply height (see [`Action::BridgeAttest`]), so it gets the window a bundle's
+            // `time` gets. A comparison, bought before an attestation buys any work.
+            ledger.check_time(*time)?;
             let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
             // The attestation's size cap ran at step 1, before this decode. `check_attest` is
             // itself ordered cheap-before-expensive: it decodes, resolves the guardian set,
@@ -60,7 +65,7 @@ pub(super) fn validate(
                 // bundle keeps `validate` and `apply` in agreement — the mempool admits on
                 // `validate`, so a gap here would be a transaction that is accepted and then
                 // fails the block it lands in.
-                let cm = deposit_commitment(ledger, recipient, t.amount, t.info.index, r, executor);
+                let cm = deposit_commitment(recipient, t.amount, t.info.index, *time, r, executor);
                 let in_fee_bundle = tx.bundle.as_ref().is_some_and(|b| b.commitments.contains(&cm));
                 if ledger.has_commitment(&cm) || in_fee_bundle {
                     return Err(TxError::CommitmentExists(cm));
@@ -120,7 +125,7 @@ pub(super) fn apply(
     checked: Option<CheckedAttestation>,
 ) -> Result<(), TxError> {
     match action {
-        Action::BridgeAttest { recipient, r, .. } => {
+        Action::BridgeAttest { recipient, r, time, .. } => {
             let checked = checked.expect("validate returns the checked attestation for an attest");
             let bridge = ledger.bridge_mut().ok_or(TxError::Bridge(BridgeError::Disabled))?;
             // Consumes the digest and registers the asset if this is its first sighting. No
@@ -128,7 +133,7 @@ pub(super) fn apply(
             // token that proves it.
             match bridge.apply_attest(checked) {
                 AttestOutcome::Minted(t) => {
-                    let cm = deposit_commitment(ledger, recipient, t.amount, t.info.index, r, executor);
+                    let cm = deposit_commitment(recipient, t.amount, t.info.index, *time, r, executor);
                     ledger.deposit(cm, executor)?;
                 }
                 // Governance only: a rotation moves guardian keys and no value.
@@ -157,34 +162,25 @@ pub(super) fn apply(
 }
 
 /// The commitment of the note a transfer attestation deposits, computed identically by
-/// [`validate`] and [`apply`] — one function so they cannot drift.
+/// [`validate`], [`apply`] and [`deposit_note`] — one function so the three cannot drift.
+///
+/// `time` is the action's own `time` word, never the height the transaction is applied at: the
+/// depositor seals an envelope against this commitment before submitting, and cannot predict
+/// which block will take it (see [`Action::BridgeAttest`]).
 ///
 /// `amount` is the gross figure the guardians signed, not `amount - relayer_fee`: the wire
 /// format's fee pays whoever relays the attestation, and on a shielded chain the submitter has
 /// no identity to pay. Minting the gross keeps what the pool holds equal to what the source
 /// chain locked; netting it would burn the difference forever.
 fn deposit_commitment(
-    ledger: &Ledger,
     recipient: &ShieldedAddress,
     amount: u64,
     asset: u32,
+    time: u32,
     r: &Word8,
     executor: &dyn ConfidentialExecutor,
 ) -> Word8 {
-    deposit_commitment_at(recipient, amount, asset, ledger.height(), r, executor)
-}
-
-/// [`deposit_commitment`] against a height given outright, for a caller that is recomputing a
-/// deposit after the fact rather than making one ([`deposit_note`]).
-fn deposit_commitment_at(
-    recipient: &ShieldedAddress,
-    amount: u64,
-    asset: u32,
-    height: u64,
-    r: &Word8,
-    executor: &dyn ConfidentialExecutor,
-) -> Word8 {
-    executor.note_commitment(&recipient.pk, &DEPOSIT_FROM, amount, asset, height as u32, r)
+    executor.note_commitment(&recipient.pk, &DEPOSIT_FROM, amount, asset, time, r)
 }
 
 /// What an attestation's payload would deposit, from the wire bytes alone: the asset it names
@@ -220,15 +216,14 @@ pub fn attested_transfer(attestation: &[u8]) -> Option<(AssetId, u64)> {
 pub fn deposit_note(
     tx: &Transaction,
     bridge: &BridgeState,
-    height: u64,
     executor: &dyn ConfidentialExecutor,
 ) -> Option<(Word8, Envelope)> {
-    let Action::BridgeAttest { attestation, recipient, r, envelope } = &tx.action else {
+    let Action::BridgeAttest { attestation, recipient, r, time, envelope } = &tx.action else {
         return None;
     };
     let (asset, amount) = attested_transfer(attestation)?;
     let index = bridge.asset_index(&asset)?;
-    Some((deposit_commitment_at(recipient, amount, index, height, r, executor), envelope.clone()))
+    Some((deposit_commitment(recipient, amount, index, *time, r, executor), envelope.clone()))
 }
 
 #[cfg(test)]
@@ -241,6 +236,7 @@ mod tests {
     use crate::confidential::StubExecutor;
     use crate::crypto::{Address, Keypair};
     use crate::gas;
+    use crate::ledger::TIME_WINDOW;
     use crate::notes::{Bundle, Envelope, ShieldedAddress};
     use crate::types::{Validator, ValidatorSet};
 
@@ -355,7 +351,7 @@ mod tests {
         Transaction::shielded(
             7,
             fee_bundle(l, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
-            Action::BridgeAttest { attestation, recipient: to, r: [7; 8], envelope: env() },
+            Action::BridgeAttest { attestation, recipient: to, r: [7; 8], time: l.height() as u32, envelope: env() },
         )
     }
 
@@ -393,6 +389,63 @@ mod tests {
         assert_ne!(tx.hash(), with_fee.hash());
     }
 
+    /// The deposit note's `time` word is the one the action published, never the height the
+    /// transaction happened to be applied at. It has to be: the recipient's envelope is sealed
+    /// against a commitment the depositor computed before submitting, and nobody can predict the
+    /// block their transaction lands in. The two are deliberately different here.
+    #[test]
+    fn attest_note_uses_the_action_time_not_the_apply_height() {
+        let (mut l, secrets) = ledger();
+        l.set_height(9);
+        l.record_anchor(9);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let mut tx = attest_tx(&l, a, recipient(), 20);
+        let Action::BridgeAttest { time, .. } = &mut tx.action else { panic!("an attest") };
+        *time = 5;
+        l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
+        assert!(l.has_commitment(&expected_cm(5, 1_000, 1)), "the note the action's time names");
+        assert!(!l.has_commitment(&expected_cm(9, 1_000, 1)), "and not the one the apply height would");
+        // The recompute-after-the-fact path reads the same word off the committed action, so a
+        // node's note index agrees with the tree whatever height it asks about.
+        let (cm, _) = deposit_note(&tx, l.bridge().unwrap(), &StubExecutor).expect("a transfer deposits a note");
+        assert_eq!(cm, expected_cm(5, 1_000, 1));
+    }
+
+    /// `time` buys the depositor a predictable commitment, so it gets the window rule a bundle's
+    /// `time` gets — and no more: a note stamped in the future, or older than the window, is
+    /// refused before the attestation is even decoded.
+    #[test]
+    fn attest_time_outside_the_window_is_refused() {
+        let (mut l, secrets) = ledger();
+        let height = TIME_WINDOW + 20;
+        l.set_height(height);
+        l.record_anchor(height);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let tx = attest_tx(&l, a, recipient(), 20);
+        let at = |time: u32| {
+            let mut tx = tx.clone();
+            let Action::BridgeAttest { time: t, .. } = &mut tx.action else { panic!("an attest") };
+            *t = time;
+            l.validate(&tx, &StubExecutor)
+        };
+        let oldest = (height - TIME_WINDOW) as u32;
+        assert_eq!(at(height as u32 + 1), Err(TxError::TimeOutOfWindow { time: height as u32 + 1, height }));
+        assert_eq!(at(oldest - 1), Err(TxError::TimeOutOfWindow { time: oldest - 1, height }));
+        assert_eq!(at(oldest), Ok(()), "exactly height - TIME_WINDOW is inside it");
+        assert_eq!(at(height as u32), Ok(()));
+        // Before any decode: a `time` outside the window is refused even with attestation bytes
+        // no decoder would accept, which the same transaction proves would otherwise be reached.
+        let junk = |time: u32| {
+            let mut tx = tx.clone();
+            let Action::BridgeAttest { attestation, time: t, .. } = &mut tx.action else { panic!("an attest") };
+            *attestation = vec![0xff; 32];
+            *t = time;
+            l.validate(&tx, &StubExecutor)
+        };
+        assert_eq!(junk(height as u32 + 1), Err(TxError::TimeOutOfWindow { time: height as u32 + 1, height }));
+        assert!(matches!(junk(height as u32), Err(TxError::Bridge(_))), "the decode is what refuses it now");
+    }
+
     /// What a node's note index needs: the deposit note recomputed from the committed
     /// transaction alone, matching the one the ledger appended. The registry *after* the
     /// attestation is what a node has on disk, and it answers the same as the one before.
@@ -401,7 +454,7 @@ mod tests {
         let (mut l, secrets) = ledger();
         let tx = deposit(&mut l, &secrets, 1_000, 0, 20);
         let bridge = l.bridge().unwrap();
-        let (cm, envelope) = deposit_note(&tx, bridge, 1, &StubExecutor).expect("a transfer deposits a note");
+        let (cm, envelope) = deposit_note(&tx, bridge, &StubExecutor).expect("a transfer deposits a note");
         assert_eq!(cm, expected_cm(1, 1_000, 1));
         assert!(l.has_commitment(&cm));
         assert_eq!(envelope, env(), "paired with the envelope that opens it");
@@ -421,9 +474,9 @@ mod tests {
             .encode(),
         };
         let upgrade = attest_tx(&l, attest(&secrets, rotation), recipient(), 30);
-        assert_eq!(deposit_note(&upgrade, bridge, 1, &StubExecutor), None);
+        assert_eq!(deposit_note(&upgrade, bridge, &StubExecutor), None);
         let plain = Transaction { chain_id: 7, bundle: None, action: Action::None };
-        assert_eq!(deposit_note(&plain, bridge, 1, &StubExecutor), None);
+        assert_eq!(deposit_note(&plain, bridge, &StubExecutor), None);
     }
 
     /// The 32-byte `to` field binds the deposit to one shielded address. A submitter who swaps

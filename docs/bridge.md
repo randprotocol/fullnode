@@ -468,7 +468,7 @@ must fit `u64` (the note format), which is checked at attestation time.
 **Inbound: an attestation deposits a note.**
 
 ```
-Action::BridgeAttest { attestation, recipient: ShieldedAddress, r: Word8, envelope }
+Action::BridgeAttest { attestation, recipient: ShieldedAddress, r: Word8, time: u32, envelope }
 ```
 
 - The wire `to` field (32 bytes) is `blake3("shrugg-shielded-recipient", pk || kem_ek)` of the
@@ -476,10 +476,15 @@ Action::BridgeAttest { attestation, recipient: ShieldedAddress, r: Word8, envelo
   and the guardians sign it as before. The submitter includes the full address in the action; the
   ledger recomputes the hash and rejects a mismatch.
 - The ledger computes the deposit note's commitment itself,
-  `cm = H(CM, (recipient.pk, from = 0, amount, asset_index, time = height, r))`, from the
-  attestation's amount and the action's `r`, so a submitter cannot mint a note that differs from
-  what the guardians attested. The commitment is appended to the tree like a faucet deposit; the
+  `cm = H(CM, (recipient.pk, from = 0, amount, asset_index, time, r))`, from the attestation's
+  amount and the action's `r` and `time`, so a submitter cannot mint a note that differs from what
+  the guardians attested. The commitment is appended to the tree like a faucet deposit; the
   envelope is stored with it.
+- `time` is the action's, not the height the transaction lands at, and admission holds it to the
+  window a bundle's `time` gets (`t <= height` and `height - t <= TIME_WINDOW`, checked before the
+  attestation is decoded). That is what makes the commitment predictable: the depositor has to
+  seal the recipient's envelope against a note it computes *before* submitting, and it cannot know
+  which block will take the transaction.
 - What is public in that transaction: the amount, the asset, the recipient's address hash and
   (in the action) the recipient's address itself. The note's later spend is unlinkable like any
   other note.

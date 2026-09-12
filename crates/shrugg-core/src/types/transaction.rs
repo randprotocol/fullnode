@@ -86,7 +86,14 @@ pub enum Action {
     Withdraw { validator: Address, amount: u64, nonce: u64, r: Word8, envelope: Envelope, signature: Signature },
     /// Phase S3: a guardian-signed bridge attestation, deposited as a note of the bridged
     /// asset to `recipient` with blinding `r`.
-    BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, envelope: Envelope },
+    ///
+    /// `time` is the deposit note's own `time` word, and it is on the action for the same reason
+    /// a bundle carries one: the note's commitment is computed by the chain, so the depositor has
+    /// to be able to predict it — and it cannot predict the height its transaction lands at.
+    /// Admission holds it to the window a bundle's `time` gets (`Ledger::check_time`), so it is
+    /// recent without having to be exact, and the envelope sealed for the recipient names exactly
+    /// the note the ledger will append.
+    BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, time: u32, envelope: Envelope },
     /// Phase S3: burn `amount` of asset `asset` to a destination chain. `asset_bundle` is the
     /// second bundle of the transaction — the one spending the asset notes; the transaction's
     /// own `bundle` pays the SHRUGG fee.
@@ -286,6 +293,7 @@ mod tests {
                 attestation: vec![1, 2, 3],
                 recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
                 r: [5; 8],
+                time: 9,
                 envelope: env(),
             },
         );
@@ -333,6 +341,7 @@ mod tests {
                     attestation: attestation.clone(),
                     recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
                     r,
+                    time: 9,
                     envelope: env(),
                 },
             )

@@ -200,10 +200,12 @@ The staking (phase S2) and bridge (phase S3) actions:
 - `{ "kind": "withdraw", "validator": "<base58>", "amount": 9, "nonce": 3 }` — the deposit note's
   blinding and envelope are not rendered.
 - `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>",
-  "asset_index": 1, "amount": 1000 }` — the amount and the asset are inside the attestation, so
-  they are decoded out of it; `asset_index` is what the registry gave that asset, and is the
-  `asset` word of the deposit note. Both are `null` for a guardian-set rotation (which deposits
-  nothing) and on a chain whose registry does not name the asset.
+  "asset_index": 1, "amount": 1000, "time": 41 }` — the amount and the asset are inside the
+  attestation, so they are decoded out of it; `asset_index` is what the registry gave that asset,
+  and is the `asset` word of the deposit note. Both are `null` for a guardian-set rotation (which
+  deposits nothing) and on a chain whose registry does not name the asset. `time` is the deposit
+  note's own `time` word, which the action publishes and admission holds to the window a bundle's
+  `time` gets — the note is derived from it, not from the height the transaction landed at.
 - `{ "kind": "bridge_burn", "asset": 2, "amount": 400, "relayer_fee": 100, "to_chain": 5, "to":
   "abab…", "asset_bundle": { …same shape as `bundle`… } }` — `to` is the 32-byte destination
   address, hex. The asset bundle renders exactly like the fee bundle: same public fields, no more.
@@ -335,7 +337,7 @@ Action::Call { program: Hash, proof: Vec<u8>, input_envelope: Option<CallEnvelop
 Action::Bond { validator: Address, amount: u64, registration: Option<Registration> }
 Action::Unbond { validator: Address, amount: u64, nonce: u64, signature: Signature }
 Action::Withdraw { validator: Address, amount: u64, nonce: u64, r: Word8, envelope: Envelope, signature: Signature }
-Action::BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, envelope: Envelope }
+Action::BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, time: u32, envelope: Envelope }
 Action::BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee: u64, to_chain: u16, to: [u8; 32] }
 ```
 
@@ -343,7 +345,10 @@ A `BridgeBurn` is the chain's one two-bundle transaction: the outer `bundle` pay
 (the bundle base twice, once per verified bundle) and `asset_bundle` burns `amount + relayer_fee`
 of the bridged asset. A `BridgeAttest`'s deposit note is the one commitment the wire does not
 carry — the chain computes it from the amount the guardians signed, the recipient the action
-names and its blinding `r`, so a submitter cannot choose either.
+names, its blinding `r` and its `time`, so a submitter cannot choose the amount or the owner. It
+*can* choose `time`, within the window a bundle's `time` gets, which is what lets the depositor
+seal an envelope for a note whose commitment it can compute before knowing which block will take
+the transaction.
 
 Encoded sizes (bincode's default configuration: fixed-width integers, 8-byte length prefixes,
 `u32` enum tags):

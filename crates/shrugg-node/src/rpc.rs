@@ -306,7 +306,7 @@ fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>) -> Value {
         // are `null` for a guardian-set rotation, which deposits nothing, and on a chain whose
         // registry does not name the asset yet. The recipient is public in this transaction
         // only — the note's later spend is not.
-        Action::BridgeAttest { attestation, recipient, .. } => {
+        Action::BridgeAttest { attestation, recipient, time, .. } => {
             let deposit = attest_deposit(attestation, bridge);
             json!({
                 "kind": "bridge_attest",
@@ -314,6 +314,9 @@ fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>) -> Value {
                 "recipient": recipient.to_string(),
                 "asset_index": deposit.map(|(index, _)| index),
                 "amount": deposit.map(|(_, amount)| amount),
+                // The deposit note's own `time` word, which is what a recipient rebuilding that
+                // note needs and the window rule this action was admitted under.
+                "time": time,
             })
         }
         Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to } => json!({
@@ -1026,7 +1029,8 @@ mod tests {
             (&json!("withdraw"), &json!(v.to_base58()), &json!(9), &json!(3))
         );
 
-        let at = j(Action::BridgeAttest { attestation: vec![9; 520], recipient: recipient.clone(), r: [5; 8], envelope });
+        let at =
+            j(Action::BridgeAttest { attestation: vec![9; 520], recipient: recipient.clone(), r: [5; 8], time: 4, envelope });
         assert_eq!(at["kind"], "bridge_attest");
         assert_eq!(at["attestation_len"], 520);
         assert_eq!(at["recipient"], recipient.to_string());

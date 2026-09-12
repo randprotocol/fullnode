@@ -12,7 +12,7 @@
 use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::ledger::TIME_WINDOW;
 use shrugg_core::notes::word8_to_hex;
-use shrugg_core::{Hash, Ledger, Transaction, TxError, Word8};
+use shrugg_core::{Action, Hash, Ledger, Transaction, TxError, Word8};
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
@@ -152,12 +152,20 @@ impl Mempool {
     /// The cheap half of `Ledger::validate` — everything that can go stale between insertion and
     /// the next block, and nothing that costs a proof verification.
     fn still_applies(tx: &Transaction, ledger: &Ledger) -> bool {
+        let in_window = |t: u32| {
+            let t = t as u64;
+            t <= ledger.height() && ledger.height() - t <= TIME_WINDOW
+        };
         if let Some(b) = &tx.bundle {
-            if !ledger.is_anchor(&b.anchor) {
+            if !ledger.is_anchor(&b.anchor) || !in_window(b.time) {
                 return false;
             }
-            let t = b.time as u64;
-            if t > ledger.height() || ledger.height() - t > TIME_WINDOW {
+        }
+        // A `BridgeAttest`'s `time` goes stale by the same rule (`Ledger::check_time`), and it is
+        // not the bundle's: a transaction whose attestation has aged out would be admitted here
+        // and then kill the block it was offered to.
+        if let Action::BridgeAttest { time, .. } = &tx.action {
+            if !in_window(*time) {
                 return false;
             }
         }
@@ -412,6 +420,7 @@ mod tests {
                 attestation,
                 recipient: recipient(),
                 r: [s; 8],
+                time: l.height() as u32,
                 envelope: fixtures::env(seed),
             },
         )

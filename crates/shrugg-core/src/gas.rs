@@ -140,6 +140,7 @@ mod tests {
             attestation: vec![],
             recipient: crate::notes::ShieldedAddress { pk: [0; 8], kem_ek: vec![] },
             r: [0; 8],
+            time: 0,
             envelope: env(),
         };
         assert_eq!(fee_floor(&attest), BUNDLE_BASE);
