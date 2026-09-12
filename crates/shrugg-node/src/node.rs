@@ -97,6 +97,22 @@ pub fn load_genesis(datadir: &std::path::Path) -> Result<(GenesisState, Arc<dyn 
 /// Verify the on-disk chain. If the tail is damaged, truncate to the last good
 /// block (keeping safety state); the missing blocks are re-fetched from peers by
 /// the normal sync path. Returns the height the node will resume from.
+/// The ledger a restarting node runs on: the persisted state, plus the three things that live
+/// in the genesis file rather than in the database.
+///
+/// `epoch_blocks` is one of them, and it is not cosmetic: `Unbond` writes `epoch() +
+/// UNBONDING_EPOCHS` into the register, which the state root hashes. A node that came back up
+/// with the default 1000 on a chain that runs shorter epochs would compute a release epoch
+/// nobody else does, disagree about the state root from its first unbond on, and never rejoin.
+/// One function, so a restart cannot pick up two of the three and be wrong about the chain.
+pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn ConfidentialExecutor) -> Result<Ledger> {
+    let mut ledger = storage.load_ledger(executor)?;
+    ledger.set_faucet(gs.faucet);
+    ledger.set_confidential(gs.confidential);
+    ledger.set_epoch_blocks(gs.epoch_blocks);
+    Ok(ledger)
+}
+
 pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: VerifyMode, executor: &dyn ConfidentialExecutor) -> Result<u64> {
     if mode == VerifyMode::Off {
         return Ok(storage.head()?.height);
@@ -174,9 +190,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // Consensus replica from persisted head.
     let head_block = storage.head_block()?;
     let head_qc = storage.head_qc()?;
-    let mut ledger = storage.load_ledger(executor.as_ref())?;
-    ledger.set_faucet(gs.faucet);
-    ledger.set_confidential(gs.confidential);
+    let ledger = reload_ledger(&storage, &gs, executor.as_ref())?;
     let safety = storage.load_safety()?;
     let signer = if cfg.validator && gs.validators.contains(&key.address()) {
         Some(Keypair::from_seed(cfg.seed)?)

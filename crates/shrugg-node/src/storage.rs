@@ -908,13 +908,19 @@ pub(crate) mod fixtures {
     }
 
     pub(crate) fn genesis_with(chain_id: u64, alloc: Vec<GenesisNote>) -> GenesisState {
+        genesis_with_epochs(chain_id, alloc, shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT)
+    }
+
+    pub(crate) fn genesis_with_epochs(chain_id: u64, alloc: Vec<GenesisNote>, epoch_blocks: u64) -> GenesisState {
         let k = key(1);
         Genesis {
             chain_id,
             timestamp_ms: 0,
             validators: vec![GenesisValidator {
                 public_key: k.public_key().clone(),
-                stake: 10,
+                // Phase S2: a genesis validator has to meet the staking minimum, or it is in
+                // the register but in no epoch's validator set.
+                stake: shrugg_core::ledger::staking::MIN_STAKE as u128,
                 // Phase S2 makes the payout address a required genesis field; storage rows for
                 // the v2 register entry are S2 Task 3's, so this only has to parse.
                 payout: shrugg_core::notes::ShieldedAddress {
@@ -929,7 +935,7 @@ pub(crate) mod fixtures {
             fri_profile: "test".into(),
             hc_bundle: word8_to_hex(&HC),
             bridge: None,
-            epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
+            epoch_blocks,
         }
         .build(&StubExecutor)
         .unwrap()
@@ -1054,6 +1060,27 @@ mod tests {
         drop(dir);
     }
 
+    /// A restart must come back on the chain's own epoch length. `epoch_blocks` lives in the
+    /// genesis file, not in the database, and `Unbond` writes `epoch() + UNBONDING_EPOCHS` into
+    /// a register the state root hashes — so a node that reloaded with the default would
+    /// compute a state root nobody else does and never rejoin.
+    #[test]
+    fn a_reloaded_ledger_comes_back_on_the_chains_own_epoch_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis_with_epochs(7, vec![alloc_note(20, 1_000)], 4);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(gs.ledger.epoch_blocks(), 4);
+        // What the database alone knows: the state, and nothing the genesis file decides.
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap().epoch_blocks(), shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT);
+        // What a restarting node runs on, through the one function `node::start` uses.
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.epoch_blocks(), 4, "the chain's epoch length, not the default");
+        assert_eq!(reloaded.epoch(), gs.ledger.epoch());
+        assert!(reloaded.faucet_enabled() && reloaded.confidential_enabled(), "and the other two switches");
+        assert_eq!(reloaded, gs.ledger);
+    }
+
     /// A chain that starts with no notes still round trips: the stored frontier is the empty
     /// tree and `load_ledger` checks it against `CommitmentTree::empty_root`.
     #[test]
@@ -1086,7 +1113,10 @@ mod tests {
         assert_eq!(s.head_block().unwrap().hash(), gs.hash());
         assert_eq!(s.head_qc().unwrap(), QuorumCertificate::genesis(gs.hash()));
         assert_eq!(s.height_by_hash(&gs.hash()).unwrap(), Some(0));
-        assert_eq!(s.validator(&key(1).address()).unwrap().unwrap().stake, 10);
+        assert_eq!(
+            s.validator(&key(1).address()).unwrap().unwrap().stake,
+            shrugg_core::ledger::staking::MIN_STAKE
+        );
         assert_eq!(s.load_ledger(&StubExecutor).unwrap(), gs.ledger);
         assert_eq!(s.load_safety().unwrap(), None);
     }

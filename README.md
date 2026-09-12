@@ -94,11 +94,18 @@ copied to all machines unchanged (the genesis hash must match everywhere):
 
 ```bash
 shrugg-node genesis --chain-id 6 \
-    --validator a.key.json --validator <hex public key of b> \
+    --validator a.key.json --payout shrugg1<a's payout address> \
+    --validator <hex public key of b> --payout shrugg1<b's payout address> \
     --alloc shrugg1<address>=1000 \
+    [--stake <units, default 1000 SHRUGG>] \
     [--faucet] [--no-confidential] [--fri-profile production] \
     --out genesis.json
 ```
+
+Each validator needs a `--payout`, one per `--validator` and in the same order: it is the shielded
+address its block rewards and unbonded stake are paid to (phase S2), and it is part of the genesis
+hash. `--stake` defaults to the 1000 SHRUGG a validator needs to be in an epoch's validator set at
+all; genesis refuses less.
 
 Each `--alloc` creates one shielded deposit note: there is no per-validator allocation, because
 value exists only as a note someone holds the spend key for. The addresses come from

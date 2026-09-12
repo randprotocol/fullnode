@@ -70,20 +70,27 @@ addresses come from wallet keys, which are not node keys.
 # one spend key per wallet that should start with funds (wallets/ is gitignored — never commit these)
 for i in 1 2 3 4 5; do shrugg --key wallets/shielded-$i.key.json keygen; done
 
-# the genesis: four validators, five 1000-SHRUGG deposit notes, faucet on, production FRI
+# the genesis: four validators staked at the 1000-SHRUGG minimum (the `--stake` default; less
+# than that and the validator is in the register but in no epoch's set, which genesis refuses),
+# five 1000-SHRUGG deposit notes, faucet on, production FRI
 args=()
 for i in 1 2 3 4 5; do
   args+=(--alloc "$(shrugg --key wallets/shielded-$i.key.json address)=1000")
 done
+# phase S2: one --payout per --validator, in the same order — the shielded address that
+# validator's rewards and unbonded stake are paid to, and part of the genesis hash
+payout() { shrugg --key wallets/shielded-$1.key.json address; }
 shrugg-node genesis --chain-id 6 \
-  --validator deploy/node-a.key.json --validator deploy/node-b.key.json \
-  --validator deploy/node-c.key.json --validator deploy/node-d.key.json \
-  --stake 100000 "${args[@]}" --faucet --fri-profile production \
+  --validator deploy/node-a.key.json --payout "$(payout 1)" \
+  --validator deploy/node-b.key.json --payout "$(payout 2)" \
+  --validator deploy/node-c.key.json --payout "$(payout 3)" \
+  --validator deploy/node-d.key.json --payout "$(payout 4)" \
+  "${args[@]}" --faucet --fri-profile production \
   --out deploy/genesis-shielded.example.json
 ```
 
 `deploy/genesis-shielded.example.json` in this repo is exactly that file, produced by that command
-(chain id 6, genesis hash `6457243776e7c152b946a3a245f6748d9934ffc6f08ac22f868fb4014b38ddf3`,
+(chain id 6, genesis hash `386371c4f96405a3246b2402610b3499a5eb8aff1834a7d4ca6f1548f5d5bff7`,
 `hc_bundle 4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb`). It is an **example**:
 its five deposit notes belong to spend keys that live only on the machine that cut it, so re-cut
 your own rather than adopting it. Two properties make that unavoidable:

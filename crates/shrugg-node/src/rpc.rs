@@ -761,7 +761,7 @@ mod tests {
         assert_eq!(rows[0]["address"], key(1).address().to_base58());
         // `stake` is a `u128`, so it goes out as a decimal string — `json!` would panic on one
         // above `u64::MAX`, and a JSON number could not carry it exactly in any case.
-        assert_eq!(rows[0]["stake"], Value::String("10".into()));
+        assert_eq!(rows[0]["stake"], Value::String(shrugg_core::ledger::staking::MIN_STAKE.to_string()));
         assert!(rows[0]["stake"].is_string(), "stake must not be a JSON number");
         // The single block's bundle fee was credited to its proposer.
         assert_eq!(rows[0]["rewards"], bundle_fee());

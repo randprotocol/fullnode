@@ -106,7 +106,7 @@ fn genesis_funding(validators: &[Keypair], funded: &[&Wallet]) -> Genesis {
             .enumerate()
             .map(|(i, k)| GenesisValidator {
                 public_key: k.public_key().clone(),
-                stake: 10,
+                stake: shrugg_core::ledger::staking::MIN_STAKE as u128,
                 // Phase S2 requires a payout address per validator; nothing in this test
                 // withdraws, so it only has to parse.
                 payout: shrugg_core::notes::ShieldedAddress {

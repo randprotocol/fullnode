@@ -192,8 +192,12 @@ rejected transaction leaves the ledger byte-identical.
    It is recomputed per block: `O(n)`, which is fine until the set passes about 10^6 entries and
    wants an incremental accumulator.
 2. `validators_root` = the same construction over
-   `blake3("shrugg-validator-leaf" || address(32) || stake_be(16) || rewards_be(8))`, in
-   address-sorted order.
+   `blake3("shrugg-validator-leaf-2" || address(32) || stake_be(8) || rewards_be(8) ||
+   nonce_be(8) || pending_len_be(8) || (release_epoch_be(8) || amount_be(8))* ||
+   payout_pk(32) || payout_kem_ek(1184))`, in address-sorted order. That is the whole v2
+   register entry (phase S2): the bonded stake, the proposer rewards, the replay nonce, the
+   unbonding queue and the shielded address a withdraw pays. The queue is length-prefixed so
+   the leaf is injective; every other field is fixed width.
 3. `programs_root` = the same over `blake3("shrugg-program-leaf" || program_id)`, in id order.
 4. `state_root = blake3("shrugg-state-2" || tree_root(32) || nullifier_root(32) ||
    validators_root(32) || programs_root(32))`.

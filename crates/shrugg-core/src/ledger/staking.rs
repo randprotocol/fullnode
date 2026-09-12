@@ -73,6 +73,8 @@ pub enum StakingError {
     BadSignature,
     #[error("stake {have} is less than the {want} being unbonded")]
     InsufficientStake { have: u64, want: u64 },
+    #[error("amount must not be zero")]
+    ZeroAmount,
     #[error("only {available} is released, cannot withdraw {want}")]
     NothingReleased { available: u64, want: u64 },
     #[error("a bond's bundle must burn exactly the bonded amount: burn {burn}, amount {amount}")]
@@ -87,6 +89,13 @@ pub enum StakingError {
 ///
 /// This is a pure function of the register, which is what lets every replica derive the same set
 /// from the same parent ledger without agreeing on anything else first.
+///
+/// **The result can be empty**, and a caller must not use an empty set: `ValidatorSet::leader`
+/// takes `view % len()`. Genesis refuses a validator below [`MIN_STAKE`], so a chain cannot
+/// start empty, but every validator unbonding below it during one epoch would empty the next
+/// one. S2 Task 2 (consensus) owns the answer: when `derive_set` comes back empty, keep the
+/// previous epoch's set rather than switching to nothing. Deriving the set is not the place to
+/// decide that — this function says what the register contains, not what consensus does about it.
 pub fn derive_set(register: &BTreeMap<Address, ValidatorEntry>) -> ValidatorSet {
     let mut eligible: Vec<(&Address, &ValidatorEntry)> =
         register.iter().filter(|(_, e)| e.stake >= MIN_STAKE).collect();
@@ -113,8 +122,11 @@ impl Ledger {
     }
 
     /// Add `amount` to `validator`'s stake, inserting the entry when `registration` is present.
-    /// The bundle's `burn` is checked by admission (spec §7 step 3), not here.
-    pub fn bond(
+    /// The bundle's `burn` is checked by admission (spec §7 step 3), not here — which is why
+    /// this is crate-internal: a bond only ever arrives as an `Action::Bond` whose bundle burned
+    /// the amount, and calling it directly would mint stake out of nothing. (`unbond` and
+    /// `withdraw` are public: they take nothing in, and the node's CLI signs them.)
+    pub(crate) fn bond(
         &mut self,
         validator: Address,
         amount: u64,
@@ -156,8 +168,16 @@ impl Ledger {
         check_unbond(self, validator, amount, nonce, signature, chain_id)?;
         let release_epoch = self.epoch().checked_add(UNBONDING_EPOCHS).ok_or(StakingError::Overflow)?;
         let e = self.validators.get_mut(validator).expect("checked above");
+        // One entry per release epoch, not one per transaction: `pending` is hashed into the
+        // state root, and a validator that unbonds a hundred times in a block would otherwise
+        // make every node carry and hash a hundred rows for it. Epochs only move forward, so
+        // the entry to merge into can only ever be the last one.
+        let merged = e.pending.last_mut().filter(|(last, _)| *last == release_epoch);
+        match merged {
+            Some((_, pending)) => *pending = pending.checked_add(amount).ok_or(StakingError::Overflow)?,
+            None => e.pending.push((release_epoch, amount)),
+        }
         e.stake -= amount;
-        e.pending.push((release_epoch, amount));
         e.nonce += 1;
         Ok(())
     }
@@ -275,6 +295,10 @@ fn check_unbond(
     chain_id: u64,
 ) -> Result<(), StakingError> {
     let e = signed_by(ledger, validator, nonce, signature, || unbond_message(chain_id, validator, amount, nonce))?;
+    // A zero unbond would spend a nonce and a `pending` row to move nothing.
+    if amount == 0 {
+        return Err(StakingError::ZeroAmount);
+    }
     if amount > e.stake {
         return Err(StakingError::InsufficientStake { have: e.stake, want: amount });
     }
@@ -302,9 +326,13 @@ pub(super) fn validate(
         }
         Action::Withdraw { validator, amount, nonce, r, envelope, signature } => {
             check_withdraw(ledger, validator, *amount, *nonce, r, envelope, signature, tx.chain_id)?;
-            // The deposit the chain is about to create must be a note nobody has created yet.
+            // The deposit the chain is about to create must be a note nobody has created yet —
+            // including the two this transaction's own bundle is about to append, which `apply`
+            // inserts before it reaches this action and which are therefore part of what its
+            // `has_commitment` sees. Checking them here keeps admission's answer and
+            // application's answer the same one.
             let cm = withdraw_note(ledger, validator, *amount, r, executor)?;
-            if ledger.has_commitment(&cm) {
+            if ledger.has_commitment(&cm) || tx.bundle.iter().any(|b| b.commitments.contains(&cm)) {
                 return Err(TxError::CommitmentExists(cm));
             }
         }
@@ -375,6 +403,10 @@ fn check_withdraw(
     signed_by(ledger, validator, nonce, signature, || {
         withdraw_message(chain_id, validator, amount, nonce, r, envelope)
     })?;
+    // A zero withdraw would append a note worth nothing to a tree every node carries forever.
+    if amount == 0 {
+        return Err(StakingError::ZeroAmount);
+    }
     let available = ledger.released(validator);
     if amount > available {
         return Err(StakingError::NothingReleased { available, want: amount });
@@ -642,6 +674,31 @@ mod tests {
         // Released value is the fees it has earned as proposer of these blocks and nothing from
         // the unbonding queue: that amount waits for its epoch.
         assert_eq!(l.released(&v.address()), gas::BUNDLE_BASE, "one applied bundle, one fee");
+
+        // A second unbond in the same epoch joins the entry already there: `pending` is hashed
+        // into the state root, so it holds one row per release epoch, not one per transaction.
+        let again = unbond_tx(&l, 70, &v, 500, 1);
+        l.apply_tx(&again, &proposer, &StubExecutor).unwrap();
+        l.record_anchor(l.height());
+        let e = &l.validators()[&v.address()];
+        assert_eq!(e.pending, vec![(1 + UNBONDING_EPOCHS, 1500)], "one row, two unbonds");
+        assert_eq!((e.stake, e.nonce), (MIN_STAKE - 500, 2));
+
+        // A zero unbond moves nothing and is refused rather than spending a nonce and a row.
+        let nothing = unbond_tx(&l, 80, &v, 0, 2);
+        assert_eq!(staking_err(l.validate(&nothing, &StubExecutor).unwrap_err()), StakingError::ZeroAmount);
+
+        // The next epoch opens a new row, and what is still unreleased never exceeds the
+        // unbonding window: an entry released later than `epoch` was made at `epoch` or before,
+        // so its release epoch is one of the next `UNBONDING_EPOCHS`.
+        l.set_height(9);
+        assert_eq!(l.epoch(), 2);
+        let next_epoch = unbond_tx(&l, 90, &v, 200, 2);
+        l.apply_tx(&next_epoch, &proposer, &StubExecutor).unwrap();
+        let e = &l.validators()[&v.address()];
+        assert_eq!(e.pending, vec![(3, 1500), (4, 200)]);
+        let unreleased = e.pending.iter().filter(|(release, _)| *release > l.epoch()).count();
+        assert!(unreleased as u64 <= UNBONDING_EPOCHS, "{:?} at epoch {}", e.pending, l.epoch());
     }
 
     #[test]
@@ -680,6 +737,22 @@ mod tests {
         assert_eq!(e.nonce, 1);
         assert_eq!(l.released(&v.address()), 30);
         assert_eq!(e.stake, MIN_STAKE, "a withdraw never touches the bonded stake");
+
+        // Admission answers exactly what application would: a withdraw whose note is one of its
+        // own bundle's two outputs collides, and the collision is the refusal at admission —
+        // not something discovered after the bundle has already been written.
+        l.record_anchor(l.height());
+        let collide = StubExecutor.note_commitment(&payout(1).pk, &[0; 8], 30, 0, 5, &[9; 8]);
+        let mut t = withdraw_tx(&l, 40, &v, 30, 1, [9; 8]);
+        {
+            let b = t.bundle.as_mut().unwrap();
+            b.commitments = [collide, [43; 8]];
+            b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()));
+        }
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::CommitmentExists(collide)));
+        let mut scratch = l.clone();
+        assert_eq!(scratch.apply_tx(&t, &proposer, &StubExecutor), Err(TxError::CommitmentExists(collide)));
+        assert_eq!(scratch, l, "and nothing of it is applied");
     }
 
     #[test]
@@ -710,6 +783,9 @@ mod tests {
             staking_err(l.validate(&greedy, &StubExecutor).unwrap_err()),
             StakingError::NothingReleased { available: 200, want: 201 }
         );
+        // A withdraw of nothing would append a worthless note to a tree every node keeps.
+        let nothing = withdraw_tx(&l, 25, &v, 0, 0, [3; 8]);
+        assert_eq!(staking_err(l.validate(&nothing, &StubExecutor).unwrap_err()), StakingError::ZeroAmount);
         let ok = withdraw_tx(&l, 30, &v, 200, 0, [3; 8]);
         l.apply_tx(&ok, &v.address(), &StubExecutor).unwrap();
         assert!(l.validators()[&v.address()].pending.is_empty());

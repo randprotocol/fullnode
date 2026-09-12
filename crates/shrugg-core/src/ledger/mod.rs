@@ -749,6 +749,11 @@ impl Ledger {
                 buf.extend_from_slice(&v.stake.to_be_bytes());
                 buf.extend_from_slice(&v.rewards.to_be_bytes());
                 buf.extend_from_slice(&v.nonce.to_be_bytes());
+                // The queue's length before the queue itself: `pending` is the one
+                // variable-length run in the leaf, and without a count a short payout key with
+                // one pending entry could serialise to the same bytes as a longer key with
+                // none. Every field is fixed-width again from here on.
+                buf.extend_from_slice(&(v.pending.len() as u64).to_be_bytes());
                 for (release_epoch, amount) in &v.pending {
                     buf.extend_from_slice(&release_epoch.to_be_bytes());
                     buf.extend_from_slice(&amount.to_be_bytes());

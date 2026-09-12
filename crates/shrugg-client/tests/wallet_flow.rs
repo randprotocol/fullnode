@@ -40,7 +40,7 @@ fn genesis(validator: &Keypair) -> Genesis {
         timestamp_ms: 0,
         validators: vec![GenesisValidator {
             public_key: validator.public_key().clone(),
-            stake: 10,
+            stake: shrugg_core::ledger::staking::MIN_STAKE as u128,
             // Phase S2 requires a payout address per validator; this test never withdraws, so
             // it only has to parse.
             payout: shrugg_core::notes::ShieldedAddress {

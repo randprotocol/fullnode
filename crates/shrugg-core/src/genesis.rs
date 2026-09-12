@@ -3,6 +3,7 @@
 use crate::bridge::BridgeConfig;
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, PublicKey, Signature};
+use crate::ledger::staking::MIN_STAKE;
 use crate::ledger::{Ledger, ValidatorEntry};
 use crate::notes::{word8_from_hex, word8_to_bytes, Envelope, ShieldedAddress, Word8};
 use crate::types::{Block, BlockHeader, QuorumCertificate, ValidatorSet};
@@ -124,6 +125,8 @@ pub enum GenesisError {
     NoValidators,
     #[error("validator {0} has zero stake")]
     ZeroStake(Address),
+    #[error("validator {addr} stake {stake} is below the minimum {min}")]
+    BelowMinStake { addr: Address, stake: u128, min: u64 },
     #[error("validator {0} stake does not fit in the register's u64")]
     StakeTooLarge(Address),
     #[error("bad payout address {0}")]
@@ -205,6 +208,13 @@ impl Genesis {
                 return Err(GenesisError::ZeroStake(addr));
             }
             let stake = u64::try_from(v.stake).map_err(|_| GenesisError::StakeTooLarge(addr))?;
+            // A genesis validator below the minimum is in the register but in no epoch's set
+            // (`staking::derive_set` filters it out), so a chain seeded entirely from such
+            // entries would derive an empty set at its first epoch boundary and have nobody to
+            // pick a leader from. Refused at the file rather than discovered at block 1000.
+            if stake < MIN_STAKE {
+                return Err(GenesisError::BelowMinStake { addr, stake: v.stake, min: MIN_STAKE });
+            }
             let payout =
                 ShieldedAddress::parse(&v.payout).map_err(|_| GenesisError::BadPayout(v.payout.clone()))?;
             // ValidatorSet::new would silently collapse duplicates (and the genesis hash would
@@ -331,7 +341,9 @@ mod tests {
                 .enumerate()
                 .map(|(i, k)| GenesisValidator {
                     public_key: k.public_key().clone(),
-                    stake: 100,
+                    // A genesis validator has to be in the first epoch's set, so it has to meet
+                    // the staking minimum.
+                    stake: MIN_STAKE as u128,
                     payout: payout(i as u8 + 1),
                 })
                 .collect(),
@@ -449,7 +461,7 @@ mod tests {
         // The register starts as one entry per genesis validator, with the file's payout.
         let addr = g.validators[0].public_key.address();
         let e = &s.ledger.validators()[&addr];
-        assert_eq!(e.stake, 100, "the genesis stake, narrowed to the register's u64");
+        assert_eq!(e.stake, MIN_STAKE, "the genesis stake, narrowed to the register's u64");
         assert_eq!((e.rewards, e.nonce, e.pending.len()), (0, 0, 0));
         assert_eq!(e.payout, ShieldedAddress::parse(&g.validators[0].payout).unwrap());
 
@@ -535,6 +547,19 @@ mod tests {
         let mut g = genesis(1);
         g.validators[0].stake = 0;
         assert!(matches!(g.build(&StubExecutor), Err(GenesisError::ZeroStake(_))));
+        // A validator the staking rules would leave out of every epoch's set: in the register,
+        // in no validator set, and — if every validator were like it — no set at all.
+        let mut g = genesis(1);
+        g.validators[0].stake = MIN_STAKE as u128 - 1;
+        match g.build(&StubExecutor) {
+            Err(GenesisError::BelowMinStake { stake, min, .. }) => {
+                assert_eq!((stake, min), (MIN_STAKE as u128 - 1, MIN_STAKE))
+            }
+            other => panic!("expected BelowMinStake, got {other:?}"),
+        }
+        let mut g = genesis(1);
+        g.validators[0].stake = MIN_STAKE as u128;
+        assert!(g.build(&StubExecutor).is_ok(), "the minimum itself is enough");
         let mut g = genesis(2);
         g.validators.push(g.validators[0].clone());
         assert!(matches!(g.build(&StubExecutor), Err(GenesisError::DuplicateValidator(_))));

@@ -77,7 +77,9 @@ enum Cmd {
         /// there. (The fuller staking CLI is S2 Task 3.)
         #[arg(long = "payout", required = true)]
         payouts: Vec<String>,
-        #[arg(long, default_value_t = 100_000)]
+        /// Stake per validator, in units. Genesis refuses anything below the staking minimum
+        /// (1000 SHRUGG), which is what a validator needs to be in an epoch's set at all.
+        #[arg(long, default_value_t = shrugg_core::ledger::staking::MIN_STAKE as u128)]
         stake: u128,
         /// Deposit notes `shrugg1<address>=<amount in SHRUGG>`, repeatable. A redacted chain has
         /// no accounts, so there is no per-validator allocation: value only exists as a note
@@ -280,6 +282,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shrugg_core::ledger::staking::MIN_STAKE;
     use shrugg_zkvm::machine::FriProfile;
 
     /// The owner of the pinned genesis's one deposit note.
@@ -303,12 +306,12 @@ mod tests {
             validators: vec![
                 GenesisValidator {
                     public_key: Keypair::from_seed([1; 32]).unwrap().public_key().clone(),
-                    stake: 10,
+                    stake: MIN_STAKE as u128,
                     payout: pinned_payee().to_string(),
                 },
                 GenesisValidator {
                     public_key: Keypair::from_seed([2; 32]).unwrap().public_key().clone(),
-                    stake: 20,
+                    stake: 2 * MIN_STAKE as u128,
                     payout: pinned_payee().to_string(),
                 },
             ],
@@ -331,10 +334,12 @@ mod tests {
         let ex = ZkExecutor::new(FriProfile::Test);
         let state = pinned_genesis().build(&ex).unwrap();
         // S2 Task 1: the register. This moved from 19df87d5… (itself moved from 700f28e8… by
-        // the scaffold's `epoch_blocks` binding) for two deliberate, consensus-breaking reasons:
-        // the genesis binding now covers every validator's payout address, and the state root's
-        // validator leaf is `shrugg-validator-leaf-2` over the v2 entry (pending, payout, nonce).
-        assert_eq!(state.hash().to_hex(), "e50f52e98d5c84006fb65408d70f5c3e0eb3b7480cdf68c803eeba49216edf2d");
+        // the scaffold's `epoch_blocks` binding) for deliberate, consensus-breaking reasons: the
+        // genesis binding now covers every validator's payout address, the state root's
+        // validator leaf is `shrugg-validator-leaf-2` over the v2 entry (a length-prefixed
+        // unbonding queue, the payout address, the nonce), and this genesis's stakes are the
+        // staking minimum, which genesis now requires.
+        assert_eq!(state.hash().to_hex(), "fb5881c8d5bb5dcf634a1f036caa4cbfb49d0f3407f0d87419fbfa57686ceb4a");
         // The envelope is resealed on every call and must not move the hash: only the
         // commitment and the amount are bound.
         let again = pinned_genesis().build(&ex).unwrap();

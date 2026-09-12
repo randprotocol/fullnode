@@ -40,7 +40,8 @@ fn setup(n: u8, validators: u8) -> Sim {
             .enumerate()
             .map(|(i, k)| GenesisValidator {
                 public_key: k.public_key().clone(),
-                stake: 10,
+                // Genesis requires every validator to meet the staking minimum (S2).
+                stake: crate::ledger::staking::MIN_STAKE as u128,
                 payout: payout(i as u8 + 1),
             })
             .collect(),
@@ -864,7 +865,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
     let genesis = Genesis {
         chain_id: 1,
         timestamp_ms: 0,
-        validators: vec![GenesisValidator { public_key: key.public_key().clone(), stake: 10, payout: payout(1) }],
+        validators: vec![GenesisValidator { public_key: key.public_key().clone(), stake: crate::ledger::staking::MIN_STAKE as u128, payout: payout(1) }],
         alloc: Vec::new(),
         faucet: true,
         confidential: true,
