@@ -148,7 +148,7 @@ the trust model: a node syncing pruned history trusts finality signatures instea
 which opens the long-range attack a proof-carrying chain does not have. Block-level
 aggregation keeps every byte a validator accepts backed by a proof and is queued as its own
 milestone (a recursive verifier guest, pipelined so consensus runs on unaggregated blocks and
-a later sealed block carries the aggregate). Until it lands, chain 6 runs at three transfers
+a later sealed block carries the aggregate; roles, payment and issuance in `docs/aggregation.md`). Until it lands, chain 6 runs at three transfers
 per block with the 4 MiB cap; the cap is revisited only after the fee-ordered mempool exists
 and the fleet shows full blocks.
 
