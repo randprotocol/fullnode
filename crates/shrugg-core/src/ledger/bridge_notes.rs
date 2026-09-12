@@ -11,8 +11,9 @@
 //!   so a submitter cannot mint a note for an amount or an owner the attestation does not say.
 //! - **`BridgeBurn`** sends value the other way. A bundle balances one asset and the fee is
 //!   always SHRUGG, so a burn is the chain's only two-bundle transaction: the transaction's own
-//!   bundle pays the fee in SHRUGG, and the action carries an *asset* bundle that burns
-//!   `amount + relayer_fee` of the bridged asset. Both bundles go through the same admission.
+//!   bundle pays the fee in SHRUGG, and the action carries an *asset* bundle that burns exactly
+//!   `amount` of the bridged asset — the wire format's `relayer_fee` is a portion of that
+//!   amount, paid on the destination chain. Both bundles go through the same admission.
 //!
 //! The bridge's own public state lives in [`crate::bridge::BridgeState`] and is committed by
 //! the fifth component of the state root; this module is only the ledger's half.
@@ -113,9 +114,14 @@ pub(super) fn validate(
             if asset_bundle.fee != 0 {
                 return Err(TxError::BurnAssetBundleFee(asset_bundle.fee));
             }
-            let expected = amount.checked_add(*relayer_fee).ok_or(TxError::Overflow)?;
-            if asset_bundle.burn != expected {
-                return Err(TxError::BurnAmountMismatch { expected, actual: asset_bundle.burn });
+            // A burn destroys exactly what the outbound message sends. The wire format's `fee` is
+            // a *portion* of `amount` — that is what `fee <= amount` means (`check_burn`, and
+            // inbound `check_attest` reads it the same way) — so the release contract pays
+            // `amount - fee` to `to` and `fee` to the relayer, releasing `amount` in total.
+            // Burning `amount + relayer_fee` here would destroy more than the far side ever
+            // releases and strand the difference in the source-chain contract forever.
+            if asset_bundle.burn != *amount {
+                return Err(TxError::BurnAmountMismatch { expected: *amount, actual: asset_bundle.burn });
             }
             // `check_bundle` sees each bundle alone and the fee bundle's notes are not in the
             // ledger yet, so the pairs *between* the two bundles are checked here: all four
@@ -695,7 +701,9 @@ mod tests {
         fee: u64,
         mutate: impl FnOnce(&mut Bundle),
     ) -> Transaction {
-        let mut asset_bundle = bundle(l, [[40; 8], [41; 8]], [[42; 8], [43; 8]], 0, asset, amount + relayer_fee);
+        // `burn == amount`: the wire format's `fee` is a *portion* of the amount, paid to the
+        // relayer on the far side out of what the release contract pays out (see `validate`).
+        let mut asset_bundle = bundle(l, [[40; 8], [41; 8]], [[42; 8], [43; 8]], 0, asset, amount);
         mutate(&mut asset_bundle);
         Transaction::shielded(
             7,
@@ -749,14 +757,14 @@ mod tests {
             break_proof(b);
         });
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::BurnAssetBundleFee(7)));
-        // the burn must be exactly amount + relayer_fee
+        // the burn must be exactly the amount the action sends
         let t = burn_tx(&l, 1, 400, 100, |b| {
-            b.burn = 499;
+            b.burn = 399;
             break_proof(b);
         });
         assert_eq!(
             l.validate(&t, &StubExecutor),
-            Err(TxError::BurnAmountMismatch { expected: 500, actual: 499 })
+            Err(TxError::BurnAmountMismatch { expected: 400, actual: 399 })
         );
         // an unregistered asset is the bridge's own refusal, still before the proof
         let t = burn_tx(&l, 9, 400, 100, break_proof);
@@ -797,6 +805,33 @@ mod tests {
         assert_eq!(record.height, 1);
         // Replay: the asset bundle's nullifiers are spent now.
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::Spent([44; 8])));
+    }
+
+    /// A burn destroys exactly what the outbound message sends, and the relayer fee is a
+    /// portion of that — the meaning the wire format gives `fee` (`fee <= amount`, and inbound
+    /// `check_attest` reads it the same way). A bundle burning `amount + relayer_fee` would
+    /// destroy value the release contract never pays out: the far side releases `amount` in
+    /// total, so the difference would be stranded in the source-chain contract forever.
+    #[test]
+    fn a_burn_destroys_its_amount_and_the_relayer_fee_is_a_portion_of_it() {
+        let (mut l, secrets) = ledger();
+        deposit(&mut l, &secrets, 1_000, 0, 20);
+        // The old rule, now refused: burning the amount *plus* the fee over-destroys.
+        let over = burn_tx(&l, 1, 400, 100, |b| b.burn = 500);
+        assert_eq!(
+            l.validate(&over, &StubExecutor),
+            Err(TxError::BurnAmountMismatch { expected: 400, actual: 500 })
+        );
+        // Exactly the amount, with a non-zero fee inside it, is what is admitted.
+        let t = burn_tx(&l, 1, 400, 100, |_| {});
+        assert_eq!(l.validate(&t, &StubExecutor), Ok(()));
+        l.apply_tx(&t, &proposer().address(), &StubExecutor).unwrap();
+        // And the message the guardians sign carries the two of them apart: `amount` is the
+        // gross figure the pool destroyed, `fee` the part of it the relayer is paid out of.
+        let body = Body::decode(&l.bridge().unwrap().burns[&0].body).expect("the record's body decodes");
+        let Ok(Payload::Transfer(sent)) = Payload::decode(&body.payload) else { panic!("a transfer") };
+        assert_eq!(sent.amount_u128(), Some(400), "what left the pool is what the far side releases");
+        assert_eq!(sent.fee_u128(), Some(100), "and the relayer is paid out of it, not on top of it");
     }
 
     /// Both actions are inadmissible on a chain whose genesis has no `bridge` section, and

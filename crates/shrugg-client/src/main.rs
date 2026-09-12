@@ -156,7 +156,7 @@ enum Cmd {
         to_chain: u16,
         /// 32-byte destination address, hex.
         to: String,
-        /// Paid to whoever relays the message, out of the same asset, on top of `amount`.
+        /// A portion of AMOUNT paid to the relayer on the destination chain, in the same asset.
         #[arg(long, default_value_t = 0)]
         relayer_fee: u64,
         /// Fee in SHRUGG; the floor is 0.002 — the bundle base for each of the two bundles.
@@ -694,7 +694,7 @@ async fn main() -> Result<()> {
             let s = s?;
             report(&s, "bridge burn");
             println!(
-                "burned {amount} units of asset {asset} to chain {to_chain} ({}), relayer fee {relayer_fee}, change {}",
+                "burned {amount} units of asset {asset} to chain {to_chain} ({}), of which {relayer_fee} pays the relayer there, change {}",
                 hex::encode(to),
                 s.change
             );

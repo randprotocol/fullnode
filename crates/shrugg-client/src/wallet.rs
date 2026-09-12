@@ -771,7 +771,7 @@ pub async fn submit(
 /// The chain's one two-bundle transaction (spec §10): burn `amount` of a bridged asset to
 /// `to_chain`/`to`, paying the SHRUGG fee from a second bundle.
 ///
-/// The asset bundle burns `amount + relayer_fee` and pays no fee — the fee is always SHRUGG, and
+/// The asset bundle burns exactly `amount` and pays no fee — the fee is always SHRUGG, and
 /// the guest's own rule is that a non-SHRUGG bundle's fee is zero — so this wallet has to hold
 /// notes of *both*: the asset to burn and the SHRUGG to pay with. Both bundles are proved before
 /// either is submitted, and both go through the same admission the fee bundle does.
@@ -806,11 +806,13 @@ pub async fn submit_burn(
         return Err(anyhow!("the relayer fee {relayer_fee} is more than the {amount} being burned"));
     }
     scan(rpc, w, store).await?;
-    let burn = amount.checked_add(relayer_fee).ok_or_else(|| anyhow!("amount + relayer fee overflows"))?;
+    // `burn == amount`, not `amount + relayer_fee`: the wire format's fee is a *portion* of the
+    // amount (`fee <= amount`), carved out on the destination chain by the release contract. A
+    // bundle burning more than the far side releases would strand the difference there forever.
     // The asset bundle first, so its notes and the fee bundle's are selected from the same store
     // read; they can never collide, since they hold different assets.
     let plans = [
-        Plan::select(store, asset, &w.address, 0, 0, burn)
+        Plan::select(store, asset, &w.address, 0, 0, amount)
             .with_context(|| format!("selecting notes of asset {asset} to burn"))?,
         Plan::select(store, 0, &w.address, 0, fee, 0).context("selecting SHRUGG notes for the fee bundle")?,
     ];
@@ -824,7 +826,7 @@ pub async fn submit_burn(
     settle(rpc, w, store, &hash, &plans, time, wait).await?;
     Ok(Submission {
         hash,
-        amount: burn,
+        amount,
         change: plans[0].change(),
         fee,
         time,

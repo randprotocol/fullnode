@@ -342,15 +342,19 @@ Transaction {
   chain_id,
   bundle: <SHRUGG bundle: asset 0, burn 0, fee = 2 * BUNDLE_BASE>,   // pays for both bundles
   action: BridgeBurn {
-    asset_bundle: <bundle: asset = index, fee 0, burn = amount + relayer_fee>,
+    asset_bundle: <bundle: asset = index, fee 0, burn = amount>,
     asset, amount, relayer_fee, to_chain, to }
 }
 ```
 
 A bundle balances one asset and the fee is always SHRUGG — the bundle guest's own rule is that a
 non-SHRUGG bundle's `fee` is zero — so a burn is the chain's only two-bundle transaction. The asset
-bundle proves in the zkVM that the burner owned notes of that asset summing to at least
-`amount + relayer_fee`, with `burn` the value leaving the pool. Both bundles go through the *same*
+bundle proves in the zkVM that the burner owned notes of that asset summing to at least `amount`,
+with `burn` the value leaving the pool — exactly `amount`, because the wire format's `relayer_fee`
+is a *portion* of the amount (`fee <= amount`), carved out on the destination chain by the release
+contract, which pays `amount - fee` to `to` and `fee` to the relayer and so releases `amount` in
+total. A pool that burned `amount + relayer_fee` would destroy more than the far side ever releases
+and strand the difference in the source-chain contract forever. Both bundles go through the *same*
 admission: four distinct unspent nullifiers, four new commitments (checked across the pair, not just
 within each), both digests recomputed, both STARK proofs verified. `apply_burn` records the outbound
 message with the **transaction hash** in the sender slot — a burn is funded by notes, so there is no
@@ -374,7 +378,7 @@ sender identity — and the next `burn_sequence`; guardians read the burn log ex
      index/quorum, low-s and one recovery per signature) → the `asset` comparison → the recipient
      hash → the deposit commitment against the tree and the fee bundle.
    - `BridgeBurn`: `asset_bundle.asset == action.asset` → its `fee == 0` →
-     `burn == amount + relayer_fee` → no nullifier or commitment shared with the fee bundle → the
+     `burn == amount` → no nullifier or commitment shared with the fee bundle → the
      asset bundle's own bundle checks → `check_burn` (registered asset, `to_chain` is the asset's
      home chain, recipient shape, `relayer_fee <= amount`, `amount != 0`) → the asset bundle's
      proof.
@@ -535,7 +539,7 @@ For anyone holding an integration written against the pre-S1 bridge:
 | a recipient was a Dilithium2 address | a recipient is `blake3` of a shielded address; the action carries the address |
 | `amount: u128` | `amount: u64` (a note's field); anything larger is refused at attestation time |
 | the registry mapped `AssetId -> (chain, token)` | it maps `AssetId -> { chain, token, index }`, and the note carries the index |
-| the relayer fee was paid to the submitter | it is carried and paid to nobody; the deposit is gross |
+| the relayer fee was paid to the submitter | inbound it is carried and paid to nobody (the deposit is gross); outbound it is still a portion of `amount`, paid on the destination chain, and a burn destroys exactly `amount` |
 | `BridgeBurn` was one account-debiting transaction | it is two bundles in one transaction |
 | `shrugg_getAssetBalance`, `bridge-status` | gone; `shrugg_getAssets` + a wallet-local `asset-balance` |
 | the bridge root committed balance leaves | it commits registry leaves with indices, plus `next_index` |

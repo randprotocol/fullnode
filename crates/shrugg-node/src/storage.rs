@@ -1220,7 +1220,7 @@ pub(crate) mod fixtures {
         let mut asset_bundle =
             bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], 0);
         asset_bundle.asset = asset;
-        asset_bundle.burn = amount + relayer_fee;
+        asset_bundle.burn = amount;
         let d = StubExecutor.bundle_digest(&asset_bundle.digest_input());
         asset_bundle.proof = StubExecutor::make_bundle_proof(&HC, &d);
         Transaction::shielded(

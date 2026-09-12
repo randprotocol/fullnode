@@ -1029,8 +1029,8 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     .await
     .expect("both of the burn's bundles commit");
     eprintln!("bridge-burn: tier {}, proved in {:.1?}, {} proof bytes", burned.tier, burned.proving, burned.proof_bytes);
-    assert_eq!(burned.amount, burn + relayer_fee, "what left the pool is the burn plus the relayer fee");
-    assert_eq!(burned.change, deposit - burn - relayer_fee);
+    assert_eq!(burned.amount, burn, "what left the pool is exactly what the message sends");
+    assert_eq!(burned.change, deposit - burn);
     assert_eq!(burned.asset, index);
 
     wait_for("the burn reaches n1", Duration::from_secs(120), || {
@@ -1040,7 +1040,7 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     for n in [&n0, &n1] {
         assert_eq!(
             asset_balance(n, &recipient, index).await,
-            deposit - burn - relayer_fee,
+            deposit - burn,
             "the change note is what is left of the deposit"
         );
         assert_eq!(balance(n, &recipient).await, ALLOC - burn_fee, "the fee bundle paid two bundle bases in SHRUGG");
@@ -1049,7 +1049,14 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
         assert_eq!(msg["sequence"], 0);
         assert_eq!(msg["tx"], burned.hash.to_hex(), "the transaction hash stands in for the absent sender");
         assert_eq!(msg["digest"].as_str().unwrap().len(), 64);
-        assert!(!msg["body_hex"].as_str().unwrap().is_empty());
+        // What the message sends is exactly what the pool destroyed, with the relayer's cut a
+        // portion of it: the far side releases `amount - fee` to `to` and `fee` to the relayer,
+        // so a pool that burned `amount + fee` would strand the difference on the source chain.
+        let body_bytes = hex::decode(msg["body_hex"].as_str().expect("body_hex is hex")).expect("body_hex decodes");
+        let body = Body::decode(&body_bytes).expect("the outbound body decodes");
+        let Ok(Payload::Transfer(sent)) = Payload::decode(&body.payload) else { panic!("a transfer payload") };
+        assert_eq!(sent.amount_u128(), Some(burn as u128), "the message sends exactly what was burned");
+        assert_eq!(sent.fee_u128(), Some(relayer_fee as u128), "and the relayer fee is a portion of it");
         assert_eq!(n.rpc.bridge_burn(1).await.unwrap(), None, "and only the one");
     }
     assert_chains_equal(&[&n0, &n1]);

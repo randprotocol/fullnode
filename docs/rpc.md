@@ -50,7 +50,7 @@ in the mempool, and gossips it. Errors come back as code `-32000` with the reaso
 `unknown program …`, `already in mempool`, `conflicts with a pending transaction over <nullifier>`,
 `faucet is disabled on this chain`, and for the bridge actions `bridge: attestation already
 consumed`, `the attestation names a different recipient`, `the attestation deposits under asset 2,
-and the transaction names 1`, `the burn's asset bundle burns 499, not amount + relayer fee = 500`.
+and the transaction names 1`, `the burn's asset bundle burns 399, not the 400 the action sends`.
 
 Acceptance is not commitment: poll `shrugg_getTransaction` until it returns a block.
 
@@ -348,7 +348,7 @@ Action::BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee:
 ```
 
 A `BridgeBurn` is the chain's one two-bundle transaction: the outer `bundle` pays the SHRUGG fee
-(the bundle base twice, once per verified bundle) and `asset_bundle` burns `amount + relayer_fee`
+(the bundle base twice, once per verified bundle) and `asset_bundle` burns exactly `amount`
 of the bridged asset. A `BridgeAttest`'s deposit note is the one commitment the wire does not
 carry — the chain computes it from the amount the guardians signed, the recipient the action
 names, its blinding `r`, its `time` and the registry index it names in `asset`, so a submitter

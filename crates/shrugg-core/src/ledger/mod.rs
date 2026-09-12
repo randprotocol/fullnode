@@ -132,7 +132,7 @@ pub enum TxError {
     BurnAssetMismatch { expected: u32, actual: u32 },
     #[error("the burn's asset bundle pays a fee of {0}; the fee is paid by the SHRUGG bundle")]
     BurnAssetBundleFee(u64),
-    #[error("the burn's asset bundle burns {actual}, not amount + relayer fee = {expected}")]
+    #[error("the burn's asset bundle burns {actual}, not the {expected} the action sends")]
     BurnAmountMismatch { expected: u64, actual: u64 },
     #[error("proposer {0} is not in the validator register")]
     UnknownProposer(Address),

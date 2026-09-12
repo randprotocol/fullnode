@@ -562,7 +562,8 @@ impl BridgeState {
     ///
     /// There is no balance to check any more: what bounds a burn on the
     /// shielded chain is the asset bundle's proof, which the ledger verifies
-    /// (`burn == amount + relayer_fee` in that bundle, spec §10).
+    /// (`burn == amount` in that bundle, spec §10; the fee is a portion of the
+    /// amount, paid on the destination chain, not something extra destroyed here).
     pub fn check_burn(
         &self,
         asset_index: u32,
