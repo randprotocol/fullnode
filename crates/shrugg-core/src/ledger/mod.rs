@@ -346,6 +346,13 @@ impl Ledger {
         self.bridge.as_mut()
     }
 
+    /// Whether the bridge has already consumed this attestation digest — the `is_spent` of the
+    /// bridge's one-shot resource (see [`Transaction::bridge_digests`]). False on a chain
+    /// without a bridge, where a `BridgeAttest` is inadmissible for a different reason.
+    pub fn is_digest_spent(&self, mu: &Hash) -> bool {
+        self.bridge.as_ref().is_some_and(|b| b.spent.contains(mu))
+    }
+
     pub fn tree(&self) -> &CommitmentTree {
         &self.tree
     }
@@ -1387,16 +1394,17 @@ mod tests {
 
         let plain = ledger();
         let unbridged = plain.state_root();
-        // The same ledger, told it has no bridge, is byte-identical — not merely equal.
-        let mut cleared = plain.clone();
-        cleared.set_bridge(None);
-        assert_eq!(cleared.state_root().as_bytes(), unbridged.as_bytes());
 
         let config =
             BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::from([(2u16, [9u8; 32])]) };
         let mut bridged = plain.clone();
         bridged.set_bridge(Some(BridgeState::from_config(&config)));
         assert_ne!(bridged.state_root(), unbridged, "the bridge root joins the commitment");
+        // Clearing the bridge again returns exactly the four-component root, which is what makes
+        // this fork opt-in: the fifth component is appended, never a zero placeholder.
+        let mut cleared = bridged.clone();
+        cleared.set_bridge(None);
+        assert_eq!(cleared.state_root(), unbridged);
 
         // Bridge state is consensus state: a different guardian set is a different root.
         let mut other = plain.clone();

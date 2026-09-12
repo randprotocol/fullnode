@@ -1,5 +1,6 @@
 //! Transactions: a shielded bundle plus an optional action (design spec §3, §6).
 
+use crate::bridge::{digest as attestation_digest, Attestation};
 use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
 use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8};
 use crate::program::ProgramId;
@@ -171,6 +172,33 @@ impl Transaction {
         }
         v
     }
+
+    /// The attestation digests this transaction consumes: one for a `BridgeAttest`, none for
+    /// anything else.
+    ///
+    /// A digest is a one-shot resource exactly like a nullifier — the bridge's `spent` set
+    /// admits it once — but unlike a nullifier it is not a field of the transaction, it is the
+    /// hash of the attestation body the guardians signed. Two relayers racing the same
+    /// attestation therefore build two *entirely different* transactions (different fee bundles,
+    /// different `r`) that share nothing [`Transaction::nullifiers`] or
+    /// [`Transaction::commitments`] can see. Without this method the mempool would hold both,
+    /// offer both, and lose the block when the second hit `Bridge(Replay)` — a permissionless
+    /// relayer race being the normal operating mode of a bridge, not an attack.
+    ///
+    /// Naming it here also covers the sibling case: two attest transactions agreeing on
+    /// recipient, amount, asset, height and `r` mint the identical deposit commitment, which
+    /// `commitments()` deliberately does not carry either.
+    ///
+    /// A malformed attestation claims nothing — it names no resource because it cannot be
+    /// decoded, and `Ledger::validate` refuses it on its own.
+    pub fn bridge_digests(&self) -> Vec<Hash> {
+        match &self.action {
+            Action::BridgeAttest { attestation, .. } => Attestation::body_bytes(attestation)
+                .map(|body| vec![Hash(attestation_digest(body))])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +291,59 @@ mod tests {
         );
         assert_eq!(a.commitments(), vec![[4; 8], [5; 8]]);
         assert_eq!(a.nullifiers(), vec![[2; 8], [3; 8]]);
+        // The deposit note is not on the wire, so the digest is the only resource an attest
+        // claims — and `vec![1, 2, 3]` does not decode, so this one claims nothing.
+        assert_eq!(a.bridge_digests(), Vec::new());
+        assert_eq!(burn.bridge_digests(), Vec::new(), "only an attest consumes a digest");
+    }
+
+    /// The digest an attest consumes is the one the bridge's `spent` set keys on, and it does
+    /// not depend on anything else in the transaction — which is the whole point: two relayers
+    /// racing one attestation build different transactions that name the same digest, and the
+    /// mempool needs to see that they collide.
+    #[test]
+    fn an_attest_claims_the_digest_of_the_attestation_body() {
+        use crate::bridge::{Body, Payload, Transfer};
+        let body = Body {
+            timestamp: 1,
+            nonce: 0,
+            emitter_chain: 2,
+            emitter_address: [2; 32],
+            sequence: 0,
+            consistency_level: 0,
+            payload: Payload::Transfer(Transfer {
+                amount: Transfer::u256_from_u128(1_000),
+                token_address: [0xaa; 32],
+                token_chain: 2,
+                to: [9; 32],
+                to_chain: 1,
+                fee: Transfer::u256_from_u128(0),
+            })
+            .encode(),
+        };
+        let mu = Hash(crate::bridge::digest(&body.encode()));
+        let attestation = Attestation { guardian_set_index: 0, signatures: Vec::new(), body }.encode();
+        let attest = |r: Word8, cms: [Word8; 2]| {
+            let mut b = bundle();
+            b.commitments = cms;
+            Transaction::shielded(
+                7,
+                b,
+                Action::BridgeAttest {
+                    attestation: attestation.clone(),
+                    recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                    r,
+                    envelope: env(),
+                },
+            )
+        };
+        let one = attest([5; 8], [[4; 8], [5; 8]]);
+        let two = attest([6; 8], [[40; 8], [50; 8]]);
+        assert_eq!(one.bridge_digests(), vec![mu]);
+        assert_eq!(two.bridge_digests(), vec![mu], "a different relayer, the same digest");
+        // They share nothing else the mempool indexes.
+        assert_ne!(one.hash(), two.hash());
+        assert!(one.commitments().iter().all(|cm| !two.commitments().contains(cm)));
     }
 
     /// Every new variant is on the wire, and a `Call`'s envelope is part of the transaction id.

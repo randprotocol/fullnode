@@ -177,6 +177,12 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     let mut ledger = storage.load_ledger(executor.as_ref())?;
     ledger.set_faucet(gs.faucet);
     ledger.set_confidential(gs.confidential);
+    // The bridge, like the two switches above, comes from genesis rather than from storage:
+    // `Ledger::from_parts` leaves it `None`, and a bridged chain's state root has a fifth
+    // component, so without this a restarted node would disagree with the blocks it produced
+    // before the restart. What it restores is the *genesis* bridge — S3 task 3 adds the column
+    // families that carry the consumed digests, the burn log and the asset registry forward.
+    ledger.set_bridge(gs.ledger.bridge().cloned());
     let safety = storage.load_safety()?;
     let signer = if cfg.validator && gs.validators.contains(&key.address()) {
         Some(Keypair::from_seed(cfg.seed)?)

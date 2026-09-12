@@ -4,9 +4,10 @@
 //! A redacted chain has no senders and no nonces, so there is no per-sender ordering left to
 //! do: a bundle is admissible or it is not, and two bundles are only related to each other when
 //! they touch the same note. What replaces the old nonce bookkeeping is *conflict* tracking —
-//! the pool never holds two transactions that spend the same nullifier or create the same
-//! commitment, because at most one of them could ever be included and carrying the other only
-//! wastes the proposer's block space and a (~20 ms) proof verification per gossip round.
+//! the pool never holds two transactions that spend the same nullifier, create the same
+//! commitment, or consume the same bridge attestation digest, because at most one of them could
+//! ever be included and carrying the other only wastes the proposer's block space and a
+//! (~20 ms) proof verification per gossip round.
 
 use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::ledger::TIME_WINDOW;
@@ -22,6 +23,10 @@ pub enum MempoolError {
     Duplicate,
     #[error("conflicts with a pending transaction over {}", word8_to_hex(.0))]
     Conflict(Word8),
+    /// Two relayers raced the same bridge attestation. Their transactions share no nullifier
+    /// and no commitment, so only the digest tells them apart.
+    #[error("conflicts with a pending transaction over bridge attestation {0}")]
+    AttestationConflict(Hash),
     #[error("mempool full")]
     Full,
 }
@@ -33,12 +38,22 @@ pub struct Mempool {
     /// Which pooled transaction creates each commitment (a bundle's two output slots, or a
     /// mint's single note).
     commitments: HashMap<Word8, Hash>,
+    /// Which pooled transaction consumes each bridge attestation digest. A digest is spendable
+    /// once, like a nullifier, but it is not a field of the transaction — see
+    /// `Transaction::bridge_digests`.
+    digests: HashMap<Hash, Hash>,
     max_size: usize,
 }
 
 impl Mempool {
     pub fn new(max_size: usize) -> Mempool {
-        Mempool { txs: HashMap::new(), nullifiers: HashMap::new(), commitments: HashMap::new(), max_size }
+        Mempool {
+            txs: HashMap::new(),
+            nullifiers: HashMap::new(),
+            commitments: HashMap::new(),
+            digests: HashMap::new(),
+            max_size,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -82,6 +97,11 @@ impl Mempool {
                 return Err(MempoolError::Conflict(cm));
             }
         }
+        for mu in tx.bridge_digests() {
+            if self.digests.contains_key(&mu) {
+                return Err(MempoolError::AttestationConflict(mu));
+            }
+        }
         if self.txs.len() >= self.max_size {
             return Err(MempoolError::Full);
         }
@@ -92,6 +112,9 @@ impl Mempool {
         }
         for cm in tx.commitments() {
             self.commitments.insert(cm, hash);
+        }
+        for mu in tx.bridge_digests() {
+            self.digests.insert(mu, hash);
         }
         self.txs.insert(hash, tx);
         Ok(hash)
@@ -138,7 +161,9 @@ impl Mempool {
                 return false;
             }
         }
-        !tx.nullifiers().iter().any(|nf| ledger.is_spent(nf)) && !tx.commitments().iter().any(|cm| ledger.has_commitment(cm))
+        !tx.nullifiers().iter().any(|nf| ledger.is_spent(nf))
+            && !tx.commitments().iter().any(|cm| ledger.has_commitment(cm))
+            && !tx.bridge_digests().iter().any(|mu| ledger.is_digest_spent(mu))
     }
 
     /// Forget these transactions — called with a committed block's hashes.
@@ -163,12 +188,18 @@ impl Mempool {
                 self.commitments.remove(&cm);
             }
         }
+        for mu in tx.bridge_digests() {
+            if self.digests.get(&mu) == Some(hash) {
+                self.digests.remove(&mu);
+            }
+        }
         Some(tx)
     }
 
     /// Drop txs that can no longer apply on `ledger`: a nullifier spent by someone else, a
-    /// commitment that now exists, an anchor that has scrolled out of the window, or a `time`
-    /// that has fallen out of it. Called after every commit.
+    /// commitment that now exists, an attestation digest another relayer's transaction already
+    /// consumed, an anchor that has scrolled out of the window, or a `time` that has fallen out
+    /// of it. Called after every commit.
     pub fn prune(&mut self, ledger: &Ledger) {
         let stale: Vec<Hash> =
             self.txs.iter().filter(|(_, tx)| !Self::still_applies(tx, ledger)).map(|(h, _)| *h).collect();
@@ -182,8 +213,11 @@ impl Mempool {
 mod tests {
     use super::*;
     use crate::storage::fixtures;
+    use shrugg_core::bridge::{digest, sign_digest, Attestation, Body, Payload, Transfer, CHAIN_RAND};
     use shrugg_core::confidential::StubExecutor;
     use shrugg_core::ledger::ANCHOR_WINDOW;
+    use shrugg_core::notes::ShieldedAddress;
+    use shrugg_core::types::Action;
 
     /// A ledger at the fixtures' genesis, with the faucet on and a height past 0 so bundles can
     /// carry a `time` inside the window.
@@ -329,5 +363,102 @@ mod tests {
         let clash = fixtures::bundle_tx(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee());
         assert_eq!(m.insert(clash, &l, &StubExecutor), Err(MempoolError::Conflict(cm(1))));
         assert_eq!(m.candidates(&l, 10), vec![mint]);
+    }
+
+    /// A ledger on a bridged chain, plus the guardian secrets that can attest to it.
+    fn bridged_ledger() -> (Ledger, Vec<[u8; 32]>) {
+        let (gs, secrets) = fixtures::bridged_genesis(1);
+        (gs.ledger.clone(), secrets)
+    }
+
+    fn recipient() -> ShieldedAddress {
+        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
+    }
+
+    /// The one attestation both relayers see: 1,000 of chain 2's token to `recipient()`,
+    /// signed by a quorum of five of the six guardians.
+    fn attestation(secrets: &[[u8; 32]]) -> Vec<u8> {
+        let body = Body {
+            timestamp: 1,
+            nonce: 0,
+            emitter_chain: 2,
+            emitter_address: [2; 32],
+            sequence: 0,
+            consistency_level: 0,
+            payload: Payload::Transfer(Transfer {
+                amount: Transfer::u256_from_u128(1_000),
+                token_address: [0xaa; 32],
+                token_chain: 2,
+                to: recipient().recipient_hash(),
+                to_chain: CHAIN_RAND,
+                fee: Transfer::u256_from_u128(0),
+            })
+            .encode(),
+        };
+        let d = digest(&body.encode());
+        let signatures = (0..5).map(|i| sign_digest(&secrets[i], i as u8, &d)).collect();
+        Attestation { guardian_set_index: 0, signatures, body }.encode()
+    }
+
+    /// One relayer's submission of `attestation`: its own fee bundle and its own blinding `r`,
+    /// so two relayers' transactions have nothing in common but the attestation itself.
+    fn attest_tx(l: &Ledger, attestation: Vec<u8>, seed: u8) -> Transaction {
+        let s = seed as u32;
+        let b = fixtures::bundle(l, [nf(seed), nf(seed + 1)], [cm(seed), cm(seed + 1)], fixtures::bundle_fee());
+        Transaction::shielded(
+            l.chain_id(),
+            b,
+            Action::BridgeAttest {
+                attestation,
+                recipient: recipient(),
+                r: [s; 8],
+                envelope: fixtures::env(seed),
+            },
+        )
+    }
+
+    /// A bridge is permissionless, so two relayers racing one attestation is the normal case,
+    /// not an attack. Their transactions share no nullifier and no commitment — the deposit
+    /// note is computed by the ledger and never appears on the wire — so only the attestation
+    /// digest says they collide. Without claiming it the pool would hold both, offer both, and
+    /// the proposer's block would die on the second with `Bridge(Replay)`.
+    #[test]
+    fn two_relayers_racing_one_attestation_do_not_both_enter_the_pool() {
+        let (l, secrets) = bridged_ledger();
+        let a = attestation(&secrets);
+        let first = attest_tx(&l, a.clone(), 10);
+        let second = attest_tx(&l, a.clone(), 20);
+        // Nothing the old indexes track connects them.
+        assert_ne!(first.hash(), second.hash());
+        assert!(first.nullifiers().iter().all(|x| !second.nullifiers().contains(x)));
+        assert!(first.commitments().iter().all(|x| !second.commitments().contains(x)));
+        // Both are independently valid: the race is real, not a validation failure.
+        assert_eq!(l.validate(&second, &StubExecutor), Ok(()));
+
+        let mut m = Mempool::new(100);
+        let mu = first.bridge_digests()[0];
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(
+            m.insert(second.clone(), &l, &StubExecutor),
+            Err(MempoolError::AttestationConflict(mu)),
+            "the digest is the only thing that tells them apart"
+        );
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.candidates(&l, 10), vec![first.clone()]);
+
+        // Once the first is mined, the digest is consumed on chain: the second can never apply,
+        // and `prune` drops it rather than leaving it to kill a block.
+        let mut mined = l.clone();
+        mined.apply_tx(&first, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        assert!(mined.is_digest_spent(&mu));
+        let mut m2 = Mempool::new(100);
+        m2.insert(second.clone(), &l, &StubExecutor).unwrap();
+        assert!(m2.candidates(&mined, 10).is_empty(), "not offered to the proposer");
+        m2.prune(&mined);
+        assert_eq!(m2.len(), 0);
+
+        // And removing the first releases its claim, so a genuine retry can take its place.
+        m.remove(&[first.hash()]);
+        assert!(m.insert(second, &l, &StubExecutor).is_ok());
     }
 }

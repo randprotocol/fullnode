@@ -883,6 +883,7 @@ impl Storage {
 pub(crate) mod fixtures {
     use super::*;
     use shrugg_core::confidential::StubExecutor;
+    use shrugg_core::bridge::{guardian_address, BridgeConfig};
     use shrugg_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
     use shrugg_core::notes::{word8_to_hex, Bundle};
     use shrugg_core::{gas, BlockHeader, Keypair, Transaction};
@@ -930,6 +931,40 @@ pub(crate) mod fixtures {
         genesis_with(chain_id, Vec::new())
     }
 
+    /// Six guardian secrets and the `bridge` section naming their addresses, with chain 2
+    /// registered as a source emitter.
+    pub(crate) fn bridge_config() -> (BridgeConfig, Vec<[u8; 32]>) {
+        let secrets: Vec<[u8; 32]> = (1u8..=6).map(|i| [i; 32]).collect();
+        let config = BridgeConfig {
+            emitter: [1; 32],
+            guardians: secrets.iter().map(guardian_address).collect(),
+            emitters: std::collections::BTreeMap::from([(2u16, [2u8; 32])]),
+        };
+        (config, secrets)
+    }
+
+    /// [`genesis`] with a `bridge` section, and the guardian secrets that can attest to it.
+    /// Its state root has the fifth component, which is what makes it useful for the reload test.
+    pub(crate) fn bridged_genesis(chain_id: u64) -> (GenesisState, Vec<[u8; 32]>) {
+        let (config, secrets) = bridge_config();
+        let k = key(1);
+        let gs = Genesis {
+            chain_id,
+            timestamp_ms: 0,
+            validators: vec![GenesisValidator { public_key: k.public_key().clone(), stake: 10, payout: None }],
+            alloc: Vec::new(),
+            faucet: true,
+            confidential: true,
+            fri_profile: "test".into(),
+            hc_bundle: word8_to_hex(&HC),
+            bridge: Some(config),
+            epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
+        }
+        .build(&StubExecutor)
+        .unwrap();
+        (gs, secrets)
+    }
+
     /// An unopened database plus a genesis holding two deposit notes.
     pub(crate) fn genesis_with_two_notes() -> (tempfile::TempDir, Storage, GenesisState) {
         let gs = genesis_with(7, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)]);
@@ -941,6 +976,12 @@ pub(crate) mod fixtures {
     /// A bundle whose stub proof publishes exactly the digest the ledger recomputes, anchored to
     /// the newest root `ledger` has recorded and timed at its current height.
     pub(crate) fn bundle_tx(ledger: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64) -> Transaction {
+        Transaction::shielded(ledger.chain_id(), bundle(ledger, nfs, cms, fee), Action::None)
+    }
+
+    /// A bundle anchored to the ledger's newest recorded root, whose stub proof publishes
+    /// exactly the digest the ledger recomputes from its plaintext fields.
+    pub(crate) fn bundle(ledger: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64) -> Bundle {
         let mut b = Bundle {
             anchor: ledger.anchors().back().expect("a ledger always has an anchor").1,
             nullifiers: nfs,
@@ -954,7 +995,7 @@ pub(crate) mod fixtures {
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d);
-        Transaction::shielded(ledger.chain_id(), b, Action::None)
+        b
     }
 
     /// A faucet mint of `amount` to a note nobody can open; the envelope is a placeholder, which
@@ -1042,6 +1083,36 @@ mod tests {
         assert_eq!(s.notes_from(0, 1).unwrap().len(), 1);
         assert!(s.notes_from(2, 10).unwrap().is_empty());
         drop(dir);
+    }
+
+    /// S3: a bridged chain's state root has a fifth component, and `Ledger::from_parts` — all
+    /// `load_ledger` can rebuild — leaves the bridge `None`. The node re-applies it from genesis
+    /// immediately after loading (`node.rs`), exactly as it re-applies the faucet and
+    /// confidential switches, because without that a restarted node would compute a different
+    /// state root than the blocks it produced before the restart.
+    ///
+    /// Until task 3 adds the bridge column families, what comes back is the *genesis* bridge, so
+    /// this chain has applied no attestations. Task 3 replaces the re-apply below with the
+    /// persisted registry, spent set and burn log.
+    #[test]
+    fn a_bridged_genesis_reloads_to_the_same_state_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, _) = bridged_genesis(9);
+        s.init_genesis(&gs).unwrap();
+        assert!(gs.ledger.bridge().is_some());
+
+        let bare = s.load_ledger(&StubExecutor).unwrap();
+        assert!(bare.bridge().is_none(), "storage does not carry the bridge yet (task 3)");
+        assert_ne!(bare.state_root(), gs.ledger.state_root(), "which is exactly the divergence");
+
+        // The three lines `node.rs` runs after `load_ledger`.
+        let mut reloaded = bare;
+        reloaded.set_faucet(gs.faucet);
+        reloaded.set_confidential(gs.confidential);
+        reloaded.set_bridge(gs.ledger.bridge().cloned());
+        assert_eq!(reloaded.state_root(), gs.ledger.state_root());
+        assert_eq!(reloaded, gs.ledger);
     }
 
     /// A chain that starts with no notes still round trips: the stored frontier is the empty

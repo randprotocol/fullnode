@@ -217,10 +217,15 @@ pub enum BridgeError {
 }
 
 /// A transfer attestation as the pool needs it: which asset, under which note
-/// index, how much, to whom, and how much of that is the relayer's.
+/// index, how much, and to whom.
 ///
-/// `amount` is the gross figure the guardians signed; the recipient's note
-/// carries `amount - relayer_fee` and the relayer's carries `relayer_fee`.
+/// `amount` is the gross figure the guardians signed, and the gross figure is
+/// what the deposit note carries — see `deposit_commitment` in
+/// [`crate::ledger::bridge_notes`]. The relayer fee is *not* deducted: on a
+/// shielded chain the submitter has no identity to pay, so netting it would
+/// burn the difference and the pool would stop holding what the source chain
+/// locked.
+///
 /// `to_hash` is the wire `to` field, which on the shielded chain is
 /// `blake3("shrugg-shielded-recipient", pk || kem_ek)` of the recipient's
 /// address — the bridge never sees the address itself, only its hash.
@@ -234,6 +239,8 @@ pub struct BridgeTransfer {
     pub info: AssetInfo,
     pub amount: u64,
     pub to_hash: [u8; 32],
+    /// Carried for the record — the figure the source chain meant for whoever
+    /// relayed this attestation. The pool pays no relayer.
     pub relayer_fee: u64,
 }
 

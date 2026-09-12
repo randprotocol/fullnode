@@ -443,13 +443,16 @@ mod tests {
         // and with every cheap check passing, the broken proof is what is left to refuse
         let t = burn_tx(&l, 1, 400, 100, break_proof);
         assert!(matches!(l.validate(&t, &StubExecutor), Err(TxError::InvalidBundleProof(_))));
-        // the four nullifiers must differ across the two bundles
+        // the four nullifiers and the four commitments must each differ across the two bundles
         let t = burn_tx(&l, 1, 400, 100, |_| {});
         let Action::BridgeBurn { asset_bundle, .. } = &t.action else { panic!("a burn") };
-        let shared = asset_bundle.nullifiers[0];
+        let (shared_nf, shared_cm) = (asset_bundle.nullifiers[0], asset_bundle.commitments[1]);
         let mut clash = t.clone();
-        clash.bundle.as_mut().unwrap().nullifiers[0] = shared;
+        clash.bundle.as_mut().unwrap().nullifiers[0] = shared_nf;
         assert_eq!(l.validate(&clash, &StubExecutor), Err(TxError::DuplicateNullifierInBundle));
+        let mut clash = t.clone();
+        clash.bundle.as_mut().unwrap().commitments[1] = shared_cm;
+        assert_eq!(l.validate(&clash, &StubExecutor), Err(TxError::DuplicateCommitmentInBundle));
     }
 
     /// The happy path: both bundles are admitted, four nullifiers are spent, four commitments
