@@ -1,20 +1,48 @@
-//! End-to-end: several nodes over real TCP on localhost reach consensus, apply a faucet mint
-//! submitted over RPC, and a late joiner syncs the chain.
+//! End-to-end: several nodes over real TCP on localhost reach consensus, apply shielded bundles
+//! and faucet mints submitted over RPC, and a late joiner syncs the chain.
 //!
-//! Traffic here is faucet mints rather than transfers: a redacted chain has no transfers to
-//! submit from a test, and a mint is the one transaction a node can build for itself (a bundle
-//! needs a wallet holding a spend key, which is phase S5's). What a mint exercises is the same
-//! plumbing the tests care about — a transaction gossips, commits, changes the commitment tree,
-//! and every node's state root agrees afterwards.
+//! Two kinds of traffic run here, and the split is deliberate. A *faucet mint* is the one
+//! transaction a node can build for itself, costs nothing to make, and still exercises the whole
+//! plumbing the structural tests care about — a transaction gossips, commits, changes the
+//! commitment tree, and every node's state root agrees afterwards. Those tests run on a fast
+//! chain (150 ms blocks) because no proof is involved. A *bundle* costs about a minute and a half
+//! of proving in the `test` FRI profile, so the tests that need one (a real transfer, a
+//! double-spend race, a deploy and a call) run on a chain whose blocks are slow enough that the
+//! 256-block anchor and time windows outlive the proof: at [`PROVING`] that is over two minutes
+//! against a proof of about one and a half.
+//!
+//! What the bundle tests assert is always a *wallet's* view, never a node's: the chain has no
+//! balances, so `balance(node, wallet)` scans a fresh note store against that node's RPC and
+//! trial-decrypts, exactly as `shrugg balance` does. A node that served the scan cannot answer
+//! the same question itself.
 
-use shrugg_core::genesis::{Genesis, GenesisValidator};
-use shrugg_core::notes::word8_to_hex;
-use shrugg_core::{Action, Hash, Keypair, Word8, UNITS_PER_SHRUGG};
+use shrugg_client::wallet::{self, NoteStore, Wallet};
 use shrugg_client::RpcClient;
+use shrugg_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
+use shrugg_core::notes::{word8_to_hex, ShieldedAddress};
+use shrugg_core::{gas, Action, Hash, Keypair, Word8, UNITS_PER_SHRUGG};
 use shrugg_node::node::{self, NodeConfig, NodeHandle};
 use shrugg_zkvm::executor::ZkExecutor;
-use shrugg_zkvm::notes::SpendKey;
+use shrugg_zkvm::machine::{Backend, FriProfile};
+use shrugg_zkvm::notes::{Note, SpendKey};
+use shrugg_zkvm::viewing::TxKey;
 use std::time::{Duration, Instant};
+
+const CHAIN_ID: u64 = 7;
+
+/// What one funded wallet holds at genesis.
+const ALLOC: u64 = 1_000 * UNITS_PER_SHRUGG;
+
+/// Block spacing for the structural tests: nothing in them proves anything, so the chain runs as
+/// fast as consensus will go.
+const FAST: Duration = Duration::from_millis(150);
+
+/// Block spacing for the tests that prove a bundle. `ANCHOR_WINDOW` and `TIME_WINDOW` are 256
+/// *blocks*, so a bundle has 256 blocks between reading its anchor and being committed under it;
+/// at 500 ms that is a little over two minutes, against a tier-14 proof of about a minute and a
+/// half in the `test` profile. A faster chain would expire the anchor mid-proof and the test
+/// would fail on the clock rather than on the property it is about.
+const PROVING: Duration = Duration::from_millis(500);
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -27,20 +55,50 @@ fn keys(n: u8) -> Vec<Keypair> {
     (1..=n).map(|i| Keypair::from_seed([i + 100; 32]).unwrap()).collect()
 }
 
-/// The shielded address every mint in this file pays. Its spend key is `SpendKey([1; 8])`, so a
-/// wallet in phase S5 could open these notes; nothing here needs to.
+/// Test wallet `i`, from the spend key `SpendKey([i; 8])`. Deterministic so a note minted or
+/// allocated to `wallet(i)` in one part of a test can be opened by `wallet(i)` in another.
+fn wallet(i: u32) -> Wallet {
+    Wallet::from_spend_key(SpendKey([i; 8]))
+}
+
+/// The shielded address a mint pays, as its `shrugg1…` text.
 fn payee(seed: u8) -> String {
-    shrugg_zkvm::address::address_of(&SpendKey([seed as u32; 8]).viewing_key()).to_string()
+    wallet(seed as u32).address.to_string()
+}
+
+/// What `wallet` can spend according to `node` — a fresh note store scanned against that node's
+/// RPC, which is the only way a balance exists at all on this chain.
+async fn balance(node: &TestNode, w: &Wallet) -> u64 {
+    let mut store = NoteStore::default();
+    wallet::scan(&node.rpc, w, &mut store).await.expect("scanning the tree");
+    store.balance()
+}
+
+/// One genesis deposit note, built exactly as `shrugg-node genesis` builds it (`main.rs`'s
+/// `deposit_note`/`seal_deposit`): a note owned by `to` with fresh commitment randomness, sealed
+/// to `to` under a throwaway sender key that is dropped here — a genesis has no identity to keep
+/// an outgoing-viewing record for.
+fn alloc_note(to: &ShieldedAddress, amount: u64) -> GenesisNote {
+    let note = Note::new(to.pk, [0; 8], amount, 0, 0);
+    let throwaway = SpendKey::random().viewing_key();
+    let envelope =
+        shrugg_zkvm::address::seal_note(&throwaway, to, &note, &TxKey::random()).expect("sealing a deposit note");
+    GenesisNote { cm: word8_to_hex(&note.commitment()), envelope: EnvelopeHex::from_envelope(&envelope), amount }
 }
 
 /// A chain with no deposit notes: every note in these tests is minted by a validator at runtime.
 /// `hc_bundle` must be this build's own guest, or `node::start` refuses to run at all.
 fn genesis(validators: &[Keypair]) -> Genesis {
+    genesis_funding(validators, &[])
+}
+
+/// The same chain with one [`ALLOC`] deposit note per wallet in `funded`.
+fn genesis_funding(validators: &[Keypair], funded: &[&Wallet]) -> Genesis {
     Genesis {
-        chain_id: 7,
+        chain_id: CHAIN_ID,
         timestamp_ms: 0,
         validators: validators.iter().map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 10 }).collect(),
-        alloc: vec![],
+        alloc: funded.iter().map(|w| alloc_note(&w.address, ALLOC)).collect(),
         faucet: true,
         confidential: true,
         fri_profile: "test".into(),
@@ -56,12 +114,32 @@ struct TestNode {
 }
 
 async fn start_node(key: &Keypair, gen: &Genesis, bootstrap: Vec<libp2p::Multiaddr>, validator: bool) -> TestNode {
+    start_node_at(key, gen, bootstrap, validator, FAST).await
+}
+
+async fn start_node_at(
+    key: &Keypair,
+    gen: &Genesis,
+    bootstrap: Vec<libp2p::Multiaddr>,
+    validator: bool,
+    block_interval: Duration,
+) -> TestNode {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("genesis.json"), gen.to_json()).unwrap();
-    start_in(dir, key, bootstrap, validator).await
+    start_in_at(dir, key, bootstrap, validator, block_interval).await
 }
 
 async fn start_in(dir: tempfile::TempDir, key: &Keypair, bootstrap: Vec<libp2p::Multiaddr>, validator: bool) -> TestNode {
+    start_in_at(dir, key, bootstrap, validator, FAST).await
+}
+
+async fn start_in_at(
+    dir: tempfile::TempDir,
+    key: &Keypair,
+    bootstrap: Vec<libp2p::Multiaddr>,
+    validator: bool,
+    block_interval: Duration,
+) -> TestNode {
     let handle = node::start(NodeConfig {
         datadir: dir.path().to_path_buf(),
         seed: *key.seed(),
@@ -70,9 +148,9 @@ async fn start_in(dir: tempfile::TempDir, key: &Keypair, bootstrap: Vec<libp2p::
         rpc_addr: "127.0.0.1:0".parse().unwrap(),
         enable_mdns: false,
         validator,
-        block_interval: Duration::from_millis(150),
-        base_timeout: Duration::from_millis(1500),
-        max_timeout: Duration::from_secs(6),
+        block_interval,
+        base_timeout: Duration::from_millis(1500).max(block_interval * 10),
+        max_timeout: Duration::from_secs(6).max(block_interval * 40),
         verify: shrugg_node::storage::VerifyMode::Full,
     })
     .await
@@ -392,18 +470,29 @@ async fn corrupted_rocksdb_is_detected_truncated_and_resynced() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn faucet_mints_reach_every_node_and_respect_the_cap() {
+async fn faucet_mint_via_rpc_reaches_every_node() {
     init_tracing();
-    let ks = keys(2);
-    let gen = genesis(&ks);
+    let ks = keys(3);
+    let gen = genesis(&ks[..2]);
     let a = start_node(&ks[0], &gen, vec![], true).await;
-    let b = start_node(&ks[1], &gen, vec![bootstrap_addr(&a)], true).await;
-    wait_height(&[&a, &b], 2, Duration::from_secs(40)).await;
+    let boot = vec![bootstrap_addr(&a)];
+    let b = start_node(&ks[1], &gen, boot.clone(), true).await;
+    let obs = start_node(&ks[2], &gen, boot, false).await;
+    wait_height(&[&a, &b, &obs], 2, Duration::from_secs(40)).await;
     assert_eq!(a.handle.storage.notes_count().unwrap(), 0, "an alloc-free genesis starts empty");
 
-    let (h1, cm1) = b.mint(1, 100 * UNITS_PER_SHRUGG).await;
+    // A validator mints the faucet's full 100 SHRUGG to C.
+    let c = wallet(3);
+    let (h1, cm1) = b.mint(3, 100 * UNITS_PER_SHRUGG).await;
     wait_for("mint visible on A", Duration::from_secs(30), || a.handle.storage.tx_location(&h1).unwrap().is_some()).await;
     assert!(a.holds(&cm1) && b.holds(&cm1));
+    // Every node — the observer included — serves the leaf C's viewing key opens, and none of
+    // them can say whose it is.
+    wait_for("the observer has the note", Duration::from_secs(30), || obs.holds(&cm1)).await;
+    for n in [&a, &b, &obs] {
+        assert_eq!(balance(n, &c).await, 100 * UNITS_PER_SHRUGG, "C's balance");
+        assert_eq!(balance(n, &wallet(4)).await, 0, "a wallet that was never paid sees nothing");
+    }
 
     // A second mint right away: nothing serialises two mints from one node any more, since
     // there is no nonce to advance — the notes simply differ.
@@ -412,10 +501,13 @@ async fn faucet_mints_reach_every_node_and_respect_the_cap() {
     wait_for("both notes on A", Duration::from_secs(30), || a.holds(&cm1) && a.holds(&cm2)).await;
     assert_eq!(a.handle.storage.notes_count().unwrap(), 2);
 
+    // An observer holds no validator key, so it cannot serve the faucet itself.
+    let err = obs.rpc.mint_shielded(&payee(3), Some(1)).await.unwrap_err().to_string();
+    assert!(err.contains("validators"), "{err}");
     // Over the cap is rejected, and so is an address that is not a shielded address.
     assert!(b.rpc.mint_shielded(&payee(3), Some(101 * UNITS_PER_SHRUGG)).await.is_err());
     assert!(b.rpc.mint_shielded("not-an-address", Some(1)).await.is_err());
-    assert_chains_equal(&[&a, &b]);
+    assert_chains_equal(&[&a, &b, &obs]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -463,4 +555,211 @@ async fn a_build_whose_bundle_guest_differs_from_genesis_refuses_to_start() {
     assert!(err.contains("bundle guest"), "{err}");
     assert!(err.contains(&word8_to_hex(&ZkExecutor::hc_bundle())), "{err}");
     assert!(err.contains(&word8_to_hex(&[0xdead; 8])), "{err}");
+}
+
+// ---------------------------------------------------------------- shielded bundles
+//
+// Everything below proves a real 2-in-2-out bundle, so these tests are minutes rather than
+// seconds and run on a `PROVING`-paced chain (see the constant). They are also the only tests
+// here that look at value at all: a mint proves that a note arrived, a bundle proves that value
+// moved from one wallet to another without the chain ever learning either.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_validators_commit_and_shielded_transfer() {
+    init_tracing();
+    let started = Instant::now();
+    let ks = keys(2);
+    let (a, b) = (wallet(1), wallet(2));
+    let gen = genesis_funding(&ks, &[&a]);
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
+    let n1 = start_node_at(&ks[1], &gen, vec![bootstrap_addr(&n0)], true, PROVING).await;
+    wait_height(&[&n0, &n1], 2, Duration::from_secs(60)).await;
+
+    // The genesis deposit note is on both nodes, and only A's viewing key opens it.
+    for n in [&n0, &n1] {
+        assert_eq!(balance(n, &a).await, ALLOC, "A's genesis note");
+        assert_eq!(balance(n, &b).await, 0, "B has nothing yet");
+    }
+
+    let fee = gas::BUNDLE_BASE;
+    let pay = UNITS_PER_SHRUGG;
+    let mut store = NoteStore::default();
+    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the bundle is accepted and commits");
+    eprintln!("transfer: tier {}, proved in {:.1?}, {} proof bytes", sent.tier, sent.proving, sent.proof_bytes);
+
+    // Both validators carry the same transaction, and both answer the same two balances.
+    wait_for("the transfer reaches n1", Duration::from_secs(60), || {
+        n1.handle.storage.tx_location(&sent.hash).unwrap().is_some()
+    })
+    .await;
+    for n in [&n0, &n1] {
+        assert_eq!(balance(n, &b).await, pay, "B was paid 1 SHRUGG");
+        assert_eq!(balance(n, &a).await, ALLOC - pay - fee, "A keeps 999 SHRUGG less the fee");
+    }
+    // The fee left the pool and landed in the proposer's public register entry.
+    let rewards: u64 = gen
+        .validators
+        .iter()
+        .map(|v| n0.handle.storage.validator(&v.public_key.address()).unwrap().map(|e| e.rewards).unwrap_or(0))
+        .sum();
+    assert_eq!(rewards, fee, "the bundle fee is the only reward paid so far");
+
+    // A replay of the very bytes that committed: the nullifiers are in the set now, so the
+    // node refuses it before any proof is re-verified.
+    let (height, index) = n0.handle.storage.tx_location(&sent.hash).unwrap().unwrap();
+    let tx = n0.handle.storage.block_by_height(height).unwrap().unwrap().transactions[index as usize].clone();
+    let err = n0.rpc.send_transaction(&tx).await.unwrap_err().to_string();
+    assert!(err.contains("spent"), "a replayed bundle must be refused as spent: {err}");
+
+    assert_chains_equal(&[&n0, &n1]);
+    eprintln!("two_validators_commit_and_shielded_transfer in {:.1?}", started.elapsed());
+}
+
+/// Two bundles spending the same note, proved in parallel and submitted to two different
+/// validators. Whichever reaches a block first spends the note; the other can never be admitted
+/// again — it is refused at the RPC if the nullifier is already committed, or dropped from the
+/// mempool by `prune` if it was accepted before the race resolved. Either way the chain must end
+/// with exactly one of them and every node must agree on the result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_bundles_spending_one_note_only_one_commits() {
+    init_tracing();
+    let started = Instant::now();
+    let ks = keys(2);
+    let (a, b) = (wallet(5), wallet(6));
+    let gen = genesis_funding(&ks, &[&a]);
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
+    let n1 = start_node_at(&ks[1], &gen, vec![bootstrap_addr(&n0)], true, PROVING).await;
+    wait_height(&[&n0, &n1], 2, Duration::from_secs(60)).await;
+    assert_eq!(balance(&n0, &a).await, ALLOC);
+
+    let fee = gas::BUNDLE_BASE;
+    // Different amounts, so the two bundles differ in every public field except the nullifier
+    // they collide on — and `--no-wait`, so each returns as soon as its node has answered.
+    let race = |rpc: RpcClient, pay: u64| {
+        tokio::spawn(async move {
+            let (a, b) = (wallet(5), wallet(6));
+            let mut store = NoteStore::default();
+            let out =
+                wallet::send(&rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, false)
+                    .await;
+            out.map(|s| (s.hash, s.amount))
+        })
+    };
+    let one = race(n0.rpc.clone(), UNITS_PER_SHRUGG);
+    let two = race(n1.rpc.clone(), 2 * UNITS_PER_SHRUGG);
+    let (one, two) = tokio::join!(one, two);
+
+    let mut accepted: Vec<(Hash, u64)> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    for r in [one.expect("the prover task did not panic"), two.expect("the prover task did not panic")] {
+        match r {
+            Ok(pair) => accepted.push(pair),
+            Err(e) => refused.push(e.to_string()),
+        }
+    }
+    assert!(!accepted.is_empty(), "both bundles were refused outright: {refused:?}");
+    eprintln!("accepted {} bundle(s), refused {refused:?}", accepted.len());
+
+    // One of the accepted hashes commits; give the chain a few blocks past it so a loser that was
+    // admitted has been pruned rather than merely not-yet-proposed.
+    let hashes: Vec<Hash> = accepted.iter().map(|(h, _)| *h).collect();
+    let committed_on = |n: &TestNode| -> Vec<Hash> {
+        hashes.iter().copied().filter(|h| n.handle.storage.tx_location(h).unwrap().is_some()).collect()
+    };
+    wait_for("one of the two bundles commits", Duration::from_secs(90), || !committed_on(&n0).is_empty()).await;
+    let h = n0.height();
+    wait_height(&[&n0, &n1], h + 6, Duration::from_secs(90)).await;
+
+    let winners = committed_on(&n0);
+    assert_eq!(winners.len(), 1, "exactly one of two bundles spending the same note may commit");
+    assert_eq!(committed_on(&n1), winners, "the two validators disagree about which one won");
+
+    // The winner's amount is what B holds, and A's note paid for it exactly once.
+    let paid = accepted.iter().find(|(h, _)| *h == winners[0]).map(|(_, amount)| *amount).unwrap();
+    for n in [&n0, &n1] {
+        assert_eq!(balance(n, &b).await, paid, "B holds the winning bundle's payment, and only that");
+        assert_eq!(balance(n, &a).await, ALLOC - paid - fee);
+    }
+    assert_chains_equal(&[&n0, &n1]);
+    eprintln!("two_bundles_spending_one_note_only_one_commits in {:.1?}", started.elapsed());
+}
+
+/// Deploy and call, both paid for by a bundle rather than by an account. The deploy and the call
+/// are ordinary shielded transactions whose `Action` happens to carry a program: the wallet pays
+/// each one's fee floor out of its notes, and the only thing the chain learns is that *some*
+/// note paid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn confidential_call_rides_on_a_bundle() {
+    init_tracing();
+    let started = Instant::now();
+    let ks = keys(2);
+    let a = wallet(7);
+    let gen = genesis_funding(&ks, &[&a]);
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
+    let n1 = start_node_at(&ks[1], &gen, vec![bootstrap_addr(&n0)], true, PROVING).await;
+    wait_height(&[&n0, &n1], 2, Duration::from_secs(60)).await;
+
+    let program = shrugg_zkvm::guests::private_payment(1_000);
+    let id = shrugg_core::program::program_id(program.base_pc, &program.words);
+    let mut store = NoteStore::default();
+
+    // ---- deploy, paid by a bundle ----
+    let action = Action::Deploy { base_pc: program.base_pc, words: program.words.clone() };
+    let deploy_fee = wallet::deploy_fee_default(&action);
+    assert_eq!(deploy_fee, gas::BUNDLE_BASE + gas::deploy_fee(program.words.len()));
+    let deployed =
+        wallet::submit(&n0.rpc, &a, &mut store, None, action, deploy_fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+            .await
+            .expect("the deploy bundle commits");
+    eprintln!("deploy: {} words, fee {deploy_fee}, proved in {:.1?}", program.words.len(), deployed.proving);
+    assert_eq!(deployed.amount, 0, "a deploy pays nobody; it is a self-transfer of zero");
+    for n in [&n0, &n1] {
+        wait_for("the program reaches every node", Duration::from_secs(60), || {
+            n.handle.storage.program(&id).unwrap().is_some()
+        })
+        .await;
+    }
+
+    // ---- call, proved locally, paid by a second bundle ----
+    let (proof, outputs, tier) =
+        shrugg_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], None, Backend::Cpu)
+            .expect("the call proves");
+    eprintln!("call: tier {tier}, {} proof bytes, outputs {outputs:?}", proof.len());
+    let call_fee = wallet::call_fee_default(tier);
+    let called = wallet::submit(
+        &n0.rpc,
+        &a,
+        &mut store,
+        None,
+        Action::Call { program: id, proof },
+        call_fee,
+        FriProfile::Test,
+        Backend::Cpu,
+        CHAIN_ID,
+        true,
+    )
+    .await
+    .expect("the call bundle commits");
+    eprintln!("call bundle: fee {call_fee}, proved in {:.1?}", called.proving);
+
+    // The receipt is on every node, with the outputs the prover published.
+    for n in [&n0, &n1] {
+        wait_for("the receipt reaches every node", Duration::from_secs(60), || {
+            n.handle.storage.receipt(&called.hash).unwrap().is_some()
+        })
+        .await;
+        let r = n.handle.storage.receipt(&called.hash).unwrap().unwrap();
+        assert_eq!(r.program, id);
+        assert_eq!(r.tier, tier);
+        assert_eq!(r.outputs, outputs);
+    }
+
+    // A paid the two fee floors and not one unit more: the deploy and the call moved no value.
+    for n in [&n0, &n1] {
+        assert_eq!(balance(n, &a).await, ALLOC - deploy_fee - call_fee, "A paid exactly the two floors");
+    }
+    assert_chains_equal(&[&n0, &n1]);
+    eprintln!("confidential_call_rides_on_a_bundle in {:.1?}", started.elapsed());
 }
