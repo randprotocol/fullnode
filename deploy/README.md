@@ -19,17 +19,23 @@ by this cut. The next fork (S2 staking + constraint set 5) is a new chain id aga
 | A | validator | laptop, LAN 192.168.100.123 (NAT) | 2nRdFChBXRmKoe2sQE3ZYDzvdg53QmBZJJ9iweY7hk1v | 12D3KooWRbvv6T8iQz1jT5ijvPoo6CEGy3yRdiuxkUMJGUkTNq6P |
 | B | validator | 192.168.100.79 (NAT) | ByDkxsEfDCR5DrmDufKftvcRsgvufypnZ4SgDQzJAQ7Z | 12D3KooWMUjpbd6U7c6KTjVXy3121aV6JLka47dh4ZPwGjyMV8Bf |
 | C | validator | DigitalOcean fra1 164.90.239.200 (moved from sgp1 2026-09-12) | F6rYLexPhyMmwPNqbEmyyp5FiTmtQqDgZyqScUqYY4F6 | 12D3KooWBKYD5bBRczEhzYQrN4jgfgaoGXb6PzbfdjtTjiy1SA5g |
-| D | validator | DigitalOcean sgp1 178.128.91.236 | 5tMgLSzXL8keU1vg2wtGEXRJkmfBK6GzhjNjxrCFgCaj | 12D3KooWPrdUXsVXsD3RqaV4otq35awpJgMonSfdu3u8gtq5iUYq |
+| D | validator | DigitalOcean ric1 165.245.173.74 (moved from sgp1 2026-09-13) | 5tMgLSzXL8keU1vg2wtGEXRJkmfBK6GzhjNjxrCFgCaj | 12D3KooWPrdUXsVXsD3RqaV4otq35awpJgMonSfdu3u8gtq5iUYq |
 | E | observer | DigitalOcean sgp1 188.166.235.187 (explorer) | CxeG7vJaxUoKBZZe8U8LGXohH2FvcCbE47AufK6Mp2jf | 12D3KooWR1nihpYk6vvdRYuq2WMGUtzDiwygytTXZJszdSnaVmDM |
-| F | observer | DigitalOcean nyc3 138.197.19.86 (moved from sgp1 2026-09-12) | DcuuZrzDSJedhFnynLFchNfYmW4UKiZT2nEKbcs2ojmJ | 12D3KooWJwsFwi9CawJrPyA7ZBT5Q6mYWmctNvLRt3SuS7SdyU6j |
+| F | observer | DigitalOcean nyc3 159.89.185.254 (moved from sgp1 2026-09-12, recreated 2026-09-13) | DcuuZrzDSJedhFnynLFchNfYmW4UKiZT2nEKbcs2ojmJ | 12D3KooWJwsFwi9CawJrPyA7ZBT5Q6mYWmctNvLRt3SuS7SdyU6j |
 | lon1 | observer | DigitalOcean lon1 139.59.160.76 | 8UcsaXDSSWcC6fT3CWT89fgUvG4ubaYd61FUQHKiUDLv | 12D3KooWJFWHiHNHnBPhjVctvLQFZQo7ecfkqbVpjuArysC88ETc |
 | sfo3 | observer | DigitalOcean sfo3 24.144.89.22 | 9rex7stS6d9QxaAh5nghjaUEratKJFUAmLAoxRFmP7LM | 12D3KooWQuPiWbAy4Pk6v4phQQauKc3iUAAFyuRnG5ahZVgLSMvQ |
 | tor1 | observer | DigitalOcean tor1 146.190.243.29 | CRW3fQsuFa7YSdU5ZDrRMxQjJ4ET9kzf6hg1D8CAhoWH | 12D3KooW9qxfAEdazt4yRB2pzWbmhFPTafy1ojJ1cdJArgHrp8Z5 |
 | blr1 | observer | DigitalOcean blr1 167.71.235.108 | ASzbnFwqVnwsrN81iytkuhNbs8f93Q3h4rQjXPDUNMjU | 12D3KooWHBtRvSeR3c4FkkQRtEJ6huEeFhG9Uj46NGs8N29ZaCsP |
 | syd1 | observer | DigitalOcean syd1 170.64.226.65 | 8cHAjP3wgGDv55Ym2qZrYyu2Mvc7b86jsrN6vWcwZoJV | 12D3KooWFmqkbLxNQb1wiTHzvRj8Xh5PkVDzPXJGzQrVZJBTv9Ms |
 | atl1 | observer | DigitalOcean atl1 165.245.142.90 | BV2BfMZJo2Lpo3pR7RfAjytnFxmMhzCWxoUHhXhjT2qL | 12D3KooWSDCzHY7aTDyJxBMEGex4G4tWhfwt5ijFzCzsHP11npDw |
+| ams3 | observer | DigitalOcean ams3 146.190.233.230 | (key deploy/node-ams3.key.json) | 12D3KooWBPLkPCm4z2isNUsRn1V4fodowBzUo1trkrSxwXrJuzko |
+| nyc1 | observer | DigitalOcean nyc1 192.81.214.91 | (key deploy/node-nyc1.key.json) | 12D3KooWB2jtCpQHGvhSimNxDUs9KBMCBG52WXiR3t6KNdyKAwAY |
+| nyc2 | observer | DigitalOcean nyc2 107.170.49.234 | (key deploy/node-nyc2.key.json) | 12D3KooWNL5ijaNaTG34kM3Vea65GtsRLCc5hhbCQPzr4mfM9nYd |
+| sfo2 | observer | DigitalOcean sfo2 143.110.135.126 | (key deploy/node-sfo2.key.json) | 12D3KooWLMEphDDvr4cpwbCN3BwhmrwPa51X8fF7Cb4DATfWDL5a |
+| mkc1 | observer | DigitalOcean mkc1 201.79.35.212 | (key deploy/node-mkc1.key.json) | 12D3KooWPwa3kgGGpd7VZh37yWzkBM5zY8rnqPU3AKARC7723jeG |
+| mem1 | observer | DigitalOcean mem1 168.144.61.10 | (key deploy/node-mem1.key.json) | 12D3KooWP8oaGnfZDA4aonemFVvj6AjRihLasj2jW3ss7FpSWQpp |
 
-D and E (sgp1) and C (fra1) have public IPs and act as bootstrap nodes; the regional observers were provisioned with `deploy/provision-observer.sh` (a small droplet, prebuilt binaries, no compiler) and dial D and E; A and B are behind NAT and dial out to C and D
+E (sgp1), C (fra1) and D (ric1) have public IPs and act as bootstrap nodes; as of 2026-09-13 every open DigitalOcean region runs one node (16 droplets); the regional observers were provisioned with `deploy/provision-observer.sh` (a small droplet, prebuilt binaries, no compiler) and dial D and E; A and B are behind NAT and dial out to C and D
 (`deploy/run-a.sh`, `deploy/run-b.sh`). Full multiaddrs are in `deploy/nodes.env`.
 
 Droplets: `deploy/push-to-vps.sh <ip> <letter> "<bootstrap multiaddrs>" [validator|observer]` provisions from scratch;
