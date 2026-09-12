@@ -14,8 +14,9 @@
 use crate::RpcClient;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use shrugg_core::notes::{word8_from_hex, word8_to_hex, Bundle, ShieldedAddress, Word8, DEPTH};
-use shrugg_core::{Action, Hash, Transaction};
+use shrugg_core::ledger::TIME_WINDOW;
+use shrugg_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, DEPTH};
+use shrugg_core::{gas, Action, Hash, Transaction};
 use shrugg_zkvm::address::{address_of, envelope_from_core, seal_note};
 use shrugg_zkvm::executor::prove_bundle;
 use shrugg_zkvm::machine::{Backend, FriProfile};
@@ -153,6 +154,13 @@ pub struct OwnedNote {
     #[serde(with = "hex_word8")]
     pub nf: Word8,
     pub spent: bool,
+    /// Set by a `--no-wait` submission to the `time` of the bundle that spends this note: the
+    /// note is not spendable, but the chain has not confirmed the spend either. A later [`scan`]
+    /// clears it once the chain answers — the nullifier appeared (`spent`), or the head has
+    /// passed `time + TIME_WINDOW`, past which that bundle can never be admitted at all
+    /// (`Ledger::validate_inner`'s time check) so the note is spendable again.
+    #[serde(default)]
+    pub pending: Option<u32>,
     pub height: u64,
 }
 
@@ -194,9 +202,18 @@ impl NoteStore {
         }
     }
 
+    /// Write the store owner-only, through a temporary file. The store holds every note
+    /// plaintext, nullifier and leaf index this wallet knows — a world-readable copy of it
+    /// discloses the wallet's whole history to anyone on the machine, which is exactly what the
+    /// envelope layer exists to prevent. The rename makes the replacement atomic, so a crash
+    /// halfway through leaves the previous store intact instead of a truncated one.
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = serde_json::to_string_pretty(self)? + "\n";
-        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        write_private(&tmp, text.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
     }
 
     /// Spendable value. A zero-value note is a real note (a bundle whose change is zero still
@@ -206,11 +223,74 @@ impl NoteStore {
     }
 
     pub fn spendable(&self) -> Vec<&OwnedNote> {
-        self.notes.iter().filter(|n| !n.spent && n.note.amount > 0).collect()
+        self.notes.iter().filter(|n| !n.spent && n.pending.is_none() && n.note.amount > 0).collect()
+    }
+}
+
+/// Create (or replace) `path` with mode 0600 from the start: writing first and chmodding
+/// afterwards leaves the contents world-readable for a window.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        f.write_all(bytes)?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
+        Ok(())
     }
 }
 
 // ---------------------------------------------------------------- scanning
+
+/// What one leaf turned out to be for this wallet.
+///
+/// The distinction the `Skipped` arm exists for: an envelope opening is *not* proof of
+/// ownership. `Envelope::open_as_receiver` checks only that the note it decrypts commits to the
+/// leaf it was published with, and anyone can seal an envelope to a published `kem_ek` — a
+/// shielded address is public by design. So a stranger can hand this wallet a perfectly valid
+/// envelope carrying a note owned by some *other* `pk`, or denominated in an asset this pool
+/// does not support. Recording it would put value in `balance()` that no proof can ever spend:
+/// the guest forces every input's owner to the derived `pk_self`, so selecting such a note
+/// yields a bundle whose digest cannot match, and the wallet would refuse its own proof after
+/// a minute and a half of work with a message blaming itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found {
+    /// A note this wallet owns and can spend.
+    Received(Note),
+    /// A note this wallet created for someone else — history only.
+    Sent(Note),
+    /// Not this wallet's, with the reason for the log.
+    Skipped(&'static str),
+}
+
+/// Decide what a single leaf is for `w`, with no I/O — the whole of [`scan`]'s per-row logic.
+pub fn classify(w: &Wallet, cm: Word8, envelope: &Envelope) -> Found {
+    let env = envelope_from_core(envelope);
+    let mut why = "no key of this wallet opens it";
+    if let Some((_, note)) = env.open_as_receiver(cm, &w.vk) {
+        if note.pk != w.vk.pk() {
+            why = "sealed to this wallet but owned by another key";
+        } else if note.asset != 0 {
+            why = "sealed to this wallet but carries a non-native asset";
+        } else {
+            return Found::Received(note);
+        }
+    }
+    // Still worth the sender path: an envelope this wallet sealed for someone else is opened
+    // through `ovk`, not through the KEM, so the two openings are independent.
+    if let Some((_, note)) = env.open_as_sender(cm, &w.vk) {
+        if note.asset == 0 {
+            return Found::Sent(note);
+        }
+        why = "sent by this wallet but carries a non-native asset";
+    }
+    Found::Skipped(why)
+}
 
 /// Trial-decrypt every commitment this wallet has not seen yet, then mark as spent every note
 /// whose nullifier the chain has published. Advances the store and saves nothing — the caller
@@ -221,26 +301,42 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
         if rows.is_empty() {
             break;
         }
+        let before = store.scanned_index;
         for row in &rows {
-            let env = envelope_from_core(&row.envelope);
-            if let Some((_, note)) = env.open_as_receiver(row.cm, &w.vk) {
-                // A note can be re-offered by a rescan; index is the leaf, so it is unique.
-                if !store.notes.iter().any(|n| n.index == row.index) {
-                    store.notes.push(OwnedNote {
-                        index: row.index,
-                        cm: row.cm,
-                        nf: w.vk.nullifier(&row.cm),
-                        note,
-                        spent: false,
-                        height: row.height,
-                    });
+            match classify(w, row.cm, &row.envelope) {
+                // A note can be re-offered by a rescan; the index is the leaf, so it is unique.
+                Found::Received(note) => {
+                    if !store.notes.iter().any(|n| n.index == row.index) {
+                        store.notes.push(OwnedNote {
+                            index: row.index,
+                            cm: row.cm,
+                            nf: w.vk.nullifier(&row.cm),
+                            note,
+                            spent: false,
+                            pending: None,
+                            height: row.height,
+                        });
+                    }
                 }
-            } else if let Some((_, note)) = env.open_as_sender(row.cm, &w.vk) {
-                if !store.sent.iter().any(|s| s.index == row.index) {
-                    store.sent.push(SentRow { index: row.index, to_pk: note.pk, amount: note.amount, height: row.height });
+                Found::Sent(note) => {
+                    if !store.sent.iter().any(|s| s.index == row.index) {
+                        store.sent.push(SentRow { index: row.index, to_pk: note.pk, amount: note.amount, height: row.height });
+                    }
+                }
+                Found::Skipped(why) => {
+                    if why != "no key of this wallet opens it" {
+                        eprintln!("warning: ignoring leaf {}: {why}", row.index);
+                    }
                 }
             }
             store.scanned_index = store.scanned_index.max(row.index + 1);
+        }
+        // A non-empty page that leaves the cursor where it was would loop forever.
+        if store.scanned_index <= before {
+            return Err(anyhow!(
+                "getCommitments returned {} rows from index {before} without advancing past it",
+                rows.len()
+            ));
         }
     }
 
@@ -260,9 +356,27 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
             from = max_height + 1;
             break;
         }
-        from = if max_height > from { max_height } else { max_height + 1 };
+        // A full page that got no further than the height it started at means this block alone
+        // has more nullifiers than a page holds. Advancing would silently skip the rest of it
+        // and leave spent notes looking spendable, so say so instead.
+        if max_height == from {
+            return Err(anyhow!("block {from} published more than {PAGE} nullifiers; raise the page size"));
+        }
+        from = max_height;
     }
     store.scanned_height = store.scanned_height.max(from);
+
+    // Resolve anything a `--no-wait` submission left pending, now that the chain has answered.
+    if store.notes.iter().any(|n| n.pending.is_some()) {
+        let (head, _) = rpc.anchor(None).await?;
+        for n in store.notes.iter_mut() {
+            if let Some(time) = n.pending {
+                if n.spent || head > time as u64 + TIME_WINDOW {
+                    n.pending = None;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -444,15 +558,30 @@ pub async fn submit(
         rpc.wait_for_transaction(&hash, COMMIT_TIMEOUT).await?;
         scan(rpc, w, store).await?;
     } else {
-        // Nothing will confirm these for the caller, so the wallet has to assume they landed;
-        // the next scan replaces the assumption with the chain's answer either way.
+        // Nothing will confirm these for the caller, so they are held back rather than declared
+        // spent: `pending` keeps them out of coin selection without the one-way write that
+        // stranded them when a bundle failed to commit. The next `scan` decides which it was.
         for n in store.notes.iter_mut() {
             if chosen.iter().any(|c| c.index == n.index) {
-                n.spent = true;
+                n.pending = Some(time);
             }
         }
     }
     Ok(Submission { hash, amount, change, fee, time, tier, proof_bytes: tx.bundle.map_or(0, |b| b.proof.len()), proving })
+}
+
+/// What a `deploy` pays by default: the bundle base plus the program's per-word charge, which
+/// is exactly `gas::fee_floor` for a `Deploy`.
+pub fn deploy_fee_default(action: &Action) -> u64 {
+    gas::fee_floor(action)
+}
+
+/// What a `call` pays by default — and deliberately NOT `fee_floor(Call) + call_fee(tier)`.
+/// `fee_floor(Call)` is `BUNDLE_BASE + CALL_BASE`, and `CALL_BASE` is already `call_fee`'s own
+/// constant term, so adding the two overpays by `CALL_BASE`. The node's floor, once it has
+/// decoded the proof and knows the tier, is precisely this (`Ledger::validate_inner`).
+pub fn call_fee_default(tier: u8) -> u64 {
+    gas::BUNDLE_BASE + gas::call_fee(tier)
 }
 
 /// A plain shielded transfer: `submit` with `Action::None`.
@@ -475,10 +604,11 @@ pub async fn send(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shrugg_zkvm::notes::SpendKey;
 
     fn owned(index: u64, amount: u64, spent: bool) -> OwnedNote {
         let note = Note::new([1; 8], [2; 8], amount, 0, 3);
-        OwnedNote { index, cm: note.commitment(), nf: [index as u32; 8], note, spent, height: index }
+        OwnedNote { index, cm: note.commitment(), nf: [index as u32; 8], note, spent, pending: None, height: index }
     }
 
     #[test]
@@ -543,6 +673,72 @@ mod tests {
         assert_eq!(amounts(11).unwrap_err(), SelectError::Insufficient { have: 10 });
     }
 
+    /// Seal `note` to `to`, as whichever party `from` is — the wire an attacker has too, since
+    /// a shielded address publishes the encapsulation key envelopes are sealed to.
+    fn sealed(from: &Wallet, to: &Wallet, note: &Note) -> shrugg_core::notes::Envelope {
+        shrugg_zkvm::address::seal_note(&from.vk, &to.address, note, &TxKey::random()).unwrap()
+    }
+
+    #[test]
+    fn scan_only_records_notes_this_wallet_actually_owns() {
+        let me = Wallet::from_spend_key(SpendKey([11; 8]));
+        let stranger = Wallet::from_spend_key(SpendKey([12; 8]));
+
+        // The genuine case: a note owned by me, sealed to me.
+        let mine = Note::new(me.vk.pk(), stranger.vk.pk(), 5, 0, 1);
+        assert_eq!(classify(&me, mine.commitment(), &sealed(&stranger, &me, &mine)), Found::Received(mine));
+
+        // Sealed to my encapsulation key, which anyone can do, but owned by someone else. The
+        // envelope opens and the commitment matches; the note is still not mine, and counting it
+        // would put unspendable value in `balance()`.
+        let theirs = Note::new(stranger.vk.pk(), stranger.vk.pk(), 1_000, 0, 1);
+        let Found::Skipped(why) = classify(&me, theirs.commitment(), &sealed(&stranger, &me, &theirs)) else {
+            panic!("a note owned by another key must not be recorded");
+        };
+        assert!(why.contains("owned by another key"), "{why}");
+
+        // Same, with a non-native asset: this pool admits asset 0 only, so such a note could
+        // never be an input either.
+        let other_asset = Note::new(me.vk.pk(), stranger.vk.pk(), 7, 1, 1);
+        let Found::Skipped(why) = classify(&me, other_asset.commitment(), &sealed(&stranger, &me, &other_asset)) else {
+            panic!("a non-native asset must not be recorded");
+        };
+        assert!(why.contains("non-native asset"), "{why}");
+
+        // A note I created for someone else is history, reached through `ovk`, not the KEM.
+        let paid = Note::new(stranger.vk.pk(), me.vk.pk(), 3, 0, 1);
+        assert_eq!(classify(&me, paid.commitment(), &sealed(&me, &stranger, &paid)), Found::Sent(paid));
+
+        // Someone else's transaction between two strangers opens with no key of mine.
+        let elsewhere = Note::new(stranger.vk.pk(), stranger.vk.pk(), 9, 0, 1);
+        assert!(matches!(classify(&me, elsewhere.commitment(), &sealed(&stranger, &stranger, &elsewhere)), Found::Skipped(_)));
+    }
+
+    #[test]
+    fn the_fee_defaults_are_the_schedule_floors_and_no_more() {
+        let deploy = Action::Deploy { base_pc: 0, words: vec![0x13; 40] };
+        assert_eq!(deploy_fee_default(&deploy), gas::fee_floor(&deploy));
+        assert_eq!(deploy_fee_default(&deploy), gas::BUNDLE_BASE + gas::deploy_fee(40));
+        for tier in [10u8, 12, 14, 20] {
+            assert_eq!(call_fee_default(tier), gas::BUNDLE_BASE + gas::call_fee(tier));
+            // The floor `Ledger::validate_inner` applies, not a cent over it: adding
+            // `fee_floor(Call)` to `call_fee` would double-count `CALL_BASE`.
+            let doubled = gas::fee_floor(&Action::Call { program: shrugg_core::Hash::ZERO, proof: vec![] }) + gas::call_fee(tier);
+            assert_eq!(doubled - call_fee_default(tier), gas::CALL_BASE, "tier {tier}");
+        }
+    }
+
+    #[test]
+    fn a_pending_note_is_held_back_but_not_spent() {
+        let mut store = NoteStore { notes: vec![owned(0, 5, false), owned(1, 3, false)], ..NoteStore::default() };
+        store.notes[1].pending = Some(9);
+        assert_eq!(store.balance(), 5, "a pending note buys nothing while the chain has not answered");
+        assert_eq!(store.spendable().len(), 1);
+        // ...and unlike `spent`, it is not a one-way write: clearing it restores the note.
+        store.notes[1].pending = None;
+        assert_eq!(store.balance(), 8);
+    }
+
     #[test]
     fn the_note_store_roundtrips_through_its_json_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -557,6 +753,15 @@ mod tests {
             notes: vec![owned(0, 5, false), owned(1, 3, true)],
             sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2 }],
         };
+        store.save(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The store holds every note plaintext this wallet knows; it is as private as the key.
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert!(!path.with_extension("json.tmp").exists(), "the temp file is renamed away");
+        }
+        // Saving over an existing store replaces it (and keeps the mode).
         store.save(&path).unwrap();
         let back = NoteStore::load(&path);
         assert_eq!(back.scanned_index, 9);

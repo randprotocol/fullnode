@@ -296,7 +296,7 @@ async fn main() -> Result<()> {
             let p = load_program(&file)?;
             let id = shrugg_core::program::program_id(p.base_pc, &p.words);
             let action = Action::Deploy { base_pc: p.base_pc, words: p.words.clone() };
-            let fee = gas::fee_floor(&action);
+            let fee = wallet::deploy_fee_default(&action);
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
             let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, profile, backend_for(cuda)?, chain_id, true).await;
@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
             let action = Action::Call { program: pid, proof };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action) + gas::call_fee(tier),
+                None => wallet::call_fee_default(tier),
             };
             let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, profile, backend, chain_id, true).await;
             store.save(&path)?;
