@@ -70,7 +70,7 @@ pub enum StorageError {
     Corrupt(String),
 }
 
-type Result<T> = std::result::Result<T, StorageError>;
+pub type Result<T> = std::result::Result<T, StorageError>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Head {
@@ -1227,6 +1227,65 @@ mod tests {
         assert!(matches!(s.commit(&[bad], &ledger), Err(StorageError::Corrupt(_))));
         s.commit(&[b1, b2], &ledger).unwrap();
         assert_eq!(s.head().unwrap().height, 2);
+    }
+
+    /// Two blocks in one `commit`, against the ledger that describes both.
+    ///
+    /// This is the shape `Node::handle_actions` produces when a replica resolves a run of
+    /// orphans and commits in one step, and the shape that was silently writing the wrong
+    /// snapshot before: `hs.committed_ledger()` is the state after the *last* block of the
+    /// batch, so every per-height thing the batch writes — anchors above all — has to be taken
+    /// from the right place rather than from that final ledger's tip.
+    #[test]
+    fn a_two_block_commit_records_each_height_from_the_right_state() {
+        let (_d, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        let k = key(1);
+        let mut ledger = gs.ledger.clone();
+
+        // Block 1: a bundle (2 commitments, 2 nullifiers). Block 2: a mint (1 commitment).
+        ledger.set_height(1);
+        let tx1 = bundle_tx(&ledger, [[41; 8], [42; 8]], [[43; 8], [44; 8]], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx1], &k);
+        let root_at_1 = ledger.root();
+        let tx2 = mint_tx(gs.chain_id, [45; 8], 7, &k);
+        let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &k);
+        let root_at_2 = ledger.root();
+        assert_ne!(root_at_1, root_at_2, "each block moved the tree");
+
+        // One commit, both blocks, the ledger after block 2 — exactly what the node does.
+        s.commit(&[b1.clone(), b2.clone()], &ledger).unwrap();
+        assert_eq!(s.head().unwrap().height, 2);
+
+        // Each height's anchor is that height's own end-of-block root, not the batch's last.
+        assert_eq!(s.anchor(0).unwrap(), Some(gs.ledger.root()));
+        assert_eq!(s.anchor(1).unwrap(), Some(root_at_1));
+        assert_eq!(s.anchor(2).unwrap(), Some(root_at_2));
+        assert_eq!(s.anchor(3).unwrap(), None);
+
+        // Two genesis notes, then the bundle's two outputs, then the mint's note — dense, in
+        // order, each stamped with the height that created it.
+        assert_eq!(s.notes_count().unwrap(), 5);
+        assert_eq!(s.notes_count().unwrap(), ledger.next_index());
+        for (index, (cm, height)) in
+            [([20; 8], 0), ([21; 8], 0), ([43; 8], 1), ([44; 8], 1), ([45; 8], 2)].into_iter().enumerate()
+        {
+            let row = s.note(index as u64).unwrap().unwrap_or_else(|| panic!("note {index} missing"));
+            assert_eq!(row.cm, cm, "note {index} commitment");
+            assert_eq!(row.height, height, "note {index} height");
+        }
+        assert_eq!(s.note(5).unwrap(), None);
+
+        // Nullifiers carry the height that spent them.
+        assert_eq!(s.nullifier_height(&[41; 8]).unwrap(), Some(1));
+        assert_eq!(s.nullifier_height(&[42; 8]).unwrap(), Some(1));
+        assert_eq!(s.nullifiers_count().unwrap(), 2);
+
+        // And the whole snapshot reloads to exactly the ledger the batch was committed against.
+        let reloaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(reloaded, ledger);
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().is_ok());
     }
 
     #[test]

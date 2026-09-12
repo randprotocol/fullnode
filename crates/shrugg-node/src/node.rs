@@ -286,7 +286,18 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
     };
-    let task = tokio::spawn(node.run(events, cmd_rx, early));
+    // A fatal error in the loop ends the node, but most embedders (every cluster test, and any
+    // caller that keeps the handle without awaiting it) never look at the `JoinHandle`, so
+    // without this the node simply goes quiet and looks like a consensus or networking stall.
+    // The `Result` is still returned for whoever does await it.
+    let task = tokio::spawn(async move {
+        let outcome = node.run(events, cmd_rx, early).await;
+        match &outcome {
+            Ok(()) => tracing::info!("node loop stopped"),
+            Err(e) => tracing::error!("node loop exited: {e:#}"),
+        }
+        outcome
+    });
     Ok(NodeHandle { rpc_addr, network: net, listen_addrs, status, storage, address, task, rpc_task })
 }
 

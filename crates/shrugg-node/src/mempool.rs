@@ -10,6 +10,7 @@
 
 use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::ledger::TIME_WINDOW;
+use shrugg_core::notes::word8_to_hex;
 use shrugg_core::{Hash, Ledger, Transaction, TxError, Word8};
 use std::collections::HashMap;
 
@@ -19,19 +20,10 @@ pub enum MempoolError {
     Invalid(TxError),
     #[error("already in mempool")]
     Duplicate,
-    #[error("conflicts with a pending transaction over {}", hex::encode(word8_bytes(.0)))]
+    #[error("conflicts with a pending transaction over {}", word8_to_hex(.0))]
     Conflict(Word8),
     #[error("mempool full")]
     Full,
-}
-
-/// `Word8`'s little-endian bytes, for the `Conflict` message only.
-fn word8_bytes(w: &Word8) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for (i, limb) in w.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&limb.to_le_bytes());
-    }
-    out
 }
 
 pub struct Mempool {

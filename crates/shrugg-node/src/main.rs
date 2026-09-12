@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::Multiaddr;
 use shrugg_client::RpcClient;
-use shrugg_core::bridge::BridgeConfig;
 use shrugg_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
 use shrugg_core::notes::{word8_to_hex, ShieldedAddress};
 use shrugg_core::{format_amount, parse_amount};
@@ -47,7 +46,7 @@ fn seal_deposit(to: &ShieldedAddress, note: &Note) -> Result<GenesisNote> {
 }
 
 #[derive(Parser)]
-#[command(name = "shrugg-node", version, about = "SHRUGG full node: HotStuff BFT consensus, p2p discovery, account ledger")]
+#[command(name = "shrugg-node", version, about = "SHRUGG full node: HotStuff BFT consensus, p2p discovery, shielded note ledger")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -91,11 +90,6 @@ enum Cmd {
         /// zkVM FRI profile: production (default) or test (fast, insecure; tests only).
         #[arg(long, default_value = "production")]
         fri_profile: String,
-        /// Enable the cross-chain bridge from a JSON file:
-        /// `{ "emitter": <64 hex>, "guardians": [<40 hex>, ...], "emitters": { "<chain id>": <64 hex> } }`.
-        /// Part of the genesis hash.
-        #[arg(long)]
-        bridge: Option<PathBuf>,
     },
     /// Initialise a data directory from a genesis file.
     Init {
@@ -164,14 +158,7 @@ async fn main() -> Result<()> {
             let id = libp2p::identity::Keypair::ed25519_from_bytes(kp.derive_subkey(b"shrugg-p2p-identity"))?;
             println!("address: {}\npublic_key: {}\npeer_id: {}", kp.address(), kp.public_key().to_hex(), id.public().to_peer_id());
         }
-        Cmd::Genesis { chain_id, validators, stake, allocs, out, faucet, no_confidential, fri_profile, bridge } => {
-            let bridge = match &bridge {
-                Some(path) => {
-                    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-                    Some(serde_json::from_str::<BridgeConfig>(&text).with_context(|| format!("parsing {}", path.display()))?)
-                }
-                None => None,
-            };
+        Cmd::Genesis { chain_id, validators, stake, allocs, out, faucet, no_confidential, fri_profile } => {
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -183,7 +170,9 @@ async fn main() -> Result<()> {
                 confidential: !no_confidential,
                 fri_profile,
                 hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
-                bridge,
+                // `Genesis::build` rejects a bridge section outright until phase S3 puts the
+                // bridge back on the shielded chain, so this CLI offers no way to write one.
+                bridge: None,
             };
             for v in validators {
                 let pk = if PathBuf::from(&v).exists() {

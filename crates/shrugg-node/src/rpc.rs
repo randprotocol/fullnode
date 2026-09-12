@@ -24,6 +24,10 @@ use tokio::sync::{mpsc, oneshot};
 /// an unbounded `limit` would let one request pull the whole pool into memory.
 const MAX_PAGE: usize = 1000;
 
+/// The longest string any RPC parameter may offer as a shielded address (spec ruling 3). See
+/// `parse_shielded` for why this is checked before the address is parsed rather than after.
+const MAX_ADDRESS_CHARS: usize = 2000;
+
 /// Snapshot the node loop keeps up to date for RPC readers.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct NodeStatus {
@@ -129,6 +133,20 @@ async fn handle(State(st): State<RpcState>, Json(req): Json<Request>) -> Json<Va
     }
 }
 
+/// Run a storage read that is not O(1) on the blocking pool, so it cannot stall the tokio
+/// workers the node loop shares. The closure takes owned handles (`Arc` clones) because it
+/// outlives this call's borrow of the state.
+async fn blocking<T, F>(f: F) -> Result<T, RpcError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> crate::storage::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(r) => r.map_err(RpcError::internal),
+        Err(e) => Err(RpcError::internal(format!("storage task failed: {e}"))),
+    }
+}
+
 fn param<T: serde::de::DeserializeOwned>(params: &Value, idx: usize, name: &str) -> Result<T, RpcError> {
     let v = params.get(idx).ok_or_else(|| RpcError::invalid_params(format!("missing param {name}")))?;
     serde_json::from_value(v.clone()).map_err(|e| RpcError::invalid_params(format!("bad param {name}: {e}")))
@@ -140,8 +158,20 @@ fn parse_hash(params: &Value, idx: usize) -> Result<Hash, RpcError> {
 }
 
 /// A `shrugg1…` shielded address.
+///
+/// The length is checked *before* parsing: `ShieldedAddress::parse` base58-decodes the whole
+/// string before it ever looks at the decoded length, and base58 decoding is quadratic in the
+/// input. This runs on a tokio worker shared with the node loop, so an unbounded parameter would
+/// let one request stall consensus. A real address is `shrugg1` plus ~1663 base58 characters
+/// (32-byte `pk` + a 1184-byte ML-KEM-768 encapsulation key), so 2000 is generous.
 fn parse_shielded(params: &Value, idx: usize) -> Result<ShieldedAddress, RpcError> {
     let s: String = param(params, idx, "address")?;
+    if s.len() > MAX_ADDRESS_CHARS {
+        return Err(RpcError::invalid_params(format!(
+            "address is {} characters, at most {MAX_ADDRESS_CHARS} allowed",
+            s.len()
+        )));
+    }
     ShieldedAddress::parse(&s).map_err(|e| RpcError::invalid_params(format!("address: {e}")))
 }
 
@@ -276,12 +306,19 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "shrugg_getNullifiers" => {
             let from: u64 = param(p, 0, "from_height")?;
             let limit = parse_limit(p, 1)?;
-            let rows = st.storage.nullifiers_from(from, limit).map_err(RpcError::internal)?;
+            // Scans and sorts the whole family (the rows are keyed by nullifier, not height), so
+            // it grows with the chain and does not belong on a runtime worker.
+            let storage = st.storage.clone();
+            let rows = blocking(move || storage.nullifiers_from(from, limit)).await?;
             Ok(json!(rows
                 .into_iter()
                 .map(|(height, nf)| json!({ "height": height, "nullifier": word8_to_hex(&nf) }))
                 .collect::<Vec<_>>()))
         }
+        // A node that caught up in one sync batch longer than the anchor window only stores
+        // rows for the heights that batch covered, so `getAnchor` can answer "no anchor at
+        // height h" for a height the chain really did pass through; ask for the head instead,
+        // which is the only anchor a prover should build against anyway.
         "shrugg_getAnchor" => {
             let (height, root) = match p.get(0) {
                 None | Some(Value::Null) => {
@@ -301,7 +338,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         }
         "shrugg_getWitness" => {
             let index: u64 = param(p, 0, "index")?;
-            match st.storage.witness(index, st.executor.as_ref()).map_err(RpcError::internal)? {
+            // Reads every leaf and rebuilds a full depth-32 tree to fold one path: the most
+            // expensive read this node serves, and unbounded in the chain's size.
+            let (storage, executor) = (st.storage.clone(), st.executor.clone());
+            match blocking(move || storage.witness(index, executor.as_ref())).await? {
                 None => Ok(Value::Null),
                 Some((root, path)) => Ok(json!({
                     "index": index,
@@ -430,7 +470,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             for v in st.validators.iter() {
                 let addr = v.address();
                 let rewards = st.storage.validator(&addr).map_err(RpcError::internal)?.map(|e| e.rewards).unwrap_or(0);
-                out.push(json!({ "address": addr.to_base58(), "stake": v.stake.to_string(), "rewards": rewards }));
+                out.push(json!({ "address": addr.to_base58(), "stake": v.stake, "rewards": rewards }));
             }
             Ok(json!(out))
         }
@@ -583,6 +623,23 @@ mod tests {
         // A well-formed address gets past parsing and dies at the (dropped) node channel.
         let good = shrugg_zkvm::address::address_of(&shrugg_zkvm::notes::SpendKey([7; 8]).viewing_key()).to_string();
         assert_eq!(call(&st, "shrugg_mint", json!([good])).await.unwrap_err().code, -32603);
+    }
+
+    /// An over-long address parameter is refused on its length, before it reaches the base58
+    /// decoder — which is quadratic in its input and runs on a worker the node loop shares.
+    #[tokio::test]
+    async fn an_oversized_address_is_refused_before_it_is_parsed() {
+        let gs = fixtures::genesis(1);
+        let (_d, st) = state_for(&gs);
+        let huge = format!("shrugg1{}", "1".repeat(3000));
+        let err = call(&st, "shrugg_mint", json!([huge])).await.unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("3007 characters"), "{}", err.message);
+        assert!(err.message.contains(&MAX_ADDRESS_CHARS.to_string()), "{}", err.message);
+        // The cap is generous: a real address is well under it and still parses.
+        let good = shrugg_zkvm::address::address_of(&shrugg_zkvm::notes::SpendKey([7; 8]).viewing_key()).to_string();
+        assert!(good.len() < MAX_ADDRESS_CHARS, "a real address is {} characters", good.len());
+        assert!(ShieldedAddress::parse(&good).is_ok());
     }
 
     #[tokio::test]
