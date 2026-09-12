@@ -1,7 +1,25 @@
 # The guardian bridge — architecture
 
-> The bridge code lands on main with the `feat/bridge` merge (`543d72b`) and the hardening
-> commits that follow it; this page describes it as of `273e13d` (`4585368` plus the attestation check reordering).
+> **Parked: the bridge is not wired on the shielded chain until phase S3.**
+>
+> Phase S1 replaced the account ledger with a shielded note pool, and the bridge went with the
+> accounts it credited. On this chain today: `Genesis::build` **rejects** a `bridge` section
+> outright (so a bridged chain cannot even be cut), there are no `BridgeAttest`/`BridgeBurn`
+> transaction kinds, no bridge column families, no `bridge_root` in the state root, and every
+> `shrugg_getBridge*`/`shrugg_getAsset*`/`shrugg_bridgeAssetId` RPC method and `shrugg bridge-*`
+> wallet command is gone (`docs/shielded.md`, `docs/rpc.md`, `docs/cli.md`).
+>
+> In S3 it comes back in shielded form: a bridged asset becomes a note with
+> `asset = <bridge asset id>`, `BridgeAttest` deposits a note of public amount, and `BridgeBurn`
+> becomes the one two-bundle transaction — an asset bundle that burns and a SHRUGG bundle that
+> pays the fee, because a bundle balances one asset and the fee is always in SHRUGG (shielded-pool
+> spec §10). The guardian model, the wire format, the guardian-set rotation and the replay rules
+> below are unchanged by any of that and stay the reference for what S3 rebuilds on. The
+> `bridge-codec` crate is still in the workspace and still tested.
+>
+> Everything below describes the bridge as it stood on the account chain, as of `273e13d`
+> (`4585368` plus the attestation check reordering). Read per-account balances in it as
+> "per-note, in S3".
 
 This page assumes `docs/architecture.md`. It covers the wire format, the guardian-attestation
 model, the on-chain `BridgeState`, the two bridge transaction kinds, and the storage/RPC/wallet
