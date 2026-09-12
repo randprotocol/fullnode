@@ -1,6 +1,6 @@
 # Block-level proof aggregation and the prover market
 
-Status: **queued design, not built** (decided 2026-09-12; spec and plan to follow). This is the
+Status: **approved design as a starting point, not built** (decided and approved 2026-09-12; the spec and plan build on §1–§4 and settle the open questions in §5). This is the
 remedy chosen in `docs/block-space.md` §6 for the 80-query proof size: a block carries one
 recursive proof for all of its bundles instead of one ~1.3 MB proof per bundle. Proof pruning was
 rejected because it makes a syncing node trust finality signatures for old history and so opens
