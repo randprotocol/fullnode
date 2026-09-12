@@ -33,6 +33,14 @@ pub trait ConfidentialExecutor: Send + Sync {
     fn warm(&self, _program: &ProgramRecord) {}
     /// Poseidon2 tree-node hash `H(NODE, left || right)` — the hash `MERKLE_VERIFY` checks against.
     fn node_hash(&self, left: &Word8, right: &Word8) -> Word8;
+    /// The note commitment `H(CM, pk(8) from(8) amount_lo amount_hi asset time r(8))` — the
+    /// 28-word note layout of the vendored `shrugg_zkvm::notes::Note`.
+    ///
+    /// The ledger needs this for the deposits it creates itself rather than accepts on the
+    /// wire: S2's `Withdraw` and S3's `BridgeAttest` publish only the blinding `r` and a public
+    /// amount, and the chain computes the commitment, so a validator cannot declare one amount
+    /// and mint a note for another.
+    fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8;
     /// `notes::bundle_digest(..)` (in the vendored research note layer, `shrugg_zkvm::notes`,
     /// arriving in Task 2) over the public bundle fields with the taint word fixed to 0.
     fn bundle_digest(&self, input: &BundleDigestInput) -> Word8;
@@ -108,6 +116,23 @@ impl ConfidentialExecutor for StubExecutor {
         Self::hash_words(b"shrugg-stub-node", &[&word8_to_bytes(left), &word8_to_bytes(right)])
     }
 
+    /// A blake3 stand-in over the same six fields. It is not the real note commitment and no
+    /// note sealed against it will ever open on a real chain — but it is injective in exactly
+    /// the fields the real one is, which is what the ledger's tests need.
+    fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+        Self::hash_words(
+            b"shrugg-stub-note",
+            &[
+                &word8_to_bytes(pk),
+                &word8_to_bytes(from),
+                &amount.to_le_bytes(),
+                &asset.to_le_bytes(),
+                &time.to_le_bytes(),
+                &word8_to_bytes(r),
+            ],
+        )
+    }
+
     fn bundle_digest(&self, i: &BundleDigestInput) -> Word8 {
         Self::hash_words(
             b"shrugg-stub-bundle-digest",
@@ -170,5 +195,25 @@ mod tests {
         assert_eq!(StubExecutor.verify_bundle(&[4u32; 8], &p), Err(ConfidentialError::WrongProgram));
         assert_eq!(StubExecutor.bundle_proof_digest(b"junk"), Err(ConfidentialError::MalformedProof));
         assert_ne!(StubExecutor.node_hash(&[1; 8], &[2; 8]), StubExecutor.node_hash(&[2; 8], &[1; 8]));
+    }
+
+    /// Every field the real commitment binds, the stand-in binds too — otherwise a ledger test
+    /// could pass on a note the real chain would compute differently.
+    #[test]
+    fn the_stub_note_commitment_binds_every_field() {
+        let base = StubExecutor.note_commitment(&[1; 8], &[2; 8], 5, 0, 9, &[3; 8]);
+        assert_eq!(base, StubExecutor.note_commitment(&[1; 8], &[2; 8], 5, 0, 9, &[3; 8]), "deterministic");
+        for other in [
+            StubExecutor.note_commitment(&[9; 8], &[2; 8], 5, 0, 9, &[3; 8]),
+            StubExecutor.note_commitment(&[1; 8], &[9; 8], 5, 0, 9, &[3; 8]),
+            StubExecutor.note_commitment(&[1; 8], &[2; 8], 6, 0, 9, &[3; 8]),
+            StubExecutor.note_commitment(&[1; 8], &[2; 8], 5, 1, 9, &[3; 8]),
+            StubExecutor.note_commitment(&[1; 8], &[2; 8], 5, 0, 10, &[3; 8]),
+            StubExecutor.note_commitment(&[1; 8], &[2; 8], 5, 0, 9, &[4; 8]),
+        ] {
+            assert_ne!(other, base);
+        }
+        // A different domain from the tree node hash, over the same-shaped input.
+        assert_ne!(base, StubExecutor.node_hash(&[1; 8], &[2; 8]));
     }
 }

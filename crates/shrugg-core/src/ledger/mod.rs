@@ -1,4 +1,16 @@
 //! The shielded notes ledger and block application rules (design spec §7, §9).
+//!
+//! Everything common to every transaction — the size caps, the chain id, the fee floor, the
+//! anchor and time windows, the bundle's nullifier/commitment uniqueness, the bundle proof —
+//! lives here. The rules that belong to one feature live in a module beside this one and are
+//! reached from the action step (spec §7 step 7): [`staking`] for `Bond`/`Unbond`/`Withdraw`
+//! (phase S2), [`call_envelope`] and [`bridge_notes`] for `Call`'s input transcript and
+//! `BridgeAttest`/`BridgeBurn` (phase S3). That split is what lets S2 and S3 be implemented in
+//! parallel: each phase owns its own file.
+
+pub mod bridge_notes;
+pub mod call_envelope;
+pub mod staking;
 
 use crate::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
 use crate::crypto::{merkle_root, Address, Hash, PublicKey};
@@ -79,6 +91,11 @@ pub enum TxError {
     BadProgram(ConfidentialError),
     #[error("unknown program {0}")]
     UnknownProgram(ProgramId),
+    /// An action whose variant exists on the wire but whose rules have not shipped yet. The
+    /// message names the phase that turns it on, so a wallet built against a newer node tells
+    /// its user which upgrade it is waiting for rather than "invalid transaction".
+    #[error("{0}")]
+    UnsupportedAction(&'static str),
     #[error("invalid proof: {0}")]
     InvalidProof(ConfidentialError),
     #[error("the bundle's digest is not what its proof published")]
@@ -445,11 +462,18 @@ impl Ledger {
                 }
                 executor.check_program(*base_pc, words).map_err(TxError::BadProgram)?;
             }
-            Action::Call { program, .. } => {
+            Action::Call { program, input_envelope, .. } => {
                 if !self.confidential {
                     return Err(TxError::ConfidentialDisabled);
                 }
+                call_envelope::validate(input_envelope)?;
                 call_record = Some(self.programs.get(program).ok_or(TxError::UnknownProgram(*program))?);
+            }
+            a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. }) => {
+                staking::validate(self, tx, a, executor)?;
+            }
+            a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
+                bridge_notes::validate(self, tx, a, executor)?;
             }
         }
         // 8-9. the bundle's digest, then its proof
@@ -518,6 +542,12 @@ impl Ledger {
             Action::Call { program, .. } => {
                 let o = outcome.expect("validate_inner returns the outcome for calls");
                 receipt = Some(CallReceiptData { program: *program, tier: o.tier, outputs: o.outputs });
+            }
+            a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. }) => {
+                staking::apply(self, tx, a, executor)?;
+            }
+            a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
+                bridge_notes::apply(self, tx, a, executor)?;
             }
         }
         Ok(receipt)
@@ -927,7 +957,7 @@ mod tests {
         let id = program_id(0, &words);
         assert!(l.program(&id).is_some());
         let proof = StubExecutor::make_proof(&id, 12, [1, 2, 3, 4, 5, 6, 7, 8]);
-        let call = Action::Call { program: id, proof };
+        let call = Action::Call { program: id, proof, input_envelope: None };
         let fee = gas::BUNDLE_BASE + gas::call_fee(12);
         let t = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], fee), call.clone());
         let r = l.apply_tx(&t, &a.address(), &StubExecutor).unwrap().unwrap();
@@ -942,6 +972,85 @@ mod tests {
         assert_eq!(l.validate(&disabled, &StubExecutor), Err(TxError::ConfidentialDisabled));
     }
 
+    /// S2/S3 scaffold: every new variant reaches its module and is refused there, naming the
+    /// phase that turns it on. S2 and S3 flip these one file at a time.
+    #[test]
+    fn the_staking_and_bridge_actions_are_refused_until_their_phase() {
+        let l = ledger();
+        let payout = crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
+        let sig = crate::crypto::Signature::empty();
+        let v = Address([1; 32]);
+        let asset_bundle = bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], 0);
+        let cases: Vec<(&str, Action)> = vec![
+            ("S2", Action::Bond { validator: v, amount: 5, registration: None }),
+            ("S2", Action::Unbond { validator: v, amount: 5, nonce: 0, signature: sig.clone() }),
+            (
+                "S2",
+                Action::Withdraw { validator: v, amount: 5, nonce: 0, r: [7; 8], envelope: env(), signature: sig },
+            ),
+            (
+                "S3",
+                Action::BridgeAttest { attestation: vec![1; 32], recipient: payout, r: [7; 8], envelope: env() },
+            ),
+            (
+                "S3",
+                Action::BridgeBurn { asset_bundle, asset: 1, amount: 400, relayer_fee: 100, to_chain: 2, to: [9; 32] },
+            ),
+        ];
+        for (i, (phase, action)) in cases.into_iter().enumerate() {
+            let n = 100 + 4 * i as u32;
+            let b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::fee_floor(&action));
+            let t = Transaction::shielded(7, b, action);
+            match l.validate(&t, &StubExecutor) {
+                Err(TxError::UnsupportedAction(m)) => {
+                    assert!(m.contains(phase), "{m} should name phase {phase}");
+                    assert!(m.contains("not available until"), "{m}");
+                }
+                other => panic!("expected UnsupportedAction, got {other:?}"),
+            }
+            // And nothing is applied: the refusal comes from the action step, before any write.
+            let mut scratch = l.clone();
+            assert!(scratch.apply_tx(&t, &keys().0.address(), &StubExecutor).is_err());
+            assert_eq!(scratch, l, "a refused action leaves the ledger untouched");
+        }
+    }
+
+    /// The one rule of the call-input envelope the chain does enforce, through a real ledger.
+    #[test]
+    fn a_call_envelope_passes_when_absent_or_small_and_is_capped() {
+        let mut l = ledger();
+        let (a, _) = keys();
+        let words = vec![0x13u32; 4];
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone() };
+        let d = Transaction::shielded(
+            7,
+            bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)),
+            deploy,
+        );
+        l.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
+        l.record_anchor(l.height());
+        let id = program_id(0, &words);
+        let fee = gas::BUNDLE_BASE + gas::call_fee(12);
+        let envelope = |body: usize| crate::types::CallEnvelope {
+            kem_ct: vec![1; 1088],
+            to_sender: vec![2; 48],
+            to_auditor: vec![3; 48],
+            body: vec![4; body],
+        };
+        let fits = crate::types::MAX_CALL_ENVELOPE_BYTES - (1088 + 48 + 48);
+        for (n, input_envelope, expect) in [
+            (10u32, None, Ok(())),
+            (20, Some(envelope(16)), Ok(())),
+            (30, Some(envelope(fits)), Ok(())),
+            (40, Some(envelope(fits + 1)), Err(TxError::EnvelopeTooLarge)),
+        ] {
+            let proof = StubExecutor::make_proof(&id, 12, [0; 8]);
+            let action = Action::Call { program: id, proof, input_envelope };
+            let b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], fee);
+            assert_eq!(l.validate(&Transaction::shielded(7, b, action), &StubExecutor), expect, "n={n}");
+        }
+    }
+
     #[test]
     fn deploy_and_call_rejections_and_redeploy_idempotence() {
         let mut l = ledger();
@@ -952,7 +1061,7 @@ mod tests {
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::ProgramTooLarge));
         // A call naming a program nobody deployed.
         let ghost = Hash::digest(b"never deployed");
-        let unknown = Action::Call { program: ghost, proof: Vec::new() };
+        let unknown = Action::Call { program: ghost, proof: Vec::new(), input_envelope: None };
         let t = Transaction::shielded(
             7,
             bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&unknown)),
@@ -974,7 +1083,7 @@ mod tests {
         }
         let (id, other_id) = (program_id(0, &words), program_id(0, &other));
         let wrong_proof = StubExecutor::make_proof(&other_id, 12, [0; 8]);
-        let call = Action::Call { program: id, proof: wrong_proof };
+        let call = Action::Call { program: id, proof: wrong_proof, input_envelope: None };
         let fee = gas::BUNDLE_BASE + gas::call_fee(12);
         let t = Transaction::shielded(7, bundle(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]], fee), call);
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::InvalidProof(ConfidentialError::WrongProgram)));

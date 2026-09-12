@@ -101,13 +101,17 @@ fn genesis_funding(validators: &[Keypair], funded: &[&Wallet]) -> Genesis {
     Genesis {
         chain_id: CHAIN_ID,
         timestamp_ms: 0,
-        validators: validators.iter().map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 10 }).collect(),
+        validators: validators
+            .iter()
+            .map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 10, payout: None })
+            .collect(),
         alloc: funded.iter().map(|w| alloc_note(&w.address, ALLOC)).collect(),
         faucet: true,
         confidential: true,
         fri_profile: "test".into(),
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
         bridge: None,
+        epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
     }
 }
 
@@ -737,7 +741,7 @@ async fn confidential_call_rides_on_a_bundle() {
         &a,
         &mut store,
         None,
-        Action::Call { program: id, proof },
+        Action::Call { program: id, proof, input_envelope: None },
         call_fee,
         FriProfile::Test,
         Backend::Cpu,

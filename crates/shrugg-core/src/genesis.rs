@@ -13,6 +13,12 @@ pub struct GenesisValidator {
     /// Hex-encoded Dilithium2 public key.
     pub public_key: PublicKey,
     pub stake: u128,
+    /// Phase S2: the shielded address this validator's rewards and unbonded stake are paid to
+    /// (`shrugg1…`). Optional and *not* part of the genesis binding yet — S2 seeds the register
+    /// from it, makes it required, and binds it then. Until then a genesis carrying one builds
+    /// to exactly the same chain as one without.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payout: Option<String>,
 }
 
 /// The four envelope parts as hex text, so a genesis file stays readable JSON.
@@ -79,10 +85,23 @@ pub struct Genesis {
     /// Cross-chain bridge. Rejected until phase S3 puts the bridge back on the shielded chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge: Option<BridgeConfig>,
+    /// Phase S2: blocks per epoch — the validator set for epoch `e` is derived from the
+    /// register as of the last block of epoch `e - 1`. Configurable so a cluster test does not
+    /// have to run 1000 blocks to cross a boundary. Part of the genesis hash: two chains that
+    /// disagree about it derive different sets from the same register.
+    #[serde(default = "default_epoch_blocks")]
+    pub epoch_blocks: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Spec §8 / S2's `EPOCH_BLOCKS_DEFAULT`.
+pub const EPOCH_BLOCKS_DEFAULT: u64 = 1000;
+
+fn default_epoch_blocks() -> u64 {
+    EPOCH_BLOCKS_DEFAULT
 }
 
 fn default_profile() -> String {
@@ -124,6 +143,8 @@ pub struct GenesisState {
     pub fri_profile: String,
     pub hc_bundle: Word8,
     pub validators: ValidatorSet,
+    /// Phase S2: blocks per epoch, as the genesis file set it.
+    pub epoch_blocks: u64,
     pub ledger: Ledger,
     pub block: Block,
     /// The alloc notes in file order: commitment, envelope, amount.
@@ -207,6 +228,13 @@ impl Genesis {
             commit.extend_from_slice(&word8_to_bytes(cm));
             commit.extend_from_slice(&amount.to_be_bytes());
         }
+        // S2 scaffold: `epoch_blocks` is bound unconditionally, after the notes. Appending it
+        // only when it is non-default would make the binding depend on a default this file can
+        // change later; paying one hash change now (`the_genesis_hash_is_pinned`, re-pinned in
+        // the same commit) buys a binding that stays stable through S2. `GenesisValidator.payout`
+        // is deliberately *not* here yet — it is optional until S2 makes it required, and
+        // binding an optional field would split chains on a field nobody has filled in.
+        commit.extend_from_slice(&self.epoch_blocks.to_be_bytes());
         let genesis_binding = Hash::digest_domain(b"shrugg-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -226,6 +254,7 @@ impl Genesis {
             fri_profile: self.fri_profile.clone(),
             hc_bundle,
             validators,
+            epoch_blocks: self.epoch_blocks,
             ledger,
             block,
             notes,
@@ -259,13 +288,17 @@ mod tests {
         Genesis {
             chain_id: 42,
             timestamp_ms: 1_700_000_000_000,
-            validators: keys.iter().map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 100 }).collect(),
+            validators: keys
+                .iter()
+                .map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 100, payout: None })
+                .collect(),
             alloc: vec![note(7, 1_000_000), note(8, 2_000_000)],
             faucet: false,
             confidential: true,
             fri_profile: "production".into(),
             hc_bundle: word8_to_hex(&[3; 8]),
             bridge: None,
+            epoch_blocks: EPOCH_BLOCKS_DEFAULT,
         }
     }
 
@@ -358,6 +391,37 @@ mod tests {
             other => panic!("expected BadBridgeConfig, got {other:?}"),
         }
         assert!(!genesis(1).to_json().contains("bridge"));
+    }
+
+    /// S2 scaffold. `epoch_blocks` defaults, is bound, and reaches the built state;
+    /// `payout` defaults, is *not* bound, and an old genesis file still parses.
+    #[test]
+    fn the_s2_fields_default_and_only_epoch_blocks_is_bound() {
+        let g = genesis(1);
+        let s = build(&g);
+        assert_eq!(s.epoch_blocks, EPOCH_BLOCKS_DEFAULT);
+
+        let mut faster = g.clone();
+        faster.epoch_blocks = 4;
+        let sf = build(&faster);
+        assert_eq!(sf.epoch_blocks, 4);
+        assert_ne!(sf.hash(), s.hash(), "epoch_blocks is part of the genesis binding");
+        assert_eq!(sf.ledger.state_root(), s.ledger.state_root(), "and is not state");
+
+        let mut paid = g.clone();
+        paid.validators[0].payout = Some("shrugg1abc".into());
+        assert_eq!(build(&paid).hash(), s.hash(), "payout is not bound until S2 makes it required");
+
+        // A genesis file written before either field existed still parses, with the defaults.
+        let mut old = serde_json::to_value(&g).unwrap();
+        old.as_object_mut().unwrap().remove("epoch_blocks");
+        let parsed = Genesis::from_json(&old.to_string()).unwrap();
+        assert_eq!(parsed.epoch_blocks, EPOCH_BLOCKS_DEFAULT);
+        assert!(parsed.validators.iter().all(|v| v.payout.is_none()));
+        assert_eq!(build(&parsed).hash(), s.hash());
+        // An unset payout stays out of the file entirely.
+        assert!(!g.to_json().contains("payout"));
+        assert!(g.to_json().contains("\"epoch_blocks\""));
     }
 
     #[test]

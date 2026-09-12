@@ -214,20 +214,24 @@ fn block_json(b: &shrugg_core::Block) -> Value {
 /// What a block explorer can say about a transaction — which is, deliberately, almost nothing:
 /// the bundle's public fields (none of which name a party) and the shape of its action. Envelope
 /// and proof are reported by length only; anyone who wants the bytes can fetch the block.
+/// A bundle's public fields — none of which names a party. Used for the transaction's own
+/// bundle and, since S3's `BridgeBurn`, for the asset bundle riding inside the action.
+fn bundle_json(b: &shrugg_core::Bundle) -> Value {
+    json!({
+        "anchor": word8_to_hex(&b.anchor),
+        "nullifiers": [word8_to_hex(&b.nullifiers[0]), word8_to_hex(&b.nullifiers[1])],
+        "commitments": [word8_to_hex(&b.commitments[0]), word8_to_hex(&b.commitments[1])],
+        "fee": b.fee,
+        "burn": b.burn,
+        "asset": b.asset,
+        "time": b.time,
+        "proof_len": b.proof.len(),
+        "envelope_len": [b.envelopes[0].len(), b.envelopes[1].len()],
+    })
+}
+
 fn tx_json(t: &Transaction) -> Value {
-    let bundle = t.bundle.as_ref().map(|b| {
-        json!({
-            "anchor": word8_to_hex(&b.anchor),
-            "nullifiers": [word8_to_hex(&b.nullifiers[0]), word8_to_hex(&b.nullifiers[1])],
-            "commitments": [word8_to_hex(&b.commitments[0]), word8_to_hex(&b.commitments[1])],
-            "fee": b.fee,
-            "burn": b.burn,
-            "asset": b.asset,
-            "time": b.time,
-            "proof_len": b.proof.len(),
-            "envelope_len": [b.envelopes[0].len(), b.envelopes[1].len()],
-        })
-    });
+    let bundle = t.bundle.as_ref().map(bundle_json);
     let action = match &t.action {
         Action::None => json!({ "kind": "none" }),
         Action::Mint { cm, amount, minter, .. } => json!({
@@ -236,8 +240,33 @@ fn tx_json(t: &Transaction) -> Value {
         Action::Deploy { base_pc, words } => json!({
             "kind": "deploy", "program": shrugg_core::program::program_id(*base_pc, words).to_hex(), "words": words.len()
         }),
-        Action::Call { program, proof } => json!({
-            "kind": "call", "program": program.to_hex(), "proof_len": proof.len()
+        Action::Call { program, proof, input_envelope } => json!({
+            "kind": "call", "program": program.to_hex(), "proof_len": proof.len(),
+            // Length only, like every other envelope: the transcript is for the caller's
+            // viewing key and an auditor, not for whoever is reading the explorer.
+            "input_envelope_len": input_envelope.as_ref().map(|e| e.len() as u64),
+        }),
+        // The staking actions are the one place this chain has public amounts by design
+        // (spec §8): the register is public, so its inputs are too.
+        Action::Bond { validator, amount, registration } => json!({
+            "kind": "bond", "validator": validator.to_base58(), "amount": amount,
+            "registered": registration.is_some(),
+        }),
+        Action::Unbond { validator, amount, nonce, .. } => json!({
+            "kind": "unbond", "validator": validator.to_base58(), "amount": amount, "nonce": nonce
+        }),
+        Action::Withdraw { validator, amount, nonce, .. } => json!({
+            "kind": "withdraw", "validator": validator.to_base58(), "amount": amount, "nonce": nonce
+        }),
+        // No amount: it is inside the attestation, which S3's bridge decoder reads. The
+        // recipient is public in this transaction only — the note's later spend is not.
+        Action::BridgeAttest { attestation, recipient, .. } => json!({
+            "kind": "bridge_attest", "attestation_len": attestation.len(), "recipient": recipient.to_string()
+        }),
+        Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to } => json!({
+            "kind": "bridge_burn", "asset": asset, "amount": amount, "relayer_fee": relayer_fee,
+            "to_chain": to_chain, "to": hex::encode(to),
+            "asset_bundle": bundle_json(asset_bundle),
         }),
     };
     json!({
@@ -736,6 +765,86 @@ mod tests {
         assert!(rows[0]["stake"].is_string(), "stake must not be a JSON number");
         // The single block's bundle fee was credited to its proposer.
         assert_eq!(rows[0]["rewards"], bundle_fee());
+    }
+
+    /// S2/S3 scaffold: an explorer can name and summarise every new action the moment one can
+    /// be submitted. Amounts that are public by design (the staking register, a burn) are shown;
+    /// ciphertexts are lengths only, and an attestation's amount is not guessed at here — S3's
+    /// bridge decoder is what reads it.
+    #[test]
+    fn tx_json_renders_every_new_action_kind() {
+        let gs = fixtures::genesis_with(1, vec![]);
+        let b = |nfs: [Word8; 2], cms: [Word8; 2]| {
+            let t = fixtures::bundle_tx(&gs.ledger, nfs, cms, bundle_fee());
+            t.bundle.expect("bundle_tx always carries one")
+        };
+        let v = shrugg_core::Address([3; 32]);
+        let sig = shrugg_core::Signature::empty();
+        let recipient = ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
+        let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
+
+        let j = |action| tx_json(&Transaction::shielded(1, b([nf(1), nf(2)], [cm(1), cm(2)]), action))["action"].clone();
+
+        let bond = j(Action::Bond { validator: v, amount: 500, registration: None });
+        assert_eq!(bond["kind"], "bond");
+        assert_eq!(bond["validator"], v.to_base58());
+        assert_eq!(bond["amount"], 500);
+        assert_eq!(bond["registered"], false);
+
+        let unbond = j(Action::Unbond { validator: v, amount: 7, nonce: 2, signature: sig.clone() });
+        assert_eq!((&unbond["kind"], &unbond["amount"], &unbond["nonce"]), (&json!("unbond"), &json!(7), &json!(2)));
+        assert!(!serde_json::to_string(&unbond).unwrap().contains("signature"), "a signature is not explorer data");
+
+        let w =
+            j(Action::Withdraw { validator: v, amount: 9, nonce: 3, r: [5; 8], envelope: envelope.clone(), signature: sig });
+        assert_eq!(
+            (&w["kind"], &w["validator"], &w["amount"], &w["nonce"]),
+            (&json!("withdraw"), &json!(v.to_base58()), &json!(9), &json!(3))
+        );
+
+        let at = j(Action::BridgeAttest { attestation: vec![9; 520], recipient: recipient.clone(), r: [5; 8], envelope });
+        assert_eq!(at["kind"], "bridge_attest");
+        assert_eq!(at["attestation_len"], 520);
+        assert_eq!(at["recipient"], recipient.to_string());
+        assert!(at["amount"].is_null(), "an attestation's amount is inside it, not on the action");
+
+        let asset_bundle = b([nf(3), nf(4)], [cm(3), cm(4)]);
+        let burn = j(Action::BridgeBurn {
+            asset_bundle,
+            asset: 2,
+            amount: 400,
+            relayer_fee: 100,
+            to_chain: 5,
+            to: [0xab; 32],
+        });
+        assert_eq!(burn["kind"], "bridge_burn");
+        assert_eq!(
+            (&burn["asset"], &burn["amount"], &burn["relayer_fee"], &burn["to_chain"]),
+            (&json!(2), &json!(400), &json!(100), &json!(5))
+        );
+        assert_eq!(burn["to"], "ab".repeat(32));
+        // The asset bundle renders exactly like the fee bundle: same public fields, no more.
+        assert_eq!(burn["asset_bundle"]["nullifiers"][0], word8_to_hex(&nf(3)));
+        assert_eq!(burn["asset_bundle"]["fee"], bundle_fee());
+
+        // A call reports its envelope's size, or null when it carries none.
+        let plain = j(Action::Call { program: Hash::ZERO, proof: vec![1; 40], input_envelope: None });
+        assert_eq!(plain["kind"], "call");
+        assert_eq!(plain["input_envelope_len"], Value::Null);
+        let sealed = j(Action::Call {
+            program: Hash::ZERO,
+            proof: vec![1; 40],
+            input_envelope: Some(shrugg_core::CallEnvelope {
+                kem_ct: vec![1; 1088],
+                to_sender: vec![2; 48],
+                to_auditor: vec![3; 48],
+                body: vec![4; 96],
+            }),
+        });
+        assert_eq!(sealed["input_envelope_len"], 1088 + 48 + 48 + 96);
+        // Still redacted: no ciphertext of any kind reaches the explorer.
+        let text = serde_json::to_string(&sealed).unwrap();
+        assert!(!text.contains("body") && !text.contains("kem_ct"), "{text}");
     }
 
     #[tokio::test]

@@ -912,13 +912,14 @@ pub(crate) mod fixtures {
         Genesis {
             chain_id,
             timestamp_ms: 0,
-            validators: vec![GenesisValidator { public_key: k.public_key().clone(), stake: 10 }],
+            validators: vec![GenesisValidator { public_key: k.public_key().clone(), stake: 10, payout: None }],
             alloc,
             faucet: true,
             confidential: true,
             fri_profile: "test".into(),
             hc_bundle: word8_to_hex(&HC),
             bridge: None,
+            epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
         }
         .build(&StubExecutor)
         .unwrap()

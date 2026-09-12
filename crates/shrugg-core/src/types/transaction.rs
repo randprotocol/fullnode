@@ -1,8 +1,9 @@
 //! Transactions: a shielded bundle plus an optional action (design spec §3, §6).
 
-use crate::crypto::{Hash, Keypair, PublicKey, Signature};
-use crate::notes::{Bundle, Envelope, Word8};
+use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
+use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8};
 use crate::program::ProgramId;
+use crate::types::actions::{CallEnvelope, Registration};
 use serde::{Deserialize, Serialize};
 
 /// Native token symbol. The whitepaper (Draft 3) calls this SHRUGG; rename here if needed.
@@ -70,8 +71,25 @@ pub enum Action {
     /// Put a zkVM program on chain. Content addressed; see `program::program_id`.
     Deploy { base_pc: u32, words: Vec<u32> },
     /// A confidential call: a STARK proof that `program` ran on private inputs and published
-    /// the eight public outputs carried in the proof.
-    Call { program: ProgramId, proof: Vec<u8> },
+    /// the eight public outputs carried in the proof. `input_envelope` is the optional
+    /// encrypted transcript of those private inputs (spec §6.1); the chain checks only its size.
+    Call { program: ProgramId, proof: Vec<u8>, input_envelope: Option<CallEnvelope> },
+    /// Phase S2: add `amount` (burned by the bundle) to `validator`'s stake. `registration` is
+    /// present exactly when the validator is not yet in the register.
+    Bond { validator: Address, amount: u64, registration: Option<Registration> },
+    /// Phase S2: move `amount` of `validator`'s stake into unbonding. Signed over
+    /// [`crate::types::actions::unbond_message`].
+    Unbond { validator: Address, amount: u64, nonce: u64, signature: Signature },
+    /// Phase S2: pay released stake and rewards into a deposit note the ledger computes itself
+    /// from `r` and the register's payout address. Signed over [`crate::types::actions::withdraw_message`].
+    Withdraw { validator: Address, amount: u64, nonce: u64, r: Word8, envelope: Envelope, signature: Signature },
+    /// Phase S3: a guardian-signed bridge attestation, deposited as a note of the bridged
+    /// asset to `recipient` with blinding `r`.
+    BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, envelope: Envelope },
+    /// Phase S3: burn `amount` of asset `asset` to a destination chain. `asset_bundle` is the
+    /// second bundle of the transaction — the one spending the asset notes; the transaction's
+    /// own `bundle` pays the SHRUGG fee.
+    BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee: u64, to_chain: u16, to: [u8; 32] },
 }
 
 /// A transaction: a shielded bundle, an action, or (for a faucet mint) an action alone.
@@ -128,17 +146,28 @@ impl Transaction {
         self.bundle.as_ref().map_or(0, |b| b.fee)
     }
 
-    /// The nullifiers this transaction spends.
+    /// The nullifiers this transaction spends: the fee bundle's, then — for a `BridgeBurn` —
+    /// the asset bundle's, which are spent by the same transaction and must be just as unique.
     pub fn nullifiers(&self) -> Vec<Word8> {
-        self.bundle.as_ref().map_or(Vec::new(), |b| b.nullifiers.to_vec())
+        let mut v: Vec<Word8> = self.bundle.as_ref().map_or(Vec::new(), |b| b.nullifiers.to_vec());
+        if let Action::BridgeBurn { asset_bundle, .. } = &self.action {
+            v.extend_from_slice(&asset_bundle.nullifiers);
+        }
+        v
     }
 
     /// Every note commitment this transaction creates: the bundle's two output slots in order,
-    /// then a mint's note.
+    /// then a mint's note, then — for a `BridgeBurn` — the asset bundle's two slots.
+    ///
+    /// A `Withdraw`'s and a `BridgeAttest`'s deposit notes are deliberately absent: their
+    /// commitment is not carried on the wire at all, it is computed by the ledger from the
+    /// action's `r` and the amount it is paying out (spec §7).
     pub fn commitments(&self) -> Vec<Word8> {
         let mut v: Vec<Word8> = self.bundle.as_ref().map_or(Vec::new(), |b| b.commitments.to_vec());
-        if let Action::Mint { cm, .. } = &self.action {
-            v.push(*cm);
+        match &self.action {
+            Action::Mint { cm, .. } => v.push(*cm),
+            Action::BridgeBurn { asset_bundle, .. } => v.extend_from_slice(&asset_bundle.commitments),
+            _ => {}
         }
         v
     }
@@ -189,6 +218,83 @@ mod tests {
         let Action::Mint { cm, envelope, amount, minter, signature } = &tx.action else { panic!() };
         assert!(minter.verify(Transaction::mint_signing_hash(7, cm, envelope, *amount).as_bytes(), signature));
         assert!(!minter.verify(Transaction::mint_signing_hash(8, cm, envelope, *amount).as_bytes(), signature));
+    }
+
+    /// A burn spends and creates through two bundles, so both must be visible to the mempool's
+    /// and the ledger's uniqueness checks. A withdraw's deposit is not on the wire at all.
+    #[test]
+    fn a_bridge_burn_reports_both_bundles_and_a_withdraw_reports_no_deposit() {
+        let mut asset_bundle = bundle();
+        asset_bundle.nullifiers = [[6; 8], [7; 8]];
+        asset_bundle.commitments = [[8; 8], [9; 8]];
+        asset_bundle.asset = 3;
+        asset_bundle.burn = 500;
+        let burn = Transaction::shielded(
+            7,
+            bundle(),
+            Action::BridgeBurn { asset_bundle, asset: 3, amount: 400, relayer_fee: 100, to_chain: 2, to: [1; 32] },
+        );
+        assert_eq!(burn.nullifiers(), vec![[2; 8], [3; 8], [6; 8], [7; 8]]);
+        assert_eq!(burn.commitments(), vec![[4; 8], [5; 8], [8; 8], [9; 8]]);
+        assert_eq!(Transaction::decode(&burn.encode()).unwrap(), burn);
+
+        let w = Transaction::shielded(
+            7,
+            bundle(),
+            Action::Withdraw {
+                validator: Address([1; 32]),
+                amount: 9,
+                nonce: 0,
+                r: [5; 8],
+                envelope: env(),
+                signature: Signature::empty(),
+            },
+        );
+        assert_eq!(w.commitments(), vec![[4; 8], [5; 8]], "the ledger computes the deposit, the wire does not carry it");
+        let a = Transaction::shielded(
+            7,
+            bundle(),
+            Action::BridgeAttest {
+                attestation: vec![1, 2, 3],
+                recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                r: [5; 8],
+                envelope: env(),
+            },
+        );
+        assert_eq!(a.commitments(), vec![[4; 8], [5; 8]]);
+        assert_eq!(a.nullifiers(), vec![[2; 8], [3; 8]]);
+    }
+
+    /// Every new variant is on the wire, and a `Call`'s envelope is part of the transaction id.
+    #[test]
+    fn the_new_variants_roundtrip_and_a_call_envelope_is_bound_to_the_tx_hash() {
+        let call = Action::Call { program: Hash::ZERO, proof: vec![1; 4], input_envelope: None };
+        let plain = Transaction::shielded(7, bundle(), call);
+        let sealed = Transaction::shielded(
+            7,
+            bundle(),
+            Action::Call {
+                program: Hash::ZERO,
+                proof: vec![1; 4],
+                input_envelope: Some(CallEnvelope {
+                    kem_ct: vec![],
+                    to_sender: vec![2; 48],
+                    to_auditor: vec![],
+                    body: vec![3; 64],
+                }),
+            },
+        );
+        assert_ne!(plain.hash(), sealed.hash());
+        for t in [&plain, &sealed] {
+            assert_eq!(&Transaction::decode(&t.encode()).unwrap(), t);
+        }
+        for action in [
+            Action::Bond { validator: Address([1; 32]), amount: 5, registration: None },
+            Action::Unbond { validator: Address([1; 32]), amount: 5, nonce: 3, signature: Signature::empty() },
+        ] {
+            let t = Transaction::shielded(7, bundle(), action);
+            assert_eq!(Transaction::decode(&t.encode()).unwrap(), t);
+        }
     }
 
     #[test]

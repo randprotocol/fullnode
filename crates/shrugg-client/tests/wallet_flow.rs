@@ -38,7 +38,7 @@ fn genesis(validator: &Keypair) -> Genesis {
     Genesis {
         chain_id: CHAIN_ID,
         timestamp_ms: 0,
-        validators: vec![GenesisValidator { public_key: validator.public_key().clone(), stake: 10 }],
+        validators: vec![GenesisValidator { public_key: validator.public_key().clone(), stake: 10, payout: None }],
         alloc: vec![],
         faucet: true,
         confidential: true,
@@ -46,6 +46,7 @@ fn genesis(validator: &Keypair) -> Genesis {
         // Must be this build's own guest, or `node::start` refuses to run at all.
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
         bridge: None,
+        epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
     }
 }
 

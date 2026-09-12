@@ -50,6 +50,14 @@ pub fn fee_floor(action: &Action) -> u64 {
         Action::None => BUNDLE_BASE,
         Action::Deploy { words, .. } => BUNDLE_BASE + deploy_fee(words.len()),
         Action::Call { .. } => BUNDLE_BASE + CALL_BASE,
+        // S2/S3 scaffold: the five new actions pay the plain bundle base until their phase
+        // lands and refines the floor (staking has no proving work of its own; a bridge
+        // attestation's decode and a burn's second bundle proof are priced in S3).
+        Action::Bond { .. }
+        | Action::Unbond { .. }
+        | Action::Withdraw { .. }
+        | Action::BridgeAttest { .. }
+        | Action::BridgeBurn { .. } => BUNDLE_BASE,
     }
 }
 
@@ -68,7 +76,10 @@ mod tests {
     fn fee_floor_adds_the_bundle_base() {
         assert_eq!(fee_floor(&Action::None), 1_000_000);
         assert_eq!(fee_floor(&Action::Deploy { base_pc: 0, words: vec![0x13; 10] }), 1_000_000 + 1_000_000);
-        assert_eq!(fee_floor(&Action::Call { program: crate::crypto::Hash::ZERO, proof: vec![] }), 2_000_000);
+        assert_eq!(
+            fee_floor(&Action::Call { program: crate::crypto::Hash::ZERO, proof: vec![], input_envelope: None }),
+            2_000_000
+        );
         assert_eq!(
             fee_floor(&Action::Mint {
                 cm: [0; 8],
@@ -79,6 +90,51 @@ mod tests {
             }),
             0
         );
+    }
+
+    /// S2/S3 scaffold: every new action pays exactly the bundle base, no more and no less.
+    #[test]
+    fn the_staking_and_bridge_actions_pay_the_bundle_base() {
+        use crate::crypto::Address;
+        use crate::notes::Envelope;
+        let env = || Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] };
+        let b = crate::notes::Bundle {
+            anchor: [0; 8],
+            nullifiers: [[0; 8], [1; 8]],
+            commitments: [[2; 8], [3; 8]],
+            fee: 0,
+            burn: 0,
+            asset: 0,
+            time: 0,
+            envelopes: [env(), env()],
+            proof: vec![],
+        };
+        for a in [
+            Action::Bond { validator: Address([1; 32]), amount: 1, registration: None },
+            Action::Unbond {
+                validator: Address([1; 32]),
+                amount: 1,
+                nonce: 0,
+                signature: crate::crypto::Signature::empty(),
+            },
+            Action::Withdraw {
+                validator: Address([1; 32]),
+                amount: 1,
+                nonce: 0,
+                r: [0; 8],
+                envelope: env(),
+                signature: crate::crypto::Signature::empty(),
+            },
+            Action::BridgeAttest {
+                attestation: vec![],
+                recipient: crate::notes::ShieldedAddress { pk: [0; 8], kem_ek: vec![] },
+                r: [0; 8],
+                envelope: env(),
+            },
+            Action::BridgeBurn { asset_bundle: b, asset: 1, amount: 1, relayer_fee: 0, to_chain: 2, to: [0; 32] },
+        ] {
+            assert_eq!(fee_floor(&a), BUNDLE_BASE, "{a:?}");
+        }
     }
 
     #[test]

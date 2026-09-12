@@ -336,7 +336,8 @@ async fn main() -> Result<()> {
             let t = std::time::Instant::now();
             let (proof, outputs, tier) = executor::prove(profile, &prog, &inputs, tier, backend).map_err(|e| anyhow::anyhow!(e))?;
             eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {outputs:?}", t.elapsed(), proof.len());
-            let action = Action::Call { program: pid, proof };
+            // S3 Task 4 seals the call-input envelope here; the scaffold submits calls without one.
+            let action = Action::Call { program: pid, proof, input_envelope: None };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => wallet::call_fee_default(tier),

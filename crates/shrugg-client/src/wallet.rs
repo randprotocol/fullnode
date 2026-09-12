@@ -755,7 +755,8 @@ mod tests {
             assert_eq!(call_fee_default(tier), gas::BUNDLE_BASE + gas::call_fee(tier));
             // The floor `Ledger::validate_inner` applies, not a cent over it: adding
             // `fee_floor(Call)` to `call_fee` would double-count `CALL_BASE`.
-            let doubled = gas::fee_floor(&Action::Call { program: shrugg_core::Hash::ZERO, proof: vec![] }) + gas::call_fee(tier);
+            let floor = gas::fee_floor(&Action::Call { program: shrugg_core::Hash::ZERO, proof: vec![], input_envelope: None });
+            let doubled = floor + gas::call_fee(tier);
             assert_eq!(doubled - call_fee_default(tier), gas::CALL_BASE, "tier {tier}");
         }
     }

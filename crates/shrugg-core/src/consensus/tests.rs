@@ -31,13 +31,14 @@ fn setup(n: u8, validators: u8) -> Sim {
         timestamp_ms: 0,
         validators: keys[..validators as usize]
             .iter()
-            .map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 10 })
+            .map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 10, payout: None })
             .collect(),
         alloc: Vec::new(),
         faucet: true,
         confidential: true,
         fri_profile: "production".into(),
         hc_bundle: word8_to_hex(&[3; 8]),
+        epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
         bridge: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
@@ -852,12 +853,13 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
     let genesis = Genesis {
         chain_id: 1,
         timestamp_ms: 0,
-        validators: vec![GenesisValidator { public_key: key.public_key().clone(), stake: 10 }],
+        validators: vec![GenesisValidator { public_key: key.public_key().clone(), stake: 10, payout: None }],
         alloc: Vec::new(),
         faucet: true,
         confidential: true,
         fri_profile: "production".into(),
         hc_bundle: word8_to_hex(&[3; 8]),
+        epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
         bridge: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
