@@ -76,7 +76,12 @@ while true; do
   local_h=$(rpc shrugg_getHead '[]' | grep -o '"height":[0-9]*' | cut -d: -f2)
   heights="a=$local_h"
   for n in $NODES; do
-    ip=${n#*=}; hh=$(ssh -i "$KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "root@$ip" 'shrugg status 2>/dev/null | grep -o "\"height\": *[0-9]*" | grep -o "[0-9]*$"' 2>/dev/null)
+    ip=${n#*=}; hh=""
+    # Two tries with a generous timeout: a slow SSH handshake to a far region is not a down node.
+    for try in 1 2; do
+      hh=$(ssh -n -i "$KEY" -o ConnectTimeout=25 -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$ip" 'shrugg status 2>/dev/null | grep -o "\"height\": *[0-9]*" | grep -o "[0-9]*$"' 2>/dev/null)
+      [ -n "$hh" ] && break; sleep 3
+    done
     heights="$heights ${n%%=*}=${hh:-down}"
   done
   ex=$(curl -s --max-time 10 "$EXPLORER/health")
