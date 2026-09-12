@@ -435,18 +435,22 @@ pub async fn submit(
     let tx = Transaction::shielded(chain_id, bundle, action);
     let hash = rpc.send_transaction(&tx).await?;
 
-    // Marked as soon as the node has taken the transaction, not once it commits: its nullifiers
-    // are in the mempool from here on, so selecting these notes again could only build a bundle
-    // that is refused. The next scan confirms it against the chain's own nullifier set.
-    for n in store.notes.iter_mut() {
-        if chosen.iter().any(|c| c.index == n.index) {
-            n.spent = true;
-        }
-    }
-
     if wait {
+        // The inputs are marked spent by the rescan, from the chain's own nullifier set — not
+        // from this wallet's belief about what it just sent. That matters on the failure path:
+        // a bundle that never commits (the wait times out, the mempool drops it) leaves its
+        // notes spendable, where marking them here would strand them until the store is thrown
+        // away and rebuilt.
         rpc.wait_for_transaction(&hash, COMMIT_TIMEOUT).await?;
         scan(rpc, w, store).await?;
+    } else {
+        // Nothing will confirm these for the caller, so the wallet has to assume they landed;
+        // the next scan replaces the assumption with the chain's answer either way.
+        for n in store.notes.iter_mut() {
+            if chosen.iter().any(|c| c.index == n.index) {
+                n.spent = true;
+            }
+        }
     }
     Ok(Submission { hash, amount, change, fee, time, tier, proof_bytes: tx.bundle.map_or(0, |b| b.proof.len()), proving })
 }
