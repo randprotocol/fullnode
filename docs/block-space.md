@@ -115,5 +115,38 @@ runs on (`docs/zkvm.md` §5).
 - The RandScan explorer shows bytes per block and per transaction; on the 80-query chain a block
   with three transfers will read as ~3.9 MB, which is correct, not a bug.
 
+## 6. The trade-offs between the three remedies
+
+Asked 2026-09-12: pruning, aggregation and a higher cap each fix a different byte budget, and
+only one of them is cheap.
+
+| | prune proofs after finality | aggregate at the block | raise the block cap |
+|---|---|---|---|
+| fixes | disk: ~1.3 MB → ~3 KB per transfer (170 GB/day → under 1 GB/day at full blocks) | everything at once: a block carries one ~1.3 MB proof plus ~3 KB per transfer, so hundreds of transfers per block | throughput only, linearly: 16 MiB gives 12 per block instead of 3 |
+| leaves alone | throughput (still 3 per block) and validator bandwidth (still 2 MB/s) | the sender's proving cost; sender-to-aggregator bandwidth | disk (×4 if full, 680 GB/day) and bandwidth (8 MB/s); stops paying long before Zcash scale |
+| trust model | changes: a syncing node trusts the epoch's finality signatures for old blocks instead of re-verifying proofs; needs a retention window and weak-subjectivity checkpoints | unchanged: one verification per block covers every bundle, so validators do less work, not more trust | unchanged |
+| effect of 80 queries | the largest ratio of any option: the proof is 99.7 % of a transfer, so pruning removes 400× the bytes | recursion scales with the inner verifier: 80 queries is 3× the Merkle paths to check inside the guest versus 27 | none; the cap is per block, 80 queries only means fewer transfers fit |
+| engineering | small: storage GC, an archive flag, a pruned block body the sync path accepts for finalised blocks | a milestone: a STARK verifier guest (Poseidon2 Merkle paths and FRI folding in RISC-V), then pipelining, because nobody proves an aggregate inside a 2 s slot | a genesis constant plus HotStuff timeouts, and the fee-ordered mempool first or it changes nothing |
+| hidden cost | long-range attacks: unbonded validators of an old epoch could sign a fake history, so proofs stay at least through the unbonding period | latency: the aggregate lands blocks after the transfers it covers, so consensus runs on unaggregated blocks and a later sealed block; who proves and who pays them | decentralisation: 16 MiB in a 2 s slot needs ~70 Mbit/s sustained per link, which the droplets have and a home node does not; propagation eats into HotStuff timeouts |
+
+How they combine matters more than the ranking:
+
+- **Pruning is the prerequisite for the other two.** Raising the cap without pruning turns a
+  disk problem into a disk emergency; aggregation without pruning still stores every inner
+  proof until the aggregate exists.
+- **Aggregation is the only option that changes the shape of the chain** rather than its
+  slope, and the only one that makes 80 queries cost the aggregator rather than every
+  validator link: inner proofs can travel sender-to-aggregator and never enter a block. At
+  today's ~100 s per bundle proof a recursive proof over a block is minutes of GPU per block,
+  so it has to be pipelined and paid for out of fees.
+- **Raising the cap is a knob, not a fix.** A linear factor at a linear bandwidth cost, with a
+  hard ceiling set by the slowest validator link, and it helps only once blocks are full and the
+  mempool orders by fee. A modest step (8 MiB) later, not a strategy.
+
+The order stays as in §4: pruning now, with the RPC hardening work, retention of at least the
+unbonding period and an archive mode for nodes that keep the full history; aggregation as its
+own milestone after M4.4, pipelined; the cap only after the fee-ordered mempool exists and the
+fleet shows full blocks.
+
 Related: `docs/fees.md` (why no gas), `docs/zkvm.md` §5 (the FRI profile), `docs/supply.md`
 (the value-balance audit), `docs/rpc-comparison.md`.
