@@ -846,6 +846,30 @@ fn signed_tx(action: Action) -> Transaction {
     Transaction { chain_id: CHAIN_ID, bundle: None, action }
 }
 
+/// Wait until every node reports `active == want` for `validator`'s register row, then assert it by
+/// timing out.
+///
+/// Deliberately not a [`wait_for`]: the row comes from an RPC call, so the condition cannot be a
+/// synchronous closure — and it has to be asked of every node rather than read off one, because
+/// `active` is *that node's* consensus-side current set. A node one view behind another reports the
+/// previous epoch's answer, so asserting the flag straight after another node's has flipped is a
+/// race even though the two agree within a block.
+async fn wait_active(nodes: &[&TestNode], validator: &Address, want: bool, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        let mut agreed = true;
+        for n in nodes {
+            let active = register_row(n, validator).await.and_then(|r| r["active"].as_bool()).unwrap_or(false);
+            agreed &= active == want;
+        }
+        if agreed {
+            return;
+        }
+        assert!(start.elapsed() < timeout, "timed out waiting for every node to report active={want} for {validator}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// A fifth validator joins a running four-validator chain: its operator prints a registration, a
 /// wallet bonds the minimum stake with it attached, and from the next epoch on the new key is in
 /// the set every node derives — leading views and having its blocks committed by the others.
@@ -911,9 +935,9 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     })
     .await;
     let joined_at = n4.height();
-    for n in all {
-        assert!(register_row(n, &ks[4].address()).await.unwrap()["active"].as_bool().unwrap(), "every node agrees it is in");
-    }
+    // Every node has to agree it is in, not just the joiner: `active` is each node's own view of the
+    // current set, so this waits rather than reads.
+    wait_active(&all, &ks[4].address(), true, Duration::from_secs(60)).await;
 
     // Two whole epochs of the five-validator set. The leader schedule runs over the set, so a
     // member leads about one view in five and the chain cannot advance past its views without it:
@@ -989,7 +1013,7 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     // (The *amount* waits `UNBONDING_EPOCHS`; the *set* is re-derived at the very next boundary,
     // which is why a validator stops proposing long before it can withdraw.)
     wait_for("D to leave the set", Duration::from_secs(180), || !n3.handle.status.read().unwrap().active_validator).await;
-    assert!(!register_row(&n0, &d).await.unwrap()["active"].as_bool().unwrap());
+    wait_active(&all, &d, false, Duration::from_secs(60)).await;
     assert_eq!(n0.rpc.epoch().await.unwrap()["next_set"].as_array().unwrap().len(), 3);
     // The other three are a quorum on their own — more than 2/3 of three equal stakes is three of
     // them — so the chain keeps committing through the boundary and D keeps following it. From the
@@ -1052,6 +1076,12 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
             .await
             .expect("the withdrawn note pays a real bundle");
     eprintln!("spending the withdrawn note: tier {}, proved in {:.1?}", sent.tier, sent.proving);
+    // `wallet::send` waited for the commit on the node it submitted to, which leaves the others up to
+    // a block behind: a balance read straight away can scan a tree the payee's note is not in yet.
+    wait_for("the spend to reach every node", Duration::from_secs(60), || {
+        all.iter().all(|n| n.handle.storage.tx_location(&sent.hash).unwrap().is_some())
+    })
+    .await;
     for n in all {
         assert_eq!(balance(n, &payee).await, pay, "1 SHRUGG out of a note the chain created itself");
         assert_eq!(balance(n, &payout).await, paid - pay - base, "and the change is spendable too");

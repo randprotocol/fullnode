@@ -57,9 +57,15 @@ before re-reporting suspected issues). Fixes merged into `main`:
   (`git worktree add /tmp/fullnode-<name> <branch>`).
 - History alternates squashed mega-commits with small linear ones; branches
   get merged and deleted quickly. `main` is the only durable line.
-- Full test suite: `cargo test --release` (~6 min: zkvm proving and the
-  TCP cluster tests dominate). Doctest flakiness ("extern location ...
-  does not exist") means a concurrent cargo run raced the cache; rerun.
+- Full test suite: `cargo test --release` (~15 min measured 2026-09-12 on a
+  machine also building for another session; cargo runs the test binaries one
+  after another and the two that prove real bundles dominate — the wallet flow
+  ~6 min, the TCP cluster suite ~4). S2 added two more proving cluster tests and
+  slowed the chain they run on to 2 s blocks so a proof cannot outlive its
+  256-block anchor when the cores are contended; see `PROVING` in
+  `crates/shrugg-node/tests/cluster.rs` before making that chain faster again.
+- Doctest flakiness ("extern location ... does not exist") means a concurrent
+  cargo run raced the cache; rerun.
 - The whitepaper is `../whitepapers/randprotocol.tex` (Draft 3) — its
   AGENTS.md has the parameter table (FRI 80/8/20, Poseidon2 width 8,
   384-bit soundness-bearing hashes) that this repo's docs should stay

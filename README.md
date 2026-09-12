@@ -72,7 +72,9 @@ nodes over TCP: a shielded transfer between wallets, a double-spend race between
 deploy-and-call paid by bundles, a fifth validator that registers and bonds itself into the next
 epoch, a validator that unbonds out of the set and withdraws into a note its payout wallet spends,
 late joiners, restart cycles, quorum loss and recovery, corrupted database recovery, and the faucet.
-The cluster suite proves real bundles and takes about twenty minutes.
+The cluster suite proves real bundles and takes about four minutes; the whole
+`cargo test --release` measured about a quarter of an hour, most of it proving, and longer again on a
+machine that is busy with something else.
 
 ## Run a node
 
