@@ -9,7 +9,9 @@ This page is the user's guide to that: the keys, what the chain publishes and wh
 the wallet commands, the RPC surface, the order a node admits a transaction in, and what is
 still leaked. The design spec is
 `docs/superpowers/specs/2026-09-11-shielded-pool-design.md`; the wire-level reference is
-`docs/rpc.md`; the confidential-computation half is `docs/confidential.md`.
+`docs/rpc.md`; the confidential-computation half is `docs/confidential.md`. Staking, the one part of
+this chain with public amounts, is `docs/staking.md`, and the audit that adds the two halves up is
+`docs/supply.md`.
 
 ## 1. Keys and addresses
 
@@ -66,7 +68,8 @@ pinned `bundle` zkVM guest.
 ```
 Bundle { anchor, nullifiers[2], commitments[2], fee, burn, asset, time, envelopes[2], proof }
 Transaction { chain_id, bundle: Option<Bundle>, action }
-Action = None | Mint { .. } | Deploy { base_pc, words } | Call { program, proof }
+Action = None | Mint { .. } | Deploy { base_pc, words } | Call { program, proof, input_envelope }
+       | Bond { validator, amount, registration } | Unbond { .. } | Withdraw { .. }
 ```
 
 The shape is fixed, so one input and one output are often dummies: a dummy input is a zero-value
@@ -90,6 +93,14 @@ nobody can say whose it is.
 The fee is public too, and paid to the block proposer's `rewards` field in the validator register
 — the one place on this chain where an amount is stored in the clear.
 
+Staking is the deliberate exception to all of the above, and it has its own page. A `Bond` publishes
+the validator and the amount, and takes the stake out of the pool as its bundle's `burn`; an
+`Unbond` and a `Withdraw` are signed by the validator's own key and carry no bundle at all; a
+`Withdraw` pays released stake and rewards back into a deposit note at the register's published
+payout address. What stays hidden is which notes paid for a bond, and what becomes of a withdrawn
+note afterwards. See `docs/staking.md`, and `docs/supply.md` for the audit that ties the register and
+the pool back together.
+
 ## 3. The wallet
 
 `shrugg` talks to a node's JSON-RPC and does all the private work locally. Global options:
@@ -105,6 +116,7 @@ The fee is public too, and paid to the block proposer's `rewards` field in the v
 | `shrugg notes` | every note this wallet has opened, with `spent` and `pending` |
 | `shrugg history` | every note this wallet created for someone else |
 | `shrugg send <TO> <AMOUNT>` | select, prove a bundle, submit, wait for the commit |
+| `shrugg bond <VALIDATOR> <AMOUNT>` | stake onto a validator: the bundle burns the amount (`docs/staking.md`) |
 | `shrugg faucet [ADDRESS]` | ask a validator to mint (testnet chains only) |
 | `shrugg program build/deploy/show` | assemble, deploy (paid by a bundle), inspect a program |
 | `shrugg call <PROGRAM>` | prove a call locally, pay through a bundle, print the receipt |
@@ -242,15 +254,20 @@ the same check before gossiping, so a bad transaction is refused once, at the ed
 1. **Size caps** — each envelope ≤ 2048 bytes, the bundle proof ≤ 1 MiB, a program ≤ 4096 words,
    a call proof ≤ 1 MiB.
 2. **Chain id** matches this chain.
-3. **Shape and fee floor** — a mint carries no bundle, everything else must; `asset = 0` and
-   `burn = 0` in this release; `fee ≥ fee_floor(action)`.
+3. **Shape and fee floor** — a mint, an `Unbond` and a `Withdraw` carry no bundle and everything
+   else must; `asset = 0`; `burn = 0` unless the action is a `Bond`, whose bundle must burn exactly
+   the bonded amount; `fee ≥ fee_floor(action)` — which is zero for the three bundle-less actions,
+   since they have nothing to pay a fee *from*.
 4. **Anchor** — the bundle's anchor is one of the last `ANCHOR_WINDOW = 256` *block-end* roots. A
    root the tree only passes through mid-block is never an anchor.
 5. **Time** — `time` is within `[height - 256, height]` (`TIME_WINDOW`).
 6. **Nullifiers and commitments** — the two nullifiers differ and neither is in the spent set;
    the two commitments differ and neither is already a leaf.
 7. **Action checks** — faucet enabled, mint under the 100 SHRUGG cap, minter is a validator and
-   its signature verifies; program decodes (Deploy); program exists (Call).
+   its signature verifies; program decodes (Deploy); program exists (Call); and for the staking
+   actions the rules of `docs/staking.md` — a registration present exactly when the validator is
+   unknown, the register's nonce and the validator's signature, enough stake to unbond, enough
+   released to withdraw, and the deposit note a withdraw derives not already in the tree.
 8. **Bundle digest** — the ledger recomputes the digest from the bundle's published plaintext and
    it must equal what the proof published. A proof whose witness broke the relation publishes a
    tainted digest, which matches no plaintext.
@@ -310,13 +327,15 @@ wallet change, not a chain change.
 
 ## 7. What is next
 
-S1 is the pool itself. Two phases follow, each a hard fork (see spec §12):
+S1 was the pool itself, S2 is in this release, and S3 follows. Each is a hard fork (see spec §12):
 
-**S2 — staking on the shielded chain.** The validator register gains `Bond`, `Unbond` and
-`Withdraw`: stake moves in from a bundle, unbonds after two epochs of 1000 blocks, and a
-validator's accumulated `rewards` (which S1 already credits on every bundle fee) become
-withdrawable into a note at a payout address. `shrugg-node genesis` seeds the register. The
-wallet's local commitment tree — the answer to the witness leak above — lands alongside it.
+**S2 — staking on the shielded chain: here.** The validator register gained `Bond`, `Unbond` and
+`Withdraw`: stake moves in from a bundle as its `burn`, unbonds over two epochs, and a validator's
+accumulated `rewards` (which S1 already credited on every bundle fee) are withdrawable into a note at
+its payout address. Epochs re-derive the validator set from the register, `shrugg-node genesis` seeds
+it, and `shrugg_getSupply` audits the pool against it. The whole of it is `docs/staking.md` and
+`docs/supply.md`. What S2 did **not** bring is the wallet's local commitment tree — the answer to the
+witness leak in §6 — which is still the first follow-up.
 
 **S3 — the bridge, and private call inputs.** Bridged assets become notes with
 `asset = <bridge asset id>`; `BridgeBurn` becomes the one two-bundle transaction (an asset bundle

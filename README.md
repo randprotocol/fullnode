@@ -13,6 +13,7 @@ chain with a proof instead of their inputs.
 | Signatures / hashes | Dilithium2 (post-quantum) / BLAKE3 for validators and blocks; Poseidon2 for notes, the tree and nullifiers; ML-KEM-768 + ChaCha20-Poly1305 for note envelopes |
 | Networking | libp2p 0.54: TCP + Noise + Yamux, gossipsub, Kademlia + bootstrap list, mDNS on LANs, request-response block sync, ping keepalive, automatic redial |
 | Ledger | shielded note pool: a depth-32 Poseidon2 commitment tree, a nullifier set, 2-in-2-out proved bundles, public fees to the proposer's register entry, BLAKE3 Merkle state root over tree, nullifiers, validators and programs |
+| Staking | a public validator register — bond out of a bundle's burn, unbond over two epochs, withdraw into a shielded note — epochs that re-derive the validator set from it, and a supply audit that adds the register and the pool back up to what the chain issued |
 | Wallet keys | a 256-bit spend key; viewing key, note-owner field, nullifier key, outgoing viewing key, ML-KEM-768 decapsulation key and `shrugg1…` address all derived from it |
 | Bridged assets | parked: the guardian bridge returns in phase S3, with bridged assets as notes (`docs/bridge.md`) |
 | Confidential computation | Rand zkVM: RV32I under a Plonky3 batch STARK (Goldilocks, Poseidon2, ZK-hiding FRI); programs deployed on chain, calls carry a proof + 8 public outputs, gas by tier, and pay through a bundle like everything else |
@@ -61,15 +62,17 @@ cargo build --release        # target/release/shrugg-node, target/release/shrugg
 cargo test --release         # all crates; release because STARK proving is slow in debug
 ```
 
-Test coverage: 93 core tests (crypto, notes and the tree, ledger admission rules, gas, genesis, a
-deterministic multi-replica HotStuff simulation with partitions and restarts), node unit tests
-(storage, corruption cases, the conflict mempool, the redacted RPC), wallet tests (key file,
-scanning, coin selection), the zkVM suite (upstream tests plus executor tests with real proofs),
-one wallet-flow test against a real one-node chain (mint, scan, send, spend the change), and 12
-cluster tests that start real nodes over TCP: a shielded transfer between wallets, a double-spend
-race between two validators, a deploy-and-call paid by bundles, late joiners, restart cycles,
-quorum loss and recovery, corrupted database recovery, and the faucet. The cluster suite proves
-real bundles and takes about ten minutes.
+Test coverage: 133 core tests (crypto, notes and the tree, ledger admission rules, the staking
+register and its epochs, the supply audit, gas, genesis, a deterministic multi-replica HotStuff
+simulation with partitions, restarts and epoch rollovers), node unit tests (storage, corruption
+cases, the conflict mempool, the redacted RPC), wallet tests (key file, scanning, coin selection),
+the zkVM suite (upstream tests plus executor tests with real proofs), one wallet-flow test against a
+real one-node chain (mint, scan, send, spend the change, bond), and 14 cluster tests that start real
+nodes over TCP: a shielded transfer between wallets, a double-spend race between two validators, a
+deploy-and-call paid by bundles, a fifth validator that registers and bonds itself into the next
+epoch, a validator that unbonds out of the set and withdraws into a note its payout wallet spends,
+late joiners, restart cycles, quorum loss and recovery, corrupted database recovery, and the faucet.
+The cluster suite proves real bundles and takes about twenty minutes.
 
 ## Run a node
 
@@ -130,7 +133,8 @@ commits in a block's time.
 Their fee model is its own, for the same reason: `unbond` moves stake inside the public register
 and pays nothing at all, while `withdraw` pays the 0.001 SHRUGG bundle base out of the amount it
 withdraws, to the proposer of the block that applies it. A withdrawal of 1000 SHRUGG therefore
-creates a note worth 999.999, and an amount that cannot cover the base is refused.
+creates a note worth 999.999, and an amount that cannot cover the base is refused. `docs/staking.md`
+walks the whole join-and-leave through, including when bonded stake starts counting as weight.
 
 Each machine initialises and runs:
 
@@ -156,6 +160,7 @@ shrugg keygen                                # wallet.key.json (or --key <file>,
 shrugg address                               # shrugg1… — about 1.6 KB of base58
 shrugg balance                               # scans the tree with this key; nobody else can
 shrugg send <shrugg1 address> 1.5            # proves a bundle locally (~100 s), submits, waits
+shrugg bond <validator address> 1000         # stake: the bundle burns it out of this wallet's notes
 shrugg faucet [address]                      # testnet chains only: mint up to 100 SHRUGG
 shrugg notes | shrugg history
 shrugg tx <hash> | shrugg block <height|hash> | shrugg head | shrugg status | shrugg peers | shrugg validators
@@ -192,9 +197,11 @@ shrugg sync && shrugg notes    # scan the tree; list what this key can open
 shrugg send shrugg1q9f… 1.5    # ~100 s of local proving, then the commit
 ```
 
-Value enters the pool through a faucet mint or a genesis `alloc` note, whose **amount is public**
-— the same one-hop visibility a transparent-to-shielded deposit has anywhere. Bridged assets, and
-staking transactions that move value in and out of the register, are phases S2 and S3.
+Value enters the pool through a faucet mint, a genesis `alloc` note, or a validator's withdraw,
+and every one of those amounts is **public** — the same one-hop visibility a transparent-to-shielded
+deposit has anywhere. It leaves as a bundle's fee or a bond's burn, both public too, which is what
+lets `shrugg_getSupply` account for a chain nobody can add up (`docs/supply.md`). Staking is where
+those public amounts live: `docs/staking.md`. Bridged assets are phase S3.
 
 ## Confidential computation
 
@@ -265,6 +272,8 @@ Full detail in `docs/architecture.md`.
 | [docs/cli.md](docs/cli.md) | every `shrugg-node` and `shrugg` command, argument, and default |
 | [docs/rpc.md](docs/rpc.md) | JSON-RPC methods, parameters, result shapes, error codes |
 | [docs/shielded.md](docs/shielded.md) | the shielded pool: keys, what is public, the wallet, the RPC, admission, what still leaks |
+| [docs/staking.md](docs/staking.md) | the validator register, epochs, and the four staking commands: register, bond, unbond, withdraw |
+| [docs/supply.md](docs/supply.md) | the supply audit: the counters, the invariant a node checks, and how exact it is |
 | [docs/confidential.md](docs/confidential.md) | programs, calls, outputs, gas, privacy |
 | [docs/architecture.md](docs/architecture.md) | how the node works end to end: consensus, ledger, storage, networking, sync, and one confidential transaction followed from wallet to receipt |
 | [docs/zkvm-milestones.md](docs/zkvm-milestones.md) | the Rand zkVM milestone by milestone (M1–M4, CUDA backend): what was built and why |
@@ -275,12 +284,12 @@ Full detail in `docs/architecture.md`.
 
 ## Roadmap
 
-The shielded pool lands in three phases, each a hard fork (`docs/shielded.md` §7). **S1**, here, is
-the pool itself: notes, bundles, the wallet, the redacted RPC. **S2** adds staking on top of it —
-Bond, Unbond and Withdraw, epochs, and the validator rewards this release already accrues but
-cannot yet pay out — plus a local wallet commitment tree, so a wallet stops telling its node which
-leaf it is about to spend. **S3** brings the bridge back as notes and gives call inputs their own
-envelopes.
+The shielded pool lands in three phases, each a hard fork (`docs/shielded.md` §7). **S1** is the
+pool itself: notes, bundles, the wallet, the redacted RPC. **S2**, here, adds staking on top of it —
+Bond, Unbond and Withdraw, epochs that re-derive the validator set from the register, and the
+validator rewards S1 accrued but could not pay out (`docs/staking.md`). **S3** brings the bridge back
+as notes and gives call inputs their own envelopes. Still outstanding from S2's own plan: the local
+wallet commitment tree, so a wallet stops telling its node which leaf it is about to spend.
 
 Not yet implemented beyond that: persistent per-program state and cross-program calls; a RISC-V
 compiler flow for programs (today: the built-in assembler or raw word files); slashing and jailing;

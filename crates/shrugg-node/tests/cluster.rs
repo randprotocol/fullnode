@@ -1,5 +1,6 @@
-//! End-to-end: several nodes over real TCP on localhost reach consensus, apply shielded bundles
-//! and faucet mints submitted over RPC, and a late joiner syncs the chain.
+//! End-to-end: several nodes over real TCP on localhost reach consensus, apply shielded bundles,
+//! faucet mints and staking actions submitted over RPC, change their validator set at an epoch
+//! boundary, and let a late joiner sync the chain.
 //!
 //! Two kinds of traffic run here, and the split is deliberate. A *faucet mint* is the one
 //! transaction a node can build for itself, costs nothing to make, and still exercises the whole
@@ -7,9 +8,11 @@
 //! commitment tree, and every node's state root agrees afterwards. Those tests run on a fast
 //! chain (150 ms blocks) because no proof is involved. A *bundle* costs about a minute and a half
 //! of proving in the `test` FRI profile, so the tests that need one (a real transfer, a
-//! double-spend race, a deploy and a call) run on a chain whose blocks are slow enough that the
-//! 256-block anchor and time windows outlive the proof: at [`PROVING`] that is over four minutes
-//! against a proof of about one and a half, margin enough for several such tests proving at once.
+//! double-spend race, a deploy and a call, and both staking tests — a bond is a bundle, and a
+//! withdrawn note is spent by one) run on a chain whose blocks are slow enough that the
+//! 256-block anchor and time windows outlive the proof: at [`PROVING`] that is over eight minutes
+//! against a proof of about one and a half, margin enough for all of them proving at once on a
+//! machine that is busy with something else as well.
 //!
 //! What the bundle tests assert is always a *wallet's* view, never a node's: the chain has no
 //! balances, so `balance(node, wallet)` scans a fresh note store against that node's RPC and
@@ -19,8 +22,10 @@
 use shrugg_client::wallet::{self, NoteStore, Wallet};
 use shrugg_client::RpcClient;
 use shrugg_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
+use shrugg_core::ledger::staking::{MIN_STAKE, UNBONDING_EPOCHS};
 use shrugg_core::notes::{word8_to_hex, ShieldedAddress};
-use shrugg_core::{gas, Action, Hash, Keypair, Word8, UNITS_PER_SHRUGG};
+use shrugg_core::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
+use shrugg_core::{gas, Action, Address, Hash, Keypair, Transaction, Word8, UNITS_PER_SHRUGG};
 use shrugg_node::node::{self, NodeConfig, NodeHandle};
 use shrugg_zkvm::executor::ZkExecutor;
 use shrugg_zkvm::machine::{Backend, FriProfile};
@@ -38,15 +43,20 @@ const ALLOC: u64 = 1_000 * UNITS_PER_SHRUGG;
 const FAST: Duration = Duration::from_millis(150);
 
 /// Block spacing for the tests that prove a bundle. `ANCHOR_WINDOW` and `TIME_WINDOW` are 256
-/// *blocks*, so a bundle has 256 blocks between reading its anchor and being committed under it;
-/// at 1 s that is a little over four minutes, against a tier-14 proof measured at about 98 s in
-/// the `test` profile. The margin is deliberately more than 2×: `cargo test --workspace`
-/// schedules the proving tests concurrently (one of them proves twice), so three or four proofs
-/// compete for the same cores and the wall-clock cost of each one grows. A faster chain would
-/// expire the anchor mid-proof and the test would fail on the clock rather than on the property
-/// it is about. The view timeouts scale with the interval, and every `wait_*` bound in these
-/// tests still holds at 1 s blocks (`wallet::COMMIT_TIMEOUT` is 180 s).
-const PROVING: Duration = Duration::from_millis(1000);
+/// *blocks*, so a bundle has 256 blocks between reading its anchor and its `time`, and being
+/// committed under them; at 2 s that is about eight and a half minutes, against a tier-14 proof
+/// measured at about 100 s in the `test` profile.
+///
+/// The margin is deliberately far more than 2×, and 1 s was not enough. `cargo test --workspace`
+/// schedules all five proving tests concurrently (two of them prove more than once), and this repo
+/// is worked on by several sessions on one machine, so a suite can run beside another suite: at a
+/// load average of 23 on 16 cores each of those proofs took about 290 s, the chain moved 286 blocks
+/// under them, and every one of the five failed on a stale `time` (`time 2 is outside [32, 288]`) —
+/// on the clock, not on the property it was about. Halving the block rate doubles what a proof may
+/// cost before that happens. The view timeouts scale with the interval, and every `wait_*` bound in these tests
+/// holds at 2 s blocks (the longest is two epochs, 24 s, against a 240 s timeout;
+/// `wallet::COMMIT_TIMEOUT` is 180 s against a commit of three or four blocks).
+const PROVING: Duration = Duration::from_millis(2000);
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -96,6 +106,17 @@ fn genesis(validators: &[Keypair]) -> Genesis {
     genesis_funding(validators, &[])
 }
 
+/// The staking chain: short epochs, and a deposit note of exactly the amount each funded wallet
+/// needs. Both differ from [`genesis_funding`] for a reason — an epoch has to pass inside a test's
+/// patience, and a bond has to cover [`MIN_STAKE`] *and* its bundle's fee, which one [`ALLOC`]
+/// note does not.
+fn genesis_staking(validators: &[Keypair], funded: &[(&Wallet, u64)]) -> Genesis {
+    let mut gen = genesis_funding(validators, &[]);
+    gen.epoch_blocks = EPOCH;
+    gen.alloc = funded.iter().map(|(w, amount)| alloc_note(&w.address, *amount)).collect();
+    gen
+}
+
 /// The same chain with one [`ALLOC`] deposit note per wallet in `funded`.
 fn genesis_funding(validators: &[Keypair], funded: &[&Wallet]) -> Genesis {
     Genesis {
@@ -106,7 +127,7 @@ fn genesis_funding(validators: &[Keypair], funded: &[&Wallet]) -> Genesis {
             .enumerate()
             .map(|(i, k)| GenesisValidator {
                 public_key: k.public_key().clone(),
-                stake: shrugg_core::ledger::staking::MIN_STAKE as u128,
+                stake: MIN_STAKE as u128,
                 // Phase S2 requires a payout address per validator; nothing in this test
                 // withdraws, so it only has to parse.
                 payout: shrugg_core::notes::ShieldedAddress {
@@ -782,4 +803,268 @@ async fn confidential_call_rides_on_a_bundle() {
     }
     assert_chains_equal(&[&n0, &n1]);
     eprintln!("confidential_call_rides_on_a_bundle in {:.1?}", started.elapsed());
+}
+
+// ---------------------------------------------------------------- staking (phase S2)
+//
+// The register with public weights, end to end on a real cluster: a validator registers and bonds
+// itself in through a wallet's bundle and starts proposing when its epoch arrives; another unbonds
+// itself out and withdraws its stake into a note its payout wallet can spend. Both run on a
+// `PROVING`-paced chain — each proves one real bundle — and on [`EPOCH`]-block epochs, because
+// what they are about is what happens at an epoch boundary.
+
+/// Blocks per epoch for the staking tests. The chain's default is 1000, which at `PROVING` pace
+/// would be over half an hour per boundary; six blocks is twelve seconds and still exercises the
+/// one rule that matters here — the set for epoch `e` is derived from the register as of the last
+/// block of epoch `e - 1`.
+const EPOCH: u64 = 6;
+
+/// One row of the register as `shrugg_getValidators` reports it, or `None` when the register holds
+/// no entry for that address. This is the read `shrugg-node unbond` and `withdraw` make to find
+/// their nonce, so a test that drives them by hand makes it too.
+async fn register_row(node: &TestNode, validator: &Address) -> Option<serde_json::Value> {
+    let rows = node.rpc.validators().await.expect("getValidators answers");
+    let want = validator.to_base58();
+    rows.as_array()?.iter().find(|r| r["address"].as_str() == Some(want.as_str())).cloned()
+}
+
+/// The supply audit, as `shrugg_getSupply` reports it (`docs/supply.md`).
+async fn supply_of(node: &TestNode) -> serde_json::Value {
+    node.rpc.call("shrugg_getSupply", serde_json::json!([])).await.expect("getSupply answers")
+}
+
+/// An amount from an RPC reply. Every amount the register and the supply audit publish is a
+/// decimal string, because a JSON number is not an exact integer past 2^53.
+fn units(v: &serde_json::Value) -> u64 {
+    v.as_str().expect("an amount is a decimal string").parse().expect("an amount parses")
+}
+
+/// A validator-signed action rides alone: no bundle to prove, no wallet, and the register's nonce
+/// is the whole of its replay protection — exactly the transaction `shrugg-node unbond` and
+/// `shrugg-node withdraw` build.
+fn signed_tx(action: Action) -> Transaction {
+    Transaction { chain_id: CHAIN_ID, bundle: None, action }
+}
+
+/// A fifth validator joins a running four-validator chain: its operator prints a registration, a
+/// wallet bonds the minimum stake with it attached, and from the next epoch on the new key is in
+/// the set every node derives — leading views and having its blocks committed by the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
+    init_tracing();
+    let started = Instant::now();
+    let ks = keys(5);
+    let bonder = wallet(50);
+    let payout = wallet(51);
+    // One note has to hold the stake and the fee of the bundle that burns it: 1000 SHRUGG of stake,
+    // and 1 SHRUGG more to pay the 0.001 fee out of and keep as change.
+    let funding = MIN_STAKE + UNITS_PER_SHRUGG;
+    let gen = genesis_staking(&ks[..4], &[(&bonder, funding)]);
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
+    let boot = vec![bootstrap_addr(&n0)];
+    let n1 = start_node_at(&ks[1], &gen, boot.clone(), true, PROVING).await;
+    let n2 = start_node_at(&ks[2], &gen, boot.clone(), true, PROVING).await;
+    let n3 = start_node_at(&ks[3], &gen, boot.clone(), true, PROVING).await;
+    // The joiner runs with `--validator` from the start and simply observes: the node's
+    // `is_validator` means "a signer is here", and a key in no current epoch's set neither
+    // proposes nor votes until an epoch admits it (spec §8) — which is why joining needs no
+    // restart.
+    let n4 = start_node_at(&ks[4], &gen, boot.clone(), true, PROVING).await;
+    let all = [&n0, &n1, &n2, &n3, &n4];
+    wait_height(&all, 2, Duration::from_secs(60)).await;
+    {
+        let s = n4.handle.status.read().unwrap();
+        assert!(s.is_validator, "the joiner holds a validator key");
+        assert!(!s.active_validator, "which is in no epoch's set yet");
+    }
+    assert!(register_row(&n0, &ks[4].address()).await.is_none(), "and in no register row yet");
+
+    // ---- the bond: a wallet's bundle burns the stake, with the validator's registration attached
+    let registration = Registration {
+        public_key: ks[4].public_key().clone(),
+        payout: payout.address.clone(),
+        signature: ks[4].sign(registration_message(CHAIN_ID, &payout.address).as_bytes()),
+    };
+    let action = Action::Bond { validator: ks[4].address(), amount: MIN_STAKE, registration: Some(registration) };
+    let fee = gas::fee_floor(&action);
+    let mut store = NoteStore::default();
+    let bonded =
+        wallet::submit(&n0.rpc, &bonder, &mut store, None, action, fee, MIN_STAKE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+            .await
+            .expect("the bond's bundle is accepted and commits");
+    eprintln!("bond: tier {}, proved in {:.1?}, {} proof bytes", bonded.tier, bonded.proving, bonded.proof_bytes);
+    assert_eq!(bonded.burn, MIN_STAKE, "the bundle burns exactly what is bonded");
+    assert_eq!(bonded.amount, 0, "a bond pays nobody a note");
+
+    // The register has the entry at once, with the payout address the validator itself signed for.
+    let row = register_row(&n0, &ks[4].address()).await.expect("the bond registered the fifth validator");
+    assert_eq!(units(&row["stake"]), MIN_STAKE);
+    assert_eq!(row["payout"].as_str().unwrap(), payout.address.to_string(), "the payout it signed, not the bonder's");
+    assert_eq!(row["nonce"].as_u64().unwrap(), 0, "a fresh entry's first signed action carries nonce 0");
+    let epoch = n0.rpc.epoch().await.unwrap();
+    assert_eq!(epoch["epoch_blocks"].as_u64().unwrap(), EPOCH);
+    assert_eq!(epoch["next_set"].as_array().unwrap().len(), 5, "the register derives five for the next epoch");
+
+    // ---- the boundary: from here the key is weight, not just a row
+    wait_for("the fifth validator's epoch to arrive", Duration::from_secs(180), || {
+        n4.handle.status.read().unwrap().active_validator
+    })
+    .await;
+    let joined_at = n4.height();
+    for n in all {
+        assert!(register_row(n, &ks[4].address()).await.unwrap()["active"].as_bool().unwrap(), "every node agrees it is in");
+    }
+
+    // Two whole epochs of the five-validator set. The leader schedule runs over the set, so a
+    // member leads about one view in five and the chain cannot advance past its views without it:
+    // a block proposed by the newcomer is proof that the other four voted for it.
+    let until = joined_at + 2 * EPOCH + 2;
+    wait_height(&all, until, Duration::from_secs(240)).await;
+    let proposed: Vec<u64> = (joined_at..=until)
+        .filter(|h| {
+            n0.handle.storage.block_by_height(*h).unwrap().is_some_and(|b| b.proposer() == ks[4].address())
+        })
+        .collect();
+    assert!(!proposed.is_empty(), "the fifth validator led no view in heights {joined_at}..={until}");
+    eprintln!("the fifth validator proposed blocks {proposed:?}");
+
+    // The register is hashed into the state root, so a node that had missed the bond would differ
+    // here rather than merely disagree about who may propose.
+    assert_chains_equal(&all);
+
+    // The stake left the pool as the bundle's burn instead of becoming anyone's note, and the
+    // audit accounts for it on the register's side of the boundary (`docs/supply.md`).
+    assert_eq!(balance(&n0, &bonder).await, funding - MIN_STAKE - fee, "the wallet paid the stake and the fee");
+    let supply = supply_of(&n0).await;
+    assert_eq!(units(&supply["burned"]), MIN_STAKE, "a bond is the only thing that burns");
+    assert_eq!(units(&supply["genesis_deposited"]), funding);
+    assert_eq!(units(&supply["genesis_staked"]), 4 * MIN_STAKE);
+    assert_eq!(units(&supply["register_total"]), 5 * MIN_STAKE + fee, "four genesis stakes, the bond, and the fee");
+    assert!(supply["invariant_holds"].as_bool().unwrap(), "{supply}");
+    eprintln!("a_fifth_validator_registers_bonds_and_joins_the_next_epoch in {:.1?}", started.elapsed());
+}
+
+/// The other direction: validator D unbonds its whole stake, so the next epoch's set is derived
+/// without it; two epochs later the amount is released and a withdraw pays it into a deposit note
+/// at the register's payout address — a note the payout wallet finds by scanning and can spend,
+/// which is the only proof that a withdraw really returns value to the pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_note() {
+    init_tracing();
+    let started = Instant::now();
+    let ks = keys(4);
+    // D's payout wallet starts with nothing at all: every unit it spends at the end arrived as the
+    // withdraw's own note, so the spend is what proves the note is real.
+    let payout = wallet(52);
+    let payee = wallet(53);
+    let mut gen = genesis_staking(&ks, &[]);
+    gen.validators[3].payout = payout.address.to_string();
+    let d = ks[3].address();
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
+    let boot = vec![bootstrap_addr(&n0)];
+    let n1 = start_node_at(&ks[1], &gen, boot.clone(), true, PROVING).await;
+    let n2 = start_node_at(&ks[2], &gen, boot.clone(), true, PROVING).await;
+    let n3 = start_node_at(&ks[3], &gen, boot.clone(), true, PROVING).await;
+    let all = [&n0, &n1, &n2, &n3];
+    wait_height(&all, 2, Duration::from_secs(60)).await;
+    assert!(n3.handle.status.read().unwrap().active_validator, "D starts in the genesis set");
+    assert_eq!(balance(&n0, &payout).await, 0, "the payout wallet holds nothing to begin with");
+
+    // ---- unbond the whole stake: free, bundle-less, signed by the validator's own key
+    let nonce = register_row(&n0, &d).await.unwrap()["nonce"].as_u64().unwrap();
+    let signature = ks[3].sign(unbond_message(CHAIN_ID, &d, MIN_STAKE, nonce).as_bytes());
+    let unbond = signed_tx(Action::Unbond { validator: d, amount: MIN_STAKE, nonce, signature });
+    let hash = n0.rpc.send_transaction(&unbond).await.expect("the unbond is accepted");
+    let unbonded = n0.rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("the unbond commits");
+    let row = register_row(&n0, &d).await.unwrap();
+    assert_eq!(units(&row["stake"]), 0, "the whole stake moved into unbonding");
+    assert_eq!(row["nonce"].as_u64().unwrap(), nonce + 1, "the nonce is the replay protection");
+    let pending = row["pending"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "one row per release epoch");
+    assert_eq!(units(&pending[0]["amount"]), MIN_STAKE);
+    let release_epoch = pending[0]["release_epoch"].as_u64().unwrap();
+    assert_eq!(release_epoch, unbonded.height / EPOCH + UNBONDING_EPOCHS, "released two epochs on");
+
+    // ---- the next boundary derives the set without it: an entry with no stake is not eligible.
+    // (The *amount* waits `UNBONDING_EPOCHS`; the *set* is re-derived at the very next boundary,
+    // which is why a validator stops proposing long before it can withdraw.)
+    wait_for("D to leave the set", Duration::from_secs(180), || !n3.handle.status.read().unwrap().active_validator).await;
+    assert!(!register_row(&n0, &d).await.unwrap()["active"].as_bool().unwrap());
+    assert_eq!(n0.rpc.epoch().await.unwrap()["next_set"].as_array().unwrap().len(), 3);
+    // The other three are a quorum on their own — more than 2/3 of three equal stakes is three of
+    // them — so the chain keeps committing through the boundary and D keeps following it. From the
+    // *first block of the next epoch* on, D leads no view: the set the leader rotation runs over is
+    // the one that epoch's boundary derived, and D is not in it. The epoch it was still in counts
+    // for nothing here — the unbond and the boundary are different heights.
+    let out_from = (unbonded.height / EPOCH + 1) * EPOCH;
+    wait_height(&all, out_from + EPOCH, Duration::from_secs(180)).await;
+    let led = (out_from..=n0.height())
+        .filter(|h| n0.handle.storage.block_by_height(*h).unwrap().is_some_and(|b| b.proposer() == d))
+        .count();
+    assert_eq!(led, 0, "a validator the epoch's set excludes leads no view in it");
+
+    // ---- withdraw, once the unbonding epochs have passed
+    wait_height(&all, release_epoch * EPOCH, Duration::from_secs(240)).await;
+    let nonce = register_row(&n0, &d).await.unwrap()["nonce"].as_u64().unwrap();
+    let base = gas::BUNDLE_BASE;
+    // Exactly what `shrugg-node withdraw` builds: the note is worth the amount less the base, at
+    // the head height (inside the 256-block window), and its envelope is sealed to the payout
+    // address under a throwaway sender key. The chain recomputes the commitment from the register
+    // and the action's public fields, so the note it appends is this one or the withdraw is
+    // refused.
+    let time = n0.height() as u32;
+    let note = Note::new(payout.address.pk, [0; 8], MIN_STAKE - base, 0, time);
+    let envelope = shrugg_zkvm::address::seal_note(&SpendKey::random().viewing_key(), &payout.address, &note, &TxKey::random())
+        .expect("sealing the payout note");
+    let signature = ks[3].sign(withdraw_message(CHAIN_ID, &d, MIN_STAKE, nonce, time, &note.r, &envelope).as_bytes());
+    let withdraw = signed_tx(Action::Withdraw {
+        validator: d,
+        amount: MIN_STAKE,
+        nonce,
+        time,
+        r: note.r,
+        envelope,
+        signature,
+    });
+    let hash = n0.rpc.send_transaction(&withdraw).await.expect("the withdraw is accepted");
+    let paid_in = n0.rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("the withdraw commits");
+    let cm = note.commitment();
+    wait_for("the withdraw's note to reach every node", Duration::from_secs(60), || all.iter().all(|n| n.holds(&cm))).await;
+
+    // The register lost the whole amount, and the base it paid is in the register still — as the
+    // rewards of the proposer of the block that applied it, exactly where a bundle fee goes.
+    // Nothing has paid a fee on this chain yet, so it is the only reward anyone holds.
+    let row = register_row(&n0, &d).await.unwrap();
+    assert!(row["pending"].as_array().unwrap().is_empty(), "the released amount left the register");
+    assert_eq!(units(&row["rewards"]), 0, "and nothing was ever credited to D: no bundle has paid a fee here");
+    let proposer = n0.handle.storage.block_by_height(paid_in.height).unwrap().unwrap().proposer();
+    assert_eq!(units(&register_row(&n0, &proposer).await.unwrap()["rewards"]), base, "the base went to the proposer");
+
+    // ---- the payout wallet finds the note by scanning, and spends it
+    let paid = MIN_STAKE - base;
+    for n in all {
+        assert_eq!(balance(n, &payout).await, paid, "the note is worth the amount less the base");
+    }
+    let mut store = NoteStore::default();
+    let pay = UNITS_PER_SHRUGG;
+    let sent =
+        wallet::send(&n0.rpc, &payout, &mut store, &payee.address, pay, base, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+            .await
+            .expect("the withdrawn note pays a real bundle");
+    eprintln!("spending the withdrawn note: tier {}, proved in {:.1?}", sent.tier, sent.proving);
+    for n in all {
+        assert_eq!(balance(n, &payee).await, pay, "1 SHRUGG out of a note the chain created itself");
+        assert_eq!(balance(n, &payout).await, paid - pay - base, "and the change is spendable too");
+    }
+
+    // The audit's two halves still add up: the withdraw moved value from the register into the
+    // pool, and only what actually reached the pool — the note, not the base — is counted.
+    let supply = supply_of(&n0).await;
+    assert_eq!(units(&supply["withdraw_deposited"]), paid);
+    assert_eq!(units(&supply["genesis_deposited"]), 0, "nothing was ever deposited at genesis here");
+    assert_eq!(units(&supply["fees_paid"]), base, "the transfer's fee; the withdraw's base never left the pool");
+    assert_eq!(units(&supply["burned"]), 0);
+    assert!(supply["invariant_holds"].as_bool().unwrap(), "{supply}");
+    assert_chains_equal(&all);
+    eprintln!("unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_note in {:.1?}", started.elapsed());
 }
