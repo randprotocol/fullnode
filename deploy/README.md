@@ -1,15 +1,18 @@
-# Testnet: chain id 5 (SHRUGG, confidential computation, zkVM constraint set 4)
-
-> **The fleet below is an account chain and is unchanged by the shielded pool.** Phase S1 (the
-> note ledger, bundles, the shielded wallet) is a hard fork: a node built from this branch cannot
-> join chain 5, and chain 5's blocks cannot be replayed by it. The fleet moves when the operator
-> decides to, by cutting a new chain id from a shielded genesis — see "Cutting a shielded genesis"
-> at the end of this file. Until then, run the shielded build on a separate chain id, or keep the
-> pinned account build (`deploy/run-a-pinned.sh`, `.update-pin`) for the fleet.
+# Testnet: chain id 6 (SHRUGG, shielded pool S1+S3, zkVM constraint set 4)
 
 Test keys only; all seeds are committed on purpose so any machine can pull and run.
-Genesis hash `3a82b0c7b6c4eb1eb1e1ba8a54b4306a883a57d46ccebce1e7adb7b5fd9ffa86`, 100 SHRUGG per validator, **faucet enabled**, **confidential computation enabled** (production FRI profile, no bridge section; fleet build commit dbea18c, constraint set 4)
-(`shrugg faucet [address]` mints up to 100 SHRUGG per call on any node). Quorum is 3 of 4 validators.
+Genesis hash `7913586b10f2f5539469c6cb4817b81e0edba6c86950fb00cedff6ad7288cbbb`, cut 2026-09-12 from
+build `01dc23d` (branch `shielded-s3`: notes ledger, bundles, faucet mints, deploy/call on bundles
+with call-input envelopes, bridge as notes; no staking register yet, no bridge section). Four
+validators A–D with stake 100000 each (quorum 3 of 4), five 1000-SHRUGG genesis deposit notes
+owned by `wallets/shielded-{1..5}.key.json` on the laptop (gitignored), **faucet enabled**,
+**confidential computation enabled** (production FRI profile), `hc_bundle`
+`4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb`. There are no accounts on this
+chain: `shrugg faucet` mints into a note for a `shrugg1…` address and `shrugg send` proves a bundle
+(about 100 s on a laptop). Datadirs are `data-<letter>-7913586b`.
+
+Chain 5 (genesis 3a82b0c7, account chain, build dbea18c) halted at height 29,854 and was replaced
+by this cut. The next fork (S2 staking + constraint set 5) is a new chain id again.
 
 | node | role | where | address | peer id |
 |---|---|---|---|---|
@@ -83,7 +86,7 @@ shrugg-node genesis --chain-id 6 \
 ```
 
 `deploy/genesis-shielded.example.json` in this repo is exactly that file, produced by that command
-(chain id 6, genesis hash `6457243776e7c152b946a3a245f6748d9934ffc6f08ac22f868fb4014b38ddf3`,
+(chain id 6, genesis hash `6457243776e7c152b946a3a245f6748d9934ffc6f08ac22f868fb4014b38ddf3`; the live fleet genesis is `deploy/genesis.json`, hash 7913586b…,
 `hc_bundle 4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb`). It is an **example**:
 its five deposit notes belong to spend keys that live only on the machine that cut it, so re-cut
 your own rather than adopting it. Two properties make that unavoidable:
