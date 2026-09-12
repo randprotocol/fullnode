@@ -4045,13 +4045,17 @@ dependencies = [
  "anyhow",
  "clap",
  "hex",
+ "libp2p",
  "reqwest",
  "serde",
  "serde_json",
  "shrugg-core",
+ "shrugg-node",
  "shrugg-zkvm",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
