@@ -8,6 +8,16 @@ on-chain call model, `docs/shielded.md` the note pool built on the `bundle` gues
 vendored here as `crates/shrugg-zkvm`; its own documents (`research/docs/01`–`06`) are the
 authoritative reference and are cited by name below.
 
+> **What this node actually runs, and the M4.2 marker.** `crates/shrugg-zkvm` is **constraint set
+> 4 (milestone M4.1)**: eight tables, no Keccak anywhere — no keccak table, no `KECCAK` syscall,
+> no `keccak_log_height`, no `keccak_demo` guest, no `keccak`/`keccak256` in the guest SDK. The
+> Keccak work exists **upstream only**, in `circuits/research` at milestone M4.2. Every line
+> below that describes it is tagged **(M4.2, upstream `circuits/research`; not yet vendored into
+> this node — constraint set 5 when it lands)**, shortened after the first few to
+> **(M4.2 — upstream only)**. It is not a chain rule here until it is vendored, and vendoring it
+> changes `hc` and the verifier key, so it arrives as a hard fork to constraint set 5. Read every
+> tagged line as a description of upstream, not of this build.
+
 ## 1. What a proof states
 
 One relation, for every program:
@@ -93,7 +103,11 @@ comes from `a1` through the row's memory slot; a value-returning syscall writes 
 | 1 | `WRITE_OUTPUT slot word` | pins public output `slot < 8`; each slot at most once; unwritten slots are pinned to zero | 1 |
 | 2 | `READ_INPUT idx` | returns private input word `idx`, looked up in the committed input table; two reads of one index agree; `idx ≥ n_in` is unsatisfiable | 1 |
 | 3 | `POSEIDON2 ptr n` | hashes `n ≤ 4096` words at word address `ptr` with the Poseidon2 sponge (width 8, rate 4, overwrite mode) and writes the 8-word digest in place | 1 + ⌈n/4⌉ + 2 |
-| 4 | `KECCAK ptr` (M4.2) | one Keccak-f[1600] permutation of the 50-word state at word address `ptr`, in place; the keccak table reads and writes the words itself | 1 |
+| 4 | `KECCAK ptr` **(M4.2, upstream `circuits/research`; not yet vendored into this node — constraint set 5 when it lands)** | one Keccak-f[1600] permutation of the 50-word state at word address `ptr`, in place; the keccak table reads and writes the words itself | 1 |
+
+Rows 0–3 are the whole syscall surface this node runs. Row 4 does not exist in
+`crates/shrugg-zkvm`: an `ECALL` with `a7 = 4` is an unsatisfiable row here, not a Keccak
+permutation.
 
 Note commitments, nullifiers and Merkle verification are **not** syscalls: they are assembler
 library routines that stage a domain-tagged message in RAM and call `POSEIDON2`
@@ -104,29 +118,33 @@ loop over the path, so program size does not scale with tree depth.
 
 **The emulator is the reference.** `emulator::run(program, inputs, max_cycles)` executes the
 program and records one `CycleEvent` per cpu row: the instruction, its operands, the ALU result,
-the memory accesses with their slots, the syscall, and any hash-row or keccak-row data. If the
-AIR and the emulator ever disagree, the AIR is wrong (`research/AGENTS.md`).
+the memory accesses with their slots, the syscall, and any hash-row data (and keccak-row data
+**(M4.2 — upstream only)**). If the AIR and the emulator ever disagree, the AIR is wrong
+(`research/AGENTS.md`).
 
 **Cycles and tiers.** A cycle is one cpu row. Gas is a tier `t ∈ {10, 12, 14, 16, 18, 20}`: the
 cpu table is padded to `2ᵗ` rows, the ALU table to `2ᵗ⁺¹`, the memory table to `2ᵗ⁺²` (four
-accesses per cycle, plus room for Keccak traffic since M4.2), the Poseidon2 table to
-`32·2ᵗ⁻³` permutation blocks. Only `t` is public. The prover picks the smallest tier whose
-budget covers `cycles + program digest rows + input digest rows`; a run that does not fit fails
-before proving.
+accesses per cycle; upstream the same headroom also carries the keccak table's own memory
+traffic **(M4.2 — upstream only)**), the Poseidon2 table to `32·2ᵗ⁻³` permutation blocks. Only
+`t` is public. The prover picks the smallest tier whose budget covers
+`cycles + program digest rows + input digest rows`; a run that does not fit fails before proving.
 
-**The trace.** A run becomes nine tables proved together as one Plonky3 batch STARK, connected
-by LogUp buses instead of direct calls:
+**The trace.** A run becomes a set of tables proved together as one Plonky3 batch STARK, connected
+by LogUp buses instead of direct calls — **eight tables today** (`program`, `cpu`, `memory`,
+`alu`, `range`, `nibble`, `poseidon2`, `input`), **nine with M4.2**, whose ninth is the `keccak`
+table **(M4.2, upstream `circuits/research`; not yet vendored into this node — constraint set 5
+when it lands)**:
 
 | table | rows | provides / consumes |
 |---|---|---|
 | `program` | one per instruction word (witness, in-circuit decoder) | provides `PROGRAM` (pc → decode) and `PROGRAM_WORD` (the words the digest absorbs) |
-| `cpu` | one per cycle, plus digest rows | consumes everything; sends `MEMORY`, `ALU`, `RANGE8`, `POW2`, `AND4/OR4/XOR4`, `POSEIDON2`, `INPUT_READ`, `KECCAK` |
+| `cpu` | one per cycle, plus digest rows | consumes everything; sends `MEMORY`, `ALU`, `RANGE8`, `POW2`, `AND4/OR4/XOR4`, `POSEIDON2`, `INPUT_READ` (and `KECCAK` **(M4.2 — upstream only)**) |
 | `memory` | one per access, sorted | receives `MEMORY` (multiset equality) |
 | `alu` | one per ALU operation | provides `ALU` `(op, a, b, c)` |
 | `range`, `nibble` | 256 rows each, preprocessed | provide byte range checks, powers of two, 4-bit AND/OR/XOR |
 | `poseidon2` | 32-row blocks, one row per round | provides `POSEIDON2` `[in0..7, out0..7]` |
 | `input` | one per private input word | provides `INPUT_DIGEST` and `INPUT_READ` |
-| `keccak` (M4.2) | 32-row blocks, 24 rounds + 8 idle rows | provides `KECCAK` `(clk, ptr)`, sends its own `MEMORY` traffic |
+| `keccak` **(M4.2, upstream `circuits/research`; not yet vendored into this node — constraint set 5 when it lands)** | 32-row blocks, 24 rounds + 8 idle rows | provides `KECCAK` `(clk, ptr)`, sends its own `MEMORY` traffic |
 
 The cpu trace begins with **digest rows**: they absorb the program words (through `PROGRAM_WORD`)
 and then the salted private inputs (through `INPUT_DIGEST`) into the Poseidon2 chip and publish
@@ -147,24 +165,30 @@ table's maximum constraint degree is pinned by a test under the cap of 8 that `l
 allows.
 
 **Verification.** `Machine::verify(hc, proof)` checks the 26 public values are canonical, `HC`
-equals `hc`, the tier is valid, the proof-declared heights (`program_log_height`,
-`input_log_height`, and `keccak_log_height` since M4.2) are in range and match the proof's degree
-bits, then runs the batch verifier. The verifier key depends only on `(tier, heights)`, never on
-program content, and is cached; a warm verify is about 16 ms.
+equals `hc`, the tier is valid, the proof-declared heights are in range and match the proof's
+degree bits, then runs the batch verifier. This node's `Proof` declares two heights,
+`program_log_height` and `input_log_height`; a third, `keccak_log_height`, joins them
+**(M4.2, upstream `circuits/research`; not yet vendored into this node — constraint set 5 when it
+lands)**. The verifier key depends only on `(tier, heights)`, never on program content, and is
+cached; a warm verify is about 16 ms.
 
 ## 6. Programs
 
 **Hand-assembled.** `asm.rs` provides mnemonic helpers and routines; the crate's guests
-(`fib`, `balance_check`, `private_payment`, `transfer`, `bundle`, `keccak_demo`, …) are built
-this way. `Program { base_pc, words }`.
+(`fib`, `balance_check`, `private_payment`, `transfer`, `bundle`, `poseidon2_demo`, …) are built
+this way; upstream's list also holds `keccak_demo` **(M4.2 — upstream only)**.
+`Program { base_pc, words }`.
 
 **Compiled.** `#![no_std]` Rust for `riscv32im-unknown-none-elf`, linked with
 `guest-sdk/guest.ld` at `0x1000` with a 64 KiB stack, converted with `llvm-objcopy -O binary`,
 and loaded by `Program::from_flat_binary(base_pc, bytes)`, which checks the length, alignment,
 size and that every word decodes. `_start` sets `sp` to `__stack_top`, calls `main`, then halts.
-`guest-sdk` wraps the syscalls (`read_input`, `write_output`, `poseidon2`, `keccak`,
-`keccak256`, `halt`); pointers passed to `poseidon2`/`keccak` are converted to word addresses by
-the SDK. Compiled guests are committed as `.bin` files with a `Makefile`.
+Upstream's `guest-sdk` wraps the syscalls (`read_input`, `write_output`, `poseidon2`, `halt`,
+plus `keccak`/`keccak256` **(M4.2 — upstream only)**); pointers passed to `poseidon2` (and to
+`keccak`, upstream) are converted to word addresses by the SDK. Compiled guests are committed as
+`.bin` files with a `Makefile`; the SDK and the `Makefile`s live upstream, and only the built
+binaries are vendored here (`guests-compiled/bin/`, copied by `deploy/sync-zkvm.sh`), so a guest
+written against the M4.2 wrappers could not be built against this node's machine in any case.
 
 **Identity.** `hc = Poseidon2(HC domain, base_pc, len; words)` with the domain, base address and
 length folded into the sponge capacity, computed in circuit. `hc` is binding but not hiding:
@@ -195,7 +219,8 @@ Proving is a wallet-side cost paid once; verification is the consensus cost paid
 
 ## 9. Soundness notes worth knowing
 
-- Every load/store address, hash pointer and keccak pointer is range-bounded below `2³⁰`.
+- Every load/store address and hash pointer is range-bounded below `2³⁰` (and, upstream, every
+  keccak pointer **(M4.2 — upstream only)**).
 - Never-written output slots are pinned to zero; a slot cannot be written twice.
 - The program digest covers every valid program row (set equality), so a computed jump into
   undigested code is impossible.
