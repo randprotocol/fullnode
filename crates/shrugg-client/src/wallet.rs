@@ -11,7 +11,7 @@
 //! the process is exactly what a bundle publishes: an anchor, two nullifiers, two commitments,
 //! the fee, and two envelopes nobody but their recipients can open.
 
-use crate::{AssetRow, RpcClient};
+use crate::{AssetRow, CommitmentRow, RpcClient};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -24,6 +24,7 @@ use shrugg_zkvm::executor::prove_bundle;
 use shrugg_zkvm::machine::{Backend, FriProfile};
 use shrugg_zkvm::notes::{bundle_inputs, expected_bundle_outputs, Note, SpendKey, ViewingKey};
 use shrugg_zkvm::viewing::TxKey;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -196,6 +197,11 @@ pub struct NoteStore {
     pub scanned_index: u64,
     /// The next block height to read nullifiers from.
     pub scanned_height: u64,
+    /// The next block height to read committed `bridge_attest` transactions from, for the
+    /// deposit-rebuild path in [`scan`]. Zero on a store written before that path existed, which
+    /// is what makes an older store re-read its blocks once and recover anything it missed.
+    #[serde(default)]
+    pub scanned_attest_height: u64,
     pub notes: Vec<OwnedNote>,
     #[serde(default)]
     pub sent: Vec<SentRow>,
@@ -327,10 +333,116 @@ pub fn classify(w: &Wallet, cm: Word8, envelope: &Envelope) -> Found {
     Found::Skipped(why)
 }
 
+/// The deposit note a committed `bridge_attest` appended for `w`, rebuilt from the public fields
+/// the node renders and nothing else.
+///
+/// Every word of a deposit note is public in that one transaction: the recipient address, the
+/// amount the guardians signed, the registry index, the action's `time` and its blinding `r`
+/// (`docs/bridge.md` §8). Nothing binds the envelope a submitter publishes to the note the chain
+/// computes, and anyone may submit an attestation — so a hostile relayer can seal garbage, consume
+/// the attestation's digest, and leave the recipient a leaf no trial decryption finds. This is the
+/// path that finds it anyway, with nothing decrypted.
+///
+/// `None` for any other action, for a deposit to another address, for a guardian-set rotation
+/// (which deposits nothing, so the node renders no index and no commitment), and for a rendering
+/// whose `commitment` is not the note these fields build — the chain computes that commitment, so
+/// it is the authority on which leaf it appended.
+pub fn rebuilt_deposit(w: &Wallet, action: &Value) -> Option<Note> {
+    if action["kind"].as_str()? != "bridge_attest" {
+        return None;
+    }
+    let recipient = ShieldedAddress::parse(action["recipient"].as_str()?).ok()?;
+    if recipient.pk != w.vk.pk() {
+        return None;
+    }
+    let note = Note {
+        pk: recipient.pk,
+        // A deposit has no sender inside the pool, so the note records the zero word — the same
+        // constant `bridge_notes::DEPOSIT_FROM` is.
+        from: [0; 8],
+        amount: action["amount"].as_u64()?,
+        asset: u32::try_from(action["asset_index"].as_u64()?).ok()?,
+        time: u32::try_from(action["time"].as_u64()?).ok()?,
+        r: word8_from_hex(action["r"].as_str()?)?,
+    };
+    (word8_to_hex(&note.commitment()) == action["commitment"].as_str()?).then_some(note)
+}
+
+/// Every deposit this wallet can rebuild out of blocks it has not read yet, keyed by the
+/// commitment the chain appended for it. [`scan`] matches each against the leaf that carries that
+/// commitment, which is what turns a rebuilt note into an owned one at a known index.
+///
+/// Blocks are read once: `scanned_attest_height` moves past them whether or not they held a
+/// deposit for this wallet. On a chain with no bridge there is nothing to read at all — a
+/// `BridgeAttest` is inadmissible there — so the whole pass costs one `shrugg_getBridgeState`.
+async fn rebuildable_deposits(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<BTreeMap<Word8, Note>> {
+    let head = rpc.head().await?["height"].as_u64().context("getHead did not return a height")?;
+    if store.scanned_attest_height > head {
+        return Ok(BTreeMap::new());
+    }
+    if !rpc.bridge_state().await?["enabled"].as_bool().unwrap_or(false) {
+        store.scanned_attest_height = head + 1;
+        return Ok(BTreeMap::new());
+    }
+    let mut out = BTreeMap::new();
+    for height in store.scanned_attest_height..=head {
+        let block = rpc.block_by_height(height).await?;
+        let Some(txs) = block["transactions"].as_array() else { continue };
+        for tx in txs {
+            if let Some(note) = rebuilt_deposit(w, &tx["action"]) {
+                out.insert(note.commitment(), note);
+            }
+        }
+    }
+    store.scanned_attest_height = head + 1;
+    Ok(out)
+}
+
+/// Record what one leaf is for this wallet. `deposits` is what [`rebuildable_deposits`] found:
+/// a leaf whose commitment is in it is this wallet's deposit whatever its envelope says, so it is
+/// tried first and the envelope is never consulted for it.
+fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, deposits: &mut BTreeMap<Word8, Note>) {
+    let found = match deposits.remove(&row.cm) {
+        Some(note) => Found::Received(note),
+        None => classify(w, row.cm, &row.envelope),
+    };
+    match found {
+        // A note can be re-offered by a rescan; the index is the leaf, so it is unique.
+        Found::Received(note) => {
+            if !store.notes.iter().any(|n| n.index == row.index) {
+                store.notes.push(OwnedNote {
+                    index: row.index,
+                    cm: row.cm,
+                    nf: w.vk.nullifier(&row.cm),
+                    note,
+                    spent: false,
+                    pending: None,
+                    height: row.height,
+                });
+            }
+        }
+        Found::Sent(note) => {
+            if !store.sent.iter().any(|s| s.index == row.index) {
+                store.sent.push(SentRow { index: row.index, to_pk: note.pk, amount: note.amount, height: row.height });
+            }
+        }
+        Found::Skipped(why) => {
+            if why != "no key of this wallet opens it" {
+                eprintln!("warning: ignoring leaf {}: {why}", row.index);
+            }
+        }
+    }
+}
+
 /// Trial-decrypt every commitment this wallet has not seen yet, then mark as spent every note
 /// whose nullifier the chain has published. Advances the store and saves nothing — the caller
 /// owns the file.
 pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<()> {
+    // What the envelope layer cannot be trusted to deliver, read off the wire instead. Done
+    // before the leaves are paged, so a deposit is placed by the same pass that first sees its
+    // leaf rather than a scan later.
+    let mut deposits = rebuildable_deposits(rpc, w, store).await?;
+
     loop {
         let rows = rpc.commitments(store.scanned_index, PAGE).await?;
         if rows.is_empty() {
@@ -338,36 +450,42 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
         }
         let before = store.scanned_index;
         for row in &rows {
-            match classify(w, row.cm, &row.envelope) {
-                // A note can be re-offered by a rescan; the index is the leaf, so it is unique.
-                Found::Received(note) => {
-                    if !store.notes.iter().any(|n| n.index == row.index) {
-                        store.notes.push(OwnedNote {
-                            index: row.index,
-                            cm: row.cm,
-                            nf: w.vk.nullifier(&row.cm),
-                            note,
-                            spent: false,
-                            pending: None,
-                            height: row.height,
-                        });
-                    }
-                }
-                Found::Sent(note) => {
-                    if !store.sent.iter().any(|s| s.index == row.index) {
-                        store.sent.push(SentRow { index: row.index, to_pk: note.pk, amount: note.amount, height: row.height });
-                    }
-                }
-                Found::Skipped(why) => {
-                    if why != "no key of this wallet opens it" {
-                        eprintln!("warning: ignoring leaf {}: {why}", row.index);
-                    }
-                }
-            }
+            place_leaf(w, store, row, &mut deposits);
             store.scanned_index = store.scanned_index.max(row.index + 1);
         }
         // A non-empty page that leaves the cursor where it was would loop forever.
         if store.scanned_index <= before {
+            return Err(anyhow!(
+                "getCommitments returned {} rows from index {before} without advancing past it",
+                rows.len()
+            ));
+        }
+    }
+
+    // A rebuilt deposit whose leaf sits *below* the cursor — an attestation this wallet read the
+    // blocks of only now, having scanned past its leaf with an older build — is placed by reading
+    // the leaves again from the start. Re-offering a leaf costs nothing (every record here is
+    // keyed by its index), and this loop runs at most once per recovered deposit, because the
+    // deposit is in the store from then on.
+    let mut from = 0;
+    while !deposits.is_empty() {
+        let rows = rpc.commitments(from, PAGE).await?;
+        if rows.is_empty() {
+            // Every leaf there is has been offered and some deposit still has no leaf: the node
+            // rendered an attestation whose commitment its own tree does not hold.
+            return Err(anyhow!(
+                "{} rebuilt deposit(s) match no leaf of the tree; the node's blocks and notes disagree",
+                deposits.len()
+            ));
+        }
+        let before = from;
+        for row in &rows {
+            place_leaf(w, store, row, &mut deposits);
+            from = from.max(row.index + 1);
+        }
+        // Same guard the forward pass has: a non-empty page that does not move the cursor would
+        // loop forever.
+        if from <= before {
             return Err(anyhow!(
                 "getCommitments returned {} rows from index {before} without advancing past it",
                 rows.len()
@@ -1135,6 +1253,7 @@ mod tests {
         let store = NoteStore {
             scanned_index: 4,
             scanned_height: 2,
+            scanned_attest_height: 3,
             notes: vec![owned(0, 5, false), owned(1, 3, true), owned(2, 0, false), owned(3, 2, false)],
             sent: vec![],
         };
@@ -1322,6 +1441,61 @@ mod tests {
         assert_ne!(deposit_note_for(&me, &me.address, 1_000, 3, 41).unwrap().0.r, note.r);
     }
 
+    /// A deposit whose published envelope is garbage — a hostile relayer's, or a broken one — is
+    /// still this wallet's note. Anyone may submit an attestation and nothing binds its envelope to
+    /// the note the chain computes, so the envelope layer is not what a deposit's recipient depends
+    /// on: every word of that note is public in the same transaction, and the wallet rebuilds it
+    /// from what the node renders and checks it against the commitment the chain appended.
+    #[test]
+    fn a_deposit_with_a_garbage_envelope_is_still_rebuilt_from_the_wire() {
+        let me = Wallet::from_spend_key(SpendKey([41; 8]));
+        let stranger = Wallet::from_spend_key(SpendKey([42; 8]));
+        // The note the chain computes for 1000 units of asset 3, deposited at time 12: `from` is
+        // the zero word, because a deposit has no sender inside the pool.
+        let note = Note { pk: me.vk.pk(), from: [0; 8], amount: 1_000, asset: 3, time: 12, r: [9; 8] };
+        // What `tx_json` renders for that committed attest.
+        let rendered = |to: &ShieldedAddress, cm: Word8| {
+            serde_json::json!({
+                "kind": "bridge_attest",
+                "attestation_len": 520,
+                "recipient": to.to_string(),
+                "asset": 3,
+                "asset_index": 3,
+                "amount": 1_000,
+                "time": 12,
+                "r": word8_to_hex(&[9; 8]),
+                "commitment": word8_to_hex(&cm),
+            })
+        };
+
+        // The envelope the relayer published opens with no key of this wallet's — which is all the
+        // griefing ever was, and it stops mattering here.
+        let garbage = Envelope { kem_ct: vec![0xff; 8], to_receiver: vec![0xff; 16], to_sender: vec![], body: vec![0xff; 16] };
+        assert!(matches!(classify(&me, note.commitment(), &garbage), Found::Skipped(_)));
+        assert_eq!(rebuilt_deposit(&me, &rendered(&me.address, note.commitment())), Some(note));
+
+        // A deposit to someone else is not rebuilt, whoever renders it.
+        assert_eq!(rebuilt_deposit(&me, &rendered(&stranger.address, note.commitment())), None);
+        // Nor is a note that does not hash to the commitment the chain published: the chain
+        // computes that commitment, so it is the authority on which leaf it appended.
+        assert_eq!(rebuilt_deposit(&me, &rendered(&me.address, [1; 8])), None);
+        // A rotation deposits nothing, so the node renders no index, no amount and no commitment.
+        let rotation = serde_json::json!({
+            "kind": "bridge_attest",
+            "recipient": me.address.to_string(),
+            "asset": 0,
+            "asset_index": serde_json::Value::Null,
+            "amount": serde_json::Value::Null,
+            "time": 12,
+            "r": word8_to_hex(&[9; 8]),
+            "commitment": serde_json::Value::Null,
+        });
+        assert_eq!(rebuilt_deposit(&me, &rotation), None);
+        // And nothing else is a deposit at all.
+        assert_eq!(rebuilt_deposit(&me, &serde_json::json!({ "kind": "mint", "amount": 5 })), None);
+        assert_eq!(rebuilt_deposit(&me, &serde_json::Value::Null), None);
+    }
+
     #[test]
     fn the_fee_defaults_are_the_schedule_floors_and_no_more() {
         let deploy = Action::Deploy { base_pc: 0, words: vec![0x13; 40] };
@@ -1464,6 +1638,7 @@ mod tests {
         let store = NoteStore {
             scanned_index: 9,
             scanned_height: 4,
+            scanned_attest_height: 5,
             notes: vec![owned(0, 5, false), owned(1, 3, true)],
             sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2 }],
         };
@@ -1480,6 +1655,7 @@ mod tests {
         let back = NoteStore::load(&path);
         assert_eq!(back.scanned_index, 9);
         assert_eq!(back.scanned_height, 4);
+        assert_eq!(back.scanned_attest_height, 5, "the deposit-rebuild cursor survives the round trip");
         assert_eq!(back.notes.len(), 2);
         assert_eq!(back.notes[0].note, store.notes[0].note);
         assert_eq!(back.notes[1].spent, true);

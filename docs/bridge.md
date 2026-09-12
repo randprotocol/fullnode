@@ -432,9 +432,10 @@ the replayed one, which covers the bridge including the burn log the root delibe
 | `shrugg_getBridgeBurn` | `[sequence]` | one outbound message (`body_hex`, `digest`, `tx`, `height`), or `null` |
 
 `shrugg_getTransaction` renders a `bridge_attest` with the recipient, the action's `asset`, the
-`asset_index` and `amount` it decodes against the registry, and the note's `time`; a `bridge_burn`
-with its asset, amount, relayer fee, destination and the asset bundle's public fields. Balances are
-not among them — there are none.
+`asset_index` and `amount` it decodes against the registry, the note's `time` and blinding `r`, and
+the `commitment` the chain computed from those fields — every word of the deposit note, which is
+what makes the recovery path below possible; a `bridge_burn` with its asset, amount, relayer fee,
+destination and the asset bundle's public fields. Balances are not among them — there are none.
 
 **Wallet** (`crates/shrugg-client`, `docs/cli.md`) — five commands:
 
@@ -493,6 +494,18 @@ would no longer be caught here.
   and on this chain nobody collects it: the deposit is minted gross and the submitter pays a SHRUGG
   bundle fee out of its own notes for the privilege. Relaying is therefore altruistic (or paid out
   of band) until there is a way to pay an identity-less submitter.
+- **A deposit's envelope is bound to nothing, so the wallet does not depend on it.** Anyone may
+  submit an attestation (the guardians' signatures are the whole authorisation) and admission checks
+  nothing about the `envelope` the submitter publishes beyond its size — so a hostile relayer can
+  seal garbage, consume the attestation's digest, and leave a note the honest relayer can no longer
+  resubmit. It locks nothing: *every* field of a deposit note is public in that one transaction
+  (`recipient`, `amount`, `asset`, `time`, `r`), so `wallet::scan` walks committed blocks, rebuilds
+  the note of every `bridge_attest` addressed to it with `rebuilt_deposit`, and records it against
+  the leaf whose commitment matches — with no envelope opened. The cost of the attack is therefore
+  one `BUNDLE_BASE` to the attacker and one extra block walk to the recipient. `scanned_attest_height`
+  is the cursor for that walk, so blocks are read once and a store written before this path existed
+  re-reads from zero the first time. In-circuit envelope validity (spec §14) is not needed for
+  deposits for the same reason: nothing about a deposit note is secret.
 - **The ledger-level vector pass has not been rebuilt** on the note pool (§7).
 - **`bridge-burn` learns about most bad arguments from the node, after paying for two proofs.** The
   wallet pre-checks only a zero amount and a relayer fee above the amount; an unregistered asset, a

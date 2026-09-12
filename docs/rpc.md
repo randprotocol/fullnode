@@ -202,7 +202,8 @@ The staking (phase S2) and bridge (phase S3) actions:
 - `{ "kind": "withdraw", "validator": "<base58>", "amount": 9, "nonce": 3 }` — the deposit note's
   blinding and envelope are not rendered.
 - `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>",
-  "asset": 1, "asset_index": 1, "amount": 1000, "time": 41 }` — the amount and the asset are
+  "asset": 1, "asset_index": 1, "amount": 1000, "time": 41, "r": "<64 hex>",
+  "commitment": "<64 hex>" }` — the amount and the asset are
   inside the attestation, so they are decoded out of it; `asset_index` is what the registry gave
   that asset, and is the `asset` word of the deposit note. Both are `null` for a guardian-set
   rotation (which deposits nothing) and on a chain whose registry does not name the asset.
@@ -211,7 +212,11 @@ The staking (phase S2) and bridge (phase S3) actions:
   the two together say whether this node's registry can resolve the deposit at all. `time` is the
   deposit note's own `time` word, which the action publishes and admission holds to the window a
   bundle's `time` gets — the note is derived from it, not from the height the transaction landed
-  at.
+  at. `r` is the deposit note's blinding, a field of the action and public like the rest of it, and
+  `commitment` is the leaf the chain computed from those five fields and appended — `null` for a
+  rotation. Together they are the whole deposit note, which is what lets its recipient rebuild it
+  without opening the submitter's envelope (`docs/bridge.md` §8); a transfer's or a withdrawal's
+  blinding is *not* rendered, because those notes are not public.
 - `{ "kind": "bridge_burn", "asset": 2, "amount": 400, "relayer_fee": 100, "to_chain": 5, "to":
   "abab…", "asset_bundle": { …same shape as `bundle`… } }` — `to` is the 32-byte destination
   address, hex. The asset bundle renders exactly like the fee bundle: same public fields, no more.

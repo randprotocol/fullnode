@@ -234,7 +234,7 @@ fn assets_json(bridge: &BridgeMeta) -> Vec<Value> {
     rows.into_iter().map(|(asset, info)| asset_json(asset, info)).collect()
 }
 
-fn block_json(b: &shrugg_core::Block, bridge: Option<&BridgeMeta>) -> Value {
+fn block_json(b: &shrugg_core::Block, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor) -> Value {
     json!({
         "hash": b.hash().to_hex(),
         "height": b.height(),
@@ -246,7 +246,7 @@ fn block_json(b: &shrugg_core::Block, bridge: Option<&BridgeMeta>) -> Value {
         "state_root": b.header.state_root.to_hex(),
         "justify_view": b.header.justify.view,
         "tx_count": b.transactions.len(),
-        "transactions": b.transactions.iter().map(|t| tx_json(t, bridge)).collect::<Vec<_>>(),
+        "transactions": b.transactions.iter().map(|t| tx_json(t, bridge, executor)).collect::<Vec<_>>(),
     })
 }
 
@@ -272,8 +272,9 @@ fn bundle_json(b: &shrugg_core::Bundle) -> Value {
 }
 
 /// `bridge` is the asset registry, which a `BridgeAttest` needs and nothing else does: the
-/// deposit's asset index is state, not a field of the transaction.
-fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>) -> Value {
+/// deposit's asset index is state, not a field of the transaction. `executor` is what computes
+/// that deposit's commitment, the one note commitment the wire does not carry.
+fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor) -> Value {
     let bundle = t.bundle.as_ref().map(bundle_json);
     let action = match &t.action {
         Action::None => json!({ "kind": "none" }),
@@ -306,7 +307,7 @@ fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>) -> Value {
         // are `null` for a guardian-set rotation, which deposits nothing, and on a chain whose
         // registry does not name the asset yet. The recipient is public in this transaction
         // only — the note's later spend is not.
-        Action::BridgeAttest { attestation, recipient, time, asset, .. } => {
+        Action::BridgeAttest { attestation, recipient, r, time, asset, .. } => {
             let deposit = attest_deposit(attestation, bridge);
             json!({
                 "kind": "bridge_attest",
@@ -322,6 +323,22 @@ fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>) -> Value {
                 // The deposit note's own `time` word, which is what a recipient rebuilding that
                 // note needs and the window rule this action was admitted under.
                 "time": time,
+                // The note's blinding. Not a secret: it is a field of the action, signed over by
+                // the transaction and in every replica's block store — and with it, the four
+                // above and the recipient, *every* word of the deposit note is here. That is the
+                // recipient's recovery path when a hostile submitter publishes a garbage envelope
+                // (`docs/bridge.md` §8): the note is rebuilt from these fields and checked
+                // against `commitment`, with nothing decrypted.
+                "r": word8_to_hex(r),
+                // The leaf the chain appended for this deposit — the one note commitment the wire
+                // does not carry, since the chain computes it rather than the submitter. `null`
+                // for a rotation, which deposits nothing.
+                "commitment": deposit.map(|(index, amount)| {
+                    let cm = shrugg_core::ledger::bridge_notes::deposit_commitment(
+                        recipient, amount, index, *time, r, executor,
+                    );
+                    word8_to_hex(&cm)
+                }),
             })
         }
         Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to } => json!({
@@ -558,7 +575,12 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                         .map_err(RpcError::internal)?
                         .ok_or_else(|| RpcError::not_found("block missing"))?;
                     let tx = b.transactions.get(index as usize).ok_or_else(|| RpcError::not_found("tx index"))?;
-                    Ok(json!({ "height": height, "index": index, "block_hash": b.hash().to_hex(), "tx": tx_json(tx, bridge.as_ref()) }))
+                    Ok(json!({
+                        "height": height,
+                        "index": index,
+                        "block_hash": b.hash().to_hex(),
+                        "tx": tx_json(tx, bridge.as_ref(), st.executor.as_ref()),
+                    }))
                 }
             }
         }
@@ -566,13 +588,13 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let h: u64 = param(p, 0, "height")?;
             let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
             let block = st.storage.block_by_height(h).map_err(RpcError::internal)?;
-            Ok(block.map(|b| block_json(&b, bridge.as_ref())).unwrap_or(Value::Null))
+            Ok(block.map(|b| block_json(&b, bridge.as_ref(), st.executor.as_ref())).unwrap_or(Value::Null))
         }
         "shrugg_getBlockByHash" => {
             let h = parse_hash(p, 0)?;
             let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
             let block = st.storage.block_by_hash(&h).map_err(RpcError::internal)?;
-            Ok(block.map(|b| block_json(&b, bridge.as_ref())).unwrap_or(Value::Null))
+            Ok(block.map(|b| block_json(&b, bridge.as_ref(), st.executor.as_ref())).unwrap_or(Value::Null))
         }
         "shrugg_getHead" => {
             let head = st.storage.head().map_err(RpcError::internal)?;
@@ -1014,8 +1036,10 @@ mod tests {
         let recipient = ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
         let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
 
-        let j =
-            |action| tx_json(&Transaction::shielded(1, b([nf(1), nf(2)], [cm(1), cm(2)]), action), None)["action"].clone();
+        let j = |action| {
+            let tx = Transaction::shielded(1, b([nf(1), nf(2)], [cm(1), cm(2)]), action);
+            tx_json(&tx, None, &StubExecutor)["action"].clone()
+        };
 
         let bond = j(Action::Bond { validator: v, amount: 500, registration: None });
         assert_eq!(bond["kind"], "bond");
@@ -1046,8 +1070,12 @@ mod tests {
         assert_eq!(at["attestation_len"], 520);
         assert_eq!(at["recipient"], recipient.to_string());
         assert_eq!(at["asset"], 1, "the index the action names, which is a field of it");
+        assert_eq!(at["time"], 4);
+        // Public, and the last word a recipient needs to rebuild the deposit note itself.
+        assert_eq!(at["r"], word8_to_hex(&[5; 8]));
         assert!(at["amount"].is_null(), "an attestation's amount is inside it, not on the action");
         assert!(at["asset_index"].is_null(), "and its asset index is in the registry, which there is none of");
+        assert!(at["commitment"].is_null(), "with no registry there is no index to compute a leaf under");
 
         let asset_bundle = b([nf(3), nf(4)], [cm(3), cm(4)]);
         let burn = j(Action::BridgeBurn {
@@ -1173,6 +1201,23 @@ mod tests {
         // transaction whose `asset` is not the one the registry resolves.
         assert_eq!(action["asset"], action["asset_index"]);
         assert_eq!(action["recipient"], fixtures::recipient().to_string());
+        // Every word of the deposit note is here, `r` included, so its recipient can rebuild the
+        // note from the wire alone — the recovery path for a hostile or garbage envelope
+        // (`docs/bridge.md` §8). Nothing about a deposit is secret; only later spends are.
+        assert_eq!(action["r"], word8_to_hex(&[7; 8]), "the note's blinding, as the action published it");
+        assert_eq!(action["time"], 0, "the note's own time word, not the height it applied at");
+        // And the commitment the chain computed from exactly those fields is the leaf it appended.
+        let cm = shrugg_core::ledger::bridge_notes::deposit_commitment(
+            &fixtures::recipient(),
+            1_000,
+            1,
+            0,
+            &[7; 8],
+            &StubExecutor,
+        );
+        assert_eq!(action["commitment"], word8_to_hex(&cm));
+        let leaves = st.storage.notes_from(0, 100).unwrap();
+        assert!(leaves.iter().any(|(_, row)| row.cm == cm), "the rendered commitment is a leaf of the tree");
         // The same transaction inside its block renders the same way.
         let block = ok(&st, "shrugg_getBlockByHeight", json!([1])).await;
         assert_eq!(block["transactions"][0]["action"], *action);

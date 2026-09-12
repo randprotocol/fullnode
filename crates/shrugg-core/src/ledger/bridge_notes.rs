@@ -206,7 +206,12 @@ pub(super) fn apply(
 /// format's fee pays whoever relays the attestation, and on a shielded chain the submitter has
 /// no identity to pay. Minting the gross keeps what the pool holds equal to what the source
 /// chain locked; netting it would burn the difference forever.
-fn deposit_commitment(
+///
+/// Public because every one of these five inputs is public on the wire, so a recipient can
+/// rebuild the note the chain appended without opening any envelope — which is what the node's
+/// `tx_json` renders the commitment from and what a wallet recovers a griefed deposit with
+/// (`docs/bridge.md` §8).
+pub fn deposit_commitment(
     recipient: &ShieldedAddress,
     amount: u64,
     asset: u32,
