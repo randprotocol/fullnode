@@ -10,9 +10,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// How many block-end roots a bundle may anchor to (spec §7 item 4).
-pub const ANCHOR_WINDOW: usize = 64;
-/// How far behind the current height a bundle's `time` may be (spec §7 item 5).
-pub const TIME_WINDOW: u64 = 64;
+///
+/// The spec proposed 64, sized for "about a minute at 1 s blocks". A tier-14 bundle proof measures
+/// ~100 s on a laptop and the fleet makes a block every ~2 s, so 64 blocks expired an anchor
+/// roughly halfway through proving one honest transfer. 256 blocks is ~8.5 minutes at the fleet's
+/// pace and ~2 minutes even at 500 ms blocks — comfortably longer than the proof it has to outlive.
+pub const ANCHOR_WINDOW: usize = 256;
+/// How far behind the current height a bundle's `time` may be (spec §7 item 5). Kept equal to
+/// [`ANCHOR_WINDOW`]: the two windows exist for the same reason (a prover needs the chain to still
+/// accept what it started proving), and a shorter `time` window would reject bundles whose anchor
+/// is still live.
+pub const TIME_WINDOW: u64 = 256;
 
 /// The one public register on the chain (spec §8): a validator's key, its stake, and the
 /// bundle fees credited to it as proposer. `stake` stays `u128` so the existing weighting and
@@ -748,15 +756,18 @@ mod tests {
         let mut t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
         t.bundle.as_mut().unwrap().anchor = [9; 8];
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::UnknownAnchor));
-        // time window: future and too old
-        l.set_height(100);
-        l.record_anchor(100);
+        // time window: future and too old. The height is chosen past the window so both edges
+        // exist; the edges themselves are expressed in TIME_WINDOW, never in its current value.
+        const H: u64 = TIME_WINDOW + 100;
+        let oldest = (H - TIME_WINDOW) as u32;
+        l.set_height(H);
+        l.record_anchor(H);
         let mut t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
-        t.bundle.as_mut().unwrap().time = 101;
-        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time: 101, height: 100 }));
-        t.bundle.as_mut().unwrap().time = 35;
-        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time: 35, height: 100 }));
-        t.bundle.as_mut().unwrap().time = 36; // height - 64 is allowed
+        t.bundle.as_mut().unwrap().time = H as u32 + 1;
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time: H as u32 + 1, height: H }));
+        t.bundle.as_mut().unwrap().time = oldest - 1;
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time: oldest - 1, height: H }));
+        t.bundle.as_mut().unwrap().time = oldest; // exactly height - TIME_WINDOW is allowed
         let mut b = t.bundle.clone().unwrap();
         b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()));
         t.bundle = Some(b);
@@ -808,15 +819,17 @@ mod tests {
             l.record_anchor(h);
         }
         assert_eq!(l.anchors().len(), ANCHOR_WINDOW);
-        assert!(!l.is_anchor(&genesis_root), "the genesis root scrolled out after 64 blocks");
+        assert!(!l.is_anchor(&genesis_root), "the genesis root scrolled out after ANCHOR_WINDOW blocks");
         assert_eq!(l.anchors().back(), Some(&(ANCHOR_WINDOW as u64, l.root())), "the last block's end root");
         // A root the tree only passes through is not an anchor: apply one more block's worth of
         // notes without closing the block, and a bundle anchored at the live root is rejected.
+        // Values above every one the loop generated (it used h, h+1000, h+2000 and h+3000 for
+        // h up to ANCHOR_WINDOW), so these notes are fresh whatever the window's size is.
         l.set_height(ANCHOR_WINDOW as u64 + 1);
-        l.apply_tx(&tx(&l, [[90; 8], [91; 8]], [[92; 8], [93; 8]]), &a.address(), &StubExecutor).unwrap();
+        l.apply_tx(&tx(&l, [[10_000; 8], [10_001; 8]], [[10_002; 8], [10_003; 8]]), &a.address(), &StubExecutor).unwrap();
         assert!(!l.is_anchor(&l.root()), "a mid-block root is not an anchor");
         assert_eq!(
-            l.validate(&tx(&l, [[94; 8], [95; 8]], [[96; 8], [97; 8]]), &StubExecutor),
+            l.validate(&tx(&l, [[10_004; 8], [10_005; 8]], [[10_006; 8], [10_007; 8]]), &StubExecutor),
             Err(TxError::UnknownAnchor)
         );
     }

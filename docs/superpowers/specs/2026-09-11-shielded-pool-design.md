@@ -206,6 +206,12 @@ Cheap before expensive, in this order, in both the mempool and the ledger:
 4. `anchor` is one of the last `ANCHOR_WINDOW = 64` roots (the research crate uses 16; 64 gives a
    prover about a minute at 1 s blocks).
 5. `time` is within `[height - 64, height]`.
+
+> **2026-09-12: raised to 256.** Both windows are 256 blocks in the implementation
+> (`shrugg_core::ledger::{ANCHOR_WINDOW, TIME_WINDOW}`). The measured tier-14 bundle proof is
+> ~100 s and the fleet makes a block every ~2 s, so the 64 assumed here — a minute at 1 s blocks —
+> expired an honest transfer's anchor while it was still being proved.
+
 6. Neither nullifier is in the nullifier set, the two differ, and neither appears twice in the
    block. Neither commitment exists in the tree.
 7. Action-specific cheap checks: program exists; Bond target is a validator or a registration

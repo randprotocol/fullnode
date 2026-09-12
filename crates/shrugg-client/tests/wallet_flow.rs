@@ -8,9 +8,9 @@
 //!
 //! Two things about the chain this test configures deliberately. The FRI profile is `test` (16
 //! queries: a real proof, not a security claim), and blocks are slow — `ANCHOR_WINDOW` and
-//! `TIME_WINDOW` are both 64 *blocks*, so a chain making blocks every 150 ms expires an anchor
-//! in under ten seconds, which is less than it takes to prove a bundle. Three-second blocks
-//! give a bundle just over three minutes between reading its anchor and being committed under
+//! `TIME_WINDOW` are both 256 *blocks*, so a chain making blocks every 150 ms expires an anchor
+//! in under forty seconds, which is less than it takes to prove a bundle. Three-second blocks
+//! give a bundle nearly thirteen minutes between reading its anchor and being committed under
 //! it, against a proof that takes about a minute and a half in this profile — margin enough
 //! that a slow machine fails the assertion it is testing rather than the clock.
 
@@ -59,8 +59,8 @@ async fn start(dir: &tempfile::TempDir, key: &Keypair) -> NodeHandle {
         rpc_addr: "127.0.0.1:0".parse().unwrap(),
         enable_mdns: false,
         validator: true,
-        // See the module comment: the anchor and time windows are 64 blocks, and a bundle proof
-        // takes longer than 64 blocks of a fast chain.
+        // See the module comment: the anchor and time windows are 256 blocks, and a bundle proof
+        // takes longer than 256 blocks of a fast chain.
         block_interval: Duration::from_secs(3),
         base_timeout: Duration::from_secs(6),
         max_timeout: Duration::from_secs(30),
