@@ -36,6 +36,11 @@ pub(super) fn validate(
 }
 
 /// The apply step for the two bridge actions. Unreachable while [`validate`] refuses them.
+///
+/// When S3 fills this in, a `BridgeAttest` that deposits **asset 0** is value entering the
+/// SHRUGG pool from outside and must be counted in `super::supply` — a counter of its own
+/// beside `withdraw_deposited`, and part of `issued()`. A deposit of any other asset is not
+/// SHRUGG and belongs in that asset's own audit, not this one.
 pub(super) fn apply(
     _ledger: &mut Ledger,
     _tx: &Transaction,
@@ -50,12 +55,20 @@ mod tests {
     use super::*;
     use crate::confidential::StubExecutor;
     use crate::crypto::Keypair;
-    use crate::types::{Validator, ValidatorSet};
+    use crate::ledger::ValidatorEntry;
 
     fn ledger() -> Ledger {
         let k = Keypair::from_seed([1; 32]).unwrap();
-        let set = ValidatorSet::new(vec![Validator { public_key: k.public_key().clone(), stake: 10 }]);
-        Ledger::new(7, [11; 8], &set, &StubExecutor)
+        // Phase S2 gave the register its v2 entry; nothing here reads a field of it.
+        let entry = ValidatorEntry {
+            public_key: k.public_key().clone(),
+            stake: 10,
+            pending: Vec::new(),
+            rewards: 0,
+            payout: crate::notes::ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+            nonce: 0,
+        };
+        Ledger::new(7, [11; 8], [(k.address(), entry)].into_iter().collect(), &StubExecutor)
     }
 
     /// Fail closed: an action this module does not own is refused rather than waved through,

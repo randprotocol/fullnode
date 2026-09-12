@@ -78,11 +78,26 @@ pub enum Action {
     /// present exactly when the validator is not yet in the register.
     Bond { validator: Address, amount: u64, registration: Option<Registration> },
     /// Phase S2: move `amount` of `validator`'s stake into unbonding. Signed over
-    /// [`crate::types::actions::unbond_message`].
+    /// [`crate::types::actions::unbond_message`]; rides without a bundle and pays no fee.
     Unbond { validator: Address, amount: u64, nonce: u64, signature: Signature },
     /// Phase S2: pay released stake and rewards into a deposit note the ledger computes itself
-    /// from `r` and the register's payout address. Signed over [`crate::types::actions::withdraw_message`].
-    Withdraw { validator: Address, amount: u64, nonce: u64, r: Word8, envelope: Envelope, signature: Signature },
+    /// from `r`, `time` and the register's payout address. Signed over
+    /// [`crate::types::actions::withdraw_message`]; rides without a bundle, and pays the bundle
+    /// base out of `amount` — the note is worth `amount - gas::BUNDLE_BASE`.
+    ///
+    /// `time` is the note's time word, and the sealing node chooses it: the envelope is sealed
+    /// against the note *before* the transaction is submitted, so the note cannot be bound to
+    /// the height that happens to apply it. Admission holds it to the same window a bundle's
+    /// `time` gets (spec §7 item 5).
+    Withdraw {
+        validator: Address,
+        amount: u64,
+        nonce: u64,
+        time: u32,
+        r: Word8,
+        envelope: Envelope,
+        signature: Signature,
+    },
     /// Phase S3: a guardian-signed bridge attestation, deposited as a note of the bridged
     /// asset to `recipient` with blinding `r`.
     BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, envelope: Envelope },
@@ -92,11 +107,29 @@ pub enum Action {
     BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee: u64, to_chain: u16, to: [u8; 32] },
 }
 
+impl Action {
+    /// The name of this action if it rides *without* a bundle, `None` if it must carry one.
+    ///
+    /// Three actions do: a faucet `Mint` (a new wallet holds no note to pay a fee with) and the
+    /// two validator-signed staking actions, `Unbond` and `Withdraw` (a validator key owns no
+    /// notes either — `Unbond` is free, and `Withdraw` pays the bundle base out of the amount it
+    /// withdraws). This is the one list of them: admission reads it for the shape rule and the
+    /// name it reports, and [`crate::gas::fee_floor`] gives each of them a zero floor.
+    pub fn bundle_less(&self) -> Option<&'static str> {
+        match self {
+            Action::Mint { .. } => Some("mint"),
+            Action::Unbond { .. } => Some("unbond"),
+            Action::Withdraw { .. } => Some("withdraw"),
+            _ => None,
+        }
+    }
+}
+
 /// A transaction: a shielded bundle, an action, or (for a faucet mint) an action alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub chain_id: u64,
-    /// `None` only for [`Action::Mint`].
+    /// `None` exactly for the actions [`Action::bundle_less`] names.
     pub bundle: Option<Bundle>,
     pub action: Action,
 }
@@ -208,6 +241,44 @@ mod tests {
         assert_ne!(other.hash(), tx.hash());
     }
 
+    /// Exactly three actions ride without a bundle, and each names itself for the shape error
+    /// admission reports when one arrives with a bundle anyway.
+    #[test]
+    fn only_a_mint_an_unbond_and_a_withdraw_are_bundle_less() {
+        let v = Address([1; 32]);
+        let minter = Keypair::from_seed([1; 32]).unwrap().public_key().clone();
+        let bundle_less = [
+            (
+                Action::Mint { cm: [1; 8], envelope: env(), amount: 1, minter, signature: Signature::empty() },
+                "mint",
+            ),
+            (Action::Unbond { validator: v, amount: 1, nonce: 0, signature: Signature::empty() }, "unbond"),
+            (
+                Action::Withdraw {
+                    validator: v,
+                    amount: 1,
+                    nonce: 0,
+                    time: 0,
+                    r: [0; 8],
+                    envelope: env(),
+                    signature: Signature::empty(),
+                },
+                "withdraw",
+            ),
+        ];
+        for (a, name) in &bundle_less {
+            assert_eq!(a.bundle_less(), Some(*name), "{a:?}");
+        }
+        for a in [
+            Action::None,
+            Action::Deploy { base_pc: 0, words: vec![0x13] },
+            Action::Call { program: Hash::ZERO, proof: vec![], input_envelope: None },
+            Action::Bond { validator: v, amount: 1, registration: None },
+        ] {
+            assert_eq!(a.bundle_less(), None, "{a:?}");
+        }
+    }
+
     #[test]
     fn a_mint_is_signed_by_its_minter_and_has_no_bundle() {
         let k = Keypair::from_seed([5; 32]).unwrap();
@@ -238,19 +309,18 @@ mod tests {
         assert_eq!(burn.commitments(), vec![[4; 8], [5; 8], [8; 8], [9; 8]]);
         assert_eq!(Transaction::decode(&burn.encode()).unwrap(), burn);
 
-        let w = Transaction::shielded(
-            7,
-            bundle(),
-            Action::Withdraw {
-                validator: Address([1; 32]),
-                amount: 9,
-                nonce: 0,
-                r: [5; 8],
-                envelope: env(),
-                signature: Signature::empty(),
-            },
-        );
-        assert_eq!(w.commitments(), vec![[4; 8], [5; 8]], "the ledger computes the deposit, the wire does not carry it");
+        let withdraw = Action::Withdraw {
+            validator: Address([1; 32]),
+            amount: 9,
+            nonce: 0,
+            time: 9,
+            r: [5; 8],
+            envelope: env(),
+            signature: Signature::empty(),
+        };
+        let w = Transaction { chain_id: 7, bundle: None, action: withdraw };
+        assert!(w.commitments().is_empty(), "the ledger computes the deposit, the wire does not carry it");
+        assert_eq!(Transaction::decode(&w.encode()).unwrap(), w);
         let a = Transaction::shielded(
             7,
             bundle(),

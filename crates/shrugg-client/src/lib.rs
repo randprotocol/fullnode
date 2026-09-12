@@ -205,6 +205,12 @@ impl RpcClient {
     pub async fn validators(&self) -> Result<Value> {
         self.call("shrugg_getValidators", json!([])).await
     }
+    /// `{epoch, epoch_blocks, next_set}` — where the chain is in its epoch schedule, and the set
+    /// the next epoch would start with if this one ended now. `next_set` is a projection: every
+    /// bond and unbond before the boundary still moves it.
+    pub async fn epoch(&self) -> Result<Value> {
+        self.call("shrugg_getEpoch", json!([])).await
+    }
     pub async fn block_by_height(&self, h: u64) -> Result<Value> {
         self.call("shrugg_getBlockByHeight", json!([h])).await
     }

@@ -12,7 +12,7 @@ use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
 use shrugg_core::gas;
 use shrugg_core::genesis::{Genesis, GenesisState};
-use shrugg_core::{Hash, Keypair, Ledger, ShieldedAddress, Transaction, FAUCET_MAX_UNITS};
+use shrugg_core::{Hash, Keypair, Ledger, ShieldedAddress, Transaction, ValidatorSet, FAUCET_MAX_UNITS};
 use shrugg_zkvm::executor::ZkExecutor;
 use shrugg_zkvm::notes::{Note, SpendKey};
 use shrugg_zkvm::viewing::TxKey;
@@ -97,6 +97,48 @@ pub fn load_genesis(datadir: &std::path::Path) -> Result<(GenesisState, Arc<dyn 
 /// Verify the on-disk chain. If the tail is damaged, truncate to the last good
 /// block (keeping safety state); the missing blocks are re-fetched from peers by
 /// the normal sync path. Returns the height the node will resume from.
+/// The ledger a restarting node runs on: the persisted state, plus the three things that live
+/// in the genesis file rather than in the database.
+///
+/// `epoch_blocks` is one of them, and it is not cosmetic: `Unbond` writes `epoch() +
+/// UNBONDING_EPOCHS` into the register, which the state root hashes. A node that came back up
+/// with the default 1000 on a chain that runs shorter epochs would compute a release epoch
+/// nobody else does, disagree about the state root from its first unbond on, and never rejoin.
+/// One function, so a restart cannot pick up two of the three and be wrong about the chain.
+pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn ConfidentialExecutor) -> Result<Ledger> {
+    let mut ledger = storage.load_ledger(executor)?;
+    ledger.set_faucet(gs.faucet);
+    ledger.set_confidential(gs.confidential);
+    ledger.set_epoch_blocks(gs.epoch_blocks);
+    Ok(ledger)
+}
+
+/// The consensus replica a node comes back up on: the persisted head and its certificate, the
+/// reloaded ledger, the safety state, and **every epoch set storage recorded**.
+///
+/// One function because the epoch sets are the easy half to forget: a node that resumed with the
+/// genesis set alone has no set for the epoch it is actually in, and stalls on `UnknownEpochSet`
+/// — it can neither lead, nor vote, nor verify the certificates its peers send it.
+pub fn resume_consensus(
+    storage: &Storage,
+    gs: &GenesisState,
+    signer: Option<Keypair>,
+    base_timeout: Duration,
+    max_timeout: Duration,
+    executor: Arc<dyn ConfidentialExecutor>,
+) -> Result<HotStuff> {
+    let head_block = storage.head_block()?;
+    let head_qc = storage.head_qc()?;
+    let ledger = reload_ledger(storage, gs, executor.as_ref())?;
+    let safety = storage.load_safety()?;
+    let mut ccfg = ConsensusConfig::new(gs.chain_id, gs.validators.clone(), gs.hash());
+    ccfg.epoch_blocks = gs.epoch_blocks;
+    ccfg.base_timeout = base_timeout;
+    ccfg.max_timeout = max_timeout;
+    let epoch_sets = storage.load_epoch_sets()?;
+    Ok(HotStuff::resume(ccfg, signer, head_block, head_qc, ledger, safety, epoch_sets, executor))
+}
+
 pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: VerifyMode, executor: &dyn ConfidentialExecutor) -> Result<u64> {
     if mode == VerifyMode::Off {
         return Ok(storage.head()?.height);
@@ -134,6 +176,9 @@ fn now_ms() -> u64 {
 struct Node {
     cfg: NodeConfig,
     gs: GenesisState,
+    /// This node's own validator address, whether or not it is signing today: what
+    /// `active_validator` is looked up by.
+    address: shrugg_core::Address,
     executor: Arc<dyn ConfidentialExecutor>,
     storage: Arc<Storage>,
     hs: HotStuff,
@@ -171,25 +216,13 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     storage.init_genesis(&gs)?;
     check_and_repair_chain(&storage, &gs, cfg.verify, executor.as_ref())?;
 
-    // Consensus replica from persisted head.
-    let head_block = storage.head_block()?;
-    let head_qc = storage.head_qc()?;
-    let mut ledger = storage.load_ledger(executor.as_ref())?;
-    ledger.set_faucet(gs.faucet);
-    ledger.set_confidential(gs.confidential);
-    let safety = storage.load_safety()?;
-    let signer = if cfg.validator && gs.validators.contains(&key.address()) {
-        Some(Keypair::from_seed(cfg.seed)?)
-    } else {
-        if cfg.validator {
-            tracing::warn!("--validator set but {} is not in the genesis validator set; running as observer", key.address());
-        }
-        None
-    };
-    let mut ccfg = ConsensusConfig::new(gs.chain_id, gs.validators.clone(), gs.hash());
-    ccfg.base_timeout = cfg.base_timeout;
-    ccfg.max_timeout = cfg.max_timeout;
-    let hs = HotStuff::resume(ccfg, signer, head_block, head_qc, ledger, safety, executor.clone());
+    // "Is a validator" is "has a signer", not "is in the genesis set" (spec §8): a validator that
+    // bonds in after genesis must already hold its key when its first epoch arrives, and a node
+    // that refused the key at startup would have nothing to vote with. `HotStuff::resume` keeps a
+    // signer that is in no current set and observes until an epoch admits it; what the RPC
+    // reports as *in the current set* is `active_validator`.
+    let signer = if cfg.validator { Some(Keypair::from_seed(cfg.seed)?) } else { None };
+    let hs = resume_consensus(&storage, &gs, signer, cfg.base_timeout, cfg.max_timeout, executor.clone())?;
 
     // Network.
     let identity = key.derive_subkey(b"shrugg-p2p-identity");
@@ -223,6 +256,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // RPC.
     let status = Arc::new(RwLock::new(NodeStatus {
         is_validator: hs.is_validator(),
+        active_validator: hs.current_set().contains(&key.address()),
         faucet: gs.faucet,
         confidential: gs.confidential,
         fri_profile: gs.fri_profile.clone(),
@@ -237,7 +271,6 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             storage: storage.clone(),
             status: status.clone(),
             node: cmd_tx,
-            validators: gs.validators.clone(),
             chain_id: gs.chain_id,
             executor: executor.clone(),
         },
@@ -272,6 +305,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     let node = Node {
         cfg,
         gs,
+        address,
         executor: executor.clone(),
         storage: storage.clone(),
         hs,
@@ -358,6 +392,9 @@ impl Node {
         s.high_qc_view = self.hs.high_qc().view;
         s.peer_count = self.peers.len();
         s.mempool_size = self.mempool.len();
+        // Whether this node's key is in the set running the epoch the next block belongs to.
+        // Distinct from `is_validator`, which only says the node holds a key at all.
+        s.active_validator = self.hs.current_set().contains(&self.address);
         let ledger = self.hs.committed_ledger();
         s.programs = ledger.programs().len() as u64;
         // The pool's public size, straight from the committed ledger rather than a second read
@@ -409,6 +446,10 @@ impl Node {
         // with a ledger that describes later ones. They are contiguous by construction, so the
         // fix is to write them as one commit, once, against the ledger that does describe them.
         let mut to_commit: Vec<CommittedBlock> = Vec::new();
+        // Emitted immediately before the `Commit` carrying the epoch's first block, and written
+        // in the same batch as it: a set persisted separately could be lost to a crash between
+        // the two writes, and that epoch's QCs would be unverifiable on the next replay.
+        let mut to_record: Vec<(u64, ValidatorSet)> = Vec::new();
         while let Some(a) = queue.pop_front() {
             match a {
                 Action::PersistSafety(s) => self.storage.save_safety(&s)?,
@@ -416,6 +457,10 @@ impl Node {
                     self.net.broadcast(GossipMessage::Consensus(m)).await;
                 }
                 Action::Commit(blocks) => to_commit.extend(blocks),
+                Action::RecordEpochSet(epoch, set) => {
+                    tracing::info!("epoch {epoch} starts with {} validators", set.len());
+                    to_record.push((epoch, set));
+                }
                 Action::ScheduleTimeout { view, duration } => {
                     self.timeout = Some((view, Instant::now() + duration));
                 }
@@ -426,15 +471,16 @@ impl Node {
                 Action::FetchBlock(h) => queue.extend(self.fetch_block(h).await),
             }
         }
-        self.commit(to_commit).await
+        self.commit(to_commit, to_record).await
     }
 
-    async fn commit(&mut self, blocks: Vec<CommittedBlock>) -> Result<()> {
+    async fn commit(&mut self, blocks: Vec<CommittedBlock>, epoch_sets: Vec<(u64, ValidatorSet)>) -> Result<()> {
         if blocks.is_empty() {
+            self.storage.commit(&[], self.hs.committed_ledger(), &epoch_sets)?;
             return Ok(());
         }
         let ledger = self.hs.committed_ledger().clone();
-        self.storage.commit(&blocks, &ledger)?;
+        self.storage.commit(&blocks, &ledger, &epoch_sets)?;
         for cb in &blocks {
             let included: Vec<Hash> = cb.block.transactions.iter().map(|tx| tx.hash()).collect();
             self.mempool.remove(&included);
@@ -492,6 +538,18 @@ impl Node {
             }
             NodeCommand::Mint { to, amount, reply } => {
                 let _ = reply.send(self.mint(to, amount).await);
+            }
+            NodeCommand::Epoch { reply } => {
+                let tip = self.hs.tip_ledger();
+                let _ = reply.send(rpc::EpochInfo {
+                    epoch: tip.epoch(),
+                    epoch_blocks: tip.epoch_blocks(),
+                    current: self.hs.current_set().iter().map(|v| v.address()).collect(),
+                    // What the register would produce if this epoch ended now; an empty
+                    // derivation is reported as empty rather than as the carry-forward
+                    // consensus would apply, because that is what the register says.
+                    next: tip.derive_next_set().iter().map(|v| v.address()).collect(),
+                });
             }
         }
         Ok(())
@@ -751,6 +809,15 @@ impl Node {
 
     /// Verify and persist committed blocks received from a peer, then rebuild
     /// the consensus replica on the new head.
+    ///
+    /// Sync crosses epoch boundaries like consensus does and by the same rule (spec §8): at the
+    /// first block of an epoch the set is derived from the register as of its parent, checked
+    /// against any set already known for that epoch, and recorded — because every QC here is
+    /// verified against the set of *its own* block's epoch, and because a node that synced past
+    /// a boundary without recording the set would have nothing to verify that epoch with after a
+    /// restart. Every block verified here is a block this node holds, so nothing in this path
+    /// relies on the replica's weaker "a QC for a block we do not have is counted in the current
+    /// set" fallback.
     async fn apply_synced(&mut self, blocks: Vec<CommittedBlock>) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
@@ -758,6 +825,9 @@ impl Node {
         let mut ledger: Ledger = self.hs.committed_ledger().clone();
         let mut head_hash = self.hs.committed_hash();
         let mut head_height = self.hs.committed_height();
+        let epoch_blocks = self.gs.epoch_blocks.max(1);
+        let mut sets = self.hs.epoch_sets().clone();
+        let mut recorded: Vec<(u64, ValidatorSet)> = Vec::new();
         let mut accepted = Vec::new();
         for cb in blocks {
             let b = &cb.block;
@@ -767,11 +837,36 @@ impl Node {
             if cb.qc.block_hash != b.hash() || cb.qc.view != b.view() {
                 anyhow::bail!("qc does not certify block {}", b.height());
             }
-            if !cb.qc.verify(&self.gs.validators, &self.gs.hash()) {
-                anyhow::bail!("invalid qc for block {}", b.height());
+            let epoch = b.height() / epoch_blocks;
+            if b.height() % epoch_blocks == 0 && b.height() > 0 {
+                // `ledger` is the state after this block's parent, which is the last block of
+                // the previous epoch: exactly what the set is derived from.
+                let mut derived = ledger.derive_next_set();
+                if derived.is_empty() {
+                    // The same carry-forward consensus does when every validator has unbonded
+                    // below the minimum: an epoch with no leader is a halt nothing can end.
+                    let Some(previous) = sets.get(epoch - 1) else {
+                        anyhow::bail!("epoch {} derives an empty set and epoch {} is unknown", epoch, epoch - 1);
+                    };
+                    derived = previous.clone();
+                }
+                match sets.get(epoch) {
+                    Some(known) if *known == derived => {}
+                    Some(_) => anyhow::bail!("block {} starts epoch {epoch} with a set we do not derive", b.height()),
+                    None => {
+                        sets.insert(epoch, derived.clone());
+                        recorded.push((epoch, derived));
+                    }
+                }
             }
-            if b.proposer() != self.gs.validators.leader(b.view()) {
-                anyhow::bail!("wrong leader for block {}", b.height());
+            let Some(set) = sets.get(epoch) else {
+                anyhow::bail!("no validator set for epoch {epoch} (block {})", b.height());
+            };
+            if !cb.qc.verify(set, &self.gs.hash()) {
+                anyhow::bail!("invalid qc for block {} in epoch {epoch}", b.height());
+            }
+            if b.proposer() != set.leader(b.view()) {
+                anyhow::bail!("wrong leader for block {} in epoch {epoch}", b.height());
             }
             let receipts = ledger.apply_block(b, self.executor.as_ref())?;
             if receipts != cb.receipts {
@@ -779,9 +874,12 @@ impl Node {
             }
             head_hash = b.hash();
             head_height = b.height();
-            accepted.push(CommittedBlock { receipts, ..cb });
+            // The notes this block made the ledger create, from our own execution rather than
+            // from the peer's copy (which the wire does not carry).
+            let deposits = ledger.take_deposits();
+            accepted.push(CommittedBlock { receipts, deposits, ..cb });
         }
-        self.storage.commit(&accepted, &ledger)?;
+        self.storage.commit(&accepted, &ledger, &recorded)?;
         for cb in &accepted {
             tracing::info!("synced block {} ({} txs)", cb.block.height(), cb.block.transactions.len());
             let included: Vec<Hash> = cb.block.transactions.iter().map(|tx| tx.hash()).collect();
@@ -789,16 +887,126 @@ impl Node {
         }
         let head = accepted.last().expect("non-empty");
         let mut ccfg = ConsensusConfig::new(self.gs.chain_id, self.gs.validators.clone(), self.gs.hash());
+        ccfg.epoch_blocks = self.gs.epoch_blocks;
         ccfg.base_timeout = self.cfg.base_timeout;
         ccfg.max_timeout = self.cfg.max_timeout;
         let signer = if self.hs.is_validator() { Some(Keypair::from_seed(self.cfg.seed)?) } else { None };
         let safety = self.hs.safety_state();
-        self.hs = HotStuff::resume(ccfg, signer, head.block.clone(), head.qc.clone(), ledger, Some(safety), self.executor.clone());
+        self.hs = HotStuff::resume(
+            ccfg,
+            signer,
+            head.block.clone(),
+            head.qc.clone(),
+            ledger,
+            Some(safety),
+            sets,
+            self.executor.clone(),
+        );
         self.timeout = None;
         self.propose_at = None;
         let acts = self.hs.start();
         self.handle_actions(acts).await?;
         self.mempool.prune(self.hs.tip_ledger());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::fixtures::{alloc_note, bundle_fee, bundle_tx, genesis_of, key, make_block_voted};
+    use shrugg_core::confidential::StubExecutor;
+    use shrugg_core::consensus::{EpochSets, HotStuff};
+    use shrugg_core::genesis::GenesisState;
+    use shrugg_core::{Block, BlockHeader, QuorumCertificate, Vote};
+
+    /// A one-validator chain with two-block epochs, committed past its first boundary: blocks 1
+    /// (epoch 0) and 2 (the first block of epoch 1, whose set is recorded with it).
+    fn chain_past_a_boundary() -> (tempfile::TempDir, Storage, GenesisState, Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![alloc_note(20, 5 * shrugg_core::UNITS_PER_SHRUGG)], 2);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+
+        ledger.set_height(1);
+        let tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        let b1 = make_block_voted(&gs.block, &mut ledger, vec![tx], &key(1), &[&key(1)]);
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[]).unwrap();
+
+        let epoch1 = ledger.derive_next_set();
+        ledger.set_height(2);
+        let tx = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
+        let b2 = make_block_voted(&b1.block, &mut ledger, vec![tx], &key(1), &[&key(1)]);
+        storage.commit(std::slice::from_ref(&b2), &ledger, &[(1, epoch1)]).unwrap();
+        (dir, storage, gs, ledger)
+    }
+
+    /// The next block of the epoch the chain is in, as a peer would propose it: certified parent,
+    /// increasing view, and the state root the ledger really produces.
+    fn next_block(head: &Block, ledger: &Ledger, k: &shrugg_core::Keypair) -> Block {
+        let height = head.height() + 1;
+        let mut after = ledger.clone();
+        after.set_height(height);
+        after.set_timestamp_ms(height);
+        after.apply_transactions(&[], &k.address(), &StubExecutor).unwrap();
+        after.record_anchor(height);
+        let header = BlockHeader {
+            height,
+            view: head.view() + 1,
+            parent: head.hash(),
+            proposer: k.public_key().clone(),
+            timestamp_ms: height,
+            tx_root: Block::tx_root(&[]),
+            state_root: after.state_root(),
+            justify: QuorumCertificate {
+                view: head.view(),
+                block_hash: head.hash(),
+                votes: vec![Vote::sign(head.view(), head.hash(), k)],
+            },
+        };
+        Block::sign(header, Vec::new(), k)
+    }
+
+    /// The restart this task exists to fix: a node whose head is past an epoch boundary comes
+    /// back up with the set that epoch runs with, and can take part in it. Resuming from the
+    /// genesis set alone — what the node did before the sets were persisted — leaves it unable
+    /// to place a block of its own epoch at all.
+    #[test]
+    fn a_node_resuming_past_an_epoch_boundary_accepts_a_block_of_the_current_epoch() {
+        let (_d, storage, gs, ledger) = chain_past_a_boundary();
+        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
+        let head = storage.head_block().unwrap();
+        assert_eq!(head.height(), 2, "the head is the first block of epoch 1");
+        let proposal = next_block(&head, &ledger, &key(1));
+
+        let mut hs = resume_consensus(
+            &storage,
+            &gs,
+            Some(key(1)),
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            executor.clone(),
+        )
+        .unwrap();
+        assert_eq!(hs.committed_height(), 2);
+        assert_eq!(hs.epoch_sets().known().count(), 2, "epoch 0 from genesis, epoch 1 from the commit");
+        hs.on_proposal(proposal.clone(), 3).expect("a block of the epoch the node resumed into");
+
+        // The same node without the recorded sets: it has no set for epoch 1, so the block of
+        // its own epoch is one it cannot even place.
+        let mut ccfg = ConsensusConfig::new(gs.chain_id, gs.validators.clone(), gs.hash());
+        ccfg.epoch_blocks = gs.epoch_blocks;
+        let mut blind = HotStuff::resume(
+            ccfg,
+            Some(key(1)),
+            head,
+            storage.head_qc().unwrap(),
+            reload_ledger(&storage, &gs, executor.as_ref()).unwrap(),
+            None,
+            EpochSets::new(gs.validators.clone()),
+            executor,
+        );
+        assert_eq!(blind.on_proposal(proposal, 3), Err(ConsensusError::UnknownEpochSet(1)));
     }
 }

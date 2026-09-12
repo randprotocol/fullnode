@@ -19,6 +19,9 @@ shrugg-node <COMMAND>
   run       Run the node
   verify    Verify the chain in a data directory without running the node
   status    Show node status
+  register  Print this node's Registration, for the wallet that bonds it in
+  unbond    Move bonded stake into unbonding
+  withdraw  Pay released stake and rewards into a note at the payout address
 ```
 
 There is no `balance` and no `transfer` subcommand: this chain has no accounts to query and a
@@ -47,16 +50,16 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | argument | default | meaning |
 |---|---|---|
 | `--chain-id <CHAIN_ID>` | `1` | chain id; transactions and gossip topics are bound to it |
-| `--validator <VALIDATORS>` | required, repeatable | key file path **or** hex public key of each validator |
-| `--stake <STAKE>` | `100000` | stake assigned to every validator (quorum is stake weighted) |
+| `--validator <KEY,STAKE,PAYOUT>` | required, repeatable | one register entry: key file path **or** hex public key, the stake in SHRUGG (at least 1000, the staking minimum), and the `shrugg1…` address its rewards and unbonded stake are paid to |
+| `--epoch-blocks <N>` | `1000` | blocks per epoch: how often the validator set is re-derived from the register (spec §8). Part of the genesis hash |
 | `--alloc <ALLOCS>` | none, repeatable | a deposit note: `shrugg1<address>=<amount in SHRUGG>` |
 | `--out <OUT>` | `genesis.json` | output path |
 | `--faucet` | off | **testnet only**: enable `Mint` transactions (`shrugg_mint`, up to 100 SHRUGG per call). Part of the genesis hash |
 | `--no-confidential` | off | disable Deploy/Call transactions on this chain. Part of the genesis hash |
 | `--fri-profile <production\|test>` | `production` | zkVM FRI profile every node must use; `test` is insecure and for the test suite. Part of the genesis hash |
 
-Prints the genesis hash, the note count, and `hc_bundle`. Every node of a chain must use a
-byte-identical genesis file.
+Prints the genesis hash, the validator and note counts, the epoch length and `hc_bundle`. Every
+node of a chain must use a byte-identical genesis file.
 
 There is no `--alloc-each`: a shielded chain has no per-validator allocation, because value only
 exists as a note someone holds the spend key for. Each `--alloc` builds one deposit note with
@@ -73,7 +76,7 @@ Genesis JSON shape:
 {
   "chain_id": 6,
   "timestamp_ms": 1788000000000,
-  "validators": [ { "public_key": "<hex>", "stake": 100000 } ],
+  "validators": [ { "public_key": "<hex>", "stake": 1000000000000, "payout": "shrugg1…" } ],
   "alloc": [
     { "cm": "<64 hex>",
       "envelope": { "kem_ct": "<hex>", "to_receiver": "<hex>", "to_sender": "<hex>", "body": "<hex>" },
@@ -82,14 +85,48 @@ Genesis JSON shape:
   "faucet": true,
   "confidential": true,
   "fri_profile": "production",
-  "hc_bundle": "<64 hex: the bundle guest's digest this build implements>"
+  "hc_bundle": "<64 hex: the bundle guest's digest this build implements>",
+  "epoch_blocks": 1000
 }
 ```
 
-`amount` is in smallest units and is public: it is what lets everyone add up the initial supply.
-Who owns the note is not — only the address the envelope was sealed to can open it. `hc_bundle`
-pins the one zkVM relation every bundle proof on this chain is checked against; a node whose
-build assembles a different guest refuses to start and names both digests.
+Both `amount` and a validator's `stake` are in smallest units, and both are public: they are what
+let everyone add up the initial supply (`docs/supply.md`). Who owns a note is not — only the address
+the envelope was sealed to can open it. A validator's `payout` is the shielded address its rewards
+and unbonded stake are withdrawn to, and it is register state, so it is part of the genesis hash like
+`epoch_blocks`, `faucet`, `confidential`, `fri_profile` and `hc_bundle`. `hc_bundle` pins the one
+zkVM relation every bundle proof on this chain is checked against; a node whose build assembles a
+different guest refuses to start and names both digests.
+
+### `shrugg-node register` / `unbond` / `withdraw`
+
+The three staking commands a validator operator runs (spec §8). `register` is offline apart from
+reading the chain id; the other two submit a real transaction, which commits in a block's time —
+there is no proof to build.
+
+| command | arguments | meaning |
+|---|---|---|
+| `register` | `--key`, `--payout <shrugg1…>`, `--rpc` | print a `Registration` (hex) signed by this node's key, for a wallet to attach to the bond that registers it |
+| `unbond <amount SHRUGG>` | `--key`, `--rpc`, `--no-wait` | move bonded stake into unbonding; withdrawable two epochs later. Free |
+| `withdraw <amount SHRUGG>` | same | pay released stake and rewards into a note at the register's payout address, less the bundle base |
+
+The bond itself is a wallet command: it burns the stake out of shielded notes, and a validator key
+owns none. `unbond` and `withdraw` need no wallet at all — they ride without a bundle, exactly as a
+faucet mint does, and the register's nonce is their replay protection. `unbond` pays nothing;
+`withdraw` pays the 0.001 SHRUGG bundle base out of the amount it withdraws, to the proposer of
+the block that applies it, so the note it creates is worth `amount − 0.001` and an amount that
+cannot cover the base is refused.
+
+`withdraw` draws the note's blinding itself and seals the envelope to the payout address under a
+throwaway sender key, so only the payout wallet can open it. The chain computes the note's
+commitment from the `time` the action carries — the head height when the command ran, which it
+prints, and which the signature binds — not from the height of the block that applies the
+transaction: the envelope is sealed before that block exists. Admission accepts any `time` within
+the 256-block window, so a withdraw that waits a few blocks for inclusion still pays a note the
+payout wallet finds by scanning.
+
+`docs/staking.md` is the whole picture these three sit in: the register, the epochs, what each action
+publishes, and a worked join-and-leave.
 
 ### `shrugg-node init`
 
@@ -111,7 +148,7 @@ refused.
 | `--listen <LISTEN>` | `/ip4/0.0.0.0/tcp/30303` | libp2p listen multiaddr, repeatable |
 | `--bootstrap <BOOTSTRAP>` | none, repeatable | peer to dial at start and every 30 s while disconnected: `/ip4/<ip>/tcp/<port>/p2p/<peer-id>` |
 | `--rpc <RPC>` | `127.0.0.1:8545` | JSON-RPC listen address; bind `0.0.0.0` only behind a firewall |
-| `--validator` | off | vote and propose; the key must be in the genesis validator set, otherwise the node warns and runs as an observer |
+| `--validator` | off | this node holds a validator key and takes part in consensus. A key in no current epoch's set observes until an epoch admits it, so a validator that bonds in after genesis needs no restart; `shrugg_status` reports `is_validator` (the key is here) and `active_validator` (it is in the current set) separately |
 | `--no-mdns` | off | disable LAN discovery (recommended on servers) |
 | `--block-interval-ms <MS>` | `1000` | minimum spacing between proposals |
 | `--view-timeout-ms <MS>` | `3000` | base view timeout; doubles per consecutive timeout up to 8x |
@@ -147,7 +184,8 @@ made the chain will stop at the first bundle (`docs/confidential.md`).
 | `--rpc <URL>` | `http://127.0.0.1:8545` | node to ask |
 
 Prints `shrugg_status` verbatim: height, view, peers, mempool, notes, nullifiers, tree root,
-`hc_bundle`, sync state.
+`hc_bundle`, sync state, and the two validator flags — `is_validator` (this node holds a key) and
+`active_validator` (that key is in the current epoch's set).
 
 ## `shrugg` (wallet)
 
@@ -167,6 +205,7 @@ Global options, accepted before or after the subcommand:
 | `notes` | | every note this wallet has opened: index, amount, height, `spent`, `pending` |
 | `history` | | every note this wallet created for someone else, opened through its own outgoing viewing key |
 | `send <TO> <AMOUNT>` | `--fee <SHRUGG>` (default `0.001`), `--no-wait`, `--cuda` | scan, select at most two notes, prove a 2-in-2-out bundle locally, submit; waits for the commit unless `--no-wait` |
+| `bond <VALIDATOR> <AMOUNT>` | `--registration <hex>`, `--fee <SHRUGG>` (default `0.001`), `--no-wait`, `--cuda` | stake onto a validator: the bundle burns the amount out of this wallet's notes. `--registration` (from `shrugg-node register`) exactly when the validator is not in the register yet, and then at least 1000 SHRUGG; prints the new stake and the epoch it counts from (`docs/staking.md`) |
 | `faucet [ADDRESS]` | `--amount <SHRUGG>` (default `100`, max `100`) | testnet only: ask a validator node to mint into a note for `ADDRESS` (default: this wallet), wait for the commit |
 | `program build` | `--guest <fib\|memcpy\|bubble_sort\|balance_check\|private_payment>`, `--arg N` (repeatable), `--out <file>` (default `program.json`) | assemble a built-in guest to `{base_pc, words}` JSON; prints the program id |
 | `program deploy <FILE>` | `.json` or `.bin` (raw LE words), `--cuda` | pay the deploy floor through a bundle, wait for the commit, print the program id |
@@ -179,7 +218,7 @@ Global options, accepted before or after the subcommand:
 | `head` | | `{height, hash, view}` |
 | `status` | | node status object (see docs/rpc.md `shrugg_status`) |
 | `peers` | | connected peers |
-| `validators` | | validator register: address, stake, rewards |
+| `validators` | | the validator register: one row per entry — address, stake, unbonding queue, rewards, payout address, nonce, and whether it is in the current epoch's set |
 
 Amounts are decimal SHRUGG strings with up to 9 decimal places (`1`, `1.5`, `.25`, `0.000000001`).
 

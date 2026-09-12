@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::notes::{word8_to_hex, Envelope};
-use shrugg_core::{Action, Hash, ShieldedAddress, Transaction, ValidatorSet, TOKEN_DECIMALS, TOKEN_SYMBOL};
+use shrugg_core::{Action, Hash, ShieldedAddress, Transaction, TOKEN_DECIMALS, TOKEN_SYMBOL};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
@@ -39,7 +39,12 @@ pub struct NodeStatus {
     pub sync_target: u64,
     pub peer_count: usize,
     pub mempool_size: usize,
+    /// This node holds a validator key and is running as one (`--validator`).
     pub is_validator: bool,
+    /// That key is in the validator set of the epoch the next block belongs to (spec §8). A
+    /// validator that has bonded in but whose epoch has not arrived — or one that has unbonded
+    /// below the minimum — is `is_validator` without being `active_validator`.
+    pub active_validator: bool,
     pub faucet: bool,
     pub confidential: bool,
     pub fri_profile: String,
@@ -63,6 +68,24 @@ pub enum NodeCommand {
     /// Only a validator can serve it, so the reply carries a message rather than a
     /// `MempoolError` — "this node is an observer" is not a mempool outcome.
     Mint { to: ShieldedAddress, amount: u64, reply: oneshot::Sender<Result<Hash, String>> },
+    /// Where the chain is in its epoch schedule, and which validators run this epoch and the
+    /// next. It comes from the node loop rather than from storage because the *next* epoch's set
+    /// is derived from the tip's register, which only the replica holds — and deriving it on
+    /// every pass of the loop, to keep a snapshot fresh, would cost a set clone per message.
+    Epoch { reply: oneshot::Sender<EpochInfo> },
+}
+
+/// The answer to [`NodeCommand::Epoch`]: the current epoch, its length, and the sets of this
+/// epoch and the next, as addresses.
+#[derive(Clone, Debug, Default)]
+pub struct EpochInfo {
+    pub epoch: u64,
+    pub epoch_blocks: u64,
+    /// The set the next block is proposed and voted by.
+    pub current: Vec<shrugg_core::Address>,
+    /// What the next epoch's set would be if this epoch ended now (spec §8). It is a projection,
+    /// not a commitment: every bond and unbond before the boundary still moves it.
+    pub next: Vec<shrugg_core::Address>,
 }
 
 #[derive(Clone)]
@@ -70,7 +93,6 @@ pub struct RpcState {
     pub storage: Arc<Storage>,
     pub status: Arc<RwLock<NodeStatus>>,
     pub node: mpsc::Sender<NodeCommand>,
-    pub validators: ValidatorSet,
     pub chain_id: u64,
     /// Needed by `shrugg_getWitness`, which rebuilds the tree to fold a path.
     pub executor: Arc<dyn ConfidentialExecutor>,
@@ -255,8 +277,11 @@ fn tx_json(t: &Transaction) -> Value {
         Action::Unbond { validator, amount, nonce, .. } => json!({
             "kind": "unbond", "validator": validator.to_base58(), "amount": amount, "nonce": nonce
         }),
-        Action::Withdraw { validator, amount, nonce, .. } => json!({
-            "kind": "withdraw", "validator": validator.to_base58(), "amount": amount, "nonce": nonce
+        // `time` is the note's time word, which the withdrawing node chose: public like the
+        // amount, and the one field an explorer needs to say which note this paid.
+        Action::Withdraw { validator, amount, nonce, time, .. } => json!({
+            "kind": "withdraw", "validator": validator.to_base58(), "amount": amount, "nonce": nonce,
+            "time": time
         }),
         // No amount: it is inside the attestation, which S3's bridge decoder reads. The
         // recipient is public in this transaction only — the note's later spend is not.
@@ -275,6 +300,13 @@ fn tx_json(t: &Transaction) -> Value {
         "bundle": bundle,
         "action": action,
     })
+}
+
+/// Ask the node loop where the chain is in its epoch schedule.
+async fn epoch_info(st: &RpcState) -> Result<EpochInfo, RpcError> {
+    let (reply, rx) = oneshot::channel();
+    st.node.send(NodeCommand::Epoch { reply }).await.map_err(|_| RpcError::internal("node loop closed"))?;
+    rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))
 }
 
 async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
@@ -492,19 +524,62 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let peers = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
             Ok(serde_json::to_value(peers).map_err(RpcError::internal)?)
         }
+        // Since phase S2 this is the *register* (spec §8), not the genesis set: every address
+        // that has ever bonded, whether or not it is in an epoch's set today. `active` is what
+        // says which of them are running the current epoch.
         "shrugg_getValidators" => {
-            // Stake comes from the genesis set; rewards are chain state, so they come from the
-            // database — a validator that has never proposed simply has none yet.
-            let mut out = Vec::new();
-            for v in st.validators.iter() {
-                let addr = v.address();
-                let rewards = st.storage.validator(&addr).map_err(RpcError::internal)?.map(|e| e.rewards).unwrap_or(0);
-                // `stake` is a `u128`: `json!` panics on one above `u64::MAX`, and JSON numbers
-                // are not safe integers past 2^53 anyway, so it goes out as a decimal string
-                // like every other amount this API returns. `rewards` is a `u64` and stays one.
-                out.push(json!({ "address": addr.to_base58(), "stake": v.stake.to_string(), "rewards": rewards }));
-            }
+            let register = st.storage.register().map_err(RpcError::internal)?;
+            let active = epoch_info(st).await?.current;
+            let out: Vec<Value> = register
+                .iter()
+                .map(|(addr, e)| {
+                    json!({
+                        "address": addr.to_base58(),
+                        // Amounts go out as decimal strings: JSON numbers are not safe integers
+                        // past 2^53, and a stake is 10^9 units per SHRUGG.
+                        "stake": e.stake.to_string(),
+                        "pending": e.pending
+                            .iter()
+                            .map(|(release_epoch, amount)| json!({ "release_epoch": release_epoch, "amount": amount.to_string() }))
+                            .collect::<Vec<_>>(),
+                        "rewards": e.rewards.to_string(),
+                        "payout": e.payout.to_string(),
+                        "nonce": e.nonce,
+                        "active": active.contains(addr),
+                    })
+                })
+                .collect();
             Ok(json!(out))
+        }
+        "shrugg_getEpoch" => {
+            let info = epoch_info(st).await?;
+            Ok(json!({
+                "epoch": info.epoch,
+                "epoch_blocks": info.epoch_blocks,
+                "next_set": info.next.iter().map(|a| a.to_base58()).collect::<Vec<_>>(),
+            }))
+        }
+        // The supply audit (`ledger::supply`). Note values are hidden, but every crossing of the
+        // pool's boundary is public, so this is exact rather than an estimate — and
+        // `--verify-chain` recomputes every counter in it by replaying the chain.
+        "shrugg_getSupply" => {
+            let height = st.storage.head().map_err(RpcError::internal)?.height;
+            let supply = st.storage.supply().map_err(RpcError::internal)?;
+            let register = st.storage.register().map_err(RpcError::internal)?;
+            let audit = shrugg_core::ledger::Audit::new(supply, shrugg_core::ledger::register_total(&register));
+            Ok(json!({
+                "height": height,
+                "genesis_deposited": supply.genesis_deposited.to_string(),
+                "genesis_staked": supply.genesis_staked.to_string(),
+                "faucet_minted": supply.faucet_minted.to_string(),
+                "withdraw_deposited": supply.withdraw_deposited.to_string(),
+                "fees_paid": supply.fees_paid.to_string(),
+                "burned": supply.burned.to_string(),
+                "pool_value": audit.pool_value.to_string(),
+                "register_total": audit.register_total.to_string(),
+                "total_supply": audit.total_supply().to_string(),
+                "invariant_holds": audit.invariant_holds(),
+            }))
         }
         other => Err(RpcError { code: -32601, message: format!("unknown method {other}") }),
     }
@@ -519,18 +594,34 @@ mod tests {
     use shrugg_core::notes::DEPTH;
     use shrugg_core::Word8;
 
-    /// An `RpcState` over a fresh database holding `gs`, with a node channel nothing reads
-    /// (every method tested here answers straight from storage).
+    /// An `RpcState` over a fresh database holding `gs`.
+    ///
+    /// Most methods answer straight from storage, but the register and epoch views ask the node
+    /// loop where the chain is in its epoch schedule — so a stand-in loop answers that one
+    /// command from the genesis state and ignores the rest. It outlives the test by holding the
+    /// receiver; without it those methods would only ever report "node loop closed".
     fn state_for(gs: &GenesisState) -> (tempfile::TempDir, RpcState) {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(crate::storage::Storage::open(dir.path()).unwrap());
         storage.init_genesis(gs).unwrap();
-        let (tx, _) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(4);
+        let info = EpochInfo {
+            epoch: 0,
+            epoch_blocks: gs.epoch_blocks,
+            current: gs.validators.iter().map(|v| v.address()).collect(),
+            next: gs.ledger.derive_next_set().iter().map(|v| v.address()).collect(),
+        };
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let NodeCommand::Epoch { reply } = cmd {
+                    let _ = reply.send(info.clone());
+                }
+            }
+        });
         let st = RpcState {
             storage,
             status: Arc::new(RwLock::new(NodeStatus::default())),
             node: tx,
-            validators: gs.validators.clone(),
             chain_id: gs.chain_id,
             executor: Arc::new(StubExecutor),
         };
@@ -561,7 +652,7 @@ mod tests {
         let mut ledger = gs.ledger.clone();
         let tx = bundle_tx(&ledger, [nf(1), nf(2)], [cm(1), cm(2)], bundle_fee());
         let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
-        st.storage.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[]).unwrap();
         (dir, st, gs)
     }
 
@@ -752,19 +843,91 @@ mod tests {
         assert_eq!(ok(&st, "shrugg_getTransaction", json!([Hash::ZERO.to_hex()])).await, Value::Null);
     }
 
+    /// Phase S2: the register, not the genesis set. A validator that has bonded in but whose
+    /// epoch has not arrived is listed with everything the register holds about it and
+    /// `active: false` — which is the whole reason the row carries the flag.
     #[tokio::test]
-    async fn validators_report_stake_and_rewards() {
+    async fn validators_report_the_whole_register_and_who_is_active() {
         let (_d, st, _gs) = chain();
+        let newcomer = key(9);
+        let payout = ShieldedAddress { pk: [3; 8], kem_ek: vec![4; shrugg_core::notes::KEM_EK_BYTES] };
+        st.storage
+            .overwrite_validator_for_testing(
+                &newcomer.address(),
+                &shrugg_core::ledger::ValidatorEntry {
+                    public_key: newcomer.public_key().clone(),
+                    stake: 700,
+                    pending: vec![(4, 250)],
+                    rewards: 11,
+                    payout: payout.clone(),
+                    nonce: 3,
+                },
+            )
+            .unwrap();
+
         let v = ok(&st, "shrugg_getValidators", json!([])).await;
         let rows = v.as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["address"], key(1).address().to_base58());
-        // `stake` is a `u128`, so it goes out as a decimal string — `json!` would panic on one
-        // above `u64::MAX`, and a JSON number could not carry it exactly in any case.
-        assert_eq!(rows[0]["stake"], Value::String("10".into()));
-        assert!(rows[0]["stake"].is_string(), "stake must not be a JSON number");
-        // The single block's bundle fee was credited to its proposer.
-        assert_eq!(rows[0]["rewards"], bundle_fee());
+        assert_eq!(rows.len(), 2, "every registered validator, in address order");
+        let row = |addr: shrugg_core::Address| {
+            rows.iter().find(|r| r["address"] == addr.to_base58()).expect("listed").clone()
+        };
+
+        let genesis = row(key(1).address());
+        // Every amount is a decimal string: JSON numbers are not safe integers past 2^53, and a
+        // stake is 10^9 units per SHRUGG.
+        assert_eq!(genesis["stake"], Value::String(shrugg_core::ledger::staking::MIN_STAKE.to_string()));
+        assert_eq!(genesis["rewards"], Value::String(bundle_fee().to_string()), "the block's fee");
+        assert_eq!(genesis["pending"], json!([]));
+        assert_eq!(genesis["nonce"], 0);
+        assert_eq!(genesis["active"], true);
+
+        let new = row(newcomer.address());
+        assert_eq!(new["stake"], Value::String("700".into()));
+        assert_eq!(new["pending"], json!([{ "release_epoch": 4, "amount": "250" }]));
+        assert_eq!(new["rewards"], Value::String("11".into()));
+        assert_eq!(new["payout"], Value::String(payout.to_string()));
+        assert_eq!(new["nonce"], 3);
+        assert_eq!(new["active"], false, "in the register, not in the current set");
+    }
+
+    #[tokio::test]
+    async fn get_epoch_reports_the_schedule_and_the_set_the_register_would_derive_next() {
+        let (_d, st, gs) = chain();
+        let v = ok(&st, "shrugg_getEpoch", json!([])).await;
+        assert_eq!(v["epoch"], 0);
+        assert_eq!(v["epoch_blocks"], gs.epoch_blocks);
+        // The only validator meets the minimum, so it is what the next epoch would run with.
+        assert_eq!(v["next_set"], json!([key(1).address().to_base58()]));
+    }
+
+    /// The supply audit: hidden note values, public boundary crossings. The one number that
+    /// matters is `invariant_holds` — everything issued is either in the pool or in the register.
+    #[tokio::test]
+    async fn get_supply_accounts_for_everything_the_chain_issued() {
+        // Enough in the pool to pay a fee out of: `chain()`'s two tiny alloc notes are smaller
+        // than one bundle base, which is a fixture artefact rather than a chain that could exist.
+        let gs = fixtures::genesis_with(1, vec![alloc_note(20, 5 * shrugg_core::UNITS_PER_SHRUGG)]);
+        let (_d, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let tx = bundle_tx(&ledger, [nf(1), nf(2)], [cm(1), cm(2)], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[]).unwrap();
+
+        let v = ok(&st, "shrugg_getSupply", json!([])).await;
+        let stake = shrugg_core::ledger::staking::MIN_STAKE;
+        let alloc = 5 * shrugg_core::UNITS_PER_SHRUGG;
+        assert_eq!(v["height"], 1);
+        assert_eq!(v["genesis_deposited"], Value::String(alloc.to_string()));
+        assert_eq!(v["genesis_staked"], Value::String(stake.to_string()));
+        assert_eq!(v["faucet_minted"], Value::String("0".into()));
+        assert_eq!(v["withdraw_deposited"], Value::String("0".into()));
+        assert_eq!(v["burned"], Value::String("0".into()));
+        // The block's one bundle moved its fee out of the pool and into the proposer's rewards.
+        assert_eq!(v["fees_paid"], Value::String(bundle_fee().to_string()));
+        assert_eq!(v["pool_value"], Value::String((alloc - bundle_fee()).to_string()));
+        assert_eq!(v["register_total"], Value::String((stake + bundle_fee()).to_string()));
+        assert_eq!(v["total_supply"], Value::String((alloc + stake).to_string()));
+        assert_eq!(v["invariant_holds"], true);
     }
 
     /// S2/S3 scaffold: an explorer can name and summarise every new action the moment one can
@@ -791,16 +954,30 @@ mod tests {
         assert_eq!(bond["amount"], 500);
         assert_eq!(bond["registered"], false);
 
-        let unbond = j(Action::Unbond { validator: v, amount: 7, nonce: 2, signature: sig.clone() });
+        // The two validator-signed actions ride bundle-less, so they are rendered as they ride.
+        let bundle_less = |action| tx_json(&Transaction { chain_id: 1, bundle: None, action });
+        let unbond = bundle_less(Action::Unbond { validator: v, amount: 7, nonce: 2, signature: sig.clone() });
+        assert!(unbond["bundle"].is_null(), "an unbond carries no bundle");
+        let unbond = unbond["action"].clone();
         assert_eq!((&unbond["kind"], &unbond["amount"], &unbond["nonce"]), (&json!("unbond"), &json!(7), &json!(2)));
         assert!(!serde_json::to_string(&unbond).unwrap().contains("signature"), "a signature is not explorer data");
 
-        let w =
-            j(Action::Withdraw { validator: v, amount: 9, nonce: 3, r: [5; 8], envelope: envelope.clone(), signature: sig });
+        let w = bundle_less(Action::Withdraw {
+            validator: v,
+            amount: 9,
+            nonce: 3,
+            time: 42,
+            r: [5; 8],
+            envelope: envelope.clone(),
+            signature: sig,
+        });
+        assert!(w["bundle"].is_null(), "a withdraw carries no bundle");
+        let w = w["action"].clone();
         assert_eq!(
-            (&w["kind"], &w["validator"], &w["amount"], &w["nonce"]),
-            (&json!("withdraw"), &json!(v.to_base58()), &json!(9), &json!(3))
+            (&w["kind"], &w["validator"], &w["amount"], &w["nonce"], &w["time"]),
+            (&json!("withdraw"), &json!(v.to_base58()), &json!(9), &json!(3), &json!(42))
         );
+        assert!(!serde_json::to_string(&w).unwrap().contains("\"r\""), "the note's blinding is not explorer data");
 
         let at = j(Action::BridgeAttest { attestation: vec![9; 520], recipient: recipient.clone(), r: [5; 8], envelope });
         assert_eq!(at["kind"], "bridge_attest");

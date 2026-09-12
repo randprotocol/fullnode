@@ -16,7 +16,9 @@ Conventions:
 - Shielded addresses are `shrugg1` + base58, about 1668 characters. A parameter longer than 2000
   characters is refused on its length before it is parsed.
 - Amounts are strings of smallest units (`"1500000000"` = 1.5 SHRUGG); 1 SHRUGG = 10^9 units.
-  Fees inside a decoded bundle are JSON integers.
+  Amounts *inside a decoded transaction* are JSON integers instead — a bundle's `fee` and `burn`, a
+  mint's amount, a staking action's amount — because they are being reported as the transaction's own
+  fields rather than as chain state.
 - Heights, leaf indices and views are JSON integers.
 - `shrugg_client::RpcClient` (Rust) wraps every method below.
 
@@ -43,7 +45,7 @@ The node validates against the state at the tip of the chain in the order of `do
 checks, the bundle digest, the bundle proof, and for a call its own proof and tier fee — puts it
 in the mempool, and gossips it. Errors come back as code `-32000` with the reason, for example
 `nullifier already spent`, `anchor is not one of the last 256 roots`,
-`bundle time 12 is outside [244, 500]`, `fee 1000000 below minimum 2000000`,
+`time 12 is outside [244, 500]`, `fee 1000000 below minimum 2000000`,
 `the bundle's digest is not what its proof published`, `invalid bundle proof: …`,
 `unknown program …`, `already in mempool`, `conflicts with a pending transaction over <nullifier>`,
 `faucet is disabled on this chain`.
@@ -171,9 +173,12 @@ The staking (phase S2) and bridge (phase S3) actions:
 
 - `{ "kind": "bond", "validator": "<base58>", "amount": 500, "registered": false }` — `registered`
   is whether this bond carried a first-time registration.
-- `{ "kind": "unbond", "validator": "<base58>", "amount": 7, "nonce": 2 }`
-- `{ "kind": "withdraw", "validator": "<base58>", "amount": 9, "nonce": 3 }` — the deposit note's
-  blinding and envelope are not rendered.
+- `{ "kind": "unbond", "validator": "<base58>", "amount": 7, "nonce": 2 }` — rendered with
+  `"bundle": null`, as a withdraw is: both are signed by the validator's key, and the register's
+  nonce, not a bundle, is what keeps them from being replayed.
+- `{ "kind": "withdraw", "validator": "<base58>", "amount": 9, "nonce": 3, "time": 1994 }` — the
+  deposit note's blinding and envelope are not rendered. `time` is the note's time word, which the
+  withdrawing node chose; the note itself is worth `amount` less the bundle base.
 - `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>" }` — no
   amount: it is inside the attestation, which the bridge decoder reads.
 - `{ "kind": "bridge_burn", "asset": 2, "amount": 400, "relayer_fee": 100, "to_chain": 5, "to":
@@ -210,14 +215,16 @@ Params: `[]`. Result:
   "height": 1998, "head_hash": "…", "view": 2251, "high_qc_view": 2250,
   "syncing": false, "sync_target": 1998,
   "peer_count": 5, "mempool_size": 0,
-  "is_validator": true, "faucet": true, "confidential": true,
+  "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
   "fri_profile": "production", "programs": 2,
   "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19",
   "address": "2nRdFC…", "peer_id": "12D3KooW..."
 }
 ```
 `syncing` is true while a batch request to a peer is in flight; `sync_target` is the highest height
-any peer has advertised. `notes` is every note the chain has ever created, `nullifiers` every note
+any peer has advertised. `is_validator` says this node holds a validator key; `active_validator`
+says that key is in the set running the current epoch (spec §8) — a validator that has bonded in
+but whose epoch has not arrived is the first without the second. `notes` is every note the chain has ever created, `nullifiers` every note
 it has ever spent, and `hc_bundle` the bundle guest this chain's proofs are against — a node whose
 build disagrees with the genesis value refuses to start at all.
 
@@ -225,12 +232,51 @@ build disagrees with the genesis value refuses to start at all.
 Params: `[]`. Result: array of `{ "peer_id": "12D3KooW...", "addrs": ["/ip4/…/tcp/30303"], "connected_secs": 1241 }`.
 
 ### `shrugg_getValidators`
-Params: `[]`. Result: array of `{ "address": "…", "stake": "100000", "rewards": 4000000 }` in
-leader-rotation order (sorted by address). The leader of view `v` is entry `v mod n`. `stake` is a
-`u128` and goes out as a **decimal string** (a JSON number cannot carry one exactly); `rewards` is a
-`u64` and stays a number. `rewards` is the bundle fees credited to that validator as proposer; it
-is chain state, and the only amount this chain stores in the clear. Paying it out is phase S2's
-`Withdraw`.
+Params: `[]`. Result: array of
+
+```json
+{ "address": "…", "stake": "1000000000000", "pending": [{ "release_epoch": 41, "amount": "5000000000" }],
+  "rewards": "4000000", "payout": "shrugg1…", "nonce": 3, "active": true }
+```
+
+one row per entry of the **register** (spec §8), in address order. Since phase S2 that is every
+validator that has ever bonded, not the genesis set: `active` is the ones in the set running the
+current epoch, and those are what the leader rotation runs over. Amounts are **decimal strings**,
+because a JSON number is not an exact integer past 2^53 and a stake is 10^9 units per SHRUGG.
+`pending` is the unbonding queue, oldest first; `rewards` is the bundle fees credited to that
+validator as proposer; `payout` is where a `Withdraw` pays; `nonce` is what its next signed
+`Unbond` or `Withdraw` must carry. The register is the only place this chain stores amounts in the
+clear — `docs/staking.md` is the guide to it.
+
+### `shrugg_getEpoch`
+Params: `[]`. Result: `{ "epoch": 41, "epoch_blocks": 1000, "next_set": ["…", "…"] }`. `epoch` is
+`height / epoch_blocks`. `next_set` is what the register would derive for the next epoch if this
+one ended now — a projection, not a commitment: every bond and unbond before the boundary moves it.
+The derivation rule is in `docs/staking.md` §2.
+
+### `shrugg_getSupply`
+Params: `[]`. Result:
+
+```json
+{ "height": 1998,
+  "genesis_deposited": "…", "genesis_staked": "…", "faucet_minted": "…",
+  "withdraw_deposited": "…", "fees_paid": "…", "burned": "…",
+  "pool_value": "…", "register_total": "…", "total_supply": "…", "invariant_holds": true }
+```
+
+The supply audit. Note values are hidden, but every crossing of the pool's boundary is public, so
+these are exact: value enters the pool as a genesis deposit, a faucet mint or a validator's
+withdraw, and leaves it as a bundle fee (into a proposer's `rewards`) or a burn (a `Bond`, into
+`stake`). A withdraw's own base fee is not a crossing: `withdraw_deposited` counts the note it
+created (`amount` less the base), and the base moves from one register entry to another.
+`pool_value = genesis_deposited + faucet_minted + withdraw_deposited − fees_paid −
+burned`; `register_total` is Σ `stake + pending + rewards` over the register; `total_supply` is the
+two together, and `invariant_holds` is whether it still equals everything the chain issued
+(`genesis_deposited + genesis_staked + faucet_minted`). A false there is a bug, never a legitimate
+chain state. The counters are not in the state root — `shrugg-node verify --mode quick` recomputes
+every one of them by replaying the chain, which is what makes them auditable. `docs/supply.md`
+works the identity through a bond and a withdraw and says where it rests on a claim (the genesis
+file's own amounts) rather than on a check.
 
 ## Errors
 
@@ -247,8 +293,10 @@ Error responses look like `{ "jsonrpc": "2.0", "id": 1, "error": { "code": -3200
 ## The transaction on the wire
 
 `shrugg_sendTransaction` takes `bincode(Transaction)`. There is no signature over the transaction
-and no sender key: a bundle authorises itself by its proof, and the only signed action is a
-faucet mint, which carries the minting validator's key and signature inside the action.
+and no sender key: a bundle authorises itself by its proof, and an action that is signed carries
+the signature inside itself — a faucet mint the minting validator's key and signature, an `Unbond`
+or `Withdraw` the register's nonce and the validator's signature over it. Those three are also the
+only actions with `bundle: null`; every other action must carry one.
 
 ```
 Transaction { chain_id: u64, bundle: Option<Bundle>, action: Action }
@@ -263,8 +311,19 @@ Envelope { kem_ct: Vec<u8>, to_receiver: Vec<u8>, to_sender: Vec<u8>, body: Vec<
 Action::None                                            // a plain shielded transfer
 Action::Mint { cm: Word8, envelope: Envelope, amount: u64, minter: PublicKey, signature: Signature }
 Action::Deploy { base_pc: u32, words: Vec<u32> }
-Action::Call { program: Hash, proof: Vec<u8> }          // postcard(rand_zkvm::Proof)
+Action::Call { program: Hash, proof: Vec<u8>,           // postcard(rand_zkvm::Proof)
+               input_envelope: Option<CallEnvelope> }
+Action::Bond { validator: Address, amount: u64, registration: Option<Registration> }
+Action::Unbond { validator: Address, amount: u64, nonce: u64, signature: Signature }
+Action::Withdraw { validator: Address, amount: u64, nonce: u64, time: u32, r: Word8,
+                   envelope: Envelope, signature: Signature }
+
+Registration { public_key: PublicKey, payout: ShieldedAddress, signature: Signature }
 ```
+
+A `Bond` must carry a bundle whose `burn` equals its `amount` — that is how the stake leaves the
+pool — and `registration` is present exactly when the validator is not in the register yet
+(`docs/staking.md`). The two bridge actions are phase S3's and are rejected until it lands.
 
 Encoded sizes (bincode's default configuration: fixed-width integers, 8-byte length prefixes,
 `u32` enum tags):

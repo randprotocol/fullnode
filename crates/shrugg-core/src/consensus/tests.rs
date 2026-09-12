@@ -11,9 +11,13 @@ struct Sim {
     nodes: Vec<HotStuff>,
     keys: Vec<Keypair>,
     addr_to_idx: BTreeMap<Address, usize>,
+    /// The genesis every replica started from, as a node's config holds it.
+    gs: crate::genesis::GenesisState,
     /// (to, msg). `None` = broadcast.
     queue: VecDeque<(Option<usize>, usize, ConsensusMessage)>,
     committed: Vec<Vec<CommittedBlock>>,
+    /// `Action::RecordEpochSet`s each replica emitted, in order (the node persists these).
+    recorded: Vec<Vec<(u64, crate::types::ValidatorSet)>>,
     timers: Vec<Option<u64>>,
     pending_propose: Vec<Option<u64>>,
     fetches: Vec<(usize, Hash)>,
@@ -22,42 +26,71 @@ struct Sim {
     down: Vec<bool>,
 }
 
+/// A payout address for a test validator: phase S2 makes it a required genesis field, and
+/// nothing in consensus reads it — it only has to parse.
+fn payout(i: u8) -> String {
+    crate::notes::ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; crate::notes::KEM_EK_BYTES] }.to_string()
+}
+
 /// The genesis every simulation runs: no notes, faucet on, so a block body can be built out
 /// of validator mints (the only transaction that needs no note to spend).
 fn setup(n: u8, validators: u8) -> Sim {
+    build(n, validators, crate::genesis::EPOCH_BLOCKS_DEFAULT, false)
+}
+
+/// A simulation with short epochs where every replica holds its signing key, including those
+/// outside the genesis set: phase S2 lets such a replica observe until an epoch admits it.
+fn setup_epochs(n: u8, validators: u8, epoch_blocks: u64) -> Sim {
+    build(n, validators, epoch_blocks, true)
+}
+
+fn build(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool) -> Sim {
     let keys: Vec<Keypair> = (1..=n).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
     let genesis = Genesis {
         chain_id: 1,
         timestamp_ms: 0,
         validators: keys[..validators as usize]
             .iter()
-            .map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 10, payout: None })
+            .enumerate()
+            .map(|(i, k)| GenesisValidator {
+                public_key: k.public_key().clone(),
+                // Genesis requires every validator to meet the staking minimum (S2).
+                stake: crate::ledger::staking::MIN_STAKE as u128,
+                payout: payout(i as u8 + 1),
+            })
             .collect(),
         alloc: Vec::new(),
         faucet: true,
         confidential: true,
         fri_profile: "production".into(),
         hc_bundle: word8_to_hex(&[3; 8]),
-        epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
+        epoch_blocks,
         bridge: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
-    let cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
+    let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
+    cfg.epoch_blocks = gs.epoch_blocks;
     let mut nodes = Vec::new();
     let mut addr_to_idx = BTreeMap::new();
     for (i, k) in keys.iter().enumerate() {
-        let signer = if i < validators as usize { Some(Keypair::from_seed(*k.seed()).unwrap()) } else { None };
+        let signer = if all_signers || i < validators as usize {
+            Some(Keypair::from_seed(*k.seed()).unwrap())
+        } else {
+            None
+        };
         nodes.push(HotStuff::new(cfg.clone(), signer, gs.block.clone(), gs.ledger.clone(), std::sync::Arc::new(StubExecutor)));
         addr_to_idx.insert(k.address(), i);
     }
     let mut sim = Sim {
         committed: vec![Vec::new(); n as usize],
+        recorded: vec![Vec::new(); n as usize],
         timers: vec![None; n as usize],
         pending_propose: vec![None; n as usize],
         fetches: Vec::new(),
         down: vec![false; n as usize],
         nodes,
         keys,
+        gs,
         addr_to_idx,
         queue: VecDeque::new(),
         now: 0,
@@ -79,6 +112,7 @@ impl Sim {
                     self.queue.push_back((Some(to), i, m));
                 }
                 Action::Commit(blocks) => self.committed[i].extend(blocks),
+                Action::RecordEpochSet(epoch, set) => self.recorded[i].push((epoch, set)),
                 Action::ScheduleTimeout { view, .. } => self.timers[i] = Some(view),
                 Action::ReadyToPropose { view } => self.pending_propose[i] = Some(view),
                 Action::FetchBlock(h) => self.fetches.push((i, h)),
@@ -447,7 +481,7 @@ fn resume_from_persisted_head_continues_chain() {
         sim.step(vec![]);
     }
     let head = sim.committed[0].last().unwrap().clone();
-    let cfg = ConsensusConfig::new(1, validators_of(&sim), genesis_hash_of(&sim));
+    let cfg = config_of(&sim);
     let safety = sim.nodes[0].safety_state();
     let ledger = sim.nodes[0].committed_ledger().clone();
     let resumed = HotStuff::resume(
@@ -457,6 +491,7 @@ fn resume_from_persisted_head_continues_chain() {
         head.qc.clone(),
         ledger,
         Some(safety.clone()),
+        sim.nodes[0].epoch_sets().clone(),
         std::sync::Arc::new(StubExecutor),
     );
     assert_eq!(resumed.committed_height(), head.block.height());
@@ -464,23 +499,17 @@ fn resume_from_persisted_head_continues_chain() {
     assert_eq!(resumed.high_qc().block_hash, head.block.hash());
 }
 
-fn validators_of(sim: &Sim) -> crate::types::ValidatorSet {
-    crate::types::ValidatorSet::new(
-        sim.keys
-            .iter()
-            .take(sim.nodes.iter().filter(|n| n.is_validator()).count())
-            .map(|k| crate::types::Validator { public_key: k.public_key().clone(), stake: 10 })
-            .collect(),
-    )
-}
-fn genesis_hash_of(sim: &Sim) -> Hash {
-    sim.committed[0][0].block.parent()
+/// The config a restarting node rebuilds from its genesis file.
+fn config_of(sim: &Sim) -> ConsensusConfig {
+    let mut cfg = ConsensusConfig::new(sim.gs.chain_id, sim.gs.validators.clone(), sim.gs.hash());
+    cfg.epoch_blocks = sim.gs.epoch_blocks;
+    cfg
 }
 
 /// A restart hands `resume` a ledger rebuilt by `Storage::load_ledger`, which carries the state
 /// families but no position: `Ledger::from_parts` starts at height 0. `resume` must move it to
 /// the head block's height, or the mempool measures spec §7 step 5 against height 0 and refuses
-/// every bundle with `bundle time N is outside [0, 0]` until the second block after the restart.
+/// every bundle with `time N is outside [0, 0]` until the second block after the restart.
 #[test]
 fn a_ledger_resumed_at_height_h_accepts_a_bundle_timed_at_h() {
     use crate::confidential::ConfidentialExecutor;
@@ -502,7 +531,7 @@ fn a_ledger_resumed_at_height_h_accepts_a_bundle_timed_at_h() {
     reloaded.set_height(0);
     reloaded.set_timestamp_ms(0);
 
-    let cfg = ConsensusConfig::new(1, validators_of(&sim), genesis_hash_of(&sim));
+    let cfg = config_of(&sim);
     let resumed = HotStuff::resume(
         cfg,
         Some(Keypair::from_seed(*sim.keys[0].seed()).unwrap()),
@@ -510,6 +539,7 @@ fn a_ledger_resumed_at_height_h_accepts_a_bundle_timed_at_h() {
         head.qc.clone(),
         reloaded,
         Some(sim.nodes[0].safety_state()),
+        sim.nodes[0].epoch_sets().clone(),
         std::sync::Arc::new(StubExecutor),
     );
     let tip = resumed.tip_ledger();
@@ -575,9 +605,11 @@ impl Sim {
                 (g, QuorumCertificate::genesis(gh))
             }
         };
-        let cfg = ConsensusConfig::new(1, validators_of(self), genesis_hash_of_any(self));
+        let cfg = config_of(self);
+        let epoch_sets = old.epoch_sets().clone();
         let signer = if old.is_validator() { Some(Keypair::from_seed(*self.keys[i].seed()).unwrap()) } else { None };
-        self.nodes[i] = HotStuff::resume(cfg, signer, head, qc, ledger, Some(safety), std::sync::Arc::new(StubExecutor));
+        self.nodes[i] =
+            HotStuff::resume(cfg, signer, head, qc, ledger, Some(safety), epoch_sets, std::sync::Arc::new(StubExecutor));
         self.timers[i] = None;
         self.pending_propose[i] = None;
         let acts = self.nodes[i].start();
@@ -595,15 +627,6 @@ impl Sim {
             assert_eq!(node.committed_ledger().state_root(), root, "node {i} ledger differs");
         }
     }
-}
-
-fn genesis_hash_of_any(sim: &Sim) -> Hash {
-    for c in &sim.committed {
-        if let Some(first) = c.first() {
-            return first.block.parent();
-        }
-    }
-    sim.nodes[0].committed_hash()
 }
 
 #[test]
@@ -853,7 +876,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
     let genesis = Genesis {
         chain_id: 1,
         timestamp_ms: 0,
-        validators: vec![GenesisValidator { public_key: key.public_key().clone(), stake: 10, payout: None }],
+        validators: vec![GenesisValidator { public_key: key.public_key().clone(), stake: crate::ledger::staking::MIN_STAKE as u128, payout: payout(1) }],
         alloc: Vec::new(),
         faucet: true,
         confidential: true,
@@ -955,4 +978,304 @@ fn speculative_tree_is_capped() {
     // refused before any execution or insertion.
     let err = n.node.propose(3, vec![], 3).unwrap_err();
     assert!(matches!(err, ConsensusError::TreeFull), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Epochs (phase S2)
+// ---------------------------------------------------------------------------
+
+use crate::ledger::staking::MIN_STAKE;
+use crate::ledger::Ledger;
+use crate::notes::ShieldedAddress;
+use crate::types::actions::{registration_message, unbond_message, Registration};
+
+fn payout_addr(i: u8) -> ShieldedAddress {
+    ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; crate::notes::KEM_EK_BYTES] }
+}
+
+/// A shielded bundle carrying `action`, anchored to `l`'s root and burning `burn`. The stub
+/// proof publishes exactly the digest the ledger recomputes, so only the action's own rules
+/// decide whether it is admissible.
+fn staking_tx(l: &Ledger, n: u32, burn: u64, action: crate::types::Action) -> Transaction {
+    use crate::confidential::ConfidentialExecutor;
+    let mut b = crate::Bundle {
+        anchor: l.root(),
+        nullifiers: [[n; 8], [n + 1; 8]],
+        commitments: [[n + 2; 8], [n + 3; 8]],
+        fee: crate::gas::BUNDLE_BASE,
+        burn,
+        asset: 0,
+        time: l.height() as u32,
+        envelopes: [env(), env()],
+        proof: vec![],
+    };
+    let d = StubExecutor.bundle_digest(&b.digest_input());
+    b.proof = StubExecutor::make_bundle_proof(&l.hc_bundle(), &d);
+    Transaction::shielded(1, b, action)
+}
+
+/// A `Bond` that registers `v` with `amount` of stake, burning the amount out of the pool.
+fn bond_tx(l: &Ledger, n: u32, v: &Keypair, amount: u64, payout_index: u8) -> Transaction {
+    let payout = payout_addr(payout_index);
+    let signature = v.sign(registration_message(1, &payout).as_bytes());
+    let registration = Registration { public_key: v.public_key().clone(), payout, signature };
+    staking_tx(l, n, amount, crate::types::Action::Bond { validator: v.address(), amount, registration: Some(registration) })
+}
+
+/// An `Unbond` of `amount` signed by `v` at its current `nonce`. Bundle-less and free: a
+/// validator key owns no notes to pay a fee with.
+fn unbond_tx(v: &Keypair, amount: u64, nonce: u64) -> Transaction {
+    let signature = v.sign(unbond_message(1, &v.address(), amount, nonce).as_bytes());
+    Transaction {
+        chain_id: 1,
+        bundle: None,
+        action: crate::types::Action::Unbond { validator: v.address(), amount, nonce, signature },
+    }
+}
+
+impl Sim {
+    /// The block at `height` on node `i`'s branch, committed or not.
+    fn block_at(&self, i: usize, height: u64) -> Block {
+        if let Some(cb) = self.committed[i].get(height as usize - 1) {
+            return cb.block.clone();
+        }
+        let mut cur = self.nodes[i].high_qc().block_hash;
+        loop {
+            let b = self.nodes[i].block(&cur).expect("block is on the branch").clone();
+            assert!(b.height() >= height, "height {height} is not on node {i}'s branch");
+            if b.height() == height {
+                return b;
+            }
+            cur = b.parent();
+        }
+    }
+
+    /// Run until the chain has committed `height`, or fail.
+    fn run_to_height(&mut self, height: u64, steps: usize) {
+        for _ in 0..steps {
+            if self.committed[0].len() as u64 >= height {
+                return;
+            }
+            self.step(vec![]);
+        }
+        panic!("chain stalled at height {} (wanted {height})", self.committed[0].len());
+    }
+}
+
+/// The set of epoch 1 is the register as it stood after the last block of epoch 0 — not the
+/// genesis set, and not the register at any other height. A validator that bonds inside epoch 0
+/// therefore leads, votes and counts towards quorum from the epoch's first block and not before.
+#[test]
+fn epoch_rollover_uses_the_register_after_the_last_block_of_the_previous_epoch() {
+    let mut sim = setup_epochs(5, 4, 4);
+    let newcomer = Keypair::from_seed(*sim.keys[4].seed()).unwrap();
+    let fifth = newcomer.address();
+    assert!(!sim.gs.validators.contains(&fifth), "the fifth key is outside the genesis set");
+
+    sim.step(vec![]); // block 1
+    // Ten times the minimum: from epoch 1 on the four genesis validators are a minority of the
+    // stake, so no QC can form unless the rollover really admitted the fifth.
+    let bond = bond_tx(sim.nodes[0].tip_ledger(), 10, &newcomer, 10 * MIN_STAKE, 5);
+    sim.step(vec![bond.clone()]); // block 2
+
+    // Epoch 0 does not know the fifth validator, whatever the register now says.
+    let b2 = sim.block_at(0, 2);
+    assert!(b2.transactions.iter().any(|t| t.hash() == bond.hash()), "the bond landed in block 2");
+    let stray = Vote::sign(b2.view(), b2.hash(), &newcomer);
+    assert_eq!(sim.nodes[0].on_vote(stray).unwrap_err(), ConsensusError::NotValidator);
+
+    sim.run_to_height(9, 40);
+    sim.assert_consistent();
+
+    let b3 = sim.block_at(0, 3);
+    let epoch0 = sim.nodes[0].set_for_height(3, &b3.parent()).expect("epoch 0 is the genesis set");
+    let epoch1 = sim.nodes[0].set_for_height(4, &b3.hash()).expect("epoch 1 derives from block 3");
+    assert_eq!(epoch0, sim.gs.validators);
+    assert!(!epoch0.contains(&fifth));
+    assert_eq!(epoch1.len(), 5, "the register after block 3 has five entries above the minimum");
+    assert_eq!(epoch1.get(&fifth).unwrap().stake, 10 * MIN_STAKE as u128);
+
+    // Every replica recorded the set of epoch 1 when its first block committed.
+    for (i, rec) in sim.recorded.iter().enumerate() {
+        assert!(rec.contains(&(1, epoch1.clone())), "node {i} did not record epoch 1: {:?}", rec.iter().map(|(e, _)| *e).collect::<Vec<_>>());
+        assert!(rec.iter().all(|(e, _)| *e != 0), "epoch 0 is the genesis set, not a recorded rollover");
+    }
+
+    // From block 4 on, the leader schedule and the quorum are epoch 1's.
+    let mut fifth_led = false;
+    for cb in &sim.committed[0] {
+        let h = cb.block.height();
+        let set = sim.nodes[0].set_for_height(h, &cb.block.parent()).expect("the set of every committed block");
+        assert_eq!(cb.block.proposer(), set.leader(cb.block.view()), "block {h} has the wrong leader");
+        if h >= 4 {
+            assert_eq!(set, epoch1);
+            assert!(
+                cb.qc.votes.iter().any(|v| v.voter_address() == fifth),
+                "block {h} reached quorum without the fifth validator's stake"
+            );
+            fifth_led |= cb.block.proposer() == fifth;
+        } else {
+            assert_eq!(set, epoch0);
+        }
+    }
+    assert!(fifth_led, "the fifth validator never took its turn as leader");
+}
+
+/// An unbond that drops a validator under the minimum takes it out of the next epoch's set; the
+/// rest keep quorum and the chain does not stall at the boundary.
+#[test]
+fn an_unbond_below_min_stake_drops_a_validator_next_epoch_and_the_chain_keeps_quorum() {
+    let mut sim = setup_epochs(5, 5, 4);
+    let leaver = Keypair::from_seed(*sim.keys[4].seed()).unwrap();
+    let gone = leaver.address();
+    assert!(sim.gs.validators.contains(&gone));
+
+    sim.step(vec![]); // block 1
+    let unbond = unbond_tx(&leaver, 1, 0);
+    sim.step(vec![unbond.clone()]); // block 2
+    let b2 = sim.block_at(0, 2);
+    assert!(b2.transactions.iter().any(|t| t.hash() == unbond.hash()), "the unbond landed in block 2");
+
+    sim.run_to_height(9, 40);
+    sim.assert_consistent();
+
+    let b3 = sim.block_at(0, 3);
+    let epoch1 = sim.nodes[0].set_for_height(4, &b3.hash()).expect("epoch 1 derives from block 3");
+    assert_eq!(epoch1.len(), 4, "one unit below the minimum is below the minimum");
+    assert!(!epoch1.contains(&gone));
+
+    // The four that remain hold quorum, and the one that left neither leads nor votes.
+    for cb in &sim.committed[0] {
+        if cb.block.height() < 4 {
+            continue;
+        }
+        assert_ne!(cb.block.proposer(), gone, "block {} was led by a dropped validator", cb.block.height());
+        assert!(!cb.qc.votes.iter().any(|v| v.voter_address() == gone), "a dropped validator's vote was counted");
+        assert!(cb.qc.votes.len() >= 3, "quorum in a four-validator set is three votes");
+    }
+
+    // And its vote on an epoch-1 block is refused outright.
+    let tip = sim.block_at(0, sim.committed[0].len() as u64);
+    assert!(tip.height() >= 4);
+    let stray = Vote::sign(tip.view(), tip.hash(), &leaver);
+    assert_eq!(sim.nodes[0].on_vote(stray).unwrap_err(), ConsensusError::NotValidator);
+}
+
+/// A QC is verified against the set of the epoch the block it certifies belonged to, so the two
+/// QCs either side of a boundary are checked against different sets. A replica resumed from the
+/// last block of epoch 0, holding only the persisted sets, accepts both.
+#[test]
+fn qcs_across_a_boundary_verify_against_their_own_epoch() {
+    let mut sim = setup_epochs(5, 4, 4);
+    let newcomer = Keypair::from_seed(*sim.keys[4].seed()).unwrap();
+    sim.step(vec![]);
+    let bond = bond_tx(sim.nodes[0].tip_ledger(), 10, &newcomer, 10 * MIN_STAKE, 5);
+    sim.step(vec![bond]);
+    sim.run_to_height(7, 40);
+    sim.assert_consistent();
+
+    let gh = sim.gs.hash();
+    let b3 = sim.block_at(0, 3);
+    let b4 = sim.block_at(0, 4);
+    let b5 = sim.block_at(0, 5);
+    let epoch0 = sim.gs.validators.clone();
+    let epoch1 = sim.nodes[0].set_for_height(4, &b3.hash()).expect("epoch 1 derives from block 3");
+    assert_ne!(epoch0, epoch1);
+
+    // Block 4's justify certifies block 3, the last block of epoch 0.
+    assert_eq!(b4.header.justify.block_hash, b3.hash());
+    assert!(b4.header.justify.verify(&epoch0, &gh), "an epoch-0 QC verifies against epoch 0's set");
+    assert!(!b4.header.justify.verify(&epoch1, &gh), "epoch 0's voters are a minority of epoch 1's stake");
+
+    // Block 5's justify certifies block 4, the first block of epoch 1.
+    assert_eq!(b5.header.justify.block_hash, b4.hash());
+    assert!(b5.header.justify.verify(&epoch1, &gh), "an epoch-1 QC verifies against epoch 1's set");
+    assert!(!b5.header.justify.verify(&epoch0, &gh), "epoch 0 does not know the fifth validator");
+
+    // A replica resumed at committed height 3, with the sets storage kept, verifies each in turn.
+    let head = sim.committed[0][2].clone();
+    assert_eq!(head.block.hash(), b3.hash());
+    let mut ledger = sim.gs.ledger.clone();
+    for k in 0..3 {
+        ledger.apply_block(&sim.committed[0][k].block, &StubExecutor).expect("replay");
+    }
+    let mut epoch_sets = EpochSets::new(epoch0.clone());
+    epoch_sets.insert(1, epoch1.clone());
+    let mut resumed = HotStuff::resume(
+        config_of(&sim),
+        None,
+        head.block.clone(),
+        head.qc.clone(),
+        ledger,
+        None,
+        epoch_sets,
+        std::sync::Arc::new(StubExecutor),
+    );
+    assert_eq!(resumed.set_for_height(3, &b3.parent()).unwrap(), epoch0);
+    assert_eq!(resumed.set_for_height(4, &b3.hash()).unwrap(), epoch1);
+    resumed.on_proposal(b4.clone(), sim.now).expect("block 4's justify is an epoch-0 QC");
+    resumed.on_proposal(b5.clone(), sim.now).expect("block 5's justify is an epoch-1 QC");
+    assert!(resumed.has_block(&b5.hash()));
+}
+
+/// Every validator unbonding below the minimum inside one epoch empties the next epoch's
+/// register. Consensus carries the previous epoch's set forward rather than switching to a set
+/// with no leader: a halted chain has no block left in which to bond back in.
+#[test]
+fn an_epoch_whose_register_empties_carries_the_previous_set_forward() {
+    let mut sim = setup_epochs(4, 4, 4);
+    sim.step(vec![]); // block 1
+    let leavers: Vec<Transaction> = (0..4)
+        .map(|i| {
+            let v = Keypair::from_seed(*sim.keys[i].seed()).unwrap();
+            unbond_tx(&v, 1, 0)
+        })
+        .collect();
+    sim.step(leavers); // block 2
+    assert_eq!(sim.block_at(0, 2).transactions.len(), 4, "all four unbonded in one block");
+
+    // Two more boundaries, so the fallback has to hold for an epoch derived from a fallback.
+    sim.run_to_height(13, 60);
+    sim.assert_consistent();
+
+    let mut ledger = sim.gs.ledger.clone();
+    for k in 0..3 {
+        ledger.apply_block(&sim.committed[0][k].block, &StubExecutor).expect("replay");
+    }
+    assert!(ledger.derive_next_set().is_empty(), "the register after block 3 has nobody above the minimum");
+
+    let b3 = sim.block_at(0, 3);
+    let epoch1 = sim.nodes[0].set_for_height(4, &b3.hash()).expect("epoch 1 falls back to epoch 0");
+    assert_eq!(epoch1, sim.gs.validators, "the empty derivation carries epoch 0's set forward");
+    let tip = sim.committed[0].len() as u64;
+    let last = sim.block_at(0, tip);
+    assert!(last.height() >= 12, "the chain kept committing past two more boundaries");
+    assert_eq!(sim.nodes[0].set_for_height(last.height(), &last.parent()).unwrap(), sim.gs.validators);
+}
+
+/// A block's height must be its parent's plus one before anything is derived from it. The epoch
+/// of an unchecked height is the sender's to choose, and each choice would be a register walk and
+/// a cached set keyed on a parent that never leaves the tree.
+#[test]
+fn a_block_whose_height_skips_its_parent_is_refused_before_its_epoch_is_derived() {
+    let mut sim = setup_epochs(4, 4, 4);
+    sim.step(vec![]);
+    let parent = sim.block_at(0, 1);
+    // Any key can sign its own block; the height, not the leader schedule, must be what refuses it.
+    let liar = 1usize;
+    let header = crate::types::BlockHeader {
+        height: parent.height() + 1 + 4 * 1_000_000,
+        view: sim.nodes[0].view() + 1,
+        parent: parent.hash(),
+        proposer: sim.keys[liar].public_key().clone(),
+        timestamp_ms: 1,
+        tx_root: Hash::ZERO,
+        state_root: parent.header.state_root,
+        justify: sim.nodes[0].high_qc().clone(),
+    };
+    let block = Block::sign(header, vec![], &sim.keys[liar]);
+    assert_eq!(
+        sim.nodes[0].on_proposal(block, sim.now).unwrap_err(),
+        ConsensusError::BadHeight { block: parent.height() + 1 + 4_000_000, parent: parent.height() }
+    );
 }

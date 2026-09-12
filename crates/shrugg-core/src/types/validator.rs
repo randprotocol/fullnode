@@ -28,6 +28,20 @@ impl ValidatorSet {
         ValidatorSet { validators }
     }
 
+    /// Build a set from register entries (`(key, stake)` pairs, phase S2).
+    ///
+    /// This is the one boundary where the register's `u64` stake becomes the `u128` consensus
+    /// weight: amounts on this chain are `u64` units, while quorum and total-stake arithmetic
+    /// keeps the headroom so summing a full set can never overflow.
+    pub fn from_entries<'a>(entries: impl IntoIterator<Item = (&'a PublicKey, u64)>) -> ValidatorSet {
+        ValidatorSet::new(
+            entries
+                .into_iter()
+                .map(|(public_key, stake)| Validator { public_key: public_key.clone(), stake: stake as u128 })
+                .collect(),
+        )
+    }
+
     pub fn len(&self) -> usize {
         self.validators.len()
     }
@@ -58,7 +72,15 @@ impl ValidatorSet {
     }
 
     /// Round-robin leader. Hook for a future sortition beacon.
+    ///
+    /// Panic backstop for an empty set, which has no leader. Consensus never asks: an epoch whose
+    /// register derives an empty set carries the previous epoch's set forward (see
+    /// `HotStuff::shared_set_for_height`), so this returns an address no key can hash to rather
+    /// than dividing by zero.
     pub fn leader(&self, view: u64) -> Address {
+        if self.validators.is_empty() {
+            return Address::ZERO;
+        }
         let idx = (view % self.validators.len() as u64) as usize;
         self.validators[idx].address()
     }

@@ -69,21 +69,32 @@ addresses come from wallet keys, which are not node keys.
 ```bash
 # one spend key per wallet that should start with funds (wallets/ is gitignored — never commit these)
 for i in 1 2 3 4 5; do shrugg --key wallets/shielded-$i.key.json keygen; done
+addr() { shrugg --key wallets/shielded-$1.key.json address; }
 
-# the genesis: four validators, five 1000-SHRUGG deposit notes, faucet on, production FRI
+# the genesis: four validators, five 1000-SHRUGG deposit notes, faucet on, production FRI,
+# 1000-block epochs. Phase S2 makes a --validator one register entry with all three of its fields
+# at once — `<key file or hex public key>,<stake in SHRUGG>,<payout shrugg1…>` — so nothing can
+# pair the wrong stake or payout with the wrong key. The payout is the shielded address that
+# validator's rewards and unbonded stake are withdrawn to, and it is part of the genesis hash.
+# The stake must be at least 1000 SHRUGG: below the staking minimum a validator is in the
+# register but in no epoch's set, which genesis refuses outright.
 args=()
-for i in 1 2 3 4 5; do
-  args+=(--alloc "$(shrugg --key wallets/shielded-$i.key.json address)=1000")
-done
+for i in 1 2 3 4 5; do args+=(--alloc "$(addr $i)=1000"); done
 shrugg-node genesis --chain-id 6 \
-  --validator deploy/node-a.key.json --validator deploy/node-b.key.json \
-  --validator deploy/node-c.key.json --validator deploy/node-d.key.json \
-  --stake 100000 "${args[@]}" --faucet --fri-profile production \
+  --validator "deploy/node-a.key.json,1000,$(addr 1)" \
+  --validator "deploy/node-b.key.json,1000,$(addr 2)" \
+  --validator "deploy/node-c.key.json,1000,$(addr 3)" \
+  --validator "deploy/node-d.key.json,1000,$(addr 4)" \
+  "${args[@]}" --epoch-blocks 1000 --faucet --fri-profile production \
   --out deploy/genesis-shielded.example.json
 ```
 
+Note that this command reuses four of the deposit wallets as payout addresses, which is convenient
+for a testnet and wrong for anything else: a payout address is public in the register from the first
+block on, so on a real chain give each validator a wallet that holds nothing else.
+
 `deploy/genesis-shielded.example.json` in this repo is exactly that file, produced by that command
-(chain id 6, genesis hash `6457243776e7c152b946a3a245f6748d9934ffc6f08ac22f868fb4014b38ddf3`,
+(chain id 6, genesis hash `386371c4f96405a3246b2402610b3499a5eb8aff1834a7d4ca6f1548f5d5bff7`,
 `hc_bundle 4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb`). It is an **example**:
 its five deposit notes belong to spend keys that live only on the machine that cut it, so re-cut
 your own rather than adopting it. Two properties make that unavoidable:
@@ -118,3 +129,14 @@ shrugg faucet "$(shrugg --key wallets/shielded-3.key.json address)"   # if --fau
 
 `shrugg-node status` on any node reports `notes`, `nullifiers`, `tree_root` and `hc_bundle`
 alongside the usual height and peer counts, which is the quickest check that a fresh fleet agrees.
+It also reports `is_validator` (this node holds a key) and `active_validator` (that key is in the
+current epoch's set) — the two are different from phase S2 on, and the second is the one that says
+whether a node is producing blocks.
+
+Adding or removing a validator on a running chain needs no new genesis (`docs/staking.md`): its
+operator runs `shrugg-node register --key node-e.key.json --payout <shrugg1…>`, a wallet with 1000
+SHRUGG runs `shrugg bond <its address> 1000 --registration <hex>`, and the node — started with
+`--validator` all along — begins proposing at the next epoch boundary. Leaving is
+`shrugg-node unbond` and, two epochs later, `shrugg-node withdraw`, which pays the stake back into a
+note at the payout address. Check the quorum arithmetic first: this fleet's four validators need
+three online, and three need all three.

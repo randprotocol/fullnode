@@ -11,14 +11,14 @@
 pub mod bridge_notes;
 pub mod call_envelope;
 pub mod staking;
+pub mod supply;
 
 use crate::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
-use crate::crypto::{merkle_root, Address, Hash, PublicKey};
+use crate::crypto::{merkle_root, Address, Hash};
 use crate::gas;
-use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Word8, MAX_ENVELOPE_BYTES};
+use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Envelope, Word8, MAX_ENVELOPE_BYTES};
 use crate::program::{program_id, CallOutcome, CallReceipt, ProgramId, ProgramRecord};
 use crate::types::{Action, Block, Transaction, ValidatorSet, FAUCET_MAX_UNITS};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// How many block-end roots a bundle may anchor to (spec §7 item 4).
@@ -34,15 +34,25 @@ pub const ANCHOR_WINDOW: usize = 256;
 /// is still live.
 pub const TIME_WINDOW: u64 = 256;
 
-/// The one public register on the chain (spec §8): a validator's key, its stake, and the
-/// bundle fees credited to it as proposer. `stake` stays `u128` so the existing weighting and
-/// quorum arithmetic is unchanged; `rewards` are token units like every other amount.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ValidatorEntry {
-    pub public_key: PublicKey,
-    pub stake: u128,
-    /// Bundle fees credited to this proposer (spec §8); paid out by S2's Withdraw.
-    pub rewards: u64,
+pub use staking::{StakingError, ValidatorEntry};
+pub use supply::{register_total, Audit, Supply};
+
+/// A deposit note the ledger created itself while applying a transaction, rather than accepting
+/// on the wire: S2's `Withdraw` (and S3's `BridgeAttest`) publish only a blinding and a public
+/// amount, so the commitment is computed here and is not in [`Transaction::commitments`].
+///
+/// This is transient output, like a call receipt — not consensus state, not in the state root,
+/// not compared by [`Ledger`]'s equality. `apply_transactions` clears the list when a block
+/// starts, so after `apply_block` the ledger's [`Ledger::deposits`] are exactly that block's,
+/// in the order they were appended to the tree. Storage (S2 Task 3) writes one `NoteRow` per
+/// entry at `index`, beside the notes `created_notes(tx)` already yields for the bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Deposit {
+    /// Leaf index the note was appended at.
+    pub index: u64,
+    pub cm: Word8,
+    /// The envelope the action carried, stored with the note so its owner can open it.
+    pub envelope: Envelope,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
@@ -51,8 +61,10 @@ pub enum TxError {
     WrongChain { expected: u64, actual: u64 },
     #[error("transaction carries no bundle")]
     MissingBundle,
-    #[error("a mint must not carry a bundle")]
-    MintCarriesBundle,
+    /// The action rides without a bundle ([`Action::bundle_less`]) and this transaction attached
+    /// one anyway. Named, so a wallet hears which of its actions was built wrong.
+    #[error("a {0} must not carry a bundle")]
+    ActionCarriesBundle(&'static str),
     #[error("envelope exceeds {MAX_ENVELOPE_BYTES} bytes")]
     EnvelopeTooLarge,
     #[error("proof too large")]
@@ -69,7 +81,8 @@ pub enum TxError {
     FeeTooLow { min: u64, fee: u64 },
     #[error("anchor is not one of the last {ANCHOR_WINDOW} roots")]
     UnknownAnchor,
-    #[error("bundle time {time} is outside [{}, {height}]", height.saturating_sub(TIME_WINDOW))]
+    /// A bundle's `time`, or a bundle-less `Withdraw`'s, outside the window (spec §7 item 5).
+    #[error("time {time} is outside [{}, {height}]", height.saturating_sub(TIME_WINDOW))]
     TimeOutOfWindow { time: u32, height: u64 },
     #[error("the bundle spends the same nullifier twice")]
     DuplicateNullifierInBundle,
@@ -106,6 +119,9 @@ pub enum TxError {
     InvalidBundleProof(ConfidentialError),
     #[error("proposer {0} is not in the validator register")]
     UnknownProposer(Address),
+    /// Phase S2: a `Bond`, `Unbond` or `Withdraw` the register refused (see [`StakingError`]).
+    #[error("staking: {0}")]
+    Staking(#[from] StakingError),
     #[error("arithmetic overflow")]
     Overflow,
 }
@@ -153,16 +169,29 @@ pub struct Ledger {
     anchors: VecDeque<(u64, Word8)>,
     validators: BTreeMap<Address, ValidatorEntry>,
     programs: BTreeMap<ProgramId, ProgramRecord>,
+    /// Blocks per epoch (spec §8), from genesis. Not state: like `faucet` and `confidential`,
+    /// a reloading node sets it from its genesis file.
+    epoch_blocks: u64,
     /// Height of the block being applied (the `time` window and `ProgramRecord::deployed_at`).
     height: u64,
     /// Timestamp of the block being applied, in unix milliseconds.
     timestamp_ms: u64,
+    /// Deposit notes this block's transactions made the ledger create (see [`Deposit`]).
+    deposits: Vec<Deposit>,
+    /// The public supply counters (see [`supply`]). Derived from the chain, not hashed into
+    /// the state root.
+    supply: Supply,
 }
 
 /// Equality is over consensus state only. `height` and `timestamp_ms` are the position of the
 /// block being applied, and `faucet`/`confidential` are genesis switches a reloading node sets
 /// from its genesis file rather than from storage, so two ledgers holding the same notes,
 /// nullifiers, anchors, validators and programs are the same ledger.
+///
+/// The [`supply`] counters are deliberately **out**: nothing in the state root covers them, and
+/// `Ledger::from_parts` cannot know them, so a rebuilt ledger would never compare equal to the
+/// one it was rebuilt from. A node audits its stored copy of them separately, by replay
+/// (`Storage::verify_chain`).
 impl PartialEq for Ledger {
     fn eq(&self, o: &Ledger) -> bool {
         self.chain_id == o.chain_id
@@ -178,20 +207,18 @@ impl PartialEq for Ledger {
 impl Eq for Ledger {}
 
 impl Ledger {
-    /// An empty ledger whose only anchor is the empty tree's root at height 0.
-    pub fn new(chain_id: u64, hc_bundle: Word8, validators: &ValidatorSet, executor: &dyn ConfidentialExecutor) -> Ledger {
+    /// An empty ledger whose only anchor is the empty tree's root at height 0, with `validators`
+    /// as its register. Genesis is the one caller that seeds a register (spec §8); every later
+    /// entry arrives through a `Bond`.
+    pub fn new(
+        chain_id: u64,
+        hc_bundle: Word8,
+        validators: BTreeMap<Address, ValidatorEntry>,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Ledger {
         let tree = CommitmentTree::new(executor);
         let mut anchors = VecDeque::new();
         anchors.push_back((0, tree.root()));
-        let validators = validators
-            .iter()
-            .map(|v| {
-                (
-                    v.public_key.address(),
-                    ValidatorEntry { public_key: v.public_key.clone(), stake: v.stake, rewards: 0 },
-                )
-            })
-            .collect();
         Ledger {
             chain_id,
             hc_bundle,
@@ -203,8 +230,11 @@ impl Ledger {
             anchors,
             validators,
             programs: BTreeMap::new(),
+            epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             height: 0,
             timestamp_ms: 0,
+            deposits: Vec::new(),
+            supply: Supply::default(),
         }
     }
 
@@ -232,8 +262,11 @@ impl Ledger {
             anchors: anchors.into_iter().collect(),
             validators,
             programs,
+            epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             height: 0,
             timestamp_ms: 0,
+            deposits: Vec::new(),
+            supply: Supply::default(),
         }
     }
 
@@ -259,6 +292,79 @@ impl Ledger {
 
     pub fn set_confidential(&mut self, on: bool) {
         self.confidential = on;
+    }
+
+    /// Blocks per epoch (spec §8), as genesis set it.
+    pub fn epoch_blocks(&self) -> u64 {
+        self.epoch_blocks
+    }
+
+    /// Set by the node from its genesis file, like the faucet and confidential switches. Zero is
+    /// refused into 1 so `epoch` can never divide by zero on a malformed genesis.
+    pub fn set_epoch_blocks(&mut self, n: u64) {
+        self.epoch_blocks = n.max(1);
+    }
+
+    /// The epoch of the block being applied: `height / epoch_blocks`, so genesis is epoch 0.
+    pub fn epoch(&self) -> u64 {
+        self.height / self.epoch_blocks.max(1)
+    }
+
+    /// The validator set the next epoch would use if this ledger were the last block of one
+    /// (spec §8). The rule itself lives in [`staking::derive_set`].
+    pub fn derive_next_set(&self) -> ValidatorSet {
+        staking::derive_set(&self.validators)
+    }
+
+    /// The public supply counters as of this ledger (see [`supply`]).
+    pub fn supply(&self) -> Supply {
+        self.supply
+    }
+
+    /// Restore the counters a node persisted beside the state. Like the faucet and confidential
+    /// switches, they do not come out of the note, nullifier and validator families, so the
+    /// loader sets them; `Ledger::from_parts` leaves them at zero.
+    pub fn set_supply(&mut self, s: Supply) {
+        self.supply = s;
+    }
+
+    /// What genesis itself created, set once by [`crate::genesis::Genesis::build`]: the deposit
+    /// notes in the pool and the stakes in the register. Neither was minted by a transaction,
+    /// and together they are the whole of a chain's supply before its first block.
+    pub fn set_genesis_supply(&mut self, deposited: u64, staked: u64) {
+        self.supply.genesis_deposited = deposited;
+        self.supply.genesis_staked = staked;
+    }
+
+    /// The supply audit against this ledger's own register.
+    pub fn audit(&self) -> Audit {
+        Audit::new(self.supply, register_total(&self.validators))
+    }
+
+    /// Deposit notes this ledger created while applying the current block (see [`Deposit`]).
+    pub fn deposits(&self) -> &[Deposit] {
+        &self.deposits
+    }
+
+    /// Take the deposits, leaving the list empty.
+    pub fn take_deposits(&mut self) -> Vec<Deposit> {
+        std::mem::take(&mut self.deposits)
+    }
+
+    /// Append a note the ledger computed itself and record it for storage. Fails — before any
+    /// mutation — if the commitment is already in the tree.
+    pub(crate) fn append_deposit(
+        &mut self,
+        cm: Word8,
+        envelope: Envelope,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<u64, TxError> {
+        if !self.commitments.insert(cm) {
+            return Err(TxError::CommitmentExists(cm));
+        }
+        let index = self.tree.append(cm, executor);
+        self.deposits.push(Deposit { index, cm, envelope });
+        Ok(index)
     }
 
     /// Height of the block whose transactions are being applied.
@@ -301,6 +407,21 @@ impl Ledger {
     /// node can enumerate.
     pub fn is_anchor(&self, root: &Word8) -> bool {
         self.anchors.iter().any(|(_, r)| r == root)
+    }
+
+    /// Spec §7 item 5: a `time` is this height at the latest and at most [`TIME_WINDOW`] blocks
+    /// behind it. A bundle's `time` and a bundle-less `Withdraw`'s both answer to this one rule,
+    /// and the mempool re-checks it with the same function as the chain scrolls on.
+    pub fn time_in_window(&self, time: u32) -> bool {
+        let t = time as u64;
+        t <= self.height && self.height - t <= TIME_WINDOW
+    }
+
+    fn check_time(&self, time: u32) -> Result<(), TxError> {
+        if !self.time_in_window(time) {
+            return Err(TxError::TimeOutOfWindow { time, height: self.height });
+        }
+        Ok(())
     }
 
     pub fn nullifiers(&self) -> &BTreeSet<Word8> {
@@ -413,19 +534,25 @@ impl Ledger {
             return Err(TxError::WrongChain { expected: self.chain_id, actual: tx.chain_id });
         }
         // 3. shape and fee floor
-        let is_mint = matches!(tx.action, Action::Mint { .. });
-        let bundle: Option<&Bundle> = match (&tx.bundle, is_mint) {
-            (None, true) => None,
-            (None, false) => return Err(TxError::MissingBundle),
-            (Some(_), true) => return Err(TxError::MintCarriesBundle),
-            (Some(b), false) => Some(b),
+        let bundle: Option<&Bundle> = match (&tx.bundle, tx.action.bundle_less()) {
+            (None, Some(_)) => None,
+            (None, None) => return Err(TxError::MissingBundle),
+            (Some(_), Some(name)) => return Err(TxError::ActionCarriesBundle(name)),
+            (Some(b), None) => Some(b),
         };
         if let Some(b) = bundle {
             if b.asset != 0 {
                 return Err(TxError::UnsupportedAsset(b.asset));
             }
-            if b.burn != 0 {
-                return Err(TxError::UnsupportedBurn(b.burn));
+            // Phase S2: `Bond` is the one action whose bundle may burn, and it must burn exactly
+            // what it bonds — that is how value leaves the pool and becomes public stake.
+            match &tx.action {
+                Action::Bond { amount, .. } if b.burn != *amount => {
+                    return Err(StakingError::BurnMismatch { burn: b.burn, amount: *amount }.into())
+                }
+                Action::Bond { .. } => {}
+                _ if b.burn != 0 => return Err(TxError::UnsupportedBurn(b.burn)),
+                _ => {}
             }
             let min = gas::fee_floor(&tx.action);
             if b.fee < min {
@@ -436,10 +563,7 @@ impl Ledger {
                 return Err(TxError::UnknownAnchor);
             }
             // 5. time
-            let t = b.time as u64;
-            if t > self.height || self.height - t > TIME_WINDOW {
-                return Err(TxError::TimeOutOfWindow { time: b.time, height: self.height });
-            }
+            self.check_time(b.time)?;
             // 6. nullifiers and commitments
             if b.nullifiers[0] == b.nullifiers[1] {
                 return Err(TxError::DuplicateNullifierInBundle);
@@ -457,6 +581,12 @@ impl Ledger {
                     return Err(TxError::CommitmentExists(*cm));
                 }
             }
+        }
+        // A bundle-less `Withdraw` carries a `time` of its own — the note's, which the sealing
+        // node chose — and it is held to the same window by the same rule. Checked here, at the
+        // step a bundle's time is checked, so a stale one is refused before any signature work.
+        if let Action::Withdraw { time, .. } = &tx.action {
+            self.check_time(*time)?;
         }
         // 7. action-specific cheap checks
         let mut call_record = None;
@@ -543,6 +673,12 @@ impl Ledger {
             // is the leader.
             let entry = self.validators.get(proposer).ok_or(TxError::UnknownProposer(*proposer))?;
             let rewards = entry.rewards.checked_add(b.fee).ok_or(TxError::Overflow)?;
+            // Both halves of what this bundle takes out of the pool (see [`supply`]): the fee
+            // becomes the proposer's `rewards` below, and the burn becomes `stake` in the
+            // `Bond` arm — which is why they are counted here, where every bundle passes,
+            // rather than in the arms that receive them.
+            self.supply.fees_paid = self.supply.fees_paid.checked_add(b.fee).ok_or(TxError::Overflow)?;
+            self.supply.burned = self.supply.burned.checked_add(b.burn).ok_or(TxError::Overflow)?;
             for nf in &b.nullifiers {
                 self.nullifiers.insert(*nf);
             }
@@ -555,7 +691,9 @@ impl Ledger {
         let mut receipt = None;
         match &tx.action {
             Action::None => {}
-            Action::Mint { cm, .. } => {
+            Action::Mint { cm, amount, .. } => {
+                self.supply.faucet_minted =
+                    self.supply.faucet_minted.checked_add(*amount).ok_or(TxError::Overflow)?;
                 self.commitments.insert(*cm);
                 self.tree.append(*cm, executor);
             }
@@ -574,7 +712,9 @@ impl Ledger {
                 receipt = Some(CallReceiptData { program: *program, tier: o.tier, outputs: o.outputs });
             }
             a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. }) => {
-                staking::apply(self, tx, a, executor)?;
+                // The proposer is passed in because a `Withdraw` pays it the bundle base out of
+                // the amount it withdraws — the one fee that does not come from a bundle.
+                staking::apply(self, tx, a, proposer, executor)?;
             }
             a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
                 bridge_notes::apply(self, tx, a, executor)?;
@@ -593,6 +733,8 @@ impl Ledger {
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
         let mut scratch = self.clone();
+        // The deposits reported after a block are exactly that block's (see `Deposit`).
+        scratch.deposits.clear();
         let mut receipts = Vec::new();
         for (index, tx) in txs.iter().enumerate() {
             if let Some(r) =
@@ -669,11 +811,23 @@ impl Ledger {
             .validators
             .iter()
             .map(|(addr, v)| {
-                let mut buf = Vec::with_capacity(32 + 16 + 8);
+                let mut buf = Vec::with_capacity(96 + 16 * v.pending.len() + v.payout.kem_ek.len());
                 buf.extend_from_slice(addr.as_bytes());
                 buf.extend_from_slice(&v.stake.to_be_bytes());
                 buf.extend_from_slice(&v.rewards.to_be_bytes());
-                Hash::digest_domain(b"shrugg-validator-leaf", &buf)
+                buf.extend_from_slice(&v.nonce.to_be_bytes());
+                // The queue's length before the queue itself: `pending` is the one
+                // variable-length run in the leaf, and without a count a short payout key with
+                // one pending entry could serialise to the same bytes as a longer key with
+                // none. Every field is fixed-width again from here on.
+                buf.extend_from_slice(&(v.pending.len() as u64).to_be_bytes());
+                for (release_epoch, amount) in &v.pending {
+                    buf.extend_from_slice(&release_epoch.to_be_bytes());
+                    buf.extend_from_slice(&amount.to_be_bytes());
+                }
+                buf.extend_from_slice(&word8_to_bytes(&v.payout.pk));
+                buf.extend_from_slice(&v.payout.kem_ek);
+                Hash::digest_domain(b"shrugg-validator-leaf-2", &buf)
             })
             .collect();
         let prog_leaves: Vec<Hash> =
@@ -697,8 +851,8 @@ mod tests {
     use super::*;
     use crate::confidential::StubExecutor;
     use crate::crypto::Keypair;
-    use crate::notes::Envelope;
-    use crate::types::{BlockHeader, QuorumCertificate, Validator, ValidatorSet};
+    use crate::notes::{Envelope, ShieldedAddress};
+    use crate::types::{BlockHeader, QuorumCertificate};
 
     const HC: Word8 = [11; 8];
 
@@ -710,13 +864,25 @@ mod tests {
         (Keypair::from_seed([1; 32]).unwrap(), Keypair::from_seed([2; 32]).unwrap())
     }
 
+    /// A register entry for `k`: the S1 fixture's stake, with the S2 fields at their defaults.
+    fn entry(k: &Keypair, stake: u64) -> (Address, ValidatorEntry) {
+        (
+            k.address(),
+            ValidatorEntry {
+                public_key: k.public_key().clone(),
+                stake,
+                pending: Vec::new(),
+                rewards: 0,
+                payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+                nonce: 0,
+            },
+        )
+    }
+
     fn ledger() -> Ledger {
         let (a, b) = keys();
-        let set = ValidatorSet::new(vec![
-            Validator { public_key: a.public_key().clone(), stake: 10 },
-            Validator { public_key: b.public_key().clone(), stake: 10 },
-        ]);
-        let mut l = Ledger::new(7, HC, &set, &StubExecutor);
+        let register: BTreeMap<Address, ValidatorEntry> = [entry(&a, 10), entry(&b, 10)].into_iter().collect();
+        let mut l = Ledger::new(7, HC, register, &StubExecutor);
         l.set_faucet(true);
         l.set_confidential(true);
         l.set_height(1);
@@ -954,7 +1120,7 @@ mod tests {
         assert_eq!(l.validate(&forged, &StubExecutor), Err(TxError::BadMintSignature));
         let with_bundle =
             Transaction { bundle: Some(bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE)), ..t.clone() };
-        assert_eq!(l.validate(&with_bundle, &StubExecutor), Err(TxError::MintCarriesBundle));
+        assert_eq!(l.validate(&with_bundle, &StubExecutor), Err(TxError::ActionCarriesBundle("mint")));
         let no_bundle = Transaction { chain_id: 7, bundle: None, action: Action::None };
         assert_eq!(l.validate(&no_bundle, &StubExecutor), Err(TxError::MissingBundle));
         l.set_faucet(false);
@@ -1003,8 +1169,8 @@ mod tests {
     }
 
     /// Each scaffolded action reaches its module, is refused there naming the phase that turns
-    /// it on, and leaves the ledger untouched. Shared by the S2 and S3 halves below so each
-    /// phase deletes only its own test.
+    /// it on, and leaves the ledger untouched. S2 has landed, so only the bridge half is left;
+    /// S3's Task 2 takes this helper with it.
     fn refused_until_its_phase(l: &Ledger, phase: &str, first_nullifier: u32, action: Action) {
         let n = first_nullifier;
         let b = bundle(l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::fee_floor(&action));
@@ -1022,34 +1188,13 @@ mod tests {
         assert_eq!(&scratch, l, "a refused action leaves the ledger untouched");
     }
 
-    /// S2 scaffold: the three staking variants reach [`staking`] and are refused there. S2's
-    /// Task 1 deletes this test.
-    #[test]
-    fn the_staking_actions_are_refused_until_phase_s2() {
-        let l = ledger();
-        let sig = crate::crypto::Signature::empty();
-        let v = Address([1; 32]);
-        refused_until_its_phase(&l, "S2", 100, Action::Bond { validator: v, amount: 5, registration: None });
-        refused_until_its_phase(
-            &l,
-            "S2",
-            104,
-            Action::Unbond { validator: v, amount: 5, nonce: 0, signature: sig.clone() },
-        );
-        refused_until_its_phase(
-            &l,
-            "S2",
-            108,
-            Action::Withdraw { validator: v, amount: 5, nonce: 0, r: [7; 8], envelope: env(), signature: sig },
-        );
-    }
-
     /// S3 scaffold: the two bridge variants reach [`bridge_notes`] and are refused there. S3's
-    /// Task 2 deletes this test.
+    /// Task 2 deletes this test. (The staking half is gone: S2 Task 1 gave the three staking
+    /// variants rules, and their tests live in `staking.rs`.)
     #[test]
     fn the_bridge_actions_are_refused_until_phase_s3() {
         let l = ledger();
-        let recipient = crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
+        let recipient = ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
         refused_until_its_phase(
             &l,
             "S3",
@@ -1066,30 +1211,48 @@ mod tests {
     }
 
     /// Step 1 caps every variable-length field the new actions carry, before any signature or
-    /// proof work — and before the action step that would otherwise refuse them, which is what
-    /// makes the cap the error a fat transaction gets. The passing case still ends in
-    /// `UnsupportedAction`, so each assertion below shows the cap firing first.
+    /// proof work — and before the action step, which is what makes the cap the error a fat
+    /// transaction gets. A transaction that clears the cap is still refused further down (an
+    /// unregistered validator, or the phase that has not landed); what it is never refused for
+    /// is its size.
     #[test]
     fn the_new_actions_are_size_capped_at_step_one() {
         let l = ledger();
         let v = Address([1; 32]);
         let sig = crate::crypto::Signature::empty();
-        let recipient = crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
+        let recipient = ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
         // An envelope of exactly `body` bytes of payload, so the cap edge is exact.
         let fat = |body: usize| Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![3; body] };
         let check = |n: u32, action: Action, expect: Result<(), TxError>| {
-            let b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::fee_floor(&action));
-            let got = l.validate(&Transaction::shielded(7, b, action), &StubExecutor);
+            // Bundle-less actions are handed over as they ride; everything else gets a bundle
+            // that pays its floor, so the only thing under test is the cap.
+            let t = match action.bundle_less() {
+                Some(_) => Transaction { chain_id: 7, bundle: None, action },
+                None => {
+                    let b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::fee_floor(&action));
+                    Transaction::shielded(7, b, action)
+                }
+            };
+            let got = l.validate(&t, &StubExecutor);
             match expect {
                 Err(e) => assert_eq!(got, Err(e), "n={n}"),
-                // "the cap passed": what is left is the phase refusal, not a size error.
-                Ok(()) => assert!(matches!(got, Err(TxError::UnsupportedAction(_))), "n={n}: {got:?}"),
+                // "the cap passed": whatever refuses this transaction next, it is not a size
+                // error. (A `Withdraw` now reaches the staking rules and is refused there for
+                // naming a validator no register holds.)
+                Ok(()) => assert!(
+                    !matches!(
+                        got,
+                        Err(TxError::EnvelopeTooLarge | TxError::AttestationTooLarge | TxError::ProofTooLarge)
+                    ),
+                    "n={n}: {got:?}"
+                ),
             }
         };
         let withdraw = |envelope: Envelope| Action::Withdraw {
             validator: v,
             amount: 5,
             nonce: 0,
+            time: 0,
             r: [7; 8],
             envelope,
             signature: sig.clone(),
@@ -1230,6 +1393,50 @@ mod tests {
         );
         assert_eq!(rebuilt.state_root(), r1);
         assert_eq!(rebuilt, l);
+    }
+
+    /// The register is state: every field of the v2 validator leaf — including the two S2
+    /// additions, `pending` and `payout` — moves the state root, so two chains that disagree
+    /// about a validator's unbonding queue or where its rewards go cannot both be valid.
+    #[test]
+    fn validator_leaf_v2_changes_the_root_when_pending_or_payout_change() {
+        let k = Keypair::from_seed([1; 32]).unwrap();
+        let base = ValidatorEntry {
+            public_key: k.public_key().clone(),
+            stake: 1_000,
+            pending: Vec::new(),
+            rewards: 0,
+            payout: crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+            nonce: 0,
+        };
+        let root_of = |e: &ValidatorEntry| {
+            let register: BTreeMap<Address, ValidatorEntry> = [(k.address(), e.clone())].into_iter().collect();
+            Ledger::new(7, HC, register, &StubExecutor).state_root()
+        };
+        let r0 = root_of(&base);
+        assert_eq!(r0, root_of(&base.clone()), "deterministic");
+        let mut roots = vec![r0];
+        for changed in [
+            ValidatorEntry { stake: 1_001, ..base.clone() },
+            ValidatorEntry { rewards: 1, ..base.clone() },
+            ValidatorEntry { nonce: 1, ..base.clone() },
+            ValidatorEntry { pending: vec![(3, 10)], ..base.clone() },
+            ValidatorEntry { pending: vec![(4, 10)], ..base.clone() },
+            ValidatorEntry { pending: vec![(3, 11)], ..base.clone() },
+            ValidatorEntry { pending: vec![(3, 10), (4, 10)], ..base.clone() },
+            ValidatorEntry {
+                payout: crate::notes::ShieldedAddress { pk: [5; 8], kem_ek: vec![6; 32] },
+                ..base.clone()
+            },
+            ValidatorEntry {
+                payout: crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![7; 32] },
+                ..base.clone()
+            },
+        ] {
+            let r = root_of(&changed);
+            assert!(!roots.contains(&r), "a v2 leaf field does not reach the state root: {changed:?}");
+            roots.push(r);
+        }
     }
 
     #[test]

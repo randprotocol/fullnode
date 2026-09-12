@@ -13,8 +13,10 @@ use clap::{Parser, Subcommand};
 use shrugg_client::wallet::{self, NoteStore, Wallet};
 use shrugg_client::RpcClient;
 use shrugg_client::wallet::Submission;
+use shrugg_core::ledger::staking::MIN_STAKE;
 use shrugg_core::notes::ShieldedAddress;
-use shrugg_core::{format_amount, gas, parse_amount, Action, Hash};
+use shrugg_core::types::actions::Registration;
+use shrugg_core::{format_amount, gas, parse_amount, Action, Address, Hash};
 use shrugg_zkvm::machine::{Backend, FriProfile};
 use shrugg_zkvm::{codec, executor, guests, isa::Program};
 use std::path::{Path, PathBuf};
@@ -53,6 +55,31 @@ enum Cmd {
         to: String,
         /// Amount in SHRUGG, e.g. 1.5
         amount: String,
+        /// Fee in SHRUGG; the floor is 0.001.
+        #[arg(long)]
+        fee: Option<String>,
+        /// Return once the node accepts the bundle instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+        /// Prove on an attached NVIDIA GPU (requires a build with `--features cuda`).
+        #[arg(long)]
+        cuda: bool,
+    },
+    /// Stake SHRUGG onto a validator: the bundle burns the stake out of this wallet's notes.
+    ///
+    /// A validator the register does not know yet needs `--registration`, the hex blob its
+    /// operator gets from `shrugg-node register --payout <shrugg1…>`; one it already knows must
+    /// not carry one. Bonded weight counts from the next epoch, and unbonding it is the
+    /// validator's own command (`shrugg-node unbond`), not this wallet's.
+    Bond {
+        /// The validator's address (base58), as `shrugg validators` lists it.
+        validator: String,
+        /// Amount in SHRUGG. Registering a new validator needs at least the staking minimum.
+        amount: String,
+        /// The hex `Registration` from `shrugg-node register`, for a validator not yet in the
+        /// register.
+        #[arg(long)]
+        registration: Option<String>,
         /// Fee in SHRUGG; the floor is 0.001.
         #[arg(long)]
         fee: Option<String>,
@@ -204,14 +231,34 @@ fn backend_for(cuda: bool) -> Result<Backend> {
 }
 
 fn report(s: &Submission, what: &str) {
+    // A burn is the bond's stake leaving the pool; every other action leaves it zero, and saying
+    // "0 SHRUGG burned" on a transfer would only invite the question.
+    let burned = if s.burn > 0 { format!("{} SHRUGG burned, ", format_amount(s.burn)) } else { String::new() };
     println!(
-        "submitted {what} {}\n  {} SHRUGG out, {} SHRUGG change, fee {} SHRUGG, anchored at height {}",
+        "submitted {what} {}\n  {} SHRUGG out, {burned}{} SHRUGG change, fee {} SHRUGG, anchored at height {}",
         s.hash,
         format_amount(s.amount),
         format_amount(s.change),
         format_amount(s.fee),
         s.time,
     );
+}
+
+/// Decode a `Registration` as `shrugg-node register` prints it: its bincode form as hex.
+fn parse_registration(text: &str) -> Result<Registration> {
+    let bytes = hex::decode(text.strip_prefix("0x").unwrap_or(text)).context("--registration must be hex")?;
+    Registration::decode(&bytes).context("--registration is not a registration from `shrugg-node register`")
+}
+
+/// A validator's bonded stake as the register reports it, or `None` when it holds no entry for
+/// that address. Amounts come out as decimal strings: a stake in units outgrows a JSON number.
+async fn register_stake(rpc: &RpcClient, address: &str) -> Result<Option<u64>> {
+    let rows = rpc.validators().await?;
+    let Some(row) = rows.as_array().and_then(|rows| rows.iter().find(|r| r["address"].as_str() == Some(address))) else {
+        return Ok(None);
+    };
+    let stake = row["stake"].as_str().context("getValidators reply has no stake")?;
+    Ok(Some(stake.parse().context("the register's stake is not a number")?))
 }
 
 #[tokio::main]
@@ -286,6 +333,67 @@ async fn main() -> Result<()> {
                 println!("balance: {} SHRUGG", format_amount(store.balance()));
             }
         }
+        Cmd::Bond { validator, amount, registration, fee, no_wait, cuda } => {
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            let validator = Address::from_base58(&validator)
+                .with_context(|| format!("{validator} is not a validator address"))?;
+            let address = validator.to_base58();
+            let amount = parse_amount(&amount)?;
+            anyhow::ensure!(amount > 0, "a bond of 0 SHRUGG moves no stake and still pays a fee and a proof");
+            let registration = registration.as_deref().map(parse_registration).transpose()?;
+            // The register decides which of the two shapes a bond has (`staking::check_bond`), so
+            // asking it first turns a rejected transaction into an answer before anything is
+            // proved — a minute of proving, on a stake this wallet would not get back.
+            let staked = register_stake(&rpc, &address).await?;
+            match (staked, &registration) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("{address} is already in the register; drop --registration")
+                }
+                (None, None) => anyhow::bail!(
+                    "{address} is not in the register; its operator must send you the registration from `shrugg-node register --payout <shrugg1…>` and it goes here as --registration <hex>"
+                ),
+                (None, Some(r)) => {
+                    anyhow::ensure!(
+                        r.public_key.address() == validator,
+                        "that registration is for validator {}, not {address}",
+                        r.public_key.address()
+                    );
+                    anyhow::ensure!(
+                        amount >= MIN_STAKE,
+                        "registering a validator bonds at least {} SHRUGG, not {}",
+                        format_amount(MIN_STAKE),
+                        format_amount(amount)
+                    );
+                }
+                (Some(_), None) => {}
+            }
+            let action = Action::Bond { validator, amount, registration };
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => gas::fee_floor(&action),
+            };
+            let chain_id = rpc.chain_id().await?;
+            let profile = profile_of(&rpc).await?;
+            // `burn = amount`: the stake leaves the shielded pool instead of becoming a note, and
+            // the ledger admits a bond only when the two are equal.
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, amount, profile, backend_for(cuda)?, chain_id, !no_wait).await;
+            store.save(&path)?;
+            report(&s?, "bond");
+            if !no_wait {
+                // The set for the next epoch is derived from the register as it stands at this
+                // epoch's last block (spec §8), so a bond that has just committed is weight from
+                // the next epoch on — not in the one it landed in.
+                let epoch = rpc.epoch().await?["epoch"].as_u64().context("getEpoch reply has no epoch")?;
+                if let Some(stake) = register_stake(&rpc, &address).await? {
+                    println!(
+                        "{address}: stake {} SHRUGG, counting as consensus weight from epoch {}",
+                        format_amount(stake),
+                        epoch + 1
+                    );
+                }
+                println!("balance: {} SHRUGG", format_amount(store.balance()));
+            }
+        }
         Cmd::Faucet { address, amount } => {
             let to = match address {
                 Some(a) => parse_address(&a)?,
@@ -312,7 +420,7 @@ async fn main() -> Result<()> {
             let fee = wallet::deploy_fee_default(&action);
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, profile, backend_for(cuda)?, chain_id, true).await;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, 0, profile, backend_for(cuda)?, chain_id, true).await;
             store.save(&path)?;
             report(&s?, "deploy");
             println!("program id: {id} ({} words)", p.words.len());
@@ -342,7 +450,7 @@ async fn main() -> Result<()> {
                 Some(f) => parse_amount(&f)?,
                 None => wallet::call_fee_default(tier),
             };
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, profile, backend, chain_id, true).await;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, 0, profile, backend, chain_id, true).await;
             store.save(&path)?;
             let s = s?;
             report(&s, "call");

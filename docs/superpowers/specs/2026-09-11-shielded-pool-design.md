@@ -145,7 +145,7 @@ Withdraw payouts.
 | Call | `program, proof, outputs are in proof` | none; kind-1 transfers are removed; fee floor `call_fee(tier)` on the bundle fee | the bundle proof |
 | Bond | `validator: Address(pk_dilithium), amount` | `burn = amount` leaves the pool into the validator's stake | the bundle proof (any note holder can bond to any validator) |
 | Unbond | `validator, amount, sig` | stake → pending, released after `UNBONDING_EPOCHS` | validator signature |
-| Withdraw | `validator, amount, cm, envelope, sig` | released stake or rewards → one new note of public `amount` | validator signature |
+| Withdraw | `validator, amount, time, r, envelope, sig` | bundle-less; released stake or rewards → one new note worth `amount − BUNDLE_BASE`, the base credited to the block proposer | validator signature |
 | Mint (faucet) | `cm, envelope, amount ≤ 100 SHRUGG` | new note of public amount; only when genesis `faucet = true` | the node key (as today) |
 | BridgeAttest | attestation bytes, `cm, envelope` | new note of public amount in the bridged asset | guardian quorum (as today) |
 | BridgeBurn | `asset, amount, destination, sig-free` | `burn = amount` in `asset` leaves the pool to the bridge | the bundle proof |
@@ -242,7 +242,9 @@ ValidatorEntry { key: PublicKey (Dilithium2), stake: u64, pending: Vec<(u64 rele
 - **Unbond** moves `amount` from `stake` to `pending` with `release_epoch = current + UNBONDING_EPOCHS`
   (2). Stake below `MIN_STAKE` after an unbond drops the validator from the next epoch's set.
 - **Rewards**: every bundle fee in a block is credited to the proposer's `rewards` field. Withdraw
-  moves released `pending` amounts and `rewards` into a new note at the payout address.
+  moves released `pending` amounts and `rewards` into a new note at the payout address. A proposer
+  may include its own withdraw in a block it proposes, in which case the bundle base it pays out
+  comes right back to it as the proposer's reward — value-neutral.
 - **Slashing**: none in this release. Double-vote evidence is out of scope; the register carries no
   `jailed` flag yet. Recorded as a follow-up.
 - The register is hashed into the state root (section 9). It is the only place on the chain where
