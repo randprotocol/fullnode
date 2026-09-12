@@ -771,7 +771,14 @@ impl HotStuff {
         let mut committed = Vec::with_capacity(path.len());
         for (h, qc) in path {
             let e = &self.tree[&h];
-            committed.push(CommittedBlock { block: e.block.clone(), qc, receipts: e.receipts.clone() });
+            committed.push(CommittedBlock {
+                block: e.block.clone(),
+                qc,
+                receipts: e.receipts.clone(),
+                // The ledger *after* this block holds exactly this block's deposits:
+                // `apply_transactions` clears the list when a block starts.
+                deposits: e.ledger_after.deposits().to_vec(),
+            });
         }
         // The first block of an epoch fixes that epoch's set for good: record it while its
         // branch is still in the tree, so a later replay can verify its QCs (spec §8).

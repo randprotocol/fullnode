@@ -147,6 +147,8 @@ pub enum GenesisError {
     DuplicateNote(String),
     #[error("bad epoch_blocks {0} (1..={MAX_EPOCH_BLOCKS})")]
     BadEpochBlocks(u64),
+    #[error("the genesis supply (alloc notes plus validator stakes) sums past u64::MAX")]
+    SupplyOverflow,
 }
 
 /// Everything a node derives from the genesis file.
@@ -246,12 +248,24 @@ impl Genesis {
         // is transient state, not part of the state root or the genesis hash.
         ledger.set_timestamp_ms(self.timestamp_ms);
         let mut notes = Vec::new();
+        // Everything this chain starts with, for the supply audit (`ledger::supply`). Genesis
+        // notes are the only value on the chain that no transaction ever minted, so this is the
+        // one place the counter is set rather than accumulated.
+        let mut deposited: u64 = 0;
         for n in &self.alloc {
             let cm = word8_from_hex(&n.cm).ok_or_else(|| GenesisError::BadNote(n.cm.clone()))?;
             let envelope = n.envelope.to_envelope()?;
             ledger.deposit(cm, executor).map_err(|_| GenesisError::DuplicateNote(n.cm.clone()))?;
+            deposited = deposited.checked_add(n.amount).ok_or(GenesisError::SupplyOverflow)?;
             notes.push((cm, envelope, n.amount));
         }
+        // The register's stakes are supply too (see `ledger::supply`): genesis is the one place
+        // stake appears without a bond having burned notes for it.
+        let mut staked: u64 = 0;
+        for e in register.values() {
+            staked = staked.checked_add(e.stake).ok_or(GenesisError::SupplyOverflow)?;
+        }
+        ledger.set_genesis_supply(deposited, staked);
         // Replaces the empty-tree root `Ledger::new` recorded, so the only anchor a chain
         // starts with is the root the deposit notes leave behind.
         ledger.record_anchor(0);

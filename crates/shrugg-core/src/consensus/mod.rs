@@ -73,6 +73,17 @@ pub struct CommittedBlock {
     /// Receipts of the block's confidential calls, in transaction order.
     #[serde(default)]
     pub receipts: Vec<crate::program::CallReceipt>,
+    /// Notes the *ledger* created while applying this block — a `Withdraw`'s deposit (spec §8),
+    /// and S3's `BridgeAttest` — in the order they were appended to the commitment tree. They
+    /// are not in `block.transactions`: the wire carries only a blinding and a public amount,
+    /// and the commitment is computed by whoever applies the block.
+    ///
+    /// Never on the wire (`#[serde(skip)]`): a peer's copy would have to be re-derived to be
+    /// trusted, and the node that applies the block has already derived it. Whoever fills this
+    /// in is whoever executed the block; storage needs it to write the leaf at the index the
+    /// ledger gave it.
+    #[serde(skip)]
+    pub deposits: Vec<crate::ledger::Deposit>,
 }
 
 /// The validator sets of the epochs this replica has seen start, keyed by epoch (spec §8).

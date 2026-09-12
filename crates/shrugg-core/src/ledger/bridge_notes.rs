@@ -36,6 +36,11 @@ pub(super) fn validate(
 }
 
 /// The apply step for the two bridge actions. Unreachable while [`validate`] refuses them.
+///
+/// When S3 fills this in, a `BridgeAttest` that deposits **asset 0** is value entering the
+/// SHRUGG pool from outside and must be counted in `super::supply` — a counter of its own
+/// beside `withdraw_deposited`, and part of `issued()`. A deposit of any other asset is not
+/// SHRUGG and belongs in that asset's own audit, not this one.
 pub(super) fn apply(
     _ledger: &mut Ledger,
     _tx: &Transaction,

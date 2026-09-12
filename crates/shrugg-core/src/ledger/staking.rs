@@ -367,6 +367,10 @@ pub(super) fn apply(
             }
             ledger.withdraw(validator, *amount, *nonce, r, envelope, signature, tx.chain_id)?;
             ledger.append_deposit(cm, envelope.clone(), executor)?;
+            // The one way value moves back from the register into the pool (see
+            // `ledger::supply`); S3's `BridgeAttest` of asset 0 would be counted the same way.
+            ledger.supply.withdraw_deposited =
+                ledger.supply.withdraw_deposited.checked_add(*amount).ok_or(TxError::Overflow)?;
         }
         _ => return Err(NOT_STAKING),
     }
@@ -815,5 +819,66 @@ mod tests {
         let t = tx(&l, 10, 0, Action::Unbond { validator: v.address(), amount: 10, nonce: 0, signature });
         assert_eq!(staking_err(l.validate(&t, &StubExecutor).unwrap_err()), StakingError::BadSignature);
         let _ = Signature::empty();
+    }
+
+    /// The supply audit (`ledger::supply`) through the whole staking cycle. Every public
+    /// movement of SHRUGG is one of these five counters, so after each step the pool plus the
+    /// register must still add up to exactly what the chain issued — and the point of checking
+    /// it after *every* step is that a counter credited in the wrong arm would balance again by
+    /// the end of the sequence.
+    #[test]
+    fn the_supply_counters_balance_through_bond_unbond_withdraw_and_transfer() {
+        let genesis = key(1);
+        let newcomer = key(2);
+        let mut l = ledger(vec![entry(&genesis, MIN_STAKE, payout(1))]);
+        // Genesis deposits nine times the minimum into the pool and stakes one; nothing else is
+        // ever minted here, so `issued()` never moves again.
+        let issued = 10 * MIN_STAKE;
+        l.set_genesis_supply(issued - MIN_STAKE, MIN_STAKE);
+        let proposer = genesis.address();
+        let check = |l: &Ledger, what: &str| {
+            let a = l.audit();
+            assert!(a.invariant_holds(), "{what}: {a:?}");
+            assert_eq!(a.total_supply(), issued, "{what}");
+            a
+        };
+        let start = check(&l, "genesis");
+        assert_eq!(start.register_total, MIN_STAKE, "the genesis validator's stake");
+        assert_eq!(start.pool_value, issued - MIN_STAKE);
+
+        // A bond burns out of the pool into public stake, and its bundle pays a fee that moves
+        // into the proposer's rewards — two separate exits, both of them into the register.
+        let fee = gas::BUNDLE_BASE;
+        l.apply_tx(&bond_tx(&l, 10, &newcomer, MIN_STAKE, Some(registration(&newcomer, payout(2)))), &proposer, &StubExecutor)
+            .unwrap();
+        let after_bond = check(&l, "bond");
+        assert_eq!(after_bond.supply.burned, MIN_STAKE);
+        assert_eq!(after_bond.supply.fees_paid, fee);
+        assert_eq!(after_bond.register_total, 2 * MIN_STAKE + fee);
+
+        // An unbond moves stake to `pending` inside the register: the totals do not move at all
+        // except for the new bundle's fee.
+        l.record_anchor(l.height());
+        l.apply_tx(&unbond_tx(&l, 20, &newcomer, MIN_STAKE, 0), &proposer, &StubExecutor).unwrap();
+        let after_unbond = check(&l, "unbond");
+        assert_eq!(after_unbond.supply.fees_paid, 2 * fee);
+        assert_eq!(after_unbond.register_total, after_bond.register_total + fee);
+
+        // A withdraw is the return leg: released value leaves the register and re-enters the
+        // pool as a note the chain computed itself.
+        l.set_height(l.epoch_blocks() * (l.epoch() + UNBONDING_EPOCHS));
+        l.record_anchor(l.height());
+        l.apply_tx(&withdraw_tx(&l, 30, &newcomer, MIN_STAKE, 1, [3; 8]), &proposer, &StubExecutor).unwrap();
+        let after_withdraw = check(&l, "withdraw");
+        assert_eq!(after_withdraw.supply.withdraw_deposited, MIN_STAKE);
+        assert_eq!(after_withdraw.register_total, after_unbond.register_total - MIN_STAKE + fee);
+
+        // A plain transfer moves nothing across the boundary but its fee.
+        l.record_anchor(l.height());
+        l.apply_tx(&tx(&l, 40, 0, Action::None), &proposer, &StubExecutor).unwrap();
+        let after_transfer = check(&l, "transfer");
+        assert_eq!(after_transfer.supply.fees_paid, 4 * fee);
+        assert_eq!(after_transfer.supply.burned, MIN_STAKE, "only a bond burns");
+        assert_eq!(after_transfer.register_total, after_withdraw.register_total + fee);
     }
 }

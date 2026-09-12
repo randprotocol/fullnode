@@ -11,6 +11,7 @@
 pub mod bridge_notes;
 pub mod call_envelope;
 pub mod staking;
+pub mod supply;
 
 use crate::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
 use crate::crypto::{merkle_root, Address, Hash};
@@ -34,6 +35,7 @@ pub const ANCHOR_WINDOW: usize = 256;
 pub const TIME_WINDOW: u64 = 256;
 
 pub use staking::{StakingError, ValidatorEntry};
+pub use supply::{register_total, Audit, Supply};
 
 /// A deposit note the ledger created itself while applying a transaction, rather than accepting
 /// on the wire: S2's `Withdraw` (and S3's `BridgeAttest`) publish only a blinding and a public
@@ -173,12 +175,20 @@ pub struct Ledger {
     timestamp_ms: u64,
     /// Deposit notes this block's transactions made the ledger create (see [`Deposit`]).
     deposits: Vec<Deposit>,
+    /// The public supply counters (see [`supply`]). Derived from the chain, not hashed into
+    /// the state root.
+    supply: Supply,
 }
 
 /// Equality is over consensus state only. `height` and `timestamp_ms` are the position of the
 /// block being applied, and `faucet`/`confidential` are genesis switches a reloading node sets
 /// from its genesis file rather than from storage, so two ledgers holding the same notes,
 /// nullifiers, anchors, validators and programs are the same ledger.
+///
+/// The [`supply`] counters are deliberately **out**: nothing in the state root covers them, and
+/// `Ledger::from_parts` cannot know them, so a rebuilt ledger would never compare equal to the
+/// one it was rebuilt from. A node audits its stored copy of them separately, by replay
+/// (`Storage::verify_chain`).
 impl PartialEq for Ledger {
     fn eq(&self, o: &Ledger) -> bool {
         self.chain_id == o.chain_id
@@ -221,6 +231,7 @@ impl Ledger {
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
+            supply: Supply::default(),
         }
     }
 
@@ -252,6 +263,7 @@ impl Ledger {
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
+            supply: Supply::default(),
         }
     }
 
@@ -299,6 +311,31 @@ impl Ledger {
     /// (spec §8). The rule itself lives in [`staking::derive_set`].
     pub fn derive_next_set(&self) -> ValidatorSet {
         staking::derive_set(&self.validators)
+    }
+
+    /// The public supply counters as of this ledger (see [`supply`]).
+    pub fn supply(&self) -> Supply {
+        self.supply
+    }
+
+    /// Restore the counters a node persisted beside the state. Like the faucet and confidential
+    /// switches, they do not come out of the note, nullifier and validator families, so the
+    /// loader sets them; `Ledger::from_parts` leaves them at zero.
+    pub fn set_supply(&mut self, s: Supply) {
+        self.supply = s;
+    }
+
+    /// What genesis itself created, set once by [`crate::genesis::Genesis::build`]: the deposit
+    /// notes in the pool and the stakes in the register. Neither was minted by a transaction,
+    /// and together they are the whole of a chain's supply before its first block.
+    pub fn set_genesis_supply(&mut self, deposited: u64, staked: u64) {
+        self.supply.genesis_deposited = deposited;
+        self.supply.genesis_staked = staked;
+    }
+
+    /// The supply audit against this ledger's own register.
+    pub fn audit(&self) -> Audit {
+        Audit::new(self.supply, register_total(&self.validators))
     }
 
     /// Deposit notes this ledger created while applying the current block (see [`Deposit`]).
@@ -616,6 +653,12 @@ impl Ledger {
             // is the leader.
             let entry = self.validators.get(proposer).ok_or(TxError::UnknownProposer(*proposer))?;
             let rewards = entry.rewards.checked_add(b.fee).ok_or(TxError::Overflow)?;
+            // Both halves of what this bundle takes out of the pool (see [`supply`]): the fee
+            // becomes the proposer's `rewards` below, and the burn becomes `stake` in the
+            // `Bond` arm — which is why they are counted here, where every bundle passes,
+            // rather than in the arms that receive them.
+            self.supply.fees_paid = self.supply.fees_paid.checked_add(b.fee).ok_or(TxError::Overflow)?;
+            self.supply.burned = self.supply.burned.checked_add(b.burn).ok_or(TxError::Overflow)?;
             for nf in &b.nullifiers {
                 self.nullifiers.insert(*nf);
             }
@@ -628,7 +671,9 @@ impl Ledger {
         let mut receipt = None;
         match &tx.action {
             Action::None => {}
-            Action::Mint { cm, .. } => {
+            Action::Mint { cm, amount, .. } => {
+                self.supply.faucet_minted =
+                    self.supply.faucet_minted.checked_add(*amount).ok_or(TxError::Overflow)?;
                 self.commitments.insert(*cm);
                 self.tree.append(*cm, executor);
             }
