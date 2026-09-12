@@ -18,7 +18,7 @@
 //! the fifth component of the state root; this module is only the ledger's half.
 
 use super::{Ledger, TxError};
-use crate::bridge::{AttestOutcome, AttestPlan, BridgeError};
+use crate::bridge::{AttestOutcome, AttestPlan, BridgeError, CheckedAttestation};
 use crate::confidential::ConfidentialExecutor;
 use crate::notes::Word8;
 use crate::types::{Action, Transaction};
@@ -29,20 +29,24 @@ use crate::types::{Action, Transaction};
 const DEPOSIT_FROM: Word8 = [0; 8];
 
 /// The action step of admission (spec §7 step 7) for the two bridge actions.
+///
+/// Returns the verified attestation, which [`apply`] consumes rather than verifying the
+/// guardian quorum a second time — the same reason `validate_inner` hands `apply_tx` a call's
+/// verified outcome.
 pub(super) fn validate(
     ledger: &Ledger,
     tx: &Transaction,
     action: &Action,
     executor: &dyn ConfidentialExecutor,
-) -> Result<(), TxError> {
+) -> Result<Option<CheckedAttestation>, TxError> {
     match action {
         Action::BridgeAttest { attestation, recipient, r, envelope: _ } => {
             let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
             // The attestation's size cap ran at step 1, before this decode. `check_attest` is
             // itself ordered cheap-before-expensive: it decodes, resolves the guardian set,
             // rejects a replayed digest and checks the payload before recovering a signature.
-            let (_, _, plan) = bridge.check_attest(attestation, ledger.now_secs()).map_err(TxError::Bridge)?;
-            if let AttestPlan::Transfer(t) = plan {
+            let checked = bridge.check_attest(attestation, ledger.now_secs()).map_err(TxError::Bridge)?;
+            if let AttestPlan::Transfer(t) = checked.plan() {
                 // The wire format has 32 bytes for a recipient and a shielded address is
                 // ~1.2 KB, so the depositor named a hash and this transaction carries the
                 // address. Without this equality the submitter would choose who receives it.
@@ -60,7 +64,7 @@ pub(super) fn validate(
                     return Err(TxError::CommitmentExists(cm));
                 }
             }
-            Ok(())
+            Ok(Some(checked))
         }
         Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to } => {
             let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
@@ -91,7 +95,8 @@ pub(super) fn validate(
             }
             ledger.check_bundle(asset_bundle)?;
             bridge.check_burn(*asset, *amount, *to_chain, to, *relayer_fee).map_err(TxError::Bridge)?;
-            ledger.check_bundle_proof(asset_bundle, executor)
+            ledger.check_bundle_proof(asset_bundle, executor)?;
+            Ok(None)
         }
         // Fail closed: an action this module does not own can only arrive through a routing
         // mistake in [`super::Ledger::validate_inner`], and `Ok(())` would let it skip its own
@@ -103,21 +108,23 @@ pub(super) fn validate(
 /// The apply step for the two bridge actions. Runs after [`validate`] has accepted the
 /// transaction, so everything it can still fail on is a state write the ledger must not have
 /// made twice; `apply_tx`'s caller discards the ledger on any error.
+///
+/// `checked` is what [`validate`] verified, for a `BridgeAttest`.
 pub(super) fn apply(
     ledger: &mut Ledger,
     tx: &Transaction,
     action: &Action,
     executor: &dyn ConfidentialExecutor,
+    checked: Option<CheckedAttestation>,
 ) -> Result<(), TxError> {
     match action {
-        Action::BridgeAttest { attestation, recipient, r, envelope: _ } => {
-            let now = ledger.now_secs();
+        Action::BridgeAttest { recipient, r, .. } => {
+            let checked = checked.expect("validate returns the checked attestation for an attest");
             let bridge = ledger.bridge_mut().ok_or(TxError::Bridge(BridgeError::Disabled))?;
-            // Consumes the digest and registers the asset if this is its first sighting. The
-            // quorum is verified a second time here (`apply_attest` re-checks what it applies);
-            // that is the bridge's own contract and keeps this module unable to apply an
-            // attestation it has not itself validated.
-            match bridge.apply_attest(attestation, now).map_err(TxError::Bridge)? {
+            // Consumes the digest and registers the asset if this is its first sighting. No
+            // signature work: the quorum was verified once, in `validate`, and this is the
+            // token that proves it.
+            match bridge.apply_attest(checked) {
                 AttestOutcome::Minted(t) => {
                     let cm = deposit_commitment(ledger, recipient, t.amount, t.info.index, r, executor);
                     ledger.deposit(cm, executor)?;
@@ -244,9 +251,9 @@ mod tests {
         b
     }
 
-    /// The SHRUGG fee bundle every bridge transaction carries.
-    fn fee_bundle(l: &Ledger, nfs: [Word8; 2], cms: [Word8; 2]) -> Bundle {
-        bundle(l, nfs, cms, gas::BUNDLE_BASE, 0, 0)
+    /// The SHRUGG fee bundle a bridge transaction carries, paying `fee`.
+    fn fee_bundle(l: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64) -> Bundle {
+        bundle(l, nfs, cms, fee, 0, 0)
     }
 
     fn recipient() -> ShieldedAddress {
@@ -288,7 +295,7 @@ mod tests {
     fn attest_tx(l: &Ledger, attestation: Vec<u8>, to: ShieldedAddress, seed: u32) -> Transaction {
         Transaction::shielded(
             7,
-            fee_bundle(l, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]]),
+            fee_bundle(l, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
             Action::BridgeAttest { attestation, recipient: to, r: [7; 8], envelope: env() },
         )
     }
@@ -352,14 +359,49 @@ mod tests {
     /// A burn transaction whose asset bundle carries a proof that would never verify, so any
     /// error other than `InvalidBundleProof` proves the check that produced it ran first.
     fn burn_tx(l: &Ledger, asset: u32, amount: u64, relayer_fee: u64, mutate: impl FnOnce(&mut Bundle)) -> Transaction {
-        let mut asset_bundle =
-            bundle(l, [[40; 8], [41; 8]], [[42; 8], [43; 8]], 0, asset, amount + relayer_fee);
+        burn_tx_paying(l, asset, amount, relayer_fee, BURN_FEE, mutate)
+    }
+
+    /// The fee a valid burn's outer bundle pays: the bundle base for each of its two bundles.
+    const BURN_FEE: u64 = 2 * gas::BUNDLE_BASE;
+
+    /// [`burn_tx`] with the outer bundle's fee chosen, for the fee-floor test.
+    fn burn_tx_paying(
+        l: &Ledger,
+        asset: u32,
+        amount: u64,
+        relayer_fee: u64,
+        fee: u64,
+        mutate: impl FnOnce(&mut Bundle),
+    ) -> Transaction {
+        let mut asset_bundle = bundle(l, [[40; 8], [41; 8]], [[42; 8], [43; 8]], 0, asset, amount + relayer_fee);
         mutate(&mut asset_bundle);
         Transaction::shielded(
             7,
-            fee_bundle(l, [[44; 8], [45; 8]], [[46; 8], [47; 8]]),
+            fee_bundle(l, [[44; 8], [45; 8]], [[46; 8], [47; 8]], fee),
             Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain: 2, to: EVM_TO },
         )
+    }
+
+    /// Spec §7 item 3 charges the bundle base per verified bundle, and a burn has two. The
+    /// floor is checked at step 3, before the anchor, the asset bundle's shape or any proof —
+    /// so an underpaying burn is refused on a comparison even with a broken asset bundle.
+    #[test]
+    fn a_burn_pays_for_both_of_its_bundles() {
+        let (mut l, secrets) = ledger();
+        deposit(&mut l, &secrets, 1_000, 0, 20);
+        let short = burn_tx_paying(&l, 1, 400, 100, gas::BUNDLE_BASE, |b| b.proof = vec![0xff; 16]);
+        assert_eq!(
+            l.validate(&short, &StubExecutor),
+            Err(TxError::FeeTooLow { min: 2 * gas::BUNDLE_BASE, fee: gas::BUNDLE_BASE })
+        );
+        // One unit short is still short; exactly the floor is accepted.
+        let short = burn_tx_paying(&l, 1, 400, 100, BURN_FEE - 1, |_| {});
+        assert_eq!(
+            l.validate(&short, &StubExecutor),
+            Err(TxError::FeeTooLow { min: 2 * gas::BUNDLE_BASE, fee: BURN_FEE - 1 })
+        );
+        assert_eq!(l.validate(&burn_tx_paying(&l, 1, 400, 100, BURN_FEE, |_| {}), &StubExecutor), Ok(()));
     }
 
     /// Spec §7's order across two bundles: an asset bundle that does not match the burn the
@@ -456,7 +498,7 @@ mod tests {
         let tx = Transaction { chain_id: 7, bundle: None, action: Action::None };
         for a in [Action::None, Action::Bond { validator: Address([1; 32]), amount: 1, registration: None }] {
             assert_eq!(validate(&l, &tx, &a, &StubExecutor), Err(TxError::UnsupportedAction("bridge")), "{a:?}");
-            assert_eq!(apply(&mut l, &tx, &a, &StubExecutor), Err(TxError::UnsupportedAction("bridge")), "{a:?}");
+            assert_eq!(apply(&mut l, &tx, &a, &StubExecutor, None), Err(TxError::UnsupportedAction("bridge")), "{a:?}");
         }
     }
 }

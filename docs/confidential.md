@@ -221,14 +221,21 @@ is no `effect` field.
 | shielded transfer | 0.001 SHRUGG (the base alone) |
 | Deploy | 0.001 SHRUGG + 100,000 units per word (0.0266 SHRUGG for 256 words) |
 | Call | 0.002 SHRUGG at tier 10, plus 0.0001 SHRUGG per two tiers above it (0.0025 at tier 20) |
+| BridgeAttest | 0.001 SHRUGG (the base alone) |
+| BridgeBurn | 0.002 SHRUGG — the base twice, for its two bundles |
 | Mint (faucet) | free, and carries no bundle |
 
 Every floor above the mint's includes `BUNDLE_BASE`, because every one of those transactions
-carries a bundle. Anything above the minimum is a tip; all of it is credited to the block
-proposer's `rewards` in the validator register, which phase S2's `Withdraw` turns back into a note.
-Blocks hold at most 4 MiB of transactions, and a bundle proof is ~300 KB, so roughly a dozen
-shielded transactions per block. Constants live in `shrugg_core::gas`; `shrugg fee bundle|deploy
-<words>|call <tier>` asks the node.
+carries a bundle. A `BridgeBurn` includes it *twice*: spec §7 item 3 charges the base per
+bundle, and a burn is the one transaction that carries two — the SHRUGG fee bundle and the
+asset bundle inside the action — both of which every node verifies. The asset bundle's own
+`fee` must be zero, so the SHRUGG bundle pays for both.
+
+Anything above the minimum is a tip; all of it is credited to the block proposer's `rewards` in
+the validator register, which phase S2's `Withdraw` turns back into a note. Blocks hold at most
+4 MiB of transactions, and a bundle proof is ~300 KB, so roughly a dozen shielded transactions
+per block. Constants live in `shrugg_core::gas`; `shrugg fee bundle|deploy <words>|call <tier>`
+asks the node.
 
 ## Privacy
 

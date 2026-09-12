@@ -155,9 +155,11 @@ answered before the ledger probe runs at all (§8).
 split. Minimums come from `shrugg_core::gas`: every bundle pays `BUNDLE_BASE = 1,000,000` units
 (0.001 SHRUGG); a `Deploy` adds `100,000` units per program word; a `Call` adds `1,000,000` units
 at the lowest tier (10) plus `100,000` per two tiers above it, to `1,500,000` at tier 20
-(`call_fee`). A mint carries no bundle and pays nothing. Blocks are capped at 2,000 transactions
-and 4 MiB of encoded bytes (`gas::MAX_BLOCK_TXS`, `gas::MAX_BLOCK_BYTES`) — enforced both where the
-proposer selects candidates and inside `Ledger::apply_block`, so a Byzantine leader cannot stuff an
+(`call_fee`). A `BridgeBurn` pays `BUNDLE_BASE` twice, because it is the one transaction that
+carries two bundles and a node verifies both. A mint carries no bundle and pays nothing. Blocks
+are capped at 2,000 transactions and 4 MiB of encoded bytes (`gas::MAX_BLOCK_TXS`,
+`gas::MAX_BLOCK_BYTES`) — enforced both where the proposer selects candidates and inside
+`Ledger::apply_block`, so a Byzantine leader cannot stuff an
 over-limit block and force every replica to execute it. At ~300 KB per bundle proof that is about a
 dozen shielded transactions per block.
 

@@ -12,7 +12,7 @@ pub mod bridge_notes;
 pub mod call_envelope;
 pub mod staking;
 
-use crate::bridge::{BridgeError, BridgeState};
+use crate::bridge::{BridgeError, BridgeState, CheckedAttestation};
 use crate::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
 use crate::crypto::{merkle_root, Address, Hash, PublicKey};
 use crate::gas;
@@ -162,6 +162,15 @@ pub struct CallReceiptData {
     /// The call's input envelope, carried through to the receipt unread (spec §6.1); see
     /// [`call_envelope`] for the one rule the chain applies to it.
     pub input_envelope: Option<crate::types::CallEnvelope>,
+}
+
+/// What `validate_inner` verified that `apply_tx` would otherwise verify again: a call's
+/// outcome (a STARK verification) and a `BridgeAttest`'s checked attestation (a guardian
+/// quorum's worth of signature recoveries). `Ledger::validate` drops it; `apply_tx` spends it.
+#[derive(Clone, Debug, Default)]
+struct Verified {
+    call: Option<CallOutcome>,
+    attestation: Option<CheckedAttestation>,
 }
 
 /// In-memory chain state: the note commitment tree, the nullifier set, the validator register
@@ -480,13 +489,9 @@ impl Ledger {
         self.validate_inner(tx, executor).map(|_| ())
     }
 
-    /// Spec §7, in order: cheap before expensive. Returns the verified call outcome so
-    /// `apply_tx` verifies a proof once.
-    fn validate_inner(
-        &self,
-        tx: &Transaction,
-        executor: &dyn ConfidentialExecutor,
-    ) -> Result<Option<CallOutcome>, TxError> {
+    /// Spec §7, in order: cheap before expensive. Returns what it verified so `apply_tx`
+    /// verifies each proof and each guardian quorum exactly once.
+    fn validate_inner(&self, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Result<Verified, TxError> {
         // 1. size caps
         if let Some(b) = &tx.bundle {
             if b.envelopes.iter().any(|e| e.len() > MAX_ENVELOPE_BYTES) {
@@ -560,6 +565,7 @@ impl Ledger {
             self.check_bundle(b)?;
         }
         // 7. action-specific cheap checks
+        let mut verified = Verified::default();
         let mut call_record = None;
         match &tx.action {
             Action::None => {}
@@ -599,7 +605,7 @@ impl Ledger {
                 staking::validate(self, tx, a, executor)?;
             }
             a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
-                bridge_notes::validate(self, tx, a, executor)?;
+                verified.attestation = bridge_notes::validate(self, tx, a, executor)?;
             }
         }
         // 8-9. the bundle's digest, then its proof
@@ -614,9 +620,9 @@ impl Ledger {
             if fee < min {
                 return Err(TxError::FeeTooLow { min, fee });
             }
-            return Ok(Some(outcome));
+            verified.call = Some(outcome);
         }
-        Ok(None)
+        Ok(verified)
     }
 
     /// Validate and apply one transaction; for calls, return the receipt data. The bundle fee
@@ -627,7 +633,7 @@ impl Ledger {
         proposer: &Address,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Option<CallReceiptData>, TxError> {
-        let outcome = self.validate_inner(tx, executor)?;
+        let verified = self.validate_inner(tx, executor)?;
         if let Some(b) = &tx.bundle {
             // This method is not atomic on its own: the action step below runs after these
             // writes and can still fail (S2's `staking::apply`, S3's `bridge_notes::apply`),
@@ -661,7 +667,7 @@ impl Ledger {
                 }
             }
             Action::Call { program, input_envelope, .. } => {
-                let o = outcome.expect("validate_inner returns the outcome for calls");
+                let o = verified.call.expect("validate_inner returns the outcome for calls");
                 receipt = Some(CallReceiptData {
                     program: *program,
                     tier: o.tier,
@@ -674,7 +680,7 @@ impl Ledger {
                 staking::apply(self, tx, a, executor)?;
             }
             a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
-                bridge_notes::apply(self, tx, a, executor)?;
+                bridge_notes::apply(self, tx, a, executor, verified.attestation)?;
             }
         }
         Ok(receipt)

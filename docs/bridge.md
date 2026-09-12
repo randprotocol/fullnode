@@ -484,20 +484,24 @@ Action::BridgeAttest { attestation, recipient: ShieldedAddress, r: Word8, envelo
   (in the action) the recipient's address itself. The note's later spend is unlinkable like any
   other note.
 - Replay protection is unchanged: the attestation digest goes into `spent`.
-- The attestation's own relayer `fee` (in the bridged asset) is paid to the submitter as a
-  second deposit note when non-zero.
+- The attestation's own relayer `fee` (in the bridged asset) is **not** deducted: the deposit
+  note carries the gross amount the guardians signed. The wire fee exists to pay whoever relays
+  the attestation, and on the shielded chain the submitter has no identity to pay — so netting
+  it would burn the difference forever, and what the pool holds would stop matching what the
+  source chain locked.
 
 **Outbound: a burn is one transaction with two bundles.**
 
 ```
-Transaction { chain_id, bundle: <SHRUGG bundle: asset 0, burn 0, pays BUNDLE_BASE>,
+Transaction { chain_id, bundle: <SHRUGG bundle: asset 0, burn 0, pays 2 * BUNDLE_BASE>,
               action: BridgeBurn { asset_bundle: <bundle: asset = index, fee 0, burn = amount + relayer_fee>,
                                    asset, amount, relayer_fee, to_chain, to } }
 ```
 
 - The asset bundle proves, in the zkVM, that the burner owned notes of that asset summing to at
   least `amount + relayer_fee`; the `burn` field is the value leaving the pool. The guest's rule
-  "`asset ≠ 0` ⇒ `fee = 0`" (phase Z) is why a second, SHRUGG bundle pays the transaction fee.
+  "`asset ≠ 0` ⇒ `fee = 0`" (phase Z) is why a second, SHRUGG bundle pays the transaction fee —
+  and why it pays `2 * BUNDLE_BASE`, the per-bundle base for both bundles a node has to verify.
 - Both bundles pass the full admission order: four nullifiers distinct and unspent, four
   commitments new, both digests recomputed, both STARK proofs verified.
 - `apply_burn` records the outbound message with the transaction hash in the sender slot
