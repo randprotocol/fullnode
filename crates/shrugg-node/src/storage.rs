@@ -576,7 +576,8 @@ impl Storage {
         }
         if next_index != ledger_after.next_index() {
             return Err(StorageError::Corrupt(format!(
-                "commit wrote {next_index} notes but the ledger holds {}",
+                "commit wrote {next_index} notes across heights {first_height}..={last_height} \
+                 but `ledger_after` holds {}; the ledger does not describe exactly these blocks",
                 ledger_after.next_index()
             )));
         }

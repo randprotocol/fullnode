@@ -1,5 +1,11 @@
 //! JSON-RPC 2.0 over HTTP. Reads come straight from storage and the shared
 //! status snapshot; transaction submission goes to the node loop.
+//!
+//! The redacted chain has no balances to report, so the wallet's read surface is the pool's
+//! own: a page of commitments (with their envelopes, which only their owner can open), the
+//! nullifiers published so far, the anchors a prover may build against, and the Merkle witness
+//! of one leaf. A node cannot tell which of those belong to whom, and neither can anyone
+//! watching the RPC port.
 
 use crate::mempool::MempoolError;
 use crate::network::PeerInfo;
@@ -7,11 +13,16 @@ use crate::storage::Storage;
 use axum::{extract::State, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use shrugg_core::bridge::{asset_id, AssetId};
-use shrugg_core::{Address, Hash, Transaction, ValidatorSet, TOKEN_DECIMALS, TOKEN_SYMBOL};
+use shrugg_core::confidential::ConfidentialExecutor;
+use shrugg_core::notes::{word8_to_hex, Envelope};
+use shrugg_core::{Action, Hash, ShieldedAddress, Transaction, ValidatorSet, TOKEN_DECIMALS, TOKEN_SYMBOL};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
+
+/// The most rows one paged read may return. A wallet scanning from zero pages through the tree;
+/// an unbounded `limit` would let one request pull the whole pool into memory.
+const MAX_PAGE: usize = 1000;
 
 /// Snapshot the node loop keeps up to date for RPC readers.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -29,6 +40,14 @@ pub struct NodeStatus {
     pub confidential: bool,
     pub fri_profile: String,
     pub programs: u64,
+    /// Leaves in the commitment tree — every note the chain has ever created.
+    pub notes: u64,
+    /// Nullifiers published — every note the chain has ever spent.
+    pub nullifiers: u64,
+    /// The current tree root, as a wallet would anchor against.
+    pub tree_root: String,
+    /// The bundle guest this chain's proofs are against.
+    pub hc_bundle: String,
     pub address: Option<String>,
     pub peer_id: String,
 }
@@ -36,8 +55,10 @@ pub struct NodeStatus {
 pub enum NodeCommand {
     SubmitTx { tx: Transaction, reply: oneshot::Sender<Result<Hash, MempoolError>> },
     Peers { reply: oneshot::Sender<Vec<PeerInfo>> },
-    /// Testnet faucet: mint `amount` units to `to`, signed by this node.
-    Mint { to: Address, amount: u128, reply: oneshot::Sender<Result<Hash, MempoolError>> },
+    /// Testnet faucet: mint `amount` units into a note owned by `to`, signed by this node.
+    /// Only a validator can serve it, so the reply carries a message rather than a
+    /// `MempoolError` — "this node is an observer" is not a mempool outcome.
+    Mint { to: ShieldedAddress, amount: u64, reply: oneshot::Sender<Result<Hash, String>> },
 }
 
 #[derive(Clone)]
@@ -47,6 +68,8 @@ pub struct RpcState {
     pub node: mpsc::Sender<NodeCommand>,
     pub validators: ValidatorSet,
     pub chain_id: u64,
+    /// Needed by `shrugg_getWitness`, which rebuilds the tree to fold a path.
+    pub executor: Arc<dyn ConfidentialExecutor>,
 }
 
 #[derive(Deserialize)]
@@ -81,7 +104,7 @@ impl RpcError {
 }
 
 pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    // Axum's default body limit is 2 MiB, but a call transaction with a
+    // Axum's default body limit is 2 MiB, but a bundle-carrying transaction with a
     // near-maximum proof is larger than that once hex-encoded inside JSON.
     let body_limit = 2 * shrugg_core::gas::MAX_PROOF_BYTES + 256 * 1024;
     let app = Router::new()
@@ -111,31 +134,35 @@ fn param<T: serde::de::DeserializeOwned>(params: &Value, idx: usize, name: &str)
     serde_json::from_value(v.clone()).map_err(|e| RpcError::invalid_params(format!("bad param {name}: {e}")))
 }
 
-fn parse_address(params: &Value, idx: usize) -> Result<Address, RpcError> {
-    let s: String = param(params, idx, "address")?;
-    Address::from_base58(&s).map_err(|e| RpcError::invalid_params(format!("address: {e}")))
-}
-
 fn parse_hash(params: &Value, idx: usize) -> Result<Hash, RpcError> {
     let s: String = param(params, idx, "hash")?;
     Hash::from_hex(&s).map_err(|e| RpcError::invalid_params(format!("hash: {e}")))
 }
 
-/// A bridged asset id: 64 hex characters, with or without `0x`.
-fn parse_asset(params: &Value, idx: usize) -> Result<AssetId, RpcError> {
-    let s: String = param(params, idx, "asset")?;
-    Hash::from_hex(&s).map_err(|e| RpcError::invalid_params(format!("asset: {e}")))
+/// A `shrugg1…` shielded address.
+fn parse_shielded(params: &Value, idx: usize) -> Result<ShieldedAddress, RpcError> {
+    let s: String = param(params, idx, "address")?;
+    ShieldedAddress::parse(&s).map_err(|e| RpcError::invalid_params(format!("address: {e}")))
 }
 
-/// A 32-byte token address: 64 hex characters, with or without `0x`. EVM and
-/// Tron addresses are the 20 bytes left-padded to 32.
-fn parse_bytes32(params: &Value, idx: usize, name: &str) -> Result<[u8; 32], RpcError> {
-    let s: String = param(params, idx, name)?;
-    let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(&s))
-        .map_err(|_| RpcError::invalid_params(format!("{name} must be hex")))?;
-    bytes
-        .try_into()
-        .map_err(|v: Vec<u8>| RpcError::invalid_params(format!("{name} must be 32 bytes, got {}", v.len())))
+/// A page size, clamped to `MAX_PAGE`. A missing or null `limit` asks for the maximum.
+fn parse_limit(params: &Value, idx: usize) -> Result<usize, RpcError> {
+    match params.get(idx) {
+        None | Some(Value::Null) => Ok(MAX_PAGE),
+        Some(_) => {
+            let n: u64 = param(params, idx, "limit")?;
+            Ok((n as usize).min(MAX_PAGE))
+        }
+    }
+}
+
+fn envelope_json(e: &Envelope) -> Value {
+    json!({
+        "kem_ct": hex::encode(&e.kem_ct),
+        "to_receiver": hex::encode(&e.to_receiver),
+        "to_sender": hex::encode(&e.to_sender),
+        "body": hex::encode(&e.body),
+    })
 }
 
 fn block_json(b: &shrugg_core::Block) -> Value {
@@ -154,33 +181,40 @@ fn block_json(b: &shrugg_core::Block) -> Value {
     })
 }
 
+/// What a block explorer can say about a transaction — which is, deliberately, almost nothing:
+/// the bundle's public fields (none of which name a party) and the shape of its action. Envelope
+/// and proof are reported by length only; anyone who wants the bytes can fetch the block.
 fn tx_json(t: &Transaction) -> Value {
-    let kind = match &t.body.kind {
-        shrugg_core::TxKind::Transfer { to, amount } => json!({ "type": "transfer", "to": to.to_base58(), "amount": amount.to_string() }),
-        shrugg_core::TxKind::Deploy { base_pc, words } => json!({
-            "type": "deploy", "base_pc": base_pc, "words_len": words.len(),
-            "program": shrugg_core::program::program_id(*base_pc, words).to_hex()
+    let bundle = t.bundle.as_ref().map(|b| {
+        json!({
+            "anchor": word8_to_hex(&b.anchor),
+            "nullifiers": [word8_to_hex(&b.nullifiers[0]), word8_to_hex(&b.nullifiers[1])],
+            "commitments": [word8_to_hex(&b.commitments[0]), word8_to_hex(&b.commitments[1])],
+            "fee": b.fee,
+            "burn": b.burn,
+            "asset": b.asset,
+            "time": b.time,
+            "proof_len": b.proof.len(),
+            "envelope_len": [b.envelopes[0].len(), b.envelopes[1].len()],
+        })
+    });
+    let action = match &t.action {
+        Action::None => json!({ "kind": "none" }),
+        Action::Mint { cm, amount, minter, .. } => json!({
+            "kind": "mint", "cm": word8_to_hex(cm), "amount": amount, "minter": minter.address().to_base58()
         }),
-        shrugg_core::TxKind::Call { program, proof, recipients } => json!({
-            "type": "call", "program": program.to_hex(), "proof_len": proof.len(),
-            "recipients": recipients.iter().map(|a| a.to_base58()).collect::<Vec<_>>()
+        Action::Deploy { base_pc, words } => json!({
+            "kind": "deploy", "program": shrugg_core::program::program_id(*base_pc, words).to_hex(), "words": words.len()
         }),
-        shrugg_core::TxKind::Mint { to, amount } => json!({ "type": "mint", "to": to.to_base58(), "amount": amount.to_string() }),
-        shrugg_core::TxKind::BridgeAttest { attestation } => json!({
-            "type": "bridge_attest", "attestation": hex::encode(attestation)
-        }),
-        shrugg_core::TxKind::BridgeBurn { asset, amount, to_chain, to, fee } => json!({
-            "type": "bridge_burn", "asset": asset.to_hex(), "amount": amount.to_string(),
-            "to_chain": to_chain, "to": hex::encode(to), "fee": fee.to_string()
+        Action::Call { program, proof } => json!({
+            "kind": "call", "program": program.to_hex(), "proof_len": proof.len()
         }),
     };
     json!({
         "hash": t.hash().to_hex(),
-        "from": t.sender().to_base58(),
-        "nonce": t.body.nonce,
-        "fee": t.body.fee.to_string(),
-        "chain_id": t.body.chain_id,
-        "kind": kind,
+        "chain_id": t.chain_id,
+        "bundle": bundle,
+        "action": action,
     })
 }
 
@@ -189,16 +223,6 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
     match req.method.as_str() {
         "shrugg_chainId" => Ok(json!(st.chain_id)),
         "shrugg_tokenInfo" => Ok(json!({ "symbol": TOKEN_SYMBOL, "decimals": TOKEN_DECIMALS })),
-        "shrugg_getBalance" => {
-            let a = parse_address(p, 0)?;
-            let acct = st.storage.account(&a).map_err(RpcError::internal)?;
-            Ok(json!(acct.balance.to_string()))
-        }
-        "shrugg_getAccount" => {
-            let a = parse_address(p, 0)?;
-            let acct = st.storage.account(&a).map_err(RpcError::internal)?;
-            Ok(json!({ "address": a.to_base58(), "nonce": acct.nonce, "balance": acct.balance.to_string() }))
-        }
         "shrugg_sendTransaction" => {
             let raw: String = param(p, 0, "tx")?;
             let bytes = hex::decode(raw.strip_prefix("0x").unwrap_or(&raw))
@@ -215,11 +239,12 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             }
         }
         "shrugg_mint" => {
-            let to = parse_address(p, 0)?;
-            let amount: u128 = match p.get(1) {
+            let to = parse_shielded(p, 0)?;
+            let amount: u64 = match p.get(1) {
                 None | Some(Value::Null) => shrugg_core::FAUCET_MAX_UNITS,
                 Some(v) => {
-                    let s: String = serde_json::from_value(v.clone()).map_err(|_| RpcError::invalid_params("amount must be a string of units"))?;
+                    let s: String = serde_json::from_value(v.clone())
+                        .map_err(|_| RpcError::invalid_params("amount must be a string of units"))?;
                     s.parse().map_err(|_| RpcError::invalid_params("amount must be a string of units"))?
                 }
             };
@@ -230,48 +255,133 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .map_err(|_| RpcError::internal("node loop closed"))?;
             match rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))? {
                 Ok(h) => Ok(json!(h.to_hex())),
-                Err(e) => Err(RpcError::rejected(e.to_string())),
+                Err(e) => Err(RpcError::rejected(e)),
             }
         }
+        // ---- the shielded pool ----
+        "shrugg_getCommitments" => {
+            let from: u64 = param(p, 0, "from_index")?;
+            let limit = parse_limit(p, 1)?;
+            let rows = st.storage.notes_from(from, limit).map_err(RpcError::internal)?;
+            Ok(json!(rows
+                .into_iter()
+                .map(|(index, r)| json!({
+                    "index": index,
+                    "cm": word8_to_hex(&r.cm),
+                    "envelope": envelope_json(&r.envelope),
+                    "height": r.height,
+                }))
+                .collect::<Vec<_>>()))
+        }
+        "shrugg_getNullifiers" => {
+            let from: u64 = param(p, 0, "from_height")?;
+            let limit = parse_limit(p, 1)?;
+            let rows = st.storage.nullifiers_from(from, limit).map_err(RpcError::internal)?;
+            Ok(json!(rows
+                .into_iter()
+                .map(|(height, nf)| json!({ "height": height, "nullifier": word8_to_hex(&nf) }))
+                .collect::<Vec<_>>()))
+        }
+        "shrugg_getAnchor" => {
+            let (height, root) = match p.get(0) {
+                None | Some(Value::Null) => {
+                    st.storage.latest_anchor().map_err(RpcError::internal)?.ok_or_else(|| RpcError::not_found("no anchor"))?
+                }
+                Some(_) => {
+                    let h: u64 = param(p, 0, "height")?;
+                    let root = st
+                        .storage
+                        .anchor(h)
+                        .map_err(RpcError::internal)?
+                        .ok_or_else(|| RpcError::not_found(format!("no anchor at height {h}")))?;
+                    (h, root)
+                }
+            };
+            Ok(json!({ "height": height, "root": word8_to_hex(&root) }))
+        }
+        "shrugg_getWitness" => {
+            let index: u64 = param(p, 0, "index")?;
+            match st.storage.witness(index, st.executor.as_ref()).map_err(RpcError::internal)? {
+                None => Ok(Value::Null),
+                Some((root, path)) => Ok(json!({
+                    "index": index,
+                    "root": word8_to_hex(&root),
+                    "path": path.iter().map(word8_to_hex).collect::<Vec<_>>(),
+                })),
+            }
+        }
+        "shrugg_getTreeInfo" => {
+            let next_index = st.storage.notes_count().map_err(RpcError::internal)?;
+            let root = st.storage.tree().map_err(RpcError::internal)?.root();
+            let nullifiers = st.storage.nullifiers_count().map_err(RpcError::internal)?;
+            Ok(json!({ "next_index": next_index, "root": word8_to_hex(&root), "nullifiers": nullifiers }))
+        }
+        // ---- confidential computation ----
         "shrugg_getProgram" => {
             let id = parse_hash(p, 0)?;
             match st.storage.program(&id).map_err(RpcError::internal)? {
                 None => Ok(Value::Null),
                 Some(r) => Ok(json!({
                     "id": r.id.to_hex(), "base_pc": r.base_pc, "words_len": r.words.len(),
-                    "code_hash": hex::encode(&r.code_hash), "deployer": r.deployer.to_base58(), "deployed_at": r.deployed_at
+                    "code_hash": hex::encode(&r.code_hash), "deployed_at": r.deployed_at
                 })),
             }
         }
         "shrugg_getProgramCode" => {
             let id = parse_hash(p, 0)?;
-            Ok(st.storage.program(&id).map_err(RpcError::internal)?.map(|r| json!({ "base_pc": r.base_pc, "words": r.words })).unwrap_or(Value::Null))
+            Ok(st
+                .storage
+                .program(&id)
+                .map_err(RpcError::internal)?
+                .map(|r| json!({ "base_pc": r.base_pc, "words": r.words }))
+                .unwrap_or(Value::Null))
         }
         "shrugg_getReceipt" => {
             let h = parse_hash(p, 0)?;
-            Ok(st.storage.receipt(&h).map_err(RpcError::internal)?.map(|r| json!({
-                "tx": r.tx.to_hex(), "program": r.program.to_hex(), "tier": r.tier, "outputs": r.outputs,
-                "effect": r.effect.map(|(to, amt)| json!({ "to": to.to_base58(), "amount": amt.to_string() })),
-                "height": r.height, "index": r.index
-            })).unwrap_or(Value::Null))
+            Ok(st
+                .storage
+                .receipt(&h)
+                .map_err(RpcError::internal)?
+                .map(|r| {
+                    json!({
+                        "tx": r.tx.to_hex(), "program": r.program.to_hex(), "tier": r.tier, "outputs": r.outputs,
+                        "height": r.height, "index": r.index
+                    })
+                })
+                .unwrap_or(Value::Null))
         }
         "shrugg_estimateFee" => {
-            let kind: String = param(p, 0, "kind")?;
-            let n: u64 = param(p, 1, "size_or_tier")?;
-            let fee = match kind.as_str() {
-                "deploy" => shrugg_core::gas::deploy_fee(n as usize),
+            let spec: Value = param(p, 0, "spec")?;
+            let kind = spec.get("kind").and_then(|k| k.as_str()).unwrap_or_default();
+            let fee = match kind {
+                // Every transaction that carries a bundle pays the base; `Action::None` is the
+                // plain shielded transfer, so its floor is the base alone.
+                "bundle" => shrugg_core::gas::BUNDLE_BASE,
+                "deploy" => {
+                    let words = spec.get("words").and_then(|w| w.as_u64()).unwrap_or(0) as usize;
+                    if words > shrugg_core::gas::MAX_PROGRAM_WORDS {
+                        return Err(RpcError::invalid_params(format!(
+                            "words must be at most {}",
+                            shrugg_core::gas::MAX_PROGRAM_WORDS
+                        )));
+                    }
+                    shrugg_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: vec![0; words] })
+                }
                 "call" => {
-                    // Tiers are the even log2 heights 10..=20; `n as u8` alone
-                    // would silently truncate (256 became tier 0).
+                    let Some(n) = spec.get("tier").and_then(|t| t.as_u64()) else {
+                        return Err(RpcError::invalid_params("call needs a tier"));
+                    };
+                    // Tiers are the even log2 heights 10..=20; `n as u8` alone would silently
+                    // truncate (256 became tier 0).
                     let Ok(tier) = u8::try_from(n) else {
                         return Err(RpcError::invalid_params("tier must be one of 10, 12, 14, 16, 18, 20"));
                     };
                     if !(shrugg_core::gas::MIN_TIER..=shrugg_core::gas::MAX_TIER).contains(&tier) || tier % 2 != 0 {
                         return Err(RpcError::invalid_params("tier must be one of 10, 12, 14, 16, 18, 20"));
                     }
-                    shrugg_core::gas::call_fee(tier)
+                    shrugg_core::gas::BUNDLE_BASE + shrugg_core::gas::call_fee(tier)
                 }
-                _ => return Err(RpcError::invalid_params("kind must be deploy or call")),
+                _ => return Err(RpcError::invalid_params("kind must be bundle, deploy or call")),
             };
             Ok(json!(fee.to_string()))
         }
@@ -313,93 +423,36 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let peers = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
             Ok(serde_json::to_value(peers).map_err(RpcError::internal)?)
         }
-        // ---- bridged assets ----
-        "shrugg_getAssetBalance" => {
-            let a = parse_address(p, 0)?;
-            let asset = parse_asset(p, 1)?;
-            Ok(json!(st.storage.asset_balance(&asset, &a).map_err(RpcError::internal)?.to_string()))
+        "shrugg_getValidators" => {
+            // Stake comes from the genesis set; rewards are chain state, so they come from the
+            // database — a validator that has never proposed simply has none yet.
+            let mut out = Vec::new();
+            for v in st.validators.iter() {
+                let addr = v.address();
+                let rewards = st.storage.validator(&addr).map_err(RpcError::internal)?.map(|e| e.rewards).unwrap_or(0);
+                out.push(json!({ "address": addr.to_base58(), "stake": v.stake.to_string(), "rewards": rewards }));
+            }
+            Ok(json!(out))
         }
-        "shrugg_getAssets" => {
-            let a = parse_address(p, 0)?;
-            Ok(json!(st
-                .storage
-                .assets_of(&a)
-                .map_err(RpcError::internal)?
-                .into_iter()
-                .map(|(asset, chain, token, balance)| json!({
-                    "asset": asset.to_hex(),
-                    "token_chain": chain,
-                    "token_address": hex::encode(token),
-                    "balance": balance.to_string(),
-                }))
-                .collect::<Vec<_>>()))
-        }
-        "shrugg_getBridgeState" => {
-            let Some(meta) = st.storage.bridge_meta().map_err(RpcError::internal)? else {
-                return Ok(json!({ "enabled": false }));
-            };
-            let guardians = meta
-                .guardian_sets
-                .get(&meta.current_set)
-                .map(|s| s.keys.iter().map(hex::encode).collect::<Vec<_>>())
-                .unwrap_or_default();
-            Ok(json!({
-                "enabled": true,
-                "emitter": hex::encode(meta.emitter),
-                "emitters": meta.emitters.iter().map(|(c, a)| (c.to_string(), json!(hex::encode(a)))).collect::<serde_json::Map<String, Value>>(),
-                "guardian_set_index": meta.current_set,
-                "guardians": guardians,
-                "burn_sequence": meta.burn_sequence,
-                "assets": meta.assets.iter().map(|(asset, (chain, token))| json!({
-                    "asset": asset.to_hex(), "token_chain": chain, "token_address": hex::encode(token),
-                })).collect::<Vec<_>>(),
-            }))
-        }
-        "shrugg_getBridgeBurn" => {
-            let sequence: u64 = param(p, 0, "sequence")?;
-            Ok(st.storage.bridge_burn(sequence).map_err(RpcError::internal)?.map(|r| json!({
-                "sequence": r.sequence, "body_hex": hex::encode(&r.body), "digest": hex::encode(r.digest),
-                "tx": r.tx.to_hex(), "height": r.height
-            })).unwrap_or(Value::Null))
-        }
-        "shrugg_bridgeAssetId" => {
-            let token_chain: u16 = param(p, 0, "token_chain")?;
-            let token_address = parse_bytes32(p, 1, "token_address")?;
-            Ok(json!(asset_id(token_chain, &token_address).to_hex()))
-        }
-        "shrugg_getValidators" => Ok(json!(st
-            .validators
-            .iter()
-            .map(|v| json!({ "address": v.address().to_base58(), "stake": v.stake.to_string() }))
-            .collect::<Vec<_>>())),
         other => Err(RpcError { code: -32601, message: format!("unknown method {other}") }),
     }
 }
 
 #[cfg(test)]
 mod tests {
-
-    /// A well-formed EVM recipient: 12 zero bytes then 20 address bytes
-    /// (spec 3.5), the shape `BridgeState::check_burn` requires for the
-    /// EVM-family chains 2, 3 and 4.
-    fn evm_to() -> [u8; 32] {
-        let mut t = [0u8; 32];
-        t[12..].copy_from_slice(&[0x22u8; 20]);
-        t
-    }
     use super::*;
-    use crate::storage::fixtures::{attestation, bridged_asset, bridged_genesis, genesis, key, make_block, TOKEN};
+    use crate::storage::fixtures::{self, alloc_note, bundle_fee, bundle_tx, genesis_with, key, make_block};
+    use shrugg_core::confidential::StubExecutor;
     use shrugg_core::genesis::GenesisState;
-    use shrugg_core::Transaction;
+    use shrugg_core::notes::DEPTH;
+    use shrugg_core::Word8;
 
-    /// An `RpcState` over a fresh database holding `gs`, with a node channel
-    /// nothing reads (these methods answer straight from storage).
+    /// An `RpcState` over a fresh database holding `gs`, with a node channel nothing reads
+    /// (every method tested here answers straight from storage).
     fn state_for(gs: &GenesisState) -> (tempfile::TempDir, RpcState) {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(crate::storage::Storage::open(dir.path()).unwrap());
         storage.init_genesis(gs).unwrap();
-        // No test here reaches the node loop: every bridge read is answered
-        // from storage, so the receiver is dropped straight away.
         let (tx, _) = mpsc::channel(4);
         let st = RpcState {
             storage,
@@ -407,6 +460,7 @@ mod tests {
             node: tx,
             validators: gs.validators.clone(),
             chain_id: gs.chain_id,
+            executor: Arc::new(StubExecutor),
         };
         (dir, st)
     }
@@ -419,132 +473,213 @@ mod tests {
         call(st, method, params).await.unwrap_or_else(|e| panic!("{method}: {}", e.message))
     }
 
-    /// A bridged chain with one committed mint: 1000 units to bob, 10 of them
-    /// the submitter's bridge fee.
-    fn bridged_chain() -> (tempfile::TempDir, RpcState, GenesisState) {
-        let gs = bridged_genesis(1);
+    fn nf(n: u8) -> Word8 {
+        [n as u32 + 1000; 8]
+    }
+
+    fn cm(n: u8) -> Word8 {
+        [n as u32 + 2000; 8]
+    }
+
+    /// Genesis with two deposit notes, plus one committed block spending two notes and creating
+    /// two more: four leaves, two nullifiers, an anchor at height 1.
+    fn chain() -> (tempfile::TempDir, RpcState, GenesisState) {
+        let gs = genesis_with(1, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)]);
         let (dir, st) = state_for(&gs);
-        let (alice, bob) = (key(1), key(2));
         let mut ledger = gs.ledger.clone();
-        ledger.set_timestamp_ms(1);
-        ledger.set_height(1);
-        let att = Transaction::bridge_attest(&alice, 1, 0, attestation(0, &bob.address(), 1_000, 10), 1);
-        let b1 = make_block(&gs.block, &mut ledger, vec![att], &alice);
+        let tx = bundle_tx(&ledger, [nf(1), nf(2)], [cm(1), cm(2)], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &ledger).unwrap();
         (dir, st, gs)
     }
 
-    /// Shorthand: `shrugg_getAssetBalance` of `addr` in the test asset.
-    async fn asset_balance(st: &RpcState, addr: &str, asset: &str) -> Value {
-        ok(st, "shrugg_getAssetBalance", json!([addr, asset])).await
-    }
-
     #[tokio::test]
-    async fn asset_balance_and_assets_report_bridged_holdings() {
-        let (_d, st, _gs) = bridged_chain();
-        let (alice, bob) = (key(1).address().to_base58(), key(2).address().to_base58());
-        let asset = bridged_asset().to_hex();
-        assert_eq!(asset_balance(&st, &bob, &asset).await, "990");
-        assert_eq!(asset_balance(&st, &alice, &asset).await, "10");
-        // An address holding nothing, and an unknown asset, are both "0".
-        let carol = key(3).address().to_base58();
-        assert_eq!(asset_balance(&st, &carol, &asset).await, "0");
-        assert_eq!(asset_balance(&st, &bob, &Hash::ZERO.to_hex()).await, "0");
-
-        let assets = ok(&st, "shrugg_getAssets", json!([bob.clone()])).await;
-        assert_eq!(
-            assets,
-            json!([{ "asset": asset, "token_chain": 2, "token_address": hex::encode(TOKEN), "balance": "990" }])
-        );
-        assert_eq!(ok(&st, "shrugg_getAssets", json!([carol])).await, json!([]));
-
-        // Bad parameters are -32602, not a panic.
-        let bad = |params| async { call(&st, "shrugg_getAssetBalance", params).await.unwrap_err().code };
-        assert_eq!(bad(json!(["not-base58", asset])).await, -32602);
-        assert_eq!(bad(json!([bob.clone(), "zz"])).await, -32602);
-        assert_eq!(bad(json!([bob])).await, -32602);
-    }
-
-    #[tokio::test]
-    async fn bridge_state_reports_guardians_emitters_and_registry() {
-        let (_d, st, _gs) = bridged_chain();
-        let v = ok(&st, "shrugg_getBridgeState", json!([])).await;
-        assert_eq!(v["enabled"], true);
-        assert_eq!(v["emitter"], hex::encode([1u8; 32]));
-        assert_eq!(v["emitters"]["2"], hex::encode([0xeeu8; 32]));
-        assert_eq!(v["guardian_set_index"], 0);
-        assert_eq!(v["guardians"].as_array().unwrap().len(), 4);
-        // The guardian addresses are 40 lowercase hex characters.
-        for g in v["guardians"].as_array().unwrap() {
-            let s = g.as_str().unwrap();
-            assert_eq!(s.len(), 40);
-            assert_eq!(s, s.to_lowercase());
+    async fn get_commitments_pages_in_order() {
+        let (_d, st, _gs) = chain();
+        let all = ok(&st, "shrugg_getCommitments", json!([0, 100])).await;
+        let all = all.as_array().unwrap();
+        assert_eq!(all.len(), 4);
+        // Indexes are dense and ascending; the genesis notes are at height 0 and the bundle's
+        // outputs at height 1.
+        for (i, row) in all.iter().enumerate() {
+            assert_eq!(row["index"], i as u64);
         }
-        assert_eq!(v["burn_sequence"], 0);
-        assert_eq!(
-            v["assets"],
-            json!([{ "asset": bridged_asset().to_hex(), "token_chain": 2, "token_address": hex::encode(TOKEN) }])
-        );
+        assert_eq!(all[0]["height"], 0);
+        assert_eq!(all[3]["height"], 1);
+        assert_eq!(all[2]["cm"], word8_to_hex(&cm(1)));
+        assert_eq!(all[3]["cm"], word8_to_hex(&cm(2)));
+        // An envelope comes back in its four hex parts.
+        assert!(all[2]["envelope"]["kem_ct"].is_string());
+
+        // Paging from the middle returns the tail, in the same order.
+        let page = ok(&st, "shrugg_getCommitments", json!([2, 100])).await;
+        assert_eq!(page.as_array().unwrap(), &all[2..]);
+        // A limit smaller than the tail truncates it, and one past the end is empty.
+        assert_eq!(ok(&st, "shrugg_getCommitments", json!([0, 2])).await.as_array().unwrap().len(), 2);
+        assert_eq!(ok(&st, "shrugg_getCommitments", json!([9, 100])).await, json!([]));
+        // An oversized limit is clamped, not refused.
+        assert_eq!(ok(&st, "shrugg_getCommitments", json!([0, 10_000])).await.as_array().unwrap().len(), 4);
     }
 
     #[tokio::test]
-    async fn bridge_state_is_just_disabled_without_a_bridge_section() {
-        let gs = genesis(1);
+    async fn get_nullifiers_and_tree_info_track_the_chain() {
+        let (_d, st, _gs) = chain();
+        let nfs = ok(&st, "shrugg_getNullifiers", json!([0, 100])).await;
+        let nfs = nfs.as_array().unwrap();
+        assert_eq!(nfs.len(), 2);
+        for row in nfs {
+            assert_eq!(row["height"], 1);
+        }
+        let seen: Vec<&str> = nfs.iter().map(|r| r["nullifier"].as_str().unwrap()).collect();
+        assert!(seen.contains(&word8_to_hex(&nf(1)).as_str()));
+        assert!(seen.contains(&word8_to_hex(&nf(2)).as_str()));
+        // Asking from a later height skips them.
+        assert_eq!(ok(&st, "shrugg_getNullifiers", json!([2, 100])).await, json!([]));
+
+        let info = ok(&st, "shrugg_getTreeInfo", json!([])).await;
+        assert_eq!(info["next_index"], 4);
+        assert_eq!(info["nullifiers"], 2);
+        assert_eq!(info["root"], word8_to_hex(&st.storage.tree().unwrap().root()));
+    }
+
+    #[tokio::test]
+    async fn get_anchor_serves_the_head_and_a_named_height() {
+        let (_d, st, _gs) = chain();
+        let head = ok(&st, "shrugg_getAnchor", json!([])).await;
+        assert_eq!(head["height"], 1);
+        assert_eq!(head["root"], word8_to_hex(&st.storage.tree().unwrap().root()));
+        let genesis = ok(&st, "shrugg_getAnchor", json!([0])).await;
+        assert_eq!(genesis["height"], 0);
+        assert_ne!(genesis["root"], head["root"], "the block changed the tree");
+        // A height the chain has not reached is not-found, not an internal error.
+        assert_eq!(call(&st, "shrugg_getAnchor", json!([99])).await.unwrap_err().code, -32001);
+    }
+
+    #[tokio::test]
+    async fn get_witness_matches_storage() {
+        let (_d, st, _gs) = chain();
+        for index in 0..4u64 {
+            let v = ok(&st, "shrugg_getWitness", json!([index])).await;
+            let (root, path) = st.storage.witness(index, &StubExecutor).unwrap().unwrap();
+            assert_eq!(v["index"], index);
+            assert_eq!(v["root"], word8_to_hex(&root));
+            let got: Vec<String> = v["path"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().into()).collect();
+            assert_eq!(got, path.iter().map(word8_to_hex).collect::<Vec<_>>());
+            assert_eq!(got.len(), DEPTH);
+        }
+        // A leaf past the end is null, not an error.
+        assert_eq!(ok(&st, "shrugg_getWitness", json!([4])).await, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_a_bad_address() {
+        let gs = fixtures::genesis(1);
         let (_d, st) = state_for(&gs);
-        assert_eq!(ok(&st, "shrugg_getBridgeState", json!([])).await, json!({ "enabled": false }));
-        // The per-asset reads degrade to empty rather than erroring.
-        let a = key(1).address().to_base58();
-        assert_eq!(asset_balance(&st, &a, &Hash::ZERO.to_hex()).await, "0");
-        assert_eq!(ok(&st, "shrugg_getAssets", json!([a])).await, json!([]));
-        assert_eq!(ok(&st, "shrugg_getBridgeBurn", json!([0])).await, Value::Null);
-    }
-
-    #[tokio::test]
-    async fn bridge_burn_serves_the_outbound_message() {
-        let (_d, st, _gs) = bridged_chain();
-        let (alice, bob) = (key(1), key(2));
-        let asset = bridged_asset();
-        // Block 2: bob sends 500 of his 990 back to chain 2.
-        let mut ledger = st.storage.load_ledger().unwrap();
-        ledger.set_timestamp_ms(1);
-        ledger.set_height(2);
-        let b1 = st.storage.block_by_height(1).unwrap().unwrap();
-        let burn = Transaction::bridge_burn(&bob, 1, 0, asset, 500, 2, evm_to(), 5, 0);
-        let b2 = make_block(&b1, &mut ledger, vec![burn.clone()], &alice);
-        st.storage.commit(std::slice::from_ref(&b2), &ledger).unwrap();
-
-        let v = ok(&st, "shrugg_getBridgeBurn", json!([0])).await;
-        assert_eq!(v["sequence"], 0);
-        assert_eq!(v["height"], 2);
-        assert_eq!(v["tx"], burn.hash().to_hex());
-        let body = hex::decode(v["body_hex"].as_str().unwrap()).unwrap();
-        assert_eq!(v["digest"], hex::encode(shrugg_core::bridge::digest(&body)));
-        assert_eq!(ok(&st, "shrugg_getBridgeBurn", json!([1])).await, Value::Null);
-        // ... and the burn advanced the sequence the bridge state reports.
-        assert_eq!(ok(&st, "shrugg_getBridgeState", json!([])).await["burn_sequence"], 1);
-        assert_eq!(asset_balance(&st, &bob.address().to_base58(), &asset.to_hex()).await, "490");
-    }
-
-    #[tokio::test]
-    async fn bridge_asset_id_is_the_domain_separated_hash() {
-        let gs = genesis(1);
-        let (_d, st) = state_for(&gs);
-        // Works on a chain without a bridge: it is a pure function of its arguments.
-        let v = ok(&st, "shrugg_bridgeAssetId", json!([2, hex::encode(TOKEN)])).await;
-        assert_eq!(v, bridged_asset().to_hex());
-        // 0x prefix accepted; the chain id is part of the identity.
-        assert_eq!(ok(&st, "shrugg_bridgeAssetId", json!([2, format!("0x{}", hex::encode(TOKEN))])).await, v);
-        assert_ne!(ok(&st, "shrugg_bridgeAssetId", json!([3, hex::encode(TOKEN)])).await, v);
-        // A 20-byte EVM address must be left-padded by the caller.
-        let err = call(&st, "shrugg_bridgeAssetId", json!([2, hex::encode([0xaau8; 20])])).await.unwrap_err();
+        let err = call(&st, "shrugg_mint", json!(["not-an-address"])).await.unwrap_err();
         assert_eq!(err.code, -32602);
-        assert!(err.message.contains("must be 32 bytes"), "{}", err.message);
+        // The message carries the address parser's own reason, not a generic one.
+        let reason = ShieldedAddress::parse("not-an-address").unwrap_err().to_string();
+        assert!(err.message.contains(&reason), "{} does not contain {reason}", err.message);
+        // A well-formed address gets past parsing and dies at the (dropped) node channel.
+        let good = shrugg_zkvm::address::address_of(&shrugg_zkvm::notes::SpendKey([7; 8]).viewing_key()).to_string();
+        assert_eq!(call(&st, "shrugg_mint", json!([good])).await.unwrap_err().code, -32603);
+    }
+
+    #[tokio::test]
+    async fn estimate_fee_answers_per_action_kind() {
+        let gs = fixtures::genesis(1);
+        let (_d, st) = state_for(&gs);
+        let fee = |spec| ok(&st, "shrugg_estimateFee", json!([spec]));
+        assert_eq!(fee(json!({"kind": "bundle"})).await, shrugg_core::gas::BUNDLE_BASE.to_string());
+        assert_eq!(
+            fee(json!({"kind": "deploy", "words": 10})).await,
+            shrugg_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: vec![0; 10] }).to_string()
+        );
+        assert_eq!(
+            fee(json!({"kind": "call", "tier": 12})).await,
+            (shrugg_core::gas::BUNDLE_BASE + shrugg_core::gas::call_fee(12)).to_string()
+        );
+        // An odd or out-of-range tier is a parameter error, never a truncated `as u8`.
+        for bad in [11u64, 9, 22, 256] {
+            let e = call(&st, "shrugg_estimateFee", json!([{"kind": "call", "tier": bad}])).await.unwrap_err();
+            assert_eq!(e.code, -32602, "tier {bad}");
+        }
+        assert_eq!(call(&st, "shrugg_estimateFee", json!([{"kind": "transfer"}])).await.unwrap_err().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn send_transaction_rejects_a_stale_anchor() {
+        let (_d, st, gs) = chain();
+        // A bundle anchored to a root the ledger has never recorded. The node channel is dropped
+        // in these tests, so drive the ledger's own admission check — the error the node relays.
+        let ledger = gs.ledger.clone();
+        let mut tx = bundle_tx(&ledger, [nf(5), nf(6)], [cm(5), cm(6)], bundle_fee());
+        ledger.validate(&tx, &StubExecutor).expect("the honest bundle is admissible");
+        tx.bundle.as_mut().unwrap().anchor = [0xdead; 8];
+        let err = ledger.validate(&tx, &StubExecutor).unwrap_err();
+        assert!(
+            matches!(err, shrugg_core::TxError::UnknownAnchor),
+            "the anchor is checked before the digest it no longer matches: {err}"
+        );
+        assert!(err.to_string().contains("anchor"), "{err}");
+        // The transport half: a malformed transaction is -32602 before the node is ever asked.
+        assert_eq!(call(&st, "shrugg_sendTransaction", json!(["zz"])).await.unwrap_err().code, -32602);
+        assert_eq!(call(&st, "shrugg_sendTransaction", json!(["00"])).await.unwrap_err().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn status_reports_note_and_nullifier_counts() {
+        let (_d, st, _gs) = chain();
+        {
+            let mut s = st.status.write().unwrap();
+            s.notes = st.storage.notes_count().unwrap();
+            s.nullifiers = st.storage.nullifiers_count().unwrap();
+            s.tree_root = word8_to_hex(&st.storage.tree().unwrap().root());
+            s.hc_bundle = word8_to_hex(&st.storage.hc_bundle().unwrap());
+        }
+        let v = ok(&st, "shrugg_status", json!([])).await;
+        assert_eq!(v["notes"], 4);
+        assert_eq!(v["nullifiers"], 2);
+        assert_eq!(v["tree_root"], word8_to_hex(&st.storage.tree().unwrap().root()));
+        assert_eq!(v["hc_bundle"], word8_to_hex(&fixtures::HC));
+    }
+
+    #[tokio::test]
+    async fn a_transaction_reads_back_without_naming_a_party() {
+        let (_d, st, _gs) = chain();
+        let b1 = st.storage.block_by_height(1).unwrap().unwrap();
+        let tx = &b1.transactions[0];
+        let v = ok(&st, "shrugg_getTransaction", json!([tx.hash().to_hex()])).await;
+        assert_eq!(v["height"], 1);
+        let j = &v["tx"];
+        assert_eq!(j["action"]["kind"], "none");
+        assert_eq!(j["bundle"]["fee"], bundle_fee());
+        assert_eq!(j["bundle"]["nullifiers"][0], word8_to_hex(&nf(1)));
+        // No sender, no recipient, no amount: the redacted shape is the point.
+        let text = serde_json::to_string(j).unwrap();
+        for banned in ["\"from\"", "\"to\"", "\"nonce\"", "\"sender\""] {
+            assert!(!text.contains(banned), "{banned} leaked into tx_json: {text}");
+        }
+        assert_eq!(ok(&st, "shrugg_getTransaction", json!([Hash::ZERO.to_hex()])).await, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn validators_report_stake_and_rewards() {
+        let (_d, st, _gs) = chain();
+        let v = ok(&st, "shrugg_getValidators", json!([])).await;
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["address"], key(1).address().to_base58());
+        // The single block's bundle fee was credited to its proposer.
+        assert_eq!(rows[0]["rewards"], bundle_fee());
     }
 
     #[tokio::test]
     async fn unknown_methods_still_report_method_not_found() {
-        let gs = genesis(1);
+        let gs = fixtures::genesis(1);
         let (_d, st) = state_for(&gs);
-        assert_eq!(call(&st, "shrugg_getBridgeStat", json!([])).await.unwrap_err().code, -32601);
+        assert_eq!(call(&st, "shrugg_getBalance", json!([])).await.unwrap_err().code, -32601);
+        assert_eq!(call(&st, "shrugg_getAccount", json!([])).await.unwrap_err().code, -32601);
+        assert_eq!(call(&st, "shrugg_getBridgeState", json!([])).await.unwrap_err().code, -32601);
     }
 }

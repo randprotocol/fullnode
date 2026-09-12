@@ -8,13 +8,14 @@ use crate::rpc::{self, NodeCommand, NodeStatus, RpcState};
 use crate::storage::{Storage, VerifyMode};
 use anyhow::{Context, Result};
 use libp2p::{Multiaddr, PeerId};
-use shrugg_core::bridge::BridgeState;
 use shrugg_core::confidential::ConfidentialExecutor;
-use shrugg_zkvm::executor::ZkExecutor;
 use shrugg_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
 use shrugg_core::gas;
 use shrugg_core::genesis::{Genesis, GenesisState};
-use shrugg_core::{Address, Hash, Keypair, Ledger, Transaction, FAUCET_MAX_UNITS};
+use shrugg_core::{Hash, Keypair, Ledger, ShieldedAddress, Transaction, FAUCET_MAX_UNITS};
+use shrugg_zkvm::executor::ZkExecutor;
+use shrugg_zkvm::notes::{Note, SpendKey};
+use shrugg_zkvm::viewing::TxKey;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -69,20 +70,28 @@ impl NodeHandle {
     }
 }
 
-pub fn load_genesis(datadir: &std::path::Path) -> Result<GenesisState> {
-    let path = datadir.join("genesis.json");
-    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(Genesis::from_json(&text)?.build()?)
+/// The confidential-computation executor a chain's genesis calls for.
+///
+/// The ledger gates `Deploy`/`Call` with its own `confidential` flag, so there is no
+/// disabled-executor variant to pick between: a node always builds a `ZkExecutor`, including on
+/// a chain whose genesis sets `confidential: false`. Building the genesis *state* needs one too
+/// — the deposit notes go into a real commitment tree — which is why this takes the raw
+/// `Genesis` rather than the built `GenesisState`.
+pub fn executor_for_profile(fri_profile: &str) -> Result<Arc<dyn ConfidentialExecutor>> {
+    let profile =
+        ZkExecutor::profile_from_str(fri_profile).with_context(|| format!("genesis fri_profile {fri_profile}"))?;
+    Ok(Arc::new(ZkExecutor::new(profile)))
 }
 
-/// The confidential-computation executor a chain's genesis calls for.
-pub fn executor_for(gs: &GenesisState) -> Result<Arc<dyn ConfidentialExecutor>> {
-    // S1: DisabledExecutor removed — the ledger gates Deploy/Call with `confidential`
-    // (Task 4 rewires this); for now the node always builds a ZkExecutor, including on a
-    // chain whose genesis sets `confidential: false`.
-    let profile = ZkExecutor::profile_from_str(&gs.fri_profile)
-        .with_context(|| format!("genesis fri_profile {}", gs.fri_profile))?;
-    Ok(Arc::new(ZkExecutor::new(profile)))
+/// The genesis file, its executor, and the state they build. One function because the state
+/// cannot be built without the executor and the executor is named by the file.
+pub fn load_genesis(datadir: &std::path::Path) -> Result<(GenesisState, Arc<dyn ConfidentialExecutor>)> {
+    let path = datadir.join("genesis.json");
+    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let genesis = Genesis::from_json(&text)?;
+    let executor = executor_for_profile(&genesis.fri_profile)?;
+    let gs = genesis.build(executor.as_ref())?;
+    Ok((gs, executor))
 }
 
 /// Verify the on-disk chain. If the tail is damaged, truncate to the last good
@@ -145,35 +154,29 @@ const MAX_FETCH_ATTEMPTS: usize = 8;
 
 pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
-    let gs = load_genesis(&cfg.datadir)?;
+    let (gs, executor) = load_genesis(&cfg.datadir)?;
+    // Every shielded-pool proof on this chain is against one guest, pinned by the genesis. A
+    // node built from a different commit would verify nothing and vote against every bundle,
+    // which looks like a consensus bug rather than the build mismatch it is — so say so here.
+    let built = ZkExecutor::hc_bundle();
+    if built != gs.hc_bundle {
+        anyhow::bail!(
+            "this build's bundle guest ({}) differs from the genesis hc_bundle ({}); \
+             rebuild from the chain's pinned commit",
+            shrugg_core::notes::word8_to_hex(&built),
+            shrugg_core::notes::word8_to_hex(&gs.hc_bundle)
+        );
+    }
     let storage = Arc::new(Storage::open(&cfg.datadir)?);
     storage.init_genesis(&gs)?;
-    let executor = executor_for(&gs)?;
     check_and_repair_chain(&storage, &gs, cfg.verify, executor.as_ref())?;
 
     // Consensus replica from persisted head.
     let head_block = storage.head_block()?;
     let head_qc = storage.head_qc()?;
-    let mut ledger = storage.load_ledger()?;
+    let mut ledger = storage.load_ledger(executor.as_ref())?;
     ledger.set_faucet(gs.faucet);
-    // A bridged chain whose database predates the bridge column families has
-    // no stored bridge state. That is only recoverable at the genesis block,
-    // where the state is exactly what the genesis section derives; past it the
-    // balances and consumed digests are gone and a replay must rebuild them.
-    if ledger.bridge().is_none() {
-        if let Some(cfg) = &gs.bridge {
-            let head = storage.head()?;
-            if head.height != 0 {
-                anyhow::bail!(
-                    "genesis has a bridge section but the database at height {} has no bridge state; \
-                     delete the data directory and resync, or restore a backup",
-                    head.height
-                );
-            }
-            tracing::info!("initializing bridge state from the genesis bridge section");
-            ledger.set_bridge(Some(BridgeState::from_config(cfg)));
-        }
-    }
+    ledger.set_confidential(gs.confidential);
     let safety = storage.load_safety()?;
     let signer = if cfg.validator && gs.validators.contains(&key.address()) {
         Some(Keypair::from_seed(cfg.seed)?)
@@ -236,6 +239,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             node: cmd_tx,
             validators: gs.validators.clone(),
             chain_id: gs.chain_id,
+            executor: executor.clone(),
         },
     )
     .await?;
@@ -248,18 +252,20 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         hs.is_validator()
     );
 
-    // Warm verifier keys for every program already on chain, off the consensus thread.
+    // Warm verifier keys off the consensus thread: the bundle guest's always (every block can
+    // carry bundles, so the first one must not pay for the key), and every program already on
+    // chain.
     {
         let programs: Vec<_> = hs.committed_ledger().programs().values().cloned().collect();
         let ex = executor.clone();
-        if !programs.is_empty() {
-            tokio::task::spawn_blocking(move || {
-                for rec in programs {
-                    ex.warm(&rec);
-                }
-                tracing::info!("verifier keys warmed");
-            });
-        }
+        tokio::task::spawn_blocking(move || {
+            ex.warm_bundle();
+            tracing::info!("bundle verifier key warmed");
+            for rec in programs {
+                ex.warm(&rec);
+            }
+            tracing::info!("verifier keys warmed");
+        });
     }
 
     let address = key.address();
@@ -269,7 +275,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         executor: executor.clone(),
         storage: storage.clone(),
         hs,
-        mempool: Mempool::new(10_000, 64),
+        mempool: Mempool::new(10_000),
         net: net.clone(),
         status: status.clone(),
         peers: HashMap::new(),
@@ -341,7 +347,14 @@ impl Node {
         s.high_qc_view = self.hs.high_qc().view;
         s.peer_count = self.peers.len();
         s.mempool_size = self.mempool.len();
-        s.programs = self.hs.committed_ledger().programs().len() as u64;
+        let ledger = self.hs.committed_ledger();
+        s.programs = ledger.programs().len() as u64;
+        // The pool's public size, straight from the committed ledger rather than a second read
+        // of storage: this runs on the node loop after every commit.
+        s.notes = ledger.next_index();
+        s.nullifiers = ledger.nullifiers().len() as u64;
+        s.tree_root = shrugg_core::notes::word8_to_hex(&ledger.root());
+        s.hc_bundle = shrugg_core::notes::word8_to_hex(&ledger.hc_bundle());
         let target = self.peers.values().flatten().map(|p| p.height).max().unwrap_or(0);
         s.sync_target = target.max(s.height);
         s.syncing = self.sync_inflight.is_some();
@@ -378,13 +391,20 @@ impl Node {
 
     async fn handle_actions(&mut self, actions: Vec<Action>) -> Result<()> {
         let mut queue: std::collections::VecDeque<Action> = actions.into();
+        // One `on_message` can emit several `Commit` actions — a node catching up resolves a
+        // run of orphans and commits in steps — but the replica has finished processing before
+        // it hands the actions back, so `hs.committed_ledger()` is already the state after the
+        // *last* of them. Persisting each batch separately would therefore pair early blocks
+        // with a ledger that describes later ones. They are contiguous by construction, so the
+        // fix is to write them as one commit, once, against the ledger that does describe them.
+        let mut to_commit: Vec<CommittedBlock> = Vec::new();
         while let Some(a) = queue.pop_front() {
             match a {
                 Action::PersistSafety(s) => self.storage.save_safety(&s)?,
                 Action::Broadcast(m) | Action::SendTo(_, m) => {
                     self.net.broadcast(GossipMessage::Consensus(m)).await;
                 }
-                Action::Commit(blocks) => self.commit(blocks).await?,
+                Action::Commit(blocks) => to_commit.extend(blocks),
                 Action::ScheduleTimeout { view, duration } => {
                     self.timeout = Some((view, Instant::now() + duration));
                 }
@@ -395,7 +415,7 @@ impl Node {
                 Action::FetchBlock(h) => queue.extend(self.fetch_block(h).await),
             }
         }
-        Ok(())
+        self.commit(to_commit).await
     }
 
     async fn commit(&mut self, blocks: Vec<CommittedBlock>) -> Result<()> {
@@ -405,9 +425,8 @@ impl Node {
         let ledger = self.hs.committed_ledger().clone();
         self.storage.commit(&blocks, &ledger)?;
         for cb in &blocks {
-            for tx in &cb.block.transactions {
-                self.mempool.remove(&tx.hash());
-            }
+            let included: Vec<Hash> = cb.block.transactions.iter().map(|tx| tx.hash()).collect();
+            self.mempool.remove(&included);
             tracing::info!(
                 "committed block {} view {} txs {} hash {:?}",
                 cb.block.height(),
@@ -428,8 +447,10 @@ impl Node {
         let records: Vec<_> = blocks
             .iter()
             .flat_map(|cb| cb.block.transactions.iter())
-            .filter_map(|tx| match &tx.body.kind {
-                shrugg_core::TxKind::Deploy { base_pc, words } => ledger.program(&shrugg_core::program::program_id(*base_pc, words)).cloned(),
+            .filter_map(|tx| match &tx.action {
+                shrugg_core::Action::Deploy { base_pc, words } => {
+                    ledger.program(&shrugg_core::program::program_id(*base_pc, words)).cloned()
+                }
                 _ => None,
             })
             .collect();
@@ -465,26 +486,37 @@ impl Node {
         Ok(())
     }
 
-    /// Testnet faucet: this node signs a `Mint` with its own key and submits it
-    /// like any other transaction, so every node applies it through consensus.
-    async fn mint(&mut self, to: Address, amount: u128) -> std::result::Result<Hash, crate::mempool::MempoolError> {
-        use crate::mempool::MempoolError;
-        use shrugg_core::TxError;
+    /// Testnet faucet: this node signs a `Mint` with its own key and submits it like any other
+    /// transaction, so every node applies it through consensus.
+    ///
+    /// A mint is only admissible with a *validator's* signature (spec §6), so an observer cannot
+    /// serve this at all — it has no key the ledger would accept, and forwarding to a peer would
+    /// silently hand someone else's faucet the request. It says so instead.
+    ///
+    /// The note is sealed to `to` under a throwaway sender key: a faucet has no identity worth
+    /// preserving and no reason to keep an outgoing-viewing record, so the `to_sender` half of
+    /// the envelope is addressed to a key that is dropped on the next line and never recoverable.
+    /// Only `to` can open the note, which is the whole intent.
+    async fn mint(&mut self, to: ShieldedAddress, amount: u64) -> std::result::Result<Hash, String> {
         if !self.gs.faucet {
-            return Err(MempoolError::Invalid(TxError::FaucetDisabled));
+            return Err("faucet is disabled on this chain".into());
+        }
+        if !self.hs.is_validator() {
+            return Err("faucet mints are signed by validators; ask a validator node".into());
         }
         if amount > FAUCET_MAX_UNITS {
-            return Err(MempoolError::Invalid(TxError::MintTooLarge { amount, cap: FAUCET_MAX_UNITS }));
+            return Err(format!("mint of {amount} exceeds the faucet cap of {FAUCET_MAX_UNITS}"));
         }
         let key = Keypair::from_seed(self.cfg.seed).expect("seed validated at startup");
-        // Next usable nonce: account nonce plus whatever this node already has pending.
-        let me = key.address();
-        let mut nonce = self.hs.tip_ledger().nonce(&me);
-        while self.mempool.has_nonce(&me, nonce) {
-            nonce += 1;
-        }
-        let tx = Transaction::mint(&key, self.gs.chain_id, nonce, to, amount, 0);
-        let hash = self.mempool.insert(tx.clone(), self.hs.tip_ledger(), self.executor.as_ref())?;
+        let height = self.hs.tip_ledger().height();
+        let note = Note::new(to.pk, [0; 8], amount, 0, height as u32);
+        let throwaway = SpendKey::random().viewing_key();
+        let envelope = shrugg_zkvm::address::seal_note(&throwaway, &to, &note, &TxKey::random())?;
+        let tx = Transaction::mint(self.gs.chain_id, note.commitment(), envelope, amount, &key);
+        let hash = self
+            .mempool
+            .insert(tx.clone(), self.hs.tip_ledger(), self.executor.as_ref())
+            .map_err(|e| e.to_string())?;
         self.net.broadcast(GossipMessage::Transaction(tx)).await;
         Ok(hash)
     }
@@ -741,9 +773,8 @@ impl Node {
         self.storage.commit(&accepted, &ledger)?;
         for cb in &accepted {
             tracing::info!("synced block {} ({} txs)", cb.block.height(), cb.block.transactions.len());
-            for tx in &cb.block.transactions {
-                self.mempool.remove(&tx.hash());
-            }
+            let included: Vec<Hash> = cb.block.transactions.iter().map(|tx| tx.hash()).collect();
+            self.mempool.remove(&included);
         }
         let head = accepted.last().expect("non-empty");
         let mut ccfg = ConsensusConfig::new(self.gs.chain_id, self.gs.validators.clone(), self.gs.hash());
