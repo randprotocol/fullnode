@@ -5,7 +5,19 @@ use crate::types::Action;
 /// Largest program, in 32-bit words (16 KiB of code).
 pub const MAX_PROGRAM_WORDS: usize = 4096;
 /// Largest proof accepted in a transaction.
-pub const MAX_PROOF_BYTES: usize = 1 << 20;
+///
+/// Constraint set 5 (upstream `ffd9e1e`, milestone 4.2) restored the whitepaper's production FRI
+/// profile — 80 queries, blowup 8, 20 proof-of-work bits — and with it the proof sizes the
+/// whitepaper's parameter table implies: a keccak-free tier-10 proof measures ~1 202 416 bytes
+/// and a tier-12 one ~1 252 338 bytes (upstream `research/docs/03-privacy.md`, measured on
+/// `guests::fib`). The old 1 MiB cap rejected *every* production proof, so it is 2 MiB now.
+///
+/// 2 MiB is the smallest power-of-two cap above the measured sizes with room for the ~1%
+/// run-to-run variation the hiding PCS's fresh per-proof entropy causes, and it is deliberately
+/// *below* the ~3.11 MB a tier-10 proof that carries the optional keccak table costs: no guest
+/// this chain deploys calls `SYS_KECCAK`, and admitting one at 4 MiB would put a single
+/// transaction in reach of the whole block (see `MAX_BLOCK_BYTES`).
+pub const MAX_PROOF_BYTES: usize = 2 << 20;
 /// Largest bridge attestation accepted in a `BridgeAttest` transaction.
 ///
 /// A real attestation is tiny: 6 envelope bytes, 66 per signature, a
@@ -15,7 +27,14 @@ pub const MAX_PROOF_BYTES: usize = 1 << 20;
 /// so it constrains nothing reachable while keeping an oversized blob
 /// from buying decode and signature-recovery work at a zero fee.
 pub const MAX_ATTESTATION_BYTES: usize = 16_384;
-/// Transaction bytes per block (proofs are ~0.9 MB each).
+/// Transaction bytes per block. Under constraint set 5 a proof is ~1.2–1.3 MB (see
+/// `MAX_PROOF_BYTES`), so 4 MiB admits **three** shielded transfers per block rather than the
+/// nine the 27-query profile allowed.
+///
+/// Deliberately unchanged at 4 MiB: `docs/block-space.md` §5 records the decision. Raising the
+/// cap buys throughput linearly and nothing else, while every validator pays the bandwidth and
+/// the disk for it — a full 4 MiB block every ~2 s is already ~170 GB/day — and block-level
+/// aggregation, not a bigger block, is the queued remedy (§6).
 pub const MAX_BLOCK_BYTES: usize = 4 << 20;
 /// Transactions per block.
 pub const MAX_BLOCK_TXS: usize = 2_000;

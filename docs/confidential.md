@@ -19,18 +19,23 @@ rewritten to publish what it decided and let the caller move the value in the bu
 plus the RV32M extension and sub-word loads/stores (constraint set 3, below), proven by a
 Plonky3 batch STARK over Goldilocks with Poseidon2 hashing and ZK-hiding FRI. Eight tables
 (program, cpu, memory, alu, range, nibble, poseidon2, input — the last added in constraint set 4,
-below) connected by LogUp/permutation buses. Four syscalls: `read_input(i)` (private input word,
-bound since constraint set 4 to a salted commitment `H_IN`), `write_output(slot, word)` (one of
-eight public outputs), `poseidon2(ptr, n)` (in-place hash of `n` words), `halt`.
+below), plus a ninth, `keccak`, that a proof carries only when its guest called the `KECCAK`
+syscall (constraint set 5, below), connected by LogUp/permutation buses. Five syscalls:
+`read_input(i)` (private input word, bound since constraint set 4 to a salted commitment `H_IN`),
+`write_output(slot, word)` (one of eight public outputs), `poseidon2(ptr, n)` (in-place hash of
+`n` words), `keccak(ptr)` (one in-place Keccak-f[1600] permutation, constraint set 5), `halt`.
 
 Gas tiers pad the execution trace: tier `t` (10, 12, ..., 20) proves up to `2^t - 1` cycles and the
-proof reveals only the tier, never the real cycle count. Production FRI profile: blowup 8, 27
-queries, 20 PoW bits (constraint set 3 below; see `docs/03-privacy.md` in the upstream `research`
-crate for the retune history).
+proof reveals only the tier, never the real cycle count. Production FRI profile: blowup 8, **80
+queries, 20 PoW bits** — the whitepaper's own Part III parameters, restored in constraint set 5
+after the 2026-09-12 zk audit; constraint sets 3 and 4 ran at 27 queries (see `docs/03-privacy.md`
+in the upstream `research` crate for the full retune-and-revert history).
 
-Measured upstream on `guests::fib` at tier 10, constraint set 3: prove 3.1 s, proof 268 KB, first
-(uncached) verify 16 ms — the verifier key itself is what a cached verify amortizes away; see
-"Constraint set 3" below for the full before/after.
+Measured upstream on `guests::fib` at tier 10: at constraint set 3, prove 3.1 s, proof 268 KB,
+first (uncached) verify 16 ms. At constraint set 5 the proof is ~1 202 416 bytes and the first
+verify ~233 ms, with prove time unchanged within noise — the query count moves bytes, not work.
+The verifier key itself is what a cached verify amortizes away; see "Constraint set 3" and
+"Constraint set 5" below for the full before/after.
 
 **Constraint set 2 (2026-09-10, upstream fix wave through `f44d58f`).** The vendored zkVM now
 carries five soundness fixes: ALU padding rows can no longer provide a bus tuple with arbitrary
@@ -180,6 +185,92 @@ budgets for this when a bundle's own note commitments and nullifiers (which have
 separately-managed disclosure story) sit downstream of a call whose `H_IN` the caller could later
 open.
 
+**Constraint set 5 (2026-09-12, upstream ffd9e1e: milestone 4.2 + audit port + FRI 80).** The
+vendored zkVM was re-synced past constraint set 4 to `research`'s milestone 4.2, which also
+carries the 2026-09-12 zk audit's findings back into the crate they were vendored from. The
+headline changes:
+
+- **A ninth table, `keccak` (Keccak-f[1600]), and a fifth syscall, `KECCAK` (number 4).** A guest
+  calls `call_keccak(ptr_words)` and the chip permutes the 50-word state at that word address in
+  place, reading and writing the words itself over the `MEMORY` bus and answering the cpu row over
+  a new `KECCAK` bus. The table is 32-row blocks (24 rounds plus 8 idle rows) and **2 612 columns
+  wide**. The host reference is `keccak.rs` (`keccak256`, `keccak_f`), checked against `p3_keccak`
+  on 1 000 random states; a compiled guest, `guests::compiled::keccak256()`, hashes a message
+  through the syscall end to end. The sponge itself stays in guest code — the chip proves the
+  permutation only.
+- **The keccak table is optional per proof.** `Proof` gained `keccak_log_height: u8`, where `0`
+  means the proof declares *no* keccak table at all: `machine::chips` then returns eight chips,
+  not nine, and the degree-bit vector is eight entries long, so `verify`'s existing degree-bits
+  equality check also pins the batch's instance count. This matters because a 2 612-column table
+  costs about **1.91 MB** of a production proof's FRI leaf openings *regardless of how few rows it
+  holds* — every query opens a full-width main-trace leaf, so the table's width, not its height,
+  is what a proof pays for. With the table in every proof a keccak-free tier-10 proof measured
+  1 142 262 bytes (at 27 queries); optional, it is back to 439 816 bytes, within half a percent of
+  its pre-M4.2 size. No guest this chain deploys calls `KECCAK`, so every proof on this chain
+  declares `keccak_log_height = 0`.
+- **`mem_log_height` is proof-declared too**, and both new heights are untrusted words checked
+  before anything is sized from them. `machine::check_declared_heights` is the single place that
+  does it — tier in `TIERS`, then `program_log_height`, then `input_log_height`, then the keccak
+  table's flat range `[5, 20]`, then the keccak-vs-tier relation `klh ≤ tier + 5` (a permutation
+  costs a cycle), then `mem_log_height ∈ [tier + 2, 24]`. `ZkExecutor::decode_and_check` calls
+  that same function rather than restating its rules, so the chain's admission bound on a proof's
+  declared shape *is* the verifier's.
+- **`Machine::verifier_key` is four-keyed**, `(tier, program_log_height, input_log_height,
+  keccak_log_height)`; `log_ext_degrees` takes a fifth argument, the declared `mem_log_height`.
+  The memory height is deliberately absent from the key: the memory table declares no preprocessed
+  and no periodic columns, so every valid declared height yields the same `CommonData`. The
+  injected `log_ext_degrees_pub` wrapper and every verifier-key lookup in `ZkExecutor`
+  (`decode_and_check`'s degree-bits pre-check, `warm`, `warm_bundle`) follow.
+- **The 2026-09-12 zk audit, ported upstream and re-vendored.** Two Critical soundness fixes in
+  the cpu table: hash row-groups now have *entry* gates (an absorb row may only follow the ecall
+  row or another absorb row; a write-back row only the ecall row, an absorb row, or the first
+  write-back row; nothing follows the second) — without them a free-standing `IS_HASH` row spliced
+  after any ordinary row gave arbitrary RAM writes at an unbounded `HASH_PTR` — and `HASH_FIN` is
+  pinned to write-back rows (`HASH_FIN·(1 − IS_HASH_OUT) = 0`), closing the same hole one row
+  later. Then: the memory table's sort key is computed by *addition* (`SPACE·2^30 + ADDR`, not
+  `|`), so an honest run whose Poseidon2-derived addresses cross `2^30` can actually be proved;
+  `Instr::encode` asserts every immediate's range instead of silently truncating it into wrong
+  code; the emulator rejects a Poseidon2 pointer at or above `2^30`, matching the AIR's own bound;
+  the auto-tier pick fits the Poseidon2 *permutation* budget as well as the cycle budget; and a
+  program or private-input vector longer than 65 535 words is rejected at prove time (the digest
+  rows' `HASH_LEFT` is a 16-bit value, so a longer one is unprovable at any tier) as is an
+  explicit tier outside `TIERS`.
+- **The production FRI profile is back to the whitepaper's: 80 queries, blowup 8, 20 PoW bits.**
+  The 27-query retune constraint sets 3 and 4 ran on met the ethSTARK *conjectured* 100-bit target
+  (`3·27 + 20 = 101`) but left only ~42 *proven* proximity-gaps bits; 80/8/20 gives ~86 proven and
+  260 conjectured, and the whitepaper's Part III reconciliation had already weighed exactly that
+  trade. Measured on `guests::fib` immediately before and after the revert, same machine
+  (`research/docs/03-privacy.md`):
+
+  | | tier 10 | tier 12 |
+  |---|---|---|
+  | proof size, 27 queries | 435 529 bytes | 460 441 bytes |
+  | proof size, 80 queries | **1 202 416 / 1 195 120 bytes** | **1 252 338 / 1 263 921 bytes** |
+  | prove time (27 → 80) | 5.96 s → 6.05 s, 5.81 s | 22.91 s → 22.78 s, 22.74 s |
+  | first (uncached) verify (27 → 80) | 213.2 ms → 232.7 ms | 809.2 ms → 837.5 ms |
+
+  Two 80-query numbers are given per cell because the hiding PCS draws fresh entropy per proof, so
+  the postcard encoding moves about a percent run to run. Proof size grows ~2.75x, a little under
+  the 80/27 = 2.96 the query count alone suggests; prove and first-verify time barely move, since
+  both are dominated by trace commitment and the uncached verifier-key recomputation, costs the
+  query count does not touch. A keccak-*carrying* tier-10 proof measures 3 106 757 bytes.
+
+**`MAX_PROOF_BYTES` is 2 MiB** (`crates/shrugg-core/src/gas.rs`), raised from 1 MiB in the same
+change: at 80 queries the 1 MiB cap rejected *every* production proof. 2 MiB is the smallest
+power-of-two cap above the measured sizes with room for the per-proof variation, and it sits
+deliberately below the ~3.11 MB a keccak-bearing proof costs. **`MAX_BLOCK_BYTES` stays 4 MiB** —
+`docs/block-space.md` §5 records that decision: at ~1.3 MB per shielded transfer that is three
+transfers per block, and block-level aggregation rather than a bigger block is the queued remedy.
+
+Proofs made under constraint set 4 (or earlier) do not verify under constraint set 5, in either
+direction — the FRI profile differs (a 27-query proof and an 80-query verifier reject each other),
+`Proof` gained two fields (`keccak_log_height`, `mem_log_height`) so the wire encoding does not
+round-trip, and the verifier key is keyed on four components instead of three. This is the same
+hard-fork situation constraint sets 2, 3 and 4 already documented: a node built from this commit
+will fail startup ledger replay of any chain with a confidential call proved under an older
+constraint set and truncate its chain. Start a new chain id, or run `--verify-chain off` on nodes
+that must keep serving an old chain. A fleet must run one build.
+
 ## On-chain model
 
 **Programs** are content addressed: `program_id = blake3("shrugg-program" || base_pc || words)`.
@@ -208,7 +299,8 @@ is no `effect` field.
   the genesis-pinned `hc_bundle`.
 - Deploy: `words.len() <= 4096`, `base_pc % 4 == 0`, every word decodes,
   `fee >= BUNDLE_BASE + 100_000 * words`.
-- Call: program exists; `proof.len() <= 1 MiB`; the proof verifies against the stored program's
+- Call: program exists; `proof.len() <= 2 MiB` (`gas::MAX_PROOF_BYTES`, raised for constraint
+  set 5's proof sizes); the proof verifies against the stored program's
   `hc` for the tier it declares; `fee >= BUNDLE_BASE + call_fee(tier)`, checked last, once a
   verified proof has revealed the tier.
 - A block with an invalid call is invalid, like any other invalid transaction.

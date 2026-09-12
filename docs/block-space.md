@@ -27,7 +27,7 @@ The node's caps (`crates/shrugg-core/src/gas.rs`):
 
 | cap | value | effect at 80 queries |
 |---|---|---|
-| `MAX_PROOF_BYTES` | 1 MiB today, **2 MiB at integration** | 1 MiB rejects every production proof |
+| `MAX_PROOF_BYTES` | **2 MiB** (raised with constraint set 5) | 1 MiB rejected every production proof |
 | `MAX_BLOCK_BYTES` | 4 MiB | **3 transfers per block** (9 at 27 queries) |
 | `MAX_BLOCK_TXS` | 2 000 | never reached |
 | block interval (chain 5) | ~2 s | ~1.5 transfers/s |
@@ -107,8 +107,9 @@ runs on (`docs/zkvm.md` §5).
 
 ## 5. Practical consequences today
 
-- Integration of the 80-query research crate raises `MAX_PROOF_BYTES` to 2 MiB; the 4 MiB
-  block cap stays. Chain 6 will admit three transfers per block.
+- Integration of the 80-query research crate (constraint set 5, `docs/confidential.md`) raised
+  `MAX_PROOF_BYTES` to 2 MiB; the 4 MiB block cap stays. Chain 6 will admit three transfers per
+  block.
 - The testnet fleet's links carry 4 MiB / 2 s comfortably. Disk is the constraint: a node that
   ran full blocks for a week would write ~1.2 TB. The fleet's ≥ 20 GB free-space rule is for
   builds, not for full blocks; proof pruning (item 1) is what makes full blocks survivable.
