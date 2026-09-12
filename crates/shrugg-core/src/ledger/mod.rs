@@ -156,6 +156,12 @@ pub enum BlockError {
     TooManyTransactions,
     #[error("block transaction bytes exceed the per-block limit")]
     TooLarge,
+    /// Only on a chain with a bridge, where the block timestamp is consensus input
+    /// (guardian-set expiry, outbound burn message times): a leader must not be able to rewind
+    /// time and keep a superseded guardian set inside its grace window. Equal timestamps are
+    /// allowed — the rule forbids a rewind, not a repeat (`docs/bridge.md` §3, §8).
+    #[error("block timestamp {block} is before its parent's {parent}")]
+    TimestampRewind { parent: u64, block: u64 },
 }
 
 /// Receipt data for a call, before it is placed in a block.
@@ -761,6 +767,15 @@ impl Ledger {
         let proposer = block.proposer();
         if !self.validators.contains_key(&proposer) {
             return Err(BlockError::UnknownProposer(proposer));
+        }
+        // Time bounds validity only where it is consensus input, so a chain without a bridge
+        // keeps byte-identical validity rules. With one, block time decides guardian-set expiry
+        // (`bridge_notes::validate` → `check_attest(.., self.now_secs())`) and stamps outbound
+        // burn messages, so a leader that could rewind it could keep a superseded — possibly
+        // compromised — set admissible past its grace window. `HotStuff::propose` already emits
+        // `max(now_ms, parent.timestamp_ms)`, so no honest leader builds a block this refuses.
+        if self.bridge.is_some() && block.header.timestamp_ms < self.timestamp_ms {
+            return Err(BlockError::TimestampRewind { parent: self.timestamp_ms, block: block.header.timestamp_ms });
         }
         let mut scratch = self.clone();
         scratch.set_height(block.height());
@@ -1436,6 +1451,59 @@ mod tests {
         assert_ne!(other.state_root(), bridged.state_root());
         // And two ledgers whose only difference is the bridge are not the same ledger.
         assert_ne!(other, bridged);
+    }
+
+    /// On a bridged chain the block timestamp is consensus input: guardian-set expiry is
+    /// evaluated against it (`bridge_notes::validate` calls `check_attest(.., ledger.now_secs())`)
+    /// and outbound burn messages are stamped with it. So a Byzantine leader must not be able to
+    /// rewind time and keep a superseded — possibly compromised — guardian set inside its grace
+    /// window. Equal timestamps pass (the rule is `<`, not `<=`), and a chain with no bridge keeps
+    /// byte-identical validity rules, because nothing on it reads a clock at all.
+    #[test]
+    fn a_bridged_chain_refuses_a_block_whose_timestamp_rewinds_its_parents() {
+        use crate::bridge::{BridgeConfig, BridgeState};
+
+        let (a, _) = keys();
+        let empty = |l: &Ledger, height: u64, timestamp_ms: u64| {
+            let header = BlockHeader {
+                height,
+                view: height,
+                parent: Hash::ZERO,
+                proposer: a.public_key().clone(),
+                timestamp_ms,
+                tx_root: Block::tx_root(&[]),
+                state_root: root_after(l, &[], &a.address(), height),
+                justify: QuorumCertificate::genesis(Hash::ZERO),
+            };
+            Block::sign(header, Vec::new(), &a)
+        };
+
+        let config =
+            BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::from([(2u16, [9u8; 32])]) };
+        let mut l = ledger();
+        l.set_bridge(Some(BridgeState::from_config(&config)));
+        l.set_timestamp_ms(1_000_000);
+
+        assert_eq!(
+            l.apply_block(&empty(&l, 2, 999_999), &StubExecutor),
+            Err(BlockError::TimestampRewind { parent: 1_000_000, block: 999_999 })
+        );
+        // Equal is allowed, and so is moving forward — which is all the proposer ever emits
+        // (`HotStuff::propose` builds `max(now_ms, parent.timestamp_ms)`).
+        l.apply_block(&empty(&l, 2, 1_000_000), &StubExecutor).unwrap();
+        l.apply_block(&empty(&l, 3, 1_000_001), &StubExecutor).unwrap();
+        assert_eq!(
+            l.apply_block(&empty(&l, 4, 1_000_000), &StubExecutor),
+            Err(BlockError::TimestampRewind { parent: 1_000_001, block: 1_000_000 })
+        );
+        assert_eq!(l.timestamp_ms(), 1_000_001, "a refused block leaves the ledger where it was");
+
+        // The very same rewind on a chain with no bridge, which is accepted: block time
+        // constrains validity only where it is consensus input.
+        let mut plain = ledger();
+        plain.set_timestamp_ms(1_000_000);
+        plain.apply_block(&empty(&plain, 2, 999_999), &StubExecutor).unwrap();
+        assert_eq!(plain.timestamp_ms(), 999_999);
     }
 
     #[test]

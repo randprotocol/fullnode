@@ -258,7 +258,10 @@ impl HotStuff {
         }
         // The shielded chain reads no clock: `time` is bounded in block heights (spec §7
         // item 5), so a block's timestamp constrains nothing a replica must agree on. A
-        // proposer still never moves it backwards (see `propose`).
+        // proposer still never moves it backwards (see `propose`). The one exception is a
+        // bridged chain, where block time decides guardian-set expiry — `apply_block` below
+        // refuses a rewind there with `BlockError::TimestampRewind`, which reaches this
+        // function's caller as `ConsensusError::Execution` like any other block rule.
 
         // Execute on top of the parent's state.
         if self.tree.len() >= self.cfg.max_tree_blocks {

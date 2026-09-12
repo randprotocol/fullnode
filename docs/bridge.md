@@ -199,7 +199,13 @@ whose timestamp precedes its parent's (`BlockError::TimestampRewind`, gated on
 `self.bridge.is_some()`), and `HotStuff::propose` emits `max(now_ms, parent.timestamp_ms)` so a
 lagging leader never proposes a block its peers must reject. Every ledger built from a head block
 carries that block's timestamp (`apply_block`, `HotStuff::resume`/`propose`, storage replay), so
-expiry is never evaluated at `now = 0`.
+expiry is never evaluated at `now = 0`. Every path that accepts a block goes through `apply_block`
+— `HotStuff::on_proposal` (where the refusal surfaces as `ConsensusError::Execution`, like any
+other block rule), the node's catch-up sync, and `--verify-chain`'s replay — so none of them can
+drift from the rule. Regression test:
+`a_bridged_chain_refuses_a_block_whose_timestamp_rewinds_its_parents`
+(`crates/shrugg-core/src/ledger/mod.rs`), which also pins that an unbridged chain accepts the very
+same rewind.
 
 Test coverage: `guardian_upgrade_must_be_signed_by_the_current_set`,
 `guardian_upgrade_rotates_with_grace_and_rejects_skips`,
