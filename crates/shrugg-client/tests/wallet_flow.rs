@@ -1,10 +1,13 @@
-//! The shielded wallet against a real chain: mint, scan, send, scan both sides, spend the change.
+//! The shielded wallet against a real chain: mint, scan, send, scan both sides, spend the change,
+//! bond a validator.
 //!
 //! One validator node runs in-process (the same `node::start` the cluster tests use) so the
 //! whole loop is exercised end to end — a faucet mint lands a note only wallet A's viewing key
 //! opens; A proves a real 2-in-2-out bundle; B finds its payment by trial-decrypting the tree;
 //! A's spent note comes back marked spent by the chain's own nullifier set; and the change note
-//! is spendable, which is the part a wallet gets wrong if it forgets its own second output.
+//! is spendable, which is the part a wallet gets wrong if it forgets its own second output. The
+//! bond at the end is the one bundle whose value does not land in anybody's note: it burns, and
+//! the register's stake is where it turns up instead.
 //!
 //! Two things about the chain this test configures deliberately. The FRI profile is `test` (16
 //! queries: a real proof, not a security claim), and blocks are slow — `ANCHOR_WINDOW` and
@@ -146,8 +149,42 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     assert_eq!(a_store.balance(), mint - 2 * pay - 2 * fee);
     assert_eq!(a_store.spendable().len(), 1, "still exactly one change note");
 
+    // ---- bond: A stakes 1 SHRUGG onto the genesis validator, burning it out of the pool ----
+    // The genesis validator is already in the register, so this bond carries no registration; the
+    // stake leaves the shielded pool as the bundle's `burn` rather than as anybody's note.
+    let validator = key.address();
+    let staked_before = stake_of(&rpc, &validator.to_base58()).await;
+    let balance_before = a_store.balance();
+    let bond = UNITS_PER_SHRUGG;
+    let action = shrugg_core::Action::Bond { validator, amount: bond, registration: None };
+    let bonded = wallet::submit(&rpc, &a, &mut a_store, None, action, fee, bond, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the bond's bundle is accepted and commits");
+    eprintln!("bond bundle: tier {}, proved in {:.1?}", bonded.tier, bonded.proving);
+    assert_eq!(bonded.burn, bond, "the bundle burns exactly what is bonded");
+    assert_eq!(bonded.amount, 0, "a bond pays nobody a note");
+    assert_eq!(
+        stake_of(&rpc, &validator.to_base58()).await,
+        staked_before + bond,
+        "the register's stake grew by exactly the bonded amount"
+    );
+    assert_eq!(a_store.balance(), balance_before - bond - fee, "the wallet paid the stake and the fee");
+
     eprintln!("whole flow in {:.1?}", started.elapsed());
     handle.shutdown().await;
+}
+
+/// One validator's bonded stake, as `shrugg_getValidators` reports it: amounts go out as decimal
+/// strings, since a stake in units does not fit a JSON number safely.
+async fn stake_of(rpc: &RpcClient, address: &str) -> u64 {
+    let rows = rpc.validators().await.expect("getValidators answers");
+    let row = rows
+        .as_array()
+        .expect("getValidators returns a list")
+        .iter()
+        .find(|r| r["address"].as_str() == Some(address))
+        .unwrap_or_else(|| panic!("{address} is in the register"));
+    row["stake"].as_str().expect("stake is a decimal string").parse().expect("stake parses")
 }
 
 /// Coin selection refuses what a 2-in-2-out bundle cannot do, before any proving starts.

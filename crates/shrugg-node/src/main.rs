@@ -399,7 +399,7 @@ async fn main() -> Result<()> {
             println!(
                 "validator {} on chain {chain_id}\nregistration: {}",
                 kp.address(),
-                hex::encode(bincode::serialize(&registration)?)
+                hex::encode(registration.encode())
             );
         }
         Cmd::Unbond { amount, staking } => {

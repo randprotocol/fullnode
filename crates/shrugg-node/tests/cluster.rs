@@ -729,7 +729,7 @@ async fn confidential_call_rides_on_a_bundle() {
     let deploy_fee = wallet::deploy_fee_default(&action);
     assert_eq!(deploy_fee, gas::BUNDLE_BASE + gas::deploy_fee(program.words.len()));
     let deployed =
-        wallet::submit(&n0.rpc, &a, &mut store, None, action, deploy_fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::submit(&n0.rpc, &a, &mut store, None, action, deploy_fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
             .await
             .expect("the deploy bundle commits");
     eprintln!("deploy: {} words, fee {deploy_fee}, proved in {:.1?}", program.words.len(), deployed.proving);
@@ -754,6 +754,7 @@ async fn confidential_call_rides_on_a_bundle() {
         None,
         Action::Call { program: id, proof, input_envelope: None },
         call_fee,
+        0,
         FriProfile::Test,
         Backend::Cpu,
         CHAIN_ID,

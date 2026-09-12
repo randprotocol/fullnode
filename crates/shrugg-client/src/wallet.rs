@@ -452,6 +452,17 @@ pub fn select_inputs(spendable: &[&OwnedNote], need: u64) -> Result<Vec<OwnedNot
 
 // ---------------------------------------------------------------- sending
 
+/// What a bundle's inputs must cover: the guest's own balance equation `in = out + fee + burn`
+/// (design spec §3), so the wallet asks coin selection for exactly that. The burn is the part
+/// that leaves the shielded pool instead of becoming somebody's note — today only a `Bond`'s
+/// stake.
+fn bundle_need(amount: u64, fee: u64, burn: u64) -> Result<u64> {
+    amount
+        .checked_add(fee)
+        .and_then(|n| n.checked_add(burn))
+        .ok_or_else(|| anyhow!("amount + fee + burn overflows"))
+}
+
 /// What a submitted bundle did, for the caller to print.
 #[derive(Clone, Debug)]
 pub struct Submission {
@@ -459,16 +470,22 @@ pub struct Submission {
     pub amount: u64,
     pub change: u64,
     pub fee: u64,
+    /// What the bundle burned out of the pool: a `Bond`'s stake, otherwise zero.
+    pub burn: u64,
     pub time: u32,
     pub tier: u8,
     pub proof_bytes: usize,
     pub proving: Duration,
 }
 
-/// Everything that rides on a bundle goes through here: a transfer (`to = Some(..)`), a deploy
-/// or a call (`to = None`, i.e. a self-transfer of zero whose only purpose is to pay the
-/// action's fee floor). One code path, so the fee, the anchor, the witnesses and the digest
-/// check cannot drift apart between the three.
+/// Everything that rides on a bundle goes through here: a transfer (`to = Some(..)`), a deploy,
+/// a call or a bond (`to = None`, i.e. a self-transfer of zero whose only purpose is to pay the
+/// action's fee floor — and, for a bond, to burn the stake). One code path, so the fee, the
+/// anchor, the witnesses and the digest check cannot drift apart between them.
+///
+/// `burn` is what the bundle takes out of the shielded pool, which a `Bond` must set to the
+/// staked amount (`Ledger::validate_inner` rejects a bond whose bundle burns anything else) and
+/// every other action leaves at zero.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit(
     rpc: &RpcClient,
@@ -477,6 +494,7 @@ pub async fn submit(
     to: Option<(&ShieldedAddress, u64)>,
     action: Action,
     fee: u64,
+    burn: u64,
     profile: FriProfile,
     backend: Backend,
     chain_id: u64,
@@ -485,7 +503,7 @@ pub async fn submit(
     scan(rpc, w, store).await?;
 
     let (dest, amount) = to.unwrap_or((&w.address, 0));
-    let need = amount.checked_add(fee).ok_or_else(|| anyhow!("amount + fee overflows"))?;
+    let need = bundle_need(amount, fee, burn)?;
     let chosen = select_inputs(&store.spendable(), need)?;
     let total: u64 = chosen.iter().map(|n| n.note.amount).sum();
     let change = total - need;
@@ -541,8 +559,8 @@ pub async fn submit(
     let out2 = Note::new(pk_self, pk_self, change, 0, time);
     let outputs = [out1, out2];
 
-    let words = bundle_inputs(&w.sk, &inputs, &outputs, root, fee, 0, 0, time);
-    let expected = expected_bundle_outputs(&w.sk, &inputs, &outputs, root, fee, 0, 0, time);
+    let words = bundle_inputs(&w.sk, &inputs, &outputs, root, fee, burn, 0, time);
+    let expected = expected_bundle_outputs(&w.sk, &inputs, &outputs, root, fee, burn, 0, time);
 
     eprintln!("proving bundle (tier 14; about a minute on a laptop)…");
     let started = Instant::now();
@@ -572,7 +590,7 @@ pub async fn submit(
         nullifiers: [w.vk.nullifier(&inputs[0].0.commitment()), w.vk.nullifier(&inputs[1].0.commitment())],
         commitments: [out1.commitment(), out2.commitment()],
         fee,
-        burn: 0,
+        burn,
         asset: 0,
         time,
         envelopes,
@@ -599,7 +617,7 @@ pub async fn submit(
             }
         }
     }
-    Ok(Submission { hash, amount, change, fee, time, tier, proof_bytes: tx.bundle.map_or(0, |b| b.proof.len()), proving })
+    Ok(Submission { hash, amount, change, fee, burn, time, tier, proof_bytes: tx.bundle.map_or(0, |b| b.proof.len()), proving })
 }
 
 /// What a `deploy` pays by default: the bundle base plus the program's per-word charge, which
@@ -630,7 +648,7 @@ pub async fn send(
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    submit(rpc, w, store, Some((to, amount)), Action::None, fee, profile, backend, chain_id, wait).await
+    submit(rpc, w, store, Some((to, amount)), Action::None, fee, 0, profile, backend, chain_id, wait).await
 }
 
 #[cfg(test)]
@@ -692,6 +710,40 @@ mod tests {
         assert_eq!(store.balance(), 7);
         let spendable: Vec<u64> = store.spendable().iter().map(|n| n.note.amount).collect();
         assert_eq!(spendable, vec![5, 2]);
+    }
+
+    /// A bond pays its stake by *burning* it, not by sending it: the bundle's only output is the
+    /// change, and the notes it spends still have to cover the whole of `out + fee + burn`.
+    #[test]
+    fn bond_bundle_balances_with_burn() {
+        let units = shrugg_core::UNITS_PER_SHRUGG;
+        let notes = [owned(0, 40 * units, false), owned(1, 10 * units, false)];
+        let spendable: Vec<&OwnedNote> = notes.iter().collect();
+        let stake = 45 * units;
+        let fee = gas::BUNDLE_BASE;
+
+        // A bond sends nothing to anybody, so the payment output is zero and the burn is the need.
+        let need = bundle_need(0, fee, stake).unwrap();
+        assert_eq!(need, stake + fee);
+        let chosen = select_inputs(&spendable, need).unwrap();
+        assert_eq!(chosen.len(), 2, "neither note alone covers the stake and the fee");
+        let total: u64 = chosen.iter().map(|n| n.note.amount).sum();
+        let change = total - need;
+        assert_eq!(change, 50 * units - stake - fee);
+        // The guest's balance equation, which is what the burn has to close: in = out + fee + burn,
+        // with the payment output zero.
+        assert_eq!(total, change + fee + stake);
+
+        // A transfer of the same size is the same arithmetic with the burn on the other side —
+        // the value goes to a note instead of out of the pool, so the change is identical.
+        assert_eq!(bundle_need(stake, fee, 0).unwrap(), need);
+
+        // Nothing is bonded that the wallet cannot cover, and the fee is part of what it covers.
+        assert_eq!(
+            select_inputs(&spendable, bundle_need(0, fee, 50 * units).unwrap()).unwrap_err(),
+            SelectError::Insufficient { have: 50 * units }
+        );
+        assert!(bundle_need(0, fee, u64::MAX).unwrap_err().to_string().contains("overflows"));
     }
 
     #[test]

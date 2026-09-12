@@ -28,6 +28,22 @@ pub struct Registration {
     pub signature: Signature,
 }
 
+impl Registration {
+    /// The blob a validator hands its bonder: `shrugg-node register` prints it as hex and
+    /// `shrugg bond --registration` reads it back. Bincode, like [`Transaction::encode`] — a
+    /// registration travels inside an `Action`, so nothing hashes this form and the two ends
+    /// only have to agree with each other.
+    ///
+    /// [`Transaction::encode`]: crate::Transaction::encode
+    pub fn encode(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("Registration serializes")
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Registration, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+}
+
 /// The encrypted transcript of a confidential call's private inputs (spec §6.1).
 ///
 /// The chain checks nothing about the ciphertext — exactly as with a note [`Envelope`] — only
@@ -129,8 +145,9 @@ mod tests {
             payout: payout.clone(),
             signature: k.sign(registration_message(7, &payout).as_bytes()),
         };
-        let back: Registration = bincode::deserialize(&bincode::serialize(&r).unwrap()).unwrap();
-        assert_eq!(back, r);
+        // The wire form the node prints and a wallet's `--registration` reads back.
+        assert_eq!(Registration::decode(&r.encode()).unwrap(), r);
+        assert!(Registration::decode(b"not a registration").is_err());
         assert!(r.public_key.verify(registration_message(7, &payout).as_bytes(), &r.signature));
         assert!(!r.public_key.verify(registration_message(8, &payout).as_bytes(), &r.signature));
     }
