@@ -470,7 +470,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             for v in st.validators.iter() {
                 let addr = v.address();
                 let rewards = st.storage.validator(&addr).map_err(RpcError::internal)?.map(|e| e.rewards).unwrap_or(0);
-                out.push(json!({ "address": addr.to_base58(), "stake": v.stake, "rewards": rewards }));
+                // `stake` is a `u128`: `json!` panics on one above `u64::MAX`, and JSON numbers
+                // are not safe integers past 2^53 anyway, so it goes out as a decimal string
+                // like every other amount this API returns. `rewards` is a `u64` and stays one.
+                out.push(json!({ "address": addr.to_base58(), "stake": v.stake.to_string(), "rewards": rewards }));
             }
             Ok(json!(out))
         }
@@ -727,6 +730,10 @@ mod tests {
         let rows = v.as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["address"], key(1).address().to_base58());
+        // `stake` is a `u128`, so it goes out as a decimal string — `json!` would panic on one
+        // above `u64::MAX`, and a JSON number could not carry it exactly in any case.
+        assert_eq!(rows[0]["stake"], Value::String("10".into()));
+        assert!(rows[0]["stake"].is_string(), "stake must not be a JSON number");
         // The single block's bundle fee was credited to its proposer.
         assert_eq!(rows[0]["rewards"], bundle_fee());
     }

@@ -8,8 +8,8 @@
 //! chain (150 ms blocks) because no proof is involved. A *bundle* costs about a minute and a half
 //! of proving in the `test` FRI profile, so the tests that need one (a real transfer, a
 //! double-spend race, a deploy and a call) run on a chain whose blocks are slow enough that the
-//! 256-block anchor and time windows outlive the proof: at [`PROVING`] that is over two minutes
-//! against a proof of about one and a half.
+//! 256-block anchor and time windows outlive the proof: at [`PROVING`] that is over four minutes
+//! against a proof of about one and a half, margin enough for several such tests proving at once.
 //!
 //! What the bundle tests assert is always a *wallet's* view, never a node's: the chain has no
 //! balances, so `balance(node, wallet)` scans a fresh note store against that node's RPC and
@@ -39,10 +39,14 @@ const FAST: Duration = Duration::from_millis(150);
 
 /// Block spacing for the tests that prove a bundle. `ANCHOR_WINDOW` and `TIME_WINDOW` are 256
 /// *blocks*, so a bundle has 256 blocks between reading its anchor and being committed under it;
-/// at 500 ms that is a little over two minutes, against a tier-14 proof of about a minute and a
-/// half in the `test` profile. A faster chain would expire the anchor mid-proof and the test
-/// would fail on the clock rather than on the property it is about.
-const PROVING: Duration = Duration::from_millis(500);
+/// at 1 s that is a little over four minutes, against a tier-14 proof measured at about 98 s in
+/// the `test` profile. The margin is deliberately more than 2×: `cargo test --workspace`
+/// schedules the proving tests concurrently (one of them proves twice), so three or four proofs
+/// compete for the same cores and the wall-clock cost of each one grows. A faster chain would
+/// expire the anchor mid-proof and the test would fail on the clock rather than on the property
+/// it is about. The view timeouts scale with the interval, and every `wait_*` bound in these
+/// tests still holds at 1 s blocks (`wallet::COMMIT_TIMEOUT` is 180 s).
+const PROVING: Duration = Duration::from_millis(1000);
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()

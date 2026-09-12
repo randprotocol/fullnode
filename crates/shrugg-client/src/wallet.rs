@@ -341,6 +341,13 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
         }
     }
 
+    // The head as it stands *before* the nullifier pages below. The pages read every nullifier
+    // that exists at read time from `scanned_height` upward, so once the loop has finished, every
+    // block at or below this height has been read — whether or not it published a nullifier.
+    // Reading the head afterwards instead would claim blocks that landed while the pages were in
+    // flight and whose nullifiers this scan never saw.
+    let head_before = rpc.head().await?["height"].as_u64().context("getHead did not return a height")?;
+
     // Nullifiers are keyed by height, and a page can in principle stop inside a height. Paging
     // back to `max_height` rather than past it is what keeps a truncated page from skipping the
     // rest of that block; re-reading rows is free, since marking a note spent is idempotent.
@@ -365,26 +372,44 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
         }
         from = max_height;
     }
-    store.scanned_height = store.scanned_height.max(from);
+    store.scanned_height = advance_scanned_height(store.scanned_height, from, head_before);
 
     // Resolve anything a `--no-wait` submission left pending, now that the chain has answered.
-    //
-    // The bound is what this scan has actually *read* — `scanned_height` is the next unread
-    // block, so every nullifier below it has been matched against this store — and not a freshly
-    // fetched head. A head runs ahead of the pages read above, so clearing against it would
-    // un-pend a note whose spend is sitting in a block the wallet has not looked at yet, and hand
-    // that note back to coin selection as if it were free.
-    if store.notes.iter().any(|n| n.pending.is_some()) {
-        let read_through = store.scanned_height.saturating_sub(1);
-        for n in store.notes.iter_mut() {
-            if let Some(time) = n.pending {
-                if n.spent || read_through > time as u64 + TIME_WINDOW {
-                    n.pending = None;
-                }
+    clear_pending(store, store.scanned_height.saturating_sub(1));
+    Ok(())
+}
+
+/// Where a scan has read through after paging nullifiers, keeping the store's invariant that
+/// every nullifier in a block below `scanned_height` has been matched against this store.
+///
+/// `paged_to` is where the nullifier pages stopped: one past the last height that published a
+/// nullifier, or the cursor unmoved when no page returned a row. On a quiet chain that is the
+/// cursor itself, which is why it cannot be the only bound — a wallet whose chain never spends
+/// again would never advance, and a `--no-wait` note pending against it would never clear.
+///
+/// `head_before` is the head read *before* the pages, so the pages covered every block up to it
+/// and `head_before + 1` is the first block this scan has not read. It is a bound, not a
+/// replacement: a head fetched *after* the pages would run ahead of them and let a spend the
+/// wallet has not looked at yet pass for "read", which is the race this rule exists to avoid.
+fn advance_scanned_height(previous: u64, paged_to: u64, head_before: u64) -> u64 {
+    previous.max(paged_to).max(head_before.saturating_add(1))
+}
+
+/// Clear the `pending` mark on every note the chain has now answered for, where `read_through`
+/// is the last block height this scan has read (`scanned_height - 1`).
+///
+/// A note clears either because its spend landed (`spent`, set by the nullifier pages) or
+/// because the blocks read reach past `time + TIME_WINDOW`, the last height at which a bundle
+/// stamped `time` could still be admitted: after that the submission can never commit, so the
+/// note is free again. The bound is what was read, never a head fetched later.
+fn clear_pending(store: &mut NoteStore, read_through: u64) {
+    for n in store.notes.iter_mut() {
+        if let Some(time) = n.pending {
+            if n.spent || read_through > time as u64 + TIME_WINDOW {
+                n.pending = None;
             }
         }
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------- coin selection
@@ -744,6 +769,52 @@ mod tests {
         // ...and unlike `spent`, it is not a one-way write: clearing it restores the note.
         store.notes[1].pending = None;
         assert_eq!(store.balance(), 8);
+    }
+
+    /// The scan cursor must move on a chain that publishes no further nullifiers, or a note left
+    /// pending by a `--no-wait` submission never clears and stays out of coin selection forever.
+    #[test]
+    fn the_scan_cursor_advances_past_the_head_even_when_no_block_spends() {
+        // Quiet chain: the pages returned nothing, so `paged_to` is the cursor unmoved. The head
+        // read before the pages is what says how far the scan actually got.
+        assert_eq!(advance_scanned_height(4, 4, 40), 41);
+        // A busy chain moves the cursor past the head only if a spend landed above it while the
+        // pages were in flight; the higher of the two wins either way.
+        assert_eq!(advance_scanned_height(4, 39, 40), 41);
+        assert_eq!(advance_scanned_height(4, 44, 40), 44);
+        // The cursor never goes backwards: a node that answers from behind our own store (a
+        // lagging peer, a fresh replica) must not re-open blocks we have already accounted for.
+        assert_eq!(advance_scanned_height(50, 4, 7), 50);
+        // Genesis: nothing read yet, head 0 — block 0 has been read, block 1 has not.
+        assert_eq!(advance_scanned_height(0, 0, 0), 1);
+        assert_eq!(advance_scanned_height(0, 0, u64::MAX), u64::MAX);
+    }
+
+    /// The pending rule itself, against what the scan read rather than a fresh head.
+    #[test]
+    fn pending_clears_once_the_blocks_read_pass_the_time_window() {
+        let pending_at = |time: u32, spent: bool| {
+            let mut n = owned(0, 5, spent);
+            n.pending = Some(time);
+            NoteStore { notes: vec![n], ..NoteStore::default() }
+        };
+
+        // One block short of the last height at which the bundle could still be admitted.
+        let mut store = pending_at(9, false);
+        clear_pending(&mut store, 9 + TIME_WINDOW);
+        assert_eq!(store.notes[0].pending, Some(9), "the bundle can still commit at this height");
+        assert_eq!(store.balance(), 0);
+
+        // One past it: the submission can never be admitted now, so the note is free again.
+        clear_pending(&mut store, 9 + TIME_WINDOW + 1);
+        assert_eq!(store.notes[0].pending, None);
+        assert_eq!(store.balance(), 5);
+
+        // A spend that did land clears the mark immediately, whatever the height reached.
+        let mut store = pending_at(9, true);
+        clear_pending(&mut store, 0);
+        assert_eq!(store.notes[0].pending, None);
+        assert_eq!(store.balance(), 0, "but a spent note is still spent");
     }
 
     #[test]

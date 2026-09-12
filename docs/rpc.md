@@ -205,10 +205,12 @@ build disagrees with the genesis value refuses to start at all.
 Params: `[]`. Result: array of `{ "peer_id": "12D3KooW...", "addrs": ["/ip4/…/tcp/30303"], "connected_secs": 1241 }`.
 
 ### `shrugg_getValidators`
-Params: `[]`. Result: array of `{ "address": "…", "stake": 100000, "rewards": 4000000 }` in
-leader-rotation order (sorted by address). The leader of view `v` is entry `v mod n`. `rewards` is
-the bundle fees credited to that validator as proposer; it is chain state, and the only amount
-this chain stores in the clear. Paying it out is phase S2's `Withdraw`.
+Params: `[]`. Result: array of `{ "address": "…", "stake": "100000", "rewards": 4000000 }` in
+leader-rotation order (sorted by address). The leader of view `v` is entry `v mod n`. `stake` is a
+`u128` and goes out as a **decimal string** (a JSON number cannot carry one exactly); `rewards` is a
+`u64` and stays a number. `rewards` is the bundle fees credited to that validator as proposer; it
+is chain state, and the only amount this chain stores in the clear. Paying it out is phase S2's
+`Withdraw`.
 
 ## Errors
 

@@ -149,7 +149,8 @@ Three things to know about spending:
   `pending` rather than spent: not spendable, but not written off either. The next `sync`
   resolves it — the nullifier appeared, or the blocks the wallet has read reach past
   `time + TIME_WINDOW` (256 blocks), after which that bundle can never be admitted and the note
-  is spendable again.
+  is spendable again. Every `sync` reads up to the head it saw when it started, whether or not
+  those blocks spent anything, so the second condition arrives on a quiet chain too.
 - **The fee floor is 0.001 SHRUGG** for a transfer, plus the action's own floor for a deploy or a
   call. `shrugg fee` asks the node rather than guessing.
 
