@@ -104,6 +104,12 @@ fn default_epoch_blocks() -> u64 {
     EPOCH_BLOCKS_DEFAULT
 }
 
+/// Largest `epoch_blocks` a genesis file may ask for. `epoch(h) = h / epoch_blocks`, so zero is
+/// a division by zero and anything past a chain's reachable height is an epoch that never ends —
+/// one set, forever, which is not what a genesis author means by a large number. `1 << 32` blocks
+/// is ~136 years at 1 s blocks: far beyond any real chain and still far from `u64::MAX`.
+pub const MAX_EPOCH_BLOCKS: u64 = 1 << 32;
+
 fn default_profile() -> String {
     "production".into()
 }
@@ -132,6 +138,8 @@ pub enum GenesisError {
     BadNote(String),
     #[error("duplicate alloc note {0}")]
     DuplicateNote(String),
+    #[error("bad epoch_blocks {0} (1..={MAX_EPOCH_BLOCKS})")]
+    BadEpochBlocks(u64),
 }
 
 /// Everything a node derives from the genesis file.
@@ -177,6 +185,12 @@ impl Genesis {
             return Err(GenesisError::BadBridgeConfig(
                 "bridge is not available on the shielded chain until phase S3".into(),
             ));
+        }
+        // S2 divides by `epoch_blocks` to get the epoch of a height; a genesis file that says
+        // zero would panic every node on the first block rather than at the one place that
+        // reads the file. The upper bound costs nothing and rejects an epoch that never ends.
+        if self.epoch_blocks == 0 || self.epoch_blocks > MAX_EPOCH_BLOCKS {
+            return Err(GenesisError::BadEpochBlocks(self.epoch_blocks));
         }
         let mut vals = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
@@ -422,6 +436,28 @@ mod tests {
         // An unset payout stays out of the file entirely.
         assert!(!g.to_json().contains("payout"));
         assert!(g.to_json().contains("\"epoch_blocks\""));
+    }
+
+    /// S2 scaffold: `epoch(h) = h / epoch_blocks`, so a genesis file has to name a divisor the
+    /// chain can actually use. Rejected at the one place that reads the file, not at the first
+    /// division.
+    #[test]
+    fn epoch_blocks_must_be_a_usable_divisor() {
+        let g = genesis(1);
+        for bad in [0, MAX_EPOCH_BLOCKS + 1, u64::MAX] {
+            let mut broken = g.clone();
+            broken.epoch_blocks = bad;
+            match broken.build(&StubExecutor) {
+                Err(GenesisError::BadEpochBlocks(n)) => assert_eq!(n, bad),
+                other => panic!("expected BadEpochBlocks for {bad}, got {other:?}"),
+            }
+        }
+        // The edges that are fine: one block per epoch, and the cap itself.
+        for ok in [1, EPOCH_BLOCKS_DEFAULT, MAX_EPOCH_BLOCKS] {
+            let mut fine = g.clone();
+            fine.epoch_blocks = ok;
+            assert_eq!(build(&fine).epoch_blocks, ok);
+        }
     }
 
     #[test]

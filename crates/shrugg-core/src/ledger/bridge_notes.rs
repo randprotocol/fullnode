@@ -11,13 +11,17 @@ use crate::types::{Action, Transaction};
 
 /// Why each bridge action is refused today. One place, so `validate` and `apply` can never
 /// disagree about which variants this module owns.
+///
+/// The catch-all fails closed: an action this module does not own can only arrive through a
+/// routing mistake in [`super::Ledger::validate_inner`], and refusing it is the safe answer
+/// even if that never happens. `Ok(())` here would let a mis-routed action skip its own rules.
 fn unsupported(action: &Action) -> Result<(), TxError> {
     match action {
         Action::BridgeAttest { .. } => {
             Err(TxError::UnsupportedAction("bridge_attest is not available until phase S3"))
         }
         Action::BridgeBurn { .. } => Err(TxError::UnsupportedAction("bridge_burn is not available until phase S3")),
-        _ => Ok(()),
+        _ => Err(TxError::UnsupportedAction("bridge")),
     }
 }
 
@@ -39,4 +43,31 @@ pub(super) fn apply(
     _executor: &dyn ConfidentialExecutor,
 ) -> Result<(), TxError> {
     unsupported(action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::confidential::StubExecutor;
+    use crate::crypto::Keypair;
+    use crate::types::{Validator, ValidatorSet};
+
+    fn ledger() -> Ledger {
+        let k = Keypair::from_seed([1; 32]).unwrap();
+        let set = ValidatorSet::new(vec![Validator { public_key: k.public_key().clone(), stake: 10 }]);
+        Ledger::new(7, [11; 8], &set, &StubExecutor)
+    }
+
+    /// Fail closed: an action this module does not own is refused rather than waved through,
+    /// and `validate` and `apply` answer alike. Only a dispatch bug can get here, which is
+    /// exactly the case where `Ok(())` would silently skip the action's real rules.
+    #[test]
+    fn a_non_bridge_action_routed_here_is_refused() {
+        let mut l = ledger();
+        let tx = Transaction { chain_id: 7, bundle: None, action: Action::None };
+        for a in [Action::None, Action::Bond { validator: crate::crypto::Address([1; 32]), amount: 1, registration: None }] {
+            assert_eq!(validate(&l, &tx, &a, &StubExecutor), Err(TxError::UnsupportedAction("bridge")), "{a:?}");
+            assert_eq!(apply(&mut l, &tx, &a, &StubExecutor), Err(TxError::UnsupportedAction("bridge")), "{a:?}");
+        }
+    }
 }

@@ -57,6 +57,8 @@ pub enum TxError {
     EnvelopeTooLarge,
     #[error("proof too large")]
     ProofTooLarge,
+    #[error("attestation exceeds {} bytes", gas::MAX_ATTESTATION_BYTES)]
+    AttestationTooLarge,
     #[error("program too large")]
     ProgramTooLarge,
     #[error("asset {0} is not supported in this release")]
@@ -384,8 +386,31 @@ impl Ledger {
                 return Err(TxError::ProgramTooLarge)
             }
             Action::Call { proof, .. } if proof.len() > gas::MAX_PROOF_BYTES => return Err(TxError::ProofTooLarge),
+            Action::Withdraw { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
+                return Err(TxError::EnvelopeTooLarge)
+            }
+            Action::BridgeAttest { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
+                return Err(TxError::EnvelopeTooLarge)
+            }
+            Action::BridgeAttest { attestation, .. } if attestation.len() > gas::MAX_ATTESTATION_BYTES => {
+                return Err(TxError::AttestationTooLarge)
+            }
+            // A burn's second bundle is a bundle: the caps above it are the caps every bundle
+            // gets, applied here because `tx.bundle` is only the fee bundle.
+            Action::BridgeBurn { asset_bundle, .. }
+                if asset_bundle.envelopes.iter().any(|e| e.len() > MAX_ENVELOPE_BYTES) =>
+            {
+                return Err(TxError::EnvelopeTooLarge)
+            }
+            Action::BridgeBurn { asset_bundle, .. } if asset_bundle.proof.len() > gas::MAX_PROOF_BYTES => {
+                return Err(TxError::ProofTooLarge)
+            }
             _ => {}
         }
+        // Every variable-length field that reaches a node before any signature or proof work is
+        // capped above, with one exception: a `Call`'s `input_envelope` has its own cap
+        // (`MAX_CALL_ENVELOPE_BYTES`, larger than a note envelope's) and is checked in
+        // `call_envelope::validate` at step 7. Nothing between here and there reads it.
         // 2. chain id
         if tx.chain_id != self.chain_id {
             return Err(TxError::WrongChain { expected: self.chain_id, actual: tx.chain_id });
@@ -510,10 +535,15 @@ impl Ledger {
     ) -> Result<Option<CallReceiptData>, TxError> {
         let outcome = self.validate_inner(tx, executor)?;
         if let Some(b) = &tx.bundle {
-            // Everything that can still fail is resolved before the first mutation, so a
-            // rejected transaction leaves the ledger byte-identical. In practice the proposer
-            // is always in the register — `apply_block` rejects a block whose proposer is not,
-            // and `HotStuff::propose` runs only when this node is the leader.
+            // This method is not atomic on its own: the action step below runs after these
+            // writes and can still fail (S2's `staking::apply`, S3's `bridge_notes::apply`),
+            // which would leave a half-applied bundle behind. What makes a rejected
+            // transaction leave the ledger byte-identical is the caller: `apply_transactions`
+            // applies every transaction to a scratch clone and only assigns it back once the
+            // whole block succeeded. Call `apply_tx` on a ledger you are willing to discard.
+            // In practice the proposer is always in the register — `apply_block` rejects a
+            // block whose proposer is not, and `HotStuff::propose` runs only when this node
+            // is the leader.
             let entry = self.validators.get(proposer).ok_or(TxError::UnknownProposer(*proposer))?;
             let rewards = entry.rewards.checked_add(b.fee).ok_or(TxError::Overflow)?;
             for nf in &b.nullifiers {
@@ -981,47 +1011,123 @@ mod tests {
         assert_eq!(l.validate(&disabled, &StubExecutor), Err(TxError::ConfidentialDisabled));
     }
 
-    /// S2/S3 scaffold: every new variant reaches its module and is refused there, naming the
-    /// phase that turns it on. S2 and S3 flip these one file at a time.
+    /// Each scaffolded action reaches its module, is refused there naming the phase that turns
+    /// it on, and leaves the ledger untouched. Shared by the S2 and S3 halves below so each
+    /// phase deletes only its own test.
+    fn refused_until_its_phase(l: &Ledger, phase: &str, first_nullifier: u32, action: Action) {
+        let n = first_nullifier;
+        let b = bundle(l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::fee_floor(&action));
+        let t = Transaction::shielded(7, b, action);
+        match l.validate(&t, &StubExecutor) {
+            Err(TxError::UnsupportedAction(m)) => {
+                assert!(m.contains(phase), "{m} should name phase {phase}");
+                assert!(m.contains("not available until"), "{m}");
+            }
+            other => panic!("expected UnsupportedAction, got {other:?}"),
+        }
+        // And nothing is applied: the refusal comes from the action step, before any write.
+        let mut scratch = l.clone();
+        assert!(scratch.apply_tx(&t, &keys().0.address(), &StubExecutor).is_err());
+        assert_eq!(&scratch, l, "a refused action leaves the ledger untouched");
+    }
+
+    /// S2 scaffold: the three staking variants reach [`staking`] and are refused there. S2's
+    /// Task 1 deletes this test.
     #[test]
-    fn the_staking_and_bridge_actions_are_refused_until_their_phase() {
+    fn the_staking_actions_are_refused_until_phase_s2() {
         let l = ledger();
-        let payout = crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
         let sig = crate::crypto::Signature::empty();
         let v = Address([1; 32]);
+        refused_until_its_phase(&l, "S2", 100, Action::Bond { validator: v, amount: 5, registration: None });
+        refused_until_its_phase(
+            &l,
+            "S2",
+            104,
+            Action::Unbond { validator: v, amount: 5, nonce: 0, signature: sig.clone() },
+        );
+        refused_until_its_phase(
+            &l,
+            "S2",
+            108,
+            Action::Withdraw { validator: v, amount: 5, nonce: 0, r: [7; 8], envelope: env(), signature: sig },
+        );
+    }
+
+    /// S3 scaffold: the two bridge variants reach [`bridge_notes`] and are refused there. S3's
+    /// Task 2 deletes this test.
+    #[test]
+    fn the_bridge_actions_are_refused_until_phase_s3() {
+        let l = ledger();
+        let recipient = crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
+        refused_until_its_phase(
+            &l,
+            "S3",
+            112,
+            Action::BridgeAttest { attestation: vec![1; 32], recipient, r: [7; 8], envelope: env() },
+        );
         let asset_bundle = bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], 0);
-        let cases: Vec<(&str, Action)> = vec![
-            ("S2", Action::Bond { validator: v, amount: 5, registration: None }),
-            ("S2", Action::Unbond { validator: v, amount: 5, nonce: 0, signature: sig.clone() }),
-            (
-                "S2",
-                Action::Withdraw { validator: v, amount: 5, nonce: 0, r: [7; 8], envelope: env(), signature: sig },
-            ),
-            (
-                "S3",
-                Action::BridgeAttest { attestation: vec![1; 32], recipient: payout, r: [7; 8], envelope: env() },
-            ),
-            (
-                "S3",
-                Action::BridgeBurn { asset_bundle, asset: 1, amount: 400, relayer_fee: 100, to_chain: 2, to: [9; 32] },
-            ),
-        ];
-        for (i, (phase, action)) in cases.into_iter().enumerate() {
-            let n = 100 + 4 * i as u32;
+        refused_until_its_phase(
+            &l,
+            "S3",
+            116,
+            Action::BridgeBurn { asset_bundle, asset: 1, amount: 400, relayer_fee: 100, to_chain: 2, to: [9; 32] },
+        );
+    }
+
+    /// Step 1 caps every variable-length field the new actions carry, before any signature or
+    /// proof work — and before the action step that would otherwise refuse them, which is what
+    /// makes the cap the error a fat transaction gets. The passing case still ends in
+    /// `UnsupportedAction`, so each assertion below shows the cap firing first.
+    #[test]
+    fn the_new_actions_are_size_capped_at_step_one() {
+        let l = ledger();
+        let v = Address([1; 32]);
+        let sig = crate::crypto::Signature::empty();
+        let recipient = crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
+        // An envelope of exactly `body` bytes of payload, so the cap edge is exact.
+        let fat = |body: usize| Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![3; body] };
+        let check = |n: u32, action: Action, expect: Result<(), TxError>| {
             let b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::fee_floor(&action));
-            let t = Transaction::shielded(7, b, action);
-            match l.validate(&t, &StubExecutor) {
-                Err(TxError::UnsupportedAction(m)) => {
-                    assert!(m.contains(phase), "{m} should name phase {phase}");
-                    assert!(m.contains("not available until"), "{m}");
-                }
-                other => panic!("expected UnsupportedAction, got {other:?}"),
+            let got = l.validate(&Transaction::shielded(7, b, action), &StubExecutor);
+            match expect {
+                Err(e) => assert_eq!(got, Err(e), "n={n}"),
+                // "the cap passed": what is left is the phase refusal, not a size error.
+                Ok(()) => assert!(matches!(got, Err(TxError::UnsupportedAction(_))), "n={n}: {got:?}"),
             }
-            // And nothing is applied: the refusal comes from the action step, before any write.
-            let mut scratch = l.clone();
-            assert!(scratch.apply_tx(&t, &keys().0.address(), &StubExecutor).is_err());
-            assert_eq!(scratch, l, "a refused action leaves the ledger untouched");
-        }
+        };
+        let withdraw = |envelope: Envelope| Action::Withdraw {
+            validator: v,
+            amount: 5,
+            nonce: 0,
+            r: [7; 8],
+            envelope,
+            signature: sig.clone(),
+        };
+        check(200, withdraw(fat(MAX_ENVELOPE_BYTES)), Ok(()));
+        check(204, withdraw(fat(MAX_ENVELOPE_BYTES + 1)), Err(TxError::EnvelopeTooLarge));
+
+        let attest = |attestation: Vec<u8>, envelope: Envelope| Action::BridgeAttest {
+            attestation,
+            recipient: recipient.clone(),
+            r: [7; 8],
+            envelope,
+        };
+        check(208, attest(vec![1; 32], fat(MAX_ENVELOPE_BYTES)), Ok(()));
+        check(212, attest(vec![1; 32], fat(MAX_ENVELOPE_BYTES + 1)), Err(TxError::EnvelopeTooLarge));
+        check(216, attest(vec![1; gas::MAX_ATTESTATION_BYTES], env()), Ok(()));
+        check(220, attest(vec![1; gas::MAX_ATTESTATION_BYTES + 1], env()), Err(TxError::AttestationTooLarge));
+
+        // A burn's asset bundle gets the caps every bundle gets: `tx.bundle` is only the fee one.
+        let burn = |envelopes: [Envelope; 2], proof: Vec<u8>| {
+            let mut asset_bundle = bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], 0);
+            asset_bundle.envelopes = envelopes;
+            asset_bundle.proof = proof;
+            Action::BridgeBurn { asset_bundle, asset: 1, amount: 400, relayer_fee: 100, to_chain: 2, to: [9; 32] }
+        };
+        check(224, burn([fat(MAX_ENVELOPE_BYTES), env()], vec![]), Ok(()));
+        check(228, burn([env(), fat(MAX_ENVELOPE_BYTES + 1)], vec![]), Err(TxError::EnvelopeTooLarge));
+        check(232, burn([env(), env()], vec![0; gas::MAX_PROOF_BYTES]), Ok(()));
+        check(236, burn([env(), env()], vec![0; gas::MAX_PROOF_BYTES + 1]), Err(TxError::ProofTooLarge));
     }
 
     /// The one rule of the call-input envelope the chain does enforce, through a real ledger.
