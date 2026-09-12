@@ -38,7 +38,17 @@ fn genesis(validator: &Keypair) -> Genesis {
     Genesis {
         chain_id: CHAIN_ID,
         timestamp_ms: 0,
-        validators: vec![GenesisValidator { public_key: validator.public_key().clone(), stake: 10, payout: None }],
+        validators: vec![GenesisValidator {
+            public_key: validator.public_key().clone(),
+            stake: 10,
+            // Phase S2 requires a payout address per validator; this test never withdraws, so
+            // it only has to parse.
+            payout: shrugg_core::notes::ShieldedAddress {
+                pk: [1; 8],
+                kem_ek: vec![2; shrugg_core::notes::KEM_EK_BYTES],
+            }
+            .to_string(),
+        }],
         alloc: vec![],
         faucet: true,
         confidential: true,

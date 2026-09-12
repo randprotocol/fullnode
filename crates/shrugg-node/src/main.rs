@@ -72,6 +72,11 @@ enum Cmd {
         /// Validator key files (seed) or hex public keys, repeatable.
         #[arg(long = "validator", required = true)]
         validators: Vec<String>,
+        /// Phase S2: each validator's payout address (`shrugg1…`), repeatable, in the same order
+        /// as `--validator` and the same number of them. Rewards and unbonded stake are paid
+        /// there. (The fuller staking CLI is S2 Task 3.)
+        #[arg(long = "payout", required = true)]
+        payouts: Vec<String>,
         #[arg(long, default_value_t = 100_000)]
         stake: u128,
         /// Deposit notes `shrugg1<address>=<amount in SHRUGG>`, repeatable. A redacted chain has
@@ -158,7 +163,13 @@ async fn main() -> Result<()> {
             let id = libp2p::identity::Keypair::ed25519_from_bytes(kp.derive_subkey(b"shrugg-p2p-identity"))?;
             println!("address: {}\npublic_key: {}\npeer_id: {}", kp.address(), kp.public_key().to_hex(), id.public().to_peer_id());
         }
-        Cmd::Genesis { chain_id, validators, stake, allocs, out, faucet, no_confidential, fri_profile } => {
+        Cmd::Genesis { chain_id, validators, payouts, stake, allocs, out, faucet, no_confidential, fri_profile } => {
+            anyhow::ensure!(
+                payouts.len() == validators.len(),
+                "expected one --payout per --validator ({} validators, {} payouts)",
+                validators.len(),
+                payouts.len()
+            );
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -173,17 +184,18 @@ async fn main() -> Result<()> {
                 // `Genesis::build` rejects a bridge section outright until phase S3 puts the
                 // bridge back on the shielded chain, so this CLI offers no way to write one.
                 bridge: None,
-                // Phase S2 adds a `--epoch-blocks` flag (and `--validator key,stake,payout`);
-                // until then every genesis this CLI writes takes the default epoch length.
+                // S2 Task 3 adds a `--epoch-blocks` flag; until then every genesis this CLI
+                // writes takes the default epoch length.
                 epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
             };
-            for v in validators {
-                let pk = if PathBuf::from(&v).exists() {
-                    load_keypair(&PathBuf::from(&v))?.public_key().clone()
+            for (v, payout) in validators.iter().zip(&payouts) {
+                let pk = if PathBuf::from(v).exists() {
+                    load_keypair(&PathBuf::from(v))?.public_key().clone()
                 } else {
-                    PublicKey::from_hex(&v).with_context(|| format!("{v} is neither a key file nor a hex public key"))?
+                    PublicKey::from_hex(v).with_context(|| format!("{v} is neither a key file nor a hex public key"))?
                 };
-                gen.validators.push(GenesisValidator { public_key: pk, stake, payout: None });
+                ShieldedAddress::parse(payout).with_context(|| format!("{payout} is not a shielded address"))?;
+                gen.validators.push(GenesisValidator { public_key: pk, stake, payout: payout.clone() });
             }
             for a in &allocs {
                 let (addr, amt) = a.split_once('=').context("--alloc must be shrugg1address=amount")?;
@@ -292,12 +304,12 @@ mod tests {
                 GenesisValidator {
                     public_key: Keypair::from_seed([1; 32]).unwrap().public_key().clone(),
                     stake: 10,
-                    payout: None,
+                    payout: pinned_payee().to_string(),
                 },
                 GenesisValidator {
                     public_key: Keypair::from_seed([2; 32]).unwrap().public_key().clone(),
                     stake: 20,
-                    payout: None,
+                    payout: pinned_payee().to_string(),
                 },
             ],
             alloc: vec![seal_deposit(&to, &note).unwrap()],
@@ -318,10 +330,11 @@ mod tests {
     fn the_genesis_hash_is_pinned() {
         let ex = ZkExecutor::new(FriProfile::Test);
         let state = pinned_genesis().build(&ex).unwrap();
-        // S2 scaffold: epoch_blocks bound. The genesis binding gained `epoch_blocks` (spec §8's
-        // epoch length, the same for every node or replicas derive different validator sets), so
-        // this moved from 700f28e8… once, deliberately, with the scaffold commit.
-        assert_eq!(state.hash().to_hex(), "19df87d5e041eef3dba03280991fc2eaf597336f82093093cbd8cb36acfe327e");
+        // S2 Task 1: the register. This moved from 19df87d5… (itself moved from 700f28e8… by
+        // the scaffold's `epoch_blocks` binding) for two deliberate, consensus-breaking reasons:
+        // the genesis binding now covers every validator's payout address, and the state root's
+        // validator leaf is `shrugg-validator-leaf-2` over the v2 entry (pending, payout, nonce).
+        assert_eq!(state.hash().to_hex(), "e50f52e98d5c84006fb65408d70f5c3e0eb3b7480cdf68c803eeba49216edf2d");
         // The envelope is resealed on every call and must not move the hash: only the
         // commitment and the amount are bound.
         let again = pinned_genesis().build(&ex).unwrap();

@@ -7,8 +7,14 @@ BIN=target/release/shrugg-node
 mkdir -p testnet
 [ -f testnet/node1.key.json ] || $BIN keygen --out testnet/node1.key.json
 [ -f testnet/node2.key.json ] || $BIN keygen --out testnet/node2.key.json
+# Phase S2: every validator needs a payout address in genesis (rewards and unbonded stake are
+# paid there as notes), so the wallet makes one key both validators are paid at.
+WALLET=target/release/shrugg
+[ -f testnet/payout.key.json ] || $WALLET --key testnet/payout.key.json keygen
+PAYOUT=$($WALLET --key testnet/payout.key.json address | tail -1)
 [ -f testnet/genesis.json ] || $BIN genesis --chain-id 1 \
-    --validator testnet/node1.key.json --validator testnet/node2.key.json --out testnet/genesis.json
+    --validator testnet/node1.key.json --payout "$PAYOUT" \
+    --validator testnet/node2.key.json --payout "$PAYOUT" --out testnet/genesis.json
 [ -d testnet/data1/db ] || $BIN init --datadir testnet/data1 --genesis testnet/genesis.json
 [ -d testnet/data2/db ] || $BIN init --datadir testnet/data2 --genesis testnet/genesis.json
 $BIN run --datadir testnet/data1 --key testnet/node1.key.json --validator \

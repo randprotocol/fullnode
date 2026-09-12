@@ -103,7 +103,18 @@ fn genesis_funding(validators: &[Keypair], funded: &[&Wallet]) -> Genesis {
         timestamp_ms: 0,
         validators: validators
             .iter()
-            .map(|k| GenesisValidator { public_key: k.public_key().clone(), stake: 10, payout: None })
+            .enumerate()
+            .map(|(i, k)| GenesisValidator {
+                public_key: k.public_key().clone(),
+                stake: 10,
+                // Phase S2 requires a payout address per validator; nothing in this test
+                // withdraws, so it only has to parse.
+                payout: shrugg_core::notes::ShieldedAddress {
+                    pk: [i as u32 + 1; 8],
+                    kem_ek: vec![i as u8 + 1; shrugg_core::notes::KEM_EK_BYTES],
+                }
+                .to_string(),
+            })
             .collect(),
         alloc: funded.iter().map(|w| alloc_note(&w.address, ALLOC)).collect(),
         faucet: true,

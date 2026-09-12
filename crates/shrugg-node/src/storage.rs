@@ -912,7 +912,17 @@ pub(crate) mod fixtures {
         Genesis {
             chain_id,
             timestamp_ms: 0,
-            validators: vec![GenesisValidator { public_key: k.public_key().clone(), stake: 10, payout: None }],
+            validators: vec![GenesisValidator {
+                public_key: k.public_key().clone(),
+                stake: 10,
+                // Phase S2 makes the payout address a required genesis field; storage rows for
+                // the v2 register entry are S2 Task 3's, so this only has to parse.
+                payout: shrugg_core::notes::ShieldedAddress {
+                    pk: [1; 8],
+                    kem_ek: vec![2; shrugg_core::notes::KEM_EK_BYTES],
+                }
+                .to_string(),
+            }],
             alloc,
             faucet: true,
             confidential: true,
