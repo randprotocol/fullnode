@@ -476,6 +476,63 @@ fn genesis_hash_of(sim: &Sim) -> Hash {
     sim.committed[0][0].block.parent()
 }
 
+/// A restart hands `resume` a ledger rebuilt by `Storage::load_ledger`, which carries the state
+/// families but no position: `Ledger::from_parts` starts at height 0. `resume` must move it to
+/// the head block's height, or the mempool measures spec §7 step 5 against height 0 and refuses
+/// every bundle with `bundle time N is outside [0, 0]` until the second block after the restart.
+#[test]
+fn a_ledger_resumed_at_height_h_accepts_a_bundle_timed_at_h() {
+    use crate::confidential::ConfidentialExecutor;
+    use crate::gas;
+    use crate::ledger::Ledger;
+    use crate::types::Action;
+    use crate::Bundle;
+
+    let mut sim = setup(2, 2);
+    for _ in 0..6 {
+        sim.step(vec![]);
+    }
+    let head = sim.committed[0].last().unwrap().clone();
+    let h = head.block.height();
+    assert!(h >= 2, "the bug hides below height 2; committed head is {h}");
+
+    // Exactly what a reload produces: the families, with no height and no timestamp.
+    let mut reloaded: Ledger = sim.nodes[0].committed_ledger().clone();
+    reloaded.set_height(0);
+    reloaded.set_timestamp_ms(0);
+
+    let cfg = ConsensusConfig::new(1, validators_of(&sim), genesis_hash_of(&sim));
+    let resumed = HotStuff::resume(
+        cfg,
+        Some(Keypair::from_seed(*sim.keys[0].seed()).unwrap()),
+        head.block.clone(),
+        head.qc.clone(),
+        reloaded,
+        Some(sim.nodes[0].safety_state()),
+        std::sync::Arc::new(StubExecutor),
+    );
+    let tip = resumed.tip_ledger();
+    assert_eq!(tip.height(), h, "the resumed tip ledger must sit at the head block's height");
+    assert_eq!(tip.timestamp_ms(), head.block.header.timestamp_ms);
+
+    // A freshly built bundle stamps `time` with the head height; it must be admissible.
+    let mut b = Bundle {
+        anchor: tip.root(),
+        nullifiers: [[9; 8], [10; 8]],
+        commitments: [[11; 8], [12; 8]],
+        fee: gas::BUNDLE_BASE,
+        burn: 0,
+        asset: 0,
+        time: h as u32,
+        envelopes: [env(), env()],
+        proof: vec![],
+    };
+    let d = StubExecutor.bundle_digest(&b.digest_input());
+    b.proof = StubExecutor::make_bundle_proof(&tip.hc_bundle(), &d);
+    let tx = Transaction::shielded(1, b, Action::None);
+    tip.validate(&tx, &StubExecutor).expect("a bundle timed at the head height is admissible after a restart");
+}
+
 #[test]
 fn late_starter_syncs_view_with_partner() {
     // Two validators: node 1 is offline while node 0 times out many views.

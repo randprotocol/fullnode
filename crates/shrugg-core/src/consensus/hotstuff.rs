@@ -81,12 +81,17 @@ impl HotStuff {
         if let Some(s) = &signer {
             assert!(cfg.validators.contains(&s.address()), "signer must be a validator");
         }
-        // A loaded ledger carries no block time: position it at the head block it was
-        // reloaded from, so RPC and the next proposal see the tip's time.
-        let mut head_ledger = head_ledger;
-        head_ledger.set_timestamp_ms(head.header.timestamp_ms);
+        // A loaded ledger carries neither block height nor block time (`Ledger::from_parts`
+        // starts both at 0, and equality ignores them): position it at the head block it was
+        // reloaded from, so RPC and the next proposal see the tip's time and — the reason this
+        // matters for admission — so `validate`'s `time` window (spec §7 step 5) is measured
+        // against the real head height. Without the height, every bundle submitted between a
+        // restart and the second new block is refused with `bundle time N is outside [0, 0]`.
         let head_hash = head.hash();
         let head_height = head.height();
+        let mut head_ledger = head_ledger;
+        head_ledger.set_height(head_height);
+        head_ledger.set_timestamp_ms(head.header.timestamp_ms);
         let mut tree = HashMap::new();
         tree.insert(head_hash, Entry { block: head, ledger_after: head_ledger.clone(), receipts: Vec::new() });
         let (view, high_qc, locked_qc, last_voted_view) = match safety {

@@ -1028,4 +1028,31 @@ mod tests {
         assert_eq!(err, BlockError::InvalidTx { index: 1, error: TxError::Spent([2; 8]) });
         assert_eq!(scratch, l, "unchanged on error");
     }
+
+    /// The positive counterpart: two bundles that share nothing both land in one block, even
+    /// though both are anchored at the root as it stood when the block started — the first
+    /// bundle's two new leaves move the tree, but an anchor is checked against the recorded
+    /// block-end roots, not against the mid-block root, so the second bundle is still valid.
+    #[test]
+    fn two_independent_bundles_anchored_at_the_block_start_root_both_apply() {
+        let l = ledger();
+        let (a, _) = keys();
+        let start_root = l.root();
+        let t1 = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let t2 = tx(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]]);
+        assert_eq!(t1.bundle.as_ref().unwrap().anchor, start_root);
+        assert_eq!(t2.bundle.as_ref().unwrap().anchor, start_root);
+
+        let mut scratch = l.clone();
+        let receipts = scratch.apply_transactions(&[t1, t2], &a.address(), &StubExecutor).unwrap();
+        assert!(receipts.is_empty(), "neither bundle carries a call");
+        for nf in [[1; 8], [2; 8], [5; 8], [6; 8]] {
+            assert!(scratch.is_spent(&nf), "nullifier {nf:?} not spent");
+        }
+        for cm in [[3; 8], [4; 8], [7; 8], [8; 8]] {
+            assert!(scratch.has_commitment(&cm), "commitment {cm:?} not appended");
+        }
+        assert_eq!(scratch.next_index(), 4, "four new leaves in tree order");
+        assert_eq!(scratch.validators()[&a.address()].rewards, 2 * gas::BUNDLE_BASE);
+    }
 }
