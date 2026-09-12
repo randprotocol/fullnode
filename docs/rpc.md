@@ -131,6 +131,22 @@ There is no `effect` field: effect kind 1 (the program-driven transfer to an acc
 with the accounts. A call's outputs are recorded and nothing else moves; value moves only through
 the bundle that paid for the call.
 
+### `shrugg_getCallEnvelope`
+Params: `[tx_hash]`. Result: `null`, or the call's input envelope (spec §6.1) in hex:
+
+```json
+{ "tx": "…", "kem_ct": "…", "to_sender": "…", "to_auditor": "…", "body": "…" }
+```
+
+`body` is the call's private input vector and its `H_IN` salt, sealed under a per-call key with
+the receipt's `H_IN` as associated data; `to_sender` wraps that key to the caller's outgoing
+viewing key and `kem_ct`/`to_auditor` to the auditor the caller named, both empty strings when
+there is none. The node holds no key that opens any of it and never looks inside — it is served
+so that a wallet with the caller's viewing key, a per-call key, or the auditor's key can open it
+(`shrugg_zkvm::call_envelope`) and check the transcript against `H_IN`. `null` means the call
+published no envelope (`--no-envelope`), the transaction is not a call, or this node has no
+receipt for that hash.
+
 ### `shrugg_estimateFee`
 Params: `[spec]`, one of `{"kind":"bundle"}`, `{"kind":"deploy","words":n}` or
 `{"kind":"call","tier":t}` (`t` one of 10, 12, 14, 16, 18, 20). Result: the minimum fee in units,
