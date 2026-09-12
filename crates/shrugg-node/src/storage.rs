@@ -818,6 +818,21 @@ impl Storage {
         // database: the database's copy is exactly what this check is auditing. Epoch 0 is the
         // genesis set by definition.
         let epoch_blocks = gs.epoch_blocks.max(1);
+        // Epoch 0 is the genesis set by definition, but `resume` reads its set from the stored
+        // row like any other epoch (`epoch_set(0)`) — so a corrupt row there would be invisible
+        // to everything below, which only ever consults `sets`, never the database's copy.
+        let epoch0_problem = match self.epoch_set(0) {
+            Ok(Some(stored)) if stored == gs.validators => None,
+            Ok(Some(_)) => Some("the stored validator set for epoch 0 is not the genesis set".to_string()),
+            Ok(None) => Some("no stored validator set for epoch 0".to_string()),
+            Err(e) => Some(format!("epoch 0 set unreadable: {e}")),
+        };
+        if let Some(problem) = epoch0_problem {
+            check.problem = Some(problem);
+            check.last_good = 0;
+            check.ledger = ledger.clone();
+            return Ok(check);
+        }
         let mut sets: BTreeMap<u64, ValidatorSet> = BTreeMap::new();
         sets.insert(0, gs.validators.clone());
         for h in 1..=head {
@@ -1657,6 +1672,28 @@ mod tests {
 
         // Writing what the replay does derive is what repairs it.
         s.commit(&[], &ledger, &[(1, epoch1)]).unwrap();
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+    }
+
+    /// Epoch 0 is seeded from `gs.validators` by definition, but `resume` reads its set from the
+    /// stored row like any other epoch — so a corrupt row there is invisible to a chain with no
+    /// epoch boundaries yet unless the audit compares the two. It must.
+    #[test]
+    fn verify_chain_rejects_a_tampered_epoch_0_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1), &key(2)], vec![], 2);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        let tampered = ValidatorSet::from_entries([(key(1).public_key(), shrugg_core::ledger::staking::MIN_STAKE)]);
+        s.commit(&[], &gs.ledger, &[(0, tampered)]).unwrap();
+        let c = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(c.last_good, 0);
+        assert!(c.problem.as_deref().unwrap_or_default().contains("epoch 0"), "{:?}", c.problem);
+
+        // Writing the genesis set back is what repairs it.
+        s.commit(&[], &gs.ledger, &[(0, gs.validators.clone())]).unwrap();
         assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
     }
 

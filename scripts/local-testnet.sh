@@ -13,8 +13,8 @@ WALLET=target/release/shrugg
 [ -f testnet/payout.key.json ] || $WALLET --key testnet/payout.key.json keygen
 PAYOUT=$($WALLET --key testnet/payout.key.json address | tail -1)
 [ -f testnet/genesis.json ] || $BIN genesis --chain-id 1 \
-    --validator testnet/node1.key.json --payout "$PAYOUT" \
-    --validator testnet/node2.key.json --payout "$PAYOUT" --out testnet/genesis.json
+    --validator "testnet/node1.key.json,1000,$PAYOUT" \
+    --validator "testnet/node2.key.json,1000,$PAYOUT" --out testnet/genesis.json
 [ -d testnet/data1/db ] || $BIN init --datadir testnet/data1 --genesis testnet/genesis.json
 [ -d testnet/data2/db ] || $BIN init --datadir testnet/data2 --genesis testnet/genesis.json
 $BIN run --datadir testnet/data1 --key testnet/node1.key.json --validator \
