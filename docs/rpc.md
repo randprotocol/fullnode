@@ -124,8 +124,14 @@ proves against).
 Params: `[tx_hash]`. Result: `null` until the call is committed, then
 
 ```json
-{ "tx": "…", "program": "…", "tier": 14, "outputs": [1, 0, 25, 0, 0, 0, 0, 0], "height": 17, "index": 0 }
+{ "tx": "…", "program": "…", "tier": 14, "outputs": [1, 0, 25, 0, 0, 0, 0, 0], "height": 17,
+  "index": 0, "h_in": "9c0e…7f" }
 ```
+
+`h_in` is the proof's public commitment to the call's *private* inputs (`Word8` hex, zkVM M4.1).
+It discloses nothing on its own — it is a salted digest — and it is what a call-input envelope is
+sealed against, so a holder needs it to open one (`shrugg_getCallEnvelope`) and to check an
+opened transcript with `hash::input_digest(salt, inputs)`.
 
 There is no `effect` field: effect kind 1 (the program-driven transfer to an account) was deleted
 with the accounts. A call's outputs are recorded and nothing else moves; value moves only through
@@ -135,11 +141,12 @@ the bundle that paid for the call.
 Params: `[tx_hash]`. Result: `null`, or the call's input envelope (spec §6.1) in hex:
 
 ```json
-{ "tx": "…", "kem_ct": "…", "to_sender": "…", "to_auditor": "…", "body": "…" }
+{ "tx": "…", "h_in": "9c0e…7f", "kem_ct": "…", "to_sender": "…", "to_auditor": "…", "body": "…" }
 ```
 
-`body` is the call's private input vector and its `H_IN` salt, sealed under a per-call key with
-the receipt's `H_IN` as associated data; `to_sender` wraps that key to the caller's outgoing
+`h_in` is the receipt's, repeated here so one request is enough to open the envelope. `body` is
+the call's private input vector and its `H_IN` salt, sealed under a per-call key with that
+`h_in` as associated data; `to_sender` wraps that key to the caller's outgoing
 viewing key and `kem_ct`/`to_auditor` to the auditor the caller named, both empty strings when
 there is none. The node holds no key that opens any of it and never looks inside — it is served
 so that a wallet with the caller's viewing key, a per-call key, or the auditor's key can open it

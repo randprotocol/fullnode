@@ -43,19 +43,28 @@ type Ek = ml_kem::ml_kem_768::EncapsulationKey;
 type KemCt = ml_kem::ml_kem_768::Ciphertext;
 
 /// Longest private-input vector a call may seal a transcript for (spec §6.1). The cap is the
-/// program's, not the envelope's: 4096 words is 16 KiB of plaintext, which the ledger's
-/// [`MAX_CALL_ENVELOPE_BYTES`] accommodates for an unaudited call. Adding an auditor costs an
-/// ML-KEM-768 ciphertext (1088 bytes) on top, so the largest *audited* vector is smaller; both
-/// limits are enforced by [`seal_call_envelope`] rather than discovered when a block refuses
-/// the transaction.
+/// program's, not the envelope's: 4096 words is 16 KiB of plaintext, and the ledger's
+/// [`MAX_CALL_ENVELOPE_BYTES`] is sized to admit that much *plus* the auditor parts (see that
+/// constant's table). [`seal_call_envelope`] enforces this one, so a wallet learns about an
+/// over-long input vector before it pays for a proof rather than when a block refuses the
+/// transaction; `executor::prove_call` enforces it one step earlier still.
 pub const MAX_CALL_INPUT_WORDS: usize = 4096;
 
 /// The per-call disclosure key, `K_call`. Handing it over discloses exactly one call's inputs.
 ///
 /// Fresh per envelope, drawn from OS entropy by [`seal_call_envelope`] — it is never derived
 /// from the caller's keys, so giving one away says nothing about any other call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct CallKey(pub [u8; 32]);
+
+/// Redacting: a disclosure key is exactly as secret as what it opens, and a wallet that logs
+/// its structs, a panic message or a test failure must not be the way one escapes. The bytes
+/// are reachable through the public field, deliberately and visibly.
+impl std::fmt::Debug for CallKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CallKey(<redacted>)")
+    }
+}
 
 impl CallKey {
     pub fn random() -> CallKey {
@@ -150,14 +159,27 @@ pub fn seal_call_envelope(
             (ct.to_vec(), seal(&ss, AAD_AUDITOR, &key.0))
         }
     };
+    // An envelope whose transcript is not the one `h_in` commits to is a lie the chain cannot
+    // detect and only a holder who decrypts ever will — which is the design (spec §6.1), but it
+    // is never what a wallet *meant* to do. Caught in debug builds, where the extra Poseidon2
+    // hash is free; left alone in release so a deliberately false envelope stays constructible
+    // (the case `call_envelope_is_faithful` exists to expose). Placed after the checks above so
+    // a malformed auditor address is still an error rather than a panic.
+    debug_assert!(
+        call_envelope_is_faithful(h_in, salt, inputs),
+        "sealing a transcript that is not the preimage of this call's H_IN"
+    );
     let envelope = CallEnvelope {
         kem_ct,
         to_sender: seal(&caller.ovk(), AAD_SENDER, &key.0),
         to_auditor,
         body: seal(&key.0, &body_aad(h_in), &plaintext(salt, inputs)),
     };
-    // The ledger's cap is the reason the wallet is told now rather than by a rejected block:
-    // the proof is already paid for by the time an envelope is sealed.
+    // Belt and braces: with `MAX_CALL_INPUT_WORDS` words and an auditor the four parts come to
+    // 17 636 bytes, inside `MAX_CALL_ENVELOPE_BYTES`, so this cannot fire for any input the
+    // check above admits. It is here because the two constants live in different crates and a
+    // wallet must learn about a mismatch now — the proof is already paid for by this point —
+    // rather than from a rejected block.
     if envelope.len() > MAX_CALL_ENVELOPE_BYTES {
         return Err(format!(
             "the sealed call envelope is {} bytes, over the {MAX_CALL_ENVELOPE_BYTES}-byte cap; \
@@ -213,19 +235,21 @@ mod tests {
         let caller = SpendKey([1; 8]).viewing_key();
         let auditor = crate::address::address_of(&SpendKey([2; 8]).viewing_key());
         let inputs = [4u32, 5, 6];
-        let (e, key) = seal_call_envelope(&caller, Some(&auditor), &[9; 8], [1, 2, 3, 4], &inputs).unwrap();
+        let h = crate::hash::input_digest([1, 2, 3, 4], &inputs);
+        let (e, key) = seal_call_envelope(&caller, Some(&auditor), &h, [1, 2, 3, 4], &inputs).unwrap();
         assert_eq!(e.kem_ct.len(), 1088, "an ML-KEM-768 ciphertext");
         assert_eq!(e.to_sender.len(), 12 + 32 + 16, "nonce + K_call + tag");
         assert_eq!(e.to_auditor.len(), 12 + 32 + 16);
         assert_eq!(e.body.len(), 12 + 16 + 4 * inputs.len() + 16, "nonce + salt + inputs + tag");
         // The body's plaintext is the salt words followed by the input words, and nothing else.
-        let pt = open(&key.0, &body_aad(&[9; 8]), &e.body).unwrap();
+        let pt = open(&key.0, &body_aad(&h), &e.body).unwrap();
         assert_eq!(&pt[..16], &words_to_bytes(&[1u32, 2, 3, 4])[..]);
         assert_eq!(&pt[16..], &words_to_bytes(&inputs)[..]);
         assert_eq!(parse_plaintext(&pt), Some(([1, 2, 3, 4], inputs.to_vec())));
         // A zero-input call is still a well-formed transcript: the salt alone.
-        let (e, key) = seal_call_envelope(&caller, None, &[9; 8], [1, 2, 3, 4], &[]).unwrap();
-        assert_eq!(open_call_with_key(&e, &[9; 8], &key), Some(([1, 2, 3, 4], Vec::new())));
+        let h = crate::hash::input_digest([1, 2, 3, 4], &[]);
+        let (e, key) = seal_call_envelope(&caller, None, &h, [1, 2, 3, 4], &[]).unwrap();
+        assert_eq!(open_call_with_key(&e, &h, &key), Some(([1, 2, 3, 4], Vec::new())));
     }
 
     /// Truncated or mis-shaped plaintexts are rejected rather than silently reinterpreted.
@@ -240,10 +264,13 @@ mod tests {
     #[test]
     fn every_call_gets_a_fresh_key() {
         let caller = SpendKey([3; 8]).viewing_key();
-        let (a, ka) = seal_call_envelope(&caller, None, &[1; 8], [0; 4], &[1]).unwrap();
-        let (b, kb) = seal_call_envelope(&caller, None, &[1; 8], [0; 4], &[1]).unwrap();
+        let h = crate::hash::input_digest([0; 4], &[1]);
+        let (a, ka) = seal_call_envelope(&caller, None, &h, [0; 4], &[1]).unwrap();
+        let (b, kb) = seal_call_envelope(&caller, None, &h, [0; 4], &[1]).unwrap();
         assert_ne!(ka, kb);
         assert_ne!(a.body, b.body, "a fresh key and a fresh nonce per envelope");
-        assert_eq!(open_call_with_key(&a, &[1; 8], &kb), None, "one call's key opens one call");
+        assert_eq!(open_call_with_key(&a, &h, &kb), None, "one call's key opens one call");
+        // A key never prints itself, however it is formatted.
+        assert_eq!(format!("{ka:?}"), "CallKey(<redacted>)");
     }
 }

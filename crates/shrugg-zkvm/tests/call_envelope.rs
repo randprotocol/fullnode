@@ -6,13 +6,16 @@
 //! what makes an envelope trustworthy is the AEAD binding to the proof's public `H_IN` plus the
 //! holder's own `input_digest` recomputation, and those are what this file pins.
 
+use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::notes::{ShieldedAddress, Word8};
+use shrugg_core::program::ProgramRecord;
+use shrugg_core::types::MAX_CALL_ENVELOPE_BYTES;
 use shrugg_zkvm::address::address_of;
 use shrugg_zkvm::call_envelope::{
     call_envelope_is_faithful, open_call_as_auditor, open_call_as_sender, open_call_with_key, seal_call_envelope,
     CallKey, MAX_CALL_INPUT_WORDS,
 };
-use shrugg_zkvm::executor::prove_call;
+use shrugg_zkvm::executor::{prove_call, ZkExecutor};
 use shrugg_zkvm::hash::input_digest;
 use shrugg_zkvm::machine::{Backend, FriProfile, Proof};
 use shrugg_zkvm::notes::{SpendKey, ViewingKey};
@@ -115,31 +118,29 @@ fn faithfulness_is_the_digest_recomputation() {
     assert!(!call_envelope_is_faithful(&h, SALT, &lied), "a single flipped word is not");
 }
 
-/// Both caps the wallet must respect are enforced where the envelope is built, so a caller
-/// never pays for a proof and then finds the transaction rejected: the spec's 4096-word input
-/// vector, and the ledger's byte cap on the four parts together.
+/// The spec's 4096-word input cap is enforced where the envelope is built, so a caller never
+/// pays for a proof and then finds the transaction rejected — and the largest envelope that cap
+/// admits, auditor included, is inside the ledger's byte cap with room to spare.
 #[test]
-fn sealing_refuses_an_input_vector_past_the_spec_cap_or_the_byte_cap() {
+fn sealing_refuses_an_input_vector_past_the_spec_cap_and_the_largest_one_still_fits() {
     let caller = vk(41);
+    let auditor = address_of(&vk(42));
     let too_many = vec![0u32; MAX_CALL_INPUT_WORDS + 1];
     let err = seal_call_envelope(&caller, None, &[0; 8], SALT, &too_many).unwrap_err();
-    assert!(err.contains("4096"), "{err}");
+    assert!(err.contains(&MAX_CALL_INPUT_WORDS.to_string()), "{err}");
 
-    // The largest permitted vector fits the byte cap on its own …
     let full = vec![0u32; MAX_CALL_INPUT_WORDS];
-    let (env, _) = seal_call_envelope(&caller, None, &[0; 8], SALT, &full).unwrap();
-    assert!(env.len() <= shrugg_core::types::MAX_CALL_ENVELOPE_BYTES, "{} bytes", env.len());
-
-    // … but not once an ML-KEM-768 ciphertext for an auditor is added, so that combination is
-    // refused here rather than by a block (see the module doc comment).
-    let auditor = address_of(&vk(42));
-    let err = seal_call_envelope(&caller, Some(&auditor), &[0; 8], SALT, &full).unwrap_err();
-    assert!(err.contains("17000") || err.contains("17_000"), "{err}");
-
-    // The largest vector an audited call can carry does fit.
-    let audited = vec![0u32; 3937];
-    let (env, _) = seal_call_envelope(&caller, Some(&auditor), &[0; 8], SALT, &audited).unwrap();
-    assert!(env.len() <= shrugg_core::types::MAX_CALL_ENVELOPE_BYTES, "{} bytes", env.len());
+    let (env, _) = seal_call_envelope(&caller, Some(&auditor), &h_in(SALT, &full), SALT, &full).unwrap();
+    // nonce + salt + inputs + tag, an ML-KEM-768 ciphertext, and two nonce + key + tag wraps.
+    let expected = (12 + 16 + 4 * MAX_CALL_INPUT_WORDS + 16) + 1088 + 2 * (12 + 32 + 16);
+    assert_eq!(env.len(), expected, "the worst case the format can produce");
+    assert!(
+        expected <= MAX_CALL_ENVELOPE_BYTES,
+        "the ledger's {MAX_CALL_ENVELOPE_BYTES}-byte cap must admit {expected}"
+    );
+    // Unaudited, the same vector is two wraps and a KEM ciphertext smaller.
+    let (bare, _) = seal_call_envelope(&caller, None, &h_in(SALT, &full), SALT, &full).unwrap();
+    assert_eq!(bare.len(), expected - 1088 - 60);
 }
 
 /// A malformed auditor address is an error, not a panic inside ML-KEM.
@@ -147,7 +148,7 @@ fn sealing_refuses_an_input_vector_past_the_spec_cap_or_the_byte_cap() {
 fn a_wrong_length_auditor_key_is_reported() {
     let caller = vk(51);
     let bad = ShieldedAddress { pk: [1; 8], kem_ek: vec![0; 7] };
-    let err = seal_call_envelope(&caller, Some(&bad), &[0; 8], SALT, &[1, 2]).unwrap_err();
+    let err = seal_call_envelope(&caller, Some(&bad), &h_in(SALT, &[1, 2]), SALT, &[1, 2]).unwrap_err();
     assert!(err.contains("7 bytes"), "{err}");
 }
 
@@ -176,4 +177,35 @@ fn prove_call_returns_the_salt_behind_the_proofs_h_in() {
     // Two calls never share a salt: the freshness `H_IN`'s hiding rests on.
     let (_, _, _, salt2) = prove_call(FriProfile::Test, &program, &inputs, Some(10), Backend::Cpu).unwrap();
     assert_ne!(salt, salt2);
+
+    // And the chain-side verifier publishes that same `H_IN` on the call's outcome, which is
+    // what puts it on the receipt and makes the envelope openable at all (spec §6.1).
+    let executor = ZkExecutor::new(FriProfile::Test);
+    let code_hash = executor.check_program(program.base_pc, &program.words).unwrap();
+    let record = ProgramRecord {
+        id: shrugg_core::program::program_id(program.base_pc, &program.words),
+        base_pc: program.base_pc,
+        words: program.words.clone(),
+        code_hash,
+        deployed_at: 0,
+    };
+    let outcome = executor.verify_call(&record, &bytes).expect("the proof this test just produced");
+    assert_eq!(outcome.h_in, input_digest(salt, &inputs), "the receipt's H_IN is the transcript's digest");
+    assert_eq!(outcome.outputs, outputs);
+    assert_eq!(outcome.tier, 10);
+}
+
+/// An input vector no call may prove is refused before the prover is started, not after minutes
+/// of proving produce an envelope that cannot be published.
+#[test]
+fn prove_call_refuses_an_input_vector_past_the_cap_before_proving() {
+    let err = prove_call(
+        FriProfile::Test,
+        &shrugg_zkvm::guests::fib(10),
+        &vec![0; MAX_CALL_INPUT_WORDS + 1],
+        Some(10),
+        Backend::Cpu,
+    )
+    .unwrap_err();
+    assert!(err.contains(&MAX_CALL_INPUT_WORDS.to_string()), "{err}");
 }

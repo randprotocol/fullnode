@@ -134,6 +134,9 @@ pub struct CallReceiptData {
     pub program: ProgramId,
     pub tier: u8,
     pub outputs: [u32; 8],
+    /// `H_IN`, the verified proof's public commitment to the call's private inputs — what the
+    /// envelope below is sealed against (spec §6.1).
+    pub h_in: Word8,
     /// The call's input envelope, carried through to the receipt unread (spec §6.1); see
     /// [`call_envelope`] for the one rule the chain applies to it.
     pub input_envelope: Option<crate::types::CallEnvelope>,
@@ -578,6 +581,7 @@ impl Ledger {
                     program: *program,
                     tier: o.tier,
                     outputs: o.outputs,
+                    h_in: o.h_in,
                     input_envelope: input_envelope.clone(),
                 });
             }
@@ -659,6 +663,7 @@ impl Ledger {
                 outputs: r.outputs,
                 height: block.height(),
                 index: index as u32,
+                h_in: r.h_in,
                 input_envelope: r.input_envelope,
             })
             .collect())
@@ -1148,11 +1153,11 @@ mod tests {
         let fee = gas::BUNDLE_BASE + gas::call_fee(12);
         let envelope = |body: usize| crate::types::CallEnvelope {
             kem_ct: vec![1; 1088],
-            to_sender: vec![2; 48],
-            to_auditor: vec![3; 48],
+            to_sender: vec![2; 60],
+            to_auditor: vec![3; 60],
             body: vec![4; body],
         };
-        let fits = crate::types::MAX_CALL_ENVELOPE_BYTES - (1088 + 48 + 48);
+        let fits = crate::types::MAX_CALL_ENVELOPE_BYTES - (1088 + 60 + 60);
         for (n, input_envelope, expect) in [
             (10u32, None, Ok(())),
             (20, Some(envelope(16)), Ok(())),

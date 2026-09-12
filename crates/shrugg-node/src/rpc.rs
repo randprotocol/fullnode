@@ -213,7 +213,9 @@ fn block_json(b: &shrugg_core::Block) -> Value {
 
 /// What a block explorer can say about a transaction — which is, deliberately, almost nothing:
 /// the bundle's public fields (none of which name a party) and the shape of its action. Envelope
-/// and proof are reported by length only; anyone who wants the bytes can fetch the block.
+/// and proof are reported by length only; anyone who wants the bytes can fetch the block, and a
+/// call's public input commitment `H_IN` — the one thing a holder needs to open its input
+/// envelope — is served on the receipt (`shrugg_getReceipt`, `shrugg_getCallEnvelope`).
 /// A bundle's public fields — none of which names a party. Used for the transaction's own
 /// bundle and, since S3's `BridgeBurn`, for the asset bundle riding inside the action.
 fn bundle_json(b: &shrugg_core::Bundle) -> Value {
@@ -414,7 +416,12 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .map(|r| {
                     json!({
                         "tx": r.tx.to_hex(), "program": r.program.to_hex(), "tier": r.tier, "outputs": r.outputs,
-                        "height": r.height, "index": r.index
+                        "height": r.height, "index": r.index,
+                        // The proof's public commitment to the call's private inputs. Public
+                        // like every other receipt field, and the associated data a call-input
+                        // envelope is sealed against: without it `shrugg_getCallEnvelope`'s
+                        // bytes could not be opened by anyone (spec §6.1).
+                        "h_in": word8_to_hex(&r.h_in),
                     })
                 })
                 .unwrap_or(Value::Null))
@@ -430,10 +437,13 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .storage
                 .receipt(&h)
                 .map_err(RpcError::internal)?
-                .and_then(|r| r.input_envelope.map(|e| (r.tx, e)))
-                .map(|(tx, e)| {
+                .and_then(|r| r.input_envelope.map(|e| (r.tx, r.h_in, e)))
+                .map(|(tx, h_in, e)| {
                     json!({
                         "tx": tx.to_hex(),
+                        // Repeated from the receipt so one request is enough to open the
+                        // envelope: it is the AEAD associated data every part below is bound to.
+                        "h_in": word8_to_hex(&h_in),
                         "kem_ct": hex::encode(&e.kem_ct),
                         "to_sender": hex::encode(&e.to_sender),
                         "to_auditor": hex::encode(&e.to_auditor),
@@ -793,6 +803,7 @@ mod tests {
             let b = bundle_tx(&ledger, nfs, cms, fee).bundle.expect("bundle_tx always carries one");
             Transaction::shielded(gs.chain_id, b, action)
         };
+        let h_in: Word8 = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         let envelope = shrugg_core::types::CallEnvelope {
             kem_ct: vec![0xab; 1088],
             to_sender: vec![0xcd; 60],
@@ -806,7 +817,7 @@ mod tests {
             call_fee,
             Action::Call {
                 program: pid,
-                proof: StubExecutor::make_proof(&pid, 12, [7; 8]),
+                proof: StubExecutor::make_proof_with_h_in(&pid, 12, [7; 8], h_in),
                 input_envelope: Some(envelope.clone()),
             },
         );
@@ -828,6 +839,8 @@ mod tests {
 
         let v = ok(&st, "shrugg_getCallEnvelope", json!([sealed.hash().to_hex()])).await;
         assert_eq!(v["tx"], sealed.hash().to_hex());
+        // The associated data the four parts below are bound to: without it nothing opens.
+        assert_eq!(v["h_in"], word8_to_hex(&h_in));
         assert_eq!(v["kem_ct"], hex::encode(&envelope.kem_ct));
         assert_eq!(v["to_sender"], hex::encode(&envelope.to_sender));
         assert_eq!(v["to_auditor"], hex::encode(&envelope.to_auditor));
@@ -837,6 +850,10 @@ mod tests {
         // separate, explicit request.
         let r = ok(&st, "shrugg_getReceipt", json!([sealed.hash().to_hex()])).await;
         assert_eq!((&r["program"], &r["tier"], &r["height"]), (&json!(pid.to_hex()), &json!(12), &json!(1)));
+        assert_eq!(r["h_in"], word8_to_hex(&h_in), "the receipt carries H_IN whether or not there is an envelope");
+        assert!(r["kem_ct"].is_null(), "the transcript itself is a separate request");
+        let bare_receipt = ok(&st, "shrugg_getReceipt", json!([bare.hash().to_hex()])).await;
+        assert_eq!(bare_receipt["h_in"], word8_to_hex(&[0; 8]));
 
         // A call that forfeited disclosure, a transaction that is not a call, and a hash the
         // chain has never seen are all null rather than errors.

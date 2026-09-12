@@ -12,11 +12,22 @@ use serde::{Deserialize, Serialize};
 
 /// Largest call-input envelope accepted in a `Call` transaction (spec §6.1).
 ///
-/// A call's private input vector is capped at 4096 words, so the sealed body is at most
-/// 16 KiB of plaintext plus a 12-byte nonce, a 16-byte salt and a 16-byte Poly1305 tag; the
-/// key-wrapping parts (`kem_ct`, `to_sender`, `to_auditor`) add an ML-KEM-768 ciphertext and
-/// two 48-byte wraps. 17 000 bytes leaves room for all of it and nothing beyond.
-pub const MAX_CALL_ENVELOPE_BYTES: usize = 17_000;
+/// The arithmetic, for the largest envelope the format can produce — a 4096-word input vector
+/// (the spec's cap) sealed for both the caller and an auditor:
+///
+/// | part | bytes |
+/// |---|---|
+/// | `body` = nonce 12 + salt 16 + inputs 4 × 4096 + Poly1305 tag 16 | 16 428 |
+/// | `kem_ct`, an ML-KEM-768 ciphertext | 1 088 |
+/// | `to_sender` = nonce 12 + key 32 + tag 16 | 60 |
+/// | `to_auditor`, the same shape | 60 |
+/// | **total** | **17 636** |
+///
+/// 18 432 bytes (18 KiB) is the next round number above that: it admits every envelope an
+/// honest wallet can build and nothing appreciably beyond. (An earlier 17 000 came from
+/// costing the two key wraps at 48 bytes, which forgot their 12-byte nonces and would have
+/// refused a fully-loaded audited call.)
+pub const MAX_CALL_ENVELOPE_BYTES: usize = 18_432;
 
 /// A validator's first appearance in the register (spec §8): the Dilithium2 key that signs its
 /// later staking actions and the shielded address its rewards are paid to. `signature` is over

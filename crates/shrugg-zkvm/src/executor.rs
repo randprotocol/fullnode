@@ -116,13 +116,18 @@ impl ZkExecutor {
         {
             return Err(ConfidentialError::InvalidProof("degree bits".into()));
         }
-        // The eight published output words are read as `u32`s by both callers; a slot outside 32
-        // bits cannot come from an honest trace (an output is a register word).
+        // The eight published output words are read as `u32`s by both callers, and since S3 so
+        // are the eight `H_IN` words (`CallOutcome::h_in`, which a call receipt publishes); a
+        // slot outside 32 bits cannot come from an honest trace — an output is a register word
+        // and `H_IN` is a digest encoded as byte sums.
         if proof.public_values.len() != pv::NUM {
             return Err(ConfidentialError::MalformedProof);
         }
         if proof.public_values[pv::OUT0..pv::OUT0 + 8].iter().any(|v| *v > u32::MAX as u64) {
             return Err(ConfidentialError::InvalidProof("output not a u32".into()));
+        }
+        if proof.public_values[pv::IN0..pv::IN0 + 8].iter().any(|v| *v > u32::MAX as u64) {
+            return Err(ConfidentialError::InvalidProof("H_IN word not a u32".into()));
         }
         Ok(proof)
     }
@@ -225,7 +230,11 @@ impl ConfidentialExecutor for ZkExecutor {
         let hc = Self::hc_of(record)?;
         self.machine.verify(&hc, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
         let outputs = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
-        Ok(CallOutcome { tier: proof.tier.0 as u8, outputs })
+        // M4.1/S3: `H_IN` travels to the receipt so a call-input envelope sealed against it can
+        // be opened and checked later (spec §6.1). `decode_and_check` has already refused a
+        // proof whose `IN0..7` are not `u32`s, so the narrowing below cannot silently truncate.
+        let h_in = std::array::from_fn(|i| proof.public_values[pv::IN0 + i] as u32);
+        Ok(CallOutcome { tier: proof.tier.0 as u8, outputs, h_in })
     }
 
     fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
@@ -341,6 +350,16 @@ pub fn prove_call(
     tier: Option<u8>,
     backend: Backend,
 ) -> Result<(Vec<u8>, [u32; 8], u8, [u32; 4]), String> {
+    // The envelope this proof is for cannot carry more than the spec's input cap, and proving
+    // is minutes: refuse now rather than after the work is done (`call_envelope`'s own check is
+    // the same one, reached by a caller that seals without proving).
+    if inputs.len() > crate::call_envelope::MAX_CALL_INPUT_WORDS {
+        return Err(format!(
+            "a call may prove at most {} input words, got {}",
+            crate::call_envelope::MAX_CALL_INPUT_WORDS,
+            inputs.len()
+        ));
+    }
     match backend {
         Backend::Cpu => {
             use rand::RngExt;
