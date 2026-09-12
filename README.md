@@ -12,9 +12,9 @@ chain with a proof instead of their inputs.
 | Consensus | chained HotStuff BFT, stake-weighted quorums (more than 2/3), round-robin leaders, three-chain commit, view synchronisation, exponential timeouts |
 | Signatures / hashes | Dilithium2 (post-quantum) / BLAKE3 for validators and blocks; Poseidon2 for notes, the tree and nullifiers; ML-KEM-768 + ChaCha20-Poly1305 for note envelopes |
 | Networking | libp2p 0.54: TCP + Noise + Yamux, gossipsub, Kademlia + bootstrap list, mDNS on LANs, request-response block sync, ping keepalive, automatic redial |
-| Ledger | shielded note pool: a depth-32 Poseidon2 commitment tree, a nullifier set, 2-in-2-out proved bundles, public fees to the proposer's register entry, BLAKE3 Merkle state root over tree, nullifiers, validators and programs |
+| Ledger | shielded note pool: a depth-32 Poseidon2 commitment tree, a nullifier set, 2-in-2-out proved bundles, public fees to the proposer's register entry, BLAKE3 Merkle state root over tree, nullifiers, validators and programs, plus the bridge on a bridged chain |
 | Wallet keys | a 256-bit spend key; viewing key, note-owner field, nullifier key, outgoing viewing key, ML-KEM-768 decapsulation key and `shrugg1…` address all derived from it |
-| Bridged assets | parked: the guardian bridge returns in phase S3, with bridged assets as notes (`docs/bridge.md`) |
+| Bridged assets | the guardian bridge as notes: a bridged holding is a note whose `asset` word is the registry's index, an attestation deposits one note the chain computes itself, and a burn is the chain's one two-bundle transaction (`docs/bridge.md`) |
 | Confidential computation | Rand zkVM: RV32I under a Plonky3 batch STARK (Goldilocks, Poseidon2, ZK-hiding FRI); programs deployed on chain, calls carry a proof + 8 public outputs, gas by tier, and pay through a bundle like everything else |
 | Storage | one RocksDB per node with column families for blocks, certificates, indexes, notes, nullifiers, anchors, validators, programs and receipts; fsynced commits; startup integrity check with truncate-and-resync |
 | Interfaces | JSON-RPC 2.0 over HTTP (`shrugg-node`), `shrugg` wallet CLI with a local prover, Rust client library |
@@ -239,19 +239,21 @@ Full detail in `docs/architecture.md`.
 | [docs/confidential.md](docs/confidential.md) | programs, calls, outputs, gas, privacy |
 | [docs/architecture.md](docs/architecture.md) | how the node works end to end: consensus, ledger, storage, networking, sync, and one confidential transaction followed from wallet to receipt |
 | [docs/zkvm-milestones.md](docs/zkvm-milestones.md) | the Rand zkVM milestone by milestone (M1–M4, CUDA backend): what was built and why |
-| [docs/bridge.md](docs/bridge.md) | the guardian bridge: trust model, wire format, guardian sets, state, transactions — **parked until phase S3** |
+| [docs/bridge.md](docs/bridge.md) | the guardian bridge: trust model, wire format, guardian sets, state, the two bridge actions, and what stays public |
 | [docs/deploy.md](docs/deploy.md) | multi-machine and cloud deployment, rebuilds, fault tests |
 | [deploy/README.md](deploy/README.md) | the live testnet: nodes, addresses, peer ids |
 | [docs/superpowers/specs](docs/superpowers/specs) | design specs (node, confidential computation, fully shielded pool) |
 
 ## Roadmap
 
-The shielded pool lands in three phases, each a hard fork (`docs/shielded.md` §7). **S1**, here, is
-the pool itself: notes, bundles, the wallet, the redacted RPC. **S2** adds staking on top of it —
-Bond, Unbond and Withdraw, epochs, and the validator rewards this release already accrues but
-cannot yet pay out — plus a local wallet commitment tree, so a wallet stops telling its node which
-leaf it is about to spend. **S3** brings the bridge back as notes and gives call inputs their own
-envelopes.
+The shielded pool lands in three phases, each a hard fork (`docs/shielded.md` §7). **S1** is the
+pool itself: notes, bundles, the wallet, the redacted RPC. **S3**, here, brings the bridge back as
+notes — a deposit is one note the chain computes from the amount the guardians signed, a burn is two
+bundles in one transaction — and gives call inputs their own envelopes, so a caller can disclose
+what a program ran on to an auditor, or to itself later, without publishing it. Still ahead:
+**S2**'s staking — Bond, Unbond and Withdraw, epochs, and the validator rewards this release already
+accrues but cannot yet pay out — plus a local wallet commitment tree, so a wallet stops telling its
+node which leaf it is about to spend.
 
 Not yet implemented beyond that: persistent per-program state and cross-program calls; a RISC-V
 compiler flow for programs (today: the built-in assembler or raw word files); slashing and jailing;

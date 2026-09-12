@@ -64,8 +64,11 @@ fresh commitment randomness, so writing the same allocation twice produces two d
 two different genesis hashes — a deterministic `r` would let anyone confirm a guess at a genesis
 note's owner and amount by recomputing the commitment. Cut a genesis once and keep the file.
 
-There is no `--bridge` either: `Genesis::build` rejects a bridge section outright until phase S3
-puts the bridge back on the shielded chain (`docs/bridge.md`).
+There is no `--bridge` flag either, but a bridged chain is cut from this file by hand: add a
+`bridge` section (`{"emitter": "<64 hex>", "guardians": ["<40 hex>"], "emitters": {"2": "<64 hex>"}}`)
+and `Genesis::build` validates it, commits it to the genesis hash, and the node persists and reloads
+it (`docs/bridge.md` §4). A guardian set and a per-chain emitter table belong with whoever holds the
+guardian keys rather than with this command.
 
 Genesis JSON shape:
 
@@ -85,6 +88,9 @@ Genesis JSON shape:
   "hc_bundle": "<64 hex: the bundle guest's digest this build implements>"
 }
 ```
+
+Two optional fields this command never writes may be added by hand, both part of the genesis hash:
+`bridge` (above) and `epoch_blocks` (blocks per staking epoch, default `1000`).
 
 `amount` is in smallest units and is public: it is what lets everyone add up the initial supply.
 Who owns the note is not — only the address the envelope was sealed to can open it. `hc_bundle`

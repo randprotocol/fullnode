@@ -48,7 +48,9 @@ in the mempool, and gossips it. Errors come back as code `-32000` with the reaso
 `bundle time 12 is outside [244, 500]`, `fee 1000000 below minimum 2000000`,
 `the bundle's digest is not what its proof published`, `invalid bundle proof: …`,
 `unknown program …`, `already in mempool`, `conflicts with a pending transaction over <nullifier>`,
-`faucet is disabled on this chain`.
+`faucet is disabled on this chain`, and for the bridge actions `bridge: attestation already
+consumed`, `the attestation names a different recipient`, `the attestation deposits under asset 2,
+and the transaction names 1`, `the burn's asset bundle burns 499, not amount + relayer fee = 500`.
 
 Acceptance is not commitment: poll `shrugg_getTransaction` until it returns a block.
 

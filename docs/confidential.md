@@ -180,17 +180,10 @@ budgets for this when a bundle's own note commitments and nullifiers (which have
 separately-managed disclosure story) sit downstream of a call whose `H_IN` the caller could later
 open.
 
-**The call-input envelope** (spec §6.1) is that opening, made durable. A caller who keeps the salt
-in its own head has a capability it loses with the next laptop, so `shrugg call` publishes the
-`(salt, inputs)` transcript on chain by default, sealed under a fresh per-call key: wrapped to the
-caller's outgoing viewing key, and to a `--auditor` address when one is named. The chain checks only
-its size (`MAX_CALL_ENVELOPE_BYTES`); what binds it to the call is the AEAD, whose associated data
-is the receipt's `H_IN`, and what makes an opened transcript *faithful* is that it hashes back to
-that `H_IN` — `shrugg open-call` checks exactly that, then re-runs the program on the recovered
-inputs so the receipt's outputs can be read against them. `--print-call-key` prints the per-call key,
-which opens that one call and nothing else; `--no-envelope` publishes none, and then nobody — the
-caller included, once the salt is gone — can ever open the call. `--cuda` cannot seal one: every
-backend but the CPU draws the `H_IN` salt inside the prover and never returns it.
+**The call-input envelope** (spec §6.1, phase S3) is that opening, made durable: a caller who keeps
+the salt in its own head has a capability it loses with the next laptop, so `shrugg call` publishes
+the `(salt, inputs)` transcript on chain by default, sealed so that the caller, a per-call key or a
+named auditor can open it later. See "Call input envelopes" below for the format and the rules.
 
 ## On-chain model
 
@@ -261,6 +254,76 @@ memory, branches taken, cycle count (padded to the tier), the `H_IN` salt itself
 *who called it and what they paid with*: the bundle publishes two nullifiers and two commitments
 and names nobody. Two proofs of the same run are different bytes (hiding commitments), so proofs do
 not fingerprint inputs.
+
+## Call input envelopes
+
+A call's private inputs are private because nothing published them — but the caller may want to be
+able to *show* them later: to an auditor, to a counterparty, to itself on another machine. `H_IN`
+makes that possible — it is a binding commitment to every word the guest read, and the salt is what
+keeps anyone else from opening it — so the capability lives exactly as long as the caller keeps the
+salt, which is to say not past the next laptop. The call-input envelope (spec §6.1) is that
+disclosure written to the chain instead.
+
+```
+Action::Call { program, proof, input_envelope: Option<CallEnvelope> }
+
+CallEnvelope { kem_ct: Vec<u8>, to_sender: Vec<u8>, to_auditor: Vec<u8>, body: Vec<u8> }
+```
+
+| part | bytes | what it is |
+|---|---|---|
+| `body` | 12 + 16 + 4·n + 16 | `salt \|\| inputs`, each word little-endian, sealed under a fresh per-call key `K_call` |
+| `to_sender` | 60 | `K_call` wrapped to the caller's outgoing viewing key (`ovk`) |
+| `kem_ct` | 1088 or 0 | an ML-KEM-768 encapsulation to the auditor's address, empty with no auditor |
+| `to_auditor` | 60 or 0 | `K_call` wrapped under that encapsulation's shared secret |
+
+Everything is ChaCha20-Poly1305 with a random 12-byte nonce prepended, and the domain tags
+(`shrugg-call-sender`, `shrugg-call-auditor`) are distinct from the note layer's, so no wrap of one
+kind is ever a wrap of another. `K_call` is drawn from OS entropy per envelope and is *not* derived
+from any other key: handing one over says nothing about any other call.
+
+**Three keys open it, and no more:**
+
+| key handed over | who holds it | what it opens |
+|---|---|---|
+| the caller's viewing key (through `ovk`) | the caller's wallet | every call that wallet made |
+| the per-call key `K_call` | the caller, and whoever it gave it to | that one call |
+| the auditor's viewing key | the auditor named when sealing | that one call |
+
+**What the chain does and does not do.** It checks the envelope's *size* and nothing else:
+`MAX_CALL_ENVELOPE_BYTES` = 18,432, sized to admit the 4096-word input cap plus the auditor parts
+(`call_envelope::validate`, step 7 of admission). It holds no key that opens any of it, never looks
+inside, and serves it verbatim to anyone who asks (`shrugg_getCallEnvelope`, alongside the receipt's
+`h_in`). The envelope is part of the transaction, so it is part of the transaction hash.
+
+**What binds an envelope to its call** is the AEAD: the body's associated data is the 32 bytes of
+`H_IN` as the receipt publishes them, so an envelope lifted onto another call authenticates for
+nobody. **What makes an opened transcript faithful** is the holder's own recomputation —
+`input_digest(salt, inputs) == H_IN` — because `H_IN` commits in-circuit to every word the guest
+read. A caller who seals a transcript that is not the preimage is not stopped by the chain; they are
+caught by whoever decrypts, who can show that decryption to anyone. `shrugg open-call` checks
+exactly this, then re-runs the program on the recovered inputs through the emulator so the receipt's
+outputs can be read against them.
+
+```bash
+shrugg call <id> --input 400 --input 250 --auditor shrugg1q9f…   # seals for the caller and the auditor
+shrugg call <id> --input 400 --print-call-key                    # also prints K_call
+shrugg call <id> --input 400 --no-envelope                       # publishes nothing
+shrugg open-call <txhash>                  # as the caller
+shrugg open-call <txhash> --as-auditor     # as the auditor
+shrugg open-call <txhash> --call-key <hex> # with the per-call key alone
+```
+
+`--no-envelope` is the deliberate opposite: nothing is published, and once the salt is gone nobody
+— the caller included — can ever open that call. `--cuda` cannot seal one either: every backend but
+the CPU draws the `H_IN` salt inside the prover and never returns it, so `shrugg call --cuda` fails
+unless `--no-envelope` is passed with it. The forfeit is always asked for explicitly; a call is never
+quietly downgraded to one.
+
+Covered end to end by `a_call_envelope_is_opened_by_the_caller_and_the_auditor_only`
+(`crates/shrugg-node/tests/cluster.rs`), which opens the bytes a *node* served as the caller and as
+the auditor, fails to open them as a fourth wallet, and catches both a tampered transcript (the
+faithfulness check) and a tampered ciphertext (the AEAD).
 
 ## Chains without confidential computation
 

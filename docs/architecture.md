@@ -554,9 +554,10 @@ through the real executor); full mode additionally re-checks every proposer sign
   in more detail than the constraint-set notes here.
 - `docs/shielded.md` — the user's guide to the pool: keys, what is published and what is not, the
   wallet commands, the RPC surface, the admission order, and what still leaks.
-- `docs/bridge.md` — the cross-chain bridge as it stood on the account chain. It is **not wired up
-  on the shielded chain**: `Genesis::build` rejects a bridge section, the bridge transaction kinds
-  and RPC methods are gone, and bridged balances come back as notes in phase S3.
+- `docs/bridge.md` — the cross-chain bridge, wired up on the shielded chain since phase S3: a
+  bridged holding is a note whose `asset` word is the registry's index for it, an attestation
+  deposits one note the chain computes itself, and a burn is the chain's one two-bundle transaction.
+  A chain turns it on with a `bridge` section in its genesis.
 - `docs/rpc.md` — every JSON-RPC method, including the ones this page names (`shrugg_getReceipt`,
   `shrugg_getProgram`, `shrugg_sendTransaction`, `shrugg_status`) with full parameter and result
   shapes.
