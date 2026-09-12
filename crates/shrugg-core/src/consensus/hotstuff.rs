@@ -1,10 +1,7 @@
-use super::{
-    Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, NewView, SafetyState,
-    MAX_CLOCK_SKEW_MS,
-};
+use super::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, NewView, SafetyState};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, Keypair};
-use crate::ledger::{BlockError, Ledger};
+use crate::ledger::Ledger;
 use crate::types::{Block, BlockHeader, QuorumCertificate, Transaction, Vote};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -84,12 +81,17 @@ impl HotStuff {
         if let Some(s) = &signer {
             assert!(cfg.validators.contains(&s.address()), "signer must be a validator");
         }
-        // A loaded ledger carries no block time; bridge validation against the
-        // tip would then see `now = 0` and treat every guardian set as fresh.
-        let mut head_ledger = head_ledger;
-        head_ledger.set_timestamp_ms(head.header.timestamp_ms);
+        // A loaded ledger carries neither block height nor block time (`Ledger::from_parts`
+        // starts both at 0, and equality ignores them): position it at the head block it was
+        // reloaded from, so RPC and the next proposal see the tip's time and — the reason this
+        // matters for admission — so `validate`'s `time` window (spec §7 step 5) is measured
+        // against the real head height. Without the height, every bundle submitted between a
+        // restart and the second new block is refused with `bundle time N is outside [0, 0]`.
         let head_hash = head.hash();
         let head_height = head.height();
+        let mut head_ledger = head_ledger;
+        head_ledger.set_height(head_height);
+        head_ledger.set_timestamp_ms(head.header.timestamp_ms);
         let mut tree = HashMap::new();
         tree.insert(head_hash, Entry { block: head, ledger_after: head_ledger.clone(), receipts: Vec::new() });
         let (view, high_qc, locked_qc, last_voted_view) = match safety {
@@ -206,8 +208,8 @@ impl HotStuff {
 
     // ---- inbound -----------------------------------------------------------
 
-    /// `now_ms` is the replica's wall clock, used only to bound how far ahead
-    /// a bridged chain's block timestamp may be (see [`MAX_CLOCK_SKEW_MS`]).
+    /// `now_ms` is the replica's wall clock, carried through to proposals so a leader never
+    /// stamps a block behind its parent.
     pub fn on_message(&mut self, msg: ConsensusMessage, now_ms: u64) -> Result<Vec<Action>, ConsensusError> {
         match msg {
             ConsensusMessage::Proposal(b) => self.on_proposal(b, now_ms),
@@ -254,22 +256,9 @@ impl HotStuff {
         if block.header.justify.view != parent.block.view() && !block.header.justify.is_genesis() {
             return Err(ConsensusError::BadJustify);
         }
-        // On a bridged chain the timestamp is consensus input, so it is bounded
-        // on both sides before we vote: never behind the parent (`apply_block`
-        // enforces the same rule, but rejecting here keeps an invalid proposal
-        // out of the tree without executing it), and never further than
-        // `MAX_CLOCK_SKEW_MS` ahead of this replica's clock, so a leader can
-        // neither revive an expired guardian set nor expire a live one. Chains
-        // without a bridge keep their previous validity rules exactly.
-        if parent.ledger_after.bridge().is_some() {
-            let (parent_ts, block_ts) = (parent.block.header.timestamp_ms, block.header.timestamp_ms);
-            if block_ts < parent_ts {
-                return Err(BlockError::TimestampRewind { parent: parent_ts, block: block_ts }.into());
-            }
-            if block_ts > now_ms.saturating_add(MAX_CLOCK_SKEW_MS) {
-                return Err(ConsensusError::TimestampTooFarAhead { block: block_ts, now: now_ms });
-            }
-        }
+        // The shielded chain reads no clock: `time` is bounded in block heights (spec §7
+        // item 5), so a block's timestamp constrains nothing a replica must agree on. A
+        // proposer still never moves it backwards (see `propose`).
 
         // Execute on top of the parent's state.
         if self.tree.len() >= self.cfg.max_tree_blocks {

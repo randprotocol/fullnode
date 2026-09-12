@@ -23,6 +23,7 @@ use crate::machine::{Backend, FriProfile, Machine, Proof, Tier, TIERS};
 use crate::tables::cpu::pv;
 use crate::tables::{input, program};
 use shrugg_core::confidential::{ConfidentialError, ConfidentialExecutor};
+use shrugg_core::notes::{BundleDigestInput, Word8};
 use shrugg_core::program::{CallOutcome, ProgramRecord};
 
 pub struct ZkExecutor {
@@ -66,6 +67,93 @@ impl ZkExecutor {
     /// comment).
     pub fn cached_keys(&self) -> usize {
         self.machine.cached_keys()
+    }
+
+    /// Decode a proof and run every check that must precede `Machine::verify` — the cheap,
+    /// purely structural ones, none of which touch the constraint system.
+    ///
+    /// All three declared heights (`tier`, `program_log_height`, `input_log_height`) are
+    /// attacker-chosen words inside the proof, and both the degree-bits comparison below and
+    /// `Machine`'s verifier-key lookup shift by them, so each has to be bounded before it is used
+    /// to size anything.
+    ///
+    /// `exact` is what separates the two callers. A *call* proof is against a program the chain
+    /// only knows the `hc` of, and whose private-input vector the chain never sees, so the two
+    /// heights are merely range-checked (`Machine::verify` then binds them cryptographically via
+    /// the program and input digests). A *bundle* proof is against one pinned guest with one
+    /// fixed input width, so both heights are known up front and anything else is a proof for a
+    /// different shape — rejected here rather than paying for a verifier key that could never
+    /// match.
+    fn decode_and_check(
+        &self,
+        proof: &[u8],
+        program_log_height: u8,
+        input_log_height: u8,
+        exact: bool,
+    ) -> Result<Proof, ConfidentialError> {
+        let proof: Proof = postcard::from_bytes(proof).map_err(|_| ConfidentialError::MalformedProof)?;
+        if !TIERS.contains(&proof.tier.0) {
+            return Err(ConfidentialError::InvalidProof("unknown tier".into()));
+        }
+        let program_ok = if exact {
+            proof.program_log_height == program_log_height
+        } else {
+            (program::MIN_LOG_HEIGHT..=program::MAX_LOG_HEIGHT).contains(&proof.program_log_height)
+        };
+        if !program_ok {
+            return Err(ConfidentialError::InvalidProof("program height out of range".into()));
+        }
+        let input_ok = if exact {
+            proof.input_log_height == input_log_height
+        } else {
+            (input::MIN_LOG_HEIGHT..=input::MAX_LOG_HEIGHT).contains(&proof.input_log_height)
+        };
+        if !input_ok {
+            return Err(ConfidentialError::InvalidProof("input height out of range".into()));
+        }
+        if proof.batch.degree_bits
+            != self.machine.log_ext_degrees_pub(proof.tier, proof.program_log_height, proof.input_log_height)
+        {
+            return Err(ConfidentialError::InvalidProof("degree bits".into()));
+        }
+        // The eight published output words are read as `u32`s by both callers; a slot outside 32
+        // bits cannot come from an honest trace (an output is a register word).
+        if proof.public_values.len() != pv::NUM {
+            return Err(ConfidentialError::MalformedProof);
+        }
+        if proof.public_values[pv::OUT0..pv::OUT0 + 8].iter().any(|v| *v > u32::MAX as u64) {
+            return Err(ConfidentialError::InvalidProof("output not a u32".into()));
+        }
+        Ok(proof)
+    }
+
+    /// The bundle guest (`guests::bundle`), the one program every shielded-pool proof on this
+    /// chain is against. Vendored verbatim from the research crate — see
+    /// `tests/shielded.rs`'s `RESEARCH_HC_BUNDLE_HEX`, which pins its digest to upstream's.
+    ///
+    /// Assembled once per process: `bundle_heights` below calls this on every bundle admission
+    /// (twice, in fact — `bundle_proof_digest` then `verify_bundle`), and re-running the
+    /// assembler for a 3811-word guest on each gossiped transaction is pure waste. The guest is
+    /// a compile-time constant, so a `OnceLock` is the whole of the cache invalidation story.
+    pub fn bundle_program() -> &'static Program {
+        static BUNDLE: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+        BUNDLE.get_or_init(crate::guests::bundle)
+    }
+
+    /// Digest of the vendored `bundle` guest — the value a genesis pins as `hc_bundle`.
+    pub fn hc_bundle() -> Word8 {
+        Self::bundle_program().digest()
+    }
+
+    /// The `(program_log_height, input_log_height)` a bundle proof must declare. Both are fixed:
+    /// the guest is one pinned program and its private-input vector is always
+    /// `notes::bundle_input::COUNT` words wide (a dummy input is a zero-amount note, not a
+    /// shorter witness — that is the whole point of the fixed 2-in-2-out shape).
+    fn bundle_heights() -> (u8, u8) {
+        (
+            program::program_log_height(Self::bundle_program().words.len()),
+            input::input_log_height(crate::notes::bundle_input::COUNT),
+        )
     }
 }
 
@@ -127,39 +215,60 @@ impl ConfidentialExecutor for ZkExecutor {
     }
 
     fn verify_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
-        let proof: Proof = postcard::from_bytes(proof).map_err(|_| ConfidentialError::MalformedProof)?;
         // `Machine::verify` bounds `proof.tier`/`proof.program_log_height`/`proof.input_log_height`
-        // itself before using any of them to size anything — but the degree-bits pre-check right
-        // below shifts by all three too, so it needs the same guard in front of it to avoid
-        // panicking on an attacker-chosen out-of-range value before ever reaching `verify`.
-        if !TIERS.contains(&proof.tier.0) {
-            return Err(ConfidentialError::InvalidProof("unknown tier".into()));
-        }
-        if !(program::MIN_LOG_HEIGHT..=program::MAX_LOG_HEIGHT).contains(&proof.program_log_height) {
-            return Err(ConfidentialError::InvalidProof("program height out of range".into()));
-        }
-        // M4.1: `proof.input_log_height` (the input table's declared height, the H_IN commitment
-        // that table proves) is just as untrusted as `proof.program_log_height` — bound it the
-        // same way before it sizes the degree-bits pre-check or the verifier-key lookup below.
-        if !(input::MIN_LOG_HEIGHT..=input::MAX_LOG_HEIGHT).contains(&proof.input_log_height) {
-            return Err(ConfidentialError::InvalidProof("input height out of range".into()));
-        }
-        if proof.batch.degree_bits
-            != self.machine.log_ext_degrees_pub(proof.tier, proof.program_log_height, proof.input_log_height)
-        {
-            return Err(ConfidentialError::InvalidProof("degree bits".into()));
-        }
+        // itself before using any of them to size anything — but the degree-bits pre-check inside
+        // `decode_and_check` shifts by all three too, so it needs the same guard in front of it to
+        // avoid panicking on an attacker-chosen out-of-range value before ever reaching `verify`.
+        // A call's heights are ranged, not exact: the chain knows neither the program's word count
+        // (only its `hc`) nor its private-input width.
+        let proof = self.decode_and_check(proof, 0, 0, false)?;
         let hc = Self::hc_of(record)?;
         self.machine.verify(&hc, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
-        let mut outputs = [0u32; 8];
-        for (i, o) in outputs.iter_mut().enumerate() {
-            let v = proof.public_values[pv::OUT0 + i];
-            if v > u32::MAX as u64 {
-                return Err(ConfidentialError::InvalidProof("output not a u32".into()));
-            }
-            *o = v as u32;
-        }
+        let outputs = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
         Ok(CallOutcome { tier: proof.tier.0 as u8, outputs })
+    }
+
+    fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
+        let mut msg = [0u32; 16];
+        msg[..8].copy_from_slice(left);
+        msg[8..].copy_from_slice(right);
+        crate::notes::hash(crate::notes::domain::NODE, &msg)
+    }
+
+    fn bundle_digest(&self, i: &BundleDigestInput) -> Word8 {
+        crate::notes::bundle_digest(
+            &i.anchor,
+            &i.nullifiers[0],
+            &i.nullifiers[1],
+            &i.commitments[0],
+            &i.commitments[1],
+            i.fee,
+            i.burn,
+            i.asset,
+            i.time,
+        )
+    }
+
+    fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+        let (plh, ilh) = Self::bundle_heights();
+        let p = self.decode_and_check(proof, plh, ilh, true)?;
+        Ok(std::array::from_fn(|k| p.public_values[pv::OUT0 + k] as u32))
+    }
+
+    fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<(), ConfidentialError> {
+        let (plh, ilh) = Self::bundle_heights();
+        let p = self.decode_and_check(proof, plh, ilh, true)?;
+        self.machine
+            .verify(hc_bundle, &p)
+            .map_err(|e| ConfidentialError::InvalidBundleProof(format!("{e:?}")))
+    }
+
+    /// The bundle guest's verifier key. Unlike `warm`, this needs no guessing: the guest is
+    /// pinned, so its `(tier, program_log_height, input_log_height)` is a single known triple —
+    /// tier 14, which is where the 3811-word guest's trace lands (`tests/shielded.rs` asserts it).
+    fn warm_bundle(&self) {
+        let (plh, ilh) = Self::bundle_heights();
+        let _ = self.machine.verifier_key(Tier(14), plh, ilh);
     }
 }
 
@@ -195,5 +304,35 @@ pub fn prove(
     let (proof, exec) = m
         .prove_with(backend, program, inputs, tier.map(|t| Tier(t as usize)))
         .map_err(|e| format!("{e:?}"))?;
+    Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
+}
+
+/// Wallet-side prover for a shielded bundle: proves `guests::bundle()` on `inputs` (built by
+/// `notes::bundle_inputs`) and returns (postcard proof bytes, the published bundle digest, tier).
+///
+/// The tier is not chosen here — `Machine::prove_with` picks the smallest one the trace fits, and
+/// the caller asserts what it got rather than pinning it, so a guest that grows past its tier is
+/// a visible failure instead of a silent prove error. Like `prove`, every path this delegates to
+/// draws a fresh per-proof `H_IN` salt from OS entropy internally; see `prove`'s doc comment for
+/// why that must not be weakened.
+///
+/// A bundle whose witness violates the relation still *proves* — the guest taints its `bad` word
+/// instead of failing — so a successful return here says nothing about admissibility. What it
+/// yields is a digest the ledger can recompute from the bundle's published plaintext
+/// (`ConfidentialExecutor::bundle_digest`); a tainted run's digest matches no such plaintext.
+pub fn prove_bundle(profile: FriProfile, inputs: &[u32], backend: Backend) -> Result<(Vec<u8>, Word8, u8), String> {
+    // The guest reads a fixed-width private-input vector (`notes::bundle_input::COUNT`); a
+    // shorter one makes the emulator read past the end and a longer one silently ignores the
+    // tail, so neither is a prove request that could ever produce an admissible bundle.
+    if inputs.len() != crate::notes::bundle_input::COUNT {
+        return Err(format!(
+            "bundle inputs must be exactly {} words, got {}",
+            crate::notes::bundle_input::COUNT,
+            inputs.len()
+        ));
+    }
+    let m = Machine::new(profile);
+    let program = ZkExecutor::bundle_program();
+    let (proof, exec) = m.prove_with(backend, program, inputs, None).map_err(|e| format!("{e:?}"))?;
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }

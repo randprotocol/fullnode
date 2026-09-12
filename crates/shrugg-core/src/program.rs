@@ -1,6 +1,6 @@
 //! On-chain programs and call receipts.
 
-use crate::crypto::{Address, Hash};
+use crate::crypto::Hash;
 use serde::{Deserialize, Serialize};
 
 pub type ProgramId = Hash;
@@ -27,7 +27,6 @@ pub struct ProgramRecord {
     /// the digest, `docs/confidential.md`'s "Constraint set 3" note). `ZkExecutor::check_program`
     /// computes it at deploy time.
     pub code_hash: Vec<u8>,
-    pub deployer: Address,
     pub deployed_at: u64,
 }
 
@@ -44,8 +43,6 @@ pub struct CallReceipt {
     pub program: ProgramId,
     pub tier: u8,
     pub outputs: [u32; 8],
-    /// The transfer the outputs requested, if any.
-    pub effect: Option<(Address, u128)>,
     pub height: u64,
     pub index: u32,
 }

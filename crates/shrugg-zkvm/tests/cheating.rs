@@ -12,53 +12,14 @@ use shrugg_zkvm::guests;
 use shrugg_zkvm::isa::{AluOp, Instr, REG_A0, REG_A1};
 use shrugg_zkvm::machine::{build_traces_salted, FriProfile, Machine, Tier, Traces};
 use shrugg_zkvm::tables::{alu, cpu, limbs, memory, nibble, poseidon2, program, range, F};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 
-/// The panic `p3-batch-stark`'s debug constraint checker raises when a row violates a
-/// constraint. Its full form is
-/// `"constraints not satisfied on row {row_index}: failed constraints = {rendered}"` —
-/// the `panic!` at the end of the row loop in
-/// `~/.cargo/registry/src/index.crates.io-*/p3-batch-stark-0.7.0/src/check_constraints.rs`
-/// (line 132 in that release). Matching the fixed prefix is what separates "the constraint
-/// system caught this" from any other unwind. This check runs *per AIR instance*, using only
-/// that instance's own trace, so it only catches a violation that's local to one table's own
-/// row constraints (e.g. the range table's `mp·(1 − is_pow2) = 0`).
-const CONSTRAINT_PANIC: &str = "constraints not satisfied on row";
-
-/// The panic `p3-lookup`'s debug bus-balance checker
-/// (`p3_lookup::debug_util::check_lookups`, `check_lookups`'s `assert_empty`) raises when a
-/// *global* lookup — one whose provider and consumers live in different AIR instances, which
-/// is every bus in this crate except the ALU/CPU's shared-table cases — has a nonzero net
-/// multiplicity for some tuple, after every instance's own `CONSTRAINT_PANIC` pass has
-/// already run clean. For a table with no row-level validity marker of its own — the nibble
-/// table's every `(a, b)` row is a genuine AND/OR/XOR entry, unlike the range table's
-/// `is_pow2` flag — an unpaid extra multiplicity is *only* visible cross-instance: the row
-/// itself is perfectly well-formed, so `CONSTRAINT_PANIC` never fires, and this is the sole
-/// mechanism left to catch it. It is exactly as much "the constraint system caught this" as
-/// `CONSTRAINT_PANIC` — just checked at the scope of the whole batch instead of one row of
-/// one instance.
-const LOOKUP_BALANCE_PANIC: &str = "Lookup mismatch (";
-
-/// A tamper counts as rejected only if `verify` returned an error, or if the panic came from
-/// one of the two constraint-system checks above. Anything else — a trace-builder `assert!`,
-/// an index out of bounds — means the test tripped over something other than the constraint
-/// it was written for, so it must fail rather than pass for the wrong reason.
-fn rejects(f: impl FnOnce() -> Result<(), shrugg_zkvm::machine::VerifyError>) -> bool {
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(Ok(())) => false,
-        Ok(Err(_)) => true,
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "<non-string panic payload>".to_string());
-            let is_constraint = msg.contains(CONSTRAINT_PANIC) || msg.contains(LOOKUP_BALANCE_PANIC);
-            if !is_constraint { eprintln!("rejects(): panic was not a constraint failure: {msg}"); }
-            is_constraint
-        }
-    }
-}
+/// `rejects()`, and the two constraint-panic prefixes it matches (`CONSTRAINT_PANIC` and
+/// `LOOKUP_BALANCE_PANIC`, referred to by name in the comments below), now live in
+/// `tests/common/mod.rs` so that `tests/viewing.rs` and `tests/bundle.rs` use this exact
+/// definition instead of their own weaker copies. The discipline it encodes is still this
+/// file's, and so is the test below that checks the helper itself.
+mod common;
+use common::rejects;
 
 #[test]
 fn rejects_only_counts_a_constraint_failure_or_a_verify_error() {

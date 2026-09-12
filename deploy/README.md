@@ -1,5 +1,12 @@
 # Testnet: chain id 5 (SHRUGG, confidential computation, zkVM constraint set 4)
 
+> **The fleet below is an account chain and is unchanged by the shielded pool.** Phase S1 (the
+> note ledger, bundles, the shielded wallet) is a hard fork: a node built from this branch cannot
+> join chain 5, and chain 5's blocks cannot be replayed by it. The fleet moves when the operator
+> decides to, by cutting a new chain id from a shielded genesis — see "Cutting a shielded genesis"
+> at the end of this file. Until then, run the shielded build on a separate chain id, or keep the
+> pinned account build (`deploy/run-a-pinned.sh`, `.update-pin`) for the fleet.
+
 Test keys only; all seeds are committed on purpose so any machine can pull and run.
 Genesis hash `3a82b0c7b6c4eb1eb1e1ba8a54b4306a883a57d46ccebce1e7adb7b5fd9ffa86`, 100 SHRUGG per validator, **faucet enabled**, **confidential computation enabled** (production FRI profile, no bridge section; fleet build commit dbea18c, constraint set 4)
 (`shrugg faucet [address]` mints up to 100 SHRUGG per call on any node). Quorum is 3 of 4 validators.
@@ -52,3 +59,62 @@ hosts the RandScan explorer, which re-indexes itself on a chain id change.
 History: chain 1 (2 validators, SESH) and chain 2 (4 validators + 2 observers, SESH) ran on 2026-09-09;
 chain 3 followed the SESH -> SHRUGG rename and added the faucet; chain 4 (2026-09-10) added confidential
 computation on constraint set 2 and ended at 31,952 blocks when the fleet moved to constraint set 4.
+
+## Cutting a shielded genesis
+
+A shielded chain has no per-validator allocation: value exists only as a note someone holds the
+spend key for, so `--alloc` takes a **shielded address** and creates one deposit note. The
+addresses come from wallet keys, which are not node keys.
+
+```bash
+# one spend key per wallet that should start with funds (wallets/ is gitignored — never commit these)
+for i in 1 2 3 4 5; do shrugg --key wallets/shielded-$i.key.json keygen; done
+
+# the genesis: four validators, five 1000-SHRUGG deposit notes, faucet on, production FRI
+args=()
+for i in 1 2 3 4 5; do
+  args+=(--alloc "$(shrugg --key wallets/shielded-$i.key.json address)=1000")
+done
+shrugg-node genesis --chain-id 6 \
+  --validator deploy/node-a.key.json --validator deploy/node-b.key.json \
+  --validator deploy/node-c.key.json --validator deploy/node-d.key.json \
+  --stake 100000 "${args[@]}" --faucet --fri-profile production \
+  --out deploy/genesis-shielded.example.json
+```
+
+`deploy/genesis-shielded.example.json` in this repo is exactly that file, produced by that command
+(chain id 6, genesis hash `6457243776e7c152b946a3a245f6748d9934ffc6f08ac22f868fb4014b38ddf3`,
+`hc_bundle 4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb`). It is an **example**:
+its five deposit notes belong to spend keys that live only on the machine that cut it, so re-cut
+your own rather than adopting it. Two properties make that unavoidable:
+
+- Every deposit note carries fresh commitment randomness, so the same `--alloc` list produces a
+  different genesis hash every time. A deterministic `r` would let anyone confirm a guess at a
+  genesis note's owner and amount by recomputing the commitment. Cut it once, distribute the file
+  byte-identically, and keep it.
+- `hc_bundle` pins the bundle guest every proof on the chain is checked against. A node whose build
+  assembles a different guest refuses to start and names both digests, so a zkVM constraint change
+  is a fork here exactly as it is for confidential calls.
+
+Then, on each machine, as for any chain:
+
+```bash
+shrugg-node init --datadir ./data-6 --genesis genesis-shielded.json
+shrugg-node run --datadir ./data-6 --key deploy/node-a.key.json --validator \
+  --block-interval-ms 1000 --bootstrap /ip4/<ip>/tcp/30303/p2p/<peer id>
+```
+
+Keep `--block-interval-ms` at 1000 or slower: a bundle proof takes about 100 seconds and its
+anchor is valid for 256 blocks, so a much faster chain rejects honest transfers whose anchor
+expired mid-proof (`docs/shielded.md` §5).
+
+The wallet side, on any machine with a key file:
+
+```bash
+shrugg --key wallets/shielded-1.key.json balance      # scans the tree; ~1000 SHRUGG at genesis
+shrugg --key wallets/shielded-1.key.json send "$(shrugg --key wallets/shielded-2.key.json address)" 1.5
+shrugg faucet "$(shrugg --key wallets/shielded-3.key.json address)"   # if --faucet was set
+```
+
+`shrugg-node status` on any node reports `notes`, `nullifiers`, `tree_root` and `hc_bundle`
+alongside the usual height and peer counts, which is the quickest check that a fresh fleet agrees.

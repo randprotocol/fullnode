@@ -1,22 +1,64 @@
 //! JSON-RPC client for a SHRUGG full node, plus wallet helpers.
+//!
+//! Phase S1 redacted the chain: there are no accounts, no balances and no bridge, so the
+//! account-shaped and bridge-shaped calls this module used to carry are gone with the RPC
+//! methods that answered them. What remains is the chain-state surface a wallet still needs
+//! (`shrugg_getCommitments`/`getNullifiers`/`getAnchor`/`getWitness`/`getTreeInfo`, decoded
+//! here into the `shrugg-core` types [`wallet`] scans with) plus the faucet mint the cluster
+//! tests drive their traffic with.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use shrugg_core::bridge::AssetId;
-use shrugg_core::program::{program_id, ProgramId};
-use shrugg_core::{gas, Address, Hash, Keypair, Transaction, TxKind};
+use shrugg_core::notes::{word8_from_hex, Envelope, Word8, DEPTH};
+use shrugg_core::program::ProgramId;
+use shrugg_core::{Hash, Transaction};
 use std::time::{Duration, Instant};
+
+pub mod wallet;
+
+/// One leaf of the commitment tree as `shrugg_getCommitments` reports it: the leaf index, the
+/// commitment, the envelope published with it, and the block it landed in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitmentRow {
+    pub index: u64,
+    pub cm: Word8,
+    pub envelope: Envelope,
+    pub height: u64,
+}
+
+/// `shrugg_getTreeInfo`: how far a wallet still has to scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeInfo {
+    pub next_index: u64,
+    pub root: Word8,
+    pub nullifiers: u64,
+}
+
+/// A `Word8` field of an RPC reply, as 64 hex characters.
+fn word8_at(v: &Value, field: &str) -> Result<Word8> {
+    let s = v.get(field).and_then(|x| x.as_str()).with_context(|| format!("{field} missing"))?;
+    word8_from_hex(s).with_context(|| format!("{field} is not 64 hex characters"))
+}
+
+/// A hex byte string field of an RPC reply.
+fn bytes_at(v: &Value, field: &str) -> Result<Vec<u8>> {
+    let s = v.get(field).and_then(|x| x.as_str()).with_context(|| format!("{field} missing"))?;
+    hex::decode(s).with_context(|| format!("{field} is not hex"))
+}
+
+fn envelope_at(v: &Value) -> Result<Envelope> {
+    Ok(Envelope {
+        kem_ct: bytes_at(v, "kem_ct")?,
+        to_receiver: bytes_at(v, "to_receiver")?,
+        to_sender: bytes_at(v, "to_sender")?,
+        body: bytes_at(v, "body")?,
+    })
+}
 
 #[derive(Clone)]
 pub struct RpcClient {
     url: String,
     http: reqwest::Client,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AccountInfo {
-    pub nonce: u64,
-    pub balance: u128,
 }
 
 #[derive(Clone, Debug)]
@@ -61,18 +103,6 @@ impl RpcClient {
         self.call("shrugg_chainId", json!([])).await?.as_u64().context("chain id")
     }
 
-    pub async fn account(&self, addr: &Address) -> Result<AccountInfo> {
-        let v = self.call("shrugg_getAccount", json!([addr.to_base58()])).await?;
-        Ok(AccountInfo {
-            nonce: v["nonce"].as_u64().unwrap_or(0),
-            balance: v["balance"].as_str().unwrap_or("0").parse().context("balance")?,
-        })
-    }
-
-    pub async fn balance(&self, addr: &Address) -> Result<u128> {
-        Ok(self.account(addr).await?.balance)
-    }
-
     pub async fn send_transaction(&self, tx: &Transaction) -> Result<Hash> {
         let v = self.call("shrugg_sendTransaction", json!([hex::encode(tx.encode())])).await?;
         Hash::from_hex(v.as_str().unwrap_or("")).map_err(|e| anyhow!("bad hash in reply: {e}"))
@@ -106,11 +136,15 @@ impl RpcClient {
         }
     }
 
-    /// Testnet faucet: ask the node to mint `amount` units (default 100 SHRUGG) to `to`.
-    pub async fn mint(&self, to: &Address, amount: Option<u128>) -> Result<Hash> {
+    /// Testnet faucet: ask a *validator* node to mint `amount` units into a note owned by the
+    /// shielded address `to` (the `shrugg1…` text form). `amount` is in units; `None` asks for
+    /// the node's default (100 SHRUGG). The node signs the mint itself — a non-validator node
+    /// answers with an error rather than forwarding, since only a validator's signature admits
+    /// a mint (spec §6).
+    pub async fn mint_shielded(&self, to: &str, amount: Option<u64>) -> Result<Hash> {
         let params = match amount {
-            Some(a) => json!([to.to_base58(), a.to_string()]),
-            None => json!([to.to_base58()]),
+            Some(a) => json!([to, a.to_string()]),
+            None => json!([to]),
         };
         let v = self.call("shrugg_mint", params).await?;
         Hash::from_hex(v.as_str().unwrap_or("")).map_err(|e| anyhow!("bad hash in reply: {e}"))
@@ -152,31 +186,11 @@ impl RpcClient {
         }
     }
 
-    pub async fn estimate_fee(&self, kind: &str, n: u64) -> Result<u128> {
-        let v = self.call("shrugg_estimateFee", json!([kind, n])).await?;
+    /// The fee floor for one action, in units. `params` is the node's `shrugg_estimateFee`
+    /// object — `{"kind":"bundle"}`, `{"kind":"deploy","words":n}` or `{"kind":"call","tier":t}`.
+    pub async fn estimate_fee(&self, params: Value) -> Result<u64> {
+        let v = self.call("shrugg_estimateFee", json!([params])).await?;
         v.as_str().unwrap_or("0").parse().context("fee")
-    }
-
-    /// Deploy a program (fee = the schedule minimum). Returns (program id, tx hash).
-    pub async fn deploy(&self, key: &Keypair, base_pc: u32, words: Vec<u32>) -> Result<(ProgramId, Hash)> {
-        let chain_id = self.chain_id().await?;
-        let acct = self.account(&key.address()).await?;
-        let fee = gas::deploy_fee(words.len());
-        if acct.balance < fee {
-            return Err(anyhow!("insufficient balance: deploy needs {} SHRUGG", shrugg_core::format_amount(fee)));
-        }
-        let id = program_id(base_pc, &words);
-        let tx = Transaction::deploy(key, chain_id, acct.nonce, base_pc, words, fee);
-        let hash = self.send_transaction(&tx).await?;
-        Ok((id, hash))
-    }
-
-    /// Submit a confidential call with an already computed proof.
-    pub async fn call_program(&self, key: &Keypair, program: ProgramId, proof: Vec<u8>, recipients: Vec<Address>, fee: u128) -> Result<Hash> {
-        let chain_id = self.chain_id().await?;
-        let acct = self.account(&key.address()).await?;
-        let tx = Transaction::call(key, chain_id, acct.nonce, program, proof, recipients, fee);
-        self.send_transaction(&tx).await
     }
 
     pub async fn head(&self) -> Result<Value> {
@@ -198,59 +212,72 @@ impl RpcClient {
         self.call("shrugg_getBlockByHash", json!([h.to_hex()])).await
     }
 
-    /// Build, sign, and submit a transfer using the sender's current on-chain nonce.
-    /// Fails before submitting if the balance cannot cover amount + fee.
-    pub async fn transfer(&self, key: &Keypair, to: Address, amount: u128, fee: u128) -> Result<Hash> {
-        let chain_id = self.chain_id().await?;
-        let acct = self.account(&key.address()).await?;
-        let need = amount.checked_add(fee).context("amount overflow")?;
-        if acct.balance < need {
-            return Err(anyhow!(
-                "insufficient balance: have {} SHRUGG, need {} SHRUGG",
-                shrugg_core::format_amount(acct.balance),
-                shrugg_core::format_amount(need)
-            ));
+    // ---- shielded chain state (the wallet's scan surface) ----
+
+    /// A page of the commitment tree's leaves from leaf index `from`, oldest first. The node
+    /// caps a page at 1000 rows however large `limit` is, so a caller pages until the reply is
+    /// short or empty rather than trusting one call to return everything.
+    pub async fn commitments(&self, from: u64, limit: usize) -> Result<Vec<CommitmentRow>> {
+        let v = self.call("shrugg_getCommitments", json!([from, limit])).await?;
+        let rows = v.as_array().context("getCommitments did not return a list")?;
+        rows.iter()
+            .map(|r| {
+                Ok(CommitmentRow {
+                    index: r["index"].as_u64().context("index")?,
+                    cm: word8_at(r, "cm")?,
+                    envelope: envelope_at(r.get("envelope").context("envelope")?)?,
+                    height: r["height"].as_u64().context("height")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Every nullifier published from block `from_height` onwards, as `(height, nullifier)`.
+    pub async fn nullifiers(&self, from_height: u64, limit: usize) -> Result<Vec<(u64, Word8)>> {
+        let v = self.call("shrugg_getNullifiers", json!([from_height, limit])).await?;
+        let rows = v.as_array().context("getNullifiers did not return a list")?;
+        rows.iter().map(|r| Ok((r["height"].as_u64().context("height")?, word8_at(r, "nullifier")?))).collect()
+    }
+
+    /// The tree root a prover anchors against: the head's (`None`), or a specific height's.
+    pub async fn anchor(&self, height: Option<u64>) -> Result<(u64, Word8)> {
+        let params = match height {
+            Some(h) => json!([h]),
+            None => json!([]),
+        };
+        let v = self.call("shrugg_getAnchor", params).await?;
+        Ok((v["height"].as_u64().context("height")?, word8_at(&v, "root")?))
+    }
+
+    /// The Merkle witness of leaf `index` — `(root, siblings leaf-first)`. The root is the
+    /// tree's *current* root, which is why a wallet checks it against the anchor it proved
+    /// under rather than assuming the two agree.
+    pub async fn witness(&self, index: u64) -> Result<(Word8, [Word8; DEPTH])> {
+        let v = self.call("shrugg_getWitness", json!([index])).await?;
+        if v.is_null() {
+            return Err(anyhow!("no leaf at index {index}"));
         }
-        let tx = Transaction::transfer(key, chain_id, acct.nonce, to, amount, fee);
-        debug_assert!(matches!(tx.body.kind, TxKind::Transfer { .. }));
-        self.send_transaction(&tx).await
+        let root = word8_at(&v, "root")?;
+        let list = v["path"].as_array().context("path")?;
+        if list.len() != DEPTH {
+            return Err(anyhow!("witness path is {} levels, expected {DEPTH}", list.len()));
+        }
+        let mut path = [[0u32; 8]; DEPTH];
+        for (slot, w) in path.iter_mut().zip(list) {
+            *slot = word8_from_hex(w.as_str().unwrap_or_default()).context("path level is not 64 hex characters")?;
+        }
+        Ok((root, path))
     }
-}
 
-/// One bridged asset an address holds, as reported by `shrugg_getAssets`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AssetHolding {
-    pub asset: AssetId,
-    /// Chain the token is native to (2 Ethereum, 3 BSC, 4 Tron, 5 Solana).
-    pub token_chain: u16,
-    /// The token's address on its home chain, left-padded to 32 bytes.
-    pub token_address: [u8; 32],
-    /// Balance in bridged units (8 decimals).
-    pub balance: u128,
-}
-
-/// Screens a burn recipient the way `BridgeState::check_burn` does, so the
-/// wallet says why before it signs rather than letting the node reject the
-/// transaction (a burn is irreversible once it lands).
-///
-/// A zero recipient is unspendable on every chain; on the EVM-family
-/// chains (2 Ethereum, 3 BSC, 4 Tron) `to` is a 20-byte address left-padded
-/// to 32 bytes (spec 3.5), so anything in the upper 12 bytes means the
-/// value was built for a different address space. Solana (5) uses the full
-/// 32 bytes.
-pub fn check_burn_recipient(to: &[u8; 32], to_chain: u16) -> Result<()> {
-    if to == &[0u8; 32] {
-        return Err(anyhow!("destination is all zeroes: nothing on chain {to_chain} could ever spend it"));
+    /// `{next_index, root, nullifiers}` — enough for a wallet to know how far it has scanned.
+    pub async fn tree_info(&self) -> Result<TreeInfo> {
+        let v = self.call("shrugg_getTreeInfo", json!([])).await?;
+        Ok(TreeInfo {
+            next_index: v["next_index"].as_u64().context("next_index")?,
+            root: word8_at(&v, "root")?,
+            nullifiers: v["nullifiers"].as_u64().context("nullifiers")?,
+        })
     }
-    if matches!(to_chain, 2 | 3 | 4) && to[..12] != [0u8; 12] {
-        return Err(anyhow!(
-            "chain {to_chain} takes a 20-byte address left-padded to 32 bytes, but {} has a non-zero upper 12 bytes; \
-             pass 000000000000000000000000{}",
-            hex::encode(to),
-            hex::encode(&to[12..])
-        ));
-    }
-    Ok(())
 }
 
 /// A 32-byte value as 64 hex characters, with or without `0x`.
@@ -259,131 +286,16 @@ pub fn hex32(s: &str) -> Result<[u8; 32]> {
     bytes.try_into().map_err(|v: Vec<u8>| anyhow!("expected 32 bytes, got {}", v.len()))
 }
 
-/// Bridged assets. Amounts here are in bridged units — 8 decimals, not
-/// SHRUGG's 9 — so they are passed and printed as plain unit integers.
-impl RpcClient {
-    /// `addr`'s balance of one bridged asset, in units. Zero for an unknown
-    /// asset, an untouched address, or a chain without a bridge.
-    pub async fn asset_balance(&self, addr: &Address, asset: &AssetId) -> Result<u128> {
-        let v = self.call("shrugg_getAssetBalance", json!([addr.to_base58(), asset.to_hex()])).await?;
-        v.as_str().unwrap_or("0").parse().context("asset balance")
-    }
-
-    /// Every bridged asset `addr` holds a non-zero balance of.
-    pub async fn assets(&self, addr: &Address) -> Result<Vec<AssetHolding>> {
-        let v = self.call("shrugg_getAssets", json!([addr.to_base58()])).await?;
-        v.as_array()
-            .context("assets: expected an array")?
-            .iter()
-            .map(|a| {
-                Ok(AssetHolding {
-                    asset: Hash::from_hex(a["asset"].as_str().unwrap_or("")).map_err(|e| anyhow!("asset: {e}"))?,
-                    token_chain: a["token_chain"].as_u64().context("token_chain")? as u16,
-                    token_address: hex32(a["token_address"].as_str().unwrap_or(""))?,
-                    balance: a["balance"].as_str().unwrap_or("0").parse().context("balance")?,
-                })
-            })
-            .collect()
-    }
-
-    /// The chain's bridge configuration and guardian set. Always answers;
-    /// `{"enabled": false}` on a chain without a bridge.
-    pub async fn bridge_state(&self) -> Result<Value> {
-        self.call("shrugg_getBridgeState", json!([])).await
-    }
-
-    /// One outbound burn message for guardians to sign, or `None` if that
-    /// sequence has not been produced yet.
-    pub async fn bridge_burn_record(&self, sequence: u64) -> Result<Option<Value>> {
-        let v = self.call("shrugg_getBridgeBurn", json!([sequence])).await?;
-        Ok(if v.is_null() { None } else { Some(v) })
-    }
-
-    /// The asset id of a token: `blake3("shrugg-bridge-asset" || chain || address)`.
-    /// Asked of the node so the wallet and the chain cannot disagree.
-    pub async fn bridge_asset_id(&self, token_chain: u16, token_address: &[u8; 32]) -> Result<AssetId> {
-        let v = self.call("shrugg_bridgeAssetId", json!([token_chain, hex::encode(token_address)])).await?;
-        Hash::from_hex(v.as_str().unwrap_or("")).map_err(|e| anyhow!("bad asset id in reply: {e}"))
-    }
-
-    /// Submit a guardian-signed attestation: mints the bridged asset it
-    /// carries (or rotates the guardian set). `fee` is the SHRUGG transaction
-    /// fee; the bridge fee inside the attestation goes to the submitter.
-    pub async fn bridge_attest(&self, key: &Keypair, attestation: Vec<u8>, fee: u128) -> Result<Hash> {
-        let chain_id = self.chain_id().await?;
-        let acct = self.account(&key.address()).await?;
-        if acct.balance < fee {
-            return Err(anyhow!("insufficient balance for the {} SHRUGG fee", shrugg_core::format_amount(fee)));
-        }
-        let tx = Transaction::bridge_attest(key, chain_id, acct.nonce, attestation, fee);
-        self.send_transaction(&tx).await
-    }
-
-    /// Burn `amount` units of a bridged asset and emit the outbound message a
-    /// source-chain contract releases against. `bridge_fee` (in the same
-    /// bridged units, at most `amount`) is carried in that message for
-    /// whoever relays it; `fee` is the SHRUGG transaction fee.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn bridge_burn(
-        &self,
-        key: &Keypair,
-        asset: AssetId,
-        amount: u128,
-        to_chain: u16,
-        to: [u8; 32],
-        bridge_fee: u128,
-        fee: u128,
-    ) -> Result<Hash> {
-        // Before anything is signed or sent: an unspendable recipient is a
-        // one-way loss the node would reject anyway.
-        check_burn_recipient(&to, to_chain)?;
-        let chain_id = self.chain_id().await?;
-        let acct = self.account(&key.address()).await?;
-        if acct.balance < fee {
-            return Err(anyhow!("insufficient balance for the {} SHRUGG fee", shrugg_core::format_amount(fee)));
-        }
-        let have = self.asset_balance(&key.address(), &asset).await?;
-        if have < amount {
-            return Err(anyhow!("insufficient bridged balance: have {have} units, need {amount}"));
-        }
-        let tx = Transaction::bridge_burn(key, chain_id, acct.nonce, asset, amount, to_chain, to, bridge_fee, fee);
-        self.send_transaction(&tx).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The wallet screens a burn recipient before signing, with the same
-    /// rule the ledger applies (`BridgeState::check_burn`).
     #[test]
-    fn burn_recipient_is_screened_before_signing() {
-        let mut evm = [0u8; 32];
-        evm[12..].copy_from_slice(&[0x22u8; 20]);
-
-        // Left-padded EVM addresses are fine on 2, 3 and 4 ...
-        for chain in [2u16, 3, 4] {
-            check_burn_recipient(&evm, chain).unwrap();
-        }
-        // ... and Solana takes the full 32 bytes.
-        check_burn_recipient(&[0x22u8; 32], 5).unwrap();
-
-        // Zero is refused everywhere.
-        for chain in [2u16, 3, 4, 5] {
-            let err = check_burn_recipient(&[0u8; 32], chain).unwrap_err().to_string();
-            assert!(err.contains("all zeroes"), "{err}");
-        }
-        // A dirty upper 12 bytes is refused on the EVM-family chains, and
-        // the error names the padded form the user probably meant.
-        let mut dirty = evm;
-        dirty[11] = 1;
-        for chain in [2u16, 3, 4] {
-            let err = check_burn_recipient(&dirty, chain).unwrap_err().to_string();
-            assert!(err.contains("upper 12 bytes"), "{err}");
-            assert!(err.contains(&format!("000000000000000000000000{}", hex::encode(&dirty[12..]))), "{err}");
-        }
-        // ... but not on Solana, where all 32 bytes are the address.
-        check_burn_recipient(&dirty, 5).unwrap();
+    fn hex32_takes_both_spellings_and_rejects_the_wrong_length() {
+        let bare = "11".repeat(32);
+        assert_eq!(hex32(&bare).unwrap(), [0x11u8; 32]);
+        assert_eq!(hex32(&format!("0x{bare}")).unwrap(), [0x11u8; 32]);
+        assert!(hex32("0x1122").unwrap_err().to_string().contains("got 2"));
+        assert!(hex32("nothex").unwrap_err().to_string().contains("not hex"));
     }
 }

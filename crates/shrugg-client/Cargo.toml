@@ -19,6 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 clap = { workspace = true }
 
 [features]
@@ -31,3 +32,9 @@ mock-cuda = ["shrugg-zkvm/mock-cuda"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `tests/wallet_flow.rs` drives a real one-node chain in-process. Cargo allows this cycle
+# because it goes through dev-dependencies only: `shrugg-node` depends on this crate for its
+# own binary, and nothing in this crate's library depends on the node.
+shrugg-node = { path = "../shrugg-node" }
+libp2p = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -10,12 +10,21 @@ curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
 
 Conventions:
 
-- Addresses are base58 strings (32 bytes). Hashes are 64 hex characters, with or without `0x`.
-- Bridge hex fields (asset ids, emitters, guardian keys, token addresses, message bodies) are
-  lowercase hex without a `0x` prefix in results; parameters accept either form.
+- Validator addresses are base58 strings (32 bytes). Hashes are 64 hex characters, with or
+  without `0x`. Shielded values (commitments, nullifiers, anchors, tree roots, witness levels) are
+  `Word8` — eight little-endian `u32` words as 64 lowercase hex characters.
+- Shielded addresses are `shrugg1` + base58, about 1668 characters. A parameter longer than 2000
+  characters is refused on its length before it is parsed.
 - Amounts are strings of smallest units (`"1500000000"` = 1.5 SHRUGG); 1 SHRUGG = 10^9 units.
-- Heights, nonces and views are JSON integers.
+  Fees inside a decoded bundle are JSON integers.
+- Heights, leaf indices and views are JSON integers.
 - `shrugg_client::RpcClient` (Rust) wraps every method below.
+
+**There is no balance method, and no account method.** This chain has no accounts; see
+`docs/shielded.md`. A wallet computes its own balance by scanning the commitment tree with its
+viewing key, which is what `shrugg_getCommitments` and `shrugg_getNullifiers` exist for. The
+bridge methods went with the account model too, and do not come back until phase S3
+(`docs/bridge.md`).
 
 ## Methods
 
@@ -25,42 +34,87 @@ Params: `[]`. Result: chain id (integer). Transactions must carry this id.
 ### `shrugg_tokenInfo`
 Params: `[]`. Result: `{ "symbol": "SHRUGG", "decimals": 9 }`.
 
-### `shrugg_getBalance`
-Params: `[address]`. Result: balance as a string of units. Unknown addresses return `"0"`.
-
-### `shrugg_getAccount`
-Params: `[address]`. Result:
-```json
-{ "address": "7th5YW...", "nonce": 4, "balance": "113085010000" }
-```
-
 ### `shrugg_sendTransaction`
-Params: `[hex]` where `hex` is the bincode encoding of a signed `Transaction` (as produced by
-`Transaction::encode()` in `shrugg-core`, or by the `shrugg` wallet). Result: the transaction hash.
+Params: `[hex]` where `hex` is `bincode(Transaction)` (as produced by `Transaction::encode()` in
+`shrugg-core`, or by the `shrugg` wallet). Result: the transaction hash.
 
-The node validates against the state at the tip of the chain (chain id, signature, nonce not below
-the account nonce and at most 64 ahead, balance covering amount plus fee, confidential proof), puts it
+The node validates against the state at the tip of the chain in the order of `docs/shielded.md`
+§5 — size caps, chain id, shape and fee floor, anchor, time, nullifiers and commitments, action
+checks, the bundle digest, the bundle proof, and for a call its own proof and tier fee — puts it
 in the mempool, and gossips it. Errors come back as code `-32000` with the reason, for example
-`bad nonce: expected 4, got 3`, `insufficient balance: have 100, need 150`, `already in mempool`,
-`replacement fee too low`, `nonce 80 too far ahead of account nonce 4`, `unknown program ...`,
-`invalid proof: ...`, `fee 1 below minimum 1000000`, `bad effect: recipient index 2 out of range`,
-`insufficient balance for emitted transfer`.
+`nullifier already spent`, `anchor is not one of the last 256 roots`,
+`bundle time 12 is outside [244, 500]`, `fee 1000000 below minimum 2000000`,
+`the bundle's digest is not what its proof published`, `invalid bundle proof: …`,
+`unknown program …`, `already in mempool`, `conflicts with a pending transaction over <nullifier>`,
+`faucet is disabled on this chain`.
 
 Acceptance is not commitment: poll `shrugg_getTransaction` until it returns a block.
 
 ### `shrugg_mint` (testnet faucet)
-Params: `[address]` or `[address, amount]` (amount as a string of units, at most `100000000000` =
-100 SHRUGG; default 100 SHRUGG). Result: the mint transaction hash.
+Params: `[address]` or `[address, amount]`, where `address` is a `shrugg1…` shielded address and
+`amount` is a string of units, at most `100000000000` (100 SHRUGG; the default). Result: the mint
+transaction hash.
 
 Only available when the genesis file has `"faucet": true`; otherwise error `-32000`
-`faucet is disabled on this chain`. The node signs a `Mint` transaction with its own key (fee 0) and
-submits it through the normal mempool, so the mint goes through consensus and every node applies it.
-Poll `shrugg_getTransaction` for the commit. A `Mint` appears in blocks as
-`"kind": { "type": "mint", "to": "...", "amount": "..." }`.
+`faucet is disabled on this chain`. The node builds the note, seals an envelope to `address`
+under a throwaway sender key, signs the `Mint` with its own validator key and submits it through
+the normal mempool, so the mint goes through consensus and every node applies it. An observer has
+no validator key and answers `faucet mints are signed by validators; ask a validator node`. Poll
+`shrugg_getTransaction` for the commit.
+
+### `shrugg_getCommitments`
+Params: `[from_index]` or `[from_index, limit]`. Result: a page of commitment-tree leaves from
+leaf `from_index`, oldest first, at most 1000 rows however large `limit` is (a missing or null
+`limit` asks for the maximum). Page until the reply is short or empty.
+
+```json
+[ { "index": 40, "cm": "2a9f…07", "height": 37,
+    "envelope": { "kem_ct": "b41c…", "to_receiver": "77e0…", "to_sender": "0c31…", "body": "9dd2…" } } ]
+```
+
+Every leaf and every envelope is served to everyone; only a viewing key tells one wallet's rows
+from another's.
+
+### `shrugg_getNullifiers`
+Params: `[from_height]` or `[from_height, limit]`. Result: every nullifier published from that
+block height onwards, same 1000-row cap.
+
+```json
+[ { "height": 37, "nullifier": "8c04…d1" }, { "height": 41, "nullifier": "12be…9a" } ]
+```
+
+A page can stop inside a height, so a caller pages back to the highest height it saw rather than
+past it; re-reading rows is harmless.
+
+### `shrugg_getAnchor`
+Params: `[]` for the head, or `[height]`. Result: `{ "height": 192, "root": "6b1d…c4" }`, or error
+`-32001` for a height with no recorded anchor.
+
+Only *block-end* roots are anchors, and only the newest 256 are kept. A node that caught up in one
+sync batch longer than that window holds rows only for the heights the batch covered, so ask for
+the head — the only anchor a prover should build against anyway.
+
+### `shrugg_getWitness`
+Params: `[index]`. Result: `null` past the end of the tree, else the Merkle path of that leaf,
+leaf-first, exactly 32 levels, with the tree's *current* root:
+
+```json
+{ "index": 40, "root": "6b1d…c4", "path": ["0000…00", "f2a1…3b", "…"] }
+```
+
+The root is the live root, not an anchor: a wallet checks it against the anchor it is proving
+under and refetches if a leaf was appended in between. This is the most expensive read a node
+serves (it rebuilds a full depth-32 tree from every stored leaf) and the one request that
+discloses something about the caller — see `docs/shielded.md` §6.
+
+### `shrugg_getTreeInfo`
+Params: `[]`. Result: `{ "next_index": 41, "root": "6b1d…c4", "nullifiers": 12 }` — the leaf count
+(the index the next note will get), the current root, and how many notes have been spent.
 
 ### `shrugg_getProgram`
 Params: `[program_id]`. Result: `null` or
-`{ "id", "base_pc", "words_len", "code_hash", "deployer", "deployed_at" }`.
+`{ "id", "base_pc", "words_len", "code_hash", "deployed_at" }`. There is no `deployer` field: a
+deploy is paid by a bundle, so the chain does not know who deployed it.
 
 ### `shrugg_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -68,39 +122,57 @@ proves against).
 
 ### `shrugg_getReceipt`
 Params: `[tx_hash]`. Result: `null` until the call is committed, then
+
 ```json
-{ "tx": "...", "program": "...", "tier": 10, "outputs": [1, 0, 25, 0, 0, 0, 0, 0],
-  "effect": { "to": "...", "amount": "25" }, "height": 17, "index": 0 }
+{ "tx": "…", "program": "…", "tier": 14, "outputs": [1, 0, 25, 0, 0, 0, 0, 0], "height": 17, "index": 0 }
 ```
-`effect` is `null` for kind-0 outputs.
+
+There is no `effect` field: effect kind 1 (the program-driven transfer to an account) was deleted
+with the accounts. A call's outputs are recorded and nothing else moves; value moves only through
+the bundle that paid for the call.
 
 ### `shrugg_estimateFee`
-Params: `["deploy", words]` or `["call", tier]`. Result: minimum fee in units (string).
+Params: `[spec]`, one of `{"kind":"bundle"}`, `{"kind":"deploy","words":n}` or
+`{"kind":"call","tier":t}` (`t` one of 10, 12, 14, 16, 18, 20). Result: the minimum fee in units,
+as a string. `{"kind":"bundle"}` is the floor for a plain transfer: `1000000`.
 
 ### `shrugg_getTransaction`
 Params: `[hash]`. Result: `null` until committed, then:
+
 ```json
 {
-  "height": 1372, "index": 0, "block_hash": "8bf2...",
+  "height": 192, "index": 0, "block_hash": "63f6…08",
   "tx": {
-    "hash": "e7a7...", "from": "7th5YW...", "nonce": 0, "fee": "1000", "chain_id": 2,
-    "kind": { "type": "transfer", "to": "9W7dsb...", "amount": "3500000000" }
+    "hash": "4f2c…e7", "chain_id": 7,
+    "bundle": {
+      "anchor": "6b1d…c4",
+      "nullifiers": ["8c04…d1", "5e77…20"],
+      "commitments": ["2a9f…07", "b310…88"],
+      "fee": 1000000, "burn": 0, "asset": 0, "time": 5,
+      "proof_len": 302857, "envelope_len": [1348, 1348]
+    },
+    "action": { "kind": "none" }
   }
 }
 ```
-Other kinds: `{ "type": "mint", "to", "amount" }`,
-`{ "type": "deploy", "base_pc", "words_len", "program" }`,
-`{ "type": "call", "program", "proof_len", "recipients": [...] }`,
-`{ "type": "bridge_attest", "attestation": "<hex>" }`,
-`{ "type": "bridge_burn", "asset", "amount", "to_chain", "to", "fee" }`.
+
+`bundle` is `null` on a mint (a mint carries no bundle). The proof and the envelopes are reported
+by length only; anyone who wants the bytes can fetch the block. Other actions:
+
+- `{ "kind": "mint", "cm": "…", "amount": 100000000000, "minter": "<validator base58>" }`
+- `{ "kind": "deploy", "program": "<program id>", "words": 412 }`
+- `{ "kind": "call", "program": "<program id>", "proof_len": 268123 }`
+
+No reply from this method carries a sender, a recipient, a nonce or a transferred amount, because
+no such field exists in the stored transaction.
 
 ### `shrugg_getBlockByHeight` / `shrugg_getBlockByHash`
 Params: `[height]` (integer) or `[hash]`. Result: `null` if unknown, else:
 ```json
 {
-  "hash": "647b...", "height": 50, "view": 92, "parent": "2d41...",
-  "proposer": "3v3VBJ...", "timestamp_ms": 1788000123456,
-  "tx_root": "0000...", "state_root": "a1b2...", "justify_view": 91,
+  "hash": "647b…", "height": 50, "view": 92, "parent": "2d41…",
+  "proposer": "3v3VBJ…", "timestamp_ms": 1788000123456,
+  "tx_root": "0000…", "state_root": "a1b2…", "justify_view": 91,
   "tx_count": 0, "transactions": [ ...same shape as shrugg_getTransaction.tx... ]
 }
 ```
@@ -118,67 +190,27 @@ Params: `[]`. Result:
   "height": 1998, "head_hash": "…", "view": 2251, "high_qc_view": 2250,
   "syncing": false, "sync_target": 1998,
   "peer_count": 5, "mempool_size": 0,
-  "is_validator": true, "faucet": true, "confidential": true, "fri_profile": "production", "programs": 2,
-  "address": "2nRdFC...", "peer_id": "12D3KooW..."
+  "is_validator": true, "faucet": true, "confidential": true,
+  "fri_profile": "production", "programs": 2,
+  "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19",
+  "address": "2nRdFC…", "peer_id": "12D3KooW..."
 }
 ```
 `syncing` is true while a batch request to a peer is in flight; `sync_target` is the highest height
-any peer has advertised.
+any peer has advertised. `notes` is every note the chain has ever created, `nullifiers` every note
+it has ever spent, and `hc_bundle` the bundle guest this chain's proofs are against — a node whose
+build disagrees with the genesis value refuses to start at all.
 
 ### `shrugg_getPeers`
 Params: `[]`. Result: array of `{ "peer_id": "12D3KooW...", "addrs": ["/ip4/…/tcp/30303"], "connected_secs": 1241 }`.
 
-### `shrugg_getAssetBalance`
-Params: `[address, asset]` where `asset` is the 64-hex asset id. Result: balance as a string of
-bridged units (8 decimals, not SHRUGG's 9). `"0"` for an unknown asset, an address that never held
-it, or a chain without a bridge.
-
-### `shrugg_getAssets`
-Params: `[address]`. Result: every bridged asset the address holds a non-zero balance of:
-```json
-[ { "asset": "8f1c...", "token_chain": 2,
-    "token_address": "000000000000000000000000f10befe1e0794722d3baf8bfd5bdac47b2a33148",
-    "balance": "99999000" } ]
-```
-Empty on a chain without a bridge.
-
-### `shrugg_getBridgeState`
-Params: `[]`. Result on a bridged chain:
-```json
-{
-  "enabled": true,
-  "emitter": "65dc6def...",
-  "emitters": { "2": "0000...7be73b64", "3": "0000...869f41c8" },
-  "guardian_set_index": 0,
-  "guardians": ["7e5f4552091a69125d5dfcb7b8c2659029395bdf", "..."],
-  "burn_sequence": 3,
-  "assets": [ { "asset": "8f1c...", "token_chain": 2, "token_address": "0000...33148" } ]
-}
-```
-`emitter` is the Rand emitter address stamped into outbound burn messages; `emitters` maps each
-source chain id to the contract address allowed to emit transfers into this chain; `guardians` are
-the 20-byte keys of the current set, in index order; `assets` is the registry, which grows the first
-time each token is bridged in. On a chain without a bridge the result is exactly
-`{ "enabled": false }`.
-
-### `shrugg_getBridgeBurn`
-Params: `[sequence]` (integer). Result: `null` until that sequence exists, then
-```json
-{ "sequence": 0, "body_hex": "…", "digest": "…", "tx": "…", "height": 42 }
-```
-`body_hex` is the encoded Section 3.2 body of the outbound message and `digest` is
-`keccak256(keccak256(body))` — what guardians sign so a source-chain contract will release. The
-sequence of the newest message is `burn_sequence - 1` from `shrugg_getBridgeState`.
-
-### `shrugg_bridgeAssetId`
-Params: `[token_chain, token_address]` where `token_address` is 32 bytes of hex (20-byte EVM and
-Tron addresses left-padded with zeros). Result: the asset id hex,
-`blake3("shrugg-bridge-asset" || token_chain BE u16 || token_address)`. A pure function of its
-arguments, so it answers on any chain, bridge or not.
-
 ### `shrugg_getValidators`
-Params: `[]`. Result: array of `{ "address": "…", "stake": "100000" }` in leader-rotation order
-(sorted by address). The leader of view `v` is entry `v mod n`.
+Params: `[]`. Result: array of `{ "address": "…", "stake": "100000", "rewards": 4000000 }` in
+leader-rotation order (sorted by address). The leader of view `v` is entry `v mod n`. `stake` is a
+`u128` and goes out as a **decimal string** (a JSON number cannot carry one exactly); `rewards` is a
+`u64` and stays a number. `rewards` is the bundle fees credited to that validator as proposer; it
+is chain state, and the only amount this chain stores in the clear. Paying it out is phase S2's
+`Withdraw`.
 
 ## Errors
 
@@ -192,20 +224,46 @@ Params: `[]`. Result: array of `{ "address": "…", "stake": "100000" }` in lead
 
 Error responses look like `{ "jsonrpc": "2.0", "id": 1, "error": { "code": -32000, "message": "…" } }`.
 
-## Building a transaction without the wallet
+## The transaction on the wire
 
-The signed payload is `bincode(Transaction)` where
+`shrugg_sendTransaction` takes `bincode(Transaction)`. There is no signature over the transaction
+and no sender key: a bundle authorises itself by its proof, and the only signed action is a
+faucet mint, which carries the minting validator's key and signature inside the action.
 
 ```
-Transaction { body: TxBody, signature: Dilithium2 signature over blake3("shrugg-tx" || bincode(body)) }
-TxBody { chain_id: u64, from: PublicKey(1312 bytes), nonce: u64, fee: u128, kind: TxKind }
-TxKind::Transfer { to: Address(32 bytes), amount: u128 }
-TxKind::Mint { to: Address, amount: u128 }                                      // testnet faucet only
-TxKind::Deploy { base_pc: u32, words: Vec<u32> }
-TxKind::Call { program: Hash, proof: Vec<u8>, recipients: Vec<Address> }        // proof = postcard(rand_zkvm::Proof)
-TxKind::BridgeAttest { attestation: Vec<u8> }                                   // bridged chains only
-TxKind::BridgeBurn { asset: Hash, amount: u128, to_chain: u16, to: [u8; 32], fee: u128 }
+Transaction { chain_id: u64, bundle: Option<Bundle>, action: Action }
+
+Bundle {
+  anchor: Word8, nullifiers: [Word8; 2], commitments: [Word8; 2],
+  fee: u64, burn: u64, asset: u32, time: u32,
+  envelopes: [Envelope; 2], proof: Vec<u8>,     // postcard(rand_zkvm::Proof) of the bundle guest
+}
+Envelope { kem_ct: Vec<u8>, to_receiver: Vec<u8>, to_sender: Vec<u8>, body: Vec<u8> }
+
+Action::None                                            // a plain shielded transfer
+Action::Mint { cm: Word8, envelope: Envelope, amount: u64, minter: PublicKey, signature: Signature }
+Action::Deploy { base_pc: u32, words: Vec<u32> }
+Action::Call { program: Hash, proof: Vec<u8> }          // postcard(rand_zkvm::Proof)
 ```
 
-Use `shrugg_core::Transaction::transfer(&keypair, chain_id, nonce, to, amount, fee)` from Rust; the
-`shrugg` wallet and `shrugg_client::RpcClient::transfer` do this for you.
+Encoded sizes (bincode's default configuration: fixed-width integers, 8-byte length prefixes,
+`u32` enum tags):
+
+| part | bytes |
+|---|---|
+| `Word8` | 32 |
+| one `Envelope` | 1380 (1088-byte ML-KEM-768 ciphertext, two 60-byte wrapped transaction keys, a 140-byte sealed note, four length prefixes) |
+| `Bundle` minus the proof | 2952 |
+| transfer transaction minus the proof | 2965 |
+| deploy transaction minus both proofs, 100-word program | 3377 |
+| call transaction minus both proofs | 3005 |
+| mint transaction (no bundle) | 5181 (a 1312-byte Dilithium2 key and a 2420-byte signature) |
+| bundle proof | 302,857 measured at tier 14 under the `test` FRI profile |
+
+So a shielded transfer on the wire is about 300 KB, essentially all proof. The ledger caps a proof
+at 1 MiB, an envelope at 2048 bytes, a program at 4096 words, and a block at 4 MiB of transaction
+bytes — roughly a dozen bundles per block.
+
+A wallet builds all of this through `shrugg_client::wallet::{send, submit}`, which selects the
+inputs, fetches the anchor and the witnesses, proves the bundle, seals both envelopes, and checks
+the proof's published digest against the one it computed before it submits anything.

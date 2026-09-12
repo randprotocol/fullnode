@@ -1,11 +1,55 @@
 # The guardian bridge — architecture
 
-> The bridge code lands on main with the `feat/bridge` merge (`543d72b`) and the hardening
-> commits that follow it; this page describes it as of `273e13d` (`4585368` plus the attestation check reordering).
+> **Parked: the bridge is not wired on the shielded chain until phase S3.**
+>
+> Phase S1 replaced the account ledger with a shielded note pool, and the bridge went with the
+> accounts it credited. On this chain today: `Genesis::build` **rejects** a `bridge` section
+> outright (so a bridged chain cannot even be cut), there are no `BridgeAttest`/`BridgeBurn`
+> transaction kinds, no bridge column families, no `bridge_root` in the state root, and every
+> `shrugg_getBridge*`/`shrugg_getAsset*`/`shrugg_bridgeAssetId` RPC method and `shrugg bridge-*`
+> wallet command is gone (`docs/shielded.md`, `docs/rpc.md`, `docs/cli.md`).
+>
+> In S3 it comes back in shielded form: a bridged asset becomes a note with
+> `asset = <bridge asset id>`, `BridgeAttest` deposits a note of public amount, and `BridgeBurn`
+> becomes the one two-bundle transaction — an asset bundle that burns and a SHRUGG bundle that
+> pays the fee, because a bundle balances one asset and the fee is always in SHRUGG (shielded-pool
+> spec §10). The guardian model, the wire format, the guardian-set rotation and the replay rules
+> below are unchanged by any of that and stay the reference for what S3 rebuilds on. The
+> `bridge-codec` crate is still in the workspace and still tested.
+>
+> Everything below describes the bridge as it stood on the account chain, as of `273e13d`
+> (`4585368` plus the attestation check reordering). Read per-account balances in it as
+> "per-note, in S3".
 
 This page assumes `docs/architecture.md`. It covers the wire format, the guardian-attestation
 model, the on-chain `BridgeState`, the two bridge transaction kinds, and the storage/RPC/wallet
 surface built on them.
+
+## 0. The bridge at a glance
+
+```
+   source chain (Ethereum / BSC / Tron / Solana)                    Rand (SHRUGG)
+   ┌──────────────────────────────┐                                 ┌──────────────────────────────┐
+   │ token contract / program     │  lock + emit Transfer           │ BridgeAttest transaction     │
+   │   locks tokens, emits        │ ───────────────────────────────►│   admission: size cap →      │
+   │   (amount, token, to, fee)   │        guardians observe,       │   decode → replay → emitter  │
+   └──────────────────────────────┘        sign mu = keccak²(body)  │   → payload → signatures     │
+                  ▲                        threshold n·2/3 + 1      │   effect: a deposit          │
+                  │                                                 │   (account-era: a balance;   │
+   release        │        ┌──────────────────┐   attestation      │    shielded chain: a note)   │
+   after guardian │        │ guardian committee│ ◄──────────────────┤                              │
+   signatures on  │        │ secp256k1 keys,   │                    │ BridgeBurn transaction       │
+   the burn       │        │ rotated by the    │   guardians read   │   burns units, appends a     │
+   message        │        │ governance emitter│   the burn log     │   BridgeBurnRecord with a    │
+                  └────────┤ (Rand, sole)      │ ◄──────────────────┤   strictly increasing        │
+                           └──────────────────┘   sequence          │   sequence                   │
+                                                                    └──────────────────────────────┘
+```
+
+Inbound: value is locked on the source chain, guardians attest, anyone submits the attestation to
+Rand, Rand mints. Outbound: a Rand transaction burns and emits a message, guardians attest that
+message, the source-chain contract releases. Rand never verifies a source-chain header or state
+proof; the guardian committee's signatures are the entire trust model.
 
 ## 1. Purpose and trust model
 
@@ -407,3 +451,99 @@ same `Ledger`/state-root machinery and gas-limits module (`MAX_ATTESTATION_BYTES
 plain, visible state in `BridgeState.balances` — no confidentiality or zero-knowledge property of
 their own. A future fully shielded design would have to shield bridged balances too; nothing here
 does that today.
+
+## 10. The bridge on the shielded chain (phase S3 design)
+
+From phase S1 on there are no accounts, so "a bridged balance" cannot be a number next to an
+address. Phase S3 (spec §10; plan `docs/superpowers/plans/2026-09-12-shielded-pool-s3.md`)
+re-attaches the bridge to the note pool. Until it lands the bridge is parked: a genesis with a
+`bridge` section is rejected and the bridge RPC methods are absent.
+
+**Assets become notes.** A note's `asset` field (`u32`) names the asset; `0` is SHRUGG. The
+registry assigns every bridged asset a dense index at registration
+(`BridgeState.assets: AssetId → { chain, token, index }`), persisted in `BridgeMeta`, and the
+note carries the index. The 32-byte `AssetId` is still the wire-level identity. Bridged amounts
+must fit `u64` (the note format), which is checked at attestation time.
+
+**Inbound: an attestation deposits a note.**
+
+```
+Action::BridgeAttest { attestation, recipient: ShieldedAddress, r: Word8, envelope }
+```
+
+- The wire `to` field (32 bytes) is `blake3("shrugg-shielded-recipient", pk || kem_ek)` of the
+  recipient's shielded address: the source-chain user computes this hash of the 1.2 KB address
+  and the guardians sign it as before. The submitter includes the full address in the action; the
+  ledger recomputes the hash and rejects a mismatch.
+- The ledger computes the deposit note's commitment itself,
+  `cm = H(CM, (recipient.pk, from = 0, amount, asset_index, time = height, r))`, from the
+  attestation's amount and the action's `r`, so a submitter cannot mint a note that differs from
+  what the guardians attested. The commitment is appended to the tree like a faucet deposit; the
+  envelope is stored with it.
+- What is public in that transaction: the amount, the asset, the recipient's address hash and
+  (in the action) the recipient's address itself. The note's later spend is unlinkable like any
+  other note.
+- Replay protection is unchanged: the attestation digest goes into `spent`.
+- The attestation's own relayer `fee` (in the bridged asset) is paid to the submitter as a
+  second deposit note when non-zero.
+
+**Outbound: a burn is one transaction with two bundles.**
+
+```
+Transaction { chain_id, bundle: <SHRUGG bundle: asset 0, burn 0, pays BUNDLE_BASE>,
+              action: BridgeBurn { asset_bundle: <bundle: asset = index, fee 0, burn = amount + relayer_fee>,
+                                   asset, amount, relayer_fee, to_chain, to } }
+```
+
+- The asset bundle proves, in the zkVM, that the burner owned notes of that asset summing to at
+  least `amount + relayer_fee`; the `burn` field is the value leaving the pool. The guest's rule
+  "`asset ≠ 0` ⇒ `fee = 0`" (phase Z) is why a second, SHRUGG bundle pays the transaction fee.
+- Both bundles pass the full admission order: four nullifiers distinct and unspent, four
+  commitments new, both digests recomputed, both STARK proofs verified.
+- `apply_burn` records the outbound message with the transaction hash in the sender slot
+  (there is no sender identity) and the next `burn_sequence`; guardians read the burn log exactly
+  as today.
+- What is public: the asset, the amount, the destination, the relayer fee. Which notes paid is
+  hidden.
+
+**State and root.** `balances` is deleted from `BridgeState`; `emitters`, `guardian_sets`,
+`current_set`, `assets` (with indices), `spent`, `burn_sequence` and `burns` remain public.
+`root()` covers everything but `burns`, as today, minus balances. The chain's state root regains
+its fifth component on a bridged chain:
+`blake3("shrugg-state-2" || tree || nullifiers || validators || programs || bridge_root)`.
+Storage keeps `bridge_spent` and `bridge_burns` families plus the `bridge_state` meta blob;
+`bridge_balances` is gone.
+
+**RPC and wallet.** `shrugg_getBridgeState`, `shrugg_getBridgeBurn`, `shrugg_bridgeAssetId` and
+`shrugg_getAssets` (the registry with indices) return; per-address balance methods do not exist.
+The wallet computes its own asset balances from its notes (`shrugg asset-balance <index>`),
+submits attestations with `shrugg bridge-mint @attestation.hex` (sealing the envelope to its own
+address), and burns with `shrugg bridge-burn <index> <amount> <chain> <to>`, which proves two
+bundles.
+
+## 11. Privacy and trust on the shielded bridge
+
+| what | who sees it |
+|---|---|
+| a deposit's amount, asset, recipient address | everyone, in that one transaction |
+| which note a recipient later spends | nobody (the nullifier is a one-way function of `nk`) |
+| a burn's amount, asset, destination | everyone (guardians need it) |
+| which notes funded a burn | nobody |
+| bridged asset balances | only the holder (or a viewing-key holder) |
+| guardian set, emitters, registry, burn log | everyone |
+
+The trust model is unchanged: `n·2/3 + 1` colluding guardians can mint arbitrary value. The
+shielded design adds one obligation on Rand's side, which the account-era bridge did not have:
+the ledger, not the submitter, derives the deposit note from the attested amount, so a relayer
+cannot inflate a mint.
+
+## 12. What changes for integrators
+
+- Recipients on Rand are identified by a 32-byte hash of a shielded address, not a Dilithium2
+  address. Wallets print it (`shrugg address --bridge-recipient`) and source-chain front ends
+  must accept it.
+- Amounts are `u64` in the bridged asset's own units after decimals; anything above `2⁶⁴ − 1`
+  is rejected at attestation time.
+- A burn costs one SHRUGG bundle fee plus two proofs (~100 s each on a laptop today).
+- The asset index, not the asset id, is what a note and a wallet carry; the registry maps between
+  them (`shrugg_getAssets`).

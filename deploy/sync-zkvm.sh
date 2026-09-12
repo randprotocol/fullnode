@@ -1,26 +1,43 @@
 #!/usr/bin/env bash
 # deploy/sync-zkvm.sh — copy the research zkVM into crates/shrugg-zkvm. Run from the repo root.
 #
-# Local additions (executor.rs, codec.rs, the extended guests.rs and asm.rs, tests/executor.rs) are preserved; machine.rs gets a
+# Local additions (executor.rs, codec.rs, address.rs, the extended guests.rs and asm.rs,
+# tests/executor.rs, tests/shielded.rs) are preserved; machine.rs gets a
 # small post-sync patch exposing log_ext_degrees_pub (M4.1: now (tier, program_log_height,
 # input_log_height)-keyed — the input table's declared height joins the program table's as a
 # third, proof-declared key component; see the M4.1 patch comment below). tests/backend.rs,
 # tests/cheating.rs, tests/emulator.rs, tests/isa.rs, tests/tables.rs and tests/zk.rs are vendored
 # wholesale, as before — nothing sync-script-specific changed for them under M4.1.
 #
-# Not vendored: the research crate's viewing-key stack (arx.rs — no longer exists upstream since
-# M3.3's Poseidon2 switch, kept in the exclude list anyway, harmless — notes.rs, viewing.rs,
-# ledger.rs and tests/viewing.rs). The node has no use for it yet and it drags in
-# ml-kem/chacha20poly1305, so those files are excluded here; lib.rs and main.rs are hand-maintained
-# on this side for the same reason (they name modules that only exist upstream).
+# Shielded pool S1: the note layer — `notes.rs`, `viewing.rs`, `ledger.rs` — IS vendored now. The
+# node's shielded pool is built on exactly the research crate's note commitments, nullifiers,
+# key hierarchy, envelope format and commitment tree, so a second hand-written copy on this side
+# would be a soundness bug waiting to happen; `crates/shrugg-zkvm/Cargo.toml` therefore carries
+# `ml-kem`/`chacha20poly1305` (the same pinned versions upstream uses) and `src/lib.rs` names the
+# three modules. Node-specific code that bridges them to `shrugg-core`'s pure data types lives in
+# the hand-maintained `src/address.rs`; the three vendored files are never hand-edited.
 #
-# `hash.rs` IS vendored (M3.4): it is core, not viewing-key-specific — the program digest `hc`
+# Still not vendored: arx.rs (no longer exists upstream since M3.3's Poseidon2 switch, kept in the
+# exclude list anyway, harmless); lib.rs and main.rs (hand-maintained on this side — they name
+# modules that only exist on one side or the other); and, on the test side, `tests/viewing.rs` and
+# `tests/bundle.rs`. Those two are excluded purely for runtime: each proves several `bundle`/
+# `transfer` guests at tier 14 and takes minutes, so they stay upstream, where they are the
+# authority on the note layer's behaviour. `crates/shrugg-zkvm/tests/shielded.rs` is this side's
+# own, much smaller check that the vendored layer agrees with `shrugg-core`'s types (trees, the
+# pinned `hc_bundle`, one end-to-end bundle proof).
+#
+# `hash.rs` IS vendored (M3.4): it is core, not note-layer-specific — the program digest `hc`
 # `isa::Program::digest` computes and the `POSEIDON2` syscall's reference sponge both live there.
 # M4.1 added a second sponge, `input_digest` (`H_IN`, the salted private-input commitment), which
-# reads a second domain tag the same way `program_digest` does. Both tags live in the excluded
-# `notes.rs` upstream (`notes::domain::HC` and `notes::domain::IN`) and `tables/cpu.rs`'s matching
-# in-circuit copies of them; both are patched below to local `hash::HC_DOMAIN` / `hash::IN_DOMAIN`
-# constants instead of pulling `notes.rs` in for two `u32`s.
+# reads a second domain tag the same way `program_digest` does. Both tags live in `notes.rs`
+# upstream (`notes::domain::HC` and `notes::domain::IN`) and `tables/cpu.rs`'s matching in-circuit
+# copies of them; both are still patched below to local `hash::HC_DOMAIN` / `hash::IN_DOMAIN`
+# constants. That patch predates the note layer being vendored and is deliberately kept rather
+# than reverted: it is two `sed` lines plus a two-constant insertion, whereas reverting it would
+# mean re-patching `hash.rs`/`tables/cpu.rs` in the opposite direction on every resync. What keeps
+# the two copies honest is `tests/shielded.rs`, which asserts `notes::domain::HC == hash::HC_DOMAIN`
+# and `notes::domain::IN == hash::IN_DOMAIN` — now that `notes.rs` is vendored, a drifting tag is a
+# test failure on this side rather than a silent divergence.
 #
 # M4.1 also vendors `tables/input.rs` (new — the salted-input-commitment witness table) and picks
 # up `isa.rs`'s new `Program::from_flat_binary`/`to_flat_binary` loader automatically, since
@@ -42,9 +59,10 @@ DST=crates/shrugg-zkvm
 mkdir -p "$DST/src" "$DST/tests"
 rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude rust-toolchain.toml \
       --exclude executor.rs --exclude codec.rs --exclude guests.rs --exclude asm.rs \
-      --exclude arx.rs --exclude notes.rs --exclude viewing.rs --exclude ledger.rs \
+      --exclude address.rs --exclude arx.rs \
       --exclude lib.rs --exclude main.rs "$SRC/src/" "$DST/src/"
-rsync -a --delete --exclude executor.rs --exclude viewing.rs "$SRC/tests/" "$DST/tests/"
+rsync -a --delete --exclude executor.rs --exclude shielded.rs \
+      --exclude viewing.rs --exclude bundle.rs "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1: vendor the compiled guest binary `tests/e2e.rs::compiled_fib_*` and the local
 # `guests::compiled::fib()` (see the header comment) both need. It lives beside `research/`, not
@@ -92,8 +110,9 @@ PY
 fi
 # M3.4/M4.1: `hash.rs`'s program-digest header and `tables/cpu.rs`'s in-circuit copy of the same
 # constant both read `crate::notes::domain::HC` upstream; M4.1 added a second such pair for the
-# input digest, `crate::notes::domain::IN`. `notes.rs` isn't vendored (see the header comment
-# above), so redirect both to local constants instead of pulling it in for two `u32`s.
+# input digest, `crate::notes::domain::IN`. The patch predates `notes.rs` being vendored and is
+# kept rather than reversed (see the header comment above): two `sed` lines and one inserted
+# constant block, versus re-patching in the opposite direction on every resync.
 if grep -Eq "crate::notes::domain::(HC|IN)" "$DST/src/hash.rs" "$DST/src/tables/cpu.rs" 2>/dev/null; then
   grep -rl "crate::notes::domain::HC" "$DST/src" | xargs -I{} sed -i '' 's/crate::notes::domain::HC/crate::hash::HC_DOMAIN/g' {}
   # No word-boundary anchor needed: `domain::IN` has no colliding sibling constant (NK, PK, NF,
@@ -102,19 +121,21 @@ if grep -Eq "crate::notes::domain::(HC|IN)" "$DST/src/hash.rs" "$DST/src/tables/
   # all rather than fail loudly, which is worse than the (nonexistent) collision risk it guards.
   grep -rl "crate::notes::domain::IN" "$DST/src" | xargs -I{} sed -i '' 's/crate::notes::domain::IN/crate::hash::IN_DOMAIN/g' {}
 fi
-if ! grep -q "pub(crate) const HC_DOMAIN" "$DST/src/hash.rs"; then
+if ! grep -q "const HC_DOMAIN" "$DST/src/hash.rs"; then
   python3 - "$DST/src/hash.rs" <<'PY'
 import sys; p=sys.argv[1]; s=open(p).read()
 anchor = "use std::sync::OnceLock;\n"
 const = anchor + (
-    "\n/// `notes::domain::HC` (= 8) and `notes::domain::IN` (= 10), inlined: `notes.rs` isn't\n"
-    "/// vendored into this crate (it drags in ml-kem/chacha20poly1305 for a viewing-key stack the\n"
-    "/// node has no use for yet — see `deploy/sync-zkvm.sh`'s header comment), but\n"
-    "/// `program_digest`/`input_digest` below and `tables::cpu`'s digest-row prefixes both need\n"
-    "/// these exact domain tags to agree. Keep in sync with `research/src/notes.rs`'s `domain::HC`\n"
-    "/// / `domain::IN` by hand across a resync.\n"
-    "pub(crate) const HC_DOMAIN: u32 = 8;\n"
-    "pub(crate) const IN_DOMAIN: u32 = 10;\n"
+    "\n/// `notes::domain::HC` (= 8) and `notes::domain::IN` (= 10), inlined: `program_digest`/\n"
+    "/// `input_digest` below and `tables::cpu`'s digest-row prefixes both need these exact domain\n"
+    "/// tags to agree, and this patch predates `notes.rs` being vendored — it is kept rather than\n"
+    "/// reversed; see `deploy/sync-zkvm.sh`'s header comment.\n"
+    "///\n"
+    "/// `pub`, not `pub(crate)`: `tests/shielded.rs` asserts these equal the vendored\n"
+    "/// `notes::domain::HC` / `notes::domain::IN`, which is what keeps the two copies from drifting\n"
+    "/// across a resync, and an integration test is a separate crate.\n"
+    "pub const HC_DOMAIN: u32 = 8;\n"
+    "pub const IN_DOMAIN: u32 = 10;\n"
 )
 assert anchor in s, "hash.rs no longer has the expected anchor line; update the sync script's patch"
 s = s.replace(anchor, const, 1)

@@ -1,14 +1,17 @@
 //! Persistent chain storage: one RocksDB with column families.
 //!
 //! Every commit is a single atomic, fsynced `WriteBatch` covering blocks,
-//! certificates, indexes, transaction locations, touched accounts, and the head.
+//! certificates, indexes, transaction locations, the notes and nullifiers the
+//! block created, its end-of-block anchor, the proposer's validator entry, the
+//! commitment-tree frontier, and the head.
 
 use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB};
-use shrugg_core::bridge::{asset_id, AssetId, Attestation, BridgeBurnRecord, BridgeMeta, BridgeState, Payload};
+use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::consensus::{CommittedBlock, SafetyState};
 use shrugg_core::genesis::GenesisState;
-use shrugg_core::confidential::ConfidentialExecutor;
-use shrugg_core::{Account, Address, Block, CallReceipt, Hash, Ledger, ProgramId, ProgramRecord, QuorumCertificate, TxKind};
+use shrugg_core::ledger::ValidatorEntry;
+use shrugg_core::notes::{word8_from_bytes, word8_to_bytes, CommitmentTree, Envelope, FullTree, Word8, DEPTH};
+use shrugg_core::{Action, Address, Block, CallReceipt, Hash, Ledger, ProgramId, ProgramRecord, QuorumCertificate};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -16,41 +19,42 @@ const CF_BLOCKS: &str = "blocks";
 const CF_QCS: &str = "qcs";
 const CF_BLOCK_INDEX: &str = "block_index";
 const CF_TXS: &str = "txs";
-const CF_ACCOUNTS: &str = "accounts";
 const CF_META: &str = "meta";
 const CF_PROGRAMS: &str = "programs";
 const CF_RECEIPTS: &str = "receipts";
-/// `asset(32) || address(32)` -> `bincode(u128)`. A zero balance has no row,
-/// matching the bridge state root, which prunes zero balances.
-const CF_BRIDGE_BALANCES: &str = "bridge_balances";
-/// Consumed attestation digest -> empty. Membership is the whole value.
-const CF_BRIDGE_SPENT: &str = "bridge_spent";
-/// Burn sequence (big-endian u64, so the family iterates in order) ->
-/// `bincode(BridgeBurnRecord)`.
-const CF_BRIDGE_BURNS: &str = "bridge_burns";
+/// Leaf index (big-endian u64, so the family iterates in tree order) -> `bincode(NoteRow)`.
+/// Dense from zero: `notes_count` is the last key plus one, and a wallet pages it to scan.
+const CF_NOTES: &str = "notes";
+/// Nullifier (32 bytes) -> the height of the block that spent it (big-endian u64).
+const CF_NULLIFIERS: &str = "nullifiers";
+/// Block height (big-endian u64) -> the commitment-tree root at the end of that block.
+const CF_ANCHORS: &str = "anchors";
+/// Validator address (32 bytes) -> `bincode(ValidatorEntry)`.
+const CF_VALIDATORS: &str = "validators";
 const ALL_CFS: [&str; 11] = [
     CF_BLOCKS,
     CF_QCS,
     CF_BLOCK_INDEX,
     CF_TXS,
-    CF_ACCOUNTS,
     CF_META,
     CF_PROGRAMS,
     CF_RECEIPTS,
-    CF_BRIDGE_BALANCES,
-    CF_BRIDGE_SPENT,
-    CF_BRIDGE_BURNS,
+    CF_NOTES,
+    CF_NULLIFIERS,
+    CF_ANCHORS,
+    CF_VALIDATORS,
 ];
-const BRIDGE_CFS: [&str; 3] = [CF_BRIDGE_BALANCES, CF_BRIDGE_SPENT, CF_BRIDGE_BURNS];
 
 const META_HEAD_HEIGHT: &str = "head_height";
 const META_GENESIS_HASH: &str = "genesis_hash";
 const META_CHAIN_ID: &str = "chain_id";
 const META_SAFETY: &str = "safety";
-/// `bincode(BridgeMeta)`: the whole-state half of the bridge (emitter, emitter
-/// table, guardian sets, current index, asset registry, burn sequence). Its
-/// presence is what makes a chain "bridged" on disk.
-const META_BRIDGE_STATE: &str = "bridge_state";
+/// `bincode(CommitmentTree)`: the depth-32 frontier, the only form of the note tree consensus
+/// state keeps. The leaves themselves live in `notes` and rebuild a `FullTree` for witnesses.
+const META_TREE: &str = "tree";
+/// The genesis `hc_bundle` (32 bytes): the bundle guest commitment every bundle proof on this
+/// chain is verified against.
+const META_HC_BUNDLE: &str = "hc_bundle";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -66,12 +70,21 @@ pub enum StorageError {
     Corrupt(String),
 }
 
-type Result<T> = std::result::Result<T, StorageError>;
+pub type Result<T> = std::result::Result<T, StorageError>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Head {
     pub height: u64,
     pub hash: Hash,
+}
+
+/// One leaf of the commitment tree as it is served to wallets: the commitment, the envelope
+/// sealed against it, and the height of the block that appended it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NoteRow {
+    pub cm: Word8,
+    pub envelope: Envelope,
+    pub height: u64,
 }
 
 pub struct Storage {
@@ -82,30 +95,37 @@ fn height_key(h: u64) -> [u8; 8] {
     h.to_be_bytes()
 }
 
-/// Key of a bridged-asset balance row: `asset || address`.
-fn balance_key(asset: &AssetId, addr: &Address) -> [u8; 64] {
-    let mut k = [0u8; 64];
-    k[..32].copy_from_slice(asset.as_bytes());
-    k[32..].copy_from_slice(addr.as_bytes());
-    k
+fn be_u64(bytes: &[u8], what: &str) -> Result<u64> {
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| StorageError::Corrupt(format!("{what} is not 8 bytes")))?;
+    Ok(u64::from_be_bytes(arr))
 }
 
-/// The inverse of [`balance_key`].
-fn split_balance_key(k: &[u8]) -> Result<(AssetId, Address)> {
-    if k.len() != 64 {
-        return Err(StorageError::Corrupt("bridge_balances key has wrong length".into()));
-    }
-    let mut asset = [0u8; 32];
-    let mut addr = [0u8; 32];
-    asset.copy_from_slice(&k[..32]);
-    addr.copy_from_slice(&k[32..]);
-    Ok((Hash(asset), Address(addr)))
+fn word8(bytes: &[u8], what: &str) -> Result<Word8> {
+    word8_from_bytes(bytes).ok_or_else(|| StorageError::Corrupt(format!("{what} is not 32 bytes")))
 }
 
 fn sync_opts() -> WriteOptions {
     let mut w = WriteOptions::default();
     w.set_sync(true);
     w
+}
+
+/// Every note a transaction creates, paired with the envelope that opens it: the bundle's two
+/// output slots in that order, then a mint's single note — exactly `Transaction::commitments`'
+/// order, so the index a leaf gets on disk is the index the ledger gave it.
+fn created_notes(tx: &shrugg_core::Transaction) -> Vec<(Word8, Envelope)> {
+    let mut out = Vec::new();
+    if let Some(b) = &tx.bundle {
+        for i in 0..2 {
+            out.push((b.commitments[i], b.envelopes[i].clone()));
+        }
+    }
+    if let Action::Mint { cm, envelope, .. } = &tx.action {
+        out.push((*cm, envelope.clone()));
+    }
+    out
 }
 
 impl Storage {
@@ -164,12 +184,17 @@ impl Storage {
             bincode::serialize(&QuorumCertificate::genesis(genesis_hash))?,
         );
         batch.put_cf(self.cf(CF_BLOCK_INDEX), genesis_hash.as_bytes(), height_key(0));
-        for (addr, acct) in gs.ledger.accounts() {
-            batch.put_cf(self.cf(CF_ACCOUNTS), addr.as_bytes(), bincode::serialize(acct)?);
+        // The alloc notes are leaves 0..n of the tree, in file order, all at height 0.
+        for (index, (cm, envelope, _amount)) in gs.notes.iter().enumerate() {
+            let row = NoteRow { cm: *cm, envelope: envelope.clone(), height: 0 };
+            batch.put_cf(self.cf(CF_NOTES), height_key(index as u64), bincode::serialize(&row)?);
         }
-        if let Some(bridge) = gs.ledger.bridge() {
-            self.put_bridge(&mut batch, bridge)?;
+        for (addr, entry) in gs.ledger.validators() {
+            batch.put_cf(self.cf(CF_VALIDATORS), addr.as_bytes(), bincode::serialize(entry)?);
         }
+        batch.put_cf(self.cf(CF_ANCHORS), height_key(0), word8_to_bytes(&gs.ledger.root()));
+        batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(gs.ledger.tree())?);
+        batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(0));
         batch.put_cf(self.cf(CF_META), META_GENESIS_HASH, genesis_hash.as_bytes());
         batch.put_cf(self.cf(CF_META), META_CHAIN_ID, gs.chain_id.to_be_bytes());
@@ -177,116 +202,129 @@ impl Storage {
         Ok(())
     }
 
-    // ---- bridged assets --------------------------------------------------
+    // ---- the shielded pool ----------------------------------------------
 
-    /// Write a whole bridge state — the `meta` blob and every row of the three
-    /// families — into `batch`. Used where the state is installed wholesale
-    /// (genesis, truncation); `commit` writes only what a block touched.
-    fn put_bridge(&self, batch: &mut WriteBatch, bridge: &BridgeState) -> Result<()> {
-        batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE, bincode::serialize(&bridge.meta())?);
-        for ((asset, addr), balance) in &bridge.balances {
-            if *balance == 0 {
-                continue;
-            }
-            batch.put_cf(self.cf(CF_BRIDGE_BALANCES), balance_key(asset, addr), bincode::serialize(balance)?);
-        }
-        for digest in &bridge.spent {
-            batch.put_cf(self.cf(CF_BRIDGE_SPENT), digest.as_bytes(), []);
-        }
-        for (sequence, rec) in &bridge.burns {
-            batch.put_cf(self.cf(CF_BRIDGE_BURNS), height_key(*sequence), bincode::serialize(rec)?);
-        }
-        Ok(())
+    /// The leaf at `index`, or `None` past the end of the tree.
+    pub fn note(&self, index: u64) -> Result<Option<NoteRow>> {
+        self.get(CF_NOTES, &height_key(index))
     }
 
-    /// Delete every bridge row and the `meta` blob into `batch`.
-    fn clear_bridge(&self, batch: &mut WriteBatch) -> Result<()> {
-        for name in BRIDGE_CFS {
-            for item in self.db.iterator_cf(self.cf(name), IteratorMode::Start) {
-                let (k, _) = item?;
-                batch.delete_cf(self.cf(name), k);
-            }
-        }
-        batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE);
-        Ok(())
-    }
-
-    /// The bridge's whole-state half, or `None` on a chain without a bridge.
-    pub fn bridge_meta(&self) -> Result<Option<BridgeMeta>> {
-        match self.get_meta_raw(META_BRIDGE_STATE)? {
-            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// `addr`'s balance of bridged asset `asset` at the committed head; zero
-    /// if there is no row (or no bridge at all).
-    pub fn asset_balance(&self, asset: &AssetId, addr: &Address) -> Result<u128> {
-        Ok(self.get::<u128>(CF_BRIDGE_BALANCES, &balance_key(asset, addr))?.unwrap_or(0))
-    }
-
-    /// Every bridged asset `addr` holds a non-zero balance of, with its home
-    /// chain and token address from the registry.
-    ///
-    /// The balance key is `asset || address`, so this scans the family rather
-    /// than seeking: bridged holdings are few, and the alternative (a second
-    /// index keyed the other way round) would be state to keep consistent.
-    pub fn assets_of(&self, addr: &Address) -> Result<Vec<(AssetId, u16, [u8; 32], u128)>> {
-        // One snapshot for the registry and the balances: a commit landing
-        // between the two reads could otherwise show a balance whose asset was
-        // registered by that same commit, which reads as corruption below.
-        let snap = self.db.snapshot();
-        let raw = snap.get_cf(self.cf(CF_META), META_BRIDGE_STATE.as_bytes())?;
-        let Some(meta) = raw.map(|b| bincode::deserialize::<BridgeMeta>(&b)).transpose()? else {
-            return Ok(Vec::new());
-        };
+    /// Up to `limit` consecutive leaves starting at `from`, in tree order: what a wallet pages
+    /// through to trial-decrypt.
+    pub fn notes_from(&self, from: u64, limit: usize) -> Result<Vec<(u64, NoteRow)>> {
+        let mode = IteratorMode::From(&height_key(from), rocksdb::Direction::Forward);
         let mut out = Vec::new();
-        for item in snap.iterator_cf(self.cf(CF_BRIDGE_BALANCES), IteratorMode::Start) {
-            let (k, v) = item?;
-            let (asset, holder) = split_balance_key(k.as_ref())?;
-            if holder != *addr {
-                continue;
+        for item in self.db.iterator_cf(self.cf(CF_NOTES), mode) {
+            if out.len() >= limit {
+                break;
             }
-            let balance: u128 = bincode::deserialize(&v)?;
-            let (chain, token) = meta
-                .assets
-                .get(&asset)
-                .copied()
-                .ok_or_else(|| StorageError::Corrupt(format!("balance of unregistered asset {asset}")))?;
-            out.push((asset, chain, token, balance));
+            let (k, v) = item?;
+            out.push((be_u64(k.as_ref(), "note key")?, bincode::deserialize(&v)?));
         }
         Ok(out)
     }
 
-    /// The outbound burn message with this sequence, for guardians to sign.
-    pub fn bridge_burn(&self, sequence: u64) -> Result<Option<BridgeBurnRecord>> {
-        self.get(CF_BRIDGE_BURNS, &height_key(sequence))
+    /// The number of leaves, i.e. the index the next note gets. The family is dense from zero,
+    /// so this is the last key plus one rather than a scan.
+    pub fn notes_count(&self) -> Result<u64> {
+        match self.db.iterator_cf(self.cf(CF_NOTES), IteratorMode::End).next() {
+            Some(item) => Ok(be_u64(item?.0.as_ref(), "note key")? + 1),
+            None => Ok(0),
+        }
     }
 
-    /// Rebuild the bridge state from the `meta` blob plus the three families.
-    /// `None` when the blob is absent, which is how a chain without a bridge
-    /// (and only such a chain, once `init_genesis` has run) looks on disk.
-    fn load_bridge(&self) -> Result<Option<BridgeState>> {
-        let Some(meta) = self.bridge_meta()? else { return Ok(None) };
-        let mut balances = BTreeMap::new();
-        for item in self.db.iterator_cf(self.cf(CF_BRIDGE_BALANCES), IteratorMode::Start) {
+    /// The height of the block that spent `nf`, or `None` if it is unspent.
+    pub fn nullifier_height(&self, nf: &Word8) -> Result<Option<u64>> {
+        match self.db.get_cf(self.cf(CF_NULLIFIERS), word8_to_bytes(nf))? {
+            Some(v) => Ok(Some(be_u64(&v, "nullifier height")?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn nullifiers_count(&self) -> Result<u64> {
+        Ok(self.db.iterator_cf(self.cf(CF_NULLIFIERS), IteratorMode::Start).count() as u64)
+    }
+
+    /// Nullifiers spent at or after `from_height`, oldest first, at most `limit` of them.
+    ///
+    /// The family is keyed by nullifier (membership is what admission asks of it), so a
+    /// height-ordered listing is a scan and a sort. That is affordable at testnet sizes and is
+    /// the price of not keeping a second index consistent across commit and truncation.
+    pub fn nullifiers_from(&self, from_height: u64, limit: usize) -> Result<Vec<(u64, Word8)>> {
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_NULLIFIERS), IteratorMode::Start) {
             let (k, v) = item?;
-            balances.insert(split_balance_key(k.as_ref())?, bincode::deserialize::<u128>(&v)?);
+            let height = be_u64(&v, "nullifier height")?;
+            if height >= from_height {
+                out.push((height, word8(k.as_ref(), "nullifier key")?));
+            }
         }
-        let mut spent = BTreeSet::new();
-        for item in self.db.iterator_cf(self.cf(CF_BRIDGE_SPENT), IteratorMode::Start) {
-            let (k, _) = item?;
-            let arr: [u8; 32] =
-                k.as_ref().try_into().map_err(|_| StorageError::Corrupt("bridge_spent key has wrong length".into()))?;
-            spent.insert(Hash(arr));
+        out.sort();
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// The commitment-tree root at the end of block `height`, if it is still in the window.
+    pub fn anchor(&self, height: u64) -> Result<Option<Word8>> {
+        match self.db.get_cf(self.cf(CF_ANCHORS), height_key(height))? {
+            Some(v) => Ok(Some(word8(&v, "anchor")?)),
+            None => Ok(None),
         }
-        let mut burns = BTreeMap::new();
-        for item in self.db.iterator_cf(self.cf(CF_BRIDGE_BURNS), IteratorMode::Start) {
-            let (_, v) = item?;
-            let rec: BridgeBurnRecord = bincode::deserialize(&v)?;
-            burns.insert(rec.sequence, rec);
+    }
+
+    /// The newest stored anchor: the root a prover should build against.
+    pub fn latest_anchor(&self) -> Result<Option<(u64, Word8)>> {
+        match self.db.iterator_cf(self.cf(CF_ANCHORS), IteratorMode::End).next() {
+            Some(item) => {
+                let (k, v) = item?;
+                Ok(Some((be_u64(k.as_ref(), "anchor key")?, word8(&v, "anchor")?)))
+            }
+            None => Ok(None),
         }
-        Ok(Some(BridgeState::from_parts(meta, balances, spent, burns)))
+    }
+
+    /// The commitment-tree frontier at the committed head.
+    pub fn tree(&self) -> Result<CommitmentTree> {
+        let bytes = self.get_meta_raw(META_TREE)?.ok_or(StorageError::NotInitialized)?;
+        Ok(bincode::deserialize(&bytes)?)
+    }
+
+    /// The bundle guest commitment this chain's genesis pinned.
+    pub fn hc_bundle(&self) -> Result<Word8> {
+        let bytes = self.get_meta_raw(META_HC_BUNDLE)?.ok_or(StorageError::NotInitialized)?;
+        word8(&bytes, "hc_bundle meta")
+    }
+
+    pub fn validator(&self, a: &Address) -> Result<Option<ValidatorEntry>> {
+        self.get(CF_VALIDATORS, a.as_bytes())
+    }
+
+    /// Every leaf in tree order. The witness source, and the check `load_ledger` runs the
+    /// stored frontier against.
+    fn leaves(&self) -> Result<Vec<Word8>> {
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_NOTES), IteratorMode::Start) {
+            let (k, v) = item?;
+            let index = be_u64(k.as_ref(), "note key")?;
+            if index != out.len() as u64 {
+                return Err(StorageError::Corrupt(format!("notes family has a gap at index {}", out.len())));
+            }
+            let row: NoteRow = bincode::deserialize(&v)?;
+            out.push(row.cm);
+        }
+        Ok(out)
+    }
+
+    /// The Merkle witness of leaf `index` against the current root: `(root, siblings)` with the
+    /// leaf level first, the layout the bundle guest's `MERKLE_VERIFY` reads. `None` past the
+    /// end of the tree. Rebuilds a `FullTree` from `notes`, so it is `O(leaves)`.
+    pub fn witness(&self, index: u64, executor: &dyn ConfidentialExecutor) -> Result<Option<(Word8, [Word8; DEPTH])>> {
+        let leaves = self.leaves()?;
+        if index >= leaves.len() as u64 {
+            return Ok(None);
+        }
+        let tree = FullTree::new(leaves, executor);
+        Ok(tree.path(index).map(|p| (tree.root(), p)))
     }
 
     pub fn genesis_hash(&self) -> Result<Hash> {
@@ -300,20 +338,12 @@ impl Storage {
 
     pub fn chain_id(&self) -> Result<u64> {
         let bytes = self.get_meta_raw(META_CHAIN_ID)?.ok_or(StorageError::NotInitialized)?;
-        let arr: [u8; 8] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| StorageError::Corrupt("chain_id meta has wrong length".into()))?;
-        Ok(u64::from_be_bytes(arr))
+        be_u64(&bytes, "chain_id meta")
     }
 
     pub fn head(&self) -> Result<Head> {
         let bytes = self.get_meta_raw(META_HEAD_HEIGHT)?.ok_or(StorageError::NotInitialized)?;
-        let arr: [u8; 8] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| StorageError::Corrupt("head_height meta has wrong length".into()))?;
-        let height = u64::from_be_bytes(arr);
+        let height = be_u64(&bytes, "head_height meta")?;
         let block = self
             .block_by_height(height)?
             .ok_or_else(|| StorageError::Corrupt(format!("head block {height} missing")))?;
@@ -356,8 +386,11 @@ impl Storage {
             match self.receipt(&tx.hash())? {
                 Some(r) => receipts.push(r),
                 None => {
-                    if matches!(tx.body.kind, shrugg_core::TxKind::Call { .. }) {
-                        return Err(StorageError::Corrupt(format!("receipt for call {} in block {h} missing", tx.hash())).into());
+                    if matches!(tx.action, Action::Call { .. }) {
+                        return Err(StorageError::Corrupt(format!(
+                            "receipt for call {} in block {h} missing",
+                            tx.hash()
+                        )));
                     }
                 }
             }
@@ -367,13 +400,7 @@ impl Storage {
 
     pub fn height_by_hash(&self, h: &Hash) -> Result<Option<u64>> {
         match self.db.get_cf(self.cf(CF_BLOCK_INDEX), h.as_bytes())? {
-            Some(bytes) => {
-                let arr: [u8; 8] = bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| StorageError::Corrupt("block_index value has wrong length".into()))?;
-                Ok(Some(u64::from_be_bytes(arr)))
-            }
+            Some(bytes) => Ok(Some(be_u64(&bytes, "block_index value")?)),
             None => Ok(None),
         }
     }
@@ -389,7 +416,6 @@ impl Storage {
         self.get(CF_TXS, h.as_bytes())
     }
 
-    /// Account state at the committed head; default (zero) if absent.
     pub fn program(&self, id: &ProgramId) -> Result<Option<ProgramRecord>> {
         self.get(CF_PROGRAMS, id.as_bytes())
     }
@@ -402,22 +428,63 @@ impl Storage {
         self.get(CF_RECEIPTS, tx.as_bytes())
     }
 
-    pub fn account(&self, a: &Address) -> Result<Account> {
-        Ok(self.get::<Account>(CF_ACCOUNTS, a.as_bytes())?.unwrap_or_default())
-    }
-
-    /// Load every account, program and bridge row into an in-memory ledger.
-    pub fn load_ledger(&self) -> Result<Ledger> {
+    /// Rebuild the in-memory ledger from the note, nullifier, anchor, validator and program
+    /// families plus the stored frontier.
+    ///
+    /// The frontier is checked against `executor` here rather than trusted: a tree written by a
+    /// different hash function (a database carried over from another build, or a damaged blob)
+    /// would otherwise be accepted and every anchor this node published afterwards would be one
+    /// no other node recognises. Rebuilding a `FullTree` from the leaves is `O(leaves)` hashing,
+    /// paid once at startup.
+    ///
+    /// The faucet and confidential switches come from genesis, not from storage, so the caller
+    /// sets them afterwards.
+    pub fn load_ledger(&self, executor: &dyn ConfidentialExecutor) -> Result<Ledger> {
         let chain_id = self.chain_id()?;
-        let mut accounts = BTreeMap::new();
-        for item in self.db.iterator_cf(self.cf(CF_ACCOUNTS), IteratorMode::Start) {
+        let hc_bundle = self.hc_bundle()?;
+        let tree = self.tree()?;
+
+        let leaves = self.leaves()?;
+        if tree.next_index() != leaves.len() as u64 {
+            return Err(StorageError::Corrupt(format!(
+                "stored tree has {} leaves but the notes family has {}",
+                tree.next_index(),
+                leaves.len()
+            )));
+        }
+        // With no leaves the two sides of this are `CommitmentTree::empty_root(executor)`.
+        let commitments: BTreeSet<Word8> = leaves.iter().copied().collect();
+        let rebuilt = FullTree::new(leaves, executor).root();
+        if rebuilt != tree.root() {
+            return Err(StorageError::Corrupt(
+                "stored commitment tree does not hash to the notes it claims to cover".into(),
+            ));
+        }
+
+        let mut nullifiers = BTreeSet::new();
+        for item in self.db.iterator_cf(self.cf(CF_NULLIFIERS), IteratorMode::Start) {
+            let (k, _) = item?;
+            nullifiers.insert(word8(k.as_ref(), "nullifier key")?);
+        }
+        // The window is the newest ANCHOR_WINDOW heights; the family may hold older rows if a
+        // commit wrote more than a window's worth of blocks at once.
+        let mut anchors: Vec<(u64, Word8)> = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_ANCHORS), IteratorMode::End) {
+            if anchors.len() >= shrugg_core::ledger::ANCHOR_WINDOW {
+                break;
+            }
+            let (k, v) = item?;
+            anchors.push((be_u64(k.as_ref(), "anchor key")?, word8(&v, "anchor")?));
+        }
+        anchors.reverse();
+        let mut validators = BTreeMap::new();
+        for item in self.db.iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::Start) {
             let (k, v) = item?;
             let arr: [u8; 32] = k
                 .as_ref()
                 .try_into()
-                .map_err(|_| StorageError::Corrupt("account key has wrong length".into()))?;
-            let acct: Account = bincode::deserialize(&v)?;
-            accounts.insert(Address(arr), acct);
+                .map_err(|_| StorageError::Corrupt("validator key has wrong length".into()))?;
+            validators.insert(Address(arr), bincode::deserialize::<ValidatorEntry>(&v)?);
         }
         let mut programs = BTreeMap::new();
         for item in self.db.iterator_cf(self.cf(CF_PROGRAMS), IteratorMode::Start) {
@@ -425,28 +492,21 @@ impl Storage {
             let rec: ProgramRecord = bincode::deserialize(&v)?;
             programs.insert(rec.id, rec);
         }
-        let mut ledger = Ledger::from_parts(chain_id, accounts, programs);
-        ledger.set_bridge(self.load_bridge()?);
-        Ok(ledger)
+        Ok(Ledger::from_parts(chain_id, hc_bundle, tree, commitments, nullifiers, anchors, validators, programs))
     }
 
-    /// Atomically append committed blocks and the accounts they touched.
+    /// Atomically append committed blocks and the state they produced.
     pub fn commit(&self, blocks: &[CommittedBlock], ledger_after: &Ledger) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
         let head = self.head()?;
-        let mut expected_height = head.height + 1;
+        let first_height = head.height + 1;
+        let mut expected_height = first_height;
         let mut expected_parent = head.hash;
+        let mut next_index = self.notes_count()?;
+        let mut proposers: BTreeSet<Address> = BTreeSet::new();
         let mut batch = WriteBatch::default();
-        let mut touched: BTreeSet<Address> = BTreeSet::new();
-        // Bridge rows a block's transactions can have moved. Attestations are
-        // re-decoded here rather than diffed against the previous state so a
-        // commit stays O(block), like the account path above.
-        let mut bridge_touched: BTreeSet<(AssetId, Address)> = BTreeSet::new();
-        let mut spent_digests: BTreeSet<Hash> = BTreeSet::new();
-        let mut has_bridge_tx = false;
-        let first_burn_sequence = self.bridge_meta()?.map(|m| m.burn_sequence).unwrap_or(0);
 
         for cb in blocks {
             let block = &cb.block;
@@ -481,94 +541,61 @@ impl Storage {
                     tx.hash().as_bytes(),
                     bincode::serialize(&(block.height(), index as u32))?,
                 );
-                touched.insert(tx.sender());
-                match &tx.body.kind {
-                    TxKind::Transfer { to, .. } | TxKind::Mint { to, .. } => {
-                        touched.insert(*to);
-                    }
-                    // Bridge kinds move bridged-asset balances, not SHRUGG
-                    // accounts beyond the sender, so they touch the bridge
-                    // families instead. A committed attestation decoded and
-                    // applied, so anything that fails to decode here would be
-                    // a torn block, not a rejected transaction; the balances
-                    // written below come from `ledger_after` either way.
-                    TxKind::BridgeAttest { attestation } => {
-                        has_bridge_tx = true;
-                        let att = Attestation::decode(attestation).map_err(|e| {
-                            StorageError::Corrupt(format!("committed attestation does not decode: {e:?}"))
-                        })?;
-                        spent_digests.insert(Hash(shrugg_core::bridge::digest(&att.body.encode())));
-                        match Payload::decode(&att.body.payload) {
-                            Ok(Payload::Transfer(t)) => {
-                                let asset = asset_id(t.token_chain, &t.token_address);
-                                bridge_touched.insert((asset, Address(t.to)));
-                                bridge_touched.insert((asset, tx.sender()));
-                            }
-                            // A guardian-set upgrade moves no balances.
-                            Ok(Payload::GuardianSetUpgrade(_)) => {}
-                            // Same reasoning as the attestation above: this
-                            // decoded once already, so failing now is a torn
-                            // block. Skipping it would write no balance rows
-                            // and leave disk disagreeing with memory.
-                            Err(e) => {
-                                let m = format!("committed attestation payload does not decode: {e:?}");
-                                return Err(StorageError::Corrupt(m));
-                            }
-                        }
-                    }
-                    TxKind::BridgeBurn { asset, .. } => {
-                        has_bridge_tx = true;
-                        bridge_touched.insert((*asset, tx.sender()));
-                    }
-                    TxKind::Deploy { .. } | TxKind::Call { .. } => {}
+                for nf in tx.nullifiers() {
+                    batch.put_cf(self.cf(CF_NULLIFIERS), word8_to_bytes(&nf), hk);
+                }
+                for (cm, envelope) in created_notes(tx) {
+                    let row = NoteRow { cm, envelope, height: block.height() };
+                    batch.put_cf(self.cf(CF_NOTES), height_key(next_index), bincode::serialize(&row)?);
+                    next_index += 1;
                 }
             }
             for r in &cb.receipts {
                 if r.height != block.height() {
-                    return Err(StorageError::Corrupt(format!("receipt for block {} attached to block {}", r.height, block.height())));
+                    return Err(StorageError::Corrupt(format!(
+                        "receipt for block {} attached to block {}",
+                        r.height,
+                        block.height()
+                    )));
                 }
                 batch.put_cf(self.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(r)?);
-                if let Some((to, _)) = r.effect {
-                    touched.insert(to);
-                }
             }
-            touched.insert(block.proposer());
+            proposers.insert(block.proposer());
             expected_height += 1;
             expected_parent = hash;
         }
+        let last_height = expected_height - 1;
 
-        for addr in &touched {
-            let acct = ledger_after.account(addr);
-            batch.put_cf(self.cf(CF_ACCOUNTS), addr.as_bytes(), bincode::serialize(&acct)?);
+        // The end-of-block root of every block this commit covers, as the ledger recorded it.
+        // A batch longer than the anchor window drops its oldest entries, which is exactly what
+        // `load_ledger` would discard anyway.
+        for (h, root) in ledger_after.anchors() {
+            if (first_height..=last_height).contains(h) {
+                batch.put_cf(self.cf(CF_ANCHORS), height_key(*h), word8_to_bytes(root));
+            }
         }
-        let first_height = head.height + 1;
+        if next_index != ledger_after.next_index() {
+            return Err(StorageError::Corrupt(format!(
+                "commit wrote {next_index} notes across heights {first_height}..={last_height} \
+                 but `ledger_after` holds {}; the ledger does not describe exactly these blocks",
+                ledger_after.next_index()
+            )));
+        }
+        // Only a proposer's entry changes (it collects the block's fees); stakes are genesis
+        // state until phase S2 puts bonding on chain.
+        for addr in &proposers {
+            let entry = ledger_after.validators().get(addr).ok_or_else(|| {
+                StorageError::Corrupt(format!("committed block proposer {addr} is not in the validator register"))
+            })?;
+            batch.put_cf(self.cf(CF_VALIDATORS), addr.as_bytes(), bincode::serialize(entry)?);
+        }
         for rec in ledger_after.programs().values() {
             if rec.deployed_at >= first_height {
                 batch.put_cf(self.cf(CF_PROGRAMS), rec.id.as_bytes(), bincode::serialize(rec)?);
             }
         }
-        if has_bridge_tx {
-            let bridge = ledger_after.bridge().ok_or_else(|| {
-                StorageError::Corrupt("committed block has a bridge transaction but the ledger has no bridge state".into())
-            })?;
-            for (asset, addr) in &bridge_touched {
-                let key = balance_key(asset, addr);
-                match bridge.balance(asset, addr) {
-                    // A drained holder has no row, so a reloaded state equals
-                    // the one in memory and commits to the same root.
-                    0 => batch.delete_cf(self.cf(CF_BRIDGE_BALANCES), key),
-                    balance => batch.put_cf(self.cf(CF_BRIDGE_BALANCES), key, bincode::serialize(&balance)?),
-                }
-            }
-            for digest in &spent_digests {
-                batch.put_cf(self.cf(CF_BRIDGE_SPENT), digest.as_bytes(), []);
-            }
-            for (sequence, rec) in bridge.burns.range(first_burn_sequence..) {
-                batch.put_cf(self.cf(CF_BRIDGE_BURNS), height_key(*sequence), bincode::serialize(rec)?);
-            }
-            batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE, bincode::serialize(&bridge.meta())?);
-        }
-        batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(expected_height - 1));
+        batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger_after.tree())?);
+        batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
         self.db.write_opt(batch, &sync_opts())?;
         Ok(())
     }
@@ -585,7 +612,6 @@ impl Storage {
     }
 }
 
-
 /// How much of the chain to verify at startup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerifyMode {
@@ -593,9 +619,9 @@ pub enum VerifyMode {
     Off,
     /// Structural checks on every block (hash links, indexes, QC/block match,
     /// tx roots) plus a full ledger replay against every header's state root.
-    /// No signature verification.
+    /// Bundle proofs are re-verified; QC votes are not.
     Quick,
-    /// `Quick` plus proposer signatures and every QC's votes.
+    /// `Quick` plus every QC's votes.
     Full,
 }
 
@@ -666,14 +692,11 @@ impl Storage {
         }
         if mode == VerifyMode::Off {
             check.last_good = head;
-            check.ledger = self.load_ledger()?;
+            check.ledger = self.load_ledger(executor)?;
             return Ok(check);
         }
 
         let mut prev_hash = gs.hash();
-        // The genesis block is the baseline for both chained checks below.
-        let mut parent_timestamp_ms = gs.block.header.timestamp_ms;
-        ledger.set_timestamp_ms(parent_timestamp_ms);
         for h in 1..=head {
             let problem = (|| -> std::result::Result<(), String> {
                 let block = self
@@ -685,9 +708,6 @@ impl Storage {
                 }
                 if block.parent() != prev_hash {
                     return Err(format!("block {h} parent {} != previous hash {}", block.parent(), prev_hash));
-                }
-                if !block.verify_tx_root() {
-                    return Err(format!("block {h} tx root mismatch"));
                 }
                 let hash = block.hash();
                 match self.height_by_hash(&hash) {
@@ -705,13 +725,8 @@ impl Storage {
                 if block.proposer() != gs.validators.leader(block.view()) {
                     return Err(format!("block {h} proposer is not the leader of view {}", block.view()));
                 }
-                if mode == VerifyMode::Full {
-                    if !block.verify_signature() {
-                        return Err(format!("block {h} proposer signature invalid"));
-                    }
-                    if !qc.verify(&gs.validators, &gs.hash()) {
-                        return Err(format!("qc {h} has invalid or insufficient votes"));
-                    }
+                if mode == VerifyMode::Full && !qc.verify(&gs.validators, &gs.hash()) {
+                    return Err(format!("qc {h} has invalid or insufficient votes"));
                 }
                 for (i, tx) in block.transactions.iter().enumerate() {
                     match self.tx_location(&tx.hash()) {
@@ -720,31 +735,17 @@ impl Storage {
                         Err(e) => return Err(format!("tx index unreadable at block {h}: {e}")),
                     }
                 }
-                // Re-execute; checks the header's state root as well. This
-                // replay uses `apply_transactions`, not `apply_block`, so the
-                // bridged-chain rule that time never runs backwards has to be
-                // restated here rather than inherited.
-                if ledger.bridge().is_some() && block.header.timestamp_ms < parent_timestamp_ms {
-                    return Err(format!(
-                        "block {h} timestamp {} is before its parent's {parent_timestamp_ms}",
-                        block.header.timestamp_ms
-                    ));
-                }
-                parent_timestamp_ms = block.header.timestamp_ms;
+                // Re-execute. `apply_block` is the consensus rule itself — proposer signature,
+                // tx root, every transaction including its bundle proof, the end-of-block
+                // anchor and the header's state root — so the replay cannot drift from it.
                 let mut next = ledger.clone();
-                next.set_height(h);
-                next.set_timestamp_ms(block.header.timestamp_ms);
                 let receipts = next
-                    .apply_transactions(&block.transactions, &block.proposer(), executor)
+                    .apply_block(&block, executor)
                     .map_err(|e| format!("block {h} does not apply: {e}"))?;
-                if next.state_root() != block.header.state_root {
-                    return Err(format!("block {h} state root mismatch"));
-                }
-                for (index, r) in receipts {
-                    let tx = &block.transactions[index];
-                    match self.receipt(&tx.hash()) {
-                        Ok(Some(stored)) if stored.program == r.program && stored.outputs == r.outputs && stored.effect == r.effect && stored.height == h => {}
-                        Ok(_) => return Err(format!("receipt for tx {} in block {h} missing or wrong", tx.hash())),
+                for r in &receipts {
+                    match self.receipt(&r.tx) {
+                        Ok(Some(stored)) if stored == *r => {}
+                        Ok(_) => return Err(format!("receipt for tx {} in block {h} missing or wrong", r.tx)),
                         Err(e) => return Err(format!("receipt unreadable at block {h}: {e}")),
                     }
                 }
@@ -760,26 +761,22 @@ impl Storage {
             }
         }
         check.last_good = head;
-        // The accounts column family must match the replayed ledger.
-        let stored = self.load_ledger()?;
-        if stored.state_root() != ledger.state_root() {
-            check.problem = Some("accounts/programs snapshot does not match replayed chain".into());
-        } else if stored.programs() != ledger.programs() {
-            check.problem = Some("programs snapshot does not match replayed chain".into());
-        } else if stored.bridge() != ledger.bridge() {
-            // The state root covers most of the bridge but not the outbound
-            // burn log, which is derived from the same blocks and must be
-            // there for guardians to read; compare the whole thing.
-            check.problem = Some("bridge snapshot does not match replayed chain".into());
+        // The snapshot families must match the replayed chain. `Ledger`'s equality covers the
+        // tree, the commitment and nullifier sets, the anchors, the validators and the programs
+        // — everything these families hold.
+        match self.load_ledger(executor) {
+            Ok(stored) if stored == ledger => {}
+            Ok(_) => check.problem = Some("state snapshot does not match replayed chain".into()),
+            Err(e) => check.problem = Some(format!("state snapshot unreadable: {e}")),
         }
         check.ledger = ledger;
         Ok(check)
     }
 
-    /// Drop everything above `height`, rewrite the accounts snapshot from
-    /// `ledger` (the replayed state at `height`), and reset the head. With
-    /// `height == 0` the genesis block and certificate are rewritten too.
-    /// Safety state is preserved. One fsynced batch.
+    /// Drop everything above `height`, rewrite the state snapshot from `ledger` (the replayed
+    /// state at `height`), and reset the head. With `height == 0` the genesis block and
+    /// certificate are rewritten too, which is the only repair for a damaged genesis — hence
+    /// `gs`. Safety state is preserved. One fsynced batch.
     pub fn truncate_to(&self, gs: &GenesisState, height: u64, ledger: &Ledger) -> Result<()> {
         let head = match self.get_meta_raw(META_HEAD_HEIGHT)? {
             Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_slice().try_into().unwrap()),
@@ -804,12 +801,37 @@ impl Storage {
                 batch.delete_cf(self.cf(CF_BLOCK_INDEX), k);
             }
         }
-        for item in self.db.iterator_cf(self.cf(CF_ACCOUNTS), IteratorMode::Start) {
+        // Notes are append-only and indexed by leaf position, so rewinding the tree is exactly
+        // dropping the leaves the replayed ledger no longer has.
+        for item in self.db.iterator_cf(self.cf(CF_NOTES), IteratorMode::End) {
             let (k, _) = item?;
-            batch.delete_cf(self.cf(CF_ACCOUNTS), k);
+            if be_u64(k.as_ref(), "note key")? < ledger.next_index() {
+                break;
+            }
+            batch.delete_cf(self.cf(CF_NOTES), k);
         }
-        for (addr, acct) in ledger.accounts() {
-            batch.put_cf(self.cf(CF_ACCOUNTS), addr.as_bytes(), bincode::serialize(acct)?);
+        for item in self.db.iterator_cf(self.cf(CF_NULLIFIERS), IteratorMode::Start) {
+            let (k, v) = item?;
+            if be_u64(&v, "nullifier height")? > height {
+                batch.delete_cf(self.cf(CF_NULLIFIERS), k);
+            }
+        }
+        // The anchor window is rewritten wholesale from the replayed ledger: truncating can
+        // shrink it below `ANCHOR_WINDOW`, and a stale row above `height` would let a prover
+        // anchor to a root this chain no longer passes through.
+        for item in self.db.iterator_cf(self.cf(CF_ANCHORS), IteratorMode::Start) {
+            let (k, _) = item?;
+            batch.delete_cf(self.cf(CF_ANCHORS), k);
+        }
+        for (h, root) in ledger.anchors() {
+            batch.put_cf(self.cf(CF_ANCHORS), height_key(*h), word8_to_bytes(root));
+        }
+        for item in self.db.iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::Start) {
+            let (k, _) = item?;
+            batch.delete_cf(self.cf(CF_VALIDATORS), k);
+        }
+        for (addr, entry) in ledger.validators() {
+            batch.put_cf(self.cf(CF_VALIDATORS), addr.as_bytes(), bincode::serialize(entry)?);
         }
         for item in self.db.iterator_cf(self.cf(CF_PROGRAMS), IteratorMode::Start) {
             let (k, _) = item?;
@@ -818,12 +840,6 @@ impl Storage {
         for rec in ledger.programs().values() {
             batch.put_cf(self.cf(CF_PROGRAMS), rec.id.as_bytes(), bincode::serialize(rec)?);
         }
-        // The bridge families have no per-height key, so they are rebuilt
-        // wholesale from the replayed ledger rather than pruned.
-        self.clear_bridge(&mut batch)?;
-        if let Some(bridge) = ledger.bridge() {
-            self.put_bridge(&mut batch, bridge)?;
-        }
         for item in self.db.iterator_cf(self.cf(CF_RECEIPTS), IteratorMode::Start) {
             let (k, v) = item?;
             let keep = bincode::deserialize::<CallReceipt>(&v).map(|r| r.height <= height).unwrap_or(false);
@@ -831,6 +847,7 @@ impl Storage {
                 batch.delete_cf(self.cf(CF_RECEIPTS), k);
             }
         }
+        batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger.tree())?);
         if height == 0 {
             let hk = height_key(0);
             batch.put_cf(self.cf(CF_BLOCKS), hk, gs.block.encode());
@@ -838,11 +855,10 @@ impl Storage {
             batch.put_cf(self.cf(CF_BLOCK_INDEX), gs.hash().as_bytes(), hk);
             batch.put_cf(self.cf(CF_META), META_GENESIS_HASH, gs.hash().as_bytes());
             batch.put_cf(self.cf(CF_META), META_CHAIN_ID, gs.chain_id.to_be_bytes());
+            batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
         }
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(height));
-        let mut wo = WriteOptions::default();
-        wo.set_sync(true);
-        self.db.write_opt(batch, &wo)?;
+        self.db.write_opt(batch, &sync_opts())?;
         Ok(())
     }
 
@@ -853,155 +869,124 @@ impl Storage {
         Ok(())
     }
 
-    /// Test hook: overwrite a stored account to simulate snapshot corruption.
-    pub fn overwrite_account_for_testing(&self, addr: &Address, acct: &Account) -> Result<()> {
-        self.db.put_cf(self.cf(CF_ACCOUNTS), addr.as_bytes(), bincode::serialize(acct)?)?;
-        Ok(())
-    }
-
-    /// Test hook: overwrite a bridged-asset balance to simulate snapshot
-    /// corruption. Never called by the node itself.
-    pub fn overwrite_asset_balance_for_testing(&self, asset: &AssetId, addr: &Address, balance: u128) -> Result<()> {
-        self.db.put_cf(self.cf(CF_BRIDGE_BALANCES), balance_key(asset, addr), bincode::serialize(&balance)?)?;
+    /// Test hook: overwrite a validator entry to simulate snapshot corruption.
+    pub fn overwrite_validator_for_testing(&self, addr: &Address, entry: &ValidatorEntry) -> Result<()> {
+        self.db.put_cf(self.cf(CF_VALIDATORS), addr.as_bytes(), bincode::serialize(entry)?)?;
         Ok(())
     }
 }
 
-/// Fixtures shared by the storage tests and the RPC tests, which need a
-/// database holding a real bridged chain to answer against.
+/// Fixtures shared by the storage tests and the RPC tests, which need a database holding a real
+/// shielded chain to answer against. Everything here is built with `StubExecutor`, whose bundle
+/// "proof" is the digest it publishes: these tests are about storage, not about the zkVM.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
     use shrugg_core::confidential::StubExecutor;
-    use shrugg_core::genesis::{Genesis, GenesisValidator};
-    use shrugg_core::{BlockHeader, Keypair, Transaction};
+    use shrugg_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
+    use shrugg_core::notes::{word8_to_hex, Bundle};
+    use shrugg_core::{gas, BlockHeader, Keypair, Transaction};
+
+    /// The bundle guest commitment the fixture chains pin. Arbitrary: `StubExecutor` checks a
+    /// proof carries it, nothing more.
+    pub(crate) const HC: Word8 = [11; 8];
 
     pub(crate) fn key(n: u8) -> Keypair {
         Keypair::from_seed([n; 32]).unwrap()
     }
 
-    pub(crate) fn genesis(chain_id: u64) -> GenesisState {
+    pub(crate) fn env(tag: u8) -> Envelope {
+        Envelope { kem_ct: vec![tag; 8], to_receiver: vec![tag; 4], to_sender: vec![], body: vec![tag; 16] }
+    }
+
+    pub(crate) fn alloc_note(seed: u8, amount: u64) -> GenesisNote {
+        GenesisNote {
+            cm: word8_to_hex(&[seed as u32; 8]),
+            envelope: EnvelopeHex::from_envelope(&env(seed)),
+            amount,
+        }
+    }
+
+    pub(crate) fn genesis_with(chain_id: u64, alloc: Vec<GenesisNote>) -> GenesisState {
         let k = key(1);
         Genesis {
             chain_id,
             timestamp_ms: 0,
             validators: vec![GenesisValidator { public_key: k.public_key().clone(), stake: 10 }],
-            alloc: [(k.address().to_base58(), 1_000u128)].into_iter().collect(),
-            faucet: false,
+            alloc,
+            faucet: true,
             confidential: true,
             fri_profile: "test".into(),
+            hc_bundle: word8_to_hex(&HC),
             bridge: None,
         }
-        .build()
+        .build(&StubExecutor)
         .unwrap()
     }
 
-    // ---- bridge fixtures -------------------------------------------------
-
-    /// Four guardian secrets (scalars 1..=4); quorum is `4 * 2 / 3 + 1 = 3`.
-    pub(crate) fn guardian_secrets() -> Vec<[u8; 32]> {
-        (1u8..=4)
-            .map(|i| {
-                let mut s = [0u8; 32];
-                s[31] = i;
-                s
-            })
-            .collect()
+    /// A chain with no alloc notes: the empty tree.
+    pub(crate) fn genesis(chain_id: u64) -> GenesisState {
+        genesis_with(chain_id, Vec::new())
     }
 
-    pub(crate) const SOURCE_EMITTER: [u8; 32] = [0xee; 32];
-    pub(crate) const TOKEN: [u8; 32] = [0xaa; 32];
-
-    pub(crate) fn bridge_config() -> shrugg_core::bridge::BridgeConfig {
-        shrugg_core::bridge::BridgeConfig {
-            emitter: [1u8; 32],
-            guardians: guardian_secrets().iter().map(shrugg_core::bridge::guardian_address).collect(),
-            emitters: [(2u16, SOURCE_EMITTER)].into_iter().collect(),
-        }
+    /// An unopened database plus a genesis holding two deposit notes.
+    pub(crate) fn genesis_with_two_notes() -> (tempfile::TempDir, Storage, GenesisState) {
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)]);
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        (dir, s, gs)
     }
 
-    /// A genesis with a bridge section, funding `key(1)` for fees.
-    pub(crate) fn bridged_genesis(chain_id: u64) -> GenesisState {
-        let k = key(1);
-        Genesis {
-            chain_id,
-            timestamp_ms: 0,
-            validators: vec![GenesisValidator { public_key: k.public_key().clone(), stake: 10 }],
-            alloc: [(k.address().to_base58(), 1_000u128)].into_iter().collect(),
-            faucet: false,
-            confidential: true,
-            fri_profile: "test".into(),
-            bridge: Some(bridge_config()),
-        }
-        .build()
-        .unwrap()
-    }
-
-    /// A quorum-signed transfer attestation crediting `to` with `amount - fee`.
-    pub(crate) fn attestation(sequence: u64, to: &Address, amount: u128, fee: u128) -> Vec<u8> {
-        use shrugg_core::bridge::{digest, sign_digest, Attestation, Body, Payload, Transfer};
-        let body = Body {
-            timestamp: 0,
-            nonce: 0,
-            emitter_chain: 2,
-            emitter_address: SOURCE_EMITTER,
-            sequence,
-            consistency_level: 0,
-            payload: Payload::Transfer(Transfer {
-                amount: Transfer::u256_from_u128(amount),
-                token_address: TOKEN,
-                token_chain: 2,
-                to: *to.as_bytes(),
-                to_chain: 1,
-                fee: Transfer::u256_from_u128(fee),
-            })
-            .encode(),
+    /// A bundle whose stub proof publishes exactly the digest the ledger recomputes, anchored to
+    /// the newest root `ledger` has recorded and timed at its current height.
+    pub(crate) fn bundle_tx(ledger: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64) -> Transaction {
+        let mut b = Bundle {
+            anchor: ledger.anchors().back().expect("a ledger always has an anchor").1,
+            nullifiers: nfs,
+            commitments: cms,
+            fee,
+            burn: 0,
+            asset: 0,
+            time: ledger.height() as u32,
+            envelopes: [env(cms[0][0] as u8), env(cms[1][0] as u8)],
+            proof: Vec::new(),
         };
-        let d = digest(&body.encode());
-        let secrets = guardian_secrets();
-        let signatures = (0..3u8).map(|i| sign_digest(&secrets[i as usize], i, &d)).collect();
-        Attestation { guardian_set_index: 0, signatures, body }.encode()
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        Transaction::shielded(ledger.chain_id(), b, Action::None)
     }
 
-    pub(crate) fn bridged_asset() -> shrugg_core::bridge::AssetId {
-        shrugg_core::bridge::asset_id(2, &TOKEN)
+    /// A faucet mint of `amount` to a note nobody can open; the envelope is a placeholder, which
+    /// the chain never inspects.
+    pub(crate) fn mint_tx(chain_id: u64, cm: Word8, amount: u64, minter: &Keypair) -> Transaction {
+        Transaction::mint(chain_id, cm, env(cm[0] as u8), amount, minter)
     }
 
-    /// A well-formed, correctly signed envelope wrapping a payload whose id
-    /// byte no version of the codec knows: the envelope decodes, the payload
-    /// does not.
-    pub(crate) fn attestation_with_undecodable_payload() -> Vec<u8> {
-        use shrugg_core::bridge::{digest, sign_digest, Attestation, Body};
-        let body = Body {
-            timestamp: 0,
-            nonce: 0,
-            emitter_chain: 2,
-            emitter_address: SOURCE_EMITTER,
-            sequence: 7,
-            consistency_level: 0,
-            payload: vec![0xff; 40],
-        };
-        let d = digest(&body.encode());
-        let secrets = guardian_secrets();
-        let signatures = (0..3u8).map(|i| sign_digest(&secrets[i as usize], i, &d)).collect();
-        Attestation { guardian_set_index: 0, signatures, body }.encode()
+    pub(crate) fn bundle_fee() -> u64 {
+        gas::BUNDLE_BASE
     }
 
+    /// Apply `txs` to `ledger` as block `parent.height() + 1` and build the committed block that
+    /// results, exactly as `Ledger::apply_block` would accept it.
     pub(crate) fn make_block(parent: &Block, ledger: &mut Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
+        let height = parent.height() + 1;
+        ledger.set_height(height);
+        ledger.set_timestamp_ms(height);
         ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
+        ledger.record_anchor(height);
         make_block_unchecked(parent, ledger, txs, k)
     }
 
-    /// `make_block` without executing the transactions: the only way to build a
-    /// block carrying a transaction the ledger would have rejected, which is
-    /// what a torn block on disk looks like.
+    /// `make_block` without executing the transactions: the only way to build a block carrying a
+    /// transaction the ledger would have rejected, which is what a torn block on disk looks like.
     pub(crate) fn make_block_unchecked(parent: &Block, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
+        let height = parent.height() + 1;
         let header = BlockHeader {
-            height: parent.height() + 1,
+            height,
             view: parent.view() + 1,
             parent: parent.hash(),
             proposer: k.public_key().clone(),
-            timestamp_ms: 1,
+            timestamp_ms: height,
             tx_root: Block::tx_root(&txs),
             state_root: ledger.state_root(),
             justify: QuorumCertificate { view: parent.view(), block_hash: parent.hash(), votes: vec![] },
@@ -1014,24 +999,68 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-
-    /// A well-formed EVM recipient: 12 zero bytes then 20 address bytes
-    /// (spec 3.5), the shape `BridgeState::check_burn` requires for the
-    /// EVM-family chains 2, 3 and 4.
-    fn evm_to() -> [u8; 32] {
-        let mut t = [0u8; 32];
-        t[12..].copy_from_slice(&[0x22u8; 20]);
-        t
-    }
     use super::fixtures::*;
     use super::*;
     use shrugg_core::confidential::StubExecutor;
+    use shrugg_core::ledger::ANCHOR_WINDOW;
     use shrugg_core::Transaction;
+
+    /// Fold a witness back to the root, the way the bundle guest's `MERKLE_VERIFY` does.
+    fn fold(leaf: Word8, index: u64, path: &[Word8; DEPTH]) -> Word8 {
+        let mut node = leaf;
+        let mut pos = index;
+        for sib in path {
+            node = if pos & 1 == 0 { StubExecutor.node_hash(&node, sib) } else { StubExecutor.node_hash(sib, &node) };
+            pos >>= 1;
+        }
+        node
+    }
+
+    #[test]
+    fn genesis_notes_land_in_the_notes_family_and_the_tree_reloads() {
+        let (dir, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.notes_count().unwrap(), 2);
+        let row = s.note(1).unwrap().unwrap();
+        assert_eq!(row.cm, gs.notes[1].0);
+        assert_eq!(row.envelope, gs.notes[1].1);
+        assert_eq!(row.height, 0);
+        assert_eq!(s.note(2).unwrap(), None);
+        assert_eq!(&s.tree().unwrap(), gs.ledger.tree());
+        assert_eq!(s.anchor(0).unwrap(), Some(gs.ledger.root()));
+        assert_eq!(s.latest_anchor().unwrap(), Some((0, gs.ledger.root())));
+        assert_eq!(s.hc_bundle().unwrap(), gs.hc_bundle);
+        let l = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(l, gs.ledger);
+        // Paging is in tree order and stops at the end.
+        let page = s.notes_from(0, 10).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].0, 0);
+        assert_eq!(page[1].1.cm, gs.notes[1].0);
+        assert_eq!(s.notes_from(1, 10).unwrap().len(), 1);
+        assert_eq!(s.notes_from(0, 1).unwrap().len(), 1);
+        assert!(s.notes_from(2, 10).unwrap().is_empty());
+        drop(dir);
+    }
+
+    /// A chain that starts with no notes still round trips: the stored frontier is the empty
+    /// tree and `load_ledger` checks it against `CommitmentTree::empty_root`.
+    #[test]
+    fn an_empty_chain_reloads_to_the_empty_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis(3);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.notes_count().unwrap(), 0);
+        assert_eq!(s.tree().unwrap().root(), CommitmentTree::empty_root(&StubExecutor));
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap(), gs.ledger);
+        assert!(s.witness(0, &StubExecutor).unwrap().is_none());
+    }
 
     #[test]
     fn init_and_reopen_preserves_meta() {
         let dir = tempfile::tempdir().unwrap();
-        let gs = genesis(7);
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
         {
             let s = Storage::open(dir.path()).unwrap();
             assert!(!s.is_initialized().unwrap());
@@ -1042,13 +1071,12 @@ mod tests {
         let s = Storage::open(dir.path()).unwrap();
         assert_eq!(s.genesis_hash().unwrap(), gs.hash());
         assert_eq!(s.chain_id().unwrap(), 7);
-        let head = s.head().unwrap();
-        assert_eq!(head, Head { height: 0, hash: gs.hash() });
+        assert_eq!(s.head().unwrap(), Head { height: 0, hash: gs.hash() });
         assert_eq!(s.head_block().unwrap().hash(), gs.hash());
         assert_eq!(s.head_qc().unwrap(), QuorumCertificate::genesis(gs.hash()));
         assert_eq!(s.height_by_hash(&gs.hash()).unwrap(), Some(0));
-        assert_eq!(s.account(&key(1).address()).unwrap().balance, 1_000);
-        assert_eq!(s.load_ledger().unwrap(), gs.ledger);
+        assert_eq!(s.validator(&key(1).address()).unwrap().unwrap().stake, 10);
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap(), gs.ledger);
         assert_eq!(s.load_safety().unwrap(), None);
     }
 
@@ -1067,64 +1095,197 @@ mod tests {
         assert_eq!(s.chain_id().unwrap(), 1);
     }
 
+    /// One committed block carrying one bundle: two notes appended, two nullifiers recorded,
+    /// the block's end root anchored, the proposer paid, and the whole thing reloads.
     #[test]
-    fn commit_two_blocks_updates_everything() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Storage::open(dir.path()).unwrap();
-        let gs = genesis(1);
+    fn commit_writes_notes_nullifiers_anchors_and_rewards_and_reloads_equal() {
+        let (_d, s, gs) = genesis_with_two_notes();
         s.init_genesis(&gs).unwrap();
-        let alice = key(1);
-        let bob = key(2);
+        let proposer = key(1);
         let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+        let tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx.clone()], &proposer);
+        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
 
-        let tx1 = Transaction::transfer(&alice, 1, 0, bob.address(), 100, 5);
-        let b1 = make_block(&gs.block, &mut ledger, vec![tx1.clone()], &alice);
-        let tx2 = Transaction::transfer(&alice, 1, 1, bob.address(), 50, 1);
-        let b2 = make_block(&b1.block, &mut ledger, vec![tx2.clone()], &alice);
-
-        s.commit(&[b1.clone(), b2.clone()], &ledger).unwrap();
-
-        let head = s.head().unwrap();
-        assert_eq!(head, Head { height: 2, hash: b2.block.hash() });
-        assert_eq!(s.head_qc().unwrap(), b2.qc);
-        assert_eq!(s.block_by_height(1).unwrap().unwrap(), b1.block);
-        assert_eq!(s.block_by_hash(&b2.block.hash()).unwrap().unwrap(), b2.block);
+        assert_eq!(s.head().unwrap(), Head { height: 1, hash: b1.block.hash() });
+        assert_eq!(s.notes_count().unwrap(), 4);
+        assert_eq!(s.note(2).unwrap().unwrap().cm, [3; 8]);
+        assert_eq!(s.note(3).unwrap().unwrap(), NoteRow { cm: [4; 8], envelope: env(4), height: 1 });
+        assert_eq!(s.nullifier_height(&[1; 8]).unwrap(), Some(1));
+        assert_eq!(s.nullifier_height(&[2; 8]).unwrap(), Some(1));
+        assert_eq!(s.nullifier_height(&[9; 8]).unwrap(), None);
+        assert_eq!(s.nullifiers_count().unwrap(), 2);
+        assert_eq!(s.nullifiers_from(0, 10).unwrap(), vec![(1, [1; 8]), (1, [2; 8])]);
+        assert_eq!(s.anchor(1).unwrap(), Some(ledger.root()));
+        assert_eq!(s.validator(&proposer.address()).unwrap().unwrap().rewards, bundle_fee());
+        assert_eq!(s.tx_location(&tx.hash()).unwrap(), Some((1, 0)));
         assert_eq!(s.committed_block(1).unwrap().unwrap(), b1);
-        assert_eq!(s.committed_block(3).unwrap(), None);
-        assert_eq!(s.tx_location(&tx1.hash()).unwrap(), Some((1, 0)));
-        assert_eq!(s.tx_location(&tx2.hash()).unwrap(), Some((2, 0)));
-        assert_eq!(s.tx_location(&Hash::ZERO).unwrap(), None);
-        // alice: 1000 - 105 - 51 + fees back as proposer (5 + 1)
-        assert_eq!(s.account(&alice.address()).unwrap(), Account { nonce: 2, balance: 850 });
-        assert_eq!(s.account(&bob.address()).unwrap(), Account { nonce: 0, balance: 150 });
-        assert_eq!(s.load_ledger().unwrap(), ledger);
 
-        // reopen keeps it
-        drop(s);
-        let s = Storage::open(dir.path()).unwrap();
-        assert_eq!(s.head().unwrap().height, 2);
+        let reloaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(reloaded, ledger);
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().is_ok());
+    }
+
+    /// A faucet mint creates its note through the action rather than a bundle slot, and the row
+    /// that lands carries the mint's own envelope.
+    #[test]
+    fn a_committed_mint_appends_its_note() {
+        let (_d, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        let minter = key(1);
+        let mut ledger = gs.ledger.clone();
+        let tx = mint_tx(gs.chain_id, [77; 8], 5_000, &minter);
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx.clone()], &minter);
+        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        assert_eq!(s.notes_count().unwrap(), 3);
+        assert_eq!(s.note(2).unwrap().unwrap(), NoteRow { cm: [77; 8], envelope: env(77), height: 1 });
+        // A mint spends nothing and pays no fee.
+        assert_eq!(s.nullifiers_count().unwrap(), 0);
+        assert_eq!(s.validator(&minter.address()).unwrap().unwrap().rewards, 0);
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap(), ledger);
+    }
+
+    #[test]
+    fn witness_paths_verify_against_the_current_root() {
+        let (_d, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        let proposer = key(1);
+        let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+        let tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &proposer);
+        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+
+        for index in 0..4 {
+            let (root, path) = s.witness(index, &StubExecutor).unwrap().expect("leaf exists");
+            assert_eq!(root, ledger.root(), "witness root at {index}");
+            let leaf = s.note(index).unwrap().unwrap().cm;
+            assert_eq!(fold(leaf, index, &path), root, "path at {index}");
+        }
+        assert_eq!(s.witness(4, &StubExecutor).unwrap(), None);
+    }
+
+    #[test]
+    fn truncate_rewinds_notes_nullifiers_anchors_and_the_tree() {
+        let (_d, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        let proposer = key(1);
+        let mut ledger = gs.ledger.clone();
+        // A real vote on each certificate, so the `VerifyMode::Full` check at the end of this
+        // test is actually checking something: `make_block`'s placeholder QC carries no votes
+        // and would fail the quorum check for reasons that have nothing to do with truncation.
+        let certify = |cb: CommittedBlock| {
+            let qc = QuorumCertificate {
+                view: cb.block.view(),
+                block_hash: cb.block.hash(),
+                votes: vec![shrugg_core::Vote::sign(cb.block.view(), cb.block.hash(), &key(1))],
+            };
+            CommittedBlock { qc, ..cb }
+        };
+        ledger.set_height(1);
+        let tx1 = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        let b1 = certify(make_block(&gs.block, &mut ledger, vec![tx1], &proposer));
+        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        let ledger_at_1 = ledger.clone();
+
+        ledger.set_height(2);
+        let tx2 = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
+        let b2 = certify(make_block(&b1.block, &mut ledger, vec![tx2.clone()], &proposer));
+        s.commit(std::slice::from_ref(&b2), &ledger).unwrap();
+        assert_eq!(s.notes_count().unwrap(), 6);
+        assert_eq!(s.nullifier_height(&[5; 8]).unwrap(), Some(2));
+
+        s.truncate_to(&gs, 1, &ledger_at_1).unwrap();
+        assert_eq!(s.head().unwrap().height, 1);
+        assert_eq!(s.notes_count().unwrap(), ledger_at_1.next_index());
+        assert_eq!(s.notes_count().unwrap(), 4);
+        assert_eq!(s.note(4).unwrap(), None);
+        assert_eq!(s.nullifier_height(&[5; 8]).unwrap(), None);
+        assert_eq!(s.nullifier_height(&[1; 8]).unwrap(), Some(1));
+        assert_eq!(s.anchor(2).unwrap(), None);
+        assert_eq!(s.anchor(1).unwrap(), Some(ledger_at_1.root()));
+        assert_eq!(&s.tree().unwrap(), ledger_at_1.tree());
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap(), ledger_at_1);
+        assert!(s.tx_location(&tx2.hash()).unwrap().is_none());
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().problem, None);
     }
 
     #[test]
     fn non_contiguous_commit_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Storage::open(dir.path()).unwrap();
-        let gs = genesis(1);
+        let (_d, s, gs) = genesis_with_two_notes();
         s.init_genesis(&gs).unwrap();
-        let alice = key(1);
+        let k = key(1);
         let mut ledger = gs.ledger.clone();
-        let b1 = make_block(&gs.block, &mut ledger, vec![], &alice);
-        let b2 = make_block(&b1.block, &mut ledger, vec![], &alice);
-        // skipping b1
-        assert!(matches!(s.commit(&[b2.clone()], &ledger), Err(StorageError::Corrupt(_))));
+        let b1 = make_block(&gs.block, &mut ledger, vec![], &k);
+        let b2 = make_block(&b1.block, &mut ledger, vec![], &k);
+        assert!(matches!(s.commit(std::slice::from_ref(&b2), &ledger), Err(StorageError::Corrupt(_))));
         assert_eq!(s.head().unwrap().height, 0);
-        // wrong qc hash
         let mut bad = b1.clone();
         bad.qc.block_hash = Hash::ZERO;
         assert!(matches!(s.commit(&[bad], &ledger), Err(StorageError::Corrupt(_))));
-        // correct order works
         s.commit(&[b1, b2], &ledger).unwrap();
         assert_eq!(s.head().unwrap().height, 2);
+    }
+
+    /// Two blocks in one `commit`, against the ledger that describes both.
+    ///
+    /// This is the shape `Node::handle_actions` produces when a replica resolves a run of
+    /// orphans and commits in one step, and the shape that was silently writing the wrong
+    /// snapshot before: `hs.committed_ledger()` is the state after the *last* block of the
+    /// batch, so every per-height thing the batch writes — anchors above all — has to be taken
+    /// from the right place rather than from that final ledger's tip.
+    #[test]
+    fn a_two_block_commit_records_each_height_from_the_right_state() {
+        let (_d, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        let k = key(1);
+        let mut ledger = gs.ledger.clone();
+
+        // Block 1: a bundle (2 commitments, 2 nullifiers). Block 2: a mint (1 commitment).
+        ledger.set_height(1);
+        let tx1 = bundle_tx(&ledger, [[41; 8], [42; 8]], [[43; 8], [44; 8]], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx1], &k);
+        let root_at_1 = ledger.root();
+        let tx2 = mint_tx(gs.chain_id, [45; 8], 7, &k);
+        let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &k);
+        let root_at_2 = ledger.root();
+        assert_ne!(root_at_1, root_at_2, "each block moved the tree");
+
+        // One commit, both blocks, the ledger after block 2 — exactly what the node does.
+        s.commit(&[b1.clone(), b2.clone()], &ledger).unwrap();
+        assert_eq!(s.head().unwrap().height, 2);
+
+        // Each height's anchor is that height's own end-of-block root, not the batch's last.
+        assert_eq!(s.anchor(0).unwrap(), Some(gs.ledger.root()));
+        assert_eq!(s.anchor(1).unwrap(), Some(root_at_1));
+        assert_eq!(s.anchor(2).unwrap(), Some(root_at_2));
+        assert_eq!(s.anchor(3).unwrap(), None);
+
+        // Two genesis notes, then the bundle's two outputs, then the mint's note — dense, in
+        // order, each stamped with the height that created it.
+        assert_eq!(s.notes_count().unwrap(), 5);
+        assert_eq!(s.notes_count().unwrap(), ledger.next_index());
+        for (index, (cm, height)) in
+            [([20; 8], 0), ([21; 8], 0), ([43; 8], 1), ([44; 8], 1), ([45; 8], 2)].into_iter().enumerate()
+        {
+            let row = s.note(index as u64).unwrap().unwrap_or_else(|| panic!("note {index} missing"));
+            assert_eq!(row.cm, cm, "note {index} commitment");
+            assert_eq!(row.height, height, "note {index} height");
+        }
+        assert_eq!(s.note(5).unwrap(), None);
+
+        // Nullifiers carry the height that spent them.
+        assert_eq!(s.nullifier_height(&[41; 8]).unwrap(), Some(1));
+        assert_eq!(s.nullifier_height(&[42; 8]).unwrap(), Some(1));
+        assert_eq!(s.nullifiers_count().unwrap(), 2);
+
+        // And the whole snapshot reloads to exactly the ledger the batch was committed against.
+        let reloaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(reloaded, ledger);
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().is_ok());
     }
 
     #[test]
@@ -1143,50 +1304,28 @@ mod tests {
         assert_eq!(s.load_safety().unwrap(), Some(state));
     }
 
+    /// `n` blocks, each carrying one bundle that spends a fresh pair of nullifiers.
     fn chain_fixture(n: u64) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
-        chain_fixture_with(n, 1_000)
-    }
-
-    fn chain_fixture_with(n: u64, alloc: u128) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
-        use shrugg_core::consensus::CommittedBlock;
-        use shrugg_core::genesis::{Genesis, GenesisValidator};
-        use shrugg_core::{BlockHeader, Keypair, Transaction, Vote};
-        let k = Keypair::from_seed([9u8; 32]).unwrap();
-        let bob = Keypair::from_seed([10u8; 32]).unwrap().address();
-        let gen = Genesis {
-            chain_id: 5,
-            timestamp_ms: 0,
-            validators: vec![GenesisValidator { public_key: k.public_key().clone(), stake: 1 }],
-            alloc: [(k.address().to_base58(), alloc)].into_iter().collect(),
-            faucet: false,
-            confidential: true,
-            fri_profile: "test".into(),
-            bridge: None,
-        };
-        let gs = gen.build().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let st = Storage::open(dir.path()).unwrap();
+        use shrugg_core::Vote;
+        let (dir, st, gs) = genesis_with_two_notes();
         st.init_genesis(&gs).unwrap();
+        let k = key(1);
         let mut ledger = gs.ledger.clone();
         let mut parent = gs.block.clone();
-        let mut qc = QuorumCertificate::genesis(gs.hash());
         let mut out = Vec::new();
         for h in 1..=n {
-            let txs = vec![Transaction::transfer(&k, 5, h - 1, bob, 10, 1)];
-            ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
-            let header = BlockHeader {
-                height: h,
-                view: h,
-                parent: parent.hash(),
-                proposer: k.public_key().clone(),
-                timestamp_ms: h,
-                tx_root: Block::tx_root(&txs),
-                state_root: ledger.state_root(),
-                justify: qc.clone(),
-            };
-            let block = Block::sign(header, txs, &k);
-            qc = QuorumCertificate { view: h, block_hash: block.hash(), votes: vec![Vote::sign(h, block.hash(), &k)] };
-            let cb = CommittedBlock { block: block.clone(), qc: qc.clone(), receipts: Vec::new() };
+            let seed = (h * 4) as u32;
+            ledger.set_height(h);
+            let txs = vec![bundle_tx(
+                &ledger,
+                [[seed; 8], [seed + 1; 8]],
+                [[seed + 2; 8], [seed + 3; 8]],
+                bundle_fee(),
+            )];
+            let cb = make_block(&parent, &mut ledger, txs, &k);
+            let block = cb.block.clone();
+            let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(block.view(), block.hash(), &k)] };
+            let cb = CommittedBlock { qc, ..cb };
             st.commit(std::slice::from_ref(&cb), &ledger).unwrap();
             out.push(cb);
             parent = block;
@@ -1201,7 +1340,8 @@ mod tests {
             let c = st.verify_chain(&gs, mode, &StubExecutor).unwrap();
             assert!(c.is_ok(), "{:?}", c.problem);
             assert_eq!(c.last_good, 6);
-            assert_eq!(c.ledger.state_root(), st.load_ledger().unwrap().state_root());
+            assert_eq!(c.ledger.state_root(), st.load_ledger(&StubExecutor).unwrap().state_root());
+            assert_eq!(c.ledger.next_index(), 14, "2 alloc notes + 2 per block");
         }
     }
 
@@ -1219,15 +1359,19 @@ mod tests {
         assert!(st.block_by_hash(&blocks[4].block.hash()).unwrap().is_none());
         assert!(st.tx_location(&blocks[5].block.transactions[0].hash()).unwrap().is_none());
         assert!(st.tx_location(&blocks[2].block.transactions[0].hash()).unwrap().is_some());
+        // The pool rewound with the chain: 2 alloc notes plus 2 per surviving block.
+        assert_eq!(st.notes_count().unwrap(), 8);
+        assert_eq!(st.nullifiers_count().unwrap(), 6);
         let again = st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap();
         assert!(again.is_ok(), "{:?}", again.problem);
         assert_eq!(again.last_good, 3);
         // Chain can be re-extended from the truncated head.
         let mut ledger = again.ledger.clone();
         let cb = &blocks[3]; // height 4 again
-        ledger.apply_transactions(&cb.block.transactions, &cb.block.proposer(), &StubExecutor).unwrap();
+        ledger.apply_block(&cb.block, &StubExecutor).unwrap();
         st.commit(std::slice::from_ref(cb), &ledger).unwrap();
         assert_eq!(st.head().unwrap().height, 4);
+        assert!(st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().is_ok());
     }
 
     #[test]
@@ -1241,16 +1385,36 @@ mod tests {
     }
 
     #[test]
-    fn account_snapshot_corruption_is_detected_and_repaired() {
+    fn validator_snapshot_corruption_is_detected_and_repaired() {
         let (_d, st, gs, _) = chain_fixture(3);
-        let k = shrugg_core::Keypair::from_seed([9u8; 32]).unwrap().address();
-        st.overwrite_account_for_testing(&k, &Account { nonce: 99, balance: 1 }).unwrap();
+        let addr = key(1).address();
+        let good = st.validator(&addr).unwrap().unwrap();
+        st.overwrite_validator_for_testing(&addr, &ValidatorEntry { rewards: 99, ..good.clone() }).unwrap();
         let c = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
         assert!(!c.is_ok());
         assert_eq!(c.last_good, 3, "blocks are fine, only the snapshot is wrong");
         st.truncate_to(&gs, 3, &c.ledger).unwrap();
-        assert_eq!(st.account(&k).unwrap().nonce, 3);
+        assert_eq!(st.validator(&addr).unwrap().unwrap(), good);
         assert!(st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().is_ok());
+    }
+
+    /// The tree meta is the one piece of consensus state the families do not re-derive, so a
+    /// damaged frontier must be caught rather than believed.
+    #[test]
+    fn a_frontier_that_does_not_match_the_notes_is_corrupt() {
+        let (_d, st, gs, _) = chain_fixture(2);
+        let other = genesis_with(7, vec![alloc_note(30, 1)]);
+        st.db
+            .put_cf(st.cf(CF_META), META_TREE, bincode::serialize(other.ledger.tree()).unwrap())
+            .unwrap();
+        match st.load_ledger(&StubExecutor) {
+            Err(StorageError::Corrupt(m)) => assert!(m.contains("leaves"), "{m}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+        let c = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(!c.is_ok());
+        st.truncate_to(&gs, 2, &c.ledger).unwrap();
+        assert!(st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().is_ok());
     }
 
     #[test]
@@ -1260,177 +1424,60 @@ mod tests {
         let c = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
         assert!(!c.genesis_ok);
         st.truncate_to(&gs, 0, &gs.ledger).unwrap();
-        assert_eq!(st.head().unwrap().height, 0);
-        assert_eq!(st.head().unwrap().hash, gs.hash());
+        assert_eq!(st.head().unwrap(), Head { height: 0, hash: gs.hash() });
+        assert_eq!(st.notes_count().unwrap(), 2);
+        assert_eq!(st.nullifiers_count().unwrap(), 0);
+        assert_eq!(st.load_ledger(&StubExecutor).unwrap(), gs.ledger);
         assert!(st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().is_ok());
         assert!(st.load_safety().is_ok());
     }
 
-    /// The whole point of the bridge column families: whatever the ledger
-    /// holds after a commit is what `load_ledger` gives back, across a reopen,
-    /// and `truncate_to` puts it back to the genesis bridge state.
+    /// More blocks than the anchor window: the stored window is what a reloaded ledger accepts
+    /// as an anchor, and it is exactly the newest `ANCHOR_WINDOW` roots.
     #[test]
-    fn a_committed_attestation_with_an_undecodable_payload_is_corrupt() {
-        let dir = tempfile::tempdir().unwrap();
-        let gs = bridged_genesis(1);
-        let alice = key(1);
-        let s = Storage::open(dir.path()).unwrap();
-        s.init_genesis(&gs).unwrap();
-
-        // Admission decoded this payload once, so a commit that cannot is a
-        // torn block. Treating it as "moves no balances" would write no rows
-        // and leave the snapshot disagreeing with the ledger.
-        let tx = Transaction::bridge_attest(&alice, 1, 0, attestation_with_undecodable_payload(), 1);
-        let cb = make_block_unchecked(&gs.block, &gs.ledger, vec![tx], &alice);
-        let err = s
-            .commit(std::slice::from_ref(&cb), &gs.ledger)
-            .expect_err("a payload that does not decode must not commit");
-        assert!(
-            matches!(&err, StorageError::Corrupt(m) if m.contains("payload does not decode")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn bridge_state_round_trips_through_commit_reopen_and_truncate() {
-        let dir = tempfile::tempdir().unwrap();
-        let gs = bridged_genesis(1);
-        let alice = key(1);
-        let bob = key(2);
-        let asset = bridged_asset();
-        {
-            let s = Storage::open(dir.path()).unwrap();
-            s.init_genesis(&gs).unwrap();
-            // The genesis bridge section is persisted, not just derived.
-            assert_eq!(s.load_ledger().unwrap(), gs.ledger);
-
-            let mut ledger = gs.ledger.clone();
-            // Position the ledger exactly as a replay would: `make_block`
-            // stamps every header with `timestamp_ms: 1`, and the burn record
-            // it produces carries the block height.
-            ledger.set_timestamp_ms(1);
-            ledger.set_height(1);
-            // Block 1: mint 1000 (fee 10) to bob, submitted by alice.
-            let att = Transaction::bridge_attest(&alice, 1, 0, attestation(0, &bob.address(), 1_000, 10), 1);
-            let b1 = make_block(&gs.block, &mut ledger, vec![att.clone()], &alice);
-            s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
-            assert_eq!(ledger.asset_balance(&asset, &bob.address()), 990);
-            assert_eq!(ledger.asset_balance(&asset, &alice.address()), 10);
-            assert_eq!(s.load_ledger().unwrap(), ledger);
-
-            // Block 2: alice burns her whole fee back out to chain 2, and a
-            // second attestation credits bob again.
-            let burn = Transaction::bridge_burn(&alice, 1, 1, asset, 10, 2, evm_to(), 1, 1);
-            let att2 = Transaction::bridge_attest(&alice, 1, 2, attestation(1, &bob.address(), 500, 0), 1);
-            ledger.set_height(2);
-            let b2 = make_block(&b1.block, &mut ledger, vec![burn.clone(), att2.clone()], &alice);
-            s.commit(std::slice::from_ref(&b2), &ledger).unwrap();
-            // alice's balance hit zero, so its row must be gone, not stale
-            assert_eq!(ledger.asset_balance(&asset, &alice.address()), 0);
-            assert_eq!(ledger.asset_balance(&asset, &bob.address()), 1_490);
-            assert_eq!(ledger.bridge().unwrap().burn_sequence, 1);
-            assert_eq!(s.load_ledger().unwrap(), ledger);
-            let c = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
-            assert!(c.is_ok(), "{:?}", c.problem);
-        }
-        // Reopening the database changes nothing.
-        let s = Storage::open(dir.path()).unwrap();
-        let reloaded = s.load_ledger().unwrap();
-        let bridge = reloaded.bridge().expect("bridge reloaded");
-        assert_eq!(bridge.balance(&asset, &bob.address()), 1_490);
-        assert_eq!(bridge.balance(&asset, &alice.address()), 0);
-        assert_eq!(bridge.spent.len(), 2);
-        assert_eq!(bridge.burns.len(), 1);
-        assert_eq!(bridge.burns[&0].height, 2);
-        assert_eq!(bridge.assets.get(&asset), Some(&(2u16, TOKEN)));
-
-        // The point queries the RPC layer uses agree with the reloaded state.
-        assert_eq!(s.asset_balance(&asset, &bob.address()).unwrap(), 1_490);
-        assert_eq!(s.asset_balance(&asset, &alice.address()).unwrap(), 0);
-        assert_eq!(s.assets_of(&bob.address()).unwrap(), vec![(asset, 2u16, TOKEN, 1_490u128)]);
-        assert!(s.assets_of(&alice.address()).unwrap().is_empty());
-        let meta = s.bridge_meta().unwrap().expect("bridge meta");
-        assert_eq!(meta, bridge.meta());
-        assert_eq!(meta.burn_sequence, 1);
-        let rec = s.bridge_burn(0).unwrap().expect("burn record");
-        assert_eq!((rec.sequence, rec.height), (0, 2));
-        assert_eq!(rec.digest, shrugg_core::bridge::digest(&rec.body));
-        assert_eq!(s.bridge_burn(1).unwrap(), None);
-
-        // Truncating to genesis restores the genesis bridge state exactly.
-        s.truncate_to(&gs, 0, &gs.ledger).unwrap();
-        assert_eq!(s.load_ledger().unwrap(), gs.ledger);
-        let back = s.load_ledger().unwrap().bridge().unwrap().clone();
-        assert!(back.balances.is_empty() && back.spent.is_empty() && back.burns.is_empty());
-        assert_eq!(back.burn_sequence, 0);
-        let c = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
-        assert!(c.is_ok(), "{:?}", c.problem);
-    }
-
-    /// A damaged bridge balance is caught by the same startup check that
-    /// catches a damaged account, and truncation repairs it.
-    #[test]
-    fn bridge_snapshot_corruption_is_detected_and_repaired() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Storage::open(dir.path()).unwrap();
-        let gs = bridged_genesis(1);
-        s.init_genesis(&gs).unwrap();
-        let (alice, bob, asset) = (key(1), key(2), bridged_asset());
-        let mut ledger = gs.ledger.clone();
-        ledger.set_timestamp_ms(1);
-        ledger.set_height(1);
-        let att = Transaction::bridge_attest(&alice, 1, 0, attestation(0, &bob.address(), 1_000, 0), 1);
-        let b1 = make_block(&gs.block, &mut ledger, vec![att], &alice);
-        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
-        assert!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().is_ok());
-
-        s.overwrite_asset_balance_for_testing(&asset, &bob.address(), 1).unwrap();
-        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
-        assert!(!check.is_ok());
-        assert_eq!(check.last_good, 1, "only the snapshot is damaged, not the blocks");
-        // Rewriting the snapshot from the replayed ledger repairs it.
-        s.truncate_to(&gs, 1, &check.ledger).unwrap();
-        assert_eq!(s.asset_balance(&asset, &bob.address()).unwrap(), 1_000);
-        assert!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().is_ok());
-    }
-
-    /// A chain whose genesis has no `bridge` section stores no bridge state.
-    #[test]
-    fn a_chain_without_a_bridge_loads_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Storage::open(dir.path()).unwrap();
-        let gs = genesis(1);
-        s.init_genesis(&gs).unwrap();
-        assert!(s.load_ledger().unwrap().bridge().is_none());
-        assert_eq!(s.load_ledger().unwrap(), gs.ledger);
+    fn the_anchor_window_slides_with_the_chain() {
+        let n = ANCHOR_WINDOW as u64 + 5;
+        let (_d, st, _gs, blocks) = chain_fixture(n);
+        let l = st.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(l.anchors().len(), ANCHOR_WINDOW);
+        assert_eq!(l.anchors().back().map(|(h, _)| *h), Some(n));
+        assert_eq!(l.anchors().front().map(|(h, _)| *h), Some(n - ANCHOR_WINDOW as u64 + 1));
+        assert!(l.is_anchor(&st.anchor(n).unwrap().unwrap()));
+        assert_eq!(st.latest_anchor().unwrap().map(|(h, _)| h), Some(n));
+        let _ = blocks;
     }
 
     #[test]
     fn programs_and_receipts_round_trip_and_truncate() {
-        let (_d, st, gs, blocks) = chain_fixture_with(2, 1_000_000_000);
-        let k = shrugg_core::Keypair::from_seed([9u8; 32]).unwrap();
-        let mut ledger = st.load_ledger().unwrap();
-        // block 3 deploys a program and (in the same block) carries a call receipt
+        let (_d, st, gs, blocks) = chain_fixture(2);
+        let k = key(1);
+        let mut ledger = st.load_ledger(&StubExecutor).unwrap();
+        ledger.set_faucet(true);
         let words = vec![0x13u32; 3];
-        let deploy = Transaction::deploy(&k, 5, 2, 0, words.clone(), shrugg_core::gas::deploy_fee(3));
         ledger.set_height(3);
+        let deploy_bundle = bundle_tx(&ledger, [[90; 8], [91; 8]], [[92; 8], [93; 8]], shrugg_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: words.clone() }));
+        let deploy = Transaction::shielded(gs.chain_id, deploy_bundle.bundle.clone().unwrap(), Action::Deploy { base_pc: 0, words: words.clone() });
+        // The bundle's digest commits to its own fields only, so swapping the action is fine.
         let cb3 = make_block(&blocks[1].block, &mut ledger, vec![deploy.clone()], &k);
         let pid = shrugg_core::program::program_id(0, &words);
-        let receipt = CallReceipt { tx: deploy.hash(), program: pid, tier: 10, outputs: [1, 0, 5, 0, 0, 0, 0, 0], effect: Some((k.address(), 5)), height: 3, index: 0 };
-        let cb3 = CommittedBlock { receipts: vec![receipt.clone()], ..cb3 };
         st.commit(std::slice::from_ref(&cb3), &ledger).unwrap();
         let rec = st.program(&pid).unwrap().expect("program stored");
         assert_eq!(rec.words, words);
         assert_eq!(rec.deployed_at, 3);
-        assert_eq!(st.receipt(&receipt.tx).unwrap().unwrap(), receipt);
-        assert_eq!(st.load_ledger().unwrap().programs().len(), 1);
+        assert_eq!(st.load_ledger(&StubExecutor).unwrap().programs().len(), 1);
         assert_eq!(st.programs_count().unwrap(), 1);
-        assert_eq!(st.committed_block(3).unwrap().unwrap().receipts, vec![receipt.clone()]);
-        // truncating below the deploy removes both
+        // truncating below the deploy removes it
         let two = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
-        st.truncate_to(&gs, 2, &gs.ledger).unwrap();
+        assert!(two.is_ok(), "{:?}", two.problem);
+        let at_two = {
+            let mut l = gs.ledger.clone();
+            for cb in &blocks {
+                l.apply_block(&cb.block, &StubExecutor).unwrap();
+            }
+            l
+        };
+        st.truncate_to(&gs, 2, &at_two).unwrap();
         assert!(st.program(&pid).unwrap().is_none());
-        assert!(st.receipt(&receipt.tx).unwrap().is_none());
-        let _ = two;
+        assert_eq!(st.load_ledger(&StubExecutor).unwrap(), at_two);
     }
 }

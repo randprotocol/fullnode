@@ -1,7 +1,12 @@
 # Command-line reference
 
 Two binaries are built by `cargo build --release`: `shrugg-node` (node and operator commands) and
-`shrugg` (wallet client). Every command accepts `-h/--help`.
+`shrugg` (the shielded wallet client). Every command accepts `-h/--help`.
+
+The two hold different kinds of key and must not be confused. A **node key** is a 32-byte seed and
+a Dilithium2 key pair whose base58 address is public and signs blocks. A **wallet key** is a
+256-bit shielded spend key whose `shrugg1…` address receives notes and which never signs anything
+on chain (`docs/shielded.md` §1).
 
 ## `shrugg-node`
 
@@ -9,14 +14,15 @@ Two binaries are built by `cargo build --release`: `shrugg-node` (node and opera
 shrugg-node <COMMAND>
   keygen    Generate a new Dilithium2 key file
   address   Print the address, public key, and libp2p peer id of a key file
-  genesis   Write a genesis.json: every validator key is staked and allocated SHRUGG
+  genesis   Write a genesis.json: every validator key is staked, each --alloc becomes a deposit note
   init      Initialise a data directory from a genesis file
   run       Run the node
   verify    Verify the chain in a data directory without running the node
-  balance   Query an account balance
-  transfer  Sign and submit a transfer
   status    Show node status
 ```
+
+There is no `balance` and no `transfer` subcommand: this chain has no accounts to query and a
+transfer needs a shielded spend key, which only the wallet holds. Use `shrugg` for both.
 
 ### `shrugg-node keygen`
 
@@ -43,38 +49,47 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--chain-id <CHAIN_ID>` | `1` | chain id; transactions and gossip topics are bound to it |
 | `--validator <VALIDATORS>` | required, repeatable | key file path **or** hex public key of each validator |
 | `--stake <STAKE>` | `100000` | stake assigned to every validator (quorum is stake weighted) |
-| `--alloc-each <ALLOC_EACH>` | `1000000` | SHRUGG credited to every validator address |
-| `--alloc <ALLOCS>` | none, repeatable | extra allocation `address=amountSHRUGG` |
+| `--alloc <ALLOCS>` | none, repeatable | a deposit note: `shrugg1<address>=<amount in SHRUGG>` |
 | `--out <OUT>` | `genesis.json` | output path |
 | `--faucet` | off | **testnet only**: enable `Mint` transactions (`shrugg_mint`, up to 100 SHRUGG per call). Part of the genesis hash |
 | `--no-confidential` | off | disable Deploy/Call transactions on this chain. Part of the genesis hash |
 | `--fri-profile <production\|test>` | `production` | zkVM FRI profile every node must use; `test` is insecure and for the test suite. Part of the genesis hash |
-| `--bridge <FILE>` | off | JSON file enabling the cross-chain bridge (see below). Part of the genesis hash |
 
-Prints the genesis hash. Every node of a chain must use a byte-identical genesis file.
+Prints the genesis hash, the note count, and `hc_bundle`. Every node of a chain must use a
+byte-identical genesis file.
+
+There is no `--alloc-each`: a shielded chain has no per-validator allocation, because value only
+exists as a note someone holds the spend key for. Each `--alloc` builds one deposit note with
+fresh commitment randomness, so writing the same allocation twice produces two different notes and
+two different genesis hashes — a deterministic `r` would let anyone confirm a guess at a genesis
+note's owner and amount by recomputing the commitment. Cut a genesis once and keep the file.
+
+There is no `--bridge` either: `Genesis::build` rejects a bridge section outright until phase S3
+puts the bridge back on the shielded chain (`docs/bridge.md`).
 
 Genesis JSON shape:
 
 ```json
 {
-  "chain_id": 2,
+  "chain_id": 6,
   "timestamp_ms": 1788000000000,
-  "validators": [ { "public_key": "<hex>", "stake": 100000 }, ... ],
-  "alloc": { "<base58 address>": 100000000000, ... },  // smallest units (1 SHRUGG = 1e9)
-  "faucet": true,                                        // omit or false outside testnets
-  "confidential": true,                                  // default true
-  "fri_profile": "production",                           // or "test"
-  "bridge": {                                            // omit entirely for a chain without a bridge
-    "emitter": "<64 hex>",                               // this chain's emitter address in outbound messages
-    "guardians": ["<40 hex>", ...],                      // initial guardian set (secp256k1 addresses)
-    "emitters": { "2": "<64 hex>", ... }                 // source chain id -> that chain's emitter address
-  }
+  "validators": [ { "public_key": "<hex>", "stake": 100000 } ],
+  "alloc": [
+    { "cm": "<64 hex>",
+      "envelope": { "kem_ct": "<hex>", "to_receiver": "<hex>", "to_sender": "<hex>", "body": "<hex>" },
+      "amount": 1000000000000 }
+  ],
+  "faucet": true,
+  "confidential": true,
+  "fri_profile": "production",
+  "hc_bundle": "<64 hex: the bundle guest's digest this build implements>"
 }
 ```
 
-The `--bridge <FILE>` flag takes exactly the `bridge` object above. Chain id 1 is Rand itself and may not
-appear in `emitters`; guardians must be non-empty, distinct and non-zero. A genesis without a `bridge`
-section hashes exactly as it did before the bridge existed.
+`amount` is in smallest units and is public: it is what lets everyone add up the initial supply.
+Who owns the note is not — only the address the envelope was sealed to can open it. `hc_bundle`
+pins the one zkVM relation every bundle proof on this chain is checked against; a node whose
+build assembles a different guest refuses to start and names both digests.
 
 ### `shrugg-node init`
 
@@ -83,8 +98,9 @@ section hashes exactly as it did before the bridge existed.
 | `--datadir <DATADIR>` | required | data directory to create |
 | `--genesis <GENESIS>` | required | genesis file; copied to `<datadir>/genesis.json` |
 
-Creates `<datadir>/db` (RocksDB) with block 0 and the genesis allocations. Re-running with the same
-genesis is a no-op; a different genesis is refused.
+Creates `<datadir>/db` (RocksDB) with block 0, the deposit notes as the tree's first leaves, and
+the validator register. Re-running with the same genesis is a no-op; a different genesis is
+refused.
 
 ### `shrugg-node run`
 
@@ -103,9 +119,14 @@ genesis is a no-op; a different genesis is refused.
 
 Environment: `RUST_LOG` (default `info,libp2p=warn,libp2p_mdns=off`). Ctrl-C shuts down cleanly.
 
-Startup sequence: open storage, run the integrity check (truncating a damaged tail if any), resume
-consensus from the persisted head and safety state, start networking and RPC, then sync from any
-peer that is ahead.
+Startup sequence: open storage, check that this build's bundle guest matches the genesis
+`hc_bundle`, run the integrity check (truncating a damaged tail if any), resume consensus from the
+persisted head and safety state, start networking and RPC, then sync from any peer that is ahead.
+
+Block spacing matters more on a shielded chain than it did on an account chain: a bundle proof
+takes about 100 seconds, and its anchor is only valid for 256 blocks. At the default 1000 ms that
+is a little over four minutes of headroom; a chain paced much faster than that will reject honest
+transfers whose anchor expired mid-proof.
 
 ### `shrugg-node verify`
 
@@ -113,22 +134,20 @@ peer that is ahead.
 |---|---|---|
 | `--datadir <DATADIR>` | required | data directory (node must not be running) |
 | `--mode <MODE>` | `full` | `quick` or `full`, as for `--verify-chain` |
-| `--repair` | off | truncate the damaged tail and rewrite the account snapshot; safety state is kept |
+| `--repair` | off | truncate the damaged tail and rewrite the note, nullifier, anchor and validator families from the replayed ledger; safety state is kept |
 
 Exit code 0 if the chain is consistent, 2 if a problem was found and `--repair` was not given.
+Replay re-verifies every bundle proof, so a build whose zkVM constraints differ from the one that
+made the chain will stop at the first bundle (`docs/confidential.md`).
 
-### `shrugg-node balance`, `transfer`, `status`
+### `shrugg-node status`
 
-Thin wrappers over the RPC, kept for operators who only have the node binary.
+| argument | default | meaning |
+|---|---|---|
+| `--rpc <URL>` | `http://127.0.0.1:8545` | node to ask |
 
-| command | arguments |
-|---|---|
-| `balance <ADDRESS>` | `--rpc <URL>` (default `http://127.0.0.1:8545`) |
-| `transfer --key <KEY> --to <ADDRESS> --amount <SHRUGG>` | `--fee <SHRUGG>` (default `0.000001`), `--rpc <URL>` |
-| `status` | `--rpc <URL>` |
-
-`transfer` reads the sender's nonce from the node, checks the balance, signs, and submits; it does
-not wait for the commit (use `shrugg send` for that).
+Prints `shrugg_status` verbatim: height, view, peers, mempool, notes, nullifiers, tree root,
+`hc_bundle`, sync state.
 
 ## `shrugg` (wallet)
 
@@ -137,52 +156,54 @@ Global options, accepted before or after the subcommand:
 | option | env | default | meaning |
 |---|---|---|---|
 | `--rpc <RPC>` | `SHRUGG_RPC` | `http://127.0.0.1:8545` | node JSON-RPC endpoint |
-| `--key <KEY>` | `SHRUGG_KEY` | `wallet.key.json` | key file used for signing and as the default address |
+| `--key <KEY>` | `SHRUGG_KEY` | `wallet.key.json` | spend-key file; the note store lives beside it at `<key>.notes.json` |
 
 | command | arguments | behaviour |
 |---|---|---|
-| `keygen` | | create the key file at `--key`; refuses to overwrite |
-| `address` | | print this wallet's address |
-| `balance [ADDRESS]` | | balance and nonce of `ADDRESS`, or of this wallet |
-| `send <TO> <AMOUNT>` | `--fee <SHRUGG>` (default `0.000001`), `--no-wait` | fetch nonce, check balance, sign, submit; then poll until committed (up to 60 s) and print the block height and new balance |
-| `faucet [ADDRESS]` | `--amount <SHRUGG>` (default `100`, max `100`) | testnet only: ask the node to mint to `ADDRESS` (default: this wallet), wait for the commit, print the balance. Fails with `faucet is disabled` on chains without the genesis flag |
-| `bridge-mint <ATTESTATION>` | `--fee <SHRUGG>` (default `0.000001`) | submit a guardian-signed attestation as hex, or `@path` to read it from a file (hex or raw bytes); wait for the commit and print this wallet's bridged holdings. The bridge fee inside the attestation is paid to you for submitting it |
-| `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | `--bridge-fee <units>` (default `0`), `--fee <SHRUGG>` (default `0.000001`) | burn `AMOUNT` bridged units of `ASSET` and emit the message a source-chain contract releases against. `TO_CHAIN` is 2 Ethereum, 3 BSC, 4 Tron, 5 Solana; `TO` is 32 bytes of hex (EVM and Tron addresses left-padded). `--bridge-fee` is carried in the message for whoever relays it and must not exceed `AMOUNT`. Prints the outbound message after the commit |
-| `asset-balance [ADDRESS] <ASSET>` | | balance of one bridged asset, as a plain integer of bridged units. With one argument it is the asset and the address is this wallet |
-| `bridge-status` | | this chain's emitter, source-chain emitter table, current guardian set, burn sequence and registered assets; prints `this chain has no bridge` where there is none |
+| `keygen` | | write a new spend-key file at `--key`, mode 0600; refuses to overwrite |
+| `address` | | print this wallet's `shrugg1…` shielded address |
+| `balance` | | scan the tree, save the store, print spendable value and the unspent note count |
+| `sync` | | scan without printing a balance; prints how far it got |
+| `notes` | | every note this wallet has opened: index, amount, height, `spent`, `pending` |
+| `history` | | every note this wallet created for someone else, opened through its own outgoing viewing key |
+| `send <TO> <AMOUNT>` | `--fee <SHRUGG>` (default `0.001`), `--no-wait`, `--cuda` | scan, select at most two notes, prove a 2-in-2-out bundle locally, submit; waits for the commit unless `--no-wait` |
+| `faucet [ADDRESS]` | `--amount <SHRUGG>` (default `100`, max `100`) | testnet only: ask a validator node to mint into a note for `ADDRESS` (default: this wallet), wait for the commit |
 | `program build` | `--guest <fib\|memcpy\|bubble_sort\|balance_check\|private_payment>`, `--arg N` (repeatable), `--out <file>` (default `program.json`) | assemble a built-in guest to `{base_pc, words}` JSON; prints the program id |
-| `program deploy <FILE>` | `.json` or `.bin` (raw LE words) | sign a `Deploy` with the schedule fee, wait for the commit, print the program id |
+| `program deploy <FILE>` | `.json` or `.bin` (raw LE words), `--cuda` | pay the deploy floor through a bundle, wait for the commit, print the program id |
 | `program show <ID>` | | deployed program metadata |
-| `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--to <address>` (repeatable, public recipient list), `--tier T`, `--fee <SHRUGG>` | fetch the code from the node, prove locally with the chain's FRI profile, submit proof + recipients, wait, print the receipt |
+| `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--tier T`, `--fee <SHRUGG>`, `--cuda` | fetch the code from the node, prove the call locally with the chain's FRI profile, pay through a bundle, wait, print the receipt |
 | `receipt <TX>` | | receipt of a committed call, or "no receipt" |
-| `fee deploy <words>` / `fee call <tier>` | | minimum fee from the node's schedule |
+| `fee bundle` / `fee deploy <words>` / `fee call <tier>` | | minimum fee from the node's schedule |
 | `tx <HASH>` | | committed transaction with its block height and index, or "not found" |
 | `block <ID>` | | block by height (integer) or by hash (hex) |
 | `head` | | `{height, hash, view}` |
 | `status` | | node status object (see docs/rpc.md `shrugg_status`) |
 | `peers` | | connected peers |
-| `validators` | | validator set with stakes |
+| `validators` | | validator register: address, stake, rewards |
 
 Amounts are decimal SHRUGG strings with up to 9 decimal places (`1`, `1.5`, `.25`, `0.000000001`).
 
-Bridged assets are a separate unit: 8 decimals, not SHRUGG's 9. `bridge-burn` and `asset-balance`
-therefore take and print plain integers of bridged units, never a decimal string — `100000000` is one
-whole token. `--fee` is always the SHRUGG transaction fee; the relayer fee inside a burn message is
-`--bridge-fee`.
+There is no `balance <ADDRESS>`, and no way to ask about anyone else's address: a balance is a
+fact about this machine's key file, not about the chain. There are no `bridge-*` or
+`asset-balance` commands either; they return with the bridge in phase S3.
 
-### A bridge round trip
+`--cuda` proves on an attached NVIDIA GPU and requires a build with `--features cuda`. There is no
+fallback: a missing driver is an error rather than a silent CPU run.
+
+### A first shielded transfer
 
 ```bash
-shrugg bridge-status                                   # the guardian set and registered assets
-shrugg bridge-mint @attestation.hex                    # guardians signed it; you submit and keep its fee
-shrugg asset-balance 8f1c...                           # your holding, in bridged units
-shrugg bridge-burn 8f1c... 100000000 2 000000000000000000000000d8da6bf2... --bridge-fee 1000
+shrugg keygen                                   # wallet.key.json
+shrugg address                                  # shrugg1… — give this to whoever pays you
+shrugg faucet                                   # testnet: 100 SHRUGG into a note only you can open
+shrugg balance                                  # balance: 100 SHRUGG
+shrugg send shrugg1q9f… 1.5                     # ~100 s of local proving, then the commit
+shrugg notes                                    # the spent note, and the change note
 ```
 
-The asset id is `blake3("shrugg-bridge-asset" || token_chain BE u16 || token_address)`; ask the node
-for it rather than computing it by hand (`shrugg_bridgeAssetId` in docs/rpc.md).
+### Key file formats
 
-## Key file format
+Node key (both binaries' `keygen` used to share this; only `shrugg-node` writes it now):
 
 ```json
 {
@@ -192,5 +213,13 @@ for it rather than computing it by hand (`shrugg_bridgeAssetId` in docs/rpc.md).
 }
 ```
 
-Both binaries read the same format. The libp2p peer id is derived as an ed25519 key from
-`blake3("shrugg-p2p-identity" || seed)`, so it is stable across restarts.
+Wallet key, version 2 — the spend key and nothing else, because every other key (viewing key,
+outgoing viewing key, ML-KEM decapsulation key, address) is a pure derivation of it:
+
+```json
+{ "version": 2, "spend_key": "hex of 8 little-endian u32 words (64 characters)" }
+```
+
+The libp2p peer id is derived as an ed25519 key from `blake3("shrugg-p2p-identity" || seed)`, so it
+is stable across restarts. Losing a wallet key loses every note it could open; there is no
+recovery phrase in this release.

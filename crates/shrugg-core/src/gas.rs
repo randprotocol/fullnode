@@ -1,11 +1,11 @@
-//! Limits and the v0 fee schedule for confidential computation.
+//! Limits and the v0 fee schedule for the shielded pool and confidential computation.
+
+use crate::types::Action;
 
 /// Largest program, in 32-bit words (16 KiB of code).
 pub const MAX_PROGRAM_WORDS: usize = 4096;
 /// Largest proof accepted in a transaction.
 pub const MAX_PROOF_BYTES: usize = 1 << 20;
-/// Largest public recipient list on a call.
-pub const MAX_RECIPIENTS: usize = 8;
 /// Largest bridge attestation accepted in a `BridgeAttest` transaction.
 ///
 /// A real attestation is tiny: 6 envelope bytes, 66 per signature, a
@@ -23,19 +23,34 @@ pub const MAX_BLOCK_TXS: usize = 2_000;
 pub const MIN_TIER: u8 = 10;
 pub const MAX_TIER: u8 = 20;
 
-pub const DEPLOY_PER_WORD: u128 = 100_000;
-pub const CALL_BASE: u128 = 1_000_000;
-pub const CALL_PER_TIER_STEP: u128 = 100_000;
+/// What every bundle pays before its action's own floor (0.001 SHRUGG, spec §7 item 3).
+pub const BUNDLE_BASE: u64 = 1_000_000;
+pub const DEPLOY_PER_WORD: u64 = 100_000;
+pub const CALL_BASE: u64 = 1_000_000;
+pub const CALL_PER_TIER_STEP: u64 = 100_000;
 
 /// Minimum fee to deploy a program of `words` words.
-pub fn deploy_fee(words: usize) -> u128 {
-    DEPLOY_PER_WORD * words as u128
+pub fn deploy_fee(words: usize) -> u64 {
+    DEPLOY_PER_WORD * words as u64
 }
 
 /// Minimum fee for a call proven at `tier` (10, 12, ..., 20).
-pub fn call_fee(tier: u8) -> u128 {
-    let steps = (tier.saturating_sub(MIN_TIER) / 2) as u128;
+pub fn call_fee(tier: u8) -> u64 {
+    let steps = (tier.saturating_sub(MIN_TIER) / 2) as u64;
     CALL_BASE + CALL_PER_TIER_STEP * steps
+}
+
+/// The floor a bundle must pay before the action's proof is verified. A call's tier-dependent
+/// part is only known once its proof has been decoded, so it is charged afterwards
+/// (`Ledger::validate`); this floor is what keeps that work from being bought for nothing.
+/// A mint carries no bundle and pays nothing.
+pub fn fee_floor(action: &Action) -> u64 {
+    match action {
+        Action::Mint { .. } => 0,
+        Action::None => BUNDLE_BASE,
+        Action::Deploy { words, .. } => BUNDLE_BASE + deploy_fee(words.len()),
+        Action::Call { .. } => BUNDLE_BASE + CALL_BASE,
+    }
 }
 
 #[cfg(test)]
@@ -47,6 +62,23 @@ mod tests {
         assert_eq!(deploy_fee(0), 0);
         assert_eq!(deploy_fee(1), 100_000);
         assert_eq!(deploy_fee(256), 25_600_000);
+    }
+
+    #[test]
+    fn fee_floor_adds_the_bundle_base() {
+        assert_eq!(fee_floor(&Action::None), 1_000_000);
+        assert_eq!(fee_floor(&Action::Deploy { base_pc: 0, words: vec![0x13; 10] }), 1_000_000 + 1_000_000);
+        assert_eq!(fee_floor(&Action::Call { program: crate::crypto::Hash::ZERO, proof: vec![] }), 2_000_000);
+        assert_eq!(
+            fee_floor(&Action::Mint {
+                cm: [0; 8],
+                envelope: crate::notes::Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] },
+                amount: 5,
+                minter: crate::crypto::Keypair::from_seed([1; 32]).unwrap().public_key().clone(),
+                signature: crate::crypto::Signature::empty(),
+            }),
+            0
+        );
     }
 
     #[test]

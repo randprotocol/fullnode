@@ -56,3 +56,9 @@ opt-level = 3
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# The zkVM prover runs in dev/test builds (the cluster tests prove real bundles). At the
+# default dev opt-level 0 a single bundle proof took 575 s; `"*"` above covers dependencies
+# only, never a workspace member, so this member needs its own entry.
+[profile.dev.package.shrugg-zkvm]
+opt-level = 2

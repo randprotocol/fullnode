@@ -2,7 +2,16 @@
 
 SHRUGG pays for confidential calls: a program runs off-chain inside the Rand zkVM on private inputs,
 and only a STARK proof plus eight public output words go on chain. Every node verifies the proof,
-charges gas, stores a receipt, and applies the transfer the outputs request.
+charges gas, and stores a receipt.
+
+Since phase S1 a call **pays through a shielded bundle**, not from an account. `Deploy` and `Call`
+are actions on an ordinary shielded transaction whose bundle is a self-transfer of zero: it exists
+to pay the action's fee floor out of the caller's own notes, and the chain never learns whose they
+were. The call proof and the bundle proof are separate objects and both are verified
+(`docs/shielded.md`, `docs/architecture.md` §9). The consequence for programs: **effect kind 1 —
+the program-driven transfer to a recipient — is deleted**, along with the recipient list a call
+used to carry, because there are no accounts to pay. A program that paid `recipients[i]` must be
+rewritten to publish what it decided and let the caller move the value in the bundle.
 
 ## The zkVM
 
@@ -177,54 +186,62 @@ open.
 A `Deploy` transaction stores `{ base_pc, words }` (at most 4096 words); every word must decode as an
 instruction. Programs are immutable and part of the state root.
 
-**Calls** carry `{ program, proof, recipients }`. The proof is `postcard(rand_zkvm::Proof)` (tier,
-public values, batch STARK proof); `recipients` is a public list (at most 8) the program may pay.
+**Calls** carry `{ program, proof }`. The proof is `postcard(rand_zkvm::Proof)` (tier, public
+values, batch STARK proof). There is no recipient list: it existed only for effect kind 1.
 
-**Effects.** The eight output words are the program's instruction to the chain:
+**Outputs.** The eight output words are published data, not an instruction to the chain. They are
+recorded in the receipt verbatim and nothing follows from them; `out0..out7` mean whatever the
+program and its caller agree they mean. The old layout (`out0` effect kind, `out1` recipient index,
+`out2|out3` a little-endian u64 amount) survives only as a convention inside guests like
+`private_payment`, which still writes `[1, 0, amount_lo, amount_hi, …]`; on this chain that is a
+statement, not a payment.
 
-| word | meaning |
-|---|---|
-| `out0` | effect kind: `0` none, `1` transfer |
-| `out1` | recipient index into `recipients` |
-| `out2`, `out3` | amount in units as a little-endian u64 (low, high) |
-| `out4..out7` | free data, recorded in the receipt |
-
-Kind 1 moves `amount` from the caller to `recipients[out1]` inside the same transaction; the caller
-must hold `amount + fee`. Kind 0 pays gas and records the outputs. The assembler helper
-`emit_transfer(index, lo_reg, hi_reg)` writes the four effect words.
-
-**Receipts** `{ tx, program, tier, outputs, effect, height, index }` are stored per call and served by
-`shrugg_getReceipt`; they are recomputed and checked when a node syncs or verifies its chain.
+**Receipts** `{ tx, program, tier, outputs, height, index }` are stored per call and served by
+`shrugg_getReceipt`; they are recomputed and checked when a node syncs or verifies its chain. There
+is no `effect` field.
 
 ## Validity rules
 
-- Deploy: `words.len() <= 4096`, `base_pc % 4 == 0`, every word decodes, `fee >= 100_000 * words`.
-- Call: program exists; `proof.len() <= 1 MiB`; `recipients.len() <= 8`; the proof verifies against
-  the stored program for the tier it declares; `fee >= call_fee(tier)`; the effect decodes (known kind,
-  index in range); for a transfer the caller's balance covers `amount + fee`.
+- Both: the transaction carries a bundle, and that bundle passes the shielded admission order
+  (`docs/shielded.md` §5) — anchor in the 256-block window, neither note already spent, the
+  recomputed digest equal to what the bundle proof published, and the bundle proof valid against
+  the genesis-pinned `hc_bundle`.
+- Deploy: `words.len() <= 4096`, `base_pc % 4 == 0`, every word decodes,
+  `fee >= BUNDLE_BASE + 100_000 * words`.
+- Call: program exists; `proof.len() <= 1 MiB`; the proof verifies against the stored program's
+  `hc` for the tier it declares; `fee >= BUNDLE_BASE + call_fee(tier)`, checked last, once a
+  verified proof has revealed the tier.
 - A block with an invalid call is invalid, like any other invalid transaction.
 
 ## Gas (v0)
 
 | operation | minimum fee |
 |---|---|
-| Deploy | 100,000 units per word (0.0256 SHRUGG for 256 words) |
-| Call | 0.001 SHRUGG + 0.0001 SHRUGG per two tiers above 10 |
-| Transfer, Mint | free (fee is a tip) |
+| any bundle (`BUNDLE_BASE`) | 0.001 SHRUGG |
+| shielded transfer | 0.001 SHRUGG (the base alone) |
+| Deploy | 0.001 SHRUGG + 100,000 units per word (0.0266 SHRUGG for 256 words) |
+| Call | 0.002 SHRUGG at tier 10, plus 0.0001 SHRUGG per two tiers above it (0.0025 at tier 20) |
+| Mint (faucet) | free, and carries no bundle |
 
-Anything above the minimum is a tip; all of it goes to the block proposer. Blocks hold at most
-4 MiB of transactions, so about four calls per block. Constants live in `shrugg_core::gas`.
+Every floor above the mint's includes `BUNDLE_BASE`, because every one of those transactions
+carries a bundle. Anything above the minimum is a tip; all of it is credited to the block
+proposer's `rewards` in the validator register, which phase S2's `Withdraw` turns back into a note.
+Blocks hold at most 4 MiB of transactions, and a bundle proof is ~300 KB, so roughly a dozen
+shielded transactions per block. Constants live in `shrugg_core::gas`; `shrugg fee bundle|deploy
+<words>|call <tier>` asks the node.
 
 ## Privacy
 
-Public: program id, tier, the eight outputs, caller, fee, recipient list, (for kind 1) the
-transfer, and — since constraint set 4 — the salted input commitment `H_IN` (`proof.public_values[
+Public: program id, tier, the eight outputs, the bundle's fee, and — since constraint set 4 — the
+salted input commitment `H_IN` (`proof.public_values[
 IN0..IN7]`). `H_IN` being public does not make any input word public: without the salt (never
 published, never leaves the prover) it cannot be opened, so on its own it only pins two reads of
 the same input index to agree and makes an out-of-range read unsatisfiable — see "Disclosure
 implication" above for what happens if a caller later reveals the salt. Private: inputs, registers,
-memory, branches taken, cycle count (padded to the tier), and the `H_IN` salt itself. Two
-proofs of the same run are different bytes (hiding commitments), so proofs do not fingerprint inputs.
+memory, branches taken, cycle count (padded to the tier), the `H_IN` salt itself — and, since S1,
+*who called it and what they paid with*: the bundle publishes two nullifiers and two commitments
+and names nobody. Two proofs of the same run are different bytes (hiding commitments), so proofs do
+not fingerprint inputs.
 
 ## Chains without confidential computation
 
