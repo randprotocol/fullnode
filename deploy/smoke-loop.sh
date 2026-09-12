@@ -51,7 +51,7 @@ while true; do
   t0=$(date +%s); out=$("$BIN/shrugg" send "$to" 1.5 --key "$W1" --rpc "$RPC" 2>&1); h=$(submitted "$out" transfer)
   if [ -n "$h" ] && body=$(explorer_tx "$h" transfer); then
     nf=$(grep -o '"nullifiers":\[[^]]*\]' <<<"$body" | head -1 | cut -c15-30)
-    log "round $round transfer ok $h (proved+committed in $(( $(date +%s) - t0 )) s, bundle nullifiers $nf…)"
+    log "round $round transfer ok $h (proved+committed in $(( $(date +%s) - t0 )) s, bundle nullifiers ${nf}...)"
   else log "round $round transfer FAIL ${h:-nohash}: $(tail -1 <<<"$out")"; fi
 
   # 3. deploy (a different threshold each round gives a different program id)
