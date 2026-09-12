@@ -13,6 +13,7 @@ use crate::storage::Storage;
 use axum::{extract::State, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use shrugg_core::bridge::{asset_id, AssetInfo, BridgeMeta};
 use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::notes::{word8_to_hex, Envelope};
 use shrugg_core::{Action, Hash, ShieldedAddress, Transaction, ValidatorSet, TOKEN_DECIMALS, TOKEN_SYMBOL};
@@ -175,6 +176,16 @@ fn parse_shielded(params: &Value, idx: usize) -> Result<ShieldedAddress, RpcErro
     ShieldedAddress::parse(&s).map_err(|e| RpcError::invalid_params(format!("address: {e}")))
 }
 
+/// A 32-byte value as hex, with or without `0x`: a bridge token address or emitter.
+fn parse_bytes32(params: &Value, idx: usize, name: &str) -> Result<[u8; 32], RpcError> {
+    let s: String = param(params, idx, name)?;
+    let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(&s))
+        .map_err(|_| RpcError::invalid_params(format!("{name} must be hex")))?;
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| RpcError::invalid_params(format!("{name} must be 32 bytes, got {}", v.len())))
+}
+
 /// A page size, clamped to `MAX_PAGE`. A missing or null `limit` asks for the maximum.
 fn parse_limit(params: &Value, idx: usize) -> Result<usize, RpcError> {
     match params.get(idx) {
@@ -195,7 +206,35 @@ fn envelope_json(e: &Envelope) -> Value {
     })
 }
 
-fn block_json(b: &shrugg_core::Block) -> Value {
+/// What a `BridgeAttest` deposits, as far as it is public: the note's asset index and the
+/// amount. `None` for a rotation, for an attestation this node cannot decode, and for an asset
+/// the registry does not hold — the last of which only a transaction that is not committed yet
+/// can be.
+fn attest_deposit(attestation: &[u8], bridge: Option<&BridgeMeta>) -> Option<(u32, u64)> {
+    let (asset, amount) = shrugg_core::ledger::bridge_notes::attested_transfer(attestation)?;
+    Some((bridge?.assets.get(&asset)?.index, amount))
+}
+
+/// One row of the bridge's asset registry: the note's `asset` word and the wire identity
+/// guardians sign about.
+fn asset_json(asset: &shrugg_core::bridge::AssetId, info: &AssetInfo) -> Value {
+    json!({
+        "index": info.index,
+        "chain": info.chain,
+        "token": hex::encode(info.token),
+        "asset_id": asset.to_hex(),
+    })
+}
+
+/// The registry as `shrugg_getAssets` serves it: one row per registered asset, ascending by
+/// index, which is registration order.
+fn assets_json(bridge: &BridgeMeta) -> Vec<Value> {
+    let mut rows: Vec<(&shrugg_core::bridge::AssetId, &AssetInfo)> = bridge.assets.iter().collect();
+    rows.sort_by_key(|(_, info)| info.index);
+    rows.into_iter().map(|(asset, info)| asset_json(asset, info)).collect()
+}
+
+fn block_json(b: &shrugg_core::Block, bridge: Option<&BridgeMeta>) -> Value {
     json!({
         "hash": b.hash().to_hex(),
         "height": b.height(),
@@ -207,7 +246,7 @@ fn block_json(b: &shrugg_core::Block) -> Value {
         "state_root": b.header.state_root.to_hex(),
         "justify_view": b.header.justify.view,
         "tx_count": b.transactions.len(),
-        "transactions": b.transactions.iter().map(tx_json).collect::<Vec<_>>(),
+        "transactions": b.transactions.iter().map(|t| tx_json(t, bridge)).collect::<Vec<_>>(),
     })
 }
 
@@ -232,7 +271,9 @@ fn bundle_json(b: &shrugg_core::Bundle) -> Value {
     })
 }
 
-fn tx_json(t: &Transaction) -> Value {
+/// `bridge` is the asset registry, which a `BridgeAttest` needs and nothing else does: the
+/// deposit's asset index is state, not a field of the transaction.
+fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>) -> Value {
     let bundle = t.bundle.as_ref().map(bundle_json);
     let action = match &t.action {
         Action::None => json!({ "kind": "none" }),
@@ -260,11 +301,21 @@ fn tx_json(t: &Transaction) -> Value {
         Action::Withdraw { validator, amount, nonce, .. } => json!({
             "kind": "withdraw", "validator": validator.to_base58(), "amount": amount, "nonce": nonce
         }),
-        // No amount: it is inside the attestation, which S3's bridge decoder reads. The
-        // recipient is public in this transaction only — the note's later spend is not.
-        Action::BridgeAttest { attestation, recipient, .. } => json!({
-            "kind": "bridge_attest", "attestation_len": attestation.len(), "recipient": recipient.to_string()
-        }),
+        // The amount and the asset are inside the attestation, so they are decoded out of it
+        // rather than read off a field; the index is what the registry gave that asset. Both
+        // are `null` for a guardian-set rotation, which deposits nothing, and on a chain whose
+        // registry does not name the asset yet. The recipient is public in this transaction
+        // only — the note's later spend is not.
+        Action::BridgeAttest { attestation, recipient, .. } => {
+            let deposit = attest_deposit(attestation, bridge);
+            json!({
+                "kind": "bridge_attest",
+                "attestation_len": attestation.len(),
+                "recipient": recipient.to_string(),
+                "asset_index": deposit.map(|(index, _)| index),
+                "amount": deposit.map(|(_, amount)| amount),
+            })
+        }
         Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to } => json!({
             "kind": "bridge_burn", "asset": asset, "amount": amount, "relayer_fee": relayer_fee,
             "to_chain": to_chain, "to": hex::encode(to),
@@ -489,6 +540,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         }
         "shrugg_getTransaction" => {
             let h = parse_hash(p, 0)?;
+            let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
             match st.storage.tx_location(&h).map_err(RpcError::internal)? {
                 None => Ok(Value::Null),
                 Some((height, index)) => {
@@ -498,17 +550,21 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                         .map_err(RpcError::internal)?
                         .ok_or_else(|| RpcError::not_found("block missing"))?;
                     let tx = b.transactions.get(index as usize).ok_or_else(|| RpcError::not_found("tx index"))?;
-                    Ok(json!({ "height": height, "index": index, "block_hash": b.hash().to_hex(), "tx": tx_json(tx) }))
+                    Ok(json!({ "height": height, "index": index, "block_hash": b.hash().to_hex(), "tx": tx_json(tx, bridge.as_ref()) }))
                 }
             }
         }
         "shrugg_getBlockByHeight" => {
             let h: u64 = param(p, 0, "height")?;
-            Ok(st.storage.block_by_height(h).map_err(RpcError::internal)?.map(|b| block_json(&b)).unwrap_or(Value::Null))
+            let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
+            let block = st.storage.block_by_height(h).map_err(RpcError::internal)?;
+            Ok(block.map(|b| block_json(&b, bridge.as_ref())).unwrap_or(Value::Null))
         }
         "shrugg_getBlockByHash" => {
             let h = parse_hash(p, 0)?;
-            Ok(st.storage.block_by_hash(&h).map_err(RpcError::internal)?.map(|b| block_json(&b)).unwrap_or(Value::Null))
+            let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
+            let block = st.storage.block_by_hash(&h).map_err(RpcError::internal)?;
+            Ok(block.map(|b| block_json(&b, bridge.as_ref())).unwrap_or(Value::Null))
         }
         "shrugg_getHead" => {
             let head = st.storage.head().map_err(RpcError::internal)?;
@@ -524,6 +580,63 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             st.node.send(NodeCommand::Peers { reply }).await.map_err(|_| RpcError::internal("node loop closed"))?;
             let peers = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
             Ok(serde_json::to_value(peers).map_err(RpcError::internal)?)
+        }
+        // ---- the bridge ----
+        // Public by design (spec §10): the bridge's own state names no pool participant. What
+        // it does name — guardians, source emitters, the asset registry, how many messages have
+        // gone out — is what a relayer and a guardian both have to read to work.
+        "shrugg_getBridgeState" => {
+            let Some(bridge) = st.storage.bridge_meta().map_err(RpcError::internal)? else {
+                return Ok(json!({ "enabled": false }));
+            };
+            let guardians = bridge
+                .guardian_sets
+                .get(&bridge.current_set)
+                .map(|s| s.keys.iter().map(hex::encode).collect::<Vec<_>>())
+                .unwrap_or_default();
+            Ok(json!({
+                "enabled": true,
+                "emitter": hex::encode(bridge.emitter),
+                "emitters": bridge
+                    .emitters
+                    .iter()
+                    .map(|(c, a)| (c.to_string(), json!(hex::encode(a))))
+                    .collect::<serde_json::Map<String, Value>>(),
+                "guardian_set_index": bridge.current_set,
+                "guardians": guardians,
+                "burn_sequence": bridge.burn_sequence,
+                "next_index": bridge.next_index,
+                "assets": assets_json(&bridge),
+            }))
+        }
+        // The registry alone, which is what a wallet needs to read a note's `asset` word.
+        // Empty on a chain without a bridge, like every other bridge read here.
+        "shrugg_getAssets" => {
+            let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
+            Ok(json!(bridge.as_ref().map(assets_json).unwrap_or_default()))
+        }
+        // The outbound message with this sequence, verbatim, for guardians to sign.
+        "shrugg_getBridgeBurn" => {
+            let sequence: u64 = param(p, 0, "sequence")?;
+            Ok(st
+                .storage
+                .bridge_burn(sequence)
+                .map_err(RpcError::internal)?
+                .map(|r| {
+                    json!({
+                        "sequence": r.sequence, "body_hex": hex::encode(&r.body), "digest": hex::encode(r.digest),
+                        "tx": r.tx.to_hex(), "height": r.height,
+                    })
+                })
+                .unwrap_or(Value::Null))
+        }
+        // Pure arithmetic on the two wire fields, so it answers on any chain: the asset id is
+        // what the registry is keyed by, and a caller that has a token address needs it to
+        // find that token's note index.
+        "shrugg_bridgeAssetId" => {
+            let token_chain: u16 = param(p, 0, "token_chain")?;
+            let token_address = parse_bytes32(p, 1, "token_address")?;
+            Ok(json!(asset_id(token_chain, &token_address).to_hex()))
         }
         "shrugg_getValidators" => {
             // Stake comes from the genesis set; rewards are chain state, so they come from the
@@ -594,7 +707,7 @@ mod tests {
         let mut ledger = gs.ledger.clone();
         let tx = bundle_tx(&ledger, [nf(1), nf(2)], [cm(1), cm(2)], bundle_fee());
         let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
-        st.storage.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &StubExecutor).unwrap();
         (dir, st, gs)
     }
 
@@ -835,7 +948,7 @@ mod tests {
         let mut b1 = make_block(&gs.block, &mut ledger, txs, &key(1));
         // The receipts the ledger itself produced for that block — what a node commits.
         b1.receipts = probe.apply_block(&b1.block, &StubExecutor).unwrap();
-        st.storage.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &StubExecutor).unwrap();
 
         let v = ok(&st, "shrugg_getCallEnvelope", json!([sealed.hash().to_hex()])).await;
         assert_eq!(v["tx"], sealed.hash().to_hex());
@@ -877,10 +990,10 @@ mod tests {
         assert_eq!(rows[0]["rewards"], bundle_fee());
     }
 
-    /// S2/S3 scaffold: an explorer can name and summarise every new action the moment one can
-    /// be submitted. Amounts that are public by design (the staking register, a burn) are shown;
-    /// ciphertexts are lengths only, and an attestation's amount is not guessed at here — S3's
-    /// bridge decoder is what reads it.
+    /// An explorer can name and summarise every new action. Amounts that are public by design
+    /// (the staking register, a burn, a deposit) are shown; ciphertexts are lengths only. This
+    /// case passes no registry, which is what a bridge-less chain has: an attestation's asset
+    /// index and amount then come back `null` rather than guessed at.
     #[test]
     fn tx_json_renders_every_new_action_kind() {
         let gs = fixtures::genesis_with(1, vec![]);
@@ -893,7 +1006,8 @@ mod tests {
         let recipient = ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
         let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
 
-        let j = |action| tx_json(&Transaction::shielded(1, b([nf(1), nf(2)], [cm(1), cm(2)]), action))["action"].clone();
+        let j =
+            |action| tx_json(&Transaction::shielded(1, b([nf(1), nf(2)], [cm(1), cm(2)]), action), None)["action"].clone();
 
         let bond = j(Action::Bond { validator: v, amount: 500, registration: None });
         assert_eq!(bond["kind"], "bond");
@@ -917,6 +1031,7 @@ mod tests {
         assert_eq!(at["attestation_len"], 520);
         assert_eq!(at["recipient"], recipient.to_string());
         assert!(at["amount"].is_null(), "an attestation's amount is inside it, not on the action");
+        assert!(at["asset_index"].is_null(), "and its asset index is in the registry, which there is none of");
 
         let asset_bundle = b([nf(3), nf(4)], [cm(3), cm(4)]);
         let burn = j(Action::BridgeBurn {
@@ -957,12 +1072,101 @@ mod tests {
         assert!(!text.contains("body") && !text.contains("kem_ct"), "{text}");
     }
 
+    /// A bridged chain with one committed attestation (1000 units of the test token to the
+    /// fixture recipient, registering it as asset 1) and one committed burn of 400 with a
+    /// relayer fee of 100.
+    fn bridged_chain() -> (tempfile::TempDir, RpcState, GenesisState, shrugg_core::Transaction) {
+        let (gs, secrets) = fixtures::bridged_genesis(1);
+        let (dir, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let att = fixtures::attest_tx(&ledger, fixtures::attestation(&secrets, &fixtures::recipient(), 1_000, 0), 20);
+        let b1 = make_block(&gs.block, &mut ledger, vec![att.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &StubExecutor).unwrap();
+        let burn = fixtures::burn_tx(&ledger, 1, 400, 100, 30);
+        let b2 = make_block(&b1.block, &mut ledger, vec![burn], &key(1));
+        st.storage.commit(std::slice::from_ref(&b2), &ledger, &StubExecutor).unwrap();
+        (dir, st, gs, att)
+    }
+
+    /// The bridge's public state, as a relayer and a guardian read it: who signs, who may
+    /// emit, what is registered and how many messages have gone out. No balance anywhere —
+    /// bridged value is notes.
+    #[tokio::test]
+    async fn bridge_state_reports_guardians_emitters_and_the_registry() {
+        let (_d, st, _gs, _) = bridged_chain();
+        let v = ok(&st, "shrugg_getBridgeState", json!([])).await;
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["emitter"], hex::encode([1u8; 32]));
+        assert_eq!(v["emitters"]["2"], hex::encode([2u8; 32]));
+        assert_eq!(v["guardian_set_index"], 0);
+        assert_eq!(v["guardians"].as_array().unwrap().len(), 6);
+        assert_eq!(v["burn_sequence"], 1);
+        assert_eq!(v["next_index"], 2, "one asset registered, so the next one gets index 2");
+        assert!(!serde_json::to_string(&v).unwrap().contains("balance"));
+
+        // The registry alone, which is what a wallet needs to read a note's `asset` word.
+        let asset = shrugg_core::bridge::asset_id(2, &fixtures::TOKEN);
+        let row = json!({
+            "index": 1, "chain": 2, "token": hex::encode(fixtures::TOKEN), "asset_id": asset.to_hex(),
+        });
+        assert_eq!(ok(&st, "shrugg_getAssets", json!([])).await, json!([row]));
+        assert_eq!(v["assets"], json!([row]));
+
+        // And the id the registry is keyed by is derivable from the two wire fields.
+        let id = ok(&st, "shrugg_bridgeAssetId", json!([2, hex::encode(fixtures::TOKEN)])).await;
+        assert_eq!(id, asset.to_hex());
+        let bad = call(&st, "shrugg_bridgeAssetId", json!([2, "aabb"])).await.unwrap_err();
+        assert_eq!(bad.code, -32602);
+    }
+
+    /// The outbound message a burn emitted, for guardians to sign, keyed by its sequence.
+    #[tokio::test]
+    async fn bridge_burn_serves_the_outbound_message() {
+        let (_d, st, _gs, _) = bridged_chain();
+        let v = ok(&st, "shrugg_getBridgeBurn", json!([0])).await;
+        assert_eq!(v["sequence"], 0);
+        assert_eq!(v["height"], 2);
+        let body = hex::decode(v["body_hex"].as_str().unwrap()).unwrap();
+        assert_eq!(v["digest"], hex::encode(shrugg_core::bridge::digest(&body)));
+        assert_eq!(ok(&st, "shrugg_getBridgeBurn", json!([1])).await, Value::Null);
+    }
+
+    /// A chain whose genesis has no `bridge` section answers every bridge read rather than
+    /// erroring: disabled, and empty.
+    #[tokio::test]
+    async fn the_bridge_reads_degrade_on_an_unbridged_chain() {
+        let (_d, st, _gs) = chain();
+        assert_eq!(ok(&st, "shrugg_getBridgeState", json!([])).await, json!({ "enabled": false }));
+        assert_eq!(ok(&st, "shrugg_getAssets", json!([])).await, json!([]));
+        assert_eq!(ok(&st, "shrugg_getBridgeBurn", json!([0])).await, Value::Null);
+        // The asset id is arithmetic on its two arguments, so it answers anywhere.
+        assert!(ok(&st, "shrugg_bridgeAssetId", json!([2, hex::encode([7u8; 32])])).await.is_string());
+    }
+
+    /// On a bridged chain the explorer resolves an attestation against the registry: the
+    /// deposit's amount and the note's asset index, neither of which is a field of the action.
+    #[tokio::test]
+    async fn an_attestation_renders_its_deposit_against_the_registry() {
+        let (_d, st, _gs, att) = bridged_chain();
+        let v = ok(&st, "shrugg_getTransaction", json!([att.hash().to_hex()])).await;
+        let action = &v["tx"]["action"];
+        assert_eq!(action["kind"], "bridge_attest");
+        assert_eq!(action["amount"], 1_000);
+        assert_eq!(action["asset_index"], 1);
+        assert_eq!(action["recipient"], fixtures::recipient().to_string());
+        // The same transaction inside its block renders the same way.
+        let block = ok(&st, "shrugg_getBlockByHeight", json!([1])).await;
+        assert_eq!(block["transactions"][0]["action"], *action);
+    }
+
     #[tokio::test]
     async fn unknown_methods_still_report_method_not_found() {
         let gs = fixtures::genesis(1);
         let (_d, st) = state_for(&gs);
         assert_eq!(call(&st, "shrugg_getBalance", json!([])).await.unwrap_err().code, -32601);
         assert_eq!(call(&st, "shrugg_getAccount", json!([])).await.unwrap_err().code, -32601);
-        assert_eq!(call(&st, "shrugg_getBridgeState", json!([])).await.unwrap_err().code, -32601);
+        // The bridge holds notes, not per-address balances, so the account-era balance read is
+        // gone for good rather than waiting on a later phase.
+        assert_eq!(call(&st, "shrugg_getAssetBalance", json!([])).await.unwrap_err().code, -32601);
     }
 }

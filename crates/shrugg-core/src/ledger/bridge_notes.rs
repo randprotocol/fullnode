@@ -18,9 +18,11 @@
 //! the fifth component of the state root; this module is only the ledger's half.
 
 use super::{Ledger, TxError};
-use crate::bridge::{AttestOutcome, AttestPlan, BridgeError, CheckedAttestation};
+use crate::bridge::{
+    asset_id, Attestation, AssetId, AttestOutcome, AttestPlan, BridgeError, BridgeState, CheckedAttestation, Payload,
+};
 use crate::confidential::ConfidentialExecutor;
-use crate::notes::Word8;
+use crate::notes::{Envelope, ShieldedAddress, Word8};
 use crate::types::{Action, Transaction};
 
 /// The `from` field of a deposit note: a deposit has no sender inside the pool, so the note
@@ -163,13 +165,70 @@ pub(super) fn apply(
 /// chain locked; netting it would burn the difference forever.
 fn deposit_commitment(
     ledger: &Ledger,
-    recipient: &crate::notes::ShieldedAddress,
+    recipient: &ShieldedAddress,
     amount: u64,
     asset: u32,
     r: &Word8,
     executor: &dyn ConfidentialExecutor,
 ) -> Word8 {
-    executor.note_commitment(&recipient.pk, &DEPOSIT_FROM, amount, asset, ledger.height() as u32, r)
+    deposit_commitment_at(recipient, amount, asset, ledger.height(), r, executor)
+}
+
+/// [`deposit_commitment`] against a height given outright, for a caller that is recomputing a
+/// deposit after the fact rather than making one ([`deposit_note`]).
+fn deposit_commitment_at(
+    recipient: &ShieldedAddress,
+    amount: u64,
+    asset: u32,
+    height: u64,
+    r: &Word8,
+    executor: &dyn ConfidentialExecutor,
+) -> Word8 {
+    executor.note_commitment(&recipient.pk, &DEPOSIT_FROM, amount, asset, height as u32, r)
+}
+
+/// What an attestation's payload would deposit, from the wire bytes alone: the asset it names
+/// and the amount, with no reference to any state and no signature work.
+///
+/// `None` for a guardian-set rotation, which moves no value, for bytes that do not decode, and
+/// for an amount no note could hold — all of which [`validate`] refuses before a transaction is
+/// admitted, so on a *committed* transaction this only ever answers `Some`.
+pub fn attested_transfer(attestation: &[u8]) -> Option<(AssetId, u64)> {
+    let att = Attestation::decode(attestation).ok()?;
+    let Payload::Transfer(t) = Payload::decode(&att.body.payload).ok()? else {
+        return None;
+    };
+    let amount = u64::try_from(t.amount_u128()?).ok()?;
+    Some((asset_id(t.token_chain, &t.token_address), amount))
+}
+
+/// The deposit note a `BridgeAttest` appended — the commitment and the envelope sealed against
+/// it — recomputed from the transaction and the asset registry.
+///
+/// A deposit's commitment is the one note commitment the wire does not carry
+/// ([`Transaction::commitments`]): the chain computes it so that a submitter cannot choose the
+/// amount or the owner. A node that indexes every note for wallets to scan has to compute it
+/// the same way, and this is that one function.
+///
+/// `bridge` may be the state from either side of the transaction: an asset index is assigned
+/// once and never changes, so the registry *after* the attestation answers exactly as the
+/// registry before it did.
+///
+/// `None` for any other action, and for an attestation that deposits nothing (a rotation) or
+/// that does not decode — the latter being a torn block, not a live possibility, for a
+/// transaction that was committed.
+pub fn deposit_note(
+    tx: &Transaction,
+    bridge: &BridgeState,
+    height: u64,
+    executor: &dyn ConfidentialExecutor,
+) -> Option<(Word8, Envelope)> {
+    let Action::BridgeAttest { attestation, recipient, r, envelope } = &tx.action else {
+        return None;
+    };
+    let (asset, amount) = attested_transfer(attestation)?;
+    let index = bridge.asset_index(&asset)?;
+    Some((deposit_commitment_at(recipient, amount, index, height, r, executor), envelope.clone()))
 }
 
 #[cfg(test)]
@@ -332,6 +391,39 @@ mod tests {
         let with_fee = attest_tx(&l, a, recipient(), 30);
         assert_eq!(l.validate(&with_fee, &StubExecutor), Err(TxError::CommitmentExists(cm)));
         assert_ne!(tx.hash(), with_fee.hash());
+    }
+
+    /// What a node's note index needs: the deposit note recomputed from the committed
+    /// transaction alone, matching the one the ledger appended. The registry *after* the
+    /// attestation is what a node has on disk, and it answers the same as the one before.
+    #[test]
+    fn a_deposit_note_is_recomputable_from_the_committed_transaction() {
+        let (mut l, secrets) = ledger();
+        let tx = deposit(&mut l, &secrets, 1_000, 0, 20);
+        let bridge = l.bridge().unwrap();
+        let (cm, envelope) = deposit_note(&tx, bridge, 1, &StubExecutor).expect("a transfer deposits a note");
+        assert_eq!(cm, expected_cm(1, 1_000, 1));
+        assert!(l.has_commitment(&cm));
+        assert_eq!(envelope, env(), "paired with the envelope that opens it");
+
+        // A guardian-set rotation deposits nothing, and neither does any other action.
+        let rotation = Body {
+            timestamp: 1,
+            nonce: 0,
+            emitter_chain: CHAIN_RAND,
+            emitter_address: crate::bridge::GOVERNANCE_EMITTER,
+            sequence: 9,
+            consistency_level: 0,
+            payload: Payload::GuardianSetUpgrade(crate::bridge::GuardianSetUpgrade {
+                new_index: 1,
+                keys: vec![guardian_address(&[9; 32])],
+            })
+            .encode(),
+        };
+        let upgrade = attest_tx(&l, attest(&secrets, rotation), recipient(), 30);
+        assert_eq!(deposit_note(&upgrade, bridge, 1, &StubExecutor), None);
+        let plain = Transaction { chain_id: 7, bundle: None, action: Action::None };
+        assert_eq!(deposit_note(&plain, bridge, 1, &StubExecutor), None);
     }
 
     /// The 32-byte `to` field binds the deposit to one shielded address. A submitter who swaps

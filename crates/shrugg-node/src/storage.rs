@@ -3,9 +3,11 @@
 //! Every commit is a single atomic, fsynced `WriteBatch` covering blocks,
 //! certificates, indexes, transaction locations, the notes and nullifiers the
 //! block created, its end-of-block anchor, the proposer's validator entry, the
-//! commitment-tree frontier, and the head.
+//! commitment-tree frontier, the bridge rows the block's transactions produced,
+//! and the head.
 
 use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB};
+use shrugg_core::bridge::{BridgeBurnRecord, BridgeMeta, BridgeState};
 use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::consensus::{CommittedBlock, SafetyState};
 use shrugg_core::genesis::GenesisState;
@@ -31,7 +33,12 @@ const CF_NULLIFIERS: &str = "nullifiers";
 const CF_ANCHORS: &str = "anchors";
 /// Validator address (32 bytes) -> `bincode(ValidatorEntry)`.
 const CF_VALIDATORS: &str = "validators";
-const ALL_CFS: [&str; 11] = [
+/// Consumed attestation digest (32 bytes) -> empty. A key set: the bridge's `spent`.
+const CF_BRIDGE_SPENT: &str = "bridge_spent";
+/// Burn sequence (big-endian u64) -> `bincode(BridgeBurnRecord)`: the outbound messages
+/// guardians read back, oldest first.
+const CF_BRIDGE_BURNS: &str = "bridge_burns";
+const ALL_CFS: [&str; 13] = [
     CF_BLOCKS,
     CF_QCS,
     CF_BLOCK_INDEX,
@@ -43,7 +50,12 @@ const ALL_CFS: [&str; 11] = [
     CF_NULLIFIERS,
     CF_ANCHORS,
     CF_VALIDATORS,
+    CF_BRIDGE_SPENT,
+    CF_BRIDGE_BURNS,
 ];
+/// The bridge families, which (unlike notes and anchors) have no per-height key and so are
+/// rewritten wholesale wherever the state is installed rather than appended to.
+const BRIDGE_CFS: [&str; 2] = [CF_BRIDGE_SPENT, CF_BRIDGE_BURNS];
 
 const META_HEAD_HEIGHT: &str = "head_height";
 const META_GENESIS_HASH: &str = "genesis_hash";
@@ -55,6 +67,11 @@ const META_TREE: &str = "tree";
 /// The genesis `hc_bundle` (32 bytes): the bundle guest commitment every bundle proof on this
 /// chain is verified against.
 const META_HC_BUNDLE: &str = "hc_bundle";
+/// `bincode(BridgeMeta)`: the whole-state half of the bridge — emitter, source emitters,
+/// guardian sets, the asset registry with its indices and `next_index`, and the burn sequence.
+/// Its presence is what makes a chain "bridged" on disk; the two collections it leaves out live
+/// in [`CF_BRIDGE_SPENT`] and [`CF_BRIDGE_BURNS`].
+const META_BRIDGE_STATE: &str = "bridge_state";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -113,19 +130,54 @@ fn sync_opts() -> WriteOptions {
 }
 
 /// Every note a transaction creates, paired with the envelope that opens it: the bundle's two
-/// output slots in that order, then a mint's single note — exactly `Transaction::commitments`'
-/// order, so the index a leaf gets on disk is the index the ledger gave it.
-fn created_notes(tx: &shrugg_core::Transaction) -> Vec<(Word8, Envelope)> {
+/// output slots in that order, then a mint's single note, a bridge deposit, or a
+/// `BridgeBurn`'s asset bundle — exactly the order the ledger appends them in, so the index a
+/// leaf gets on disk is the index the ledger gave it.
+///
+/// A `BridgeAttest`'s deposit is the one commitment the wire does not carry: the chain computes
+/// it from the amount the guardians signed, so this recomputes it the same way, through the
+/// ledger's own function. `bridge` is the registry that names the note's asset — absent only on
+/// a chain without a bridge, where a `BridgeAttest` is inadmissible.
+fn created_notes(
+    tx: &shrugg_core::Transaction,
+    height: u64,
+    bridge: Option<&BridgeState>,
+    executor: &dyn ConfidentialExecutor,
+) -> Result<Vec<(Word8, Envelope)>> {
     let mut out = Vec::new();
     if let Some(b) = &tx.bundle {
         for i in 0..2 {
             out.push((b.commitments[i], b.envelopes[i].clone()));
         }
     }
-    if let Action::Mint { cm, envelope, .. } = &tx.action {
-        out.push((*cm, envelope.clone()));
+    match &tx.action {
+        Action::Mint { cm, envelope, .. } => out.push((*cm, envelope.clone())),
+        Action::BridgeAttest { attestation, .. } => {
+            let bridge = bridge.ok_or_else(|| {
+                StorageError::Corrupt("committed block has a bridge attestation but no bridge state".into())
+            })?;
+            // A guardian-set rotation is the one attestation that deposits nothing. Everything
+            // else was admitted, so it decodes and its asset is registered; failing to find the
+            // note here is a torn block, and leaving the leaf out would put the notes family one
+            // short of the tree the ledger committed to.
+            if shrugg_core::ledger::bridge_notes::attested_transfer(attestation).is_some() {
+                let note = shrugg_core::ledger::bridge_notes::deposit_note(tx, bridge, height, executor)
+                    .ok_or_else(|| {
+                        StorageError::Corrupt(
+                            "committed attestation deposits an asset the registry does not hold".into(),
+                        )
+                    })?;
+                out.push(note);
+            }
+        }
+        Action::BridgeBurn { asset_bundle, .. } => {
+            for i in 0..2 {
+                out.push((asset_bundle.commitments[i], asset_bundle.envelopes[i].clone()));
+            }
+        }
+        _ => {}
     }
-    out
+    Ok(out)
 }
 
 impl Storage {
@@ -198,8 +250,79 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(0));
         batch.put_cf(self.cf(CF_META), META_GENESIS_HASH, genesis_hash.as_bytes());
         batch.put_cf(self.cf(CF_META), META_CHAIN_ID, gs.chain_id.to_be_bytes());
+        // A genesis `bridge` section is state like any other: persisted here rather than
+        // re-derived from the genesis file at every startup, so that what a restarted node
+        // reloads is the bridge as the chain left it.
+        if let Some(bridge) = gs.ledger.bridge() {
+            self.put_bridge(&mut batch, bridge)?;
+        }
         self.db.write_opt(batch, &sync_opts())?;
         Ok(())
+    }
+
+    // ---- the bridge ------------------------------------------------------
+
+    /// Write a whole bridge state — the `meta` blob and every row of the two families — into
+    /// `batch`. Used where the state is installed wholesale (genesis, truncation); `commit`
+    /// writes only what a block touched.
+    fn put_bridge(&self, batch: &mut WriteBatch, bridge: &BridgeState) -> Result<()> {
+        batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE, bincode::serialize(&bridge.meta())?);
+        for digest in &bridge.spent {
+            batch.put_cf(self.cf(CF_BRIDGE_SPENT), digest.as_bytes(), []);
+        }
+        for (sequence, rec) in &bridge.burns {
+            batch.put_cf(self.cf(CF_BRIDGE_BURNS), height_key(*sequence), bincode::serialize(rec)?);
+        }
+        Ok(())
+    }
+
+    /// Delete every bridge row and the `meta` blob into `batch`.
+    fn clear_bridge(&self, batch: &mut WriteBatch) -> Result<()> {
+        for name in BRIDGE_CFS {
+            for item in self.db.iterator_cf(self.cf(name), IteratorMode::Start) {
+                let (k, _) = item?;
+                batch.delete_cf(self.cf(name), k);
+            }
+        }
+        batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE);
+        Ok(())
+    }
+
+    /// The bridge's whole-state half — emitters, guardian sets, the asset registry with its
+    /// indices — or `None` on a chain without a bridge.
+    pub fn bridge_meta(&self) -> Result<Option<BridgeMeta>> {
+        match self.get_meta_raw(META_BRIDGE_STATE)? {
+            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The outbound burn message with this sequence, for guardians to sign.
+    pub fn bridge_burn(&self, sequence: u64) -> Result<Option<BridgeBurnRecord>> {
+        self.get(CF_BRIDGE_BURNS, &height_key(sequence))
+    }
+
+    /// Rebuild the bridge from the `meta` blob plus the two families. `None` when the blob is
+    /// absent, which is how a chain without a bridge — and, once `init_genesis` has run, only
+    /// such a chain — looks on disk.
+    fn load_bridge(&self) -> Result<Option<BridgeState>> {
+        let Some(meta) = self.bridge_meta()? else { return Ok(None) };
+        let mut spent = BTreeSet::new();
+        for item in self.db.iterator_cf(self.cf(CF_BRIDGE_SPENT), IteratorMode::Start) {
+            let (k, _) = item?;
+            let arr: [u8; 32] = k
+                .as_ref()
+                .try_into()
+                .map_err(|_| StorageError::Corrupt("bridge_spent key has wrong length".into()))?;
+            spent.insert(Hash(arr));
+        }
+        let mut burns = BTreeMap::new();
+        for item in self.db.iterator_cf(self.cf(CF_BRIDGE_BURNS), IteratorMode::Start) {
+            let (_, v) = item?;
+            let rec: BridgeBurnRecord = bincode::deserialize(&v)?;
+            burns.insert(rec.sequence, rec);
+        }
+        Ok(Some(BridgeState::from_parts(meta, spent, burns)))
     }
 
     // ---- the shielded pool ----------------------------------------------
@@ -492,11 +615,22 @@ impl Storage {
             let rec: ProgramRecord = bincode::deserialize(&v)?;
             programs.insert(rec.id, rec);
         }
-        Ok(Ledger::from_parts(chain_id, hc_bundle, tree, commitments, nullifiers, anchors, validators, programs))
+        let mut ledger =
+            Ledger::from_parts(chain_id, hc_bundle, tree, commitments, nullifiers, anchors, validators, programs);
+        ledger.set_bridge(self.load_bridge()?);
+        Ok(ledger)
     }
 
     /// Atomically append committed blocks and the state they produced.
-    pub fn commit(&self, blocks: &[CommittedBlock], ledger_after: &Ledger) -> Result<()> {
+    ///
+    /// `executor` is here for one reason: a bridge deposit's note commitment is computed by the
+    /// chain rather than carried on the wire, so indexing it means hashing it (`created_notes`).
+    pub fn commit(
+        &self,
+        blocks: &[CommittedBlock],
+        ledger_after: &Ledger,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
@@ -506,6 +640,12 @@ impl Storage {
         let mut expected_parent = head.hash;
         let mut next_index = self.notes_count()?;
         let mut proposers: BTreeSet<Address> = BTreeSet::new();
+        // The bridge rows these blocks add. Digests are read off the transactions rather than
+        // diffed against the previous state, so a commit stays O(block); the burn log is a
+        // suffix of the ledger's, taken from the sequence the last commit left behind.
+        let mut has_bridge_tx = false;
+        let mut spent_digests: BTreeSet<Hash> = BTreeSet::new();
+        let first_burn_sequence = self.bridge_meta()?.map(|m| m.burn_sequence).unwrap_or(0);
         let mut batch = WriteBatch::default();
 
         for cb in blocks {
@@ -544,10 +684,22 @@ impl Storage {
                 for nf in tx.nullifiers() {
                     batch.put_cf(self.cf(CF_NULLIFIERS), word8_to_bytes(&nf), hk);
                 }
-                for (cm, envelope) in created_notes(tx) {
+                for (cm, envelope) in created_notes(tx, block.height(), ledger_after.bridge(), executor)? {
                     let row = NoteRow { cm, envelope, height: block.height() };
                     batch.put_cf(self.cf(CF_NOTES), height_key(next_index), bincode::serialize(&row)?);
                     next_index += 1;
+                }
+                if matches!(tx.action, Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) {
+                    has_bridge_tx = true;
+                    // An admitted attestation names exactly one digest; none at all means the
+                    // bytes no longer decode, which for a committed block is a torn block.
+                    if matches!(tx.action, Action::BridgeAttest { .. }) && tx.bridge_digests().is_empty() {
+                        return Err(StorageError::Corrupt(format!(
+                            "committed attestation in block {} does not decode",
+                            block.height()
+                        )));
+                    }
+                    spent_digests.extend(tx.bridge_digests());
                 }
             }
             for r in &cb.receipts {
@@ -593,6 +745,21 @@ impl Storage {
             if rec.deployed_at >= first_height {
                 batch.put_cf(self.cf(CF_PROGRAMS), rec.id.as_bytes(), bincode::serialize(rec)?);
             }
+        }
+        // The bridge's own rows, in the same batch as the blocks that produced them: a node
+        // that reloaded a consumed-digest set older than its head would re-admit an attestation
+        // the chain has already paid out.
+        if has_bridge_tx {
+            let bridge = ledger_after.bridge().ok_or_else(|| {
+                StorageError::Corrupt("committed block has a bridge transaction but the ledger has no bridge".into())
+            })?;
+            for digest in &spent_digests {
+                batch.put_cf(self.cf(CF_BRIDGE_SPENT), digest.as_bytes(), []);
+            }
+            for (sequence, rec) in bridge.burns.range(first_burn_sequence..) {
+                batch.put_cf(self.cf(CF_BRIDGE_BURNS), height_key(*sequence), bincode::serialize(rec)?);
+            }
+            batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE, bincode::serialize(&bridge.meta())?);
         }
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger_after.tree())?);
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
@@ -840,6 +1007,13 @@ impl Storage {
         for rec in ledger.programs().values() {
             batch.put_cf(self.cf(CF_PROGRAMS), rec.id.as_bytes(), bincode::serialize(rec)?);
         }
+        // The bridge families have no per-height key — a consumed digest does not say which
+        // block consumed it — so they are rebuilt wholesale from the replayed ledger rather
+        // than pruned.
+        self.clear_bridge(&mut batch)?;
+        if let Some(bridge) = ledger.bridge() {
+            self.put_bridge(&mut batch, bridge)?;
+        }
         for item in self.db.iterator_cf(self.cf(CF_RECEIPTS), IteratorMode::Start) {
             let (k, v) = item?;
             let keep = bincode::deserialize::<CallReceipt>(&v).map(|r| r.height <= height).unwrap_or(false);
@@ -885,7 +1059,7 @@ pub(crate) mod fixtures {
     use shrugg_core::confidential::StubExecutor;
     use shrugg_core::bridge::{guardian_address, BridgeConfig};
     use shrugg_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
-    use shrugg_core::notes::{word8_to_hex, Bundle};
+    use shrugg_core::notes::{word8_to_hex, Bundle, ShieldedAddress};
     use shrugg_core::{gas, BlockHeader, Keypair, Transaction};
 
     /// The bundle guest commitment the fixture chains pin. Arbitrary: `StubExecutor` checks a
@@ -963,6 +1137,80 @@ pub(crate) mod fixtures {
         .build(&StubExecutor)
         .unwrap();
         (gs, secrets)
+    }
+
+    /// The canonical test token, native to chain 2. The first asset any attestation below
+    /// names, so the registry gives it note index 1.
+    pub(crate) const TOKEN: [u8; 32] = [0xaa; 32];
+
+    /// A well-formed EVM burn destination: twelve zero bytes then twenty address bytes.
+    pub(crate) const EVM_TO: [u8; 32] = {
+        let mut t = [0u8; 32];
+        let mut i = 12;
+        while i < 32 {
+            t[i] = 0x22;
+            i += 1;
+        }
+        t
+    };
+
+    /// The shielded address every fixture deposit is addressed to.
+    pub(crate) fn recipient() -> ShieldedAddress {
+        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
+    }
+
+    /// An attestation of `amount` units of [`TOKEN`] to `to`, emitted by chain 2's registered
+    /// emitter and signed by five of the six guardians in [`bridge_config`]. `sequence`
+    /// distinguishes otherwise identical bodies, and so their digests.
+    pub(crate) fn attestation(secrets: &[[u8; 32]], to: &ShieldedAddress, amount: u128, sequence: u64) -> Vec<u8> {
+        use shrugg_core::bridge::{digest, sign_digest, Attestation, Body, Payload, Transfer, CHAIN_RAND};
+        let body = Body {
+            timestamp: 1,
+            nonce: 0,
+            emitter_chain: 2,
+            emitter_address: [2; 32],
+            sequence,
+            consistency_level: 0,
+            payload: Payload::Transfer(Transfer {
+                amount: Transfer::u256_from_u128(amount),
+                token_address: TOKEN,
+                token_chain: 2,
+                to: to.recipient_hash(),
+                to_chain: CHAIN_RAND,
+                fee: Transfer::u256_from_u128(0),
+            })
+            .encode(),
+        };
+        let d = digest(&body.encode());
+        let signatures = (0..5u8).map(|i| sign_digest(&secrets[i as usize], i, &d)).collect();
+        Attestation { guardian_set_index: 0, signatures, body }.encode()
+    }
+
+    /// The transaction a relayer submits for `attestation`. Its fee bundle's four words are
+    /// `seed..seed + 3`, so two fixtures with different seeds never collide.
+    pub(crate) fn attest_tx(ledger: &Ledger, attestation: Vec<u8>, seed: u32) -> Transaction {
+        Transaction::shielded(
+            ledger.chain_id(),
+            bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
+            Action::BridgeAttest { attestation, recipient: recipient(), r: [7; 8], envelope: env(seed as u8) },
+        )
+    }
+
+    /// A burn of `amount` of asset index `asset` to chain 2, paying the bundle base for each of
+    /// its two bundles. The asset bundle's words are `seed..seed + 3` and the fee bundle's
+    /// `seed + 4..seed + 7`.
+    pub(crate) fn burn_tx(ledger: &Ledger, asset: u32, amount: u64, relayer_fee: u64, seed: u32) -> Transaction {
+        let mut asset_bundle =
+            bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], 0);
+        asset_bundle.asset = asset;
+        asset_bundle.burn = amount + relayer_fee;
+        let d = StubExecutor.bundle_digest(&asset_bundle.digest_input());
+        asset_bundle.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        Transaction::shielded(
+            ledger.chain_id(),
+            bundle(ledger, [[seed + 4; 8], [seed + 5; 8]], [[seed + 6; 8], [seed + 7; 8]], 2 * gas::BUNDLE_BASE),
+            Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain: 2, to: EVM_TO },
+        )
     }
 
     /// An unopened database plus a genesis holding two deposit notes.
@@ -1085,34 +1333,108 @@ mod tests {
         drop(dir);
     }
 
-    /// S3: a bridged chain's state root has a fifth component, and `Ledger::from_parts` — all
-    /// `load_ledger` can rebuild — leaves the bridge `None`. The node re-applies it from genesis
-    /// immediately after loading (`node.rs`), exactly as it re-applies the faucet and
-    /// confidential switches, because without that a restarted node would compute a different
-    /// state root than the blocks it produced before the restart.
+    /// S3: the bridge column families, end to end. A bridged chain's state root has a fifth
+    /// component, so a node that reloaded without the bridge would compute a different root
+    /// than the blocks it produced before the restart — and one that reloaded only the
+    /// *genesis* bridge would forget every asset registered, digest consumed and message
+    /// emitted since.
     ///
-    /// Until task 3 adds the bridge column families, what comes back is the *genesis* bridge, so
-    /// this chain has applied no attestations. Task 3 replaces the re-apply below with the
-    /// persisted registry, spent set and burn log.
+    /// The chain here applies an attestation and a burn, so the registry, the consumed-digest
+    /// set and the outbound log are all non-genesis by the time it is reloaded.
     #[test]
     fn a_bridged_genesis_reloads_to_the_same_state_root() {
         let dir = tempfile::tempdir().unwrap();
         let s = Storage::open(dir.path()).unwrap();
-        let (gs, _) = bridged_genesis(9);
+        let (gs, secrets) = bridged_genesis(9);
         s.init_genesis(&gs).unwrap();
         assert!(gs.ledger.bridge().is_some());
+        // The genesis bridge is on disk before any block: the `bridge` section is persisted,
+        // not merely derived from the genesis file at every startup.
+        assert_eq!(s.bridge_meta().unwrap().as_ref(), Some(&gs.ledger.bridge().unwrap().meta()));
 
-        let bare = s.load_ledger(&StubExecutor).unwrap();
-        assert!(bare.bridge().is_none(), "storage does not carry the bridge yet (task 3)");
-        assert_ne!(bare.state_root(), gs.ledger.state_root(), "which is exactly the divergence");
+        let mut ledger = gs.ledger.clone();
+        let att = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000, 0), 20);
+        let b1 = make_block(&gs.block, &mut ledger, vec![att.clone()], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &StubExecutor).unwrap();
+        let burn = burn_tx(&ledger, 1, 400, 100, 30);
+        let b2 = make_block(&b1.block, &mut ledger, vec![burn], &key(1));
+        s.commit(std::slice::from_ref(&b2), &ledger, &StubExecutor).unwrap();
 
-        // The three lines `node.rs` runs after `load_ledger`.
-        let mut reloaded = bare;
+        let live = ledger.bridge().unwrap();
+        assert_eq!(live.asset_index(&shrugg_core::bridge::asset_id(2, &TOKEN)), Some(1));
+        assert_eq!(live.spent.len(), 1);
+        assert_eq!(live.burns.len(), 1);
+
+        // The two lines `node.rs` still runs after `load_ledger` are the genesis switches; the
+        // bridge now comes from storage.
+        let mut reloaded = s.load_ledger(&StubExecutor).unwrap();
         reloaded.set_faucet(gs.faucet);
         reloaded.set_confidential(gs.confidential);
-        reloaded.set_bridge(gs.ledger.bridge().cloned());
-        assert_eq!(reloaded.state_root(), gs.ledger.state_root());
-        assert_eq!(reloaded, gs.ledger);
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        let back = reloaded.bridge().expect("the bridge reloaded");
+        assert_eq!(back.spent, live.spent, "the consumed digests survive the restart");
+        assert_eq!(back.burns, live.burns, "and so does the outbound log");
+        assert_eq!(back.next_index, 2, "and the index the next new asset will get");
+
+        // The deposit note is leaf 2 — after the fee bundle's two — and is served like any
+        // other, so a wallet scanning the tree finds its bridged deposit.
+        let deposit = shrugg_core::ledger::bridge_notes::deposit_note(&att, back, 1, &StubExecutor).unwrap();
+        let row = s.note(2).unwrap().expect("the deposit note is indexed");
+        assert_eq!((row.cm, row.envelope), deposit);
+        assert_eq!(row.height, 1);
+
+        // Guardians read the outbound message by sequence.
+        let rec = s.bridge_burn(0).unwrap().expect("the burn record");
+        assert_eq!(rec.digest, shrugg_core::bridge::digest(&rec.body));
+        assert_eq!(rec.height, 2);
+        assert_eq!(s.bridge_burn(1).unwrap(), None);
+
+        // Truncating back to genesis puts the bridge back to the genesis state exactly: no
+        // registered asset, no consumed digest, no burn.
+        let replayed = gs.ledger.clone();
+        s.truncate_to(&gs, 0, &replayed).unwrap();
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap().bridge(), gs.ledger.bridge());
+        assert_eq!(s.bridge_burn(0).unwrap(), None);
+    }
+
+    /// `--verify-chain` replays every block and compares the result to the stored snapshot,
+    /// which on a bridged chain includes the bridge (`Ledger`'s equality covers it). A replay
+    /// that did not reproduce the registry, the consumed digests or the burn log would truncate
+    /// a chain that is perfectly good.
+    #[test]
+    fn verify_chain_replays_a_bridged_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, secrets) = bridged_genesis(11);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let att = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000, 0), 20);
+        let b1 = make_block(&gs.block, &mut ledger, vec![att], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &StubExecutor).unwrap();
+        let burn = burn_tx(&ledger, 1, 400, 100, 30);
+        let b2 = make_block(&b1.block, &mut ledger, vec![burn], &key(1));
+        s.commit(std::slice::from_ref(&b2), &ledger, &StubExecutor).unwrap();
+
+        // Quick, not Full: `make_block` leaves the certificates unsigned, which is a vote
+        // check, not a state check.
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(check.problem, None);
+        assert_eq!(check.last_good, 2);
+        assert_eq!(check.ledger.bridge(), ledger.bridge(), "the replay rebuilt the bridge");
+    }
+
+    /// A chain whose genesis has no `bridge` section stores no bridge state at all, and
+    /// reloads without one — which is what keeps its state root the four components phase S1
+    /// hashed.
+    #[test]
+    fn a_chain_without_a_bridge_stores_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis(4);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.bridge_meta().unwrap(), None);
+        assert!(s.load_ledger(&StubExecutor).unwrap().bridge().is_none());
     }
 
     /// A chain that starts with no notes still round trips: the stored frontier is the empty
@@ -1178,7 +1500,7 @@ mod tests {
         ledger.set_height(1);
         let tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
         let b1 = make_block(&gs.block, &mut ledger, vec![tx.clone()], &proposer);
-        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        s.commit(std::slice::from_ref(&b1), &ledger, &StubExecutor).unwrap();
 
         assert_eq!(s.head().unwrap(), Head { height: 1, hash: b1.block.hash() });
         assert_eq!(s.notes_count().unwrap(), 4);
@@ -1210,7 +1532,7 @@ mod tests {
         let mut ledger = gs.ledger.clone();
         let tx = mint_tx(gs.chain_id, [77; 8], 5_000, &minter);
         let b1 = make_block(&gs.block, &mut ledger, vec![tx.clone()], &minter);
-        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        s.commit(std::slice::from_ref(&b1), &ledger, &StubExecutor).unwrap();
         assert_eq!(s.notes_count().unwrap(), 3);
         assert_eq!(s.note(2).unwrap().unwrap(), NoteRow { cm: [77; 8], envelope: env(77), height: 1 });
         // A mint spends nothing and pays no fee.
@@ -1228,7 +1550,7 @@ mod tests {
         ledger.set_height(1);
         let tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
         let b1 = make_block(&gs.block, &mut ledger, vec![tx], &proposer);
-        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        s.commit(std::slice::from_ref(&b1), &ledger, &StubExecutor).unwrap();
 
         for index in 0..4 {
             let (root, path) = s.witness(index, &StubExecutor).unwrap().expect("leaf exists");
@@ -1259,13 +1581,13 @@ mod tests {
         ledger.set_height(1);
         let tx1 = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
         let b1 = certify(make_block(&gs.block, &mut ledger, vec![tx1], &proposer));
-        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        s.commit(std::slice::from_ref(&b1), &ledger, &StubExecutor).unwrap();
         let ledger_at_1 = ledger.clone();
 
         ledger.set_height(2);
         let tx2 = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
         let b2 = certify(make_block(&b1.block, &mut ledger, vec![tx2.clone()], &proposer));
-        s.commit(std::slice::from_ref(&b2), &ledger).unwrap();
+        s.commit(std::slice::from_ref(&b2), &ledger, &StubExecutor).unwrap();
         assert_eq!(s.notes_count().unwrap(), 6);
         assert_eq!(s.nullifier_height(&[5; 8]).unwrap(), Some(2));
 
@@ -1292,12 +1614,12 @@ mod tests {
         let mut ledger = gs.ledger.clone();
         let b1 = make_block(&gs.block, &mut ledger, vec![], &k);
         let b2 = make_block(&b1.block, &mut ledger, vec![], &k);
-        assert!(matches!(s.commit(std::slice::from_ref(&b2), &ledger), Err(StorageError::Corrupt(_))));
+        assert!(matches!(s.commit(std::slice::from_ref(&b2), &ledger, &StubExecutor), Err(StorageError::Corrupt(_))));
         assert_eq!(s.head().unwrap().height, 0);
         let mut bad = b1.clone();
         bad.qc.block_hash = Hash::ZERO;
-        assert!(matches!(s.commit(&[bad], &ledger), Err(StorageError::Corrupt(_))));
-        s.commit(&[b1, b2], &ledger).unwrap();
+        assert!(matches!(s.commit(&[bad], &ledger, &StubExecutor), Err(StorageError::Corrupt(_))));
+        s.commit(&[b1, b2], &ledger, &StubExecutor).unwrap();
         assert_eq!(s.head().unwrap().height, 2);
     }
 
@@ -1326,7 +1648,7 @@ mod tests {
         assert_ne!(root_at_1, root_at_2, "each block moved the tree");
 
         // One commit, both blocks, the ledger after block 2 — exactly what the node does.
-        s.commit(&[b1.clone(), b2.clone()], &ledger).unwrap();
+        s.commit(&[b1.clone(), b2.clone()], &ledger, &StubExecutor).unwrap();
         assert_eq!(s.head().unwrap().height, 2);
 
         // Each height's anchor is that height's own end-of-block root, not the batch's last.
@@ -1398,7 +1720,7 @@ mod tests {
             let block = cb.block.clone();
             let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(block.view(), block.hash(), &k)] };
             let cb = CommittedBlock { qc, ..cb };
-            st.commit(std::slice::from_ref(&cb), &ledger).unwrap();
+            st.commit(std::slice::from_ref(&cb), &ledger, &StubExecutor).unwrap();
             out.push(cb);
             parent = block;
         }
@@ -1441,7 +1763,7 @@ mod tests {
         let mut ledger = again.ledger.clone();
         let cb = &blocks[3]; // height 4 again
         ledger.apply_block(&cb.block, &StubExecutor).unwrap();
-        st.commit(std::slice::from_ref(cb), &ledger).unwrap();
+        st.commit(std::slice::from_ref(cb), &ledger, &StubExecutor).unwrap();
         assert_eq!(st.head().unwrap().height, 4);
         assert!(st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().is_ok());
     }
@@ -1532,7 +1854,7 @@ mod tests {
         // The bundle's digest commits to its own fields only, so swapping the action is fine.
         let cb3 = make_block(&blocks[1].block, &mut ledger, vec![deploy.clone()], &k);
         let pid = shrugg_core::program::program_id(0, &words);
-        st.commit(std::slice::from_ref(&cb3), &ledger).unwrap();
+        st.commit(std::slice::from_ref(&cb3), &ledger, &StubExecutor).unwrap();
         let rec = st.program(&pid).unwrap().expect("program stored");
         assert_eq!(rec.words, words);
         assert_eq!(rec.deployed_at, 3);

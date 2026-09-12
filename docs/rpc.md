@@ -22,9 +22,11 @@ Conventions:
 
 **There is no balance method, and no account method.** This chain has no accounts; see
 `docs/shielded.md`. A wallet computes its own balance by scanning the commitment tree with its
-viewing key, which is what `shrugg_getCommitments` and `shrugg_getNullifiers` exist for. The
-bridge methods went with the account model too, and do not come back until phase S3
-(`docs/bridge.md`).
+viewing key, which is what `shrugg_getCommitments` and `shrugg_getNullifiers` exist for. That
+holds for bridged assets too: a bridged holding is a note whose `asset` word is the registry's
+index for it (phase S3, `docs/bridge.md`), so the bridge methods below report the bridge's own
+*public* state — guardians, emitters, the asset registry, the outbound burn log — and no
+per-address balance. `shrugg_getAssetBalance` is gone for good.
 
 ## Methods
 
@@ -197,8 +199,11 @@ The staking (phase S2) and bridge (phase S3) actions:
 - `{ "kind": "unbond", "validator": "<base58>", "amount": 7, "nonce": 2 }`
 - `{ "kind": "withdraw", "validator": "<base58>", "amount": 9, "nonce": 3 }` — the deposit note's
   blinding and envelope are not rendered.
-- `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>" }` — no
-  amount: it is inside the attestation, which the bridge decoder reads.
+- `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>",
+  "asset_index": 1, "amount": 1000 }` — the amount and the asset are inside the attestation, so
+  they are decoded out of it; `asset_index` is what the registry gave that asset, and is the
+  `asset` word of the deposit note. Both are `null` for a guardian-set rotation (which deposits
+  nothing) and on a chain whose registry does not name the asset.
 - `{ "kind": "bridge_burn", "asset": 2, "amount": 400, "relayer_fee": 100, "to_chain": 5, "to":
   "abab…", "asset_bundle": { …same shape as `bundle`… } }` — `to` is the 32-byte destination
   address, hex. The asset bundle renders exactly like the fee bundle: same public fields, no more.
@@ -247,6 +252,46 @@ build disagrees with the genesis value refuses to start at all.
 ### `shrugg_getPeers`
 Params: `[]`. Result: array of `{ "peer_id": "12D3KooW...", "addrs": ["/ip4/…/tcp/30303"], "connected_secs": 1241 }`.
 
+### `shrugg_getBridgeState`
+Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false }`. Otherwise:
+```json
+{
+  "enabled": true,
+  "emitter": "01…",                      // this chain's outbound emitter address, 32 bytes hex
+  "emitters": { "2": "02…" },            // source chain id -> the emitter address trusted there
+  "guardian_set_index": 0,
+  "guardians": ["aabb…"],                // the current set's 20-byte addresses, hex
+  "burn_sequence": 1,                    // outbound messages emitted so far
+  "next_index": 2,                       // the note index the next newly registered asset gets
+  "assets": [ …the rows of `shrugg_getAssets`… ]
+}
+```
+No balances: bridged value is notes, not accounts.
+
+### `shrugg_getAssets`
+Params: `[]`. Result: the bridge's asset registry, ascending by index (which is registration
+order), or `[]` on a chain without a bridge:
+```json
+[{ "index": 1, "chain": 2, "token": "aaaa…", "asset_id": "…" }]
+```
+`index` is the `asset` word a note of that asset carries — index 0 is SHRUGG and is never in the
+registry. `chain` and `token` are the wire identity guardians sign about; `asset_id` is
+`blake3` of the two, and is what `shrugg_bridgeAssetId` computes.
+
+### `shrugg_bridgeAssetId`
+Params: `[token_chain, token_address]` where `token_chain` is an integer and `token_address` is
+32 bytes of hex. Result: the asset id (64 hex characters). Pure arithmetic on its arguments, so
+it answers on any chain, bridged or not.
+
+### `shrugg_getBridgeBurn`
+Params: `[sequence]` (integer). Result: `null` if this chain has emitted no such message, else
+```json
+{ "sequence": 0, "body_hex": "…", "digest": "…", "tx": "…", "height": 2 }
+```
+`body_hex` is the outbound message as guardians must hash and sign it; `digest` is its hash.
+`tx` is the burn transaction that emitted it — a burn is funded by notes, so the transaction
+hash stands in for the sender identity the message has no room for.
+
 ### `shrugg_getValidators`
 Params: `[]`. Result: array of `{ "address": "…", "stake": "100000", "rewards": 4000000 }` in
 leader-rotation order (sorted by address). The leader of view `v` is entry `v mod n`. `stake` is a
@@ -286,8 +331,19 @@ Envelope { kem_ct: Vec<u8>, to_receiver: Vec<u8>, to_sender: Vec<u8>, body: Vec<
 Action::None                                            // a plain shielded transfer
 Action::Mint { cm: Word8, envelope: Envelope, amount: u64, minter: PublicKey, signature: Signature }
 Action::Deploy { base_pc: u32, words: Vec<u32> }
-Action::Call { program: Hash, proof: Vec<u8> }          // postcard(rand_zkvm::Proof)
+Action::Call { program: Hash, proof: Vec<u8>, input_envelope: Option<CallEnvelope> }
+Action::Bond { validator: Address, amount: u64, registration: Option<Registration> }
+Action::Unbond { validator: Address, amount: u64, nonce: u64, signature: Signature }
+Action::Withdraw { validator: Address, amount: u64, nonce: u64, r: Word8, envelope: Envelope, signature: Signature }
+Action::BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, envelope: Envelope }
+Action::BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee: u64, to_chain: u16, to: [u8; 32] }
 ```
+
+A `BridgeBurn` is the chain's one two-bundle transaction: the outer `bundle` pays the SHRUGG fee
+(the bundle base twice, once per verified bundle) and `asset_bundle` burns `amount + relayer_fee`
+of the bridged asset. A `BridgeAttest`'s deposit note is the one commitment the wire does not
+carry — the chain computes it from the amount the guardians signed, the recipient the action
+names and its blinding `r`, so a submitter cannot choose either.
 
 Encoded sizes (bincode's default configuration: fixed-width integers, 8-byte length prefixes,
 `u32` enum tags):
