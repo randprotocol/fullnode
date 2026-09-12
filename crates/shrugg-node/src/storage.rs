@@ -1252,7 +1252,6 @@ mod tests {
         let k = key(1);
         let mut ledger = gs.ledger.clone();
         let mut parent = gs.block.clone();
-        let mut qc = QuorumCertificate::genesis(gs.hash());
         let mut out = Vec::new();
         for h in 1..=n {
             let seed = (h * 4) as u32;
@@ -1265,8 +1264,8 @@ mod tests {
             )];
             let cb = make_block(&parent, &mut ledger, txs, &k);
             let block = cb.block.clone();
-            qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(block.view(), block.hash(), &k)] };
-            let cb = CommittedBlock { qc: qc.clone(), ..cb };
+            let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(block.view(), block.hash(), &k)] };
+            let cb = CommittedBlock { qc, ..cb };
             st.commit(std::slice::from_ref(&cb), &ledger).unwrap();
             out.push(cb);
             parent = block;
