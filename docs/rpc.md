@@ -210,14 +210,16 @@ Params: `[]`. Result:
   "height": 1998, "head_hash": "…", "view": 2251, "high_qc_view": 2250,
   "syncing": false, "sync_target": 1998,
   "peer_count": 5, "mempool_size": 0,
-  "is_validator": true, "faucet": true, "confidential": true,
+  "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
   "fri_profile": "production", "programs": 2,
   "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19",
   "address": "2nRdFC…", "peer_id": "12D3KooW..."
 }
 ```
 `syncing` is true while a batch request to a peer is in flight; `sync_target` is the highest height
-any peer has advertised. `notes` is every note the chain has ever created, `nullifiers` every note
+any peer has advertised. `is_validator` says this node holds a validator key; `active_validator`
+says that key is in the set running the current epoch (spec §8) — a validator that has bonded in
+but whose epoch has not arrived is the first without the second. `notes` is every note the chain has ever created, `nullifiers` every note
 it has ever spent, and `hc_bundle` the bundle guest this chain's proofs are against — a node whose
 build disagrees with the genesis value refuses to start at all.
 
@@ -225,12 +227,46 @@ build disagrees with the genesis value refuses to start at all.
 Params: `[]`. Result: array of `{ "peer_id": "12D3KooW...", "addrs": ["/ip4/…/tcp/30303"], "connected_secs": 1241 }`.
 
 ### `shrugg_getValidators`
-Params: `[]`. Result: array of `{ "address": "…", "stake": "100000", "rewards": 4000000 }` in
-leader-rotation order (sorted by address). The leader of view `v` is entry `v mod n`. `stake` is a
-`u128` and goes out as a **decimal string** (a JSON number cannot carry one exactly); `rewards` is a
-`u64` and stays a number. `rewards` is the bundle fees credited to that validator as proposer; it
-is chain state, and the only amount this chain stores in the clear. Paying it out is phase S2's
-`Withdraw`.
+Params: `[]`. Result: array of
+
+```json
+{ "address": "…", "stake": "1000000000000", "pending": [{ "release_epoch": 41, "amount": "5000000000" }],
+  "rewards": "4000000", "payout": "shrugg1…", "nonce": 3, "active": true }
+```
+
+one row per entry of the **register** (spec §8), in address order. Since phase S2 that is every
+validator that has ever bonded, not the genesis set: `active` is the ones in the set running the
+current epoch, and those are what the leader rotation runs over. Amounts are **decimal strings**,
+because a JSON number is not an exact integer past 2^53 and a stake is 10^9 units per SHRUGG.
+`pending` is the unbonding queue, oldest first; `rewards` is the bundle fees credited to that
+validator as proposer; `payout` is where a `Withdraw` pays; `nonce` is what its next signed
+`Unbond` or `Withdraw` must carry. The register is the only place this chain stores amounts in the
+clear.
+
+### `shrugg_getEpoch`
+Params: `[]`. Result: `{ "epoch": 41, "epoch_blocks": 1000, "next_set": ["…", "…"] }`. `epoch` is
+`height / epoch_blocks`. `next_set` is what the register would derive for the next epoch if this
+one ended now — a projection, not a commitment: every bond and unbond before the boundary moves it.
+
+### `shrugg_getSupply`
+Params: `[]`. Result:
+
+```json
+{ "height": 1998,
+  "genesis_deposited": "…", "genesis_staked": "…", "faucet_minted": "…",
+  "withdraw_deposited": "…", "fees_paid": "…", "burned": "…",
+  "pool_value": "…", "register_total": "…", "total_supply": "…", "invariant_holds": true }
+```
+
+The supply audit. Note values are hidden, but every crossing of the pool's boundary is public, so
+these are exact: value enters the pool as a genesis deposit, a faucet mint or a validator's
+withdraw, and leaves it as a bundle fee (into a proposer's `rewards`) or a burn (a `Bond`, into
+`stake`). `pool_value = genesis_deposited + faucet_minted + withdraw_deposited − fees_paid −
+burned`; `register_total` is Σ `stake + pending + rewards` over the register; `total_supply` is the
+two together, and `invariant_holds` is whether it still equals everything the chain issued
+(`genesis_deposited + genesis_staked + faucet_minted`). A false there is a bug, never a legitimate
+chain state. The counters are not in the state root — `shrugg-node verify --mode quick` recomputes
+every one of them by replaying the chain, which is what makes them auditable.
 
 ## Errors
 

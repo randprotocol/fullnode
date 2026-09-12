@@ -7,11 +7,13 @@
 
 use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 use shrugg_core::confidential::ConfidentialExecutor;
-use shrugg_core::consensus::{CommittedBlock, SafetyState};
+use shrugg_core::consensus::{CommittedBlock, EpochSets, SafetyState};
 use shrugg_core::genesis::GenesisState;
-use shrugg_core::ledger::ValidatorEntry;
+use shrugg_core::ledger::{Supply, ValidatorEntry};
 use shrugg_core::notes::{word8_from_bytes, word8_to_bytes, CommitmentTree, Envelope, FullTree, Word8, DEPTH};
-use shrugg_core::{Action, Address, Block, CallReceipt, Hash, Ledger, ProgramId, ProgramRecord, QuorumCertificate};
+use shrugg_core::{
+    Action, Address, Block, CallReceipt, Hash, Ledger, ProgramId, ProgramRecord, QuorumCertificate, ValidatorSet,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -31,7 +33,15 @@ const CF_NULLIFIERS: &str = "nullifiers";
 const CF_ANCHORS: &str = "anchors";
 /// Validator address (32 bytes) -> `bincode(ValidatorEntry)`.
 const CF_VALIDATORS: &str = "validators";
-const ALL_CFS: [&str; 11] = [
+/// Epoch (big-endian u64) -> `bincode(ValidatorSet)`: the set that epoch's blocks are proposed,
+/// voted and certified by (spec §8). Epoch 0 is written by `init_genesis`; every later epoch is
+/// written when its first block commits, in the same batch as that block.
+///
+/// Without this family a node that restarts past an epoch boundary cannot verify the QCs of the
+/// epoch it is in: the register the set was derived from has moved on, and the blocks it would
+/// re-derive from are no longer in the speculative tree.
+const CF_EPOCH_SETS: &str = "epoch_sets";
+const ALL_CFS: [&str; 12] = [
     CF_BLOCKS,
     CF_QCS,
     CF_BLOCK_INDEX,
@@ -43,6 +53,7 @@ const ALL_CFS: [&str; 11] = [
     CF_NULLIFIERS,
     CF_ANCHORS,
     CF_VALIDATORS,
+    CF_EPOCH_SETS,
 ];
 
 const META_HEAD_HEIGHT: &str = "head_height";
@@ -55,6 +66,11 @@ const META_TREE: &str = "tree";
 /// The genesis `hc_bundle` (32 bytes): the bundle guest commitment every bundle proof on this
 /// chain is verified against.
 const META_HC_BUNDLE: &str = "hc_bundle";
+/// `bincode(Supply)`: the public supply counters as of the head (`ledger::supply`). Derived
+/// state, not covered by any state root, which is why it lives in `meta` beside the frontier
+/// rather than in a family of its own — and why `verify_chain` recomputes it from a full replay
+/// instead of trusting it.
+const META_SUPPLY: &str = "supply";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -192,6 +208,10 @@ impl Storage {
         for (addr, entry) in gs.ledger.validators() {
             batch.put_cf(self.cf(CF_VALIDATORS), addr.as_bytes(), bincode::serialize(entry)?);
         }
+        // Epoch 0 runs with the genesis set, by definition (spec §8); every later epoch's set is
+        // derived and written when its first block commits.
+        batch.put_cf(self.cf(CF_EPOCH_SETS), height_key(0), bincode::serialize(&gs.validators)?);
+        batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&gs.ledger.supply())?);
         batch.put_cf(self.cf(CF_ANCHORS), height_key(0), word8_to_bytes(&gs.ledger.root()));
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(gs.ledger.tree())?);
         batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
@@ -299,6 +319,44 @@ impl Storage {
         self.get(CF_VALIDATORS, a.as_bytes())
     }
 
+    /// The whole register, in address order. Small by construction (`MAX_VALIDATORS` rows plus
+    /// whatever has fallen below the minimum), so RPC reads it directly rather than through a
+    /// ledger reload.
+    pub fn register(&self) -> Result<BTreeMap<Address, ValidatorEntry>> {
+        let mut out = BTreeMap::new();
+        for item in self.db.iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::Start) {
+            let (k, v) = item?;
+            let arr: [u8; 32] = k
+                .as_ref()
+                .try_into()
+                .map_err(|_| StorageError::Corrupt("validator key has wrong length".into()))?;
+            out.insert(Address(arr), bincode::deserialize::<ValidatorEntry>(&v)?);
+        }
+        Ok(out)
+    }
+
+    /// The validator set of `epoch`, as it was recorded when that epoch's first block committed.
+    pub fn epoch_set(&self, epoch: u64) -> Result<Option<ValidatorSet>> {
+        self.get(CF_EPOCH_SETS, &height_key(epoch))
+    }
+
+    /// Every recorded epoch set, for a resuming replica (`HotStuff::resume`).
+    pub fn load_epoch_sets(&self) -> Result<EpochSets> {
+        let mut sets = EpochSets::default();
+        for item in self.db.iterator_cf(self.cf(CF_EPOCH_SETS), IteratorMode::Start) {
+            let (k, v) = item?;
+            sets.insert(be_u64(k.as_ref(), "epoch set key")?, bincode::deserialize(&v)?);
+        }
+        Ok(sets)
+    }
+
+    /// The supply counters as of the head. A database written before this family existed has
+    /// none; zeros are what `verify_chain` then reports a mismatch against, and a repair
+    /// rewrites them from the replay.
+    pub fn supply(&self) -> Result<Supply> {
+        Ok(self.get_meta_raw(META_SUPPLY)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
     /// Every leaf in tree order. The witness source, and the check `load_ledger` runs the
     /// stored frontier against.
     fn leaves(&self) -> Result<Vec<Word8>> {
@@ -395,7 +453,9 @@ impl Storage {
                 }
             }
         }
-        Ok(Some(CommittedBlock { block, qc, receipts }))
+        // `deposits` stays empty: this is how a block is served to a peer, and the peer
+        // recomputes them by applying the block itself.
+        Ok(Some(CommittedBlock { block, qc, receipts, deposits: Vec::new() }))
     }
 
     pub fn height_by_hash(&self, h: &Hash) -> Result<Option<u64>> {
@@ -477,27 +537,42 @@ impl Storage {
             anchors.push((be_u64(k.as_ref(), "anchor key")?, word8(&v, "anchor")?));
         }
         anchors.reverse();
-        let mut validators = BTreeMap::new();
-        for item in self.db.iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::Start) {
-            let (k, v) = item?;
-            let arr: [u8; 32] = k
-                .as_ref()
-                .try_into()
-                .map_err(|_| StorageError::Corrupt("validator key has wrong length".into()))?;
-            validators.insert(Address(arr), bincode::deserialize::<ValidatorEntry>(&v)?);
-        }
+        let validators = self.register()?;
         let mut programs = BTreeMap::new();
         for item in self.db.iterator_cf(self.cf(CF_PROGRAMS), IteratorMode::Start) {
             let (_, v) = item?;
             let rec: ProgramRecord = bincode::deserialize(&v)?;
             programs.insert(rec.id, rec);
         }
-        Ok(Ledger::from_parts(chain_id, hc_bundle, tree, commitments, nullifiers, anchors, validators, programs))
+        let mut ledger =
+            Ledger::from_parts(chain_id, hc_bundle, tree, commitments, nullifiers, anchors, validators, programs);
+        ledger.set_supply(self.supply()?);
+        Ok(ledger)
     }
 
-    /// Atomically append committed blocks and the state they produced.
-    pub fn commit(&self, blocks: &[CommittedBlock], ledger_after: &Ledger) -> Result<()> {
+    /// Atomically append committed blocks, the state they produced, and the epoch sets the
+    /// replica recorded while committing them.
+    ///
+    /// `epoch_sets` is `Action::RecordEpochSet` distilled: `(epoch, set)` for every epoch whose
+    /// first block is in `blocks`. They go into the same batch as the blocks on purpose — a set
+    /// written after the block it belongs to would be lost by a crash in between, and the epoch's
+    /// QCs would become unverifiable on the next replay.
+    pub fn commit(
+        &self,
+        blocks: &[CommittedBlock],
+        ledger_after: &Ledger,
+        epoch_sets: &[(u64, ValidatorSet)],
+    ) -> Result<()> {
         if blocks.is_empty() {
+            // A record without a block should not happen (the replica emits them together), but
+            // dropping one silently would cost an epoch's verifiability.
+            if !epoch_sets.is_empty() {
+                let mut batch = WriteBatch::default();
+                for (epoch, set) in epoch_sets {
+                    batch.put_cf(self.cf(CF_EPOCH_SETS), height_key(*epoch), bincode::serialize(set)?);
+                }
+                self.db.write_opt(batch, &sync_opts())?;
+            }
             return Ok(());
         }
         let head = self.head()?;
@@ -505,7 +580,9 @@ impl Storage {
         let mut expected_height = first_height;
         let mut expected_parent = head.hash;
         let mut next_index = self.notes_count()?;
-        let mut proposers: BTreeSet<Address> = BTreeSet::new();
+        // Register rows this commit must rewrite: the proposers and every validator an action
+        // named.
+        let mut touched: BTreeSet<Address> = BTreeSet::new();
         let mut batch = WriteBatch::default();
 
         for cb in blocks {
@@ -535,6 +612,11 @@ impl Storage {
             batch.put_cf(self.cf(CF_BLOCKS), hk, block.encode());
             batch.put_cf(self.cf(CF_QCS), hk, bincode::serialize(&cb.qc)?);
             batch.put_cf(self.cf(CF_BLOCK_INDEX), hash.as_bytes(), hk);
+            // The notes the ledger created itself, in append order (see `CommittedBlock`). They
+            // are interleaved with the transactions' own: a `Withdraw`'s deposit lands right
+            // after the two notes of the bundle that carried it, and each one knows the index it
+            // was given, which is what this loop checks as it goes.
+            let mut deposits = cb.deposits.iter().peekable();
             for (index, tx) in block.transactions.iter().enumerate() {
                 batch.put_cf(
                     self.cf(CF_TXS),
@@ -549,6 +631,19 @@ impl Storage {
                     batch.put_cf(self.cf(CF_NOTES), height_key(next_index), bincode::serialize(&row)?);
                     next_index += 1;
                 }
+                while deposits.peek().is_some_and(|d| d.index == next_index) {
+                    let d = deposits.next().expect("peeked");
+                    let row = NoteRow { cm: d.cm, envelope: d.envelope.clone(), height: block.height() };
+                    batch.put_cf(self.cf(CF_NOTES), height_key(next_index), bincode::serialize(&row)?);
+                    next_index += 1;
+                }
+            }
+            if let Some(d) = deposits.next() {
+                return Err(StorageError::Corrupt(format!(
+                    "block {} reports a deposit at leaf {} that no transaction of it accounts for",
+                    block.height(),
+                    d.index
+                )));
             }
             for r in &cb.receipts {
                 if r.height != block.height() {
@@ -560,7 +655,17 @@ impl Storage {
                 }
                 batch.put_cf(self.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(r)?);
             }
-            proposers.insert(block.proposer());
+            touched.insert(block.proposer());
+            for tx in &block.transactions {
+                match &tx.action {
+                    Action::Bond { validator, .. }
+                    | Action::Unbond { validator, .. }
+                    | Action::Withdraw { validator, .. } => {
+                        touched.insert(*validator);
+                    }
+                    _ => {}
+                }
+            }
             expected_height += 1;
             expected_parent = hash;
         }
@@ -581,20 +686,32 @@ impl Storage {
                 ledger_after.next_index()
             )));
         }
-        // Only a proposer's entry changes (it collects the block's fees); stakes are genesis
-        // state until phase S2 puts bonding on chain.
-        for addr in &proposers {
-            let entry = ledger_after.validators().get(addr).ok_or_else(|| {
-                StorageError::Corrupt(format!("committed block proposer {addr} is not in the validator register"))
-            })?;
-            batch.put_cf(self.cf(CF_VALIDATORS), addr.as_bytes(), bincode::serialize(entry)?);
+        // A proposer's entry changes because it collects the block's fees; since phase S2 a
+        // staking action changes the entry it names, and a registration adds one that was not
+        // there at all. `touched` is both.
+        for addr in &touched {
+            match ledger_after.validators().get(addr) {
+                Some(entry) => batch.put_cf(self.cf(CF_VALIDATORS), addr.as_bytes(), bincode::serialize(entry)?),
+                // A proposer must be in the register (`apply_block` rejects a block otherwise);
+                // an action's target may not be, if the transaction was refused — but a refused
+                // transaction is not in a committed block either.
+                None => {
+                    return Err(StorageError::Corrupt(format!(
+                        "committed block touches validator {addr}, which is not in the register"
+                    )))
+                }
+            }
         }
         for rec in ledger_after.programs().values() {
             if rec.deployed_at >= first_height {
                 batch.put_cf(self.cf(CF_PROGRAMS), rec.id.as_bytes(), bincode::serialize(rec)?);
             }
         }
+        for (epoch, set) in epoch_sets {
+            batch.put_cf(self.cf(CF_EPOCH_SETS), height_key(*epoch), bincode::serialize(set)?);
+        }
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger_after.tree())?);
+        batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger_after.supply())?);
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
         self.db.write_opt(batch, &sync_opts())?;
         Ok(())
@@ -697,8 +814,42 @@ impl Storage {
         }
 
         let mut prev_hash = gs.hash();
+        // The set each epoch runs with, re-derived from the replay rather than read from the
+        // database: the database's copy is exactly what this check is auditing. Epoch 0 is the
+        // genesis set by definition.
+        let epoch_blocks = gs.epoch_blocks.max(1);
+        let mut sets: BTreeMap<u64, ValidatorSet> = BTreeMap::new();
+        sets.insert(0, gs.validators.clone());
         for h in 1..=head {
             let problem = (|| -> std::result::Result<(), String> {
+                // A block at the first height of an epoch fixes that epoch's set, from the
+                // register as of its parent — the same rule consensus used
+                // (`HotStuff::shared_set_for_height`), including carrying a previous set forward
+                // when the register derives nothing.
+                let epoch = h / epoch_blocks;
+                if h % epoch_blocks == 0 {
+                    let mut derived = ledger.derive_next_set();
+                    if derived.is_empty() {
+                        derived = sets
+                            .get(&(epoch - 1))
+                            .cloned()
+                            .ok_or_else(|| format!("epoch {} has no set to carry into epoch {epoch}", epoch - 1))?;
+                    }
+                    match self.epoch_set(epoch) {
+                        Ok(Some(stored)) if stored == derived => {}
+                        Ok(Some(_)) => {
+                            return Err(format!(
+                                "the stored validator set for epoch {epoch} is not the one block {h} derives"
+                            ))
+                        }
+                        Ok(None) => return Err(format!("no stored validator set for epoch {epoch}")),
+                        Err(e) => return Err(format!("epoch {epoch} set unreadable: {e}")),
+                    }
+                    sets.insert(epoch, derived);
+                }
+                let set = sets
+                    .get(&epoch)
+                    .ok_or_else(|| format!("no validator set for epoch {epoch} at block {h}"))?;
                 let block = self
                     .block_by_height(h)
                     .map_err(|e| format!("block {h} unreadable: {e}"))?
@@ -722,11 +873,13 @@ impl Storage {
                 if qc.block_hash != hash || qc.view != block.view() {
                     return Err(format!("qc {h} does not certify block {h}"));
                 }
-                if block.proposer() != gs.validators.leader(block.view()) {
+                if block.proposer() != set.leader(block.view()) {
                     return Err(format!("block {h} proposer is not the leader of view {}", block.view()));
                 }
-                if mode == VerifyMode::Full && !qc.verify(&gs.validators, &gs.hash()) {
-                    return Err(format!("qc {h} has invalid or insufficient votes"));
+                // A QC certifies the block it is stored with, so it is verified against the set
+                // of *that block's* epoch — not the current one, and not genesis's.
+                if mode == VerifyMode::Full && !qc.verify(set, &gs.hash()) {
+                    return Err(format!("qc {h} has invalid or insufficient votes for epoch {epoch}"));
                 }
                 for (i, tx) in block.transactions.iter().enumerate() {
                     match self.tx_location(&tx.hash()) {
@@ -765,6 +918,15 @@ impl Storage {
         // tree, the commitment and nullifier sets, the anchors, the validators and the programs
         // — everything these families hold.
         match self.load_ledger(executor) {
+            // The supply counters are outside `Ledger`'s equality (nothing hashes them), so they
+            // are audited here explicitly: this is the replay the RPC's numbers are worth.
+            Ok(stored) if stored == ledger && stored.supply() != ledger.supply() => {
+                check.problem = Some(format!(
+                    "stored supply {:?} does not match the replayed chain's {:?}",
+                    stored.supply(),
+                    ledger.supply()
+                ))
+            }
             Ok(stored) if stored == ledger => {}
             Ok(_) => check.problem = Some("state snapshot does not match replayed chain".into()),
             Err(e) => check.problem = Some(format!("state snapshot unreadable: {e}")),
@@ -847,7 +1009,23 @@ impl Storage {
                 batch.delete_cf(self.cf(CF_RECEIPTS), k);
             }
         }
+        // Epoch sets above the epoch the new head is in describe blocks this chain no longer
+        // has. The epoch the head is *in* stays: its first block is still on the chain (or is
+        // the head itself), and its set is what verifies the QCs of the blocks that remain.
+        let head_epoch = height / gs.epoch_blocks.max(1);
+        for item in self.db.iterator_cf(self.cf(CF_EPOCH_SETS), IteratorMode::End) {
+            let (k, _) = item?;
+            if be_u64(k.as_ref(), "epoch set key")? <= head_epoch {
+                break;
+            }
+            batch.delete_cf(self.cf(CF_EPOCH_SETS), k);
+        }
+        if height == 0 {
+            // A rewritten genesis is a rewritten epoch 0.
+            batch.put_cf(self.cf(CF_EPOCH_SETS), height_key(0), bincode::serialize(&gs.validators)?);
+        }
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger.tree())?);
+        batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger.supply())?);
         if height == 0 {
             let hk = height_key(0);
             batch.put_cf(self.cf(CF_BLOCKS), hk, gs.block.encode());
@@ -872,6 +1050,13 @@ impl Storage {
     /// Test hook: overwrite a validator entry to simulate snapshot corruption.
     pub fn overwrite_validator_for_testing(&self, addr: &Address, entry: &ValidatorEntry) -> Result<()> {
         self.db.put_cf(self.cf(CF_VALIDATORS), addr.as_bytes(), bincode::serialize(entry)?)?;
+        Ok(())
+    }
+
+    /// Test hook: overwrite the certificate stored for a block height, so a chain can be given a
+    /// QC that was signed by the wrong epoch's validators.
+    pub fn overwrite_qc_for_testing(&self, height: u64, qc: &QuorumCertificate) -> Result<()> {
+        self.db.put_cf(self.cf(CF_QCS), height_key(height), bincode::serialize(qc)?)?;
         Ok(())
     }
 }
@@ -912,23 +1097,35 @@ pub(crate) mod fixtures {
     }
 
     pub(crate) fn genesis_with_epochs(chain_id: u64, alloc: Vec<GenesisNote>, epoch_blocks: u64) -> GenesisState {
-        let k = key(1);
+        genesis_of(chain_id, &[&key(1)], alloc, epoch_blocks)
+    }
+
+    /// A validator's payout address. It only has to parse and be a fixed width; nothing in these
+    /// tests opens the note a withdraw would seal to it.
+    pub(crate) fn payout(i: u8) -> shrugg_core::notes::ShieldedAddress {
+        shrugg_core::notes::ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; shrugg_core::notes::KEM_EK_BYTES] }
+    }
+
+    /// A genesis staking each of `validators` at the minimum — below it an entry is in the
+    /// register but in no epoch's set, which genesis refuses.
+    pub(crate) fn genesis_of(
+        chain_id: u64,
+        validators: &[&Keypair],
+        alloc: Vec<GenesisNote>,
+        epoch_blocks: u64,
+    ) -> GenesisState {
         Genesis {
             chain_id,
             timestamp_ms: 0,
-            validators: vec![GenesisValidator {
-                public_key: k.public_key().clone(),
-                // Phase S2: a genesis validator has to meet the staking minimum, or it is in
-                // the register but in no epoch's validator set.
-                stake: shrugg_core::ledger::staking::MIN_STAKE as u128,
-                // Phase S2 makes the payout address a required genesis field; storage rows for
-                // the v2 register entry are S2 Task 3's, so this only has to parse.
-                payout: shrugg_core::notes::ShieldedAddress {
-                    pk: [1; 8],
-                    kem_ek: vec![2; shrugg_core::notes::KEM_EK_BYTES],
-                }
-                .to_string(),
-            }],
+            validators: validators
+                .iter()
+                .enumerate()
+                .map(|(i, k)| GenesisValidator {
+                    public_key: k.public_key().clone(),
+                    stake: shrugg_core::ledger::staking::MIN_STAKE as u128,
+                    payout: payout(i as u8 + 1).to_string(),
+                })
+                .collect(),
             alloc,
             faucet: true,
             confidential: true,
@@ -994,6 +1191,29 @@ pub(crate) mod fixtures {
         make_block_unchecked(parent, ledger, txs, k)
     }
 
+    /// Which of `keys` leads `view` in `set`. A block proposed by anyone else is rejected as
+    /// "not the leader", so a fixture chain with more than one validator cannot simply always
+    /// propose with the same key.
+    pub(crate) fn leader_among<'a>(set: &ValidatorSet, view: u64, keys: &[&'a Keypair]) -> &'a Keypair {
+        let want = set.leader(view);
+        keys.iter().copied().find(|k| k.address() == want).expect("the leader is one of these keys")
+    }
+
+    /// `make_block`, but with a quorum certificate really signed by `voters` — what a chain
+    /// verified in `VerifyMode::Full` needs, and what makes a QC's validity depend on which
+    /// epoch's set it is checked against.
+    pub(crate) fn make_block_voted(
+        parent: &Block,
+        ledger: &mut Ledger,
+        txs: Vec<Transaction>,
+        k: &Keypair,
+        voters: &[&Keypair],
+    ) -> CommittedBlock {
+        let mut cb = make_block(parent, ledger, txs, k);
+        cb.qc.votes = voters.iter().map(|v| shrugg_core::Vote::sign(cb.qc.view, cb.qc.block_hash, v)).collect();
+        cb
+    }
+
     /// `make_block` without executing the transactions: the only way to build a block carrying a
     /// transaction the ledger would have rejected, which is what a torn block on disk looks like.
     pub(crate) fn make_block_unchecked(parent: &Block, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
@@ -1010,7 +1230,7 @@ pub(crate) mod fixtures {
         };
         let block = Block::sign(header, txs, k);
         let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![] };
-        CommittedBlock { block, qc, receipts: Vec::new() }
+        CommittedBlock { block, qc, receipts: Vec::new(), deposits: ledger.deposits().to_vec() }
     }
 }
 
@@ -1147,7 +1367,7 @@ mod tests {
         ledger.set_height(1);
         let tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
         let b1 = make_block(&gs.block, &mut ledger, vec![tx.clone()], &proposer);
-        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        s.commit(std::slice::from_ref(&b1), &ledger, &[]).unwrap();
 
         assert_eq!(s.head().unwrap(), Head { height: 1, hash: b1.block.hash() });
         assert_eq!(s.notes_count().unwrap(), 4);
@@ -1179,13 +1399,172 @@ mod tests {
         let mut ledger = gs.ledger.clone();
         let tx = mint_tx(gs.chain_id, [77; 8], 5_000, &minter);
         let b1 = make_block(&gs.block, &mut ledger, vec![tx.clone()], &minter);
-        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        s.commit(std::slice::from_ref(&b1), &ledger, &[]).unwrap();
         assert_eq!(s.notes_count().unwrap(), 3);
         assert_eq!(s.note(2).unwrap().unwrap(), NoteRow { cm: [77; 8], envelope: env(77), height: 1 });
         // A mint spends nothing and pays no fee.
         assert_eq!(s.nullifiers_count().unwrap(), 0);
         assert_eq!(s.validator(&minter.address()).unwrap().unwrap().rewards, 0);
         assert_eq!(s.load_ledger(&StubExecutor).unwrap(), ledger);
+    }
+
+    /// Phase S2 storage: a v2 register entry survives a round trip with every field it gained,
+    /// and so does the set of every epoch the chain has seen start.
+    #[test]
+    fn v2_validator_entries_and_epoch_sets_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1), &key(2)], vec![], 4);
+        s.init_genesis(&gs).unwrap();
+
+        // Genesis rows carry the v2 shape: an empty unbonding queue, the payout address the
+        // genesis file named, and a zero nonce.
+        let row = s.validator(&key(1).address()).unwrap().unwrap();
+        assert_eq!(row.stake, shrugg_core::ledger::staking::MIN_STAKE);
+        assert_eq!(row.pending, Vec::new());
+        assert_eq!(row.rewards, 0);
+        assert_eq!(row.nonce, 0);
+        assert_eq!(row.payout, payout(1));
+        assert_eq!(s.register().unwrap().len(), 2);
+
+        // Every field of a written entry comes back, including a multi-entry queue.
+        let mut changed = row.clone();
+        changed.stake = 41;
+        changed.pending = vec![(3, 100), (4, 250)];
+        changed.rewards = 7;
+        changed.nonce = 9;
+        s.overwrite_validator_for_testing(&key(1).address(), &changed).unwrap();
+        assert_eq!(s.validator(&key(1).address()).unwrap().unwrap(), changed);
+
+        // Epoch 0 is the genesis set, written by `init_genesis`; nothing else is known yet.
+        assert_eq!(s.epoch_set(0).unwrap().as_ref(), Some(&gs.validators));
+        assert_eq!(s.epoch_set(1).unwrap(), None);
+        let sets = s.load_epoch_sets().unwrap();
+        assert_eq!(sets.get(0), Some(&gs.validators));
+        assert_eq!(sets.known().count(), 1);
+    }
+
+    /// A chain that crosses an epoch boundary, with the epoch's set derived from the register as
+    /// of the last block of the epoch before (spec §8). Block 1 unbonds validator 2 out of the
+    /// set, so epoch 1 runs with validator 1 alone.
+    fn chain_across_a_boundary() -> (tempfile::TempDir, Storage, GenesisState, ValidatorSet, Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        // Two blocks per epoch, so block 2 is the first block of epoch 1.
+        let gs = genesis_of(7, &[&key(1), &key(2)], vec![alloc_note(20, 5 * shrugg_core::UNITS_PER_SHRUGG)], 2);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+
+        let leaving = key(2);
+        let amount = shrugg_core::ledger::staking::MIN_STAKE;
+        let signature =
+            leaving.sign(shrugg_core::unbond_message(gs.chain_id, &leaving.address(), amount, 0).as_bytes());
+        let action = Action::Unbond { validator: leaving.address(), amount, nonce: 0, signature };
+        let mut b = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee())
+            .bundle
+            .expect("bundle_tx always carries one");
+        b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()));
+        let unbond = Transaction::shielded(gs.chain_id, b, action);
+
+        // Block 1 is in epoch 0: led and certified by that epoch's set, both validators.
+        let both = [&key(1), &key(2)];
+        let b1 = make_block_voted(&gs.block, &mut ledger, vec![unbond], leader_among(&gs.validators, 1, &both), &both);
+        s.commit(std::slice::from_ref(&b1), &ledger, &[]).unwrap();
+
+        // Block 2 opens epoch 1, whose set the register now derives as validator 1 alone.
+        let epoch1 = ledger.derive_next_set();
+        assert_eq!(epoch1.len(), 1, "validator 2 unbonded out of the set");
+        assert_eq!(epoch1.leader(2), key(1).address());
+        ledger.set_height(2);
+        let tx = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
+        let b2 = make_block_voted(&b1.block, &mut ledger, vec![tx], &key(1), &[&key(1)]);
+        s.commit(std::slice::from_ref(&b2), &ledger, &[(1, epoch1.clone())]).unwrap();
+        (dir, s, gs, epoch1, ledger)
+    }
+
+    #[test]
+    fn an_epoch_set_is_written_with_the_block_that_starts_the_epoch() {
+        let (_d, s, gs, epoch1, ledger) = chain_across_a_boundary();
+        assert_eq!(s.epoch_set(0).unwrap().as_ref(), Some(&gs.validators));
+        assert_eq!(s.epoch_set(1).unwrap().as_ref(), Some(&epoch1));
+        assert_eq!(s.load_epoch_sets().unwrap().known().count(), 2);
+        // The unbonded stake is in the register's queue, and the whole chain verifies against
+        // the per-epoch sets it recorded.
+        let e = s.validator(&key(2).address()).unwrap().unwrap();
+        assert_eq!(e.stake, 0);
+        assert_eq!(e.pending, vec![(2, shrugg_core::ledger::staking::MIN_STAKE)]);
+        assert_eq!(e.nonce, 1);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().problem, None);
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap(), ledger);
+        assert_eq!(s.supply().unwrap(), ledger.supply(), "the counters are committed with the state");
+
+        // Rewinding to the last block of epoch 0 drops epoch 1's set: those blocks are gone.
+        let replayed = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let mut at_one = gs.ledger.clone();
+        at_one.apply_block(&s.block_by_height(1).unwrap().unwrap(), &StubExecutor).unwrap();
+        assert!(replayed.is_ok());
+        s.truncate_to(&gs, 1, &at_one).unwrap();
+        assert_eq!(s.epoch_set(0).unwrap().as_ref(), Some(&gs.validators), "epoch 0 outlives any truncation");
+        assert_eq!(s.epoch_set(1).unwrap(), None);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().problem, None);
+    }
+
+    /// The point of storing a set per epoch: a certificate is only valid against the set of the
+    /// epoch its own block belonged to. This QC would pass under epoch 0's set and must not pass
+    /// under epoch 1's.
+    #[test]
+    fn verify_chain_rejects_a_qc_signed_by_the_wrong_epochs_set() {
+        let (_d, s, gs, epoch1, _) = chain_across_a_boundary();
+        let b2 = s.block_by_height(2).unwrap().unwrap();
+        let wrong = QuorumCertificate {
+            view: b2.view(),
+            block_hash: b2.hash(),
+            votes: [&key(1), &key(2)].iter().map(|k| shrugg_core::Vote::sign(b2.view(), b2.hash(), k)).collect(),
+        };
+        // Under the set that ran epoch 0 it is a perfectly good certificate.
+        assert!(wrong.verify(&gs.validators, &gs.hash()));
+        assert!(!wrong.verify(&epoch1, &gs.hash()), "validator 2 is not in epoch 1's set");
+        s.overwrite_qc_for_testing(2, &wrong).unwrap();
+
+        let c = s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap();
+        assert_eq!(c.last_good, 1, "the chain is good up to the block before");
+        assert!(c.problem.as_deref().unwrap_or_default().contains("epoch 1"), "{:?}", c.problem);
+    }
+
+    /// The other half of the audit: the set a boundary block ran with has to be *there*, and it
+    /// has to be the one the replayed register derives.
+    #[test]
+    fn verify_chain_rejects_an_epoch_set_that_is_missing_or_not_the_one_the_replay_derives() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1), &key(2)], vec![], 2);
+        s.init_genesis(&gs).unwrap();
+        let both = [&key(1), &key(2)];
+        let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+        let b1 = make_block(&gs.block, &mut ledger, vec![], leader_among(&gs.validators, 1, &both));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[]).unwrap();
+        // Nobody unbonded, so epoch 1's set is still both validators.
+        let epoch1 = ledger.derive_next_set();
+        ledger.set_height(2);
+        let b2 = make_block(&b1.block, &mut ledger, vec![], leader_among(&epoch1, 2, &both));
+        s.commit(std::slice::from_ref(&b2), &ledger, &[]).unwrap();
+
+        let missing = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(missing.last_good, 1, "the chain is good up to the block before the boundary");
+        assert_eq!(missing.problem.as_deref(), Some("no stored validator set for epoch 1"));
+
+        // A set that is there but is not the one this register derives is no better.
+        let wrong = ValidatorSet::from_entries([(key(1).public_key(), shrugg_core::ledger::staking::MIN_STAKE)]);
+        s.commit(&[], &ledger, &[(1, wrong)]).unwrap();
+        let c = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(c.last_good, 1);
+        assert!(c.problem.as_deref().unwrap_or_default().contains("epoch 1"), "{:?}", c.problem);
+
+        // Writing what the replay does derive is what repairs it.
+        s.commit(&[], &ledger, &[(1, epoch1)]).unwrap();
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
     }
 
     #[test]
@@ -1197,7 +1576,7 @@ mod tests {
         ledger.set_height(1);
         let tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
         let b1 = make_block(&gs.block, &mut ledger, vec![tx], &proposer);
-        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        s.commit(std::slice::from_ref(&b1), &ledger, &[]).unwrap();
 
         for index in 0..4 {
             let (root, path) = s.witness(index, &StubExecutor).unwrap().expect("leaf exists");
@@ -1228,13 +1607,13 @@ mod tests {
         ledger.set_height(1);
         let tx1 = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
         let b1 = certify(make_block(&gs.block, &mut ledger, vec![tx1], &proposer));
-        s.commit(std::slice::from_ref(&b1), &ledger).unwrap();
+        s.commit(std::slice::from_ref(&b1), &ledger, &[]).unwrap();
         let ledger_at_1 = ledger.clone();
 
         ledger.set_height(2);
         let tx2 = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
         let b2 = certify(make_block(&b1.block, &mut ledger, vec![tx2.clone()], &proposer));
-        s.commit(std::slice::from_ref(&b2), &ledger).unwrap();
+        s.commit(std::slice::from_ref(&b2), &ledger, &[]).unwrap();
         assert_eq!(s.notes_count().unwrap(), 6);
         assert_eq!(s.nullifier_height(&[5; 8]).unwrap(), Some(2));
 
@@ -1261,12 +1640,12 @@ mod tests {
         let mut ledger = gs.ledger.clone();
         let b1 = make_block(&gs.block, &mut ledger, vec![], &k);
         let b2 = make_block(&b1.block, &mut ledger, vec![], &k);
-        assert!(matches!(s.commit(std::slice::from_ref(&b2), &ledger), Err(StorageError::Corrupt(_))));
+        assert!(matches!(s.commit(std::slice::from_ref(&b2), &ledger, &[]), Err(StorageError::Corrupt(_))));
         assert_eq!(s.head().unwrap().height, 0);
         let mut bad = b1.clone();
         bad.qc.block_hash = Hash::ZERO;
-        assert!(matches!(s.commit(&[bad], &ledger), Err(StorageError::Corrupt(_))));
-        s.commit(&[b1, b2], &ledger).unwrap();
+        assert!(matches!(s.commit(&[bad], &ledger, &[]), Err(StorageError::Corrupt(_))));
+        s.commit(&[b1, b2], &ledger, &[]).unwrap();
         assert_eq!(s.head().unwrap().height, 2);
     }
 
@@ -1295,7 +1674,7 @@ mod tests {
         assert_ne!(root_at_1, root_at_2, "each block moved the tree");
 
         // One commit, both blocks, the ledger after block 2 — exactly what the node does.
-        s.commit(&[b1.clone(), b2.clone()], &ledger).unwrap();
+        s.commit(&[b1.clone(), b2.clone()], &ledger, &[]).unwrap();
         assert_eq!(s.head().unwrap().height, 2);
 
         // Each height's anchor is that height's own end-of-block root, not the batch's last.
@@ -1367,7 +1746,7 @@ mod tests {
             let block = cb.block.clone();
             let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(block.view(), block.hash(), &k)] };
             let cb = CommittedBlock { qc, ..cb };
-            st.commit(std::slice::from_ref(&cb), &ledger).unwrap();
+            st.commit(std::slice::from_ref(&cb), &ledger, &[]).unwrap();
             out.push(cb);
             parent = block;
         }
@@ -1410,7 +1789,7 @@ mod tests {
         let mut ledger = again.ledger.clone();
         let cb = &blocks[3]; // height 4 again
         ledger.apply_block(&cb.block, &StubExecutor).unwrap();
-        st.commit(std::slice::from_ref(cb), &ledger).unwrap();
+        st.commit(std::slice::from_ref(cb), &ledger, &[]).unwrap();
         assert_eq!(st.head().unwrap().height, 4);
         assert!(st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().is_ok());
     }
@@ -1501,7 +1880,7 @@ mod tests {
         // The bundle's digest commits to its own fields only, so swapping the action is fine.
         let cb3 = make_block(&blocks[1].block, &mut ledger, vec![deploy.clone()], &k);
         let pid = shrugg_core::program::program_id(0, &words);
-        st.commit(std::slice::from_ref(&cb3), &ledger).unwrap();
+        st.commit(std::slice::from_ref(&cb3), &ledger, &[]).unwrap();
         let rec = st.program(&pid).unwrap().expect("program stored");
         assert_eq!(rec.words, words);
         assert_eq!(rec.deployed_at, 3);

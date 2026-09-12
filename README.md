@@ -94,23 +94,37 @@ copied to all machines unchanged (the genesis hash must match everywhere):
 
 ```bash
 shrugg-node genesis --chain-id 6 \
-    --validator a.key.json --payout shrugg1<a's payout address> \
-    --validator <hex public key of b> --payout shrugg1<b's payout address> \
+    --validator a.key.json,1000,shrugg1<a's payout address> \
+    --validator <hex public key of b>,1000,shrugg1<b's payout address> \
     --alloc shrugg1<address>=1000 \
-    [--stake <units, default 1000 SHRUGG>] \
+    [--epoch-blocks 1000] \
     [--faucet] [--no-confidential] [--fri-profile production] \
     --out genesis.json
 ```
 
-Each validator needs a `--payout`, one per `--validator` and in the same order: it is the shielded
-address its block rewards and unbonded stake are paid to (phase S2), and it is part of the genesis
-hash. `--stake` defaults to the 1000 SHRUGG a validator needs to be in an epoch's validator set at
-all; genesis refuses less.
+A `--validator` is one register entry, so it carries all three of its fields at once: the key, the
+stake in SHRUGG, and the payout address its block rewards and unbonded stake are paid to (phase S2).
+All three are part of the genesis hash. 1000 SHRUGG is the minimum a validator needs to be in an
+epoch's validator set at all; genesis refuses less. `--epoch-blocks` is how often the set is
+re-derived from the register (spec §8) — the default is 1000 blocks.
 
 Each `--alloc` creates one shielded deposit note: there is no per-validator allocation, because
 value exists only as a note someone holds the spend key for. The addresses come from
 `shrugg keygen` + `shrugg address` on whichever machines will hold the funds. `deploy/README.md`
 has a worked example, and `deploy/genesis-shielded.example.json` is one such file.
+
+A validator that joins an existing chain registers instead of appearing in genesis:
+
+```bash
+shrugg-node register --key node.key.json --payout shrugg1<payout address>   # prints a Registration (hex)
+shrugg-node unbond   1000 --key node.key.json --wallet wallet.key.json      # two epochs to release
+shrugg-node withdraw 1000 --key node.key.json --wallet wallet.key.json      # into a note at the payout address
+```
+
+The bond itself is a wallet transaction — it burns the stake out of shielded notes, which a node
+holds none of — and takes the hex `register` printed. `unbond` and `withdraw` are signed by the
+node's key but still ride on a bundle the wallet pays for, so they take a `--wallet` too and spend
+about a minute proving it.
 
 Each machine initialises and runs:
 
@@ -122,8 +136,10 @@ shrugg-node run  --datadir ./data --key node.key.json --validator \
 ```
 
 Nodes on one LAN discover each other over mDNS; across networks, machines behind NAT dial out to a
-node with a public address. A key that is not in the genesis validator set runs as an observer;
-omit `--validator` to run an observer on purpose. Restarting from the same `--datadir` resumes from
+node with a public address. `--validator` means "this node holds a validator key": a key that is in
+no current epoch's set observes until an epoch admits it, which is how a validator that bonds in
+after genesis joins without a restart (`shrugg_status` reports `is_validator` for the key and
+`active_validator` for being in the current set). Omit `--validator` to run an observer on purpose. Restarting from the same `--datadir` resumes from
 the persisted head. A validator set of `n` needs more than 2/3 of stake online: 2 of 2, 3 of 4, 5 of 6.
 
 ## Use the wallet

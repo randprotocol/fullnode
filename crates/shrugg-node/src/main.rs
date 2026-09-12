@@ -1,15 +1,18 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::Multiaddr;
+use shrugg_client::wallet::{self, NoteStore, Wallet};
 use shrugg_client::RpcClient;
 use shrugg_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
 use shrugg_core::notes::{word8_to_hex, ShieldedAddress};
+use shrugg_core::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
 use shrugg_core::{format_amount, parse_amount};
 use shrugg_core::{Keypair, PublicKey, UNITS_PER_SHRUGG};
 use shrugg_node::keyfile::{load_keypair, KeyFile};
 use shrugg_node::node::{self, NodeConfig};
 use shrugg_node::storage::{Storage, VerifyMode};
 use shrugg_zkvm::executor::ZkExecutor;
+use shrugg_zkvm::machine::Backend;
 use shrugg_zkvm::notes::{Note, SpendKey};
 use shrugg_zkvm::viewing::TxKey;
 use std::net::SocketAddr;
@@ -45,6 +48,82 @@ fn seal_deposit(to: &ShieldedAddress, note: &Note) -> Result<GenesisNote> {
     })
 }
 
+/// One `--validator key,stake,payout` triple. The three fields travel together because they are
+/// one register entry (spec §8): three parallel repeatable flags would silently pair the wrong
+/// stake with the wrong key the moment one of them was left out.
+fn parse_genesis_validator(spec: &str) -> Result<GenesisValidator> {
+    let parts: Vec<&str> = spec.split(',').collect();
+    let [key, stake, payout] = parts.as_slice() else {
+        anyhow::bail!("--validator takes <key file or hex public key>,<stake in SHRUGG>,<payout shrugg1…>, got {spec}");
+    };
+    let public_key = if PathBuf::from(key).exists() {
+        load_keypair(&PathBuf::from(key))?.public_key().clone()
+    } else {
+        PublicKey::from_hex(key).with_context(|| format!("{key} is neither a key file nor a hex public key"))?
+    };
+    let stake = parse_amount(stake).with_context(|| format!("{stake} is not an amount in SHRUGG"))?;
+    ShieldedAddress::parse(payout).with_context(|| format!("{payout} is not a shielded address"))?;
+    // `Genesis::build` is what refuses a stake below the minimum; saying so here too means the
+    // operator hears it before a genesis hash has been printed anywhere.
+    anyhow::ensure!(
+        stake >= shrugg_core::ledger::staking::MIN_STAKE,
+        "stake {} SHRUGG is below the staking minimum of {} SHRUGG",
+        format_amount(stake),
+        format_amount(shrugg_core::ledger::staking::MIN_STAKE)
+    );
+    Ok(GenesisValidator { public_key, stake: stake as u128, payout: (*payout).to_string() })
+}
+
+
+/// This validator's row of the register, as `shrugg_getValidators` reports it: the nonce its
+/// next signed action must carry, and the payout address a withdraw pays to. A node that is not
+/// in the register has nothing to sign yet — it has to be bonded in first.
+async fn register_row(rpc: &RpcClient, me: &shrugg_core::Address) -> Result<(u64, ShieldedAddress)> {
+    let rows = rpc.validators().await?;
+    let want = me.to_base58();
+    let row = rows
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["address"].as_str() == Some(want.as_str())))
+        .with_context(|| format!("{want} is not in the validator register; bond it in first (`shrugg-node register`)"))?;
+    let nonce = row["nonce"].as_u64().context("the node's getValidators reply has no nonce")?;
+    let payout = row["payout"].as_str().context("the node's getValidators reply has no payout address")?;
+    let payout = ShieldedAddress::parse(payout).map_err(|e| anyhow::anyhow!("register payout address: {e}"))?;
+    Ok((nonce, payout))
+}
+
+/// Submit a validator-signed action on a bundle the wallet pays for, and report it.
+async fn submit_staking(args: &StakingArgs, action: shrugg_core::Action, what: &str) -> Result<()> {
+    let rpc = RpcClient::new(args.rpc.clone());
+    let chain_id = rpc.chain_id().await?;
+    let w = Wallet::load(&args.wallet)?;
+    let store_path = wallet::store_path(&args.wallet);
+    let mut store = NoteStore::load(&store_path);
+    let fee = match &args.fee {
+        Some(f) => parse_amount(f)?,
+        None => shrugg_core::gas::fee_floor(&action),
+    };
+    let profile = ZkExecutor::profile_from_str(
+        rpc.status().await?["fri_profile"].as_str().unwrap_or("production"),
+    )
+    .context("node reports an unknown fri profile")?;
+    let submission = wallet::submit(
+        &rpc,
+        &w,
+        &mut store,
+        None,
+        action,
+        fee,
+        profile,
+        Backend::Cpu,
+        chain_id,
+        !args.no_wait,
+    )
+    .await?;
+    store.save(&store_path)?;
+    println!("submitted {what} {}\n  fee {} SHRUGG, anchored at height {}", submission.hash, format_amount(submission.fee), submission.time);
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "shrugg-node", version, about = "SHRUGG full node: HotStuff BFT consensus, p2p discovery, shielded note ledger")]
 struct Cli {
@@ -69,18 +148,17 @@ enum Cmd {
     Genesis {
         #[arg(long, default_value_t = 1)]
         chain_id: u64,
-        /// Validator key files (seed) or hex public keys, repeatable.
-        #[arg(long = "validator", required = true)]
+        /// A validator, as `<key file or hex public key>,<stake in SHRUGG>,<payout shrugg1…>`;
+        /// repeatable. The stake must be at least the staking minimum (1000 SHRUGG) or the
+        /// validator would be in the register but in no epoch's set. The payout address is where
+        /// this validator's rewards and unbonded stake are paid, and it is part of the genesis
+        /// hash: it is register state.
+        #[arg(long = "validator", required = true, value_name = "KEY,STAKE,PAYOUT")]
         validators: Vec<String>,
-        /// Phase S2: each validator's payout address (`shrugg1…`), repeatable, in the same order
-        /// as `--validator` and the same number of them. Rewards and unbonded stake are paid
-        /// there. (The fuller staking CLI is S2 Task 3.)
-        #[arg(long = "payout", required = true)]
-        payouts: Vec<String>,
-        /// Stake per validator, in units. Genesis refuses anything below the staking minimum
-        /// (1000 SHRUGG), which is what a validator needs to be in an epoch's set at all.
-        #[arg(long, default_value_t = shrugg_core::ledger::staking::MIN_STAKE as u128)]
-        stake: u128,
+        /// Blocks per epoch (spec §8): the validator set for epoch `e` is derived from the
+        /// register as of the last block of epoch `e - 1`. Part of the genesis hash.
+        #[arg(long, default_value_t = shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT)]
+        epoch_blocks: u64,
         /// Deposit notes `shrugg1<address>=<amount in SHRUGG>`, repeatable. A redacted chain has
         /// no accounts, so there is no per-validator allocation: value only exists as a note
         /// someone holds the spend key for.
@@ -118,7 +196,9 @@ enum Cmd {
         bootstrap: Vec<Multiaddr>,
         #[arg(long, default_value = "127.0.0.1:8545")]
         rpc: SocketAddr,
-        /// Participate in consensus (key must be in the genesis validator set).
+        /// Take part in consensus with this node's key. A key in no current epoch's validator
+        /// set observes until an epoch admits it (spec §8), so a validator that bonds in after
+        /// genesis does not need a restart.
         #[arg(long)]
         validator: bool,
         /// Disable LAN discovery via mDNS.
@@ -147,6 +227,59 @@ enum Cmd {
         #[arg(long, default_value = "http://127.0.0.1:8545")]
         rpc: String,
     },
+    /// Print this node's `Registration` (hex) for a wallet to attach to the bond that registers
+    /// it. The bond itself is a wallet transaction: it burns the stake out of the wallet's own
+    /// notes, which a node has none of.
+    Register {
+        #[arg(long)]
+        key: PathBuf,
+        /// Where this validator's rewards and unbonded stake are paid (`shrugg1…`).
+        #[arg(long)]
+        payout: String,
+        /// The chain to register on is read from here: a registration is signed over the chain
+        /// id, so one written for the wrong chain is simply refused.
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Move bonded stake into unbonding. Withdrawable two epochs later.
+    Unbond {
+        /// Amount in SHRUGG.
+        amount: String,
+        #[command(flatten)]
+        staking: StakingArgs,
+    },
+    /// Pay released stake and rewards into a note at this validator's payout address.
+    Withdraw {
+        /// Amount in SHRUGG.
+        amount: String,
+        #[command(flatten)]
+        staking: StakingArgs,
+    },
+}
+
+/// What `unbond` and `withdraw` both need.
+///
+/// The action is signed by the *node's* key, but it rides on a bundle like every other
+/// transaction (spec §7): something has to pay the fee, and a validator key owns no notes. So
+/// these commands take a wallet as well, and the bundle they build is a self-transfer of zero
+/// whose only purpose is to carry the action — the same shape `shrugg deploy` and `shrugg call`
+/// use. Proving it takes about a minute.
+#[derive(clap::Args)]
+struct StakingArgs {
+    /// The validator key file: the key the register knows, and the key that signs the action.
+    #[arg(long)]
+    key: PathBuf,
+    /// Wallet spend-key file that pays the bundle fee.
+    #[arg(long, default_value = "wallet.key.json")]
+    wallet: PathBuf,
+    #[arg(long, default_value = "http://127.0.0.1:8545")]
+    rpc: String,
+    /// Fee in SHRUGG; the floor is 0.001.
+    #[arg(long)]
+    fee: Option<String>,
+    /// Return once the node accepts the transaction instead of waiting for it to commit.
+    #[arg(long)]
+    no_wait: bool,
 }
 
 #[tokio::main]
@@ -165,13 +298,7 @@ async fn main() -> Result<()> {
             let id = libp2p::identity::Keypair::ed25519_from_bytes(kp.derive_subkey(b"shrugg-p2p-identity"))?;
             println!("address: {}\npublic_key: {}\npeer_id: {}", kp.address(), kp.public_key().to_hex(), id.public().to_peer_id());
         }
-        Cmd::Genesis { chain_id, validators, payouts, stake, allocs, out, faucet, no_confidential, fri_profile } => {
-            anyhow::ensure!(
-                payouts.len() == validators.len(),
-                "expected one --payout per --validator ({} validators, {} payouts)",
-                validators.len(),
-                payouts.len()
-            );
+        Cmd::Genesis { chain_id, validators, epoch_blocks, allocs, out, faucet, no_confidential, fri_profile } => {
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -186,18 +313,10 @@ async fn main() -> Result<()> {
                 // `Genesis::build` rejects a bridge section outright until phase S3 puts the
                 // bridge back on the shielded chain, so this CLI offers no way to write one.
                 bridge: None,
-                // S2 Task 3 adds a `--epoch-blocks` flag; until then every genesis this CLI
-                // writes takes the default epoch length.
-                epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
+                epoch_blocks,
             };
-            for (v, payout) in validators.iter().zip(&payouts) {
-                let pk = if PathBuf::from(v).exists() {
-                    load_keypair(&PathBuf::from(v))?.public_key().clone()
-                } else {
-                    PublicKey::from_hex(v).with_context(|| format!("{v} is neither a key file nor a hex public key"))?
-                };
-                ShieldedAddress::parse(payout).with_context(|| format!("{payout} is not a shielded address"))?;
-                gen.validators.push(GenesisValidator { public_key: pk, stake, payout: payout.clone() });
+            for v in &validators {
+                gen.validators.push(parse_genesis_validator(v)?);
             }
             for a in &allocs {
                 let (addr, amt) = a.split_once('=').context("--alloc must be shrugg1address=amount")?;
@@ -209,10 +328,12 @@ async fn main() -> Result<()> {
             let state = gen.build(executor.as_ref())?;
             std::fs::write(&out, gen.to_json())?;
             println!(
-                "wrote {} (genesis hash {}, {} notes, faucet {}, confidential {}, fri {}, hc_bundle {})",
+                "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, faucet {}, confidential {}, fri {}, hc_bundle {})",
                 out.display(),
                 state.hash(),
+                state.validators.len(),
                 state.notes.len(),
+                state.epoch_blocks,
                 if faucet { "on" } else { "off" },
                 if no_confidential { "off" } else { "on" },
                 state.fri_profile,
@@ -273,6 +394,64 @@ async fn main() -> Result<()> {
         Cmd::Status { rpc } => {
             let v = RpcClient::new(rpc).status().await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Cmd::Register { key, payout, rpc } => {
+            let kp = load_keypair(&key)?;
+            let chain_id = RpcClient::new(rpc).chain_id().await?;
+            let payout = ShieldedAddress::parse(&payout)
+                .map_err(|e| anyhow::anyhow!("{payout} is not a shielded address: {e}"))?;
+            let signature = kp.sign(registration_message(chain_id, &payout).as_bytes());
+            let registration = Registration { public_key: kp.public_key().clone(), payout, signature };
+            println!(
+                "validator {} on chain {chain_id}\nregistration: {}",
+                kp.address(),
+                hex::encode(bincode::serialize(&registration)?)
+            );
+        }
+        Cmd::Unbond { amount, staking } => {
+            let kp = load_keypair(&staking.key)?;
+            let amount = parse_amount(&amount)?;
+            let (nonce, _) = register_row(&RpcClient::new(staking.rpc.clone()), &kp.address()).await?;
+            let chain_id = RpcClient::new(staking.rpc.clone()).chain_id().await?;
+            let signature = kp.sign(unbond_message(chain_id, &kp.address(), amount, nonce).as_bytes());
+            let action = shrugg_core::Action::Unbond { validator: kp.address(), amount, nonce, signature };
+            submit_staking(&staking, action, &format!("unbond of {} SHRUGG", format_amount(amount))).await?;
+        }
+        Cmd::Withdraw { amount, staking } => {
+            let kp = load_keypair(&staking.key)?;
+            let amount = parse_amount(&amount)?;
+            let rpc = RpcClient::new(staking.rpc.clone());
+            let chain_id = rpc.chain_id().await?;
+            let (nonce, payout) = register_row(&rpc, &kp.address()).await?;
+            // The chain computes the deposit note itself, from the register's payout address,
+            // the public amount, the blinding below and **the height of the block that applies
+            // the transaction**. The envelope, which only the payee can open, has to be sealed
+            // against that same note — so the height is predicted here as the next block, and
+            // said out loud, because a transaction that lands later carries an envelope the
+            // payee's wallet cannot open. The note itself is still created and still spendable;
+            // it is the automatic discovery of it that a wrong guess costs.
+            let height = rpc.head().await?["height"].as_u64().context("head has no height")? + 1;
+            let note = Note::new(payout.pk, [0; 8], amount, 0, height as u32);
+            let throwaway = SpendKey::random().viewing_key();
+            let envelope = shrugg_zkvm::address::seal_note(&throwaway, &payout, &note, &TxKey::random())
+                .map_err(|e| anyhow::anyhow!("sealing the payout note: {e}"))?;
+            let signature =
+                kp.sign(withdraw_message(chain_id, &kp.address(), amount, nonce, &note.r, &envelope).as_bytes());
+            let action = shrugg_core::Action::Withdraw {
+                validator: kp.address(),
+                amount,
+                nonce,
+                r: note.r,
+                envelope,
+                signature,
+            };
+            println!(
+                "paying {} SHRUGG to {}\n  note blinding r {} at predicted height {height}",
+                format_amount(amount),
+                payout,
+                word8_to_hex(&note.r)
+            );
+            submit_staking(&staking, action, &format!("withdraw of {} SHRUGG", format_amount(amount))).await?;
         }
     }
     let _ = UNITS_PER_SHRUGG;

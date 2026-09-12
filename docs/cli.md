@@ -47,16 +47,37 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | argument | default | meaning |
 |---|---|---|
 | `--chain-id <CHAIN_ID>` | `1` | chain id; transactions and gossip topics are bound to it |
-| `--validator <VALIDATORS>` | required, repeatable | key file path **or** hex public key of each validator |
-| `--stake <STAKE>` | `100000` | stake assigned to every validator (quorum is stake weighted) |
+| `--validator <KEY,STAKE,PAYOUT>` | required, repeatable | one register entry: key file path **or** hex public key, the stake in SHRUGG (at least 1000, the staking minimum), and the `shrugg1…` address its rewards and unbonded stake are paid to |
+| `--epoch-blocks <N>` | `1000` | blocks per epoch: how often the validator set is re-derived from the register (spec §8). Part of the genesis hash |
 | `--alloc <ALLOCS>` | none, repeatable | a deposit note: `shrugg1<address>=<amount in SHRUGG>` |
 | `--out <OUT>` | `genesis.json` | output path |
 | `--faucet` | off | **testnet only**: enable `Mint` transactions (`shrugg_mint`, up to 100 SHRUGG per call). Part of the genesis hash |
 | `--no-confidential` | off | disable Deploy/Call transactions on this chain. Part of the genesis hash |
 | `--fri-profile <production\|test>` | `production` | zkVM FRI profile every node must use; `test` is insecure and for the test suite. Part of the genesis hash |
 
-Prints the genesis hash, the note count, and `hc_bundle`. Every node of a chain must use a
-byte-identical genesis file.
+Prints the genesis hash, the validator and note counts, the epoch length and `hc_bundle`. Every
+node of a chain must use a byte-identical genesis file.
+
+### `shrugg-node register` / `unbond` / `withdraw`
+
+The three staking commands a validator operator runs (spec §8). `register` is offline apart from
+reading the chain id; the other two build a real transaction and take about a minute to prove it.
+
+| command | arguments | meaning |
+|---|---|---|
+| `register` | `--key`, `--payout <shrugg1…>`, `--rpc` | print a `Registration` (hex) signed by this node's key, for a wallet to attach to the bond that registers it |
+| `unbond <amount SHRUGG>` | `--key`, `--wallet`, `--rpc`, `--fee`, `--no-wait` | move bonded stake into unbonding; withdrawable two epochs later |
+| `withdraw <amount SHRUGG>` | same | pay released stake and rewards into a note at the register's payout address |
+
+The bond itself is a wallet command: it burns the stake out of shielded notes, and a validator key
+owns none. For the same reason `unbond` and `withdraw` take a `--wallet` — the action is signed by
+`--key`, but the bundle carrying it pays a fee out of the wallet's notes.
+
+`withdraw` draws the note's blinding itself and seals the envelope to the payout address under a
+throwaway sender key, so only the payout wallet can open it. The chain computes the note's
+commitment from the height of the block that applies the transaction, which this command predicts
+as the next block and prints; a transaction that lands at a different height still creates the note
+and still pays it, but the payout wallet will not find it by scanning.
 
 There is no `--alloc-each`: a shielded chain has no per-validator allocation, because value only
 exists as a note someone holds the spend key for. Each `--alloc` builds one deposit note with
@@ -111,7 +132,7 @@ refused.
 | `--listen <LISTEN>` | `/ip4/0.0.0.0/tcp/30303` | libp2p listen multiaddr, repeatable |
 | `--bootstrap <BOOTSTRAP>` | none, repeatable | peer to dial at start and every 30 s while disconnected: `/ip4/<ip>/tcp/<port>/p2p/<peer-id>` |
 | `--rpc <RPC>` | `127.0.0.1:8545` | JSON-RPC listen address; bind `0.0.0.0` only behind a firewall |
-| `--validator` | off | vote and propose; the key must be in the genesis validator set, otherwise the node warns and runs as an observer |
+| `--validator` | off | this node holds a validator key and takes part in consensus. A key in no current epoch's set observes until an epoch admits it, so a validator that bonds in after genesis needs no restart; `shrugg_status` reports `is_validator` (the key is here) and `active_validator` (it is in the current set) separately |
 | `--no-mdns` | off | disable LAN discovery (recommended on servers) |
 | `--block-interval-ms <MS>` | `1000` | minimum spacing between proposals |
 | `--view-timeout-ms <MS>` | `3000` | base view timeout; doubles per consecutive timeout up to 8x |
