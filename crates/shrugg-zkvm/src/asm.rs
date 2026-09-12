@@ -95,6 +95,19 @@ pub mod ops {
         v.push(ecall());
         v
     }
+    /// M4.2: one Keccak-f[1600] permutation of the `KECCAK_WORDS` words at word address
+    /// `ptr_words` (`a0`, the same `MEM_ADDR` word-address convention `call_poseidon2` uses),
+    /// in place. No second argument — the state's width is fixed.
+    ///
+    /// Mirrors upstream `research/src/asm.rs` verbatim; `asm.rs` is hand-maintained on this side
+    /// (see `deploy/sync-zkvm.sh`'s header), and the vendored `tests/{asm,cheating,e2e,emulator}.rs`
+    /// all call it by name.
+    pub fn call_keccak(ptr_words: i32) -> Vec<Instr> {
+        let mut v = li(REG_A7, SYS_KECCAK as i32);
+        v.extend(li(REG_A0, ptr_words));
+        v.push(ecall());
+        v
+    }
 }
 
 // ───────────────────────── M3.3: note-layer guest routines ─────────────────────────

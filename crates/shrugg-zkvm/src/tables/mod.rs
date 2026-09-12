@@ -7,6 +7,7 @@ pub mod alu;
 pub mod cpu;
 pub mod poseidon2;
 pub mod input;
+pub mod keccak;
 
 pub type F = p3_goldilocks::Goldilocks;
 
@@ -45,6 +46,14 @@ pub mod bus {
     pub const POW2: LookupBus<'static> = LookupBus::new("POW2");
     /// (in0..7, out0..7): a width-8 Poseidon2 permutation. Poseidon2 table provides.
     pub const POSEIDON2: LookupBus<'static> = LookupBus::new("POSEIDON2");
+    /// M4.2 — cpu (SYS_KECCAK rows) → keccak: (clk, ptr). The keccak table provides one entry
+    /// per real 32-row block, on the block's last round row, with count `MULT`. The message is
+    /// deliberately *just* the clk/ptr pair and not the 100 permuted words: the permutation's
+    /// input and output never travel on this bus at all, they travel on `MEMORY` — the keccak
+    /// chip sends its own 50 reads at `ts = 4·clk` and 50 writes at `ts = 4·clk + 1`, which is
+    /// what actually ties the permutation to the guest's RAM. `(clk, ptr)` is only the handle
+    /// that makes the cpu's syscall row and the chip's block the same event.
+    pub const KECCAK: LookupBus<'static> = LookupBus::new("KECCAK");
 }
 
 /// Split a u32 into four little-endian bytes as field elements.

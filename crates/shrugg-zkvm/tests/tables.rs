@@ -151,7 +151,12 @@ fn every_legal_encoding(rng: &mut StdRng) -> Vec<u32> {
     use shrugg_zkvm::asm::ops::*;
     use shrugg_zkvm::isa::BranchCond;
     let r = |rng: &mut StdRng| -> u32 { rand_u32(rng) % 32 };
-    let imm = |rng: &mut StdRng| -> i32 { rand_u32(rng) as i32 };
+    // Audit ZM3 (2026-09-12): in-range immediates only — `Instr::encode` now *asserts* the
+    // field widths instead of silently truncating, and this helper used to rely on the
+    // truncation (an unwitting live demonstration of the bug).
+    let imm = |rng: &mut StdRng| -> i32 { (rand_u32(rng) % 4096) as i32 - 2048 }; // 12-bit signed
+    let bimm = |rng: &mut StdRng| -> i32 { ((rand_u32(rng) % 8192) as i32 - 4096) & !1 }; // 13-bit signed, even
+    let jimm = |rng: &mut StdRng| -> i32 { ((rand_u32(rng) % (1 << 21)) as i32 - (1 << 20)) & !1 }; // 21-bit signed, even
     let shamt = |rng: &mut StdRng| -> u32 { rand_u32(rng) % 32 };
     let mut out = Vec::new();
     let (rd, rs1, rs2) = (r(rng), r(rng), r(rng));
@@ -169,9 +174,9 @@ fn every_legal_encoding(rng: &mut StdRng) -> Vec<u32> {
     out.push(jalr(rd, rs1, imm(rng)).encode());
     out.push(ecall().encode());
     for cond in [BranchCond::Eq, BranchCond::Ne, BranchCond::Lt, BranchCond::Ge, BranchCond::Ltu, BranchCond::Geu] {
-        out.push((Instr::Branch { cond, rs1, rs2, imm: imm(rng) as u32 }).encode());
+        out.push((Instr::Branch { cond, rs1, rs2, imm: bimm(rng) as u32 }).encode());
     }
-    out.push((Instr::Jal { rd, imm: imm(rng) as u32 }).encode());
+    out.push((Instr::Jal { rd, imm: jimm(rng) as u32 }).encode());
     out
 }
 
@@ -290,7 +295,9 @@ fn memory_trace_is_sorted_and_consistent() {
     let accesses: usize = e.events.iter().map(|c| c.accesses.len()).sum();
     let real: usize = (0..t.height()).filter(|r| t.values[r * w + memory::col::IS_REAL] == F::ONE).count();
     assert_eq!(real, accesses);
-    let key = |r: usize| t.values[r * w + memory::col::SPACE].as_canonical_u64() << 30 | t.values[r * w + memory::col::ADDR].as_canonical_u64();
+    // Audit ZM2 (2026-09-12): `+`, mirroring both the AIR's own key arithmetic and
+    // `memory_trace`'s — `|` only coincides with it below `addr < 2^30`.
+    let key = |r: usize| (t.values[r * w + memory::col::SPACE].as_canonical_u64() << 30) + t.values[r * w + memory::col::ADDR].as_canonical_u64();
     let ts = |r: usize| t.values[r * w + memory::col::TS].as_canonical_u64();
     for r in 0..real - 1 {
         assert!((key(r), ts(r)) < (key(r + 1), ts(r + 1)), "row {r} not sorted");
@@ -587,7 +594,8 @@ fn div_family_lookup_counts_per_op() {
 /// what actually ships, not a hand-recount. No proving: `ProverData::from_airs_and_degrees`
 /// only commits the preprocessed columns and walks the symbolic constraint tree: sub-second.
 ///
-/// Chip order is `machine::chips()`'s: program, cpu, memory, alu, range, nibble, poseidon2.
+/// Chip order is `machine::chips()`'s: program, cpu, memory, alu, range, nibble, poseidon2,
+/// input, keccak.
 ///
 /// If any of these numbers moves, re-measure (this test will fail with the new number) and:
 /// - update the assertion and its comment below,
@@ -603,8 +611,29 @@ fn alu_max_constraint_degree_is_pinned() {
     // any declared program height give the same numbers. `Tier(10)`/`MIN_LOG_HEIGHT` (the
     // smallest of each) are used only because `max_constraint_degrees` needs concrete values
     // to size the tables.
-    let degrees = max_constraint_degrees(Tier(10), MIN_LOG_HEIGHT, shrugg_zkvm::tables::input::MIN_LOG_HEIGHT);
-    assert_eq!(degrees.len(), 8, "one degree per chip in machine::chips() order");
+    // M4.2 (Task 6): the keccak table is optional per proof, so `chips()` — and therefore this
+    // list — has two shapes. Pin both. `klh = 0` is the eight-chip batch a keccak-free proof
+    // uses; `klh = keccak::MIN_LOG_HEIGHT` is the nine-chip one. Every shared table's degree
+    // must be identical between them: dropping an instance changes the batch's instance count,
+    // not any other AIR's constraints or its own packed lookups.
+    let keccak_free = max_constraint_degrees(
+        Tier(10),
+        MIN_LOG_HEIGHT,
+        shrugg_zkvm::tables::input::MIN_LOG_HEIGHT,
+        0,
+        Tier(10).min_mem_log_height(),
+    );
+    assert_eq!(keccak_free.len(), 8, "eight chips when the proof declares no keccak table");
+
+    let degrees = max_constraint_degrees(
+        Tier(10),
+        MIN_LOG_HEIGHT,
+        shrugg_zkvm::tables::input::MIN_LOG_HEIGHT,
+        shrugg_zkvm::tables::keccak::MIN_LOG_HEIGHT,
+        Tier(10).min_mem_log_height(),
+    );
+    assert_eq!(degrees.len(), 9, "one degree per chip in machine::chips() order");
+    assert_eq!(keccak_free[..], degrees[..8], "the other eight tables are unaffected");
 
     // program: M3.4's main-trace in-circuit decoder. Every one-hot flag pin
     // (`flag*(op-code)=0`) and field-consistency equation is at most degree 2 in the
@@ -650,6 +679,14 @@ fn alu_max_constraint_degree_is_pinned() {
     // `IS_REAL * MULT_READ` on `INPUT_READ` (degree 2) — no table here is anywhere close to
     // the degree-8 ceiling.
     assert_eq!(degrees[7], 2, "input table max constraint degree");
+
+    // keccak (M4.2): measured max is 3, exactly the module doc's own claim — the three cubic
+    // rules that must be cubic (`xor3`, the parity triple product, χ's `p ⊕ (¬q ∧ r)`), with
+    // every other rule written to stay at or below that (rule 5 deliberately spelled
+    // `is_round · A = Σ …` rather than `is_round · (A − Σ …)` to avoid a fourth degree). The
+    // chip's own packed `MEMORY`/`KECCAK` lookups — selector-weighted message columns times a
+    // degree-2 `IS_REAL · sel_sum` count — don't raise it either.
+    assert_eq!(degrees[8], 3, "keccak table max constraint degree");
 }
 
 mod poseidon2_tests {
@@ -900,5 +937,70 @@ mod poseidon2_tests {
         let pd = ProverData::from_instances(&config, &instances);
         let proof = prove_batch(&config, &instances, &pd);
         verify_batch(&config, &airs, &proof, &[vec![], vec![]], &pd.common).unwrap();
+    }
+}
+
+mod keccak_tests {
+    use super::*;
+    use shrugg_zkvm::keccak::RC;
+    use shrugg_zkvm::tables::keccak::{self, col, pre, KeccakAir, BLOCK, ROUNDS};
+
+    /// M4.2 Task 3, Step 4 — the preprocessed trace's one-hot pattern and round-constant bits,
+    /// and the pinned main width (`4 + 100 + 100 + 320 + 320 + 1600 + 100 + 64 + 4`).
+    #[test]
+    fn keccak_preprocessed_trace_has_the_right_shape() {
+        assert_eq!(col::WIDTH, 2612, "keccak main width");
+        assert_eq!(pre::WIDTH, 24 + 3 + 8 + 64, "keccak preprocessed width");
+
+        let height = BLOCK * 2;
+        let p: RowMajorMatrix<F> = KeccakAir::preprocessed_trace_at(height);
+        assert_eq!(p.height(), height);
+        assert_eq!(p.width(), pre::WIDTH);
+        let row = |r: usize| -> &[F] { &p.values[r * pre::WIDTH..(r + 1) * pre::WIDTH] };
+
+        for r in 0..height {
+            let want_first = r % BLOCK == 0;
+            let want_last = r % BLOCK == ROUNDS - 1;
+            let want_idle = r % BLOCK >= ROUNDS;
+            assert_eq!(row(r)[pre::IS_FIRST], F::from_bool(want_first), "IS_FIRST row {r}");
+            assert_eq!(row(r)[pre::IS_LAST_ROUND], F::from_bool(want_last), "IS_LAST_ROUND row {r}");
+            assert_eq!(row(r)[pre::IS_IDLE], F::from_bool(want_idle), "IS_IDLE row {r}");
+            // Exactly one of the 24 round selectors on a round row, none on an idle row; and
+            // exactly one of the 8 idle selectors on an idle row, none on a round row.
+            let n_round: usize = (0..ROUNDS).filter(|&i| row(r)[pre::IS_ROUND0 + i] == F::ONE).count();
+            let n_idle: usize = (0..8).filter(|&i| row(r)[pre::IS_IDLE0 + i] == F::ONE).count();
+            assert_eq!(n_round, usize::from(!want_idle), "round one-hot row {r}");
+            assert_eq!(n_idle, usize::from(want_idle), "idle one-hot row {r}");
+            if !want_idle {
+                assert_eq!(row(r)[pre::IS_ROUND0 + r % BLOCK], F::ONE, "round selector row {r}");
+            } else {
+                assert_eq!(row(r)[pre::IS_IDLE0 + (r % BLOCK - ROUNDS)], F::ONE, "idle selector row {r}");
+            }
+        }
+        // IS_FIRST at rows 0 and 32 only, IS_LAST_ROUND at 23 and 55, IS_IDLE on 24..31, 56..63
+        // — spelled out, as the brief asks, on top of the generic sweep above.
+        for r in [0usize, 32] { assert_eq!(row(r)[pre::IS_FIRST], F::ONE); }
+        for r in [23usize, 55] { assert_eq!(row(r)[pre::IS_LAST_ROUND], F::ONE); }
+        for r in (24..32).chain(56..64) { assert_eq!(row(r)[pre::IS_IDLE], F::ONE, "row {r}"); }
+
+        // RC bits: row 0 is RC[0] == 1, row 23 is RC[23], and every idle row is all zero.
+        for (r, want) in [(0usize, RC[0]), (23, RC[23]), (7, RC[7]), (32, RC[0]), (55, RC[23])] {
+            for z in 0..64 {
+                let bit = F::from_bool((want >> z) & 1 == 1);
+                assert_eq!(row(r)[pre::RC0 + z], bit, "RC bit {z} of row {r}");
+            }
+        }
+        for r in 24..32 {
+            for z in 0..64 { assert_eq!(row(r)[pre::RC0 + z], F::ZERO, "RC bit {z} of idle row {r}"); }
+        }
+        // The pattern repeats identically block to block.
+        assert_eq!(row(32), row(0));
+        assert_eq!(row(63), row(31));
+        assert_eq!(keccak::MIN_LOG_HEIGHT, 5);
+        // M4.2 (controller ruling 2): the upper bound is the tier's, not a flat constant of
+        // this module's — one permutation costs one cycle, so `klh <= t + 5`.
+        use shrugg_zkvm::machine::Tier;
+        assert_eq!(Tier(10).max_keccak_log_height(), 15);
+        assert_eq!(Tier(20).max_keccak_log_height(), 25);
     }
 }

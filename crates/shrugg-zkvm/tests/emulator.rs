@@ -45,6 +45,24 @@ fn poseidon2_over_the_word_limit_is_rejected() {
     assert_eq!(err, ExecError::Poseidon2WordCount(POSEIDON2_MAX_WORDS + 1));
 }
 
+/// Audit ZM4 (2026-09-12): `ptr >= 2^30` emulates fine but can never satisfy the AIR (the cpu
+/// table bounds `HASH_PTR < 2^30` via the ecall row's `HP0..3`/`HP3_HI` decomposition), so the
+/// emulator — the crate's reference semantics — rejects it, and the boundary pointer just
+/// below still runs.
+#[test]
+fn poseidon2_pointer_at_or_above_2_to_the_30_is_an_execution_error() {
+    let mut a = Assembler::new(0);
+    a.extend(call_poseidon2(1 << 30, 4)); // ptr words = 2^30
+    a.extend(halt());
+    let err = execute(&a.assemble(), &[], 1 << 16).unwrap_err();
+    assert_eq!(err, ExecError::Poseidon2Ptr(1 << 30));
+
+    let mut a = Assembler::new(0);
+    a.extend(call_poseidon2(((1u32 << 30) - 8) as i32, 4)); // every derived address stays < 2^30
+    a.extend(halt());
+    run(&a.assemble(), &[]);
+}
+
 #[test]
 fn sub_word_loads_and_stores_match_the_spec() {
     let mut a = Assembler::new(0);
@@ -291,4 +309,70 @@ fn muldiv_covers_every_op() {
     ];
     let acc = folded.iter().fold(0u32, |a, (op, l, r)| a ^ op.eval(*l, *r));
     assert_eq!(e.outputs[0], acc);
+}
+
+/// M4.2: `SYS_KECCAK` permutes the 50 words at the **word** address in `a0` in place, in
+/// exactly one cpu row (`next_pc = pc + 4`) — the chip, not the cpu table, does the 24 rounds.
+/// The 100 RAM accesses it makes (50 reads at slot 0, then 50 writes at slot 1) are kept in
+/// `keccak_accesses`, apart from the ecall row's own register accesses, because Task 4's keccak
+/// table is what sends them on the `MEMORY` bus; the memory *table* still records all of them.
+#[test]
+fn sys_keccak_permutes_fifty_words_in_place_in_one_cycle() {
+    use shrugg_zkvm::keccak::{keccak_f, state_to_words, words_to_state};
+    const BUF: i32 = 0x400; // byte address; word address 0x100
+    const T0: u32 = 5;
+    const T1: u32 = 6;
+    let mut a = Assembler::new(0);
+    // store words 0..50 = w at BUF, call KECCAK, publish word 0 and word 49
+    for w in 0..50u32 {
+        a.extend(li(T0, (w * 0x0101_0101 + 7) as i32));
+        a.push(sw(REG_ZERO, T0, BUF + 4 * w as i32));
+    }
+    a.extend(call_keccak(BUF / 4));
+    a.push(lw(T1, REG_ZERO, BUF));
+    a.extend(write_output(0, T1));
+    a.push(lw(T1, REG_ZERO, BUF + 4 * 49));
+    a.extend(write_output(1, T1));
+    a.extend(halt());
+    let exec = run(&a.assemble(), &[]);
+    let mut expected = words_to_state(&std::array::from_fn(|w| (w as u32) * 0x0101_0101 + 7));
+    keccak_f(&mut expected);
+    let words = state_to_words(&expected);
+    assert_eq!(exec.outputs[0], words[0]);
+    assert_eq!(exec.outputs[1], words[49]);
+    let ev = exec.events.iter().find(|e| matches!(e.sys, Some(Syscall::Keccak { .. }))).unwrap();
+    let row = ev.keccak_row.as_ref().unwrap();
+    assert_eq!(row.ptr, (BUF / 4) as u32);
+    assert_eq!(row.output, words);
+    assert_eq!(ev.keccak_accesses.len(), 100);
+    assert!(ev.keccak_accesses[..50].iter().all(|m| !m.is_write && m.slot == 0));
+    assert!(ev.keccak_accesses[50..].iter().all(|m| m.is_write && m.slot == 1));
+    assert_eq!(ev.next_pc, ev.pc + 4, "one cpu row per KECCAK call");
+}
+
+/// M4.2 (controller ruling 2): the AIR bounds a `SYS_KECCAK` row's `HASH_PTR` to
+/// `ptr < 0x3000_0000` (`HP3_HI ∈ {0,1,2}`), so the chip's own `PTR + w` address arithmetic
+/// cannot wrap or alias another `MEMORY` key. The emulator — the reference semantics — must
+/// refuse the same pointers rather than produce a trace no AIR can prove.
+#[test]
+fn a_keccak_pointer_past_the_provable_range_is_an_error() {
+    const T0: u32 = 5;
+    let program = |ptr: u32| {
+        let mut a = Assembler::new(0);
+        a.extend(li(REG_A7, SYS_KECCAK as i32));
+        a.extend(li(REG_A0, ptr as i32));
+        a.push(ecall());
+        a.extend(li(T0, 1));
+        a.extend(write_output(0, T0));
+        a.extend(halt());
+        a.assemble()
+    };
+    let limit = 0x3000_0000u32 - 50;
+    assert!(matches!(
+        execute(&program(limit + 1), &[], 1 << 16),
+        Err(ExecError::KeccakPtrOutOfRange(p)) if p == limit + 1
+    ));
+    // The largest still-permitted pointer runs (and permutes 50 words of untouched zeros).
+    let e = execute(&program(limit), &[], 1 << 16).unwrap();
+    assert_eq!(e.events.iter().filter(|ev| ev.keccak_row.is_some()).count(), 1);
 }

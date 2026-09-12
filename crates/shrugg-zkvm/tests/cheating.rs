@@ -7,11 +7,11 @@
 use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
 use p3_matrix::Matrix;
 use shrugg_zkvm::asm::{ops::*, Assembler};
-use shrugg_zkvm::emulator::{execute, SLOT_W};
+use shrugg_zkvm::emulator::{execute, CycleEvent, HashRow, MemAccess, Syscall, SLOT_W, SPACE_RAM};
 use shrugg_zkvm::guests;
-use shrugg_zkvm::isa::{AluOp, Instr, REG_A0, REG_A1};
-use shrugg_zkvm::machine::{build_traces_salted, FriProfile, Machine, Tier, Traces};
-use shrugg_zkvm::tables::{alu, cpu, limbs, memory, nibble, poseidon2, program, range, F};
+use shrugg_zkvm::isa::{AluOp, Decoded, Instr, Program, REG_A0, REG_A1, REG_A2, REG_A7, SYS_POSEIDON2};
+use shrugg_zkvm::machine::{build_traces_salted, FriProfile, Machine, Tier, Traces, Val};
+use shrugg_zkvm::tables::{alu, cpu, keccak, limbs, memory, nibble, poseidon2, program, range, F};
 
 /// `rejects()`, and the two constraint-panic prefixes it matches (`CONSTRAINT_PANIC` and
 /// `LOOKUP_BALANCE_PANIC`, referred to by name in the comments below), now live in
@@ -868,6 +868,262 @@ fn skipping_the_first_write_back_row_is_rejected() {
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
 }
 
+// ---------------------------------------------------------------------------
+// Audit (2026-09-12) regressions, ZC1/ZC2: free-standing hash rows. Until the entry gates and
+// the `HASH_FIN` pin landed, every hash row-group routing rule was gated on the *current* row
+// already being inside a group — so a cheating witness could splice `IS_HASH_OUT`/`IS_HASH`
+// rows in anywhere, with a free, unbounded `HASH_PTR` (the `SYS_HASH`-gated `HP0..3`
+// decomposition never fires on such rows) and no ecall, no fetch, and (on write-back rows) not
+// even a permutation consumed: arbitrary RAM writes at arbitrary addresses at an
+// attacker-chosen cycle, from which any "execution" can be fabricated. Each test below builds
+// the *complete* attack witness — not just a flipped cell — by feeding a crafted event stream
+// through the honest trace builders, so before the fix it verified outright (RED-verified by
+// re-running these four tests with the new gates commented out; the report records the
+// output); afterwards the named gate is what rejects it.
+
+/// A small guest with one genuine `POSEIDON2` call (`n = 4` words at `0x40`) and `noops`
+/// `addi x0, x0, 0` slots between the hash group and the output write — sacrificial
+/// instructions a spliced row-group can replace without disturbing any register value (a
+/// no-op writes nothing and reads only `x0`'s always-fresh zero), bus count, or public value.
+/// Returns the program and its honest outputs (out0 = 42).
+fn audit_guest(noops: usize) -> (Program, [u32; 8]) {
+    let mut a = Assembler::new(0);
+    a.extend(li(REG_A2, 42));
+    a.extend(li(REG_A7, SYS_POSEIDON2 as i32));
+    a.extend(li(REG_A0, 0x40));
+    a.extend(li(REG_A1, 4));
+    a.push(ecall());
+    for _ in 0..noops { a.push(addi(0, 0, 0)); }
+    a.extend(write_output(0, REG_A2));
+    a.extend(halt());
+    let p = a.assemble();
+    let outputs = execute(&p, &[], 10_000).unwrap().outputs;
+    (p, outputs)
+}
+
+/// Indices of the guest's no-op events in an execution (its only `addi x0, x0, 0`s).
+fn noop_rows(events: &[CycleEvent]) -> Vec<usize> {
+    events.iter().enumerate()
+        .filter(|(_, e)| e.instr == Instr::AluImm { op: AluOp::Add, rd: 0, rs1: 0, imm: 0 })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// A synthetic write-back row event: `IS_HASH_OUT` with the given `fin`, writing `words` at
+/// `ptr + 4·fin .. + 3` with sponge state `state`. `cpu_trace` turns this into a complete
+/// write-back row (`HVL` limbs and the `HIMAX/INV` gadget included) as long as some ecall row
+/// preceded it (its `hash_ptr_n` state) — the row a cheating prover writes by hand.
+fn rogue_write_out(fin: bool, pc: u32, next_pc: u32, ptr: u32, words: [u32; 4], state: [Val; 8]) -> CycleEvent {
+    let base = ptr + if fin { 4 } else { 0 };
+    CycleEvent {
+        clk: 0, // renumbered once the stream is assembled
+        pc, next_pc,
+        instr: Instr::Ecall, // unread on hash rows (`dec` below is what the builder consumes)
+        dec: Decoded::default(),
+        a: 0, b: 0, c: 0, alu_out: 0, tgt: 0, mem_addr: 0, mem_val: 0,
+        sys: None,
+        accesses: (0..4).map(|k| MemAccess { space: SPACE_RAM, addr: base + k as u32, slot: k as u32, value: words[k as usize], is_write: true }).collect(),
+        alu: Vec::new(),
+        hash_row: Some(HashRow::WriteOut { fin, words, state }),
+        keccak_row: None,
+        keccak_accesses: Vec::new(),
+    }
+}
+
+/// Build the full witness for a crafted event stream through the *honest* builders — the same
+/// `build_traces_salted` `Machine::prove` uses (empty inputs, zero salt, tier 10) —
+/// renumbering `clk` contiguously first so `CLK` and the memory timestamps agree.
+fn rogue_traces(p: &shrugg_zkvm::isa::Program, mut events: Vec<CycleEvent>, outputs: [u32; 8]) -> Traces {
+    for (i, e) in events.iter_mut().enumerate() { e.clk = i as u32; }
+    let exec = shrugg_zkvm::emulator::Execution { events, outputs, halted: true };
+    build_traces_salted(p, &[], [0u32; 4], &exec, Tier(10)).unwrap()
+}
+
+/// ZC1, the entry gate `(1 − SYS_HASH − is_hash − is_hash_out)·n(IS_HASH_OUT) = 0`: a
+/// free-standing write-back pair spliced in after an *ordinary* row — the canonical attack.
+/// The pair takes the second no-op's slot, so its predecessor is the first no-op. Eight
+/// zero-word writes land at the stale group pointer `0x40..0x47` (the builder's `hash_ptr_n`
+/// carry), no permutation is consumed, and outputs/`hc` are untouched — pre-fix this verified.
+#[test]
+fn a_free_standing_write_back_pair_after_an_ordinary_row_is_rejected() {
+    let (p, outputs) = audit_guest(2);
+    let honest = execute(&p, &[], 10_000).unwrap();
+    let noops = noop_rows(&honest.events);
+    assert_eq!(noops.len(), 2);
+    let pc = honest.events[noops[1]].pc;
+    let mut events: Vec<CycleEvent> = Vec::new();
+    for (i, e) in honest.events.iter().enumerate() {
+        if i == noops[1] {
+            events.push(rogue_write_out(false, pc, pc, 0x40, [0; 4], [Val::ZERO; 8]));
+            events.push(rogue_write_out(true, pc, pc + 4, 0x40, [0; 4], [Val::ZERO; 8]));
+        } else {
+            events.push(e.clone());
+        }
+    }
+    let m = Machine::new(FriProfile::Test);
+    let t = rogue_traces(&p, events, outputs);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// ZC1, the exit gate `HASH_FIN·n(IS_HASH_OUT) = 0`: the same pair, but spliced directly after
+/// the genuine group's own final write-back row — dressed up as the group's tail. The honest
+/// `HASH_FIN = 1` row must end the group.
+#[test]
+fn a_free_standing_write_back_pair_after_a_hash_group_is_rejected() {
+    let (p, outputs) = audit_guest(1);
+    let honest = execute(&p, &[], 10_000).unwrap();
+    let noops = noop_rows(&honest.events);
+    assert_eq!(noops.len(), 1);
+    let pc = honest.events[noops[0]].pc;
+    let mut events: Vec<CycleEvent> = Vec::new();
+    for (i, e) in honest.events.iter().enumerate() {
+        if i == noops[0] {
+            events.push(rogue_write_out(false, pc, pc, 0x40, [0; 4], [Val::ZERO; 8]));
+            events.push(rogue_write_out(true, pc, pc + 4, 0x40, [0; 4], [Val::ZERO; 8]));
+        } else {
+            events.push(e.clone());
+        }
+    }
+    let m = Machine::new(FriProfile::Test);
+    let t = rogue_traces(&p, events, outputs);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// ZC1, the entry gate `(1 − SYS_HASH − is_hash)·n(IS_HASH) = 0`: a whole rogue "group" —
+/// absorb + two write-backs, no ecall — spliced in place of the first no-op (its predecessor
+/// is the genuine group's `HASH_FIN = 1` row, which is neither `SYS_HASH` nor `IS_HASH`). The
+/// absorb honestly re-reads the four digest words the genuine group just wrote at `0x40..0x43`
+/// (memory stays consistent) and hashes them through one *genuine* permutation — which the
+/// witness really does supply to the POSEIDON2 table; that is not the hole. The hole is the
+/// rogue absorb's free sponge state and pointer, pinned by nothing an ecall would have
+/// provided.
+#[test]
+fn a_free_standing_absorb_group_with_a_forged_state_is_rejected() {
+    let (p, outputs) = audit_guest(2);
+    let honest = execute(&p, &[], 10_000).unwrap();
+    let noops = noop_rows(&honest.events);
+    assert_eq!(noops.len(), 2);
+    // The genuine digest at `0x40..0x47`: the message was four zero words (that region is
+    // never written before the group reads it).
+    let digest = shrugg_zkvm::hash::sponge_hash(&[0, 0, 0, 0]);
+    let mut merged = [Val::ZERO; 8];
+    for k in 0..4 { merged[k] = Val::from_u32(digest[k]); }
+    let state_out = shrugg_zkvm::hash::permute_state(merged);
+    let rehashed = shrugg_zkvm::hash::split_digest([state_out[0], state_out[1], state_out[2], state_out[3]]);
+    let pc = honest.events[noops[0]].pc;
+    let mut events: Vec<CycleEvent> = Vec::new();
+    for (i, e) in honest.events.iter().enumerate() {
+        if i == noops[0] {
+            events.push(CycleEvent {
+                clk: 0, pc, next_pc: pc,
+                instr: Instr::Ecall, dec: Decoded::default(),
+                a: 0, b: 0, c: 0, alu_out: 0, tgt: 0, mem_addr: 0, mem_val: 0,
+                sys: None,
+                accesses: (0..4).map(|k| MemAccess { space: SPACE_RAM, addr: 0x40 + k as u32, slot: k as u32, value: digest[k as usize], is_write: false }).collect(),
+                alu: Vec::new(),
+                hash_row: Some(HashRow::Absorb { idx: 0, left_before: 4, words: [digest[0], digest[1], digest[2], digest[3]], active: [true; 4], state_in: [Val::ZERO; 8], state_out }),
+                keccak_row: None,
+                keccak_accesses: Vec::new(),
+            });
+            events.push(rogue_write_out(false, pc, pc, 0x40, [rehashed[0], rehashed[1], rehashed[2], rehashed[3]], state_out));
+            events.push(rogue_write_out(true, pc, pc + 4, 0x40, [rehashed[4], rehashed[5], rehashed[6], rehashed[7]], state_out));
+        } else {
+            events.push(e.clone());
+        }
+    }
+    let m = Machine::new(FriProfile::Test);
+    let t = rogue_traces(&p, events, outputs);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// ZC2, the pin `HASH_FIN·(1 − IS_HASH_OUT) = 0`: setting `HASH_FIN` on the ecall row drives
+/// `continues` to 0 there, so the rest of the row-group's `HASH_PTR` is no longer a copy of the
+/// ecall row's range-checked one — it becomes a free, unbounded field element on the `MEMORY`
+/// bus (the mod-`p` key-aliasing hole CRITICAL 1 closed, one row later), while the ecall row's
+/// own `NEXT_PC` snaps to `PC + 4` and silently swallows one instruction. The witness below
+/// does the whole thing: the group shifts up by one instruction slot (the no-op vanishes) and
+/// every absorb/write-back row points at `ROGUE_PTR = 2^31`, past the `2^30` bound the ecall's
+/// `HP0..3` decomposition enforces — pre-fix this verified, with the digest written to
+/// `2^31..` instead of `0x40..`.
+#[test]
+fn hash_fin_on_the_ecall_row_detaching_hash_ptr_is_rejected() {
+    const ROGUE_PTR: u32 = 0x8000_0000;
+    let (p, outputs) = audit_guest(1);
+    let honest = execute(&p, &[], 10_000).unwrap();
+    let h = honest.events.iter().position(|e| matches!(e.sys, Some(Syscall::Poseidon2 { .. }))).expect("the poseidon2 ecall");
+    let noops = noop_rows(&honest.events);
+    assert_eq!(noops.len(), 1);
+    assert_eq!(noops[0], h + 4, "the no-op follows the group directly");
+    let mut events: Vec<CycleEvent> = Vec::new();
+    for (i, e) in honest.events.iter().enumerate() {
+        if i == noops[0] { continue; } // the instruction the shifted group lands on: gone
+        let mut e = e.clone();
+        if i == h {
+            e.next_pc = e.pc + 4; // `continues = 0` here once HASH_FIN is set below
+        } else if i == h + 1 || i == h + 2 {
+            e.pc += 4;
+            e.next_pc += 4;
+            for a in &mut e.accesses { a.addr = a.addr - 0x40 + ROGUE_PTR; }
+        } else if i == h + 3 {
+            e.pc += 4;
+            e.next_pc = e.pc + 4;
+            for a in &mut e.accesses { a.addr = a.addr - 0x40 + ROGUE_PTR; }
+        }
+        events.push(e);
+    }
+    let m = Machine::new(FriProfile::Test);
+    let mut t = rogue_traces(&p, events, outputs);
+    // The builders never produce this cell combination — that is exactly the point of the pin:
+    // `HASH_FIN` on the ecall row, and the rest of the group carrying the rogue pointer the
+    // ecall's own bounded one no longer reaches.
+    let w = cpu::col::WIDTH;
+    let (ecall_row, absorbs, writes) = hash_rows(&t);
+    t.cpu.values[ecall_row * w + cpu::col::HASH_FIN] = F::ONE;
+    for r in absorbs.iter().chain(writes.iter()) {
+        t.cpu.values[*r * w + cpu::col::HASH_PTR] = F::from_u32(ROGUE_PTR);
+    }
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// ZC1, the `SYS_KECCAK` classification (controller ruling 2): a `KECCAK` row is an ecall row
+/// of the ordinary shape — one row, `continues` keys off `SYS_HASH` alone — so nothing
+/// hash-shaped may follow it, exactly as for `SYS_WRITE`. Splicing a write-back pair in right
+/// after the genuine `KECCAK` row is therefore the entry gate's business, not a special case:
+/// `SYS_KECCAK` is not in either gate's whitelist, so `n(IS_HASH_OUT)` is forced to zero there.
+#[test]
+fn a_free_standing_write_back_pair_after_a_keccak_row_is_rejected() {
+    // A genuine `POSEIDON2` group first (at `0x40`), then the `KECCAK` call (at `0x100`, clear
+    // of the digest): the rogue pair rides the pointer that group left behind, exactly as in
+    // the ordinary-row test — what differs is only the row it is spliced after.
+    let mut a = Assembler::new(0);
+    a.extend(li(REG_A2, 42));
+    a.extend(call_poseidon2(0x40, 4));
+    a.extend(call_keccak(0x100));
+    a.push(addi(0, 0, 0));
+    a.push(addi(0, 0, 0));
+    a.extend(write_output(0, REG_A2));
+    a.extend(halt());
+    let p = a.assemble();
+    let honest = execute(&p, &[], 100_000).unwrap();
+    let k = honest.events.iter().position(|e| matches!(e.sys, Some(Syscall::Keccak { .. }))).expect("the keccak ecall");
+    let noops = noop_rows(&honest.events);
+    assert_eq!(noops.len(), 2);
+    assert_eq!(noops[0], k + 1, "the first no-op follows the keccak row directly");
+    let pc = honest.events[noops[0]].pc;
+    let mut events: Vec<CycleEvent> = Vec::new();
+    for (i, e) in honest.events.iter().enumerate() {
+        if i == noops[0] {
+            events.push(rogue_write_out(false, pc, pc, 0x40, [0; 4], [Val::ZERO; 8]));
+            events.push(rogue_write_out(true, pc, pc + 4, 0x40, [0; 4], [Val::ZERO; 8]));
+        } else {
+            events.push(e.clone());
+        }
+    }
+    let m = Machine::new(FriProfile::Test);
+    let t = rogue_traces(&p, events, honest.outputs);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
 // M3.4: the program table as a witness trace with an in-circuit decoder, and the digest
 // prefix that computes `hc`.
 
@@ -1384,5 +1640,530 @@ fn a_mult_read_bumped_on_an_input_padding_row_is_rejected() {
     let iw = shrugg_zkvm::tables::input::col::WIDTH;
     assert!(t.input.height() > 4, "the input table has spare padding rows past the 4 real ones");
     t.input.values[4 * iw + shrugg_zkvm::tables::input::col::MULT_READ] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ───────────────────────────── M4.2: the KECCAK syscall ─────────────────────────────
+//
+// `guests::keccak_demo(b"hi")` is one `SYS_KECCAK` cpu row plus one real 32-row keccak block,
+// at tier 10. The block sits first in the keccak table (blocks are filled in event order), so
+// its rows are `0..BLOCK` and every later block is padding.
+
+/// The keccak-side twin of `setup_poseidon2`.
+fn setup_keccak() -> (Machine, shrugg_zkvm::isa::Program, Traces) {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::keccak_demo(b"hi");
+    let e = execute(&p, &[], 10_000).unwrap();
+    let t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
+    (m, p, t)
+}
+
+/// A keccak table that actually has a padding block to forge on. M4.2 Task 6 made the table
+/// optional, so a keccak-free guest no longer carries one at all, and `setup_keccak`'s single
+/// permutation fills its one block exactly (`klh = 5`, 32 rows, all real). Three permutations
+/// need three 32-row blocks rounded up to `2^7 = 128` rows, i.e. four blocks — blocks 0..=2
+/// real, **block 3 padding**.
+fn setup_keccak_with_a_padding_block() -> (Machine, shrugg_zkvm::isa::Program, Traces) {
+    const BUF: i32 = 0x1000;
+    let m = Machine::new(FriProfile::Test);
+    let mut a = Assembler::new(0);
+    a.extend(li(8, BUF));
+    for _ in 0..3 {
+        a.extend(call_keccak(BUF / 4));
+    }
+    a.extend(halt());
+    let p = a.assemble();
+    let e = execute(&p, &[], 10_000).unwrap();
+    let t = build_traces_salted(&p, &[], [0u32; 4], &e, Tier(10)).unwrap();
+    assert_eq!(t.keccak_log_height, 7, "three blocks rounded up to four");
+    (m, p, t)
+}
+
+/// The cpu-table row index of the one `SYS_KECCAK` ecall row.
+fn keccak_row(t: &Traces) -> usize {
+    let w = cpu::col::WIDTH;
+    (0..t.cpu.height())
+        .find(|&r| t.cpu.values[r * w + cpu::col::SYS_KECCAK] == F::ONE)
+        .expect("a SYS_KECCAK row")
+}
+
+/// A flipped state bit inside the permutation is pinned three ways at once (rule 5 recomputes
+/// this row's `A` limb from it, rule 6 the column parity, rule 7 feeds it to χ) and, past
+/// those, changes the output the chip writes back to RAM.
+#[test]
+fn tampering_a_keccak_state_bit_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    let w = keccak::col::WIDTH;
+    let cell = 5 * w + keccak::col::AP0 + 100;
+    let kt = t.keccak.as_mut().expect("keccak_demo declares a keccak table");
+    kt.values[cell] = F::ONE - kt.values[cell];
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// Rule 11's `IS_LAST_ROUND·(IS_REAL − MULT) = 0`: a padding block cannot claim a `KECCAK`
+/// entry it has no syscall behind. The forged entry has no consumer either, so the `KECCAK`
+/// bus is left unbalanced on top of the local constraint failure. (Before M4.2 Task 6 this
+/// used `guests::fib`, whose keccak table was the one padding block every proof carried; the
+/// table is optional now, so the padding block has to come from a guest that genuinely has
+/// one — three permutations rounded up to four blocks.)
+#[test]
+fn bumping_keccak_mult_on_a_padding_block_is_rejected() {
+    let (m, p, mut t) = setup_keccak_with_a_padding_block();
+    let kt = t.keccak.as_mut().expect("this guest declares a keccak table");
+    let w = keccak::col::WIDTH;
+    let row = 3 * keccak::BLOCK + keccak::ROUNDS - 1; // block 3's last round row
+    assert_eq!(kt.values[row * w + keccak::col::IS_REAL], F::ZERO, "block 3 is padding");
+    kt.values[row * w + keccak::col::MULT] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M4.2 (Task 6): the cpu table is unchanged by making the keccak table optional — it is the
+/// *bus* that does the work. Take `keccak_demo`'s honest traces, drop the keccak table
+/// entirely (exactly the shape a keccak-free proof has) and leave the real `SYS_KECCAK` cpu row
+/// in place: the `KECCAK` bus now has a consumer and no provider at all, so it cannot balance.
+/// This is the check that makes "no keccak table" safe rather than merely smaller.
+#[test]
+fn a_keccak_syscall_without_a_keccak_table_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    assert_eq!(t.keccak_log_height, 5, "the honest witness declares one block");
+    assert_eq!(t.cpu.height(), Tier(10).cpu_height());
+    let w = cpu::col::WIDTH;
+    let row = keccak_row(&t);
+    assert_eq!(t.cpu.values[row * w + cpu::col::SYS_KECCAK], F::ONE, "the syscall row stays");
+    t.keccak = None;
+    t.keccak_log_height = 0;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `IN` is block-constant (rule 1) and equals `A` on row 0 (rule 2), and it is what the chip's
+/// 50 read messages carry — so bumping it uniformly across the block keeps rules 1/2 happy
+/// (row 0's `A` moves with it) and instead breaks the `MEMORY` permutation against the words
+/// the guest actually stored.
+#[test]
+fn a_keccak_input_limb_that_disagrees_with_memory_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    let w = keccak::col::WIDTH;
+    let kt = t.keccak.as_mut().expect("keccak_demo declares a keccak table");
+    for r in 0..keccak::BLOCK {
+        kt.values[r * w + keccak::col::IN0] += F::ONE;
+    }
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// The idle rows' `A` is the permutation's output — what the 50 write-back messages carry.
+/// Bumping it there changes the value written to RAM (and trips rules 9/10, which pin the idle
+/// rows' `A` to the last round's own output).
+#[test]
+fn a_keccak_output_limb_that_disagrees_with_the_permutation_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    let w = keccak::col::WIDTH;
+    let kt = t.keccak.as_mut().expect("keccak_demo declares a keccak table");
+    for r in keccak::ROUNDS..keccak::BLOCK {
+        kt.values[r * w + keccak::col::A0] += F::ONE;
+    }
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `SYS_KECCAK` joins the `SELECTORS` padding-row gate — and, set on an all-zero padding row,
+/// also asks the `KECCAK` bus for an entry at `(0, 0)` that nothing provides (M4.2 Task 6:
+/// `guests::fib` declares no keccak table at all now, so there is not even a padding block on
+/// the other side of that bus).
+#[test]
+fn bumping_sys_keccak_on_a_padding_row_is_rejected() {
+    let (m, p, mut t) = setup();
+    assert_eq!(t.keccak_log_height, 0, "a keccak-free guest carries no keccak table");
+    let w = cpu::col::WIDTH;
+    let pad = t.cpu.height() - 1;
+    assert_eq!(t.cpu.values[pad * w + cpu::col::IS_REAL], F::ZERO, "last cpu row is padding");
+    t.cpu.values[pad * w + cpu::col::SYS_KECCAK] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `an_unbounded_hash_ptr_that_aliases_a_register_key_is_rejected`'s `SYS_KECCAK` twin: the
+/// chip does field addition `PTR + w` for `w < 50` and nothing in the *chip* bounds `PTR`, so
+/// the cpu row's `HASH_PTR` limb decomposition (`HP0..3`/`HP3_HI`, now gated on `SYS_HASH +
+/// SYS_KECCAK`) is what keeps the address off any other `MEMORY` key. Leaving the limbs at
+/// their honest values makes this trip the recomposition equation directly.
+#[test]
+fn an_unbounded_keccak_ptr_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    let w = cpu::col::WIDTH;
+    let row = keccak_row(&t);
+    t.cpu.values[row * w + cpu::col::HASH_PTR] = F::from_u32(REG_A0) - F::from_u64(1u64 << 30);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// The `KECCAK` bus in the other direction: a syscall row whose permutation is not in the
+/// keccak table at all (the real block demoted to padding) has no provider for its lookup —
+/// and the 100 `MEMORY` messages the block no longer sends leave that bus unbalanced too.
+#[test]
+fn a_keccak_call_whose_permutation_is_missing_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    let w = keccak::col::WIDTH;
+    let kt = t.keccak.as_mut().expect("keccak_demo declares a keccak table");
+    for r in 0..keccak::BLOCK {
+        kt.values[r * w + keccak::col::IS_REAL] = F::ZERO;
+        kt.values[r * w + keccak::col::MULT] = F::ZERO;
+    }
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ── M4.2 controller ruling 2: the tier is the keccak table's one ceiling ──
+
+/// `proof.keccak_log_height` is prover-declared and untrusted, and it sizes both the keccak
+/// table's own AIR instance and (before it) the verifier key. A permutation costs a cycle, so a
+/// tier-10 proof can honestly need at most `t + 5 = 15`; anything past that is a request for a
+/// table with more permutation slots than the tier has cycles. The check runs before
+/// `log_ext_degrees` and before `verifier_key`, so the attacker's matching `degree_bits` edit
+/// (which is what they would have to do to get past the degree-bits equality check) buys them
+/// nothing — and the verifier never pays for a preprocessed-commitment recomputation, which
+/// `cached_keys() == 0` is the observable proof of.
+#[test]
+fn a_keccak_height_past_the_tiers_ceiling_is_rejected_before_any_verifier_key_is_built() {
+    use shrugg_zkvm::machine::VerifyError;
+    let prover = Machine::new(FriProfile::Test);
+    // M4.2 (Task 6): a guest that actually calls `KECCAK`, so the honest proof carries the
+    // ninth instance and the attacker's `degree_bits` edit below has a keccak entry to edit.
+    let p = guests::keccak_demo(b"hi");
+    let (mut proof, _) = prover.prove_salted(&p, &[], [0; 4], Some(Tier(10))).unwrap();
+    assert_eq!(proof.keccak_log_height, 5);
+    assert_eq!(proof.batch.degree_bits.len(), 9);
+    assert_eq!(Tier(10).max_keccak_log_height(), 15);
+    // `t + 6`, with `degree_bits` adjusted to match (the keccak instance is last in `chips()`
+    // order; `+ 1` is the hiding config's `is_zk`).
+    proof.keccak_log_height = 16;
+    let last = proof.batch.degree_bits.len() - 1;
+    proof.batch.degree_bits[last] = 16 + 1;
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::KeccakHeightExceedsTier)));
+    assert_eq!(verifier.cached_keys(), 0, "the range check must precede the verifier key");
+}
+
+/// The lower bound's other half, now that M4.2 Task 6 has carved `0` out of it: `0` means "no
+/// keccak table" and is legal, but any *other* value below one full 32-row block is still
+/// nonsense — a table too short to hold the permutation it claims — and is rejected before it
+/// can size anything.
+#[test]
+fn a_nonzero_keccak_height_below_one_block_is_rejected_before_any_verifier_key_is_built() {
+    use shrugg_zkvm::machine::VerifyError;
+    let prover = Machine::new(FriProfile::Test);
+    let p = guests::keccak_demo(b"hi");
+    let (mut proof, _) = prover.prove_salted(&p, &[], [0; 4], Some(Tier(10))).unwrap();
+    assert_eq!(proof.keccak_log_height, 5);
+    proof.keccak_log_height = 3;
+    let last = proof.batch.degree_bits.len() - 1;
+    proof.batch.degree_bits[last] = 3 + 1;
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::KeccakHeight)));
+    assert_eq!(verifier.cached_keys(), 0, "the range check must precede the verifier key");
+}
+
+/// The memory table's declared height (controller ruling 1) gets the same treatment on its own
+/// lower bound: a proof cannot declare less than the tier's `2^(t+2)` floor, which is what
+/// keeps the declaration from revealing a guest's memory-access count below the resolution the
+/// tier already publishes.
+#[test]
+fn a_memory_height_below_the_tier_floor_is_rejected_before_any_verifier_key_is_built() {
+    use shrugg_zkvm::machine::VerifyError;
+    let prover = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let (mut proof, _) = prover.prove_salted(&p, &[], [0; 4], Some(Tier(10))).unwrap();
+    assert_eq!(proof.mem_log_height, 12);
+    proof.mem_log_height = 11;
+    proof.batch.degree_bits[2] = 11 + 1; // memory is instance 2 in `chips()` order
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::MemoryHeight)));
+    assert_eq!(verifier.cached_keys(), 0);
+}
+
+/// M4.2 (Task 5 review): the tier bound is not the *only* keccak ceiling, because it is not a
+/// cheap one at the top tier. `Tier(20).max_keccak_log_height()` is 25, so a tier-20 header
+/// declaring `klh = 25` passes that relation and would have the verifier build a 2^25-row,
+/// 99-column preprocessed keccak trace before any later check could reject the proof. The flat
+/// `tables::keccak::MAX_LOG_HEIGHT = 20` is what refuses it, as `VerifyError::KeccakHeight`.
+///
+/// Checked through `machine::check_declared_heights` rather than a real proof on purpose: the
+/// forgery only *bites* at tier 20, and a tier-20 proof is 2^20 cpu rows — far outside what this
+/// suite can afford to prove — while the declared shape is exactly what the check reads. The
+/// test below pairs this with the `cached_keys() == 0` evidence on a proof the suite can afford.
+#[test]
+fn a_keccak_height_past_the_absolute_cap_is_rejected_where_the_tier_bound_would_admit_it() {
+    use shrugg_zkvm::machine::{check_declared_heights, VerifyError};
+    let (plh, ilh) = (program::MIN_LOG_HEIGHT, shrugg_zkvm::tables::input::MIN_LOG_HEIGHT);
+    let mlh = Tier(20).min_mem_log_height();
+    // The tier relation alone admits everything up to 25 here.
+    assert_eq!(Tier(20).max_keccak_log_height(), 25);
+    assert_eq!(keccak::MAX_LOG_HEIGHT, 20);
+    for klh in [21, 24, 25, u8::MAX] {
+        assert!(
+            matches!(check_declared_heights(Tier(20), plh, ilh, klh, mlh), Err(VerifyError::KeccakHeight)),
+            "klh = {klh} is past the absolute cap and must be refused by the range check",
+        );
+    }
+    // The cap itself, and everything under it, still passes the declared-shape checks at a tier
+    // whose own bound is looser — this is a ceiling, not a narrowing of what tier 20 may declare.
+    for klh in [0, keccak::MIN_LOG_HEIGHT, 19, keccak::MAX_LOG_HEIGHT] {
+        assert!(check_declared_heights(Tier(20), plh, ilh, klh, mlh).is_ok(), "klh = {klh} is legal at tier 20");
+    }
+    // And where the tier is the tighter of the two, the tier variant is still what a forgery
+    // earns: at tier 10 anything in `16..=20` is flat-legal but past `t + 5`.
+    assert!(matches!(
+        check_declared_heights(Tier(10), plh, ilh, 16, Tier(10).min_mem_log_height()),
+        Err(VerifyError::KeccakHeightExceedsTier)
+    ));
+    assert!(matches!(
+        check_declared_heights(Tier(10), plh, ilh, 21, Tier(10).min_mem_log_height()),
+        Err(VerifyError::KeccakHeight),
+    ), "past both bounds is reported by the range check, which runs first");
+}
+
+/// The same cap on a real proof, for the half `check_declared_heights` alone cannot show: that it
+/// runs before the verifier key is built. A tier-10 proof forged to `klh = 25` (`degree_bits`
+/// edited to match, which is what the attacker would have to do to reach the equality check)
+/// is refused for a comparison's worth of work, not a preprocessed-commitment recomputation.
+#[test]
+fn a_keccak_height_past_the_absolute_cap_is_rejected_before_any_verifier_key_is_built() {
+    use shrugg_zkvm::machine::VerifyError;
+    let prover = Machine::new(FriProfile::Test);
+    let p = guests::keccak_demo(b"hi");
+    let (mut proof, _) = prover.prove_salted(&p, &[], [0; 4], Some(Tier(10))).unwrap();
+    assert_eq!(proof.keccak_log_height, 5);
+    proof.keccak_log_height = 25;
+    let last = proof.batch.degree_bits.len() - 1;
+    proof.batch.degree_bits[last] = 25 + 1;
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::KeccakHeight)));
+    assert_eq!(verifier.cached_keys(), 0, "the range check must precede the verifier key");
+}
+
+/// The memory table's upper bound (controller ruling 1), the half the lower-bound test above
+/// does not cover: `MAX_MEM_LOG_HEIGHT` is the defensive ceiling on an untrusted shift amount,
+/// and a declaration past it is refused before anything is sized from it.
+#[test]
+fn a_memory_height_past_the_ceiling_is_rejected_before_any_verifier_key_is_built() {
+    use shrugg_zkvm::machine::{check_declared_heights, VerifyError, MAX_MEM_LOG_HEIGHT};
+    let prover = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let (mut proof, _) = prover.prove_salted(&p, &[], [0; 4], Some(Tier(10))).unwrap();
+    assert_eq!(proof.mem_log_height, 12);
+    assert_eq!(MAX_MEM_LOG_HEIGHT, 24);
+    proof.mem_log_height = 25;
+    proof.batch.degree_bits[2] = 25 + 1; // memory is instance 2 in `chips()` order
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::MemoryHeight)));
+    assert_eq!(verifier.cached_keys(), 0, "the range check must precede the verifier key");
+    // The same bound at a tier where it is reachable in principle (tier 20's floor is 22), so
+    // the ceiling is doing its own work rather than standing behind the tier floor.
+    let (plh, ilh, klh) = (program::MIN_LOG_HEIGHT, shrugg_zkvm::tables::input::MIN_LOG_HEIGHT, 0);
+    assert!(check_declared_heights(Tier(20), plh, ilh, klh, 24).is_ok());
+    assert!(matches!(check_declared_heights(Tier(20), plh, ilh, klh, 25), Err(VerifyError::MemoryHeight)));
+}
+
+// ── M4.2 controller ruling 3: the cubic pointer rule on a SYS_KECCAK cpu row ──
+//
+// `SYS_KECCAK · HP3_HI · (HP3_HI − 1) · (HP3_HI − 2) = 0` (`tables::cpu`'s eval) is the rule
+// that tightens the keccak pointer from the `AND4[HP3_HI, 0xC, 0]` lookup's `ptr < 2^30` to
+// `ptr < 0x3000_0000`, so that the chip's own `PTR + w` (`w < 50`) address arithmetic stays
+// inside the range the `AND4` bound covers. `HP3_HI = 3` is exactly the value the lookup admits
+// and the cubic must not.
+//
+// A `Traces` tamper cannot express it: `HASH_PTR` is pinned equal to `B` (the `a0` register
+// value the ecall row reads over `MEMORY`), so moving the pointer's top nibble means moving the
+// register value the guest actually held, and every limb, lookup receipt and memory message
+// that follows from it. And the emulator refuses the pointer outright
+// (`ExecError::KeccakPtrOutOfRange`, the reference-semantics half of the same bound), so no
+// `execute` call produces such a run either.
+//
+// So the witness is built directly instead — as the emulator *would* have built it without that
+// refusal. The guest takes its pointer from a private input rather than an immediate, which
+// makes the whole relocation a pure `Execution` edit: the program words, and therefore `hc`,
+// the program table and every `PROGRAM` message, are byte-identical between the two pointers,
+// and `build_traces_salted` then fills every table from the relocated events exactly as it
+// would for an honest run. `a_relocated_keccak_pointer_inside_the_bound_still_proves` is the
+// control that pins that: the same helper, the same program, a pointer whose top nibble is 2
+// instead of 3, and the proof verifies.
+
+/// `read_input(0) -> a0; KECCAK a0; halt` — the pointer is data, not an immediate.
+fn keccak_ptr_from_input() -> shrugg_zkvm::isa::Program {
+    let mut a = Assembler::new(0);
+    a.extend(read_input(0));
+    a.extend(li(shrugg_zkvm::isa::REG_A7, shrugg_zkvm::isa::SYS_KECCAK as i32));
+    a.push(ecall());
+    a.extend(halt());
+    a.assemble()
+}
+
+/// Rewrites an honest `Execution` of `keccak_ptr_from_input` with input `p0` into the execution
+/// the emulator would have produced for input `p1`: the input word itself (and the `a0` it is
+/// written to, and every later read of `a0`), the `KECCAK` syscall's pointer, and the 50
+/// read/50 write addresses the permutation makes. `p0` is chosen so that no other value in the
+/// run collides with it — every other register and memory value in this guest is 0, 2, 4 or a
+/// pc — which is what makes the value-equality matching below exact rather than approximate.
+fn relocate_keccak_ptr(exec: &mut shrugg_zkvm::emulator::Execution, p0: u32, p1: u32) {
+    use shrugg_zkvm::emulator::Syscall;
+    for e in &mut exec.events {
+        if e.b == p0 { e.b = p1; }
+        if e.c == p0 { e.c = p1; }
+        for acc in e.accesses.iter_mut().filter(|a| a.value == p0) { acc.value = p1; }
+        match &mut e.sys {
+            Some(Syscall::ReadInput { word, .. }) if *word == p0 => *word = p1,
+            Some(Syscall::Keccak { ptr }) if *ptr == p0 => *ptr = p1,
+            _ => {}
+        }
+        if let Some(k) = &mut e.keccak_row {
+            assert_eq!(k.ptr, p0);
+            k.ptr = p1;
+        }
+        for acc in &mut e.keccak_accesses {
+            assert!((p0..p0 + 50).contains(&acc.addr));
+            acc.addr = p1 + (acc.addr - p0);
+        }
+    }
+}
+
+/// Builds the relocated traces for pointer `p1`, checking on the way that the cpu row really
+/// does carry the intended `HP3_HI` with a consistent limb decomposition (so the test cannot
+/// silently degenerate into checking some other rule).
+fn keccak_ptr_traces(p1: u32) -> (Machine, shrugg_zkvm::isa::Program, Traces) {
+    const P0: u32 = 0x2000_0000;
+    let m = Machine::new(FriProfile::Test);
+    let p = keccak_ptr_from_input();
+    let mut e = execute(&p, &[P0], 10_000).unwrap();
+    relocate_keccak_ptr(&mut e, P0, p1);
+    let t = build_traces_salted(&p, &[p1], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = cpu::col::WIDTH;
+    let row = keccak_row(&t);
+    // `HASH_PTR = B` (the `a0` the row read) and the four limbs recompose to it: the two
+    // premises the cubic rule is the only thing left checking.
+    assert_eq!(t.cpu.values[row * w + cpu::col::HASH_PTR], F::from_u32(p1));
+    assert_eq!(t.cpu.values[row * w + cpu::col::B], F::from_u32(p1));
+    let limbs_sum: u64 = (0..4)
+        .map(|i| t.cpu.values[row * w + cpu::col::HP0 + i].as_canonical_u64() << (8 * i))
+        .sum();
+    assert_eq!(limbs_sum, p1 as u64);
+    assert_eq!(t.cpu.values[row * w + cpu::col::HP3_HI], F::from_u32(p1 >> 28));
+    (m, p, t)
+}
+
+/// The control: top nibble 2, everything else identical. If the relocation helper produced a
+/// witness that were wrong in any *other* way, this would fail too — and the negative test
+/// below would be passing for the wrong reason.
+#[test]
+fn a_relocated_keccak_pointer_inside_the_bound_still_proves() {
+    let (m, p, t) = keccak_ptr_traces(0x2800_0000);
+    let proof = m.prove_traces(&p, &t, Tier(10));
+    m.verify(&p.digest(), &proof).unwrap();
+}
+
+/// And top nibble 3 — admitted by `AND4[HP3_HI, 0xC, 0]`, rejected by the cubic.
+#[test]
+fn a_keccak_pointer_with_hp3_hi_equal_to_three_is_rejected() {
+    let (m, p, t) = keccak_ptr_traces(0x3000_0000);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ---------------------------------------------------------------------------
+// Audit (2026-09-12) prove-side guards and coverage gaps: ZH1, ZH2, ZH3, and the input
+// table's own AIR invariants.
+
+/// Audit ZH3: the prove-side mirror of `out_of_range_tier_is_an_error_not_a_panic` — an
+/// explicit tier outside `TIERS` used to reach `Tier::cpu_height`'s `1 << tier` with no guard
+/// (a shift-overflow panic in debug, a masked shift plus an abort-scale allocation in release).
+/// Now a clean `ProveError::BadTier` before any shift happens.
+#[test]
+fn an_out_of_tiers_tier_is_an_error_on_the_prove_side_too() {
+    use shrugg_zkvm::machine::ProveError;
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    assert!(matches!(m.prove(&p, &[], Some(Tier(99))), Err(ProveError::BadTier(99))));
+    assert!(matches!(m.prove(&p, &[], Some(Tier(11))), Err(ProveError::BadTier(11))));
+}
+
+/// Audit ZH1: the poseidon2 table holds `2^(t-3)` permutation blocks against up to ~`2^t`
+/// permutation-emitting rows under the cycle budget alone — so a workload can fit the cycle
+/// budget while overflowing the permutation budget (which used to be `poseidon2_trace`'s
+/// `assert!` panic, with the auto-tier pick walking straight into it). Now a clean
+/// `ProveError::TooManyPoseidon2Permutations`, and `Tier::for_workload` climbs to a tier whose
+/// permutation budget fits.
+#[test]
+fn a_workload_exceeding_the_poseidon2_budget_is_a_clean_error() {
+    use shrugg_zkvm::machine::ProveError;
+    let m = Machine::new(FriProfile::Test);
+    let mut a = Assembler::new(0);
+    a.extend(li(5, 1));
+    a.extend(write_output(0, 5));
+    a.extend(halt());
+    for _ in 0..592 { a.push(addi(0, 0, 0)); }
+    let p = a.assemble(); // 599 words -> 150 digest-row permutations + 1 indigest > tier 10's 128 blocks
+    assert_eq!(p.len(), 599);
+    let exec = execute(&p, &[], 10_000).unwrap();
+    assert!(exec.cycles() < 20, "only the leading few instructions ever execute");
+    assert!(
+        matches!(build_traces_salted(&p, &[], [0u32; 4], &exec, Tier(10)), Err(ProveError::TooManyPoseidon2Permutations { .. })),
+        "151 permutations cannot fit tier 10's 128 poseidon2 blocks"
+    );
+    let (proof, _) = m.prove(&p, &[], None).expect("auto-tier must climb past the permutation wall, not panic");
+    assert_eq!(proof.tier, Tier(12));
+    m.verify(&p.digest(), &proof).unwrap();
+}
+
+/// Audit ZH2: the digest rows' 16-bit `HASH_LEFT` (`LEFT0..1`) caps a provable program (and
+/// private-input vector) at 65535 words — enforced host-side now, not as an opaque constraint
+/// failure deep inside `prove_batch`.
+#[test]
+fn a_program_or_input_longer_than_the_16_bit_hash_left_cap_is_a_clean_error() {
+    use shrugg_zkvm::machine::ProveError;
+    let m = Machine::new(FriProfile::Test);
+    let mut a = Assembler::new(0);
+    a.extend(halt());
+    let mut words = a.assemble().words;
+    words.resize(u16::MAX as usize + 1, 0x0000_0013); // trailing `addi x0, x0, 0`s, never executed
+    let p = shrugg_zkvm::isa::Program::new(0, words);
+    assert!(matches!(m.prove(&p, &[], None), Err(ProveError::ProgramTooLong { .. })));
+    let small = guests::fib(10);
+    let inputs = vec![0u32; u16::MAX as usize + 1];
+    assert!(matches!(m.prove(&small, &inputs, None), Err(ProveError::InputTooLong { .. })));
+}
+
+/// Audit coverage: the verify-side declared-height guards for the program and input tables
+/// (`VerifyError::ProgramHeight`/`InputHeight`) — the twins of
+/// `out_of_range_tier_is_an_error_not_a_panic`, rejected before they can size a table
+/// (`1 << log_height`). The keccak and memory heights already have their own tests above.
+#[test]
+fn out_of_range_declared_program_and_input_heights_are_errors_not_panics() {
+    use shrugg_zkvm::machine::VerifyError;
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let (mut proof, _) = m.prove(&p, &[], None).unwrap();
+    proof.program_log_height = program::MAX_LOG_HEIGHT + 1;
+    assert!(matches!(m.verify(&p.digest(), &proof), Err(VerifyError::ProgramHeight)));
+    let (mut proof, _) = m.prove(&p, &[], None).unwrap();
+    proof.input_log_height = shrugg_zkvm::tables::input::MAX_LOG_HEIGHT + 1;
+    assert!(matches!(m.verify(&p.digest(), &proof), Err(VerifyError::InputHeight)));
+}
+
+/// Audit coverage: the input table's own AIR invariants. A hole in the real-row prefix (a row
+/// drops `IS_REAL` while a later row stays real) trips the `(1 − IS_REAL)·n(IS_REAL) = 0`
+/// prefix rule directly — and, independently, the `INPUT_DIGEST` set-equality it backstops
+/// (the "hole" index's supply vanishes while the digest still demands it).
+#[test]
+fn a_hole_in_the_input_tables_real_prefix_is_rejected() {
+    use shrugg_zkvm::tables::input;
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    let iw = input::col::WIDTH;
+    assert_eq!(t.input.values[2 * iw + input::col::IS_REAL], F::ONE, "row 2 is real, so clearing row 1 leaves a hole");
+    t.input.values[iw + input::col::IS_REAL] = F::ZERO;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// Audit coverage: `IDX` is the arithmetic sequence 0, 1, 2, … — bumping one row's claimed
+/// index trips the `n(IDX) − v(IDX) − 1 = 0` chain directly (and would otherwise mis-key every
+/// `INPUT_DIGEST`/`INPUT_READ` message at that row).
+#[test]
+fn a_skipped_input_table_index_is_rejected() {
+    use shrugg_zkvm::tables::input;
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    let iw = input::col::WIDTH;
+    t.input.values[iw + input::col::IDX] += F::ONE;
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
 }
