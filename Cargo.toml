@@ -39,6 +39,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.35", features = ["full"] }
 futures = "0.3"
 libp2p = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "mdns", "identify", "kad", "request-response", "cbor", "ping", "macros"] }
+# The sync request-response codec is ours rather than libp2p's `cbor::Behaviour`, because that one
+# hard-codes its size limits (see `network::codec`). Same serializer, same versions libp2p pins.
+cbor4ii = { version = "0.3.2", features = ["serde1", "use_std"] }
+async-trait = "0.1"
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 

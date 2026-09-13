@@ -1,3 +1,4 @@
+use super::codec::Codec;
 use super::wire::{SyncRequest, SyncResponse};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::NetworkBehaviour;
@@ -10,7 +11,9 @@ pub struct ShruggBehaviour {
     pub identify: identify::Behaviour,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub mdns: Toggle<mdns::tokio::Behaviour>,
-    pub sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+    /// Our own CBOR codec, not `request_response::cbor::Behaviour`: that one's size limits are
+    /// private constants and it truncates rather than rejects (see [`super::codec`]).
+    pub sync: request_response::Behaviour<Codec<SyncRequest, SyncResponse>>,
     /// Keeps connections from idling out and surfaces dead links quickly.
     pub ping: ping::Behaviour,
 }

@@ -28,6 +28,8 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 libp2p = { workspace = true }
+cbor4ii = { workspace = true }
+async-trait = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 rocksdb = { workspace = true }

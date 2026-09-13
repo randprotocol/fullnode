@@ -4094,10 +4094,12 @@ name = "shrugg-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bincode",
  "blake3",
  "bs58",
+ "cbor4ii",
  "clap",
  "futures",
  "hex",

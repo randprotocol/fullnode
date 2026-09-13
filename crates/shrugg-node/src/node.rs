@@ -24,10 +24,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 const SYNC_BATCH: u32 = 100;
-/// Approximate cap on a sync batch response: the request-response codec caps
-/// messages at 10 MiB, so an unbounded 100-block batch of fat blocks would be
-/// undeliverable and the requester would retry the same range forever.
-const SYNC_MAX_BYTES: usize = 8 << 20;
+
+/// Smallest batch the client falls back to after a failure. One block always fits, whatever it
+/// carries.
+const SYNC_BATCH_MIN: u32 = 1;
 
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -190,12 +190,61 @@ struct Node {
     propose_at: Option<(u64, Instant)>,
     last_block_at: Instant,
     sync_inflight: Option<(PeerId, libp2p::request_response::OutboundRequestId, Instant)>,
+    /// Blocks to ask for in the next batch. Halved toward [`SYNC_BATCH_MIN`] after a failure and
+    /// reset to [`SYNC_BATCH`] after a batch applies, so a batch size the wire cannot carry is
+    /// backed away from instead of retried forever.
+    sync_batch: u32,
     fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, Hash>,
     /// Block hash -> (attempts so far, peers already asked) for by-hash fetches.
     fetch_attempts: HashMap<Hash, (usize, Vec<PeerId>)>,
 }
 
 const MAX_FETCH_ATTEMPTS: usize = 8;
+
+/// The wire cost of one committed block in a sync batch.
+///
+/// Measured with the codec's own CBOR serializer ([`network::codec::cbor_size`]) rather than with
+/// bincode, so the budget is in the units the wire actually charges — and over the whole
+/// [`CommittedBlock`], which is what goes out. The budget this feeds used to count
+/// `cb.block.encode()` alone and so missed the QC that certifies the block: on an 18-validator
+/// chain, half the payload. `deposits` is `#[serde(skip)]`, so it costs nothing here, matching the
+/// wire.
+fn committed_block_wire_size(cb: &CommittedBlock) -> u64 {
+    // A block that cannot be sized is charged the whole budget, which ends the batch rather than
+    // letting an unmeasured block through.
+    network::codec::cbor_size(cb).map(|n| n as u64).unwrap_or(network::SYNC_MAX_WIRE_BYTES)
+}
+
+/// Take committed blocks from `blocks` while they fit in `budget` bytes of wire.
+///
+/// The first block is always taken, however large it is: a block fatter than the whole budget must
+/// still be servable, or a node stuck behind it has no way past it. Every later block is charged
+/// its CBOR size before it is admitted, and the batch ends as soon as one would take the total
+/// over.
+///
+/// `blocks` is consumed lazily, so a batch that fills on bytes never reads the rest from storage.
+fn fill_sync_batch(blocks: impl IntoIterator<Item = CommittedBlock>, budget: u64) -> Vec<CommittedBlock> {
+    let mut out: Vec<CommittedBlock> = Vec::new();
+    let mut bytes = 0u64;
+    for cb in blocks {
+        bytes = bytes.saturating_add(committed_block_wire_size(&cb));
+        if !out.is_empty() && bytes > budget {
+            break;
+        }
+        out.push(cb);
+    }
+    out
+}
+
+/// How many bytes of blocks one sync response may carry.
+///
+/// Half the reader limit the codec enforces, by construction: the budget is the server's promise
+/// and the limit is the client's check, and keeping the first at half the second leaves room for
+/// framing and for a peer on a slightly different build.
+pub(crate) fn serve_sync_budget() -> u64 {
+    debug_assert!(network::SYNC_MAX_WIRE_BYTES * 2 <= network::SYNC_RESPONSE_WIRE_LIMIT);
+    network::SYNC_MAX_WIRE_BYTES
+}
 
 pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
@@ -317,6 +366,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         propose_at: None,
         last_block_at: Instant::now(),
         sync_inflight: None,
+        sync_batch: SYNC_BATCH,
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
     };
@@ -625,9 +675,21 @@ impl Node {
                 self.on_sync_response(peer, request_id, response).await?;
             }
             NetworkEvent::SyncFailed { peer, request_id, error } => {
-                tracing::debug!("sync request to {peer} failed: {error}");
                 if self.sync_inflight.map(|s| s.1) == Some(request_id) {
                     self.sync_inflight = None;
+                    // Halve the batch, down to a single block. A batch too big for the wire fails
+                    // identically every time it is retried at the same size — which is how a node
+                    // that fell behind chain 8's first 1.3 MB transfer proof stopped dead at that
+                    // height across restarts, asking four peers in turn for the same 100 blocks
+                    // and getting `Eof { name: "bytes", .. }` back from each. At `warn` because at
+                    // `debug` an operator on the default `RUST_LOG=info` saw nothing at all.
+                    self.sync_batch = (self.sync_batch / 2).max(SYNC_BATCH_MIN);
+                    tracing::warn!(
+                        %peer, ?request_id, next_batch = self.sync_batch,
+                        "sync batch request failed: {error}"
+                    );
+                } else {
+                    tracing::debug!("sync request to {peer} failed: {error}");
                 }
                 self.retry_fetch(request_id).await?;
             }
@@ -670,21 +732,10 @@ impl Node {
         match req {
             SyncRequest::Blocks { from_height, max } => {
                 let max = max.min(SYNC_BATCH);
-                let mut out = Vec::new();
-                let mut bytes = 0usize;
-                for h in from_height..from_height.saturating_add(max as u64) {
-                    match self.storage.committed_block(h) {
-                        Ok(Some(cb)) => {
-                            bytes += cb.block.encode().len();
-                            if !out.is_empty() && bytes > SYNC_MAX_BYTES {
-                                break;
-                            }
-                            out.push(cb);
-                        }
-                        _ => break,
-                    }
-                }
-                SyncResponse::Blocks(out)
+                // Lazy: a batch that fills up on bytes must not have read the rest from RocksDB.
+                let heights = from_height..from_height.saturating_add(max as u64);
+                let blocks = heights.map_while(|h| self.storage.committed_block(h).ok().flatten());
+                SyncResponse::Blocks(fill_sync_batch(blocks, serve_sync_budget()))
             }
             SyncRequest::BlockByHash(h) => {
                 let b = self.hs.block(&h).cloned().or_else(|| self.storage.block_by_hash(&h).ok().flatten());
@@ -765,7 +816,7 @@ impl Node {
             .filter(|(_, h)| *h > my_height)
             .max_by_key(|(_, h)| *h);
         let Some((peer, _)) = best else { return };
-        let req = SyncRequest::Blocks { from_height: my_height + 1, max: SYNC_BATCH };
+        let req = SyncRequest::Blocks { from_height: my_height + 1, max: self.sync_batch };
         if let Some(id) = self.net.send_sync_request(peer, req).await {
             self.sync_inflight = Some((peer, id, Instant::now()));
         }
@@ -799,7 +850,12 @@ impl Node {
                     self.peers.remove(&peer);
                     return Ok(());
                 }
-                if n as u32 == SYNC_BATCH {
+                // A batch got through, so the wire carries this size: go back to asking for a full
+                // one. The server caps by bytes as well, so a batch can be shorter than we asked
+                // for without meaning the chain has run out — follow up on any batch that moved us
+                // while a peer is still ahead.
+                self.sync_batch = SYNC_BATCH;
+                if n > 0 && self.best_peer_height() > self.hs.committed_height() {
                     self.maybe_sync().await;
                 }
             }
@@ -1008,5 +1064,169 @@ mod tests {
             executor,
         );
         assert_eq!(blind.on_proposal(proposal, 3), Err(ConsensusError::UnknownEpochSet(1)));
+    }
+
+    // ------------------------------------------------------- sync batch wire budget
+    //
+    // Chain 8 stopped a late-joining node dead at the height of the chain's first
+    // constraint-set-5 transfer: every peer asked for the 100-block batch containing it answered
+    // with a response the reader cut at its 10 MiB limit, which then failed to decode
+    // (`Eof { name: "bytes", .. }`). The server believed the batch was inside its 8 MiB budget,
+    // because that budget counted `cb.block.encode()` and ignored the QC certifying the block —
+    // on an 18-validator chain, half of what goes on the wire.
+
+    /// `n` votes over `hash`, by the first `n` of `ks`.
+    fn votes_of(view: u64, hash: Hash, ks: &[Keypair], n: usize) -> QuorumCertificate {
+        QuorumCertificate { view, block_hash: hash, votes: ks[..n].iter().map(|k| Vote::sign(view, hash, k)).collect() }
+    }
+
+    /// A committed block shaped like chain 8's: `votes` votes in both the header's `justify` QC and
+    /// the QC that certifies it, carrying `txs`.
+    fn sized_block(height: u64, ks: &[Keypair], votes: usize, txs: Vec<Transaction>) -> CommittedBlock {
+        let parent = Hash::digest(&height.to_be_bytes());
+        let header = BlockHeader {
+            height,
+            view: height,
+            parent,
+            proposer: ks[0].public_key().clone(),
+            timestamp_ms: height,
+            tx_root: Block::tx_root(&txs),
+            state_root: parent,
+            justify: votes_of(height.saturating_sub(1), parent, ks, votes),
+        };
+        let block = Block::sign(header, txs, &ks[0]);
+        let hash = block.hash();
+        CommittedBlock { block, qc: votes_of(height, hash, ks, votes), receipts: Vec::new(), deposits: Vec::new() }
+    }
+
+    fn validators(n: u8) -> Vec<Keypair> {
+        (1..=n).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect()
+    }
+
+    /// A shielded transaction carrying a `proof_bytes`-byte proof, standing in for a real one.
+    fn fat_tx(proof_bytes: usize) -> Transaction {
+        let bundle = shrugg_core::notes::Bundle {
+            anchor: [1; 8],
+            nullifiers: [[2; 8], [3; 8]],
+            commitments: [[4; 8], [5; 8]],
+            fee: 1,
+            burn: 0,
+            asset: 0,
+            time: 1,
+            envelopes: [crate::storage::fixtures::env(1), crate::storage::fixtures::env(2)],
+            proof: vec![7u8; proof_bytes],
+        };
+        Transaction::shielded(7, bundle, shrugg_core::Action::None)
+    }
+
+    fn wire_size(blocks: &[CommittedBlock]) -> u64 {
+        network::codec::cbor_size(&SyncResponse::Blocks(blocks.to_vec())).unwrap() as u64
+    }
+
+    /// The measurement that explains the stall: on an 18-validator chain a batch of 100 *empty*
+    /// blocks is over 13 MiB on the wire, while the retired budget — `block.encode()` only, capped
+    /// at 8 MiB — saw less than 7 MiB of it and let it go.
+    #[test]
+    fn a_hundred_empty_chain_8_blocks_overrun_the_reader_limit_libp2p_would_have_used() {
+        let ks = validators(18);
+        let blocks: Vec<CommittedBlock> = (1..=100).map(|h| sized_block(h, &ks, 18, vec![])).collect();
+        let on_the_wire = wire_size(&blocks);
+        // The limit libp2p's own `cbor::Behaviour` would have applied, and truncated at.
+        const LIBP2P_DEFAULT_RESPONSE_MAXIMUM: u64 = 10 << 20;
+        assert!(
+            on_the_wire > LIBP2P_DEFAULT_RESPONSE_MAXIMUM,
+            "expected a 100-block batch to overrun 10 MiB, measured {on_the_wire} B"
+        );
+        let old_budget_would_have_counted: u64 = blocks.iter().map(|b| b.block.encode().len() as u64).sum();
+        assert!(
+            old_budget_would_have_counted < 8 << 20,
+            "the old 8 MiB budget should have thought this batch fit: {old_budget_would_have_counted} B"
+        );
+    }
+
+    #[test]
+    fn the_batch_budget_is_at_most_half_the_reader_limit() {
+        assert!(2 * network::SYNC_MAX_WIRE_BYTES <= network::SYNC_RESPONSE_WIRE_LIMIT);
+        assert_eq!(serve_sync_budget(), network::SYNC_MAX_WIRE_BYTES);
+    }
+
+    #[test]
+    fn a_capped_batch_of_chain_8_blocks_fits_on_the_wire() {
+        let ks = validators(18);
+        let blocks: Vec<CommittedBlock> = (1..=SYNC_BATCH as u64).map(|h| sized_block(h, &ks, 18, vec![])).collect();
+        let batch = fill_sync_batch(blocks, serve_sync_budget());
+        assert!(batch.len() < SYNC_BATCH as usize, "the budget should have cut the batch short");
+        assert!(!batch.is_empty());
+        let on_the_wire = wire_size(&batch);
+        assert!(
+            on_the_wire <= network::SYNC_RESPONSE_WIRE_LIMIT,
+            "a capped batch must be readable: {on_the_wire} B over {} B",
+            network::SYNC_RESPONSE_WIRE_LIMIT
+        );
+        // Contiguous from the first block, so the client can apply it.
+        for (i, cb) in batch.iter().enumerate() {
+            assert_eq!(cb.block.height(), 1 + i as u64);
+        }
+    }
+
+    /// The worst block the consensus rules admit: `MAX_BLOCK_BYTES` of transactions — two proofs at
+    /// `MAX_PROOF_BYTES` — under 18-validator QCs. It has to be servable on its own, because a node
+    /// stuck behind it has no other way past it, and readable, or the reader limit is the new wall.
+    #[test]
+    fn the_largest_admissible_block_is_servable_and_readable_alone() {
+        let ks = validators(18);
+        let txs = vec![fat_tx(gas::MAX_PROOF_BYTES), fat_tx(gas::MAX_PROOF_BYTES)];
+        let tx_bytes: usize = txs.iter().map(|t| bincode::serialize(t).unwrap().len()).sum();
+        assert!(tx_bytes >= gas::MAX_BLOCK_BYTES / 2, "the fixture should be a fat block: {tx_bytes} B");
+        let block = sized_block(1, &ks, 18, txs);
+
+        let batch = fill_sync_batch(vec![block], serve_sync_budget());
+        assert_eq!(batch.len(), 1, "a fat block must never be dropped from an empty batch");
+        let on_the_wire = wire_size(&batch);
+        assert!(
+            on_the_wire <= network::SYNC_RESPONSE_WIRE_LIMIT,
+            "the largest admissible block must be readable: {on_the_wire} B over {} B",
+            network::SYNC_RESPONSE_WIRE_LIMIT
+        );
+    }
+
+    /// A block over the budget ends the batch rather than joining it — but only once something is
+    /// in the batch already.
+    #[test]
+    fn a_block_over_the_budget_ends_the_batch_it_cannot_join() {
+        let ks = validators(4);
+        let small = sized_block(1, &ks, 4, vec![]);
+        let fat = sized_block(2, &ks, 4, vec![fat_tx(gas::MAX_PROOF_BYTES)]);
+        let tiny_budget = committed_block_wire_size(&small) + 1;
+        let batch = fill_sync_batch(vec![small, fat], tiny_budget);
+        assert_eq!(batch.len(), 1, "the fat block should not have been admitted over the budget");
+        assert_eq!(batch[0].block.height(), 1);
+    }
+
+    /// A batch is charged for the whole `CommittedBlock`, not just its block: the certifying QC is
+    /// most of an empty block on a large validator set, and missing it is what let batches overrun.
+    #[test]
+    fn the_wire_size_of_a_block_counts_its_certifying_qc() {
+        let ks = validators(18);
+        let cb = sized_block(1, &ks, 18, vec![]);
+        let counted = committed_block_wire_size(&cb);
+        let block_only = cb.block.encode().len() as u64;
+        assert!(
+            counted > block_only + (60 << 10),
+            "an 18-vote QC is ~68 KB and must be charged for: counted {counted} B against {block_only} B of block"
+        );
+    }
+
+    #[test]
+    fn the_client_batch_halves_toward_one_and_never_below() {
+        let mut batch = SYNC_BATCH;
+        let mut seen = vec![batch];
+        for _ in 0..10 {
+            batch = (batch / 2).max(SYNC_BATCH_MIN);
+            seen.push(batch);
+        }
+        assert_eq!(&seen[..4], &[100, 50, 25, 12]);
+        assert_eq!(*seen.last().unwrap(), SYNC_BATCH_MIN);
+        assert!(seen.iter().all(|b| *b >= 1));
     }
 }

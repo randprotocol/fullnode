@@ -6,6 +6,7 @@
 //! `NetworkHandle` (commands in) and an `mpsc::Receiver<NetworkEvent>` (events out).
 
 mod behaviour;
+pub mod codec;
 pub mod wire;
 
 pub use wire::{GossipMessage, Status, SyncRequest, SyncResponse};
@@ -21,6 +22,43 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
+
+/// How long the request-response protocol waits for a sync response before reporting `SyncFailed`.
+pub const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What a sync batch is allowed to weigh on the wire, measured with the codec's own serializer.
+///
+/// The server fills a batch up to this and stops; one block is always included even if it alone is
+/// larger, so a fat block is never unservable. A single block cannot exceed `MAX_BLOCK_BYTES`
+/// (4 MiB of transactions) plus its two QCs and receipts, so one always fits inside this budget.
+///
+/// The number matters because a chain-8 block is 140 KB when *empty* — two 18-validator Dilithium2
+/// QCs, the `justify` one in its header and the one that certifies it, each 18 votes of a
+/// 1312-byte public key plus a 2420-byte signature — and a constraint-set-5 transfer proof is
+/// another 1.3 MB. Measured, 100 empty chain-8 blocks:
+///
+/// | | 100 empty blocks |
+/// |---|---|
+/// | `block.encode()` only — what the retired 8 MiB budget counted | 6.88 MiB |
+/// | whole `CommittedBlock`, bincode | 13.38 MiB |
+/// | whole `CommittedBlock`, CBOR — the wire | **13.57 MiB** |
+///
+/// So the old budget let a batch go out at 13.57 MiB believing it was under 8 MiB, and libp2p's
+/// codec cut it at 10 MiB. At a bare 13-vote quorum the same batch measures 9.91 MiB and *just*
+/// fit, which is why catch-up sync advanced in fits and starts instead of not at all — and why a
+/// node behind a block carrying a 1.3 MB proof could not get past it at any batch size it tried.
+pub const SYNC_MAX_WIRE_BYTES: u64 = 6 << 20;
+
+/// The reader limit our codec enforces on a sync response.
+///
+/// Twice the server's batch budget plus framing headroom, so the budget sits at half of it — the
+/// invariant [`codec`] exists to keep honest. Going over this is an *error* naming the limit, not
+/// the silent truncation libp2p's hard-coded 10 MiB produced, which resurfaced on the reader as
+/// `Eof { name: "bytes", .. }` and named nothing.
+pub const SYNC_RESPONSE_WIRE_LIMIT: u64 = 2 * SYNC_MAX_WIRE_BYTES + (256 << 10);
+
+/// The reader limit on a sync *request*. A request is a height and a count, or a block hash.
+pub const SYNC_REQUEST_WIRE_LIMIT: u64 = 64 << 10;
 
 #[derive(Clone, Debug)]
 pub struct NetworkConfig {
@@ -160,9 +198,12 @@ pub async fn start(
         None
     };
 
-    let sync = request_response::cbor::Behaviour::<SyncRequest, SyncResponse>::new(
+    // Our codec, not `request_response::cbor::Behaviour`: that one's size limits are private
+    // constants and it enforces them by truncation (see `codec`).
+    let sync = request_response::Behaviour::with_codec(
+        codec::Codec::<SyncRequest, SyncResponse>::new(SYNC_REQUEST_WIRE_LIMIT, SYNC_RESPONSE_WIRE_LIMIT),
         [(StreamProtocol::try_from_owned(format!("/shrugg/{}/sync/1", cfg.chain_id))?, ProtocolSupport::Full)],
-        request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+        request_response::Config::default().with_request_timeout(SYNC_REQUEST_TIMEOUT),
     );
 
     let ping = libp2p::ping::Behaviour::new(libp2p::ping::Config::new().with_interval(Duration::from_secs(15)).with_timeout(Duration::from_secs(20)));

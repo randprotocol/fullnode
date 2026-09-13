@@ -783,6 +783,83 @@ async fn two_validators_commit_and_shielded_transfer() {
     eprintln!("two_validators_commit_and_shielded_transfer in {:.1?}", started.elapsed());
 }
 
+/// A node that was down while a real shielded transfer committed must be able to sync past it.
+///
+/// The chain-8 wall this belongs to is a *size* bug, not a slowness one: a batch carrying a
+/// constraint-set-5 proof under 18-validator Dilithium2 QCs came to more than the 10 MiB the
+/// libp2p CBOR codec reads before it truncates, so the response was cut mid-message and failed to
+/// decode. Node A sat at the height below the chain's first transfer across restarts, asking four
+/// peers for the same range and getting `Eof { name: "bytes", .. }` from each — unservable at any
+/// size the client asked for, because the server's budget counted only `cb.block.encode()`.
+///
+/// What this test covers is the end-to-end path: a node that missed a proof-bearing block gets it
+/// over sync, replays it, and agrees on the state it produced. It does **not** reproduce the
+/// overrun itself — a `FriProfile::Test` proof is ~300 KB against production's ~1.3 MB, and four
+/// validators make a QC a twentieth of chain 8's — so the wire arithmetic is pinned where it can be
+/// stated exactly: `network::codec::tests` round-trips a real chain-8-shaped batch through the
+/// codec, and `node::tests` measures the budget against
+/// `MAX_PROOF_BYTES` and 18-validator QCs.
+///
+/// Four validators, because three leave exactly 2/3 of the stake when one is down, which is not a
+/// quorum, and the chain has to keep committing while this node is away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_node_that_was_down_syncs_past_a_block_carrying_a_real_proof() {
+    init_tracing();
+    let started = Instant::now();
+    let ks = keys(4);
+    let (a, b) = (wallet(1), wallet(2));
+    let gen = genesis_funding(&ks, &[&a]);
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
+    let boot = vec![bootstrap_addr(&n0)];
+    let n1 = start_node_at(&ks[1], &gen, boot.clone(), true, PROVING).await;
+    let n2 = start_node_at(&ks[2], &gen, boot.clone(), true, PROVING).await;
+    let n3 = start_node_at(&ks[3], &gen, boot.clone(), true, PROVING).await;
+    wait_height(&[&n0, &n1, &n2, &n3], 2, Duration::from_secs(90)).await;
+
+    // n3 goes down before the transfer, so the only way it can learn the proof-bearing block is
+    // over sync.
+    let stopped_at = n3.handle.storage.head().unwrap().height;
+    let d3 = stop(n3).await;
+
+    let fee = gas::BUNDLE_BASE;
+    let pay = UNITS_PER_SHRUGG;
+    let mut store = NoteStore::default();
+    let slot = proving_slot().await;
+    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the bundle is accepted and commits");
+    drop(slot);
+    eprintln!("transfer: tier {}, proved in {:.1?}, {} proof bytes", sent.tier, sent.proving, sent.proof_bytes);
+    // The point of the test: a block carrying a real proof, not a stub. In the `test` profile that
+    // is ~300 KB (production's 80-query profile is ~1.3 MB), still two orders of magnitude past an
+    // empty block and enough that the block must travel as its own batch.
+    assert!(sent.proof_bytes > 200 << 10, "expected a real proof, got {} bytes", sent.proof_bytes);
+
+    let (proof_height, _) = n0.handle.storage.tx_location(&sent.hash).unwrap().unwrap();
+    assert!(proof_height > stopped_at, "the transfer must land after n3 went down");
+    // And put a few more blocks on top, so catching up means a batch, not a single block.
+    wait_height(&[&n0, &n1, &n2], proof_height + 3, Duration::from_secs(180)).await;
+
+    // Back up: it must cross the proof-bearing block and reach the others.
+    let n3 = start_in_at(d3, &ks[3], boot.clone(), true, PROVING).await;
+    assert_eq!(n3.handle.storage.head().unwrap().height, stopped_at);
+    wait_caught_up(&n3, &[&n0, &n1, &n2], Duration::from_secs(180)).await;
+    assert!(
+        n3.handle.storage.tx_location(&sent.hash).unwrap().is_some(),
+        "n3 synced without the proof-bearing transaction"
+    );
+    // It agrees on the state the proof produced, not merely on the block bytes.
+    assert_eq!(balance(&n3, &b).await, pay, "B's note, as n3 sees it");
+    assert_eq!(balance(&n3, &a).await, ALLOC - pay - fee);
+    assert_chains_equal(&[&n0, &n1, &n2, &n3]);
+
+    // and it keeps up afterwards
+    let h = n0.height();
+    wait_height(&[&n0, &n1, &n2, &n3], h + 3, Duration::from_secs(120)).await;
+    assert_chains_equal(&[&n0, &n1, &n2, &n3]);
+    eprintln!("a_node_that_was_down_syncs_past_a_block_carrying_a_real_proof in {:.1?}", started.elapsed());
+}
+
 /// Two bundles spending the same note, proved in parallel and submitted to two different
 /// validators. Whichever reaches a block first spends the note; the other can never be admitted
 /// again — it is refused at the RPC if the nullifier is already committed, or dropped from the
