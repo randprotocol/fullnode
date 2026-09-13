@@ -30,6 +30,14 @@ const MAX_PAGE: usize = 1000;
 /// window per request.
 const MAX_COMPACT_BLOCKS: u64 = 128;
 
+/// The most request objects one batch may carry. A batch is a request amplifier and
+/// `shrugg_getWitness` rebuilds the whole commitment tree per call, so this is deliberately
+/// small: the realistic batch is a head, a tree info and two pages, which is four.
+///
+/// The *byte* bound is `RPC_MAX_BODY_BYTES`, which is sized for one proof-carrying transaction, so
+/// a batch of submissions is refused on size at the extractor long before this count is consulted.
+const MAX_BATCH: usize = 20;
+
 /// The longest string any RPC parameter may offer as a shielded address (spec ruling 3). See
 /// `parse_shielded` for why this is checked before the address is parsed rather than after.
 const MAX_ADDRESS_CHARS: usize = 2000;
@@ -128,8 +136,20 @@ struct Request {
     method: String,
     #[serde(default)]
     params: Value,
-    #[serde(default)]
-    id: Value,
+    /// A request object's `id`. `None` is a *missing* `id` member — a JSON-RPC notification, which
+    /// this node refuses (see `docs/rpc.md`); `Some(Value::Null)` is an explicit null id and is a
+    /// normal request, as it has always been here.
+    ///
+    /// `Option<Value>` alone cannot say that: serde reads an explicit `null` as `None`, collapsing
+    /// the two. `id_member` is only ever called for a member that is *present*, so it is what keeps
+    /// `"id": null` a request; `default` covers the missing one.
+    #[serde(default, deserialize_with = "id_member")]
+    id: Option<Value>,
+}
+
+/// A present `id` member, null included. See [`Request::id`].
+fn id_member<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
 }
 
 struct RpcError {
@@ -196,6 +216,39 @@ pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketA
     Ok((bound, task))
 }
 
+/// One error response object. Built from an `RpcError` so every `-32600` in this file comes from
+/// `RpcError::invalid_request` — including the oversized-body one `rejection_error` already makes.
+fn error_value(id: Value, e: RpcError) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": e.code, "message": e.message } })
+}
+
+/// One request object in, one response object out. Every failure mode — an object that does not
+/// deserialize, a notification, an unknown method — is a response, so a batch's replies always
+/// line up one-for-one with its requests.
+async fn dispatch_one(st: &RpcState, v: Value) -> Value {
+    // Echo whatever id the object carried even if nothing else about it parses.
+    let raw_id = v.get("id").cloned();
+    let req: Request = match serde_json::from_value(v) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_value(
+                raw_id.unwrap_or(Value::Null),
+                RpcError::invalid_request(format!("invalid request: {e}")),
+            )
+        }
+    };
+    let Some(id) = req.id.clone() else {
+        return error_value(
+            Value::Null,
+            RpcError::invalid_request("this node does not accept notifications; every request must carry an id"),
+        );
+    };
+    match dispatch(st, &req).await {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Err(e) => error_value(id, e),
+    }
+}
+
 async fn handle(
     State(st): State<RpcState>,
     // `Result<Json<_>, _>` rather than `Json<_>`: a body axum refuses — over the limit, or not
@@ -203,26 +256,42 @@ async fn handle(
     // read. `shrugg send` reported a body over the limit as
     // "expected value at line 1 column 1" after a hundred seconds of proving, naming neither the
     // size nor the limit.
-    req: Result<Json<Request>, axum::extract::rejection::JsonRejection>,
+    //
+    // `Value` rather than `Request` because the body may also be an *array* of request objects, and
+    // because a single object that does not deserialize should answer with the id it carried rather
+    // than with axum's rejection.
+    req: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, Json<Value>) {
-    let req = match req {
-        Ok(Json(req)) => req,
+    let body = match req {
+        Ok(Json(body)) => body,
         Err(rejection) => {
-            let e = rejection_error(&rejection);
             // The HTTP status stays what axum decided (413 for an oversized body); only the body
             // becomes something a client can parse. The id is `null`: we never saw the request.
-            return (
-                rejection.status(),
-                Json(json!({ "jsonrpc": "2.0", "id": Value::Null, "error": { "code": e.code, "message": e.message } })),
-            );
+            return (rejection.status(), Json(error_value(Value::Null, rejection_error(&rejection))));
         }
     };
-    let id = req.id.clone();
-    let body = match dispatch(&st, &req).await {
-        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err(e) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": e.code, "message": e.message } }),
+    // Everything past here parsed, so the HTTP status is 200 and the errors are in the body.
+    let out = match body {
+        Value::Array(items) if items.is_empty() => {
+            error_value(Value::Null, RpcError::invalid_request("invalid request: empty batch"))
+        }
+        Value::Array(items) if items.len() > MAX_BATCH => error_value(
+            Value::Null,
+            RpcError::invalid_request(format!("batch of {} requests exceeds the limit of {MAX_BATCH}", items.len())),
+        ),
+        // Sequential on purpose: a batch must not multiply this node's concurrency, and the
+        // expensive reads inside already hand themselves to the blocking pool one at a time.
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(dispatch_one(&st, it).await);
+            }
+            Value::Array(out)
+        }
+        obj @ Value::Object(_) => dispatch_one(&st, obj).await,
+        _ => error_value(Value::Null, RpcError::invalid_request("invalid request: expected an object or an array")),
     };
-    (StatusCode::OK, Json(body))
+    (StatusCode::OK, Json(out))
 }
 
 /// Turn a body axum would not give us into a JSON-RPC error, naming the limit when that is why.
@@ -969,7 +1038,7 @@ mod tests {
     }
 
     async fn call(st: &RpcState, method: &str, params: Value) -> Result<Value, RpcError> {
-        dispatch(st, &Request { jsonrpc: None, method: method.into(), params, id: Value::Null }).await
+        dispatch(st, &Request { jsonrpc: None, method: method.into(), params, id: Some(Value::Null) }).await
     }
 
     async fn ok(st: &RpcState, method: &str, params: Value) -> Value {
@@ -1920,6 +1989,144 @@ mod tests {
                 envelope_json(&expected_deposit.1),
                 "attest_first={attest_first}: the envelope the chain sealed, not the action's"
             );
+        }
+    }
+
+    // --------------------------------------------------------- batch requests
+    //
+    // These drive the axum handler directly rather than through `call`/`ok`, which go straight to
+    // `dispatch`: batching lives in `handle`, above the dispatcher, and the shape under test is
+    // the HTTP reply — its status as well as its body.
+
+    /// A JSON array of request objects comes back as an array of responses, in order, one per
+    /// request — including the errors, so a client can correlate by position as well as by id.
+    #[tokio::test]
+    async fn a_batch_answers_every_request_in_order() {
+        let (_d, st, _gs) = chain();
+        let (code, Json(v)) = handle(
+            State(st.clone()),
+            Ok(Json(json!([
+                { "jsonrpc": "2.0", "id": 1, "method": "shrugg_chainId", "params": [] },
+                { "jsonrpc": "2.0", "id": "two", "method": "shrugg_getTreeInfo", "params": [] },
+                { "jsonrpc": "2.0", "id": 3, "method": "shrugg_nope", "params": [] }
+            ]))),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "a parsed body is always 200, errors inside it or not");
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!((&rows[0]["id"], &rows[0]["result"]), (&json!(1), &json!(st.chain_id)));
+        assert_eq!(rows[1]["id"], json!("two"));
+        assert_eq!(rows[1]["result"]["next_index"], 4);
+        assert_eq!((&rows[2]["id"], &rows[2]["error"]["code"]), (&json!(3), &json!(-32601)));
+        // A single request object still answers with a single object, exactly as before.
+        let (_, Json(one)) = handle(
+            State(st.clone()),
+            Ok(Json(json!({ "jsonrpc": "2.0", "id": 9, "method": "shrugg_chainId", "params": [] }))),
+        )
+        .await;
+        assert_eq!(one["result"], json!(st.chain_id));
+        assert!(one.get("error").is_none());
+    }
+
+    /// The three shapes a batch can get wrong, each a single error object rather than an array —
+    /// there is no per-request id to attach them to.
+    #[tokio::test]
+    async fn a_malformed_batch_is_one_invalid_request_error() {
+        let (_d, st, _gs) = chain();
+        let err = |v: Value| async {
+            let (_, Json(r)) = handle(State(st.clone()), Ok(Json(v))).await;
+            r
+        };
+
+        let empty = err(json!([])).await;
+        assert_eq!(empty["error"]["code"], -32600);
+        assert_eq!(empty["id"], Value::Null);
+
+        let over: Vec<Value> = (0..=MAX_BATCH)
+            .map(|i| json!({ "jsonrpc": "2.0", "id": i, "method": "shrugg_chainId", "params": [] }))
+            .collect();
+        let big = err(json!(over)).await;
+        assert_eq!(big["error"]["code"], -32600);
+        assert!(big["error"]["message"].as_str().unwrap().contains(&MAX_BATCH.to_string()));
+
+        // Not an object and not an array.
+        assert_eq!(err(json!("hello")).await["error"]["code"], -32600);
+    }
+
+    /// Notifications are refused rather than silently dropped: every request here either reads (the
+    /// answer is the point) or submits (a dropped submission is an invisible wallet bug), and
+    /// refusing keeps one response per request so a client can correlate by position.
+    #[tokio::test]
+    async fn a_notification_is_refused_with_a_null_id() {
+        let (_d, st, _gs) = chain();
+        let (_, Json(v)) = handle(
+            State(st.clone()),
+            Ok(Json(json!([
+                { "jsonrpc": "2.0", "method": "shrugg_chainId", "params": [] },
+                { "jsonrpc": "2.0", "id": null, "method": "shrugg_chainId", "params": [] }
+            ]))),
+        )
+        .await;
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "one response per request, notifications included");
+        assert_eq!(rows[0]["error"]["code"], -32600);
+        assert!(rows[0]["error"]["message"].as_str().unwrap().contains("notification"));
+        assert_eq!(rows[0]["id"], Value::Null);
+        // An explicit null id is a request, not a notification, and is answered as always.
+        assert_eq!(rows[1]["result"], json!(st.chain_id));
+    }
+
+    /// A request object that does not deserialize at all still gets a response, with the id it
+    /// carried if it carried a readable one.
+    #[tokio::test]
+    async fn an_undecodable_request_object_still_gets_a_response() {
+        let (_d, st, _gs) = chain();
+        let (_, Json(v)) = handle(
+            State(st.clone()),
+            Ok(Json(json!([
+                { "jsonrpc": "2.0", "id": 4 },                      // no method
+                { "jsonrpc": "2.0", "id": 5, "method": 7 }          // method is not a string
+            ]))),
+        )
+        .await;
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row["error"]["code"], -32600, "row {i}");
+            assert_eq!(row["id"], json!(4 + i as u64), "the id is echoed even when nothing else parses");
+        }
+    }
+
+    /// An element that is not an object at all is an element like any other: it gets its own error
+    /// response with a null id, and the valid requests around it are still answered.
+    ///
+    /// The nested arrays are the case worth pinning: batching is decided once, on the *body*, so an
+    /// array inside a batch is a bad request object rather than a second batch to recurse into.
+    #[tokio::test]
+    async fn a_batch_element_that_is_not_an_object_does_not_lose_its_neighbours() {
+        let (_d, st, _gs) = chain();
+        let (code, Json(v)) = handle(
+            State(st.clone()),
+            Ok(Json(json!([
+                { "jsonrpc": "2.0", "id": 1, "method": "shrugg_chainId", "params": [] },
+                7,
+                "not a request",
+                [],
+                [{ "jsonrpc": "2.0", "id": 8, "method": "shrugg_chainId", "params": [] }],
+                { "jsonrpc": "2.0", "id": 2, "method": "shrugg_chainId", "params": [] }
+            ]))),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 6, "one response per element, whatever the element was");
+        assert_eq!(rows[0]["result"], json!(st.chain_id));
+        assert_eq!(rows[5]["result"], json!(st.chain_id));
+        for i in 1..5 {
+            assert_eq!(rows[i]["error"]["code"], -32600, "row {i}");
+            assert_eq!(rows[i]["id"], Value::Null, "row {i}: nothing to echo");
+            assert!(rows[i].get("result").is_none(), "row {i}: an error response carries no result");
         }
     }
 }

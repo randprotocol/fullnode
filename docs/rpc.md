@@ -1,7 +1,6 @@
 # JSON-RPC reference
 
-The node serves JSON-RPC 2.0 over HTTP on `--rpc` (default `127.0.0.1:8545`). One request per HTTP
-POST to `/`; batches are not supported.
+The node serves JSON-RPC 2.0 over HTTP on `--rpc` (default `127.0.0.1:8545`).
 
 ```bash
 curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
@@ -20,6 +19,9 @@ Conventions:
   mint's amount, a staking action's amount — because they are being reported as the transaction's own
   fields rather than as chain state.
 - Heights, leaf indices and views are JSON integers.
+- **Every request must carry an `id` member**, batched or not: an object without one is a JSON-RPC
+  notification, and this node refuses it with `-32600` rather than running it silently. An explicit
+  `"id": null` is a normal request. See [Batches](#batches) for why.
 - `shrugg_client::RpcClient` (Rust) wraps every method below.
 
 **There is no balance method, and no account method.** This chain has no accounts; see
@@ -29,6 +31,39 @@ holds for bridged assets too: a bridged holding is a note whose `asset` word is 
 index for it (phase S3, `docs/bridge.md`), so the bridge methods below report the bridge's own
 *public* state — guardians, emitters, the asset registry, the outbound burn log — and no
 per-address balance. `shrugg_getAssetBalance` is gone for good.
+
+## Batches
+
+The body of a POST to `/` is either one request object or an **array of at most 20** of them. A
+batch answers with an array of the same length, in request order, one response per request —
+errors included, so a client can correlate by position as well as by id. The requests run one after
+another, not concurrently: a batch is a request amplifier, and `shrugg_getWitness` rebuilds the
+whole commitment tree per call.
+
+A request object with no `id` member is a JSON-RPC **notification**, and this node refuses it with
+`-32600` and `"id": null` rather than running it silently — inside a batch and as a lone request
+object alike, since both go through the same path. Every method here either reads, where
+the answer is the point, or submits, where a silently dropped request is an invisible wallet bug —
+and refusing keeps the reply array the same length as the request array. An explicit `"id": null`
+is a normal request and is answered as always.
+
+An empty array, an array over 20, and a body that is neither an object nor an array each come back
+as a *single* `-32600` error object with a null id, because there is no per-request id to attach
+them to. A batch that parses always answers `200`, whatever the errors inside it.
+
+**The count cap is not the byte cap.** The whole body is still bounded by the node's request-body
+limit, which is sized for a single proof-carrying transaction, and that limit is enforced
+before the count is ever looked at: a batch of two *proof-carrying* `shrugg_sendTransaction` calls
+is refused with a `413` and a `-32600` body naming the limit, whatever the count cap says. (The
+bundle-less actions — a faucet mint, an `Unbond`, a `Withdraw` — are a few kilobytes each and
+batch fine; it is the proofs that do not.) Batching proved submissions does not work, and is not
+what this is for; batching the reads a wallet or explorer makes per page is.
+
+```bash
+curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
+  -d '[{"jsonrpc":"2.0","id":1,"method":"shrugg_getHead","params":[]},
+       {"jsonrpc":"2.0","id":2,"method":"shrugg_getTreeInfo","params":[]}]'
+```
 
 ## Methods
 
@@ -418,6 +453,7 @@ file's own amounts) rather than on a check.
 | `-32000` | transaction rejected by the mempool (message gives the reason) |
 | `-32001` | referenced object not found |
 | `-32603` | internal error (storage or node loop) |
+| `-32600` | invalid request — the body is over the size limit, is not JSON, is a malformed batch, or is a notification |
 
 Error responses look like `{ "jsonrpc": "2.0", "id": 1, "error": { "code": -32000, "message": "…" } }`.
 
