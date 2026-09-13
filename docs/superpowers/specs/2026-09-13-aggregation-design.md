@@ -1,7 +1,7 @@
 # Block-level proof aggregation — chain-side design
 
-Status: **sections 1 and 2 approved by the user in conversation on 2026-09-13; sections 3 and 4
-drafted for the user's review; not built.** This is the fullnode half of the remedy chosen in
+Status: **all four sections approved by the user in conversation on 2026-09-13; not built.** Plan
+follows M5.3 (the interfaces it consumes). This is the fullnode half of the remedy chosen in
 `docs/block-space.md` §6 and sketched in `docs/aggregation.md` §1–§4; it settles that note's §5
 open questions with the user's rulings of 2026-09-13. The zkVM half — the recursion VM whose proof
 this design consumes — is `circuits/docs/superpowers/specs/2026-09-13-zkvm-m5-recursion-vm-design.md`
@@ -105,7 +105,7 @@ bundle-less, no fee. Everything else invalid is simply refused.
   its own counter (burned in on registration, paid out on withdraw). `shrugg_getSupply` reports
   `subsidised`, `sealed_blocks`, `aggregator_bonds` and `slashed` separately.
 
-## 3. Sealed history, pruning, sync (for review)
+## 3. Sealed history, pruning, sync (approved)
 
 - **Sealed.** Storage records per bundle `sealed_by: Option<Hash>` (the `Aggregate` transaction)
   and per block `sealed: bool` once every bundle in it has one. Both are node state derived from
@@ -124,7 +124,7 @@ bundle-less, no fee. Everything else invalid is simply refused.
   itself (raw or aggregate). Disk: about 1.3 MB → about 3 KB per sealed transfer. Throughput:
   unchanged in this phase (three raw bundles per block); the forward path is out of scope.
 
-## 4. RPC, wallet, aggregator daemon, tests, rollout (for review)
+## 4. RPC, wallet, aggregator daemon, tests, rollout (approved)
 
 - **RPC.** `shrugg_getBlockByHeight` gains `sealed` and per-bundle `sealed_by`;
   `shrugg_getAggregate(tx)` returns the public fields (`covers`, `aggregator`, `subsidy`,
