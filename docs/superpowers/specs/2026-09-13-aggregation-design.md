@@ -69,10 +69,13 @@ Bundle-less. Size cap `MAX_AGGREGATE_BYTES` = the proof cap plus `MAX_COVERS · 
    duplicates, every hash names a bundle transaction in a **finalised** block within the last 256
    blocks, none already covered (`sealed_by` absent);
 5. the payout note `cm` is new (`derived_commitment` claims it in the mempool, as a `Withdraw`'s);
-6. the expected public values are built from the covered bundles' public fields (M5 §4.4: the
-   inner verifier key digest the chain pins for the current constraint set, `N`, then each
-   bundle's eight output words in `covers` order) and `verify_aggregate(rvm_vk, proof)` must
-   return exactly them — the one expensive step, last.
+6. the expected public values are built from the covered bundles' public fields (M5 §4.4 as
+   corrected by M5 §12: the 4-element inner verifier key digest the chain pins for the current
+   constraint set, `N`, then each bundle's **all 26** public values in `pv` order — `PC_ENTRY`,
+   `TIER`, `OUT0..7`, `HC0..7` = the registered bundle guest's `hc`, `IN0..7` — in `covers` order)
+   and `verify_aggregate(rvm_vk, proof)` must return exactly them — the one expensive step, last.
+   Checking `HC0..7` against the registered `hc` is what stops an aggregate from covering a proof
+   of some other guest.
 
 **Selection.** A proposer includes at most one `Aggregate` per block. Among the valid submissions
 it holds, it picks the one with the largest `covers.len()`; ties by the lowest proof hash. Losing
