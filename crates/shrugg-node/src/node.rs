@@ -29,6 +29,16 @@ const SYNC_BATCH: u32 = 100;
 /// carries.
 const SYNC_BATCH_MIN: u32 = 1;
 
+/// How long the node waits for a sync response before it abandons the request.
+///
+/// The wire's own timeout, deliberately. A shorter deadline here abandons a request that is still
+/// alive, and the node then discarded the response when it arrived: the 10 s give-up this replaces
+/// meant only a batch answered inside 10 s counted, and a 1-vCPU droplet serving 100 blocks from
+/// RocksDB on the same event loop that verifies proofs frequently took longer. This is an upper
+/// bound rather than the usual case — a request that fails reports `SyncFailed` and is re-picked at
+/// once.
+pub(crate) const SYNC_GIVE_UP: Duration = network::SYNC_REQUEST_TIMEOUT;
+
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
     pub datadir: PathBuf,
@@ -185,7 +195,7 @@ struct Node {
     mempool: Mempool,
     net: NetworkHandle,
     status: Arc<RwLock<NodeStatus>>,
-    peers: HashMap<PeerId, Option<Status>>,
+    peers: HashMap<PeerId, Peer>,
     timeout: Option<(u64, Instant)>,
     propose_at: Option<(u64, Instant)>,
     last_block_at: Instant,
@@ -194,12 +204,31 @@ struct Node {
     /// reset to [`SYNC_BATCH`] after a batch applies, so a batch size the wire cannot carry is
     /// backed away from instead of retried forever.
     sync_batch: u32,
+    /// Sync requests that failed on the wire, timed out, or came back unusable, since start.
+    /// Surfaced in `shrugg status`, because the failure mode this counts was invisible on chain 8.
+    sync_failures: u64,
     fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, Hash>,
     /// Block hash -> (attempts so far, peers already asked) for by-hash fetches.
     fetch_attempts: HashMap<Hash, (usize, Vec<PeerId>)>,
 }
 
 const MAX_FETCH_ATTEMPTS: usize = 8;
+
+/// What the node knows about one peer.
+///
+/// Connectedness is tracked apart from the status, because the two arrive from different places and
+/// a peer can have one without the other. A `Status` reaches us over gossipsub, whose `from` is the
+/// message's *author* — so a validator several hops away, with no connection to us at all, lands in
+/// this map. Sending it a sync request makes `request_response` open a connection first, and on
+/// chain 8 that dial went to whatever identify had advertised and failed, taking the request with
+/// it. Only [`Peer::connected`] peers are asked for blocks.
+#[derive(Clone, Debug, Default)]
+struct Peer {
+    /// The last status this peer published, if we have seen one.
+    status: Option<Status>,
+    /// We currently hold an open connection to it.
+    connected: bool,
+}
 
 /// The wire cost of one committed block in a sync batch.
 ///
@@ -367,6 +396,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         last_block_at: Instant::now(),
         sync_inflight: None,
         sync_batch: SYNC_BATCH,
+        sync_failures: 0,
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
     };
@@ -440,7 +470,9 @@ impl Node {
         s.head_hash = self.hs.committed_hash().to_hex();
         s.view = self.hs.view();
         s.high_qc_view = self.hs.high_qc().view;
-        s.peer_count = self.peers.len();
+        // Connected peers, not every peer whose gossip we have relayed: the number an operator
+        // reads here is the number sync can actually ask for blocks.
+        s.peer_count = self.peers.values().filter(|p| p.connected).count();
         s.mempool_size = self.mempool.len();
         // Whether this node's key is in the set running the epoch the next block belongs to.
         // Distinct from `is_validator`, which only says the node holds a key at all.
@@ -453,9 +485,14 @@ impl Node {
         s.nullifiers = ledger.nullifiers().len() as u64;
         s.tree_root = shrugg_core::notes::word8_to_hex(&ledger.root());
         s.hc_bundle = shrugg_core::notes::word8_to_hex(&ledger.hc_bundle());
-        let target = self.peers.values().flatten().map(|p| p.height).max().unwrap_or(0);
+        let target = self.peers.values().filter_map(|p| p.status.as_ref()).map(|p| p.height).max().unwrap_or(0);
         s.sync_target = target.max(s.height);
         s.syncing = self.sync_inflight.is_some();
+        // Without these, a node that is `syncing: true` with a rising target and no warning in the
+        // log looks healthy while making no progress at all — which is exactly how chain 8's
+        // catch-up stall presented.
+        s.sync_inflight_age_ms = self.sync_inflight.map(|(_, _, at)| at.elapsed().as_millis() as u64);
+        s.sync_failures = self.sync_failures;
     }
 
     async fn broadcast_status(&self) {
@@ -644,13 +681,16 @@ impl Node {
         match ev {
             NetworkEvent::Listening(a) => tracing::info!("listening on {a}"),
             NetworkEvent::PeerConnected(p) => {
-                self.peers.entry(p).or_insert(None);
+                self.peers.entry(p).or_default().connected = true;
                 self.broadcast_status().await;
             }
             NetworkEvent::PeerDisconnected(p) => {
                 self.peers.remove(&p);
                 if self.sync_inflight.map(|s| s.0) == Some(p) {
                     self.sync_inflight = None;
+                    // The peer we were waiting on is gone: go to another one now rather than
+                    // sitting out the rest of the give-up window.
+                    self.maybe_sync().await;
                 }
             }
             NetworkEvent::Gossip { from, msg } => match msg {
@@ -660,7 +700,7 @@ impl Node {
                 }
                 GossipMessage::Status(s) => {
                     let ahead = s.height > self.hs.committed_height() + 1;
-                    self.peers.insert(from, Some(s));
+                    self.peers.entry(from).or_default().status = Some(s);
                     if ahead && self.sync_inflight.is_none() {
                         self.maybe_sync().await;
                     }
@@ -675,7 +715,10 @@ impl Node {
                 self.on_sync_response(peer, request_id, response).await?;
             }
             NetworkEvent::SyncFailed { peer, request_id, error } => {
-                if self.sync_inflight.map(|s| s.1) == Some(request_id) {
+                let was_batch = self.sync_inflight.map(|s| s.1) == Some(request_id);
+                if was_batch {
+                    let elapsed = self.sync_inflight.map(|(_, _, at)| at.elapsed().as_millis() as u64).unwrap_or(0);
+                    self.sync_failures += 1;
                     self.sync_inflight = None;
                     // Halve the batch, down to a single block. A batch too big for the wire fails
                     // identically every time it is retried at the same size — which is how a node
@@ -685,13 +728,18 @@ impl Node {
                     // `debug` an operator on the default `RUST_LOG=info` saw nothing at all.
                     self.sync_batch = (self.sync_batch / 2).max(SYNC_BATCH_MIN);
                     tracing::warn!(
-                        %peer, ?request_id, next_batch = self.sync_batch,
+                        %peer, ?request_id, elapsed_ms = elapsed, failures = self.sync_failures,
+                        next_batch = self.sync_batch,
                         "sync batch request failed: {error}"
                     );
                 } else {
-                    tracing::debug!("sync request to {peer} failed: {error}");
+                    tracing::info!(%peer, ?request_id, "sync request failed: {error}");
                 }
                 self.retry_fetch(request_id).await?;
+                if was_batch {
+                    // Straight to another peer rather than waiting out the 2 s tick.
+                    self.sync_from(Some(peer)).await;
+                }
             }
         }
         Ok(())
@@ -761,11 +809,23 @@ impl Node {
         let mut candidates: Vec<PeerId> = self
             .peers
             .iter()
-            .filter(|(p, s)| !asked.contains(p) && s.as_ref().map(|s| s.height >= my_height).unwrap_or(false))
+            // Connected, not yet asked, and on our chain at or past our height. A by-hash fetch
+            // goes over a connection for the same reason a batch request does (see [`Peer`]).
+            .filter(|(p, peer)| {
+                peer.connected
+                    && !asked.contains(p)
+                    && peer.status.as_ref().map(|s| s.height >= my_height).unwrap_or(false)
+            })
             .map(|(p, _)| *p)
             .collect();
         if candidates.is_empty() {
-            candidates = self.peers.keys().filter(|p| !asked.contains(p)).copied().collect();
+            // Any connected peer, even one that has not told us its height.
+            candidates = self
+                .peers
+                .iter()
+                .filter(|(p, peer)| peer.connected && !asked.contains(p))
+                .map(|(p, _)| *p)
+                .collect();
         }
         let Some(peer) = candidates.first().copied() else {
             tracing::debug!("no peer left to fetch block {h:?} from");
@@ -798,21 +858,39 @@ impl Node {
     }
 
     fn best_peer_height(&self) -> u64 {
-        self.peers.values().flatten().map(|s| s.height).max().unwrap_or(0)
+        self.peers.values().filter_map(|p| p.status.as_ref()).map(|s| s.height).max().unwrap_or(0)
     }
 
     async fn maybe_sync(&mut self) {
-        if let Some((_, _, started)) = self.sync_inflight {
-            if started.elapsed() < Duration::from_secs(10) {
+        self.sync_from(None).await
+    }
+
+    /// Ask the best peer ahead of us for the next batch of committed blocks.
+    ///
+    /// `skip` is a peer not to choose — the one whose request just failed, so a failure moves to
+    /// another peer instead of re-picking the same one by the same `max_by_key`. On chain 8 the
+    /// picker chose the same unreachable peer six times in two seconds.
+    ///
+    /// Only *connected* peers are candidates; see [`Peer`].
+    async fn sync_from(&mut self, skip: Option<PeerId>) {
+        if let Some((peer, id, started)) = self.sync_inflight {
+            if started.elapsed() < SYNC_GIVE_UP {
                 return;
             }
+            // Past the wire's own timeout, so the request is gone rather than merely slow.
+            tracing::warn!(
+                %peer, ?id, elapsed_ms = started.elapsed().as_millis() as u64,
+                "sync request abandoned after the wire timeout; trying another peer"
+            );
+            self.sync_failures += 1;
             self.sync_inflight = None;
         }
         let my_height = self.hs.committed_height();
         let best = self
             .peers
             .iter()
-            .filter_map(|(p, s)| s.as_ref().map(|s| (*p, s.height)))
+            .filter(|(p, peer)| peer.connected && Some(**p) != skip)
+            .filter_map(|(p, peer)| peer.status.as_ref().map(|s| (*p, s.height)))
             .filter(|(_, h)| *h > my_height)
             .max_by_key(|(_, h)| *h);
         let Some((peer, _)) = best else { return };
@@ -840,8 +918,44 @@ impl Node {
                 self.retry_fetch(request_id).await?;
             }
             SyncResponse::Blocks(blocks) => {
-                if self.sync_inflight.map(|s| s.1) != Some(request_id) {
+                let current = self.sync_inflight.map(|s| s.1) == Some(request_id);
+                let elapsed = self.sync_inflight.map(|(_, _, at)| at.elapsed().as_millis() as u64);
+                // A batch is judged by what it contains, not by which request asked for it. The
+                // node used to drop any response whose id was not the current one, which threw away
+                // perfectly good blocks every time its own give-up had already re-requested the
+                // same range — so only a batch that arrived inside the give-up window counted, and
+                // catch-up moved one batch per 30-40 s with nothing in the log to say why. A batch
+                // that starts at exactly our next height is usable whoever asked for it and however
+                // late it is; applying it twice is impossible, because the second copy no longer
+                // starts at our next height.
+                let usable = match blocks.first() {
+                    Some(first) => first.block.height() == self.hs.committed_height() + 1,
+                    // An empty batch says the peer has nothing past our height.
+                    None => false,
+                };
+                if !usable {
+                    if !current {
+                        self.sync_failures += 1;
+                    }
+                    tracing::info!(
+                        %peer, ?request_id, current_request = current, ?elapsed,
+                        first = ?blocks.first().map(|b| b.block.height()),
+                        my_height = self.hs.committed_height(), blocks = blocks.len(),
+                        "ignoring a sync batch that does not start at our next height"
+                    );
+                    if current {
+                        self.sync_inflight = None;
+                    }
                     return Ok(());
+                }
+                if !current {
+                    // Late but usable: count it, so an operator can see the deadline being missed,
+                    // and apply it anyway.
+                    self.sync_failures += 1;
+                    tracing::info!(
+                        %peer, ?request_id, blocks = blocks.len(),
+                        "applying a sync batch that arrived after its request was abandoned"
+                    );
                 }
                 self.sync_inflight = None;
                 let n = blocks.len();
@@ -1228,5 +1342,50 @@ mod tests {
         assert_eq!(&seen[..4], &[100, 50, 25, 12]);
         assert_eq!(*seen.last().unwrap(), SYNC_BATCH_MIN);
         assert!(seen.iter().all(|b| *b >= 1));
+    }
+
+    // ------------------------------------------------- the response-acceptance rule
+    //
+    // A batch is judged by what it holds, not by which request asked for it. The node used to drop
+    // any response whose id was not the current one, so a batch that arrived after its own 10 s
+    // give-up had re-requested the same range was thrown away — and on a 1-vCPU peer serving 100
+    // blocks, most of them did.
+
+    /// The rule `on_sync_response` applies, as a function of the batch's first height and ours.
+    fn accepts(first_height: Option<u64>, my_height: u64) -> bool {
+        match first_height {
+            Some(h) => h == my_height + 1,
+            None => false,
+        }
+    }
+
+    #[test]
+    fn a_batch_starting_at_our_next_height_is_accepted_however_late() {
+        assert!(accepts(Some(301), 300));
+    }
+
+    #[test]
+    fn a_batch_that_is_behind_or_overlaps_what_we_already_have_is_ignored() {
+        // Applied from another response while this one was in flight.
+        assert!(!accepts(Some(301), 400));
+        // Starts at a height we already hold, so it would not be contiguous.
+        assert!(!accepts(Some(300), 300));
+    }
+
+    #[test]
+    fn a_batch_that_skips_a_height_is_ignored() {
+        assert!(!accepts(Some(302), 300));
+    }
+
+    #[test]
+    fn an_empty_batch_is_not_progress() {
+        assert!(!accepts(None, 300));
+    }
+
+    /// The invariant the stall turned on: a give-up shorter than the wire's timeout abandons live
+    /// requests and then discards their answers.
+    #[test]
+    fn the_client_give_up_is_not_shorter_than_the_wire_timeout() {
+        assert!(SYNC_GIVE_UP >= network::SYNC_REQUEST_TIMEOUT);
     }
 }

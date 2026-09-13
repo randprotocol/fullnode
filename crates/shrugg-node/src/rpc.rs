@@ -38,6 +38,15 @@ pub struct NodeStatus {
     pub high_qc_view: u64,
     pub syncing: bool,
     pub sync_target: u64,
+    /// How long the outstanding sync request has been waiting, if one is outstanding.
+    ///
+    /// `syncing: true` with a rising `sync_target` says only that this node knows it is behind. An
+    /// age that keeps climbing past a few seconds says the request it is waiting on is not coming
+    /// back — the shape of the chain-8 catch-up stall, which showed nothing else at all.
+    pub sync_inflight_age_ms: Option<u64>,
+    /// Sync requests that failed on the wire, timed out, or came back unusable, since start.
+    /// Rising while `height` does not is the signature of a node that cannot catch up.
+    pub sync_failures: u64,
     pub peer_count: usize,
     pub mempool_size: usize,
     /// This node holds a validator key and is running as one (`--validator`).

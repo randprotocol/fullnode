@@ -19,11 +19,16 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{identify, identity, kad, mdns, noise, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 /// How long the request-response protocol waits for a sync response before reporting `SyncFailed`.
+///
+/// The node's own give-up (`node::SYNC_GIVE_UP`) is this same constant. A client deadline *shorter*
+/// than the wire's abandons a request id that is still perfectly alive, re-requests the same range
+/// under a new id, and then throws the answer to the old one away when it lands — which is the
+/// other half of why chain-8 catch-up advanced one batch per 30-40 s.
 pub const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a sync batch is allowed to weigh on the wire, measured with the codec's own serializer.
@@ -59,6 +64,71 @@ pub const SYNC_RESPONSE_WIRE_LIMIT: u64 = 2 * SYNC_MAX_WIRE_BYTES + (256 << 10);
 
 /// The reader limit on a sync *request*. A request is a height and a count, or a block hash.
 pub const SYNC_REQUEST_WIRE_LIMIT: u64 = 64 << 10;
+
+/// How reachable an address a peer advertised for itself actually is, from our side of the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddrScope {
+    /// `127.0.0.0/8` or `::1` — only ever reachable on the peer's own machine.
+    Loopback,
+    /// RFC1918 / RFC4193 / link-local — reachable only from the peer's own network.
+    Private,
+    /// Globally routable, or a name we cannot classify without resolving it.
+    Global,
+}
+
+/// Classify a multiaddr by the reachability of its IP component.
+///
+/// An address with no IP component (a `/dns4/...` name) counts as [`AddrScope::Global`]: we cannot
+/// tell without resolving it, and a name is not the failure mode this exists for.
+pub fn addr_scope(addr: &Multiaddr) -> AddrScope {
+    for p in addr.iter() {
+        match p {
+            libp2p::multiaddr::Protocol::Ip4(ip) => {
+                return if ip.is_loopback() {
+                    AddrScope::Loopback
+                } else if ip.is_private() || ip.is_link_local() || ip.is_unspecified() {
+                    AddrScope::Private
+                } else {
+                    AddrScope::Global
+                };
+            }
+            libp2p::multiaddr::Protocol::Ip6(ip) => {
+                let seg = ip.segments()[0];
+                return if ip.is_loopback() {
+                    AddrScope::Loopback
+                } else if ip.is_unspecified() || seg & 0xffc0 == 0xfe80 || seg & 0xfe00 == 0xfc00 {
+                    AddrScope::Private
+                } else {
+                    AddrScope::Global
+                };
+            }
+            _ => {}
+        }
+    }
+    AddrScope::Global
+}
+
+/// Whether an address a peer advertised through identify belongs in the dial table.
+///
+/// Every node advertises *all* of its listen addresses, and a node listening on
+/// `/ip4/0.0.0.0/tcp/30303` advertises the loopback one among them. Dialing that reaches our own
+/// machine, not the peer. On chain 8 it produced
+/// `Failed to negotiate transport protocol(s): [(/ip4/127.0.0.1/tcp/30303/...` and, because the
+/// loopback entry is tried as part of the same dial, it failed the dial and with it the sync
+/// request that needed the connection — one lost batch per attempt, against a chain growing at a
+/// block a second.
+///
+/// Loopback is therefore never dialable. A private address is dialable only for a peer we found on
+/// our own link over mDNS (`peer_on_lan`) — which is how the two laptop nodes reach each other —
+/// and never for a peer we learned about over the WAN, where `10.x` is the droplets' private
+/// network and unreachable from here.
+pub fn is_dialable_advertised_addr(addr: &Multiaddr, peer_on_lan: bool) -> bool {
+    match addr_scope(addr) {
+        AddrScope::Loopback => false,
+        AddrScope::Private => peer_on_lan,
+        AddrScope::Global => true,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct NetworkConfig {
@@ -293,6 +363,9 @@ async fn run(
     // Dialable addresses of every peer we have ever connected to, so a dropped
     // link is re-established without waiting for mDNS or Kademlia to rediscover it.
     let mut known: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+    // Peers mDNS found on our own link: for these, and only these, a private advertised address is
+    // worth dialing.
+    let mut lan_peers: HashSet<PeerId> = HashSet::new();
     dial_bootstrap(&mut swarm, &cfg, &peers);
     if !cfg.bootstrap.is_empty() {
         let _ = swarm.behaviour_mut().kademlia.bootstrap();
@@ -366,7 +439,7 @@ async fn run(
                 }
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &mut peers, &mut known, &evt_tx).await;
+                handle_swarm_event(event, &mut swarm, &mut peers, &mut known, &mut lan_peers, &evt_tx).await;
             }
         }
     }
@@ -378,6 +451,7 @@ async fn handle_swarm_event(
     swarm: &mut Swarm<ShruggBehaviour>,
     peers: &mut HashMap<PeerId, ConnectedPeer>,
     known: &mut HashMap<PeerId, Vec<Multiaddr>>,
+    lan_peers: &mut HashSet<PeerId>,
     evt_tx: &mpsc::Sender<NetworkEvent>,
 ) {
     match event {
@@ -420,11 +494,18 @@ async fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(ShruggEvent::Gossipsub(_)) => {}
         SwarmEvent::Behaviour(ShruggEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+            // A peer advertises every address it listens on, loopback and LAN included. Only the
+            // ones we could actually reach it at go in: Kademlia's addresses are what
+            // `request_response` dials when it has no open connection to a peer, so an unreachable
+            // entry there does not merely waste a dial, it fails the sync request that needed the
+            // connection (`is_dialable_advertised_addr`).
+            let on_lan = lan_peers.contains(&peer_id);
             for addr in info.listen_addrs {
-                let is_loopback = addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::Ip4(ip) if ip.is_loopback()));
-                if !is_loopback {
-                    remember_addr(known, peer_id, addr.clone());
+                if !is_dialable_advertised_addr(&addr, on_lan) {
+                    tracing::trace!(%peer_id, %addr, "ignoring an unreachable advertised address");
+                    continue;
                 }
+                remember_addr(known, peer_id, addr.clone());
                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
             }
         }
@@ -440,6 +521,9 @@ async fn handle_swarm_event(
         SwarmEvent::Behaviour(ShruggEvent::Mdns(mdns::Event::Discovered(list))) => {
             for (peer_id, addr) in list {
                 tracing::info!(%peer_id, %addr, "mdns discovered peer");
+                // mDNS only answers from our own link, so this peer's private addresses are
+                // reachable and identify may keep advertising them to us.
+                lan_peers.insert(peer_id);
                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
                 if !peers.contains_key(&peer_id) {
                     if let Err(e) = swarm.dial(addr) {
@@ -474,6 +558,75 @@ async fn handle_swarm_event(
 mod tests {
     use super::*;
     use shrugg_core::Hash;
+
+    // ------------------------------------------- advertised-address filtering
+    //
+    // Chain 8's other catch-up defect: every node listens on `/ip4/0.0.0.0/tcp/30303` and so
+    // advertises `/ip4/127.0.0.1/tcp/30303` through identify beside its public address. That entry
+    // went into Kademlia, `request_response` used it when it needed a connection to send a sync
+    // request, and the dial — and the request with it — failed.
+
+    fn addr(s: &str) -> Multiaddr {
+        s.parse().expect("a valid multiaddr")
+    }
+
+    #[test]
+    fn loopback_is_never_a_dialable_advertised_address() {
+        for a in ["/ip4/127.0.0.1/tcp/30303", "/ip4/127.0.0.53/tcp/1", "/ip6/::1/tcp/30303"] {
+            assert_eq!(addr_scope(&addr(a)), AddrScope::Loopback, "{a}");
+            // Not even for a peer on our own link: its loopback is still its own machine.
+            assert!(!is_dialable_advertised_addr(&addr(a), true), "{a} dialable on lan");
+            assert!(!is_dialable_advertised_addr(&addr(a), false), "{a} dialable off lan");
+        }
+    }
+
+    #[test]
+    fn a_private_advertised_address_is_dialable_only_for_an_mdns_peer() {
+        // `10.x` is the droplets' private network, which chain 8's nodes advertise beside their
+        // public addresses and which is unreachable from a laptop.
+        for a in [
+            "/ip4/10.100.0.2/tcp/30303",
+            "/ip4/192.168.100.79/tcp/30303",
+            "/ip4/172.16.4.1/tcp/1",
+            "/ip4/169.254.1.1/tcp/1",
+            "/ip6/fe80::1/tcp/1",
+            "/ip6/fd00::1/tcp/1",
+        ] {
+            assert_eq!(addr_scope(&addr(a)), AddrScope::Private, "{a}");
+            assert!(!is_dialable_advertised_addr(&addr(a), false), "{a} dialable off lan");
+            // The two laptop nodes find each other over mDNS and must keep working.
+            assert!(is_dialable_advertised_addr(&addr(a), true), "{a} not dialable on lan");
+        }
+    }
+
+    #[test]
+    fn a_public_advertised_address_is_always_dialable() {
+        for a in [
+            "/ip4/107.170.49.234/tcp/30303",
+            "/ip4/188.166.235.187/tcp/30303",
+            "/ip6/2606:4700::1/tcp/1",
+            "/dns4/node.example/tcp/30303",
+        ] {
+            assert_eq!(addr_scope(&addr(a)), AddrScope::Global, "{a}");
+            assert!(is_dialable_advertised_addr(&addr(a), false), "{a}");
+            assert!(is_dialable_advertised_addr(&addr(a), true), "{a}");
+        }
+    }
+
+    /// Exactly what nyc2 advertised on chain 8, in the order the dial table would have tried it:
+    /// the loopback entry first, then the public address, then two private ones.
+    #[test]
+    fn filtering_a_chain_8_advertisement_keeps_only_the_public_address() {
+        let advertised = [
+            "/ip4/127.0.0.1/tcp/30303",
+            "/ip4/107.170.49.234/tcp/30303",
+            "/ip4/10.13.0.5/tcp/30303",
+            "/ip4/10.100.0.2/tcp/30303",
+        ];
+        let kept: Vec<&str> =
+            advertised.iter().copied().filter(|a| is_dialable_advertised_addr(&addr(a), false)).collect();
+        assert_eq!(kept, vec!["/ip4/107.170.49.234/tcp/30303"]);
+    }
 
     async fn wait_for<T>(
         rx: &mut mpsc::Receiver<NetworkEvent>,
