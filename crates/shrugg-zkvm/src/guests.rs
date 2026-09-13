@@ -6,14 +6,15 @@ const T0: u32 = 5; const T1: u32 = 6; const T2: u32 = 7; const T3: u32 = 28; con
 const T6: u32 = 31; const S0: u32 = 8; const S1: u32 = 9;
 const HEAP: i32 = 0x1000; // data lives above the code
 
-/// M4.1: guests built with the real `riscv32im-unknown-none-elf` toolchain (upstream's
+/// M4.1/M4.2: guests built with the real `riscv32im-unknown-none-elf` toolchain (upstream's
 /// `guest-sdk`/`guests-compiled/`, not vendored into this crate — see `deploy/sync-zkvm.sh`'s
 /// header comment) and loaded as flat binaries (`isa::Program::from_flat_binary`), as opposed to
 /// every other guest in this module, which is written directly against `asm.rs`'s mnemonic
 /// helpers. Mirrors upstream `research/src/guests.rs`'s `compiled` module exactly, except the
 /// `include_bytes!` path: `guests-compiled/` sits directly under this crate root
-/// (`crates/shrugg-zkvm/guests-compiled/bin/fib.bin`, vendored by `deploy/sync-zkvm.sh`'s copy
-/// step), one level shallower than upstream's `research/../guests-compiled/`.
+/// (`crates/shrugg-zkvm/guests-compiled/bin/{fib,keccak256}.bin`, vendored by
+/// `deploy/sync-zkvm.sh`'s copy step), one level shallower than upstream's
+/// `research/../guests-compiled/`.
 pub mod compiled {
     use crate::isa::Program;
 
@@ -24,6 +25,19 @@ pub mod compiled {
     pub fn fib() -> Program {
         const BIN: &[u8] = include_bytes!("../guests-compiled/bin/fib.bin");
         Program::from_flat_binary(0x1000, BIN).expect("fib.bin is a committed, known-good build")
+    }
+
+    /// M4.2's exit guest: Keccak-256 over the `KECCAK` syscall, compiled from upstream
+    /// `guests-compiled/keccak256` (see that Makefile's header, in `circuits/guests-compiled/
+    /// keccak256/`, for the exact `rustc +1.98.1` build) and vendored as
+    /// `guests-compiled/bin/keccak256.bin`. `input[0]` is the message's byte length, `input[1..]`
+    /// the message four bytes per word little-endian; the 32-byte digest comes back in output
+    /// slots 0..7 the same way. The sponge is `guest_sdk::keccak256` — ordinary compiled guest
+    /// code — so the only thing the chip proves is the permutation itself, which is the whole
+    /// point of the milestone.
+    pub fn keccak256() -> Program {
+        const BIN: &[u8] = include_bytes!("../guests-compiled/bin/keccak256.bin");
+        Program::from_flat_binary(0x1000, BIN).expect("keccak256.bin is a committed, known-good build")
     }
 }
 
@@ -306,10 +320,49 @@ pub fn poseidon2_demo(msg: &[u32]) -> Program {
     a.assemble()
 }
 
+/// M4.2 demo: `keccak256(msg)` for a message that fits one rate block (≤ 135 bytes, so a
+/// single permutation), with the sponge itself in guest code — exactly what `guest-sdk`'s own
+/// `keccak256` does, transcribed against `asm.rs`: XOR the padded 136-byte block into the first
+/// 34 words of a 50-word state, call `KECCAK` once, and publish the first 8 words of the
+/// permuted state as the 32-byte digest.
+///
+/// Words 34..49 of the state start at zero and are never written, so the emulator's
+/// never-written-reads-zero rule supplies them (and the memory table's own "first touch of a
+/// fresh address as a read returns zero" rule proves it).
+///
+/// The state's base address is held in a register (`S0`), not folded into each `sw`'s
+/// immediate: `HEAP + 4·49` is far outside a 12-bit signed I-type field, and AGENTS.md
+/// invariant 3 is exactly the silent wrap that would cause.
+///
+/// Ported from upstream `guests.rs` (see `sub_word_checksum`'s doc comment for why it isn't in
+/// `all()`); the vendored `tests/cheating.rs` and `tests/e2e.rs` call it by name.
+pub fn keccak_demo(msg: &[u8]) -> Program {
+    assert!(msg.len() <= 135, "keccak_demo hashes one rate block");
+    let mut block = [0u8; 136];
+    block[..msg.len()].copy_from_slice(msg);
+    block[msg.len()] ^= 0x01;
+    block[135] ^= 0x80;
+    let mut a = Assembler::new(0);
+    a.extend(li(S0, HEAP));
+    for i in 0..34 {
+        let w = u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap());
+        a.extend(li(T0, w as i32));
+        a.push(sw(S0, T0, 4 * i as i32));
+    }
+    a.extend(call_keccak(HEAP / 4));
+    for k in 0..8 {
+        a.push(lw(T0, S0, 4 * k as i32));
+        a.extend(write_output(k as u32, T0));
+    }
+    a.extend(halt());
+    a.assemble()
+}
+
 /// (name, program, private inputs) — this chain's deployed guest catalog, which the vendored
 /// `tests/{asm,backend,e2e,isa,tables}.rs` sweep over. Deliberately NOT upstream's list: it
-/// carries the node-local `private_payment` and leaves out the three guests upstream added to
-/// its own `all()` for coverage (`sub_word_checksum`, `muldiv`, `poseidon2_demo` — all three
+/// carries the node-local `private_payment` and leaves out the four guests upstream added to
+/// its own `all()` for coverage (`sub_word_checksum`, `muldiv`, `poseidon2_demo`,
+/// `keccak_demo` — all four
 /// still exist above and the vendored tests that want them call them by name). Neither
 /// `transfer()` nor `bundle()` belongs here either: upstream does not list them, and both prove
 /// at tier 14, which would turn every sweeping test into a multi-minute run.

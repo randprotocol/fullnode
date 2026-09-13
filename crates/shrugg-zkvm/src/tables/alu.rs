@@ -91,11 +91,14 @@ pub mod col {
     pub const S0: usize = 38;
     /// pw - 1 - r limbs / bitwise CL0..3 / **M2.6 mul**: `LO`'s own byte limbs, populated
     /// on every mul-family row regardless of which op is selected (this is what pins the
-    /// shared `CARRY` witness to its unique honest value — see the `alu` doc comment) /
-    /// **M2.6 div**: `|A|`'s own byte limbs.
+    /// shared `CARRY` witness to its unique honest value — see the `alu` doc comment).
+    /// Unused on div rows (audit ZL4, 2026-09-12: the shipped division design decomposes no
+    /// `|A|` columns — see the in-AIR comment at the division block; the old wording described
+    /// an abandoned design).
     pub const T0: usize = 42;
     pub const SA: usize = 46; pub const SB: usize = 47; pub const SHH: usize = 48; pub const PW: usize = 49;
-    /// four adder carries / **M2.6 div**: `|B|`'s own byte limbs.
+    /// four adder carries. Unconditionally boolean; unused as limbs on div rows (same note as
+    /// `T0` — `|A|`/`|B|` are pure expressions there, not column decompositions).
     pub const CARRY0: usize = 50;
     pub const INV: usize = 54; pub const IS_REAL: usize = 55; pub const MULT: usize = 56;
     /// A's top-limb (A0+3) low nibble's high-nibble companion, used on `slt`/`sra` rows and

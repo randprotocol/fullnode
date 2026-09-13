@@ -3,11 +3,11 @@
 #
 # Local additions (executor.rs, codec.rs, address.rs, the extended guests.rs and asm.rs,
 # tests/executor.rs, tests/shielded.rs) are preserved; machine.rs gets a
-# small post-sync patch exposing log_ext_degrees_pub (M4.1: now (tier, program_log_height,
-# input_log_height)-keyed — the input table's declared height joins the program table's as a
-# third, proof-declared key component; see the M4.1 patch comment below). tests/backend.rs,
-# tests/cheating.rs, tests/emulator.rs, tests/isa.rs, tests/tables.rs and tests/zk.rs are vendored
-# wholesale, as before — nothing sync-script-specific changed for them under M4.1.
+# small post-sync patch exposing log_ext_degrees_pub (M4.2: now a five-argument
+# (tier, program_log_height, input_log_height, keccak_log_height, mem_log_height) function —
+# see the M4.2 patch comment below). tests/backend.rs,
+# tests/cheating.rs, tests/emulator.rs, tests/isa.rs, tests/keccak.rs, tests/tables.rs and
+# tests/zk.rs are vendored wholesale, as before.
 #
 # Shielded pool S1: the note layer — `notes.rs`, `viewing.rs`, `ledger.rs` — IS vendored now. The
 # node's shielded pool is built on exactly the research crate's note commitments, nullifiers,
@@ -50,6 +50,31 @@
 # `research/tests` either, so it needs its own copy step (below) rather than riding along with
 # either rsync.
 #
+# M4.2 (constraint set 5, upstream ffd9e1e) changes five things this script has to know about.
+# (1) A ninth AIR table, `tables/keccak.rs` (Keccak-f[1600]), plus its host reference `src/keccak.rs`
+# and its own `tests/keccak.rs`: all three ride along with the two rsyncs, but `src/lib.rs` is
+# hand-maintained on this side, so `pub mod keccak;` has to be added there by hand, and
+# `crates/shrugg-zkvm/Cargo.toml` needs upstream's `p3-keccak = "=0.7.0"` (the table's AIR) and the
+# `hex = "0.4"` dev-dependency `tests/keccak.rs`'s known-answer vectors use.
+# (2) The keccak table is *optional per proof*: `Proof::keccak_log_height == 0` means the batch has
+# eight instances and no keccak table at all, and `Proof::mem_log_height` is proof-declared too.
+# Both are untrusted words, both are range-checked by `machine::check_declared_heights` before
+# anything is sized from them — the chain executor calls that same function rather than restating
+# its rules (`src/executor.rs`).
+# (3) `Machine::verifier_key` is keyed on four components now, `(tier, program_log_height,
+# input_log_height, keccak_log_height)`, while `log_ext_degrees` takes five (the declared
+# `mem_log_height` as well, which `verifier_key` deliberately does not take — every valid memory
+# height yields the same `CommonData`). The `log_ext_degrees_pub` patch below follows both.
+# (4) The 2026-09-12 zk-audit port (ZC1/ZC2 cpu hash row-group entry gates and the HASH_FIN pin,
+# ZM2's additive memory sort key, ZM3's `Instr::encode` immediate-range asserts, ZM4's Poseidon2
+# pointer bound, ZH1-ZH4's tier/length caps) arrives entirely through the rsyncs — nothing here.
+# (5) The production FRI profile is back to 80 queries / blowup 8 / 20 PoW bits, so proofs are
+# ~1.20 MB (tier 10) / ~1.25 MB (tier 12) and a keccak-bearing proof is ~1.91 MB larger. That is
+# not a sync-script concern, but it is why `shrugg-core`'s `MAX_PROOF_BYTES` moved to 2 MiB.
+# `guests.rs` and `asm.rs` stay excluded, so M4.2's `guests::compiled::keccak256()`,
+# `guests::keccak_demo()` and `asm::call_keccak()` are mirrored by hand into the local copies —
+# the vendored `tests/{asm,cheating,e2e,emulator}.rs` call all three by name.
+#
 # The CUDA backend is *not* vendored either: crates/shrugg-zkvm depends on it by path, as
 # ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building
 # with --features cuda or --features mock-cuda.
@@ -64,45 +89,60 @@ rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude
 rsync -a --delete --exclude executor.rs --exclude shielded.rs \
       --exclude viewing.rs --exclude bundle.rs "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
-# M4.1: vendor the compiled guest binary `tests/e2e.rs::compiled_fib_*` and the local
-# `guests::compiled::fib()` (see the header comment) both need. It lives beside `research/`, not
-# inside it, so `$SRC/../guests-compiled` — fail loudly rather than leaving a stale/missing binary
-# that only shows up as a runtime `include_bytes!` compile error far from this script.
-FIB_SRC="$SRC/../guests-compiled/bin/fib.bin"
-if [ ! -f "$FIB_SRC" ]; then
-  echo "sync-zkvm.sh: expected compiled guest binary at $FIB_SRC — not found" >&2
-  exit 1
-fi
+# M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local
+# `guests::compiled::{fib,keccak256}()` (see the header comment) need — `fib.bin` since M4.1,
+# `keccak256.bin` since M4.2. They live beside `research/`, not inside it, so
+# `$SRC/../guests-compiled` — fail loudly rather than leaving a stale/missing binary that only
+# shows up as a runtime `include_bytes!` compile error far from this script.
 mkdir -p "$DST/guests-compiled/bin"
-cp "$FIB_SRC" "$DST/guests-compiled/bin/fib.bin"
-[ -f "$FIB_SRC.sha256" ] && cp "$FIB_SRC.sha256" "$DST/guests-compiled/bin/fib.bin.sha256" || true
+for GUEST in fib keccak256; do
+  BIN_SRC="$SRC/../guests-compiled/bin/$GUEST.bin"
+  if [ ! -f "$BIN_SRC" ]; then
+    echo "sync-zkvm.sh: expected compiled guest binary at $BIN_SRC — not found" >&2
+    exit 1
+  fi
+  cp "$BIN_SRC" "$DST/guests-compiled/bin/$GUEST.bin"
+  [ -f "$BIN_SRC.sha256" ] && cp "$BIN_SRC.sha256" "$DST/guests-compiled/bin/$GUEST.bin.sha256" || true
+done
 # rand_zkvm -> shrugg_zkvm, but the *dependency* rand_zkvm_cuda keeps its own name (it is an
 # unmodified external crate), so park it behind a placeholder while the rename runs.
 grep -rl "rand_zkvm" "$DST/src" "$DST/tests" | xargs -I{} sed -i '' \
       -e 's/rand_zkvm_cuda/@@RAND_ZKVM_CUDA@@/g' \
       -e 's/rand_zkvm/shrugg_zkvm/g' \
       -e 's/@@RAND_ZKVM_CUDA@@/rand_zkvm_cuda/g' {} 2>/dev/null || true
-# M4.1: `verifier_key` grew from a (tier, program_log_height) 2-tuple key to a (tier,
-# program_log_height, input_log_height) 3-tuple (the input table's height is proof-declared, just
-# like the program table's since M3.4) — the wrapper's signature has to track that, or the chain
-# executor's degree-bits pre-check (`ZkExecutor::verify_call`) won't compile against it. The
-# anchor is the exact `verifier_key` signature line; if upstream's signature ever changes again
+# M4.2: `verifier_key`'s key grew a fourth component — it is `(tier, program_log_height,
+# input_log_height, keccak_log_height)` now, the keccak table's declared height joining the
+# program table's (M3.4) and the input table's (M4.1) as proof-declared key material, with
+# `keccak_log_height == 0` a legitimate value meaning "this proof declares no keccak table".
+# `log_ext_degrees` takes a *fifth* argument on top of those four, the declared `mem_log_height`:
+# `verifier_key` deliberately does not take it (every valid memory height yields the same
+# `CommonData` — see that function's doc comment) but the degree-bit vector does depend on it, and
+# `Machine::verify` compares `proof.batch.degree_bits` against the five-argument call. The wrapper
+# therefore forwards all five, or the chain executor's degree-bits pre-check
+# (`ZkExecutor::decode_and_check`) could not reproduce what `verify` checks.
+#
+# The anchor is the exact `verifier_key` signature line — patched *in front of* it, so the wrapper
+# lands next to the function whose arity it tracks; if upstream's signature ever changes again
 # without this script being updated, `str.replace` would silently no-op and the build would fail
 # downstream with a much more confusing "no method named `log_ext_degrees_pub`" error far from
 # here — so this asserts the anchor is present and aborts the sync (non-zero exit) instead.
 if ! grep -q "log_ext_degrees_pub" "$DST/src/machine.rs"; then
   python3 - "$DST/src/machine.rs" <<'PY'
 import sys; p=sys.argv[1]; s=open(p).read()
-anchor = "    pub fn verifier_key(&self, tier: Tier, program_log_height: u8, input_log_height: u8) -> Arc<CommonData<Config>> {"
+anchor = "    pub fn verifier_key(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8) -> Arc<CommonData<Config>> {"
 wrapper = (
-    "    /// Public wrapper used by the chain executor to check a proof's degree bits.\n"
-    "    pub fn log_ext_degrees_pub(&self, tier: Tier, program_log_height: u8, input_log_height: u8) -> Vec<usize> "
-    "{ self.log_ext_degrees(tier, program_log_height, input_log_height) }\n\n"
+    "    /// Public wrapper used by the chain executor to check a proof's degree bits. Takes the\n"
+    "    /// declared `mem_log_height` as well as `verifier_key`'s four key components: the degree\n"
+    "    /// vector depends on it even though the verifier key does not, and `verify` compares\n"
+    "    /// `proof.batch.degree_bits` against exactly this call.\n"
+    "    pub fn log_ext_degrees_pub(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, mem_log_height: u8) -> Vec<usize> "
+    "{ self.log_ext_degrees(tier, program_log_height, input_log_height, keccak_log_height, mem_log_height) }\n\n"
 )
 assert anchor in s, (
     "machine.rs's verifier_key signature no longer matches the anchor this script patches on "
-    "(expected the M4.1 3-arg (tier, program_log_height, input_log_height) form) — update "
-    "deploy/sync-zkvm.sh's log_ext_degrees_pub patch to match the new signature before re-running"
+    "(expected the M4.2 4-arg (tier, program_log_height, input_log_height, keccak_log_height) "
+    "form) — update deploy/sync-zkvm.sh's log_ext_degrees_pub patch to match the new signature "
+    "before re-running"
 )
 s = s.replace(anchor, wrapper + anchor, 1)
 open(p, 'w').write(s)

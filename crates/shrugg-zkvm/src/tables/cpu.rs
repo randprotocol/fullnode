@@ -91,7 +91,12 @@ pub mod col {
     /// active on a real absorb row).
     pub const ACT0: usize = HV0 + 4;                                 // 96..99
     /// 2: byte limbs of this row's `HASH_LEFT` (absorb rows only) — bounds it to 16 bits,
-    /// comfortably more than `POSEIDON2_MAX_WORDS = 4096` needs.
+    /// comfortably more than `POSEIDON2_MAX_WORDS = 4096` needs. Note this is also the
+    /// effective cap on a provable *program* (and private-input vector): the first digest row's
+    /// `HASH_LEFT` is the program's word count, so a `len` (likewise `n_in`) over 65535 can
+    /// never satisfy the AIR — rejected host-side (audit ZH2, 2026-09-12:
+    /// `machine::ProveError::ProgramTooLong`/`InputTooLong`; `Program::from_flat_binary` caps at
+    /// the same bound).
     pub const LEFT0: usize = ACT0 + 4;                               // 100,101
     /// 2: byte limbs of this row's `HASH_IDX` (absorb rows only).
     pub const IDX0: usize = LEFT0 + 2;                               // 102,103
@@ -186,16 +191,38 @@ pub mod col {
     pub const IHVL0: usize = IS_SALT + 1;         // 32: byte limbs of the 8 H_IN output words
     pub const IHIMAX0: usize = IHVL0 + 32;        // 4
     pub const IINV0: usize = IHIMAX0 + 4;         // 4
-    pub const WIDTH: usize = IINV0 + 4;
+    /// M4.2: the `KECCAK` ecall row. One row, never a row group — the chip (`tables::keccak`)
+    /// proves the 24 rounds and sends the permutation's own 100 `MEMORY` messages; this row
+    /// only dispatches the call, bounds the pointer, and claims the chip's block on the
+    /// `KECCAK` bus. Appended at the end of the column list rather than slotted next to
+    /// `SYS_HASH`: column *indices* are load-bearing for the vendored fullnode at
+    /// re-vendoring time, and appending keeps every pre-M4.2 index where it was.
+    ///
+    /// It reuses the `SYS_HASH` group's `HASH_PTR`/`HP0..3`/`HP3_HI` columns for its own
+    /// (bounded) copy of `a0` — see the "CRITICAL 1" block in `eval` — and pins every *other*
+    /// hash-group column (`HASH_N`/`HASH_LEFT`/`HASH_IDX`/`HS0..7`) to zero, since nothing
+    /// routes a keccak row into a hash row-group (`continues` keys off `SYS_HASH` alone).
+    pub const SYS_KECCAK: usize = IINV0 + 4;
+    pub const WIDTH: usize = SYS_KECCAK + 1;
     /// Columns that must be zero on padding rows.
-    pub const SELECTORS: [usize; 26] = [
+    pub const SELECTORS: [usize; 27] = [
         IS_ALU, IS_IMM, IS_BRANCH, IS_LB, IS_LH, IS_LW, IS_SB, IS_SH, IS_SW, SIGNED,
         IS_JAL, IS_JALR, IS_LUI, IS_AUIPC, IS_ECALL, WRITES_RD, SYS_HALT, SYS_WRITE, SYS_READ, BR_NEG,
-        SYS_HASH, IS_HASH, IS_HASH_OUT, HASH_FIN, IS_DIGEST, IS_INDIGEST,
+        SYS_HASH, IS_HASH, IS_HASH_OUT, HASH_FIN, IS_DIGEST, IS_INDIGEST, SYS_KECCAK,
     ];
 }
 pub mod pv {
-    pub const PC_ENTRY: usize = 0; pub const TIER: usize = 1; pub const OUT0: usize = 2;
+    pub const PC_ENTRY: usize = 0;
+    /// Audit ZL1 (2026-09-12), **known and not fixed**: `TIER` is never constrained by the AIR.
+    /// Not exploitable — `Proof::tier` is independently checked against `TIERS` and against the
+    /// batch's `degree_bits` (`machine::check_declared_heights`, `Machine::verify`), and
+    /// `Machine::verify` also checks this public value against `proof.tier` — but it is a dead
+    /// public value as far as the *circuit* is concerned, and any future consumer assuming the
+    /// circuit binds it would be mistaken. Left as-is: removing it shifts the whole `pv` layout,
+    /// a breaking change for the vendoring node, so it is flagged for the next constraint-set
+    /// bump rather than taken here.
+    pub const TIER: usize = 1;
+    pub const OUT0: usize = 2;
     /// M3.4: the in-circuit program digest, pinned by the last digest row. Replaces the
     /// verifier-held `Program` — `Machine::verify` now checks `pv[HC0..HC7] == hc` instead.
     pub const HC0: usize = OUT0 + crate::isa::NUM_OUTPUTS;
@@ -339,6 +366,18 @@ where
         // `NEXT_PC = PC` on every row but the last (PC only advances once the whole
         // instruction — all its rows — has retired).
         let continues = v(SYS_HASH) + is_hash.clone() + is_hash_out.clone() - v(HASH_FIN);
+        // CRITICAL 4 (fix, audit ZC2 2026-09-12): `HASH_FIN` is meaningful only on a write-back
+        // row — it marks the *second* one. Left unpinned everywhere else, setting it on the
+        // ecall row (or on an absorb row) drives `continues` to 0 on that row, so the rest of
+        // the row-group's `HASH_PTR`/`HASH_N` stop being carried forward from the ecall row's
+        // range-checked values (the `HP0..3`/`HP3_HI` decomposition below, gated by `SYS_HASH +
+        // SYS_KECCAK`) and become free, unbounded field elements on the `MEMORY` bus — the exact
+        // mod-`p` key-aliasing hole CRITICAL 1 closed, one row later, with the absorb/write-back
+        // addresses (`HASH_PTR + 4·HASH_IDX + k`, `HASH_PTR + k + 4·HASH_FIN`) pointing wherever
+        // the witness likes. The same `continues = 0` also forces the ecall row's `NEXT_PC` to
+        // `PC + 4` via the general fallthrough rule, silently swallowing one instruction.
+        // Honest traces only ever set `HASH_FIN` on the second write-back row. Degree 2.
+        b.assert_zero(v(HASH_FIN) * (one.clone() - v(IS_HASH_OUT)));
 
         // fetch. M3.4: digest rows are `is_real = 1` (they count as cycles) but are not an
         // ordinary instruction fetch either — excluded via `off_cpu`, same as hash rows.
@@ -358,6 +397,7 @@ where
         b.assert_zero(off_cpu.clone() * v(SYS_HALT));
         b.assert_zero(off_cpu.clone() * v(SYS_WRITE));
         b.assert_zero(off_cpu.clone() * v(SYS_READ));
+        b.assert_zero(off_cpu.clone() * v(SYS_KECCAK));
         b.assert_zero(off_cpu.clone() * v(A));
         b.assert_zero(off_cpu.clone() * v(B));
         b.assert_zero(off_cpu.clone() * v(MEM_VAL));
@@ -566,7 +606,7 @@ where
         bus::MEMORY.send(b, [slot_w_space, slot_w_addr, ts(SLOT_W), slot_w_val, slot_w_is_write], Count::bounded(count3, 1));
 
         // syscalls: a = number, b = arg0, mem_val = arg1
-        let sys_sum = v(SYS_HALT) + v(SYS_WRITE) + v(SYS_READ) + v(SYS_HASH);
+        let sys_sum = v(SYS_HALT) + v(SYS_WRITE) + v(SYS_READ) + v(SYS_HASH) + v(SYS_KECCAK);
         b.assert_zero(v(IS_ECALL) * (sys_sum.clone() - one.clone()));
         b.assert_zero((one.clone() - v(IS_ECALL)) * sys_sum);
         b.assert_zero(v(SYS_HALT) * (v(A) - AB::Expr::from_u32(SYS_NUM_HALT)));
@@ -604,14 +644,53 @@ where
         // 2^16` via `IDX0..1`) or `HASH_PTR + k <= HASH_PTR + 7` (write-back) — stays comfortably
         // under `2^32` with no wraparound, the same argument `MA0..3`'s doc comment makes for
         // `MEM_ADDR·4 + off`.
+        //
+        // M4.2: the gate is `SYS_HASH + SYS_KECCAK`, not `SYS_HASH` — a `KECCAK` row reuses
+        // `HASH_PTR` as *its* bounded copy of `a0`, and needs the bound for the same reason and
+        // then some: the keccak chip does plain field addition `PTR + w` for `w < 50` and has
+        // nothing of its own that bounds `PTR` (Task 3 review, Important #1). The two selectors
+        // are mutually exclusive (the one-hot-on-ecall rule above), so the count stays ≤ 1.
+        let hp_gate = v(SYS_HASH) + v(SYS_KECCAK);
         {
             let mut hp = AB::Expr::ZERO;
             for i in 0..4 { hp += v(HP0 + i) * AB::Expr::from_u32(1 << (8 * i)); }
-            b.assert_zero(v(SYS_HASH) * (v(HASH_PTR) - hp));
-            for i in 0..4 { bus::RANGE8.lookup_key(b, [v(HP0 + i)], Count::bounded(v(SYS_HASH), 1)); }
+            b.assert_zero(hp_gate.clone() * (v(HASH_PTR) - hp));
+            for i in 0..4 { bus::RANGE8.lookup_key(b, [v(HP0 + i)], Count::bounded(hp_gate.clone(), 1)); }
             let hp3_lo = v(HP0 + 3) - AB::Expr::from_u32(16) * v(HP3_HI);
-            bus::AND4.lookup_key(b, [hp3_lo, AB::Expr::ZERO, AB::Expr::ZERO], Count::bounded(v(SYS_HASH), 1));
-            bus::AND4.lookup_key(b, [v(HP3_HI), AB::Expr::from_u32(0xC), AB::Expr::ZERO], Count::bounded(v(SYS_HASH), 1));
+            bus::AND4.lookup_key(b, [hp3_lo, AB::Expr::ZERO, AB::Expr::ZERO], Count::bounded(hp_gate.clone(), 1));
+            bus::AND4.lookup_key(b, [v(HP3_HI), AB::Expr::from_u32(0xC), AB::Expr::ZERO], Count::bounded(hp_gate.clone(), 1));
+        }
+
+        // M4.2: the `KECCAK` ecall row. `a0` (in `B`, read on every ecall row) is the word
+        // address of the 50-word state; there is no second argument (the state's width is
+        // fixed), and the whole syscall is this one row — `continues` keys off `SYS_HASH`
+        // alone, so a keccak row falls through to the ordinary `NEXT_PC = PC + 4` rule below
+        // and never routes into a hash row-group.
+        {
+            b.assert_zero(v(SYS_KECCAK) * (v(A) - AB::Expr::from_u32(crate::isa::SYS_KECCAK)));
+            b.assert_zero(v(SYS_KECCAK) * (v(HASH_PTR) - v(B)));
+            // The rest of the hash group's shared columns stay zero here: they are meaningless
+            // on a keccak row, and pinning them keeps a witness from smuggling a half-formed
+            // hash claim through a row that no hash-group rule gates on.
+            b.assert_zero(v(SYS_KECCAK) * v(HASH_N));
+            b.assert_zero(v(SYS_KECCAK) * v(HASH_LEFT));
+            b.assert_zero(v(SYS_KECCAK) * v(HASH_IDX));
+            for i in 0..8 { b.assert_zero(v(SYS_KECCAK) * v(HS0 + i)); }
+            // Controller ruling 3 (the cubic pointer rule): the `AND4[HP3_HI, 0xC, 0]` lookup
+            // above already forces `HP3_HI < 4`, i.e. `ptr < 2^30`. A keccak row needs
+            // `ptr + 49 < 2^30` (the chip addresses `PTR .. PTR+49`), so tighten the top
+            // nibble to `{0, 1, 2}`: then `ptr <= 0x2fff_ffff` and `ptr + 49 < 2^30` with room
+            // to spare. Degree 4 on a selector-gated product of one column — well under this
+            // table's degree-8 ceiling, which comes from the packed lookups, not row logic.
+            let hi = v(HP3_HI);
+            b.assert_zero(
+                v(SYS_KECCAK) * hi.clone() * (hi.clone() - one.clone()) * (hi - AB::Expr::TWO),
+            );
+            // The chip's side of the handshake: one entry per real 32-row block, keyed by the
+            // pair that makes the cpu's row and the chip's block the same event. `CLK` is this
+            // table's own (digest-prefix-shifted) clock, which is also what the chip's memory
+            // timestamps `4·CLK`/`4·CLK + 1` are built from.
+            bus::KECCAK.lookup_key(b, [v(CLK), v(HASH_PTR)], Count::bounded(v(SYS_KECCAK), 1));
         }
         {
             let mut t = b.when_transition();
@@ -650,6 +729,38 @@ where
             // absorb's `POSEIDON2` lookup — nothing else propagates it there.
             let out_continues = is_hash_out.clone() * (one.clone() - v(HASH_FIN));
             for i in 0..8 { t.assert_zero(out_continues.clone() * (n(HS0 + i) - v(HS0 + i))); }
+        }
+        {
+            let mut t = b.when_transition();
+            // CRITICAL 5 (fix, audit ZC1 2026-09-12): hash row-groups need *entry* gates, not
+            // just interior routing. Until these, every routing rule above was gated on the
+            // *current* row already being inside a group, so nothing constrained what may
+            // *precede* an `IS_HASH` or `IS_HASH_OUT` row: a cheating prover could splice a
+            // free-standing write-back pair (or a lone absorb row) in after any ordinary row —
+            // four arbitrary RAM writes per write-back row at a free, unbounded `HASH_PTR` (the
+            // `SYS_HASH`-gated `HP0..3` decomposition never fires on such a row, and the
+            // `continues` carry-forward only ever propagates *into* a group from its own ecall
+            // row), no permutation consumed (`is_hash_or_digest` excludes `IS_HASH_OUT`), and
+            // `HV` pinned only to a free `HS`. From there: plant values that later honest loads
+            // read, and fabricate any execution ending in any output.
+            //
+            // An absorb row may only follow the ecall row or another absorb row; a write-back
+            // row may only follow the ecall row (the `n = 0` case), an absorb row, or the
+            // *first* write-back row; and nothing hash-shaped may follow the second write-back
+            // row — the group ends there. Every honest group satisfies all three by
+            // construction, and every other row kind is excluded by having neither `SYS_HASH`
+            // nor `IS_HASH`/`IS_HASH_OUT` set: an ordinary instruction row, a digest or
+            // indigest row, a padding row (`SELECTORS`' `(1 - IS_REAL)·sel = 0`), and — the
+            // M4.2 case these gates must get right — a `SYS_KECCAK` row, which is an ecall row
+            // of the *ordinary* shape (one row, `continues` keys off `SYS_HASH` alone), so like
+            // `SYS_WRITE` or any other instruction it may not be followed by a hash row. Only
+            // `SYS_HASH` opens a row-group.
+            //
+            // All three are products of two degree-1 selectors: degree 2, well under this
+            // table's pinned degree 8 (`tests/tables.rs`'s degree pin).
+            t.assert_zero((one.clone() - v(SYS_HASH) - is_hash.clone()) * n(IS_HASH));
+            t.assert_zero((one.clone() - v(SYS_HASH) - is_hash.clone() - is_hash_out.clone()) * n(IS_HASH_OUT));
+            t.assert_zero(v(HASH_FIN) * n(IS_HASH_OUT));
         }
 
         // Absorb rows: `ACT0..3` is a boolean, non-increasing (contiguous-prefix) pattern —
@@ -1235,6 +1346,22 @@ pub fn cpu_trace(program: &Program, inputs: &[u32], salt: [u32; 4], events: &[Cy
             Some(Syscall::WriteOutput { slot, .. }) => { r[SYS_WRITE] = F::ONE; r[OUT_SEL0 + slot as usize] = F::ONE; written[slot as usize] += 1; }
             Some(Syscall::ReadInput { .. }) => r[SYS_READ] = F::ONE,
             Some(Syscall::Poseidon2 { .. }) => r[SYS_HASH] = F::ONE,
+            // M4.2: one row, and the pointer's own bounded byte decomposition — the same
+            // `HP0..3`/`HP3_HI` columns (and the same `RANGE8`/`AND4` receipts) a `SYS_HASH`
+            // ecall row fills, since the AIR's "CRITICAL 1" bound is gated on both selectors.
+            // Everything else about the call — the permutation and its 100 memory accesses —
+            // belongs to the keccak chip, not to this row.
+            Some(Syscall::Keccak { ptr }) => {
+                r[SYS_KECCAK] = F::ONE;
+                r[HASH_PTR] = F::from_u32(ptr);
+                let hpl = limbs(ptr);
+                for k in 0..4 { r[HP0 + k] = hpl[k]; range.range8((ptr >> (8 * k)) & 0xff); }
+                let hp3 = (ptr >> 24) & 0xff;
+                let (hp3_lo, hp3_hi) = (hp3 & 0xf, hp3 >> 4);
+                r[HP3_HI] = F::from_u32(hp3_hi);
+                nibble.and4(hp3_lo, 0);
+                nibble.and4(hp3_hi, 0xC);
+            }
             None => {}
         }
         // M3.2 hash rows. `hash_ptr_n` remembers the group's `(ptr, n)` from its ecall row

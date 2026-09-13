@@ -190,7 +190,7 @@ The proof says: both inputs are leaves under `anchor`, their nullifiers are the 
 inputs balance outputs plus the fee, and the spender holds the keys — without revealing which
 leaves, which amounts, or who. A wallet finds its own notes by trial-decrypting every envelope on
 the chain with its viewing key, so a node answers "here is the whole tree" and never "here is your
-balance". `docs/shielded.md` is the full guide, including the public/hidden table per action and
+balance". `docs/howto.md` (five questions, end to end) and `docs/shielded.md` is the full guide, including the public/hidden table per action and
 what still leaks (a witness request names the leaf you are about to spend).
 
 ```bash

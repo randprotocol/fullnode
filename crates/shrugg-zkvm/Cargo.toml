@@ -34,6 +34,10 @@ p3-fri = "=0.7.0"
 p3-dft = "=0.7.0"
 p3-merkle-tree = "=0.7.0"
 p3-symmetric = "=0.7.0"
+# M4.2: the `keccak` table (`tables/keccak.rs`) is built on `p3_keccak::KeccakAir`, and
+# `tests/keccak.rs` cross-checks `src/keccak.rs`'s host permutation against `p3_keccak`'s own.
+# Pinned to the exact version upstream uses — see `deploy/sync-zkvm.sh`'s header.
+p3-keccak = "=0.7.0"
 rand = { version = "0.10", features = ["std_rng"] }
 # Shielded pool S1: the vendored note layer's envelope format (`src/viewing.rs`). Pinned to the
 # exact versions the research crate uses — an envelope sealed by a wallet must open on a node,
@@ -46,6 +50,11 @@ postcard = { version = "1", features = ["alloc"] }
 # The GPU backend lives in the sibling `circuits` checkout and is referenced by path, never
 # vendored: `circuits/` must sit beside `fullnode/` to build any of the features below.
 rand-zkvm-cuda = { path = "../../../circuits/rand-zkvm-cuda", optional = true }
+
+[dev-dependencies]
+# M4.2: the vendored `tests/keccak.rs` states its known-answer vectors as hex strings. Same
+# version upstream's `[dev-dependencies]` pins.
+hex = "0.4"
 
 [features]
 default = []

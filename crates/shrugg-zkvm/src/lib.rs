@@ -5,6 +5,7 @@ pub mod emulator;
 pub mod tables;
 pub mod machine;
 pub mod hash;
+pub mod keccak;
 pub mod notes;
 pub mod viewing;
 pub mod ledger;

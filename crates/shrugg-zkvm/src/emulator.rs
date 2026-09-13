@@ -18,7 +18,16 @@ impl MemAccess { pub fn ts(&self, clk: u32) -> u32 { 4 * clk + self.slot } }
 pub struct AluEvent { pub op: AluOp, pub a: u32, pub b: u32, pub c: u32 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Syscall { Halt, WriteOutput { slot: u32, word: u32 }, ReadInput { idx: u32, word: u32 }, Poseidon2 { ptr: u32, n: u32 } }
+pub enum Syscall { Halt, WriteOutput { slot: u32, word: u32 }, ReadInput { idx: u32, word: u32 }, Poseidon2 { ptr: u32, n: u32 }, Keccak { ptr: u32 } }
+
+/// M4.2: the whole of one `KECCAK` syscall, on the single cpu row that issues it. `ptr` is the
+/// state's word address; `input`/`output` are the 50 words before and after the permutation, in
+/// `keccak::state_to_words`' layout. Unlike `HashRow` this is not a row *kind* — a `KECCAK` call
+/// is one row, never a row group — it is the message the keccak chip's table will be built from
+/// (M4.2 Task 4), which is why the permutation's own memory traffic lives beside it in
+/// `CycleEvent::keccak_accesses` rather than in `accesses`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeccakRow { pub ptr: u32, pub input: [u32; 50], pub output: [u32; 50] }
 
 /// Which row of a `POSEIDON2` syscall's row group a `CycleEvent` is, and the extra fields that
 /// row alone needs (the cpu table's hash-row columns, `docs/02-tables-and-buses.md`). `None` on
@@ -57,6 +66,15 @@ pub struct CycleEvent {
     pub a: u32, pub b: u32, pub c: u32, pub alu_out: u32, pub tgt: u32, pub mem_addr: u32, pub mem_val: u32,
     pub sys: Option<Syscall>, pub accesses: Vec<MemAccess>, pub alu: Vec<AluEvent>,
     pub hash_row: Option<HashRow>,
+    /// M4.2: `Some` exactly on a `KECCAK` row, `None` everywhere else.
+    pub keccak_row: Option<KeccakRow>,
+    /// M4.2: the `KECCAK` permutation's own 100 RAM accesses — 50 reads at slot 0, then 50
+    /// writes at slot 1 — kept apart from `accesses` because the *keccak* table, not the cpu
+    /// table, sends them on the `MEMORY` bus. `memory_trace` is the only consumer: it records
+    /// both lists, so that every access is on the receiving side of the bus whoever sends it.
+    /// The keccak table builds its own sends from its own columns (`PTR`, `CLK`, `IN`, `A`),
+    /// not from this list — which is why nothing else reads it.
+    pub keccak_accesses: Vec<MemAccess>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,7 +82,36 @@ pub struct Execution { pub events: Vec<CycleEvent>, pub outputs: [u32; NUM_OUTPU
 impl Execution { pub fn cycles(&self) -> usize { self.events.len() } }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecError { OutOfCycles(usize), BadPc(u32), Misaligned(u32), BadSyscall(u32), OutputSlot(u32), DoubleWrite(u32), InputIndex(u32), Poseidon2WordCount(u32) }
+pub enum ExecError {
+    OutOfCycles(usize), BadPc(u32), Misaligned(u32), BadSyscall(u32), OutputSlot(u32), DoubleWrite(u32),
+    InputIndex(u32), Poseidon2WordCount(u32),
+    /// Audit ZM4 (2026-09-12): a `POSEIDON2` pointer at or above `2^30`. The cpu AIR bounds
+    /// `HASH_PTR < 2^30` (the ecall row's `HP0..3`/`HP3_HI` decomposition — `MEM_ADDR`'s own
+    /// `MA0..3`/`MA3_HI` bound, checked once and carried across the row-group). A pointer at or
+    /// above that emulates fine but can never satisfy the AIR, so by this module's own doctrine
+    /// (the emulator is the reference semantics) the *emulator* must reject it — the same
+    /// treatment `KeccakPtrOutOfRange` gives the keccak syscall's own tighter bound.
+    Poseidon2Ptr(u32),
+    /// M4.2 (controller ruling 2): a `KECCAK` pointer past `KECCAK_PTR_LIMIT`. The cpu AIR
+    /// bounds a `SYS_KECCAK` row's pointer to `ptr < 0x3000_0000` (`HP3_HI ∈ {0,1,2}`, the
+    /// tightened top-nibble rule) so that the chip's own `PTR + w` address arithmetic can
+    /// neither wrap nor alias another `MEMORY` key; the emulator refuses at least those pointers
+    /// (`KECCAK_PTR_LIMIT` is 49 tighter still — see its doc), so there is no execution whose
+    /// honest trace the AIR would be unable to prove.
+    KeccakPtrOutOfRange(u32),
+}
+
+/// The largest word address a `KECCAK` syscall may name: the state occupies `ptr ..
+/// ptr + KECCAK_WORDS`, so this limit keeps the *whole* state below `0x3000_0000`.
+///
+/// This is **strictly inside** the AIR's bound, not equal to it: the cpu AIR only requires
+/// `ptr < 0x3000_0000` (`HP3_HI ∈ {0,1,2}`), which admits `ptr ≤ 0x2fff_ffff`, and `ptr + 49`
+/// cannot wrap for any of those either. The emulator therefore refuses the top
+/// `KECCAK_WORDS - 1 = 49` pointers the AIR would accept. That direction is the safe one — every
+/// execution the emulator admits has a provable honest trace, which is the property this module
+/// owes the AIR — and it keeps the whole state inside the sub-`2^30` region the memory table's
+/// key argument reasons about (`tables/memory.rs`).
+pub const KECCAK_PTR_LIMIT: u32 = 0x3000_0000 - KECCAK_WORDS;
 
 pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<Execution, ExecError> {
     let mut regs = [0u32; 32];
@@ -98,10 +145,11 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
         if let Some(op) = op1 { alu_out = op.eval(a, b_eff); alu.push(AluEvent { op, a, b: b_eff, c: alu_out }); }
         // slot-2 ALU: pc + imm
         if dec.is_branch + dec.is_jal + dec.is_auipc == 1 { tgt = pc.wrapping_add(dec.imm); alu.push(AluEvent { op: AluOp::Add, a: pc, b: dec.imm, c: tgt }); }
-        // POSEIDON2 dispatches a whole row-group and `continue`s the outer loop itself; every
-        // other instruction kind (including the other ecall syscalls) falls through to the
-        // single-event push at the bottom, unchanged from before M3.2.
-        let mut hashed = false;
+        // POSEIDON2 (a whole row group) and KECCAK (one row, but with its own memory and
+        // pc/register bookkeeping) push their events themselves and `continue` the outer loop;
+        // every other instruction kind (including the other ecall syscalls) falls through to
+        // the single-event push at the bottom, unchanged from before M3.2.
+        let mut pushed_own_rows = false;
         match instr {
             Instr::AluImm { .. } | Instr::AluReg { .. } => c = alu_out,
             Instr::Lui { imm, .. } => c = imm,
@@ -145,12 +193,18 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
                 if num == SYS_POSEIDON2 {
                     let (ptr, n) = (arg0, arg1);
                     if n > POSEIDON2_MAX_WORDS { return Err(ExecError::Poseidon2WordCount(n)); }
+                    // Audit ZM4 (2026-09-12): the AIR's `HASH_PTR < 2^30` bound, enforced here
+                    // too (see `ExecError::Poseidon2Ptr`). With `n <= POSEIDON2_MAX_WORDS` every
+                    // derived address (`ptr + 4·idx + k`, `ptr + k + 4`) then stays
+                    // `< 2^30 + 4099`, so the address arithmetic below never wraps and the
+                    // memory table's `(space << 30) + addr` key stays injective.
+                    if ptr >= 1 << 30 { return Err(ExecError::Poseidon2Ptr(ptr)); }
                     // ecall row: HASH_LEFT = n, HASH_IDX = 0, HS0..7 = 0 — all pinned by the AIR
                     // directly from HASH_N/the zero sentinel, so `cpu_trace` only needs `ptr`/`n`.
                     events.push(CycleEvent {
                         clk, pc, next_pc: pc, instr, dec, a, b, c: 0, alu_out, tgt, mem_addr, mem_val,
                         sys: Some(Syscall::Poseidon2 { ptr, n }), accesses: acc.clone(), alu: alu.clone(),
-                        hash_row: Some(HashRow::Ecall { ptr, n }),
+                        hash_row: Some(HashRow::Ecall { ptr, n }), keccak_row: None, keccak_accesses: Vec::new(),
                     });
                     clk += 1;
 
@@ -182,6 +236,7 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
                             clk, pc, next_pc: pc, instr, dec: Decoded::default(), a: 0, b: 0, c: 0,
                             alu_out: 0, tgt: 0, mem_addr: 0, mem_val: 0, sys: None, accesses: racc, alu: Vec::new(),
                             hash_row: Some(HashRow::Absorb { idx, left_before: left, words, active, state_in, state_out }),
+                            keccak_row: None, keccak_accesses: Vec::new(),
                         });
                         state = state_out;
                         left -= cnt;
@@ -207,13 +262,57 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
                         events.push(CycleEvent {
                             clk, pc, next_pc: row_next_pc, instr, dec: Decoded::default(), a: 0, b: 0, c: 0,
                             alu_out: 0, tgt: 0, mem_addr: 0, mem_val: 0, sys: None, accesses: wacc, alu: Vec::new(),
-                            hash_row: Some(HashRow::WriteOut { fin, words, state }),
+                            hash_row: Some(HashRow::WriteOut { fin, words, state }), keccak_row: None, keccak_accesses: Vec::new(),
                         });
                         clk += 1;
                     }
                     regs[0] = 0;
                     pc = pc.wrapping_add(4);
-                    hashed = true;
+                    pushed_own_rows = true;
+                } else if num == SYS_KECCAK {
+                    // One cpu row, one permutation. The 50 words at `ptr` are read at slot 0 and
+                    // the permuted state written back at slot 1 — `MemAccess::ts` is `4*clk +
+                    // slot`, so the reads all sit at `4*clk` and the writes at `4*clk + 1`,
+                    // ordered and distinct from the ecall row's own register accesses (those are
+                    // `SPACE_REG`). These go in `keccak_accesses`, not `accesses`: the memory
+                    // table records them, but the *keccak* table is what sends them on the
+                    // `MEMORY` bus.
+                    let ptr = arg0;
+                    // Controller ruling 2: the cpu AIR bounds this pointer (`HP3_HI ∈ {0,1,2}`
+                    // on a `SYS_KECCAK` row, i.e. `ptr < 0x3000_0000`), so the emulator — the
+                    // reference semantics — must refuse anything past it rather than produce a
+                    // run whose honest trace cannot be proved. With the bound in hand, the
+                    // address arithmetic below is plain addition: `ptr + 49` cannot wrap.
+                    if ptr > KECCAK_PTR_LIMIT { return Err(ExecError::KeccakPtrOutOfRange(ptr)); }
+                    let mut input = [0u32; crate::keccak::WORDS];
+                    let mut kacc = Vec::with_capacity(2 * crate::keccak::WORDS);
+                    for k in 0..KECCAK_WORDS {
+                        let addr = ptr + k;
+                        let w = *ram.get(&addr).unwrap_or(&0);
+                        input[k as usize] = w;
+                        kacc.push(MemAccess { space: SPACE_RAM, addr, slot: 0, value: w, is_write: false });
+                    }
+                    let mut st = crate::keccak::words_to_state(&input);
+                    crate::keccak::keccak_f(&mut st);
+                    let output = crate::keccak::state_to_words(&st);
+                    for k in 0..KECCAK_WORDS {
+                        let addr = ptr + k;
+                        ram.insert(addr, output[k as usize]);
+                        kacc.push(MemAccess { space: SPACE_RAM, addr, slot: 1, value: output[k as usize], is_write: true });
+                    }
+                    // `acc`/`alu` are moved, not cloned: unlike `POSEIDON2` (which pushes a
+                    // whole row group and needs them again on later rows), this is the call's
+                    // one and only row.
+                    events.push(CycleEvent {
+                        clk, pc, next_pc: pc.wrapping_add(4), instr, dec, a, b, c: 0, alu_out, tgt, mem_addr, mem_val,
+                        sys: Some(Syscall::Keccak { ptr }), accesses: std::mem::take(&mut acc), alu: std::mem::take(&mut alu),
+                        hash_row: None,
+                        keccak_row: Some(KeccakRow { ptr, input, output }), keccak_accesses: kacc,
+                    });
+                    clk += 1;
+                    regs[0] = 0;
+                    pc = pc.wrapping_add(4);
+                    pushed_own_rows = true;
                 } else {
                     sys = Some(match num {
                         SYS_HALT => Syscall::Halt,
@@ -234,8 +333,8 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
                 }
             }
         }
-        if hashed {
-            // `POSEIDON2` already pushed its whole row group above (including its own
+        if pushed_own_rows {
+            // `POSEIDON2`/`KECCAK` already pushed their rows above (including their own
             // register/memory-write bookkeeping and `regs[0] = 0`/`pc` advance) — do not fall
             // through to the single-event push below, which would push a stray extra row.
             continue;
@@ -247,7 +346,7 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
         }
         regs[0] = 0;
         let halted = matches!(sys, Some(Syscall::Halt));
-        events.push(CycleEvent { clk, pc, next_pc, instr, dec, a, b, c, alu_out, tgt, mem_addr, mem_val, sys, accesses: acc, alu, hash_row: None });
+        events.push(CycleEvent { clk, pc, next_pc, instr, dec, a, b, c, alu_out, tgt, mem_addr, mem_val, sys, accesses: acc, alu, hash_row: None, keccak_row: None, keccak_accesses: Vec::new() });
         clk += 1;
         if halted { return Ok(Execution { events, outputs, halted: true }); }
         pc = next_pc;

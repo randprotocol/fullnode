@@ -1,5 +1,15 @@
 # Testnet: chain id 5 (SHRUGG, confidential computation, zkVM constraint set 4)
 
+> **Constraint set 5 belongs to the next chain, not this one.** A build from `main` today vendors
+> `circuits/research` at milestone 4.2: the production FRI profile is back to 80 queries, a proof
+> declares a `keccak_log_height` and a `mem_log_height`, and the verifier key is four-keyed. None
+> of that round-trips against a chain-5 proof in either direction, so such a build cannot join the
+> fleet below and the fleet's blocks cannot be replayed by it — see `docs/confidential.md`'s
+> "Constraint set 5" section. It arrives the same way every constraint set before it did: by
+> cutting a new chain id. Note also that `MAX_PROOF_BYTES` is 2 MiB on constraint set 5 (1 MiB
+> rejects every 80-query proof) while `MAX_BLOCK_BYTES` stays 4 MiB, which is about three shielded
+> transfers per block (`docs/block-space.md` §5).
+
 > **The fleet below is an account chain and is unchanged by the shielded pool.** Phase S1 (the
 > note ledger, bundles, the shielded wallet) is a hard fork: a node built from this branch cannot
 > join chain 5, and chain 5's blocks cannot be replayed by it. The fleet moves when the operator
