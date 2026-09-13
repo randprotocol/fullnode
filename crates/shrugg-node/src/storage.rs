@@ -201,18 +201,25 @@ fn created_notes(
 /// deposit note the ledger derives for a `Withdraw`, and for a `BridgeAttest` the deposit it
 /// derives from the attestation — none for a guardian-set rotation, which deposits nothing.
 ///
-/// This is the count of `Ledger::derived_commitment` (shrugg-core `ledger/staking.rs`), and the
-/// two must stay in step: those are the only two actions that mint a note out of public words, and
-/// `Mempool::claimed_commitments` reads the same function for the pool's conflict index. Applying
-/// the attestation size cap before the decode mirrors it exactly; in a *committed* block both arms
-/// always produced a note, since a transaction that could not derive one was refused by `validate`.
-/// `Transaction::commitments()` deliberately omits both, and `commit` appends them immediately
-/// after that transaction's own, so `tx.commitments().len() + derived_note_count(tx)` is exactly
-/// the slice `tx` owns.
+/// The function this must agree with is **`created_notes` above, plus `commit`'s `cb.deposits`
+/// drain** — those two together are what actually appended the block's leaves, so this is a count
+/// of them, not of anything else: `created_notes` emits the `BridgeAttest` deposit, and the
+/// `Withdraw` deposit arrives as a `cb.deposits` entry immediately after that transaction's own
+/// notes. `Transaction::commitments()` deliberately omits both, which is why
+/// `tx.commitments().len() + derived_note_count(tx)` is exactly the slice `tx` owns.
+///
+/// One deliberate difference from `created_notes`: the attestation size cap is applied here
+/// *before* the decode, as `Ledger::derived_commitment` applies it, so a caller holding an
+/// unvalidated transaction cannot be made to parse an oversized blob. `created_notes` calls
+/// `attested_transfer` with no cap and the two still agree, because `validate` refuses an
+/// attestation over `gas::MAX_ATTESTATION_BYTES` (`TxError::AttestationTooLarge`) and a committed
+/// block therefore holds none. That is the invariant to keep: relax the cap in `validate` and
+/// these two stop agreeing on a committed block.
 pub fn derived_note_count(tx: &shrugg_core::Transaction) -> usize {
     match &tx.action {
         Action::Withdraw { .. } => 1,
-        // The size cap before the decode, exactly as `Ledger::derived_commitment` applies it.
+        // The size cap before the decode, exactly as `Ledger::derived_commitment` applies it;
+        // `created_notes` needs no cap because it only ever sees a committed block.
         Action::BridgeAttest { attestation, .. } if attestation.len() > shrugg_core::gas::MAX_ATTESTATION_BYTES => 0,
         Action::BridgeAttest { attestation, .. } => {
             usize::from(shrugg_core::ledger::bridge_notes::attested_transfer(attestation).is_some())
@@ -1529,6 +1536,29 @@ pub(crate) mod fixtures {
         )
     }
 
+    /// A bridged chain funded for a withdraw (one bundle fee, one validator staked) — the shared
+    /// setup under the S2×S3 seam tests, their `BridgeBurn` variant, and the RPC test that renders
+    /// both derived-note mechanisms through a compact block.
+    pub(crate) fn bridged_chain_funded_for_a_withdraw(
+        chain_id: u64,
+    ) -> (tempfile::TempDir, Storage, GenesisState, Vec<[u8; 32]>, CommittedBlock, Ledger, Keypair) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, secrets) = bridged_genesis(chain_id);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let v = key(1);
+        // Two fees, not one: `Withdraw` pays the bundle base to the block's proposer out of the
+        // amount withdrawn, so an amount equal to just one fee is entirely eaten by that base
+        // and rejected as `BelowBundleBase`.
+        let fees = vec![
+            bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee()),
+            bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee()),
+        ];
+        let b1 = make_block_voted(&gs.block, &mut ledger, fees, &v, &[&v]);
+        (dir, s, gs, secrets, b1, ledger, v)
+    }
+
     /// An unopened database plus a genesis holding two deposit notes.
     pub(crate) fn genesis_with_two_notes() -> (tempfile::TempDir, Storage, GenesisState) {
         let gs = genesis_with(7, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)]);
@@ -2034,28 +2064,6 @@ mod tests {
             matches!(&err, StorageError::Corrupt(m) if m.contains("no transaction of it accounts for")),
             "{err:?}"
         );
-    }
-
-    /// A bridged chain funded for a withdraw (one bundle fee, one validator staked) — the shared
-    /// setup under the S2×S3 seam test below and its `BridgeBurn` variant.
-    fn bridged_chain_funded_for_a_withdraw(
-        chain_id: u64,
-    ) -> (tempfile::TempDir, Storage, GenesisState, Vec<[u8; 32]>, CommittedBlock, Ledger, shrugg_core::Keypair) {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Storage::open(dir.path()).unwrap();
-        let (gs, secrets) = bridged_genesis(chain_id);
-        s.init_genesis(&gs).unwrap();
-        let mut ledger = gs.ledger.clone();
-        let v = key(1);
-        // Two fees, not one: `Withdraw` pays the bundle base to the block's proposer out of the
-        // amount withdrawn, so an amount equal to just one fee is entirely eaten by that base
-        // and rejected as `BelowBundleBase`.
-        let fees = vec![
-            bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee()),
-            bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee()),
-        ];
-        let b1 = make_block_voted(&gs.block, &mut ledger, fees, &v, &[&v]);
-        (dir, s, gs, secrets, b1, ledger, v)
     }
 
     /// The S2×S3 seam: a block carrying both a `Withdraw` (S2 — its deposit arrives through
@@ -2655,8 +2663,6 @@ mod tests {
 
     #[test]
     fn derived_note_count_covers_the_notes_the_wire_does_not_carry() {
-        use shrugg_core::notes::ShieldedAddress;
-        let payout = ShieldedAddress { pk: [3; 8], kem_ek: vec![4; shrugg_core::notes::KEM_EK_BYTES] };
         let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
         let w = Transaction {
             chain_id: 1,
@@ -2668,11 +2674,57 @@ mod tests {
         };
         assert_eq!(derived_note_count(&w), 1, "the ledger derives a withdraw's deposit note");
         assert_eq!(w.commitments().len(), 0, "and the wire does not carry it");
-        let _ = payout;
         // A plain transfer carries both its notes itself.
         let gs = fixtures::genesis_with(1, vec![]);
         let t = fixtures::bundle_tx(&gs.ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
         assert_eq!(derived_note_count(&t), 0);
         assert_eq!(t.commitments().len(), 2);
+
+        // An attestation that decodes to a transfer deposits one note the wire does not carry,
+        // on top of the two its fee bundle does.
+        let (bgs, secrets) = bridged_genesis(3);
+        let att = attest_tx(&bgs.ledger, attestation(&secrets, &recipient(), 1_000, 0), 20);
+        assert_eq!(derived_note_count(&att), 1, "the ledger derives the attestation's deposit note");
+        assert_eq!(att.commitments().len(), 2, "and the wire carries only the fee bundle's slots");
+        let with_attestation = |bytes: Vec<u8>| {
+            let mut t = att.clone();
+            if let Action::BridgeAttest { attestation, .. } = &mut t.action {
+                *attestation = bytes;
+            }
+            t
+        };
+
+        // A guardian-set rotation decodes and deposits nothing, so its transaction owns only what
+        // it carries. (No signature is recovered here, so the body alone decides.)
+        let rotation = {
+            use shrugg_core::bridge::{Attestation, Body, GuardianSetUpgrade, Payload};
+            let body = Body {
+                timestamp: 1,
+                nonce: 0,
+                emitter_chain: 1,
+                emitter_address: [9; 32],
+                sequence: 0,
+                consistency_level: 0,
+                payload: Payload::GuardianSetUpgrade(GuardianSetUpgrade { new_index: 1, keys: vec![] }).encode(),
+            };
+            Attestation { guardian_set_index: 0, signatures: vec![], body }.encode()
+        };
+        assert!(
+            shrugg_core::ledger::bridge_notes::attested_transfer(&rotation).is_none(),
+            "a rotation is not a transfer"
+        );
+        assert_eq!(derived_note_count(&with_attestation(rotation)), 0);
+
+        // Over `MAX_ATTESTATION_BYTES` the blob is never decoded at all — the cap comes first,
+        // exactly as `Ledger::derived_commitment` applies it, so an unvalidated transaction
+        // cannot buy the parse. `created_notes` has no cap and agrees anyway, because `validate`
+        // refuses such a transaction and a committed block never holds one.
+        let mut oversized = attestation(&secrets, &recipient(), 1_000, 1);
+        assert!(
+            shrugg_core::ledger::bridge_notes::attested_transfer(&oversized).is_some(),
+            "the unpadded attestation does decode to a transfer"
+        );
+        oversized.resize(shrugg_core::gas::MAX_ATTESTATION_BYTES + 1, 0);
+        assert_eq!(derived_note_count(&with_attestation(oversized)), 0);
     }
 }

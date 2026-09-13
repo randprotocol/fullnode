@@ -940,6 +940,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(crate::storage::Storage::open(dir.path()).unwrap());
         storage.init_genesis(gs).unwrap();
+        (dir, state_over(storage, gs))
+    }
+
+    /// The same state over a database a storage fixture already opened and initialised.
+    fn state_over(storage: Arc<crate::storage::Storage>, gs: &GenesisState) -> RpcState {
         let (tx, mut rx) = mpsc::channel(4);
         let info = EpochInfo {
             epoch: 0,
@@ -954,14 +959,13 @@ mod tests {
                 }
             }
         });
-        let st = RpcState {
+        RpcState {
             storage,
             status: Arc::new(RwLock::new(NodeStatus::default())),
             node: tx,
             chain_id: gs.chain_id,
             executor: Arc::new(StubExecutor),
-        };
-        (dir, st)
+        }
     }
 
     async fn call(st: &RpcState, method: &str, params: Value) -> Result<Value, RpcError> {
@@ -1847,5 +1851,75 @@ mod tests {
         let next = ok(&st, "shrugg_getCompactBlocks", json!([2, 2])).await;
         assert_eq!(next.as_array().unwrap().len(), 1);
         assert_eq!(next[0]["height"], 2);
+    }
+
+    /// The two notes the wire does not carry, rendered end to end: a `Withdraw`'s deposit, which
+    /// reaches storage as a `cb.deposits` entry, and a `BridgeAttest`'s, which reaches it through
+    /// `created_notes`. Both live in one block, in both orders, and both must come back under the
+    /// transaction that produced them — which is what `docs/rpc.md` promises a wallet.
+    #[tokio::test]
+    async fn compact_blocks_attribute_the_notes_the_ledger_derives() {
+        for attest_first in [false, true] {
+            let (_d, storage, gs, secrets, b1, mut ledger, v) = fixtures::bridged_chain_funded_for_a_withdraw(40);
+            let storage = Arc::new(storage);
+            let st = state_over(storage.clone(), &gs);
+            let time = ledger.height() as u32;
+            let withdraw = fixtures::withdraw_tx(gs.chain_id, &v, 2 * bundle_fee(), 0, time, [13; 8]);
+            let att =
+                fixtures::attest_tx(&ledger, fixtures::attestation(&secrets, &fixtures::recipient(), 1_000, 0), 20);
+            let txs = if attest_first { vec![att.clone(), withdraw] } else { vec![withdraw, att.clone()] };
+            let b2 = fixtures::make_block_voted(&b1.block, &mut ledger, txs, &v, &[&v]);
+            let withdraw_leaf = b2.deposits[0].index;
+            storage.commit(&[b1, b2], &ledger, &[], &StubExecutor).unwrap();
+            let expected_deposit = shrugg_core::ledger::bridge_notes::deposit_note(
+                &att,
+                ledger.bridge().expect("bridged genesis"),
+                &StubExecutor,
+            )
+            .expect("the attestation deposits into a registered asset");
+
+            let v_json = ok(&st, "shrugg_getCompactBlocks", json!([2, 2])).await;
+            let rows = v_json.as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            let rendered = rows[0]["transactions"].as_array().unwrap();
+            let block = storage.block_by_height(2).unwrap().unwrap();
+            assert_eq!(rendered.len(), block.transactions.len(), "attest_first={attest_first}");
+            assert_eq!(
+                rows[0]["commitments"],
+                json!([]),
+                "attest_first={attest_first}: every leaf of this block belongs to a transaction"
+            );
+
+            // Each transaction owns exactly the slice `commit` appended for it, derived notes
+            // included, and the block's transactions together own every leaf stored at height 2.
+            let mut total = 0usize;
+            for (row, tx) in rendered.iter().zip(&block.transactions) {
+                let want = tx.commitments().len() + crate::storage::derived_note_count(tx);
+                let got = row["commitments"].as_array().unwrap();
+                assert_eq!(got.len(), want, "attest_first={attest_first}: {} owns {want} leaves", tx.hash().to_hex());
+                total += got.len();
+            }
+            assert_eq!(
+                total,
+                storage.notes_in_heights(2, 2, usize::MAX).unwrap().len(),
+                "attest_first={attest_first}: nothing of this block is dropped or double-counted"
+            );
+
+            // The withdraw's one note is the leaf the ledger itself named...
+            let wi = block.transactions.iter().position(|t| matches!(t.action, Action::Withdraw { .. })).unwrap();
+            let w_notes = rendered[wi]["commitments"].as_array().unwrap();
+            assert_eq!(w_notes.len(), 1, "attest_first={attest_first}");
+            assert_eq!(w_notes[0]["index"], withdraw_leaf, "attest_first={attest_first}");
+            // ...and the attest's deposit rides with its fee bundle's two slots, last of the three.
+            let ai = block.transactions.iter().position(|t| matches!(t.action, Action::BridgeAttest { .. })).unwrap();
+            let a_notes = rendered[ai]["commitments"].as_array().unwrap();
+            assert_eq!(a_notes.len(), 3, "attest_first={attest_first}: two bundle slots and the deposit");
+            assert_eq!(a_notes[2]["cm"], word8_to_hex(&expected_deposit.0), "attest_first={attest_first}");
+            assert_eq!(
+                a_notes[2]["envelope"],
+                envelope_json(&expected_deposit.1),
+                "attest_first={attest_first}: the envelope the chain sealed, not the action's"
+            );
+        }
     }
 }
