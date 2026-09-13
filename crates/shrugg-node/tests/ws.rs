@@ -211,6 +211,51 @@ async fn post_still_answers_json_rpc_on_the_merged_router() {
     assert_eq!(body["result"]["height"], json!(0), "the genesis head");
     assert!(body["result"]["hash"].as_str().unwrap().len() == 64);
     assert!(body["result"]["view"].is_u64());
+
+    // `GET /` is the upgrade now, so a plain browser GET is a bad upgrade request (400) rather
+    // than the 405 a POST-only route answered. Documented in docs/rpc.md; asserted here so the
+    // documentation cannot quietly stop being true.
+    let plain = reqwest::Client::new().get(format!("http://{addr}/")).send().await.expect("a response");
+    assert_eq!(plain.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+/// A subscriber that stops reading altogether does not get to hold a connection slot. This is the
+/// denial the write deadline exists for: without it the node's task parks in the kernel's send
+/// buffer until the link is torn down, and 64 such sockets close the endpoint to everyone while
+/// `ws_clients` reports 64 healthy clients.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subscriber_that_never_reads_is_dropped_and_frees_its_slot() {
+    // Room for every head this test will push, so the channel cannot overrun: the *only* way out
+    // of this connection is the write deadline, which is the thing being proved. (The lag path has
+    // its own test, and with a small channel it would fire first and prove nothing about writes.)
+    const HEADS: usize = 50_000;
+    let (addr, heads, served) = common::serve_heads(HEADS).await;
+    let (mut sock, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.expect("upgrade");
+    sock.send(Message::Text(
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "shrugg_subscribe", "params": ["newHeads"] }).to_string(),
+    ))
+    .await
+    .unwrap();
+    // The one and only read: after this the client goes silent, which is what a wedged client
+    // looks like from here.
+    assert!(wait_frame(&mut sock, Duration::from_secs(5), |v| (v["id"] == json!(1)).then_some(())).await.is_some());
+    assert_eq!(served.ws_conns(), 1, "the slot is held while the client is connected");
+
+    // ~10 MB of notifications at a socket nobody is draining: far more than any kernel buffer, so
+    // the node's write blocks and stays blocked.
+    for height in 1..=HEADS as u64 {
+        heads.send(shrugg_node::rpc::HeadSummary { height, hash: "cd".repeat(32), view: height }).expect("a receiver");
+    }
+
+    let started = tokio::time::Instant::now();
+    let left = served.wait_ws_conns(0, shrugg_node::ws::WS_SEND_TIMEOUT * 6).await;
+    let took = started.elapsed();
+    assert_eq!(left, 0, "a client that stopped reading does not keep its slot");
+    assert!(
+        took >= shrugg_node::ws::WS_SEND_TIMEOUT,
+        "the slot came back in {took:?}, before the write deadline — this test is no longer proving it"
+    );
+    drop(sock);
 }
 
 /// A subscriber that cannot keep up is closed, not buffered: this node's memory is not a client's

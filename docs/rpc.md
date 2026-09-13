@@ -457,6 +457,11 @@ path. `POST /` is unchanged and is still where every method above is served — 
 **only** `shrugg_subscribe` and `shrugg_unsubscribe`, and answers `-32601` to anything else,
 including reads. There is nothing to configure and no second port to open.
 
+One thing did change for non-WebSocket clients: `GET /` is now the upgrade handler, so a plain
+`GET` with no upgrade headers answers **`400 Bad Request`** where a POST-only route used to answer
+`405 Method Not Allowed`. Nothing reads that status — the RPC has always been `POST` — but a
+health check that asserted on `405` needs to assert on `400`.
+
 One topic exists, `newHeads`, and its payload is exactly `shrugg_getHead`'s three fields, in the
 same shape — one `HeadSummary` serves both, so they cannot drift apart. The one difference is what
 `view` means: a notification carries the *block's own* view, the one its quorum certificate is for,
@@ -483,15 +488,25 @@ ids survived. Ids are per connection, are never reused within one, and all of th
 socket does. A frame with no `id` member is a notification and is refused with `-32600`, as over
 HTTP. An unknown topic is `-32602`.
 
-This endpoint is unauthenticated, so it is bounded three ways:
+This endpoint is unauthenticated, so it is bounded four ways:
 
 - **64 connections per node.** The 65th is refused at the upgrade with HTTP `503` and a body
   naming the limit — not accepted and then dropped, which a client cannot tell from a network
   fault. `shrugg_status`'s `ws_clients` is the live count.
 - **8 subscriptions per connection.** The ninth `shrugg_subscribe` is `-32000`; the eight it holds
   are untouched.
-- **64 KiB per frame**, either direction. Proof-carrying bodies go to `POST /`, which has its own
-  much larger limit.
+- **64 KiB per frame from the client.** A larger frame is refused and the socket ends. (This is a
+  bound on what the node will *read*; what it writes is a request reply or a head notification,
+  neither of which comes near it.) Proof-carrying bodies go to `POST /`, which has its own much
+  larger limit.
+- **5 seconds to take a frame, and a ping every 30 seconds.** A write that does not complete in
+  5 s means a client that has stopped reading, and the socket is dropped rather than written to
+  again. Without that deadline the node's task parks in the kernel's send buffer until the link is
+  torn down — minutes — holding its connection slot, so 64 sockets from one host would close the
+  endpoint to everyone while `ws_clients` still read 64 healthy clients. A connection with no
+  subscription is never written to at all, so it is pinged every 30 s and must answer within the
+  same 5 s. Any WebSocket library answers pings for you; a client that does not must send
+  `Pong` itself.
 
 **Backpressure closes, it does not buffer.** The node keeps 256 committed heads in flight per
 subscriber. A client that falls further behind than that — because it stopped reading, or its link

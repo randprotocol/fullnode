@@ -130,16 +130,36 @@ pub async fn serve_heads(capacity: usize) -> (SocketAddr, broadcast::Sender<Head
         heads: heads.clone(),
         ws_conns: Arc::new(AtomicUsize::new(0)),
     };
+    let ws_conns = state.ws_conns.clone();
     let (addr, task) = shrugg_node::rpc::serve("127.0.0.1:0".parse().unwrap(), state).await.expect("rpc binds");
-    (addr, heads, ServedRpc { task, _dir: dir, _node_rx: node_rx })
+    (addr, heads, ServedRpc { task, ws_conns, _dir: dir, _node_rx: node_rx })
 }
 
 /// Keeps a [`serve_heads`] server's task, database directory and command receiver alive for the
 /// length of a test.
 pub struct ServedRpc {
     task: tokio::task::JoinHandle<()>,
+    ws_conns: Arc<AtomicUsize>,
     _dir: tempfile::TempDir,
     _node_rx: tokio::sync::mpsc::Receiver<shrugg_node::rpc::NodeCommand>,
+}
+
+impl ServedRpc {
+    /// Live WebSocket connections, the number `NodeStatus::ws_clients` reports on a real node.
+    /// Read straight off the counter here, because there is no node loop to publish it.
+    pub fn ws_conns(&self) -> usize {
+        self.ws_conns.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait, bounded, for the live count to reach `want`. Returns what it actually was, so the
+    /// caller asserts on a value rather than on a timeout.
+    pub async fn wait_ws_conns(&self, want: usize, timeout: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.ws_conns() != want && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        self.ws_conns()
+    }
 }
 
 impl Drop for ServedRpc {

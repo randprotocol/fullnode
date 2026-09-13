@@ -1,11 +1,21 @@
 //! The WebSocket half of the RPC: a `newHeads` subscription, so an explorer or a wallet stops
 //! polling `shrugg_getHead`.
 //!
-//! Three bounds hold this endpoint, because it is unauthenticated: a per-node connection cap, a
-//! per-connection subscription cap, and a bounded broadcast channel whose lagging receivers are
-//! *closed* rather than buffered. Buffering a slow subscriber is how a node runs out of memory; a
-//! dropped one reconnects and resyncs from `shrugg_getCompactBlocks`, which is the documented
-//! recovery.
+//! Four bounds hold this endpoint, because it is unauthenticated: a per-node connection cap, a
+//! per-connection subscription cap, a bounded broadcast channel whose lagging receivers are
+//! *closed* rather than buffered, and a deadline on every write. Buffering a slow subscriber is
+//! how a node runs out of memory; a dropped one reconnects and resyncs from
+//! `shrugg_getCompactBlocks`, which is the documented recovery.
+//!
+//! The write deadline is what makes "closed rather than buffered" true of the *socket* and not
+//! only of the channel. A client that subscribes and then stops reading fills its TCP window, and
+//! an unbounded `send().await` parks this task in the kernel's buffer instead: the connection slot
+//! is held until the OS tears the link down, which is minutes, and 64 such sockets from one host
+//! close the endpoint to everyone else while `ws_clients` reports 64 healthy clients. A write that
+//! does not complete inside [`WS_SEND_TIMEOUT`] is a dead client, and the socket is dropped rather
+//! than written to again. [`WS_PING_INTERVAL`] covers the other half of it: a connection that
+//! never subscribes and never reads is never written to at all, so it is pinged, and a pong that
+//! does not come back inside the same deadline ends it.
 //!
 //! Reads are not served here. A subscription is cheap — one channel receiver and a map — while a
 //! read is `shrugg_getWitness` rebuilding the commitment tree, and serving those over a socket
@@ -18,7 +28,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 
 /// WebSocket clients one node will carry at once. The 65th is refused at the upgrade.
@@ -36,56 +48,139 @@ pub const WS_MAX_FRAME_BYTES: usize = 64 * 1024;
 /// The one topic this node serves.
 const NEW_HEADS: &str = "newHeads";
 
+/// How long one outbound frame may take before the client is treated as dead.
+///
+/// This is a bound on a *write into a socket buffer*, not on a round trip: a client that is
+/// reading at all takes a 200-byte notification in microseconds. Five seconds is therefore
+/// generous even across a bad link, and what it refuses is the client that has stopped reading
+/// entirely — which is precisely the one this node must not hold a slot for. The socket is
+/// dropped on expiry rather than written to again; there is nothing useful to say to a peer that
+/// is not reading.
+pub const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often a connection with nothing to say is pinged, and within [`WS_SEND_TIMEOUT`] of which
+/// a pong must come back.
+///
+/// Without it a socket that never subscribes is never written to, so no write deadline ever
+/// applies to it and it holds its slot until the peer or the OS gives up. Thirty seconds is well
+/// inside the idle timeout of any proxy that would sit in front of this, and costs two frames a
+/// minute per client.
+pub const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+
 /// WebSocket close code 1008 "policy violation": what a subscriber that could not keep up is
 /// closed with, so the reason reaches the client rather than looking like a dropped TCP link.
 const CLOSE_POLICY: u16 = 1008;
+
+/// One of this node's [`MAX_WS_CONNECTIONS`] connection slots, held for as long as the connection
+/// is.
+///
+/// A guard rather than a pair of counter statements: the slot is claimed before the handshake, so
+/// releasing it by hand means getting every exit right — the handshake that fails, the loop that
+/// breaks, and a panic anywhere inside a connection. A leaked slot is permanent until restart and
+/// invisible except as an endpoint that slowly stops accepting clients.
+struct ConnSlot(Arc<AtomicUsize>);
+
+impl ConnSlot {
+    /// Claim a slot, or `None` if the node is already at the cap.
+    fn claim(conns: &Arc<AtomicUsize>) -> Option<ConnSlot> {
+        conns.fetch_update(SeqCst, SeqCst, |n| (n < MAX_WS_CONNECTIONS).then_some(n + 1)).ok()?;
+        Some(ConnSlot(conns.clone()))
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        // `checked_sub` rather than `fetch_sub`: one released slot too many would wrap the count to
+        // `usize::MAX` and refuse every client from then on, which is a far worse failure than the
+        // over-count it would be correcting.
+        let _ = self.0.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1));
+    }
+}
 
 /// The upgrade handler, mounted by [`crate::rpc::serve`] on `GET /` and `GET /ws`.
 pub async fn upgrade(State(st): State<RpcState>, ws: WebSocketUpgrade) -> Response {
     // Claim a slot before upgrading: an upgrade the node then closes looks like a network fault to
     // the client, while a 503 says exactly what happened.
-    if st.ws_conns.fetch_update(SeqCst, SeqCst, |n| (n < MAX_WS_CONNECTIONS).then_some(n + 1)).is_err() {
+    let Some(slot) = ConnSlot::claim(&st.ws_conns) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             format!("this node serves at most {MAX_WS_CONNECTIONS} websocket clients"),
         )
             .into_response();
-    }
-    let failed = st.clone();
+    };
     ws.max_message_size(WS_MAX_FRAME_BYTES)
         .max_frame_size(WS_MAX_FRAME_BYTES)
-        // The slot is claimed above, before the handshake can fail, so it has to be released on
-        // both exits or a client that disappears mid-handshake leaks one until restart.
-        .on_failed_upgrade(move |e| {
-            tracing::debug!("websocket upgrade failed: {e}");
-            release(&failed);
-        })
-        .on_upgrade(move |socket| run(socket, st))
+        .on_failed_upgrade(|e| tracing::debug!("websocket upgrade failed: {e}"))
+        // `slot` moves into the callback, which is the one place it can be. It is released when
+        // the connection ends, and equally when the handshake fails and the callback is dropped
+        // without ever being called.
+        .on_upgrade(move |socket| run(socket, st, slot))
+}
+
+/// Write one frame, or give up on the client. `false` ends the connection, and the caller must not
+/// write again: a socket that missed its deadline is not going to take a close frame either.
+async fn send_or_give_up(socket: &mut WebSocket, msg: Message) -> bool {
+    match tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(msg)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::debug!("websocket write failed: {e}");
+            false
+        }
+        Err(_) => {
+            tracing::debug!("closing a websocket client that did not take a frame in {WS_SEND_TIMEOUT:?}");
+            false
+        }
+    }
+}
+
+/// Sleep until `at`, or forever when there is no deadline to wait for.
+async fn deadline(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// One connection: its own receiver on the head channel, and its own subscription map.
-async fn run(mut socket: WebSocket, st: RpcState) {
+///
+/// `slot` is never read. It is this connection's claim on [`MAX_WS_CONNECTIONS`], and dropping it
+/// — on any exit from this function, a panic included — is what gives the slot back.
+async fn run(mut socket: WebSocket, st: RpcState, slot: ConnSlot) {
+    let _slot = slot;
     let mut heads = st.heads.subscribe();
     // Subscription id -> topic. One topic today; the map is what makes unsubscribe a lookup rather
     // than a boolean, and what the per-connection cap counts.
     let mut subs: BTreeMap<String, &'static str> = BTreeMap::new();
     let mut next_id = 1u64;
+    // The first ping is one interval away, not immediate: a client that has just connected has
+    // said everything it needs to.
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + WS_PING_INTERVAL, WS_PING_INTERVAL);
+    // When the pong for an outstanding ping stops being worth waiting for. `None` while none is
+    // outstanding.
+    let mut pong_due: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             incoming = socket.recv() => {
                 let Some(Ok(msg)) = incoming else { break };
-                // Pings and pongs are answered by axum; a close is the `None`/`Err` above or a
-                // `Message::Close`, and either way there is nothing to reply to.
-                let Message::Text(text) = msg else { continue };
-                let reply = on_request(&text, &mut subs, &mut next_id);
-                if socket.send(Message::Text(reply)).await.is_err() { break }
+                match msg {
+                    Message::Text(text) => {
+                        let reply = on_request(&text, &mut subs, &mut next_id);
+                        if !send_or_give_up(&mut socket, Message::Text(reply)).await { break }
+                    }
+                    // The keepalive came back, so this client is alive whether or not it has
+                    // anything subscribed.
+                    Message::Pong(_) => pong_due = None,
+                    // A client's ping is answered by axum; a close ends the stream on the next
+                    // poll; binary is not a request here.
+                    _ => {}
+                }
             }
             head = heads.recv() => match head {
                 Ok(h) => {
                     let Some(frames) = notifications(&subs, &h) else { continue };
                     let mut ok = true;
                     for frame in frames {
-                        if socket.send(Message::Text(frame)).await.is_err() { ok = false; break }
+                        if !send_or_give_up(&mut socket, Message::Text(frame)).await { ok = false; break }
                     }
                     if !ok { break }
                 }
@@ -96,15 +191,27 @@ async fn run(mut socket: WebSocket, st: RpcState) {
                     let reason =
                         format!("subscriber fell {n} heads behind; reconnect and catch up with shrugg_getCompactBlocks");
                     let frame = CloseFrame { code: CLOSE_POLICY, reason: reason.into() };
-                    let _ = socket.send(Message::Close(Some(frame))).await;
+                    // On its own deadline like every other write: a subscriber that lagged because
+                    // it stopped reading will not take this frame either, and waiting on it is the
+                    // same parked task the deadline exists to prevent.
+                    let _ = send_or_give_up(&mut socket, Message::Close(Some(frame))).await;
                     break;
                 }
                 // The node loop is gone: so is this node.
                 Err(RecvError::Closed) => break,
+            },
+            _ = ping.tick() => {
+                if !send_or_give_up(&mut socket, Message::Ping(Vec::new())).await { break }
+                // Only the *first* unanswered ping sets the deadline, so a client that has gone
+                // quiet is not given a fresh grace period every interval.
+                pong_due.get_or_insert(tokio::time::Instant::now() + WS_SEND_TIMEOUT);
+            }
+            _ = deadline(pong_due) => {
+                tracing::debug!("closing a websocket client that did not answer a ping in {WS_SEND_TIMEOUT:?}");
+                break;
             }
         }
     }
-    release(&st);
 }
 
 /// One `shrugg_subscription` frame per subscription this connection holds, or `None` when it
@@ -183,11 +290,6 @@ fn err(id: Value, code: i64, message: String) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }).to_string()
 }
 
-/// Give the connection slot back. Called exactly once per claimed slot, on either exit.
-fn release(st: &RpcState) {
-    st.ws_conns.fetch_sub(1, SeqCst);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +356,34 @@ mod tests {
         assert!(subs.is_empty());
         let r = call(&mut subs, &mut next, json!({ "id": 1 }));
         assert_eq!(r["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn a_slot_is_claimed_up_to_the_cap_and_given_back_by_dropping_it() {
+        let conns = Arc::new(AtomicUsize::new(0));
+        let held: Vec<ConnSlot> = (0..MAX_WS_CONNECTIONS).map(|_| ConnSlot::claim(&conns).expect("a slot")).collect();
+        assert_eq!(conns.load(SeqCst), MAX_WS_CONNECTIONS);
+        assert!(ConnSlot::claim(&conns).is_none(), "the cap is a hard bound");
+        drop(held);
+        assert_eq!(conns.load(SeqCst), 0, "every slot comes back");
+        // A connection that panics releases its slot the same way, because nothing else does.
+        let conns2 = conns.clone();
+        assert!(std::panic::catch_unwind(move || {
+            let _slot = ConnSlot::claim(&conns2).expect("a slot");
+            panic!("something inside the connection");
+        })
+        .is_err());
+        assert_eq!(conns.load(SeqCst), 0, "a panicking connection does not leak its slot");
+    }
+
+    #[test]
+    fn releasing_more_slots_than_were_claimed_cannot_wrap_the_count() {
+        let conns = Arc::new(AtomicUsize::new(0));
+        // The counter is shared, so the failure to rule out is an underflow to `usize::MAX`, which
+        // would refuse every client from then on.
+        drop(ConnSlot(conns.clone()));
+        assert_eq!(conns.load(SeqCst), 0);
+        assert!(ConnSlot::claim(&conns).is_some(), "and the endpoint still accepts");
     }
 
     #[test]
