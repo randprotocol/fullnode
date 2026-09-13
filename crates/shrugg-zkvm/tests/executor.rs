@@ -80,6 +80,17 @@ fn check_program_rejects_bad_words() {
     assert!(ex.check_program(0, &[]).is_err());
 }
 
+/// ZH4 (2026-09-12 zk audit, ours not `research`'s): `base_pc + 4*len` must not wrap the u32 pc
+/// space, or `instr_at`/`Program::pc_of` could never address the tail of the program. Two words
+/// at `u32::MAX - 3` puts the last word's address one past the wrap; one word lands exactly on
+/// it and still fits.
+#[test]
+fn zh4_rejects_a_program_that_wraps_the_u32_pc_space() {
+    let ex = ZkExecutor::new(FriProfile::Test);
+    assert!(ex.check_program(u32::MAX - 3, &[0x13, 0x13]).is_err(), "two words wraps");
+    assert!(ex.check_program(u32::MAX - 3, &[0x13]).is_ok(), "one word exactly fits");
+}
+
 #[test]
 fn private_payment_emits_no_transfer_below_threshold() {
     let (_, outputs, _) = prove(FriProfile::Test, &guests::private_payment(2000), &[400, 250, 300, 75], None, Backend::Cpu).unwrap();

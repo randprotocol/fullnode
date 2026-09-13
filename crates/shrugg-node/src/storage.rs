@@ -1966,6 +1966,121 @@ mod tests {
         );
     }
 
+    /// A bridged chain funded for a withdraw (one bundle fee, one validator staked) — the shared
+    /// setup under the S2×S3 seam test below and its `BridgeBurn` variant.
+    fn bridged_chain_funded_for_a_withdraw(
+        chain_id: u64,
+    ) -> (tempfile::TempDir, Storage, GenesisState, Vec<[u8; 32]>, CommittedBlock, Ledger, shrugg_core::Keypair) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, secrets) = bridged_genesis(chain_id);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let v = key(1);
+        // Two fees, not one: `Withdraw` pays the bundle base to the block's proposer out of the
+        // amount withdrawn, so an amount equal to just one fee is entirely eaten by that base
+        // and rejected as `BelowBundleBase`.
+        let fees = vec![
+            bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee()),
+            bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee()),
+        ];
+        let b1 = make_block_voted(&gs.block, &mut ledger, fees, &v, &[&v]);
+        (dir, s, gs, secrets, b1, ledger, v)
+    }
+
+    /// The S2×S3 seam: a block carrying both a `Withdraw` (S2 — its deposit arrives through
+    /// `cb.deposits`) and a `BridgeAttest` (S3 — its note arrives through `created_notes`), in
+    /// both orders. `commit`'s per-transaction loop appends `created_notes` first and then drains
+    /// `cb.deposits` entries that match the running `next_index`, so whichever mechanism's tx
+    /// comes first in the block must still land its note at the leaf the ledger actually gave it
+    /// — this was true by reading the code, but nothing committed a block that exercised both at
+    /// once.
+    #[test]
+    fn a_withdraw_and_a_bridge_attest_interleave_in_either_order() {
+        for attest_first in [false, true] {
+            let (_d, s, gs, secrets, b1, mut ledger, v) = bridged_chain_funded_for_a_withdraw(40);
+            let base = ledger.next_index();
+            let amount = 2 * bundle_fee();
+            let time = ledger.height() as u32;
+            let withdraw = withdraw_tx(gs.chain_id, &v, amount, 0, time, [13; 8]);
+            let att = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000, 0), 20);
+            let txs = if attest_first { vec![att.clone(), withdraw] } else { vec![withdraw, att.clone()] };
+            let b2 = make_block_voted(&b1.block, &mut ledger, txs, &v, &[&v]);
+            assert_eq!(
+                b2.deposits.len(),
+                1,
+                "attest_first={attest_first}: only the withdraw's note is ledger-made; the \
+                 attest's goes through created_notes, not cb.deposits"
+            );
+            let withdraw_leaf = b2.deposits[0].index;
+            // Four new leaves either way: the withdraw's deposit, the attest's fee bundle's two
+            // output slots, and the attest's own deposit note — just in a different order.
+            assert_eq!(ledger.next_index(), base + 4, "attest_first={attest_first}");
+
+            s.commit(&[b1, b2], &ledger, &[], &StubExecutor).unwrap();
+
+            assert_eq!(s.notes_count().unwrap(), ledger.next_index(), "attest_first={attest_first}");
+            let reloaded = s.load_ledger(&StubExecutor).unwrap();
+            assert_eq!(
+                reloaded, ledger,
+                "attest_first={attest_first}: tree root, next_index and bridge state all round-trip"
+            );
+
+            let withdraw_row =
+                s.note(withdraw_leaf).unwrap().expect("the withdraw's deposit is indexed at the leaf it named");
+            assert_eq!(withdraw_row.height, 2, "attest_first={attest_first}");
+
+            let bridge = ledger.bridge().expect("bridged genesis");
+            let expected_deposit = shrugg_core::ledger::bridge_notes::deposit_note(&att, bridge, &StubExecutor)
+                .expect("the attestation registered an asset and deposits into it");
+            let deposit_leaf = (base..base + 4)
+                .find(|&i| s.note(i).unwrap().expect("leaf in range").cm == expected_deposit.0)
+                .unwrap_or_else(|| panic!("attest_first={attest_first}: the attest's deposit note is not on disk"));
+            assert_ne!(
+                deposit_leaf, withdraw_leaf,
+                "attest_first={attest_first}: the two mechanisms must not collide on the same leaf"
+            );
+            let deposit_row = s.note(deposit_leaf).unwrap().unwrap();
+            assert_eq!(deposit_row.envelope, expected_deposit.1, "attest_first={attest_first}");
+            assert_eq!(deposit_row.height, 2, "attest_first={attest_first}");
+
+            assert_eq!(
+                s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().problem,
+                None,
+                "attest_first={attest_first}"
+            );
+        }
+    }
+
+    /// The same seam with a third mechanism folded in: a `BridgeBurn` of the asset the attest in
+    /// the same block just registered. Cheap to add because `apply_transactions` applies the
+    /// block's transactions sequentially into the same scratch ledger, so a burn textually after
+    /// its funding attest sees the registry already updated — no second block needed.
+    #[test]
+    fn a_withdraw_a_bridge_attest_and_a_bridge_burn_share_a_block() {
+        let (_d, s, gs, secrets, b1, mut ledger, v) = bridged_chain_funded_for_a_withdraw(41);
+        let base = ledger.next_index();
+        let amount = 2 * bundle_fee();
+        let time = ledger.height() as u32;
+        let withdraw = withdraw_tx(gs.chain_id, &v, amount, 0, time, [13; 8]);
+        let att = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000, 0), 20);
+        // `burn_tx` only needs `ledger` for its anchor/height/chain_id, so the asset index (1,
+        // this chain's first registered asset) can be hardcoded ahead of applying `att`.
+        let burn = burn_tx(&ledger, 1, 400, 100, 30);
+        let b2 = make_block_voted(&b1.block, &mut ledger, vec![att, withdraw, burn], &v, &[&v]);
+        assert_eq!(b2.deposits.len(), 1, "still only the withdraw's note is ledger-made");
+
+        s.commit(&[b1, b2], &ledger, &[], &StubExecutor).unwrap();
+
+        assert_eq!(s.notes_count().unwrap(), ledger.next_index());
+        let reloaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(reloaded, ledger, "tree root, next_index and bridge state all round-trip");
+        assert!(ledger.next_index() > base, "the block did add leaves");
+        let bridge = ledger.bridge().expect("bridged genesis");
+        assert_eq!(bridge.burns.len(), 1, "the burn landed in the outbound log");
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().problem, None);
+    }
+
     /// A chain that crosses an epoch boundary, with the epoch's set derived from the register as
     /// of the last block of the epoch before (spec §8). Block 1 unbonds validator 2 out of the
     /// set, so epoch 1 runs with validator 1 alone.
