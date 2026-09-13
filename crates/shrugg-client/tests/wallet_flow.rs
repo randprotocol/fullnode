@@ -1,13 +1,18 @@
 //! The shielded wallet against a real chain: mint, scan, send, scan both sides, spend the change,
-//! bond a validator.
+//! bond a validator, then make a confidential call and open its input transcript back.
 //!
 //! One validator node runs in-process (the same `node::start` the cluster tests use) so the
 //! whole loop is exercised end to end — a faucet mint lands a note only wallet A's viewing key
 //! opens; A proves a real 2-in-2-out bundle; B finds its payment by trial-decrypting the tree;
-//! A's spent note comes back marked spent by the chain's own nullifier set; and the change note
-//! is spendable, which is the part a wallet gets wrong if it forgets its own second output. The
-//! bond at the end is the one bundle whose value does not land in anybody's note: it burns, and
-//! the register's stake is where it turns up instead.
+//! A's spent note comes back marked spent by the chain's own nullifier set; the change note
+//! is spendable, which is the part a wallet gets wrong if it forgets its own second output; the
+//! bond is the one bundle whose value does not land in anybody's note (it burns, and the
+//! register's stake is where it turns up instead); and a call's private inputs come back off the
+//! chain under A's viewing key alone, checked against the `H_IN` its proof published (spec §6.1).
+//!
+//! Six bundle proofs and one call proof, so this is the slowest test in the workspace by a wide
+//! margin — minutes, not seconds. The bridge commands are not here: they need a chain with a
+//! guardian set, which the node's cluster tests configure.
 //!
 //! Two things about the chain this test configures deliberately. The FRI profile is `test` (16
 //! queries: a real proof, not a security claim), and blocks are slow — `ANCHOR_WINDOW` and
@@ -21,11 +26,12 @@ use shrugg_client::wallet::{self, NoteStore, Wallet};
 use shrugg_client::RpcClient;
 use shrugg_core::genesis::{Genesis, GenesisValidator};
 use shrugg_core::notes::word8_to_hex;
-use shrugg_core::{format_amount, gas, Keypair, UNITS_PER_SHRUGG};
+use shrugg_core::{format_amount, gas, Action, Keypair, UNITS_PER_SHRUGG};
 use shrugg_node::node::{self, NodeConfig, NodeHandle};
 use shrugg_zkvm::executor::ZkExecutor;
 use shrugg_zkvm::machine::{Backend, FriProfile};
 use shrugg_zkvm::notes::SpendKey;
+use shrugg_zkvm::{call_envelope, executor, guests, hash};
 use std::time::{Duration, Instant};
 
 const CHAIN_ID: u64 = 7;
@@ -169,6 +175,61 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
         "the register's stake grew by exactly the bonded amount"
     );
     assert_eq!(a_store.balance(), balance_before - bond - fee, "the wallet paid the stake and the fee");
+
+    // ---- a confidential call whose input transcript A can open back (spec §6.1) ----
+    // `balance_check` reads four private words and publishes only whether they reach a threshold,
+    // so the transcript is the only record of what it was fed — and it is sealed to A alone.
+    let prog = guests::balance_check(1_000);
+    let pid = shrugg_core::program::program_id(prog.base_pc, &prog.words);
+    let deploy = Action::Deploy { base_pc: prog.base_pc, words: prog.words.clone() };
+    let fee = wallet::deploy_fee_default(&deploy);
+    wallet::submit(&rpc, &a, &mut a_store, None, deploy, fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the program deploys");
+
+    let inputs = [100u32, 200, 300, 400];
+    // `prove_call`, not `prove`: it returns the `H_IN` salt, without which the transcript could not
+    // be bound to this proof at all.
+    let (proof, outputs, tier, salt) =
+        executor::prove_call(FriProfile::Test, &prog, &inputs, None, Backend::Cpu).expect("the call proves");
+    let h_in = hash::input_digest(salt, &inputs);
+    let (envelope, key) = call_envelope::seal_call_envelope(&a.vk, None, &h_in, salt, &inputs).expect("the transcript seals");
+    let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
+    let call = wallet::submit(
+        &rpc,
+        &a,
+        &mut a_store,
+        None,
+        action,
+        wallet::call_fee_default(tier),
+        0,
+        FriProfile::Test,
+        Backend::Cpu,
+        CHAIN_ID,
+        true,
+    )
+    .await
+    .expect("the call is accepted and commits");
+    let receipt = rpc.wait_for_receipt(&call.hash, Duration::from_secs(120)).await.expect("the call has a receipt");
+    // The chain publishes the same `H_IN` the wallet sealed against — it comes out of the proof,
+    // not out of the transaction, which is what makes it a commitment to the inputs.
+    assert_eq!(receipt["h_in"], serde_json::json!(word8_to_hex(&h_in)));
+    assert_eq!(receipt["outputs"][0], 1, "the four private balances do reach the threshold");
+
+    // Off the chain and back open, with nothing but A's own viewing key.
+    let (served_h_in, e) = rpc.call_envelope(&call.hash).await.unwrap().expect("the call published a transcript");
+    assert_eq!(served_h_in, h_in, "the envelope is served with the H_IN it is bound to");
+    let (back_key, back_salt, back_inputs) =
+        call_envelope::open_call_as_sender(&e, &h_in, &a.vk).expect("A opens the call it made");
+    assert_eq!(back_inputs, inputs.to_vec(), "the four private words, as they were fed to the guest");
+    assert_eq!((back_salt, back_key), (salt, key));
+    // And the transcript is faithful: it hashes to the `H_IN` the proof published, which commits
+    // in-circuit to every word the guest read.
+    assert!(call_envelope::call_envelope_is_faithful(&h_in, back_salt, &back_inputs));
+    assert_eq!(receipt["outputs"], serde_json::json!(outputs));
+    // B holds the same bytes as everyone else and no key that opens them.
+    assert!(call_envelope::open_call_as_sender(&e, &h_in, &b.vk).is_none(), "a transcript is not public");
+    assert!(call_envelope::open_call_as_auditor(&e, &h_in, &b.vk).is_none(), "and this call named no auditor");
 
     eprintln!("whole flow in {:.1?}", started.elapsed());
     handle.shutdown().await;

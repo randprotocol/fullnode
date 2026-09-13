@@ -69,8 +69,16 @@ pinned `bundle` zkVM guest.
 Bundle { anchor, nullifiers[2], commitments[2], fee, burn, asset, time, envelopes[2], proof }
 Transaction { chain_id, bundle: Option<Bundle>, action }
 Action = None | Mint { .. } | Deploy { base_pc, words } | Call { program, proof, input_envelope }
-       | Bond { validator, amount, registration } | Unbond { .. } | Withdraw { .. }
+       | Bond { validator, amount, registration } | Unbond { .. } | Withdraw { .. } // phase S2
+       | BridgeAttest { attestation, recipient, r, time, asset, envelope }         // phase S3
+       | BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to }
 ```
+
+A note's `asset` word is `0` for SHRUGG and, since phase S3, the bridge registry's dense index for
+a bridged asset (`docs/bridge.md`). A bundle balances exactly one asset, which is why a `BridgeBurn`
+— the one transaction that spends a bridged asset and pays a SHRUGG fee — carries two bundles. The
+three staking variants are on the wire but every one of them is still refused
+(`UnsupportedAction`) until phase S2 lands.
 
 The shape is fixed, so one input and one output are often dummies: a dummy input is a zero-value
 note owned by the spender, and the change output is published even when the change is zero. A
@@ -84,6 +92,12 @@ transaction that looked different when there was no change would leak that there
 | **Deploy** | everything above, plus `base_pc` and the program's words (so the program id and its code) | who deployed it, and what the paying notes were worth |
 | **Call** | everything a transfer publishes, plus the program id, the call proof, and the receipt's tier and eight output words | the private inputs, registers, memory, branches taken, the real cycle count (only the padded tier shows), who called it |
 | **Mint** (faucet) | the new note's commitment, its envelope, the **amount in the clear**, and the minting validator's public key (shown as its address) and signature | who the note is for — only the address holder can open the envelope; the address itself is never published |
+| **BridgeAttest** | the attestation (so the source chain, the token, the **amount**, the recipient's address hash and the guardian signatures), the recipient's shielded address, the deposit note's `asset` index, `r` and `time`, and the fee bundle | which notes paid the fee, and everything about the deposit note's later spend |
+| **BridgeBurn** | the asset index, the **amount**, the relayer fee and the destination chain and address, plus both bundles' public fields | which notes were burned, and who burned them |
+
+A `Call`'s `input_envelope` is the one optional publication in that table: the call's private inputs,
+sealed so that the caller, a per-call key, or a named auditor can open them later
+(`docs/confidential.md` §call input envelopes). The chain checks only its size.
 
 A mint is how value enters the pool at all, and its amount is public by design (spec §6: the same
 one-hop visibility Zcash's t→z has). Genesis deposit notes are the same trade: `alloc` in
@@ -120,7 +134,12 @@ the pool back together.
 | `shrugg faucet [ADDRESS]` | ask a validator to mint (testnet chains only) |
 | `shrugg program build/deploy/show` | assemble, deploy (paid by a bundle), inspect a program |
 | `shrugg call <PROGRAM>` | prove a call locally, pay through a bundle, print the receipt |
+| `shrugg open-call <TX>` | open a committed call's input transcript and check it against its `H_IN` |
 | `shrugg receipt <TX>` | the receipt of a committed call |
+| `shrugg asset-balance [INDEX]` | what this wallet holds in a bridged asset, or a row per asset |
+| `shrugg bridge-mint <ATTESTATION>` | deposit a guardian-signed attestation as a note |
+| `shrugg bridge-burn <ASSET> <AMOUNT> <CHAIN> <TO>` | burn a bridged asset outbound; proves two bundles |
+| `shrugg bridge` / `shrugg bridge-message <SEQ>` | the bridge's public state; one outbound message |
 | `shrugg fee bundle\|deploy <words>\|call <tier>` | the schedule's floor |
 | `shrugg tx/block/head/status/peers/validators` | plain chain reads |
 
@@ -255,19 +274,25 @@ the same check before gossiping, so a bad transaction is refused once, at the ed
    a call proof ≤ 1 MiB.
 2. **Chain id** matches this chain.
 3. **Shape and fee floor** — a mint, an `Unbond` and a `Withdraw` carry no bundle and everything
-   else must; `asset = 0`; `burn = 0` unless the action is a `Bond`, whose bundle must burn exactly
-   the bonded amount; `fee ≥ fee_floor(action)` — which is zero for the three bundle-less actions,
-   since they have nothing to pay a fee *from*.
+   else must; the transaction's own bundle is always SHRUGG (`asset = 0`) and burns nothing
+   (`burn = 0`) unless the action is a `Bond`, whose bundle must burn exactly the bonded amount; a
+   `BridgeBurn`'s second bundle is the one bundle exempt from both (it is the bridged asset's, and
+   it burns); `fee ≥ fee_floor(action)` — zero for the three bundle-less actions, since they have
+   nothing to pay a fee *from*, and the bundle base twice for a burn, once per bundle a node has to
+   verify.
 4. **Anchor** — the bundle's anchor is one of the last `ANCHOR_WINDOW = 256` *block-end* roots. A
    root the tree only passes through mid-block is never an anchor.
 5. **Time** — `time` is within `[height - 256, height]` (`TIME_WINDOW`).
 6. **Nullifiers and commitments** — the two nullifiers differ and neither is in the spent set;
    the two commitments differ and neither is already a leaf.
 7. **Action checks** — faucet enabled, mint under the 100 SHRUGG cap, minter is a validator and
-   its signature verifies; program decodes (Deploy); program exists (Call); and for the staking
-   actions the rules of `docs/staking.md` — a registration present exactly when the validator is
-   unknown, the register's nonce and the validator's signature, enough stake to unbond, enough
-   released to withdraw, and the deposit note a withdraw derives not already in the tree.
+   its signature verifies; program decodes (Deploy); program exists and the input envelope is
+   within its own cap (Call); for the staking actions the rules of `docs/staking.md` — a
+   registration present exactly when the validator is unknown, the register's nonce and the
+   validator's signature, enough stake to unbond, enough released to withdraw, and the deposit note
+   a withdraw derives not already in the tree; and the bridge's own rules for the two bridge
+   actions, including a burn's asset bundle in full — all of it before either bundle's proof, so a
+   bridge transaction that cannot apply costs no verification (`docs/bridge.md` §5).
 8. **Bundle digest** — the ledger recomputes the digest from the bundle's published plaintext and
    it must equal what the proof published. A proof whose witness broke the relation publishes a
    tainted digest, which matches no plaintext.
@@ -300,9 +325,12 @@ worth naming.
 - **Timing and the fee.** A transaction's fee is public, and the fee floors differ by action, so
   a watcher can tell a transfer from a deploy from a call. Submission timing links a bundle to
   whoever was connected to that node's RPC at that moment.
-- **Deposits.** Mint and genesis alloc amounts are in the clear. The one-hop link from "100
-  SHRUGG was minted" to "a note worth 100 SHRUGG exists" is unavoidable until value can enter the
-  pool with a proof instead of a public amount.
+- **Deposits.** Mint, genesis alloc and bridge-deposit amounts are in the clear, and a bridge
+  deposit also publishes its asset and the recipient's shielded address in that one transaction.
+  The one-hop link from "100 SHRUGG was minted" to "a note worth 100 SHRUGG exists" is unavoidable
+  until value can enter the pool with a proof instead of a public amount. A bridge *burn* leaks the
+  same way on the way out, and deliberately: the guardians releasing on the other chain need the
+  amount and the destination.
 - **The program.** A deployed program is public code, and `hc` is binding, not hiding: anyone who
   can enumerate candidate programs can confirm which was deployed.
 
@@ -321,13 +349,21 @@ compel:
   sealed under a fresh one for precisely this reason.
 
 In S1 the wallet derives the viewing key on every run and never stores it, and it draws each
-`TxKey` fresh and drops it after sealing. So per-transaction disclosure is a property of the
-format the chain already enforces, not yet a command the CLI offers; exporting either key is a
+`TxKey` fresh and drops it after sealing. So per-transaction disclosure of *value* is a property of
+the format the chain already enforces, not yet a command the CLI offers; exporting either key is a
 wallet change, not a chain change.
+
+Phase S3 added the same two grains for *computation*, and these the CLI does offer: a call may
+publish its private inputs as a sealed transcript, openable by the caller's viewing key, by a
+per-call key (`--print-call-key`), or by an auditor named when the call was made (`--auditor`), and
+`shrugg open-call` checks the opened transcript against the `H_IN` the proof published before
+believing it. `--no-envelope` publishes nothing at all, which is irreversible: once the salt is
+gone, nobody can open that call. See `docs/confidential.md` §call input envelopes.
 
 ## 7. What is next
 
-S1 was the pool itself, S2 is in this release, and S3 follows. Each is a hard fork (see spec §12):
+S1 was the pool itself. Two phases follow it, each a hard fork (see spec §12), and both are in this
+release — S3 landed first, which is the order they arrived in, not the order they were planned in:
 
 **S2 — staking on the shielded chain: here.** The validator register gained `Bond`, `Unbond` and
 `Withdraw`: stake moves in from a bundle as its `burn`, unbonds over two epochs, and a validator's
@@ -337,11 +373,13 @@ it, and `shrugg_getSupply` audits the pool against it. The whole of it is `docs/
 `docs/supply.md`. What S2 did **not** bring is the wallet's local commitment tree — the answer to the
 witness leak in §6 — which is still the first follow-up.
 
-**S3 — the bridge, and private call inputs.** Bridged assets become notes with
-`asset = <bridge asset id>`; `BridgeBurn` becomes the one two-bundle transaction (an asset bundle
-that burns, and a SHRUGG bundle that pays the fee). Call inputs gain their own envelopes (spec
-§6.1), so a caller can disclose what a program ran on without publishing it. `docs/bridge.md`
-describes the bridge as it stood on the account chain; none of it is wired up here until S3.
+**S3 — the bridge, and private call inputs — has landed.** A bridged asset is a note whose `asset`
+word is the registry's index for it; `BridgeAttest` deposits one note that the *chain* computes from
+the amount the guardians signed; `BridgeBurn` is the chain's one two-bundle transaction (an asset
+bundle that burns, and a SHRUGG bundle that pays for both). Call inputs have their own envelopes
+(spec §6.1), so a caller can disclose what a program ran on without publishing it. `docs/bridge.md`
+and `docs/confidential.md` are the references; a chain turns the bridge on with a `bridge` section in
+its genesis, which is a hard fork for the chains that take it and a no-op for the ones that do not.
 
 Not scheduled yet: slashing and jailing, a nullifier accumulator to replace the per-block
 recomputation of the nullifier root, and proof batching to amortize the ~16 ms warm verify.

@@ -4,6 +4,7 @@
 //! free of the zkVM's field-arithmetic crates.
 
 use crate::confidential::ConfidentialExecutor;
+use crate::crypto::Hash;
 use serde::{Deserialize, Serialize};
 
 pub type Word8 = [u32; 8];
@@ -130,6 +131,20 @@ impl ShieldedAddress {
         let mut raw = word8_to_bytes(&self.pk).to_vec();
         raw.extend_from_slice(&self.kem_ek);
         format!("{ADDRESS_PREFIX}{}", bs58::encode(raw).into_string())
+    }
+
+    /// The 32-byte stand-in for this address in a place that has room for 32 bytes and no
+    /// more: the `to` field of a bridge transfer payload (spec §10).
+    ///
+    /// A shielded address is ~1.2 KB — the ML-KEM encapsulation key dominates — and the wire
+    /// format guardians sign is fixed at 32 bytes, so a source-chain depositor names its
+    /// recipient by this hash and the `BridgeAttest` transaction carries the address itself for
+    /// the ledger to check against it. Domain-separated like every other hash here, over
+    /// exactly the two fields the address is: `pk` bytes then `kem_ek`.
+    pub fn recipient_hash(&self) -> [u8; 32] {
+        let mut raw = word8_to_bytes(&self.pk).to_vec();
+        raw.extend_from_slice(&self.kem_ek);
+        Hash::digest_domain(b"shrugg-shielded-recipient", &raw).0
     }
 
     pub fn parse(s: &str) -> Result<ShieldedAddress, AddressError> {

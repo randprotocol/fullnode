@@ -155,9 +155,11 @@ answered before the ledger probe runs at all (§8).
 split. Minimums come from `shrugg_core::gas`: every bundle pays `BUNDLE_BASE = 1,000,000` units
 (0.001 SHRUGG); a `Deploy` adds `100,000` units per program word; a `Call` adds `1,000,000` units
 at the lowest tier (10) plus `100,000` per two tiers above it, to `1,500,000` at tier 20
-(`call_fee`). A mint carries no bundle and pays nothing. Blocks are capped at 2,000 transactions
-and 4 MiB of encoded bytes (`gas::MAX_BLOCK_TXS`, `gas::MAX_BLOCK_BYTES`) — enforced both where the
-proposer selects candidates and inside `Ledger::apply_block`, so a Byzantine leader cannot stuff an
+(`call_fee`). A `BridgeBurn` pays `BUNDLE_BASE` twice, because it is the one transaction that
+carries two bundles and a node verifies both. A mint carries no bundle and pays nothing. Blocks
+are capped at 2,000 transactions and 4 MiB of encoded bytes (`gas::MAX_BLOCK_TXS`,
+`gas::MAX_BLOCK_BYTES`) — enforced both where the proposer selects candidates and inside
+`Ledger::apply_block`, so a Byzantine leader cannot stuff an
 over-limit block and force every replica to execute it. At ~300 KB per bundle proof that is about a
 dozen shielded transactions per block.
 
@@ -556,9 +558,10 @@ through the real executor); full mode additionally re-checks every proposer sign
   in more detail than the constraint-set notes here.
 - `docs/shielded.md` — the user's guide to the pool: keys, what is published and what is not, the
   wallet commands, the RPC surface, the admission order, and what still leaks.
-- `docs/bridge.md` — the cross-chain bridge as it stood on the account chain. It is **not wired up
-  on the shielded chain**: `Genesis::build` rejects a bridge section, the bridge transaction kinds
-  and RPC methods are gone, and bridged balances come back as notes in phase S3.
+- `docs/bridge.md` — the cross-chain bridge, wired up on the shielded chain since phase S3: a
+  bridged holding is a note whose `asset` word is the registry's index for it, an attestation
+  deposits one note the chain computes itself, and a burn is the chain's one two-bundle transaction.
+  A chain turns it on with a `bridge` section in its genesis.
 - `docs/rpc.md` — every JSON-RPC method, including the ones this page names (`shrugg_getReceipt`,
   `shrugg_getProgram`, `shrugg_sendTransaction`, `shrugg_status`) with full parameter and result
   shapes.

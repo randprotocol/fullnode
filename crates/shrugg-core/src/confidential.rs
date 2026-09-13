@@ -53,23 +53,32 @@ pub trait ConfidentialExecutor: Send + Sync {
     fn warm_bundle(&self) {}
 }
 
-/// Test executor. A "proof" is `STUB` || tier (1 byte) || 8 outputs (LE u32) || blake3(program id)[..8].
-/// Any code is accepted. Never use on a real chain.
+/// Test executor. A "proof" is `STUB` || tier (1 byte) || 8 outputs (LE u32) || `H_IN`
+/// (8 LE u32) || blake3(program id)[..8]. Any code is accepted. Never use on a real chain.
 #[derive(Debug, Default, Clone)]
 pub struct StubExecutor;
 
 pub const STUB_MARKER: &[u8; 4] = b"STUB";
-const STUB_LEN: usize = 4 + 1 + 32 + 8;
+const STUB_LEN: usize = 4 + 1 + 32 + 32 + 8;
 /// Stub bundle proof: `STUB` || 32-byte digest || blake3("shrugg-stub-bundle", hc_bundle bytes)[..8].
 const STUB_BUNDLE_LEN: usize = 4 + 32 + 8;
 
 impl StubExecutor {
+    /// A stub call proof publishing an all-zero `H_IN` — what a test that is not about the
+    /// input commitment wants. [`Self::make_proof_with_h_in`] is the same proof with a chosen one.
     pub fn make_proof(program: &Hash, tier: u8, outputs: [u32; 8]) -> Vec<u8> {
+        Self::make_proof_with_h_in(program, tier, outputs, [0; 8])
+    }
+
+    /// A stub call proof publishing `h_in` as its private-input commitment (`pv::IN0..7` on a
+    /// real proof) — what a call-input envelope is sealed against (spec §6.1).
+    pub fn make_proof_with_h_in(program: &Hash, tier: u8, outputs: [u32; 8], h_in: Word8) -> Vec<u8> {
         let mut v = STUB_MARKER.to_vec();
         v.push(tier);
         for o in outputs {
             v.extend_from_slice(&o.to_le_bytes());
         }
+        v.extend_from_slice(&word8_to_bytes(&h_in));
         v.extend_from_slice(&Hash::digest_domain(b"shrugg-stub-binding", program.as_bytes()).0[..8]);
         v
     }
@@ -109,7 +118,8 @@ impl ConfidentialExecutor for StubExecutor {
         for (i, o) in outputs.iter_mut().enumerate() {
             *o = u32::from_le_bytes(proof[5 + 4 * i..9 + 4 * i].try_into().unwrap());
         }
-        Ok(CallOutcome { tier, outputs })
+        let h_in = word8_from_bytes(&proof[37..69]).expect("32 bytes");
+        Ok(CallOutcome { tier, outputs, h_in })
     }
 
     fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
@@ -180,7 +190,10 @@ mod tests {
         let id = Hash::digest(b"p");
         let proof = StubExecutor::make_proof(&id, 12, [1, 0, 5, 0, 0, 0, 0, 9]);
         let out = StubExecutor.verify_call(&record(id), &proof).unwrap();
-        assert_eq!(out, CallOutcome { tier: 12, outputs: [1, 0, 5, 0, 0, 0, 0, 9] });
+        assert_eq!(out, CallOutcome { tier: 12, outputs: [1, 0, 5, 0, 0, 0, 0, 9], h_in: [0; 8] });
+        // …and the H_IN a call-input envelope is sealed against travels in the proof, not beside it.
+        let sealed = StubExecutor::make_proof_with_h_in(&id, 12, [1, 0, 5, 0, 0, 0, 0, 9], [7; 8]);
+        assert_eq!(StubExecutor.verify_call(&record(id), &sealed).unwrap().h_in, [7; 8]);
         assert_eq!(StubExecutor.verify_call(&record(Hash::digest(b"q")), &proof), Err(ConfidentialError::WrongProgram));
         assert_eq!(StubExecutor.verify_call(&record(id), b"junk"), Err(ConfidentialError::MalformedProof));
     }

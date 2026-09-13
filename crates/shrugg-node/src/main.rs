@@ -304,8 +304,11 @@ async fn main() -> Result<()> {
                 confidential: !no_confidential,
                 fri_profile,
                 hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
-                // `Genesis::build` rejects a bridge section outright until phase S3 puts the
-                // bridge back on the shielded chain, so this CLI offers no way to write one.
+                // A bridged chain is cut by adding a `bridge` section to this file by hand:
+                // `Genesis::build` accepts and validates one (`check_bridge`) and the node
+                // persists and reloads it, but a guardian set plus a per-chain emitter table is
+                // more than a flag's worth of surface and belongs with whoever holds the
+                // guardian keys, not with this command.
                 bridge: None,
                 epoch_blocks,
             };

@@ -56,10 +56,14 @@ pub fn fee_floor(action: &Action) -> u64 {
         // A bond is the one staking action that rides on a bundle — the bundle is what burns the
         // stake out of the pool — so it pays the plain base like a transfer.
         Action::Bond { .. } => BUNDLE_BASE,
-        // S3 scaffold: the bundle base until S3 prices the work these buy — an attestation's
-        // decode and guardian signature recovery, and a burn's second bundle proof. S3 owns
-        // this arm, so the two phases never touch the same line.
-        Action::BridgeAttest { .. } | Action::BridgeBurn { .. } => BUNDLE_BASE,
+        // An attestation's decode and guardian signature recovery are cheap next to a STARK
+        // verify, and the bundle base already covers the one bundle it carries.
+        Action::BridgeAttest { .. } => BUNDLE_BASE,
+        // Spec §7 item 3 charges the bundle base "for every bundle", and a `BridgeBurn` is the
+        // one transaction that carries two: the SHRUGG fee bundle and the asset bundle inside
+        // the action. Both are verified, so both are paid for — and by this bundle, because the
+        // asset bundle's `fee` must be zero (the guest's "`asset != 0` => `fee = 0`" rule).
+        Action::BridgeBurn { .. } => 2 * BUNDLE_BASE,
     }
 }
 
@@ -122,10 +126,11 @@ mod tests {
         }
     }
 
-    /// S3 scaffold: each bridge action pays exactly the bundle base, no more and no less.
-    /// S3 owns this test and its arm of [`fee_floor`].
+    /// Spec §7 item 3 charges the bundle base per *bundle*, so a `BridgeAttest` — one bundle —
+    /// pays it once and a `BridgeBurn` — the chain's only two-bundle transaction — pays it
+    /// twice, out of the one bundle that is allowed a non-zero fee.
     #[test]
-    fn the_bridge_actions_pay_the_bundle_base() {
+    fn a_burn_pays_the_bundle_base_for_both_of_its_bundles() {
         let b = crate::notes::Bundle {
             anchor: [0; 8],
             nullifiers: [[0; 8], [1; 8]],
@@ -137,17 +142,17 @@ mod tests {
             envelopes: [env(), env()],
             proof: vec![],
         };
-        for a in [
-            Action::BridgeAttest {
-                attestation: vec![],
-                recipient: crate::notes::ShieldedAddress { pk: [0; 8], kem_ek: vec![] },
-                r: [0; 8],
-                envelope: env(),
-            },
-            Action::BridgeBurn { asset_bundle: b, asset: 1, amount: 1, relayer_fee: 0, to_chain: 2, to: [0; 32] },
-        ] {
-            assert_eq!(fee_floor(&a), BUNDLE_BASE, "{a:?}");
-        }
+        let attest = Action::BridgeAttest {
+            attestation: vec![],
+            recipient: crate::notes::ShieldedAddress { pk: [0; 8], kem_ek: vec![] },
+            r: [0; 8],
+            time: 0,
+            asset: 1,
+            envelope: env(),
+        };
+        assert_eq!(fee_floor(&attest), BUNDLE_BASE);
+        let burn = Action::BridgeBurn { asset_bundle: b, asset: 1, amount: 1, relayer_fee: 0, to_chain: 2, to: [0; 32] };
+        assert_eq!(fee_floor(&burn), 2 * BUNDLE_BASE);
     }
 
     #[test]

@@ -24,9 +24,11 @@ Conventions:
 
 **There is no balance method, and no account method.** This chain has no accounts; see
 `docs/shielded.md`. A wallet computes its own balance by scanning the commitment tree with its
-viewing key, which is what `shrugg_getCommitments` and `shrugg_getNullifiers` exist for. The
-bridge methods went with the account model too, and do not come back until phase S3
-(`docs/bridge.md`).
+viewing key, which is what `shrugg_getCommitments` and `shrugg_getNullifiers` exist for. That
+holds for bridged assets too: a bridged holding is a note whose `asset` word is the registry's
+index for it (phase S3, `docs/bridge.md`), so the bridge methods below report the bridge's own
+*public* state — guardians, emitters, the asset registry, the outbound burn log — and no
+per-address balance. `shrugg_getAssetBalance` is gone for good.
 
 ## Methods
 
@@ -48,7 +50,9 @@ in the mempool, and gossips it. Errors come back as code `-32000` with the reaso
 `time 12 is outside [244, 500]`, `fee 1000000 below minimum 2000000`,
 `the bundle's digest is not what its proof published`, `invalid bundle proof: …`,
 `unknown program …`, `already in mempool`, `conflicts with a pending transaction over <nullifier>`,
-`faucet is disabled on this chain`.
+`faucet is disabled on this chain`, and for the bridge actions `bridge: attestation already
+consumed`, `the attestation names a different recipient`, `the attestation deposits under asset 2,
+and the transaction names 1`, `the burn's asset bundle burns 399, not the 400 the action sends`.
 
 Acceptance is not commitment: poll `shrugg_getTransaction` until it returns a block.
 
@@ -126,12 +130,35 @@ proves against).
 Params: `[tx_hash]`. Result: `null` until the call is committed, then
 
 ```json
-{ "tx": "…", "program": "…", "tier": 14, "outputs": [1, 0, 25, 0, 0, 0, 0, 0], "height": 17, "index": 0 }
+{ "tx": "…", "program": "…", "tier": 14, "outputs": [1, 0, 25, 0, 0, 0, 0, 0], "height": 17,
+  "index": 0, "h_in": "9c0e…7f" }
 ```
+
+`h_in` is the proof's public commitment to the call's *private* inputs (`Word8` hex, zkVM M4.1).
+It discloses nothing on its own — it is a salted digest — and it is what a call-input envelope is
+sealed against, so a holder needs it to open one (`shrugg_getCallEnvelope`) and to check an
+opened transcript with `hash::input_digest(salt, inputs)`.
 
 There is no `effect` field: effect kind 1 (the program-driven transfer to an account) was deleted
 with the accounts. A call's outputs are recorded and nothing else moves; value moves only through
 the bundle that paid for the call.
+
+### `shrugg_getCallEnvelope`
+Params: `[tx_hash]`. Result: `null`, or the call's input envelope (spec §6.1) in hex:
+
+```json
+{ "tx": "…", "h_in": "9c0e…7f", "kem_ct": "…", "to_sender": "…", "to_auditor": "…", "body": "…" }
+```
+
+`h_in` is the receipt's, repeated here so one request is enough to open the envelope. `body` is
+the call's private input vector and its `H_IN` salt, sealed under a per-call key with that
+`h_in` as associated data; `to_sender` wraps that key to the caller's outgoing
+viewing key and `kem_ct`/`to_auditor` to the auditor the caller named, both empty strings when
+there is none. The node holds no key that opens any of it and never looks inside — it is served
+so that a wallet with the caller's viewing key, a per-call key, or the auditor's key can open it
+(`shrugg_zkvm::call_envelope`) and check the transcript against `H_IN`. `null` means the call
+published no envelope (`--no-envelope`), the transaction is not a call, or this node has no
+receipt for that hash.
 
 ### `shrugg_estimateFee`
 Params: `[spec]`, one of `{"kind":"bundle"}`, `{"kind":"deploy","words":n}` or
@@ -179,8 +206,22 @@ The staking (phase S2) and bridge (phase S3) actions:
 - `{ "kind": "withdraw", "validator": "<base58>", "amount": 9, "nonce": 3, "time": 1994 }` — the
   deposit note's blinding and envelope are not rendered. `time` is the note's time word, which the
   withdrawing node chose; the note itself is worth `amount` less the bundle base.
-- `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>" }` — no
-  amount: it is inside the attestation, which the bridge decoder reads.
+- `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>",
+  "asset": 1, "asset_index": 1, "amount": 1000, "time": 41, "r": "<64 hex>",
+  "commitment": "<64 hex>" }` — the amount and the asset are
+  inside the attestation, so they are decoded out of it; `asset_index` is what the registry gave
+  that asset, and is the `asset` word of the deposit note. Both are `null` for a guardian-set
+  rotation (which deposits nothing) and on a chain whose registry does not name the asset.
+  `asset` is the index the *action* names, and on a committed attest it always equals
+  `asset_index` — admission refuses a transaction where they differ — but it is never `null`, so
+  the two together say whether this node's registry can resolve the deposit at all. `time` is the
+  deposit note's own `time` word, which the action publishes and admission holds to the window a
+  bundle's `time` gets — the note is derived from it, not from the height the transaction landed
+  at. `r` is the deposit note's blinding, a field of the action and public like the rest of it, and
+  `commitment` is the leaf the chain computed from those five fields and appended — `null` for a
+  rotation. Together they are the whole deposit note, which is what lets its recipient rebuild it
+  without opening the submitter's envelope (`docs/bridge.md` §8); a transfer's or a withdrawal's
+  blinding is *not* rendered, because those notes are not public.
 - `{ "kind": "bridge_burn", "asset": 2, "amount": 400, "relayer_fee": 100, "to_chain": 5, "to":
   "abab…", "asset_bundle": { …same shape as `bundle`… } }` — `to` is the 32-byte destination
   address, hex. The asset bundle renders exactly like the fee bundle: same public fields, no more.
@@ -230,6 +271,46 @@ build disagrees with the genesis value refuses to start at all.
 
 ### `shrugg_getPeers`
 Params: `[]`. Result: array of `{ "peer_id": "12D3KooW...", "addrs": ["/ip4/…/tcp/30303"], "connected_secs": 1241 }`.
+
+### `shrugg_getBridgeState`
+Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false }`. Otherwise:
+```json
+{
+  "enabled": true,
+  "emitter": "01…",                      // this chain's outbound emitter address, 32 bytes hex
+  "emitters": { "2": "02…" },            // source chain id -> the emitter address trusted there
+  "guardian_set_index": 0,
+  "guardians": ["aabb…"],                // the current set's 20-byte addresses, hex
+  "burn_sequence": 1,                    // outbound messages emitted so far
+  "next_index": 2,                       // the note index the next newly registered asset gets
+  "assets": [ …the rows of `shrugg_getAssets`… ]
+}
+```
+No balances: bridged value is notes, not accounts.
+
+### `shrugg_getAssets`
+Params: `[]`. Result: the bridge's asset registry, ascending by index (which is registration
+order), or `[]` on a chain without a bridge:
+```json
+[{ "index": 1, "chain": 2, "token": "aaaa…", "asset_id": "…" }]
+```
+`index` is the `asset` word a note of that asset carries — index 0 is SHRUGG and is never in the
+registry. `chain` and `token` are the wire identity guardians sign about; `asset_id` is
+`blake3` of the two, and is what `shrugg_bridgeAssetId` computes.
+
+### `shrugg_bridgeAssetId`
+Params: `[token_chain, token_address]` where `token_chain` is an integer and `token_address` is
+32 bytes of hex. Result: the asset id (64 hex characters). Pure arithmetic on its arguments, so
+it answers on any chain, bridged or not.
+
+### `shrugg_getBridgeBurn`
+Params: `[sequence]` (integer). Result: `null` if this chain has emitted no such message, else
+```json
+{ "sequence": 0, "body_hex": "…", "digest": "…", "tx": "…", "height": 2 }
+```
+`body_hex` is the outbound message as guardians must hash and sign it; `digest` is its hash.
+`tx` is the burn transaction that emitted it — a burn is funded by notes, so the transaction
+hash stands in for the sender identity the message has no room for.
 
 ### `shrugg_getValidators`
 Params: `[]`. Result: array of
@@ -317,13 +398,34 @@ Action::Bond { validator: Address, amount: u64, registration: Option<Registratio
 Action::Unbond { validator: Address, amount: u64, nonce: u64, signature: Signature }
 Action::Withdraw { validator: Address, amount: u64, nonce: u64, time: u32, r: Word8,
                    envelope: Envelope, signature: Signature }
+Action::BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, time: u32,
+                       asset: u32, envelope: Envelope }
+Action::BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee: u64,
+                     to_chain: u16, to: [u8; 32] }
 
 Registration { public_key: PublicKey, payout: ShieldedAddress, signature: Signature }
 ```
 
 A `Bond` must carry a bundle whose `burn` equals its `amount` — that is how the stake leaves the
 pool — and `registration` is present exactly when the validator is not in the register yet
-(`docs/staking.md`). The two bridge actions are phase S3's and are rejected until it lands.
+(`docs/staking.md`).
+
+A `BridgeBurn` is the chain's one two-bundle transaction: the outer `bundle` pays the SHRUGG fee
+(the bundle base twice, once per verified bundle) and `asset_bundle` burns exactly `amount`
+of the bridged asset. A `BridgeAttest`'s deposit note is the one commitment the wire does not
+carry — the chain computes it from the amount the guardians signed, the recipient the action
+names, its blinding `r`, its `time` and the registry index it names in `asset`, so a submitter
+cannot choose the amount or the owner. It *can* choose `time`, within the window a bundle's `time`
+gets, which is what lets the depositor seal an envelope for a note whose commitment it can compute
+before knowing which block will take the transaction. `asset` is the other half of that: the index
+the envelope was sealed for, which admission compares against the index the registry resolves (an
+existing asset's, or the one this transaction's own registration would assign) and refuses on a
+mismatch — `the attestation deposits under asset 2, and the transaction names 1`. Only a *first*
+sighting can hit that, and only by losing a race to another first sighting, which costs the
+submitter a fee bundle and a re-proof instead of depositing a note its recipient cannot open.
+
+A `Withdraw` derives its note the same way and for the same reason: `time` is the head height when
+the command ran, and the chain, not the wire, computes the commitment (`docs/staking.md`).
 
 Encoded sizes (bincode's default configuration: fixed-width integers, 8-byte length prefixes,
 `u32` enum tags):

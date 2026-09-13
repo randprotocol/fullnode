@@ -476,11 +476,11 @@ impl Node {
 
     async fn commit(&mut self, blocks: Vec<CommittedBlock>, epoch_sets: Vec<(u64, ValidatorSet)>) -> Result<()> {
         if blocks.is_empty() {
-            self.storage.commit(&[], self.hs.committed_ledger(), &epoch_sets)?;
+            self.storage.commit(&[], self.hs.committed_ledger(), &epoch_sets, self.executor.as_ref())?;
             return Ok(());
         }
         let ledger = self.hs.committed_ledger().clone();
-        self.storage.commit(&blocks, &ledger, &epoch_sets)?;
+        self.storage.commit(&blocks, &ledger, &epoch_sets, self.executor.as_ref())?;
         for cb in &blocks {
             let included: Vec<Hash> = cb.block.transactions.iter().map(|tx| tx.hash()).collect();
             self.mempool.remove(&included);
@@ -879,7 +879,7 @@ impl Node {
             let deposits = ledger.take_deposits();
             accepted.push(CommittedBlock { receipts, deposits, ..cb });
         }
-        self.storage.commit(&accepted, &ledger, &recorded)?;
+        self.storage.commit(&accepted, &ledger, &recorded, self.executor.as_ref())?;
         for cb in &accepted {
             tracing::info!("synced block {} ({} txs)", cb.block.height(), cb.block.transactions.len());
             let included: Vec<Hash> = cb.block.transactions.iter().map(|tx| tx.hash()).collect();
@@ -932,13 +932,13 @@ mod tests {
         ledger.set_height(1);
         let tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
         let b1 = make_block_voted(&gs.block, &mut ledger, vec![tx], &key(1), &[&key(1)]);
-        storage.commit(std::slice::from_ref(&b1), &ledger, &[]).unwrap();
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
         let epoch1 = ledger.derive_next_set();
         ledger.set_height(2);
         let tx = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
         let b2 = make_block_voted(&b1.block, &mut ledger, vec![tx], &key(1), &[&key(1)]);
-        storage.commit(std::slice::from_ref(&b2), &ledger, &[(1, epoch1)]).unwrap();
+        storage.commit(std::slice::from_ref(&b2), &ledger, &[(1, epoch1)], &StubExecutor).unwrap();
         (dir, storage, gs, ledger)
     }
 

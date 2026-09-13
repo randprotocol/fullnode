@@ -27,6 +27,14 @@ use std::collections::BTreeMap;
 /// A withdraw pays the bundle base to the block's proposer out of the amount it withdraws, and
 /// that half never leaves the register: only the note is counted here, and the base simply moves
 /// from one register entry to another.
+///
+/// Phase S3's bridge adds no counter, and deliberately: asset index 0 is reserved for SHRUGG and
+/// the asset registry never hands it out ([`crate::bridge::FIRST_ASSET_INDEX`]), so a
+/// `BridgeAttest` always deposits a note of some *other* asset and a `BridgeBurn`'s asset bundle
+/// always destroys one. Neither crosses the SHRUGG boundary, which is why `apply_tx` counts
+/// `fees_paid`/`burned` on the fee bundle's path only and not inside
+/// [`super::Ledger::apply_bundle_notes`], which both bundles share. Each bridged asset's own
+/// audit is the bridge state's business (`shrugg_getAssets`), not this one's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Supply {
     /// Σ of the genesis deposit notes (asset 0).

@@ -8,11 +8,10 @@
 //! commitment tree, and every node's state root agrees afterwards. Those tests run on a fast
 //! chain (150 ms blocks) because no proof is involved. A *bundle* costs about a minute and a half
 //! of proving in the `test` FRI profile, so the tests that need one (a real transfer, a
-//! double-spend race, a deploy and a call, and both staking tests — a bond is a bundle, and a
-//! withdrawn note is spent by one) run on a chain whose blocks are slow enough that the
-//! 256-block anchor and time windows outlive the proof: at [`PROVING`] that is over eight minutes
-//! against a proof of about one and a half, margin enough for all of them proving at once on a
-//! machine that is busy with something else as well.
+//! double-spend race, a deploy and a call, a call's input envelope, both staking tests — a bond is
+//! a bundle, and a withdrawn note is spent by one — and a bridge deposit and burn) run on a chain
+//! whose blocks are slow enough that the 256-block anchor and time windows outlive the proof — see
+//! [`PROVING`].
 //!
 //! What the bundle tests assert is always a *wallet's* view, never a node's: the chain has no
 //! balances, so `balance(node, wallet)` scans a fresh note store against that node's RPC and
@@ -21,9 +20,12 @@
 
 use shrugg_client::wallet::{self, NoteStore, Wallet};
 use shrugg_client::RpcClient;
+use shrugg_core::bridge::{
+    digest, guardian_address, sign_digest, Attestation, Body, BridgeConfig, Payload, Transfer, CHAIN_RAND,
+};
 use shrugg_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
 use shrugg_core::ledger::staking::{MIN_STAKE, UNBONDING_EPOCHS};
-use shrugg_core::notes::{word8_to_hex, ShieldedAddress};
+use shrugg_core::notes::{word8_to_hex, Bundle, Envelope, ShieldedAddress};
 use shrugg_core::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
 use shrugg_core::{gas, Action, Address, Hash, Keypair, Transaction, Word8, UNITS_PER_SHRUGG};
 use shrugg_node::node::{self, NodeConfig, NodeHandle};
@@ -31,6 +33,7 @@ use shrugg_zkvm::executor::ZkExecutor;
 use shrugg_zkvm::machine::{Backend, FriProfile};
 use shrugg_zkvm::notes::{Note, SpendKey};
 use shrugg_zkvm::viewing::TxKey;
+use shrugg_zkvm::{call_envelope, hash};
 use std::time::{Duration, Instant};
 
 const CHAIN_ID: u64 = 7;
@@ -42,21 +45,28 @@ const ALLOC: u64 = 1_000 * UNITS_PER_SHRUGG;
 /// fast as consensus will go.
 const FAST: Duration = Duration::from_millis(150);
 
-/// Block spacing for the tests that prove a bundle. `ANCHOR_WINDOW` and `TIME_WINDOW` are 256
-/// *blocks*, so a bundle has 256 blocks between reading its anchor and its `time`, and being
-/// committed under them; at 2 s that is about eight and a half minutes, against a tier-14 proof
-/// measured at about 100 s in the `test` profile.
+/// Block spacing for every test here that proves a bundle. `ANCHOR_WINDOW` and `TIME_WINDOW` are
+/// 256 *blocks*, so a bundle gets 256 blocks between reading its anchor and being committed under
+/// it — and its own `time` word gets the same window. Three-second blocks make that nearly thirteen
+/// minutes, which is the number `wallet_flow.rs` uses for the same reason.
 ///
-/// The margin is deliberately far more than 2×, and 1 s was not enough. `cargo test --workspace`
-/// schedules all five proving tests concurrently (two of them prove more than once), and this repo
-/// is worked on by several sessions on one machine, so a suite can run beside another suite: at a
-/// load average of 23 on 16 cores each of those proofs took about 290 s, the chain moved 286 blocks
-/// under them, and every one of the five failed on a stale `time` (`time 2 is outside [32, 288]`) —
-/// on the clock, not on the property it was about. Halving the block rate doubles what a proof may
-/// cost before that happens. The view timeouts scale with the interval, and every `wait_*` bound in these tests
-/// holds at 2 s blocks (the longest is two epochs, 24 s, against a 240 s timeout;
-/// `wallet::COMMIT_TIMEOUT` is 180 s against a commit of three or four blocks).
-const PROVING: Duration = Duration::from_millis(2000);
+/// The margin has to be far more than one proof's worth, because `cargo test --workspace` schedules
+/// every proving test in this file concurrently and they compete for the same cores: a tier-14
+/// bundle measures about 98 s alone and 255 s with six other proofs running, and `submit_burn`
+/// proves *twice* under one anchor (189 s for the pair, alone). At 1 s blocks — where this constant
+/// started — a 255 s proof put the committed bundle's own `time` outside the window by the time the
+/// test replayed it, and `two_validators_commit_and_shielded_transfer` failed on
+/// `bundle time 2 is outside [3, 259]` instead of on the double-spend it is about. A test must fail
+/// on its property, not on the clock.
+///
+/// S2 raised this to 2 s and S3 to 3 s; the integration keeps 3 s (S3's reviewer: 2 s leaves only
+/// ~2× against a 255 s contended proof), and the S2 staking tests hold there too — their longest
+/// wait is two `EPOCH`-block epochs, 36 s, against a 180 s bound.
+///
+/// The view timeouts scale with the interval (`start_node_at`), and every `wait_*` bound in these
+/// tests is a wall-clock timeout with room to spare at 3 s blocks (`wallet::COMMIT_TIMEOUT` is
+/// 180 s, which is 60 blocks).
+const PROVING: Duration = Duration::from_millis(3000);
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -83,9 +93,15 @@ fn payee(seed: u8) -> String {
 /// What `wallet` can spend according to `node` — a fresh note store scanned against that node's
 /// RPC, which is the only way a balance exists at all on this chain.
 async fn balance(node: &TestNode, w: &Wallet) -> u64 {
+    asset_balance(node, w, 0).await
+}
+
+/// The same question about one bridged asset: the notes of that registry index this wallet's
+/// viewing key opens (`shrugg asset-balance`). Index 0 is SHRUGG, which is what [`balance`] asks.
+async fn asset_balance(node: &TestNode, w: &Wallet, asset: u32) -> u64 {
     let mut store = NoteStore::default();
     wallet::scan(&node.rpc, w, &mut store).await.expect("scanning the tree");
-    store.balance()
+    store.balance_of(asset)
 }
 
 /// One genesis deposit note, built exactly as `shrugg-node genesis` builds it (`main.rs`'s
@@ -119,6 +135,12 @@ fn genesis_staking(validators: &[Keypair], funded: &[(&Wallet, u64)]) -> Genesis
 
 /// The same chain with one [`ALLOC`] deposit note per wallet in `funded`.
 fn genesis_funding(validators: &[Keypair], funded: &[&Wallet]) -> Genesis {
+    genesis_bridge(validators, funded, None)
+}
+
+/// [`genesis_funding`] with an optional `bridge` section. A chain built with `None` has no bridge
+/// at all — no registry, no bridge root, and both bridge actions inadmissible.
+fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<BridgeConfig>) -> Genesis {
     Genesis {
         chain_id: CHAIN_ID,
         timestamp_ms: 0,
@@ -142,9 +164,80 @@ fn genesis_funding(validators: &[Keypair], funded: &[&Wallet]) -> Genesis {
         confidential: true,
         fri_profile: "test".into(),
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
-        bridge: None,
+        bridge,
         epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
     }
+}
+
+// ---------------------------------------------------------------- the bridge
+//
+// A bridged test chain, built the way `docs/bridge.md` describes one: six guardian secrets whose
+// addresses are the genesis guardian set, and chain 2 registered as a source emitter. These are
+// the same fixed secrets the core bridge tests sign with; they are built here out of the public
+// API (`guardian_address`, `sign_digest`, `Attestation`) rather than borrowed from those tests,
+// which are `#[cfg(test)]` inside `shrugg-core` and unreachable from an integration test.
+
+/// The six guardian secrets of a bridged test chain. Five signatures is a quorum for six keys.
+fn guardian_secrets() -> Vec<[u8; 32]> {
+    (1u8..=6).map(|i| [i; 32]).collect()
+}
+
+/// The `bridge` section those guardians name, with chain 2 as the one registered source emitter.
+/// No asset is registered: a registry starts empty and the first attestation to name a token is
+/// what puts it in, under index 1.
+fn bridge_config() -> BridgeConfig {
+    BridgeConfig {
+        emitter: [1; 32],
+        guardians: guardian_secrets().iter().map(guardian_address).collect(),
+        emitters: std::collections::BTreeMap::from([(TOKEN_CHAIN, [TOKEN_CHAIN as u8; 32])]),
+    }
+}
+
+/// The bridged token these tests move: chain 2's `0xaa…`, which the first attestation registers as
+/// asset index 1.
+const TOKEN: [u8; 32] = [0xaa; 32];
+const TOKEN_CHAIN: u16 = 2;
+
+/// A well-formed EVM burn destination: twelve zero bytes then twenty address bytes (spec 3.5),
+/// which is the shape `BridgeState::check_burn` requires for chains 2, 3 and 4.
+const EVM_TO: [u8; 32] = {
+    let mut t = [0u8; 32];
+    let mut i = 12;
+    while i < 32 {
+        t[i] = 0x22;
+        i += 1;
+    }
+    t
+};
+
+/// One inbound transfer attestation: `amount` units of [`TOKEN`] addressed to `to`, emitted by
+/// chain 2's registered emitter and signed by five of the six guardians.
+///
+/// The 32-byte recipient slot carries `to.recipient_hash()`, not an address: a shielded address is
+/// 1.2 KB and the wire format has room for a hash, so the source-chain depositor names the hash and
+/// the transaction carries the address for the ledger to check against it.
+fn attestation(to: &ShieldedAddress, amount: u128) -> Vec<u8> {
+    let secrets = guardian_secrets();
+    let body = Body {
+        timestamp: 1,
+        nonce: 0,
+        emitter_chain: TOKEN_CHAIN,
+        emitter_address: [TOKEN_CHAIN as u8; 32],
+        sequence: 0,
+        consistency_level: 0,
+        payload: Payload::Transfer(Transfer {
+            amount: Transfer::u256_from_u128(amount),
+            token_address: TOKEN,
+            token_chain: TOKEN_CHAIN,
+            to: to.recipient_hash(),
+            to_chain: CHAIN_RAND,
+            fee: Transfer::u256_from_u128(0),
+        })
+        .encode(),
+    };
+    let d = digest(&body.encode());
+    let signatures = (0..5).map(|i| sign_digest(&secrets[i], i as u8, &d)).collect();
+    Attestation { guardian_set_index: 0, signatures, body }.encode()
 }
 
 struct TestNode {
@@ -1097,4 +1190,313 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     assert!(supply["invariant_holds"].as_bool().unwrap(), "{supply}");
     assert_chains_equal(&all);
     eprintln!("unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_note in {:.1?}", started.elapsed());
+}
+
+// ---------------------------------------------------------------- the bridge, end to end
+//
+// One inbound deposit and one outbound burn across two validators. This is the only place the two
+// bridge actions meet a real chain: a guardian-signed attestation turns into a note the chain
+// computes itself, and a burn spends that note through two bundles in one transaction.
+
+/// The relayer's half of `shrugg bridge-mint`, in the wallet helpers the command itself uses: read
+/// the deposit out of the attestation bytes, resolve the index the note will carry against the
+/// node's registry, stamp the note with a `time` inside the admission window, seal the recipient's
+/// envelope against the commitment the *chain* will compute, and pay for all of it with a bundle of
+/// the relayer's own SHRUGG.
+///
+/// Returns the submission, the asset index and the deposit note's commitment — the last of which is
+/// on no wire anywhere: the chain derives it from the amount the guardians signed, which is what
+/// stops a relayer minting a note of its own choosing.
+async fn bridge_mint(
+    node: &TestNode,
+    relayer: &Wallet,
+    store: &mut NoteStore,
+    to: &ShieldedAddress,
+    attestation: Vec<u8>,
+) -> (wallet::Submission, u32, Word8) {
+    let d = wallet::attested_deposit(&attestation).expect("the attestation decodes to a transfer");
+    assert_eq!(d.to_hash, to.recipient_hash(), "the guardians signed this recipient's hash");
+    // The asset id from the node, over the two wire fields the guardians signed; a disagreement
+    // would mean the two are not talking about the same chain.
+    let asset_id = node.rpc.bridge_asset_id(d.token_chain, &d.token).await.expect("the node computes an asset id");
+    assert_eq!(asset_id, d.asset.to_hex(), "and computes the same one this wallet did");
+    let state = node.rpc.bridge_state().await.expect("bridge state");
+    let assets = node.rpc.assets().await.expect("the registry");
+    let index = wallet::deposit_index(&state, &assets, &asset_id).expect("an index for this asset").index();
+    let time = u32::try_from(node.rpc.head().await.expect("head")["height"].as_u64().expect("height")).unwrap();
+    let (note, envelope) = wallet::deposit_note_for(relayer, to, d.amount, index, time).expect("sealing the deposit");
+    let action =
+        Action::BridgeAttest { attestation, recipient: to.clone(), r: note.r, time, asset: index, envelope };
+    let fee = gas::fee_floor(&action);
+    let s = wallet::submit(&node.rpc, relayer, store, None, action, fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the attestation's fee bundle commits");
+    (s, index, note.commitment())
+}
+
+/// A second transaction for the same attestation, as a relayer who has not noticed it was already
+/// consumed would build it — except that its bundle carries junk where a proof goes.
+///
+/// Admission checks the action at step 7 and a bundle proof only at step 9 (spec §7,
+/// `docs/shielded.md` §5), so everything before the action passes and the refusal that comes back
+/// is the *attestation's*. That is what makes this a probe worth a second of test time rather than
+/// a second bundle proof.
+async fn replayed_attest(node: &TestNode, to: &ShieldedAddress, attestation: Vec<u8>, asset: u32) -> Transaction {
+    let (height, anchor) = node.rpc.anchor(None).await.expect("the head anchor");
+    let time = u32::try_from(height).unwrap();
+    let empty = Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] };
+    let bundle = Bundle {
+        anchor,
+        nullifiers: [[0x51; 8], [0x52; 8]],
+        commitments: [[0x53; 8], [0x54; 8]],
+        fee: gas::BUNDLE_BASE,
+        burn: 0,
+        asset: 0,
+        time,
+        envelopes: [empty.clone(), empty.clone()],
+        proof: vec![0xff; 32],
+    };
+    let action =
+        Action::BridgeAttest { attestation, recipient: to.clone(), r: [7; 8], time, asset, envelope: empty };
+    Transaction::shielded(CHAIN_ID, bundle, action)
+}
+
+/// Inbound and outbound across a two-validator bridged chain: an attestation deposits a note only
+/// its recipient can open, the registry names the token on both nodes, the same attestation
+/// resubmitted is refused, and a two-bundle burn spends the note and leaves an outbound message
+/// every guardian reads identically.
+///
+/// Three bundle proofs (one for the attestation's fee bundle, two for the burn), so this is the
+/// slowest test in this file; the burn's pair is also what sets [`PROVING`]'s lower bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
+    init_tracing();
+    let started = Instant::now();
+    let ks = keys(2);
+    // The relayer pays the fees and the recipient receives the deposit: two wallets, because a
+    // relayer having no claim on what it relays is the property worth showing.
+    let (relayer, recipient) = (wallet(60), wallet(61));
+    let gen = genesis_bridge(&ks, &[&relayer, &recipient], Some(bridge_config()));
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
+    let n1 = start_node_at(&ks[1], &gen, vec![bootstrap_addr(&n0)], true, PROVING).await;
+    wait_height(&[&n0, &n1], 2, Duration::from_secs(90)).await;
+
+    // A bridged genesis names guardians and emitters, and nothing else: the registry is empty, so
+    // the attestation below is a first sighting and its deposit takes the first index.
+    let state = n0.rpc.bridge_state().await.unwrap();
+    assert_eq!(state["enabled"], true);
+    assert_eq!(state["guardians"].as_array().unwrap().len(), 6);
+    assert_eq!(state["next_index"], 1, "nothing registered yet");
+    assert!(n0.rpc.assets().await.unwrap().is_empty());
+
+    // ---- inbound: one attestation, one deposit note ----
+    let deposit = 5_000u64;
+    let attested = attestation(&recipient.address, deposit as u128);
+    let mut relayer_store = NoteStore::default();
+    let (minted, index, cm) =
+        bridge_mint(&n0, &relayer, &mut relayer_store, &recipient.address, attested.clone()).await;
+    assert_eq!(index, 1, "a first sighting takes FIRST_ASSET_INDEX");
+    eprintln!("bridge-mint: tier {}, proved in {:.1?}, {} proof bytes", minted.tier, minted.proving, minted.proof_bytes);
+
+    wait_for("the attestation reaches n1", Duration::from_secs(120), || {
+        n1.handle.storage.tx_location(&minted.hash).unwrap().is_some()
+    })
+    .await;
+    for n in [&n0, &n1] {
+        assert!(n.holds(&cm), "the deposit note the chain computed is a leaf");
+        assert_eq!(asset_balance(n, &recipient, index).await, deposit, "the recipient holds the deposit");
+        assert_eq!(asset_balance(n, &relayer, index).await, 0, "and the relayer, who paid for it, holds none");
+        assert_eq!(balance(n, &relayer).await, ALLOC - gas::BUNDLE_BASE, "the relayer paid one bundle base");
+        assert_eq!(balance(n, &recipient).await, ALLOC, "the recipient paid nothing");
+        // Both nodes registered the same token under the same index.
+        let rows = n.rpc.assets().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].index, rows[0].chain, rows[0].token.as_slice()), (index, TOKEN_CHAIN, &TOKEN[..]));
+        assert_eq!(n.rpc.bridge_state().await.unwrap()["next_index"], index + 1);
+    }
+    // The explorer's view of it: the amount and the asset decoded out of the attestation, and the
+    // index the action named, which admission held to the registry's answer.
+    let rendered = n0.rpc.call("shrugg_getTransaction", serde_json::json!([minted.hash.to_hex()])).await.unwrap();
+    let action = &rendered["tx"]["action"];
+    assert_eq!(action["kind"], "bridge_attest");
+    assert_eq!(action["amount"], deposit);
+    assert_eq!(action["asset"], index, "the index the action named");
+    assert_eq!(action["asset_index"], index, "and the one the registry resolves, which admission held it to");
+
+    // ---- the same attestation again: one digest, one deposit ----
+    let replay = replayed_attest(&n0, &recipient.address, attested, index).await;
+    let err = n0.rpc.send_transaction(&replay).await.unwrap_err().to_string();
+    assert!(err.contains("already consumed"), "a replayed attestation must be refused as consumed: {err}");
+
+    // ---- outbound: the recipient burns part of it, through two bundles in one transaction ----
+    let (burn, relayer_fee) = (2_000u64, 100u64);
+    let burn_fee = wallet::burn_fee_default();
+    // Pinned here rather than taken on trust from the wallet: the floor this transaction has to
+    // clear is the bundle base once per bundle a node verifies, and a burn is the one transaction
+    // with two (spec §7 item 3). The balance assertion below would hold against a wrong default.
+    assert_eq!(burn_fee, 2 * gas::BUNDLE_BASE);
+    let mut recipient_store = NoteStore::default();
+    let burned = wallet::submit_burn(
+        &n0.rpc,
+        &recipient,
+        &mut recipient_store,
+        index,
+        burn,
+        relayer_fee,
+        TOKEN_CHAIN,
+        EVM_TO,
+        burn_fee,
+        FriProfile::Test,
+        Backend::Cpu,
+        CHAIN_ID,
+        true,
+    )
+    .await
+    .expect("both of the burn's bundles commit");
+    eprintln!("bridge-burn: tier {}, proved in {:.1?}, {} proof bytes", burned.tier, burned.proving, burned.proof_bytes);
+    assert_eq!(burned.amount, burn, "what left the pool is exactly what the message sends");
+    assert_eq!(burned.change, deposit - burn);
+    assert_eq!(burned.asset, index);
+
+    wait_for("the burn reaches n1", Duration::from_secs(120), || {
+        n1.handle.storage.tx_location(&burned.hash).unwrap().is_some()
+    })
+    .await;
+    for n in [&n0, &n1] {
+        assert_eq!(
+            asset_balance(n, &recipient, index).await,
+            deposit - burn,
+            "the change note is what is left of the deposit"
+        );
+        assert_eq!(balance(n, &recipient).await, ALLOC - burn_fee, "the fee bundle paid two bundle bases in SHRUGG");
+        // The outbound message, which is the whole point of a burn: guardians sign this digest.
+        let msg = n.rpc.bridge_burn(0).await.unwrap().expect("the burn emitted a message");
+        assert_eq!(msg["sequence"], 0);
+        assert_eq!(msg["tx"], burned.hash.to_hex(), "the transaction hash stands in for the absent sender");
+        assert_eq!(msg["digest"].as_str().unwrap().len(), 64);
+        // What the message sends is exactly what the pool destroyed, with the relayer's cut a
+        // portion of it: the far side releases `amount - fee` to `to` and `fee` to the relayer,
+        // so a pool that burned `amount + fee` would strand the difference on the source chain.
+        let body_bytes = hex::decode(msg["body_hex"].as_str().expect("body_hex is hex")).expect("body_hex decodes");
+        let body = Body::decode(&body_bytes).expect("the outbound body decodes");
+        let Ok(Payload::Transfer(sent)) = Payload::decode(&body.payload) else { panic!("a transfer payload") };
+        assert_eq!(sent.amount_u128(), Some(burn as u128), "the message sends exactly what was burned");
+        assert_eq!(sent.fee_u128(), Some(relayer_fee as u128), "and the relayer fee is a portion of it");
+        assert_eq!(n.rpc.bridge_burn(1).await.unwrap(), None, "and only the one");
+    }
+    assert_chains_equal(&[&n0, &n1]);
+    eprintln!("bridge_mint_deposits_a_note_and_a_burn_spends_it in {:.1?}", started.elapsed());
+}
+
+/// The call-input envelope end to end (spec §6.1). A call's private inputs are published as one
+/// sealed transcript, and exactly three keys open it: the caller's outgoing viewing key, the
+/// per-call key, and the viewing key of the auditor named when it was sealed. Every node serves the
+/// ciphertext to anyone who asks and none of them holds a key to it.
+///
+/// What the chain guarantees is only the binding: the transcript's AEAD is bound to the `H_IN` the
+/// proof published, and a holder who decrypts checks that it hashes back to that `H_IN`. Both
+/// halves are asserted here, against the bytes a *node* served rather than the ones sealed locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
+    init_tracing();
+    let started = Instant::now();
+    let ks = keys(2);
+    let (caller, auditor, stranger) = (wallet(70), wallet(71), wallet(72));
+    let gen = genesis_funding(&ks, &[&caller]);
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
+    let n1 = start_node_at(&ks[1], &gen, vec![bootstrap_addr(&n0)], true, PROVING).await;
+    wait_height(&[&n0, &n1], 2, Duration::from_secs(60)).await;
+
+    let program = shrugg_zkvm::guests::private_payment(1_000);
+    let id = shrugg_core::program::program_id(program.base_pc, &program.words);
+    let mut store = NoteStore::default();
+    let deploy = Action::Deploy { base_pc: program.base_pc, words: program.words.clone() };
+    let deploy_fee = wallet::deploy_fee_default(&deploy);
+    wallet::submit(&n0.rpc, &caller, &mut store, None, deploy, deploy_fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the deploy bundle commits");
+
+    // `prove_call` is `prove` plus the salt the input commitment was drawn with — the one value
+    // that never leaves the prover on its own, and the thing the transcript is sealed around.
+    let inputs = [400u32, 250, 300, 75];
+    let (proof, outputs, tier, salt) =
+        shrugg_zkvm::executor::prove_call(FriProfile::Test, &program, &inputs, None, Backend::Cpu)
+            .expect("the call proves");
+    let h_in = hash::input_digest(salt, &inputs);
+    let (sealed, key) = call_envelope::seal_call_envelope(&caller.vk, Some(&auditor.address), &h_in, salt, &inputs)
+        .expect("sealing the transcript");
+    let called = wallet::submit(
+        &n0.rpc,
+        &caller,
+        &mut store,
+        None,
+        Action::Call { program: id, proof, input_envelope: Some(sealed.clone()) },
+        wallet::call_fee_default(tier),
+        0,
+        FriProfile::Test,
+        Backend::Cpu,
+        CHAIN_ID,
+        true,
+    )
+    .await
+    .expect("the call bundle commits");
+    eprintln!("call: tier {tier}, envelope {} bytes, outputs {outputs:?}", sealed.len());
+
+    for n in [&n0, &n1] {
+        wait_for("the receipt reaches every node", Duration::from_secs(90), || {
+            n.handle.storage.receipt(&called.hash).unwrap().is_some()
+        })
+        .await;
+        let (served_h_in, served) =
+            n.rpc.call_envelope(&called.hash).await.unwrap().expect("the node serves the transcript");
+        assert_eq!(served_h_in, h_in, "served against the H_IN the proof published");
+        assert_eq!(served, sealed, "and verbatim: a node holds no key to any part of it");
+        let receipt = n.rpc.receipt(&called.hash).await.unwrap().expect("a receipt");
+        assert_eq!(receipt["h_in"].as_str().unwrap(), word8_to_hex(&h_in));
+        assert_eq!(receipt["tier"], tier);
+
+        // The caller, through the outgoing viewing key that opens every call this wallet made.
+        let (as_caller, salt_back, inputs_back) =
+            call_envelope::open_call_as_sender(&served, &served_h_in, &caller.vk).expect("the caller opens it");
+        assert_eq!(salt_back, salt);
+        assert_eq!(inputs_back, inputs.to_vec(), "the words the guest was fed, off the chain");
+        assert_eq!(as_caller, key, "and the very per-call key it was sealed under");
+        // The auditor it was addressed to, through a different path entirely: ML-KEM against that
+        // address's encapsulation key, not the caller's `ovk`.
+        let (as_auditor, _, audited) =
+            call_envelope::open_call_as_auditor(&served, &served_h_in, &auditor.vk).expect("the auditor opens it");
+        assert_eq!((as_auditor, audited), (key, inputs_back.clone()));
+        // A third wallet — neither the caller nor the auditor — is served the same bytes and gets
+        // nothing out of either path.
+        assert!(call_envelope::open_call_as_sender(&served, &served_h_in, &stranger.vk).is_none());
+        assert!(call_envelope::open_call_as_auditor(&served, &served_h_in, &stranger.vk).is_none());
+        // Nor do the two named parties open each other's part: the wrapped key is a different
+        // ciphertext under different associated data in each.
+        assert!(call_envelope::open_call_as_sender(&served, &served_h_in, &auditor.vk).is_none());
+        assert!(call_envelope::open_call_as_auditor(&served, &served_h_in, &caller.vk).is_none());
+        // The per-call key alone opens this one call — the grain of disclosure that hands over no
+        // history.
+        assert_eq!(call_envelope::open_call_with_key(&served, &served_h_in, &key), Some((salt, inputs.to_vec())));
+
+        // Faithfulness is the holder's own recomputation, not something the chain checked: the
+        // transcript hashes back to the receipt's H_IN, and a transcript with one word changed
+        // does not — which is how a caller who published a lie is caught, by whoever decrypts.
+        assert!(call_envelope::call_envelope_is_faithful(&served_h_in, salt_back, &inputs_back));
+        let mut tampered = inputs_back.clone();
+        tampered[0] += 1;
+        assert!(!call_envelope::call_envelope_is_faithful(&served_h_in, salt_back, &tampered));
+        // And the ciphertext is bound to that H_IN by the AEAD: a flipped byte opens for nobody,
+        // and neither does the real envelope read against another call's H_IN.
+        let mut bent = served.clone();
+        *bent.body.last_mut().unwrap() ^= 1;
+        assert!(call_envelope::open_call_as_sender(&bent, &served_h_in, &caller.vk).is_none());
+        let other_h_in = hash::input_digest(salt, &tampered);
+        assert!(call_envelope::open_call_with_key(&served, &other_h_in, &key).is_none());
+    }
+
+    // The transcript is voluntary — a call built with `--no-envelope` publishes none and the node
+    // serves `null` for it — which costs a proof to show here and is already pinned against a
+    // committed block in `rpc.rs`'s `get_call_envelope_serves_the_sealed_transcript_of_a_call`.
+    assert_chains_equal(&[&n0, &n1]);
+    eprintln!("a_call_envelope_is_opened_by_the_caller_and_the_auditor_only in {:.1?}", started.elapsed());
 }

@@ -25,14 +25,15 @@ mod tests {
     use super::*;
 
     fn envelope(body: usize) -> Option<CallEnvelope> {
-        Some(CallEnvelope { kem_ct: vec![1; 1088], to_sender: vec![2; 48], to_auditor: vec![3; 48], body: vec![4; body] })
+        // The real shapes: an ML-KEM-768 ciphertext and two nonce + 32-byte key + tag wraps.
+        Some(CallEnvelope { kem_ct: vec![1; 1088], to_sender: vec![2; 60], to_auditor: vec![3; 60], body: vec![4; body] })
     }
 
     #[test]
     fn the_cap_is_the_only_rule() {
         assert_eq!(validate(&None), Ok(()));
         assert_eq!(validate(&envelope(0)), Ok(()));
-        let fits = MAX_CALL_ENVELOPE_BYTES - (1088 + 48 + 48);
+        let fits = MAX_CALL_ENVELOPE_BYTES - (1088 + 60 + 60);
         assert_eq!(validate(&envelope(fits)), Ok(()), "exactly at the cap is accepted");
         assert_eq!(validate(&envelope(fits + 1)), Err(TxError::EnvelopeTooLarge));
     }

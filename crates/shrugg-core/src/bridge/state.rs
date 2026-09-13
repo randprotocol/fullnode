@@ -1,19 +1,26 @@
-//! The Rand-side bridge ledger: guardian sets, bridged asset balances, the
-//! consumed-digest set, and the outbound burn message log.
+//! The Rand-side bridge ledger: guardian sets, the bridged asset registry,
+//! the consumed-digest set, and the outbound burn message log.
 //!
-//! Everything here is pure state transition logic; the ledger (Task C2)
-//! owns persistence, fee accounting, and the block timestamp that feeds
-//! `now` (unix seconds) and burn message timestamps.
+//! Everything here is pure state transition logic; the ledger
+//! ([`crate::ledger::bridge_notes`]) owns persistence, the deposit notes an
+//! attestation creates, and the block timestamp that feeds `now` (unix
+//! seconds) and burn message timestamps.
+//!
+//! Phase S3 removed per-account balances: on the shielded chain a bridged
+//! holding is a *note* whose `asset` word is the registry index below, not a
+//! number next to an address. What is left here is the public half of the
+//! bridge — who may attest, which assets exist and under which index, which
+//! digests are consumed, and what has been burned outbound.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::bridge::{
-    asset_id, digest, verify_decoded, Attestation, Body, GuardianKey, GuardianSet, Payload,
-    Transfer, VerifyError, AssetId, CHAIN_RAND, GOVERNANCE_EMITTER, GUARDIAN_GRACE_SECS,
+    asset_id, digest, verify_decoded, Attestation, Body, GuardianKey, GuardianSet, GuardianSetUpgrade,
+    Payload, Transfer, VerifyError, AssetId, CHAIN_RAND, GOVERNANCE_EMITTER, GUARDIAN_GRACE_SECS,
 };
-use crate::crypto::{merkle_root, Address, Hash};
+use crate::crypto::{merkle_root, Hash};
 
 /// The genesis-facing `bridge` section: the Rand emitter address published
 /// in outbound burn messages, the initial guardian set, and the registered
@@ -80,15 +87,38 @@ pub struct BridgeBurnRecord {
     pub height: u64,
 }
 
+/// A registered bridged asset: the wire identity guardians sign about (its
+/// home chain and token address) and the dense `u32` **index** a note of that
+/// asset carries in its `asset` word (spec §10).
+///
+/// The 32-byte [`AssetId`] does not fit a note's one-word asset field, so the
+/// registry hands out indices `1, 2, …` in registration order and the pool
+/// speaks in indices. Index 0 is SHRUGG and is never in this registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetInfo {
+    pub chain: u16,
+    pub token: [u8; 32],
+    pub index: u32,
+}
+
+/// The first index the registry hands out. 0 is reserved for SHRUGG, which is
+/// not a bridged asset and is never registered.
+pub const FIRST_ASSET_INDEX: u32 = 1;
+
 /// The bridge ledger.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BridgeState {
     pub emitter: [u8; 32],
     pub emitters: BTreeMap<u16, [u8; 32]>,
     pub guardian_sets: BTreeMap<u32, GuardianSet>,
     pub current_set: u32,
-    pub balances: BTreeMap<(AssetId, Address), u128>,
-    pub assets: BTreeMap<AssetId, (u16, [u8; 32])>,
+    /// Every asset an accepted attestation has ever named, with the note index
+    /// assigned to it at that first registration.
+    pub assets: BTreeMap<AssetId, AssetInfo>,
+    /// The index the next newly registered asset gets. Consensus state, not a
+    /// cache: two nodes that disagree about it would mint notes with different
+    /// `asset` words from the same attestation.
+    pub next_index: u32,
     pub spent: BTreeSet<Hash>,
     pub burn_sequence: u64,
     /// Every outbound burn message ever emitted, held whole in memory and
@@ -97,24 +127,50 @@ pub struct BridgeState {
     pub burns: BTreeMap<u64, BridgeBurnRecord>,
 }
 
+/// `next_index` starts at [`FIRST_ASSET_INDEX`], not at zero, so a defaulted
+/// bridge cannot hand a bridged asset the index SHRUGG owns. Written out
+/// rather than derived for exactly that one field.
+impl Default for BridgeState {
+    fn default() -> BridgeState {
+        BridgeState {
+            emitter: [0; 32],
+            emitters: BTreeMap::new(),
+            guardian_sets: BTreeMap::new(),
+            current_set: 0,
+            assets: BTreeMap::new(),
+            next_index: FIRST_ASSET_INDEX,
+            spent: BTreeSet::new(),
+            burn_sequence: 0,
+            burns: BTreeMap::new(),
+        }
+    }
+}
+
 /// The small, whole-state half of a [`BridgeState`]: everything except the
-/// three collections a node stores one row at a time (`balances`, `spent`,
-/// `burns`).
+/// two collections a node stores one row at a time (`spent`, `burns`).
 ///
 /// Storage keeps this as a single `bincode` blob under one `meta` key and the
-/// three collections in column families, so a commit rewrites only the rows a
+/// two collections in column families, so a commit rewrites only the rows a
 /// block touched. Owning the split here — rather than in the node crate —
 /// keeps it in one place: a new [`BridgeState`] field has to be classified in
 /// [`BridgeState::meta`] and [`BridgeState::from_parts`] or those stop
 /// compiling.
-#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgeMeta {
     pub emitter: [u8; 32],
     pub emitters: BTreeMap<u16, [u8; 32]>,
     pub guardian_sets: BTreeMap<u32, GuardianSet>,
     pub current_set: u32,
-    pub assets: BTreeMap<AssetId, (u16, [u8; 32])>,
+    pub assets: BTreeMap<AssetId, AssetInfo>,
+    pub next_index: u32,
     pub burn_sequence: u64,
+}
+
+/// Mirrors [`BridgeState`]'s own default, for the same reason.
+impl Default for BridgeMeta {
+    fn default() -> BridgeMeta {
+        BridgeState::default().meta()
+    }
 }
 
 /// Why a bridge transaction was rejected.
@@ -134,6 +190,11 @@ pub enum BridgeError {
     FeeExceedsAmount,
     #[error("amount does not fit in u128")]
     AmountOverflow,
+    /// A note's amount is a `u64`; the wire format's is a u256. A transfer
+    /// the bridge could carry but the pool could not hold is refused rather
+    /// than truncated into a note.
+    #[error("amount does not fit in u64")]
+    AmountTooLarge,
     #[error("amount is zero")]
     ZeroAmount,
     #[error("recipient is unusable on the destination chain")]
@@ -148,22 +209,87 @@ pub enum BridgeError {
     DuplicateGuardian,
     #[error("unknown asset")]
     UnknownAsset,
-    #[error("insufficient asset balance: have {have}, need {need}")]
-    InsufficientAsset { have: u128, need: u128 },
-    #[error("balance overflow")]
-    Overflow,
+    /// Every `u32` index has been handed out. Unreachable in practice (it
+    /// takes four billion distinct registered assets) but checked so
+    /// `apply_attest` cannot fail on an attestation `check_attest` accepted.
+    #[error("the asset registry is full")]
+    AssetRegistryFull,
+}
+
+/// A transfer attestation as the pool needs it: which asset, under which note
+/// index, how much, and to whom.
+///
+/// `amount` is the gross figure the guardians signed, and the gross figure is
+/// what the deposit note carries — see `deposit_commitment` in
+/// [`crate::ledger::bridge_notes`]. The relayer fee is *not* deducted: on a
+/// shielded chain the submitter has no identity to pay, so netting it would
+/// burn the difference and the pool would stop holding what the source chain
+/// locked.
+///
+/// `to_hash` is the wire `to` field, which on the shielded chain is
+/// `blake3("shrugg-shielded-recipient", pk || kem_ek)` of the recipient's
+/// address — the bridge never sees the address itself, only its hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BridgeTransfer {
+    pub asset: AssetId,
+    /// The registry entry for `asset`. When the asset is not registered yet,
+    /// `info.index` is the index registration *will* assign, so the ledger can
+    /// compute the deposit note's commitment while checking and get the same
+    /// answer applying.
+    pub info: AssetInfo,
+    pub amount: u64,
+    pub to_hash: [u8; 32],
+    /// Carried for the record — the figure the source chain meant for whoever
+    /// relayed this attestation. The pool pays no relayer.
+    pub relayer_fee: u64,
+}
+
+/// What an attestation would do, decoded and validated but not yet applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttestPlan {
+    Transfer(BridgeTransfer),
+    GuardianSetUpgrade(GuardianSetUpgrade),
+}
+
+/// An attestation that has passed [`BridgeState::check_attest`] in full: decoded, screened
+/// against this state, and its guardian quorum verified.
+///
+/// Only `check_attest` can build one — the fields are private — and
+/// [`BridgeState::apply_attest`] takes one instead of raw bytes. That is what makes the quorum
+/// verification happen exactly *once* per attestation: the ledger checks in its validate step
+/// and hands the token to its apply step, rather than paying for a second round of secp256k1
+/// recoveries there.
+///
+/// It carries the `now` it was judged at, so the grace window a rotation opens cannot drift
+/// from the time the quorum was checked against. It is valid only against the state that
+/// produced it — a transfer plan names the index the *current* `next_index` would assign — so
+/// check and apply against the same [`BridgeState`], which is what the ledger does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedAttestation {
+    /// `mu`, the consumed-digest key.
+    digest: [u8; 32],
+    now: u64,
+    plan: AttestPlan,
+}
+
+impl CheckedAttestation {
+    /// What applying this attestation would do. The ledger reads it to compute a deposit note's
+    /// commitment before committing to anything.
+    pub fn plan(&self) -> &AttestPlan {
+        &self.plan
+    }
+
+    /// `mu`, the digest that goes into the consumed set.
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
 }
 
 /// What a successfully applied `BridgeAttest` did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttestOutcome {
-    /// `amount` is the net credited to `to`; `fee` went to the submitter.
-    Minted {
-        asset: AssetId,
-        to: Address,
-        amount: u128,
-        fee: u128,
-    },
+    /// The transfer the ledger turns into deposit notes.
+    Minted(BridgeTransfer),
     GuardianSetUpgraded(u32),
 }
 
@@ -198,8 +324,8 @@ impl BridgeState {
             emitters,
             guardian_sets,
             current_set,
-            balances: _,
             assets,
+            next_index,
             spent: _,
             burn_sequence,
             burns: _,
@@ -210,15 +336,15 @@ impl BridgeState {
             guardian_sets: guardian_sets.clone(),
             current_set: *current_set,
             assets: assets.clone(),
+            next_index: *next_index,
             burn_sequence: *burn_sequence,
         }
     }
 
     /// Rebuilds a bridge from the two halves storage keeps apart. The inverse
-    /// of [`BridgeState::meta`] plus the three row-wise collections.
+    /// of [`BridgeState::meta`] plus the two row-wise collections.
     pub fn from_parts(
         meta: BridgeMeta,
-        balances: BTreeMap<(AssetId, Address), u128>,
         spent: BTreeSet<Hash>,
         burns: BTreeMap<u64, BridgeBurnRecord>,
     ) -> BridgeState {
@@ -228,6 +354,7 @@ impl BridgeState {
             guardian_sets,
             current_set,
             assets,
+            next_index,
             burn_sequence,
         } = meta;
         BridgeState {
@@ -235,51 +362,63 @@ impl BridgeState {
             emitters,
             guardian_sets,
             current_set,
-            balances,
             assets,
+            next_index,
             spent,
             burn_sequence,
             burns,
         }
     }
 
-    /// `addr`'s balance of bridged asset `asset`; absent means zero.
-    pub fn balance(&self, asset: &AssetId, addr: &Address) -> u128 {
-        self.balances.get(&(*asset, *addr)).copied().unwrap_or(0)
+    /// The note index of a registered asset, or `None` if it has never been
+    /// named by an accepted attestation.
+    pub fn asset_index(&self, asset: &AssetId) -> Option<u32> {
+        self.assets.get(asset).map(|info| info.index)
     }
 
-    /// The balances a minted transfer would produce: `amount - fee` to the
-    /// recipient and `fee` to `submitter`, accumulated when they are the same
-    /// address. Computed before any mutation, so an overflow leaves the state
-    /// untouched — and screened by `check_attest`, so `apply_attest` cannot
-    /// fail on a transfer that validated.
-    fn transfer_credits(
-        &self,
-        asset: &AssetId,
-        to: Address,
-        net: u128,
-        submitter: Address,
-        fee: u128,
-    ) -> Result<BTreeMap<Address, u128>, BridgeError> {
-        let mut credited: BTreeMap<Address, u128> = BTreeMap::new();
-        for (addr, delta) in [(to, net), (submitter, fee)] {
-            if delta == 0 {
-                continue;
-            }
-            let current = match credited.get(&addr) {
-                Some(v) => *v,
-                None => self.balance(asset, &addr),
-            };
-            let next = current.checked_add(delta).ok_or(BridgeError::Overflow)?;
-            credited.insert(addr, next);
+    /// The asset a note index names. `0` (SHRUGG) is never registered, so it
+    /// answers `None`, as does any index beyond what has been handed out.
+    pub fn asset_by_index(&self, index: u32) -> Option<AssetId> {
+        self.assets.iter().find(|(_, info)| info.index == index).map(|(asset, _)| *asset)
+    }
+
+    /// The note index a deposit of `asset` would carry: the index the registry
+    /// already assigned it, or the one registration would hand a first
+    /// sighting. `None` only when every index has been handed out, which is
+    /// the one case [`BridgeState::asset_entry`] refuses a new asset in.
+    ///
+    /// Public because the answer is needed without an attestation's signature
+    /// work: a pooled `BridgeAttest` names the index its envelope was sealed
+    /// for, and the mempool has to drop it once a competing first sighting has
+    /// moved that number (`Mempool::still_applies`).
+    pub fn deposit_index(&self, asset: &AssetId) -> Option<u32> {
+        match self.assets.get(asset) {
+            Some(info) => Some(info.index),
+            None if self.next_index == u32::MAX => None,
+            None => Some(self.next_index),
         }
-        Ok(credited)
+    }
+
+    /// The registry entry `asset` has, or the one it would get on
+    /// registration. Deterministic from state, which is what lets
+    /// `check_attest` hand the ledger an index before `apply_attest` writes
+    /// it: both compute the same number from the same `next_index`.
+    fn asset_entry(&self, asset: &AssetId, chain: u16, token: [u8; 32]) -> Result<AssetInfo, BridgeError> {
+        match self.assets.get(asset) {
+            Some(info) => Ok(*info),
+            // The same number [`BridgeState::deposit_index`] reports, so the
+            // index the mempool screens against is the index this assigns.
+            None => Ok(AssetInfo {
+                chain,
+                token,
+                index: self.deposit_index(asset).ok_or(BridgeError::AssetRegistryFull)?,
+            }),
+        }
     }
 
     /// Validates an encoded attestation without mutating anything: resolve
     /// the guardian set named by the envelope, reject an already-consumed
-    /// digest, decode and check the payload, screen the mint credits for
-    /// overflow, and only then verify the quorum.
+    /// digest, decode and check the payload, and only then verify the quorum.
     ///
     /// Cheap before expensive: `BridgeAttest` has a zero minimum fee, so
     /// every check that needs no signature recovery runs first. Otherwise a
@@ -288,14 +427,15 @@ impl BridgeState {
     /// validates it. The accepted set is identical either way; only which
     /// refusal is reported first changes.
     ///
-    /// `submitter` is the account that would keep the transfer's bridge fee;
-    /// `now` is unix seconds (the ledger passes `timestamp_ms / 1000`).
-    pub fn check_attest(
-        &self,
-        bytes: &[u8],
-        submitter: Address,
-        now: u64,
-    ) -> Result<(Attestation, [u8; 32], Payload), BridgeError> {
+    /// `now` is unix seconds (the ledger passes `timestamp_ms / 1000`). On a
+    /// transfer the returned plan carries everything the pool needs to build
+    /// the deposit notes; nothing about the *recipient's* shielded address is
+    /// checked here, because the bridge only ever sees its hash — that
+    /// comparison belongs to [`crate::ledger::bridge_notes`].
+    ///
+    /// The result is the only thing [`BridgeState::apply_attest`] accepts, so
+    /// an attestation is verified here and nowhere else.
+    pub fn check_attest(&self, bytes: &[u8], now: u64) -> Result<CheckedAttestation, BridgeError> {
         // One decode for the whole check: the envelope is parsed here and
         // the already-decoded value handed to `verify_decoded`, which
         // hashes the wire body bytes rather than a re-encoding.
@@ -311,7 +451,7 @@ impl BridgeState {
             return Err(BridgeError::Replay);
         }
         let payload = Payload::decode(&att.body.payload).map_err(|_| BridgeError::BadPayload)?;
-        match &payload {
+        let plan = match payload {
             Payload::Transfer(t) => {
                 if self.emitters.get(&att.body.emitter_chain) != Some(&att.body.emitter_address) {
                     return Err(BridgeError::WrongEmitter);
@@ -332,13 +472,13 @@ impl BridgeState {
                 if amount == 0 {
                     return Err(BridgeError::ZeroAmount);
                 }
-                self.transfer_credits(
-                    &asset_id(t.token_chain, &t.token_address),
-                    Address(t.to),
-                    amount - fee,
-                    submitter,
-                    fee,
-                )?;
+                // A note holds a `u64`. Checked after the amount relations
+                // above so a malformed transfer is still reported as malformed.
+                let amount = u64::try_from(amount).map_err(|_| BridgeError::AmountTooLarge)?;
+                let relayer_fee = fee as u64; // fee <= amount, which fits
+                let asset = asset_id(t.token_chain, &t.token_address);
+                let info = self.asset_entry(&asset, t.token_chain, t.token_address)?;
+                AttestPlan::Transfer(BridgeTransfer { asset, info, amount, to_hash: t.to, relayer_fee })
             }
             Payload::GuardianSetUpgrade(g) => {
                 if (att.body.emitter_chain, att.body.emitter_address)
@@ -367,52 +507,38 @@ impl BridgeState {
                 if unique.len() != g.keys.len() || g.keys.iter().any(|k| k == &[0u8; 20]) {
                     return Err(BridgeError::DuplicateGuardian);
                 }
+                AttestPlan::GuardianSetUpgrade(g)
             }
-        }
+        };
         // The expensive part last: set expiry, index and quorum rule, low-s,
         // and one recovery per signature.
         let verified = verify_decoded(&att, body_bytes, set, now)?;
         debug_assert_eq!(verified, mu);
-        Ok((att, mu, payload))
+        Ok(CheckedAttestation { digest: mu, now, plan })
     }
 
-    /// Consumes an attestation: mints a transfer (crediting `amount - fee`
-    /// to the recipient and `fee` to `submitter`) or rotates the guardian
-    /// set, marking the digest spent either way. Leaves `self` untouched on
-    /// error.
-    pub fn apply_attest(
-        &mut self,
-        bytes: &[u8],
-        submitter: Address,
-        now: u64,
-    ) -> Result<AttestOutcome, BridgeError> {
-        let (_, mu, payload) = self.check_attest(bytes, submitter, now)?;
-        match payload {
-            Payload::Transfer(t) => {
-                let asset = asset_id(t.token_chain, &t.token_address);
-                let amount = t.amount_u128().expect("checked by check_attest");
-                let fee = t.fee_u128().expect("checked by check_attest");
-                let to = Address(t.to);
-                let net = amount - fee;
-                let credited = self
-                    .transfer_credits(&asset, to, net, submitter, fee)
-                    .expect("checked by check_attest");
-                self.spent.insert(Hash(mu));
-                self.assets
-                    .entry(asset)
-                    .or_insert((t.token_chain, t.token_address));
-                for (addr, balance) in credited {
-                    self.balances.insert((asset, addr), balance);
+    /// Consumes a [`CheckedAttestation`]: registers the asset a transfer names
+    /// (if new) and hands the transfer back for the pool to turn into notes,
+    /// or rotates the guardian set — marking the digest spent either way.
+    ///
+    /// Infallible, and deliberately so: everything that could refuse an
+    /// attestation was decided by [`BridgeState::check_attest`], including the
+    /// registry-full case, so there is no half-applied state to unwind and no
+    /// reason to verify the quorum a second time.
+    pub fn apply_attest(&mut self, checked: CheckedAttestation) -> AttestOutcome {
+        let CheckedAttestation { digest: mu, now, plan } = checked;
+        self.spent.insert(Hash(mu));
+        match plan {
+            AttestPlan::Transfer(t) => {
+                // First sighting registers the asset under the index
+                // `check_attest` already told the caller about.
+                if self.assets.insert(t.asset, t.info).is_none() {
+                    debug_assert_eq!(t.info.index, self.next_index);
+                    self.next_index += 1;
                 }
-                Ok(AttestOutcome::Minted {
-                    asset,
-                    to,
-                    amount: net,
-                    fee,
-                })
+                AttestOutcome::Minted(t)
             }
-            Payload::GuardianSetUpgrade(g) => {
-                self.spent.insert(Hash(mu));
+            AttestPlan::GuardianSetUpgrade(g) => {
                 if let Some(old) = self.guardian_sets.get_mut(&self.current_set) {
                     old.expires_at = now.saturating_add(GUARDIAN_GRACE_SECS);
                 }
@@ -424,26 +550,31 @@ impl BridgeState {
                     },
                 );
                 self.current_set = g.new_index;
-                Ok(AttestOutcome::GuardianSetUpgraded(g.new_index))
+                AttestOutcome::GuardianSetUpgraded(g.new_index)
             }
         }
     }
 
-    /// Validates an outbound burn: the asset must be registered, `to_chain`
-    /// must be the asset's home chain, `to` must be a usable recipient on
-    /// that chain, `fee <= amount`, and `from` must hold at least
-    /// `amount`.
+    /// Validates an outbound burn: `asset_index` must name a registered
+    /// asset, `to_chain` must be that asset's home chain, `to` must be a
+    /// usable recipient on that chain, and `relayer_fee <= amount != 0`.
+    /// Returns the asset id the index names.
+    ///
+    /// There is no balance to check any more: what bounds a burn on the
+    /// shielded chain is the asset bundle's proof, which the ledger verifies
+    /// (`burn == amount` in that bundle, spec §10; the fee is a portion of the
+    /// amount, paid on the destination chain, not something extra destroyed here).
     pub fn check_burn(
         &self,
-        from: &Address,
-        asset: &AssetId,
-        amount: u128,
+        asset_index: u32,
+        amount: u64,
         to_chain: u16,
         to: &[u8; 32],
-        fee: u128,
-    ) -> Result<(), BridgeError> {
-        let (token_chain, _) = self.assets.get(asset).ok_or(BridgeError::UnknownAsset)?;
-        if to_chain != *token_chain {
+        relayer_fee: u64,
+    ) -> Result<AssetId, BridgeError> {
+        let asset = self.asset_by_index(asset_index).ok_or(BridgeError::UnknownAsset)?;
+        let info = self.assets[&asset];
+        if to_chain != info.chain {
             return Err(BridgeError::WrongTokenChain);
         }
         // The burn is one-way and irreversible once the message is signed,
@@ -459,46 +590,35 @@ impl BridgeState {
         if matches!(to_chain, 2 | 3 | 4) && to[..12] != [0u8; 12] {
             return Err(BridgeError::BadRecipient);
         }
-        if fee > amount {
+        if relayer_fee > amount {
             return Err(BridgeError::FeeExceedsAmount);
         }
         if amount == 0 {
             return Err(BridgeError::ZeroAmount);
         }
-        let have = self.balance(asset, from);
-        if have < amount {
-            return Err(BridgeError::InsufficientAsset {
-                have,
-                need: amount,
-            });
-        }
-        Ok(())
+        Ok(asset)
     }
 
-    /// Burns `amount` of `asset` from `from` and records the outbound
-    /// message guardians will sign. `timestamp` is the block time in unix
-    /// seconds. Leaves `self` untouched on error.
+    /// Records the outbound message guardians will sign for a burn of
+    /// `amount` of the asset at `asset_index`. `tx` is the transaction hash,
+    /// which stands in for the sender slot: a burn is funded by notes, so
+    /// there is no sender identity to record. `timestamp` is the block time
+    /// in unix seconds. Leaves `self` untouched on error.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_burn(
         &mut self,
-        from: Address,
-        asset: AssetId,
-        amount: u128,
+        tx: Hash,
+        asset_index: u32,
+        amount: u64,
         to_chain: u16,
         to: [u8; 32],
-        fee: u128,
-        tx: Hash,
+        relayer_fee: u64,
         height: u64,
         timestamp: u32,
     ) -> Result<BridgeBurnRecord, BridgeError> {
-        self.check_burn(&from, &asset, amount, to_chain, &to, fee)?;
-        let (token_chain, token_address) = self.assets[&asset];
-        let remaining = self.balance(&asset, &from) - amount;
-        if remaining == 0 {
-            self.balances.remove(&(asset, from));
-        } else {
-            self.balances.insert((asset, from), remaining);
-        }
+        let asset = self.check_burn(asset_index, amount, to_chain, &to, relayer_fee)?;
+        let AssetInfo { chain: token_chain, token: token_address, .. } = self.assets[&asset];
+        let (amount, fee) = (amount as u128, relayer_fee as u128);
         let sequence = self.burn_sequence;
         let body = Body {
             timestamp,
@@ -530,43 +650,35 @@ impl BridgeState {
         Ok(record)
     }
 
-    /// Deterministic bridge commitment (spec 6.3):
+    /// Deterministic bridge commitment (spec 6.3, as phase S3 left it):
     ///
     /// ```text
     /// blake3("shrugg-bridge-state"
     ///     || bincode(emitter, emitters, current_set, guardian_sets)
-    ///     || merkle(blake3("shrugg-asset-balance" || asset || addr || balance BE))
-    ///     || merkle(blake3("shrugg-asset-registry" || asset || chain BE || token))
+    ///     || merkle(blake3("shrugg-asset-registry" || asset || chain BE || token || index BE))
     ///     || merkle(sorted spent digests)
-    ///     || burn_sequence BE)
+    ///     || burn_sequence BE || next_index BE)
     /// ```
     ///
     /// The outbound emitter and the source-chain emitter table are part of
-    /// the commitment: they are consensus-relevant genesis configuration.
-    /// `burns` is derivable from the transaction history and is deliberately
-    /// excluded. Zero balances are pruned so a never-credited holder and a
-    /// drained one commit identically.
+    /// the commitment: they are consensus-relevant genesis configuration. So
+    /// are the note indices and the counter that assigns the next one — two
+    /// nodes that disagreed about them would mint notes with different
+    /// `asset` words from the same attestation. `burns` is derivable from the
+    /// transaction history and is deliberately excluded.
+    ///
+    /// Per-account balances are gone (phase S3): a bridged holding is a note,
+    /// and notes are committed to by the ledger's own tree.
     pub fn root(&self) -> Hash {
-        let balance_leaves: Vec<Hash> = self
-            .balances
-            .iter()
-            .filter(|(_, balance)| **balance != 0)
-            .map(|((asset, addr), balance)| {
-                let mut buf = Vec::with_capacity(32 + 32 + 16);
-                buf.extend_from_slice(asset.as_bytes());
-                buf.extend_from_slice(addr.as_bytes());
-                buf.extend_from_slice(&balance.to_be_bytes());
-                Hash::digest_domain(b"shrugg-asset-balance", &buf)
-            })
-            .collect();
         let registry_leaves: Vec<Hash> = self
             .assets
             .iter()
-            .map(|(asset, (chain, token))| {
-                let mut buf = Vec::with_capacity(32 + 2 + 32);
+            .map(|(asset, info)| {
+                let mut buf = Vec::with_capacity(32 + 2 + 32 + 4);
                 buf.extend_from_slice(asset.as_bytes());
-                buf.extend_from_slice(&chain.to_be_bytes());
-                buf.extend_from_slice(token);
+                buf.extend_from_slice(&info.chain.to_be_bytes());
+                buf.extend_from_slice(&info.token);
+                buf.extend_from_slice(&info.index.to_be_bytes());
                 Hash::digest_domain(b"shrugg-asset-registry", &buf)
             })
             .collect();
@@ -578,10 +690,10 @@ impl BridgeState {
             &self.guardian_sets,
         ))
         .expect("bridge configuration and guardian sets serialize");
-        buf.extend_from_slice(merkle_root(&balance_leaves).as_bytes());
         buf.extend_from_slice(merkle_root(&registry_leaves).as_bytes());
         buf.extend_from_slice(merkle_root(&spent_leaves).as_bytes());
         buf.extend_from_slice(&self.burn_sequence.to_be_bytes());
+        buf.extend_from_slice(&self.next_index.to_be_bytes());
         Hash::digest_domain(b"shrugg-bridge-state", &buf)
     }
 }
@@ -685,6 +797,15 @@ mod tests {
         (config, secrets)
     }
 
+    /// Check then apply, which is what a test wants when the plan in between
+    /// is not the point. The ledger keeps the two halves apart on purpose: it
+    /// checks in its validate step and applies the token in its apply step, so
+    /// the quorum is verified once.
+    fn apply(st: &mut BridgeState, bytes: &[u8], now: u64) -> Result<AttestOutcome, BridgeError> {
+        let checked = st.check_attest(bytes, now)?;
+        Ok(st.apply_attest(checked))
+    }
+
     /// Signs `body` with the first five secrets (quorum for a set of six)
     /// and returns the encoded attestation.
     fn attest(secrets: &[[u8; 32]], set_index: u32, body: Body) -> Vec<u8> {
@@ -711,10 +832,10 @@ mod tests {
         }
     }
 
-    /// A transfer of `amount` (fee `fee`) of token `[0xaa; 32]` native to
-    /// `emitter_chain`, emitted by that chain's registered emitter, to
-    /// `key(1)` on `to_chain`.
-    fn transfer_body(emitter_chain: u16, amount: u128, fee: u128, to_chain: u16) -> Body {
+    /// A transfer of `amount` (fee `fee`) of `token`, native to
+    /// `emitter_chain` and emitted by that chain's registered emitter, to the
+    /// 32-byte recipient field `to_hash` on `to_chain`.
+    fn token_body(emitter_chain: u16, token: [u8; 32], amount: u128, fee: u128, to_chain: u16) -> Body {
         Body {
             timestamp: 1,
             nonce: 0,
@@ -724,7 +845,7 @@ mod tests {
             consistency_level: 0,
             payload: Payload::Transfer(Transfer {
                 amount: Transfer::u256_from_u128(amount),
-                token_address: [0xaa; 32],
+                token_address: token,
                 token_chain: emitter_chain,
                 to: key(1).address().0,
                 to_chain,
@@ -734,27 +855,83 @@ mod tests {
         }
     }
 
+    /// [`token_body`] for the canonical test token `[0xaa; 32]`.
+    fn transfer_body(emitter_chain: u16, amount: u128, fee: u128, to_chain: u16) -> Body {
+        token_body(emitter_chain, [0xaa; 32], amount, fee, to_chain)
+    }
+
+    /// The recipient field of the transfer bodies above, which is what the
+    /// ledger compares against `blake3("shrugg-shielded-recipient", ..)`.
+    fn to_hash() -> [u8; 32] {
+        key(1).address().0
+    }
+
+    /// The guardian quorum is verified in `check_attest` and nowhere else. `apply_attest` takes
+    /// the token that check produced — whose fields are private, so only `check_attest` can make
+    /// one — and returns an outcome rather than a `Result`, because there is nothing left for it
+    /// to refuse. That signature is the guarantee; this test pins it.
     #[test]
-    fn mint_credits_recipient_and_fee_to_submitter() {
+    fn an_attestation_is_verified_once_and_then_applied_from_its_token() {
         let (c, s) = cfg();
         let mut st = BridgeState::from_config(&c);
-        let out = st
-            .apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 10, 1)), key(9).address(), 1)
-            .unwrap();
+        let body = transfer_body(2, 1_000, 10, 1);
+        let mu = digest(&body.encode());
+        let bytes = attest(&s, 0, body);
+
+        let checked = st.check_attest(&bytes, 1).unwrap();
+        assert_eq!(checked.digest(), mu);
+        assert!(matches!(checked.plan(), AttestPlan::Transfer(_)));
+        // No `unwrap`: applying a checked attestation cannot fail.
+        let out: AttestOutcome = st.apply_attest(checked);
+        assert!(matches!(out, AttestOutcome::Minted(_)));
+        assert!(st.spent.contains(&Hash(mu)));
+        // And the token cannot be made again: the digest is consumed, so a second attempt is a
+        // replay — which is refused before any signature is recovered.
+        assert_eq!(st.check_attest(&bytes, 1).unwrap_err(), BridgeError::Replay);
+    }
+
+    #[test]
+    fn a_transfer_decodes_to_an_index_an_amount_and_a_recipient_hash() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
         let asset = asset_id(2, &[0xaa; 32]);
-        assert_eq!(
-            out,
-            AttestOutcome::Minted {
-                asset,
-                to: key(1).address(),
-                amount: 990,
-                fee: 10
-            }
-        );
-        assert_eq!(st.balance(&asset, &key(1).address()), 990);
-        assert_eq!(st.balance(&asset, &key(9).address()), 10);
-        assert_eq!(st.assets[&asset], (2, [0xaa; 32]));
+        // The plan is available before anything is applied, and names the index the asset is
+        // about to get — the ledger needs it to compute the deposit note's commitment.
+        let plan = st.check_attest(&attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap().plan().clone();
+        let want = BridgeTransfer {
+            asset,
+            info: AssetInfo { chain: 2, token: [0xaa; 32], index: 1 },
+            amount: 1_000,
+            to_hash: to_hash(),
+            relayer_fee: 10,
+        };
+        assert_eq!(plan, AttestPlan::Transfer(want.clone()));
+        let out = apply(&mut st, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap();
+        assert_eq!(out, AttestOutcome::Minted(want));
+        assert_eq!(st.assets[&asset], AssetInfo { chain: 2, token: [0xaa; 32], index: 1 });
+        assert_eq!(st.asset_index(&asset), Some(1));
+        assert_eq!(st.asset_by_index(1), Some(asset));
         assert_eq!(st.spent.len(), 1);
+        // 0 is SHRUGG and is never handed out.
+        assert_eq!(st.asset_by_index(0), None);
+    }
+
+    /// Indices are dense and assigned in registration order, and a second
+    /// transfer of an already-registered asset reuses its index rather than
+    /// minting a new one — the property a note's `asset` word depends on.
+    #[test]
+    fn asset_indices_are_assigned_once_in_registration_order() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        assert_eq!(st.next_index, FIRST_ASSET_INDEX);
+        apply(&mut st, &attest(&s, 0, token_body(2, [0xaa; 32], 10, 0, 1)), 1).unwrap();
+        apply(&mut st, &attest(&s, 0, token_body(3, [0xbb; 32], 10, 0, 1)), 1).unwrap();
+        apply(&mut st, &attest(&s, 0, token_body(2, [0xaa; 32], 11, 0, 1)), 1).unwrap();
+        assert_eq!(st.asset_index(&asset_id(2, &[0xaa; 32])), Some(1));
+        assert_eq!(st.asset_index(&asset_id(3, &[0xbb; 32])), Some(2));
+        assert_eq!(st.next_index, 3, "three attestations, two assets");
+        assert_eq!(st.asset_by_index(2), Some(asset_id(3, &[0xbb; 32])));
+        assert_eq!(st.asset_index(&Hash::ZERO), None);
     }
 
     #[test]
@@ -762,113 +939,120 @@ mod tests {
         let (c, s) = cfg();
         let mut st = BridgeState::from_config(&c);
         let a = attest(&s, 0, transfer_body(2, 1_000, 10, 1));
-        st.apply_attest(&a, key(9).address(), 1).unwrap();
-        assert_eq!(
-            st.apply_attest(&a, key(9).address(), 1).unwrap_err(),
-            BridgeError::Replay
-        );
+        apply(&mut st, &a, 1).unwrap();
+        assert_eq!(apply(&mut st, &a, 1).unwrap_err(), BridgeError::Replay);
         let mut b = transfer_body(2, 1, 0, 1);
         b.emitter_address = [9; 32];
-        assert_eq!(
-            st.check_attest(&attest(&s, 0, b), key(9).address(), 1).unwrap_err(),
-            BridgeError::WrongEmitter
-        );
+        assert_eq!(st.check_attest(&attest(&s, 0, b), 1).unwrap_err(), BridgeError::WrongEmitter);
         let mut b = transfer_body(2, 1, 0, 1);
         b.emitter_chain = 3; // chain-2 address presented as chain 3
+        assert_eq!(st.check_attest(&attest(&s, 0, b), 1).unwrap_err(), BridgeError::WrongEmitter);
         assert_eq!(
-            st.check_attest(&attest(&s, 0, b), key(9).address(), 1).unwrap_err(),
-            BridgeError::WrongEmitter
-        );
-        assert_eq!(
-            st.check_attest(&attest(&s, 0, transfer_body(2, 1, 0, 2)), key(9).address(), 1)
-                .unwrap_err(),
+            st.check_attest(&attest(&s, 0, transfer_body(2, 1, 0, 2)), 1).unwrap_err(),
             BridgeError::WrongToChain
         );
         assert_eq!(
-            st.check_attest(&attest(&s, 0, transfer_body(2, 1, 2, 1)), key(9).address(), 1)
-                .unwrap_err(),
+            st.check_attest(&attest(&s, 0, transfer_body(2, 1, 2, 1)), 1).unwrap_err(),
             BridgeError::FeeExceedsAmount
         );
         let mut b = transfer_body(2, 1, 0, 1);
         b.payload[1] = 1; // amount top byte
+        assert_eq!(st.check_attest(&attest(&s, 0, b), 1).unwrap_err(), BridgeError::AmountOverflow);
+    }
+
+    /// A note's `amount` is a `u64`, so a transfer the wire format can carry
+    /// but the pool cannot hold is refused at attestation time rather than
+    /// truncated into a note (spec §10, `docs/bridge.md` §12).
+    #[test]
+    fn an_amount_above_u64_is_rejected() {
+        let (c, s) = cfg();
+        let st = BridgeState::from_config(&c);
+        let over = u64::MAX as u128 + 1;
         assert_eq!(
-            st.check_attest(&attest(&s, 0, b), key(9).address(), 1).unwrap_err(),
-            BridgeError::AmountOverflow
+            st.check_attest(&attest(&s, 0, transfer_body(2, over, 0, 1)), 1).unwrap_err(),
+            BridgeError::AmountTooLarge
+        );
+        // The largest amount that does fit still validates, fee and all.
+        let plan = st.check_attest(&attest(&s, 0, transfer_body(2, u64::MAX as u128, 7, 1)), 1).unwrap().plan().clone();
+        assert_eq!(
+            plan,
+            AttestPlan::Transfer(BridgeTransfer {
+                asset: asset_id(2, &[0xaa; 32]),
+                info: AssetInfo { chain: 2, token: [0xaa; 32], index: 1 },
+                amount: u64::MAX,
+                to_hash: to_hash(),
+                relayer_fee: 7,
+            })
         );
     }
 
+    /// `next_index` is a `u32` and the registry never forgets an asset, so
+    /// the one state in which a registration could collide with an existing
+    /// index is refused while checking — `apply_attest` must not be able to
+    /// fail on an attestation that validated.
     #[test]
-    fn burn_debits_and_records_message() {
+    fn a_full_asset_registry_refuses_a_new_asset_but_not_a_known_one() {
         let (c, s) = cfg();
         let mut st = BridgeState::from_config(&c);
-        st.apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 0, 1)), key(9).address(), 1)
-            .unwrap();
-        let asset = asset_id(2, &[0xaa; 32]);
-        let rec = st
-            .apply_burn(key(1).address(), asset, 400, 2, EVM_TO, 5, Hash::ZERO, 12, 1_700)
-            .unwrap();
+        apply(&mut st, &attest(&s, 0, token_body(2, [0xaa; 32], 10, 0, 1)), 1).unwrap();
+        st.next_index = u32::MAX;
+        assert_eq!(
+            st.check_attest(&attest(&s, 0, token_body(3, [0xbb; 32], 10, 0, 1)), 1).unwrap_err(),
+            BridgeError::AssetRegistryFull
+        );
+        // The already-registered asset needs no new index and is unaffected.
+        assert!(st.check_attest(&attest(&s, 0, token_body(2, [0xaa; 32], 11, 0, 1)), 1).is_ok());
+    }
+
+    #[test]
+    fn burn_records_the_message_against_an_index() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        apply(&mut st, &attest(&s, 0, transfer_body(2, 1_000, 0, 1)), 1).unwrap();
+        let tx = Hash::digest(b"burn-tx");
+        let rec = st.apply_burn(tx, 1, 400, 2, EVM_TO, 5, 12, 1_700).unwrap();
         assert_eq!(rec.sequence, 0);
         assert_eq!(st.burn_sequence, 1);
-        assert_eq!(st.balance(&asset, &key(1).address()), 600);
+        assert_eq!(rec.tx, tx, "the transaction hash stands in for the absent sender");
         let body = Body::decode(&rec.body).unwrap();
         assert_eq!(
-            (
-                body.emitter_chain,
-                body.emitter_address,
-                body.sequence,
-                body.timestamp,
-                body.nonce,
-                body.consistency_level
-            ),
+            (body.emitter_chain, body.emitter_address, body.sequence, body.timestamp, body.nonce, body.consistency_level),
             (1, [1; 32], 0, 1_700, 0, 0)
         );
         match Payload::decode(&body.payload).unwrap() {
             Payload::Transfer(t) => {
                 assert_eq!(t.amount_u128(), Some(400));
                 assert_eq!(t.fee_u128(), Some(5));
-                assert_eq!(
-                    (t.token_chain, t.token_address, t.to_chain, t.to),
-                    (2, [0xaa; 32], 2, EVM_TO)
-                );
+                assert_eq!((t.token_chain, t.token_address, t.to_chain, t.to), (2, [0xaa; 32], 2, EVM_TO));
             }
             _ => panic!(),
         }
         assert_eq!(rec.digest, digest(&rec.body));
-        assert_eq!(
-            st.check_burn(&key(1).address(), &asset, 601, 2, &EVM_TO, 0).unwrap_err(),
-            BridgeError::InsufficientAsset {
-                have: 600,
-                need: 601
-            }
-        );
-        assert_eq!(
-            st.check_burn(&key(1).address(), &asset, 1, 3, &EVM_TO, 0).unwrap_err(),
-            BridgeError::WrongTokenChain
-        );
-        assert_eq!(
-            st.check_burn(&key(1).address(), &Hash::ZERO, 1, 2, &EVM_TO, 0).unwrap_err(),
-            BridgeError::UnknownAsset
-        );
+        // There is no balance to run out of any more: the asset bundle's proof is what bounds
+        // a burn. What is left here is the registry and the destination.
+        assert_eq!(st.check_burn(1, u64::MAX, 2, &EVM_TO, 0), Ok(asset_id(2, &[0xaa; 32])));
+        assert_eq!(st.check_burn(1, 1, 3, &EVM_TO, 0).unwrap_err(), BridgeError::WrongTokenChain);
+        assert_eq!(st.check_burn(2, 1, 2, &EVM_TO, 0).unwrap_err(), BridgeError::UnknownAsset);
+        assert_eq!(st.check_burn(0, 1, 2, &EVM_TO, 0).unwrap_err(), BridgeError::UnknownAsset, "0 is SHRUGG");
+        assert_eq!(st.check_burn(1, 10, 2, &EVM_TO, 11).unwrap_err(), BridgeError::FeeExceedsAmount);
     }
 
-    /// `meta` + the three row-wise collections must reassemble the exact same
+    /// `meta` + the two row-wise collections must reassemble the exact same
     /// bridge — the invariant storage's column-family layout depends on.
     #[test]
     fn meta_and_parts_round_trip() {
         let (c, s) = cfg();
         let mut st = BridgeState::from_config(&c);
-        st.apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 7, 1)), key(9).address(), 1)
-            .unwrap();
-        st.apply_burn(key(1).address(), asset_id(2, &[0xaa; 32]), 400, 2, EVM_TO, 5, Hash::ZERO, 12, 1_700)
-            .unwrap();
-        st.apply_attest(&attest(&s, 0, upgrade_body(1, vec![[7u8; 20], [8u8; 20]])), key(9).address(), 1)
-            .unwrap();
-        assert!(!st.balances.is_empty() && !st.spent.is_empty() && !st.burns.is_empty());
+        apply(&mut st, &attest(&s, 0, transfer_body(2, 1_000, 7, 1)), 1).unwrap();
+        st.apply_burn(Hash::ZERO, 1, 400, 2, EVM_TO, 5, 12, 1_700).unwrap();
+        apply(&mut st, &attest(&s, 0, upgrade_body(1, vec![[7u8; 20], [8u8; 20]])), 1).unwrap();
+        assert!(!st.assets.is_empty() && !st.spent.is_empty() && !st.burns.is_empty());
         // The blob itself must survive bincode, which is how storage keeps it.
         let blob = bincode::serialize(&st.meta()).unwrap();
         let meta: BridgeMeta = bincode::deserialize(&blob).unwrap();
         assert_eq!(meta, st.meta());
-        let rebuilt = BridgeState::from_parts(meta, st.balances.clone(), st.spent.clone(), st.burns.clone());
+        assert_eq!(meta.next_index, 2, "the index counter is part of the blob, not derived");
+        let rebuilt = BridgeState::from_parts(meta, st.spent.clone(), st.burns.clone());
         assert_eq!(rebuilt, st);
         assert_eq!(rebuilt.root(), st.root());
     }
@@ -896,59 +1080,50 @@ mod tests {
             .encode(),
         };
         assert_eq!(
-            st.check_attest(&attest(&s, 0, up(2)), key(9).address(), 100).unwrap_err(),
-            BridgeError::BadUpgradeIndex {
-                expected: 1,
-                got: 2
-            }
+            st.check_attest(&attest(&s, 0, up(2)), 100).unwrap_err(),
+            BridgeError::BadUpgradeIndex { expected: 1, got: 2 }
         );
-        assert_eq!(
-            st.apply_attest(&attest(&s, 0, up(1)), key(9).address(), 100)
-                .unwrap(),
-            AttestOutcome::GuardianSetUpgraded(1)
-        );
+        assert_eq!(apply(&mut st, &attest(&s, 0, up(1)), 100).unwrap(), AttestOutcome::GuardianSetUpgraded(1));
         assert_eq!(st.current_set, 1);
         assert_eq!(st.guardian_sets[&0].expires_at, 100 + GUARDIAN_GRACE_SECS);
         assert_eq!(st.guardian_sets[&1].keys, new_keys);
         // old set still mints inside grace, not after
         assert!(st
-            .check_attest(
-                &attest(&s, 0, transfer_body(2, 1, 0, 1)),
-                key(9).address(),
-                100 + GUARDIAN_GRACE_SECS
-            )
+            .check_attest(&attest(&s, 0, transfer_body(2, 1, 0, 1)), 100 + GUARDIAN_GRACE_SECS)
             .is_ok());
         assert_eq!(
-            st.check_attest(
-                &attest(&s, 0, transfer_body(2, 1, 0, 1)),
-                key(9).address(),
-                101 + GUARDIAN_GRACE_SECS
-            )
-            .unwrap_err(),
+            st.check_attest(&attest(&s, 0, transfer_body(2, 1, 0, 1)), 101 + GUARDIAN_GRACE_SECS)
+                .unwrap_err(),
             BridgeError::Verify(VerifyError::SetExpired)
         );
     }
 
     #[test]
-    fn root_changes_with_balances_spent_and_sequence_but_not_burn_records() {
+    fn root_changes_with_the_registry_spent_and_sequence_but_not_burn_records() {
         let (c, s) = cfg();
         let mut st = BridgeState::from_config(&c);
         let empty_root = st.root();
-        st.apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 0, 1)), key(9).address(), 1)
-            .unwrap();
+        apply(&mut st, &attest(&s, 0, transfer_body(2, 1_000, 0, 1)), 1).unwrap();
         let minted_root = st.root();
-        assert_ne!(minted_root, empty_root);
-        let asset = asset_id(2, &[0xaa; 32]);
-        st.apply_burn(key(1).address(), asset, 400, 2, EVM_TO, 0, Hash::ZERO, 12, 1_700)
-            .unwrap();
+        assert_ne!(minted_root, empty_root, "a registered asset and a consumed digest");
+        st.apply_burn(Hash::ZERO, 1, 400, 2, EVM_TO, 0, 12, 1_700).unwrap();
         let burned_root = st.root();
-        assert_ne!(burned_root, minted_root);
+        assert_ne!(burned_root, minted_root, "the burn sequence moved");
         // burn records are derivable and deliberately excluded from the root
         let mut without_burns = st.clone();
         without_burns.burns.clear();
         assert!(!st.burns.is_empty());
         assert_eq!(without_burns.root(), burned_root);
         assert_eq!(st.root(), burned_root);
+        // ... but an asset's index is not: two registries that differ only in which index an
+        // asset holds would mint notes with different `asset` words.
+        let mut renumbered = st.clone();
+        let asset = asset_id(2, &[0xaa; 32]);
+        renumbered.assets.get_mut(&asset).unwrap().index = 9;
+        assert_ne!(renumbered.root(), burned_root);
+        let mut recounted = st.clone();
+        recounted.next_index = 9;
+        assert_ne!(recounted.root(), burned_root, "the next index is what a future note will carry");
     }
 
     #[test]
@@ -976,21 +1151,17 @@ mod tests {
         let mut duplicated = keys.clone();
         duplicated[2] = duplicated[1];
         assert_eq!(
-            st.check_attest(&attest(&s, 0, upgrade_body(1, duplicated)), key(9).address(), 100)
-                .unwrap_err(),
+            st.check_attest(&attest(&s, 0, upgrade_body(1, duplicated)), 100).unwrap_err(),
             BridgeError::DuplicateGuardian
         );
         let mut zeroed = keys.clone();
         zeroed[3] = [0u8; 20];
         assert_eq!(
-            st.check_attest(&attest(&s, 0, upgrade_body(1, zeroed)), key(9).address(), 100)
-                .unwrap_err(),
+            st.check_attest(&attest(&s, 0, upgrade_body(1, zeroed)), 100).unwrap_err(),
             BridgeError::DuplicateGuardian
         );
         // the same upgrade with distinct, non-zero keys clears every rung
-        assert!(st
-            .check_attest(&attest(&s, 0, upgrade_body(1, keys)), key(9).address(), 100)
-            .is_ok());
+        assert!(st.check_attest(&attest(&s, 0, upgrade_body(1, keys)), 100).is_ok());
     }
 
     #[test]
@@ -998,8 +1169,7 @@ mod tests {
         let (c, s) = cfg();
         let st = BridgeState::from_config(&c);
         assert_eq!(
-            st.check_attest(&attest(&s, 5, transfer_body(2, 1, 0, 1)), key(9).address(), 1)
-                .unwrap_err(),
+            st.check_attest(&attest(&s, 5, transfer_body(2, 1, 0, 1)), 1).unwrap_err(),
             BridgeError::Verify(VerifyError::UnknownGuardianSet(5))
         );
     }
@@ -1010,17 +1180,11 @@ mod tests {
         let st = BridgeState::from_config(&c);
         let mut unknown_id = transfer_body(2, 1, 0, 1);
         unknown_id.payload = vec![9u8; TRANSFER_PAYLOAD_LEN]; // payload id 9
-        assert_eq!(
-            st.check_attest(&attest(&s, 0, unknown_id), key(9).address(), 1).unwrap_err(),
-            BridgeError::BadPayload
-        );
+        assert_eq!(st.check_attest(&attest(&s, 0, unknown_id), 1).unwrap_err(), BridgeError::BadPayload);
         let mut short = transfer_body(2, 1, 0, 1);
         short.payload.truncate(TRANSFER_PAYLOAD_LEN - 1); // a 132-byte transfer
         assert_eq!(short.payload.len(), 132);
-        assert_eq!(
-            st.check_attest(&attest(&s, 0, short), key(9).address(), 1).unwrap_err(),
-            BridgeError::BadPayload
-        );
+        assert_eq!(st.check_attest(&attest(&s, 0, short), 1).unwrap_err(), BridgeError::BadPayload);
     }
 
     #[test]
@@ -1030,31 +1194,21 @@ mod tests {
         let mut b = transfer_body(2, 1, 0, 1);
         // token_chain lives at payload[65..67]: id (1) + amount (32) + token_address (32)
         b.payload[65..67].copy_from_slice(&3u16.to_be_bytes());
-        assert_eq!(
-            st.check_attest(&attest(&s, 0, b), key(9).address(), 1).unwrap_err(),
-            BridgeError::WrongTokenChain
-        );
+        assert_eq!(st.check_attest(&attest(&s, 0, b), 1).unwrap_err(), BridgeError::WrongTokenChain);
     }
 
     #[test]
     fn zero_amount_burn_is_rejected() {
         let (c, s) = cfg();
         let mut st = BridgeState::from_config(&c);
-        st.apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 0, 1)), key(9).address(), 1)
-            .unwrap();
-        let asset = asset_id(2, &[0xaa; 32]);
+        apply(&mut st, &attest(&s, 0, transfer_body(2, 1_000, 0, 1)), 1).unwrap();
+        assert_eq!(st.check_burn(1, 0, 2, &EVM_TO, 0).unwrap_err(), BridgeError::ZeroAmount);
         assert_eq!(
-            st.check_burn(&key(1).address(), &asset, 0, 2, &EVM_TO, 0).unwrap_err(),
-            BridgeError::ZeroAmount
-        );
-        assert_eq!(
-            st.apply_burn(key(1).address(), asset, 0, 2, EVM_TO, 0, Hash::ZERO, 1, 1_700)
-                .unwrap_err(),
+            st.apply_burn(Hash::ZERO, 1, 0, 2, EVM_TO, 0, 1, 1_700).unwrap_err(),
             BridgeError::ZeroAmount
         );
         assert_eq!(st.burn_sequence, 0);
         assert!(st.burns.is_empty());
-        assert_eq!(st.balance(&asset, &key(1).address()), 1_000);
     }
 
     /// Spec 3.4/3.6: the grace window covers transfer payloads only. A
@@ -1073,46 +1227,25 @@ mod tests {
             .map(guardian_address)
             .chain([guardian_address(&[7; 32])])
             .collect();
-        st.apply_attest(
-            &attest(&s, 0, upgrade_body(1, set1_keys.clone())),
-            key(9).address(),
-            100,
-        )
-        .unwrap();
+        apply(&mut st, &attest(&s, 0, upgrade_body(1, set1_keys.clone())), 100).unwrap();
         assert_eq!(st.current_set, 1);
         // Set 0 is superseded but still inside its grace window ...
         assert!(st.guardian_sets[&0].expires_at > 100);
         let set2_keys: Vec<GuardianKey> = (10u8..=15).map(|i| [i; 20]).collect();
         // ... which buys it nothing on a rotation.
         assert_eq!(
-            st.check_attest(
-                &attest(&s, 0, upgrade_body(2, set2_keys.clone())),
-                key(9).address(),
-                100
-            )
-            .unwrap_err(),
+            st.check_attest(&attest(&s, 0, upgrade_body(2, set2_keys.clone())), 100).unwrap_err(),
             BridgeError::Verify(VerifyError::SetExpired)
         );
         // The very same upgrade signed by the current set is accepted.
         assert_eq!(
-            st.apply_attest(
-                &attest(&s[1..], 1, upgrade_body(2, set2_keys.clone())),
-                key(9).address(),
-                100
-            )
-            .unwrap(),
+            apply(&mut st, &attest(&s[1..], 1, upgrade_body(2, set2_keys.clone())), 100).unwrap(),
             AttestOutcome::GuardianSetUpgraded(2)
         );
         assert_eq!(st.current_set, 2);
         assert_eq!(st.guardian_sets[&2].keys, set2_keys);
         // Transfers, by contrast, still ride the grace window (spec 3.4).
-        assert!(st
-            .check_attest(
-                &attest(&s, 0, transfer_body(2, 1, 0, 1)),
-                key(9).address(),
-                100
-            )
-            .is_ok());
+        assert!(st.check_attest(&attest(&s, 0, transfer_body(2, 1, 0, 1)), 100).is_ok());
     }
 
     /// Symmetry with `check_burn`: a zero-value mint would consume a digest
@@ -1122,14 +1255,11 @@ mod tests {
         let (c, s) = cfg();
         let st = BridgeState::from_config(&c);
         assert_eq!(
-            st.check_attest(&attest(&s, 0, transfer_body(2, 0, 0, 1)), key(9).address(), 1)
-                .unwrap_err(),
+            st.check_attest(&attest(&s, 0, transfer_body(2, 0, 0, 1)), 1).unwrap_err(),
             BridgeError::ZeroAmount
         );
         // ... and a non-zero amount over the same path still validates.
-        assert!(st
-            .check_attest(&attest(&s, 0, transfer_body(2, 1, 0, 1)), key(9).address(), 1)
-            .is_ok());
+        assert!(st.check_attest(&attest(&s, 0, transfer_body(2, 1, 0, 1)), 1).is_ok());
     }
 
     /// A burn is irreversible once guardians sign it, so an unspendable
@@ -1139,52 +1269,43 @@ mod tests {
     fn burn_rejects_zero_and_wrongly_shaped_recipients() {
         let (c, s) = cfg();
         let mut st = BridgeState::from_config(&c);
-        st.apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 0, 1)), key(9).address(), 1)
-            .unwrap();
+        apply(&mut st, &attest(&s, 0, transfer_body(2, 1_000, 0, 1)), 1).unwrap();
         // A chain-5 (Solana) asset, to prove the upper-12-bytes rule is
         // scoped to the EVM-family chains.
-        st.assets.insert(asset_id(5, &[0xbb; 32]), (5, [0xbb; 32]));
-        st.balances
-            .insert((asset_id(5, &[0xbb; 32]), key(1).address()), 1_000);
-
-        let evm = asset_id(2, &[0xaa; 32]);
-        let sol = asset_id(5, &[0xbb; 32]);
-        let holder = key(1).address();
+        apply(&mut st, &attest(&s, 0, token_body(5, [0xbb; 32], 1_000, 0, 1)), 1).unwrap();
+        let (evm, sol) = (1u32, 2u32);
+        assert_eq!(st.asset_by_index(sol), Some(asset_id(5, &[0xbb; 32])));
 
         // Zero recipient: unspendable on every chain.
-        assert_eq!(
-            st.check_burn(&holder, &evm, 1, 2, &[0u8; 32], 0).unwrap_err(),
-            BridgeError::BadRecipient
-        );
-        assert_eq!(
-            st.check_burn(&holder, &sol, 1, 5, &[0u8; 32], 0).unwrap_err(),
-            BridgeError::BadRecipient
-        );
+        assert_eq!(st.check_burn(evm, 1, 2, &[0u8; 32], 0).unwrap_err(), BridgeError::BadRecipient);
+        assert_eq!(st.check_burn(sol, 1, 5, &[0u8; 32], 0).unwrap_err(), BridgeError::BadRecipient);
         // Dirty upper 12 bytes on an EVM-family chain (2, 3, 4).
         let mut dirty = EVM_TO;
         dirty[11] = 1;
-        assert_eq!(
-            st.check_burn(&holder, &evm, 1, 2, &dirty, 0).unwrap_err(),
-            BridgeError::BadRecipient
-        );
+        assert_eq!(st.check_burn(evm, 1, 2, &dirty, 0).unwrap_err(), BridgeError::BadRecipient);
         // A full 32-byte Solana pubkey is fine on chain 5.
-        assert!(st.check_burn(&holder, &sol, 1, 5, &[0x22u8; 32], 0).is_ok());
+        assert!(st.check_burn(sol, 1, 5, &[0x22u8; 32], 0).is_ok());
         // ... and a left-padded address is fine on chain 2.
-        assert!(st.check_burn(&holder, &evm, 1, 2, &EVM_TO, 0).is_ok());
+        assert!(st.check_burn(evm, 1, 2, &EVM_TO, 0).is_ok());
         // `apply_burn` refuses it too and records nothing.
         assert_eq!(
-            st.apply_burn(holder, evm, 1, 2, dirty, 0, Hash::ZERO, 1, 1_700)
-                .unwrap_err(),
+            st.apply_burn(Hash::ZERO, evm, 1, 2, dirty, 0, 1, 1_700).unwrap_err(),
             BridgeError::BadRecipient
         );
         assert_eq!(st.burn_sequence, 0);
         assert!(st.burns.is_empty());
-        assert_eq!(st.balance(&evm, &holder), 1_000);
     }
 
     /// Golden vector for the spec 6.3 commitment. Changing this hash changes
     /// consensus: every node's state root moves with it, so treat a failure
     /// here as a hard fork, never as a test to re-baseline.
+    ///
+    /// Re-pinned exactly once, in phase S3 (`docs/superpowers/plans/2026-09-12-shielded-pool-s3.md`):
+    /// per-account `balances` left `BridgeState` altogether and the asset
+    /// registry gained the dense note index (and its `next_index` counter),
+    /// so the commitment's second component is a registry leaf with an index
+    /// in it and the balance leaves are gone. That *is* the hard fork this
+    /// phase ships; the previous value was c757e13d25a59234ca3c642f38fd53970051055a73a1db9bc63f2c0b3058b043.
     #[test]
     fn root_is_pinned_for_a_fixed_state() {
         let mut st = BridgeState::from_config(&BridgeConfig {
@@ -1193,11 +1314,11 @@ mod tests {
             emitters: BTreeMap::from([(2u16, [2u8; 32])]),
         });
         let asset = asset_id(2, &[0xaa; 32]);
-        st.assets.insert(asset, (2, [0xaa; 32]));
-        st.balances.insert((asset, Address([0x33; 32])), 1_000);
+        st.assets.insert(asset, AssetInfo { chain: 2, token: [0xaa; 32], index: 1 });
+        st.next_index = 2;
         st.spent.insert(Hash([0x44; 32]));
         st.burn_sequence = 7;
-        assert_eq!(st.root().to_hex(), "c757e13d25a59234ca3c642f38fd53970051055a73a1db9bc63f2c0b3058b043");
+        assert_eq!(st.root().to_hex(), "ee50b48c82eacf7aca2a1bdb33b32b7c98b1a255e645c9ba12dde9d060c43dc8");
         // the emitter and the source-chain emitter table are committed too
         let mut other_emitter = st.clone();
         other_emitter.emitter = [9; 32];
@@ -1205,32 +1326,6 @@ mod tests {
         let mut other_emitters = st.clone();
         other_emitters.emitters.insert(3, [3; 32]);
         assert_ne!(other_emitters.root(), st.root());
-    }
-
-    /// A mint that would overflow a `u128` balance must be caught while
-    /// checking, so the ledger can never apply an attestation it validated
-    /// and then fail half way through.
-    #[test]
-    fn mint_overflow_is_rejected_at_check_time() {
-        let (c, s) = cfg();
-        let mut st = BridgeState::from_config(&c);
-        let asset = asset_id(2, &[0xaa; 32]);
-        let (recipient, submitter) = (key(1).address(), key(9).address());
-        st.assets.insert(asset, (2, [0xaa; 32]));
-        st.balances.insert((asset, recipient), u128::MAX - 1);
-        let a = attest(&s, 0, transfer_body(2, 1_000, 10, 1));
-        assert_eq!(st.check_attest(&a, submitter, 1).unwrap_err(), BridgeError::Overflow);
-        assert_eq!(st.apply_attest(&a, submitter, 1).unwrap_err(), BridgeError::Overflow);
-        // the fee credit is screened too: here the *submitter* is the one at the ceiling
-        st.balances.insert((asset, recipient), 0);
-        st.balances.insert((asset, submitter), u128::MAX);
-        assert_eq!(st.check_attest(&a, submitter, 1).unwrap_err(), BridgeError::Overflow);
-        // nothing was consumed or credited by either rejection
-        assert!(st.spent.is_empty());
-        assert_eq!(st.balance(&asset, &recipient), 0);
-        // and the same attestation is fine once the balance has room
-        st.balances.insert((asset, submitter), 0);
-        assert!(st.check_attest(&a, submitter, 1).is_ok());
     }
 
     #[test]
@@ -1277,55 +1372,42 @@ mod tests {
     fn cheap_checks_run_before_signature_recovery() {
         let (c, s) = cfg();
         let mut st = BridgeState::from_config(&c);
-        let sub = key(9).address();
-        st.apply_attest(&attest(&s, 0, transfer_body(2, 1_000, 10, 1)), sub, 1)
-            .unwrap();
+        apply(&mut st, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap();
         // A consumed digest is public knowledge and free to resubmit.
         assert_eq!(
-            st.check_attest(&misattest(0, transfer_body(2, 1_000, 10, 1)), sub, 1)
-                .unwrap_err(),
+            st.check_attest(&misattest(0, transfer_body(2, 1_000, 10, 1)), 1).unwrap_err(),
             BridgeError::Replay
         );
         let mut b = transfer_body(2, 1, 0, 1);
         b.emitter_address = [9; 32];
+        assert_eq!(st.check_attest(&misattest(0, b), 1).unwrap_err(), BridgeError::WrongEmitter);
         assert_eq!(
-            st.check_attest(&misattest(0, b), sub, 1).unwrap_err(),
-            BridgeError::WrongEmitter
-        );
-        assert_eq!(
-            st.check_attest(&misattest(0, transfer_body(2, 1, 0, 2)), sub, 1)
-                .unwrap_err(),
+            st.check_attest(&misattest(0, transfer_body(2, 1, 0, 2)), 1).unwrap_err(),
             BridgeError::WrongToChain
         );
         assert_eq!(
-            st.check_attest(&misattest(0, transfer_body(2, 1, 2, 1)), sub, 1)
-                .unwrap_err(),
+            st.check_attest(&misattest(0, transfer_body(2, 1, 2, 1)), 1).unwrap_err(),
             BridgeError::FeeExceedsAmount
         );
         assert_eq!(
-            st.check_attest(&misattest(0, transfer_body(2, 0, 0, 1)), sub, 1)
-                .unwrap_err(),
+            st.check_attest(&misattest(0, transfer_body(2, 0, 0, 1)), 1).unwrap_err(),
             BridgeError::ZeroAmount
+        );
+        assert_eq!(
+            st.check_attest(&misattest(0, transfer_body(2, u64::MAX as u128 + 1, 0, 1)), 1).unwrap_err(),
+            BridgeError::AmountTooLarge
         );
         let mut b = transfer_body(2, 1, 0, 1);
         b.payload[0] = 9; // unknown payload id
-        assert_eq!(
-            st.check_attest(&misattest(0, b), sub, 1).unwrap_err(),
-            BridgeError::BadPayload
-        );
+        assert_eq!(st.check_attest(&misattest(0, b), 1).unwrap_err(), BridgeError::BadPayload);
         let keys = vec![guardian_address(&[21; 32])];
         assert_eq!(
-            st.check_attest(&misattest(0, upgrade_body(5, keys)), sub, 1)
-                .unwrap_err(),
-            BridgeError::BadUpgradeIndex {
-                expected: 1,
-                got: 5
-            }
+            st.check_attest(&misattest(0, upgrade_body(5, keys)), 1).unwrap_err(),
+            BridgeError::BadUpgradeIndex { expected: 1, got: 5 }
         );
         // Well-formed and fresh: now the quorum is what fails.
         assert!(matches!(
-            st.check_attest(&misattest(0, transfer_body(2, 1, 0, 1)), sub, 1)
-                .unwrap_err(),
+            st.check_attest(&misattest(0, transfer_body(2, 1, 0, 1)), 1).unwrap_err(),
             BridgeError::Verify(VerifyError::WrongGuardian(_))
         ));
     }

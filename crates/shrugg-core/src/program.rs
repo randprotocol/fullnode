@@ -1,6 +1,8 @@
 //! On-chain programs and call receipts.
 
 use crate::crypto::Hash;
+use crate::notes::Word8;
+use crate::types::CallEnvelope;
 use serde::{Deserialize, Serialize};
 
 pub type ProgramId = Hash;
@@ -30,11 +32,20 @@ pub struct ProgramRecord {
     pub deployed_at: u64,
 }
 
-/// What a verified call proved: its gas tier and the eight public outputs.
+/// What a verified call proved: its gas tier, the eight public outputs, and the public
+/// commitment to its private inputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallOutcome {
     pub tier: u8,
     pub outputs: [u32; 8],
+    /// `H_IN` (zkVM M4.1, `pv::IN0..7`): the salted in-circuit commitment to every word the
+    /// guest read. Public, and taken straight from the proof the verifier just accepted.
+    ///
+    /// The chain does nothing with it — but it is the associated data a call-input envelope is
+    /// sealed against (spec §6.1), so without it on the receipt nobody holding a viewing key, a
+    /// per-call key or an auditor key could open the transcript, and nobody could check an
+    /// opened one against `hash::input_digest(salt, inputs)`.
+    pub h_in: Word8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +56,16 @@ pub struct CallReceipt {
     pub outputs: [u32; 8],
     pub height: u64,
     pub index: u32,
+    /// `H_IN`, copied from the verified proof: the public commitment to the call's private
+    /// inputs, and the key to reading `input_envelope` (see [`CallOutcome::h_in`]).
+    pub h_in: Word8,
+    /// The call-input envelope the transaction published, if it published one (spec §6.1).
+    ///
+    /// Chain data the chain never reads: the ledger checks its size and stores it here, and a
+    /// node serves it as `shrugg_getCallEnvelope`. It lives on the receipt rather than being
+    /// re-read from the block because that is how it is asked for — by transaction hash, by
+    /// someone who was handed a viewing key or a per-call key long after the block was made.
+    pub input_envelope: Option<CallEnvelope>,
 }
 
 #[cfg(test)]
