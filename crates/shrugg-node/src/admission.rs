@@ -75,13 +75,29 @@ impl RefusedCache {
 /// all statements about *this node's state at this moment*: a node one block behind would
 /// otherwise poison itself against transactions that are about to be valid.
 ///
-/// The allowlist is explicit and everything outside it is treated as state, so a `TxError` added
-/// later is not cached until someone decides it may be. That is also why the chain's *own
-/// configuration* is not permanent: `FaucetDisabled`, `ConfidentialDisabled`, `MintTooLarge`
-/// (the faucet cap), `FeeTooLow` (the floor), `UnsupportedAsset`, `UnsupportedBurn` and
-/// `UnsupportedAction` (the phase this release has shipped) are all statements about a chain or a
-/// build rather than about the bytes, and a genesis flag or an upgrade changes them under a
-/// running pool. `Overflow` is arithmetic over amounts this node holds, so it goes with them.
+/// Two arms are worth spelling out, because neither is literally a property of the bytes on their
+/// own — each is a property of the bytes *against a constant that cannot change under this cache*:
+///
+/// - `WrongChain` compares against `Ledger::chain_id`, which is fixed at genesis and cannot move
+///   without a new chain, and
+/// - `InvalidBundleProof` (like `InvalidProof`) is a verdict against `hc_bundle` — also a genesis
+///   constant — under the executor's constraint set and FRI profile, which are compiled in. A
+///   constraint-set change is a hard fork and a new binary.
+///
+/// A cache entry only ever has to outlive the *process*, and none of those constants changes inside
+/// one. Anything genuinely per-node-state is what the paragraph above refuses.
+///
+/// Everything outside the allowlist is treated as state, so a `TxError` added later is not cached
+/// until someone decides it may be. Kept out deliberately, for the record, are the chain's own
+/// configuration and this build's reach: `FaucetDisabled` and `ConfidentialDisabled` (genesis flags
+/// the node can also toggle at runtime), `FeeTooLow` (a floor a fee market would make dynamic),
+/// `UnsupportedAsset`, `UnsupportedBurn` and `UnsupportedAction` (the phase this release has
+/// shipped, so a rolling upgrade makes them valid mid-process — an operator restarts the binary, but
+/// the transaction was never about *bytes*), and `Overflow` (arithmetic over amounts this node
+/// holds). `MintTooLarge` is the closest call: `FAUCET_MAX_UNITS` is a compile-time constant, so it
+/// would qualify on the same argument as `WrongChain` — it stays out because a faucet cap is a
+/// policy knob, unlike a chain id or a guest commitment, and a mint is cheap to re-refuse; nothing
+/// is gained by caching it and the conservative side of this line is the safe one.
 pub fn is_permanent(e: &TxError) -> bool {
     matches!(
         e,
@@ -120,6 +136,12 @@ pub fn is_permanent(e: &TxError) -> bool {
 /// One peer's allowance. Lives on `node::Peer`, which the node already keys by `PeerId` and already
 /// drops on `PeerDisconnected` — so this type holds no peer id, no map and no lifetime rule of its
 /// own. `None` for the tokens means "not yet used": a fresh bucket starts full.
+///
+/// **It is `Copy`, so spend it in place.** `PeerLimiter::allow` takes `&mut TokenBucket` and writes
+/// the remaining tokens back into it: call it on the field the peer table owns
+/// (`allow(&mut peer.tx_bucket, now)`), never on a local copy of it (`let mut b = peer.tx_bucket`),
+/// or every call sees a full bucket and the limit does nothing. `Copy` is here because a bucket is
+/// two words and `node::Peer` is `Clone`; it is not an invitation to move one around.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TokenBucket {
     tokens: Option<f64>,
@@ -226,6 +248,26 @@ mod tests {
         let mut c = RefusedCache::new(4);
         c.insert(h(1), TxError::UnknownAnchor);
         assert_eq!(c.len(), 0);
+    }
+
+    /// The shipped policy, pinned: 8192 entries against a 10 000-transaction pool, and a burst of 16
+    /// refilling at 4/s against a chain that commits about one transaction a second. Changing any of
+    /// the three is a decision about how much work an unknown peer may cost this node, so it should
+    /// break a test rather than a fleet.
+    #[test]
+    fn the_shipped_policy_is_the_one_the_plan_sized() {
+        assert_eq!(REFUSED_CACHE_ENTRIES, 8192);
+        assert_eq!(PEER_TX_BURST, 16);
+        assert_eq!(PEER_TX_PER_SEC, 4.0);
+        // And the constants are what the node's own limiter is built from: burst first, rate second.
+        let l = PeerLimiter::new(PEER_TX_BURST, PEER_TX_PER_SEC);
+        let mut b = TokenBucket::default();
+        let t0 = Instant::now();
+        for i in 0..PEER_TX_BURST {
+            assert!(l.allow(&mut b, t0), "burst {i} of {PEER_TX_BURST}");
+        }
+        assert!(!l.allow(&mut b, t0), "and no more until it refills");
+        assert!(l.allow(&mut b, t0 + Duration::from_millis(250)), "a quarter second is one token at 4/s");
     }
 
     #[test]
