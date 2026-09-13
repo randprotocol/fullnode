@@ -7,9 +7,12 @@
 //! consensus: a cached verdict only ever refuses what `Ledger::validate` would refuse anyway, and a
 //! throttled peer's transaction is dropped by *this* node, not judged invalid.
 
-use shrugg_core::{Hash, TxError};
+use crate::mempool::MempoolError;
+use crate::network::{GossipId, MessageAcceptance};
+use shrugg_core::{Hash, Transaction, TxError};
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
+use tokio::sync::oneshot;
 
 /// How many refused hashes to remember. The pool itself holds 10 000, so a flood of distinct bad
 /// proofs cannot evict the entries that are actually saving work.
@@ -184,6 +187,159 @@ impl PeerLimiter {
         }
         bucket.tokens = Some(available - 1.0);
         true
+    }
+}
+
+/// How many proof verifications may run on blocking workers at once.
+///
+/// Four, against a machine that also runs the consensus loop, RocksDB and the RPC server: a warm
+/// bundle verification is ~20 ms of pure CPU, so four of them saturate four cores and no more. The
+/// number is a *concurrency* bound, not a throughput target — the queue below is what absorbs a
+/// burst.
+pub const MAX_VERIFY_IN_FLIGHT: usize = 4;
+
+/// How many transactions may be waiting for one of those slots.
+///
+/// Sized against gossipsub's validation window rather than against memory: a message stays in
+/// gossipsub's cache for `history_length` heartbeats (5 × 500 ms = 2.5 s), and a verdict later than
+/// that reports into nothing. At ~20 ms a verification and four at a time, 64 queued is ~320 ms of
+/// work — comfortably inside the window even when every proof is cold. Deeper would only buy
+/// verdicts nobody can act on; the 65th transaction is shed with an `Ignore`, which an honest peer
+/// re-gossips on its next heartbeat.
+pub const MAX_VERIFY_QUEUE: usize = 64;
+
+/// What this node has decided to tell gossipsub about one delivered message.
+///
+/// libp2p's own [`MessageAcceptance`] derives `Debug` and nothing else — no `Clone`, no `PartialEq`
+/// — so it can be neither compared in a test nor carried beside a queued transaction. This is that
+/// enum with the three derives the decision path needs; it converts into libp2p's at the single
+/// boundary where the verdict leaves this node ([`crate::network::NetworkHandle::report_validation`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Acceptance {
+    /// Valid as far as this node can tell: deliver it onward.
+    Accept,
+    /// This message's *bytes* are bad, and the forwarder wears the penalty.
+    Reject,
+    /// Not forwarded, nobody penalised — the refusal is about this node, not about the message.
+    Ignore,
+}
+
+impl From<Acceptance> for MessageAcceptance {
+    fn from(a: Acceptance) -> MessageAcceptance {
+        match a {
+            Acceptance::Accept => MessageAcceptance::Accept,
+            Acceptance::Reject => MessageAcceptance::Reject,
+            Acceptance::Ignore => MessageAcceptance::Ignore,
+        }
+    }
+}
+
+/// Who is waiting on a verification, and what has to happen when it lands.
+pub enum VerifySource {
+    /// Gossip: the verdict decides the message's acceptance, so the transaction is propagated only
+    /// once it has verified here.
+    Gossip(GossipId),
+    /// RPC: the verdict is the caller's answer, and an accepted transaction is broadcast.
+    Rpc(oneshot::Sender<Result<Hash, MempoolError>>),
+}
+
+/// One finished verification, on its way back to the node loop.
+pub struct Verdict {
+    pub tx: Transaction,
+    pub result: Result<(), TxError>,
+    pub source: VerifySource,
+}
+
+/// What to do with one gossip message, decided without touching the pool or a proof.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GossipOutcome {
+    Report(Acceptance),
+    Verify,
+}
+
+impl GossipOutcome {
+    /// A consensus or status message. Neither is validated at the application level — a proposal's
+    /// verification stays on the consensus loop, and a status is three fields — so both are
+    /// accepted at once, exactly as they were before `validate_messages()` was turned on.
+    pub fn for_consensus() -> GossipOutcome {
+        GossipOutcome::Report(Acceptance::Accept)
+    }
+
+    /// `bucket` is the **forwarding** peer's allowance (`node::Peer::tx_bucket`, looked up by
+    /// `GossipId.propagation_source`), and `None` for an RPC submission, which is not metered.
+    /// `queued` is the current verification queue depth.
+    ///
+    /// The order is the point. The refused cache first, because it is a hash lookup and because a
+    /// peer flooding one known-bad transaction must not spend an allowance it could have used on a
+    /// good one. Then the bucket, so a burst is shed before anything reads the ledger. Then the
+    /// queue depth. Everything more expensive than this — `Mempool::precheck`, which hashes a
+    /// bridge attestation, and the proof itself — happens only after a `Verify`.
+    pub fn for_transaction(
+        tx: &Transaction,
+        bucket: Option<&mut TokenBucket>,
+        refused: &mut RefusedCache,
+        limiter: &PeerLimiter,
+        queued: usize,
+        now: Instant,
+    ) -> GossipOutcome {
+        if refused.get(&tx.hash()).is_some() {
+            return GossipOutcome::Report(Acceptance::Reject);
+        }
+        if let Some(b) = bucket {
+            if !limiter.allow(b, now) {
+                return GossipOutcome::Report(Acceptance::Ignore);
+            }
+        }
+        if queued >= MAX_VERIFY_QUEUE {
+            return GossipOutcome::Report(Acceptance::Ignore);
+        }
+        GossipOutcome::Verify
+    }
+}
+
+/// The acceptance a verdict earns, and the cache entry it leaves behind.
+///
+/// `Accept` even when the pool then refuses the transaction as a conflict: it verified, so
+/// propagating it is right — some other node's pool may have room for it.
+pub fn acceptance_for(result: &Result<(), TxError>, hash: Hash, refused: &mut RefusedCache) -> Acceptance {
+    match result {
+        Ok(()) => Acceptance::Accept,
+        Err(e) if is_permanent(e) => {
+            refused.insert(hash, e.clone());
+            Acceptance::Reject
+        }
+        Err(_) => Acceptance::Ignore,
+    }
+}
+
+/// The same rule one level up, for a refusal that came from the pool's pre-screen rather than from
+/// a verification: a `Duplicate`, a `Conflict` or a `Full` pool is a statement about *this node*
+/// and never about the message, so it is an `Ignore` and is not cached. A `TxError` the pre-screen
+/// found — an oversized attestation, a spent nullifier — is judged exactly as a verdict's is.
+pub fn acceptance_for_pool(e: &MempoolError, hash: Hash, refused: &mut RefusedCache) -> Acceptance {
+    match e {
+        MempoolError::Invalid(t) => acceptance_for(&Err(t.clone()), hash, refused),
+        MempoolError::Duplicate
+        | MempoolError::Conflict(_)
+        | MempoolError::AttestationConflict(_)
+        | MempoolError::Full => Acceptance::Ignore,
+    }
+}
+
+/// The error an RPC submitter hears for a decision [`GossipOutcome::for_transaction`] took before
+/// any verification ran. Both are errors `Mempool::insert` already produced, because `docs/rpc.md`
+/// quotes its messages:
+///
+/// - `Reject` can only be the refused cache — the RPC path passes no bucket and a full queue is an
+///   `Ignore` — so the answer is the verdict the ledger gave this transaction the first time.
+/// - `Ignore` is the full verify queue, which is a "not now": `Full` is what that already says to a
+///   client, and it is the one refusal here worth retrying.
+pub fn rpc_refusal(a: Acceptance, hash: &Hash, refused: &RefusedCache) -> MempoolError {
+    match (a, refused.get(hash)) {
+        (Acceptance::Reject, Some(e)) => MempoolError::Invalid(e.clone()),
+        // Unreachable as long as `for_transaction` only rejects on a cache hit; `Full` rather than
+        // a panic, because an RPC caller is owed an answer either way.
+        _ => MempoolError::Full,
     }
 }
 

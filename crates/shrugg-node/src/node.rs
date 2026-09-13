@@ -2,8 +2,11 @@
 //! network handle; turns consensus `Action`s into I/O and network events into
 //! consensus input.
 
-use crate::mempool::Mempool;
-use crate::network::{self, GossipMessage, NetworkConfig, NetworkEvent, NetworkHandle, Status, SyncRequest, SyncResponse};
+use crate::admission::{self, GossipOutcome, Verdict, VerifySource, MAX_VERIFY_IN_FLIGHT};
+use crate::mempool::{Mempool, MempoolError};
+use crate::network::{
+    self, GossipId, GossipMessage, NetworkConfig, NetworkEvent, NetworkHandle, Status, SyncRequest, SyncResponse,
+};
 use crate::rpc::{self, NodeCommand, NodeStatus, RpcState};
 use crate::storage::{Storage, VerifyMode};
 use anyhow::{Context, Result};
@@ -12,17 +15,17 @@ use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
 use shrugg_core::gas;
 use shrugg_core::genesis::{Genesis, GenesisState};
-use shrugg_core::{Hash, Keypair, Ledger, ShieldedAddress, Transaction, ValidatorSet, FAUCET_MAX_UNITS};
+use shrugg_core::{Hash, Keypair, Ledger, ShieldedAddress, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
 use shrugg_zkvm::executor::ZkExecutor;
 use shrugg_zkvm::notes::{Note, SpendKey};
 use shrugg_zkvm::viewing::TxKey;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 const SYNC_BATCH: u32 = 100;
 
@@ -230,6 +233,23 @@ struct Node {
     fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, Hash>,
     /// Block hash -> (attempts so far, peers already asked) for by-hash fetches.
     fetch_attempts: HashMap<Hash, (usize, Vec<PeerId>)>,
+    /// Transaction hashes this node has already refused for a reason about their bytes, so a
+    /// re-gossiped copy costs a hash lookup instead of a proof verification.
+    refused: admission::RefusedCache,
+    /// Policy only — every bucket lives on its [`Peer`], so nothing here has to track the peer set.
+    limiter: admission::PeerLimiter,
+    /// The tip the pending verifications are running against, refreshed lazily: a full ledger clone
+    /// per consensus message would cost one per vote, so it is taken only when a transaction is
+    /// waiting and the tip's `(height, root)` has moved since the last one.
+    snapshot: Option<(u64, Word8, Arc<Ledger>)>,
+    /// Verifications on blocking workers right now, capped at [`MAX_VERIFY_IN_FLIGHT`].
+    verify_in_flight: usize,
+    /// Transactions waiting for one of those slots, capped at `admission::MAX_VERIFY_QUEUE` by
+    /// [`GossipOutcome::for_transaction`].
+    verify_queue: VecDeque<(Transaction, VerifySource)>,
+    /// The sender every verification task answers on; its receiver is an arm of the loop's
+    /// `select!`.
+    verdicts_tx: mpsc::Sender<Verdict>,
 }
 
 const MAX_FETCH_ATTEMPTS: usize = 8;
@@ -248,6 +268,11 @@ struct Peer {
     status: Option<Status>,
     /// We currently hold an open connection to it.
     connected: bool,
+    /// This peer's gossip-submission allowance. Metered only when the peer is the *forwarder* of a
+    /// transaction (`GossipId.propagation_source`); a peer we know of only as the author of relayed
+    /// gossip never spends from it. Dropped with the entry on `PeerDisconnected`, which is why
+    /// `PeerLimiter` keeps no map.
+    tx_bucket: admission::TokenBucket,
 }
 
 /// The wire cost of one committed block in a sync batch.
@@ -437,6 +462,9 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     }
 
     let address = key.address();
+    // At most `MAX_VERIFY_IN_FLIGHT` verdicts can be outstanding — a worker only exists because the
+    // loop counted it in — so the channel never has to hold more than that.
+    let (verdicts_tx, verdicts_rx) = mpsc::channel(MAX_VERIFY_IN_FLIGHT);
     let node = Node {
         cfg,
         gs,
@@ -459,13 +487,19 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         sync_late_batches: 0,
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
+        refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
+        limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
+        snapshot: None,
+        verify_in_flight: 0,
+        verify_queue: VecDeque::new(),
+        verdicts_tx,
     };
     // A fatal error in the loop ends the node, but most embedders (every cluster test, and any
     // caller that keeps the handle without awaiting it) never look at the `JoinHandle`, so
     // without this the node simply goes quiet and looks like a consensus or networking stall.
     // The `Result` is still returned for whoever does await it.
     let task = tokio::spawn(async move {
-        let outcome = node.run(events, cmd_rx, early).await;
+        let outcome = node.run(events, cmd_rx, verdicts_rx, early).await;
         match &outcome {
             Ok(()) => tracing::info!("node loop stopped"),
             Err(e) => tracing::error!("node loop exited: {e:#}"),
@@ -487,6 +521,7 @@ impl Node {
         mut self,
         mut events: mpsc::Receiver<NetworkEvent>,
         mut cmds: mpsc::Receiver<NodeCommand>,
+        mut verdicts: mpsc::Receiver<Verdict>,
         early: Vec<NetworkEvent>,
     ) -> Result<()> {
         let actions = self.hs.start();
@@ -506,6 +541,14 @@ impl Node {
                 cmd = cmds.recv() => match cmd {
                     Some(cmd) => self.on_command(cmd).await?,
                     None => { tracing::info!("rpc closed; shutting down"); return Ok(()); }
+                },
+                // A proof verification that finished on a blocking worker. The whole point of this
+                // arm: the ~20 ms it cost was not spent here.
+                v = verdicts.recv() => match v {
+                    Some(v) => self.on_verdict(v).await?,
+                    // This node holds a sender for as long as it lives, so the channel cannot close
+                    // under it; stopping beats spinning on a closed receiver if it ever does.
+                    None => { tracing::warn!("verify channel closed; shutting down"); return Ok(()); }
                 },
                 _ = sleep_until(self.timeout.map(|t| t.1)) => {
                     if let Some((view, _)) = self.timeout.take() {
@@ -558,6 +601,150 @@ impl Node {
         s.sync_failures = self.sync_failures;
         s.sync_late_batches = self.sync_late_batches;
         s.ws_clients = self.ws_conns.load(SeqCst);
+        // Admission's two numbers, beside the sync ones and never mixed with them: a verification
+        // that was shed or refused is not a sync failure, and the two sets answer different
+        // questions for an operator.
+        s.refused_cache = self.refused.len();
+        s.verify_queue = self.verify_queue.len();
+    }
+
+    /// The tip ledger the pending verifications run against, cloned at most once per tip change.
+    ///
+    /// Taken lazily — only when a transaction is actually waiting — because a clone per consensus
+    /// message would be a clone per vote. On an idle chain there is none at all, and on a busy one
+    /// at most one per block.
+    fn snapshot(&mut self) -> Arc<Ledger> {
+        let key = {
+            let tip = self.hs.tip_ledger();
+            (tip.height(), tip.root())
+        };
+        if self.snapshot.as_ref().map(|(h, r, _)| (*h, *r)) != Some(key) {
+            self.snapshot = Some((key.0, key.1, Arc::new(self.hs.tip_ledger().clone())));
+        }
+        self.snapshot.as_ref().expect("just set").2.clone()
+    }
+
+    /// Start verifications from the queue while there is a free slot.
+    ///
+    /// Nothing here blocks: `spawn_blocking` puts the proof work on a worker thread and the loop
+    /// goes straight back to the `select!`. The verdict returns on its own arm.
+    fn pump_verify(&mut self) {
+        while self.verify_in_flight < MAX_VERIFY_IN_FLIGHT {
+            let Some((tx, source)) = self.verify_queue.pop_front() else { break };
+            let ledger = self.snapshot();
+            let executor = self.executor.clone();
+            let out = self.verdicts_tx.clone();
+            self.verify_in_flight += 1;
+            tokio::task::spawn_blocking(move || {
+                let result = ledger.validate(&tx, executor.as_ref());
+                // The loop is the only receiver and outlives every task it spawned, so a send
+                // failure means the node is already shutting down.
+                let _ = out.blocking_send(Verdict { tx, result, source });
+            });
+        }
+    }
+
+    /// One finished verification: the second half of the exactly-once report, and the only way a
+    /// gossiped transaction reaches the pool.
+    async fn on_verdict(&mut self, v: Verdict) -> Result<()> {
+        self.verify_in_flight = self.verify_in_flight.saturating_sub(1);
+        let hash = v.tx.hash();
+        let acceptance = admission::acceptance_for(&v.result, hash, &mut self.refused);
+        // A verified transaction is pooled against the *current* tip, not the snapshot it was
+        // verified on: `insert_verified` re-runs `precheck` there, so a nullifier spent or an anchor
+        // scrolled out in the meantime is caught on the state it is actually being pooled on.
+        let pooled = match &v.result {
+            Ok(()) => self.mempool.insert_verified(v.tx.clone(), self.hs.tip_ledger(), self.executor.as_ref()),
+            Err(e) => Err(MempoolError::Invalid(e.clone())),
+        };
+        match v.source {
+            // `acceptance`, not `pooled`: a transaction that verified and then lost a pool conflict
+            // is still a valid message, and another node's pool may have room for it.
+            VerifySource::Gossip(id) => self.net.report_validation(id, acceptance.into()).await,
+            VerifySource::Rpc(reply) => {
+                if pooled.is_ok() {
+                    self.net.broadcast(GossipMessage::Transaction(v.tx)).await;
+                }
+                let _ = reply.send(pooled);
+            }
+        }
+        self.pump_verify();
+        Ok(())
+    }
+
+    /// Hand one decision to gossipsub. Every path that delivers a gossip message ends here or in
+    /// [`Node::on_verdict`], exactly once, which is what `validate_messages()` demands.
+    async fn report(&self, id: GossipId, outcome: GossipOutcome) {
+        let a = match outcome {
+            GossipOutcome::Report(a) => a,
+            // Only `for_transaction` answers `Verify`, and its caller queues the transaction rather
+            // than reporting it. Accepting is the safe reading if that ever changes: a message
+            // forwarded once too often beats a message this node silently stops relaying.
+            GossipOutcome::Verify => admission::Acceptance::Accept,
+        };
+        self.net.report_validation(id, a.into()).await;
+    }
+
+    /// One gossiped transaction. Reported exactly once: here when the decision is final, or on its
+    /// verdict when it goes to a worker.
+    async fn on_gossiped_tx(&mut self, tx: Transaction, id: GossipId) -> Result<()> {
+        let outcome = {
+            // The *forwarder's* bucket, not the author's, and spent in place — `TokenBucket` is
+            // `Copy`, so metering a local copy of it would leave every call seeing a full bucket.
+            let bucket = &mut self.peers.entry(id.propagation_source).or_default().tx_bucket;
+            GossipOutcome::for_transaction(
+                &tx,
+                Some(bucket),
+                &mut self.refused,
+                &self.limiter,
+                self.verify_queue.len(),
+                Instant::now(),
+            )
+        };
+        if outcome != GossipOutcome::Verify {
+            self.report(id, outcome).await;
+            return Ok(());
+        }
+        // Everything the pool can answer for free, before a ~20 ms proof is scheduled for it. A
+        // duplicate or a conflict never reaches the queue.
+        if let Err(e) = self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref()) {
+            let a = admission::acceptance_for_pool(&e, tx.hash(), &mut self.refused);
+            self.report(id, GossipOutcome::Report(a)).await;
+            return Ok(());
+        }
+        self.verify_queue.push_back((tx, VerifySource::Gossip(id)));
+        self.pump_verify();
+        Ok(())
+    }
+
+    /// An RPC submission takes the same queue as a gossiped transaction, with the caller's oneshot
+    /// in place of a message id. Not metered: that port is the operator's own, and it is already
+    /// bounded by `rpc::RPC_MAX_BODY_BYTES`.
+    async fn submit_tx(&mut self, tx: Transaction, reply: oneshot::Sender<Result<Hash, MempoolError>>) {
+        let hash = tx.hash();
+        let outcome = GossipOutcome::for_transaction(
+            &tx,
+            None,
+            &mut self.refused,
+            &self.limiter,
+            self.verify_queue.len(),
+            Instant::now(),
+        );
+        if let GossipOutcome::Report(a) = outcome {
+            let _ = reply.send(Err(admission::rpc_refusal(a, &hash, &self.refused)));
+            return;
+        }
+        // A pre-screen refusal is the caller's answer directly, so every error message a submitter
+        // can hear is the one `Mempool::insert` always produced (`docs/rpc.md` quotes them). The
+        // acceptance is discarded here — only its caching side effect matters, so a resubmission of
+        // a permanently bad transaction is answered for free.
+        if let Err(e) = self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref()) {
+            let _ = admission::acceptance_for_pool(&e, hash, &mut self.refused);
+            let _ = reply.send(Err(e));
+            return;
+        }
+        self.verify_queue.push_back((tx, VerifySource::Rpc(reply)));
+        self.pump_verify();
     }
 
     async fn broadcast_status(&self) {
@@ -701,13 +888,7 @@ impl Node {
 
     async fn on_command(&mut self, cmd: NodeCommand) -> Result<()> {
         match cmd {
-            NodeCommand::SubmitTx { tx, reply } => {
-                let res = self.mempool.insert(tx.clone(), self.hs.tip_ledger(), self.executor.as_ref());
-                if res.is_ok() {
-                    self.net.broadcast(GossipMessage::Transaction(tx)).await;
-                }
-                let _ = reply.send(res);
-            }
+            NodeCommand::SubmitTx { tx, reply } => self.submit_tx(tx, reply).await,
             NodeCommand::Peers { reply } => {
                 let _ = reply.send(self.net.peers().await);
             }
@@ -781,12 +962,20 @@ impl Node {
                     self.maybe_sync().await;
                 }
             }
-            NetworkEvent::Gossip { from, msg } => match msg {
-                GossipMessage::Consensus(m) => self.on_consensus(m).await?,
-                GossipMessage::Transaction(tx) => {
-                    let _ = self.mempool.insert(tx, self.hs.tip_ledger(), self.executor.as_ref());
+            // Every arm here reports exactly once, and this is the whole list: a consensus or status
+            // message immediately, a transaction either immediately or on its verdict. An
+            // undecodable message never gets this far — the network task reports that one itself.
+            NetworkEvent::Gossip { from, msg, id } => match msg {
+                GossipMessage::Consensus(m) => {
+                    // Before handling, because a proposal's verification stays on this loop and the
+                    // report must not queue behind it. `GossipOutcome::for_consensus` is this
+                    // decision, spelled out and tested there.
+                    self.report(id, GossipOutcome::for_consensus()).await;
+                    self.on_consensus(m).await?
                 }
+                GossipMessage::Transaction(tx) => self.on_gossiped_tx(tx, id).await?,
                 GossipMessage::Status(s) => {
+                    self.report(id, GossipOutcome::for_consensus()).await;
                     let ahead = s.height > self.hs.committed_height() + 1;
                     self.peers.entry(from).or_default().status = Some(s);
                     if ahead && self.sync_inflight.is_none() {
@@ -1536,5 +1725,152 @@ mod tests {
     #[test]
     fn the_client_give_up_is_not_shorter_than_the_wire_timeout() {
         assert!(SYNC_GIVE_UP >= network::SYNC_REQUEST_TIMEOUT);
+    }
+
+    // ------------------------------------- gossip validation: one acceptance per delivery
+    //
+    // With `validate_messages()` on, gossipsub holds every delivered message until this node
+    // reports on it, and an unreported message is one this node silently stops forwarding for
+    // everyone. So the decision path has to name exactly one acceptance on every path, including
+    // the ones that never reach a proof.
+
+    /// A distinct shielded transfer per `tag`. Nothing here verifies a proof, so the bytes only
+    /// have to differ.
+    fn transfer(tag: u8) -> Transaction {
+        let n = tag as u32;
+        let bundle = shrugg_core::notes::Bundle {
+            anchor: [n; 8],
+            nullifiers: [[n + 10; 8], [n + 20; 8]],
+            commitments: [[n + 30; 8], [n + 40; 8]],
+            fee: 1,
+            burn: 0,
+            asset: 0,
+            time: 1,
+            envelopes: [crate::storage::fixtures::env(tag), crate::storage::fixtures::env(tag.wrapping_add(1))],
+            proof: vec![tag; 32],
+        };
+        Transaction::shielded(7, bundle, shrugg_core::Action::None)
+    }
+
+    #[test]
+    fn every_gossip_outcome_names_exactly_one_acceptance() {
+        use crate::admission::{Acceptance, GossipOutcome, PeerLimiter, RefusedCache, TokenBucket, MAX_VERIFY_QUEUE};
+        let mut refused = RefusedCache::new(4);
+        let limiter = PeerLimiter::new(1, 1.0);
+        // One forwarding peer's bucket, as it is held on `node::Peer::tx_bucket`.
+        let mut bucket = TokenBucket::default();
+        let t = Instant::now();
+        let tx = transfer(1);
+        refused.insert(tx.hash(), shrugg_core::TxError::BadDigest);
+
+        // A consensus or status message is accepted at once — this node does not validate them at
+        // the application level, exactly as before validate_messages() was turned on.
+        assert_eq!(GossipOutcome::for_consensus(), GossipOutcome::Report(Acceptance::Accept));
+        // A transaction already refused here is rejected without any verification.
+        assert_eq!(
+            GossipOutcome::for_transaction(&tx, Some(&mut bucket), &mut refused, &limiter, 0, t),
+            GossipOutcome::Report(Acceptance::Reject)
+        );
+        // A fresh one is queued (and the caller must report when the verdict lands).
+        let fresh = transfer(2);
+        assert_eq!(
+            GossipOutcome::for_transaction(&fresh, Some(&mut bucket), &mut refused, &limiter, 0, t),
+            GossipOutcome::Verify
+        );
+        // The same *forwarder's* next one is over the rate limit: ignored, not rejected — an honest
+        // peer in a burst must not be penalised.
+        assert_eq!(
+            GossipOutcome::for_transaction(&fresh, Some(&mut bucket), &mut refused, &limiter, 0, t),
+            GossipOutcome::Report(Acceptance::Ignore)
+        );
+        // A different forwarder has its own bucket, because it has its own `node::Peer`.
+        let mut other = TokenBucket::default();
+        assert_eq!(
+            GossipOutcome::for_transaction(&fresh, Some(&mut other), &mut refused, &limiter, 0, t),
+            GossipOutcome::Verify
+        );
+        // And a full queue sheds the same way (no bucket: this is the RPC path).
+        assert_eq!(
+            GossipOutcome::for_transaction(&fresh, None, &mut refused, &limiter, MAX_VERIFY_QUEUE, t),
+            GossipOutcome::Report(Acceptance::Ignore)
+        );
+        // The refused cache is consulted *before* the bucket, so a peer flooding one known-bad
+        // transaction never spends an allowance it could have used on a good one — and the queue
+        // depth last, so a full queue does not mask a free refusal.
+        assert_eq!(
+            GossipOutcome::for_transaction(&tx, Some(&mut TokenBucket::default()), &mut refused, &limiter, MAX_VERIFY_QUEUE, t),
+            GossipOutcome::Report(Acceptance::Reject)
+        );
+    }
+
+    /// A verdict decides the acceptance, and only a permanent one reaches the cache.
+    #[test]
+    fn a_verdict_reports_and_caches_by_permanence() {
+        use crate::admission::{acceptance_for, Acceptance, RefusedCache};
+        use shrugg_core::TxError;
+        let mut refused = RefusedCache::new(8);
+        assert_eq!(acceptance_for(&Ok(()), Hash::ZERO, &mut refused), Acceptance::Accept);
+        assert_eq!(refused.len(), 0);
+        assert_eq!(
+            acceptance_for(&Err(TxError::BadDigest), Hash::digest(b"a"), &mut refused),
+            Acceptance::Reject
+        );
+        assert_eq!(refused.len(), 1, "a bad digest is worth remembering");
+        assert_eq!(
+            acceptance_for(&Err(TxError::UnknownAnchor), Hash::digest(b"b"), &mut refused),
+            Acceptance::Ignore
+        );
+        assert_eq!(refused.len(), 1, "a stale anchor is not this transaction's fault");
+    }
+
+    /// The pre-screen's refusals map the same way, one level up: the pool's own answers are about
+    /// this node, and only a `TxError` about the bytes is cached and rejected.
+    #[test]
+    fn a_pre_screen_refusal_reports_by_whose_fault_it_is() {
+        use crate::admission::{acceptance_for_pool, Acceptance, RefusedCache};
+        use crate::mempool::MempoolError;
+        use shrugg_core::TxError;
+        let mut refused = RefusedCache::new(8);
+        let h = Hash::digest(b"x");
+        // A transaction we already hold, one that collides with a pending one, and a full pool are
+        // all statements about this node's pool — another node's may have room for it.
+        for e in [
+            MempoolError::Duplicate,
+            MempoolError::Conflict([1; 8]),
+            MempoolError::AttestationConflict(h),
+            MempoolError::Full,
+        ] {
+            assert_eq!(acceptance_for_pool(&e, h, &mut refused), Acceptance::Ignore, "{e}");
+        }
+        assert_eq!(refused.len(), 0, "nothing about the pool is worth caching");
+        // The pre-screen's own byte-level refusal: an attestation over the cap.
+        assert_eq!(
+            acceptance_for_pool(&MempoolError::Invalid(TxError::AttestationTooLarge), h, &mut refused),
+            Acceptance::Reject
+        );
+        assert_eq!(refused.len(), 1);
+        // And its state-level one, which is not.
+        assert_eq!(
+            acceptance_for_pool(&MempoolError::Invalid(TxError::Spent([2; 8])), Hash::digest(b"y"), &mut refused),
+            Acceptance::Ignore
+        );
+        assert_eq!(refused.len(), 1);
+    }
+
+    /// What an RPC submitter hears for a decision taken before any verification. The messages are
+    /// the ones `Mempool::insert` already produced, because `docs/rpc.md` quotes them.
+    #[test]
+    fn an_rpc_submission_refused_before_verification_keeps_the_pools_own_errors() {
+        use crate::admission::{rpc_refusal, Acceptance, RefusedCache};
+        use crate::mempool::MempoolError;
+        use shrugg_core::TxError;
+        let mut refused = RefusedCache::new(8);
+        let h = Hash::digest(b"z");
+        refused.insert(h, TxError::BadDigest);
+        // A `Reject` can only be the refused cache — the RPC path passes no bucket and a full
+        // queue is an `Ignore` — so the caller hears the verdict the ledger gave it the first time.
+        assert_eq!(rpc_refusal(Acceptance::Reject, &h, &refused), MempoolError::Invalid(TxError::BadDigest));
+        // A full verify queue is a "not now", which is what `Full` already says to a client.
+        assert_eq!(rpc_refusal(Acceptance::Ignore, &h, &refused), MempoolError::Full);
     }
 }

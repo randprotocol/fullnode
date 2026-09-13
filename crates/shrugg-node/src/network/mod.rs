@@ -11,6 +11,11 @@ pub mod wire;
 
 pub use wire::{GossipMessage, Status, SyncRequest, SyncResponse};
 
+/// Re-exported so the node can name a verdict without depending on libp2p directly. It derives
+/// `Debug` and nothing else — see `admission::Acceptance` for the comparable copy the decision path
+/// uses, which converts into this at the `NetworkHandle` boundary.
+pub use libp2p::gossipsub::MessageAcceptance;
+
 use behaviour::{ShruggBehaviour, ShruggEvent};
 use futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic, MessageAuthenticity, MessageId, ValidationMode};
@@ -145,12 +150,30 @@ pub struct PeerInfo {
     pub connected_secs: u64,
 }
 
+/// Everything `report_message_validation_result` needs, carried alongside every gossip event so
+/// the node loop can report after it has decided.
+///
+/// `propagation_source` is the peer that forwarded the message, which is not always
+/// `NetworkEvent::Gossip.from` (the author) — and it is also the peer the rate limit meters, for the
+/// same reason `node::Peer` distinguishes `connected` from having published a `Status`. The
+/// `message_id` is content-addressed (blake3 of the message bytes, see the `message_id_fn` in
+/// [`start`]), so two peers forwarding one transaction produce the same id and each delivery is
+/// reported against its own `(message_id, propagation_source)` pair.
+#[derive(Clone, Debug)]
+pub struct GossipId {
+    pub message_id: MessageId,
+    pub propagation_source: PeerId,
+}
+
 #[derive(Debug)]
 pub enum NetworkEvent {
     Listening(Multiaddr),
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
-    Gossip { from: PeerId, msg: GossipMessage },
+    /// One delivered gossip message. **Every one of these must be reported exactly once** with
+    /// [`NetworkHandle::report_validation`], on every path including the error paths: with
+    /// `validate_messages()` on, an unreported message is one this node silently stops forwarding.
+    Gossip { from: PeerId, msg: GossipMessage, id: GossipId },
     SyncRequest { peer: PeerId, request: SyncRequest, channel: ResponseChannel<SyncResponse> },
     SyncResponse { peer: PeerId, request_id: OutboundRequestId, response: SyncResponse },
     SyncFailed { peer: PeerId, request_id: OutboundRequestId, error: String },
@@ -163,6 +186,8 @@ pub enum NetworkCommand {
     SendSyncResponse { channel: ResponseChannel<SyncResponse>, response: SyncResponse },
     Dial(Multiaddr),
     Peers(oneshot::Sender<Vec<PeerInfo>>),
+    /// The application's verdict on one delivered gossip message (see [`GossipId`]).
+    ReportValidation { id: GossipId, acceptance: MessageAcceptance },
     Shutdown,
 }
 
@@ -185,6 +210,12 @@ impl NetworkHandle {
 
     pub async fn send_sync_response(&self, channel: ResponseChannel<SyncResponse>, response: SyncResponse) {
         let _ = self.cmd.send(NetworkCommand::SendSyncResponse { channel, response }).await;
+    }
+
+    /// Tell gossipsub what this node decided about one delivered message. A send, never a wait:
+    /// the swarm task does the reporting, so the consensus loop never blocks on it.
+    pub async fn report_validation(&self, id: GossipId, acceptance: MessageAcceptance) {
+        let _ = self.cmd.send(NetworkCommand::ReportValidation { id, acceptance }).await;
     }
 
     pub async fn dial(&self, addr: Multiaddr) {
@@ -247,6 +278,13 @@ pub async fn start(
         .validation_mode(ValidationMode::Permissive)
         .max_transmit_size(16 * 1024 * 1024)
         .message_id_fn(|m: &gossipsub::Message| MessageId::from(blake3::hash(&m.data).as_bytes().to_vec()))
+        // Application-level validation: this node forwards a transaction only after it has
+        // verified here, off the consensus loop. Local to this node — the wire is unchanged, so it
+        // rolls out onto a mixed fleet by ordinary restart. `ValidationMode` stays `Permissive`
+        // above: that one *is* on the wire, and a Strict/Permissive mix across the fleet drops
+        // messages. The cost of the switch is that every delivered message must be reported
+        // exactly once (see [`GossipId`]) or this node stops forwarding it.
+        .validate_messages()
         .build()
         .map_err(|e| anyhow::anyhow!("gossipsub config: {e}"))?;
     let gossipsub = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gossipsub_config)
@@ -299,6 +337,29 @@ pub async fn start(
     let (evt_tx, evt_rx) = mpsc::channel(4096);
     tokio::spawn(run(swarm, cfg, topics, cmd_rx, evt_tx));
     Ok((NetworkHandle { cmd: cmd_tx, local_peer_id }, evt_rx))
+}
+
+/// Hand one verdict to gossipsub. The only place that calls
+/// `report_message_validation_result`, so the "the message is gone" case is decided once.
+///
+/// `Ok(false)` means the message is no longer in gossipsub's cache, and it is an ordinary outcome
+/// rather than a failure or a missed report: the verdict was still made exactly once, gossipsub
+/// simply has nothing left to forward or to penalise. Three ways to reach it, all normal — a
+/// verification that outlived the cache window (`history_length` 5 × the 500 ms heartbeat, so
+/// 2.5 s), a second report of one id, and a topic this node has left in the meantime, because
+/// leaving a topic drops its pending validations. Logged at `debug` for that reason: a node
+/// shedding gossip while it catches up would otherwise fill the log with warnings about working
+/// normally.
+fn report_to_gossipsub(swarm: &mut Swarm<ShruggBehaviour>, id: &GossipId, acceptance: MessageAcceptance) {
+    match swarm.behaviour_mut().gossipsub.report_message_validation_result(
+        &id.message_id,
+        &id.propagation_source,
+        acceptance,
+    ) {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(?id, "validation reported for a message no longer in the cache"),
+        Err(e) => tracing::debug!(?id, "reporting validation failed: {e}"),
+    }
 }
 
 fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
@@ -435,6 +496,9 @@ async fn run(
                             .collect();
                         let _ = reply.send(list);
                     }
+                    NetworkCommand::ReportValidation { id, acceptance } => {
+                        report_to_gossipsub(&mut swarm, &id, acceptance);
+                    }
                     NetworkCommand::Shutdown => break,
                 }
             }
@@ -483,13 +547,29 @@ async fn handle_swarm_event(
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             tracing::debug!(?peer_id, "outgoing connection error: {error}");
         }
-        SwarmEvent::Behaviour(ShruggEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
+        SwarmEvent::Behaviour(ShruggEvent::Gossipsub(gossipsub::Event::Message {
+            propagation_source,
+            message,
+            message_id,
+        })) => {
             match bincode::deserialize::<GossipMessage>(&message.data) {
                 Ok(msg) => {
+                    // `from` falls back to `propagation_source` for a message that carries no
+                    // source, which is the only case where the two coincide by construction. The
+                    // rate limit still keys on `propagation_source`.
                     let from = message.source.unwrap_or(propagation_source);
-                    let _ = evt_tx.send(NetworkEvent::Gossip { from, msg }).await;
+                    let id = GossipId { message_id, propagation_source };
+                    let _ = evt_tx.send(NetworkEvent::Gossip { from, msg, id }).await;
                 }
-                Err(e) => tracing::debug!(%propagation_source, "undecodable gossip: {e}"),
+                Err(e) => {
+                    tracing::debug!(%propagation_source, "undecodable gossip: {e}");
+                    // Reported here rather than by the node loop, which never sees this message:
+                    // an unreported delivery sits in gossipsub's cache and this node stops
+                    // forwarding it for everyone. Reject rather than Ignore — bytes that are not a
+                    // `GossipMessage` at all are this peer's fault.
+                    let id = GossipId { message_id, propagation_source };
+                    report_to_gossipsub(swarm, &id, MessageAcceptance::Reject);
+                }
             }
         }
         SwarmEvent::Behaviour(ShruggEvent::Gossipsub(_)) => {}
@@ -650,6 +730,94 @@ mod tests {
         }
     }
 
+    /// Two nodes on loopback with an established connection, A reachable through B's bootstrap
+    /// list. Both event streams come back, because a dropped receiver silently discards the events
+    /// a test is about to wait for.
+    async fn two_connected_nodes(
+    ) -> (NetworkHandle, mpsc::Receiver<NetworkEvent>, NetworkHandle, mpsc::Receiver<NetworkEvent>) {
+        let cfg_a = NetworkConfig {
+            chain_id: 7,
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            bootstrap: vec![],
+            enable_mdns: false,
+        };
+        let (a, mut a_rx) = start(cfg_a, [3u8; 32]).await.unwrap();
+        let a_addr = wait_for(&mut a_rx, Duration::from_secs(5), |e| match e {
+            NetworkEvent::Listening(addr) => Some(addr),
+            _ => None,
+        })
+        .await
+        .expect("A listening");
+        let a_full = a_addr.with(libp2p::multiaddr::Protocol::P2p(a.local_peer_id));
+
+        let cfg_b = NetworkConfig {
+            chain_id: 7,
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            bootstrap: vec![a_full],
+            enable_mdns: false,
+        };
+        let (b, b_rx) = start(cfg_b, [4u8; 32]).await.unwrap();
+        let a_saw = wait_for(&mut a_rx, Duration::from_secs(10), |e| match e {
+            NetworkEvent::PeerConnected(p) if p == b.local_peer_id => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(a_saw.is_some(), "A never saw B connect");
+        (a, a_rx, b, b_rx)
+    }
+
+    /// Publish `status` from `b` until `a` receives it, because the gossip mesh takes a heartbeat
+    /// or two to form. Returns the author and the id the delivery must be reported against.
+    async fn gossip_status_to(
+        b: &NetworkHandle,
+        a_rx: &mut mpsc::Receiver<NetworkEvent>,
+        status: Status,
+    ) -> (PeerId, GossipId) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut received = None;
+        while received.is_none() && tokio::time::Instant::now() < deadline {
+            b.broadcast(GossipMessage::Status(status.clone())).await;
+            received = wait_for(a_rx, Duration::from_millis(300), |e| match e {
+                NetworkEvent::Gossip { from, msg: GossipMessage::Status(_), id } => Some((from, id)),
+                _ => None,
+            })
+            .await;
+        }
+        received.expect("A never received B's status")
+    }
+
+    /// With application-level validation on, gossipsub holds a message until the application
+    /// reports on it. A node that forgets to report stops forwarding — so this asserts the round
+    /// trip: B publishes, A receives with an id, A reports Accept, and A can then report again
+    /// without the swarm having lost the message.
+    #[tokio::test]
+    async fn a_gossiped_message_carries_the_id_its_validation_is_reported_with() {
+        let (a, mut a_rx, b, _b_rx) = two_connected_nodes().await;
+        let (from, id) =
+            gossip_status_to(&b, &mut a_rx, Status { height: 9, head_hash: Hash::digest(b"h"), view: 3 }).await;
+        assert_eq!(from, b.local_peer_id);
+        assert_eq!(id.propagation_source, b.local_peer_id, "one hop, so the forwarder is the author");
+        assert!(!id.message_id.0.is_empty());
+
+        let first_id = id.message_id.clone();
+        a.report_validation(id.clone(), MessageAcceptance::Accept).await;
+        // Reporting the same id again is the "no longer in the cache" path — `Ok(false)` from
+        // gossipsub, which must be a no-op and not a panic, because a verdict can also land after
+        // the 2.5 s mcache window or after the topic was left. The report is still made once per
+        // delivery; this second one is the test that a miss is survivable.
+        a.report_validation(id, MessageAcceptance::Ignore).await;
+
+        // The mesh still works afterwards: a second, different message arrives the same way, with
+        // its own content-addressed id.
+        let (_, next) =
+            gossip_status_to(&b, &mut a_rx, Status { height: 11, head_hash: Hash::digest(b"h2"), view: 4 }).await;
+        assert_ne!(next.message_id, first_id, "a different message is a different id");
+        a.report_validation(next, MessageAcceptance::Accept).await;
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
     #[tokio::test]
     async fn two_nodes_connect_gossip_and_sync() {
         let cfg_a = NetworkConfig {
@@ -695,7 +863,7 @@ mod tests {
         while received.is_none() && tokio::time::Instant::now() < deadline {
             b.broadcast(GossipMessage::Status(Status { height: 9, head_hash: Hash::digest(b"h"), view: 3 })).await;
             received = wait_for(&mut a_rx, Duration::from_millis(300), |e| match e {
-                NetworkEvent::Gossip { from, msg: GossipMessage::Status(s) } => Some((from, s)),
+                NetworkEvent::Gossip { from, msg: GossipMessage::Status(s), .. } => Some((from, s)),
                 _ => None,
             })
             .await;

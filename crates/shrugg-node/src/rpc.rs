@@ -73,6 +73,14 @@ pub struct NodeStatus {
     /// next upgrade is refused with a 503, which an operator would otherwise only see as clients
     /// that cannot connect for no visible reason.
     pub ws_clients: usize,
+    /// Transaction hashes this node refuses for free, because it has already verified them and the
+    /// refusal was about their bytes (`admission::REFUSED_CACHE_ENTRIES` is the cap). Rising fast
+    /// means someone is re-sending known-bad proofs — which now cost a hash lookup, not 20 ms.
+    pub refused_cache: usize,
+    /// Transactions waiting for a proof verification slot, against `admission::MAX_VERIFY_QUEUE`.
+    /// Normally 0: a queue that sits near the cap means this node is shedding gossiped
+    /// transactions, and it is unrelated to the sync counters above.
+    pub verify_queue: usize,
     pub mempool_size: usize,
     /// This node holds a validator key and is running as one (`--validator`).
     pub is_validator: bool,
