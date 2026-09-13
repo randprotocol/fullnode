@@ -14,8 +14,10 @@
 //! can collide over an output, so `Ledger::derived_commitment` answers for both and the pool
 //! claims what it answers.
 
+use shrugg_core::bridge::BridgeError;
 use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::ledger::bridge_notes;
+use shrugg_core::ledger::staking::StakingError;
 use shrugg_core::notes::{word8_from_bytes, word8_to_hex};
 use shrugg_core::{Action, Address, Hash, Ledger, Transaction, TxError, Word8};
 use std::collections::HashMap;
@@ -132,13 +134,35 @@ impl Mempool {
     ///
     /// Cheap admission decisions come first: `Ledger::validate` clones nothing but does verify
     /// the bundle's STARK, so a duplicate, a conflict or a full pool has to be answered before
-    /// paying that cost for every gossiped transaction.
+    /// paying that cost for every gossiped transaction. Those cheap decisions are [`Mempool::precheck`]
+    /// — the whole of this method except the one line that costs a verification.
     pub fn insert(
         &mut self,
         tx: Transaction,
         ledger: &Ledger,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Hash, MempoolError> {
+        let commitments = self.precheck(&tx, ledger, executor)?;
+        ledger.validate(&tx, executor).map_err(MempoolError::Invalid)?;
+        let claim = claimed_nonce(&tx.action);
+        Ok(self.admit(tx, commitments, claim))
+    }
+
+    /// Everything [`Mempool::insert`] decides without verifying a proof: pool conflicts, capacity,
+    /// and the state-dependent half of `Ledger::validate` (anchor, time, nullifiers, commitments,
+    /// attestation digests, the register nonce). Returns the commitments the transaction claims —
+    /// including the note the ledger would derive for a `Withdraw` **or a `BridgeAttest`**, which is
+    /// why the executor is a parameter — so the caller never recomputes either.
+    ///
+    /// Safe to run twice: once before a verification is scheduled, once against the tip it will
+    /// actually be pooled on. It takes `&self`, so a caller may ask before it holds the pool
+    /// mutably.
+    pub fn precheck(
+        &self,
+        tx: &Transaction,
+        ledger: &Ledger,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<Vec<Word8>, MempoolError> {
         let hash = tx.hash();
         if self.txs.contains_key(&hash) {
             return Err(MempoolError::Duplicate);
@@ -148,7 +172,7 @@ impl Mempool {
                 return Err(MempoolError::Conflict(nf));
             }
         }
-        let commitments = claimed_commitments(&tx, ledger, executor);
+        let commitments = claimed_commitments(tx, ledger, executor);
         for cm in &commitments {
             if self.commitments.contains_key(cm) {
                 return Err(MempoolError::Conflict(*cm));
@@ -168,8 +192,33 @@ impl Mempool {
         if self.txs.len() >= self.max_size {
             return Err(MempoolError::Full);
         }
-        ledger.validate(&tx, executor).map_err(MempoolError::Invalid)?;
+        Self::applies(tx, &commitments, claim, ledger).map_err(MempoolError::Invalid)?;
+        Ok(commitments)
+    }
 
+    /// Insert a transaction whose proof has already been verified. Re-runs [`Mempool::precheck`],
+    /// because the tip has moved since the verification was scheduled — a nullifier spent, a
+    /// commitment created or an anchor scrolled out in the meantime is caught here, on the state
+    /// the transaction is actually being pooled on.
+    ///
+    /// `Ledger::validate` stays the authority over everything else: this is only for a caller that
+    /// has just run it (off the consensus loop, against a tip of its own) and must not pay for it
+    /// twice.
+    pub fn insert_verified(
+        &mut self,
+        tx: Transaction,
+        ledger: &Ledger,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<Hash, MempoolError> {
+        let commitments = self.precheck(&tx, ledger, executor)?;
+        let claim = claimed_nonce(&tx.action);
+        Ok(self.admit(tx, commitments, claim))
+    }
+
+    /// Take ownership of `tx`'s claims and pool it. Every caller has already prechecked, so no
+    /// index entry here can collide with one that exists.
+    fn admit(&mut self, tx: Transaction, commitments: Vec<Word8>, claim: Option<(Address, u64)>) -> Hash {
+        let hash = tx.hash();
         for nf in tx.nullifiers() {
             self.nullifiers.insert(nf, hash);
         }
@@ -183,7 +232,7 @@ impl Mempool {
             self.digests.insert(mu, hash);
         }
         self.txs.insert(hash, Pooled { tx, commitments, claim });
-        Ok(hash)
+        hash
     }
 
     /// Transactions ready for inclusion on top of `ledger`, highest fee first and ties broken by
@@ -224,18 +273,30 @@ impl Mempool {
 
     /// The cheap half of `Ledger::validate` — everything that can go stale between insertion and
     /// the next block, and nothing that costs a proof verification.
-    fn still_applies(p: &Pooled, ledger: &Ledger) -> bool {
-        let tx = &p.tx;
+    ///
+    /// Shared by [`Mempool::precheck`], before a transaction is pooled, and
+    /// [`Mempool::still_applies`], after: the two ask the same question a block apart. It reports
+    /// the `TxError` each check stands for, because the pre-pool caller answers a submitter and the
+    /// post-pool one only needs a yes or no.
+    fn applies(
+        tx: &Transaction,
+        commitments: &[Word8],
+        claim: Option<(Address, u64)>,
+        ledger: &Ledger,
+    ) -> Result<(), TxError> {
         if let Some(b) = &tx.bundle {
-            if !ledger.is_anchor(&b.anchor) || !ledger.time_in_window(b.time) {
-                return false;
+            if !ledger.is_anchor(&b.anchor) {
+                return Err(TxError::UnknownAnchor);
+            }
+            if !ledger.time_in_window(b.time) {
+                return Err(TxError::TimeOutOfWindow { time: b.time, height: ledger.height() });
             }
         }
         // A bundle-less `Withdraw` (S2) carries a `time` of its own, under the same window rule —
         // so it goes stale here the same way a bundle does (`Ledger::time_in_window`).
         if let Action::Withdraw { time, .. } = &tx.action {
             if !ledger.time_in_window(*time) {
-                return false;
+                return Err(TxError::TimeOutOfWindow { time: *time, height: ledger.height() });
             }
         }
         // A `BridgeAttest`'s `time` (S3) goes stale by that same rule, and it is not the bundle's:
@@ -243,7 +304,7 @@ impl Mempool {
         // block it was offered to.
         if let Action::BridgeAttest { attestation, time, asset, .. } = &tx.action {
             if !ledger.time_in_window(*time) {
-                return false;
+                return Err(TxError::TimeOutOfWindow { time: *time, height: ledger.height() });
             }
             // And its `asset` goes stale the same way: a pooled first sighting names the index it
             // sealed an envelope for, and a *competing* first sighting committing in the meantime
@@ -251,8 +312,19 @@ impl Mempool {
             // (`TxError::AttestAssetMismatch`). Decoding the attestation costs no signature work,
             // and a rotation (which decodes to no transfer) binds no index.
             if let Some((id, _)) = bridge_notes::attested_transfer(attestation) {
-                if ledger.bridge().and_then(|b| b.deposit_index(&id)) != Some(*asset) {
-                    return false;
+                // No registry at all is no bridge, which is the bridge's own verdict rather than a
+                // mismatch — the error `Ledger::validate` gives it, so a caller that prechecks
+                // before validating hears the same thing either way. A pooled attest can only
+                // exist on a bridged chain, so this arm is unreachable from `still_applies`.
+                let Some(bridge) = ledger.bridge() else {
+                    return Err(TxError::Bridge(BridgeError::Disabled));
+                };
+                let expected = bridge.deposit_index(&id);
+                if expected != Some(*asset) {
+                    return Err(TxError::AttestAssetMismatch {
+                        expected: expected.unwrap_or(0),
+                        actual: *asset,
+                    });
                 }
             }
         }
@@ -261,16 +333,33 @@ impl Mempool {
         // has moved past the one this transaction signed over, it can never apply again (the
         // register does not rewind), so it has to leave here rather than sit in every pool
         // (and every proposal's trial-apply) until the node restarts.
-        if let Some((validator, nonce)) = p.claim {
-            if ledger.validators().get(&validator).map(|e| e.nonce) != Some(nonce) {
-                return false;
+        if let Some((validator, nonce)) = claim {
+            match ledger.validators().get(&validator).map(|e| e.nonce) {
+                Some(current) if current == nonce => {}
+                Some(current) => {
+                    return Err(TxError::Staking(StakingError::BadNonce { expected: current, actual: nonce }))
+                }
+                None => return Err(TxError::Staking(StakingError::UnknownValidator(validator))),
             }
+        }
+        let nullifiers = tx.nullifiers();
+        if let Some(nf) = nullifiers.iter().find(|nf| ledger.is_spent(nf)) {
+            return Err(TxError::Spent(*nf));
         }
         // The claims include a derived deposit, so a note someone else created in the meantime
         // takes the withdraw or the attest that would have created it out of the pool too.
-        !tx.nullifiers().iter().any(|nf| ledger.is_spent(nf))
-            && !p.commitments.iter().any(|cm| ledger.has_commitment(cm))
-            && !tx.bridge_digests().iter().any(|mu| ledger.is_digest_spent(mu))
+        if let Some(cm) = commitments.iter().find(|cm| ledger.has_commitment(cm)) {
+            return Err(TxError::CommitmentExists(*cm));
+        }
+        let digests = tx.bridge_digests();
+        if digests.iter().any(|mu| ledger.is_digest_spent(mu)) {
+            return Err(TxError::Bridge(BridgeError::Replay));
+        }
+        Ok(())
+    }
+
+    fn still_applies(p: &Pooled, ledger: &Ledger) -> bool {
+        Self::applies(&p.tx, &p.commitments, p.claim, ledger).is_ok()
     }
 
     /// Forget these transactions — called with a committed block's hashes.
@@ -522,6 +611,58 @@ mod tests {
         assert!(!scrolled.is_anchor(&far.bundle.as_ref().unwrap().anchor));
         m.prune(&scrolled);
         assert_eq!(m.len(), 0, "a transaction anchored outside the window survived");
+    }
+
+    /// The split the off-loop verification needs: `precheck` decides everything that does not cost
+    /// a proof verification, and `insert_verified` does the rest without paying for one. Together
+    /// they must accept and reject exactly what `insert` does.
+    #[test]
+    fn precheck_and_insert_verified_agree_with_insert() {
+        let gs = fixtures::genesis_with(1, vec![fixtures::alloc_note(20, 5 * shrugg_core::UNITS_PER_SHRUGG)]);
+        let ledger = gs.ledger.clone();
+        let tx = fixtures::bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fixtures::bundle_fee());
+
+        let mut a = Mempool::new(10);
+        let mut b = Mempool::new(10);
+        assert!(a.precheck(&tx, &ledger, &StubExecutor).is_ok());
+        let via_split = b.insert_verified(tx.clone(), &ledger, &StubExecutor).unwrap();
+        let via_insert = a.insert(tx.clone(), &ledger, &StubExecutor).unwrap();
+        assert_eq!(via_split, via_insert);
+        assert_eq!((a.len(), b.len()), (1, 1));
+
+        // A duplicate is refused by both halves, with the same error.
+        assert_eq!(b.precheck(&tx, &ledger, &StubExecutor).unwrap_err(), MempoolError::Duplicate);
+        assert_eq!(b.insert_verified(tx.clone(), &ledger, &StubExecutor).unwrap_err(), MempoolError::Duplicate);
+
+        // And a state change between the precheck and the insert is caught at the insert: this is
+        // the race the off-loop verification opens, and re-running precheck is what closes it.
+        let mut moved = ledger.clone();
+        let rival = fixtures::bundle_tx(&ledger, [[1; 8], [9; 8]], [[7; 8], [8; 8]], fixtures::bundle_fee());
+        moved.apply_tx(&rival, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        assert!(moved.is_spent(&[1; 8]), "the rival spent the note this transaction spends");
+        let mut c = Mempool::new(10);
+        assert!(c.precheck(&tx, &ledger, &StubExecutor).is_ok(), "fine against the tip it was scheduled on");
+        assert_eq!(
+            c.insert_verified(tx, &moved, &StubExecutor).unwrap_err(),
+            MempoolError::Invalid(TxError::Spent([1; 8])),
+            "and refused against the tip it would be pooled on"
+        );
+        assert_eq!(c.len(), 0, "and it left no trace in the conflict indexes");
+    }
+
+    /// `precheck` must refuse a stale anchor without ever reaching a proof — that is the whole
+    /// point of the split.
+    #[test]
+    fn precheck_refuses_a_stale_anchor_before_any_proof_work() {
+        let gs = fixtures::genesis_with(1, vec![fixtures::alloc_note(20, 5 * shrugg_core::UNITS_PER_SHRUGG)]);
+        let ledger = gs.ledger.clone();
+        let mut tx = fixtures::bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fixtures::bundle_fee());
+        tx.bundle.as_mut().unwrap().anchor = [0xdead; 8];
+        let pool = Mempool::new(10);
+        assert_eq!(
+            pool.precheck(&tx, &ledger, &StubExecutor).unwrap_err(),
+            MempoolError::Invalid(TxError::UnknownAnchor)
+        );
     }
 
     #[test]
