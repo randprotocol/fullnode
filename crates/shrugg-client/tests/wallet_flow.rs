@@ -27,7 +27,7 @@
 //! `cargo test` against the same target directory — is ever in flight beside it. The slow blocks
 //! are what covers a slow machine; the slot is what covers a busy one.
 
-use shrugg_client::wallet::{self, NoteStore, Wallet};
+use shrugg_client::wallet::{self, Burn, NoteStore, Wallet};
 use shrugg_client::RpcClient;
 use shrugg_core::genesis::{Genesis, GenesisValidator};
 use shrugg_core::notes::word8_to_hex;
@@ -181,12 +181,12 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     let action = shrugg_core::Action::Bond { validator, amount: bond, registration: None };
     let slot = proving_slot().await;
     let bonded =
-        wallet::submit(&rpc, &a, &mut a_store, None, action, fee, bond, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::submit(&rpc, &a, &mut a_store, None, action, fee, Burn::Shrugg(bond), FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
             .await
             .expect("the bond's bundle is accepted and commits");
     drop(slot);
     eprintln!("bond bundle: tier {}, proved in {:.1?}", bonded.tier, bonded.proving);
-    assert_eq!(bonded.burn, bond, "the bundle burns exactly what is bonded");
+    assert_eq!(bonded.burn, Burn::Shrugg(bond), "the bundle burns exactly what is bonded, in SHRUGG");
     assert_eq!(bonded.amount, 0, "a bond pays nobody a note");
     assert_eq!(
         stake_of(&rpc, &validator.to_base58()).await,
@@ -203,7 +203,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     let deploy = Action::Deploy { base_pc: prog.base_pc, words: prog.words.clone() };
     let fee = wallet::deploy_fee_default(&deploy);
     let slot = proving_slot().await;
-    wallet::submit(&rpc, &a, &mut a_store, None, deploy, fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    wallet::submit(&rpc, &a, &mut a_store, None, deploy, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the program deploys");
     drop(slot);
@@ -225,7 +225,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
         None,
         action,
         wallet::call_fee_default(tier),
-        0,
+        Burn::None,
         FriProfile::Test,
         Backend::Cpu,
         CHAIN_ID,

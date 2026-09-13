@@ -18,7 +18,7 @@ use serde_json::Value;
 use shrugg_core::bridge::{AssetId, Attestation, Payload};
 use shrugg_core::ledger::{bridge_notes, TIME_WINDOW};
 use shrugg_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, DEPTH};
-use shrugg_core::{gas, Action, Hash, Transaction};
+use shrugg_core::{format_amount, gas, Action, Hash, Transaction};
 use shrugg_zkvm::address::{address_of, envelope_from_core, seal_note};
 use shrugg_zkvm::executor::prove_bundle;
 use shrugg_zkvm::machine::{Backend, FriProfile};
@@ -619,6 +619,47 @@ fn bundle_need(amount: u64, fee: u64, burn: u64) -> Result<u64> {
         .ok_or_else(|| anyhow!("amount + fee + burn overflows"))
 }
 
+/// What a bundle took out of the shielded pool, in the unit it is measured in.
+///
+/// The two burns this chain has are denominated differently: a `Bond` burns its stake in SHRUGG,
+/// and a `BridgeBurn`'s asset bundle burns its amount in the units of a bridged asset, which owe
+/// nothing to SHRUGG's nine decimals. As one `u64` the field was two values in a trench coat,
+/// disambiguated by [`Submission::asset`] and read correctly only by a caller that remembered to
+/// look — which is why the printer used to gate it (`asset == 0 && burn > 0`). Spelled as a sum
+/// type there is nothing to remember and no gate to forget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Burn {
+    /// Nothing left the pool: every action except a bond and a bridge burn.
+    #[default]
+    None,
+    /// A `Bond`'s stake, in SHRUGG units — the one burn a transaction's own bundle can carry.
+    Shrugg(u64),
+    /// A `BridgeBurn`'s amount, in the units of the bridged asset at registry index `index` (the
+    /// same index as [`Submission::asset`]; carried here too so a burn describes itself).
+    Asset { index: u32, amount: u64 },
+}
+
+impl Burn {
+    /// `amount` SHRUGG out of the pool, or [`Burn::None`] when it is zero: burning nothing and
+    /// burning zero are the same event, and a printer should not have to decide which.
+    pub fn shrugg(amount: u64) -> Burn {
+        if amount == 0 {
+            Burn::None
+        } else {
+            Burn::Shrugg(amount)
+        }
+    }
+
+    /// The `burn` word a bundle carries for this, in that bundle's own asset: zero when nothing
+    /// is burned.
+    pub fn units(self) -> u64 {
+        match self {
+            Burn::None => 0,
+            Burn::Shrugg(amount) | Burn::Asset { amount, .. } => amount,
+        }
+    }
+}
+
 /// What a submitted transaction did, for the caller to print.
 ///
 /// A `BridgeBurn` carries two bundles, and its figures are the *asset* bundle's: `amount` is what
@@ -631,14 +672,43 @@ pub struct Submission {
     pub amount: u64,
     pub change: u64,
     pub fee: u64,
-    /// What the bundle burned out of the pool: a `Bond`'s stake in SHRUGG, a `BridgeBurn`'s
-    /// `amount` in `asset`'s units, otherwise zero.
-    pub burn: u64,
+    /// What the bundle burned out of the pool, and in which unit (see [`Burn`]).
+    pub burn: Burn,
     pub time: u32,
     pub asset: u32,
     pub tier: u8,
     pub proof_bytes: usize,
     pub proving: Duration,
+}
+
+impl Submission {
+    /// The two lines `shrugg` prints when a submission comes back, `what` naming the action
+    /// ("transfer", "bond", "bridge burn"): the transaction hash, then what moved.
+    ///
+    /// Here rather than in `main` so that the one line a user reads after paying for a proof is
+    /// covered by a test.
+    pub fn summary(&self, what: &str) -> String {
+        // A bridge burn's figures are its asset bundle's, in that asset's own units; everything
+        // else moves SHRUGG. The fee is always SHRUGG.
+        let (out, change) = if self.asset == 0 {
+            (format!("{} SHRUGG", format_amount(self.amount)), format!("{} SHRUGG", format_amount(self.change)))
+        } else {
+            (format!("{} of asset {}", self.amount, self.asset), format!("{} of asset {}", self.change, self.asset))
+        };
+        // What left the pool without becoming anybody's note. A bond's stake is SHRUGG and says
+        // so. A bridge burn's is the `out` figure above — the same number in the same units,
+        // already printed — and repeating it would only raise the question of why two lines agree.
+        let burned = match self.burn {
+            Burn::None | Burn::Asset { .. } => String::new(),
+            Burn::Shrugg(amount) => format!("{} SHRUGG burned, ", format_amount(amount)),
+        };
+        format!(
+            "submitted {what} {}\n  {out} out, {burned}{change} change, fee {} SHRUGG, anchored at height {}",
+            self.hash,
+            format_amount(self.fee),
+            self.time,
+        )
+    }
 }
 
 /// One bundle of a transaction as the wallet plans it, before any witness or proof: the notes it
@@ -863,8 +933,8 @@ async fn settle(
 ///
 /// `burn` is what the bundle takes out of the shielded pool, which a `Bond` must set to the staked
 /// amount (`Ledger::validate_inner` rejects a bond whose bundle burns anything else) and every
-/// other action leaves at zero. A burn of a *bridged* asset is not this path — it needs a second
-/// bundle, so it goes through [`submit_burn`].
+/// other action leaves at [`Burn::None`]. A burn of a *bridged* asset is not this path — it needs
+/// a second bundle, so [`Burn::Asset`] is an error here and goes through [`submit_burn`].
 #[allow(clippy::too_many_arguments)]
 pub async fn submit(
     rpc: &RpcClient,
@@ -873,16 +943,27 @@ pub async fn submit(
     to: Option<(&ShieldedAddress, u64)>,
     action: Action,
     fee: u64,
-    burn: u64,
+    burn: Burn,
     profile: FriProfile,
     backend: Backend,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
+    // The transaction's own bundle is always SHRUGG, so this path can burn only SHRUGG. Answered
+    // before the chain is asked anything: a caller holding notes of a bridged asset is one
+    // function away from what it meant, and a proof away from finding out the hard way.
+    let burn = match burn {
+        Burn::Shrugg(amount) => Burn::shrugg(amount),
+        Burn::None => Burn::None,
+        Burn::Asset { index, amount } => {
+            return Err(anyhow!(
+                "burning {amount} of asset {index} takes an asset bundle of its own: that is `submit_burn`, not `submit`"
+            ))
+        }
+    };
     scan(rpc, w, store).await?;
     let (dest, amount) = to.unwrap_or((&w.address, 0));
-    // The transaction's own bundle is always SHRUGG; it burns only for a `Bond`.
-    let plans = [Plan::select(store, 0, dest, amount, fee, burn)?];
+    let plans = [Plan::select(store, 0, dest, amount, fee, burn.units())?];
     let (proved, time) = prove_bundles(rpc, w, &plans, profile, backend).await?;
     let [one] = <[Proved; 1]>::try_from(proved).ok().expect("one plan, one proof");
 
@@ -1000,8 +1081,8 @@ pub async fn submit_burn(
         change: plans[0].change(),
         fee,
         // The asset bundle's own burn word, which for a bridge burn *is* `amount` — the reporter
-        // prints it as the `out` figure rather than twice (`main::report`).
-        burn: amount,
+        // prints it as the `out` figure rather than twice (`Submission::summary`).
+        burn: Burn::Asset { index: asset, amount },
         time,
         asset,
         tier: asset_proof.tier.max(fee_proof.tier),
@@ -1196,7 +1277,7 @@ pub async fn send(
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    submit(rpc, w, store, Some((to, amount)), Action::None, fee, 0, profile, backend, chain_id, wait).await
+    submit(rpc, w, store, Some((to, amount)), Action::None, fee, Burn::None, profile, backend, chain_id, wait).await
 }
 
 #[cfg(test)]
@@ -1343,6 +1424,71 @@ mod tests {
         assert!(e.contains("registry is empty"), "{e}");
         // And a reply with no registry at all is an error, not an empty registry.
         assert!(burn_is_possible(&serde_json::json!({ "enabled": true }), 1).is_err());
+    }
+
+    /// One submission per shape of [`Burn`], as `shrugg` prints it. This is the line a user reads
+    /// after paying for a proof, and the burn is the part of it that used to depend on the reader
+    /// knowing which unit a `u64` was in: a bond's stake is SHRUGG and is named as such; a bridge
+    /// burn's is the `out` figure already printed, in asset units, so the line says it once; every
+    /// other action burns nothing and says nothing.
+    #[test]
+    fn the_summary_line_names_a_burn_in_its_own_units() {
+        let submission = |burn: Burn, asset: u32, amount: u64, change: u64| Submission {
+            hash: Hash([0xab; 32]),
+            amount,
+            change,
+            fee: gas::BUNDLE_BASE,
+            burn,
+            time: 42,
+            asset,
+            tier: 14,
+            proof_bytes: 1 << 20,
+            proving: Duration::from_secs(98),
+        };
+
+        // A transfer: nothing burned, nothing said about burning.
+        let unit = shrugg_core::UNITS_PER_SHRUGG;
+        let transfer = submission(Burn::None, 0, unit, 3 * unit);
+        assert_eq!(
+            transfer.summary("transfer"),
+            format!(
+                "submitted transfer {}\n  1 SHRUGG out, 3 SHRUGG change, fee 0.001 SHRUGG, anchored at height 42",
+                Hash([0xab; 32])
+            )
+        );
+
+        // A bond: the stake left the pool, in SHRUGG, and the payment output is zero because a
+        // bond pays nobody a note.
+        let bond = submission(Burn::Shrugg(1_000 * unit), 0, 0, 2 * unit);
+        assert!(
+            bond.summary("bond").ends_with(
+                "0 SHRUGG out, 1000 SHRUGG burned, 2 SHRUGG change, fee 0.001 SHRUGG, anchored at height 42"
+            ),
+            "{}",
+            bond.summary("bond")
+        );
+
+        // A bridge burn: asset units throughout, and the burn is the `out` figure — said once.
+        let burn = submission(Burn::Asset { index: 3, amount: 2_000 }, 3, 2_000, 3_000);
+        assert!(
+            burn.summary("bridge burn")
+                .ends_with("2000 of asset 3 out, 3000 of asset 3 change, fee 0.001 SHRUGG, anchored at height 42"),
+            "{}",
+            burn.summary("bridge burn")
+        );
+        assert!(!burn.summary("bridge burn").contains("burned"), "an asset burn is not printed twice");
+    }
+
+    /// `Burn` answers the two questions the old `u64` beside an `asset` index could not: how many
+    /// units the bundle's `burn` word carries, and whether a zero is a burn at all.
+    #[test]
+    fn a_burn_of_nothing_is_none() {
+        assert_eq!(Burn::shrugg(0), Burn::None);
+        assert_eq!(Burn::shrugg(7), Burn::Shrugg(7));
+        assert_eq!(Burn::default(), Burn::None);
+        assert_eq!(Burn::None.units(), 0);
+        assert_eq!(Burn::Shrugg(7).units(), 7);
+        assert_eq!(Burn::Asset { index: 2, amount: 9 }.units(), 9);
     }
 
     /// A bond pays its stake by *burning* it, not by sending it: the bundle's only output is the

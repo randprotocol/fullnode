@@ -18,7 +18,7 @@
 //! trial-decrypts, exactly as `shrugg balance` does. A node that served the scan cannot answer
 //! the same question itself.
 
-use shrugg_client::wallet::{self, NoteStore, Wallet};
+use shrugg_client::wallet::{self, Burn, NoteStore, Wallet};
 use shrugg_client::RpcClient;
 use shrugg_core::bridge::{
     digest, guardian_address, sign_digest, Attestation, Body, BridgeConfig, Payload, Transfer, CHAIN_RAND,
@@ -873,7 +873,7 @@ async fn confidential_call_rides_on_a_bundle() {
     assert_eq!(deploy_fee, gas::BUNDLE_BASE + gas::deploy_fee(program.words.len()));
     let slot = proving_slot().await;
     let deployed =
-        wallet::submit(&n0.rpc, &a, &mut store, None, action, deploy_fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::submit(&n0.rpc, &a, &mut store, None, action, deploy_fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
             .await
             .expect("the deploy bundle commits");
     drop(slot);
@@ -902,7 +902,7 @@ async fn confidential_call_rides_on_a_bundle() {
         None,
         Action::Call { program: id, proof, input_envelope: None },
         call_fee,
-        0,
+        Burn::None,
         FriProfile::Test,
         Backend::Cpu,
         CHAIN_ID,
@@ -1042,12 +1042,12 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     let mut store = NoteStore::default();
     let slot = proving_slot().await;
     let bonded =
-        wallet::submit(&n0.rpc, &bonder, &mut store, None, action, fee, MIN_STAKE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::submit(&n0.rpc, &bonder, &mut store, None, action, fee, Burn::Shrugg(MIN_STAKE), FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
             .await
             .expect("the bond's bundle is accepted and commits");
     drop(slot);
     eprintln!("bond: tier {}, proved in {:.1?}, {} proof bytes", bonded.tier, bonded.proving, bonded.proof_bytes);
-    assert_eq!(bonded.burn, MIN_STAKE, "the bundle burns exactly what is bonded");
+    assert_eq!(bonded.burn, Burn::Shrugg(MIN_STAKE), "the bundle burns exactly what is bonded, in SHRUGG");
     assert_eq!(bonded.amount, 0, "a bond pays nobody a note");
 
     // The register has the entry at once, with the payout address the validator itself signed for.
@@ -1270,7 +1270,7 @@ async fn bridge_mint(
         Action::BridgeAttest { attestation, recipient: to.clone(), r: note.r, time, asset: index, envelope };
     let fee = gas::fee_floor(&action);
     let slot = proving_slot().await;
-    let s = wallet::submit(&node.rpc, relayer, store, None, action, fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let s = wallet::submit(&node.rpc, relayer, store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the attestation's fee bundle commits");
     drop(slot);
@@ -1459,7 +1459,7 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
     let deploy = Action::Deploy { base_pc: program.base_pc, words: program.words.clone() };
     let deploy_fee = wallet::deploy_fee_default(&deploy);
     let slot = proving_slot().await;
-    wallet::submit(&n0.rpc, &caller, &mut store, None, deploy, deploy_fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    wallet::submit(&n0.rpc, &caller, &mut store, None, deploy, deploy_fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the deploy bundle commits");
     drop(slot);
@@ -1481,7 +1481,7 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
         None,
         Action::Call { program: id, proof, input_envelope: Some(sealed.clone()) },
         wallet::call_fee_default(tier),
-        0,
+        Burn::None,
         FriProfile::Test,
         Backend::Cpu,
         CHAIN_ID,

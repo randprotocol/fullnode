@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use shrugg_client::wallet::{self, NoteStore, Wallet};
 use shrugg_client::RpcClient;
-use shrugg_client::wallet::Submission;
+use shrugg_client::wallet::{Burn, Submission};
 use shrugg_core::ledger::staking::MIN_STAKE;
 use shrugg_core::notes::ShieldedAddress;
 use shrugg_core::types::actions::Registration;
@@ -310,24 +310,10 @@ fn backend_for(cuda: bool) -> Result<Backend> {
     }
 }
 
+/// The summary line, printed. The wording lives in [`Submission::summary`], where a test can read
+/// it back.
 fn report(s: &Submission, what: &str) {
-    // A bridge burn's figures are its asset bundle's, in that asset's own units; everything else
-    // moves SHRUGG. The fee is always SHRUGG.
-    let (out, change) = if s.asset == 0 {
-        (format!("{} SHRUGG", format_amount(s.amount)), format!("{} SHRUGG", format_amount(s.change)))
-    } else {
-        (format!("{} of asset {}", s.amount, s.asset), format!("{} of asset {}", s.change, s.asset))
-    };
-    // On a SHRUGG bundle a burn is a bond's stake leaving the pool; every other action leaves it
-    // zero, and saying "0 SHRUGG burned" on a transfer would only invite the question. A bridge
-    // burn's burn word *is* its `amount`, already printed as `out`.
-    let burned = if s.asset == 0 && s.burn > 0 { format!("{} SHRUGG burned, ", format_amount(s.burn)) } else { String::new() };
-    println!(
-        "submitted {what} {}\n  {out} out, {burned}{change} change, fee {} SHRUGG, anchored at height {}",
-        s.hash,
-        format_amount(s.fee),
-        s.time,
-    );
+    println!("{}", s.summary(what));
 }
 
 /// Decode a `Registration` as `shrugg-node register` prints it: its bincode form as hex.
@@ -548,9 +534,12 @@ async fn main() -> Result<()> {
             };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            // `burn = amount`: the stake leaves the shielded pool instead of becoming a note, and
-            // the ledger admits a bond only when the two are equal.
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, amount, profile, backend_for(cuda)?, chain_id, !no_wait).await;
+            // `Burn::shrugg(amount)`: the stake leaves the shielded pool instead of becoming a
+            // note, and the ledger admits a bond only when the bundle burns exactly what is
+            // bonded. The unit is SHRUGG, which is now in the type rather than in this comment.
+            let s =
+                wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::shrugg(amount), profile, backend_for(cuda)?, chain_id, !no_wait)
+                    .await;
             store.save(&path)?;
             report(&s?, "bond");
             if !no_wait {
@@ -594,7 +583,7 @@ async fn main() -> Result<()> {
             let fee = wallet::deploy_fee_default(&action);
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, 0, profile, backend_for(cuda)?, chain_id, true).await;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, true).await;
             store.save(&path)?;
             report(&s?, "deploy");
             println!("program id: {id} ({} words)", p.words.len());
@@ -642,7 +631,7 @@ async fn main() -> Result<()> {
                 Some(f) => parse_amount(&f)?,
                 None => wallet::call_fee_default(tier),
             };
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, 0, profile, backend, chain_id, true).await;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend, chain_id, true).await;
             store.save(&path)?;
             let s = s?;
             report(&s, "call");
@@ -765,7 +754,7 @@ async fn main() -> Result<()> {
             };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, 0, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
