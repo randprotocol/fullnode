@@ -162,6 +162,52 @@ shrugg-node run --datadir data-c-8c742fc9 --key deploy/node-c.key.json --validat
     --block-interval-ms 1000 --bootstrap /ip4/<ip>/tcp/30303/p2p/<peer id>
 ```
 
+### The droplet unit change, exactly as applied (2026-09-13 rollout)
+
+Every droplet already had a `shrugg-node` systemd unit pointing at its chain-7 data dir. The only
+edit the unit needed was the data-dir name — the key path, listen address, `--rpc 127.0.0.1:8545`,
+`--no-mdns` and both `--bootstrap` multiaddrs stay exactly as they were, because the peer ids did
+not change with the genesis:
+
+```bash
+# 1. new data dir, from the chain-8 genesis (must print 8c742fc9…, chain id 8)
+systemctl stop shrugg-node
+shrugg-node init --datadir /root/data-$(hostname)-8c742fc9 \
+    --genesis /root/fullnode/deploy/genesis-chain8.json
+
+# 2. repoint the unit: the datadir suffix, and nothing else
+cp -a /etc/systemd/system/shrugg-node.service /root/shrugg-node.service.chain7.bak
+sed -i 's/-55668ebf/-8c742fc9/g' /etc/systemd/system/shrugg-node.service
+
+# 3. restart
+systemctl daemon-reload && systemctl restart shrugg-node
+shrugg status          # chain id 8 via shrugg_chainId, height climbing, peer_count → 15–16
+```
+
+`-55668ebf` occurs exactly once per unit (in `--datadir`), so the `sed` is safe as written; the
+chain-7 backup of each unit is left at `/root/shrugg-node.service.chain7.bak`. Data dirs are keyed
+on the genesis hash, so `/root/data-<hostname>-55668ebf` survives untouched next to the new one.
+
+Two things worth knowing before the next cut-over:
+
+- **Swap the binary and chain 7 stops there and then.** Build `03c9fb9` cannot open a chain-7 data
+  dir at all: it needs a `payout` on every validator in the stored genesis, and chain 7's genesis has
+  none, so the node exits with ``json: missing field `payout` `` and `Restart=always` turns that into
+  a crash loop. Distributing the binaries *is* the cut-over — do it immediately before the init, not
+  as a separate earlier step, and expect no graceful overlap between the two chains.
+- **Distribute through E, not from the laptop.** 36 MB per node over a home uplink is minutes each;
+  copying to E once and fanning out droplet-to-droplet (`ssh -A` from the laptop, so E uses the
+  forwarded agent and never holds a private key) moves all 15 in well under a minute.
+
+#### What the rollout actually did
+
+The 16 droplets went to chain 8 in this order — the 12 regional validators in batches of four, then
+F, C, D, and E last because it also serves the explorer. **The 13th node (F) came up at
+07:10:55Z and block 1 committed at 07:10:58.438Z**, 3.4 s later: quorum is 13 of 18 and the 16
+droplets alone carry it, so the chain started without waiting for A or B. Nothing on E's explorer
+(`/root/randscan`, `/etc/randscan`, `/etc/caddy`, `randscan-*`) was touched, and E's RPC stayed on
+`127.0.0.1:8545`.
+
 Keep `--block-interval-ms` at 1000 (the default) or slower. A bundle proof takes ~100 s and its
 anchor is valid for 256 blocks, so a faster chain rejects honest transfers whose anchor expired
 mid-proof (`docs/shielded.md` §5); at 1000 ms the anchor window is ~256 s, which holds. The
@@ -231,5 +277,7 @@ computation on constraint set 2 and ended at 31 952 blocks; chain 5 (2026-09-11)
 set 4; chain 6 was the first shielded genesis (phase S1: the note ledger, bundles, the shielded
 wallet — an account balance stopped existing); chain 7 (build `01dc23d`) added S3's bridge-as-notes
 and call envelopes with 18 validators at 100 000 SHRUGG each, genesis
-`55668ebfe1cb842c48bf67fe58bb9e97d344be1e07f8f36b35eb8b405aef8c1f`, and is what the fleet is
-running until this cut-over. Its genesis file is kept here as `deploy/genesis-chain7.json`.
+`55668ebfe1cb842c48bf67fe58bb9e97d344be1e07f8f36b35eb8b405aef8c1f`, and ran to height ~12 620,
+where it stopped when the fleet moved to chain 8 on 2026-09-13. Its genesis file is kept here as
+`deploy/genesis-chain7.json` and every node still has its `data-*-55668ebf` directory, but build
+`03c9fb9` cannot open one — replaying chain 7 needs a `01dc23d` binary.
