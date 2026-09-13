@@ -19,9 +19,10 @@ use shrugg_zkvm::viewing::TxKey;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 const SYNC_BATCH: u32 = 100;
 
@@ -200,6 +201,12 @@ struct Node {
     mempool: Mempool,
     net: NetworkHandle,
     status: Arc<RwLock<NodeStatus>>,
+    /// Committed heads, for whatever WebSocket clients are subscribed. Held here rather than read
+    /// back out of the `RpcState` because this is the only place that writes it.
+    heads: broadcast::Sender<rpc::HeadSummary>,
+    /// The live WebSocket connection count `ws::upgrade` maintains; reported as
+    /// `NodeStatus::ws_clients`.
+    ws_conns: Arc<AtomicUsize>,
     peers: HashMap<PeerId, Peer>,
     timeout: Option<(u64, Instant)>,
     propose_at: Option<(u64, Instant)>,
@@ -387,6 +394,10 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         ..Default::default()
     }));
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
+    // The receiver is dropped: every subscriber makes its own at upgrade, and a channel with no
+    // receiver simply drops what is sent, which is the normal case for a node nobody watches.
+    let (heads, _) = broadcast::channel(rpc::HEAD_CHANNEL);
+    let ws_conns = Arc::new(AtomicUsize::new(0));
     let (rpc_addr, rpc_task) = rpc::serve(
         cfg.rpc_addr,
         RpcState {
@@ -395,6 +406,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             node: cmd_tx,
             chain_id: gs.chain_id,
             executor: executor.clone(),
+            heads: heads.clone(),
+            ws_conns: ws_conns.clone(),
         },
     )
     .await?;
@@ -434,6 +447,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         mempool: Mempool::new(10_000),
         net: net.clone(),
         status: status.clone(),
+        heads,
+        ws_conns,
         peers: HashMap::new(),
         timeout: None,
         propose_at: None,
@@ -542,6 +557,7 @@ impl Node {
         s.sync_inflight_age_ms = self.sync_inflight.map(|(_, _, at)| at.elapsed().as_millis() as u64);
         s.sync_failures = self.sync_failures;
         s.sync_late_batches = self.sync_late_batches;
+        s.ws_clients = self.ws_conns.load(SeqCst);
     }
 
     async fn broadcast_status(&self) {
@@ -629,9 +645,32 @@ impl Node {
             );
         }
         self.mempool.prune(self.hs.tip_ledger());
+        self.publish_heads(&blocks);
         self.warm_new_programs(&blocks);
         self.fetch_attempts.clear();
         Ok(())
+    }
+
+    /// One `newHeads` notification per committed block, in order — a light wallet tracking heads
+    /// must not silently skip heights, so a commit of three blocks is three notifications and not
+    /// one for the tip. `send` fails only when nobody is subscribed, which is the normal case.
+    ///
+    /// Called after `storage.commit` has returned, on both paths a block becomes committed by: a
+    /// subscriber must never be told about a head this node could still lose. On the sync path
+    /// that is before the replica is resumed, so a batch's heads go out in their own order and
+    /// never behind a head the restarted replica commits.
+    ///
+    /// `view` is the *block's* view, which is what certified it. `shrugg_getHead` reports the
+    /// node's current view instead — the same field, and for the tip usually the same number, but
+    /// a notification is a statement about one block rather than about this node's clock.
+    fn publish_heads(&self, blocks: &[CommittedBlock]) {
+        for cb in blocks {
+            let _ = self.heads.send(rpc::HeadSummary {
+                height: cb.block.height(),
+                hash: cb.block.hash().to_hex(),
+                view: cb.block.view(),
+            });
+        }
     }
 
     /// Precompute verifier keys for programs deployed in `blocks`, off the node loop.
@@ -1097,6 +1136,7 @@ impl Node {
             let included: Vec<Hash> = cb.block.transactions.iter().map(|tx| tx.hash()).collect();
             self.mempool.remove(&included);
         }
+        self.publish_heads(&accepted);
         let head = accepted.last().expect("non-empty");
         let mut ccfg = ConsensusConfig::new(self.gs.chain_id, self.gs.validators.clone(), self.gs.hash());
         ccfg.epoch_blocks = self.gs.epoch_blocks;

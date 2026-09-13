@@ -69,6 +69,10 @@ pub struct NodeStatus {
     /// Peers this node holds an open connection to — the ones sync can actually ask for blocks. A
     /// `peer_count` far above this says most of what we know about the network is hearsay.
     pub connected_peers: usize,
+    /// WebSocket clients currently connected, against `ws::MAX_WS_CONNECTIONS`. At the cap the
+    /// next upgrade is refused with a 503, which an operator would otherwise only see as clients
+    /// that cannot connect for no visible reason.
+    pub ws_clients: usize,
     pub mempool_size: usize,
     /// This node holds a validator key and is running as one (`--validator`).
     pub is_validator: bool,
@@ -119,6 +123,27 @@ pub struct EpochInfo {
     pub next: Vec<shrugg_core::Address>,
 }
 
+/// Slots in the head broadcast channel. A 100-block sync batch fits with slack, and at 3 s blocks
+/// 256 heads is thirteen minutes: a subscriber that falls further behind than that is not going to
+/// catch up, and is closed rather than buffered.
+pub const HEAD_CHANNEL: usize = 256;
+
+/// One committed head, as `shrugg_getHead` reports it. What a `newHeads` notification carries.
+#[derive(Clone, Debug, Serialize)]
+pub struct HeadSummary {
+    pub height: u64,
+    pub hash: String,
+    pub view: u64,
+}
+
+/// The head as `shrugg_getHead` reports it — one function, so the RPC and the subscription can
+/// never drift apart.
+pub fn head_summary(storage: &Storage, status: &RwLock<NodeStatus>) -> crate::storage::Result<HeadSummary> {
+    let head = storage.head()?;
+    let view = status.read().unwrap_or_else(|e| e.into_inner()).view;
+    Ok(HeadSummary { height: head.height, hash: head.hash.to_hex(), view })
+}
+
 #[derive(Clone)]
 pub struct RpcState {
     pub storage: Arc<Storage>,
@@ -127,6 +152,11 @@ pub struct RpcState {
     pub chain_id: u64,
     /// Needed by `shrugg_getWitness`, which rebuilds the tree to fold a path.
     pub executor: Arc<dyn ConfidentialExecutor>,
+    /// Committed heads, one per block, fanned out to WebSocket subscribers. Bounded: a subscriber
+    /// that falls more than [`HEAD_CHANNEL`] behind is closed, not buffered.
+    pub heads: tokio::sync::broadcast::Sender<HeadSummary>,
+    /// Live WebSocket connections, against [`crate::ws::MAX_WS_CONNECTIONS`].
+    pub ws_conns: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Deserialize)]
@@ -203,7 +233,13 @@ pub const RPC_MAX_BODY_BYTES: usize = 2
 
 pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let app = Router::new()
-        .route("/", post(handle))
+        // Same port, two protocols: `POST /` is the JSON-RPC this file serves, `GET /` and
+        // `GET /ws` are the WebSocket upgrade. A client that knows only the POST sees no change.
+        .route("/", post(handle).get(crate::ws::upgrade))
+        .route("/ws", axum::routing::get(crate::ws::upgrade))
+        // `RPC_MAX_BODY_BYTES`, unchanged — it bounds the POST. A WebSocket upgrade is a GET with
+        // no body, so the layer costs it nothing; frames are bounded by `ws::WS_MAX_FRAME_BYTES`
+        // instead.
         .layer(axum::extract::DefaultBodyLimit::max(RPC_MAX_BODY_BYTES))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -858,9 +894,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             Ok(block.map(|b| block_json(&b, bridge.as_ref(), st.executor.as_ref())).unwrap_or(Value::Null))
         }
         "shrugg_getHead" => {
-            let head = st.storage.head().map_err(RpcError::internal)?;
-            let s = st.status.read().unwrap_or_else(|e| e.into_inner()).clone();
-            Ok(json!({ "height": head.height, "hash": head.hash.to_hex(), "view": s.view }))
+            let head = head_summary(&st.storage, &st.status).map_err(RpcError::internal)?;
+            Ok(serde_json::to_value(head).map_err(RpcError::internal)?)
         }
         "shrugg_syncStatus" | "shrugg_status" => {
             let s = st.status.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1034,6 +1069,8 @@ mod tests {
             node: tx,
             chain_id: gs.chain_id,
             executor: Arc::new(StubExecutor),
+            heads: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
+            ws_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 

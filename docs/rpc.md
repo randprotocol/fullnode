@@ -7,6 +7,9 @@ curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"shrugg_getHead","params":[]}'
 ```
 
+The same port also serves a WebSocket on `/` and `/ws`, which pushes every committed head instead
+of being polled for it — see [Subscriptions](#subscriptions-websocket).
+
 Conventions:
 
 - Validator addresses are base58 strings (32 bytes). Hashes are 64 hex characters, with or
@@ -321,7 +324,7 @@ Params: `[]`. Result:
   "height": 1998, "head_hash": "…", "view": 2251, "high_qc_view": 2250,
   "syncing": false, "sync_target": 1998,
   "sync_inflight_age_ms": null, "sync_failures": 0, "sync_late_batches": 0,
-  "peer_count": 5, "connected_peers": 5, "mempool_size": 0,
+  "peer_count": 5, "connected_peers": 5, "ws_clients": 3, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
   "fri_profile": "production", "programs": 2,
   "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19",
@@ -347,6 +350,9 @@ otherwise looks identical to a node that is behind and working:
   blocks. `peer_count` counts every peer this node knows of, including those seen only as the author
   of relayed gossip, so `peer_count` far above `connected_peers` means most of what this node knows
   about the network is hearsay.
+- `ws_clients` — WebSocket clients connected right now, against the 64 this node will carry (see
+  [Subscriptions](#subscriptions-websocket)). At 64 the next upgrade is refused with a `503`, which
+  otherwise shows up only as clients that cannot connect for no visible reason.
 
 `is_validator` says this node holds a validator key; `active_validator`
 says that key is in the set running the current epoch (spec §8) — a validator that has bonded in
@@ -444,13 +450,65 @@ every one of them by replaying the chain, which is what makes them auditable. `d
 works the identity through a bond and a withdraw and says where it rests on a claim (the genesis
 file's own amounts) rather than on a check.
 
+## Subscriptions (WebSocket)
+
+The same port also speaks WebSocket: `ws://127.0.0.1:8545/` or `ws://127.0.0.1:8545/ws`, either
+path. `POST /` is unchanged and is still where every method above is served — the socket serves
+**only** `shrugg_subscribe` and `shrugg_unsubscribe`, and answers `-32601` to anything else,
+including reads. There is nothing to configure and no second port to open.
+
+One topic exists, `newHeads`, and its payload is exactly `shrugg_getHead`'s three fields, in the
+same shape — one `HeadSummary` serves both, so they cannot drift apart. The one difference is what
+`view` means: a notification carries the *block's own* view, the one its quorum certificate is for,
+while `shrugg_getHead` reports the node's current consensus view. For the tip of a healthy chain
+they are the same number. A notification is sent **once per committed
+block, in order**, including during sync: a batch of 100 synced blocks is 100 notifications, not one
+for the tip, so a wallet tracking heads never silently skips a height. Nothing is sent before the
+block is committed to storage, so a head you are told about is a head this node will not lose.
+
+```jsonc
+// client -> node
+{ "jsonrpc": "2.0", "id": 1, "method": "shrugg_subscribe",   "params": ["newHeads"] }
+{ "jsonrpc": "2.0", "id": 2, "method": "shrugg_unsubscribe", "params": ["1"] }
+// node -> client
+{ "jsonrpc": "2.0", "id": 1, "result": "1" }        // the subscription id, a decimal string
+{ "jsonrpc": "2.0", "id": 2, "result": true }
+{ "jsonrpc": "2.0", "method": "shrugg_subscription",
+  "params": { "subscription": "1", "result": { "height": 1998, "hash": "…", "view": 2251 } } }
+```
+
+`shrugg_unsubscribe` answers `true` when this connection held that id and `false` when it did not —
+a `false` is not an error, because a client tearing down after a reconnect has no way to know which
+ids survived. Ids are per connection, are never reused within one, and all of them go when the
+socket does. A frame with no `id` member is a notification and is refused with `-32600`, as over
+HTTP. An unknown topic is `-32602`.
+
+This endpoint is unauthenticated, so it is bounded three ways:
+
+- **64 connections per node.** The 65th is refused at the upgrade with HTTP `503` and a body
+  naming the limit — not accepted and then dropped, which a client cannot tell from a network
+  fault. `shrugg_status`'s `ws_clients` is the live count.
+- **8 subscriptions per connection.** The ninth `shrugg_subscribe` is `-32000`; the eight it holds
+  are untouched.
+- **64 KiB per frame**, either direction. Proof-carrying bodies go to `POST /`, which has its own
+  much larger limit.
+
+**Backpressure closes, it does not buffer.** The node keeps 256 committed heads in flight per
+subscriber. A client that falls further behind than that — because it stopped reading, or its link
+cannot carry what the chain produces — is closed with WebSocket code `1008` (policy violation) and
+a reason saying how many heads it missed. Buffering a slow subscriber is how a node runs out of
+memory. The recovery is to reconnect, subscribe again, and fill the gap with
+[`shrugg_getCompactBlocks`](#shrugg_getcompactblocks) from the last height you did see; at 3 s
+blocks, 256 heads is about thirteen minutes, so a subscriber that hits this was not going to catch
+up on the socket anyway.
+
 ## Errors
 
 | code | meaning |
 |---|---|
-| `-32601` | unknown method |
+| `-32601` | unknown method — over HTTP, and on the WebSocket for anything but the two subscription methods |
 | `-32602` | invalid or missing parameter (message says which) |
-| `-32000` | transaction rejected by the mempool (message gives the reason) |
+| `-32000` | rejected: a transaction the mempool refused, or a subscription over this connection's cap (message gives the reason) |
 | `-32001` | referenced object not found |
 | `-32603` | internal error (storage or node loop) |
 | `-32600` | invalid request — the body is over the size limit, is not JSON, is a malformed batch, or is a notification |

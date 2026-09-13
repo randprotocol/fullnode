@@ -43,7 +43,7 @@ libp2p = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "goss
 # hard-codes its size limits (see `network::codec`). Same serializer, same versions libp2p pins.
 cbor4ii = { version = "0.3.2", features = ["serde1", "use_std"] }
 async-trait = "0.1"
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 # storage
@@ -54,6 +54,10 @@ clap = { version = "4.4", features = ["derive", "env"] }
 
 # test
 tempfile = "3.10"
+# The WebSocket *client* the `ws` integration test drives. axum's own `ws` feature brings a
+# tungstenite of its own for the server side; this is the other end of the wire, and a test-only
+# dependency for that reason.
+tokio-tungstenite = "0.24"
 
 [profile.release]
 opt-level = 3
