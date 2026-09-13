@@ -104,16 +104,26 @@ through the constraint-set-5 re-vendor, not as a local patch — so read
   get merged and deleted quickly. `main` is the only durable line.
 - Full test suite: `cargo test --workspace --release` — 466 tests across 27
   binaries, **22 min measured 2026-09-13** on a machine also running another
-  session's build. Cargo runs the test binaries one after another and the two
-  that prove real bundles dominate: the wallet flow 9m19s (six bundle proofs
-  plus a call proof, after S2's bond stage and S3's call-envelope stage were
-  merged into it) and the TCP cluster suite 6m28s (16 tests). Phases S2 and S3
-  each added proving cluster tests and each slowed the chain they run on; the
-  integrated branch runs it at **3 s blocks** (S2 had raised it to 2, S3 to 3)
-  so a proof cannot outlive its 256-block anchor when the cores are contended.
-  Read `PROVING` in `crates/shrugg-node/tests/cluster.rs` before making that
-  chain faster again — capping proving concurrency is the real fix, and is not
-  done.
+  session's build, and measured *before* the proving slot below. Cargo runs the
+  test binaries one after another and the two that prove real bundles dominate:
+  the wallet flow 9m19s (six bundle proofs plus a call proof, after S2's bond
+  stage and S3's call-envelope stage were merged into it) and the TCP cluster
+  suite 6m28s (16 tests, proofs overlapping).
+- **Proving concurrency is capped, and that cap — not block spacing — is what
+  keeps a proof inside its window.** `crates/shrugg-node/tests/proving_slot/`
+  and `crates/shrugg-client/tests/proving_slot/` (one module, two copies: both
+  test binaries need it and they are different crates) hand out one permit at a
+  time through a file lock in `<target-dir>/tmp`, so no two bundle proofs run at
+  once anywhere in the workspace — across test binaries, and across two
+  sessions' concurrent `cargo test` runs. Every proving test takes it around the
+  whole `wallet::send`/`submit`/`submit_burn` call; the one test that
+  deliberately races two bundles takes it once for the pair. With it the cluster
+  suite measures **19m59s, 17 tests, 2026-09-13** — slower in wall time, because
+  the proofs no longer overlap, and each proof correspondingly faster (19 proofs
+  measured at 94.6–97.9 s each, against the ~255 s a contended one took, and
+  190 s for the burn's pair). `PROVING` stays at **3 s blocks** (S2 had
+  raised it to 2, S3 to 3) and its doc comment now says why rather than what;
+  read it before making that chain faster again.
 - Doctest flakiness ("extern location ... does not exist") means a concurrent
   cargo run raced the cache; rerun.
 - The whitepaper is `../whitepapers/randprotocol.tex` (Draft 3) — its

@@ -36,6 +36,10 @@ use shrugg_zkvm::viewing::TxKey;
 use shrugg_zkvm::{call_envelope, hash};
 use std::time::{Duration, Instant};
 
+/// One proof at a time, for every test in this file and in `shrugg-client`'s `wallet_flow.rs`.
+mod proving_slot;
+use proving_slot::proving_slot;
+
 const CHAIN_ID: u64 = 7;
 
 /// What one funded wallet holds at genesis.
@@ -50,18 +54,31 @@ const FAST: Duration = Duration::from_millis(150);
 /// it — and its own `time` word gets the same window. Three-second blocks make that nearly thirteen
 /// minutes, which is the number `wallet_flow.rs` uses for the same reason.
 ///
-/// The margin has to be far more than one proof's worth, because `cargo test --workspace` schedules
-/// every proving test in this file concurrently and they compete for the same cores: a tier-14
-/// bundle measures about 98 s alone and 255 s with six other proofs running, and `submit_burn`
-/// proves *twice* under one anchor (189 s for the pair, alone). At 1 s blocks — where this constant
-/// started — a 255 s proof put the committed bundle's own `time` outside the window by the time the
-/// test replayed it, and `two_validators_commit_and_shielded_transfer` failed on
+/// Proving concurrency is what used to make this number load-bearing. `cargo test --workspace`
+/// schedules every proving test in this file concurrently and they compete for the same cores: a
+/// tier-14 bundle measures about 98 s alone and 255 s with six other proofs running, and
+/// `submit_burn` proves *twice* under one anchor (189 s for the pair, alone). At 1 s blocks — where
+/// this constant started — a 255 s proof put the committed bundle's own `time` outside the window by
+/// the time the test replayed it, and `two_validators_commit_and_shielded_transfer` failed on
 /// `bundle time 2 is outside [3, 259]` instead of on the double-spend it is about. A test must fail
-/// on its property, not on the clock.
+/// on its property, not on the clock. S2 raised this to 2 s and S3 to 3 s to buy room against that.
 ///
-/// S2 raised this to 2 s and S3 to 3 s; the integration keeps 3 s (S3's reviewer: 2 s leaves only
-/// ~2× against a 255 s contended proof), and the S2 staking tests hold there too — their longest
-/// wait is two `EPOCH`-block epochs, 36 s, against a 180 s bound.
+/// That room was a margin rather than a bound, and [`proving_slot`] is the bound: no two proofs in
+/// this workspace run at once any more, so what has to fit inside 256 blocks is one uncontended
+/// proof (~100 s, ~190 s for the burn's pair) and not a contended one. Three seconds stays anyway,
+/// and deliberately:
+///
+/// - a queueing test's own cluster keeps making blocks while it waits for the slot, and at 1 s
+///   blocks up to seven idle clusters would burn three times the consensus CPU beside the one proof
+///   that actually matters — the slot's whole point is to leave that proof alone;
+/// - the windows are *blocks*, so a slower chain is the one knob that costs nothing: 3 s makes them
+///   nearly thirteen minutes against a proof of two, which is margin no assertion depends on;
+/// - the S2 staking tests hold there too — their longest wait is two `EPOCH`-block epochs, 36 s,
+///   against a 180 s bound.
+///
+/// Lowering it again is a question about suite wall time rather than about the window — with proofs
+/// serialised the clock is the proofs, not the blocks — and nobody has measured the tests at 1 s
+/// since the slot landed, so it stays where the integration left it.
 ///
 /// The view timeouts scale with the interval (`start_node_at`), and every `wait_*` bound in these
 /// tests is a wall-clock timeout with room to spare at 3 s blocks (`wallet::COMMIT_TIMEOUT` is
@@ -696,6 +713,10 @@ async fn a_build_whose_bundle_guest_differs_from_genesis_refuses_to_start() {
 // seconds and run on a `PROVING`-paced chain (see the constant). They are also the only tests
 // here that look at value at all: a mint proves that a note arrived, a bundle proves that value
 // moved from one wallet to another without the chain ever learning either.
+//
+// Every proof below is taken under the workspace's one proving slot (`proving_slot`), which is
+// what makes the anchor window a bound rather than a margin: the slot is held around the whole
+// `wallet::` call, so it is taken before the anchor is read and released after the commit.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn two_validators_commit_and_shielded_transfer() {
@@ -717,9 +738,11 @@ async fn two_validators_commit_and_shielded_transfer() {
     let fee = gas::BUNDLE_BASE;
     let pay = UNITS_PER_SHRUGG;
     let mut store = NoteStore::default();
+    let slot = proving_slot().await;
     let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
+    drop(slot);
     eprintln!("transfer: tier {}, proved in {:.1?}, {} proof bytes", sent.tier, sent.proving, sent.proof_bytes);
 
     // Both validators carry the same transaction, and both answer the same two balances.
@@ -780,9 +803,15 @@ async fn two_bundles_spending_one_note_only_one_commits() {
             out.map(|s| (s.hash, s.amount))
         })
     };
+    // One slot for the pair, not one each: these two proofs are the *subject* of this test — two
+    // bundles built against the same tree, so that one of them has to lose — and taking the slot
+    // twice would prove them one after the other, the second scanning a chain where the note it
+    // means to spend is already spent. The slot bounds unrelated proofs (`proving_slot`).
+    let slot = proving_slot().await;
     let one = race(n0.rpc.clone(), UNITS_PER_SHRUGG);
     let two = race(n1.rpc.clone(), 2 * UNITS_PER_SHRUGG);
     let (one, two) = tokio::join!(one, two);
+    drop(slot);
 
     let mut accepted: Vec<(Hash, u64)> = Vec::new();
     let mut refused: Vec<String> = Vec::new();
@@ -842,10 +871,12 @@ async fn confidential_call_rides_on_a_bundle() {
     let action = Action::Deploy { base_pc: program.base_pc, words: program.words.clone() };
     let deploy_fee = wallet::deploy_fee_default(&action);
     assert_eq!(deploy_fee, gas::BUNDLE_BASE + gas::deploy_fee(program.words.len()));
+    let slot = proving_slot().await;
     let deployed =
         wallet::submit(&n0.rpc, &a, &mut store, None, action, deploy_fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
             .await
             .expect("the deploy bundle commits");
+    drop(slot);
     eprintln!("deploy: {} words, fee {deploy_fee}, proved in {:.1?}", program.words.len(), deployed.proving);
     assert_eq!(deployed.amount, 0, "a deploy pays nobody; it is a self-transfer of zero");
     for n in [&n0, &n1] {
@@ -856,6 +887,9 @@ async fn confidential_call_rides_on_a_bundle() {
     }
 
     // ---- call, proved locally, paid by a second bundle ----
+    // The call's own proof and the bundle that pays for it are one hold of the slot: a program
+    // proof is prover work like any other, and the bundle follows it immediately.
+    let slot = proving_slot().await;
     let (proof, outputs, tier) =
         shrugg_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], None, Backend::Cpu)
             .expect("the call proves");
@@ -876,6 +910,7 @@ async fn confidential_call_rides_on_a_bundle() {
     )
     .await
     .expect("the call bundle commits");
+    drop(slot);
     eprintln!("call bundle: fee {call_fee}, proved in {:.1?}", called.proving);
 
     // The receipt is on every node, with the outputs the prover published.
@@ -1005,10 +1040,12 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     let action = Action::Bond { validator: ks[4].address(), amount: MIN_STAKE, registration: Some(registration) };
     let fee = gas::fee_floor(&action);
     let mut store = NoteStore::default();
+    let slot = proving_slot().await;
     let bonded =
         wallet::submit(&n0.rpc, &bonder, &mut store, None, action, fee, MIN_STAKE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
             .await
             .expect("the bond's bundle is accepted and commits");
+    drop(slot);
     eprintln!("bond: tier {}, proved in {:.1?}, {} proof bytes", bonded.tier, bonded.proving, bonded.proof_bytes);
     assert_eq!(bonded.burn, MIN_STAKE, "the bundle burns exactly what is bonded");
     assert_eq!(bonded.amount, 0, "a bond pays nobody a note");
@@ -1164,10 +1201,12 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     }
     let mut store = NoteStore::default();
     let pay = UNITS_PER_SHRUGG;
+    let slot = proving_slot().await;
     let sent =
         wallet::send(&n0.rpc, &payout, &mut store, &payee.address, pay, base, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
             .await
             .expect("the withdrawn note pays a real bundle");
+    drop(slot);
     eprintln!("spending the withdrawn note: tier {}, proved in {:.1?}", sent.tier, sent.proving);
     // `wallet::send` waited for the commit on the node it submitted to, which leaves the others up to
     // a block behind: a balance read straight away can scan a tree the payee's note is not in yet.
@@ -1207,6 +1246,8 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
 /// Returns the submission, the asset index and the deposit note's commitment — the last of which is
 /// on no wire anywhere: the chain derives it from the amount the guardians signed, which is what
 /// stops a relayer minting a note of its own choosing.
+///
+/// Takes the proving slot around its own bundle, so a caller must not already hold it.
 async fn bridge_mint(
     node: &TestNode,
     relayer: &Wallet,
@@ -1228,9 +1269,11 @@ async fn bridge_mint(
     let action =
         Action::BridgeAttest { attestation, recipient: to.clone(), r: note.r, time, asset: index, envelope };
     let fee = gas::fee_floor(&action);
+    let slot = proving_slot().await;
     let s = wallet::submit(&node.rpc, relayer, store, None, action, fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the attestation's fee bundle commits");
+    drop(slot);
     (s, index, note.commitment())
 }
 
@@ -1336,6 +1379,8 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     // with two (spec §7 item 3). The balance assertion below would hold against a wrong default.
     assert_eq!(burn_fee, 2 * gas::BUNDLE_BASE);
     let mut recipient_store = NoteStore::default();
+    // A burn proves twice under one anchor, which is the longest single hold of the slot there is.
+    let slot = proving_slot().await;
     let burned = wallet::submit_burn(
         &n0.rpc,
         &recipient,
@@ -1353,6 +1398,7 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     )
     .await
     .expect("both of the burn's bundles commit");
+    drop(slot);
     eprintln!("bridge-burn: tier {}, proved in {:.1?}, {} proof bytes", burned.tier, burned.proving, burned.proof_bytes);
     assert_eq!(burned.amount, burn, "what left the pool is exactly what the message sends");
     assert_eq!(burned.change, deposit - burn);
@@ -1412,13 +1458,16 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
     let mut store = NoteStore::default();
     let deploy = Action::Deploy { base_pc: program.base_pc, words: program.words.clone() };
     let deploy_fee = wallet::deploy_fee_default(&deploy);
+    let slot = proving_slot().await;
     wallet::submit(&n0.rpc, &caller, &mut store, None, deploy, deploy_fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the deploy bundle commits");
+    drop(slot);
 
     // `prove_call` is `prove` plus the salt the input commitment was drawn with — the one value
     // that never leaves the prover on its own, and the thing the transcript is sealed around.
     let inputs = [400u32, 250, 300, 75];
+    let slot = proving_slot().await;
     let (proof, outputs, tier, salt) =
         shrugg_zkvm::executor::prove_call(FriProfile::Test, &program, &inputs, None, Backend::Cpu)
             .expect("the call proves");
@@ -1440,6 +1489,7 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
     )
     .await
     .expect("the call bundle commits");
+    drop(slot);
     eprintln!("call: tier {tier}, envelope {} bytes, outputs {outputs:?}", sealed.len());
 
     for n in [&n0, &n1] {

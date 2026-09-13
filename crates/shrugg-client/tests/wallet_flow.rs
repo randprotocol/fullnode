@@ -21,6 +21,11 @@
 //! give a bundle nearly thirteen minutes between reading its anchor and being committed under
 //! it, against a proof that takes about a minute and a half in this profile — margin enough
 //! that a slow machine fails the assertion it is testing rather than the clock.
+//!
+//! Every proof here is taken under the workspace's one proving slot ([`proving_slot`]), so no other
+//! test's proof — in this binary, in `shrugg-node`'s cluster suite, or in another session's
+//! `cargo test` against the same target directory — is ever in flight beside it. The slow blocks
+//! are what covers a slow machine; the slot is what covers a busy one.
 
 use shrugg_client::wallet::{self, NoteStore, Wallet};
 use shrugg_client::RpcClient;
@@ -33,6 +38,10 @@ use shrugg_zkvm::machine::{Backend, FriProfile};
 use shrugg_zkvm::notes::SpendKey;
 use shrugg_zkvm::{call_envelope, executor, guests, hash};
 use std::time::{Duration, Instant};
+
+/// One proof at a time, for every test here and in `shrugg-node`'s `cluster.rs`.
+mod proving_slot;
+use proving_slot::proving_slot;
 
 const CHAIN_ID: u64 = 7;
 
@@ -121,9 +130,14 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     // ---- send: A pays B 1 SHRUGG, proving a real bundle ----
     let fee = gas::BUNDLE_BASE;
     let pay = UNITS_PER_SHRUGG;
+    // Under the workspace's proving slot, held around the whole call: taken before the anchor is
+    // read and released after the commit, so no other test's proof shares these cores (see
+    // `proving_slot`).
+    let slot = proving_slot().await;
     let first = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
+    drop(slot);
     eprintln!("first bundle: tier {}, proved in {:.1?}, {} proof bytes", first.tier, first.proving, first.proof_bytes);
     assert_eq!(first.amount, pay);
     assert_eq!(first.change, mint - pay - fee);
@@ -145,9 +159,11 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     assert!(a_store.sent.iter().any(|s| s.amount == pay && s.to_pk == b.vk.pk()), "A's history names the payment");
 
     // ---- the change note is spendable ----
+    let slot = proving_slot().await;
     let second = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the change note pays a second bundle");
+    drop(slot);
     eprintln!("second bundle: tier {}, proved in {:.1?}", second.tier, second.proving);
     wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
     wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
@@ -163,9 +179,12 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     let balance_before = a_store.balance();
     let bond = UNITS_PER_SHRUGG;
     let action = shrugg_core::Action::Bond { validator, amount: bond, registration: None };
-    let bonded = wallet::submit(&rpc, &a, &mut a_store, None, action, fee, bond, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
-        .await
-        .expect("the bond's bundle is accepted and commits");
+    let slot = proving_slot().await;
+    let bonded =
+        wallet::submit(&rpc, &a, &mut a_store, None, action, fee, bond, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+            .await
+            .expect("the bond's bundle is accepted and commits");
+    drop(slot);
     eprintln!("bond bundle: tier {}, proved in {:.1?}", bonded.tier, bonded.proving);
     assert_eq!(bonded.burn, bond, "the bundle burns exactly what is bonded");
     assert_eq!(bonded.amount, 0, "a bond pays nobody a note");
@@ -183,13 +202,17 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     let pid = shrugg_core::program::program_id(prog.base_pc, &prog.words);
     let deploy = Action::Deploy { base_pc: prog.base_pc, words: prog.words.clone() };
     let fee = wallet::deploy_fee_default(&deploy);
+    let slot = proving_slot().await;
     wallet::submit(&rpc, &a, &mut a_store, None, deploy, fee, 0, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the program deploys");
+    drop(slot);
 
     let inputs = [100u32, 200, 300, 400];
     // `prove_call`, not `prove`: it returns the `H_IN` salt, without which the transcript could not
-    // be bound to this proof at all.
+    // be bound to this proof at all. It and the bundle that pays for it are one hold of the proving
+    // slot — a program proof is prover work like any other, and the bundle follows it immediately.
+    let slot = proving_slot().await;
     let (proof, outputs, tier, salt) =
         executor::prove_call(FriProfile::Test, &prog, &inputs, None, Backend::Cpu).expect("the call proves");
     let h_in = hash::input_digest(salt, &inputs);
@@ -210,6 +233,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     )
     .await
     .expect("the call is accepted and commits");
+    drop(slot);
     let receipt = rpc.wait_for_receipt(&call.hash, Duration::from_secs(120)).await.expect("the call has a receipt");
     // The chain publishes the same `H_IN` the wallet sealed against — it comes out of the proof,
     // not out of the transaction, which is what makes it a commitment to the inputs.
