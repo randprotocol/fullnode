@@ -92,6 +92,36 @@ block height onwards, same 1000-row cap.
 A page can stop inside a height, so a caller pages back to the highest height it saw rather than
 past it; re-reading rows is harmless.
 
+### `shrugg_getCompactBlocks`
+Params: `[from_height, to_height]`, both required. Result: one row per block in the range, oldest
+first, carrying everything a light wallet needs to trial-decrypt and track spends — and nothing
+else: no proofs, no actions, no receipts.
+
+```json
+[ { "height": 192, "hash": "63f6…08", "timestamp_ms": 1788000123456,
+    "commitments": [],
+    "transactions": [
+      { "hash": "4f2c…e7",
+        "commitments": [ { "index": 40, "cm": "2a9f…07",
+          "envelope": { "kem_ct": "…", "to_receiver": "…", "to_sender": "…", "body": "…" } } ],
+        "nullifiers": ["8c04…d1", "5e77…20"] } ] } ]
+```
+
+One call covers at most **128 blocks** (half the 256-block anchor window), counted from
+`from_height`; a wider range is clamped, not refused. Past the first block the reply also stops
+once it has emitted **1000 notes** — but the *first* block of a reply is always served whole,
+however many notes it holds, so a caller is never stuck behind one fat block. Resume from the
+last returned `height` plus one, and page until the reply is empty; a `from_height` past the head
+comes back `[]` rather than an error.
+
+The block-level `commitments` array holds the leaves of that block that belong to no transaction
+— the genesis deposits at height 0 — and is empty at every other height. A `Withdraw`'s and a
+`BridgeAttest`'s deposit notes do appear under their transaction even though the wire does not
+carry their commitments (the ledger derives them, spec §7); they are appended immediately after
+that transaction's own notes, which is the order served here.
+
+Errors: `-32602` for a backwards range (`to_height` below `from_height`) or a missing bound.
+
 ### `shrugg_getAnchor`
 Params: `[]` for the head, or `[height]`. Result: `{ "height": 192, "root": "6b1d…c4" }`, or error
 `-32001` for a height with no recorded anchor.

@@ -25,6 +25,11 @@ use tokio::sync::{mpsc, oneshot};
 /// an unbounded `limit` would let one request pull the whole pool into memory.
 const MAX_PAGE: usize = 1000;
 
+/// The most blocks one `shrugg_getCompactBlocks` call may cover. Half the 256-block anchor
+/// window (`ledger::ANCHOR_WINDOW`), so a wallet syncing forward never crosses more than one
+/// window per request.
+const MAX_COMPACT_BLOCKS: u64 = 128;
+
 /// The longest string any RPC parameter may offer as a shielded address (spec ruling 3). See
 /// `parse_shielded` for why this is checked before the address is parsed rather than after.
 const MAX_ADDRESS_CHARS: usize = 2000;
@@ -331,6 +336,40 @@ fn assets_json(bridge: &BridgeMeta) -> Vec<Value> {
     rows.into_iter().map(|(asset, info)| asset_json(asset, info)).collect()
 }
 
+/// One block as a light wallet reads it: the header fields it chains on, and per transaction
+/// the notes it created (leaf index, commitment, envelope) and the nullifiers it spent. No
+/// proof, no action, no receipt — those are `shrugg_getBlockByHeight`'s job.
+///
+/// `notes` is this block's slice of the tree in append order. Each transaction owns
+/// `commitments().len() + derived_note_count()` of it, in the order `Storage::commit` appended
+/// them; anything left over goes into the block-level `commitments`, which is where genesis
+/// deposits live and where a future note the attribution does not know about would still surface
+/// rather than disappear.
+fn compact_block_json(b: &shrugg_core::Block, notes: &[(u64, crate::storage::NoteRow)]) -> Value {
+    let row = |(index, r): &(u64, crate::storage::NoteRow)| {
+        json!({ "index": index, "cm": word8_to_hex(&r.cm), "envelope": envelope_json(&r.envelope) })
+    };
+    let mut at = 0usize;
+    let mut txs = Vec::with_capacity(b.transactions.len());
+    for tx in &b.transactions {
+        let want = tx.commitments().len() + crate::storage::derived_note_count(tx);
+        let end = (at + want).min(notes.len());
+        txs.push(json!({
+            "hash": tx.hash().to_hex(),
+            "commitments": notes[at..end].iter().map(row).collect::<Vec<_>>(),
+            "nullifiers": tx.nullifiers().iter().map(word8_to_hex).collect::<Vec<_>>(),
+        }));
+        at = end;
+    }
+    json!({
+        "height": b.height(),
+        "hash": b.hash().to_hex(),
+        "timestamp_ms": b.header.timestamp_ms,
+        "commitments": notes[at.min(notes.len())..].iter().map(row).collect::<Vec<_>>(),
+        "transactions": txs,
+    })
+}
+
 fn block_json(b: &shrugg_core::Block, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor) -> Value {
     json!({
         "hash": b.hash().to_hex(),
@@ -539,6 +578,41 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .into_iter()
                 .map(|(height, nf)| json!({ "height": height, "nullifier": word8_to_hex(&nf) }))
                 .collect::<Vec<_>>()))
+        }
+        // A range of blocks with everything a light wallet needs and nothing it does not: the
+        // commitments each transaction created with their leaf indices and envelopes, and the
+        // nullifiers it spent. Zcash's `CompactBlock` by another name (`docs/rpc-comparison.md` §4),
+        // and the reason a sync is one round-trip per page instead of two per block.
+        "shrugg_getCompactBlocks" => {
+            let from: u64 = param(p, 0, "from_height")?;
+            let to: u64 = param(p, 1, "to_height")?;
+            if to < from {
+                return Err(RpcError::invalid_params(format!("to_height {to} is below from_height {from}")));
+            }
+            let to = to.min(from.saturating_add(MAX_COMPACT_BLOCKS - 1));
+            let storage = st.storage.clone();
+            // Reads every block in the range and scans a slice of the notes family: linear in the
+            // range, so it goes on the blocking pool like the other unbounded reads here.
+            let out = blocking(move || {
+                let head = storage.head()?.height;
+                let to = to.min(head);
+                let mut rows: Vec<Value> = Vec::new();
+                let mut emitted = 0usize;
+                for h in from..=to {
+                    let Some(b) = storage.block_by_height(h)? else { break };
+                    // Always emit the first block whole, however many notes it holds, so a client
+                    // is never stuck behind one fat block; after that the page cap ends the reply.
+                    if !rows.is_empty() && emitted >= MAX_PAGE {
+                        break;
+                    }
+                    let notes = storage.notes_in_heights(h, h, usize::MAX)?;
+                    emitted += notes.len();
+                    rows.push(compact_block_json(&b, &notes));
+                }
+                Ok(rows)
+            })
+            .await?;
+            Ok(json!(out))
         }
         // A node that caught up in one sync batch longer than the anchor window only stores
         // rows for the heights that batch covered, so `getAnchor` can answer "no anchor at
@@ -1657,5 +1731,121 @@ mod tests {
         assert_eq!(ok["result"], 7);
 
         task.abort();
+    }
+
+    /// Everything a light wallet needs to trial-decrypt and track spends, per block, with no proof
+    /// bytes: the leaf index, the commitment, the envelope, and the nullifiers the transaction spent.
+    #[tokio::test]
+    async fn compact_blocks_carry_every_note_and_nullifier_per_transaction() {
+        let (_d, st, _gs) = chain();
+        let v = ok(&st, "shrugg_getCompactBlocks", json!([0, 1])).await;
+        let blocks = v.as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "genesis and the one committed block");
+
+        // Height 0 owns the genesis deposits, which belong to no transaction.
+        assert_eq!(blocks[0]["height"], 0);
+        assert_eq!(blocks[0]["transactions"], json!([]));
+        let genesis_notes = blocks[0]["commitments"].as_array().unwrap();
+        assert_eq!(genesis_notes.len(), 2);
+        assert_eq!(genesis_notes[0]["index"], 0);
+
+        let b1 = &blocks[1];
+        let head = st.storage.block_by_height(1).unwrap().unwrap();
+        assert_eq!(b1["hash"], head.hash().to_hex());
+        assert_eq!(b1["timestamp_ms"], head.header.timestamp_ms);
+        assert_eq!(b1["commitments"], json!([]), "every note of this block belongs to a transaction");
+        let txs = b1["transactions"].as_array().unwrap();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0]["hash"], head.transactions[0].hash().to_hex());
+        assert_eq!(txs[0]["nullifiers"], json!([word8_to_hex(&nf(1)), word8_to_hex(&nf(2))]));
+        let cms = txs[0]["commitments"].as_array().unwrap();
+        assert_eq!(cms.len(), 2);
+        assert_eq!((&cms[0]["index"], &cms[0]["cm"]), (&json!(2), &json!(word8_to_hex(&cm(1)))));
+        assert_eq!((&cms[1]["index"], &cms[1]["cm"]), (&json!(3), &json!(word8_to_hex(&cm(2)))));
+        // The envelope goes out in its four hex parts, exactly as getCommitments serves it.
+        assert!(cms[0]["envelope"]["kem_ct"].is_string());
+        // And no proof bytes anywhere: that is the whole point of a compact block.
+        let text = serde_json::to_string(&v).unwrap();
+        assert!(!text.contains("proof"), "a compact block carries no proof: {}", &text[..200.min(text.len())]);
+    }
+
+    /// The range is clamped, not refused; a backwards range is a parameter error.
+    #[tokio::test]
+    async fn compact_blocks_clamp_the_range_and_stop_at_the_head() {
+        let (_d, st, _gs) = chain();
+        // Past the head: a short reply, never an error.
+        let v = ok(&st, "shrugg_getCompactBlocks", json!([0, 99])).await;
+        assert_eq!(v.as_array().unwrap().len(), 2);
+        // A range longer than the cap is truncated to MAX_COMPACT_BLOCKS blocks, from `from_height`.
+        let v = ok(&st, "shrugg_getCompactBlocks", json!([0, MAX_COMPACT_BLOCKS + 500])).await;
+        assert_eq!(v.as_array().unwrap().len(), 2, "the head stops it first here");
+        // Backwards is a parameter error, and so is a missing bound.
+        assert_eq!(call(&st, "shrugg_getCompactBlocks", json!([1, 0])).await.unwrap_err().code, -32602);
+        assert_eq!(call(&st, "shrugg_getCompactBlocks", json!([0])).await.unwrap_err().code, -32602);
+        // A range that starts past the head is empty, not an error.
+        assert_eq!(ok(&st, "shrugg_getCompactBlocks", json!([50, 60])).await, json!([]));
+    }
+
+    /// A chain long enough for the block cap to be the binding one: the reply stops at
+    /// `MAX_COMPACT_BLOCKS` blocks counted from `from_height`, and the caller resumes from the
+    /// last height it got plus one.
+    #[tokio::test]
+    async fn compact_blocks_stop_at_the_block_cap() {
+        let gs = genesis_with(1, vec![alloc_note(20, 1_000)]);
+        let (_d, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let mut parent = gs.block.clone();
+        let blocks = MAX_COMPACT_BLOCKS as u32 + 5;
+        for i in 0..blocks {
+            let w = 1_000 + i * 4;
+            let tx = bundle_tx(&ledger, [[w; 8], [w + 1; 8]], [[w + 2; 8], [w + 3; 8]], bundle_fee());
+            let b = make_block(&parent, &mut ledger, vec![tx], &key(1));
+            st.storage.commit(std::slice::from_ref(&b), &ledger, &[], &StubExecutor).unwrap();
+            parent = b.block.clone();
+        }
+        // 2 notes a block is well under the row cap, so the block cap is what ends this reply.
+        let v = ok(&st, "shrugg_getCompactBlocks", json!([0, blocks])).await;
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), MAX_COMPACT_BLOCKS as usize);
+        assert_eq!(rows[0]["height"], 0);
+        assert_eq!(rows[MAX_COMPACT_BLOCKS as usize - 1]["height"], MAX_COMPACT_BLOCKS - 1);
+        // Resuming from the last height plus one picks up exactly where it stopped.
+        let next = ok(&st, "shrugg_getCompactBlocks", json!([MAX_COMPACT_BLOCKS, blocks])).await;
+        assert_eq!(next.as_array().unwrap()[0]["height"], MAX_COMPACT_BLOCKS);
+    }
+
+    /// The row cap ends a reply early, but never before one whole block: a block holding more
+    /// notes than the cap still comes back complete, and it comes back alone.
+    #[tokio::test]
+    async fn compact_blocks_serve_a_fat_block_whole_and_alone() {
+        let gs = genesis_with(1, vec![alloc_note(20, 1_000)]);
+        let (_d, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        // One block of 600 transfers: 1200 leaves, well past the 1000-row cap.
+        let fat: Vec<_> = (0..600u32)
+            .map(|i| {
+                let w = 1_000 + i * 4;
+                bundle_tx(&ledger, [[w; 8], [w + 1; 8]], [[w + 2; 8], [w + 3; 8]], bundle_fee())
+            })
+            .collect();
+        let b1 = make_block(&gs.block, &mut ledger, fat, &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let tx = bundle_tx(&ledger, [[9001; 8], [9002; 8]], [[9003; 8], [9004; 8]], bundle_fee());
+        let b2 = make_block(&b1.block, &mut ledger, vec![tx], &key(1));
+        st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+
+        let v = ok(&st, "shrugg_getCompactBlocks", json!([1, 2])).await;
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "the fat block fills the page on its own");
+        assert_eq!(rows[0]["height"], 1);
+        let txs = rows[0]["transactions"].as_array().unwrap();
+        assert_eq!(txs.len(), 600);
+        let notes: usize = txs.iter().map(|t| t["commitments"].as_array().unwrap().len()).sum();
+        assert_eq!(notes, 1200, "the block is served whole however far past the cap it is");
+        assert_eq!(rows[0]["commitments"], json!([]), "and every leaf is attributed to its transaction");
+        // The caller resumes at the last height it got plus one and gets the next block.
+        let next = ok(&st, "shrugg_getCompactBlocks", json!([2, 2])).await;
+        assert_eq!(next.as_array().unwrap().len(), 1);
+        assert_eq!(next[0]["height"], 2);
     }
 }

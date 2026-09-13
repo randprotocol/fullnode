@@ -197,6 +197,30 @@ fn created_notes(
     Ok(out)
 }
 
+/// How many notes of a block's slice belong to `tx` beyond the ones it carries on the wire: the
+/// deposit note the ledger derives for a `Withdraw`, and for a `BridgeAttest` the deposit it
+/// derives from the attestation — none for a guardian-set rotation, which deposits nothing.
+///
+/// This is the count of `Ledger::derived_commitment` (shrugg-core `ledger/staking.rs`), and the
+/// two must stay in step: those are the only two actions that mint a note out of public words, and
+/// `Mempool::claimed_commitments` reads the same function for the pool's conflict index. Applying
+/// the attestation size cap before the decode mirrors it exactly; in a *committed* block both arms
+/// always produced a note, since a transaction that could not derive one was refused by `validate`.
+/// `Transaction::commitments()` deliberately omits both, and `commit` appends them immediately
+/// after that transaction's own, so `tx.commitments().len() + derived_note_count(tx)` is exactly
+/// the slice `tx` owns.
+pub fn derived_note_count(tx: &shrugg_core::Transaction) -> usize {
+    match &tx.action {
+        Action::Withdraw { .. } => 1,
+        // The size cap before the decode, exactly as `Ledger::derived_commitment` applies it.
+        Action::BridgeAttest { attestation, .. } if attestation.len() > shrugg_core::gas::MAX_ATTESTATION_BYTES => 0,
+        Action::BridgeAttest { attestation, .. } => {
+            usize::from(shrugg_core::ledger::bridge_notes::attested_transfer(attestation).is_some())
+        }
+        _ => 0,
+    }
+}
+
 impl Storage {
     /// Open (creating if needed) the database at `<path>/db`.
     pub fn open(path: &Path) -> Result<Storage> {
@@ -364,6 +388,52 @@ impl Storage {
             }
             let (k, v) = item?;
             out.push((be_u64(k.as_ref(), "note key")?, bincode::deserialize(&v)?));
+        }
+        Ok(out)
+    }
+
+    /// The lowest leaf index whose row is at height >= `height`, or `notes_count()` if none is.
+    ///
+    /// Binary search: the `notes` family is dense from zero and its rows' heights are
+    /// non-decreasing in index, because `commit` appends blocks in ascending height and
+    /// `truncate_to` only deletes a suffix.
+    fn first_note_at_or_after(&self, height: u64) -> Result<u64> {
+        let count = self.notes_count()?;
+        let (mut lo, mut hi) = (0u64, count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let row = self
+                .note(mid)?
+                .ok_or_else(|| StorageError::Corrupt(format!("notes family has a gap at index {mid}")))?;
+            if row.height >= height {
+                hi = mid
+            } else {
+                lo = mid + 1
+            }
+        }
+        Ok(lo)
+    }
+
+    /// Every leaf appended by blocks in `from_height..=to_height`, in tree order, at most
+    /// `max_rows` of them (truncated, never an error). One binary search, then a forward scan.
+    pub fn notes_in_heights(&self, from_height: u64, to_height: u64, max_rows: usize) -> Result<Vec<(u64, NoteRow)>> {
+        if from_height > to_height || max_rows == 0 {
+            return Ok(Vec::new());
+        }
+        let start = self.first_note_at_or_after(from_height)?;
+        let mode = IteratorMode::From(&height_key(start), rocksdb::Direction::Forward);
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_NOTES), mode) {
+            if out.len() >= max_rows {
+                break;
+            }
+            let (k, v) = item?;
+            let row: NoteRow = bincode::deserialize(&v)?;
+            // Heights are non-decreasing in index, so the first row past the range ends the scan.
+            if row.height > to_height {
+                break;
+            }
+            out.push((be_u64(k.as_ref(), "note key")?, row));
         }
         Ok(out)
     }
@@ -2555,5 +2625,54 @@ mod tests {
         st.truncate_to(&gs, 2, &at_two).unwrap();
         assert!(st.program(&pid).unwrap().is_none());
         assert_eq!(st.load_ledger(&StubExecutor).unwrap(), at_two);
+    }
+
+    #[test]
+    fn notes_in_heights_returns_one_blocks_slice() {
+        // Genesis with two deposit notes (height 0), then two blocks each spending two
+        // notes and creating two: leaves 0,1 at height 0; 2,3 at height 1; 4,5 at height 2.
+        let gs = genesis_with(1, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)]);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let t1 = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![t1], &key(1));
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let t2 = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
+        let b2 = make_block(&b1.block, &mut ledger, vec![t2], &key(1));
+        storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+
+        let all = storage.notes_in_heights(0, 2, 1000).unwrap();
+        assert_eq!(all.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5]);
+        let one = storage.notes_in_heights(1, 1, 1000).unwrap();
+        assert_eq!(one.iter().map(|(i, r)| (*i, r.height)).collect::<Vec<_>>(), vec![(2, 1), (3, 1)]);
+        // A height past the head, and an empty height, are empty rather than errors.
+        assert!(storage.notes_in_heights(9, 9, 1000).unwrap().is_empty());
+        // max_rows truncates rather than failing.
+        assert_eq!(storage.notes_in_heights(0, 2, 3).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn derived_note_count_covers_the_notes_the_wire_does_not_carry() {
+        use shrugg_core::notes::ShieldedAddress;
+        let payout = ShieldedAddress { pk: [3; 8], kem_ek: vec![4; shrugg_core::notes::KEM_EK_BYTES] };
+        let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
+        let w = Transaction {
+            chain_id: 1,
+            bundle: None,
+            action: Action::Withdraw {
+                validator: Address([3; 32]), amount: 9, nonce: 0, time: 1, r: [5; 8],
+                envelope: envelope.clone(), signature: shrugg_core::Signature::empty(),
+            },
+        };
+        assert_eq!(derived_note_count(&w), 1, "the ledger derives a withdraw's deposit note");
+        assert_eq!(w.commitments().len(), 0, "and the wire does not carry it");
+        let _ = payout;
+        // A plain transfer carries both its notes itself.
+        let gs = fixtures::genesis_with(1, vec![]);
+        let t = fixtures::bundle_tx(&gs.ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        assert_eq!(derived_note_count(&t), 0);
+        assert_eq!(t.commitments().len(), 2);
     }
 }
