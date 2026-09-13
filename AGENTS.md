@@ -102,13 +102,18 @@ through the constraint-set-5 re-vendor, not as a local patch — so read
   (`git worktree add /tmp/fullnode-<name> <branch>`).
 - History alternates squashed mega-commits with small linear ones; branches
   get merged and deleted quickly. `main` is the only durable line.
-- Full test suite: `cargo test --release` (~15 min measured 2026-09-12 on a
-  machine also building for another session; cargo runs the test binaries one
-  after another and the two that prove real bundles dominate — the wallet flow
-  ~6 min, the TCP cluster suite ~4). S2 added two more proving cluster tests and
-  slowed the chain they run on to 2 s blocks so a proof cannot outlive its
-  256-block anchor when the cores are contended; see `PROVING` in
-  `crates/shrugg-node/tests/cluster.rs` before making that chain faster again.
+- Full test suite: `cargo test --workspace --release` — 466 tests across 27
+  binaries, **22 min measured 2026-09-13** on a machine also running another
+  session's build. Cargo runs the test binaries one after another and the two
+  that prove real bundles dominate: the wallet flow 9m19s (six bundle proofs
+  plus a call proof, after S2's bond stage and S3's call-envelope stage were
+  merged into it) and the TCP cluster suite 6m28s (16 tests). Phases S2 and S3
+  each added proving cluster tests and each slowed the chain they run on; the
+  integrated branch runs it at **3 s blocks** (S2 had raised it to 2, S3 to 3)
+  so a proof cannot outlive its 256-block anchor when the cores are contended.
+  Read `PROVING` in `crates/shrugg-node/tests/cluster.rs` before making that
+  chain faster again — capping proving concurrency is the real fix, and is not
+  done.
 - Doctest flakiness ("extern location ... does not exist") means a concurrent
   cargo run raced the cache; rerun.
 - The whitepaper is `../whitepapers/randprotocol.tex` (Draft 3) — its

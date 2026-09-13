@@ -67,14 +67,18 @@ register and its epochs, the supply audit, gas, genesis, a deterministic multi-r
 simulation with partitions, restarts and epoch rollovers), node unit tests (storage, corruption
 cases, the conflict mempool, the redacted RPC), wallet tests (key file, scanning, coin selection),
 the zkVM suite (upstream tests plus executor tests with real proofs), one wallet-flow test against a
-real one-node chain (mint, scan, send, spend the change, bond), and 14 cluster tests that start real
-nodes over TCP: a shielded transfer between wallets, a double-spend race between two validators, a
-deploy-and-call paid by bundles, a fifth validator that registers and bonds itself into the next
-epoch, a validator that unbonds out of the set and withdraws into a note its payout wallet spends,
-late joiners, restart cycles, quorum loss and recovery, corrupted database recovery, and the faucet.
-The cluster suite proves real bundles and takes about four minutes; the whole
-`cargo test --release` measured about a quarter of an hour, most of it proving, and longer again on a
-machine that is busy with something else.
+real one-node chain (mint, scan, send, spend the change, bond, and a confidential call whose input
+transcript it opens back), and 16 cluster tests that start real nodes over TCP: a shielded transfer
+between wallets, a double-spend race between two validators, a deploy-and-call paid by bundles, a
+call whose input envelope only its caller and its auditor open, a guardian-attested bridge deposit
+and a two-bundle burn, a fifth validator that registers and bonds itself into the next epoch, a
+validator that unbonds out of the set and withdraws into a note its payout wallet spends, late
+joiners, restart cycles, quorum loss and recovery, corrupted database recovery, and the faucet.
+
+**466 tests, all green.** `cargo test --workspace --release` measured 22 minutes on 2026-09-13, on a
+machine that was also running another session's build — most of it proving. The two tests that prove
+real bundles dominate: the wallet flow 9m19s (six bundle proofs and a call proof) and the cluster
+suite 6m28s. One test is `#[ignore]`d, a production-profile measurement harness.
 
 ## Run a node
 
