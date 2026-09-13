@@ -302,8 +302,11 @@ nobody. **What makes an opened transcript faithful** is the holder's own recompu
 `input_digest(salt, inputs) == H_IN` — because `H_IN` commits in-circuit to every word the guest
 read. A caller who seals a transcript that is not the preimage is not stopped by the chain; they are
 caught by whoever decrypts, who can show that decryption to anyone. `shrugg open-call` checks
-exactly this, then re-runs the program on the recovered inputs through the emulator so the receipt's
-outputs can be read against them.
+exactly this, then re-runs the program on the recovered inputs through the emulator and compares the
+outputs with the receipt's. Both checks are the command's **exit status**, not just a printed line:
+an unfaithful transcript, or one whose words do not reproduce the receipt's outputs, exits non-zero,
+so a script that opens a disclosure to check a claim cannot read a warning beside a zero exit as a
+yes.
 
 ```bash
 shrugg call <id> --input 400 --input 250 --auditor shrugg1q9f…   # seals for the caller and the auditor

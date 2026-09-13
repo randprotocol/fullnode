@@ -904,6 +904,38 @@ pub async fn submit(
     })
 }
 
+/// The two facts about the chain a burn needs before any proving: the chain has a bridge at all, and
+/// the asset index it names is one the registry holds.
+///
+/// Neither is something a wallet can know locally — both are state — and getting either wrong costs
+/// *two* bundle proofs (minutes of a laptop) for a transaction the ledger refuses outright:
+/// `Bridge(Disabled)` for a chain with no bridge, `Bridge(UnknownAsset)` for an index nothing was
+/// ever registered under. `shrugg bridge-mint` already reads the chain before proving for the same
+/// reason (`deposit_index`); this is a burn's half of it, off the one `shrugg_getBridgeState` reply,
+/// whose `assets` array is the registry.
+///
+/// Deliberately not the rest of `BridgeState::check_burn` — the destination chain must be the
+/// asset's own, the recipient must be shaped for it — which is the bridge's own policy and stays
+/// stated in one place.
+fn burn_is_possible(bridge_state: &Value, asset: u32) -> Result<()> {
+    if bridge_state["enabled"] != Value::Bool(true) {
+        return Err(anyhow!("this chain has no bridge, so there is nothing to burn to"));
+    }
+    let rows = bridge_state["assets"].as_array().context("bridge state has no asset registry")?;
+    if !rows.iter().any(|r| r["index"].as_u64() == Some(asset as u64)) {
+        let known: Vec<String> = rows.iter().filter_map(|r| r["index"].as_u64()).map(|i| i.to_string()).collect();
+        return Err(anyhow!(
+            "asset {asset} is not in this chain's registry, so no note of it was ever deposited{}",
+            if known.is_empty() {
+                " (the registry is empty)".to_string()
+            } else {
+                format!(" (registered: {})", known.join(", "))
+            }
+        ));
+    }
+    Ok(())
+}
+
 /// The chain's one two-bundle transaction (spec §10): burn `amount` of a bridged asset to
 /// `to_chain`/`to`, paying the SHRUGG fee from a second bundle.
 ///
@@ -941,6 +973,8 @@ pub async fn submit_burn(
     if relayer_fee > amount {
         return Err(anyhow!("the relayer fee {relayer_fee} is more than the {amount} being burned"));
     }
+    // One read of the chain, before any proving, for the two facts only the chain knows.
+    burn_is_possible(&rpc.bridge_state().await?, asset)?;
     scan(rpc, w, store).await?;
     // `burn == amount`, not `amount + relayer_fee`: the wire format's fee is a *portion* of the
     // amount (`fee <= amount`), carved out on the destination chain by the release contract. A
@@ -1281,6 +1315,34 @@ mod tests {
         assert_eq!(store.balance(), 7);
         let spendable: Vec<u64> = store.spendable().iter().map(|n| n.note.amount).collect();
         assert_eq!(spendable, vec![5, 2]);
+    }
+
+    /// A burn costs two bundle proofs, so the two things only the chain knows are checked before
+    /// any of that work: the chain has a bridge, and the registry holds the asset being burned.
+    #[test]
+    fn a_burn_checks_the_bridge_and_the_registry_before_proving() {
+        let registry = serde_json::json!([
+            { "index": 1, "chain": 2, "token": "aa", "asset_id": "00" },
+            { "index": 2, "chain": 2, "token": "bb", "asset_id": "01" },
+        ]);
+        let bridged = serde_json::json!({ "enabled": true, "next_index": 3, "assets": registry });
+        burn_is_possible(&bridged, 1).expect("a registered asset can be burned");
+        burn_is_possible(&bridged, 2).expect("and so can the second one");
+
+        // An index the registry does not hold: no note of it was ever deposited, so the ledger
+        // would refuse the transaction after both proofs.
+        let e = burn_is_possible(&bridged, 3).unwrap_err().to_string();
+        assert!(e.contains("asset 3 is not in this chain's registry") && e.contains("registered: 1, 2"), "{e}");
+
+        // A chain with no bridge at all, which is what `shrugg_getBridgeState` says with one field.
+        let e = burn_is_possible(&serde_json::json!({ "enabled": false }), 1).unwrap_err().to_string();
+        assert!(e.contains("no bridge"), "{e}");
+        // A bridged chain whose registry is still empty names that rather than listing nothing.
+        let empty = serde_json::json!({ "enabled": true, "next_index": 1, "assets": [] });
+        let e = burn_is_possible(&empty, 1).unwrap_err().to_string();
+        assert!(e.contains("registry is empty"), "{e}");
+        // And a reply with no registry at all is an error, not an empty registry.
+        assert!(burn_is_possible(&serde_json::json!({ "enabled": true }), 1).is_err());
     }
 
     /// A bond pays its stake by *burning* it, not by sending it: the bundle's only output is the

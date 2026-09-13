@@ -448,7 +448,7 @@ destination and the asset bundle's public fields. Balances are not among them �
 | Command | Purpose |
 |---------|---------|
 | `bridge-mint <ATTESTATION>` | deposit an attestation (hex or `@path`): seal the recipient's envelope, pay with a bundle of this wallet's SHRUGG |
-| `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | burn a bridged asset outbound; proves **two** bundles |
+| `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | burn a bridged asset outbound; checks the bridge and the registry first, then proves **two** bundles |
 | `asset-balance [INDEX]` | what this wallet's own notes hold in one bridged asset, or a row per asset |
 | `bridge` | the bridge's public state |
 | `bridge-message <SEQUENCE>` | one outbound message, verbatim, for a guardian to sign |
@@ -513,11 +513,13 @@ would no longer be caught here.
   re-reads from zero the first time. In-circuit envelope validity (spec §14) is not needed for
   deposits for the same reason: nothing about a deposit note is secret.
 - **The ledger-level vector pass has not been rebuilt** on the note pool (§7).
-- **`bridge-burn` learns about most bad arguments from the node, after paying for two proofs.** The
-  wallet pre-checks only a zero amount and a relayer fee above the amount; an unregistered asset, a
-  destination that is not that asset's home chain, or a recipient of the wrong shape all come back
-  as a rejection once both bundles have been proved (three minutes), because the wallet deliberately
-  does not restate the bridge's rules. Cheap to fix by asking `shrugg_getAssets` first.
+- **`bridge-burn` still learns about *some* bad arguments from the node, after paying for two
+  proofs.** The wallet now pre-checks four things before any proving: a zero amount, a relayer fee
+  above the amount, a chain with no bridge at all, and an asset index the registry does not hold —
+  the last two off one `shrugg_getBridgeState` read (`wallet::burn_is_possible`). What is left is
+  the bridge's own policy, which the wallet deliberately does not restate: a destination that is not
+  that asset's home chain, and a recipient of the wrong shape, both still come back as a rejection
+  once both bundles have been proved (three minutes).
 - **Equal-to-parent block timestamps are allowed.** The bridged-chain check in `apply_block` is `<`,
   not `<=` — it forbids a rewind but not a repeat. The residual, in the code's own words: "a
   colluding 2/3 of leaders can hold `timestamp_ms` constant, which freezes outbound burn timestamps

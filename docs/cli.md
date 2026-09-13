@@ -218,10 +218,10 @@ Global options, accepted before or after the subcommand:
 | `program deploy <FILE>` | `.json` or `.bin` (raw LE words), `--cuda` | pay the deploy floor through a bundle, wait for the commit, print the program id |
 | `program show <ID>` | | deployed program metadata |
 | `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--tier T`, `--fee <SHRUGG>`, `--auditor <shrugg1…>`, `--no-envelope`, `--print-call-key`, `--cuda` | fetch the code from the node, prove the call locally with the chain's FRI profile, seal its input transcript, pay through a bundle, wait, print the receipt |
-| `open-call <TXHASH>` | `--call-key <hex>`, `--as-auditor` | fetch the receipt and the sealed transcript, open it, check it against the receipt's `H_IN`, re-run the program on the recovered inputs and print both sets of outputs |
+| `open-call <TXHASH>` | `--call-key <hex>`, `--as-auditor` | fetch the receipt and the sealed transcript, open it, check it against the receipt's `H_IN`, re-run the program on the recovered inputs and compare the outputs with the receipt's. **Exits non-zero** if the transcript is not the preimage of that `H_IN`, or if the re-run disagrees with the receipt |
 | `receipt <TX>` | | receipt of a committed call, or "no receipt" |
 | `bridge-mint <ATTESTATION>` | hex or `@path`, `--to <shrugg1…>`, `--fee <SHRUGG>`, `--no-wait`, `--cuda` | deposit a guardian-signed attestation as a note: seal the deposit's envelope for its recipient and pay through a bundle from this wallet. Prints the note's `owner`, `time` and `r` every time, and on the waiting path checks the asset index the chain actually deposited under |
-| `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | `--relayer-fee N`, `--fee <SHRUGG>` (default `0.002`), `--no-wait`, `--cuda` | burn a bridged asset to another chain: select that asset's notes for the asset bundle and SHRUGG for the fee bundle, prove **both**, submit one transaction. `--relayer-fee` is a *portion* of `AMOUNT` paid to the relayer on the destination chain, not an extra charge: the asset bundle burns exactly `AMOUNT` |
+| `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | `--relayer-fee N`, `--fee <SHRUGG>` (default `0.002`), `--no-wait`, `--cuda` | burn a bridged asset to another chain: check the chain has a bridge and holds `ASSET` in its registry, select that asset's notes for the asset bundle and SHRUGG for the fee bundle, prove **both**, submit one transaction. `--relayer-fee` is a *portion* of `AMOUNT` paid to the relayer on the destination chain, not an extra charge: the asset bundle burns exactly `AMOUNT` |
 | `bridge` | | the bridge's public state: guardians, emitters, the asset registry, `next_index`, the burn sequence |
 | `bridge-message <SEQUENCE>` | | one outbound burn message, verbatim, for a guardian to sign |
 | `fee bundle` / `fee deploy <words>` / `fee call <tier>` | | minimum fee from the node's schedule |
@@ -282,7 +282,7 @@ shrugg notes                                    # the spent note, and the change
 shrugg program build --guest balance_check --arg 1000 --out bc.json
 shrugg program deploy bc.json                   # prints the program id
 shrugg call <id> --input 100 --input 200 --input 300 --input 400
-shrugg open-call <txhash>                       # inputs: [100, 200, 300, 400] — H_IN: faithful
+shrugg open-call <txhash>                       # inputs: [100, 200, 300, 400] — verdict: faithful (exit 0)
 ```
 
 ### Key file formats

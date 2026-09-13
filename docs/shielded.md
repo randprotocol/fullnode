@@ -356,8 +356,8 @@ wallet change, not a chain change.
 Phase S3 added the same two grains for *computation*, and these the CLI does offer: a call may
 publish its private inputs as a sealed transcript, openable by the caller's viewing key, by a
 per-call key (`--print-call-key`), or by an auditor named when the call was made (`--auditor`), and
-`shrugg open-call` checks the opened transcript against the `H_IN` the proof published before
-believing it. `--no-envelope` publishes nothing at all, which is irreversible: once the salt is
+`shrugg open-call` checks the opened transcript against the `H_IN` the proof published and re-runs
+the program on it, and exits non-zero rather than believing it if either check fails. `--no-envelope` publishes nothing at all, which is irreversible: once the salt is
 gone, nobody can open that call. See `docs/confidential.md` §call input envelopes.
 
 ## 7. What is next

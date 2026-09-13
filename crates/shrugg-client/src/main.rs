@@ -347,6 +347,43 @@ async fn register_stake(rpc: &RpcClient, address: &str) -> Result<Option<u64>> {
     Ok(Some(stake.parse().context("the register's stake is not a number")?))
 }
 
+/// The verdict `shrugg open-call` returns to its caller: `Ok` only when the opened transcript is
+/// both faithful and consistent with the receipt it came with.
+///
+/// Two independent checks, and the chain makes neither. `faithful` is that the transcript hashes to
+/// the `H_IN` the proof published, which commits in-circuit to every word the guest read — so an
+/// unfaithful transcript is a lie its holder can show to anyone (spec §6.1). The second is that
+/// re-running the program on those words reproduces the outputs the receipt reports; the emulator is
+/// the reference semantics for the same program, so a difference means these inputs are not what
+/// produced that receipt even if they hash correctly.
+///
+/// An `Err` is the point: this is what makes the command exit non-zero, so a script that opens a
+/// transcript to check a claim gets an answer it cannot mistake for a yes.
+fn transcript_verdict(faithful: bool, emulated: &[u32], receipt_outputs: &serde_json::Value) -> Result<()> {
+    if !faithful {
+        anyhow::bail!(
+            "NOT FAITHFUL: this transcript is not the preimage of the receipt's H_IN — \
+             whoever published it did not run the program on these words"
+        );
+    }
+    // The receipt's outputs are JSON numbers; anything else means this is not a call receipt at all,
+    // which is worth failing on rather than comparing against nothing.
+    let from_receipt: Option<Vec<u32>> = receipt_outputs
+        .as_array()
+        .map(|a| a.iter().map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok())).collect::<Option<Vec<u32>>>())
+        .unwrap_or(None);
+    let Some(from_receipt) = from_receipt else {
+        anyhow::bail!("the receipt's outputs are not eight numbers ({receipt_outputs}) — nothing to compare against");
+    };
+    if from_receipt != emulated {
+        anyhow::bail!(
+            "OUTPUT MISMATCH: re-running the program on this transcript gives {emulated:?}, \
+             and the receipt reports {from_receipt:?} — these inputs are not what produced that receipt"
+        );
+    }
+    Ok(())
+}
+
 /// A command-line argument that is either hex outright or `@path` to read the hex from a file.
 /// Whitespace is ignored, so a file written by `xxd` or an editor works as it is.
 fn read_hex_arg(arg: &str) -> Result<Vec<u8>> {
@@ -664,11 +701,7 @@ async fn main() -> Result<()> {
             // that it hashes to the `H_IN` the proof published, which commits in-circuit to every
             // word the guest read. A transcript that fails this is a lie the holder can show to
             // anyone (spec §6.1).
-            if call_envelope::call_envelope_is_faithful(&h_in, salt, &inputs) {
-                println!("H_IN: faithful — these are the words the proof was made over");
-            } else {
-                println!("H_IN: NOT FAITHFUL — this transcript is not the preimage of the receipt's H_IN");
-            }
+            let faithful = call_envelope::call_envelope_is_faithful(&h_in, salt, &inputs);
             // Re-run the program on the transcript. The receipt's outputs came out of a proof; these
             // come out of the emulator, which is the reference semantics for the same program, so a
             // difference means the transcript is not what produced that receipt.
@@ -677,6 +710,11 @@ async fn main() -> Result<()> {
             let exec = emulator::execute(&Program { base_pc, words }, &inputs, Tier(*TIERS.last().expect("a tier")).max_cycles())
                 .map_err(|e| anyhow::anyhow!("re-running the program on these inputs failed: {e:?}"))?;
             println!("emulator outputs: {:?}\nreceipt outputs:  {}", exec.outputs, receipt["outputs"]);
+            // The verdict is the exit status, not a line of output: whoever runs this in a script is
+            // asking "is this transcript the one that produced that receipt", and a printed
+            // NOT FAITHFUL beside a zero exit reads as a yes.
+            transcript_verdict(faithful, &exec.outputs, &receipt["outputs"])?;
+            println!("verdict: faithful — these are the words the proof was made over, and they reproduce its outputs");
         }
         Cmd::BridgeMint { attestation, to, fee, no_wait, cuda } => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
@@ -856,4 +894,42 @@ async fn main() -> Result<()> {
         Cmd::Validators => println!("{}", pretty(&rpc.validators().await?)),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `open-call`'s verdict is its exit status. A transcript that is not the preimage of the
+    /// receipt's `H_IN` is a lie its holder can show to anyone, and one whose words do not
+    /// reproduce the receipt's outputs is not what produced that receipt — either way the command
+    /// has to fail, or a script checking a disclosure reads a printed warning beside a zero exit as
+    /// a yes.
+    #[test]
+    fn a_transcript_that_is_not_the_one_behind_the_receipt_fails() {
+        let outputs = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let receipt = json!(outputs);
+
+        // Faithful and reproducing: the only case that passes.
+        transcript_verdict(true, &outputs, &receipt).expect("a faithful, consistent transcript opens");
+
+        // Unfaithful, even with matching outputs — H_IN is the commitment, and it is checked first.
+        let e = transcript_verdict(false, &outputs, &receipt).unwrap_err().to_string();
+        assert!(e.contains("NOT FAITHFUL"), "{e}");
+
+        // Faithful, but the program run on these words produces something else.
+        let mut other = outputs;
+        other[7] = 9;
+        let e = transcript_verdict(true, &other, &receipt).unwrap_err().to_string();
+        assert!(e.contains("OUTPUT MISMATCH") && e.contains("[1, 2, 3, 4, 5, 6, 7, 9]"), "{e}");
+        // And a length disagreement is a mismatch too, not a silent prefix compare.
+        assert!(transcript_verdict(true, &outputs[..7], &receipt).is_err());
+
+        // A receipt that is not shaped like outputs at all fails rather than comparing to nothing.
+        for bad in [json!(null), json!("nope"), json!([1, "two"]), json!([1, -2]), json!([1, 4294967296u64])] {
+            let e = transcript_verdict(true, &outputs, &bad).unwrap_err().to_string();
+            assert!(e.contains("not eight numbers"), "{bad}: {e}");
+        }
+    }
 }
