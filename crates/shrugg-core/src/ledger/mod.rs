@@ -39,8 +39,17 @@ pub use staking::{StakingError, ValidatorEntry};
 pub use supply::{register_total, Audit, Supply};
 
 /// A deposit note the ledger created itself while applying a transaction, rather than accepting
-/// on the wire: S2's `Withdraw` (and S3's `BridgeAttest`) publish only a blinding and a public
-/// amount, so the commitment is computed here and is not in [`Transaction::commitments`].
+/// on the wire: S2's `Withdraw` publishes only a blinding and a public amount, and the owner is
+/// the payout address in the register, so the commitment is computed here and is not in
+/// [`Transaction::commitments`].
+///
+/// S3's `BridgeAttest` creates a note the wire does not carry either, and is deliberately *not*
+/// on this list: its note goes into the tree through [`Ledger::deposit`], and a node that has to
+/// index it rebuilds it from the transaction and the asset registry alone
+/// (`bridge_notes::deposit_note`, which `storage::created_notes` calls), because every input to
+/// that commitment is public. A withdraw's note cannot be rebuilt that way — only the register
+/// knows who it pays — which is the whole reason this list exists. The one place the two are
+/// answered together is [`Ledger::derived_commitment`], for the mempool's conflict index.
 ///
 /// This is transient output, like a call receipt — not consensus state, not in the state root,
 /// not compared by [`Ledger`]'s equality. `apply_transactions` clears the list when a block

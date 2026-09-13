@@ -7,9 +7,12 @@
 //! the pool never holds two transactions that spend the same nullifier, create the same
 //! commitment, or consume the same bridge attestation digest, because at most one of them could
 //! ever be included and carrying the other only wastes the proposer's block space and a
-//! (~20 ms) proof verification per gossip round. One of those commitments is not in the
-//! transaction at all: a `Withdraw`'s deposit note, which the ledger derives from the register,
-//! and which two withdraws can collide over just as two bundles can collide over an output.
+//! (~20 ms) proof verification per gossip round. Some of those commitments are not in the
+//! transaction at all: the notes the *ledger* creates — a `Withdraw`'s deposit, whose owner is
+//! the payout address in the register, and a `BridgeAttest`'s, whose amount and asset come from
+//! the attestation and the registry. Two of either can collide over one note just as two bundles
+//! can collide over an output, so `Ledger::derived_commitment` answers for both and the pool
+//! claims what it answers.
 
 use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::ledger::bridge_notes;
@@ -25,8 +28,10 @@ pub enum MempoolError {
     Duplicate,
     #[error("conflicts with a pending transaction over {}", word8_to_hex(.0))]
     Conflict(Word8),
-    /// Two relayers raced the same bridge attestation. Their transactions share no nullifier
-    /// and no commitment, so only the digest tells them apart.
+    /// Two relayers raced the same bridge attestation. Their transactions share no nullifier and
+    /// no commitment *of their own*, so the digest is what tells them apart — unless the two
+    /// happened to choose the same blinding for the deposit, in which case the note they both
+    /// derive collides first and the conflict is reported over that note instead.
     #[error("conflicts with a pending transaction over bridge attestation {0}")]
     AttestationConflict(Hash),
     #[error("mempool full")]
@@ -36,9 +41,9 @@ pub enum MempoolError {
 /// A pooled transaction and the commitments it claims.
 ///
 /// The claims are remembered rather than recomputed because one of them is not on the wire: the
-/// note a `Withdraw` makes the ledger create comes from the register, via
-/// `Ledger::derived_commitment`, so a transaction leaving the pool could not name it again
-/// without a ledger to hand.
+/// note a `Withdraw` or a `BridgeAttest` makes the ledger create comes from the register or the
+/// asset registry, via `Ledger::derived_commitment`, so a transaction leaving the pool could not
+/// name it again without a ledger to hand.
 struct Pooled {
     tx: Transaction,
     commitments: Vec<Word8>,
@@ -72,7 +77,7 @@ pub struct Mempool {
     /// Which pooled transaction spends each nullifier — one owner per nullifier, always.
     nullifiers: HashMap<Word8, Hash>,
     /// Which pooled transaction creates each commitment: a bundle's two output slots, a mint's
-    /// single note, or the deposit a `Withdraw` will make the ledger create.
+    /// single note, or the deposit a `Withdraw` or a `BridgeAttest` will make the ledger create.
     commitments: HashMap<Word8, Hash>,
     /// Which pooled transaction claims each validator's next register action — an `Unbond` or
     /// `Withdraw`'s `(validator, nonce)`, keyed the same way `commitments` claims a note.
@@ -86,8 +91,9 @@ pub struct Mempool {
 
 /// Every commitment `tx` claims: the ones it carries, plus the deposit `ledger` would derive for
 /// it. Two transactions claiming one commitment can never both be included, so the pool holds at
-/// most one of them — and for a withdraw that is also what makes a second withdraw paying the same
-/// note a conflict here rather than a transaction the proposer silently drops.
+/// most one of them — which is what makes a second `Withdraw` paying the same note, or a second
+/// relayer's `BridgeAttest` deriving it, a conflict here rather than a transaction the proposer
+/// silently drops at its trial apply.
 fn claimed_commitments(tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> Vec<Word8> {
     let mut v = tx.commitments();
     v.extend(ledger.derived_commitment(&tx.action, executor));
@@ -253,8 +259,8 @@ impl Mempool {
                 return false;
             }
         }
-        // The claims include a withdraw's derived deposit, so a note someone else created in the
-        // meantime takes that withdraw out of the pool too.
+        // The claims include a derived deposit, so a note someone else created in the meantime
+        // takes the withdraw or the attest that would have created it out of the pool too.
         !tx.nullifiers().iter().any(|nf| ledger.is_spent(nf))
             && !p.commitments.iter().any(|cm| ledger.has_commitment(cm))
             && !tx.bridge_digests().iter().any(|mu| ledger.is_digest_spent(mu))
@@ -648,7 +654,13 @@ mod tests {
     /// so two relayers' transactions have nothing in common but the attestation itself. The
     /// `asset` word is the index `l`'s registry would deposit under, as a wallet would fill it in.
     fn attest_tx(l: &Ledger, attestation: Vec<u8>, seed: u8) -> Transaction {
-        let s = seed as u32;
+        attest_tx_with_r(l, attestation, seed, [seed as u32; 8])
+    }
+
+    /// [`attest_tx`] with the blinding spelled out. Two relayers that pick the same `r` for the
+    /// same deposit at the same `time` derive the very same note, which is a collision no field of
+    /// either transaction shows.
+    fn attest_tx_with_r(l: &Ledger, attestation: Vec<u8>, seed: u8, r: Word8) -> Transaction {
         let b = fixtures::bundle(l, [nf(seed), nf(seed + 1)], [cm(seed), cm(seed + 1)], fixtures::bundle_fee());
         let asset = fixtures::deposit_index(l, &attestation);
         Transaction::shielded(
@@ -657,12 +669,28 @@ mod tests {
             Action::BridgeAttest {
                 attestation,
                 recipient: recipient(),
-                r: [s; 8],
+                r,
                 time: l.height() as u32,
                 asset,
                 envelope: fixtures::env(seed),
             },
         )
+    }
+
+    /// [`bridged_ledger`] with validator 1 holding more rewards than the bundle base, so it has
+    /// something to withdraw beside an attestation: two applied bundles whose fees are its own as
+    /// their proposer, exactly as [`ledger_with_rewards`] does it on the unbridged chain.
+    fn bridged_ledger_with_rewards() -> (Ledger, Vec<[u8; 32]>) {
+        let (mut l, secrets) = bridged_ledger();
+        let v = fixtures::key(1);
+        for (height, n) in [(1u64, 40u8), (2, 44)] {
+            l.set_height(height);
+            let t = fixtures::bundle_tx(&l, [nf(n), nf(n + 1)], [cm(n), cm(n + 1)], fixtures::bundle_fee());
+            l.apply_tx(&t, &v.address(), &StubExecutor).unwrap();
+            l.record_anchor(height);
+        }
+        assert_eq!(l.released(&v.address()), 2 * fixtures::bundle_fee());
+        (l, secrets)
     }
 
     /// A bridge is permissionless, so two relayers racing one attestation is the normal case,
@@ -752,5 +780,74 @@ mod tests {
         assert_eq!(*asset, 2);
         m.insert(again.clone(), &after, &StubExecutor).unwrap();
         assert_eq!(m.candidates(&after, 10), vec![again]);
+    }
+
+    /// Two attestations of one transfer, with two different digests — a different `sequence`, so
+    /// nothing the digest index tracks connects them — submitted by relayers that happened to
+    /// choose the same blinding and the same `time`. The note the *ledger* derives is then one
+    /// note, and only one of the two can ever be included. Before the derivation covered an
+    /// attest, both pooled and the second died at the proposer's trial apply with
+    /// `CommitmentExists`, costing a block's worth of space and a proof verification per gossip
+    /// round; now they collide at insert, over the note itself.
+    #[test]
+    fn two_attests_deriving_one_note_conflict_at_insert() {
+        let (l, secrets) = bridged_ledger();
+        let first = attest_tx_with_r(&l, attestation_of(&secrets, [0xaa; 32], 0), 10, [7; 8]);
+        let second = attest_tx_with_r(&l, attestation_of(&secrets, [0xaa; 32], 1), 20, [7; 8]);
+        // Nothing the other indexes track connects them, and both are independently admissible:
+        // the collision is between the two transactions, not inside either.
+        assert_ne!(first.bridge_digests(), second.bridge_digests(), "two digests, so two attestations");
+        assert!(first.nullifiers().iter().all(|x| !second.nullifiers().contains(x)));
+        assert!(first.commitments().iter().all(|x| !second.commitments().contains(x)));
+        assert_eq!(l.validate(&first, &StubExecutor), Ok(()));
+        assert_eq!(l.validate(&second, &StubExecutor), Ok(()));
+
+        let derived = l.derived_commitment(&first.action, &StubExecutor).expect("an attest derives one note");
+        assert_eq!(
+            l.derived_commitment(&second.action, &StubExecutor),
+            Some(derived),
+            "the same recipient, amount, asset, time and blinding is the same note"
+        );
+        assert!(!first.commitments().contains(&derived), "and neither transaction carries it");
+
+        let mut m = Mempool::new(100);
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(
+            m.insert(second.clone(), &l, &StubExecutor),
+            Err(MempoolError::Conflict(derived)),
+            "named by the note the two disagree over"
+        );
+        // A bundle whose output slot is that same note collides with it too, exactly as it does
+        // with a withdraw's derived deposit.
+        let clash = fixtures::bundle_tx(&l, [nf(1), nf(2)], [derived, cm(2)], fixtures::bundle_fee());
+        assert_eq!(m.insert(clash, &l, &StubExecutor), Err(MempoolError::Conflict(derived)));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.candidates(&l, 10), vec![first.clone()]);
+
+        // And removing the owner frees the note, so the loser can take its place.
+        m.remove(&[first.hash()]);
+        m.insert(second, &l, &StubExecutor).unwrap();
+    }
+
+    /// The claim is one note, not one *kind* of note: an attest and a withdraw that derive
+    /// different notes are unrelated, and the pool has to hold both — a bridged chain whose
+    /// validator is also withdrawing is the ordinary case, and dropping either would cost a
+    /// transaction that is perfectly includable.
+    #[test]
+    fn an_attest_and_a_withdraw_deriving_different_notes_both_pool() {
+        let (l, secrets) = bridged_ledger_with_rewards();
+        let v = fixtures::key(1);
+        let attest = attest_tx(&l, attestation(&secrets), 10);
+        let withdraw =
+            fixtures::withdraw_tx(l.chain_id(), &v, 2 * fixtures::bundle_fee(), 0, l.height() as u32, [3; 8]);
+        let deposited = l.derived_commitment(&attest.action, &StubExecutor).expect("the attest derives a note");
+        let withdrawn = l.derived_commitment(&withdraw.action, &StubExecutor).expect("the withdraw derives a note");
+        assert_ne!(deposited, withdrawn, "different owners, different amounts, different assets");
+
+        let mut m = Mempool::new(100);
+        m.insert(attest.clone(), &l, &StubExecutor).unwrap();
+        m.insert(withdraw.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.candidates(&l, 10).len(), 2, "and both are offered to the proposer");
     }
 }

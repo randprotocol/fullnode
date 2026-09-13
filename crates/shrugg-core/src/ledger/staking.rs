@@ -11,8 +11,14 @@
 //! note commitment the chain computes for a withdraw's deposit — which the chain computes
 //! itself, from the register's payout address and the action's published blinding, precisely so
 //! a validator cannot declare one amount and mint a note for another.
+//!
+//! One thing here is not about the register at all: [`Ledger::derived_commitment`], which answers
+//! that same question — "what note would this action make the ledger create?" — for every action
+//! that makes one, a `BridgeAttest` included. It lives beside the withdraw note because the
+//! withdraw is where the problem first appeared, and it is one function because the mempool needs
+//! one answer (`shrugg_node::mempool`).
 
-use super::{Ledger, TxError};
+use super::{bridge_notes, Ledger, TxError};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, PublicKey, Signature};
 use crate::gas;
@@ -126,18 +132,39 @@ impl Ledger {
         })
     }
 
-    /// The deposit commitment this ledger would create for `action`, for a caller that has to
-    /// reason about the note before admission does: the mempool's conflict index, which must hold
-    /// a `Withdraw`'s note even though the wire does not carry it (only the register knows the
-    /// payout address it pays to). S3's `BridgeAttest` joins this list when it lands.
+    /// The note this ledger would create for `action` itself — the one commitment that is not on
+    /// the wire — for a caller that has to reason about it before admission does: the mempool's
+    /// conflict index, which must hold such a note just as it holds a bundle's outputs, or it
+    /// pools two transactions of which at most one could ever be included.
     ///
-    /// `None` when the action creates no such note, and when this register cannot derive one — an
-    /// unknown validator, or an amount that does not cover the bundle base — both of which
-    /// [`validate`] refuses on its own.
+    /// Both actions that mint a note out of public words and a blinding are here, and this is the
+    /// only place either is derived from outside the ledger:
+    ///
+    /// - a `Withdraw` (S2), whose owner is known only to the register — the validator's payout
+    ///   address — and whose amount is the withdrawal less the bundle base;
+    /// - a `BridgeAttest` (S3), whose amount is the one the guardians signed and whose `asset` is
+    ///   the index the registry assigns, neither of which the submitter chooses. Read off the wire
+    ///   bytes and the registry alone (`bridge_notes::attested_transfer`, `deposit_index`): no
+    ///   guardian signature is recovered, because a caller screening a pool must not be able to
+    ///   buy that work. The action's own `asset` word is deliberately not consulted: it is the
+    ///   submitter's claim, and admission holds it to this very index
+    ///   (`TxError::AttestAssetMismatch`).
+    ///
+    /// `None` when the action creates no such note, and when this state cannot derive one — an
+    /// unknown validator, an amount that does not cover the bundle base, a chain with no bridge, an
+    /// attestation that decodes to no transfer (a rotation deposits nothing) or to an asset the
+    /// registry has no index for. Every one of those is something [`validate`] refuses on its own,
+    /// which is what makes a missing claim safe here: the pool would admit a second transaction
+    /// only for the ledger to refuse it.
     pub fn derived_commitment(&self, action: &Action, executor: &dyn ConfidentialExecutor) -> Option<Word8> {
         match action {
             Action::Withdraw { validator, amount, time, r, .. } => {
                 withdraw_note(self, validator, *amount, *time, r, executor).ok()
+            }
+            Action::BridgeAttest { attestation, recipient, r, time, .. } => {
+                let (id, amount) = bridge_notes::attested_transfer(attestation)?;
+                let index = self.bridge()?.deposit_index(&id)?;
+                Some(bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor))
             }
             _ => None,
         }
@@ -790,7 +817,11 @@ mod tests {
         let cm = withdrawn_note(1, 120 * BASE, 5, [3; 8]);
         assert!(l.has_commitment(&cm), "the withdraw note is in the tree");
         assert_eq!(claimed, Some(cm), "and it is the note the ledger named in advance");
-        assert_eq!(l.derived_commitment(&Action::None, &StubExecutor), None, "only a withdraw derives one");
+        assert_eq!(
+            l.derived_commitment(&Action::None, &StubExecutor),
+            None,
+            "an action that makes the ledger create no note derives none"
+        );
         assert_eq!(l.next_index(), notes_before + 1, "one note, and no bundle to carry two more");
         let deposits = l.deposits();
         assert_eq!(deposits.len(), 1);

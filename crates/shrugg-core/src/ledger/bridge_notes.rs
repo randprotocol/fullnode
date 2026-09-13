@@ -491,6 +491,10 @@ mod tests {
         let mut tx = attest_tx(&l, a, recipient(), 20);
         let Action::BridgeAttest { time, .. } = &mut tx.action else { panic!("an attest") };
         *time = 5;
+        // The same note, named before the transaction is applied: this is what a mempool claims
+        // for an attest (`Ledger::derived_commitment`, one derivation for a withdraw and an attest
+        // alike), and it reads the registry rather than the action's `asset` word.
+        assert_eq!(l.derived_commitment(&tx.action, &StubExecutor), Some(expected_cm(5, 1_000, 1)));
         l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
         assert!(l.has_commitment(&expected_cm(5, 1_000, 1)), "the note the action's time names");
         assert!(!l.has_commitment(&expected_cm(9, 1_000, 1)), "and not the one the apply height would");
