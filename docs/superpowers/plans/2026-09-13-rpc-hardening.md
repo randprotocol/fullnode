@@ -2,6 +2,67 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Reconciliation 2026-09-13
+
+This plan was written against main `3c0f119`. Two branches have merged since — **review-followups**
+(`170a8d9..a58c080`) and **fix-sync-stall** (`a58c080..9ffdd43`) — and they touched every file the
+plan edits. What moved, and what each task now has to do about it:
+
+- **`rpc.rs::handle` already has a shape.** It is no longer `Json<Request> -> Json<Value>`: it takes
+  `Result<Json<Request>, axum::extract::rejection::JsonRejection>` and returns
+  `(StatusCode, Json<Value>)`, so a body axum refuses comes back as JSON-RPC rather than plain text
+  (`rejection_error`, rpc.rs:222). **Task 2 wraps that shape instead of replacing it** — the request
+  type becomes `Result<Json<Value>, JsonRejection>`, the rejection arm and the non-`OK` status stay,
+  and the batch tests destructure `(StatusCode, Json(v))`.
+- **`-32600` already exists.** `RpcError::invalid_request` (rpc.rs:139) was added for oversized and
+  malformed bodies, and `docs/rpc.md`'s Errors table still does not list it. Task 2 reuses the
+  constructor rather than writing the code inline, and its doc step adds the one row covering all
+  three uses (oversized body, batch shape, notification). The Global Constraint that said this plan
+  *adds* the code is amended below.
+- **The body limit is derived now.** `RPC_MAX_BODY_BYTES` (rpc.rs:154–175) is
+  `2 * (2*MAX_PROOF_BYTES + 2*MAX_ENVELOPE_BYTES + MAX_CALL_ENVELOPE_BYTES + MAX_ATTESTATION_BYTES +
+  64 KiB) + 256 KiB` ≈ **8.86 MB**, sized for one transaction carrying two proofs, and `serve`
+  layers it with `DefaultBodyLimit`. Task 2's `MAX_BATCH` is the *request-count* bound and this is
+  the *byte* bound; Task 3's route merge must keep the layer.
+- **A transaction bigger than a block is refused twice.** `shrugg_sendTransaction` pre-checks
+  `tx.encoded_len() > gas::MAX_BLOCK_BYTES` (rpc.rs:475) and `Ledger::validate` step 1 returns the
+  new `TxError::TransactionTooLarge(usize)`. Task 1 maps no `TxError` variants, so it is unaffected;
+  **Task 4's `is_permanent` allowlist gains `TransactionTooLarge(_)`** — a byte length is a function
+  of the bytes.
+- **`NodeStatus` grew four fields**: `sync_inflight_age_ms`, `sync_failures`, `sync_late_batches`,
+  `connected_peers`. Tasks 3 and 5 add `ws_clients` / `refused_cache` / `verify_queue` **into that
+  same block, in the same doc-commented style**, and set them in `publish_status` (node.rs:512)
+  beside `s.sync_failures`. No task adds a counter that duplicates one of the four.
+- **`Node::peers` is `HashMap<PeerId, Peer>`** now, where `Peer { status: Option<Status>, connected:
+  bool }` (node.rs:230). **The per-peer token bucket becomes a third field on `Peer`**, not a map
+  inside `PeerLimiter`: `PeerDisconnected` already does `self.peers.remove(&p)`, so the bucket dies
+  with the peer and `PeerLimiter::forget` is dropped. That arm also calls `maybe_sync()` now, which
+  must stay.
+- **Gossip `from` is the author, not the forwarder.** `Peer`'s doc comment states it: a validator
+  several hops away, with no connection to us, lands in `peers` purely as the author of relayed
+  gossip — which is what `connected_peers` exists to expose. So the rate limit is keyed on
+  `GossipId.propagation_source`. Ruling amended below.
+- **`network/mod.rs` grew a lot that is out of scope**: `pub mod codec`, `SYNC_REQUEST_TIMEOUT`,
+  `SYNC_MAX_WIRE_BYTES`, `SYNC_RESPONSE_WIRE_LIMIT`, `SYNC_REQUEST_WIRE_LIMIT`, `addr_scope`,
+  `is_dialable_advertised_addr`, and a `lan_peers` set threaded through `handle_swarm_event`.
+  `ValidationMode::Permissive` moved from line 139 to **247**. Task 5 touches only the gossipsub
+  `ConfigBuilder` (245–250) and the `Event::Message` arm (486–493).
+- **`mempool.rs` claims a `BridgeAttest`'s derived note too.** `claimed_commitments` calls
+  `Ledger::derived_commitment` (shrugg-core `ledger/staking.rs:161`) for `Withdraw` *and*
+  `BridgeAttest`, so Task 4's `precheck` keeps its `&dyn ConfidentialExecutor` argument, and Task 1's
+  `derived_note_count` must cover the same two arms. `candidates_within` also continues past an
+  oversized candidate now; no task here touches it.
+- **The cluster suite is serialised by a proving-slot file lock** (`<target-dir>/tmp/shrugg-proving-slot.lock`,
+  `crates/shrugg-node/tests/proving_slot/`). It is **17 tests / 19m59s**, not 16 / 6m28s. Task 6's one
+  `--test cluster` run is sized accordingly and its proving test must take the slot.
+- **The client sizes its POST timeout by body** (`shrugg-client` `READ_TIMEOUT` 15 s flat for reads,
+  `upload_timeout` = 30 s + body/32 KiB/s for uploads). Task 1's page caps sit under the 15 s read
+  budget; Task 5's extra submission latency sits inside `upload_timeout`.
+- **`docs/rpc.md` gained a `shrugg_status` block** documenting the four sync fields. Tasks 3 and 6
+  **append** to it and to the Errors table; nothing in this plan rewrites what fix-sync-stall wrote.
+
+Scope is unchanged: the same six tasks, the same rulings, with the two amendments named below.
+
 **Goal:** Give the node the four read/serve capabilities a light wallet and an explorer need and a chain under load survives — a compact-block range read, a WebSocket `newHeads` subscription, JSON-RPC batch requests, and an admission path that refuses a known-bad transaction for free, rate-limits gossiped submissions per peer, and verifies proofs off the consensus event loop under gossipsub application-level validation — **without a hard fork**.
 
 **Architecture:** Everything here is node-local. `shrugg_getCompactBlocks` derives its rows from the block store and the `notes` family already on disk — no new column family, so it answers on a database written by the current binary and needs no migration. Batching wraps the existing `dispatch`; the WebSocket lives in a new `src/ws.rs` served on the same axum router and fed by a `tokio::sync::broadcast` channel the node loop publishes one head into per committed block. The admission work splits `Mempool::insert` into a cheap `precheck` (pool conflicts + the state-dependent half of `Ledger::validate`) and an `insert_verified`, so the expensive half — the bundle and call proofs — can run on `tokio::task::spawn_blocking` against an `Arc<Ledger>` snapshot while the node loop keeps turning; the verdict comes back on a channel, decides the gossipsub `MessageAcceptance`, and feeds a bounded refused-hash cache.
@@ -13,12 +74,19 @@
 ## Global Constraints
 
 - **No hard fork.** Nothing in this plan may change block validity, the transaction wire format, the genesis hash, any consensus rule, or the gossip topic names / `GossipMessage` encoding. The result deploys onto the running **chain 8** fleet (18 validators) by rolling restart, with old and new binaries coexisting indefinitely.
-- **Do not change `ValidationMode::Permissive`** in `crates/shrugg-node/src/network/mod.rs:139`. A Strict/Permissive mix across a fleet drops messages. What this plan turns on is `ConfigBuilder::validate_messages()` — *application*-level validation, which is local to one node and invisible on the wire.
+- **Do not change `ValidationMode::Permissive`** in `crates/shrugg-node/src/network/mod.rs:247` (it moved from :139 when fix-sync-stall added the wire constants above it). A Strict/Permissive mix across a fleet drops messages. What this plan turns on is `ConfigBuilder::validate_messages()` — *application*-level validation, which is local to one node and invisible on the wire.
+- **The sync wire is out of scope.** `network/codec.rs`, `SYNC_REQUEST_TIMEOUT`, `SYNC_MAX_WIRE_BYTES`, `SYNC_RESPONSE_WIRE_LIMIT`, `SYNC_REQUEST_WIRE_LIMIT`, `addr_scope` / `is_dialable_advertised_addr` and the `lan_peers` set are fix-sync-stall's, and nothing here reads or changes them. Task 5's only edit in `network/mod.rs` is the gossipsub `ConfigBuilder` (lines 245–250) and the `Event::Message` arm (486–493). Likewise the sync counters (`sync_failures`, `sync_late_batches`, `sync_inflight_age_ms`) are read-only to this plan: no task increments them, and no task adds a counter that shadows one.
 - `validate_messages()` makes every delivered gossipsub message require exactly one `report_message_validation_result` call, or it is never forwarded by this node. **Every `NetworkEvent::Gossip` must be reported exactly once, on every path, including error paths.** Consensus and status messages are reported `Accept` immediately (that is today's behaviour); only transactions wait for a verdict.
 - The gossipsub message cache holds an unvalidated message for `history_length` (5) heartbeats at a `heartbeat_interval` of 500 ms = **2.5 s**. A verdict later than that reports into nothing. Every queue size below is chosen against that budget.
-- Tests: `cargo test --release -p shrugg-node` for node-only work. **Per-task verification uses focused runs** (`--lib <filter>`, or one `--test <file>`); the full workspace suite is 466 tests / 22 min and proves real bundles. **The cluster suite (`--test cluster`, 16 tests, 6m28s) is run once, in the final task.** Never run the whole workspace suite mid-plan.
+- Tests: `cargo test --release -p shrugg-node` for node-only work. **Per-task verification uses focused runs** (`--lib <filter>`, or one `--test <file>`); the full workspace suite is 466 tests / 22 min — measured *before* the proving slot below, so longer now — and proves real bundles. **The cluster suite (`--test cluster`) is run once, in the final task.** Never run the whole workspace suite mid-plan.
+- **The proving slot, and what it costs.** Every proving test in the workspace takes one permit through a file lock at `<target-dir>/tmp/shrugg-proving-slot.lock` (`crates/shrugg-node/tests/proving_slot/`, twinned in `crates/shrugg-client/tests/proving_slot/`), so no two unrelated bundle proofs run at once — **across test binaries and across two sessions' concurrent `cargo test` runs**. Consequences for this plan:
+  - The cluster suite is **17 tests / 19m59s measured 2026-09-13**, serialised, not the 16 / 6m28s this plan was written against. Task 6's single `--test cluster` run should be expected to take **~20 minutes plus whatever its new proof adds**, and must not be reported as hung before then.
+  - **Do not start it while another session's `--test cluster` or `--test wallet_flow` holds the lock**: the two runs will not overlap their proofs, they will queue, and the wall time adds. Check first (`lsof <target-dir>/tmp/shrugg-proving-slot.lock`, or just ask) and wait.
+  - Any new test in this plan that proves a real bundle must take the slot the same way the file's other proving tests do — `let _slot = proving_slot().await;` around the whole `wallet::send` / `submit` call, taken before the anchor is read and released after the commit. A test that proves without it breaks the bound for everyone else's tests, not just its own.
+  - Everything else in this plan is FAST-paced or `--lib`, proves nothing, and needs no slot.
+- **Memory, on a shared machine.** Before and after any release build or test run, check nothing has run away: `ps -eo rss= | awk '$1>8000000'` should print nothing (an 8 GB resident process is a runaway `rustc` or a leaked node). Other sessions share this machine.
 - New RPC tests go at the bottom of `crates/shrugg-node/src/rpc.rs`, in the existing style: `state_for(&gs)` / `chain()` fixtures and the `ok(&st, "shrugg_…", json!([…]))` / `call(…)` helpers.
-- Error conventions are the existing ones (`docs/rpc.md` → Errors): `-32601` unknown method, `-32602` bad parameter, `-32000` rejected, `-32001` not found, `-32603` internal. This plan adds exactly one: `-32600` invalid request (batch shape, notification).
+- Error conventions are the existing ones (`docs/rpc.md` → Errors): `-32601` unknown method, `-32602` bad parameter, `-32000` rejected, `-32001` not found, `-32603` internal. **Amended 2026-09-13:** `-32600` is no longer new — fix-sync-stall added `RpcError::invalid_request` (rpc.rs:139) for a body that is oversized or not JSON at all, and it is the one code `docs/rpc.md`'s Errors table still does not list. This plan adds two *uses* of it (batch shape, notification), reuses the existing constructor, and Task 2's doc step adds the single row covering all three.
 - Commit style from `git log`: a lowercase area prefix (`node: …`, `docs: …`), then a body that explains the *why*. One commit per task. Every commit message ends with:
   ```
   Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
@@ -32,9 +100,9 @@
 |---|---|---|
 | `shrugg_getCompactBlocks` derives everything from `blocks` + `notes`; **no new column family** | a new family would be empty for every block already on chain-8 disks, so a rolling restart would serve holes until a resync. The `notes` family is dense, ordered by leaf index, and each row carries its `height` — one binary search plus a forward scan recovers the per-block slice exactly | a block's notes cost `O(log n)` gets instead of one; if the heights-are-monotone-in-index assumption ever broke, the scan would stop early (caught by the test that walks a three-block chain) |
 | range cap `MAX_COMPACT_BLOCKS = 128` blocks per call | half the 256-block anchor window, so a wallet syncing forward never crosses more than one anchor window per call, and a 128-block reply of typical chain-8 blocks (3 bundles) is ~2 MB of JSON | a wallet pages twice as often as it could; raising it later is a one-constant change |
-| the reply also stops after `MAX_PAGE` (1000) note rows, **but always returns at least one whole block** | a block may hold up to ~800 mints (4 MiB / 5181 bytes), each with a 1380-byte envelope — a 128-block range of those is gigabytes. Row-capping bounds the reply; the always-one-block rule keeps a client able to make progress past a fat block | a client that assumes it got the range it asked for skips blocks — which is why the reply is truncated, never padded, and a client resumes from `last returned height + 1` |
+| the reply also stops after `MAX_PAGE` (1000) note rows, **but always returns at least one whole block** (the reply is a *response*, so `RPC_MAX_BODY_BYTES` does not bound it — these two caps are the only bound, and `shrugg-client`'s flat 15 s `READ_TIMEOUT` for a small-bodied request is what a too-generous page would actually hit) | a block may hold up to ~800 mints (4 MiB / 5181 bytes), each with a 1380-byte envelope — a 128-block range of those is gigabytes. Row-capping bounds the reply; the always-one-block rule keeps a client able to make progress past a fat block | a client that assumes it got the range it asked for skips blocks — which is why the reply is truncated, never padded, and a client resumes from `last returned height + 1` |
 | a block-level `commitments` array carries notes of that height no transaction of it accounts for | height 0's genesis deposits belong to no transaction, and it doubles as the safety net if per-transaction attribution ever desynchronises: leftover leaves still reach the wallet rather than vanishing | one always-empty array on every block above 0 |
-| batch cap `MAX_BATCH = 20` | the batch is a request amplifier and `shrugg_getWitness` rebuilds the whole tree per call; 20 leaves room for the realistic batch (head + treeInfo + a commitments page + a nullifiers page = 4) without turning one POST into 20 full-tree rebuilds | an explorer batching 50 reads gets `-32600` and splits; the body limit already caps bytes |
+| batch cap `MAX_BATCH = 20` | the batch is a request amplifier and `shrugg_getWitness` rebuilds the whole tree per call; 20 leaves room for the realistic batch (head + treeInfo + a commitments page + a nullifiers page = 4) without turning one POST into 20 full-tree rebuilds. It is the *request-count* bound only: `RPC_MAX_BODY_BYTES` (≈8.86 MB, rpc.rs:154) is the byte bound and is sized for **one** proof-carrying transaction, so a batch of 20 submissions is refused by the body limit — also `-32600`, from `rejection_error` — long before the count cap is reached | an explorer batching 50 reads gets `-32600` and splits; the body limit already caps bytes |
 | **notifications are refused**, not silently dropped: a request object with no `id` member gets an error with `"id": null`, code `-32600` | every method here either reads (the answer is the point) or submits (a silently-dropped submission is an invisible wallet bug). Refusing also keeps `responses.len() == requests.len()`, which makes client-side batch correlation trivial | a spec-strict client sending notifications sees errors instead of silence — visible and diagnosable, which is the intent. `"id": null` *present* is still a normal request, exactly as today |
 | WebSocket on the **same port**, upgrading on `GET /` and `GET /ws`; `POST /` stays JSON-RPC | one URL and one firewall rule for operators; `/ws` for clients that want it explicit | none; an operator wanting a separate port is not served, and no one asked |
 | the socket serves **only** `shrugg_subscribe` / `shrugg_unsubscribe`; any other method on it is `-32601` | reads on the socket would need their own blocking-pool and per-connection concurrency discipline, and HTTP already serves them | a client that wants one transport for everything keeps two |
@@ -42,8 +110,8 @@
 | backpressure: one `broadcast::channel(256)`, **a lagging subscriber is closed** (code 1008) rather than buffered | `broadcast` gives lag detection for free, and 256 absorbs a whole 100-block sync batch plus slack (13 min at 3 s blocks). A subscriber that cannot keep up is a client problem, and buffering it is how a node runs out of memory | a client on a bad link is disconnected and must reconnect and re-sync from `shrugg_getCompactBlocks` — which is the documented recovery |
 | one notification **per committed block**, in order (a sync batch emits one per block) | a light wallet tracking heads must not silently skip heights; the 256-slot channel is sized for exactly this | a burst during sync; a client that lags through it is dropped and resyncs |
 | refused cache: `REFUSED_CACHE_ENTRIES = 8192`, FIFO eviction, in memory only, **no new dependency** | the mempool holds 10 000, so the refused set is the same order of magnitude and a flood of distinct bad proofs cannot evict the live ones. ~8192 × ~160 B ≈ 1.3 MB. Recency ordering buys nothing here — a refused hash is looked up on arrival, not repeatedly — so FIFO, hand-rolled, beats pulling in an `lru` crate | a flood wider than 8192 distinct bad transactions re-verifies the oldest; the per-peer rate limit is the bound that actually holds |
-| only **permanent** verdicts are cached (an explicit `is_permanent(&TxError)` allowlist) | `UnknownAnchor`, `Spent`, `UnknownProgram`, `Staking(..)`, `Bridge(..)` are statements about *this node's state at this moment* — a node one block behind would poison itself against transactions that are about to be valid. The allowlist is the set of verdicts that are functions of the transaction bytes alone | caching too little costs a re-verification; caching too much loses a valid transaction until restart, which is why the allowlist is explicit and tested |
-| per-peer gossip rate limit: token bucket, **burst 16, refill 4/s**, gossiped transactions only | the chain commits ~3 transactions per 3 s block, so 4/s per peer is well above any honest peer's share, and a burst of 16 covers a peer forwarding a block's worth at once. RPC submissions are *not* limited: they are the operator's own port, already bounded by the HTTP body limit | an honest peer in a genuine burst has a transaction Ignored (not Rejected, no penalty) and re-gossips it on the next heartbeat |
+| only **permanent** verdicts are cached (an explicit `is_permanent(&TxError)` allowlist, which now includes fix-sync-stall's `TransactionTooLarge(_)` — a byte length is a function of the bytes) | `UnknownAnchor`, `Spent`, `UnknownProgram`, `Staking(..)`, `Bridge(..)` are statements about *this node's state at this moment* — a node one block behind would poison itself against transactions that are about to be valid. The allowlist is the set of verdicts that are functions of the transaction bytes alone | caching too little costs a re-verification; caching too much loses a valid transaction until restart, which is why the allowlist is explicit and tested |
+| per-peer gossip rate limit: token bucket, **burst 16, refill 4/s**, gossiped transactions only, keyed on the **forwarding** peer (`GossipId.propagation_source`) and held on `Peer` — **amended 2026-09-13** | the chain commits ~3 transactions per 3 s block, so 4/s per peer is well above any honest peer's share, and a burst of 16 covers a peer forwarding a block's worth at once. RPC submissions are *not* limited: they are the operator's own port, already bounded by `RPC_MAX_BODY_BYTES`. **Why the key changed:** the draft metered `NetworkEvent::Gossip.from`, and fix-sync-stall's `Peer` doc comment (node.rs:230) now states that `from` is the gossip *author* — a validator several hops away with no connection to us at all, which is exactly why `connected_peers` was added beside `peer_count`. Metering the author would bill one peer for what N forwarders relayed, would leave a flooding neighbour unmetered, and would grow a bucket for every peer whose messages we merely relay. `propagation_source` is a peer we hold an open connection to, which is the thing a rate limit can actually push back on | an honest peer in a genuine burst has a transaction Ignored (not Rejected, no penalty) and re-gossips it on the next heartbeat |
 | verification off-loop: `MAX_VERIFY_IN_FLIGHT = 4` blocking tasks, `MAX_VERIFY_QUEUE = 64`; a full queue reports `Ignore` | 4 concurrent × ~20 ms warm keeps the blocking pool available for `shrugg_getWitness` and the storage reads that already use it; 64 queued × 20 ms / 4 = 320 ms worst-case wait, comfortably inside the 2.5 s gossipsub validation window | a flood past the queue is Ignored — not propagated, not penalised — which is the correct shed |
 | the verification snapshot is an `Arc<Ledger>` refreshed **lazily**, when the tip's `(height, root)` has moved and a transaction is actually waiting | a clone per consensus message would cost a full ledger clone per vote; keyed on the tip this is at most one clone per block, and none at all on an idle chain | a transaction verified against a one-block-stale snapshot can get `UnknownProgram` for a program deployed in the block in between — transient, so not cached, and the peer re-gossips. Everything state-dependent that *can* go stale is re-checked by `precheck` on the live tip at insert time |
 | `Reject` is reported for a permanent verdict even though **no peer-score parameters are installed** | `Reject` is the honest signal and costs nothing today (the P₄ penalty needs `with_peer_score`, which this node does not configure); it is the right thing already in place if scoring is ever turned on | none today |
@@ -72,26 +140,34 @@ Candidates from `docs/rpc-comparison.md` deliberately **not** in this plan. They
 crates/shrugg-node/src/
   storage.rs      [edit] notes_in_heights(), first_note_at_or_after(), derived_note_count()  — reads only
   rpc.rs          [edit] MAX_COMPACT_BLOCKS/MAX_BATCH consts; compact_block_json(); head_summary();
-                         shrugg_getCompactBlocks; batch-aware handle(); RpcState.heads + .ws_conns;
-                         serve() merges the ws routes; new tests at the bottom
+                         shrugg_getCompactBlocks; batch-aware handle() *wrapping* the existing
+                         Result<Json<_>, JsonRejection> -> (StatusCode, Json<Value>) shape and its
+                         rejection_error path; RpcState.heads + .ws_conns; serve() merges the ws
+                         routes and keeps the RPC_MAX_BODY_BYTES layer; NodeStatus gains ws_clients /
+                         refused_cache / verify_queue beside the four sync fields; tests at the bottom
   ws.rs           [new]  the WebSocket half: upgrade handler, connection cap, per-connection
                          subscription table, broadcast fan-out, lag close. Kept out of rpc.rs
                          (1414 lines already, and worked on by parallel sessions)
-  admission.rs    [new]  RefusedCache (FIFO, bounded), is_permanent(&TxError), PeerLimiter
-                         (token bucket), VerifySource / Verdict — the pure, unit-testable half
+  admission.rs    [new]  RefusedCache (FIFO, bounded), is_permanent(&TxError), TokenBucket +
+                         PeerLimiter (policy only — the bucket lives on node.rs's Peer),
+                         VerifySource / Verdict — the pure, unit-testable half
   mempool.rs      [edit] precheck() + insert_verified() split out of insert(); applies() shared
                          with still_applies()
-  network/mod.rs  [edit] ConfigBuilder::validate_messages(); NetworkEvent::Gossip carries
-                         { message_id, propagation_source }; NetworkCommand::ReportValidation;
-                         NetworkHandle::report_validation()
+  network/mod.rs  [edit] ConfigBuilder::validate_messages() at :245-250 only; NetworkEvent::Gossip
+                         carries { message_id, propagation_source }; NetworkCommand::ReportValidation;
+                         NetworkHandle::report_validation(). codec.rs, the SYNC_* wire limits and the
+                         address filter are NOT touched.
   node.rs         [edit] heads broadcast sender; tip snapshot; verify queue + in-flight counter;
-                         verdict channel in the select!; report exactly once per gossip message;
-                         NodeStatus gains ws_clients / refused_cache / verify_queue
+                         verdict channel in the select! (:486); report exactly once per gossip
+                         message; Peer (:230) gains the token bucket; publish_status (:512) fills
+                         the three new NodeStatus fields beside s.sync_failures
   lib.rs          [edit] `pub mod ws;` `mod admission;`
 crates/shrugg-node/tests/
   ws.rs           [new]  the WebSocket integration test: a real listener, a real tokio-tungstenite client
-  cluster.rs      [edit] one compact-block assertion on an existing proving chain; one
-                         refused-cache assertion on a FAST chain
+  cluster.rs      [edit] one compact-block assertion, preferably folded into the existing
+                         two_validators_commit_and_shielded_transfer (:732) so the serialised
+                         suite gains no thirteenth bundle proof; one refused-cache assertion on a
+                         FAST chain. Anything that proves takes proving_slot().
 Cargo.toml (workspace)      [edit] axum features = ["ws"]; tokio-tungstenite = "0.24" (dev)
 crates/shrugg-node/Cargo.toml [edit] tokio-tungstenite in [dev-dependencies]
 docs/rpc.md                 [edit] the three new methods/notifications, the -32600 row, a Changelog section
@@ -107,7 +183,7 @@ README.md                   [edit] the Interfaces row: JSON-RPC over HTTP *and* 
 
 **Files:**
 - Modify: `crates/shrugg-node/src/storage.rs` (read helpers, near `notes_from`, ~line 358)
-- Modify: `crates/shrugg-node/src/rpc.rs` (a const near `MAX_PAGE`, a renderer near `block_json`, a dispatch arm near `shrugg_getNullifiers`)
+- Modify: `crates/shrugg-node/src/rpc.rs` (a const near `MAX_PAGE` at :26, a renderer near `block_json` at :334 — `envelope_json` is at :297 — and a dispatch arm after `shrugg_getNullifiers`, whose arm is at :531 inside `dispatch` at :465)
 - Modify: `docs/rpc.md` (a method section after `shrugg_getNullifiers`)
 - Test: `crates/shrugg-node/src/storage.rs` `mod tests`, `crates/shrugg-node/src/rpc.rs` `mod tests`
 
@@ -129,6 +205,12 @@ pub fn notes_in_heights(&self, from_height: u64, to_height: u64, max_rows: usize
 /// How many notes of a block's slice belong to `tx` beyond the ones it carries on the wire: the
 /// deposit note the ledger derives for a `Withdraw`, and for a `BridgeAttest` the deposit it
 /// derives from the attestation — none for a guardian-set rotation, which deposits nothing.
+///
+/// This is the count of `Ledger::derived_commitment` (shrugg-core `ledger/staking.rs:161`), and the
+/// two must stay in step: those are the only two actions that mint a note out of public words, and
+/// `Mempool::claimed_commitments` reads the same function for the pool's conflict index. Applying
+/// the attestation size cap before the decode mirrors it exactly; in a *committed* block both arms
+/// always produced a note, since a transaction that could not derive one was refused by `validate`.
 /// `Transaction::commitments()` deliberately omits both, and `commit` appends them immediately
 /// after that transaction's own, so `tx.commitments().len() + derived_note_count(tx)` is exactly
 /// the slice `tx` owns.
@@ -253,6 +335,8 @@ pub fn notes_in_heights(&self, from_height: u64, to_height: u64, max_rows: usize
 pub fn derived_note_count(tx: &shrugg_core::Transaction) -> usize {
     match &tx.action {
         Action::Withdraw { .. } => 1,
+        // The size cap before the decode, exactly as `Ledger::derived_commitment` applies it.
+        Action::BridgeAttest { attestation, .. } if attestation.len() > shrugg_core::gas::MAX_ATTESTATION_BYTES => 0,
         Action::BridgeAttest { attestation, .. } => {
             usize::from(shrugg_core::ledger::bridge_notes::attested_transfer(attestation).is_some())
         }
@@ -425,6 +509,13 @@ The dispatch arm, after `shrugg_getNullifiers`:
 
 Note `from > head` falls out of the `for h in from..=to` loop with `to = to.min(head) < from`, giving `[]`.
 
+**Two things about size, both new since this plan was drafted:**
+
+- `RPC_MAX_BODY_BYTES` (rpc.rs:154) and the `DefaultBodyLimit` layer in `serve` bound the *request*, not the reply. A `shrugg_getCompactBlocks` request is two integers, so it is nowhere near the limit and needs nothing from this task; `MAX_COMPACT_BLOCKS` and `MAX_PAGE` remain the only bound on the *reply*.
+- What a too-generous reply actually hits is the client: `shrugg-client`'s `RpcClient::call` gives a request under `UPLOAD_THRESHOLD` (64 KiB) the flat 15 s `READ_TIMEOUT`, and only an upload gets `upload_timeout`. A compact-block read is a small request with a large answer, so it has 15 s to be served end to end — which the 128-block / 1000-note caps sit comfortably inside, and which is the number to revisit before either cap is raised.
+
+This method maps no `TxError`, so fix-sync-stall's new `TxError::TransactionTooLarge(usize)` does not reach it; the variant is Task 4's business (`is_permanent`).
+
 - [ ] **Step 8: Run the RPC tests green**
 
 Run: `cargo test --release -p shrugg-node --lib rpc::tests::compact_blocks storage::tests::notes_in_heights storage::tests::derived_note`
@@ -469,27 +560,46 @@ EOF
 ### Task 2: JSON-RPC batch requests
 
 **Files:**
-- Modify: `crates/shrugg-node/src/rpc.rs` (`Request`, `handle`, a const near `MAX_PAGE`)
-- Modify: `docs/rpc.md` (the intro line "batches are not supported", the Errors table)
+- Modify: `crates/shrugg-node/src/rpc.rs` (`Request` at :119, `handle` at :194, `rejection_error` at :222, a const near `MAX_PAGE` at :26)
+- Modify: `docs/rpc.md` (the intro line "batches are not supported" at :4, the Errors table at :382)
 - Test: `crates/shrugg-node/src/rpc.rs` `mod tests`
+
+**What `handle` already is (changed since this plan was drafted).** fix-sync-stall gave it a
+rejection path, and this task must keep every part of it:
+
+```rust
+async fn handle(
+    State(st): State<RpcState>,
+    req: Result<Json<Request>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, Json<Value>) { … }
+
+fn rejection_error(rejection: &JsonRejection) -> RpcError   // -32600, names RPC_MAX_BODY_BYTES on a 413
+```
+
+So the batch work **wraps** it: the extractor becomes `Result<Json<Value>, JsonRejection>`, the
+rejection arm and its non-`OK` status code are untouched, and only the `Ok` arm learns about arrays.
+An oversized or non-JSON body keeps returning axum's status (413 / 400) with a `-32600` body; every
+*parsed* body, batch or not, keeps returning `StatusCode::OK`.
 
 **Interfaces:**
 
 ```rust
 // rpc.rs — produces
-/// The most request objects one batch may carry.
+/// The most request objects one batch may carry. The *byte* bound is RPC_MAX_BODY_BYTES, which is
+/// sized for one proof-carrying transaction, so a batch of submissions is refused on size first.
 const MAX_BATCH: usize = 20;
 /// A request object's `id`. `None` is a *missing* `id` member — a JSON-RPC notification, which
 /// this node refuses (see `docs/rpc.md`); `Some(Value::Null)` is an explicit null id and is a
-/// normal request, as it has always been here.
+/// normal request, as it has always been here. (Today `id` is `#[serde(default)] id: Value`;
+/// keep `#[serde(default)]` on `params` and drop it from `id`.)
 struct Request { jsonrpc: Option<String>, method: String, params: Value, id: Option<Value> }
-fn response(id: Value, out: Result<Value, RpcError>) -> Value;
+fn error_value(id: Value, e: RpcError) -> Value;           // built from RpcError::invalid_request etc.
 async fn dispatch_one(st: &RpcState, v: Value) -> Value;   // one request object -> one response object
 ```
 
 - [ ] **Step 1: Write the failing tests**
 
-`handle` is not reachable through the `call`/`ok` helpers (they go straight to `dispatch`), so these tests drive the axum handler by calling it directly with a `Json<Value>` body:
+`handle` is not reachable through the `call`/`ok` helpers (`state_for` at :865, `call` at :893, `ok` at :897, `chain` at :911 — they go straight to `dispatch`), so these tests drive the axum handler by calling it directly. **It returns `(StatusCode, Json<Value>)` and takes a `Result<Json<Value>, _>`**, so every call below destructures the tuple and wraps the body in `Ok(Json(…))`:
 
 ```rust
 /// A JSON array of request objects comes back as an array of responses, in order, one per
@@ -497,11 +607,12 @@ async fn dispatch_one(st: &RpcState, v: Value) -> Value;   // one request object
 #[tokio::test]
 async fn a_batch_answers_every_request_in_order() {
     let (_d, st, _gs) = chain();
-    let Json(v) = handle(State(st.clone()), Json(json!([
+    let (code, Json(v)) = handle(State(st.clone()), Ok(Json(json!([
         { "jsonrpc": "2.0", "id": 1, "method": "shrugg_chainId", "params": [] },
         { "jsonrpc": "2.0", "id": "two", "method": "shrugg_getTreeInfo", "params": [] },
         { "jsonrpc": "2.0", "id": 3, "method": "shrugg_nope", "params": [] }
-    ]))).await;
+    ])))).await;
+    assert_eq!(code, StatusCode::OK, "a parsed body is always 200, errors inside it or not");
     let rows = v.as_array().unwrap();
     assert_eq!(rows.len(), 3);
     assert_eq!((&rows[0]["id"], &rows[0]["result"]), (&json!(1), &json!(st.chain_id)));
@@ -509,9 +620,9 @@ async fn a_batch_answers_every_request_in_order() {
     assert_eq!(rows[1]["result"]["next_index"], 4);
     assert_eq!((&rows[2]["id"], &rows[2]["error"]["code"]), (&json!(3), &json!(-32601)));
     // A single request object still answers with a single object, exactly as before.
-    let Json(one) = handle(State(st.clone()), Json(json!(
+    let (_, Json(one)) = handle(State(st.clone()), Ok(Json(json!(
         { "jsonrpc": "2.0", "id": 9, "method": "shrugg_chainId", "params": [] }
-    ))).await;
+    )))).await;
     assert_eq!(one["result"], json!(st.chain_id));
     assert!(one.get("error").is_none());
 }
@@ -521,7 +632,7 @@ async fn a_batch_answers_every_request_in_order() {
 #[tokio::test]
 async fn a_malformed_batch_is_one_invalid_request_error() {
     let (_d, st, _gs) = chain();
-    let err = |v: Value| async { let Json(r) = handle(State(st.clone()), Json(v)).await; r };
+    let err = |v: Value| async { let (_, Json(r)) = handle(State(st.clone()), Ok(Json(v))).await; r };
 
     let empty = err(json!([])).await;
     assert_eq!(empty["error"]["code"], -32600);
@@ -544,10 +655,10 @@ async fn a_malformed_batch_is_one_invalid_request_error() {
 #[tokio::test]
 async fn a_notification_is_refused_with_a_null_id() {
     let (_d, st, _gs) = chain();
-    let Json(v) = handle(State(st.clone()), Json(json!([
+    let (_, Json(v)) = handle(State(st.clone()), Ok(Json(json!([
         { "jsonrpc": "2.0", "method": "shrugg_chainId", "params": [] },
         { "jsonrpc": "2.0", "id": null, "method": "shrugg_chainId", "params": [] }
-    ]))).await;
+    ])))).await;
     let rows = v.as_array().unwrap();
     assert_eq!(rows.len(), 2, "one response per request, notifications included");
     assert_eq!(rows[0]["error"]["code"], -32600);
@@ -562,10 +673,10 @@ async fn a_notification_is_refused_with_a_null_id() {
 #[tokio::test]
 async fn an_undecodable_request_object_still_gets_a_response() {
     let (_d, st, _gs) = chain();
-    let Json(v) = handle(State(st.clone()), Json(json!([
+    let (_, Json(v)) = handle(State(st.clone()), Ok(Json(json!([
         { "jsonrpc": "2.0", "id": 4 },                       // no method
         { "jsonrpc": "2.0", "id": 5, "method": 7 }            // method is not a string
-    ]))).await;
+    ])))).await;
     let rows = v.as_array().unwrap();
     assert_eq!(rows.len(), 2);
     for (i, row) in rows.iter().enumerate() {
@@ -578,7 +689,12 @@ async fn an_undecodable_request_object_still_gets_a_response() {
 - [ ] **Step 2: Run them and see them fail**
 
 Run: `cargo test --release -p shrugg-node --lib rpc::tests::a_batch rpc::tests::a_malformed rpc::tests::a_notification rpc::tests::an_undecodable`
-Expected: FAIL to compile — `handle` takes `Json<Request>`, not `Json<Value>`; `MAX_BATCH` is undefined.
+Expected: FAIL to compile — `handle` takes `Result<Json<Request>, JsonRejection>`, not `Result<Json<Value>, _>`; `MAX_BATCH` is undefined.
+
+There is also an existing test block at the bottom of `rpc.rs` (from :1497) whose subject is the
+request body limit. **Leave it alone** — it exercises `RPC_MAX_BODY_BYTES` and `rejection_error`,
+which this task must not change — and run it alongside the new ones as the regression that says the
+rejection path survived.
 
 - [ ] **Step 3: Implement batching**
 
@@ -594,8 +710,10 @@ const MAX_BATCH: usize = 20;
 `Request.id` becomes `Option<Value>` (drop the `#[serde(default)]` on it; keep it on `params`), and:
 
 ```rust
-fn error_value(id: Value, code: i64, message: impl Into<String>) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message.into() } })
+/// One error response object. Built from an `RpcError` so every `-32600` in this file comes from
+/// `RpcError::invalid_request` — including the oversized-body one `rejection_error` already makes.
+fn error_value(id: Value, e: RpcError) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": e.code, "message": e.message } })
 }
 
 /// One request object in, one response object out. Every failure mode — an object that does not
@@ -606,31 +724,47 @@ async fn dispatch_one(st: &RpcState, v: Value) -> Value {
     let raw_id = v.get("id").cloned();
     let req: Request = match serde_json::from_value(v) {
         Ok(r) => r,
-        Err(e) => return error_value(raw_id.unwrap_or(Value::Null), -32600, format!("invalid request: {e}")),
+        Err(e) => {
+            return error_value(raw_id.unwrap_or(Value::Null), RpcError::invalid_request(format!("invalid request: {e}")))
+        }
     };
     let Some(id) = req.id.clone() else {
         return error_value(
             Value::Null,
-            -32600,
-            "this node does not accept notifications; every request must carry an id",
+            RpcError::invalid_request("this node does not accept notifications; every request must carry an id"),
         );
     };
     match dispatch(st, &req).await {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err(e) => error_value(id, e.code, e.message),
+        Err(e) => error_value(id, e),
     }
 }
 
-async fn handle(State(st): State<RpcState>, Json(body): Json<Value>) -> Json<Value> {
-    match body {
-        Value::Array(items) if items.is_empty() => {
-            Json(error_value(Value::Null, -32600, "invalid request: empty batch"))
+async fn handle(
+    State(st): State<RpcState>,
+    // Unchanged in shape from what fix-sync-stall left here, only `Request` -> `Value`: a body axum
+    // refuses — over `RPC_MAX_BODY_BYTES`, or not JSON at all — must still come back as JSON-RPC
+    // rather than plain text, with the status axum chose.
+    req: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let body = match req {
+        Err(rejection) => {
+            return (rejection.status(), Json(error_value(Value::Null, rejection_error(&rejection))))
         }
-        Value::Array(items) if items.len() > MAX_BATCH => Json(error_value(
+        Ok(Json(body)) => body,
+    };
+    // Everything past here parsed, so the HTTP status is 200 and the errors are in the body.
+    let out = match body {
+        Value::Array(items) if items.is_empty() => {
+            error_value(Value::Null, RpcError::invalid_request("invalid request: empty batch"))
+        }
+        Value::Array(items) if items.len() > MAX_BATCH => error_value(
             Value::Null,
-            -32600,
-            format!("batch of {} requests exceeds the limit of {MAX_BATCH}", items.len()),
-        )),
+            RpcError::invalid_request(format!(
+                "batch of {} requests exceeds the limit of {MAX_BATCH}",
+                items.len()
+            )),
+        ),
         // Sequential on purpose: a batch must not multiply this node's concurrency, and the
         // expensive reads inside already hand themselves to the blocking pool one at a time.
         Value::Array(items) => {
@@ -638,13 +772,22 @@ async fn handle(State(st): State<RpcState>, Json(body): Json<Value>) -> Json<Val
             for it in items {
                 out.push(dispatch_one(&st, it).await);
             }
-            Json(Value::Array(out))
+            Value::Array(out)
         }
-        obj @ Value::Object(_) => Json(dispatch_one(&st, obj).await),
-        _ => Json(error_value(Value::Null, -32600, "invalid request: expected an object or an array")),
-    }
+        obj @ Value::Object(_) => dispatch_one(&st, obj).await,
+        _ => error_value(
+            Value::Null,
+            RpcError::invalid_request("invalid request: expected an object or an array"),
+        ),
+    };
+    (StatusCode::OK, Json(out))
 }
 ```
+
+`rejection_error` and `RPC_MAX_BODY_BYTES` are untouched: the byte bound on a batch is still the
+body limit, which is sized for one proof-carrying transaction, so a batch of 20 `shrugg_sendTransaction`
+calls is refused at the extractor with a 413 and a `-32600` body naming the limit — before
+`MAX_BATCH` is ever consulted. That is the intended layering, and the doc step says so.
 
 - [ ] **Step 4: Run the tests green**
 
@@ -653,7 +796,9 @@ Expected: PASS — the four new tests and every existing `rpc::tests` case (they
 
 - [ ] **Step 5: Document it in `docs/rpc.md`**
 
-Replace "One request per HTTP POST to `/`; batches are not supported." with a paragraph: a POST body may be one request object or an array of at most 20; the reply is an array of the same length, in request order; every element gets a response, errors included; notifications (a request object with no `id` member) are refused with `-32600` and a null id, and the reasoning; an explicit `"id": null` is a normal request. Add a `curl` example of a two-request batch. Add the `-32600` row to the Errors table: "invalid request (batch shape, or a notification)".
+Replace "One request per HTTP POST to `/`; batches are not supported." (docs/rpc.md:4) with a paragraph: a POST body may be one request object or an array of at most 20; the reply is an array of the same length, in request order; every element gets a response, errors included; notifications (a request object with no `id` member) are refused with `-32600` and a null id, and the reasoning; an explicit `"id": null` is a normal request. Say that the count cap is not the byte cap — the whole body is still bounded by the node's request-body limit, which is sized for a single proof-carrying transaction, so batching submissions does not work and batching reads is what this is for. Add a `curl` example of a two-request batch.
+
+Add the `-32600` row to the Errors table (docs/rpc.md:382). **It is not there today** even though the code already returns it for an oversized or unparseable body, so write the row to cover all three uses: "invalid request — the body is over the size limit, is not JSON, is a malformed batch, or is a notification". Append the row; do not reorder or reword the five that fix-sync-stall and earlier work left there.
 
 - [ ] **Step 6: Commit**
 
@@ -689,7 +834,7 @@ EOF
 - Create: `crates/shrugg-node/src/ws.rs`
 - Create: `crates/shrugg-node/tests/ws.rs`
 - Modify: `Cargo.toml` (workspace: `axum` gains `features = ["ws"]`; add `tokio-tungstenite = "0.24"`), `crates/shrugg-node/Cargo.toml` (dev-dependency)
-- Modify: `crates/shrugg-node/src/lib.rs` (`pub mod ws;`), `crates/shrugg-node/src/rpc.rs` (`HeadSummary`, `head_summary`, `RpcState.heads`/`.ws_conns`, `serve` routes, `NodeStatus.ws_clients`), `crates/shrugg-node/src/node.rs` (publish a head per committed block; build the channel; report `ws_clients`)
+- Modify: `crates/shrugg-node/src/lib.rs` (`pub mod ws;`), `crates/shrugg-node/src/rpc.rs` (`HeadSummary`, `head_summary`, `RpcState` at :110 gains `.heads`/`.ws_conns`, `serve` routes at :180, `NodeStatus.ws_clients` — added to the block at :38 that now also carries `sync_inflight_age_ms`, `sync_failures`, `sync_late_batches` and `connected_peers`), `crates/shrugg-node/src/node.rs` (publish a head per committed block; build the channel; `publish_status` at :512 sets `ws_clients` beside `s.connected_peers`)
 - Modify: `docs/rpc.md`
 - Test: `crates/shrugg-node/tests/ws.rs`
 
@@ -869,6 +1014,9 @@ async fn the_connection_cap_refuses_the_sixty_fifth_socket() {
 Run: `cargo test --release -p shrugg-node --test ws`
 Expected: FAIL to compile — `shrugg_node::ws` does not exist; `NodeStatus` has no `ws_clients`.
 
+(`NodeHandle` exposes `pub status: Arc<RwLock<NodeStatus>>` and `pub rpc_addr: SocketAddr`, which is
+what the third test reads.)
+
 - [ ] **Step 4: Implement the head channel and the socket**
 
 `rpc.rs`:
@@ -891,15 +1039,23 @@ pub fn head_summary(storage: &Storage, status: &RwLock<NodeStatus>) -> crate::st
 }
 ```
 
-`shrugg_getHead`'s arm becomes `Ok(serde_json::to_value(head_summary(&st.storage, &st.status).map_err(RpcError::internal)?).map_err(RpcError::internal)?)`. `NodeStatus` gains `pub ws_clients: usize`.
+`shrugg_getHead`'s arm (rpc.rs:717, today `json!({ "height", "hash", "view" })` built inline from
+`storage.head()` and `status.view`) becomes
+`Ok(serde_json::to_value(head_summary(&st.storage, &st.status).map_err(RpcError::internal)?).map_err(RpcError::internal)?)`
+— same three fields, same order, so no client sees a change. `NodeStatus` gains `pub ws_clients:
+usize`, written into the field block at rpc.rs:38 **after** `connected_peers`, with a doc comment in
+the style fix-sync-stall used for the sync fields (those four are `Serialize`d into `shrugg_status`,
+so an added field is an added key and nothing else).
 
-`serve` merges the routes:
+`serve` merges the routes, **keeping the derived body limit**:
 
 ```rust
 let app = Router::new()
     .route("/", post(handle).get(crate::ws::upgrade))
     .route("/ws", axum::routing::get(crate::ws::upgrade))
-    .layer(axum::extract::DefaultBodyLimit::max(body_limit))
+    // RPC_MAX_BODY_BYTES, unchanged — it bounds the POST. A WebSocket upgrade is a GET with no
+    // body, so the layer costs it nothing; frames are bounded by WS_MAX_FRAME_BYTES instead.
+    .layer(axum::extract::DefaultBodyLimit::max(RPC_MAX_BODY_BYTES))
     .with_state(state);
 ```
 
@@ -1000,7 +1156,7 @@ fn publish_heads(&self, blocks: &[CommittedBlock]) {
 }
 ```
 
-and `publish_status` sets `s.ws_clients = self.ws_conns.load(SeqCst);`.
+and `publish_status` (node.rs:512) sets `s.ws_clients = self.ws_conns.load(SeqCst);` in the same run of assignments as `s.connected_peers` and `s.sync_failures` — one place fills the whole status, and the three fields this plan adds belong beside the four fix-sync-stall added, not in a second pass.
 
 - [ ] **Step 5: Run the integration test green**
 
@@ -1010,11 +1166,11 @@ Expected: PASS (3 tests). These run on 150 ms blocks and prove nothing, so the w
 - [ ] **Step 6: Check nothing else broke**
 
 Run: `cargo test --release -p shrugg-node --lib`
-Expected: PASS — `rpc::tests` compiles against the new `RpcState` fields (add `heads`/`ws_conns` to the `state_for` fixture).
+Expected: PASS — `rpc::tests` compiles against the new `RpcState` fields (add `heads`/`ws_conns` to the `state_for` fixture at rpc.rs:865). Task 2's batch tests and the body-limit block at :1497 both go through `handle`, so they are the check that the route merge did not disturb the POST path.
 
 - [ ] **Step 7: Document it in `docs/rpc.md`**
 
-New section `## Subscriptions (WebSocket)` after the methods: the endpoint (`ws://host:8545/` or `/ws`, same port as HTTP), the three frame shapes above, that `newHeads` is the only topic and its payload is exactly `shrugg_getHead`'s, one notification per committed block including during sync, the caps (64 connections per node — the 65th gets HTTP 503 —, 8 subscriptions per connection, 64 KiB frames), and the backpressure rule: a subscriber that falls more than 256 heads behind is closed with code 1008 and a reason, and should reconnect and catch up with `shrugg_getCompactBlocks`. Add `ws_clients` to the `shrugg_status` example and its prose.
+New section `## Subscriptions (WebSocket)` after the methods: the endpoint (`ws://host:8545/` or `/ws`, same port as HTTP), the three frame shapes above, that `newHeads` is the only topic and its payload is exactly `shrugg_getHead`'s, one notification per committed block including during sync, the caps (64 connections per node — the 65th gets HTTP 503 —, 8 subscriptions per connection, 64 KiB frames), and the backpressure rule: a subscriber that falls more than 256 heads behind is closed with code 1008 and a reason, and should reconnect and catch up with `shrugg_getCompactBlocks`. **Append** `ws_clients` to the `shrugg_status` example object and add one line for it after the four sync bullets fix-sync-stall wrote (`sync_inflight_age_ms`, `sync_failures`, `sync_late_batches`, `connected_peers`) — do not rewrite that block, and do not drop the new keys from the example.
 
 - [ ] **Step 8: Commit**
 
@@ -1053,10 +1209,22 @@ EOF
 
 **Files:**
 - Create: `crates/shrugg-node/src/admission.rs`
-- Modify: `crates/shrugg-node/src/mempool.rs` (split `insert`), `crates/shrugg-node/src/lib.rs` (`mod admission;`)
+- Modify: `crates/shrugg-node/src/mempool.rs` (split `insert` at :136; `still_applies` is at :227, `claimed_commitments` at :97, `claimed_nonce` at :59), `crates/shrugg-node/src/lib.rs` (`mod admission;`)
 - Test: `crates/shrugg-node/src/admission.rs` `mod tests`, `crates/shrugg-node/src/mempool.rs` `mod tests`
 
 This task ships the two pure, unit-testable pieces and the mempool split they need. Task 5 wires them into the loop.
+
+**Two things review-followups and fix-sync-stall changed here, both of which this task must respect:**
+
+- `claimed_commitments` (mempool.rs:97) now asks `Ledger::derived_commitment` for a `BridgeAttest`'s
+  deposit as well as a `Withdraw`'s, which is why it takes `&dyn ConfidentialExecutor`. `precheck`
+  keeps that argument and keeps returning the claimed commitments, so the caller never recomputes
+  either derivation. `candidates_within` (mempool.rs:202), which now continues past an oversized
+  candidate, is not touched by this split.
+- **The per-peer bucket does not get its own map.** `Node::peers` is already
+  `HashMap<PeerId, Peer>` (node.rs:203/230) and `PeerDisconnected` already removes the entry, so the
+  bucket is a field on `Peer` and `PeerLimiter` keeps only the policy. That is why there is no
+  `PeerLimiter::forget` below: there is nothing for it to forget.
 
 **Interfaces:**
 
@@ -1083,15 +1251,23 @@ impl RefusedCache {
 /// otherwise poison itself against transactions that are about to be valid.
 pub fn is_permanent(e: &TxError) -> bool;
 
-/// A per-peer token bucket over gossiped transaction submissions. RPC submissions are not
-/// metered: that port is the operator's own and is bounded by the HTTP body limit.
-pub struct PeerLimiter { buckets: HashMap<PeerId, (f64, Instant)>, burst: f64, per_sec: f64 }
+/// One peer's allowance. Lives on `node::Peer`, which the node already keys by `PeerId` and already
+/// drops on `PeerDisconnected` — so this type holds no peer id, no map and no lifetime rule of its
+/// own. `None` for the tokens means "not yet used": a fresh bucket starts full.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TokenBucket { tokens: Option<f64>, last: Option<Instant> }
+
+/// The policy over those buckets: a token bucket on gossiped transaction submissions, metered
+/// against the peer that **forwarded** the message (`GossipId.propagation_source`), never the peer
+/// that authored it — `NetworkEvent::Gossip.from` is the author and may be a peer we hold no
+/// connection to at all (see `node::Peer`'s doc comment, and `connected_peers` in `shrugg_status`).
+/// RPC submissions are not metered: that port is the operator's own and is bounded by
+/// `rpc::RPC_MAX_BODY_BYTES`.
+pub struct PeerLimiter { burst: f64, per_sec: f64 }
 impl PeerLimiter {
     pub fn new(burst: u32, per_sec: f64) -> PeerLimiter;
-    /// Spend one token, refilling first. `false` means "over the limit right now".
-    pub fn allow(&mut self, peer: &PeerId, now: Instant) -> bool;
-    /// Drop a disconnected peer's bucket so the map tracks the peer set, not history.
-    pub fn forget(&mut self, peer: &PeerId);
+    /// Spend one token from `bucket`, refilling it first. `false` means "over the limit right now".
+    pub fn allow(&self, bucket: &mut TokenBucket, now: Instant) -> bool;
 }
 
 pub const REFUSED_CACHE_ENTRIES: usize = 8192;
@@ -1102,9 +1278,10 @@ pub const PEER_TX_PER_SEC: f64 = 4.0;
 impl Mempool {
     /// Everything `insert` decides without verifying a proof: pool conflicts, capacity, and the
     /// state-dependent half of `Ledger::validate` (anchor, time, nullifiers, commitments,
-    /// attestation digests, the register nonce). Returns the commitments the transaction claims,
-    /// so the caller does not recompute the withdraw deposit. Safe to run twice — once before a
-    /// verification is scheduled, once against the tip it will actually be pooled on.
+    /// attestation digests, the register nonce). Returns the commitments the transaction claims —
+    /// including the note the ledger would derive for a `Withdraw` **or a `BridgeAttest`**, which is
+    /// why the executor is a parameter — so the caller never recomputes either. Safe to run twice:
+    /// once before a verification is scheduled, once against the tip it will actually be pooled on.
     pub fn precheck(&self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor)
         -> Result<Vec<Word8>, MempoolError>;
     /// Insert a transaction whose proof has already been verified. Re-runs `precheck`, because
@@ -1149,6 +1326,7 @@ mod tests {
             TxError::BadMintSignature,
             TxError::ProofTooLarge,
             TxError::EnvelopeTooLarge,
+            TxError::TransactionTooLarge(9_000_000),
             TxError::DuplicateNullifierInBundle,
             TxError::WrongChain { expected: 7, actual: 8 },
         ] {
@@ -1175,23 +1353,23 @@ mod tests {
 
     #[test]
     fn the_peer_limiter_allows_a_burst_then_refills() {
-        let p = PeerId::random();
-        let mut l = PeerLimiter::new(4, 2.0);
+        let l = PeerLimiter::new(4, 2.0);
+        let mut b = TokenBucket::default();
         let t0 = Instant::now();
-        for i in 0..4 { assert!(l.allow(&p, t0), "burst {i}") }
-        assert!(!l.allow(&p, t0), "the bucket is empty");
+        for i in 0..4 { assert!(l.allow(&mut b, t0), "burst {i}") }
+        assert!(!l.allow(&mut b, t0), "the bucket is empty");
         // Half a second at 2/s is one token.
-        assert!(l.allow(&p, t0 + Duration::from_millis(500)));
-        assert!(!l.allow(&p, t0 + Duration::from_millis(500)));
+        assert!(l.allow(&mut b, t0 + Duration::from_millis(500)));
+        assert!(!l.allow(&mut b, t0 + Duration::from_millis(500)));
         // It never refills past the burst.
-        assert!(l.allow(&p, t0 + Duration::from_secs(60)));
-        for _ in 0..3 { assert!(l.allow(&p, t0 + Duration::from_secs(60))) }
-        assert!(!l.allow(&p, t0 + Duration::from_secs(60)), "burst is the ceiling");
-        // Buckets are per peer, and a disconnected peer's is forgotten.
-        let q = PeerId::random();
-        assert!(l.allow(&q, t0 + Duration::from_secs(60)));
-        l.forget(&p);
-        assert!(l.allow(&p, t0 + Duration::from_secs(60)), "a fresh bucket");
+        assert!(l.allow(&mut b, t0 + Duration::from_secs(60)));
+        for _ in 0..3 { assert!(l.allow(&mut b, t0 + Duration::from_secs(60))) }
+        assert!(!l.allow(&mut b, t0 + Duration::from_secs(60)), "burst is the ceiling");
+        // Buckets are per peer because the *peer table* is: a second peer's bucket is a second
+        // `TokenBucket` on a second `node::Peer`, and a disconnected peer's goes with the entry.
+        let mut other = TokenBucket::default();
+        assert!(l.allow(&mut other, t0 + Duration::from_secs(60)), "an untouched bucket starts full");
+        assert!(l.allow(&mut TokenBucket::default(), t0), "and so does a fresh one at any time");
     }
 }
 ```
@@ -1203,7 +1381,7 @@ Expected: FAIL — `file not found for module admission` / unresolved names.
 
 - [ ] **Step 3: Implement `admission.rs`**
 
-Straight implementations of the three types above. `RefusedCache::insert` returns early when `!is_permanent(&e)`; on eviction it pops `order.front()` and removes it from `seen`; on a repeat insert of a hash already in `seen` it replaces the error and leaves `order` alone. `PeerLimiter::allow` refills `min(burst, tokens + elapsed_secs * per_sec)` before spending 1.0, and stores the new `(tokens, now)`.
+Straight implementations of the three types above. `RefusedCache::insert` returns early when `!is_permanent(&e)`; on eviction it pops `order.front()` and removes it from `seen`; on a repeat insert of a hash already in `seen` it replaces the error and leaves `order` alone. `PeerLimiter::allow` treats an unused bucket as full (`tokens.unwrap_or(burst)`), refills `min(burst, tokens + elapsed_secs * per_sec)` before spending 1.0, and writes the new tokens and `now` back into the bucket. It holds no state itself, so a `&self` receiver is enough.
 
 `is_permanent` is an explicit `matches!` allowlist:
 
@@ -1222,6 +1400,10 @@ pub fn is_permanent(e: &TxError) -> bool {
             | TxError::EnvelopeTooLarge
             | TxError::ProofTooLarge
             | TxError::AttestationTooLarge
+            // fix-sync-stall's: the whole transaction is bigger than a block. A byte length is a
+            // function of the bytes, and `validate` refuses it at step 1 before anything about
+            // this node's state is consulted, so it is as permanent as a size cap gets.
+            | TxError::TransactionTooLarge(_)
             | TxError::ProgramTooLarge
             | TxError::DuplicateNullifierInBundle
             | TxError::DuplicateCommitmentInBundle
@@ -1377,7 +1559,11 @@ so insertion order is as good as recency and costs no dependency.
 The per-peer token bucket (burst 16, refill 4/s) meters gossiped submissions
 only: the RPC port is the operator's own and is bounded by the body limit. The
 chain commits about one transaction a second, so 4/s per peer is far above any
-honest peer's share.
+honest peer's share. It meters the peer that *forwarded* the message, not the
+one that authored it — gossip's `from` is the author, which may be a peer this
+node holds no connection to at all — and the bucket lives on the peer table
+entry the node already keeps, so a disconnect drops it with the peer and the
+limiter needs no map of its own.
 
 Mempool::insert is split into precheck (pool conflicts, capacity, and the
 state-dependent half of Ledger::validate) and insert_verified, so the next
@@ -1395,9 +1581,9 @@ EOF
 ### Task 5: Proof verification off the consensus loop, under gossipsub application validation
 
 **Files:**
-- Modify: `crates/shrugg-node/src/network/mod.rs` (config, event, command, handle)
-- Modify: `crates/shrugg-node/src/node.rs` (the queue, the snapshot, the verdict channel, reporting)
-- Modify: `crates/shrugg-node/src/rpc.rs` (`NodeStatus` gains `refused_cache`, `verify_queue`)
+- Modify: `crates/shrugg-node/src/network/mod.rs` — **only** the gossipsub `ConfigBuilder` (:245–250), `NetworkEvent`/`NetworkCommand` (:149–167), `NetworkHandle`, and the `Event::Message` arm of `handle_swarm_event` (:486–493). `codec.rs`, `SYNC_REQUEST_TIMEOUT`, the `SYNC_*_WIRE_LIMIT`s, `addr_scope` / `is_dialable_advertised_addr` and `lan_peers` are fix-sync-stall's and stay exactly as they are.
+- Modify: `crates/shrugg-node/src/node.rs` (the queue, the snapshot, the verdict channel as a new arm of the `select!` at :486, reporting; `Peer` at :230 gains the bucket; `publish_status` at :512)
+- Modify: `crates/shrugg-node/src/rpc.rs` (`NodeStatus` at :38 gains `refused_cache`, `verify_queue`, beside `connected_peers` and the three sync counters)
 - Modify: `crates/shrugg-node/src/admission.rs` (the `VerifySource` / `Verdict` types)
 - Test: `crates/shrugg-node/src/network/mod.rs` `mod tests`, `crates/shrugg-node/src/node.rs` `mod tests`
 
@@ -1407,7 +1593,11 @@ EOF
 // network/mod.rs — produces
 /// Everything `report_message_validation_result` needs, carried alongside every gossip event so
 /// the node loop can report after it has decided. `propagation_source` is the peer that
-/// forwarded the message, which is not always `NetworkEvent::Gossip.from` (the author).
+/// forwarded the message, which is not always `NetworkEvent::Gossip.from` (the author) — and it is
+/// also the peer the rate limit meters, for the same reason `node::Peer` distinguishes `connected`
+/// from having published a `Status`. The `message_id` is content-addressed (blake3 of the message
+/// bytes, network/mod.rs:249), so two peers forwarding one transaction produce the same id and each
+/// delivery is reported against its own `(message_id, propagation_source)` pair.
 #[derive(Clone, Debug)]
 pub struct GossipId { pub message_id: MessageId, pub propagation_source: PeerId }
 
@@ -1457,19 +1647,28 @@ async fn a_gossiped_message_carries_the_id_its_validation_is_reported_with() {
 - [ ] **Step 2: Run and see it fail**
 
 Run: `cargo test --release -p shrugg-node --lib network::tests`
-Expected: FAIL to compile — `NetworkEvent::Gossip` has no `id` field, `report_validation` does not exist.
+Expected: FAIL to compile — `NetworkEvent::Gossip` has no `id` field, `report_validation` does not exist. The four address-filter tests fix-sync-stall added to `network::tests` (`loopback_is_never_a_dialable_advertised_address` and friends) must still compile and pass untouched — they are the check that this task stayed out of the sync wire.
 
 - [ ] **Step 3: Implement the network side**
 
 ```rust
-// in start(), on the ConfigBuilder — beside heartbeat_interval, and NOT touching validation_mode:
+// in start(), on the ConfigBuilder at network/mod.rs:245 — beside `.heartbeat_interval(500ms)`
+// (:246) and `.message_id_fn(blake3)` (:249), and NOT touching `.validation_mode(Permissive)` (:247):
     .validate_messages()   // application-level: this node forwards a transaction only after it
                            // has verified here. Local to this node; the wire is unchanged, so it
                            // rolls out onto a mixed fleet. ValidationMode stays Permissive — a
                            // Strict/Permissive mix across the fleet drops messages.
 ```
 
-In `handle_swarm_event`, the `Event::Message` arm destructures `message_id` as well and sends `NetworkEvent::Gossip { from, msg, id: GossipId { message_id, propagation_source } }`. An **undecodable** message must still be reported, right there, or it sits in the cache forever:
+In `handle_swarm_event`, the `Event::Message` arm (network/mod.rs:486, today
+`SwarmEvent::Behaviour(ShruggEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. }))`
+with `let from = message.source.unwrap_or(propagation_source)`) destructures `message_id` as well —
+replacing the `..` — and sends `NetworkEvent::Gossip { from, msg, id: GossipId { message_id, propagation_source } }`.
+Note that `from` falls back to `propagation_source` when the message carries no source, which is the
+only case where the two coincide by construction; the rate limit still keys on `propagation_source`. An **undecodable** message must still be reported, right there, or it sits in the cache forever:
+
+The existing `Err(e) => tracing::debug!(%propagation_source, "undecodable gossip: {e}")` arm
+(network/mod.rs:492) becomes:
 
 ```rust
 Err(e) => {
@@ -1486,7 +1685,7 @@ Err(e) => {
 - [ ] **Step 4: Run the network test green**
 
 Run: `cargo test --release -p shrugg-node --lib network::tests`
-Expected: PASS (2 tests, ~20 s — they build real swarms).
+Expected: PASS — the new round-trip test, the existing two-node gossip/sync test, and the four address-filter unit tests, ~20 s (the first two build real swarms).
 
 - [ ] **Step 5: Write the failing node-loop test**
 
@@ -1499,10 +1698,11 @@ In `node.rs`'s `mod tests` — a unit test over the decision function rather tha
 /// consensus or status message reports immediately.
 #[test]
 fn every_gossip_outcome_names_exactly_one_acceptance() {
-    use crate::admission::{GossipOutcome, RefusedCache, PeerLimiter};
+    use crate::admission::{GossipOutcome, PeerLimiter, RefusedCache, TokenBucket};
     let mut refused = RefusedCache::new(4);
-    let mut limiter = PeerLimiter::new(1, 1.0);
-    let peer = PeerId::random();
+    let limiter = PeerLimiter::new(1, 1.0);
+    // One forwarding peer's bucket, as it is held on `node::Peer::tx_bucket`.
+    let mut bucket = TokenBucket::default();
     let t = Instant::now();
     let tx = /* a fixture transfer */;
     let bad = /* its hash, pre-refused */;
@@ -1513,24 +1713,30 @@ fn every_gossip_outcome_names_exactly_one_acceptance() {
     assert_eq!(GossipOutcome::for_consensus(), GossipOutcome::Report(MessageAcceptance::Accept));
     // A transaction already refused here is rejected without any verification.
     assert_eq!(
-        GossipOutcome::for_transaction(&tx, Some(&peer), &mut refused, &mut limiter, 0, t),
+        GossipOutcome::for_transaction(&tx, Some(&mut bucket), &mut refused, &limiter, 0, t),
         GossipOutcome::Report(MessageAcceptance::Reject)
     );
     // A fresh one is queued (and the caller must report when the verdict lands).
     let fresh = /* a second fixture transfer */;
     assert_eq!(
-        GossipOutcome::for_transaction(&fresh, Some(&peer), &mut refused, &mut limiter, 0, t),
+        GossipOutcome::for_transaction(&fresh, Some(&mut bucket), &mut refused, &limiter, 0, t),
         GossipOutcome::Verify
     );
-    // The same peer's next one is over the rate limit: ignored, not rejected — an honest peer
-    // in a burst must not be penalised.
+    // The same *forwarder's* next one is over the rate limit: ignored, not rejected — an honest
+    // peer in a burst must not be penalised.
     assert_eq!(
-        GossipOutcome::for_transaction(&fresh, Some(&peer), &mut refused, &mut limiter, 0, t),
+        GossipOutcome::for_transaction(&fresh, Some(&mut bucket), &mut refused, &limiter, 0, t),
         GossipOutcome::Report(MessageAcceptance::Ignore)
     );
-    // And a full queue sheds the same way.
+    // A different forwarder has its own bucket, because it has its own `node::Peer`.
+    let mut other = TokenBucket::default();
     assert_eq!(
-        GossipOutcome::for_transaction(&fresh, None, &mut refused, &mut limiter, MAX_VERIFY_QUEUE, t),
+        GossipOutcome::for_transaction(&fresh, Some(&mut other), &mut refused, &limiter, 0, t),
+        GossipOutcome::Verify
+    );
+    // And a full queue sheds the same way (no bucket: this is the RPC path).
+    assert_eq!(
+        GossipOutcome::for_transaction(&fresh, None, &mut refused, &limiter, MAX_VERIFY_QUEUE, t),
         GossipOutcome::Report(MessageAcceptance::Ignore)
     );
 }
@@ -1571,17 +1777,18 @@ pub enum GossipOutcome { Report(MessageAcceptance), Verify }
 impl GossipOutcome {
     pub fn for_consensus() -> GossipOutcome { GossipOutcome::Report(MessageAcceptance::Accept) }
 
-    /// `peer` is `None` for an RPC submission, which is not metered. `queued` is the current
-    /// verification queue depth.
+    /// `bucket` is the **forwarding** peer's allowance (`node::Peer::tx_bucket`, looked up by
+    /// `GossipId.propagation_source`), and `None` for an RPC submission, which is not metered.
+    /// `queued` is the current verification queue depth.
     pub fn for_transaction(
-        tx: &Transaction, peer: Option<&PeerId>, refused: &mut RefusedCache,
-        limiter: &mut PeerLimiter, queued: usize, now: Instant,
+        tx: &Transaction, bucket: Option<&mut TokenBucket>, refused: &mut RefusedCache,
+        limiter: &PeerLimiter, queued: usize, now: Instant,
     ) -> GossipOutcome {
         if refused.get(&tx.hash()).is_some() {
             return GossipOutcome::Report(MessageAcceptance::Reject);
         }
-        if let Some(p) = peer {
-            if !limiter.allow(p, now) { return GossipOutcome::Report(MessageAcceptance::Ignore) }
+        if let Some(b) = bucket {
+            if !limiter.allow(b, now) { return GossipOutcome::Report(MessageAcceptance::Ignore) }
         }
         if queued >= MAX_VERIFY_QUEUE { return GossipOutcome::Report(MessageAcceptance::Ignore) }
         GossipOutcome::Verify
@@ -1606,6 +1813,7 @@ In `node.rs`, `Node` gains:
 
 ```rust
 refused: RefusedCache,
+/// Policy only — every bucket lives on its `Peer`, so nothing here has to track the peer set.
 limiter: PeerLimiter,
 /// The tip the pending verifications are running against, refreshed lazily: a full ledger
 /// clone per consensus message would cost one per vote, so it is taken only when a transaction
@@ -1616,7 +1824,17 @@ verify_queue: VecDeque<(Transaction, VerifySource)>,
 verdicts_tx: mpsc::Sender<Verdict>,
 ```
 
-with `verdicts_rx` added as a fourth arm of the `select!` in `run`. The flow:
+and `Peer` (node.rs:230) gains a third field beside `status` and `connected`:
+
+```rust
+/// This peer's gossip-submission allowance. Metered only when the peer is the *forwarder* of a
+/// transaction; a peer we know of only as the author of relayed gossip never spends from it.
+/// Dropped with the entry on `PeerDisconnected`, which is why the limiter keeps no map.
+tx_bucket: admission::TokenBucket,
+```
+
+with `verdicts_rx` added as a **seventh** arm of the `select!` at node.rs:486 (which already has
+`events`, `cmds`, the timeout sleep, the propose sleep, `status_tick` and `sync_tick`). The flow:
 
 ```rust
 fn snapshot(&mut self) -> Arc<Ledger> {
@@ -1644,7 +1862,18 @@ fn pump_verify(&mut self) {
 }
 ```
 
-`NetworkEvent::Gossip`'s transaction arm becomes: `precheck` against the tip first (a duplicate or a conflict is Ignored, free, and never queued), then `GossipOutcome::for_transaction`; `Report(a)` → `self.net.report_validation(id, a).await`; `Verify` → push onto the queue and `pump_verify()`. Consensus and status arms report `Accept` immediately, before handling. `NodeCommand::SubmitTx` takes the same path with `VerifySource::Rpc(reply)` and `peer: None`, except that a `precheck` failure answers the caller directly (so the RPC error messages in `docs/rpc.md` are unchanged).
+`NetworkEvent::Gossip`'s transaction arm (node.rs:747, today a bare
+`let _ = self.mempool.insert(tx, self.hs.tip_ledger(), self.executor.as_ref());`) becomes: `precheck`
+against the tip first (a duplicate or a conflict is Ignored, free, and never queued), then
+`GossipOutcome::for_transaction`, whose bucket argument is
+`self.peers.entry(id.propagation_source).or_default().tx_bucket` — the forwarder's, not `from`'s;
+`Report(a)` → `self.net.report_validation(id, a).await`; `Verify` → push onto the queue and
+`pump_verify()`. The `Status` arm (:749) and the consensus arm report `Accept` immediately, before
+handling, and must keep the `entry(from).or_default().status = Some(s)` write and the `ahead &&
+sync_inflight.is_none()` sync kick exactly as they are. `NodeCommand::SubmitTx` (node.rs:665) takes
+the same path with `VerifySource::Rpc(reply)` and no bucket, except that a `precheck` failure answers
+the caller directly (so the RPC error messages in `docs/rpc.md` are unchanged) — and it keeps
+broadcasting only on success, as it does today.
 
 On a verdict:
 
@@ -1671,7 +1900,16 @@ async fn on_verdict(&mut self, v: Verdict) -> Result<()> {
 }
 ```
 
-`NetworkEvent::PeerDisconnected` also calls `self.limiter.forget(&p)`. `publish_status` sets `s.refused_cache = self.refused.len()` and `s.verify_queue = self.verify_queue.len()`.
+`NetworkEvent::PeerDisconnected` (node.rs:736) needs **no change at all**: it already does
+`self.peers.remove(&p)`, which drops the peer's `tx_bucket` with it, and it also clears
+`sync_inflight` and calls `maybe_sync()` — leave both alone. That is the whole reason the bucket
+lives on `Peer` rather than in a map inside `PeerLimiter`.
+
+`publish_status` (node.rs:512) sets `s.refused_cache = self.refused.len()` and `s.verify_queue =
+self.verify_queue.len()` in the same run of assignments that already fills `s.connected_peers`,
+`s.sync_failures`, `s.sync_late_batches` and `s.sync_inflight_age_ms`. Nothing here increments or
+reinterprets those four: a verification that is shed or refused is not a sync failure, and the two
+sets of numbers answer different questions for an operator.
 
 - [ ] **Step 8: Run the focused tests green**
 
@@ -1736,14 +1974,27 @@ EOF
 
 - [ ] **Step 1: Write the failing cluster tests**
 
-Two additions, both on chains the file already builds:
+Two additions, both on chains the file already builds. `cluster.rs` gives you `keys` (:105),
+`genesis` (:148), `genesis_funding` (:164), `start_node` (:276, FAST) / `start_node_at` (:280, takes
+the pace), `wait_height` (:343), `wait_for` (:335), `stop` (:323), `bootstrap_addr` (:329), and
+`TestNode { handle, dir, rpc }` (:270) — so `n.handle.status.read().unwrap()` is the `NodeStatus`
+and `n.rpc.call(method, params)` the raw JSON-RPC.
+
+**The proving slot applies to the first one.** Anything that proves a real bundle takes
+`let _slot = proving_slot().await;` around the whole `wallet::` call (the module is already imported
+at cluster.rs:40–41 and every proving test in the file holds it) — taken before the anchor is read,
+released after the commit. The second test is FAST-paced and proves nothing, so it takes no slot.
 
 ```rust
 /// The compact-block read against a real chain: a wallet that has only ever called
 /// getCompactBlocks sees exactly the leaves and nullifiers getCommitments and getNullifiers
 /// report, and the rows are grouped by the transaction that produced them.
-/// Rides on the existing `two_validators_commit_and_shielded_transfer` chain (PROVING pace, one
-/// real bundle) rather than proving a second one.
+/// **Prefer extending `two_validators_commit_and_shielded_transfer` (cluster.rs:732) in place** to
+/// writing this as a separate test: since the proving slot serialises the suite, a second copy of
+/// that opening is a thirteenth bundle proof and ~95–100 s of wall time added to a run that already
+/// takes ~20 minutes, for assertions that need no chain of their own. Write it standalone only if
+/// the existing test's shape genuinely will not carry it; if you do, it takes the slot like the
+/// rest, at PROVING pace, and this doc comment should say why.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn compact_blocks_agree_with_the_paged_reads() {
     /* start two validators on genesis_funding, mint, send one shielded transfer, wait for the
@@ -1821,6 +2072,9 @@ async fn a_refused_transaction_is_not_verified_twice() {
 Run: `cargo test --release -p shrugg-node --test cluster -- compact_blocks_agree a_refused_transaction`
 Expected: the compact-block one fails on the assertion (or compiles and passes if Task 1 landed correctly — in which case assert it *does* pass and move on); the refused-cache one fails on `refused_cache` not existing if Task 5 missed the status field.
 
+Even this focused run takes the proving slot for the compact-block half, so it will wait if another
+session holds the lock. Budget minutes, not seconds, and check the lock before blaming the test.
+
 - [ ] **Step 3: Make them pass**
 
 Fix whatever the two tests surface. No new production code should be needed; if something is, it belongs to the task that owns that file and the commit message should say so.
@@ -1828,11 +2082,23 @@ Fix whatever the two tests surface. No new production code should be needed; if 
 - [ ] **Step 4: Run the whole cluster suite, once**
 
 Run: `cargo test --release -p shrugg-node --test cluster`
-Expected: PASS — 18 tests (16 existing + 2), about 7 minutes. This is the only full-cluster run in the plan. `faucet_mint_via_rpc_reaches_every_node` is the load-bearing one: if `validate_messages()` broke propagation, it fails here.
+Expected: PASS — **19 tests (17 existing + 2), about 20 minutes**, or ~22 if the compact-block assertion was written as its own proving test rather than folded into `two_validators_commit_and_shielded_transfer`. The suite measured 17 tests / 19m59s on 2026-09-13 *because* the proving slot serialises its twelve bundle proofs and two program proofs; the 16 tests / 6m28s this plan was drafted against is the pre-slot number and will not be seen again.
+
+This is the only full-cluster run in the plan. Before starting it, make sure no other session's
+`--test cluster` or `--test wallet_flow` holds `<target-dir>/tmp/shrugg-proving-slot.lock` — the runs
+will not fail, they will queue, and the wall times add. While it runs, `ps -eo rss= | awk '$1>8000000'`
+should stay silent.
+
+`faucet_mint_via_rpc_reaches_every_node` (cluster.rs:633) is the load-bearing one: if
+`validate_messages()` broke propagation, it fails here. `node_behind_by_more_than_one_sync_batch_catches_up`
+(:553) and `four_validators_plus_late_observer_syncs` (:418) are the ones that would catch a
+regression in fix-sync-stall's batch sizing if this plan touched it — they should be untouched and
+green, which is the evidence that it did not.
 
 - [ ] **Step 5: Write the documentation**
 
-1. **`docs/rpc.md`** — add a `## Changelog` section at the end, headed "what changed for clients", listing in one place: `shrugg_getCompactBlocks` (new; the shape and the caps); batch requests (new; the 20 cap; notifications refused with `-32600`); the WebSocket endpoint and `newHeads` (new; same port, the caps, the drop-on-lag rule); `shrugg_status` gains `ws_clients`, `refused_cache`, `verify_queue`; the `-32600` error code is new; and the one behaviour change an existing client can notice — **a transaction submitted over RPC is now answered after its proof has verified on a worker rather than on the consensus loop, so the reply can take a few hundred milliseconds longer under load, and the error messages are unchanged**. Note explicitly that no wire format, block, or consensus rule changed and that old and new nodes interoperate.
+0. **Everywhere in `docs/rpc.md`: append, never overwrite.** fix-sync-stall rewrote the `shrugg_status` section (the example object at :258 now carries `sync_inflight_age_ms`, `sync_failures`, `sync_late_batches` and `connected_peers`, with four explanatory bullets after it) and added the behaviour `-32600` describes without adding its Errors row. The new keys, the new bullets and the sync prose all stay exactly as they are; this plan adds `ws_clients` / `refused_cache` / `verify_queue` to that example and one bullet each, and adds the `-32600` row.
+1. **`docs/rpc.md`** — add a `## Changelog` section at the end, headed "what changed for clients", listing in one place: `shrugg_getCompactBlocks` (new; the shape and the caps); batch requests (new; the 20 cap; notifications refused with `-32600`); the WebSocket endpoint and `newHeads` (new; same port, the caps, the drop-on-lag rule); `shrugg_status` gains `ws_clients`, `refused_cache`, `verify_queue` (beside the four sync fields fix-sync-stall added, which are unchanged); the `-32600` error code is newly *documented* — it already existed for an oversized or unparseable body, and this plan adds the batch-shape and notification uses; and the one behaviour change an existing client can notice — **a transaction submitted over RPC is now answered after its proof has verified on a worker rather than on the consensus loop, so the reply can take a few hundred milliseconds longer under load, and the error messages are unchanged**. Note explicitly that no wire format, block, or consensus rule changed and that old and new nodes interoperate.
 2. **`docs/rpc-comparison.md` §2** — replace "Two cheap, non-consensus additions close most of that and are scheduled as an RPC hardening task after phase S3" and its two bullets with the shipped shapes: `shrugg_getCompactBlocks(from_height, to_height)` → per block its height, hash, timestamp and per transaction its note commitments (leaf index + envelope) and nullifiers, 128 blocks per call; and the WebSocket `newHeads` subscription (`shrugg_subscribe`/`shrugg_unsubscribe`, same port). Update the §1 table's *subscriptions* row (SHRUGG: `newHeads` over WebSocket) and its *batching and paging* row (SHRUGG: JSON-RPC batch, cap 20, plus limit-based paging and the compact-block range). Update §4's *subscriptions* row the same way and drop "(planned: WebSocket `newHeads`)". Leave §4's viewing-key-import and `check_tx_proof` paragraphs as candidates — they are this plan's "pending the user's decision" list.
 3. **`AGENTS.md`** — rewrite the Open-follow-ups bullet. It currently reads "Proof verification still runs on the consensus event loop (~20 ms warm); moving it to `spawn_blocking` + gossipsub `Strict` validation is the real DoS fix (fee floor and FIFO key cache are mitigations only)." It becomes a statement of what shipped, under the review-state section rather than the follow-ups: transaction proof verification runs on `spawn_blocking` behind a bounded queue, gossipsub uses application-level validation (`validate_messages`, **`ValidationMode` deliberately still `Permissive` — a Strict/Permissive mix across a fleet drops messages**), a bounded refused-hash cache answers a repeat refusal for free, and a per-peer token bucket meters gossiped submissions. Keep one line under Open follow-ups: **block-application proof verification is still on the loop and needs a consensus decision to move**.
 4. **`docs/architecture.md` §8** — the Mempool numbered list becomes the new order (duplicate hash → pool conflicts → capacity → the staleness half of `Ledger::validate` → *queue for off-loop verification* → the proofs on a blocking task → `insert_verified` against the tip), with the gossipsub application-validation paragraph and the report-exactly-once invariant. §9c's sentence about the RPC handler is updated the same way.
@@ -1841,6 +2107,11 @@ Expected: PASS — 18 tests (16 existing + 2), about 7 minutes. This is the only
 - [ ] **Step 6: Verify the docs against the code**
 
 Run: `cargo test --release -p shrugg-node --lib` and re-read `docs/rpc.md`'s new sections against the constants in `rpc.rs`, `ws.rs` and `admission.rs`. Every number in the docs (128, 1000, 20, 64, 8, 256, 8192, 16, 4) must be the constant's value. Fix any drift.
+
+Also check what you did **not** write: the body-limit prose must still describe `RPC_MAX_BODY_BYTES`
+as derived from `2 * MAX_PROOF_BYTES` and the envelope caps (it is a `const` expression, so quote the
+formula, not a stale byte count), and the four sync bullets must read exactly as fix-sync-stall left
+them. A docs diff that touches those lines is a mistake in this step.
 
 - [ ] **Step 7: Commit**
 
@@ -1881,5 +2152,18 @@ EOF
 **Placeholder scan.** Every step names its file, its test, its command and its expected output. The one deliberate "confirm before writing" is Task 4 Step 5's `insert_nullifier_for_testing`, which is a named `cargo check` against a helper that may or may not exist under that name in `shrugg-core` — the user permitted `cargo check`, and the alternative (build the moved ledger by applying a block) is stated. `docs/rpc.md`'s prose is described by content rather than transcribed, because it is documentation, not code.
 
 **Type consistency.** `HeadSummary` / `head_summary` / `HEAD_CHANNEL` (rpc.rs) are used identically in ws.rs and node.rs. `GossipId { message_id, propagation_source }` is produced in network/mod.rs and consumed in admission.rs (`VerifySource::Gossip`) and node.rs. `RefusedCache::{new,get,insert,len}`, `is_permanent`, `PeerLimiter::{new,allow,forget}`, `GossipOutcome::{for_consensus,for_transaction}`, `acceptance_for`, `Verdict { tx, result, source }` keep one spelling across Tasks 4 and 5. `Mempool::{precheck, insert_verified, insert}` and the private `applies`/`admit` are named the same in Task 4's implementation and Task 5's `on_verdict`. `Storage::{notes_in_heights, first_note_at_or_after}` and the free `derived_note_count` are named the same in Task 1's storage code, its RPC renderer and its tests. `NodeStatus`'s three new fields (`ws_clients`, `refused_cache`, `verify_queue`) are added in Tasks 3 and 5 and read by Task 6's cluster tests and the docs.
+
+**Reconciliation with main `9ffdd43`.** Every file:line above was re-checked against the merged head
+on 2026-09-13: `rpc.rs` `MAX_PAGE`:26, `NodeStatus`:38, `RpcState`:110, `Request`:119,
+`invalid_request`:139, `RPC_MAX_BODY_BYTES`:154, `handle`:194, `rejection_error`:222, `blocking`:237,
+`envelope_json`:297, `block_json`:334, `dispatch`:465, the `sendTransaction` size pre-check:475,
+`shrugg_getNullifiers`:531, `shrugg_getHead`:717, the test fixtures:865–911, the body-limit tests:1497;
+`network/mod.rs` `NetworkEvent`:149, `ConfigBuilder`:245–250, `Event::Message`:486; `node.rs`
+`peers`:203, `Peer`:230, `run`'s `select!`:486, `publish_status`:512, `SubmitTx`:665,
+`PeerDisconnected`:736, the gossip transaction arm:747; `mempool.rs` `claimed_nonce`:59,
+`claimed_commitments`:97, `insert`:136, `candidates_within`:202, `still_applies`:227;
+`shrugg-core` `ledger/staking.rs::derived_commitment`:161 and `TxError::TransactionTooLarge` in
+`ledger/mod.rs`. The two amendments the new code forced are named at the top and marked in place:
+the `-32600` constraint, and the rate limit's key.
 
 **One gap found and closed while reviewing:** the first draft reported gossip validation only for transactions, which would have left every consensus and status message unvalidated in the gossipsub cache and silently stopped this node forwarding them — a whole-network failure from a local switch. Task 5 now reports `Accept` for those immediately, rejects undecodable bytes inside the network task, and has a test whose whole subject is "exactly one report per message".
