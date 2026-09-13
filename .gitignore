@@ -4,5 +4,8 @@
 /testnet
 *.key.json
 !deploy/*.key.json
+# Chain-8 per-validator payout wallets: test keys, committed on purpose (deploy/payout/README.md).
+!deploy/payout/*.key.json
 .git-rev
 bin-b00bc72/
+bin-03c9fb9/
