@@ -255,7 +255,8 @@ Params: `[]`. Result:
 {
   "height": 1998, "head_hash": "…", "view": 2251, "high_qc_view": 2250,
   "syncing": false, "sync_target": 1998,
-  "peer_count": 5, "mempool_size": 0,
+  "sync_inflight_age_ms": null, "sync_failures": 0, "sync_late_batches": 0,
+  "peer_count": 5, "connected_peers": 5, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
   "fri_profile": "production", "programs": 2,
   "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19",
@@ -263,7 +264,26 @@ Params: `[]`. Result:
 }
 ```
 `syncing` is true while a batch request to a peer is in flight; `sync_target` is the highest height
-any peer has advertised. `is_validator` says this node holds a validator key; `active_validator`
+any peer has advertised.
+
+The four fields beside them are for reading a node that is behind and not catching up, which
+otherwise looks identical to a node that is behind and working:
+
+- `sync_inflight_age_ms` — how long the outstanding batch request has been outstanding, or `null`
+  when none is. An age that keeps climbing past a few seconds is the diagnosis: the request is not
+  coming back. The node gives up at the wire's own timeout (30 s) and tries another peer.
+- `sync_failures` — batch requests that failed since start: a wire or codec error, a give-up past
+  that timeout, or a batch that arrived and could not be applied. Rising while `height` does not is
+  a node that cannot catch up.
+- `sync_late_batches` — batches applied *after* their request had been given up on. Progress, not
+  failure, but a rising count means the give-up is firing on requests that were still alive, so the
+  peers being asked are slower than the timeout.
+- `connected_peers` — peers with an open connection, which are the only ones sync can ask for
+  blocks. `peer_count` counts every peer this node knows of, including those seen only as the author
+  of relayed gossip, so `peer_count` far above `connected_peers` means most of what this node knows
+  about the network is hearsay.
+
+`is_validator` says this node holds a validator key; `active_validator`
 says that key is in the set running the current epoch (spec §8) — a validator that has bonded in
 but whose epoch has not arrived is the first without the second. `notes` is every note the chain has ever created, `nullifiers` every note
 it has ever spent, and `hc_bundle` the bundle guest this chain's proofs are against — a node whose

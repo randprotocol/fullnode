@@ -129,16 +129,17 @@ where
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_limited(io, req, self.request_size_maximum, "request").await?;
-        io.close().await
+        // No `io.close()`: `libp2p_request_response`'s handler closes the stream itself the moment
+        // this returns, which is also what gives the reader its EOF.
+        write_limited(io, req, self.request_size_maximum, "request").await
     }
 
     async fn write_response<T>(&mut self, _: &Self::Protocol, io: &mut T, res: Resp) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_limited(io, res, self.response_size_maximum, "response").await?;
-        io.close().await
+        // Closed by the handler, as above.
+        write_limited(io, res, self.response_size_maximum, "response").await
     }
 }
 

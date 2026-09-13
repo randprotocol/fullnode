@@ -44,10 +44,18 @@ pub struct NodeStatus {
     /// age that keeps climbing past a few seconds says the request it is waiting on is not coming
     /// back — the shape of the chain-8 catch-up stall, which showed nothing else at all.
     pub sync_inflight_age_ms: Option<u64>,
-    /// Sync requests that failed on the wire, timed out, or came back unusable, since start.
-    /// Rising while `height` does not is the signature of a node that cannot catch up.
+    /// Sync batch requests that failed since start: a wire or codec error, a give-up past the wire
+    /// timeout, or a batch that could not be applied. Rising while `height` does not is the
+    /// signature of a node that cannot catch up.
     pub sync_failures: u64,
+    /// Batches applied after their request had been given up on. Progress rather than failure, but
+    /// a rising count means the give-up is firing on requests that were still alive.
+    pub sync_late_batches: u64,
+    /// Every peer this node knows of, including those seen only as the author of relayed gossip.
     pub peer_count: usize,
+    /// Peers this node holds an open connection to — the ones sync can actually ask for blocks. A
+    /// `peer_count` far above this says most of what we know about the network is hearsay.
+    pub connected_peers: usize,
     pub mempool_size: usize,
     /// This node holds a validator key and is running as one (`--validator`).
     pub is_validator: bool,
@@ -464,6 +472,17 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let bytes = hex::decode(raw.strip_prefix("0x").unwrap_or(&raw))
                 .map_err(|_| RpcError::invalid_params("tx must be hex"))?;
             let tx = Transaction::decode(&bytes).map_err(|e| RpcError::invalid_params(format!("tx decode: {e}")))?;
+            // The body limit admits more than a block can carry — two `MAX_PROOF_BYTES` proofs are
+            // a legal `Call` by the per-part caps and still over `MAX_BLOCK_BYTES` — so refuse one
+            // here rather than handing the node loop a transaction no block could ever include.
+            // Admission refuses it too (`TxError::TransactionTooLarge`); this keeps it off the loop.
+            let encoded_len = tx.encoded_len();
+            if encoded_len > shrugg_core::gas::MAX_BLOCK_BYTES {
+                return Err(RpcError::rejected(format!(
+                    "transaction of {encoded_len} bytes exceeds the {} byte block limit",
+                    shrugg_core::gas::MAX_BLOCK_BYTES
+                )));
+            }
             let (reply, rx) = oneshot::channel();
             st.node
                 .send(NodeCommand::SubmitTx { tx, reply })
@@ -1487,10 +1506,15 @@ mod tests {
     // plain-text 413, and the wallet reported the unparseable reply as
     // "expected value at line 1 column 1" after ~100 s of proving.
 
-    /// The worst transaction the chain can admit: a bundle at `MAX_PROOF_BYTES` with two maximal
-    /// output envelopes, and a `Call` carrying a second `MAX_PROOF_BYTES` proof and a maximal input
-    /// envelope.
-    fn worst_case_transaction() -> Transaction {
+    /// The largest transaction the *per-part* caps allow: a bundle at `MAX_PROOF_BYTES` with two
+    /// maximal output envelopes, and a `Call` carrying a second `MAX_PROOF_BYTES` proof and a
+    /// maximal input envelope.
+    ///
+    /// Deliberately **not** an admissible transaction: two maximal proofs are over
+    /// `MAX_BLOCK_BYTES`, so no block can carry it and admission refuses it as
+    /// `TxError::TransactionTooLarge`. It is the right fixture for the *body* limit, which has to be
+    /// wide enough that the limit is never what refuses a transaction — the block rule is.
+    fn largest_transaction_the_part_caps_allow() -> Transaction {
         use shrugg_core::notes::{Bundle, MAX_ENVELOPE_BYTES};
         use shrugg_core::types::actions::{CallEnvelope, MAX_CALL_ENVELOPE_BYTES};
 
@@ -1524,9 +1548,12 @@ mod tests {
         Transaction::shielded(7, bundle, call)
     }
 
+    /// The body limit is never the thing that refuses a transaction: it is wide enough for anything
+    /// the per-part caps allow, so what refuses an over-large one is the block rule, with a message
+    /// about blocks.
     #[test]
-    fn the_body_limit_admits_the_largest_transaction_the_chain_can_take() {
-        let tx = worst_case_transaction();
+    fn the_body_limit_is_wider_than_any_transaction_the_part_caps_allow() {
+        let tx = largest_transaction_the_part_caps_allow();
         let encoded = tx.encode();
         // Two proofs' worth, not one: this is the term the old limit was missing.
         assert!(
@@ -1540,12 +1567,31 @@ mod tests {
         let posted = serde_json::to_vec(&body).unwrap().len();
         assert!(
             posted <= RPC_MAX_BODY_BYTES,
-            "the largest admissible transaction must fit: {posted} B posted against a {RPC_MAX_BODY_BYTES} B limit"
+            "the widest transaction the part caps allow must fit: {posted} B posted against a {RPC_MAX_BODY_BYTES} B limit"
         );
 
         // And the retired limit would have refused it, which is the bug.
         let old_limit = 2 * shrugg_core::gas::MAX_PROOF_BYTES + 256 * 1024;
         assert!(posted > old_limit, "the old limit should have refused this: {posted} B against {old_limit} B");
+    }
+
+    /// A transaction larger than a block is refused at the RPC, before it reaches the node loop, and
+    /// the message names the block limit rather than the body limit.
+    ///
+    /// The body limit admits it on purpose (above): the two caps answer different questions, and
+    /// without this check a transaction no block could ever carry would be handed to the mempool.
+    #[tokio::test]
+    async fn a_transaction_larger_than_a_block_is_refused_naming_the_block_limit() {
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_dir, st) = state_for(&gs);
+        let tx = largest_transaction_the_part_caps_allow();
+        let encoded_len = tx.encoded_len();
+        assert!(encoded_len > shrugg_core::gas::MAX_BLOCK_BYTES, "the fixture must be unminable: {encoded_len} B");
+
+        let err = call(&st, "shrugg_sendTransaction", json!([hex::encode(tx.encode())])).await.unwrap_err();
+        assert_eq!(err.code, -32000, "{}", err.message);
+        assert!(err.message.contains(&shrugg_core::gas::MAX_BLOCK_BYTES.to_string()), "{}", err.message);
+        assert!(err.message.contains(&encoded_len.to_string()), "{}", err.message);
     }
 
     /// A body over the limit comes back as a JSON-RPC error naming the limit — parseable, where the

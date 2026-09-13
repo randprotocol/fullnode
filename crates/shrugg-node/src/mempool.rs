@@ -192,7 +192,8 @@ impl Mempool {
         self.candidates_within(ledger, max, usize::MAX)
     }
 
-    /// Like `candidates`, but stops before the encoded size of the selection exceeds `max_bytes`.
+    /// Like `candidates`, but keeps the encoded size of the selection within `max_bytes`, skipping
+    /// any transaction that would not fit rather than ending the selection at it.
     ///
     /// Only pool-level re-checks happen here (the ledger may have moved since insertion): a
     /// transaction whose anchor has scrolled out, whose nullifier was spent, or whose commitment
@@ -207,7 +208,13 @@ impl Mempool {
         for (_, p) in ready.into_iter().take(max) {
             let len = p.tx.encoded_len();
             if bytes + len > max_bytes {
-                break;
+                // Skip it, do not end the block. `break` meant one transaction that cannot fit —
+                // sorted first because it pays the highest fee — produced *empty* blocks for as
+                // long as it stayed pooled. Admission now refuses a transaction larger than a block
+                // outright (`TxError::TransactionTooLarge`), so what reaches here is only a
+                // transaction too large for the space *left*, and a smaller one behind it should
+                // still travel.
+                continue;
             }
             bytes += len;
             out.push(p.tx.clone());
@@ -353,11 +360,80 @@ mod tests {
         // Highest fee first, regardless of insertion order.
         assert_eq!(m.candidates(&l, 10), vec![dear.clone(), cheap.clone()]);
         assert_eq!(m.candidates(&l, 1), vec![dear.clone()]);
-        // The byte budget stops the selection short rather than overflowing a block.
+        // The byte budget keeps the selection inside a block rather than overflowing it.
         let one = dear.encoded_len();
         assert_eq!(m.candidates_within(&l, 10, one).len(), 1);
         assert_eq!(m.candidates_within(&l, 10, 1).len(), 0);
         assert_eq!(m.candidates_within(&l, 10, usize::MAX).len(), 2);
+    }
+
+    /// A transaction larger than a block never enters the pool.
+    ///
+    /// The RPC body limit admits one — two `MAX_PROOF_BYTES` proofs each pass the per-part caps and
+    /// together exceed `MAX_BLOCK_BYTES` — so without this the pool would hold a transaction no
+    /// block could ever carry, and `candidates_within` would meet it on every proposal.
+    #[test]
+    fn a_transaction_larger_than_a_block_is_refused_at_insert() {
+        let l = ledger();
+        let mut m = Mempool::new(100);
+        let mut big = fixtures::bundle(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee());
+        // A proof inside its own cap, twice over once the action carries one too.
+        big.proof = vec![3u8; shrugg_core::gas::MAX_PROOF_BYTES];
+        let tx = Transaction::shielded(
+            l.chain_id(),
+            big,
+            Action::Call {
+                program: shrugg_core::Hash::digest(b"program"),
+                proof: vec![4u8; shrugg_core::gas::MAX_PROOF_BYTES],
+                input_envelope: None,
+            },
+        );
+        assert!(
+            tx.encoded_len() > shrugg_core::gas::MAX_BLOCK_BYTES,
+            "the fixture must be unminable: {} B",
+            tx.encoded_len()
+        );
+
+        let err = m.insert(tx, &l, &StubExecutor).unwrap_err();
+        match err {
+            MempoolError::Invalid(shrugg_core::ledger::TxError::TransactionTooLarge(n)) => {
+                assert!(n > shrugg_core::gas::MAX_BLOCK_BYTES, "the error should carry the size: {n}");
+            }
+            other => panic!("expected TransactionTooLarge, got {other}"),
+        }
+        assert_eq!(m.len(), 0, "nothing should have been pooled");
+    }
+
+    /// A transaction that does not fit is skipped, not treated as the end of the block.
+    ///
+    /// It used to `break`: a transaction too big for the budget, sorted first because it paid the
+    /// most, produced *empty* blocks for as long as it stayed pooled — one poisoned entry stalling
+    /// throughput for every other sender.
+    #[test]
+    fn a_candidate_that_does_not_fit_is_skipped_so_a_smaller_one_behind_it_still_travels() {
+        let l = ledger();
+        let mut m = Mempool::new(100);
+        // The dear one pays more, so it sorts first and is met first by the byte budget — and it is
+        // bigger, so it is the one that does not fit. The padding goes in the envelopes, which the
+        // bundle digest does not cover, so the fixture's stub proof still verifies.
+        let cheap = fixtures::bundle_tx(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee());
+        let mut big = fixtures::bundle(&l, [nf(3), nf(4)], [cm(3), cm(4)], fixtures::bundle_fee() * 3);
+        for e in &mut big.envelopes {
+            e.body = vec![7u8; 512];
+        }
+        let dear = Transaction::shielded(l.chain_id(), big, Action::None);
+        m.insert(cheap.clone(), &l, &StubExecutor).unwrap();
+        m.insert(dear.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&l, 10), vec![dear.clone(), cheap.clone()], "the dear one sorts first");
+
+        // A budget that fits the cheap one but not the dear one.
+        let budget = dear.encoded_len() - 1;
+        assert!(cheap.encoded_len() <= budget, "the cheap one has to fit for this test to mean anything");
+        assert_eq!(
+            m.candidates_within(&l, 10, budget),
+            vec![cheap],
+            "the block should carry the transaction that fits, not come back empty"
+        );
     }
 
     #[test]

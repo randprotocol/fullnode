@@ -29,6 +29,11 @@ const SYNC_BATCH: u32 = 100;
 /// carries.
 const SYNC_BATCH_MIN: u32 = 1;
 
+/// Charged to every batch before its first block: the CBOR framing around the blocks themselves
+/// (the `SyncResponse::Blocks` variant, and the array header, which grows to 9 bytes at most).
+/// Generous on purpose — the budget should over-estimate the response, never under-estimate it.
+const SYNC_RESPONSE_FRAMING_BYTES: u64 = 64;
+
 /// How long the node waits for a sync response before it abandons the request.
 ///
 /// The wire's own timeout, deliberately. A shorter deadline here abandons a request that is still
@@ -204,9 +209,17 @@ struct Node {
     /// reset to [`SYNC_BATCH`] after a batch applies, so a batch size the wire cannot carry is
     /// backed away from instead of retried forever.
     sync_batch: u32,
-    /// Sync requests that failed on the wire, timed out, or came back unusable, since start.
-    /// Surfaced in `shrugg status`, because the failure mode this counts was invisible on chain 8.
+    /// Sync batch requests that *failed*: a wire or codec error, a give-up past the wire timeout,
+    /// or a batch we asked for and could not apply. Surfaced in `shrugg status`, because the
+    /// failure mode this counts was invisible on chain 8.
+    ///
+    /// Deliberately not the same number as [`Node::sync_late_batches`]: one says the round trip was
+    /// lost, the other says it was merely slow, and an operator reading a stall needs to tell them
+    /// apart.
     sync_failures: u64,
+    /// Batches that arrived after their request had been given up on and were applied anyway.
+    /// Progress, not failure — but a rising count means the give-up is firing on live requests.
+    sync_late_batches: u64,
     fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, Hash>,
     /// Block hash -> (attempts so far, peers already asked) for by-hash fetches.
     fetch_attempts: HashMap<Hash, (usize, Vec<PeerId>)>,
@@ -244,6 +257,33 @@ fn committed_block_wire_size(cb: &CommittedBlock) -> u64 {
     network::codec::cbor_size(cb).map(|n| n as u64).unwrap_or(network::SYNC_MAX_WIRE_BYTES)
 }
 
+/// The two decisions to make about an arriving `Blocks` response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatchDecision {
+    /// These blocks continue our chain: apply them.
+    apply: bool,
+    /// They arrived after their own request had been given up on. Applied anyway — the blocks are
+    /// good — but counted, because a give-up firing on live requests is worth seeing.
+    late: bool,
+    /// Free the in-flight slot. Only ever when this response *is* the request the slot holds: on the
+    /// late path the slot holds the replacement we sent when we gave up, and that one is still on
+    /// the wire.
+    clear_inflight: bool,
+}
+
+/// A batch is judged by what it holds, not by which request asked for it.
+///
+/// The node used to drop any response whose id was not the current one, which threw away good
+/// blocks every time its own give-up had already re-requested the same range — so only a batch that
+/// arrived inside the give-up window counted, and catch-up moved one batch per 30-40 s with nothing
+/// in the log to say why. A batch whose first block is exactly our next height continues our chain
+/// whoever asked for it and however late; applying it twice is impossible, because the second copy
+/// no longer starts there. `None` is an empty batch: the peer has nothing past our height.
+fn batch_decision(first_height: Option<u64>, my_height: u64, is_current: bool) -> BatchDecision {
+    let apply = first_height == Some(my_height + 1);
+    BatchDecision { apply, late: apply && !is_current, clear_inflight: is_current }
+}
+
 /// Take committed blocks from `blocks` while they fit in `budget` bytes of wire.
 ///
 /// The first block is always taken, however large it is: a block fatter than the whole budget must
@@ -254,7 +294,11 @@ fn committed_block_wire_size(cb: &CommittedBlock) -> u64 {
 /// `blocks` is consumed lazily, so a batch that fills on bytes never reads the rest from storage.
 fn fill_sync_batch(blocks: impl IntoIterator<Item = CommittedBlock>, budget: u64) -> Vec<CommittedBlock> {
     let mut out: Vec<CommittedBlock> = Vec::new();
-    let mut bytes = 0u64;
+    // Seeded with the enclosing framing — the `SyncResponse` variant tag and the array header —
+    // rather than starting at zero, so the running total is an over-estimate of the response and
+    // never an under-estimate of it. A few bytes against a 6 MiB budget, but the direction of the
+    // error is the point.
+    let mut bytes = SYNC_RESPONSE_FRAMING_BYTES;
     for cb in blocks {
         bytes = bytes.saturating_add(committed_block_wire_size(&cb));
         if !out.is_empty() && bytes > budget {
@@ -397,6 +441,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         sync_inflight: None,
         sync_batch: SYNC_BATCH,
         sync_failures: 0,
+        sync_late_batches: 0,
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
     };
@@ -470,9 +515,12 @@ impl Node {
         s.head_hash = self.hs.committed_hash().to_hex();
         s.view = self.hs.view();
         s.high_qc_view = self.hs.high_qc().view;
-        // Connected peers, not every peer whose gossip we have relayed: the number an operator
-        // reads here is the number sync can actually ask for blocks.
-        s.peer_count = self.peers.values().filter(|p| p.connected).count();
+        // `peer_count` keeps the meaning it has always had — every peer we know of, including
+        // those seen only as the author of relayed gossip — because dashboards threshold on it.
+        // `connected_peers` is the new number, and the one that matters for sync: only a peer we
+        // hold an open connection to can be asked for blocks.
+        s.peer_count = self.peers.len();
+        s.connected_peers = self.peers.values().filter(|p| p.connected).count();
         s.mempool_size = self.mempool.len();
         // Whether this node's key is in the set running the epoch the next block belongs to.
         // Distinct from `is_validator`, which only says the node holds a key at all.
@@ -493,6 +541,7 @@ impl Node {
         // catch-up stall presented.
         s.sync_inflight_age_ms = self.sync_inflight.map(|(_, _, at)| at.elapsed().as_millis() as u64);
         s.sync_failures = self.sync_failures;
+        s.sync_late_batches = self.sync_late_batches;
     }
 
     async fn broadcast_status(&self) {
@@ -920,55 +969,48 @@ impl Node {
             SyncResponse::Blocks(blocks) => {
                 let current = self.sync_inflight.map(|s| s.1) == Some(request_id);
                 let elapsed = self.sync_inflight.map(|(_, _, at)| at.elapsed().as_millis() as u64);
-                // A batch is judged by what it contains, not by which request asked for it. The
-                // node used to drop any response whose id was not the current one, which threw away
-                // perfectly good blocks every time its own give-up had already re-requested the
-                // same range — so only a batch that arrived inside the give-up window counted, and
-                // catch-up moved one batch per 30-40 s with nothing in the log to say why. A batch
-                // that starts at exactly our next height is usable whoever asked for it and however
-                // late it is; applying it twice is impossible, because the second copy no longer
-                // starts at our next height.
-                let usable = match blocks.first() {
-                    Some(first) => first.block.height() == self.hs.committed_height() + 1,
-                    // An empty batch says the peer has nothing past our height.
-                    None => false,
-                };
-                if !usable {
-                    if !current {
-                        self.sync_failures += 1;
-                    }
+                let my_height = self.hs.committed_height();
+                let d = batch_decision(blocks.first().map(|b| b.block.height()), my_height, current);
+                if d.clear_inflight {
+                    self.sync_inflight = None;
+                }
+                if !d.apply {
                     tracing::info!(
                         %peer, ?request_id, current_request = current, ?elapsed,
                         first = ?blocks.first().map(|b| b.block.height()),
-                        my_height = self.hs.committed_height(), blocks = blocks.len(),
+                        my_height, blocks = blocks.len(),
                         "ignoring a sync batch that does not start at our next height"
                     );
-                    if current {
-                        self.sync_inflight = None;
-                    }
                     return Ok(());
                 }
-                if !current {
-                    // Late but usable: count it, so an operator can see the deadline being missed,
-                    // and apply it anyway.
-                    self.sync_failures += 1;
+                if d.late {
+                    self.sync_late_batches += 1;
                     tracing::info!(
-                        %peer, ?request_id, blocks = blocks.len(),
+                        %peer, ?request_id, late_batches = self.sync_late_batches, blocks = blocks.len(),
                         "applying a sync batch that arrived after its request was abandoned"
                     );
                 }
-                self.sync_inflight = None;
                 let n = blocks.len();
                 if let Err(e) = self.apply_synced(blocks).await {
-                    tracing::warn!("sync batch from {peer} rejected: {e}");
+                    // Blocks we asked for and could not use: a peer on a different chain, or a
+                    // damaged batch. It cost us a round trip either way.
+                    self.sync_failures += 1;
+                    tracing::warn!(%peer, failures = self.sync_failures, "sync batch rejected: {e}");
                     self.peers.remove(&peer);
                     return Ok(());
                 }
-                // A batch got through, so the wire carries this size: go back to asking for a full
-                // one. The server caps by bytes as well, so a batch can be shorter than we asked
-                // for without meaning the chain has run out — follow up on any batch that moved us
+                // A batch got through, so the wire carries this size: ask for more next time, but
+                // *double* rather than snapping straight back to full. Against a peer still on the
+                // old build — whose block-only budget puts a 13.57 MiB response on the wire for a
+                // 100-block request — snapping back would oscillate full/rejected/halved/full for
+                // as long as we sync from it, paying a rejected multi-megabyte download every
+                // other round trip. Doubling settles at the largest size that peer can actually
+                // deliver.
+                //
+                // The server caps by bytes as well, so a batch can be shorter than we asked for
+                // without meaning the chain has run out — follow up on any batch that moved us
                 // while a peer is still ahead.
-                self.sync_batch = SYNC_BATCH;
+                self.sync_batch = (self.sync_batch * 2).min(SYNC_BATCH);
                 if n > 0 && self.best_peer_height() > self.hs.committed_height() {
                     self.maybe_sync().await;
                 }
@@ -1344,6 +1386,76 @@ mod tests {
         assert!(seen.iter().all(|b| *b >= 1));
     }
 
+    /// After a success the batch *doubles* rather than snapping back to full.
+    ///
+    /// Snapping back oscillated against a peer still on the old build, whose block-only budget puts
+    /// a 13.57 MiB response on the wire for a 100-block request: full, rejected, halved, succeeds,
+    /// full again — paying a rejected multi-megabyte download every other round trip for as long as
+    /// we sync from it. Doubling settles at the largest size that peer can deliver.
+    #[test]
+    fn the_client_batch_grows_back_geometrically_and_stops_at_full() {
+        let grow = |b: u32| (b * 2).min(SYNC_BATCH);
+        assert_eq!(grow(SYNC_BATCH_MIN), 2);
+        assert_eq!(grow(25), 50);
+        // Never past the ceiling, from either side of it.
+        assert_eq!(grow(50), SYNC_BATCH);
+        assert_eq!(grow(SYNC_BATCH), SYNC_BATCH);
+
+        // A peer that can serve 25 but not 50: halving after each failure and doubling after each
+        // success settles on 25 rather than retrying 100 forever.
+        let mut batch = SYNC_BATCH;
+        let deliverable = 25;
+        let mut asked = Vec::new();
+        for _ in 0..8 {
+            asked.push(batch);
+            batch = if batch > deliverable { (batch / 2).max(SYNC_BATCH_MIN) } else { grow(batch) };
+        }
+        // It reaches the deliverable size and then alternates 25/50 — never back to 100.
+        assert_eq!(&asked[..3], &[100, 50, 25]);
+        assert!(asked[3..].iter().all(|b| *b <= 50), "must not snap back to a full batch: {asked:?}");
+        assert!(asked[3..].contains(&deliverable));
+    }
+
+    /// A late but usable batch is applied, counted as late rather than as a failure, and — the fix —
+    /// leaves the in-flight slot alone.
+    ///
+    /// When the give-up fires the node sends a replacement and records it. If the abandoned
+    /// request's answer then arrives and is applied, clearing the slot would forget that live
+    /// replacement: the follow-up would put a third request on the wire and the replacement's
+    /// answer, up to a full batch, would arrive orphaned.
+    #[test]
+    fn a_late_acceptance_applies_the_batch_and_leaves_the_live_replacement_recorded() {
+        let d = batch_decision(Some(301), 300, false);
+        assert!(d.apply, "the blocks continue our chain, whoever asked for them");
+        assert!(d.late, "counted as late, not as a failure");
+        assert!(!d.clear_inflight, "the replacement request is still on the wire");
+    }
+
+    /// Answering the request the slot holds frees it, and is not late.
+    #[test]
+    fn the_current_requests_answer_frees_the_slot() {
+        let d = batch_decision(Some(301), 300, true);
+        assert!(d.apply);
+        assert!(!d.late);
+        assert!(d.clear_inflight);
+    }
+
+    /// An unusable response frees the slot only when it is the one the slot holds — otherwise it is
+    /// a stale answer to a request we already gave up on, and the live one must survive it.
+    #[test]
+    fn an_unusable_batch_never_takes_the_live_request_with_it() {
+        for first in [None, Some(300u64), Some(302), Some(250)] {
+            let stale = batch_decision(first, 300, false);
+            assert!(!stale.apply, "{first:?}");
+            assert!(!stale.late, "an unapplied batch is not a late batch: {first:?}");
+            assert!(!stale.clear_inflight, "a stale answer must not free the live slot: {first:?}");
+
+            let current = batch_decision(first, 300, true);
+            assert!(!current.apply, "{first:?}");
+            assert!(current.clear_inflight, "the slot's own answer frees it even when unusable: {first:?}");
+        }
+    }
+
     // ------------------------------------------------- the response-acceptance rule
     //
     // A batch is judged by what it holds, not by which request asked for it. The node used to drop
@@ -1351,12 +1463,9 @@ mod tests {
     // give-up had re-requested the same range was thrown away — and on a 1-vCPU peer serving 100
     // blocks, most of them did.
 
-    /// The rule `on_sync_response` applies, as a function of the batch's first height and ours.
+    /// Whether a batch would be applied, over the shipped decision.
     fn accepts(first_height: Option<u64>, my_height: u64) -> bool {
-        match first_height {
-            Some(h) => h == my_height + 1,
-            None => false,
-        }
+        batch_decision(first_height, my_height, true).apply
     }
 
     #[test]

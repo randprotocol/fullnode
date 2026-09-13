@@ -81,6 +81,15 @@ pub enum TxError {
     ProofTooLarge,
     #[error("attestation exceeds {} bytes", gas::MAX_ATTESTATION_BYTES)]
     AttestationTooLarge,
+    /// The whole transaction is larger than a block, so no block could ever carry it.
+    ///
+    /// The per-part caps above do not imply this one: a `Call` carries two proofs, each admissible
+    /// at `MAX_PROOF_BYTES`, whose sum with envelopes is over `MAX_BLOCK_BYTES`. `apply_block`
+    /// already refuses such a transaction as part of the block's cumulative byte rule, so nothing
+    /// about block validity changes here — this only stops one from being accepted for a block it
+    /// can never be in.
+    #[error("transaction of {0} bytes exceeds the {max} byte block limit", max = gas::MAX_BLOCK_BYTES)]
+    TransactionTooLarge(usize),
     #[error("program too large")]
     ProgramTooLarge,
     #[error("asset {0} is not supported in this release")]
@@ -645,6 +654,14 @@ impl Ledger {
     /// verifies each proof and each guardian quorum exactly once.
     fn validate_inner(&self, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Result<Verified, TxError> {
         // 1. size caps
+        //
+        // The whole transaction first: a transaction bigger than a block can never be mined, and
+        // every per-part cap below can be satisfied by one that is (two `MAX_PROOF_BYTES` proofs
+        // already exceed `MAX_BLOCK_BYTES`).
+        let encoded_len = tx.encoded_len();
+        if encoded_len > gas::MAX_BLOCK_BYTES {
+            return Err(TxError::TransactionTooLarge(encoded_len));
+        }
         if let Some(b) = &tx.bundle {
             if b.envelopes.iter().any(|e| e.len() > MAX_ENVELOPE_BYTES) {
                 return Err(TxError::EnvelopeTooLarge);
