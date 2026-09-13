@@ -113,16 +113,24 @@ through the constraint-set-5 re-vendor, not as a local patch — so read
   keeps a proof inside its window.** `crates/shrugg-node/tests/proving_slot/`
   and `crates/shrugg-client/tests/proving_slot/` (one module, two copies: both
   test binaries need it and they are different crates) hand out one permit at a
-  time through a file lock in `<target-dir>/tmp`, so no two bundle proofs run at
-  once anywhere in the workspace — across test binaries, and across two
-  sessions' concurrent `cargo test` runs. Every proving test takes it around the
-  whole `wallet::send`/`submit`/`submit_burn` call; the one test that
-  deliberately races two bundles takes it once for the pair. With it the cluster
-  suite measures **19m59s, 17 tests, 2026-09-13** — slower in wall time, because
-  the proofs no longer overlap, and each proof correspondingly faster (19 proofs
-  measured at 94.6–97.9 s each, against the ~255 s a contended one took, and
-  190 s for the burn's pair). `PROVING` stays at **3 s blocks** (S2 had
-  raised it to 2, S3 to 3) and its doc comment now says why rather than what;
+  time through a file lock in `<target-dir>/tmp`, so no two *unrelated* bundle
+  proofs run at once anywhere in the workspace — across test binaries, and
+  across two sessions' concurrent `cargo test` runs. Every proving test takes it
+  around the whole `wallet::send`/`submit`/`submit_burn` call; the one test whose
+  subject is a race takes it once for its pair, so the bound the windows have to
+  outlive is a *two-way* contended proof (~190–255 s against 768 s at 3 s
+  blocks), not a lone one — `PROVING`'s doc comment states it. With it the
+  cluster suite measures **19m59s, 17 tests, 2026-09-13** — slower in wall time, because
+  the proofs no longer overlap, and each proof correspondingly faster. That is
+  where the 20 minutes go: the suite's ten holds carry **12 bundle proofs and 2
+  program proofs**, and a bundle now measures 94.6–97.9 s alone (against ~255 s
+  contended), with the double-spend race's two concurrent bundles at 114 s each
+  and the burn's two sequential ones 190 s together — ~19 min of proving, plus
+  the structural tests. The **wallet flow** measures **9m40s** with the slot
+  (579.84 s, five bundles at 99.6–107.7 s plus a call proof) against 9m19s
+  without it: that suite was already one test proving in sequence, so the slot
+  costs it nothing and it never waited once. `PROVING` stays at **3 s blocks**
+  (S2 had raised it to 2, S3 to 3) and its doc comment now says why rather than what;
   read it before making that chain faster again.
 - Doctest flakiness ("extern location ... does not exist") means a concurrent
   cargo run raced the cache; rerun.

@@ -8,9 +8,13 @@
 //! window. That is a margin, not a bound — it holds only as long as nobody adds another proving
 //! test and nobody runs on fewer cores.
 //!
-//! This is the bound. [`proving_slot`] hands out one permit at a time, so a proof is the only
-//! proof running: the ~100 s a tier-14 bundle takes alone, not the ~255 s measured with seven at
-//! once. The permit is a file lock on one path under `CARGO_TARGET_TMPDIR` — cargo's own scratch
+//! This is the bound. [`proving_slot`] hands out one permit at a time, so an *unrelated* proof is
+//! never in flight beside this one: a tier-14 bundle takes its ~96 s rather than the ~255 s measured
+//! with seven at once. One hold may still cover two deliberately concurrent proofs (see below), so
+//! the bound the windows have to outlive is a two-way contended proof, ~190–255 s — which is what
+//! `cluster.rs`'s `PROVING` comment records against its 768 s window.
+//!
+//! The permit is a file lock on one path under `CARGO_TARGET_TMPDIR` — cargo's own scratch
 //! directory for integration tests, `<target-dir>/tmp`, which is one directory for the whole
 //! workspace — rather than a `static Mutex`, for two reasons:
 //!

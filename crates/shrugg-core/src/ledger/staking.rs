@@ -152,16 +152,26 @@ impl Ledger {
     ///
     /// `None` when the action creates no such note, and when this state cannot derive one — an
     /// unknown validator, an amount that does not cover the bundle base, a chain with no bridge, an
-    /// attestation that decodes to no transfer (a rotation deposits nothing) or to an asset the
-    /// registry has no index for. Every one of those is something [`validate`] refuses on its own,
-    /// which is what makes a missing claim safe here: the pool would admit a second transaction
-    /// only for the ledger to refuse it.
+    /// attestation over [`gas::MAX_ATTESTATION_BYTES`] (checked before the decode, so a caller
+    /// screening unvalidated transactions cannot be made to parse a blob), one that decodes to no
+    /// transfer (a rotation deposits nothing), or one naming an asset the registry has no index for.
+    /// Every one of those is something [`validate`] refuses on its own, which is what makes a
+    /// missing claim safe here: the pool would admit a second transaction only for the ledger to
+    /// refuse it.
     pub fn derived_commitment(&self, action: &Action, executor: &dyn ConfidentialExecutor) -> Option<Word8> {
         match action {
             Action::Withdraw { validator, amount, time, r, .. } => {
                 withdraw_note(self, validator, *amount, *time, r, executor).ok()
             }
             Action::BridgeAttest { attestation, recipient, r, time, .. } => {
+                // The size cap, before the decode. `validate` applies it at step 1
+                // (`TxError::AttestationTooLarge`), but this runs *before* validation — the
+                // mempool claims what a transaction would create in order to decide whether to
+                // validate it at all — so an oversized blob would otherwise buy a decode here at
+                // no fee. Nothing admissible is lost: a transaction over the cap is refused.
+                if attestation.len() > gas::MAX_ATTESTATION_BYTES {
+                    return None;
+                }
                 let (id, amount) = bridge_notes::attested_transfer(attestation)?;
                 let index = self.bridge()?.deposit_index(&id)?;
                 Some(bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor))

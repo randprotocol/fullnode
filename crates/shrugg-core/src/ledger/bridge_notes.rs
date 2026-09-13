@@ -504,6 +504,36 @@ mod tests {
         assert_eq!(cm, expected_cm(5, 1_000, 1));
     }
 
+    /// The size cap reaches the *pre-validation* derivation too. `derived_commitment` is what a
+    /// mempool calls before it validates anything — it has to know what note a transaction would
+    /// create in order to decide whether the transaction is worth validating — so an attestation
+    /// over the cap must not buy a decode there either. Admission refuses it at step 1 regardless
+    /// (`TxError::AttestationTooLarge`), which is what makes dropping the claim safe.
+    #[test]
+    fn an_oversized_attestation_derives_no_note() {
+        let (l, secrets) = ledger();
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let tx = attest_tx(&l, a, recipient(), 20);
+        assert!(l.derived_commitment(&tx.action, &StubExecutor).is_some(), "the admissible one names its note");
+
+        // Bytes that really do decode — the same body with its quorum's first signature repeated
+        // to the codec's 255-signature ceiling — so what the check stops is the decode itself and
+        // not a parse failure standing in for it.
+        let body = transfer(1_000, 0, recipient().recipient_hash(), 0);
+        let d = digest(&body.encode());
+        let one = sign_digest(&secrets[0], 0, &d);
+        let big = Attestation { guardian_set_index: 0, signatures: vec![one; 250], body }.encode();
+        assert!(big.len() > gas::MAX_ATTESTATION_BYTES, "{} bytes", big.len());
+        assert!(Attestation::decode(&big).is_ok(), "and they parse, which is the work being refused");
+        assert!(attested_transfer(&big).is_some(), "all the way to a transfer");
+
+        let mut oversized = tx.clone();
+        let Action::BridgeAttest { attestation, .. } = &mut oversized.action else { panic!("an attest") };
+        *attestation = big;
+        assert_eq!(l.derived_commitment(&oversized.action, &StubExecutor), None, "over the cap, so no claim");
+        assert_eq!(l.validate(&oversized, &StubExecutor), Err(TxError::AttestationTooLarge));
+    }
+
     /// `time` buys the depositor a predictable commitment, so it gets the window rule a bundle's
     /// `time` gets — and no more: a note stamped in the future, or older than the window, is
     /// refused before the attestation is even decoded.

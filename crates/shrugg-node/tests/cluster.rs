@@ -63,22 +63,32 @@ const FAST: Duration = Duration::from_millis(150);
 /// `bundle time 2 is outside [3, 259]` instead of on the double-spend it is about. A test must fail
 /// on its property, not on the clock. S2 raised this to 2 s and S3 to 3 s to buy room against that.
 ///
-/// That room was a margin rather than a bound, and [`proving_slot`] is the bound: no two proofs in
-/// this workspace run at once any more, so what has to fit inside 256 blocks is one uncontended
-/// proof (~100 s, ~190 s for the burn's pair) and not a contended one. Three seconds stays anyway,
-/// and deliberately:
+/// That room was a margin rather than a bound, and [`proving_slot`] is the bound. **What the bound
+/// actually is: a two-way contended proof, not an uncontended one.** The slot serialises *unrelated*
+/// proofs, and `two_bundles_spending_one_note_only_one_commits` deliberately proves two bundles at
+/// once under a single hold — that race is its subject — so the worst case any window has to
+/// outlive is two proofs under one anchor, ~190–255 s, against 3 s × 256 = 768 s. Measured in the
+/// serialised suite: a single bundle 94.6–97.9 s (~8× headroom), the race's two concurrent bundles
+/// 114 s each (~7×), and `submit_burn`'s two sequential bundles 190 s together under one anchor —
+/// the longest exposure any window here has, and still ~4×.
 ///
+/// Three seconds stays, and what it buys is that headroom rather than protection from contention:
+///
+/// - the windows are counted in *blocks*, so slowing the chain is the one knob that costs nothing
+///   but a test's patience — and every `wait_*` bound here is already sized for it;
 /// - a queueing test's own cluster keeps making blocks while it waits for the slot, and at 1 s
 ///   blocks up to seven idle clusters would burn three times the consensus CPU beside the one proof
 ///   that actually matters — the slot's whole point is to leave that proof alone;
-/// - the windows are *blocks*, so a slower chain is the one knob that costs nothing: 3 s makes them
-///   nearly thirteen minutes against a proof of two, which is margin no assertion depends on;
 /// - the S2 staking tests hold there too — their longest wait is two `EPOCH`-block epochs, 36 s,
 ///   against a 180 s bound.
 ///
-/// Lowering it again is a question about suite wall time rather than about the window — with proofs
-/// serialised the clock is the proofs, not the blocks — and nobody has measured the tests at 1 s
-/// since the slot landed, so it stays where the integration left it.
+/// **The open knob is the slot's width, not the block interval.** Serialising costs wall time: the
+/// suite went from 6m28s with proofs overlapping to 19m59s with one at a time (measured
+/// 2026-09-13). A slot of N = 2 permits would run two proofs at once — which the race test already
+/// shows costs ~114 s each rather than ~96 s — and roughly halve the serialised time while keeping
+/// the bound at the two-way figure this comment states, i.e. inside 768 s with room to spare. It is
+/// the alternative to reach for if the suite's wall time becomes the problem; N = 1 is what is
+/// implemented, because it is the simplest thing that makes the bound a bound.
 ///
 /// The view timeouts scale with the interval (`start_node_at`), and every `wait_*` bound in these
 /// tests is a wall-clock timeout with room to spare at 3 s blocks (`wallet::COMMIT_TIMEOUT` is
