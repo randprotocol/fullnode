@@ -330,8 +330,8 @@ asset bundle inside the action — both of which every node verifies. The asset 
 
 Anything above the minimum is a tip; all of it is credited to the block proposer's `rewards` in
 the validator register, which phase S2's `Withdraw` turns back into a note. Blocks hold at most
-4 MiB of transactions, and a bundle proof is ~300 KB, so roughly a dozen shielded transactions
-per block. Constants live in `shrugg_core::gas`; `shrugg fee bundle|deploy <words>|call <tier>`
+4 MiB of transactions, and at constraint set 5's 80 queries a bundle proof is ~1.3 MB, so **three**
+shielded transactions per block (it was roughly a dozen at 27 queries; `docs/block-space.md`). Constants live in `shrugg_core::gas`; `shrugg fee bundle|deploy <words>|call <tier>`
 asks the node.
 
 ## Privacy

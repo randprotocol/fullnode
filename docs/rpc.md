@@ -441,9 +441,10 @@ Encoded sizes (bincode's default configuration: fixed-width integers, 8-byte len
 | mint transaction (no bundle) | 5181 (a 1312-byte Dilithium2 key and a 2420-byte signature) |
 | bundle proof | 302,857 measured at tier 14 under the `test` FRI profile |
 
-So a shielded transfer on the wire is about 300 KB, essentially all proof. The ledger caps a proof
-at 1 MiB, an envelope at 2048 bytes, a program at 4096 words, and a block at 4 MiB of transaction
-bytes — roughly a dozen bundles per block.
+So a shielded transfer on the wire is about 1.3 MB at constraint set 5's 80-query profile,
+essentially all proof (it was ~300 KB at 27 queries). The ledger caps a proof at 2 MiB, an envelope
+at 2048 bytes, a program at 4096 words, and a block at 4 MiB of transaction bytes — three bundles
+per block (`docs/block-space.md`).
 
 A wallet builds all of this through `shrugg_client::wallet::{send, submit}`, which selects the
 inputs, fetches the anchor and the witnesses, proves the bundle, seals both envelopes, and checks
