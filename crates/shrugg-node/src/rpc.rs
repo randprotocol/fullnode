@@ -10,7 +10,7 @@
 use crate::mempool::MempoolError;
 use crate::network::PeerInfo;
 use crate::storage::Storage;
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shrugg_core::bridge::{asset_id, AssetInfo, BridgeMeta};
@@ -128,6 +128,10 @@ impl RpcError {
     fn invalid_params(m: impl Into<String>) -> RpcError {
         RpcError { code: -32602, message: m.into() }
     }
+    /// A request we could not read as a request at all — an oversized or malformed body.
+    fn invalid_request(m: impl Into<String>) -> RpcError {
+        RpcError { code: -32600, message: m.into() }
+    }
     fn not_found(m: impl Into<String>) -> RpcError {
         RpcError { code: -32001, message: m.into() }
     }
@@ -139,13 +143,35 @@ impl RpcError {
     }
 }
 
+/// The largest request body the RPC accepts, derived from the largest transaction the chain can
+/// admit rather than guessed.
+///
+/// `shrugg_sendTransaction` carries `hex(bincode(tx))` inside a JSON envelope, so every byte of the
+/// transaction costs two here. The terms, all per single transaction:
+///
+/// - `2 * MAX_PROOF_BYTES` — a `Call` carries **two** proofs, the fee bundle's and the call's own,
+///   and a `BridgeBurn` likewise carries two bundles. This is the term the retired limit missed: it
+///   allowed `2 * MAX_PROOF_BYTES + 256 KiB` *in total*, which is one hex-encoded proof, so a
+///   constraint-set-5 `Call` — measured at 1 321 773 bytes for the fee bundle's proof plus ~1.2 MB
+///   for the call's — was refused after about a hundred seconds of proving.
+/// - `2 * MAX_ENVELOPE_BYTES` — the bundle's two output envelopes.
+/// - `MAX_CALL_ENVELOPE_BYTES` — the call's input envelope.
+/// - `MAX_ATTESTATION_BYTES` — a `BridgeAttest`'s attestation.
+/// - 64 KiB for the rest: public keys, signatures, hashes, nullifiers and bincode framing.
+///
+/// Then doubled for the hex encoding, plus 256 KiB for the JSON envelope and headers.
+pub const RPC_MAX_BODY_BYTES: usize = 2
+    * (2 * shrugg_core::gas::MAX_PROOF_BYTES
+        + 2 * shrugg_core::notes::MAX_ENVELOPE_BYTES
+        + shrugg_core::types::actions::MAX_CALL_ENVELOPE_BYTES
+        + shrugg_core::gas::MAX_ATTESTATION_BYTES
+        + 64 * 1024)
+    + 256 * 1024;
+
 pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    // Axum's default body limit is 2 MiB, but a bundle-carrying transaction with a
-    // near-maximum proof is larger than that once hex-encoded inside JSON.
-    let body_limit = 2 * shrugg_core::gas::MAX_PROOF_BYTES + 256 * 1024;
     let app = Router::new()
         .route("/", post(handle))
-        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
+        .layer(axum::extract::DefaultBodyLimit::max(RPC_MAX_BODY_BYTES))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
@@ -157,12 +183,44 @@ pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketA
     Ok((bound, task))
 }
 
-async fn handle(State(st): State<RpcState>, Json(req): Json<Request>) -> Json<Value> {
+async fn handle(
+    State(st): State<RpcState>,
+    // `Result<Json<_>, _>` rather than `Json<_>`: a body axum refuses — over the limit, or not
+    // JSON at all — otherwise comes back as a *plain-text* 413 or 400, which no JSON-RPC client can
+    // read. `shrugg send` reported a body over the limit as
+    // "expected value at line 1 column 1" after a hundred seconds of proving, naming neither the
+    // size nor the limit.
+    req: Result<Json<Request>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let req = match req {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            let e = rejection_error(&rejection);
+            // The HTTP status stays what axum decided (413 for an oversized body); only the body
+            // becomes something a client can parse. The id is `null`: we never saw the request.
+            return (
+                rejection.status(),
+                Json(json!({ "jsonrpc": "2.0", "id": Value::Null, "error": { "code": e.code, "message": e.message } })),
+            );
+        }
+    };
     let id = req.id.clone();
-    match dispatch(&st, &req).await {
-        Ok(result) => Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
-        Err(e) => Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": e.code, "message": e.message } })),
+    let body = match dispatch(&st, &req).await {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Err(e) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": e.code, "message": e.message } }),
+    };
+    (StatusCode::OK, Json(body))
+}
+
+/// Turn a body axum would not give us into a JSON-RPC error, naming the limit when that is why.
+fn rejection_error(rejection: &axum::extract::rejection::JsonRejection) -> RpcError {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return RpcError::invalid_request(format!(
+            "request body is larger than the {RPC_MAX_BODY_BYTES}-byte limit; \
+             a transaction is sent as hex, so it may be at most half of that"
+        ));
     }
+    RpcError::invalid_request(rejection.body_text())
 }
 
 /// Run a storage read that is not O(1) on the blocking pool, so it cannot stall the tokio
@@ -1419,5 +1477,139 @@ mod tests {
         // The bridge holds notes, not per-address balances, so the account-era balance read is
         // gone for good rather than waiting on a later phase.
         assert_eq!(call(&st, "shrugg_getAssetBalance", json!([])).await.unwrap_err().code, -32601);
+    }
+
+    // --------------------------------------------------------- the request body limit
+    //
+    // The retired limit was `2 * MAX_PROOF_BYTES + 256 KiB` — sized for *one* hex-encoded proof.
+    // A constraint-set-5 `Call` carries two proofs (the fee bundle's, measured 1 321 773 bytes on
+    // chain 8, plus the call's own ~1.2 MB), so its hex JSON is ~5 MB: axum refused the body with a
+    // plain-text 413, and the wallet reported the unparseable reply as
+    // "expected value at line 1 column 1" after ~100 s of proving.
+
+    /// The worst transaction the chain can admit: a bundle at `MAX_PROOF_BYTES` with two maximal
+    /// output envelopes, and a `Call` carrying a second `MAX_PROOF_BYTES` proof and a maximal input
+    /// envelope.
+    fn worst_case_transaction() -> Transaction {
+        use shrugg_core::notes::{Bundle, MAX_ENVELOPE_BYTES};
+        use shrugg_core::types::actions::{CallEnvelope, MAX_CALL_ENVELOPE_BYTES};
+
+        let big_envelope = || Envelope {
+            kem_ct: vec![1u8; MAX_ENVELOPE_BYTES / 4],
+            to_receiver: vec![2u8; MAX_ENVELOPE_BYTES / 4],
+            to_sender: vec![3u8; MAX_ENVELOPE_BYTES / 4],
+            body: vec![4u8; MAX_ENVELOPE_BYTES / 4],
+        };
+        let bundle = Bundle {
+            anchor: [1; 8],
+            nullifiers: [nf(1), nf(2)],
+            commitments: [cm(1), cm(2)],
+            fee: shrugg_core::gas::BUNDLE_BASE,
+            burn: 0,
+            asset: 0,
+            time: 1,
+            envelopes: [big_envelope(), big_envelope()],
+            proof: vec![9u8; shrugg_core::gas::MAX_PROOF_BYTES],
+        };
+        let call = Action::Call {
+            program: Hash::digest(b"program"),
+            proof: vec![8u8; shrugg_core::gas::MAX_PROOF_BYTES],
+            input_envelope: Some(CallEnvelope {
+                kem_ct: vec![1u8; MAX_CALL_ENVELOPE_BYTES / 4],
+                to_sender: vec![2u8; MAX_CALL_ENVELOPE_BYTES / 4],
+                to_auditor: vec![3u8; MAX_CALL_ENVELOPE_BYTES / 4],
+                body: vec![4u8; MAX_CALL_ENVELOPE_BYTES / 4],
+            }),
+        };
+        Transaction::shielded(7, bundle, call)
+    }
+
+    #[test]
+    fn the_body_limit_admits_the_largest_transaction_the_chain_can_take() {
+        let tx = worst_case_transaction();
+        let encoded = tx.encode();
+        // Two proofs' worth, not one: this is the term the old limit was missing.
+        assert!(
+            encoded.len() > 2 * shrugg_core::gas::MAX_PROOF_BYTES,
+            "the fixture should carry two maximal proofs: {} B",
+            encoded.len()
+        );
+
+        // What `send_transaction` actually posts.
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "shrugg_sendTransaction", "params": [hex::encode(&encoded)] });
+        let posted = serde_json::to_vec(&body).unwrap().len();
+        assert!(
+            posted <= RPC_MAX_BODY_BYTES,
+            "the largest admissible transaction must fit: {posted} B posted against a {RPC_MAX_BODY_BYTES} B limit"
+        );
+
+        // And the retired limit would have refused it, which is the bug.
+        let old_limit = 2 * shrugg_core::gas::MAX_PROOF_BYTES + 256 * 1024;
+        assert!(posted > old_limit, "the old limit should have refused this: {posted} B against {old_limit} B");
+    }
+
+    /// A body over the limit comes back as a JSON-RPC error naming the limit — parseable, where the
+    /// plain-text 413 was not.
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_refused_as_json_naming_the_limit() {
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_dir, st) = state_for(&gs);
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), st).await.unwrap();
+
+        // Just over: a valid JSON-RPC envelope whose hex payload pushes it past the limit.
+        let filler = "ab".repeat(RPC_MAX_BODY_BYTES / 2);
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "shrugg_sendTransaction", "params": [filler] });
+        let raw = serde_json::to_vec(&body).unwrap();
+        assert!(raw.len() > RPC_MAX_BODY_BYTES, "the fixture must exceed the limit: {} B", raw.len());
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}"))
+            .header("content-type", "application/json")
+            .body(raw)
+            .send()
+            .await
+            .expect("the server answers");
+        assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE, "the HTTP status stays honest");
+
+        // The point: the body parses as JSON-RPC rather than being plain text.
+        let v: Value = resp.json().await.expect("an oversized body must still answer JSON");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["error"]["code"], -32600);
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(&RPC_MAX_BODY_BYTES.to_string()), "the message must name the limit: {msg}");
+
+        task.abort();
+    }
+
+    /// A body within the limit still reaches the dispatcher, and a malformed one answers JSON too.
+    #[tokio::test]
+    async fn a_malformed_body_answers_json_rather_than_plain_text() {
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_dir, st) = state_for(&gs);
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), st).await.unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}"))
+            .header("content-type", "application/json")
+            .body("{not json".to_string())
+            .send()
+            .await
+            .expect("the server answers");
+        let v: Value = resp.json().await.expect("a malformed body must still answer JSON");
+        assert_eq!(v["error"]["code"], -32600);
+
+        // A well-formed request over the same server still works.
+        let ok: Value = reqwest::Client::new()
+            .post(format!("http://{addr}"))
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "shrugg_chainId", "params": [] }))
+            .send()
+            .await
+            .expect("answers")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(ok["result"], 7);
+
+        task.abort();
     }
 }
