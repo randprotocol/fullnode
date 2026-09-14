@@ -280,6 +280,17 @@ acceptance is not commitment, so poll `shrugg_getTransaction`.
 There is no `from`, no `to`, no `nonce` and no amount in that reply, and there is nothing in the
 stored block either — the node has nothing more to redact.
 
+**`shrugg_checkTransaction(hash, key)`** — the other side of that redaction, for exactly one key
+holder: what does this `TxKey` disclose about this transaction. Stateless (the key is dropped
+with the call), and a wrong key is indistinguishable from one that sealed nothing.
+
+```json
+→ {"method":"shrugg_checkTransaction","params":["4f2c…e7", "77e0…1b"]}
+← {"tx": "4f2c…e7", "height": 192,
+   "disclosed": [{"output": "bundle:0", "cm": "2a9f…07", "index": 40,
+                  "note": {"pk": "…", "from": "…", "amount": "1500000000", "asset": 0, "time": 5}}]}
+```
+
 ## 5. How a node admits a transaction
 
 Cheap before expensive, in this exact order (`Ledger::validate_inner`, spec §7). The mempool runs
@@ -363,7 +374,9 @@ compel:
   It is all-or-nothing, and it is retroactive and forward-looking at once.
 - **A per-transaction key** (`TxKey`) opens exactly the one envelope it sealed, and nothing else
   — the right grain for "show me this payment" without handing over a history. Each envelope is
-  sealed under a fresh one for precisely this reason.
+  sealed under a fresh one for precisely this reason. `shrugg_checkTransaction(hash, key)` makes
+  the check one stateless RPC call for whoever holds the pair (Monero's `check_tx_proof` shape):
+  what comes back is the note the key sealed, bound to its on-chain commitment and leaf.
 
 In S1 the wallet derives the viewing key on every run and never stores it, and it draws each
 `TxKey` fresh and drops it after sealing. Since the RPC-hardening work a *node* may also be

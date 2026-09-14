@@ -136,6 +136,11 @@ Candidates from `docs/rpc-comparison.md` deliberately **not** in this plan. They
   10 000 scanned leaves per call, cleared at restart. The property is narrowed by an explicit
   operator decision, per key, per node; the RPC layer still has no type for a spend key.
 - **`shrugg_checkTransaction(tx, key)`**, the Monero `check_tx_proof` shape for third-party payment proofs (§4). A `TxKey` already gives the capability client-side; the RPC would make it one call for an explorer — and would put a viewing key in a request body.
+  **Decided 2026-09-14: built** on the `rpc-viewing` branch as `shrugg_checkTransaction(hash, key)`
+  — stateless, one call, no key retention (nothing is imported or stored; unlike
+  `shrugg_importViewingKey` the key is dropped with the request). It is a per-transaction `TxKey`
+  in the body, never a party viewing key, so the request discloses exactly the one envelope that
+  key already opens.
 - **A mempool-aware `next_nonce` RPC** (`AGENTS.md` → Open follow-ups, the wallet's stale-nonce race on fast double-sends). Node-only and fork-free, but it is a wallet-protocol decision paired with a `shrugg-client` change, and the user scoped this task to the four items above.
 
 ## File structure

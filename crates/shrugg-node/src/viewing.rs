@@ -1,5 +1,6 @@
 //! Node-side viewing-key imports: the Zcash `z_importviewingkey` analogue
-//! (`docs/rpc-comparison.md` §4).
+//! (`docs/rpc-comparison.md` §4), and the per-transaction disclosure check behind
+//! `shrugg_checkTransaction` (Monero's `check_tx_proof` analogue).
 //!
 //! This is the one deliberate exception to the chain's "the node never holds a key" property,
 //! and it is worth stating exactly what changes and what does not. An operator may hand this
@@ -20,8 +21,10 @@
 
 use crate::storage::{Storage, StorageError};
 use shrugg_core::notes::{Envelope, Word8};
+use shrugg_core::{Action, Transaction};
 use shrugg_zkvm::address::envelope_from_core;
 use shrugg_zkvm::notes::{Note, ViewingKey};
+use shrugg_zkvm::viewing::TxKey;
 use std::collections::BTreeMap;
 
 /// The most viewing keys one node holds at once. Every import costs a trial decryption per new
@@ -167,6 +170,64 @@ pub fn advance(storage: &Storage, import: &mut Import, max_rows: u64) -> Result<
     Ok(())
 }
 
+/// One envelope of a transaction that `key` opened, with the commitment it is bound to.
+#[derive(Clone, Debug)]
+pub struct Opening {
+    /// Which of the transaction's envelope sets this came from: `"bundle"` (the transaction's
+    /// own, the fee bundle of a `BridgeBurn`), `"asset_bundle"` (a `BridgeBurn`'s second
+    /// bundle), or `"deposit"` (a `BridgeAttest`'s deposit envelope).
+    pub output: &'static str,
+    /// The slot inside `output`; meaningless for `"deposit"`, which carries exactly one
+    /// envelope.
+    pub slot: u8,
+    /// The on-chain commitment the opened note commits to — what makes the disclosure a proof
+    /// rather than a claim: `open_with_tx_key` authenticates the note *and* checks it against
+    /// this leaf, so a key that opens an envelope lifted from another transaction yields
+    /// nothing.
+    pub cm: Word8,
+    pub note: Note,
+}
+
+/// Every envelope of `tx` that `key` opens — the whole of `shrugg_checkTransaction`'s
+/// disclosure semantics. The envelopes tried are exactly the ones a living `TxKey` can exist
+/// for: the bundle outputs (sealed by the sender, who may hand the key over) and a bridge
+/// deposit (sealed by the depositor). A mint's, a withdraw's and a genesis alloc's envelopes are
+/// sealed inside the node under keys that are dropped at once (`seal_deposit`,
+/// `sealed_withdraw_note`, the faucet's mint), so no `TxKey` for them can ever be presented and
+/// they are not tried.
+///
+/// `deposit_cm` is the chain-computed commitment of a `BridgeAttest`'s deposit note — the one
+/// commitment the wire does not carry — which the caller computes from the registry the way
+/// `tx_json` does; `None` for any other action, for a rotation (which deposits nothing), and on
+/// a chain whose registry does not hold the asset.
+pub fn disclosed(tx: &Transaction, deposit_cm: Option<Word8>, key: &TxKey) -> Vec<Opening> {
+    let mut out = Vec::new();
+    let mut try_env = |output: &'static str, slot: u8, cm: Word8, e: &Envelope| {
+        if let Some(note) = envelope_from_core(e).open_with_tx_key(cm, key) {
+            out.push(Opening { output, slot, cm, note });
+        }
+    };
+    if let Some(b) = &tx.bundle {
+        for (i, (cm, e)) in b.commitments.iter().zip(&b.envelopes).enumerate() {
+            try_env("bundle", i as u8, *cm, e);
+        }
+    }
+    match &tx.action {
+        Action::BridgeBurn { asset_bundle, .. } => {
+            for (i, (cm, e)) in asset_bundle.commitments.iter().zip(&asset_bundle.envelopes).enumerate() {
+                try_env("asset_bundle", i as u8, *cm, e);
+            }
+        }
+        Action::BridgeAttest { envelope, .. } => {
+            if let Some(cm) = deposit_cm {
+                try_env("deposit", 0, cm, envelope);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Test helpers shared with `rpc.rs`'s tests: real viewing keys, real notes, real sealed
 /// envelopes — the fixtures in `storage` only carry placeholder envelopes, which open for
 /// nobody.
@@ -175,7 +236,6 @@ pub(crate) mod testkit {
     use super::*;
     use shrugg_zkvm::address::{address_of, seal_note};
     use shrugg_zkvm::notes::SpendKey;
-    use shrugg_zkvm::viewing::TxKey;
 
     pub(crate) fn key_vk(n: u8) -> ViewingKey {
         SpendKey([n as u32; 8]).viewing_key()
@@ -204,10 +264,8 @@ mod tests {
     use crate::storage::Storage;
     use testkit::{key_vk, note_for, sealed_to as sealed};
     use shrugg_core::confidential::StubExecutor;
-    use shrugg_core::{Action, Transaction};
     use shrugg_zkvm::address::{address_of, seal_note};
     use shrugg_zkvm::notes::SpendKey;
-    use shrugg_zkvm::viewing::TxKey;
 
     fn alice() -> ViewingKey {
         key_vk(1)
@@ -345,5 +403,58 @@ mod tests {
         }
         advance(&storage, &mut slow, 1).unwrap();
         assert_eq!(slow.notes.len(), 3, "the same three rows, gathered incrementally");
+    }
+
+    #[test]
+    fn disclosed_opens_exactly_the_slots_the_key_sealed() {
+        let ledger = genesis_with(7, vec![]).ledger;
+        let alice_note = note_for(&alice(), &bob(), 500);
+        let change = note_for(&bob(), &bob(), 9_500);
+        let payment_key = TxKey([21; 32]);
+        let change_key = TxKey([22; 32]);
+        let mut bundle = fixtures::bundle(
+            &ledger,
+            [[31; 8], [32; 8]],
+            [alice_note.commitment(), change.commitment()],
+            bundle_fee(),
+        );
+        bundle.envelopes = [
+            sealed(&bob(), &alice(), &alice_note, &payment_key),
+            seal_note(&bob(), &address_of(&bob()), &change, &change_key).unwrap(),
+        ];
+        let tx = Transaction::shielded(7, bundle, Action::None);
+
+        // The payment key discloses the payment and nothing else.
+        let opened = disclosed(&tx, None, &payment_key);
+        assert_eq!(opened.len(), 1);
+        assert_eq!((opened[0].output, opened[0].slot), ("bundle", 0));
+        assert_eq!((opened[0].cm, opened[0].note), (alice_note.commitment(), alice_note));
+        // The change key discloses the change, and a wrong key nothing at all.
+        assert_eq!(disclosed(&tx, None, &change_key).len(), 1);
+        assert!(disclosed(&tx, None, &TxKey([99; 32])).is_empty());
+
+        // A bridge attestation's deposit envelope opens against the chain-computed commitment —
+        // and does not open against anything else, so a key lifted from another transaction
+        // authenticates for nobody.
+        let deposit = note_for(&alice(), &bob(), 1_000);
+        let deposit_key = TxKey([23; 32]);
+        let attest = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::BridgeAttest {
+                attestation: vec![9; 64],
+                recipient: address_of(&alice()),
+                r: [5; 8],
+                time: 4,
+                asset: 1,
+                envelope: sealed(&bob(), &alice(), &deposit, &deposit_key),
+            },
+        };
+        let opened = disclosed(&attest, Some(deposit.commitment()), &deposit_key);
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].output, "deposit");
+        assert_eq!(opened[0].note, deposit);
+        assert!(disclosed(&attest, None, &deposit_key).is_empty(), "no commitment, no opening");
+        assert!(disclosed(&attest, Some([6; 8]), &deposit_key).is_empty(), "the AEAD binds the real one");
     }
 }

@@ -1023,6 +1023,67 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 }
             }
         }
+        // Monero's `check_tx_proof` shape (`docs/rpc-comparison.md` §4): given a committed
+        // transaction's hash and a per-transaction `TxKey`, report what that key discloses about
+        // the transaction. Stateless — the key opens this one call's envelopes and is dropped;
+        // nothing is registered, and a key that sealed nothing gets an empty list, not an error.
+        "shrugg_checkTransaction" => {
+            // Cheap before expensive: both byte parameters are parsed before any storage read.
+            let h = parse_hash(p, 0)?;
+            let key = parse_bytes32(p, 1, "key")?;
+            let Some((height, index)) = st.storage.tx_location(&h).map_err(RpcError::internal)? else {
+                return Ok(Value::Null);
+            };
+            let b = st
+                .storage
+                .block_by_height(height)
+                .map_err(RpcError::internal)?
+                .ok_or_else(|| RpcError::not_found("block missing"))?;
+            let tx = b.transactions.get(index as usize).ok_or_else(|| RpcError::not_found("tx index"))?;
+            // A `BridgeAttest`'s deposit commitment — the one commitment the wire does not carry
+            // — computed from the registry exactly as `tx_json` renders it.
+            let deposit_cm = match &tx.action {
+                Action::BridgeAttest { attestation, recipient, r, time, .. } => {
+                    let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
+                    attest_deposit(attestation, bridge.as_ref()).map(|(index, amount)| {
+                        shrugg_core::ledger::bridge_notes::deposit_commitment(
+                            recipient,
+                            amount,
+                            index,
+                            *time,
+                            r,
+                            st.executor.as_ref(),
+                        )
+                    })
+                }
+                _ => None,
+            };
+            let opened = crate::viewing::disclosed(tx, deposit_cm, &shrugg_zkvm::viewing::TxKey(key));
+            if opened.is_empty() {
+                return Ok(json!({ "tx": h.to_hex(), "height": height, "disclosed": [] }));
+            }
+            // Each opened note's leaf index, by matching its commitment against the block's own
+            // slice of the tree — unique, because the ledger refuses duplicate commitments.
+            let rows = st.storage.notes_in_heights(height, height, usize::MAX).map_err(RpcError::internal)?;
+            let mut out = Vec::with_capacity(opened.len());
+            for o in opened {
+                let leaf = rows
+                    .iter()
+                    .find(|(_, r)| r.cm == o.cm)
+                    .map(|(i, _)| *i)
+                    .ok_or_else(|| RpcError::internal("the disclosed note's commitment is not a leaf of its block"))?;
+                out.push(json!({
+                    "output": match o.output {
+                        "deposit" => "deposit".to_string(),
+                        other => format!("{other}:{}", o.slot),
+                    },
+                    "cm": word8_to_hex(&o.cm),
+                    "index": leaf,
+                    "note": note_json(&o.note),
+                }));
+            }
+            Ok(json!({ "tx": h.to_hex(), "height": height, "disclosed": out }))
+        }
         "shrugg_getBlockByHeight" => {
             let h: u64 = param(p, 0, "height")?;
             let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
@@ -2178,7 +2239,8 @@ mod tests {
     // --------------------------------------------------------- viewing keys
     //
     // Node-side import (`shrugg_importViewingKey` + `shrugg_getViewingNotes`, the Zcash
-    // `z_importviewingkey` analogue). The fixture chain every case here
+    // `z_importviewingkey` analogue) and the per-transaction disclosure check
+    // (`shrugg_checkTransaction`, Monero's `check_tx_proof`). The fixture chain every case here
     // runs on: block 1 pays Alice 500 (sealed by Bob) and Bob 700 (sealed by Alice) in one
     // bundle, block 2 pays Alice 900 — on top of one genesis alloc, so five leaves.
 
@@ -2328,6 +2390,63 @@ mod tests {
         assert!(err.message.contains(&crate::viewing::MAX_VIEWING_KEYS.to_string()), "{}", err.message);
         let v = ok(&st, "shrugg_importViewingKey", json!([word8_to_hex(&[1u32; 8])])).await;
         assert_eq!(v["imported"], false);
+    }
+
+    /// Monero's `check_tx_proof` shape: the key that sealed a slot discloses exactly that slot's
+    /// note, bound to its on-chain commitment and leaf; any other key discloses nothing.
+    #[tokio::test]
+    async fn check_transaction_discloses_what_the_key_sealed_and_nothing_more() {
+        let (_d, st, _ledger, _parent, a500, b700, _a900) = viewing_chain();
+        let tx1 = st.storage.block_by_height(1).unwrap().unwrap().transactions[0].clone();
+
+        // The key that sealed the 500 discloses exactly it: slot 0 of the bundle, at leaf 1.
+        let v = ok(&st, "shrugg_checkTransaction", json!([tx1.hash().to_hex(), hex::encode([11u8; 32])])).await;
+        assert_eq!((&v["tx"], &v["height"]), (&json!(tx1.hash().to_hex()), &json!(1)));
+        let d = v["disclosed"].as_array().unwrap();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0]["output"], "bundle:0");
+        assert_eq!((&d[0]["cm"], &d[0]["index"]), (&json!(word8_to_hex(&a500.commitment())), &json!(1)));
+        assert_eq!((&d[0]["note"]["amount"], &d[0]["note"]["pk"]), (&json!("500".to_string()), &json!(word8_to_hex(&a500.pk))));
+
+        // The other slot's key discloses the 700; a key that sealed nothing in this transaction
+        // discloses nothing — the negative case is an empty list, never an error.
+        let v = ok(&st, "shrugg_checkTransaction", json!([tx1.hash().to_hex(), hex::encode([12u8; 32])])).await;
+        let d = v["disclosed"].as_array().unwrap();
+        assert_eq!(d.len(), 1);
+        assert_eq!((&d[0]["output"], &d[0]["note"]["pk"]), (&json!("bundle:1".to_string()), &json!(word8_to_hex(&b700.pk))));
+        let v = ok(&st, "shrugg_checkTransaction", json!([tx1.hash().to_hex(), hex::encode([99u8; 32])])).await;
+        assert_eq!(v["disclosed"], json!([]));
+
+        // An unknown transaction is null; malformed parameters are -32602, and the key is parsed
+        // before the hash is ever looked up (cheap before expensive).
+        assert_eq!(ok(&st, "shrugg_checkTransaction", json!([Hash::ZERO.to_hex(), hex::encode([11u8; 32])])).await, Value::Null);
+        for bad in ["zz", "00", "abab"] {
+            assert_eq!(call(&st, "shrugg_checkTransaction", json!([Hash::ZERO.to_hex(), bad])).await.unwrap_err().code, -32602, "{bad}");
+        }
+        assert_eq!(call(&st, "shrugg_checkTransaction", json!(["zz", hex::encode([11u8; 32])])).await.unwrap_err().code, -32602);
+    }
+
+    /// The new methods sit inside the same sequential batch as every other: the import lands
+    /// before the read that follows it in the array, and the replies line up by position.
+    #[tokio::test]
+    async fn the_viewing_methods_are_batch_safe() {
+        use crate::viewing::testkit::{key_vk, nk_hex};
+        let (_d, st, ..) = viewing_chain();
+        let tx1 = st.storage.block_by_height(1).unwrap().unwrap().transactions[0].clone();
+        let (_, Json(v)) = handle(
+            State(st.clone()),
+            Ok(Json(json!([
+                { "jsonrpc": "2.0", "id": 1, "method": "shrugg_importViewingKey", "params": [nk_hex(&key_vk(1))] },
+                { "jsonrpc": "2.0", "id": 2, "method": "shrugg_getViewingNotes", "params": [nk_hex(&key_vk(1))] },
+                { "jsonrpc": "2.0", "id": 3, "method": "shrugg_checkTransaction", "params": [tx1.hash().to_hex(), hex::encode([11u8; 32])] }
+            ]))),
+        )
+        .await;
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["result"]["imported"], true);
+        assert_eq!(rows[1]["result"]["notes"].as_array().unwrap().len(), 3);
+        assert_eq!(rows[2]["result"]["disclosed"].as_array().unwrap().len(), 1);
     }
 
     // --------------------------------------------------------- batch requests

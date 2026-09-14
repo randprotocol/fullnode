@@ -372,6 +372,38 @@ exception — a validator address, an amount and a replay nonce are public in th
 way a mint's amount is, because the validator register and the bridge's accounting are public
 (spec §8). A shielded note's later spend stays private in every case.
 
+### `shrugg_checkTransaction`
+Params: `[hash, key]`, where `key` is a per-transaction `TxKey` as 64 hex characters. Result:
+`null` for a hash this node has no committed transaction for, else what the key discloses about
+it:
+
+```json
+{ "tx": "4f2c…e7", "height": 192,
+  "disclosed": [
+    { "output": "bundle:0", "cm": "2a9f…07", "index": 40,
+      "note": { "pk": "…", "from": "…", "amount": "1500000000", "asset": 0, "time": 5 } }
+  ] }
+```
+
+Monero's `check_tx_proof` shape (`docs/rpc-comparison.md` §4): a sender who sealed an output with
+a fresh `TxKey` can hand `(hash, key)` to anyone — a recipient proving they were paid, an auditor
+checking a claim — and this call is the whole verification. Each entry of `disclosed` is one
+envelope the key opened: `output` names the envelope set (`bundle:0` / `bundle:1` for the
+transaction's own bundle — the fee bundle of a `BridgeBurn` — `asset_bundle:0` / `asset_bundle:1`
+for a burn's second bundle, `deposit` for a `BridgeAttest`'s deposit envelope), `cm` the on-chain
+commitment the note commits to, and `index` its leaf. The binding is the proof: the AEAD
+authenticates the note *and* checks it against `cm`, so a key lifted onto another transaction —
+or a note that is not the commitment's preimage — yields an empty list, never a forged row. A
+mint's, a withdraw's and a genesis alloc's envelopes are not tried: they are sealed inside the
+node under keys dropped at once, so no `TxKey` for them can exist.
+
+The call is **stateless**: the key is used for this one request and dropped — it is not imported,
+stored, or learnable from anything the node keeps (unlike `shrugg_importViewingKey`, which
+retains). A key that opens nothing gets `{ "disclosed": [] }`, indistinguishable from a wrong key
+by design. Amounts are strings, as everywhere chain state is served.
+
+Errors: `-32602` for a malformed hash or key (both are parsed before any storage read).
+
 ### `shrugg_getBlockByHeight` / `shrugg_getBlockByHash`
 Params: `[height]` (integer) or `[hash]`. Result: `null` if unknown, else:
 ```json
