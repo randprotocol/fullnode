@@ -476,14 +476,16 @@ own coprocessor table rather than running through the general ALU.
 | CUDA backend | unchanged — same proof format, same constraint set | No | unchanged (same `Proof` type; performance only) | opt in with `--cuda` on a build compiled with `--features cuda`, and expect a hard error, never a silent CPU run, if no device is available |
 | M4.1 (salted `H_IN` + `input` table, flat-binary loader, compiled guests) | constraint set 4 | **Yes** — `pv::NUM` 18 → 26, eighth AIR, `Proof` gains `input_log_height` | same order as constraint set 3 | private inputs are now committed (salted `H_IN` in the public values); compiled flat binaries can be deployed, not just hand-assembled programs |
 | M4.2 + the 2026-09-12 audit fixes (`keccak` table and syscall, optional per proof; proof-declared `mem_log_height`; four-keyed verifier key; hash row-group gates; FRI back to 80/8/20; prove-time guards) | constraint set 5 | **Yes** — FRI query count 27 → 80, new AIR constraints, `Proof` gains `keccak_log_height` and `mem_log_height`, and the verifier key is keyed on four components; old proofs fail the new verifier and vice versa | 435 529 → ~1 202 416 bytes at tier 10, prove time unchanged within noise, first verify 213 → 233 ms; `MAX_PROOF_BYTES` had to go to 2 MiB | none — call format unchanged; provers just produce 80-query proofs, and no guest this chain deploys calls `KECCAK` |
+| M4.3 + M4.4 + the public input segment (ninth **mandatory** table `public`, the `PUBLIC_DIGEST`/`PUBLIC_READ` bus pair, unsalted `H_PUB` in `pv::PUB0..7`, `SYS_READ_PUBLIC`, `Machine::verify_public`; M4.4's `sha256` table and syscall, optional per proof on the keccak table's terms; the EVM/sBPF interpreter guests vendored as libraries; six-keyed verifier key) | constraint set 6 | **Yes** — `pv::NUM` 26 → 34, a new AIR region (pubdigest rows) and table, `Proof` gains `sha256_log_height` and `public_log_height`; old proofs fail the new verifier and vice versa | 1 298 729 bytes at tier 10, 1 359 978 at tier 12 (keccak-free, production; keccak-carrying 3 198 430); `MAX_PROOF_BYTES` stays 2 MiB | none — call format unchanged; the node now verifies with `verify_public(hc, &[], proof)`, so a proof whose guest read a non-empty public segment is inadmissible; no guest this chain deploys calls `KECCAK`, `SHA256` or `READ_PUBLIC` |
 
 ## 8. Reading order
 
 Upstream (`randprotocol/circuits/research/docs`), in the order they were written to be read:
 
 1. `01-isa.md` — the instruction set, encoding, and syscall ABI.
-2. `02-tables-and-buses.md` — the nine tables (the ninth, `keccak`, optional per proof), their
-   columns, and the buses that connect them.
+2. `02-tables-and-buses.md` — the nine mandatory tables (the ninth, `public`, since constraint
+   set 6; `keccak` and `sha256` stay optional per proof), their columns, and the buses that
+   connect them.
 3. `03-privacy.md` — what zero-knowledge covers here, what a proof leaks, and what `verify` checks.
 4. `04-guests.md` — the M4 plan for EVM/sBPF interpreters and coprocessor chips.
 5. `05-roadmap.md` — the milestone table, exit criteria, and the whitepaper deviation list.

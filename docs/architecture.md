@@ -421,12 +421,14 @@ programs are public, content-addressed, immutable data.
 Once the block commits, the node warms the verifier for the tiers real guests land on today (10,
 12 and 14) at this program's declared table height in a background `spawn_blocking` task
 (`ZkExecutor::warm`), so the first call against it doesn't pay the full uncached-verify cost. The
-key is keyed on `(tier, program_log_height, input_log_height, keccak_log_height)` — constraint set
-5's four components — not on the program's content, so this warms shared keys that every program of
-the same shape reuses, not a per-program cache. `warm` covers two input-height classes (the smallest
-table and the 4-word-call class the current guests use) at `keccak_log_height = 0`, since no guest
-this chain deploys calls the `KECCAK` syscall: six keys total, one of which a first call typically
-finds already built by an earlier verify.
+key is keyed on `(tier, program_log_height, input_log_height, keccak_log_height,
+sha256_log_height, public_log_height)` — constraint set 6's six components — not on the program's
+content, so this warms shared keys that every program of the same shape reuses, not a per-program
+cache. `warm` covers two input-height classes (the smallest table and the 4-word-call class the
+current guests use) at `keccak_log_height = 0` and `sha256_log_height = 0`, since no guest this
+chain deploys calls either hash syscall, and at the empty public segment's height, since the
+chain admits no other (`verify_call` below): twelve keys total, one of which a first call
+typically finds already built by an earlier verify.
 
 ### b. Prove (wallet, off-chain)
 
@@ -440,30 +442,37 @@ never the real cycle count.
 `Machine::prove` (or, behind `--cuda`, `prove_with(Backend::Cuda)` — the batch STARK's NTTs and
 Poseidon2 Merkle commitments run on an attached NVIDIA GPU instead of the CPU; there is no fallback,
 so a missing driver, missing PTX, or a tier too large for device memory is a hard error rather than
-a silent CPU run) builds eight interconstrained trace tables for this execution (`docs/zkvm.md` describes them): `program` (now a
+a silent CPU run) builds nine interconstrained trace tables for this execution (`docs/zkvm.md` describes them): `program` (now a
 witness, decoded in-circuit — no longer the verifier's own preprocessed copy), `cpu` (whose first
-rows are two *digest prefixes* that absorb the whole program and, separately, the committed private
-inputs through Poseidon2, one permutation per up to four words, computing `hc` and the salted `H_IN`
+rows are three *digest prefixes* that absorb the whole program, the committed private
+inputs, and the public segment through Poseidon2, one permutation per up to four words, computing
+`hc`, the salted `H_IN` and the unsalted `H_PUB`
 as part of the trace itself), `memory`, `alu`, `range`, `nibble` (the
 old combined byte-range table split in two for a much smaller preprocessed commitment),
-`poseidon2` (the syscall's own chip), and `input` (one row per committed private-input word,
-feeding the `H_IN` digest and `READ_INPUT` over two split buses). Constraint set 5 adds an
-*optional* ninth, `keccak`: a proof that declares `keccak_log_height = 0` carries no such table and
-the batch has eight instances, which is every proof on this chain, since no guest here calls the
+`poseidon2` (the syscall's own chip), `input` (one row per committed private-input word,
+feeding the `H_IN` digest and `READ_INPUT` over two split buses), and `public` (one row per
+public-segment word, feeding `H_PUB` and `READ_PUBLIC` the same way — mandatory since constraint
+set 6, four rows even when the segment is empty). Two further tables are
+*optional* per proof: `keccak` (constraint set 5) and `sha256` (arrived with constraint set 6),
+each carried only when the guest called the matching syscall — a proof that declares
+`keccak_log_height = 0` and `sha256_log_height = 0` carries neither, and the batch has nine
+instances, which is every proof on this chain, since no guest here calls either
 syscall. LogUp/permutation buses tie them together (e.g. the
 `POSEIDON2` bus between `cpu`'s hash rows and the `poseidon2` chip). The private inputs — the four
 balances here — never appear in any public column; they only steer which trace rows get produced.
 FRI is run in hiding mode, so two proofs of the identical execution are different bytes — proofs
 don't fingerprint the specific inputs that produced them.
 
-The proof publishes exactly 26 public values (`tables::cpu::pv`): `PC_ENTRY` (1 word), `TIER` (1
-word), `OUT0..OUT0+7` (the eight output words), `HC0..HC0+7` (the 8-word program digest), and
-`IN0..IN0+7` (the salted private-input commitment `H_IN`, milestone 4.1). It is serialized as
+The proof publishes exactly 34 public values (`tables::cpu::pv`): `PC_ENTRY` (1 word), `TIER` (1
+word), `OUT0..OUT0+7` (the eight output words), `HC0..HC0+7` (the 8-word program digest),
+`IN0..IN0+7` (the salted private-input commitment `H_IN`, milestone 4.1), and `PUB0..PUB0+7` (the
+unsalted public-segment commitment `H_PUB`, constraint set 6). It is serialized as
 `Proof { tier, program_log_height, input_log_height, public_values, batch }`, postcard-encoded — the
 same shape `Action::Call.proof` carries — with `keccak_log_height` and `mem_log_height` added to it
-by constraint set 5. Measured upstream on a different guest (`fib`) at tier 10 under constraint
+by constraint set 5 and `sha256_log_height` and `public_log_height` by constraint set 6. Measured upstream on a different guest (`fib`) at tier 10 under constraint
 set 3 (`docs/confidential.md`): proof size 268 KB, prove time 3.1 s, first (uncached) verify 16 ms;
-at constraint set 5's 80 queries the same proof is ~1.20 MB and first verify ~233 ms. The README's own measurement of `private_payment` specifically (an
+at constraint set 5's 80 queries the same proof is ~1.20 MB and first verify ~233 ms, and at
+constraint set 6 it is 1 298 729 bytes (see `docs/confidential.md`, "Constraint set 6"). The README's own measurement of `private_payment` specifically (an
 earlier constraint set): proving ~21 s, proof ~0.9 MB, on-chain verification ~19 ms once its
 verifier key is cached (the key itself costs ~2 s to build on a laptop, ~7 s on a 2-vCPU server, and
 is what deploy-time warming amortizes away).
@@ -490,19 +499,27 @@ digest, `verify_bundle` against the genesis-pinned `hc_bundle`). Then the call h
    with the other caps.
 2. The program must exist (`programs.get(program)`).
 3. `ZkExecutor::verify_call`: decode the `postcard`-encoded `Proof`; reject an out-of-range tier or
-   declared height — `program_log_height`, `input_log_height`, `keccak_log_height`, `mem_log_height`
+   declared height — `program_log_height`, `input_log_height`, `keccak_log_height`,
+   `sha256_log_height`, `public_log_height`, `mem_log_height`
    — before any of them is used to size anything (guarding against a panic on an attacker-chosen
    huge shift), through `machine::check_declared_heights`, the very function the verifier itself
    calls; check the proof's declared degree bits match what those heights imply, which also pins the
-   batch's instance count (eight without a keccak table, nine with); decode `record.code_hash` back
-   into `hc`; call `Machine::verify(&hc, &proof)` — the actual batch-STARK check, against a verifier
-   key cached by `(tier, program_log_height, input_log_height, keccak_log_height)` (shared across
-   every program of that shape, not recomputed per call).
-4. `Machine::verify` itself checks, in order: the public value count is exactly 26; every public
+   batch's instance count (nine mandatory tables, plus one per optional hash table declared);
+   decode `record.code_hash` back
+   into `hc`; call `Machine::verify_public(&hc, &[], &proof)` — the actual batch-STARK check,
+   against a verifier
+   key cached by `(tier, program_log_height, input_log_height, keccak_log_height,
+   sha256_log_height, public_log_height)` (shared across
+   every program of that shape, not recomputed per call). The `&[]` is this chain's public
+   segment: no transaction publishes public words, so the only admissible `H_PUB` is the empty
+   segment's digest (`docs/confidential.md`, "Constraint set 6").
+4. `Machine::verify` itself checks, in order: the public value count is exactly 34; every public
    value is a canonical field element (rejecting `x` and `x + p` as two encodings of one proof);
    `HC0..HC7` match the caller-supplied `hc`; `TIER` matches the proof's declared tier and that tier
    is one of the six defined; every declared height is in range; the declared degree bits match;
-   then the batch STARK verification equation itself.
+   then the batch STARK verification equation itself — and `verify_public` adds the one check
+   `verify` cannot do on its own: `PUB0..PUB7` equal `hash::public_digest(&[])`, recomputed
+   natively from the (empty) public segment.
 5. Back in the ledger: the fee must now cover `BUNDLE_BASE + call_fee(tier)`, which is only
    knowable once a verified proof has revealed the tier. This is the last check of the whole
    admission order.
@@ -554,7 +571,10 @@ through the real executor); full mode additionally re-checks every proposer sign
 | Declared `program_log_height` out of `[4, 22]` | same two layers | `invalid proof: program height out of range` |
 | Declared `input_log_height` out of range | same two layers | `invalid proof: input height out of range` |
 | Declared `keccak_log_height` neither 0 nor in `[5, 20]`, or above `tier + 5` | same two layers | `invalid proof: keccak height out of range` |
+| Declared `sha256_log_height` neither 0 nor in `[6, 20]`, or above `tier + 6` | same two layers | `invalid proof: sha256 height out of range` |
+| Declared `public_log_height` outside `[2, 20]` (mandatory — no `0` escape) | same two layers | `invalid proof: public height out of range` |
 | Declared `mem_log_height` out of `[tier + 2, 24]` | same two layers | `invalid proof: memory height out of range` |
+| Proof commits to a non-empty public segment (`H_PUB` ≠ `public_digest(&[])`) | `verify_public`, inside both `verify_call` and `verify_bundle` | `invalid proof: ...` (opaque `VerifyError`, no separate error code) |
 | Proof's degree bits don't match the declared heights | `verify_call`'s pre-check | `invalid proof: degree bits` |
 | Stale/wrong program (proof's `hc` doesn't match `record.code_hash`) | `Machine::verify`'s public-value check | `invalid proof: ...` (opaque `VerifyError`, no separate error code) |
 | Unknown program id | `Ledger::check_call` | `unknown program <id>` |

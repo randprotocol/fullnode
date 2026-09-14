@@ -4,7 +4,53 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-10)
+## Project memory (state as of 2026-09-14)
+
+### Constraint set 6 re-vendor (2026-09-14, upstream 0200877): the public input segment, carrying M4.3 + M4.4
+
+`crates/shrugg-zkvm/` is re-vendored to `research`'s constraint-set-6 merge (the public input
+segment), which also carries milestones 4.3 (the EVM interpreter guest) and 4.4 (the `sha256`
+table, `SYS_SHA256 = 5`, and the sBPF interpreter guest) into this crate. A hard fork like every
+set before it; fleets must run the same build (`docs/confidential.md`, "Constraint set 6").
+
+- The zk side: a ninth **mandatory** table, `public` (the `PUBLIC_DIGEST`/`PUBLIC_READ` bus pair,
+  sixteen buses in all), `SYS_READ_PUBLIC = 6`, and `H_PUB` in `pv::PUB0..7` — **unsalted**,
+  unlike `H_IN`, so `Machine::verify_public(hc, public_words, proof)` recomputes
+  `hash::public_digest(words)` natively and compares. `pv::NUM` 26 → 34, cpu `col::WIDTH`
+  224 → 275, `Machine::verifier_key` a 6-tuple `(tier, program, input, keccak, sha256, public)`,
+  and `Proof` gains `sha256_log_height` (optional, `0` = no table, the keccak table's exact
+  terms) and `public_log_height` (mandatory; an empty segment is four rows, height 2).
+- **The chain admits only the empty public segment**: `ZkExecutor::verify_call`/`verify_bundle`
+  both call `verify_public(hc, &[], proof)`. Plain `verify` would leave `pv::PUB0..7` bound only
+  in-circuit — to a segment the chain never saw — and today's guests read no public words
+  anyway. A future action type that publishes words passes them in place of `&[]`.
+- `MAX_PROOF_BYTES` **stays 2 MiB**, re-measured on this tree (see the commit message and
+  `docs/confidential.md`): the mandatory public table + 51 new cpu columns grow a keccak-free
+  production proof by a few percent over set 5's 1 202 416 bytes (tier 10), still far under the
+  cap, and a keccak-carrying proof is still far over it.
+- Vendoring mechanics worth knowing before the next resync (all in `deploy/sync-zkvm.sh`'s
+  header): the `log_ext_degrees_pub` patch is re-anchored on the six-parameter `verifier_key`
+  line and forwards all seven `log_ext_degrees` arguments; the domain-tag inlining gained a
+  third tag (`PUB_DOMAIN = 15`, in `hash.rs` and `tables/cpu.rs`); `call_envelope.rs` (src and
+  tests) had to be **added to the rsync exclude list** — it is node-local S3 code that did not
+  exist when the list was written, and `--delete` would have removed it; three vendored files
+  (`src/evm.rs`, `src/sbpf.rs`, `tests/isa.rs`) `include!` assets at upstream's two-levels-up
+  `guests-compiled/` layout and get a sed to this crate's shallower one; the guest copy step is
+  four bins (`fib`, `keccak256`, `evm`, `sbpf`) plus two assets (`erc20.runtime.hex`,
+  `spl_token.so`).
+- **New build requirement**: `evm-core` and `sbpf-core` are *path* dependencies of
+  `shrugg-zkvm` (`../../../circuits/guests-compiled/{evm-core,sbpf-core}`) and, unlike
+  `rand-zkvm-cuda`, they are NOT optional — `circuits/` must sit beside `fullnode/` for any
+  build of the crate. In a `/tmp/fullnode-*` worktree that means `ln -s
+  <real circuits checkout> /tmp/circuits` first, or `cargo metadata` fails on the (already
+  pre-existing) optional cuda path dep too. Dev-oracles at upstream's exact pins: `revm
+  =43.0.2`, `solana-sbpf =0.11.1`, `sha2 =0.10.9`, `num-bigint 0.4`.
+- The vendored suite grows by the EVM/sBPF/sha256 test files (`tests/evm_*.rs`, `tests/sbpf_*.rs`,
+  `tests/sha256.rs`, a much bigger `tests/e2e.rs` including a tier-16 EVM call proof).
+  `cargo test --workspace --release` at the re-vendor: **678 passed, 0 failed, 6 ignored**
+  (upstream's three production measurements, the sBPF cycle breakdown, and the two
+  memory-bound interpreter exit proofs), ~43½ min wall from a cold release target on a loaded
+  machine — wallet flow 9m37s, cluster 22m44s (18 tests), zkvm e2e 7m25s.
 
 ### Security review: done, fixes merged
 

@@ -17,6 +17,12 @@ pub const MAX_PROGRAM_WORDS: usize = 4096;
 /// *below* the ~3.11 MB a tier-10 proof that carries the optional keccak table costs: no guest
 /// this chain deploys calls `SYS_KECCAK`, and admitting one at 4 MiB would put a single
 /// transaction in reach of the whole block (see `MAX_BLOCK_BYTES`).
+///
+/// Re-measured at constraint set 6 (upstream `0200877`, the public input segment): the mandatory
+/// `public` table and the cpu table's 51 new columns grow a keccak-free proof to 1 298 729 bytes at
+/// tier 10 / 1 359 978 at tier 12 and the keccak-carrying one to 3 198 430 (`crates/shrugg-zkvm`'s
+/// `tests/e2e.rs::measure_production_profile_at_tier_10_and_12`, run `--ignored`). Both properties
+/// above hold unchanged, so the cap does not move.
 pub const MAX_PROOF_BYTES: usize = 2 << 20;
 /// Largest bridge attestation accepted in a `BridgeAttest` transaction.
 ///
