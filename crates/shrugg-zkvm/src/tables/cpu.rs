@@ -2,7 +2,7 @@
 //! delegates arithmetic to ALU. The only table with public values.
 use super::{bus, limbs, nibble::NibbleCounts, program::MESSAGE_LEN, range::RangeCounts, F};
 use crate::emulator::{CycleEvent, HashRow, Syscall, ECALL_MEM_REG, SLOT_MEM, SLOT_R1, SLOT_R2, SLOT_W, SPACE_RAM};
-use crate::isa::{Program, NUM_OUTPUTS, SYS_HALT as SYS_NUM_HALT, SYS_POSEIDON2, SYS_READ_INPUT, SYS_WRITE_OUTPUT};
+use crate::isa::{Program, NUM_OUTPUTS, SYS_HALT as SYS_NUM_HALT, SYS_POSEIDON2, SYS_READ_INPUT, SYS_READ_PUBLIC, SYS_WRITE_OUTPUT};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{Field, PrimeCharacteristicRing};
 use p3_lookup::{Count, InteractionBuilder};
@@ -203,12 +203,63 @@ pub mod col {
     /// hash-group column (`HASH_N`/`HASH_LEFT`/`HASH_IDX`/`HS0..7`) to zero, since nothing
     /// routes a keccak row into a hash row-group (`continues` keys off `SYS_HASH` alone).
     pub const SYS_KECCAK: usize = IINV0 + 4;
-    pub const WIDTH: usize = SYS_KECCAK + 1;
+    /// M4.4: the `SHA256` ecall row — `SYS_KECCAK`'s shape exactly, one column later. One row,
+    /// never a row group: the chip (`tables::sha256`) proves the 64 rounds and sends the
+    /// compression's own 32 `MEMORY` messages (24 reads, 8 write-backs); this row only dispatches
+    /// the call, bounds the pointer, and claims the chip's block on the `SHA256` bus. Appended at
+    /// the end of the column list for the same reason `SYS_KECCAK` was: column *indices* are
+    /// load-bearing for the vendored fullnode at re-vendoring time, and appending keeps every
+    /// pre-M4.4 index where it was.
+    ///
+    /// It reuses the `SYS_HASH` group's `HASH_PTR`/`HP0..3`/`HP3_HI` columns for its own
+    /// (bounded) copy of `a0` — see the "CRITICAL 1" block in `eval` — and pins every *other*
+    /// hash-group column (`HASH_N`/`HASH_LEFT`/`HASH_IDX`/`HS0..7`) to zero, since nothing routes
+    /// a sha256 row into a hash row-group (`continues` keys off `SYS_HASH` alone).
+    pub const SYS_SHA256: usize = SYS_KECCAK + 1;
+    /// Constraint set 6: the `SYS_READ_PUBLIC` ecall row — `SYS_READ`'s twin on the **public**
+    /// segment. One row, like `SYS_READ`: `B` is the index, `C` the returned word (written back
+    /// to `a0` by the shared register-write path), and the pair is drawn from `PUBLIC_READ`.
+    /// Appended at the end of the column list, like every column since M4.2, because column
+    /// *indices* are load-bearing for the vendored fullnode at re-vendoring time.
+    pub const SYS_READ_PUB: usize = SYS_SHA256 + 1;
+    /// Constraint set 6: a **third** digest region, absorbing the committed public-input words
+    /// right after the indigest region ends. Mirrors `IS_INDIGEST`'s structure — including
+    /// reusing the shared absorb machinery (`HS0..7`, `HV0..3`, `ACT0..3`, `HASH_LEFT`,
+    /// `HASH_IDX`, `LEFT0..1`, `IDX0..1`; `IS_DIGEST`, `IS_HASH`, `IS_INDIGEST` and
+    /// `IS_PUBDIGEST` are pairwise mutually exclusive, so all four safely share those columns)
+    /// — with its own final-encoding columns (`PHVL0..31`/`PHIMAX0..3`/`PINV0..3`) for the
+    /// reason `IS_INDIGEST` has its own rather than reusing `DHVL0..31`.
+    ///
+    /// Two things differ from a plain mirror of `IS_INDIGEST`, both because `H_PUB` is
+    /// **unsalted** (`hash::public_digest`): there is no `IS_SALT` analogue, so `HASH_IDX`
+    /// starts at 0 on the first pubdigest row (not one past a salt row) and every real row
+    /// drains `HASH_LEFT` by its own `active_sum`; and a pubdigest row may legitimately have no
+    /// active lane at all — the `n_pub == 0` header-only block (`public_digest_rows`'s
+    /// `max(1, ⌈n/4⌉)`) — which is why "lane 0 is always active" is stated here as "only the
+    /// `HASH_IDX = 0` row may be empty" instead.
+    pub const IS_PUBDIGEST: usize = SYS_READ_PUB + 1;
+    /// `INDIGEST_LAST`'s twin for the pubdigest region: 1 on the transition row out of it.
+    pub const PUBDIGEST_LAST: usize = IS_PUBDIGEST + 1;
+    /// 8: the last *indigest* row's own permutation output. Exactly what `DPOUT0..7` is for the
+    /// last program-digest row, one region later and for the identical reason: the row after
+    /// the last indigest row is now the first `IS_PUBDIGEST` row, whose `n(HS0..7)` is
+    /// repurposed to seed `H_PUB`'s capacity header — so H_IN's own output can no longer be
+    /// read back through `n(HS0 + j)`. Two unrelated values cannot occupy one cell; asserting
+    /// both is unsatisfiable even for an honest witness (M4.1 found this the hard way).
+    pub const IPOUT0: usize = PUBDIGEST_LAST + 1;
+    /// 32: byte limbs of the 8 `H_PUB` output words — `IHVL0..31`'s role for this region.
+    pub const PHVL0: usize = IPOUT0 + 8;
+    pub const PHIMAX0: usize = PHVL0 + 32;
+    pub const PINV0: usize = PHIMAX0 + 4;
+    pub const WIDTH: usize = PINV0 + 4;
     /// Columns that must be zero on padding rows.
-    pub const SELECTORS: [usize; 27] = [
+    pub const SELECTORS: [usize; 30] = [
         IS_ALU, IS_IMM, IS_BRANCH, IS_LB, IS_LH, IS_LW, IS_SB, IS_SH, IS_SW, SIGNED,
         IS_JAL, IS_JALR, IS_LUI, IS_AUIPC, IS_ECALL, WRITES_RD, SYS_HALT, SYS_WRITE, SYS_READ, BR_NEG,
-        SYS_HASH, IS_HASH, IS_HASH_OUT, HASH_FIN, IS_DIGEST, IS_INDIGEST, SYS_KECCAK,
+        SYS_HASH, IS_HASH, IS_HASH_OUT, HASH_FIN, IS_DIGEST, IS_INDIGEST, SYS_KECCAK, SYS_SHA256,
+        // Constraint set 6. `PUBDIGEST_LAST` is deliberately *not* here, mirroring
+        // `INDIGEST_LAST`/`DIGEST_LAST`: it is pinned to zero off its own region instead.
+        SYS_READ_PUB, IS_PUBDIGEST,
     ];
 }
 pub mod pv {
@@ -232,7 +283,12 @@ pub mod pv {
     /// the way `HC0..7` is against `hc` — it is a guest-visible commitment, not a
     /// verifier-side identity check (`docs/03-privacy.md`'s M4.1 section).
     pub const IN0: usize = HC0 + 8;
-    pub const NUM: usize = IN0 + 8; // 26
+    /// The unsalted public-segment commitment `H_PUB`, pinned by the last `IS_PUBDIGEST` row
+    /// (Task 2 — until then this is a declared value bound to nothing). Unlike `IN0..7` this
+    /// *is* checkable by a verifier: `Machine::verify_public` recomputes
+    /// `hash::public_digest(words)` from the words the chain publishes and compares.
+    pub const PUB0: usize = IN0 + 8;
+    pub const NUM: usize = PUB0 + 8; // 34
 }
 use col::*;
 
@@ -300,10 +356,13 @@ where
         // valid 0/1 selector. Hoisted here (rather than defined only where the `INPUT_DIGEST`
         // lookup needs it, further down) so the lane-0 rule below can also use it.
         let is_real_indigest = is_indigest.clone() - v(IS_SALT);
+        // Constraint set 6: the third digest region. Unlike `is_indigest` it has no salt row, so
+        // there is no `is_real_pubdigest` analogue — every pubdigest row's lanes are checked.
+        let is_pubdigest = v(IS_PUBDIGEST);
         // M3.4: digest rows share every "this is not an ordinary per-instruction row" gate a
         // hash row already needed (no PROGRAM fetch, no DEC/register/memory-value columns, no
         // per-slot MEMORY send) — `off_cpu` is `is_hash_any` generalized to include them.
-        let off_cpu = is_hash_any.clone() + is_digest.clone() + is_indigest.clone();
+        let off_cpu = is_hash_any.clone() + is_digest.clone() + is_indigest.clone() + is_pubdigest.clone();
         // MINOR (fix): explicit mutual exclusivity. Nothing else directly forbids a row
         // claiming to be *both* an absorb row and a write-back row at once; every other
         // hash-row constraint happens to be gated by one selector or the other (never by
@@ -323,7 +382,20 @@ where
         b.assert_zero(is_indigest.clone() * is_hash.clone());
         b.assert_zero(is_indigest.clone() * is_hash_out.clone());
         b.assert_zero(is_indigest.clone() * is_digest.clone());
+        // Constraint set 6: the pubdigest region joins the same pairwise-exclusivity set, for
+        // exactly the reasons the block above gives — all four share `HS0..7`/`HV0..3`/`ACT0..3`
+        // and `is_hash_or_digest` (below) must stay a valid 0/1 "this row makes one POSEIDON2
+        // call" selector.
+        b.assert_zero(is_pubdigest.clone() * is_hash.clone());
+        b.assert_zero(is_pubdigest.clone() * is_hash_out.clone());
+        b.assert_zero(is_pubdigest.clone() * is_digest.clone());
+        b.assert_zero(is_pubdigest.clone() * is_indigest.clone());
         let digest_last = v(DIGEST_LAST);
+        // Hoisted (M4.1 defined `indigest_last` beside its own `pv::IN0..7` block, far below):
+        // the `POSEIDON2` lookup's `state_out` now needs it too, since constraint set 6 gives
+        // the last indigest row its own `IPOUT0..7` output columns (see that column's comment).
+        let indigest_last = v(INDIGEST_LAST);
+        let pubdigest_last = v(PUBDIGEST_LAST);
         {
             // M4.1: IS_INDIGEST turns on exactly once, on the row right after the
             // program-digest prefix ends (DIGEST_LAST=1's next row) — forced, not merely
@@ -341,6 +413,16 @@ where
             let mut t = b.when_transition();
             t.assert_zero(digest_last.clone() * (one.clone() - n(IS_INDIGEST)));
             t.assert_zero((one.clone() - v(IS_DIGEST)) * (one.clone() - is_indigest.clone()) * n(IS_INDIGEST));
+        }
+        {
+            // Constraint set 6: the same two rules again, one region later — `IS_PUBDIGEST`
+            // turns on exactly once, on the row right after the indigest region ends
+            // (`INDIGEST_LAST = 1`'s next row), and can never turn back on afterwards. Together
+            // with `PUBDIGEST_LAST`'s own pin below this makes the region a mandatory,
+            // contiguous block of every proof's cpu table, exactly as the other two are.
+            let mut t = b.when_transition();
+            t.assert_zero(indigest_last.clone() * (one.clone() - n(IS_PUBDIGEST)));
+            t.assert_zero((one.clone() - is_indigest.clone()) * (one.clone() - is_pubdigest.clone()) * n(IS_PUBDIGEST));
         }
         // M4.1 (salted H_IN, controller ruling): `IS_SALT` — pinned to 0 wherever `is_indigest`
         // is 0 (so it inherits the padding-row pin transitively through `is_indigest`'s own),
@@ -398,6 +480,8 @@ where
         b.assert_zero(off_cpu.clone() * v(SYS_WRITE));
         b.assert_zero(off_cpu.clone() * v(SYS_READ));
         b.assert_zero(off_cpu.clone() * v(SYS_KECCAK));
+        b.assert_zero(off_cpu.clone() * v(SYS_SHA256));
+        b.assert_zero(off_cpu.clone() * v(SYS_READ_PUB));
         b.assert_zero(off_cpu.clone() * v(A));
         b.assert_zero(off_cpu.clone() * v(B));
         b.assert_zero(off_cpu.clone() * v(MEM_VAL));
@@ -429,7 +513,7 @@ where
         // `cpu_trace` always leaves it at the emulator's own `c = 0` default for these rows
         // (see `emulator::execute`), so this cannot reject any honest trace. Pin it to that
         // same zero sentinel.
-        let defines_c = v(IS_ALU) + is_load.clone() + v(IS_JAL) + v(IS_JALR) + v(IS_LUI) + v(IS_AUIPC) + v(SYS_READ);
+        let defines_c = v(IS_ALU) + is_load.clone() + v(IS_JAL) + v(IS_JALR) + v(IS_LUI) + v(IS_AUIPC) + v(SYS_READ) + v(SYS_READ_PUB);
         b.assert_zero((one.clone() - defines_c) * v(C));
 
         // next pc
@@ -455,8 +539,12 @@ where
         // from the digest prefix, through the indigest prefix, into the first instruction
         // row's own `PC` — the same chain `is_digest`'s rule maintains for its own region.
         b.assert_zero(is_indigest.clone() * (v(NEXT_PC) - v(PC)));
+        // Constraint set 6: and pubdigest rows, for the identical reason — `PC` (`base_pc`) has
+        // to stand still through all three digest regions so it reaches the first instruction
+        // row's own `PC` through the ordinary `n(PC) = v(NEXT_PC)` chain.
+        b.assert_zero(is_pubdigest.clone() * (v(NEXT_PC) - v(PC)));
         b.assert_zero(
-            is_real.clone() * (one.clone() - v(IS_BRANCH) - v(IS_JAL) - v(IS_JALR) - continues.clone() - is_digest.clone() - is_indigest.clone()) * (v(NEXT_PC) - fallthrough),
+            is_real.clone() * (one.clone() - v(IS_BRANCH) - v(IS_JAL) - v(IS_JALR) - continues.clone() - is_digest.clone() - is_indigest.clone() - is_pubdigest.clone()) * (v(NEXT_PC) - fallthrough),
         );
 
         // memory: address, alignment, and the word actually in memory
@@ -590,8 +678,8 @@ where
         let count2 = is_mem.clone() + v(IS_ECALL) + v(ACT0 + 2) * is_hash.clone() + is_hash_out.clone();
         bus::MEMORY.send(b, [space2, addr2, ts(SLOT_MEM), value2, is_hash_out.clone()], Count::bounded(count2, 1));
 
-        // `SLOT_W`: a register writeback (space 0, addr RD, value C — WRITES_RD or SYS_READ
-        // rows), a store's word write (space 1/RAM, addr MEM_ADDR, value MERGED — the pin
+        // `SLOT_W`: a register writeback (space 0, addr RD, value C — WRITES_RD, SYS_READ or
+        // (constraint set 6) SYS_READ_PUB rows), a store's word write (space 1/RAM, addr MEM_ADDR, value MERGED — the pin
         // that replaces `2c8a39d`'s "a store's mem_val is the rs2 value": now "the written
         // value is MERGED, and MERGED = B when IS_SW", proved structurally by the MERGED
         // formula above), or (M3.2) a hash row's 4th lane. No two of the three ever coincide
@@ -602,11 +690,11 @@ where
             + hash_addr(3) * is_hash.clone() + write_addr(3) * is_hash_out.clone();
         let slot_w_val = is_store.clone() * merged + (one.clone() - is_store.clone()) * v(C) + v(HV0 + 3) * is_hash_any.clone();
         let slot_w_is_write = (one.clone() - is_hash_any.clone()) + is_hash_out.clone();
-        let count3 = v(WRITES_RD) + v(SYS_READ) + is_store.clone() + v(ACT0 + 3) * is_hash.clone() + is_hash_out.clone();
+        let count3 = v(WRITES_RD) + v(SYS_READ) + v(SYS_READ_PUB) + is_store.clone() + v(ACT0 + 3) * is_hash.clone() + is_hash_out.clone();
         bus::MEMORY.send(b, [slot_w_space, slot_w_addr, ts(SLOT_W), slot_w_val, slot_w_is_write], Count::bounded(count3, 1));
 
         // syscalls: a = number, b = arg0, mem_val = arg1
-        let sys_sum = v(SYS_HALT) + v(SYS_WRITE) + v(SYS_READ) + v(SYS_HASH) + v(SYS_KECCAK);
+        let sys_sum = v(SYS_HALT) + v(SYS_WRITE) + v(SYS_READ) + v(SYS_HASH) + v(SYS_KECCAK) + v(SYS_SHA256) + v(SYS_READ_PUB);
         b.assert_zero(v(IS_ECALL) * (sys_sum.clone() - one.clone()));
         b.assert_zero((one.clone() - v(IS_ECALL)) * sys_sum);
         b.assert_zero(v(SYS_HALT) * (v(A) - AB::Expr::from_u32(SYS_NUM_HALT)));
@@ -619,6 +707,12 @@ where
         // note, now closed). Draws from `INPUT_READ`, not `INPUT_DIGEST` (review round 1, C1):
         // a read can never affect the digest's own count.
         bus::INPUT_READ.lookup_key(b, [v(B), v(C)], Count::bounded(v(SYS_READ), 1));
+        // Constraint set 6: `SYS_READ`'s twin on the public segment.
+        b.assert_zero(v(SYS_READ_PUB) * (v(A) - AB::Expr::from_u32(SYS_READ_PUBLIC)));
+        // The only constraint that pins a SYS_READ_PUB row's returned value (`C`, already written
+        // back to `a0` by the shared register-write path). Draws from PUBLIC_READ, never
+        // PUBLIC_DIGEST — the C1 split again: a read can never affect the digest's own count.
+        bus::PUBLIC_READ.lookup_key(b, [v(B), v(C)], Count::bounded(v(SYS_READ_PUB), 1));
 
         // M3.2: the `POSEIDON2` ecall row. `a0` (already read into `B` every ecall row) is the
         // word pointer; `a1` (read through `MEM_VAL`, the memory slot, exactly like every other
@@ -650,7 +744,12 @@ where
         // then some: the keccak chip does plain field addition `PTR + w` for `w < 50` and has
         // nothing of its own that bounds `PTR` (Task 3 review, Important #1). The two selectors
         // are mutually exclusive (the one-hot-on-ecall rule above), so the count stays ≤ 1.
-        let hp_gate = v(SYS_HASH) + v(SYS_KECCAK);
+        //
+        // M4.4: and `SYS_SHA256`, for exactly the same reason — the sha256 chip addresses
+        // `PTR .. PTR + 23` by plain field addition and bounds nothing itself. All three
+        // selectors are pairwise exclusive under the same one-hot rule, so the count is still ≤ 1
+        // and the shared limb columns still carry one well-defined pointer per row.
+        let hp_gate = v(SYS_HASH) + v(SYS_KECCAK) + v(SYS_SHA256);
         {
             let mut hp = AB::Expr::ZERO;
             for i in 0..4 { hp += v(HP0 + i) * AB::Expr::from_u32(1 << (8 * i)); }
@@ -691,6 +790,47 @@ where
             // table's own (digest-prefix-shifted) clock, which is also what the chip's memory
             // timestamps `4·CLK`/`4·CLK + 1` are built from.
             bus::KECCAK.lookup_key(b, [v(CLK), v(HASH_PTR)], Count::bounded(v(SYS_KECCAK), 1));
+        }
+
+        // M4.4: the `SHA256` ecall row, `SYS_KECCAK`'s twin. `a0` (in `B`, read on every ecall
+        // row) is the word address of the 24-word buffer — the 512-bit message block in words
+        // `0..16` and the chaining state in `16..24`; there is no second argument (the widths are
+        // fixed), and the whole syscall is this one row, since `continues` keys off `SYS_HASH`
+        // alone.
+        //
+        // `MEM_VAL` is deliberately *not* pinned here (the `SYS_KECCAK` row does not pin it
+        // either). It is the `a1` register value every ecall row reads over `MEMORY`
+        // (`count2`'s `IS_ECALL` term, `MEM_ADDR = ECALL_MEM_REG`), so it is bound to the
+        // register file whether or not the syscall reads it — AGENTS.md invariant 1 is satisfied
+        // by that send, not by a zero pin. Forcing it to zero would instead make an honest run
+        // unprovable whenever the guest happens to hold a non-zero `a1` at the call, which
+        // `call_sha256` (which sets only `a7` and `a0`) says nothing about.
+        {
+            b.assert_zero(v(SYS_SHA256) * (v(A) - AB::Expr::from_u32(crate::isa::SYS_SHA256)));
+            b.assert_zero(v(SYS_SHA256) * (v(HASH_PTR) - v(B)));
+            // The rest of the hash group's shared columns stay zero here, for the reason the
+            // keccak block above gives: they are meaningless on a sha256 row, and pinning them
+            // keeps a witness from smuggling a half-formed hash claim through a row that no
+            // hash-group rule gates on.
+            b.assert_zero(v(SYS_SHA256) * v(HASH_N));
+            b.assert_zero(v(SYS_SHA256) * v(HASH_LEFT));
+            b.assert_zero(v(SYS_SHA256) * v(HASH_IDX));
+            for i in 0..8 { b.assert_zero(v(SYS_SHA256) * v(HS0 + i)); }
+            // The cubic pointer rule, again: the `AND4[HP3_HI, 0xC, 0]` lookup above already
+            // forces `HP3_HI < 4`, i.e. `ptr < 2^30`. A sha256 row needs `ptr + 23 < 2^30` (the
+            // chip addresses `PTR .. PTR + 23`), so tighten the top nibble to `{0, 1, 2}`: then
+            // `ptr <= 0x2fff_ffff` and `ptr + 23 < 2^30` with room to spare. Degree 4 on a
+            // selector-gated product of one column — under this table's degree-8 ceiling, which
+            // comes from the packed lookups, not row logic.
+            let hi = v(HP3_HI);
+            b.assert_zero(
+                v(SYS_SHA256) * hi.clone() * (hi.clone() - one.clone()) * (hi - AB::Expr::TWO),
+            );
+            // The chip's side of the handshake: one entry per real 64-row block, keyed by the
+            // pair that makes the cpu's row and the chip's block the same event. `CLK` is this
+            // table's own (digest-prefix-shifted) clock, which is also what the chip's memory
+            // timestamps `4·CLK`/`4·CLK + 1` are built from.
+            bus::SHA256.lookup_key(b, [v(CLK), v(HASH_PTR)], Count::bounded(v(SYS_SHA256), 1));
         }
         {
             let mut t = b.when_transition();
@@ -754,7 +894,9 @@ where
             // M4.2 case these gates must get right — a `SYS_KECCAK` row, which is an ecall row
             // of the *ordinary* shape (one row, `continues` keys off `SYS_HASH` alone), so like
             // `SYS_WRITE` or any other instruction it may not be followed by a hash row. Only
-            // `SYS_HASH` opens a row-group.
+            // `SYS_HASH` opens a row-group. M4.4's `SYS_SHA256` row is that same shape and is
+            // covered by these same gates for the same reason: neither selector appears in
+            // either whitelist, so `n(IS_HASH)`/`n(IS_HASH_OUT)` are forced to zero after both.
             //
             // All three are products of two degree-1 selectors: degree 2, well under this
             // table's pinned degree 8 (`tests/tables.rs`'s degree pin).
@@ -804,6 +946,19 @@ where
         // never produces, and gets rejected there instead (`tests/cheating.rs`'s regression
         // (h)).
         b.assert_zero(is_real_indigest.clone() * (one.clone() - v(ACT0)));
+        // Constraint set 6: the pubdigest region's version of the same requirement. It cannot be
+        // the unconditional one — `hash::public_digest_rows` is `max(1, ⌈n_pub/4⌉)`, so at
+        // `n_pub == 0` the single (header-only) block has *no* active lane and an honest trace
+        // would be rejected. What must be ruled out is the (h)-style forgery the unconditional
+        // rule closes for indigest rows: an extra, all-inactive pubdigest row appended after the
+        // last real one, demanding nothing on `PUBLIC_DIGEST` yet still charged a genuine
+        // permutation on `POSEIDON2`, which would make `H_PUB` `perm(H_honest)` rather than a
+        // function of `public` alone. `HASH_IDX` separates the two cases exactly: it is 0 on the
+        // first pubdigest row and strictly increasing after (the increment rule below), so
+        // "only the first pubdigest row may be empty" is `HASH_IDX = 0` whenever `ACT0 = 0`.
+        // An empty row appended at the *front* is excluded by a different rule — a non-final
+        // pubdigest row must be full (`ACT0 + 3 = 1`), which cascades to `ACT0 = 1`.
+        b.assert_zero(is_pubdigest.clone() * (one.clone() - v(ACT0)) * v(HASH_IDX));
         let active_sum = v(ACT0) + v(ACT0 + 1) + v(ACT0 + 2) + v(ACT0 + 3);
         {
             let mut t = b.when_transition();
@@ -841,7 +996,7 @@ where
         // Inactive lanes are not overwritten by the sponge: `HV_k` carries the previous
         // state's own lane `k` forward instead of a memory read (hash rows) or a
         // `PROGRAM_WORD` lookup (digest rows).
-        let is_hash_or_digest = is_hash.clone() + is_digest.clone() + is_indigest.clone();
+        let is_hash_or_digest = is_hash.clone() + is_digest.clone() + is_indigest.clone() + is_pubdigest.clone();
         for i in 0..4 { b.assert_zero(is_hash_or_digest.clone() * (one.clone() - v(ACT0 + i)) * (v(HV0 + i) - v(HS0 + i))); }
         // `HASH_LEFT`/`HASH_IDX` range checks (byte limbs), the same purpose `MA0..3` serves
         // for `MEM_ADDR`: without this, a wrong `HASH_LEFT`/`HASH_IDX` could only be caught via
@@ -860,7 +1015,7 @@ where
         b.assert_zero(is_hash_or_digest.clone() * (v(LEFT0) + v(LEFT0 + 1) * AB::Expr::from_u32(256) - v(HASH_LEFT)));
         b.assert_zero(is_hash_or_digest.clone() * (v(IDX0) + v(IDX0 + 1) * AB::Expr::from_u32(256) - v(HASH_IDX)));
         for c in [LEFT0, LEFT0 + 1, IDX0] { bus::RANGE8.lookup_key(b, [v(c)], Count::bounded(is_hash_or_digest.clone(), 1)); }
-        bus::RANGE8.lookup_key(b, [v(IDX0 + 1)], Count::bounded(is_digest.clone() + is_indigest.clone(), 1));
+        bus::RANGE8.lookup_key(b, [v(IDX0 + 1)], Count::bounded(is_digest.clone() + is_indigest.clone() + is_pubdigest.clone(), 1));
         bus::AND4.lookup_key(b, [v(IDX0 + 1), AB::Expr::from_u32(3), v(IDX0 + 1)], Count::bounded(is_hash.clone(), 1));
         // The `POSEIDON2` lookup: `state_in` overwrites lanes 0..3 of the row's entering state
         // (`HS`) with this row's `HV`, keeping the capacity lanes 4..7; `state_out` is the
@@ -876,7 +1031,19 @@ where
         // `is_hash_or_digest` row (every hash/indigest absorb row, and every non-last digest
         // row) is unaffected — `digest_last` is 0 there, so this reduces to the original
         // `n(HS0+i)` exactly.
-        let state_out: Vec<AB::Expr> = (0..8).map(|i| (one.clone() - digest_last.clone()) * n(HS0 + i) + digest_last.clone() * v(DPOUT0 + i)).collect();
+        // Constraint set 6 (the same deviation, one region later — see `IPOUT0`'s doc comment):
+        // the last *indigest* row's output goes to `IPOUT0..7` for the identical reason, since
+        // the physical `n(HS0+i)` cell at that transition now carries H_PUB's header seed.
+        // `digest_last` and `indigest_last` are mutually exclusive (each implies its own
+        // region's selector, and the two selectors are), so at most one of the three terms is
+        // ever live and the expression stays degree 2.
+        let state_out: Vec<AB::Expr> = (0..8)
+            .map(|i| {
+                (one.clone() - digest_last.clone() - indigest_last.clone()) * n(HS0 + i)
+                    + digest_last.clone() * v(DPOUT0 + i)
+                    + indigest_last.clone() * v(IPOUT0 + i)
+            })
+            .collect();
         bus::POSEIDON2.lookup_key(b, state_in.into_iter().chain(state_out).collect::<Vec<_>>(), Count::bounded(is_hash_or_digest.clone(), 1));
 
         // M3.4 digest rows: `PROGRAM_WORD` lookups in place of a memory read, one per active
@@ -902,6 +1069,17 @@ where
         let indigest_idx = |k: u32| (v(HASH_IDX) - one.clone()) * four.clone() + AB::Expr::from_u32(k);
         for k in 0..4u32 {
             bus::INPUT_DIGEST.lookup_key(b, [indigest_idx(k), v(HV0 + k as usize)], Count::bounded(is_real_indigest.clone() * v(ACT0 + k as usize), 1));
+        }
+
+        // Constraint set 6: pubdigest rows draw their 4 words per row from `PUBLIC_DIGEST`, the
+        // indigest block above with two differences, both from `H_PUB` being unsalted. There is
+        // no salt row, so `HASH_IDX` *is* the block index (no `- 1` offset), and there is no
+        // `IS_SALT` gate — every real pubdigest row's active lanes are checked. Draws from
+        // `PUBLIC_DIGEST`, never `PUBLIC_READ` (the C1 split): the digest's own count can never
+        // be affected by how many times (if any) a `SYS_READ_PUBLIC` reads the same index.
+        let pubdigest_idx = |k: u32| v(HASH_IDX) * four.clone() + AB::Expr::from_u32(k);
+        for k in 0..4u32 {
+            bus::PUBLIC_DIGEST.lookup_key(b, [pubdigest_idx(k), v(HV0 + k as usize)], Count::bounded(is_pubdigest.clone() * v(ACT0 + k as usize), 1));
         }
 
         // M3.4: the digest group's own bookkeeping — `PC` (`base_pc`) and `HASH_N` (`len`,
@@ -950,7 +1128,6 @@ where
         // `IINV0..3`) rather than reusing `DHVL0..31` (see `IS_INDIGEST`'s doc comment for why).
         b.assert_bool(v(INDIGEST_LAST));
         b.assert_zero((one.clone() - is_indigest.clone()) * v(INDIGEST_LAST));
-        let indigest_last = v(INDIGEST_LAST);
         for k in 0..8 {
             for j in 0..4 { bus::RANGE8.lookup_key(b, [v(IHVL0 + 4 * k + j)], Count::bounded(indigest_last.clone(), 1)); }
             let byte_sum: AB::Expr = (0..4).map(|j| v(IHVL0 + 4 * k + j) * AB::Expr::from_u32(1 << (8 * j))).sum();
@@ -960,17 +1137,56 @@ where
         {
             let mut t = b.when_transition();
             t.assert_zero(is_indigest.clone() * (v(INDIGEST_LAST) - (one.clone() - n(IS_INDIGEST))));
-            t.assert_zero(indigest_last.clone() * n(HASH_LEFT));
+            // DELETED (constraint set 6), the exact `digest_last * n(HASH_LEFT)` deletion M4.1
+            // made one region earlier: `t.assert_zero(indigest_last * n(HASH_LEFT));` correctly
+            // meant "the row after the indigest region (the first instruction row) starts with
+            // `HASH_LEFT = 0`" while that row's `HASH_LEFT` had no other obligation. That row is
+            // now the *first pubdigest row*, whose honest `HASH_LEFT` is `n_pub` (seeded below,
+            // via `n(HASH_LEFT) - n(HASH_N)`), so leaving the line in would make an `n_pub > 0`
+            // proof unconditionally unsatisfiable. The full-drain obligation it carried moves to
+            // the *local* `indigest_last * (HASH_LEFT - indigest_drain) = 0` check below, which
+            // says the same thing about this row's own columns instead of the next row's.
             // `two32` (the top-level binding from the `c_load` computation) was moved by that
             // computation's own use of it — redefine locally here, harmless (see brief note).
             let two32 = AB::Expr::from_u64(1u64 << 32);
             for j in 0..4usize {
                 let lo = v(IHVL0 + 8 * j) + v(IHVL0 + 8 * j + 1) * AB::Expr::from_u32(1 << 8) + v(IHVL0 + 8 * j + 2) * AB::Expr::from_u32(1 << 16) + v(IHVL0 + 8 * j + 3) * AB::Expr::from_u32(1 << 24);
                 let hi = v(IHVL0 + 8 * j + 4) + v(IHVL0 + 8 * j + 5) * AB::Expr::from_u32(1 << 8) + v(IHVL0 + 8 * j + 6) * AB::Expr::from_u32(1 << 16) + v(IHVL0 + 8 * j + 7) * AB::Expr::from_u32(1 << 24);
-                t.assert_zero(indigest_last.clone() * (lo.clone() + hi.clone() * two32.clone() - n(HS0 + j)));
+                // Constraint set 6 (see `IPOUT0`): reads `v(IPOUT0 + j)` — the last indigest
+                // row's own dedicated output columns — instead of `n(HS0 + j)`, which now
+                // carries H_PUB's header seed on this exact transition.
+                t.assert_zero(indigest_last.clone() * (lo.clone() + hi.clone() * two32.clone() - v(IPOUT0 + j)));
                 let d = hi - AB::Expr::from_u32(0xFFFF_FFFF);
                 t.assert_zero(indigest_last.clone() * (d * v(IINV0 + j) - (one.clone() - v(IHIMAX0 + j))));
                 t.assert_zero(indigest_last.clone() * v(IHIMAX0 + j) * lo);
+            }
+        }
+
+        // Constraint set 6: `PUBDIGEST_LAST`, the final `H_PUB` encoding and the `pv::PUB0..7`
+        // pin — the `INDIGEST_LAST`/`IHVL0..31`/`IHIMAX0..3`/`IINV0..3` mechanism above,
+        // mirrored once more with this region's own encoding columns. Unlike the indigest
+        // region's, this one *can* read `n(HS0 + j)`: the row after the last pubdigest row is an
+        // ordinary instruction row, which has no header of its own to seed, so nothing else
+        // claims that cell.
+        b.assert_bool(v(PUBDIGEST_LAST));
+        b.assert_zero((one.clone() - is_pubdigest.clone()) * v(PUBDIGEST_LAST));
+        for k in 0..8 {
+            for j in 0..4 { bus::RANGE8.lookup_key(b, [v(PHVL0 + 4 * k + j)], Count::bounded(pubdigest_last.clone(), 1)); }
+            let byte_sum: AB::Expr = (0..4).map(|j| v(PHVL0 + 4 * k + j) * AB::Expr::from_u32(1 << (8 * j))).sum();
+            b.assert_zero(pubdigest_last.clone() * (pvs[pv::PUB0 + k].clone() - byte_sum));
+        }
+        for j in 0..4usize { b.assert_bool(v(PHIMAX0 + j)); }
+        {
+            let mut t = b.when_transition();
+            t.assert_zero(is_pubdigest.clone() * (v(PUBDIGEST_LAST) - (one.clone() - n(IS_PUBDIGEST))));
+            let two32 = AB::Expr::from_u64(1u64 << 32);
+            for j in 0..4usize {
+                let lo = v(PHVL0 + 8 * j) + v(PHVL0 + 8 * j + 1) * AB::Expr::from_u32(1 << 8) + v(PHVL0 + 8 * j + 2) * AB::Expr::from_u32(1 << 16) + v(PHVL0 + 8 * j + 3) * AB::Expr::from_u32(1 << 24);
+                let hi = v(PHVL0 + 8 * j + 4) + v(PHVL0 + 8 * j + 5) * AB::Expr::from_u32(1 << 8) + v(PHVL0 + 8 * j + 6) * AB::Expr::from_u32(1 << 16) + v(PHVL0 + 8 * j + 7) * AB::Expr::from_u32(1 << 24);
+                t.assert_zero(pubdigest_last.clone() * (lo.clone() + hi.clone() * two32.clone() - n(HS0 + j)));
+                let d = hi - AB::Expr::from_u32(0xFFFF_FFFF);
+                t.assert_zero(pubdigest_last.clone() * (d * v(PINV0 + j) - (one.clone() - v(PHIMAX0 + j))));
+                t.assert_zero(pubdigest_last.clone() * v(PHIMAX0 + j) * lo);
             }
         }
 
@@ -1028,9 +1244,65 @@ where
             // must carry through to the first real block unchanged. `indigest_drain` is
             // `active_sum` on every real indigest row and 0 on the salt row.
             let indigest_drain = active_sum.clone() * (one.clone() - v(IS_SALT));
-            t.assert_zero(is_indigest.clone() * (v(HASH_LEFT) - indigest_drain - n(HASH_LEFT)));
+            // DEVIATION (constraint set 6), the same split M4.1 made for the digest region one
+            // region earlier and for the identical reason: this chain rule used to be gated by
+            // bare `is_indigest`, which was harmless while the row after the last indigest row
+            // was an ordinary row whose `HASH_LEFT` legitimately defaults to 0. That row is now
+            // the first *pubdigest* row, whose `HASH_LEFT` is seeded to `n_pub` below — an
+            // unconditional chain rule on the same transition would simultaneously force it to
+            // `v(HASH_LEFT) - indigest_drain` (0 for an honest, fully-absorbed last block),
+            // unsatisfiable whenever `n_pub > 0`. Split in two: the chain only when the next row
+            // is another indigest row, plus a *local* full-drain check on the last one (which
+            // says nothing about the next row's column) that replaces the deleted
+            // `indigest_last * n(HASH_LEFT) = 0`.
+            t.assert_zero(not_final_indigest.clone() * (v(HASH_LEFT) - indigest_drain.clone() - n(HASH_LEFT)));
+            t.assert_zero(indigest_last.clone() * (v(HASH_LEFT) - indigest_drain));
             t.assert_zero(not_final_indigest.clone() * (n(HASH_IDX) - v(HASH_IDX) - one.clone()));
             t.assert_zero(not_final_indigest * (one.clone() - v(ACT0 + 3)));
+            // Constraint set 6: the first pubdigest row's own bookkeeping, seeded on the
+            // transition out of the indigest region exactly as the first indigest row's is
+            // seeded on the transition out of the program-digest prefix (there is no ecall row
+            // ahead of it and it is not row 0 of the table, so the seed has nowhere else to
+            // live). Capacity header `[PUB_DOMAIN, n_pub, 0]` — `hash::public_digest_rows`'s own
+            // header, one fewer real word than `hc`'s, exactly like H_IN's.
+            //
+            // The one structural difference from H_IN: **no salt row.** `HASH_IDX` starts at 0
+            // on the first pubdigest row (rather than on a salt row one earlier), and every
+            // pubdigest row drains `HASH_LEFT` by its own `active_sum` — there is no `IS_SALT`
+            // analogue and so no `indigest_drain`-style exemption.
+            for i in [0usize, 1, 2, 3, 7] { t.assert_zero(indigest_last.clone() * n(HS0 + i)); }
+            t.assert_zero(indigest_last.clone() * (n(HS0 + 4) - AB::Expr::from_u32(crate::hash::PUB_DOMAIN)));
+            t.assert_zero(indigest_last.clone() * (n(HS0 + 5) - n(HASH_N)));
+            t.assert_zero(indigest_last.clone() * n(HS0 + 6));
+            t.assert_zero(indigest_last.clone() * n(HASH_IDX));
+            t.assert_zero(indigest_last.clone() * (n(HASH_LEFT) - n(HASH_N)));
+            let not_final_pubdigest = is_pubdigest.clone() * n(IS_PUBDIGEST);
+            t.assert_zero(not_final_pubdigest.clone() * (n(HASH_N) - v(HASH_N)));
+            // Unlike the indigest region's, this drain rule stays gated by bare `is_pubdigest`:
+            // the row after the last pubdigest row is the first instruction row, whose
+            // `HASH_LEFT` legitimately is (and, per `cpu_trace`'s `zero_vec` default, always
+            // is) 0 — so the chain and the local full-drain check below agree there instead of
+            // conflicting.
+            //
+            // Which of the two is load-bearing: the **local** one
+            // (`pubdigest_last · (HASH_LEFT − active_sum) = 0`). It is what forces the region to
+            // absorb exactly `HASH_N` words, and it has no substitute — the chain rule's
+            // application *on the last row* is the redundant one, because the first instruction
+            // row's `HASH_LEFT` carries no zero pin of its own (the `LEFT0..1` decomposition and
+            // every drain rule are gated on hash/digest rows; `cpu_trace`'s `zero_vec` default is
+            // a trace-builder fact, not a constraint). Drop the local rule and an over-declare
+            // attack opens: seed `HASH_N = 4k + 4` and both header `HASH_LEFT`s to match over a
+            // region that only absorbs `4k + 1` words, and the undrained remainder lands in that
+            // free cell — producing an `H_PUB` that is no honest `hash::public_digest` of
+            // anything, which bare `verify` would accept and only `verify_public` would catch.
+            // `tests/cheating.rs`'s
+            // `a_pubdigest_region_declaring_more_words_than_it_absorbs_is_rejected` is that exact
+            // witness (RED-verified against this line commented out). The ledger's Task 2
+            // "redundant drain rule" note had the two backwards.
+            t.assert_zero(is_pubdigest.clone() * (v(HASH_LEFT) - active_sum.clone() - n(HASH_LEFT)));
+            t.assert_zero(pubdigest_last.clone() * (v(HASH_LEFT) - active_sum.clone()));
+            t.assert_zero(not_final_pubdigest.clone() * (n(HASH_IDX) - v(HASH_IDX) - one.clone()));
+            t.assert_zero(not_final_pubdigest * (one.clone() - v(ACT0 + 3)));
             t.assert_zero(not_final_digest.clone() * (n(HASH_IDX) - v(HASH_IDX) - one.clone()));
             t.assert_zero(not_final_digest * (one.clone() - v(ACT0 + 3)));
             // CRITICAL — the old `t.assert_zero(digest_last.clone() * n(HASH_LEFT));` rule is
@@ -1132,11 +1404,12 @@ where
     }
 }
 
-pub fn public_values(pc_entry: u32, tier_log2: usize, outputs: &[u32; NUM_OUTPUTS], hc: &[u32; 8], hin: &[u32; 8]) -> Vec<F> {
+pub fn public_values(pc_entry: u32, tier_log2: usize, outputs: &[u32; NUM_OUTPUTS], hc: &[u32; 8], hin: &[u32; 8], hpub: &[u32; 8]) -> Vec<F> {
     let mut v = vec![F::from_u32(pc_entry), F::from_u64(tier_log2 as u64)];
     v.extend(outputs.iter().map(|o| F::from_u32(*o)));
     v.extend(hc.iter().map(|o| F::from_u32(*o)));
     v.extend(hin.iter().map(|o| F::from_u32(*o)));
+    v.extend(hpub.iter().map(|o| F::from_u32(*o)));
     v
 }
 
@@ -1239,7 +1512,15 @@ fn fill_input_digest_rows(v: &mut [F], offset: usize, base_pc: u32, salt: [u32; 
         let (i0, i1) = (blk.idx & 0xff, (blk.idx >> 8) & 0xff);
         r[IDX0] = F::from_u32(i0); r[IDX0 + 1] = F::from_u32(i1);
         range.range8(i0); range.range8(i1);
-        if i + 1 == n { r[INDIGEST_LAST] = F::ONE; }
+        if i + 1 == n {
+            r[INDIGEST_LAST] = F::ONE;
+            // Constraint set 6 (see `IPOUT0`'s doc comment, the exact `DPOUT0` deviation one
+            // region later): this row's own real permutation output goes into its own dedicated
+            // `IPOUT0..7` columns — `n(HS0 + k)` (the physical cell at row `offset + n`) now
+            // instead carries H_PUB's header seed, written by `fill_public_digest_rows` from
+            // `public_digest_rows`'s block-0 `state_in`.
+            for k in 0..8 { r[IPOUT0 + k] = blk.state_out[k]; }
+        }
     }
     if let Some(last) = blocks.last() {
         let words = crate::hash::split_digest([last.state_out[0], last.state_out[1], last.state_out[2], last.state_out[3]]);
@@ -1255,9 +1536,64 @@ fn fill_input_digest_rows(v: &mut [F], offset: usize, base_pc: u32, salt: [u32; 
                 r[IINV0 + j] = d.inverse();
             }
         }
-        // Seed the row right after the indigest region (the first ordinary/instruction row)
-        // with this block's final state — the same "no next event populates this" gap
-        // `fill_digest_rows` used to close for the program-digest boundary.
+    }
+    n
+}
+
+/// Constraint set 6: fills the `max(1, ⌈n_pub/4⌉)`-row pubdigest region
+/// (`hash::public_digest_row_count`) starting at cpu-table row `offset`
+/// (`program.digest_rows() + input_digest_row_count(n_in)`) — `fill_input_digest_rows` without
+/// the salt row, with `hash::public_digest_rows`/`IS_PUBDIGEST`/`PUBDIGEST_LAST`/`PHVL0..31`/
+/// `PHIMAX0..3`/`PINV0..3` in place of its indigest counterparts. Returns the number of rows it
+/// filled.
+///
+/// Unlike `fill_input_digest_rows` this one *does* seed the row after the region (the first
+/// ordinary instruction row) with the final sponge state: that row has no header of its own to
+/// carry, so the AIR reads H_PUB's own permutation output back through `n(HS0..7)` there rather
+/// than through a dedicated `POUT` column set.
+fn fill_public_digest_rows(v: &mut [F], offset: usize, base_pc: u32, public: &[u32], range: &mut RangeCounts) -> usize {
+    let blocks = crate::hash::public_digest_rows(public);
+    let n = blocks.len();
+    for (i, blk) in blocks.iter().enumerate() {
+        let r = &mut v[(offset + i) * WIDTH..(offset + i + 1) * WIDTH];
+        r[IS_PUBDIGEST] = F::ONE;
+        r[IS_REAL] = F::ONE;
+        r[CLK] = F::from_u32((offset + i) as u32);
+        r[PC] = F::from_u32(base_pc);
+        r[NEXT_PC] = F::from_u32(base_pc);
+        r[HASH_N] = F::from_u32(public.len() as u32);
+        r[HASH_LEFT] = F::from_u32(blk.left_before);
+        r[HASH_IDX] = F::from_u32(blk.idx);
+        for k in 0..8 { r[HS0 + k] = blk.state_in[k]; }
+        for k in 0..4 {
+            r[ACT0 + k] = F::from_bool(blk.active[k]);
+            r[HV0 + k] = if blk.active[k] { F::from_u32(blk.words[k]) } else { blk.state_in[k] };
+        }
+        let (l0, l1) = (blk.left_before & 0xff, (blk.left_before >> 8) & 0xff);
+        r[LEFT0] = F::from_u32(l0); r[LEFT0 + 1] = F::from_u32(l1);
+        range.range8(l0); range.range8(l1);
+        let (i0, i1) = (blk.idx & 0xff, (blk.idx >> 8) & 0xff);
+        r[IDX0] = F::from_u32(i0); r[IDX0 + 1] = F::from_u32(i1);
+        range.range8(i0); range.range8(i1);
+        if i + 1 == n { r[PUBDIGEST_LAST] = F::ONE; }
+    }
+    if let Some(last) = blocks.last() {
+        let words = crate::hash::split_digest([last.state_out[0], last.state_out[1], last.state_out[2], last.state_out[3]]);
+        let r = &mut v[(offset + n - 1) * WIDTH..(offset + n) * WIDTH];
+        for k in 0..8 {
+            let bl = limbs(words[k]);
+            for j in 0..4 { r[PHVL0 + 4 * k + j] = bl[j]; range.range8((words[k] >> (8 * j)) & 0xff); }
+        }
+        for j in 0..4usize {
+            let hi = words[2 * j + 1];
+            if hi == u32::MAX { r[PHIMAX0 + j] = F::ONE; } else {
+                let d = F::from_u32(hi) - F::from_u32(u32::MAX);
+                r[PINV0 + j] = d.inverse();
+            }
+        }
+        // Seed the row right after the pubdigest region (the first ordinary/instruction row)
+        // with this block's final state — nothing else populates it, and the `PHVL` pin above
+        // reads it as `n(HS0 + j)`.
         let r = &mut v[(offset + n) * WIDTH..(offset + n + 1) * WIDTH];
         for k in 0..8 { r[HS0 + k] = last.state_out[k]; }
     }
@@ -1269,18 +1605,20 @@ fn fill_input_digest_rows(v: &mut [F], offset: usize, base_pc: u32, salt: [u32; 
 /// digest-row prefix (`Program::digest_rows()` rows, `hash::program_digest_rows`) — the
 /// witness's own traversal of the whole program for `hc`, distinct from `events`'ordinary
 /// per-cycle rows, which now start `digest_rows` rows later (`CLK` shifted the same amount).
-pub fn cpu_trace(program: &Program, inputs: &[u32], salt: [u32; 4], events: &[CycleEvent], height: usize, range: &mut RangeCounts, nibble: &mut NibbleCounts) -> RowMajorMatrix<F> {
+pub fn cpu_trace(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 4], events: &[CycleEvent], height: usize, range: &mut RangeCounts, nibble: &mut NibbleCounts) -> RowMajorMatrix<F> {
     let digest_rows = program.digest_rows();
     let input_digest_rows = crate::hash::input_digest_row_count(inputs.len());
-    let offset = digest_rows + input_digest_rows;
+    let public_digest_rows = crate::hash::public_digest_row_count(public.len());
+    let offset = digest_rows + input_digest_rows + public_digest_rows;
     assert!(
         offset + events.len() < height,
-        "cpu table needs a padding row: {digest_rows} program-digest rows + {input_digest_rows} input-digest rows + {} cycles, height {height}",
+        "cpu table needs a padding row: {digest_rows} program-digest rows + {input_digest_rows} input-digest rows + {public_digest_rows} public-digest rows + {} cycles, height {height}",
         events.len()
     );
     let mut v = F::zero_vec(height * WIDTH);
     fill_digest_rows(&mut v, program, range);
     fill_input_digest_rows(&mut v, digest_rows, program.base_pc, salt, inputs, range);
+    fill_public_digest_rows(&mut v, digest_rows + input_digest_rows, program.base_pc, public, range);
     let mut written = [0u32; NUM_OUTPUTS];
     let mut hash_ptr_n: Option<(u32, u32)> = None;
     for (i, e) in events.iter().enumerate() {
@@ -1345,6 +1683,7 @@ pub fn cpu_trace(program: &Program, inputs: &[u32], salt: [u32; 4], events: &[Cy
             Some(Syscall::Halt) => r[SYS_HALT] = F::ONE,
             Some(Syscall::WriteOutput { slot, .. }) => { r[SYS_WRITE] = F::ONE; r[OUT_SEL0 + slot as usize] = F::ONE; written[slot as usize] += 1; }
             Some(Syscall::ReadInput { .. }) => r[SYS_READ] = F::ONE,
+            Some(Syscall::ReadPublic { .. }) => r[SYS_READ_PUB] = F::ONE,
             Some(Syscall::Poseidon2 { .. }) => r[SYS_HASH] = F::ONE,
             // M4.2: one row, and the pointer's own bounded byte decomposition — the same
             // `HP0..3`/`HP3_HI` columns (and the same `RANGE8`/`AND4` receipts) a `SYS_HASH`
@@ -1353,6 +1692,22 @@ pub fn cpu_trace(program: &Program, inputs: &[u32], salt: [u32; 4], events: &[Cy
             // belongs to the keccak chip, not to this row.
             Some(Syscall::Keccak { ptr }) => {
                 r[SYS_KECCAK] = F::ONE;
+                r[HASH_PTR] = F::from_u32(ptr);
+                let hpl = limbs(ptr);
+                for k in 0..4 { r[HP0 + k] = hpl[k]; range.range8((ptr >> (8 * k)) & 0xff); }
+                let hp3 = (ptr >> 24) & 0xff;
+                let (hp3_lo, hp3_hi) = (hp3 & 0xf, hp3 >> 4);
+                r[HP3_HI] = F::from_u32(hp3_hi);
+                nibble.and4(hp3_lo, 0);
+                nibble.and4(hp3_hi, 0xC);
+            }
+            // M4.4: one row, and the pointer's own bounded byte decomposition — the same
+            // `HP0..3`/`HP3_HI` columns (and the same `RANGE8`/`AND4` receipts) a `SYS_HASH` or
+            // `SYS_KECCAK` ecall row fills, since the AIR's "CRITICAL 1" bound is gated on all
+            // three selectors. Everything else about the call — the 64 rounds and the 32 memory
+            // accesses — belongs to the sha256 chip, not to this row.
+            Some(Syscall::Sha256 { ptr }) => {
+                r[SYS_SHA256] = F::ONE;
                 r[HASH_PTR] = F::from_u32(ptr);
                 let hpl = limbs(ptr);
                 for k in 0..4 { r[HP0 + k] = hpl[k]; range.range8((ptr >> (8 * k)) & 0xff); }

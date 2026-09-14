@@ -81,7 +81,9 @@ pub fn memory_trace(events: &[CycleEvent], clk_offset: u32, height: usize, count
         // not `accesses` because the cpu table does not send them — the keccak table does — but
         // this table records *every* access, whoever sends it, or the two sides of the `MEMORY`
         // bus stop balancing and a permuted word could be read back as something else.
-        for a in e.accesses.iter().chain(e.keccak_accesses.iter()) {
+        // M4.4: `sha256_accesses` are the same thing for the `SHA256` compression — 24 reads of
+        // the buffer at slot 0 and 8 state write-backs at slot 1, sent by the sha256 chip.
+        for a in e.accesses.iter().chain(e.keccak_accesses.iter()).chain(e.sha256_accesses.iter()) {
             // Audit ZM2 (2026-09-12): the sort key must be computed exactly the way the AIR
             // recomputes it — `SPACE·2^30 + ADDR` (`eval`'s `key_l`/`key_n`), i.e. `+`, not
             // `|`. With `|`, any RAM address `>= 2^30` (reachable through `POSEIDON2`
@@ -94,7 +96,8 @@ pub fn memory_trace(events: &[CycleEvent], clk_offset: u32, height: usize, count
             // memory. `+` is injective and monotone over every provable trace: register
             // addresses are `< 32` and RAM addresses stay `< 2^31` (ordinary word addresses are
             // `alu_out >> 2 < 2^30`; hash-derived ones `< 2^30 + 4099`; keccak-derived ones
-            // `< 0x3000_0000 + 50`).
+            // `< 0x3000_0000 + 50`; and M4.4's sha256-derived ones `< 0x3000_0000 + 24`, under the
+            // same cubic `HP3_HI ∈ {0,1,2}` bound on the syscall's pointer).
             rows.push((((a.space as u64) << KEY_SHIFT) + a.addr as u64, a.ts(clk_offset + e.clk) as u64, a.space, a.addr, a.value, a.is_write));
         }
     }

@@ -50,11 +50,31 @@ postcard = { version = "1", features = ["alloc"] }
 # The GPU backend lives in the sibling `circuits` checkout and is referenced by path, never
 # vendored: `circuits/` must sit beside `fullnode/` to build any of the features below.
 rand-zkvm-cuda = { path = "../../../circuits/rand-zkvm-cuda", optional = true }
+# M4.3/M4.4 (arrived with the constraint-set-6 re-vendor): the EVM and sBPF interpreter cores —
+# no_std libraries with their own workspace roots, compiled into the `evm`/`sbpf` guests on
+# riscv32im and run natively here. Normal dependencies, not dev-dependencies, because
+# `src/evm.rs`/`src/sbpf.rs` (the host sides: `HostRef`, the storage tree, the aligned
+# serializer) are part of this library — the vendored `tests/{evm,sbpf}_*.rs` link
+# `shrugg_zkvm` as an external crate. Same sibling-checkout rule as `rand-zkvm-cuda` above,
+# but NOT optional: `circuits/` must sit beside `fullnode/` for any build of this crate.
+evm-core = { path = "../../../circuits/guests-compiled/evm-core" }
+sbpf-core = { path = "../../../circuits/guests-compiled/sbpf-core" }
 
 [dev-dependencies]
 # M4.2: the vendored `tests/keccak.rs` states its known-answer vectors as hex strings. Same
 # version upstream's `[dev-dependencies]` pins.
 hex = "0.4"
+# M4.3/M4.4 (constraint-set-6 re-vendor), all at upstream's exact pins, host tests only, never
+# in a guest: `num-bigint` is the oracle for `evm-core`'s 256-bit arithmetic; `revm` (bare
+# interpreter, default-features off so the precompile crates' C dependencies stay out) the
+# oracle for its opcode semantics and gas; `sha2` (`compress`) the oracle for the SHA-256 chip
+# and `src/sha256.rs`; `solana-sbpf` (default-features off — its default `jit` is x86_64-only
+# and irrelevant) the differential oracle for `sbpf-core`'s interpreter and ELF loader, in
+# `tests/common/sbpf_oracle.rs`.
+num-bigint = "0.4"
+revm = { version = "=43.0.2", default-features = false, features = ["std"] }
+sha2 = { version = "=0.10.9", features = ["compress"] }
+solana-sbpf = { version = "=0.11.1", default-features = false }
 
 [features]
 default = []

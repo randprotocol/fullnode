@@ -18,7 +18,7 @@ impl MemAccess { pub fn ts(&self, clk: u32) -> u32 { 4 * clk + self.slot } }
 pub struct AluEvent { pub op: AluOp, pub a: u32, pub b: u32, pub c: u32 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Syscall { Halt, WriteOutput { slot: u32, word: u32 }, ReadInput { idx: u32, word: u32 }, Poseidon2 { ptr: u32, n: u32 }, Keccak { ptr: u32 } }
+pub enum Syscall { Halt, WriteOutput { slot: u32, word: u32 }, ReadInput { idx: u32, word: u32 }, ReadPublic { idx: u32, word: u32 }, Poseidon2 { ptr: u32, n: u32 }, Keccak { ptr: u32 }, Sha256 { ptr: u32 } }
 
 /// M4.2: the whole of one `KECCAK` syscall, on the single cpu row that issues it. `ptr` is the
 /// state's word address; `input`/`output` are the 50 words before and after the permutation, in
@@ -28,6 +28,15 @@ pub enum Syscall { Halt, WriteOutput { slot: u32, word: u32 }, ReadInput { idx: 
 /// `CycleEvent::keccak_accesses` rather than in `accesses`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeccakRow { pub ptr: u32, pub input: [u32; 50], pub output: [u32; 50] }
+
+/// M4.4: the whole of one `SHA256` syscall, on the single cpu row that issues it — `KeccakRow`
+/// one algorithm over. `ptr` is the buffer's word address and `clk` the row's cycle, together
+/// the two-element `SHA256` lookup the chip answers (`bus::SHA256`, `[clk, ptr]`); `block` is
+/// words `0..16` as read, `h_in` words `16..24` as read and `h_out` the compressed state written
+/// back over them. Like a `KECCAK` call this is one row, never a row group, so the compression's
+/// own memory traffic lives beside it in `CycleEvent::sha256_accesses` rather than in `accesses`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sha256Row { pub clk: u32, pub ptr: u32, pub block: [u32; 16], pub h_in: [u32; 8], pub h_out: [u32; 8] }
 
 /// Which row of a `POSEIDON2` syscall's row group a `CycleEvent` is, and the extra fields that
 /// row alone needs (the cpu table's hash-row columns, `docs/02-tables-and-buses.md`). `None` on
@@ -75,6 +84,15 @@ pub struct CycleEvent {
     /// The keccak table builds its own sends from its own columns (`PTR`, `CLK`, `IN`, `A`),
     /// not from this list — which is why nothing else reads it.
     pub keccak_accesses: Vec<MemAccess>,
+    /// M4.4: `Some` exactly on a `SHA256` row, `None` everywhere else.
+    pub sha256_row: Option<Sha256Row>,
+    /// M4.4: the `SHA256` compression's own 32 RAM accesses — 24 reads of the whole buffer at
+    /// slot 0, then 8 writes of the new state at slot 1 — kept apart from `accesses` for exactly
+    /// the reason `keccak_accesses` is: the *sha256* table, not the cpu table, is what will send
+    /// them on the `MEMORY` bus. `memory_trace`'s receiving side and the memory-height accounting
+    /// are wired up with the chip itself (M4.4 Tasks 3-4); this list is the emulator's record of
+    /// what they must agree on.
+    pub sha256_accesses: Vec<MemAccess>,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +103,10 @@ impl Execution { pub fn cycles(&self) -> usize { self.events.len() } }
 pub enum ExecError {
     OutOfCycles(usize), BadPc(u32), Misaligned(u32), BadSyscall(u32), OutputSlot(u32), DoubleWrite(u32),
     InputIndex(u32), Poseidon2WordCount(u32),
+    /// Constraint set 6: a `READ_PUBLIC` index at or past `n_pub`. `InputIndex`'s twin on the
+    /// public segment — the two spaces are indexed independently, so an index legal in one says
+    /// nothing about the other.
+    PublicIndex(u32),
     /// Audit ZM4 (2026-09-12): a `POSEIDON2` pointer at or above `2^30`. The cpu AIR bounds
     /// `HASH_PTR < 2^30` (the ecall row's `HP0..3`/`HP3_HI` decomposition — `MEM_ADDR`'s own
     /// `MA0..3`/`MA3_HI` bound, checked once and carried across the row-group). A pointer at or
@@ -99,6 +121,11 @@ pub enum ExecError {
     /// (`KECCAK_PTR_LIMIT` is 49 tighter still — see its doc), so there is no execution whose
     /// honest trace the AIR would be unable to prove.
     KeccakPtrOutOfRange(u32),
+    /// M4.4: a `SHA256` pointer past `SHA256_PTR_LIMIT`, refused for the same reason and on the
+    /// same terms as `KeccakPtrOutOfRange` — the cpu AIR bounds a `SYS_SHA256` row's pointer to
+    /// `ptr < 0x3000_0000`, and the emulator refuses at least those pointers so that every
+    /// execution it admits has an honest trace the AIR can prove.
+    Sha256PtrOutOfRange(u32),
 }
 
 /// The largest word address a `KECCAK` syscall may name: the state occupies `ptr ..
@@ -113,7 +140,13 @@ pub enum ExecError {
 /// key argument reasons about (`tables/memory.rs`).
 pub const KECCAK_PTR_LIMIT: u32 = 0x3000_0000 - KECCAK_WORDS;
 
-pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<Execution, ExecError> {
+/// The largest word address a `SHA256` syscall may name: the 24-word buffer occupies `ptr ..
+/// ptr + SHA256_WORDS`, so this limit keeps all of it below `0x3000_0000`. Strictly inside the
+/// AIR's own `ptr < 0x3000_0000` bound by `SHA256_WORDS - 1 = 23` pointers, for the reason
+/// `KECCAK_PTR_LIMIT`'s doc gives at length.
+pub const SHA256_PTR_LIMIT: u32 = 0x3000_0000 - SHA256_WORDS;
+
+pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: usize) -> Result<Execution, ExecError> {
     let mut regs = [0u32; 32];
     let mut ram: HashMap<u32, u32> = HashMap::new(); // word address -> value; unwritten reads are 0
     let mut outputs = [0u32; NUM_OUTPUTS];
@@ -205,6 +238,7 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
                         clk, pc, next_pc: pc, instr, dec, a, b, c: 0, alu_out, tgt, mem_addr, mem_val,
                         sys: Some(Syscall::Poseidon2 { ptr, n }), accesses: acc.clone(), alu: alu.clone(),
                         hash_row: Some(HashRow::Ecall { ptr, n }), keccak_row: None, keccak_accesses: Vec::new(),
+                        sha256_row: None, sha256_accesses: Vec::new(),
                     });
                     clk += 1;
 
@@ -237,6 +271,7 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
                             alu_out: 0, tgt: 0, mem_addr: 0, mem_val: 0, sys: None, accesses: racc, alu: Vec::new(),
                             hash_row: Some(HashRow::Absorb { idx, left_before: left, words, active, state_in, state_out }),
                             keccak_row: None, keccak_accesses: Vec::new(),
+                            sha256_row: None, sha256_accesses: Vec::new(),
                         });
                         state = state_out;
                         left -= cnt;
@@ -263,6 +298,7 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
                             clk, pc, next_pc: row_next_pc, instr, dec: Decoded::default(), a: 0, b: 0, c: 0,
                             alu_out: 0, tgt: 0, mem_addr: 0, mem_val: 0, sys: None, accesses: wacc, alu: Vec::new(),
                             hash_row: Some(HashRow::WriteOut { fin, words, state }), keccak_row: None, keccak_accesses: Vec::new(),
+                            sha256_row: None, sha256_accesses: Vec::new(),
                         });
                         clk += 1;
                     }
@@ -308,6 +344,49 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
                         sys: Some(Syscall::Keccak { ptr }), accesses: std::mem::take(&mut acc), alu: std::mem::take(&mut alu),
                         hash_row: None,
                         keccak_row: Some(KeccakRow { ptr, input, output }), keccak_accesses: kacc,
+                        sha256_row: None, sha256_accesses: Vec::new(),
+                    });
+                    clk += 1;
+                    regs[0] = 0;
+                    pc = pc.wrapping_add(4);
+                    pushed_own_rows = true;
+                } else if num == SYS_SHA256 {
+                    // One cpu row, one compression — `SYS_KECCAK`'s shape exactly. The 24 words
+                    // at `ptr` (block then state) are read at slot 0 and the eight new state
+                    // words written back at slot 1, so the reads sit at `ts = 4*clk` and the
+                    // writes at `4*clk + 1`, distinct from the ecall row's own register accesses
+                    // (`SPACE_REG`). These go in `sha256_accesses`, not `accesses`: the memory
+                    // table records them, but the *sha256* table sends them on the `MEMORY` bus.
+                    let ptr = arg0;
+                    // As for `KECCAK`: the cpu AIR bounds this pointer to `ptr < 0x3000_0000`, so
+                    // the emulator — the reference semantics — refuses anything past it rather
+                    // than produce a run whose honest trace cannot be proved. With the bound in
+                    // hand `ptr + 23` cannot wrap.
+                    if ptr > SHA256_PTR_LIMIT { return Err(ExecError::Sha256PtrOutOfRange(ptr)); }
+                    let mut buf = [0u32; crate::sha256::WORDS];
+                    let mut sacc = Vec::with_capacity(crate::sha256::WORDS + crate::sha256::STATE_WORDS);
+                    for k in 0..SHA256_WORDS {
+                        let addr = ptr + k;
+                        let w = *ram.get(&addr).unwrap_or(&0);
+                        buf[k as usize] = w;
+                        sacc.push(MemAccess { space: SPACE_RAM, addr, slot: 0, value: w, is_write: false });
+                    }
+                    let block: [u32; crate::sha256::BLOCK_WORDS] = buf[..crate::sha256::BLOCK_WORDS].try_into().unwrap();
+                    let h_in: [u32; crate::sha256::STATE_WORDS] = buf[crate::sha256::BLOCK_WORDS..].try_into().unwrap();
+                    let mut h_out = h_in;
+                    crate::sha256::compress(&mut h_out, &block);
+                    // Only the state is written back; words `0..16` keep the message block, which
+                    // is what lets a guest reuse the buffer's block slot for the next call.
+                    for (i, w) in h_out.iter().enumerate() {
+                        let addr = ptr + crate::sha256::BLOCK_WORDS as u32 + i as u32;
+                        ram.insert(addr, *w);
+                        sacc.push(MemAccess { space: SPACE_RAM, addr, slot: 1, value: *w, is_write: true });
+                    }
+                    events.push(CycleEvent {
+                        clk, pc, next_pc: pc.wrapping_add(4), instr, dec, a, b, c: 0, alu_out, tgt, mem_addr, mem_val,
+                        sys: Some(Syscall::Sha256 { ptr }), accesses: std::mem::take(&mut acc), alu: std::mem::take(&mut alu),
+                        hash_row: None, keccak_row: None, keccak_accesses: Vec::new(),
+                        sha256_row: Some(Sha256Row { clk, ptr, block, h_in, h_out }), sha256_accesses: sacc,
                     });
                     clk += 1;
                     regs[0] = 0;
@@ -328,25 +407,31 @@ pub fn execute(program: &Program, inputs: &[u32], max_cycles: usize) -> Result<E
                             c = word;
                             Syscall::ReadInput { idx: arg0, word }
                         }
+                        SYS_READ_PUBLIC => {
+                            let word = *public.get(arg0 as usize).ok_or(ExecError::PublicIndex(arg0))?;
+                            c = word;
+                            Syscall::ReadPublic { idx: arg0, word }
+                        }
                         other => return Err(ExecError::BadSyscall(other)),
                     });
                 }
             }
         }
         if pushed_own_rows {
-            // `POSEIDON2`/`KECCAK` already pushed their rows above (including their own
+            // `POSEIDON2`/`KECCAK`/`SHA256` already pushed their rows above (including their own
             // register/memory-write bookkeeping and `regs[0] = 0`/`pc` advance) — do not fall
             // through to the single-event push below, which would push a stray extra row.
             continue;
         }
-        let writes = dec.writes_rd == 1 || matches!(sys, Some(Syscall::ReadInput { .. }));
+        let writes = dec.writes_rd == 1
+            || matches!(sys, Some(Syscall::ReadInput { .. }) | Some(Syscall::ReadPublic { .. }));
         if writes {
             regs[dec.rd as usize] = c;
             acc.push(MemAccess { space: SPACE_REG, addr: dec.rd, slot: SLOT_W, value: c, is_write: true });
         }
         regs[0] = 0;
         let halted = matches!(sys, Some(Syscall::Halt));
-        events.push(CycleEvent { clk, pc, next_pc, instr, dec, a, b, c, alu_out, tgt, mem_addr, mem_val, sys, accesses: acc, alu, hash_row: None, keccak_row: None, keccak_accesses: Vec::new() });
+        events.push(CycleEvent { clk, pc, next_pc, instr, dec, a, b, c, alu_out, tgt, mem_addr, mem_val, sys, accesses: acc, alu, hash_row: None, keccak_row: None, keccak_accesses: Vec::new(), sha256_row: None, sha256_accesses: Vec::new() });
         clk += 1;
         if halted { return Ok(Execution { events, outputs, halted: true }); }
         pc = next_pc;

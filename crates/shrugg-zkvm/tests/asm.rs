@@ -99,3 +99,16 @@ fn call_keccak_passes_the_syscall_number_and_a_word_address() {
     assert_eq!(seq, vec![addi(REG_A7, 0, SYS_KECCAK as i32), addi(REG_A0, 0, 0x400 / 4), Instr::Ecall]);
     for i in &seq { assert_eq!(Instr::decode(i.encode()).unwrap(), *i); }
 }
+
+/// Constraint set 6: `ops::read_public` is the `READ_PUBLIC` syscall's sequence — number 6 in
+/// `a7`, the index in `a0`, `ecall` — and the emulator answers it from the public segment.
+#[test]
+fn ops_read_public_assembles_to_a7_six_and_a0_idx() {
+    use shrugg_zkvm::asm::{ops::read_public, Assembler};
+    let mut a = Assembler::new(0);
+    a.extend(read_public(9));
+    a.extend(shrugg_zkvm::asm::ops::halt());
+    let p = a.assemble();
+    let e = shrugg_zkvm::emulator::execute(&p, &[], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 77], 100).unwrap();
+    assert!(e.events.iter().any(|ev| matches!(ev.sys, Some(shrugg_zkvm::emulator::Syscall::ReadPublic { idx: 9, word: 77 }))));
+}

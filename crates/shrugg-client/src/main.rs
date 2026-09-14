@@ -696,7 +696,7 @@ async fn main() -> Result<()> {
             // difference means the transcript is not what produced that receipt.
             let pid = Hash::from_hex(receipt["program"].as_str().unwrap_or_default()).context("receipt program id")?;
             let (base_pc, words) = rpc.program_code(&pid).await?.context("the program is no longer on chain")?;
-            let exec = emulator::execute(&Program { base_pc, words }, &inputs, Tier(*TIERS.last().expect("a tier")).max_cycles())
+            let exec = emulator::execute(&Program { base_pc, words }, &inputs, &[], Tier(*TIERS.last().expect("a tier")).max_cycles())
                 .map_err(|e| anyhow::anyhow!("re-running the program on these inputs failed: {e:?}"))?;
             println!("emulator outputs: {:?}\nreceipt outputs:  {}", exec.outputs, receipt["outputs"]);
             // The verdict is the exit status, not a line of output: whoever runs this in a script is

@@ -10,6 +10,14 @@
 //! blanket `dead_code` allow.
 #![allow(dead_code)]
 
+/// M4.4 Task 5: the hand-built ELF64 fixtures `tests/sbpf_elf.rs` and `tests/sbpf_abi.rs` share.
+pub mod sbpf_elf_builder;
+
+/// M4.4 Task 5: `solana-sbpf` 0.11.1 as the differential oracle for `sbpf-core`. It lives under
+/// `common` rather than in `shrugg_zkvm::sbpf` because it is a dev-dependency and `src/sbpf.rs` is
+/// library code; only `tests/sbpf_interp.rs` and `tests/sbpf_elf.rs` use it.
+pub mod sbpf_oracle;
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// The panic `p3-batch-stark`'s debug constraint checker raises when a row violates a

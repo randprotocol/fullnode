@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # deploy/sync-zkvm.sh — copy the research zkVM into crates/shrugg-zkvm. Run from the repo root.
 #
-# Local additions (executor.rs, codec.rs, address.rs, the extended guests.rs and asm.rs,
-# tests/executor.rs, tests/shielded.rs) are preserved; machine.rs gets a
-# small post-sync patch exposing log_ext_degrees_pub (M4.2: now a five-argument
-# (tier, program_log_height, input_log_height, keccak_log_height, mem_log_height) function —
-# see the M4.2 patch comment below). tests/backend.rs,
-# tests/cheating.rs, tests/emulator.rs, tests/isa.rs, tests/keccak.rs, tests/tables.rs and
-# tests/zk.rs are vendored wholesale, as before.
+# Local additions (executor.rs, codec.rs, address.rs, call_envelope.rs, the extended guests.rs
+# and asm.rs, tests/executor.rs, tests/shielded.rs, tests/call_envelope.rs) are preserved;
+# machine.rs gets a small post-sync patch exposing log_ext_degrees_pub (constraint set 6: now a
+# seven-argument (tier, program_log_height, input_log_height, keccak_log_height,
+# sha256_log_height, public_log_height, mem_log_height) function — see the cs6 patch comment
+# below). tests/asm.rs, tests/backend.rs, tests/cheating.rs, tests/e2e.rs, tests/emulator.rs,
+# tests/isa.rs, tests/keccak.rs, tests/sha256.rs, tests/tables.rs, tests/zk.rs, the four
+# tests/evm_*.rs, the four tests/sbpf_*.rs and tests/common/ are vendored wholesale, as before.
 #
 # Shielded pool S1: the note layer — `notes.rs`, `viewing.rs`, `ledger.rs` — IS vendored now. The
 # node's shielded pool is built on exactly the research crate's note commitments, nullifiers,
@@ -29,15 +30,17 @@
 # `hash.rs` IS vendored (M3.4): it is core, not note-layer-specific — the program digest `hc`
 # `isa::Program::digest` computes and the `POSEIDON2` syscall's reference sponge both live there.
 # M4.1 added a second sponge, `input_digest` (`H_IN`, the salted private-input commitment), which
-# reads a second domain tag the same way `program_digest` does. Both tags live in `notes.rs`
-# upstream (`notes::domain::HC` and `notes::domain::IN`) and `tables/cpu.rs`'s matching in-circuit
-# copies of them; both are still patched below to local `hash::HC_DOMAIN` / `hash::IN_DOMAIN`
-# constants. That patch predates the note layer being vendored and is deliberately kept rather
-# than reverted: it is two `sed` lines plus a two-constant insertion, whereas reverting it would
-# mean re-patching `hash.rs`/`tables/cpu.rs` in the opposite direction on every resync. What keeps
-# the two copies honest is `tests/shielded.rs`, which asserts `notes::domain::HC == hash::HC_DOMAIN`
-# and `notes::domain::IN == hash::IN_DOMAIN` — now that `notes.rs` is vendored, a drifting tag is a
-# test failure on this side rather than a silent divergence.
+# reads a second domain tag the same way `program_digest` does, and constraint set 6 a third,
+# `public_digest` (`H_PUB`, the unsalted public-segment commitment, tag `notes::domain::PUB`).
+# All three tags live in `notes.rs` upstream (`notes::domain::{HC, IN, PUB}`) and
+# `tables/cpu.rs`'s matching in-circuit copies of them; all are still patched below to local
+# `hash::{HC_DOMAIN, IN_DOMAIN, PUB_DOMAIN}` constants. That patch predates the note layer being
+# vendored and is deliberately kept rather than reverted: it is one `sed` line per tag plus a
+# three-constant insertion, whereas reverting it would mean re-patching
+# `hash.rs`/`tables/cpu.rs` in the opposite direction on every resync. What keeps the two copies
+# honest is `tests/shielded.rs`, which asserts all three `notes::domain` tags equal the
+# `hash::*_DOMAIN` constants — now that `notes.rs` is vendored, a drifting tag is a test failure
+# on this side rather than a silent divergence.
 #
 # M4.1 also vendors `tables/input.rs` (new — the salted-input-commitment witness table) and picks
 # up `isa.rs`'s new `Program::from_flat_binary`/`to_flat_binary` loader automatically, since
@@ -75,6 +78,44 @@
 # `guests::keccak_demo()` and `asm::call_keccak()` are mirrored by hand into the local copies —
 # the vendored `tests/{asm,cheating,e2e,emulator}.rs` call all three by name.
 #
+# Constraint set 6 (upstream 0200877) carries three upstream milestones and changes five things
+# this script has to know about. (1) M4.3 (the EVM guest) and M4.4 (the sha256 table and the
+# sBPF guest) ride along in the rsyncs: `src/evm.rs`, `src/sbpf.rs`, `src/sha256.rs`,
+# `tables/sha256.rs`, `tests/{evm_u256,evm_storage,evm_interp,evm_abi}.rs`,
+# `tests/{sbpf_isa,sbpf_interp,sbpf_elf,sbpf_abi}.rs`, `tests/sha256.rs` and
+# `tests/common/{sbpf_oracle,sbpf_elf_builder}.rs`. `src/lib.rs` is hand-maintained, so
+# `pub mod {evm,sbpf,sha256}` go in by hand, and `crates/shrugg-zkvm/Cargo.toml` needs
+# upstream's pins: `evm-core`/`sbpf-core` as *path* dependencies (`../../../circuits/
+# guests-compiled/{evm-core,sbpf-core}` — beside the repo, like `rand-zkvm-cuda`, but NOT
+# optional: `src/evm.rs`/`src/sbpf.rs` are library code) and the dev-dependencies
+# `num-bigint = "0.4"`, `revm = "=43.0.2"` (default-features off, `std` on), `sha2 = "=0.10.9"`
+# (`compress`), `solana-sbpf = "=0.11.1"` (default-features off). (2) The compiled-guest copy
+# step is now four guests (fib, keccak256, evm, sbpf) plus the two assets the vendored sources
+# `include!` directly: `evm/contracts/erc20.runtime.hex` (`src/evm.rs`) and
+# `sbpf/programs/spl_token.so` (`src/sbpf.rs`). Those includes — and `tests/isa.rs`'s
+# `keccak256.bin` one, which arrived with M4.3's image container — spell the path
+# `../../guests-compiled/`, upstream's two-levels-up layout; a sed below rewrites them to this
+# crate's shallower `../guests-compiled/`, the same adjustment `guests.rs` has always had by
+# hand. `tests/sbpf_elf.rs` reads the same `spl_token.so` at *runtime* from
+# `env!("CARGO_MANIFEST_DIR")` + `/../guests-compiled/...` and gets the same adjustment spelled
+# `"/../guests-compiled/` -> `"/guests-compiled/` (this crate's `guests-compiled/` is inside the
+# crate root, not beside it). (3) Constraint set 6 proper: a ninth **mandatory** table, `tables/public.rs` (the
+# public input segment, `PUBLIC_DIGEST`/`PUBLIC_READ` buses, `SYS_READ_PUBLIC = 6`, `H_PUB` in
+# `pv::PUB0..7` — unsalted, so `Machine::verify_public(hc, public_words, proof)` can recompute
+# it), `pv::NUM` 26 -> 34 and cpu `col::WIDTH` 224 -> 275, all of which ride along in the
+# rsyncs. `guests.rs`/`asm.rs` being excluded means `guests::compiled::{evm,sbpf}()`,
+# `guests::public_echo()`, `guests::sha256_demo()` + `SHA256_DEMO_MSG` and
+# `asm::ops::{read_public,call_sha256}()` are mirrored by hand into the local copies, same as
+# M4.2's mirrors. (4) `Machine::verifier_key` is a **6-tuple** now, `(tier,
+# program_log_height, input_log_height, keccak_log_height, sha256_log_height,
+# public_log_height)` — the `log_ext_degrees_pub` patch below is re-anchored on the new
+# signature line and its wrapper forwards all seven of `log_ext_degrees`'s arguments.
+# (5) The domain-tag inlining gains a third tag: `hash::public_digest`'s header and
+# `tables/cpu.rs`'s pubdigest region read `crate::notes::domain::PUB` (= 15), patched below to
+# `hash::PUB_DOMAIN` exactly the way `HC`/`IN` already were. One more exclusion joined the
+# rsyncs: `call_envelope.rs` (src and tests) is node-local S3 code that arrived after the cs5
+# sync script's exclude list was written — without it `--delete` would remove both files.
+#
 # The CUDA backend is *not* vendored either: crates/shrugg-zkvm depends on it by path, as
 # ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building
 # with --features cuda or --features mock-cuda.
@@ -84,18 +125,21 @@ DST=crates/shrugg-zkvm
 mkdir -p "$DST/src" "$DST/tests"
 rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude rust-toolchain.toml \
       --exclude executor.rs --exclude codec.rs --exclude guests.rs --exclude asm.rs \
-      --exclude address.rs --exclude arx.rs \
+      --exclude address.rs --exclude arx.rs --exclude call_envelope.rs \
       --exclude lib.rs --exclude main.rs "$SRC/src/" "$DST/src/"
-rsync -a --delete --exclude executor.rs --exclude shielded.rs \
+rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_envelope.rs \
       --exclude viewing.rs --exclude bundle.rs "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local
 # `guests::compiled::{fib,keccak256}()` (see the header comment) need — `fib.bin` since M4.1,
-# `keccak256.bin` since M4.2. They live beside `research/`, not inside it, so
-# `$SRC/../guests-compiled` — fail loudly rather than leaving a stale/missing binary that only
-# shows up as a runtime `include_bytes!` compile error far from this script.
-mkdir -p "$DST/guests-compiled/bin"
-for GUEST in fib keccak256; do
+# `keccak256.bin` since M4.2. Constraint set 6 extends the set to four: `evm.bin` (M4.3) and
+# `sbpf.bin` (M4.4) join them, plus the two assets the *vendored* sources `include!` directly —
+# `evm/contracts/erc20.runtime.hex` (`src/evm.rs`'s test contract) and
+# `sbpf/programs/spl_token.so` (`src/sbpf.rs`'s `SPL_TOKEN_ELF`). They live beside `research/`,
+# not inside it, so `$SRC/../guests-compiled` — fail loudly rather than leaving a stale/missing
+# binary that only shows up as a runtime `include_bytes!` compile error far from this script.
+mkdir -p "$DST/guests-compiled/bin" "$DST/guests-compiled/evm/contracts" "$DST/guests-compiled/sbpf/programs"
+for GUEST in fib keccak256 evm sbpf; do
   BIN_SRC="$SRC/../guests-compiled/bin/$GUEST.bin"
   if [ ! -f "$BIN_SRC" ]; then
     echo "sync-zkvm.sh: expected compiled guest binary at $BIN_SRC — not found" >&2
@@ -104,21 +148,49 @@ for GUEST in fib keccak256; do
   cp "$BIN_SRC" "$DST/guests-compiled/bin/$GUEST.bin"
   [ -f "$BIN_SRC.sha256" ] && cp "$BIN_SRC.sha256" "$DST/guests-compiled/bin/$GUEST.bin.sha256" || true
 done
+for ASSET in evm/contracts/erc20.runtime.hex sbpf/programs/spl_token.so; do
+  if [ ! -f "$SRC/../guests-compiled/$ASSET" ]; then
+    echo "sync-zkvm.sh: expected guest asset at $SRC/../guests-compiled/$ASSET — not found" >&2
+    exit 1
+  fi
+  cp "$SRC/../guests-compiled/$ASSET" "$DST/guests-compiled/$ASSET"
+done
 # rand_zkvm -> shrugg_zkvm, but the *dependency* rand_zkvm_cuda keeps its own name (it is an
 # unmodified external crate), so park it behind a placeholder while the rename runs.
 grep -rl "rand_zkvm" "$DST/src" "$DST/tests" | xargs -I{} sed -i '' \
       -e 's/rand_zkvm_cuda/@@RAND_ZKVM_CUDA@@/g' \
       -e 's/rand_zkvm/shrugg_zkvm/g' \
       -e 's/@@RAND_ZKVM_CUDA@@/rand_zkvm_cuda/g' {} 2>/dev/null || true
-# M4.2: `verifier_key`'s key grew a fourth component — it is `(tier, program_log_height,
-# input_log_height, keccak_log_height)` now, the keccak table's declared height joining the
-# program table's (M3.4) and the input table's (M4.1) as proof-declared key material, with
-# `keccak_log_height == 0` a legitimate value meaning "this proof declares no keccak table".
-# `log_ext_degrees` takes a *fifth* argument on top of those four, the declared `mem_log_height`:
-# `verifier_key` deliberately does not take it (every valid memory height yields the same
-# `CommonData` — see that function's doc comment) but the degree-bit vector does depend on it, and
-# `Machine::verify` compares `proof.batch.degree_bits` against the five-argument call. The wrapper
-# therefore forwards all five, or the chain executor's degree-bits pre-check
+# Constraint set 6 (M4.3/M4.4): three vendored files `include!` assets from upstream's
+# `guests-compiled/`, spelled `../../guests-compiled/` (two levels up from `research/src` and
+# `research/tests`). This crate's layout is one level shallower — the copy step above puts the
+# same files under `crates/shrugg-zkvm/guests-compiled/` — so the paths become
+# `../guests-compiled/`, the same adjustment hand-maintained `guests.rs` has always had. A
+# no-match here means upstream moved the asset; the include would then fail at compile time
+# naming the file, which is loud enough — so this patches whatever matches and asserts nothing.
+for f in "$DST/src/evm.rs" "$DST/src/sbpf.rs" "$DST/tests/isa.rs"; do
+  if [ -f "$f" ] && grep -q '\.\./\.\./guests-compiled/' "$f"; then
+    sed -i '' 's|\.\./\.\./guests-compiled/|../guests-compiled/|g' "$f"
+  fi
+done
+# The same adjustment once more, spelled differently: `tests/sbpf_elf.rs` reads the SPL Token
+# ELF at runtime from `env!("CARGO_MANIFEST_DIR")` + `/../guests-compiled/...` — one level up
+# from upstream's `research/` crate root, but this crate's `guests-compiled/` is *inside* the
+# crate root, so the vendored copy drops the `..` (caught by
+# `spl_token_elf_loads_with_relocations_applied` failing with a plain file-not-found).
+if [ -f "$DST/tests/sbpf_elf.rs" ] && grep -q '"/\.\./guests-compiled/' "$DST/tests/sbpf_elf.rs"; then
+  sed -i '' 's|"/\.\./guests-compiled/|"/guests-compiled/|g' "$DST/tests/sbpf_elf.rs"
+fi
+# Constraint set 6: `verifier_key`'s key grew to six components — it is `(tier,
+# program_log_height, input_log_height, keccak_log_height, sha256_log_height,
+# public_log_height)` now, M4.4's sha256 table joining M4.2's keccak one as an optional
+# proof-declared height (`0` = no such table) and cs6's public table as a *mandatory* one
+# (every proof commits to a public segment, even an empty one). `log_ext_degrees` takes a
+# *seventh* argument on top of those six, the declared `mem_log_height`: `verifier_key`
+# deliberately does not take it (every valid memory height yields the same `CommonData` — see
+# that function's doc comment) but the degree-bit vector does depend on it, and
+# `Machine::verify` compares `proof.batch.degree_bits` against the seven-argument call. The
+# wrapper therefore forwards all seven, or the chain executor's degree-bits pre-check
 # (`ZkExecutor::decode_and_check`) could not reproduce what `verify` checks.
 #
 # The anchor is the exact `verifier_key` signature line — patched *in front of* it, so the wrapper
@@ -129,20 +201,20 @@ grep -rl "rand_zkvm" "$DST/src" "$DST/tests" | xargs -I{} sed -i '' \
 if ! grep -q "log_ext_degrees_pub" "$DST/src/machine.rs"; then
   python3 - "$DST/src/machine.rs" <<'PY'
 import sys; p=sys.argv[1]; s=open(p).read()
-anchor = "    pub fn verifier_key(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8) -> Arc<CommonData<Config>> {"
+anchor = "    pub fn verifier_key(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, public_log_height: u8) -> Arc<CommonData<Config>> {"
 wrapper = (
     "    /// Public wrapper used by the chain executor to check a proof's degree bits. Takes the\n"
-    "    /// declared `mem_log_height` as well as `verifier_key`'s four key components: the degree\n"
+    "    /// declared `mem_log_height` as well as `verifier_key`'s six key components: the degree\n"
     "    /// vector depends on it even though the verifier key does not, and `verify` compares\n"
     "    /// `proof.batch.degree_bits` against exactly this call.\n"
-    "    pub fn log_ext_degrees_pub(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, mem_log_height: u8) -> Vec<usize> "
-    "{ self.log_ext_degrees(tier, program_log_height, input_log_height, keccak_log_height, mem_log_height) }\n\n"
+    "    pub fn log_ext_degrees_pub(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, public_log_height: u8, mem_log_height: u8) -> Vec<usize> "
+    "{ self.log_ext_degrees(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, public_log_height, mem_log_height) }\n\n"
 )
 assert anchor in s, (
     "machine.rs's verifier_key signature no longer matches the anchor this script patches on "
-    "(expected the M4.2 4-arg (tier, program_log_height, input_log_height, keccak_log_height) "
-    "form) — update deploy/sync-zkvm.sh's log_ext_degrees_pub patch to match the new signature "
-    "before re-running"
+    "(expected the constraint-set-6 6-arg (tier, program_log_height, input_log_height, "
+    "keccak_log_height, sha256_log_height, public_log_height) form) — update "
+    "deploy/sync-zkvm.sh's log_ext_degrees_pub patch to match the new signature before re-running"
 )
 s = s.replace(anchor, wrapper + anchor, 1)
 open(p, 'w').write(s)
@@ -150,32 +222,40 @@ PY
 fi
 # M3.4/M4.1: `hash.rs`'s program-digest header and `tables/cpu.rs`'s in-circuit copy of the same
 # constant both read `crate::notes::domain::HC` upstream; M4.1 added a second such pair for the
-# input digest, `crate::notes::domain::IN`. The patch predates `notes.rs` being vendored and is
-# kept rather than reversed (see the header comment above): two `sed` lines and one inserted
-# constant block, versus re-patching in the opposite direction on every resync.
-if grep -Eq "crate::notes::domain::(HC|IN)" "$DST/src/hash.rs" "$DST/src/tables/cpu.rs" 2>/dev/null; then
+# input digest, `crate::notes::domain::IN`. Constraint set 6 added a third: `crate::notes::
+# domain::PUB` (= 15), in `hash.rs`'s `public_digest` header and `tables/cpu.rs`'s pubdigest
+# region (the in-circuit copy of the same constant). The patch predates `notes.rs` being
+# vendored and is kept rather than reversed (see the header comment above): one `sed` line per
+# tag and one inserted constant block, versus re-patching in the opposite direction on every
+# resync.
+if grep -Eq "crate::notes::domain::(HC|IN|PUB)" "$DST/src/hash.rs" "$DST/src/tables/cpu.rs" 2>/dev/null; then
   grep -rl "crate::notes::domain::HC" "$DST/src" | xargs -I{} sed -i '' 's/crate::notes::domain::HC/crate::hash::HC_DOMAIN/g' {}
   # No word-boundary anchor needed: `domain::IN` has no colliding sibling constant (NK, PK, NF,
-  # CM, OVK, KEM_SEED, NODE, HC, OUT, IN, TEST — nothing else starts with "IN"), and BSD sed
-  # (macOS) does not support `\b` — a `\b`-anchored pattern here would silently fail to match at
-  # all rather than fail loudly, which is worse than the (nonexistent) collision risk it guards.
+  # CM, OVK, KEM_SEED, NODE, HC, OUT, IN, BUNDLE, STORAGE_LEAF, EVM_OUT, SBPF_OUT, PUB, TEST —
+  # nothing else starts with "IN"), and BSD sed (macOS) does not support `\b` — a `\b`-anchored
+  # pattern here would silently fail to match at all rather than fail loudly, which is worse
+  # than the (nonexistent) collision risk it guards. `domain::PUB` is collision-free the same
+  # way (nothing else starts with "PUB").
   grep -rl "crate::notes::domain::IN" "$DST/src" | xargs -I{} sed -i '' 's/crate::notes::domain::IN/crate::hash::IN_DOMAIN/g' {}
+  grep -rl "crate::notes::domain::PUB" "$DST/src" | xargs -I{} sed -i '' 's/crate::notes::domain::PUB/crate::hash::PUB_DOMAIN/g' {}
 fi
 if ! grep -q "const HC_DOMAIN" "$DST/src/hash.rs"; then
   python3 - "$DST/src/hash.rs" <<'PY'
 import sys; p=sys.argv[1]; s=open(p).read()
 anchor = "use std::sync::OnceLock;\n"
 const = anchor + (
-    "\n/// `notes::domain::HC` (= 8) and `notes::domain::IN` (= 10), inlined: `program_digest`/\n"
-    "/// `input_digest` below and `tables::cpu`'s digest-row prefixes both need these exact domain\n"
-    "/// tags to agree, and this patch predates `notes.rs` being vendored — it is kept rather than\n"
-    "/// reversed; see `deploy/sync-zkvm.sh`'s header comment.\n"
+    "\n/// `notes::domain::HC` (= 8), `notes::domain::IN` (= 10) and `notes::domain::PUB` (= 15),\n"
+    "/// inlined: `program_digest`/`input_digest`/`public_digest` below and `tables::cpu`'s\n"
+    "/// digest-row prefixes both need these exact domain tags to agree, and this patch predates\n"
+    "/// `notes.rs` being vendored — it is kept rather than reversed; see `deploy/sync-zkvm.sh`'s\n"
+    "/// header comment.\n"
     "///\n"
     "/// `pub`, not `pub(crate)`: `tests/shielded.rs` asserts these equal the vendored\n"
-    "/// `notes::domain::HC` / `notes::domain::IN`, which is what keeps the two copies from drifting\n"
-    "/// across a resync, and an integration test is a separate crate.\n"
+    "/// `notes::domain::HC` / `notes::domain::IN` / `notes::domain::PUB`, which is what keeps the\n"
+    "/// two copies from drifting across a resync, and an integration test is a separate crate.\n"
     "pub const HC_DOMAIN: u32 = 8;\n"
     "pub const IN_DOMAIN: u32 = 10;\n"
+    "pub const PUB_DOMAIN: u32 = 15;\n"
 )
 assert anchor in s, "hash.rs no longer has the expected anchor line; update the sync script's patch"
 s = s.replace(anchor, const, 1)
