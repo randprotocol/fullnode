@@ -131,6 +131,13 @@ grew `shrugg_getCompactBlocks`, batch requests (cap 20, notifications refused
 `-32600`) and a WebSocket `newHeads` subscription on the same port;
 `docs/rpc.md`'s changelog is the client-facing list.
 
+Same day, the key property narrowed: a node may hold **viewing keys** — never
+spend keys; the RPC layer has no type for those — for explorer-side scanning
+(`shrugg_importViewingKey` / `shrugg_getViewingNotes`, in memory, 64 keys, 10 000
+leaves a call, cleared at restart) and answer one-call payment proofs
+(`shrugg_checkTransaction`, stateless). An imported key can disclose notes but
+never move them.
+
 ### Load-bearing consensus invariants (do not regress)
 
 - **The commit rule needs three consecutive-view QCs.** Any relaxation

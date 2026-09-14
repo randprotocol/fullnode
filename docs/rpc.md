@@ -35,6 +35,13 @@ index for it (phase S3, `docs/bridge.md`), so the bridge methods below report th
 *public* state — guardians, emitters, the asset registry, the outbound burn log — and no
 per-address balance. `shrugg_getAssetBalance` is gone for good.
 
+**A node can now hold viewing keys — never spend keys.** `shrugg_importViewingKey` hands the node
+a viewing key so it scans on the holder's behalf (the Zcash `z_importviewingkey` analogue, for
+explorers). That is the one exception to "the node never holds a key", and it is deliberate: the
+key arrives in memory only, is capped at 64 per node, dies with the process, and can disclose
+notes but never move them. It also means the RPC port should be treated as key-bearing once an
+import has happened: bind it where you would bind a wallet, not to the public internet.
+
 ## Batches
 
 The body of a POST to `/` is either one request object or an **array of at most 20** of them. A
@@ -185,6 +192,69 @@ discloses something about the caller — see `docs/shielded.md` §6.
 Params: `[]`. Result: `{ "next_index": 41, "root": "6b1d…c4", "nullifiers": 12 }` — the leaf count
 (the index the next note will get), the current root, and how many notes have been spent.
 
+### `shrugg_importViewingKey`
+Params: `[viewing_key]` or `[viewing_key, rescan_from_height]`, where `viewing_key` is a party
+viewing key's `nk` as 64 hex characters and `rescan_from_height` is the block height to start
+watching from (default 0, the whole chain). Result:
+
+```json
+{ "imported": true, "rescan_from_height": 0, "viewing_keys": 3 }
+```
+
+The Zcash `z_importviewingkey` analogue (`docs/rpc-comparison.md` §4), and the one deliberate
+exception to this chain's "the node never holds a key" property: after this call the node holds
+`viewing_key` **in memory** and trial-decrypts for it — which is what a block explorer runs a
+node for. What it can never hold is a *spend* key (the RPC layer has no type for one), so an
+imported key changes what compromising this process would disclose — the notes that key opens,
+which its holder can already see — and never what it could spend. **Nothing is written to disk:**
+a restart clears every import, and the operator's orchestration re-imports on boot.
+
+Imports are bounded and idempotent:
+
+- At most **64** keys per node (`viewing_keys` in the reply is the live count, also in
+  `shrugg_status`). The 65th distinct key is `-32000`; a key already held is a no-op
+  (`"imported": false`) — in particular it does **not** restart the scan, so a rescan from an
+  earlier height is a restart plus re-import, not a second call.
+- A `rescan_from_height` in the future is accepted and simply matches nothing until the chain
+  reaches it.
+- Import itself never scans: the scan is lazy, driven by `shrugg_getViewingNotes`.
+
+Errors: `-32602` for a malformed key.
+
+### `shrugg_getViewingNotes`
+Params: `[viewing_key]` or `[viewing_key, from_index, limit]` — `from_index` pages the matched
+notes by leaf index (default 0), `limit` caps the page (default and maximum 1000, as everywhere).
+Result:
+
+```json
+{ "scanned_index": 10041, "next_index": 10041, "complete": true,
+  "notes": [
+    { "index": 40, "cm": "2a9f…07", "height": 37, "role": "received",
+      "note": { "pk": "…", "from": "…", "amount": "1500000000", "asset": 0, "time": 5 },
+      "nullifier": "8c04…d1", "spent": false },
+    { "index": 43, "cm": "b310…88", "height": 39, "role": "sent",
+      "note": { "pk": "…", "from": "…", "amount": "25000000", "asset": 0, "time": 9 },
+      "nullifier": null, "spent": null }
+  ] }
+```
+
+Each call first advances the key's scan by up to **10 000** new leaves (one ML-KEM decapsulation
+plus up to two AEAD opens each), then serves the page. `scanned_index` is how far the scan has
+tried, `next_index` the tree's size, and `complete` is true when they meet — a long rescan
+completes over several calls, so an explorer polls until `complete`. The cap bounds one request,
+not the history: the cursor persists between calls.
+
+A row is one matched leaf, in tree order. `role` is `"received"` for a note the key owns (the
+envelope opened as receiver *and* the note names the key's `pk` — an envelope anyone can seal to
+a public address is not proof of ownership) and `"sent"` for a note the key created for someone
+else, opened through the outgoing viewing key. A `received` row carries the note's `nullifier`
+(a function of the viewing key) and whether the chain has published it — refreshed on every call;
+a `sent` row has neither, because the note is not the key's to nullify. Amounts are strings, as
+everywhere chain state is served.
+
+Errors: `-32602` for a malformed key or page bound, `-32001` for a key this node has not
+imported.
+
 ### `shrugg_getProgram`
 Params: `[program_id]`. Result: `null` or
 `{ "id", "base_pc", "words_len", "code_hash", "deployed_at" }`. There is no `deployer` field: a
@@ -222,7 +292,9 @@ Params: `[tx_hash]`. Result: `null`, or the call's input envelope (spec §6.1) i
 the call's private input vector and its `H_IN` salt, sealed under a per-call key with that
 `h_in` as associated data; `to_sender` wraps that key to the caller's outgoing
 viewing key and `kem_ct`/`to_auditor` to the auditor the caller named, both empty strings when
-there is none. The node holds no key that opens any of it and never looks inside — it is served
+there is none. The node holds no key that opens any of it and never looks inside — a viewing key
+imported for note scanning (`shrugg_importViewingKey`) opens *note* envelopes only; call
+envelopes are not part of its scan. It is served
 so that a wallet with the caller's viewing key, a per-call key, or the auditor's key can open it
 (`shrugg_zkvm::call_envelope`) and check the transcript against `H_IN`. `null` means the call
 published no envelope (`--no-envelope`), the transaction is not a call, or this node has no
@@ -300,6 +372,38 @@ exception — a validator address, an amount and a replay nonce are public in th
 way a mint's amount is, because the validator register and the bridge's accounting are public
 (spec §8). A shielded note's later spend stays private in every case.
 
+### `shrugg_checkTransaction`
+Params: `[hash, key]`, where `key` is a per-transaction `TxKey` as 64 hex characters. Result:
+`null` for a hash this node has no committed transaction for, else what the key discloses about
+it:
+
+```json
+{ "tx": "4f2c…e7", "height": 192,
+  "disclosed": [
+    { "output": "bundle:0", "cm": "2a9f…07", "index": 40,
+      "note": { "pk": "…", "from": "…", "amount": "1500000000", "asset": 0, "time": 5 } }
+  ] }
+```
+
+Monero's `check_tx_proof` shape (`docs/rpc-comparison.md` §4): a sender who sealed an output with
+a fresh `TxKey` can hand `(hash, key)` to anyone — a recipient proving they were paid, an auditor
+checking a claim — and this call is the whole verification. Each entry of `disclosed` is one
+envelope the key opened: `output` names the envelope set (`bundle:0` / `bundle:1` for the
+transaction's own bundle — the fee bundle of a `BridgeBurn` — `asset_bundle:0` / `asset_bundle:1`
+for a burn's second bundle, `deposit` for a `BridgeAttest`'s deposit envelope), `cm` the on-chain
+commitment the note commits to, and `index` its leaf. The binding is the proof: the AEAD
+authenticates the note *and* checks it against `cm`, so a key lifted onto another transaction —
+or a note that is not the commitment's preimage — yields an empty list, never a forged row. A
+mint's, a withdraw's and a genesis alloc's envelopes are not tried: they are sealed inside the
+node under keys dropped at once, so no `TxKey` for them can exist.
+
+The call is **stateless**: the key is used for this one request and dropped — it is not imported,
+stored, or learnable from anything the node keeps (unlike `shrugg_importViewingKey`, which
+retains). A key that opens nothing gets `{ "disclosed": [] }`, indistinguishable from a wrong key
+by design. Amounts are strings, as everywhere chain state is served.
+
+Errors: `-32602` for a malformed hash or key (both are parsed before any storage read).
+
 ### `shrugg_getBlockByHeight` / `shrugg_getBlockByHash`
 Params: `[height]` (integer) or `[hash]`. Result: `null` if unknown, else:
 ```json
@@ -327,13 +431,16 @@ Params: `[]`. Result:
   "peer_count": 5, "connected_peers": 5, "ws_clients": 3, "refused_cache": 0,
   "verify_queue": 0, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
-  "fri_profile": "production", "programs": 2,
+  "fri_profile": "production", "programs": 2, "viewing_keys": 0,
   "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19",
   "address": "2nRdFC…", "peer_id": "12D3KooW..."
 }
 ```
 `syncing` is true while a batch request to a peer is in flight; `sync_target` is the highest height
-any peer has advertised.
+any peer has advertised. `viewing_keys` is how many viewing keys this node is holding for
+node-side scanning (see `shrugg_importViewingKey`) — in memory only, so it reads 0 after every
+restart, and anything above it is worth an operator's attention precisely because it changes what
+compromising the process would disclose.
 
 The four fields beside them are for reading a node that is behind and not catching up, which
 otherwise looks identical to a node that is behind and working:
@@ -621,6 +728,24 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-14 — viewing keys in the node
+
+A node may now hold **viewing keys** (never spend keys — the RPC layer has no type for those) and
+scan on the holder's behalf, the Zcash `z_importviewingkey` shape for explorers. Keys are held in
+memory only: at most 64 per node, cleared at restart, re-imported by the operator. No wire format,
+block or consensus rule changed.
+
+- **`shrugg_importViewingKey(viewing_key, [rescan_from_height])`** registers the party viewing
+  key's `nk` (64 hex); re-import of a held key is a no-op. `shrugg_status` gains `viewing_keys`.
+- **`shrugg_getViewingNotes(viewing_key, [from_index, limit])`** lazily scans from the rescan
+  floor (at most 10 000 leaves per call, with `scanned_index`/`next_index`/`complete` for
+  progress) and pages matched notes — received rows with their nullifier and spent state, sent
+  rows (opened through `ovk`) without.
+- **`shrugg_checkTransaction(hash, key)`** is the Monero `check_tx_proof` shape: stateless, one
+  call, no key retention — what the given per-transaction `TxKey` discloses about the committed
+  transaction, each opened note bound to its on-chain commitment by the AEAD. A wrong key returns
+  an empty `disclosed` list, indistinguishable from a transaction that discloses nothing.
 
 ### 2026-09-14 — RPC hardening
 

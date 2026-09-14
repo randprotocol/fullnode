@@ -404,7 +404,7 @@ impl Storage {
     /// Binary search: the `notes` family is dense from zero and its rows' heights are
     /// non-decreasing in index, because `commit` appends blocks in ascending height and
     /// `truncate_to` only deletes a suffix.
-    fn first_note_at_or_after(&self, height: u64) -> Result<u64> {
+    pub(crate) fn first_note_at_or_after(&self, height: u64) -> Result<u64> {
         let count = self.notes_count()?;
         let (mut lo, mut hi) = (0u64, count);
         while lo < hi {

@@ -204,6 +204,9 @@ struct Node {
     mempool: Mempool,
     net: NetworkHandle,
     status: Arc<RwLock<NodeStatus>>,
+    /// Viewing keys imported over RPC, shared with the `RpcState`; read here only so
+    /// `publish_status` can report the count (`NodeStatus::viewing_keys`).
+    viewing: Arc<RwLock<crate::viewing::Registry>>,
     /// Committed heads, for whatever WebSocket clients are subscribed. Held here rather than read
     /// back out of the `RpcState` because this is the only place that writes it.
     heads: broadcast::Sender<rpc::HeadSummary>,
@@ -423,6 +426,9 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // receiver simply drops what is sent, which is the normal case for a node nobody watches.
     let (heads, _) = broadcast::channel(rpc::HEAD_CHANNEL);
     let ws_conns = Arc::new(AtomicUsize::new(0));
+    // Viewing keys imported over RPC (`shrugg_importViewingKey`), in memory only. Shared with the
+    // node loop purely so `shrugg_status` can say how many keys this process is holding.
+    let viewing = Arc::new(RwLock::new(crate::viewing::Registry::default()));
     let (rpc_addr, rpc_task) = rpc::serve(
         cfg.rpc_addr,
         RpcState {
@@ -433,6 +439,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             executor: executor.clone(),
             heads: heads.clone(),
             ws_conns: ws_conns.clone(),
+            viewing: viewing.clone(),
         },
     )
     .await?;
@@ -475,6 +482,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         mempool: Mempool::new(10_000),
         net: net.clone(),
         status: status.clone(),
+        viewing,
         heads,
         ws_conns,
         peers: HashMap::new(),
@@ -606,6 +614,7 @@ impl Node {
         // questions for an operator.
         s.refused_cache = self.refused.len();
         s.verify_queue = self.verify_queue.len();
+        s.viewing_keys = self.viewing.read().unwrap_or_else(|e| e.into_inner()).len();
     }
 
     /// The tip ledger the pending verifications run against, cloned at most once per tip change.

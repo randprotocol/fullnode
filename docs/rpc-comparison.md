@@ -18,8 +18,8 @@ marked *S2* arrive with the staking phase.
 | history by address | `eth_getLogs` by address; external indexers | `getSignaturesForAddress` | impossible by design; a viewing-key holder reconstructs it client-side |
 | validators and epochs | none (the consensus client's beacon API) | `getVoteAccounts`, `getEpochInfo`, `getLeaderSchedule` | `shrugg_getValidators`, `shrugg_getPeers`; `shrugg_getEpoch` (*S2*) |
 | supply | none | `getSupply`, `getInflationRate` | `shrugg_getSupply` (*S2*, `docs/supply.md`); no inflation |
-| subscriptions | WebSocket `newHeads`, `logs`, `pendingTransactions` | WebSocket `accountSubscribe`, `logsSubscribe`, `slotSubscribe` | `newHeads` over WebSocket (`shrugg_subscribe` / `shrugg_unsubscribe`, same port) |
-| batching and paging | JSON-RPC batch requests | batch, plus cursors on `getSignaturesForAddress` | JSON-RPC batch, cap 20, plus limit-based paging on commitments and nullifiers and the `shrugg_getCompactBlocks` range |
+| subscriptions | WebSocket `newHeads`, `logs`, `pendingTransactions` | WebSocket `accountSubscribe`, `logsSubscribe`, `slotSubscribe` | `newHeads` over WebSocket, same port (`shrugg_subscribe`/`shrugg_unsubscribe`) |
+| batching and paging | JSON-RPC batch requests | batch, plus cursors on `getSignaturesForAddress` | JSON-RPC batch (cap 20); limit-based paging on commitments and nullifiers, plus the compact-block range |
 | state proofs | `eth_getProof` (Merkle-Patricia) | none | `shrugg_getWitness` (a Poseidon2 Merkle path the zkVM consumes) |
 
 ## 2. What the differences mean
@@ -30,15 +30,17 @@ marked *S2* arrive with the staking phase.
 and Solana expose state because their state is public; ours cannot, so the "missing" account
 methods are the privacy property, not a gap.
 
-**Where this node was behind, and what closed it.** Subscriptions, batch requests and a chatty
-scan (one page of commitments plus one page of nullifiers per sync) were the gaps that mattered for
-explorers and wallets; the RPC hardening of 2026-09-14 closed them without a consensus change:
+**Where this node was behind, and what closed it.** No subscriptions (a wallet or explorer polled
+`shrugg_getHead`), no batch requests, and a chatty scan (one page of commitments plus one page of
+nullifiers per sync) were the gaps that mattered for explorers and wallets. Three cheap,
+non-consensus additions closed them:
 
-- `shrugg_getCompactBlocks(from_height, to_height)`: per block its height, hash and timestamp,
-  and per transaction its note commitments (leaf index and envelope) and the nullifiers it spent —
-  up to 128 blocks a call, so a sync is one round-trip per page instead of two per block.
-- a WebSocket `newHeads` subscription on the same port (`shrugg_subscribe` /
-  `shrugg_unsubscribe`), so nothing has to poll.
+- `shrugg_getCompactBlocks(from_height, to_height)`: per block its height, hash, timestamp and,
+  per transaction, its note commitments (leaf index + envelope) and nullifiers, 128 blocks per
+  call — a sync is one round-trip per few hundred blocks.
+- a WebSocket `newHeads` subscription (`shrugg_subscribe`/`shrugg_unsubscribe`, same port), so
+  nothing has to poll.
+- JSON-RPC batch requests, capped at 20.
 
 **Where the shape differs deliberately and should stay that way.** No gas market (fees are flat
 floors because verification cost is nearly constant per proof); no event logs (a call publishes
@@ -75,14 +77,14 @@ behind a socket.
 | submit | `send_raw_transaction` | `sendrawtransaction`; lightwalletd `SendTransaction` | `shrugg_sendTransaction` |
 | fee | `get_fee_estimate` (per-byte, dynamic) | `estimatefee`, ZIP-317 conventional fee | `shrugg_estimateFee` (flat floors) |
 | the spent-set | key images, checked via `is_key_image_spent` | nullifiers inside compact blocks (`CompactTx.spends`) | `shrugg_getNullifiers` |
-| the note stream a wallet scans | `get_blocks.bin` (full blocks; wallet trial-decrypts every output with the private view key) | lightwalletd `GetBlockRange` → `CompactBlock` (per output: `cmu`, ephemeral key, 52-byte ciphertext prefix) | `shrugg_getCompactBlocks` (per block: height, hash, timestamp; per transaction: leaf index, `cm`, full envelope, nullifiers) |
+| the note stream a wallet scans | `get_blocks.bin` (full blocks; wallet trial-decrypts every output with the private view key) | lightwalletd `GetBlockRange` → `CompactBlock` (per output: `cmu`, ephemeral key, 52-byte ciphertext prefix) | `shrugg_getCommitments` (index, `cm`, full envelope, height); `shrugg_getCompactBlocks` (the range stream) |
 | membership witness | `get_outs`, `get_output_distribution` (ring-signature decoys, no Merkle tree) | `z_gettreestate`; lightwalletd `GetTreeState`, `GetSubtreeRoots` (clients keep their own tree) | `shrugg_getWitness`, `shrugg_getAnchor`, `shrugg_getTreeInfo` |
 | wallet balance | `get_balance` (wallet RPC) | `z_getbalance`, `z_gettotalbalance` (zcashd holds keys) | `shrugg balance` (CLI, local key file) |
 | send | `transfer`, `transfer_split` | `z_sendmany` | `shrugg send` |
-| viewing keys | private view key; "view-only wallets"; `query_key` | `z_exportviewingkey` / `z_importviewingkey` (node scans on the holder's behalf), full and incoming viewing keys, unified keys | party viewing key `nk` (full history) and per-transaction `TxKey`; no node-side import yet |
-| per-tx disclosure | `get_tx_key`, `get_tx_proof` / `check_tx_proof` (prove a payment to a third party) | `z_getpaymentdisclosure` (experimental), viewing keys | `TxKey` opens one transaction; a call's `CallEnvelope` opens one call's inputs |
+| viewing keys | private view key; "view-only wallets"; `query_key` | `z_exportviewingkey` / `z_importviewingkey` (node scans on the holder's behalf), full and incoming viewing keys, unified keys | party viewing key `nk` (full history) and per-transaction `TxKey`; node-side import for explorers: `shrugg_importViewingKey` / `shrugg_getViewingNotes` (in memory, 64 keys, 10 000 leaves per call) |
+| per-tx disclosure | `get_tx_key`, `get_tx_proof` / `check_tx_proof` (prove a payment to a third party) | `z_getpaymentdisclosure` (experimental), viewing keys | `TxKey` opens one transaction; `shrugg_checkTransaction(hash, key)` is the one-call third-party check (the `check_tx_proof` shape); a call's `CallEnvelope` opens one call's inputs |
 | supply audit | `get_reserve_proof` (prove a wallet holds ≥ X); no chain-wide value balance (RingCT hides amounts; inflation undetectable except via range proofs) | `getblockchaininfo.valuePools[].chainValue` — the per-pool value balance, exactly the invariant | `shrugg_getSupply` (*S2*, `docs/supply.md`) |
-| subscriptions | ZMQ `json-minimal-chain_main`, `json-minimal-txpool_add` | lightwalletd `GetMempoolStream`; zcashd ZMQ | WebSocket `newHeads` (`shrugg_subscribe`) |
+| subscriptions | ZMQ `json-minimal-chain_main`, `json-minimal-txpool_add` | lightwalletd `GetMempoolStream`; zcashd ZMQ | `newHeads` over WebSocket, same port |
 | history by address | none (by design); wallet keeps `get_transfers` | none by address; `z_listreceivedbyaddress` from the wallet's own scan | none (by design) |
 
 **What is the same.** All three make the wallet, not the node, the place where balances exist:
@@ -105,14 +107,15 @@ per-note spend tag); Zcash's nullifier is the direct ancestor of ours.
 - *Programs.* Neither Monero nor Zcash has confidential programs; SHRUGG's `getReceipt`,
   `getProgram*` and `getCallEnvelope` have no counterpart.
 - *Keys in the node.* zcashd and monero-wallet-rpc can hold keys and scan on the holder's
-  behalf; SHRUGG's node never holds a key. A node-side "import a viewing key" for explorers
-  (RandScan) would be the Zcash `z_importviewingkey` equivalent and remains a candidate, pending
-  the user's decision.
+  behalf. SHRUGG's node now does the same for **viewing keys only**: `shrugg_importViewingKey`
+  hands one over (the `z_importviewingkey` equivalent an explorer like RandScan needs), held in
+  memory, capped at 64, cleared at restart — deliberately never on disk. The RPC layer has no
+  type for a spend key, so the property is narrowed, not abandoned: an imported key can disclose
+  notes but never move them.
 
-**What SHRUGG should borrow.** Two of these arrived with the RPC hardening of 2026-09-14 —
-Zcash's compact-block range stream (`shrugg_getCompactBlocks`) and the head stream (WebSocket
-`newHeads`; the mempool half of lightwalletd's stream has no counterpart here). Still candidates,
-pending the user's decision rather than an engineering one: Monero's `check_tx_proof` shape for
-third-party payment proofs (a `TxKey` already gives the capability; a
-`shrugg_checkTransaction(tx, key)` RPC would make it a one-call verification for an explorer), and
-Zcash's viewing-key import for explorer-side views.
+**What SHRUGG has borrowed.** The compact-block range stream shipped as
+`shrugg_getCompactBlocks`, the head stream as the WebSocket `newHeads` subscription,
+Zcash's viewing-key import as `shrugg_importViewingKey` / `shrugg_getViewingNotes` for
+explorer-side views, and Monero's `check_tx_proof` shape as `shrugg_checkTransaction(hash, key)`:
+stateless, one call, no key retention — a `TxKey` discloses exactly the envelope it sealed, bound
+to its on-chain commitment.

@@ -226,6 +226,21 @@ serves the head, which is the only anchor a wallet should use.
 ← {"height": 192, "root": "6b1d…c4"}
 ```
 
+**`shrugg_importViewingKey(nk[, rescan_from_height])`** and **`shrugg_getViewingNotes(nk[, from_index, limit])`** —
+the explorer's path: hand the *node* a viewing key (in memory, capped at 64, gone at restart) and
+it scans on the holder's behalf, the Zcash `z_importviewingkey` analogue. This is the one
+exception to "the node never holds a key"; see §6.
+
+```json
+→ {"method":"shrugg_importViewingKey","params":["0c31…9e", 0]}
+← {"imported": true, "rescan_from_height": 0, "viewing_keys": 1}
+→ {"method":"shrugg_getViewingNotes","params":["0c31…9e"]}
+← {"scanned_index": 41, "next_index": 41, "complete": true,
+   "notes": [{"index": 40, "cm": "2a9f…07", "height": 37, "role": "received",
+              "note": {"pk": "…", "from": "…", "amount": "100000000000", "asset": 0, "time": 5},
+              "nullifier": "8c04…d1", "spent": false}]}
+```
+
 **`shrugg_getWitness(index)`** — the Merkle path of one leaf, leaf-first, 32 levels. `null` past
 the end of the tree. See §6: this is the one request that says something about the caller.
 
@@ -264,6 +279,17 @@ acceptance is not commitment, so poll `shrugg_getTransaction`.
 
 There is no `from`, no `to`, no `nonce` and no amount in that reply, and there is nothing in the
 stored block either — the node has nothing more to redact.
+
+**`shrugg_checkTransaction(hash, key)`** — the other side of that redaction, for exactly one key
+holder: what does this `TxKey` disclose about this transaction. Stateless (the key is dropped
+with the call), and a wrong key is indistinguishable from one that sealed nothing.
+
+```json
+→ {"method":"shrugg_checkTransaction","params":["4f2c…e7", "77e0…1b"]}
+← {"tx": "4f2c…e7", "height": 192,
+   "disclosed": [{"output": "bundle:0", "cm": "2a9f…07", "index": 40,
+                  "note": {"pk": "…", "from": "…", "amount": "1500000000", "asset": 0, "time": 5}}]}
+```
 
 ## 5. How a node admits a transaction
 
@@ -321,8 +347,10 @@ worth naming.
   node, or ask for witnesses you do not need alongside the ones you do.
 - **Scanning.** `shrugg_getCommitments` hands out everything to everyone, so scanning itself
   reveals nothing about which leaves are yours — but it does tell the node that *somebody* at
-  your IP is scanning, and how far. Trial decryption is local and the node never sees a viewing
-  key.
+  your IP is scanning, and how far. Trial decryption is local and, on that path, the node never
+  sees a viewing key. The exception is the explorer's import below: a node an operator handed a
+  viewing key to knows exactly which leaves that key opens — which the key's holder could have
+  computed anyway — and the IP of whoever asked it to.
 - **Timing and the fee.** A transaction's fee is public, and the fee floors differ by action, so
   a watcher can tell a transfer from a deploy from a call. Submission timing links a bundle to
   whoever was connected to that node's RPC at that moment.
@@ -347,12 +375,20 @@ compel:
   It is all-or-nothing, and it is retroactive and forward-looking at once.
 - **A per-transaction key** (`TxKey`) opens exactly the one envelope it sealed, and nothing else
   — the right grain for "show me this payment" without handing over a history. Each envelope is
-  sealed under a fresh one for precisely this reason.
+  sealed under a fresh one for precisely this reason. `shrugg_checkTransaction(hash, key)` makes
+  the check one stateless RPC call for whoever holds the pair (Monero's `check_tx_proof` shape):
+  what comes back is the note the key sealed, bound to its on-chain commitment and leaf.
 
 In S1 the wallet derives the viewing key on every run and never stores it, and it draws each
-`TxKey` fresh and drops it after sealing. So per-transaction disclosure of *value* is a property of
-the format the chain already enforces, not yet a command the CLI offers; exporting either key is a
-wallet change, not a chain change.
+`TxKey` fresh and drops it after sealing. Since the RPC-hardening work a *node* may also be
+handed a viewing key: `shrugg_importViewingKey` imports one (in memory only, capped at 64 keys,
+cleared at restart — deliberately never on disk) and `shrugg_getViewingNotes` serves what the
+node's scan found, the Zcash `z_importviewingkey` shape an explorer such as RandScan needs.
+That is the one place "the node never holds a key" stops being true, and it is a property of an
+explicit operator decision, scoped to that node: the RPC layer has no type for a spend key, so an
+imported key can disclose notes but never move them, and a port that has seen an import should be
+treated as key-bearing. Exporting either key out of the wallet remains a wallet change, not a
+chain change.
 
 Phase S3 added the same two grains for *computation*, and these the CLI does offer: a call may
 publish its private inputs as a sealed transcript, openable by the caller's viewing key, by a

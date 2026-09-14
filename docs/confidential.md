@@ -466,7 +466,10 @@ from any other key: handing one over says nothing about any other call.
 `MAX_CALL_ENVELOPE_BYTES` = 18,432, sized to admit the 4096-word input cap plus the auditor parts
 (`call_envelope::validate`, step 7 of admission). It holds no key that opens any of it, never looks
 inside, and serves it verbatim to anyone who asks (`shrugg_getCallEnvelope`, alongside the receipt's
-`h_in`). The envelope is part of the transaction, so it is part of the transaction hash.
+`h_in`). (A viewing key imported for note scanning — `shrugg_importViewingKey`, `docs/shielded.md` —
+opens *note* envelopes only; a caller's viewing key would open its own calls' sender wraps, but
+nothing on the node tries: the scan runs over the commitment tree's leaves, and call envelopes are
+not part of it.) The envelope is part of the transaction, so it is part of the transaction hash.
 
 **What binds an envelope to its call** is the AEAD: the body's associated data is the 32 bytes of
 `H_IN` as the receipt publishes them, so an envelope lifted onto another call authenticates for
