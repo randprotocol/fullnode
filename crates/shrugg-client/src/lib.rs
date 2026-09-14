@@ -377,6 +377,36 @@ impl RpcClient {
         Ok(Some((word8_at(&v, "h_in")?, e)))
     }
 
+    // ---- node-side viewing keys and payment proofs ----
+
+    /// `shrugg_importViewingKey`: hand the node a viewing key (`nk` as 64 hex) to scan with,
+    /// from `rescan_from_height` onwards (default 0, the whole chain). The node holds it in
+    /// memory only — capped at 64 keys, cleared at restart — and never on disk; see `docs/rpc.md`
+    /// for what that changes about the node's trust profile.
+    pub async fn import_viewing_key(&self, nk_hex: &str, rescan_from_height: Option<u64>) -> Result<Value> {
+        let params = match rescan_from_height {
+            Some(h) => json!([nk_hex, h]),
+            None => json!([nk_hex]),
+        };
+        self.call("shrugg_importViewingKey", params).await
+    }
+
+    /// `shrugg_getViewingNotes`: one page of the notes an imported key has matched, by leaf
+    /// index, plus the scan's progress (`scanned_index` / `next_index` / `complete` — a rescan
+    /// longer than one call's 10 000-leaf bound completes over several calls).
+    pub async fn viewing_notes(&self, nk_hex: &str, from_index: u64, limit: usize) -> Result<Value> {
+        self.call("shrugg_getViewingNotes", json!([nk_hex, from_index, limit])).await
+    }
+
+    /// `shrugg_checkTransaction`: what `key_hex` — a per-transaction `TxKey` as 64 hex —
+    /// discloses about the committed transaction `hash` (Monero's `check_tx_proof` shape).
+    /// Stateless: the key is dropped with the call. `None` for a hash the node has no committed
+    /// transaction for; a key that sealed nothing in it gets `{ "disclosed": [] }`.
+    pub async fn check_transaction(&self, hash: &Hash, key_hex: &str) -> Result<Option<Value>> {
+        let v = self.call("shrugg_checkTransaction", json!([hash.to_hex(), key_hex])).await?;
+        Ok(if v.is_null() { None } else { Some(v) })
+    }
+
     // ---- the bridge (spec §10) ----
 
     /// The bridge's own public state: guardians, source emitters, the asset registry, the
