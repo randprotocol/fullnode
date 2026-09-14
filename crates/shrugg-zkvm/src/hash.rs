@@ -9,16 +9,18 @@ use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_symmetric::{CryptographicHasher, PaddingFreeSponge, Permutation};
 use std::sync::OnceLock;
 
-/// `notes::domain::HC` (= 8) and `notes::domain::IN` (= 10), inlined: `program_digest`/
-/// `input_digest` below and `tables::cpu`'s digest-row prefixes both need these exact domain
-/// tags to agree, and this patch predates `notes.rs` being vendored — it is kept rather than
-/// reversed; see `deploy/sync-zkvm.sh`'s header comment.
+/// `notes::domain::HC` (= 8), `notes::domain::IN` (= 10) and `notes::domain::PUB` (= 15),
+/// inlined: `program_digest`/`input_digest`/`public_digest` below and `tables::cpu`'s
+/// digest-row prefixes both need these exact domain tags to agree, and this patch predates
+/// `notes.rs` being vendored — it is kept rather than reversed; see `deploy/sync-zkvm.sh`'s
+/// header comment.
 ///
 /// `pub`, not `pub(crate)`: `tests/shielded.rs` asserts these equal the vendored
-/// `notes::domain::HC` / `notes::domain::IN`, which is what keeps the two copies from drifting
-/// across a resync, and an integration test is a separate crate.
+/// `notes::domain::HC` / `notes::domain::IN` / `notes::domain::PUB`, which is what keeps the
+/// two copies from drifting across a resync, and an integration test is a separate crate.
 pub const HC_DOMAIN: u32 = 8;
 pub const IN_DOMAIN: u32 = 10;
+pub const PUB_DOMAIN: u32 = 15;
 
 /// `machine::permutation()` redraws the whole round-constant RNG stream on every call; this
 /// crate's hash paths (absorbing one 32-row block per call) run it often enough — up to 1024
@@ -223,3 +225,56 @@ pub fn input_digest_rows(salt: [u32; 4], inputs: &[u32]) -> Vec<DigestBlock> {
 /// `n_inputs.div_ceil(4).max(1)` "at least one block" special case redundant — the salt row
 /// alone already guarantees at least one row, even at `n_inputs == 0`.
 pub fn input_digest_row_count(n_inputs: usize) -> usize { 1 + n_inputs.div_ceil(4) }
+
+/// H_PUB: the in-circuit commitment to the guest's **public** input segment — what
+/// `tables::cpu`'s `IS_PUBDIGEST` rows compute and `pv::PUB0..PUB7` publish.
+///
+/// `input_digest` without the salt, which is the entire point: the words are published with the
+/// transaction and `Machine::verify_public` recomputes this natively and compares. With no salt
+/// block there is nothing guaranteeing a permutation at `n_pub == 0`, so this uses
+/// `program_digest`'s `max(1, ⌈n/4⌉)` rule rather than `input_digest`'s — a header-only block —
+/// and `public_digest(&[])` is therefore a fixed, non-zero value rather than the all-zero digest.
+pub fn public_digest(public: &[u32]) -> [u32; 8] {
+    let blocks = public_digest_rows(public);
+    let state = blocks.last().expect("public_digest_rows always returns at least the header block").state_out;
+    split_digest([state[0], state[1], state[2], state[3]])
+}
+
+/// One `tables::cpu` `IS_PUBDIGEST` row's worth of absorb data — `program_digest_rows` with
+/// `domain::PUB` and `[PUB, n_pub, 0]` in the capacity lanes (no `base_pc` analogue for a flat
+/// vector, exactly as `input_digest_rows` has none). `idx` numbers the rows from 0, matching
+/// `tables::cpu`'s own `HASH_IDX` chain for the region.
+pub fn public_digest_rows(public: &[u32]) -> Vec<DigestBlock> {
+    let mut state = [Val::ZERO; 8];
+    state[4] = Val::from_u32(crate::hash::PUB_DOMAIN);
+    state[5] = Val::from_u32(public.len() as u32);
+    // state[6] stays 0 — the header is [PUB_DOMAIN, n_pub, 0].
+    let n = public.len();
+    let rows = n.div_ceil(4).max(1);
+    let mut out = Vec::with_capacity(rows);
+    for i in 0..rows {
+        let state_in = state;
+        let mut block_words = [0u32; 4];
+        let mut active = [false; 4];
+        let mut merged = state;
+        for k in 0..4 {
+            let idx = i * 4 + k;
+            if idx < n {
+                block_words[k] = public[idx];
+                active[k] = true;
+                merged[k] = Val::from_u32(public[idx]);
+            }
+        }
+        // `i * 4 <= n` on every row this loop emits (`rows = ⌈n/4⌉` for `n > 0`, and the single
+        // `n == 0` row has `i = 0`), so this is `input_digest_rows`'s expression exactly — the
+        // `.min(n)` an earlier cut carried here could never bind.
+        let left_before = (n - i * 4) as u32;
+        state = permute_state(merged);
+        out.push(DigestBlock { idx: i as u32, left_before, words: block_words, active, state_in, state_out: state });
+    }
+    out
+}
+
+/// `max(1, ⌈n/4⌉)` — the number of cpu-table `IS_PUBDIGEST` rows `H_PUB` costs, without
+/// building the `Vec` (used by `build_traces_salted`'s cycle-budget check).
+pub fn public_digest_row_count(n: usize) -> usize { n.div_ceil(4).max(1) }

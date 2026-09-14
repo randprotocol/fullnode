@@ -71,8 +71,9 @@ Bundle-less. Size cap `MAX_AGGREGATE_BYTES` = the proof cap plus `MAX_COVERS · 
 5. the payout note `cm` is new (`derived_commitment` claims it in the mempool, as a `Withdraw`'s);
 6. the expected public values are built from the covered bundles' public fields (M5 §4.4 as
    corrected by M5 §12: the 4-element inner verifier key digest the chain pins for the current
-   constraint set, `N`, then each bundle's **all 26** public values in `pv` order — `PC_ENTRY`,
-   `TIER`, `OUT0..7`, `HC0..7` = the registered bundle guest's `hc`, `IN0..7` — in `covers` order)
+   constraint set, `N`, then each bundle's **all 34** public values in `pv` order — `PC_ENTRY`,
+   `TIER`, `OUT0..7`, `HC0..7` = the registered bundle guest's `hc`, `IN0..7`, `PUB0..7` — in
+   `covers` order; the count was **26** until constraint set 6 added the eight `H_PUB` words)
    and `verify_aggregate(rvm_vk, proof)` must return exactly them — the one expensive step, last.
    Checking `HC0..7` against the registered `hc` is what stops an aggregate from covering a proof
    of some other guest.

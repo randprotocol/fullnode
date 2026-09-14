@@ -68,6 +68,30 @@ pub mod domain {
     /// guest ever writes a nonzero `bad` word, which is exactly what makes a dishonest witness's
     /// digest fail to match any plaintext the ledger could reconstruct.
     pub const BUNDLE: u32 = 11;
+    /// M4.3: an EVM storage leaf, `[slot(8), value(8)]` (16 words). Canonical in the value: a
+    /// leaf whose value is zero is `H(STORAGE_LEAF, [0; 16])` whatever its slot, so an absent
+    /// slot, a never-written slot and a slot written back to zero are the same leaf and the
+    /// storage root is history-independent (`evm::leaf_hash`).
+    pub const STORAGE_LEAF: u32 = 12;
+    /// M4.3: the EVM guest's public-output digest,
+    /// `[codehash(8), pre_root(8), post_root(8), return_hash(8), logs_hash(8)]` (40 words).
+    pub const EVM_OUT: u32 = 13;
+    /// M4.4: the sBPF guest's public-output digest, `[input_hash(8), output_hash(8)]` (16 words)
+    /// — two SHA-256 digests, each packed `word[i] = LE(bytes[4i..4i+4])`, binding the instruction
+    /// the program was given (the canonical unpadded encoding, `sbpf_core::abi::
+    /// canonical_input_hash`) and the accounts' post-state (`sbpf_core::abi::public_output`,
+    /// mirrored there as `SBPF_OUT_DOMAIN`). The program itself is *not* in this preimage: since
+    /// the public input segment (constraint set 6) the ELF is public, so `H_PUB` binds it and the
+    /// chain checks it — the old `program_hash(8)` word group is gone and the preimage is 16 words,
+    /// not 24. 12 and 13 are M4.3's (`STORAGE_LEAF`, `EVM_OUT`) and are left free so the two
+    /// milestones' domains do not collide when both land.
+    pub const SBPF_OUT: u32 = 14;
+    /// The public input segment's commitment (`hash::public_digest`), sealing the unsalted
+    /// words `SYS_READ_PUBLIC` draws from — the capacity-lane header `[PUB, n_pub, 0]` seeded
+    /// into the very first pubdigest-row permutation. `IN`'s header shape exactly, minus the
+    /// salt block: this digest is meant to be recomputed by a verifier who holds the words
+    /// (`Machine::verify_public`), which is precisely what a salted `H_IN` cannot support.
+    pub const PUB: u32 = 15;
     pub const TEST: u32 = 0xff;
 }
 

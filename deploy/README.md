@@ -2,6 +2,13 @@
 
 Test keys only; all seeds are committed on purpose so any machine can pull and run.
 
+> **Constraint set 6 is vendored on `main` now and is the *next* chain's set, not this one's.**
+> Chain 8 stays on constraint set 5 and build `03c9fb9`: a set-6 build cannot join the chain-8
+> fleet and a set-5 build cannot verify a set-6 chain — in either direction (`pv::NUM` 26 → 34,
+> `Proof` gains `sha256_log_height` and `public_log_height`, a six-keyed verifier key, a new AIR
+> region and table). Like every set before it, set 6 arrives by cutting a new chain id (chain 9),
+> not by upgrading chain 8 in place. See `docs/confidential.md`, "Constraint set 6".
+
 | | |
 |---|---|
 | chain id | **8** |

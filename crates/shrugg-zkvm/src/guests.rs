@@ -6,13 +6,14 @@ const T0: u32 = 5; const T1: u32 = 6; const T2: u32 = 7; const T3: u32 = 28; con
 const T6: u32 = 31; const S0: u32 = 8; const S1: u32 = 9;
 const HEAP: i32 = 0x1000; // data lives above the code
 
-/// M4.1/M4.2: guests built with the real `riscv32im-unknown-none-elf` toolchain (upstream's
-/// `guest-sdk`/`guests-compiled/`, not vendored into this crate — see `deploy/sync-zkvm.sh`'s
-/// header comment) and loaded as flat binaries (`isa::Program::from_flat_binary`), as opposed to
-/// every other guest in this module, which is written directly against `asm.rs`'s mnemonic
-/// helpers. Mirrors upstream `research/src/guests.rs`'s `compiled` module exactly, except the
-/// `include_bytes!` path: `guests-compiled/` sits directly under this crate root
-/// (`crates/shrugg-zkvm/guests-compiled/bin/{fib,keccak256}.bin`, vendored by
+/// M4.1/M4.2 (and, since the constraint-set-6 re-vendor, M4.3/M4.4): guests built with the
+/// real `riscv32im-unknown-none-elf` toolchain (upstream's `guest-sdk`/`guests-compiled/`, not
+/// vendored into this crate — see `deploy/sync-zkvm.sh`'s header comment) and loaded as flat
+/// binaries or image containers (`isa::Program::from_flat_binary`/`from_flat_image`), as
+/// opposed to every other guest in this module, which is written directly against `asm.rs`'s
+/// mnemonic helpers. Mirrors upstream `research/src/guests.rs`'s `compiled` module exactly,
+/// except the `include_bytes!` path: `guests-compiled/` sits directly under this crate root
+/// (`crates/shrugg-zkvm/guests-compiled/bin/{fib,keccak256,evm,sbpf}.bin`, vendored by
 /// `deploy/sync-zkvm.sh`'s copy step), one level shallower than upstream's
 /// `research/../guests-compiled/`.
 pub mod compiled {
@@ -38,6 +39,46 @@ pub mod compiled {
     pub fn keccak256() -> Program {
         const BIN: &[u8] = include_bytes!("../guests-compiled/bin/keccak256.bin");
         Program::from_flat_binary(0x1000, BIN).expect("keccak256.bin is a committed, known-good build")
+    }
+
+    /// M4.3's exit guest: an EVM interpreter over the ERC-20 subset, compiled from upstream
+    /// `guests-compiled/evm` (`evm-core` plus a 20-line `main`, see that Makefile's header, in
+    /// `circuits/guests-compiled/evm/`, for the exact `rustc +1.98.1` build) and vendored as
+    /// `guests-compiled/bin/evm.bin`.
+    ///
+    /// The private input is one call — bytecode, calldata, caller, the pre-state root and a Merkle
+    /// witness per storage slot touched (`evm_core::abi`'s layout, built host-side by
+    /// `evm::EvmCall::input_words`). The eight public outputs are the status word and the 224-bit
+    /// `hash(EVM_OUT, [codehash ‖ pre_root ‖ post_root ‖ return_hash ‖ logs_hash])` that binds the
+    /// contract and its state-root transition. Everything but the Keccak-f[1600] permutation and
+    /// the Poseidon2 sponge is ordinary compiled guest code: no table, syscall or public value is
+    /// new in M4.3.
+    /// Unlike `fib` and `keccak256` this one is an **image container**, not a bare flat binary: the
+    /// interpreter has a `.rodata` (panic locations, the constants LLVM materialised), and
+    /// `Program::from_flat_image` writes it into RAM with a prologue it synthesises below the text —
+    /// so the data is part of the program and `hc` binds it (upstream `docs/01-isa.md`).
+    pub fn evm() -> Program {
+        const BIN: &[u8] = include_bytes!("../guests-compiled/bin/evm.bin");
+        Program::from_flat_image(BIN).expect("evm.bin is a committed, known-good build")
+    }
+
+    /// M4.4's exit guest: an **sBPF interpreter**, compiled from upstream `guests-compiled/sbpf`
+    /// (see that Makefile's header, in `circuits/guests-compiled/sbpf/`, for the exact
+    /// `rustc +1.98.1` build) and vendored as `guests-compiled/bin/sbpf.bin`. It reads **two**
+    /// vectors: the public one is `[n_elf, elf bytes…]` (`sbpf::SbpfCall::public_words`, bound
+    /// by `H_PUB`, which is what a chain checks against the ELF it published) and the private one
+    /// is `[n_input, input bytes…]` (`SbpfCall::input_words`). The output is a status word plus a
+    /// 224-bit digest over the instruction and the accounts' post-state — *not* the program,
+    /// which the guest no longer hashes (`sbpf_core::abi`).
+    ///
+    /// This is an **image**, not a flat binary: a real compiler output has a `.rodata` (the
+    /// interpreter's `Halt::Trap` literals, panic locations and the opcode dispatch's jump tables),
+    /// which the flat loader cannot carry. `from_flat_image` synthesises the `li`/`sw` prologue that
+    /// writes the data into RAM and reports it as part of the program, so `hc` binds the constants
+    /// exactly as it binds the code (upstream `docs/01-isa.md`).
+    pub fn sbpf() -> Program {
+        const BIN: &[u8] = include_bytes!("../guests-compiled/bin/sbpf.bin");
+        Program::from_flat_image(BIN).expect("sbpf.bin is a committed, known-good build")
     }
 }
 
@@ -156,6 +197,27 @@ pub fn private_payment(threshold: u32) -> Program {
     a.extend(li(T3, 0));                     // amount hi
     a.extend(emit_transfer(0, T2, T3));
     a.label("done");
+    a.extend(halt());
+    a.assemble()
+}
+
+/// Reads the four public words, sums them, and reads `public[1]` a second time — so one proof
+/// exercises a multi-word digest region, a `MULT_READ` of 2, and the `PUBLIC_READ` bus.
+///
+/// Ported from upstream `guests.rs` (constraint set 6's `SYS_READ_PUBLIC` exerciser — see
+/// `sub_word_checksum`'s doc comment for why it isn't in `all()`); the vendored
+/// `tests/cheating.rs` and `tests/e2e.rs` call it by name.
+pub fn public_echo() -> Program {
+    let mut a = Assembler::new(0);
+    a.extend(read_public(0));
+    a.push(mv(T0, REG_A0));
+    for i in [1u32, 2, 3] {
+        a.extend(read_public(i));
+        a.push(add(T0, T0, REG_A0));
+    }
+    a.extend(read_public(1));
+    a.push(add(T0, T0, REG_A0));
+    a.extend(write_output(0, T0));
     a.extend(halt());
     a.assemble()
 }
@@ -358,11 +420,68 @@ pub fn keccak_demo(msg: &[u8]) -> Program {
     a.assemble()
 }
 
+/// The message `sha256_demo` hashes: 55 bytes, the longest message whose
+/// `0x80 ‖ zeros ‖ be64(bit length)` padding still fits a single 512-bit block, so the guest needs
+/// exactly one `SHA256` call and no Merkle–Damgård loop at all. Exported so
+/// `tests/e2e.rs` can check the published digest against `sha256::sha256` of the very same bytes
+/// rather than a copy that could drift.
+///
+/// Ported from upstream `guests.rs` with the function below.
+pub const SHA256_DEMO_MSG: &[u8; 55] = b"The quick brown fox jumps over the lazy dog............";
+
+/// M4.4 demo: `sha256(SHA256_DEMO_MSG)` with the padding done at assembly time and the
+/// compression done by the chip — one `SYS_SHA256` call, whose 8 output words are the digest.
+///
+/// The syscall's buffer is 24 words at `HEAP`: words `0..16` are the padded block as sixteen
+/// **big-endian-valued** words (word `i` is `u32::from_be_bytes` of the block's bytes `4i..4i+4`,
+/// `sha256::bytes_to_words`' layout), words `16..24` the chaining state, which starts at the FIPS
+/// 180-4 `IV` and is overwritten in place with `IV + f(IV, block)` — the digest, big-endian per
+/// word, published as `out0..7` in that order.
+///
+/// One block means the whole of SHA-256 is this one call: `guest_sdk::sha256` is where the general
+/// Merkle–Damgård loop and the runtime padding live (`keccak256`'s sponge is the analogue), and a
+/// compiled guest over that loop is M4.4's later business. This guest exists to anchor the
+/// syscall path end to end at the smallest possible size.
+///
+/// The buffer's base address is held in a register (`S0`) rather than folded into each `sw`'s
+/// immediate: `HEAP` itself is far outside a 12-bit signed I-type field, and AGENTS.md invariant 3
+/// is exactly the silent wrap that would cause.
+///
+/// Ported from upstream `guests.rs` (see `sub_word_checksum`'s doc comment for why it isn't in
+/// `all()`); the vendored `tests/{asm,cheating,e2e,emulator}.rs` call it by name.
+pub fn sha256_demo() -> Program {
+    use crate::sha256::{bytes_to_words, IV};
+    let msg = SHA256_DEMO_MSG;
+    // `msg ‖ 0x80 ‖ zeros ‖ be64(8·55)`, the one-block padding of `sha256::sha256`.
+    let mut block = [0u8; 64];
+    block[..msg.len()].copy_from_slice(msg);
+    block[msg.len()] = 0x80;
+    block[56..].copy_from_slice(&(8 * msg.len() as u64).to_be_bytes());
+    let words = bytes_to_words(&block);
+    let mut a = Assembler::new(0);
+    a.extend(li(S0, HEAP));
+    for (i, w) in words.iter().enumerate() {
+        a.extend(li(T0, *w as i32));
+        a.push(sw(S0, T0, 4 * i as i32));
+    }
+    for (i, h) in IV.iter().enumerate() {
+        a.extend(li(T0, *h as i32));
+        a.push(sw(S0, T0, 4 * (crate::sha256::BLOCK_WORDS + i) as i32));
+    }
+    a.extend(call_sha256(HEAP as u32 / 4));
+    for k in 0..8 {
+        a.push(lw(T0, S0, 4 * (crate::sha256::BLOCK_WORDS + k) as i32));
+        a.extend(write_output(k as u32, T0));
+    }
+    a.extend(halt());
+    a.assemble()
+}
+
 /// (name, program, private inputs) — this chain's deployed guest catalog, which the vendored
 /// `tests/{asm,backend,e2e,isa,tables}.rs` sweep over. Deliberately NOT upstream's list: it
-/// carries the node-local `private_payment` and leaves out the four guests upstream added to
+/// carries the node-local `private_payment` and leaves out the guests upstream added to
 /// its own `all()` for coverage (`sub_word_checksum`, `muldiv`, `poseidon2_demo`,
-/// `keccak_demo` — all four
+/// `keccak_demo`, `sha256_demo` — all five
 /// still exist above and the vendored tests that want them call them by name). Neither
 /// `transfer()` nor `bundle()` belongs here either: upstream does not list them, and both prove
 /// at tier 14, which would turn every sweeping test into a multi-minute run.

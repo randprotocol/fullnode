@@ -5,7 +5,7 @@ use shrugg_zkvm::emulator::execute;
 use shrugg_zkvm::guests;
 use shrugg_zkvm::isa::Instr;
 use shrugg_zkvm::machine::{build_traces, FriProfile, Machine, Tier, TIERS};
-use shrugg_zkvm::tables::{alu, cpu, memory, nibble, poseidon2, program, range, F};
+use shrugg_zkvm::tables::{alu, cpu, input, keccak, memory, nibble, poseidon2, program, public, range, sha256, F};
 use std::time::Instant;
 
 fn hr(title: &str) { println!("\n══ {title} {}", "═".repeat(70usize.saturating_sub(title.len()))); }
@@ -30,23 +30,33 @@ fn main() {
 
     hr("Part 3 · Execute (prover side; nothing here is visible to the chain)");
     let t = Instant::now();
-    let exec = execute(&program, &inputs, 1 << 20).unwrap();
+    let exec = execute(&program, &inputs, &[], 1 << 20).unwrap();
     println!("inputs {:?} → outputs {:?} in {} cycles ({:?})", inputs, &exec.outputs[..2], exec.cycles(), t.elapsed());
 
-    hr("Part 4 · Arithmetize: eight tables on twelve buses (nine and thirteen with KECCAK)");
+    hr("Part 4 · Arithmetize: nine tables on sixteen buses (ten or eleven with a keccak/sha256 table)");
     // M3.4/M4.1: the cpu table's digest-row prefixes (program hc + input H_IN) count as cycles
     // too, and the auto-tier pick fits the Poseidon2 permutation budget as well as the cycles
     // (the 2026-09-12 audit's `Tier::for_workload`).
-    let input_digest_rows = shrugg_zkvm::hash::input_digest_row_count(inputs.len());
-    let cycles = exec.cycles() + program.digest_rows() + input_digest_rows;
-    let tier = Tier::for_workload(cycles, program.digest_rows() + input_digest_rows).unwrap();
-    let traces = build_traces(&program, &inputs, &exec, tier).unwrap();
+    let digest_rows = program.digest_rows()
+        + shrugg_zkvm::hash::input_digest_row_count(inputs.len())
+        // Constraint set 6: and the public-input digest prefix, which every proof pays even with
+        // an empty segment (`public_digest_row_count(0) == 1`). Omitting it under-reported the
+        // cycle count by one row and could, at a tier boundary, have picked a tier
+        // `build_traces` then refuses.
+        + shrugg_zkvm::hash::public_digest_row_count(0);
+    let cycles = exec.cycles() + digest_rows;
+    // The permutation count is digest rows *plus* the guest's own `POSEIDON2` absorb rows — the
+    // same sum `Machine::prove_salted` forms. `balance_check` makes no `POSEIDON2` call, so this
+    // term is zero for this demo; it is written out anyway because omitting it is exactly the
+    // mistake audit ZH1 fixed.
+    let absorb_rows = exec.events.iter()
+        .filter(|e| matches!(e.hash_row, Some(shrugg_zkvm::emulator::HashRow::Absorb { .. })))
+        .count();
+    let tier = Tier::for_workload(cycles, digest_rows + absorb_rows).unwrap();
+    let traces = build_traces(&program, &inputs, &[], &exec, tier).unwrap();
     println!(
         "tier {} → cpu 2^{} rows (actual {} cycles incl. {} digest rows), padding hides the rest",
-        tier.0,
-        tier.0,
-        cycles,
-        program.digest_rows() + input_digest_rows
+        tier.0, tier.0, cycles, digest_rows
     );
     println!("{:<10}{:>10}{:>8}   {}", "table", "rows", "cols", "role");
     for (name, h, w, role) in [
@@ -56,22 +66,35 @@ fn main() {
         ("alu", traces.alu.height(), alu::col::WIDTH, "byte-limb arithmetic, shifts, compares, M extension"),
         ("range", traces.range.height(), range::col::WIDTH + range::pre::WIDTH, "preprocessed, 256 rows: every byte a, pow2(a)"),
         ("nibble", traces.nibble.height(), nibble::col::WIDTH + nibble::pre::WIDTH, "preprocessed, 256 rows: every nibble pair and/or/xor"),
-        ("poseidon2", traces.poseidon2.height(), poseidon2::col::WIDTH + poseidon2::pre::WIDTH, "hash syscall + program/input digest rows"),
-        ("input", traces.input.height(), shrugg_zkvm::tables::input::col::WIDTH, "committed private inputs; H_IN proved, split digest/read buses"),
+        ("poseidon2", traces.poseidon2.height(), poseidon2::col::WIDTH + poseidon2::pre::WIDTH, "hash syscall + program/input/public digest rows"),
+        ("input", traces.input.height(), input::col::WIDTH, "committed private inputs; H_IN proved, split digest/read buses"),
+        ("public", traces.public.height(), public::col::WIDTH, "committed public segment; unsalted H_PUB, mandatory even when empty"),
     ] {
         println!("{name:<10}{h:>10}{w:>8}   {role}");
     }
-    // M4.2: a ninth `keccak` table joins only when a guest calls the KECCAK syscall — this one
-    // does not, so its proof declares `keccak_log_height = 0` and the batch has eight instances.
-    println!(
-        "keccak    {:>10}{:>8}   Keccak-f[1600] permutation chip, optional per proof (declared here: {})",
-        traces.keccak.as_ref().map_or(0, |k| k.height()),
-        shrugg_zkvm::tables::keccak::col::WIDTH,
-        traces.keccak_log_height,
-    );
+    // M4.2: a tenth `keccak` table joins only when a guest calls the KECCAK syscall — this one
+    // does not, so its proof declares `keccak_log_height = 0` and the batch has nine instances.
+    match &traces.keccak {
+        Some(k) => println!("{:<10}{:>10}{:>8}   Keccak-f[1600] permutation chip, optional per proof", "keccak", k.height(), keccak::col::WIDTH + keccak::pre::WIDTH),
+        None => println!("{:<10}{:>10}{:>8}   absent: this guest makes no KECCAK call", "keccak", "—", "—"),
+    }
+    // M4.4: the sha256 table is optional on exactly the same terms, and independently.
+    match &traces.sha256 {
+        Some(sh) => println!("{:<10}{:>10}{:>8}   SHA-256 compression chip, optional per proof", "sha256", sh.height(), sha256::col::WIDTH + sha256::pre::WIDTH),
+        None => println!("{:<10}{:>10}{:>8}   absent: this guest makes no SHA256 call", "sha256", "—", "—"),
+    }
     println!(
         "buses: PROGRAM PROGRAM_WORD MEMORY ALU RANGE8 POW2 AND4 OR4 XOR4 POSEIDON2 INPUT_DIGEST \
-         INPUT_READ KECCAK (LogUp/permutation, verified globally)"
+         INPUT_READ KECCAK SHA256 PUBLIC_DIGEST PUBLIC_READ (LogUp/permutation, verified globally)"
+    );
+    println!(
+        "declared heights: program 2^{} · input 2^{} · keccak {} · sha256 {} · public 2^{} · memory 2^{}",
+        traces.program_log_height,
+        traces.input_log_height,
+        if traces.keccak_log_height == 0 { "absent".to_string() } else { format!("2^{}", traces.keccak_log_height) },
+        if traces.sha256_log_height == 0 { "absent".to_string() } else { format!("2^{}", traces.sha256_log_height) },
+        traces.public_log_height,
+        traces.mem_log_height
     );
 
     hr("Part 5 · Prove and verify (production FRI)");
@@ -94,7 +117,7 @@ fn main() {
     println!("verified in {verify_ms:.1} ms with public values {:?}", proof.public_values);
 
     hr("Part 6 · Cheating provers");
-    let mut bad = build_traces(&program, &inputs, &exec, tier).unwrap();
+    let mut bad = build_traces(&program, &inputs, &[], &exec, tier).unwrap();
     bad.public_values[cpu::pv::OUT0] = F::from_u32(0);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let p = m.prove_traces(&program, &bad, tier);
@@ -108,8 +131,8 @@ fn main() {
     );
 
     hr("Part 7 · Zero knowledge and tier padding");
-    let (p1, _) = m.prove(&program, &inputs, None).unwrap();
-    let (p2, _) = m.prove(&program, &[1000, 0, 0, 0], None).unwrap();
+    let (p1, _) = m.prove(&program, &inputs, &[], None).unwrap();
+    let (p2, _) = m.prove(&program, &[1000, 0, 0, 0], &[], None).unwrap();
     println!("same output, different private inputs: public values differ only in the salted H_IN = {}, proof bytes equal = {}", {
         // M4.1: `pv::IN0..7` is a *salted*, hiding commitment (fresh OS entropy per proof), so the
         // two vectors are no longer equal — the ZK story is that the only words that may differ are
@@ -118,7 +141,7 @@ fn main() {
         let diff: Vec<usize> = (0..p1.public_values.len()).filter(|&i| p1.public_values[i] != p2.public_values[i]).collect();
         diff == (shrugg_zkvm::tables::cpu::pv::IN0..shrugg_zkvm::tables::cpu::pv::IN0 + 8).collect::<Vec<_>>()
     }, p1.to_bytes() == p2.to_bytes());
-    let (p3, _) = m.prove(&program, &inputs, Some(Tier(12))).unwrap();
+    let (p3, _) = m.prove(&program, &inputs, &[], Some(Tier(12))).unwrap();
     println!("same run at tier 12: {} bytes (tier 10: {} bytes) — size reveals the tier, never the cycle count", p3.size(), p1.size());
 
     hr("Part 8 · Summary");
@@ -139,7 +162,7 @@ fn main() {
     println!("field Goldilocks · challenge F_p² · hash Poseidon2 · blowup 8 · ZK hiding FRI · tiers {TIERS:?}");
     println!("\nRead docs/02-tables-and-buses.md for the constraint list, docs/03-privacy.md for what leaks.");
     for (name, p, inp) in guests::all() {
-        let (pr, ex) = m.prove(&p, &inp, None).unwrap();
+        let (pr, ex) = m.prove(&p, &inp, &[], None).unwrap();
         m.verify(&p.digest(), &pr).unwrap();
         println!("{name:<16} cycles {:>6} tier {:>2} proof {:>7} B", ex.cycles(), pr.tier.0, pr.size());
     }

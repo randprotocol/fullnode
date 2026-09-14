@@ -11,8 +11,8 @@ fn two_proofs_of_the_same_run_differ_and_both_verify() {
     let m = Machine::new(FriProfile::Test);
     let p = guests::balance_check(1000);
     let inputs = [400, 250, 300, 75];
-    let (a, _) = m.prove(&p, &inputs, None).unwrap();
-    let (b, _) = m.prove(&p, &inputs, None).unwrap();
+    let (a, _) = m.prove(&p, &inputs, &[], None).unwrap();
+    let (b, _) = m.prove(&p, &inputs, &[], None).unwrap();
     assert_eq!(&a.public_values[..pv::IN0], &b.public_values[..pv::IN0], "public values outside H_IN must still agree");
     assert_eq!(&a.public_values[pv::IN0 + 8..], &b.public_values[pv::IN0 + 8..], "public values after H_IN must still agree");
     assert_ne!(&a.public_values[pv::IN0..pv::IN0 + 8], &b.public_values[pv::IN0..pv::IN0 + 8], "H_IN must be salted (hiding)");
@@ -26,8 +26,8 @@ fn different_private_inputs_same_output_are_indistinguishable_in_public_values()
     use shrugg_zkvm::tables::cpu::pv;
     let m = Machine::new(FriProfile::Test);
     let p = guests::balance_check(1000);
-    let (a, _) = m.prove(&p, &[400, 250, 300, 75], None).unwrap();
-    let (b, _) = m.prove(&p, &[1000, 0, 0, 0], None).unwrap();
+    let (a, _) = m.prove(&p, &[400, 250, 300, 75], &[], None).unwrap();
+    let (b, _) = m.prove(&p, &[1000, 0, 0, 0], &[], None).unwrap();
     assert_eq!(&a.public_values[..pv::IN0], &b.public_values[..pv::IN0], "public values outside H_IN must agree");
     assert_eq!(&a.public_values[pv::IN0 + 8..], &b.public_values[pv::IN0 + 8..], "public values after H_IN must agree");
     assert_eq!(a.batch.degree_bits, b.batch.degree_bits);
@@ -49,7 +49,7 @@ fn input_commitment_matches_the_reference_and_is_bound_to_salt_and_inputs() {
     let inputs_a = [400u32, 250, 300, 75];
     let inputs_b = [1000u32, 0, 0, 0]; // same guest output, different private inputs
 
-    let (proof, _) = m.prove_salted(&p, &inputs_a, salt_a, None).unwrap();
+    let (proof, _) = m.prove_salted(&p, &inputs_a, &[], salt_a, None).unwrap();
     let expected = shrugg_zkvm::hash::input_digest(salt_a, &inputs_a);
     for k in 0..8 {
         assert_eq!(proof.public_values[pv::IN0 + k], expected[k] as u64, "H_IN word {k}");
@@ -57,7 +57,7 @@ fn input_commitment_matches_the_reference_and_is_bound_to_salt_and_inputs() {
 
     // Bound to the inputs: same salt, different inputs, via an actual second proof — not just
     // a second call into the host reference function.
-    let (proof_diff_inputs, _) = m.prove_salted(&p, &inputs_b, salt_a, None).unwrap();
+    let (proof_diff_inputs, _) = m.prove_salted(&p, &inputs_b, &[], salt_a, None).unwrap();
     assert_ne!(
         &proof.public_values[pv::IN0..pv::IN0 + 8],
         &proof_diff_inputs.public_values[pv::IN0..pv::IN0 + 8],
@@ -65,7 +65,7 @@ fn input_commitment_matches_the_reference_and_is_bound_to_salt_and_inputs() {
     );
 
     // Bound to the salt: same inputs, different salt.
-    let (proof_diff_salt, _) = m.prove_salted(&p, &inputs_a, salt_b, None).unwrap();
+    let (proof_diff_salt, _) = m.prove_salted(&p, &inputs_a, &[], salt_b, None).unwrap();
     assert_ne!(
         &proof.public_values[pv::IN0..pv::IN0 + 8],
         &proof_diff_salt.public_values[pv::IN0..pv::IN0 + 8],

@@ -27,7 +27,7 @@ The node's caps (`crates/shrugg-core/src/gas.rs`):
 
 | cap | value | effect at 80 queries |
 |---|---|---|
-| `MAX_PROOF_BYTES` | **2 MiB** (raised with constraint set 5) | 1 MiB rejected every production proof |
+| `MAX_PROOF_BYTES` | **2 MiB** (raised with constraint set 5; re-measured and kept with constraint set 6) | 1 MiB rejected every production proof |
 | `MAX_BLOCK_BYTES` | 4 MiB | **3 transfers per block** (9 at 27 queries) |
 | `MAX_BLOCK_TXS` | 2 000 | never reached |
 | block interval (chain 5) | ~2 s | ~1.5 transfers/s |

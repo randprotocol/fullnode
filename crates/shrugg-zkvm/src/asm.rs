@@ -85,6 +85,12 @@ pub mod ops {
     }
     /// Result lands in a0.
     pub fn read_input(idx: u32) -> Vec<Instr> { let mut v = li(REG_A7, SYS_READ_INPUT as i32); v.extend(li(REG_A0, idx as i32)); v.push(ecall()); v }
+    /// Constraint set 6: `read_input` on the **public** segment — the unsalted words committed
+    /// to `H_PUB` (`pv::PUB0..7`). Result lands in a0.
+    ///
+    /// Mirrors upstream `research/src/asm.rs` verbatim (see `call_keccak`'s doc comment for the
+    /// arrangement); the vendored `tests/{asm,cheating,e2e,emulator}.rs` call it by name.
+    pub fn read_public(idx: u32) -> Vec<Instr> { let mut v = li(REG_A7, SYS_READ_PUBLIC as i32); v.extend(li(REG_A0, idx as i32)); v.push(ecall()); v }
     /// M3.2: hashes `n` words at word address `ptr_words` (`a0`, the `MEM_ADDR` word-address
     /// convention) with the `POSEIDON2` sponge, overwriting `ptr_words..ptr_words+8` with the
     /// 8-word digest in place.
@@ -105,6 +111,23 @@ pub mod ops {
     pub fn call_keccak(ptr_words: i32) -> Vec<Instr> {
         let mut v = li(REG_A7, SYS_KECCAK as i32);
         v.extend(li(REG_A0, ptr_words));
+        v.push(ecall());
+        v
+    }
+    /// M4.4: one SHA-256 compression of the `SHA256_WORDS` words at word address `ptr_words`
+    /// (`a0`) — the message block in words `0..16`, the chaining state in `16..24`, the new state
+    /// written back over `16..24` in place. No second argument.
+    ///
+    /// `u32`, not `call_keccak`'s `i32`: a word address is never negative, and the callers that
+    /// probe the bound pass `emulator::SHA256_PTR_LIMIT`, itself a `u32`. The emulator refuses
+    /// every pointer past that limit (`0x3000_0000 - 24`), so the `as i32` below can only ever
+    /// see a value well below `2^31` — it never changes the constant `li` materializes.
+    ///
+    /// Mirrors upstream `research/src/asm.rs` verbatim (see `call_keccak`'s doc comment for the
+    /// arrangement); the vendored `tests/{asm,cheating,e2e,emulator}.rs` call it by name.
+    pub fn call_sha256(ptr_words: u32) -> Vec<Instr> {
+        let mut v = li(REG_A7, SYS_SHA256 as i32);
+        v.extend(li(REG_A0, ptr_words as i32));
         v.push(ecall());
         v
     }

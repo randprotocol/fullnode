@@ -271,7 +271,8 @@ Cheap before expensive, in this exact order (`Ledger::validate_inner`, spec §7)
 the same check before gossiping, so a bad transaction is refused once, at the edge.
 
 1. **Size caps** — each envelope ≤ 2048 bytes, the bundle proof ≤ 2 MiB, a program ≤ 4096 words,
-   a call proof ≤ 2 MiB (`gas::MAX_PROOF_BYTES`, raised for constraint set 5's 80-query proofs).
+   a call proof ≤ 2 MiB (`gas::MAX_PROOF_BYTES`, raised for constraint set 5's 80-query proofs,
+   re-measured and kept at constraint set 6).
 2. **Chain id** matches this chain.
 3. **Shape and fee floor** — a mint, an `Unbond` and a `Withdraw` carry no bundle and everything
    else must; the transaction's own bundle is always SHRUGG (`asset = 0`) and burns nothing

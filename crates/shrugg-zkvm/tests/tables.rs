@@ -104,7 +104,7 @@ fn nibble_table_answers_and4_or4_xor4_lookups() {
 #[test]
 fn program_table_rows_are_decoded_instructions_and_fetch_counts() {
     let p = guests::fib(5);
-    let e = execute(&p, &[], 10_000).unwrap();
+    let e = execute(&p, &[], &[], 10_000).unwrap();
     let t = program_trace(&p, &e.events, 16);
     assert_eq!(t.height(), 16);
     let w = program::col::WIDTH;
@@ -131,7 +131,7 @@ fn program_table_rows_are_decoded_instructions_and_fetch_counts() {
 #[test]
 fn every_guest_program_trace_has_mult_word_equal_to_valid() {
     for (name, program, inputs) in guests::all() {
-        let e = execute(&program, &inputs, 1 << 20).unwrap_or_else(|err| panic!("{name}: {err:?}"));
+        let e = execute(&program, &inputs, &[], 1 << 20).unwrap_or_else(|err| panic!("{name}: {err:?}"));
         let height = 1usize << program::program_log_height(program.len());
         let t = program_trace(&program, &e.events, height);
         let w = program::col::WIDTH;
@@ -288,7 +288,7 @@ fn program_decoder_equals_instr_decode() {
 #[test]
 fn memory_trace_is_sorted_and_consistent() {
     let p = guests::memcpy(4);
-    let e = execute(&p, &[], 10_000).unwrap();
+    let e = execute(&p, &[], &[], 10_000).unwrap();
     let mut counts = RangeCounts::default();
     let t = memory_trace(&e.events, 0, 1 << 12, &mut counts);
     let w = memory::col::WIDTH;
@@ -423,15 +423,18 @@ fn input_table_shape_and_padding() {
 #[test]
 fn cpu_trace_mirrors_events_and_pads() {
     let p = guests::fib(3);
-    let e = execute(&p, &[], 10_000).unwrap();
+    let e = execute(&p, &[], &[], 10_000).unwrap();
     let mut range = RangeCounts::default();
     let mut nibble = NibbleCounts::default();
-    let t = cpu_trace(&p, &[], [0u32; 4], &e.events, 64, &mut range, &mut nibble);
+    let t = cpu_trace(&p, &[], &[], [0u32; 4], &e.events, 64, &mut range, &mut nibble);
     let w = cpu::col::WIDTH;
     // M4.1: ordinary events now start after both the program-digest prefix (`dr`) and the
     // (always >= 1) input-digest prefix (`shrugg_zkvm::hash::input_digest_row_count(0) == 1`
-    // here, since this test passes no inputs).
-    let dr = p.digest_rows() + shrugg_zkvm::hash::input_digest_row_count(0);
+    // here, since this test passes no inputs). Constraint set 6 adds a third prefix on the
+    // same terms — `public_digest_row_count(0) == 1`, the header-only block.
+    let dr = p.digest_rows()
+        + shrugg_zkvm::hash::input_digest_row_count(0)
+        + shrugg_zkvm::hash::public_digest_row_count(0);
     assert_eq!(t.height(), 64);
     // Row 0 is the first of the `dr` M3.4 digest rows; ordinary events start at row `dr`.
     assert_eq!(t.values[cpu::col::IS_DIGEST], F::ONE);
@@ -460,7 +463,7 @@ fn cpu_trace_mirrors_events_and_pads() {
     let last = &t.values[(t.height() - 1) * w..t.height() * w];
     assert_eq!(last[cpu::col::WRITTEN0], F::ONE, "slot 0 was written");
     for k in 1..8 { assert_eq!(last[cpu::col::WRITTEN0 + k], F::ZERO, "slot {k} was not"); }
-    let pv = public_values(0, 10, &e.outputs, &p.digest(), &shrugg_zkvm::hash::input_digest([0u32; 4], &[]));
+    let pv = public_values(0, 10, &e.outputs, &p.digest(), &shrugg_zkvm::hash::input_digest([0u32; 4], &[]), &shrugg_zkvm::hash::public_digest(&[]));
     assert_eq!(pv.len(), cpu::pv::NUM);
     assert_eq!(pv[cpu::pv::OUT0], F::from_u32(2));
 }
@@ -468,15 +471,17 @@ fn cpu_trace_mirrors_events_and_pads() {
 #[test]
 fn cpu_trace_limbs_and_counts_every_load_store_address() {
     let p = guests::memcpy(4);
-    let e = execute(&p, &[], 10_000).unwrap();
+    let e = execute(&p, &[], &[], 10_000).unwrap();
     let mut range = RangeCounts::default();
     let mut nibble = NibbleCounts::default();
-    let t = cpu_trace(&p, &[], [0u32; 4], &e.events, 1 << 10, &mut range, &mut nibble);
+    let t = cpu_trace(&p, &[], &[], [0u32; 4], &e.events, 1 << 10, &mut range, &mut nibble);
     let w = cpu::col::WIDTH;
     // M4.1: as in `cpu_trace_mirrors_events_and_pads`, ordinary events start after both the
-    // program-digest prefix and the (always >= 1) input-digest prefix.
+    // program-digest prefix and the (always >= 1) input-digest prefix — and, since constraint
+    // set 6, the (always >= 1) public-digest prefix too.
     let idr = shrugg_zkvm::hash::input_digest_row_count(0);
-    let dr = p.digest_rows() + idr;
+    let pdr = shrugg_zkvm::hash::public_digest_row_count(0);
+    let dr = p.digest_rows() + idr + pdr;
     let is_mem = |i: usize| { let d = &e.events[i].dec; d.is_lb + d.is_lh + d.is_lw + d.is_sb + d.is_sh + d.is_sw == 1 };
     let is_store = |i: usize| { let d = &e.events[i].dec; d.is_sb + d.is_sh + d.is_sw == 1 };
     let mem_rows: Vec<usize> = (0..e.events.len()).filter(|i| is_mem(*i)).collect();
@@ -503,7 +508,9 @@ fn cpu_trace_limbs_and_counts_every_load_store_address() {
     // >= 1 since this test passes no inputs) pays the identical 4-per-row rate (already folded
     // into `dr = program digest rows + idr`) plus its own 32-word `IHVL0..31` canonical
     // encoding on its own last row — a second +32, on top of the program digest's own.
-    let digest_range8 = 4 * dr + 32 + 32;
+    // Constraint set 6: the public-digest prefix (`pdr` rows, also folded into `dr`) pays the
+    // same 4-per-row rate plus its own 32-word `PHVL0..31` encoding — a third +32.
+    let digest_range8 = 4 * dr + 32 + 32 + 32;
     assert_eq!(range.range.iter().sum::<u64>() as usize, 8 * mem_rows.len() + 4 * n_stores + digest_range8);
     let nibble_total: u64 = nibble.and.iter().sum();
     assert_eq!(nibble_total as usize, 2 * mem_rows.len());
@@ -611,29 +618,36 @@ fn alu_max_constraint_degree_is_pinned() {
     // any declared program height give the same numbers. `Tier(10)`/`MIN_LOG_HEIGHT` (the
     // smallest of each) are used only because `max_constraint_degrees` needs concrete values
     // to size the tables.
-    // M4.2 (Task 6): the keccak table is optional per proof, so `chips()` — and therefore this
-    // list — has two shapes. Pin both. `klh = 0` is the eight-chip batch a keccak-free proof
-    // uses; `klh = keccak::MIN_LOG_HEIGHT` is the nine-chip one. Every shared table's degree
-    // must be identical between them: dropping an instance changes the batch's instance count,
-    // not any other AIR's constraints or its own packed lookups.
-    let keccak_free = max_constraint_degrees(
+    // M4.2 (Task 6) and M4.4: the keccak *and* sha256 tables are optional per proof, so
+    // `chips()` — and therefore this list — has four shapes. Pin the two extremes: `klh = slh =
+    // 0` is the eight-chip batch a hash-syscall-free proof uses, and both at their minima is the
+    // ten-chip one. Every shared table's degree must be identical between them: dropping an
+    // instance changes the batch's instance count, not any other AIR's constraints or its own
+    // packed lookups.
+    let bare = max_constraint_degrees(
         Tier(10),
         MIN_LOG_HEIGHT,
         shrugg_zkvm::tables::input::MIN_LOG_HEIGHT,
         0,
+        0,
+        shrugg_zkvm::tables::public::MIN_LOG_HEIGHT,
         Tier(10).min_mem_log_height(),
     );
-    assert_eq!(keccak_free.len(), 8, "eight chips when the proof declares no keccak table");
+    assert_eq!(bare.len(), 9, "nine chips when the proof declares neither hash table");
 
     let degrees = max_constraint_degrees(
         Tier(10),
         MIN_LOG_HEIGHT,
         shrugg_zkvm::tables::input::MIN_LOG_HEIGHT,
         shrugg_zkvm::tables::keccak::MIN_LOG_HEIGHT,
+        shrugg_zkvm::tables::sha256::MIN_LOG_HEIGHT,
+        shrugg_zkvm::tables::public::MIN_LOG_HEIGHT,
         Tier(10).min_mem_log_height(),
     );
-    assert_eq!(degrees.len(), 9, "one degree per chip in machine::chips() order");
-    assert_eq!(keccak_free[..], degrees[..8], "the other eight tables are unaffected");
+    assert_eq!(degrees.len(), 11, "one degree per chip in machine::chips() order");
+    // `public` is last, so dropping the two optional chips moves it from index 10 to index 8.
+    assert_eq!(bare[..8], degrees[..8], "the eight mandatory non-public tables are unaffected");
+    assert_eq!(bare[8], degrees[10], "the public table's degree does not depend on the hash chips");
 
     // program: M3.4's main-trace in-circuit decoder. Every one-hot flag pin
     // (`flag*(op-code)=0`) and field-consistency equation is at most degree 2 in the
@@ -687,6 +701,78 @@ fn alu_max_constraint_degree_is_pinned() {
     // chip's own packed `MEMORY`/`KECCAK` lookups — selector-weighted message columns times a
     // degree-2 `IS_REAL · sel_sum` count — don't raise it either.
     assert_eq!(degrees[8], 3, "keccak table max constraint degree");
+
+    // sha256 (M4.4): measured max is 4, of which the AIR's own rules account for 3 and the packed
+    // lookups for the fourth. 4 costs nothing over 3 here: the quotient is chunked by
+    // `log2_ceil(degree + is_zk - 1)`, which is 2 for both. The three cubic rules are the ones
+    // that must be cubic: `xor3` inside Σ0/Σ1 and σ0/σ1, and `Maj`'s `ab + bc + ca − 2abc`.
+    // Everything else is written to stay at or below that — the σ values get their own two
+    // columns (`S1`, `S0`) precisely so the *gated* schedule equation stays degree 2 instead of
+    // carrying a cubic σ under a preprocessed selector, and every carry is spelled as bits so no
+    // rule needs a range lookup.
+    assert_eq!(degrees[9], 4, "sha256 table max constraint degree");
+
+    // public (constraint set 6): `tables::input`'s table verbatim, one bus pair, no arithmetic —
+    // a boolean flag, an arithmetic-sequence pin, and a degree-2 provided count on the busier of
+    // its two split buses (`IS_REAL` alone on `PUBLIC_DIGEST`, `IS_REAL * MULT_READ` on
+    // `PUBLIC_READ`). Same number as `input`'s, for the same reasons.
+    assert_eq!(degrees[10], 2, "public table max constraint degree: tables::input's, one bus pair, no arithmetic");
+
+    // Task 3 measured this off `Sha256Air` through a local height-carrying wrapper, because
+    // `Chip::Sha256` did not exist yet; the wrapper is gone and the two halves below are measured
+    // off the real chip instance, so the pin says *where* the degree comes from (as the cpu
+    // comment above does): the AIR's own rules are all degree ≤ 3 (the module doc's claim), and
+    // the packed `MEMORY`/`SHA256` fraction-pins — 18 interactions folded into 7 groups, each with
+    // a degree-2 `IS_REAL · selector` count — are what adds the fourth. (Folding each state word's
+    // read and write-back into one degree-2 send gives 10 interactions but *9* groups;
+    // `tables/sha256.rs`'s rule 12 records that measurement.)
+    {
+        use p3_air::symbolic::AirLayout;
+        use p3_batch_stark::symbolic::get_max_constraint_degree;
+        use shrugg_zkvm::machine::{Challenge, Chip, Machine};
+        use shrugg_zkvm::tables::sha256::{self, Sha256Air};
+
+        let height = 1usize << sha256::MIN_LOG_HEIGHT;
+        let chip = Chip::Sha256(Sha256Air, height);
+        let air_only = get_max_constraint_degree::<F, Challenge, Chip, _>(
+            &chip,
+            AirLayout::from_air::<F>(&chip),
+            height,
+            &[],
+            &p3_lookup::LogUpGadget::new(),
+        );
+        assert_eq!(air_only, 3, "sha256 table max constraint degree, AIR rules alone");
+        // The packed groups, read off the same `CommonData` `verifier_key` hands a verifier — the
+        // sha256 instance is the last *optional* one in `chips()` order, hence index 9 in the
+        // eleven-chip shape (constraint set 6 appends the mandatory `public` chip after it).
+        let m = Machine::new(FriProfile::Test);
+        let common = m.verifier_key(
+            Tier(10),
+            MIN_LOG_HEIGHT,
+            shrugg_zkvm::tables::input::MIN_LOG_HEIGHT,
+            shrugg_zkvm::tables::keccak::MIN_LOG_HEIGHT,
+            sha256::MIN_LOG_HEIGHT,
+            shrugg_zkvm::tables::public::MIN_LOG_HEIGHT,
+        );
+        assert_eq!(common.lookups.len(), 11);
+        assert_eq!(common.lookups[9].len(), 7, "sha256 packed lookup groups");
+    }
+}
+
+/// M4.4 Task 3: the sha256 table's documented shape. 466 main columns and 10 preprocessed ones —
+/// the numbers `src/tables/sha256.rs`'s module doc breaks down column by column (and that
+/// `docs/02-tables-and-buses.md` will quote once the chip is wired). A change here is a
+/// constraint-set change, so it has to be deliberate.
+#[test]
+fn sha256_table_has_the_documented_width() {
+    use shrugg_zkvm::tables::sha256::{col, pre};
+    assert_eq!(col::WIDTH, 466, "sha256 main width");
+    assert_eq!(pre::WIDTH, 10, "sha256 preprocessed width");
+    // The six bit banks of the working variables, then the two post-round banks: 8 x 32 bits is
+    // most of the table.
+    assert_eq!(col::B_BITS - col::A_BITS, 32);
+    assert_eq!(col::ENEW_BITS - col::ANEW_BITS, 32);
+    assert_eq!(col::HOUT - col::HIN, 8);
 }
 
 mod poseidon2_tests {
@@ -1003,4 +1089,31 @@ mod keccak_tests {
         assert_eq!(Tier(10).max_keccak_log_height(), 15);
         assert_eq!(Tier(20).max_keccak_log_height(), 25);
     }
+}
+
+/// Constraint set 6: the `public` table is `tables::input`'s layout and rules exactly — one row
+/// per committed public word, `IDX` counting through the padding, every message column (and the
+/// read count's own witness) pinned to zero on a padding row.
+#[test]
+fn public_table_rows_are_committed_words_with_their_read_counts() {
+    use shrugg_zkvm::tables::public;
+    let w = public::col::WIDTH;
+    let t = public::public_trace(&[5, 6, 7], &[2, 0, 1], 8);
+    assert_eq!(t.height(), 8);
+    for i in 0..3 {
+        assert_eq!(t.values[i * w + public::col::IDX], F::from_u32(i as u32));
+        assert_eq!(t.values[i * w + public::col::IS_REAL], F::ONE);
+    }
+    assert_eq!(t.values[public::col::WORD], F::from_u32(5));
+    assert_eq!(t.values[public::col::MULT_READ], F::from_u32(2));
+    // Padding: IDX keeps counting, everything else is pinned to zero.
+    assert_eq!(t.values[3 * w + public::col::IDX], F::from_u32(3));
+    assert_eq!(t.values[3 * w + public::col::IS_REAL], F::ZERO);
+    assert_eq!(t.values[3 * w + public::col::WORD], F::ZERO);
+    assert_eq!(t.values[3 * w + public::col::MULT_READ], F::ZERO);
+    // Height rule: declare n+1, floor at MIN_HEIGHT — tables::input's rule exactly.
+    assert_eq!(public::public_log_height(0), public::MIN_LOG_HEIGHT);
+    assert_eq!(public::public_log_height(3), 2);
+    assert_eq!(public::public_log_height(4), 3);
+    assert_eq!(public::public_log_height(1000), 10);
 }

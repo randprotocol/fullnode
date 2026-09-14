@@ -62,23 +62,27 @@ cargo build --release        # target/release/shrugg-node, target/release/shrugg
 cargo test --release         # all crates; release because STARK proving is slow in debug
 ```
 
-Test coverage: 133 core tests (crypto, notes and the tree, ledger admission rules, the staking
+Test coverage: 155 core tests (crypto, notes and the tree, ledger admission rules, the staking
 register and its epochs, the supply audit, gas, genesis, a deterministic multi-replica HotStuff
 simulation with partitions, restarts and epoch rollovers), node unit tests (storage, corruption
 cases, the conflict mempool, the redacted RPC), wallet tests (key file, scanning, coin selection),
-the zkVM suite (upstream tests plus executor tests with real proofs), one wallet-flow test against a
+the zkVM suite (the upstream tests wholesale — including, since constraint set 6, the EVM, sBPF
+and SHA-256 suites and a tier-16 EVM-call proof — plus executor tests with real proofs), one wallet-flow test against a
 real one-node chain (mint, scan, send, spend the change, bond, and a confidential call whose input
-transcript it opens back), and 16 cluster tests that start real nodes over TCP: a shielded transfer
+transcript it opens back), and 18 cluster tests that start real nodes over TCP: a shielded transfer
 between wallets, a double-spend race between two validators, a deploy-and-call paid by bundles, a
 call whose input envelope only its caller and its auditor open, a guardian-attested bridge deposit
 and a two-bundle burn, a fifth validator that registers and bonds itself into the next epoch, a
 validator that unbonds out of the set and withdraws into a note its payout wallet spends, late
 joiners, restart cycles, quorum loss and recovery, corrupted database recovery, and the faucet.
 
-**466 tests, all green.** `cargo test --workspace --release` measured 22 minutes on 2026-09-13, on a
-machine that was also running another session's build — most of it proving. The two tests that prove
-real bundles dominate: the wallet flow 9m19s (six bundle proofs and a call proof) and the cluster
-suite 6m28s. One test is `#[ignore]`d, a production-profile measurement harness.
+**678 tests, all green.** `cargo test --workspace --release` measured ~43½ minutes on 2026-09-14
+from a cold release target, on a machine that was also running other sessions' work — most of it
+proving. The proofs dominate: the wallet flow 9m37s (six bundle proofs and a call proof), the
+cluster suite 22m44s (18 tests, 12 bundle proofs and 2 program proofs serialised through the
+proving slot), and the zkVM end-to-end file 7m25s (a tier-16 EVM-call proof among its 24). Six
+upstream tests are `#[ignore]`d: three production-profile measurement harnesses, the sBPF cycle
+breakdown, and the two interpreter guests' exit proofs (memory-bound; they want ≥ 64 GB).
 
 ## Run a node
 

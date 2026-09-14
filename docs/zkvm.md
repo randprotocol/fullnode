@@ -8,12 +8,14 @@ on-chain call model, `docs/shielded.md` the note pool built on the `bundle` gues
 vendored here as `crates/shrugg-zkvm`; its own documents (`research/docs/01`–`06`) are the
 authoritative reference and are cited by name below.
 
-> **What this node actually runs.** `crates/shrugg-zkvm` is **constraint set 5 (milestone
-> M4.2, upstream `ffd9e1e`)**: nine tables, the ninth being `keccak` (Keccak-f[1600]), which a
-> proof carries only when its guest actually called the `KECCAK` syscall. Everything the M4.2
-> lines below describe is vendored and is a chain rule here. Constraint set 4 (M4.1) was the
-> eight-table, no-Keccak set; proofs made under it do not verify under set 5, so the move was a
-> hard fork — see `docs/confidential.md`'s "Constraint set 5" section.
+> **What this node actually runs.** `crates/shrugg-zkvm` is **constraint set 6 (the public input
+> segment, upstream `0200877`, carrying milestones M4.3 and M4.4)**: nine *mandatory* tables, the
+> ninth being `public` (the public input segment), plus a `keccak` and a `sha256` table a proof
+> carries only when its guest actually called the matching syscall. Everything the M4 lines below
+> describe is vendored and is a chain rule here. Constraint set 5 (M4.2 + the audit port) was the
+> eight-mandatory-tables, no-sha256, no-public-segment set; proofs made under it do not verify
+> under set 6, so the move was a hard fork — see `docs/confidential.md`'s "Constraint set 6"
+> section.
 
 ## 1. What a proof states
 
@@ -23,15 +25,19 @@ One relation, for every program:
 > `H_IN`, halted within `2ᵗ − 1` cycles and published these eight output words.*
 
 The program is identified by its in-circuit digest `hc` (public values `HC0..7`), the inputs by
-the salted digest `H_IN` (`IN0..7`), the outputs by `OUT0..7`, and the gas tier by `TIER`. That
-is the whole public interface: 26 field elements (`pv::NUM = 26`). Everything else — registers,
-memory, branches taken, the exact cycle count, the inputs — is witness and stays private.
+the salted digest `H_IN` (`IN0..7`), the public segment by the unsalted digest `H_PUB` (`PUB0..7`,
+constraint set 6 — empty on this chain), the outputs by `OUT0..7`, and the gas tier by `TIER`.
+That is the whole public interface: 34 field elements (`pv::NUM = 34`). Everything else —
+registers, memory, branches taken, the exact cycle count, the inputs — is witness and stays
+private.
 
 A contract is therefore a program: the node stores its words at deploy time, computes `hc`, and
-verifies every call with `Machine::verify(hc, proof)` without ever re-reading the program. The
+verifies every call with `Machine::verify_public(hc, &[], proof)` — `verify` plus a check that
+`H_PUB` is the empty segment's digest — without ever re-reading the program. The
 shielded pool's transfer is the `bundle` guest, whose `hc` is pinned in genesis. The EVM and sBPF
-targets (milestone M4) are interpreters compiled to this ISA with the foreign bytecode as
-private input.
+targets (milestones M4.3/M4.4, vendored as libraries with constraint set 6) are interpreters
+compiled to this ISA with the foreign bytecode as private input — or, for the sBPF guest since
+set 6, as a *public* segment bound by `H_PUB`.
 
 ## 2. The machine
 
@@ -101,10 +107,13 @@ comes from `a1` through the row's memory slot; a value-returning syscall writes 
 | 2 | `READ_INPUT idx` | returns private input word `idx`, looked up in the committed input table; two reads of one index agree; `idx ≥ n_in` is unsatisfiable | 1 |
 | 3 | `POSEIDON2 ptr n` | hashes `n ≤ 4096` words at word address `ptr` with the Poseidon2 sponge (width 8, rate 4, overwrite mode) and writes the 8-word digest in place | 1 + ⌈n/4⌉ + 2 |
 | 4 | `KECCAK ptr` **(M4.2)** | one Keccak-f[1600] permutation of the 50-word state at word address `ptr`, in place; the keccak table reads and writes the words itself | 1 |
+| 5 | `SHA256 ptr` **(M4.4)** | one SHA-256 compression of the 24 words at word address `ptr` (16-word block, 8-word chaining state), the new state written back in place; the sha256 table reads and writes the words itself | 1 |
+| 6 | `READ_PUBLIC idx` **(constraint set 6)** | returns public-segment word `idx`, looked up in the public table; two reads of one index agree; `idx ≥ n_pub` is unsatisfiable | 1 |
 
-Rows 0–4 are the whole syscall surface. A guest that issues `ECALL` with `a7 = 4` makes its
-proof declare a keccak table (`keccak_log_height != 0`); a `SYS_KECCAK` row in a proof that
-declares none cannot balance the `KECCAK` bus and is rejected.
+Rows 0–6 are the whole syscall surface. A guest that issues `ECALL` with `a7 = 4` or `a7 = 5`
+makes its proof declare the matching hash table (`keccak_log_height` / `sha256_log_height !=
+0`); a `SYS_KECCAK` or `SYS_SHA256` row in a proof that declares none cannot balance that bus
+and is rejected. `READ_PUBLIC` needs no such declaration: the public table is in every batch.
 
 Note commitments, nullifiers and Merkle verification are **not** syscalls: they are assembler
 library routines that stage a domain-tagged message in RAM and call `POSEIDON2`
@@ -127,24 +136,28 @@ accesses per cycle; the same headroom also carries the keccak table's own memory
 `cycles + program digest rows + input digest rows`; a run that does not fit fails before proving.
 
 **The trace.** A run becomes a set of tables proved together as one Plonky3 batch STARK, connected
-by LogUp buses instead of direct calls — **eight tables always** (`program`, `cpu`, `memory`,
-`alu`, `range`, `nibble`, `poseidon2`, `input`) plus, **only when the guest called `KECCAK`**, a
-ninth, the `keccak` table **(M4.2)**:
+by LogUp buses instead of direct calls — **nine tables always** (`program`, `cpu`, `memory`,
+`alu`, `range`, `nibble`, `poseidon2`, `input`, `public` — the ninth mandatory since constraint
+set 6) plus, **only when the guest called the matching syscall**, a `keccak` table **(M4.2)** and
+a `sha256` table **(M4.4)**, each optional and independent:
 
 | table | rows | provides / consumes |
 |---|---|---|
 | `program` | one per instruction word (witness, in-circuit decoder) | provides `PROGRAM` (pc → decode) and `PROGRAM_WORD` (the words the digest absorbs) |
-| `cpu` | one per cycle, plus digest rows | consumes everything; sends `MEMORY`, `ALU`, `RANGE8`, `POW2`, `AND4/OR4/XOR4`, `POSEIDON2`, `INPUT_READ` (and `KECCAK` **(M4.2)**) |
+| `cpu` | one per cycle, plus digest rows | consumes everything; sends `MEMORY`, `ALU`, `RANGE8`, `POW2`, `AND4/OR4/XOR4`, `POSEIDON2`, `INPUT_READ`, `PUBLIC_READ` (and `KECCAK` **(M4.2)**, `SHA256` **(M4.4)**) |
 | `memory` | one per access, sorted | receives `MEMORY` (multiset equality) |
 | `alu` | one per ALU operation | provides `ALU` `(op, a, b, c)` |
 | `range`, `nibble` | 256 rows each, preprocessed | provide byte range checks, powers of two, 4-bit AND/OR/XOR |
 | `poseidon2` | 32-row blocks, one row per round | provides `POSEIDON2` `[in0..7, out0..7]` |
 | `input` | one per private input word | provides `INPUT_DIGEST` and `INPUT_READ` |
+| `public` **(constraint set 6; always present, four rows even when empty)** | one per public-segment word | provides `PUBLIC_DIGEST` and `PUBLIC_READ` |
 | `keccak` **(M4.2; present only when `keccak_log_height != 0`)** | 32-row blocks, 24 rounds + 8 idle rows | provides `KECCAK` `(clk, ptr)`, sends its own `MEMORY` traffic |
+| `sha256` **(M4.4; present only when `sha256_log_height != 0`)** | 64-row blocks | provides `SHA256` `(clk, ptr)`, sends its own `MEMORY` traffic |
 
-The cpu trace begins with **digest rows**: they absorb the program words (through `PROGRAM_WORD`)
-and then the salted private inputs (through `INPUT_DIGEST`) into the Poseidon2 chip and publish
-`hc` and `H_IN`. A constraint forces the digest multiplicity of every valid program row to be
+The cpu trace begins with **digest rows**: they absorb the program words (through `PROGRAM_WORD`),
+then the salted private inputs (through `INPUT_DIGEST`), and finally the public segment (through
+`PUBLIC_DIGEST`, constraint set 6) into the Poseidon2 chip and publish
+`hc`, `H_IN` and `H_PUB`. A constraint forces the digest multiplicity of every valid program row to be
 exactly one, which turns the bus balance into a set equality: no reachable instruction can be
 left out of `hc`.
 
@@ -162,11 +175,17 @@ parameters (conjectured `3·80 + 20 = 260` bits; ~86 *proven* bits under proximi
 ~42 proven bits, and the 2026-09-12 zk audit (finding ZM1) had it reverted. Every table's
 maximum constraint degree is pinned by a test under the cap of 8 that `log_blowup = 3` allows.
 
-**Verification.** `Machine::verify(hc, proof)` checks the 26 public values are canonical, `HC`
+**Verification.** `Machine::verify(hc, proof)` checks the 34 public values are canonical, `HC`
 equals `hc`, the tier is valid, the proof-declared heights are in range and match the proof's
-degree bits, then runs the batch verifier. A `Proof` declares four heights: `program_log_height`,
-`input_log_height`, `keccak_log_height` (`0` = no keccak table) and `mem_log_height` **(M4.2)**.
-The verifier key is `(tier, program_log_height, input_log_height, keccak_log_height)` — the
+degree bits, then runs the batch verifier; `Machine::verify_public(hc, public_words, proof)`
+(constraint set 6) adds the one check `verify` cannot do on its own — `PUB0..7` must equal
+`hash::public_digest(public_words)`, recomputed natively (this chain passes `&[]`, the empty
+segment). A `Proof` declares six heights: `program_log_height`,
+`input_log_height`, `keccak_log_height` (`0` = no keccak table), `sha256_log_height` (`0` = no
+sha256 table), `public_log_height` (mandatory — an empty segment is four rows) and
+`mem_log_height`.
+The verifier key is `(tier, program_log_height, input_log_height, keccak_log_height,
+sha256_log_height, public_log_height)` — the
 memory height is deliberately not part of it, because every valid memory height yields the same
 preprocessed data. It never depends on program content, and is cached; a warm verify is about
 16 ms.
@@ -182,10 +201,11 @@ this way, `keccak_demo` **(M4.2)** among them. `Program { base_pc, words }`.
 and loaded by `Program::from_flat_binary(base_pc, bytes)`, which checks the length, alignment,
 size and that every word decodes. `_start` sets `sp` to `__stack_top`, calls `main`, then halts.
 Upstream's `guest-sdk` wraps the syscalls (`read_input`, `write_output`, `poseidon2`, `halt`,
-plus `keccak`/`keccak256` **(M4.2)**); pointers passed to `poseidon2` and `keccak` are converted
+plus `keccak`/`keccak256` **(M4.2)**, `sha256`/`sha256_compress` **(M4.4)** and
+`read_public` **(constraint set 6)**); pointers passed to `poseidon2`, `keccak` and `sha256` are converted
 to word addresses by the SDK. Compiled guests are committed as `.bin` files with a `Makefile`;
 the SDK and the `Makefile`s live upstream, and only the built binaries are vendored here
-(`guests-compiled/bin/fib.bin` and `keccak256.bin`, copied by `deploy/sync-zkvm.sh`), so building
+(`guests-compiled/bin/{fib,keccak256,evm,sbpf}.bin`, copied by `deploy/sync-zkvm.sh`), so building
 a new compiled guest still means working in `circuits/`.
 
 **Identity.** `hc = Poseidon2(HC domain, base_pc, len; words)` with the domain, base address and
@@ -197,6 +217,13 @@ anyone who can guess a program can confirm it.
 Private inputs are a vector of words. `H_IN = Poseidon2(IN domain, n_in; salt, inputs)` with a
 128-bit per-proof salt, so it is hiding as well as binding. `READ_INPUT` is a lookup against the
 committed input table; a program that wants an input to be public absorbs it into an output.
+
+Since constraint set 6 there is also a **public** input segment: a second, independently indexed
+vector the guest reads with `READ_PUBLIC` (syscall 6), committed to `H_PUB = Poseidon2(PUB
+domain, n_pub; public)` — the same construction as `H_IN` minus the salt, precisely so a verifier
+who holds the words (they are published with the transaction) can recompute it:
+`Machine::verify_public`. This chain publishes no public words, so every proof here commits to
+the empty segment.
 
 Outputs are eight public words. The shielded `bundle` guest uses them for one digest of its 47
 public plaintext words (anchor, nullifiers, commitments, fee, burn, asset, time, and the taint
@@ -217,7 +244,10 @@ leaves prove time unchanged within noise:
 
 A proof that carries the keccak table costs ~1.91 MB more than one that does not — the table is
 2 612 columns wide, and every FRI query opens a full-width main-trace leaf, so its *width*, not
-its row count, is what a proof pays for. `shrugg-core`'s `MAX_PROOF_BYTES` is 2 MiB, so no
+its row count, is what a proof pays for. The sha256 table **(M4.4)** costs the same way and a
+quarter as much (466 columns, +~400 KB at the production profile). Constraint set 6's mandatory
+`public` table and wider cpu table grow every proof by a few percent over set 5 (measured in
+`docs/confidential.md`, "Constraint set 6"). `shrugg-core`'s `MAX_PROOF_BYTES` is 2 MiB, so no
 keccak-bearing proof is admissible on this chain today; `docs/block-space.md` has the block-space
 consequences.
 

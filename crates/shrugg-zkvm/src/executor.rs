@@ -24,24 +24,41 @@
 //! *is* upstream's (`klh ∈ [5, min(tier + 5, 20)]`), and what keeps an absurd declaration cheap
 //! is that the degree-bits pre-check below rejects it before any verifier key is built.
 //!
+//! Constraint set 6: two more declared heights join the key — M4.4's `sha256_log_height`
+//! (optional, on the keccak table's exact terms, `0` = no sha256 table) and the public input
+//! segment's `public_log_height` (**mandatory**: every proof commits to a public segment, even
+//! an empty one, which declares `tables::public::MIN_LOG_HEIGHT`). The public segment also
+//! changes *what* verification means: `H_PUB` (`pv::PUB0..7`) is unsalted, so a verifier that
+//! holds the words can recompute it — `Machine::verify_public`. This chain publishes no public
+//! words with any transaction today, so the only public segment a proof may commit to here is
+//! the empty one: both `verify_call` and `verify_bundle` run `verify_public(hc, &[], proof)`,
+//! which pins `H_PUB` to `hash::public_digest(&[])`. Plain `verify` would leave `pv::PUB0..7`
+//! unchecked against anything outside the proof — a guest reading a prover-chosen public
+//! segment the chain never saw — and every honest proof by today's guests (none of which calls
+//! `SYS_READ_PUBLIC`) has the empty segment anyway, so the stronger check costs nothing.
+//!
 //! Verifying a proof costs ~16-20 ms once its `(tier, program_log_height, input_log_height,
-//! keccak_log_height)` verifier key is known; computing that key (the range/nibble/Poseidon2-
-//! round-constant preprocessed commitment, FRI-expanded) is the dominant cost of an uncached
-//! verify (`docs/03-privacy.md`).
+//! keccak_log_height, sha256_log_height, public_log_height)` verifier key is known; computing
+//! that key (the range/nibble/Poseidon2-round-constant preprocessed commitment, FRI-expanded) is
+//! the dominant cost of an uncached verify (`docs/03-privacy.md`).
 
 use crate::isa::{Instr, Program};
 use crate::machine::{check_declared_heights, Backend, FriProfile, Machine, Proof, Tier, TIERS};
 use crate::tables::cpu::pv;
-use crate::tables::{input, program};
+use crate::tables::{input, program, public};
 use shrugg_core::confidential::{ConfidentialError, ConfidentialExecutor};
 use shrugg_core::notes::{BundleDigestInput, Word8};
 use shrugg_core::program::{CallOutcome, ProgramRecord};
 
-/// M4.2: the `keccak_log_height` of a proof that declares no keccak table — the eight-instance
-/// batch every guest this chain deploys produces, and the only keccak class `warm`/`warm_bundle`
+/// M4.2: the `keccak_log_height` of a proof that declares no keccak table — the batch shape
+/// every guest this chain deploys produces, and the only keccak class `warm`/`warm_bundle`
 /// precompute a verifier key for. Named rather than inlined as `0` because `0` is a *value* of
 /// that key component, not the absence of one (`Machine::verifier_key`'s doc comment).
 const NO_KECCAK: u8 = 0;
+
+/// M4.4 (arrived with constraint set 6): the sha256 table's analogue of `NO_KECCAK` — no guest
+/// this chain deploys calls `SYS_SHA256`, and `warm`/`warm_bundle` precompute no sha256 class.
+const NO_SHA256: u8 = 0;
 
 pub struct ZkExecutor {
     machine: Machine,
@@ -79,26 +96,30 @@ impl ZkExecutor {
         Ok(hc)
     }
 
-    /// Number of `(tier, program_log_height, input_log_height, keccak_log_height)` verifier keys
-    /// this executor's `Machine` currently has cached — `Machine`'s own cache, not a second one
-    /// kept here (see the module doc comment).
+    /// Number of `(tier, program_log_height, input_log_height, keccak_log_height,
+    /// sha256_log_height, public_log_height)` verifier keys this executor's `Machine` currently
+    /// has cached — `Machine`'s own cache, not a second one kept here (see the module doc
+    /// comment).
     pub fn cached_keys(&self) -> usize {
         self.machine.cached_keys()
     }
 
-    /// Decode a proof and run every check that must precede `Machine::verify` — the cheap,
-    /// purely structural ones, none of which touch the constraint system.
+    /// Decode a proof and run every check that must precede `Machine::verify_public` — the
+    /// cheap, purely structural ones, none of which touch the constraint system.
     ///
-    /// The tier and all four declared table heights (`program_log_height`, `input_log_height`,
-    /// `keccak_log_height`, `mem_log_height`) are attacker-chosen words inside the proof, and
-    /// both the degree-bits comparison below and `Machine`'s verifier-key lookup shift by them,
-    /// so each has to be bounded before it is used to size anything. M4.2: that bounding is
-    /// `machine::check_declared_heights`, called verbatim rather than restated — it is the same
-    /// function `Machine::verify` runs, in the same order (tier, then program, then input, then
-    /// the keccak table's flat range, then the keccak-vs-tier relation, then memory), and the
-    /// chain has no reason to want a different rule. `keccak_log_height == 0` is legitimate and
-    /// means the proof declares no keccak table at all, which is every proof this chain has
-    /// produced so far: neither the deployed guests nor the bundle guest uses the syscall.
+    /// The tier and all six declared table heights (`program_log_height`, `input_log_height`,
+    /// `keccak_log_height`, `sha256_log_height`, `public_log_height`, `mem_log_height`) are
+    /// attacker-chosen words inside the proof, and both the degree-bits comparison below and
+    /// `Machine`'s verifier-key lookup shift by them, so each has to be bounded before it is
+    /// used to size anything. That bounding is `machine::check_declared_heights`, called
+    /// verbatim rather than restated — it is the same function `Machine::verify` runs, in the
+    /// same order (tier, then program, then input, then the keccak table's flat range and
+    /// keccak-vs-tier relation, then the sha256 table's pair, then the public table's plain
+    /// range — mandatory, so there is no `0` escape — then memory), and the chain has no reason
+    /// to want a different rule. `keccak_log_height == 0` and `sha256_log_height == 0` are
+    /// legitimate and mean the proof declares no such table at all, which is every proof this
+    /// chain has produced so far: neither the deployed guests nor the bundle guest uses either
+    /// syscall.
     ///
     /// `exact` is what separates the two callers, and it still applies only to the program and
     /// input heights. A *call* proof is against a program the chain only knows the `hc` of, and
@@ -106,13 +127,16 @@ impl ZkExecutor {
     /// range-checked (`Machine::verify` then binds them cryptographically via the program and
     /// input digests). A *bundle* proof is against one pinned guest with one fixed input width,
     /// so both heights are known up front and anything else is a proof for a different shape —
-    /// rejected here rather than paying for a verifier key that could never match. The keccak
-    /// and memory heights are *not* pinned even in the exact case: `mem_log_height` legitimately
-    /// varies with how much RAM a given witness touches, and a keccak table the bundle guest
-    /// never fills is padding the prover pays for, not something a verifier must forbid — at the
-    /// production profile a keccak-bearing proof is ~1.91 MB larger (3 106 757 bytes at tier 10,
-    /// upstream `docs/03-privacy.md`), so `shrugg-core`'s 2 MiB `MAX_PROOF_BYTES` rejects it long
-    /// before this would.
+    /// rejected here rather than paying for a verifier key that could never match. The sha256,
+    /// public and memory heights are *not* pinned even in the exact case: `mem_log_height`
+    /// legitimately varies with how much RAM a given witness touches, a hash table the bundle
+    /// guest never fills is padding the prover pays for, not something a verifier must forbid —
+    /// at the production profile a keccak-bearing proof is ~1.91 MB larger (3 106 757 bytes at
+    /// tier 10, upstream `docs/03-privacy.md`), so `shrugg-core`'s 2 MiB `MAX_PROOF_BYTES`
+    /// rejects it long before this would — and the public height's real binding is
+    /// cryptographic anyway: `verify_public(.., &[], ..)` pins `H_PUB` to the empty segment's
+    /// digest, so a bundle proof whose public table holds anything else fails there regardless
+    /// of what height it declared.
     fn decode_and_check(
         &self,
         proof: &[u8],
@@ -126,6 +150,8 @@ impl ZkExecutor {
             proof.program_log_height,
             proof.input_log_height,
             proof.keccak_log_height,
+            proof.sha256_log_height,
+            proof.public_log_height,
             proof.mem_log_height,
         )
         .map_err(|e| ConfidentialError::InvalidProof(format!("declared shape: {e:?}")))?;
@@ -136,15 +162,18 @@ impl ZkExecutor {
             return Err(ConfidentialError::InvalidProof("input height not the pinned guest's".into()));
         }
         // Reproduces `Machine::verify`'s own equality check, which is simultaneously the check
-        // that the batch's *instance count* matches what `chips` would build — eight without a
-        // keccak table, nine with one — so a header that claims `keccak_log_height = 0` while
-        // carrying nine instances dies here, before any verifier key is built.
+        // that the batch's *instance count* matches what `chips` would build — nine mandatory
+        // tables (the public table since constraint set 6), plus one per optional hash table
+        // declared — so a header that claims `keccak_log_height = 0` while carrying ten
+        // instances dies here, before any verifier key is built.
         if proof.batch.degree_bits
             != self.machine.log_ext_degrees_pub(
                 proof.tier,
                 proof.program_log_height,
                 proof.input_log_height,
                 proof.keccak_log_height,
+                proof.sha256_log_height,
+                proof.public_log_height,
                 proof.mem_log_height,
             )
         {
@@ -153,7 +182,10 @@ impl ZkExecutor {
         // The eight published output words are read as `u32`s by both callers, and since S3 so
         // are the eight `H_IN` words (`CallOutcome::h_in`, which a call receipt publishes); a
         // slot outside 32 bits cannot come from an honest trace — an output is a register word
-        // and `H_IN` is a digest encoded as byte sums.
+        // and `H_IN` is a digest encoded as byte sums. The eight `H_PUB` words need no range
+        // check of their own: `verify_public(.., &[], ..)` compares them against the empty
+        // segment's digest wholesale, and `Machine::verify` has already insisted every public
+        // value is a canonical field element.
         if proof.public_values.len() != pv::NUM {
             return Err(ConfidentialError::MalformedProof);
         }
@@ -258,6 +290,14 @@ impl ConfidentialExecutor for ZkExecutor {
     /// this by the whole `[5, tier + 5]` range; a call that does declare one (at the `Test`
     /// profile, or once the block-space work makes such a proof admissible) pays the key-build
     /// cost once, like an unwarmed tier.
+    ///
+    /// Constraint set 6: the key carries `sha256_log_height` and `public_log_height` as well,
+    /// and this warms exactly one value of each, on the same grounds as the keccak class —
+    /// `NO_SHA256` (no deployed guest calls `SYS_SHA256` either) and
+    /// `public::public_log_height(0)` (the empty public segment's declared height,
+    /// `tables::public::MIN_LOG_HEIGHT`; `verify_call` admits no other segment — see its
+    /// `verify_public` call — so no proof this chain accepts can declare another public class
+    /// honestly).
     fn warm(&self, record: &ProgramRecord) {
         let log_height = program::program_log_height(record.words.len());
         let smallest = input::MIN_LOG_HEIGHT;
@@ -265,13 +305,13 @@ impl ConfidentialExecutor for ZkExecutor {
         let input_heights: &[u8] = if typical == smallest { &[smallest] } else { &[smallest, typical] };
         for t in &TIERS[..3] {
             for &in_h in input_heights {
-                self.machine.verifier_key(Tier(*t), log_height, in_h, NO_KECCAK);
+                self.machine.verifier_key(Tier(*t), log_height, in_h, NO_KECCAK, NO_SHA256, public::public_log_height(0));
             }
         }
     }
 
     fn verify_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
-        // `Machine::verify` runs `check_declared_heights` on the proof's tier and four declared
+        // `Machine::verify` runs `check_declared_heights` on the proof's tier and six declared
         // table heights before using any of them to size anything — but the degree-bits pre-check
         // inside `decode_and_check` shifts by them too, so it runs that same function in front of
         // it, to avoid panicking on an attacker-chosen out-of-range value before ever reaching
@@ -279,7 +319,11 @@ impl ConfidentialExecutor for ZkExecutor {
         // neither the program's word count (only its `hc`) nor its private-input width.
         let proof = self.decode_and_check(proof, 0, 0, false)?;
         let hc = Self::hc_of(record)?;
-        self.machine.verify(&hc, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+        // Constraint set 6: `verify_public` with the empty segment. The chain publishes no
+        // public words with any transaction, so the only `H_PUB` a proof may commit to is
+        // `hash::public_digest(&[])` — plain `verify` would accept any value there, bound
+        // in-circuit to a public segment the chain never saw (see the module doc comment).
+        self.machine.verify_public(&hc, &[], &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
         let outputs = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
         // M4.1/S3: `H_IN` travels to the receipt so a call-input envelope sealed against it can
         // be opened and checked later (spec §6.1). `decode_and_check` has already refused a
@@ -325,18 +369,22 @@ impl ConfidentialExecutor for ZkExecutor {
     fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<(), ConfidentialError> {
         let (plh, ilh) = Self::bundle_heights();
         let p = self.decode_and_check(proof, plh, ilh, true)?;
+        // `verify_public` with the empty segment, exactly as `verify_call` — the bundle guest
+        // issues no `SYS_READ_PUBLIC`, so its only honest `H_PUB` is the empty segment's digest.
         self.machine
-            .verify(hc_bundle, &p)
+            .verify_public(hc_bundle, &[], &p)
             .map_err(|e| ConfidentialError::InvalidBundleProof(format!("{e:?}")))
     }
 
     /// The bundle guest's verifier key. Unlike `warm`, this needs no guessing: the guest is
-    /// pinned, so its `(tier, program_log_height, input_log_height, keccak_log_height)` is a
-    /// single known quadruple — tier 14, which is where the 3811-word guest's trace lands
-    /// (`tests/shielded.rs` asserts it), and `NO_KECCAK`, since the guest issues no `SYS_KECCAK`.
+    /// pinned, so its `(tier, program_log_height, input_log_height, keccak_log_height,
+    /// sha256_log_height, public_log_height)` is a single known sextuple — tier 14, which is
+    /// where the 3811-word guest's trace lands (`tests/shielded.rs` asserts it), `NO_KECCAK`
+    /// and `NO_SHA256` since the guest issues neither hash syscall, and the empty public
+    /// segment's height since it issues no `SYS_READ_PUBLIC`.
     fn warm_bundle(&self) {
         let (plh, ilh) = Self::bundle_heights();
-        let _ = self.machine.verifier_key(Tier(14), plh, ilh, NO_KECCAK);
+        let _ = self.machine.verifier_key(Tier(14), plh, ilh, NO_KECCAK, NO_SHA256, public::public_log_height(0));
     }
 }
 
@@ -373,8 +421,10 @@ pub fn prove(
     backend: Backend,
 ) -> Result<(Vec<u8>, [u32; 8], u8), String> {
     let m = Machine::new(profile);
+    // The empty public segment (`&[]`): no guest provable through this entry point reads one —
+    // and no proof carrying another segment would pass the chain's `verify_public(.., &[], ..)`.
     let (proof, exec) = m
-        .prove_with(backend, program, inputs, tier.map(|t| Tier(t as usize)))
+        .prove_with(backend, program, inputs, &[], tier.map(|t| Tier(t as usize)))
         .map_err(|e| format!("{e:?}"))?;
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }
@@ -417,8 +467,9 @@ pub fn prove_call(
             use rand::RngExt;
             let salt: [u32; 4] = rand::rng().random();
             let m = Machine::new(profile);
+            // The empty public segment, as in `prove`.
             let (proof, exec) = m
-                .prove_salted(program, inputs, salt, tier.map(|t| Tier(t as usize)))
+                .prove_salted(program, inputs, &[], salt, tier.map(|t| Tier(t as usize)))
                 .map_err(|e| format!("{e:?}"))?;
             Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8, salt))
         }
@@ -456,6 +507,7 @@ pub fn prove_bundle(profile: FriProfile, inputs: &[u32], backend: Backend) -> Re
     }
     let m = Machine::new(profile);
     let program = ZkExecutor::bundle_program();
-    let (proof, exec) = m.prove_with(backend, program, inputs, None).map_err(|e| format!("{e:?}"))?;
+    // The empty public segment: the bundle guest issues no `SYS_READ_PUBLIC`.
+    let (proof, exec) = m.prove_with(backend, program, inputs, &[], None).map_err(|e| format!("{e:?}"))?;
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }

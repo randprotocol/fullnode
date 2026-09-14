@@ -3,7 +3,7 @@ use shrugg_zkvm::guests;
 use shrugg_zkvm::asm::{ops::*, Assembler};
 use shrugg_zkvm::isa::*;
 
-fn run(p: &Program, inputs: &[u32]) -> Execution { execute(p, inputs, 1 << 16).unwrap() }
+fn run(p: &Program, inputs: &[u32]) -> Execution { execute(p, inputs, &[], 1 << 16).unwrap() }
 
 /// M3.2: the `POSEIDON2` syscall (`guests::poseidon2_demo`, which hashes its message in place
 /// and outputs the 8-word digest) must agree with `hash::sponge_hash` — the host-side
@@ -41,7 +41,7 @@ fn poseidon2_over_the_word_limit_is_rejected() {
     a.extend(li(8, 0x1000));
     a.extend(call_poseidon2(0x1000 / 4, (POSEIDON2_MAX_WORDS + 1) as usize));
     a.extend(halt());
-    let err = execute(&a.assemble(), &[], 1 << 16).unwrap_err();
+    let err = execute(&a.assemble(), &[], &[], 1 << 16).unwrap_err();
     assert_eq!(err, ExecError::Poseidon2WordCount(POSEIDON2_MAX_WORDS + 1));
 }
 
@@ -54,7 +54,7 @@ fn poseidon2_pointer_at_or_above_2_to_the_30_is_an_execution_error() {
     let mut a = Assembler::new(0);
     a.extend(call_poseidon2(1 << 30, 4)); // ptr words = 2^30
     a.extend(halt());
-    let err = execute(&a.assemble(), &[], 1 << 16).unwrap_err();
+    let err = execute(&a.assemble(), &[], &[], 1 << 16).unwrap_err();
     assert_eq!(err, ExecError::Poseidon2Ptr(1 << 30));
 
     let mut a = Assembler::new(0);
@@ -112,17 +112,17 @@ fn misaligned_half_load_and_store_are_rejected() {
     // `Misaligned` carries the actual byte address (`alu_out`), matching `errors_are_reported`'s
     // existing convention (`lw(6, 0, 2)` -> `Misaligned(2)`, not `Misaligned(0)`).
     let mut a = Assembler::new(0); a.extend(li(8, 0x1000)); a.push(lh(6, 8, 1)); a.extend(halt());
-    assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::Misaligned(0x1001));
+    assert_eq!(execute(&a.assemble(), &[], &[], 100).unwrap_err(), ExecError::Misaligned(0x1001));
     let mut a = Assembler::new(0); a.extend(li(8, 0x1000)); a.extend(li(5, 1)); a.push(sh(8, 5, 1)); a.extend(halt());
-    assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::Misaligned(0x1001));
+    assert_eq!(execute(&a.assemble(), &[], &[], 100).unwrap_err(), ExecError::Misaligned(0x1001));
 }
 
 #[test]
 fn misaligned_word_load_and_store_are_still_rejected() {
     let mut a = Assembler::new(0); a.push(lw(6, 0, 2)); a.extend(halt());
-    assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::Misaligned(2));
+    assert_eq!(execute(&a.assemble(), &[], &[], 100).unwrap_err(), ExecError::Misaligned(2));
     let mut a = Assembler::new(0); a.extend(li(5, 1)); a.push(sw(0, 5, 2)); a.extend(halt());
-    assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::Misaligned(2));
+    assert_eq!(execute(&a.assemble(), &[], &[], 100).unwrap_err(), ExecError::Misaligned(2));
 }
 
 #[test]
@@ -130,15 +130,15 @@ fn byte_and_half_loads_are_never_misaligned_except_half_on_an_odd_offset() {
     // lb/sb at every offset succeed; lh/sh only at offsets 0 and 2.
     for off in 0..4i32 {
         let mut a = Assembler::new(0); a.extend(li(8, 0x1000)); a.push(lb(6, 8, off)); a.extend(halt());
-        execute(&a.assemble(), &[], 100).unwrap();
+        execute(&a.assemble(), &[], &[], 100).unwrap();
     }
     for off in [0i32, 2] {
         let mut a = Assembler::new(0); a.extend(li(8, 0x1000)); a.push(lh(6, 8, off)); a.extend(halt());
-        execute(&a.assemble(), &[], 100).unwrap();
+        execute(&a.assemble(), &[], &[], 100).unwrap();
     }
     for off in [1i32, 3] {
         let mut a = Assembler::new(0); a.extend(li(8, 0x1000)); a.push(lh(6, 8, off)); a.extend(halt());
-        assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::Misaligned(0x1000 + off as u32));
+        assert_eq!(execute(&a.assemble(), &[], &[], 100).unwrap_err(), ExecError::Misaligned(0x1000 + off as u32));
     }
 }
 
@@ -210,13 +210,13 @@ fn sub_word_checksum_guest_matches_hand_computed_reference() {
 #[test]
 fn errors_are_reported() {
     let mut a = Assembler::new(0); a.push(lw(6, 0, 2)); a.extend(halt());
-    assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::Misaligned(2));
+    assert_eq!(execute(&a.assemble(), &[], &[], 100).unwrap_err(), ExecError::Misaligned(2));
     let mut a = Assembler::new(0); a.push(addi(0, 0, 0));
-    assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::BadPc(4));
+    assert_eq!(execute(&a.assemble(), &[], &[], 100).unwrap_err(), ExecError::BadPc(4));
     let mut a = Assembler::new(0); a.label("l"); a.jal(0, "l");
-    assert_eq!(execute(&a.assemble(), &[], 10).unwrap_err(), ExecError::OutOfCycles(10));
+    assert_eq!(execute(&a.assemble(), &[], &[], 10).unwrap_err(), ExecError::OutOfCycles(10));
     let mut a = Assembler::new(0); a.extend(write_output(0, 5)); a.extend(write_output(0, 5)); a.extend(halt());
-    assert_eq!(execute(&a.assemble(), &[], 100).unwrap_err(), ExecError::DoubleWrite(0));
+    assert_eq!(execute(&a.assemble(), &[], &[], 100).unwrap_err(), ExecError::DoubleWrite(0));
 }
 
 #[test]
@@ -369,10 +369,140 @@ fn a_keccak_pointer_past_the_provable_range_is_an_error() {
     };
     let limit = 0x3000_0000u32 - 50;
     assert!(matches!(
-        execute(&program(limit + 1), &[], 1 << 16),
+        execute(&program(limit + 1), &[], &[], 1 << 16),
         Err(ExecError::KeccakPtrOutOfRange(p)) if p == limit + 1
     ));
     // The largest still-permitted pointer runs (and permutes 50 words of untouched zeros).
-    let e = execute(&program(limit), &[], 1 << 16).unwrap();
+    let e = execute(&program(limit), &[], &[], 1 << 16).unwrap();
     assert_eq!(e.events.iter().filter(|ev| ev.keccak_row.is_some()).count(), 1);
+}
+
+/// M4.4: `SYS_SHA256` compresses the 24 words at the **word** address in `a0` in place — words
+/// `0..16` the message block as big-endian-valued `u32`s, words `16..24` the chaining state — in
+/// exactly one cpu row (`next_pc = pc + 4`), the sha256 chip proving the 64 rounds off the cpu
+/// table the way the keccak chip proves its permutation. The 32 RAM accesses it makes (24 reads
+/// at slot 0, then 8 writes at slot 1 — only the state is written back, the block is left alone)
+/// live in `sha256_accesses`, apart from the ecall row's own register accesses, because the
+/// sha256 table is what sends them on the `MEMORY` bus.
+#[test]
+fn sys_sha256_compresses_twenty_four_words_in_place_in_one_cycle() {
+    use shrugg_zkvm::sha256;
+    const BUF: i32 = 0x400; // byte address; word address 0x100
+    const T0: u32 = 5;
+    const T1: u32 = 6;
+    let ptr = (BUF / 4) as u32;
+    let block: [u32; 16] = std::array::from_fn(|i| 0x0101_0101u32.wrapping_mul(i as u32 + 1));
+    let mut a = Assembler::new(0);
+    // words 0..16 = the block, words 16..24 = the IV, then one SHA256 call, then publish the
+    // eight state words it wrote back.
+    for (i, w) in block.iter().chain(sha256::IV.iter()).enumerate() {
+        a.extend(li(T0, *w as i32));
+        a.push(sw(REG_ZERO, T0, BUF + 4 * i as i32));
+    }
+    a.extend(call_sha256(ptr));
+    for i in 0..8u32 {
+        a.push(lw(T1, REG_ZERO, BUF + 4 * (16 + i) as i32));
+        a.extend(write_output(i, T1));
+    }
+    a.extend(halt());
+    let exec = run(&a.assemble(), &[]);
+
+    let mut want = sha256::IV;
+    sha256::compress(&mut want, &block);
+    assert_eq!(exec.outputs, want, "the state written back is one honest compression");
+
+    let rows: Vec<_> = exec.events.iter().filter_map(|e| e.sha256_row).collect();
+    assert_eq!(rows.len(), 1, "one row per SHA256 call");
+    assert_eq!(rows[0].ptr, ptr);
+    assert_eq!(rows[0].block, block);
+    assert_eq!(rows[0].h_in, sha256::IV);
+    assert_eq!(rows[0].h_out, want);
+
+    let ev = exec.events.iter().find(|e| matches!(e.sys, Some(Syscall::Sha256 { .. }))).unwrap();
+    assert_eq!(rows[0].clk, ev.clk, "the row carries the cycle its lookup is keyed by");
+    assert_eq!(ev.sha256_accesses.len(), 32);
+    assert!(ev.sha256_accesses[..24].iter().all(|m| !m.is_write && m.slot == 0 && m.space == SPACE_RAM));
+    assert!(ev.sha256_accesses[24..].iter().all(|m| m.is_write && m.slot == 1 && m.space == SPACE_RAM));
+    // The reads cover the whole buffer and carry its pre-state; the writes cover words 16..24
+    // only, which is what leaves the message block untouched.
+    assert_eq!(ev.sha256_accesses[..24].iter().map(|m| m.addr).collect::<Vec<_>>(), (0..24).map(|w| ptr + w).collect::<Vec<_>>());
+    assert_eq!(ev.sha256_accesses[..24].iter().map(|m| m.value).collect::<Vec<_>>(), block.iter().chain(sha256::IV.iter()).copied().collect::<Vec<_>>());
+    assert_eq!(ev.sha256_accesses[24..].iter().map(|m| m.addr).collect::<Vec<_>>(), (16..24).map(|w| ptr + w).collect::<Vec<_>>());
+    assert_eq!(ev.sha256_accesses[24..].iter().map(|m| m.value).collect::<Vec<_>>(), want.to_vec());
+    assert_eq!(ev.next_pc, ev.pc + 4, "one cpu row per SHA256 call");
+}
+
+/// M4.4, as for `SYS_KECCAK`: the cpu AIR bounds a `SYS_SHA256` row's pointer to
+/// `ptr < 0x3000_0000`, so the chip's own `PTR + w` address arithmetic can neither wrap nor
+/// alias another `MEMORY` key. The emulator — the reference semantics — refuses every pointer
+/// whose 24-word buffer would cross that boundary rather than produce a trace no AIR can prove.
+#[test]
+fn a_sha256_pointer_past_the_provable_range_is_an_error() {
+    const T0: u32 = 5;
+    let program = |ptr: u32| {
+        let mut a = Assembler::new(0);
+        a.extend(call_sha256(ptr));
+        a.extend(li(T0, 1));
+        a.extend(write_output(0, T0));
+        a.extend(halt());
+        a.assemble()
+    };
+    // Spelled out rather than taken from the constant under test: `SHA256_WORDS = 24` words have
+    // to fit below `0x3000_0000`, so the last legal pointer is `0x3000_0000 - 24`.
+    let limit = 0x3000_0000u32 - 24;
+    assert_eq!(SHA256_PTR_LIMIT, limit);
+    assert_eq!(SHA256_WORDS, 24);
+    assert!(matches!(
+        execute(&program(limit + 1), &[], &[], 1 << 16),
+        Err(ExecError::Sha256PtrOutOfRange(p)) if p == limit + 1
+    ));
+    // The largest still-permitted pointer runs (and compresses 24 words of untouched zeros).
+    let e = execute(&program(limit), &[], &[], 1 << 16).unwrap();
+    assert_eq!(e.events.iter().filter(|ev| ev.sha256_row.is_some()).count(), 1);
+}
+
+/// The public segment (constraint set 6): `SYS_READ_PUBLIC` draws from a second, unsalted input
+/// space whose words are committed to `H_PUB` (`pv::PUB0..7`), and an index past its end is
+/// refused exactly as `READ_INPUT`'s is — an `ExecError`, not a zero word.
+#[test]
+fn read_public_returns_the_public_word_and_is_bound_by_its_own_length() {
+    use shrugg_zkvm::asm::{ops::*, Assembler};
+    use shrugg_zkvm::emulator::{execute, ExecError, Syscall};
+    let mut a = Assembler::new(0);
+    a.extend(read_public(1));
+    a.push(mv(5, REG_A0));
+    a.extend(read_input(0));
+    a.push(add(6, 5, REG_A0));
+    a.extend(write_output(0, 6));
+    a.extend(halt());
+    let p = a.assemble();
+
+    let e = execute(&p, &[100], &[7, 11], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 111, "public[1] + input[0]");
+    assert!(
+        e.events.iter().any(|ev| matches!(ev.sys, Some(Syscall::ReadPublic { idx: 1, word: 11 }))),
+        "the read must show up as a ReadPublic event"
+    );
+
+    // Out of range is refused exactly as READ_INPUT's is: an ExecError, no trace at all.
+    assert!(matches!(execute(&p, &[100], &[7], 10_000), Err(ExecError::PublicIndex(1))));
+    assert!(matches!(execute(&p, &[100], &[], 10_000), Err(ExecError::PublicIndex(1))));
+}
+
+/// The private and public segments are indexed independently: index 0 of one has nothing to do
+/// with index 0 of the other.
+#[test]
+fn the_two_segments_are_independent_spaces() {
+    use shrugg_zkvm::asm::{ops::*, Assembler};
+    use shrugg_zkvm::emulator::execute;
+    let mut a = Assembler::new(0);
+    a.extend(read_input(0));
+    a.push(mv(5, REG_A0));
+    a.extend(read_public(0));
+    a.push(sub(6, 5, REG_A0));
+    a.extend(write_output(0, 6));
+    a.extend(halt());
+    let p = a.assemble();
+    // Same index, different spaces, different words.
+    assert_eq!(execute(&p, &[900], &[400], 10_000).unwrap().outputs[0], 500);
 }

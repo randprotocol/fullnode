@@ -17,13 +17,16 @@ rewritten to publish what it decided and let the caller move the value in the bu
 
 `crates/shrugg-zkvm` (vendored from `circuits/research`, upstream `rand_zkvm`): an RV32I subset,
 plus the RV32M extension and sub-word loads/stores (constraint set 3, below), proven by a
-Plonky3 batch STARK over Goldilocks with Poseidon2 hashing and ZK-hiding FRI. Eight tables
-(program, cpu, memory, alu, range, nibble, poseidon2, input — the last added in constraint set 4,
-below), plus a ninth, `keccak`, that a proof carries only when its guest called the `KECCAK`
-syscall (constraint set 5, below), connected by LogUp/permutation buses. Five syscalls:
-`read_input(i)` (private input word, bound since constraint set 4 to a salted commitment `H_IN`),
-`write_output(slot, word)` (one of eight public outputs), `poseidon2(ptr, n)` (in-place hash of
-`n` words), `keccak(ptr)` (one in-place Keccak-f[1600] permutation, constraint set 5), `halt`.
+Plonky3 batch STARK over Goldilocks with Poseidon2 hashing and ZK-hiding FRI. Nine mandatory
+tables (program, cpu, memory, alu, range, nibble, poseidon2, input, public — `input` added in
+constraint set 4, `public` in constraint set 6, below), plus a `keccak` and a `sha256` table a
+proof carries only when its guest called the matching syscall (sets 5 and 6), connected by
+LogUp/permutation buses. Seven syscalls: `read_input(i)` (private input word, bound since
+constraint set 4 to a salted commitment `H_IN`), `write_output(slot, word)` (one of eight
+public outputs), `poseidon2(ptr, n)` (in-place hash of `n` words), `keccak(ptr)` (one in-place
+Keccak-f[1600] permutation, constraint set 5), `sha256(ptr)` (one in-place SHA-256 compression,
+arrived with constraint set 6's re-vendor), `read_public(i)` (public input word, bound to the
+unsalted `H_PUB`, constraint set 6), `halt`.
 
 Gas tiers pad the execution trace: tier `t` (10, 12, ..., 20) proves up to `2^t - 1` cycles and the
 proof reveals only the tier, never the real cycle count. Production FRI profile: blowup 8, **80
@@ -34,6 +37,8 @@ in the upstream `research` crate for the full retune-and-revert history).
 Measured upstream on `guests::fib` at tier 10: at constraint set 3, prove 3.1 s, proof 268 KB,
 first (uncached) verify 16 ms. At constraint set 5 the proof is ~1 202 416 bytes and the first
 verify ~233 ms, with prove time unchanged within noise — the query count moves bytes, not work.
+Constraint set 6's mandatory public table and wider cpu table add a few percent to those bytes
+(see "Constraint set 6" below for the measured deltas); prove and verify are unchanged in kind.
 The verifier key itself is what a cached verify amortizes away; see "Constraint set 3" and
 "Constraint set 5" below for the full before/after.
 
@@ -276,6 +281,81 @@ will fail startup ledger replay of any chain with a confidential call proved und
 constraint set and truncate its chain. Start a new chain id, or run `--verify-chain off` on nodes
 that must keep serving an old chain. A fleet must run one build.
 
+**Constraint set 6 (2026-09-14, upstream 0200877: the public input segment, carrying milestones
+4.3 + 4.4).** The vendored zkVM was re-synced past constraint set 5 to `research`'s
+constraint-set-6 merge, which also brings milestones 4.3 (the EVM interpreter guest) and 4.4
+(the SHA-256 table and the sBPF interpreter guest) into the crate. The headline changes:
+
+- **A ninth *mandatory* table, `public` — the public input segment — and a seventh syscall,
+  `SYS_READ_PUBLIC` (number 6).** A second, independently indexed input vector the guest reads
+  with `read_public(idx)`, committed to `H_PUB` (`pv::PUB0..7`): a Poseidon2 digest of the
+  segment with capacity header `[PUB(15), n_pub, 0]`, computed by the cpu table's new
+  `IS_PUBDIGEST` row prefix exactly the way `IS_INDIGEST` computes `H_IN`. The buses mirror the
+  input table's pair — `PUBLIC_DIGEST` (the digest's sole source) and `PUBLIC_READ` (the
+  syscall's sole source, count `MULT_READ`) — sixteen buses in all. Unlike `H_IN`, **`H_PUB` is
+  unsalted**: the words are meant to be published with the transaction, so a verifier holding
+  them recomputes the digest natively and compares — `Machine::verify_public(hc, public_words,
+  proof)`. The table is mandatory, not a third optional hash chip: every proof commits to a
+  public segment even when it is empty (four rows, `public_log_height = 2`, the fixed
+  header-only digest), because the segment is where a guest reads data the chain itself
+  publishes — upstream's sBPF guest reads its whole ELF from it, dropping M4.4's in-circuit hash
+  of a hiding commitment (1 753 945 → 694 498 cycles).
+- **`pv::NUM` is 34 and the cpu table is 275 columns** (was 26 and 224): the eight `PUB0..7`
+  public values and the pubdigest region's columns. The existing `pv` slots (`OUT0`, `HC0`,
+  `IN0`) do not move, and `H_PUB` binds `SYS_READ_PUBLIC` exactly the way `H_IN` binds
+  `SYS_READ_INPUT` — 17 new cheating tests upstream pin the table and its digest region.
+- **`Machine::verifier_key` is a 6-tuple**, `(tier, program_log_height, input_log_height,
+  keccak_log_height, sha256_log_height, public_log_height)`; `log_ext_degrees` takes a seventh
+  argument, the declared `mem_log_height` (still deliberately absent from the key). The injected
+  `log_ext_degrees_pub` wrapper and every verifier-key lookup in `ZkExecutor` follow, and
+  `check_declared_heights` gained the sha256 pair (flat range, then the sha256-vs-tier relation
+  — the keccak table's exact terms) plus a plain range check on the public height (mandatory,
+  so there is no `0` escape). `ZkExecutor::decode_and_check` still delegates to that same
+  function, so the chain's admission bound on a proof's declared shape *is* the verifier's.
+- **M4.4's `sha256` table and `SHA256` syscall (number 5) ride along, optional per proof on the
+  keccak table's exact and independent terms**: `sha256_log_height == 0` means no sha256 table
+  (the batch is then nine instances; ten with one hash chip, eleven with both). The chip is
+  466 + 10 columns, 64-row blocks, one compression in place over 24 words; a proof carrying it
+  measures +92 307 bytes at `FriProfile::Test` and +400 563 at the production profile (upstream,
+  same guest, instance in versus out). No guest this chain deploys calls either hash syscall, so
+  every proof here declares both heights `0`.
+- **M4.3/M4.4's interpreter guests arrive as libraries and test fixtures, not as deployed
+  guests.** `src/evm.rs` (the EVM host side: `HostRef`, the Poseidon2 sparse storage tree,
+  `EvmCall`) and `src/sbpf.rs` (the sBPF host side and the committed SPL Token ELF) are vendored
+  with `evm-core`/`sbpf-core` as *path* dependencies (beside the repo, like `rand-zkvm-cuda`,
+  but not optional — `circuits/` must sit beside `fullnode/` for any build of the crate), and
+  the compiled `evm.bin`/`sbpf.bin` beside `fib.bin`/`keccak256.bin`. Their test suites
+  (`tests/evm_*.rs`, `tests/sbpf_*.rs`, `tests/sha256.rs`, the grown `tests/e2e.rs`) are vendored
+  wholesale as always, because they are the upstream authority on the machine's behaviour; the
+  EVM tier-16 call proof in `e2e.rs` is part of this suite now.
+- **The chain admits only the empty public segment.** No transaction on this chain publishes
+  public words, so `ZkExecutor::verify_call` and `verify_bundle` both run
+  `Machine::verify_public(hc, &[], proof)`, pinning `H_PUB` to `hash::public_digest(&[])`. Plain
+  `verify` would leave `pv::PUB0..7` unchecked against anything outside the proof — bound
+  in-circuit to a public segment the chain never saw — and every honest proof by today's guests
+  (none of which calls `SYS_READ_PUBLIC`) has the empty segment anyway, so the stronger check
+  costs nothing. A future action type that publishes words (a public-ELF program in the upstream
+  sBPF shape is the obvious one) would pass them in place of `&[]`.
+- **`MAX_PROOF_BYTES` stays 2 MiB.** Measured on this tree
+  (`cargo test -p shrugg-zkvm --release --test e2e
+  measure_production_profile_at_tier_10_and_12 -- --ignored --nocapture`): a keccak-free
+  production proof is 1 298 729 bytes at tier 10 and 1 359 978 at tier 12 (constraint set 5 measured
+  1 202 416 / 1 252 338 — the delta is the mandatory public table, the 51 new cpu columns and
+  the eight new public values), and a keccak-carrying tier-10 proof is 3 198 430 (set 5:
+  3 106 757). The cap keeps both of its constraint-set-5 properties: every hash-table-free proof
+  the deployed guests can produce fits, with room for the hiding PCS's ~1% per-proof variation,
+  and a keccak-bearing proof is still refused outright.
+
+Proofs made under constraint set 5 (or earlier) do not verify under constraint set 6, in either
+direction: `pv::NUM` 26 → 34 changes the public-values vector every proof carries, `Proof`
+gained two fields (`sha256_log_height`, `public_log_height`) so the wire encoding does not
+round-trip, the verifier key is six-keyed instead of four, and the AIR itself changed (the
+pubdigest row region, the public table, its two buses). This is the same hard-fork situation
+constraint sets 2–5 already documented: a node built from this commit will fail startup ledger
+replay of any chain with a confidential call proved under an older constraint set and truncate
+its chain. Start a new chain id, or run `--verify-chain off` on nodes that must keep serving an
+old chain. A fleet must run one build.
+
 ## On-chain model
 
 **Programs** are content addressed: `program_id = blake3("shrugg-program" || base_pc || words)`.
@@ -305,7 +385,7 @@ is no `effect` field.
 - Deploy: `words.len() <= 4096`, `base_pc % 4 == 0`, every word decodes,
   `fee >= BUNDLE_BASE + 100_000 * words`.
 - Call: program exists; `proof.len() <= 2 MiB` (`gas::MAX_PROOF_BYTES`, raised for constraint
-  set 5's proof sizes); the proof verifies against the stored program's
+  set 5's proof sizes, re-measured and kept at constraint set 6's); the proof verifies against the stored program's
   `hc` for the tier it declares; `fee >= BUNDLE_BASE + call_fee(tier)`, checked last, once a
   verified proof has revealed the tier.
 - A block with an invalid call is invalid, like any other invalid transaction.

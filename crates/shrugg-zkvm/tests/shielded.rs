@@ -64,10 +64,11 @@ fn hc_bundle_is_the_vendored_guest_digest_and_domains_agree() {
     assert_eq!(ZkExecutor::bundle_program().code_hash(), RESEARCH_HC_BUNDLE_HEX);
     assert_eq!(ZkExecutor::bundle_program().words.len(), 3811);
     // `deploy/sync-zkvm.sh` rewrites `hash.rs`/`tables/cpu.rs`'s references to
-    // `notes::domain::{HC, IN}` into local constants rather than reverting that patch now that
-    // `notes.rs` is vendored; this is what keeps the two copies from drifting.
+    // `notes::domain::{HC, IN, PUB}` into local constants rather than reverting that patch now
+    // that `notes.rs` is vendored; this is what keeps the two copies from drifting.
     assert_eq!(notes::domain::HC, shrugg_zkvm::hash::HC_DOMAIN);
     assert_eq!(notes::domain::IN, shrugg_zkvm::hash::IN_DOMAIN);
+    assert_eq!(notes::domain::PUB, shrugg_zkvm::hash::PUB_DOMAIN);
 }
 
 /// S2/S3 scaffold. `Withdraw` and `BridgeAttest` publish an amount and a blinding `r` and let
@@ -131,7 +132,7 @@ fn a_bundle_proves_and_the_executor_verifies_it() {
     // Emulate first, in milliseconds, and check the witness against the core-side recompute before
     // paying for a proof: a witness the guest taints (`bad != 0`) publishes a digest no plaintext
     // can reproduce, and finding that out after the prover has run costs minutes.
-    let emulated = shrugg_zkvm::emulator::execute(ZkExecutor::bundle_program(), &inputs, 50_000_000).unwrap();
+    let emulated = shrugg_zkvm::emulator::execute(ZkExecutor::bundle_program(), &inputs, &[], 50_000_000).unwrap();
     assert_eq!(ex.bundle_digest(&di), emulated.outputs, "the witness is tainted or the digest preimage disagrees");
     let started = std::time::Instant::now();
     let (proof, digest, tier) = prove_bundle(FriProfile::Test, &inputs, Backend::Cpu).unwrap();

@@ -45,9 +45,9 @@ fn every_guest_proves_on_the_backend_and_verifies_on_the_cpu() {
     let m = Machine::new(FriProfile::Test);
     for (name, program, inputs) in guests::all() {
         let (proof, exec) = m
-            .prove_with(backend(), &program, &inputs, None)
+            .prove_with(backend(), &program, &inputs, &[], None)
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
-        let expected = execute(&program, &inputs, 1 << 20).unwrap();
+        let expected = execute(&program, &inputs, &[], 1 << 20).unwrap();
         assert_eq!(exec.outputs, expected.outputs, "{name}");
         m.verify(&program.digest(), &proof).unwrap_or_else(|e| panic!("{name}: verify {e:?}"));
         let bytes = proof.to_bytes();
@@ -60,8 +60,8 @@ fn every_guest_proves_on_the_backend_and_verifies_on_the_cpu() {
 fn backend_proof_has_the_same_shape_as_a_cpu_proof() {
     let m = Machine::new(FriProfile::Test);
     let p = guests::fib(10);
-    let (a, _) = m.prove_with(backend(), &p, &[], None).unwrap();
-    let (b, _) = m.prove(&p, &[], None).unwrap();
+    let (a, _) = m.prove_with(backend(), &p, &[], &[], None).unwrap();
+    let (b, _) = m.prove(&p, &[], &[], None).unwrap();
     assert_eq!(a.tier, b.tier);
     assert_eq!(a.public_values, b.public_values);
     assert_eq!(a.batch.degree_bits, b.batch.degree_bits);
@@ -133,6 +133,6 @@ fn backend_proof_has_the_same_shape_as_a_cpu_proof() {
 fn cpu_backend_still_proves_and_verifies() {
     let m = Machine::new(FriProfile::Test);
     let p = guests::fib(10);
-    let (proof, _) = m.prove_with(Backend::Cpu, &p, &[], None).unwrap();
+    let (proof, _) = m.prove_with(Backend::Cpu, &p, &[], &[], None).unwrap();
     m.verify(&p.digest(), &proof).unwrap();
 }
