@@ -78,7 +78,7 @@ behind a socket.
 | membership witness | `get_outs`, `get_output_distribution` (ring-signature decoys, no Merkle tree) | `z_gettreestate`; lightwalletd `GetTreeState`, `GetSubtreeRoots` (clients keep their own tree) | `shrugg_getWitness`, `shrugg_getAnchor`, `shrugg_getTreeInfo` |
 | wallet balance | `get_balance` (wallet RPC) | `z_getbalance`, `z_gettotalbalance` (zcashd holds keys) | `shrugg balance` (CLI, local key file) |
 | send | `transfer`, `transfer_split` | `z_sendmany` | `shrugg send` |
-| viewing keys | private view key; "view-only wallets"; `query_key` | `z_exportviewingkey` / `z_importviewingkey` (node scans on the holder's behalf), full and incoming viewing keys, unified keys | party viewing key `nk` (full history) and per-transaction `TxKey`; no node-side import yet |
+| viewing keys | private view key; "view-only wallets"; `query_key` | `z_exportviewingkey` / `z_importviewingkey` (node scans on the holder's behalf), full and incoming viewing keys, unified keys | party viewing key `nk` (full history) and per-transaction `TxKey`; node-side import for explorers: `shrugg_importViewingKey` / `shrugg_getViewingNotes` (in memory, 64 keys, 10 000 leaves per call) |
 | per-tx disclosure | `get_tx_key`, `get_tx_proof` / `check_tx_proof` (prove a payment to a third party) | `z_getpaymentdisclosure` (experimental), viewing keys | `TxKey` opens one transaction; a call's `CallEnvelope` opens one call's inputs |
 | supply audit | `get_reserve_proof` (prove a wallet holds ≥ X); no chain-wide value balance (RingCT hides amounts; inflation undetectable except via range proofs) | `getblockchaininfo.valuePools[].chainValue` — the per-pool value balance, exactly the invariant | `shrugg_getSupply` (*S2*, `docs/supply.md`) |
 | subscriptions | ZMQ `json-minimal-chain_main`, `json-minimal-txpool_add` | lightwalletd `GetMempoolStream`; zcashd ZMQ | none yet (planned: WebSocket `newHeads`) |
@@ -104,12 +104,15 @@ per-note spend tag); Zcash's nullifier is the direct ancestor of ours.
 - *Programs.* Neither Monero nor Zcash has confidential programs; SHRUGG's `getReceipt`,
   `getProgram*` and `getCallEnvelope` have no counterpart.
 - *Keys in the node.* zcashd and monero-wallet-rpc can hold keys and scan on the holder's
-  behalf; SHRUGG's node never holds a key. A node-side "import a viewing key" for explorers
-  (RandScan) would be the Zcash `z_importviewingkey` equivalent and is a candidate for the RPC
-  hardening task.
+  behalf. SHRUGG's node now does the same for **viewing keys only**: `shrugg_importViewingKey`
+  hands one over (the `z_importviewingkey` equivalent an explorer like RandScan needs), held in
+  memory, capped at 64, cleared at restart — deliberately never on disk. The RPC layer has no
+  type for a spend key, so the property is narrowed, not abandoned: an imported key can disclose
+  notes but never move them.
 
-**What SHRUGG should borrow.** Zcash's compact-block range stream (planned as
-`shrugg_getCompactBlocks`), lightwalletd's mempool stream (the `newHeads`/mempool subscription),
-Monero's `check_tx_proof` shape for third-party payment proofs (a `TxKey` already gives the
-capability; a `shrugg_checkTransaction(tx, key)` RPC would make it a one-call verification for
-an explorer), and Zcash's viewing-key import for explorer-side views.
+**What SHRUGG has borrowed, and what remains.** The compact-block range stream shipped as
+`shrugg_getCompactBlocks`, the head stream as the WebSocket `newHeads` subscription, and
+Zcash's viewing-key import as `shrugg_importViewingKey` / `shrugg_getViewingNotes` for
+explorer-side views. What remains is Monero's `check_tx_proof` shape for third-party payment
+proofs (a `TxKey` already gives the capability client-side; a `shrugg_checkTransaction(tx, key)`
+RPC would make it a one-call verification for an explorer).

@@ -129,6 +129,7 @@ pub async fn serve_heads(capacity: usize) -> (SocketAddr, broadcast::Sender<Head
         executor: Arc::new(StubExecutor),
         heads: heads.clone(),
         ws_conns: Arc::new(AtomicUsize::new(0)),
+        viewing: Arc::new(RwLock::new(shrugg_node::viewing::Registry::default())),
     };
     let ws_conns = state.ws_conns.clone();
     let (addr, task) = shrugg_node::rpc::serve("127.0.0.1:0".parse().unwrap(), state).await.expect("rpc binds");

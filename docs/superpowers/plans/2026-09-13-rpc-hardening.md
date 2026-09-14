@@ -131,6 +131,10 @@ Nothing in this plan needs one, and these are the things that would:
 Candidates from `docs/rpc-comparison.md` deliberately **not** in this plan. They are not forks — they are product decisions the user has not made:
 
 - **Node-side viewing-key import for explorers** (`docs/rpc-comparison.md` §4, "Keys in the node" and "What SHRUGG should borrow"): the Zcash `z_importviewingkey` equivalent. It breaks the "the node never holds a key" model, which is a stated property of this chain, not an oversight.
+  **Decided 2026-09-14: built** on the `rpc-viewing` branch — `shrugg_importViewingKey` /
+  `shrugg_getViewingNotes`, viewing keys only, in memory (never on disk), capped at 64 keys and
+  10 000 scanned leaves per call, cleared at restart. The property is narrowed by an explicit
+  operator decision, per key, per node; the RPC layer still has no type for a spend key.
 - **`shrugg_checkTransaction(tx, key)`**, the Monero `check_tx_proof` shape for third-party payment proofs (§4). A `TxKey` already gives the capability client-side; the RPC would make it one call for an explorer — and would put a viewing key in a request body.
 - **A mempool-aware `next_nonce` RPC** (`AGENTS.md` → Open follow-ups, the wallet's stale-nonce race on fast double-sends). Node-only and fork-free, but it is a wallet-protocol decision paired with a `shrugg-client` change, and the user scoped this task to the four items above.
 

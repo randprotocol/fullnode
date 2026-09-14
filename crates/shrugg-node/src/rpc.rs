@@ -82,6 +82,11 @@ pub struct NodeStatus {
     /// transactions, and it is unrelated to the sync counters above.
     pub verify_queue: usize,
     pub mempool_size: usize,
+    /// Viewing keys this node holds for node-side scanning (`shrugg_importViewingKey`), against
+    /// `viewing::MAX_VIEWING_KEYS`. In memory only, so it reads zero after every restart. Nonzero
+    /// changes what compromising this process would disclose: the notes those keys open — which
+    /// their holders can already see, and never spend authority.
+    pub viewing_keys: usize,
     /// This node holds a validator key and is running as one (`--validator`).
     pub is_validator: bool,
     /// That key is in the validator set of the epoch the next block belongs to (spec §8). A
@@ -165,6 +170,10 @@ pub struct RpcState {
     pub heads: tokio::sync::broadcast::Sender<HeadSummary>,
     /// Live WebSocket connections, against [`crate::ws::MAX_WS_CONNECTIONS`].
     pub ws_conns: Arc<std::sync::atomic::AtomicUsize>,
+    /// Viewing keys imported for node-side scanning (`shrugg_importViewingKey`), in memory only:
+    /// a restart clears them. Nothing else in the process reads it — the scan is lazy, driven by
+    /// `shrugg_getViewingNotes` calls.
+    pub viewing: Arc<RwLock<crate::viewing::Registry>>,
 }
 
 #[derive(Deserialize)]
@@ -363,6 +372,45 @@ where
     }
 }
 
+/// The viewing-key surface's own failure set. Storage errors ride the same channel so the arms
+/// can use `?` for both.
+enum ViewingError {
+    Full,
+    NotImported,
+    Storage(crate::storage::StorageError),
+}
+
+impl From<crate::storage::StorageError> for ViewingError {
+    fn from(e: crate::storage::StorageError) -> ViewingError {
+        ViewingError::Storage(e)
+    }
+}
+
+impl From<crate::viewing::RegistryFull> for ViewingError {
+    fn from(_: crate::viewing::RegistryFull) -> ViewingError {
+        ViewingError::Full
+    }
+}
+
+/// `blocking` for the viewing-key arms: same spawn-blocking discipline (a scan trial-decrypts up
+/// to `viewing::MAX_SCAN_ROWS` envelopes per call), a different error channel — the import cap
+/// is a refusal and an unimported key is not-found, and neither is an internal error.
+async fn blocking_viewing<T, F>(f: F) -> Result<T, RpcError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ViewingError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(t)) => Ok(t),
+        Ok(Err(ViewingError::Full)) => Err(RpcError::rejected(crate::viewing::RegistryFull.to_string())),
+        Ok(Err(ViewingError::NotImported)) => {
+            Err(RpcError::not_found("that viewing key is not imported on this node"))
+        }
+        Ok(Err(ViewingError::Storage(e))) => Err(RpcError::internal(e)),
+        Err(e) => Err(RpcError::internal(format!("storage task failed: {e}"))),
+    }
+}
+
 fn param<T: serde::de::DeserializeOwned>(params: &Value, idx: usize, name: &str) -> Result<T, RpcError> {
     let v = params.get(idx).ok_or_else(|| RpcError::invalid_params(format!("missing param {name}")))?;
     serde_json::from_value(v.clone()).map_err(|e| RpcError::invalid_params(format!("bad param {name}: {e}")))
@@ -399,6 +447,26 @@ fn parse_bytes32(params: &Value, idx: usize, name: &str) -> Result<[u8; 32], Rpc
     bytes
         .try_into()
         .map_err(|v: Vec<u8>| RpcError::invalid_params(format!("{name} must be 32 bytes, got {}", v.len())))
+}
+
+/// A `Word8` parameter as 64 hex characters, with or without `0x` — a viewing key's `nk`.
+fn parse_word8(params: &Value, idx: usize, name: &str) -> Result<shrugg_core::Word8, RpcError> {
+    let s: String = param(params, idx, name)?;
+    shrugg_core::notes::word8_from_hex(s.strip_prefix("0x").unwrap_or(&s))
+        .ok_or_else(|| RpcError::invalid_params(format!("{name} must be 64 hex characters")))
+}
+
+/// A note as the viewing-key methods report it. The amount is a **string**, like every amount
+/// this RPC serves as chain state (`getValidators`, `getSupply`): a note's amount is a u64 a
+/// JSON number cannot hold past 2^53, and these rows exist to be summed.
+fn note_json(n: &shrugg_zkvm::notes::Note) -> Value {
+    json!({
+        "pk": word8_to_hex(&n.pk),
+        "from": word8_to_hex(&n.from),
+        "amount": n.amount.to_string(),
+        "asset": n.asset,
+        "time": n.time,
+    })
 }
 
 /// A page size, clamped to `MAX_PAGE`. A missing or null `limit` asks for the maximum.
@@ -768,6 +836,72 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let nullifiers = st.storage.nullifiers_count().map_err(RpcError::internal)?;
             Ok(json!({ "next_index": next_index, "root": word8_to_hex(&root), "nullifiers": nullifiers }))
         }
+        // ---- node-side viewing keys (`docs/rpc-comparison.md` §4) ----
+        // The Zcash `z_importviewingkey` analogue, and the one deliberate exception to "the node
+        // never holds a key": an operator hands this node a viewing key and the node scans for
+        // that key's notes on the holder's behalf — what a block explorer runs a node *for*. The
+        // RPC layer has no type for a *spend* key, so nothing here can move value. Imports are
+        // in memory only; a restart clears them.
+        "shrugg_importViewingKey" => {
+            let nk = parse_word8(p, 0, "viewing_key")?;
+            let rescan_from_height: u64 = match p.get(1) {
+                None | Some(Value::Null) => 0,
+                Some(_) => param(p, 1, "rescan_from_height")?,
+            };
+            let (viewing, storage) = (st.viewing.clone(), st.storage.clone());
+            blocking_viewing(move || {
+                // The cursor starts at the first leaf of that height (one binary search), so the
+                // scan never reads — let alone trial-decrypts — anything earlier.
+                let start = storage.first_note_at_or_after(rescan_from_height)?;
+                let mut reg = viewing.write().unwrap_or_else(|e| e.into_inner());
+                let imported = reg.import(nk, rescan_from_height, start)?;
+                Ok(json!({ "imported": imported, "rescan_from_height": rescan_from_height, "viewing_keys": reg.len() }))
+            })
+            .await
+        }
+        // The scan is lazy and lives here: import only records the key, and each call advances
+        // the cursor by at most `viewing::MAX_SCAN_ROWS` leaves (the rescan-range cap), so one
+        // request can never make the node re-walk unbounded history.
+        "shrugg_getViewingNotes" => {
+            let nk = parse_word8(p, 0, "viewing_key")?;
+            let from_index: u64 = match p.get(1) {
+                None | Some(Value::Null) => 0,
+                Some(_) => param(p, 1, "from_index")?,
+            };
+            let limit = parse_limit(p, 2)?;
+            let (viewing, storage) = (st.viewing.clone(), st.storage.clone());
+            blocking_viewing(move || {
+                let mut reg = viewing.write().unwrap_or_else(|e| e.into_inner());
+                let import = reg.get_mut(&nk).ok_or(ViewingError::NotImported)?;
+                crate::viewing::advance(&storage, import, crate::viewing::MAX_SCAN_ROWS)?;
+                let next_index = storage.notes_count()?;
+                let mut notes = Vec::new();
+                for n in import.notes.iter().filter(|n| n.index >= from_index).take(limit) {
+                    // A received note's nullifier is a function of this key, so its spent state is
+                    // a point lookup served fresh on every call; a sent note belongs to someone
+                    // else and has neither.
+                    let (nullifier, spent) = match n.role {
+                        crate::viewing::Role::Received => {
+                            let nf = import.vk.nullifier(&n.cm);
+                            (Some(word8_to_hex(&nf)), Some(storage.nullifier_height(&nf)?.is_some()))
+                        }
+                        crate::viewing::Role::Sent => (None, None),
+                    };
+                    notes.push(json!({
+                        "index": n.index, "cm": word8_to_hex(&n.cm), "height": n.height,
+                        "role": n.role.as_str(), "note": note_json(&n.note),
+                        "nullifier": nullifier, "spent": spent,
+                    }));
+                }
+                Ok(json!({
+                    "scanned_index": import.scanned_index,
+                    "next_index": next_index,
+                    "complete": import.scanned_index >= next_index,
+                    "notes": notes,
+                }))
+            })
+            .await
+        }
         // ---- confidential computation ----
         "shrugg_getProgram" => {
             let id = parse_hash(p, 0)?;
@@ -1079,6 +1213,7 @@ mod tests {
             executor: Arc::new(StubExecutor),
             heads: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
             ws_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            viewing: Arc::new(RwLock::new(crate::viewing::Registry::default())),
         }
     }
 
@@ -1276,6 +1411,9 @@ mod tests {
         assert_eq!(v["nullifiers"], 2);
         assert_eq!(v["tree_root"], word8_to_hex(&st.storage.tree().unwrap().root()));
         assert_eq!(v["hc_bundle"], word8_to_hex(&fixtures::HC));
+        // Written by the node loop's publish_status, which these tests don't run: zero here, and
+        // present — an operator must be able to see the node is holding keys at all.
+        assert_eq!(v["viewing_keys"], 0);
     }
 
     #[tokio::test]
@@ -2035,6 +2173,161 @@ mod tests {
                 "attest_first={attest_first}: the envelope the chain sealed, not the action's"
             );
         }
+    }
+
+    // --------------------------------------------------------- viewing keys
+    //
+    // Node-side import (`shrugg_importViewingKey` + `shrugg_getViewingNotes`, the Zcash
+    // `z_importviewingkey` analogue). The fixture chain every case here
+    // runs on: block 1 pays Alice 500 (sealed by Bob) and Bob 700 (sealed by Alice) in one
+    // bundle, block 2 pays Alice 900 — on top of one genesis alloc, so five leaves.
+
+    /// The two-block chain above, plus the running ledger and tip so a test can extend it, and
+    /// the three notes (which cannot be rebuilt later: `Note::new` draws a fresh `r`).
+    fn viewing_chain() -> (
+        tempfile::TempDir,
+        RpcState,
+        shrugg_core::Ledger,
+        shrugg_core::Block,
+        shrugg_zkvm::notes::Note,
+        shrugg_zkvm::notes::Note,
+        shrugg_zkvm::notes::Note,
+    ) {
+        use crate::viewing::testkit::{key_vk, note_for, sealed_to};
+        use shrugg_zkvm::viewing::TxKey;
+
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (dir, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let (alice, bob) = (key_vk(1), key_vk(2));
+
+        let a500 = note_for(&alice, &bob, 500);
+        let b700 = note_for(&bob, &alice, 700);
+        let mut bundle =
+            fixtures::bundle(&ledger, [[31; 8], [32; 8]], [a500.commitment(), b700.commitment()], bundle_fee());
+        bundle.envelopes = [
+            sealed_to(&bob, &alice, &a500, &TxKey([11; 32])),
+            sealed_to(&alice, &bob, &b700, &TxKey([12; 32])),
+        ];
+        let tx1 = Transaction::shielded(gs.chain_id, bundle, Action::None);
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx1], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+
+        let a900 = note_for(&alice, &bob, 900);
+        let mut bundle = fixtures::bundle(&ledger, [[33; 8], [34; 8]], [a900.commitment(), [44; 8]], bundle_fee());
+        bundle.envelopes = [sealed_to(&bob, &alice, &a900, &TxKey([13; 32])), fixtures::env(9)];
+        let tx2 = Transaction::shielded(gs.chain_id, bundle, Action::None);
+        let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &key(1));
+        st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+
+        (dir, st, ledger, b2.block, a500, b700, a900)
+    }
+
+    /// Import a key, scan, and read back exactly that key's view of the pool: Alice's two
+    /// receipts and the note she sent, in tree order — and, for Bob, the mirror image.
+    #[tokio::test]
+    async fn import_and_scan_finds_the_keys_notes_and_nobody_elses() {
+        use crate::viewing::testkit::{key_vk, nk_hex};
+        let (_d, st, ..) = viewing_chain();
+        let (alice, bob) = (key_vk(1), key_vk(2));
+
+        let v = ok(&st, "shrugg_importViewingKey", json!([nk_hex(&alice)])).await;
+        assert_eq!(v, json!({ "imported": true, "rescan_from_height": 0, "viewing_keys": 1 }));
+        // Re-importing the same key is a no-op, not a second key and not a rescan.
+        let v = ok(&st, "shrugg_importViewingKey", json!([nk_hex(&alice)])).await;
+        assert_eq!((&v["imported"], &v["viewing_keys"]), (&json!(false), &json!(1)));
+
+        let v = ok(&st, "shrugg_getViewingNotes", json!([nk_hex(&alice)])).await;
+        assert_eq!((&v["scanned_index"], &v["next_index"], &v["complete"]), (&json!(5), &json!(5), &json!(true)));
+        let rows = v["notes"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        // In tree order: received 500 at height 1, sent 700 at height 1, received 900 at 2.
+        assert_eq!((&rows[0]["index"], &rows[0]["role"], &rows[0]["height"]), (&json!(1), &json!("received"), &json!(1)));
+        assert_eq!((&rows[1]["index"], &rows[1]["role"]), (&json!(2), &json!("sent")));
+        assert_eq!((&rows[2]["index"], &rows[2]["role"], &rows[2]["height"]), (&json!(3), &json!("received"), &json!(2)));
+        // Amounts are strings, like every amount this RPC reports as chain state.
+        assert_eq!(rows[0]["note"]["amount"], "500");
+        assert_eq!(rows[1]["note"]["amount"], "700");
+        assert_eq!(rows[2]["note"]["amount"], "900");
+        // A received row carries the nullifier (a function of this key) and its spent state; a
+        // sent row has neither — the note belongs to someone else.
+        assert!(rows[0]["nullifier"].is_string());
+        assert_eq!(rows[0]["spent"], false);
+        assert!(rows[1]["nullifier"].is_null());
+        assert!(rows[1]["spent"].is_null());
+
+        // Bob's key sees the mirror image: he sent the 500 and the 900, and owns the 700.
+        ok(&st, "shrugg_importViewingKey", json!([nk_hex(&bob)])).await;
+        let v = ok(&st, "shrugg_getViewingNotes", json!([nk_hex(&bob)])).await;
+        let roles: Vec<&str> = v["notes"].as_array().unwrap().iter().map(|r| r["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["sent", "received", "sent"]);
+
+        // A key nobody imported is not-found; a malformed one is a parameter error, on both
+        // methods, before any storage read.
+        let err = call(&st, "shrugg_getViewingNotes", json!([nk_hex(&key_vk(9))])).await.unwrap_err();
+        assert_eq!(err.code, -32001);
+        for bad in ["zz", "00", "abab"] {
+            assert_eq!(call(&st, "shrugg_importViewingKey", json!([bad])).await.unwrap_err().code, -32602, "{bad}");
+            assert_eq!(call(&st, "shrugg_getViewingNotes", json!([bad])).await.unwrap_err().code, -32602, "{bad}");
+        }
+    }
+
+    /// The rescan floor: importing from height 2 never touches block 1's leaves, so the one note
+    /// found is the 900 — and the reply still reports the whole tree was walked from there.
+    #[tokio::test]
+    async fn import_with_a_rescan_height_skips_earlier_notes() {
+        use crate::viewing::testkit::{key_vk, nk_hex};
+        let (_d, st, ..) = viewing_chain();
+        let alice = key_vk(1);
+        let v = ok(&st, "shrugg_importViewingKey", json!([nk_hex(&alice), 2])).await;
+        assert_eq!(v, json!({ "imported": true, "rescan_from_height": 2, "viewing_keys": 1 }));
+        let v = ok(&st, "shrugg_getViewingNotes", json!([nk_hex(&alice)])).await;
+        assert_eq!(v["complete"], true);
+        let rows = v["notes"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((&rows[0]["index"], &rows[0]["note"]["amount"]), (&json!(3), &json!("900".to_string())));
+    }
+
+    /// A spend shows up as soon as its nullifier is committed: the received note's `spent` flips
+    /// and the nullifier the row already carried is the one the chain published.
+    #[tokio::test]
+    async fn viewing_notes_report_a_spend_once_its_nullifier_lands() {
+        use crate::viewing::testkit::{key_vk, nk_hex};
+        let (_d, st, mut ledger, parent, a500, _, _) = viewing_chain();
+        let alice = key_vk(1);
+        ok(&st, "shrugg_importViewingKey", json!([nk_hex(&alice)])).await;
+
+        let nf = alice.nullifier(&a500.commitment());
+        let tx = fixtures::bundle_tx(&ledger, [nf, [77; 8]], [[55; 8], [56; 8]], bundle_fee());
+        let b3 = make_block(&parent, &mut ledger, vec![tx], &key(1));
+        st.storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+
+        let v = ok(&st, "shrugg_getViewingNotes", json!([nk_hex(&alice)])).await;
+        let rows = v["notes"].as_array().unwrap();
+        // The scan also picked up the new block's two leaves (placeholder envelopes, no match),
+        // and the 500 is now spent — by exactly the nullifier the row reports.
+        assert_eq!(v["scanned_index"], 7);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["nullifier"], word8_to_hex(&nf));
+        assert_eq!(rows[0]["spent"], true);
+        assert_eq!(rows[2]["spent"], false, "the 900 is untouched");
+    }
+
+    /// The import cap: `MAX_VIEWING_KEYS` distinct keys and no more; a key already held is still
+    /// a no-op at the cap.
+    #[tokio::test]
+    async fn the_import_cap_is_enforced() {
+        let gs = fixtures::genesis(7);
+        let (_d, st) = state_for(&gs);
+        for i in 0..crate::viewing::MAX_VIEWING_KEYS {
+            let v = ok(&st, "shrugg_importViewingKey", json!([word8_to_hex(&[i as u32 + 1; 8])])).await;
+            assert_eq!(v["viewing_keys"], i + 1);
+        }
+        let err = call(&st, "shrugg_importViewingKey", json!([word8_to_hex(&[0xbeef; 8])])).await.unwrap_err();
+        assert_eq!(err.code, -32000);
+        assert!(err.message.contains(&crate::viewing::MAX_VIEWING_KEYS.to_string()), "{}", err.message);
+        let v = ok(&st, "shrugg_importViewingKey", json!([word8_to_hex(&[1u32; 8])])).await;
+        assert_eq!(v["imported"], false);
     }
 
     // --------------------------------------------------------- batch requests
