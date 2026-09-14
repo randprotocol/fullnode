@@ -324,7 +324,8 @@ Params: `[]`. Result:
   "height": 1998, "head_hash": "…", "view": 2251, "high_qc_view": 2250,
   "syncing": false, "sync_target": 1998,
   "sync_inflight_age_ms": null, "sync_failures": 0, "sync_late_batches": 0,
-  "peer_count": 5, "connected_peers": 5, "ws_clients": 3, "mempool_size": 0,
+  "peer_count": 5, "connected_peers": 5, "ws_clients": 3, "refused_cache": 0,
+  "verify_queue": 0, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
   "fri_profile": "production", "programs": 2,
   "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19",
@@ -353,6 +354,14 @@ otherwise looks identical to a node that is behind and working:
 - `ws_clients` — WebSocket clients connected right now, against the 64 this node will carry (see
   [Subscriptions](#subscriptions-websocket)). At 64 the next upgrade is refused with a `503`, which
   otherwise shows up only as clients that cannot connect for no visible reason.
+- `refused_cache` — transactions this node has already refused for a reason that is a function of
+  the bytes alone (a bad proof or mint signature, an oversized part) and now refuses again by hash,
+  for free. Bounded at 8192, oldest evicted first; a count pinned at the cap is a flood of distinct
+  bad transactions, and the per-peer gossip rate limit is the bound that actually holds.
+- `verify_queue` — transactions waiting for one of the four proof-verification workers that run
+  off the consensus loop. 64 deep at most; a queue that stays full means verifications are arriving
+  faster than ~20 ms apiece drains them, and what does not fit is shed — an honest peer re-gossips
+  on its next heartbeat — rather than queued unboundedly.
 
 `is_validator` says this node holds a validator key; `active_validator`
 says that key is in the set running the current epoch (spec §8) — a validator that has bonded in
@@ -608,3 +617,36 @@ per block (`docs/block-space.md`).
 A wallet builds all of this through `shrugg_client::wallet::{send, submit}`, which selects the
 inputs, fetches the anchor and the witnesses, proves the bundle, seals both envelopes, and checks
 the proof's published digest against the one it computed before it submits anything.
+
+## Changelog
+
+What changed for clients, in one place. Newest first.
+
+### 2026-09-14 — RPC hardening
+
+No wire format, block or consensus rule changed: old and new nodes interoperate, and a fleet
+upgrades by ordinary restart. What a client can see:
+
+- **`shrugg_getCompactBlocks(from_height, to_height)`** is new: per block its height, hash and
+  timestamp, and per transaction the note commitments it created (leaf index, commitment, envelope)
+  and the nullifiers it spent. At most 128 blocks per call and, past the first block — which is
+  always served whole — 1000 notes; resume from the last returned height plus one. This is the
+  one-round-trip note stream a light wallet syncs with.
+- **Batch requests** are new: a POST body may be an array of at most 20 request objects, answered
+  as an array of the same length in request order. A request object with no `id` member — a
+  JSON-RPC notification — is refused with `-32600`, batched or not; an explicit `"id": null` is
+  still a normal request.
+- **A WebSocket endpoint on the same port** (`/` and `/ws`) is new, serving one subscription,
+  `newHeads`, through `shrugg_subscribe` / `shrugg_unsubscribe`: one notification per committed
+  block, in order, in `shrugg_getHead`'s shape. Bounded — 64 connections per node, 8 subscriptions
+  per connection, 64 KiB per client frame, 256 heads of backlog — and a subscriber that falls
+  further behind than that is closed (code `1008`), not buffered; the recovery is to reconnect and
+  fill the gap with `shrugg_getCompactBlocks`.
+- **`shrugg_status` gains three fields**: `ws_clients`, `refused_cache` and `verify_queue`, beside
+  the four sync fields (`sync_inflight_age_ms`, `sync_failures`, `sync_late_batches`,
+  `connected_peers`), which are unchanged.
+- **`-32600` is newly documented, not new**: it already answered an oversized or unparseable body,
+  and now also covers the malformed-batch shapes and notifications.
+- **The one behaviour change an existing client can notice**: a transaction submitted over RPC is
+  answered after its proof has verified on a worker rather than on the consensus loop, so the reply
+  can take a few hundred milliseconds longer under load. The error messages are unchanged.

@@ -18,7 +18,7 @@ chain with a proof instead of their inputs.
 | Bridged assets | the guardian bridge as notes: a bridged holding is a note whose `asset` word is the registry's index, an attestation deposits one note the chain computes itself, and a burn is the chain's one two-bundle transaction (`docs/bridge.md`) |
 | Confidential computation | Rand zkVM: RV32I under a Plonky3 batch STARK (Goldilocks, Poseidon2, ZK-hiding FRI); programs deployed on chain, calls carry a proof + 8 public outputs, gas by tier, and pay through a bundle like everything else |
 | Storage | one RocksDB per node with column families for blocks, certificates, indexes, notes, nullifiers, anchors, validators, programs and receipts; fsynced commits; startup integrity check with truncate-and-resync |
-| Interfaces | JSON-RPC 2.0 over HTTP (`shrugg-node`), `shrugg` wallet CLI with a local prover, Rust client library |
+| Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` subscription on the same port (`shrugg-node`), `shrugg` wallet CLI with a local prover, Rust client library |
 
 Status: an experimental testnet (see `deploy/README.md`) runs across two laptops and four cloud
 servers. That fleet is still on **chain 5, an account chain**: the shielded pool is a hard fork and

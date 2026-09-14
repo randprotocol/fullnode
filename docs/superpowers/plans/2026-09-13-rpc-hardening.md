@@ -1972,7 +1972,7 @@ EOF
 - Modify: `crates/shrugg-node/tests/cluster.rs`
 - Modify: `docs/rpc.md` (a new `## Changelog` section), `docs/rpc-comparison.md` (§2), `docs/architecture.md` (§8), `AGENTS.md` (Open follow-ups), `README.md` (the Interfaces row)
 
-- [ ] **Step 1: Write the failing cluster tests**
+- [x] **Step 1: Write the failing cluster tests**
 
 Two additions, both on chains the file already builds. `cluster.rs` gives you `keys` (:105),
 `genesis` (:148), `genesis_funding` (:164), `start_node` (:276, FAST) / `start_node_at` (:280, takes
@@ -2067,7 +2067,7 @@ async fn a_refused_transaction_is_not_verified_twice() {
 }
 ```
 
-- [ ] **Step 2: Run the two new cluster tests and see them fail**
+- [x] **Step 2: Run the two new cluster tests and see them fail**
 
 Run: `cargo test --release -p shrugg-node --test cluster -- compact_blocks_agree a_refused_transaction`
 Expected: the compact-block one fails on the assertion (or compiles and passes if Task 1 landed correctly — in which case assert it *does* pass and move on); the refused-cache one fails on `refused_cache` not existing if Task 5 missed the status field.
@@ -2075,11 +2075,11 @@ Expected: the compact-block one fails on the assertion (or compiles and passes i
 Even this focused run takes the proving slot for the compact-block half, so it will wait if another
 session holds the lock. Budget minutes, not seconds, and check the lock before blaming the test.
 
-- [ ] **Step 3: Make them pass**
+- [x] **Step 3: Make them pass**
 
 Fix whatever the two tests surface. No new production code should be needed; if something is, it belongs to the task that owns that file and the commit message should say so.
 
-- [ ] **Step 4: Run the whole cluster suite, once**
+- [x] **Step 4: Run the whole cluster suite, once**
 
 Run: `cargo test --release -p shrugg-node --test cluster`
 Expected: PASS — **19 tests (17 existing + 2), about 20 minutes**, or ~22 if the compact-block assertion was written as its own proving test rather than folded into `two_validators_commit_and_shielded_transfer`. The suite measured 17 tests / 19m59s on 2026-09-13 *because* the proving slot serialises its twelve bundle proofs and two program proofs; the 16 tests / 6m28s this plan was drafted against is the pre-slot number and will not be seen again.
@@ -2095,7 +2095,7 @@ should stay silent.
 regression in fix-sync-stall's batch sizing if this plan touched it — they should be untouched and
 green, which is the evidence that it did not.
 
-- [ ] **Step 5: Write the documentation**
+- [x] **Step 5: Write the documentation**
 
 0. **Everywhere in `docs/rpc.md`: append, never overwrite.** fix-sync-stall rewrote the `shrugg_status` section (the example object at :258 now carries `sync_inflight_age_ms`, `sync_failures`, `sync_late_batches` and `connected_peers`, with four explanatory bullets after it) and added the behaviour `-32600` describes without adding its Errors row. The new keys, the new bullets and the sync prose all stay exactly as they are; this plan adds `ws_clients` / `refused_cache` / `verify_queue` to that example and one bullet each, and adds the `-32600` row.
 1. **`docs/rpc.md`** — add a `## Changelog` section at the end, headed "what changed for clients", listing in one place: `shrugg_getCompactBlocks` (new; the shape and the caps); batch requests (new; the 20 cap; notifications refused with `-32600`); the WebSocket endpoint and `newHeads` (new; same port, the caps, the drop-on-lag rule); `shrugg_status` gains `ws_clients`, `refused_cache`, `verify_queue` (beside the four sync fields fix-sync-stall added, which are unchanged); the `-32600` error code is newly *documented* — it already existed for an oversized or unparseable body, and this plan adds the batch-shape and notification uses; and the one behaviour change an existing client can notice — **a transaction submitted over RPC is now answered after its proof has verified on a worker rather than on the consensus loop, so the reply can take a few hundred milliseconds longer under load, and the error messages are unchanged**. Note explicitly that no wire format, block, or consensus rule changed and that old and new nodes interoperate.
@@ -2104,7 +2104,7 @@ green, which is the evidence that it did not.
 4. **`docs/architecture.md` §8** — the Mempool numbered list becomes the new order (duplicate hash → pool conflicts → capacity → the staleness half of `Ledger::validate` → *queue for off-loop verification* → the proofs on a blocking task → `insert_verified` against the tip), with the gossipsub application-validation paragraph and the report-exactly-once invariant. §9c's sentence about the RPC handler is updated the same way.
 5. **`README.md`** — the Interfaces row: "JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` subscription on the same port (`shrugg-node`), `shrugg` wallet CLI with a local prover, Rust client library".
 
-- [ ] **Step 6: Verify the docs against the code**
+- [x] **Step 6: Verify the docs against the code**
 
 Run: `cargo test --release -p shrugg-node --lib` and re-read `docs/rpc.md`'s new sections against the constants in `rpc.rs`, `ws.rs` and `admission.rs`. Every number in the docs (128, 1000, 20, 64, 8, 256, 8192, 16, 4) must be the constant's value. Fix any drift.
 
@@ -2113,7 +2113,7 @@ as derived from `2 * MAX_PROOF_BYTES` and the envelope caps (it is a `const` exp
 formula, not a stale byte count), and the four sync bullets must read exactly as fix-sync-stall left
 them. A docs diff that touches those lines is a mistake in this step.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/shrugg-node/tests/cluster.rs docs/rpc.md docs/rpc-comparison.md \

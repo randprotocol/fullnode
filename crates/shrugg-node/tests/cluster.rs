@@ -34,6 +34,7 @@ use shrugg_zkvm::machine::{Backend, FriProfile};
 use shrugg_zkvm::notes::{Note, SpendKey};
 use shrugg_zkvm::viewing::TxKey;
 use shrugg_zkvm::{call_envelope, hash};
+use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 /// One proof at a time, for every test in this file and in `shrugg-client`'s `wallet_flow.rs`.
@@ -683,6 +684,48 @@ async fn faucet_is_rejected_when_genesis_disables_it() {
     assert_eq!(a.handle.storage.notes_count().unwrap(), 0);
 }
 
+/// The refused cache end to end: a mint whose signature does not check is a permanent verdict,
+/// so the second copy of the same bytes is refused without a second verification — and the
+/// count an operator reads says so. No proving: a bad mint signature needs no bundle, which is
+/// why this runs on a FAST chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_transaction_is_not_verified_twice() {
+    init_tracing();
+    // One validator: two in the set with only one running could never form a QC, and this
+    // test needs the chain to commit.
+    let ks = keys(1);
+    let gen = genesis(&ks);
+    let n0 = start_node(&ks[0], &gen, vec![], true).await;
+    wait_height(&[&n0], 2, Duration::from_secs(20)).await;
+    assert_eq!(n0.handle.status.read().unwrap().refused_cache, 0);
+
+    // A mint that names a real validator as its minter and carries a signature over nothing.
+    let bad = Transaction {
+        chain_id: CHAIN_ID,
+        bundle: None,
+        action: Action::Mint {
+            cm: [9; 8],
+            envelope: Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] },
+            amount: 1_000,
+            minter: ks[0].public_key().clone(),
+            signature: shrugg_core::Signature::empty(),
+        },
+    };
+    let first = n0.rpc.send_transaction(&bad).await.unwrap_err().to_string();
+    assert!(first.contains("mint signature"), "{first}");
+    wait_for("the refusal to be cached", Duration::from_secs(5), || {
+        n0.handle.status.read().unwrap().refused_cache == 1
+    })
+    .await;
+    // The same bytes again: the same refusal, and the cache did not grow — it answered.
+    let again = n0.rpc.send_transaction(&bad).await.unwrap_err().to_string();
+    assert!(again.contains("mint signature"), "{again}");
+    assert_eq!(n0.handle.status.read().unwrap().refused_cache, 1);
+    // A legitimate transaction still goes through, so the cache is not a blanket refusal.
+    n0.mint(7, 5 * UNITS_PER_SHRUGG).await;
+    stop(n0).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_build_whose_bundle_guest_differs_from_genesis_refuses_to_start() {
     init_tracing();
@@ -778,6 +821,65 @@ async fn two_validators_commit_and_shielded_transfer() {
     let tx = n0.handle.storage.block_by_height(height).unwrap().unwrap().transactions[index as usize].clone();
     let err = n0.rpc.send_transaction(&tx).await.unwrap_err().to_string();
     assert!(err.contains("spent"), "a replayed bundle must be refused as spent: {err}");
+
+    // The compact-block read against this chain: a wallet that has only ever called
+    // getCompactBlocks sees exactly the leaves and nullifiers getCommitments and getNullifiers
+    // report, and the rows are grouped by the transaction that produced them. Folded into this
+    // test rather than given one of its own because the proving slot serialises the suite — a
+    // second copy of this opening is a thirteenth bundle proof and ~95–100 s of wall time, and
+    // these assertions need no chain of their own.
+    let head = n0.rpc.head().await.unwrap()["height"].as_u64().unwrap();
+    wait_height(&[&n1], head, Duration::from_secs(30)).await;
+    // Page the range as a wallet must: one call covers at most 128 blocks, so resume from the
+    // last returned height + 1 until the range is done. Not ceremony — under the full suite this
+    // test's own chain keeps making 3 s blocks while the proof waits for the slot, and the
+    // transfer landed at height 181, past the first page, where a single [0, head] call is
+    // silently clamped to 128 blocks.
+    let mut compact: Vec<Value> = Vec::new();
+    let mut from = 0;
+    while from <= head {
+        let page = n0.rpc.call("shrugg_getCompactBlocks", json!([from, head])).await.unwrap();
+        let page = page.as_array().unwrap();
+        assert!(!page.is_empty(), "a page inside [0, {head}] is never empty");
+        from = page.last().unwrap()["height"].as_u64().unwrap() + 1;
+        compact.extend(page.iter().cloned());
+    }
+
+    // Every leaf, in the same order and with the same envelopes, as the paged read. The
+    // block-level `commitments` flatten first only because the one block that has any — height
+    // 0's genesis deposit — has no transactions; every later block's array is empty, so the
+    // flatten is in tree order.
+    let flat: Vec<Value> = compact
+        .iter()
+        .flat_map(|b| {
+            b["commitments"].as_array().unwrap().iter().cloned().chain(
+                b["transactions"].as_array().unwrap().iter().flat_map(|t| t["commitments"].as_array().unwrap().iter().cloned()),
+            )
+        })
+        .collect();
+    let paged = n0.rpc.call("shrugg_getCommitments", json!([0, 1000])).await.unwrap();
+    let paged = paged.as_array().unwrap();
+    assert_eq!(flat.len(), paged.len(), "the same leaves");
+    for (a, b) in flat.iter().zip(paged) {
+        assert_eq!((&a["index"], &a["cm"], &a["envelope"]), (&b["index"], &b["cm"], &b["envelope"]));
+    }
+    // And every nullifier, attributed to the transaction that spent it.
+    let nfs: Vec<&str> = compact
+        .iter()
+        .flat_map(|b| b["transactions"].as_array().unwrap())
+        .flat_map(|t| t["nullifiers"].as_array().unwrap())
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    let paged_nfs = n0.rpc.call("shrugg_getNullifiers", json!([0, 1000])).await.unwrap();
+    assert_eq!(nfs.len(), paged_nfs.as_array().unwrap().len());
+    for row in paged_nfs.as_array().unwrap() {
+        assert!(nfs.contains(&row["nullifier"].as_str().unwrap()));
+    }
+    // Every node answers the same way.
+    assert_eq!(
+        n1.rpc.call("shrugg_getCompactBlocks", json!([0, head])).await.unwrap(),
+        n0.rpc.call("shrugg_getCompactBlocks", json!([0, head])).await.unwrap()
+    );
 
     assert_chains_equal(&[&n0, &n1]);
     eprintln!("two_validators_commit_and_shielded_transfer in {:.1?}", started.elapsed());

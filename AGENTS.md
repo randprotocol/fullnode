@@ -62,6 +62,29 @@ through the constraint-set-5 re-vendor, not as a local patch — so read
   like every set before it; fleets must run the same build
   (`docs/confidential.md`, "Constraint set 5").
 
+### RPC hardening: admission verification off the consensus loop (2026-09-14)
+
+S1's review item I2, shipped on `rpc-hardening`. A gossiped or RPC-submitted
+transaction's proofs now verify on `spawn_blocking` against a lazily refreshed
+`Arc<Ledger>` snapshot — four workers behind a 64-deep queue — while the
+consensus loop keeps turning; `Mempool` is split into a cheap `precheck` and an
+`insert_verified` that re-runs the state-dependent half against the tip the
+transaction is actually pooled on. Gossipsub uses application-level validation
+(`validate_messages`), so a transaction is forwarded only once it has verified
+here — **`ValidationMode` deliberately stays `Permissive`: a Strict/Permissive
+mix across a fleet drops messages, and application validation is local to one
+node**. The cost of that switch: every delivered message must be reported back
+to gossipsub **exactly once** (accept / reject / ignore) or this node silently
+stops forwarding it — consensus and status messages are accepted immediately,
+and every transaction path, error paths included, ends in exactly one report. A
+bounded refused-hash cache (8192 entries, FIFO, permanent verdicts only — the
+`is_permanent` allowlist) answers a repeat refusal for free, and a per-peer
+token bucket (burst 16, refill 4/s, keyed on the forwarding peer's
+`propagation_source`, held on `node::Peer`) meters gossiped submissions. The RPC
+grew `shrugg_getCompactBlocks`, batch requests (cap 20, notifications refused
+`-32600`) and a WebSocket `newHeads` subscription on the same port;
+`docs/rpc.md`'s changelog is the client-facing list.
+
 ### Load-bearing consensus invariants (do not regress)
 
 - **The commit rule needs three consecutive-view QCs.** Any relaxation
@@ -84,9 +107,10 @@ through the constraint-set-5 re-vendor, not as a local patch — so read
 
 - `deploy/*.key.json` holds the live testnet validator seeds, whitelisted in
   `.gitignore`. Decide: rotate + scrub, or document as throwaway-public.
-- Proof verification still runs on the consensus event loop (~20 ms warm);
-  moving it to `spawn_blocking` + gossipsub `Strict` validation is the real
-  DoS fix (fee floor and FIFO key cache are mitigations only).
+- Block-application proof verification (`Ledger::apply_block`, synchronous
+  inside `on_proposal`) still runs on the consensus event loop; moving it
+  changes when a vote is emitted, so it needs a consensus decision. Admission
+  verification left the loop on 2026-09-14 — see the RPC-hardening note above.
 - Lock promises are not durable across restarts (`resume` discards persisted
   `locked_qc`; `extends_locked` relaxes when the locked block is unknown) —
   deliberate liveness choice, needs a protocol-level decision.

@@ -357,23 +357,55 @@ necessarily the last committed block — the tip a proposer would actually build
 chain has no senders and no nonces, so there is no per-sender ordering left to do: a bundle is
 admissible or it is not, and two bundles are related only when they touch the same note. What
 replaces the nonce bookkeeping is *conflict* tracking. The pool indexes every pending
-transaction's nullifiers and commitments and refuses, in this order:
+transaction's nullifiers and commitments, and admission runs in this order:
 
 1. a duplicate transaction hash;
 2. a nullifier or a commitment already claimed by a pending transaction (`conflicts with a pending
    transaction over <value>`) — at most one of the two could ever be included, and carrying the
    other would cost the proposer block space and a proof verification per gossip round;
 3. a full pool;
-4. only then the full `Ledger::validate` probe, which is where the STARK verification happens.
+4. the state-dependent half of `Ledger::validate` — anchor in the window, `time` in it, nullifiers
+   unspent, commitments absent, attestation digests unclaimed, the register nonce — everything that
+   can go stale between admission and inclusion, and nothing that costs a proof;
+5. the transaction queues (64 deep at most) for one of four verification workers, and
+   `Ledger::validate`'s expensive half — the bundle digest, the bundle proof, then the call's own —
+   runs on a blocking task **off the consensus loop**, against a snapshot of the tip that is
+   cloned lazily, at most once per tip change and only while a transaction is waiting;
+6. `insert_verified` re-runs step 4 against the tip the transaction is actually pooled on — it may
+   have moved while the proof ran — and admits it.
 
-The proposer orders candidates by fee (highest first, ties broken by hash so every honest proposer
+Steps 1–4 are `Mempool::precheck`, and step 5 is the only one that verifies a STARK, so everything
+cheaper has refused what it can before that cost is paid — and because the cost is paid on a
+worker, a flood of bad proofs occupies four threads, never the loop that votes. The proposer orders
+candidates by fee (highest first, ties broken by hash so every honest proposer
 building on the same pool picks the same block) and fills up to the 2,000-transaction / 4 MiB
 budget, re-checking the cheap half of admission — anchor still in the window, `time` still in it,
 nullifiers not yet spent, commitments not yet present — against the ledger it is building on. After
 every commit, `prune` drops exactly the same way: transactions whose note was spent by someone
 else, whose commitment now exists, or whose anchor or `time` has scrolled out of the 256-block
-window. A bundle that loses a double-spend race therefore disappears on its own. See §4 for how
-the ledger's own admission order continues from step 4.
+window. A bundle that loses a double-spend race therefore disappears on its own. See §4 for the
+ledger's own admission order, which steps 4 and 5 between them run.
+
+Two guards sit in front of that order for gossiped traffic, and a verdict cache behind it. A
+gossiped transaction is metered against the peer that *forwarded* it — a token bucket, burst 16
+refilling at 4/s; RPC submissions are not metered, because that port is the operator's own and is
+already bounded by the request-body limit — and a transaction this node has already refused for a
+reason that is a function of its bytes alone (a bad proof, a bad signature, an oversized part) is
+refused again from an 8192-entry FIFO cache instead of being verified a second time. A verdict
+that says something about *this node's state* — an unknown anchor, a spent nullifier — is never
+cached: a node one block behind would poison itself against transactions that are about to be
+valid.
+
+Gossipsub runs with application-level validation (`validate_messages()`), so a transaction is
+forwarded to other peers only once it has verified here; consensus and status messages are
+accepted immediately, exactly as before. The invariant the switch imposes is that every delivered
+message is reported back to gossipsub **exactly once** — accept, reject or ignore — or this node
+silently stops forwarding it, so every admission path, error paths included, ends in exactly one
+report. `ValidationMode` stays `Permissive` on purpose: a Strict/Permissive mix across a fleet
+drops messages, and application-level validation is local to one node, so the change rolls out by
+ordinary restart. A *proposal's* proof verification stays on the consensus loop: a proposal is
+signed by a scheduled leader and paced by the block interval, so it is not the DoS vector, and
+moving it would change when a vote is emitted.
 
 ## 9. End-to-end confidential transaction
 
@@ -473,10 +505,12 @@ is what deploy-time warming amortizes away).
 The wallet builds `Call { program: program_id, proof }` and a bundle paying at least
 `BUNDLE_BASE + call_fee(tier)` — 2,000,000 units at tier 10, rising by 100,000 per two tiers to
 2,500,000 at tier 20 — then proves that bundle (about 100 s at tier 14) and submits the pair over
-`shrugg_sendTransaction`. The RPC handler hands it to the mempool, which runs the admission order
-from §8: duplicate hash, nullifier/commitment conflicts and pool space first, then the full
-`ledger.validate` probe — chain id, fee floor, anchor, time, spends, the bundle digest, the bundle
-proof, and finally the call's own proof — before it is gossiped.
+`shrugg_sendTransaction`. The RPC handler hands it to the admission path, which runs the order
+from §8: the pre-screen first — duplicate hash, nullifier/commitment conflicts, pool space, the
+state-dependent half of validation — then the full `ledger.validate` probe (chain id, fee floor,
+anchor, time, spends, the bundle digest, the bundle proof, and finally the call's own proof) on a
+verification worker off the consensus loop, and only then is it pooled against the tip and
+gossiped.
 
 ### d. Block
 
