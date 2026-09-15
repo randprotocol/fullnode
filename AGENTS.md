@@ -34,6 +34,37 @@ user's 2026-09-15 ruling. ② A fleet GPU node (Linux, R580+, CUDA 13, LLVM 21, 
 device, ≥ 160 GB host) for the rVM CUDA backend's PTX build and the production N re-measurement
 (M5.4's only open tasks, T3/T4).
 
+### Block aggregation, Tasks 1–10 (2026-09-15, `aggregation-spec` branch): the full pipeline landed
+
+(The fuller picture: `docs/superpowers/plans/2026-09-15-block-aggregation.md`, ten commits on
+the branch. What a later session needs beyond the T1–T4 entry below, which stays as the
+vendoring/workflow record.)
+
+- **Load-bearing invariants this plan added**: a chain without `genesis.aggregation` is
+  byte-for-byte chain 8 (the gate is absolute — `NOT_AGGREGATION` before any register check);
+  the nine-step admission is cheap-before-expensive with the rVM verify last, and the covered
+  bundles' records are always node-assembled (`Storage::covered_record`, one read for the Raw
+  and Pruned forms); `total_supply == issued − slashed` holds with exactly the four new
+  counters — `fees_paid` counts the proposer-kept floor at inclusion and an expired excess at
+  its sweep, the bucket is not `register_total`, and the payout note's excess part touches no
+  counter; a pruned bundle's ledger effect is bound to its aggregate-verified public values by
+  the digest of its public fields (`check_bundle_proof`'s pruned branch) — never trust a
+  marker form without it.
+- **The proving share's bucket is `Ledger::unsealed_fees`, persisted beside `META_SUPPLY` and
+  replay-audited** — a restarted node that lost it would mis-pay the next aggregate and fork
+  at the state root. The aggregator register (`META_AGGREGATORS`) and the genesis section
+  (`META_AGGREGATION`) are persisted the same way; `load_ledger` restores all three.
+- **Sealed-form sync is batch-atomic**: a pruned bundle is accepted only when a covering
+  aggregate is applied (a local mark) or in the same batch (whose commit is atomic); anything
+  else is the raw-form fallback to another peer, never a ban (`node.rs`'s `RawFallback`).
+- The chain-9 admitted shape is the fleet's own measured classes for a 2-in/2-out bundle
+  (`program 12, input 10, keccak 0, sha256 0, public 2, mem 16`) — NOT the recursion
+  fixtures' (they over-declare at 13/12/18). Cutting a genesis with the wrong shape means no
+  aggregate can ever cover a fleet bundle; the cut script's `hc_bundle` keyword substitutes
+  the build's pinned guest digest.
+- **The measured numbers live in `docs/aggregation.md`** (the cluster capstone's walls, the
+  startup key-build, the warm verify).
+
 ### Block aggregation, Tasks 1–4 (2026-09-15, `aggregation-spec` branch): the rVM vendored, admission live
 
 The block-aggregation plan (`docs/superpowers/plans/2026-09-15-block-aggregation.md`, ten

@@ -1,10 +1,19 @@
 # Block-level proof aggregation and the prover market
 
-Status: **approved design as a starting point, not built** (decided and approved 2026-09-12; the spec and plan build on §1–§4 and settle the open questions in §5). This is the
-remedy chosen in `docs/block-space.md` §6 for the 80-query proof size: a block carries one
-recursive proof for all of its bundles instead of one ~1.3 MB proof per bundle. Proof pruning was
-rejected because it makes a syncing node trust finality signatures for old history and so opens
-the long-range attack a proof-carrying chain does not have.
+Status: **built (2026-09-15, the `aggregation-spec` branch): the chain-side spec
+(`docs/superpowers/specs/2026-09-15-block-aggregation.md`) is implemented in full — the
+register, the nine-step admission, the subsidy and fee split, sealing and pruning, sealed-form
+sync, the RPC and CLI, and the chain-9 genesis tooling.** The measured numbers are collected
+in §6; the text of §1–§4 below is the approved design as written, kept because the build
+followed it almost word for word.
+
+The original status line, for the record: *approved design as a starting point, not built*
+(decided and approved 2026-09-12; the spec and plan build on §1–§4 and settle the open
+questions in §5). This is the remedy chosen in `docs/block-space.md` §6 for the 80-query proof
+size: a block carries one recursive proof for all of its bundles instead of one ~1.3 MB proof
+per bundle. Proof pruning was rejected because it makes a syncing node trust finality
+signatures for old history and so opens the long-range attack a proof-carrying chain does not
+have.
 
 ## 1. Two roles, two kinds of hardware
 
@@ -109,6 +118,48 @@ chain never depends on a GPU being online.
 - The verifier guest: the STARK verifier (Poseidon2 Merkle paths, FRI folding) in RISC-V, its
   cycle count per inner 80-query proof, and the tier it lands in. This is the zkVM milestone
   the rest depends on.
+
+## 6. Measured numbers (2026-09-15, this tree)
+
+Every number below was measured on the implementation branch, not projected. The test-profile
+rows are the cluster capstone's (`tests/cluster.rs`'s
+`a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window`); the production
+rows are the activation checklist's placeholders (`docs/deploy.md`, "Chain 9 activation"),
+filled at activation.
+
+| measurement | value | source |
+|---|---|---|
+| bundle proof (register), test profile, tier 14 | 98.2 s, 323 909 bytes | capstone register stage |
+| aggregate prove, test profile, N=1 (tier 19) | PENDING-CAPSTONE | capstone aggregate stage |
+| startup key-build, test profile (2¹⁹) | ~18 s (the ops expectation at 2²¹ production: ~30–70 s) | `warm_aggregation` startup log |
+| warm aggregate verify, test profile | PENDING-CAPSTONE | admission step 8 |
+| seal → pruned, at `window` blocks | the pruning pass runs every 16 blocks, gated at `sealed_at + window` | capstone |
+| sealed resync, a fresh joiner | **1 rVM verification per sealed window** (the covering aggregate's; a raw sync re-verifies each bundle) | capstone's verification counter |
+| rVM aggregate proof size, test profile | 328 121 bytes (the circuits M5.3 record; production est. ~0.5–0.6 MB, far under the 2 MiB cap) | `circuits/recursion/docs/02-aggregate.md` |
+| the interface conformance vectors | `inner_vk_digest` `33a94ec6…92a1c8`, the 107-word list, digest `9f11f1ae…88dcd` — reproduced byte-for-byte by the fullnode's recompute | the conformance suite (`agg_executor.rs`) |
+
+### The one capstone walk-through
+
+Register an aggregator (one bond-burning bundle, proving share 7 over the floor) → the chain
+halts for the prove (the cover window cannot scroll) → one rVM aggregate over the bundle's
+proof (the proving slot's single hold) → submitted, admitted (its own verification), pooled
+per §3.4's selection, committed — the sealing block — the mark lands atomically with the
+commit → the prune pass rewrites the record (34 public values + the 7 declared shape bytes,
+~3.3 KB against ~1.3 MB raw) → a fresh node joins and syncs the pruned block in sealed form,
+reaching the same blocks and state roots at every height with exactly one rVM verification —
+and the supply audit holds end to end (`total_supply == issued − slashed`, with one subsidy
+minted against `sealed_blocks == 1`).
+
+### The fleet bundle's declared shape
+
+The admitted shape chain 9 registers is the fleet's own measured classes for a 2-in/2-out
+bundle — `{tier, program 12, input 10, keccak 0, sha256 0, public 2, mem 16}` — and NOT the
+recursion fixtures' shape (13/12/18): the same `guests::bundle()` underlies both, but the
+chain executor pins the tight declared classes (`ZkExecutor::bundle_heights`) while the
+fixtures' auto-derived ones land a rung or two looser, and a declared height is part of the
+shape. The cluster capstone pins this distinction by asserting the committed bundle's header
+equals the admitted shape; a genesis cut with the fixtures' classes would admit a shape no
+fleet bundle can ever match.
 
 Related: `docs/block-space.md` (the numbers and the three remedies), `docs/fees.md`,
 `docs/supply.md`, `docs/staking.md`, `docs/zkvm.md`.

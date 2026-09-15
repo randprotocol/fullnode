@@ -700,17 +700,6 @@ impl HotStuff {
             };
             cb.len().cmp(&ca.len()).then_with(|| Hash::digest(pa).cmp(&Hash::digest(pb)))
         });
-        let mut chosen = None;
-        for (_, tx) in aggregates {
-            let crate::types::Action::Aggregate { covers, .. } = &tx.action else { unreachable!() };
-            let Some(c) = self.covered.as_ref().and_then(|s| s.covered(covers)) else { continue };
-            let mut trial = ledger.clone();
-            if trial.apply_aggregate(&tx, &c, self.executor.as_ref()).is_ok() {
-                ledger = trial;
-                chosen = Some(tx);
-                break;
-            }
-        }
         for tx in ordinary {
             // Apply on a trial clone: a transaction that fails part-way through
             // must not leave the cumulative ledger dirty for the next candidate
@@ -721,8 +710,18 @@ impl HotStuff {
                 txs.push(tx);
             }
         }
-        if let Some(tx) = chosen {
-            txs.push(tx);
+        // The aggregate's trial apply runs where its place in the block is: after the ordinary
+        // transactions, so the proposer's state root is the one every validator recomputes in
+        // list order.
+        for (_, tx) in aggregates {
+            let crate::types::Action::Aggregate { covers, .. } = &tx.action else { unreachable!() };
+            let Some(c) = self.covered.as_ref().and_then(|s| s.covered(covers)) else { continue };
+            let mut trial = ledger.clone();
+            if trial.apply_aggregate(&tx, &c, self.executor.as_ref()).is_ok() {
+                ledger = trial;
+                txs.push(tx);
+                break;
+            }
         }
         let header = BlockHeader {
             height: parent.block.height() + 1,

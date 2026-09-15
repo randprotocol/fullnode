@@ -74,6 +74,7 @@ fn genesis(validator: &Keypair) -> Genesis {
         // Must be this build's own guest, or `node::start` refuses to run at all.
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
         bridge: None,
+        aggregation: None,
         epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
     }
 }
@@ -94,6 +95,7 @@ async fn start(dir: &tempfile::TempDir, key: &Keypair) -> NodeHandle {
         base_timeout: Duration::from_secs(6),
         max_timeout: Duration::from_secs(30),
         verify: shrugg_node::storage::VerifyMode::Full,
+        keep_raw_proofs: false,
     })
     .await
     .expect("node starts")

@@ -979,7 +979,16 @@ impl Ledger {
             self.validators.get_mut(proposer).expect("looked up above").rewards = rewards;
             if self.aggregation.is_some() && b.fee > gas::BUNDLE_BASE {
                 let until = self.height.checked_add(self.aggregation().expect("just checked").window).ok_or(TxError::Overflow)?;
-                self.bucket_excess(tx.hash(), b.fee - gas::BUNDLE_BASE, *proposer, until);
+                // The bucket key is the bundle's *raw* transaction hash — the hash an
+                // aggregate's covers name. A pruned bundle's marker form hashes differently
+                // (its proof bytes differ), so on the sealed-sync replay the key comes from
+                // the side table's attestation, or the aggregate's payment would find no
+                // excess and the replay would diverge (spec §6.2's byte-identical replay).
+                let bucket_key = match crate::notes::pruned_proof_hash(&b.proof) {
+                    Some(ph) => self.pruned_side.get(&ph).map(|(raw, _)| *raw).unwrap_or_else(|| tx.hash()),
+                    None => tx.hash(),
+                };
+                self.bucket_excess(bucket_key, b.fee - gas::BUNDLE_BASE, *proposer, until);
             }
         }
         let mut receipt = None;

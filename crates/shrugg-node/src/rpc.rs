@@ -637,11 +637,21 @@ pub(crate) fn unsealed_bundles(
         let Ok(Some(block)) = storage.block_by_height(h) else { continue };
         for tx in &block.transactions {
             let Some(b) = &tx.bundle else { continue };
-            if matches!(storage.sealed_by(&tx.hash()), Ok(Some(_))) {
+            // The bundle's identity is its *raw* hash — the hash marks and covers name; a
+            // marker-form record (this node synced the block in sealed form) resolves through
+            // the proof-hash index.
+            let raw_hash = match shrugg_core::notes::pruned_proof_hash(&b.proof) {
+                Some(ph) => match storage.tx_hash_by_proof_hash(&ph) {
+                    Ok(Some(raw)) => raw,
+                    _ => continue,
+                },
+                None => tx.hash(),
+            };
+            if matches!(storage.sealed_by(&raw_hash), Ok(Some(_))) {
                 continue;
             }
             out.push(json!({
-                "hash": tx.hash().to_hex(),
+                "hash": raw_hash.to_hex(),
                 "height": h,
                 "excess": b.fee.saturating_sub(shrugg_core::gas::BUNDLE_BASE).to_string(),
             }));

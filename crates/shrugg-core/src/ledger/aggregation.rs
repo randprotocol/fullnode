@@ -2337,6 +2337,42 @@ mod payment_tests {
         assert!(m.is_spent(&[1; 8]) && m.has_commitment(&[3; 8]), "the public-field effects land");
         // And the fee split treats it like any bundle.
         assert_eq!(m.validators()[&p].rewards, gas::BUNDLE_BASE);
+        // The pruned bundle's excess is bucketed under the *raw* hash — the hash an aggregate's
+        // covers name — not the marker form's (spec §6.2's byte-identical replay).
+        let mut rich_tx = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE + 60, 0), Action::None);
+        let rich_digest = StubExecutor.bundle_digest(&rich_tx.bundle.as_ref().unwrap().digest_input());
+        let mut rich_pv = [0u64; 34];
+        for k in 0..8 {
+            rich_pv[pv::OUT0 + k] = rich_digest[k] as u64;
+        }
+        let rich_marker = {
+            let mut m2 = crate::notes::PRUNED_PROOF_MARKER.to_vec();
+            m2.extend_from_slice(Hash::digest(b"the rich raw proof").as_bytes());
+            m2
+        };
+        rich_tx.bundle.as_mut().unwrap().proof = rich_marker;
+        let rich_side = PrunedBundle {
+            tx_hash: {
+                // The raw hash: recompute the tx with a placeholder raw proof (any bytes —
+                // the hash covers them, which is the point of the side table attesting it).
+                let mut raw = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE + 60, 0), Action::None);
+                raw.bundle.as_mut().unwrap().proof = b"the rich raw proof".to_vec();
+                raw.hash()
+            },
+            proof_hash: Hash::digest(b"the rich raw proof"),
+            public_values: rich_pv.to_vec(),
+            shape: shape(),
+        };
+        let mut m2 = l.clone();
+        m2.set_height(1);
+        m2.set_timestamp_ms(1);
+        m2.apply_transactions_for_sync(&[rich_tx], &p, &BTreeMap::new(), std::slice::from_ref(&rich_side), &StubExecutor)
+            .unwrap();
+        assert!(
+            m2.unsealed_fees().contains_key(&rich_side.tx_hash),
+            "the excess is bucketed under the raw hash"
+        );
+        assert_eq!(m2.unsealed_fees().len(), 1, "and under no second key");
 
         // Without any side table the block reads as a raw block with a marker for a proof —
         // its hash is not the raw one, and the root refuses it.

@@ -167,7 +167,7 @@ pub fn subsidy(n: u64, cfg: &AggregationConfig) -> u64 {
 }
 ```
 
-- [ ] **Step 1: Write the failing tests** — `ledger/aggregation.rs` tests: (a) a chain without
+- [x] **Step 1: Write the failing tests** — `ledger/aggregation.rs` tests: (a) a chain without
   `genesis.aggregation` computes today's state root byte-for-byte over the fixture ledger, and a
   gated chain's root differs exactly by the `aggregators_root` component (empty register ⇒
   component is the hash of nothing); (b) `Action::Aggregate` round-trips bincode and is
@@ -175,17 +175,17 @@ pub fn subsidy(n: u64, cfg: &AggregationConfig) -> u64 {
   `RegisterAggregator` is the one that rides a bundle); (c) `MAX_AGGREGATE_BYTES` admits a
   2 MiB proof plus the caps and refuses one byte past; (d) `subsidy` at `n = 0`, `209 999`,
   `210 000`, and the 64th halving's zero.
-- [ ] **Step 2: Run to verify it fails** — no such types exist.
-- [ ] **Step 3: Implement** — the types, the register map with the leaf
+- [x] **Step 2: Run to verify it fails** — no such types exist.
+- [x] **Step 3: Implement** — the types, the register map with the leaf
   `blake3("shrugg-aggregator-leaf-1", addr || bond || nonce || release || payout pk || payout
   kem_ek)`, the `shrugg-state-3`-domained `aggregators_root` joined into `Ledger::state_root`
   exactly when `genesis.aggregation.is_some()`; the `Genesis` section with the same gating
   pattern `bridge` uses; `derived_commitment` in `ledger/staking.rs:161` extended to the two
   new derived-note actions (an `Aggregate`'s payout note and a `WithdrawAggregator`'s) so the
   mempool has one function to ask.
-- [ ] **Step 4: Run to verify it passes** — the new tests green; the workspace suite green
+- [x] **Step 4: Run to verify it passes** — the new tests green; the workspace suite green
   (state-root and wire-format pins unmoved).
-- [ ] **Step 5: Commit** — `core: aggregation — the action and register types, genesis-gated: the aggregator register, the state-root component, the subsidy schedule`
+- [x] **Step 5: Commit** — `core: aggregation — the action and register types, genesis-gated: the aggregator register, the state-root component, the subsidy schedule`
 
 ### Task 2: The four register actions
 
@@ -222,18 +222,18 @@ payout)`, refusal when the address is registered, entry created at `nonce = 0`;
 headers to share `(aggregator, nonce)` with different content, burns the bond into `slashed`,
 deletes the entry. One monotonic nonce per entry, consumed per accepted action.
 
-- [ ] **Step 1: Write the failing tests** — register → duplicate register refused; unbond →
+- [x] **Step 1: Write the failing tests** — register → duplicate register refused; unbond →
   submission with `unbonding` set refused; withdraw before the release height refused, after it
   pays `bond − BUNDLE_BASE` as a derived note the wallet opens, entry gone; a slash with
   mismatched nonces refused, a well-formed one burns the bond and deletes; the nonce rules
   (replay of an accepted action refused); the `burn != bond` register refused in
   `validate_inner`'s burn arm, before any signature work.
-- [ ] **Step 2: Run to verify it fails.**
-- [ ] **Step 3: Implement** — the module plus the two `validate_inner`/`apply_tx` arms and the
+- [x] **Step 2: Run to verify it fails.**
+- [x] **Step 3: Implement** — the module plus the two `validate_inner`/`apply_tx` arms and the
   `fee_floor` arms (`Aggregate`, `UnbondAggregator`, `WithdrawAggregator`, `SlashAggregator` →
   0 per R5; `RegisterAggregator` → `BUNDLE_BASE`).
-- [ ] **Step 4: Run to verify it passes** — plus the full core suite.
-- [ ] **Step 5: Commit** — `core: aggregation — the aggregator register's four actions: register, unbond, withdraw, slash (S2's semantics, mirrored)`
+- [x] **Step 4: Run to verify it passes** — plus the full core suite.
+- [x] **Step 5: Commit** — `core: aggregation — the aggregator register's four actions: register, unbond, withdraw, slash (S2's semantics, mirrored)`
 
 ### Task 3: The rVM executor capability and the vendoring (R1)
 
@@ -269,21 +269,21 @@ sources, so its `rand_zkvm` dep resolves to the vendored `crates/shrugg-zkvm`), 
 pin recorded as circuits main `271679d` in the script's header and in `crates/shrugg-rvm/AGENTS.md`
 (one paragraph: what it is, whence, how to re-sync).
 
-- [ ] **Step 1: Write the failing tests** — (a) `ZkExecutor::aggregate_program_digest` for the
+- [x] **Step 1: Write the failing tests** — (a) `ZkExecutor::aggregate_program_digest` for the
   test-profile fixture shape equals the recursion-crate-computed value (the pinned
   `33a94ec6…` is the *inner* vk digest; the *program* digest pin is recomputed in the test from
   the vendored crate and recorded in `docs/aggregation.md` at activation); (b) the stub
   executor records `verify_aggregate` calls and replays canned answers, so ledger tests never
   touch a proof.
-- [ ] **Step 2: Run to verify it fails** — no `shrugg-rvm` crate, no such methods.
-- [ ] **Step 3: Implement** — the vendoring section, run it (produces `crates/shrugg-rvm`), the
+- [x] **Step 2: Run to verify it fails** — no `shrugg-rvm` crate, no such methods.
+- [x] **Step 3: Implement** — the vendoring section, run it (produces `crates/shrugg-rvm`), the
   trait extension and the real `ZkExecutor` wiring (the startup key-build at `Node` startup
   when `genesis.aggregation` is present: build the registered program, call recursion's
   `verifier_key`, cache; log the build's wall time — R2's measured number).
-- [ ] **Step 4: Run to verify it passes** — the digest test green; `cargo check -p shrugg-zkvm
+- [x] **Step 4: Run to verify it passes** — the digest test green; `cargo check -p shrugg-zkvm
   -p shrugg-rvm` clean (this is the one build step of the plan; it stays off the heavy suite
   until Task 10).
-- [ ] **Step 5: Commit** — `zkvm: vendored recursion as shrugg-rvm (circuits 271679d) + the executor's aggregate surface and the startup key-build`
+- [x] **Step 5: Commit** — `zkvm: vendored recursion as shrugg-rvm (circuits 271679d) + the executor's aggregate surface and the startup key-build`
 
 ### Task 4: Aggregate admission (spec §4) and the conformance suite
 
@@ -322,7 +322,7 @@ mismatch, invalid aggregate proof, a covered bundle whose stored header mismatch
 registered shape); state-verdicts (already-sealed, window, unknown bundle, unknown aggregator)
 stay uncached, exactly the file's own rule.
 
-- [ ] **Step 1: Write the failing tests** — ledger: the nine steps each refuse in their own
+- [x] **Step 1: Write the failing tests** — ledger: the nine steps each refuse in their own
   order with a named error (a test per step, built on the stub executor); the **conformance
   suite**: the pinned vectors of `circuits/recursion/docs/02-aggregate.md` — the fixture set's
   inner vk digest `33a94ec690bb7cbe5a3d4564967460996277ac61b539f6525b5fe7f92992a1c8`, the
@@ -332,12 +332,12 @@ stay uncached, exactly the file's own rule.
   before admission is trusted, spec §4's own gate); a wrong-shape covered bundle refused at
   step 6 with the bundle named; a tampered `public` word failing step 7; a bad proof failing
   step 8. Node: a gossiped aggregate is reported to gossipsub exactly once on each outcome.
-- [ ] **Step 2: Run to verify it fails.**
-- [ ] **Step 3: Implement** — the validator, the mempool claims, the worker arm in `node.rs`
+- [x] **Step 2: Run to verify it fails.**
+- [x] **Step 3: Implement** — the validator, the mempool claims, the worker arm in `node.rs`
   (the `GossipOutcome::Verify` path unchanged; the verdict's `acceptance_for` covers the new
   `TxError`s).
-- [ ] **Step 4: Run to verify it passes** — the conformance suite green *first*, then the rest.
-- [ ] **Step 5: Commit** — `core+node: aggregation — admission: the nine steps cheap-before-expensive, the declared-shape check, the pinned conformance vectors`
+- [x] **Step 4: Run to verify it passes** — the conformance suite green *first*, then the rest.
+- [x] **Step 5: Commit** — `core+node: aggregation — admission: the nine steps cheap-before-expensive, the declared-shape check, the pinned conformance vectors`
 
 ### Task 5: Subsidy, the proving share, and the supply audit
 
@@ -373,19 +373,19 @@ derived exactly as a validator's `Withdraw` note (spec §5.4), sealed by the act
 and appended at apply with `withdraw_deposited` *not* touched — the subsidy is counted by
 `subsidised`, and `withdraw_deposited` stays the validator-only counter (spec §5.3's identity).
 
-- [ ] **Step 1: Write the failing tests** — the fee bucket's three exits (covered → to the
+- [x] **Step 1: Write the failing tests** — the fee bucket's three exits (covered → to the
   aggregator; expired → to the recorded proposer; never-included → still bucketed); the subsidy
   schedule at the halving edges; the supply invariant holding across a register, an aggregate,
   a withdraw and a slash (`total_supply == issued − slashed` exactly); `sealed_blocks`
   incrementing per included aggregate and not per block; `shrugg_getSupply` reporting the four
   new counters separately from `faucet_minted`.
-- [ ] **Step 2: Run to verify it fails.**
-- [ ] **Step 3: Implement** — the split in `apply_tx` (the proposer credit becomes
+- [x] **Step 2: Run to verify it fails.**
+- [x] **Step 3: Implement** — the split in `apply_tx` (the proposer credit becomes
   `BUNDLE_BASE` with the excess bucketed, gated on `genesis.aggregation` — ungated chains keep
   the full fee to the proposer, byte-for-byte), the sweep at `apply_block`'s commit, the
   payment and note at the aggregate's apply, the counters.
-- [ ] **Step 4: Run to verify it passes.**
-- [ ] **Step 5: Commit** — `core: aggregation — the subsidy schedule, the proving share, and the supply audit's four new counters`
+- [x] **Step 4: Run to verify it passes.**
+- [x] **Step 5: Commit** — `core: aggregation — the subsidy schedule, the proving share, and the supply audit's four new counters`
 
 ### Task 6: Sealing and pruning
 
@@ -412,18 +412,18 @@ impl Storage {
 }
 ```
 
-- [ ] **Step 1: Write the failing tests** — the sealing marks land per bundle and per block
+- [x] **Step 1: Write the failing tests** — the sealing marks land per bundle and per block
   (`sealed` only once every bundle in the block has one); the pruned record round-trips with
   the 34 pv and the 7 shape bytes intact; the gate refuses to prune before `window` blocks;
   the never-prune list is honored (an aggregate's own record is never rewritten);
   `verify_chain` on a pruned store recomputes the same ledger and the same state root as the
   archival store (spec §6.2's proof, as a test); the admission path reads a covered bundle's
   shape from the pruned record when raw bytes are gone (Task 4's step 6, both record forms).
-- [ ] **Step 2: Run to verify it fails.**
-- [ ] **Step 3: Implement** — the record forms, the marks at commit, the pruning pass and the
+- [x] **Step 2: Run to verify it fails.**
+- [x] **Step 3: Implement** — the record forms, the marks at commit, the pruning pass and the
   flag.
-- [ ] **Step 4: Run to verify it passes** — plus the node suite.
-- [ ] **Step 5: Commit** — `node: aggregation — sealing and pruning: CF_SEALS, the pruned record (34 pv + 7 shape bytes), the 256-block gate`
+- [x] **Step 4: Run to verify it passes** — plus the node suite.
+- [x] **Step 5: Commit** — `node: aggregation — sealing and pruning: CF_SEALS, the pruned record (34 pv + 7 shape bytes), the 256-block gate`
 
 ### Task 7: Sealed-form sync
 
@@ -441,7 +441,7 @@ enum SyncedBlock { Raw(Block), Sealed(Block) }   // Sealed carries pruned bundle
 // applied, and covers names the bundle's hash — else request the raw form from another peer.
 ```
 
-- [ ] **Step 1: Write the failing tests** — the three failure modes of spec §7 (missing
+- [x] **Step 1: Write the failing tests** — the three failure modes of spec §7 (missing
   aggregate → raw-form fallback; aggregate failing any admission step → batch fails as an
   invalid block; pruned bundle with neither aggregate nor raw → retry from another peer, no
   ban); `verify_chain` on a pruned store; **the cluster test**: two nodes run a window of real
@@ -449,11 +449,11 @@ enum SyncedBlock { Raw(Block), Sealed(Block) }   // Sealed carries pruned bundle
   admitted, sealed, pruned on node A; node B joins fresh, syncs in sealed form, and both reach
   the same state root with node B doing **one rVM verification per sealed window** (the sync
   log's verify count asserted).
-- [ ] **Step 2: Run to verify it fails.**
-- [ ] **Step 3: Implement** — the wire form, the acceptance rule, the fallback.
-- [ ] **Step 4: Run to verify it passes** — the cluster test green (the suite's slowest;
+- [x] **Step 2: Run to verify it fails.**
+- [x] **Step 3: Implement** — the wire form, the acceptance rule, the fallback.
+- [x] **Step 4: Run to verify it passes** — the cluster test green (the suite's slowest;
   scheduled alone per the proving-slot discipline, R7).
-- [ ] **Step 5: Commit** — `node: aggregation — sealed-form sync: the second block form, the acceptance rule, the one-verify-per-window cluster test`
+- [x] **Step 5: Commit** — `node: aggregation — sealed-form sync: the second block form, the acceptance rule, the one-verify-per-window cluster test`
 
 ### Task 8: RPC, CLI, and the changelog
 
@@ -470,14 +470,14 @@ the five actions. The node CLI: `shrugg-node aggregator register --bond --payout
 `withdraw`, and `shrugg-node aggregate --watch --rpc <url>` (poll `shrugg_getUnsealed`, fetch
 raw bundles, call `shrugg_rvm::aggregate::aggregate`, submit — a separate process, RPC-only).
 
-- [ ] **Step 1: Write the failing tests** — the methods' shapes against the spec (request/
+- [x] **Step 1: Write the failing tests** — the methods' shapes against the spec (request/
   response fixtures), `tx_json`'s five renderings, the changelog entry's presence in
   `docs/rpc.md` with the hard-fork framing (wire format, block rules and consensus change —
   not an interop-compatible hardening).
-- [ ] **Step 2: Run to verify it fails.**
-- [ ] **Step 3: Implement** — the methods, the CLI arms, the changelog and `cli.md`.
-- [ ] **Step 4: Run to verify it passes.**
-- [ ] **Step 5: Commit** — `node+docs: aggregation — the RPC surface, the aggregator CLI, the aggregate --watch daemon, the hard-fork changelog`
+- [x] **Step 2: Run to verify it fails.**
+- [x] **Step 3: Implement** — the methods, the CLI arms, the changelog and `cli.md`.
+- [x] **Step 4: Run to verify it passes.**
+- [x] **Step 5: Commit** — `node+docs: aggregation — the RPC surface, the aggregator CLI, the aggregate --watch daemon, the hard-fork changelog`
 
 ### Task 9: The chain-9 genesis
 
@@ -493,14 +493,14 @@ activation measurements (see "What activation hands to ops" — the file ships w
 `FILL-AT-ACTIVATION`, and `genesis.rs`'s validation refuses a section with a zero program
 digest so the placeholder can never reach a fleet).
 
-- [ ] **Step 1: Write the failing tests** — a genesis without the section behaves as today; a
+- [x] **Step 1: Write the failing tests** — a genesis without the section behaves as today; a
   genesis with it carries the register empty at block 0 with `aggregators_root` present; the
   zero-digest placeholder is refused by validation; the cut script produces a valid
   `genesis-chain9.json` against a fixture admitted shape.
-- [ ] **Step 2: Run to verify it fails.**
-- [ ] **Step 3: Implement** — the CLI arms, the script, the deploy runbook section.
-- [ ] **Step 4: Run to verify it passes.**
-- [ ] **Step 5: Commit** — `deploy: aggregation — the chain-9 genesis: the aggregation section, the cut script, the activation checklist`
+- [x] **Step 2: Run to verify it fails.**
+- [x] **Step 3: Implement** — the CLI arms, the script, the deploy runbook section.
+- [x] **Step 4: Run to verify it passes.**
+- [x] **Step 5: Commit** — `deploy: aggregation — the chain-9 genesis: the aggregation section, the cut script, the activation checklist`
 
 ### Task 10: End-to-end, the full suite, and the docs
 

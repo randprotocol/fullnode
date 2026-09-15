@@ -1885,8 +1885,15 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
     };
 
     // The chain resumes, and the aggregate is submitted: admitted (its own rVM verification at
-    // the node), pooled, selected, committed — the sealing block.
+    // the node), pooled, selected, committed — the sealing block. Wait for consensus to be
+    // alive again first: the prove halted the chain for minutes of wall time, and the replicas'
+    // view timeouts had escalated to their cap while it was down — convergence takes a view
+    // change or two at that cap, so a bare 120 s commit window right after the restart is not a
+    // margin, it is the stall itself.
     let n1 = start_in_at(dir1, &ks[1], vec![bootstrap_addr(&n0)], true, PROVING).await;
+    let resumed_at = n0.height();
+    wait_height(&[&n0, &n1], resumed_at + 2, Duration::from_secs(600)).await;
+    eprintln!("chain resumed at {} ({:.1?} in)", n0.height(), started.elapsed());
     let head = n0.height();
     let aggregate_tx = {
         let r = [9u32; 8];
@@ -1914,7 +1921,7 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
     };
     let agg_hash = n0.rpc.send_transaction(&aggregate_tx).await.expect("the aggregate is admitted");
     assert_eq!(agg_hash, aggregate_tx.hash());
-    n0.rpc.wait_for_transaction(&agg_hash, Duration::from_secs(120)).await.expect("the aggregate commits");
+    n0.rpc.wait_for_transaction(&agg_hash, Duration::from_secs(300)).await.expect("the aggregate commits");
     let (h_seal, _) = n0.handle.storage.tx_location(&agg_hash).unwrap().unwrap();
     eprintln!("sealed at block {h_seal} ({:.1?} in)", started.elapsed());
     assert_eq!(
@@ -1936,7 +1943,19 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
     let verifications_before = shrugg_node::agg_executor::AggExecutor::verification_count();
     let n2 = start_node(&ks[1], &gen, vec![bootstrap_addr(&n0)], false).await;
     let target = n0.height();
-    wait_height(&[&n2], target, Duration::from_secs(300)).await;
+    // The sealed sync, with its failure modes printed: a batch rejection shows in
+    // `sync_failures`, a raw-form fallback in the log's own line, and a stall in neither.
+    let t0 = Instant::now();
+    while n2.height() < target {
+        assert!(
+            t0.elapsed() < Duration::from_secs(300),
+            "n2 never reached {target}: height {}, sync_failures {}, verify_queue {}",
+            n2.height(),
+            n2.handle.status.read().unwrap().sync_failures,
+            shrugg_node::agg_executor::AggExecutor::verification_count() - verifications_before,
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     let verifications_after = shrugg_node::agg_executor::AggExecutor::verification_count();
 
     for h in 0..=target {
