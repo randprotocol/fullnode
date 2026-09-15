@@ -56,6 +56,29 @@ shrugg-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop
   node; total supply unchanged.
 - A dropped peer link is re-established by the redial logic within about 30 s.
 
+## Deferred proof runs and hardware tasks (user-owned; accepted 2026-09-15, scheduled 2026-09-16)
+
+Two hardware tasks gate the next milestones. **For any future session:** this is the checklist;
+the runbook with exact per-run commands and estimates is `circuits/recursion/docs/03-gpu-and-self-recursion.md`
+Appendix A (11 rows). The deferred proofs are all written and `#[ignore]`d with run-alone command
+lines in their test files.
+
+1. **The ≥ 64 GB batch** (runbook rows 1–6; one machine, one session, sequential with an RSS
+   watchdog — the 48 GB laptop jetsams these at ~33 GB): the ERC-20 transfer proof, the SPL token
+   proof (`research/tests/e2e.rs`, both `#[ignore]`d), the rVM tier-21 exit (`recursion/tests/exit.rs`),
+   the M5.3 N=2/N=3 test-profile aggregates (`recursion/tests/aggregate.rs`), the production N=1
+   aggregate. Record per run: wall time, peak RSS, proof size. **Then fill chain-9's
+   `genesis.aggregation.admitted_shapes[0]`** (the production bundle guest's declared heights +
+   `hc`, `aggregate_program_digest(shape, key)`, the startup key-build wall at 2^21, the warm
+   verify wall) — the zero-digest placeholder refuses to init, so this measurement is what
+   activates chain 9. Per the 2026-09-15 ruling the batch runs *after* chain-side aggregation
+   lands on main.
+2. **The fleet GPU node** (runbook rows 8–10): Linux, R580+ driver, CUDA 13, LLVM 21, sm_80+,
+   80 GB device (H100/A100-80G), ≥ 160 GB host RAM — none exists today. Unlocks the first PTX
+   build + hardware bring-up (`circuits` `PTX_BUILD.md`'s checklist, param-ABI audit first), then
+   the production N re-measurement (runbook rows 7–8, production N=2/N=3, the ≥ 160 GB host
+   classes), and later the self-verifier's end-to-end (row 11, est. tier 22 / ≥ 128 GB).
+
 ## Recovery cheatsheet
 
 | symptom | action |

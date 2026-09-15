@@ -309,6 +309,23 @@ compiler flow for programs (today: the built-in assembler or raw word files); sl
 a nullifier accumulator in place of the per-block recomputation; block rewards; the hash-sortition
 leader beacon; proof pruning after finality; fee markets.
 
+## Open ops tasks (hardware, for any future session)
+
+Two user-owned hardware tasks gate the next milestones. The full checklist with exact commands is
+in `docs/deploy.md` ("Deferred proof runs and hardware tasks"); both were accepted by the user on
+2026-09-15 and are scheduled for **2026-09-16**.
+
+1. **A ≥ 64 GB machine, one batch session** — runs the deferred production proofs (runbook rows
+   1–6 in `circuits/recursion/docs/03-gpu-and-self-recursion.md` Appendix A): the ERC-20 and SPL
+   token guest proofs, the rVM tier-21 exit, the N=2/N=3 aggregate twins, the production N=1
+   aggregate. Its measurements fill chain-9's `genesis.aggregation.admitted_shapes[0]` — **chain-9
+   activation is blocked on this batch** (the 2026-09-15 ruling: production proofs execute on
+   ≥ 64 GB after chain-side aggregation lands).
+2. **A fleet GPU node** — for the rVM CUDA backend's remaining tasks (the first PTX build +
+   hardware bring-up per `circuits` `PTX_BUILD.md`, then the production N re-measurement). Spec:
+   Linux, R580+ driver, CUDA 13, LLVM 21, sm_80+, 80 GB device (H100/A100-80G), ≥ 160 GB host.
+   None exists today.
+
 ## License
 
 Apache-2.0.

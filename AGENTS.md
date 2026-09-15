@@ -4,7 +4,35 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-14)
+## Project memory (state as of 2026-09-15)
+
+### Block aggregation: implementation in flight on `aggregation-spec` (user-owned hardware tasks gate activation)
+
+The chain-side block aggregation spec is **approved by the user (2026-09-15)** —
+`docs/superpowers/specs/2026-09-15-block-aggregation.md` — with its ten-task plan at
+`docs/superpowers/plans/2026-09-15-block-aggregation.md`. Work happens on branch
+`aggregation-spec`; **the finish line is merge to main + push** (T7–T10 remain at this writing:
+sealed sync, RPC/CLI, chain-9 genesis, end-to-end). Everything is genesis-gated on
+`genesis.aggregation`: a chain without the section behaves byte-for-byte as today, and the branch
+lands dark — activation waits on hardware below. Landed so far: the five actions and the
+genesis-gated `aggregators_root` (`shrugg-state-3`); the register actions mirrored on S2;
+`crates/shrugg-rvm` vendored from `circuits/recursion` `271679d` via `deploy/sync-zkvm.sh`'s
+two-step rename (a **path dep would fork `rand_zkvm` into two distinct crates — never do it**);
+the nine-step admission with the pinned hex conformance vectors reproduced byte-for-byte; the
+crate-cycle rule (shrugg-rvm → shrugg-zkvm, so the real `AggExecutor` lives in shrugg-node);
+subsidy + the four audit counters; sealing and pruning (CF_SEALS, pruned = full tx + 34 pv + 7
+shape bytes). Two traps already caught and pinned: `main.rs`'s genesis command must set
+`genesis.aggregation`, and `reload_ledger` must restore the gate on restart (fork-at-first-restart
+otherwise).
+
+**User-owned hardware tasks (accepted 2026-09-15, scheduled 2026-09-16 — see `docs/deploy.md`
+"Deferred proof runs and hardware tasks" and README's "Open ops tasks"):** ① the ≥ 64 GB batch
+(runbook rows 1–6 in `circuits/recursion/docs/03-gpu-and-self-recursion.md` Appendix A) — its
+measurements fill chain-9's `admitted_shapes[0]`, which is what activates chain 9 (the zero-digest
+placeholder refuses to init); production proofs run *after* chain-side aggregation lands, per the
+user's 2026-09-15 ruling. ② A fleet GPU node (Linux, R580+, CUDA 13, LLVM 21, sm_80+, 80 GB
+device, ≥ 160 GB host) for the rVM CUDA backend's PTX build and the production N re-measurement
+(M5.4's only open tasks, T3/T4).
 
 ### Constraint set 6 re-vendor (2026-09-14, upstream 0200877): the public input segment, carrying M4.3 + M4.4
 
