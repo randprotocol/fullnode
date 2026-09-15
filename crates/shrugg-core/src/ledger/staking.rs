@@ -173,11 +173,12 @@ impl Ledger {
                 // bond less the base, at the entry's payout (spec §2.2).
                 super::aggregation::withdraw_note(self, aggregator, *time, r, executor).ok()
             }
-            Action::Aggregate { aggregator, time, r, .. } => {
-                // The payout note (spec §4 step 5): the subsidy the block would pay, at the
-                // entry's payout, stamped with the action's `time` and blinding — claimed in
-                // the mempool exactly as a `BridgeAttest`'s derived deposit is.
-                super::aggregation::payout_note(self, aggregator, *time, r, executor).ok()
+            Action::Aggregate { aggregator, covers, time, r, .. } => {
+                // The payout note (spec §4 step 5): the subsidy plus the covered bundles'
+                // bucketed excesses the block would pay, at the entry's payout, stamped with
+                // the action's `time` and blinding — claimed in the mempool exactly as a
+                // `BridgeAttest`'s derived deposit is.
+                super::aggregation::payout_note(self, aggregator, covers, *time, r, executor).ok()
             }
             Action::BridgeAttest { attestation, recipient, r, time, .. } => {
                 // The size cap, before the decode. `validate` applies it at step 1

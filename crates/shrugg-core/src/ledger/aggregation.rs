@@ -254,7 +254,7 @@ pub(super) fn apply(
     Ok(())
 }
 
-// ── the `Aggregate` itself: admission (spec §4) and Task 4's apply ───────────────────────────
+// ── the `Aggregate` itself: admission (spec §4) and apply (spec §5) ──────────────────────────
 
 use crate::confidential::ConfidentialExecutor;
 use crate::types::{pv, CoveredBundle};
@@ -269,15 +269,82 @@ pub struct ValidatedAggregate {
     pub outs: Vec<[u32; 8]>,
 }
 
-/// The aggregate's payout note (spec §5.4): one deposit to the entry's payout address, worth
-/// the subsidy at the ledger's sealed-block counter plus the covered bundles' proving shares,
-/// stamped with the action's `time` and blinding — derived exactly as a validator's `Withdraw`
-/// note. Task 4's interim: no excess buckets exist yet (Task 5 lands them and the counter's
-/// increment), so the amount is `subsidy(0)` — exactly what a chain that has sealed nothing
-/// pays, and the claim the mempool makes on the note (spec §4 step 5).
+/// The aggregate's payment (spec §5.4): the subsidy at the ledger's sealed-block counter, the
+/// covered bundles' proving shares, their sum, and the one deposit note they are paid as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Payment {
+    pub subsidy: u64,
+    pub proving_shares: u64,
+    pub total: u64,
+    pub note: Word8,
+}
+
+impl Ledger {
+    /// At bundle inclusion: the proposer keeps `gas::BUNDLE_BASE`; the excess is bucketed
+    /// against the bundle transaction's hash (spec §5.2) with its coverable-until height —
+    /// the two resolutions of which are the aggregate's payment and the commit sweep.
+    pub(crate) fn bucket_excess(&mut self, bundle_hash: Hash, excess: u64, proposer: Address, expires_at: u64) {
+        self.unsealed_fees.insert(bundle_hash, (excess, proposer, expires_at));
+    }
+
+    /// At block commit: every bucket entry whose window passed is credited to its recorded
+    /// proposer (spec §5.2) — the moment the excess actually leaves the pool's accounting, so
+    /// `fees_paid` moves here and not at inclusion. Bounded by construction (the bucket holds
+    /// at most `window × max_covers` entries) and a no-op on a chain without the section.
+    pub(crate) fn sweep_expired_excesses(&mut self, head_height: u64, committing: &Address) {
+        if self.aggregation().is_none() {
+            return;
+        }
+        let expired: Vec<Hash> = self
+            .unsealed_fees
+            .iter()
+            .filter(|(_, (_, _, until))| *until <= head_height)
+            .map(|(h, _)| *h)
+            .collect();
+        for h in expired {
+            let (excess, recorded, _) = self.unsealed_fees.remove(&h).expect("iterated from the map");
+            // The recorded proposer's entry may be gone — it withdrew since including the
+            // bundle; the committing block's proposer takes the excess then, so it always
+            // lands register-side. Either way it leaves the pool now: `fees_paid` moves.
+            // Saturating, per `Supply::pool_value`'s own rule: the arithmetic cannot wrap on a
+            // chain whose blocks all applied, and a damaged counter shows up as the audit's
+            // invariant failing, not as a panic inside block application.
+            let credit = if self.validators.contains_key(&recorded) { recorded } else { *committing };
+            let e = self.validators.get_mut(&credit).expect("the committing proposer is in the register");
+            e.rewards = e.rewards.saturating_add(excess);
+            self.supply.fees_paid = self.supply.fees_paid.saturating_add(excess);
+        }
+    }
+
+    /// The aggregate's one deposit note (spec §5.4): `subsidy(sealed_blocks)` plus the covered
+    /// bundles' bucketed excesses, derived exactly as a validator's `Withdraw` note — the
+    /// amount admission's step 5 derives, the mempool claims, and apply appends.
+    fn aggregate_payment(
+        &self,
+        covers: &[Hash],
+        cfg: &AggregationConfig,
+        time: u32,
+        r: &Word8,
+        payout: &ShieldedAddress,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<Payment, TxError> {
+        let subsidy = gas::subsidy(self.supply.sealed_blocks, cfg);
+        let proving_shares = covers.iter().try_fold(0u64, |acc, c| {
+            let e = self.unsealed_fees.get(c).map(|(excess, _, _)| *excess).unwrap_or(0);
+            acc.checked_add(e).ok_or(TxError::Overflow)
+        })?;
+        let total = subsidy.checked_add(proving_shares).ok_or(TxError::Overflow)?;
+        let note = executor.note_commitment(&payout.pk, &[0; 8], total, 0, time, r);
+        Ok(Payment { subsidy, proving_shares, total, note })
+    }
+}
+
+/// The aggregate's payout note (spec §5.4), derived for admission and the mempool's claim:
+/// the entry's payout address looked up, then [`Ledger::aggregate_payment`]'s note.
 pub(crate) fn payout_note(
     ledger: &Ledger,
     aggregator: &Address,
+    covers: &[Hash],
     time: u32,
     r: &Word8,
     executor: &dyn ConfidentialExecutor,
@@ -287,8 +354,7 @@ pub(crate) fn payout_note(
         .aggregators()
         .get(aggregator)
         .ok_or(TxError::Aggregation(AggregationError::UnknownAggregator(*aggregator)))?;
-    let amount = gas::subsidy(ledger.supply.sealed_blocks, cfg);
-    Ok(executor.note_commitment(&e.payout.pk, &[0; 8], amount, 0, time, r))
+    Ok(ledger.aggregate_payment(covers, cfg, time, r, &e.payout, executor)?.note)
 }
 
 /// Spec §4's nine steps, in order, cheap before expensive (`validate_inner`'s discipline,
@@ -357,7 +423,7 @@ pub(super) fn validate_aggregate(
     }
     // 5. The payout note's commitment is new — derived as a `BridgeAttest`'s is, claimed in
     //    the mempool by the same `derived_commitment` arm.
-    let payout_cm = payout_note(ledger, aggregator, time, r, executor)?;
+    let payout_cm = payout_note(ledger, aggregator, covers, time, r, executor)?;
     if ledger.has_commitment(&payout_cm) {
         return Err(TxError::CommitmentExists(payout_cm));
     }
@@ -456,19 +522,38 @@ impl Ledger {
         )
     }
 
-    /// Task 4's apply half, in lockstep with [`Ledger::validate_aggregate`]: the register nonce
-    /// moves and nothing else — payment (spec §5) is Task 5's, sealing (spec §6) Task 6's, and
-    /// until they land no proposer includes an aggregate (`apply_tx`'s arm refuses the action
-    /// by name, so a block carrying one cannot be built or applied yet).
+    /// The apply half, in lockstep with [`Ledger::validate_aggregate`] (spec §4 validated, then
+    /// spec §5 paid): the one deposit note of subsidy plus covered proving shares is appended,
+    /// the covered excesses leave the bucket, the subsidy counters and the register nonce move.
+    /// Everything fallible is in the validation and the payment's derivation, before the first
+    /// mutation (`apply_tx`'s rule for its own arms, one action over). Sealing (spec §6) is
+    /// Task 6's, and until its covered pre-pass lands no proposer includes an aggregate
+    /// (`apply_tx`'s arm refuses the action by name, so a block carrying one cannot be built or
+    /// applied yet).
     pub fn apply_aggregate(
         &mut self,
         tx: &Transaction,
         covered: &[CoveredBundle],
         executor: &dyn ConfidentialExecutor,
     ) -> Result<(), TxError> {
-        let Action::Aggregate { aggregator, .. } = &tx.action else { return Err(NOT_AGGREGATION) };
-        let aggregator = *aggregator;
-        self.validate_aggregate(tx, covered, executor)?;
+        let Action::Aggregate { covers, aggregator, time, r, envelope, .. } = &tx.action else {
+            return Err(NOT_AGGREGATION);
+        };
+        let (covers, aggregator, time, r, envelope) = (covers.clone(), *aggregator, *time, *r, envelope.clone());
+        let validated = self.validate_aggregate(tx, covered, executor)?;
+        let cfg = self.aggregation().expect("validated above").clone();
+        let payout = self.aggregators().get(&aggregator).expect("validated above").payout.clone();
+        let payment = self.aggregate_payment(&covers, &cfg, time, &r, &payout, executor)?;
+        debug_assert_eq!(
+            payment.note, validated.payout_cm,
+            "admission and apply derive one note from one state"
+        );
+        self.append_deposit(payment.note, envelope, executor)?;
+        for c in &covers {
+            self.unsealed_fees.remove(c);
+        }
+        self.supply.subsidised = self.supply.subsidised.checked_add(payment.subsidy).ok_or(TxError::Overflow)?;
+        self.supply.sealed_blocks = self.supply.sealed_blocks.checked_add(1).ok_or(TxError::Overflow)?;
         let e = self.aggregators.get_mut(&aggregator).expect("validated above");
         e.nonce += 1;
         Ok(())
@@ -1763,5 +1848,384 @@ mod admission_tests {
         let (l, kp) = setup();
         let tx = aggregate_tx(&kp, 0, 100, covers(1), b"ok".to_vec());
         assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::AggregateNeedsCovered));
+    }
+}
+
+// ── Task 5: the subsidy, the proving share, and the supply audit ─────────────────────────────
+#[cfg(test)]
+mod payment_tests {
+    use super::*;
+    use crate::confidential::{ConfidentialExecutor, StubExecutor};
+    use crate::crypto::{Hash, Keypair};
+    use crate::gas;
+    use crate::ledger::staking::ValidatorEntry;
+    use crate::ledger::{Ledger, TxError};
+    use crate::types::{Block, BlockHeader, QuorumCertificate};
+    use crate::notes::{word8_from_bytes, Bundle, Envelope, ShieldedAddress, Word8};
+    use crate::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
+    use crate::types::{pv, Action, CoveredBundle, DeclaredShape, FriProfile, Transaction};
+    use std::collections::BTreeMap;
+
+    const HC: Word8 = [11; 8];
+
+    fn keys() -> (Keypair, Keypair) {
+        (Keypair::from_seed([1; 32]).unwrap(), Keypair::from_seed([2; 32]).unwrap())
+    }
+
+    fn entry(k: &Keypair, stake: u64) -> (Address, ValidatorEntry) {
+        (
+            k.public_key().address(),
+            ValidatorEntry {
+                public_key: k.public_key().clone(),
+                stake,
+                pending: Vec::new(),
+                rewards: 0,
+                payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+                nonce: 0,
+            },
+        )
+    }
+
+    fn shape() -> DeclaredShape {
+        DeclaredShape {
+            profile: FriProfile::Test,
+            tier: 14,
+            program_log_height: 13,
+            input_log_height: 12,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 2,
+            mem_log_height: 18,
+        }
+    }
+
+    fn cfg_with_window(window: u64) -> AggregationConfig {
+        AggregationConfig {
+            bond: 100 * crate::types::UNITS_PER_SHRUGG,
+            max_covers: 3,
+            subsidy_base: 100 * crate::types::UNITS_PER_SHRUGG,
+            halving_blocks: 210_000,
+            window,
+            admitted_shapes: vec![AdmittedShape { shape: shape(), hc: Hash::digest(b"the bundle guest"), aggregate_program_digest: [1; 4] }],
+        }
+    }
+
+    fn gated(window: u64) -> Ledger {
+        let (a, b) = keys();
+        let register: BTreeMap<Address, ValidatorEntry> = [entry(&a, 10), entry(&b, 10)].into_iter().collect();
+        let mut l = Ledger::new(7, HC, register, &StubExecutor);
+        l.set_faucet(true);
+        l.set_confidential(true);
+        l.set_height(1);
+        l.set_aggregation(Some(cfg_with_window(window)));
+        l.set_genesis_supply(300 * crate::types::UNITS_PER_SHRUGG - 20, 20);
+        l
+    }
+
+    fn env() -> Envelope {
+        Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] }
+    }
+
+    fn payout_addr() -> ShieldedAddress {
+        ShieldedAddress { pk: [7; 8], kem_ek: vec![8; crate::notes::KEM_EK_BYTES] }
+    }
+
+    fn proposer(l: &Ledger) -> Address {
+        *l.validators().keys().next().unwrap()
+    }
+
+    /// A fee-paying bundle whose stub proof publishes the recomputed digest.
+    fn bundle(l: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64, burn: u64) -> Bundle {
+        let mut b = Bundle {
+            anchor: l.root(),
+            nullifiers: nfs,
+            commitments: cms,
+            fee,
+            burn,
+            asset: 0,
+            time: l.height() as u32,
+            envelopes: [env(), env()],
+            proof: vec![],
+        };
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        b
+    }
+
+    fn register(l: &mut Ledger, kp: &Keypair, tag: u32) {
+        let payout = payout_addr();
+        let registration = AggregatorRegistration {
+            public_key: kp.public_key().clone(),
+            payout: payout.clone(),
+            signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
+        };
+        let tx = Transaction::shielded(
+            7,
+            bundle(l, [[tag; 8], [tag + 1; 8]], [[tag + 2; 8], [tag + 3; 8]], gas::BUNDLE_BASE, cfg_with_window(256).bond),
+            Action::RegisterAggregator { registration },
+        );
+        l.apply_tx(&tx, &proposer(l), &StubExecutor).unwrap();
+        l.record_anchor(l.height());
+    }
+
+    fn aggregate_tx(kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
+        let aggregator = kp.public_key().address();
+        let r = [9; 8];
+        let signature = kp.sign(aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof)).as_bytes());
+        Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(), signature },
+        }
+    }
+
+    fn covered_records(tags: &[u8]) -> Vec<CoveredBundle> {
+        let hc_words = word8_from_bytes(Hash::digest(b"the bundle guest").as_bytes()).unwrap();
+        tags.iter()
+            .map(|&t| {
+                let mut public_values = [0u64; 34];
+                public_values[pv::TIER] = shape().tier as u64;
+                for k in 0..8 {
+                    public_values[pv::OUT0 + k] = t as u64 * 100 + k as u64;
+                    public_values[pv::HC0 + k] = hc_words[k] as u64;
+                }
+                CoveredBundle { public_values, shape: shape() }
+            })
+            .collect()
+    }
+
+    /// A block signed by `key` over the ledger's real post-apply root — `mod.rs`'s own fixture.
+    fn signed_block(l: &Ledger, txs: Vec<Transaction>, key: &Keypair, height: u64) -> Block {
+        let mut after = l.clone();
+        after.set_height(height);
+        after.set_timestamp_ms(height);
+        after.apply_transactions(&txs, &key.address(), &StubExecutor).unwrap();
+        after.sweep_expired_excesses(height, &key.address());
+        after.record_anchor(height);
+        let header = BlockHeader {
+            height,
+            view: height,
+            parent: Hash::ZERO,
+            proposer: key.public_key().clone(),
+            timestamp_ms: height,
+            tx_root: Block::tx_root(&txs),
+            state_root: after.state_root(),
+            justify: QuorumCertificate::genesis(Hash::ZERO),
+        };
+        Block::sign(header, txs, key)
+    }
+
+    /// The fee split at bundle inclusion (spec §5.2): the proposer keeps exactly the floor, the
+    /// excess is bucketed against the bundle's hash with its coverable-until height — and an
+    /// ungated chain keeps the full fee to the proposer, byte-for-byte.
+    #[test]
+    fn the_proposer_keeps_the_floor_and_the_excess_is_bucketed() {
+        let mut l = gated(256);
+        let p = proposer(&l);
+        let fee = gas::BUNDLE_BASE + 60;
+        let tx = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), Action::None);
+        l.apply_tx(&tx, &p, &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&p].rewards, gas::BUNDLE_BASE, "the proposer keeps the floor");
+        assert_eq!(l.supply().fees_paid, gas::BUNDLE_BASE, "only the floor has left the pool so far");
+        assert_eq!(
+            l.unsealed_fees().get(&tx.hash()),
+            Some(&(60, p, 1 + 256)),
+            "the excess is bucketed with the coverable-until height"
+        );
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+
+        // Ungated: the split is off, exactly today's accounting.
+        let (a, b) = keys();
+        let register: BTreeMap<Address, ValidatorEntry> = [entry(&a, 10), entry(&b, 10)].into_iter().collect();
+        let mut u = Ledger::new(7, HC, register, &StubExecutor);
+        u.set_faucet(true);
+        u.set_confidential(true);
+        u.set_height(1);
+        let tx = Transaction::shielded(7, bundle(&u, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), Action::None);
+        u.apply_tx(&tx, &p, &StubExecutor).unwrap();
+        assert_eq!(u.validators()[&p].rewards, fee);
+        assert_eq!(u.supply().fees_paid, fee);
+        assert!(u.unsealed_fees().is_empty(), "no bucket exists without the section");
+    }
+
+    /// The covered exit (spec §5.2/§5.4): the aggregate's one deposit note pays subsidy(n) plus
+    /// the covered bundles' excesses to the entry's payout address; the bucket empties of them;
+    /// the counters move exactly the subsidy's worth.
+    #[test]
+    fn a_covering_aggregate_pays_subsidy_plus_the_covered_excesses() {
+        let mut l = gated(256);
+        let (kp, _) = keys();
+        register(&mut l, &kp, 10);
+        l.record_anchor(1);
+        let p = proposer(&l);
+        let fee = gas::BUNDLE_BASE + 60;
+        let covered_tx = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None);
+        l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
+        let before = l.supply();
+
+        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let covered = covered_records(&[1]);
+        let v = l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        let subsidy = gas::subsidy(0, &cfg_with_window(256));
+        let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy + 60, 0, 1, &[9; 8]);
+        assert_eq!(v.payout_cm, want_cm, "the T4 derivation, now with the real amount (spec §5.4)");
+        l.apply_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        assert!(l.has_commitment(&want_cm), "the payout note is in the tree");
+        assert!(l.unsealed_fees().is_empty(), "the covered excess left the bucket");
+        assert_eq!(l.supply().subsidised, subsidy);
+        assert_eq!(l.supply().sealed_blocks, 1);
+        assert_eq!(l.supply().fees_paid, before.fees_paid, "the payout is not a fee movement");
+        assert_eq!(l.supply().withdraw_deposited, before.withdraw_deposited, "nor a withdraw's");
+        assert_eq!(l.aggregators()[&kp.public_key().address()].nonce, 1);
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
+    /// The expiry exit: a bundle whose window passes uncovered has its excess credited to the
+    /// recorded proposer at block commit — the moment it actually leaves the pool's accounting.
+    #[test]
+    fn an_expired_excess_is_swept_to_the_recorded_proposer_at_commit() {
+        let mut l = gated(2);
+        let (a, _) = keys();
+        let p = proposer(&l);
+        let fee = gas::BUNDLE_BASE + 60;
+        let tx = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), Action::None);
+        l.apply_block(&signed_block(&l, vec![tx.clone()], &a, 1), &StubExecutor).unwrap();
+        assert_eq!(l.unsealed_fees().get(&tx.hash()), Some(&(60, p, 3)), "bucketed, coverable until 1 + 2");
+        assert!(l.audit().invariant_holds());
+
+        // Block 2 commits with the bundle still coverable: the bucket holds, nothing moves.
+        l.apply_block(&signed_block(&l, vec![], &a, 2), &StubExecutor).unwrap();
+        assert_eq!(l.unsealed_fees().len(), 1, "still bucketed inside the window");
+        assert_eq!(l.validators()[&p].rewards, gas::BUNDLE_BASE);
+
+        // Block 3 is the first head at which the bundle is uncoverable: the sweep lands.
+        l.apply_block(&signed_block(&l, vec![], &a, 3), &StubExecutor).unwrap();
+        assert!(l.unsealed_fees().is_empty(), "the window passed: the entry resolved");
+        assert_eq!(l.validators()[&p].rewards, gas::BUNDLE_BASE + 60, "the recorded proposer takes the excess");
+        assert_eq!(l.supply().fees_paid, fee, "and only now has the whole fee left the pool");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
+    /// `sealed_blocks` is the subsidy schedule's index: it counts included aggregates, never
+    /// blocks — an idle chain consumes nothing of the schedule (spec §5.1).
+    #[test]
+    fn sealed_blocks_counts_aggregates_not_blocks() {
+        let mut l = gated(256);
+        let (a, _) = keys();
+        let (kp, _) = keys();
+        register(&mut l, &kp, 10);
+        l.apply_block(&signed_block(&l, vec![], &a, 1), &StubExecutor).unwrap();
+        l.apply_block(&signed_block(&l, vec![], &a, 2), &StubExecutor).unwrap();
+        assert_eq!(l.supply().sealed_blocks, 0, "empty blocks do not consume the schedule");
+        for (i, tag) in [30u8, 40].iter().enumerate() {
+            let tx = aggregate_tx(&kp, i as u64, (i + 1) as u32, vec![Hash::digest(&[*tag])], b"ok".to_vec());
+            l.apply_aggregate(&tx, &covered_records(&[1]), &StubExecutor).unwrap();
+        }
+        assert_eq!(l.supply().sealed_blocks, 2);
+        assert_eq!(l.supply().subsidised, 2 * gas::subsidy(0, &cfg_with_window(256)));
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
+    /// The audit across the whole lifecycle (spec §5.3): a register, a fee-paying bundle, an
+    /// aggregate covering it, an aggregator withdraw, and a slash — after each, the pool plus
+    /// the register adds up to exactly what the chain issued less what was slashed.
+    #[test]
+    fn the_supply_invariant_holds_across_register_aggregate_withdraw_and_slash() {
+        let (a, b) = keys();
+        let validators: BTreeMap<Address, ValidatorEntry> = [entry(&a, 10), entry(&b, 10)].into_iter().collect();
+        let mut l = Ledger::new(7, HC, validators, &StubExecutor);
+        l.set_faucet(true);
+        l.set_confidential(true);
+        l.set_height(1);
+        l.set_aggregation(Some(cfg_with_window(2)));
+        let issued = 300 * crate::types::UNITS_PER_SHRUGG;
+        l.set_genesis_supply(issued - 20, 20);
+        let check = |l: &Ledger, what: &str| {
+            let audit = l.audit();
+            assert!(audit.invariant_holds(), "{what}: {audit:?}");
+        };
+        check(&l, "genesis");
+
+        // Register two aggregators: bonds leave the pool for the register, counted both sides.
+        register(&mut l, &a, 10);
+        register(&mut l, &b, 20);
+        l.record_anchor(1);
+        check(&l, "two registers");
+        assert_eq!(l.supply().aggregator_bonds, 2 * cfg_with_window(2).bond);
+
+        // A fee-paying bundle, then the aggregate covering it: subsidy minted, excess paid.
+        let p = proposer(&l);
+        let covered_tx = Transaction::shielded(
+            7,
+            bundle(&l, [[31; 8], [32; 8]], [[33; 8], [34; 8]], gas::BUNDLE_BASE + 60, 0),
+            Action::None,
+        );
+        l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
+        check(&l, "a fee-paying bundle");
+        let agg_tx = aggregate_tx(&a, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        l.apply_aggregate(&agg_tx, &covered_records(&[1]), &StubExecutor).unwrap();
+        check(&l, "the covering aggregate");
+
+        // Unbond then withdraw `a`'s bond once the (window-2) release passes: the bond comes
+        // back into the pool as a note, less the base the proposer takes.
+        let unbond = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::UnbondAggregator {
+                aggregator: a.public_key().address(),
+                nonce: 1,
+                signature: a.sign(
+                    crate::types::actions::aggregator_unbond_message(7, &a.public_key().address(), 1).as_bytes()
+                ),
+            },
+        };
+        l.apply_tx(&unbond, &p, &StubExecutor).unwrap();
+        check(&l, "unbond");
+        l.set_height(1 + 2);
+        let withdraw = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::WithdrawAggregator {
+                aggregator: a.public_key().address(),
+                nonce: 2,
+                time: 3,
+                r: [5; 8],
+                envelope: env(),
+                signature: a.sign(
+                    crate::types::actions::aggregator_withdraw_message(
+                        7,
+                        &a.public_key().address(),
+                        2,
+                        3,
+                        &[5; 8],
+                        &env(),
+                    )
+                    .as_bytes(),
+                ),
+            },
+        };
+        l.apply_tx(&withdraw, &p, &StubExecutor).unwrap();
+        check(&l, "withdraw");
+
+        // Slash `b` for equivocation: the bond is destroyed, and `issued − slashed` tracks it.
+        let slash = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::SlashAggregator {
+                a: Box::new(signed_header(&b, 0, vec![Hash::digest(b"x")])),
+                b: Box::new(signed_header(&b, 0, vec![Hash::digest(b"y")])),
+            },
+        };
+        l.apply_tx(&slash, &p, &StubExecutor).unwrap();
+        check(&l, "slash");
+        assert_eq!(l.supply().slashed, cfg_with_window(2).bond);
+        assert_eq!(l.supply().aggregator_bonds, 0, "both bonds resolved");
+    }
+
+    fn signed_header(kp: &Keypair, nonce: u64, covers: Vec<Hash>) -> crate::types::SignedAggregateHeader {
+        let aggregator = kp.public_key().address();
+        let proof_hash = Hash::digest(b"p");
+        let signature = kp.sign(aggregate_signing_hash(7, nonce, 9, &[1; 8], &covers, &proof_hash).as_bytes());
+        crate::types::SignedAggregateHeader { aggregator, nonce, time: 9, r: [1; 8], covers, proof_hash, signature }
     }
 }

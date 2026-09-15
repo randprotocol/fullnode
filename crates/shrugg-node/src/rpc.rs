@@ -1230,7 +1230,13 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let height = st.storage.head().map_err(RpcError::internal)?.height;
             let supply = st.storage.supply().map_err(RpcError::internal)?;
             let register = st.storage.register().map_err(RpcError::internal)?;
-            let audit = shrugg_core::ledger::Audit::new(supply, shrugg_core::ledger::register_total(&register));
+            let aggregators = st.storage.aggregators().map_err(RpcError::internal)?;
+            // The register's two halves, exactly `Ledger::audit`'s: the aggregator register's
+            // outstanding bonds are register-side value, and without them the invariant would
+            // read false on any chain with a live registration.
+            let register_total = shrugg_core::ledger::register_total(&register)
+                .saturating_add(shrugg_core::ledger::supply::aggregators_total(&aggregators));
+            let audit = shrugg_core::ledger::Audit::new(supply, register_total);
             Ok(json!({
                 "height": height,
                 "genesis_deposited": supply.genesis_deposited.to_string(),
@@ -1239,6 +1245,14 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "withdraw_deposited": supply.withdraw_deposited.to_string(),
                 "fees_paid": supply.fees_paid.to_string(),
                 "burned": supply.burned.to_string(),
+                // Block aggregation (spec §5.3): the subsidy and its schedule index, and the
+                // aggregator register's two bond counters — reported separately from
+                // `faucet_minted`, so an auditor checks the schedule against `sealed_blocks`
+                // directly.
+                "subsidised": supply.subsidised.to_string(),
+                "sealed_blocks": supply.sealed_blocks.to_string(),
+                "aggregator_bonds": supply.aggregator_bonds.to_string(),
+                "slashed": supply.slashed.to_string(),
                 "pool_value": audit.pool_value.to_string(),
                 "register_total": audit.register_total.to_string(),
                 "total_supply": audit.total_supply().to_string(),
@@ -1679,6 +1693,63 @@ mod tests {
         assert_eq!(v["register_total"], Value::String((stake + bundle_fee()).to_string()));
         assert_eq!(v["total_supply"], Value::String((alloc + stake).to_string()));
         assert_eq!(v["invariant_holds"], true);
+    }
+
+    /// The aggregation counters (spec §5.3): reported separately, and the invariant holds on a
+    /// chain with a live registration — which needs the aggregator register's bonds counted in
+    /// the register half, `Ledger::audit()`'s own rule.
+    #[tokio::test]
+    async fn get_supply_reports_the_aggregation_counters_on_a_gated_chain() {
+        let bond = 100 * shrugg_core::UNITS_PER_SHRUGG;
+        let mut gs = fixtures::genesis_with(1, vec![alloc_note(20, 200 * shrugg_core::UNITS_PER_SHRUGG)]);
+        gs.ledger.set_aggregation(Some(shrugg_core::ledger::aggregation::AggregationConfig {
+            bond,
+            max_covers: 3,
+            subsidy_base: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![],
+        }));
+        let (_d, st) = state_for(&gs);
+        // Block 1: a registration, whose bundle burns exactly the bond.
+        let mut ledger = gs.ledger.clone();
+        let kp = key(7);
+        let payout = shrugg_core::notes::ShieldedAddress {
+            pk: [7; 8],
+            kem_ek: vec![8; shrugg_core::notes::KEM_EK_BYTES],
+        };
+        let registration = shrugg_core::types::actions::AggregatorRegistration {
+            public_key: kp.public_key().clone(),
+            payout: payout.clone(),
+            signature: kp.sign(
+                shrugg_core::types::actions::aggregator_register_message(1, &payout).as_bytes(),
+            ),
+        };
+        let mut b = shrugg_core::notes::Bundle {
+            anchor: ledger.root(),
+            nullifiers: [nf(1), nf(2)],
+            commitments: [cm(1), cm(2)],
+            fee: bundle_fee(),
+            burn: bond,
+            asset: 0,
+            time: 1,
+            envelopes: [fixtures::env(1), fixtures::env(2)],
+            proof: vec![],
+        };
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d);
+        let register = Transaction::shielded(1, b, shrugg_core::types::Action::RegisterAggregator { registration });
+        let b1 = make_block(&gs.block, &mut ledger, vec![register], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+
+        let v = ok(&st, "shrugg_getSupply", json!([])).await;
+        assert_eq!(v["height"], 1);
+        assert_eq!(v["subsidised"], Value::String("0".into()));
+        assert_eq!(v["sealed_blocks"], Value::String("0".into()));
+        assert_eq!(v["aggregator_bonds"], Value::String(bond.to_string()));
+        assert_eq!(v["slashed"], Value::String("0".into()));
+        assert_eq!(v["burned"], Value::String(bond.to_string()));
+        assert_eq!(v["invariant_holds"], true, "{v}");
     }
 
     /// An explorer can name and summarise every new action. Amounts that are public by design

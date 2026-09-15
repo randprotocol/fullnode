@@ -278,6 +278,13 @@ pub struct Ledger {
     /// The public supply counters (see [`supply`]). Derived from the chain, not hashed into
     /// the state root.
     supply: Supply,
+    /// The proving-share bucket (block aggregation, spec §5.2): per included bundle, the fee
+    /// excess over `gas::BUNDLE_BASE`, the proposer that included it, and the height it is
+    /// coverable until. Derived state like `supply` — rebuilt on replay, persisted beside it,
+    /// and deliberately outside both the state root and `Ledger`'s equality: the map repeats
+    /// information the chain already holds (the fee is in the bundle, the heights are the
+    /// chain's), and `Ledger::from_parts` cannot know it.
+    unsealed_fees: BTreeMap<Hash, (u64, Address, u64)>,
 }
 
 /// Equality is over consensus state only. `height` and `timestamp_ms` are the position of the
@@ -337,6 +344,7 @@ impl Ledger {
             timestamp_ms: 0,
             deposits: Vec::new(),
             supply: Supply::default(),
+            unsealed_fees: BTreeMap::new(),
         }
     }
 
@@ -373,6 +381,7 @@ impl Ledger {
             timestamp_ms: 0,
             deposits: Vec::new(),
             supply: Supply::default(),
+            unsealed_fees: BTreeMap::new(),
         }
     }
 
@@ -432,6 +441,25 @@ impl Ledger {
     /// loader sets them; `Ledger::from_parts` leaves them at zero.
     pub fn set_supply(&mut self, s: Supply) {
         self.supply = s;
+    }
+
+    /// The proving-share bucket (spec §5.2), for the audit, the tests and `shrugg_getUnsealed`.
+    pub fn unsealed_fees(&self) -> &BTreeMap<Hash, (u64, Address, u64)> {
+        &self.unsealed_fees
+    }
+
+    /// Restore the bucket a node persisted beside the state — `set_supply`'s twin: the payout
+    /// an aggregate must pay is computed from it, so a restarted node that lost it would
+    /// disagree with its peers about the very next aggregate's state root.
+    pub fn set_unsealed_fees(&mut self, m: BTreeMap<Hash, (u64, Address, u64)>) {
+        self.unsealed_fees = m;
+    }
+
+    /// Restore the aggregator register a node persisted beside the state: hashed into the state
+    /// root whenever the chain aggregates, so a restarted node that lost it would disagree with
+    /// its peers from the very next block. `from_parts` leaves it empty; the loader sets it.
+    pub fn set_aggregators(&mut self, m: BTreeMap<Address, aggregation::AggregatorEntry>) {
+        self.aggregators = m;
     }
 
     /// What genesis itself created, set once by [`crate::genesis::Genesis::build`]: the deposit
@@ -906,18 +934,29 @@ impl Ledger {
             // block whose proposer is not, and `HotStuff::propose` runs only when this node
             // is the leader.
             let entry = self.validators.get(proposer).ok_or(TxError::UnknownProposer(*proposer))?;
-            let rewards = entry.rewards.checked_add(b.fee).ok_or(TxError::Overflow)?;
+            // The fee split (block aggregation, spec §5.2): on an aggregating chain the
+            // proposer keeps exactly the floor and the excess is bucketed against this
+            // transaction's hash — an `Aggregate` may still cover it — where an ungated chain
+            // keeps the whole fee to the proposer, byte-for-byte today's accounting. The
+            // counter moves with what the proposer actually keeps: the floor now, an expired
+            // excess at the sweep (`sweep_expired_excesses`), never the bucketed part.
+            let kept = if self.aggregation.is_some() { gas::BUNDLE_BASE.min(b.fee) } else { b.fee };
+            let rewards = entry.rewards.checked_add(kept).ok_or(TxError::Overflow)?;
             // Both halves of what this bundle takes out of the pool (see [`supply`]): the fee
             // becomes the proposer's `rewards` below, and the burn becomes `stake` in the
             // `Bond` arm — which is why they are counted here, where every bundle passes,
             // rather than in the arms that receive them.
-            self.supply.fees_paid = self.supply.fees_paid.checked_add(b.fee).ok_or(TxError::Overflow)?;
+            self.supply.fees_paid = self.supply.fees_paid.checked_add(kept).ok_or(TxError::Overflow)?;
             self.supply.burned = self.supply.burned.checked_add(b.burn).ok_or(TxError::Overflow)?;
             // S3 factored the note writes out so a `BridgeBurn`'s asset bundle can reuse them;
             // the counters stay here, on the *fee* bundle's path only, because a bridged asset's
             // burn is not SHRUGG and has no place in the SHRUGG audit.
             self.apply_bundle_notes(b, executor);
             self.validators.get_mut(proposer).expect("looked up above").rewards = rewards;
+            if self.aggregation.is_some() && b.fee > gas::BUNDLE_BASE {
+                let until = self.height.checked_add(self.aggregation().expect("just checked").window).ok_or(TxError::Overflow)?;
+                self.bucket_excess(tx.hash(), b.fee - gas::BUNDLE_BASE, *proposer, until);
+            }
         }
         let mut receipt = None;
         match &tx.action {
@@ -1035,6 +1074,11 @@ impl Ledger {
         scratch.set_height(block.height());
         scratch.set_timestamp_ms(block.header.timestamp_ms);
         let data = scratch.apply_transactions(&block.transactions, &proposer, executor)?;
+        // The proving-share sweep (spec §5.2): every bucketed excess whose window passed at
+        // this head is credited to its recorded proposer. Part of the applied state — the
+        // rewards it credits are in the state root — so it runs inside the scratch, before the
+        // root is computed, and no-ops on a chain without the section.
+        scratch.sweep_expired_excesses(block.height(), &proposer);
         scratch.record_anchor(block.height());
         let computed = scratch.state_root();
         if computed != block.header.state_root {

@@ -1589,6 +1589,66 @@ mod tests {
         );
     }
 
+    /// The register and the bucket survive the same restart, hashed into and computed into the
+    /// state root as they are: a node that came back without them would fork at the next block
+    /// (the register's root) or mis-pay the next aggregate (the bucket's excesses).
+    #[test]
+    fn a_restart_restores_the_aggregator_register_and_the_fee_bucket() {
+        use crate::storage::fixtures::make_block;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        let cfg = shrugg_core::ledger::aggregation::AggregationConfig {
+            bond: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            max_covers: 3,
+            subsidy_base: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![],
+        };
+        gs.ledger.set_aggregation(Some(cfg.clone()));
+        storage.init_genesis(&gs).unwrap();
+
+        // Block 1: a fee-paying bundle (its excess buckets) and a registration, both anchored
+        // to the genesis root, applied by `make_block`.
+        let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+        let fee = shrugg_core::gas::BUNDLE_BASE + 60;
+        let fee_tx = bundle_tx(&ledger, [[41; 8], [42; 8]], [[43; 8], [44; 8]], fee);
+        let mut register_tx = {
+            let kp = key(7);
+            let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; shrugg_core::notes::KEM_EK_BYTES] };
+            let registration = AggregatorRegistration {
+                public_key: kp.public_key().clone(),
+                payout: payout.clone(),
+                signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
+            };
+            let mut b = shrugg_core::notes::Bundle {
+                anchor: ledger.root(),
+                nullifiers: [[45; 8], [46; 8]],
+                commitments: [[47; 8], [48; 8]],
+                fee: shrugg_core::gas::BUNDLE_BASE,
+                burn: cfg.bond,
+                asset: 0,
+                time: 1,
+                envelopes: [env(1), env(2)],
+                proof: vec![],
+            };
+            let d = StubExecutor.bundle_digest(&b.digest_input());
+            b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+            Transaction::shielded(7, b, shrugg_core::types::Action::RegisterAggregator { registration })
+        };
+        let b1 = make_block(&gs.block, &mut ledger, vec![fee_tx, register_tx], &key(1));
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(ledger.unsealed_fees().len(), 1, "the excess is bucketed");
+        assert_eq!(ledger.aggregators().len(), 1, "the aggregator is registered");
+
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.aggregators(), ledger.aggregators(), "the register round-trips");
+        assert_eq!(reloaded.unsealed_fees(), ledger.unsealed_fees(), "the bucket round-trips");
+        assert_eq!(reloaded.state_root(), ledger.state_root(), "and the root agrees");
+    }
+
     // ---------------------------------- block aggregation: covered assembly and the worker arm
 
     use crate::storage::fixtures::{env, make_block_unchecked, HC};

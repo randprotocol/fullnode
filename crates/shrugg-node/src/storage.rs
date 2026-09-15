@@ -84,6 +84,16 @@ const META_HC_BUNDLE: &str = "hc_bundle";
 /// rather than in a family of its own — and why `verify_chain` recomputes it from a full replay
 /// instead of trusting it.
 const META_SUPPLY: &str = "supply";
+/// `bincode(BTreeMap<Hash, (u64, Address, u64)>)`: the proving-share bucket as of the head
+/// (`ledger::unsealed_fees`). `META_SUPPLY`'s twin in every respect — derived state, no root
+/// covers it, `verify_chain` replays it — persisted because the payout an aggregate must pay
+/// is computed from it: a restarted node that lost it would disagree with its peers about the
+/// very next aggregate's state root.
+const META_UNSEALED_FEES: &str = "unsealed_fees";
+/// `bincode(BTreeMap<Address, AggregatorEntry>)`: the aggregator register as of the head.
+/// `META_SUPPLY`'s twin in kind — derived, replay-audited — but unlike the bucket this one is
+/// hashed into the state root, so a restarted node that lost it would fork at the next block.
+const META_AGGREGATORS: &str = "aggregators";
 /// `bincode(BridgeMeta)`: the whole-state half of the bridge — emitter, source emitters,
 /// guardian sets, the asset registry with its indices and `next_index`, and the burn sequence.
 /// Its presence is what makes a chain "bridged" on disk; the two collections it leaves out live
@@ -296,6 +306,8 @@ impl Storage {
         // derived and written when its first block commits.
         batch.put_cf(self.cf(CF_EPOCH_SETS), height_key(0), bincode::serialize(&gs.validators)?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&gs.ledger.supply())?);
+        batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
+        batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_ANCHORS), height_key(0), word8_to_bytes(&gs.ledger.root()));
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(gs.ledger.tree())?);
         batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
@@ -558,6 +570,18 @@ impl Storage {
         Ok(self.get_meta_raw(META_SUPPLY)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
     }
 
+    /// The proving-share bucket as of the head — `supply()`'s twin, with the same rule for a
+    /// database written before the key existed: empty, and `verify_chain`'s replay reports or
+    /// repairs the mismatch.
+    pub fn unsealed_fees(&self) -> Result<std::collections::BTreeMap<Hash, (u64, shrugg_core::Address, u64)>> {
+        Ok(self.get_meta_raw(META_UNSEALED_FEES)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    /// The aggregator register as of the head — the same rule again.
+    pub fn aggregators(&self) -> Result<std::collections::BTreeMap<shrugg_core::Address, shrugg_core::ledger::aggregation::AggregatorEntry>> {
+        Ok(self.get_meta_raw(META_AGGREGATORS)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
     /// Every leaf in tree order. The witness source, and the check `load_ledger` runs the
     /// stored frontier against.
     fn leaves(&self) -> Result<Vec<Word8>> {
@@ -748,6 +772,8 @@ impl Storage {
         let mut ledger =
             Ledger::from_parts(chain_id, hc_bundle, tree, commitments, nullifiers, anchors, validators, programs);
         ledger.set_supply(self.supply()?);
+        ledger.set_unsealed_fees(self.unsealed_fees()?);
+        ledger.set_aggregators(self.aggregators()?);
         ledger.set_bridge(self.load_bridge()?);
         Ok(ledger)
     }
@@ -951,6 +977,8 @@ impl Storage {
         }
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger_after.tree())?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger_after.supply())?);
+        batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
+        batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
         self.db.write_opt(batch, &sync_opts())?;
         Ok(())
@@ -1181,6 +1209,15 @@ impl Storage {
                     ledger.supply()
                 ))
             }
+            // The bucket is outside `Ledger`'s equality for the same reason, so it is audited
+            // beside the counters: the next aggregate's payout is computed from it.
+            Ok(stored) if stored == ledger && stored.unsealed_fees() != ledger.unsealed_fees() => {
+                check.problem = Some(format!(
+                    "stored unsealed fees {:?} do not match the replayed chain's {:?}",
+                    stored.unsealed_fees(),
+                    ledger.unsealed_fees()
+                ))
+            }
             Ok(stored) if stored == ledger => {}
             Ok(_) => check.problem = Some("state snapshot does not match replayed chain".into()),
             Err(e) => check.problem = Some(format!("state snapshot unreadable: {e}")),
@@ -1287,6 +1324,8 @@ impl Storage {
         }
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger.tree())?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger.supply())?);
+        batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
+        batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
         if height == 0 {
             let hk = height_key(0);
             batch.put_cf(self.cf(CF_BLOCKS), hk, gs.block.encode());

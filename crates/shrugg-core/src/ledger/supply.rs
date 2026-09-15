@@ -55,6 +55,13 @@ pub struct Supply {
     /// actually crossed into the pool, which is what the invariant needs it to be.
     pub withdraw_deposited: u64,
     /// Σ of every bundle fee: value that left the pool into a proposer's `rewards`.
+    ///
+    /// On an aggregating chain the fee splits at inclusion (spec §5.2): the proposer keeps the
+    /// floor (`gas::BUNDLE_BASE`), counted here at once, and the excess is bucketed in
+    /// `unsealed_fees` — still pool-side in this accounting until it resolves. It resolves one
+    /// of two ways, each counted here at that moment and not before: an expired excess is swept
+    /// to the recorded proposer, and a covered one returns to the pool inside the aggregate's
+    /// payout note (spec §5.4), where it needs no counter — it never left.
     pub fees_paid: u64,
     /// Σ of every bundle `burn`. Today only a `Bond` may burn, and it burns into `stake` — and
     /// a `RegisterAggregator`'s bundle, which burns into `aggregator_bonds` (spec §5.3).
@@ -67,9 +74,14 @@ pub struct Supply {
     /// slashed`).
     pub slashed: u64,
     /// The count of sealed blocks — blocks carrying an included `Aggregate` (spec §5.1's `n`).
-    /// The subsidy schedule reads it; Task 5 increments it at the aggregate's apply, so on a
-    /// chain that has sealed nothing it is 0 and the subsidy is `subsidy_base`.
+    /// The subsidy schedule reads it; it increments at the aggregate's apply, so on a chain
+    /// that has sealed nothing it is 0 and the subsidy is `subsidy_base`.
     pub sealed_blocks: u64,
+    /// Σ of every `subsidy(n)` minted at an `Aggregate`'s apply (spec §5.1). This is new
+    /// issuance, and it is the *whole* of what the payout note adds to these counters: the
+    /// note's other part, the covered bundles' proving shares, is value that never left the
+    /// pool in this accounting (see `fees_paid`), so it touches no counter when it lands.
+    pub subsidised: u64,
 }
 
 impl Supply {
@@ -79,19 +91,28 @@ impl Supply {
     /// blocks all applied (a fee or a burn is paid out of a note the pool already held), so a
     /// saturation would mean the counters are wrong — and it shows up as
     /// [`Audit::invariant_holds`] being false rather than as a panic in an RPC handler.
+    ///
+    /// On an aggregating chain this reads a little high while proving shares are unresolved:
+    /// the bucketed excess of a not-yet-covered, not-yet-expired bundle is pool-side in this
+    /// accounting until it seals or sweeps (see `fees_paid`), so the number includes it. The
+    /// audit's *total* is exact at every height either way.
     pub fn pool_value(&self) -> u64 {
         self.genesis_deposited
             .saturating_add(self.faucet_minted)
             .saturating_add(self.withdraw_deposited)
+            .saturating_add(self.subsidised)
             .saturating_sub(self.fees_paid)
             .saturating_sub(self.burned)
     }
 
-    /// Everything this chain has ever issued: what genesis created, plus the faucet. A withdraw
-    /// is not issuance — it moves value the register already held back into the pool — and
-    /// neither is a fee or a burn, which move value the other way.
+    /// Everything this chain has ever issued: what genesis created, plus the faucet and the
+    /// aggregation subsidy. A withdraw is not issuance — it moves value the register already
+    /// held back into the pool — and neither is a fee or a burn, which move value the other way.
     pub fn issued(&self) -> u64 {
-        self.genesis_deposited.saturating_add(self.genesis_staked).saturating_add(self.faucet_minted)
+        self.genesis_deposited
+            .saturating_add(self.genesis_staked)
+            .saturating_add(self.faucet_minted)
+            .saturating_add(self.subsidised)
     }
 }
 
