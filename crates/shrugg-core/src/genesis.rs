@@ -90,6 +90,12 @@ pub struct Genesis {
     /// are byte-for-byte what phase S1 produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge: Option<BridgeConfig>,
+    /// Block aggregation (spec §2): the aggregator bond, cover cap, subsidy schedule, sealing
+    /// window and admitted inner shapes. Part of the genesis hash and of the state root when
+    /// present; omitted entirely when absent, so an aggregation-less chain's genesis file, hash
+    /// and state root are byte-for-byte today's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregation: Option<crate::ledger::aggregation::AggregationConfig>,
     /// Phase S2: blocks per epoch — the validator set for epoch `e` is derived from the
     /// register as of the last block of epoch `e - 1`. Configurable so a cluster test does not
     /// have to run 1000 blocks to cross a boundary. Part of the genesis hash: two chains that
@@ -142,6 +148,8 @@ pub enum GenesisError {
     BadFriProfile(String),
     #[error("bad bridge config: {0}")]
     BadBridgeConfig(String),
+    #[error("bad aggregation config: {0}")]
+    BadAggregationConfig(String),
     #[error("bad hc_bundle {0} (64 hex characters)")]
     BadHcBundle(String),
     #[error("bad alloc note {0}")]
@@ -196,6 +204,9 @@ impl Genesis {
         if let Some(bridge) = &self.bridge {
             check_bridge(bridge)?;
         }
+        if let Some(aggregation) = &self.aggregation {
+            check_aggregation(aggregation)?;
+        }
         // S2 divides by `epoch_blocks` to get the epoch of a height; a genesis file that says
         // zero would panic every node on the first block rather than at the one place that
         // reads the file. The upper bound costs nothing and rejects an epoch that never ends.
@@ -245,6 +256,7 @@ impl Genesis {
         ledger.set_faucet(self.faucet);
         ledger.set_confidential(self.confidential);
         ledger.set_bridge(self.bridge.as_ref().map(BridgeState::from_config));
+        ledger.set_aggregation(self.aggregation.clone());
         // The genesis ledger is positioned at the genesis block, so it carries that block's
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
@@ -300,6 +312,11 @@ impl Genesis {
         // *strings*.
         if let Some(bridge) = &self.bridge {
             commit.extend_from_slice(&bincode::serialize(&BridgeCommit::from(bridge)).expect("serializes"));
+        }
+        // Block aggregation, likewise: appended only when the section is configured, so an
+        // aggregation-less chain's genesis hash is byte-for-byte today's.
+        if let Some(aggregation) = &self.aggregation {
+            commit.extend_from_slice(&bincode::serialize(aggregation).expect("serializes"));
         }
         let genesis_binding = Hash::digest_domain(b"shrugg-genesis-2", &commit);
         let header = BlockHeader {
@@ -363,6 +380,30 @@ fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
     Ok(())
 }
 
+/// Rejects an `aggregation` section a chain could not run (spec §2.3): a zero bond, cover cap,
+/// halving interval or window (each would make a rule the section exists to create
+/// meaningless), or an admitted shape whose aggregate-program digest is all zero — the
+/// activation placeholder, which must never reach a fleet (spec §10's `FILL-AT-ACTIVATION`).
+fn check_aggregation(cfg: &crate::ledger::aggregation::AggregationConfig) -> Result<(), GenesisError> {
+    let bad = |m: String| Err(GenesisError::BadAggregationConfig(m));
+    if cfg.bond == 0 {
+        return bad("zero bond".into());
+    }
+    if cfg.max_covers == 0 {
+        return bad("zero max_covers".into());
+    }
+    if cfg.halving_blocks == 0 {
+        return bad("zero halving_blocks".into());
+    }
+    if cfg.window == 0 {
+        return bad("zero window".into());
+    }
+    if cfg.admitted_shapes.iter().any(|s| s.aggregate_program_digest == [0; 4]) {
+        return bad("an admitted shape has no aggregate-program digest (the activation placeholder)".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +452,7 @@ mod tests {
             fri_profile: "production".into(),
             hc_bundle: word8_to_hex(&[3; 8]),
             bridge: None,
+            aggregation: None,
             epoch_blocks: EPOCH_BLOCKS_DEFAULT,
         }
     }

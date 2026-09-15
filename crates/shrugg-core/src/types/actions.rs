@@ -192,3 +192,62 @@ mod tests {
         assert_ne!(base.to_hex(), wbase.to_hex());
     }
 }
+
+// ── block aggregation: the aggregator register's signed forms (spec §2–§3) ──────────────────
+
+/// An aggregator's first appearance in the register (spec §2.2): the Dilithium2 key that signs
+/// its later aggregation actions and the shielded address its subsidy, proving shares and bond
+/// are paid to. `signature` is over [`aggregator_register_message`]. The [`Registration`] twin,
+/// one role over.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregatorRegistration {
+    pub public_key: PublicKey,
+    pub payout: ShieldedAddress,
+    pub signature: Signature,
+}
+
+/// One signed header of a slash's evidence pair (spec §2.2): two of these with the same
+/// `(aggregator, nonce)` and different content are the equivocation `Action::SlashAggregator`
+/// proves. Carried boxed so a slash transaction's size stays bounded by two headers rather than
+/// by any list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedAggregateHeader {
+    pub aggregator: Address,
+    pub nonce: u64,
+    pub time: u32,
+    pub r: Word8,
+    pub covers: Vec<crate::crypto::Hash>,
+    pub proof_hash: crate::crypto::Hash,
+    pub signature: Signature,
+}
+
+/// What an aggregator signs to claim an address in the register: the chain and the payout —
+/// [`registration_message`]'s exact construction, one role over. As there, the enclosing
+/// action's `aggregator` field must equal `registration.public_key.address()`, so one key's
+/// payout cannot be registered under another key's address.
+pub fn aggregator_register_message(chain_id: u64, payout: &ShieldedAddress) -> crate::crypto::Hash {
+    let bytes = bincode::serialize(&(chain_id, payout)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"shrugg-aggregator-register", &bytes)
+}
+
+/// What an aggregator signs to stop submitting and start the unbonding window: the register's
+/// `nonce` is the replay protection — [`unbond_message`]'s, one role over.
+pub fn aggregator_unbond_message(chain_id: u64, aggregator: &Address, nonce: u64) -> crate::crypto::Hash {
+    let bytes = bincode::serialize(&(chain_id, aggregator, nonce)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"shrugg-aggregator-unbond", &bytes)
+}
+
+/// What an aggregator signs to withdraw its released bond into a deposit note: `r`, the note's
+/// `time` and the envelope are in the message so the note the ledger computes is the note the
+/// aggregator asked for — [`withdraw_message`]'s, one role over.
+pub fn aggregator_withdraw_message(
+    chain_id: u64,
+    aggregator: &Address,
+    nonce: u64,
+    time: u32,
+    r: &Word8,
+    envelope: &Envelope,
+) -> crate::crypto::Hash {
+    let bytes = bincode::serialize(&(chain_id, aggregator, nonce, time, r, envelope)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"shrugg-aggregator-withdraw", &bytes)
+}

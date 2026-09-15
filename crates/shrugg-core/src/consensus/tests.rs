@@ -66,6 +66,7 @@ fn build(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool) -> Sim {
         hc_bundle: word8_to_hex(&[3; 8]),
         epoch_blocks,
         bridge: None,
+        aggregation: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -884,6 +885,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         hc_bundle: word8_to_hex(&[3; 8]),
         epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
         bridge: None,
+        aggregation: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());

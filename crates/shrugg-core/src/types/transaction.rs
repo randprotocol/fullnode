@@ -4,7 +4,7 @@ use crate::bridge::{digest as attestation_digest, Attestation};
 use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
 use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8};
 use crate::program::ProgramId;
-use crate::types::actions::{CallEnvelope, Registration};
+use crate::types::actions::{AggregatorRegistration, CallEnvelope, Registration, SignedAggregateHeader};
 use serde::{Deserialize, Serialize};
 
 /// Native token symbol. The whitepaper (Draft 3) calls this SHRUGG; rename here if needed.
@@ -128,21 +128,54 @@ pub enum Action {
     /// second bundle of the transaction — the one spending the asset notes; the transaction's
     /// own `bundle` pays the SHRUGG fee.
     BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee: u64, to_chain: u16, to: [u8; 32] },
+    /// Block aggregation (spec §2.2): register the sender as an aggregator. Rides a bundle
+    /// whose `burn` equals the genesis bond — the only aggregation action that carries one.
+    RegisterAggregator { registration: AggregatorRegistration },
+    /// Block aggregation: stop submitting and start the unbonding window. Bundle-less,
+    /// validator-style signed over [`crate::types::actions::aggregator_unbond_message`].
+    UnbondAggregator { aggregator: Address, nonce: u64, signature: Signature },
+    /// Block aggregation: after the release height, withdraw the bond as a deposit note the
+    /// ledger derives (`bond − BUNDLE_BASE`; the base goes to the proposer) — S2's `Withdraw`
+    /// verbatim, one register over. Bundle-less; signed over
+    /// [`crate::types::actions::aggregator_withdraw_message`].
+    WithdrawAggregator { aggregator: Address, nonce: u64, time: u32, r: Word8, envelope: Envelope, signature: Signature },
+    /// Block aggregation: the equivocation proof (spec §2.2) — two signed headers by the same
+    /// aggregator at the same nonce with different content. Bundle-less, no fee, anyone may
+    /// submit it; burns the bond and deletes the entry.
+    SlashAggregator { a: Box<SignedAggregateHeader>, b: Box<SignedAggregateHeader> },
+    /// Block aggregation (spec §3): one rVM proof covering `covers` bundle transactions of a
+    /// finalised window, by a registered aggregator. Bundle-less; the public list is
+    /// recomputed, not carried; the nine admission steps of spec §4.
+    Aggregate {
+        covers: Vec<Hash>,
+        proof: Vec<u8>,
+        aggregator: Address,
+        nonce: u64,
+        time: u32,
+        r: Word8,
+        envelope: Envelope,
+        signature: Signature,
+    },
 }
 
 impl Action {
     /// The name of this action if it rides *without* a bundle, `None` if it must carry one.
     ///
-    /// Three actions do: a faucet `Mint` (a new wallet holds no note to pay a fee with) and the
-    /// two validator-signed staking actions, `Unbond` and `Withdraw` (a validator key owns no
-    /// notes either — `Unbond` is free, and `Withdraw` pays the bundle base out of the amount it
-    /// withdraws). This is the one list of them: admission reads it for the shape rule and the
-    /// name it reports, and [`crate::gas::fee_floor`] gives each of them a zero floor.
+    /// The faucet `Mint` and the validator-signed staking actions started the list; block
+    /// aggregation adds four: `UnbondAggregator`, `WithdrawAggregator`, `SlashAggregator` and
+    /// `Aggregate` (an aggregator key owns no notes; the aggregate's proving share is collected
+    /// from the covered bundles' excess, not from the author — spec §5.2). This is the one list
+    /// of them: admission reads it for the shape rule and the name it reports, and
+    /// [`crate::gas::fee_floor`] gives each of them a zero floor.
     pub fn bundle_less(&self) -> Option<&'static str> {
         match self {
             Action::Mint { .. } => Some("mint"),
             Action::Unbond { .. } => Some("unbond"),
             Action::Withdraw { .. } => Some("withdraw"),
+            Action::UnbondAggregator { .. } => Some("unbond_aggregator"),
+            Action::WithdrawAggregator { .. } => Some("withdraw_aggregator"),
+            Action::SlashAggregator { .. } => Some("slash_aggregator"),
+            Action::Aggregate { .. } => Some("aggregate"),
             _ => None,
         }
     }

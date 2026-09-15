@@ -8,6 +8,7 @@
 //! `BridgeAttest`/`BridgeBurn` (phase S3). That split is what lets S2 and S3 be implemented in
 //! parallel: each phase owns its own file.
 
+pub mod aggregation;
 pub mod bridge_notes;
 pub mod call_envelope;
 pub mod staking;
@@ -245,6 +246,13 @@ pub struct Ledger {
     /// (spec §10). `None` makes the two bridge actions inadmissible and leaves the state root
     /// with the four components a bridge-less chain has always had.
     bridge: Option<BridgeState>,
+    /// The aggregation section of genesis (spec §2), set from the genesis file exactly like
+    /// `epoch_blocks` — a genesis parameter, not consensus state. `None` makes the five
+    /// aggregation actions inadmissible and keeps the state root byte-for-byte today's.
+    aggregation: Option<aggregation::AggregationConfig>,
+    /// The aggregator register, hashed into the state root (spec §2.1) when `aggregation` is
+    /// set; empty otherwise and at chain-9 block 0.
+    aggregators: BTreeMap<Address, aggregation::AggregatorEntry>,
     /// Height of the block being applied (the `time` window and `ProgramRecord::deployed_at`).
     height: u64,
     /// Timestamp of the block being applied, in unix milliseconds.
@@ -276,6 +284,7 @@ impl PartialEq for Ledger {
             && self.validators == o.validators
             && self.programs == o.programs
             && self.bridge == o.bridge
+            && self.aggregators == o.aggregators
     }
 }
 impl Eq for Ledger {}
@@ -306,6 +315,8 @@ impl Ledger {
             programs: BTreeMap::new(),
             epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             bridge: None,
+            aggregation: None,
+            aggregators: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
@@ -340,6 +351,8 @@ impl Ledger {
             programs,
             epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             bridge: None,
+            aggregation: None,
+            aggregators: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
@@ -482,6 +495,25 @@ impl Ledger {
 
     pub fn bridge_mut(&mut self) -> Option<&mut BridgeState> {
         self.bridge.as_mut()
+    }
+
+    /// Install (or clear) the aggregation section. Genesis calls this once from its
+    /// `aggregation` section; a reloading node calls it with what storage held. The register
+    /// itself is not touched: it is consensus state, and only the five actions move it.
+    pub fn set_aggregation(&mut self, aggregation: Option<aggregation::AggregationConfig>) {
+        self.aggregation = aggregation;
+    }
+
+    /// The aggregation section, or `None` on a chain without one — where the five aggregation
+    /// actions are inadmissible and the state root is byte-for-byte today's.
+    pub fn aggregation(&self) -> Option<&aggregation::AggregationConfig> {
+        self.aggregation.as_ref()
+    }
+
+    /// The aggregator register (spec §2.1): every row that has ever registered, keyed by
+    /// address. Empty on a chain without the section and at chain-9 block 0.
+    pub fn aggregators(&self) -> &BTreeMap<Address, aggregation::AggregatorEntry> {
+        &self.aggregators
     }
 
     /// Whether the bridge has already consumed this attestation digest — the `is_spent` of the
@@ -729,6 +761,10 @@ impl Ledger {
                     return Err(StakingError::BurnMismatch { burn: b.burn, amount: *amount }.into())
                 }
                 Action::Bond { .. } => {}
+                // Block aggregation: `RegisterAggregator` is the one aggregation action whose
+                // bundle burns (the genesis bond). The exact figure is the register's own check
+                // (Task 2's admission arm); the action itself is refused here until it lands.
+                Action::RegisterAggregator { .. } => {}
                 _ if b.burn != 0 => return Err(TxError::UnsupportedBurn(b.burn)),
                 _ => {}
             }
@@ -787,6 +823,9 @@ impl Ledger {
             }
             a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
                 verified.attestation = bridge_notes::validate(self, tx, a, executor)?;
+            }
+            _ => {
+                return Err(aggregation::NOT_AGGREGATION);
             }
         }
         // 8-9. the bundle's digest, then its proof
@@ -875,6 +914,9 @@ impl Ledger {
             }
             a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
                 bridge_notes::apply(self, tx, a, executor, verified.attestation)?;
+            }
+            _ => {
+                return Err(aggregation::NOT_AGGREGATION);
             }
         }
         Ok(receipt)
@@ -967,14 +1009,16 @@ impl Ledger {
 
     /// Deterministic state commitment (spec §9):
     /// `blake3("shrugg-state-2" || tree_root || nullifier_root || validators_root || programs_root)`,
-    /// with `|| bridge_root` appended on a chain whose genesis has a `bridge` section (spec §10).
+    /// with `|| bridge_root` appended on a chain whose genesis has a `bridge` section (spec §10),
+    /// and — on a chain whose genesis has an `aggregation` section — the whole of that under
+    /// `shrugg-state-3` with `|| aggregators_root` appended (block-aggregation spec §2.1).
     /// The nullifier and validator roots are BLAKE3 Merkle roots over the sorted sets; programs
     /// are content addressed, so their ids commit to the code.
     ///
-    /// The bridge component is appended, not always present with a zero placeholder, so a
-    /// chain without a bridge commits exactly the 128 bytes phase S1 committed: turning the
-    /// bridge on is a hard fork for the chains that take it and a no-op for the ones that
-    /// do not.
+    /// The optional components are appended, never zero-placed, so a chain without a bridge
+    /// commits exactly what phase S1 committed and a chain without aggregation exactly what the
+    /// bridge commit added — turning either on is a hard fork for the chains that take it and a
+    /// no-op for the ones that do not.
     pub fn state_root(&self) -> Hash {
         let nf_leaves: Vec<Hash> = self
             .nullifiers
@@ -1013,6 +1057,10 @@ impl Ledger {
         buf.extend_from_slice(merkle_root(&prog_leaves).as_bytes());
         if let Some(bridge) = &self.bridge {
             buf.extend_from_slice(bridge.root().as_bytes());
+        }
+        if self.aggregation.is_some() {
+            buf.extend_from_slice(aggregation::aggregators_root(&self.aggregators).as_bytes());
+            return Hash::digest_domain(b"shrugg-state-3", &buf);
         }
         Hash::digest_domain(b"shrugg-state-2", &buf)
     }

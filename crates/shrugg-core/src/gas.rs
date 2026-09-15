@@ -89,6 +89,16 @@ pub fn fee_floor(action: &Action) -> u64 {
         // the action. Both are verified, so both are paid for — and by this bundle, because the
         // asset bundle's `fee` must be zero (the guest's "`asset != 0` => `fee = 0`" rule).
         Action::BridgeBurn { .. } => 2 * BUNDLE_BASE,
+        // Block aggregation: registering burns the genesis bond through its bundle, so the
+        // bundle pays the plain base like a transfer or a `Bond`. The four bundle-less
+        // aggregation actions have nothing to pay *from* (this function's own rule for
+        // bundle-less actions): the aggregate's proving share is collected from the covered
+        // bundles' excess, not from the author (spec §5.2, ruling R5).
+        Action::RegisterAggregator { .. } => BUNDLE_BASE,
+        Action::UnbondAggregator { .. }
+        | Action::WithdrawAggregator { .. }
+        | Action::SlashAggregator { .. }
+        | Action::Aggregate { .. } => 0,
     }
 }
 
@@ -186,5 +196,27 @@ mod tests {
         assert_eq!(call_fee(12), 1_100_000);
         assert_eq!(call_fee(20), 1_500_000);
         assert_eq!(call_fee(0), 1_000_000, "below MIN_TIER saturates");
+    }
+}
+
+/// The most bundles one `Aggregate` may cover, the genesis default (spec §3.3 — the measured
+/// per-N economics set it: production N=1 provable on the ≥ 64 GB batch machine, N=2/N=3
+/// arriving with the GPU numbers).
+pub const MAX_COVERS_DEFAULT: u32 = 3;
+
+/// The `Aggregate` action's wire cap (spec §3.1): the proof cap plus the covers, the
+/// recomputed interface list's length bound, an envelope and fixed overhead. The rVM proof at
+/// production is estimated well under the 2 MiB proof cap already (`circuits`' M5.2 record).
+pub const MAX_AGGREGATE_BYTES: usize =
+    MAX_PROOF_BYTES + MAX_COVERS_DEFAULT as usize * 32 + (4 + 1 + 34 * MAX_COVERS_DEFAULT as usize) * 8 + 4_400;
+
+/// The sealing block's minted subsidy (spec §5.1): `subsidy_base` per sealed block, halving
+/// every `halving_blocks`, zero from the 64th halving. `n` is the ledger's `sealed_blocks`
+/// counter, incremented per included aggregate, so an idle chain does not consume the schedule.
+pub fn subsidy(n: u64, cfg: &crate::ledger::aggregation::AggregationConfig) -> u64 {
+    if n / cfg.halving_blocks >= 64 {
+        0
+    } else {
+        cfg.subsidy_base >> (n / cfg.halving_blocks)
     }
 }
