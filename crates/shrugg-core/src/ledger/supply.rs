@@ -56,8 +56,16 @@ pub struct Supply {
     pub withdraw_deposited: u64,
     /// Σ of every bundle fee: value that left the pool into a proposer's `rewards`.
     pub fees_paid: u64,
-    /// Σ of every bundle `burn`. Today only a `Bond` may burn, and it burns into `stake`.
+    /// Σ of every bundle `burn`. Today only a `Bond` may burn, and it burns into `stake` — and
+    /// a `RegisterAggregator`'s bundle, which burns into `aggregator_bonds` (spec §5.3).
     pub burned: u64,
+    /// Σ of aggregator bonds burned in, minus bonds paid out or slashed (block aggregation,
+    /// spec §5.3): the register-side twin of the aggregator register's outstanding bonds.
+    pub aggregator_bonds: u64,
+    /// Σ of bonds burned by `SlashAggregator`. Slashing destroys issuance: the bond is not paid
+    /// out, so it appears on the right of the audit's identity (`total_supply == issued −
+    /// slashed`).
+    pub slashed: u64,
 }
 
 impl Supply {
@@ -91,6 +99,14 @@ pub fn register_total(register: &BTreeMap<Address, ValidatorEntry>) -> u64 {
     })
 }
 
+/// The aggregator register's half of the register total (block aggregation, spec §5.3): the
+/// outstanding bonds. Deliberately a separate function from [`register_total`] — the validator
+/// register's shape is unchanged by the new register, and callers that predate it keep their
+/// answer.
+pub fn aggregators_total(aggregators: &BTreeMap<Address, super::aggregation::AggregatorEntry>) -> u64 {
+    aggregators.values().fold(0u64, |acc, e| acc.saturating_add(e.bond))
+}
+
 /// The answer `shrugg_getSupply` gives: the counters, the two halves they add up to, and
 /// whether the two halves still account for everything the chain issued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,7 +128,7 @@ impl Audit {
     /// Everything the chain issued is either in the pool or in the register. A false here is a
     /// consensus bug or a damaged counter, never a legitimate chain state.
     pub fn invariant_holds(&self) -> bool {
-        self.total_supply() == self.supply.issued()
+        self.total_supply() == self.supply.issued().saturating_sub(self.supply.slashed)
     }
 }
 

@@ -8,7 +8,7 @@
 //! with a named error rather than applied.
 
 use crate::crypto::{merkle_root, Address, Hash, PublicKey};
-use crate::notes::{word8_to_bytes, ShieldedAddress};
+use crate::notes::{word8_to_bytes, ShieldedAddress, Word8};
 use crate::types::DeclaredShape;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -81,10 +81,370 @@ pub fn aggregators_root(register: &BTreeMap<Address, AggregatorEntry>) -> Hash {
     merkle_root(&leaves)
 }
 
-/// What an aggregation action gets before the register's actions land (Task 2) — and always on
-/// a chain without the section. Named, so a wallet hears which phase turns the actions on
-/// rather than "invalid transaction" (`staking`'s `NOT_STAKING` pattern, mirrored).
-pub(super) const NOT_AGGREGATION: crate::ledger::TxError = crate::ledger::TxError::UnsupportedAction("aggregation");
+// ── the register's four actions (spec §2.2) ─────────────────────────────────────────────────
+
+use crate::crypto::Signature;
+use crate::gas;
+use crate::ledger::{Ledger, TxError};
+use crate::types::actions::{
+    aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message,
+    aggregator_withdraw_message, AggregatorRegistration,
+};
+use crate::types::{Action, SignedAggregateHeader, Transaction};
+
+/// Why an aggregation action was refused. Carried inside [`TxError::Aggregation`] so admission
+/// reports the module's own name for it — [`super::staking::StakingError`]'s role, one role over.
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
+pub enum AggregationError {
+    #[error("aggregator {0} is not in the register")]
+    UnknownAggregator(Address),
+    #[error("aggregator {0} is already registered")]
+    AlreadyRegistered(Address),
+    #[error("the registration is for another aggregator or its payout is not an address")]
+    BadRegistration,
+    #[error("bad aggregator signature")]
+    BadSignature,
+    #[error("wrong nonce: expected {expected}, got {actual}")]
+    BadNonce { expected: u64, actual: u64 },
+    #[error("a register bundle must burn exactly the genesis bond: burn {burn}, bond {bond}")]
+    BondMismatch { burn: u64, bond: u64 },
+    #[error("aggregator {0} is unbonding and cannot submit")]
+    Unbonding(Address),
+    #[error("nothing is released before height {release}; withdraw at {height} refused")]
+    NothingReleased { release: u64, height: u64 },
+    #[error("withdraw of {amount} does not cover the bundle base {base}")]
+    BelowBundleBase { amount: u64, base: u64 },
+    #[error("a slash's headers must share one aggregator at one nonce with different content")]
+    NotEquivocation,
+    #[error("arithmetic overflow")]
+    Overflow,
+}
+
+/// What an action reaching this module that it does not own gets. Only a routing mistake in
+/// [`super::Ledger::validate_inner`] can produce one, and refusing it is the safe answer
+/// (`super::staking`'s `NOT_STAKING`, mirrored).
+pub(super) const NOT_AGGREGATION: TxError = TxError::UnsupportedAction("aggregation");
+
+/// The bundle-burn check (spec §2.2): a `RegisterAggregator`'s bundle must burn exactly the
+/// genesis bond. `None` on a chain without the section — where the action itself is refused at
+/// the action step and the burn number does not matter.
+pub(super) fn check_burn(ledger: &Ledger, burn: u64) -> Result<(), TxError> {
+    let Some(cfg) = ledger.aggregation() else { return Ok(()) };
+    if burn != cfg.bond {
+        return Err(AggregationError::BondMismatch { burn, bond: cfg.bond }.into());
+    }
+    Ok(())
+}
+
+/// The action step of admission for the four register actions (spec §2.2), the staking
+/// module's `validate` mirrored: the Aggregate itself is not this module's yet (Task 4).
+pub(super) fn validate(
+    ledger: &Ledger,
+    tx: &Transaction,
+    action: &Action,
+    executor: &dyn crate::confidential::ConfidentialExecutor,
+) -> Result<(), TxError> {
+    // The absolute gate (spec §9): a chain without the section refuses every aggregation action
+    // by name, before any register check — and `apply` never sees one.
+    if ledger.aggregation().is_none() {
+        return Err(NOT_AGGREGATION);
+    }
+    match action {
+        Action::RegisterAggregator { registration } => {
+            check_register(ledger, registration, tx.chain_id)?;
+        }
+        Action::UnbondAggregator { aggregator, nonce, signature } => {
+            check_unbond(ledger, aggregator, *nonce, signature, tx.chain_id)?;
+        }
+        Action::WithdrawAggregator { aggregator, nonce, time, r, envelope, signature } => {
+            check_withdraw(ledger, aggregator, *nonce, *time, r, envelope, signature, tx.chain_id)?;
+            // The deposit the chain is about to create must be a note nobody has created yet
+            // (the staking `Withdraw` rule, verbatim).
+            let cm = withdraw_note(ledger, aggregator, *time, r, executor)?;
+            if ledger.has_commitment(&cm) {
+                return Err(TxError::CommitmentExists(cm));
+            }
+        }
+        Action::SlashAggregator { a, b } => {
+            check_slash(ledger, a, b, tx.chain_id)?;
+        }
+        _ => return Err(NOT_AGGREGATION),
+    }
+    Ok(())
+}
+
+/// The apply step, in lockstep with [`validate`]: each arm re-runs its checks through the
+/// `Ledger` method that owns the mutation, so the two halves cannot drift apart (`staking`'s
+/// `apply`, mirrored).
+pub(super) fn apply(
+    ledger: &mut Ledger,
+    tx: &Transaction,
+    action: &Action,
+    proposer: &Address,
+    executor: &dyn crate::confidential::ConfidentialExecutor,
+) -> Result<(), TxError> {
+    match action {
+        Action::RegisterAggregator { registration } => {
+            let bond = ledger.aggregation().expect("gated by validate").bond;
+            ledger.register_aggregator(registration, bond, tx.chain_id)?;
+        }
+        Action::UnbondAggregator { aggregator, nonce, signature } => {
+            ledger.unbond_aggregator(aggregator, *nonce, signature, tx.chain_id)?;
+        }
+        Action::WithdrawAggregator { aggregator, nonce, time, r, envelope, signature } => {
+            // Everything that can fail happens before the first mutation (the staking
+            // `Withdraw` rule, verbatim): the register's half is checked by `withdraw`, and the
+            // note and the proposer's credit are worked out here.
+            let cm = withdraw_note(ledger, aggregator, *time, r, executor)?;
+            if ledger.has_commitment(&cm) {
+                return Err(TxError::CommitmentExists(cm));
+            }
+            let rewards = ledger.validators().get(proposer).ok_or(TxError::UnknownProposer(*proposer))?.rewards;
+            let _ = rewards.checked_add(gas::BUNDLE_BASE).ok_or(TxError::Overflow)?;
+            let bond = ledger
+                .aggregators()
+                .get(aggregator)
+                .ok_or(TxError::Aggregation(AggregationError::UnknownAggregator(*aggregator)))?
+                .bond;
+            let paid = note_amount(bond)?;
+
+            ledger.withdraw_aggregator(aggregator, *nonce, *time, r, envelope, signature, tx.chain_id)?;
+            ledger.append_deposit(cm, envelope.clone(), executor)?;
+            // The base goes to the proposer, exactly as a `Withdraw`'s; and what actually
+            // reached the pool is the note, not the bond (see `ledger::supply`).
+            let e = ledger.validators.get_mut(proposer).expect("looked up above");
+            e.rewards = e.rewards.checked_add(gas::BUNDLE_BASE).ok_or(TxError::Overflow)?;
+            ledger.supply.withdraw_deposited =
+                ledger.supply.withdraw_deposited.checked_add(paid).ok_or(TxError::Overflow)?;
+            ledger.supply.aggregator_bonds =
+                ledger.supply.aggregator_bonds.checked_sub(bond).ok_or(TxError::Overflow)?;
+        }
+        Action::SlashAggregator { a, b } => {
+            ledger.slash_aggregator(a, b, tx.chain_id)?;
+        }
+        _ => return Err(NOT_AGGREGATION),
+    }
+    Ok(())
+}
+
+impl Ledger {
+    /// Register the address as an aggregator (spec §2.2), inserting the entry at nonce 0. The
+    /// bundle's burn is checked by admission, not here — a register only ever arrives as an
+    /// `Action::RegisterAggregator` whose bundle burned the genesis bond (crate-internal, like
+    /// the validator register's `bond`).
+    pub(crate) fn register_aggregator(
+        &mut self,
+        registration: &AggregatorRegistration,
+        bond: u64,
+        chain_id: u64,
+    ) -> Result<(), AggregationError> {
+        check_register(self, registration, chain_id)?;
+        let aggregator = registration.public_key.address();
+        self.aggregators.insert(
+            aggregator,
+            AggregatorEntry {
+                public_key: registration.public_key.clone(),
+                bond,
+                payout: registration.payout.clone(),
+                nonce: 0,
+                unbonding: None,
+            },
+        );
+        self.supply.aggregator_bonds =
+            self.supply.aggregator_bonds.checked_add(bond).ok_or(AggregationError::Overflow)?;
+        Ok(())
+    }
+
+    /// Stop the aggregator submitting and set its unbonding release height (spec §2.2).
+    pub fn unbond_aggregator(
+        &mut self,
+        aggregator: &Address,
+        nonce: u64,
+        signature: &Signature,
+        chain_id: u64,
+    ) -> Result<(), AggregationError> {
+        check_unbond(self, aggregator, nonce, signature, chain_id)?;
+        let release = self
+            .height
+            .checked_add(self.aggregation().expect("gated").window)
+            .ok_or(AggregationError::Overflow)?;
+        let e = self.aggregators.get_mut(aggregator).expect("checked above");
+        e.unbonding = Some(release);
+        e.nonce += 1;
+        Ok(())
+    }
+
+    /// Pay the released bond as a derived deposit note and delete the entry (spec §2.2). The
+    /// note itself is created by [`apply`], which owns the executor; this is the register's
+    /// half. The base goes to the block's proposer (also in [`apply`]).
+    pub fn withdraw_aggregator(
+        &mut self,
+        aggregator: &Address,
+        nonce: u64,
+        time: u32,
+        r: &Word8,
+        envelope: &crate::notes::Envelope,
+        signature: &Signature,
+        chain_id: u64,
+    ) -> Result<(), AggregationError> {
+        check_withdraw(self, aggregator, nonce, time, r, envelope, signature, chain_id)?;
+        self.aggregators.remove(aggregator).expect("checked above");
+        Ok(())
+    }
+
+    /// Burn the bond and delete the entry on an equivocation proof (spec §2.2). The checks are
+    /// in [`check_slash`]; this is the mutation it gates.
+    pub(crate) fn slash_aggregator(
+        &mut self,
+        a: &SignedAggregateHeader,
+        b: &SignedAggregateHeader,
+        chain_id: u64,
+    ) -> Result<(), AggregationError> {
+        check_slash(self, a, b, chain_id)?;
+        let bond = self
+            .aggregators
+            .remove(&a.aggregator)
+            .expect("checked above")
+            .bond;
+        self.supply.aggregator_bonds =
+            self.supply.aggregator_bonds.checked_sub(bond).ok_or(AggregationError::Overflow)?;
+        self.supply.slashed = self.supply.slashed.checked_add(bond).ok_or(AggregationError::Overflow)?;
+        Ok(())
+    }
+}
+
+/// Registration's rules (spec §2.2): the address is unknown, the registration's key claims
+/// that very address, its payout is sealable (a fixed-width `kem_ek`, the validator
+/// registration's rule), and the signature is over the register message — `check_bond`'s
+/// registration arm, one register over.
+fn check_register(
+    ledger: &Ledger,
+    registration: &AggregatorRegistration,
+    chain_id: u64,
+) -> Result<(), AggregationError> {
+    let aggregator = registration.public_key.address();
+    if ledger.aggregators().contains_key(&aggregator) {
+        return Err(AggregationError::AlreadyRegistered(aggregator));
+    }
+    if registration.payout.kem_ek.len() != crate::notes::KEM_EK_BYTES {
+        return Err(AggregationError::BadRegistration);
+    }
+    if !registration
+        .public_key
+        .verify(aggregator_register_message(chain_id, &registration.payout).as_bytes(), &registration.signature)
+    {
+        return Err(AggregationError::BadSignature);
+    }
+    Ok(())
+}
+
+/// The three signed actions share three checks, in this order (`staking`'s `signed_by`): the
+/// aggregator is in the register, the nonce is the one the register expects, and the signature
+/// is that aggregator's over `message`.
+fn signed_by<'a>(
+    ledger: &'a Ledger,
+    aggregator: &Address,
+    nonce: u64,
+    signature: &Signature,
+    message: impl FnOnce() -> crate::crypto::Hash,
+) -> Result<&'a AggregatorEntry, AggregationError> {
+    let e = ledger.aggregators().get(aggregator).ok_or(AggregationError::UnknownAggregator(*aggregator))?;
+    if nonce != e.nonce {
+        return Err(AggregationError::BadNonce { expected: e.nonce, actual: nonce });
+    }
+    if !e.public_key.verify(message().as_bytes(), signature) {
+        return Err(AggregationError::BadSignature);
+    }
+    Ok(e)
+}
+
+fn check_unbond(
+    ledger: &Ledger,
+    aggregator: &Address,
+    nonce: u64,
+    signature: &Signature,
+    chain_id: u64,
+) -> Result<(), AggregationError> {
+    let e = signed_by(ledger, aggregator, nonce, signature, || aggregator_unbond_message(chain_id, aggregator, nonce))?;
+    if e.unbonding.is_some() {
+        return Err(AggregationError::Unbonding(*aggregator));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_withdraw(
+    ledger: &Ledger,
+    aggregator: &Address,
+    nonce: u64,
+    time: u32,
+    r: &Word8,
+    envelope: &crate::notes::Envelope,
+    signature: &Signature,
+    chain_id: u64,
+) -> Result<(), AggregationError> {
+    let e = signed_by(ledger, aggregator, nonce, signature, || {
+        aggregator_withdraw_message(chain_id, aggregator, nonce, time, r, envelope)
+    })?;
+    if e.bond <= gas::BUNDLE_BASE {
+        return Err(AggregationError::BelowBundleBase { amount: e.bond, base: gas::BUNDLE_BASE });
+    }
+    match e.unbonding {
+        Some(release) if release <= ledger.height => Ok(()),
+        _ => Err(AggregationError::NothingReleased {
+            release: e.unbonding.unwrap_or(0),
+            height: ledger.height,
+        }),
+    }
+}
+
+/// The equivocation check (spec §2.2): both headers are signed by the same aggregator at the
+/// same nonce with different content — the only fault provable on chain.
+fn check_slash(
+    ledger: &Ledger,
+    a: &SignedAggregateHeader,
+    b: &SignedAggregateHeader,
+    chain_id: u64,
+) -> Result<(), AggregationError> {
+    if a.aggregator != b.aggregator || a.nonce != b.nonce || a == b {
+        return Err(AggregationError::NotEquivocation);
+    }
+    let e = ledger
+        .aggregators()
+        .get(&a.aggregator)
+        .ok_or(AggregationError::UnknownAggregator(a.aggregator))?;
+    for h in [a, b] {
+        let msg = aggregate_signing_hash(chain_id, h.nonce, h.time, &h.r, &h.covers, &h.proof_hash);
+        if !e.public_key.verify(msg.as_bytes(), &h.signature) {
+            return Err(AggregationError::BadSignature);
+        }
+    }
+    Ok(())
+}
+
+/// The deposit note an aggregator withdraw creates: the register's payout address, no sender,
+/// the bond less the bundle base, the native asset, the action's own `time`, and the blinding
+/// it published — the validator withdraw note's exact construction, one register over.
+pub(crate) fn withdraw_note(
+    ledger: &Ledger,
+    aggregator: &Address,
+    time: u32,
+    r: &Word8,
+    executor: &dyn crate::confidential::ConfidentialExecutor,
+) -> Result<Word8, TxError> {
+    let e = ledger
+        .aggregators()
+        .get(aggregator)
+        .ok_or(TxError::Aggregation(AggregationError::UnknownAggregator(*aggregator)))?;
+    Ok(executor.note_commitment(&e.payout.pk, &[0; 8], note_amount(e.bond)?, 0, time, r))
+}
+
+/// What an aggregator withdraw's note is worth: the bond, less the bundle base it pays the
+/// proposer (`staking`'s `note_amount`, one register over).
+fn note_amount(bond: u64) -> Result<u64, AggregationError> {
+    bond.checked_sub(gas::BUNDLE_BASE)
+        .ok_or(AggregationError::BelowBundleBase { amount: bond, base: gas::BUNDLE_BASE })
+}
 
 #[cfg(test)]
 mod tests {
@@ -394,5 +754,331 @@ mod tests {
             assert!(s <= prev, "subsidy increased at halving {k}");
             prev = s;
         }
+    }
+}
+
+// ── the register's four actions (Task 2) ─────────────────────────────────────────────────────
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+    use crate::confidential::{ConfidentialExecutor, StubExecutor};
+    use crate::crypto::{Keypair, Hash, Signature};
+    use crate::gas;
+    use crate::ledger::staking::ValidatorEntry;
+    use crate::ledger::Ledger;
+    use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8};
+    use crate::types::actions::{
+        aggregator_register_message, aggregator_unbond_message, aggregator_withdraw_message,
+        aggregate_signing_hash, AggregatorRegistration,
+    };
+    use crate::types::{Action, SignedAggregateHeader, Transaction};
+    use std::collections::BTreeMap;
+
+    const HC: Word8 = [11; 8];
+
+    fn keys() -> (Keypair, Keypair) {
+        (Keypair::from_seed([1; 32]).unwrap(), Keypair::from_seed([2; 32]).unwrap())
+    }
+
+    fn entry(k: &Keypair, stake: u64) -> (Address, ValidatorEntry) {
+        (
+            k.public_key().address(),
+            ValidatorEntry {
+                public_key: k.public_key().clone(),
+                stake,
+                pending: Vec::new(),
+                rewards: 0,
+                payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+                nonce: 0,
+            },
+        )
+    }
+
+    fn gated() -> Ledger {
+        let (a, b) = keys();
+        let register: BTreeMap<Address, ValidatorEntry> = [entry(&a, 10), entry(&b, 10)].into_iter().collect();
+        let mut l = Ledger::new(7, HC, register, &StubExecutor);
+        l.set_faucet(true);
+        l.set_confidential(true);
+        l.set_height(1);
+        l.set_aggregation(Some(cfg()));
+        l
+    }
+
+    fn cfg() -> AggregationConfig {
+        AggregationConfig {
+            bond: 100 * crate::types::UNITS_PER_SHRUGG,
+            max_covers: 3,
+            subsidy_base: 100 * crate::types::UNITS_PER_SHRUGG,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![],
+        }
+    }
+
+    fn env() -> Envelope {
+        Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] }
+    }
+
+    fn bundle(l: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64, burn: u64) -> Bundle {
+        let mut b = Bundle {
+            anchor: l.root(),
+            nullifiers: nfs,
+            commitments: cms,
+            fee,
+            burn,
+            asset: 0,
+            time: l.height as u32,
+            envelopes: [env(), env()],
+            proof: vec![],
+        };
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        b
+    }
+
+    fn registration(kp: &Keypair, payout: &ShieldedAddress) -> AggregatorRegistration {
+        AggregatorRegistration {
+            public_key: kp.public_key().clone(),
+            payout: payout.clone(),
+            signature: kp.sign(aggregator_register_message(7, payout).as_bytes()),
+        }
+    }
+
+    fn register_tx(l: &Ledger, kp: &Keypair, payout: &ShieldedAddress, burn: u64) -> Transaction {
+        Transaction::shielded(
+            7,
+            bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, burn),
+            Action::RegisterAggregator { registration: registration(kp, payout) },
+        )
+    }
+
+    fn unbond_tx(kp: &Keypair, nonce: u64) -> Transaction {
+        let aggregator = kp.public_key().address();
+        Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::UnbondAggregator {
+                aggregator,
+                nonce,
+                signature: kp.sign(aggregator_unbond_message(7, &aggregator, nonce).as_bytes()),
+            },
+        }
+    }
+
+    fn withdraw_tx(kp: &Keypair, nonce: u64, time: u32, r: Word8) -> Transaction {
+        let aggregator = kp.public_key().address();
+        let envelope = env();
+        Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::WithdrawAggregator {
+                aggregator,
+                nonce,
+                time,
+                r,
+                envelope: envelope.clone(),
+                signature: kp.sign(aggregator_withdraw_message(7, &aggregator, nonce, time, &r, &envelope).as_bytes()),
+            },
+        }
+    }
+
+    fn signed_header(kp: &Keypair, nonce: u64, covers: Vec<Hash>, proof_hash: Hash) -> Box<SignedAggregateHeader> {
+        let aggregator = kp.public_key().address();
+        let signature = kp.sign(aggregate_signing_hash(7, nonce, 9, &[1; 8], &covers, &proof_hash).as_bytes());
+        Box::new(SignedAggregateHeader { aggregator, nonce, time: 9, r: [1; 8], covers, proof_hash, signature })
+    }
+
+    fn payout_addr() -> ShieldedAddress {
+        ShieldedAddress { pk: [7; 8], kem_ek: vec![8; crate::notes::KEM_EK_BYTES] }
+    }
+
+    fn proposer(l: &Ledger) -> Address {
+        *l.validators().keys().next().unwrap()
+    }
+
+    /// Registering: the bundle burns exactly the genesis bond, the entry appears at nonce 0,
+    /// and the register's root moves.
+    #[test]
+    fn registering_creates_the_entry_and_moves_the_root() {
+        let mut l = gated();
+        let (kp, _) = keys();
+        let payout = payout_addr();
+        let before = crate::ledger::aggregation::aggregators_root(l.aggregators());
+        let tx = register_tx(&l, &kp, &payout, cfg().bond);
+        l.apply_tx(&tx, &proposer(&l), &StubExecutor).unwrap();
+        let e = &l.aggregators()[&kp.public_key().address()];
+        assert_eq!(e.bond, cfg().bond);
+        assert_eq!(e.payout, payout);
+        assert_eq!(e.nonce, 0);
+        assert_eq!(e.unbonding, None);
+        assert_ne!(crate::ledger::aggregation::aggregators_root(l.aggregators()), before);
+    }
+
+    /// The burn must be exactly the genesis bond — no more, no less (spec §2.2).
+    #[test]
+    fn registering_with_the_wrong_burn_is_refused() {
+        let mut l = gated();
+        let (kp, _) = keys();
+        let payout = payout_addr();
+        for burn in [cfg().bond - 1, cfg().bond + 1, 0] {
+            let tx = register_tx(&l, &kp, &payout, burn);
+            match l.apply_tx(&tx, &proposer(&l), &StubExecutor) {
+                Err(crate::ledger::TxError::Aggregation(AggregationError::BondMismatch { burn: b, bond })) => {
+                    assert_eq!(b, burn);
+                    assert_eq!(bond, cfg().bond);
+                }
+                other => panic!("burn {burn} must fail the bond check, got {other:?}"),
+            }
+        }
+        assert!(l.aggregators().is_empty());
+    }
+
+    /// A second registration under the same address is refused.
+    #[test]
+    fn registering_twice_is_refused() {
+        let mut l = gated();
+        let (kp, _) = keys();
+        let payout = payout_addr();
+        let tx = register_tx(&l, &kp, &payout, cfg().bond);
+        l.apply_tx(&tx, &proposer(&l), &StubExecutor).unwrap();
+        let tx2 = register_tx(&l, &kp, &payout, cfg().bond);
+        // The second bundle spends the same nullifiers, so use fresh ones.
+        let mut tx2 = tx2;
+        tx2.bundle.as_mut().unwrap().nullifiers = [[5; 8], [6; 8]];
+        tx2.bundle.as_mut().unwrap().commitments = [[7; 8], [8; 8]];
+        let d = StubExecutor.bundle_digest(&tx2.bundle.as_ref().unwrap().digest_input());
+        tx2.bundle.as_mut().unwrap().proof = StubExecutor::make_bundle_proof(&HC, &d);
+        assert!(l.apply_tx(&tx2, &proposer(&l), &StubExecutor).is_err());
+    }
+
+    /// A chain without the section refuses every aggregation action by name.
+    #[test]
+    fn the_actions_are_refused_on_an_ungated_chain() {
+        let (a, b) = keys();
+        let register: BTreeMap<Address, ValidatorEntry> = [entry(&a, 10), entry(&b, 10)].into_iter().collect();
+        let mut l = Ledger::new(7, HC, register, &StubExecutor);
+        l.set_faucet(true);
+        l.set_confidential(true);
+        l.set_height(1);
+        let (kp, _) = keys();
+        let tx = register_tx(&l, &kp, &payout_addr(), cfg().bond);
+        match l.apply_tx(&tx, &proposer(&l), &StubExecutor) {
+            Err(crate::ledger::TxError::UnsupportedAction("aggregation")) => {}
+            other => panic!("expected the named refusal, got {other:?}"),
+        }
+        match l.apply_tx(&unbond_tx(&kp, 0), &proposer(&l), &StubExecutor) {
+            Err(crate::ledger::TxError::UnsupportedAction("aggregation")) => {}
+            other => panic!("expected the named refusal, got {other:?}"),
+        }
+    }
+
+    /// A registration signed over the wrong message is refused.
+    #[test]
+    fn a_bad_registration_signature_is_refused() {
+        let mut l = gated();
+        let (kp, _) = keys();
+        let payout = payout_addr();
+        let mut registration = registration(&kp, &payout);
+        registration.signature = kp.sign(b"not the registration message");
+        let tx = Transaction::shielded(
+            7,
+            bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, cfg().bond),
+            Action::RegisterAggregator { registration },
+        );
+        assert!(l.apply_tx(&tx, &proposer(&l), &StubExecutor).is_err());
+    }
+
+    /// Unbonding sets the release height and bars further submissions; the nonce is monotonic.
+    #[test]
+    fn unbonding_sets_the_release_and_the_nonce_is_monotonic() {
+        let mut l = gated();
+        let (kp, _) = keys();
+        l.apply_tx(&register_tx(&l, &kp, &payout_addr(), cfg().bond), &proposer(&l), &StubExecutor).unwrap();
+        l.apply_tx(&unbond_tx(&kp, 0), &proposer(&l), &StubExecutor).unwrap();
+        let e = &l.aggregators()[&kp.public_key().address()];
+        assert_eq!(e.nonce, 1);
+        assert_eq!(e.unbonding, Some(l.height + cfg().window));
+        // The replay: nonce 0 again is refused.
+        assert!(l.apply_tx(&unbond_tx(&kp, 0), &proposer(&l), &StubExecutor).is_err());
+        // And a second unbond with unbonding already set is refused.
+        assert!(l.apply_tx(&unbond_tx(&kp, 1), &proposer(&l), &StubExecutor).is_err());
+    }
+
+    /// The withdraw: before the release height it is refused; at it, the bond less the base is
+    /// paid as a note the ledger derives, the base goes to the proposer, and the entry is gone.
+    #[test]
+    fn the_withdraw_pays_the_bond_less_the_base_at_release() {
+        let mut l = gated();
+        let (kp, _) = keys();
+        let payout = payout_addr();
+        l.apply_tx(&register_tx(&l, &kp, &payout, cfg().bond), &proposer(&l), &StubExecutor).unwrap();
+        l.apply_tx(&unbond_tx(&kp, 0), &proposer(&l), &StubExecutor).unwrap();
+        let release = l.height + cfg().window;
+        // Before the release: refused.
+        assert!(l.apply_tx(&withdraw_tx(&kp, 1, l.height as u32, [9; 8]), &proposer(&l), &StubExecutor).is_err());
+        // At the release height: pays bond − BUNDLE_BASE as a derived note.
+        l.set_height(release);
+        let before_rewards = l.validators()[&proposer(&l)].rewards;
+        let tx = withdraw_tx(&kp, 1, release as u32, [9; 8]);
+        let expected_cm = l.derived_commitment(&tx.action, &StubExecutor).expect("the note is derivable at admission");
+        l.apply_tx(&tx, &proposer(&l), &StubExecutor).unwrap();
+        assert!(l.has_commitment(&expected_cm), "the derived note is in the tree");
+        assert_eq!(
+            l.validators()[&proposer(&l)].rewards,
+            before_rewards + gas::BUNDLE_BASE,
+            "the base goes to the proposer"
+        );
+        assert!(l.aggregators().get(&kp.public_key().address()).is_none(), "the entry is deleted");
+    }
+
+    /// Slashing: two headers by the same aggregator at the same nonce with different content
+    /// burn the bond and delete the entry — and anyone may submit the proof.
+    #[test]
+    fn a_slash_burns_the_bond_and_deletes_the_entry() {
+        let mut l = gated();
+        let (kp, other) = keys();
+        l.apply_tx(&register_tx(&l, &kp, &payout_addr(), cfg().bond), &proposer(&l), &StubExecutor).unwrap();
+        let h1 = Hash::digest(b"covers one");
+        let h2 = Hash::digest(b"covers two");
+        let slash = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::SlashAggregator {
+                a: signed_header(&kp, 1, vec![h1], Hash::digest(b"proof one")),
+                b: signed_header(&kp, 1, vec![h2], Hash::digest(b"proof two")),
+            },
+        };
+        l.apply_tx(&slash, &proposer(&l), &StubExecutor).unwrap();
+        assert!(l.aggregators().get(&kp.public_key().address()).is_none(), "the entry is slashed away");
+        let _ = other;
+    }
+
+    /// Not equivocation: identical content, or the same aggregator at different nonces.
+    #[test]
+    fn a_slash_without_equivocation_is_refused() {
+        let mut l = gated();
+        let (kp, _) = keys();
+        l.apply_tx(&register_tx(&l, &kp, &payout_addr(), cfg().bond), &proposer(&l), &StubExecutor).unwrap();
+        let h = Hash::digest(b"covers");
+        let p = Hash::digest(b"proof");
+        // Identical headers.
+        let same = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::SlashAggregator { a: signed_header(&kp, 1, vec![h], p), b: signed_header(&kp, 1, vec![h], p) },
+        };
+        assert!(l.apply_tx(&same, &proposer(&l), &StubExecutor).is_err());
+        // Different nonces.
+        let different = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::SlashAggregator {
+                a: signed_header(&kp, 1, vec![h], p),
+                b: signed_header(&kp, 2, vec![Hash::digest(b"other")], Hash::digest(b"other proof")),
+            },
+        };
+        assert!(l.apply_tx(&different, &proposer(&l), &StubExecutor).is_err());
+        assert_eq!(l.aggregators().len(), 1, "the entry survives both refusals");
     }
 }

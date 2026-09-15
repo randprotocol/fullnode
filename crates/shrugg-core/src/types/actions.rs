@@ -251,3 +251,18 @@ pub fn aggregator_withdraw_message(
     let bytes = bincode::serialize(&(chain_id, aggregator, nonce, time, r, envelope)).expect("serializes");
     crate::crypto::Hash::digest_domain(b"shrugg-aggregator-withdraw", &bytes)
 }
+
+/// What an aggregator signs over an `Aggregate` submission (spec §3.1): the chain, the register
+/// nonce, the payout note's `time` and blinding `r`, the cover set, and the proof's hash — the
+/// full content an equivocating pair of `SignedAggregateHeader`s is evidence of.
+pub fn aggregate_signing_hash(
+    chain_id: u64,
+    nonce: u64,
+    time: u32,
+    r: &Word8,
+    covers: &[crate::crypto::Hash],
+    proof_hash: &crate::crypto::Hash,
+) -> crate::crypto::Hash {
+    let bytes = bincode::serialize(&(chain_id, nonce, time, r, covers, proof_hash)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"shrugg-aggregate", &bytes)
+}

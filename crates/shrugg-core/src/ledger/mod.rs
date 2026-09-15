@@ -171,6 +171,10 @@ pub enum TxError {
     /// Phase S2: a `Bond`, `Unbond` or `Withdraw` the register refused (see [`StakingError`]).
     #[error("staking: {0}")]
     Staking(#[from] StakingError),
+    /// Block aggregation: a register action or aggregate the aggregation module refused (see
+    /// [`aggregation::AggregationError`]).
+    #[error("aggregation: {0}")]
+    Aggregation(#[from] aggregation::AggregationError),
     #[error("arithmetic overflow")]
     Overflow,
 }
@@ -428,7 +432,10 @@ impl Ledger {
 
     /// The supply audit against this ledger's own register.
     pub fn audit(&self) -> Audit {
-        Audit::new(self.supply, register_total(&self.validators))
+        Audit::new(
+            self.supply,
+            register_total(&self.validators).saturating_add(supply::aggregators_total(&self.aggregators)),
+        )
     }
 
     /// Deposit notes this ledger created while applying the current block (see [`Deposit`]).
@@ -762,9 +769,11 @@ impl Ledger {
                 }
                 Action::Bond { .. } => {}
                 // Block aggregation: `RegisterAggregator` is the one aggregation action whose
-                // bundle burns (the genesis bond). The exact figure is the register's own check
-                // (Task 2's admission arm); the action itself is refused here until it lands.
-                Action::RegisterAggregator { .. } => {}
+                // bundle burns, and it must burn exactly the genesis bond (spec §2.2) — the
+                // `Bond` arm's rule, one register over.
+                Action::RegisterAggregator { .. } => {
+                    aggregation::check_burn(self, b.burn)?;
+                }
                 _ if b.burn != 0 => return Err(TxError::UnsupportedBurn(b.burn)),
                 _ => {}
             }
@@ -824,7 +833,13 @@ impl Ledger {
             a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
                 verified.attestation = bridge_notes::validate(self, tx, a, executor)?;
             }
-            _ => {
+            a @ (Action::RegisterAggregator { .. }
+            | Action::UnbondAggregator { .. }
+            | Action::WithdrawAggregator { .. }
+            | Action::SlashAggregator { .. }) => {
+                aggregation::validate(self, tx, a, executor)?;
+            }
+            Action::Aggregate { .. } => {
                 return Err(aggregation::NOT_AGGREGATION);
             }
         }
@@ -915,7 +930,13 @@ impl Ledger {
             a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
                 bridge_notes::apply(self, tx, a, executor, verified.attestation)?;
             }
-            _ => {
+            a @ (Action::RegisterAggregator { .. }
+            | Action::UnbondAggregator { .. }
+            | Action::WithdrawAggregator { .. }
+            | Action::SlashAggregator { .. }) => {
+                aggregation::apply(self, tx, a, proposer, executor)?;
+            }
+            Action::Aggregate { .. } => {
                 return Err(aggregation::NOT_AGGREGATION);
             }
         }

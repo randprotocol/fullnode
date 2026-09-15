@@ -1394,6 +1394,7 @@ pub(crate) mod fixtures {
             fri_profile: "test".into(),
             hc_bundle: word8_to_hex(&HC),
             bridge: None,
+            aggregation: None,
             epoch_blocks,
         }
         .build(&StubExecutor)
@@ -1438,6 +1439,7 @@ pub(crate) mod fixtures {
             fri_profile: "test".into(),
             hc_bundle: word8_to_hex(&HC),
             bridge: Some(config),
+            aggregation: None,
             epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
         }
         .build(&StubExecutor)

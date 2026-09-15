@@ -163,6 +163,11 @@ impl Ledger {
             Action::Withdraw { validator, amount, time, r, .. } => {
                 withdraw_note(self, validator, *amount, *time, r, executor).ok()
             }
+            Action::WithdrawAggregator { aggregator, time, r, .. } => {
+                // The aggregator's withdraw note derives the same way, one register over: the
+                // bond less the base, at the entry's payout (spec §2.2).
+                super::aggregation::withdraw_note(self, aggregator, *time, r, executor).ok()
+            }
             Action::BridgeAttest { attestation, recipient, r, time, .. } => {
                 // The size cap, before the decode. `validate` applies it at step 1
                 // (`TxError::AttestationTooLarge`), but this runs *before* validation — the

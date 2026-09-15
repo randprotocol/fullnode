@@ -666,6 +666,27 @@ fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>, executor: &dyn Confiden
             "to_chain": to_chain, "to": hex::encode(to),
             "asset_bundle": bundle_json(asset_bundle),
         }),
+        // Block aggregation: the register is public by design (spec §2), so its inputs are too —
+        // the staking actions' rule, one register over. The aggregate itself reports the cover
+        // count and the proof size; the covered bundles are named by hash anyway.
+        Action::RegisterAggregator { registration } => json!({
+            "kind": "register_aggregator", "aggregator": registration.public_key.address().to_base58()
+        }),
+        Action::UnbondAggregator { aggregator, nonce, .. } => json!({
+            "kind": "unbond_aggregator", "aggregator": aggregator.to_base58(), "nonce": nonce
+        }),
+        Action::WithdrawAggregator { aggregator, nonce, time, .. } => json!({
+            "kind": "withdraw_aggregator", "aggregator": aggregator.to_base58(), "nonce": nonce,
+            "time": time
+        }),
+        Action::SlashAggregator { a, b } => json!({
+            "kind": "slash_aggregator", "aggregator": a.aggregator.to_base58(), "nonce": a.nonce,
+            "headers": [a.proof_hash.to_hex(), b.proof_hash.to_hex()]
+        }),
+        Action::Aggregate { covers, proof, aggregator, nonce, time, .. } => json!({
+            "kind": "aggregate", "covers": covers.len(), "proof_len": proof.len(),
+            "aggregator": aggregator.to_base58(), "nonce": nonce, "time": time
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),
