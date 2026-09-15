@@ -18,6 +18,9 @@ use shrugg_rvm::shape::{InnerKey, InnerShape};
 use shrugg_zkvm::executor::ZkExecutor;
 use shrugg_zkvm::machine::FriProfile;
 
+/// The counter behind [`AggExecutor::verification_count`] — see its doc comment.
+static AGGREGATE_VERIFICATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The executor the node runs: `ZkExecutor` inside, one rVM `Machine` beside it (its 64-entry
 /// verifier-key FIFO is what `warm_aggregation` fills and every `verify_aggregate` then reuses).
 pub struct AggExecutor {
@@ -28,6 +31,14 @@ pub struct AggExecutor {
 impl AggExecutor {
     pub fn new(profile: FriProfile) -> AggExecutor {
         AggExecutor { inner: ZkExecutor::new(profile), rvm: shrugg_rvm::machine::Machine::new(profile) }
+    }
+
+    /// Process-wide count of real rVM aggregate verifications this process has run — the
+    /// sealed-sync cluster test's instrument for "one rVM verification per sealed window" (it
+    /// reads the delta across a fresh node's sync, in the same process). Incremented only on
+    /// this real path, never by the stub executor.
+    pub fn verification_count() -> usize {
+        AGGREGATE_VERIFICATIONS.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The rVM's own shape types for a registered declared shape: the fallible
@@ -126,8 +137,11 @@ impl ConfidentialExecutor for AggExecutor {
         let pvs: Vec<Vec<u64>> = covered.iter().map(|c| c.public_values.to_vec()).collect();
         let public = shrugg_rvm::public_values::interface_words(&vk.shape, &vk.key, &pvs);
         let program = aggregate_program(&vk);
-        shrugg_rvm::aggregate::verify_aggregate(&self.rvm, &program, &AggregateProof { proof: rvm_proof, public })
-            .map_err(|e| ConfidentialError::InvalidAggregateProof(format!("{e:?}")))
+        let out =
+            shrugg_rvm::aggregate::verify_aggregate(&self.rvm, &program, &AggregateProof { proof: rvm_proof, public })
+                .map_err(|e| ConfidentialError::InvalidAggregateProof(format!("{e:?}")))?;
+        AGGREGATE_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(out)
     }
 
     /// The startup key-build (spec §2.3, `circuits/recursion/docs/02-aggregate.md` "Startup: the

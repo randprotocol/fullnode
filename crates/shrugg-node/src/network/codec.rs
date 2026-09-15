@@ -177,7 +177,7 @@ mod tests {
         };
         let block = Block::sign(header, vec![], &ks[0]);
         let hash = block.hash();
-        CommittedBlock { block, qc: qc(height, hash), receipts: Vec::new(), deposits: Vec::new() }
+        CommittedBlock { block, pruned: Vec::new(), qc: qc(height, hash), receipts: Vec::new(), deposits: Vec::new() }
     }
 
     fn chain_8_batch(n: u64) -> SyncResponse {

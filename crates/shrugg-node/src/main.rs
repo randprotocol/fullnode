@@ -5,7 +5,11 @@ use shrugg_client::wallet;
 use shrugg_client::RpcClient;
 use shrugg_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
 use shrugg_core::notes::{word8_to_hex, Envelope, ShieldedAddress};
-use shrugg_core::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
+use shrugg_core::types::actions::{
+    aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message, aggregator_withdraw_message,
+    registration_message, unbond_message, withdraw_message, AggregatorRegistration, Registration,
+};
+use shrugg_zkvm::machine::FriProfile;
 use shrugg_core::{format_amount, parse_amount};
 use shrugg_core::{Keypair, PublicKey, UNITS_PER_SHRUGG};
 use shrugg_node::keyfile::{load_keypair, KeyFile};
@@ -260,6 +264,61 @@ enum Cmd {
         #[command(flatten)]
         staking: StakingArgs,
     },
+    /// The aggregator role on a chain with an `aggregation` section (block aggregation,
+    /// spec §2.2): register, unbond, withdraw. The register's twins, one register over.
+    Aggregator {
+        #[command(subcommand)]
+        cmd: AggregatorCmd,
+    },
+    /// The aggregate daemon (spec §8): poll the unsealed work list, fetch the raw bundles,
+    /// prove one aggregate over them, and submit it — a separate process from the validator,
+    /// needing only an RPC endpoint and the registered key.
+    Aggregate {
+        /// The aggregator key file: the key the register knows, and the key that signs.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Keep polling instead of submitting once and exiting.
+        #[arg(long)]
+        watch: bool,
+        /// Seconds between polls in `--watch` mode.
+        #[arg(long, default_value_t = 15)]
+        interval_secs: u64,
+        /// Return once the node accepts the aggregate instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+/// `shrugg-node aggregator …`: the register actions.
+#[derive(Subcommand)]
+enum AggregatorCmd {
+    /// Print a signed registration for this key and payout (`--bond` is the genesis bond you
+    /// *intend* to burn through the wallet's `submit`; the chain's config rules the value).
+    Register {
+        #[arg(long)]
+        key: PathBuf,
+        /// The bond you will burn at registration, in SHRUGG — a note to yourself: the
+        /// registration's signature does not carry it, the genesis config decides it.
+        #[arg(long)]
+        bond: String,
+        /// Where this aggregator's payments are paid (`shrugg1…`).
+        #[arg(long)]
+        payout: String,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Stop this aggregator submitting; the bond releases after the chain's window.
+    Unbond {
+        #[command(flatten)]
+        staking: StakingArgs,
+    },
+    /// Pay the released bond into a note at the payout address, less the bundle base.
+    Withdraw {
+        #[command(flatten)]
+        staking: StakingArgs,
+    },
 }
 
 /// What `unbond` and `withdraw` both need.
@@ -467,9 +526,190 @@ async fn main() -> Result<()> {
             );
             submit_staking(&staking, chain_id, action, &format!("withdraw of {} SHRUGG", format_amount(amount))).await?;
         }
+        Cmd::Aggregator { cmd } => match cmd {
+            AggregatorCmd::Register { key, bond, payout, rpc } => {
+                let kp = load_keypair(&key)?;
+                let chain_id = RpcClient::new(rpc).chain_id().await?;
+                let payout = ShieldedAddress::parse(&payout)
+                    .map_err(|e| anyhow::anyhow!("{payout} is not a shielded address: {e}"))?;
+                let signature = kp.sign(aggregator_register_message(chain_id, &payout).as_bytes());
+                let registration = AggregatorRegistration { public_key: kp.public_key().clone(), payout, signature };
+                println!(
+                    "aggregator {} on chain {chain_id}\nregistration: {}\n  bond {} SHRUGG rides through the wallet's `submit` as the register bundle's burn",
+                    kp.address(),
+                    hex::encode(bincode::serialize(&registration).expect("a registration serialises")),
+                    bond
+                );
+            }
+            AggregatorCmd::Unbond { staking } => {
+                let kp = load_keypair(&staking.key)?;
+                let rpc = RpcClient::new(staking.rpc.clone());
+                let chain_id = rpc.chain_id().await?;
+                let nonce = aggregator_row(&rpc, &kp.address()).await?.0;
+                let signature = kp.sign(aggregator_unbond_message(chain_id, &kp.address(), nonce).as_bytes());
+                let action = shrugg_core::Action::UnbondAggregator { aggregator: kp.address(), nonce, signature };
+                submit_staking(&staking, chain_id, action, "aggregator unbond").await?;
+            }
+            AggregatorCmd::Withdraw { staking } => {
+                let kp = load_keypair(&staking.key)?;
+                let rpc = RpcClient::new(staking.rpc.clone());
+                let chain_id = rpc.chain_id().await?;
+                let (nonce, payout, _) = aggregator_row(&rpc, &kp.address()).await?;
+                // The note is the bond less the base, derived by the chain from the register —
+                // the amount itself is not in the action, exactly like the aggregate's payout.
+                let bond = aggregator_row(&rpc, &kp.address()).await?.2;
+                let base = shrugg_core::gas::BUNDLE_BASE;
+                anyhow::ensure!(bond > base, "the bond does not cover the bundle base");
+                let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
+                let (note, envelope) = sealed_withdraw_note(&payout, bond - base, time)?;
+                let signature = kp.sign(
+                    aggregator_withdraw_message(chain_id, &kp.address(), nonce, time, &note.r, &envelope).as_bytes(),
+                );
+                let action = shrugg_core::Action::WithdrawAggregator {
+                    aggregator: kp.address(),
+                    nonce,
+                    time,
+                    r: note.r,
+                    envelope,
+                    signature,
+                };
+                submit_staking(&staking, chain_id, action, "aggregator withdraw").await?;
+            }
+        },
+        Cmd::Aggregate { key, rpc, watch, interval_secs, no_wait } => {
+            aggregate_daemon(&key, &rpc, watch, interval_secs, no_wait).await?;
+        }
     }
     let _ = UNITS_PER_SHRUGG;
     Ok(())
+}
+
+/// The aggregator register row for `me`: nonce, payout and bond, from `shrugg_getAggregators`.
+async fn aggregator_row(rpc: &RpcClient, me: &shrugg_core::Address) -> Result<(u64, ShieldedAddress, u64)> {
+    let rows = rpc.call("shrugg_getAggregators", serde_json::json!([])).await?;
+    let want = me.to_base58();
+    let row = rows
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["address"].as_str() == Some(want.as_str())))
+        .with_context(|| format!("{want} is not in the aggregator register; register it first (`shrugg-node aggregator register`)"))?;
+    let nonce = row["nonce"].as_u64().context("the node's getAggregators reply has no nonce")?;
+    let payout = row["payout"].as_str().context("the node's getAggregators reply has no payout address")?;
+    let payout = ShieldedAddress::parse(payout).map_err(|e| anyhow::anyhow!("register payout address: {e}"))?;
+    let bond = row["bond"].as_str().and_then(|b| b.parse::<u64>().ok()).context("the node's getAggregators reply has no bond")?;
+    Ok((nonce, payout, bond))
+}
+
+/// The aggregate daemon's one pass (spec §8's shape): the unsealed work list, up to
+/// `max_covers` of it, the raw bundles fetched back, one rVM proof over them, and the signed
+/// aggregate submitted. `--watch` loops it on the interval; every pass is one proving job.
+async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, interval_secs: u64, no_wait: bool) -> Result<()> {
+    let kp = load_keypair(key)?;
+    let rpc = RpcClient::new(rpc_url.to_string());
+    let chain_id = rpc.chain_id().await?;
+    loop {
+        let status = rpc.status().await?;
+        let agg = &status["aggregation"];
+        let profile = match status["fri_profile"].as_str().unwrap_or("production") {
+            "test" => FriProfile::Test,
+            _ => FriProfile::Production,
+        };
+        let max_covers = agg["max_covers"].as_u64().unwrap_or(0) as usize;
+        let subsidy_base = agg["subsidy_base"].as_u64().unwrap_or(0);
+        let halving = agg["halving_blocks"].as_u64().unwrap_or(1).max(1);
+        let n = agg["sealed_blocks"].as_u64().unwrap_or(0);
+        let height = status["height"].as_u64().unwrap_or(0);
+        let work = rpc.call("shrugg_getUnsealed", serde_json::json!([0, max_covers.max(1)])).await?;
+        let bundles = work["bundles"].as_array().cloned().unwrap_or_default();
+        if !bundles.is_empty() && max_covers > 0 {
+            let chosen = &bundles[..bundles.len().min(max_covers)];
+            // The raw bundles, back from the node: each one's stored proof is the tape input.
+            let mut proofs = Vec::with_capacity(chosen.len());
+            let mut covers = Vec::with_capacity(chosen.len());
+            let mut shares = 0u64;
+            for b in chosen {
+                let hash = shrugg_core::Hash::from_hex(b["hash"].as_str().context("work row has no hash")?)
+                    .map_err(|e| anyhow::anyhow!("work row hash: {e}"))?;
+                let raw = rpc.call("shrugg_getRawTransaction", serde_json::json!([b["hash"].clone()])).await?;
+                let bytes = hex::decode(raw.as_str().context("getRawTransaction answer is not hex")?)?;
+                let tx: shrugg_core::Transaction = bincode::deserialize(&bytes)?;
+                let bundle = tx.bundle.as_ref().context("a work row with no bundle")?;
+                let proof: shrugg_zkvm::machine::Proof = postcard::from_bytes(&bundle.proof)
+                    .map_err(|_| anyhow::anyhow!("a work row's proof does not decode"))?;
+                covers.push(hash);
+                shares = shares.saturating_add(bundle.fee.saturating_sub(shrugg_core::gas::BUNDLE_BASE));
+                proofs.push(proof);
+            }
+            // The shape is the first proof's; every proof in the set must share it (the
+            // chain's admission checks it again).
+            let first = &proofs[0];
+            let shape = shrugg_rvm::shape::InnerShape::of(
+                profile,
+                first.tier,
+                first.program_log_height,
+                first.input_log_height,
+                first.keccak_log_height,
+                first.sha256_log_height,
+                first.public_log_height,
+                first.mem_log_height,
+            );
+            let key_inner = shrugg_rvm::shape::InnerKey::of(profile, &shape);
+            let vk = shrugg_rvm::aggregate::InnerVerifierKey { shape, key: key_inner };
+            let m = shrugg_rvm::machine::Machine::new(profile);
+            let t0 = std::time::Instant::now();
+            let a = shrugg_rvm::aggregate::aggregate(&m, &vk, &proofs, None)
+                .map_err(|e| anyhow::anyhow!("aggregating {} bundles: {e:?}", proofs.len()))?;
+            let proof_bytes = a.proof.to_bytes();
+            tracing::info!(
+                "aggregated {} bundles in {:.1?} ({} proof bytes)",
+                proofs.len(),
+                t0.elapsed(),
+                proof_bytes.len()
+            );
+            // The payment note: the subsidy at the schedule's current index plus the proving
+            // shares, sealed to the register's payout address (spec §5.4).
+            let subsidy = subsidy_base.checked_shr((n / halving) as u32).unwrap_or(0);
+            let (_, payout, _) = aggregator_row(&rpc, &kp.address()).await?;
+            let time = height as u32 + 1;
+            let (note, envelope) = sealed_withdraw_note(&payout, subsidy + shares, time)?;
+            let nonce = aggregator_row(&rpc, &kp.address()).await?.0;
+            let signature = kp.sign(
+                aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &shrugg_core::Hash::digest(&proof_bytes))
+                    .as_bytes(),
+            );
+            let tx = shrugg_core::Transaction {
+                chain_id,
+                bundle: None,
+                action: shrugg_core::Action::Aggregate {
+                    covers,
+                    proof: proof_bytes,
+                    aggregator: kp.address(),
+                    nonce,
+                    time,
+                    r: note.r,
+                    envelope,
+                    signature,
+                },
+            };
+            let hash = rpc.send_transaction(&tx).await?;
+            if no_wait {
+                println!("submitted aggregate {hash} ({} covered)", proofs.len());
+            } else {
+                let receipt = rpc.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
+                println!("submitted aggregate {hash} ({} covered)
+  committed in block {}", proofs.len(), receipt.height);
+            }
+            if !watch {
+                return Ok(());
+            }
+        }
+        if !watch {
+            if bundles.is_empty() {
+                println!("nothing to cover right now");
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+    }
 }
 
 #[cfg(test)]

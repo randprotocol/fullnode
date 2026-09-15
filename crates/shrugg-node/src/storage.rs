@@ -24,9 +24,14 @@ const CF_BLOCKS: &str = "blocks";
 const CF_QCS: &str = "qcs";
 const CF_BLOCK_INDEX: &str = "block_index";
 const CF_TXS: &str = "txs";
-/// Sealing marks (block aggregation, spec §6.1), two key shapes: `b't' + bundle_hash` ->
-/// `bincode((aggregate_tx_hash, sealed_at_height))` per covered bundle, and `b'b' + block_hash`
-/// -> `bincode(bool)` once every bundle in the block has one. Derived state, never consensus.
+/// Sealing marks (block aggregation, spec §6.1), three key shapes: `b't' + bundle_hash` ->
+/// `bincode((aggregate_tx_hash, sealed_at_height))` per covered bundle; `b'b' + block_hash` ->
+/// `bincode(bool)` once every bundle in the block has one; `b'p' + proof_hash` ->
+/// `bincode(tx_hash)`, the proof-hash index the sealed form is served by (a marker-form
+/// transaction's hash is not its raw hash, so the record cannot be found without it); and
+/// `b'a' + aggregate_hash` -> `bincode((subsidy, proving_shares, n))`, the payment facts of a
+/// committed aggregate (spec §5.4), written with its block so `shrugg_getAggregate` can report
+/// them without a historical ledger. All derived state, never consensus.
 const CF_SEALS: &str = "seals";
 const CF_META: &str = "meta";
 const CF_PROGRAMS: &str = "programs";
@@ -91,6 +96,9 @@ pub enum TxRecord {
     Pruned {
         height: u64,
         index: u32,
+        /// The *raw* transaction's hash: unrecomputable from the pruned bytes, and what the
+        /// sealed form's side table and every `covers` list names.
+        tx_hash: Hash,
         tx: Transaction,
         proof_hash: Hash,
         /// The proof's 34 public values, in `pv` order — a `Vec` because serde's built-in array
@@ -146,6 +154,11 @@ const META_UNSEALED_FEES: &str = "unsealed_fees";
 /// `META_SUPPLY`'s twin in kind — derived, replay-audited — but unlike the bucket this one is
 /// hashed into the state root, so a restarted node that lost it would fork at the next block.
 const META_AGGREGATORS: &str = "aggregators";
+/// `bincode(Option<AggregationConfig>)`: the genesis section itself. The register and the
+/// bucket are persisted derived state, but the config is genesis truth — `load_ledger` restores
+/// it from here so every reader of the store (RPC included, which has no genesis file to hand)
+/// sees the same gate the node sees.
+const META_AGGREGATION: &str = "aggregation";
 /// `bincode(BridgeMeta)`: the whole-state half of the bridge — emitter, source emitters,
 /// guardian sets, the asset registry with its indices and `next_index`, and the burn sequence.
 /// Its presence is what makes a chain "bridged" on disk; the two collections it leaves out live
@@ -360,6 +373,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&gs.ledger.supply())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
+        batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
         batch.put_cf(self.cf(CF_ANCHORS), height_key(0), word8_to_bytes(&gs.ledger.root()));
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(gs.ledger.tree())?);
         batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
@@ -732,7 +746,7 @@ impl Storage {
         }
         // `deposits` stays empty: this is how a block is served to a peer, and the peer
         // recomputes them by applying the block itself.
-        Ok(Some(CommittedBlock { block, qc, receipts, deposits: Vec::new() }))
+        Ok(Some(CommittedBlock { block, pruned: Vec::new(), qc, receipts, deposits: Vec::new() }))
     }
 
     pub fn height_by_hash(&self, h: &Hash) -> Result<Option<u64>> {
@@ -751,6 +765,11 @@ impl Storage {
 
     pub fn tx_location(&self, h: &Hash) -> Result<Option<(u64, u32)>> {
         Ok(self.tx_record(h)?.map(|r| r.location()))
+    }
+
+    /// The transaction itself, either record form (a pruned one's proof is the marker form).
+    pub fn tx_by_hash(&self, h: &Hash) -> Result<Option<Transaction>> {
+        Ok(self.tx_record(h)?.map(|r| r.transaction().clone()))
     }
 
     /// The stored record for a transaction — `Raw` until it is sealed and pruned, `Pruned`
@@ -861,6 +880,32 @@ impl Storage {
         }
     }
 
+    /// The raw transaction hash a pruned proof hash maps to, if any — the sealed form's
+    /// serving index: a marker-form transaction's own hash is its marker bytes', so the record
+    /// is found by the proof hash instead.
+    pub fn tx_hash_by_proof_hash(&self, proof_hash: &Hash) -> Result<Option<Hash>> {
+        let mut key = Vec::with_capacity(33);
+        key.push(b'p');
+        key.extend_from_slice(proof_hash.as_bytes());
+        match self.db.get_cf(self.cf(CF_SEALS), &key)? {
+            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The payment facts of a committed aggregate (spec §5.4), written with its block:
+    /// `(subsidy, proving_shares, n)` — the minted part, the covered excesses' sum, and the
+    /// schedule index it minted at.
+    pub fn aggregate_payment(&self, aggregate: &Hash) -> Result<Option<(u64, u64, u64)>> {
+        let mut key = Vec::with_capacity(33);
+        key.push(b'a');
+        key.extend_from_slice(aggregate.as_bytes());
+        match self.db.get_cf(self.cf(CF_SEALS), &key)? {
+            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Whether every bundle in a block is sealed (spec §6.1's per-block flag).
     pub fn block_sealed(&self, block_hash: &Hash) -> Result<bool> {
         let mut key = Vec::with_capacity(33);
@@ -916,9 +961,22 @@ impl Storage {
             let mut marker = PRUNED_PROOF_MARKER.to_vec();
             marker.extend_from_slice(proof_hash.as_bytes());
             pruned_tx.bundle.as_mut().expect("checked above").proof = marker;
-            let record = TxRecord::Pruned { height, index, tx: pruned_tx, proof_hash, public_values: public_values.to_vec(), shape };
+            let record = TxRecord::Pruned {
+                height,
+                index,
+                tx_hash: bundle_hash,
+                tx: pruned_tx,
+                proof_hash,
+                public_values: public_values.to_vec(),
+                shape,
+            };
             let mut batch = rocksdb::WriteBatch::default();
             batch.put_cf(self.cf(CF_TXS), bundle_hash.as_bytes(), bincode::serialize(&record)?);
+            batch.put_cf(
+                self.cf(CF_SEALS),
+                [b"p".as_slice(), proof_hash.as_bytes()].concat(),
+                bincode::serialize(&bundle_hash)?,
+            );
             self.db.write_opt(batch, &sync_opts())?;
             pruned += 1;
         }
@@ -998,6 +1056,10 @@ impl Storage {
         ledger.set_supply(self.supply()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
+        if let Some(cfg) = self.get_meta_raw(META_AGGREGATION)? {
+            let cfg: Option<shrugg_core::ledger::aggregation::AggregationConfig> = bincode::deserialize(&cfg)?;
+            ledger.set_aggregation(cfg);
+        }
         ledger.set_bridge(self.load_bridge()?);
         Ok(ledger)
     }
@@ -1080,11 +1142,46 @@ impl Storage {
             // each one knows the index it was given — which is what this loop checks as it goes.
             let mut deposits = cb.deposits.iter().peekable();
             for (index, tx) in block.transactions.iter().enumerate() {
-                let record = TxRecord::Raw { height: block.height(), index: index as u32, tx: tx.clone() };
-                batch.put_cf(self.cf(CF_TXS), tx.hash().as_bytes(), bincode::serialize(&record)?);
+                // A block that arrived in sealed form (spec §7) carries its pruned bundles in
+                // marker form with a side table keyed by proof hash: those txs become their
+                // Pruned records — the form the pruning pass would have produced, keyed by the
+                // *raw* tx hash the table attests — and everything else a Raw record, keyed by
+                // its own hash. The block itself is stored as served (marker forms included).
+                let pruned = tx
+                    .bundle
+                    .as_ref()
+                    .and_then(|b| shrugg_core::notes::pruned_proof_hash(&b.proof))
+                    .and_then(|ph| cb.pruned.iter().find(|p| p.proof_hash == ph));
+                let (key, record) = match pruned {
+                    Some(p) => (
+                        p.tx_hash,
+                        TxRecord::Pruned {
+                            height: block.height(),
+                            index: index as u32,
+                            tx_hash: p.tx_hash,
+                            tx: tx.clone(),
+                            proof_hash: p.proof_hash,
+                            public_values: p.public_values.clone(),
+                            shape: p.shape,
+                        },
+                    ),
+                    None => (tx.hash(), TxRecord::Raw { height: block.height(), index: index as u32, tx: tx.clone() }),
+                };
+                batch.put_cf(self.cf(CF_TXS), key.as_bytes(), bincode::serialize(&record)?);
+                if let Some(p) = pruned {
+                    batch.put_cf(
+                        self.cf(CF_SEALS),
+                        [b"p".as_slice(), p.proof_hash.as_bytes()].concat(),
+                        bincode::serialize(&p.tx_hash)?,
+                    );
+                }
             }
             // The sealing marks land in the same batch (spec §6.1): atomically with the block
-            // that carries the aggregate — their per-block flags refresh after it lands.
+            // that carries the aggregate — their per-block flags refresh after it lands. The
+            // aggregate's payment facts land too (spec §5.4): the schedule index is the
+            // post-block counter less the one this aggregate minted (at most one per block,
+            // spec §3.4), and the proving share is the covered bundles' excess over the floor,
+            // read off their own public fee fields.
             for tx in &block.transactions {
                 if let shrugg_core::types::Action::Aggregate { covers, .. } = &tx.action {
                     for cover in covers {
@@ -1092,6 +1189,23 @@ impl Storage {
                             self.cf(CF_SEALS),
                             [b"t".as_slice(), cover.as_bytes()].concat(),
                             bincode::serialize(&(tx.hash(), block.height()))?,
+                        );
+                    }
+                    if let Some(cfg) = ledger_after.aggregation() {
+                        let n = ledger_after.supply().sealed_blocks.saturating_sub(1);
+                        let subsidy = shrugg_core::gas::subsidy(n, cfg);
+                        let mut shares = 0u64;
+                        for cover in covers {
+                            if let Some(covered_tx) = self.tx_by_hash(cover)? {
+                                if let Some(b) = &covered_tx.bundle {
+                                    shares = shares.saturating_add(b.fee.saturating_sub(shrugg_core::gas::BUNDLE_BASE));
+                                }
+                            }
+                        }
+                        batch.put_cf(
+                            self.cf(CF_SEALS),
+                            [b"a".as_slice(), tx.hash().as_bytes()].concat(),
+                            bincode::serialize(&(subsidy, shares, n))?,
                         );
                     }
                 }
@@ -1988,7 +2102,7 @@ pub(crate) mod fixtures {
         };
         let block = Block::sign(header, txs, k);
         let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![] };
-        CommittedBlock { block, qc, receipts: Vec::new(), deposits: ledger.deposits().to_vec() }
+        CommittedBlock { block, pruned: Vec::new(), qc, receipts: Vec::new(), deposits: ledger.deposits().to_vec() }
     }
 }
 
@@ -3200,10 +3314,11 @@ mod seal_tests {
 
         assert_eq!(storage.prune_sealed(6, 4, FriProfile::Test).unwrap(), 1, "the window passed: one record rewrites");
         let record = storage.tx_record(&covered_tx.hash()).unwrap().unwrap();
-        let TxRecord::Pruned { height, index, tx, proof_hash, public_values, shape } = record else {
+        let TxRecord::Pruned { height, index, tx_hash, tx, proof_hash, public_values, shape } = record else {
             panic!("expected the pruned form, got {record:?}")
         };
         assert_eq!((height, index), (1, 0));
+        assert_eq!(tx_hash, covered_tx.hash(), "the raw hash rides the record");
         let fixture = crate::agg_executor::fixture_proof(0);
         let expect: Vec<u64> = fixture.public_values.clone();
         assert_eq!(public_values, expect, "the 34 public values ride the record");
@@ -3299,6 +3414,7 @@ mod seal_tests {
         let record = TxRecord::Pruned {
             height: 1,
             index: 0,
+            tx_hash: covered_tx.hash(),
             tx: pruned_tx,
             proof_hash,
             public_values: pv.to_vec(),

@@ -134,6 +134,44 @@ payout wallet finds by scanning.
 `docs/staking.md` is the whole picture these three sit in: the register, the epochs, what each action
 publishes, and a worked join-and-leave.
 
+### `shrugg-node aggregator register` / `unbond` / `withdraw` (chain 9)
+
+The validator trio's twins, one register over — the three actions an aggregator operator runs on
+a chain whose genesis carries an `aggregation` section (block aggregation, spec §2.2):
+
+| command | arguments | meaning |
+|---|---|---|
+| `aggregator register` | `--key`, `--bond <SHRUGG>`, `--payout <shrugg1…>`, `--rpc` | print an `AggregatorRegistration` (hex) signed by this node's key; the bond itself burns through the wallet's `submit` as the register bundle's burn |
+| `aggregator unbond` | `--key`, `--rpc`, `--no-wait` | stop this aggregator submitting; the bond releases after the chain's aggregation window |
+| `aggregator withdraw` | same | pay the released bond into a note at the register's payout address, less the bundle base |
+
+`unbond` and `withdraw` are bundle-less and free of proving, exactly the validator twins;
+`withdraw`'s note is the bond less the base, sealed to the payout address the register holds.
+
+### `shrugg-node aggregate` (chain 9)
+
+The aggregate daemon (spec §8): a separate process from the validator, needing only an RPC
+endpoint and the registered aggregator key.
+
+| argument | default | meaning |
+|---|---|---|
+| `--key <KEY>` | required | the aggregator key the register knows; signs every aggregate |
+| `--rpc <URL>` | `http://127.0.0.1:8545` | the node's RPC |
+| `--watch` | off | keep polling instead of submitting once and exiting |
+| `--interval-secs <N>` | 15 | poll interval in `--watch` mode |
+| `--no-wait` | off | return once the node accepts the aggregate |
+
+One pass polls `shrugg_getUnsealed`, fetches up to `max_covers` raw bundles with
+`shrugg_getRawTransaction`, proves one rVM aggregate over them (CPU; the test profile lands at
+tier 19, production at 21 — minutes and tens of GB on this tree, so run it on the proof batch
+machine), seals the payment note (subsidy at the current schedule index plus the covered
+bundles' proving shares) to the register's payout address, signs and submits. `shrugg_status`'s
+`aggregation` section carries the chain parameters the payment is computed from.
+
+`shrugg-node run` gains **`--keep-raw-proofs`**: an archive node keeps sealed bundles' raw
+proofs; by default the pruning pass rewrites their records (34 public values + the 7 declared
+shape bytes) once the sealing window passes.
+
 ### `shrugg-node init`
 
 | argument | default | meaning |

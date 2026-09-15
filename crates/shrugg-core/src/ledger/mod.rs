@@ -275,6 +275,11 @@ pub struct Ledger {
     timestamp_ms: u64,
     /// Deposit notes this block's transactions made the ledger create (see [`Deposit`]).
     deposits: Vec<Deposit>,
+    /// The sealed form's side table for the block being applied (spec §7), keyed by proof
+    /// hash: the raw transaction hash and the 34 public values per pruned bundle. Scratch,
+    /// like `deposits` — set by `apply_transactions_for_sync`, cleared with the deposits,
+    /// never hashed into anything, and empty on every path but sealed-form sync.
+    pruned_side: BTreeMap<Hash, (Hash, Vec<u64>)>,
     /// The public supply counters (see [`supply`]). Derived from the chain, not hashed into
     /// the state root.
     supply: Supply,
@@ -343,6 +348,7 @@ impl Ledger {
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
+            pruned_side: BTreeMap::new(),
             supply: Supply::default(),
             unsealed_fees: BTreeMap::new(),
         }
@@ -380,6 +386,7 @@ impl Ledger {
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
+            pruned_side: BTreeMap::new(),
             supply: Supply::default(),
             unsealed_fees: BTreeMap::new(),
         }
@@ -717,6 +724,22 @@ impl Ledger {
     /// is the expensive half of admission and runs only after every cheap check of *every*
     /// bundle in the transaction.
     fn check_bundle_proof(&self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Result<(), TxError> {
+        // A pruned bundle (spec §6.2's marker form) carries no proof to check: the covering
+        // aggregate — verified when its own block applied — is what this bundle's validity
+        // rests on. Two checks stand in for it (spec §7's acceptance, the ledger's half): the
+        // proof hash must be one the sync side vouched for, and the bundle's own public fields
+        // must hash to the digest the covering aggregate's verified public values commit to —
+        // the binding that keeps a peer from substituting the bundle's content.
+        if let Some(proof_hash) = crate::notes::pruned_proof_hash(&b.proof) {
+            let Some((_, pv)) = self.pruned_side.get(&proof_hash) else {
+                return Err(TxError::InvalidBundleProof(crate::confidential::ConfidentialError::MalformedProof));
+            };
+            let want = executor.bundle_digest(&b.digest_input());
+            let got: Word8 = std::array::from_fn(|k| {
+                u32::try_from(pv[crate::types::pv::OUT0 + k]).expect("a pruned record's OUT words are u32-range")
+            });
+            return if want == got { Ok(()) } else { Err(TxError::BadDigest) };
+        }
         let published = executor.bundle_proof_digest(&b.proof).map_err(TxError::InvalidBundleProof)?;
         if published != executor.bundle_digest(&b.digest_input()) {
             return Err(TxError::BadDigest);
@@ -1034,9 +1057,26 @@ impl Ledger {
         covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
+        self.apply_transactions_for_sync(txs, proposer, covered, &[], executor)
+    }
+
+    /// `apply_transactions_with_covered` with the sealed form's side table (spec §7): the
+    /// pruned bundles the block carries in marker form, keyed by proof hash for
+    /// `check_bundle_proof`'s membership and binding checks. Empty on every path but
+    /// sealed-form sync.
+    pub fn apply_transactions_for_sync(
+        &mut self,
+        txs: &[Transaction],
+        proposer: &Address,
+        covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
+        pruned: &[crate::consensus::PrunedBundle],
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
         let mut scratch = self.clone();
         // The deposits reported after a block are exactly that block's (see `Deposit`).
         scratch.deposits.clear();
+        scratch.pruned_side =
+            pruned.iter().map(|p| (p.proof_hash, (p.tx_hash, p.public_values.clone()))).collect();
         let mut receipts = Vec::new();
         for (index, tx) in txs.iter().enumerate() {
             if matches!(tx.action, Action::Aggregate { .. }) {
@@ -1072,6 +1112,20 @@ impl Ledger {
         covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Vec<CallReceipt>, BlockError> {
+        self.apply_block_for_sync(block, covered, &[], executor)
+    }
+
+    /// `apply_block_with_covered` with the sealed form's side table (spec §7): the tx root
+    /// checks against the raw hashes the table attests (a marker-form transaction's own hash is
+    /// its marker bytes', never the raw one), and `check_bundle_proof` runs its membership and
+    /// digest-binding checks against the same table.
+    pub fn apply_block_for_sync(
+        &mut self,
+        block: &Block,
+        covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
+        pruned: &[crate::consensus::PrunedBundle],
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<Vec<CallReceipt>, BlockError> {
         // Size limits are a consensus rule, not only proposer policy: without them a Byzantine
         // leader can stuff a block up to the gossip transport cap and force every replica to
         // execute it.
@@ -1088,8 +1142,34 @@ impl Ledger {
         if !block.verify_signature() {
             return Err(BlockError::BadProposerSignature);
         }
-        if !block.verify_tx_root() {
-            return Err(BlockError::TxRootMismatch);
+        if pruned.is_empty() {
+            if !block.verify_tx_root() {
+                return Err(BlockError::TxRootMismatch);
+            }
+        } else {
+            // The sealed form's tx-root check (spec §7): the raw hashes the side table attests
+            // stand in for the marker-form transactions' own.
+            let leaves: Result<Vec<Hash>, BlockError> = block
+                .transactions
+                .iter()
+                .enumerate()
+                .map(|(index, tx)| {
+                    match tx.bundle.as_ref().and_then(|b| crate::notes::pruned_proof_hash(&b.proof)) {
+                        None => Ok(tx.hash()),
+                        Some(ph) => pruned
+                            .iter()
+                            .find(|p| p.proof_hash == ph)
+                            .map(|p| p.tx_hash)
+                            .ok_or(BlockError::InvalidTx {
+                                index,
+                                error: TxError::InvalidBundleProof(crate::confidential::ConfidentialError::MalformedProof),
+                            }),
+                    }
+                })
+                .collect();
+            if merkle_root(&leaves?) != block.header.tx_root {
+                return Err(BlockError::TxRootMismatch);
+            }
         }
         let proposer = block.proposer();
         if !self.validators.contains_key(&proposer) {
@@ -1107,7 +1187,7 @@ impl Ledger {
         let mut scratch = self.clone();
         scratch.set_height(block.height());
         scratch.set_timestamp_ms(block.header.timestamp_ms);
-        let data = scratch.apply_transactions_with_covered(&block.transactions, &proposer, covered, executor)?;
+        let data = scratch.apply_transactions_for_sync(&block.transactions, &proposer, covered, pruned, executor)?;
         // The proving-share sweep (spec §5.2): every bucketed excess whose window passed at
         // this head is credited to its recorded proposer. Part of the applied state — the
         // rewards it credits are in the state root — so it runs inside the scratch, before the

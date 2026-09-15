@@ -107,6 +107,35 @@ pub struct NodeStatus {
     pub hc_bundle: String,
     pub address: Option<String>,
     pub peer_id: String,
+    /// The aggregation section (spec §8): the register's size, the coverable bundles the
+    /// daemon's work list would return right now, and the verification queue's depth. Absent
+    /// (zeroed) on a chain without the section.
+    #[serde(default)]
+    pub aggregation: AggregationStatus,
+}
+
+/// `shrugg_status`'s `aggregation` object (spec §8).
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct AggregationStatus {
+    /// Aggregators in the register right now.
+    pub registered: usize,
+    /// Bundles an aggregator may still cover: committed, in-window, unsealed.
+    pub unsealed: usize,
+    /// Transactions waiting for a verification slot — the top-level `verify_queue`, repeated
+    /// here because an aggregator watches it as its own backpressure signal.
+    pub verify_queue: usize,
+    // The chain parameters an aggregate daemon needs to compute the payment it seals (spec
+    // §5.4) — zeroed on a chain without the section.
+    /// The most bundles one aggregate may cover (genesis `max_covers`).
+    pub max_covers: u32,
+    /// The cover and pruning window, in blocks (genesis `window`).
+    pub window: u64,
+    /// `subsidy(0)` in units (genesis `subsidy_base`).
+    pub subsidy_base: u64,
+    /// The halving interval of the subsidy schedule, in sealed blocks.
+    pub halving_blocks: u64,
+    /// Sealed blocks so far — the schedule index `n` the next aggregate mints at.
+    pub sealed_blocks: u64,
 }
 
 pub enum NodeCommand {
@@ -551,7 +580,26 @@ fn compact_block_json(b: &shrugg_core::Block, notes: &[(u64, crate::storage::Not
     })
 }
 
-fn block_json(b: &shrugg_core::Block, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor) -> Value {
+fn block_json(b: &shrugg_core::Block, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor, storage: &crate::storage::Storage) -> Value {
+    let sealed = storage.block_sealed(&b.hash()).unwrap_or(false);
+    let txs: Vec<Value> = b
+        .transactions
+        .iter()
+        .map(|t| {
+            let mut j = tx_json(t, bridge, executor);
+            // Per-bundle `sealed_by` (spec §8): the aggregate that covered it, `null` while it
+            // is coverable — and for a bundle-less transaction, `null` by construction.
+            let sealed_by = match &t.bundle {
+                Some(_) => match storage.sealed_by(&t.hash()) {
+                    Ok(Some((agg, _))) => Value::String(agg.to_hex()),
+                    _ => Value::Null,
+                },
+                None => Value::Null,
+            };
+            j["sealed_by"] = sealed_by;
+            j
+        })
+        .collect();
     json!({
         "hash": b.hash().to_hex(),
         "height": b.height(),
@@ -562,9 +610,48 @@ fn block_json(b: &shrugg_core::Block, bridge: Option<&BridgeMeta>, executor: &dy
         "tx_root": b.header.tx_root.to_hex(),
         "state_root": b.header.state_root.to_hex(),
         "justify_view": b.header.justify.view,
+        "sealed": sealed,
         "tx_count": b.transactions.len(),
-        "transactions": b.transactions.iter().map(|t| tx_json(t, bridge, executor)).collect::<Vec<_>>(),
+        "transactions": txs,
     })
+}
+
+/// The bundles an aggregator may still cover (spec §3.2, R8's view): committed
+/// bundle-carrying transactions inside the window with no seal, paginated by block height as
+/// `(rows, next_from)` — each row the hash, its block height and its excess over the floor
+/// (what an aggregate would earn for covering it).
+pub(crate) fn unsealed_bundles(
+    storage: &crate::storage::Storage,
+    head: u64,
+    window: u64,
+    from: u64,
+    limit: usize,
+) -> (Vec<Value>, Option<u64>) {
+    let mut out = Vec::new();
+    let mut next_from = None;
+    'blocks: for h in from..=head {
+        // The window (spec §3.3): coverable means newer than `head - window`.
+        if h + window <= head {
+            continue;
+        }
+        let Ok(Some(block)) = storage.block_by_height(h) else { continue };
+        for tx in &block.transactions {
+            let Some(b) = &tx.bundle else { continue };
+            if matches!(storage.sealed_by(&tx.hash()), Ok(Some(_))) {
+                continue;
+            }
+            out.push(json!({
+                "hash": tx.hash().to_hex(),
+                "height": h,
+                "excess": b.fee.saturating_sub(shrugg_core::gas::BUNDLE_BASE).to_string(),
+            }));
+            if out.len() >= limit {
+                next_from = Some(h + 1);
+                break 'blocks;
+            }
+        }
+    }
+    (out, next_from)
 }
 
 /// What a block explorer can say about a transaction — which is, deliberately, almost nothing:
@@ -1109,13 +1196,68 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let h: u64 = param(p, 0, "height")?;
             let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
             let block = st.storage.block_by_height(h).map_err(RpcError::internal)?;
-            Ok(block.map(|b| block_json(&b, bridge.as_ref(), st.executor.as_ref())).unwrap_or(Value::Null))
+            Ok(block.map(|b| block_json(&b, bridge.as_ref(), st.executor.as_ref(), &st.storage)).unwrap_or(Value::Null))
         }
         "shrugg_getBlockByHash" => {
             let h = parse_hash(p, 0)?;
             let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
             let block = st.storage.block_by_hash(&h).map_err(RpcError::internal)?;
-            Ok(block.map(|b| block_json(&b, bridge.as_ref(), st.executor.as_ref())).unwrap_or(Value::Null))
+            Ok(block.map(|b| block_json(&b, bridge.as_ref(), st.executor.as_ref(), &st.storage)).unwrap_or(Value::Null))
+        }
+        // ---- block aggregation (spec §8) ----
+        // The register is public by design (spec §2), so its rows and the sealing facts are too.
+        "shrugg_getAggregate" => {
+            let h = parse_hash(p, 0)?;
+            let Some(tx) = st.storage.tx_by_hash(&h).map_err(RpcError::internal)? else {
+                return Ok(Value::Null);
+            };
+            let shrugg_core::types::Action::Aggregate { covers, aggregator, .. } = &tx.action else {
+                return Ok(Value::Null);
+            };
+            let (height, _) = st.storage.tx_location(&h).map_err(RpcError::internal)?.unwrap_or((0, 0));
+            let (subsidy, shares, n) = st.storage.aggregate_payment(&h).map_err(RpcError::internal)?.unwrap_or((0, 0, 0));
+            Ok(json!({
+                "hash": h.to_hex(),
+                "height": height,
+                "covers": covers.iter().map(|c| c.to_hex()).collect::<Vec<_>>(),
+                "aggregator": aggregator.to_base58(),
+                "subsidy": subsidy.to_string(),
+                "proving_share": shares.to_string(),
+                "n": n,
+            }))
+        }
+        "shrugg_getAggregators" => {
+            let rows = st.storage.aggregators().map_err(RpcError::internal)?;
+            Ok(json!(rows
+                .iter()
+                .map(|(addr, e)| json!({
+                    "address": addr.to_base58(),
+                    "bond": e.bond.to_string(),
+                    "payout": e.payout.to_string(),
+                    "nonce": e.nonce,
+                    "unbonding": e.unbonding,
+                }))
+                .collect::<Vec<_>>()))
+        }
+        "shrugg_getUnsealed" => {
+            let from: u64 = param(p, 0, "from")?;
+            let limit = parse_limit(p, 1)?;
+            let head = st.storage.head().map_err(RpcError::internal)?.height;
+            let ledger = st.storage.load_ledger(st.executor.as_ref()).map_err(RpcError::internal)?;
+            let Some(cfg) = ledger.aggregation() else {
+                return Ok(json!({ "bundles": [], "next_from": Value::Null }));
+            };
+            let (bundles, next_from) = unsealed_bundles(&st.storage, head, cfg.window, from, limit);
+            Ok(json!({ "bundles": bundles, "next_from": next_from }))
+        }
+        // The raw bytes a prover needs (the aggregate daemon's fetch): the full transaction,
+        // bincode then hex — what `tx_json` deliberately does not render.
+        "shrugg_getRawTransaction" => {
+            let h = parse_hash(p, 0)?;
+            let Some(tx) = st.storage.tx_by_hash(&h).map_err(RpcError::internal)? else {
+                return Ok(Value::Null);
+            };
+            Ok(json!(hex::encode(tx.encode())))
         }
         "shrugg_getHead" => {
             let head = head_summary(&st.storage, &st.status).map_err(RpcError::internal)?;
@@ -1266,7 +1408,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::fixtures::{self, alloc_note, bundle_fee, bundle_tx, genesis_with, key, make_block};
+    use crate::storage::fixtures::{self, alloc_note, bundle_fee, bundle_tx, genesis_with, key, make_block, make_block_unchecked};
+    use std::collections::BTreeMap;
     use shrugg_core::confidential::StubExecutor;
     use shrugg_core::genesis::GenesisState;
     use shrugg_core::notes::DEPTH;
@@ -1331,6 +1474,106 @@ mod tests {
 
     /// Genesis with two deposit notes, plus one committed block spending two notes and creating
     /// two more: four leaves, two nullifiers, an anchor at height 1.
+    /// A gated chain with a committed aggregate (block aggregation, spec §8's fixture): block 1
+    /// carries the covered bundle (a real fixture proof, excess 60 over the floor) and the
+    /// aggregator's registration; block 2 carries the aggregate covering it. Built exactly as
+    /// the seal tests' chain — the applied sets use the stub twins where the stored bytes are a
+    /// real proof.
+    fn gated_chain() -> (tempfile::TempDir, RpcState, GenesisState, Transaction, Transaction) {
+        use shrugg_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use shrugg_core::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
+        use shrugg_core::types::{CoveredBundle, DeclaredShape, FriProfile};
+
+        let proof = crate::agg_executor::fixture_proof(0);
+        let shape = DeclaredShape {
+            profile: FriProfile::Test,
+            tier: proof.tier.0 as u8,
+            program_log_height: proof.program_log_height,
+            input_log_height: proof.input_log_height,
+            keccak_log_height: proof.keccak_log_height,
+            sha256_log_height: proof.sha256_log_height,
+            public_log_height: proof.public_log_height,
+            mem_log_height: proof.mem_log_height,
+        };
+        let hc_words: [u32; 8] = std::array::from_fn(|k| {
+            u32::try_from(proof.public_values[shrugg_core::types::pv::HC0 + k]).unwrap()
+        });
+        let hc = Hash(shrugg_core::notes::word8_to_bytes(&hc_words));
+        let bond = 100 * shrugg_core::UNITS_PER_SHRUGG;
+        let mut gs = genesis_with(7, vec![alloc_note(20, 200 * shrugg_core::UNITS_PER_SHRUGG)]);
+        gs.ledger.set_aggregation(Some(AggregationConfig {
+            bond,
+            max_covers: 3,
+            subsidy_base: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![AdmittedShape { shape, hc, aggregate_program_digest: [1; 4] }],
+        }));
+        let (dir, st) = state_for(&gs);
+
+        let fee = bundle_fee() + 60;
+        let mut covered_tx = bundle_tx(&gs.ledger, [nf(1), nf(2)], [cm(1), cm(2)], fee);
+        covered_tx.bundle.as_mut().unwrap().proof = proof.to_bytes();
+        let stub_twin = bundle_tx(&gs.ledger, [nf(1), nf(2)], [cm(1), cm(2)], fee);
+        let kp = key(7);
+        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; shrugg_core::notes::KEM_EK_BYTES] };
+        let registration = AggregatorRegistration {
+            public_key: kp.public_key().clone(),
+            payout: payout.clone(),
+            signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
+        };
+        let mut b = shrugg_core::notes::Bundle {
+            anchor: gs.ledger.root(),
+            nullifiers: [nf(3), nf(4)],
+            commitments: [cm(3), cm(4)],
+            fee: bundle_fee(),
+            burn: bond,
+            asset: 0,
+            time: 1,
+            envelopes: [fixtures::env(1), fixtures::env(2)],
+            proof: vec![],
+        };
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d);
+        let register = Transaction::shielded(7, b, Action::RegisterAggregator { registration });
+        let mut l1 = gs.ledger.clone();
+        l1.set_height(1);
+        l1.set_timestamp_ms(1);
+        l1.apply_transactions(&[stub_twin, register.clone()], &key(1).address(), &StubExecutor).unwrap();
+        l1.record_anchor(1);
+        let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), register], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
+
+        let r = [9u32; 8];
+        let covers = vec![covered_tx.hash()];
+        let proof_bytes = b"ok".to_vec();
+        let signature = kp.sign(aggregate_signing_hash(7, 0, 2, &r, &covers, &Hash::digest(&proof_bytes)).as_bytes());
+        let aggregate = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::Aggregate {
+                covers,
+                proof: proof_bytes,
+                aggregator: kp.public_key().address(),
+                nonce: 0,
+                time: 2,
+                r,
+                envelope: fixtures::env(9),
+                signature,
+            },
+        };
+        let record = st.storage.covered_record(&covered_tx.hash(), FriProfile::Test).unwrap().unwrap();
+        let sidecar: BTreeMap<usize, Vec<CoveredBundle>> = [(0usize, vec![record])].into_iter().collect();
+        let mut l2 = l1.clone();
+        l2.set_height(2);
+        l2.set_timestamp_ms(2);
+        l2.apply_transactions_with_covered(&[aggregate.clone()], &key(1).address(), &sidecar, &StubExecutor).unwrap();
+        l2.record_anchor(2);
+        let b2 = make_block_unchecked(&b1.block, &l2, vec![aggregate.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
+        (dir, st, gs, covered_tx, aggregate)
+    }
+
     fn chain() -> (tempfile::TempDir, RpcState, GenesisState) {
         let gs = genesis_with(1, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)]);
         let (dir, st) = state_for(&gs);
@@ -1339,6 +1582,162 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         (dir, st, gs)
+    }
+
+    /// The aggregation surface (spec §8): the block's `sealed` flag and the per-bundle
+    /// `sealed_by`, `shrugg_getAggregate`'s public fields, the register, the work list, and the
+    /// status section — all against a committed aggregate.
+    #[tokio::test]
+    async fn the_aggregation_rpc_surface_reports_seals_payments_the_register_and_the_work_list() {
+        let (_d, st, _gs, covered_tx, aggregate) = gated_chain();
+        let (h_seal, _) = st.storage.tx_location(&aggregate.hash()).unwrap().unwrap();
+
+        // Blocks: the sealed flag and the per-bundle mark.
+        let b1 = ok(&st, "shrugg_getBlockByHeight", json!([1])).await;
+        assert_eq!(b1["sealed"], false, "block 1's covered bundle is the only one sealed yet");
+        let txs = b1["transactions"].as_array().unwrap();
+        assert_eq!(txs[0]["sealed_by"], aggregate.hash().to_hex(), "the covered bundle names its aggregate");
+        assert_eq!(txs[1]["sealed_by"], Value::Null, "the register's bundle is uncovered");
+        let b2 = ok(&st, "shrugg_getBlockByHeight", json!([2])).await;
+        assert_eq!(b2["transactions"].as_array().unwrap()[0]["action"]["kind"], "aggregate");
+
+        // `shrugg_getAggregate`: the public fields of the sealing aggregate (spec §8).
+        let v = ok(&st, "shrugg_getAggregate", json!([aggregate.hash().to_hex()])).await;
+        assert_eq!(v["covers"], json!([covered_tx.hash().to_hex()]));
+        assert_eq!(v["aggregator"], aggregate_agg_addr(&st));
+        assert_eq!(v["subsidy"], "100000000000");
+        assert_eq!(v["proving_share"], "60", "the covered bundle's excess over the floor");
+        assert_eq!(v["n"], 0, "the first sealed block of the schedule");
+        assert_eq!(v["height"], h_seal);
+        // A transaction that is not an aggregate, and one that does not exist.
+        assert_eq!(ok(&st, "shrugg_getAggregate", json!([covered_tx.hash().to_hex()])).await, Value::Null);
+        assert_eq!(ok(&st, "shrugg_getAggregate", json!([Hash::ZERO.to_hex()])).await, Value::Null);
+
+        // The register, public by design (spec §2): one row, the fields an operator watches.
+        let v = ok(&st, "shrugg_getAggregators", json!([])).await;
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["address"], rows[0]["address"].as_str().unwrap().to_string());
+        assert_eq!(rows[0]["bond"], "100000000000");
+        assert_eq!(rows[0]["nonce"], 1, "the aggregate moved it");
+        assert_eq!(rows[0]["unbonding"], Value::Null);
+
+        // The work list (R8): after the seal the covered bundle is gone from it, and nothing
+        // bundle-less ever appears.
+        let v = ok(&st, "shrugg_getUnsealed", json!([0, 10])).await;
+        let bundles = v["bundles"].as_array().unwrap();
+        assert!(bundles.iter().all(|b| b["hash"] != covered_tx.hash().to_hex()), "a sealed bundle is not work");
+        assert!(bundles.iter().all(|b| b["hash"] != aggregate.hash().to_hex()), "an aggregate is not a bundle");
+        // But before the seal it was exactly the work an aggregator wanted: hash, height, excess.
+        let register_tx = &st.storage.block_by_height(1).unwrap().unwrap().transactions[1];
+        assert!(
+            bundles.iter().any(|b| b["hash"] == register_tx.hash().to_hex() && b["height"] == 1 && b["excess"] == "0"),
+            "the register's bundle (no excess) is still coverable: {v}"
+        );
+
+        // The status section: registered aggregators, the unsealed count, the verify queue.
+        // `publish_status` writes these per commit on the loop, which this harness does not
+        // run — set them the way the loop would (the shape is what is asserted here).
+        {
+            let mut s = st.status.write().unwrap();
+            s.aggregation.registered = st.storage.aggregators().unwrap().len();
+            s.aggregation.unsealed = crate::rpc::unsealed_bundles(&st.storage, 2, 256, 0, usize::MAX).0.len();
+            s.aggregation.verify_queue = 0;
+        }
+        let v = ok(&st, "shrugg_status", json!([])).await;
+        assert_eq!(v["aggregation"]["registered"], 1);
+        assert!(v["aggregation"]["unsealed"].as_u64().unwrap() >= 1, "{v}");
+        assert_eq!(v["aggregation"]["verify_queue"], 0);
+    }
+
+    fn aggregate_agg_addr(st: &RpcState) -> String {
+        key(7).public_key().address().to_base58()
+    }
+
+    /// `tx_json`'s five renderings (spec §8): every aggregation action is named with its public
+    /// fields, nothing more.
+    #[test]
+    fn tx_json_renders_the_five_aggregation_actions() {
+        use shrugg_core::types::actions::{AggregatorRegistration, SignedAggregateHeader};
+        let kp = key(7);
+        let addr = kp.public_key().address();
+        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; 32] };
+        let sig = shrugg_core::Signature::empty();
+        let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
+        let tx = |action| Transaction {
+            chain_id: 7,
+            bundle: None,
+            action,
+        };
+        let registration = AggregatorRegistration { public_key: kp.public_key().clone(), payout: payout.clone(), signature: sig.clone() };
+        let header = |covers: Vec<Hash>| SignedAggregateHeader {
+            aggregator: addr,
+            nonce: 3,
+            time: 9,
+            r: [1; 8],
+            covers,
+            proof_hash: Hash::digest(b"p"),
+            signature: sig.clone(),
+        };
+        let cases: Vec<(Transaction, &str, Value)> = vec![
+            (
+                tx(Action::RegisterAggregator { registration }),
+                "register_aggregator",
+                json!({ "aggregator": addr.to_base58() }),
+            ),
+            (
+                tx(Action::UnbondAggregator { aggregator: addr, nonce: 1, signature: sig.clone() }),
+                "unbond_aggregator",
+                json!({ "aggregator": addr.to_base58(), "nonce": 1 }),
+            ),
+            (
+                tx(Action::WithdrawAggregator {
+                    aggregator: addr,
+                    nonce: 2,
+                    time: 9,
+                    r: [3; 8],
+                    envelope: envelope.clone(),
+                    signature: sig.clone(),
+                }),
+                "withdraw_aggregator",
+                json!({ "aggregator": addr.to_base58(), "nonce": 2, "time": 9 }),
+            ),
+            (
+                tx(Action::SlashAggregator {
+                    a: Box::new(header(vec![Hash::digest(b"x")])),
+                    b: Box::new(header(vec![Hash::digest(b"y")])),
+                }),
+                "slash_aggregator",
+                json!({ "aggregator": addr.to_base58(), "nonce": 3, "headers": [Hash::digest(b"p").to_hex(), Hash::digest(b"p").to_hex()] }),
+            ),
+            (
+                tx(Action::Aggregate {
+                    covers: vec![Hash::digest(b"one"), Hash::digest(b"two")],
+                    proof: vec![9; 64],
+                    aggregator: addr,
+                    nonce: 3,
+                    time: 9,
+                    r: [4; 8],
+                    envelope,
+                    signature: sig,
+                }),
+                "aggregate",
+                json!({
+                    "covers": 2,
+                    "aggregator": addr.to_base58(),
+                    "nonce": 3,
+                    "time": 9,
+                    "proof_len": 64,
+                }),
+            ),
+        ];
+        for (t, kind, want) in cases {
+            let j = tx_json(&t, None, &StubExecutor);
+            assert_eq!(j["action"]["kind"], kind, "{t:?}");
+            for (k, v) in want.as_object().unwrap() {
+                assert_eq!(&j["action"][k], v, "{kind}.{k}: {j}");
+            }
+        }
     }
 
     #[tokio::test]

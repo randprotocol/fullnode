@@ -20,6 +20,7 @@
 
 use shrugg_client::wallet::{self, Burn, NoteStore, Wallet};
 use shrugg_client::RpcClient;
+use shrugg_core::confidential::ConfidentialExecutor;
 use shrugg_core::bridge::{
     digest, guardian_address, sign_digest, Attestation, Body, BridgeConfig, Payload, Transfer, CHAIN_RAND,
 };
@@ -1741,4 +1742,233 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
     // committed block in `rpc.rs`'s `get_call_envelope_serves_the_sealed_transcript_of_a_call`.
     assert_chains_equal(&[&n0, &n1]);
     eprintln!("a_call_envelope_is_opened_by_the_caller_and_the_auditor_only in {:.1?}", started.elapsed());
+}
+
+// ── block aggregation, end to end (spec §7): one rVM verification per sealed window ──────────
+
+/// The sealed-sync capstone (spec §7's acceptance, live): a gated chain registers an
+/// aggregator, its bond bundle is covered by a real aggregate (the proving slot's one rVM
+/// proof at the test profile), the seal lands, the pruning pass rewrites the record — and a
+/// fresh joiner syncs the pruned block in sealed form, reaching the same blocks and the same
+/// state root with exactly **one** rVM verification for the whole sealed window (the covering
+/// aggregate's), where a raw sync would have re-verified the bundle itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window() {
+    init_tracing();
+    let started = Instant::now();
+    let ks = keys(3);
+    let (a, aggregator) = (wallet(1), &ks[2]);
+
+    // The gated genesis: the test-profile bundle shape admitted — the fleet's own measured
+    // classes for a 2-in/2-out bundle, NOT the recursion fixtures' (which over-declare at
+    // 13/12/18; asserted live against the committed bundle's header below, since an admitted
+    // shape the fleet does not declare is one no aggregate can ever cover) — the bundle
+    // guest's digest as the admitted hc, the real aggregate program digest computed up front,
+    // and a short window so the prune pass fires inside the test.
+    let shape = shrugg_core::types::DeclaredShape {
+        profile: shrugg_core::types::FriProfile::Test,
+        tier: 14,
+        program_log_height: 12,
+        input_log_height: 10,
+        keccak_log_height: 0,
+        sha256_log_height: 0,
+        public_log_height: 2,
+        mem_log_height: 16,
+    };
+    let hc = Hash(shrugg_core::notes::word8_to_bytes(&ZkExecutor::hc_bundle()));
+    let program_digest = shrugg_node::agg_executor::AggExecutor::new(FriProfile::Test)
+        .aggregate_program_digest(&shape)
+        .expect("the shape builds");
+    let cfg = shrugg_core::ledger::aggregation::AggregationConfig {
+        bond: 100 * UNITS_PER_SHRUGG,
+        max_covers: 3,
+        subsidy_base: 100 * UNITS_PER_SHRUGG,
+        halving_blocks: 210_000,
+        window: 8,
+        admitted_shapes: vec![shrugg_core::ledger::aggregation::AdmittedShape {
+            shape,
+            hc,
+            aggregate_program_digest: program_digest,
+        }],
+    };
+    let mut gen = genesis_funding(&ks[..2], &[&a]);
+    gen.aggregation = Some(cfg.clone());
+
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
+    let n1 = start_node_at(&ks[1], &gen, vec![bootstrap_addr(&n0)], true, PROVING).await;
+    wait_height(&[&n0, &n1], 2, Duration::from_secs(60)).await;
+
+    // The registration, a wallet submission with a bond-burning bundle (excess 7 over the
+    // floor, so the aggregate's payment is the subsidy plus a proving share).
+    let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; shrugg_core::notes::KEM_EK_BYTES] };
+    let registration = shrugg_core::types::actions::AggregatorRegistration {
+        public_key: aggregator.public_key().clone(),
+        payout: payout.clone(),
+        signature: aggregator.sign(
+            shrugg_core::types::actions::aggregator_register_message(CHAIN_ID, &payout).as_bytes(),
+        ),
+    };
+    let mut store = NoteStore::default();
+    let register = {
+        let slot = proving_slot().await;
+        let sent = wallet::submit(
+            &n0.rpc,
+            &a,
+            &mut store,
+            None,
+            Action::RegisterAggregator { registration },
+            gas::BUNDLE_BASE + 7,
+            wallet::Burn::Shrugg(cfg.bond),
+            FriProfile::Test,
+            Backend::Cpu,
+            CHAIN_ID,
+            true,
+        )
+        .await
+        .expect("the registration is accepted and commits");
+        drop(slot);
+        sent
+    };
+    eprintln!("register: proved in {:.1?} ({:.1?} in)", register.proving, started.elapsed());
+
+    // The committed bundle and its proof, read back: its declared heights must be the admitted
+    // shape's, or the aggregate's admission refuses at step 6 — check that here, loudly.
+    let (h_reg, i_reg) = n0.handle.storage.tx_location(&register.hash).unwrap().unwrap();
+    let register_block = n0.handle.storage.block_by_height(h_reg).unwrap().unwrap();
+    let register_tx = register_block.transactions[i_reg as usize].clone();
+    let proof: shrugg_zkvm::machine::Proof =
+        postcard::from_bytes(&register_tx.bundle.as_ref().unwrap().proof).expect("the stored proof decodes");
+    let declared = shrugg_core::types::DeclaredShape {
+        profile: shrugg_core::types::FriProfile::Test,
+        tier: proof.tier.0 as u8,
+        program_log_height: proof.program_log_height,
+        input_log_height: proof.input_log_height,
+        keccak_log_height: proof.keccak_log_height,
+        sha256_log_height: proof.sha256_log_height,
+        public_log_height: proof.public_log_height,
+        mem_log_height: proof.mem_log_height,
+    };
+    assert_eq!(declared, shape, "the committed bundle's declared shape is the admitted shape");
+
+    // Halt the chain for the prove: with n1 down the window cannot scroll past the covered
+    // bundle no matter how long the rVM prove takes.
+    let dir1 = stop(n1).await;
+
+    // The aggregate: one rVM proof over the register bundle's proof, through the proving slot.
+    let aggregate_proof = {
+        let slot = proving_slot().await;
+        let shape_inner = shrugg_rvm::shape::InnerShape::of(
+            FriProfile::Test,
+            proof.tier,
+            proof.program_log_height,
+            proof.input_log_height,
+            proof.keccak_log_height,
+            proof.sha256_log_height,
+            proof.public_log_height,
+            proof.mem_log_height,
+        );
+        let key_inner = shrugg_rvm::shape::InnerKey::of(FriProfile::Test, &shape_inner);
+        let vk = shrugg_rvm::aggregate::InnerVerifierKey { shape: shape_inner, key: key_inner };
+        let m = shrugg_rvm::machine::Machine::new(FriProfile::Test);
+        let t0 = Instant::now();
+        let a = shrugg_rvm::aggregate::aggregate(&m, &vk, std::slice::from_ref(&proof), None)
+            .expect("one real bundle proof aggregates");
+        eprintln!(
+            "aggregate: tier {}, {} proof bytes, proved in {:.1?} ({:.1?} in)",
+            a.proof.tier.0,
+            a.proof.to_bytes().len(),
+            t0.elapsed(),
+            started.elapsed()
+        );
+        drop(slot);
+        a
+    };
+
+    // The chain resumes, and the aggregate is submitted: admitted (its own rVM verification at
+    // the node), pooled, selected, committed — the sealing block.
+    let n1 = start_in_at(dir1, &ks[1], vec![bootstrap_addr(&n0)], true, PROVING).await;
+    let head = n0.height();
+    let aggregate_tx = {
+        let r = [9u32; 8];
+        let covers = vec![register.hash];
+        let proof_bytes = aggregate_proof.proof.to_bytes();
+        let time = head as u32 + 1;
+        let signature = aggregator.sign(
+            shrugg_core::types::actions::aggregate_signing_hash(CHAIN_ID, 0, time, &r, &covers, &Hash::digest(&proof_bytes))
+                .as_bytes(),
+        );
+        Transaction {
+            chain_id: CHAIN_ID,
+            bundle: None,
+            action: Action::Aggregate {
+                covers,
+                proof: proof_bytes,
+                aggregator: aggregator.public_key().address(),
+                nonce: 0,
+                time,
+                r,
+                envelope: Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] },
+                signature,
+            },
+        }
+    };
+    let agg_hash = n0.rpc.send_transaction(&aggregate_tx).await.expect("the aggregate is admitted");
+    assert_eq!(agg_hash, aggregate_tx.hash());
+    n0.rpc.wait_for_transaction(&agg_hash, Duration::from_secs(120)).await.expect("the aggregate commits");
+    let (h_seal, _) = n0.handle.storage.tx_location(&agg_hash).unwrap().unwrap();
+    eprintln!("sealed at block {h_seal} ({:.1?} in)", started.elapsed());
+    assert_eq!(
+        n0.handle.storage.sealed_by(&register.hash).unwrap(),
+        Some((agg_hash, h_seal)),
+        "the covered bundle carries the seal"
+    );
+
+    // The prune pass: it runs every 16 blocks on a gated chain, gated at sealed_at + window.
+    wait_for(
+        "the covered bundle's record is pruned",
+        Duration::from_secs(300),
+        || matches!(n0.handle.storage.tx_record(&register.hash).unwrap().unwrap(), shrugg_node::storage::TxRecord::Pruned { .. }),
+    )
+    .await;
+
+    // The fresh joiner: syncs the whole chain, the pruned block in sealed form. The
+    // verification counter scopes to this sync alone.
+    let verifications_before = shrugg_node::agg_executor::AggExecutor::verification_count();
+    let n2 = start_node(&ks[1], &gen, vec![bootstrap_addr(&n0)], false).await;
+    let target = n0.height();
+    wait_height(&[&n2], target, Duration::from_secs(300)).await;
+    let verifications_after = shrugg_node::agg_executor::AggExecutor::verification_count();
+
+    for h in 0..=target {
+        let b2 = n2.handle.storage.block_by_height(h).unwrap().unwrap();
+        let b0 = n0.handle.storage.block_by_height(h).unwrap().unwrap();
+        assert_eq!(b2.hash(), b0.hash(), "block hash differs at {h}");
+        assert_eq!(b2.header.state_root, b0.header.state_root, "state root differs at {h}");
+    }
+    assert_eq!(
+        verifications_after - verifications_before,
+        1,
+        "one rVM verification for the whole sealed window — the covering aggregate's"
+    );
+    assert_eq!(
+        n2.handle.storage.sealed_by(&register.hash).unwrap(),
+        Some((agg_hash, h_seal)),
+        "the joiner marked the seal itself"
+    );
+    let supply = n2.rpc.call("shrugg_getSupply", json!([])).await.unwrap();
+    assert_eq!(supply["invariant_holds"], true, "{supply}");
+    assert_eq!(supply["sealed_blocks"], Value::String("1".into()), "{supply}");
+    assert_eq!(
+        supply["subsidised"],
+        Value::String(cfg.subsidy_base.to_string()),
+        "one subsidy minted: {supply}"
+    );
+
+    eprintln!(
+        "sealed-sync capstone done in {:.1?}: register + aggregate prove + seal + prune + resync",
+        started.elapsed()
+    );
+    n2.handle.shutdown().await;
+    n0.handle.shutdown().await;
+    n1.handle.shutdown().await;
 }

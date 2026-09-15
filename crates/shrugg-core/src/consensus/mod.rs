@@ -66,10 +66,29 @@ pub struct SafetyState {
 }
 
 /// A finalized block together with the QC that certifies it.
+/// One pruned bundle's attestation on the wire (block aggregation, spec §7's sealed form):
+/// everything a joining node needs to accept the marker form in place of the raw proof — the
+/// raw transaction's hash (unrecomputable once the proof bytes are gone, and what the tx_root
+/// checks against), the proof's hash (what the sync-side skip vouches for), the 34 public
+/// values and the declared shape (what the covering aggregate's admission reads).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunedBundle {
+    pub tx_hash: crate::crypto::Hash,
+    pub proof_hash: crate::crypto::Hash,
+    /// The 34 public values, in `pv` order — a `Vec` for serde's array limit, always 34.
+    pub public_values: Vec<u64>,
+    pub shape: crate::types::DeclaredShape,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedBlock {
     pub block: Block,
     pub qc: QuorumCertificate,
+    /// The sealed form's side table (spec §7): this block's pruned bundles, in transaction
+    /// order, their transactions carrying the marker form. Empty on a raw block — the two
+    /// forms share one wire type, and a block with no pruned bundles is raw by construction.
+    #[serde(default)]
+    pub pruned: Vec<PrunedBundle>,
     /// Receipts of the block's confidential calls, in transaction order.
     #[serde(default)]
     pub receipts: Vec<crate::program::CallReceipt>,

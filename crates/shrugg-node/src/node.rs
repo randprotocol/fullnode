@@ -19,7 +19,7 @@ use shrugg_core::{Hash, Keypair, Ledger, ShieldedAddress, Transaction, Validator
 use shrugg_zkvm::executor::ZkExecutor;
 use shrugg_zkvm::notes::{Note, SpendKey};
 use shrugg_zkvm::viewing::TxKey;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -284,6 +284,69 @@ impl shrugg_core::consensus::CoveredSource for StoreCovered {
         assemble_covered(&self.storage, head, self.window, self.profile, covers).ok()
     }
 }
+
+/// The form a stored block is served in (spec §7): every transaction whose record is
+/// `Pruned` rides as the record's marker form with a side-table entry — the raw hash, the
+/// proof hash, the 34 public values and the declared shape — in transaction order. A block
+/// with no pruned records is raw by construction: the two forms share one wire type.
+fn sealed_form_of(storage: &Storage, cb: &CommittedBlock) -> CommittedBlock {
+    let mut block = cb.block.clone();
+    let mut pruned = Vec::new();
+    for tx in &mut block.transactions {
+        // The record is keyed by the raw hash, which is `tx.hash()` for a raw-stored tx;
+        // for a marker-form one (this block itself arrived sealed), the record is found by
+        // the proof hash the marker carries.
+        let key = match tx.bundle.as_ref().and_then(|b| shrugg_core::notes::pruned_proof_hash(&b.proof)) {
+            Some(ph) => match storage.tx_hash_by_proof_hash(&ph) {
+                Ok(Some(k)) => k,
+                _ => continue,
+            },
+            None => tx.hash(),
+        };
+        let Ok(Some(crate::storage::TxRecord::Pruned { tx_hash, tx: pruned_tx, proof_hash, public_values, shape, .. })) =
+            storage.tx_record(&key)
+        else {
+            continue;
+        };
+        *tx = pruned_tx;
+        pruned.push(shrugg_core::consensus::PrunedBundle { tx_hash, proof_hash, public_values, shape });
+    }
+    CommittedBlock { block, pruned, ..cb.clone() }
+}
+
+/// The sealed acceptance's coverage half (spec §7), one pruned transaction at a time: the
+/// marker must carry a side-table entry, and the entry's raw hash must name a bundle this
+/// node has already sealed or this batch carries an aggregate for. Anything else is the
+/// raw-form fallback; a marker without an entry is a damaged batch.
+fn check_sealed_coverage(storage: &Storage, batch_covers: &BTreeSet<Hash>, cb: &CommittedBlock) -> Result<()> {
+    for tx in &cb.block.transactions {
+        let Some(proof_hash) = tx.bundle.as_ref().and_then(|bd| shrugg_core::notes::pruned_proof_hash(&bd.proof)) else {
+            continue;
+        };
+        let Some(p) = cb.pruned.iter().find(|p| p.proof_hash == proof_hash) else {
+            anyhow::bail!("block {} carries a pruned bundle with no side-table entry", cb.block.height());
+        };
+        let covered = storage.sealed_by(&p.tx_hash)?.is_some() || batch_covers.contains(&p.tx_hash);
+        if !covered {
+            return Err(RawFallback(cb.block.height()).into());
+        }
+    }
+    Ok(())
+}
+
+/// The raw-form fallback (spec §7): a pruned bundle arrived whose covering aggregate is
+/// neither applied nor in this batch — another peer may hold the raw proofs. Not a failure:
+/// serving pruned history is policy, not malice, so the peer wears no strike for it.
+#[derive(Debug)]
+struct RawFallback(u64);
+
+impl std::fmt::Display for RawFallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "block {} is pruned history without its covering aggregate", self.0)
+    }
+}
+
+impl std::error::Error for RawFallback {}
 
 struct Node {
     cfg: NodeConfig,
@@ -706,6 +769,33 @@ impl Node {
         s.active_validator = self.hs.current_set().contains(&self.address);
         let ledger = self.hs.committed_ledger();
         s.programs = ledger.programs().len() as u64;
+        // The aggregation section (spec §8): the register's size straight from the ledger, and
+        // the work-list count over the window the chain runs with — both zeroed without the
+        // section. The count re-reads the window's blocks each commit; at the chain's scale
+        // that is a few hundred transactions.
+        s.aggregation.registered = ledger.aggregators().len();
+        s.aggregation.unsealed = match ledger.aggregation() {
+            Some(cfg) => {
+                crate::rpc::unsealed_bundles(
+                    &self.storage,
+                    self.hs.committed_height(),
+                    cfg.window,
+                    self.hs.committed_height().saturating_sub(cfg.window),
+                    usize::MAX,
+                )
+                .0
+                .len()
+            }
+            None => 0,
+        };
+        s.aggregation.verify_queue = self.verify_queue.len();
+        if let Some(cfg) = ledger.aggregation() {
+            s.aggregation.max_covers = cfg.max_covers;
+            s.aggregation.window = cfg.window;
+            s.aggregation.subsidy_base = cfg.subsidy_base;
+            s.aggregation.halving_blocks = cfg.halving_blocks;
+            s.aggregation.sealed_blocks = ledger.supply().sealed_blocks;
+        }
         // The pool's public size, straight from the committed ledger rather than a second read
         // of storage: this runs on the node loop after every commit.
         s.notes = ledger.next_index();
@@ -1218,11 +1308,16 @@ impl Node {
                 let max = max.min(SYNC_BATCH);
                 // Lazy: a batch that fills up on bytes must not have read the rest from RocksDB.
                 let heights = from_height..from_height.saturating_add(max as u64);
-                let blocks = heights.map_while(|h| self.storage.committed_block(h).ok().flatten());
+                let blocks = heights
+                    .map_while(|h| self.storage.committed_block(h).ok().flatten())
+                    .map(|cb| sealed_form_of(&self.storage, &cb));
                 SyncResponse::Blocks(fill_sync_batch(blocks, serve_sync_budget()))
             }
             SyncRequest::BlockByHash(h) => {
                 let b = self.hs.block(&h).cloned().or_else(|| self.storage.block_by_hash(&h).ok().flatten());
+                // A by-hash fetch is a single block with no aggregate context beside it: serve
+                // the stored block untouched, marker forms and all, and let the fetcher's
+                // acceptance decide (the batch path's sealed form is built in `Blocks`).
                 SyncResponse::Block(b)
             }
         }
@@ -1379,6 +1474,15 @@ impl Node {
                 }
                 let n = blocks.len();
                 if let Err(e) = self.apply_synced(blocks).await {
+                    // The raw-form fallback (spec §7): pruned history without its covering
+                    // aggregate is a request to try another peer, not a failure — serving
+                    // pruned history is policy, not malice, so the peer wears no strike and is
+                    // not dropped; the next batch is asked of someone else.
+                    if e.downcast_ref::<RawFallback>().is_some() {
+                        tracing::info!(%peer, "{e}; asking another peer for the raw form");
+                        self.sync_from(Some(peer)).await;
+                        return Ok(());
+                    }
                     // Blocks we asked for and could not use: a peer on a different chain, or a
                     // damaged batch. It cost us a round trip either way.
                     self.sync_failures += 1;
@@ -1428,6 +1532,19 @@ impl Node {
         let mut sets = self.hs.epoch_sets().clone();
         let mut recorded: Vec<(u64, ValidatorSet)> = Vec::new();
         let mut accepted = Vec::new();
+        let profile = core_profile(&self.gs.fri_profile);
+        // The sealed form's coverage map (spec §7): every cover every aggregate in this batch
+        // names — checked before each pruned bundle's skip, and the batch is atomic if one
+        // fails.
+        let mut batch_covers: BTreeSet<Hash> = BTreeSet::new();
+        for cb in &blocks {
+            for tx in &cb.block.transactions {
+                if let shrugg_core::types::Action::Aggregate { covers, .. } = &tx.action {
+                    batch_covers.extend(covers.iter().copied());
+                }
+            }
+        }
+        let mut recent: HashMap<Hash, shrugg_core::types::CoveredBundle> = HashMap::new();
         for cb in blocks {
             let b = &cb.block;
             if b.height() != head_height + 1 || b.parent() != head_hash {
@@ -1467,9 +1584,71 @@ impl Node {
             if b.proposer() != set.leader(b.view()) {
                 anyhow::bail!("wrong leader for block {} in epoch {epoch}", b.height());
             }
-            let receipts = ledger.apply_block(b, self.executor.as_ref())?;
+            // The sealed form's acceptance (spec §7): a pruned bundle is accepted only if its
+            // block is finalised — the QC above — and a covering aggregate names its raw hash,
+            // applied already (a local mark) or carried later in this very batch (whose commit
+            // is atomic: if the aggregate then fails any admission step, the whole batch —
+            // this block's tentative skip included — is discarded, exactly as an invalid raw
+            // block fails today). Anything else is the raw-form fallback: another peer may
+            // hold the raw proofs, and serving pruned history is policy, not malice.
+            check_sealed_coverage(&self.storage, &batch_covers, &cb)?;
+            // The covered-carrying sidecar for any aggregate in the block: the records the
+            // batch has produced so far, then the store's (spec §3.2's data — the pruned form
+            // reads exactly as the raw one).
+            let mut sidecar = BTreeMap::new();
+            for (index, tx) in b.transactions.iter().enumerate() {
+                if let shrugg_core::types::Action::Aggregate { covers, .. } = &tx.action {
+                    let mut records = Vec::with_capacity(covers.len());
+                    for cover in covers {
+                        let record = match recent.get(cover) {
+                            Some(r) => r.clone(),
+                            None => self
+                                .storage
+                                .covered_record(cover, profile)?
+                                .ok_or_else(|| anyhow::anyhow!("cover {cover} of block {} names no stored bundle", b.height()))?,
+                        };
+                        records.push(record);
+                    }
+                    sidecar.insert(index, records);
+                }
+            }
+            let receipts = ledger.apply_block_for_sync(b, &sidecar, &cb.pruned, self.executor.as_ref())?;
             if receipts != cb.receipts {
                 anyhow::bail!("receipts for block {} do not match our execution", b.height());
+            }
+            // The records this block makes available to later aggregates in the batch: raw
+            // bundles by their proofs, marker-form ones by the side table.
+            for tx in &b.transactions {
+                match tx.bundle.as_ref().and_then(|bd| shrugg_core::notes::pruned_proof_hash(&bd.proof)) {
+                    Some(proof_hash) => {
+                        let p = cb.pruned.iter().find(|p| p.proof_hash == proof_hash).expect("checked above");
+                        let pv: [u64; 34] = p.public_values.clone().try_into().expect("a side table's list is 34 words");
+                        recent.insert(p.tx_hash, shrugg_core::types::CoveredBundle { public_values: pv, shape: p.shape });
+                    }
+                    None => {
+                        if let Some(bd) = &tx.bundle {
+                            if let Ok(proof) = postcard::from_bytes::<shrugg_zkvm::machine::Proof>(&bd.proof) {
+                                let pv: [u64; 34] = proof.public_values.clone().try_into().expect("cs6 proofs carry 34 public values");
+                                recent.insert(
+                                    tx.hash(),
+                                    shrugg_core::types::CoveredBundle {
+                                        public_values: pv,
+                                        shape: shrugg_core::types::DeclaredShape {
+                                            profile,
+                                            tier: proof.tier.0 as u8,
+                                            program_log_height: proof.program_log_height,
+                                            input_log_height: proof.input_log_height,
+                                            keccak_log_height: proof.keccak_log_height,
+                                            sha256_log_height: proof.sha256_log_height,
+                                            public_log_height: proof.public_log_height,
+                                            mem_log_height: proof.mem_log_height,
+                                        },
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
             }
             head_hash = b.hash();
             head_height = b.height();
@@ -1869,6 +2048,78 @@ mod tests {
         );
     }
 
+    // ---------------------------------- sealed-form sync (spec §7)
+
+    /// A sealed-form block built from `chain_with_a_real_proof`'s covered tx: the proof swapped
+    /// for the marker form, the side table attesting the raw hash, proof hash, pv and shape.
+    fn sealed_form_fixture() -> (tempfile::TempDir, Storage, GenesisState, CommittedBlock) {
+        let (dir, storage, gs, covered_tx, _mint) = chain_with_a_real_proof();
+        let proof = crate::agg_executor::fixture_proof(0);
+        let proof_hash = Hash::digest(&proof.to_bytes());
+        let mut marker = shrugg_core::notes::PRUNED_PROOF_MARKER.to_vec();
+        marker.extend_from_slice(proof_hash.as_bytes());
+        let mut marker_tx = covered_tx.clone();
+        marker_tx.bundle.as_mut().unwrap().proof = marker;
+        let side = shrugg_core::consensus::PrunedBundle {
+            tx_hash: covered_tx.hash(),
+            proof_hash,
+            public_values: proof.public_values.clone(),
+            shape: fixture_shape(&proof),
+        };
+        let mut cb = make_block_unchecked(&gs.block, &gs.ledger, vec![marker_tx], &key(1));
+        cb.pruned = vec![side];
+        (dir, storage, gs, cb)
+    }
+
+    /// The coverage rule (spec §7): a pruned bundle is accepted when its raw hash is sealed
+    /// locally or carried by an aggregate in the batch — and falls back to the raw form,
+    /// never a ban, when neither holds.
+    #[test]
+    fn the_sealed_coverage_rule_accepts_marks_and_batch_and_falls_back_otherwise() {
+        let (_d, storage, _gs, cb) = sealed_form_fixture();
+        let hash = cb.pruned[0].tx_hash;
+        // No mark, no batch aggregate: the raw-form fallback, at the block's height.
+        let err = check_sealed_coverage(&storage, &BTreeSet::new(), &cb).unwrap_err();
+        assert!(err.downcast_ref::<RawFallback>().is_some(), "expected RawFallback, got {err:?}");
+        // A batch carrying an aggregate for it: accepted.
+        let batch: BTreeSet<Hash> = [hash].into_iter().collect();
+        check_sealed_coverage(&storage, &batch, &cb).unwrap();
+        // A local mark: accepted without the batch too.
+        storage.mark_sealed(hash, Hash::digest(b"the covering aggregate"), 2).unwrap();
+        check_sealed_coverage(&storage, &BTreeSet::new(), &cb).unwrap();
+        // A marker with no side-table entry is a damaged batch, not a fallback.
+        let mut damaged = cb.clone();
+        damaged.pruned = Vec::new();
+        let err = check_sealed_coverage(&storage, &batch, &damaged).unwrap_err();
+        assert!(err.downcast_ref::<RawFallback>().is_none(), "a damaged batch is not the fallback: {err:?}");
+    }
+
+    /// The serve half (spec §7): on a pruned store the block rides with its pruned bundle in
+    /// marker form and the side table carrying exactly the record's contents; the same block
+    /// before pruning is raw by construction.
+    #[test]
+    fn the_serve_form_carries_the_marker_and_the_table_once_pruned() {
+        let (_d, storage, gs, covered_tx, _mint) = chain_with_a_real_proof();
+        let raw_cb = make_block_unchecked(&gs.block, &gs.ledger, vec![covered_tx.clone()], &key(1));
+        let raw_form = sealed_form_of(&storage, &raw_cb);
+        assert!(raw_form.pruned.is_empty(), "nothing pruned: the raw form");
+        assert_eq!(raw_form.block.transactions[0], covered_tx, "untouched");
+        // Seal and prune it, then serve again.
+        storage.mark_sealed(covered_tx.hash(), Hash::digest(b"the covering aggregate"), 1).unwrap();
+        assert_eq!(storage.prune_sealed(300, 256, shrugg_core::types::FriProfile::Test).unwrap(), 1);
+        let sealed = sealed_form_of(&storage, &raw_cb);
+        assert_eq!(sealed.pruned.len(), 1, "one bundle, one side entry");
+        let side = &sealed.pruned[0];
+        assert_eq!(side.tx_hash, covered_tx.hash());
+        let proof = crate::agg_executor::fixture_proof(0);
+        assert_eq!(side.proof_hash, Hash::digest(&proof.to_bytes()));
+        assert_eq!(side.public_values, proof.public_values);
+        assert_eq!(side.shape, fixture_shape(&proof));
+        let served_tx = &sealed.block.transactions[0];
+        let field = served_tx.bundle.as_ref().unwrap().proof.clone();
+        assert!(field.starts_with(shrugg_core::notes::PRUNED_PROOF_MARKER), "the marker form rides");
+    }
+
     /// The worker arm's ordering (cheap before expensive, and bytes before storage): the wire
     /// caps and the chain id refuse before a single cover is looked up, an ungated chain names
     /// the gate, and anything that is not an aggregate is the ledger's own `validate`.
@@ -1955,7 +2206,7 @@ mod tests {
         };
         let block = Block::sign(header, txs, &ks[0]);
         let hash = block.hash();
-        CommittedBlock { block, qc: votes_of(height, hash, ks, votes), receipts: Vec::new(), deposits: Vec::new() }
+        CommittedBlock { block, pruned: Vec::new(), qc: votes_of(height, hash, ks, votes), receipts: Vec::new(), deposits: Vec::new() }
     }
 
     fn validators(n: u8) -> Vec<Keypair> {

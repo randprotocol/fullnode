@@ -729,6 +729,47 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
+### 2026-09-15 — block aggregation (chain 9): a hard fork
+
+**The wire format, block rules and consensus change: this is a hard fork, not an
+interop-compatible hardening.** A chain whose genesis carries an `aggregation` section admits
+five new transaction actions — `RegisterAggregator`, `UnbondAggregator`, `WithdrawAggregator`,
+`SlashAggregator` and the `Aggregate` itself — prunes sealed bundle proofs, and serves a second
+block form on sync. Chains without the section behave byte-for-byte as before. What a client can
+see:
+
+- **`shrugg_submitAggregate`** is `shrugg_sendTransaction`: an `Aggregate` is an ordinary
+  bundle-less transaction, admitted on the same queue (its rVM verification occupies a worker
+  slot far longer than a bundle's ~20 ms, which the queue and the per-peer token bucket already
+  bound).
+- **`shrugg_getBlockByHeight` / `shrugg_getBlockByHash`** gain `sealed` (every bundle in the
+  block covered) and a per-transaction `sealed_by` (the covering aggregate's hash, `null` while
+  the bundle is coverable or the transaction is bundle-less).
+- **`shrugg_getAggregate(hash)`** returns the sealing aggregate's public fields: `covers`
+  (hashes, in proof order), `aggregator`, `subsidy`, `proving_share`, and `n` — the subsidy
+  schedule's index the block minted at — plus its `height`. `null` for any other transaction.
+- **`shrugg_getAggregators`** lists the register (public by design): `address`, `bond`,
+  `payout`, `nonce`, `unbonding` per row.
+- **`shrugg_getUnsealed(from, limit)`** pages the bundles an aggregator may still cover —
+  finalised, inside the window, unsealed — as `{ bundles: [{ hash, height, excess }], next_from }`,
+  `excess` in units over the floor: the daemon's work list.
+- **`shrugg_getRawTransaction(hash)`** returns the full transaction, bincode as hex — the proof
+  bytes an aggregator needs and `tx_json` deliberately never renders.
+- **`shrugg_getSupply`** gains the four counters `subsidised`, `sealed_blocks`,
+  `aggregator_bonds`, `slashed` (reported separately from `faucet_minted`, so the schedule is
+  auditable against `sealed_blocks` directly).
+- **`shrugg_status` gains `aggregation`**: `registered`, `unsealed`, `verify_queue`, and the
+  chain parameters an aggregate daemon computes the payment from (`max_covers`, `window`,
+  `subsidy_base`, `halving_blocks`, `sealed_blocks`).
+- **`tx_json`** renders the five new actions (`register_aggregator`, `unbond_aggregator`,
+  `withdraw_aggregator`, `slash_aggregator`, `aggregate`) with their public fields.
+- The node CLI gains the role's commands: **`shrugg-node aggregator register|unbond|withdraw`**
+  (the validator commands' twins, one register over) and **`shrugg-node aggregate [--watch]`**,
+  the aggregate daemon: poll `shrugg_getUnsealed`, fetch the raw bundles, prove one aggregate,
+  submit — a separate process from the validator, needing only an RPC endpoint and the
+  registered key. `--keep-raw-proofs` keeps sealed bundles' raw proofs for archives; by default
+  the pruning pass rewrites their records once the window passes.
+
 ### 2026-09-14 — viewing keys in the node
 
 A node may now hold **viewing keys** (never spend keys — the RPC layer has no type for those) and

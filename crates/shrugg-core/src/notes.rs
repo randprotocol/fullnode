@@ -92,6 +92,19 @@ pub struct BundleDigestInput {
     pub time: u32,
 }
 
+/// What a pruned bundle's `proof` field carries (block aggregation, spec §6.2, the 2026-09-13
+/// form): this marker then the proof's 32-byte hash. Never a decodable proof, so a pruned
+/// record can never be mistaken for a raw one — and 46 bytes stands in for ~1.3 MB. In core
+/// (not the node's storage) because the ledger's sync-side apply must recognise the form.
+pub const PRUNED_PROOF_MARKER: &[u8] = b"shrugg-pruned\0";
+
+/// The proof hash a marker-form proof carries, if it is one: `PRUNED_PROOF_MARKER` followed by
+/// exactly 32 bytes. Anything longer, shorter or unmarked is not the pruned form.
+pub fn pruned_proof_hash(proof: &[u8]) -> Option<crate::crypto::Hash> {
+    let tail = proof.strip_prefix(PRUNED_PROOF_MARKER)?;
+    Some(crate::crypto::Hash(tail.try_into().ok()?))
+}
+
 impl Bundle {
     /// The public fields the bundle digest commits to, in spec order.
     pub fn digest_input(&self) -> BundleDigestInput {

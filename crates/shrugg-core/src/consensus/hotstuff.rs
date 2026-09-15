@@ -853,6 +853,7 @@ impl HotStuff {
             let e = &self.tree[&h];
             committed.push(CommittedBlock {
                 block: e.block.clone(),
+                pruned: Vec::new(),
                 qc,
                 receipts: e.receipts.clone(),
                 // The ledger *after* this block holds exactly this block's deposits:

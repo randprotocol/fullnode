@@ -41,3 +41,5 @@ clap = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
+shrugg-rvm = { workspace = true }
+p3-field = "=0.7.0" 

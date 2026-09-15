@@ -2271,6 +2271,102 @@ mod payment_tests {
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
     }
 
+    /// The sealed form's ledger half (spec §7): a pruned bundle applies on the marker's
+    /// membership and the digest binding — the public fields hash to the digest the covering
+    /// aggregate's verified pv commits to — and every malformed variation is refused by name.
+    #[test]
+    fn a_pruned_bundle_applies_on_membership_and_the_digest_binding() {
+        use crate::consensus::PrunedBundle;
+        let (a, _) = keys();
+        let l = gated(256);
+        let p = proposer(&l);
+        // A bundle whose "proof" is the marker form: the side table's pv carries the digest
+        // its own public fields hash to.
+        let tx = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, 0), Action::None);
+        let digest = StubExecutor.bundle_digest(&tx.bundle.as_ref().unwrap().digest_input());
+        let mut pv = [0u64; 34];
+        for k in 0..8 {
+            pv[pv::OUT0 + k] = digest[k] as u64;
+        }
+        let proof_hash = Hash::digest(b"the raw proof bytes");
+        let mut marker = crate::notes::PRUNED_PROOF_MARKER.to_vec();
+        marker.extend_from_slice(proof_hash.as_bytes());
+        let mut pruned_tx = tx.clone();
+        pruned_tx.bundle.as_mut().unwrap().proof = marker;
+        let side = PrunedBundle {
+            tx_hash: tx.hash(),
+            proof_hash,
+            public_values: pv.to_vec(),
+            shape: shape(),
+        };
+        // The block carries the marker form; its root is over the *raw* hashes, as the table
+        // attests.
+        let root = crate::crypto::merkle_root(&[tx.hash()]);
+        let block = Block::sign(
+            BlockHeader {
+                height: 1,
+                view: 1,
+                parent: Hash::ZERO,
+                proposer: a.public_key().clone(),
+                timestamp_ms: 1,
+                tx_root: root,
+                state_root: Hash::ZERO,
+                justify: QuorumCertificate::genesis(Hash::ZERO),
+            },
+            vec![pruned_tx.clone()],
+            &a,
+        );
+        // The ledger root must be computed by the same path: apply the pruned tx with the side
+        // table, over a fresh clone.
+        let root_after = {
+            let mut after = l.clone();
+            after.set_height(1);
+            after.set_timestamp_ms(1);
+            after.apply_transactions_for_sync(&[pruned_tx.clone()], &p, &BTreeMap::new(), std::slice::from_ref(&side), &StubExecutor).unwrap();
+            after.sweep_expired_excesses(1, &p);
+            after.record_anchor(1);
+            after.state_root()
+        };
+        let mut header = block.header.clone();
+        header.state_root = root_after;
+        let block = Block::sign(header, vec![pruned_tx.clone()], &a);
+
+        let mut m = l.clone();
+        m.apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&side), &StubExecutor)
+            .expect("the pruned bundle applies on the table's attestation");
+        assert!(m.is_spent(&[1; 8]) && m.has_commitment(&[3; 8]), "the public-field effects land");
+        // And the fee split treats it like any bundle.
+        assert_eq!(m.validators()[&p].rewards, gas::BUNDLE_BASE);
+
+        // Without any side table the block reads as a raw block with a marker for a proof —
+        // its hash is not the raw one, and the root refuses it.
+        match l.clone().apply_block_for_sync(&block, &BTreeMap::new(), &[], &StubExecutor) {
+            Err(crate::ledger::BlockError::TxRootMismatch) => {}
+            other => panic!("expected TxRootMismatch, got {other:?}"),
+        }
+        // And a table that simply does not attest this proof: the malformed-marker refusal,
+        // at its index.
+        let other_side = PrunedBundle {
+            tx_hash: Hash::digest(b"some other tx"),
+            proof_hash: Hash::digest(b"some other proof"),
+            public_values: pv.to_vec(),
+            shape: shape(),
+        };
+        match l.clone().apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&other_side), &StubExecutor) {
+            Err(crate::ledger::BlockError::InvalidTx { index: 0, error: TxError::InvalidBundleProof(_) }) => {}
+            other => panic!("expected the unattested-marker refusal, got {other:?}"),
+        }
+        // A table whose pv does not match the bundle's own fields: the binding refuses it.
+        let mut forged = side.clone();
+        forged.public_values[pv::OUT0] += 1;
+        match l.clone().apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&forged), &StubExecutor) {
+            Err(crate::ledger::BlockError::InvalidTx { index: 0, error: TxError::BadDigest }) => {}
+            other => panic!("expected the binding's BadDigest, got {other:?}"),
+        }
+        // (A side-table raw hash that lies is not the ledger's check: the *coverage* rule is
+        // the caller's, and the digest binding above is what anchors the content.)
+    }
+
     fn signed_header(kp: &Keypair, nonce: u64, covers: Vec<Hash>) -> crate::types::SignedAggregateHeader {
         let aggregator = kp.public_key().address();
         let proof_hash = Hash::digest(b"p");
