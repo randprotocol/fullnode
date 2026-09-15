@@ -508,6 +508,7 @@ mod tests {
             fri_profile: "test".into(),
             hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
             bridge: None,
+            aggregation: None,
             epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
         }
     }

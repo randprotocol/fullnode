@@ -200,6 +200,88 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// The chain's FRI profile as the ledger's mirror enum, parsed from the genesis file — which
+/// `executor_for_profile` already validated, so the `expect` cannot fire.
+fn core_profile(fri_profile: &str) -> shrugg_core::types::FriProfile {
+    match ZkExecutor::profile_from_str(fri_profile).expect("genesis fri_profile was validated at load") {
+        shrugg_zkvm::machine::FriProfile::Test => shrugg_core::types::FriProfile::Test,
+        shrugg_zkvm::machine::FriProfile::Production => shrugg_core::types::FriProfile::Production,
+    }
+}
+
+/// The worker's validation of one transaction. An aggregate's covered bundles live in storage,
+/// not the ledger, so its admission pre-flights the byte checks (spec §4 step 1), assembles the
+/// covered records (§3.2's coverability), and takes the covered-carrying path; every other
+/// transaction is the ledger's own `validate`.
+fn validate_for_pool(
+    tx: &Transaction,
+    ledger: &Ledger,
+    storage: &Storage,
+    profile: shrugg_core::types::FriProfile,
+    executor: &dyn ConfidentialExecutor,
+) -> Result<(), shrugg_core::TxError> {
+    let shrugg_core::types::Action::Aggregate { covers, .. } = &tx.action else {
+        return ledger.validate(tx, executor);
+    };
+    ledger.preflight_aggregate(tx)?;
+    let window = ledger.aggregation().expect("preflight checked the gate").window;
+    let covered = assemble_covered(storage, ledger.height(), window, profile, covers)?;
+    ledger.validate_aggregate(tx, &covered, executor).map(|_| ())
+}
+
+/// The covered-bundle records an aggregate's admission needs (spec §3.2), assembled from the
+/// store: for each cover hash, the committed transaction's 34 public values and declared shape,
+/// read off its bundle proof's stored header. A stored block is finalised by construction (only
+/// committed blocks are stored), chain-9 is implied by the genesis gate, and `sealed_by` does
+/// not exist until Task 6 — so the coverability checks that remain here are existence,
+/// bundle-ness, and the window. A stored record that cannot be read back indicts this node's
+/// store, not the transaction: `CoverStoreCorrupt`, never a permanent verdict.
+fn assemble_covered(
+    storage: &Storage,
+    head: u64,
+    window: u64,
+    profile: shrugg_core::types::FriProfile,
+    covers: &[Hash],
+) -> Result<Vec<shrugg_core::types::CoveredBundle>, shrugg_core::TxError> {
+    use shrugg_core::ledger::aggregation::AggregationError as A;
+    use shrugg_core::TxError;
+    covers
+        .iter()
+        .map(|cover| {
+            let corrupt = || TxError::Aggregation(A::CoverStoreCorrupt(*cover));
+            let (height, index) = storage
+                .tx_location(cover)
+                .map_err(|_| corrupt())?
+                .ok_or(TxError::Aggregation(A::UnknownCover(*cover)))?;
+            // The window (spec §3.3): the bundle's block must be newer than `head - window`.
+            if height + window <= head {
+                return Err(TxError::Aggregation(A::CoverOutsideWindow { cover: *cover, block: height, head }));
+            }
+            let block = storage.block_by_height(height).map_err(|_| corrupt())?.ok_or_else(corrupt)?;
+            let tx = block.transactions.get(index as usize).ok_or_else(corrupt)?;
+            let Some(bundle) = &tx.bundle else {
+                return Err(TxError::Aggregation(A::CoverNotABundle(*cover)));
+            };
+            let proof: shrugg_zkvm::machine::Proof =
+                postcard::from_bytes(&bundle.proof).map_err(|_| corrupt())?;
+            let public_values: [u64; 34] = proof.public_values.clone().try_into().map_err(|_| corrupt())?;
+            Ok(shrugg_core::types::CoveredBundle {
+                public_values,
+                shape: shrugg_core::types::DeclaredShape {
+                    profile,
+                    tier: proof.tier.0 as u8,
+                    program_log_height: proof.program_log_height,
+                    input_log_height: proof.input_log_height,
+                    keccak_log_height: proof.keccak_log_height,
+                    sha256_log_height: proof.sha256_log_height,
+                    public_log_height: proof.public_log_height,
+                    mem_log_height: proof.mem_log_height,
+                },
+            })
+        })
+        .collect()
+}
+
 struct Node {
     cfg: NodeConfig,
     gs: GenesisState,
@@ -659,11 +741,13 @@ impl Node {
         while self.verify_in_flight < MAX_VERIFY_IN_FLIGHT {
             let Some((tx, source)) = self.verify_queue.pop_front() else { break };
             let ledger = self.snapshot();
+            let storage = self.storage.clone();
+            let profile = core_profile(&self.gs.fri_profile);
             let executor = self.executor.clone();
             let out = self.verdicts_tx.clone();
             self.verify_in_flight += 1;
             tokio::task::spawn_blocking(move || {
-                let result = ledger.validate(&tx, executor.as_ref());
+                let result = validate_for_pool(&tx, &ledger, &storage, profile, executor.as_ref());
                 // The loop is the only receiver and outlives every task it spawned, so a send
                 // failure means the node is already shutting down.
                 let _ = out.blocking_send(Verdict { tx, result, source });
@@ -1503,6 +1587,227 @@ mod tests {
             gs.ledger.state_root(),
             "the reloaded ledger hashes the gated state-3 root, not state-2"
         );
+    }
+
+    // ---------------------------------- block aggregation: covered assembly and the worker arm
+
+    use crate::storage::fixtures::{env, make_block_unchecked, HC};
+    use shrugg_core::ledger::aggregation::{AggregationConfig, AggregationError};
+    use shrugg_core::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
+    use shrugg_core::types::{CoveredBundle, DeclaredShape};
+
+    /// The fixture proof's declared shape as the ledger's mirror type (profile `Test`).
+    fn fixture_shape(p: &shrugg_zkvm::machine::Proof) -> DeclaredShape {
+        DeclaredShape {
+            profile: shrugg_core::types::FriProfile::Test,
+            tier: p.tier.0 as u8,
+            program_log_height: p.program_log_height,
+            input_log_height: p.input_log_height,
+            keccak_log_height: p.keccak_log_height,
+            sha256_log_height: p.sha256_log_height,
+            public_log_height: p.public_log_height,
+            mem_log_height: p.mem_log_height,
+        }
+    }
+
+    /// The fixture bundle's guest digest as a `Hash`: its `HC0..7` public values are the eight
+    /// little-endian `u32` words of it.
+    fn fixture_hc(p: &shrugg_zkvm::machine::Proof) -> Hash {
+        let words: [u32; 8] = std::array::from_fn(|k| {
+            u32::try_from(p.public_values[shrugg_core::types::pv::HC0 + k]).expect("a guest digest word is u32-range")
+        });
+        Hash(shrugg_core::notes::word8_to_bytes(&words))
+    }
+
+    fn agg_cfg(shape: DeclaredShape, hc: Hash) -> AggregationConfig {
+        AggregationConfig {
+            bond: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            max_covers: 3,
+            subsidy_base: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![shrugg_core::ledger::aggregation::AdmittedShape {
+                shape,
+                hc,
+                aggregate_program_digest: [1; 4],
+            }],
+        }
+    }
+
+    fn aggregate_tx(chain_id: u64, kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
+        let aggregator = kp.public_key().address();
+        let r = [9; 8];
+        let signature =
+            kp.sign(aggregate_signing_hash(chain_id, nonce, time, &r, &covers, &Hash::digest(&proof)).as_bytes());
+        Transaction {
+            chain_id,
+            bundle: None,
+            action: shrugg_core::types::Action::Aggregate {
+                covers,
+                proof,
+                aggregator,
+                nonce,
+                time,
+                r,
+                envelope: env(9),
+                signature,
+            },
+        }
+    }
+
+    /// Register `kp` as an aggregator on a stub-executor ledger: the registration bundle burns
+    /// exactly the bond, its stub proof publishing the digest the ledger recomputes.
+    fn register_aggregator(l: &mut Ledger, kp: &Keypair, bond: u64) {
+        let mut b = shrugg_core::notes::Bundle {
+            anchor: l.root(),
+            nullifiers: [[1; 8], [2; 8]],
+            commitments: [[3; 8], [4; 8]],
+            fee: gas::BUNDLE_BASE,
+            burn: bond,
+            asset: 0,
+            time: l.height() as u32,
+            envelopes: [env(1), env(2)],
+            proof: vec![],
+        };
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; shrugg_core::notes::KEM_EK_BYTES] };
+        let registration = AggregatorRegistration {
+            public_key: kp.public_key().clone(),
+            payout: payout.clone(),
+            signature: kp.sign(aggregator_register_message(l.chain_id(), &payout).as_bytes()),
+        };
+        let tx = Transaction::shielded(l.chain_id(), b, shrugg_core::types::Action::RegisterAggregator { registration });
+        let proposer = *l.validators().keys().next().unwrap();
+        l.apply_tx(&tx, &proposer, &StubExecutor).unwrap();
+    }
+
+    /// A chain whose block 1 carries two transactions: a bundle whose proof is a real fixture
+    /// proof, and a bundle-less mint. The block is built `unchecked` (a stub-executor chain
+    /// cannot apply a real proof); the ledger the commit is balanced against applies the stub
+    /// twins — the same commitments and nullifiers, so the note bookkeeping matches.
+    fn chain_with_a_real_proof() -> (tempfile::TempDir, Storage, GenesisState, Transaction, Transaction) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![], 2);
+        storage.init_genesis(&gs).unwrap();
+
+        // The stored set: the fixture-proof bundle and the mint.
+        let mut covered_tx = bundle_tx(&gs.ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
+        covered_tx.bundle.as_mut().unwrap().proof = crate::agg_executor::fixture_proof(0).to_bytes();
+        let mint_tx = Transaction::mint(7, [31; 8], env(3), 1000, &key(1));
+        // The applied set: identical apart from the bundle's proof, which is the stub's.
+        let stub_tx = bundle_tx(&gs.ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
+        let mut ledger_after = gs.ledger.clone();
+        ledger_after.set_height(1);
+        ledger_after.set_timestamp_ms(1);
+        ledger_after
+            .apply_transactions(&[stub_tx, mint_tx.clone()], &key(1).address(), &StubExecutor)
+            .unwrap();
+        ledger_after.record_anchor(1);
+
+        let b1 = make_block_unchecked(&gs.block, &ledger_after, vec![covered_tx.clone(), mint_tx.clone()], &key(1));
+        storage.commit(std::slice::from_ref(&b1), &ledger_after, &[], &StubExecutor).unwrap();
+        (dir, storage, gs, covered_tx, mint_tx)
+    }
+
+    /// Assembly reads the store (spec §3.2): the covered bundle's 34 public values and its
+    /// declared shape come back off the stored proof's header, the profile filled from the chain.
+    #[test]
+    fn assembly_reads_the_stored_bundle_records() {
+        let (_d, storage, _gs, covered_tx, _mint) = chain_with_a_real_proof();
+        let proof = crate::agg_executor::fixture_proof(0);
+        let covered =
+            assemble_covered(&storage, 1, 256, shrugg_core::types::FriProfile::Test, &[covered_tx.hash()]).unwrap();
+        assert_eq!(covered.len(), 1);
+        let expected: [u64; 34] = proof.public_values.clone().try_into().unwrap();
+        assert_eq!(covered[0], CoveredBundle { public_values: expected, shape: fixture_shape(&proof) });
+    }
+
+    /// The coverability refusals: a hash no committed transaction has, a transaction with no
+    /// bundle, and a block scrolled out of the window — each named.
+    #[test]
+    fn assembly_refuses_the_unknown_the_bundle_less_and_the_window_expired() {
+        let (_d, storage, _gs, covered_tx, mint_tx) = chain_with_a_real_proof();
+        let unknown = Hash::digest(b"nobody committed this");
+        assert_eq!(
+            assemble_covered(&storage, 1, 256, shrugg_core::types::FriProfile::Test, &[unknown]),
+            Err(shrugg_core::TxError::Aggregation(AggregationError::UnknownCover(unknown)))
+        );
+        assert_eq!(
+            assemble_covered(&storage, 1, 256, shrugg_core::types::FriProfile::Test, &[mint_tx.hash()]),
+            Err(shrugg_core::TxError::Aggregation(AggregationError::CoverNotABundle(mint_tx.hash())))
+        );
+        // Height 1 is inside the window at head 200 and out of it at head 300 (window 256).
+        let hash = covered_tx.hash();
+        assert!(
+            assemble_covered(&storage, 200, 256, shrugg_core::types::FriProfile::Test, &[hash]).is_ok(),
+            "height 1 + 256 > 200 is inside"
+        );
+        assert_eq!(
+            assemble_covered(&storage, 300, 256, shrugg_core::types::FriProfile::Test, &[hash]),
+            Err(shrugg_core::TxError::Aggregation(AggregationError::CoverOutsideWindow {
+                cover: hash,
+                block: 1,
+                head: 300
+            }))
+        );
+    }
+
+    /// The worker arm's ordering (cheap before expensive, and bytes before storage): the wire
+    /// caps and the chain id refuse before a single cover is looked up, an ungated chain names
+    /// the gate, and anything that is not an aggregate is the ledger's own `validate`.
+    #[test]
+    fn validate_for_pool_preflights_before_any_storage_read() {
+        let (_d, storage, gs, _covered, _mint) = chain_with_a_real_proof();
+        let kp = key(7);
+        let mut gated = gs.ledger.clone();
+        gated.set_aggregation(Some(agg_cfg(
+            fixture_shape(&crate::agg_executor::fixture_proof(0)),
+            fixture_hc(&crate::agg_executor::fixture_proof(0)),
+        )));
+        // Wrong chain id *and* an unknown cover: the byte verdict must come first.
+        let tx = aggregate_tx(99, &kp, 0, 1, vec![Hash::digest(b"unknown")], b"ok".to_vec());
+        match validate_for_pool(&tx, &gated, &storage, shrugg_core::types::FriProfile::Test, &StubExecutor) {
+            Err(shrugg_core::TxError::WrongChain { expected: 7, actual: 99 }) => {}
+            other => panic!("the preflight's WrongChain must precede assembly, got {other:?}"),
+        }
+        // Ungated: the gate is the preflight's first check.
+        let tx = aggregate_tx(7, &kp, 0, 1, vec![], b"ok".to_vec());
+        assert_eq!(
+            validate_for_pool(&tx, &gs.ledger, &storage, shrugg_core::types::FriProfile::Test, &StubExecutor),
+            Err(shrugg_core::TxError::UnsupportedAction("aggregation"))
+        );
+        // Not an aggregate: delegated. A valid mint validates; a forged one is the ledger's answer.
+        let mint = Transaction::mint(7, [41; 8], env(4), 1000, &key(1));
+        assert!(
+            validate_for_pool(&mint, &gs.ledger, &storage, shrugg_core::types::FriProfile::Test, &StubExecutor).is_ok()
+        );
+    }
+
+    /// End to end through the worker arm: the stored fixture bundle assembled, the ledger's
+    /// nine steps against it, and a well-formed aggregate admitted.
+    #[test]
+    fn validate_for_pool_admits_a_well_formed_aggregate_end_to_end() {
+        let (_d, storage, gs, covered_tx, _mint) = chain_with_a_real_proof();
+        let proof = crate::agg_executor::fixture_proof(0);
+        let cfg = agg_cfg(fixture_shape(&proof), fixture_hc(&proof));
+        let mut ledger = gs.ledger.clone();
+        ledger.set_aggregation(Some(cfg.clone()));
+        ledger.set_height(1);
+        let kp = key(7);
+        register_aggregator(&mut ledger, &kp, cfg.bond);
+
+        let tx = aggregate_tx(7, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        validate_for_pool(&tx, &ledger, &storage, shrugg_core::types::FriProfile::Test, &StubExecutor)
+            .expect("a well-formed aggregate over a stored bundle validates");
+        // And the state-dependent verdicts come off the snapshot: a wrong nonce is the
+        // register's answer, not assembly's.
+        let tx = aggregate_tx(7, &kp, 5, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        match validate_for_pool(&tx, &ledger, &storage, shrugg_core::types::FriProfile::Test, &StubExecutor) {
+            Err(shrugg_core::TxError::Aggregation(AggregationError::BadNonce { expected: 0, actual: 5 })) => {}
+            other => panic!("expected BadNonce, got {other:?}"),
+        }
     }
 
     // ------------------------------------------------------- sync batch wire budget

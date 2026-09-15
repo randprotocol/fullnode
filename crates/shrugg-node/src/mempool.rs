@@ -9,10 +9,11 @@
 //! ever be included and carrying the other only wastes the proposer's block space and a
 //! (~20 ms) proof verification per gossip round. Some of those commitments are not in the
 //! transaction at all: the notes the *ledger* creates — a `Withdraw`'s deposit, whose owner is
-//! the payout address in the register, and a `BridgeAttest`'s, whose amount and asset come from
-//! the attestation and the registry. Two of either can collide over one note just as two bundles
-//! can collide over an output, so `Ledger::derived_commitment` answers for both and the pool
-//! claims what it answers.
+//! the payout address in the register, a `BridgeAttest`'s, whose amount and asset come from
+//! the attestation and the registry, and an `Aggregate`'s payout (spec §4 step 5), whose amount
+//! is the subsidy the block would pay. Two of either can collide over one note just as two
+//! bundles can collide over an output, so `Ledger::derived_commitment` answers for all three
+//! and the pool claims what it answers.
 
 use shrugg_core::bridge::BridgeError;
 use shrugg_core::confidential::ConfidentialExecutor;
@@ -41,34 +42,37 @@ pub enum MempoolError {
 }
 
 /// What a transaction claims of the pool, as [`Mempool::precheck`] worked it out: the commitments
-/// it creates — including the note the *ledger* would derive for a `Withdraw` or a `BridgeAttest`,
-/// which is not on the wire — and the `(validator, nonce)` register slot it takes, if any.
+/// it creates — including the note the *ledger* would derive for a `Withdraw`, a `BridgeAttest`
+/// or an `Aggregate`'s payout, which is not on the wire — and the register nonce slot it takes,
+/// if any.
 ///
 /// Returned rather than recomputed because the derivation costs a note hash and a registry lookup,
 /// and because the caller that pools the transaction is not always the one that screened it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claims {
     pub commitments: Vec<Word8>,
-    /// See [`claimed_nonce`]: `None` for every action but a bundle-less `Unbond` or `Withdraw`.
+    /// See [`claimed_nonce`]: `None` for every action but a bundle-less `Unbond` or `Withdraw`,
+    /// or an `Aggregate`.
     pub claim: Option<(Address, u64)>,
 }
 
 /// A pooled transaction and the commitments it claims.
 ///
 /// The claims are remembered rather than recomputed because one of them is not on the wire: the
-/// note a `Withdraw` or a `BridgeAttest` makes the ledger create comes from the register or the
-/// asset registry, via `Ledger::derived_commitment`, so a transaction leaving the pool could not
-/// name it again without a ledger to hand.
+/// note a `Withdraw`, a `BridgeAttest` or an `Aggregate` makes the ledger create comes from the
+/// register or the asset registry, via `Ledger::derived_commitment`, so a transaction leaving
+/// the pool could not name it again without a ledger to hand.
 struct Pooled {
     tx: Transaction,
     commitments: Vec<Word8>,
-    /// The `(validator, nonce)` this transaction claims, for an `Unbond` or `Withdraw` — see
-    /// [`claimed_nonce`].
+    /// The register nonce this transaction claims, for an `Unbond`, a `Withdraw` or an
+    /// `Aggregate` — see [`claimed_nonce`].
     claim: Option<(Address, u64)>,
 }
 
-/// The register nonce a bundle-less `Unbond` or `Withdraw` claims, `None` for every other
-/// action. Two pooled transactions can never both apply at the same nonce — the register accepts
+/// The register nonce a bundle-less `Unbond` or `Withdraw` claims — and an `Aggregate`'s
+/// `(aggregator, nonce)`, one register over (spec §4 step 5) — `None` for every other action.
+/// Two pooled transactions can never both apply at the same nonce — the register accepts
 /// only the one matching its current nonce — so this is a pool-level claim exactly like a
 /// commitment: at most one pooled transaction may hold it.
 fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
@@ -76,6 +80,7 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         Action::Unbond { validator, nonce, .. } | Action::Withdraw { validator, nonce, .. } => {
             Some((*validator, *nonce))
         }
+        Action::Aggregate { aggregator, nonce, .. } => Some((*aggregator, *nonce)),
         _ => None,
     }
 }
@@ -87,6 +92,17 @@ fn claim_conflict_key(validator: &Address) -> Word8 {
     word8_from_bytes(validator.as_bytes()).expect("an address is exactly 32 bytes, like a Word8")
 }
 
+/// The claims map's key: the register the nonce belongs to, so one keypair's two roles — a
+/// validator's `Unbond` and an aggregator's `Aggregate` at the same nonce — never collide over
+/// a slot the two registers do not share (chain-9 runs both roles on the same ops keys).
+fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
+    let role = match action {
+        Action::Aggregate { .. } => 1u8,
+        _ => 0,
+    };
+    (role, claim.0, claim.1)
+}
+
 pub struct Mempool {
     txs: HashMap<Hash, Pooled>,
     /// Which pooled transaction spends each nullifier — one owner per nullifier, always.
@@ -94,9 +110,10 @@ pub struct Mempool {
     /// Which pooled transaction creates each commitment: a bundle's two output slots, a mint's
     /// single note, or the deposit a `Withdraw` or a `BridgeAttest` will make the ledger create.
     commitments: HashMap<Word8, Hash>,
-    /// Which pooled transaction claims each validator's next register action — an `Unbond` or
-    /// `Withdraw`'s `(validator, nonce)`, keyed the same way `commitments` claims a note.
-    claims: HashMap<(Address, u64), Hash>,
+    /// Which pooled transaction claims each register's next action — an `Unbond` or `Withdraw`'s
+    /// `(validator, nonce)`, an `Aggregate`'s `(aggregator, nonce)` — keyed by register and
+    /// address the same way `commitments` claims a note (see [`claim_key`]).
+    claims: HashMap<(u8, Address, u64), Hash>,
     /// Which pooled transaction consumes each bridge attestation digest. A digest is spendable
     /// once, like a nullifier, but it is not a field of the transaction — see
     /// `Transaction::bridge_digests`.
@@ -194,7 +211,7 @@ impl Mempool {
         }
         let claim = claimed_nonce(&tx.action);
         if let Some(claim) = claim {
-            if self.claims.contains_key(&claim) {
+            if self.claims.contains_key(&claim_key(&tx.action, &claim)) {
                 return Err(MempoolError::Conflict(claim_conflict_key(&claim.0)));
             }
         }
@@ -269,7 +286,7 @@ impl Mempool {
             self.commitments.insert(*cm, hash);
         }
         if let Some(claim) = claim {
-            self.claims.insert(claim, hash);
+            self.claims.insert(claim_key(&tx.action, &claim), hash);
         }
         for mu in tx.bridge_digests() {
             self.digests.insert(mu, hash);
@@ -327,6 +344,15 @@ impl Mempool {
         claim: Option<(Address, u64)>,
         ledger: &Ledger,
     ) -> Result<(), TxError> {
+        // An `Aggregate`'s byte-level checks (spec §4 step 1) come before any register state,
+        // here exactly as they do in the worker's `validate_for_pool`: a wrong chain id or an
+        // oversized part is a verdict about the bytes — cacheable the moment it is answered
+        // (`admission::is_permanent`) — and it must not be pre-empted by the register's
+        // state-dependent answers below. The same argument the attestation size cap makes for
+        // running in this pre-screen at all.
+        if matches!(tx.action, Action::Aggregate { .. }) {
+            ledger.preflight_aggregate(tx)?;
+        }
         if let Some(b) = &tx.bundle {
             if !ledger.is_anchor(&b.anchor) {
                 return Err(TxError::UnknownAnchor);
@@ -336,8 +362,9 @@ impl Mempool {
             }
         }
         // A bundle-less `Withdraw` (S2) carries a `time` of its own, under the same window rule —
-        // so it goes stale here the same way a bundle does (`Ledger::time_in_window`).
-        if let Action::Withdraw { time, .. } = &tx.action {
+        // so it goes stale here the same way a bundle does (`Ledger::time_in_window`). An
+        // `Aggregate`'s payout note's `time` (spec §4 step 3) is the same promise, one action over.
+        if let Action::Withdraw { time, .. } | Action::Aggregate { time, .. } = &tx.action {
             if !ledger.time_in_window(*time) {
                 return Err(TxError::TimeOutOfWindow { time: *time, height: ledger.height() });
             }
@@ -391,14 +418,26 @@ impl Mempool {
         // register's nonce is the only thing that can make it stale. Once the validator's nonce
         // has moved past the one this transaction signed over, it can never apply again (the
         // register does not rewind), so it has to leave here rather than sit in every pool
-        // (and every proposal's trial-apply) until the node restarts.
-        if let Some((validator, nonce)) = claim {
-            match ledger.validators().get(&validator).map(|e| e.nonce) {
-                Some(current) if current == nonce => {}
-                Some(current) => {
-                    return Err(TxError::Staking(StakingError::BadNonce { expected: current, actual: nonce }))
+        // (and every proposal's trial-apply) until the node restarts. An `Aggregate`'s claim is
+        // the aggregator register's nonce, so it is read there (spec §4 step 5).
+        if let Some((addr, nonce)) = claim {
+            if matches!(tx.action, Action::Aggregate { .. }) {
+                use shrugg_core::ledger::aggregation::AggregationError;
+                match ledger.aggregators().get(&addr).map(|e| e.nonce) {
+                    Some(current) if current == nonce => {}
+                    Some(current) => {
+                        return Err(TxError::Aggregation(AggregationError::BadNonce { expected: current, actual: nonce }))
+                    }
+                    None => return Err(TxError::Aggregation(AggregationError::UnknownAggregator(addr))),
                 }
-                None => return Err(TxError::Staking(StakingError::UnknownValidator(validator))),
+            } else {
+                match ledger.validators().get(&addr).map(|e| e.nonce) {
+                    Some(current) if current == nonce => {}
+                    Some(current) => {
+                        return Err(TxError::Staking(StakingError::BadNonce { expected: current, actual: nonce }))
+                    }
+                    None => return Err(TxError::Staking(StakingError::UnknownValidator(addr))),
+                }
             }
         }
         let nullifiers = tx.nullifiers();
@@ -444,8 +483,9 @@ impl Mempool {
             }
         }
         if let Some(claim) = p.claim {
-            if self.claims.get(&claim) == Some(hash) {
-                self.claims.remove(&claim);
+            let key = claim_key(&p.tx.action, &claim);
+            if self.claims.get(&key) == Some(hash) {
+                self.claims.remove(&key);
             }
         }
         for mu in p.tx.bridge_digests() {
@@ -1182,4 +1222,112 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert_eq!(m.candidates(&l, 10).len(), 2, "and both are offered to the proposer");
     }
+
+    /// The aggregate's pool claims (spec §4 step 5): the derived payout note is claimed the way
+    /// a `BridgeAttest`'s is, and the `(aggregator, nonce)` the way an `Unbond`'s register nonce
+    /// is — keyed by register, so one keypair's two roles never collide over a shared slot.
+    #[test]
+    fn an_aggregate_claims_its_payout_note_and_its_aggregator_nonce() {
+        use shrugg_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use shrugg_core::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
+        use shrugg_core::types::{DeclaredShape, FriProfile};
+
+        let kp = fixtures::key(1); // the fixture chain's one validator — and its aggregator.
+        let addr = kp.public_key().address();
+        let shape = DeclaredShape {
+            profile: FriProfile::Test,
+            tier: 14,
+            program_log_height: 13,
+            input_log_height: 12,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 2,
+            mem_log_height: 18,
+        };
+        let bond = 100 * shrugg_core::UNITS_PER_SHRUGG;
+        let mut l = ledger();
+        l.set_aggregation(Some(AggregationConfig {
+            bond,
+            max_covers: 3,
+            subsidy_base: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![AdmittedShape { shape, hc: Hash::digest(b"guest"), aggregate_program_digest: [1; 4] }],
+        }));
+        // Register the aggregator, through a bond-burning bundle with a stub proof.
+        let mut b = shrugg_core::notes::Bundle {
+            anchor: l.root(),
+            nullifiers: [nf(1), nf(2)],
+            commitments: [cm(1), cm(2)],
+            fee: fixtures::bundle_fee(),
+            burn: bond,
+            asset: 0,
+            time: l.height() as u32,
+            envelopes: [fixtures::env(1), fixtures::env(2)],
+            proof: vec![],
+        };
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d);
+        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; shrugg_core::notes::KEM_EK_BYTES] };
+        let registration = AggregatorRegistration {
+            public_key: kp.public_key().clone(),
+            payout: payout.clone(),
+            signature: kp.sign(aggregator_register_message(1, &payout).as_bytes()),
+        };
+        let register = Transaction::shielded(1, b, Action::RegisterAggregator { registration });
+        l.apply_tx(&register, &fixtures::key(1).address(), &StubExecutor).unwrap();
+
+        let aggregate = |covers: Vec<Hash>, nonce: u64, r: Word8| {
+            let proof = b"ok".to_vec();
+            Transaction {
+                chain_id: 1,
+                bundle: None,
+                action: Action::Aggregate {
+                    covers: covers.clone(),
+                    proof: proof.clone(),
+                    aggregator: addr,
+                    nonce,
+                    time: 0,
+                    r,
+                    envelope: fixtures::env(3),
+                    signature: kp.sign(
+                        aggregate_signing_hash(1, nonce, 0, &r, &covers, &Hash::digest(&proof)).as_bytes(),
+                    ),
+                },
+            }
+        };
+
+        let mut m = Mempool::new(10);
+        let tx1 = aggregate(vec![Hash::digest(b"cover a")], 0, [9; 8]);
+        let claims = m.precheck(&tx1, &l, &StubExecutor).unwrap();
+        assert_eq!(claims.claim, Some((addr, 0)), "the aggregator's nonce slot is claimed");
+        let payout_cm = l.derived_commitment(&tx1.action, &StubExecutor).expect("the payout note derives");
+        assert_eq!(claims.commitments, vec![payout_cm], "and the payout note is the commitment claim");
+        m.insert_verified(tx1.clone(), &l, &StubExecutor).unwrap();
+
+        // The same aggregator at the same nonce, whatever it covers: a conflict over the slot.
+        let tx2 = aggregate(vec![Hash::digest(b"cover b")], 0, [10; 8]);
+        assert_eq!(
+            m.precheck(&tx2, &l, &StubExecutor),
+            Err(MempoolError::Conflict(claim_conflict_key(&addr)))
+        );
+        // The same keypair's *validator* unbond at nonce 0: a different register, no collision.
+        let unbond = Transaction {
+            chain_id: 1,
+            bundle: None,
+            action: Action::Unbond {
+                validator: addr,
+                amount: shrugg_core::ledger::staking::MIN_STAKE,
+                nonce: 0,
+                signature: kp.sign(
+                    shrugg_core::types::unbond_message(1, &addr, shrugg_core::ledger::staking::MIN_STAKE, 0).as_bytes(),
+                ),
+            },
+        };
+        assert!(
+            m.precheck(&unbond, &l, &StubExecutor).is_ok(),
+            "one keypair's two roles must not collide over a shared address and nonce"
+        );
+    }
+
 }

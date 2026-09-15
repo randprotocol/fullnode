@@ -46,3 +46,18 @@ pub struct CoveredBundle {
     pub public_values: [u64; 34],
     pub shape: DeclaredShape,
 }
+
+/// The zkVM's public-value layout (`shrugg_zkvm::tables::cpu::pv`), mirrored so the ledger
+/// never names a zkvm type — [`FriProfile`]'s discipline, one level down. The constraint-set-6
+/// values: `PC_ENTRY, TIER, OUT0..7, HC0..7, IN0..7, PUB0..7`, 34 in all. A test on the zkvm
+/// side pins these to the real constants, so a constraint-set change that moves the layout
+/// fails there, not silently here.
+pub mod pv {
+    pub const PC_ENTRY: usize = 0;
+    pub const TIER: usize = 1;
+    pub const OUT0: usize = 2;
+    pub const HC0: usize = OUT0 + 8;
+    pub const IN0: usize = HC0 + 8;
+    pub const PUB0: usize = IN0 + 8;
+    pub const NUM: usize = PUB0 + 8;
+}

@@ -66,6 +66,10 @@ pub struct Supply {
     /// out, so it appears on the right of the audit's identity (`total_supply == issued −
     /// slashed`).
     pub slashed: u64,
+    /// The count of sealed blocks — blocks carrying an included `Aggregate` (spec §5.1's `n`).
+    /// The subsidy schedule reads it; Task 5 increments it at the aggregate's apply, so on a
+    /// chain that has sealed nothing it is 0 and the subsidy is `subsidy_base`.
+    pub sealed_blocks: u64,
 }
 
 impl Supply {

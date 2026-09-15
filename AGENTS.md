@@ -34,6 +34,37 @@ user's 2026-09-15 ruling. ② A fleet GPU node (Linux, R580+, CUDA 13, LLVM 21, 
 device, ≥ 160 GB host) for the rVM CUDA backend's PTX build and the production N re-measurement
 (M5.4's only open tasks, T3/T4).
 
+### Block aggregation, Tasks 1–4 (2026-09-15, `aggregation-spec` branch): the rVM vendored, admission live
+
+The block-aggregation plan (`docs/superpowers/plans/2026-09-15-block-aggregation.md`, ten
+tasks) is landing task-by-task on `aggregation-spec`. State and traps a later session needs:
+
+- `crates/shrugg-rvm/` is **vendored** from `circuits/recursion` (pin `271679d`) by
+  `deploy/sync-zkvm.sh`'s recursion section (`RVM_SRC` env override) — never hand-edit it; the
+  same two-step `rand_zkvm → shrugg_zkvm` rename as the research section makes the two
+  vendored crates' `Proof` types one type. Re-running the script re-vendors both sections.
+- **The crate cycle decides where executor code lives**: `shrugg-rvm → shrugg-zkvm`, so
+  `ZkExecutor` cannot touch the rVM. Its three aggregate arms return
+  `ConfidentialError::AggregationUnsupported`; the real implementation is
+  `shrugg_node::agg_executor::AggExecutor`, which `node::executor_for_profile` always wraps.
+  `AggregationUnsupported`/`BadDeclaredShape` are never permanent admission verdicts.
+- `shrugg_core::types::pv` **mirrors** the zkVM's `pv` layout (core cannot name zkvm types);
+  `shrugg-zkvm/src/executor.rs`'s test pins mirror == real.
+- Interims by design until the later tasks land: `validate_inner`/`apply_tx` refuse
+  `Action::Aggregate` with `TxError::AggregateNeedsCovered` (a proposer's trial-apply skips
+  pooled aggregates; no block can carry one until T6's covered pre-pass); admission runs
+  through `Ledger::validate_aggregate`/`apply_aggregate` with the covered records assembled
+  node-side (`node::assemble_covered`, from CF_TXS); the payout amount is `subsidy(0)` (no
+  excess buckets, `sealed_blocks` unincremented) until T5.
+- **Gate gap this branch already fell into once**: `cargo test -p shrugg-node --lib` compiles
+  neither `src/main.rs` nor `tests/`, so T1's new `Genesis` field silently broke both. Fixed
+  in T3/T4; run `cargo check --tests` (or the T10 full suite) before trusting a `--lib`-only
+  gate after touching shared types.
+- Recursion-heavy tests stay out of gates: `cargo test --release -p shrugg-rvm -- --skip
+  round_trips --skip two_test_profile` with `RECURSION_FIXTURES` pointing at a recursion
+  fixture cache (the conformance vectors ride on the fixtures' random notes — the cache that
+  produced `circuits/recursion/docs/02-aggregate.md`'s pins reproduces them byte-for-byte).
+
 ### Constraint set 6 re-vendor (2026-09-14, upstream 0200877): the public input segment, carrying M4.3 + M4.4
 
 `crates/shrugg-zkvm/` is re-vendored to `research`'s constraint-set-6 merge (the public input

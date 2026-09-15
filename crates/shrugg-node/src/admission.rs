@@ -102,6 +102,30 @@ impl RefusedCache {
 /// policy knob, unlike a chain id or a guest commitment, and a mint is cheap to re-refuse; nothing
 /// is gained by caching it and the conservative side of this line is the safe one.
 pub fn is_permanent(e: &TxError) -> bool {
+    // The aggregation register's verdicts, split like `Staking`'s: the byte-verdicts (and the
+    // ones against genesis-pinned constants) are cacheable, the register's state is not. A
+    // signature is over the transaction's own fields against the entry's key — and an address
+    // *is* its key's address, so no re-registration can ever make a bad signature a good one.
+    // `UnregisteredShape`/`CoveredShapeMismatch`/`CoveredGuestMismatch` judge the covered
+    // bundles against the admitted shapes, which are genesis constants. `CoverNotABundle` is a
+    // statement about a *committed* — finalised, immutable — transaction's shape. Everything
+    // else (`UnknownAggregator`, `Unbonding`, `BadNonce`, the payout's `CommitmentExists`,
+    // `UnknownCover`, `CoverOutsideWindow`, `CoverStoreCorrupt`, the register actions' own
+    // verdicts) moves with this node's state and stays out.
+    if let TxError::Aggregation(a) = e {
+        use shrugg_core::ledger::aggregation::AggregationError as A;
+        return matches!(
+            a,
+            A::BadSignature
+                | A::EmptyCoverSet
+                | A::TooManyCovers { .. }
+                | A::DuplicateCover(_)
+                | A::UnregisteredShape(_)
+                | A::CoveredShapeMismatch { .. }
+                | A::CoveredGuestMismatch(_)
+                | A::CoverNotABundle(_)
+        );
+    }
     matches!(
         e,
         // The proofs and the digest are over the transaction's own fields.
@@ -124,6 +148,11 @@ pub fn is_permanent(e: &TxError) -> bool {
             // this node's state is consulted, so it is as permanent as a size cap gets.
             | TxError::TransactionTooLarge(_)
             | TxError::ProgramTooLarge
+            // The aggregate action's wire cap is a byte length, and its proof's verdicts are
+            // against genesis-pinned artifacts (the registered shapes and the aggregate
+            // program), exactly `InvalidBundleProof`'s argument.
+            | TxError::AggregateTooLarge(_)
+            | TxError::InvalidAggregateProof(_)
             // A transaction colliding with *itself* — no other transaction and no state involved.
             | TxError::DuplicateNullifierInBundle
             | TxError::DuplicateCommitmentInBundle
@@ -404,6 +433,40 @@ mod tests {
         let mut c = RefusedCache::new(4);
         c.insert(h(1), TxError::UnknownAnchor);
         assert_eq!(c.len(), 0);
+    }
+
+    /// The aggregate verdicts, split: the byte-verdicts and the genesis-constant ones are
+    /// cached, the register's and the window's state is not.
+    #[test]
+    fn aggregate_verdicts_are_cached_only_when_they_are_about_the_bytes() {
+        use shrugg_core::ledger::aggregation::AggregationError as A;
+        let agg = |a: A| TxError::Aggregation(a);
+        for e in [
+            agg(A::BadSignature),
+            agg(A::EmptyCoverSet),
+            agg(A::TooManyCovers { got: 4, max: 3 }),
+            agg(A::DuplicateCover(h(1))),
+            agg(A::UnregisteredShape(h(2))),
+            agg(A::CoveredShapeMismatch { cover: h(3), field: "tier", expected: 14, actual: 15 }),
+            agg(A::CoveredGuestMismatch(h(4))),
+            agg(A::CoverNotABundle(h(5))),
+            TxError::AggregateTooLarge(9_000_000),
+            TxError::InvalidAggregateProof(ConfidentialError::MalformedProof),
+        ] {
+            assert!(is_permanent(&e), "{e} is a statement about the bytes or genesis constants");
+        }
+        for e in [
+            agg(A::UnknownAggregator(Address([9; 32]))),
+            agg(A::Unbonding(Address([9; 32]))),
+            agg(A::BadNonce { expected: 1, actual: 0 }),
+            agg(A::UnknownCover(h(6))),
+            agg(A::CoverOutsideWindow { cover: h(7), block: 1, head: 300 }),
+            agg(A::CoverStoreCorrupt(h(8))),
+            // The covered-carrying path's signpost is not a verdict on the transaction at all.
+            TxError::AggregateNeedsCovered,
+        ] {
+            assert!(!is_permanent(&e), "{e} depends on state and must not be cached");
+        }
     }
 
     /// The shipped policy, pinned: 8192 entries against a 10 000-transaction pool, and a burst of 16

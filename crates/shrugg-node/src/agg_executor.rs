@@ -163,30 +163,32 @@ impl ConfidentialExecutor for AggExecutor {
     }
 }
 
+/// A recursion fixture cache proof (`$RECURSION_FIXTURES/{profile}-{k}.proof`: a 32-byte `hc`
+/// then the postcard `shrugg_zkvm::machine::Proof`). The conformance discipline needs the
+/// *doc's* fixtures — the 107-word interface list rides on their random notes — so a missing
+/// cache is a loud failure, not a skip: set `RECURSION_FIXTURES` to a checkout's
+/// `recursion/target/recursion-fixtures`. `pub(crate)` so `node`'s covered-assembly tests can
+/// store a bundle carrying a real proof.
+#[cfg(test)]
+pub(crate) fn fixture_proof(k: usize) -> shrugg_zkvm::machine::Proof {
+    let dir = std::env::var_os("RECURSION_FIXTURES")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/recursion-fixtures"));
+    let path = dir.join(format!("Test-{k}.proof"));
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e} — the aggregation tests need a recursion fixture cache; \
+             set RECURSION_FIXTURES (docs/aggregation.md)",
+            path.display()
+        )
+    });
+    postcard::from_bytes(&bytes[32..]).expect("a fixture proof decodes")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use shrugg_core::types::FriProfile as CoreProfile;
-
-    /// A recursion fixture cache proof (`$RECURSION_FIXTURES/{profile}-{k}.proof`: a 32-byte
-    /// `hc` then the postcard `shrugg_zkvm::machine::Proof`). The conformance discipline needs
-    /// the *doc's* fixtures — the 107-word interface list rides on their random notes — so a
-    /// missing cache is a loud failure, not a skip: set `RECURSION_FIXTURES` to a checkout's
-    /// `recursion/target/recursion-fixtures`.
-    fn fixture_proof(k: usize) -> shrugg_zkvm::machine::Proof {
-        let dir = std::env::var_os("RECURSION_FIXTURES")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/recursion-fixtures"));
-        let path = dir.join(format!("Test-{k}.proof"));
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
-            panic!(
-                "{}: {e} — the aggregation tests need a recursion fixture cache; \
-                 set RECURSION_FIXTURES (docs/aggregation.md)",
-                path.display()
-            )
-        });
-        postcard::from_bytes(&bytes[32..]).expect("a fixture proof decodes")
-    }
 
     /// The covered-bundle record admission would assemble for fixture `k`: its declared shape
     /// read off the proof's stored header, and its 34 public values.
@@ -264,6 +266,75 @@ mod tests {
             Err(ConfidentialError::MalformedProof)
         );
     }
+
+    /// The conformance suite (spec §4, and the plan's gate): the admission stub is not trusted
+    /// until the fullnode's recompute reproduces `circuits/recursion/docs/02-aggregate.md`'s
+    /// pinned vectors byte-for-byte — the `inner_vk_digest` (a constant of the fixture shape),
+    /// the 107-word interface list for the 3-proof test-profile fixture set, and its digest.
+    /// The list rides on the fixtures' random notes, so this pins against *this* fixture
+    /// cache, the same one the doc's worked example measured.
+    #[test]
+    fn the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte() {
+        use p3_field::PrimeField64;
+        let hex_words = |words: &[shrugg_rvm::isa::F]| -> String {
+            words.iter().map(|w| format!("{:016x}", w.as_canonical_u64())).collect::<Vec<_>>().join("")
+        };
+        let (shape, _) = covered(0);
+        for k in 1..3 {
+            let (s, _) = covered(k);
+            assert_eq!(s, shape, "the fixture set shares one declared shape");
+        }
+        let vk = AggExecutor::inner_key(&shape).unwrap();
+        // The inner vk digest, a data-independent constant of the shape.
+        assert_eq!(
+            hex_words(&shrugg_rvm::shape::inner_vk_digest(&vk.shape, &vk.key)),
+            "33a94ec690bb7cbe5a3d4564967460996277ac61b539f6525b5fe7f92992a1c8",
+            "the pinned inner_vk_digest"
+        );
+        // The 107-word interface list, built the way admission builds it: from the covered
+        // bundles' 34 public values, in cover order.
+        let pvs: Vec<Vec<u64>> = (0..3).map(|k| covered(k).1.public_values.to_vec()).collect();
+        let list = shrugg_rvm::public_values::interface_words(&vk.shape, &vk.key, &pvs);
+        assert_eq!(list.len(), 4 + 1 + 34 * 3);
+        assert_eq!(hex_words(&list), INTERFACE_LIST_HEX, "the pinned 107-word interface list");
+        assert_eq!(
+            hex_words(&shrugg_rvm::public_values::public_digest(&list)),
+            "9f11f1aeb33546be79efe66a4829dc39c28f49f2ebd0bb055ac8a1a3fe088dcd",
+            "the pinned interface digest"
+        );
+    }
+
+    /// `docs/02-aggregate.md`'s worked example: the 107-word interface list for the 3-proof
+    /// test-profile fixture set, each word the canonical `u64` as 16 lowercase hex chars.
+    const INTERFACE_LIST_HEX: &str = concat!(
+        "33a94ec690bb7cbe5a3d4564967460996277ac61b539f6525b5fe7f92992a1c8",
+        "00000000000000030000000000000000000000000000000e000000005d14ecfe",
+        "00000000ce79a1da0000000049a7f73400000000272b8ab1000000009e349119",
+        "000000007b4352f9000000004895d8b90000000019456d2f000000006f35274a",
+        "000000000371953700000000a8a42560000000004b291c6600000000b7c2de0e",
+        "00000000d6bf7fcf00000000182b470b00000000fb4abd6c000000001b1c6d71",
+        "00000000b3fe016a00000000dbc589840000000064fe382600000000f65a5995",
+        "00000000b50cb2db00000000879d19c4000000007f2a281900000000934a2759",
+        "00000000d5389ac8000000002e612784000000008639ed090000000085f58a21",
+        "000000004448d889000000006bb9c915000000000671dc2c0000000000000000",
+        "000000000000000e0000000074f52033000000008800a94e0000000057a33ba9",
+        "000000001c26c5e4000000008fe213ef000000001ea2ad220000000019b569a6",
+        "00000000937e3135000000006f35274a000000000371953700000000a8a42560",
+        "000000004b291c6600000000b7c2de0e00000000d6bf7fcf00000000182b470b",
+        "00000000fb4abd6c00000000411a8c0500000000cc72996c000000009e3b3c0c",
+        "00000000db272b6300000000003f7555000000000bab78070000000036480e8f",
+        "000000003f87a6e000000000934a275900000000d5389ac8000000002e612784",
+        "000000008639ed090000000085f58a21000000004448d889000000006bb9c915",
+        "000000000671dc2c0000000000000000000000000000000e00000000d8c8a779",
+        "000000001ca1010e00000000997e50da00000000288bb2cb00000000a544b803",
+        "000000009346ee320000000047fe4bfd000000003e98afc0000000006f35274a",
+        "000000000371953700000000a8a42560000000004b291c6600000000b7c2de0e",
+        "00000000d6bf7fcf00000000182b470b00000000fb4abd6c00000000ed62b62b",
+        "000000008dab0ce0000000001523999000000000b36787f2000000000dc6f8bf",
+        "00000000ef9a31bc00000000a19e9ecb00000000bc07b80f00000000934a2759",
+        "00000000d5389ac8000000002e612784000000008639ed090000000085f58a21",
+        "000000004448d889000000006bb9c915000000000671dc2c",
+    );
 
     /// An RV32 bundle proof's bytes are not an rVM aggregate proof: the answer is a named error,
     /// never a panic — even if the postcard bytes happen to decode across the two proof types.

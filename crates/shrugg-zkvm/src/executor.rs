@@ -530,3 +530,23 @@ pub fn prove_bundle(profile: FriProfile, inputs: &[u32], backend: Backend) -> Re
     let (proof, exec) = m.prove_with(backend, program, inputs, &[], None).map_err(|e| format!("{e:?}"))?;
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }
+
+#[cfg(test)]
+mod tests {
+    /// The ledger mirrors this machine's public-value layout as `shrugg_core::types::pv` (it
+    /// cannot name a zkvm type — the dependency points this way). If a constraint-set change
+    /// moves the real layout, this fails here, where both sides are visible, rather than
+    /// silently desynchronising block-aggregation's admission checks.
+    #[test]
+    fn the_ledgers_pv_mirror_matches_the_real_layout() {
+        use crate::tables::cpu::pv as real;
+        use shrugg_core::types::pv as mirror;
+        assert_eq!(mirror::PC_ENTRY, real::PC_ENTRY);
+        assert_eq!(mirror::TIER, real::TIER);
+        assert_eq!(mirror::OUT0, real::OUT0);
+        assert_eq!(mirror::HC0, real::HC0);
+        assert_eq!(mirror::IN0, real::IN0);
+        assert_eq!(mirror::PUB0, real::PUB0);
+        assert_eq!(mirror::NUM, real::NUM);
+    }
+}

@@ -141,6 +141,18 @@ pub enum TxError {
     BadDigest,
     #[error("invalid bundle proof: {0}")]
     InvalidBundleProof(ConfidentialError),
+    /// The whole `Aggregate` action's encoding (block aggregation, spec §3.1's wire cap).
+    #[error("the aggregate action of {0} bytes exceeds the {max} byte cap", max = gas::MAX_AGGREGATE_BYTES)]
+    AggregateTooLarge(usize),
+    /// The aggregate proof failed the executor (spec §4 step 8): the interface-digest compare
+    /// or the rVM's `Machine::verify`.
+    #[error("invalid aggregate proof: {0}")]
+    InvalidAggregateProof(ConfidentialError),
+    /// `Ledger::validate`'s answer to an `Aggregate`: the covered bundles' records live in node
+    /// storage, so admission runs through [`Ledger::validate_aggregate`], the covered-carrying
+    /// path. Never a verdict on the transaction itself.
+    #[error("an aggregate is validated on the covered-carrying path (Ledger::validate_aggregate)")]
+    AggregateNeedsCovered,
     /// Everything the bridge itself refuses: an unknown guardian set, a replayed digest, a
     /// short quorum, an unregistered asset, an unusable destination (spec §10).
     #[error("bridge: {0}")]
@@ -726,6 +738,15 @@ impl Ledger {
             Action::BridgeAttest { attestation, .. } if attestation.len() > gas::MAX_ATTESTATION_BYTES => {
                 return Err(TxError::AttestationTooLarge)
             }
+            // The `Aggregate` action's caps (spec §3.1): the per-field ones every action gets,
+            // then the composite wire cap over the transaction's encoding.
+            Action::Aggregate { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
+                return Err(TxError::EnvelopeTooLarge)
+            }
+            Action::Aggregate { proof, .. } if proof.len() > gas::MAX_PROOF_BYTES => return Err(TxError::ProofTooLarge),
+            Action::Aggregate { .. } if encoded_len > gas::MAX_AGGREGATE_BYTES => {
+                return Err(TxError::AggregateTooLarge(encoded_len))
+            }
             // A burn's second bundle is a bundle: the caps above it are the caps every bundle
             // gets, applied here because `tx.bundle` is only the fee bundle.
             Action::BridgeBurn { asset_bundle, .. }
@@ -840,7 +861,12 @@ impl Ledger {
                 aggregation::validate(self, tx, a, executor)?;
             }
             Action::Aggregate { .. } => {
-                return Err(aggregation::NOT_AGGREGATION);
+                // The covered bundles' records live in node storage, which the ledger cannot
+                // see: admission and application of an aggregate run through
+                // [`Ledger::validate_aggregate`] / [`Ledger::apply_aggregate`], and a proposer's
+                // trial apply takes this arm until Task 6 wires the covered pre-pass into
+                // `apply_block`.
+                return Err(TxError::AggregateNeedsCovered);
             }
         }
         // 8-9. the bundle's digest, then its proof
@@ -937,7 +963,9 @@ impl Ledger {
                 aggregation::apply(self, tx, a, proposer, executor)?;
             }
             Action::Aggregate { .. } => {
-                return Err(aggregation::NOT_AGGREGATION);
+                // Unreachable through `validate_inner` (its action arm refuses first); named
+                // the same so a direct caller hears where aggregates go.
+                return Err(TxError::AggregateNeedsCovered);
             }
         }
         Ok(receipt)

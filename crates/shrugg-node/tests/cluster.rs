@@ -193,6 +193,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         fri_profile: "test".into(),
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
         bridge,
+        aggregation: None,
         epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
     }
 }

@@ -52,6 +52,11 @@ impl TestNode {
 /// A one-validator chain. `hc_bundle` must be this build's own guest, or `node::start` refuses to
 /// run at all.
 fn genesis(key: &Keypair) -> Genesis {
+    genesis_with_aggregation(key, None)
+}
+
+/// `genesis`, with an `aggregation` section when the test is about one.
+fn genesis_with_aggregation(key: &Keypair, aggregation: Option<shrugg_core::ledger::aggregation::AggregationConfig>) -> Genesis {
     Genesis {
         chain_id: 7,
         timestamp_ms: 0,
@@ -71,6 +76,7 @@ fn genesis(key: &Keypair) -> Genesis {
         fri_profile: "test".into(),
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
         bridge: None,
+        aggregation,
         epoch_blocks: shrugg_core::genesis::EPOCH_BLOCKS_DEFAULT,
     }
 }
@@ -78,6 +84,19 @@ fn genesis(key: &Keypair) -> Genesis {
 /// Start that chain's single validator on an ephemeral RPC port. It commits an empty block every
 /// [`FAST`], which is all a head subscription needs.
 pub async fn start_one_validator() -> TestNode {
+    start_one_validator_with(None).await
+}
+
+/// `start_one_validator`, on a chain whose genesis carries an `aggregation` section.
+pub async fn start_one_validator_aggregating(
+    aggregation: shrugg_core::ledger::aggregation::AggregationConfig,
+) -> TestNode {
+    start_one_validator_with(Some(aggregation)).await
+}
+
+async fn start_one_validator_with(
+    aggregation: Option<shrugg_core::ledger::aggregation::AggregationConfig>,
+) -> TestNode {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,shrugg_node=info".into()),
@@ -86,7 +105,7 @@ pub async fn start_one_validator() -> TestNode {
         .try_init();
     let key = Keypair::from_seed([101; 32]).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("genesis.json"), genesis(&key).to_json()).unwrap();
+    std::fs::write(dir.path().join("genesis.json"), genesis_with_aggregation(&key, aggregation).to_json()).unwrap();
     let handle = node::start(NodeConfig {
         datadir: dir.path().to_path_buf(),
         seed: *key.seed(),

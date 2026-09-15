@@ -150,6 +150,11 @@ impl Ledger {
     ///   submitter's claim, and admission holds it to this very index
     ///   (`TxError::AttestAssetMismatch`).
     ///
+    /// The aggregator register's two are alongside, one role over: the `WithdrawAggregator`'s,
+    /// the bond less the base at the entry's payout, and the `Aggregate`'s payout note (spec §4
+    /// step 5), the subsidy the block would pay — both claimed in the mempool before either is
+    /// validated, exactly as the two above.
+    ///
     /// `None` when the action creates no such note, and when this state cannot derive one — an
     /// unknown validator, an amount that does not cover the bundle base, a chain with no bridge, an
     /// attestation over [`gas::MAX_ATTESTATION_BYTES`] (checked before the decode, so a caller
@@ -167,6 +172,12 @@ impl Ledger {
                 // The aggregator's withdraw note derives the same way, one register over: the
                 // bond less the base, at the entry's payout (spec §2.2).
                 super::aggregation::withdraw_note(self, aggregator, *time, r, executor).ok()
+            }
+            Action::Aggregate { aggregator, time, r, .. } => {
+                // The payout note (spec §4 step 5): the subsidy the block would pay, at the
+                // entry's payout, stamped with the action's `time` and blinding — claimed in
+                // the mempool exactly as a `BridgeAttest`'s derived deposit is.
+                super::aggregation::payout_note(self, aggregator, *time, r, executor).ok()
             }
             Action::BridgeAttest { attestation, recipient, r, time, .. } => {
                 // The size cap, before the decode. `validate` applies it at step 1

@@ -226,13 +226,13 @@ impl ConfidentialExecutor for StubExecutor {
             return Err(ConfidentialError::InvalidAggregateProof("stub rejection".into()));
         }
         // The stub answers what the real one would for an honest aggregate: each covered
-        // bundle's `OUT0..7` — pv words 2..10 in cover order — so ledger tests exercise the
-        // real control flow without any proving.
+        // bundle's `OUT0..7` — pv words `pv::OUT0..OUT0+8` in cover order — so ledger tests
+        // exercise the real control flow without any proving.
         Ok(covered
             .iter()
             .map(|c| {
                 std::array::from_fn(|k| {
-                    u32::try_from(c.public_values[2 + k]).expect("stub OUT words are u32-range")
+                    u32::try_from(c.public_values[crate::types::pv::OUT0 + k]).expect("stub OUT words are u32-range")
                 })
             })
             .collect())
