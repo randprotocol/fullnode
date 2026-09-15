@@ -1,8 +1,8 @@
 # Block aggregation — the chain-side spec
 
-Status: **written for user review 2026-09-15; not approved.** Implementation plan written
-2026-09-15 (`docs/superpowers/plans/2026-09-15-block-aggregation.md`); the spec remains under
-user review. This formalizes the approved design
+Status: **approved by the user 2026-09-15; implementation begins.** Implementation plan
+(`docs/superpowers/plans/2026-09-15-block-aggregation.md`) written 2026-09-15. This formalizes
+the approved design
 — `docs/aggregation.md` §1–§4 with the user's rulings of 2026-09-13
 (`docs/superpowers/specs/2026-09-13-aggregation-design.md` §0) — against what the recursion
 milestones actually delivered (M5.1–M5.3 in `circuits/`: the rVM machine, the N-generic
