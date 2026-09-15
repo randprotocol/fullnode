@@ -18,6 +18,20 @@ pub enum ConfidentialError {
     WrongProgram,
     #[error("bundle proof: {0}")]
     InvalidBundleProof(String),
+    /// Block aggregation: the aggregate proof's interface digest does not match the covered
+    /// bundles' recomputed list, or the rVM `Machine::verify` refused it (spec §4 steps 7–8).
+    #[error("aggregate proof: {0}")]
+    InvalidAggregateProof(String),
+    /// Block aggregation: this executor does not build or verify aggregate proofs (the bare
+    /// zkVM executor; the node wraps it with the rVM-backed aggregating one). Never a
+    /// transaction's fault, so never a permanent admission verdict.
+    #[error("this executor does not support aggregate proofs")]
+    AggregationUnsupported,
+    /// Block aggregation: the registered declared shape is one the rVM refuses to build a
+    /// verifier for (`InnerShape::try_of`). A chain-configuration error, never a transaction's
+    /// fault — never a permanent admission verdict either.
+    #[error("the registered shape is not one a proof can have: {0}")]
+    BadDeclaredShape(String),
     #[error("confidential computation is disabled on this chain")]
     Disabled,
 }
@@ -51,6 +65,26 @@ pub trait ConfidentialExecutor: Send + Sync {
     fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<(), ConfidentialError>;
     /// Precompute the bundle verifier key. May be a no-op.
     fn warm_bundle(&self) {}
+
+    /// The registered aggregate program's digest for an admitted shape (block aggregation,
+    /// spec §2.3): a startup constant, recomputed from the shape alone. Cheap relative to
+    /// verification (the DSL program build, not the proving key).
+    fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], ConfidentialError>;
+    /// spec §4 steps 7–8: the interface-list recompute and digest compare against the proof's
+    /// batch public values, then the rVM `Machine::verify` of the aggregate proof against the
+    /// registered aggregate program. Returns each covered bundle's `OUT0..7` in cover order.
+    /// Expensive: the rVM verify (~1–2 s warm at production; the first call at a shape pays the
+    /// startup key-build).
+    fn verify_aggregate(
+        &self,
+        shape: &crate::types::DeclaredShape,
+        covered: &[crate::types::CoveredBundle],
+        proof: &[u8],
+    ) -> Result<Vec<[u32; 8]>, ConfidentialError>;
+    /// Precompute the aggregate program and the rVM verifier key for an admitted shape (the
+    /// startup key-build, ~30–70 s at production). Called once at node startup on a chain whose
+    /// genesis has an `aggregation` section; may be a no-op.
+    fn warm_aggregation(&self, _shape: &crate::types::DeclaredShape) {}
 }
 
 /// Test executor. A "proof" is `STUB` || tier (1 byte) || 8 outputs (LE u32) || `H_IN`
@@ -174,6 +208,34 @@ impl ConfidentialExecutor for StubExecutor {
             return Err(ConfidentialError::WrongProgram);
         }
         Ok(())
+    }
+
+    fn aggregate_program_digest(&self, _shape: &crate::types::DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+        // A stand-in digest, not the real one — distinctive so a test that forgot to stub the
+        // right thing notices, and deterministic so the rest can compare.
+        Ok([0xa66_e6a7e_u64; 4])
+    }
+
+    fn verify_aggregate(
+        &self,
+        _shape: &crate::types::DeclaredShape,
+        covered: &[crate::types::CoveredBundle],
+        proof: &[u8],
+    ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+        if proof == b"reject" {
+            return Err(ConfidentialError::InvalidAggregateProof("stub rejection".into()));
+        }
+        // The stub answers what the real one would for an honest aggregate: each covered
+        // bundle's `OUT0..7` — pv words 2..10 in cover order — so ledger tests exercise the
+        // real control flow without any proving.
+        Ok(covered
+            .iter()
+            .map(|c| {
+                std::array::from_fn(|k| {
+                    u32::try_from(c.public_values[2 + k]).expect("stub OUT words are u32-range")
+                })
+            })
+            .collect())
     }
 }
 

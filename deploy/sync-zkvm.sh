@@ -265,3 +265,77 @@ fi
 REV=$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
 echo "synced zkVM from $SRC at $REV into $DST"
 echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../../circuits/rand-zkvm-cuda (i.e. circuits/ beside fullnode/)"
+
+# ── the recursion VM (rVM) → crates/shrugg-rvm ────────────────────────────────────────────────
+# M5.3/M5.4's recursion VM, vendored at circuits main `271679d` ("Merge zkvm-m5-4"). What the
+# rename has to achieve (the block-aggregation plan's R1): recursion's own
+# `rand_zkvm = { path = "../research" }` dependency must land on the *vendored*
+# `crates/shrugg-zkvm`, not on `circuits/research` — a path dependency on this repo from
+# `crates/shrugg-rvm` to `circuits/recursion` would drag `circuits/research` in as a second,
+# distinct `rand_zkvm` crate beside the vendored one, and `recursion::InnerProof` and
+# `shrugg_zkvm::machine::Proof` would then be *different types* (the aggregate's covered bundles
+# could never be handed to the verifier). The two-step rename below — the same one the research
+# sync runs, over the whole vendored tree plus its Cargo.toml — makes the vendored recursion's
+# `rand_zkvm` references point at the vendored `shrugg_zkvm`, so the proof types unify.
+#
+# `rand-zkvm-cuda` is an *optional* path dependency of recursion (`reference-backend` /
+# `mock-cuda` / `cuda` features, all off by default): the vendored copy repoints it outside the
+# repo to `../../../circuits/rand-zkvm-cuda` exactly as `crates/shrugg-zkvm`'s own optional cuda
+# dep already works — default features off, the CUDA feature stays unvendored. Building the
+# vendored crate's *tests* wants the fixture cache: `RECURSION_FIXTURES` pointing at a warm
+# `recursion/target/recursion-fixtures` saves the first run's re-proving (the cache re-verifies
+# every proof it loads, so a stale entry is a reprove, never a wrong pass). The two heavy test
+# functions in `tests/aggregate.rs` (the tier-19 round-trip and the tier-20 two-proof prove)
+# are NOT `#[ignore]`d upstream; keep them out of gate runs with
+# `--skip round_trips --skip two_test_profile` (they are the M5.3 exit's own runs, not this
+# repo's gate).
+RVM_SRC=${RVM_SRC:-../circuits/recursion}
+RVM_DST=crates/shrugg-rvm
+mkdir -p "$RVM_DST/src" "$RVM_DST/tests"
+rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude rust-toolchain.toml \
+      "$RVM_SRC/src/" "$RVM_DST/src/"
+rsync -a --delete --exclude target "$RVM_SRC/tests/" "$RVM_DST/tests/"
+cp "$RVM_SRC/Cargo.toml" "$RVM_DST/Cargo.toml"
+# The rename, over the vendored tree and the manifest alike: `rand_zkvm` -> `shrugg_zkvm`, with
+# the external `rand_zkvm_cuda` parked behind the placeholder as above; then the three path
+# adjustments the manifest and the crate name need.
+grep -rl "rand_zkvm" "$RVM_DST" | xargs -I{} sed -i '' \
+      -e 's/rand_zkvm_cuda/@@RAND_ZKVM_CUDA@@/g' \
+      -e 's/rand_zkvm/shrugg_zkvm/g' \
+      -e 's/@@RAND_ZKVM_CUDA@@/rand_zkvm_cuda/g' {} 2>/dev/null || true
+sed -i '' \
+      -e 's|^name = "recursion"|name = "shrugg-rvm"|' \
+      -e 's|path = "../research"|path = "../shrugg-zkvm"|' \
+      -e 's|path = "../rand-zkvm-cuda"|path = "../../../circuits/rand-zkvm-cuda"|' \
+      "$RVM_DST/Cargo.toml"
+# Two manifest adjustments the rename cannot express: the dependency key must match the
+# *package* name (`shrugg-zkvm`, hyphenated) even though the lib it links is `shrugg_zkvm` —
+# the rename underscored it too — and recursion's own `[profile.*]` sections have to go: they
+# were written for recursion as its own workspace root, cargo ignores (and warns on) profile
+# tables in a member manifest, and this workspace's root profiles already cover it (the
+# `profile.dev.package.shrugg-rvm` entry mirrors the zkVM's).
+sed -i '' 's|^shrugg_zkvm = { path = "../shrugg-zkvm" }|shrugg-zkvm = { path = "../shrugg-zkvm" }|' "$RVM_DST/Cargo.toml"
+python3 - "$RVM_DST/Cargo.toml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+anchor = "\n# `research`'s profiles, verbatim. This crate is its own package root, so cargo reads *these*"
+if anchor in s:
+    s = s[:s.index(anchor)]
+    open(p, 'w').write(s.rstrip() + "\n")
+PY
+# The lib name and every test-side `recursion::` path become `shrugg_rvm` (the vendored sources
+# use `crate::` internally; only the integration tests name the crate).
+python3 - "$RVM_DST/Cargo.toml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+anchor = '[lib]\npath = "src/lib.rs"'
+want = '[lib]\nname = "shrugg_rvm"\npath = "src/lib.rs"'
+assert anchor in s, "recursion's Cargo.toml lost its [lib] path anchor; update sync-zkvm.sh"
+s = s.replace(anchor, want, 1)
+open(p, 'w').write(s)
+PY
+grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/shrugg_rvm::/g' {} 2>/dev/null || true
+RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 271679d) into $RVM_DST"

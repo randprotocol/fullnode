@@ -96,10 +96,15 @@ impl NodeHandle {
 /// a chain whose genesis sets `confidential: false`. Building the genesis *state* needs one too
 /// — the deposit notes go into a real commitment tree — which is why this takes the raw
 /// `Genesis` rather than the built `GenesisState`.
+///
+/// The concrete type is [`AggExecutor`], the `ZkExecutor` plus the rVM-backed aggregate surface:
+/// the ledger likewise gates the aggregation actions on `genesis.aggregation`, so on a chain
+/// without the section the rVM half is built (cheap — a machine config, no keys) and never
+/// called, and a chain with it never meets `ConfidentialError::AggregationUnsupported`.
 pub fn executor_for_profile(fri_profile: &str) -> Result<Arc<dyn ConfidentialExecutor>> {
     let profile =
         ZkExecutor::profile_from_str(fri_profile).with_context(|| format!("genesis fri_profile {fri_profile}"))?;
-    Ok(Arc::new(ZkExecutor::new(profile)))
+    Ok(Arc::new(crate::agg_executor::AggExecutor::new(profile)))
 }
 
 /// The genesis file, its executor, and the state they build. One function because the state
@@ -129,6 +134,9 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     ledger.set_faucet(gs.faucet);
     ledger.set_confidential(gs.confidential);
     ledger.set_epoch_blocks(gs.epoch_blocks);
+    // The aggregation gate lives in the genesis file too: without this a restarted chain-9 node
+    // would compute state-2 roots and refuse every aggregation action by name.
+    ledger.set_aggregation(gs.ledger.aggregation().cloned());
     Ok(ledger)
 }
 
@@ -453,10 +461,17 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     );
 
     // Warm verifier keys off the consensus thread: the bundle guest's always (every block can
-    // carry bundles, so the first one must not pay for the key), and every program already on
-    // chain.
+    // carry bundles, so the first one must not pay for the key), every program already on
+    // chain, and — on a chain with an aggregation section — the aggregate program and its N=1
+    // landing tier's rVM verifier key per admitted shape (spec §2.3's startup obligation; the
+    // ~30–70 s production key-build happens here, not inside the first aggregate's admission).
     {
         let programs: Vec<_> = hs.committed_ledger().programs().values().cloned().collect();
+        let agg_shapes: Vec<_> = hs
+            .committed_ledger()
+            .aggregation()
+            .map(|c| c.admitted_shapes.iter().map(|a| a.shape).collect())
+            .unwrap_or_default();
         let ex = executor.clone();
         tokio::task::spawn_blocking(move || {
             ex.warm_bundle();
@@ -465,6 +480,9 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
                 ex.warm(&rec);
             }
             tracing::info!("verifier keys warmed");
+            for shape in &agg_shapes {
+                ex.warm_aggregation(shape);
+            }
         });
     }
 
@@ -1458,6 +1476,33 @@ mod tests {
             executor,
         );
         assert_eq!(blind.on_proposal(proposal, 3), Err(ConsensusError::UnknownEpochSet(1)));
+    }
+
+    /// The aggregation gate survives a restart: it lives in the genesis file, so a reloaded
+    /// ledger must carry it — a node that resumed without it would compute state-2 roots and
+    /// refuse every aggregation action by name, forking off a chain-9 fleet at its first restart.
+    #[test]
+    fn a_restart_restores_the_aggregation_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        let cfg = shrugg_core::ledger::aggregation::AggregationConfig {
+            bond: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            max_covers: 3,
+            subsidy_base: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![],
+        };
+        gs.ledger.set_aggregation(Some(cfg.clone()));
+        storage.init_genesis(&gs).unwrap();
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.aggregation(), Some(&cfg));
+        assert_eq!(
+            reloaded.state_root(),
+            gs.ledger.state_root(),
+            "the reloaded ledger hashes the gated state-3 root, not state-2"
+        );
     }
 
     // ------------------------------------------------------- sync batch wire budget

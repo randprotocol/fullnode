@@ -310,6 +310,10 @@ async fn main() -> Result<()> {
                 // more than a flag's worth of surface and belongs with whoever holds the
                 // guardian keys, not with this command.
                 bridge: None,
+                // An aggregating chain likewise: the `aggregation` section carries the bond,
+                // the subsidy schedule and the registered shapes with their measured program
+                // digests (spec §2.3) — values cut by the chain-9 deploy work, not by a flag.
+                aggregation: None,
                 epoch_blocks,
             };
             for v in &validators {

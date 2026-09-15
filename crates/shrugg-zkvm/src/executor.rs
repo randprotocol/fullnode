@@ -386,6 +386,25 @@ impl ConfidentialExecutor for ZkExecutor {
         let (plh, ilh) = Self::bundle_heights();
         let _ = self.machine.verifier_key(Tier(14), plh, ilh, NO_KECCAK, NO_SHA256, public::public_log_height(0));
     }
+
+    /// The bare zkVM executor cannot build or verify aggregate proofs: the rVM lives in
+    /// `shrugg-rvm`, which depends on this crate, so linking it here would be a crate cycle.
+    /// `shrugg-node` wraps this executor with the rVM-backed aggregating one.
+    fn aggregate_program_digest(
+        &self,
+        _shape: &shrugg_core::types::DeclaredShape,
+    ) -> Result<[u64; 4], ConfidentialError> {
+        Err(ConfidentialError::AggregationUnsupported)
+    }
+
+    fn verify_aggregate(
+        &self,
+        _shape: &shrugg_core::types::DeclaredShape,
+        _covered: &[shrugg_core::types::CoveredBundle],
+        _proof: &[u8],
+    ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+        Err(ConfidentialError::AggregationUnsupported)
+    }
 }
 
 /// The zkVM's own commitment to a program: `hc`, the in-circuit Poseidon2 digest

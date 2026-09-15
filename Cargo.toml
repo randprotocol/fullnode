@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/shrugg-core", "crates/shrugg-zkvm", "crates/shrugg-client", "crates/shrugg-node", "crates/bridge-codec"]
+members = ["crates/shrugg-core", "crates/shrugg-zkvm", "crates/shrugg-client", "crates/shrugg-node", "crates/bridge-codec", "crates/shrugg-rvm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ authors = ["RandProtocol Contributors"]
 shrugg-core = { path = "crates/shrugg-core" }
 shrugg-client = { path = "crates/shrugg-client" }
 shrugg-zkvm = { path = "crates/shrugg-zkvm" }
+shrugg-rvm = { path = "crates/shrugg-rvm" }
 bridge-codec = { path = "crates/bridge-codec" }
 
 # crypto
@@ -69,4 +70,9 @@ opt-level = 2
 # default dev opt-level 0 a single bundle proof took 575 s; `"*"` above covers dependencies
 # only, never a workspace member, so this member needs its own entry.
 [profile.dev.package.shrugg-zkvm]
+opt-level = 2
+
+# The recursion VM's prover runs in dev/test builds too (the aggregation cluster tests prove
+# real rVM aggregates): the same member-level entry as the zkVM's, and for the same reason.
+[profile.dev.package.shrugg-rvm]
 opt-level = 2

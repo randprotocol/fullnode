@@ -5920,6 +5920,8 @@ dependencies = [
  "futures",
  "hex",
  "libp2p",
+ "p3-field",
+ "postcard",
  "rand 0.8.8",
  "reqwest",
  "rocksdb",
@@ -5927,6 +5929,7 @@ dependencies = [
  "serde_json",
  "shrugg-client",
  "shrugg-core",
+ "shrugg-rvm",
  "shrugg-zkvm",
  "tempfile",
  "thiserror 2.0.20",
@@ -5934,6 +5937,33 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "shrugg-rvm"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "p3-air",
+ "p3-batch-stark",
+ "p3-challenger",
+ "p3-commit",
+ "p3-dft",
+ "p3-field",
+ "p3-fri",
+ "p3-goldilocks",
+ "p3-lookup",
+ "p3-matrix",
+ "p3-merkle-tree",
+ "p3-poseidon2",
+ "p3-symmetric",
+ "p3-uni-stark",
+ "p3-util",
+ "postcard",
+ "rand 0.10.2",
+ "rand-zkvm-cuda",
+ "serde",
+ "shrugg-zkvm",
 ]
 
 [[package]]
