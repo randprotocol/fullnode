@@ -67,6 +67,73 @@ fn sealed_withdraw_note(payout: &ShieldedAddress, amount: u64, time: u32) -> Res
     Ok((note, envelope))
 }
 
+/// The `--aggregation` flag: `<bond SHRUGG>,<max_covers>,<subsidy_base SHRUGG>,<halving_blocks>,<window>`.
+/// The admitted shapes ride separately (`--admitted-shape`), so this is exactly the genesis
+/// section's other five fields (spec §2.3).
+fn parse_aggregation_config(spec: &str) -> Result<shrugg_core::ledger::aggregation::AggregationConfig> {
+    let parts: Vec<&str> = spec.split(',').collect();
+    let [bond, max_covers, subsidy_base, halving_blocks, window] = parts.as_slice() else {
+        anyhow::bail!("--aggregation takes <bond>,<max_covers>,<subsidy_base>,<halving_blocks>,<window>, got {spec}");
+    };
+    Ok(shrugg_core::ledger::aggregation::AggregationConfig {
+        bond: parse_amount(bond)?,
+        max_covers: max_covers.parse().with_context(|| format!("max_covers: {max_covers}"))?,
+        subsidy_base: parse_amount(subsidy_base)?,
+        halving_blocks: halving_blocks.parse().with_context(|| format!("halving_blocks: {halving_blocks}"))?,
+        window: window.parse().with_context(|| format!("window: {window}"))?,
+        admitted_shapes: Vec::new(),
+    })
+}
+
+/// One `--admitted-shape`: `<profile>,<tier>,<program>,<input>,<keccak>,<sha256>,<public>,
+/// <mem>,<hc hex>,<program digest hex>` — the declared shape of every coverable bundle and the
+/// aggregate program's digest for it (spec §2.3). The digest is the four words as 16 lowercase
+/// hex chars each, concatenated — the circuits docs' own spelling.
+fn parse_admitted_shape(spec: &str) -> Result<shrugg_core::ledger::aggregation::AdmittedShape> {
+    use shrugg_core::ledger::aggregation::AdmittedShape;
+    use shrugg_core::types::{DeclaredShape, FriProfile};
+    let parts: Vec<&str> = spec.split(',').collect();
+    let [profile, tier, program, input, keccak, sha256, public, mem, hc, digest] = parts.as_slice() else {
+        anyhow::bail!(
+            "--admitted-shape takes <profile>,<tier>,<program>,<input>,<keccak>,<sha256>,<public>,<mem>,<hc>,<digest>, got {spec}"
+        );
+    };
+    let profile = match *profile {
+        "test" => FriProfile::Test,
+        "production" => FriProfile::Production,
+        other => anyhow::bail!("--admitted-shape's profile is test or production, got {other}"),
+    };
+    let u8_of = |name: &str, v: &str| v.parse::<u8>().with_context(|| format!("--admitted-shape's {name}: {v}"));
+    let hc_bytes = hex::decode(hc).with_context(|| format!("--admitted-shape's hc is not hex: {hc}"))?;
+    if hc_bytes.len() != 32 {
+        anyhow::bail!("--admitted-shape's hc must be 32 bytes (64 hex chars), got {}", hc_bytes.len());
+    }
+    let hc = shrugg_core::Hash(hc_bytes.try_into().expect("length checked above"));
+    let digest_bytes = hex::decode(digest).with_context(|| format!("--admitted-shape's digest is not hex: {digest}"))?;
+    if digest_bytes.len() != 32 {
+        anyhow::bail!("--admitted-shape's digest must be four 16-hex words (64 hex chars, 32 bytes), got {}", digest_bytes.len());
+    }
+    let mut words = [0u64; 4];
+    for (i, w) in words.iter_mut().enumerate() {
+        *w = u64::from_str_radix(&digest[16 * i..16 * i + 16], 16)
+            .with_context(|| format!("--admitted-shape's digest word {i}: {digest}"))?;
+    }
+    Ok(AdmittedShape {
+        shape: DeclaredShape {
+            profile,
+            tier: u8_of("tier", tier)?,
+            program_log_height: u8_of("program", program)?,
+            input_log_height: u8_of("input", input)?,
+            keccak_log_height: u8_of("keccak", keccak)?,
+            sha256_log_height: u8_of("sha256", sha256)?,
+            public_log_height: u8_of("public", public)?,
+            mem_log_height: u8_of("mem", mem)?,
+        },
+        hc,
+        aggregate_program_digest: words,
+    })
+}
+
 /// One `--validator key,stake,payout` triple. The three fields travel together because they are
 /// one register entry (spec §8): three parallel repeatable flags would silently pair the wrong
 /// stake with the wrong key the moment one of them was left out.
@@ -178,6 +245,19 @@ enum Cmd {
         /// zkVM FRI profile: production (default) or test (fast, insecure; tests only).
         #[arg(long, default_value = "production")]
         fri_profile: String,
+        /// The aggregation section (chain 9), as
+        /// `<bond SHRUGG>,<max_covers>,<subsidy_base SHRUGG>,<halving_blocks>,<window>`.
+        /// Omitted entirely when absent, so an aggregation-less chain's file and hash are
+        /// byte-for-byte today's.
+        #[arg(long, value_name = "BOND,MAX_COVERS,SUBSIDY,HALVING,WINDOW")]
+        aggregation: Option<String>,
+        /// One admitted shape, as
+        /// `<profile>,<tier>,<program>,<input>,<keccak>,<sha256>,<public>,<mem>,<hc hex>,<program digest hex>`;
+        /// repeatable, required with `--aggregation`. The digest is 64 lowercase hex chars (the
+        /// four words as 16 each); the activation placeholder must never ship — genesis
+        /// validation refuses a zero digest.
+        #[arg(long = "admitted-shape", value_name = "PROFILE,TIER,HEIGHTS…,HC,DIGEST")]
+        admitted_shapes: Vec<String>,
     },
     /// Initialise a data directory from a genesis file.
     Init {
@@ -356,7 +436,7 @@ async fn main() -> Result<()> {
             let id = libp2p::identity::Keypair::ed25519_from_bytes(kp.derive_subkey(b"shrugg-p2p-identity"))?;
             println!("address: {}\npublic_key: {}\npeer_id: {}", kp.address(), kp.public_key().to_hex(), id.public().to_peer_id());
         }
-        Cmd::Genesis { chain_id, validators, epoch_blocks, allocs, out, faucet, no_confidential, fri_profile } => {
+        Cmd::Genesis { chain_id, validators, epoch_blocks, allocs, out, faucet, no_confidential, fri_profile, aggregation, admitted_shapes } => {
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -374,10 +454,31 @@ async fn main() -> Result<()> {
                 // more than a flag's worth of surface and belongs with whoever holds the
                 // guardian keys, not with this command.
                 bridge: None,
-                // An aggregating chain likewise: the `aggregation` section carries the bond,
-                // the subsidy schedule and the registered shapes with their measured program
-                // digests (spec §2.3) — values cut by the chain-9 deploy work, not by a flag.
-                aggregation: None,
+                // An aggregating chain is cut with the section spelled out on the command
+                // line (chain 9, spec §2.3): the bond, the subsidy schedule and the registered
+                // shapes with their measured program digests.
+                aggregation: match (&aggregation, &admitted_shapes) {
+                    (Some(spec), shapes) if !shapes.is_empty() => {
+                        let mut cfg = parse_aggregation_config(spec)?;
+                        cfg.admitted_shapes = shapes
+                            .iter()
+                            .map(|s| {
+                                // The literal `hc_bundle` means this build's pinned guest
+                                // digest — the only value a chain-9 genesis may take, so the
+                                // flag cannot quietly carry a stale one.
+                                parse_admitted_shape(&s.replace(
+                                    ",hc_bundle,",
+                                    &format!(",{},", word8_to_hex(&ZkExecutor::hc_bundle())),
+                                ))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Some(cfg)
+                    }
+                    (Some(spec), _) => anyhow::bail!(
+                        "--aggregation {spec} needs at least one --admitted-shape (a chain that admits no shape seals nothing)"
+                    ),
+                    (None, _) => None,
+                },
                 epoch_blocks,
             };
             for v in &validators {
@@ -717,6 +818,62 @@ mod tests {
     use super::*;
     use shrugg_core::ledger::staking::MIN_STAKE;
     use shrugg_zkvm::machine::FriProfile;
+
+    /// The chain-9 genesis arms (spec §2.3): the section parses from the flag spellings, the
+    /// digest round-trips as the circuits docs spell it, and the activation placeholder dies at
+    /// validation — a fleet can never be cut from FILL-AT-ACTIVATION values.
+    #[test]
+    fn the_aggregation_flags_parse_and_the_zero_digest_placeholder_is_refused() {
+        use shrugg_core::types::{DeclaredShape, FriProfile as CoreProfile};
+        let digest_hex = "33a94ec690bb7cbe5a3d4564967460996277ac61b539f6525b5fe7f92992a1c8";
+        let hc_hex = "00".repeat(31) + "2a";
+        let mut cfg = parse_aggregation_config("100,3,100,210000,256").unwrap();
+        assert_eq!(cfg.bond, 100 * UNITS_PER_SHRUGG);
+        assert_eq!(cfg.max_covers, 3);
+        assert_eq!(cfg.subsidy_base, 100 * UNITS_PER_SHRUGG);
+        assert_eq!(cfg.halving_blocks, 210_000);
+        assert_eq!(cfg.window, 256);
+        let shape = parse_admitted_shape(&format!("production,21,12,10,0,0,2,16,{hc_hex},{digest_hex}")).unwrap();
+        assert_eq!(
+            shape.shape,
+            DeclaredShape {
+                profile: CoreProfile::Production,
+                tier: 21,
+                program_log_height: 12,
+                input_log_height: 10,
+                keccak_log_height: 0,
+                sha256_log_height: 0,
+                public_log_height: 2,
+                mem_log_height: 16,
+            }
+        );
+        assert_eq!(shape.hc, shrugg_core::Hash([0u8; 31].into_iter().chain([0x2a]).collect::<Vec<u8>>().try_into().unwrap()));
+        assert_eq!(
+            shape.aggregate_program_digest,
+            [0x33a94ec690bb7cbe, 0x5a3d456496746099, 0x6277ac61b539f652, 0x5b5fe7f92992a1c8],
+            "the digest words, in the docs' own order"
+        );
+        cfg.admitted_shapes = vec![shape];
+        // The placeholder: all-zero digest words, refused by name.
+        let mut placeholder = parse_aggregation_config("100,3,100,210000,256").unwrap();
+        let mut bad = parse_admitted_shape(&format!("production,21,12,10,0,0,2,16,{hc_hex},{digest_hex}")).unwrap();
+        bad.aggregate_program_digest = [0; 4];
+        placeholder.admitted_shapes = vec![bad];
+        let mut g = pinned_genesis();
+        g.aggregation = Some(placeholder);
+        match g.build(&ZkExecutor::new(FriProfile::Test)) {
+            Err(shrugg_core::genesis::GenesisError::BadAggregationConfig(m)) => {
+                assert!(m.contains("placeholder"), "{m}");
+            }
+            other => panic!("the placeholder must be refused, got {other:?}"),
+        }
+        // And the real thing builds, with the register empty and the gated root.
+        let mut g2 = pinned_genesis();
+        g2.aggregation = Some(cfg);
+        let built = g2.build(&ZkExecutor::new(FriProfile::Test)).unwrap();
+        assert!(built.ledger.aggregators().is_empty());
+        assert!(built.ledger.aggregation().is_some());
+    }
 
     /// The owner of the pinned genesis's one deposit note.
     fn pinned_payee() -> ShieldedAddress {

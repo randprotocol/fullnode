@@ -79,6 +79,40 @@ lines in their test files.
    the production N re-measurement (runbook rows 7–8, production N=2/N=3, the ≥ 160 GB host
    classes), and later the self-verifier's end-to-end (row 11, est. tier 22 / ≥ 128 GB).
 
+## Chain 9 activation (block aggregation)
+
+Cutting and bringing up the chain-9 fleet, in order. Everything here is the hard fork it is:
+the wire format, block rules and consensus all change, so every node runs the same build, cut
+from the same commit.
+
+1. **Measure the activation values** on the production build the fleet will run (never from a
+   note, never from another build): the admitted shape is the fleet's 2-in/2-out bundle at its
+   production landing — tier, the six declared log-heights, and the aggregate program digest,
+   computed from the shape alone by the startup key-build (spec §2.3; the ~30–70 s 2²¹ key-build
+   every node then pays once at startup). The fleet's own measured classes for the bundle are
+   `program 12, input 10, keccak 0, sha256 0, public 2, mem 16`; the tier and the digest are the
+   two numbers activation must measure — the digest through the executor's
+   `aggregate_program_digest`, the tier from a production bundle proof's header.
+2. **Cut the genesis**: `deploy/cut-chain9-genesis.sh`, mirroring chain-8's validator and alloc
+   mechanics with `--chain-id 9` and the section. The admitted shape's `hc` is the keyword
+   `hc_bundle` (the genesis command substitutes the build's pinned guest digest — the cut
+   cannot carry a stale one); the digest and tier come from step 1. The script ships with the
+   test-profile values marked FILL-AT-ACTIVATION; genesis validation refuses a zero digest, so
+   an unedited placeholder can never reach a fleet.
+3. **Distribute the file byte-identically** (re-cutting re-randomises the deposit notes, so the
+   hash differs every run — cut once, copy everywhere).
+4. **Bring the fleet up as usual**; each node logs the startup key-build's wall time once
+   (`aggregation: aggregate program built and the tier-21 verifier key warmed`).
+5. **Aggregators register** (`shrugg-node aggregator register --bond --payout` prints the
+   signed registration; the bond burns through the wallet's `submit` as the register bundle's
+   burn) and run **`shrugg-node aggregate --watch`** on a proof machine (≥ 64 GB at N=1, the
+   GPU node for N≥2 — see `docs/aggregation.md`'s machine classes), pointed at any fleet RPC.
+6. **Ops checks**: `shrugg_status`'s `aggregation` section (registered, unsealed, the schedule
+   index), `shrugg_getUnsealed` for the work list, `shrugg_getSupply` for the four counters
+   (`subsidised` against `sealed_blocks` is the schedule audit). Archive nodes run with
+   `--keep-raw-proofs`; everyone else lets the pruning pass reclaim sealed bundles after the
+   256-block window.
+
 ## Recovery cheatsheet
 
 | symptom | action |
