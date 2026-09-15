@@ -139,6 +139,10 @@ pub enum AggregationError {
     /// Its block has scrolled out of the aggregation window (spec §3.3).
     #[error("cover {cover}'s block {block} is outside the window at head {head}")]
     CoverOutsideWindow { cover: Hash, block: u64, head: u64 },
+    /// It is already covered: `sealed_by` is present (spec §3.2.3). A statement about committed
+    /// history — a seal, once committed, never un-happens — so a permanent verdict.
+    #[error("cover {0} is already sealed by another aggregate")]
+    CoverSealed(Hash),
     /// The stored record a cover names cannot be read back — this node's store, not the
     /// transaction, is at fault; never a permanent verdict.
     #[error("the stored record for cover {0} is corrupt")]
@@ -1996,10 +2000,22 @@ mod payment_tests {
 
     /// A block signed by `key` over the ledger's real post-apply root — `mod.rs`'s own fixture.
     fn signed_block(l: &Ledger, txs: Vec<Transaction>, key: &Keypair, height: u64) -> Block {
+        signed_block_with_covered(l, txs, key, height, &BTreeMap::new())
+    }
+
+    /// `signed_block` whose transactions may include an `Aggregate`: the root is computed
+    /// through the covered-carrying apply, exactly as `apply_block` now runs it.
+    fn signed_block_with_covered(
+        l: &Ledger,
+        txs: Vec<Transaction>,
+        key: &Keypair,
+        height: u64,
+        covered: &BTreeMap<usize, Vec<CoveredBundle>>,
+    ) -> Block {
         let mut after = l.clone();
         after.set_height(height);
         after.set_timestamp_ms(height);
-        after.apply_transactions(&txs, &key.address(), &StubExecutor).unwrap();
+        after.apply_transactions_with_covered(&txs, &key.address(), covered, &StubExecutor).unwrap();
         after.sweep_expired_excesses(height, &key.address());
         after.record_anchor(height);
         let header = BlockHeader {
@@ -2220,6 +2236,39 @@ mod payment_tests {
         check(&l, "slash");
         assert_eq!(l.supply().slashed, cfg_with_window(2).bond);
         assert_eq!(l.supply().aggregator_bonds, 0, "both bonds resolved");
+    }
+
+    /// The T4 interim closes (spec §4's admission, run at apply): a block carrying an
+    /// `Aggregate` applies through the covered-carrying path — the payment lands, the counters
+    /// move — and the same block without the records is refused at the aggregate's index with
+    /// the signpost error.
+    #[test]
+    fn a_block_carrying_an_aggregate_applies_through_the_covered_carrying_path() {
+        let (a, _) = keys();
+        let mut l = gated(256);
+        let (kp, _) = keys();
+        register(&mut l, &kp, 10);
+        let p = proposer(&l);
+        let fee = gas::BUNDLE_BASE + 60;
+        let covered_tx = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None);
+        l.apply_block(&signed_block(&l, vec![covered_tx.clone()], &a, 1), &StubExecutor).unwrap();
+
+        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
+        sidecar.insert(0, covered_records(&[1]));
+        let block = signed_block_with_covered(&l, vec![tx.clone()], &a, 2, &sidecar);
+        // Without the records: the signpost, at the aggregate's index.
+        match l.apply_block(&block, &StubExecutor) {
+            Err(crate::ledger::BlockError::InvalidTx { index: 0, error: TxError::AggregateNeedsCovered }) => {}
+            other => panic!("expected the signpost at index 0, got {other:?}"),
+        }
+        l.apply_block_with_covered(&block, &sidecar, &StubExecutor).unwrap();
+        assert_eq!(l.supply().sealed_blocks, 1);
+        assert!(l.unsealed_fees().is_empty(), "the covered excess was paid out");
+        let subsidy = gas::subsidy(0, &cfg_with_window(256));
+        let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy + 60, 0, 1, &[9; 8]);
+        assert!(l.has_commitment(&want_cm), "the payout note is in the tree");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
     }
 
     fn signed_header(kp: &Keypair, nonce: u64, covers: Vec<Hash>) -> crate::types::SignedAggregateHeader {

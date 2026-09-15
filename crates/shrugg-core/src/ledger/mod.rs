@@ -834,9 +834,10 @@ impl Ledger {
             self.check_bundle(b)?;
         }
         // A bundle-less `Withdraw` carries a `time` of its own — the note's, which the sealing
-        // node chose — and it is held to the same window by the same rule. Checked here, at the
-        // step a bundle's time is checked, so a stale one is refused before any signature work.
-        if let Action::Withdraw { time, .. } = &tx.action {
+        // node chose — and it is held to the same window by the same rule; a `WithdrawAggregator`'s
+        // note time is its twin, one register over. Checked here, at the step a bundle's time is
+        // checked, so a stale one is refused before any signature work.
+        if let Action::Withdraw { time, .. } | Action::WithdrawAggregator { time, .. } = &tx.action {
             self.check_time(*time)?;
         }
         // 7. action-specific cheap checks
@@ -1019,12 +1020,31 @@ impl Ledger {
         proposer: &Address,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
+        self.apply_transactions_with_covered(txs, proposer, &BTreeMap::new(), executor)
+    }
+
+    /// `apply_transactions` with the covered-bundle records any `Aggregate` among the
+    /// transactions needs (see [`Ledger::apply_block_with_covered`]): an `Aggregate` applies
+    /// through [`Ledger::apply_aggregate`] — validation, payment and all — and yields no call
+    /// receipt; everything else takes `apply_tx` as today.
+    pub fn apply_transactions_with_covered(
+        &mut self,
+        txs: &[Transaction],
+        proposer: &Address,
+        covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
         let mut scratch = self.clone();
         // The deposits reported after a block are exactly that block's (see `Deposit`).
         scratch.deposits.clear();
         let mut receipts = Vec::new();
         for (index, tx) in txs.iter().enumerate() {
-            if let Some(r) =
+            if matches!(tx.action, Action::Aggregate { .. }) {
+                let c = covered
+                    .get(&index)
+                    .ok_or(BlockError::InvalidTx { index, error: TxError::AggregateNeedsCovered })?;
+                scratch.apply_aggregate(tx, c, executor).map_err(|error| BlockError::InvalidTx { index, error })?;
+            } else if let Some(r) =
                 scratch.apply_tx(tx, proposer, executor).map_err(|error| BlockError::InvalidTx { index, error })?
             {
                 receipts.push((index, r));
@@ -1038,6 +1058,20 @@ impl Ledger {
     /// the resulting state root must match the header. Ledger unchanged on error. Returns the
     /// receipts of the block's calls.
     pub fn apply_block(&mut self, block: &Block, executor: &dyn ConfidentialExecutor) -> Result<Vec<CallReceipt>, BlockError> {
+        self.apply_block_with_covered(block, &BTreeMap::new(), executor)
+    }
+
+    /// `apply_block` with the covered-bundle records any `Aggregate` in the block needs (spec
+    /// §4's admission, run at apply exactly as at the pool). The ledger has no transaction
+    /// store, so the caller assembles them: the node from its store (spec §3.2's coverability),
+    /// `verify_chain` from the store it replays. An `Aggregate` without a record is refused at
+    /// its index with the T4 signpost error.
+    pub fn apply_block_with_covered(
+        &mut self,
+        block: &Block,
+        covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<Vec<CallReceipt>, BlockError> {
         // Size limits are a consensus rule, not only proposer policy: without them a Byzantine
         // leader can stuff a block up to the gossip transport cap and force every replica to
         // execute it.
@@ -1073,7 +1107,7 @@ impl Ledger {
         let mut scratch = self.clone();
         scratch.set_height(block.height());
         scratch.set_timestamp_ms(block.header.timestamp_ms);
-        let data = scratch.apply_transactions(&block.transactions, &proposer, executor)?;
+        let data = scratch.apply_transactions_with_covered(&block.transactions, &proposer, covered, executor)?;
         // The proving-share sweep (spec §5.2): every bucketed excess whose window passed at
         // this head is credited to its recorded proposer. Part of the applied state — the
         // rewards it credits are in the state root — so it runs inside the scratch, before the

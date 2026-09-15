@@ -14,7 +14,8 @@ use shrugg_core::genesis::GenesisState;
 use shrugg_core::ledger::{Supply, ValidatorEntry};
 use shrugg_core::notes::{word8_from_bytes, word8_to_bytes, CommitmentTree, Envelope, FullTree, Word8, DEPTH};
 use shrugg_core::{
-    Action, Address, Block, CallReceipt, Hash, Ledger, ProgramId, ProgramRecord, QuorumCertificate, ValidatorSet,
+    Action, Address, Block, CallReceipt, Hash, Ledger, ProgramId, ProgramRecord, QuorumCertificate, Transaction,
+    ValidatorSet,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -23,6 +24,10 @@ const CF_BLOCKS: &str = "blocks";
 const CF_QCS: &str = "qcs";
 const CF_BLOCK_INDEX: &str = "block_index";
 const CF_TXS: &str = "txs";
+/// Sealing marks (block aggregation, spec §6.1), two key shapes: `b't' + bundle_hash` ->
+/// `bincode((aggregate_tx_hash, sealed_at_height))` per covered bundle, and `b'b' + block_hash`
+/// -> `bincode(bool)` once every bundle in the block has one. Derived state, never consensus.
+const CF_SEALS: &str = "seals";
 const CF_META: &str = "meta";
 const CF_PROGRAMS: &str = "programs";
 const CF_RECEIPTS: &str = "receipts";
@@ -49,11 +54,12 @@ const CF_BRIDGE_SPENT: &str = "bridge_spent";
 /// Burn sequence (big-endian u64) -> `bincode(BridgeBurnRecord)`: the outbound messages
 /// guardians read back, oldest first.
 const CF_BRIDGE_BURNS: &str = "bridge_burns";
-const ALL_CFS: [&str; 14] = [
+const ALL_CFS: [&str; 15] = [
     CF_BLOCKS,
     CF_QCS,
     CF_BLOCK_INDEX,
     CF_TXS,
+    CF_SEALS,
     CF_META,
     CF_PROGRAMS,
     CF_RECEIPTS,
@@ -68,6 +74,52 @@ const ALL_CFS: [&str; 14] = [
 /// The bridge families, which (unlike notes and anchors) have no per-height key and so are
 /// rewritten wholesale wherever the state is installed rather than appended to.
 const BRIDGE_CFS: [&str; 2] = [CF_BRIDGE_SPENT, CF_BRIDGE_BURNS];
+
+/// One stored transaction record (`CF_TXS`'s value, block aggregation's R3): the location and
+/// the transaction itself, in one of two forms. `Raw` is every record at commit. `Pruned` is
+/// the form a sealed bundle takes once the pruning pass (spec §6.2) has dropped its raw proof
+/// bytes — the transaction with `bundle.proof` replaced by [`PRUNED_PROOF_MARKER`] plus the
+/// proof's hash, the proof's hash again on its own, the 34 public values, and the declared
+/// shape, which is everything admission (§4 step 6) and the replay ever read of it afterwards.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TxRecord {
+    Raw {
+        height: u64,
+        index: u32,
+        tx: Transaction,
+    },
+    Pruned {
+        height: u64,
+        index: u32,
+        tx: Transaction,
+        proof_hash: Hash,
+        /// The proof's 34 public values, in `pv` order — a `Vec` because serde's built-in array
+        /// impls stop at 32; always exactly 34 (the pruning pass writes it, the readers assert it).
+        public_values: Vec<u64>,
+        shape: shrugg_core::types::DeclaredShape,
+    },
+}
+
+impl TxRecord {
+    /// The block and the index inside it the record belongs to, either form.
+    pub fn location(&self) -> (u64, u32) {
+        match self {
+            TxRecord::Raw { height, index, .. } | TxRecord::Pruned { height, index, .. } => (*height, *index),
+        }
+    }
+
+    /// The transaction, either form — a `Pruned` one's bundle proof is the marker form.
+    pub fn transaction(&self) -> &Transaction {
+        match self {
+            TxRecord::Raw { tx, .. } | TxRecord::Pruned { tx, .. } => tx,
+        }
+    }
+}
+
+/// What a pruned bundle's `proof` field carries (spec §6.2, the 2026-09-13 form): this marker
+/// then the proof's 32-byte hash. Never a decodable proof, so a pruned record can never be
+/// mistaken for a raw one — and 46 bytes stands in for ~1.3 MB.
+pub const PRUNED_PROOF_MARKER: &[u8] = b"shrugg-pruned\0";
 
 const META_HEAD_HEIGHT: &str = "head_height";
 const META_GENESIS_HASH: &str = "genesis_hash";
@@ -698,7 +750,179 @@ impl Storage {
     }
 
     pub fn tx_location(&self, h: &Hash) -> Result<Option<(u64, u32)>> {
+        Ok(self.tx_record(h)?.map(|r| r.location()))
+    }
+
+    /// The stored record for a transaction — `Raw` until it is sealed and pruned, `Pruned`
+    /// after (spec §6.2's two forms).
+    pub fn tx_record(&self, h: &Hash) -> Result<Option<TxRecord>> {
         self.get(CF_TXS, h.as_bytes())
+    }
+
+    /// One covered bundle's admission record (spec §3.2's data half): its 34 public values and
+    /// declared shape — the `Raw` form's read off the stored proof, the `Pruned` form's off the
+    /// record, so admission and the replay read one way regardless of pruning (spec §6.2's
+    /// promise). No policy attached: finality, the window and sealing are the caller's checks
+    /// (`node::assemble_covered` has admission's, `verify_chain` attaches none). `None` when
+    /// the hash names no transaction or one with no bundle.
+    pub fn covered_record(
+        &self,
+        cover: &Hash,
+        profile: shrugg_core::types::FriProfile,
+    ) -> Result<Option<shrugg_core::types::CoveredBundle>> {
+        use shrugg_core::types::{CoveredBundle, DeclaredShape};
+        let Some(record) = self.tx_record(cover)? else { return Ok(None) };
+        match record {
+            TxRecord::Raw { tx, .. } => {
+                let Some(bundle) = &tx.bundle else { return Ok(None) };
+                let proof: shrugg_zkvm::machine::Proof = postcard::from_bytes(&bundle.proof)
+                    .map_err(|_| StorageError::Corrupt(format!("covered bundle {cover}'s proof does not decode")))?;
+                let public_values: [u64; 34] = proof
+                    .public_values
+                    .clone()
+                    .try_into()
+                    .map_err(|_| StorageError::Corrupt(format!("covered bundle {cover}'s public values are not 34 words")))?;
+                Ok(Some(CoveredBundle {
+                    public_values,
+                    shape: DeclaredShape {
+                        profile,
+                        tier: proof.tier.0 as u8,
+                        program_log_height: proof.program_log_height,
+                        input_log_height: proof.input_log_height,
+                        keccak_log_height: proof.keccak_log_height,
+                        sha256_log_height: proof.sha256_log_height,
+                        public_log_height: proof.public_log_height,
+                        mem_log_height: proof.mem_log_height,
+                    },
+                }))
+            }
+            TxRecord::Pruned { tx, public_values, shape, .. } => {
+                if tx.bundle.is_none() {
+                    return Ok(None);
+                }
+                let public_values: [u64; 34] = public_values.try_into().map_err(|_| {
+                    StorageError::Corrupt(format!("pruned record for {cover} does not carry 34 public values"))
+                })?;
+                Ok(Some(CoveredBundle { public_values, shape }))
+            }
+        }
+    }
+
+    /// Mark a covered bundle sealed by an aggregate (spec §6.1): the per-bundle mark lands,
+    /// and once every bundle in its block has one, the block's flag does. `sealed_at` is the
+    /// committing block's height, which the pruning gate measures against the head.
+    pub fn mark_sealed(&self, bundle_hash: Hash, aggregate_tx: Hash, sealed_at: u64) -> Result<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut key = Vec::with_capacity(33);
+        key.push(b't');
+        key.extend_from_slice(bundle_hash.as_bytes());
+        batch.put_cf(self.cf(CF_SEALS), &key, bincode::serialize(&(aggregate_tx, sealed_at))?);
+        self.db.write_opt(batch, &sync_opts())?;
+        self.refresh_block_sealed_flag(&bundle_hash)
+    }
+
+    /// The per-block half of sealing: once every bundle-carrying transaction in the bundle's
+    /// block has a mark, the block's `sealed` flag lands (spec §6.1). Split from
+    /// [`Storage::mark_sealed`] because the commit path writes the bundle marks in its own
+    /// batch — atomically with the block — and refreshes the flags right after it lands.
+    fn refresh_block_sealed_flag(&self, bundle_hash: &Hash) -> Result<()> {
+        let Some((height, _)) = self.tx_location(bundle_hash)? else { return Ok(()) };
+        let block = self
+            .block_by_height(height)?
+            .ok_or_else(|| StorageError::Corrupt(format!("sealed bundle's block {height} missing")))?;
+        let mut all_sealed = true;
+        for tx in &block.transactions {
+            if tx.bundle.is_some() && self.sealed_by(&tx.hash())?.is_none() {
+                all_sealed = false;
+                break;
+            }
+        }
+        if all_sealed {
+            let block_hash = block.hash();
+            let mut key = Vec::with_capacity(33);
+            key.push(b'b');
+            key.extend_from_slice(block_hash.as_bytes());
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.put_cf(self.cf(CF_SEALS), &key, bincode::serialize(&true)?);
+            self.db.write_opt(batch, &sync_opts())?;
+        }
+        Ok(())
+    }
+
+    /// The aggregate that sealed a bundle, if one has (spec §6.1): its hash and the height it
+    /// committed at.
+    pub fn sealed_by(&self, bundle_hash: &Hash) -> Result<Option<(Hash, u64)>> {
+        let mut key = Vec::with_capacity(33);
+        key.push(b't');
+        key.extend_from_slice(bundle_hash.as_bytes());
+        match self.db.get_cf(self.cf(CF_SEALS), &key)? {
+            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether every bundle in a block is sealed (spec §6.1's per-block flag).
+    pub fn block_sealed(&self, block_hash: &Hash) -> Result<bool> {
+        let mut key = Vec::with_capacity(33);
+        key.push(b'b');
+        key.extend_from_slice(block_hash.as_bytes());
+        match self.db.get_cf(self.cf(CF_SEALS), &key)? {
+            Some(bytes) => Ok(bincode::deserialize(&bytes)?),
+            None => Ok(false),
+        }
+    }
+
+    /// The pruning pass (spec §6.2 — policy, never consensus): every bundle sealed for at
+    /// least `window` blocks whose record is still `Raw` becomes its `Pruned` form, the 34
+    /// public values and the declared shape filled from the stored proof. Aggregate
+    /// transactions and unsealed bundles are never touched — the first are bundle-less, the
+    /// second have no mark. Returns how many records it rewrote.
+    pub fn prune_sealed(&self, head_height: u64, window: u64, profile: shrugg_core::types::FriProfile) -> Result<u64> {
+        let mut pruned = 0u64;
+        let seals: Vec<(Box<[u8]>, Box<[u8]>)> = self
+            .db
+            .iterator_cf(self.cf(CF_SEALS), IteratorMode::Start)
+            .collect::<std::result::Result<_, _>>()?;
+        for (k, _) in seals {
+            if k.first() != Some(&b't') {
+                continue;
+            }
+            let bundle_hash = Hash(k[1..].try_into().map_err(|_| StorageError::Corrupt("seal key has wrong length".into()))?);
+            let Some((_, sealed_at)) = self.sealed_by(&bundle_hash)? else { continue };
+            if sealed_at.saturating_add(window) > head_height {
+                continue;
+            }
+            let Some(TxRecord::Raw { height, index, tx }) = self.tx_record(&bundle_hash)? else { continue };
+            let Some(bundle) = &tx.bundle else { continue };
+            let proof: shrugg_zkvm::machine::Proof = postcard::from_bytes(&bundle.proof)
+                .map_err(|_| StorageError::Corrupt(format!("sealed bundle {}'s proof does not decode", bundle_hash)))?;
+            let public_values: [u64; 34] = proof
+                .public_values
+                .clone()
+                .try_into()
+                .map_err(|_| StorageError::Corrupt(format!("sealed bundle {}'s public values are not 34 words", bundle_hash)))?;
+            let shape = shrugg_core::types::DeclaredShape {
+                profile,
+                tier: proof.tier.0 as u8,
+                program_log_height: proof.program_log_height,
+                input_log_height: proof.input_log_height,
+                keccak_log_height: proof.keccak_log_height,
+                sha256_log_height: proof.sha256_log_height,
+                public_log_height: proof.public_log_height,
+                mem_log_height: proof.mem_log_height,
+            };
+            let proof_hash = Hash::digest(&bundle.proof);
+            let mut pruned_tx = tx.clone();
+            let mut marker = PRUNED_PROOF_MARKER.to_vec();
+            marker.extend_from_slice(proof_hash.as_bytes());
+            pruned_tx.bundle.as_mut().expect("checked above").proof = marker;
+            let record = TxRecord::Pruned { height, index, tx: pruned_tx, proof_hash, public_values: public_values.to_vec(), shape };
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.put_cf(self.cf(CF_TXS), bundle_hash.as_bytes(), bincode::serialize(&record)?);
+            self.db.write_opt(batch, &sync_opts())?;
+            pruned += 1;
+        }
+        Ok(pruned)
     }
 
     pub fn program(&self, id: &ProgramId) -> Result<Option<ProgramRecord>> {
@@ -856,11 +1080,23 @@ impl Storage {
             // each one knows the index it was given — which is what this loop checks as it goes.
             let mut deposits = cb.deposits.iter().peekable();
             for (index, tx) in block.transactions.iter().enumerate() {
-                batch.put_cf(
-                    self.cf(CF_TXS),
-                    tx.hash().as_bytes(),
-                    bincode::serialize(&(block.height(), index as u32))?,
-                );
+                let record = TxRecord::Raw { height: block.height(), index: index as u32, tx: tx.clone() };
+                batch.put_cf(self.cf(CF_TXS), tx.hash().as_bytes(), bincode::serialize(&record)?);
+            }
+            // The sealing marks land in the same batch (spec §6.1): atomically with the block
+            // that carries the aggregate — their per-block flags refresh after it lands.
+            for tx in &block.transactions {
+                if let shrugg_core::types::Action::Aggregate { covers, .. } = &tx.action {
+                    for cover in covers {
+                        batch.put_cf(
+                            self.cf(CF_SEALS),
+                            [b"t".as_slice(), cover.as_bytes()].concat(),
+                            bincode::serialize(&(tx.hash(), block.height()))?,
+                        );
+                    }
+                }
+            }
+            for tx in &block.transactions {
                 for nf in tx.nullifiers() {
                     batch.put_cf(self.cf(CF_NULLIFIERS), word8_to_bytes(&nf), hk);
                 }
@@ -981,6 +1217,17 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
         self.db.write_opt(batch, &sync_opts())?;
+        // The sealing marks' per-block half (spec §6.1): the bundle marks went in with the
+        // batch above; the flags read them, so they refresh after it lands.
+        for cb in blocks {
+            for tx in &cb.block.transactions {
+                if let shrugg_core::types::Action::Aggregate { covers, .. } = &tx.action {
+                    for cover in covers {
+                        self.refresh_block_sealed_flag(cover)?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1048,6 +1295,13 @@ impl Storage {
     /// last good height so the caller can `truncate_to` it and resync the rest
     /// from peers.
     pub fn verify_chain(&self, gs: &GenesisState, mode: VerifyMode, executor: &dyn ConfidentialExecutor) -> Result<ChainCheck> {
+        // The chain's FRI profile as the ledger's mirror enum (genesis-validated at load),
+        // for the declared shapes the covered-carrying replay reads off raw proofs.
+        let profile = match gs.fri_profile.as_str() {
+            "test" => shrugg_core::types::FriProfile::Test,
+            "production" => shrugg_core::types::FriProfile::Production,
+            other => panic!("genesis fri_profile {other} was validated at load"),
+        };
         let head = match self.get_meta_raw(META_HEAD_HEIGHT)? {
             Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_slice().try_into().unwrap()),
             _ => 0,
@@ -1172,10 +1426,29 @@ impl Storage {
                 }
                 // Re-execute. `apply_block` is the consensus rule itself — proposer signature,
                 // tx root, every transaction including its bundle proof, the end-of-block
-                // anchor and the header's state root — so the replay cannot drift from it.
+                // anchor and the header's state root — so the replay cannot drift from it. A
+                // block carrying an `Aggregate` replays through the covered-carrying path, its
+                // records read from the store with no admission policy attached: the covered
+                // bundles may be sealed or pruned *now*, which says nothing about the block
+                // then — and the pruned record carries exactly the 34 public values and the
+                // shape the apply reads (spec §6.2's proof, as code).
+                let mut sidecar = BTreeMap::new();
+                for (index, tx) in block.transactions.iter().enumerate() {
+                    if let shrugg_core::types::Action::Aggregate { covers, .. } = &tx.action {
+                        let mut records = Vec::with_capacity(covers.len());
+                        for cover in covers {
+                            let record = self
+                                .covered_record(cover, profile)
+                                .map_err(|e| format!("cover {cover} unreadable at block {h}: {e}"))?
+                                .ok_or_else(|| format!("cover {cover} of block {h} names no stored bundle"))?;
+                            records.push(record);
+                        }
+                        sidecar.insert(index, records);
+                    }
+                }
                 let mut next = ledger.clone();
                 let receipts = next
-                    .apply_block(&block, executor)
+                    .apply_block_with_covered(&block, &sidecar, executor)
                     .map_err(|e| format!("block {h} does not apply: {e}"))?;
                 for r in &receipts {
                     match self.receipt(&r.tx) {
@@ -2767,5 +3040,281 @@ mod tests {
         );
         oversized.resize(shrugg_core::gas::MAX_ATTESTATION_BYTES + 1, 0);
         assert_eq!(derived_note_count(&with_attestation(oversized)), 0);
+    }
+}
+
+// ── sealing and pruning (block aggregation, spec §6) ─────────────────────────────────────────
+#[cfg(test)]
+mod seal_tests {
+    use super::fixtures::*;
+    use super::*;
+    use shrugg_core::confidential::StubExecutor;
+    use shrugg_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+    use shrugg_core::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
+    use shrugg_core::types::{CoveredBundle, DeclaredShape, FriProfile};
+    use shrugg_core::{Keypair, Transaction};
+
+    fn fixture_shape(p: &shrugg_zkvm::machine::Proof) -> DeclaredShape {
+        DeclaredShape {
+            profile: FriProfile::Test,
+            tier: p.tier.0 as u8,
+            program_log_height: p.program_log_height,
+            input_log_height: p.input_log_height,
+            keccak_log_height: p.keccak_log_height,
+            sha256_log_height: p.sha256_log_height,
+            public_log_height: p.public_log_height,
+            mem_log_height: p.mem_log_height,
+        }
+    }
+
+    fn fixture_hc(p: &shrugg_zkvm::machine::Proof) -> Hash {
+        let words: [u32; 8] = std::array::from_fn(|k| {
+            u32::try_from(p.public_values[shrugg_core::types::pv::HC0 + k]).expect("a guest digest word is u32-range")
+        });
+        Hash(shrugg_core::notes::word8_to_bytes(&words))
+    }
+
+    fn gated_cfg(shape: DeclaredShape, hc: Hash, window: u64) -> AggregationConfig {
+        AggregationConfig {
+            bond: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            max_covers: 3,
+            subsidy_base: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            halving_blocks: 210_000,
+            window,
+            admitted_shapes: vec![AdmittedShape { shape, hc, aggregate_program_digest: [1; 4] }],
+        }
+    }
+
+    fn aggregate_tx(kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
+        let aggregator = kp.public_key().address();
+        let r = [9; 8];
+        let signature = kp.sign(aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof)).as_bytes());
+        Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(9), signature },
+        }
+    }
+
+    fn register_tx(l: &Ledger, kp: &Keypair, bond: u64) -> Transaction {
+        let payout = shrugg_core::notes::ShieldedAddress { pk: [7; 8], kem_ek: vec![8; shrugg_core::notes::KEM_EK_BYTES] };
+        let registration = AggregatorRegistration {
+            public_key: kp.public_key().clone(),
+            payout: payout.clone(),
+            signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
+        };
+        let mut b = shrugg_core::notes::Bundle {
+            anchor: l.root(),
+            nullifiers: [[11; 8], [12; 8]],
+            commitments: [[13; 8], [14; 8]],
+            fee: shrugg_core::gas::BUNDLE_BASE,
+            burn: bond,
+            asset: 0,
+            time: 1,
+            envelopes: [env(1), env(2)],
+            proof: vec![],
+        };
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        Transaction::shielded(7, b, Action::RegisterAggregator { registration })
+    }
+
+    /// A gated chain of two committed blocks: block 1 carries the covered bundle (a real
+    /// fixture proof) and the aggregator's registration; block 2 carries the aggregate covering
+    /// it — committed atomically with the sealing marks. The applied sets use the stub twins
+    /// where the stored bytes are a real proof, exactly the worker-arm tests' construction.
+    fn chain_with_an_aggregate(window: u64) -> (tempfile::TempDir, Storage, GenesisState, Transaction, Transaction) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let proof = crate::agg_executor::fixture_proof(0);
+        let cfg = gated_cfg(fixture_shape(&proof), fixture_hc(&proof), window);
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_aggregation(Some(cfg.clone()));
+        storage.init_genesis(&gs).unwrap();
+
+        let fee = shrugg_core::gas::BUNDLE_BASE + 60;
+        let mut covered_tx = bundle_tx(&gs.ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee);
+        covered_tx.bundle.as_mut().unwrap().proof = proof.to_bytes();
+        let stub_twin = bundle_tx(&gs.ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee);
+        let register = register_tx(&gs.ledger, &key(7), cfg.bond);
+        let mut l1 = gs.ledger.clone();
+        l1.set_height(1);
+        l1.set_timestamp_ms(1);
+        l1.apply_transactions(&[stub_twin, register.clone()], &key(1).address(), &StubExecutor).unwrap();
+        l1.record_anchor(1);
+        let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), register], &key(1));
+        storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
+
+        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
+        let record = storage.covered_record(&covered_tx.hash(), FriProfile::Test).unwrap().unwrap();
+        let sidecar: BTreeMap<usize, Vec<CoveredBundle>> = [(0usize, vec![record])].into_iter().collect();
+        let mut l2 = l1.clone();
+        l2.set_height(2);
+        l2.set_timestamp_ms(2);
+        l2.apply_transactions_with_covered(&[aggregate.clone()], &key(1).address(), &sidecar, &StubExecutor).unwrap();
+        l2.record_anchor(2);
+        let b2 = make_block_unchecked(&b1.block, &l2, vec![aggregate.clone()], &key(1));
+        storage.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
+        (dir, storage, gs, covered_tx, aggregate)
+    }
+
+    /// The sealing marks (spec §6.1): the per-bundle mark lands atomically with the committing
+    /// block, and the block's flag only once every bundle in it has one.
+    #[test]
+    fn the_sealing_marks_land_per_bundle_and_per_block() {
+        let (_d, storage, _gs, covered_tx, aggregate) = chain_with_an_aggregate(256);
+        assert_eq!(
+            storage.sealed_by(&covered_tx.hash()).unwrap(),
+            Some((aggregate.hash(), 2)),
+            "the mark: sealed by this aggregate, at its block"
+        );
+        // Block 1 carries the register's bundle too, which nobody covers: its flag stays down...
+        let block1 = storage.block_by_height(1).unwrap().unwrap();
+        assert!(!storage.block_sealed(&block1.hash()).unwrap(), "a bundle short of full coverage keeps the flag down");
+        // ...until a second aggregate covers the register's bundle as well.
+        let register_tx = &block1.transactions[1];
+        let second = aggregate_tx(&key(7), 1, 3, vec![register_tx.hash()], b"ok".to_vec());
+        let l3 = {
+            let mut l = storage.load_ledger(&StubExecutor).unwrap();
+            l.set_height(3);
+            l.set_timestamp_ms(3);
+            l.record_anchor(3);
+            l
+        };
+        let block2 = storage.block_by_height(2).unwrap().unwrap();
+        let b3 = make_block_unchecked(&block2, &l3, vec![second], &key(1));
+        storage.commit(std::slice::from_ref(&b3), &l3, &[], &StubExecutor).unwrap();
+        assert!(storage.block_sealed(&block1.hash()).unwrap(), "every bundle in it sealed: the flag lands");
+    }
+
+    /// The pruning gate (spec §6.2): before `sealed_at + window` the record stays raw; at it,
+    /// the pass rewrites it — and the never-prune list (the aggregate's own record, every
+    /// unsealed bundle) is untouched either way.
+    #[test]
+    fn the_gate_holds_then_the_pruned_record_round_trips_and_the_never_prune_list_holds() {
+        let (_d, storage, _gs, covered_tx, aggregate) = chain_with_an_aggregate(4);
+        let raw = storage.covered_record(&covered_tx.hash(), FriProfile::Test).unwrap().unwrap();
+
+        assert_eq!(storage.prune_sealed(5, 4, FriProfile::Test).unwrap(), 0, "sealed at 2, gated until 6");
+        assert!(matches!(storage.tx_record(&covered_tx.hash()).unwrap().unwrap(), TxRecord::Raw { .. }));
+
+        assert_eq!(storage.prune_sealed(6, 4, FriProfile::Test).unwrap(), 1, "the window passed: one record rewrites");
+        let record = storage.tx_record(&covered_tx.hash()).unwrap().unwrap();
+        let TxRecord::Pruned { height, index, tx, proof_hash, public_values, shape } = record else {
+            panic!("expected the pruned form, got {record:?}")
+        };
+        assert_eq!((height, index), (1, 0));
+        let fixture = crate::agg_executor::fixture_proof(0);
+        let expect: Vec<u64> = fixture.public_values.clone();
+        assert_eq!(public_values, expect, "the 34 public values ride the record");
+        assert_eq!(shape, fixture_shape(&fixture), "and the declared shape, 7 bytes' worth");
+        let stored_proof = crate::agg_executor::fixture_proof(0).to_bytes();
+        assert_eq!(proof_hash, Hash::digest(&stored_proof));
+        let proof_field = tx.bundle.as_ref().unwrap().proof.clone();
+        assert!(proof_field.starts_with(PRUNED_PROOF_MARKER), "the marker form, not a proof");
+        assert_eq!(proof_field.len(), PRUNED_PROOF_MARKER.len() + 32);
+        // The two forms read one way: admission's record is identical before and after pruning.
+        let pruned = storage.covered_record(&covered_tx.hash(), FriProfile::Test).unwrap().unwrap();
+        assert_eq!(pruned, raw);
+
+        // The never-prune list: the aggregate's own (bundle-less) record and the register's
+        // unsealed bundle both stay raw.
+        assert!(matches!(storage.tx_record(&aggregate.hash()).unwrap().unwrap(), TxRecord::Raw { .. }), "an aggregate is never pruned");
+        let block1 = storage.block_by_height(1).unwrap().unwrap();
+        let register_tx = &block1.transactions[1];
+        assert!(matches!(storage.tx_record(&register_tx.hash()).unwrap().unwrap(), TxRecord::Raw { .. }), "an unsealed bundle is never pruned");
+    }
+
+    /// `verify_chain` on a pruned store recomputes the direct ledger exactly (spec §6.2's
+    /// proof, as a test): the replay's covered-carrying apply reads the pruned record's 34
+    /// public values and declared shape where the raw proof's bytes are gone — and without the
+    /// record the replay refuses the aggregate's block, so the record is load-bearing, not
+    /// decoration. The chain is stub-consistent end to end (a synthetic plaintext can never
+    /// replay a real fixture proof — the digest compare binds them — so the pruned record is
+    /// written directly; the Raw form's equivalence to it is the round-trip test above's claim).
+    #[test]
+    fn verify_chain_on_a_pruned_store_recomputes_the_direct_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let shape = DeclaredShape {
+            profile: FriProfile::Test,
+            tier: 14,
+            program_log_height: 13,
+            input_log_height: 12,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 2,
+            mem_log_height: 18,
+        };
+        let hc = Hash::digest(b"the bundle guest");
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 100);
+        gs.ledger.set_aggregation(Some(gated_cfg(shape, hc, 256)));
+        storage.init_genesis(&gs).unwrap();
+
+        // Block 1: the bundle the aggregate will cover (stub-proven, so the chain replays) and
+        // the registration.
+        let fee = shrugg_core::gas::BUNDLE_BASE + 60;
+        let covered_tx = bundle_tx(&gs.ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee);
+        let register = register_tx(&gs.ledger, &key(7), 100 * shrugg_core::UNITS_PER_SHRUGG);
+        let mut l1 = gs.ledger.clone();
+        l1.set_height(1);
+        l1.set_timestamp_ms(1);
+        l1.apply_transactions(&[covered_tx.clone(), register.clone()], &key(1).address(), &StubExecutor).unwrap();
+        l1.record_anchor(1);
+        let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), register], &key(1));
+        storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
+
+        // The covered record as the pruned form carries it: the 34 public values (with the
+        // guest's hc at HC0..7) and the registered shape.
+        let hc_words: [u32; 8] = shrugg_core::notes::word8_from_bytes(hc.as_bytes()).unwrap();
+        let mut pv = [0u64; 34];
+        pv[shrugg_core::types::pv::TIER] = shape.tier as u64;
+        for k in 0..8 {
+            pv[shrugg_core::types::pv::OUT0 + k] = 100 + k as u64;
+            pv[shrugg_core::types::pv::HC0 + k] = hc_words[k] as u64;
+        }
+        let covered = CoveredBundle { public_values: pv, shape };
+
+        // Block 2: the aggregate, applied against that record.
+        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
+        let sidecar: BTreeMap<usize, Vec<CoveredBundle>> = [(0usize, vec![covered.clone()])].into_iter().collect();
+        let mut l2 = l1.clone();
+        l2.set_height(2);
+        l2.set_timestamp_ms(2);
+        l2.apply_transactions_with_covered(&[aggregate.clone()], &key(1).address(), &sidecar, &StubExecutor).unwrap();
+        l2.record_anchor(2);
+        let b2 = make_block_unchecked(&b1.block, &l2, vec![aggregate.clone()], &key(1));
+        storage.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
+
+        // Without the record, the replay refuses the aggregate's block: it is load-bearing.
+        let without = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(without.problem.is_some(), "the replay must refuse without the covered record");
+
+        // Write the pruned record directly — the form the pruning pass would have produced.
+        let proof_hash = Hash::digest(&covered_tx.bundle.as_ref().unwrap().proof);
+        let mut pruned_tx = covered_tx.clone();
+        let mut marker = PRUNED_PROOF_MARKER.to_vec();
+        marker.extend_from_slice(proof_hash.as_bytes());
+        pruned_tx.bundle.as_mut().unwrap().proof = marker;
+        let record = TxRecord::Pruned {
+            height: 1,
+            index: 0,
+            tx: pruned_tx,
+            proof_hash,
+            public_values: pv.to_vec(),
+            shape,
+        };
+        storage
+            .db
+            .put_cf(storage.cf(CF_TXS), covered_tx.hash().as_bytes(), bincode::serialize(&record).unwrap())
+            .unwrap();
+
+        let replayed = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(replayed.problem.is_none(), "pruned replay: {:?}", replayed.problem);
+        assert_eq!(replayed.last_good, 2);
+        assert_eq!(replayed.ledger, l2, "the same ledger the direct apply computed");
+        assert_eq!(replayed.ledger.state_root(), l2.state_root(), "the same root");
+        assert_eq!(replayed.ledger.supply(), l2.supply(), "the same counters");
+        assert_eq!(replayed.ledger.unsealed_fees(), l2.unsealed_fees(), "the same bucket");
     }
 }

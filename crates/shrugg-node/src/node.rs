@@ -62,6 +62,9 @@ pub struct NodeConfig {
     pub max_timeout: Duration,
     /// Chain integrity check at startup; damaged tail is truncated and resynced from peers.
     pub verify: VerifyMode,
+    /// Keep the raw proofs of sealed bundles (spec §6.2's archive flag): the pruning pass
+    /// never runs when set.
+    pub keep_raw_proofs: bool,
 }
 
 /// Handles returned by `Node::start` so tests and the CLI can observe the node.
@@ -230,12 +233,12 @@ fn validate_for_pool(
 }
 
 /// The covered-bundle records an aggregate's admission needs (spec §3.2), assembled from the
-/// store: for each cover hash, the committed transaction's 34 public values and declared shape,
-/// read off its bundle proof's stored header. A stored block is finalised by construction (only
-/// committed blocks are stored), chain-9 is implied by the genesis gate, and `sealed_by` does
-/// not exist until Task 6 — so the coverability checks that remain here are existence,
-/// bundle-ness, and the window. A stored record that cannot be read back indicts this node's
-/// store, not the transaction: `CoverStoreCorrupt`, never a permanent verdict.
+/// store: the records themselves come from [`Storage::covered_record`] (one read for the raw
+/// and the pruned form), and the policy half is here — a stored block is finalised by
+/// construction (only committed blocks are stored), chain-9 is implied by the genesis gate, the
+/// window (§3.3), and the seal (§6.1): a covered bundle is never coverable again. A stored
+/// record that cannot be read back indicts this node's store, not the transaction:
+/// `CoverStoreCorrupt`, never a permanent verdict.
 fn assemble_covered(
     storage: &Storage,
     head: u64,
@@ -249,37 +252,37 @@ fn assemble_covered(
         .iter()
         .map(|cover| {
             let corrupt = || TxError::Aggregation(A::CoverStoreCorrupt(*cover));
-            let (height, index) = storage
-                .tx_location(cover)
-                .map_err(|_| corrupt())?
-                .ok_or(TxError::Aggregation(A::UnknownCover(*cover)))?;
+            let (height, _) = storage.tx_location(cover).map_err(|_| corrupt())?.ok_or(TxError::Aggregation(A::UnknownCover(*cover)))?;
             // The window (spec §3.3): the bundle's block must be newer than `head - window`.
             if height + window <= head {
                 return Err(TxError::Aggregation(A::CoverOutsideWindow { cover: *cover, block: height, head }));
             }
-            let block = storage.block_by_height(height).map_err(|_| corrupt())?.ok_or_else(corrupt)?;
-            let tx = block.transactions.get(index as usize).ok_or_else(corrupt)?;
-            let Some(bundle) = &tx.bundle else {
-                return Err(TxError::Aggregation(A::CoverNotABundle(*cover)));
-            };
-            let proof: shrugg_zkvm::machine::Proof =
-                postcard::from_bytes(&bundle.proof).map_err(|_| corrupt())?;
-            let public_values: [u64; 34] = proof.public_values.clone().try_into().map_err(|_| corrupt())?;
-            Ok(shrugg_core::types::CoveredBundle {
-                public_values,
-                shape: shrugg_core::types::DeclaredShape {
-                    profile,
-                    tier: proof.tier.0 as u8,
-                    program_log_height: proof.program_log_height,
-                    input_log_height: proof.input_log_height,
-                    keccak_log_height: proof.keccak_log_height,
-                    sha256_log_height: proof.sha256_log_height,
-                    public_log_height: proof.public_log_height,
-                    mem_log_height: proof.mem_log_height,
-                },
-            })
+            if storage.sealed_by(cover).map_err(|_| corrupt())?.is_some() {
+                return Err(TxError::Aggregation(A::CoverSealed(*cover)));
+            }
+            storage
+                .covered_record(cover, profile)
+                .map_err(|_| corrupt())?
+                .ok_or(TxError::Aggregation(A::CoverNotABundle(*cover)))
         })
         .collect()
+}
+
+/// HotStuff's covered source over the store (spec §3.2): `assemble_covered`'s exact checks,
+/// answered against the committed head. The seal and the window are admission policy, not
+/// consensus — a covered bundle's excess resolves through the ledger's bucket either way — so
+/// the committed head is the right vantage for them here.
+struct StoreCovered {
+    storage: Arc<Storage>,
+    window: u64,
+    profile: shrugg_core::types::FriProfile,
+}
+
+impl shrugg_core::consensus::CoveredSource for StoreCovered {
+    fn covered(&self, covers: &[Hash]) -> Option<Vec<shrugg_core::types::CoveredBundle>> {
+        let head = self.storage.head().ok()?.height;
+        assemble_covered(&self.storage, head, self.window, self.profile, covers).ok()
+    }
 }
 
 struct Node {
@@ -469,7 +472,17 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // signer that is in no current set and observes until an epoch admits it; what the RPC
     // reports as *in the current set* is `active_validator`.
     let signer = if cfg.validator { Some(Keypair::from_seed(cfg.seed)?) } else { None };
-    let hs = resume_consensus(&storage, &gs, signer, cfg.base_timeout, cfg.max_timeout, executor.clone())?;
+    let mut hs = resume_consensus(&storage, &gs, signer, cfg.base_timeout, cfg.max_timeout, executor.clone())?;
+    // The covered source (spec §3.2): on a chain that aggregates, proposals and candidates
+    // carrying an `Aggregate` apply through the covered-carrying path, answered from the store.
+    // Set once, before the loop's first proposal; a chain without the section never consults it.
+    if let Some(agg) = gs.ledger.aggregation() {
+        hs.set_covered_source(Arc::new(StoreCovered {
+            storage: storage.clone(),
+            window: agg.window,
+            profile: core_profile(&gs.fri_profile),
+        }));
+    }
 
     // Network.
     let identity = key.derive_subkey(b"shrugg-p2p-identity");
@@ -931,9 +944,15 @@ impl Node {
         }
         let ledger = self.hs.committed_ledger().clone();
         self.storage.commit(&blocks, &ledger, &epoch_sets, self.executor.as_ref())?;
+        let mut newly_sealed: Vec<Hash> = Vec::new();
         for cb in &blocks {
             let included: Vec<Hash> = cb.block.transactions.iter().map(|tx| tx.hash()).collect();
             self.mempool.remove(&included);
+            for tx in &cb.block.transactions {
+                if let shrugg_core::types::Action::Aggregate { covers, .. } = &tx.action {
+                    newly_sealed.extend_from_slice(covers);
+                }
+            }
             tracing::info!(
                 "committed block {} view {} txs {} hash {:?}",
                 cb.block.height(),
@@ -941,6 +960,35 @@ impl Node {
                 cb.block.transactions.len(),
                 cb.block.hash()
             );
+        }
+        // Spec §3.4's pool rule: a pooled aggregate whose cover set just sealed is dead — its
+        // excess would pay out nothing new — so it leaves the pool here rather than at the
+        // window's end.
+        if !newly_sealed.is_empty() {
+            let doomed: Vec<Hash> = self
+                .mempool
+                .pooled_aggregate_covers()
+                .into_iter()
+                .filter(|(_, covers)| covers.iter().any(|c| newly_sealed.contains(c)))
+                .map(|(hash, _)| hash)
+                .collect();
+            self.mempool.remove(&doomed);
+        }
+        // The pruning pass (spec §6.2 — policy, never consensus): sealed bundles whose window
+        // has passed become their pruned record. Every 16 blocks is often enough that the pass
+        // lags the gate by at most that; `--keep-raw-proofs` archives instead.
+        let head = self.hs.committed_height();
+        if !self.cfg.keep_raw_proofs && head % 16 == 0 {
+            if let Some(agg) = self.hs.committed_ledger().aggregation().cloned() {
+                let profile = core_profile(&self.gs.fri_profile);
+                let storage = self.storage.clone();
+                let pruned = tokio::task::spawn_blocking(move || storage.prune_sealed(head, agg.window, profile))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("pruning task: {e}"))??;
+                if pruned > 0 {
+                    tracing::info!("pruned {pruned} sealed bundle records at head {head}");
+                }
+            }
         }
         self.mempool.prune(self.hs.tip_ledger());
         self.publish_heads(&blocks);
@@ -1615,7 +1663,7 @@ mod tests {
         ledger.set_height(1);
         let fee = shrugg_core::gas::BUNDLE_BASE + 60;
         let fee_tx = bundle_tx(&ledger, [[41; 8], [42; 8]], [[43; 8], [44; 8]], fee);
-        let mut register_tx = {
+        let register_tx = {
             let kp = key(7);
             let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; shrugg_core::notes::KEM_EK_BYTES] };
             let registration = AggregatorRegistration {
@@ -1811,6 +1859,13 @@ mod tests {
                 block: 1,
                 head: 300
             }))
+        );
+        // And a sealed bundle is never coverable again (spec §3.2.3): the mark lands and the
+        // same assembly now names it.
+        storage.mark_sealed(hash, Hash::digest(b"the covering aggregate"), 2).unwrap();
+        assert_eq!(
+            assemble_covered(&storage, 200, 256, shrugg_core::types::FriProfile::Test, &[hash]),
+            Err(shrugg_core::TxError::Aggregation(AggregationError::CoverSealed(hash)))
         );
     }
 

@@ -1,8 +1,8 @@
 use super::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, EpochSets, NewView, SafetyState};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, Keypair};
-use crate::ledger::Ledger;
-use crate::types::{Block, BlockHeader, QuorumCertificate, Transaction, ValidatorSet, Vote};
+use crate::ledger::{BlockError, Ledger, TxError};
+use crate::types::{Block, BlockHeader, CoveredBundle, QuorumCertificate, Transaction, ValidatorSet, Vote};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,10 +31,25 @@ struct Entry {
 }
 
 /// Chained HotStuff replica. Validators hold a `signer`; observing full nodes do not.
+/// What the covered-carrying apply path asks of the node (block aggregation, spec §3.2): the
+/// covered bundles' records for an aggregate's cover set, or `None` when any of them is
+/// unavailable — which the block's validators then read as the covered-carrying admission's
+/// own refusal, at the aggregate's index. The node answers from its transaction store; the
+/// ledger itself has none, which is why this is a callback and not a method on it.
+pub trait CoveredSource: Send + Sync {
+    fn covered(&self, covers: &[Hash]) -> Option<Vec<CoveredBundle>>;
+}
+
 pub struct HotStuff {
     cfg: ConsensusConfig,
     signer: Option<Keypair>,
     executor: Arc<dyn ConfidentialExecutor>,
+    /// The node's covered-bundle record source (block aggregation, spec §3.2): consulted only
+    /// for blocks and candidates that carry an `Aggregate`, whose admission needs the covered
+    /// bundles' records — which live in the node's store, not the ledger. `None` until the node
+    /// sets one (tests, and any chain that never aggregates): an `Aggregate` then takes the T4
+    /// signpost error, exactly as before.
+    covered: Option<Arc<dyn CoveredSource>>,
 
     view: u64,
     high_qc: QuorumCertificate,
@@ -138,6 +153,7 @@ impl HotStuff {
             cfg,
             signer,
             executor,
+            covered: None,
             view,
             high_qc,
             locked_qc,
@@ -189,6 +205,31 @@ impl HotStuff {
     }
     pub fn address(&self) -> Option<Address> {
         self.signer.as_ref().map(|k| k.address())
+    }
+
+    /// Register the node's covered-bundle record source (block aggregation): the store the
+    /// covered-carrying apply path consults for any proposal or candidate carrying an
+    /// `Aggregate`. Called once at startup; everything before it keeps the T4 behavior.
+    pub fn set_covered_source(&mut self, source: Arc<dyn CoveredSource>) {
+        self.covered = Some(source);
+    }
+
+    /// The covered-bundle records a block's `Aggregate` transactions need, keyed by their
+    /// index in it — empty for a block that carries none, so a chain that never aggregates
+    /// never consults the source. An aggregate the source cannot cover is the covered-carrying
+    /// admission's refusal, at its index.
+    fn covered_sidecar(&self, block: &Block) -> Result<BTreeMap<usize, Vec<CoveredBundle>>, ConsensusError> {
+        let mut sidecar = BTreeMap::new();
+        for (index, tx) in block.transactions.iter().enumerate() {
+            if let crate::types::Action::Aggregate { covers, .. } = &tx.action {
+                let records = self.covered.as_ref().and_then(|s| s.covered(covers)).ok_or(BlockError::InvalidTx {
+                    index,
+                    error: TxError::AggregateNeedsCovered,
+                })?;
+                sidecar.insert(index, records);
+            }
+        }
+        Ok(sidecar)
     }
 
     // ---- epochs ------------------------------------------------------------
@@ -453,7 +494,8 @@ impl HotStuff {
             return Err(ConsensusError::TreeFull);
         }
         let mut ledger = parent.ledger_after.clone();
-        let receipts = ledger.apply_block(&block, self.executor.as_ref())?;
+        let sidecar = self.covered_sidecar(&block)?;
+        let receipts = ledger.apply_block_with_covered(&block, &sidecar, self.executor.as_ref())?;
         self.tree.insert(hash, Entry { block: block.clone(), ledger_after: ledger, receipts });
         self.refresh_current_set();
 
@@ -637,7 +679,39 @@ impl HotStuff {
         ledger.set_timestamp_ms(timestamp_ms);
         let mut txs = Vec::with_capacity(candidates.len());
         let me = signer.address();
-        for tx in candidates {
+        // The aggregate selection (spec §3.4): at most one `Aggregate` per block — the largest
+        // cover set among the candidates that apply, ties to the lowest proof hash. The rest
+        // stay pooled for a later block; a cover set the store cannot cover skips its own
+        // candidate, never the block.
+        let mut aggregates: Vec<(usize, crate::types::Transaction)> = Vec::new();
+        let mut ordinary = Vec::new();
+        for (i, tx) in candidates.into_iter().enumerate() {
+            if matches!(tx.action, crate::types::Action::Aggregate { .. }) {
+                aggregates.push((i, tx));
+            } else {
+                ordinary.push(tx);
+            }
+        }
+        aggregates.sort_by(|(_, a), (_, b)| {
+            let (crate::types::Action::Aggregate { covers: ca, proof: pa, .. }, crate::types::Action::Aggregate { covers: cb, proof: pb, .. }) =
+                (&a.action, &b.action)
+            else {
+                unreachable!("filtered above")
+            };
+            cb.len().cmp(&ca.len()).then_with(|| Hash::digest(pa).cmp(&Hash::digest(pb)))
+        });
+        let mut chosen = None;
+        for (_, tx) in aggregates {
+            let crate::types::Action::Aggregate { covers, .. } = &tx.action else { unreachable!() };
+            let Some(c) = self.covered.as_ref().and_then(|s| s.covered(covers)) else { continue };
+            let mut trial = ledger.clone();
+            if trial.apply_aggregate(&tx, &c, self.executor.as_ref()).is_ok() {
+                ledger = trial;
+                chosen = Some(tx);
+                break;
+            }
+        }
+        for tx in ordinary {
             // Apply on a trial clone: a transaction that fails part-way through
             // must not leave the cumulative ledger dirty for the next candidate
             // or for the state root committed to the header.
@@ -646,6 +720,9 @@ impl HotStuff {
                 ledger = trial;
                 txs.push(tx);
             }
+        }
+        if let Some(tx) = chosen {
+            txs.push(tx);
         }
         let header = BlockHeader {
             height: parent.block.height() + 1,

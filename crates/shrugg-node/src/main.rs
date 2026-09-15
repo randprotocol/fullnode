@@ -210,6 +210,11 @@ enum Cmd {
         /// Startup chain integrity check: off, quick (structure + ledger replay), full (also signatures).
         #[arg(long, default_value = "quick")]
         verify_chain: String,
+        /// Keep the raw proofs of sealed bundles (block aggregation, spec §6.2): an archive
+        /// node. By default the pruning pass rewrites a sealed bundle's record to its pruned
+        /// form (34 public values + the declared shape) once the window passes.
+        #[arg(long)]
+        keep_raw_proofs: bool,
     },
     /// Verify the chain in a data directory without running the node.
     Verify {
@@ -370,7 +375,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Run { datadir, key, listen, bootstrap, rpc, validator, no_mdns, block_interval_ms, view_timeout_ms, verify_chain } => {
+        Cmd::Run { datadir, key, listen, bootstrap, rpc, validator, no_mdns, block_interval_ms, view_timeout_ms, verify_chain, keep_raw_proofs } => {
             let kp = load_keypair(&key)?;
             let handle = node::start(NodeConfig {
                 datadir,
@@ -384,6 +389,7 @@ async fn main() -> Result<()> {
                 base_timeout: Duration::from_millis(view_timeout_ms),
                 max_timeout: Duration::from_millis(view_timeout_ms * 8),
                 verify: verify_chain.parse().map_err(|e: String| anyhow::anyhow!(e))?,
+                keep_raw_proofs,
             })
             .await?;
             let mut handle = handle;

@@ -70,17 +70,20 @@ struct Pooled {
     claim: Option<(Address, u64)>,
 }
 
-/// The register nonce a bundle-less `Unbond` or `Withdraw` claims — and an `Aggregate`'s
-/// `(aggregator, nonce)`, one register over (spec §4 step 5) — `None` for every other action.
-/// Two pooled transactions can never both apply at the same nonce — the register accepts
-/// only the one matching its current nonce — so this is a pool-level claim exactly like a
-/// commitment: at most one pooled transaction may hold it.
+/// The register nonce a bundle-less `Unbond` or `Withdraw` claims — and the aggregator
+/// register's nonce-consuming actions, one register over: an `Aggregate`'s (spec §4 step 5)
+/// and an `UnbondAggregator`'s or `WithdrawAggregator`'s `(aggregator, nonce)`. `None` for
+/// every other action. Two pooled transactions can never both apply at the same nonce — the
+/// register accepts only the one matching its current nonce — so this is a pool-level claim
+/// exactly like a commitment: at most one pooled transaction may hold it.
 fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
     match action {
         Action::Unbond { validator, nonce, .. } | Action::Withdraw { validator, nonce, .. } => {
             Some((*validator, *nonce))
         }
-        Action::Aggregate { aggregator, nonce, .. } => Some((*aggregator, *nonce)),
+        Action::Aggregate { aggregator, nonce, .. }
+        | Action::UnbondAggregator { aggregator, nonce, .. }
+        | Action::WithdrawAggregator { aggregator, nonce, .. } => Some((*aggregator, *nonce)),
         _ => None,
     }
 }
@@ -97,7 +100,7 @@ fn claim_conflict_key(validator: &Address) -> Word8 {
 /// a slot the two registers do not share (chain-9 runs both roles on the same ops keys).
 fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
     let role = match action {
-        Action::Aggregate { .. } => 1u8,
+        Action::Aggregate { .. } | Action::UnbondAggregator { .. } | Action::WithdrawAggregator { .. } => 1u8,
         _ => 0,
     };
     (role, claim.0, claim.1)
@@ -301,6 +304,18 @@ impl Mempool {
         self.candidates_within(ledger, max, usize::MAX)
     }
 
+    /// Every pooled aggregate's `(tx hash, cover set)` — the commit path's §3.4 rule (a pooled
+    /// aggregate whose cover just sealed leaves the pool) reads nothing else of the pool.
+    pub fn pooled_aggregate_covers(&self) -> Vec<(Hash, Vec<Hash>)> {
+        self.txs
+            .values()
+            .filter_map(|p| match &p.tx.action {
+                Action::Aggregate { covers, .. } => Some((p.tx.hash(), covers.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Like `candidates`, but keeps the encoded size of the selection within `max_bytes`, skipping
     /// any transaction that would not fit rather than ending the selection at it.
     ///
@@ -363,8 +378,11 @@ impl Mempool {
         }
         // A bundle-less `Withdraw` (S2) carries a `time` of its own, under the same window rule —
         // so it goes stale here the same way a bundle does (`Ledger::time_in_window`). An
-        // `Aggregate`'s payout note's `time` (spec §4 step 3) is the same promise, one action over.
-        if let Action::Withdraw { time, .. } | Action::Aggregate { time, .. } = &tx.action {
+        // `Aggregate`'s payout note's `time` (spec §4 step 3) is the same promise, one action
+        // over, and a `WithdrawAggregator`'s note time is its `Withdraw` twin's, one register over.
+        if let Action::Withdraw { time, .. } | Action::Aggregate { time, .. } | Action::WithdrawAggregator { time, .. } =
+            &tx.action
+        {
             if !ledger.time_in_window(*time) {
                 return Err(TxError::TimeOutOfWindow { time: *time, height: ledger.height() });
             }
@@ -421,7 +439,10 @@ impl Mempool {
         // (and every proposal's trial-apply) until the node restarts. An `Aggregate`'s claim is
         // the aggregator register's nonce, so it is read there (spec §4 step 5).
         if let Some((addr, nonce)) = claim {
-            if matches!(tx.action, Action::Aggregate { .. }) {
+            if matches!(
+                tx.action,
+                Action::Aggregate { .. } | Action::UnbondAggregator { .. } | Action::WithdrawAggregator { .. }
+            ) {
                 use shrugg_core::ledger::aggregation::AggregationError;
                 match ledger.aggregators().get(&addr).map(|e| e.nonce) {
                     Some(current) if current == nonce => {}
@@ -1328,6 +1349,89 @@ mod tests {
             m.precheck(&unbond, &l, &StubExecutor).is_ok(),
             "one keypair's two roles must not collide over a shared address and nonce"
         );
+
+        // The register's other nonce consumers claim the same slot: an `UnbondAggregator` at
+        // the same nonce conflicts with the pooled aggregate, and so does a
+        // `WithdrawAggregator` — one register, one nonce, one claim.
+        let agg_unbond = Transaction {
+            chain_id: 1,
+            bundle: None,
+            action: Action::UnbondAggregator {
+                aggregator: addr,
+                nonce: 0,
+                signature: kp.sign(
+                    shrugg_core::types::actions::aggregator_unbond_message(1, &addr, 0).as_bytes(),
+                ),
+            },
+        };
+        assert_eq!(
+            m.precheck(&agg_unbond, &l, &StubExecutor),
+            Err(MempoolError::Conflict(claim_conflict_key(&addr)))
+        );
+        let agg_withdraw = Transaction {
+            chain_id: 1,
+            bundle: None,
+            action: Action::WithdrawAggregator {
+                aggregator: addr,
+                nonce: 0,
+                time: 0,
+                r: [4; 8],
+                envelope: fixtures::env(5),
+                signature: kp.sign(
+                    shrugg_core::types::actions::aggregator_withdraw_message(1, &addr, 0, 0, &[4; 8], &fixtures::env(5))
+                        .as_bytes(),
+                ),
+            },
+        };
+        assert_eq!(
+            m.precheck(&agg_withdraw, &l, &StubExecutor),
+            Err(MempoolError::Conflict(claim_conflict_key(&addr)))
+        );
+    }
+
+    /// A `WithdrawAggregator`'s note time goes stale by the same rule as a `Withdraw`'s: out of
+    /// the window, the pre-screen refuses it before any register work.
+    #[test]
+    fn a_withdraw_aggregator_whose_time_is_outside_the_window_is_refused() {
+        use shrugg_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use shrugg_core::types::actions::aggregator_withdraw_message;
+        use shrugg_core::types::{DeclaredShape, FriProfile};
+
+        let kp = fixtures::key(1);
+        let addr = kp.public_key().address();
+        let mut l = ledger();
+        l.set_aggregation(Some(AggregationConfig {
+            bond: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            max_covers: 3,
+            subsidy_base: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![],
+        }));
+        // Height 1, so a future time is outside the window.
+        l.set_height(1);
+        let tx = Transaction {
+            chain_id: 1,
+            bundle: None,
+            action: Action::WithdrawAggregator {
+                aggregator: addr,
+                nonce: 0,
+                time: 2,
+                r: [4; 8],
+                envelope: fixtures::env(5),
+                signature: kp.sign(aggregator_withdraw_message(1, &addr, 0, 2, &[4; 8], &fixtures::env(5)).as_bytes()),
+            },
+        };
+        match l.validate(&tx, &StubExecutor) {
+            Err(TxError::TimeOutOfWindow { time: 2, height: 1 }) => {}
+            other => panic!("a stale note time must be refused, got {other:?}"),
+        }
+        // And the pre-screen reports it the same way.
+        let m = Mempool::new(10);
+        match m.precheck(&tx, &l, &StubExecutor) {
+            Err(MempoolError::Invalid(TxError::TimeOutOfWindow { time: 2, height: 1 })) => {}
+            other => panic!("the pre-screen must report it too, got {other:?}"),
+        }
     }
 
 }

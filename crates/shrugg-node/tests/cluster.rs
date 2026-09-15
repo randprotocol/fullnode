@@ -314,6 +314,7 @@ async fn start_in_at(
         base_timeout: Duration::from_millis(1500).max(block_interval * 10),
         max_timeout: Duration::from_secs(6).max(block_interval * 40),
         verify: shrugg_node::storage::VerifyMode::Full,
+        keep_raw_proofs: false,
     })
     .await
     .expect("node starts");
@@ -748,6 +749,7 @@ async fn a_build_whose_bundle_guest_differs_from_genesis_refuses_to_start() {
         base_timeout: Duration::from_millis(1500),
         max_timeout: Duration::from_secs(6),
         verify: shrugg_node::storage::VerifyMode::Full,
+        keep_raw_proofs: false,
     })
     .await;
     // `NodeHandle` is not `Debug`, so unwrap the error by hand rather than via `expect_err`.

@@ -118,6 +118,7 @@ async fn start_one_validator_with(
         base_timeout: Duration::from_millis(1500),
         max_timeout: Duration::from_secs(6),
         verify: shrugg_node::storage::VerifyMode::Full,
+        keep_raw_proofs: false,
     })
     .await
     .expect("node starts");

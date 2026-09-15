@@ -108,7 +108,8 @@ pub fn is_permanent(e: &TxError) -> bool {
     // *is* its key's address, so no re-registration can ever make a bad signature a good one.
     // `UnregisteredShape`/`CoveredShapeMismatch`/`CoveredGuestMismatch` judge the covered
     // bundles against the admitted shapes, which are genesis constants. `CoverNotABundle` is a
-    // statement about a *committed* — finalised, immutable — transaction's shape. Everything
+    // statement about a *committed* — finalised, immutable — transaction's shape, and
+    // `CoverSealed` one about committed history, which only ever accumulates. Everything
     // else (`UnknownAggregator`, `Unbonding`, `BadNonce`, the payout's `CommitmentExists`,
     // `UnknownCover`, `CoverOutsideWindow`, `CoverStoreCorrupt`, the register actions' own
     // verdicts) moves with this node's state and stays out.
@@ -124,6 +125,7 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | A::CoveredShapeMismatch { .. }
                 | A::CoveredGuestMismatch(_)
                 | A::CoverNotABundle(_)
+                | A::CoverSealed(_)
         );
     }
     matches!(
@@ -450,6 +452,7 @@ mod tests {
             agg(A::CoveredShapeMismatch { cover: h(3), field: "tier", expected: 14, actual: 15 }),
             agg(A::CoveredGuestMismatch(h(4))),
             agg(A::CoverNotABundle(h(5))),
+            agg(A::CoverSealed(h(5))),
             TxError::AggregateTooLarge(9_000_000),
             TxError::InvalidAggregateProof(ConfidentialError::MalformedProof),
         ] {

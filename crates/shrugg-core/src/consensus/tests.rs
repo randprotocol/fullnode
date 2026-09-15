@@ -1,7 +1,7 @@
 //! Deterministic multi-replica simulation of the HotStuff state machine.
 
 use super::*;
-use crate::confidential::StubExecutor;
+use crate::confidential::{ConfidentialExecutor, StubExecutor};
 use crate::genesis::{Genesis, GenesisValidator};
 use crate::notes::{word8_to_hex, Envelope};
 use crate::types::Transaction;
@@ -1279,5 +1279,204 @@ fn a_block_whose_height_skips_its_parent_is_refused_before_its_epoch_is_derived(
     assert_eq!(
         sim.nodes[0].on_proposal(block, sim.now).unwrap_err(),
         ConsensusError::BadHeight { block: parent.height() + 1 + 4_000_000, parent: parent.height() }
+    );
+}
+
+// ── block aggregation: the covered source and the §3.4 selection ─────────────────────────────
+
+/// A one-validator HotStuff with an aggregation-gated genesis, a registered aggregator, and a
+/// covered source that answers every cover set with the same synthetic record.
+fn aggregation_node() -> (HotStuff, Keypair, crate::ledger::aggregation::AggregationConfig) {
+    use crate::ledger::aggregation::{AdmittedShape, AggregationConfig};
+    use crate::types::actions::{aggregator_register_message, AggregatorRegistration};
+    use crate::types::{DeclaredShape, FriProfile};
+    let key = Keypair::from_seed([1; 32]).unwrap();
+    let shape = DeclaredShape {
+        profile: FriProfile::Test,
+        tier: 14,
+        program_log_height: 13,
+        input_log_height: 12,
+        keccak_log_height: 0,
+        sha256_log_height: 0,
+        public_log_height: 2,
+        mem_log_height: 18,
+    };
+    let cfg = AggregationConfig {
+        bond: 100 * crate::types::UNITS_PER_SHRUGG,
+        max_covers: 3,
+        subsidy_base: 100 * crate::types::UNITS_PER_SHRUGG,
+        halving_blocks: 210_000,
+        window: 256,
+        admitted_shapes: vec![AdmittedShape { shape, hc: Hash::digest(b"the bundle guest"), aggregate_program_digest: [1; 4] }],
+    };
+    let genesis = Genesis {
+        chain_id: 1,
+        timestamp_ms: 0,
+        validators: vec![GenesisValidator {
+            public_key: key.public_key().clone(),
+            stake: crate::ledger::staking::MIN_STAKE as u128,
+            payout: payout(1),
+        }],
+        alloc: Vec::new(),
+        faucet: true,
+        confidential: true,
+        fri_profile: "production".into(),
+        hc_bundle: word8_to_hex(&[3; 8]),
+        epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
+        bridge: None,
+        aggregation: Some(cfg.clone()),
+    };
+    let mut gs = genesis.build(&StubExecutor).unwrap();
+    // Register the aggregator directly on the genesis ledger the node builds on (the register
+    // move is what a first block would have done anyway; nothing here re-verifies genesis).
+    let payout_addr = crate::notes::ShieldedAddress { pk: [7; 8], kem_ek: vec![8; crate::notes::KEM_EK_BYTES] };
+    let registration = AggregatorRegistration {
+        public_key: key.public_key().clone(),
+        payout: payout_addr.clone(),
+        signature: key.sign(aggregator_register_message(1, &payout_addr).as_bytes()),
+    };
+    let mut b = crate::notes::Bundle {
+        anchor: gs.ledger.root(),
+        nullifiers: [[11; 8], [12; 8]],
+        commitments: [[13; 8], [14; 8]],
+        fee: crate::gas::BUNDLE_BASE,
+        burn: cfg.bond,
+        asset: 0,
+        time: 0,
+        envelopes: [
+            crate::notes::Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] },
+            crate::notes::Envelope { kem_ct: vec![5; 8], to_receiver: vec![6; 4], to_sender: vec![7; 4], body: vec![8; 16] },
+        ],
+        proof: vec![],
+    };
+    let d = StubExecutor.bundle_digest(&b.digest_input());
+    b.proof = StubExecutor::make_bundle_proof(&[3; 8], &d);
+    let register_tx = Transaction::shielded(1, b, crate::types::Action::RegisterAggregator { registration });
+    gs.ledger.apply_tx(&register_tx, &key.address(), &StubExecutor).unwrap();
+    let mut hs = HotStuff::new(
+        ConsensusConfig::new(1, gs.validators.clone(), gs.hash()),
+        Some(Keypair::from_seed(*key.seed()).unwrap()),
+        gs.block.clone(),
+        gs.ledger.clone(),
+        std::sync::Arc::new(StubExecutor),
+    );
+    let hc_words: [u32; 8] = crate::notes::word8_from_bytes(Hash::digest(b"the bundle guest").as_bytes()).unwrap();
+    let mut pv = [0u64; 34];
+    pv[crate::types::pv::TIER] = shape.tier as u64;
+    for k in 0..8 {
+        pv[crate::types::pv::OUT0 + k] = 100 + k as u64;
+        pv[crate::types::pv::HC0 + k] = hc_words[k] as u64;
+    }
+    let record = crate::types::CoveredBundle { public_values: pv, shape };
+    struct TestCovered(crate::types::CoveredBundle);
+    impl CoveredSource for TestCovered {
+        fn covered(&self, covers: &[Hash]) -> Option<Vec<crate::types::CoveredBundle>> {
+            Some(vec![self.0.clone(); covers.len()])
+        }
+    }
+    hs.set_covered_source(std::sync::Arc::new(TestCovered(record)));
+    (hs, key, cfg)
+}
+
+fn aggregate_tx(key: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
+    let aggregator = key.public_key().address();
+    let r = [9; 8];
+    let signature = key.sign(
+        crate::types::actions::aggregate_signing_hash(1, nonce, time, &r, &covers, &Hash::digest(&proof)).as_bytes(),
+    );
+    Transaction {
+        chain_id: 1,
+        bundle: None,
+        action: crate::types::Action::Aggregate {
+            covers,
+            proof,
+            aggregator,
+            nonce,
+            time,
+            r,
+            envelope: crate::notes::Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] },
+            signature,
+        },
+    }
+}
+
+/// Spec §3.4's selection, in the block the leader builds: at most one aggregate — the largest
+/// cover set among the candidates that apply, ties to the lowest proof hash.
+#[test]
+fn a_proposal_carries_at_most_one_aggregate_the_largest_valid_cover_set() {
+    let (mut hs, key, _cfg) = aggregation_node();
+    hs.start();
+    let covers = |n: usize| (0..n).map(|i| Hash::digest(&[i as u8 + 40])).collect::<Vec<_>>();
+    let big = aggregate_tx(&key, 0, 1, covers(3), b"ok".to_vec());
+    let small = aggregate_tx(&key, 0, 1, covers(1), b"ok-2".to_vec());
+    let acts = hs.propose(1, vec![small.clone(), big.clone()], 1).expect("propose");
+    let proposal = acts.iter().find_map(|a| match a {
+        Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b),
+        _ => None,
+    });
+    let block = proposal.expect("a proposal was built");
+    let aggregates: Vec<_> = block
+        .transactions
+        .iter()
+        .filter(|tx| matches!(tx.action, crate::types::Action::Aggregate { .. }))
+        .collect();
+    assert_eq!(aggregates.len(), 1, "at most one aggregate per block");
+    assert_eq!(aggregates[0].hash(), big.hash(), "the largest cover set wins");
+
+    // A tie on the count goes to the lowest proof hash.
+    let mut hs2_state = aggregation_node();
+    let hs2 = &mut hs2_state.0;
+    hs2.start();
+    let (p_low, p_high) = {
+        let (a, b) = (vec![1u8; 4], vec![2u8; 4]);
+        if Hash::digest(&a) < Hash::digest(&b) { (a, b) } else { (b, a) }
+    };
+    let a_high = aggregate_tx(&key, 0, 1, covers(2), p_high.clone());
+    let a_low = aggregate_tx(&key, 0, 1, covers(2), p_low.clone());
+    assert!(Hash::digest(&p_low) < Hash::digest(&p_high), "the fixture's own order");
+    // Candidates in the losing order: the higher proof hash first.
+    let acts = hs2.propose(1, vec![a_high.clone(), a_low.clone()], 1).expect("propose");
+    let block = acts
+        .iter()
+        .find_map(|a| match a {
+            Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b),
+            _ => None,
+        })
+        .expect("a proposal was built");
+    let aggregates: Vec<_> = block
+        .transactions
+        .iter()
+        .filter(|tx| matches!(tx.action, crate::types::Action::Aggregate { .. }))
+        .collect();
+    assert_eq!(aggregates.len(), 1);
+    assert_eq!(aggregates[0].hash(), a_low.hash(), "the lowest proof hash breaks the tie");
+}
+
+/// A candidate the covered source cannot cover is skipped — never the block.
+#[test]
+fn a_proposal_skips_an_aggregate_whose_covers_are_unavailable() {
+    let (mut hs, key, _cfg) = aggregation_node();
+    hs.set_covered_source(std::sync::Arc::new({
+        struct NoneCovered;
+        impl CoveredSource for NoneCovered {
+            fn covered(&self, _covers: &[Hash]) -> Option<Vec<crate::types::CoveredBundle>> {
+                None
+            }
+        }
+        NoneCovered
+    }));
+    hs.start();
+    let agg = aggregate_tx(&key, 0, 1, vec![Hash::digest(b"cover")], b"ok".to_vec());
+    let acts = hs.propose(1, vec![agg], 1).expect("propose");
+    let block = acts
+        .iter()
+        .find_map(|a| match a {
+            Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b),
+            _ => None,
+        })
+        .expect("a proposal was built");
+    assert!(
+        block.transactions.iter().all(|tx| !matches!(tx.action, crate::types::Action::Aggregate { .. })),
+        "an uncoverable aggregate never enters the block"
     );
 }

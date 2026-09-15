@@ -9,7 +9,7 @@ mod hotstuff;
 #[cfg(test)]
 mod tests;
 
-pub use hotstuff::HotStuff;
+pub use hotstuff::{CoveredSource, HotStuff};
 
 use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
 use crate::types::{Block, QuorumCertificate, ValidatorSet, Vote};
