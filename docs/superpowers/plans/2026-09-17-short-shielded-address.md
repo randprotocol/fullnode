@@ -51,7 +51,7 @@
 - Test: inline `#[cfg(test)]` in `receiver.rs`
 
 **Interfaces:**
-- Produces: `ReceiverId(pub [u8; 32])` with `Display` (`rand1…`, 54 chars), `FromStr`/`parse`, `as_bytes`, `From<&PublicKey>`, `From<Address>`; `ReceiverRecord { version: u32, pk: Word8, kem_ek: Vec<u8>, signing_key: PublicKey, signature: Signature }` with `sign(kp, chain_id, version, pk, kem_ek) -> ReceiverRecord`, `id(&self) -> ReceiverId`, `verify(&self, id: &ReceiverId, chain_id: u64) -> Result<(), RecordError>`, `signing_hash(chain_id, version, pk, kem_ek) -> Hash`, `encoded_len()`; `receiver_signing_keypair(spend_key: &[u8; 32]) -> Keypair`; `MAX_RECORD_BYTES: usize = 8192`; `RecordError { WrongId, BadSignature, KemLength(usize), TooLarge(usize) }`.
+- Produces: `ReceiverId(pub [u8; 32])` with `Display` (`rand1…`, 53–55 chars), `FromStr`/`parse`, `as_bytes`, `From<&PublicKey>`, `From<Address>`; `ReceiverRecord { version: u32, pk: Word8, kem_ek: Vec<u8>, signing_key: PublicKey, signature: Signature }` with `sign(kp, chain_id, version, pk, kem_ek) -> ReceiverRecord`, `id(&self) -> ReceiverId`, `verify(&self, id: &ReceiverId, chain_id: u64) -> Result<(), RecordError>`, `signing_hash(chain_id, version, pk, kem_ek) -> Hash`, `encoded_len()`; `receiver_signing_keypair(spend_key: &[u8; 32]) -> Keypair`; `MAX_RECORD_BYTES: usize = 8192`; `RecordError { WrongId, BadSignature, KemLength(usize), TooLarge(usize) }`.
 
 - [ ] **Step 1: Write the failing tests**
 

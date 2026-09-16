@@ -27,7 +27,7 @@ After this spec:
 
 | | today | after |
 |---|---|---|
-| address | 1,667 chars, `rand1` + base58(pk ‖ kem_ek) | **54 chars**, `rand1` + base58(id ‖ checksum) |
+| address | 1,667 chars, `rand1` + base58(pk ‖ kem_ek) | **54 or 55 chars** (base58 is variable length), `rand1` + base58(id ‖ checksum) |
 | what the address is | the record itself | a 32-byte **receiver id** = blake3(receiver signing key) |
 | where the KEM key lives | in the address | in a signed, versioned **receiver record** |
 | how a sender gets the record | from the address | inline with a payment request, or from the explorer's registry |
@@ -58,7 +58,7 @@ address too — `Address::from(signing.public_key())` — which is what makes th
 ## 2. The address
 
 `rand1` + base58(`id` ‖ `checksum`), `checksum = blake3("rand-receiver-addr-1" ‖ id)[..4]`.
-54 characters (Algorand: 58, QRL: 79). `ShieldedAddress::parse` accepts this form only; the
+54 or 55 characters — base58 is variable length (Algorand: 58, QRL: 79). `ShieldedAddress::parse` accepts this form only; the
 long form is gone. The prefix stays `rand1` so nothing downstream (explorer, wallets, docs)
 learns a new prefix; the length and the checksum tell the forms apart, and a long-form string
 fails the length check with a message naming the change.
