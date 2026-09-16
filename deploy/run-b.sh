@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 # Prebuilt binaries at the chain-10 build (RAND: every hash domain, id and peer id changed with
 # the rename) — the whole fleet must run this one build, because a hash-domain change is a fork
 # and a mixed fleet stalls. Override with BINDIR= to test a build.
-BINDIR=${BINDIR:-bin-CHAIN10BUILD}
+BINDIR=${BINDIR:-bin-a00c88c}
 BIN=$BINDIR/rand-node
 [ -x $BIN ] || { echo "$BIN missing — build it at the chain-10 commit or set BINDIR" >&2; exit 1; }
 DATA=data-b-4d757f11   # keyed on the genesis hash so a regenerated genesis gets a fresh db

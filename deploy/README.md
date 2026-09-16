@@ -16,7 +16,7 @@ Test keys only; all seeds are committed on purpose so any machine can pull and r
 | chain id | **10** |
 | genesis hash | **`4d757f11cbbf48daaf2040fbd091d70ca66d5ff6fcb228e8319c9014a99bb7ed`** |
 | genesis file | `deploy/genesis-chain10.json` (cut 2026-09-16; chain 9's stays at `deploy/genesis-chain9.json`) |
-| pinned build | **`CHAIN10BUILD`** — binaries `rand-node` and `rand` in `bin-CHAIN10BUILD/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `CHAIN10BUILD` |
+| pinned build | **`a00c88c`** — binaries `rand-node` and `rand` in `bin-a00c88c/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `a00c88c` |
 | zkVM | **constraint set 6** (the public input segment; M4.3 EVM and M4.4 sBPF/sha256 guests ride along) |
 | `hc_bundle` | `4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb` |
 | validators | **18, every one staked at exactly 1000 RAND** (the staking minimum) |
@@ -149,13 +149,13 @@ Nothing about chain 7 is reusable — different chain id, incompatible proofs �
 start on every machine. Keep chain 7's data directory around if you want to keep serving it; the
 new `DATA` name is keyed on the genesis hash, so the two never collide.
 
-1. **Binary**: `bin-CHAIN10BUILD/rand-node` and `bin-CHAIN10BUILD/rand` (or `cargo build --release` at
-   commit `CHAIN10BUILD`; the Linux ones are built once on E and fanned out by `deploy/cutover-droplet-rand.sh`). Every node on the fleet must run this one build — a constraint-set change is a
+1. **Binary**: `bin-a00c88c/rand-node` and `bin-a00c88c/rand` (or `cargo build --release` at
+   commit `a00c88c`; the Linux ones are built once on E and fanned out by `deploy/cutover-droplet-rand.sh`). Every node on the fleet must run this one build — a constraint-set change is a
    fork, and a mixed fleet stalls.
 2. **Genesis**: `deploy/genesis-chain10.json`, byte-identical everywhere. `rand-node init` prints
    the hash; it must read `4d757f11cbbf48daaf2040fbd091d70ca66d5ff6fcb228e8319c9014a99bb7ed`.
 3. **Fresh data dir**: `data-<letter>-4d757f11` (never reuse a chain-9 directory).
-4. **`.update-pin`** on the MacBook Air (node B, auto-updater): set its content to **`CHAIN10BUILD`**, or
+4. **`.update-pin`** on the MacBook Air (node B, auto-updater): set its content to **`a00c88c`**, or
    the updater drags B back onto the chain-9 build and B drops out of the set.
 5. **Start**, and check `rand-node status`: `height` climbing, `chain id 10`,
    `hc_bundle 4a27356f…`, `active_validator: true`, `notes: 5` at genesis,
