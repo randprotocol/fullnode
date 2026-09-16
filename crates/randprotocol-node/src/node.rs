@@ -15,9 +15,12 @@ use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
 use randprotocol_core::gas;
 use randprotocol_core::genesis::{Genesis, GenesisState};
-use randprotocol_core::receiver::ReceiverId;
+use randprotocol_core::notes::ShieldedAddress;
+use randprotocol_core::receiver::{ReceiverId, ReceiverRecord};
 use randprotocol_core::{Hash, Keypair, Ledger, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
 use randprotocol_zkvm::executor::ZkExecutor;
+use randprotocol_zkvm::notes::{Note, SpendKey};
+use randprotocol_zkvm::viewing::TxKey;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -1233,8 +1236,8 @@ impl Node {
             NodeCommand::Peers { reply } => {
                 let _ = reply.send(self.net.peers().await);
             }
-            NodeCommand::Mint { to, amount, reply } => {
-                let _ = reply.send(self.mint(to, amount).await);
+            NodeCommand::Mint { to, amount, record, reply } => {
+                let _ = reply.send(self.mint(to, amount, record).await);
             }
             NodeCommand::Epoch { reply } => {
                 let tip = self.hs.tip_ledger();
@@ -1264,13 +1267,12 @@ impl Node {
     /// the envelope is addressed to a key that is dropped on the next line and never recoverable.
     /// Only `to` can open the note, which is the whole intent.
     ///
-    /// Short-shielded-address task 5: `to` is a receiver id now, but sealing the note needs the
-    /// id's resolved record (`pk`/`kem_ek`), and this command has no way to obtain one yet — the
-    /// same stub `randprotocol-node/src/main.rs`'s `deposit_note` and `sealed_withdraw_note` are
-    /// (short-shielded-address task 4). Task 6 wires this through the receiver registry
-    /// (`Ledger::resolve_record`) and seals from the resolved record; until then the id's shape
-    /// is validated by the RPC's parse and this refuses here.
-    async fn mint(&mut self, to: ReceiverId, amount: u64) -> std::result::Result<Hash, String> {
+    /// Short-shielded-address task 6: `to` is a receiver id, resolved to the record that seals
+    /// the note — either the caller's own `record` (the RPC's optional third `rand_mint`
+    /// parameter, verified against `to` and this chain before use) or, absent that, whatever the
+    /// registry holds for `to` right now. Neither is `to` with no record at all: there is no
+    /// `pk`/`kem_ek` to seal to, so this refuses by name rather than guessing one.
+    async fn mint(&mut self, to: ReceiverId, amount: u64, record: Option<ReceiverRecord>) -> std::result::Result<Hash, String> {
         if !self.gs.faucet {
             return Err("faucet is disabled on this chain".into());
         }
@@ -1280,8 +1282,31 @@ impl Node {
         if amount > FAUCET_MAX_UNITS {
             return Err(format!("mint of {amount} exceeds the faucet cap of {FAUCET_MAX_UNITS}"));
         }
-        let _ = to;
-        Err("mint needs a resolved record: Task 6".into())
+        let record = match record {
+            Some(r) => {
+                r.verify(&to, self.gs.chain_id).map_err(|e| format!("the record does not match {to}: {e}"))?;
+                r
+            }
+            None => self
+                .hs
+                .tip_ledger()
+                .resolve_record(&to)
+                .cloned()
+                .ok_or_else(|| format!("receiver {to} has no record: register it, or pass the record"))?,
+        };
+        let payout = ShieldedAddress::from(&record);
+        let key = Keypair::from_seed(self.cfg.seed).expect("seed validated at startup");
+        let height = self.hs.tip_ledger().height();
+        let note = Note::new(payout.pk, [0; 8], amount, 0, height as u32);
+        let throwaway = SpendKey::random().viewing_key();
+        let envelope = randprotocol_zkvm::address::seal_note(&throwaway, &payout, &note, &TxKey::random())?;
+        let tx = Transaction::mint(self.gs.chain_id, note.commitment(), envelope, amount, &key);
+        let hash = self
+            .mempool
+            .insert(tx.clone(), self.hs.tip_ledger(), self.executor.as_ref())
+            .map_err(|e| e.to_string())?;
+        self.net.broadcast(GossipMessage::Transaction(tx)).await;
+        Ok(hash)
     }
 
     async fn on_network_event(&mut self, ev: NetworkEvent) -> Result<()> {

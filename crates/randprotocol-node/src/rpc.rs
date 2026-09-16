@@ -149,9 +149,10 @@ pub enum NodeCommand {
     /// Only a validator can serve it, so the reply carries a message rather than a
     /// `MempoolError` — "this node is an observer" is not a mempool outcome.
     ///
-    /// `to` is a receiver id now (short-shielded-address task 5), not the long shielded address:
-    /// see `Node::mint`'s doc for why it still always refuses (Task 6).
-    Mint { to: ReceiverId, amount: u64, reply: oneshot::Sender<Result<Hash, String>> },
+    /// `to` is a receiver id (short-shielded-address task 5). `record` is the optional record
+    /// `rand_mint`'s third parameter carries verbatim; `None` means "resolve it from the
+    /// registry" (task 6, see `Node::mint`'s doc).
+    Mint { to: ReceiverId, amount: u64, record: Option<ReceiverRecord>, reply: oneshot::Sender<Result<Hash, String>> },
     /// Where the chain is in its epoch schedule, and which validators run this epoch and the
     /// next. It comes from the node loop rather than from storage because the *next* epoch's set
     /// is derived from the tip's register, which only the replica holds — and deriving it on
@@ -682,6 +683,21 @@ pub(crate) fn unsealed_bundles(
 /// envelope — is served on the receipt (`rand_getReceipt`, `rand_getCallEnvelope`).
 /// A bundle's public fields — none of which names a party. Used for the transaction's own
 /// bundle and, since S3's `BridgeBurn`, for the asset bundle riding inside the action.
+/// A receiver record as RPC JSON (`rand_getReceiver`/`rand_getReceivers`, and the
+/// `register_receiver` action): every binary field hex, like `ReceiverRecordHex` — the id is
+/// derived (`record.id()`), not carried on the wire form, since a record's id is a function of
+/// its signing key rather than a field to trust separately.
+fn record_json(r: &ReceiverRecord) -> Value {
+    json!({
+        "id": r.id().to_string(),
+        "version": r.version,
+        "pk": word8_to_hex(&r.pk),
+        "kem_ek": hex::encode(&r.kem_ek),
+        "signing_key": r.signing_key.to_hex(),
+        "signature": hex::encode(r.signature.as_bytes()),
+    })
+}
+
 fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
     json!({
         "anchor": word8_to_hex(&b.anchor),
@@ -805,11 +821,11 @@ fn tx_json(
             "kind": "aggregate", "covers": covers.len(), "proof_len": proof.len(),
             "aggregator": aggregator.to_base58(), "nonce": nonce, "time": time
         }),
-        // Minimal arm to keep this exhaustive match compiling; the short-address RPC surface
-        // (the receiver id in place of the long shielded address) is a later task.
-        Action::RegisterReceiver { record } => json!({
-            "kind": "register_receiver", "id": record.id().to_string(), "version": record.version
-        }),
+        Action::RegisterReceiver { record } => {
+            let mut v = record_json(record);
+            v["kind"] = json!("register_receiver");
+            v
+        }
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -867,9 +883,19 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     s.parse().map_err(|_| RpcError::invalid_params("amount must be a string of units"))?
                 }
             };
+            // The third, optional parameter: a record as `record_json` renders one (hex fields).
+            // Without it the node resolves `to` from its own registry.
+            let record: Option<ReceiverRecord> = match p.get(2) {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let hex: randprotocol_core::genesis::ReceiverRecordHex = serde_json::from_value(v.clone())
+                        .map_err(|e| RpcError::invalid_params(format!("record: {e}")))?;
+                    Some(hex.to_record().map_err(|e| RpcError::invalid_params(format!("record: {e}")))?)
+                }
+            };
             let (reply, rx) = oneshot::channel();
             st.node
-                .send(NodeCommand::Mint { to, amount, reply })
+                .send(NodeCommand::Mint { to, amount, record, reply })
                 .await
                 .map_err(|_| RpcError::internal("node loop closed"))?;
             match rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))? {
@@ -1278,6 +1304,17 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 }))
                 .collect::<Vec<_>>()))
         }
+        // The receiver registry (spec §6): a record by id, or the whole registry. `null` for an
+        // id nobody has registered — not an error, since asking is how a wallet finds out.
+        "rand_getReceiver" => {
+            let id = parse_receiver_id(p, 0)?;
+            let m = st.storage.receivers().map_err(RpcError::internal)?;
+            Ok(m.get(&id).map(record_json).unwrap_or(Value::Null))
+        }
+        "rand_getReceivers" => {
+            let m = st.storage.receivers().map_err(RpcError::internal)?;
+            Ok(json!(m.values().map(record_json).collect::<Vec<_>>()))
+        }
         "rand_getUnsealed" => {
             let from: u64 = param(p, 0, "from")?;
             let limit = parse_limit(p, 1)?;
@@ -1502,6 +1539,23 @@ mod tests {
         call(st, method, params).await.unwrap_or_else(|e| panic!("{method}: {}", e.message))
     }
 
+    /// A chain with exactly one receiver registered beyond its validator's own payout, and that
+    /// record — for `rand_getReceiver`/`rand_getReceivers` to serve. Leaks its temp directory
+    /// (`std::mem::forget`) since `RpcState` outlives the fixture function; acceptable for a
+    /// short-lived test process, like the RocksDB handle it keeps open past the drop either way.
+    async fn state_with_one_receiver() -> (RpcState, ReceiverRecord) {
+        use randprotocol_core::receiver::receiver_signing_keypair;
+        let mut gs = genesis_with(7, vec![]);
+        let signing = receiver_signing_keypair(&[9; 32]);
+        let rec = ReceiverRecord::sign(&signing, gs.chain_id, 1, [9; 8], vec![9; randprotocol_core::notes::KEM_EK_BYTES]);
+        let mut receivers = gs.ledger.receivers().clone();
+        receivers.insert(rec.id(), rec.clone());
+        gs.ledger.set_receivers(receivers);
+        let (dir, st) = state_for(&gs);
+        std::mem::forget(dir);
+        (st, rec)
+    }
+
     fn nf(n: u8) -> Word8 {
         [n as u32 + 1000; 8]
     }
@@ -1720,6 +1774,31 @@ mod tests {
         assert_eq!(v["aggregation"]["registered"], 1);
         assert!(v["aggregation"]["unsealed"].as_u64().unwrap() >= 1, "{v}");
         assert_eq!(v["aggregation"]["verify_queue"], 0);
+    }
+
+    /// The receiver registry's RPC surface (short-shielded-address task 6): a record by id,
+    /// `null` for one nobody has registered, and `-32602` for a string that is not an address at
+    /// all — the same three-way split `rand_getValidators`'s payout field and `rand_mint`'s first
+    /// parameter already answer to.
+    #[tokio::test]
+    async fn rand_get_receiver_serves_the_record_and_null_for_the_unknown() {
+        let (st, rec) = state_with_one_receiver().await;
+        let v = ok(&st, "rand_getReceiver", json!([rec.id().to_string()])).await;
+        assert_eq!(v["id"], rec.id().to_string());
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["pk"], word8_to_hex(&rec.pk));
+        assert_eq!(v["kem_ek"].as_str().unwrap().len(), randprotocol_core::notes::KEM_EK_BYTES * 2);
+        assert_eq!(v["kem_ek"], hex::encode(&rec.kem_ek));
+        assert_eq!(v["signing_key"], rec.signing_key.to_hex());
+        assert_eq!(v["signature"], hex::encode(rec.signature.as_bytes()));
+        let none = ok(&st, "rand_getReceiver", json!([ReceiverId([1; 32]).to_string()])).await;
+        assert!(none.is_null());
+        assert_eq!(call(&st, "rand_getReceiver", json!(["rand1notanaddress"])).await.unwrap_err().code, -32602);
+
+        // `rand_getReceivers`: the whole registry, this one record among it.
+        let all = ok(&st, "rand_getReceivers", json!([])).await;
+        let rows = all.as_array().unwrap();
+        assert!(rows.iter().any(|r| r["id"] == rec.id().to_string()), "{all}");
     }
 
     fn aggregate_agg_addr(_st: &RpcState) -> String {

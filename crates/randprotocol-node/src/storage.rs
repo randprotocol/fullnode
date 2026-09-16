@@ -2041,6 +2041,15 @@ pub(crate) mod fixtures {
         (dir, s, gs)
     }
 
+    /// An unopened database plus a one-validator genesis with no alloc notes — the smallest fixture
+    /// a test can still register an extra receiver into before calling `init_genesis`.
+    pub(crate) fn fresh_genesis_state() -> (tempfile::TempDir, Storage, GenesisState) {
+        let gs = genesis(7);
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        (dir, s, gs)
+    }
+
     /// A bundle whose stub proof publishes exactly the digest the ledger recomputes, anchored to
     /// the newest root `ledger` has recorded and timed at its current height.
     pub(crate) fn bundle_tx(ledger: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64) -> Transaction {
@@ -2185,6 +2194,8 @@ mod tests {
     use super::*;
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::ledger::ANCHOR_WINDOW;
+    use randprotocol_core::notes::KEM_EK_BYTES;
+    use randprotocol_core::receiver::{receiver_signing_keypair, ReceiverRecord};
     use randprotocol_core::Transaction;
 
     /// Fold a witness back to the root, the way the bundle guest's `MERKLE_VERIFY` does.
@@ -2244,6 +2255,28 @@ mod tests {
         assert_eq!(reloaded.epoch(), gs.ledger.epoch());
         assert!(reloaded.faucet_enabled() && reloaded.confidential_enabled(), "and the other two switches");
         assert_eq!(reloaded, gs.ledger);
+    }
+
+    /// The receiver registry persists through `init_genesis` and comes back byte for byte on
+    /// reload (short-shielded-address task 6, `META_RECEIVERS` — task 4's storage work, exercised
+    /// here for the first time): `Storage::receivers()` answers the same map `Ledger::receivers`
+    /// held before the write, and a restarting node's ledger (`reload_ledger`) carries it too, so
+    /// the state root the registry contributes agrees before and after a restart.
+    #[test]
+    fn the_receiver_registry_round_trips_through_meta_and_reload() {
+        let (_d, storage, mut gs) = fresh_genesis_state();
+        let signing = receiver_signing_keypair(&[4; 32]);
+        let rec = ReceiverRecord::sign(&signing, gs.chain_id, 1, [4; 8], vec![4; KEM_EK_BYTES]);
+        // `Ledger::apply_register_receiver` is `pub(crate)` to `randprotocol-core` and unreachable
+        // from this crate's tests; `set_receivers` (public) does the same insert directly.
+        let mut receivers = gs.ledger.receivers().clone();
+        receivers.insert(rec.id(), rec.clone());
+        gs.ledger.set_receivers(receivers);
+        storage.init_genesis(&gs).unwrap();
+        assert_eq!(storage.receivers().unwrap().get(&rec.id()), Some(&rec));
+        let reloaded = crate::node::reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.receivers(), gs.ledger.receivers());
+        assert_eq!(reloaded.state_root(), gs.ledger.state_root());
     }
 
     /// S3: the bridge column families, end to end. A bridged chain's state root has a fifth

@@ -114,14 +114,36 @@ fn wallet(i: u32) -> Wallet {
     Wallet::from_spend_key(SpendKey([i; 8]))
 }
 
-/// The receiver id `wallet(seed)` would register under (short-shielded-address task 5): pure,
-/// like `wallet` itself, so it can be named before any genesis exists. Not the same seed space as
-/// a validator's payout (`genesis_bridge`'s own `receiver_record`) — this is one wallet's id, not
-/// a validator's.
+/// A bare, arbitrary receiver id for the structural faucet-mint tests (short-shielded-address
+/// task 5): pure, so it can be named before any genesis exists. It names no wallet — those tests
+/// only ever check that a minted commitment is present (`TestNode::holds`), never that anyone can
+/// open it — so it is not registered by [`genesis_bridge`], and a test that needs its mint to
+/// resolve has to register it itself (see [`wallet_receiver_id`] for a funded wallet's own id,
+/// which `genesis_bridge` does register).
 fn receiver_id(seed: u8) -> randprotocol_core::receiver::ReceiverId {
     randprotocol_core::receiver::ReceiverId::from(
         randprotocol_core::receiver::receiver_signing_keypair(&[seed; 32]).public_key(),
     )
+}
+
+/// The receiver record a funded wallet's own id resolves to, derived straight from its spend key
+/// (`receiver_signing_keypair`, spec §1) with `pk`/`kem_ek` set to the wallet's real note-owning
+/// address — the same pattern `a_fifth_validator_registers_bonds_and_joins_the_next_epoch` and
+/// `unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_note` register at runtime
+/// for a payout wallet, but built once here so [`genesis_bridge`] can register it for every
+/// wallet it funds. A payment to [`wallet_receiver_id`] therefore seals to a note that wallet's
+/// own viewing key opens — unlike [`receiver_id`], which names nobody.
+fn wallet_receiver_record(w: &Wallet, chain_id: u64) -> randprotocol_core::receiver::ReceiverRecord {
+    let seed = randprotocol_core::notes::word8_to_bytes(&w.sk.0);
+    let kp = randprotocol_core::receiver::receiver_signing_keypair(&seed);
+    randprotocol_core::receiver::ReceiverRecord::sign(&kp, chain_id, 1, w.address.pk, w.address.kem_ek.clone())
+}
+
+/// The id [`wallet_receiver_record`] registers under — pure, like [`receiver_id`], so it can be
+/// named before any genesis exists.
+fn wallet_receiver_id(w: &Wallet) -> randprotocol_core::receiver::ReceiverId {
+    let seed = randprotocol_core::notes::word8_to_bytes(&w.sk.0);
+    randprotocol_core::receiver::ReceiverId::from(randprotocol_core::receiver::receiver_signing_keypair(&seed).public_key())
 }
 
 /// The receiver id a mint pays, as its `rand1…` text.
@@ -205,8 +227,18 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
             })
             .collect(),
         alloc: funded.iter().map(|w| alloc_note(&w.address, ALLOC)).collect(),
+        // Every id this genesis pays: each validator's payout, and — short-shielded-address
+        // task 6 — every funded wallet's own receiver id, so a payment addressed to it (a bridge
+        // deposit, here) resolves to a note that wallet can actually open. `wallet_receiver_id`,
+        // not `receiver_id`: a funded wallet's real note key, not the structural mint tests'
+        // arbitrary one.
         receivers: (0..validators.len())
             .map(|i| randprotocol_core::genesis::ReceiverRecordHex::from_record(&receiver_record(i)))
+            .chain(
+                funded
+                    .iter()
+                    .map(|w| randprotocol_core::genesis::ReceiverRecordHex::from_record(&wallet_receiver_record(w, CHAIN_ID))),
+            )
             .collect(),
         faucet: true,
         confidential: true,
@@ -1598,12 +1630,11 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     assert!(n0.rpc.assets().await.unwrap().is_empty());
 
     // ---- inbound: one attestation, one deposit note ----
-    // Short-shielded-address task 5: the deposit is addressed to a receiver id, which the ledger
-    // resolves through the registry — a full run against a live node would need `genesis_bridge`
-    // to register `recipient`'s record too (it currently only registers validators' payouts), so
-    // this attestation targets an id nothing here has registered. Left for Task 6/7's wallet and
-    // registry wiring; this test is not part of this task's required suite.
-    let recipient_id = receiver_id(61);
+    // Short-shielded-address task 6: the deposit is addressed to `recipient`'s own receiver id,
+    // registered by `genesis_bridge` (it is one of `funded`) with the record pointing at
+    // `recipient`'s real note key — so the deposit resolves and `recipient`'s wallet opens it,
+    // exactly as the assertions below check.
+    let recipient_id = wallet_receiver_id(&recipient);
     let deposit = 5_000u64;
     let attested = attestation(&recipient_id, deposit as u128);
     let mut relayer_store = NoteStore::default();
