@@ -31,16 +31,18 @@ case "$HASH" in
   *) echo "genesis hash on $IP is $HASH, expected prefix $NEW — stopping before any change" >&2; exit 1 ;;
 esac
 
-# 2. stop, swap the binaries, init the new data dir, repoint the unit, restart
+# 2. the unit check FIRST (a droplet already cut over, or one with a hand-edited unit, is refused
+#    before anything is stopped — the chain-9 rollout learned this by leaving three nodes
+#    stopped), then stop, swap the binaries, init the new data dir, repoint the unit, restart
 $SSH "set -e
+  UNIT=/etc/systemd/system/$SERVICE.service
+  n=\$(grep -c -- '-$OLD' \$UNIT || true)
+  [ \"\$n\" = 1 ] || { echo \"expected exactly one -$OLD in \$UNIT, found \$n — not touching this node\" >&2; exit 1; }
   systemctl stop $SERVICE
   install -m 755 /root/$BIN_NODE /root/$BIN_WALLET /usr/local/bin/
   DATA=/root/data-\$(hostname)-$NEW
   [ -d \$DATA/db ] || /usr/local/bin/$BIN_NODE init --datadir \$DATA --genesis /root/fullnode/deploy/$(basename "$GENESIS")
-  UNIT=/etc/systemd/system/$SERVICE.service
   cp -a \$UNIT /root/$SERVICE.service.$OLD.bak
-  n=\$(grep -c -- '-$OLD' \$UNIT || true)
-  [ \"\$n\" = 1 ] || { echo \"expected exactly one -$OLD in \$UNIT, found \$n\" >&2; exit 1; }
   sed -i 's/-$OLD/-$NEW/' \$UNIT
   systemctl daemon-reload
   systemctl restart $SERVICE

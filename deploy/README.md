@@ -232,6 +232,29 @@ On A and B: `./deploy/run-a.sh` / `./deploy/run-b.sh` (they init `data-{a,b}-8c7
 scratch, `deploy/rebuild-vps.sh <ip>` rebuilds on a new commit and restarts. Service name:
 `shrugg-node`.
 
+### What the chain-9 rollout actually did (2026-09-16)
+
+Order: lon1 alone first (to prove `deploy/cutover-droplet.sh`), then sfo3/tor1/blr1, ams3,
+nyc1/nyc2/sfo2, mkc1/mem1, syd1/atl1, then F, C, D, E. Binaries built once on E (4 cores, 8 GB)
+from `5f8c6f9` and fanned out droplet-to-droplet over the forwarded agent — the deploy key
+(`~/.ssh/id_ed25519`) has to be *in* the agent (`ssh-add`) for the hop to E to authenticate.
+**Quorum (13 of 18) landed during the last batch; D reported height 23 while E was still cutting
+over**, and ten minutes later all 16 droplets plus A sat at 16 peers each, ~1 block/s. B (the
+MacBook Air) was unreachable and stays on chain 8 until its `.update-pin` is set to `5f8c6f9`.
+
+Three things went wrong and are fixed in the scripts:
+
+- `deploy/cutover-fleet.sh` under macOS bash 3.2 re-ran droplets that were already over, and the
+  per-droplet script stopped the service *before* its unit check — nyc1, nyc2 and sfo2 were left
+  stopped for a few minutes. The unit check now comes first, and the fleet script says to use
+  bash ≥ 4 or go one droplet at a time.
+- mkc1 and mem1 (30 GB disks) had filled up with three chains' data dirs and crash-looped for days
+  before the rollout (RocksDB `No space left on device` on every restart, 10k and 29k restarts);
+  the chain-8 resync after clearing the stale dirs filled them again. Their chain-8 data dirs
+  were deleted at cut-over (a set-6 binary cannot serve chain 8 anyway); 25 GB free each now.
+  Resize those two before chain 9 grows past ~20 GB.
+- Chain 9 is cut **without the aggregation section** — see the note at the top.
+
 ## Using the chain
 
 ```bash
