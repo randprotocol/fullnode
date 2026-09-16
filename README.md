@@ -287,6 +287,7 @@ Full detail in `docs/architecture.md`.
 | [docs/confidential.md](docs/confidential.md) | programs, calls, outputs, gas, privacy |
 | [docs/architecture.md](docs/architecture.md) | how the node works end to end: consensus, ledger, storage, networking, sync, and one confidential transaction followed from wallet to receipt |
 | [docs/zkvm-milestones.md](docs/zkvm-milestones.md) | the Rand zkVM milestone by milestone (M1–M4, CUDA backend): what was built and why |
+| [docs/zkvm-m4-m5-progress.md](docs/zkvm-m4-m5-progress.md) | M4 and M5 as delivered: constraint sets 4–6, the recursion VM (M5.1–M5.4) with all measured numbers, what is deferred to which hardware |
 | [docs/bridge.md](docs/bridge.md) | the guardian bridge: trust model, wire format, guardian sets, state, the two bridge actions, and what stays public |
 | [docs/deploy.md](docs/deploy.md) | multi-machine and cloud deployment, rebuilds, fault tests |
 | [deploy/README.md](deploy/README.md) | the live testnet: nodes, addresses, peer ids |
