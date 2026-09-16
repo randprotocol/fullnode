@@ -403,11 +403,24 @@ async fn wait_height(nodes: &[&TestNode], min: u64, timeout: Duration) {
 }
 
 impl TestNode {
-    /// Mint `amount` units to `payee(seed)` through this node's RPC and wait for the commit.
-    /// Returns the transaction hash and the commitment of the note it created, which is the
-    /// thing every node must agree on afterwards.
-    async fn mint(&self, seed: u8, amount: u64) -> (Hash, Word8) {
-        let hash = self.rpc.mint_shielded(&payee(seed), Some(amount)).await.expect("mint accepted");
+    /// Mint `amount` units to `w`'s own receiver id through this node's RPC and wait for the
+    /// commit. First-contact path (short-shielded-address task 6's controller ruling): nothing
+    /// has registered `w` before this call, so the mint carries `w`'s own record as
+    /// `rand_mint`'s third parameter rather than relying on the registry already holding it —
+    /// exactly how a fresh wallet actually gets its first note in production. Returns the
+    /// transaction hash and the commitment of the note it created, which is the thing every node
+    /// must agree on afterwards.
+    async fn mint(&self, w: &Wallet, amount: u64) -> (Hash, Word8) {
+        let record = wallet_receiver_record(w, CHAIN_ID);
+        let record_json =
+            serde_json::to_value(randprotocol_core::genesis::ReceiverRecordHex::from_record(&record)).unwrap();
+        let to = wallet_receiver_id(w).to_string();
+        let v = self
+            .rpc
+            .call("rand_mint", json!([to, amount.to_string(), record_json]))
+            .await
+            .expect("mint accepted");
+        let hash = Hash::from_hex(v.as_str().expect("rand_mint returns a hash string")).expect("valid hash hex");
         self.rpc.wait_for_transaction(&hash, Duration::from_secs(30)).await.expect("mint commits");
         (hash, self.note_of(&hash).expect("a committed mint has a note"))
     }
@@ -481,7 +494,7 @@ async fn four_validators_plus_late_observer_syncs() {
     let n3 = start_node(&ks[3], &gen, boot.clone(), true).await;
     wait_height(&[&n0, &n1, &n2, &n3], 6, Duration::from_secs(60)).await;
 
-    let (hash, cm) = n2.mint(1, 5 * UNITS_PER_RAND).await;
+    let (hash, cm) = n2.mint(&wallet(1), 5 * UNITS_PER_RAND).await;
     wait_for("mint committed on n0", Duration::from_secs(30), || n0.handle.storage.tx_location(&hash).unwrap().is_some())
         .await;
 
@@ -560,7 +573,7 @@ async fn restart_cycles_keep_all_nodes_in_sync() {
             let target = rest.iter().map(|n| n.height()).max().unwrap() + 4;
             wait_height(&rest, target, Duration::from_secs(60)).await;
             // Also mint while it is down, so it has state to catch up on.
-            let (_, cm) = nodes[0].mint(10 + cycle * 4 + i as u8, UNITS_PER_RAND).await;
+            let (_, cm) = nodes[0].mint(&wallet((10 + cycle * 4 + i as u8) as u32), UNITS_PER_RAND).await;
 
             let restarted = start_in(dir, &ks[i], boot.clone(), true).await;
             assert_eq!(restarted.handle.storage.head().unwrap().height, before, "restart lost committed blocks");
@@ -623,7 +636,7 @@ async fn node_behind_by_more_than_one_sync_batch_catches_up() {
     // With one validator down every fourth view times out, so ~2 s per 3 blocks; give it room
     // (the suite runs several clusters in parallel on a few threads).
     wait_height(&[&n0, &n1, &n3], stopped_at + 130, Duration::from_secs(400)).await;
-    let (_, cm) = n0.mint(30, 2 * UNITS_PER_RAND).await;
+    let (_, cm) = n0.mint(&wallet(30), 2 * UNITS_PER_RAND).await;
 
     let n2 = start_in(d2, &ks[2], boot.clone(), true).await;
     assert_eq!(n2.handle.storage.head().unwrap().height, stopped_at);
@@ -648,7 +661,7 @@ async fn corrupted_rocksdb_is_detected_truncated_and_resynced() {
     let _n3 = start_node(&ks[3], &gen, boot.clone(), true).await;
     let n2 = start_node(&ks[2], &gen, boot.clone(), true).await;
     // A mint early in the chain, so the note must survive the repair.
-    let (hash, cm) = n0.mint(40, 3 * UNITS_PER_RAND).await;
+    let (hash, cm) = n0.mint(&wallet(40), 3 * UNITS_PER_RAND).await;
     let receipt_height = n0.handle.storage.tx_location(&hash).unwrap().unwrap().0;
     wait_height(&[&n0, &n1, &n2], receipt_height + 8, Duration::from_secs(60)).await;
 
@@ -698,7 +711,7 @@ async fn faucet_mint_via_rpc_reaches_every_node() {
 
     // A validator mints the faucet's full 100 RAND to C.
     let c = wallet(3);
-    let (h1, cm1) = b.mint(3, 100 * UNITS_PER_RAND).await;
+    let (h1, cm1) = b.mint(&c, 100 * UNITS_PER_RAND).await;
     wait_for("mint visible on A", Duration::from_secs(30), || a.handle.storage.tx_location(&h1).unwrap().is_some()).await;
     assert!(a.holds(&cm1) && b.holds(&cm1));
     // Every node — the observer included — serves the leaf C's viewing key opens, and none of
@@ -711,7 +724,7 @@ async fn faucet_mint_via_rpc_reaches_every_node() {
 
     // A second mint right away: nothing serialises two mints from one node any more, since
     // there is no nonce to advance — the notes simply differ.
-    let (_, cm2) = b.mint(2, 5 * UNITS_PER_RAND).await;
+    let (_, cm2) = b.mint(&wallet(2), 5 * UNITS_PER_RAND).await;
     assert_ne!(cm1, cm2);
     wait_for("both notes on A", Duration::from_secs(30), || a.holds(&cm1) && a.holds(&cm2)).await;
     assert_eq!(a.handle.storage.notes_count().unwrap(), 2);
@@ -776,7 +789,7 @@ async fn a_refused_transaction_is_not_verified_twice() {
     assert!(again.contains("mint signature"), "{again}");
     assert_eq!(n0.handle.status.read().unwrap().refused_cache, 1);
     // A legitimate transaction still goes through, so the cache is not a blanket refusal.
-    n0.mint(7, 5 * UNITS_PER_RAND).await;
+    n0.mint(&wallet(7), 5 * UNITS_PER_RAND).await;
     stop(n0).await;
 }
 
