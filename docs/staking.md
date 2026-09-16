@@ -22,16 +22,26 @@ ValidatorEntry {
     stake:    u64,               // bonded: the weight an epoch's set gives it
     pending:  Vec<(u64, u64)>,   // unbonding, as (release_epoch, amount), oldest first
     rewards:  u64,               // fees earned as a block proposer, unpaid
-    payout:   ShieldedAddress,   // rand1… — where a withdraw pays
+    payout:   ReceiverId,        // rand1… — the receiver id a withdraw pays; resolved through the registry
     nonce:    u64,               // the replay protection for its signed actions
 }
 ```
 
 Every field of every row is public, and the register is hashed into every block's state root
-(leaf domain `rand-validator-leaf-2`), so a node that disagrees about one of them disagrees about
+(leaf domain `rand-validator-leaf-3`), so a node that disagrees about one of them disagrees about
 the chain. A row is created by genesis or by the bond that registers the validator, and is never
 deleted: a validator that unbonds everything keeps a row with `stake = 0`, which is simply in no
 epoch's set.
+
+Since chain 11 (`docs/shielded.md` §2) `payout` is a **receiver id**, not the record itself: the
+`pk` a withdraw's note is addressed to is resolved from the receiver registry
+(`ledger.resolve_pk(payout)`) at validate and apply time, not stored in the register. A `Bond`
+that registers a new validator (`check_bond`) therefore needs the `Registration`'s payout id to
+already resolve in the registry — there is no way to carry the record on the same transaction, so
+the payout wallet must run `rand register` before it is named as anyone's payout — else the bond
+is refused as `StakingError::UnknownReceiver(payout)`, "receiver {id} is not in the registry". A
+row's payout id can be rotated to a fresh KEM key without ever touching the register: `rand
+register --rotate` republishes the same id's record, and the register entry needs no change.
 
 | constant | value | meaning |
 |---|---|---|
@@ -94,11 +104,13 @@ the node holds.
 rand-node register --key node.key.json --payout rand1<payout address> [--rpc http://127.0.0.1:8545]
 ```
 
-Prints the validator's address and a hex `Registration` — its public key, the payout address, and a
-signature over `(chain_id, payout)`. The RPC is only read for the chain id: a registration signed
-for one chain is refused on another. The payout address comes from a **wallet** key
+Prints the validator's address and a hex `Registration` — its public key, the payout receiver id,
+and a signature over `(chain_id, payout)`. The RPC is only read for the chain id: a registration
+signed for one chain is refused on another. The payout id comes from a **wallet** key
 (`rand --key payout.key.json address`), not from a node key, and it is the one field a later
-top-up cannot change.
+top-up cannot change. The id must already resolve in the registry — `rand --key payout.key.json
+register` first, if it has never published a record — else the bond that carries this
+registration is refused as `receiver {id} is not in the registry`.
 
 Hand the hex to whoever holds the stake.
 
@@ -153,7 +165,7 @@ epoch merge into one `pending` row, because that row is hashed into the state ro
 rand-node withdraw <amount in RAND> --key node.key.json [--rpc …] [--no-wait]
 ```
 
-Pays released value into a deposit note at the register's `payout` address. Released means
+Pays released value into a deposit note at the register's `payout` id. Released means
 `rewards` plus the `pending` rows whose `release_epoch` has arrived; the command takes the released
 rows oldest first and then the rewards.
 
@@ -162,12 +174,19 @@ bundle base to the proposer of the block that applies it, **out of the amount wi
 withdrawal of 1000 RAND leaves the register entirely and creates a note worth 999.999 RAND, and
 an amount that cannot cover the base is refused rather than buying a note worth nothing.
 
-The note is the one the chain computes for itself, from the register's payout address, the amount
-less the base, the blinding `r` the action publishes, and the action's own `time`:
+The note is the one the chain computes for itself, from the `pk` the registry resolves for the
+entry's payout id, the amount less the base, the blinding `r` the action publishes, and the
+action's own `time`:
 
 ```
-cm = H_CM(payout.pk, from = 0, amount − 0.001 RAND, asset 0, time, r)
+pk = registry[payout].pk        // resolved at withdraw time — not stored in the register
+cm = H_CM(pk, from = 0, amount − 0.001 RAND, asset 0, time, r)
 ```
+
+A payout id the registry no longer holds a record for (it cannot happen through this chain's own
+rules, since a receiver's record is never deleted, but a corrupted or hand-edited registry could
+still lack one) refuses the withdraw as `receiver {id} is not in the registry` rather than
+producing a note nobody can open.
 
 `time` is the head height when the command ran, which it prints and which the signature binds — not
 the height of the block that applies the transaction, because the envelope only the payout wallet
@@ -195,6 +214,9 @@ rand --key payout.key.json send rand1… 1
 Joining, from the two sides:
 
 ```bash
+# on the machine holding the stake, first, if it has never published a record (docs/shielded.md §2)
+rand --key payout.key.json register
+
 # on the joining validator's machine
 rand-node register --key node.key.json --payout "$(rand --key payout.key.json address)"
 rand-node run --datadir ./data --key node.key.json --validator --bootstrap /ip4/…/p2p/…
@@ -230,9 +252,12 @@ rand-node genesis --chain-id 6 \
 ```
 
 The three fields of a `--validator` travel together because they are one register entry, and all
-three are part of the genesis hash — the payout address included, because it is register state.
-Genesis refuses a stake below `MIN_STAKE`: such a validator would be in the register but in no
-epoch's set, and a chain seeded entirely from those would have nobody to pick a leader from.
+three are part of the genesis hash — the payout id included, because it is register state. Each
+payout id must resolve against the genesis file's own receiver registry, seeded by repeatable
+`--receiver <RECORD.JSON>` entries (`docs/cli.md`) registered before any `--validator` or `--alloc`
+is parsed — an id with no matching `--receiver` record is refused. Genesis refuses a stake below
+`MIN_STAKE`: such a validator would be in the register but in no epoch's set, and a chain seeded
+entirely from those would have nobody to pick a leader from.
 
 ## 5. What is public
 

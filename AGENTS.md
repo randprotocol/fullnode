@@ -4,7 +4,80 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-16)
+## Project memory (state as of 2026-09-17)
+
+### Short shielded addresses (2026-09-17): implemented on branch `short-address`, chain 11
+
+Spec approved 2026-09-17 (`docs/superpowers/specs/2026-09-17-short-shielded-address.md`, design
+Anish Mohammad); the plan (`docs/superpowers/plans/2026-09-17-short-shielded-address.md`) refined
+it with four rulings, R1–R4, all implemented as ruled, not as the spec first drafted:
+
+- **R1** — retired ML-KEM secrets are **re-derived by version, not stored**: `ViewingKey::
+  kem_seed_at(v)` (`crates/randprotocol-zkvm/src/notes.rs`) is `kem_seed()` itself at `v = 0`
+  (domain `KEM_SEED`, unchanged, so every pre-chain-11 wallet and envelope keeps its meaning) and
+  a fresh `domain::KEM_SEED_VERSION` hash of `(nk, v)` for every `v ≥ 1` — never layered on top of
+  `kem_seed()`'s output. The key file (`KeyFile` v3, `randprotocol-client/src/wallet.rs`) stores
+  only the highest `kem_version` reached; opening an envelope tries every version down to 0,
+  newest first.
+- **R2** — sender-paid registration **needs no note-to-pk tie**: `Action::RegisterReceiver`'s
+  validity is `record.verify(id, chain_id)` plus the version-step rule alone
+  (`ledger/receivers.rs`); nothing checks that the paying bundle also creates a note for the
+  record's `pk` (the spec §6.3 draft's proposed tie — see the note at the end of this entry).
+- **R3** — registrations (validator and aggregator) **must name a registered id**:
+  `StakingError::UnknownReceiver` / `AggregationError::UnknownReceiver` refuse a `Bond`/
+  `RegisterAggregator` whose payout id has no record in the registry at check time — no same-
+  transaction carry-in exists in the implemented code.
+- **R4** — `ShieldedAddress` (`crates/randprotocol-core/src/notes.rs`) **stays the in-memory
+  pk/kem_ek pair**; only its text form (`Display`/`parse`/`recipient_hash`/`ADDRESS_PREFIX`) was
+  removed. `impl From<&ReceiverRecord> for ShieldedAddress` is the bridge from a resolved record
+  to what sealing an envelope needs.
+
+Per crate:
+
+- **core** (`crates/randprotocol-core/src/receiver.rs`): `ReceiverId` (32 bytes, `rand1…` text,
+  53–55 chars, checksummed) and `ReceiverRecord` (`version`, `pk`, `kem_ek`, `signing_key`,
+  `signature`, `MAX_RECORD_BYTES = 8192`), one `verify()` used by core, client and the explorer
+  (`randprotocol_core::ReceiverRecord::verify`, confirmed in randscan's own `docs/api.md`). New
+  hash domains: `rand-receiver-sign-1` (the signing key seed), `rand-receiver-
+  addr-1` (the address checksum), `rand-receiver-record-1` (the signing hash). `ledger/
+  receivers.rs`: the registry `BTreeMap<ReceiverId, ReceiverRecord>`, `rand-receiver-leaf-1`
+  merkle leaves, folded into the state root as `rand-state-4` (bumped from `rand-state-3`).
+  `ledger/staking.rs` / `ledger/aggregation.rs`: `payout: ReceiverId` throughout, resolved via
+  `resolve_pk`/`resolve_record`, `UnknownReceiver` on a miss; leaf domains bumped to
+  `rand-validator-leaf-3` and `rand-aggregator-leaf-2`. `ledger/bridge_notes.rs`:
+  `BridgeAttest.recipient: ReceiverId`, the wire's 32-byte `to` field *is* the id (no more
+  `blake3` hash of a long address), `BridgeError::UnknownReceiver` on an unregistered recipient.
+  `genesis.rs`: `Genesis::receivers: Vec<ReceiverRecordHex>`, registered before any validator
+  payout or alloc owner is resolved.
+- **zkVM** (`crates/randprotocol-zkvm/src/viewing.rs`, `notes.rs`): `kem_seed_at`/`address_at`/
+  `open_as_receiver_at`, versioned KEM keys (R1 above); nothing about the receiver id enters a
+  proof.
+- **node** (`crates/randprotocol-node/src/rpc.rs`): `rand_getReceiver`/`rand_getReceivers`,
+  `rand_mint`'s optional third `record` param, `record_json`/`tx_json`'s `register_receiver`
+  kind. `main.rs`: `genesis --receiver <RECORD.JSON>` (repeatable, registered first), the
+  withdraw/aggregate commands resolve records through `resolve_receiver`.
+- **client** (`crates/randprotocol-client`): `receiver.rs` (the payment-request URI, the registry
+  lookup, the §4 error text verbatim: *"no receiver record for {id}: ask the receiver for a
+  payment request, or for them to register"*), `wallet.rs` (`KeyFile` v3 with `kem_version`,
+  `Wallet::rotate`/`record`/`record_at`, record version = KEM version + 1), `main.rs` (`address
+  [--record]`, `request`, `register [--rotate]`, `send [--record|--registry|--register]`,
+  `bridge-deposit-address` refusing until registered, `call --auditor-record/--registry`).
+- **explorer** (`randprotocol/randscan`, branch `receivers`): `GET /api/v1/receivers/:address`
+  and `/history`, re-verifying every record with the same `verify()` before indexing
+  (`../randscan/docs/api.md` "Receivers").
+
+**Chain 11 is not yet cut.** This is a hard fork (address text form, register/registry state,
+bridge wire format, state root domain) and ships alongside the next chain cut, not before it —
+`deploy/cut-chain11-genesis.sh` does not exist yet. Docs updated to match this branch's code:
+`docs/shielded.md` (new §2), `docs/staking.md`, `docs/bridge.md` (§§5, 6, 10–12), `docs/rpc.md`
+(new methods, wire format, changelog), `docs/cli.md`, `README.md`.
+
+Note for anyone reading the spec document itself: its §6.3 draft proposed that a sender-paid
+`RegisterReceiver` "must sit on a bundle that also creates a note for the record's `pk`" — the
+plan's ruling R2 dropped that tie, and `validate_register_receiver` (`ledger/receivers.rs`)
+implements exactly that: `verify()` plus the version-step rule, nothing about the bundle's
+commitments. `docs/shielded.md` §6 and `docs/bridge.md` describe the code as it is (no tie), per
+R2, not the spec's original §6.3 text.
 
 ### Session close 2026-09-16: M5 complete, aggregation merged, papers synced — all three repos at their final commits
 

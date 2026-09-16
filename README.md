@@ -167,7 +167,7 @@ the persisted head. A validator set of `n` needs more than 2/3 of stake online: 
 ```bash
 export RAND_RPC=http://127.0.0.1:8545     # or --rpc on each call
 rand keygen                                # wallet.key.json (or --key <file>, RAND_KEY)
-rand address                               # rand1… — about 1.6 KB of base58
+rand address                               # rand1… — 54 characters, a receiver id
 rand balance                               # scans the tree with this key; nobody else can
 rand send <rand1 address> 1.5            # proves a bundle locally (~100 s), submits, waits
 rand bond <validator address> 1000         # stake: the bundle burns it out of this wallet's notes
@@ -200,6 +200,15 @@ leaves, which amounts, or who. A wallet finds its own notes by trial-decrypting 
 the chain with its viewing key, so a node answers "here is the whole tree" and never "here is your
 balance". `docs/howto.md` (five questions, end to end) and `docs/shielded.md` is the full guide, including the public/hidden table per action and
 what still leaks (a witness request names the leaf you are about to spend).
+
+A shielded address is short: a `rand1…` **receiver id** — blake3 of a Dilithium2 key derived from
+the spend key, the same 32 bytes as the wallet's transparent address, one wallet with one identity
+either way. What a sender needs to seal an envelope, `pk` and the current ML-KEM-768 key, lives in
+a signed, versioned **receiver record** the id resolves to, delivered either inline with a
+`rand request` payment URI (no chain, no registration needed) or looked up from the explorer's
+registry (`rand send`'s default) — the wallet verifies the record either way before ever sealing a
+note to it. `docs/shielded.md` §2 is the whole of it, including rotation and the exact error `rand
+send` gives when no record can be found.
 
 ```bash
 rand faucet                  # testnet: a validator mints 100 RAND into a note only you can open
