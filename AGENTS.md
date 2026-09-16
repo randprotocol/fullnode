@@ -4,7 +4,34 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-15)
+## Project memory (state as of 2026-09-16)
+
+### Session close 2026-09-16: M5 complete, aggregation merged, papers synced — all three repos at their final commits
+
+Everything below is merged and pushed; nothing is pending in any working tree.
+
+- **circuits** `main` at **271679d** (origin): the recursion VM complete — M5.1 (ISA,
+  emulator, DSL, verifier program; 50/50 real proofs accepted/refused; 5 682 847 rows per
+  inner proof measured), M5.2 (the machine: 8 instances, three gated cuts to **1 968 619
+  rows**, tier 21; 26/26 cheating; test-profile exit passed), M5.3 (the N-generic aggregate
+  program + chain API + admission stub vectors; machine classes N=1/2/3 → ≥64/128/160 GB),
+  M5.4 (CUDA backend split with **zero new kernels**, tier-23 rung, measured device model,
+  self-verifier written with its measured requirement). Open only: the PTX first build and
+  the production N re-measurement — **blocked on the user provisioning a fleet GPU node**
+  (Linux, R580+, CUDA 13, LLVM 21, sm_80+, 80 GB device, ≥160 GB host; `PTX_BUILD.md`).
+- **fullnode** `main` at **faef139** (origin): RPC hardening, constraint set 6, viewing-key
+  import + `shrugg_checkTransaction`, and the full block-aggregation pipeline (see the merged
+  entry below). `docs/zkvm-m4-m5-progress.md` is the consolidated M4+M5 record with every
+  measured number and the 11-row deferred-proof runbook.
+- **whitepapers** `main` at **f31277c** (origin): both papers synced to `faef139` —
+  `randprotocol.tex` (third pass: abstract + changes list, reconciliation at cs6/M5/aggregation,
+  remarks updated) and `randprotocol_implementation.tex` (Implementation Draft 3, new
+  `sec:aggregation`); all three PDFs regenerated and committed. Both compile clean, zero
+  undefined refs.
+- **Outstanding, user-owned**: ① the ≥64 GB proof batch (runbook rows 1–6; fills chain-9's
+  `admitted_shapes[0]` — the zero-digest placeholder refuses to init, so this activates
+  aggregation) and ② the GPU node above. Full checklists: `docs/deploy.md` ("Deferred proof
+  runs and hardware tasks", "Chain 9 activation") and the README's "Open ops tasks".
 
 ### Block aggregation: MERGED to main (856887a, 2026-09-16, linear rebase) — user-owned hardware tasks gate activation
 
