@@ -267,6 +267,19 @@ On A and B: `./deploy/run-a.sh` / `./deploy/run-b.sh` (they init `data-{a,b}-8c7
 scratch, `deploy/rebuild-vps.sh <ip>` rebuilds on a new commit and restarts. Service name:
 `rand-node`.
 
+### What the chain-11 rollout actually did (2026-09-17)
+
+Build `ee716d7` (tag `v0.2`) on E, then `deploy/cutover-droplet.sh <ip> 4d757f11 79123fa7
+deploy/genesis-chain11.json` with `SERVICE=rand-node BIN_NODE=rand-node BIN_WALLET=rand`, one
+droplet at a time: the twelve regional validators, then F, C, D, E — about 16 minutes for all
+16; peer ids and bootstraps unchanged from chain 10. E was at height 24 when its own cut-over
+finished, i.e. the chain was committing before the last node joined. A followed from
+`deploy/run-a.sh`; ten minutes later every node sat at 16 peers, ~1 block/s. The explorer was
+redeployed with the receiver registry (randscan `d580e5b`) right after E: healthy, lag 0. The
+activity loop's two wallets were faucet-funded with their own records (the first-contact path,
+live) and registered so the loop's transfers resolve through `/api/v1/receivers`. B (the MacBook
+Air) is still unreachable: it needs `bin-ee716d7/` and `.update-pin` = `ee716d7`.
+
 ### What the chain-10 rollout actually did (2026-09-16, ~50 minutes after chain 9)
 
 `deploy/cutover-droplet-rand.sh`, one droplet at a time: a peer-id pass first (the new binary on

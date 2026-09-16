@@ -6,6 +6,20 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-17)
 
+### Chain 11 (RAND, short shielded addresses) is LIVE — tag v0.2 (2026-09-17)
+
+Main at `255618f` (pinned build `ee716d7`, tag **`v0.2`**): the short-address feature merged
+linear (ff) from `short-address`. Chain 11 genesis `79123fa7…` (23 receiver records), rolled
+out to 16 droplets + A with `deploy/cutover-droplet.sh` (service `rand-node`, peer ids
+unchanged); explorer redeployed with `/api/v1/receivers` (randscan main `d580e5b`); the
+activity wallets registered. **B still needs `bin-ee716d7/` and `.update-pin` = `ee716d7`.**
+Deferred after merge (the final review's list, in `docs/superpowers/plans/…` history and the
+review): a dedicated explorer `TxKind::RegisterReceiver`; `docs/architecture.md`'s stale txid /
+action-count / state-domain lines; `--chain-id` for `rand address --record` so the next cut
+needs no bootstrap node; a mempool claim key for first registrations; the explorer's address
+length pre-check and `receiver_history` limit; `PaymentRequest.record` accessor; http registry
+warning; the research repo's own RAND rename.
+
 ### Short shielded addresses (2026-09-17): implemented on branch `short-address`, chain 11
 
 Spec approved 2026-09-17 (`docs/superpowers/specs/2026-09-17-short-shielded-address.md`, design
