@@ -268,10 +268,13 @@ fn assemble_covered(
         .collect()
 }
 
-/// HotStuff's covered source over the store (spec §3.2): `assemble_covered`'s exact checks,
-/// answered against the committed head. The seal and the window are admission policy, not
-/// consensus — a covered bundle's excess resolves through the ledger's bucket either way — so
-/// the committed head is the right vantage for them here.
+/// HotStuff's covered source over the store (spec §3.2): the record half of
+/// `assemble_covered`, answered against the committed head. The seal and the window are not
+/// re-checked here — they are consensus through the ledger's coverable set (the fee bucket
+/// records every bundle and drops it at its cover or its sweep; `validate_aggregate` step 4
+/// refuses a cover with no entry), so a block that re-covers a sealed bundle is invalid on
+/// every replica whatever this source answers. `assemble_covered` keeps the three named
+/// verdicts for admission's error reporting.
 struct StoreCovered {
     storage: Arc<Storage>,
     profile: shrugg_core::types::FriProfile,

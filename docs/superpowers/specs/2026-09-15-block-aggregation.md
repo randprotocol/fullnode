@@ -247,10 +247,12 @@ included it (§5.2), not to any aggregator.
 
 ### 3.4 Selection
 
-A proposer includes **at most one** `Aggregate` per block. Among the valid submissions it
-holds, it picks the one with the largest `covers.len()`; ties go to the lowest proof hash.
-Losing submissions stay pooled until any bundle they cover is sealed by another aggregate
-(the pool's `still_applies` drops them) or their window passes.
+A block carries **at most one** `Aggregate` — a block-validity rule, not proposer policy
+(the pre-v0.1 review's H1): a replica refuses a block whose second aggregate it meets, by
+index, before looking the covers up. Among the valid submissions a proposer holds, it picks
+the one with the largest `covers.len()`; ties go to the lowest proof hash. Losing submissions
+stay pooled until any bundle they cover is sealed by another aggregate (the pool's
+`still_applies` drops them) or their window passes.
 
 ## 4. Admission
 
@@ -264,7 +266,11 @@ at any step invalidates the transaction; the error names the step.
 3. **`time`** within the ledger's ordinary window.
 4. **The cover set**: `1 ≤ covers.len() ≤ MAX_COVERS`; no duplicates; every hash names a bundle
    transaction that is coverable at the head (§3.2 — finalised, inside the window, chain-9,
-   unsealed).
+   unsealed). The ledger's half of this is a block-validity rule (H1): every cover must have
+   an entry in the ledger's fee bucket, which records every bundle at inclusion and drops it at
+   its covering aggregate or at the window's sweep — so "already covered" and "past the window"
+   are refused by every replica at apply, not only by an honest pool at admission. The node's
+   three named verdicts (unknown, sealed, outside the window) remain admission's error reporting.
 5. **The payout note's commitment is new** — derived from `time`, `r`, the entry's payout and
    the amount the block would pay (§5.4), and claimed in the mempool the way a `BridgeAttest`'s
    derived commitment is claimed (`crates/shrugg-node/src/mempool.rs`'s
@@ -381,8 +387,12 @@ through the bundle's own inclusion, unchanged.
 
 ### 6.1 What a sealing block records
 
-The `Aggregate` is an ordinary transaction in a later block — nothing else. Node state derived
-from committed blocks (never consensus state):
+The `Aggregate` is an ordinary transaction in a later block — nothing else. Coverability
+itself *is* consensus (H1): the ledger's fee bucket records every bundle at inclusion, excess or
+not, and the entry leaves at the covering aggregate or at the window's sweep, never to return;
+an aggregate naming a cover with no entry is invalid on every replica (§4 step 4). The node
+keeps, in addition, the state below derived from committed blocks (never consensus state — it
+names the case admission refuses, and drives pruning and sealed-form serving):
 
 - per bundle, `sealed_by: Option<Hash>` — the hash of the `Aggregate` transaction that covers
   it; and
