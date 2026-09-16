@@ -44,9 +44,14 @@ type KemCt = ml_kem::ml_kem_768::Ciphertext;
 pub struct Address { pub pk: Word8, pub kem_ek: Vec<u8> }
 
 impl ViewingKey {
-    fn kem_keys(&self) -> (Dk, Ek) { MlKem768::from_seed(&ml_kem::Seed::from(self.kem_seed())) }
-    pub fn address(&self) -> Address {
-        let (_, ek) = self.kem_keys();
+    pub fn address(&self) -> Address { self.address_at(0) }
+    /// The ML-KEM-768 keypair for key version `v`, from `kem_seed_at(v)` (`notes.rs`).
+    pub fn kem_keys_at(&self, version: u32) -> (Dk, Ek) { MlKem768::from_seed(&ml_kem::Seed::from(self.kem_seed_at(version))) }
+    /// The address a sender uses to seal an envelope under key version `v`: `pk` never
+    /// changes with the version (it does not depend on the KEM key at all), only `kem_ek`
+    /// does.
+    pub fn address_at(&self, version: u32) -> Address {
+        let (_, ek) = self.kem_keys_at(version);
         Address { pk: self.pk(), kem_ek: ek.to_bytes().to_vec() }
     }
 }
@@ -124,9 +129,16 @@ impl Envelope {
         let note = Note::from_bytes(&open(&key.0, &aad(AAD_BODY, cm), &self.body)?)?;
         (note.commitment() == cm).then_some(note)
     }
-    /// Opens as the receiver: decapsulate, unwrap the transaction key, open the body.
+    /// Opens as the receiver: decapsulate, unwrap the transaction key, open the body. Equals
+    /// `open_as_receiver_at(cm, vk, 0)`.
     pub fn open_as_receiver(&self, cm: Word8, vk: &ViewingKey) -> Option<(TxKey, Note)> {
-        let (dk, _) = vk.kem_keys();
+        self.open_as_receiver_at(cm, vk, 0)
+    }
+    /// Opens as the receiver under KEM key version `version`: only the address the envelope
+    /// was actually sealed to (`ViewingKey::address_at(version)`) opens it — a wrong version,
+    /// like a wrong key entirely, fails AEAD authentication and returns `None`.
+    pub fn open_as_receiver_at(&self, cm: Word8, vk: &ViewingKey, version: u32) -> Option<(TxKey, Note)> {
+        let (dk, _) = vk.kem_keys_at(version);
         let ct = KemCt::try_from(&self.kem_ct[..]).ok()?;
         let ss: [u8; 32] = dk.decapsulate(&ct).into();
         let key = TxKey(open(&ss, &aad(AAD_RECEIVER, cm), &self.to_receiver)?.try_into().ok()?);
