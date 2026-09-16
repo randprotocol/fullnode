@@ -156,6 +156,9 @@ pub enum Action {
         envelope: Envelope,
         signature: Signature,
     },
+    /// Publishes (or rotates) a receiver record (spec §6.2/§6.3). Anyone may carry a valid
+    /// record — it is authorisation by construction — and pays the bundle's fee for it.
+    RegisterReceiver { record: crate::receiver::ReceiverRecord },
 }
 
 impl Action {

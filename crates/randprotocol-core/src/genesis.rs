@@ -558,8 +558,10 @@ mod tests {
         assert!(s.ledger.bridge().is_none());
         assert_eq!(
             s.ledger.state_root().to_hex(),
-            "e845c110b5e366acf87806cb7f09cc212ad47008cac7cafbd141c30da4c738d4",
-            "a chain without a bridge commits the four components, over S2's v2 register leaf"
+            // Moved once by the short-address registry (task 3): every chain now hashes under
+            // `rand-state-4` with an (empty) `receivers_root` appended, gate or no gate.
+            "6b10f3738309fc808d3559c87a2020b688b45f4c6ae8cf48bafd565c7fd23d5a",
+            "a chain without a bridge commits the four components, over S2's v2 register leaf, plus the always-on empty receivers root"
         );
         assert!(!plain.to_json().contains("bridge"), "and its genesis file does not mention one");
 

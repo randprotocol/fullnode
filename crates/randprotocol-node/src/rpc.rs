@@ -784,6 +784,11 @@ fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>, executor: &dyn Confiden
             "kind": "aggregate", "covers": covers.len(), "proof_len": proof.len(),
             "aggregator": aggregator.to_base58(), "nonce": nonce, "time": time
         }),
+        // Minimal arm to keep this exhaustive match compiling; the short-address RPC surface
+        // (the receiver id in place of the long shielded address) is a later task.
+        Action::RegisterReceiver { record } => json!({
+            "kind": "register_receiver", "id": record.id().to_string(), "version": record.version
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),

@@ -11,6 +11,7 @@
 pub mod aggregation;
 pub mod bridge_notes;
 pub mod call_envelope;
+pub mod receivers;
 pub mod staking;
 pub mod supply;
 
@@ -20,8 +21,11 @@ use crate::crypto::{merkle_root, Address, Hash};
 use crate::gas;
 use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Envelope, Word8, MAX_ENVELOPE_BYTES};
 use crate::program::{program_id, CallOutcome, CallReceipt, ProgramId, ProgramRecord};
+use crate::receiver::{ReceiverId, ReceiverRecord};
 use crate::types::{Action, Block, Transaction, ValidatorSet, FAUCET_MAX_UNITS};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+pub use receivers::receivers_root;
 
 /// How many block-end roots a bundle may anchor to (spec §7 item 4).
 ///
@@ -187,6 +191,18 @@ pub enum TxError {
     /// [`aggregation::AggregationError`]).
     #[error("aggregation: {0}")]
     Aggregation(#[from] aggregation::AggregationError),
+    /// A `RegisterReceiver` whose record does not verify under the id it names (spec §6.2): a
+    /// bad signature, a wrong chain, an oversized or short-length KEM key.
+    #[error("receiver record: {0}")]
+    Receiver(#[from] crate::receiver::RecordError),
+    /// A `RegisterReceiver` whose version is not the one the registry expects: 1 for a first
+    /// registration, `current + 1` for a rotation.
+    #[error("receiver record version {actual}, expected {expected}")]
+    ReceiverVersion { expected: u32, actual: u32 },
+    /// A `RegisterReceiver` rotation whose `pk` differs from the registered one: rotation moves
+    /// the KEM key, never the note owner.
+    #[error("a receiver record may not change pk")]
+    ReceiverPkChanged,
     #[error("arithmetic overflow")]
     Overflow,
 }
@@ -273,6 +289,11 @@ pub struct Ledger {
     /// The aggregator register, hashed into the state root (spec §2.1) when `aggregation` is
     /// set; empty otherwise and at chain-9 block 0.
     aggregators: BTreeMap<Address, aggregation::AggregatorEntry>,
+    /// The receiver registry (spec §6.1–§6.3), keyed by receiver id: every record ever
+    /// published, at its latest version. Always hashed into the state root, on every chain —
+    /// unlike `aggregators` there is no genesis gate, so it is empty rather than absent on a
+    /// chain that has registered none.
+    receivers: BTreeMap<ReceiverId, ReceiverRecord>,
     /// Height of the block being applied (the `time` window and `ProgramRecord::deployed_at`).
     height: u64,
     /// Timestamp of the block being applied, in unix milliseconds.
@@ -317,6 +338,7 @@ impl PartialEq for Ledger {
             && self.programs == o.programs
             && self.bridge == o.bridge
             && self.aggregators == o.aggregators
+            && self.receivers == o.receivers
     }
 }
 impl Eq for Ledger {}
@@ -349,6 +371,7 @@ impl Ledger {
             bridge: None,
             aggregation: None,
             aggregators: BTreeMap::new(),
+            receivers: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
@@ -387,6 +410,7 @@ impl Ledger {
             bridge: None,
             aggregation: None,
             aggregators: BTreeMap::new(),
+            receivers: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
@@ -812,6 +836,11 @@ impl Ledger {
             Action::BridgeBurn { asset_bundle, .. } if asset_bundle.proof.len() > gas::MAX_PROOF_BYTES => {
                 return Err(TxError::ProofTooLarge)
             }
+            // The receiver record's own cap (spec §6.2): a record over `MAX_RECORD_BYTES` is
+            // refused by size before its signature is ever checked.
+            Action::RegisterReceiver { record } if record.encoded_len() > crate::receiver::MAX_RECORD_BYTES => {
+                return Err(TxError::Receiver(crate::receiver::RecordError::TooLarge(record.encoded_len())))
+            }
             _ => {}
         }
         // Every variable-length field that reaches a node before any signature or proof work is
@@ -924,6 +953,7 @@ impl Ledger {
                 // `apply_block`.
                 return Err(TxError::AggregateNeedsCovered);
             }
+            Action::RegisterReceiver { record } => self.validate_register_receiver(record)?,
         }
         // 8-9. the bundle's digest, then its proof
         if let Some(b) = bundle {
@@ -1041,6 +1071,7 @@ impl Ledger {
                 // the same so a direct caller hears where aggregates go.
                 return Err(TxError::AggregateNeedsCovered);
             }
+            Action::RegisterReceiver { record } => self.apply_register_receiver(record),
         }
         Ok(receipt)
     }
@@ -1239,17 +1270,20 @@ impl Ledger {
     }
 
     /// Deterministic state commitment (spec §9):
-    /// `blake3("rand-state-2" || tree_root || nullifier_root || validators_root || programs_root)`,
-    /// with `|| bridge_root` appended on a chain whose genesis has a `bridge` section (spec §10),
-    /// and — on a chain whose genesis has an `aggregation` section — the whole of that under
-    /// `rand-state-3` with `|| aggregators_root` appended (block-aggregation spec §2.1).
+    /// `blake3("rand-state-4" || tree_root || nullifier_root || validators_root || programs_root
+    /// [|| bridge_root] [|| aggregators_root] || receivers_root)`, with `bridge_root` appended on
+    /// a chain whose genesis has a `bridge` section (spec §10) and `aggregators_root` appended on
+    /// a chain whose genesis has an `aggregation` section (block-aggregation spec §2.1), always
+    /// under `rand-state-4` — the short-address registry (spec §6.1) moved every chain to this
+    /// domain, since `receivers_root` is always appended, gate or no gate.
     /// The nullifier and validator roots are BLAKE3 Merkle roots over the sorted sets; programs
     /// are content addressed, so their ids commit to the code.
     ///
-    /// The optional components are appended, never zero-placed, so a chain without a bridge
-    /// commits exactly what phase S1 committed and a chain without aggregation exactly what the
-    /// bridge commit added — turning either on is a hard fork for the chains that take it and a
-    /// no-op for the ones that do not.
+    /// The bridge and aggregation components are appended, never zero-placed, so a chain without
+    /// either commits exactly what it did before that section existed — turning one on is a hard
+    /// fork for the chains that take it and a no-op for the ones that do not. `receivers_root` is
+    /// the one component every chain gets unconditionally, because the registry has no genesis
+    /// gate: it is simply empty until a first `RegisterReceiver` lands.
     /// The three merkle roots `state_root` binds, in order: nullifiers, validators, programs.
     /// Split out so a state-root mismatch can name the component it diverges in.
     fn state_root_leaves(&self) -> (Hash, Hash, Hash) {
@@ -1287,7 +1321,8 @@ impl Ledger {
     }
 
     /// The component roots of [`Ledger::state_root`], for logging a mismatch: tree, nullifiers,
-    /// validators, programs, aggregators. A divergence between two ledgers names itself here.
+    /// validators, programs, aggregators, receivers. A divergence between two ledgers names
+    /// itself here.
     pub fn debug_state_root_components(&self) -> String {
         let (nf, val, prog) = self.state_root_leaves();
         let agg = if self.aggregation.is_some() {
@@ -1295,7 +1330,11 @@ impl Ledger {
         } else {
             "none".into()
         };
-        format!("tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} aggregators {agg}", self.tree.root())
+        let recv = receivers_root(&self.receivers);
+        format!(
+            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} aggregators {agg} receivers {recv:?}",
+            self.tree.root()
+        )
     }
 
     pub fn state_root(&self) -> Hash {
@@ -1310,9 +1349,9 @@ impl Ledger {
         }
         if self.aggregation.is_some() {
             buf.extend_from_slice(aggregation::aggregators_root(&self.aggregators).as_bytes());
-            return Hash::digest_domain(b"rand-state-3", &buf);
         }
-        Hash::digest_domain(b"rand-state-2", &buf)
+        buf.extend_from_slice(receivers_root(&self.receivers).as_bytes());
+        Hash::digest_domain(b"rand-state-4", &buf)
     }
 }
 
@@ -1321,26 +1360,29 @@ pub fn default_executor() -> StubExecutor {
     StubExecutor
 }
 
+/// Fixtures shared by every ledger-family test module — `mod tests` below and each feature
+/// file's own (`receivers::tests`, and so on) — so the construction logic for "a ledger", "a
+/// bundle transaction" and "a valid proposer" lives in exactly one place.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_fixtures {
     use super::*;
     use crate::confidential::StubExecutor;
     use crate::crypto::Keypair;
-    use crate::notes::{Envelope, ShieldedAddress};
-    use crate::types::{BlockHeader, QuorumCertificate};
+    use crate::notes::ShieldedAddress;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    const HC: Word8 = [11; 8];
+    pub(crate) const HC: Word8 = [11; 8];
 
-    fn env() -> Envelope {
+    pub(crate) fn env() -> Envelope {
         Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] }
     }
 
-    fn keys() -> (Keypair, Keypair) {
+    pub(crate) fn keys() -> (Keypair, Keypair) {
         (Keypair::from_seed([1; 32]).unwrap(), Keypair::from_seed([2; 32]).unwrap())
     }
 
     /// A register entry for `k`: the S1 fixture's stake, with the S2 fields at their defaults.
-    fn entry(k: &Keypair, stake: u64) -> (Address, ValidatorEntry) {
+    pub(crate) fn entry(k: &Keypair, stake: u64) -> (Address, ValidatorEntry) {
         (
             k.address(),
             ValidatorEntry {
@@ -1354,14 +1396,69 @@ mod tests {
         )
     }
 
-    fn ledger() -> Ledger {
+    /// Chain `chain_id`, two validators (the fixture keys above, stake 10 each), faucet and
+    /// confidential on, height 1 — the ledger every ledger test, and every other feature file's
+    /// tests, build from.
+    pub(crate) fn ledger_with_validators(chain_id: u64) -> Ledger {
         let (a, b) = keys();
         let register: BTreeMap<Address, ValidatorEntry> = [entry(&a, 10), entry(&b, 10)].into_iter().collect();
-        let mut l = Ledger::new(7, HC, register, &StubExecutor);
+        let mut l = Ledger::new(chain_id, HC, register, &StubExecutor);
         l.set_faucet(true);
         l.set_confidential(true);
         l.set_height(1);
         l
+    }
+
+    /// The first validator's address: a proposer valid for any ledger `ledger_with_validators`
+    /// built (the register is a `BTreeMap`, so this is deterministic).
+    pub(crate) fn proposer(l: &Ledger) -> Address {
+        *l.validators().keys().next().expect("ledger_with_validators seeds two validators")
+    }
+
+    /// A valid stub bundle at the base fee, carrying `action`, timed to `l`'s own height, with
+    /// fresh nullifiers and commitments every call (a counter, so concurrent tests never
+    /// collide) — the fixture a single-action test builds its transaction from.
+    ///
+    /// Anchored to `l`'s *last recorded* anchor rather than its live root: every bundle a caller
+    /// applies through this fixture appends two commitments (`apply_bundle_notes` runs for every
+    /// bundle, whatever the action), which moves the live root without recording it as an
+    /// anchor — a caller that never calls `record_anchor` between two `apply_tx`s would anchor
+    /// the second at a root the tree only passed through, and get `UnknownAnchor` for it. The
+    /// genesis anchor `record_anchor` never evicts on its own stays valid across such calls.
+    pub(crate) fn bundle_tx(l: &Ledger, action: Action) -> Transaction {
+        static COUNTER: AtomicU32 = AtomicU32::new(1);
+        let base = COUNTER.fetch_add(4, Ordering::Relaxed);
+        let anchor = l.anchors().back().map(|(_, r)| *r).unwrap_or_else(|| l.root());
+        let mut b = Bundle {
+            anchor,
+            nullifiers: [[base; 8], [base + 1; 8]],
+            commitments: [[base + 2; 8], [base + 3; 8]],
+            fee: gas::BUNDLE_BASE,
+            burn: 0,
+            asset: 0,
+            time: l.height() as u32,
+            envelopes: [env(), env()],
+            proof: vec![],
+        };
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        Transaction::shielded(l.chain_id(), b, action)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::test_fixtures::{env, keys, HC};
+    use crate::confidential::StubExecutor;
+    use crate::crypto::Keypair;
+    use crate::notes::ShieldedAddress;
+    use crate::types::{BlockHeader, QuorumCertificate};
+
+    /// Chain 7, the fixture's two validators — `test_fixtures::ledger_with_validators`, at the
+    /// one chain id every test in this module uses.
+    fn ledger() -> Ledger {
+        test_fixtures::ledger_with_validators(7)
     }
 
     /// A bundle whose stub proof publishes exactly the digest the ledger recomputes.

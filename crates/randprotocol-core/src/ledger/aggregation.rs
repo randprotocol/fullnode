@@ -73,9 +73,10 @@ pub fn aggregator_leaf(addr: &Address, entry: &AggregatorEntry) -> Hash {
 }
 
 /// The register's component of the state root: the merkle root of every entry's leaf, empty at
-/// chain-9 block 0. Joined into the root (under the `rand-state-3` domain) exactly when
-/// `genesis.aggregation` is `Some`; a chain without the section keeps the state-2 root
-/// byte-for-byte.
+/// chain-9 block 0. Joined into the root exactly when `genesis.aggregation` is `Some`; a chain
+/// without the section omits it, keeping the state root it would have had without aggregation
+/// (the short-address registry's `rand-state-4` domain, and its `receivers_root` component,
+/// apply to both).
 pub fn aggregators_root(register: &BTreeMap<Address, AggregatorEntry>) -> Hash {
     let leaves: Vec<Hash> = register.iter().map(|(addr, e)| aggregator_leaf(addr, e)).collect();
     merkle_root(&leaves)
@@ -851,10 +852,11 @@ mod tests {
         }
     }
 
-    /// The manual state-root computation, written out per the documented construction: the
-    /// state-2 root of `tree ‖ nullifiers ‖ validators ‖ programs [‖ bridge]`, the state-3 root
-    /// with the aggregator component appended, each hashed with its own domain. Any drift in the
-    /// implementation's construction fails against this, not against a hash pasted from it.
+    /// The manual state-root computation, written out per the documented construction:
+    /// `tree ‖ nullifiers ‖ validators ‖ programs [‖ bridge] [‖ aggregators] ‖ receivers`, under
+    /// the `domain` passed in — `rand-state-4` on every chain since the short-address registry
+    /// moved every chain to that one domain. Any drift in the implementation's construction
+    /// fails against this, not against a hash pasted from it.
     fn manual_state_root(l: &Ledger, domain: &'static [u8], with_aggregators: bool) -> Hash {
         use crate::crypto::merkle_root;
         use crate::notes::word8_to_bytes;
@@ -898,20 +900,21 @@ mod tests {
         if with_aggregators {
             buf.extend_from_slice(aggregators_root(l.aggregators()).as_bytes());
         }
+        buf.extend_from_slice(crate::ledger::receivers::receivers_root(l.receivers()).as_bytes());
         Hash::digest_domain(domain, &buf)
     }
 
-    /// The absolute gate: an aggregation-less chain's root is today's, computed exactly the way
-    /// it is computed now — and a gated chain's is a different domain's, with the component in.
+    /// The absolute gate: an aggregation-less chain's root is computed exactly the way it is
+    /// computed now — and a gated chain's includes the aggregators component, same domain.
     #[test]
     fn a_chain_without_the_section_keeps_todays_state_root_byte_for_byte() {
         let l = ledger();
-        assert_eq!(l.state_root(), manual_state_root(&l, b"rand-state-2", false));
+        assert_eq!(l.state_root(), manual_state_root(&l, b"rand-state-4", false));
         // The same ledger, gated, gets a different root — and the component is the empty
         // register's (so an empty register at chain-9 block 0 is well-defined).
         let mut gated = l.clone();
         gated.set_aggregation(Some(cfg()));
-        assert_eq!(gated.state_root(), manual_state_root(&gated, b"rand-state-3", true));
+        assert_eq!(gated.state_root(), manual_state_root(&gated, b"rand-state-4", true));
         assert_ne!(gated.state_root(), l.state_root());
         // And taking the section back off is the identity, not a third value.
         let mut ungated = gated.clone();
@@ -1065,7 +1068,7 @@ mod tests {
         assert!(built.ledger.aggregators().is_empty());
         assert_eq!(
             built.ledger.state_root(),
-            manual_state_root(&built.ledger, b"rand-state-3", true)
+            manual_state_root(&built.ledger, b"rand-state-4", true)
         );
 
         let mut bad = genesis();
