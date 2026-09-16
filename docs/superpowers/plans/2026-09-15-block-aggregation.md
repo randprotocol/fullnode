@@ -515,14 +515,14 @@ prunes → node B joins and syncs in sealed form → both roots agree and the su
 (`total_supply == issued − slashed`, exactly) → the run's walls recorded (register, window,
 aggregate prove, admission, seal+prune, resync) into `docs/aggregation.md`.
 
-- [ ] **Step 1: Write the failing tests** — the end-to-end test itself; the full workspace
+- [x] **Step 1: Write the failing tests** — the end-to-end test itself; the full workspace
   suite (`cargo test --workspace --release`, proving slot held) green.
-- [ ] **Step 2: Implement** — whatever the end-to-end exposes (this is where review findings
+- [x] **Step 2: Implement** — whatever the end-to-end exposes (this is where review findings
   land).
-- [ ] **Step 3: The docs** — `docs/aggregation.md` amended with the measured numbers;
+- [x] **Step 3: The docs** — `docs/aggregation.md` amended with the measured numbers;
   `AGENTS.md` gains the aggregation project-memory entry (the invariants this plan added:
   genesis gating, the nine-step admission, the pruned record, the supply identity).
-- [ ] **Step 4: Commit** — `docs: aggregation — the end-to-end: cluster-sealed-sync, the measured numbers, the project memory entry`
+- [x] **Step 4: Commit** — `docs: aggregation — the end-to-end: cluster-sealed-sync, the measured numbers, the project memory entry`
 
 ## What activation hands to ops
 

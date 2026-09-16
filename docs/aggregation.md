@@ -129,13 +129,14 @@ filled at activation.
 
 | measurement | value | source |
 |---|---|---|
-| bundle proof (register), test profile, tier 14 | 98.2 s, 323 909 bytes | capstone register stage |
-| aggregate prove, test profile, N=1 (tier 19) | PENDING-CAPSTONE | capstone aggregate stage |
-| startup key-build, test profile (2¹⁹) | ~18 s (the ops expectation at 2²¹ production: ~30–70 s) | `warm_aggregation` startup log |
-| warm aggregate verify, test profile | PENDING-CAPSTONE | admission step 8 |
-| seal → pruned, at `window` blocks | the pruning pass runs every 16 blocks, gated at `sealed_at + window` | capstone |
-| sealed resync, a fresh joiner | **1 rVM verification per sealed window** (the covering aggregate's; a raw sync re-verifies each bundle) | capstone's verification counter |
-| rVM aggregate proof size, test profile | 328 121 bytes (the circuits M5.3 record; production est. ~0.5–0.6 MB, far under the 2 MiB cap) | `circuits/recursion/docs/02-aggregate.md` |
+| bundle proof (register), test profile, tier 14 | 94.3–99.1 s across runs, 321 701–327 322 bytes (random notes vary the witness) | capstone register stage |
+| aggregate prove, test profile, N=1 (tier 19) | **1568.2 s wall (~26 min) on a loaded shared box**, 327 035 bytes | capstone aggregate stage |
+| startup key-build, test profile (2¹⁹) | **13.0–13.4 s** (the ops expectation at 2²¹ production: ~30–70 s) | `warm_aggregation` startup log, three nodes |
+| warm aggregate verify, test profile | ~1–2 s (the first at a shape pays the 13 s key-build, once) | admission step 8 |
+| seal → pruned | sealed at block 46; the pass at head 64 rewrote the record (every 16 blocks, gated at `sealed_at + window`) | capstone |
+| sealed resync, a fresh joiner | **1 rVM verification per sealed window** (the covering aggregate's; a raw sync re-verifies each bundle); the 7-block sealed batch applied in under a second | capstone's verification counter |
+| the capstone end to end | **1873.2 s** (register 97 s → prove 1568 s → seal → prune → resync) | `tests/cluster.rs` |
+| rVM aggregate proof size, test profile | 325–327 KB measured here (the circuits M5.3 record is 328 121 bytes; production est. ~0.5–0.6 MB, far under the 2 MiB cap) | `circuits/recursion/docs/02-aggregate.md` |
 | the interface conformance vectors | `inner_vk_digest` `33a94ec6…92a1c8`, the 107-word list, digest `9f11f1ae…88dcd` — reproduced byte-for-byte by the fullnode's recompute | the conformance suite (`agg_executor.rs`) |
 
 ### The one capstone walk-through
@@ -149,6 +150,40 @@ commit → the prune pass rewrites the record (34 public values + the 7 declared
 reaching the same blocks and state roots at every height with exactly one rVM verification —
 and the supply audit holds end to end (`total_supply == issued − slashed`, with one subsidy
 minted against `sealed_blocks == 1`).
+
+### What the capstone exposed: the sealed-sync stall
+
+The capstone passed alone, twice (1873.2 s, 1876.4 s), and stalled inside the full cluster
+suite three times — the fresh joiner stuck part-way with nothing outstanding and nothing
+counted as failed. The mechanism, once the warn-level keeper diagnostics named it, was two
+give-ups compounding:
+
+- **A batch cut between a pruned block and its cover is unservable, deterministically.** The
+  sync client's batch count halves on wire failures (under suite load, toward 1) and the
+  server's byte budget cuts where it cuts; either can end a batch after a sealed block (the
+  window at 33) but before its covering aggregate (block 46). The joiner's coverage check
+  refuses the batch — correctly, it is batch-atomic — and the raw-form fallback asked
+  *another peer*, which pruned the same record and served the same split form. A give-up
+  that can never succeed, retried forever.
+- **The sync peer picker had no fallback.** When the fresh peer's connection flapped or its
+  status had not landed, the picker returned nothing and the sync stopped silently until
+  gossip happened to re-trigger it; a send that failed was not even counted.
+
+The fixes, each with its node-lib regression test:
+
+- **Coverage-closed serving** (`node.rs`'s `close_batch_coverage`): before a `Blocks`
+  response goes out, every served pruned entry's seal mark is resolved and the batch extends
+  — past the count asked, past the soft byte budget — until every cover it needs is in. The
+  extension's only ceiling is the reader's own wire limit; a chain whose cover sits beyond
+  that is the genuine archive case the raw-form fallback exists for. Pinned by
+  `a_batch_cut_short_of_its_cover_extends_until_the_coverage_closes` (the count cut),
+  `a_batch_cut_by_bytes_short_of_its_cover_extends_within_the_reader_limit` (the byte cut),
+  and `the_extension_stops_at_the_reader_limit_and_serves_what_it_can` (the ceiling).
+- **The robust picker** (`node.rs`'s `pick_sync_peer`): the freshest connected peer ahead
+  wins, but when the chain is known ahead and no connected-and-fresh pair exists, any
+  connected peer is worth one round trip — a possibly-stale answer costs a little, a silent
+  stall costs the chain. A send that cannot go out warns, counts, and tries the next
+  candidate. Pinned by `pick_sync_peer_prefers_fresh_and_falls_back_to_any_connected`.
 
 ### The fleet bundle's declared shape
 

@@ -57,6 +57,43 @@ vendoring/workflow record.)
 - **Sealed-form sync is batch-atomic**: a pruned bundle is accepted only when a covering
   aggregate is applied (a local mark) or in the same batch (whose commit is atomic); anything
   else is the raw-form fallback to another peer, never a ban (`node.rs`'s `RawFallback`).
+- **Serving is coverage-closed** (`node.rs`'s `close_batch_coverage`). The acceptance above
+  makes a batch that ends between a pruned block and its cover unservable — the fallback
+  re-asks a peer that pruned the same record and serves the same split form, forever (the
+  sealed-sync stall, shown by the capstone inside the full suite: the client's batch count
+  halves on wire failures under load; the byte budget cuts where it cuts). So a `Blocks`
+  response extends past the count asked and past the soft byte budget until every served
+  pruned entry's seal mark resolves inside the batch, capped only by the reader's wire limit
+  — beyond that is the genuine archive case the fallback exists for. Do not reintroduce a
+  serve path that can cut coverage (regression tests:
+  `a_batch_cut_short_of_its_cover_extends_until_the_coverage_closes`,
+  `a_batch_cut_by_bytes_short_of_its_cover_extends_within_the_reader_limit`,
+  `the_extension_stops_at_the_reader_limit_and_serves_what_it_can`).
+- **The sync picker never silently gives up** (`node.rs`'s `pick_sync_peer`): the freshest
+  connected-and-ahead peer wins, but with the chain known ahead and no such pair, any
+  connected peer is worth one round trip; a send that cannot go out warns, counts, and tries
+  the next candidate (regression test:
+  `pick_sync_peer_prefers_fresh_and_falls_back_to_any_connected`).
+- **Every replica construction re-registers the covered source.** `HotStuff::resume` builds a
+  fresh replica, and `apply_synced` forgot to re-set it: a synced node then failed every
+  aggregate block at the sidecar (peer-side `AggregateNeedsCovered`; a stable state-root
+  mismatch on its own proposals). The resume re-sets `StoreCovered` exactly as startup does.
+  And the source answers the **record-only** flavor — existence, bundle-ness, pv and shape —
+  never the admission-policy one: before that fix, replaying an aggregate block whose window
+  had passed was refused with `AggregateNeedsCovered`, a deterministic consensus break for any
+  slow syncer. Coverability policy (window, seal) lives in the admission worker's
+  `assemble_covered`, nowhere else.
+- **A pruned bundle's identity is its *raw* transaction hash** (the marker form hashes
+  differently — the proof bytes differ). The fee bucket keys on it (`0498a3b`), the sealed
+  form's side table attests it, and `shrugg_getUnsealed` resolves marker forms through the
+  proof-hash index. Get any of these wrong and the sealed replay diverges at the state root.
+- **The proposer's root is computed in list order**: the §3.4 selection trial-applies the
+  chosen aggregate *after* the ordinary transactions, where its place in the block is — the
+  validators recompute in the same order (the ordering fix, also `0498a3b`).
+- The capstone (`tests/cluster.rs`'s `a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window`)
+  is the end-to-end proof: register → prove (tier 19, ~26 min on the loaded box) → seal →
+  prune → a fresh node resyncs with **one rVM verification per sealed window**. Its wall time
+  (~31 min) and the measured numbers live in `docs/aggregation.md` §6.
 - The chain-9 admitted shape is the fleet's own measured classes for a 2-in/2-out bundle
   (`program 12, input 10, keccak 0, sha256 0, public 2, mem 16`) — NOT the recursion
   fixtures' (they over-declare at 13/12/18). Cutting a genesis with the wrong shape means no
