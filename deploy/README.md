@@ -1,21 +1,25 @@
-# Testnet: chain id 8 (SHRUGG shielded pool, staking, bridge, zkVM constraint set 5)
+# Testnet: chain id 9 (SHRUGG shielded pool, staking, bridge, zkVM constraint set 6, the pre-v0.1 security fixes)
 
 Test keys only; all seeds are committed on purpose so any machine can pull and run.
 
-> **Constraint set 6 is vendored on `main` now and is the *next* chain's set, not this one's.**
-> Chain 8 stays on constraint set 5 and build `03c9fb9`: a set-6 build cannot join the chain-8
-> fleet and a set-5 build cannot verify a set-6 chain — in either direction (`pv::NUM` 26 → 34,
-> `Proof` gains `sha256_log_height` and `public_log_height`, a six-keyed verifier key, a new AIR
-> region and table). Like every set before it, set 6 arrives by cutting a new chain id (chain 9),
-> not by upgrading chain 8 in place. See `docs/confidential.md`, "Constraint set 6".
+> **Chain 9 (cut 2026-09-16) is the constraint-set-6 chain, on build `5f8c6f9`**: the M4.3/M4.4
+> re-vendor (the public input segment, `pv::NUM` 34, the six-keyed verifier key), the RPC
+> hardening, the vendored recursion VM and the chain-side aggregation code, the pre-v0.1
+> security review's three fixes (H1, M1, L1 — `../security/fullnode-security-review-pre-v0.1-2026-09-16.md`),
+> and libp2p 0.57. **Cut without the `aggregation` section** (`AGGREGATION=off
+> deploy/cut-chain9-genesis.sh`): the section's activation values are the user-owned ≥ 64 GB
+> measurements (`docs/deploy.md`, "Chain 9 activation") and a section cannot be added to a
+> running chain, so aggregation activates on a later chain. Chain 8 (build `03c9fb9`,
+> constraint set 5) is retired: a set-6 build cannot join the chain-8 fleet and a set-5 build
+> cannot verify a set-6 chain, in either direction. The chain-8 record is under "History".
 
 | | |
 |---|---|
-| chain id | **8** |
-| genesis hash | **`8c742fc9c84c37e21c942cd86e1bd064e62f1c488a217e8b43a9eb8d89de8983`** |
-| genesis file | `deploy/genesis-chain8.json` (cut 2026-09-13) |
-| pinned build | **`03c9fb9`** — binaries in `bin-03c9fb9/`, `.update-pin` content is `03c9fb9` |
-| zkVM | **constraint set 5** (milestone 4.2 + the 2026-09-12 zk audit port + FRI back to 80 queries) |
+| chain id | **9** |
+| genesis hash | **`dbb7498b83723ccf4de66f3497a50237bff3306e71d9598eb462120c5ae28904`** |
+| genesis file | `deploy/genesis-chain9.json` (cut 2026-09-16; chain 8's stays at `deploy/genesis-chain8.json`) |
+| pinned build | **`5f8c6f9`** — binaries in `bin-5f8c6f9/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `5f8c6f9` |
+| zkVM | **constraint set 6** (the public input segment; M4.3 EVM and M4.4 sBPF/sha256 guests ride along) |
 | `hc_bundle` | `4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb` |
 | validators | **18, every one staked at exactly 1000 SHRUGG** (the staking minimum) |
 | quorum | **13 of 18** (strictly more than two thirds of 18 000 SHRUGG of stake) |
@@ -147,15 +151,15 @@ Nothing about chain 7 is reusable — different chain id, incompatible proofs �
 start on every machine. Keep chain 7's data directory around if you want to keep serving it; the
 new `DATA` name is keyed on the genesis hash, so the two never collide.
 
-1. **Binary**: `bin-03c9fb9/shrugg-node` and `bin-03c9fb9/shrugg` (or `cargo build --release` at
-   commit `03c9fb9`). Every node on the fleet must run this one build — a constraint-set change is a
+1. **Binary**: `bin-5f8c6f9/shrugg-node` and `bin-5f8c6f9/shrugg` (or `cargo build --release` at
+   commit `5f8c6f9`; the Linux ones are built once on E and fanned out by `deploy/cutover-droplet.sh`). Every node on the fleet must run this one build — a constraint-set change is a
    fork, and a mixed fleet stalls.
-2. **Genesis**: `deploy/genesis-chain8.json`, byte-identical everywhere. `shrugg-node init` prints
-   the hash; it must read `8c742fc9c84c37e21c942cd86e1bd064e62f1c488a217e8b43a9eb8d89de8983`.
-3. **Fresh data dir**: `data-<letter>-8c742fc9` (never reuse a chain-7 directory).
-4. **`.update-pin`** on the MacBook Air (node B, auto-updater): set its content to **`03c9fb9`**, or
-   the updater drags B back onto the chain-7 build and B drops out of the set.
-5. **Start**, and check `shrugg-node status`: `height` climbing, `chain id 8`,
+2. **Genesis**: `deploy/genesis-chain9.json`, byte-identical everywhere. `shrugg-node init` prints
+   the hash; it must read `dbb7498b83723ccf4de66f3497a50237bff3306e71d9598eb462120c5ae28904`.
+3. **Fresh data dir**: `data-<letter>-dbb7498b` (never reuse a chain-8 directory).
+4. **`.update-pin`** on the MacBook Air (node B, auto-updater): set its content to **`5f8c6f9`**, or
+   the updater drags B back onto the chain-8 build and B drops out of the set.
+5. **Start**, and check `shrugg-node status`: `height` climbing, `chain id 9`,
    `hc_bundle 4a27356f…`, `active_validator: true`, `notes: 5` at genesis,
    `tree_root 1ff293744074aa828b7a63cc26e5591d6f04173606a3b5048981649bbe2b35da` at height 0.
 6. **Quorum**: nothing commits until 13 of the 18 are up. Bring the droplets up before declaring a

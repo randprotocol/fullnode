@@ -27,6 +27,11 @@ WALLET=${WALLET:-target/release/shrugg}
 CHAIN8=${CHAIN8:-deploy/genesis-chain8.json}
 ALLOC_WALLETS=${ALLOC_WALLETS:-wallets}          # shielded-{1..5}.key.json (gitignored)
 OUT=${OUT:-deploy/genesis-chain9.json}
+# AGGREGATION=off cuts the chain without the section (a genesis like chain 8's, on this build):
+# the security-fixed constraint-set-6 tree goes to the fleet while the section's activation
+# values are still the user-owned hardware measurements (docs/deploy.md, "Chain 9 activation").
+# A later chain activates aggregation; a section cannot be added to a running chain.
+AGGREGATION=${AGGREGATION:-on}
 
 # ── the aggregation section ────────────────────────────────────────────────────────────────
 # The bond, cap, schedule and window (spec §2.3, §3.3): the activation values.
@@ -74,7 +79,12 @@ for i in 1 2 3 4 5; do
   args+=(--alloc "$("$WALLET" --key "$ALLOC_WALLETS/shielded-$i.key.json" address | tail -1)=1000")
 done
 
-"$NODE" genesis --chain-id 9 "${args[@]}" \
-  --epoch-blocks 1000 --faucet --fri-profile production --out "$OUT" \
-  --aggregation "$BOND,$MAX_COVERS,$SUBSIDY_BASE,$HALVING_BLOCKS,$AGGREGATION_WINDOW" \
-  --admitted-shape "$SHAPE_PROFILE,$SHAPE_TIER,$SHAPE_PROGRAM,$SHAPE_INPUT,$SHAPE_KECCAK,$SHAPE_SHA256,$SHAPE_PUBLIC,$SHAPE_MEM,$SHAPE_HC,$SHAPE_DIGEST"
+if [ "$AGGREGATION" = off ]; then
+  "$NODE" genesis --chain-id "${CHAIN_ID:-9}" "${args[@]}" \
+    --epoch-blocks 1000 --faucet --fri-profile production --out "$OUT"
+else
+  "$NODE" genesis --chain-id "${CHAIN_ID:-9}" "${args[@]}" \
+    --epoch-blocks 1000 --faucet --fri-profile production --out "$OUT" \
+    --aggregation "$BOND,$MAX_COVERS,$SUBSIDY_BASE,$HALVING_BLOCKS,$AGGREGATION_WINDOW" \
+    --admitted-shape "$SHAPE_PROFILE,$SHAPE_TIER,$SHAPE_PROGRAM,$SHAPE_INPUT,$SHAPE_KECCAK,$SHAPE_SHA256,$SHAPE_PUBLIC,$SHAPE_MEM,$SHAPE_HC,$SHAPE_DIGEST"
+fi
