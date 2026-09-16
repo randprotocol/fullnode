@@ -204,6 +204,13 @@ impl Wallet {
     /// does. The spend key on disk must be this wallet's: rewriting a *different* key's file is
     /// the one mistake that destroys notes, so it is refused rather than merged, and a path with
     /// no file yet falls through to [`Wallet::save_new`].
+    ///
+    /// **Never in place.** Truncating this file and then writing it leaves a window in which the
+    /// only copy of the spend key is a zero-length file, and a crash in that window is every note
+    /// this wallet will ever own. So the new contents go to a sibling temp file that is flushed
+    /// to disk and then renamed over the original: at every instant the path holds a whole key
+    /// file, either the new one or the old one, and the old one is not a loss — it differs only
+    /// in a KEM version, and every version below the current one opens anyway.
     pub fn save(&self, path: &Path) -> Result<()> {
         if !path.exists() {
             return self.save_new(path);
@@ -215,7 +222,7 @@ impl Wallet {
                 path.display()
             ));
         }
-        write_private(path, self.key_file()?.as_bytes())
+        write_private_atomic(path, self.key_file()?.as_bytes())
     }
 }
 
@@ -371,6 +378,54 @@ impl NoteStore {
         assets.sort_unstable();
         assets.dedup();
         assets.into_iter().map(|a| (a, self.balance_of(a))).collect()
+    }
+}
+
+/// Replace `path` with `bytes` atomically and owner-only: write a sibling `<path>.tmp` (created
+/// 0600, so the contents are never world-readable even for an instant), flush it to the disk,
+/// then rename it over the original.
+///
+/// The rename is the point. A reader — or a crash — sees the old file or the new one and never a
+/// half-written one, which for a key file is the difference between a rotation and a wallet that
+/// can no longer open anything. `sync_all` before the rename is what makes that true across a
+/// power loss rather than only across a process death: without it the rename can reach the disk
+/// before the bytes it points at.
+///
+/// A leftover temp file from an earlier crash is removed first, since `create_new` would
+/// otherwise refuse — and a stale temp must never be mistaken for the real file, which is why it
+/// is never the thing left behind at `path`.
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
+    let _ = std::fs::remove_file(&tmp);
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(bytes)?;
+        f.sync_all().with_context(|| format!("flushing {}", tmp.display()))?;
+        drop(f);
+        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        // The rename carries the temp file's mode, so this is belt and braces — and it is the
+        // line that makes a key file left at 0644 by some earlier hand come back owner-only.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {} to its owner", path.display()))?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(())
     }
 }
 
@@ -1484,6 +1539,51 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    /// The rewrite a rotation does never leaves a half-written key file behind. It goes to a
+    /// sibling temp file and is renamed over the original, so a crash at any moment leaves either
+    /// the new file or the old one — and the old one still opens every note, where a truncated
+    /// one would open none of them, ever. The result is owner-only whatever the old file's mode
+    /// was.
+    #[test]
+    fn saving_a_rotated_key_file_is_atomic_and_stays_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.key.json");
+        let tmp = {
+            let mut s = path.clone().into_os_string();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+        let mut w = Wallet::generate();
+        w.save_new(&path).unwrap();
+        // A file someone left world-readable does not stay that way through a rotation.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        w.rotate();
+        w.save(&path).unwrap();
+        let back = Wallet::load(&path).unwrap();
+        assert_eq!(back.sk, w.sk);
+        assert_eq!(back.kem_version, 1);
+        assert!(!tmp.exists(), "the temp file is renamed over the original, not left beside it");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // A temp file left by an earlier crash does not block the next rotation.
+        std::fs::write(&tmp, "leftover").unwrap();
+        w.rotate();
+        w.save(&path).unwrap();
+        assert_eq!(Wallet::load(&path).unwrap().kem_version, 2);
+        assert!(!tmp.exists());
+        // And the refusal that guards the whole path is still the first thing it does.
+        let err = Wallet::generate().save(&path).unwrap_err().to_string();
+        assert!(err.contains("another wallet's spend key"), "{err}");
+        assert_eq!(Wallet::load(&path).unwrap().sk, w.sk, "the refused write touched nothing");
     }
 
     /// A version 2 file — written before rotation existed — loads as a wallet at KEM version 0,

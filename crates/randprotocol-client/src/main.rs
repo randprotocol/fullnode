@@ -520,25 +520,35 @@ async fn main() -> Result<()> {
         Cmd::Register { rotate, fee, cuda } => {
             let (mut w, path, mut store) = open_wallet(&cli.key)?;
             let chain_id = rpc.chain_id().await?;
+            // The version comes from the chain, never from this wallet's counter: the ledger
+            // admits exactly `current + 1`, so a rotation that did not commit has to be retried
+            // at the version it failed at (`receiver::registration_target`).
             let already = rpc.receiver(&w.id).await?;
-            if rotate {
-                anyhow::ensure!(
-                    already.is_some(),
+            let kem_version = match receiver::registration_target(already.as_ref().map(|r| r.version), rotate) {
+                receiver::RegisterPlan::Publish { kem_version } => kem_version,
+                receiver::RegisterPlan::AlreadyRegistered { version } => {
+                    // Not a failure: the wallet is in the state that was asked for.
+                    println!(
+                        "{} is already registered at version {version}; `rand register --rotate` publishes a fresh KEM key",
+                        w.id
+                    );
+                    return Ok(());
+                }
+                receiver::RegisterPlan::NothingToRotate => anyhow::bail!(
                     "{} has never been registered, so there is nothing to rotate; run `rand register` first",
                     w.id
+                ),
+            };
+            if w.kem_version != kem_version {
+                // A counter ahead of the chain is what a failed rotation leaves behind. Moving it
+                // back is what keeps the retry publishable — and it is worth a line, because the
+                // wallet's address moves with it.
+                eprintln!(
+                    "this wallet's KEM key version is {}, and the chain's registry implies {kem_version}; \
+                     publishing (and moving to) the version the chain will accept",
+                    w.kem_version
                 );
-                // The key file moves before the record is published, deliberately: a rotation
-                // that published first and crashed before saving would leave senders sealing to
-                // a key this wallet no longer knows it has. The other order costs nothing —
-                // every version below the current one still opens.
-                w.rotate();
-                w.save(&cli.key)?;
-            } else if let Some(current) = &already {
-                anyhow::bail!(
-                    "{} is already registered at version {}; `rand register --rotate` publishes a fresh KEM key",
-                    w.id,
-                    current.version
-                );
+                w.kem_version = kem_version;
             }
             let record = w.record(chain_id);
             let action = Action::RegisterReceiver { record: record.clone() };
@@ -564,7 +574,13 @@ async fn main() -> Result<()> {
             )
             .await;
             store.save(&path)?;
-            report(&s?, "receiver registration");
+            let s = s?;
+            // Only now: the node has taken the transaction, so the version this wallet will
+            // advertise from here on is the version the chain holds. Saving before proving would
+            // move the file for a registration that may never land, which is the state the
+            // reconciliation above exists to climb back out of.
+            w.save(&cli.key)?;
+            report(&s, "receiver registration");
             println!("registered {} at record version {} (KEM key version {})", w.id, record.version, w.kem_version);
         }
         Cmd::Balance => {
@@ -662,15 +678,18 @@ async fn main() -> Result<()> {
             let dest = randprotocol_core::notes::ShieldedAddress::from(&record);
             let amount = parse_amount(&amount)?;
             // Sender-paid registration (spec §6.3): the same record, published on the bundle
-            // that pays the receiver. Only worth doing once — the ledger refuses a repeat of a
-            // version it already holds — so a receiver the chain already knows is left alone.
+            // that pays the receiver — but only at the one version the ledger will take. A
+            // registration the chain refuses takes the payment down with it, and that payment is
+            // a proof this machine has already spent a minute and a half on, so every other case
+            // pays and says why (`receiver::carried_registration`).
             let action = if register {
-                match rpc.receiver(&id).await? {
-                    Some(current) if current.version >= record.version => {
-                        println!("{id} is already registered at version {}; sending without registering", current.version);
+                let chain = rpc.receiver(&id).await?.map(|r| r.version);
+                match receiver::carried_registration(record.version, chain) {
+                    receiver::CarriedRegistration::Publish => Action::RegisterReceiver { record },
+                    receiver::CarriedRegistration::Skip(why) => {
+                        println!("paying {id} without registering it: {why}");
                         Action::None
                     }
-                    _ => Action::RegisterReceiver { record },
                 }
             } else {
                 Action::None

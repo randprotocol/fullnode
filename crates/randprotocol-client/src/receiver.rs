@@ -177,6 +177,75 @@ pub fn verified(record: &ReceiverRecord, id: &ReceiverId, chain_id: u64) -> Resu
     Ok(ShieldedAddress::from(record))
 }
 
+// ---------------------------------------------------------------- publishing a record
+
+/// What `rand register` should do, given what the chain already holds for this id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisterPlan {
+    /// Publish a record built at this KEM key version; its record version is `kem_version + 1`.
+    Publish { kem_version: u32 },
+    /// The chain already holds a record and no rotation was asked for. Not an error: the wallet
+    /// is in the state the user asked for.
+    AlreadyRegistered { version: u32 },
+    /// `--rotate` on an id the chain has never seen — there is nothing to rotate *from*, and
+    /// version 1 is the only record a first registration may publish.
+    NothingToRotate,
+}
+
+/// The version a registration must publish, taken from the chain and never from the wallet's own
+/// counter (spec §6.2: the ledger admits exactly `current + 1`, or 1 for a first registration).
+///
+/// This is the whole of the retry story. A rotation whose transaction did not commit leaves a
+/// wallet whose counter has moved and a chain that has not; deriving the next version from the
+/// counter would then publish `current + 2`, which the ledger refuses — and refuses again on
+/// every later attempt, because the counter moves each time. Deriving it from `current` instead
+/// makes a retry publish the same version as the attempt that failed, which is what idempotent
+/// means here. A counter that has run ahead is reconciled back down to what the chain will
+/// accept, so that what the wallet advertises is what it published.
+pub fn registration_target(chain_version: Option<u32>, rotate: bool) -> RegisterPlan {
+    match (chain_version, rotate) {
+        // A rotation publishes `current + 1`, i.e. KEM key version `current` (record version
+        // `kem + 1`).
+        (Some(current), true) => RegisterPlan::Publish { kem_version: current },
+        (None, true) => RegisterPlan::NothingToRotate,
+        (None, false) => RegisterPlan::Publish { kem_version: 0 },
+        (Some(version), false) => RegisterPlan::AlreadyRegistered { version },
+    }
+}
+
+/// Whether a sender-paid registration (spec §6.3) may ride a payment, and if not, why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CarriedRegistration {
+    Publish,
+    /// Pay without registering, and say this.
+    Skip(String),
+}
+
+/// Decide whether the record a sender resolved can be published on the bundle that pays its
+/// owner.
+///
+/// The asymmetry that makes this worth a function: the registration is free to skip and
+/// expensive to get wrong. A record at a version the ledger will not accept does not merely fail
+/// to register — it makes the whole transaction inadmissible, and the payment inside it is a
+/// bundle proof that has already been paid for in a minute and a half of this machine. So the
+/// only version that rides is the one the chain will take, and every other case pays.
+pub fn carried_registration(record_version: u32, chain_version: Option<u32>) -> CarriedRegistration {
+    let wanted = chain_version.map_or(1, |c| c + 1);
+    if record_version == wanted {
+        return CarriedRegistration::Publish;
+    }
+    CarriedRegistration::Skip(match chain_version {
+        Some(c) => format!(
+            "the chain holds version {c} of this record and only version {wanted} may follow it, \
+             while the record offered is version {record_version}"
+        ),
+        None => format!(
+            "this receiver has never registered, so only version 1 may be published, \
+             while the record offered is version {record_version}"
+        ),
+    })
+}
+
 // ---------------------------------------------------------------- URI encodings
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -314,6 +383,60 @@ mod tests {
         let other = Wallet::from_spend_key(SpendKey([15; 8]));
         assert!(verified(&record, &other.id, 7).is_err(), "not the id it was asked for");
         assert!(verified(&record, &w.id, 8).is_err(), "the chain id is signed over too");
+    }
+
+    /// What `rand register` publishes is the chain's business, not this wallet's counter. The
+    /// ledger accepts exactly `current + 1`, so a rotation whose transaction never committed has
+    /// to be retried at the *same* version — and a wallet whose counter ran ahead of the chain
+    /// (that is what a failed rotation leaves behind) is reconciled down to it rather than
+    /// wedged one version past what the chain will ever accept.
+    #[test]
+    fn a_registration_takes_its_version_from_the_chain_and_not_from_this_wallet() {
+        // Never registered: version 1, which is the only first registration the ledger admits.
+        assert_eq!(registration_target(None, false), RegisterPlan::Publish { kem_version: 0 });
+        // Registered at version 1: a rotation publishes version 2, i.e. KEM key version 1.
+        assert_eq!(registration_target(Some(1), true), RegisterPlan::Publish { kem_version: 1 });
+        assert_eq!(registration_target(Some(7), true), RegisterPlan::Publish { kem_version: 7 });
+        // Already there, and no rotation asked for: nothing to do, and not an error.
+        assert_eq!(registration_target(Some(3), false), RegisterPlan::AlreadyRegistered { version: 3 });
+        // A rotation of an id the chain has never seen has nothing to rotate *from*.
+        assert_eq!(registration_target(None, true), RegisterPlan::NothingToRotate);
+
+        // The reconciliation, at the only place it is visible: a wallet whose own counter is
+        // ahead of the chain publishes what the chain will accept, and its address moves back
+        // to match what it published — two failed rotations do not cost two versions.
+        let mut w = crate::wallet::Wallet::from_spend_key_at(SpendKey([21; 8]), 4);
+        let RegisterPlan::Publish { kem_version } = registration_target(Some(1), true) else {
+            panic!("a rotation of a registered id publishes");
+        };
+        w.kem_version = kem_version;
+        assert_eq!(w.kem_version, 1, "the chain's version, not the wallet's 4");
+        assert_eq!(w.record(9).version, 2, "which is exactly current + 1");
+        assert_eq!(w.record(9).kem_ek, w.current_address().kem_ek, "and what it publishes is what it advertises");
+    }
+
+    /// A sender-paid registration rides a payment that has already been proved for — so the one
+    /// version that may ride is the one the ledger will accept. Anything else is skipped with a
+    /// reason, and the payment still goes through: the alternative is a rejected transaction
+    /// that takes the payment down with it.
+    #[test]
+    fn a_sender_paid_registration_rides_only_the_version_the_chain_will_accept() {
+        assert_eq!(carried_registration(1, None), CarriedRegistration::Publish);
+        assert_eq!(carried_registration(3, Some(2)), CarriedRegistration::Publish);
+        // A stale request against a chain that has moved on, and a request from the future.
+        let CarriedRegistration::Skip(why) = carried_registration(1, Some(2)) else {
+            panic!("version 1 cannot be published over version 2");
+        };
+        assert!(why.contains("holds version 2") && why.contains("version 1"), "{why}");
+        let CarriedRegistration::Skip(why) = carried_registration(5, Some(2)) else {
+            panic!("version 5 skips two versions the ledger requires");
+        };
+        assert!(why.contains("holds version 2"), "{why}");
+        // Never registered, but the record offered is not a first registration.
+        let CarriedRegistration::Skip(why) = carried_registration(2, None) else {
+            panic!("an unregistered id is registered at version 1 or not at all");
+        };
+        assert!(why.contains("version 1"), "{why}");
     }
 
     /// The two encodings the URI is made of, against their own edge cases: every length modulo
