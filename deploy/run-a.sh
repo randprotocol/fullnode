@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 # the registry, the record files — no hash-domain or peer-id change, so this is the same p2p
 # identity as chain 10) — the whole fleet must run this one build, because a genesis-format
 # change is a fork and a mixed fleet stalls. Override with BINDIR= to test a build.
-BINDIR=${BINDIR:-bin-CHAIN11BUILD}
+BINDIR=${BINDIR:-bin-ee716d7}
 BIN=$BINDIR/rand-node
 [ -x $BIN ] || { echo "$BIN missing — build it at the chain-11 commit or set BINDIR" >&2; exit 1; }
 DATA=data-a-79123fa7   # keyed on the genesis hash so a regenerated genesis gets a fresh db

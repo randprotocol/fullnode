@@ -23,7 +23,7 @@ Test keys only; all seeds are committed on purpose so any machine can pull and r
 | chain id | **11** |
 | genesis hash | **`79123fa75a2b946e21248e4b77e86444f134d0dc879035af9d4996c55eadeec2`** |
 | genesis file | `deploy/genesis-chain11.json` (cut 2026-09-17; chain 10's stays at `deploy/genesis-chain10.json`) |
-| pinned build | **`CHAIN11BUILD`** — binaries `rand-node` and `rand` in `bin-CHAIN11BUILD/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `CHAIN11BUILD` (filled in by the controller after merge, from the merge commit) |
+| pinned build | **`ee716d7`** — binaries `rand-node` and `rand` in `bin-ee716d7/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `ee716d7` (filled in by the controller after merge, from the merge commit) |
 | zkVM | **constraint set 6** (the public input segment; M4.3 EVM and M4.4 sBPF/sha256 guests ride along) — unchanged, this feature touches no proof |
 | `hc_bundle` | `4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb` |
 | receivers | **23** filed at genesis: 18 validator payouts + 5 alloc-note owners, each a signed record verified for chain id 11 |
@@ -180,7 +180,7 @@ parse — so this is a clean start on every machine. Keep chain 10's data direct
 want to keep serving it; the new `DATA` name is keyed on the genesis hash, so the two never
 collide.
 
-1. **Binary**: `bin-CHAIN11BUILD/rand-node` and `bin-CHAIN11BUILD/rand` (or `cargo build --release`
+1. **Binary**: `bin-ee716d7/rand-node` and `bin-ee716d7/rand` (or `cargo build --release`
    at the chain-11 merge commit; the Linux ones are built once on E and fanned out by
    `deploy/cutover-droplet-rand.sh`). Every node on the fleet must run this one build — a genesis
    format change is a fork, and a mixed fleet stalls.
@@ -189,7 +189,7 @@ collide.
    the file's `receivers` array must have 23 entries.
 3. **Fresh data dir**: `data-<letter>-79123fa7` (never reuse a chain-10 directory).
 4. **`.update-pin`** on the MacBook Air (node B, auto-updater): set its content to
-   **`CHAIN11BUILD`**, or the updater drags B back onto the chain-10 build and B drops out of the
+   **`ee716d7`**, or the updater drags B back onto the chain-10 build and B drops out of the
    set.
 5. **Start**, and check `rand-node status`: `height` climbing, `chain id 11`,
    `hc_bundle 4a27356f…`, `active_validator: true`, `notes: 5` at genesis,
