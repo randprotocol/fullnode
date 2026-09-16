@@ -2403,6 +2403,42 @@ mod payment_tests {
         // the caller's, and the digest binding above is what anchors the content.)
     }
 
+    /// The proposer–validator invariant for an aggregate-carrying block: the root a proposer
+    /// computes by trial-applying the aggregate onto the parent's ledger is the root every
+    /// validator recomputes through `apply_block_with_covered` — the same txs, the same order,
+    /// the same covered records.
+    #[test]
+    fn the_proposers_trial_apply_and_the_validators_block_apply_compute_one_root() {
+        let (a, _) = keys();
+        let mut l = gated(256);
+        let (kp, _) = keys();
+        register(&mut l, &kp, 10);
+        let p = proposer(&l);
+        let covered_tx = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE + 60, 0), Action::None);
+        l.apply_block(&signed_block(&l, vec![covered_tx.clone()], &a, 1), &StubExecutor).unwrap();
+
+        let tx = aggregate_tx(&kp, 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
+        let covered = covered_records(&[1]);
+        let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
+        sidecar.insert(0, covered.clone());
+
+        // The proposer's computation (HotStuff::propose's shape): clone the parent ledger, set
+        // height and timestamp, trial-apply the aggregate onto it, read the root.
+        let parent = l.clone();
+        let mut trial = parent.clone();
+        trial.set_height(2);
+        trial.set_timestamp_ms(2);
+        trial.apply_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        let header_root = trial.state_root();
+
+        // The validators' computation: apply_block_with_covered of a block built over that root.
+        let block = signed_block_with_covered(&parent, vec![tx.clone()], &a, 2, &sidecar);
+        let mut v = parent.clone();
+        v.apply_block_with_covered(&block, &sidecar, &StubExecutor).unwrap();
+        assert_eq!(v.state_root(), header_root, "the proposer's root is the validators' root");
+        assert_eq!(block.header.state_root, header_root, "and the block carries it");
+    }
+
     fn signed_header(kp: &Keypair, nonce: u64, covers: Vec<Hash>) -> crate::types::SignedAggregateHeader {
         let aggregator = kp.public_key().address();
         let proof_hash = Hash::digest(b"p");

@@ -1756,7 +1756,10 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
 async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window() {
     init_tracing();
     let started = Instant::now();
-    let ks = keys(3);
+    let ks = keys(4);
+    // ks[0]/ks[1] validate, ks[2] aggregates, ks[3] is the fresh observer (its own peer id —
+    // reusing a live validator's key would collide its libp2p identity and the join would
+    // silently never connect).
     let (a, aggregator) = (wallet(1), &ks[2]);
 
     // The gated genesis: the test-profile bundle shape admitted — the fleet's own measured
@@ -1941,18 +1944,23 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
     // The fresh joiner: syncs the whole chain, the pruned block in sealed form. The
     // verification counter scopes to this sync alone.
     let verifications_before = shrugg_node::agg_executor::AggExecutor::verification_count();
-    let n2 = start_node(&ks[1], &gen, vec![bootstrap_addr(&n0)], false).await;
+    let n2 = start_node(&ks[3], &gen, vec![bootstrap_addr(&n0)], false).await;
     let target = n0.height();
     // The sealed sync, with its failure modes printed: a batch rejection shows in
     // `sync_failures`, a raw-form fallback in the log's own line, and a stall in neither.
     let t0 = Instant::now();
     while n2.height() < target {
+        let st = n2.handle.status.read().unwrap().clone();
         assert!(
             t0.elapsed() < Duration::from_secs(300),
-            "n2 never reached {target}: height {}, sync_failures {}, verify_queue {}",
-            n2.height(),
-            n2.handle.status.read().unwrap().sync_failures,
-            shrugg_node::agg_executor::AggExecutor::verification_count() - verifications_before,
+            "n2 never reached {target}: height {height}, syncing {}, sync_inflight_age_ms {:?}, sync_target {}, connected_peers {}/{}, sync_failures {}",
+            st.syncing,
+            st.sync_inflight_age_ms,
+            st.sync_target,
+            st.connected_peers,
+            st.peer_count,
+            st.sync_failures,
+            height = n2.height(),
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

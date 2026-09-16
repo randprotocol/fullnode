@@ -274,14 +274,25 @@ fn assemble_covered(
 /// the committed head is the right vantage for them here.
 struct StoreCovered {
     storage: Arc<Storage>,
-    window: u64,
     profile: shrugg_core::types::FriProfile,
 }
 
 impl shrugg_core::consensus::CoveredSource for StoreCovered {
+    /// The record-only flavor (spec §3.2's data half): existence, bundle-ness, and the public
+    /// values and declared shape — one read for the raw and the pruned form. Coverability
+    /// *policy* — the window and the seal — is admission's, run on the node's worker
+    /// (`assemble_covered` in `validate_for_pool`), never here: whether a cover would still be
+    /// coverable today says nothing about the validity of a committed block that covers it,
+    /// and a slow syncer replaying an aggregate whose window has since passed must not be
+    /// refused for it (the aggregate's own proof, and the ledger's bucket, are the validity).
     fn covered(&self, covers: &[Hash]) -> Option<Vec<shrugg_core::types::CoveredBundle>> {
-        let head = self.storage.head().ok()?.height;
-        assemble_covered(&self.storage, head, self.window, self.profile, covers).ok()
+        covers
+            .iter()
+            .map(|cover| match self.storage.covered_record(cover, self.profile) {
+                Ok(Some(record)) => Some(record),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -539,10 +550,9 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // The covered source (spec §3.2): on a chain that aggregates, proposals and candidates
     // carrying an `Aggregate` apply through the covered-carrying path, answered from the store.
     // Set once, before the loop's first proposal; a chain without the section never consults it.
-    if let Some(agg) = gs.ledger.aggregation() {
+    if gs.ledger.aggregation().is_some() {
         hs.set_covered_source(Arc::new(StoreCovered {
             storage: storage.clone(),
-            window: agg.window,
             profile: core_profile(&gs.fri_profile),
         }));
     }
@@ -1681,6 +1691,15 @@ impl Node {
             sets,
             self.executor.clone(),
         );
+        // The covered source does not ride the resume: `HotStuff::resume` is a fresh replica,
+        // and without this a synced node would refuse every aggregate-carrying block at the
+        // sidecar forever (the capstone's AggregateNeedsCovered).
+        if self.gs.ledger.aggregation().is_some() {
+            self.hs.set_covered_source(Arc::new(StoreCovered {
+                storage: self.storage.clone(),
+                profile: core_profile(&self.gs.fri_profile),
+            }));
+        }
         self.timeout = None;
         self.propose_at = None;
         let acts = self.hs.start();
@@ -2046,6 +2065,101 @@ mod tests {
             assemble_covered(&storage, 200, 256, shrugg_core::types::FriProfile::Test, &[hash]),
             Err(shrugg_core::TxError::Aggregation(AggregationError::CoverSealed(hash)))
         );
+    }
+
+    // ---------------------------------- the proposer–validator invariant, live
+
+    /// The capstone's mechanism, replayed against a real store: two replicas with a
+    /// `StoreCovered` over one storage — the leader's own block carrying an aggregate applies
+    /// on it with no state-root mismatch, and the peer accepts it to the same root.
+    #[test]
+    fn a_proposal_carrying_an_aggregate_applies_identically_on_proposer_and_peer_live() {
+        use shrugg_core::consensus::{ConsensusConfig, CoveredSource, HotStuff};
+
+        let (_d, storage, gs, covered_tx, _mint) = chain_with_a_real_proof();
+        let storage = Arc::new(storage);
+        let proof = crate::agg_executor::fixture_proof(0);
+        let cfg = shrugg_core::ledger::aggregation::AggregationConfig {
+            bond: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            max_covers: 3,
+            subsidy_base: 100 * shrugg_core::UNITS_PER_SHRUGG,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![shrugg_core::ledger::aggregation::AdmittedShape {
+                shape: fixture_shape(&proof),
+                hc: fixture_hc(&proof),
+                aggregate_program_digest: [1; 4],
+            }],
+        };
+        // The gated ledger, with the aggregator registered at height 1 (the block-1 state the
+        // proposal builds on).
+        let mut ledger = gs.ledger.clone();
+        ledger.set_aggregation(Some(cfg));
+        ledger.set_height(1);
+        let kp = key(7);
+        register_aggregator(&mut ledger, &kp, 100 * shrugg_core::UNITS_PER_SHRUGG);
+
+        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
+        let source: Arc<dyn CoveredSource> = Arc::new(StoreCovered {
+            storage: storage.clone(),
+            profile: shrugg_core::types::FriProfile::Test,
+        });
+        let mk = |signer: Option<shrugg_core::Keypair>| {
+            let mut hs = HotStuff::new(
+                ConsensusConfig::new(7, gs.validators.clone(), gs.hash()),
+                signer,
+                gs.block.clone(),
+                ledger.clone(),
+                executor.clone(),
+            );
+            hs.set_covered_source(source.clone());
+            hs
+        };
+        let mut leader = mk(Some(key(1)));
+        let mut peer = mk(Some(key(1)));
+        leader.start();
+        peer.start();
+
+        let tx = aggregate_tx(7, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let acts = leader.propose(1, vec![tx.clone()], 1).expect("the leader's own block must apply");
+        let block = acts
+            .iter()
+            .find_map(|a| match a {
+                shrugg_core::consensus::Action::Broadcast(shrugg_core::consensus::ConsensusMessage::Proposal(b)) => Some(b.clone()),
+                _ => None,
+            })
+            .expect("a proposal was built");
+        assert!(block.transactions.iter().any(|t| t.hash() == tx.hash()), "the aggregate is in the block");
+        peer.on_proposal(block, 1).expect("the peer applies the same block to the same root");
+        assert_eq!(
+            peer.committed_ledger().state_root(),
+            leader.committed_ledger().state_root(),
+            "proposer and peer hold one root"
+        );
+    }
+
+    /// The replay flavor (spec §3.2's data, not its admission policy): a cover whose window
+    /// has long passed still answers its record — a slow syncer replaying a historical
+    /// aggregate block must not be refused for what is no longer coverable today. The
+    /// admission-side check (`assemble_covered`'s window arm) is where that policy lives.
+    #[test]
+    fn the_covered_source_answers_replayed_history_past_the_window() {
+        use shrugg_core::consensus::CoveredSource as _;
+        let (_d, storage, _gs, covered_tx, _mint) = chain_with_a_real_proof();
+        let proof = crate::agg_executor::fixture_proof(0);
+        let source = StoreCovered { storage: Arc::new(storage), profile: shrugg_core::types::FriProfile::Test };
+        let covered = source.covered(&[covered_tx.hash()]).expect("the record answers at any head");
+        let expect = fixture_shape(&proof);
+        assert_eq!(covered.len(), 1);
+        assert_eq!(covered[0].shape, expect);
+        let pv: [u64; 34] = proof.public_values.clone().try_into().unwrap();
+        assert_eq!(covered[0].public_values, pv);
+        // And the admission policy is where it belongs: `assemble_covered` still refuses the
+        // same bundle once the window passes.
+        match assemble_covered(source.storage.as_ref(), 300, 256, shrugg_core::types::FriProfile::Test, &[covered_tx.hash()]) {
+            Err(shrugg_core::TxError::Aggregation(AggregationError::CoverOutsideWindow { .. })) => {}
+            other => panic!("the window is admission policy, got {other:?}"),
+        }
     }
 
     // ---------------------------------- sealed-form sync (spec §7)

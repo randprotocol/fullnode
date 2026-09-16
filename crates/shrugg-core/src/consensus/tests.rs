@@ -1452,6 +1452,65 @@ fn a_proposal_carries_at_most_one_aggregate_the_largest_valid_cover_set() {
     assert_eq!(aggregates[0].hash(), a_low.hash(), "the lowest proof hash breaks the tie");
 }
 
+/// The capstone's own invariant, at HotStuff level: a leader builds a block carrying an
+/// aggregate, its own `on_proposal` accepts it (no state-root mismatch), and a second replica
+/// with the same covered source accepts it too.
+#[test]
+fn a_proposal_carrying_an_aggregate_applies_identically_on_proposer_and_peer() {
+    let (mut leader, key, _cfg) = aggregation_node();
+    let (mut peer, _, _) = aggregation_node();
+    // The peer shares the leader's covered source (both are the same closure over the same
+    // synthetic record — the test-double stands in for two nodes' identical stores).
+    let covered_source = std::sync::Arc::new({
+        struct SharedCovered;
+        impl CoveredSource for SharedCovered {
+            fn covered(&self, covers: &[Hash]) -> Option<Vec<crate::types::CoveredBundle>> {
+                let hc_words: [u32; 8] = crate::notes::word8_from_bytes(Hash::digest(b"the bundle guest").as_bytes()).unwrap();
+                let shape = crate::types::DeclaredShape {
+                    profile: crate::types::FriProfile::Test,
+                    tier: 14,
+                    program_log_height: 13,
+                    input_log_height: 12,
+                    keccak_log_height: 0,
+                    sha256_log_height: 0,
+                    public_log_height: 2,
+                    mem_log_height: 18,
+                };
+                Some(
+                    covers
+                        .iter()
+                        .map(|_| {
+                            let mut pv = [0u64; 34];
+                            pv[crate::types::pv::TIER] = 14;
+                            for k in 0..8 {
+                                pv[crate::types::pv::OUT0 + k] = 100 + k as u64;
+                                pv[crate::types::pv::HC0 + k] = hc_words[k] as u64;
+                            }
+                            crate::types::CoveredBundle { public_values: pv, shape }
+                        })
+                        .collect(),
+                )
+            }
+        }
+        SharedCovered
+    });
+    leader.set_covered_source(covered_source.clone());
+    peer.set_covered_source(covered_source);
+    leader.start();
+    peer.start();
+    let tx = aggregate_tx(&key, 0, 1, vec![Hash::digest(b"cover a")], b"ok".to_vec());
+    let acts = leader.propose(1, vec![tx.clone()], 1).expect("the leader's own block must apply");
+    let block = acts
+        .iter()
+        .find_map(|a| match a {
+            Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()),
+            _ => None,
+        })
+        .expect("a proposal was built");
+    assert!(block.transactions.iter().any(|t| t.hash() == tx.hash()), "the aggregate is in the block");
+    peer.on_proposal(block, 1).expect("the peer applies the same block to the same root");
+}
+
 /// A candidate the covered source cannot cover is skipped — never the block.
 #[test]
 fn a_proposal_skips_an_aggregate_whose_covers_are_unavailable() {

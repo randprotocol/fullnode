@@ -1205,6 +1205,14 @@ impl Ledger {
         scratch.record_anchor(block.height());
         let computed = scratch.state_root();
         if computed != block.header.state_root {
+            // Components, not just the composite: the divergence names the ledger half it
+            // lives in (the capstone's mismatch read as opaque before this).
+            tracing::warn!(
+                "state root mismatch at block {}: computed {computed}, header {} — computed components: {}",
+                block.height(),
+                block.header.state_root,
+                scratch.debug_state_root_components()
+            );
             return Err(BlockError::StateRootMismatch { computed, header: block.header.state_root });
         }
         *self = scratch;
@@ -1235,7 +1243,9 @@ impl Ledger {
     /// commits exactly what phase S1 committed and a chain without aggregation exactly what the
     /// bridge commit added — turning either on is a hard fork for the chains that take it and a
     /// no-op for the ones that do not.
-    pub fn state_root(&self) -> Hash {
+    /// The three merkle roots `state_root` binds, in order: nullifiers, validators, programs.
+    /// Split out so a state-root mismatch can name the component it diverges in.
+    fn state_root_leaves(&self) -> (Hash, Hash, Hash) {
         let nf_leaves: Vec<Hash> = self
             .nullifiers
             .iter()
@@ -1266,11 +1276,28 @@ impl Ledger {
             .collect();
         let prog_leaves: Vec<Hash> =
             self.programs.keys().map(|id| Hash::digest_domain(b"shrugg-program-leaf", id.as_bytes())).collect();
+        (merkle_root(&nf_leaves), merkle_root(&val_leaves), merkle_root(&prog_leaves))
+    }
+
+    /// The component roots of [`Ledger::state_root`], for logging a mismatch: tree, nullifiers,
+    /// validators, programs, aggregators. A divergence between two ledgers names itself here.
+    pub fn debug_state_root_components(&self) -> String {
+        let (nf, val, prog) = self.state_root_leaves();
+        let agg = if self.aggregation.is_some() {
+            format!("{:?}", aggregation::aggregators_root(&self.aggregators))
+        } else {
+            "none".into()
+        };
+        format!("tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} aggregators {agg}", self.tree.root())
+    }
+
+    pub fn state_root(&self) -> Hash {
+        let (nf_root, val_root, prog_root) = self.state_root_leaves();
         let mut buf = Vec::with_capacity(128);
         buf.extend_from_slice(&word8_to_bytes(&self.tree.root()));
-        buf.extend_from_slice(merkle_root(&nf_leaves).as_bytes());
-        buf.extend_from_slice(merkle_root(&val_leaves).as_bytes());
-        buf.extend_from_slice(merkle_root(&prog_leaves).as_bytes());
+        buf.extend_from_slice(nf_root.as_bytes());
+        buf.extend_from_slice(val_root.as_bytes());
+        buf.extend_from_slice(prog_root.as_bytes());
         if let Some(bridge) = &self.bridge {
             buf.extend_from_slice(bridge.root().as_bytes());
         }
