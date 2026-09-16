@@ -1393,9 +1393,8 @@ mod tests {
     /// the window, the pre-screen refuses it before any register work.
     #[test]
     fn a_withdraw_aggregator_whose_time_is_outside_the_window_is_refused() {
-        use shrugg_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use shrugg_core::ledger::aggregation::AggregationConfig;
         use shrugg_core::types::actions::aggregator_withdraw_message;
-        use shrugg_core::types::{DeclaredShape, FriProfile};
 
         let kp = fixtures::key(1);
         let addr = kp.public_key().address();

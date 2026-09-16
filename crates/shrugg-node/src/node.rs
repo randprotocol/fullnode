@@ -346,8 +346,11 @@ fn check_sealed_coverage(storage: &Storage, batch_covers: &BTreeSet<Hash>, cb: &
 }
 
 /// The raw-form fallback (spec §7): a pruned bundle arrived whose covering aggregate is
-/// neither applied nor in this batch — another peer may hold the raw proofs. Not a failure:
-/// serving pruned history is policy, not malice, so the peer wears no strike for it.
+/// neither applied nor in this batch. Serving closes a batch's coverage before it goes out
+/// ([`close_batch_coverage`]), so what remains here is the genuine archive case — the cover
+/// sits beyond the reader limit's reach, or the peer's store is torn — and another peer may
+/// hold the raw proofs. Not a failure: serving pruned history is policy, not malice, so the
+/// peer wears no strike for it.
 #[derive(Debug)]
 struct RawFallback(u64);
 
@@ -358,6 +361,33 @@ impl std::fmt::Display for RawFallback {
 }
 
 impl std::error::Error for RawFallback {}
+
+/// The sync peer for the next batch request, or `None` when nothing usable exists: the
+/// freshest connected peer ahead of `my_height`; and when no peer is connected *and* fresh at
+/// once but the chain is known to be ahead (`best_peer_height` says so), any connected peer
+/// whose stale answer costs one round trip — the fallback that keeps the cycle alive where a
+/// silent stall costs the chain (the sealed-sync stall's shape, shown under load).
+fn pick_sync_peer(
+    peers: &HashMap<PeerId, Peer>,
+    my_height: u64,
+    best_peer_height: u64,
+    skipped: &[PeerId],
+) -> Option<PeerId> {
+    let best = peers
+        .iter()
+        .filter(|(p, peer)| peer.connected && !skipped.contains(p))
+        .filter_map(|(p, peer)| peer.status.as_ref().map(|s| (*p, s.height)))
+        .filter(|(_, h)| *h > my_height)
+        .max_by_key(|(_, h)| *h)
+        .map(|(p, _)| p);
+    best.or_else(|| {
+        if best_peer_height > my_height + 1 {
+            peers.iter().find(|(p, peer)| peer.connected && !skipped.contains(p)).map(|(p, _)| *p)
+        } else {
+            None
+        }
+    })
+}
 
 struct Node {
     cfg: NodeConfig,
@@ -519,6 +549,56 @@ fn fill_sync_batch(blocks: impl IntoIterator<Item = CommittedBlock>, budget: u64
 pub(crate) fn serve_sync_budget() -> u64 {
     debug_assert!(network::SYNC_MAX_WIRE_BYTES * 2 <= network::SYNC_RESPONSE_WIRE_LIMIT);
     network::SYNC_MAX_WIRE_BYTES
+}
+
+/// The coverage-closure half of serving (spec §7): a batch that ends between a pruned block
+/// and its covering aggregate is unusable to the syncer — its coverage check fails and the
+/// batch comes back as the raw-form fallback, identically from every pruned peer, however
+/// often it is re-asked. Both cuts produce that shape: a count halved on wire failures (the
+/// capstone stall's: window at 33, cover at 46, batch cut to four) and a byte budget spent on
+/// raw proofs before the cover's height. Neither the requester nor the filler knows where the
+/// covers sit — but this store does: every pruned entry it serves carries a seal mark naming
+/// the aggregate's committing height (the mark landed with the aggregate's block, or the
+/// record would still be raw). So a batch that leaves a served pruned entry's cover beyond
+/// its end extends — past the count asked for and past the soft byte budget — until every
+/// cover is in. The extension's only ceiling is the reader's own wire limit: a batch that
+/// cannot close inside it serves as far as it can, and the syncer's fallback is then the
+/// genuine archive case it exists for.
+fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>) {
+    let farthest_cover = |batch: &[CommittedBlock]| -> Option<u64> {
+        batch
+            .iter()
+            .flat_map(|cb| &cb.pruned)
+            .filter_map(|p| storage.sealed_by(&p.tx_hash).ok().flatten())
+            .map(|(_, height)| height)
+            .max()
+    };
+    let Some(mut farthest) = farthest_cover(batch) else { return };
+    let Some(mut end) = batch.last().map(|cb| cb.block.height()) else { return };
+    if farthest <= end {
+        return;
+    }
+    let mut bytes: u64 =
+        SYNC_RESPONSE_FRAMING_BYTES + batch.iter().map(committed_block_wire_size).sum::<u64>();
+    while farthest > end {
+        let h = end + 1;
+        // A mark never names a height past this store's head, so a miss here is a torn
+        // store — serve what the batch holds and let the syncer's fallback say so.
+        let Ok(Some(cb)) = storage.committed_block(h) else { return };
+        let cb = sealed_form_of(storage, &cb);
+        bytes = bytes.saturating_add(committed_block_wire_size(&cb));
+        if bytes > network::SYNC_RESPONSE_WIRE_LIMIT {
+            return;
+        }
+        // The extension can cross another pruned window whose own covers sit farther out.
+        for p in &cb.pruned {
+            if let Ok(Some((_, height))) = storage.sealed_by(&p.tx_hash) {
+                farthest = farthest.max(height);
+            }
+        }
+        batch.push(cb);
+        end = h;
+    }
 }
 
 pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
@@ -1321,7 +1401,9 @@ impl Node {
                 let blocks = heights
                     .map_while(|h| self.storage.committed_block(h).ok().flatten())
                     .map(|cb| sealed_form_of(&self.storage, &cb));
-                SyncResponse::Blocks(fill_sync_batch(blocks, serve_sync_budget()))
+                let mut batch = fill_sync_batch(blocks, serve_sync_budget());
+                close_batch_coverage(&self.storage, &mut batch);
+                SyncResponse::Blocks(batch)
             }
             SyncRequest::BlockByHash(h) => {
                 let b = self.hs.block(&h).cloned().or_else(|| self.storage.block_by_hash(&h).ok().flatten());
@@ -1427,17 +1509,30 @@ impl Node {
             self.sync_inflight = None;
         }
         let my_height = self.hs.committed_height();
-        let best = self
-            .peers
-            .iter()
-            .filter(|(p, peer)| peer.connected && Some(**p) != skip)
-            .filter_map(|(p, peer)| peer.status.as_ref().map(|s| (*p, s.height)))
-            .filter(|(_, h)| *h > my_height)
-            .max_by_key(|(_, h)| *h);
-        let Some((peer, _)) = best else { return };
-        let req = SyncRequest::Blocks { from_height: my_height + 1, max: self.sync_batch };
-        if let Some(id) = self.net.send_sync_request(peer, req).await {
-            self.sync_inflight = Some((peer, id, Instant::now()));
+        let mut skipped: Vec<PeerId> = skip.into_iter().collect();
+        // The starvation shape the sealed-sync stall showed under load: the chain is known to
+        // be ahead (some peer's status says so) and nothing is outstanding, yet the obvious
+        // candidate is unusable — no connected-and-fresh peer, or the send cannot go out. Both
+        // are give-ups, never stalls: fall to the next candidate — a possibly-stale answer
+        // costs one round trip, and it keeps the cycle alive where a silent stall costs the chain.
+        for _ in 0..3 {
+            let Some(peer) = pick_sync_peer(&self.peers, my_height, self.best_peer_height(), &skipped) else { return };
+            let req = SyncRequest::Blocks { from_height: my_height + 1, max: self.sync_batch };
+            if let Some(id) = self.net.send_sync_request(peer, req).await {
+                self.sync_inflight = Some((peer, id, Instant::now()));
+                return;
+            }
+            tracing::warn!(%peer, "sync request could not be sent; trying another peer");
+            self.sync_failures += 1;
+            skipped.push(peer);
+        }
+        if self.best_peer_height() > my_height + 1 {
+            tracing::warn!(
+                height = my_height,
+                target = self.best_peer_height(),
+                peers = ?self.peers.iter().map(|(p, peer)| format!("{p} connected={} status={:?}", peer.connected, peer.status.as_ref().map(|s| s.height))).collect::<Vec<_>>(),
+                "sync wanted but every candidate refused the request"
+            );
         }
     }
 
@@ -1764,6 +1859,41 @@ mod tests {
             },
         };
         Block::sign(header, Vec::new(), k)
+    }
+
+    /// The sync peer selection (the stall shape's unit test): the freshest connected peer
+    /// ahead wins; the fallback asks any connected peer when the chain is known ahead but no
+    /// connected-and-fresh pair exists; and a statusless connected peer is still askable.
+    #[test]
+    fn pick_sync_peer_prefers_fresh_and_falls_back_to_any_connected() {
+        let pid = |seed: u8| {
+            let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+            PeerId::from(kp.public())
+        };
+        let p = |seed: u8, connected: bool, height: Option<u64>| {
+            (
+                pid(seed),
+                Peer {
+                    status: height.map(|height| Status { height, head_hash: Hash::ZERO, view: height }),
+                    connected,
+                    tx_bucket: Default::default(),
+                },
+            )
+        };
+        let peers: HashMap<PeerId, Peer> = [p(1, true, Some(163)), p(2, true, Some(120)), p(3, false, Some(200))].into_iter().collect();
+        // The freshest connected-and-ahead peer wins — never a disconnected one, however fresh.
+        assert_eq!(pick_sync_peer(&peers, 43, 200, &[]), Some(pid(1)));
+        // The stall shape: the fresh peer is disconnected and the connected one is statusless,
+        // but the chain is known ahead — the fallback asks the connected peer anyway.
+        let peers: HashMap<PeerId, Peer> = [p(1, false, Some(163)), p(2, true, None)].into_iter().collect();
+        assert_eq!(pick_sync_peer(&peers, 43, 163, &[]), Some(pid(2)));
+        // Nothing ahead at all: no fallback (a peer at our height is not worth asking).
+        let peers: HashMap<PeerId, Peer> = [p(1, true, None)].into_iter().collect();
+        assert_eq!(pick_sync_peer(&peers, 43, 43, &[]), None);
+        // The skip list (a give-up) is honored before the fallback too.
+        let skipped = [pid(2)];
+        let peers: HashMap<PeerId, Peer> = [p(1, false, Some(163)), p(2, true, None), p(3, true, Some(50))].into_iter().collect();
+        assert_eq!(pick_sync_peer(&peers, 43, 163, &skipped), Some(pid(3)));
     }
 
     /// The restart this task exists to fix: a node whose head is past an epoch boundary comes
@@ -2232,6 +2362,161 @@ mod tests {
         let served_tx = &sealed.block.transactions[0];
         let field = served_tx.bundle.as_ref().unwrap().proof.clone();
         assert!(field.starts_with(shrugg_core::notes::PRUNED_PROOF_MARKER), "the marker form rides");
+    }
+
+    /// The capstone stall's chain shape, stored: block 2 carries the fixture-proof bundle,
+    /// `fat` heights each carry one max-size raw proof (the raw bundles that spend the byte
+    /// budget between a window and its cover), and the covering aggregate lands at
+    /// `aggregate_at`, the chain's last block. The bundle is sealed at the aggregate's height
+    /// and pruned, so serving returns block 2 in marker form. The stored blocks are built
+    /// unchecked; the ledger applies each bundle's stub twin (same commitments and
+    /// nullifiers), so the commit's note bookkeeping balances.
+    fn chain_with_a_split_cover(fat: &[u64], aggregate_at: u64) -> (tempfile::TempDir, Storage, Transaction) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![], 2);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger_after = gs.ledger.clone();
+        let mut covered: Option<Transaction> = None;
+        let mut agg: Option<Transaction> = None;
+        let mut parent = gs.block.clone();
+        let mut blocks = Vec::new();
+        for h in 1..=aggregate_at {
+            ledger_after.set_height(h);
+            ledger_after.set_timestamp_ms(h);
+            let stored: Vec<Transaction> = if h == 2 {
+                let twin = bundle_tx(&ledger_after, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
+                ledger_after.apply_transactions(std::slice::from_ref(&twin), &key(1).address(), &StubExecutor).unwrap();
+                let mut tx = twin;
+                tx.bundle.as_mut().unwrap().proof = crate::agg_executor::fixture_proof(0).to_bytes();
+                covered = Some(tx.clone());
+                vec![tx]
+            } else if h == aggregate_at {
+                let tx = aggregate_tx(7, &key(7), 0, 1, vec![covered.as_ref().unwrap().hash()], b"ok".to_vec());
+                agg = Some(tx.clone());
+                vec![tx]
+            } else if fat.contains(&h) {
+                let n = h as u32;
+                let twin = bundle_tx(&ledger_after, [[n; 8], [n + 40; 8]], [[n + 80; 8], [n + 120; 8]], bundle_fee());
+                ledger_after.apply_transactions(std::slice::from_ref(&twin), &key(1).address(), &StubExecutor).unwrap();
+                let mut tx = twin;
+                tx.bundle.as_mut().unwrap().proof = vec![7u8; gas::MAX_PROOF_BYTES];
+                vec![tx]
+            } else {
+                vec![]
+            };
+            ledger_after.record_anchor(h);
+            let cb = make_block_unchecked(&parent, &ledger_after, stored, &key(1));
+            parent = cb.block.clone();
+            blocks.push(cb);
+        }
+        storage.commit(&blocks, &ledger_after, &[], &StubExecutor).unwrap();
+        let covered = covered.expect("block 2 carries the covered bundle");
+        storage.mark_sealed(covered.hash(), agg.expect("the last block carries the aggregate").hash(), aggregate_at).unwrap();
+        assert_eq!(storage.prune_sealed(aggregate_at + 256, 256, shrugg_core::types::FriProfile::Test).unwrap(), 1);
+        (dir, storage, covered)
+    }
+
+    /// Serve `Blocks { from_height: 1, max }` against the split-cover store the way
+    /// `serve_sync` does: the lazy read, the sealed form, the budget — and the coverage
+    /// closure.
+    fn serve_blocks(storage: &Storage, max: u64) -> Vec<CommittedBlock> {
+        let heights = 1..1u64.saturating_add(max);
+        let blocks = heights
+            .map_while(|h| storage.committed_block(h).ok().flatten())
+            .map(|cb| sealed_form_of(storage, &cb));
+        let mut batch = fill_sync_batch(blocks, serve_sync_budget());
+        close_batch_coverage(storage, &mut batch);
+        batch
+    }
+
+    /// What the syncer does with a batch: the covers its aggregates carry, then the coverage
+    /// check against its own (fresh, mark-less) store.
+    fn accepted_by_a_fresh_store(batch: &[CommittedBlock]) -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Storage::open(dir.path()).unwrap();
+        let mut batch_covers = BTreeSet::new();
+        for cb in batch {
+            for tx in &cb.block.transactions {
+                if let shrugg_core::types::Action::Aggregate { covers, .. } = &tx.action {
+                    batch_covers.extend(covers.iter().copied());
+                }
+            }
+        }
+        for cb in batch {
+            check_sealed_coverage(&client, &batch_covers, cb)?;
+        }
+        Ok(())
+    }
+
+    /// The stall's mechanism, pinned: a batch cut between a pruned block and its covering
+    /// aggregate — here by the count, halved on wire failures under load — is unusable to the
+    /// syncer and comes back as the raw-form fallback, identically from every pruned peer
+    /// (the ping-pong the capstone showed). The serve closes the coverage instead: the
+    /// response extends past the count it was asked for until the cover is in, and the
+    /// syncer accepts the batch.
+    #[test]
+    fn a_batch_cut_short_of_its_cover_extends_until_the_coverage_closes() {
+        let (_d, storage, covered_tx) = chain_with_a_split_cover(&[], 5);
+        // The fill without the closure: the halved count's three blocks, the cover at 5
+        // unserved — the exact shape the fallback ping-ponged on.
+        let heights = 1..=3u64;
+        let blocks = heights
+            .map_while(|h| storage.committed_block(h).ok().flatten())
+            .map(|cb| sealed_form_of(&storage, &cb));
+        let cut = fill_sync_batch(blocks, serve_sync_budget());
+        assert_eq!(cut.len(), 3);
+        assert_eq!(cut[1].pruned.len(), 1, "block 2 rides in marker form");
+        assert!(accepted_by_a_fresh_store(&cut).unwrap_err().downcast_ref::<RawFallback>().is_some());
+        // The served batch: the closure reaches the aggregate's block, and the syncer takes it.
+        let batch = serve_blocks(&storage, 3);
+        assert_eq!(batch.last().unwrap().block.height(), 5, "the extension closed the coverage");
+        assert!(batch[1].pruned[0].tx_hash == covered_tx.hash());
+        accepted_by_a_fresh_store(&batch).expect("a coverage-closed batch is accepted");
+    }
+
+    /// The byte-budget twin of the count cut: max-proof raw bundles between the pruned block
+    /// and its cover spend the budget before the cover's height, so even a full-count ask is
+    /// cut. The extension goes past the soft budget but stays inside the reader's limit.
+    #[test]
+    fn a_batch_cut_by_bytes_short_of_its_cover_extends_within_the_reader_limit() {
+        let (_d, storage, _covered_tx) = chain_with_a_split_cover(&[4, 5, 6], 7);
+        let batch = serve_blocks(&storage, SYNC_BATCH as u64);
+        assert!(batch.last().unwrap().block.height() > 5, "the budget alone would have cut at 5");
+        assert_eq!(batch.last().unwrap().block.height(), 7, "the cover's block");
+        let on_the_wire = wire_size(&batch);
+        assert!(
+            on_the_wire > network::SYNC_MAX_WIRE_BYTES,
+            "the closure goes past the soft budget: {on_the_wire} B"
+        );
+        assert!(
+            on_the_wire <= network::SYNC_RESPONSE_WIRE_LIMIT,
+            "and stays readable: {on_the_wire} B over {} B",
+            network::SYNC_RESPONSE_WIRE_LIMIT
+        );
+        accepted_by_a_fresh_store(&batch).expect("a coverage-closed batch is accepted");
+    }
+
+    /// The case the fallback is for: a cover so far out the extension cannot reach it inside
+    /// the reader limit. The serve stops at the limit rather than past it — an undeliverable
+    /// response helps no one — and the syncer's raw-form fallback (an archive peer) is what
+    /// remains.
+    #[test]
+    fn the_extension_stops_at_the_reader_limit_and_serves_what_it_can() {
+        let (_d, storage, _covered_tx) = chain_with_a_split_cover(&[4, 5, 6, 7, 8, 9, 10, 11], 12);
+        let batch = serve_blocks(&storage, SYNC_BATCH as u64);
+        let last = batch.last().unwrap().block.height();
+        assert!(last > 5, "it extended past the soft cut as far as the limit allows: {last}");
+        assert!(last < 12, "the cover at 12 stays out of reach: {last}");
+        let on_the_wire = wire_size(&batch);
+        assert!(
+            on_the_wire <= network::SYNC_RESPONSE_WIRE_LIMIT,
+            "never past the reader's limit: {on_the_wire} B over {} B",
+            network::SYNC_RESPONSE_WIRE_LIMIT
+        );
+        // Unclosed, so the fresh syncer's answer is the fallback — the archive case, pinned
+        // in `the_sealed_coverage_rule_accepts_marks_and_batch_and_falls_back_otherwise`.
+        assert!(accepted_by_a_fresh_store(&batch).unwrap_err().downcast_ref::<RawFallback>().is_some());
     }
 
     /// The worker arm's ordering (cheap before expensive, and bytes before storage): the wire

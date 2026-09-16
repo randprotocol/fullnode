@@ -1660,7 +1660,7 @@ mod tests {
         assert_eq!(v["aggregation"]["verify_queue"], 0);
     }
 
-    fn aggregate_agg_addr(st: &RpcState) -> String {
+    fn aggregate_agg_addr(_st: &RpcState) -> String {
         key(7).public_key().address().to_base58()
     }
 
