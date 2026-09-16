@@ -2016,7 +2016,7 @@ mod tests {
         };
         let b1 = make_block(&gs.block, &mut ledger, vec![fee_tx, register_tx], &key(1));
         storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
-        assert_eq!(ledger.unsealed_fees().len(), 1, "the excess is bucketed");
+        assert_eq!(ledger.unsealed_fees().len(), 2, "every bundle is recorded: the excess, and the register's at 0");
         assert_eq!(ledger.aggregators().len(), 1, "the aggregator is registered");
 
         let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
@@ -2228,6 +2228,9 @@ mod tests {
         ledger.set_height(1);
         let kp = key(7);
         register_aggregator(&mut ledger, &kp, 100 * shrugg_core::UNITS_PER_SHRUGG);
+        // The stored bundle was applied before the section was set, so it is not in the
+        // ledger's coverable set (H1's block rule): record it as the gated apply would have.
+        ledger.set_unsealed_fees([(covered_tx.hash(), (0, key(1).address(), u64::MAX))].into_iter().collect());
 
         let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
         let source: Arc<dyn CoveredSource> = Arc::new(StoreCovered {
@@ -2562,6 +2565,8 @@ mod tests {
         ledger.set_height(1);
         let kp = key(7);
         register_aggregator(&mut ledger, &kp, cfg.bond);
+        // As above: the stored bundle into the coverable set the gated apply would have built.
+        ledger.set_unsealed_fees([(covered_tx.hash(), (0, key(1).address(), u64::MAX))].into_iter().collect());
 
         let tx = aggregate_tx(7, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         validate_for_pool(&tx, &ledger, &storage, shrugg_core::types::FriProfile::Test, &StubExecutor)

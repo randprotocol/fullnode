@@ -1361,6 +1361,11 @@ fn aggregation_node_with(
     b.proof = StubExecutor::make_bundle_proof(&[3; 8], &d);
     let register_tx = Transaction::shielded(1, b, crate::types::Action::RegisterAggregator { registration });
     gs.ledger.apply_tx(&register_tx, &key.address(), &StubExecutor).unwrap();
+    // The synthetic covers the tests name, in the ledger's coverable set (H1's block rule):
+    // the single-byte digests 40.. and the two named ones, excess-free, never expiring.
+    for c in (0..4u8).map(|i| Hash::digest(&[i + 40])).chain([Hash::digest(b"cover"), Hash::digest(b"cover a")]) {
+        gs.ledger.bucket_excess(c, 0, key.address(), u64::MAX);
+    }
     prepare(&mut gs.ledger, &key);
     let mut hs = HotStuff::new(
         ConsensusConfig::new(1, gs.validators.clone(), gs.hash()),

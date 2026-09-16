@@ -147,6 +147,12 @@ pub enum AggregationError {
     /// transaction, is at fault; never a permanent verdict.
     #[error("the stored record for cover {0} is corrupt")]
     CoverStoreCorrupt(Hash),
+    /// The ledger's half of coverability, a block-validity rule (the pre-v0.1 review's H1): the
+    /// cover is not in the ledger's coverable set — never a bundle this chain applied, already
+    /// covered, or past its window and swept. The node's three verdicts above name the case at
+    /// admission; at apply the ledger only knows the set. Permanent: none of the three un-happens.
+    #[error("cover {0} is not coverable: unknown, already covered, or past its window")]
+    CoverNotCoverable(Hash),
     #[error("arithmetic overflow")]
     Overflow,
 }
@@ -334,7 +340,9 @@ impl Ledger {
     ) -> Result<Payment, TxError> {
         let subsidy = gas::subsidy(self.supply.sealed_blocks, cfg);
         let proving_shares = covers.iter().try_fold(0u64, |acc, c| {
-            let e = self.unsealed_fees.get(c).map(|(excess, _, _)| *excess).unwrap_or(0);
+            // Validation already required the entry; a missing one here is the same refusal,
+            // never a silent zero share.
+            let e = self.unsealed_fees.get(c).map(|(excess, _, _)| *excess).ok_or(AggregationError::CoverNotCoverable(*c))?;
             acc.checked_add(e).ok_or(TxError::Overflow)
         })?;
         let total = subsidy.checked_add(proving_shares).ok_or(TxError::Overflow)?;
@@ -424,6 +432,16 @@ pub(super) fn validate_aggregate(
     }
     if covered.len() != covers.len() {
         return Err(AggregationError::CoverAssemblyMismatch { covers: covers.len(), covered: covered.len() }.into());
+    }
+    //    And the ledger's own half of coverability (the pre-v0.1 review's H1): every cover
+    //    must stand in the coverable set — a bundle this chain applied, not yet covered, and
+    //    inside its window. The node's admission names the case; here the set is the rule, so
+    //    a block that re-covers a sealed bundle, or covers one whose window passed, is invalid
+    //    on every replica and not only refused by an honest pool.
+    for cover in covers {
+        if !ledger.unsealed_fees.contains_key(cover) {
+            return Err(AggregationError::CoverNotCoverable(*cover).into());
+        }
     }
     // 5. The payout note's commitment is new — derived as a `BridgeAttest`'s is, claimed in
     //    the mempool by the same `derived_commitment` arm.
@@ -1587,6 +1605,11 @@ mod admission_tests {
         let mut l = gated();
         let (kp, _) = keys();
         register(&mut l, &kp);
+        // The synthetic covers in the ledger's coverable set (H1's block rule), excess-free.
+        let p = proposer(&l);
+        for c in covers(4) {
+            l.bucket_excess(c, 0, p, u64::MAX);
+        }
         (l, kp)
     }
 
@@ -2087,7 +2110,7 @@ mod payment_tests {
         assert_eq!(v.payout_cm, want_cm, "the T4 derivation, now with the real amount (spec §5.4)");
         l.apply_aggregate(&tx, &covered, &StubExecutor).unwrap();
         assert!(l.has_commitment(&want_cm), "the payout note is in the tree");
-        assert!(l.unsealed_fees().is_empty(), "the covered excess left the bucket");
+        assert!(!l.unsealed_fees().contains_key(&covered_tx.hash()), "the covered excess left the bucket");
         assert_eq!(l.supply().subsidised, subsidy);
         assert_eq!(l.supply().sealed_blocks, 1);
         assert_eq!(l.supply().fees_paid, before.fees_paid, "the payout is not a fee movement");
@@ -2134,6 +2157,8 @@ mod payment_tests {
         l.apply_block(&signed_block(&l, vec![], &a, 2), &StubExecutor).unwrap();
         assert_eq!(l.supply().sealed_blocks, 0, "empty blocks do not consume the schedule");
         for (i, tag) in [30u8, 40].iter().enumerate() {
+            let p = proposer(&l);
+            l.bucket_excess(Hash::digest(&[*tag]), 0, p, u64::MAX);
             let tx = aggregate_tx(&kp, i as u64, (i + 1) as u32, vec![Hash::digest(&[*tag])], b"ok".to_vec());
             l.apply_aggregate(&tx, &covered_records(&[1]), &StubExecutor).unwrap();
         }
@@ -2264,10 +2289,128 @@ mod payment_tests {
         }
         l.apply_block_with_covered(&block, &sidecar, &StubExecutor).unwrap();
         assert_eq!(l.supply().sealed_blocks, 1);
-        assert!(l.unsealed_fees().is_empty(), "the covered excess was paid out");
+        assert!(!l.unsealed_fees().contains_key(&covered_tx.hash()), "the covered excess was paid out");
         let subsidy = gas::subsidy(0, &cfg_with_window(256));
         let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy + 60, 0, 1, &[9; 8]);
         assert!(l.has_commitment(&want_cm), "the payout note is in the tree");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
+    /// A block whose validity is decided before its root is compared: the header carries the
+    /// pre-apply root, so a refusal must come from the transactions, never from the root check.
+    fn unchecked_block(l: &Ledger, txs: Vec<Transaction>, key: &Keypair, height: u64) -> Block {
+        let header = BlockHeader {
+            height,
+            view: height,
+            parent: Hash::ZERO,
+            proposer: key.public_key().clone(),
+            timestamp_ms: height,
+            tx_root: Block::tx_root(&txs),
+            state_root: l.state_root(),
+            justify: QuorumCertificate::genesis(Hash::ZERO),
+        };
+        Block::sign(header, txs, key)
+    }
+
+    /// Two covered bundles in block 1, on a chain of `window`; the aggregator registered.
+    fn two_covered(window: u64) -> (Ledger, Keypair, Keypair, Transaction, Transaction) {
+        let (a, _) = keys();
+        let mut l = gated(window);
+        let (kp, _) = keys();
+        register(&mut l, &kp, 10);
+        let fee = gas::BUNDLE_BASE + 60;
+        let c1 = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None);
+        let c2 = Transaction::shielded(7, bundle(&l, [[31; 8], [32; 8]], [[33; 8], [34; 8]], fee, 0), Action::None);
+        l.apply_block(&signed_block(&l, vec![c1.clone(), c2.clone()], &a, 1), &StubExecutor).unwrap();
+        (l, a, kp, c1, c2)
+    }
+
+    /// "At most one `Aggregate` per block" is a block-validity rule, not proposer selection
+    /// (the pre-v0.1 review's H1): a replica refuses the second, by index, before any root work.
+    #[test]
+    fn a_block_carrying_two_aggregates_is_refused_at_the_second() {
+        let (mut l, a, kp, c1, c2) = two_covered(256);
+        let t1 = aggregate_tx(&kp, 0, 1, vec![c1.hash()], b"ok".to_vec());
+        let t2 = aggregate_tx(&kp, 1, 2, vec![c2.hash()], b"ok2".to_vec());
+        let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
+        sidecar.insert(0, covered_records(&[1]));
+        sidecar.insert(1, covered_records(&[2]));
+        let block = unchecked_block(&l, vec![t1, t2], &a, 2);
+        match l.apply_block_with_covered(&block, &sidecar, &StubExecutor) {
+            Err(crate::ledger::BlockError::SecondAggregate { index: 1 }) => {}
+            other => panic!("expected the second aggregate refused at index 1, got {other:?}"),
+        }
+        assert_eq!(l.supply().sealed_blocks, 0, "nothing applied");
+    }
+
+    /// A covered bundle is never coverable again, at apply (H1): the same proof bytes re-signed
+    /// under the register's next nonce name a cover the ledger no longer holds, and the block
+    /// is refused — no second subsidy, no second `sealed_blocks`.
+    #[test]
+    fn an_aggregate_over_an_already_covered_bundle_is_refused_under_a_fresh_nonce() {
+        let (mut l, a, kp, c1, _) = two_covered(256);
+        let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
+        sidecar.insert(0, covered_records(&[1]));
+        let first = aggregate_tx(&kp, 0, 1, vec![c1.hash()], b"ok".to_vec());
+        l.apply_block_with_covered(&signed_block_with_covered(&l, vec![first], &a, 2, &sidecar), &sidecar, &StubExecutor)
+            .unwrap();
+        assert_eq!(l.supply().sealed_blocks, 1);
+        let subsidised = l.supply().subsidised;
+        let replay = aggregate_tx(&kp, 1, 1, vec![c1.hash()], b"ok".to_vec());
+        let block = unchecked_block(&l, vec![replay], &a, 3);
+        match l.apply_block_with_covered(&block, &sidecar, &StubExecutor) {
+            Err(crate::ledger::BlockError::InvalidTx {
+                index: 0,
+                error: TxError::Aggregation(AggregationError::CoverNotCoverable(h)),
+            }) if h == c1.hash() => {}
+            other => panic!("expected the sealed cover refused by name, got {other:?}"),
+        }
+        assert_eq!(l.supply().sealed_blocks, 1, "no second seal");
+        assert_eq!(l.supply().subsidised, subsidised, "no second subsidy");
+    }
+
+    /// The window is a block-validity rule too (H1): once the bundle's window passed and the
+    /// sweep resolved it, an aggregate naming it is refused at apply.
+    #[test]
+    fn an_aggregate_over_an_expired_cover_is_refused_at_apply() {
+        let (mut l, a, kp, c1, _) = two_covered(2);
+        // Block 1 carried the bundles, coverable until 3: the empty blocks 2 and 3 pass the window.
+        l.apply_block(&signed_block(&l, vec![], &a, 2), &StubExecutor).unwrap();
+        l.apply_block(&signed_block(&l, vec![], &a, 3), &StubExecutor).unwrap();
+        assert!(l.unsealed_fees().is_empty(), "the window passed: both entries resolved");
+        let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
+        sidecar.insert(0, covered_records(&[1]));
+        let late = aggregate_tx(&kp, 0, 4, vec![c1.hash()], b"ok".to_vec());
+        let block = unchecked_block(&l, vec![late], &a, 4);
+        match l.apply_block_with_covered(&block, &sidecar, &StubExecutor) {
+            Err(crate::ledger::BlockError::InvalidTx {
+                index: 0,
+                error: TxError::Aggregation(AggregationError::CoverNotCoverable(h)),
+            }) if h == c1.hash() => {}
+            other => panic!("expected the expired cover refused by name, got {other:?}"),
+        }
+    }
+
+    /// A bundle at exactly the floor has no excess but is a bundle all the same: it is recorded
+    /// as coverable (excess 0) so an aggregate over it applies and pays the subsidy alone.
+    #[test]
+    fn a_bundle_at_the_base_fee_is_coverable_and_pays_the_subsidy_alone() {
+        let (a, _) = keys();
+        let mut l = gated(256);
+        let (kp, _) = keys();
+        register(&mut l, &kp, 10);
+        let floor = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE, 0), Action::None);
+        l.apply_block(&signed_block(&l, vec![floor.clone()], &a, 1), &StubExecutor).unwrap();
+        assert_eq!(l.unsealed_fees().get(&floor.hash()).map(|e| e.0), Some(0), "coverable, with no excess");
+        let tx = aggregate_tx(&kp, 0, 1, vec![floor.hash()], b"ok".to_vec());
+        let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
+        sidecar.insert(0, covered_records(&[1]));
+        l.apply_block_with_covered(&signed_block_with_covered(&l, vec![tx], &a, 2, &sidecar), &sidecar, &StubExecutor)
+            .unwrap();
+        let subsidy = gas::subsidy(0, &cfg_with_window(256));
+        let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy, 0, 1, &[9; 8]);
+        assert!(l.has_commitment(&want_cm), "the payout note is the subsidy alone");
+        assert!(!l.unsealed_fees().contains_key(&floor.hash()), "covered: never coverable again");
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
     }
 

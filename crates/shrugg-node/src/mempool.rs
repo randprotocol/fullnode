@@ -1318,6 +1318,13 @@ mod tests {
             }
         };
 
+        // The synthetic covers in the ledger's coverable set (H1's block rule), excess-free.
+        l.set_unsealed_fees(
+            [Hash::digest(b"cover a"), Hash::digest(b"cover b")]
+                .into_iter()
+                .map(|c| (c, (0, fixtures::key(1).address(), u64::MAX)))
+                .collect(),
+        );
         let mut m = Mempool::new(10);
         let tx1 = aggregate(vec![Hash::digest(b"cover a")], 0, [9; 8]);
         let claims = m.precheck(&tx1, &l, &StubExecutor).unwrap();

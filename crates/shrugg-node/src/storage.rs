@@ -3254,8 +3254,14 @@ mod seal_tests {
         let mut l1 = gs.ledger.clone();
         l1.set_height(1);
         l1.set_timestamp_ms(1);
-        l1.apply_transactions(&[stub_twin, register.clone()], &key(1).address(), &StubExecutor).unwrap();
+        l1.apply_transactions(&[stub_twin.clone(), register.clone()], &key(1).address(), &StubExecutor).unwrap();
         l1.record_anchor(1);
+        // The ledger applied the stub twin, so its coverable entry is keyed by the twin's hash;
+        // the stored bundle (and the aggregate's cover) is the real-proof one. Re-key it.
+        let mut fees = l1.unsealed_fees().clone();
+        let entry = fees.remove(&stub_twin.hash()).expect("the twin was bucketed");
+        fees.insert(covered_tx.hash(), entry);
+        l1.set_unsealed_fees(fees);
         let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), register], &key(1));
         storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
 

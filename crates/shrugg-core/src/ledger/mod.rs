@@ -205,6 +205,10 @@ pub enum BlockError {
     UnknownProposer(Address),
     #[error("too many transactions in block")]
     TooManyTransactions,
+    /// At most one `Aggregate` per block (spec §3.4) is a block-validity rule, not proposer
+    /// selection alone (the pre-v0.1 review's H1): the second is refused by index.
+    #[error("a block carries at most one aggregate; a second is at tx {index}")]
+    SecondAggregate { index: usize },
     #[error("block transaction bytes exceed the per-block limit")]
     TooLarge,
     /// Only on a chain with a bridge, where the block timestamp is consensus input
@@ -977,13 +981,16 @@ impl Ledger {
             // burn is not SHRUGG and has no place in the SHRUGG audit.
             self.apply_bundle_notes(b, executor);
             self.validators.get_mut(proposer).expect("looked up above").rewards = rewards;
-            if self.aggregation.is_some() && b.fee > gas::BUNDLE_BASE {
+            if self.aggregation.is_some() {
                 let until = self.height.checked_add(self.aggregation().expect("just checked").window).ok_or(TxError::Overflow)?;
-                // The bucket key is the bundle's *raw* transaction hash — the hash an
-                // aggregate's covers name. A pruned bundle's marker form hashes differently
-                // (its proof bytes differ), so on the sealed-sync replay the key comes from
-                // the side table's attestation, or the aggregate's payment would find no
-                // excess and the replay would diverge (spec §6.2's byte-identical replay).
+                // Every bundle is recorded, excess or not: the bucket doubles as the ledger's
+                // coverable set (the pre-v0.1 review's H1) — an aggregate may name a cover only
+                // while its entry stands, and the entry leaves at the covering aggregate or at
+                // the sweep, never to return. The key is the bundle's *raw* transaction hash —
+                // the hash an aggregate's covers name. A pruned bundle's marker form hashes
+                // differently (its proof bytes differ), so on the sealed-sync replay the key
+                // comes from the side table's attestation, or the aggregate's payment would
+                // find no entry and the replay would diverge (spec §6.2's byte-identical replay).
                 let bucket_key = match crate::notes::pruned_proof_hash(&b.proof) {
                     Some(ph) => self.pruned_side.get(&ph).map(|(raw, _)| *raw).unwrap_or_else(|| tx.hash()),
                     None => tx.hash(),
@@ -1087,8 +1094,14 @@ impl Ledger {
         scratch.pruned_side =
             pruned.iter().map(|p| (p.proof_hash, (p.tx_hash, p.public_values.clone()))).collect();
         let mut receipts = Vec::new();
+        let mut aggregate_seen = false;
         for (index, tx) in txs.iter().enumerate() {
             if matches!(tx.action, Action::Aggregate { .. }) {
+                // Spec §3.4's "at most one" as a block rule: the second is refused by index,
+                // before its records are even looked up.
+                if std::mem::replace(&mut aggregate_seen, true) {
+                    return Err(BlockError::SecondAggregate { index });
+                }
                 let c = covered
                     .get(&index)
                     .ok_or(BlockError::InvalidTx { index, error: TxError::AggregateNeedsCovered })?;
