@@ -1287,6 +1287,14 @@ fn a_block_whose_height_skips_its_parent_is_refused_before_its_epoch_is_derived(
 /// A one-validator HotStuff with an aggregation-gated genesis, a registered aggregator, and a
 /// covered source that answers every cover set with the same synthetic record.
 fn aggregation_node() -> (HotStuff, Keypair, crate::ledger::aggregation::AggregationConfig) {
+    aggregation_node_with(|_, _| {})
+}
+
+/// `aggregation_node`, with `prepare` run on the genesis ledger (after the aggregator's
+/// registration) before the node is built on it.
+fn aggregation_node_with(
+    prepare: impl FnOnce(&mut crate::ledger::Ledger, &Keypair),
+) -> (HotStuff, Keypair, crate::ledger::aggregation::AggregationConfig) {
     use crate::ledger::aggregation::{AdmittedShape, AggregationConfig};
     use crate::types::actions::{aggregator_register_message, AggregatorRegistration};
     use crate::types::{DeclaredShape, FriProfile};
@@ -1353,6 +1361,7 @@ fn aggregation_node() -> (HotStuff, Keypair, crate::ledger::aggregation::Aggrega
     b.proof = StubExecutor::make_bundle_proof(&[3; 8], &d);
     let register_tx = Transaction::shielded(1, b, crate::types::Action::RegisterAggregator { registration });
     gs.ledger.apply_tx(&register_tx, &key.address(), &StubExecutor).unwrap();
+    prepare(&mut gs.ledger, &key);
     let mut hs = HotStuff::new(
         ConsensusConfig::new(1, gs.validators.clone(), gs.hash()),
         Some(Keypair::from_seed(*key.seed()).unwrap()),
@@ -1509,6 +1518,26 @@ fn a_proposal_carrying_an_aggregate_applies_identically_on_proposer_and_peer() {
         .expect("a proposal was built");
     assert!(block.transactions.iter().any(|t| t.hash() == tx.hash()), "the aggregate is in the block");
     peer.on_proposal(block, 1).expect("the peer applies the same block to the same root");
+}
+
+/// The block-end sweep (spec §5.2) is part of the applied state: a bucketed excess whose window
+/// passed at this height is credited to a validator's `rewards`, which the state root commits.
+/// The leader's header root must therefore come from the same block-end steps every replica
+/// runs — otherwise the first expired bucket makes every leader reject its own block, and the
+/// chain halts (the pre-v0.1 review's L1).
+#[test]
+fn a_proposal_after_an_excess_window_passes_is_one_the_leader_itself_applies() {
+    let (mut leader, _key, _cfg) = aggregation_node_with(|ledger, key| {
+        // An excess bucketed at genesis whose window ends at height 1: the block this leader
+        // builds is the one that sweeps it.
+        ledger.bucket_excess(Hash::digest(b"an over-floor bundle"), 5, key.address(), 1);
+    });
+    leader.start();
+    let acts = leader.propose(1, vec![], 1).expect("the leader accepts the block it built");
+    assert!(
+        acts.iter().any(|a| matches!(a, Action::Broadcast(ConsensusMessage::Proposal(_)))),
+        "the proposal was broadcast"
+    );
 }
 
 /// A candidate the covered source cannot cover is skipped — never the block.

@@ -1197,12 +1197,7 @@ impl Ledger {
         scratch.set_height(block.height());
         scratch.set_timestamp_ms(block.header.timestamp_ms);
         let data = scratch.apply_transactions_for_sync(&block.transactions, &proposer, covered, pruned, executor)?;
-        // The proving-share sweep (spec §5.2): every bucketed excess whose window passed at
-        // this head is credited to its recorded proposer. Part of the applied state — the
-        // rewards it credits are in the state root — so it runs inside the scratch, before the
-        // root is computed, and no-ops on a chain without the section.
-        scratch.sweep_expired_excesses(block.height(), &proposer);
-        scratch.record_anchor(block.height());
+        scratch.close_block(block.height(), &proposer);
         let computed = scratch.state_root();
         if computed != block.header.state_root {
             // Components, not just the composite: the divergence names the ledger half it
@@ -1229,6 +1224,18 @@ impl Ledger {
                 input_envelope: r.input_envelope,
             })
             .collect())
+    }
+
+    /// The block-end steps, after the last transaction and before the state root: the
+    /// proving-share sweep (spec §5.2 — every bucketed excess whose window passed at this head
+    /// is credited to its recorded proposer, and the rewards it credits are in the state root;
+    /// a no-op on a chain without the section) and the anchor record. One function for both
+    /// paths on purpose: the proposer's header root and the replica's recomputed root must come
+    /// from the same steps, or the first expired bucket makes every leader reject its own block
+    /// (the pre-v0.1 review's L1).
+    pub fn close_block(&mut self, height: u64, proposer: &Address) {
+        self.sweep_expired_excesses(height, proposer);
+        self.record_anchor(height);
     }
 
     /// Deterministic state commitment (spec §9):

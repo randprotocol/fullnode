@@ -723,6 +723,8 @@ impl HotStuff {
                 break;
             }
         }
+        // The same block-end steps `apply_block_for_sync` runs before it recomputes the root.
+        ledger.close_block(height, &me);
         let header = BlockHeader {
             height: parent.block.height() + 1,
             view,
