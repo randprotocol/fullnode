@@ -2414,6 +2414,52 @@ mod payment_tests {
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
     }
 
+    /// The sealed form binds the whole pruned transaction, not only its digest fields (the
+    /// pre-v0.1 review's M1): a transaction hashes its bundle proof by digest, so the marker
+    /// form hashes to the raw hash the certified tx root commits to, and a sync peer that
+    /// substitutes an envelope (or anything else outside the proof) fails that root.
+    #[test]
+    fn a_sealed_block_binds_its_pruned_transactions_beyond_the_digest_fields() {
+        use crate::consensus::PrunedBundle;
+        let (a, _) = keys();
+        let l = gated(256);
+        let tx = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, 0), Action::None);
+        let digest = StubExecutor.bundle_digest(&tx.bundle.as_ref().unwrap().digest_input());
+        let mut pv = [0u64; 34];
+        for k in 0..8 {
+            pv[pv::OUT0 + k] = digest[k] as u64;
+        }
+        let proof_hash = Hash::digest(&tx.bundle.as_ref().unwrap().proof);
+        let mut marker = crate::notes::PRUNED_PROOF_MARKER.to_vec();
+        marker.extend_from_slice(proof_hash.as_bytes());
+        let mut pruned_tx = tx.clone();
+        pruned_tx.bundle.as_mut().unwrap().proof = marker;
+        let side = PrunedBundle { tx_hash: tx.hash(), proof_hash, public_values: pv.to_vec(), shape: shape() };
+        assert_eq!(pruned_tx.hash(), tx.hash(), "the marker form hashes to the raw hash");
+        let mut forged = pruned_tx.clone();
+        forged.bundle.as_mut().unwrap().envelopes[0].body = vec![0xEE; 16];
+        assert_ne!(forged.hash(), tx.hash(), "a substituted envelope changes the hash");
+        let block = Block::sign(
+            BlockHeader {
+                height: 1,
+                view: 1,
+                parent: Hash::ZERO,
+                proposer: a.public_key().clone(),
+                timestamp_ms: 1,
+                tx_root: crate::crypto::merkle_root(&[tx.hash()]),
+                state_root: Hash::ZERO,
+                justify: QuorumCertificate::genesis(Hash::ZERO),
+            },
+            vec![forged],
+            &a,
+        );
+        let mut after = l.clone();
+        match after.apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&side), &StubExecutor) {
+            Err(crate::ledger::BlockError::TxRootMismatch) => {}
+            other => panic!("expected the substituted envelope refused by the tx root, got {other:?}"),
+        }
+    }
+
     /// The sealed form's ledger half (spec §7): a pruned bundle applies on the marker's
     /// membership and the digest binding — the public fields hash to the digest the covering
     /// aggregate's verified pv commits to — and every malformed variation is refused by name.
@@ -2431,7 +2477,8 @@ mod payment_tests {
         for k in 0..8 {
             pv[pv::OUT0 + k] = digest[k] as u64;
         }
-        let proof_hash = Hash::digest(b"the raw proof bytes");
+        // The marker carries the raw proof's digest — what the raw hash commits the proof by.
+        let proof_hash = Hash::digest(&tx.bundle.as_ref().unwrap().proof);
         let mut marker = crate::notes::PRUNED_PROOF_MARKER.to_vec();
         marker.extend_from_slice(proof_hash.as_bytes());
         let mut pruned_tx = tx.clone();
@@ -2517,11 +2564,11 @@ mod payment_tests {
         );
         assert_eq!(m2.unsealed_fees().len(), 1, "and under no second key");
 
-        // Without any side table the block reads as a raw block with a marker for a proof —
-        // its hash is not the raw one, and the root refuses it.
+        // Without any side table the root still holds (the marker form hashes to the raw
+        // hash), but the marker has no entry: the malformed-marker refusal, at its index.
         match l.clone().apply_block_for_sync(&block, &BTreeMap::new(), &[], &StubExecutor) {
-            Err(crate::ledger::BlockError::TxRootMismatch) => {}
-            other => panic!("expected TxRootMismatch, got {other:?}"),
+            Err(crate::ledger::BlockError::InvalidTx { index: 0, error: TxError::InvalidBundleProof(_) }) => {}
+            other => panic!("expected the unattested-marker refusal, got {other:?}"),
         }
         // And a table that simply does not attest this proof: the malformed-marker refusal,
         // at its index.

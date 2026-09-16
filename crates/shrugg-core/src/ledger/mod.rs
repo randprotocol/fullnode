@@ -986,16 +986,11 @@ impl Ledger {
                 // Every bundle is recorded, excess or not: the bucket doubles as the ledger's
                 // coverable set (the pre-v0.1 review's H1) — an aggregate may name a cover only
                 // while its entry stands, and the entry leaves at the covering aggregate or at
-                // the sweep, never to return. The key is the bundle's *raw* transaction hash —
-                // the hash an aggregate's covers name. A pruned bundle's marker form hashes
-                // differently (its proof bytes differ), so on the sealed-sync replay the key
-                // comes from the side table's attestation, or the aggregate's payment would
-                // find no entry and the replay would diverge (spec §6.2's byte-identical replay).
-                let bucket_key = match crate::notes::pruned_proof_hash(&b.proof) {
-                    Some(ph) => self.pruned_side.get(&ph).map(|(raw, _)| *raw).unwrap_or_else(|| tx.hash()),
-                    None => tx.hash(),
-                };
-                self.bucket_excess(bucket_key, b.fee - gas::BUNDLE_BASE, *proposer, until);
+                // the sweep, never to return. The key is the transaction hash an aggregate's
+                // covers name; a pruned bundle's marker form hashes to the same value
+                // (`Transaction::hash` takes the proof by digest), so the sealed-sync replay
+                // keys byte-identically without consulting the side table.
+                self.bucket_excess(tx.hash(), b.fee - gas::BUNDLE_BASE, *proposer, until);
             }
         }
         let mut receipt = None;
@@ -1137,10 +1132,11 @@ impl Ledger {
         self.apply_block_for_sync(block, covered, &[], executor)
     }
 
-    /// `apply_block_with_covered` with the sealed form's side table (spec §7): the tx root
-    /// checks against the raw hashes the table attests (a marker-form transaction's own hash is
-    /// its marker bytes', never the raw one), and `check_bundle_proof` runs its membership and
-    /// digest-binding checks against the same table.
+    /// `apply_block_with_covered` with the sealed form's side table (spec §7): the tx root is
+    /// checked over the transactions as served — a marker-form transaction hashes to its raw
+    /// hash (`Transaction::hash` takes the proof by digest), so the certified root binds every
+    /// byte of it but the proof — the table's attested raw hash must agree with that, and
+    /// `check_bundle_proof` runs its membership and digest-binding checks against the table.
     pub fn apply_block_for_sync(
         &mut self,
         block: &Block,
@@ -1164,33 +1160,24 @@ impl Ledger {
         if !block.verify_signature() {
             return Err(BlockError::BadProposerSignature);
         }
-        if pruned.is_empty() {
-            if !block.verify_tx_root() {
-                return Err(BlockError::TxRootMismatch);
-            }
-        } else {
-            // The sealed form's tx-root check (spec §7): the raw hashes the side table attests
-            // stand in for the marker-form transactions' own.
-            let leaves: Result<Vec<Hash>, BlockError> = block
-                .transactions
-                .iter()
-                .enumerate()
-                .map(|(index, tx)| {
-                    match tx.bundle.as_ref().and_then(|b| crate::notes::pruned_proof_hash(&b.proof)) {
-                        None => Ok(tx.hash()),
-                        Some(ph) => pruned
-                            .iter()
-                            .find(|p| p.proof_hash == ph)
-                            .map(|p| p.tx_hash)
-                            .ok_or(BlockError::InvalidTx {
-                                index,
-                                error: TxError::InvalidBundleProof(crate::confidential::ConfidentialError::MalformedProof),
-                            }),
-                    }
-                })
-                .collect();
-            if merkle_root(&leaves?) != block.header.tx_root {
-                return Err(BlockError::TxRootMismatch);
+        // The tx root, over the transactions as served: the same check for the raw and the
+        // sealed form, because a marker-form transaction hashes to its raw hash. Nothing a peer
+        // changes outside the proof bytes survives it (the pre-v0.1 review's M1).
+        if !block.verify_tx_root() {
+            return Err(BlockError::TxRootMismatch);
+        }
+        // The sealed form's side table (spec §7): every marker-form transaction must have its
+        // entry, and the entry's attested raw hash must be the hash the root just certified —
+        // the table can vouch for a proof, never rename a transaction.
+        for (index, tx) in block.transactions.iter().enumerate() {
+            let Some(ph) = tx.bundle.as_ref().and_then(|b| crate::notes::pruned_proof_hash(&b.proof)) else { continue };
+            let malformed = || BlockError::InvalidTx {
+                index,
+                error: TxError::InvalidBundleProof(crate::confidential::ConfidentialError::MalformedProof),
+            };
+            let entry = pruned.iter().find(|p| p.proof_hash == ph).ok_or_else(malformed)?;
+            if entry.tx_hash != tx.hash() {
+                return Err(malformed());
             }
         }
         let proposer = block.proposer();

@@ -221,8 +221,44 @@ impl Transaction {
     }
 
     /// Transaction id = hash of the full encoding.
+    /// The transaction id. The bundle's proof enters by its digest, every other byte as is —
+    /// so the pruned marker form (spec §6.2: `PRUNED_PROOF_MARKER` then that digest) hashes to
+    /// the *same* id as the raw transaction, and the tx root a QC certifies binds a sealed
+    /// block's pruned transactions whole: envelopes, action, everything but the proof bytes the
+    /// covering aggregate stands in for (the pre-v0.1 review's M1). A bundle-less transaction
+    /// hashes its bytes as is.
     pub fn hash(&self) -> Hash {
-        Hash::digest_domain(b"shrugg-txid", &self.encode())
+        #[derive(Serialize)]
+        struct BundleView<'a> {
+            anchor: &'a Word8,
+            nullifiers: &'a [Word8; 2],
+            commitments: &'a [Word8; 2],
+            fee: u64,
+            burn: u64,
+            asset: u32,
+            time: u32,
+            envelopes: &'a [Envelope; 2],
+            proof_hash: Hash,
+        }
+        #[derive(Serialize)]
+        struct TxView<'a> {
+            chain_id: u64,
+            bundle: Option<BundleView<'a>>,
+            action: &'a Action,
+        }
+        let bundle = self.bundle.as_ref().map(|b| BundleView {
+            anchor: &b.anchor,
+            nullifiers: &b.nullifiers,
+            commitments: &b.commitments,
+            fee: b.fee,
+            burn: b.burn,
+            asset: b.asset,
+            time: b.time,
+            envelopes: &b.envelopes,
+            proof_hash: crate::notes::pruned_proof_hash(&b.proof).unwrap_or_else(|| Hash::digest(&b.proof)),
+        });
+        let view = TxView { chain_id: self.chain_id, bundle, action: &self.action };
+        Hash::digest_domain(b"shrugg-txid-2", &bincode::serialize(&view).expect("Transaction serializes"))
     }
 
     /// Wire size, used for block byte accounting.

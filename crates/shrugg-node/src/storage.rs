@@ -96,8 +96,9 @@ pub enum TxRecord {
     Pruned {
         height: u64,
         index: u32,
-        /// The *raw* transaction's hash: unrecomputable from the pruned bytes, and what the
-        /// sealed form's side table and every `covers` list names.
+        /// The raw transaction's hash — what the sealed form's side table and every `covers`
+        /// list names. Equal to the marker form's own `hash()` (the proof enters by digest),
+        /// kept explicit so the record and the side table attest it rather than recompute it.
         tx_hash: Hash,
         tx: Transaction,
         proof_hash: Hash,
@@ -881,8 +882,8 @@ impl Storage {
     }
 
     /// The raw transaction hash a pruned proof hash maps to, if any — the sealed form's
-    /// serving index: a marker-form transaction's own hash is its marker bytes', so the record
-    /// is found by the proof hash instead.
+    /// serving index by proof hash (the marker form hashes to the raw hash too; this index
+    /// answers the question from the proof's side).
     pub fn tx_hash_by_proof_hash(&self, proof_hash: &Hash) -> Result<Option<Hash>> {
         let mut key = Vec::with_capacity(33);
         key.push(b'p');
