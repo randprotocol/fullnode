@@ -537,7 +537,7 @@ mod tests {
     use randprotocol_core::bridge::{digest, sign_digest, Attestation, Body, Payload, Transfer, CHAIN_RAND};
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::ledger::ANCHOR_WINDOW;
-    use randprotocol_core::notes::ShieldedAddress;
+    use randprotocol_core::receiver::ReceiverId;
     use randprotocol_core::types::Action;
 
     /// A ledger at the fixtures' genesis, with the faucet on and a height past 0 so bundles can
@@ -981,8 +981,8 @@ mod tests {
         (gs.ledger.clone(), secrets)
     }
 
-    fn recipient() -> ShieldedAddress {
-        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
+    fn recipient() -> ReceiverId {
+        fixtures::recipient()
     }
 
     /// The one attestation both relayers see: 1,000 of chain 2's token to `recipient()`,
@@ -1005,7 +1005,7 @@ mod tests {
                 amount: Transfer::u256_from_u128(1_000),
                 token_address: token,
                 token_chain: 2,
-                to: recipient().recipient_hash(),
+                to: recipient().0,
                 to_chain: CHAIN_RAND,
                 fee: Transfer::u256_from_u128(0),
             })

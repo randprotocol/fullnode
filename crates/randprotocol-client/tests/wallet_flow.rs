@@ -122,8 +122,15 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     assert_ne!(a.address, b.address, "two spend keys, two addresses");
 
     // ---- mint: a validator pays 100 RAND into a note only A can open ----
+    // Short-shielded-address task 5: `rand_mint` takes a receiver id now, not A's long address,
+    // and the node always refuses one until Task 6 wires resolution through — so this id need not
+    // be A's own (this wallet has none yet either); it only has to be well-formed.
     let mint = 100 * UNITS_PER_RAND;
-    let hash = rpc.mint_shielded(&a.address.to_string(), Some(mint)).await.expect("mint accepted");
+    let mint_to = randprotocol_core::receiver::ReceiverId::from(
+        randprotocol_core::receiver::receiver_signing_keypair(&[1; 32]).public_key(),
+    )
+    .to_string();
+    let hash = rpc.mint_shielded(&mint_to, Some(mint)).await.expect("mint accepted");
     rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
 
     wallet::scan(&rpc, &a, &mut a_store).await.unwrap();

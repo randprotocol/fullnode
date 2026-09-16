@@ -182,7 +182,7 @@ mod tests {
         };
         let attest = Action::BridgeAttest {
             attestation: vec![],
-            recipient: crate::notes::ShieldedAddress { pk: [0; 8], kem_ek: vec![] },
+            recipient: crate::receiver::ReceiverId([0; 32]),
             r: [0; 8],
             time: 0,
             asset: 1,

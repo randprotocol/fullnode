@@ -89,8 +89,8 @@ mod tests {
         // A wrong-length encapsulation key is an error, not a panic inside ML-KEM.
         let short = ShieldedAddress { pk: a.pk, kem_ek: vec![0; 7] };
         assert!(to_research(&short).unwrap_err().contains("7 bytes"));
-        // The text form parses back to the same address, so a wallet can hand one out as a string.
-        assert_eq!(randprotocol_core::notes::ShieldedAddress::parse(&a.to_string()).unwrap(), a);
+        // Short-shielded-address task 5 removed `ShieldedAddress`'s text form: a wallet hands out
+        // a receiver id now, not this struct's ~1.2 KB text, so there is no round trip to pin here.
 
         let note = Note::new(vk.pk(), vk.pk(), 7, 0, 3);
         let key = TxKey::random();

@@ -53,7 +53,7 @@ fn deposit_note(addr: &str, _amount: u64) -> Result<GenesisNote> {
 fn seal_deposit(to: &ShieldedAddress, note: &Note) -> Result<GenesisNote> {
     let throwaway = SpendKey::random().viewing_key();
     let envelope = randprotocol_zkvm::address::seal_note(&throwaway, to, note, &TxKey::random())
-        .map_err(|e| anyhow::anyhow!("sealing a note to {}: {e}", to.to_string()))?;
+        .map_err(|e| anyhow::anyhow!("sealing a note to {}: {e}", word8_to_hex(&to.pk)))?;
     Ok(GenesisNote {
         cm: word8_to_hex(&note.commitment()),
         envelope: EnvelopeHex::from_envelope(&envelope),

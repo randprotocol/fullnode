@@ -234,12 +234,12 @@ fn sync_opts() -> WriteOptions {
 ///
 /// A `BridgeAttest`'s deposit is the one commitment the wire does not carry: the chain computes
 /// it from the amount the guardians signed, the `time` the action published and the asset the
-/// registry named, so this recomputes it the same way, through the ledger's own function.
-/// `bridge` is that registry — absent only on a chain without a bridge, where a `BridgeAttest`
-/// is inadmissible.
+/// registry named and the receiver id resolved to, so this recomputes it the same way, through
+/// the ledger's own function. `ledger` carries both registries this needs — absent a bridge
+/// section only on a chain without one, where a `BridgeAttest` is inadmissible.
 fn created_notes(
     tx: &randprotocol_core::Transaction,
-    bridge: Option<&BridgeState>,
+    ledger: &Ledger,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<Vec<(Word8, Envelope)>> {
     let mut out = Vec::new();
@@ -251,18 +251,22 @@ fn created_notes(
     match &tx.action {
         Action::Mint { cm, envelope, .. } => out.push((*cm, envelope.clone())),
         Action::BridgeAttest { attestation, .. } => {
-            let bridge = bridge.ok_or_else(|| {
-                StorageError::Corrupt("committed block has a bridge attestation but no bridge state".into())
-            })?;
+            if ledger.bridge().is_none() {
+                return Err(
+                    StorageError::Corrupt("committed block has a bridge attestation but no bridge state".into())
+                        .into(),
+                );
+            }
             // A guardian-set rotation is the one attestation that deposits nothing. Everything
-            // else was admitted, so it decodes and its asset is registered; failing to find the
-            // note here is a torn block, and leaving the leaf out would put the notes family one
-            // short of the tree the ledger committed to.
+            // else was admitted, so it decodes, its asset is registered and its receiver id
+            // resolves; failing to find the note here is a torn block, and leaving the leaf out
+            // would put the notes family one short of the tree the ledger committed to.
             if randprotocol_core::ledger::bridge_notes::attested_transfer(attestation).is_some() {
-                let note = randprotocol_core::ledger::bridge_notes::deposit_note(tx, bridge, executor)
+                let note = randprotocol_core::ledger::bridge_notes::deposit_note(tx, ledger, executor)
                     .ok_or_else(|| {
                         StorageError::Corrupt(
-                            "committed attestation deposits an asset the registry does not hold".into(),
+                            "committed attestation deposits an asset or a receiver the registry does not hold"
+                                .into(),
                         )
                     })?;
                 out.push(note);
@@ -1228,7 +1232,7 @@ impl Storage {
                 for nf in tx.nullifiers() {
                     batch.put_cf(self.cf(CF_NULLIFIERS), word8_to_bytes(&nf), hk);
                 }
-                for (cm, envelope) in created_notes(tx, ledger_after.bridge(), executor)? {
+                for (cm, envelope) in created_notes(tx, ledger_after, executor)? {
                     let row = NoteRow { cm, envelope, height: block.height() };
                     batch.put_cf(self.cf(CF_NOTES), height_key(next_index), bincode::serialize(&row)?);
                     next_index += 1;
@@ -1773,7 +1777,7 @@ pub(crate) mod fixtures {
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::bridge::{guardian_address, BridgeConfig};
     use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator, ReceiverRecordHex};
-    use randprotocol_core::notes::{word8_to_hex, Bundle, ShieldedAddress};
+    use randprotocol_core::notes::{word8_to_hex, Bundle, KEM_EK_BYTES};
     use randprotocol_core::receiver::{receiver_signing_keypair, ReceiverId, ReceiverRecord};
     use randprotocol_core::{gas, BlockHeader, Keypair, Transaction};
 
@@ -1888,7 +1892,10 @@ pub(crate) mod fixtures {
                 payout: payout(1).to_string(),
             }],
             alloc: Vec::new(),
-            receivers: vec![ReceiverRecordHex::from_record(&receiver_record_for(chain_id, 1))],
+            receivers: vec![
+                ReceiverRecordHex::from_record(&receiver_record_for(chain_id, 1)),
+                ReceiverRecordHex::from_record(&recipient_record(chain_id)),
+            ],
             faucet: true,
             confidential: true,
             fri_profile: "test".into(),
@@ -1917,15 +1924,25 @@ pub(crate) mod fixtures {
         t
     };
 
-    /// The shielded address every fixture deposit is addressed to.
-    pub(crate) fn recipient() -> ShieldedAddress {
-        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
+    /// The receiver every fixture deposit is addressed to, distinct from any validator payout
+    /// (seed 200, where genesis payouts are seeded `1..=validators.len()`). [`bridged_genesis`]
+    /// registers it, so a deposit built against it always resolves.
+    const RECIPIENT_SEED: u8 = 200;
+
+    pub(crate) fn recipient() -> ReceiverId {
+        ReceiverId::from(receiver_signing_keypair(&[RECIPIENT_SEED; 32]).public_key())
+    }
+
+    /// The receiver record [`recipient`] resolves to, on chain `chain_id`.
+    pub(crate) fn recipient_record(chain_id: u64) -> ReceiverRecord {
+        let kp = receiver_signing_keypair(&[RECIPIENT_SEED; 32]);
+        ReceiverRecord::sign(&kp, chain_id, 1, [4; 8], vec![6; KEM_EK_BYTES])
     }
 
     /// An attestation of `amount` units of [`TOKEN`] to `to`, emitted by chain 2's registered
     /// emitter and signed by five of the six guardians in [`bridge_config`]. `sequence`
     /// distinguishes otherwise identical bodies, and so their digests.
-    pub(crate) fn attestation(secrets: &[[u8; 32]], to: &ShieldedAddress, amount: u128, sequence: u64) -> Vec<u8> {
+    pub(crate) fn attestation(secrets: &[[u8; 32]], to: &ReceiverId, amount: u128, sequence: u64) -> Vec<u8> {
         use randprotocol_core::bridge::{digest, sign_digest, Attestation, Body, Payload, Transfer, CHAIN_RAND};
         let body = Body {
             timestamp: 1,
@@ -1938,7 +1955,7 @@ pub(crate) mod fixtures {
                 amount: Transfer::u256_from_u128(amount),
                 token_address: TOKEN,
                 token_chain: 2,
-                to: to.recipient_hash(),
+                to: to.0,
                 to_chain: CHAIN_RAND,
                 fee: Transfer::u256_from_u128(0),
             })
@@ -2275,7 +2292,7 @@ mod tests {
 
         // The deposit note is leaf 2 — after the fee bundle's two — and is served like any
         // other, so a wallet scanning the tree finds its bridged deposit.
-        let deposit = randprotocol_core::ledger::bridge_notes::deposit_note(&att, back, &StubExecutor).unwrap();
+        let deposit = randprotocol_core::ledger::bridge_notes::deposit_note(&att, &reloaded, &StubExecutor).unwrap();
         let row = s.note(2).unwrap().expect("the deposit note is indexed");
         assert_eq!((row.cm, row.envelope), deposit);
         assert_eq!(row.height, 1);
@@ -2592,8 +2609,7 @@ mod tests {
                 s.note(withdraw_leaf).unwrap().expect("the withdraw's deposit is indexed at the leaf it named");
             assert_eq!(withdraw_row.height, 2, "attest_first={attest_first}");
 
-            let bridge = ledger.bridge().expect("bridged genesis");
-            let expected_deposit = randprotocol_core::ledger::bridge_notes::deposit_note(&att, bridge, &StubExecutor)
+            let expected_deposit = randprotocol_core::ledger::bridge_notes::deposit_note(&att, &ledger, &StubExecutor)
                 .expect("the attestation registered an asset and deposits into it");
             let deposit_leaf = (base..base + 4)
                 .find(|&i| s.note(i).unwrap().expect("leaf in range").cm == expected_deposit.0)

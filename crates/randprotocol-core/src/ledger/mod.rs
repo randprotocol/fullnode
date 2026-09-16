@@ -1476,7 +1476,7 @@ mod tests {
     use super::test_fixtures::{env, keys, HC};
     use crate::confidential::StubExecutor;
     use crate::crypto::Keypair;
-    use crate::notes::ShieldedAddress;
+    use crate::receiver::ReceiverId;
     use crate::types::{BlockHeader, QuorumCertificate};
 
     /// Chain 7, the fixture's two validators — `test_fixtures::ledger_with_validators`, at the
@@ -1774,7 +1774,7 @@ mod tests {
         let l = ledger();
         let v = Address([1; 32]);
         let sig = crate::crypto::Signature::empty();
-        let recipient = ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
+        let recipient = ReceiverId([4; 32]);
         // An envelope of exactly `body` bytes of payload, so the cap edge is exact.
         let fat = |body: usize| Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![3; body] };
         let check = |n: u32, action: Action, expect: Result<(), TxError>| {

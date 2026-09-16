@@ -15,10 +15,9 @@ use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
 use randprotocol_core::gas;
 use randprotocol_core::genesis::{Genesis, GenesisState};
-use randprotocol_core::{Hash, Keypair, Ledger, ShieldedAddress, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
+use randprotocol_core::receiver::ReceiverId;
+use randprotocol_core::{Hash, Keypair, Ledger, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
 use randprotocol_zkvm::executor::ZkExecutor;
-use randprotocol_zkvm::notes::{Note, SpendKey};
-use randprotocol_zkvm::viewing::TxKey;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -1264,7 +1263,14 @@ impl Node {
     /// preserving and no reason to keep an outgoing-viewing record, so the `to_sender` half of
     /// the envelope is addressed to a key that is dropped on the next line and never recoverable.
     /// Only `to` can open the note, which is the whole intent.
-    async fn mint(&mut self, to: ShieldedAddress, amount: u64) -> std::result::Result<Hash, String> {
+    ///
+    /// Short-shielded-address task 5: `to` is a receiver id now, but sealing the note needs the
+    /// id's resolved record (`pk`/`kem_ek`), and this command has no way to obtain one yet — the
+    /// same stub `randprotocol-node/src/main.rs`'s `deposit_note` and `sealed_withdraw_note` are
+    /// (short-shielded-address task 4). Task 6 wires this through the receiver registry
+    /// (`Ledger::resolve_record`) and seals from the resolved record; until then the id's shape
+    /// is validated by the RPC's parse and this refuses here.
+    async fn mint(&mut self, to: ReceiverId, amount: u64) -> std::result::Result<Hash, String> {
         if !self.gs.faucet {
             return Err("faucet is disabled on this chain".into());
         }
@@ -1274,18 +1280,8 @@ impl Node {
         if amount > FAUCET_MAX_UNITS {
             return Err(format!("mint of {amount} exceeds the faucet cap of {FAUCET_MAX_UNITS}"));
         }
-        let key = Keypair::from_seed(self.cfg.seed).expect("seed validated at startup");
-        let height = self.hs.tip_ledger().height();
-        let note = Note::new(to.pk, [0; 8], amount, 0, height as u32);
-        let throwaway = SpendKey::random().viewing_key();
-        let envelope = randprotocol_zkvm::address::seal_note(&throwaway, &to, &note, &TxKey::random())?;
-        let tx = Transaction::mint(self.gs.chain_id, note.commitment(), envelope, amount, &key);
-        let hash = self
-            .mempool
-            .insert(tx.clone(), self.hs.tip_ledger(), self.executor.as_ref())
-            .map_err(|e| e.to_string())?;
-        self.net.broadcast(GossipMessage::Transaction(tx)).await;
-        Ok(hash)
+        let _ = to;
+        Err("mint needs a resolved record: Task 6".into())
     }
 
     async fn on_network_event(&mut self, ev: NetworkEvent) -> Result<()> {

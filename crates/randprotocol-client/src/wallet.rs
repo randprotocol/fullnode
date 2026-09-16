@@ -347,16 +347,20 @@ pub fn classify(w: &Wallet, cm: Word8, envelope: &Envelope) -> Found {
 /// (which deposits nothing, so the node renders no index and no commitment), and for a rendering
 /// whose `commitment` is not the note these fields build — the chain computes that commitment, so
 /// it is the authority on which leaf it appended.
+///
+/// Short-shielded-address task 5: `action["recipient"]` is now a receiver id, and this wallet has
+/// no way to resolve one to a `pk` without a registry lookup (there is no RPC for that yet —
+/// Task 7). So this no longer reads `recipient` at all: it builds the candidate note straight
+/// from `w`'s own note key and checks the result against the commitment the chain published,
+/// which is a strictly stronger check than comparing a claimed recipient ever was — a match here
+/// means `w`'s key really does produce the leaf the chain appended, not merely that the wire
+/// claims it does.
 pub fn rebuilt_deposit(w: &Wallet, action: &Value) -> Option<Note> {
     if action["kind"].as_str()? != "bridge_attest" {
         return None;
     }
-    let recipient = ShieldedAddress::parse(action["recipient"].as_str()?).ok()?;
-    if recipient.pk != w.vk.pk() {
-        return None;
-    }
     let note = Note {
-        pk: recipient.pk,
+        pk: w.vk.pk(),
         // A deposit has no sender inside the pool, so the note records the zero word — the same
         // constant `bridge_notes::DEPOSIT_FROM` is.
         from: [0; 8],
@@ -1119,9 +1123,9 @@ pub fn burn_fee_default() -> u64 {
 /// wire bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttestedDeposit {
-    /// The 32-byte stand-in for the recipient's shielded address that the source-chain depositor
-    /// named and the guardians signed — `ShieldedAddress::recipient_hash`. The ledger refuses a
-    /// transaction whose `recipient` does not hash to it.
+    /// The recipient's 32-byte receiver id (`ReceiverId`) that the source-chain depositor named
+    /// and the guardians signed. The ledger refuses a transaction whose `recipient` is not this
+    /// same id (short-shielded-address task 5).
     pub to_hash: [u8; 32],
     /// The token as the guardians named it, which is what `rand_bridgeAssetId` turns into an
     /// [`AttestedDeposit::asset`] — the registry's key, and from there the note's `asset` index.
@@ -1610,16 +1614,16 @@ mod tests {
     /// wallet seals an envelope for is the note the chain will append.
     #[test]
     fn an_attestation_names_its_recipient_its_asset_and_its_amount() {
-        let me = Wallet::from_spend_key(SpendKey([21; 8]));
-        let d = attested_deposit(&transfer_attestation(1_000, me.address.recipient_hash())).unwrap();
-        assert_eq!(d.to_hash, me.address.recipient_hash(), "the 32-byte stand-in for the address");
+        let id = randprotocol_core::receiver::ReceiverId([21; 32]);
+        let d = attested_deposit(&transfer_attestation(1_000, id.0)).unwrap();
+        assert_eq!(d.to_hash, id.0, "the 32-byte receiver id the guardians signed");
         assert_eq!(d.amount, 1_000, "the gross amount, relayer fee and all");
         assert_eq!((d.token_chain, d.token), (TOKEN_CHAIN, TOKEN), "the token the guardians named");
         assert_eq!(d.asset, randprotocol_core::bridge::asset_id(TOKEN_CHAIN, &TOKEN), "the registry's key for the token");
-        // The address the guardians named is one address: another wallet's does not hash to it,
+        // The id the guardians named is one id: another wallet's receiver id is different bytes,
         // which is what the ledger refuses with `BridgeRecipientMismatch`.
-        let other = Wallet::from_spend_key(SpendKey([22; 8]));
-        assert_ne!(d.to_hash, other.address.recipient_hash());
+        let other = randprotocol_core::receiver::ReceiverId([22; 32]);
+        assert_ne!(d.to_hash, other.0);
         // Bytes that are not an attestation, and one that deposits nothing, are refused by name.
         assert!(attested_deposit(&[0xff; 32]).unwrap_err().to_string().contains("not a bridge attestation"));
         assert!(attested_deposit(&rotation_attestation()).unwrap_err().to_string().contains("rotation"));
@@ -1716,12 +1720,15 @@ mod tests {
         // The note the chain computes for 1000 units of asset 3, deposited at time 12: `from` is
         // the zero word, because a deposit has no sender inside the pool.
         let note = Note { pk: me.vk.pk(), from: [0; 8], amount: 1_000, asset: 3, time: 12, r: [9; 8] };
-        // What `tx_json` renders for that committed attest.
-        let rendered = |to: &ShieldedAddress, cm: Word8| {
+        // What `tx_json` renders for that committed attest. `recipient` is a receiver id now
+        // (short-shielded-address task 5) and `rebuilt_deposit` no longer reads it — the only
+        // thing that decides ownership is whether `w`'s own key reproduces `cm` — so it is a
+        // fixed, arbitrary id here rather than one derived from either wallet.
+        let rendered = |cm: Word8| {
             serde_json::json!({
                 "kind": "bridge_attest",
                 "attestation_len": 520,
-                "recipient": to.to_string(),
+                "recipient": randprotocol_core::receiver::ReceiverId([9; 32]).to_string(),
                 "asset": 3,
                 "asset_index": 3,
                 "amount": 1_000,
@@ -1735,17 +1742,19 @@ mod tests {
         // griefing ever was, and it stops mattering here.
         let garbage = Envelope { kem_ct: vec![0xff; 8], to_receiver: vec![0xff; 16], to_sender: vec![], body: vec![0xff; 16] };
         assert!(matches!(classify(&me, note.commitment(), &garbage), Found::Skipped(_)));
-        assert_eq!(rebuilt_deposit(&me, &rendered(&me.address, note.commitment())), Some(note));
+        assert_eq!(rebuilt_deposit(&me, &rendered(note.commitment())), Some(note));
 
-        // A deposit to someone else is not rebuilt, whoever renders it.
-        assert_eq!(rebuilt_deposit(&me, &rendered(&stranger.address, note.commitment())), None);
+        // A deposit whose commitment is really someone else's note is not rebuilt as this
+        // wallet's: `me`'s key does not reproduce it.
+        let stranger_note = Note { pk: stranger.vk.pk(), from: [0; 8], amount: 1_000, asset: 3, time: 12, r: [9; 8] };
+        assert_eq!(rebuilt_deposit(&me, &rendered(stranger_note.commitment())), None);
         // Nor is a note that does not hash to the commitment the chain published: the chain
         // computes that commitment, so it is the authority on which leaf it appended.
-        assert_eq!(rebuilt_deposit(&me, &rendered(&me.address, [1; 8])), None);
+        assert_eq!(rebuilt_deposit(&me, &rendered([1; 8])), None);
         // A rotation deposits nothing, so the node renders no index, no amount and no commitment.
         let rotation = serde_json::json!({
             "kind": "bridge_attest",
-            "recipient": me.address.to_string(),
+            "recipient": randprotocol_core::receiver::ReceiverId([9; 32]).to_string(),
             "asset": 0,
             "asset_index": serde_json::Value::Null,
             "amount": serde_json::Value::Null,

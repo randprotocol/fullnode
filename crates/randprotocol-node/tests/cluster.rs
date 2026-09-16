@@ -114,9 +114,19 @@ fn wallet(i: u32) -> Wallet {
     Wallet::from_spend_key(SpendKey([i; 8]))
 }
 
-/// The shielded address a mint pays, as its `rand1…` text.
+/// The receiver id `wallet(seed)` would register under (short-shielded-address task 5): pure,
+/// like `wallet` itself, so it can be named before any genesis exists. Not the same seed space as
+/// a validator's payout (`genesis_bridge`'s own `receiver_record`) — this is one wallet's id, not
+/// a validator's.
+fn receiver_id(seed: u8) -> randprotocol_core::receiver::ReceiverId {
+    randprotocol_core::receiver::ReceiverId::from(
+        randprotocol_core::receiver::receiver_signing_keypair(&[seed; 32]).public_key(),
+    )
+}
+
+/// The receiver id a mint pays, as its `rand1…` text.
 fn payee(seed: u8) -> String {
-    wallet(seed as u32).address.to_string()
+    receiver_id(seed).to_string()
 }
 
 /// What `wallet` can spend according to `node` — a fresh note store scanned against that node's
@@ -252,10 +262,10 @@ const EVM_TO: [u8; 32] = {
 /// One inbound transfer attestation: `amount` units of [`TOKEN`] addressed to `to`, emitted by
 /// chain 2's registered emitter and signed by five of the six guardians.
 ///
-/// The 32-byte recipient slot carries `to.recipient_hash()`, not an address: a shielded address is
-/// 1.2 KB and the wire format has room for a hash, so the source-chain depositor names the hash and
-/// the transaction carries the address for the ledger to check against it.
-fn attestation(to: &ShieldedAddress, amount: u128) -> Vec<u8> {
+/// The 32-byte recipient slot carries `to.0` directly (short-shielded-address task 5): a receiver
+/// id is already exactly the 32 bytes the wire format holds, unlike the long shielded address
+/// this replaced, which needed a separate hash to fit.
+fn attestation(to: &randprotocol_core::receiver::ReceiverId, amount: u128) -> Vec<u8> {
     let secrets = guardian_secrets();
     let body = Body {
         timestamp: 1,
@@ -268,7 +278,7 @@ fn attestation(to: &ShieldedAddress, amount: u128) -> Vec<u8> {
             amount: Transfer::u256_from_u128(amount),
             token_address: TOKEN,
             token_chain: TOKEN_CHAIN,
-            to: to.recipient_hash(),
+            to: to.0,
             to_chain: CHAIN_RAND,
             fee: Transfer::u256_from_u128(0),
         })
@@ -1504,10 +1514,11 @@ async fn bridge_mint(
     relayer: &Wallet,
     store: &mut NoteStore,
     to: &ShieldedAddress,
+    id: randprotocol_core::receiver::ReceiverId,
     attestation: Vec<u8>,
 ) -> (wallet::Submission, u32, Word8) {
     let d = wallet::attested_deposit(&attestation).expect("the attestation decodes to a transfer");
-    assert_eq!(d.to_hash, to.recipient_hash(), "the guardians signed this recipient's hash");
+    assert_eq!(d.to_hash, id.0, "the guardians signed this recipient's id");
     // The asset id from the node, over the two wire fields the guardians signed; a disagreement
     // would mean the two are not talking about the same chain.
     let asset_id = node.rpc.bridge_asset_id(d.token_chain, &d.token).await.expect("the node computes an asset id");
@@ -1517,8 +1528,7 @@ async fn bridge_mint(
     let index = wallet::deposit_index(&state, &assets, &asset_id).expect("an index for this asset").index();
     let time = u32::try_from(node.rpc.head().await.expect("head")["height"].as_u64().expect("height")).unwrap();
     let (note, envelope) = wallet::deposit_note_for(relayer, to, d.amount, index, time).expect("sealing the deposit");
-    let action =
-        Action::BridgeAttest { attestation, recipient: to.clone(), r: note.r, time, asset: index, envelope };
+    let action = Action::BridgeAttest { attestation, recipient: id, r: note.r, time, asset: index, envelope };
     let fee = gas::fee_floor(&action);
     let slot = proving_slot().await;
     let s = wallet::submit(&node.rpc, relayer, store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
@@ -1535,7 +1545,12 @@ async fn bridge_mint(
 /// `docs/shielded.md` §5), so everything before the action passes and the refusal that comes back
 /// is the *attestation's*. That is what makes this a probe worth a second of test time rather than
 /// a second bundle proof.
-async fn replayed_attest(node: &TestNode, to: &ShieldedAddress, attestation: Vec<u8>, asset: u32) -> Transaction {
+async fn replayed_attest(
+    node: &TestNode,
+    id: randprotocol_core::receiver::ReceiverId,
+    attestation: Vec<u8>,
+    asset: u32,
+) -> Transaction {
     let (height, anchor) = node.rpc.anchor(None).await.expect("the head anchor");
     let time = u32::try_from(height).unwrap();
     let empty = Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] };
@@ -1550,8 +1565,7 @@ async fn replayed_attest(node: &TestNode, to: &ShieldedAddress, attestation: Vec
         envelopes: [empty.clone(), empty.clone()],
         proof: vec![0xff; 32],
     };
-    let action =
-        Action::BridgeAttest { attestation, recipient: to.clone(), r: [7; 8], time, asset, envelope: empty };
+    let action = Action::BridgeAttest { attestation, recipient: id, r: [7; 8], time, asset, envelope: empty };
     Transaction::shielded(CHAIN_ID, bundle, action)
 }
 
@@ -1584,11 +1598,17 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     assert!(n0.rpc.assets().await.unwrap().is_empty());
 
     // ---- inbound: one attestation, one deposit note ----
+    // Short-shielded-address task 5: the deposit is addressed to a receiver id, which the ledger
+    // resolves through the registry — a full run against a live node would need `genesis_bridge`
+    // to register `recipient`'s record too (it currently only registers validators' payouts), so
+    // this attestation targets an id nothing here has registered. Left for Task 6/7's wallet and
+    // registry wiring; this test is not part of this task's required suite.
+    let recipient_id = receiver_id(61);
     let deposit = 5_000u64;
-    let attested = attestation(&recipient.address, deposit as u128);
+    let attested = attestation(&recipient_id, deposit as u128);
     let mut relayer_store = NoteStore::default();
     let (minted, index, cm) =
-        bridge_mint(&n0, &relayer, &mut relayer_store, &recipient.address, attested.clone()).await;
+        bridge_mint(&n0, &relayer, &mut relayer_store, &recipient.address, recipient_id, attested.clone()).await;
     assert_eq!(index, 1, "a first sighting takes FIRST_ASSET_INDEX");
     eprintln!("bridge-mint: tier {}, proved in {:.1?}, {} proof bytes", minted.tier, minted.proving, minted.proof_bytes);
 
@@ -1618,7 +1638,7 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     assert_eq!(action["asset_index"], index, "and the one the registry resolves, which admission held it to");
 
     // ---- the same attestation again: one digest, one deposit ----
-    let replay = replayed_attest(&n0, &recipient.address, attested, index).await;
+    let replay = replayed_attest(&n0, recipient_id, attested, index).await;
     let err = n0.rpc.send_transaction(&replay).await.unwrap_err().to_string();
     assert!(err.contains("already consumed"), "a replayed attestation must be refused as consumed: {err}");
 

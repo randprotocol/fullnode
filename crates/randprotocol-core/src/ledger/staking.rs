@@ -195,7 +195,11 @@ impl Ledger {
                 }
                 let (id, amount) = bridge_notes::attested_transfer(attestation)?;
                 let index = self.bridge()?.deposit_index(&id)?;
-                Some(bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor))
+                // An unregistered receiver claims nothing either: `validate` refuses it
+                // (`BridgeError::UnknownReceiver`), so a caller screening the pool must not be
+                // able to claim a note for a recipient the chain would never deposit to.
+                let pk = self.resolve_pk(recipient)?;
+                Some(bridge_notes::deposit_commitment(&pk, amount, index, *time, r, executor))
             }
             _ => None,
         }

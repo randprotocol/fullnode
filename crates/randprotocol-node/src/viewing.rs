@@ -264,6 +264,7 @@ mod tests {
     use crate::storage::Storage;
     use testkit::{key_vk, note_for, sealed_to as sealed};
     use randprotocol_core::confidential::StubExecutor;
+    use randprotocol_core::receiver::ReceiverId;
     use randprotocol_zkvm::address::{address_of, seal_note};
     use randprotocol_zkvm::notes::SpendKey;
 
@@ -443,7 +444,7 @@ mod tests {
             bundle: None,
             action: Action::BridgeAttest {
                 attestation: vec![9; 64],
-                recipient: address_of(&alice()),
+                recipient: ReceiverId([1; 32]),
                 r: [5; 8],
                 time: 4,
                 asset: 1,
