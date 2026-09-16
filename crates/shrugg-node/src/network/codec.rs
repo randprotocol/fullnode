@@ -23,7 +23,6 @@
 //! The serializer is `cbor4ii::serde`, exactly what libp2p's codec uses, so
 //! [`cbor_size`] measures what the wire will carry.
 
-use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::request_response;
 use libp2p::StreamProtocol;
@@ -99,7 +98,6 @@ where
     io.write_all(&data).await
 }
 
-#[async_trait]
 impl<Req, Resp> request_response::Codec for Codec<Req, Resp>
 where
     Req: Send + Serialize + DeserializeOwned,

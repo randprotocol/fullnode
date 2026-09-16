@@ -351,14 +351,9 @@ pub async fn start(
 /// shedding gossip while it catches up would otherwise fill the log with warnings about working
 /// normally.
 fn report_to_gossipsub(swarm: &mut Swarm<ShruggBehaviour>, id: &GossipId, acceptance: MessageAcceptance) {
-    match swarm.behaviour_mut().gossipsub.report_message_validation_result(
-        &id.message_id,
-        &id.propagation_source,
-        acceptance,
-    ) {
-        Ok(true) => {}
-        Ok(false) => tracing::debug!(?id, "validation reported for a message no longer in the cache"),
-        Err(e) => tracing::debug!(?id, "reporting validation failed: {e}"),
+    if !swarm.behaviour_mut().gossipsub.report_message_validation_result(&id.message_id, &id.propagation_source, acceptance)
+    {
+        tracing::debug!(?id, "validation reported for a message no longer in the cache");
     }
 }
 
@@ -456,7 +451,7 @@ async fn run(
                             Ok(data) => {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
                                     match e {
-                                        gossipsub::PublishError::InsufficientPeers => {
+                                        gossipsub::PublishError::NoPeersSubscribedToTopic => {
                                             tracing::debug!("publish: no peers yet")
                                         }
                                         gossipsub::PublishError::Duplicate => {}
@@ -614,7 +609,7 @@ async fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(ShruggEvent::Mdns(mdns::Event::Expired(_))) => {}
         SwarmEvent::Behaviour(ShruggEvent::Sync(ev)) => match ev {
-            request_response::Event::Message { peer, message } => match message {
+            request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request { request, channel, .. } => {
                     let _ = evt_tx.send(NetworkEvent::SyncRequest { peer, request, channel }).await;
                 }
@@ -622,7 +617,7 @@ async fn handle_swarm_event(
                     let _ = evt_tx.send(NetworkEvent::SyncResponse { peer, request_id, response }).await;
                 }
             },
-            request_response::Event::OutboundFailure { peer, request_id, error } => {
+            request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
                 let _ = evt_tx.send(NetworkEvent::SyncFailed { peer, request_id, error: error.to_string() }).await;
             }
             request_response::Event::InboundFailure { peer, error, .. } => {

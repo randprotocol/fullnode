@@ -1117,7 +1117,7 @@ mod tests {
 mod register_tests {
     use super::*;
     use crate::confidential::{ConfidentialExecutor, StubExecutor};
-    use crate::crypto::{Keypair, Hash, Signature};
+    use crate::crypto::{Hash, Keypair};
     use crate::gas;
     use crate::ledger::staking::ValidatorEntry;
     use crate::ledger::Ledger;
@@ -2273,7 +2273,6 @@ mod payment_tests {
         let mut l = gated(256);
         let (kp, _) = keys();
         register(&mut l, &kp, 10);
-        let p = proposer(&l);
         let fee = gas::BUNDLE_BASE + 60;
         let covered_tx = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None);
         l.apply_block(&signed_block(&l, vec![covered_tx.clone()], &a, 1), &StubExecutor).unwrap();
@@ -2603,7 +2602,6 @@ mod payment_tests {
         let mut l = gated(256);
         let (kp, _) = keys();
         register(&mut l, &kp, 10);
-        let p = proposer(&l);
         let covered_tx = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE + 60, 0), Action::None);
         l.apply_block(&signed_block(&l, vec![covered_tx.clone()], &a, 1), &StubExecutor).unwrap();
 
