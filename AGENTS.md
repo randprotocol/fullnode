@@ -209,6 +209,20 @@ set before it; fleets must run the same build (`docs/confidential.md`, "Constrai
   memory-bound interpreter exit proofs), ~43½ min wall from a cold release target on a loaded
   machine — wallet flow 9m37s, cluster 22m44s (18 tests), zkvm e2e 7m25s.
 
+### RAND rename and chain 10 (2026-09-16): the coin is RAND; every SHRUGG/SESH name is gone
+
+Commits `a00c88c` (the rename: crates `randprotocol-core/-zkvm/-rvm/-client/-node` — a crate
+cannot be `rand-core`, that is crates.io's `rand_core` — binaries `rand-node` and `rand`, RPC
+`rand_*`, addresses `rand1…`, hash domains `rand-*`, p2p identity `rand-p2p-identity`, service
+`rand-node`; the two root pins moved) and `a7b69d7` (the pin). **Chain 10** = genesis
+`4d757f11…`, cut without the aggregation section like chain 9; `deploy/nodes.env` regenerated
+(every peer id changed); rolled out with `deploy/cutover-droplet-rand.sh` C, D (the bootstraps)
+first, then E, F, the twelve regional; hostnames are `rand-node-<name>`; old binaries and
+retired chains' data dirs removed from every droplet. 16 droplets + A live; **B (MacBook Air)
+still unreachable — it needs `bin-a00c88c/` and `.update-pin` = `a00c88c`.** The randscan
+explorer got the same rename (randscan `286f399`) and was redeployed to E in the same minute.
+Chain 9 (`dbb7498b…`, build `5f8c6f9`) lived for about an hour between the two.
+
 ### Pre-v0.1 security review (2026-09-16): two findings, both gated behind chain 9 — FIXED the same day
 
 **Fixes merged to `main` (branch `security-fixes-v0.1`):** L1 `151af5b` (`Ledger::close_block`,

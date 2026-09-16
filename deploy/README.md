@@ -230,6 +230,19 @@ On A and B: `./deploy/run-a.sh` / `./deploy/run-b.sh` (they init `data-{a,b}-8c7
 scratch, `deploy/rebuild-vps.sh <ip>` rebuilds on a new commit and restarts. Service name:
 `rand-node`.
 
+### What the chain-10 rollout actually did (2026-09-16, ~50 minutes after chain 9)
+
+`deploy/cutover-droplet-rand.sh`, one droplet at a time: a peer-id pass first (the new binary on
+every droplet, `rand-node address --key`, nothing else touched) to regenerate `deploy/nodes.env`
+and the bootstraps, then **C and D first** — every peer id changed with the rename, so the nodes
+that bootstrap the fleet had to be on their new identities before anyone dialled them — then E,
+F, and the twelve regional validators. The script writes a fresh `rand-node` unit (bootstraps
+included), renames the hostname to `rand-node-<name>`, and retires the `shrugg-node` unit. All
+16 were over in about 12 minutes; heights were climbing at ~1 block/s with 16 peers each by the
+time the last one finished, and A followed from `deploy/run-a.sh`. The explorer on E was
+redeployed with the `rand_*` RPC names (randscan `286f399`) right after E's cut-over: healthy,
+lag 0. Old binaries and every retired chain's data dir were then removed from all droplets.
+
 ### What the chain-9 rollout actually did (2026-09-16)
 
 Order: lon1 alone first (to prove `deploy/cutover-droplet.sh`), then sfo3/tor1/blr1, ams3,
