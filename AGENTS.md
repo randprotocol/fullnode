@@ -209,6 +209,30 @@ set before it; fleets must run the same build (`docs/confidential.md`, "Constrai
   memory-bound interpreter exit proofs), ~43½ min wall from a cold release target on a loaded
   machine — wallet flow 9m37s, cluster 22m44s (18 tests), zkvm e2e 7m25s.
 
+### Pre-v0.1 security review (2026-09-16): two findings, both gated behind chain 9
+
+Tag `v0.1` sits on `0b98580`. A four-reviewer pass over `6f112e3..0b98580` (RPC hardening,
+constraint set 6, M5 `shrugg-rvm`, chain-side aggregation, S2/S3 follow-ups), each candidate
+re-traced by an adversarial verifier. Findings:
+`../security/fullnode-security-review-pre-v0.1-2026-09-16.md` (severity-ordered, "verified
+OK" per crate — read it before re-reporting suspected issues). **Nothing found is reachable
+on chains 5–8 (`aggregation: null`); all three items must be fixed before chain 9 is cut:**
+
+- **H1** subsidy minting is bounded only by node policy: the replica applies every
+  `Aggregate` in a block and `StoreCovered::covered` is seal-blind, so a leader holding an
+  aggregator key re-signs a committed proof under fresh nonces and mints `subsidy(n)` per
+  copy. Fix: one-per-block and unsealed-and-in-window as consensus rules, proof bound to
+  `(aggregator, nonce)`.
+- **M1** sealed-form sync binds a pruned bundle's digest fields and the state root, not its
+  `envelopes` (nor a stateless `Call`); a sync peer can substitute them and the victim
+  persists and re-serves them. Fix: a proof-less tx hash in the pruned record, bound by the
+  aggregate interface or the tx-root leaf.
+- **L1** (liveness, not security) `propose` never runs `sweep_expired_excesses`, which
+  `apply_block_for_sync` runs before the root; the first expired fee bucket halts the chain.
+  Fix: sweep in `propose` (factor the block-end steps into one function).
+
+`shrugg-zkvm` (constraint set 6) and `shrugg-rvm` had no findings.
+
 ### Security review: done, fixes merged
 
 A full review of the four crates against the Draft 3 whitepaper was done on
