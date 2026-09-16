@@ -492,6 +492,15 @@ never move them.
   read it before making that chain faster again.
 - Doctest flakiness ("extern location ... does not exist") means a concurrent
   cargo run raced the cache; rerun.
+- **Short-shielded-address feature, full release suite, 2026-09-17** (chain-11 cut, `short-address`
+  branch, task 10): `RECURSION_FIXTURES=… cargo test --workspace --release -- --skip round_trips
+  --skip two_test_profile` — **0 failed across every one of the ~50 test binaries**, run detached,
+  **~87 min wall time**. The three long poles named in the task brief matched: **wallet flow**
+  3 tests, **760.24 s** (12m40s); **cluster** 20 tests, **3467.25 s** (57m47s, the aggregation
+  capstone included); **zkvm e2e** (`crates/randprotocol-zkvm/tests/e2e.rs`) 24 passed + 6 ignored,
+  **412.20 s** (6m52s). Everything else in the workspace (`randprotocol-core`, `-node`, `-client`,
+  `-rvm`, `-zkvm`'s ~40 other test files, `bridge-codec`, doctests) finished in seconds each. No
+  code changes were needed — the branch's Tasks 1–9 were already green.
 - The whitepaper is `../whitepapers/randprotocol.tex` (Draft 3) — its
   AGENTS.md has the parameter table (FRI 80/8/20, Poseidon2 width 8,
   384-bit soundness-bearing hashes) that this repo's docs should stay

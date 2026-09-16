@@ -1,24 +1,32 @@
-# Testnet: chain id 10 (RAND shielded pool, staking, bridge, zkVM constraint set 6)
+# Testnet: chain id 11 (short shielded addresses, staking, bridge, zkVM constraint set 6)
 
 Test keys only; all seeds are committed on purpose so any machine can pull and run.
 
-> **Chain 10 (cut 2026-09-16) is the RAND chain.** The coin is RAND; every crate, binary, RPC
-> method (`rand_*`), address prefix (`rand1…`), hash domain, the transaction id, the p2p identity
-> (every peer id changed — `deploy/nodes.env` was regenerated) and the systemd service
-> (`rand-node`) carry the new name, so chain 10 is a fresh chain like every rename before it.
-> Same code otherwise as chain 9 (constraint set 6, the pre-v0.1 security fixes, libp2p 0.57),
-> and like chain 9 **cut without the `aggregation` section** (`deploy/cut-chain10-genesis.sh`
-> defaults to `AGGREGATION=off`; the activation values are the user-owned ≥ 64 GB
-> measurements). The chain-9 and chain-8 records are under "History".
+> **Chain 11 (cut 2026-09-17) is the short-shielded-address chain.** An address is now a 54-char
+> receiver id (`rand1…`), not the long shielded address chain 10 used: what a sender needs to pay
+> it — the note key and the 1,184-byte ML-KEM encapsulation key — lives in a signed **receiver
+> record** the id resolves to, either delivered inline with a payment request or filed in the
+> on-chain registry (`rand_getReceiver`, `rand register`). Every payout and every genesis deposit
+> note is now a receiver id backed by a record filed at genesis with `--receiver`; genesis's
+> `receivers` array carries all 23 of them (`deploy/payout/*.record.json`, committed, and
+> `wallets/shielded-*.record.json`, gitignored like the keys). No hash-domain or peer-id change —
+> same RAND naming, same `rand_*` RPC methods, same libp2p identities as chain 10 — so `nodes.env`
+> is untouched, but the genesis format itself changed (a chain-10 node cannot parse a receiver-id
+> payout), which is why this is a fresh chain like every format change before it. Same code
+> otherwise as chain 10 (constraint set 6, the pre-v0.1 security fixes, libp2p 0.57), and like
+> chain 10 **cut without the `aggregation` section** (`deploy/cut-chain11-genesis.sh` defaults to
+> `AGGREGATION=off`; the activation values are the user-owned ≥ 64 GB measurements). The chain-10
+> and chain-9 records are under "History".
 
 | | |
 |---|---|
-| chain id | **10** |
-| genesis hash | **`4d757f11cbbf48daaf2040fbd091d70ca66d5ff6fcb228e8319c9014a99bb7ed`** |
-| genesis file | `deploy/genesis-chain10.json` (cut 2026-09-16; chain 9's stays at `deploy/genesis-chain9.json`) |
-| pinned build | **`a00c88c`** — binaries `rand-node` and `rand` in `bin-a00c88c/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `a00c88c` |
-| zkVM | **constraint set 6** (the public input segment; M4.3 EVM and M4.4 sBPF/sha256 guests ride along) |
+| chain id | **11** |
+| genesis hash | **`79123fa75a2b946e21248e4b77e86444f134d0dc879035af9d4996c55eadeec2`** |
+| genesis file | `deploy/genesis-chain11.json` (cut 2026-09-17; chain 10's stays at `deploy/genesis-chain10.json`) |
+| pinned build | **`CHAIN11BUILD`** — binaries `rand-node` and `rand` in `bin-CHAIN11BUILD/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `CHAIN11BUILD` (filled in by the controller after merge, from the merge commit) |
+| zkVM | **constraint set 6** (the public input segment; M4.3 EVM and M4.4 sBPF/sha256 guests ride along) — unchanged, this feature touches no proof |
 | `hc_bundle` | `4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb` |
+| receivers | **23** filed at genesis: 18 validator payouts + 5 alloc-note owners, each a signed record verified for chain id 11 |
 | validators | **18, every one staked at exactly 1000 RAND** (the staking minimum) |
 | quorum | **13 of 18** (strictly more than two thirds of 18 000 RAND of stake) |
 | epochs | `--epoch-blocks 1000`; `UNBONDING_EPOCHS = 2`, so unbonded stake releases ~2000 blocks later |
@@ -59,24 +67,24 @@ from chain 7's validator order and can only be confirmed on the droplet itself.
 
 | name | where (chain-7 fleet) | validator address | pubkey | payout (`deploy/payout/…`) |
 |---|---|---|---|---|
-| a | laptop, LAN 192.168.100.123 (NAT) | `2nRdFChBXRmKoe2sQE3ZYDzvdg53QmBZJJ9iweY7hk1v` | `15321b04570d7095…` | `rand11qgA3ETvT…uLm4n9` |
-| b | 192.168.100.79 (NAT), MacBook Air, auto-updater | `ByDkxsEfDCR5DrmDufKftvcRsgvufypnZ4SgDQzJAQ7Z` | `4d491d8a5540f005…` | `rand188sGyCRpX…hY5T8k` |
-| c | DigitalOcean fra1 164.90.239.200 | `F6rYLexPhyMmwPNqbEmyyp5FiTmtQqDgZyqScUqYY4F6` | `f3557730c8a76b43…` | `rand14wXebNPJc…rxb3sy` |
-| d | DigitalOcean ric1 165.245.173.74 | `5tMgLSzXL8keU1vg2wtGEXRJkmfBK6GzhjNjxrCFgCaj` | `e95ecd68c5621147…` | `rand13SKXv49EH…thJHN4` |
-| e | DigitalOcean sgp1 188.166.235.187 (RandScan explorer) | `CxeG7vJaxUoKBZZe8U8LGXohH2FvcCbE47AufK6Mp2jf` | `9ffac1e8ff6b687d…` | `rand12nJ3vSqUc…E3YbGt` |
-| f | DigitalOcean nyc3 159.89.185.254 | `DcuuZrzDSJedhFnynLFchNfYmW4UKiZT2nEKbcs2ojmJ` | `b277b8eb8863fca2…` | `rand1CE5oAjb8S…VFDQs2` |
-| lon1 | DigitalOcean lon1 139.59.160.76 | `8UcsaXDSSWcC6fT3CWT89fgUvG4ubaYd61FUQHKiUDLv` | `7edc60fc6e6e35f6…` | `rand12kmqp9BMq…2h77jF` |
-| sfo3 | DigitalOcean sfo3 24.144.89.22 | `9rex7stS6d9QxaAh5nghjaUEratKJFUAmLAoxRFmP7LM` | `5394ea2fc122a869…` | `rand1cjU3K9faj…x2sB7S` |
-| tor1 | DigitalOcean tor1 146.190.243.29 | `CRW3fQsuFa7YSdU5ZDrRMxQjJ4ET9kzf6hg1D8CAhoWH` | `71528cc5c8b11715…` | `rand191phQ9Ffb…YCHDJc` |
-| blr1 | DigitalOcean blr1 167.71.235.108 | `ASzbnFwqVnwsrN81iytkuhNbs8f93Q3h4rQjXPDUNMjU` | `ca6b8bdc43f95a4f…` | `rand1aD55SbVMS…HJjUTs` |
-| syd1 | DigitalOcean syd1 170.64.226.65 | `8cHAjP3wgGDv55Ym2qZrYyu2Mvc7b86jsrN6vWcwZoJV` | `574d78491644c873…` | `rand1CdUmb2fXv…v2YX2p` |
-| atl1 | DigitalOcean atl1 165.245.142.90 | `BV2BfMZJo2Lpo3pR7RfAjytnFxmMhzCWxoUHhXhjT2qL` | `c82e55fd7ff180e0…` | `rand13iwyU6yJM…cJcDx3` |
-| ams3 | DigitalOcean ams3 146.190.233.230 | `6orzEKd3Ds3ZFmp21pidbF19kAe6AczzPCtnMVrKRLeA` | `76bcc53c2370404b…` | `rand16ct7YSQsS…DsRzq9` |
-| nyc1 | DigitalOcean nyc1 192.81.214.91 | `F5RVdAe3Wo2AWHsjKZjFKmGcnTHvJrDpdSHL8gnF4wN1` | `59bd8ed1017f2743…` | `rand15eMjSnZxL…GqYsZj` |
-| nyc2 | DigitalOcean nyc2 107.170.49.234 | `9hU2qrPFxbcZjSse6MJnapYRs4RchALWtJH4RRrbwDGo` | `2c111e425d2fa4d3…` | `rand1AY2hQjQ3X…MHYjq9` |
-| sfo2 | DigitalOcean sfo2 143.110.135.126 | `6NGLfkZcTs3i5LTTbqoYKM9aQCs7ZXygHirTg2AtWhsA` | `c18d93c46e9f8cc5…` | `rand18BY14Pv39…EwrVu6` |
-| mkc1 | DigitalOcean mkc1 201.79.35.212 | `8m5BoX2RA4xTVNfDwKMbWQ3JSChrj69hvJzdSEKMsZDM` | `38c1921b1738182a…` | `rand1qtwxvqK9M…7obifJ` |
-| mem1 | DigitalOcean mem1 168.144.61.10 | `6T5WyBUrYN1noLi3tDKC1Uw5Vf3xabExnWCDdik7VTPV` | `ce48ef3e62463c08…` | `rand15ijmGYjDG…N7co5n` |
+| a | laptop, LAN 192.168.100.123 (NAT) | `2nRdFChBXRmKoe2sQE3ZYDzvdg53QmBZJJ9iweY7hk1v` | `15321b04570d7095…` | `rand12wXbbPp9S…7RdsHX` |
+| b | 192.168.100.79 (NAT), MacBook Air, auto-updater | `ByDkxsEfDCR5DrmDufKftvcRsgvufypnZ4SgDQzJAQ7Z` | `4d491d8a5540f005…` | `rand123m1qRsJC…spYBt2` |
+| c | DigitalOcean fra1 164.90.239.200 | `F6rYLexPhyMmwPNqbEmyyp5FiTmtQqDgZyqScUqYY4F6` | `f3557730c8a76b43…` | `rand12JKxhEJdK…bbBC9D` |
+| d | DigitalOcean ric1 165.245.173.74 | `5tMgLSzXL8keU1vg2wtGEXRJkmfBK6GzhjNjxrCFgCaj` | `e95ecd68c5621147…` | `rand1K6CKerkU7…epmHvS` |
+| e | DigitalOcean sgp1 188.166.235.187 (RandScan explorer) | `CxeG7vJaxUoKBZZe8U8LGXohH2FvcCbE47AufK6Mp2jf` | `9ffac1e8ff6b687d…` | `rand12LtowjJ4a…DvagmG` |
+| f | DigitalOcean nyc3 159.89.185.254 | `DcuuZrzDSJedhFnynLFchNfYmW4UKiZT2nEKbcs2ojmJ` | `b277b8eb8863fca2…` | `rand12NKo9Vzad…JZ67ce` |
+| lon1 | DigitalOcean lon1 139.59.160.76 | `8UcsaXDSSWcC6fT3CWT89fgUvG4ubaYd61FUQHKiUDLv` | `7edc60fc6e6e35f6…` | `rand1psgNofkXu…b9ELgs` |
+| sfo3 | DigitalOcean sfo3 24.144.89.22 | `9rex7stS6d9QxaAh5nghjaUEratKJFUAmLAoxRFmP7LM` | `5394ea2fc122a869…` | `rand1c4QGogGoQ…9JWq6o` |
+| tor1 | DigitalOcean tor1 146.190.243.29 | `CRW3fQsuFa7YSdU5ZDrRMxQjJ4ET9kzf6hg1D8CAhoWH` | `71528cc5c8b11715…` | `rand12Nqq4qRnA…z8eRU8` |
+| blr1 | DigitalOcean blr1 167.71.235.108 | `ASzbnFwqVnwsrN81iytkuhNbs8f93Q3h4rQjXPDUNMjU` | `ca6b8bdc43f95a4f…` | `rand1EgAGA6jvA…PovHe2` |
+| syd1 | DigitalOcean syd1 170.64.226.65 | `8cHAjP3wgGDv55Ym2qZrYyu2Mvc7b86jsrN6vWcwZoJV` | `574d78491644c873…` | `rand127uhVMLgw…fZc1iT` |
+| atl1 | DigitalOcean atl1 165.245.142.90 | `BV2BfMZJo2Lpo3pR7RfAjytnFxmMhzCWxoUHhXhjT2qL` | `c82e55fd7ff180e0…` | `rand12DXh5myrS…zza1UL` |
+| ams3 | DigitalOcean ams3 146.190.233.230 | `6orzEKd3Ds3ZFmp21pidbF19kAe6AczzPCtnMVrKRLeA` | `76bcc53c2370404b…` | `rand12KMhq8TQf…V4sthx` |
+| nyc1 | DigitalOcean nyc1 192.81.214.91 | `F5RVdAe3Wo2AWHsjKZjFKmGcnTHvJrDpdSHL8gnF4wN1` | `59bd8ed1017f2743…` | `rand1PzJWMbbmr…R8tBxd` |
+| nyc2 | DigitalOcean nyc2 107.170.49.234 | `9hU2qrPFxbcZjSse6MJnapYRs4RchALWtJH4RRrbwDGo` | `2c111e425d2fa4d3…` | `rand1299VKZVdp…t47CTv` |
+| sfo2 | DigitalOcean sfo2 143.110.135.126 | `6NGLfkZcTs3i5LTTbqoYKM9aQCs7ZXygHirTg2AtWhsA` | `c18d93c46e9f8cc5…` | `rand1j9HvRGKyh…rRDbgB` |
+| mkc1 | DigitalOcean mkc1 201.79.35.212 | `8m5BoX2RA4xTVNfDwKMbWQ3JSChrj69hvJzdSEKMsZDM` | `38c1921b1738182a…` | `rand12sQ9J2wkd…D8jXFH` |
+| mem1 | DigitalOcean mem1 168.144.61.10 | `6T5WyBUrYN1noLi3tDKC1Uw5Vf3xabExnWCDdik7VTPV` | `ce48ef3e62463c08…` | `rand12ZnGtMMx6…TS36wS` |
 
 The rows are in genesis order (which is chain 7's validator order). C, D, E and the rest of the
 droplets have public IPs and act as bootstrap nodes; A and B are behind NAT and dial out
@@ -85,17 +93,18 @@ droplets have public IPs and act as bootstrap nodes; A and B are behind NAT and 
 ## The five genesis notes
 
 A shielded chain has no per-validator allocation: value exists only as a note someone holds the
-spend key for, so `--alloc` takes a shielded address and creates one deposit note. As on chain 7,
-1000 RAND goes to each of the five wallets in `wallets/` (gitignored — those keys live on the
-machine that cut this genesis and nowhere else):
+spend key for, so `--alloc` takes a receiver id and creates one deposit note owned by whatever
+record that id resolves to (`--receiver`). As on chain 7, 1000 RAND goes to each of the five
+wallets in `wallets/` (gitignored — those keys and their `.record.json` files live on the machine
+that cut this genesis and nowhere else):
 
 | wallet | address | amount |
 |---|---|---|
-| `wallets/shielded-1.key.json` | `rand14mvBw1njfEY…BcuX6X` | 1000 RAND |
-| `wallets/shielded-2.key.json` | `rand17twtYjPKv2J…6nQRjq` | 1000 RAND |
-| `wallets/shielded-3.key.json` | `rand18NRCt4GE9qu…AxGBHY` | 1000 RAND |
-| `wallets/shielded-4.key.json` | `rand1BFkPNgb7vZq…xS8jqF` | 1000 RAND |
-| `wallets/shielded-5.key.json` | `rand1DoRgCizWrqB…DhyMfb` | 1000 RAND |
+| `wallets/shielded-1.key.json` | `rand12re6vUGb3MM…rQk1Ck` | 1000 RAND |
+| `wallets/shielded-2.key.json` | `rand1boQSaTUEzfr…BVPiKx` | 1000 RAND |
+| `wallets/shielded-3.key.json` | `rand1W7pknfb5F2K…ypKKV3` | 1000 RAND |
+| `wallets/shielded-4.key.json` | `rand1uKceMv12dvy…UPdhGV` | 1000 RAND |
+| `wallets/shielded-5.key.json` | `rand1DxMwWQrZjap…w3vBUe` | 1000 RAND |
 
 ## No bridge section, and why it stays that way
 
@@ -143,27 +152,55 @@ deterministic `r` would let anyone confirm a guess at a genesis note's owner and
 recomputing the commitment. Cut once, distribute `deploy/genesis-chain8.json` byte-identically,
 keep it.
 
+## The receiver records (new in chain 11)
+
+Every payout and every alloc-note owner is now a receiver id, and an id alone proves nothing —
+genesis needs the *record* that id resolves to: the note key `pk` and the 1,184-byte ML-KEM
+encapsulation key, signed by the wallet over `(chain id, version, pk, kem_ek)`
+(`ReceiverRecord::sign`/`verify`). `rand-node genesis --receiver <RECORD.JSON>` files each one
+into `Genesis::receivers` before any `--validator` payout or `--alloc` owner is resolved against
+it, and `Genesis::build` refuses the file outright if a record's signature does not verify for
+*this* genesis's chain id — a record signed for chain 10 (or any other chain) cannot be replayed
+into chain 11's genesis.
+
+Each record was produced once, on this machine, with `rand address --record --key <wallet>` —
+the `--rpc` node it asked answered chain id 11 — and the JSON that command prints is exactly the
+file `--receiver` reads (`ReceiverRecordHex`, either bare or wrapped under a `"record"` key):
+
+- **The 18 payout records are committed**, at `deploy/payout/<name>.record.json` — public data (a
+  public signing key, a public KEM key, a signature), the same convention as the payout key files
+  themselves.
+- **The 5 alloc records are gitignored**, at `wallets/shielded-<i>.record.json`, next to the key
+  files they were derived from — `wallets/` is already excluded.
+
 ## Cut-over checklist, per node
 
-Nothing about chain 7 is reusable — different chain id, incompatible proofs — so this is a clean
-start on every machine. Keep chain 7's data directory around if you want to keep serving it; the
-new `DATA` name is keyed on the genesis hash, so the two never collide.
+Nothing about chain 10 is reusable — different chain id, a genesis format a chain-10 node cannot
+parse — so this is a clean start on every machine. Keep chain 10's data directory around if you
+want to keep serving it; the new `DATA` name is keyed on the genesis hash, so the two never
+collide.
 
-1. **Binary**: `bin-a00c88c/rand-node` and `bin-a00c88c/rand` (or `cargo build --release` at
-   commit `a00c88c`; the Linux ones are built once on E and fanned out by `deploy/cutover-droplet-rand.sh`). Every node on the fleet must run this one build — a constraint-set change is a
-   fork, and a mixed fleet stalls.
-2. **Genesis**: `deploy/genesis-chain10.json`, byte-identical everywhere. `rand-node init` prints
-   the hash; it must read `4d757f11cbbf48daaf2040fbd091d70ca66d5ff6fcb228e8319c9014a99bb7ed`.
-3. **Fresh data dir**: `data-<letter>-4d757f11` (never reuse a chain-9 directory).
-4. **`.update-pin`** on the MacBook Air (node B, auto-updater): set its content to **`a00c88c`**, or
-   the updater drags B back onto the chain-9 build and B drops out of the set.
-5. **Start**, and check `rand-node status`: `height` climbing, `chain id 10`,
+1. **Binary**: `bin-CHAIN11BUILD/rand-node` and `bin-CHAIN11BUILD/rand` (or `cargo build --release`
+   at the chain-11 merge commit; the Linux ones are built once on E and fanned out by
+   `deploy/cutover-droplet-rand.sh`). Every node on the fleet must run this one build — a genesis
+   format change is a fork, and a mixed fleet stalls.
+2. **Genesis**: `deploy/genesis-chain11.json`, byte-identical everywhere. `rand-node init` prints
+   the hash; it must read `79123fa75a2b946e21248e4b77e86444f134d0dc879035af9d4996c55eadeec2`, and
+   the file's `receivers` array must have 23 entries.
+3. **Fresh data dir**: `data-<letter>-79123fa7` (never reuse a chain-10 directory).
+4. **`.update-pin`** on the MacBook Air (node B, auto-updater): set its content to
+   **`CHAIN11BUILD`**, or the updater drags B back onto the chain-10 build and B drops out of the
+   set.
+5. **Start**, and check `rand-node status`: `height` climbing, `chain id 11`,
    `hc_bundle 4a27356f…`, `active_validator: true`, `notes: 5` at genesis,
-   `tree_root 1ff293744074aa828b7a63cc26e5591d6f04173606a3b5048981649bbe2b35da` at height 0.
+   `tree_root f5b40b3ad78200448937c306e0a55edd37a56602428f79a1ce66f948c1c9f80b` at height 0.
 6. **Quorum**: nothing commits until 13 of the 18 are up. Bring the droplets up before declaring a
    stall.
-7. **Explorer** on E re-indexes itself on a chain id change; RandScan's chain 7 index can be dropped
-   once nobody is asking for it.
+7. **Explorer** on E re-indexes itself on a chain id change; RandScan's chain 10 index can be
+   dropped once nobody is asking for it.
+8. **Per droplet**, same service and peer ids as chain 10 —
+   `deploy/cutover-droplet.sh <ip> 4d757f11 79123fa7 deploy/genesis-chain11.json` (old prefix,
+   new prefix, then the genesis file; peer ids do not change, so this is the whole cut-over).
 
 ```bash
 rand-node init --datadir data-c-8c742fc9 --genesis deploy/genesis-chain8.json
@@ -326,3 +363,13 @@ and call envelopes with 18 validators at 100 000 RAND each, genesis
 where it stopped when the fleet moved to chain 8 on 2026-09-13. Its genesis file is kept here as
 `deploy/genesis-chain7.json` and every node still has its `data-*-55668ebf` directory, but build
 `03c9fb9` cannot open one — replaying chain 7 needs a `01dc23d` binary.
+
+**Chain 10** (cut and rolled out 2026-09-16, build `a00c88c`) was the RAND rename: every crate,
+binary, RPC method (`rand_*`), address prefix (`rand1…`), hash domain, transaction id and p2p
+identity carried the new name over chain 9's constraint-set-6, cut-without-aggregation genesis,
+18 validators at 1000 RAND each, genesis
+`4d757f11cbbf48daaf2040fbd091d70ca66d5ff6fcb228e8319c9014a99bb7ed`. All 16 droplets plus A were
+over in about 12 minutes ("What the chain-10 rollout actually did", above), and it ran until the
+fleet moved to chain 11 for the short-shielded-address feature. Its genesis file is kept here as
+`deploy/genesis-chain10.json`; a chain-11 node cannot open a chain-10 data dir (the genesis format
+changed: payouts and alloc owners are receiver ids now, not bare addresses).
