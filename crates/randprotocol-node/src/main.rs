@@ -930,7 +930,11 @@ mod tests {
         // validator leaf is `rand-validator-leaf-2` over the v2 entry (a length-prefixed
         // unbonding queue, the payout address, the nonce), and this genesis's stakes are the
         // staking minimum, which genesis now requires.
-        assert_eq!(state.hash().to_hex(), "fb5881c8d5bb5dcf634a1f036caa4cbfb49d0f3407f0d87419fbfa57686ceb4a");
+        //
+        // Moved again from fb5881c8… (short shielded addresses, task 3): the genesis block
+        // header's hash covers `state_root`, and every chain's state root now hashes under
+        // `rand-state-4` with an (empty) `receivers_root` appended, gate or no gate.
+        assert_eq!(state.hash().to_hex(), "722b3b238aef94ec523b119839fd4eb94328ef35de0a1ef3956474c47f68fce1");
         // The envelope is resealed on every call and must not move the hash: only the
         // commitment and the amount are bound.
         let again = pinned_genesis().build(&ex).unwrap();
