@@ -14,8 +14,19 @@ use randprotocol_core::notes::{BundleDigestInput, Envelope, ShieldedAddress, Wor
 /// The address a party publishes: its note-owner field `pk` plus the ML-KEM-768 encapsulation
 /// key envelopes are sealed to. Both are derived from the viewing key alone — holding it is
 /// enough to compute the address, and never enough to spend (`notes::SpendKey`).
+///
+/// This is the KEM key version 0 address, i.e. what a wallet that has never rotated publishes.
+/// [`address_of_at`] is the same thing at a later version.
 pub fn address_of(vk: &ViewingKey) -> ShieldedAddress {
-    let a = vk.address();
+    address_of_at(vk, 0)
+}
+
+/// The address under KEM key version `version` (spec §7's rotation): `pk` is the same at every
+/// version — it does not depend on the KEM key at all — and only `kem_ek` moves. A wallet that
+/// has rotated publishes this at its current version and keeps opening envelopes sealed to every
+/// earlier one (`viewing::Envelope::open_as_receiver_at`).
+pub fn address_of_at(vk: &ViewingKey, version: u32) -> ShieldedAddress {
+    let a = vk.address_at(version);
     ShieldedAddress { pk: a.pk, kem_ek: a.kem_ek }
 }
 
@@ -91,6 +102,13 @@ mod tests {
         assert!(to_research(&short).unwrap_err().contains("7 bytes"));
         // Short-shielded-address task 5 removed `ShieldedAddress`'s text form: a wallet hands out
         // a receiver id now, not this struct's ~1.2 KB text, so there is no round trip to pin here.
+
+        // A rotation moves `kem_ek` and nothing else: the note owner is the same key at every
+        // version, so a rotated wallet keeps every note it has ever owned.
+        let rotated = address_of_at(&vk, 1);
+        assert_eq!(rotated.pk, a.pk, "pk never moves with the KEM version");
+        assert_ne!(rotated.kem_ek, a.kem_ek, "the encapsulation key does");
+        assert_eq!(address_of_at(&vk, 0), a, "version 0 is what `address_of` publishes");
 
         let note = Note::new(vk.pk(), vk.pk(), 7, 0, 3);
         let key = TxKey::random();

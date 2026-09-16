@@ -10,7 +10,12 @@
 //! register's stake is where it turns up instead); and a call's private inputs come back off the
 //! chain under A's viewing key alone, checked against the `H_IN` its proof published (spec §6.1).
 //!
-//! Six bundle proofs and one call proof, so this is the slowest test in the workspace by a wide
+//! The last stage is the short address (spec §4, §6.3, §7): wallet C, which the chain has never
+//! heard of, is paid from a payment request that carries its own signed record, registered on
+//! the bundle that pays it, rotated to a fresh ML-KEM key, and paid again — and both notes open,
+//! because a rotation that stopped opening the first would have burned it.
+//!
+//! Eight bundle proofs and one call proof, so this is the slowest test in the workspace by a wide
 //! margin — minutes, not seconds. The bridge commands are not here: they need a chain with a
 //! guardian set, which the node's cluster tests configure.
 //!
@@ -27,6 +32,7 @@
 //! `cargo test` against the same target directory — is ever in flight beside it. The slow blocks
 //! are what covers a slow machine; the slot is what covers a busy one.
 
+use randprotocol_client::receiver;
 use randprotocol_client::wallet::{self, Burn, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
 use randprotocol_core::genesis::{Genesis, GenesisValidator};
@@ -119,18 +125,18 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     let b = Wallet::from_spend_key(SpendKey([2; 8]));
     let mut a_store = NoteStore::default();
     let mut b_store = NoteStore::default();
-    assert_ne!(a.address, b.address, "two spend keys, two addresses");
+    assert_ne!(a.current_address(), b.current_address(), "two spend keys, two addresses");
+    assert_ne!(a.id, b.id, "and two short addresses");
 
     // ---- mint: a validator pays 100 RAND into a note only A can open ----
-    // Short-shielded-address task 5: `rand_mint` takes a receiver id now, not A's long address,
-    // and the node always refuses one until Task 6 wires resolution through — so this id need not
-    // be A's own (this wallet has none yet either); it only has to be well-formed.
+    // First contact (spec §6.3): A has never been on chain, so the mint carries the record A
+    // signed itself as `rand_mint`'s third parameter — a fresh wallet is fundable before it is
+    // registered, and the node verifies the record under the id rather than looking it up.
     let mint = 100 * UNITS_PER_RAND;
-    let mint_to = randprotocol_core::receiver::ReceiverId::from(
-        randprotocol_core::receiver::receiver_signing_keypair(&[1; 32]).public_key(),
-    )
-    .to_string();
-    let hash = rpc.mint_shielded(&mint_to, Some(mint)).await.expect("mint accepted");
+    let hash = rpc
+        .mint_shielded_with_record(&a.id.to_string(), Some(mint), Some(&a.record(CHAIN_ID)))
+        .await
+        .expect("mint accepted");
     rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
 
     wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
@@ -148,7 +154,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     // read and released after the commit, so no other test's proof shares these cores (see
     // `proving_slot`).
     let slot = proving_slot().await;
-    let first = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let first = wallet::send(&rpc, &a, &mut a_store, &b.current_address(), pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -174,7 +180,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
 
     // ---- the change note is spendable ----
     let slot = proving_slot().await;
-    let second = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let second = wallet::send(&rpc, &a, &mut a_store, &b.current_address(), pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the change note pays a second bundle");
     drop(slot);
@@ -269,6 +275,99 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     assert!(call_envelope::open_call_as_sender(&e, &h_in, &b.vk).is_none(), "a transcript is not public");
     assert!(call_envelope::open_call_as_auditor(&e, &h_in, &b.vk).is_none(), "and this call named no auditor");
 
+    // ---- the short address: a payment request, a sender-paid registration, a rotation ----
+    //
+    // C is a wallet the chain has never heard of: no notes, no registry entry, no way for anyone
+    // to look it up. It is paid anyway, because a payment request carries the record itself
+    // (spec §4) — and A's payment registers C on the same bundle it pays with (§6.3), so C is
+    // resolvable from its address alone afterwards without ever having spent anything.
+    let mut c = Wallet::from_spend_key(SpendKey([4; 8]));
+    let mut c_store = NoteStore::default();
+    // Before any of that: an address with nothing behind it resolves to nothing, in the words
+    // the spec fixes (§4). No proof has been paid for at this point, which is the point.
+    let unresolved = receiver::resolve(&c.id, CHAIN_ID, None, None).await.unwrap_err().to_string();
+    assert_eq!(
+        unresolved,
+        format!("no receiver record for {}: ask the receiver for a payment request, or for them to register", c.id)
+    );
+    assert!(rpc.receiver(&c.id).await.unwrap().is_none(), "and the chain has never heard of C");
+
+    // C hands out a request; A parses it, verifies it against the address, and seals to what it
+    // carries. Nothing in this exchange touched a node or an explorer.
+    let request = receiver::PaymentRequest {
+        id: c.id,
+        record: c.record(CHAIN_ID),
+        amount: Some(pay),
+        memo: Some("first contact".into()),
+    };
+    let parsed = receiver::PaymentRequest::parse(&request.to_uri()).expect("the URI round-trips");
+    assert_eq!(parsed, request);
+    let to_c = receiver::resolve_from_request(&parsed, CHAIN_ID).expect("the record C signed verifies");
+    assert_eq!(to_c.pk, c.vk.pk());
+    assert_eq!(to_c.kem_ek, c.current_address().kem_ek, "version 1 of the record is KEM key version 0");
+
+    let fee = gas::BUNDLE_BASE;
+    let slot = proving_slot().await;
+    let paid = wallet::submit(
+        &rpc,
+        &a,
+        &mut a_store,
+        Some((&to_c, pay)),
+        Action::RegisterReceiver { record: parsed.record.clone() },
+        fee,
+        Burn::None,
+        FriProfile::Test,
+        Backend::Cpu,
+        CHAIN_ID,
+        true,
+    )
+    .await
+    .expect("a payment that also registers its receiver commits");
+    drop(slot);
+    eprintln!("sender-paid registration: tier {}, proved in {:.1?}", paid.tier, paid.proving);
+    let registered = rpc.receiver(&c.id).await.unwrap().expect("the sender's payment registered C");
+    assert_eq!(registered.version, 1, "a first registration is version 1");
+    registered.verify(&c.id, CHAIN_ID).expect("what the chain serves verifies under the id");
+    assert_eq!(registered.pk, c.vk.pk());
+    wallet::scan(&rpc, &c, &mut c_store).await.unwrap();
+    assert_eq!(c_store.balance(), pay, "C was paid without ever having been on chain");
+
+    // ---- rotation: a new KEM key, and every earlier note still opens ----
+    // C rotates and hands out a fresh request. The chain's registry still holds version 1 — a
+    // rotation is only on chain once it is published — so the *request* is what tells A about
+    // the new key, exactly as it told it about the first one.
+    assert_eq!(c.rotate(), 1, "KEM key version 1, i.e. record version 2");
+    let rotated = c.record(CHAIN_ID);
+    assert_eq!(rotated.version, 2);
+    assert_ne!(rotated.kem_ek, registered.kem_ek, "a rotation moves the encapsulation key");
+    assert_eq!(rotated.pk, registered.pk, "and never the note owner");
+    assert_eq!(rpc.receiver(&c.id).await.unwrap().map(|r| r.version), Some(1), "unpublished, so still version 1");
+    let to_c2 = receiver::resolve_from_request(
+        &receiver::PaymentRequest::parse(
+            &receiver::PaymentRequest { id: c.id, record: rotated, amount: None, memo: None }.to_uri(),
+        )
+        .unwrap(),
+        CHAIN_ID,
+    )
+    .expect("the rotated record verifies under the same address");
+    assert_ne!(to_c2.kem_ek, to_c.kem_ek);
+
+    let slot = proving_slot().await;
+    let second_pay = wallet::send(&rpc, &a, &mut a_store, &to_c2, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the payment to the rotated address commits");
+    drop(slot);
+    eprintln!("payment after rotation: tier {}, proved in {:.1?}", second_pay.tier, second_pay.proving);
+
+    // Both notes open: the first was sealed to the KEM key C has rotated away from, and a
+    // rotation that stopped opening it would have burned it (spec §7, ruling 1).
+    c_store = NoteStore::default();
+    wallet::scan(&rpc, &c, &mut c_store).await.unwrap();
+    assert_eq!(c_store.balance(), 2 * pay, "both payments, across the rotation");
+    assert_eq!(c_store.spendable().len(), 2);
+    // And the address never moved: one identity, two KEM keys.
+    assert_eq!(c.id, Wallet::from_spend_key(SpendKey([4; 8])).id);
+
     eprintln!("whole flow in {:.1?}", started.elapsed());
     handle.shutdown().await;
 }
@@ -292,7 +391,7 @@ fn a_wallet_that_cannot_pay_says_so_without_proving() {
     let a = Wallet::from_spend_key(SpendKey([3; 8]));
     let store = NoteStore::default();
     assert_eq!(store.balance(), 0);
-    assert_eq!(a.address.pk, a.vk.pk());
+    assert_eq!(a.current_address().pk, a.vk.pk());
     let err = wallet::select_inputs(&store.spendable(), 1).unwrap_err();
     assert_eq!(err, wallet::SelectError::Insufficient { have: 0 });
 }

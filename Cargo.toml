@@ -45,7 +45,10 @@ libp2p = { version = "0.57", features = ["tokio", "tcp", "noise", "yamux", "goss
 cbor4ii = { version = "0.3.2", features = ["serde1", "use_std"] }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# `rustls-tls` is there for one caller: the wallet's receiver-registry lookup, whose default is
+# the explorer over https (`randprotocol_client::receiver::DEFAULT_REGISTRY`). rustls rather than
+# the platform's TLS because libp2p already builds it, so this adds a feature and not a stack.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # storage
 rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }

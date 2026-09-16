@@ -134,16 +134,13 @@ fn receiver_id(seed: u8) -> randprotocol_core::receiver::ReceiverId {
 /// wallet it funds. A payment to [`wallet_receiver_id`] therefore seals to a note that wallet's
 /// own viewing key opens — unlike [`receiver_id`], which names nobody.
 fn wallet_receiver_record(w: &Wallet, chain_id: u64) -> randprotocol_core::receiver::ReceiverRecord {
-    let seed = randprotocol_core::notes::word8_to_bytes(&w.sk.0);
-    let kp = randprotocol_core::receiver::receiver_signing_keypair(&seed);
-    randprotocol_core::receiver::ReceiverRecord::sign(&kp, chain_id, 1, w.address.pk, w.address.kem_ek.clone())
+    w.record(chain_id)
 }
 
 /// The id [`wallet_receiver_record`] registers under — pure, like [`receiver_id`], so it can be
 /// named before any genesis exists.
 fn wallet_receiver_id(w: &Wallet) -> randprotocol_core::receiver::ReceiverId {
-    let seed = randprotocol_core::notes::word8_to_bytes(&w.sk.0);
-    randprotocol_core::receiver::ReceiverId::from(randprotocol_core::receiver::receiver_signing_keypair(&seed).public_key())
+    w.id
 }
 
 /// The receiver id a mint pays, as its `rand1…` text.
@@ -190,7 +187,7 @@ fn genesis(validators: &[Keypair]) -> Genesis {
 fn genesis_staking(validators: &[Keypair], funded: &[(&Wallet, u64)]) -> Genesis {
     let mut gen = genesis_funding(validators, &[]);
     gen.epoch_blocks = EPOCH;
-    gen.alloc = funded.iter().map(|(w, amount)| alloc_note(&w.address, *amount)).collect();
+    gen.alloc = funded.iter().map(|(w, amount)| alloc_note(&w.current_address(), *amount)).collect();
     gen
 }
 
@@ -226,7 +223,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
                 payout: receiver_record(i).id().to_string(),
             })
             .collect(),
-        alloc: funded.iter().map(|w| alloc_note(&w.address, ALLOC)).collect(),
+        alloc: funded.iter().map(|w| alloc_note(&w.current_address(), ALLOC)).collect(),
         // Every id this genesis pays: each validator's payout, and — short-shielded-address
         // task 6 — every funded wallet's own receiver id, so a payment addressed to it (a bridge
         // deposit, here) resolves to a note that wallet can actually open. `wallet_receiver_id`,
@@ -860,7 +857,7 @@ async fn two_validators_commit_and_shielded_transfer() {
     let pay = UNITS_PER_RAND;
     let mut store = NoteStore::default();
     let slot = proving_slot().await;
-    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.current_address(), pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -995,7 +992,7 @@ async fn a_node_that_was_down_syncs_past_a_block_carrying_a_real_proof() {
     let pay = UNITS_PER_RAND;
     let mut store = NoteStore::default();
     let slot = proving_slot().await;
-    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.current_address(), pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -1055,7 +1052,7 @@ async fn two_bundles_spending_one_note_only_one_commits() {
             let (a, b) = (wallet(5), wallet(6));
             let mut store = NoteStore::default();
             let out =
-                wallet::send(&rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, false)
+                wallet::send(&rpc, &a, &mut store, &b.current_address(), pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, false)
                     .await;
             out.map(|s| (s.hash, s.amount))
         })
@@ -1292,11 +1289,7 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
 
     // ---- the receiver record: the registry, not the register, owns the note key
     // (short-shielded-address task 4), so the payout wallet registers its record first.
-    let payout_record = {
-        let seed = randprotocol_core::notes::word8_to_bytes(&payout.sk.0);
-        let kp = randprotocol_core::receiver::receiver_signing_keypair(&seed);
-        randprotocol_core::receiver::ReceiverRecord::sign(&kp, CHAIN_ID, 1, payout.address.pk, payout.address.kem_ek.clone())
-    };
+    let payout_record = wallet_receiver_record(&payout, CHAIN_ID);
     let payout_id = payout_record.id();
     let mut store = NoteStore::default();
     let register_receiver_action = Action::RegisterReceiver { record: payout_record };
@@ -1412,11 +1405,7 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     let mut gen = genesis_staking(&ks, &[]);
     // The registry, not the register, owns the note key (short-shielded-address task 4): D's
     // payout is this wallet's record, registered in the genesis file alongside the others.
-    let payout_record = {
-        let seed = randprotocol_core::notes::word8_to_bytes(&payout.sk.0);
-        let kp = randprotocol_core::receiver::receiver_signing_keypair(&seed);
-        randprotocol_core::receiver::ReceiverRecord::sign(&kp, CHAIN_ID, 1, payout.address.pk, payout.address.kem_ek.clone())
-    };
+    let payout_record = wallet_receiver_record(&payout, CHAIN_ID);
     gen.validators[3].payout = payout_record.id().to_string();
     gen.receivers.push(randprotocol_core::genesis::ReceiverRecordHex::from_record(&payout_record));
     let d = ks[3].address();
@@ -1473,8 +1462,8 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     // and the action's public fields, so the note it appends is this one or the withdraw is
     // refused.
     let time = n0.height() as u32;
-    let note = Note::new(payout.address.pk, [0; 8], MIN_STAKE - base, 0, time);
-    let envelope = randprotocol_zkvm::address::seal_note(&SpendKey::random().viewing_key(), &payout.address, &note, &TxKey::random())
+    let note = Note::new(payout.current_address().pk, [0; 8], MIN_STAKE - base, 0, time);
+    let envelope = randprotocol_zkvm::address::seal_note(&SpendKey::random().viewing_key(), &payout.current_address(), &note, &TxKey::random())
         .expect("sealing the payout note");
     let signature = ks[3].sign(withdraw_message(CHAIN_ID, &d, MIN_STAKE, nonce, time, &note.r, &envelope).as_bytes());
     let withdraw = signed_tx(Action::Withdraw {
@@ -1509,7 +1498,7 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     let pay = UNITS_PER_RAND;
     let slot = proving_slot().await;
     let sent =
-        wallet::send(&n0.rpc, &payout, &mut store, &payee.address, pay, base, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::send(&n0.rpc, &payout, &mut store, &payee.current_address(), pay, base, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
             .await
             .expect("the withdrawn note pays a real bundle");
     drop(slot);
@@ -1652,7 +1641,7 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     let attested = attestation(&recipient_id, deposit as u128);
     let mut relayer_store = NoteStore::default();
     let (minted, index, cm) =
-        bridge_mint(&n0, &relayer, &mut relayer_store, &recipient.address, recipient_id, attested.clone()).await;
+        bridge_mint(&n0, &relayer, &mut relayer_store, &recipient.current_address(), recipient_id, attested.clone()).await;
     assert_eq!(index, 1, "a first sighting takes FIRST_ASSET_INDEX");
     eprintln!("bridge-mint: tier {}, proved in {:.1?}, {} proof bytes", minted.tier, minted.proving, minted.proof_bytes);
 
@@ -1787,7 +1776,7 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
         randprotocol_zkvm::executor::prove_call(FriProfile::Test, &program, &inputs, None, Backend::Cpu)
             .expect("the call proves");
     let h_in = hash::input_digest(salt, &inputs);
-    let (sealed, key) = call_envelope::seal_call_envelope(&caller.vk, Some(&auditor.address), &h_in, salt, &inputs)
+    let (sealed, key) = call_envelope::seal_call_envelope(&caller.vk, Some(&auditor.current_address()), &h_in, salt, &inputs)
         .expect("sealing the transcript");
     let called = wallet::submit(
         &n0.rpc,
