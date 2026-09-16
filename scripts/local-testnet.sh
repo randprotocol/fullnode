@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Launch a 2-validator SHRUGG testnet on this machine (ports 30301/30302, RPC 8545/8546).
+# Launch a 2-validator RAND testnet on this machine (ports 30301/30302, RPC 8545/8546).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo build --release
-BIN=target/release/shrugg-node
+BIN=target/release/rand-node
 mkdir -p testnet
 [ -f testnet/node1.key.json ] || $BIN keygen --out testnet/node1.key.json
 [ -f testnet/node2.key.json ] || $BIN keygen --out testnet/node2.key.json
 # Phase S2: every validator needs a payout address in genesis (rewards and unbonded stake are
 # paid there as notes), so the wallet makes one key both validators are paid at.
-WALLET=target/release/shrugg
+WALLET=target/release/rand
 [ -f testnet/payout.key.json ] || $WALLET --key testnet/payout.key.json keygen
 PAYOUT=$($WALLET --key testnet/payout.key.json address | tail -1)
 [ -f testnet/genesis.json ] || $BIN genesis --chain-id 1 \

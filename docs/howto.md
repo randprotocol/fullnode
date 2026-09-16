@@ -1,4 +1,4 @@
-# How things work on SHRUGG, in five questions
+# How things work on RAND, in five questions
 
 Short, end-to-end answers for someone arriving at the shielded chain with a wallet and a
 program. Each one points at the page with the detail. Written 2026-09-12 against phase S1 with
@@ -12,18 +12,18 @@ The chain cannot answer this for anyone. You need:
   in its key file), and
 - a node to scan against.
 
-`shrugg balance` walks `shrugg_getCommitments` from the wallet's last index, trial-decrypts every
+`rand balance` walks `rand_getCommitments` from the wallet's last index, trial-decrypts every
 envelope with `nk` (receiver path) and the outgoing key `ovk` (sender path), keeps the notes
 whose owner field is `pk = H_PK(nk)`, marks the ones whose nullifier `H_NF(nk, cm)` appears in
-`shrugg_getNullifiers`, and sums the rest. Anyone else, an explorer included, sees commitments
+`rand_getNullifiers`, and sums the rest. Anyone else, an explorer included, sees commitments
 and ciphertexts only. Hand a party the viewing key and they can run the same scan and see
 everything the address ever received or sent; hand them a per-transaction `TxKey` and they see
 one transaction; hand them nothing and they see nothing. `docs/shielded.md` §2–3.
 
 ## 2. How do I deploy a program?
 
-Build the RV32IM words — `shrugg program build <guest>` for a hand-assembled guest, or a
-compiled `.bin` from `guest-sdk` and `llvm-objcopy` — then `shrugg program deploy <file>`. The
+Build the RV32IM words — `rand program build <guest>` for a hand-assembled guest, or a
+compiled `.bin` from `guest-sdk` and `llvm-objcopy` — then `rand program deploy <file>`. The
 wallet builds a bundle from its own notes that pays the deploy floor, attaches
 `Action::Deploy { base_pc, words }`, proves the bundle and submits it. The node checks every
 word decodes, computes the in-circuit digest `hc`, and stores the record under the
@@ -35,7 +35,7 @@ interpreter guest is deployed once and the contract's bytecode is a private inpu
 
 ## 3. How does a transfer work?
 
-`shrugg send <shrugg1…> 1.5`:
+`rand send <rand1…> 1.5`:
 
 1. scan (as in question 1) and pick the largest one or two unspent notes covering
    amount + fee; if only one is needed, the second input is a dummy (amount 0, owned by
@@ -55,15 +55,15 @@ commitments and two ciphertexts. `docs/shielded.md` §4–5.
 
 ## 4. How do I check that a program is deployed?
 
-`shrugg program show <id>` calls `shrugg_getProgram(id)`: the id, `code_hash` (the in-circuit
+`rand program show <id>` calls `rand_getProgram(id)`: the id, `code_hash` (the in-circuit
 `hc` that calls are verified against), `base_pc`, the word count and `deployed_at`;
-`shrugg_getProgramCode` returns the words. `shrugg tx <hash>` shows the deploying transaction
+`rand_getProgramCode` returns the words. `rand tx <hash>` shows the deploying transaction
 with `action: { kind: "deploy", program, words }`. An unknown id answers `null`, and a `Call`
 naming it is rejected as `UnknownProgram`. `docs/rpc.md`.
 
 ## 5. What is the gas calculation?
 
-There is none. Fees are flat floors (`BUNDLE_BASE` = 0.001 SHRUGG per bundle, plus a per-word
+There is none. Fees are flat floors (`BUNDLE_BASE` = 0.001 RAND per bundle, plus a per-word
 deploy fee or a small per-tier call fee) because a node's cost is one STARK verification of
 nearly constant cost. The only variable cost, proving, is paid by the sender's own machine and
 scales with the tier the run needs. `docs/fees.md` has the schedule, the proving-cost factors,

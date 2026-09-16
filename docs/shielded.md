@@ -1,6 +1,6 @@
 # The shielded pool
 
-Phase S1 replaced SHRUGG's account ledger with a shielded note pool. There are no accounts, no
+Phase S1 replaced RAND's account ledger with a shielded note pool. There are no accounts, no
 balances and no addresses-with-money on this chain: value exists only as **notes**, each one a
 commitment in an append-only tree, and the only way to learn what a note is worth is to hold the
 key that opens it.
@@ -25,11 +25,11 @@ spend key   SpendKey([u32; 8])           256 bits, in <key>.key.json, mode 0600
    │     ├─ nullifier(cm) = H(NF, nk, cm)  what a spend publishes
    │     ├─ ovk                          opens envelopes this wallet sent
    │     └─ ML-KEM-768 decapsulation key opens envelopes sent to this wallet
-   └─ address       shrugg1 + base58(pk || kem_ek)     1668 characters
+   └─ address       rand1 + base58(pk || kem_ek)     1668 characters
 ```
 
 A **shielded address** is 32 bytes of `pk` plus the 1184-byte ML-KEM-768 encapsulation key
-envelopes are sealed to, base58 after the `shrugg1` prefix — about 1.6 KB of text. It is public
+envelopes are sealed to, base58 after the `rand1` prefix — about 1.6 KB of text. It is public
 by design: anyone may pay it, and holding it tells you nothing about what it holds.
 
 The key file is version 2 and carries the spend key alone, because every other key above is a
@@ -39,7 +39,7 @@ pure derivation of it:
 { "version": 2, "spend_key": "0101010101010101010101010101010101010101010101010101010101010101" }
 ```
 
-`shrugg keygen` refuses to overwrite an existing file: there is no second copy of a spend key,
+`rand keygen` refuses to overwrite an existing file: there is no second copy of a spend key,
 and overwriting one destroys every note it could still open. Next to it lives
 `<key>.key.json.notes.json`, the note store — a cache of the notes this key has opened, every row
 of which is recoverable by rescanning from leaf 0. It holds note plaintexts, so it is written
@@ -74,9 +74,9 @@ Action = None | Mint { .. } | Deploy { base_pc, words } | Call { program, proof,
        | BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to }
 ```
 
-A note's `asset` word is `0` for SHRUGG and, since phase S3, the bridge registry's dense index for
+A note's `asset` word is `0` for RAND and, since phase S3, the bridge registry's dense index for
 a bridged asset (`docs/bridge.md`). A bundle balances exactly one asset, which is why a `BridgeBurn`
-— the one transaction that spends a bridged asset and pays a SHRUGG fee — carries two bundles. The
+— the one transaction that spends a bridged asset and pays a RAND fee — carries two bundles. The
 three staking variants are on the wire but every one of them is still refused
 (`UnsupportedAction`) until phase S2 lands.
 
@@ -117,48 +117,48 @@ the pool back together.
 
 ## 3. The wallet
 
-`shrugg` talks to a node's JSON-RPC and does all the private work locally. Global options:
-`--rpc` (`SHRUGG_RPC`, default `http://127.0.0.1:8545`) and `--key` (`SHRUGG_KEY`, default
+`rand` talks to a node's JSON-RPC and does all the private work locally. Global options:
+`--rpc` (`RAND_RPC`, default `http://127.0.0.1:8545`) and `--key` (`RAND_KEY`, default
 `wallet.key.json`).
 
 | command | what it does |
 |---|---|
-| `shrugg keygen` | write a new spend-key file; refuses to overwrite |
-| `shrugg address` | print this wallet's `shrugg1…` address |
-| `shrugg balance` | scan, then print what this wallet can spend |
-| `shrugg sync` | scan without printing a balance |
-| `shrugg notes` | every note this wallet has opened, with `spent` and `pending` |
-| `shrugg history` | every note this wallet created for someone else |
-| `shrugg send <TO> <AMOUNT>` | select, prove a bundle, submit, wait for the commit |
-| `shrugg bond <VALIDATOR> <AMOUNT>` | stake onto a validator: the bundle burns the amount (`docs/staking.md`) |
-| `shrugg faucet [ADDRESS]` | ask a validator to mint (testnet chains only) |
-| `shrugg program build/deploy/show` | assemble, deploy (paid by a bundle), inspect a program |
-| `shrugg call <PROGRAM>` | prove a call locally, pay through a bundle, print the receipt |
-| `shrugg open-call <TX>` | open a committed call's input transcript and check it against its `H_IN` |
-| `shrugg receipt <TX>` | the receipt of a committed call |
-| `shrugg asset-balance [INDEX]` | what this wallet holds in a bridged asset, or a row per asset |
-| `shrugg bridge-mint <ATTESTATION>` | deposit a guardian-signed attestation as a note |
-| `shrugg bridge-burn <ASSET> <AMOUNT> <CHAIN> <TO>` | burn a bridged asset outbound; proves two bundles |
-| `shrugg bridge` / `shrugg bridge-message <SEQ>` | the bridge's public state; one outbound message |
-| `shrugg fee bundle\|deploy <words>\|call <tier>` | the schedule's floor |
-| `shrugg tx/block/head/status/peers/validators` | plain chain reads |
+| `rand keygen` | write a new spend-key file; refuses to overwrite |
+| `rand address` | print this wallet's `rand1…` address |
+| `rand balance` | scan, then print what this wallet can spend |
+| `rand sync` | scan without printing a balance |
+| `rand notes` | every note this wallet has opened, with `spent` and `pending` |
+| `rand history` | every note this wallet created for someone else |
+| `rand send <TO> <AMOUNT>` | select, prove a bundle, submit, wait for the commit |
+| `rand bond <VALIDATOR> <AMOUNT>` | stake onto a validator: the bundle burns the amount (`docs/staking.md`) |
+| `rand faucet [ADDRESS]` | ask a validator to mint (testnet chains only) |
+| `rand program build/deploy/show` | assemble, deploy (paid by a bundle), inspect a program |
+| `rand call <PROGRAM>` | prove a call locally, pay through a bundle, print the receipt |
+| `rand open-call <TX>` | open a committed call's input transcript and check it against its `H_IN` |
+| `rand receipt <TX>` | the receipt of a committed call |
+| `rand asset-balance [INDEX]` | what this wallet holds in a bridged asset, or a row per asset |
+| `rand bridge-mint <ATTESTATION>` | deposit a guardian-signed attestation as a note |
+| `rand bridge-burn <ASSET> <AMOUNT> <CHAIN> <TO>` | burn a bridged asset outbound; proves two bundles |
+| `rand bridge` / `rand bridge-message <SEQ>` | the bridge's public state; one outbound message |
+| `rand fee bundle\|deploy <words>\|call <tier>` | the schedule's floor |
+| `rand tx/block/head/status/peers/validators` | plain chain reads |
 
 ```bash
-shrugg keygen                                      # wrote wallet.key.json
-shrugg address                                     # shrugg1x7Qk…  (1668 characters)
-shrugg faucet                                      # 100 SHRUGG into a note only you can open
-shrugg sync                                        # scanned 41 leaves and 37 blocks; 1 notes, 1 unspent
-shrugg balance                                     # balance: 100 SHRUGG / notes: 1 unspent
-shrugg notes
+rand keygen                                      # wrote wallet.key.json
+rand address                                     # rand1x7Qk…  (1668 characters)
+rand faucet                                      # 100 RAND into a note only you can open
+rand sync                                        # scanned 41 leaves and 37 blocks; 1 notes, 1 unspent
+rand balance                                     # balance: 100 RAND / notes: 1 unspent
+rand notes
 #    index              amount    height    spent  pending
 #       40                 100        37    false  -
-shrugg send shrugg1q9f… 1.5                        # proves ~100 s, then waits for the commit
-shrugg history                                     # what this wallet has paid out
-shrugg fee call 14                                 # 0.0022 SHRUGG
-shrugg program build --guest private_payment --arg 1000 --out pp.json
-shrugg program deploy pp.json                      # a bundle pays the deploy floor
-shrugg call <program id> --input 400 --input 250 --input 300 --input 75
-shrugg receipt <tx hash>
+rand send rand1q9f… 1.5                        # proves ~100 s, then waits for the commit
+rand history                                     # what this wallet has paid out
+rand fee call 14                                 # 0.0022 RAND
+rand program build --guest private_payment --arg 1000 --out pp.json
+rand program deploy pp.json                      # a bundle pays the deploy floor
+rand call <program id> --input 400 --input 250 --input 300 --input 75
+rand receipt <tx hash>
 ```
 
 `send` prints what it did and nothing about anyone else:
@@ -166,8 +166,8 @@ shrugg receipt <tx hash>
 ```
 proving bundle (tier 14; about a minute on a laptop)…
 proved in 98.3s: tier 14, 302857 bytes
-submitted transfer 4f2c…  1.5 SHRUGG out, 98.499 SHRUGG change, fee 0.001 SHRUGG, anchored at height 192
-balance: 98.499 SHRUGG
+submitted transfer 4f2c…  1.5 RAND out, 98.499 RAND change, fee 0.001 RAND, anchored at height 192
+balance: 98.499 RAND
 ```
 
 Three things to know about spending:
@@ -185,8 +185,8 @@ Three things to know about spending:
   and therefore the moment a pending note clears, is whatever the node the wallet points at
   reports: a node that lies about its head can make the wallet retry a spend the chain will
   refuse as spent, never lose funds.
-- **The fee floor is 0.001 SHRUGG** for a transfer, plus the action's own floor for a deploy or a
-  call. `shrugg fee` asks the node rather than guessing.
+- **The fee floor is 0.001 RAND** for a transfer, plus the action's own floor for a deploy or a
+  call. `rand fee` asks the node rather than guessing.
 
 ## 4. RPC
 
@@ -194,79 +194,79 @@ Full parameter and error detail is in `docs/rpc.md`; this is the shielded subset
 each. Every example is one HTTP POST of
 `{"jsonrpc":"2.0","id":1,"method":…,"params":…}` to the node's `/`.
 
-**`shrugg_getTreeInfo`** — how far a wallet still has to scan.
+**`rand_getTreeInfo`** — how far a wallet still has to scan.
 
 ```json
-→ {"method":"shrugg_getTreeInfo","params":[]}
+→ {"method":"rand_getTreeInfo","params":[]}
 ← {"next_index": 41, "root": "6b1d…c4", "nullifiers": 12}
 ```
 
-**`shrugg_getCommitments(from_index, limit)`** — a page of leaves, oldest first, at most 1000 per
+**`rand_getCommitments(from_index, limit)`** — a page of leaves, oldest first, at most 1000 per
 call. This is the whole of a wallet's scan: every leaf and every envelope go to everyone, and
 only a viewing key tells them apart.
 
 ```json
-→ {"method":"shrugg_getCommitments","params":[40, 500]}
+→ {"method":"rand_getCommitments","params":[40, 500]}
 ← [{"index": 40, "cm": "2a9f…07", "height": 37,
     "envelope": {"kem_ct": "b41c…", "to_receiver": "77e0…", "to_sender": "0c31…", "body": "9dd2…"}}]
 ```
 
-**`shrugg_getNullifiers(from_height, limit)`** — what has been spent, by block.
+**`rand_getNullifiers(from_height, limit)`** — what has been spent, by block.
 
 ```json
-→ {"method":"shrugg_getNullifiers","params":[0, 500]}
+→ {"method":"rand_getNullifiers","params":[0, 500]}
 ← [{"height": 37, "nullifier": "8c04…d1"}, {"height": 41, "nullifier": "12be…9a"}]
 ```
 
-**`shrugg_getAnchor([height])`** — the tree root a prover may build against. With no parameter it
+**`rand_getAnchor([height])`** — the tree root a prover may build against. With no parameter it
 serves the head, which is the only anchor a wallet should use.
 
 ```json
-→ {"method":"shrugg_getAnchor","params":[]}
+→ {"method":"rand_getAnchor","params":[]}
 ← {"height": 192, "root": "6b1d…c4"}
 ```
 
-**`shrugg_importViewingKey(nk[, rescan_from_height])`** and **`shrugg_getViewingNotes(nk[, from_index, limit])`** —
+**`rand_importViewingKey(nk[, rescan_from_height])`** and **`rand_getViewingNotes(nk[, from_index, limit])`** —
 the explorer's path: hand the *node* a viewing key (in memory, capped at 64, gone at restart) and
 it scans on the holder's behalf, the Zcash `z_importviewingkey` analogue. This is the one
 exception to "the node never holds a key"; see §6.
 
 ```json
-→ {"method":"shrugg_importViewingKey","params":["0c31…9e", 0]}
+→ {"method":"rand_importViewingKey","params":["0c31…9e", 0]}
 ← {"imported": true, "rescan_from_height": 0, "viewing_keys": 1}
-→ {"method":"shrugg_getViewingNotes","params":["0c31…9e"]}
+→ {"method":"rand_getViewingNotes","params":["0c31…9e"]}
 ← {"scanned_index": 41, "next_index": 41, "complete": true,
    "notes": [{"index": 40, "cm": "2a9f…07", "height": 37, "role": "received",
               "note": {"pk": "…", "from": "…", "amount": "100000000000", "asset": 0, "time": 5},
               "nullifier": "8c04…d1", "spent": false}]}
 ```
 
-**`shrugg_getWitness(index)`** — the Merkle path of one leaf, leaf-first, 32 levels. `null` past
+**`rand_getWitness(index)`** — the Merkle path of one leaf, leaf-first, 32 levels. `null` past
 the end of the tree. See §6: this is the one request that says something about the caller.
 
 ```json
-→ {"method":"shrugg_getWitness","params":[40]}
+→ {"method":"rand_getWitness","params":[40]}
 ← {"index": 40, "root": "6b1d…c4", "path": ["0000…00", "f2a1…3b", … 32 entries …]}
 ```
 
-**`shrugg_sendTransaction(hex)`** — `bincode(Transaction)` as hex. Returns the transaction hash;
-acceptance is not commitment, so poll `shrugg_getTransaction`.
+**`rand_sendTransaction(hex)`** — `bincode(Transaction)` as hex. Returns the transaction hash;
+acceptance is not commitment, so poll `rand_getTransaction`.
 
 ```json
-→ {"method":"shrugg_sendTransaction","params":["0700000000000000012a9f…"]}
+→ {"method":"rand_sendTransaction","params":["0700000000000000012a9f…"]}
 ← "4f2c8b31…e7"
 ```
 
-**`shrugg_mint(address[, amount])`** — the testnet faucet, on chains whose genesis says
+**`rand_mint(address[, amount])`** — the testnet faucet, on chains whose genesis says
 `"faucet": true`. The node signs the mint with its own validator key; an observer answers
 `faucet mints are signed by validators; ask a validator node`.
 
 ```json
-→ {"method":"shrugg_mint","params":["shrugg1x7Qk…", "100000000000"]}
+→ {"method":"rand_mint","params":["rand1x7Qk…", "100000000000"]}
 ← "9ab1c0…4f"
 ```
 
-**`shrugg_getTransaction(hash)`** — what an explorer can say, which is almost nothing:
+**`rand_getTransaction(hash)`** — what an explorer can say, which is almost nothing:
 
 ```json
 ← {"height": 192, "index": 0, "block_hash": "63f6…08",
@@ -280,12 +280,12 @@ acceptance is not commitment, so poll `shrugg_getTransaction`.
 There is no `from`, no `to`, no `nonce` and no amount in that reply, and there is nothing in the
 stored block either — the node has nothing more to redact.
 
-**`shrugg_checkTransaction(hash, key)`** — the other side of that redaction, for exactly one key
+**`rand_checkTransaction(hash, key)`** — the other side of that redaction, for exactly one key
 holder: what does this `TxKey` disclose about this transaction. Stateless (the key is dropped
 with the call), and a wrong key is indistinguishable from one that sealed nothing.
 
 ```json
-→ {"method":"shrugg_checkTransaction","params":["4f2c…e7", "77e0…1b"]}
+→ {"method":"rand_checkTransaction","params":["4f2c…e7", "77e0…1b"]}
 ← {"tx": "4f2c…e7", "height": 192,
    "disclosed": [{"output": "bundle:0", "cm": "2a9f…07", "index": 40,
                   "note": {"pk": "…", "from": "…", "amount": "1500000000", "asset": 0, "time": 5}}]}
@@ -301,7 +301,7 @@ the same check before gossiping, so a bad transaction is refused once, at the ed
    re-measured and kept at constraint set 6).
 2. **Chain id** matches this chain.
 3. **Shape and fee floor** — a mint, an `Unbond` and a `Withdraw` carry no bundle and everything
-   else must; the transaction's own bundle is always SHRUGG (`asset = 0`) and burns nothing
+   else must; the transaction's own bundle is always RAND (`asset = 0`) and burns nothing
    (`burn = 0`) unless the action is a `Bond`, whose bundle must burn exactly the bonded amount; a
    `BridgeBurn`'s second bundle is the one bundle exempt from both (it is the bridged asset's, and
    it burns); `fee ≥ fee_floor(action)` — zero for the three bundle-less actions, since they have
@@ -312,7 +312,7 @@ the same check before gossiping, so a bad transaction is refused once, at the ed
 5. **Time** — `time` is within `[height - 256, height]` (`TIME_WINDOW`).
 6. **Nullifiers and commitments** — the two nullifiers differ and neither is in the spent set;
    the two commitments differ and neither is already a leaf.
-7. **Action checks** — faucet enabled, mint under the 100 SHRUGG cap, minter is a validator and
+7. **Action checks** — faucet enabled, mint under the 100 RAND cap, minter is a validator and
    its signature verifies; program decodes (Deploy); program exists and the input envelope is
    within its own cap (Call); for the staking actions the rules of `docs/staking.md` — a
    registration present exactly when the validator is unknown, the register's nonce and the
@@ -341,11 +341,11 @@ node answers `anchor is not one of the last 256 roots` and the wallet reproves.
 The pool hides amounts, senders and recipients. It does not hide everything, and the gaps are
 worth naming.
 
-- **Witness requests.** `shrugg_getWitness(index)` tells the node exactly which leaf a wallet is
+- **Witness requests.** `rand_getWitness(index)` tells the node exactly which leaf a wallet is
   about to spend — the single largest leak in S1. A wallet that keeps its own copy of the tree
   never asks, and that (a local wallet tree) is the first follow-up. Until then: run your own
   node, or ask for witnesses you do not need alongside the ones you do.
-- **Scanning.** `shrugg_getCommitments` hands out everything to everyone, so scanning itself
+- **Scanning.** `rand_getCommitments` hands out everything to everyone, so scanning itself
   reveals nothing about which leaves are yours — but it does tell the node that *somebody* at
   your IP is scanning, and how far. Trial decryption is local and, on that path, the node never
   sees a viewing key. The exception is the explorer's import below: a node an operator handed a
@@ -356,7 +356,7 @@ worth naming.
   whoever was connected to that node's RPC at that moment.
 - **Deposits.** Mint, genesis alloc and bridge-deposit amounts are in the clear, and a bridge
   deposit also publishes its asset and the recipient's shielded address in that one transaction.
-  The one-hop link from "100 SHRUGG was minted" to "a note worth 100 SHRUGG exists" is unavoidable
+  The one-hop link from "100 RAND was minted" to "a note worth 100 RAND exists" is unavoidable
   until value can enter the pool with a proof instead of a public amount. A bridge *burn* leaks the
   same way on the way out, and deliberately: the guardians releasing on the other chain need the
   amount and the destination.
@@ -375,14 +375,14 @@ compel:
   It is all-or-nothing, and it is retroactive and forward-looking at once.
 - **A per-transaction key** (`TxKey`) opens exactly the one envelope it sealed, and nothing else
   — the right grain for "show me this payment" without handing over a history. Each envelope is
-  sealed under a fresh one for precisely this reason. `shrugg_checkTransaction(hash, key)` makes
+  sealed under a fresh one for precisely this reason. `rand_checkTransaction(hash, key)` makes
   the check one stateless RPC call for whoever holds the pair (Monero's `check_tx_proof` shape):
   what comes back is the note the key sealed, bound to its on-chain commitment and leaf.
 
 In S1 the wallet derives the viewing key on every run and never stores it, and it draws each
 `TxKey` fresh and drops it after sealing. Since the RPC-hardening work a *node* may also be
-handed a viewing key: `shrugg_importViewingKey` imports one (in memory only, capped at 64 keys,
-cleared at restart — deliberately never on disk) and `shrugg_getViewingNotes` serves what the
+handed a viewing key: `rand_importViewingKey` imports one (in memory only, capped at 64 keys,
+cleared at restart — deliberately never on disk) and `rand_getViewingNotes` serves what the
 node's scan found, the Zcash `z_importviewingkey` shape an explorer such as RandScan needs.
 That is the one place "the node never holds a key" stops being true, and it is a property of an
 explicit operator decision, scoped to that node: the RPC layer has no type for a spend key, so an
@@ -393,7 +393,7 @@ chain change.
 Phase S3 added the same two grains for *computation*, and these the CLI does offer: a call may
 publish its private inputs as a sealed transcript, openable by the caller's viewing key, by a
 per-call key (`--print-call-key`), or by an auditor named when the call was made (`--auditor`), and
-`shrugg open-call` checks the opened transcript against the `H_IN` the proof published and re-runs
+`rand open-call` checks the opened transcript against the `H_IN` the proof published and re-runs
 the program on it, and exits non-zero rather than believing it if either check fails. `--no-envelope` publishes nothing at all, which is irreversible: once the salt is
 gone, nobody can open that call. See `docs/confidential.md` §call input envelopes.
 
@@ -405,15 +405,15 @@ release — S3 landed first, which is the order they arrived in, not the order t
 **S2 — staking on the shielded chain: here.** The validator register gained `Bond`, `Unbond` and
 `Withdraw`: stake moves in from a bundle as its `burn`, unbonds over two epochs, and a validator's
 accumulated `rewards` (which S1 already credited on every bundle fee) are withdrawable into a note at
-its payout address. Epochs re-derive the validator set from the register, `shrugg-node genesis` seeds
-it, and `shrugg_getSupply` audits the pool against it. The whole of it is `docs/staking.md` and
+its payout address. Epochs re-derive the validator set from the register, `rand-node genesis` seeds
+it, and `rand_getSupply` audits the pool against it. The whole of it is `docs/staking.md` and
 `docs/supply.md`. What S2 did **not** bring is the wallet's local commitment tree — the answer to the
 witness leak in §6 — which is still the first follow-up.
 
 **S3 — the bridge, and private call inputs — has landed.** A bridged asset is a note whose `asset`
 word is the registry's index for it; `BridgeAttest` deposits one note that the *chain* computes from
 the amount the guardians signed; `BridgeBurn` is the chain's one two-bundle transaction (an asset
-bundle that burns, and a SHRUGG bundle that pays for both). Call inputs have their own envelopes
+bundle that burns, and a RAND bundle that pays for both). Call inputs have their own envelopes
 (spec §6.1), so a caller can disclose what a program ran on without publishing it. `docs/bridge.md`
 and `docs/confidential.md` are the references; a chain turns the bridge on with a `bridge` section in
 its genesis, which is a hard fork for the chains that take it and a no-op for the ones that do not.

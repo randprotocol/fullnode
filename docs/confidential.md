@@ -1,6 +1,6 @@
 # Confidential computation
 
-SHRUGG pays for confidential calls: a program runs off-chain inside the Rand zkVM on private inputs,
+RAND pays for confidential calls: a program runs off-chain inside the Rand zkVM on private inputs,
 and only a STARK proof plus eight public output words go on chain. Every node verifies the proof,
 charges gas, and stores a receipt.
 
@@ -15,7 +15,7 @@ rewritten to publish what it decided and let the caller move the value in the bu
 
 ## The zkVM
 
-`crates/shrugg-zkvm` (vendored from `circuits/research`, upstream `rand_zkvm`): an RV32I subset,
+`crates/randprotocol-zkvm` (vendored from `circuits/research`, upstream `rand_zkvm`): an RV32I subset,
 plus the RV32M extension and sub-word loads/stores (constraint set 3, below), proven by a
 Plonky3 batch STARK over Goldilocks with Poseidon2 hashing and ZK-hiding FRI. Nine mandatory
 tables (program, cpu, memory, alu, range, nibble, poseidon2, input, public — `input` added in
@@ -105,7 +105,7 @@ headline changes:
   stores `hc` (`isa::Program::digest()`, 8 little-endian `u32` words) as `code_hash` at deploy
   time, and `ZkExecutor::verify_call` decodes it back out and hands it to `Machine::verify` —
   `code_hash` is now the actual verification key material, not just an explorer-facing label.
-  `shrugg-core`'s `programs` RPC already serves `code_hash` as hex; nothing there changed.
+  `randprotocol-core`'s `programs` RPC already serves `code_hash` as hex; nothing there changed.
 - **Tiers are unchanged** (10, 12, 14, 16, 18, 20; `cpu`/`alu`/`memory` height formulas
   unchanged); `Tier::poseidon2_height()` (`2^(t+2)`) and the proof-declared `program_log_height`
   are new, both sized independently of `cpu_height`.
@@ -191,7 +191,7 @@ separately-managed disclosure story) sit downstream of a call whose `H_IN` the c
 open.
 
 **The call-input envelope** (spec §6.1, phase S3) is that opening, made durable: a caller who keeps
-the salt in its own head has a capability it loses with the next laptop, so `shrugg call` publishes
+the salt in its own head has a capability it loses with the next laptop, so `rand call` publishes
 the `(salt, inputs)` transcript on chain by default, sealed so that the caller, a per-call key or a
 named auditor can open it later. See "Call input envelopes" below for the format and the rules.
 
@@ -265,7 +265,7 @@ headline changes:
   both are dominated by trace commitment and the uncached verifier-key recomputation, costs the
   query count does not touch. A keccak-*carrying* tier-10 proof measures 3 106 757 bytes.
 
-**`MAX_PROOF_BYTES` is 2 MiB** (`crates/shrugg-core/src/gas.rs`), raised from 1 MiB in the same
+**`MAX_PROOF_BYTES` is 2 MiB** (`crates/randprotocol-core/src/gas.rs`), raised from 1 MiB in the same
 change: at 80 queries the 1 MiB cap rejected *every* production proof. 2 MiB is the smallest
 power-of-two cap above the measured sizes with room for the per-proof variation, and it sits
 deliberately below the ~3.11 MB a keccak-bearing proof costs. **`MAX_BLOCK_BYTES` stays 4 MiB** —
@@ -337,7 +337,7 @@ constraint-set-6 merge, which also brings milestones 4.3 (the EVM interpreter gu
   costs nothing. A future action type that publishes words (a public-ELF program in the upstream
   sBPF shape is the obvious one) would pass them in place of `&[]`.
 - **`MAX_PROOF_BYTES` stays 2 MiB.** Measured on this tree
-  (`cargo test -p shrugg-zkvm --release --test e2e
+  (`cargo test -p randprotocol-zkvm --release --test e2e
   measure_production_profile_at_tier_10_and_12 -- --ignored --nocapture`): a keccak-free
   production proof is 1 298 729 bytes at tier 10 and 1 359 978 at tier 12 (constraint set 5 measured
   1 202 416 / 1 252 338 — the delta is the mandatory public table, the 51 new cpu columns and
@@ -358,7 +358,7 @@ old chain. A fleet must run one build.
 
 ## On-chain model
 
-**Programs** are content addressed: `program_id = blake3("shrugg-program" || base_pc || words)`.
+**Programs** are content addressed: `program_id = blake3("rand-program" || base_pc || words)`.
 A `Deploy` transaction stores `{ base_pc, words }` (at most 4096 words); every word must decode as an
 instruction. Programs are immutable and part of the state root.
 
@@ -373,7 +373,7 @@ program and its caller agree they mean. The old layout (`out0` effect kind, `out
 statement, not a payment.
 
 **Receipts** `{ tx, program, tier, outputs, height, index }` are stored per call and served by
-`shrugg_getReceipt`; they are recomputed and checked when a node syncs or verifies its chain. There
+`rand_getReceipt`; they are recomputed and checked when a node syncs or verifies its chain. There
 is no `effect` field.
 
 ## Validity rules
@@ -394,24 +394,24 @@ is no `effect` field.
 
 | operation | minimum fee |
 |---|---|
-| any bundle (`BUNDLE_BASE`) | 0.001 SHRUGG |
-| shielded transfer | 0.001 SHRUGG (the base alone) |
-| Deploy | 0.001 SHRUGG + 100,000 units per word (0.0266 SHRUGG for 256 words) |
-| Call | 0.002 SHRUGG at tier 10, plus 0.0001 SHRUGG per two tiers above it (0.0025 at tier 20) |
-| BridgeAttest | 0.001 SHRUGG (the base alone) |
-| BridgeBurn | 0.002 SHRUGG — the base twice, for its two bundles |
+| any bundle (`BUNDLE_BASE`) | 0.001 RAND |
+| shielded transfer | 0.001 RAND (the base alone) |
+| Deploy | 0.001 RAND + 100,000 units per word (0.0266 RAND for 256 words) |
+| Call | 0.002 RAND at tier 10, plus 0.0001 RAND per two tiers above it (0.0025 at tier 20) |
+| BridgeAttest | 0.001 RAND (the base alone) |
+| BridgeBurn | 0.002 RAND — the base twice, for its two bundles |
 | Mint (faucet) | free, and carries no bundle |
 
 Every floor above the mint's includes `BUNDLE_BASE`, because every one of those transactions
 carries a bundle. A `BridgeBurn` includes it *twice*: spec §7 item 3 charges the base per
-bundle, and a burn is the one transaction that carries two — the SHRUGG fee bundle and the
+bundle, and a burn is the one transaction that carries two — the RAND fee bundle and the
 asset bundle inside the action — both of which every node verifies. The asset bundle's own
-`fee` must be zero, so the SHRUGG bundle pays for both.
+`fee` must be zero, so the RAND bundle pays for both.
 
 Anything above the minimum is a tip; all of it is credited to the block proposer's `rewards` in
 the validator register, which phase S2's `Withdraw` turns back into a note. Blocks hold at most
 4 MiB of transactions, and at constraint set 5's 80 queries a bundle proof is ~1.3 MB, so **three**
-shielded transactions per block (it was roughly a dozen at 27 queries; `docs/block-space.md`). Constants live in `shrugg_core::gas`; `shrugg fee bundle|deploy <words>|call <tier>`
+shielded transactions per block (it was roughly a dozen at 27 queries; `docs/block-space.md`). Constants live in `randprotocol_core::gas`; `rand fee bundle|deploy <words>|call <tier>`
 asks the node.
 
 ## Privacy
@@ -450,7 +450,7 @@ CallEnvelope { kem_ct: Vec<u8>, to_sender: Vec<u8>, to_auditor: Vec<u8>, body: V
 | `to_auditor` | 60 or 0 | `K_call` wrapped under that encapsulation's shared secret |
 
 Everything is ChaCha20-Poly1305 with a random 12-byte nonce prepended, and the domain tags
-(`shrugg-call-sender`, `shrugg-call-auditor`) are distinct from the note layer's, so no wrap of one
+(`rand-call-sender`, `rand-call-auditor`) are distinct from the note layer's, so no wrap of one
 kind is ever a wrap of another. `K_call` is drawn from OS entropy per envelope and is *not* derived
 from any other key: handing one over says nothing about any other call.
 
@@ -465,8 +465,8 @@ from any other key: handing one over says nothing about any other call.
 **What the chain does and does not do.** It checks the envelope's *size* and nothing else:
 `MAX_CALL_ENVELOPE_BYTES` = 18,432, sized to admit the 4096-word input cap plus the auditor parts
 (`call_envelope::validate`, step 7 of admission). It holds no key that opens any of it, never looks
-inside, and serves it verbatim to anyone who asks (`shrugg_getCallEnvelope`, alongside the receipt's
-`h_in`). (A viewing key imported for note scanning — `shrugg_importViewingKey`, `docs/shielded.md` —
+inside, and serves it verbatim to anyone who asks (`rand_getCallEnvelope`, alongside the receipt's
+`h_in`). (A viewing key imported for note scanning — `rand_importViewingKey`, `docs/shielded.md` —
 opens *note* envelopes only; a caller's viewing key would open its own calls' sender wraps, but
 nothing on the node tries: the scan runs over the commitment tree's leaves, and call envelopes are
 not part of it.) The envelope is part of the transaction, so it is part of the transaction hash.
@@ -476,7 +476,7 @@ not part of it.) The envelope is part of the transaction, so it is part of the t
 nobody. **What makes an opened transcript faithful** is the holder's own recomputation —
 `input_digest(salt, inputs) == H_IN` — because `H_IN` commits in-circuit to every word the guest
 read. A caller who seals a transcript that is not the preimage is not stopped by the chain; they are
-caught by whoever decrypts, who can show that decryption to anyone. `shrugg open-call` checks
+caught by whoever decrypts, who can show that decryption to anyone. `rand open-call` checks
 exactly this, then re-runs the program on the recovered inputs through the emulator and compares the
 outputs with the receipt's. Both checks are the command's **exit status**, not just a printed line:
 an unfaithful transcript, or one whose words do not reproduce the receipt's outputs, exits non-zero,
@@ -484,22 +484,22 @@ so a script that opens a disclosure to check a claim cannot read a warning besid
 yes.
 
 ```bash
-shrugg call <id> --input 400 --input 250 --auditor shrugg1q9f…   # seals for the caller and the auditor
-shrugg call <id> --input 400 --print-call-key                    # also prints K_call
-shrugg call <id> --input 400 --no-envelope                       # publishes nothing
-shrugg open-call <txhash>                  # as the caller
-shrugg open-call <txhash> --as-auditor     # as the auditor
-shrugg open-call <txhash> --call-key <hex> # with the per-call key alone
+rand call <id> --input 400 --input 250 --auditor rand1q9f…   # seals for the caller and the auditor
+rand call <id> --input 400 --print-call-key                    # also prints K_call
+rand call <id> --input 400 --no-envelope                       # publishes nothing
+rand open-call <txhash>                  # as the caller
+rand open-call <txhash> --as-auditor     # as the auditor
+rand open-call <txhash> --call-key <hex> # with the per-call key alone
 ```
 
 `--no-envelope` is the deliberate opposite: nothing is published, and once the salt is gone nobody
 — the caller included — can ever open that call. `--cuda` cannot seal one either: every backend but
-the CPU draws the `H_IN` salt inside the prover and never returns it, so `shrugg call --cuda` fails
+the CPU draws the `H_IN` salt inside the prover and never returns it, so `rand call --cuda` fails
 unless `--no-envelope` is passed with it. The forfeit is always asked for explicitly; a call is never
 quietly downgraded to one.
 
 Covered end to end by `a_call_envelope_is_opened_by_the_caller_and_the_auditor_only`
-(`crates/shrugg-node/tests/cluster.rs`), which opens the bytes a *node* served as the caller and as
+(`crates/randprotocol-node/tests/cluster.rs`), which opens the bytes a *node* served as the caller and as
 the auditor, fails to open them as a third wallet that is neither, and catches both a tampered
 transcript (the faithfulness check) and a tampered ciphertext (the AEAD).
 
@@ -511,7 +511,7 @@ genesis hash, so nodes with different settings cannot join the same chain.
 
 ## Guest programs
 
-`shrugg program build --guest <name> --arg ...` assembles the built-in guests: `fib n`, `memcpy n`,
+`rand program build --guest <name> --arg ...` assembles the built-in guests: `fib n`, `memcpy n`,
 `bubble_sort v...`, `balance_check threshold`, `private_payment threshold`. Any RV32I program in the
 supported subset can be deployed from a `.json` (`{ "base_pc", "words" }`) or `.bin` (raw
 little-endian words) file.
@@ -519,7 +519,7 @@ little-endian words) file.
 ## GPU proving (--cuda)
 
 Proving is the only expensive half of a confidential call, and it happens in the wallet, never on
-the chain. `shrugg call --cuda` runs the batch STARK's NTTs and Poseidon2 Merkle commitments on an
+the chain. `rand call --cuda` runs the batch STARK's NTTs and Poseidon2 Merkle commitments on an
 attached NVIDIA GPU instead of the CPU. The proof is the same object either way — same public
 values, same tier, verified by the same CPU verifier — so nothing on the node changes and a chain
 cannot tell which backend produced a proof.
@@ -532,8 +532,8 @@ the same reminder.
 **Building.** On a machine with a CUDA 13 toolkit, an NVIDIA driver, and the compiled PTX:
 
 ```
-cargo build --release -p shrugg-client --features cuda
-shrugg call <program-id> --input 400 --input 250 --cuda
+cargo build --release -p randprotocol-client --features cuda
+rand call <program-id> --input 400 --input 250 --cuda
 ```
 
 The flag is always accepted by the parser, so `--cuda` on a stock build fails with a message rather
@@ -551,7 +551,7 @@ and its toolkit requirement.
 
 | Situation | Message |
 | --- | --- |
-| Built without the feature | `built without CUDA support; rebuild shrugg with --features cuda` |
+| Built without the feature | `built without CUDA support; rebuild rand with --features cuda` |
 | No driver or no device | `Backend("CUDA driver: ...")` |
 | Built, driver present, PTX missing | `Backend("no PTX for the GPU kernels at <dir>/ptx/kernels.sm_80.ptx (see rand-zkvm-cuda/ptx/PTX_BUILD.md)")` |
 | Tier too large for device memory | `Backend("device allocation of N bytes failed (M bytes free); use a lower tier")` |

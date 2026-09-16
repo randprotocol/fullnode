@@ -5172,6 +5172,143 @@ dependencies = [
 ]
 
 [[package]]
+name = "randprotocol-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "libp2p",
+ "randprotocol-core",
+ "randprotocol-node",
+ "randprotocol-zkvm",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "randprotocol-core"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "blake3",
+ "bridge-codec",
+ "bs58",
+ "crystals-dilithium",
+ "hex",
+ "k256",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha3 0.10.9",
+ "thiserror 2.0.20",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "randprotocol-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bincode",
+ "blake3",
+ "bs58",
+ "cbor4ii 0.3.3",
+ "clap",
+ "futures",
+ "hex",
+ "libp2p",
+ "p3-field",
+ "postcard",
+ "rand 0.8.8",
+ "randprotocol-client",
+ "randprotocol-core",
+ "randprotocol-rvm",
+ "randprotocol-zkvm",
+ "reqwest",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "randprotocol-rvm"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "p3-air",
+ "p3-batch-stark",
+ "p3-challenger",
+ "p3-commit",
+ "p3-dft",
+ "p3-field",
+ "p3-fri",
+ "p3-goldilocks",
+ "p3-lookup",
+ "p3-matrix",
+ "p3-merkle-tree",
+ "p3-poseidon2",
+ "p3-symmetric",
+ "p3-uni-stark",
+ "p3-util",
+ "postcard",
+ "rand 0.10.2",
+ "rand-zkvm-cuda",
+ "randprotocol-zkvm",
+ "serde",
+]
+
+[[package]]
+name = "randprotocol-zkvm"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305 0.11.0",
+ "evm-core",
+ "hex",
+ "ml-kem",
+ "num-bigint 0.4.8",
+ "p3-air",
+ "p3-batch-stark",
+ "p3-challenger",
+ "p3-commit",
+ "p3-dft",
+ "p3-field",
+ "p3-fri",
+ "p3-goldilocks",
+ "p3-keccak",
+ "p3-lookup",
+ "p3-matrix",
+ "p3-merkle-tree",
+ "p3-poseidon2",
+ "p3-symmetric",
+ "p3-uni-stark",
+ "postcard",
+ "rand 0.10.2",
+ "rand-zkvm-cuda",
+ "randprotocol-core",
+ "revm",
+ "sbpf-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-sbpf",
+]
+
+[[package]]
 name = "rapidhash"
 version = "4.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6014,143 +6151,6 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "shrugg-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "hex",
- "libp2p",
- "reqwest",
- "serde",
- "serde_json",
- "shrugg-core",
- "shrugg-node",
- "shrugg-zkvm",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "shrugg-core"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "blake3",
- "bridge-codec",
- "bs58",
- "crystals-dilithium",
- "hex",
- "k256",
- "rand 0.8.8",
- "serde",
- "serde_json",
- "sha3 0.10.9",
- "thiserror 2.0.20",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "shrugg-node"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "bincode",
- "blake3",
- "bs58",
- "cbor4ii 0.3.3",
- "clap",
- "futures",
- "hex",
- "libp2p",
- "p3-field",
- "postcard",
- "rand 0.8.8",
- "reqwest",
- "rocksdb",
- "serde",
- "serde_json",
- "shrugg-client",
- "shrugg-core",
- "shrugg-rvm",
- "shrugg-zkvm",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "shrugg-rvm"
-version = "0.1.0"
-dependencies = [
- "hex",
- "p3-air",
- "p3-batch-stark",
- "p3-challenger",
- "p3-commit",
- "p3-dft",
- "p3-field",
- "p3-fri",
- "p3-goldilocks",
- "p3-lookup",
- "p3-matrix",
- "p3-merkle-tree",
- "p3-poseidon2",
- "p3-symmetric",
- "p3-uni-stark",
- "p3-util",
- "postcard",
- "rand 0.10.2",
- "rand-zkvm-cuda",
- "serde",
- "shrugg-zkvm",
-]
-
-[[package]]
-name = "shrugg-zkvm"
-version = "0.1.0"
-dependencies = [
- "chacha20poly1305 0.11.0",
- "evm-core",
- "hex",
- "ml-kem",
- "num-bigint 0.4.8",
- "p3-air",
- "p3-batch-stark",
- "p3-challenger",
- "p3-commit",
- "p3-dft",
- "p3-field",
- "p3-fri",
- "p3-goldilocks",
- "p3-keccak",
- "p3-lookup",
- "p3-matrix",
- "p3-merkle-tree",
- "p3-poseidon2",
- "p3-symmetric",
- "p3-uni-stark",
- "postcard",
- "rand 0.10.2",
- "rand-zkvm-cuda",
- "revm",
- "sbpf-core",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "shrugg-core",
- "solana-sbpf",
-]
 
 [[package]]
 name = "signal-hook-registry"

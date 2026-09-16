@@ -1,0 +1,268 @@
+//! Field structs and signing messages the staking (phase S2) and bridge/call-envelope
+//! (phase S3) actions carry.
+//!
+//! Nothing here is interpreted by the ledger yet: phase S2/S3 Task 0 adds the shapes and the
+//! signing messages so both phases can be implemented in parallel against one wire format.
+//! The variants that use them are rejected with [`crate::ledger::TxError::UnsupportedAction`]
+//! until their phase lands.
+
+use crate::crypto::{Address, Hash, PublicKey, Signature};
+use crate::notes::{Envelope, ShieldedAddress, Word8};
+use serde::{Deserialize, Serialize};
+
+/// Largest call-input envelope accepted in a `Call` transaction (spec §6.1).
+///
+/// The arithmetic, for the largest envelope the format can produce — a 4096-word input vector
+/// (the spec's cap) sealed for both the caller and an auditor:
+///
+/// | part | bytes |
+/// |---|---|
+/// | `body` = nonce 12 + salt 16 + inputs 4 × 4096 + Poly1305 tag 16 | 16 428 |
+/// | `kem_ct`, an ML-KEM-768 ciphertext | 1 088 |
+/// | `to_sender` = nonce 12 + key 32 + tag 16 | 60 |
+/// | `to_auditor`, the same shape | 60 |
+/// | **total** | **17 636** |
+///
+/// 18 432 bytes (18 KiB) is the next round number above that: it admits every envelope an
+/// honest wallet can build and nothing appreciably beyond. (An earlier 17 000 came from
+/// costing the two key wraps at 48 bytes, which forgot their 12-byte nonces and would have
+/// refused a fully-loaded audited call.)
+pub const MAX_CALL_ENVELOPE_BYTES: usize = 18_432;
+
+/// A validator's first appearance in the register (spec §8): the Dilithium2 key that signs its
+/// later staking actions and the shielded address its rewards are paid to. `signature` is over
+/// [`registration_message`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Registration {
+    pub public_key: PublicKey,
+    pub payout: ShieldedAddress,
+    pub signature: Signature,
+}
+
+impl Registration {
+    /// The blob a validator hands its bonder: `rand-node register` prints it as hex and
+    /// `rand bond --registration` reads it back. Bincode, like [`Transaction::encode`] — a
+    /// registration travels inside an `Action`, so nothing hashes this form and the two ends
+    /// only have to agree with each other.
+    ///
+    /// [`Transaction::encode`]: crate::Transaction::encode
+    pub fn encode(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("Registration serializes")
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Registration, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+}
+
+/// The encrypted transcript of a confidential call's private inputs (spec §6.1).
+///
+/// The chain checks nothing about the ciphertext — exactly as with a note [`Envelope`] — only
+/// that it is no larger than [`MAX_CALL_ENVELOPE_BYTES`]. Binding to the call comes from the
+/// proof's public input commitment `H_IN`, which the sealing uses as AEAD associated data:
+/// an envelope that does not belong to this call simply fails to open.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallEnvelope {
+    /// ML-KEM-768 ciphertext sealing the per-call key to the auditor; empty when there is none.
+    pub kem_ct: Vec<u8>,
+    /// The per-call key wrapped under the caller's outgoing viewing key.
+    pub to_sender: Vec<u8>,
+    /// The per-call key wrapped under the auditor's KEM shared secret; empty when there is none.
+    pub to_auditor: Vec<u8>,
+    /// The inputs themselves, sealed under the per-call key with `H_IN` as associated data.
+    pub body: Vec<u8>,
+}
+
+impl CallEnvelope {
+    /// Total wire size of the four parts.
+    pub fn len(&self) -> usize {
+        self.kem_ct.len() + self.to_sender.len() + self.to_auditor.len() + self.body.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// What a validator signs to claim an address in the register: the chain and the payout
+/// address. The key itself is not in the message — it is what verifies the signature, so a
+/// valid signature already proves possession of `registration.public_key`.
+///
+/// The message therefore binds chain and payout only; what binds the registration to the
+/// address it is claiming is a separate rule the message cannot carry: the enclosing
+/// `Action::Bond`'s `validator` field must equal `registration.public_key.address()`, and
+/// S2's validation asserts it. Without that check a bond could register one key's payout
+/// under another key's address.
+pub fn registration_message(chain_id: u64, payout: &ShieldedAddress) -> Hash {
+    let bytes = bincode::serialize(&(chain_id, payout)).expect("serializes");
+    Hash::digest_domain(b"rand-register", &bytes)
+}
+
+/// What a validator signs to move stake into unbonding. The register's `nonce` is the replay
+/// protection: there are no accounts on this chain to carry one.
+pub fn unbond_message(chain_id: u64, validator: &Address, amount: u64, nonce: u64) -> Hash {
+    let bytes = bincode::serialize(&(chain_id, validator, amount, nonce)).expect("serializes");
+    Hash::digest_domain(b"rand-unbond", &bytes)
+}
+
+/// What a validator signs to withdraw released stake and rewards into a deposit note. The
+/// blinding `r`, the note's `time` and the envelope are in the message so the note the ledger
+/// computes is the note the validator asked for — and, since the envelope is sealed against that
+/// exact note, the one the payout wallet can open.
+#[allow(clippy::too_many_arguments)]
+pub fn withdraw_message(
+    chain_id: u64,
+    validator: &Address,
+    amount: u64,
+    nonce: u64,
+    time: u32,
+    r: &Word8,
+    envelope: &Envelope,
+) -> Hash {
+    let bytes = bincode::serialize(&(chain_id, validator, amount, nonce, time, r, envelope)).expect("serializes");
+    Hash::digest_domain(b"rand-withdraw", &bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::Keypair;
+
+    fn addr() -> ShieldedAddress {
+        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
+    }
+
+    fn env() -> Envelope {
+        Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] }
+    }
+
+    #[test]
+    fn call_envelopes_roundtrip_and_measure_their_four_parts() {
+        let e = CallEnvelope { kem_ct: vec![1; 1088], to_sender: vec![2; 48], to_auditor: vec![3; 48], body: vec![4; 100] };
+        assert_eq!(e.len(), 1088 + 48 + 48 + 100);
+        assert!(!e.is_empty());
+        let back: CallEnvelope = bincode::deserialize(&bincode::serialize(&e).unwrap()).unwrap();
+        assert_eq!(back, e);
+        let empty = CallEnvelope { kem_ct: vec![], to_sender: vec![], to_auditor: vec![], body: vec![] };
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn registrations_roundtrip() {
+        let k = Keypair::from_seed([9; 32]).unwrap();
+        let payout = addr();
+        let r = Registration {
+            public_key: k.public_key().clone(),
+            payout: payout.clone(),
+            signature: k.sign(registration_message(7, &payout).as_bytes()),
+        };
+        // The wire form the node prints and a wallet's `--registration` reads back.
+        assert_eq!(Registration::decode(&r.encode()).unwrap(), r);
+        assert!(Registration::decode(b"not a registration").is_err());
+        assert!(r.public_key.verify(registration_message(7, &payout).as_bytes(), &r.signature));
+        assert!(!r.public_key.verify(registration_message(8, &payout).as_bytes(), &r.signature));
+    }
+
+    /// Every field of every staking message is bound, and the three domains never collide.
+    #[test]
+    fn signing_messages_bind_every_field_under_distinct_domains() {
+        let v = Address([1; 32]);
+        let w = Address([2; 32]);
+        let base = unbond_message(7, &v, 5, 1);
+        for other in [unbond_message(8, &v, 5, 1), unbond_message(7, &w, 5, 1), unbond_message(7, &v, 6, 1), unbond_message(7, &v, 5, 2)] {
+            assert_ne!(other, base);
+        }
+        let wbase = withdraw_message(7, &v, 5, 1, 9, &[3; 8], &env());
+        for other in [
+            withdraw_message(8, &v, 5, 1, 9, &[3; 8], &env()),
+            withdraw_message(7, &w, 5, 1, 9, &[3; 8], &env()),
+            withdraw_message(7, &v, 6, 1, 9, &[3; 8], &env()),
+            withdraw_message(7, &v, 5, 2, 9, &[3; 8], &env()),
+            withdraw_message(7, &v, 5, 1, 10, &[3; 8], &env()),
+            withdraw_message(7, &v, 5, 1, 9, &[4; 8], &env()),
+            withdraw_message(7, &v, 5, 1, 9, &[3; 8], &Envelope { body: vec![9], ..env() }),
+        ] {
+            assert_ne!(other, wbase);
+        }
+        let mut other_payout = addr();
+        other_payout.pk = [5; 8];
+        assert_ne!(registration_message(7, &addr()), registration_message(7, &other_payout));
+        assert_ne!(registration_message(7, &addr()), registration_message(8, &addr()));
+        // Different domains, so no message of one kind is ever a message of another.
+        assert_ne!(base.to_hex(), wbase.to_hex());
+    }
+}
+
+// ── block aggregation: the aggregator register's signed forms (spec §2–§3) ──────────────────
+
+/// An aggregator's first appearance in the register (spec §2.2): the Dilithium2 key that signs
+/// its later aggregation actions and the shielded address its subsidy, proving shares and bond
+/// are paid to. `signature` is over [`aggregator_register_message`]. The [`Registration`] twin,
+/// one role over.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregatorRegistration {
+    pub public_key: PublicKey,
+    pub payout: ShieldedAddress,
+    pub signature: Signature,
+}
+
+/// One signed header of a slash's evidence pair (spec §2.2): two of these with the same
+/// `(aggregator, nonce)` and different content are the equivocation `Action::SlashAggregator`
+/// proves. Carried boxed so a slash transaction's size stays bounded by two headers rather than
+/// by any list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedAggregateHeader {
+    pub aggregator: Address,
+    pub nonce: u64,
+    pub time: u32,
+    pub r: Word8,
+    pub covers: Vec<crate::crypto::Hash>,
+    pub proof_hash: crate::crypto::Hash,
+    pub signature: Signature,
+}
+
+/// What an aggregator signs to claim an address in the register: the chain and the payout —
+/// [`registration_message`]'s exact construction, one role over. As there, the enclosing
+/// action's `aggregator` field must equal `registration.public_key.address()`, so one key's
+/// payout cannot be registered under another key's address.
+pub fn aggregator_register_message(chain_id: u64, payout: &ShieldedAddress) -> crate::crypto::Hash {
+    let bytes = bincode::serialize(&(chain_id, payout)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"rand-aggregator-register", &bytes)
+}
+
+/// What an aggregator signs to stop submitting and start the unbonding window: the register's
+/// `nonce` is the replay protection — [`unbond_message`]'s, one role over.
+pub fn aggregator_unbond_message(chain_id: u64, aggregator: &Address, nonce: u64) -> crate::crypto::Hash {
+    let bytes = bincode::serialize(&(chain_id, aggregator, nonce)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"rand-aggregator-unbond", &bytes)
+}
+
+/// What an aggregator signs to withdraw its released bond into a deposit note: `r`, the note's
+/// `time` and the envelope are in the message so the note the ledger computes is the note the
+/// aggregator asked for — [`withdraw_message`]'s, one role over.
+pub fn aggregator_withdraw_message(
+    chain_id: u64,
+    aggregator: &Address,
+    nonce: u64,
+    time: u32,
+    r: &Word8,
+    envelope: &Envelope,
+) -> crate::crypto::Hash {
+    let bytes = bincode::serialize(&(chain_id, aggregator, nonce, time, r, envelope)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"rand-aggregator-withdraw", &bytes)
+}
+
+/// What an aggregator signs over an `Aggregate` submission (spec §3.1): the chain, the register
+/// nonce, the payout note's `time` and blinding `r`, the cover set, and the proof's hash — the
+/// full content an equivocating pair of `SignedAggregateHeader`s is evidence of.
+pub fn aggregate_signing_hash(
+    chain_id: u64,
+    nonce: u64,
+    time: u32,
+    r: &Word8,
+    covers: &[crate::crypto::Hash],
+    proof_hash: &crate::crypto::Hash,
+) -> crate::crypto::Hash {
+    let bytes = bincode::serialize(&(chain_id, nonce, time, r, covers, proof_hash)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"rand-aggregate", &bytes)
+}

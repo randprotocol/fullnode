@@ -15,8 +15,8 @@ Related: `docs/staking.md` (the register pattern every structure here copies), `
 
 | question (`aggregation.md` §5) | ruling |
 |---|---|
-| subsidy amount, halving, cap | Bitcoin-style: **100 SHRUGG per sealed block**, halving every **210 000 sealed blocks**, zero after 64 halvings (geometric cap ≈ 42 M SHRUGG) |
-| proving share | **floor to the proposer, excess to the aggregator**: the proposer keeps exactly `BUNDLE_BASE` (0.001 SHRUGG) per bundle; everything a sender attaches above the floor is the proving share |
+| subsidy amount, halving, cap | Bitcoin-style: **100 RAND per sealed block**, halving every **210 000 sealed blocks**, zero after 64 halvings (geometric cap ≈ 42 M RAND) |
+| proving share | **floor to the proposer, excess to the aggregator**: the proposer keeps exactly `BUNDLE_BASE` (0.001 RAND) per bundle; everything a sender attaches above the floor is the proving share |
 | sealing window `k` | **256 finalised blocks** (`ANCHOR_WINDOW`/`TIME_WINDOW`), then never: an older bundle stays raw, no subsidy, the proposer keeps the excess |
 | double coverage | the first finalised aggregate covering a bundle wins; a later one covering it is invalid |
 | submission spam | **registered aggregators with a refundable bond**, every submission signed; the bond is slashed only for equivocation |
@@ -30,15 +30,15 @@ Two pieces of ledger state and three actions, all modelled on S2's staking regis
 in `ledger/aggregation.rs`, keyed by address, hashed into the state root as a component present
 only on chains whose genesis enables aggregation (`genesis.aggregation: Option<AggregationConfig>`,
 the way `bridge` gates its component): the leaf is
-`blake3("shrugg-aggregator-leaf-1", addr || bond || nonce || release || payout pk || payout kem_ek)`
+`blake3("rand-aggregator-leaf-1", addr || bond || nonce || release || payout pk || payout kem_ek)`
 and the root joins the state root as `… || aggregators_root` under a new domain
-`shrugg-state-3`. A chain without the section keeps the current root byte for byte.
+`rand-state-3`. A chain without the section keeps the current root byte for byte.
 
 **Joining, leaving.**
 - `Action::RegisterAggregator { registration: AggregatorRegistration { public_key, payout, signature } }`
-  on a bundle whose `burn == AGGREGATOR_BOND` (genesis parameter, default `100 * UNITS_PER_SHRUGG`),
+  on a bundle whose `burn == AGGREGATOR_BOND` (genesis parameter, default `100 * UNITS_PER_RAND`),
   exactly as a validator's `Bond` burns stake; the signature is over
-  `blake3("shrugg-aggregator-register", chain_id || payout)`. Refused if the address is registered.
+  `blake3("rand-aggregator-register", chain_id || payout)`. Refused if the address is registered.
 - `Action::UnbondAggregator { aggregator, nonce, signature }`: bundle-less, validator-style signed;
   sets `unbonding = Some(height + 256)`; a submitting aggregator with `unbonding` set is refused.
 - `Action::WithdrawAggregator { aggregator, nonce, time, r, envelope, signature }`: bundle-less;
@@ -56,7 +56,7 @@ Action::Aggregate {
     time: u32,                    // window-checked; the payout note's time
     r: Word8,
     envelope: Envelope,           // the payout note sealed to `payout`
-    signature: Signature,         // over blake3("shrugg-aggregate", chain_id || nonce || time || r || covers || proof hash)
+    signature: Signature,         // over blake3("rand-aggregate", chain_id || nonce || time || r || covers || proof hash)
 }
 ```
 Bundle-less. Size cap `MAX_AGGREGATE_BYTES` = the proof cap plus `MAX_COVERS · 32` bytes.
@@ -92,7 +92,7 @@ bundle-less, no fee. Everything else invalid is simply refused.
 
 - **Subsidy.** The block that includes an `Aggregate` mints `subsidy(n)` to the aggregator, where
   `n` = the number of sealed blocks so far (a ledger counter incremented per included aggregate, so
-  an idle chain does not consume the schedule): `subsidy(n) = 100 SHRUGG >> (n / 210_000)`, zero
+  an idle chain does not consume the schedule): `subsidy(n) = 100 RAND >> (n / 210_000)`, zero
   once the shift reaches 64.
 - **Proving share.** When a bundle is included in its block, the proposer is credited only
   `BUNDLE_BASE`; the excess `fee − BUNDLE_BASE` goes to an `unsealed_fees: BTreeMap<Hash, u64>`
@@ -106,7 +106,7 @@ bundle-less, no fee. Everything else invalid is simply refused.
   public in that block only.
 - **Supply invariant** (`docs/supply.md`) gains two terms:
   `supply = genesis + faucet + Σ subsidies − burns − slashed`, with `aggregator_bonds` tracked as
-  its own counter (burned in on registration, paid out on withdraw). `shrugg_getSupply` reports
+  its own counter (burned in on registration, paid out on withdraw). `rand_getSupply` reports
   `subsidised`, `sealed_blocks`, `aggregator_bonds` and `slashed` separately.
 
 ## 3. Sealed history, pruning, sync (approved)
@@ -130,16 +130,16 @@ bundle-less, no fee. Everything else invalid is simply refused.
 
 ## 4. RPC, wallet, aggregator daemon, tests, rollout (approved)
 
-- **RPC.** `shrugg_getBlockByHeight` gains `sealed` and per-bundle `sealed_by`;
-  `shrugg_getAggregate(tx)` returns the public fields (`covers`, `aggregator`, `subsidy`,
-  `proving_share`, `n`); `shrugg_getAggregators` lists the register; `shrugg_getUnsealed(from, limit)`
-  pages the bundles an aggregator may still cover (hash, height, excess fee); `shrugg_submitAggregate`
-  is `shrugg_sendTransaction` (no new path). `tx_json` renders the four actions.
-- **Node CLI (the aggregator role).** `shrugg-node aggregator register --bond --payout`, `unbond`,
-  `withdraw` (the validator commands' twins), and `shrugg-node aggregate --watch`: a daemon that
-  polls `shrugg_getUnsealed`, fetches the raw bundles, calls `recursion::aggregate` (CPU or GPU),
+- **RPC.** `rand_getBlockByHeight` gains `sealed` and per-bundle `sealed_by`;
+  `rand_getAggregate(tx)` returns the public fields (`covers`, `aggregator`, `subsidy`,
+  `proving_share`, `n`); `rand_getAggregators` lists the register; `rand_getUnsealed(from, limit)`
+  pages the bundles an aggregator may still cover (hash, height, excess fee); `rand_submitAggregate`
+  is `rand_sendTransaction` (no new path). `tx_json` renders the four actions.
+- **Node CLI (the aggregator role).** `rand-node aggregator register --bond --payout`, `unbond`,
+  `withdraw` (the validator commands' twins), and `rand-node aggregate --watch`: a daemon that
+  polls `rand_getUnsealed`, fetches the raw bundles, calls `recursion::aggregate` (CPU or GPU),
   and submits. It is a separate process from the validator and needs only an RPC endpoint.
-- **Wallet.** No change: a sender attaches `--fee` above the floor to be sealed first; `shrugg fee`
+- **Wallet.** No change: a sender attaches `--fee` above the floor to be sealed first; `rand fee`
   prints the floor and the current median excess.
 - **Genesis.** `aggregation: Option<AggregationConfig { bond, max_covers, subsidy_base, halving_blocks, window }>`;
   chain 8 has none; enabling it is a chain cut (like the bridge).

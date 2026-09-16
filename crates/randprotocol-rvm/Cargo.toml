@@ -1,0 +1,52 @@
+[package]
+name = "randprotocol-rvm"
+version = "0.1.0"
+edition = "2021"
+description = "Rand recursion VM (rVM): a field-native machine whose programs verify Rand zkVM proofs"
+
+[lib]
+name = "randprotocol_rvm"
+path = "src/lib.rs"
+
+[dependencies]
+# Exactly research's pins; the rVM shares the field, the permutation and the proof system.
+p3-goldilocks = "=0.7.0"
+p3-field = "=0.7.0"
+p3-symmetric = "=0.7.0"
+p3-challenger = "=0.7.0"
+p3-poseidon2 = "=0.7.0"
+p3-air = "=0.7.0"
+p3-batch-stark = "=0.7.0"
+p3-lookup = "=0.7.0"
+p3-uni-stark = "=0.7.0"
+p3-fri = "=0.7.0"
+p3-dft = "=0.7.0"
+p3-merkle-tree = "=0.7.0"
+p3-commit = "=0.7.0"
+p3-matrix = "=0.7.0"
+p3-util = "=0.7.0"
+rand = { version = "0.10", features = ["std_rng"] }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+# The reference verifier this crate's first program mirrors, the reference permutation it hashes
+# with, the Chip AIRs its constraint emitter walks, and the bundle guest its fixtures prove.
+randprotocol-zkvm = { path = "../randprotocol-zkvm" }
+# The GPU (CUDA) and CPU-twin NTT/Poseidon2-Merkle engines the proving backends run on —
+# research's dependency, consumed as-is (M5.4 R1: the rVM's shapes need no new kernels).
+rand-zkvm-cuda = { path = "../../../circuits/rand-zkvm-cuda", optional = true }
+
+[dev-dependencies]
+hex = "0.4"
+
+[features]
+# `rand-zkvm-cuda`'s CPU-twin engines (the reference backend). Research's feature, mirrored.
+reference-backend = ["dep:rand-zkvm-cuda"]
+# `cuda` and `mock-cuda` are mutually exclusive: enabling both is a hard `compile_error!` in
+# rand-zkvm-cuda, so the host mock can never be silently substituted for the GPU.
+# `Backend::Cuda` against a real device. Pulls `cuda-core`, which needs a CUDA 13 toolkit
+# (`rand-zkvm-cuda/ptx/PTX_BUILD.md`): a fleet-GPU-node build, never this box's.
+cuda = ["dep:rand-zkvm-cuda", "rand-zkvm-cuda/cuda"]
+# Deliberately *not* `["cuda", ...]` — `rand-zkvm-cuda/cuda` is what pulls `cuda-core`, so
+# enabling it would put a CUDA toolkit back in the way of a no-GPU test run. The two features
+# exercise the identical `Backend::Cuda` path.
+mock-cuda = ["dep:rand-zkvm-cuda", "rand-zkvm-cuda/mock-driver"]

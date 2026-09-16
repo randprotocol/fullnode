@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Cut the chain-8 genesis: 18 validators, each staked at exactly the 1000 SHRUGG staking minimum,
-# each with its own payout wallet, five 1000 SHRUGG deposit notes, faucet on, production FRI,
+# Cut the chain-8 genesis: 18 validators, each staked at exactly the 1000 RAND staking minimum,
+# each with its own payout wallet, five 1000 RAND deposit notes, faucet on, production FRI,
 # 1000-block epochs, no bridge section. Constraint set 5 (build 03c9fb9).
 #
 # Run from the repo root. Re-running produces a DIFFERENT genesis hash: every deposit note carries
@@ -12,8 +12,8 @@
 # for how solid that name mapping is.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-NODE=${NODE:-target/release/shrugg-node}
-WALLET=${WALLET:-target/release/shrugg}
+NODE=${NODE:-target/release/rand-node}
+WALLET=${WALLET:-target/release/rand}
 CHAIN7=${CHAIN7:-deploy/genesis-chain7.json}
 ALLOC_WALLETS=${ALLOC_WALLETS:-wallets}          # shielded-{1..5}.key.json (gitignored)
 OUT=${OUT:-deploy/genesis-chain8.json}
@@ -31,7 +31,7 @@ for i in "${!regions[@]}"; do
   pk=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['validators'][6+int(sys.argv[2])]['public_key'])" "$CHAIN7" "$i")
   args+=(--validator "$pk,1000,$(payout "${regions[$i]}")")
 done
-# Five 1000 SHRUGG deposit notes, one per shielded wallet.
+# Five 1000 RAND deposit notes, one per shielded wallet.
 for i in 1 2 3 4 5; do
   args+=(--alloc "$("$WALLET" --key "$ALLOC_WALLETS/shielded-$i.key.json" address | tail -1)=1000")
 done

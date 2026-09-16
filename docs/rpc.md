@@ -4,7 +4,7 @@ The node serves JSON-RPC 2.0 over HTTP on `--rpc` (default `127.0.0.1:8545`).
 
 ```bash
 curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"shrugg_getHead","params":[]}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"rand_getHead","params":[]}'
 ```
 
 The same port also serves a WebSocket on `/` and `/ws`, which pushes every committed head instead
@@ -15,9 +15,9 @@ Conventions:
 - Validator addresses are base58 strings (32 bytes). Hashes are 64 hex characters, with or
   without `0x`. Shielded values (commitments, nullifiers, anchors, tree roots, witness levels) are
   `Word8` — eight little-endian `u32` words as 64 lowercase hex characters.
-- Shielded addresses are `shrugg1` + base58, about 1668 characters. A parameter longer than 2000
+- Shielded addresses are `rand1` + base58, about 1668 characters. A parameter longer than 2000
   characters is refused on its length before it is parsed.
-- Amounts are strings of smallest units (`"1500000000"` = 1.5 SHRUGG); 1 SHRUGG = 10^9 units.
+- Amounts are strings of smallest units (`"1500000000"` = 1.5 RAND); 1 RAND = 10^9 units.
   Amounts *inside a decoded transaction* are JSON integers instead — a bundle's `fee` and `burn`, a
   mint's amount, a staking action's amount — because they are being reported as the transaction's own
   fields rather than as chain state.
@@ -25,17 +25,17 @@ Conventions:
 - **Every request must carry an `id` member**, batched or not: an object without one is a JSON-RPC
   notification, and this node refuses it with `-32600` rather than running it silently. An explicit
   `"id": null` is a normal request. See [Batches](#batches) for why.
-- `shrugg_client::RpcClient` (Rust) wraps every method below.
+- `randprotocol_client::RpcClient` (Rust) wraps every method below.
 
 **There is no balance method, and no account method.** This chain has no accounts; see
 `docs/shielded.md`. A wallet computes its own balance by scanning the commitment tree with its
-viewing key, which is what `shrugg_getCommitments` and `shrugg_getNullifiers` exist for. That
+viewing key, which is what `rand_getCommitments` and `rand_getNullifiers` exist for. That
 holds for bridged assets too: a bridged holding is a note whose `asset` word is the registry's
 index for it (phase S3, `docs/bridge.md`), so the bridge methods below report the bridge's own
 *public* state — guardians, emitters, the asset registry, the outbound burn log — and no
-per-address balance. `shrugg_getAssetBalance` is gone for good.
+per-address balance. `rand_getAssetBalance` is gone for good.
 
-**A node can now hold viewing keys — never spend keys.** `shrugg_importViewingKey` hands the node
+**A node can now hold viewing keys — never spend keys.** `rand_importViewingKey` hands the node
 a viewing key so it scans on the holder's behalf (the Zcash `z_importviewingkey` analogue, for
 explorers). That is the one exception to "the node never holds a key", and it is deliberate: the
 key arrives in memory only, is capped at 64 per node, dies with the process, and can disclose
@@ -47,7 +47,7 @@ import has happened: bind it where you would bind a wallet, not to the public in
 The body of a POST to `/` is either one request object or an **array of at most 20** of them. A
 batch answers with an array of the same length, in request order, one response per request —
 errors included, so a client can correlate by position as well as by id. The requests run one after
-another, not concurrently: a batch is a request amplifier, and `shrugg_getWitness` rebuilds the
+another, not concurrently: a batch is a request amplifier, and `rand_getWitness` rebuilds the
 whole commitment tree per call.
 
 A request object with no `id` member is a JSON-RPC **notification**, and this node refuses it with
@@ -63,7 +63,7 @@ them to. A batch that parses always answers `200`, whatever the errors inside it
 
 **The count cap is not the byte cap.** The whole body is still bounded by the node's request-body
 limit, which is sized for a single proof-carrying transaction, and that limit is enforced
-before the count is ever looked at: a batch of two *proof-carrying* `shrugg_sendTransaction` calls
+before the count is ever looked at: a batch of two *proof-carrying* `rand_sendTransaction` calls
 is refused with a `413` and a `-32600` body naming the limit, whatever the count cap says. (The
 bundle-less actions — a faucet mint, an `Unbond`, a `Withdraw` — are a few kilobytes each and
 batch fine; it is the proofs that do not.) Batching proved submissions does not work, and is not
@@ -71,21 +71,21 @@ what this is for; batching the reads a wallet or explorer makes per page is.
 
 ```bash
 curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
-  -d '[{"jsonrpc":"2.0","id":1,"method":"shrugg_getHead","params":[]},
-       {"jsonrpc":"2.0","id":2,"method":"shrugg_getTreeInfo","params":[]}]'
+  -d '[{"jsonrpc":"2.0","id":1,"method":"rand_getHead","params":[]},
+       {"jsonrpc":"2.0","id":2,"method":"rand_getTreeInfo","params":[]}]'
 ```
 
 ## Methods
 
-### `shrugg_chainId`
+### `rand_chainId`
 Params: `[]`. Result: chain id (integer). Transactions must carry this id.
 
-### `shrugg_tokenInfo`
-Params: `[]`. Result: `{ "symbol": "SHRUGG", "decimals": 9 }`.
+### `rand_tokenInfo`
+Params: `[]`. Result: `{ "symbol": "RAND", "decimals": 9 }`.
 
-### `shrugg_sendTransaction`
+### `rand_sendTransaction`
 Params: `[hex]` where `hex` is `bincode(Transaction)` (as produced by `Transaction::encode()` in
-`shrugg-core`, or by the `shrugg` wallet). Result: the transaction hash.
+`randprotocol-core`, or by the `rand` wallet). Result: the transaction hash.
 
 The node validates against the state at the tip of the chain in the order of `docs/shielded.md`
 §5 — size caps, chain id, shape and fee floor, anchor, time, nullifiers and commitments, action
@@ -99,11 +99,11 @@ in the mempool, and gossips it. Errors come back as code `-32000` with the reaso
 consumed`, `the attestation names a different recipient`, `the attestation deposits under asset 2,
 and the transaction names 1`, `the burn's asset bundle burns 399, not the 400 the action sends`.
 
-Acceptance is not commitment: poll `shrugg_getTransaction` until it returns a block.
+Acceptance is not commitment: poll `rand_getTransaction` until it returns a block.
 
-### `shrugg_mint` (testnet faucet)
-Params: `[address]` or `[address, amount]`, where `address` is a `shrugg1…` shielded address and
-`amount` is a string of units, at most `100000000000` (100 SHRUGG; the default). Result: the mint
+### `rand_mint` (testnet faucet)
+Params: `[address]` or `[address, amount]`, where `address` is a `rand1…` shielded address and
+`amount` is a string of units, at most `100000000000` (100 RAND; the default). Result: the mint
 transaction hash.
 
 Only available when the genesis file has `"faucet": true`; otherwise error `-32000`
@@ -111,9 +111,9 @@ Only available when the genesis file has `"faucet": true`; otherwise error `-320
 under a throwaway sender key, signs the `Mint` with its own validator key and submits it through
 the normal mempool, so the mint goes through consensus and every node applies it. An observer has
 no validator key and answers `faucet mints are signed by validators; ask a validator node`. Poll
-`shrugg_getTransaction` for the commit.
+`rand_getTransaction` for the commit.
 
-### `shrugg_getCommitments`
+### `rand_getCommitments`
 Params: `[from_index]` or `[from_index, limit]`. Result: a page of commitment-tree leaves from
 leaf `from_index`, oldest first, at most 1000 rows however large `limit` is (a missing or null
 `limit` asks for the maximum). Page until the reply is short or empty.
@@ -126,7 +126,7 @@ leaf `from_index`, oldest first, at most 1000 rows however large `limit` is (a m
 Every leaf and every envelope is served to everyone; only a viewing key tells one wallet's rows
 from another's.
 
-### `shrugg_getNullifiers`
+### `rand_getNullifiers`
 Params: `[from_height]` or `[from_height, limit]`. Result: every nullifier published from that
 block height onwards, same 1000-row cap.
 
@@ -137,7 +137,7 @@ block height onwards, same 1000-row cap.
 A page can stop inside a height, so a caller pages back to the highest height it saw rather than
 past it; re-reading rows is harmless.
 
-### `shrugg_getCompactBlocks`
+### `rand_getCompactBlocks`
 Params: `[from_height, to_height]`, both required. Result: one row per block in the range, oldest
 first, carrying everything a light wallet needs to trial-decrypt and track spends — and nothing
 else: no proofs, no actions, no receipts.
@@ -167,7 +167,7 @@ that transaction's own notes, which is the order served here.
 
 Errors: `-32602` for a backwards range (`to_height` below `from_height`) or a missing bound.
 
-### `shrugg_getAnchor`
+### `rand_getAnchor`
 Params: `[]` for the head, or `[height]`. Result: `{ "height": 192, "root": "6b1d…c4" }`, or error
 `-32001` for a height with no recorded anchor.
 
@@ -175,7 +175,7 @@ Only *block-end* roots are anchors, and only the newest 256 are kept. A node tha
 sync batch longer than that window holds rows only for the heights the batch covered, so ask for
 the head — the only anchor a prover should build against anyway.
 
-### `shrugg_getWitness`
+### `rand_getWitness`
 Params: `[index]`. Result: `null` past the end of the tree, else the Merkle path of that leaf,
 leaf-first, exactly 32 levels, with the tree's *current* root:
 
@@ -188,11 +188,11 @@ under and refetches if a leaf was appended in between. This is the most expensiv
 serves (it rebuilds a full depth-32 tree from every stored leaf) and the one request that
 discloses something about the caller — see `docs/shielded.md` §6.
 
-### `shrugg_getTreeInfo`
+### `rand_getTreeInfo`
 Params: `[]`. Result: `{ "next_index": 41, "root": "6b1d…c4", "nullifiers": 12 }` — the leaf count
 (the index the next note will get), the current root, and how many notes have been spent.
 
-### `shrugg_importViewingKey`
+### `rand_importViewingKey`
 Params: `[viewing_key]` or `[viewing_key, rescan_from_height]`, where `viewing_key` is a party
 viewing key's `nk` as 64 hex characters and `rescan_from_height` is the block height to start
 watching from (default 0, the whole chain). Result:
@@ -212,16 +212,16 @@ a restart clears every import, and the operator's orchestration re-imports on bo
 Imports are bounded and idempotent:
 
 - At most **64** keys per node (`viewing_keys` in the reply is the live count, also in
-  `shrugg_status`). The 65th distinct key is `-32000`; a key already held is a no-op
+  `rand_status`). The 65th distinct key is `-32000`; a key already held is a no-op
   (`"imported": false`) — in particular it does **not** restart the scan, so a rescan from an
   earlier height is a restart plus re-import, not a second call.
 - A `rescan_from_height` in the future is accepted and simply matches nothing until the chain
   reaches it.
-- Import itself never scans: the scan is lazy, driven by `shrugg_getViewingNotes`.
+- Import itself never scans: the scan is lazy, driven by `rand_getViewingNotes`.
 
 Errors: `-32602` for a malformed key.
 
-### `shrugg_getViewingNotes`
+### `rand_getViewingNotes`
 Params: `[viewing_key]` or `[viewing_key, from_index, limit]` — `from_index` pages the matched
 notes by leaf index (default 0), `limit` caps the page (default and maximum 1000, as everywhere).
 Result:
@@ -255,16 +255,16 @@ everywhere chain state is served.
 Errors: `-32602` for a malformed key or page bound, `-32001` for a key this node has not
 imported.
 
-### `shrugg_getProgram`
+### `rand_getProgram`
 Params: `[program_id]`. Result: `null` or
 `{ "id", "base_pc", "words_len", "code_hash", "deployed_at" }`. There is no `deployer` field: a
 deploy is paid by a bundle, so the chain does not know who deployed it.
 
-### `shrugg_getProgramCode`
+### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
 proves against).
 
-### `shrugg_getReceipt`
+### `rand_getReceipt`
 Params: `[tx_hash]`. Result: `null` until the call is committed, then
 
 ```json
@@ -274,14 +274,14 @@ Params: `[tx_hash]`. Result: `null` until the call is committed, then
 
 `h_in` is the proof's public commitment to the call's *private* inputs (`Word8` hex, zkVM M4.1).
 It discloses nothing on its own — it is a salted digest — and it is what a call-input envelope is
-sealed against, so a holder needs it to open one (`shrugg_getCallEnvelope`) and to check an
+sealed against, so a holder needs it to open one (`rand_getCallEnvelope`) and to check an
 opened transcript with `hash::input_digest(salt, inputs)`.
 
 There is no `effect` field: effect kind 1 (the program-driven transfer to an account) was deleted
 with the accounts. A call's outputs are recorded and nothing else moves; value moves only through
 the bundle that paid for the call.
 
-### `shrugg_getCallEnvelope`
+### `rand_getCallEnvelope`
 Params: `[tx_hash]`. Result: `null`, or the call's input envelope (spec §6.1) in hex:
 
 ```json
@@ -293,19 +293,19 @@ the call's private input vector and its `H_IN` salt, sealed under a per-call key
 `h_in` as associated data; `to_sender` wraps that key to the caller's outgoing
 viewing key and `kem_ct`/`to_auditor` to the auditor the caller named, both empty strings when
 there is none. The node holds no key that opens any of it and never looks inside — a viewing key
-imported for note scanning (`shrugg_importViewingKey`) opens *note* envelopes only; call
+imported for note scanning (`rand_importViewingKey`) opens *note* envelopes only; call
 envelopes are not part of its scan. It is served
 so that a wallet with the caller's viewing key, a per-call key, or the auditor's key can open it
-(`shrugg_zkvm::call_envelope`) and check the transcript against `H_IN`. `null` means the call
+(`randprotocol_zkvm::call_envelope`) and check the transcript against `H_IN`. `null` means the call
 published no envelope (`--no-envelope`), the transaction is not a call, or this node has no
 receipt for that hash.
 
-### `shrugg_estimateFee`
+### `rand_estimateFee`
 Params: `[spec]`, one of `{"kind":"bundle"}`, `{"kind":"deploy","words":n}` or
 `{"kind":"call","tier":t}` (`t` one of 10, 12, 14, 16, 18, 20). Result: the minimum fee in units,
 as a string. `{"kind":"bundle"}` is the floor for a plain transfer: `1000000`.
 
-### `shrugg_getTransaction`
+### `rand_getTransaction`
 Params: `[hash]`. Result: `null` until committed, then:
 
 ```json
@@ -372,7 +372,7 @@ exception — a validator address, an amount and a replay nonce are public in th
 way a mint's amount is, because the validator register and the bridge's accounting are public
 (spec §8). A shielded note's later spend stays private in every case.
 
-### `shrugg_checkTransaction`
+### `rand_checkTransaction`
 Params: `[hash, key]`, where `key` is a per-transaction `TxKey` as 64 hex characters. Result:
 `null` for a hash this node has no committed transaction for, else what the key discloses about
 it:
@@ -398,30 +398,30 @@ mint's, a withdraw's and a genesis alloc's envelopes are not tried: they are sea
 node under keys dropped at once, so no `TxKey` for them can exist.
 
 The call is **stateless**: the key is used for this one request and dropped — it is not imported,
-stored, or learnable from anything the node keeps (unlike `shrugg_importViewingKey`, which
+stored, or learnable from anything the node keeps (unlike `rand_importViewingKey`, which
 retains). A key that opens nothing gets `{ "disclosed": [] }`, indistinguishable from a wrong key
 by design. Amounts are strings, as everywhere chain state is served.
 
 Errors: `-32602` for a malformed hash or key (both are parsed before any storage read).
 
-### `shrugg_getBlockByHeight` / `shrugg_getBlockByHash`
+### `rand_getBlockByHeight` / `rand_getBlockByHash`
 Params: `[height]` (integer) or `[hash]`. Result: `null` if unknown, else:
 ```json
 {
   "hash": "647b…", "height": 50, "view": 92, "parent": "2d41…",
   "proposer": "3v3VBJ…", "timestamp_ms": 1788000123456,
   "tx_root": "0000…", "state_root": "a1b2…", "justify_view": 91,
-  "tx_count": 0, "transactions": [ ...same shape as shrugg_getTransaction.tx... ]
+  "tx_count": 0, "transactions": [ ...same shape as rand_getTransaction.tx... ]
 }
 ```
 Only committed blocks are served. `justify_view` is the view of the quorum certificate for the
 parent that this block carries.
 
-### `shrugg_getHead`
+### `rand_getHead`
 Params: `[]`. Result: `{ "height": 1998, "hash": "…", "view": 2251 }` (`view` is the node's current
 consensus view, which runs ahead of height when views time out).
 
-### `shrugg_status` (alias `shrugg_syncStatus`)
+### `rand_status` (alias `rand_syncStatus`)
 Params: `[]`. Result:
 ```json
 {
@@ -438,7 +438,7 @@ Params: `[]`. Result:
 ```
 `syncing` is true while a batch request to a peer is in flight; `sync_target` is the highest height
 any peer has advertised. `viewing_keys` is how many viewing keys this node is holding for
-node-side scanning (see `shrugg_importViewingKey`) — in memory only, so it reads 0 after every
+node-side scanning (see `rand_importViewingKey`) — in memory only, so it reads 0 after every
 restart, and anything above it is worth an operator's attention precisely because it changes what
 compromising the process would disclose.
 
@@ -476,10 +476,10 @@ but whose epoch has not arrived is the first without the second. `notes` is ever
 it has ever spent, and `hc_bundle` the bundle guest this chain's proofs are against — a node whose
 build disagrees with the genesis value refuses to start at all.
 
-### `shrugg_getPeers`
+### `rand_getPeers`
 Params: `[]`. Result: array of `{ "peer_id": "12D3KooW...", "addrs": ["/ip4/…/tcp/30303"], "connected_secs": 1241 }`.
 
-### `shrugg_getBridgeState`
+### `rand_getBridgeState`
 Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false }`. Otherwise:
 ```json
 {
@@ -490,27 +490,27 @@ Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false 
   "guardians": ["aabb…"],                // the current set's 20-byte addresses, hex
   "burn_sequence": 1,                    // outbound messages emitted so far
   "next_index": 2,                       // the note index the next newly registered asset gets
-  "assets": [ …the rows of `shrugg_getAssets`… ]
+  "assets": [ …the rows of `rand_getAssets`… ]
 }
 ```
 No balances: bridged value is notes, not accounts.
 
-### `shrugg_getAssets`
+### `rand_getAssets`
 Params: `[]`. Result: the bridge's asset registry, ascending by index (which is registration
 order), or `[]` on a chain without a bridge:
 ```json
 [{ "index": 1, "chain": 2, "token": "aaaa…", "asset_id": "…" }]
 ```
-`index` is the `asset` word a note of that asset carries — index 0 is SHRUGG and is never in the
+`index` is the `asset` word a note of that asset carries — index 0 is RAND and is never in the
 registry. `chain` and `token` are the wire identity guardians sign about; `asset_id` is
-`blake3` of the two, and is what `shrugg_bridgeAssetId` computes.
+`blake3` of the two, and is what `rand_bridgeAssetId` computes.
 
-### `shrugg_bridgeAssetId`
+### `rand_bridgeAssetId`
 Params: `[token_chain, token_address]` where `token_chain` is an integer and `token_address` is
 32 bytes of hex. Result: the asset id (64 hex characters). Pure arithmetic on its arguments, so
 it answers on any chain, bridged or not.
 
-### `shrugg_getBridgeBurn`
+### `rand_getBridgeBurn`
 Params: `[sequence]` (integer). Result: `null` if this chain has emitted no such message, else
 ```json
 { "sequence": 0, "body_hex": "…", "digest": "…", "tx": "…", "height": 2 }
@@ -519,30 +519,30 @@ Params: `[sequence]` (integer). Result: `null` if this chain has emitted no such
 `tx` is the burn transaction that emitted it — a burn is funded by notes, so the transaction
 hash stands in for the sender identity the message has no room for.
 
-### `shrugg_getValidators`
+### `rand_getValidators`
 Params: `[]`. Result: array of
 
 ```json
 { "address": "…", "stake": "1000000000000", "pending": [{ "release_epoch": 41, "amount": "5000000000" }],
-  "rewards": "4000000", "payout": "shrugg1…", "nonce": 3, "active": true }
+  "rewards": "4000000", "payout": "rand1…", "nonce": 3, "active": true }
 ```
 
 one row per entry of the **register** (spec §8), in address order. Since phase S2 that is every
 validator that has ever bonded, not the genesis set: `active` is the ones in the set running the
 current epoch, and those are what the leader rotation runs over. Amounts are **decimal strings**,
-because a JSON number is not an exact integer past 2^53 and a stake is 10^9 units per SHRUGG.
+because a JSON number is not an exact integer past 2^53 and a stake is 10^9 units per RAND.
 `pending` is the unbonding queue, oldest first; `rewards` is the bundle fees credited to that
 validator as proposer; `payout` is where a `Withdraw` pays; `nonce` is what its next signed
 `Unbond` or `Withdraw` must carry. The register is the only place this chain stores amounts in the
 clear — `docs/staking.md` is the guide to it.
 
-### `shrugg_getEpoch`
+### `rand_getEpoch`
 Params: `[]`. Result: `{ "epoch": 41, "epoch_blocks": 1000, "next_set": ["…", "…"] }`. `epoch` is
 `height / epoch_blocks`. `next_set` is what the register would derive for the next epoch if this
 one ended now — a projection, not a commitment: every bond and unbond before the boundary moves it.
 The derivation rule is in `docs/staking.md` §2.
 
-### `shrugg_getSupply`
+### `rand_getSupply`
 Params: `[]`. Result:
 
 ```json
@@ -561,7 +561,7 @@ created (`amount` less the base), and the base moves from one register entry to 
 burned`; `register_total` is Σ `stake + pending + rewards` over the register; `total_supply` is the
 two together, and `invariant_holds` is whether it still equals everything the chain issued
 (`genesis_deposited + genesis_staked + faucet_minted`). A false there is a bug, never a legitimate
-chain state. The counters are not in the state root — `shrugg-node verify --mode quick` recomputes
+chain state. The counters are not in the state root — `rand-node verify --mode quick` recomputes
 every one of them by replaying the chain, which is what makes them auditable. `docs/supply.md`
 works the identity through a bond and a withdraw and says where it rests on a claim (the genesis
 file's own amounts) rather than on a check.
@@ -570,7 +570,7 @@ file's own amounts) rather than on a check.
 
 The same port also speaks WebSocket: `ws://127.0.0.1:8545/` or `ws://127.0.0.1:8545/ws`, either
 path. `POST /` is unchanged and is still where every method above is served — the socket serves
-**only** `shrugg_subscribe` and `shrugg_unsubscribe`, and answers `-32601` to anything else,
+**only** `rand_subscribe` and `rand_unsubscribe`, and answers `-32601` to anything else,
 including reads. There is nothing to configure and no second port to open.
 
 One thing did change for non-WebSocket clients: `GET /` is now the upgrade handler, so a plain
@@ -578,10 +578,10 @@ One thing did change for non-WebSocket clients: `GET /` is now the upgrade handl
 `405 Method Not Allowed`. Nothing reads that status — the RPC has always been `POST` — but a
 health check that asserted on `405` needs to assert on `400`.
 
-One topic exists, `newHeads`, and its payload is exactly `shrugg_getHead`'s three fields, in the
+One topic exists, `newHeads`, and its payload is exactly `rand_getHead`'s three fields, in the
 same shape — one `HeadSummary` serves both, so they cannot drift apart. The one difference is what
 `view` means: a notification carries the *block's own* view, the one its quorum certificate is for,
-while `shrugg_getHead` reports the node's current consensus view. For the tip of a healthy chain
+while `rand_getHead` reports the node's current consensus view. For the tip of a healthy chain
 they are the same number. A notification is sent **once per committed
 block, in order**, including during sync: a batch of 100 synced blocks is 100 notifications, not one
 for the tip, so a wallet tracking heads never silently skips a height. Nothing is sent before the
@@ -589,16 +589,16 @@ block is committed to storage, so a head you are told about is a head this node 
 
 ```jsonc
 // client -> node
-{ "jsonrpc": "2.0", "id": 1, "method": "shrugg_subscribe",   "params": ["newHeads"] }
-{ "jsonrpc": "2.0", "id": 2, "method": "shrugg_unsubscribe", "params": ["1"] }
+{ "jsonrpc": "2.0", "id": 1, "method": "rand_subscribe",   "params": ["newHeads"] }
+{ "jsonrpc": "2.0", "id": 2, "method": "rand_unsubscribe", "params": ["1"] }
 // node -> client
 { "jsonrpc": "2.0", "id": 1, "result": "1" }        // the subscription id, a decimal string
 { "jsonrpc": "2.0", "id": 2, "result": true }
-{ "jsonrpc": "2.0", "method": "shrugg_subscription",
+{ "jsonrpc": "2.0", "method": "rand_subscription",
   "params": { "subscription": "1", "result": { "height": 1998, "hash": "…", "view": 2251 } } }
 ```
 
-`shrugg_unsubscribe` answers `true` when this connection held that id and `false` when it did not —
+`rand_unsubscribe` answers `true` when this connection held that id and `false` when it did not —
 a `false` is not an error, because a client tearing down after a reconnect has no way to know which
 ids survived. Ids are per connection, are never reused within one, and all of them go when the
 socket does. A frame with no `id` member is a notification and is refused with `-32600`, as over
@@ -608,8 +608,8 @@ This endpoint is unauthenticated, so it is bounded four ways:
 
 - **64 connections per node.** The 65th is refused at the upgrade with HTTP `503` and a body
   naming the limit — not accepted and then dropped, which a client cannot tell from a network
-  fault. `shrugg_status`'s `ws_clients` is the live count.
-- **8 subscriptions per connection.** The ninth `shrugg_subscribe` is `-32000`; the eight it holds
+  fault. `rand_status`'s `ws_clients` is the live count.
+- **8 subscriptions per connection.** The ninth `rand_subscribe` is `-32000`; the eight it holds
   are untouched.
 - **64 KiB per frame from the client.** A larger frame is refused and the socket ends. (This is a
   bound on what the node will *read*; what it writes is a request reply or a head notification,
@@ -629,7 +629,7 @@ subscriber. A client that falls further behind than that — because it stopped 
 cannot carry what the chain produces — is closed with WebSocket code `1008` (policy violation) and
 a reason saying how many heads it missed. Buffering a slow subscriber is how a node runs out of
 memory. The recovery is to reconnect, subscribe again, and fill the gap with
-[`shrugg_getCompactBlocks`](#shrugg_getcompactblocks) from the last height you did see; at 3 s
+[`rand_getCompactBlocks`](#rand_getcompactblocks) from the last height you did see; at 3 s
 blocks, 256 heads is about thirteen minutes, so a subscriber that hits this was not going to catch
 up on the socket anyway.
 
@@ -648,7 +648,7 @@ Error responses look like `{ "jsonrpc": "2.0", "id": 1, "error": { "code": -3200
 
 ## The transaction on the wire
 
-`shrugg_sendTransaction` takes `bincode(Transaction)`. There is no signature over the transaction
+`rand_sendTransaction` takes `bincode(Transaction)`. There is no signature over the transaction
 and no sender key: a bundle authorises itself by its proof, and an action that is signed carries
 the signature inside itself — a faucet mint the minting validator's key and signature, an `Unbond`
 or `Withdraw` the register's nonce and the validator's signature over it. Those three are also the
@@ -685,7 +685,7 @@ A `Bond` must carry a bundle whose `burn` equals its `amount` — that is how th
 pool — and `registration` is present exactly when the validator is not in the register yet
 (`docs/staking.md`).
 
-A `BridgeBurn` is the chain's one two-bundle transaction: the outer `bundle` pays the SHRUGG fee
+A `BridgeBurn` is the chain's one two-bundle transaction: the outer `bundle` pays the RAND fee
 (the bundle base twice, once per verified bundle) and `asset_bundle` burns exactly `amount`
 of the bridged asset. A `BridgeAttest`'s deposit note is the one commitment the wire does not
 carry — the chain computes it from the amount the guardians signed, the recipient the action
@@ -721,7 +721,7 @@ essentially all proof (it was ~300 KB at 27 queries). The ledger caps a proof at
 at 2048 bytes, a program at 4096 words, and a block at 4 MiB of transaction bytes — three bundles
 per block (`docs/block-space.md`).
 
-A wallet builds all of this through `shrugg_client::wallet::{send, submit}`, which selects the
+A wallet builds all of this through `randprotocol_client::wallet::{send, submit}`, which selects the
 inputs, fetches the anchor and the witnesses, proves the bundle, seals both envelopes, and checks
 the proof's published digest against the one it computed before it submits anything.
 
@@ -738,34 +738,34 @@ five new transaction actions — `RegisterAggregator`, `UnbondAggregator`, `With
 block form on sync. Chains without the section behave byte-for-byte as before. What a client can
 see:
 
-- **`shrugg_submitAggregate`** is `shrugg_sendTransaction`: an `Aggregate` is an ordinary
+- **`rand_submitAggregate`** is `rand_sendTransaction`: an `Aggregate` is an ordinary
   bundle-less transaction, admitted on the same queue (its rVM verification occupies a worker
   slot far longer than a bundle's ~20 ms, which the queue and the per-peer token bucket already
   bound).
-- **`shrugg_getBlockByHeight` / `shrugg_getBlockByHash`** gain `sealed` (every bundle in the
+- **`rand_getBlockByHeight` / `rand_getBlockByHash`** gain `sealed` (every bundle in the
   block covered) and a per-transaction `sealed_by` (the covering aggregate's hash, `null` while
   the bundle is coverable or the transaction is bundle-less).
-- **`shrugg_getAggregate(hash)`** returns the sealing aggregate's public fields: `covers`
+- **`rand_getAggregate(hash)`** returns the sealing aggregate's public fields: `covers`
   (hashes, in proof order), `aggregator`, `subsidy`, `proving_share`, and `n` — the subsidy
   schedule's index the block minted at — plus its `height`. `null` for any other transaction.
-- **`shrugg_getAggregators`** lists the register (public by design): `address`, `bond`,
+- **`rand_getAggregators`** lists the register (public by design): `address`, `bond`,
   `payout`, `nonce`, `unbonding` per row.
-- **`shrugg_getUnsealed(from, limit)`** pages the bundles an aggregator may still cover —
+- **`rand_getUnsealed(from, limit)`** pages the bundles an aggregator may still cover —
   finalised, inside the window, unsealed — as `{ bundles: [{ hash, height, excess }], next_from }`,
   `excess` in units over the floor: the daemon's work list.
-- **`shrugg_getRawTransaction(hash)`** returns the full transaction, bincode as hex — the proof
+- **`rand_getRawTransaction(hash)`** returns the full transaction, bincode as hex — the proof
   bytes an aggregator needs and `tx_json` deliberately never renders.
-- **`shrugg_getSupply`** gains the four counters `subsidised`, `sealed_blocks`,
+- **`rand_getSupply`** gains the four counters `subsidised`, `sealed_blocks`,
   `aggregator_bonds`, `slashed` (reported separately from `faucet_minted`, so the schedule is
   auditable against `sealed_blocks` directly).
-- **`shrugg_status` gains `aggregation`**: `registered`, `unsealed`, `verify_queue`, and the
+- **`rand_status` gains `aggregation`**: `registered`, `unsealed`, `verify_queue`, and the
   chain parameters an aggregate daemon computes the payment from (`max_covers`, `window`,
   `subsidy_base`, `halving_blocks`, `sealed_blocks`).
 - **`tx_json`** renders the five new actions (`register_aggregator`, `unbond_aggregator`,
   `withdraw_aggregator`, `slash_aggregator`, `aggregate`) with their public fields.
-- The node CLI gains the role's commands: **`shrugg-node aggregator register|unbond|withdraw`**
-  (the validator commands' twins, one register over) and **`shrugg-node aggregate [--watch]`**,
-  the aggregate daemon: poll `shrugg_getUnsealed`, fetch the raw bundles, prove one aggregate,
+- The node CLI gains the role's commands: **`rand-node aggregator register|unbond|withdraw`**
+  (the validator commands' twins, one register over) and **`rand-node aggregate [--watch]`**,
+  the aggregate daemon: poll `rand_getUnsealed`, fetch the raw bundles, prove one aggregate,
   submit — a separate process from the validator, needing only an RPC endpoint and the
   registered key. `--keep-raw-proofs` keeps sealed bundles' raw proofs for archives; by default
   the pruning pass rewrites their records once the window passes.
@@ -777,13 +777,13 @@ scan on the holder's behalf, the Zcash `z_importviewingkey` shape for explorers.
 memory only: at most 64 per node, cleared at restart, re-imported by the operator. No wire format,
 block or consensus rule changed.
 
-- **`shrugg_importViewingKey(viewing_key, [rescan_from_height])`** registers the party viewing
-  key's `nk` (64 hex); re-import of a held key is a no-op. `shrugg_status` gains `viewing_keys`.
-- **`shrugg_getViewingNotes(viewing_key, [from_index, limit])`** lazily scans from the rescan
+- **`rand_importViewingKey(viewing_key, [rescan_from_height])`** registers the party viewing
+  key's `nk` (64 hex); re-import of a held key is a no-op. `rand_status` gains `viewing_keys`.
+- **`rand_getViewingNotes(viewing_key, [from_index, limit])`** lazily scans from the rescan
   floor (at most 10 000 leaves per call, with `scanned_index`/`next_index`/`complete` for
   progress) and pages matched notes — received rows with their nullifier and spent state, sent
   rows (opened through `ovk`) without.
-- **`shrugg_checkTransaction(hash, key)`** is the Monero `check_tx_proof` shape: stateless, one
+- **`rand_checkTransaction(hash, key)`** is the Monero `check_tx_proof` shape: stateless, one
   call, no key retention — what the given per-transaction `TxKey` discloses about the committed
   transaction, each opened note bound to its on-chain commitment by the AEAD. A wrong key returns
   an empty `disclosed` list, indistinguishable from a transaction that discloses nothing.
@@ -793,7 +793,7 @@ block or consensus rule changed.
 No wire format, block or consensus rule changed: old and new nodes interoperate, and a fleet
 upgrades by ordinary restart. What a client can see:
 
-- **`shrugg_getCompactBlocks(from_height, to_height)`** is new: per block its height, hash and
+- **`rand_getCompactBlocks(from_height, to_height)`** is new: per block its height, hash and
   timestamp, and per transaction the note commitments it created (leaf index, commitment, envelope)
   and the nullifiers it spent. At most 128 blocks per call and, past the first block — which is
   always served whole — 1000 notes; resume from the last returned height plus one. This is the
@@ -803,12 +803,12 @@ upgrades by ordinary restart. What a client can see:
   JSON-RPC notification — is refused with `-32600`, batched or not; an explicit `"id": null` is
   still a normal request.
 - **A WebSocket endpoint on the same port** (`/` and `/ws`) is new, serving one subscription,
-  `newHeads`, through `shrugg_subscribe` / `shrugg_unsubscribe`: one notification per committed
-  block, in order, in `shrugg_getHead`'s shape. Bounded — 64 connections per node, 8 subscriptions
+  `newHeads`, through `rand_subscribe` / `rand_unsubscribe`: one notification per committed
+  block, in order, in `rand_getHead`'s shape. Bounded — 64 connections per node, 8 subscriptions
   per connection, 64 KiB per client frame, 256 heads of backlog — and a subscriber that falls
   further behind than that is closed (code `1008`), not buffered; the recovery is to reconnect and
-  fill the gap with `shrugg_getCompactBlocks`.
-- **`shrugg_status` gains three fields**: `ws_clients`, `refused_cache` and `verify_queue`, beside
+  fill the gap with `rand_getCompactBlocks`.
+- **`rand_status` gains three fields**: `ws_clients`, `refused_cache` and `verify_queue`, beside
   the four sync fields (`sync_inflight_age_ms`, `sync_failures`, `sync_late_batches`,
   `connected_peers`), which are unchanged.
 - **`-32600` is newly documented, not new**: it already answered an oversized or unparseable body,

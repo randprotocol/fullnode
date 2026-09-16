@@ -20,7 +20,7 @@ Everything below is merged and pushed; nothing is pending in any working tree.
   the production N re-measurement — **blocked on the user provisioning a fleet GPU node**
   (Linux, R580+, CUDA 13, LLVM 21, sm_80+, 80 GB device, ≥160 GB host; `PTX_BUILD.md`).
 - **fullnode** `main` at **faef139** (origin): RPC hardening, constraint set 6, viewing-key
-  import + `shrugg_checkTransaction`, and the full block-aggregation pipeline (see the merged
+  import + `rand_checkTransaction`, and the full block-aggregation pipeline (see the merged
   entry below). `docs/zkvm-m4-m5-progress.md` is the consolidated M4+M5 record with every
   measured number and the 11-row deferred-proof runbook.
 - **whitepapers** `main` at **f31277c** (origin): both papers synced to `faef139` —
@@ -42,11 +42,11 @@ included). Everything is genesis-gated on `genesis.aggregation`: a chain without
 behaves byte-for-byte as today, so **chain 8 is unaffected and chain 9 activates only after the
 hardware batch below** (its measurements fill `admitted_shapes[0]`; the zero-digest placeholder
 refuses to init). What landed: the five actions and the genesis-gated `aggregators_root`
-(`shrugg-state-3`); the register actions mirrored on S2; `crates/shrugg-rvm` vendored from
+(`rand-state-3`); the register actions mirrored on S2; `crates/randprotocol-rvm` vendored from
 `circuits/recursion` `271679d` via `deploy/sync-zkvm.sh`'s two-step rename (a **path dep would
 fork `rand_zkvm` into two distinct crates — never do it**); the nine-step admission with the
-pinned hex conformance vectors reproduced byte-for-byte; the crate-cycle rule (shrugg-rvm →
-shrugg-zkvm, so the real `AggExecutor` lives in shrugg-node); subsidy + the four audit counters;
+pinned hex conformance vectors reproduced byte-for-byte; the crate-cycle rule (randprotocol-rvm →
+randprotocol-zkvm, so the real `AggExecutor` lives in rand-node); subsidy + the four audit counters;
 sealing and pruning (CF_SEALS, pruned = full tx + 34 pv + 7 shape bytes); sealed-form sync with
 coverage-closed serving and the robust sync picker; the RPC surface and the `aggregate --watch`
 daemon; the chain-9 cut script. Traps already caught and pinned: `main.rs`'s genesis command must
@@ -115,7 +115,7 @@ vendoring/workflow record.)
   `assemble_covered`, nowhere else.
 - **A pruned bundle's identity is its *raw* transaction hash** (the marker form hashes
   differently — the proof bytes differ). The fee bucket keys on it (`0498a3b`), the sealed
-  form's side table attests it, and `shrugg_getUnsealed` resolves marker forms through the
+  form's side table attests it, and `rand_getUnsealed` resolves marker forms through the
   proof-hash index. Get any of these wrong and the sealed replay diverges at the state root.
 - **The proposer's root is computed in list order**: the §3.4 selection trial-applies the
   chosen aggregate *after* the ordinary transactions, where its place in the block is — the
@@ -137,35 +137,35 @@ vendoring/workflow record.)
 The block-aggregation plan (`docs/superpowers/plans/2026-09-15-block-aggregation.md`, ten
 tasks) is landing task-by-task on `aggregation-spec`. State and traps a later session needs:
 
-- `crates/shrugg-rvm/` is **vendored** from `circuits/recursion` (pin `271679d`) by
+- `crates/randprotocol-rvm/` is **vendored** from `circuits/recursion` (pin `271679d`) by
   `deploy/sync-zkvm.sh`'s recursion section (`RVM_SRC` env override) — never hand-edit it; the
-  same two-step `rand_zkvm → shrugg_zkvm` rename as the research section makes the two
+  same two-step `rand_zkvm → randprotocol_zkvm` rename as the research section makes the two
   vendored crates' `Proof` types one type. Re-running the script re-vendors both sections.
-- **The crate cycle decides where executor code lives**: `shrugg-rvm → shrugg-zkvm`, so
+- **The crate cycle decides where executor code lives**: `randprotocol-rvm → randprotocol-zkvm`, so
   `ZkExecutor` cannot touch the rVM. Its three aggregate arms return
   `ConfidentialError::AggregationUnsupported`; the real implementation is
-  `shrugg_node::agg_executor::AggExecutor`, which `node::executor_for_profile` always wraps.
+  `randprotocol_node::agg_executor::AggExecutor`, which `node::executor_for_profile` always wraps.
   `AggregationUnsupported`/`BadDeclaredShape` are never permanent admission verdicts.
-- `shrugg_core::types::pv` **mirrors** the zkVM's `pv` layout (core cannot name zkvm types);
-  `shrugg-zkvm/src/executor.rs`'s test pins mirror == real.
+- `randprotocol_core::types::pv` **mirrors** the zkVM's `pv` layout (core cannot name zkvm types);
+  `randprotocol-zkvm/src/executor.rs`'s test pins mirror == real.
 - Interims by design until the later tasks land: `validate_inner`/`apply_tx` refuse
   `Action::Aggregate` with `TxError::AggregateNeedsCovered` (a proposer's trial-apply skips
   pooled aggregates; no block can carry one until T6's covered pre-pass); admission runs
   through `Ledger::validate_aggregate`/`apply_aggregate` with the covered records assembled
   node-side (`node::assemble_covered`, from CF_TXS); the payout amount is `subsidy(0)` (no
   excess buckets, `sealed_blocks` unincremented) until T5.
-- **Gate gap this branch already fell into once**: `cargo test -p shrugg-node --lib` compiles
+- **Gate gap this branch already fell into once**: `cargo test -p randprotocol-node --lib` compiles
   neither `src/main.rs` nor `tests/`, so T1's new `Genesis` field silently broke both. Fixed
   in T3/T4; run `cargo check --tests` (or the T10 full suite) before trusting a `--lib`-only
   gate after touching shared types.
-- Recursion-heavy tests stay out of gates: `cargo test --release -p shrugg-rvm -- --skip
+- Recursion-heavy tests stay out of gates: `cargo test --release -p randprotocol-rvm -- --skip
   round_trips --skip two_test_profile` with `RECURSION_FIXTURES` pointing at a recursion
   fixture cache (the conformance vectors ride on the fixtures' random notes — the cache that
   produced `circuits/recursion/docs/02-aggregate.md`'s pins reproduces them byte-for-byte).
 
 ### Constraint set 6 re-vendor (2026-09-14, upstream 0200877): the public input segment, carrying M4.3 + M4.4
 
-`crates/shrugg-zkvm/` is re-vendored to `research`'s constraint-set-6 merge (the public input
+`crates/randprotocol-zkvm/` is re-vendored to `research`'s constraint-set-6 merge (the public input
 segment), which also carries milestones 4.3 (the EVM interpreter guest) and 4.4 (the `sha256`
 table, `SYS_SHA256 = 5`, and the sBPF interpreter guest) into this crate. A hard fork like every
 set before it; fleets must run the same build (`docs/confidential.md`, "Constraint set 6").
@@ -196,7 +196,7 @@ set before it; fleets must run the same build (`docs/confidential.md`, "Constrai
   four bins (`fib`, `keccak256`, `evm`, `sbpf`) plus two assets (`erc20.runtime.hex`,
   `spl_token.so`).
 - **New build requirement**: `evm-core` and `sbpf-core` are *path* dependencies of
-  `shrugg-zkvm` (`../../../circuits/guests-compiled/{evm-core,sbpf-core}`) and, unlike
+  `randprotocol-zkvm` (`../../../circuits/guests-compiled/{evm-core,sbpf-core}`) and, unlike
   `rand-zkvm-cuda`, they are NOT optional — `circuits/` must sit beside `fullnode/` for any
   build of the crate. In a `/tmp/fullnode-*` worktree that means `ln -s
   <real circuits checkout> /tmp/circuits` first, or `cargo metadata` fails on the (already
@@ -216,7 +216,7 @@ called by both `propose` and `apply_block_for_sync`); H1 `248a0f7` + `e03f8bd` (
 records every bundle and is the ledger's coverable set — `CoverNotCoverable` at step 4, a
 missing entry is a refusal not a zero share — and `BlockError::SecondAggregate` refuses a
 second aggregate per block; spec §3.4/§4/§6.1 rewritten); M1 `32ec1b8` (`Transaction::hash`
-takes the bundle proof by digest, domain `shrugg-txid-2`, so the marker form hashes to the
+takes the bundle proof by digest, domain `rand-txid-2`, so the marker form hashes to the
 raw hash and the certified tx root binds a sealed block whole — **every transaction id
 changes**, a hard fork like constraint set 6); dependencies `4a07d85` (libp2p 0.54 → 0.57,
 all ten Dependabot alerts cleared). Each fix has a regression test that failed on `v0.1`.
@@ -225,7 +225,7 @@ proof to `(aggregator, nonce)` — a circuits change, defence in depth only now)
 
 
 Tag `v0.1` sits on `0b98580`. A four-reviewer pass over `6f112e3..0b98580` (RPC hardening,
-constraint set 6, M5 `shrugg-rvm`, chain-side aggregation, S2/S3 follow-ups), each candidate
+constraint set 6, M5 `randprotocol-rvm`, chain-side aggregation, S2/S3 follow-ups), each candidate
 re-traced by an adversarial verifier. Findings:
 `../security/fullnode-security-review-pre-v0.1-2026-09-16.md` (severity-ordered, "verified
 OK" per crate — read it before re-reporting suspected issues). **Nothing found is reachable
@@ -244,7 +244,7 @@ on chains 5–8 (`aggregation: null`); all three items must be fixed before chai
   `apply_block_for_sync` runs before the root; the first expired fee bucket halts the chain.
   Fix: sweep in `propose` (factor the block-end steps into one function).
 
-`shrugg-zkvm` (constraint set 6) and `shrugg-rvm` had no findings.
+`randprotocol-zkvm` (constraint set 6) and `randprotocol-rvm` had no findings.
 
 ### Security review: done, fixes merged
 
@@ -268,7 +268,7 @@ that verify pre-fix — read it before re-reporting suspected issues).
 
 Every zk-side fix below was **ported into `research` upstream** and arrives here
 through the constraint-set-5 re-vendor, not as a local patch — so read
-`crates/shrugg-zkvm/` as vendored code and take a fix back to `research` first.
+`crates/randprotocol-zkvm/` as vendored code and take a fix back to `research` first.
 
 - Free-standing `IS_HASH`/`IS_HASH_OUT` rows had **no entry gate** — a cheating
   prover could splice write-back rows anywhere, giving 4 arbitrary RAM writes per
@@ -293,7 +293,7 @@ through the constraint-set-5 re-vendor, not as a local patch — so read
   (auto-tier fits both budgets); the 16-bit `HASH_LEFT` cap (65 535 words) is
   enforced host-side; prove-side tier and immediate-truncation guards.
 - **ZH4 is the one fix that is ours, not `research`'s**, because the function is:
-  `ZkExecutor::check_program` (`crates/shrugg-zkvm/src/executor.rs`) rejects a
+  `ZkExecutor::check_program` (`crates/randprotocol-zkvm/src/executor.rs`) rejects a
   program whose `base_pc + 4·len` wraps the u32 pc space — deployable, provable
   by nothing, and paid for per word.
 - The re-vendor that carried these also carried **milestone 4.2** (the `keccak`
@@ -321,15 +321,15 @@ bounded refused-hash cache (8192 entries, FIFO, permanent verdicts only — the
 `is_permanent` allowlist) answers a repeat refusal for free, and a per-peer
 token bucket (burst 16, refill 4/s, keyed on the forwarding peer's
 `propagation_source`, held on `node::Peer`) meters gossiped submissions. The RPC
-grew `shrugg_getCompactBlocks`, batch requests (cap 20, notifications refused
+grew `rand_getCompactBlocks`, batch requests (cap 20, notifications refused
 `-32600`) and a WebSocket `newHeads` subscription on the same port;
 `docs/rpc.md`'s changelog is the client-facing list.
 
 Same day, the key property narrowed: a node may hold **viewing keys** — never
 spend keys; the RPC layer has no type for those — for explorer-side scanning
-(`shrugg_importViewingKey` / `shrugg_getViewingNotes`, in memory, 64 keys, 10 000
+(`rand_importViewingKey` / `rand_getViewingNotes`, in memory, 64 keys, 10 000
 leaves a call, cleared at restart) and answer one-call payment proofs
-(`shrugg_checkTransaction`, stateless). An imported key can disclose notes but
+(`rand_checkTransaction`, stateless). An imported key can disclose notes but
 never move them.
 
 ### Load-bearing consensus invariants (do not regress)
@@ -381,8 +381,8 @@ never move them.
   stage and S3's call-envelope stage were merged into it) and the TCP cluster
   suite 6m28s (16 tests, proofs overlapping).
 - **Proving concurrency is capped, and that cap — not block spacing — is what
-  keeps a proof inside its window.** `crates/shrugg-node/tests/proving_slot/`
-  and `crates/shrugg-client/tests/proving_slot/` (one module, two copies: both
+  keeps a proof inside its window.** `crates/randprotocol-node/tests/proving_slot/`
+  and `crates/randprotocol-client/tests/proving_slot/` (one module, two copies: both
   test binaries need it and they are different crates) hand out one permit at a
   time through a file lock in `<target-dir>/tmp`, so no two *unrelated* bundle
   proofs run at once anywhere in the workspace — across test binaries, and

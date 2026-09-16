@@ -1,7 +1,7 @@
 # Randprotocol Full Node and RPC Client
 
 The reference full node for the Rand Protocol chain and its command-line wallet, written in Rust.
-The chain's native token is **SHRUGG**, and it lives in a **fully shielded pool**: there are no
+The chain's native token is **RAND**, and it lives in a **fully shielded pool**: there are no
 accounts and no balances, only note commitments and nullifiers, and a transfer is a zero-knowledge
 proof that some two notes became some other two. The same token pays for **confidential arbitrary
 computation** — programs that run off-chain inside a zero-knowledge virtual machine and settle on
@@ -14,11 +14,11 @@ chain with a proof instead of their inputs.
 | Networking | libp2p 0.54: TCP + Noise + Yamux, gossipsub, Kademlia + bootstrap list, mDNS on LANs, request-response block sync, ping keepalive, automatic redial |
 | Ledger | shielded note pool: a depth-32 Poseidon2 commitment tree, a nullifier set, 2-in-2-out proved bundles, public fees to the proposer's register entry, BLAKE3 Merkle state root over tree, nullifiers, validators and programs, plus the bridge on a bridged chain |
 | Staking | a public validator register — bond out of a bundle's burn, unbond over two epochs, withdraw into a shielded note — epochs that re-derive the validator set from it, and a supply audit that adds the register and the pool back up to what the chain issued |
-| Wallet keys | a 256-bit spend key; viewing key, note-owner field, nullifier key, outgoing viewing key, ML-KEM-768 decapsulation key and `shrugg1…` address all derived from it |
+| Wallet keys | a 256-bit spend key; viewing key, note-owner field, nullifier key, outgoing viewing key, ML-KEM-768 decapsulation key and `rand1…` address all derived from it |
 | Bridged assets | the guardian bridge as notes: a bridged holding is a note whose `asset` word is the registry's index, an attestation deposits one note the chain computes itself, and a burn is the chain's one two-bundle transaction (`docs/bridge.md`) |
 | Confidential computation | Rand zkVM: RV32I under a Plonky3 batch STARK (Goldilocks, Poseidon2, ZK-hiding FRI); programs deployed on chain, calls carry a proof + 8 public outputs, gas by tier, and pay through a bundle like everything else |
 | Storage | one RocksDB per node with column families for blocks, certificates, indexes, notes, nullifiers, anchors, validators, programs and receipts; fsynced commits; startup integrity check with truncate-and-resync |
-| Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` subscription on the same port (`shrugg-node`), `shrugg` wallet CLI with a local prover, Rust client library |
+| Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` subscription on the same port (`rand-node`), `rand` wallet CLI with a local prover, Rust client library |
 
 Status: an experimental testnet (see `deploy/README.md`) runs across two laptops and four cloud
 servers. That fleet is still on **chain 5, an account chain**: the shielded pool is a hard fork and
@@ -40,13 +40,13 @@ the operator cuts it as a new chain id when they choose to. Not audited; not for
 ## Repository layout
 
 ```
-crates/shrugg-core     pure logic, no I/O: crypto, types, notes and the commitment tree, ledger
+crates/randprotocol-core     pure logic, no I/O: crypto, types, notes and the commitment tree, ledger
                        rules, gas, genesis, the HotStuff state machine (tested with a simulated network)
-crates/shrugg-zkvm     the Rand zkVM (vendored from circuits/research; resync with deploy/sync-zkvm.sh)
+crates/randprotocol-zkvm     the Rand zkVM (vendored from circuits/research; resync with deploy/sync-zkvm.sh)
                        plus the chain-side proof verifier with its verifier-key cache
-crates/shrugg-node     RocksDB storage, libp2p networking, mempool, block sync, JSON-RPC server,
-                       the node event loop, and the shrugg-node binary
-crates/shrugg-client   the shrugg wallet binary and the RpcClient library (no RocksDB/libp2p dependency)
+crates/randprotocol-node     RocksDB storage, libp2p networking, mempool, block sync, JSON-RPC server,
+                       the node event loop, and the rand-node binary
+crates/randprotocol-client   the rand wallet binary and the RpcClient library (no RocksDB/libp2p dependency)
 deploy/                testnet genesis, test keys, run scripts, cloud provisioning and rebuild scripts
 docs/                  reference documentation and the design spec / plan
 scripts/               local two-validator testnet
@@ -58,7 +58,7 @@ Requirements: Rust 1.98.1 (pinned in `rust-toolchain.toml`; rustup installs it),
 and `cmake` (RocksDB). First build: 10 to 20 minutes (RocksDB and Plonky3 from source).
 
 ```bash
-cargo build --release        # target/release/shrugg-node, target/release/shrugg
+cargo build --release        # target/release/rand-node, target/release/rand
 cargo test --release         # all crates; release because STARK proving is slow in debug
 ```
 
@@ -90,7 +90,7 @@ breakdown, and the two interpreter guests' exit proofs (memory-bound; they want 
 
 ```bash
 scripts/local-testnet.sh
-target/release/shrugg --rpc http://127.0.0.1:8545 status
+target/release/rand --rpc http://127.0.0.1:8545 status
 ```
 
 ### Several machines
@@ -98,40 +98,40 @@ target/release/shrugg --rpc http://127.0.0.1:8545 status
 Each machine creates a key:
 
 ```bash
-shrugg-node keygen --out node.key.json      # prints the address
-shrugg-node address --key node.key.json     # address, public key, libp2p peer id
+rand-node keygen --out node.key.json      # prints the address
+rand-node address --key node.key.json     # address, public key, libp2p peer id
 ```
 
 One machine writes the genesis with every validator's key file or hex public key, then the file is
 copied to all machines unchanged (the genesis hash must match everywhere):
 
 ```bash
-shrugg-node genesis --chain-id 6 \
-    --validator a.key.json,1000,shrugg1<a's payout address> \
-    --validator <hex public key of b>,1000,shrugg1<b's payout address> \
-    --alloc shrugg1<address>=1000 \
+rand-node genesis --chain-id 6 \
+    --validator a.key.json,1000,rand1<a's payout address> \
+    --validator <hex public key of b>,1000,rand1<b's payout address> \
+    --alloc rand1<address>=1000 \
     [--epoch-blocks 1000] \
     [--faucet] [--no-confidential] [--fri-profile production] \
     --out genesis.json
 ```
 
 A `--validator` is one register entry, so it carries all three of its fields at once: the key, the
-stake in SHRUGG, and the payout address its block rewards and unbonded stake are paid to (phase S2).
-All three are part of the genesis hash. 1000 SHRUGG is the minimum a validator needs to be in an
+stake in RAND, and the payout address its block rewards and unbonded stake are paid to (phase S2).
+All three are part of the genesis hash. 1000 RAND is the minimum a validator needs to be in an
 epoch's validator set at all; genesis refuses less. `--epoch-blocks` is how often the set is
 re-derived from the register (spec §8) — the default is 1000 blocks.
 
 Each `--alloc` creates one shielded deposit note: there is no per-validator allocation, because
 value exists only as a note someone holds the spend key for. The addresses come from
-`shrugg keygen` + `shrugg address` on whichever machines will hold the funds. `deploy/README.md`
+`rand keygen` + `rand address` on whichever machines will hold the funds. `deploy/README.md`
 has a worked example, and `deploy/genesis-shielded.example.json` is one such file.
 
 A validator that joins an existing chain registers instead of appearing in genesis:
 
 ```bash
-shrugg-node register --key node.key.json --payout shrugg1<payout address>   # prints a Registration (hex)
-shrugg-node unbond   1000 --key node.key.json                               # two epochs to release
-shrugg-node withdraw 1000 --key node.key.json                               # into a note at the payout address
+rand-node register --key node.key.json --payout rand1<payout address>   # prints a Registration (hex)
+rand-node unbond   1000 --key node.key.json                               # two epochs to release
+rand-node withdraw 1000 --key node.key.json                               # into a note at the payout address
 ```
 
 The bond itself is a wallet transaction — it burns the stake out of shielded notes, which a node
@@ -141,16 +141,16 @@ register's nonce is what keeps them from being replayed. So there is nothing to 
 commits in a block's time.
 
 Their fee model is its own, for the same reason: `unbond` moves stake inside the public register
-and pays nothing at all, while `withdraw` pays the 0.001 SHRUGG bundle base out of the amount it
-withdraws, to the proposer of the block that applies it. A withdrawal of 1000 SHRUGG therefore
+and pays nothing at all, while `withdraw` pays the 0.001 RAND bundle base out of the amount it
+withdraws, to the proposer of the block that applies it. A withdrawal of 1000 RAND therefore
 creates a note worth 999.999, and an amount that cannot cover the base is refused. `docs/staking.md`
 walks the whole join-and-leave through, including when bonded stake starts counting as weight.
 
 Each machine initialises and runs:
 
 ```bash
-shrugg-node init --datadir ./data --genesis genesis.json
-shrugg-node run  --datadir ./data --key node.key.json --validator \
+rand-node init --datadir ./data --genesis genesis.json
+rand-node run  --datadir ./data --key node.key.json --validator \
     --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 \
     [--bootstrap /ip4/<ip>/tcp/30303/p2p/<peer id>]...
 ```
@@ -158,27 +158,27 @@ shrugg-node run  --datadir ./data --key node.key.json --validator \
 Nodes on one LAN discover each other over mDNS; across networks, machines behind NAT dial out to a
 node with a public address. `--validator` means "this node holds a validator key": a key that is in
 no current epoch's set observes until an epoch admits it, which is how a validator that bonds in
-after genesis joins without a restart (`shrugg_status` reports `is_validator` for the key and
+after genesis joins without a restart (`rand_status` reports `is_validator` for the key and
 `active_validator` for being in the current set). Omit `--validator` to run an observer on purpose. Restarting from the same `--datadir` resumes from
 the persisted head. A validator set of `n` needs more than 2/3 of stake online: 2 of 2, 3 of 4, 5 of 6.
 
 ## Use the wallet
 
 ```bash
-export SHRUGG_RPC=http://127.0.0.1:8545     # or --rpc on each call
-shrugg keygen                                # wallet.key.json (or --key <file>, SHRUGG_KEY)
-shrugg address                               # shrugg1… — about 1.6 KB of base58
-shrugg balance                               # scans the tree with this key; nobody else can
-shrugg send <shrugg1 address> 1.5            # proves a bundle locally (~100 s), submits, waits
-shrugg bond <validator address> 1000         # stake: the bundle burns it out of this wallet's notes
-shrugg faucet [address]                      # testnet chains only: mint up to 100 SHRUGG
-shrugg notes | shrugg history
-shrugg tx <hash> | shrugg block <height|hash> | shrugg head | shrugg status | shrugg peers | shrugg validators
+export RAND_RPC=http://127.0.0.1:8545     # or --rpc on each call
+rand keygen                                # wallet.key.json (or --key <file>, RAND_KEY)
+rand address                               # rand1… — about 1.6 KB of base58
+rand balance                               # scans the tree with this key; nobody else can
+rand send <rand1 address> 1.5            # proves a bundle locally (~100 s), submits, waits
+rand bond <validator address> 1000         # stake: the bundle burns it out of this wallet's notes
+rand faucet [address]                      # testnet chains only: mint up to 100 RAND
+rand notes | rand history
+rand tx <hash> | rand block <height|hash> | rand head | rand status | rand peers | rand validators
 ```
 
-Amounts are decimal SHRUGG (1 SHRUGG = 10^9 units). The fee floor is 0.001 SHRUGG per bundle and
+Amounts are decimal RAND (1 RAND = 10^9 units). The fee floor is 0.001 RAND per bundle and
 goes to the proposer of the block that includes the transaction. There is no
-`shrugg balance <address>`: a balance is a fact about your key file, not about the chain.
+`rand balance <address>`: a balance is a fact about your key file, not about the chain.
 
 ## The shielded pool
 
@@ -202,15 +202,15 @@ balance". `docs/howto.md` (five questions, end to end) and `docs/shielded.md` is
 what still leaks (a witness request names the leaf you are about to spend).
 
 ```bash
-shrugg faucet                  # testnet: a validator mints 100 SHRUGG into a note only you can open
-shrugg sync && shrugg notes    # scan the tree; list what this key can open
-shrugg send shrugg1q9f… 1.5    # ~100 s of local proving, then the commit
+rand faucet                  # testnet: a validator mints 100 RAND into a note only you can open
+rand sync && rand notes    # scan the tree; list what this key can open
+rand send rand1q9f… 1.5    # ~100 s of local proving, then the commit
 ```
 
 Value enters the pool through a faucet mint, a genesis `alloc` note, or a validator's withdraw,
 and every one of those amounts is **public** — the same one-hop visibility a transparent-to-shielded
 deposit has anywhere. It leaves as a bundle's fee or a bond's burn, both public too, which is what
-lets `shrugg_getSupply` account for a chain nobody can add up (`docs/supply.md`). Staking is where
+lets `rand_getSupply` account for a chain nobody can add up (`docs/supply.md`). Staking is where
 those public amounts live: `docs/staking.md`. Bridged assets are phase S3.
 
 ## Confidential computation
@@ -222,10 +222,10 @@ and stores a receipt. The gas is paid by a shielded bundle like any other transa
 chain does not learn who called the program either.
 
 ```bash
-shrugg program build --guest private_payment --arg 1000 --out pp.json   # assemble a built-in guest
-shrugg program deploy pp.json                                            # prints the program id
-shrugg call <program id> --input 400 --input 250 --input 300 --input 75
-shrugg receipt <tx>
+rand program build --guest private_payment --arg 1000 --out pp.json   # assemble a built-in guest
+rand program deploy pp.json                                            # prints the program id
+rand call <program id> --input 400 --input 250 --input 300 --input 75
+rand receipt <tx>
 ```
 
 `private_payment` reads four private balances and, if they sum to at least the threshold,
@@ -237,16 +237,16 @@ Silicon: proving 21 s, proof 0.9 MB, on-chain verification 19 ms with a cached v
 key costs 2 s per program on a laptop, 7 s on a 2-vCPU server, computed once in the background
 when the program is deployed).
 
-Gas: every bundle 0.001 SHRUGG, plus 100,000 units per code word to deploy, plus 0.001 SHRUGG at
+Gas: every bundle 0.001 RAND, plus 100,000 units per code word to deploy, plus 0.001 RAND at
 tier 10 rising 0.0001 per two tiers to call. See `docs/confidential.md`.
 
 ## Operating a node
 
 ```bash
-shrugg-node status                                  # height, view, peers, mempool, programs, sync state
-shrugg-node verify --datadir ./data                 # full integrity check: hashes, QCs, signatures, proofs, replay
-shrugg-node verify --datadir ./data --repair        # truncate a damaged tail; peers resync the rest
-RUST_LOG=debug shrugg-node run ...                  # verbose logs
+rand-node status                                  # height, view, peers, mempool, programs, sync state
+rand-node verify --datadir ./data                 # full integrity check: hashes, QCs, signatures, proofs, replay
+rand-node verify --datadir ./data --repair        # truncate a damaged tail; peers resync the rest
+RUST_LOG=debug rand-node run ...                  # verbose logs
 ```
 
 At startup a node checks its chain (`--verify-chain quick|full|off`), truncates anything
@@ -279,7 +279,7 @@ Full detail in `docs/architecture.md`.
 
 | document | contents |
 |---|---|
-| [docs/cli.md](docs/cli.md) | every `shrugg-node` and `shrugg` command, argument, and default |
+| [docs/cli.md](docs/cli.md) | every `rand-node` and `rand` command, argument, and default |
 | [docs/rpc.md](docs/rpc.md) | JSON-RPC methods, parameters, result shapes, error codes |
 | [docs/shielded.md](docs/shielded.md) | the shielded pool: keys, what is public, the wallet, the RPC, admission, what still leaks |
 | [docs/staking.md](docs/staking.md) | the validator register, epochs, and the four staking commands: register, bond, unbond, withdraw |

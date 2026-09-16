@@ -1,14 +1,14 @@
 # The Rand zkVM — ISA and execution model
 
-This page explains the machine every confidential operation on SHRUGG runs on: what a proof
+This page explains the machine every confidential operation on RAND runs on: what a proof
 states, the instruction set, how memory and syscalls work, how a run becomes a trace and a
 trace becomes a STARK, what is public, and what it costs. `docs/confidential.md` covers the
 on-chain call model, `docs/shielded.md` the note pool built on the `bundle` guest, and
 `docs/zkvm-milestones.md` the history. The upstream crate is `circuits/research` (`rand_zkvm`),
-vendored here as `crates/shrugg-zkvm`; its own documents (`research/docs/01`–`06`) are the
+vendored here as `crates/randprotocol-zkvm`; its own documents (`research/docs/01`–`06`) are the
 authoritative reference and are cited by name below.
 
-> **What this node actually runs.** `crates/shrugg-zkvm` is **constraint set 6 (the public input
+> **What this node actually runs.** `crates/randprotocol-zkvm` is **constraint set 6 (the public input
 > segment, upstream `0200877`, carrying milestones M4.3 and M4.4)**: nine *mandatory* tables, the
 > ninth being `public` (the public input segment), plus a `keccak` and a `sha256` table a proof
 > carries only when its guest actually called the matching syscall. Everything the M4 lines below
@@ -247,7 +247,7 @@ A proof that carries the keccak table costs ~1.91 MB more than one that does not
 its row count, is what a proof pays for. The sha256 table **(M4.4)** costs the same way and a
 quarter as much (466 columns, +~400 KB at the production profile). Constraint set 6's mandatory
 `public` table and wider cpu table grow every proof by a few percent over set 5 (measured in
-`docs/confidential.md`, "Constraint set 6"). `shrugg-core`'s `MAX_PROOF_BYTES` is 2 MiB, so no
+`docs/confidential.md`, "Constraint set 6"). `randprotocol-core`'s `MAX_PROOF_BYTES` is 2 MiB, so no
 keccak-bearing proof is admissible on this chain today; `docs/block-space.md` has the block-space
 consequences.
 

@@ -22,23 +22,23 @@ ValidatorEntry {
     stake:    u64,               // bonded: the weight an epoch's set gives it
     pending:  Vec<(u64, u64)>,   // unbonding, as (release_epoch, amount), oldest first
     rewards:  u64,               // fees earned as a block proposer, unpaid
-    payout:   ShieldedAddress,   // shrugg1… — where a withdraw pays
+    payout:   ShieldedAddress,   // rand1… — where a withdraw pays
     nonce:    u64,               // the replay protection for its signed actions
 }
 ```
 
 Every field of every row is public, and the register is hashed into every block's state root
-(leaf domain `shrugg-validator-leaf-2`), so a node that disagrees about one of them disagrees about
+(leaf domain `rand-validator-leaf-2`), so a node that disagrees about one of them disagrees about
 the chain. A row is created by genesis or by the bond that registers the validator, and is never
 deleted: a validator that unbonds everything keeps a row with `stake = 0`, which is simply in no
 epoch's set.
 
 | constant | value | meaning |
 |---|---|---|
-| `MIN_STAKE` | 1000 SHRUGG | stake a row needs to be in an epoch's set at all |
+| `MIN_STAKE` | 1000 RAND | stake a row needs to be in an epoch's set at all |
 | `MAX_VALIDATORS` | 100 | largest set an epoch can have |
 | `UNBONDING_EPOCHS` | 2 | epochs an unbonded amount waits before it can be withdrawn |
-| `epoch_blocks` | 1000 (genesis) | blocks per epoch; `shrugg-node genesis --epoch-blocks` |
+| `epoch_blocks` | 1000 (genesis) | blocks per epoch; `rand-node genesis --epoch-blocks` |
 
 ## 2. Epochs
 
@@ -61,7 +61,7 @@ old registers.
 Two consequences worth knowing:
 
 - **A bond is not weight until the next epoch.** It is in the register the moment it commits, and
-  `shrugg_getEpoch`'s `next_set` shows it immediately, but the set only changes at a boundary.
+  `rand_getEpoch`'s `next_set` shows it immediately, but the set only changes at a boundary.
 - **An unbond costs weight at the next boundary, not two epochs later.** The `UNBONDING_EPOCHS` wait
   is about the *amount* becoming withdrawable; the *set* is re-derived at the very next boundary, so
   a validator stops proposing long before it can withdraw.
@@ -70,7 +70,7 @@ If an epoch's derivation is empty — every validator below the minimum — the 
 carried forward, because an epoch with no leader is a halt nothing could end.
 
 A node runs with `--validator` when it holds a validator key at all; being in the current set is a
-separate thing, and `shrugg_status` reports the two separately as `is_validator` and
+separate thing, and `rand_status` reports the two separately as `is_validator` and
 `active_validator`. A key in no current set neither proposes nor votes, but keeps following the
 chain, so **a validator that bonds in after genesis does not need a restart**: start it with
 `--validator` and it begins proposing when its epoch arrives.
@@ -83,21 +83,21 @@ the node holds.
 
 | action | command | rides on | pays |
 |---|---|---|---|
-| register | `shrugg-node register` | nothing — it prints a blob | nothing (offline) |
-| `Bond` | `shrugg bond` | a bundle, which burns the stake | the 0.001 SHRUGG bundle base, out of the wallet's notes |
-| `Unbond` | `shrugg-node unbond` | nothing (`bundle: null`) | nothing |
-| `Withdraw` | `shrugg-node withdraw` | nothing (`bundle: null`) | the 0.001 SHRUGG base, out of the amount withdrawn |
+| register | `rand-node register` | nothing — it prints a blob | nothing (offline) |
+| `Bond` | `rand bond` | a bundle, which burns the stake | the 0.001 RAND bundle base, out of the wallet's notes |
+| `Unbond` | `rand-node unbond` | nothing (`bundle: null`) | nothing |
+| `Withdraw` | `rand-node withdraw` | nothing (`bundle: null`) | the 0.001 RAND base, out of the amount withdrawn |
 
 ### Registration
 
 ```bash
-shrugg-node register --key node.key.json --payout shrugg1<payout address> [--rpc http://127.0.0.1:8545]
+rand-node register --key node.key.json --payout rand1<payout address> [--rpc http://127.0.0.1:8545]
 ```
 
 Prints the validator's address and a hex `Registration` — its public key, the payout address, and a
 signature over `(chain_id, payout)`. The RPC is only read for the chain id: a registration signed
 for one chain is refused on another. The payout address comes from a **wallet** key
-(`shrugg --key payout.key.json address`), not from a node key, and it is the one field a later
+(`rand --key payout.key.json address`), not from a node key, and it is the one field a later
 top-up cannot change.
 
 Hand the hex to whoever holds the stake.
@@ -105,8 +105,8 @@ Hand the hex to whoever holds the stake.
 ### Bond
 
 ```bash
-shrugg bond <validator base58> <amount in SHRUGG> \
-    [--registration <hex>] [--fee <SHRUGG>] [--no-wait] [--cuda]
+rand bond <validator base58> <amount in RAND> \
+    [--registration <hex>] [--fee <RAND>] [--no-wait] [--cuda]
 ```
 
 A bond is an ordinary shielded transaction: the wallet proves a 2-in-2-out bundle whose `burn` is the
@@ -117,7 +117,7 @@ transfer.
 - `--registration` is required exactly when the validator is not in the register yet, and refused
   when it is. The wallet asks the register first, so the wrong shape is an answer rather than a
   wasted proof.
-- Registering bonds at least `MIN_STAKE` (1000 SHRUGG). A top-up afterwards can be any amount above
+- Registering bonds at least `MIN_STAKE` (1000 RAND). A top-up afterwards can be any amount above
   zero — the wallet refuses zero, which would pay a fee and a proof to move nothing.
 - What the chain learns is that this validator's stake grew by this much. Which notes paid for it,
   and who holds them, is hidden exactly as in a transfer — so anyone can stake onto a validator
@@ -127,15 +127,15 @@ The wallet prints the new stake and the epoch the weight starts counting from:
 
 ```
 submitted bond 8c3f…e1
-  0 SHRUGG out, 1000 SHRUGG burned, 0.999 SHRUGG change, fee 0.001 SHRUGG, anchored at height 412
-2nRdFC…: stake 1000 SHRUGG, counting as consensus weight from epoch 69
-balance: 0.999 SHRUGG
+  0 RAND out, 1000 RAND burned, 0.999 RAND change, fee 0.001 RAND, anchored at height 412
+2nRdFC…: stake 1000 RAND, counting as consensus weight from epoch 69
+balance: 0.999 RAND
 ```
 
 ### Unbond
 
 ```bash
-shrugg-node unbond <amount in SHRUGG> --key node.key.json [--rpc …] [--no-wait]
+rand-node unbond <amount in RAND> --key node.key.json [--rpc …] [--no-wait]
 ```
 
 Moves `amount` from `stake` into `pending` with `release_epoch = epoch + UNBONDING_EPOCHS`, and
@@ -150,23 +150,23 @@ epoch merge into one `pending` row, because that row is hashed into the state ro
 ### Withdraw
 
 ```bash
-shrugg-node withdraw <amount in SHRUGG> --key node.key.json [--rpc …] [--no-wait]
+rand-node withdraw <amount in RAND> --key node.key.json [--rpc …] [--no-wait]
 ```
 
 Pays released value into a deposit note at the register's `payout` address. Released means
 `rewards` plus the `pending` rows whose `release_epoch` has arrived; the command takes the released
 rows oldest first and then the rewards.
 
-Like an unbond it is validator-signed and bundle-less, but it is not free: it pays the 0.001 SHRUGG
+Like an unbond it is validator-signed and bundle-less, but it is not free: it pays the 0.001 RAND
 bundle base to the proposer of the block that applies it, **out of the amount withdrawn**. So a
-withdrawal of 1000 SHRUGG leaves the register entirely and creates a note worth 999.999 SHRUGG, and
+withdrawal of 1000 RAND leaves the register entirely and creates a note worth 999.999 RAND, and
 an amount that cannot cover the base is refused rather than buying a note worth nothing.
 
 The note is the one the chain computes for itself, from the register's payout address, the amount
 less the base, the blinding `r` the action publishes, and the action's own `time`:
 
 ```
-cm = H_CM(payout.pk, from = 0, amount − 0.001 SHRUGG, asset 0, time, r)
+cm = H_CM(payout.pk, from = 0, amount − 0.001 RAND, asset 0, time, r)
 ```
 
 `time` is the head height when the command ran, which it prints and which the signature binds — not
@@ -177,17 +177,17 @@ the payout wallet finds by scanning. Publishing `r` is what closes the "declare 
 another" gap: the chain never takes the note's commitment from the transaction.
 
 ```
-withdrawing 1000 SHRUGG: a note worth 999.999 SHRUGG to shrugg1x7Qk…, the 0.001 SHRUGG base to the block's proposer
+withdrawing 1000 RAND: a note worth 999.999 RAND to rand1x7Qk…, the 0.001 RAND base to the block's proposer
   note blinding r 3f9a…7c at time 4131
-submitted withdraw of 1000 SHRUGG 1b7e…
+submitted withdraw of 1000 RAND 1b7e…
   committed in block 4133
 ```
 
 Afterwards the payout wallet finds the note like any other — by scanning, with nothing told to it:
 
 ```bash
-shrugg --key payout.key.json balance      # balance: 999.999 SHRUGG
-shrugg --key payout.key.json send shrugg1… 1
+rand --key payout.key.json balance      # balance: 999.999 RAND
+rand --key payout.key.json send rand1… 1
 ```
 
 ## 4. Joining and leaving a chain
@@ -196,25 +196,25 @@ Joining, from the two sides:
 
 ```bash
 # on the joining validator's machine
-shrugg-node register --key node.key.json --payout "$(shrugg --key payout.key.json address)"
-shrugg-node run --datadir ./data --key node.key.json --validator --bootstrap /ip4/…/p2p/…
-#   … it syncs and observes; shrugg_status says is_validator true, active_validator false
+rand-node register --key node.key.json --payout "$(rand --key payout.key.json address)"
+rand-node run --datadir ./data --key node.key.json --validator --bootstrap /ip4/…/p2p/…
+#   … it syncs and observes; rand_status says is_validator true, active_validator false
 
 # on the machine holding the stake, with the hex from above
-shrugg bond <validator base58> 1000 --registration <hex>
-shrugg validators                       # the new row, active false until the boundary
+rand bond <validator base58> 1000 --registration <hex>
+rand validators                       # the new row, active false until the boundary
 
 # back on the validator's machine, from the next epoch on
-shrugg-node status                      # active_validator: true — it is proposing now
+rand-node status                      # active_validator: true — it is proposing now
 ```
 
 Leaving:
 
 ```bash
-shrugg-node unbond 1000 --key node.key.json     # out of the set at the next boundary
-shrugg validators                                # stake 0, pending [{release_epoch, amount}]
+rand-node unbond 1000 --key node.key.json     # out of the set at the next boundary
+rand validators                                # stake 0, pending [{release_epoch, amount}]
 #   … wait two epochs …
-shrugg-node withdraw 1000 --key node.key.json    # a note worth 999.999 SHRUGG at the payout address
+rand-node withdraw 1000 --key node.key.json    # a note worth 999.999 RAND at the payout address
 ```
 
 A set of `n` validators needs more than 2/3 of its stake online, so check the arithmetic before
@@ -223,10 +223,10 @@ unbonding: dropping one of four leaves three, which is a quorum only if all thre
 Genesis seeds the register directly, one entry per `--validator`:
 
 ```bash
-shrugg-node genesis --chain-id 6 \
-    --validator node-a.key.json,1000,shrugg1<a's payout> \
-    --validator <hex public key of b>,1000,shrugg1<b's payout> \
-    --epoch-blocks 1000 --alloc shrugg1<address>=1000 --faucet --out genesis.json
+rand-node genesis --chain-id 6 \
+    --validator node-a.key.json,1000,rand1<a's payout> \
+    --validator <hex public key of b>,1000,rand1<b's payout> \
+    --epoch-blocks 1000 --alloc rand1<address>=1000 --faucet --out genesis.json
 ```
 
 The three fields of a `--validator` travel together because they are one register entry, and all
@@ -243,8 +243,8 @@ epoch's set, and a chain seeded entirely from those would have nobody to pick a 
 | `Unbond` | the validator, the amount, the nonce | nothing — there is nothing else in it |
 | `Withdraw` | the validator, the amount, the nonce, the note's `time` | who can open the note, and every later spend of it |
 
-So a watcher learns that 1000 SHRUGG was bonded to this validator and, later, that the validator
-withdrew 1000 SHRUGG into a note at its published payout address. What the note is then worth to whom, and
+So a watcher learns that 1000 RAND was bonded to this validator and, later, that the validator
+withdrew 1000 RAND into a note at its published payout address. What the note is then worth to whom, and
 where the value goes next, is a shielded transfer like any other. The payout address is public in the
 register from the day the validator registers, so publishing the withdraw's blinding leaks nothing
 the register did not already say.
@@ -257,22 +257,22 @@ costs its stake nothing, and the remedy is the operators'.
 ## 6. Reading it back
 
 ```bash
-shrugg validators          # the whole register, one row per entry
-shrugg status              # is_validator / active_validator for the node you asked
+rand validators          # the whole register, one row per entry
+rand status              # is_validator / active_validator for the node you asked
 ```
 
-`shrugg_getValidators` (`docs/rpc.md`) returns one row per register entry, in address order, with
-amounts as **decimal strings** — a stake is 10⁹ units per SHRUGG and a JSON number is not an exact
+`rand_getValidators` (`docs/rpc.md`) returns one row per register entry, in address order, with
+amounts as **decimal strings** — a stake is 10⁹ units per RAND and a JSON number is not an exact
 integer past 2⁵³:
 
 ```json
 { "address": "2nRdFC…", "stake": "1000000000000",
   "pending": [{ "release_epoch": 71, "amount": "1000000000000" }],
-  "rewards": "4000000", "payout": "shrugg1…", "nonce": 3, "active": true }
+  "rewards": "4000000", "payout": "rand1…", "nonce": 3, "active": true }
 ```
 
 `active` is whether this row is in the set running the current epoch — that, and not the presence of
-a row, is what says who is producing blocks. `shrugg_getEpoch` answers where the chain is in its
+a row, is what says who is producing blocks. `rand_getEpoch` answers where the chain is in its
 schedule and what the next boundary would derive today:
 
 ```json
@@ -281,6 +281,6 @@ schedule and what the next boundary would derive today:
 
 `next_set` is a projection, not a commitment: every bond and unbond before the boundary moves it.
 
-For where the staked value came from and went to, read `shrugg_getSupply` and `docs/supply.md`: the
+For where the staked value came from and went to, read `rand_getSupply` and `docs/supply.md`: the
 register's total and the pool's value have to add up to everything the chain ever issued, and a node
 checks it.

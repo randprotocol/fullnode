@@ -7,7 +7,7 @@ Date: 2026-09-11. Status: draft for review. Supersedes the transparent account l
 
 ## 1. Goal
 
-Every SHRUGG balance becomes a set of unspent notes. There is no transparent pool: no
+Every RAND balance becomes a set of unspent notes. There is no transparent pool: no
 `Account { nonce, balance }`, no plaintext transfer, no plaintext amount anywhere on chain. A
 balance is visible only to whoever holds the owner's viewing key, and a transaction's sender,
 receiver and amount are visible only to the two parties, to whoever they hand a per-transaction key,
@@ -48,9 +48,9 @@ Transaction {
     anchor:       Word8,          // a recent commitment-tree root
     nullifiers:   [Word8; 2],     // nf of each spent note (dummy inputs still publish one)
     commitments:  [Word8; 2],     // cm of each created note (dummy outputs still publish one)
-    fee:          u64,            // units, public, always asset 0 (SHRUGG)
+    fee:          u64,            // units, public, always asset 0 (RAND)
     burn:         u64,            // units leaving the pool into the action (0 for none)
-    asset:        u32,            // asset id balanced by this bundle; 0 = SHRUGG
+    asset:        u32,            // asset id balanced by this bundle; 0 = RAND
     time:         u64,            // block height the sender targets
     envelopes:    [Envelope; 2],  // ciphertext per created note
     proof:        Vec<u8>,        // postcard(rand_zkvm::Proof)
@@ -91,7 +91,7 @@ plus the amounts; the public fee, burn and asset. The guest proves:
    with no wrap-around (each amount is two u32 words; the guest checks carries with RV32M-free
    add-with-carry sequences, and every amount is below `2^63` so the sum cannot overflow).
 6. Every note's `asset` equals the bundle's public `asset`; `fee` is charged in asset 0, so a bundle
-   with `asset != 0` must have `fee = 0` in this bundle and be paired with a second SHRUGG bundle
+   with `asset != 0` must have `fee = 0` in this bundle and be paired with a second RAND bundle
    (section 10). For the first release `asset` is always 0.
 7. `time` is copied into both output notes.
 8. The single public output is
@@ -111,8 +111,8 @@ Cost estimate, to be measured in the zkVM task that builds this guest (section 1
 walks of 32 hashes, six note hashes, one output hash, about 80 permutations at a few cycles each,
 plus 64-bit bookkeeping. The current one-in-one-out guest runs 4903 cycles at 4554 program words
 because the Merkle walk is unrolled; the looped routine is a prerequisite, and the target is tier 12
-(4095 cycles) or 14. Amount width is `u64` units (18.4 billion SHRUGG per note at
-`UNITS_PER_SHRUGG = 1e9`), up from the research crate's `u32`.
+(4095 cycles) or 14. Amount width is `u64` units (18.4 billion RAND per note at
+`UNITS_PER_RAND = 1e9`), up from the research crate's `u32`.
 
 ## 5. Notes, keys, addresses
 
@@ -124,7 +124,7 @@ cm = H(CM, note words)          nf = H(NF, nk, cm)          nk = H(NK, sk)      
 ```
 
 Keys: `sk` (spend), `nk` (viewing; derives `pk`, every nullifier, `ovk`, and the ML-KEM-768
-decapsulation seed). A **shielded address** is `(pk, kem_ek)`, encoded base58 with a `shrugg1`
+decapsulation seed). A **shielded address** is `(pk, kem_ek)`, encoded base58 with a `rand1`
 prefix. The ML-KEM-768 encapsulation key is 1184 bytes, so an address is about 1.6 KB. That is the
 price of a post-quantum envelope consistent with the chain's Dilithium2 choice; a 32-byte X25519
 address would be shorter and not post-quantum. Ruling: keep ML-KEM.
@@ -146,7 +146,7 @@ Withdraw payouts.
 | Bond | `validator: Address(pk_dilithium), amount` | `burn = amount` leaves the pool into the validator's stake | the bundle proof (any note holder can bond to any validator) |
 | Unbond | `validator, amount, sig` | stake → pending, released after `UNBONDING_EPOCHS` | validator signature |
 | Withdraw | `validator, amount, time, r, envelope, sig` | bundle-less; released stake or rewards → one new note worth `amount − BUNDLE_BASE`, the base credited to the block proposer | validator signature |
-| Mint (faucet) | `cm, envelope, amount ≤ 100 SHRUGG` | new note of public amount; only when genesis `faucet = true` | the node key (as today) |
+| Mint (faucet) | `cm, envelope, amount ≤ 100 RAND` | new note of public amount; only when genesis `faucet = true` | the node key (as today) |
 | BridgeAttest | attestation bytes, `cm, envelope` | new note of public amount in the bridged asset | guardian quorum (as today) |
 | BridgeBurn | `asset, amount, destination, sig-free` | `burn = amount` in `asset` leaves the pool to the bridge | the bundle proof |
 
@@ -201,14 +201,14 @@ Cheap before expensive, in this order, in both the mempool and the ledger:
 
 1. Size caps: transaction ≤ 8 KiB before the proof, proof ≤ 1 MiB, envelopes ≤ 2 KiB each.
 2. `chain_id` matches.
-3. `fee ≥ fee_floor(action)`: `BUNDLE_BASE = 1_000_000` units (0.001 SHRUGG) for every bundle, plus
-   the Deploy or Call floor. Transfers therefore cost 0.001 SHRUGG; the faucet mints 100.
+3. `fee ≥ fee_floor(action)`: `BUNDLE_BASE = 1_000_000` units (0.001 RAND) for every bundle, plus
+   the Deploy or Call floor. Transfers therefore cost 0.001 RAND; the faucet mints 100.
 4. `anchor` is one of the last `ANCHOR_WINDOW = 64` roots (the research crate uses 16; 64 gives a
    prover about a minute at 1 s blocks).
 5. `time` is within `[height - 64, height]`.
 
 > **2026-09-12: raised to 256.** Both windows are 256 blocks in the implementation
-> (`shrugg_core::ledger::{ANCHOR_WINDOW, TIME_WINDOW}`). The measured tier-14 bundle proof is
+> (`randprotocol_core::ledger::{ANCHOR_WINDOW, TIME_WINDOW}`). The measured tier-14 bundle proof is
 > ~100 s and the fleet makes a block every ~2 s, so the 64 assumed here — a minute at 1 s blocks —
 > expired an honest transfer's anchor while it was still being proved.
 
@@ -234,7 +234,7 @@ ValidatorEntry { key: PublicKey (Dilithium2), stake: u64, pending: Vec<(u64 rele
 
 - **Epochs**: `EPOCH_BLOCKS = 1000`. The validator set used by HotStuff for epoch `e` is computed
   from the register as of the last block of epoch `e - 1`: every entry with `stake ≥ MIN_STAKE`
-  (1000 SHRUGG), capped at `MAX_VALIDATORS = 100` by stake, sorted by address. Weights are the
+  (1000 RAND), capped at `MAX_VALIDATORS = 100` by stake, sorted by address. Weights are the
   `stake` field. `ValidatorSet::has_quorum` and `leader` are unchanged.
 - **Registration** is a Bond to a key not yet in the register with `amount ≥ MIN_STAKE`; the
   action carries the validator's Dilithium2 public key and payout address signed by that key.
@@ -251,7 +251,7 @@ ValidatorEntry { key: PublicKey (Dilithium2), stake: u64, pending: Vec<(u64 rele
   an amount is stored in the clear.
 
 Genesis: `validators: [{public_key, stake, payout}]` seeds the register; `alloc` becomes a list of
-`(cm, envelope, amount)` deposit notes, generated by `shrugg-node genesis` from shielded addresses.
+`(cm, envelope, amount)` deposit notes, generated by `rand-node genesis` from shielded addresses.
 
 ## 9. State, storage, state root
 
@@ -266,7 +266,7 @@ programs         as today
 bridge           as today (bridged balances become notes; the bridge keeps emitters, guardian sets, asset registry, spent digests)
 ```
 
-`state_root = blake3("shrugg-state-2" || tree_root || nullifier_root || validators_root || programs_root [|| bridge_root])`.
+`state_root = blake3("rand-state-2" || tree_root || nullifier_root || validators_root || programs_root [|| bridge_root])`.
 `nullifier_root` is a BLAKE3 Merkle root over the sorted nullifier set, recomputed per block
 (O(n); an incremental accumulator is a follow-up once the set passes about 10^6 entries).
 `validators_root` is a BLAKE3 Merkle root over entries in address order.
@@ -281,18 +281,18 @@ re-verifies proofs; `off` trusts the stored state as today).
 ## 10. Bridge on the shielded chain
 
 Bridged assets are notes with `asset = bridge asset id`. BridgeAttest deposits a note of public
-amount; BridgeBurn burns from a bundle in that asset. Because the fee is in SHRUGG and a bundle
+amount; BridgeBurn burns from a bundle in that asset. Because the fee is in RAND and a bundle
 balances one asset, a BridgeBurn transaction carries **two bundles**: an asset bundle (fee 0,
-`burn = amount`) and a SHRUGG bundle paying the fee. This is the only two-bundle transaction and is
+`burn = amount`) and a RAND bundle paying the fee. This is the only two-bundle transaction and is
 scheduled last (phase S3). The bridge's own state (emitters, guardian sets, asset registry, spent
 digests, burn log) is unchanged and stays public; its per-account balances are deleted.
 
 ## 11. What the explorer and RPC see
 
-Removed: `shrugg_getBalance`, `shrugg_getAccount`, plaintext transfer bodies, per-account history.
-Added: `shrugg_getCommitments(from_index, limit)`, `shrugg_getNullifiers(height)`,
-`shrugg_getEnvelopes(height)`, `shrugg_getAnchor(height)`, `shrugg_getValidators` (public register),
-`shrugg_getWitness(cm)` (Merkle path for a wallet that lacks a local tree). Fees, actions, program
+Removed: `rand_getBalance`, `rand_getAccount`, plaintext transfer bodies, per-account history.
+Added: `rand_getCommitments(from_index, limit)`, `rand_getNullifiers(height)`,
+`rand_getEnvelopes(height)`, `rand_getAnchor(height)`, `rand_getValidators` (public register),
+`rand_getWitness(cm)` (Merkle path for a wallet that lacks a local tree). Fees, actions, program
 ids, receipts, validators and bridge state remain public. Transaction bodies are public but contain
 only commitments, nullifiers, ciphertexts, fee, burn, time and the proof.
 
@@ -307,8 +307,8 @@ transactions are private unless the viewing key is given.
 | phase | scope | depends on |
 |---|---|---|
 | Z (zkVM, `circuits/research`) | looped `MERKLE_VERIFY`; the 2-in-2-out `bundle` guest with `u64` amounts, dummy inputs, fee and burn; `H_OUT` over the 9-field preimage; measured tier; vendored | M3 (done) |
-| S1 (fullnode) | notes ledger, `Bundle` transaction, admission order, storage, state root, deposits via Mint, wallet (keys, scanning, proving, `shrugg send`), RPC redaction, genesis with deposit notes, `--verify-chain` replay | Z |
-| S2 | validator register, Bond/Unbond/Withdraw, epochs, rewards, `shrugg-node genesis` seeding | S1 |
+| S1 (fullnode) | notes ledger, `Bundle` transaction, admission order, storage, state root, deposits via Mint, wallet (keys, scanning, proving, `rand send`), RPC redaction, genesis with deposit notes, `--verify-chain` replay | Z |
+| S2 | validator register, Bond/Unbond/Withdraw, epochs, rewards, `rand-node genesis` seeding | S1 |
 | S3 | Deploy/Call riding on bundles (kind 1 removed), call input envelopes (section 6.1), bridge as notes with the two-bundle BridgeBurn | S1, zkVM M4.1, bridge merge |
 
 Each phase is a hard fork; S1 alone is a new chain. The chain 5 fork the fleet session is
@@ -319,7 +319,7 @@ preparing (for f1a29dd) is independent of this; the shielded chain is the fork a
 | ruling | why | cost if wrong |
 |---|---|---|
 | 2-in-2-out fixed shape with dummy notes | uniform transaction size and shape; Sapling-proven | wallets with many small notes need chained transactions |
-| `u64` amounts | SHRUGG units are 1e9 per coin; u32 cannot hold one coin | note format change if supply ever exceeds 1.8e10 SHRUGG |
+| `u64` amounts | RAND units are 1e9 per coin; u32 cannot hold one coin | note format change if supply ever exceeds 1.8e10 RAND |
 | fee public, paid to proposer's public rewards | matches "public stake weights"; keeps admission cheap | fee amounts leak transaction class (transfer vs call) |
 | deposits with public amount (Withdraw, Mint, BridgeAttest) | value must enter the pool somewhere; same as Zcash t→z | one-hop amount visibility on deposits |
 | anchor window 64, time window 64 | proving takes seconds to a minute | stale-anchor rejections if blocks are faster than expected |

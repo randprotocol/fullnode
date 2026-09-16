@@ -16,9 +16,9 @@
 # the RAND ones. Run from the repo root with an agent that can reach both hosts.
 set -euo pipefail
 IP=$1; OLD=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-188.166.235.187}
-SERVICE=${SERVICE:-shrugg-node}
-BIN_NODE=${BIN_NODE:-shrugg-node}
-BIN_WALLET=${BIN_WALLET:-shrugg}
+SERVICE=${SERVICE:-rand-node}
+BIN_NODE=${BIN_NODE:-rand-node}
+BIN_WALLET=${BIN_WALLET:-rand}
 BUILD_DIR=${BUILD_DIR:-/root/fullnode/target/release}
 SSH="ssh -A -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$IP"
 

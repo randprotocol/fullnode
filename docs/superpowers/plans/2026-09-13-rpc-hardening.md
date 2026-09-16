@@ -24,7 +24,7 @@ plan edits. What moved, and what each task now has to do about it:
   64 KiB) + 256 KiB` ≈ **8.86 MB**, sized for one transaction carrying two proofs, and `serve`
   layers it with `DefaultBodyLimit`. Task 2's `MAX_BATCH` is the *request-count* bound and this is
   the *byte* bound; Task 3's route merge must keep the layer.
-- **A transaction bigger than a block is refused twice.** `shrugg_sendTransaction` pre-checks
+- **A transaction bigger than a block is refused twice.** `rand_sendTransaction` pre-checks
   `tx.encoded_len() > gas::MAX_BLOCK_BYTES` (rpc.rs:475) and `Ledger::validate` step 1 returns the
   new `TxError::TransactionTooLarge(usize)`. Task 1 maps no `TxError` variants, so it is unaffected;
   **Task 4's `is_permanent` allowlist gains `TransactionTooLarge(_)`** — a byte length is a function
@@ -48,24 +48,24 @@ plan edits. What moved, and what each task now has to do about it:
   `ValidationMode::Permissive` moved from line 139 to **247**. Task 5 touches only the gossipsub
   `ConfigBuilder` (245–250) and the `Event::Message` arm (486–493).
 - **`mempool.rs` claims a `BridgeAttest`'s derived note too.** `claimed_commitments` calls
-  `Ledger::derived_commitment` (shrugg-core `ledger/staking.rs:161`) for `Withdraw` *and*
+  `Ledger::derived_commitment` (randprotocol-core `ledger/staking.rs:161`) for `Withdraw` *and*
   `BridgeAttest`, so Task 4's `precheck` keeps its `&dyn ConfidentialExecutor` argument, and Task 1's
   `derived_note_count` must cover the same two arms. `candidates_within` also continues past an
   oversized candidate now; no task here touches it.
-- **The cluster suite is serialised by a proving-slot file lock** (`<target-dir>/tmp/shrugg-proving-slot.lock`,
-  `crates/shrugg-node/tests/proving_slot/`). It is **17 tests / 19m59s**, not 16 / 6m28s. Task 6's one
+- **The cluster suite is serialised by a proving-slot file lock** (`<target-dir>/tmp/rand-proving-slot.lock`,
+  `crates/randprotocol-node/tests/proving_slot/`). It is **17 tests / 19m59s**, not 16 / 6m28s. Task 6's one
   `--test cluster` run is sized accordingly and its proving test must take the slot.
-- **The client sizes its POST timeout by body** (`shrugg-client` `READ_TIMEOUT` 15 s flat for reads,
+- **The client sizes its POST timeout by body** (`randprotocol-client` `READ_TIMEOUT` 15 s flat for reads,
   `upload_timeout` = 30 s + body/32 KiB/s for uploads). Task 1's page caps sit under the 15 s read
   budget; Task 5's extra submission latency sits inside `upload_timeout`.
-- **`docs/rpc.md` gained a `shrugg_status` block** documenting the four sync fields. Tasks 3 and 6
+- **`docs/rpc.md` gained a `rand_status` block** documenting the four sync fields. Tasks 3 and 6
   **append** to it and to the Errors table; nothing in this plan rewrites what fix-sync-stall wrote.
 
 Scope is unchanged: the same six tasks, the same rulings, with the two amendments named below.
 
 **Goal:** Give the node the four read/serve capabilities a light wallet and an explorer need and a chain under load survives — a compact-block range read, a WebSocket `newHeads` subscription, JSON-RPC batch requests, and an admission path that refuses a known-bad transaction for free, rate-limits gossiped submissions per peer, and verifies proofs off the consensus event loop under gossipsub application-level validation — **without a hard fork**.
 
-**Architecture:** Everything here is node-local. `shrugg_getCompactBlocks` derives its rows from the block store and the `notes` family already on disk — no new column family, so it answers on a database written by the current binary and needs no migration. Batching wraps the existing `dispatch`; the WebSocket lives in a new `src/ws.rs` served on the same axum router and fed by a `tokio::sync::broadcast` channel the node loop publishes one head into per committed block. The admission work splits `Mempool::insert` into a cheap `precheck` (pool conflicts + the state-dependent half of `Ledger::validate`) and an `insert_verified`, so the expensive half — the bundle and call proofs — can run on `tokio::task::spawn_blocking` against an `Arc<Ledger>` snapshot while the node loop keeps turning; the verdict comes back on a channel, decides the gossipsub `MessageAcceptance`, and feeds a bounded refused-hash cache.
+**Architecture:** Everything here is node-local. `rand_getCompactBlocks` derives its rows from the block store and the `notes` family already on disk — no new column family, so it answers on a database written by the current binary and needs no migration. Batching wraps the existing `dispatch`; the WebSocket lives in a new `src/ws.rs` served on the same axum router and fed by a `tokio::sync::broadcast` channel the node loop publishes one head into per committed block. The admission work splits `Mempool::insert` into a cheap `precheck` (pool conflicts + the state-dependent half of `Ledger::validate`) and an `insert_verified`, so the expensive half — the bundle and call proofs — can run on `tokio::task::spawn_blocking` against an `Arc<Ledger>` snapshot while the node loop keeps turning; the verdict comes back on a channel, decides the gossipsub `MessageAcceptance`, and feeds a bounded refused-hash cache.
 
 **Tech Stack:** Rust 1.98.1, tokio, axum 0.7.9 (+ its `ws` feature), libp2p 0.54 / libp2p-gossipsub 0.47, RocksDB. One new dev-dependency: `tokio-tungstenite` 0.24 (the version axum 0.7.9's `ws` feature already pulls in), for the WebSocket integration test's client side. No new runtime dependency.
 
@@ -74,18 +74,18 @@ Scope is unchanged: the same six tasks, the same rulings, with the two amendment
 ## Global Constraints
 
 - **No hard fork.** Nothing in this plan may change block validity, the transaction wire format, the genesis hash, any consensus rule, or the gossip topic names / `GossipMessage` encoding. The result deploys onto the running **chain 8** fleet (18 validators) by rolling restart, with old and new binaries coexisting indefinitely.
-- **Do not change `ValidationMode::Permissive`** in `crates/shrugg-node/src/network/mod.rs:247` (it moved from :139 when fix-sync-stall added the wire constants above it). A Strict/Permissive mix across a fleet drops messages. What this plan turns on is `ConfigBuilder::validate_messages()` — *application*-level validation, which is local to one node and invisible on the wire.
+- **Do not change `ValidationMode::Permissive`** in `crates/randprotocol-node/src/network/mod.rs:247` (it moved from :139 when fix-sync-stall added the wire constants above it). A Strict/Permissive mix across a fleet drops messages. What this plan turns on is `ConfigBuilder::validate_messages()` — *application*-level validation, which is local to one node and invisible on the wire.
 - **The sync wire is out of scope.** `network/codec.rs`, `SYNC_REQUEST_TIMEOUT`, `SYNC_MAX_WIRE_BYTES`, `SYNC_RESPONSE_WIRE_LIMIT`, `SYNC_REQUEST_WIRE_LIMIT`, `addr_scope` / `is_dialable_advertised_addr` and the `lan_peers` set are fix-sync-stall's, and nothing here reads or changes them. Task 5's only edit in `network/mod.rs` is the gossipsub `ConfigBuilder` (lines 245–250) and the `Event::Message` arm (486–493). Likewise the sync counters (`sync_failures`, `sync_late_batches`, `sync_inflight_age_ms`) are read-only to this plan: no task increments them, and no task adds a counter that shadows one.
 - `validate_messages()` makes every delivered gossipsub message require exactly one `report_message_validation_result` call, or it is never forwarded by this node. **Every `NetworkEvent::Gossip` must be reported exactly once, on every path, including error paths.** Consensus and status messages are reported `Accept` immediately (that is today's behaviour); only transactions wait for a verdict.
 - The gossipsub message cache holds an unvalidated message for `history_length` (5) heartbeats at a `heartbeat_interval` of 500 ms = **2.5 s**. A verdict later than that reports into nothing. Every queue size below is chosen against that budget.
-- Tests: `cargo test --release -p shrugg-node` for node-only work. **Per-task verification uses focused runs** (`--lib <filter>`, or one `--test <file>`); the full workspace suite is 466 tests / 22 min — measured *before* the proving slot below, so longer now — and proves real bundles. **The cluster suite (`--test cluster`) is run once, in the final task.** Never run the whole workspace suite mid-plan.
-- **The proving slot, and what it costs.** Every proving test in the workspace takes one permit through a file lock at `<target-dir>/tmp/shrugg-proving-slot.lock` (`crates/shrugg-node/tests/proving_slot/`, twinned in `crates/shrugg-client/tests/proving_slot/`), so no two unrelated bundle proofs run at once — **across test binaries and across two sessions' concurrent `cargo test` runs**. Consequences for this plan:
+- Tests: `cargo test --release -p randprotocol-node` for node-only work. **Per-task verification uses focused runs** (`--lib <filter>`, or one `--test <file>`); the full workspace suite is 466 tests / 22 min — measured *before* the proving slot below, so longer now — and proves real bundles. **The cluster suite (`--test cluster`) is run once, in the final task.** Never run the whole workspace suite mid-plan.
+- **The proving slot, and what it costs.** Every proving test in the workspace takes one permit through a file lock at `<target-dir>/tmp/rand-proving-slot.lock` (`crates/randprotocol-node/tests/proving_slot/`, twinned in `crates/randprotocol-client/tests/proving_slot/`), so no two unrelated bundle proofs run at once — **across test binaries and across two sessions' concurrent `cargo test` runs**. Consequences for this plan:
   - The cluster suite is **17 tests / 19m59s measured 2026-09-13**, serialised, not the 16 / 6m28s this plan was written against. Task 6's single `--test cluster` run should be expected to take **~20 minutes plus whatever its new proof adds**, and must not be reported as hung before then.
-  - **Do not start it while another session's `--test cluster` or `--test wallet_flow` holds the lock**: the two runs will not overlap their proofs, they will queue, and the wall time adds. Check first (`lsof <target-dir>/tmp/shrugg-proving-slot.lock`, or just ask) and wait.
+  - **Do not start it while another session's `--test cluster` or `--test wallet_flow` holds the lock**: the two runs will not overlap their proofs, they will queue, and the wall time adds. Check first (`lsof <target-dir>/tmp/rand-proving-slot.lock`, or just ask) and wait.
   - Any new test in this plan that proves a real bundle must take the slot the same way the file's other proving tests do — `let _slot = proving_slot().await;` around the whole `wallet::send` / `submit` call, taken before the anchor is read and released after the commit. A test that proves without it breaks the bound for everyone else's tests, not just its own.
   - Everything else in this plan is FAST-paced or `--lib`, proves nothing, and needs no slot.
 - **Memory, on a shared machine.** Before and after any release build or test run, check nothing has run away: `ps -eo rss= | awk '$1>8000000'` should print nothing (an 8 GB resident process is a runaway `rustc` or a leaked node). Other sessions share this machine.
-- New RPC tests go at the bottom of `crates/shrugg-node/src/rpc.rs`, in the existing style: `state_for(&gs)` / `chain()` fixtures and the `ok(&st, "shrugg_…", json!([…]))` / `call(…)` helpers.
+- New RPC tests go at the bottom of `crates/randprotocol-node/src/rpc.rs`, in the existing style: `state_for(&gs)` / `chain()` fixtures and the `ok(&st, "rand_…", json!([…]))` / `call(…)` helpers.
 - Error conventions are the existing ones (`docs/rpc.md` → Errors): `-32601` unknown method, `-32602` bad parameter, `-32000` rejected, `-32001` not found, `-32603` internal. **Amended 2026-09-13:** `-32600` is no longer new — fix-sync-stall added `RpcError::invalid_request` (rpc.rs:139) for a body that is oversized or not JSON at all, and it is the one code `docs/rpc.md`'s Errors table still does not list. This plan adds two *uses* of it (batch shape, notification), reuses the existing constructor, and Task 2's doc step adds the single row covering all three.
 - Commit style from `git log`: a lowercase area prefix (`node: …`, `docs: …`), then a body that explains the *why*. One commit per task. Every commit message ends with:
   ```
@@ -98,21 +98,21 @@ Scope is unchanged: the same six tasks, the same rulings, with the two amendment
 
 | ruling | why | cost if wrong |
 |---|---|---|
-| `shrugg_getCompactBlocks` derives everything from `blocks` + `notes`; **no new column family** | a new family would be empty for every block already on chain-8 disks, so a rolling restart would serve holes until a resync. The `notes` family is dense, ordered by leaf index, and each row carries its `height` — one binary search plus a forward scan recovers the per-block slice exactly | a block's notes cost `O(log n)` gets instead of one; if the heights-are-monotone-in-index assumption ever broke, the scan would stop early (caught by the test that walks a three-block chain) |
+| `rand_getCompactBlocks` derives everything from `blocks` + `notes`; **no new column family** | a new family would be empty for every block already on chain-8 disks, so a rolling restart would serve holes until a resync. The `notes` family is dense, ordered by leaf index, and each row carries its `height` — one binary search plus a forward scan recovers the per-block slice exactly | a block's notes cost `O(log n)` gets instead of one; if the heights-are-monotone-in-index assumption ever broke, the scan would stop early (caught by the test that walks a three-block chain) |
 | range cap `MAX_COMPACT_BLOCKS = 128` blocks per call | half the 256-block anchor window, so a wallet syncing forward never crosses more than one anchor window per call, and a 128-block reply of typical chain-8 blocks (3 bundles) is ~2 MB of JSON | a wallet pages twice as often as it could; raising it later is a one-constant change |
-| the reply also stops after `MAX_PAGE` (1000) note rows, **but always returns at least one whole block** (the reply is a *response*, so `RPC_MAX_BODY_BYTES` does not bound it — these two caps are the only bound, and `shrugg-client`'s flat 15 s `READ_TIMEOUT` for a small-bodied request is what a too-generous page would actually hit) | a block may hold up to ~800 mints (4 MiB / 5181 bytes), each with a 1380-byte envelope — a 128-block range of those is gigabytes. Row-capping bounds the reply; the always-one-block rule keeps a client able to make progress past a fat block | a client that assumes it got the range it asked for skips blocks — which is why the reply is truncated, never padded, and a client resumes from `last returned height + 1` |
+| the reply also stops after `MAX_PAGE` (1000) note rows, **but always returns at least one whole block** (the reply is a *response*, so `RPC_MAX_BODY_BYTES` does not bound it — these two caps are the only bound, and `randprotocol-client`'s flat 15 s `READ_TIMEOUT` for a small-bodied request is what a too-generous page would actually hit) | a block may hold up to ~800 mints (4 MiB / 5181 bytes), each with a 1380-byte envelope — a 128-block range of those is gigabytes. Row-capping bounds the reply; the always-one-block rule keeps a client able to make progress past a fat block | a client that assumes it got the range it asked for skips blocks — which is why the reply is truncated, never padded, and a client resumes from `last returned height + 1` |
 | a block-level `commitments` array carries notes of that height no transaction of it accounts for | height 0's genesis deposits belong to no transaction, and it doubles as the safety net if per-transaction attribution ever desynchronises: leftover leaves still reach the wallet rather than vanishing | one always-empty array on every block above 0 |
-| batch cap `MAX_BATCH = 20` | the batch is a request amplifier and `shrugg_getWitness` rebuilds the whole tree per call; 20 leaves room for the realistic batch (head + treeInfo + a commitments page + a nullifiers page = 4) without turning one POST into 20 full-tree rebuilds. It is the *request-count* bound only: `RPC_MAX_BODY_BYTES` (≈8.86 MB, rpc.rs:154) is the byte bound and is sized for **one** proof-carrying transaction, so a batch of 20 submissions is refused by the body limit — also `-32600`, from `rejection_error` — long before the count cap is reached | an explorer batching 50 reads gets `-32600` and splits; the body limit already caps bytes |
+| batch cap `MAX_BATCH = 20` | the batch is a request amplifier and `rand_getWitness` rebuilds the whole tree per call; 20 leaves room for the realistic batch (head + treeInfo + a commitments page + a nullifiers page = 4) without turning one POST into 20 full-tree rebuilds. It is the *request-count* bound only: `RPC_MAX_BODY_BYTES` (≈8.86 MB, rpc.rs:154) is the byte bound and is sized for **one** proof-carrying transaction, so a batch of 20 submissions is refused by the body limit — also `-32600`, from `rejection_error` — long before the count cap is reached | an explorer batching 50 reads gets `-32600` and splits; the body limit already caps bytes |
 | **notifications are refused**, not silently dropped: a request object with no `id` member gets an error with `"id": null`, code `-32600` | every method here either reads (the answer is the point) or submits (a silently-dropped submission is an invisible wallet bug). Refusing also keeps `responses.len() == requests.len()`, which makes client-side batch correlation trivial | a spec-strict client sending notifications sees errors instead of silence — visible and diagnosable, which is the intent. `"id": null` *present* is still a normal request, exactly as today |
 | WebSocket on the **same port**, upgrading on `GET /` and `GET /ws`; `POST /` stays JSON-RPC | one URL and one firewall rule for operators; `/ws` for clients that want it explicit | none; an operator wanting a separate port is not served, and no one asked |
-| the socket serves **only** `shrugg_subscribe` / `shrugg_unsubscribe`; any other method on it is `-32601` | reads on the socket would need their own blocking-pool and per-connection concurrency discipline, and HTTP already serves them | a client that wants one transport for everything keeps two |
+| the socket serves **only** `rand_subscribe` / `rand_unsubscribe`; any other method on it is `-32601` | reads on the socket would need their own blocking-pool and per-connection concurrency discipline, and HTTP already serves them | a client that wants one transport for everything keeps two |
 | `MAX_WS_CONNECTIONS = 64` per node, `MAX_WS_SUBSCRIPTIONS = 8` per connection, `WS_MAX_FRAME_BYTES = 64 KiB` | a chain-8 node serves one explorer and a handful of wallets; 64 sockets is two orders of magnitude of headroom and still a hard bound on an unauthenticated endpoint. Subscribe frames are ~100 bytes, so 64 KiB is generous | the 65th client is refused at upgrade with HTTP 503; raising it is one constant |
-| backpressure: one `broadcast::channel(256)`, **a lagging subscriber is closed** (code 1008) rather than buffered | `broadcast` gives lag detection for free, and 256 absorbs a whole 100-block sync batch plus slack (13 min at 3 s blocks). A subscriber that cannot keep up is a client problem, and buffering it is how a node runs out of memory | a client on a bad link is disconnected and must reconnect and re-sync from `shrugg_getCompactBlocks` — which is the documented recovery |
+| backpressure: one `broadcast::channel(256)`, **a lagging subscriber is closed** (code 1008) rather than buffered | `broadcast` gives lag detection for free, and 256 absorbs a whole 100-block sync batch plus slack (13 min at 3 s blocks). A subscriber that cannot keep up is a client problem, and buffering it is how a node runs out of memory | a client on a bad link is disconnected and must reconnect and re-sync from `rand_getCompactBlocks` — which is the documented recovery |
 | one notification **per committed block**, in order (a sync batch emits one per block) | a light wallet tracking heads must not silently skip heights; the 256-slot channel is sized for exactly this | a burst during sync; a client that lags through it is dropped and resyncs |
 | refused cache: `REFUSED_CACHE_ENTRIES = 8192`, FIFO eviction, in memory only, **no new dependency** | the mempool holds 10 000, so the refused set is the same order of magnitude and a flood of distinct bad proofs cannot evict the live ones. ~8192 × ~160 B ≈ 1.3 MB. Recency ordering buys nothing here — a refused hash is looked up on arrival, not repeatedly — so FIFO, hand-rolled, beats pulling in an `lru` crate | a flood wider than 8192 distinct bad transactions re-verifies the oldest; the per-peer rate limit is the bound that actually holds |
 | only **permanent** verdicts are cached (an explicit `is_permanent(&TxError)` allowlist, which now includes fix-sync-stall's `TransactionTooLarge(_)` — a byte length is a function of the bytes) | `UnknownAnchor`, `Spent`, `UnknownProgram`, `Staking(..)`, `Bridge(..)` are statements about *this node's state at this moment* — a node one block behind would poison itself against transactions that are about to be valid. The allowlist is the set of verdicts that are functions of the transaction bytes alone | caching too little costs a re-verification; caching too much loses a valid transaction until restart, which is why the allowlist is explicit and tested |
 | per-peer gossip rate limit: token bucket, **burst 16, refill 4/s**, gossiped transactions only, keyed on the **forwarding** peer (`GossipId.propagation_source`) and held on `Peer` — **amended 2026-09-13** | the chain commits ~3 transactions per 3 s block, so 4/s per peer is well above any honest peer's share, and a burst of 16 covers a peer forwarding a block's worth at once. RPC submissions are *not* limited: they are the operator's own port, already bounded by `RPC_MAX_BODY_BYTES`. **Why the key changed:** the draft metered `NetworkEvent::Gossip.from`, and fix-sync-stall's `Peer` doc comment (node.rs:230) now states that `from` is the gossip *author* — a validator several hops away with no connection to us at all, which is exactly why `connected_peers` was added beside `peer_count`. Metering the author would bill one peer for what N forwarders relayed, would leave a flooding neighbour unmetered, and would grow a bucket for every peer whose messages we merely relay. `propagation_source` is a peer we hold an open connection to, which is the thing a rate limit can actually push back on | an honest peer in a genuine burst has a transaction Ignored (not Rejected, no penalty) and re-gossips it on the next heartbeat |
-| verification off-loop: `MAX_VERIFY_IN_FLIGHT = 4` blocking tasks, `MAX_VERIFY_QUEUE = 64`; a full queue reports `Ignore` | 4 concurrent × ~20 ms warm keeps the blocking pool available for `shrugg_getWitness` and the storage reads that already use it; 64 queued × 20 ms / 4 = 320 ms worst-case wait, comfortably inside the 2.5 s gossipsub validation window | a flood past the queue is Ignored — not propagated, not penalised — which is the correct shed |
+| verification off-loop: `MAX_VERIFY_IN_FLIGHT = 4` blocking tasks, `MAX_VERIFY_QUEUE = 64`; a full queue reports `Ignore` | 4 concurrent × ~20 ms warm keeps the blocking pool available for `rand_getWitness` and the storage reads that already use it; 64 queued × 20 ms / 4 = 320 ms worst-case wait, comfortably inside the 2.5 s gossipsub validation window | a flood past the queue is Ignored — not propagated, not penalised — which is the correct shed |
 | the verification snapshot is an `Arc<Ledger>` refreshed **lazily**, when the tip's `(height, root)` has moved and a transaction is actually waiting | a clone per consensus message would cost a full ledger clone per vote; keyed on the tip this is at most one clone per block, and none at all on an idle chain | a transaction verified against a one-block-stale snapshot can get `UnknownProgram` for a program deployed in the block in between — transient, so not cached, and the peer re-gossips. Everything state-dependent that *can* go stale is re-checked by `precheck` on the live tip at insert time |
 | `Reject` is reported for a permanent verdict even though **no peer-score parameters are installed** | `Reject` is the honest signal and costs nothing today (the P₄ penalty needs `with_peer_score`, which this node does not configure); it is the right thing already in place if scoring is ever turned on | none today |
 | **proposal** (consensus-message) verification stays on the loop | a proposal is signed by a scheduled leader and paced by the block interval, so it is not the DoS vector; moving it would be a consensus-path change, which this plan is forbidden | the ~20 ms per bundle in a proposal still lands on the loop — the same as today, and named in "Out of scope" below |
@@ -130,26 +130,26 @@ Nothing in this plan needs one, and these are the things that would:
 
 Candidates from `docs/rpc-comparison.md` deliberately **not** in this plan. They are not forks — they are product decisions the user has not made:
 
-- **Node-side viewing-key import for explorers** (`docs/rpc-comparison.md` §4, "Keys in the node" and "What SHRUGG should borrow"): the Zcash `z_importviewingkey` equivalent. It breaks the "the node never holds a key" model, which is a stated property of this chain, not an oversight.
-  **Decided 2026-09-14: built** on the `rpc-viewing` branch — `shrugg_importViewingKey` /
-  `shrugg_getViewingNotes`, viewing keys only, in memory (never on disk), capped at 64 keys and
+- **Node-side viewing-key import for explorers** (`docs/rpc-comparison.md` §4, "Keys in the node" and "What RAND should borrow"): the Zcash `z_importviewingkey` equivalent. It breaks the "the node never holds a key" model, which is a stated property of this chain, not an oversight.
+  **Decided 2026-09-14: built** on the `rpc-viewing` branch — `rand_importViewingKey` /
+  `rand_getViewingNotes`, viewing keys only, in memory (never on disk), capped at 64 keys and
   10 000 scanned leaves per call, cleared at restart. The property is narrowed by an explicit
   operator decision, per key, per node; the RPC layer still has no type for a spend key.
-- **`shrugg_checkTransaction(tx, key)`**, the Monero `check_tx_proof` shape for third-party payment proofs (§4). A `TxKey` already gives the capability client-side; the RPC would make it one call for an explorer — and would put a viewing key in a request body.
-  **Decided 2026-09-14: built** on the `rpc-viewing` branch as `shrugg_checkTransaction(hash, key)`
+- **`rand_checkTransaction(tx, key)`**, the Monero `check_tx_proof` shape for third-party payment proofs (§4). A `TxKey` already gives the capability client-side; the RPC would make it one call for an explorer — and would put a viewing key in a request body.
+  **Decided 2026-09-14: built** on the `rpc-viewing` branch as `rand_checkTransaction(hash, key)`
   — stateless, one call, no key retention (nothing is imported or stored; unlike
-  `shrugg_importViewingKey` the key is dropped with the request). It is a per-transaction `TxKey`
+  `rand_importViewingKey` the key is dropped with the request). It is a per-transaction `TxKey`
   in the body, never a party viewing key, so the request discloses exactly the one envelope that
   key already opens.
-- **A mempool-aware `next_nonce` RPC** (`AGENTS.md` → Open follow-ups, the wallet's stale-nonce race on fast double-sends). Node-only and fork-free, but it is a wallet-protocol decision paired with a `shrugg-client` change, and the user scoped this task to the four items above.
+- **A mempool-aware `next_nonce` RPC** (`AGENTS.md` → Open follow-ups, the wallet's stale-nonce race on fast double-sends). Node-only and fork-free, but it is a wallet-protocol decision paired with a `randprotocol-client` change, and the user scoped this task to the four items above.
 
 ## File structure
 
 ```
-crates/shrugg-node/src/
+crates/randprotocol-node/src/
   storage.rs      [edit] notes_in_heights(), first_note_at_or_after(), derived_note_count()  — reads only
   rpc.rs          [edit] MAX_COMPACT_BLOCKS/MAX_BATCH consts; compact_block_json(); head_summary();
-                         shrugg_getCompactBlocks; batch-aware handle() *wrapping* the existing
+                         rand_getCompactBlocks; batch-aware handle() *wrapping* the existing
                          Result<Json<_>, JsonRejection> -> (StatusCode, Json<Value>) shape and its
                          rejection_error path; RpcState.heads + .ws_conns; serve() merges the ws
                          routes and keeps the RPC_MAX_BODY_BYTES layer; NodeStatus gains ws_clients /
@@ -171,14 +171,14 @@ crates/shrugg-node/src/
                          message; Peer (:230) gains the token bucket; publish_status (:512) fills
                          the three new NodeStatus fields beside s.sync_failures
   lib.rs          [edit] `pub mod ws;` `mod admission;`
-crates/shrugg-node/tests/
+crates/randprotocol-node/tests/
   ws.rs           [new]  the WebSocket integration test: a real listener, a real tokio-tungstenite client
   cluster.rs      [edit] one compact-block assertion, preferably folded into the existing
                          two_validators_commit_and_shielded_transfer (:732) so the serialised
                          suite gains no thirteenth bundle proof; one refused-cache assertion on a
                          FAST chain. Anything that proves takes proving_slot().
 Cargo.toml (workspace)      [edit] axum features = ["ws"]; tokio-tungstenite = "0.24" (dev)
-crates/shrugg-node/Cargo.toml [edit] tokio-tungstenite in [dev-dependencies]
+crates/randprotocol-node/Cargo.toml [edit] tokio-tungstenite in [dev-dependencies]
 docs/rpc.md                 [edit] the three new methods/notifications, the -32600 row, a Changelog section
 docs/rpc-comparison.md      [edit] §2 "scheduled as an RPC hardening task" → done, with the shapes
 docs/architecture.md        [edit] §8 mempool: the split admission path and gossip validation
@@ -188,13 +188,13 @@ README.md                   [edit] the Interfaces row: JSON-RPC over HTTP *and* 
 
 ---
 
-### Task 1: `shrugg_getCompactBlocks`
+### Task 1: `rand_getCompactBlocks`
 
 **Files:**
-- Modify: `crates/shrugg-node/src/storage.rs` (read helpers, near `notes_from`, ~line 358)
-- Modify: `crates/shrugg-node/src/rpc.rs` (a const near `MAX_PAGE` at :26, a renderer near `block_json` at :334 — `envelope_json` is at :297 — and a dispatch arm after `shrugg_getNullifiers`, whose arm is at :531 inside `dispatch` at :465)
-- Modify: `docs/rpc.md` (a method section after `shrugg_getNullifiers`)
-- Test: `crates/shrugg-node/src/storage.rs` `mod tests`, `crates/shrugg-node/src/rpc.rs` `mod tests`
+- Modify: `crates/randprotocol-node/src/storage.rs` (read helpers, near `notes_from`, ~line 358)
+- Modify: `crates/randprotocol-node/src/rpc.rs` (a const near `MAX_PAGE` at :26, a renderer near `block_json` at :334 — `envelope_json` is at :297 — and a dispatch arm after `rand_getNullifiers`, whose arm is at :531 inside `dispatch` at :465)
+- Modify: `docs/rpc.md` (a method section after `rand_getNullifiers`)
+- Test: `crates/randprotocol-node/src/storage.rs` `mod tests`, `crates/randprotocol-node/src/rpc.rs` `mod tests`
 
 **Interfaces:**
 
@@ -215,7 +215,7 @@ pub fn notes_in_heights(&self, from_height: u64, to_height: u64, max_rows: usize
 /// deposit note the ledger derives for a `Withdraw`, and for a `BridgeAttest` the deposit it
 /// derives from the attestation — none for a guardian-set rotation, which deposits nothing.
 ///
-/// This is the count of `Ledger::derived_commitment` (shrugg-core `ledger/staking.rs:161`), and the
+/// This is the count of `Ledger::derived_commitment` (randprotocol-core `ledger/staking.rs:161`), and the
 /// two must stay in step: those are the only two actions that mint a note out of public words, and
 /// `Mempool::claimed_commitments` reads the same function for the pool's conflict index. Applying
 /// the attestation size cap before the decode mirrors it exactly; in a *committed* block both arms
@@ -226,7 +226,7 @@ pub fn notes_in_heights(&self, from_height: u64, to_height: u64, max_rows: usize
 pub fn derived_note_count(tx: &Transaction) -> usize;
 
 // rpc.rs — produces
-/// The most blocks one `shrugg_getCompactBlocks` call may cover. Half the 256-block anchor
+/// The most blocks one `rand_getCompactBlocks` call may cover. Half the 256-block anchor
 /// window, so a syncing wallet never crosses more than one window per call.
 const MAX_COMPACT_BLOCKS: u64 = 128;
 fn compact_block_json(b: &Block, notes: &[(u64, NoteRow)]) -> Value;
@@ -277,14 +277,14 @@ fn notes_in_heights_returns_one_blocks_slice() {
 
 #[test]
 fn derived_note_count_covers_the_notes_the_wire_does_not_carry() {
-    let payout = ShieldedAddress { pk: [3; 8], kem_ek: vec![4; shrugg_core::notes::KEM_EK_BYTES] };
+    let payout = ShieldedAddress { pk: [3; 8], kem_ek: vec![4; randprotocol_core::notes::KEM_EK_BYTES] };
     let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
     let w = Transaction {
         chain_id: 1,
         bundle: None,
         action: Action::Withdraw {
             validator: Address([3; 32]), amount: 9, nonce: 0, time: 1, r: [5; 8],
-            envelope: envelope.clone(), signature: shrugg_core::Signature::empty(),
+            envelope: envelope.clone(), signature: randprotocol_core::Signature::empty(),
         },
     };
     assert_eq!(derived_note_count(&w), 1, "the ledger derives a withdraw's deposit note");
@@ -300,7 +300,7 @@ fn derived_note_count_covers_the_notes_the_wire_does_not_carry() {
 
 - [ ] **Step 2: Run them and see them fail**
 
-Run: `cargo test --release -p shrugg-node --lib storage::tests::notes_in_heights storage::tests::derived_note`
+Run: `cargo test --release -p randprotocol-node --lib storage::tests::notes_in_heights storage::tests::derived_note`
 Expected: FAIL — `no method named notes_in_heights`, `cannot find function derived_note_count`.
 
 - [ ] **Step 3: Implement the storage helpers**
@@ -341,13 +341,13 @@ pub fn notes_in_heights(&self, from_height: u64, to_height: u64, max_rows: usize
     Ok(out)
 }
 
-pub fn derived_note_count(tx: &shrugg_core::Transaction) -> usize {
+pub fn derived_note_count(tx: &randprotocol_core::Transaction) -> usize {
     match &tx.action {
         Action::Withdraw { .. } => 1,
         // The size cap before the decode, exactly as `Ledger::derived_commitment` applies it.
-        Action::BridgeAttest { attestation, .. } if attestation.len() > shrugg_core::gas::MAX_ATTESTATION_BYTES => 0,
+        Action::BridgeAttest { attestation, .. } if attestation.len() > randprotocol_core::gas::MAX_ATTESTATION_BYTES => 0,
         Action::BridgeAttest { attestation, .. } => {
-            usize::from(shrugg_core::ledger::bridge_notes::attested_transfer(attestation).is_some())
+            usize::from(randprotocol_core::ledger::bridge_notes::attested_transfer(attestation).is_some())
         }
         _ => 0,
     }
@@ -358,7 +358,7 @@ pub fn derived_note_count(tx: &shrugg_core::Transaction) -> usize {
 
 - [ ] **Step 4: Run the storage tests green**
 
-Run: `cargo test --release -p shrugg-node --lib storage::tests::notes_in_heights storage::tests::derived_note`
+Run: `cargo test --release -p randprotocol-node --lib storage::tests::notes_in_heights storage::tests::derived_note`
 Expected: PASS (2 tests).
 
 - [ ] **Step 5: Write the failing RPC test**
@@ -371,7 +371,7 @@ At the bottom of `rpc.rs`'s `mod tests` (`chain()` gives genesis with 2 notes pl
 #[tokio::test]
 async fn compact_blocks_carry_every_note_and_nullifier_per_transaction() {
     let (_d, st, _gs) = chain();
-    let v = ok(&st, "shrugg_getCompactBlocks", json!([0, 1])).await;
+    let v = ok(&st, "rand_getCompactBlocks", json!([0, 1])).await;
     let blocks = v.as_array().unwrap();
     assert_eq!(blocks.len(), 2, "genesis and the one committed block");
 
@@ -407,30 +407,30 @@ async fn compact_blocks_carry_every_note_and_nullifier_per_transaction() {
 async fn compact_blocks_clamp_the_range_and_stop_at_the_head() {
     let (_d, st, _gs) = chain();
     // Past the head: a short reply, never an error.
-    let v = ok(&st, "shrugg_getCompactBlocks", json!([0, 99])).await;
+    let v = ok(&st, "rand_getCompactBlocks", json!([0, 99])).await;
     assert_eq!(v.as_array().unwrap().len(), 2);
     // A range longer than the cap is truncated to MAX_COMPACT_BLOCKS blocks, from `from_height`.
-    let v = ok(&st, "shrugg_getCompactBlocks", json!([0, MAX_COMPACT_BLOCKS + 500])).await;
+    let v = ok(&st, "rand_getCompactBlocks", json!([0, MAX_COMPACT_BLOCKS + 500])).await;
     assert_eq!(v.as_array().unwrap().len(), 2, "the head stops it first here");
     // Backwards is a parameter error, and so is a missing bound.
-    assert_eq!(call(&st, "shrugg_getCompactBlocks", json!([1, 0])).await.unwrap_err().code, -32602);
-    assert_eq!(call(&st, "shrugg_getCompactBlocks", json!([0])).await.unwrap_err().code, -32602);
+    assert_eq!(call(&st, "rand_getCompactBlocks", json!([1, 0])).await.unwrap_err().code, -32602);
+    assert_eq!(call(&st, "rand_getCompactBlocks", json!([0])).await.unwrap_err().code, -32602);
     // A range that starts past the head is empty, not an error.
-    assert_eq!(ok(&st, "shrugg_getCompactBlocks", json!([50, 60])).await, json!([]));
+    assert_eq!(ok(&st, "rand_getCompactBlocks", json!([50, 60])).await, json!([]));
 }
 ```
 
 - [ ] **Step 6: Run it and see it fail**
 
-Run: `cargo test --release -p shrugg-node --lib rpc::tests::compact_blocks`
-Expected: FAIL — `unknown method shrugg_getCompactBlocks` (the `ok` helper panics with that message).
+Run: `cargo test --release -p randprotocol-node --lib rpc::tests::compact_blocks`
+Expected: FAIL — `unknown method rand_getCompactBlocks` (the `ok` helper panics with that message).
 
 - [ ] **Step 7: Implement the RPC method**
 
 In `rpc.rs`, beside `MAX_PAGE`:
 
 ```rust
-/// The most blocks one `shrugg_getCompactBlocks` call may cover. Half the 256-block anchor
+/// The most blocks one `rand_getCompactBlocks` call may cover. Half the 256-block anchor
 /// window (`ledger::ANCHOR_WINDOW`), so a wallet syncing forward never crosses more than one
 /// window per request.
 const MAX_COMPACT_BLOCKS: u64 = 128;
@@ -441,14 +441,14 @@ Beside `block_json`:
 ```rust
 /// One block as a light wallet reads it: the header fields it chains on, and per transaction
 /// the notes it created (leaf index, commitment, envelope) and the nullifiers it spent. No
-/// proof, no action, no receipt — those are `shrugg_getBlockByHeight`'s job.
+/// proof, no action, no receipt — those are `rand_getBlockByHeight`'s job.
 ///
 /// `notes` is this block's slice of the tree in append order. Each transaction owns
 /// `commitments().len() + derived_note_count()` of it, in the order `Storage::commit` appended
 /// them; anything left over goes into the block-level `commitments`, which is where genesis
 /// deposits live and where a future note the attribution does not know about would still surface
 /// rather than disappear.
-fn compact_block_json(b: &shrugg_core::Block, notes: &[(u64, crate::storage::NoteRow)]) -> Value {
+fn compact_block_json(b: &randprotocol_core::Block, notes: &[(u64, crate::storage::NoteRow)]) -> Value {
     let row = |(index, r): &(u64, crate::storage::NoteRow)| {
         json!({ "index": index, "cm": word8_to_hex(&r.cm), "envelope": envelope_json(&r.envelope) })
     };
@@ -474,14 +474,14 @@ fn compact_block_json(b: &shrugg_core::Block, notes: &[(u64, crate::storage::Not
 }
 ```
 
-The dispatch arm, after `shrugg_getNullifiers`:
+The dispatch arm, after `rand_getNullifiers`:
 
 ```rust
 // A range of blocks with everything a light wallet needs and nothing it does not: the
 // commitments each transaction created with their leaf indices and envelopes, and the
 // nullifiers it spent. Zcash's `CompactBlock` by another name (`docs/rpc-comparison.md` §4),
 // and the reason a sync is one round-trip per page instead of two per block.
-"shrugg_getCompactBlocks" => {
+"rand_getCompactBlocks" => {
     let from: u64 = param(p, 0, "from_height")?;
     let to: u64 = param(p, 1, "to_height")?;
     if to < from {
@@ -520,26 +520,26 @@ Note `from > head` falls out of the `for h in from..=to` loop with `to = to.min(
 
 **Two things about size, both new since this plan was drafted:**
 
-- `RPC_MAX_BODY_BYTES` (rpc.rs:154) and the `DefaultBodyLimit` layer in `serve` bound the *request*, not the reply. A `shrugg_getCompactBlocks` request is two integers, so it is nowhere near the limit and needs nothing from this task; `MAX_COMPACT_BLOCKS` and `MAX_PAGE` remain the only bound on the *reply*.
-- What a too-generous reply actually hits is the client: `shrugg-client`'s `RpcClient::call` gives a request under `UPLOAD_THRESHOLD` (64 KiB) the flat 15 s `READ_TIMEOUT`, and only an upload gets `upload_timeout`. A compact-block read is a small request with a large answer, so it has 15 s to be served end to end — which the 128-block / 1000-note caps sit comfortably inside, and which is the number to revisit before either cap is raised.
+- `RPC_MAX_BODY_BYTES` (rpc.rs:154) and the `DefaultBodyLimit` layer in `serve` bound the *request*, not the reply. A `rand_getCompactBlocks` request is two integers, so it is nowhere near the limit and needs nothing from this task; `MAX_COMPACT_BLOCKS` and `MAX_PAGE` remain the only bound on the *reply*.
+- What a too-generous reply actually hits is the client: `randprotocol-client`'s `RpcClient::call` gives a request under `UPLOAD_THRESHOLD` (64 KiB) the flat 15 s `READ_TIMEOUT`, and only an upload gets `upload_timeout`. A compact-block read is a small request with a large answer, so it has 15 s to be served end to end — which the 128-block / 1000-note caps sit comfortably inside, and which is the number to revisit before either cap is raised.
 
 This method maps no `TxError`, so fix-sync-stall's new `TxError::TransactionTooLarge(usize)` does not reach it; the variant is Task 4's business (`is_permanent`).
 
 - [ ] **Step 8: Run the RPC tests green**
 
-Run: `cargo test --release -p shrugg-node --lib rpc::tests::compact_blocks storage::tests::notes_in_heights storage::tests::derived_note`
+Run: `cargo test --release -p randprotocol-node --lib rpc::tests::compact_blocks storage::tests::notes_in_heights storage::tests::derived_note`
 Expected: PASS (4 tests).
 
 - [ ] **Step 9: Document it in `docs/rpc.md`**
 
-Add a `### shrugg_getCompactBlocks` section after `shrugg_getNullifiers`, carrying: the params (`[from_height, to_height]`, both required), the 128-block cap and the 1000-note early stop with the always-one-whole-block rule, the JSON shape above, the "resume from the last returned height + 1" instruction, the note that the block-level `commitments` array holds the genesis deposits at height 0 and is empty everywhere else, the note that a `Withdraw`'s and a `BridgeAttest`'s deposit notes appear under their transaction even though the wire does not carry their commitments, and the errors (`-32602` for a backwards range or a missing bound).
+Add a `### rand_getCompactBlocks` section after `rand_getNullifiers`, carrying: the params (`[from_height, to_height]`, both required), the 128-block cap and the 1000-note early stop with the always-one-whole-block rule, the JSON shape above, the "resume from the last returned height + 1" instruction, the note that the block-level `commitments` array holds the genesis deposits at height 0 and is empty everywhere else, the note that a `Withdraw`'s and a `BridgeAttest`'s deposit notes appear under their transaction even though the wire does not carry their commitments, and the errors (`-32602` for a backwards range or a missing bound).
 
 - [ ] **Step 10: Commit**
 
 ```bash
-git add crates/shrugg-node/src/storage.rs crates/shrugg-node/src/rpc.rs docs/rpc.md
+git add crates/randprotocol-node/src/storage.rs crates/randprotocol-node/src/rpc.rs docs/rpc.md
 git commit -m "$(cat <<'EOF'
-node: shrugg_getCompactBlocks, a one-round-trip note stream for light wallets
+node: rand_getCompactBlocks, a one-round-trip note stream for light wallets
 
 A wallet syncing this chain made two requests per page and then had to fetch
 whole blocks to learn which transaction a note came from. This serves the
@@ -569,9 +569,9 @@ EOF
 ### Task 2: JSON-RPC batch requests
 
 **Files:**
-- Modify: `crates/shrugg-node/src/rpc.rs` (`Request` at :119, `handle` at :194, `rejection_error` at :222, a const near `MAX_PAGE` at :26)
+- Modify: `crates/randprotocol-node/src/rpc.rs` (`Request` at :119, `handle` at :194, `rejection_error` at :222, a const near `MAX_PAGE` at :26)
 - Modify: `docs/rpc.md` (the intro line "batches are not supported" at :4, the Errors table at :382)
-- Test: `crates/shrugg-node/src/rpc.rs` `mod tests`
+- Test: `crates/randprotocol-node/src/rpc.rs` `mod tests`
 
 **What `handle` already is (changed since this plan was drafted).** fix-sync-stall gave it a
 rejection path, and this task must keep every part of it:
@@ -617,9 +617,9 @@ async fn dispatch_one(st: &RpcState, v: Value) -> Value;   // one request object
 async fn a_batch_answers_every_request_in_order() {
     let (_d, st, _gs) = chain();
     let (code, Json(v)) = handle(State(st.clone()), Ok(Json(json!([
-        { "jsonrpc": "2.0", "id": 1, "method": "shrugg_chainId", "params": [] },
-        { "jsonrpc": "2.0", "id": "two", "method": "shrugg_getTreeInfo", "params": [] },
-        { "jsonrpc": "2.0", "id": 3, "method": "shrugg_nope", "params": [] }
+        { "jsonrpc": "2.0", "id": 1, "method": "rand_chainId", "params": [] },
+        { "jsonrpc": "2.0", "id": "two", "method": "rand_getTreeInfo", "params": [] },
+        { "jsonrpc": "2.0", "id": 3, "method": "rand_nope", "params": [] }
     ])))).await;
     assert_eq!(code, StatusCode::OK, "a parsed body is always 200, errors inside it or not");
     let rows = v.as_array().unwrap();
@@ -630,7 +630,7 @@ async fn a_batch_answers_every_request_in_order() {
     assert_eq!((&rows[2]["id"], &rows[2]["error"]["code"]), (&json!(3), &json!(-32601)));
     // A single request object still answers with a single object, exactly as before.
     let (_, Json(one)) = handle(State(st.clone()), Ok(Json(json!(
-        { "jsonrpc": "2.0", "id": 9, "method": "shrugg_chainId", "params": [] }
+        { "jsonrpc": "2.0", "id": 9, "method": "rand_chainId", "params": [] }
     )))).await;
     assert_eq!(one["result"], json!(st.chain_id));
     assert!(one.get("error").is_none());
@@ -648,7 +648,7 @@ async fn a_malformed_batch_is_one_invalid_request_error() {
     assert_eq!(empty["id"], Value::Null);
 
     let over: Vec<Value> = (0..=MAX_BATCH)
-        .map(|i| json!({ "jsonrpc": "2.0", "id": i, "method": "shrugg_chainId", "params": [] }))
+        .map(|i| json!({ "jsonrpc": "2.0", "id": i, "method": "rand_chainId", "params": [] }))
         .collect();
     let big = err(json!(over)).await;
     assert_eq!(big["error"]["code"], -32600);
@@ -665,8 +665,8 @@ async fn a_malformed_batch_is_one_invalid_request_error() {
 async fn a_notification_is_refused_with_a_null_id() {
     let (_d, st, _gs) = chain();
     let (_, Json(v)) = handle(State(st.clone()), Ok(Json(json!([
-        { "jsonrpc": "2.0", "method": "shrugg_chainId", "params": [] },
-        { "jsonrpc": "2.0", "id": null, "method": "shrugg_chainId", "params": [] }
+        { "jsonrpc": "2.0", "method": "rand_chainId", "params": [] },
+        { "jsonrpc": "2.0", "id": null, "method": "rand_chainId", "params": [] }
     ])))).await;
     let rows = v.as_array().unwrap();
     assert_eq!(rows.len(), 2, "one response per request, notifications included");
@@ -697,7 +697,7 @@ async fn an_undecodable_request_object_still_gets_a_response() {
 
 - [ ] **Step 2: Run them and see them fail**
 
-Run: `cargo test --release -p shrugg-node --lib rpc::tests::a_batch rpc::tests::a_malformed rpc::tests::a_notification rpc::tests::an_undecodable`
+Run: `cargo test --release -p randprotocol-node --lib rpc::tests::a_batch rpc::tests::a_malformed rpc::tests::a_notification rpc::tests::an_undecodable`
 Expected: FAIL to compile — `handle` takes `Result<Json<Request>, JsonRejection>`, not `Result<Json<Value>, _>`; `MAX_BATCH` is undefined.
 
 There is also an existing test block at the bottom of `rpc.rs` (from :1497) whose subject is the
@@ -711,7 +711,7 @@ In `rpc.rs`:
 
 ```rust
 /// The most request objects one batch may carry. A batch is a request amplifier and
-/// `shrugg_getWitness` rebuilds the whole commitment tree per call, so this is deliberately
+/// `rand_getWitness` rebuilds the whole commitment tree per call, so this is deliberately
 /// small: the realistic batch is a head, a tree info and two pages, which is four.
 const MAX_BATCH: usize = 20;
 ```
@@ -794,13 +794,13 @@ async fn handle(
 ```
 
 `rejection_error` and `RPC_MAX_BODY_BYTES` are untouched: the byte bound on a batch is still the
-body limit, which is sized for one proof-carrying transaction, so a batch of 20 `shrugg_sendTransaction`
+body limit, which is sized for one proof-carrying transaction, so a batch of 20 `rand_sendTransaction`
 calls is refused at the extractor with a 413 and a `-32600` body naming the limit — before
 `MAX_BATCH` is ever consulted. That is the intended layering, and the doc step says so.
 
 - [ ] **Step 4: Run the tests green**
 
-Run: `cargo test --release -p shrugg-node --lib rpc::tests`
+Run: `cargo test --release -p randprotocol-node --lib rpc::tests`
 Expected: PASS — the four new tests and every existing `rpc::tests` case (they call `dispatch` directly and are unaffected).
 
 - [ ] **Step 5: Document it in `docs/rpc.md`**
@@ -812,7 +812,7 @@ Add the `-32600` row to the Errors table (docs/rpc.md:382). **It is not there to
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/shrugg-node/src/rpc.rs docs/rpc.md
+git add crates/randprotocol-node/src/rpc.rs docs/rpc.md
 git commit -m "$(cat <<'EOF'
 node: JSON-RPC batch requests
 
@@ -840,18 +840,18 @@ EOF
 ### Task 3: WebSocket `newHeads` subscription
 
 **Files:**
-- Create: `crates/shrugg-node/src/ws.rs`
-- Create: `crates/shrugg-node/tests/ws.rs`
-- Modify: `Cargo.toml` (workspace: `axum` gains `features = ["ws"]`; add `tokio-tungstenite = "0.24"`), `crates/shrugg-node/Cargo.toml` (dev-dependency)
-- Modify: `crates/shrugg-node/src/lib.rs` (`pub mod ws;`), `crates/shrugg-node/src/rpc.rs` (`HeadSummary`, `head_summary`, `RpcState` at :110 gains `.heads`/`.ws_conns`, `serve` routes at :180, `NodeStatus.ws_clients` — added to the block at :38 that now also carries `sync_inflight_age_ms`, `sync_failures`, `sync_late_batches` and `connected_peers`), `crates/shrugg-node/src/node.rs` (publish a head per committed block; build the channel; `publish_status` at :512 sets `ws_clients` beside `s.connected_peers`)
+- Create: `crates/randprotocol-node/src/ws.rs`
+- Create: `crates/randprotocol-node/tests/ws.rs`
+- Modify: `Cargo.toml` (workspace: `axum` gains `features = ["ws"]`; add `tokio-tungstenite = "0.24"`), `crates/randprotocol-node/Cargo.toml` (dev-dependency)
+- Modify: `crates/randprotocol-node/src/lib.rs` (`pub mod ws;`), `crates/randprotocol-node/src/rpc.rs` (`HeadSummary`, `head_summary`, `RpcState` at :110 gains `.heads`/`.ws_conns`, `serve` routes at :180, `NodeStatus.ws_clients` — added to the block at :38 that now also carries `sync_inflight_age_ms`, `sync_failures`, `sync_late_batches` and `connected_peers`), `crates/randprotocol-node/src/node.rs` (publish a head per committed block; build the channel; `publish_status` at :512 sets `ws_clients` beside `s.connected_peers`)
 - Modify: `docs/rpc.md`
-- Test: `crates/shrugg-node/tests/ws.rs`
+- Test: `crates/randprotocol-node/tests/ws.rs`
 
 **Interfaces:**
 
 ```rust
 // rpc.rs — produces
-/// One committed head, as `shrugg_getHead` reports it. What a `newHeads` notification carries.
+/// One committed head, as `rand_getHead` reports it. What a `newHeads` notification carries.
 #[derive(Clone, Debug, Serialize)]
 pub struct HeadSummary { pub height: u64, pub hash: String, pub view: u64 }
 
@@ -879,25 +879,25 @@ Wire shapes (documented in `docs/rpc.md`):
 
 ```jsonc
 // client -> node
-{ "jsonrpc": "2.0", "id": 1, "method": "shrugg_subscribe",   "params": ["newHeads"] }
-{ "jsonrpc": "2.0", "id": 2, "method": "shrugg_unsubscribe", "params": ["1"] }
+{ "jsonrpc": "2.0", "id": 1, "method": "rand_subscribe",   "params": ["newHeads"] }
+{ "jsonrpc": "2.0", "id": 2, "method": "rand_unsubscribe", "params": ["1"] }
 // node -> client
 { "jsonrpc": "2.0", "id": 1, "result": "1" }        // the subscription id, a decimal string
 { "jsonrpc": "2.0", "id": 2, "result": true }
-{ "jsonrpc": "2.0", "method": "shrugg_subscription",
+{ "jsonrpc": "2.0", "method": "rand_subscription",
   "params": { "subscription": "1", "result": { "height": 1998, "hash": "…", "view": 2251 } } }
 ```
 
 - [ ] **Step 1: Add the dependencies**
 
 Workspace `Cargo.toml`: `axum = { version = "0.7", features = ["ws"] }`, and under `# test`: `tokio-tungstenite = "0.24"`.
-`crates/shrugg-node/Cargo.toml` `[dev-dependencies]`: `tokio-tungstenite = { workspace = true }`, `futures = { workspace = true }`.
+`crates/randprotocol-node/Cargo.toml` `[dev-dependencies]`: `tokio-tungstenite = { workspace = true }`, `futures = { workspace = true }`.
 
-Run: `cargo check --release -p shrugg-node` — expected: clean (feature only, no code change yet).
+Run: `cargo check --release -p randprotocol-node` — expected: clean (feature only, no code change yet).
 
 - [ ] **Step 2: Write the failing integration test**
 
-`crates/shrugg-node/tests/ws.rs` — a real node on a real listener, a real WebSocket client:
+`crates/randprotocol-node/tests/ws.rs` — a real node on a real listener, a real WebSocket client:
 
 ```rust
 //! The WebSocket half of the RPC: a real listener, a real client, and a head that arrives
@@ -936,17 +936,17 @@ async fn a_subscriber_is_pushed_every_committed_head() {
     let (mut sock, _) = tokio_tungstenite::connect_async(&url).await.expect("upgrade");
 
     sock.send(Message::Text(
-        json!({ "jsonrpc": "2.0", "id": 1, "method": "shrugg_subscribe", "params": ["newHeads"] }).to_string(),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "rand_subscribe", "params": ["newHeads"] }).to_string(),
     )).await.unwrap();
     let sub = wait_frame(&mut sock, Duration::from_secs(5), |v| {
         (v["id"] == json!(1)).then(|| v["result"].as_str().unwrap().to_string())
     }).await.expect("a subscription id");
 
-    // Three heads arrive, strictly ascending, with the shape shrugg_getHead returns.
+    // Three heads arrive, strictly ascending, with the shape rand_getHead returns.
     let mut heights = Vec::new();
     while heights.len() < 3 {
         let h = wait_frame(&mut sock, Duration::from_secs(15), |v| {
-            (v["method"] == json!("shrugg_subscription") && v["params"]["subscription"] == json!(sub.clone()))
+            (v["method"] == json!("rand_subscription") && v["params"]["subscription"] == json!(sub.clone()))
                 .then(|| v["params"]["result"].clone())
         }).await.expect("a head notification");
         assert!(h["hash"].as_str().unwrap().len() == 64);
@@ -957,7 +957,7 @@ async fn a_subscriber_is_pushed_every_committed_head() {
 
     // Unsubscribing stops them: nothing more arrives in three block intervals.
     sock.send(Message::Text(
-        json!({ "jsonrpc": "2.0", "id": 2, "method": "shrugg_unsubscribe", "params": [sub] }).to_string(),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "rand_unsubscribe", "params": [sub] }).to_string(),
     )).await.unwrap();
     assert_eq!(
         wait_frame(&mut sock, Duration::from_secs(2), |v| (v["id"] == json!(2)).then(|| v["result"].clone())).await,
@@ -965,7 +965,7 @@ async fn a_subscriber_is_pushed_every_committed_head() {
     );
     assert!(
         wait_frame(&mut sock, Duration::from_millis(600), |v| {
-            (v["method"] == json!("shrugg_subscription")).then_some(())
+            (v["method"] == json!("rand_subscription")).then_some(())
         }).await.is_none(),
         "an unsubscribed socket is quiet"
     );
@@ -978,9 +978,9 @@ async fn the_socket_serves_only_subscribe_and_unsubscribe() {
     let (mut sock, _) = tokio_tungstenite::connect_async(format!("ws://{}/", node.rpc_addr))
         .await.expect("the bare path upgrades too");
     for (id, method, params) in [
-        (1, "shrugg_getHead", json!([])),                 // a read: HTTP's job
-        (2, "shrugg_subscribe", json!(["logs"])),          // an unknown topic
-        (3, "shrugg_unsubscribe", json!(["99"])),          // an id this socket never held
+        (1, "rand_getHead", json!([])),                 // a read: HTTP's job
+        (2, "rand_subscribe", json!(["logs"])),          // an unknown topic
+        (3, "rand_unsubscribe", json!(["99"])),          // an id this socket never held
     ] {
         sock.send(Message::Text(
             json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string(),
@@ -1005,23 +1005,23 @@ async fn the_connection_cap_refuses_the_sixty_fifth_socket() {
     let node = common::start_one_validator().await;
     let url = format!("ws://{}/ws", node.rpc_addr);
     let mut held = Vec::new();
-    for i in 0..shrugg_node::ws::MAX_WS_CONNECTIONS {
+    for i in 0..randprotocol_node::ws::MAX_WS_CONNECTIONS {
         held.push(tokio_tungstenite::connect_async(&url).await.unwrap_or_else(|e| panic!("socket {i}: {e}")).0);
     }
     assert!(tokio_tungstenite::connect_async(&url).await.is_err(), "the cap is a hard bound");
     // And the count is visible to an operator.
-    assert_eq!(node.status.read().unwrap().ws_clients, shrugg_node::ws::MAX_WS_CONNECTIONS);
+    assert_eq!(node.status.read().unwrap().ws_clients, randprotocol_node::ws::MAX_WS_CONNECTIONS);
     drop(held);
     node.shutdown().await;
 }
 ```
 
-`crates/shrugg-node/tests/common/mod.rs` (new, small): `start_one_validator()` builds a one-validator `Genesis` with `FAST` (150 ms) blocks in a `tempfile::tempdir`, calls `node::start`, and returns the `NodeHandle`. Copy the shape of `cluster.rs`'s `genesis`/`start_node_at`; do **not** import `cluster.rs` (integration test binaries do not share modules).
+`crates/randprotocol-node/tests/common/mod.rs` (new, small): `start_one_validator()` builds a one-validator `Genesis` with `FAST` (150 ms) blocks in a `tempfile::tempdir`, calls `node::start`, and returns the `NodeHandle`. Copy the shape of `cluster.rs`'s `genesis`/`start_node_at`; do **not** import `cluster.rs` (integration test binaries do not share modules).
 
 - [ ] **Step 3: Run it and see it fail**
 
-Run: `cargo test --release -p shrugg-node --test ws`
-Expected: FAIL to compile — `shrugg_node::ws` does not exist; `NodeStatus` has no `ws_clients`.
+Run: `cargo test --release -p randprotocol-node --test ws`
+Expected: FAIL to compile — `randprotocol_node::ws` does not exist; `NodeStatus` has no `ws_clients`.
 
 (`NodeHandle` exposes `pub status: Arc<RwLock<NodeStatus>>` and `pub rpc_addr: SocketAddr`, which is
 what the third test reads.)
@@ -1039,7 +1039,7 @@ pub const HEAD_CHANNEL: usize = 256;
 #[derive(Clone, Debug, Serialize)]
 pub struct HeadSummary { pub height: u64, pub hash: String, pub view: u64 }
 
-/// The head as `shrugg_getHead` reports it — one function, so the RPC and the subscription can
+/// The head as `rand_getHead` reports it — one function, so the RPC and the subscription can
 /// never drift apart.
 pub fn head_summary(storage: &Storage, status: &RwLock<NodeStatus>) -> crate::storage::Result<HeadSummary> {
     let head = storage.head()?;
@@ -1048,12 +1048,12 @@ pub fn head_summary(storage: &Storage, status: &RwLock<NodeStatus>) -> crate::st
 }
 ```
 
-`shrugg_getHead`'s arm (rpc.rs:717, today `json!({ "height", "hash", "view" })` built inline from
+`rand_getHead`'s arm (rpc.rs:717, today `json!({ "height", "hash", "view" })` built inline from
 `storage.head()` and `status.view`) becomes
 `Ok(serde_json::to_value(head_summary(&st.storage, &st.status).map_err(RpcError::internal)?).map_err(RpcError::internal)?)`
 — same three fields, same order, so no client sees a change. `NodeStatus` gains `pub ws_clients:
 usize`, written into the field block at rpc.rs:38 **after** `connected_peers`, with a doc comment in
-the style fix-sync-stall used for the sync fields (those four are `Serialize`d into `shrugg_status`,
+the style fix-sync-stall used for the sync fields (those four are `Serialize`d into `rand_status`,
 so an added field is an added key and nothing else).
 
 `serve` merges the routes, **keeping the derived body limit**:
@@ -1072,12 +1072,12 @@ let app = Router::new()
 
 ```rust
 //! The WebSocket half of the RPC: a `newHeads` subscription, so an explorer or a wallet stops
-//! polling `shrugg_getHead`.
+//! polling `rand_getHead`.
 //!
 //! Three bounds hold this endpoint, because it is unauthenticated: a per-node connection cap, a
 //! per-connection subscription cap, and a bounded broadcast channel whose lagging receivers are
 //! *closed* rather than buffered. Buffering a slow subscriber is how a node runs out of memory;
-//! a dropped one reconnects and resyncs from `shrugg_getCompactBlocks`, which is the documented
+//! a dropped one reconnects and resyncs from `rand_getCompactBlocks`, which is the documented
 //! recovery.
 
 pub const MAX_WS_CONNECTIONS: usize = 64;
@@ -1117,7 +1117,7 @@ async fn run(mut socket: WebSocket, st: RpcState) {
             head = heads.recv() => match head {
                 Ok(h) => {
                     for id in subs.keys() {
-                        let frame = json!({ "jsonrpc": "2.0", "method": "shrugg_subscription",
+                        let frame = json!({ "jsonrpc": "2.0", "method": "rand_subscription",
                                             "params": { "subscription": id, "result": h } }).to_string();
                         if socket.send(Message::Text(frame)).await.is_err() { return cleanup(&st) }
                     }
@@ -1143,10 +1143,10 @@ fn cleanup(st: &RpcState) { st.ws_conns.fetch_sub(1, SeqCst); }
 ```
 
 `on_request` parses one text frame into a `Request` (reusing `rpc::Request` shape via `serde_json::from_str::<Value>`), then:
-- `shrugg_subscribe` with `params[0] == "newHeads"` → if `subs.len() >= MAX_WS_SUBSCRIPTIONS` reply `-32000` "at most 8 subscriptions per connection"; else allocate `next_id.to_string()`, insert, reply `result: "<id>"`.
-- `shrugg_subscribe` with any other topic → `-32602` `"unknown subscription topic <x>; this node serves newHeads"`.
-- `shrugg_unsubscribe` with `params[0]` a string → `result: subs.remove(&id).is_some()` (a bool, `false` for one this socket never held — not an error, which is what Ethereum clients expect).
-- anything else → `-32601` `"the websocket serves shrugg_subscribe and shrugg_unsubscribe; reads go to POST /"`.
+- `rand_subscribe` with `params[0] == "newHeads"` → if `subs.len() >= MAX_WS_SUBSCRIPTIONS` reply `-32000` "at most 8 subscriptions per connection"; else allocate `next_id.to_string()`, insert, reply `result: "<id>"`.
+- `rand_subscribe` with any other topic → `-32602` `"unknown subscription topic <x>; this node serves newHeads"`.
+- `rand_unsubscribe` with `params[0]` a string → `result: subs.remove(&id).is_some()` (a bool, `false` for one this socket never held — not an error, which is what Ethereum clients expect).
+- anything else → `-32601` `"the websocket serves rand_subscribe and rand_unsubscribe; reads go to POST /"`.
 - an unparseable frame or a notification → `-32600`, as on HTTP.
 
 `node.rs`: build the channel in `start` (`let (heads, _) = tokio::sync::broadcast::channel(rpc::HEAD_CHANNEL);`), put the sender and an `Arc<AtomicUsize>` into `RpcState`, keep both on `Node`, and publish in exactly the two places a block becomes committed — at the end of `Node::commit` and at the end of `apply_synced`, after `storage.commit` has succeeded:
@@ -1169,28 +1169,28 @@ and `publish_status` (node.rs:512) sets `s.ws_clients = self.ws_conns.load(SeqCs
 
 - [ ] **Step 5: Run the integration test green**
 
-Run: `cargo test --release -p shrugg-node --test ws`
+Run: `cargo test --release -p randprotocol-node --test ws`
 Expected: PASS (3 tests). These run on 150 ms blocks and prove nothing, so the whole file is seconds, not minutes.
 
 - [ ] **Step 6: Check nothing else broke**
 
-Run: `cargo test --release -p shrugg-node --lib`
+Run: `cargo test --release -p randprotocol-node --lib`
 Expected: PASS — `rpc::tests` compiles against the new `RpcState` fields (add `heads`/`ws_conns` to the `state_for` fixture at rpc.rs:865). Task 2's batch tests and the body-limit block at :1497 both go through `handle`, so they are the check that the route merge did not disturb the POST path.
 
 - [ ] **Step 7: Document it in `docs/rpc.md`**
 
-New section `## Subscriptions (WebSocket)` after the methods: the endpoint (`ws://host:8545/` or `/ws`, same port as HTTP), the three frame shapes above, that `newHeads` is the only topic and its payload is exactly `shrugg_getHead`'s, one notification per committed block including during sync, the caps (64 connections per node — the 65th gets HTTP 503 —, 8 subscriptions per connection, 64 KiB frames), and the backpressure rule: a subscriber that falls more than 256 heads behind is closed with code 1008 and a reason, and should reconnect and catch up with `shrugg_getCompactBlocks`. **Append** `ws_clients` to the `shrugg_status` example object and add one line for it after the four sync bullets fix-sync-stall wrote (`sync_inflight_age_ms`, `sync_failures`, `sync_late_batches`, `connected_peers`) — do not rewrite that block, and do not drop the new keys from the example.
+New section `## Subscriptions (WebSocket)` after the methods: the endpoint (`ws://host:8545/` or `/ws`, same port as HTTP), the three frame shapes above, that `newHeads` is the only topic and its payload is exactly `rand_getHead`'s, one notification per committed block including during sync, the caps (64 connections per node — the 65th gets HTTP 503 —, 8 subscriptions per connection, 64 KiB frames), and the backpressure rule: a subscriber that falls more than 256 heads behind is closed with code 1008 and a reason, and should reconnect and catch up with `rand_getCompactBlocks`. **Append** `ws_clients` to the `rand_status` example object and add one line for it after the four sync bullets fix-sync-stall wrote (`sync_inflight_age_ms`, `sync_failures`, `sync_late_batches`, `connected_peers`) — do not rewrite that block, and do not drop the new keys from the example.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add Cargo.toml crates/shrugg-node/Cargo.toml crates/shrugg-node/src/ws.rs \
-        crates/shrugg-node/src/lib.rs crates/shrugg-node/src/rpc.rs crates/shrugg-node/src/node.rs \
-        crates/shrugg-node/tests/ws.rs crates/shrugg-node/tests/common/mod.rs docs/rpc.md
+git add Cargo.toml crates/randprotocol-node/Cargo.toml crates/randprotocol-node/src/ws.rs \
+        crates/randprotocol-node/src/lib.rs crates/randprotocol-node/src/rpc.rs crates/randprotocol-node/src/node.rs \
+        crates/randprotocol-node/tests/ws.rs crates/randprotocol-node/tests/common/mod.rs docs/rpc.md
 git commit -m "$(cat <<'EOF'
 node: WebSocket newHeads subscription
 
-Everything watching this chain polled shrugg_getHead — the explorer, every
+Everything watching this chain polled rand_getHead — the explorer, every
 wallet waiting on a commit, the deploy scripts. A JSON-RPC subscribe over a
 WebSocket on the same port now pushes the same head summary once per committed
 block instead, sync batches included, so nothing has to guess an interval.
@@ -1200,10 +1200,10 @@ per node (the 65th gets a 503 at upgrade, not a silent close), 8 subscriptions
 per connection, and a 256-slot broadcast channel whose lagging receivers are
 closed with 1008 and a reason rather than buffered. Buffering a slow subscriber
 is how a node runs out of memory; a closed one reconnects and catches up with
-shrugg_getCompactBlocks.
+rand_getCompactBlocks.
 
-Reads stay on POST: the socket answers shrugg_subscribe and
-shrugg_unsubscribe and -32601 for anything else, because serving reads there
+Reads stay on POST: the socket answers rand_subscribe and
+rand_unsubscribe and -32601 for anything else, because serving reads there
 would need its own blocking-pool and concurrency discipline for no gain.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
@@ -1217,9 +1217,9 @@ EOF
 ### Task 4: The refused-hash cache and the per-peer rate limit
 
 **Files:**
-- Create: `crates/shrugg-node/src/admission.rs`
-- Modify: `crates/shrugg-node/src/mempool.rs` (split `insert` at :136; `still_applies` is at :227, `claimed_commitments` at :97, `claimed_nonce` at :59), `crates/shrugg-node/src/lib.rs` (`mod admission;`)
-- Test: `crates/shrugg-node/src/admission.rs` `mod tests`, `crates/shrugg-node/src/mempool.rs` `mod tests`
+- Create: `crates/randprotocol-node/src/admission.rs`
+- Modify: `crates/randprotocol-node/src/mempool.rs` (split `insert` at :136; `still_applies` is at :227, `claimed_commitments` at :97, `claimed_nonce` at :59), `crates/randprotocol-node/src/lib.rs` (`mod admission;`)
+- Test: `crates/randprotocol-node/src/admission.rs` `mod tests`, `crates/randprotocol-node/src/mempool.rs` `mod tests`
 
 This task ships the two pure, unit-testable pieces and the mempool split they need. Task 5 wires them into the loop.
 
@@ -1269,7 +1269,7 @@ pub struct TokenBucket { tokens: Option<f64>, last: Option<Instant> }
 /// The policy over those buckets: a token bucket on gossiped transaction submissions, metered
 /// against the peer that **forwarded** the message (`GossipId.propagation_source`), never the peer
 /// that authored it — `NetworkEvent::Gossip.from` is the author and may be a peer we hold no
-/// connection to at all (see `node::Peer`'s doc comment, and `connected_peers` in `shrugg_status`).
+/// connection to at all (see `node::Peer`'s doc comment, and `connected_peers` in `rand_status`).
 /// RPC submissions are not metered: that port is the operator's own and is bounded by
 /// `rpc::RPC_MAX_BODY_BYTES`.
 pub struct PeerLimiter { burst: f64, per_sec: f64 }
@@ -1385,7 +1385,7 @@ mod tests {
 
 - [ ] **Step 2: Run and see them fail**
 
-Run: `cargo test --release -p shrugg-node --lib admission::`
+Run: `cargo test --release -p randprotocol-node --lib admission::`
 Expected: FAIL — `file not found for module admission` / unresolved names.
 
 - [ ] **Step 3: Implement `admission.rs`**
@@ -1428,7 +1428,7 @@ Every arm is a function of the transaction's own bytes: the chain id is a per-ch
 
 - [ ] **Step 4: Run them green**
 
-Run: `cargo test --release -p shrugg-node --lib admission::`
+Run: `cargo test --release -p randprotocol-node --lib admission::`
 Expected: PASS (3 tests).
 
 - [ ] **Step 5: Write the failing mempool split test**
@@ -1439,7 +1439,7 @@ Expected: PASS (3 tests).
 /// they must accept and reject exactly what `insert` does.
 #[test]
 fn precheck_and_insert_verified_agree_with_insert() {
-    let gs = fixtures::genesis_with(1, vec![alloc_note(20, 5 * UNITS_PER_SHRUGG)]);
+    let gs = fixtures::genesis_with(1, vec![alloc_note(20, 5 * UNITS_PER_RAND)]);
     let ledger = gs.ledger.clone();
     let tx = fixtures::bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
 
@@ -1472,7 +1472,7 @@ fn precheck_and_insert_verified_agree_with_insert() {
 /// point of the split.
 #[test]
 fn precheck_refuses_a_stale_anchor_before_any_proof_work() {
-    let gs = fixtures::genesis_with(1, vec![alloc_note(20, 5 * UNITS_PER_SHRUGG)]);
+    let gs = fixtures::genesis_with(1, vec![alloc_note(20, 5 * UNITS_PER_RAND)]);
     let ledger = gs.ledger.clone();
     let mut tx = fixtures::bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
     tx.bundle.as_mut().unwrap().anchor = [0xdead; 8];
@@ -1484,11 +1484,11 @@ fn precheck_refuses_a_stale_anchor_before_any_proof_work() {
 }
 ```
 
-(If `insert_nullifier_for_testing` does not exist, add a `#[cfg(any(test, feature = "..."))]`-free `pub fn insert_nullifier_for_testing` beside `Storage::overwrite_validator_for_testing`'s equivalent on `Ledger`, or build the moved ledger by applying a block — whichever the crate already does. Confirm with `cargo check --release -p shrugg-core` before writing the implementation.)
+(If `insert_nullifier_for_testing` does not exist, add a `#[cfg(any(test, feature = "..."))]`-free `pub fn insert_nullifier_for_testing` beside `Storage::overwrite_validator_for_testing`'s equivalent on `Ledger`, or build the moved ledger by applying a block — whichever the crate already does. Confirm with `cargo check --release -p randprotocol-core` before writing the implementation.)
 
 - [ ] **Step 6: Run and see them fail**
 
-Run: `cargo test --release -p shrugg-node --lib mempool::tests::precheck`
+Run: `cargo test --release -p randprotocol-node --lib mempool::tests::precheck`
 Expected: FAIL — `no method named precheck` / `insert_verified`.
 
 - [ ] **Step 7: Implement the split**
@@ -1539,13 +1539,13 @@ pub fn insert(&mut self, tx: Transaction, ledger: &Ledger, executor: &dyn Confid
 
 - [ ] **Step 8: Run the mempool tests green**
 
-Run: `cargo test --release -p shrugg-node --lib mempool::`
+Run: `cargo test --release -p randprotocol-node --lib mempool::`
 Expected: PASS — the two new tests and all 12 existing `mempool::tests` cases unchanged.
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/shrugg-node/src/admission.rs crates/shrugg-node/src/mempool.rs crates/shrugg-node/src/lib.rs
+git add crates/randprotocol-node/src/admission.rs crates/randprotocol-node/src/mempool.rs crates/randprotocol-node/src/lib.rs
 git commit -m "$(cat <<'EOF'
 node: a refused-hash cache, a per-peer rate limit, and the mempool split they need
 
@@ -1590,11 +1590,11 @@ EOF
 ### Task 5: Proof verification off the consensus loop, under gossipsub application validation
 
 **Files:**
-- Modify: `crates/shrugg-node/src/network/mod.rs` — **only** the gossipsub `ConfigBuilder` (:245–250), `NetworkEvent`/`NetworkCommand` (:149–167), `NetworkHandle`, and the `Event::Message` arm of `handle_swarm_event` (:486–493). `codec.rs`, `SYNC_REQUEST_TIMEOUT`, the `SYNC_*_WIRE_LIMIT`s, `addr_scope` / `is_dialable_advertised_addr` and `lan_peers` are fix-sync-stall's and stay exactly as they are.
-- Modify: `crates/shrugg-node/src/node.rs` (the queue, the snapshot, the verdict channel as a new arm of the `select!` at :486, reporting; `Peer` at :230 gains the bucket; `publish_status` at :512)
-- Modify: `crates/shrugg-node/src/rpc.rs` (`NodeStatus` at :38 gains `refused_cache`, `verify_queue`, beside `connected_peers` and the three sync counters)
-- Modify: `crates/shrugg-node/src/admission.rs` (the `VerifySource` / `Verdict` types)
-- Test: `crates/shrugg-node/src/network/mod.rs` `mod tests`, `crates/shrugg-node/src/node.rs` `mod tests`
+- Modify: `crates/randprotocol-node/src/network/mod.rs` — **only** the gossipsub `ConfigBuilder` (:245–250), `NetworkEvent`/`NetworkCommand` (:149–167), `NetworkHandle`, and the `Event::Message` arm of `handle_swarm_event` (:486–493). `codec.rs`, `SYNC_REQUEST_TIMEOUT`, the `SYNC_*_WIRE_LIMIT`s, `addr_scope` / `is_dialable_advertised_addr` and `lan_peers` are fix-sync-stall's and stay exactly as they are.
+- Modify: `crates/randprotocol-node/src/node.rs` (the queue, the snapshot, the verdict channel as a new arm of the `select!` at :486, reporting; `Peer` at :230 gains the bucket; `publish_status` at :512)
+- Modify: `crates/randprotocol-node/src/rpc.rs` (`NodeStatus` at :38 gains `refused_cache`, `verify_queue`, beside `connected_peers` and the three sync counters)
+- Modify: `crates/randprotocol-node/src/admission.rs` (the `VerifySource` / `Verdict` types)
+- Test: `crates/randprotocol-node/src/network/mod.rs` `mod tests`, `crates/randprotocol-node/src/node.rs` `mod tests`
 
 **Interfaces:**
 
@@ -1655,7 +1655,7 @@ async fn a_gossiped_message_carries_the_id_its_validation_is_reported_with() {
 
 - [ ] **Step 2: Run and see it fail**
 
-Run: `cargo test --release -p shrugg-node --lib network::tests`
+Run: `cargo test --release -p randprotocol-node --lib network::tests`
 Expected: FAIL to compile — `NetworkEvent::Gossip` has no `id` field, `report_validation` does not exist. The four address-filter tests fix-sync-stall added to `network::tests` (`loopback_is_never_a_dialable_advertised_address` and friends) must still compile and pass untouched — they are the check that this task stayed out of the sync wire.
 
 - [ ] **Step 3: Implement the network side**
@@ -1670,7 +1670,7 @@ Expected: FAIL to compile — `NetworkEvent::Gossip` has no `id` field, `report_
 ```
 
 In `handle_swarm_event`, the `Event::Message` arm (network/mod.rs:486, today
-`SwarmEvent::Behaviour(ShruggEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. }))`
+`SwarmEvent::Behaviour(RandEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. }))`
 with `let from = message.source.unwrap_or(propagation_source)`) destructures `message_id` as well —
 replacing the `..` — and sends `NetworkEvent::Gossip { from, msg, id: GossipId { message_id, propagation_source } }`.
 Note that `from` falls back to `propagation_source` when the message carries no source, which is the
@@ -1693,7 +1693,7 @@ Err(e) => {
 
 - [ ] **Step 4: Run the network test green**
 
-Run: `cargo test --release -p shrugg-node --lib network::tests`
+Run: `cargo test --release -p randprotocol-node --lib network::tests`
 Expected: PASS — the new round-trip test, the existing two-node gossip/sync test, and the four address-filter unit tests, ~20 s (the first two build real swarms).
 
 - [ ] **Step 5: Write the failing node-loop test**
@@ -1771,7 +1771,7 @@ fn a_verdict_reports_and_caches_by_permanence() {
 
 - [ ] **Step 6: Run and see it fail**
 
-Run: `cargo test --release -p shrugg-node --lib node::tests::every_gossip node::tests::a_verdict`
+Run: `cargo test --release -p randprotocol-node --lib node::tests::every_gossip node::tests::a_verdict`
 Expected: FAIL — `GossipOutcome` / `acceptance_for` undefined.
 
 - [ ] **Step 7: Implement the node-loop wiring**
@@ -1922,14 +1922,14 @@ sets of numbers answer different questions for an operator.
 
 - [ ] **Step 8: Run the focused tests green**
 
-Run: `cargo test --release -p shrugg-node --lib`
+Run: `cargo test --release -p randprotocol-node --lib`
 Expected: PASS — the new node and admission tests, plus every existing `--lib` test (network, mempool, storage, rpc, node).
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/shrugg-node/src/network/mod.rs crates/shrugg-node/src/node.rs \
-        crates/shrugg-node/src/admission.rs crates/shrugg-node/src/rpc.rs
+git add crates/randprotocol-node/src/network/mod.rs crates/randprotocol-node/src/node.rs \
+        crates/randprotocol-node/src/admission.rs crates/randprotocol-node/src/rpc.rs
 git commit -m "$(cat <<'EOF'
 node: verify transaction proofs off the consensus loop
 
@@ -1978,7 +1978,7 @@ EOF
 ### Task 6: End-to-end on a cluster, and the documentation
 
 **Files:**
-- Modify: `crates/shrugg-node/tests/cluster.rs`
+- Modify: `crates/randprotocol-node/tests/cluster.rs`
 - Modify: `docs/rpc.md` (a new `## Changelog` section), `docs/rpc-comparison.md` (§2), `docs/architecture.md` (§8), `AGENTS.md` (Open follow-ups), `README.md` (the Interfaces row)
 
 - [x] **Step 1: Write the failing cluster tests**
@@ -2009,7 +2009,7 @@ async fn compact_blocks_agree_with_the_paged_reads() {
     /* start two validators on genesis_funding, mint, send one shielded transfer, wait for the
        commit — the same opening as two_validators_commit_and_shielded_transfer */
     let head = n0.rpc.head().await.unwrap()["height"].as_u64().unwrap();
-    let compact = n0.rpc.call("shrugg_getCompactBlocks", json!([0, head])).await.unwrap();
+    let compact = n0.rpc.call("rand_getCompactBlocks", json!([0, head])).await.unwrap();
 
     // Every leaf, in the same order and with the same envelopes, as the paged read.
     let flat: Vec<Value> = compact.as_array().unwrap().iter().flat_map(|b| {
@@ -2017,7 +2017,7 @@ async fn compact_blocks_agree_with_the_paged_reads() {
             .chain(b["transactions"].as_array().unwrap().iter()
                 .flat_map(|t| t["commitments"].as_array().unwrap().iter().cloned()))
     }).collect();
-    let paged = n0.rpc.call("shrugg_getCommitments", json!([0, 1000])).await.unwrap();
+    let paged = n0.rpc.call("rand_getCommitments", json!([0, 1000])).await.unwrap();
     let paged = paged.as_array().unwrap();
     assert_eq!(flat.len(), paged.len(), "the same leaves");
     for (a, b) in flat.iter().zip(paged) {
@@ -2028,13 +2028,13 @@ async fn compact_blocks_agree_with_the_paged_reads() {
         .flat_map(|b| b["transactions"].as_array().unwrap())
         .flat_map(|t| t["nullifiers"].as_array().unwrap())
         .map(|n| n.as_str().unwrap()).collect();
-    let paged_nfs = n0.rpc.call("shrugg_getNullifiers", json!([0, 1000])).await.unwrap();
+    let paged_nfs = n0.rpc.call("rand_getNullifiers", json!([0, 1000])).await.unwrap();
     assert_eq!(nfs.len(), paged_nfs.as_array().unwrap().len());
     for row in paged_nfs.as_array().unwrap() {
         assert!(nfs.contains(&row["nullifier"].as_str().unwrap()));
     }
     // Every node answers the same way.
-    assert_eq!(n1.rpc.call("shrugg_getCompactBlocks", json!([0, head])).await.unwrap(), compact);
+    assert_eq!(n1.rpc.call("rand_getCompactBlocks", json!([0, head])).await.unwrap(), compact);
 }
 
 /// The refused cache end to end: a mint whose signature does not check is a permanent verdict,
@@ -2058,7 +2058,7 @@ async fn a_refused_transaction_is_not_verified_twice() {
             envelope: Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] },
             amount: 1_000,
             minter: ks[0].public_key().clone(),
-            signature: shrugg_core::Signature::empty(),
+            signature: randprotocol_core::Signature::empty(),
         },
     };
     let first = n0.rpc.send_transaction(&bad).await.unwrap_err().to_string();
@@ -2071,14 +2071,14 @@ async fn a_refused_transaction_is_not_verified_twice() {
     assert!(again.contains("mint signature"), "{again}");
     assert_eq!(n0.handle.status.read().unwrap().refused_cache, 1);
     // A legitimate transaction still goes through, so the cache is not a blanket refusal.
-    n0.mint(7, 5 * UNITS_PER_SHRUGG).await;
+    n0.mint(7, 5 * UNITS_PER_RAND).await;
     stop(n0).await;
 }
 ```
 
 - [x] **Step 2: Run the two new cluster tests and see them fail**
 
-Run: `cargo test --release -p shrugg-node --test cluster -- compact_blocks_agree a_refused_transaction`
+Run: `cargo test --release -p randprotocol-node --test cluster -- compact_blocks_agree a_refused_transaction`
 Expected: the compact-block one fails on the assertion (or compiles and passes if Task 1 landed correctly — in which case assert it *does* pass and move on); the refused-cache one fails on `refused_cache` not existing if Task 5 missed the status field.
 
 Even this focused run takes the proving slot for the compact-block half, so it will wait if another
@@ -2090,11 +2090,11 @@ Fix whatever the two tests surface. No new production code should be needed; if 
 
 - [x] **Step 4: Run the whole cluster suite, once**
 
-Run: `cargo test --release -p shrugg-node --test cluster`
+Run: `cargo test --release -p randprotocol-node --test cluster`
 Expected: PASS — **19 tests (17 existing + 2), about 20 minutes**, or ~22 if the compact-block assertion was written as its own proving test rather than folded into `two_validators_commit_and_shielded_transfer`. The suite measured 17 tests / 19m59s on 2026-09-13 *because* the proving slot serialises its twelve bundle proofs and two program proofs; the 16 tests / 6m28s this plan was drafted against is the pre-slot number and will not be seen again.
 
 This is the only full-cluster run in the plan. Before starting it, make sure no other session's
-`--test cluster` or `--test wallet_flow` holds `<target-dir>/tmp/shrugg-proving-slot.lock` — the runs
+`--test cluster` or `--test wallet_flow` holds `<target-dir>/tmp/rand-proving-slot.lock` — the runs
 will not fail, they will queue, and the wall times add. While it runs, `ps -eo rss= | awk '$1>8000000'`
 should stay silent.
 
@@ -2106,16 +2106,16 @@ green, which is the evidence that it did not.
 
 - [x] **Step 5: Write the documentation**
 
-0. **Everywhere in `docs/rpc.md`: append, never overwrite.** fix-sync-stall rewrote the `shrugg_status` section (the example object at :258 now carries `sync_inflight_age_ms`, `sync_failures`, `sync_late_batches` and `connected_peers`, with four explanatory bullets after it) and added the behaviour `-32600` describes without adding its Errors row. The new keys, the new bullets and the sync prose all stay exactly as they are; this plan adds `ws_clients` / `refused_cache` / `verify_queue` to that example and one bullet each, and adds the `-32600` row.
-1. **`docs/rpc.md`** — add a `## Changelog` section at the end, headed "what changed for clients", listing in one place: `shrugg_getCompactBlocks` (new; the shape and the caps); batch requests (new; the 20 cap; notifications refused with `-32600`); the WebSocket endpoint and `newHeads` (new; same port, the caps, the drop-on-lag rule); `shrugg_status` gains `ws_clients`, `refused_cache`, `verify_queue` (beside the four sync fields fix-sync-stall added, which are unchanged); the `-32600` error code is newly *documented* — it already existed for an oversized or unparseable body, and this plan adds the batch-shape and notification uses; and the one behaviour change an existing client can notice — **a transaction submitted over RPC is now answered after its proof has verified on a worker rather than on the consensus loop, so the reply can take a few hundred milliseconds longer under load, and the error messages are unchanged**. Note explicitly that no wire format, block, or consensus rule changed and that old and new nodes interoperate.
-2. **`docs/rpc-comparison.md` §2** — replace "Two cheap, non-consensus additions close most of that and are scheduled as an RPC hardening task after phase S3" and its two bullets with the shipped shapes: `shrugg_getCompactBlocks(from_height, to_height)` → per block its height, hash, timestamp and per transaction its note commitments (leaf index + envelope) and nullifiers, 128 blocks per call; and the WebSocket `newHeads` subscription (`shrugg_subscribe`/`shrugg_unsubscribe`, same port). Update the §1 table's *subscriptions* row (SHRUGG: `newHeads` over WebSocket) and its *batching and paging* row (SHRUGG: JSON-RPC batch, cap 20, plus limit-based paging and the compact-block range). Update §4's *subscriptions* row the same way and drop "(planned: WebSocket `newHeads`)". Leave §4's viewing-key-import and `check_tx_proof` paragraphs as candidates — they are this plan's "pending the user's decision" list.
+0. **Everywhere in `docs/rpc.md`: append, never overwrite.** fix-sync-stall rewrote the `rand_status` section (the example object at :258 now carries `sync_inflight_age_ms`, `sync_failures`, `sync_late_batches` and `connected_peers`, with four explanatory bullets after it) and added the behaviour `-32600` describes without adding its Errors row. The new keys, the new bullets and the sync prose all stay exactly as they are; this plan adds `ws_clients` / `refused_cache` / `verify_queue` to that example and one bullet each, and adds the `-32600` row.
+1. **`docs/rpc.md`** — add a `## Changelog` section at the end, headed "what changed for clients", listing in one place: `rand_getCompactBlocks` (new; the shape and the caps); batch requests (new; the 20 cap; notifications refused with `-32600`); the WebSocket endpoint and `newHeads` (new; same port, the caps, the drop-on-lag rule); `rand_status` gains `ws_clients`, `refused_cache`, `verify_queue` (beside the four sync fields fix-sync-stall added, which are unchanged); the `-32600` error code is newly *documented* — it already existed for an oversized or unparseable body, and this plan adds the batch-shape and notification uses; and the one behaviour change an existing client can notice — **a transaction submitted over RPC is now answered after its proof has verified on a worker rather than on the consensus loop, so the reply can take a few hundred milliseconds longer under load, and the error messages are unchanged**. Note explicitly that no wire format, block, or consensus rule changed and that old and new nodes interoperate.
+2. **`docs/rpc-comparison.md` §2** — replace "Two cheap, non-consensus additions close most of that and are scheduled as an RPC hardening task after phase S3" and its two bullets with the shipped shapes: `rand_getCompactBlocks(from_height, to_height)` → per block its height, hash, timestamp and per transaction its note commitments (leaf index + envelope) and nullifiers, 128 blocks per call; and the WebSocket `newHeads` subscription (`rand_subscribe`/`rand_unsubscribe`, same port). Update the §1 table's *subscriptions* row (RAND: `newHeads` over WebSocket) and its *batching and paging* row (RAND: JSON-RPC batch, cap 20, plus limit-based paging and the compact-block range). Update §4's *subscriptions* row the same way and drop "(planned: WebSocket `newHeads`)". Leave §4's viewing-key-import and `check_tx_proof` paragraphs as candidates — they are this plan's "pending the user's decision" list.
 3. **`AGENTS.md`** — rewrite the Open-follow-ups bullet. It currently reads "Proof verification still runs on the consensus event loop (~20 ms warm); moving it to `spawn_blocking` + gossipsub `Strict` validation is the real DoS fix (fee floor and FIFO key cache are mitigations only)." It becomes a statement of what shipped, under the review-state section rather than the follow-ups: transaction proof verification runs on `spawn_blocking` behind a bounded queue, gossipsub uses application-level validation (`validate_messages`, **`ValidationMode` deliberately still `Permissive` — a Strict/Permissive mix across a fleet drops messages**), a bounded refused-hash cache answers a repeat refusal for free, and a per-peer token bucket meters gossiped submissions. Keep one line under Open follow-ups: **block-application proof verification is still on the loop and needs a consensus decision to move**.
 4. **`docs/architecture.md` §8** — the Mempool numbered list becomes the new order (duplicate hash → pool conflicts → capacity → the staleness half of `Ledger::validate` → *queue for off-loop verification* → the proofs on a blocking task → `insert_verified` against the tip), with the gossipsub application-validation paragraph and the report-exactly-once invariant. §9c's sentence about the RPC handler is updated the same way.
-5. **`README.md`** — the Interfaces row: "JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` subscription on the same port (`shrugg-node`), `shrugg` wallet CLI with a local prover, Rust client library".
+5. **`README.md`** — the Interfaces row: "JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` subscription on the same port (`rand-node`), `rand` wallet CLI with a local prover, Rust client library".
 
 - [x] **Step 6: Verify the docs against the code**
 
-Run: `cargo test --release -p shrugg-node --lib` and re-read `docs/rpc.md`'s new sections against the constants in `rpc.rs`, `ws.rs` and `admission.rs`. Every number in the docs (128, 1000, 20, 64, 8, 256, 8192, 16, 4) must be the constant's value. Fix any drift.
+Run: `cargo test --release -p randprotocol-node --lib` and re-read `docs/rpc.md`'s new sections against the constants in `rpc.rs`, `ws.rs` and `admission.rs`. Every number in the docs (128, 1000, 20, 64, 8, 256, 8192, 16, 4) must be the constant's value. Fix any drift.
 
 Also check what you did **not** write: the body-limit prose must still describe `RPC_MAX_BODY_BYTES`
 as derived from `2 * MAX_PROOF_BYTES` and the envelope caps (it is a `const` expression, so quote the
@@ -2125,7 +2125,7 @@ them. A docs diff that touches those lines is a mistake in this step.
 - [x] **Step 7: Commit**
 
 ```bash
-git add crates/shrugg-node/tests/cluster.rs docs/rpc.md docs/rpc-comparison.md \
+git add crates/randprotocol-node/tests/cluster.rs docs/rpc.md docs/rpc-comparison.md \
         docs/architecture.md AGENTS.md README.md
 git commit -m "$(cat <<'EOF'
 docs: RPC hardening shipped — compact blocks, batch, newHeads, admission
@@ -2156,9 +2156,9 @@ EOF
 
 ## Self-review
 
-**Spec coverage.** Scope item 1 (`shrugg_getCompactBlocks`, per-block height/hash/timestamp, per-transaction commitments with tree index and envelope bytes, nullifiers, a documented page cap, existing error conventions, reusing today's storage) → Task 1, which reuses `CF_NOTES`/`NoteRow`/`envelope_json` and adds no column family. Item 2 (WebSocket `newHeads` on axum's `ws` feature, JSON-RPC subscribe/unsubscribe, the `shrugg_getHead` payload, documented backpressure and a connection cap) → Task 3. Item 3 (array in, array out, a batch cap, notifications documented) → Task 2, which chooses explicit refusal and says why. Item 4 (a) refused-hash cache and (b) per-peer rate limit → Task 4; (c) `spawn_blocking` verification plus `validate_messages()` + `report_message_validation_result`, with `ValidationMode` untouched, and the mempool interaction (one entry per verified transaction, a bounded cache, sized with reasoning) → Tasks 4 and 5 together. The three comparison candidates the user excluded are in "Out of scope, pending the user's decision". The no-fork constraint has its own section naming what *would* fork.
+**Spec coverage.** Scope item 1 (`rand_getCompactBlocks`, per-block height/hash/timestamp, per-transaction commitments with tree index and envelope bytes, nullifiers, a documented page cap, existing error conventions, reusing today's storage) → Task 1, which reuses `CF_NOTES`/`NoteRow`/`envelope_json` and adds no column family. Item 2 (WebSocket `newHeads` on axum's `ws` feature, JSON-RPC subscribe/unsubscribe, the `rand_getHead` payload, documented backpressure and a connection cap) → Task 3. Item 3 (array in, array out, a batch cap, notifications documented) → Task 2, which chooses explicit refusal and says why. Item 4 (a) refused-hash cache and (b) per-peer rate limit → Task 4; (c) `spawn_blocking` verification plus `validate_messages()` + `report_message_validation_result`, with `ValidationMode` untouched, and the mempool interaction (one entry per verified transaction, a bounded cache, sized with reasoning) → Tasks 4 and 5 together. The three comparison candidates the user excluded are in "Out of scope, pending the user's decision". The no-fork constraint has its own section naming what *would* fork.
 
-**Placeholder scan.** Every step names its file, its test, its command and its expected output. The one deliberate "confirm before writing" is Task 4 Step 5's `insert_nullifier_for_testing`, which is a named `cargo check` against a helper that may or may not exist under that name in `shrugg-core` — the user permitted `cargo check`, and the alternative (build the moved ledger by applying a block) is stated. `docs/rpc.md`'s prose is described by content rather than transcribed, because it is documentation, not code.
+**Placeholder scan.** Every step names its file, its test, its command and its expected output. The one deliberate "confirm before writing" is Task 4 Step 5's `insert_nullifier_for_testing`, which is a named `cargo check` against a helper that may or may not exist under that name in `randprotocol-core` — the user permitted `cargo check`, and the alternative (build the moved ledger by applying a block) is stated. `docs/rpc.md`'s prose is described by content rather than transcribed, because it is documentation, not code.
 
 **Type consistency.** `HeadSummary` / `head_summary` / `HEAD_CHANNEL` (rpc.rs) are used identically in ws.rs and node.rs. `GossipId { message_id, propagation_source }` is produced in network/mod.rs and consumed in admission.rs (`VerifySource::Gossip`) and node.rs. `RefusedCache::{new,get,insert,len}`, `is_permanent`, `PeerLimiter::{new,allow,forget}`, `GossipOutcome::{for_consensus,for_transaction}`, `acceptance_for`, `Verdict { tx, result, source }` keep one spelling across Tasks 4 and 5. `Mempool::{precheck, insert_verified, insert}` and the private `applies`/`admit` are named the same in Task 4's implementation and Task 5's `on_verdict`. `Storage::{notes_in_heights, first_note_at_or_after}` and the free `derived_note_count` are named the same in Task 1's storage code, its RPC renderer and its tests. `NodeStatus`'s three new fields (`ws_clients`, `refused_cache`, `verify_queue`) are added in Tasks 3 and 5 and read by Task 6's cluster tests and the docs.
 
@@ -2166,12 +2166,12 @@ EOF
 on 2026-09-13: `rpc.rs` `MAX_PAGE`:26, `NodeStatus`:38, `RpcState`:110, `Request`:119,
 `invalid_request`:139, `RPC_MAX_BODY_BYTES`:154, `handle`:194, `rejection_error`:222, `blocking`:237,
 `envelope_json`:297, `block_json`:334, `dispatch`:465, the `sendTransaction` size pre-check:475,
-`shrugg_getNullifiers`:531, `shrugg_getHead`:717, the test fixtures:865–911, the body-limit tests:1497;
+`rand_getNullifiers`:531, `rand_getHead`:717, the test fixtures:865–911, the body-limit tests:1497;
 `network/mod.rs` `NetworkEvent`:149, `ConfigBuilder`:245–250, `Event::Message`:486; `node.rs`
 `peers`:203, `Peer`:230, `run`'s `select!`:486, `publish_status`:512, `SubmitTx`:665,
 `PeerDisconnected`:736, the gossip transaction arm:747; `mempool.rs` `claimed_nonce`:59,
 `claimed_commitments`:97, `insert`:136, `candidates_within`:202, `still_applies`:227;
-`shrugg-core` `ledger/staking.rs::derived_commitment`:161 and `TxError::TransactionTooLarge` in
+`randprotocol-core` `ledger/staking.rs::derived_commitment`:161 and `TxError::TransactionTooLarge` in
 `ledger/mod.rs`. The two amendments the new code forced are named at the top and marked in place:
 the `-32600` constraint, and the rate limit's key.
 

@@ -7,12 +7,12 @@ every viewing key but one.
 What *is* public is every crossing of the pool's boundary, and on this chain there are only five
 kinds. Count those, add the validator register — which holds its amounts in the clear because
 consensus weight must be public (`docs/staking.md`) — and the total is exactly what the chain has
-ever issued. That identity is the supply audit: `shrugg_getSupply` reports it, and every node checks
+ever issued. That identity is the supply audit: `rand_getSupply` reports it, and every node checks
 it against a full replay of its own chain.
 
 ## What is counted
 
-Six counters, all in units (1 SHRUGG = 10⁹ units), all monotonic:
+Six counters, all in units (1 RAND = 10⁹ units), all monotonic:
 
 | counter | what it sums | when it moves |
 |---|---|---|
@@ -29,11 +29,11 @@ makes the arithmetic below closed rather than approximate.
 
 Two of those rows are easy to get subtly wrong, so they are worth stating twice:
 
-- **`genesis_staked` is issuance.** A genesis validator's stake is real SHRUGG — it can be unbonded
+- **`genesis_staked` is issuance.** A genesis validator's stake is real RAND — it can be unbonded
   and withdrawn into a note like any other — but it was never deposited into the pool. Without this
   counter every chain with validators would report more supply than it issued from its first block.
 - **A withdraw's base fee is not a crossing.** A `Withdraw` takes the whole amount out of the
-  register, creates a note worth `amount − 0.001 SHRUGG`, and pays the 0.001 to the proposer's
+  register, creates a note worth `amount − 0.001 RAND`, and pays the 0.001 to the proposer's
   `rewards`. Only the note crossed, so `withdraw_deposited` counts the note; the base simply moved
   from one register entry to another and is not a `fees_paid`, because it was never in the pool to be
   paid out of it.
@@ -53,7 +53,7 @@ invariant:       total_supply == issued
 — it is what entered minus what left, which comes to the same number. `invariant_holds` being false
 is a consensus bug or a damaged database, never a legitimate chain state.
 
-Follow one bond and one withdraw of 1000 SHRUGG through it, on a chain that deposited 2000 at genesis
+Follow one bond and one withdraw of 1000 RAND through it, on a chain that deposited 2000 at genesis
 and staked 4000:
 
 | after | `burned` | `withdraw_deposited` | `fees_paid` | `pool_value` | `register_total` | `total_supply` |
@@ -70,7 +70,7 @@ halves and never create or destroy any. Only a faucet mint moves `issued` at all
 
 ```bash
 curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"shrugg_getSupply","params":[]}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"rand_getSupply","params":[]}'
 ```
 
 ```json
@@ -83,8 +83,8 @@ curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
 ```
 
 Every amount is a **decimal string of units**, because a JSON number is not an exact integer past
-2⁵³ and a supply is 10⁹ units per SHRUGG. `height` is the head the numbers are as of; the register's
-own rows are in `shrugg_getValidators`.
+2⁵³ and a supply is 10⁹ units per RAND. `height` is the head the numbers are as of; the register's
+own rows are in `rand_getValidators`.
 
 Three things the reply does not say, by design: which notes make up `pool_value`, who holds them, and
 what any one of them is worth.
@@ -107,10 +107,10 @@ accounting rests on a claim rather than a check.
 
 The counters are also deliberately **not consensus state**: the state root does not hash them and no
 rule reads them. They are derived from the chain the way the note tree is — a node persists them
-beside the state, and `shrugg-node verify` recomputes every one of them by replaying every block and
+beside the state, and `rand-node verify` recomputes every one of them by replaying every block and
 reports `stored supply … does not match the replayed chain's …` if the snapshot disagrees. That
 replay is what the RPC's numbers are worth:
 
 ```bash
-shrugg-node verify --datadir ./data --mode quick     # structure, ledger replay, and the counters
+rand-node verify --datadir ./data --mode quick     # structure, ledger replay, and the counters
 ```

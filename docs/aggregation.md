@@ -20,7 +20,7 @@ have.
 | role | hardware | admitted by | does | paid by |
 |---|---|---|---|---|
 | **proposer** (HotStuff leader) | CPU | stake (`docs/staking.md`, the S2 register) | orders transactions, verifies one aggregate proof per sealed block (~0.8 s cold, ~16 ms warm) | the verification share of fees, as today |
-| **aggregator** (prover) | GPU | permissionless, a registered payout address | proves one recursive STARK that verifies N bundle proofs; submits it for a sealing block | the proving share of fees **plus a block subsidy in newly minted SHRUGG** |
+| **aggregator** (prover) | GPU | permissionless, a registered payout address | proves one recursive STARK that verifies N bundle proofs; submits it for a sealing block | the proving share of fees **plus a block subsidy in newly minted RAND** |
 
 Validators stay CPU-cheap, so a home node can still validate. GPU capital competes in its own
 market and is never a requirement for consensus. The two roles may be the same operator, but
@@ -56,7 +56,7 @@ aggregator it prices proving too. The fee splits into a **verification share** (
 more than the floor is aggregated first; that is the fee-ordered mempool the block-space doc
 asks for, with GPU operators doing the ordering.
 
-### 3.2 A block subsidy in new SHRUGG
+### 3.2 A block subsidy in new RAND
 
 At launch fee volume is near zero and nobody runs a GPU for it. So the sealing block mints a
 **subsidy** for the aggregate it includes, the way a Bitcoin coinbase pays a miner before fees
@@ -96,7 +96,7 @@ other.
 supply = genesis notes + faucet mints + Σ subsidies − burns
 ```
 
-`shrugg_getSupply` reports issuance separately from faucet mints so an auditor can check the
+`rand_getSupply` reports issuance separately from faucet mints so an auditor can check the
 schedule against the sealed-block count.
 
 ## 4. Fallback

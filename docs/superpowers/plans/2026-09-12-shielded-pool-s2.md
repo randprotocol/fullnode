@@ -4,7 +4,7 @@
 
 **Goal:** Give the shielded chain its validator register with public weights: `Bond` (from a bundle, value leaving the pool as `burn`), `Unbond` and `Withdraw` (validator-signed), registration of new validators, epochs of `EPOCH_BLOCKS` blocks with the validator set for epoch `e` derived from the register as of the last block of epoch `e − 1`, rewards paid out as deposit notes, and genesis seeding with payout addresses.
 
-**Architecture:** The register lives in `shrugg-core`'s ledger as `ValidatorEntry { public_key, stake, pending, rewards, payout, nonce }` and is hashed into the state root. Staking rules live in a new `ledger/staking.rs` module the ledger delegates to, so S3's action modules (call envelopes, bridge) can land beside it without touching the same functions. HotStuff stops reading one static validator set: it derives the set for a block height from the ledger of that height's epoch-start parent, verifies each QC against the set of the certified block's epoch, and picks leaders from the set of the next height. Storage persists one `ValidatorSet` per epoch so replay and sync verify QCs without re-deriving. The wallet gains `bond`; the node binary gains `unbond`, `withdraw` and `register` (they need the validator's Dilithium2 key). S2 ships with S3 as one hard fork.
+**Architecture:** The register lives in `randprotocol-core`'s ledger as `ValidatorEntry { public_key, stake, pending, rewards, payout, nonce }` and is hashed into the state root. Staking rules live in a new `ledger/staking.rs` module the ledger delegates to, so S3's action modules (call envelopes, bridge) can land beside it without touching the same functions. HotStuff stops reading one static validator set: it derives the set for a block height from the ledger of that height's epoch-start parent, verifies each QC against the set of the certified block's epoch, and picks leaders from the set of the next height. Storage persists one `ValidatorSet` per epoch so replay and sync verify QCs without re-deriving. The wallet gains `bond`; the node binary gains `unbond`, `withdraw` and `register` (they need the validator's Dilithium2 key). S2 ships with S3 as one hard fork.
 
 **Tech Stack:** unchanged from S1 (Rust 1.98.1, RocksDB, bincode; no new dependencies).
 
@@ -12,12 +12,12 @@
 
 ## Global Constraints
 
-- `EPOCH_BLOCKS` default `1000`, configurable in genesis (`epoch_blocks`, part of the genesis hash) so cluster tests can use small epochs; `UNBONDING_EPOCHS = 2`; `MIN_STAKE = 1000 * UNITS_PER_SHRUGG`; `MAX_VALIDATORS = 100`. Stake is `u64` units from S2 on (the register's `stake: u128` in `ValidatorSet` is kept for consensus arithmetic by widening at the boundary).
-- **Epoch of a height**: `epoch(h) = h / epoch_blocks`; genesis (height 0) is epoch 0. The set for epoch 0 is the genesis validators. The set for epoch `e ≥ 1` is `derive_set(register after block e·epoch_blocks − 1)`: every entry with `stake ≥ MIN_STAKE`, the top `MAX_VALIDATORS` by `(stake desc, address asc)`, then sorted by address. `derive_set` is a pure function in `shrugg-core` and the only place the rule is written.
+- `EPOCH_BLOCKS` default `1000`, configurable in genesis (`epoch_blocks`, part of the genesis hash) so cluster tests can use small epochs; `UNBONDING_EPOCHS = 2`; `MIN_STAKE = 1000 * UNITS_PER_RAND`; `MAX_VALIDATORS = 100`. Stake is `u64` units from S2 on (the register's `stake: u128` in `ValidatorSet` is kept for consensus arithmetic by widening at the boundary).
+- **Epoch of a height**: `epoch(h) = h / epoch_blocks`; genesis (height 0) is epoch 0. The set for epoch 0 is the genesis validators. The set for epoch `e ≥ 1` is `derive_set(register after block e·epoch_blocks − 1)`: every entry with `stake ≥ MIN_STAKE`, the top `MAX_VALIDATORS` by `(stake desc, address asc)`, then sorted by address. `derive_set` is a pure function in `randprotocol-core` and the only place the rule is written.
 - **Consensus rules**: a block at height `h` is proposed and voted by the set of `epoch(h)`; the leader for a view is `set(epoch(high_qc.height + 1)).leader(view)`; a QC certifying block `B` is verified against `set(epoch(B.height))`; a `NewView` quorum for view `v` is counted against the set of `epoch(high_qc.height + 1)` of the receiver. Because every replica derives the set from the same parent ledger, the derivation is deterministic along one chain; competing forks at an epoch boundary derive their own sets and HotStuff safety picks one.
 - **Validator-signed actions** carry `chain_id`, the validator's current `nonce` and the action fields in the signed message; the register increments `nonce` on every accepted Unbond/Withdraw/registration, which is the replay protection.
 - **Withdraw creates a deposit note the ledger can check**: the action carries the note's blinding `r` and the ledger computes `cm = H(CM, (payout.pk, from = 0, amount, asset 0, time = height, r))` itself through a new executor method, so a validator cannot mint more than it withdraws. The payout address is public in the register already (spec §8), so publishing `r` leaks nothing new; the note's later spend is unlinkable as any other.
-- **State root**: unchanged formula and domain (`shrugg-state-2`), but the validator leaf becomes `blake3("shrugg-validator-leaf-2", addr || stake || rewards || nonce || Σ pending (release_epoch, amount) || payout pk || payout kem_ek)`.
+- **State root**: unchanged formula and domain (`rand-state-2`), but the validator leaf becomes `blake3("rand-validator-leaf-2", addr || stake || rewards || nonce || Σ pending (release_epoch, amount) || payout pk || payout kem_ek)`.
 - `burn` is allowed only when the action is `Bond` and equals the bond amount; every other action keeps `burn = 0` (S3 adds `BridgeBurn`).
 - No slashing, no jailing (spec §13).
 - Commit style as S1.
@@ -31,12 +31,12 @@
 | Withdraw publishes `r` | closes the "validator declares one amount, mints another" gap flagged in S1 | the withdraw note is linkable to the validator, which the public payout address already is |
 | validator `nonce` in the register | Unbond/Withdraw are signed but the chain has no accounts or nonces since S1 | one more `u64` per entry |
 | `epoch_blocks` in genesis | cluster tests cannot wait 1000 blocks per epoch | one more genesis field |
-| the node binary, not the wallet, signs Unbond/Withdraw/register | they need the Dilithium2 validator key the node already holds | operators use two tools (`shrugg` for bonds, `shrugg-node` for the validator side) |
+| the node binary, not the wallet, signs Unbond/Withdraw/register | they need the Dilithium2 validator key the node already holds | operators use two tools (`rand` for bonds, `rand-node` for the validator side) |
 
 ## File structure
 
 ```
-crates/shrugg-core/src/
+crates/randprotocol-core/src/
   ledger.rs               [edit] delegates Bond/Unbond/Withdraw to staking.rs; epoch(); validator leaf v2; burn rule
   ledger/staking.rs       [new]  ValidatorEntry, Registration, derive_set, bond/unbond/withdraw/credit_fee, StakingError
   types/transaction.rs    [edit] Action::{Bond, Unbond, Withdraw}, signing messages
@@ -46,25 +46,25 @@ crates/shrugg-core/src/
   consensus/tests.rs      [edit] epoch rollover simulation
   confidential.rs         [edit] trait: note_commitment(); StubExecutor impl
   genesis.rs              [edit] GenesisValidator.payout, epoch_blocks
-crates/shrugg-zkvm/src/executor.rs [edit] note_commitment()
-crates/shrugg-node/src/
+crates/randprotocol-zkvm/src/executor.rs [edit] note_commitment()
+crates/randprotocol-node/src/
   storage.rs              [edit] validators rows v2; epoch_sets CF; commit/load/truncate; verify_chain per-epoch QCs
   node.rs                 [edit] HotStuff resume with EpochSets; sync QC verification per epoch
-  rpc.rs                  [edit] shrugg_getValidators (full entries), shrugg_getEpoch
+  rpc.rs                  [edit] rand_getValidators (full entries), rand_getEpoch
   main.rs                 [edit] genesis --validator key,stake,payout; unbond/withdraw/register subcommands
-crates/shrugg-client/src/
-  wallet.rs, main.rs      [edit] `shrugg bond <validator> <amount>`
-crates/shrugg-node/tests/cluster.rs [edit] bond, epoch rollover with a fifth validator, unbond+withdraw
+crates/randprotocol-client/src/
+  wallet.rs, main.rs      [edit] `rand bond <validator> <amount>`
+crates/randprotocol-node/tests/cluster.rs [edit] bond, epoch rollover with a fifth validator, unbond+withdraw
 docs/shielded.md, docs/staking.md [edit/new]
 ```
 
 ---
 
-### Task 1: The register and the staking rules in `shrugg-core`
+### Task 1: The register and the staking rules in `randprotocol-core`
 
 **Files:**
-- Create: `crates/shrugg-core/src/ledger/staking.rs` (move `ledger.rs` to `ledger/mod.rs` first)
-- Modify: `crates/shrugg-core/src/types/transaction.rs`, `confidential.rs`, `types/validator.rs`, `ledger/mod.rs`, `genesis.rs`
+- Create: `crates/randprotocol-core/src/ledger/staking.rs` (move `ledger.rs` to `ledger/mod.rs` first)
+- Modify: `crates/randprotocol-core/src/types/transaction.rs`, `confidential.rs`, `types/validator.rs`, `ledger/mod.rs`, `genesis.rs`
 - Test: unit tests in `staking.rs`, `ledger/mod.rs`, `genesis.rs`
 
 **Interfaces:**
@@ -72,7 +72,7 @@ docs/shielded.md, docs/staking.md [edit/new]
 ```rust
 // staking.rs
 pub const EPOCH_BLOCKS_DEFAULT: u64 = 1000; pub const UNBONDING_EPOCHS: u64 = 2;
-pub const MIN_STAKE: u64 = 1000 * UNITS_PER_SHRUGG; pub const MAX_VALIDATORS: usize = 100;
+pub const MIN_STAKE: u64 = 1000 * UNITS_PER_RAND; pub const MAX_VALIDATORS: usize = 100;
 pub struct ValidatorEntry { pub public_key: PublicKey, pub stake: u64, pub pending: Vec<(u64 /*release_epoch*/, u64)>, pub rewards: u64, pub payout: ShieldedAddress, pub nonce: u64 }
 pub struct Registration { pub public_key: PublicKey, pub payout: ShieldedAddress, pub signature: Signature }   // signs registration_message(chain_id, payout)
 pub fn derive_set(register: &BTreeMap<Address, ValidatorEntry>) -> ValidatorSet;
@@ -87,9 +87,9 @@ pub enum Action { None, Mint{..}, Deploy{..}, Call{..},
   Bond { validator: Address, amount: u64, registration: Option<Registration> },
   Unbond { validator: Address, amount: u64, nonce: u64, signature: Signature },
   Withdraw { validator: Address, amount: u64, nonce: u64, r: Word8, envelope: Envelope, signature: Signature } }
-pub fn unbond_message(chain_id, validator, amount, nonce) -> Hash;   // blake3 "shrugg-unbond"
-pub fn withdraw_message(chain_id, validator, amount, nonce, r, envelope) -> Hash;  // blake3 "shrugg-withdraw"
-pub fn registration_message(chain_id, payout: &ShieldedAddress) -> Hash;  // blake3 "shrugg-register"
+pub fn unbond_message(chain_id, validator, amount, nonce) -> Hash;   // blake3 "rand-unbond"
+pub fn withdraw_message(chain_id, validator, amount, nonce, r, envelope) -> Hash;  // blake3 "rand-withdraw"
+pub fn registration_message(chain_id, payout: &ShieldedAddress) -> Hash;  // blake3 "rand-register"
 // confidential.rs
 fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8;   // H(CM, 28 words) — Stub: blake3 stand-in
 // ledger
@@ -100,13 +100,13 @@ pub fn derive_next_set(&self) -> ValidatorSet;   // = staking::derive_set(&self.
 Admission additions (spec §7 order, action step): `Bond` → the bundle's `burn == amount` else `BurnMismatch`; registration present iff the validator is unknown; `amount ≥ MIN_STAKE` when registering; `Unbond`/`Withdraw` → validator known, nonce matches, signature valid, amounts available; `Withdraw` → the ledger computes `cm` via `executor.note_commitment(payout.pk, [0;8], amount, 0, height as u32, r)` and treats it exactly like a Mint deposit (commitment new, appended, envelope stored). Apply: `Bond` adds to `stake` (registration inserts the entry with `nonce = 0`), `Unbond` moves to `pending` with `release_epoch = epoch + UNBONDING_EPOCHS` and bumps `nonce`, `Withdraw` drains released pending entries then rewards, bumps `nonce`, appends the note.
 
 - [ ] Step 1: tests first — `derive_set_filters_sorts_and_caps` (11 entries, two below min stake, cap 100 not hit; a second case with 101 eligible caps at 100 by stake then address), `bond_registers_and_tops_up`, `bond_requires_burn_equal_to_amount`, `unbond_moves_to_pending_and_needs_nonce_and_signature`, `withdraw_pays_released_and_rewards_into_a_checkable_note` (Stub `note_commitment` equals the appended cm; a wrong `r` changes it), `withdraw_rejects_unreleased_pending`, `validator_leaf_v2_changes_the_root_when_pending_or_payout_change`, `genesis_seeds_payout_and_epoch_blocks`.
-- [ ] Step 2: run, see them fail. Step 3: implement `staking.rs` and the ledger/transaction/genesis edits. Step 4: `cargo test -p shrugg-core` green (the S1 tests keep passing: existing bundles have `burn = 0` and no staking action). Step 5: commit `core: staking register — ValidatorEntry v2, Bond/Unbond/Withdraw, epoch derivation, checkable withdraw notes`.
+- [ ] Step 2: run, see them fail. Step 3: implement `staking.rs` and the ledger/transaction/genesis edits. Step 4: `cargo test -p randprotocol-core` green (the S1 tests keep passing: existing bundles have `burn = 0` and no staking action). Step 5: commit `core: staking register — ValidatorEntry v2, Bond/Unbond/Withdraw, epoch derivation, checkable withdraw notes`.
 
 ---
 
 ### Task 2: Epoch-aware HotStuff
 
-**Files:** `crates/shrugg-core/src/consensus/{mod.rs, hotstuff.rs, tests.rs}`, `types/validator.rs`, `types/block.rs` (QC verify takes the set as today).
+**Files:** `crates/randprotocol-core/src/consensus/{mod.rs, hotstuff.rs, tests.rs}`, `types/validator.rs`, `types/block.rs` (QC verify takes the set as today).
 
 **Interfaces:**
 
@@ -130,30 +130,30 @@ Rules to implement: `leader(view)` uses `current_set()`; `on_proposal` checks `b
 
 ### Task 3: Storage, node, RPC, node CLI
 
-**Files:** `crates/shrugg-node/src/{storage.rs, node.rs, rpc.rs, main.rs}`, `crates/shrugg-zkvm/src/executor.rs` (`note_commitment` = `Note{..}.commitment()`).
+**Files:** `crates/randprotocol-node/src/{storage.rs, node.rs, rpc.rs, main.rs}`, `crates/randprotocol-zkvm/src/executor.rs` (`note_commitment` = `Note{..}.commitment()`).
 
 - Storage: `validators` rows hold `ValidatorEntry` v2; new CF `epoch_sets` (epoch BE u64 → bincode(ValidatorSet)); `commit` writes every touched entry (bond/unbond/withdraw targets and the proposer) and the epoch set carried by `Action::RecordEpochSet`; `load_epoch_sets`; `truncate_to` deletes epoch sets above the epoch of the new head and rewrites entries from the ledger; `verify_chain` verifies each block's QC against the persisted set of its epoch and re-derives the set at every boundary from its replayed ledger, failing on mismatch; `init_genesis` writes epoch 0.
-- Node: `HotStuff::resume(cfg with genesis_set + epoch_blocks, .., epoch_sets)`; `apply_synced` verifies QCs per epoch; the node's `is_validator` becomes "signer present", while "in the current set" is reported in `shrugg_status` as `active_validator: bool`.
-- RPC: `shrugg_getValidators` → `[{address, stake, pending: [{release_epoch, amount}], rewards, payout, nonce, active}]`; `shrugg_getEpoch` → `{epoch, epoch_blocks, next_set: [addresses]}`.
-- `shrugg-node genesis --validator <keyfile>,<stake>,<payout shrugg1…>` (repeatable), `--epoch-blocks n`; `shrugg-node register --payout <addr>` prints a `Registration` (hex) for a wallet to attach to its bond; `shrugg-node unbond <amount>` and `shrugg-node withdraw <amount>` build and submit the validator-signed transactions (they read the node's key and query `shrugg_getValidators` for the nonce; `withdraw` draws `r`, seals the envelope to the payout address with a throwaway sender key, prints the tx hash).
-- Tests: storage round-trips of v2 entries and epoch sets; `verify_chain` rejects a block whose QC is signed by a set from the wrong epoch; RPC shapes. Gate `cargo test -p shrugg-node` (cluster tests come in Task 5).
+- Node: `HotStuff::resume(cfg with genesis_set + epoch_blocks, .., epoch_sets)`; `apply_synced` verifies QCs per epoch; the node's `is_validator` becomes "signer present", while "in the current set" is reported in `rand_status` as `active_validator: bool`.
+- RPC: `rand_getValidators` → `[{address, stake, pending: [{release_epoch, amount}], rewards, payout, nonce, active}]`; `rand_getEpoch` → `{epoch, epoch_blocks, next_set: [addresses]}`.
+- `rand-node genesis --validator <keyfile>,<stake>,<payout rand1…>` (repeatable), `--epoch-blocks n`; `rand-node register --payout <addr>` prints a `Registration` (hex) for a wallet to attach to its bond; `rand-node unbond <amount>` and `rand-node withdraw <amount>` build and submit the validator-signed transactions (they read the node's key and query `rand_getValidators` for the nonce; `withdraw` draws `r`, seals the envelope to the payout address with a throwaway sender key, prints the tx hash).
+- Tests: storage round-trips of v2 entries and epoch sets; `verify_chain` rejects a block whose QC is signed by a set from the wrong epoch; RPC shapes. Gate `cargo test -p randprotocol-node` (cluster tests come in Task 5).
 - Commit `node: staking — epoch sets persisted and verified, validator register RPC, register/unbond/withdraw commands`.
 
 ---
 
 ### Task 4: Wallet `bond`
 
-**Files:** `crates/shrugg-client/src/{wallet.rs, main.rs, lib.rs}`.
+**Files:** `crates/randprotocol-client/src/{wallet.rs, main.rs, lib.rs}`.
 
-- `shrugg bond <validator address> <amount SHRUGG> [--registration <hex>] [--fee]`: `wallet::submit` with `burn = amount` and `action = Bond { .. }` (the bundle's outputs are the change only: `amount` leaves the pool; the guest's balance is `in = out + fee + burn`). `RpcClient::{validators, epoch}`.
+- `rand bond <validator address> <amount RAND> [--registration <hex>] [--fee]`: `wallet::submit` with `burn = amount` and `action = Bond { .. }` (the bundle's outputs are the change only: `amount` leaves the pool; the guest's balance is `in = out + fee + burn`). `RpcClient::{validators, epoch}`.
 - Tests: `bond_bundle_balances_with_burn` (unit, stub-free arithmetic on the note selection), and the flow test in `tests/wallet_flow.rs` gains a bond against a genesis validator and asserts the register's stake grew by the amount (proves one bundle, ~1 min).
-- Commit `client: shrugg bond`.
+- Commit `client: rand bond`.
 
 ---
 
 ### Task 5: Cluster end-to-end and docs
 
-- `cluster.rs`, `epoch_blocks = 6`: `a_fifth_validator_registers_bonds_and_joins_the_next_epoch` (bond with registration from wallet A; wait for the epoch boundary; the fifth node proposes at least one block; every node agrees on the state root), `unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_note` (validator D unbonds to 0, drops out after two epochs, withdraws after `UNBONDING_EPOCHS`, the payout wallet scans the note and sends 1 SHRUGG from it).
+- `cluster.rs`, `epoch_blocks = 6`: `a_fifth_validator_registers_bonds_and_joins_the_next_epoch` (bond with registration from wallet A; wait for the epoch boundary; the fifth node proposes at least one block; every node agrees on the state root), `unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_note` (validator D unbonds to 0, drops out after two epochs, withdraws after `UNBONDING_EPOCHS`, the payout wallet scans the note and sends 1 RAND from it).
 - `docs/staking.md` (new): the register, epochs, the three actions with exact CLI commands, what is public; `docs/shielded.md` and `docs/rpc.md` updated; `deploy/README.md` genesis command.
 - Full workspace suite green; commit `node: staking end-to-end; docs: staking`.
 

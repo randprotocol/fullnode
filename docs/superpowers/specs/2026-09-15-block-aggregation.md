@@ -60,7 +60,7 @@ From `circuits/recursion/docs/02-aggregate.md`, verbatim where it matters:
 
 | question | settlement |
 |---|---|
-| subsidy amount, halving, cap | 2026-09-13 ruling: **100 SHRUGG per sealed block**, halving every **210 000 sealed blocks**, zero from the 64th halving (§5) |
+| subsidy amount, halving, cap | 2026-09-13 ruling: **100 RAND per sealed block**, halving every **210 000 sealed blocks**, zero from the 64th halving (§5) |
 | proving share | 2026-09-13 ruling: **floor to the proposer, excess to the aggregator** (§5) |
 | sealing window `k`; double coverage | **256 finalised blocks**, then never; the first finalised aggregate covering a bundle wins, a later one naming it is invalid (§3, §6) |
 | submission spam | 2026-09-13 ruling: **registered aggregators with a refundable bond**, every submission signed; slashing for equivocation only (§2) |
@@ -116,13 +116,13 @@ block, no subsidy.
 ### 2.1 State
 
 One row per registered aggregator, keyed by base58 address, modelled on S2's validator register
-(`docs/staking.md` §1, `crates/shrugg-core/src/ledger/staking.rs`):
+(`docs/staking.md` §1, `crates/randprotocol-core/src/ledger/staking.rs`):
 
 ```rust
 AggregatorEntry {
     public_key: PublicKey,            // Dilithium2: signs this aggregator's actions
     bond:       u64,                  // burned in at registration, paid out at withdrawal
-    payout:     ShieldedAddress,      // shrugg1… — where subsidy, proving shares and the bond go
+    payout:     ShieldedAddress,      // rand1… — where subsidy, proving shares and the bond go
     nonce:      u64,                  // replay protection for its signed actions
     unbonding:  Option<u64>,          // the release height, set by UnbondAggregator
 }
@@ -130,16 +130,16 @@ AggregatorEntry {
 
 The register is hashed into the state root as a component present only when
 `genesis.aggregation` is `Some`, exactly as the bridge's component is gated: the leaf is
-`blake3("shrugg-aggregator-leaf-1", addr || bond || nonce || release || payout pk || payout
+`blake3("rand-aggregator-leaf-1", addr || bond || nonce || release || payout pk || payout
 kem_ek)`, and the root joins the state root as `… || aggregators_root` under the new domain
-`shrugg-state-3`. A chain without the section keeps the current root byte for byte.
+`rand-state-3`. A chain without the section keeps the current root byte for byte.
 
 ### 2.2 Joining, leaving, slashing
 
 - **`Action::RegisterAggregator { registration: AggregatorRegistration { public_key, payout,
   signature } }`** rides a bundle whose `burn == AGGREGATOR_BOND` (genesis parameter, default
-  `100 * UNITS_PER_SHRUGG`), exactly as a validator's `Bond` burns stake. The signature is over
-  `blake3("shrugg-aggregator-register", chain_id || payout)`. Refused if the address is
+  `100 * UNITS_PER_RAND`), exactly as a validator's `Bond` burns stake. The signature is over
+  `blake3("rand-aggregator-register", chain_id || payout)`. Refused if the address is
   registered. The entry is created with `nonce = 0`.
 - **`Action::UnbondAggregator { aggregator, nonce, signature }`**: bundle-less, validator-style
   signed over the register nonce. Sets `unbonding = Some(head_height + AGGREGATION_WINDOW)`
@@ -163,9 +163,9 @@ submission; each accepted action consumes `nonce + 1`.
 
 ```rust
 AggregationConfig {
-    bond: u64,                    // AGGREGATOR_BOND, default 100 SHRUGG
+    bond: u64,                    // AGGREGATOR_BOND, default 100 RAND
     max_covers: u32,              // MAX_COVERS, 3 at activation (§3.3)
-    subsidy_base: u64,            // 100 * UNITS_PER_SHRUGG (§5.1)
+    subsidy_base: u64,            // 100 * UNITS_PER_RAND (§5.1)
     halving_blocks: u64,          // 210_000 (§5.1)
     window: u64,                  // AGGREGATION_WINDOW, 256 (§3.3)
     admitted_shapes: Vec<AdmittedShape>,
@@ -204,7 +204,7 @@ Action::Aggregate {
     time:       u32,             // window-checked; the payout note's time
     r:          Word8,           // the payout note's blinding factor
     envelope:   Envelope,        // the payout note sealed to the entry's payout address
-    signature:  Signature,       // over blake3("shrugg-aggregate",
+    signature:  Signature,       // over blake3("rand-aggregate",
                                  //   chain_id || nonce || time || r || covers || proof hash)
 }
 ```
@@ -256,7 +256,7 @@ stay pooled until any bundle they cover is sealed by another aggregate (the pool
 
 ## 4. Admission
 
-The exact algorithm, in order, cheap before expensive (`crates/shrugg-core/src/ledger/mod.rs`'s
+The exact algorithm, in order, cheap before expensive (`crates/randprotocol-core/src/ledger/mod.rs`'s
 `validate_inner` discipline, extended), with the M5.3 admission stub as steps 6–8. A rejection
 at any step invalidates the transaction; the error names the step.
 
@@ -273,7 +273,7 @@ at any step invalidates the transaction; the error names the step.
    three named verdicts (unknown, sealed, outside the window) remain admission's error reporting.
 5. **The payout note's commitment is new** — derived from `time`, `r`, the entry's payout and
    the amount the block would pay (§5.4), and claimed in the mempool the way a `BridgeAttest`'s
-   derived commitment is claimed (`crates/shrugg-node/src/mempool.rs`'s
+   derived commitment is claimed (`crates/randprotocol-node/src/mempool.rs`'s
    `derived_commitment` pattern); the `(aggregator, nonce)` pair is claimed the way an
    `Unbond`'s register nonce is. The `covers` are deliberately **not** claimed: overlapping
    submissions may pool (§3.4).
@@ -294,7 +294,7 @@ at any step invalidates the transaction; the error names the step.
    chain recomputes — invalid.
 8. **The proof**: `Machine::verify` on the rVM proof against the registered aggregate program
    — the one expensive step, last, ~1–2 s warm, run off the consensus loop on the RPC
-   hardening task's verification workers (`crates/shrugg-node/src/admission.rs`; an aggregate
+   hardening task's verification workers (`crates/randprotocol-node/src/admission.rs`; an aggregate
    occupies a slot far longer than a bundle's ~20 ms, which the 64-deep queue and the
    per-peer token bucket already bound), and reported to gossipsub exactly once, as today.
 9. **Payment** (§5): the subsidy for the block's `sealed_blocks` index plus the proving shares
@@ -317,14 +317,14 @@ ledger's `sealed_blocks` counter — incremented per included aggregate, so an i
 not consume the schedule:
 
 ```
-subsidy(n) = subsidy_base >> (n / halving_blocks)        // 100 SHRUGG, halving every 210 000
+subsidy(n) = subsidy_base >> (n / halving_blocks)        // 100 RAND, halving every 210 000
            = 0                              once n / halving_blocks >= 64
 ```
 
 The 64th halving ends issuance; the geometric total is `210 000 × 100 × (2 − ε)` ≈ **42 M
-SHRUGG**, the schedule's asymptote, not a consensus cap anyone must enforce — the shift itself
-is the whole rule, and it is plain `u64` arithmetic in `crates/shrugg-core/src/gas.rs`'s units
-(`UNITS_PER_SHRUGG = 10⁹`, so `subsidy_base = 100 × 10⁹`).
+RAND**, the schedule's asymptote, not a consensus cap anyone must enforce — the shift itself
+is the whole rule, and it is plain `u64` arithmetic in `crates/randprotocol-core/src/gas.rs`'s units
+(`UNITS_PER_RAND = 10⁹`, so `subsidy_base = 100 × 10⁹`).
 
 Per `docs/aggregation.md` §3.2, the subsidy rewards *coverage* — a fixed amount per sealed
 block, never per bundle — and it does not buy security: consensus weight stays with bonded
@@ -348,7 +348,7 @@ excess.**
 
 ### 5.3 Supply accounting
 
-`docs/supply.md`'s audit (`crates/shrugg-core/src/ledger/supply.rs`) gains four counters:
+`docs/supply.md`'s audit (`crates/randprotocol-core/src/ledger/supply.rs`) gains four counters:
 
 | counter | what it sums | when it moves |
 |---|---|---|
@@ -370,7 +370,7 @@ invariant:     total_supply == issued − slashed
 
 A slash destroys issuance (the bond was burned into `slashed`, not paid out), so `slashed`
 appears on the right-hand side; every other movement is a transfer between the two halves.
-`shrugg_getSupply` reports `subsidised`, `sealed_blocks`, `aggregator_bonds` and `slashed`
+`rand_getSupply` reports `subsidised`, `sealed_blocks`, `aggregator_bonds` and `slashed`
 separately from `faucet_minted`, so an auditor checks the schedule against `sealed_blocks`
 directly (§8).
 
@@ -420,7 +420,7 @@ the note tree, the nullifier set, the registers, the program records — and the
 path re-derives every one of those from a bundle's *public fields* (anchor, nullifiers,
 commitments, fee, burn, asset, time, envelopes). Proof bytes were never in the state root: they
 are witness data the ledger verifies and forgets, held in the node-local transaction store
-(`crates/shrugg-node/src/storage.rs`'s `CF_TXS`), which no root reads. Pruning touches only
+(`crates/randprotocol-node/src/storage.rs`'s `CF_TXS`), which no root reads. Pruning touches only
 that store, so two nodes — one pruned, one archival — derive the same state root at every
 height, and `verify_chain` on a pruned store reproduces the same ledger.
 
@@ -461,23 +461,23 @@ In `docs/rpc.md`'s conventions (and its changelog's shape — this entry states 
 wire format, block rules and consensus change: a hard fork, not an interop-compatible
 hardening):
 
-- **`shrugg_submitAggregate`** is `shrugg_sendTransaction` — no new path; `tx_json` renders the
+- **`rand_submitAggregate`** is `rand_sendTransaction` — no new path; `tx_json` renders the
   four new actions (`RegisterAggregator`, `UnbondAggregator`, `WithdrawAggregator`,
   `SlashAggregator`) and `Aggregate`.
-- **`shrugg_getBlockByHeight` / `shrugg_getBlockByHash`** gain `sealed` and per-bundle
+- **`rand_getBlockByHeight` / `rand_getBlockByHash`** gain `sealed` and per-bundle
   `sealed_by`.
-- **`shrugg_getAggregate(hash)`** returns the public fields: `covers`, `aggregator`,
+- **`rand_getAggregate(hash)`** returns the public fields: `covers`, `aggregator`,
   `subsidy`, `proving_share`, `n` (the schedule index).
-- **`shrugg_getAggregators`** lists the register (address, bond, payout, nonce, unbonding).
-- **`shrugg_getUnsealed(from, limit)`** pages the bundles an aggregator may still cover: hash,
+- **`rand_getAggregators`** lists the register (address, bond, payout, nonce, unbonding).
+- **`rand_getUnsealed(from, limit)`** pages the bundles an aggregator may still cover: hash,
   height, excess fee — the daemon's work list.
-- **`shrugg_getSupply`** gains `subsidised`, `sealed_blocks`, `aggregator_bonds`, `slashed`
+- **`rand_getSupply`** gains `subsidised`, `sealed_blocks`, `aggregator_bonds`, `slashed`
   (§5.3).
-- **`shrugg_status`** gains `aggregation: { registered, unsealed, verify_queue }` beside the
+- **`rand_status`** gains `aggregation: { registered, unsealed, verify_queue }` beside the
   existing fields.
-- The **node CLI** for the role: `shrugg-node aggregator register --bond --payout`, `unbond`,
-  `withdraw` (the validator commands' twins), and `shrugg-node aggregate --watch` — a daemon
-  that polls `shrugg_getUnsealed`, fetches the raw bundles, calls `recursion::aggregate` (CPU
+- The **node CLI** for the role: `rand-node aggregator register --bond --payout`, `unbond`,
+  `withdraw` (the validator commands' twins), and `rand-node aggregate --watch` — a daemon
+  that polls `rand_getUnsealed`, fetches the raw bundles, calls `recursion::aggregate` (CPU
   or, with M5.4, GPU), and submits. A separate process from the validator; needs only an RPC
   endpoint.
 
@@ -491,7 +491,7 @@ chain-8 bundle (§3.2.2 — the cover set is chain-9 blocks only), so chain 8's 
 unaggregated, unprunable under §6.2, and verified bundle-by-bundle as today. Chain 9's history
 starts unsealed and aggregates from its first finalised window. The chain-9 genesis carries the
 one admitted shape record (§2.3) with its two digests filled from measurement (§10), and the
-state root gains the `aggregators_root` component under `shrugg-state-3` from block 0.
+state root gains the `aggregators_root` component under `rand-state-3` from block 0.
 
 ## 10. Testing and activation sequencing
 

@@ -3,8 +3,8 @@
 > **Live on the shielded chain since phase S3.** A bridged holding is a **note**, not a balance.
 > `BridgeState` has no per-account balances at all — the S1 pool deleted the accounts they were
 > keyed by — so what a wallet "has" in a bridged asset is the notes of that asset its viewing key
-> opens, exactly as for SHRUGG. A note's `asset` word is the registry's dense `u32` index for the
-> asset; index 0 is SHRUGG. There is no `shrugg_getAssetBalance` and there never will be again.
+> opens, exactly as for RAND. A note's `asset` word is the registry's dense `u32` index for the
+> asset; index 0 is RAND. There is no `rand_getAssetBalance` and there never will be again.
 >
 > §§1–3 (the trust model, the wire format, guardian sets) are unchanged by any of that and are the
 > reference the shielded half is built on. §§4–9 describe the bridge as it stands now. §10 is what
@@ -18,7 +18,7 @@ storage/RPC/wallet surface built on them.
 ## 0. The bridge at a glance
 
 ```
-   source chain (Ethereum / BSC / Tron / Solana)                    Rand (SHRUGG)
+   source chain (Ethereum / BSC / Tron / Solana)                    Rand (RAND)
    ┌──────────────────────────────┐                                 ┌──────────────────────────────┐
    │ token contract / program     │  lock + emit Transfer           │ BridgeAttest transaction     │
    │   locks tokens, emits        │ ───────────────────────────────►│   admission: size cap → time │
@@ -30,7 +30,7 @@ storage/RPC/wallet surface built on them.
    after guardian │        │ guardian committee│ ◄──────────────────┤                              │
    signatures on  │        │ secp256k1 keys,   │                    │ BridgeBurn transaction       │
    the burn       │        │ rotated by the    │   guardians read   │   two bundles: one burns the │
-   message        │        │ governance emitter│   the burn log     │   asset, one pays the SHRUGG │
+   message        │        │ governance emitter│   the burn log     │   asset, one pays the RAND │
                   └────────┤ (Rand, sole)      │ ◄──────────────────┤   fee. Appends a             │
                            └──────────────────┘   sequence          │   BridgeBurnRecord           │
                                                                     └──────────────────────────────┘
@@ -63,7 +63,7 @@ source-chain header or state proof is ever verified on Rand.
 An **attestation** is a guardian-signed envelope: a body (metadata plus an opaque payload) and a
 threshold of ECDSA signatures over the body's digest. **Guardians** are a fixed committee of
 secp256k1 keys; a guardian's on-chain identity is the last 20 bytes of
-`keccak256(uncompressed_pubkey[1..])` (`crates/shrugg-core/src/bridge/mod.rs`) — Ethereum's
+`keccak256(uncompressed_pubkey[1..])` (`crates/randprotocol-core/src/bridge/mod.rs`) — Ethereum's
 address derivation, reused so the same key/address works across the EVM contracts, the Solana
 program, and Rand.
 
@@ -71,7 +71,7 @@ Quorum for a set of size `n` is `n*2/3 + 1` (`quorum`, `crates/bridge-codec/src/
 signature carries `r`, `s`, and recovery id `v`, and must be **low-s**: `s <= n/2` for the
 secp256k1 curve order, pinned as `SECP256K1_HALF_N` — a high-s signature is rejected outright,
 foreclosing signature malleability. The digest guardians sign is `mu =
-keccak256(keccak256(body_bytes))`, a double keccak (`crates/shrugg-core/src/bridge/mod.rs`).
+keccak256(keccak256(body_bytes))`, a double keccak (`crates/randprotocol-core/src/bridge/mod.rs`).
 
 A **governance emitter** is a fixed, non-guardian address Rand treats as the sole authorized
 source of guardian-set rotations: `keccak256("rand-bridge-governance")`, pinned as a literal
@@ -91,7 +91,7 @@ committee is the rotation rule in §3.
 truth for the byte layout shared by the Solidity contracts, the Solana program, and this
 fullnode. Its own doc comment: "hashing and ECDSA are deliberately NOT performed here; callers
 inject a keccak256 and a secp256k1 verifier" — kept out of the codec so it stays portable to
-whatever verifies it on the other chains; `shrugg-core` supplies both (`sha3`, `k256`).
+whatever verifies it on the other chains; `randprotocol-core` supplies both (`sha3`, `k256`).
 
 Every integer is big-endian. Wire version is `VERSION = 1` (`bridge-codec/src/lib.rs`);
 `Attestation::decode` rejects any other value as `CodecError::BadVersion`.
@@ -158,13 +158,13 @@ bytes yields `None`, mapped upstream to `BridgeError::AmountOverflow`.
 
 Decode rejects `n == 0` (`ZeroGuardians`), too few bytes (`Truncated`), or too many
 (`TrailingBytes`). The codec does not check `new_index == current + 1`, uniqueness, or non-zero
-keys — that is `shrugg-core`'s job; the codec has no notion of "current guardian set."
+keys — that is `randprotocol-core`'s job; the codec has no notion of "current guardian set."
 
 **Left-padding.** `to`, `token_address`, and `emitter_address` are fixed 32-byte slots, so the wire
 format is one chain-agnostic shape regardless of native address width. Ethereum/BSC/Tron addresses
 are 20 bytes, left-padded with 12 zero bytes. `bridge-codec` doesn't enforce this — it's chain-shape
 policy, not wire law — but `BridgeState::check_burn` does on the way out
-(`crates/shrugg-core/src/bridge/state.rs`): non-zero `to[..12]` is `BadRecipient` on chains 2/3/4,
+(`crates/randprotocol-core/src/bridge/state.rs`): non-zero `to[..12]` is `BadRecipient` on chains 2/3/4,
 and an all-zero `to` is `BadRecipient` everywhere. The wallet no longer restates those rules (the
 account era's `check_burn_recipient` went with the accounts): `wallet::submit_burn` pre-checks only
 the two things it would otherwise throw two bundle proofs away on — a zero amount and a relayer fee
@@ -172,7 +172,7 @@ larger than the amount — and leaves the rest to admission (§8).
 
 ## 3. Guardian sets
 
-`BridgeConfig` (`crates/shrugg-core/src/bridge/state.rs`) carries the genesis emitter address,
+`BridgeConfig` (`crates/randprotocol-core/src/bridge/state.rs`) carries the genesis emitter address,
 initial guardian keys, and per-source-chain emitter table, as human-readable hex JSON.
 `BridgeState::from_config` installs those keys as guardian set index 0, `current_set = 0`,
 `expires_at: 0` — "never expires."
@@ -204,16 +204,16 @@ expiry is never evaluated at `now = 0`. Every path that accepts a block goes thr
 other block rule), the node's catch-up sync, and `--verify-chain`'s replay — so none of them can
 drift from the rule. Regression test:
 `a_bridged_chain_refuses_a_block_whose_timestamp_rewinds_its_parents`
-(`crates/shrugg-core/src/ledger/mod.rs`), which also pins that an unbridged chain accepts the very
+(`crates/randprotocol-core/src/ledger/mod.rs`), which also pins that an unbridged chain accepts the very
 same rewind.
 
 Test coverage: `guardian_upgrade_must_be_signed_by_the_current_set`,
 `guardian_upgrade_rotates_with_grace_and_rejects_skips`,
-`upgrade_rejects_duplicate_and_zero_guardian_keys` (`crates/shrugg-core/src/bridge/state.rs`).
+`upgrade_rejects_duplicate_and_zero_guardian_keys` (`crates/randprotocol-core/src/bridge/state.rs`).
 
 ## 4. On-chain state: `BridgeState`
 
-`crates/shrugg-core/src/bridge/state.rs`:
+`crates/randprotocol-core/src/bridge/state.rs`:
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -232,12 +232,12 @@ a bridged holding is a note in the ledger's own commitment tree, and the tree is
 What is left here is the *public* half of the bridge — who may attest, which assets exist and under
 which index, which digests are consumed, and what has been burned outbound.
 
-`AssetId = blake3("shrugg-bridge-asset" || token_chain BE u16 || token_address)` — a pure,
+`AssetId = blake3("rand-bridge-asset" || token_chain BE u16 || token_address)` — a pure,
 domain-separated function of `(chain, address)`, computable even without a bridge (§6).
 
 **Asset indices.** A note's `asset` field is one word (`u32`), and a 32-byte `AssetId` does not fit
 in it, so the registry hands out dense indices in registration order: `FIRST_ASSET_INDEX = 1`, and
-0 is SHRUGG, which is never in the registry. The index is assigned at an asset's **first sighting**
+0 is RAND, which is never in the registry. The index is assigned at an asset's **first sighting**
 — the first accepted attestation naming it — and never changes afterwards. `next_index` is
 consensus state, not a cache: two nodes disagreeing about it would mint notes with different `asset`
 words from the same attestation. Bridged amounts must also fit a note's `u64`; a transfer above that
@@ -246,9 +246,9 @@ is `BridgeError::AmountTooLarge` rather than a truncated note.
 ### `root()` and what it commits
 
 ```
-blake3("shrugg-bridge-state"
+blake3("rand-bridge-state"
     || bincode(emitter, emitters, current_set, guardian_sets)
-    || merkle(blake3("shrugg-asset-registry" || asset || chain BE || token || index BE))
+    || merkle(blake3("rand-asset-registry" || asset || chain BE || token || index BE))
     || merkle(sorted spent digests)
     || burn_sequence BE || next_index BE)
 ```
@@ -270,8 +270,8 @@ commitment and the registry leaf gained an index — that re-pin *is* the hard f
 The bridge root folds into the chain's state root only when a bridge exists:
 
 ```
-state_root = blake3("shrugg-state-2" || tree_root || nullifier_root || validators_root || programs_root)
-           = blake3("shrugg-state-2" || … || programs_root || bridge_root)   with a `bridge` section
+state_root = blake3("rand-state-2" || tree_root || nullifier_root || validators_root || programs_root)
+           = blake3("rand-state-2" || … || programs_root || bridge_root)   with a `bridge` section
 ```
 
 A bridge-less chain commits exactly the 128 bytes phase S1 committed — byte-identical, no fifth
@@ -285,7 +285,7 @@ storage keeps one row per key. `meta()`/`from_parts()` destructure the struct fi
 purpose, so a new field must be classified as meta or column family or the build breaks.
 
 `Genesis::build` accepts a `bridge` section again (S1 rejected one outright) and validates it
-(`check_bridge`, `crates/shrugg-core/src/genesis.rs`): it rejects an empty guardian set, a duplicate
+(`check_bridge`, `crates/randprotocol-core/src/genesis.rs`): it rejects an empty guardian set, a duplicate
 or zero-value guardian key, a zero emitter, an emitter equal to the governance emitter, `CHAIN_RAND`
 as a source emitter, a source emitter equal to the governance emitter, and a zero-value source
 emitter. A genesis registers *no assets*: a registry starts empty and the first attestation to name
@@ -293,7 +293,7 @@ a token is what puts it in, under index 1.
 
 ## 5. Transactions
 
-Two `Action` variants (`crates/shrugg-core/src/types/transaction.rs`), bincode tags 7 and 8, after
+Two `Action` variants (`crates/randprotocol-core/src/types/transaction.rs`), bincode tags 7 and 8, after
 the three staking actions:
 
 ```
@@ -304,14 +304,14 @@ Action::BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee:
                      to_chain: u16, to: [u8; 32] }
 ```
 
-Both are carried by an ordinary shielded transaction, and both pay their fee in SHRUGG: an attest
+Both are carried by an ordinary shielded transaction, and both pay their fee in RAND: an attest
 pays `BUNDLE_BASE` (one bundle), a burn pays `2 * BUNDLE_BASE` (two), out of the one bundle allowed
 a non-zero fee. See `docs/confidential.md`'s fee table.
 
 ### Inbound: an attestation deposits a note
 
 - **The recipient is a hash on the wire.** The 32-byte `to` field of the `Transfer` payload is
-  `blake3("shrugg-shielded-recipient", pk || kem_ek)` of the recipient's shielded address
+  `blake3("rand-shielded-recipient", pk || kem_ek)` of the recipient's shielded address
   (`ShieldedAddress::recipient_hash`): a shielded address is about 1.2 KB and the wire format has
   room for a hash. The source-chain depositor names the hash, the guardians sign it, the submitter
   puts the full address in the action, and the ledger recomputes the hash and rejects a mismatch
@@ -346,15 +346,15 @@ a non-zero fee. See `docs/confidential.md`'s fee table.
 ```
 Transaction {
   chain_id,
-  bundle: <SHRUGG bundle: asset 0, burn 0, fee = 2 * BUNDLE_BASE>,   // pays for both bundles
+  bundle: <RAND bundle: asset 0, burn 0, fee = 2 * BUNDLE_BASE>,   // pays for both bundles
   action: BridgeBurn {
     asset_bundle: <bundle: asset = index, fee 0, burn = amount>,
     asset, amount, relayer_fee, to_chain, to }
 }
 ```
 
-A bundle balances one asset and the fee is always SHRUGG — the bundle guest's own rule is that a
-non-SHRUGG bundle's `fee` is zero — so a burn is the chain's only two-bundle transaction. The asset
+A bundle balances one asset and the fee is always RAND — the bundle guest's own rule is that a
+non-RAND bundle's `fee` is zero — so a burn is the chain's only two-bundle transaction. The asset
 bundle proves in the zkVM that the burner owned notes of that asset summing to at least `amount`,
 with `burn` the value leaving the pool — exactly `amount`, because the wire format's `relayer_fee`
 is a *portion* of the amount (`fee <= amount`), carved out on the destination chain by the release
@@ -371,7 +371,7 @@ sender identity — and the next `burn_sequence`; guardians read the burn log ex
 `Ledger::validate_inner` (`docs/shielded.md` §5, spec §7). What is bridge-specific:
 
 1. Size caps first, before a byte is parsed: `attestation.len() <= MAX_ATTESTATION_BYTES`
-   (16 KiB, `crates/shrugg-core/src/gas.rs`), each envelope ≤ 2048 bytes, and a burn's asset bundle
+   (16 KiB, `crates/randprotocol-core/src/gas.rs`), each envelope ≤ 2048 bytes, and a burn's asset bundle
    gets the caps every bundle gets (`tx.bundle` is only the fee bundle). A guardian set is at most
    255 keys by wire format, so anything past the cap is malformed by construction and must not buy
    verification work.
@@ -412,7 +412,7 @@ error (`BridgeError::BadPayload`), never a silent fall-through.
 
 ## 6. Storage, RPC, wallet
 
-**Storage** (`crates/shrugg-node/src/storage.rs`) — two RocksDB column families plus one `meta` key:
+**Storage** (`crates/randprotocol-node/src/storage.rs`) — two RocksDB column families plus one `meta` key:
 
 | Column family | Key | Value |
 |----------------|-----|-------|
@@ -428,26 +428,26 @@ height. Startup verification replays the chain and then compares the whole store
 the replayed one, which covers the bridge including the burn log the root deliberately leaves out
 (`verify_chain`; `verify_chain_replays_a_bridged_chain`).
 
-**RPC** (`crates/shrugg-node/src/rpc.rs`, `docs/rpc.md`) — four methods, none of them per-address:
+**RPC** (`crates/randprotocol-node/src/rpc.rs`, `docs/rpc.md`) — four methods, none of them per-address:
 
 | Method | Params | Result |
 |--------|--------|--------|
-| `shrugg_getBridgeState` | `[]` | emitter, emitter table, current guardian set, the registry, `next_index`, `burn_sequence`; `{"enabled": false}` with no bridge |
-| `shrugg_getAssets` | `[]` | the registry, ascending by index: `{ index, chain, token, asset_id }` |
-| `shrugg_bridgeAssetId` | `[token_chain, token_address]` | the asset id; pure arithmetic, answers on any chain |
-| `shrugg_getBridgeBurn` | `[sequence]` | one outbound message (`body_hex`, `digest`, `tx`, `height`), or `null` |
+| `rand_getBridgeState` | `[]` | emitter, emitter table, current guardian set, the registry, `next_index`, `burn_sequence`; `{"enabled": false}` with no bridge |
+| `rand_getAssets` | `[]` | the registry, ascending by index: `{ index, chain, token, asset_id }` |
+| `rand_bridgeAssetId` | `[token_chain, token_address]` | the asset id; pure arithmetic, answers on any chain |
+| `rand_getBridgeBurn` | `[sequence]` | one outbound message (`body_hex`, `digest`, `tx`, `height`), or `null` |
 
-`shrugg_getTransaction` renders a `bridge_attest` with the recipient, the action's `asset`, the
+`rand_getTransaction` renders a `bridge_attest` with the recipient, the action's `asset`, the
 `asset_index` and `amount` it decodes against the registry, the note's `time` and blinding `r`, and
 the `commitment` the chain computed from those fields — every word of the deposit note, which is
 what makes the recovery path below possible; a `bridge_burn` with its asset, amount, relayer fee,
 destination and the asset bundle's public fields. Balances are not among them — there are none.
 
-**Wallet** (`crates/shrugg-client`, `docs/cli.md`) — five commands:
+**Wallet** (`crates/randprotocol-client`, `docs/cli.md`) — five commands:
 
 | Command | Purpose |
 |---------|---------|
-| `bridge-mint <ATTESTATION>` | deposit an attestation (hex or `@path`): seal the recipient's envelope, pay with a bundle of this wallet's SHRUGG |
+| `bridge-mint <ATTESTATION>` | deposit an attestation (hex or `@path`): seal the recipient's envelope, pay with a bundle of this wallet's RAND |
 | `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | burn a bridged asset outbound; checks the bridge and the registry first, then proves **two** bundles |
 | `asset-balance [INDEX]` | what this wallet's own notes hold in one bridged asset, or a row per asset |
 | `bridge` | the bridge's public state |
@@ -459,7 +459,7 @@ recipient hash, the asset id and the index against the node before paying for a 
 signature work, because the envelope has to be sealed before the transaction exists.
 
 **Tests.** `bridge_mint_deposits_a_note_and_a_burn_spends_it`
-(`crates/shrugg-node/tests/cluster.rs`) runs the whole path across two validators on a bridged
+(`crates/randprotocol-node/tests/cluster.rs`) runs the whole path across two validators on a bridged
 genesis: an attestation deposits a note only its recipient's viewing key opens (the relayer who paid
 for it holds nothing), both nodes register the token under index 1, the same attestation resubmitted
 is refused as already consumed, and a two-bundle burn leaves the change as a note and an identical
@@ -469,14 +469,14 @@ outbound message on both nodes. The unit level is `bridge/state.rs` (the bridge'
 
 ## 7. Test vectors
 
-`crates/shrugg-core/src/bridge/vectors.json` is generated externally by a `tools/vectors` generator
+`crates/randprotocol-core/src/bridge/vectors.json` is generated externally by a `tools/vectors` generator
 in a separate "bridge repo" and copied in verbatim: top-level keys `guardians`,
 `governance_emitter`, `rand_emitter`, `emitters`, `now`, `vectors`, and **39 vectors** — named cases
 like `transfer_eth_usdt_6dp_ok`, `upgrade_signed_by_superseded_set`, `quorum_four`, `high_s`,
 `replay_eth`, `stale_governance_set`.
 
 One test pins them, at the signature level: `shared_vectors_match_verify`
-(`crates/shrugg-core/src/bridge/mod.rs`) re-verifies every vector whose `expect` is one of `ok,
+(`crates/randprotocol-core/src/bridge/mod.rs`) re-verifies every vector whose `expect` is one of `ok,
 no_quorum, index_order, index_out_of_range, bad_signature, high_s, wrong_guardian, set_expired,
 bad_version` against `bridge::verify`, checking the pinned digest (`ok`) or the exact `VerifyError`.
 `checked == 23` — an **exact** count, not a lower bound, so a vector that stops matching fails the
@@ -497,7 +497,7 @@ would no longer be caught here.
 ## 8. Known gaps
 
 - **No relayer is paid.** The `Transfer` payload carries a `fee` for whoever relays the attestation,
-  and on this chain nobody collects it: the deposit is minted gross and the submitter pays a SHRUGG
+  and on this chain nobody collects it: the deposit is minted gross and the submitter pays a RAND
   bundle fee out of its own notes for the privilege. Relaying is therefore altruistic (or paid out
   of band) until there is a way to pay an identity-less submitter.
 - **A deposit's envelope is bound to nothing, so the wallet does not depend on it.** Anyone may
@@ -516,7 +516,7 @@ would no longer be caught here.
 - **`bridge-burn` still learns about *some* bad arguments from the node, after paying for two
   proofs.** The wallet now pre-checks four things before any proving: a zero amount, a relayer fee
   above the amount, a chain with no bridge at all, and an asset index the registry does not hold —
-  the last two off one `shrugg_getBridgeState` read (`wallet::burn_is_possible`). What is left is
+  the last two off one `rand_getBridgeState` read (`wallet::burn_is_possible`). What is left is
   the bridge's own policy, which the wallet deliberately does not restate: a destination that is not
   that asset's home chain, and a recipient of the wrong shape, both still come back as a rejection
   once both bundles have been proved (three minutes).
@@ -546,7 +546,7 @@ now rides on the pool's machinery:
 - Deposit notes are appended to the same commitment tree as every other note and are
   indistinguishable from them once appended; they are committed by the tree, not by `bridge_root`.
 - The bridge's own work is still plain CPU cryptography: keccak256, secp256k1 recovery, and set
-  lookups. `bridge-codec` and `shrugg-core::bridge` import nothing confidential or zkVM-related.
+  lookups. `bridge-codec` and `randprotocol-core::bridge` import nothing confidential or zkVM-related.
 - The privacy of a bridged holding is the privacy of a note (§11), which is a strictly stronger
   claim than the account era could make, where a bridged balance was plain visible state.
 
@@ -562,7 +562,7 @@ For anyone holding an integration written against the pre-S1 bridge:
 | the registry mapped `AssetId -> (chain, token)` | it maps `AssetId -> { chain, token, index }`, and the note carries the index |
 | the relayer fee was paid to the submitter | inbound it is carried and paid to nobody (the deposit is gross); outbound it is still a portion of `amount`, paid on the destination chain, and a burn destroys exactly `amount` |
 | `BridgeBurn` was one account-debiting transaction | it is two bundles in one transaction |
-| `shrugg_getAssetBalance`, `bridge-status` | gone; `shrugg_getAssets` + a wallet-local `asset-balance` |
+| `rand_getAssetBalance`, `bridge-status` | gone; `rand_getAssets` + a wallet-local `asset-balance` |
 | the bridge root committed balance leaves | it commits registry leaves with indices, plus `next_index` |
 
 The last row is a consensus change: `BridgeState::root` was re-pinned in S3, so a bridged chain
@@ -589,10 +589,10 @@ mint.
 - Recipients on Rand are identified by a 32-byte hash of a shielded address, not a Dilithium2
   address. Wallets print it and source-chain front ends must accept it.
 - Amounts are `u64` in the bridged asset's own units after decimals; anything above `2⁶⁴ − 1` is
-  rejected at attestation time. Only index 0 (SHRUGG) has this chain's nine decimals — what a
+  rejected at attestation time. Only index 0 (RAND) has this chain's nine decimals — what a
   bridged token's smallest unit means belongs to its source chain.
-- The asset **index**, not the asset id, is what a note and a wallet carry; `shrugg_getAssets` maps
-  between them, and `shrugg_bridgeAssetId` computes an id for a token the registry has never seen.
+- The asset **index**, not the asset id, is what a note and a wallet carry; `rand_getAssets` maps
+  between them, and `rand_bridgeAssetId` computes an id for a token the registry has never seen.
 - A deposit of a token this chain has never seen is a first sighting, and the transaction has to
   name the index it will be given. Submit one at a time, or be ready to re-prove the loser.
-- A burn costs one SHRUGG fee bundle plus two proofs (~100 s each on a laptop today).
+- A burn costs one RAND fee bundle plus two proofs (~100 s each on a laptop today).

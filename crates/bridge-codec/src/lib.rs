@@ -40,7 +40,7 @@ pub const GUARDIAN_GRACE_SECS: u64 = 86_400;
 /// `cast keccak "rand-bridge-governance"`.
 ///
 /// This crate has no keccak256 of its own, so the value is pinned here as a
-/// literal; `shrugg-core` (Task A2) carries a test that hashes the string
+/// literal; `randprotocol-core` (Task A2) carries a test that hashes the string
 /// `"rand-bridge-governance"` and asserts it matches this constant.
 pub const GOVERNANCE_EMITTER: [u8; 32] = [
     0xb8, 0x6d, 0xc2, 0x9d, 0x18, 0x21, 0x46, 0x83, 0x1b, 0xe3, 0x19, 0xf8, 0xcd, 0xd0, 0xbe, 0x86,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Cut the chain-9 genesis: 18 validators, each staked at exactly the 1000 SHRUGG staking
-# minimum, each with its own payout wallet, five 1000 SHRUGG deposit notes, faucet on,
+# Cut the chain-9 genesis: 18 validators, each staked at exactly the 1000 RAND staking
+# minimum, each with its own payout wallet, five 1000 RAND deposit notes, faucet on,
 # production FRI, 1000-block epochs — and, new in chain 9, the `aggregation` section (block
 # aggregation, spec §2.3): the bond, the subsidy schedule, the window, and the one admitted
 # bundle shape with its aggregate program digest. A hard fork, like every chain before it.
@@ -13,7 +13,7 @@
 # this tree (so the script is reviewable end to end), NOT the production activation values.
 # What activation must replace before cutting for real — see docs/deploy.md, "Chain 9
 # activation": the shape's tier and the `aggregate_program_digest`, measured on the production
-# bundle (the startup key-build measures the digest: `shrugg-node` builds it from the shape
+# bundle (the startup key-build measures the digest: `rand-node` builds it from the shape
 # alone). Genesis validation refuses a zero digest, so the placeholder can never reach a
 # fleet; cutting with the test-profile values below is just as wrong for a production fleet —
 # the same refusal class, one level up: no fleet bundle would match the shape.
@@ -22,8 +22,8 @@
 # are chain-8's, keyed as in deploy/cut-chain8-genesis.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-NODE=${NODE:-target/release/shrugg-node}
-WALLET=${WALLET:-target/release/shrugg}
+NODE=${NODE:-target/release/rand-node}
+WALLET=${WALLET:-target/release/rand}
 CHAIN8=${CHAIN8:-deploy/genesis-chain8.json}
 ALLOC_WALLETS=${ALLOC_WALLETS:-wallets}          # shielded-{1..5}.key.json (gitignored)
 OUT=${OUT:-deploy/genesis-chain9.json}
@@ -74,7 +74,7 @@ for i in "${!regions[@]}"; do
   pk=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['validators'][6+int(sys.argv[2])]['public_key'])" "$CHAIN8" "$i")
   args+=(--validator "$pk,1000,$(payout "${regions[$i]}")")
 done
-# Five 1000 SHRUGG deposit notes, one per shielded wallet.
+# Five 1000 RAND deposit notes, one per shielded wallet.
 for i in 1 2 3 4 5; do
   args+=(--alloc "$("$WALLET" --key "$ALLOC_WALLETS/shielded-$i.key.json" address | tail -1)=1000")
 done

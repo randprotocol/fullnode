@@ -1,6 +1,6 @@
 # The Rand zkVM, milestone by milestone — what was built and why
 
-This is the history behind `crates/shrugg-zkvm` (vendored from the upstream `research` crate,
+This is the history behind `crates/randprotocol-zkvm` (vendored from the upstream `research` crate,
 `rand_zkvm`, in `randprotocol/circuits`). `docs/architecture.md` covers how the node is put
 together; `docs/confidential.md` covers what a confidential call looks like on this chain today.
 This document is the part in between: what each zkVM milestone actually built, why it was built
@@ -371,7 +371,7 @@ leak than the digest alone. After M3.4, the verifier holds only the 8-word diges
 instruction word, which is a real privacy gain, but `hc` itself is exactly as guessable as it always
 was (`research/docs/03-privacy.md`, "`hc` is now an in-circuit digest").
 
-**What changed on the node side.** `ZkExecutor::check_program` (`crates/shrugg-zkvm/src/
+**What changed on the node side.** `ZkExecutor::check_program` (`crates/randprotocol-zkvm/src/
 executor.rs`) computes `Program::digest()` and stores it as `ProgramRecord.code_hash` — `code_hash`
 is now the actual verification key material, 8 little-endian `u32` words, not an informational
 label (before this sync it was `blake3(program_id)` again, since the verifier used to take the
@@ -401,7 +401,7 @@ compiling CUDA at build time) and `gpu-kernels` (a `cuda-oxide` crate, pinned to
 `nightly-2026-08-28`, containing only the actual kernel code — NTT stages, Poseidon2 permutation
 and compression, byte transposes). `research` gains an optional `cuda` feature exposing
 `Backend::{Cpu, Cuda, Reference}` and `Machine::prove_with(backend, ...)`; the fullnode's
-`crates/shrugg-zkvm` mirrors that feature, and `shrugg call --cuda` is the client-facing flag,
+`crates/randprotocol-zkvm` mirrors that feature, and `rand call --cuda` is the client-facing flag,
 gated behind `cargo build --features cuda`. Every backend produces the exact same `Proof` type — the
 CPU verifier neither knows nor cares which backend produced a given proof.
 
@@ -411,8 +411,8 @@ device-side routine has a pure-Rust reference twin with an identical layout — 
 Plonky3's own CPU implementation, plus a mock CUDA driver that runs the "device" code path on the
 host. `Machine::prove_with(Backend::Reference)` proves and verifies every guest end to end this way,
 and that is the contract the real GPU path inherits once it exists. There is deliberately **no
-silent fallback**: `shrugg call --cuda` on a build without the `cuda` feature errors with "built
-without CUDA support; rebuild shrugg with --features cuda" rather than quietly running on the CPU,
+silent fallback**: `rand call --cuda` on a build without the `cuda` feature errors with "built
+without CUDA support; rebuild rand with --features cuda" rather than quietly running on the CPU,
 and a build with the feature but no usable device surfaces the underlying `CudaError` and exits
 non-zero (`docs/confidential.md`'s "GPU proving" section has the full failure-mode table).
 
@@ -499,5 +499,5 @@ Design specs and plans (`randprotocol/circuits/docs/superpowers/`):
 
 This repository: `docs/architecture.md` (how the node fits together), `docs/confidential.md` (the
 on-chain model, gas, and the constraint-set history from the node's point of view — the primary
-source for everything in §7), `crates/shrugg-zkvm/src/executor.rs` (the verifier glue), and
+source for everything in §7), `crates/randprotocol-zkvm/src/executor.rs` (the verifier glue), and
 `deploy/sync-zkvm.sh` (what is and is not vendored, and why).

@@ -1,0 +1,3031 @@
+//! Every test here builds a wrong witness and checks the verifier rejects it.
+//! In debug builds Plonky3 panics inside `prove_batch` on the first violated
+//! constraint — either one AIR's own row constraint, or (for a violation only
+//! visible across AIR instances, like an unpaid extra table multiplicity) the
+//! global lookup-balance check; in release builds it produces a proof that
+//! fails to verify. `rejects` accepts any of these — and nothing else.
+use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
+use p3_matrix::Matrix;
+use randprotocol_zkvm::asm::{ops::*, Assembler};
+use randprotocol_zkvm::emulator::{execute, CycleEvent, HashRow, MemAccess, Syscall, SLOT_W, SPACE_RAM};
+use randprotocol_zkvm::guests;
+use randprotocol_zkvm::isa::{AluOp, Decoded, Instr, Program, REG_A0, REG_A1, REG_A2, REG_A7, SYS_POSEIDON2};
+use randprotocol_zkvm::machine::{build_traces_salted, FriProfile, Machine, Tier, Traces, Val};
+use randprotocol_zkvm::tables::{alu, cpu, keccak, limbs, memory, nibble, poseidon2, program, range, F};
+
+/// `rejects()`, and the two constraint-panic prefixes it matches (`CONSTRAINT_PANIC` and
+/// `LOOKUP_BALANCE_PANIC`, referred to by name in the comments below), now live in
+/// `tests/common/mod.rs` so that `tests/viewing.rs` and `tests/bundle.rs` use this exact
+/// definition instead of their own weaker copies. The discipline it encodes is still this
+/// file's, and so is the test below that checks the helper itself.
+mod common;
+use common::rejects;
+
+#[test]
+fn rejects_only_counts_a_constraint_failure_or_a_verify_error() {
+    assert!(rejects(|| Err(randprotocol_zkvm::machine::VerifyError::PublicValues)));
+    assert!(rejects(|| panic!("constraints not satisfied on row 7: failed constraints = [#1]")));
+    assert!(rejects(|| panic!("Lookup mismatch (global lookup 'AND4'): tuple [\"9\", \"6\", \"0\"] has net multiplicity 1. Locations: []")));
+    // A trace-builder `assert!` is not the constraint system catching anything.
+    assert!(!rejects(|| panic!("alu table needs a padding row: 5 ops, height 4")));
+    assert!(!rejects(|| Ok(())));
+}
+
+fn setup() -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    (m, p, t)
+}
+
+#[test]
+fn honest_traces_pass() {
+    let (m, p, t) = setup();
+    let proof = m.prove_traces(&p, &t, Tier(10));
+    m.verify(&p.digest(), &proof).unwrap();
+}
+
+#[test]
+fn claiming_a_wrong_output_is_rejected() {
+    let (m, p, mut t) = setup();
+    t.public_values[cpu::pv::OUT0] = F::from_u32(56);   // fib(10) is 55
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+#[test]
+fn tampering_a_register_value_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = cpu::col::WIDTH;
+    t.cpu.values[3 * w + cpu::col::C] += F::ONE;         // row 3 writes a wrong rd
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+#[test]
+fn skipping_a_cycle_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = cpu::col::WIDTH;
+    let last = (0..t.cpu.height()).rev().find(|r| t.cpu.values[r * w + cpu::col::IS_REAL] == F::ONE).unwrap();
+    // mark the row before HALT as padding: the chain of pcs breaks
+    t.cpu.values[(last - 1) * w + cpu::col::IS_REAL] = F::ZERO;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+#[test]
+fn proof_for_one_program_does_not_verify_another() {
+    let m = Machine::new(FriProfile::Test);
+    let (proof, _) = m.prove(&guests::fib(10), &[], &[], None).unwrap();
+    assert!(rejects(|| m.verify(&guests::fib(11).digest(), &proof)));
+}
+
+#[test]
+fn wrong_tier_claim_is_rejected() {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let (mut proof, _) = m.prove(&p, &[], &[], None).unwrap();
+    proof.tier = Tier(12);
+    assert!(rejects(|| m.verify(&p.digest(), &proof)));
+}
+
+#[test]
+fn a_run_that_does_not_fit_the_tier_is_refused() {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::fib(300);   // ~1800 cycles > 2^10 - 1
+    assert!(matches!(m.prove(&p, &[], &[], Some(Tier(10))), Err(randprotocol_zkvm::machine::ProveError::TooManyCycles { .. })));
+    let (proof, _) = m.prove(&p, &[], &[], None).unwrap();
+    assert_eq!(proof.tier, Tier(12));
+}
+
+#[test]
+fn out_of_range_tier_is_an_error_not_a_panic() {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let (mut proof, _) = m.prove(&p, &[], &[], None).unwrap();
+    proof.tier = Tier(99);
+    proof.public_values[cpu::pv::TIER] = 99;
+    assert!(matches!(m.verify(&p.digest(), &proof), Err(randprotocol_zkvm::machine::VerifyError::Tier)));
+}
+
+/// M3.4: `pc_entry` is no longer independently checked against anything the verifier holds
+/// (there is no `program.base_pc` on the verifier's side any more) — it is read out of the
+/// proof and only bound *in-circuit* to the digest group's own `PC` (`tables::cpu`'s `eval`).
+/// So tampering it post-hoc (without re-proving) is still rejected, but now because the
+/// tampered public value no longer matches what the committed trace actually proves — a
+/// genuine STARK batch-verification failure, not the early `PublicValues` sanity check.
+#[test]
+fn wrong_entry_point_claim_is_rejected() {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let (mut proof, _) = m.prove(&p, &[], &[], None).unwrap();
+    proof.public_values[cpu::pv::PC_ENTRY] = 4;
+    assert!(rejects(|| m.verify(&p.digest(), &proof)));
+}
+
+/// Rewrite an honest `fib(10)` witness so that it claims `out0 = forged`, using nothing
+/// but a *padding* row of the ALU table as the source of the arithmetic that justifies it.
+///
+/// The ALU table provides `(op, a, b, c)` on the ALU bus with count `MULT`. On a padding
+/// row every op flag is zero — so the provided `op` decodes as `Add` — the limb range
+/// checks and every arithmetic constraint are gated on a flag or on `is_real`, and (before
+/// the `(1 − is_real)·MULT = 0` constraint) `MULT` itself was unconstrained. A padding row
+/// could therefore hand the CPU an arbitrary `Add` tuple with arbitrary multiplicity.
+///
+/// The rewrite is a closed edit: `mv a1, t0` (the instruction that stages the output word)
+/// is made to produce `forged` instead of `fib(10)`; the register file, every later `a1`
+/// read, the `WRITE_OUTPUT` row's `mem_val` and the public output word follow; the honest
+/// ALU row that provided the real tuple is retired to `MULT = 0` so the bus still balances,
+/// and the forged tuple is planted on the last (padding) ALU row. Nothing else moves.
+fn forge_fib_output_through_an_alu_padding_row(t: &mut Traces, forged: u32) {
+    let (wc, wm, wa) = (cpu::col::WIDTH, memory::col::WIDTH, alu::col::WIDTH);
+    let new = F::from_u32(forged);
+
+    // The `WRITE_OUTPUT` ecall, and the `mv a1, t0` immediately before it that stages a1.
+    let ecall_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * wc + cpu::col::SYS_WRITE] == F::ONE).expect("fib writes an output");
+    let mv_row = ecall_row - 1;
+    assert_eq!(t.cpu.values[mv_row * wc + cpu::col::IS_ALU], F::ONE, "row before the ecall is `mv a1, t0`");
+    assert_eq!(t.cpu.values[mv_row * wc + cpu::col::RD], F::from_u32(REG_A1));
+    let a_in = t.cpu.values[mv_row * wc + cpu::col::A];
+    let honest = t.cpu.values[mv_row * wc + cpu::col::C];
+    let write_ts = 4 * t.cpu.values[mv_row * wc + cpu::col::CLK].as_canonical_u64() + SLOT_W as u64;
+
+    // cpu: the `mv` now yields `forged`, and every later ecall reads the new a1.
+    t.cpu.values[mv_row * wc + cpu::col::ALU_OUT] = new;
+    t.cpu.values[mv_row * wc + cpu::col::C] = new;
+    for r in mv_row + 1..t.cpu.height() {
+        if t.cpu.values[r * wc + cpu::col::IS_ECALL] == F::ONE { t.cpu.values[r * wc + cpu::col::MEM_VAL] = new; }
+    }
+    t.public_values[cpu::pv::OUT0] = new;
+
+    // memory: a1's write and every read of it afterwards.
+    for r in 0..t.memory.height() {
+        let row = &mut t.memory.values[r * wm..(r + 1) * wm];
+        if row[memory::col::IS_REAL] == F::ONE
+            && row[memory::col::SPACE] == F::ZERO
+            && row[memory::col::ADDR] == F::from_u32(REG_A1)
+            && row[memory::col::TS].as_canonical_u64() >= write_ts
+        {
+            row[memory::col::VALUE] = new;
+        }
+    }
+
+    // alu: retire one honest provider of the real tuple, plant the forged one on padding.
+    let honest_row = (0..t.alu.height())
+        .find(|r| {
+            let row = &t.alu.values[r * wa..(r + 1) * wa];
+            row[alu::col::FLAG0] == F::ONE && row[alu::col::A] == a_in && row[alu::col::B] == F::ZERO && row[alu::col::C] == honest && row[alu::col::MULT] != F::ZERO
+        })
+        .expect("the honest (Add, a, 0, c) tuple is provided somewhere");
+    t.alu.values[honest_row * wa + alu::col::MULT] = F::ZERO;
+    let pad = t.alu.height() - 1;
+    assert_eq!(t.alu.values[pad * wa + alu::col::IS_REAL], F::ZERO, "last alu row is padding");
+    t.alu.values[pad * wa + alu::col::A] = a_in;
+    t.alu.values[pad * wa + alu::col::B] = F::ZERO;
+    t.alu.values[pad * wa + alu::col::C] = new;
+    // `word(A0) = A` and `word(C0) = C` are the only ungated constraints that touch these
+    // columns, and the limbs' `RANGE8` lookups are counted by `is_real` — so parking the
+    // whole word in limb 0 satisfies the recomposition with no range check to answer to.
+    t.alu.values[pad * wa + alu::col::A0] = a_in;
+    t.alu.values[pad * wa + alu::col::C0] = new;
+    t.alu.values[pad * wa + alu::col::MULT] = F::ONE;
+}
+
+#[test]
+fn a_tuple_forged_on_an_alu_padding_row_is_rejected() {
+    let (m, p, mut t) = setup();
+    forge_fib_output_through_an_alu_padding_row(&mut t, 999); // fib(10) is 55
+    assert_eq!(t.public_values[cpu::pv::OUT0], F::from_u32(999));
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+
+#[test]
+fn claiming_a_word_in_an_unwritten_output_slot_is_rejected() {
+    let (m, p, mut t) = setup();
+    // `fib` writes slot 0 only; spec §3.4 says every slot no WRITE_OUTPUT selected is zero.
+    assert_eq!(t.public_values[cpu::pv::OUT0 + 1], F::ZERO);
+    t.public_values[cpu::pv::OUT0 + 1] = F::from_u32(7);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+#[test]
+fn non_canonical_public_values_are_an_error_not_a_panic() {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let (mut proof, _) = m.prove(&p, &[], &[], None).unwrap();
+    m.verify(&p.digest(), &proof).unwrap();
+    // `Val::from_u64` does not reduce, so `out0 + p` is the same field element and would
+    // otherwise verify — with a different `to_bytes()` and a different apparent output.
+    proof.public_values[cpu::pv::OUT0] += F::ORDER_U64;
+    assert!(matches!(m.verify(&p.digest(), &proof), Err(randprotocol_zkvm::machine::VerifyError::PublicValues)));
+}
+
+#[test]
+fn bumping_a_program_multiplicity_on_a_padding_row_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = program::col::WIDTH;
+    let pad = t.program.height() - 1; // the table is padded past the last instruction
+    assert!(pad >= p.len(), "last program row is padding");
+    t.program.values[pad * w + program::col::MULT] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// The `MULT_WORD` (M3.4 digest-row fetch count) sibling of the test above: a padding row
+/// (`valid = 0`) must never answer a `PROGRAM_WORD` lookup either — `mult_word = valid` (the
+/// fix in `an_undigested_reachable_program_tail_is_rejected`, below) forces `mult_word = 0`
+/// there too, same as the weaker constraint it replaced did on this padding-row case.
+#[test]
+fn a_bumped_program_word_multiplicity_on_a_padding_row_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = program::col::WIDTH;
+    let pad = t.program.height() - 1;
+    assert!(pad >= p.len(), "last program row is padding");
+    t.program.values[pad * w + program::col::MULT_WORD] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+#[test]
+fn swapping_two_adjacent_memory_rows_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = memory::col::WIDTH;
+    let real = (0..t.memory.height()).filter(|r| t.memory.values[r * w + memory::col::IS_REAL] == F::ONE).count();
+    assert!(real > 4, "fib(10) touches memory plenty");
+    // Swapping whole rows leaves the MEMORY multiset and the RANGE8 counts untouched, so
+    // both buses still balance: the only thing that can catch this is the ordering AIR.
+    let r = real / 2;
+    for k in 0..w { t.memory.values.swap(r * w + k, (r + 1) * w + k); }
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+#[test]
+fn bumping_a_range_pow2_multiplicity_on_a_non_pow2_row_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = range::col::WIDTH;
+    let row = 200usize; // a=200 ≥ 32, so is_pow2 is 0 here
+    t.range.values[row * w + range::col::M_POW2] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+#[test]
+fn bumping_a_nibble_and_multiplicity_on_a_padding_row_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = nibble::col::WIDTH;
+    let row = nibble::row_of(9, 6); // an arbitrary valid nibble pair the honest trace never counts
+    t.nibble.values[row * w + nibble::col::M_AND] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// The memory-path mirror of `forge_fib_output_through_an_alu_padding_row`, ported to
+/// M2.5's read-modify-write store: an honest `store 5; load; output` witness is rewritten
+/// so the `SW` delivers a value that was never in any register. Before the CPU pinned
+/// `MEM_VAL = B` on store rows (`2c8a39d`), nothing tied the value sent on the MEMORY bus
+/// to the register the store reads. M2.5 replaced that single pin with the `MERGED0..3`
+/// formula (`MERGED_k = W_k + selp(k)*(bp(k) - W_k)`, `bp` built from `RB0..3`, and
+/// `is_store*(B - word(RB0))=0` ties `RB0..3` to `B`): on this program's plain `SW`
+/// (`off=0`), `selp(k)=1` for every `k`, so the formula forces `MERGED = word(RB0) = B`
+/// structurally. This helper forges `MERGED0..3` directly — bypassing `RB0..3`/`B`, which
+/// stay untouched and honestly show `5` — so the row constraint above must reject it,
+/// exactly as `2c8a39d`'s `MEM_VAL = B` pin did for the old single-column design.
+fn forge_a_store(t: &mut Traces, forged: u32) {
+    use randprotocol_zkvm::tables::limbs;
+    let (wc, wm) = (cpu::col::WIDTH, memory::col::WIDTH);
+    let new = F::from_u32(forged);
+    let nl = limbs(forged);
+
+    // cpu: the store's own MERGED (the value actually written), the load that reads it
+    // back (its own, independent MEM_VAL/W0..3 word witness), the `mv a1, t1` staging the
+    // output word, and every ecall row (each reads `a1` through the memory slot).
+    for r in 0..t.cpu.height() {
+        let row = &mut t.cpu.values[r * wc..(r + 1) * wc];
+        if row[cpu::col::IS_SW] == F::ONE { for k in 0..4 { row[cpu::col::MERGED0 + k] = nl[k]; } }
+        if row[cpu::col::IS_LW] == F::ONE {
+            row[cpu::col::MEM_VAL] = new;
+            for k in 0..4 { row[cpu::col::W0 + k] = nl[k]; }
+            row[cpu::col::C] = new;
+        }
+        if row[cpu::col::IS_ECALL] == F::ONE { row[cpu::col::MEM_VAL] = new; }
+        if row[cpu::col::IS_ALU] == F::ONE && row[cpu::col::RD] == F::from_u32(REG_A1) && row[cpu::col::RS1] == F::from_u32(6) {
+            row[cpu::col::A] = new; row[cpu::col::ALU_OUT] = new; row[cpu::col::C] = new;
+        }
+    }
+    // memory: the RAM cell, and registers t1 (the load's write, the mv's read) and a1.
+    for r in 0..t.memory.height() {
+        let row = &mut t.memory.values[r * wm..(r + 1) * wm];
+        if row[memory::col::IS_REAL] != F::ONE { continue; }
+        let ram = row[memory::col::SPACE] == F::ONE;
+        let addr = row[memory::col::ADDR];
+        if ram && addr == F::from_u32(0x400) { row[memory::col::VALUE] = new; }
+        if !ram && (addr == F::from_u32(6) || addr == F::from_u32(REG_A1)) { row[memory::col::VALUE] = new; }
+    }
+    t.public_values[cpu::pv::OUT0] = new;
+}
+
+#[test]
+fn storing_a_value_that_was_never_in_a_register_is_rejected() {
+    // li s0, 0x1000 ; li t0, 5 ; sw t0, 0(s0) ; lw t1, 0(s0) ; write_output(0, t1) ; halt
+    let mut a = Assembler::new(0);
+    a.extend(li(8, 0x1000)); a.extend(li(5, 5));
+    a.push(sw(8, 5, 0)); a.push(lw(6, 8, 0));
+    a.extend(write_output(0, 6)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 5);
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    forge_a_store(&mut t, 0x0500_0000);
+    assert_eq!(t.public_values[cpu::pv::OUT0], F::from_u32(0x0500_0000));
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M2.4 regression: bitwise rows (`and`/`or`/`xor`) no longer RANGE8-check their
+/// `A0..3`/`B0..3`/`C0..3` limbs (`g_ab` is 0 there) — those limbs are now bound
+/// solely by the nibble lookups. This bumps the RANGE8 table's own multiplicity at
+/// a value that appears as this `and` row's `A0` limb (0x12): nothing on the AND
+/// row (or, on inspection, anywhere else in this tiny program) asks the RANGE8 bus
+/// for one more count of 0x12, so the bus no longer balances and the proof must
+/// fail — confirming the dropped gate didn't leave a residual, silent RANGE8 demand
+/// for this limb.
+#[test]
+fn bumping_range8_on_a_bitwise_rows_now_unconstrained_a_limb_is_rejected() {
+    let mut a = Assembler::new(0);
+    a.extend(li(5, 0x12)); a.extend(li(6, 0x34));
+    a.push(and(7, 5, 6)); a.extend(write_output(0, 7)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    t.range.values[0x12 * range::col::WIDTH + range::col::M_RANGE] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M2.4 regression: `slt`/`sltu`/`eq` rows no longer RANGE8-check their `C0..3`
+/// limb (`g_c` is 0 there) — `C` is bound instead by `(cmp+eq)*C*(C-1)=0`. This
+/// bumps the RANGE8 table's multiplicity at value 1 (this `slt` row's `C`, and
+/// hence `C0`); the RANGE8 bus no longer has a matching demand for that extra
+/// count, so the proof must fail.
+#[test]
+fn bumping_range8_on_an_slt_rows_now_unconstrained_c_limb_is_rejected() {
+    let mut a = Assembler::new(0);
+    a.extend(li(5, 3)); a.extend(li(6, 9));
+    a.push(slt(7, 5, 6)); a.extend(write_output(0, 7)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    t.range.values[range::col::WIDTH + range::col::M_RANGE] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M2.5: a store's `MERGED0..3` is the read-modify-write result, bound per byte by
+/// `MERGED_k = W_k + selp(k)*(bp(k) - W_k)`. Corrupting one limb to disagree with that
+/// formula — even while leaving the *aggregate* value looking plausible — must be caught
+/// by the row constraint directly, not just by an accidental downstream mismatch.
+#[test]
+fn a_store_that_replaces_the_wrong_byte_is_rejected() {
+    let mut a = Assembler::new(0);
+    a.extend(li(8, 0x1000)); a.extend(li(5, 0x11223344u32 as i32)); a.extend(li(6, 0xff));
+    a.push(sw(8, 5, 0)); a.push(sb(8, 6, 0)); // sets byte 0 to 0xff: word becomes 0x112233ff
+    a.push(lw(7, 8, 0)); a.extend(write_output(0, 7)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 0x112233ff);
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = cpu::col::WIDTH;
+    // Find the SB row and corrupt MERGED to replace byte 1 instead of byte 0.
+    let sb_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_SB] == F::ONE).unwrap();
+    t.cpu.values[sb_row * w + cpu::col::MERGED0] = F::from_u32(0x44);     // put the old byte 0 back
+    t.cpu.values[sb_row * w + cpu::col::MERGED0 + 1] = F::from_u32(0xff); // and corrupt byte 1 instead
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M2.5: `LB`'s sign extension runs through `SGN`, itself bound to the sign-relevant
+/// byte's true top bit only via the `AND4[HI, 8, SGN*8]` lookup — flipping `SGN` (and `C`
+/// to match, so the row's own `C` pin stays self-consistent) must be caught by that
+/// lookup disagreeing with the nibble table, not by the `C` pin alone.
+#[test]
+fn a_load_byte_with_flipped_sign_extension_is_rejected() {
+    let mut a = Assembler::new(0);
+    a.extend(li(8, 0x1000)); a.extend(li(5, 0xffu32 as i32)); // byte 0xff, top bit set
+    a.push(sw(8, 5, 0)); a.push(lb(6, 8, 0)); // LB sign-extends: -1 = 0xffffffff
+    a.extend(write_output(0, 6)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 0xffff_ffff);
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = cpu::col::WIDTH;
+    let lb_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_LB] == F::ONE).unwrap();
+    t.cpu.values[lb_row * w + cpu::col::SGN] = F::ZERO; // flip: claim unsigned-looking zero-extend
+    t.cpu.values[lb_row * w + cpu::col::C] = F::from_u32(0xff);
+    t.public_values[cpu::pv::OUT0] = F::from_u32(0xff);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M2.5: `IS_LH*OFF0 = 0` is the stated alignment constraint for halfwords — a retagged
+/// row claiming `LH` at an odd byte offset must be rejected by the AIR, not merely
+/// unreachable through the emulator.
+#[test]
+fn a_misaligned_lh_is_rejected_by_the_air() {
+    let mut a = Assembler::new(0);
+    a.extend(li(8, 0x1000)); a.extend(li(5, 0x1234)); a.push(sw(8, 5, 0));
+    a.push(lw(6, 8, 0)); // an ordinary LW so the trace has a row to repurpose
+    a.extend(write_output(0, 6)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = cpu::col::WIDTH;
+    let lw_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_LW] == F::ONE).unwrap();
+    // Retag this LW row as an LH with OFF0=1 (byte offset 1 — misaligned for a half).
+    t.cpu.values[lw_row * w + cpu::col::IS_LW] = F::ZERO;
+    t.cpu.values[lw_row * w + cpu::col::IS_LH] = F::ONE;
+    t.cpu.values[lw_row * w + cpu::col::OFF0] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M2.5: `SB`'s per-byte `MERGED` formula pins `selp(k)=0` for every byte outside `off`,
+/// forcing `MERGED_k = W_k` there — corrupting a byte the store never touches must be
+/// caught even though the touched byte (`off`) is still correct.
+#[test]
+fn a_sb_that_changes_a_byte_outside_its_offset_is_rejected() {
+    let mut a = Assembler::new(0);
+    a.extend(li(8, 0x1000)); a.extend(li(5, 0x11223344u32 as i32)); a.extend(li(6, 0xff));
+    a.push(sw(8, 5, 0)); a.push(sb(8, 6, 1)); // sets byte 1 only: word becomes 0x1122ff44
+    a.push(lw(7, 8, 0)); a.extend(write_output(0, 7)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 0x1122ff44);
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = cpu::col::WIDTH;
+    let sb_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_SB] == F::ONE).unwrap();
+    // Also corrupt byte 2 (outside off=1), leaving byte 1 correct.
+    t.cpu.values[sb_row * w + cpu::col::MERGED0 + 2] = F::from_u32(0x00);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ---------------------------------------------------------------------------------------
+// M2.6: the RV32M extension.
+// ---------------------------------------------------------------------------------------
+
+fn find_alu_row(t: &Traces, op: randprotocol_zkvm::isa::AluOp) -> usize {
+    let w = alu::col::WIDTH;
+    (0..t.alu.height())
+        .find(|r| t.alu.values[r * w + alu::col::FLAG0 + op.code() as usize] == F::ONE)
+        .unwrap_or_else(|| panic!("no ALU row for {op:?}"))
+}
+
+/// The spec's own `HI = 2^32-1, LO = A*B + 1` product attack: `MULHU(3, 4)` has true
+/// `HI = 0` (3*4 = 12 fits in 32 bits). Forging `HI = 0xffff_ffff` needs `CARRY =
+/// 0xffff_ffff` (since `T2 = 0` here), but `CARRY`'s own decomposition is only 3 RANGE8
+/// limbs (`S1..3`, bounding it to `< 2^24`) — a 4-byte value has no valid encoding there,
+/// so `CARRY - carry_limbs = 0` fails directly.
+#[test]
+fn mulhu_cannot_claim_hi_equals_2_32_minus_1_for_a_small_product() {
+    let mut a = Assembler::new(0);
+    a.extend(li(5, 3)); a.extend(li(6, 4));
+    a.push(mulhu(7, 5, 6)); a.extend(write_output(0, 7)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 0);
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = alu::col::WIDTH;
+    let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Mulhu);
+    let forged_carry = 0xffff_ffffu32; // would make HI = T2 + CARRY = 0xffff_ffff
+    t.alu.values[row * w + alu::col::Q0 + 3] = F::from_u32(forged_carry); // CARRY column
+    // Only 3 limb columns exist for CARRY (S1..3): the forged value's low 3 bytes, dropping
+    // the 4th — carry_limbs can only ever reconstruct a < 2^24 value.
+    t.alu.values[row * w + alu::col::S0 + 1] = F::from_u32(forged_carry & 0xff);
+    t.alu.values[row * w + alu::col::S0 + 2] = F::from_u32((forged_carry >> 8) & 0xff);
+    t.alu.values[row * w + alu::col::S0 + 3] = F::from_u32((forged_carry >> 16) & 0xff);
+    t.alu.values[row * w + alu::col::C] = F::from_u32(0xffff_ffff);
+    for k in 0..4 { t.alu.values[row * w + alu::col::C0 + k] = F::from_u32(0xff); }
+    t.public_values[cpu::pv::OUT0] = F::from_u32(0xffff_ffff);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// A supplementary test for the fix this table needed beyond the spec sketch: `LO`'s own
+/// byte limbs (`T0..3`) are range-checked *unconditionally* on every mul-family row, not
+/// just `mul` rows — without that, a `MULHU`-only row's `HI = T2 + CARRY` check alone does
+/// not pin `CARRY` (see the `alu` module doc comment's uniqueness argument), so a forged
+/// `CARRY` that still fits the 3-limb `< 2^24` bound (unlike the attack above) would
+/// otherwise pass. `MULHU(3, 4)`: honest `CARRY = 0`; forging `CARRY = 100` (well within
+/// the 3-limb bound) must still be rejected, this time via the `LO` recomposition
+/// (`word(T0..3) = T0 + 2^16*T1 - 2^32*CARRY`) disagreeing.
+#[test]
+fn a_small_in_range_forged_carry_on_a_mulhu_row_is_still_rejected() {
+    let mut a = Assembler::new(0);
+    a.extend(li(5, 3)); a.extend(li(6, 4));
+    a.push(mulhu(7, 5, 6)); a.extend(write_output(0, 7)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 0);
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = alu::col::WIDTH;
+    let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Mulhu);
+    let forged_carry = 100u32; // < 2^24, so the CARRY-limb check alone does not catch this
+    t.alu.values[row * w + alu::col::Q0 + 3] = F::from_u32(forged_carry);
+    t.alu.values[row * w + alu::col::S0 + 1] = F::from_u32(forged_carry & 0xff);
+    t.alu.values[row * w + alu::col::S0 + 2] = F::ZERO;
+    t.alu.values[row * w + alu::col::S0 + 3] = F::ZERO;
+    t.alu.values[row * w + alu::col::C] = F::from_u32(100); // T2 (= 0 here) + forged CARRY
+    t.alu.values[row * w + alu::col::C0] = F::from_u32(100);
+    t.public_values[cpu::pv::OUT0] = F::from_u32(100);
+    // T0..3 (LO's own limbs) are left at their honest value (12, from the real 3*4 = 12),
+    // which now disagrees with `T0 + 2^16*T1 - 2^32*CARRY` for the forged CARRY.
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `R >= B`: `REMU(17, 5) = 2` (`17 = 3*5 + 2`). Re-decompose as `q=2, r=7` — the core
+/// identity `|A| = Q*|B| + R` still holds (`17 = 2*5 + 7`) — but `7 >= 5` violates
+/// `R < |B|`. Kept otherwise self-consistent (`C`, the magnitude-zero gadget's `INV`) so the
+/// only constraint that can catch this is the `R < |B|` range check on `|B| - R - 1`, which
+/// has no valid witness once `R >= |B|` (the difference is not representable as 4
+/// non-negative bytes for any choice of the diff-limb columns).
+#[test]
+fn a_remainder_not_smaller_than_the_divisor_is_rejected() {
+    let mut a = Assembler::new(0);
+    a.extend(li(5, 17)); a.extend(li(6, 5));
+    a.push(remu(7, 5, 6)); a.extend(write_output(0, 7)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 2);
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = alu::col::WIDTH;
+    let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Remu);
+    t.alu.values[row * w + alu::col::Q0] = F::from_u32(2); // quotient core: 3 -> 2
+    t.alu.values[row * w + alu::col::S0] = F::from_u32(7); // remainder core: 2 -> 7 (>= B = 5)
+    t.alu.values[row * w + alu::col::C] = F::from_u32(7);
+    t.alu.values[row * w + alu::col::C0] = F::from_u32(7);
+    t.alu.values[row * w + alu::col::INV] = F::from_u32(7).inverse(); // keep the mag-zero gadget honest
+    t.public_values[cpu::pv::OUT0] = F::from_u32(7);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// A wrong `DIVZ` on a nonzero divisor: `DIVU(10, 3) = 3` (`B = 3 != 0`). The naive
+/// single-equation is-zero gadget (`B*INVB = 1-DIVZ`) alone is bypassable — set `INVB = 0`
+/// and `DIVZ = 1`, satisfying `3*0 = 1-1 = 0` — which is exactly why the table also asserts
+/// `DIVZ*B = 0`: with `B = 3` and `DIVZ = 1` forged, `1*3 = 3 != 0` catches it.
+#[test]
+fn a_wrong_divz_on_a_nonzero_divisor_is_rejected() {
+    let mut a = Assembler::new(0);
+    a.extend(li(5, 10)); a.extend(li(6, 3));
+    a.push(divu(7, 5, 6)); a.extend(write_output(0, 7)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 3);
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = alu::col::WIDTH;
+    let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Divu);
+    t.alu.values[row * w + alu::col::DIVZ] = F::ONE; // B = 3 != 0, but claim DIVZ
+    t.alu.values[row * w + alu::col::INVB] = F::ZERO; // ... and try to smuggle it past B*INVB=1-DIVZ
+    t.alu.values[row * w + alu::col::C] = F::from_u32(0xffff_ffff);
+    for k in 0..4 { t.alu.values[row * w + alu::col::C0 + k] = F::from_u32(0xff); }
+    t.public_values[cpu::pv::OUT0] = F::from_u32(0xffff_ffff);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M2.6 regression. An earlier version of this test set `MULT = 1` on the forged row, which
+/// (with `IS_REAL = 0`) always fails the older, independent `(1-IS_REAL)*MULT = 0`
+/// padding-row invariant regardless of what the one-hot sum/boolean loop (`for i in
+/// 0..AluOp::COUNT { assert_bool; sum += flag_i }`, checked against `sum == is_real`)
+/// covers — masking whether the loop actually visits all 19 flags or was silently left at
+/// the old 11. This version leaves `MULT = 0` (and `A`/`B`/`C` at their padding-row default
+/// of zero) and sets *only* the `Mul` flag (index 11), so `(1-IS_REAL)*MULT = (1-0)*0 = 0`
+/// holds and that older invariant cannot fire.
+///
+/// This is *not*, however, a single-constraint regression guard for the sum/boolean loop
+/// specifically — confirmed by directly checking, not assumed: shrinking that loop to
+/// `0..11` (so it never visits index 11) still rejects this exact row, but via a different
+/// mechanism entirely. Setting `FLAG0 + 11` also sets `is_mul = mul+mulh+mulhu+mulhsu` to 1,
+/// which activates `mul`'s *unconditional* `RANGE8` lookups on `S1, S2, S3` (`CARRY`'s own
+/// limbs) and `T0..3` (`LO`'s own limbs) — seven lookups against value `0` (the padding
+/// row's untouched default for those columns) with no corresponding honest `fill_row` call
+/// to have accounted for them. That imbalances the global `RANGE8` bus regardless of the
+/// sum/boolean loop's range, confirmed directly: on a guest with zero other mul-family rows
+/// (so no other row's lookups mask the count), the ablated build fails with `Lookup mismatch
+/// (global lookup 'RANGE8'): tuple ["0"] has net multiplicity 7` — exactly those seven. So
+/// this row is doubly protected (the sum/boolean loop *and* the mul-family's own
+/// unconditional range checks), which is why it cannot cleanly isolate either one — see the
+/// task-6 fix report for the full experiment.
+#[test]
+fn a_mul_flag_set_on_an_otherwise_all_zero_padding_row_is_rejected() {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::muldiv();
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let wa = alu::col::WIDTH;
+    let pad = t.alu.height() - 1;
+    assert_eq!(t.alu.values[pad * wa + alu::col::IS_REAL], F::ZERO, "last alu row is padding");
+    assert_eq!(t.alu.values[pad * wa + alu::col::MULT], F::ZERO, "padding row's MULT starts at 0");
+    // Set only the `Mul` flag; `A`, `B`, `C` (and every other column) stay at the padding
+    // row's default zero, and `MULT` stays 0 — `(1-IS_REAL)*MULT = 0` holds regardless.
+    t.alu.values[pad * wa + alu::col::FLAG0 + randprotocol_zkvm::isa::AluOp::Mul.code() as usize] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// A sign flip on `MULH`: `MULH(-2, -3) = 0` (`(-2)*(-3) = 6`, fits in the low word). Flip
+/// `SA` (claim `A`'s sign is positive when it is actually negative) while leaving the
+/// sign-correction `borrow` and `C` as the honest solver found them — the `HI_signed = HI -
+/// SA*B - SB*A + borrow*2^32` identity now disagrees with `C`.
+#[test]
+fn a_sign_flipped_mulh_is_rejected() {
+    let mut a = Assembler::new(0);
+    a.extend(li(5, -2)); a.extend(li(6, -3)); // (-2)*(-3) = 6, MULH = 0
+    a.push(mulh(7, 5, 6)); a.extend(write_output(0, 7)); a.extend(halt());
+    let p = a.assemble();
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 0);
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = alu::col::WIDTH;
+    let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Mulh);
+    assert_eq!(t.alu.values[row * w + alu::col::SA], F::ONE, "A = -2 is negative");
+    t.alu.values[row * w + alu::col::SA] = F::ZERO; // flip A's claimed sign
+    // `C` (0) and `borrow` are left as the honest solver set them: `rejects()` only needs a
+    // genuine mismatch, and the public output stays whatever the (now-inconsistent) row
+    // claims so `verify` doesn't reject on a public-value mismatch instead.
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M3.1: the Poseidon2 table's round-transition constraints are gated by the *preprocessed*
+/// `IS_FULL`/`IS_PARTIAL`/idle selectors, not by the main column `IS_REAL` — so they run on
+/// every block, including the all-padding blocks `build_traces` currently produces (the
+/// emulator doesn't call `POSEIDON2` until M3.2; see `tables::poseidon2`'s module doc
+/// comment). That means these three cheating tests need no real event at all: tampering any
+/// padding block's own honest, self-consistent permutation trace is already enough to trip
+/// the AIR.
+#[test]
+fn tampering_a_poseidon2_x7_column_is_rejected() {
+    let (m, p, mut t) = setup();
+    // Row 0 of block 0 is the first full round; flip lane 0's X7 (the S-box output half of
+    // `x7 = x3*x3*(mds_light(s)+rc)`, checked unconditionally on every `IS_FULL` row).
+    t.poseidon2.values[poseidon2::col::X7_0] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+#[test]
+fn tampering_the_poseidon2_in_copy_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = poseidon2::col::WIDTH;
+    // Row 1 of block 0 must copy row 0's IN down (the "same block" transition invariant);
+    // flip it.
+    t.poseidon2.values[w + poseidon2::col::IN0] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+#[test]
+fn bumping_poseidon2_mult_on_an_idle_row_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = poseidon2::col::WIDTH;
+    // Rows 30/31 of a block are idle (ROUND_ROWS = 30); MULT there must stay 0 via
+    // `MULT * (1 - IS_LAST) = 0`, a purely local (`CONSTRAINT_PANIC`) constraint. M3.4:
+    // `setup()`'s guest (`fib(10)`) now calls `POSEIDON2` once per digest row (its own hc,
+    // `Program::digest_rows()` blocks), so block 0 is real — pick the first genuinely idle
+    // block instead of assuming block 0 is padding.
+    let idle_block = (0..t.poseidon2.height() / randprotocol_zkvm::tables::poseidon2::BLOCK)
+        .find(|b| t.poseidon2.values[b * randprotocol_zkvm::tables::poseidon2::BLOCK * w + poseidon2::col::IS_REAL] == F::ZERO)
+        .expect("some block must be idle padding");
+    let idle_row = idle_block * randprotocol_zkvm::tables::poseidon2::BLOCK + 30;
+    t.poseidon2.values[idle_row * w + poseidon2::col::MULT] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M3.2: `guests::poseidon2_demo` for `msg`, traced at tier 10.
+fn setup_poseidon2(msg: &[u32]) -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::poseidon2_demo(msg);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    (m, p, t)
+}
+
+/// The cpu-table row indices of one `POSEIDON2` call's ecall row, absorb rows (in order), and
+/// write-back rows (in order).
+fn hash_rows(t: &Traces) -> (usize, Vec<usize>, Vec<usize>) {
+    let w = cpu::col::WIDTH;
+    let h = t.cpu.height();
+    let ecall = (0..h).find(|&r| t.cpu.values[r * w + cpu::col::SYS_HASH] == F::ONE).expect("an ecall row");
+    let absorbs: Vec<usize> = (0..h).filter(|&r| t.cpu.values[r * w + cpu::col::IS_HASH] == F::ONE).collect();
+    let writes: Vec<usize> = (0..h).filter(|&r| t.cpu.values[r * w + cpu::col::IS_HASH_OUT] == F::ONE).collect();
+    (ecall, absorbs, writes)
+}
+
+/// Flipping a written digest word breaks the write-back row's own pin, `HV = byte_sum(HVL)`
+/// (the two never leave it), whether or not it also breaks the `HV·2^0 + HV·2^32 = HS_lane`
+/// identity or the `MEMORY` permutation against what the emulator actually put in RAM.
+#[test]
+fn tampering_a_hash_digest_word_is_rejected() {
+    let (m, p, mut t) = setup_poseidon2(&[1, 2, 3, 4]);
+    let w = cpu::col::WIDTH;
+    let (_, _, writes) = hash_rows(&t);
+    assert_eq!(writes.len(), 2, "one POSEIDON2 call always has two write-back rows");
+    t.cpu.values[writes[0] * w + cpu::col::HV0] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `n = 5` absorbs a full block then a one-word block, so the final absorb row's lane 1 is
+/// inactive: its `HV1` must equal `HS1`, the previous block's own lane 1, carried forward
+/// unread rather than pulled from memory. Flipping `HV1` alone (leaving `ACT`/`HS` untouched)
+/// trips that copy-forward pin directly — the lane-copy invariant a cheating witness could
+/// otherwise use to smuggle an unabsorbed value into the sponge state between two absorb rows.
+#[test]
+fn tampering_a_hash_state_lane_between_absorb_rows_is_rejected() {
+    let (m, p, mut t) = setup_poseidon2(&[1, 2, 3, 4, 5]);
+    let w = cpu::col::WIDTH;
+    let (_, absorbs, _) = hash_rows(&t);
+    assert_eq!(absorbs.len(), 2, "n=5 is one full block plus one partial block");
+    let last = absorbs[1];
+    assert_eq!(t.cpu.values[last * w + cpu::col::ACT0 + 1], F::ZERO, "lane 1 is inactive on the final (partial) block");
+    t.cpu.values[last * w + cpu::col::HV0 + 1] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// Every new selector (`SYS_HASH`, `IS_HASH`, `IS_HASH_OUT`, `HASH_FIN`) must be zero on a
+/// padding row — `SELECTORS`' `(1 - is_real)·v(s) = 0` gate, the same invariant class as every
+/// other cpu selector. Setting `IS_HASH` in particular also requests a `POSEIDON2` lookup with
+/// count 1 (`Count::bounded(is_hash, 1)`) that nothing else on an all-zero padding row can
+/// answer, so this doubles as "a POSEIDON2 lookup with count 1 on a non-hash row is rejected".
+#[test]
+fn bumping_a_new_hash_selector_on_a_padding_row_is_rejected() {
+    for &sel in &[cpu::col::SYS_HASH, cpu::col::IS_HASH, cpu::col::IS_HASH_OUT, cpu::col::HASH_FIN] {
+        let (m, p, mut t) = setup();
+        let w = cpu::col::WIDTH;
+        let pad = t.cpu.height() - 1;
+        assert_eq!(t.cpu.values[pad * w + cpu::col::IS_REAL], F::ZERO, "last cpu row is padding");
+        t.cpu.values[pad * w + sel] = F::ONE;
+        assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }), "selector column {sel}");
+    }
+}
+
+/// CRITICAL 1 regression: before `HASH_PTR` got its own `RANGE8`/`AND4` byte decomposition
+/// (`HP0..3`/`HP3_HI`, the `MA0..3`/`MA3_HI` pattern), it was just the raw `a0` register
+/// value — an unbounded field element on the `MEMORY` bus. A witness could pick it so that
+/// `SPACE_RAM`'s sort key (`1·2^30 + HASH_PTR`, `memory.rs::KEY_SHIFT`) wraps, mod the
+/// Goldilocks prime, to alias *any* other key — here, register `a0`'s own key
+/// (`0·2^30 + REG_A0`) — letting a hash row's memory access land wherever the witness likes
+/// instead of the `n` words it claims to hash. `HP0..3`/`HP3_HI` are deliberately left at
+/// their honest (small) values, so this must trip the new recomposition equation
+/// (`v(SYS_HASH)·(HASH_PTR - hp) = 0`) directly — a local `CONSTRAINT_PANIC` on the ecall row,
+/// not a downstream `MEMORY`-bus imbalance.
+#[test]
+fn an_unbounded_hash_ptr_that_aliases_a_register_key_is_rejected() {
+    let (m, p, mut t) = setup_poseidon2(&[1, 2, 3, 4]);
+    let w = cpu::col::WIDTH;
+    let (ecall, _, _) = hash_rows(&t);
+    let alias = F::from_u32(REG_A0) - F::from_u64(1u64 << 30);
+    t.cpu.values[ecall * w + cpu::col::HASH_PTR] = alias;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// CRITICAL 2 regression: without a rule binding the ecall row's routing to `HASH_N`, a
+/// witness could skip every absorb row entirely and go straight from the ecall row to a
+/// write-back row, publishing the empty-input digest for a nonzero `n` — the `final_absorb`
+/// drain rule never fires, since it only lives on `IS_HASH` transitions and there would be no
+/// absorb row at all. Relabel `n = 5`'s first absorb row as a write-back row instead (leaving
+/// its columns otherwise untouched, in particular its own `HASH_LEFT = 5`, the "left before
+/// this row" value an honest absorb row carries): this trips both new rules directly — the
+/// ecall row's own `SYS_HASH·n(IS_HASH_OUT)·HASH_N = 0` (now `1·1·5 != 0`) and the write-back
+/// row's own `IS_HASH_OUT·(1-HASH_FIN)·HASH_LEFT = 0` (now `1·1·5 != 0`) — local
+/// `CONSTRAINT_PANIC`s, not a `PROGRAM`/`POSEIDON2`-bus imbalance.
+#[test]
+fn skipping_every_absorb_row_for_a_nonzero_hash_n_is_rejected() {
+    let (m, p, mut t) = setup_poseidon2(&[1, 2, 3, 4, 5]);
+    let w = cpu::col::WIDTH;
+    let (ecall, absorbs, _) = hash_rows(&t);
+    assert_eq!(absorbs.len(), 2, "n=5 needs two absorb rows");
+    assert_eq!(absorbs[0], ecall + 1, "the first absorb row follows the ecall row directly");
+    assert_eq!(t.cpu.values[absorbs[0] * w + cpu::col::HASH_LEFT], F::from_u32(5));
+    t.cpu.values[absorbs[0] * w + cpu::col::IS_HASH] = F::ZERO;
+    t.cpu.values[absorbs[0] * w + cpu::col::IS_HASH_OUT] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// CRITICAL 3 regression: `hv_lo + hv_hi·2^32 = hs_lane` is only a field identity, and for any
+/// lane `< 2^32-1` the non-canonical pair `(lane+1, 2^32-1)` satisfies it too (`(lane+1) +
+/// (2^32-1)·2^32 = lane + p ≡ lane mod p`) with both words still individually `< 2^32` — so the
+/// existing `RANGE8`/`HVL` byte check does not catch it either. `n = 0`'s digest is all-zero,
+/// so lane 0 is exactly `0`, one of the rare values with such an alternate: `1 +
+/// (2^32-1)·2^32 = p ≡ 0`. Re-encode it as `(lo=1, hi=2^32-1)`, including the gadget columns a
+/// "smart" cheating witness would also have to update to keep the canonical-check gadget's
+/// first equation satisfied (`d = hi-(2^32-1) = 0` forces `HIMAX = 1` regardless of `INV`, so
+/// there is no way to leave `HIMAX = 0` here) — only the second equation, `HIMAX·lo = 0`, is
+/// left to catch `lo = 1 != 0`.
+#[test]
+fn a_non_canonical_digest_word_encoding_is_rejected() {
+    let (m, p, mut t) = setup_poseidon2(&[]);
+    let w = cpu::col::WIDTH;
+    let (_, absorbs, writes) = hash_rows(&t);
+    assert!(absorbs.is_empty(), "n=0 has no absorb rows");
+    let row = writes[0];
+    assert_eq!(t.cpu.values[row * w + cpu::col::HS0], F::ZERO, "n=0's digest is all-zero");
+    t.cpu.values[row * w + cpu::col::HV0] = F::ONE;
+    t.cpu.values[row * w + cpu::col::HV0 + 1] = F::from_u32(0xFFFF_FFFF);
+    let (lo_limbs, hi_limbs) = (limbs(1), limbs(0xFFFF_FFFF));
+    for j in 0..4 {
+        t.cpu.values[row * w + cpu::col::HVL0_0 + j] = lo_limbs[j];
+        t.cpu.values[row * w + cpu::col::HVL0_0 + 4 + j] = hi_limbs[j];
+    }
+    t.cpu.values[row * w + cpu::col::HIMAX0] = F::ONE;
+    t.cpu.values[row * w + cpu::col::INV0] = F::ZERO;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// MINOR regression: `is_hash` and `is_hash_out` set together on the same row must be
+/// rejected outright, not merely fall through whichever half's constraints happen to notice.
+#[test]
+fn a_row_claiming_to_be_both_an_absorb_and_a_write_back_row_is_rejected() {
+    let (m, p, mut t) = setup_poseidon2(&[1, 2, 3, 4]);
+    let w = cpu::col::WIDTH;
+    let (_, absorbs, _) = hash_rows(&t);
+    assert_eq!(absorbs.len(), 1, "n=4 is exactly one full block");
+    t.cpu.values[absorbs[0] * w + cpu::col::IS_HASH_OUT] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// CRITICAL 2b regression (round 2): before the three `n(HASH_FIN) = 0`/"followed by
+/// `HASH_FIN = 1`" routing rules, a witness could route the `n = 0` case straight from the
+/// ecall row to the *second* write-back row, skipping the first — digest words 0..3 are then
+/// never written at all, so a guest reading `ptr..ptr+3` back would see whatever was already
+/// in RAM instead of the honest zeros: a valid proof of a non-honest execution. Flip the
+/// (otherwise honest) first write-back row's own `HASH_FIN` from 0 to 1, i.e. pretend it is
+/// the only write-back row present — trips `SYS_HASH·n(IS_HASH_OUT)·n(HASH_FIN) = 0` directly
+/// on the ecall row, a local `CONSTRAINT_PANIC`.
+#[test]
+fn skipping_the_first_write_back_row_is_rejected() {
+    let (m, p, mut t) = setup_poseidon2(&[]);
+    let w = cpu::col::WIDTH;
+    let (ecall, absorbs, writes) = hash_rows(&t);
+    assert!(absorbs.is_empty(), "n=0 has no absorb rows");
+    assert_eq!(writes.len(), 2, "one POSEIDON2 call always has two write-back rows");
+    assert_eq!(writes[0], ecall + 1, "the first write-back row follows the ecall row directly");
+    assert_eq!(t.cpu.values[writes[0] * w + cpu::col::HASH_FIN], F::ZERO);
+    t.cpu.values[writes[0] * w + cpu::col::HASH_FIN] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ---------------------------------------------------------------------------
+// Audit (2026-09-12) regressions, ZC1/ZC2: free-standing hash rows. Until the entry gates and
+// the `HASH_FIN` pin landed, every hash row-group routing rule was gated on the *current* row
+// already being inside a group — so a cheating witness could splice `IS_HASH_OUT`/`IS_HASH`
+// rows in anywhere, with a free, unbounded `HASH_PTR` (the `SYS_HASH`-gated `HP0..3`
+// decomposition never fires on such rows) and no ecall, no fetch, and (on write-back rows) not
+// even a permutation consumed: arbitrary RAM writes at arbitrary addresses at an
+// attacker-chosen cycle, from which any "execution" can be fabricated. Each test below builds
+// the *complete* attack witness — not just a flipped cell — by feeding a crafted event stream
+// through the honest trace builders, so before the fix it verified outright (RED-verified by
+// re-running these four tests with the new gates commented out; the report records the
+// output); afterwards the named gate is what rejects it.
+
+/// A small guest with one genuine `POSEIDON2` call (`n = 4` words at `0x40`) and `noops`
+/// `addi x0, x0, 0` slots between the hash group and the output write — sacrificial
+/// instructions a spliced row-group can replace without disturbing any register value (a
+/// no-op writes nothing and reads only `x0`'s always-fresh zero), bus count, or public value.
+/// Returns the program and its honest outputs (out0 = 42).
+fn audit_guest(noops: usize) -> (Program, [u32; 8]) {
+    let mut a = Assembler::new(0);
+    a.extend(li(REG_A2, 42));
+    a.extend(li(REG_A7, SYS_POSEIDON2 as i32));
+    a.extend(li(REG_A0, 0x40));
+    a.extend(li(REG_A1, 4));
+    a.push(ecall());
+    for _ in 0..noops { a.push(addi(0, 0, 0)); }
+    a.extend(write_output(0, REG_A2));
+    a.extend(halt());
+    let p = a.assemble();
+    let outputs = execute(&p, &[], &[], 10_000).unwrap().outputs;
+    (p, outputs)
+}
+
+/// Indices of the guest's no-op events in an execution (its only `addi x0, x0, 0`s).
+fn noop_rows(events: &[CycleEvent]) -> Vec<usize> {
+    events.iter().enumerate()
+        .filter(|(_, e)| e.instr == Instr::AluImm { op: AluOp::Add, rd: 0, rs1: 0, imm: 0 })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// A synthetic write-back row event: `IS_HASH_OUT` with the given `fin`, writing `words` at
+/// `ptr + 4·fin .. + 3` with sponge state `state`. `cpu_trace` turns this into a complete
+/// write-back row (`HVL` limbs and the `HIMAX/INV` gadget included) as long as some ecall row
+/// preceded it (its `hash_ptr_n` state) — the row a cheating prover writes by hand.
+fn rogue_write_out(fin: bool, pc: u32, next_pc: u32, ptr: u32, words: [u32; 4], state: [Val; 8]) -> CycleEvent {
+    let base = ptr + if fin { 4 } else { 0 };
+    CycleEvent {
+        clk: 0, // renumbered once the stream is assembled
+        pc, next_pc,
+        instr: Instr::Ecall, // unread on hash rows (`dec` below is what the builder consumes)
+        dec: Decoded::default(),
+        a: 0, b: 0, c: 0, alu_out: 0, tgt: 0, mem_addr: 0, mem_val: 0,
+        sys: None,
+        accesses: (0..4).map(|k| MemAccess { space: SPACE_RAM, addr: base + k as u32, slot: k as u32, value: words[k as usize], is_write: true }).collect(),
+        alu: Vec::new(),
+        hash_row: Some(HashRow::WriteOut { fin, words, state }),
+        keccak_row: None,
+        keccak_accesses: Vec::new(),
+        sha256_row: None,
+        sha256_accesses: Vec::new(),
+    }
+}
+
+/// Build the full witness for a crafted event stream through the *honest* builders — the same
+/// `build_traces_salted` `Machine::prove` uses (empty inputs, zero salt, tier 10) —
+/// renumbering `clk` contiguously first so `CLK` and the memory timestamps agree.
+fn rogue_traces(p: &randprotocol_zkvm::isa::Program, mut events: Vec<CycleEvent>, outputs: [u32; 8]) -> Traces {
+    for (i, e) in events.iter_mut().enumerate() { e.clk = i as u32; }
+    let exec = randprotocol_zkvm::emulator::Execution { events, outputs, halted: true };
+    build_traces_salted(p, &[], &[], [0u32; 4], &exec, Tier(10)).unwrap()
+}
+
+/// ZC1, the entry gate `(1 − SYS_HASH − is_hash − is_hash_out)·n(IS_HASH_OUT) = 0`: a
+/// free-standing write-back pair spliced in after an *ordinary* row — the canonical attack.
+/// The pair takes the second no-op's slot, so its predecessor is the first no-op. Eight
+/// zero-word writes land at the stale group pointer `0x40..0x47` (the builder's `hash_ptr_n`
+/// carry), no permutation is consumed, and outputs/`hc` are untouched — pre-fix this verified.
+#[test]
+fn a_free_standing_write_back_pair_after_an_ordinary_row_is_rejected() {
+    let (p, outputs) = audit_guest(2);
+    let honest = execute(&p, &[], &[], 10_000).unwrap();
+    let noops = noop_rows(&honest.events);
+    assert_eq!(noops.len(), 2);
+    let pc = honest.events[noops[1]].pc;
+    let mut events: Vec<CycleEvent> = Vec::new();
+    for (i, e) in honest.events.iter().enumerate() {
+        if i == noops[1] {
+            events.push(rogue_write_out(false, pc, pc, 0x40, [0; 4], [Val::ZERO; 8]));
+            events.push(rogue_write_out(true, pc, pc + 4, 0x40, [0; 4], [Val::ZERO; 8]));
+        } else {
+            events.push(e.clone());
+        }
+    }
+    let m = Machine::new(FriProfile::Test);
+    let t = rogue_traces(&p, events, outputs);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// ZC1, the exit gate `HASH_FIN·n(IS_HASH_OUT) = 0`: the same pair, but spliced directly after
+/// the genuine group's own final write-back row — dressed up as the group's tail. The honest
+/// `HASH_FIN = 1` row must end the group.
+#[test]
+fn a_free_standing_write_back_pair_after_a_hash_group_is_rejected() {
+    let (p, outputs) = audit_guest(1);
+    let honest = execute(&p, &[], &[], 10_000).unwrap();
+    let noops = noop_rows(&honest.events);
+    assert_eq!(noops.len(), 1);
+    let pc = honest.events[noops[0]].pc;
+    let mut events: Vec<CycleEvent> = Vec::new();
+    for (i, e) in honest.events.iter().enumerate() {
+        if i == noops[0] {
+            events.push(rogue_write_out(false, pc, pc, 0x40, [0; 4], [Val::ZERO; 8]));
+            events.push(rogue_write_out(true, pc, pc + 4, 0x40, [0; 4], [Val::ZERO; 8]));
+        } else {
+            events.push(e.clone());
+        }
+    }
+    let m = Machine::new(FriProfile::Test);
+    let t = rogue_traces(&p, events, outputs);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// ZC1, the entry gate `(1 − SYS_HASH − is_hash)·n(IS_HASH) = 0`: a whole rogue "group" —
+/// absorb + two write-backs, no ecall — spliced in place of the first no-op (its predecessor
+/// is the genuine group's `HASH_FIN = 1` row, which is neither `SYS_HASH` nor `IS_HASH`). The
+/// absorb honestly re-reads the four digest words the genuine group just wrote at `0x40..0x43`
+/// (memory stays consistent) and hashes them through one *genuine* permutation — which the
+/// witness really does supply to the POSEIDON2 table; that is not the hole. The hole is the
+/// rogue absorb's free sponge state and pointer, pinned by nothing an ecall would have
+/// provided.
+#[test]
+fn a_free_standing_absorb_group_with_a_forged_state_is_rejected() {
+    let (p, outputs) = audit_guest(2);
+    let honest = execute(&p, &[], &[], 10_000).unwrap();
+    let noops = noop_rows(&honest.events);
+    assert_eq!(noops.len(), 2);
+    // The genuine digest at `0x40..0x47`: the message was four zero words (that region is
+    // never written before the group reads it).
+    let digest = randprotocol_zkvm::hash::sponge_hash(&[0, 0, 0, 0]);
+    let mut merged = [Val::ZERO; 8];
+    for k in 0..4 { merged[k] = Val::from_u32(digest[k]); }
+    let state_out = randprotocol_zkvm::hash::permute_state(merged);
+    let rehashed = randprotocol_zkvm::hash::split_digest([state_out[0], state_out[1], state_out[2], state_out[3]]);
+    let pc = honest.events[noops[0]].pc;
+    let mut events: Vec<CycleEvent> = Vec::new();
+    for (i, e) in honest.events.iter().enumerate() {
+        if i == noops[0] {
+            events.push(CycleEvent {
+                clk: 0, pc, next_pc: pc,
+                instr: Instr::Ecall, dec: Decoded::default(),
+                a: 0, b: 0, c: 0, alu_out: 0, tgt: 0, mem_addr: 0, mem_val: 0,
+                sys: None,
+                accesses: (0..4).map(|k| MemAccess { space: SPACE_RAM, addr: 0x40 + k as u32, slot: k as u32, value: digest[k as usize], is_write: false }).collect(),
+                alu: Vec::new(),
+                hash_row: Some(HashRow::Absorb { idx: 0, left_before: 4, words: [digest[0], digest[1], digest[2], digest[3]], active: [true; 4], state_in: [Val::ZERO; 8], state_out }),
+                keccak_row: None,
+                keccak_accesses: Vec::new(),
+                sha256_row: None,
+                sha256_accesses: Vec::new(),
+            });
+            events.push(rogue_write_out(false, pc, pc, 0x40, [rehashed[0], rehashed[1], rehashed[2], rehashed[3]], state_out));
+            events.push(rogue_write_out(true, pc, pc + 4, 0x40, [rehashed[4], rehashed[5], rehashed[6], rehashed[7]], state_out));
+        } else {
+            events.push(e.clone());
+        }
+    }
+    let m = Machine::new(FriProfile::Test);
+    let t = rogue_traces(&p, events, outputs);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// ZC2, the pin `HASH_FIN·(1 − IS_HASH_OUT) = 0`: setting `HASH_FIN` on the ecall row drives
+/// `continues` to 0 there, so the rest of the row-group's `HASH_PTR` is no longer a copy of the
+/// ecall row's range-checked one — it becomes a free, unbounded field element on the `MEMORY`
+/// bus (the mod-`p` key-aliasing hole CRITICAL 1 closed, one row later), while the ecall row's
+/// own `NEXT_PC` snaps to `PC + 4` and silently swallows one instruction. The witness below
+/// does the whole thing: the group shifts up by one instruction slot (the no-op vanishes) and
+/// every absorb/write-back row points at `ROGUE_PTR = 2^31`, past the `2^30` bound the ecall's
+/// `HP0..3` decomposition enforces — pre-fix this verified, with the digest written to
+/// `2^31..` instead of `0x40..`.
+#[test]
+fn hash_fin_on_the_ecall_row_detaching_hash_ptr_is_rejected() {
+    const ROGUE_PTR: u32 = 0x8000_0000;
+    let (p, outputs) = audit_guest(1);
+    let honest = execute(&p, &[], &[], 10_000).unwrap();
+    let h = honest.events.iter().position(|e| matches!(e.sys, Some(Syscall::Poseidon2 { .. }))).expect("the poseidon2 ecall");
+    let noops = noop_rows(&honest.events);
+    assert_eq!(noops.len(), 1);
+    assert_eq!(noops[0], h + 4, "the no-op follows the group directly");
+    let mut events: Vec<CycleEvent> = Vec::new();
+    for (i, e) in honest.events.iter().enumerate() {
+        if i == noops[0] { continue; } // the instruction the shifted group lands on: gone
+        let mut e = e.clone();
+        if i == h {
+            e.next_pc = e.pc + 4; // `continues = 0` here once HASH_FIN is set below
+        } else if i == h + 1 || i == h + 2 {
+            e.pc += 4;
+            e.next_pc += 4;
+            for a in &mut e.accesses { a.addr = a.addr - 0x40 + ROGUE_PTR; }
+        } else if i == h + 3 {
+            e.pc += 4;
+            e.next_pc = e.pc + 4;
+            for a in &mut e.accesses { a.addr = a.addr - 0x40 + ROGUE_PTR; }
+        }
+        events.push(e);
+    }
+    let m = Machine::new(FriProfile::Test);
+    let mut t = rogue_traces(&p, events, outputs);
+    // The builders never produce this cell combination — that is exactly the point of the pin:
+    // `HASH_FIN` on the ecall row, and the rest of the group carrying the rogue pointer the
+    // ecall's own bounded one no longer reaches.
+    let w = cpu::col::WIDTH;
+    let (ecall_row, absorbs, writes) = hash_rows(&t);
+    t.cpu.values[ecall_row * w + cpu::col::HASH_FIN] = F::ONE;
+    for r in absorbs.iter().chain(writes.iter()) {
+        t.cpu.values[*r * w + cpu::col::HASH_PTR] = F::from_u32(ROGUE_PTR);
+    }
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// ZC1, the `SYS_KECCAK` classification (controller ruling 2): a `KECCAK` row is an ecall row
+/// of the ordinary shape — one row, `continues` keys off `SYS_HASH` alone — so nothing
+/// hash-shaped may follow it, exactly as for `SYS_WRITE`. Splicing a write-back pair in right
+/// after the genuine `KECCAK` row is therefore the entry gate's business, not a special case:
+/// `SYS_KECCAK` is not in either gate's whitelist, so `n(IS_HASH_OUT)` is forced to zero there.
+#[test]
+fn a_free_standing_write_back_pair_after_a_keccak_row_is_rejected() {
+    // A genuine `POSEIDON2` group first (at `0x40`), then the `KECCAK` call (at `0x100`, clear
+    // of the digest): the rogue pair rides the pointer that group left behind, exactly as in
+    // the ordinary-row test — what differs is only the row it is spliced after.
+    let mut a = Assembler::new(0);
+    a.extend(li(REG_A2, 42));
+    a.extend(call_poseidon2(0x40, 4));
+    a.extend(call_keccak(0x100));
+    a.push(addi(0, 0, 0));
+    a.push(addi(0, 0, 0));
+    a.extend(write_output(0, REG_A2));
+    a.extend(halt());
+    let p = a.assemble();
+    let honest = execute(&p, &[], &[], 100_000).unwrap();
+    let k = honest.events.iter().position(|e| matches!(e.sys, Some(Syscall::Keccak { .. }))).expect("the keccak ecall");
+    let noops = noop_rows(&honest.events);
+    assert_eq!(noops.len(), 2);
+    assert_eq!(noops[0], k + 1, "the first no-op follows the keccak row directly");
+    let pc = honest.events[noops[0]].pc;
+    let mut events: Vec<CycleEvent> = Vec::new();
+    for (i, e) in honest.events.iter().enumerate() {
+        if i == noops[0] {
+            events.push(rogue_write_out(false, pc, pc, 0x40, [0; 4], [Val::ZERO; 8]));
+            events.push(rogue_write_out(true, pc, pc + 4, 0x40, [0; 4], [Val::ZERO; 8]));
+        } else {
+            events.push(e.clone());
+        }
+    }
+    let m = Machine::new(FriProfile::Test);
+    let t = rogue_traces(&p, events, honest.outputs);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// M3.4: the program table as a witness trace with an in-circuit decoder, and the digest
+// prefix that computes `hc`.
+
+/// Flip one `BIT` column on a real instruction row without touching `WORD` (or the `FIELDS`
+/// that were honestly derived from the *original* bits) — the bit-decomposition constraint
+/// `WORD == Σ bit_i·2^i` is what this table is built on, so any single flipped bit trips it
+/// directly, independent of what that bit even controls.
+#[test]
+fn tampering_a_program_bit_column_changes_the_digest_and_is_rejected() {
+    let (m, p, mut t) = setup();
+    assert!(!p.is_empty(), "fib(10) has instructions");
+    t.program.values[program::col::BIT0] += F::ONE; // row 0's bit 0
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `verify` checks `pv[HC0..HC7]` against the caller-supplied `hc` *before* the STARK batch
+/// check even runs — a proof for `fib(10)` checked against `fib(11)`'s digest is rejected
+/// structurally (`VerifyError::PublicValues`), which `rejects()` still accepts (it takes any
+/// `VerifyError`, not just a constraint-system panic).
+#[test]
+fn claiming_a_digest_that_does_not_match_the_program_is_rejected() {
+    let (m, p, t) = setup();
+    let proof = m.prove_traces(&p, &t, Tier(10));
+    let wrong_hc = guests::fib(11).digest();
+    assert_ne!(wrong_hc, p.digest());
+    assert!(rejects(|| m.verify(&wrong_hc, &proof)));
+}
+
+/// M3.4 ruling: the eight M-extension ops are legal only under `OP_ALU` with `funct7 = 1` —
+/// no flag in the decoder ever maps an `OP_ALUI`-opcode word to an M op (the `funct7` bits of
+/// an ALUI word are just part of its sign-extended immediate, never a "claim M-extension"
+/// signal, exactly mirroring `isa::Instr::decode`). Tamper an honest ALUI row's `ALU_OP`
+/// field to claim `MUL` directly: no combination of (legitimately derivable) flags can
+/// produce that value on an `OP_ALUI` row, so the field-consistency equation `ALU_OP ==
+/// (flag-weighted sum)` must fail.
+#[test]
+fn an_alui_word_claiming_mul_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = program::col::WIDTH;
+    let row = (0..p.len())
+        .find(|&i| { let d = Instr::decode(p.words[i]).unwrap().decoded(); d.is_alu == 1 && d.is_imm == 1 })
+        .expect("fib(10) uses at least one ALUI op (e.g. an ADDI)");
+    t.program.values[row * w + program::col::ALU_OP] = F::from_u32(AluOp::Mul.code());
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// The digest-row count is bound to the program's length exactly like M3.2's absorb-row
+/// count is bound to `n` (`skipping_every_absorb_row_for_a_nonzero_hash_n_is_rejected`
+/// above): ending the digest group one row early — turning the true last digest row back into
+/// an ordinary row — desyncs `DIGEST_LAST`'s own pin (`is_digest*(DIGEST_LAST-(1-n(IS_DIGEST)))
+/// = 0`, now violated one row earlier than the witness updated it) and, even if it hadn't,
+/// would leave the program table's now-unconsumed `PROGRAM_WORD` provides for the dropped
+/// words unpaid.
+#[test]
+fn skipping_a_digest_row_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = cpu::col::WIDTH;
+    let dr = p.digest_rows();
+    assert!(dr > 1, "fib(10)'s program needs more than one digest row");
+    t.cpu.values[(dr - 1) * w + cpu::col::IS_DIGEST] = F::ZERO;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// CRITICAL regression (M3.4 fix): before `MULT_WORD` was pinned to equal `VALID` exactly,
+/// the table's own constraint was the one-sided `mult_word · (1 − valid) = 0` — a no-op on
+/// any `valid = 1` row (`mult_word · (1 − 1) = mult_word · 0 = 0` regardless of `mult_word`'s
+/// value). That let a real, decodable instruction sit in the program table with `valid = 1`
+/// but `mult_word = 0`: it would never be claimed by any digest row's `PROGRAM_WORD` lookup
+/// (so it would never enter `hc`), while remaining fully `valid = 1` — and hence fetchable,
+/// and at runtime reachable via a computed jump (`JALR`) past the honestly-digested
+/// `base_pc..base_pc+4·len` window — on the ordinary `PROGRAM` bus. Under the *old* AIR this
+/// witness was not merely undetected by this one constraint, it was a fully valid, verifying
+/// proof: `hc` would bind a strict prefix of the executable program, not the program actually
+/// run.
+///
+/// Reproduce exactly that witness against `fib(10)`, then check it against the *fixed* AIR.
+/// `fib(10)`'s program table (`MIN_HEIGHT = 16` floor) has spare padding rows past the last
+/// real instruction; overwrite the first one with a real, decodable instruction (reusing one
+/// of the program's own words) at the PC `program_trace` already continues the honest
+/// arithmetic sequence to (so the separate "no address aliasing" invariant is untouched) —
+/// `VALID` comes out `1` — and leave `MULT_WORD` at its padding-row default, `0`. This alone
+/// (no change to the cpu table needed — `program_trace`'s own honest `mult`/fetch bookkeeping
+/// for the *real* program is untouched, so this is "append an escaped instruction to the
+/// program table" in its simplest form) now violates `mult_word = valid` directly on the
+/// tampered row: a local `CONSTRAINT_PANIC` on the `program` table, not a downstream
+/// `PROGRAM_WORD` lookup-balance check — the row-level equality alone is now strong enough to
+/// catch the escape without needing anything to actually consume (or even fetch) the row.
+#[test]
+fn an_undigested_reachable_program_tail_is_rejected() {
+    let (m, p, mut t) = setup();
+    let w = program::col::WIDTH;
+    let extra = p.len(); // first padding row past the digested program
+    assert!(t.program.height() > extra, "fib(10)'s program table has spare padding rows");
+    let pc = p.pc_of(extra); // continues program_trace's own honest PC sequence
+    let word = p.words[0]; // reuse a real, decodable instruction
+    let mut row = vec![F::ZERO; w];
+    program::fill_word_row(&mut row, pc, word);
+    assert_eq!(row[program::col::VALID], F::ONE, "the reused word must decode");
+    assert_eq!(row[program::col::MULT_WORD], F::ZERO, "fill_word_row never sets MULT_WORD");
+    t.program.values[extra * w..(extra + 1) * w].copy_from_slice(&row);
+    // VALID = 1, MULT_WORD = 0: the exact witness the old, one-sided constraint accepted.
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// IMPORTANT regression: mirrors `a_row_claiming_to_be_both_an_absorb_and_a_write_back_row_is_rejected`
+/// above, one selector pair over — `IS_DIGEST` must be exclusive with `IS_HASH` too (and,
+/// symmetrically, with `IS_HASH_OUT`; both are pinned in `tables::cpu.rs`). `Count::bounded(is_hash
+/// + is_digest, 1)` (the shared `POSEIDON2` lookup both row kinds feed) is only a valid 0/1
+/// selector if a row can never claim both at once — otherwise it would double-count one
+/// `POSEIDON2` call's worth of bus demand while also falling through both row kinds' own
+/// selector-gated constraints half-unconstrained on whichever half its own logic doesn't cover.
+/// Take an honest absorb row from a `POSEIDON2` call and additionally claim `IS_DIGEST`: trips
+/// `is_digest · is_hash = 0` directly, a local `CONSTRAINT_PANIC`.
+#[test]
+fn a_row_claiming_to_be_both_a_digest_and_an_absorb_row_is_rejected() {
+    let (m, p, mut t) = setup_poseidon2(&[1, 2, 3, 4]);
+    let w = cpu::col::WIDTH;
+    let (_, absorbs, _) = hash_rows(&t);
+    assert_eq!(absorbs.len(), 1, "n=4 is exactly one full block");
+    t.cpu.values[absorbs[0] * w + cpu::col::IS_DIGEST] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// M4.1: the input commitment — READ_INPUT bound to a committed H_IN via the new `input`
+// table and the split INPUT_DIGEST/INPUT_READ buses (review round 1, C1).
+
+/// The fixed salt every hand-tampered witness below uses — value is arbitrary, only its
+/// *consistency* with what a given `Traces` was actually built with matters.
+const TEST_SALT: [u32; 4] = [0u32; 4];
+
+fn setup_with_inputs(inputs: &[u32]) -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::balance_check(1000); // reads inputs 0..3 once each
+    let e = execute(&p, inputs, &[], 10_000).unwrap();
+    let t = build_traces_salted(&p, inputs, &[], TEST_SALT, &e, Tier(10)).unwrap();
+    (m, p, t)
+}
+
+/// Rewrites `t`'s indigest region in place as if H_IN had only ever committed to
+/// `new_inputs` (a prefix of the original inputs `t` was built with, needing the *same*
+/// number of real indigest rows — i.e. `new_inputs.len()` and the original `n_in` fall in the
+/// same `⌈./4⌉` block), while leaving the `input` witness table (and hence the guest's own
+/// reads) completely untouched. This is the shared "shrink the digest's own declared n_in"
+/// step behind cheating tests (d) and (f): it recomputes the salt row's header, the real
+/// block's absorbed words and inactive-lane carry, `HASH_LEFT`'s own `LEFT0/LEFT0+1`
+/// byte-limb re-encoding (and the `range` table's matching multiplicity shift, since RANGE8 is
+/// exact-count accounting — leaving this out would reject on a RANGE8 imbalance instead of the
+/// intended `INPUT_DIGEST` one), the last real row's canonical `IHVL/IHIMAX/IINV` encoding,
+/// the two permutation entries in the poseidon2 table (this only holds for a guest with no
+/// `POSEIDON2` syscalls of its own, true of `guests::balance_check`, so the program digest's
+/// own permutations plus the indigest ones are the *entire* poseidon2 event list — see
+/// `machine::build_traces_salted`), and `pv::IN0..7` — everything an honest
+/// `hash::input_digest_rows(salt, new_inputs)` computation would produce — mirroring
+/// `tables::cpu::fill_input_digest_rows` by hand against an already-built `Traces`.
+fn shrink_declared_n_in(t: &mut Traces, p: &randprotocol_zkvm::isa::Program, salt: [u32; 4], new_inputs: &[u32]) {
+    let w = cpu::col::WIDTH;
+    let offset = p.digest_rows();
+    let blocks = randprotocol_zkvm::hash::input_digest_rows(salt, new_inputs);
+    let n = blocks.len();
+    let rw = range::col::WIDTH;
+    // RANGE8 is exact-count accounting (`RangeCounts`/`range_trace`): every RANGE8-checked
+    // byte column this loop overwrites (`LEFT0/LEFT0+1`, and — on the last row —
+    // `IHVL0..31`) changes which byte values the cpu table demands, so the `range` table's
+    // own supply must shift by the same amount, tracked generically here as (old, new) byte
+    // pairs, or a RANGE8 imbalance (not the intended INPUT_DIGEST one) rejects the witness
+    // instead.
+    let mut range_byte_edits: Vec<(u32, u32)> = Vec::new();
+    for (i, blk) in blocks.iter().enumerate() {
+        let r0 = (offset + i) * w;
+        t.cpu.values[r0 + cpu::col::HASH_N] = F::from_u32(new_inputs.len() as u32);
+        let old_left = t.cpu.values[r0 + cpu::col::HASH_LEFT].as_canonical_u64() as u32;
+        t.cpu.values[r0 + cpu::col::HASH_LEFT] = F::from_u32(blk.left_before);
+        let (old_l0, old_l1) = (old_left & 0xff, (old_left >> 8) & 0xff);
+        let (new_l0, new_l1) = (blk.left_before & 0xff, (blk.left_before >> 8) & 0xff);
+        t.cpu.values[r0 + cpu::col::LEFT0] = F::from_u32(new_l0);
+        t.cpu.values[r0 + cpu::col::LEFT0 + 1] = F::from_u32(new_l1);
+        range_byte_edits.push((old_l0, new_l0));
+        range_byte_edits.push((old_l1, new_l1));
+        for k in 0..8 { t.cpu.values[r0 + cpu::col::HS0 + k] = blk.state_in[k]; }
+        for k in 0..4 {
+            t.cpu.values[r0 + cpu::col::ACT0 + k] = F::from_bool(blk.active[k]);
+            t.cpu.values[r0 + cpu::col::HV0 + k] = if blk.active[k] { F::from_u32(blk.words[k]) } else { blk.state_in[k] };
+        }
+        if i + 1 == n {
+            let words = randprotocol_zkvm::hash::split_digest([blk.state_out[0], blk.state_out[1], blk.state_out[2], blk.state_out[3]]);
+            for kk in 0..8 {
+                let old_bytes: [u32; 4] = core::array::from_fn(|j| t.cpu.values[r0 + cpu::col::IHVL0 + 4 * kk + j].as_canonical_u64() as u32);
+                let new_bl = limbs(words[kk]);
+                for j in 0..4 {
+                    let new_byte = new_bl[j].as_canonical_u64() as u32;
+                    range_byte_edits.push((old_bytes[j], new_byte));
+                    t.cpu.values[r0 + cpu::col::IHVL0 + 4 * kk + j] = new_bl[j];
+                }
+            }
+            for j in 0..4usize {
+                let hi = words[2 * j + 1];
+                if hi == u32::MAX {
+                    t.cpu.values[r0 + cpu::col::IHIMAX0 + j] = F::ONE;
+                    t.cpu.values[r0 + cpu::col::IINV0 + j] = F::ZERO;
+                } else {
+                    t.cpu.values[r0 + cpu::col::IHIMAX0 + j] = F::ZERO;
+                    t.cpu.values[r0 + cpu::col::IINV0 + j] = (F::from_u32(hi) - F::from_u32(u32::MAX)).inverse();
+                }
+            }
+            // Seed the row right after (the first ordinary instruction row) with this block's
+            // final state, exactly as `fill_input_digest_rows` does.
+            let r1 = (offset + n) * w;
+            for k in 0..8 { t.cpu.values[r1 + cpu::col::HS0 + k] = blk.state_out[k]; }
+        }
+    }
+    for (old_byte, new_byte) in range_byte_edits {
+        t.range.values[old_byte as usize * rw + range::col::M_RANGE] -= F::ONE;
+        t.range.values[new_byte as usize * rw + range::col::M_RANGE] += F::ONE;
+    }
+    // Rebuild the poseidon2 table's program-digest + indigest permutation entries — the only
+    // two event sources for a guest with no `POSEIDON2` syscalls of its own.
+    let digest_blocks = randprotocol_zkvm::hash::program_digest_rows(p.base_pc, &p.words);
+    let to_events = |blocks: &[randprotocol_zkvm::hash::DigestBlock]| -> Vec<poseidon2::Poseidon2Event> {
+        blocks.iter().map(|blk| {
+            let mut input = blk.state_in;
+            for k in 0..4 { if blk.active[k] { input[k] = F::from_u32(blk.words[k]); } }
+            poseidon2::Poseidon2Event { input, output: blk.state_out }
+        }).collect()
+    };
+    let all: Vec<poseidon2::Poseidon2Event> = to_events(&digest_blocks).into_iter().chain(to_events(&blocks)).collect();
+    t.poseidon2 = poseidon2::poseidon2_trace(&all, t.poseidon2.height());
+    // pv::IN0..7
+    let hin = randprotocol_zkvm::hash::input_digest(salt, new_inputs);
+    for k in 0..8 { t.public_values[cpu::pv::IN0 + k] = F::from_u32(hin[k]); }
+}
+
+// (a) two reads of the same index returning different words rejects.
+#[test]
+fn two_reads_of_the_same_index_returning_different_words_is_rejected() {
+    // A tiny hand-built guest: read input[0] twice into two registers, output their XOR
+    // (0 if honest), so the second read's row is easy to locate and its C column easy to
+    // tamper independently of the first.
+    let mut a = Assembler::new(0);
+    a.extend(read_input(0));
+    a.push(mv(5, REG_A0)); // t0 = first read
+    a.extend(read_input(0));
+    a.push(xor(6, 5, REG_A0)); // t1 = t0 ^ second read (0 if honest)
+    a.extend(write_output(0, 6));
+    a.extend(halt());
+    let p = a.assemble();
+    let inputs = [7u32];
+    let e = execute(&p, &inputs, &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 0, "two honest reads of the same index must agree");
+    let m = Machine::new(FriProfile::Test);
+    let mut t = build_traces_salted(&p, &inputs, &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = cpu::col::WIDTH;
+    // Locate the second SYS_READ row (there are exactly two) and forge its returned word.
+    let read_rows: Vec<usize> = (0..t.cpu.height()).filter(|&i| t.cpu.values[i * w + cpu::col::SYS_READ] == F::ONE).collect();
+    assert_eq!(read_rows.len(), 2);
+    t.cpu.values[read_rows[1] * w + cpu::col::C] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (b) a read of a word not in the committed inputs (the input table's own row tampered)
+// rejects — the SYS_READ row's honestly-returned C no longer matches what H_IN absorbed.
+#[test]
+fn a_read_disagreeing_with_the_committed_input_word_is_rejected() {
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    let iw = randprotocol_zkvm::tables::input::col::WIDTH;
+    t.input.values[0 * iw + randprotocol_zkvm::tables::input::col::WORD] += F::ONE; // tamper index 0's committed word
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (c) H_IN in pv tampered rejects.
+#[test]
+fn tampering_h_in_in_public_values_is_rejected() {
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    t.public_values[cpu::pv::IN0] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (d) declaring n_in smaller than the reads rejects — I3 (review round 1): rewritten to
+// exercise the property against the split-bus design. Shrinking only the *digest's* declared
+// n_in (via `shrink_declared_n_in`, which recomputes everything the digest itself is
+// responsible for, so no *other* check trips first) while leaving the `input` table exactly
+// as built for the real 4-word vector leaves its now-unclaimed 4th real row's `IS_REAL = 1`
+// supply on `INPUT_DIGEST` unmatched — the read of that same index still succeeds fine on
+// `INPUT_READ`, which is untouched.
+#[test]
+fn declaring_n_in_smaller_than_the_reads_is_rejected() {
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]); // n_in = 4, exactly 1 real indigest row
+    shrink_declared_n_in(&mut t, &p, TEST_SALT, &[400, 250, 300]);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (f) the full C1 witness (n_in 4→3 with the 4th word still read via MULT_READ) is rejected —
+// the reviewer's exact concrete cheating witness against the pre-split single-bus design: (1)
+// shrink the digest's declared n_in (as in (d)), (2) additionally zero the orphaned input
+// row's `MULT_READ` to try to "hide" its now-unclaimed mandatory-copy slot. Under the split
+// design `MULT_READ` no longer feeds `INPUT_DIGEST` at all, so step (2) is powerless: the
+// row's `IS_REAL = 1` supply on `INPUT_DIGEST` stays unclaimed regardless.
+#[test]
+fn the_c1_witness_shrinking_n_in_while_still_reading_the_dropped_word_is_rejected() {
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    shrink_declared_n_in(&mut t, &p, TEST_SALT, &[400, 250, 300]);
+    let iw = randprotocol_zkvm::tables::input::col::WIDTH;
+    t.input.values[3 * iw + randprotocol_zkvm::tables::input::col::MULT_READ] = F::ZERO;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (g) an extra real input row at IDX = n_in is rejected — the "dual form" of (f): appending a
+// committed word past the digest's own declared n_in leaves an unclaimed `IS_REAL = 1` supply
+// on `INPUT_DIGEST` regardless of whether anything else claims to read it. What this witness
+// stands in for — a genuine `READ_INPUT(n_in)` — is exactly what the emulator refuses
+// (checked directly below), which is why the witness has to be built by hand.
+#[test]
+fn an_extra_real_input_row_at_idx_equal_to_n_in_is_rejected() {
+    assert!(matches!(
+        execute(&guests::balance_check(1000), &[400u32, 250, 300], &[], 10_000),
+        Err(randprotocol_zkvm::emulator::ExecError::InputIndex(3))
+    ), "a READ_INPUT past the supplied inputs is exactly what the emulator refuses");
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]); // n_in = 4
+    let iw = randprotocol_zkvm::tables::input::col::WIDTH;
+    assert!(t.input.height() > 4, "spare padding rows past the 4 real ones");
+    t.input.values[4 * iw + randprotocol_zkvm::tables::input::col::WORD] = F::from_u32(999);
+    t.input.values[4 * iw + randprotocol_zkvm::tables::input::col::IS_REAL] = F::ONE;
+    // MULT_READ stays 0 — nothing needs to claim to read this row for INPUT_DIGEST alone
+    // (an unclaimed IS_REAL = 1 supply the digest never demands) to reject it.
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (h) I2 (review round 2, N1): the *faithful* regression — a genuinely appended, all-inactive
+// indigest row after a block-aligned n_in (n_in = 4, so HASH_LEFT is already fully drained to
+// 0 on the one real block), built so that *only* the lane-0 rule stands between it and
+// acceptance: everything else the AIR demands (INDIGEST_LAST moved to the new row, the
+// canonical H_IN encoding moved with it, the new row's own genuine POSEIDON2 permutation
+// wired into the poseidon2 table and into the row after it, the whole rest of the cpu table's
+// CLK chain shifted by one, MEMORY and RANGE8 kept exactly balanced) is made fully consistent
+// by hand. Round 1's version repurposed the very next row in place, leaving INDIGEST_LAST = 1
+// on the real row while the new row also claimed IS_INDIGEST = 1 — a shape the untouched
+// chain rule at the real→new transition (`is_indigest * (INDIGEST_LAST - (1 - n(IS_INDIGEST)))
+// = 0`) already rejects on its own, independent of the lane-0 rule, so it never actually
+// exercised I2.
+//
+// Discrimination check, run by hand against this same witness: restoring the old,
+// `HASH_LEFT`-gated rule (`is_indigest * HASH_LEFT * (1 - ACT0) = 0`) makes the witness
+// VERIFY (it's vacuous here, since the appended row's `HASH_LEFT = 0`); the current rule
+// (`is_real_indigest * (1 - ACT0) = 0`) rejects it, by that single constraint alone.
+///
+/// Builds the faithful witness described above from an honest `Traces`, mutating `t.cpu` (row
+/// insertion + CLK shift), `t.memory` (rebuilt at the shifted `CLK` offset — every access after
+/// the insertion point moves by one timestamp unit), `t.range` (RANGE8 is exact-count
+/// accounting: every byte-column value this edit changes — the moved `IHVL0..31`/new row's
+/// `LEFT0/LEFT0+1`/`IDX0/IDX0+1`, and whatever `memory_trace` itself demands at the two
+/// offsets — is tracked and applied as a delta), `t.poseidon2` (append the new row's own
+/// permutation event), and `t.public_values` (`pv::IN0..7` becomes the canonical encoding of
+/// `perm(H_honest)`, the gratuitous extra permutation's actual output).
+fn append_gratuitous_indigest_permutation(p: &randprotocol_zkvm::isa::Program, inputs: &[u32], mut t: Traces) -> Traces {
+    let e = execute(p, inputs, &[], 10_000).unwrap();
+    let w = cpu::col::WIDTH;
+    let height = t.cpu.height();
+    let real_row = p.digest_rows() + 1; // the one real indigest row (right after the salt row)
+    let insert_at = real_row + 1; // == p.digest_rows() + input_digest_row_count(inputs.len())
+
+    // The real row's own permutation output — already seeded (by `fill_input_digest_rows`)
+    // into what is, before this edit, the first ordinary instruction row's HS0..7.
+    let real_state_out: [F; 8] = core::array::from_fn(|k| t.cpu.values[insert_at * w + cpu::col::HS0 + k]);
+    let new_state_out = randprotocol_zkvm::hash::permute_state(real_state_out);
+
+    let mut range_removed: Vec<u32> = Vec::new();
+    let mut range_added: Vec<u32> = Vec::new();
+
+    // The real row is no longer last: clear INDIGEST_LAST and its canonical encoding (moving
+    // to the new row below). RANGE8's demand for the old IHVL bytes disappears with it.
+    t.cpu.values[real_row * w + cpu::col::INDIGEST_LAST] = F::ZERO;
+    for kk in 0..32 {
+        let old_byte = t.cpu.values[real_row * w + cpu::col::IHVL0 + kk].as_canonical_u64() as u32;
+        range_removed.push(old_byte);
+        t.cpu.values[real_row * w + cpu::col::IHVL0 + kk] = F::ZERO;
+    }
+    for c in 0..4 {
+        t.cpu.values[real_row * w + cpu::col::IHIMAX0 + c] = F::ZERO;
+        t.cpu.values[real_row * w + cpu::col::IINV0 + c] = F::ZERO;
+    }
+
+    let real_hash_idx = t.cpu.values[real_row * w + cpu::col::HASH_IDX].as_canonical_u64() as u32;
+    let base_pc = t.cpu.values[real_row * w + cpu::col::PC];
+    let new_clk = t.cpu.values[real_row * w + cpu::col::CLK] + F::ONE;
+
+    let mut new_row = vec![F::ZERO; w];
+    new_row[cpu::col::IS_REAL] = F::ONE;
+    new_row[cpu::col::IS_INDIGEST] = F::ONE;
+    new_row[cpu::col::INDIGEST_LAST] = F::ONE;
+    new_row[cpu::col::HASH_N] = F::from_u32(4);
+    new_row[cpu::col::HASH_LEFT] = F::ZERO; // carried in — the real block already drained it
+    new_row[cpu::col::HASH_IDX] = F::from_u32(real_hash_idx + 1);
+    new_row[cpu::col::CLK] = new_clk;
+    new_row[cpu::col::PC] = base_pc;
+    new_row[cpu::col::NEXT_PC] = base_pc; // is_indigest holds PC still
+    for k in 0..8 { new_row[cpu::col::HS0 + k] = real_state_out[k]; }
+    for k in 0..4 { new_row[cpu::col::HV0 + k] = real_state_out[k]; } // ACT = 0: inactive-lane carry
+    let (l0, l1) = (0u32, 0u32); // byte limbs of HASH_LEFT = 0
+    new_row[cpu::col::LEFT0] = F::from_u32(l0);
+    new_row[cpu::col::LEFT0 + 1] = F::from_u32(l1);
+    range_added.push(l0);
+    range_added.push(l1);
+    let new_idx = real_hash_idx + 1;
+    let (i0, i1) = (new_idx & 0xff, (new_idx >> 8) & 0xff);
+    new_row[cpu::col::IDX0] = F::from_u32(i0);
+    new_row[cpu::col::IDX0 + 1] = F::from_u32(i1);
+    range_added.push(i0);
+    range_added.push(i1);
+
+    // The gratuitous extra permutation's own canonical H_IN encoding, moved here.
+    let words = randprotocol_zkvm::hash::split_digest([new_state_out[0], new_state_out[1], new_state_out[2], new_state_out[3]]);
+    for kk in 0..8 {
+        let bl = limbs(words[kk]);
+        for j in 0..4 {
+            range_added.push(bl[j].as_canonical_u64() as u32);
+            new_row[cpu::col::IHVL0 + 4 * kk + j] = bl[j];
+        }
+    }
+    for j in 0..4usize {
+        let hi = words[2 * j + 1];
+        if hi == u32::MAX {
+            new_row[cpu::col::IHIMAX0 + j] = F::ONE;
+        } else {
+            new_row[cpu::col::IINV0 + j] = (F::from_u32(hi) - F::from_u32(u32::MAX)).inverse();
+        }
+    }
+
+    // Splice the new row in right after the real one, shifting every later row down by one
+    // (CLK bumped for every IS_REAL row, since one more genuine cycle now precedes them) —
+    // drop the table's very last (all-zero-plus-WRITTEN-accumulator padding) row to keep the
+    // height fixed; there are hundreds of identical padding rows to spare.
+    let mut values = Vec::with_capacity(height * w);
+    values.extend_from_slice(&t.cpu.values[..insert_at * w]);
+    values.extend_from_slice(&new_row);
+    for row in insert_at..height - 1 {
+        let mut r: Vec<F> = t.cpu.values[row * w..(row + 1) * w].to_vec();
+        if row == insert_at {
+            // The (now-shifted) first ordinary row is where the extra permutation's own
+            // output belongs: POSEIDON2's n(HS0..7) must equal permute(new_row's state_in).
+            for k in 0..8 { r[cpu::col::HS0 + k] = new_state_out[k]; }
+        }
+        if r[cpu::col::IS_REAL] == F::ONE { r[cpu::col::CLK] += F::ONE; }
+        values.extend_from_slice(&r);
+    }
+    assert_eq!(values.len(), height * w);
+    t.cpu = p3_matrix::dense::RowMajorMatrix::new(values, w);
+
+    // MEMORY: every shifted row's CLK (hence every SLOT timestamp, `ts = CLK*4 + slot`) moved
+    // by one — rebuild the whole table at the new offset (`insert_at + 1`, matching the shift
+    // above exactly) rather than hand-patching timestamps.
+    let mem_height = t.memory.height();
+    let mut old_mem_range = range::RangeCounts::default();
+    let _ = memory::memory_trace(&e.events, insert_at as u32, mem_height, &mut old_mem_range);
+    let mut new_mem_range = range::RangeCounts::default();
+    t.memory = memory::memory_trace(&e.events, (insert_at + 1) as u32, mem_height, &mut new_mem_range);
+
+    // RANGE8 is exact-count accounting: apply the cpu-side byte-demand deltas collected above,
+    // plus whatever delta the memory rebuild itself introduced (a pure CLK-offset shift should
+    // leave every same-address delta unchanged, but this is computed, not assumed).
+    let rw = range::col::WIDTH;
+    for b in range_removed { t.range.values[b as usize * rw + range::col::M_RANGE] -= F::ONE; }
+    for b in range_added { t.range.values[b as usize * rw + range::col::M_RANGE] += F::ONE; }
+    for v in 0..256usize {
+        let old_c = old_mem_range.range.get(v).copied().unwrap_or(0);
+        let new_c = new_mem_range.range.get(v).copied().unwrap_or(0);
+        if new_c > old_c { t.range.values[v * rw + range::col::M_RANGE] += F::from_u32((new_c - old_c) as u32); }
+        if old_c > new_c { t.range.values[v * rw + range::col::M_RANGE] -= F::from_u32((old_c - new_c) as u32); }
+    }
+
+    // POSEIDON2: append the new row's own genuine permutation event.
+    let digest_blocks = randprotocol_zkvm::hash::program_digest_rows(p.base_pc, &p.words);
+    let indigest_blocks = randprotocol_zkvm::hash::input_digest_rows(TEST_SALT, inputs);
+    let extra_block = randprotocol_zkvm::hash::DigestBlock {
+        idx: new_idx,
+        left_before: 0,
+        words: [0; 4],
+        active: [false; 4],
+        state_in: real_state_out,
+        state_out: new_state_out,
+    };
+    let to_events = |blocks: &[randprotocol_zkvm::hash::DigestBlock]| -> Vec<poseidon2::Poseidon2Event> {
+        blocks.iter().map(|blk| {
+            let mut input = blk.state_in;
+            for k in 0..4 { if blk.active[k] { input[k] = F::from_u32(blk.words[k]); } }
+            poseidon2::Poseidon2Event { input, output: blk.state_out }
+        }).collect()
+    };
+    let all: Vec<poseidon2::Poseidon2Event> = to_events(&digest_blocks)
+        .into_iter()
+        .chain(to_events(&indigest_blocks))
+        .chain(to_events(std::slice::from_ref(&extra_block)))
+        .collect();
+    t.poseidon2 = poseidon2::poseidon2_trace(&all, t.poseidon2.height());
+
+    // pv::IN0..7 = the canonical encoding of perm(H_honest) — the gratuitous extra
+    // permutation's actual output, exactly what an otherwise-honest prover computing H_IN off
+    // this witness would publish.
+    for k in 0..8 { t.public_values[cpu::pv::IN0 + k] = F::from_u32(words[k]); }
+
+    t
+}
+
+#[test]
+fn an_appended_all_inactive_indigest_row_after_a_block_aligned_n_in_is_rejected() {
+    let inputs = [400u32, 250, 300, 75]; // n_in = 4, one full real block
+    let (m, p, t) = setup_with_inputs(&inputs);
+    let t = append_gratuitous_indigest_permutation(&p, &inputs, t);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// (e) out-of-window MULT_READ = 1 on a padding row rejects.
+#[test]
+fn a_mult_read_bumped_on_an_input_padding_row_is_rejected() {
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    let iw = randprotocol_zkvm::tables::input::col::WIDTH;
+    assert!(t.input.height() > 4, "the input table has spare padding rows past the 4 real ones");
+    t.input.values[4 * iw + randprotocol_zkvm::tables::input::col::MULT_READ] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ───────────────────────────── M4.2: the KECCAK syscall ─────────────────────────────
+//
+// `guests::keccak_demo(b"hi")` is one `SYS_KECCAK` cpu row plus one real 32-row keccak block,
+// at tier 10. The block sits first in the keccak table (blocks are filled in event order), so
+// its rows are `0..BLOCK` and every later block is padding.
+
+/// The keccak-side twin of `setup_poseidon2`.
+fn setup_keccak() -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::keccak_demo(b"hi");
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    (m, p, t)
+}
+
+/// A keccak table that actually has a padding block to forge on. M4.2 Task 6 made the table
+/// optional, so a keccak-free guest no longer carries one at all, and `setup_keccak`'s single
+/// permutation fills its one block exactly (`klh = 5`, 32 rows, all real). Three permutations
+/// need three 32-row blocks rounded up to `2^7 = 128` rows, i.e. four blocks — blocks 0..=2
+/// real, **block 3 padding**.
+fn setup_keccak_with_a_padding_block() -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
+    const BUF: i32 = 0x1000;
+    let m = Machine::new(FriProfile::Test);
+    let mut a = Assembler::new(0);
+    a.extend(li(8, BUF));
+    for _ in 0..3 {
+        a.extend(call_keccak(BUF / 4));
+    }
+    a.extend(halt());
+    let p = a.assemble();
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    assert_eq!(t.keccak_log_height, 7, "three blocks rounded up to four");
+    (m, p, t)
+}
+
+/// The cpu-table row index of the one `SYS_KECCAK` ecall row.
+fn keccak_row(t: &Traces) -> usize {
+    let w = cpu::col::WIDTH;
+    (0..t.cpu.height())
+        .find(|&r| t.cpu.values[r * w + cpu::col::SYS_KECCAK] == F::ONE)
+        .expect("a SYS_KECCAK row")
+}
+
+/// A flipped state bit inside the permutation is pinned three ways at once (rule 5 recomputes
+/// this row's `A` limb from it, rule 6 the column parity, rule 7 feeds it to χ) and, past
+/// those, changes the output the chip writes back to RAM.
+#[test]
+fn tampering_a_keccak_state_bit_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    let w = keccak::col::WIDTH;
+    let cell = 5 * w + keccak::col::AP0 + 100;
+    let kt = t.keccak.as_mut().expect("keccak_demo declares a keccak table");
+    kt.values[cell] = F::ONE - kt.values[cell];
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// Rule 11's `IS_LAST_ROUND·(IS_REAL − MULT) = 0`: a padding block cannot claim a `KECCAK`
+/// entry it has no syscall behind. The forged entry has no consumer either, so the `KECCAK`
+/// bus is left unbalanced on top of the local constraint failure. (Before M4.2 Task 6 this
+/// used `guests::fib`, whose keccak table was the one padding block every proof carried; the
+/// table is optional now, so the padding block has to come from a guest that genuinely has
+/// one — three permutations rounded up to four blocks.)
+#[test]
+fn bumping_keccak_mult_on_a_padding_block_is_rejected() {
+    let (m, p, mut t) = setup_keccak_with_a_padding_block();
+    let kt = t.keccak.as_mut().expect("this guest declares a keccak table");
+    let w = keccak::col::WIDTH;
+    let row = 3 * keccak::BLOCK + keccak::ROUNDS - 1; // block 3's last round row
+    assert_eq!(kt.values[row * w + keccak::col::IS_REAL], F::ZERO, "block 3 is padding");
+    kt.values[row * w + keccak::col::MULT] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M4.2 (Task 6): the cpu table is unchanged by making the keccak table optional — it is the
+/// *bus* that does the work. Take `keccak_demo`'s honest traces, drop the keccak table
+/// entirely (exactly the shape a keccak-free proof has) and leave the real `SYS_KECCAK` cpu row
+/// in place: the `KECCAK` bus now has a consumer and no provider at all, so it cannot balance.
+/// This is the check that makes "no keccak table" safe rather than merely smaller.
+#[test]
+fn a_keccak_syscall_without_a_keccak_table_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    assert_eq!(t.keccak_log_height, 5, "the honest witness declares one block");
+    assert_eq!(t.cpu.height(), Tier(10).cpu_height());
+    let w = cpu::col::WIDTH;
+    let row = keccak_row(&t);
+    assert_eq!(t.cpu.values[row * w + cpu::col::SYS_KECCAK], F::ONE, "the syscall row stays");
+    t.keccak = None;
+    t.keccak_log_height = 0;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `IN` is block-constant (rule 1) and equals `A` on row 0 (rule 2), and it is what the chip's
+/// 50 read messages carry — so bumping it uniformly across the block keeps rules 1/2 happy
+/// (row 0's `A` moves with it) and instead breaks the `MEMORY` permutation against the words
+/// the guest actually stored.
+#[test]
+fn a_keccak_input_limb_that_disagrees_with_memory_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    let w = keccak::col::WIDTH;
+    let kt = t.keccak.as_mut().expect("keccak_demo declares a keccak table");
+    for r in 0..keccak::BLOCK {
+        kt.values[r * w + keccak::col::IN0] += F::ONE;
+    }
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// The idle rows' `A` is the permutation's output — what the 50 write-back messages carry.
+/// Bumping it there changes the value written to RAM (and trips rules 9/10, which pin the idle
+/// rows' `A` to the last round's own output).
+#[test]
+fn a_keccak_output_limb_that_disagrees_with_the_permutation_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    let w = keccak::col::WIDTH;
+    let kt = t.keccak.as_mut().expect("keccak_demo declares a keccak table");
+    for r in keccak::ROUNDS..keccak::BLOCK {
+        kt.values[r * w + keccak::col::A0] += F::ONE;
+    }
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `SYS_KECCAK` joins the `SELECTORS` padding-row gate — and, set on an all-zero padding row,
+/// also asks the `KECCAK` bus for an entry at `(0, 0)` that nothing provides (M4.2 Task 6:
+/// `guests::fib` declares no keccak table at all now, so there is not even a padding block on
+/// the other side of that bus).
+#[test]
+fn bumping_sys_keccak_on_a_padding_row_is_rejected() {
+    let (m, p, mut t) = setup();
+    assert_eq!(t.keccak_log_height, 0, "a keccak-free guest carries no keccak table");
+    let w = cpu::col::WIDTH;
+    let pad = t.cpu.height() - 1;
+    assert_eq!(t.cpu.values[pad * w + cpu::col::IS_REAL], F::ZERO, "last cpu row is padding");
+    t.cpu.values[pad * w + cpu::col::SYS_KECCAK] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `an_unbounded_hash_ptr_that_aliases_a_register_key_is_rejected`'s `SYS_KECCAK` twin: the
+/// chip does field addition `PTR + w` for `w < 50` and nothing in the *chip* bounds `PTR`, so
+/// the cpu row's `HASH_PTR` limb decomposition (`HP0..3`/`HP3_HI`, now gated on `SYS_HASH +
+/// SYS_KECCAK`) is what keeps the address off any other `MEMORY` key. Leaving the limbs at
+/// their honest values makes this trip the recomposition equation directly.
+#[test]
+fn an_unbounded_keccak_ptr_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    let w = cpu::col::WIDTH;
+    let row = keccak_row(&t);
+    t.cpu.values[row * w + cpu::col::HASH_PTR] = F::from_u32(REG_A0) - F::from_u64(1u64 << 30);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// The `KECCAK` bus in the other direction: a syscall row whose permutation is not in the
+/// keccak table at all (the real block demoted to padding) has no provider for its lookup —
+/// and the 100 `MEMORY` messages the block no longer sends leave that bus unbalanced too.
+#[test]
+fn a_keccak_call_whose_permutation_is_missing_is_rejected() {
+    let (m, p, mut t) = setup_keccak();
+    let w = keccak::col::WIDTH;
+    let kt = t.keccak.as_mut().expect("keccak_demo declares a keccak table");
+    for r in 0..keccak::BLOCK {
+        kt.values[r * w + keccak::col::IS_REAL] = F::ZERO;
+        kt.values[r * w + keccak::col::MULT] = F::ZERO;
+    }
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ── M4.2 controller ruling 2: the tier is the keccak table's one ceiling ──
+
+/// `proof.keccak_log_height` is prover-declared and untrusted, and it sizes both the keccak
+/// table's own AIR instance and (before it) the verifier key. A permutation costs a cycle, so a
+/// tier-10 proof can honestly need at most `t + 5 = 15`; anything past that is a request for a
+/// table with more permutation slots than the tier has cycles. The check runs before
+/// `log_ext_degrees` and before `verifier_key`, so the attacker's matching `degree_bits` edit
+/// (which is what they would have to do to get past the degree-bits equality check) buys them
+/// nothing — and the verifier never pays for a preprocessed-commitment recomputation, which
+/// `cached_keys() == 0` is the observable proof of.
+#[test]
+fn a_keccak_height_past_the_tiers_ceiling_is_rejected_before_any_verifier_key_is_built() {
+    use randprotocol_zkvm::machine::VerifyError;
+    let prover = Machine::new(FriProfile::Test);
+    // M4.2 (Task 6): a guest that actually calls `KECCAK`, so the honest proof carries the
+    // ninth instance and the attacker's `degree_bits` edit below has a keccak entry to edit.
+    let p = guests::keccak_demo(b"hi");
+    let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
+    assert_eq!(proof.keccak_log_height, 5);
+    assert_eq!(proof.batch.degree_bits.len(), 10, "eight mandatory tables, the keccak one, and the public one");
+    assert_eq!(Tier(10).max_keccak_log_height(), 15);
+    // `t + 6`, with `degree_bits` adjusted to match (the keccak instance is last in `chips()`
+    // order; `+ 1` is the hiding config's `is_zk`).
+    proof.keccak_log_height = 16;
+    // Constraint set 6: the optional hash instance is no longer the last entry — the
+    // mandatory `public` one is appended after it (`machine::chips`), so it is second to
+    // last.
+    let last = proof.batch.degree_bits.len() - 2;
+    proof.batch.degree_bits[last] = 16 + 1;
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::KeccakHeightExceedsTier)));
+    assert_eq!(verifier.cached_keys(), 0, "the range check must precede the verifier key");
+}
+
+/// The lower bound's other half, now that M4.2 Task 6 has carved `0` out of it: `0` means "no
+/// keccak table" and is legal, but any *other* value below one full 32-row block is still
+/// nonsense — a table too short to hold the permutation it claims — and is rejected before it
+/// can size anything.
+#[test]
+fn a_nonzero_keccak_height_below_one_block_is_rejected_before_any_verifier_key_is_built() {
+    use randprotocol_zkvm::machine::VerifyError;
+    let prover = Machine::new(FriProfile::Test);
+    let p = guests::keccak_demo(b"hi");
+    let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
+    assert_eq!(proof.keccak_log_height, 5);
+    proof.keccak_log_height = 3;
+    // Constraint set 6: the optional hash instance is no longer the last entry — the
+    // mandatory `public` one is appended after it (`machine::chips`), so it is second to
+    // last.
+    let last = proof.batch.degree_bits.len() - 2;
+    proof.batch.degree_bits[last] = 3 + 1;
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::KeccakHeight)));
+    assert_eq!(verifier.cached_keys(), 0, "the range check must precede the verifier key");
+}
+
+/// The memory table's declared height (controller ruling 1) gets the same treatment on its own
+/// lower bound: a proof cannot declare less than the tier's `2^(t+2)` floor, which is what
+/// keeps the declaration from revealing a guest's memory-access count below the resolution the
+/// tier already publishes.
+#[test]
+fn a_memory_height_below_the_tier_floor_is_rejected_before_any_verifier_key_is_built() {
+    use randprotocol_zkvm::machine::VerifyError;
+    let prover = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
+    assert_eq!(proof.mem_log_height, 12);
+    proof.mem_log_height = 11;
+    proof.batch.degree_bits[2] = 11 + 1; // memory is instance 2 in `chips()` order
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::MemoryHeight)));
+    assert_eq!(verifier.cached_keys(), 0);
+}
+
+/// M4.2 (Task 5 review): the tier bound is not the *only* keccak ceiling, because it is not a
+/// cheap one at the top tier. `Tier(20).max_keccak_log_height()` is 25, so a tier-20 header
+/// declaring `klh = 25` passes that relation and would have the verifier build a 2^25-row,
+/// 99-column preprocessed keccak trace before any later check could reject the proof. The flat
+/// `tables::keccak::MAX_LOG_HEIGHT = 20` is what refuses it, as `VerifyError::KeccakHeight`.
+///
+/// Checked through `machine::check_declared_heights` rather than a real proof on purpose: the
+/// forgery only *bites* at tier 20, and a tier-20 proof is 2^20 cpu rows — far outside what this
+/// suite can afford to prove — while the declared shape is exactly what the check reads. The
+/// test below pairs this with the `cached_keys() == 0` evidence on a proof the suite can afford.
+#[test]
+fn a_keccak_height_past_the_absolute_cap_is_rejected_where_the_tier_bound_would_admit_it() {
+    use randprotocol_zkvm::machine::{check_declared_heights, VerifyError};
+    let (plh, ilh) = (program::MIN_LOG_HEIGHT, randprotocol_zkvm::tables::input::MIN_LOG_HEIGHT);
+    let mlh = Tier(20).min_mem_log_height();
+    // The tier relation alone admits everything up to 25 here.
+    assert_eq!(Tier(20).max_keccak_log_height(), 25);
+    assert_eq!(keccak::MAX_LOG_HEIGHT, 20);
+    for klh in [21, 24, 25, u8::MAX] {
+        assert!(
+            matches!(check_declared_heights(Tier(20), plh, ilh, klh, 0, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, mlh), Err(VerifyError::KeccakHeight)),
+            "klh = {klh} is past the absolute cap and must be refused by the range check",
+        );
+    }
+    // The cap itself, and everything under it, still passes the declared-shape checks at a tier
+    // whose own bound is looser — this is a ceiling, not a narrowing of what tier 20 may declare.
+    for klh in [0, keccak::MIN_LOG_HEIGHT, 19, keccak::MAX_LOG_HEIGHT] {
+        assert!(check_declared_heights(Tier(20), plh, ilh, klh, 0, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, mlh).is_ok(), "klh = {klh} is legal at tier 20");
+    }
+    // And where the tier is the tighter of the two, the tier variant is still what a forgery
+    // earns: at tier 10 anything in `16..=20` is flat-legal but past `t + 5`.
+    assert!(matches!(
+        check_declared_heights(Tier(10), plh, ilh, 16, 0, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, Tier(10).min_mem_log_height()),
+        Err(VerifyError::KeccakHeightExceedsTier)
+    ));
+    assert!(matches!(
+        check_declared_heights(Tier(10), plh, ilh, 21, 0, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, Tier(10).min_mem_log_height()),
+        Err(VerifyError::KeccakHeight),
+    ), "past both bounds is reported by the range check, which runs first");
+}
+
+/// The same cap on a real proof, for the half `check_declared_heights` alone cannot show: that it
+/// runs before the verifier key is built. A tier-10 proof forged to `klh = 25` (`degree_bits`
+/// edited to match, which is what the attacker would have to do to reach the equality check)
+/// is refused for a comparison's worth of work, not a preprocessed-commitment recomputation.
+#[test]
+fn a_keccak_height_past_the_absolute_cap_is_rejected_before_any_verifier_key_is_built() {
+    use randprotocol_zkvm::machine::VerifyError;
+    let prover = Machine::new(FriProfile::Test);
+    let p = guests::keccak_demo(b"hi");
+    let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
+    assert_eq!(proof.keccak_log_height, 5);
+    proof.keccak_log_height = 25;
+    // Constraint set 6: the optional hash instance is no longer the last entry — the
+    // mandatory `public` one is appended after it (`machine::chips`), so it is second to
+    // last.
+    let last = proof.batch.degree_bits.len() - 2;
+    proof.batch.degree_bits[last] = 25 + 1;
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::KeccakHeight)));
+    assert_eq!(verifier.cached_keys(), 0, "the range check must precede the verifier key");
+}
+
+/// The memory table's upper bound (controller ruling 1), the half the lower-bound test above
+/// does not cover: `MAX_MEM_LOG_HEIGHT` is the defensive ceiling on an untrusted shift amount,
+/// and a declaration past it is refused before anything is sized from it.
+#[test]
+fn a_memory_height_past_the_ceiling_is_rejected_before_any_verifier_key_is_built() {
+    use randprotocol_zkvm::machine::{check_declared_heights, VerifyError, MAX_MEM_LOG_HEIGHT};
+    let prover = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
+    assert_eq!(proof.mem_log_height, 12);
+    assert_eq!(MAX_MEM_LOG_HEIGHT, 24);
+    proof.mem_log_height = 25;
+    proof.batch.degree_bits[2] = 25 + 1; // memory is instance 2 in `chips()` order
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::MemoryHeight)));
+    assert_eq!(verifier.cached_keys(), 0, "the range check must precede the verifier key");
+    // The same bound at a tier where it is reachable in principle (tier 20's floor is 22), so
+    // the ceiling is doing its own work rather than standing behind the tier floor.
+    let (plh, ilh, klh) = (program::MIN_LOG_HEIGHT, randprotocol_zkvm::tables::input::MIN_LOG_HEIGHT, 0);
+    assert!(check_declared_heights(Tier(20), plh, ilh, klh, 0, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, 24).is_ok());
+    assert!(matches!(check_declared_heights(Tier(20), plh, ilh, klh, 0, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, 25), Err(VerifyError::MemoryHeight)));
+}
+
+// ── M4.2 controller ruling 3: the cubic pointer rule on a SYS_KECCAK cpu row ──
+//
+// `SYS_KECCAK · HP3_HI · (HP3_HI − 1) · (HP3_HI − 2) = 0` (`tables::cpu`'s eval) is the rule
+// that tightens the keccak pointer from the `AND4[HP3_HI, 0xC, 0]` lookup's `ptr < 2^30` to
+// `ptr < 0x3000_0000`, so that the chip's own `PTR + w` (`w < 50`) address arithmetic stays
+// inside the range the `AND4` bound covers. `HP3_HI = 3` is exactly the value the lookup admits
+// and the cubic must not.
+//
+// A `Traces` tamper cannot express it: `HASH_PTR` is pinned equal to `B` (the `a0` register
+// value the ecall row reads over `MEMORY`), so moving the pointer's top nibble means moving the
+// register value the guest actually held, and every limb, lookup receipt and memory message
+// that follows from it. And the emulator refuses the pointer outright
+// (`ExecError::KeccakPtrOutOfRange`, the reference-semantics half of the same bound), so no
+// `execute` call produces such a run either.
+//
+// So the witness is built directly instead — as the emulator *would* have built it without that
+// refusal. The guest takes its pointer from a private input rather than an immediate, which
+// makes the whole relocation a pure `Execution` edit: the program words, and therefore `hc`,
+// the program table and every `PROGRAM` message, are byte-identical between the two pointers,
+// and `build_traces_salted` then fills every table from the relocated events exactly as it
+// would for an honest run. `a_relocated_keccak_pointer_inside_the_bound_still_proves` is the
+// control that pins that: the same helper, the same program, a pointer whose top nibble is 2
+// instead of 3, and the proof verifies.
+
+/// `read_input(0) -> a0; KECCAK a0; halt` — the pointer is data, not an immediate.
+fn keccak_ptr_from_input() -> randprotocol_zkvm::isa::Program {
+    let mut a = Assembler::new(0);
+    a.extend(read_input(0));
+    a.extend(li(randprotocol_zkvm::isa::REG_A7, randprotocol_zkvm::isa::SYS_KECCAK as i32));
+    a.push(ecall());
+    a.extend(halt());
+    a.assemble()
+}
+
+/// Rewrites an honest `Execution` of `keccak_ptr_from_input` with input `p0` into the execution
+/// the emulator would have produced for input `p1`: the input word itself (and the `a0` it is
+/// written to, and every later read of `a0`), the `KECCAK` syscall's pointer, and the 50
+/// read/50 write addresses the permutation makes. `p0` is chosen so that no other value in the
+/// run collides with it — every other register and memory value in this guest is 0, 2, 4 or a
+/// pc — which is what makes the value-equality matching below exact rather than approximate.
+fn relocate_keccak_ptr(exec: &mut randprotocol_zkvm::emulator::Execution, p0: u32, p1: u32) {
+    use randprotocol_zkvm::emulator::Syscall;
+    for e in &mut exec.events {
+        if e.b == p0 { e.b = p1; }
+        if e.c == p0 { e.c = p1; }
+        for acc in e.accesses.iter_mut().filter(|a| a.value == p0) { acc.value = p1; }
+        match &mut e.sys {
+            Some(Syscall::ReadInput { word, .. }) if *word == p0 => *word = p1,
+            Some(Syscall::Keccak { ptr }) if *ptr == p0 => *ptr = p1,
+            _ => {}
+        }
+        if let Some(k) = &mut e.keccak_row {
+            assert_eq!(k.ptr, p0);
+            k.ptr = p1;
+        }
+        for acc in &mut e.keccak_accesses {
+            assert!((p0..p0 + 50).contains(&acc.addr));
+            acc.addr = p1 + (acc.addr - p0);
+        }
+    }
+}
+
+/// Builds the relocated traces for pointer `p1`, checking on the way that the cpu row really
+/// does carry the intended `HP3_HI` with a consistent limb decomposition (so the test cannot
+/// silently degenerate into checking some other rule).
+fn keccak_ptr_traces(p1: u32) -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
+    const P0: u32 = 0x2000_0000;
+    let m = Machine::new(FriProfile::Test);
+    let p = keccak_ptr_from_input();
+    let mut e = execute(&p, &[P0], &[], 10_000).unwrap();
+    relocate_keccak_ptr(&mut e, P0, p1);
+    let t = build_traces_salted(&p, &[p1], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = cpu::col::WIDTH;
+    let row = keccak_row(&t);
+    // `HASH_PTR = B` (the `a0` the row read) and the four limbs recompose to it: the two
+    // premises the cubic rule is the only thing left checking.
+    assert_eq!(t.cpu.values[row * w + cpu::col::HASH_PTR], F::from_u32(p1));
+    assert_eq!(t.cpu.values[row * w + cpu::col::B], F::from_u32(p1));
+    let limbs_sum: u64 = (0..4)
+        .map(|i| t.cpu.values[row * w + cpu::col::HP0 + i].as_canonical_u64() << (8 * i))
+        .sum();
+    assert_eq!(limbs_sum, p1 as u64);
+    assert_eq!(t.cpu.values[row * w + cpu::col::HP3_HI], F::from_u32(p1 >> 28));
+    (m, p, t)
+}
+
+/// The control: top nibble 2, everything else identical. If the relocation helper produced a
+/// witness that were wrong in any *other* way, this would fail too — and the negative test
+/// below would be passing for the wrong reason.
+#[test]
+fn a_relocated_keccak_pointer_inside_the_bound_still_proves() {
+    let (m, p, t) = keccak_ptr_traces(0x2800_0000);
+    let proof = m.prove_traces(&p, &t, Tier(10));
+    m.verify(&p.digest(), &proof).unwrap();
+}
+
+/// And top nibble 3 — admitted by `AND4[HP3_HI, 0xC, 0]`, rejected by the cubic.
+#[test]
+fn a_keccak_pointer_with_hp3_hi_equal_to_three_is_rejected() {
+    let (m, p, t) = keccak_ptr_traces(0x3000_0000);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ───────────────────────────── M4.4: the SHA256 syscall ─────────────────────────────
+//
+// `guests::sha256_demo()` is one `SYS_SHA256` cpu row plus one real 64-row sha256 block, at
+// tier 10. The block sits first in the sha256 table (blocks are filled in event order), so its
+// rows are `0..BLOCK` and every later block is padding.
+
+/// The sha256-side twin of `setup_keccak`.
+fn setup_sha256() -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::sha256_demo();
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    assert_eq!(t.sha256_log_height, 6, "one compression fills the minimum block exactly");
+    (m, p, t)
+}
+
+/// A sha256 table that actually has a padding block to forge on: `setup_sha256`'s single
+/// compression fills its one block exactly, so the forgery needs a guest whose block count is
+/// not a power of two. Three compressions are 192 rows rounded up to `2^8 = 256`, i.e. four
+/// blocks — blocks 0..=2 real, **block 3 padding**.
+fn setup_sha256_with_a_padding_block() -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
+    const BUF: i32 = 0x1000;
+    let m = Machine::new(FriProfile::Test);
+    let mut a = Assembler::new(0);
+    a.extend(li(8, BUF));
+    for _ in 0..3 {
+        a.extend(call_sha256(BUF as u32 / 4));
+    }
+    a.extend(halt());
+    let p = a.assemble();
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    assert_eq!(t.sha256_log_height, 8, "three blocks rounded up to four");
+    (m, p, t)
+}
+
+/// The cpu-table row index of the one `SYS_SHA256` ecall row.
+fn sha256_cpu_row(t: &Traces) -> usize {
+    let w = cpu::col::WIDTH;
+    (0..t.cpu.height())
+        .find(|&r| t.cpu.values[r * w + cpu::col::SYS_SHA256] == F::ONE)
+        .expect("a SYS_SHA256 row")
+}
+
+/// A flipped working-variable bit inside the compression is pinned several ways at once (this
+/// row's `Σ0`/`Maj` read it, the previous row's `ANEW_BITS` transition pinned it, and the final
+/// add's tail rows read the a-chain back out) and, past those, changes the digest the chip
+/// writes back to RAM.
+#[test]
+fn sha256_round_bit_flip_is_rejected() {
+    use randprotocol_zkvm::tables::sha256;
+    let (m, p, mut t) = setup_sha256();
+    let w = sha256::col::WIDTH;
+    let cell = 7 * w + sha256::col::A_BITS + 11;
+    let st = t.sha256.as_mut().expect("sha256_demo declares a sha256 table");
+    st.values[cell] = F::ONE - st.values[cell];
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// The write-backs are sent from the block's last row, and `HOUT` is what they carry. Changing
+/// one there breaks both the `TAIL_COPY` carry-down from row 62 (rule 10) and the `MEMORY`
+/// permutation against what the guest's later `lw` reads.
+#[test]
+fn sha256_write_back_tamper_is_rejected() {
+    use randprotocol_zkvm::tables::sha256;
+    let (m, p, mut t) = setup_sha256();
+    let w = sha256::col::WIDTH;
+    let st = t.sha256.as_mut().expect("sha256_demo declares a sha256 table");
+    st.values[(sha256::BLOCK - 1) * w + sha256::col::HOUT + 3] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// A tampered schedule word on a round past 16, where `W[t]` is computed rather than read:
+/// `WNEW` is pinned to its own bits and to `W[t−16] + σ0 + W[t−7] + σ1` (rule 7), and it feeds
+/// this round's `T1`.
+#[test]
+fn sha256_schedule_tamper_is_rejected() {
+    use randprotocol_zkvm::tables::sha256;
+    let (m, p, mut t) = setup_sha256();
+    let w = sha256::col::WIDTH;
+    let st = t.sha256.as_mut().expect("sha256_demo declares a sha256 table");
+    st.values[20 * w + sha256::col::WNEW] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// M4.4 (the M4.2 Task 6 argument again): the cpu table is unchanged by making the sha256 table
+/// optional — it is the *bus* that does the work. Take `sha256_demo`'s honest traces, drop the
+/// sha256 table entirely (exactly the shape a sha256-free proof has) and leave the real
+/// `SYS_SHA256` cpu row in place: the `SHA256` bus now has a consumer and no provider at all,
+/// so it cannot balance. This is the check that makes "no sha256 table" safe rather than merely
+/// smaller.
+#[test]
+fn sha256_row_without_a_sha256_table_is_rejected() {
+    let (m, p, mut t) = setup_sha256();
+    let w = cpu::col::WIDTH;
+    let row = sha256_cpu_row(&t);
+    assert_eq!(t.cpu.values[row * w + cpu::col::SYS_SHA256], F::ONE, "the syscall row stays");
+    t.sha256 = None;
+    t.sha256_log_height = 0;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `proof.sha256_log_height` is prover-declared and untrusted, and it sizes both the sha256
+/// table's own AIR instance and (before it) the verifier key. A compression costs a cycle and
+/// occupies one 64-row block, so a tier-`ℓ` proof can honestly need at most `ℓ + 6`; `ℓ + 7` is a
+/// request for a table with more compression slots than the tier has cycles. The check runs
+/// before `log_ext_degrees` and before `verifier_key`, which `cached_keys() == 0` is the
+/// observable proof of.
+#[test]
+fn sha256_height_above_the_tier_cap_is_rejected() {
+    use randprotocol_zkvm::machine::VerifyError;
+    let prover = Machine::new(FriProfile::Test);
+    let p = guests::sha256_demo();
+    let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
+    assert_eq!(proof.sha256_log_height, 6);
+    assert_eq!(Tier(10).max_sha256_log_height(), 16);
+    // `t + 7`, with `degree_bits` adjusted to match (the sha256 instance is last in `chips()`
+    // order; `+ 1` is the hiding config's `is_zk`).
+    proof.sha256_log_height = 17;
+    // Constraint set 6: the optional hash instance is no longer the last entry — the
+    // mandatory `public` one is appended after it (`machine::chips`), so it is second to
+    // last.
+    let last = proof.batch.degree_bits.len() - 2;
+    proof.batch.degree_bits[last] = 17 + 1;
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::Sha256HeightExceedsTier)));
+    assert_eq!(verifier.cached_keys(), 0, "the range check must precede the verifier key");
+}
+
+/// A non-zero height below one full 64-row block is nonsense in the other direction — a table
+/// too short to hold the compression it claims — and, like keccak's, is refused by the flat
+/// range check before it can size anything. (`0` is not a height at all: it is "no sha256
+/// table", and legal.)
+#[test]
+fn a_nonzero_sha256_height_below_one_block_is_rejected() {
+    use randprotocol_zkvm::machine::VerifyError;
+    let prover = Machine::new(FriProfile::Test);
+    let p = guests::sha256_demo();
+    let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
+    proof.sha256_log_height = 5;
+    // Constraint set 6: the optional hash instance is no longer the last entry — the
+    // mandatory `public` one is appended after it (`machine::chips`), so it is second to
+    // last.
+    let last = proof.batch.degree_bits.len() - 2;
+    proof.batch.degree_bits[last] = 5 + 1;
+    let verifier = Machine::new(FriProfile::Test);
+    assert!(matches!(verifier.verify(&p.digest(), &proof), Err(VerifyError::Sha256Height)));
+    assert_eq!(verifier.cached_keys(), 0, "the range check must precede the verifier key");
+}
+
+/// The declared-shape checks on `sha256_log_height`, at tiers no test could afford to prove at.
+/// `Tier::max_sha256_log_height` folds the flat `tables::sha256::MAX_LOG_HEIGHT` into the tier
+/// relation (`min(ℓ + 6, 20)`), which is the difference from keccak's spelling and the reason a
+/// tier-20 header cannot ask this verifier to build a 2^26-row preprocessed sha256 trace: at
+/// tier 20 the tier bound *is* the cap, so everything past it is refused, and the flat range
+/// check — which runs first — is what names the failure.
+#[test]
+fn declared_sha256_heights_outside_the_range_or_past_the_tier_are_refused() {
+    use randprotocol_zkvm::machine::{check_declared_heights, VerifyError};
+    use randprotocol_zkvm::tables::sha256;
+    let (plh, ilh) = (program::MIN_LOG_HEIGHT, randprotocol_zkvm::tables::input::MIN_LOG_HEIGHT);
+    let mlh20 = Tier(20).min_mem_log_height();
+    assert_eq!(sha256::MIN_LOG_HEIGHT, 6);
+    assert_eq!(sha256::MAX_LOG_HEIGHT, 20);
+    assert_eq!(Tier(20).max_sha256_log_height(), 20, "the flat cap, not `ℓ + 6 = 26`");
+    for slh in [21, 25, u8::MAX] {
+        assert!(
+            matches!(check_declared_heights(Tier(20), plh, ilh, 0, slh, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, mlh20), Err(VerifyError::Sha256Height)),
+            "slh = {slh} is past the absolute cap and must be refused by the range check",
+        );
+    }
+    for slh in [1, 5] {
+        assert!(
+            matches!(check_declared_heights(Tier(20), plh, ilh, 0, slh, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, mlh20), Err(VerifyError::Sha256Height)),
+            "slh = {slh} is a table too short to hold one block",
+        );
+    }
+    for slh in [0, sha256::MIN_LOG_HEIGHT, 19, sha256::MAX_LOG_HEIGHT] {
+        assert!(check_declared_heights(Tier(20), plh, ilh, 0, slh, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, mlh20).is_ok(), "slh = {slh} is legal at tier 20");
+    }
+    // And where the tier is the tighter of the two, the tier variant is what a forgery earns.
+    let mlh10 = Tier(10).min_mem_log_height();
+    assert_eq!(Tier(10).max_sha256_log_height(), 16);
+    assert!(matches!(
+        check_declared_heights(Tier(10), plh, ilh, 0, 17, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, mlh10),
+        Err(VerifyError::Sha256HeightExceedsTier)
+    ));
+    assert!(matches!(
+        check_declared_heights(Tier(10), plh, ilh, 0, 21, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, mlh10),
+        Err(VerifyError::Sha256Height),
+    ), "past both bounds is reported by the range check, which runs first");
+}
+
+/// The sha256 chip has no `MULT` witness — the `SHA256` count *is* `IS_REAL · IS_FIRST` — so the
+/// keccak table's "real but unpaid block" forgery has to be spelled as flipping a padding
+/// block's `IS_REAL`. That block then provides a `(CLK, PTR)` entry at `(0, 0)` no cpu row looks
+/// up (and `IS_REAL` is block-constant by rule 1, so setting it on the first row alone breaks
+/// that too).
+#[test]
+fn sha256_padding_block_with_a_count_is_rejected() {
+    use randprotocol_zkvm::tables::sha256;
+    let (m, p, mut t) = setup_sha256_with_a_padding_block();
+    let w = sha256::col::WIDTH;
+    let row = 3 * sha256::BLOCK; // block 3's first row, where `IS_FIRST` provides the entry
+    let st = t.sha256.as_mut().expect("this guest declares a sha256 table");
+    assert_eq!(st.values[row * w + sha256::col::IS_REAL], F::ZERO, "block 3 is padding");
+    st.values[row * w + sha256::col::IS_REAL] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `SYS_SHA256` joins the `SELECTORS` padding-row gate (AGENTS.md invariant 2 for the new row
+/// kind) — and, set on an all-zero padding row, also asks the `SHA256` bus for an entry at
+/// `(0, 0)` that nothing provides, since a sha256-free guest carries no sha256 table at all.
+#[test]
+fn bumping_sys_sha256_on_a_padding_row_is_rejected() {
+    let (m, p, mut t) = setup();
+    assert_eq!(t.sha256_log_height, 0, "a sha256-free guest carries no sha256 table");
+    let w = cpu::col::WIDTH;
+    let pad = t.cpu.height() - 1;
+    assert_eq!(t.cpu.values[pad * w + cpu::col::IS_REAL], F::ZERO, "last cpu row is padding");
+    t.cpu.values[pad * w + cpu::col::SYS_SHA256] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// `an_unbounded_keccak_ptr_is_rejected`'s `SYS_SHA256` twin: the chip does field addition
+/// `PTR + w` for `w < 24` and nothing in the *chip* bounds `PTR`, so the cpu row's `HASH_PTR`
+/// limb decomposition (`HP0..3`/`HP3_HI`, gated on `SYS_HASH + SYS_KECCAK + SYS_SHA256`) is what
+/// keeps the address off any other `MEMORY` key. Leaving the limbs at their honest values makes
+/// this trip the recomposition equation directly.
+#[test]
+fn an_unbounded_sha256_ptr_is_rejected() {
+    let (m, p, mut t) = setup_sha256();
+    let w = cpu::col::WIDTH;
+    let row = sha256_cpu_row(&t);
+    t.cpu.values[row * w + cpu::col::HASH_PTR] = F::from_u32(REG_A0) - F::from_u64(1u64 << 30);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// The `SHA256` bus in the other direction: a syscall row whose compression is not in the
+/// sha256 table at all (the real block demoted to padding) has no provider for its lookup — and
+/// the 32 `MEMORY` messages the block no longer sends leave that bus unbalanced too.
+#[test]
+fn a_sha256_call_whose_compression_is_missing_is_rejected() {
+    use randprotocol_zkvm::tables::sha256;
+    let (m, p, mut t) = setup_sha256();
+    let w = sha256::col::WIDTH;
+    let st = t.sha256.as_mut().expect("sha256_demo declares a sha256 table");
+    for r in 0..sha256::BLOCK {
+        st.values[r * w + sha256::col::IS_REAL] = F::ZERO;
+    }
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ---------------------------------------------------------------------------
+// Audit (2026-09-12) prove-side guards and coverage gaps: ZH1, ZH2, ZH3, and the input
+// table's own AIR invariants.
+
+/// Audit ZH3: the prove-side mirror of `out_of_range_tier_is_an_error_not_a_panic` — an
+/// explicit tier outside `TIERS` used to reach `Tier::cpu_height`'s `1 << tier` with no guard
+/// (a shift-overflow panic in debug, a masked shift plus an abort-scale allocation in release).
+/// Now a clean `ProveError::BadTier` before any shift happens.
+#[test]
+fn an_out_of_tiers_tier_is_an_error_on_the_prove_side_too() {
+    use randprotocol_zkvm::machine::ProveError;
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    assert!(matches!(m.prove(&p, &[], &[], Some(Tier(99))), Err(ProveError::BadTier(99))));
+    assert!(matches!(m.prove(&p, &[], &[], Some(Tier(11))), Err(ProveError::BadTier(11))));
+}
+
+/// Audit ZH1: the poseidon2 table holds `2^(t-3)` permutation blocks against up to ~`2^t`
+/// permutation-emitting rows under the cycle budget alone — so a workload can fit the cycle
+/// budget while overflowing the permutation budget (which used to be `poseidon2_trace`'s
+/// `assert!` panic, with the auto-tier pick walking straight into it). Now a clean
+/// `ProveError::TooManyPoseidon2Permutations`, and `Tier::for_workload` climbs to a tier whose
+/// permutation budget fits.
+#[test]
+fn a_workload_exceeding_the_poseidon2_budget_is_a_clean_error() {
+    use randprotocol_zkvm::machine::ProveError;
+    let m = Machine::new(FriProfile::Test);
+    let mut a = Assembler::new(0);
+    a.extend(li(5, 1));
+    a.extend(write_output(0, 5));
+    a.extend(halt());
+    for _ in 0..592 { a.push(addi(0, 0, 0)); }
+    let p = a.assemble(); // 599 words -> 150 digest-row permutations + 1 indigest > tier 10's 128 blocks
+    assert_eq!(p.len(), 599);
+    let exec = execute(&p, &[], &[], 10_000).unwrap();
+    assert!(exec.cycles() < 20, "only the leading few instructions ever execute");
+    assert!(
+        matches!(build_traces_salted(&p, &[], &[], [0u32; 4], &exec, Tier(10)), Err(ProveError::TooManyPoseidon2Permutations { .. })),
+        "151 permutations cannot fit tier 10's 128 poseidon2 blocks"
+    );
+    let (proof, _) = m.prove(&p, &[], &[], None).expect("auto-tier must climb past the permutation wall, not panic");
+    assert_eq!(proof.tier, Tier(12));
+    m.verify(&p.digest(), &proof).unwrap();
+}
+
+/// Audit ZH2: the digest rows' 16-bit `HASH_LEFT` (`LEFT0..1`) caps a provable program (and
+/// private-input vector, and — constraint set 6 — public-input vector) at 65535 words — enforced
+/// host-side now, not as an opaque constraint failure deep inside `prove_batch`.
+///
+/// The public arm is `ProveError::PublicTooLong`, the pubdigest region's twin of
+/// `InputTooLong` (not `PublicTooLarge`, which is the `tables::public::MAX_LOG_HEIGHT` ceiling —
+/// two different caps with confusingly similar names). Checked through `prove`'s auto-tier path
+/// *and* through `build_traces_salted` directly, at a tier whose cycle budget is wide enough that
+/// the earlier `TooManyCycles` guard does not mask it.
+#[test]
+fn a_program_input_or_public_vector_longer_than_the_16_bit_hash_left_cap_is_a_clean_error() {
+    use randprotocol_zkvm::machine::ProveError;
+    let m = Machine::new(FriProfile::Test);
+    let mut a = Assembler::new(0);
+    a.extend(halt());
+    let mut words = a.assemble().words;
+    words.resize(u16::MAX as usize + 1, 0x0000_0013); // trailing `addi x0, x0, 0`s, never executed
+    let p = randprotocol_zkvm::isa::Program::new(0, words);
+    assert!(matches!(m.prove(&p, &[], &[], None), Err(ProveError::ProgramTooLong { .. })));
+    let small = guests::fib(10);
+    let inputs = vec![0u32; u16::MAX as usize + 1];
+    assert!(matches!(m.prove(&small, &inputs, &[], None), Err(ProveError::InputTooLong { .. })));
+    let public = vec![0u32; u16::MAX as usize + 1];
+    assert!(matches!(m.prove(&small, &[], &public, None), Err(ProveError::PublicTooLong { len: 65536 })));
+    // And directly, so the guard is pinned rather than reached through `for_workload`'s pick:
+    // tier 20's cycle budget swallows the 16 384 pubdigest rows, so `TooManyCycles` cannot mask
+    // this the way it would at tier 10.
+    let exec = execute(&small, &[], &public, 10_000).unwrap();
+    assert!(matches!(
+        build_traces_salted(&small, &[], &public, [0u32; 4], &exec, Tier(20)),
+        Err(ProveError::PublicTooLong { len: 65536 })
+    ));
+}
+
+/// Audit coverage: the verify-side declared-height guards for the program and input tables
+/// (`VerifyError::ProgramHeight`/`InputHeight`) — the twins of
+/// `out_of_range_tier_is_an_error_not_a_panic`, rejected before they can size a table
+/// (`1 << log_height`). The keccak and memory heights already have their own tests above.
+#[test]
+fn out_of_range_declared_program_and_input_heights_are_errors_not_panics() {
+    use randprotocol_zkvm::machine::VerifyError;
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let (mut proof, _) = m.prove(&p, &[], &[], None).unwrap();
+    proof.program_log_height = program::MAX_LOG_HEIGHT + 1;
+    assert!(matches!(m.verify(&p.digest(), &proof), Err(VerifyError::ProgramHeight)));
+    let (mut proof, _) = m.prove(&p, &[], &[], None).unwrap();
+    proof.input_log_height = randprotocol_zkvm::tables::input::MAX_LOG_HEIGHT + 1;
+    assert!(matches!(m.verify(&p.digest(), &proof), Err(VerifyError::InputHeight)));
+}
+
+/// Audit coverage: the input table's own AIR invariants. A hole in the real-row prefix (a row
+/// drops `IS_REAL` while a later row stays real) trips the `(1 − IS_REAL)·n(IS_REAL) = 0`
+/// prefix rule directly — and, independently, the `INPUT_DIGEST` set-equality it backstops
+/// (the "hole" index's supply vanishes while the digest still demands it).
+#[test]
+fn a_hole_in_the_input_tables_real_prefix_is_rejected() {
+    use randprotocol_zkvm::tables::input;
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    let iw = input::col::WIDTH;
+    assert_eq!(t.input.values[2 * iw + input::col::IS_REAL], F::ONE, "row 2 is real, so clearing row 1 leaves a hole");
+    t.input.values[iw + input::col::IS_REAL] = F::ZERO;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// Audit coverage: `IDX` is the arithmetic sequence 0, 1, 2, … — bumping one row's claimed
+/// index trips the `n(IDX) − v(IDX) − 1 = 0` chain directly (and would otherwise mis-key every
+/// `INPUT_DIGEST`/`INPUT_READ` message at that row).
+#[test]
+fn a_skipped_input_table_index_is_rejected() {
+    use randprotocol_zkvm::tables::input;
+    let (m, p, mut t) = setup_with_inputs(&[400, 250, 300, 75]);
+    let iw = input::col::WIDTH;
+    t.input.values[iw + input::col::IDX] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ---- the public segment (constraint set 6) ------------------------------------------------------
+//
+// M4.1's `input`-table attacks, one for one, against the `public` table and the split
+// `PUBLIC_DIGEST`/`PUBLIC_READ` bus pair — plus the two the public segment has that `input` does
+// not (a forged declared height, and a `SYS_READ_PUBLIC` row hidden behind padding), and the two
+// region-shape forgeries the Task 2 review named (an appended all-inactive pubdigest row, and a
+// `HASH_LEFT` leak across the indigest → pubdigest boundary).
+
+fn setup_with_public(public: &[u32]) -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::public_echo(); // reads public[0..4], and public[1] twice
+    let e = execute(&p, &[], public, 10_000).unwrap();
+    let t = build_traces_salted(&p, &[], public, TEST_SALT, &e, Tier(10)).unwrap();
+    (m, p, t)
+}
+
+/// (1) A real `public` row outside `{0..n_pub-1}`: an unclaimed `PUBLIC_DIGEST` supply the digest
+/// never demands, rejected whether or not anything claims to read it.
+#[test]
+fn a_real_public_row_past_n_pub_is_rejected() {
+    use randprotocol_zkvm::tables::public::col;
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    let w = col::WIDTH;
+    assert!(t.public.height() > 4, "the +1 padding-row rule leaves spare rows past the four real ones");
+    t.public.values[4 * w + col::WORD] = F::from_u32(999);
+    t.public.values[4 * w + col::IS_REAL] = F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// (2) A word the digest did not absorb but a read returned: tamper the committed row's WORD, so
+/// the honest `SYS_READ_PUB` row's `C` no longer matches what `H_PUB` absorbed.
+#[test]
+fn a_public_read_disagreeing_with_the_committed_word_is_rejected() {
+    use randprotocol_zkvm::tables::public::col;
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    t.public.values[col::WORD] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// (3) A read of a dropped index: clear a real row's `IS_REAL` while the guest still reads it.
+/// Two independent buses catch it — `PUBLIC_READ`, whose count carries the same `IS_REAL`
+/// factor and so leaves the guest's `READ_PUBLIC(3)` with no provider at all, and
+/// `PUBLIC_DIGEST`, whose demand for index 3 is likewise unclaimed. (Not the monotone-prefix
+/// rule: row 3 is the *last* real row, so clearing it leaves a shorter prefix, not a hole —
+/// that case is test (8).) Because the read dies with the row, this witness would be rejected
+/// by an unsplit single-bus design too; the split's own property is tests (13)/(14).
+#[test]
+fn a_read_of_a_dropped_public_index_is_rejected() {
+    use randprotocol_zkvm::tables::public::col;
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    let w = col::WIDTH;
+    t.public.values[3 * w + col::IS_REAL] = F::ZERO;
+    t.public.values[3 * w + col::WORD] = F::ZERO;
+    t.public.values[3 * w + col::MULT_READ] = F::ZERO;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// (4) `MULT_READ` forged on a padding row — the AGENTS.md invariant-2 regression. The count's
+/// `IS_REAL` factor already zeroes the supply, so what rejects this is the explicit padding pin,
+/// which is exactly why that pin exists.
+#[test]
+fn a_mult_read_bumped_on_a_public_padding_row_is_rejected() {
+    use randprotocol_zkvm::tables::public::col;
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    let w = col::WIDTH;
+    assert_eq!(t.public.values[5 * w + col::IS_REAL], F::ZERO, "row 5 is padding");
+    t.public.values[5 * w + col::MULT_READ] = F::from_u32(3);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// (5) A forged `H_PUB` public value.
+#[test]
+fn tampering_h_pub_in_public_values_is_rejected() {
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    t.public_values[cpu::pv::PUB0] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// (6) A mismatched `public_log_height`: the declared height and the batch's degree bits disagree,
+/// which `verify`'s degree-bits equality catches before any verifier key is built.
+///
+/// The variant is `VerifyError::Tier` — the shared degree-bits mismatch every table's declared
+/// height funnels into — *not* `VerifyError::PublicHeight`, which is `check_declared_heights`'
+/// range guard and fires only for a height outside `[MIN_LOG_HEIGHT, MAX_LOG_HEIGHT]` (test (6b)).
+/// `+ 1` here stays inside that range, so it gets past the range guard and dies on the bits.
+#[test]
+fn a_mismatched_public_height_is_rejected_before_any_verifier_key_is_built() {
+    let (m, p, t) = setup_with_public(&[11, 22, 33, 44]);
+    let mut pr = m.prove_traces(&p, &t, Tier(10));
+    pr.public_log_height += 1;
+    let fresh = Machine::new(FriProfile::Test);
+    let err = fresh.verify(&p.digest(), &pr).unwrap_err();
+    assert!(matches!(err, randprotocol_zkvm::machine::VerifyError::Tier), "actual: {err:?}");
+    assert_eq!(fresh.cached_keys(), 0, "rejected before the preprocessed commitment is recomputed");
+}
+
+/// (6b) And a declared height outside `[MIN_LOG_HEIGHT, MAX_LOG_HEIGHT]` is an error, not a panic —
+/// the untrusted-shift guard `check_declared_heights` exists for.
+#[test]
+fn out_of_range_declared_public_heights_are_errors_not_panics() {
+    use randprotocol_zkvm::machine::{check_declared_heights, VerifyError};
+    use randprotocol_zkvm::tables::public;
+    let t = Tier(10);
+    for h in [0u8, 1, public::MAX_LOG_HEIGHT + 1, 200] {
+        assert!(matches!(
+            check_declared_heights(t, randprotocol_zkvm::tables::program::MIN_LOG_HEIGHT, randprotocol_zkvm::tables::input::MIN_LOG_HEIGHT, 0, 0, h, t.min_mem_log_height()),
+            Err(VerifyError::PublicHeight)
+        ), "public_log_height {h}");
+    }
+}
+
+/// (7) A `SYS_READ_PUBLIC` row in a proof whose public table is padded to hide it: zero out every
+/// real row of the table (so it declares an empty segment) while the cpu table's read row stands.
+/// `PUBLIC_READ` then has no provider for that `(idx, word)` at all.
+#[test]
+fn a_public_read_whose_table_is_padded_away_is_rejected() {
+    use randprotocol_zkvm::tables::public::col;
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    let w = col::WIDTH;
+    for r in 0..4 {
+        t.public.values[r * w + col::IS_REAL] = F::ZERO;
+        t.public.values[r * w + col::WORD] = F::ZERO;
+        t.public.values[r * w + col::MULT_READ] = F::ZERO;
+    }
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// (8) A hole in the real-row prefix — the monotone-prefix rule, and independently the digest's
+/// unclaimed demand at the hole's index. `WORD` and `MULT_READ` go to zero with `IS_REAL` so
+/// that the two padding pins (`#4`/`#5`) stay satisfied and the prefix rule (`#1`) is the only
+/// local constraint this witness violates.
+#[test]
+fn a_hole_in_the_public_tables_real_prefix_is_rejected() {
+    use randprotocol_zkvm::tables::public::col;
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    let w = col::WIDTH;
+    assert_eq!(t.public.values[2 * w + col::IS_REAL], F::ONE, "row 2 is real, so clearing row 1 leaves a hole");
+    t.public.values[w + col::IS_REAL] = F::ZERO;
+    t.public.values[w + col::WORD] = F::ZERO;
+    t.public.values[w + col::MULT_READ] = F::ZERO;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// (9) A skipped index in the `IDX` chain — it would otherwise mis-key every `PUBLIC_DIGEST`
+/// and `PUBLIC_READ` message from that row on.
+#[test]
+fn a_skipped_public_table_index_is_rejected() {
+    use randprotocol_zkvm::tables::public::col;
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    let w = col::WIDTH;
+    t.public.values[w + col::IDX] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// (10) Two reads of the same public index returning different words — `public_echo` reads
+/// `public[1]` twice, so the second read's row is there to tamper.
+///
+/// What actually rejects it is the `MEMORY` bus, not `PUBLIC_READ`: a `SYS_READ_PUB` row's `C`
+/// is both the word `PUBLIC_READ` looks up *and* the value written back to `rd` (`defines_c`
+/// includes `SYS_READ_PUB`), and the register write is checked first. `PUBLIC_READ`'s own
+/// unclaimed demand for `(1, 23)` stands behind it either way.
+#[test]
+fn two_public_reads_of_the_same_index_returning_different_words_is_rejected() {
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    let w = cpu::col::WIDTH;
+    let read_rows: Vec<usize> = (0..t.cpu.height()).filter(|&i| t.cpu.values[i * w + cpu::col::SYS_READ_PUB] == F::ONE).collect();
+    assert_eq!(read_rows.len(), 5, "public_echo makes five READ_PUBLIC calls");
+    t.cpu.values[read_rows[4] * w + cpu::col::C] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ---- the two region-shape forgeries the Task 2 review named --------------------------------------
+//
+// Both rebuild the digest regions' own permutations and byte limbs by hand, so that the *only*
+// thing standing between the forged witness and acceptance is the single rule under test. The two
+// shared helpers below are what that costs; they are the `shrink_declared_n_in` machinery above,
+// factored for reuse rather than copied.
+
+/// Rebuilds `t.poseidon2` from the three digest regions' block lists, in the exact order
+/// `machine::build_traces_salted` emits them (program digest, then indigest, then pubdigest).
+/// Correct only for a guest with no `POSEIDON2` syscalls of its own — true of both guests below,
+/// so these blocks are the entire event list.
+fn rebuild_digest_permutations(
+    t: &mut Traces,
+    p: &randprotocol_zkvm::isa::Program,
+    indigest: &[randprotocol_zkvm::hash::DigestBlock],
+    pubdigest: &[randprotocol_zkvm::hash::DigestBlock],
+) {
+    let to_events = |blocks: &[randprotocol_zkvm::hash::DigestBlock]| -> Vec<poseidon2::Poseidon2Event> {
+        blocks.iter().map(|blk| {
+            let mut input = blk.state_in;
+            for k in 0..4 { if blk.active[k] { input[k] = F::from_u32(blk.words[k]); } }
+            poseidon2::Poseidon2Event { input, output: blk.state_out }
+        }).collect()
+    };
+    let all: Vec<poseidon2::Poseidon2Event> =
+        to_events(&randprotocol_zkvm::hash::program_digest_rows(p.base_pc, &p.words))
+            .into_iter()
+            .chain(to_events(indigest))
+            .chain(to_events(pubdigest))
+            .collect();
+    t.poseidon2 = poseidon2::poseidon2_trace(&all, t.poseidon2.height());
+}
+
+/// RANGE8 is exact-count accounting (`RangeCounts`/`range_trace`), so every byte-limb column a
+/// hand-edit rewrites has to shift the `range` table's own supply by the same amount — otherwise
+/// the witness rejects on a RANGE8 imbalance rather than on the rule under test.
+fn shift_range8(t: &mut Traces, edits: &[(u32, u32)]) {
+    let rw = range::col::WIDTH;
+    for &(old, new) in edits {
+        t.range.values[old as usize * rw + range::col::M_RANGE] -= F::ONE;
+        t.range.values[new as usize * rw + range::col::M_RANGE] += F::ONE;
+    }
+}
+
+/// Writes `left` into a digest row's `HASH_LEFT` and its two `LEFT0` byte limbs, recording the
+/// RANGE8 shift the limb rewrite owes.
+fn set_hash_left(t: &mut Traces, row: usize, left: u32, edits: &mut Vec<(u32, u32)>) {
+    let w = cpu::col::WIDTH;
+    let old = t.cpu.values[row * w + cpu::col::HASH_LEFT].as_canonical_u64() as u32;
+    t.cpu.values[row * w + cpu::col::HASH_LEFT] = F::from_u32(left);
+    for j in 0..2 {
+        let (o, n) = ((old >> (8 * j)) & 0xff, (left >> (8 * j)) & 0xff);
+        t.cpu.values[row * w + cpu::col::LEFT0 + j] = F::from_u32(n);
+        edits.push((o, n));
+    }
+}
+
+/// Rewrites a digest region's final `H` encoding — the 32 RANGE8-checked byte limbs at `lo_col`
+/// plus the `hi == u32::MAX` gadget at `himax_col`/`inv_col` — from a final sponge state, and
+/// returns the eight canonical words so the caller can pin the matching public values.
+fn set_digest_encoding(
+    t: &mut Traces,
+    row: usize,
+    state_out: [F; 8],
+    lo_col: usize,
+    himax_col: usize,
+    inv_col: usize,
+    edits: &mut Vec<(u32, u32)>,
+) -> [u32; 8] {
+    let w = cpu::col::WIDTH;
+    let words = randprotocol_zkvm::hash::split_digest([state_out[0], state_out[1], state_out[2], state_out[3]]);
+    for k in 0..8 {
+        let bl = limbs(words[k]);
+        for j in 0..4 {
+            let cell = row * w + lo_col + 4 * k + j;
+            edits.push((t.cpu.values[cell].as_canonical_u64() as u32, bl[j].as_canonical_u64() as u32));
+            t.cpu.values[cell] = bl[j];
+        }
+    }
+    for j in 0..4usize {
+        let hi = words[2 * j + 1];
+        if hi == u32::MAX {
+            t.cpu.values[row * w + himax_col + j] = F::ONE;
+            t.cpu.values[row * w + inv_col + j] = F::ZERO;
+        } else {
+            t.cpu.values[row * w + himax_col + j] = F::ZERO;
+            t.cpu.values[row * w + inv_col + j] = (F::from_u32(hi) - F::from_u32(u32::MAX)).inverse();
+        }
+    }
+    words
+}
+
+/// (11) The pubdigest twin of the M4.1 regression (h)
+/// (`an_appended_all_inactive_indigest_row_after_a_block_aligned_n_in_is_rejected`): an extra,
+/// all-inactive pubdigest row appended after the region's real blocks, demanding nothing on
+/// `PUBLIC_DIGEST` yet still charged a genuine `POSEIDON2` permutation — which would make `H_PUB`
+/// `perm(H_honest)` rather than a function of `public` alone. The rule that closes it is
+/// `is_pubdigest * (1 - ACT0) * HASH_IDX = 0` (`tables::cpu`): the *first* pubdigest row may be
+/// empty (`n_pub == 0` has a header-only block), every later one may not.
+///
+/// Unlike the indigest version this needs no row insertion and hence no `CLK`/memory shift: build
+/// the honest trace for `n_pub = 5` (two pubdigest rows), then rewrite it as the `n_pub = 4`
+/// segment spread over those same two rows, the second absorbing nothing. Everything else the AIR
+/// demands is made consistent by hand — both rows' `HASH_N`/`HASH_LEFT` (and its byte limbs, with
+/// the RANGE8 shift), the header lane `HS0+5`, the second row's state/lanes, both rows' genuine
+/// permutations, the final `H_PUB` encoding and `pv::PUB0..7`, and the `public` table's now-unread
+/// fifth row dropped so `PUBLIC_DIGEST` balances.
+///
+/// Discrimination: the `HASH_LEFT`-gated shape of this rule (`is_pubdigest * HASH_LEFT *
+/// (1 - ACT0)`) would be vacuous here — the appended row's `HASH_LEFT` is 0, since the real block
+/// already drained it — so it is specifically the `HASH_IDX` gate that rejects this witness.
+#[test]
+fn an_appended_all_inactive_pubdigest_row_is_rejected() {
+    use randprotocol_zkvm::hash;
+    use randprotocol_zkvm::tables::public::col as pcol;
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44, 55]);
+    let w = cpu::col::WIDTH;
+    let offset = p.digest_rows() + hash::input_digest_row_count(0);
+    assert_eq!(t.cpu.values[(offset + 1) * w + cpu::col::IS_PUBDIGEST], F::ONE, "n_pub = 5 takes two pubdigest rows");
+    assert_eq!(t.cpu.values[(offset + 1) * w + cpu::col::HASH_IDX], F::ONE, "and the second of them is block 1");
+
+    // The one block `n_pub = 4` really needs, plus the gratuitous empty one after it.
+    let real = hash::public_digest_rows(&[11, 22, 33, 44])[0];
+    let extra = hash::DigestBlock {
+        idx: 1,
+        left_before: 0,
+        words: [0; 4],
+        active: [false; 4],
+        state_in: real.state_out,
+        state_out: hash::permute_state(real.state_out),
+    };
+    let mut edits: Vec<(u32, u32)> = Vec::new();
+
+    // Row 0: the same four absorbed words, now under a `n_pub = 4` header.
+    let r0 = offset * w;
+    t.cpu.values[r0 + cpu::col::HASH_N] = F::from_u32(4);
+    set_hash_left(&mut t, offset, real.left_before, &mut edits);
+    for k in 0..8 { t.cpu.values[r0 + cpu::col::HS0 + k] = real.state_in[k]; }
+
+    // Row 1: all four lanes inactive, `HASH_IDX` still 1 — the shape the rule forbids.
+    let r1 = (offset + 1) * w;
+    t.cpu.values[r1 + cpu::col::HASH_N] = F::from_u32(4);
+    set_hash_left(&mut t, offset + 1, extra.left_before, &mut edits);
+    for k in 0..8 { t.cpu.values[r1 + cpu::col::HS0 + k] = extra.state_in[k]; }
+    for k in 0..4 {
+        t.cpu.values[r1 + cpu::col::ACT0 + k] = F::ZERO;
+        // An inactive lane carries the entering state forward instead of absorbing a word.
+        t.cpu.values[r1 + cpu::col::HV0 + k] = extra.state_in[k];
+    }
+    // The first ordinary instruction row carries the region's own permutation output.
+    for k in 0..8 { t.cpu.values[(offset + 2) * w + cpu::col::HS0 + k] = extra.state_out[k]; }
+    let hpub = set_digest_encoding(&mut t, offset + 1, extra.state_out, cpu::col::PHVL0, cpu::col::PHIMAX0, cpu::col::PINV0, &mut edits);
+    for k in 0..8 { t.public_values[cpu::pv::PUB0 + k] = F::from_u32(hpub[k]); }
+    shift_range8(&mut t, &edits);
+
+    // The fifth committed word is gone from the digest's demand, so it must go from the table's
+    // supply too — otherwise `PUBLIC_DIGEST` rejects this before the lane-0 rule ever fires.
+    let pw = pcol::WIDTH;
+    assert_eq!(t.public.values[4 * pw + pcol::MULT_READ], F::ZERO, "public_echo never reads public[4]");
+    t.public.values[4 * pw + pcol::IS_REAL] = F::ZERO;
+    t.public.values[4 * pw + pcol::WORD] = F::ZERO;
+    rebuild_digest_permutations(&mut t, &p, &hash::input_digest_rows(TEST_SALT, &[]), &[real, extra]);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// A guest with *both* segments, so the indigest → pubdigest boundary below is the real one: the
+/// first pubdigest row's `HASH_LEFT` is seeded to a genuinely nonzero `n_pub`.
+fn setup_with_inputs_and_public(inputs: &[u32], public: &[u32]) -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
+    let m = Machine::new(FriProfile::Test);
+    let mut a = Assembler::new(0);
+    a.extend(read_input(0));
+    a.push(mv(5, REG_A0));
+    a.extend(read_public(0));
+    a.push(add(6, 5, REG_A0));
+    a.extend(write_output(0, 6));
+    a.extend(halt());
+    let p = a.assemble();
+    let e = execute(&p, inputs, public, 10_000).unwrap();
+    let t = build_traces_salted(&p, inputs, public, TEST_SALT, &e, Tier(10)).unwrap();
+    (m, p, t)
+}
+
+/// (12) The indigest drain split. Constraint set 6 had to *delete* `indigest_last * n(HASH_LEFT)
+/// = 0` — the row after the last indigest row is now the first pubdigest row, whose `HASH_LEFT`
+/// is legitimately `n_pub` — and replace it with a *local* full-drain check on the last indigest
+/// row's own columns, `indigest_last * (HASH_LEFT - indigest_drain) = 0`. Without that
+/// replacement `HASH_LEFT` would leak straight across the boundary: a witness could declare
+/// `n_in` larger than the words it actually absorbs, stop absorbing early, and have the leftover
+/// silently overwritten by the pubdigest region's own seed.
+///
+/// This is that witness: `n_in` declared as 5 (header lane, `HASH_N`, and both rows' `HASH_LEFT`)
+/// while the single real block still absorbs only the four genuine inputs, so the last indigest
+/// row ends with `HASH_LEFT = 5` against an `active_sum` of 4. Every other rule is satisfied by
+/// hand — the salt row's chain rule (`5 - 0 - 5 = 0`, the salt does not drain), the digest-boundary
+/// seed (`n(HASH_LEFT) = n(HASH_N) = 5`), the two genuine permutations under the new header, the
+/// `IPOUT0..7` output columns, the `H_IN` encoding and `pv::IN0..7`. `INPUT_DIGEST` is untouched:
+/// the real block still demands indices 0..3 with the words the `input` table supplies.
+#[test]
+fn an_indigest_region_leaking_hash_left_into_the_public_digest_region_is_rejected() {
+    use randprotocol_zkvm::hash;
+    let inputs = [400u32, 250, 300, 75];
+    let public = [11u32, 22, 33, 44];
+    let (m, p, mut t) = setup_with_inputs_and_public(&inputs, &public);
+    let w = cpu::col::WIDTH;
+    let offset = p.digest_rows(); // the salt row; the one real input block follows it
+    assert_eq!(t.cpu.values[(offset + 1) * w + cpu::col::INDIGEST_LAST], F::ONE, "n_in = 4 is one real block");
+    assert_eq!(t.cpu.values[(offset + 2) * w + cpu::col::HASH_LEFT], F::from_u32(4), "and the pubdigest region opens at n_pub = 4");
+
+    // `hash::input_digest_rows(TEST_SALT, inputs)` with the header's `n_in` lane forged to 5 —
+    // a shape no honest call produces, so it is built here directly.
+    const FORGED_N_IN: u32 = 5;
+    let mut state = [F::ZERO; 8];
+    state[4] = F::from_u32(randprotocol_zkvm::notes::domain::IN);
+    state[5] = F::from_u32(FORGED_N_IN);
+    let mut blocks: Vec<hash::DigestBlock> = Vec::new();
+    for (idx, words) in [(0u32, TEST_SALT), (1, inputs)] {
+        let state_in = state;
+        let mut merged = state;
+        for k in 0..4 { merged[k] = F::from_u32(words[k]); }
+        state = hash::permute_state(merged);
+        blocks.push(hash::DigestBlock { idx, left_before: FORGED_N_IN, words, active: [true; 4], state_in, state_out: state });
+    }
+
+    let mut edits: Vec<(u32, u32)> = Vec::new();
+    for (i, blk) in blocks.iter().enumerate() {
+        let r = (offset + i) * w;
+        t.cpu.values[r + cpu::col::HASH_N] = F::from_u32(FORGED_N_IN);
+        set_hash_left(&mut t, offset + i, blk.left_before, &mut edits);
+        for k in 0..8 { t.cpu.values[r + cpu::col::HS0 + k] = blk.state_in[k]; }
+        // Every lane stays active with the same word, so `HV0..3` and `ACT0..3` are unchanged.
+    }
+    let last = *blocks.last().unwrap();
+    for k in 0..8 { t.cpu.values[(offset + 1) * w + cpu::col::IPOUT0 + k] = last.state_out[k]; }
+    let hin = set_digest_encoding(&mut t, offset + 1, last.state_out, cpu::col::IHVL0, cpu::col::IHIMAX0, cpu::col::IINV0, &mut edits);
+    for k in 0..8 { t.public_values[cpu::pv::IN0 + k] = F::from_u32(hin[k]); }
+    shift_range8(&mut t, &edits);
+    rebuild_digest_permutations(&mut t, &p, &blocks, &hash::public_digest_rows(&public));
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// (12b) The pubdigest twin of (12), and the witness the *local* full-drain rule
+/// `pubdigest_last * (HASH_LEFT - active_sum) = 0` (`tables::cpu`) exists for — the one rule in
+/// the pubdigest region with no substitute. The chain rule beside it
+/// (`is_pubdigest * (HASH_LEFT - active_sum - n(HASH_LEFT)) = 0`) does *not* cover this on the
+/// last row: `HASH_LEFT` on an ordinary instruction row is an entirely free cell (the `LEFT0..1`
+/// decomposition, the RANGE8 lookups and every drain rule are gated on hash/digest rows; the
+/// `zero_vec` default `cpu_trace` leaves there is a trace-builder fact, not a constraint), so the
+/// chain rule is happy to deposit an undrained remainder into it.
+///
+/// The attack that opens without the local rule: declare `n_pub = 4k + 4` while the region
+/// absorbs only `4k + 1` words. Here, at its smallest — `n_pub` declared as 5 (header lane
+/// `HS0+5`, `HASH_N`, and the first pubdigest row's `HASH_LEFT`, which the indigest-boundary seed
+/// pins to `HASH_N`) over the single block that really absorbs 4, leaving the leftover 1 on the
+/// first instruction row's free `HASH_LEFT`. `PUBLIC_DIGEST` is perfectly balanced throughout —
+/// the four active lanes demand indices 0..3 and the `public` table supplies exactly those — and
+/// the capacity header, both permutations, the `H_PUB` encoding and `pv::PUB0..7` are all made
+/// consistent by hand for the forged `n_pub`. What the prover gains is an `H_PUB` that is
+/// `hash::public_digest` of *nothing*: `verify` alone would accept it, and only `verify_public`,
+/// recomputing the digest from the caller's own words, would notice. That is why this rule is
+/// load-bearing and the chain rule's last-row application is the redundant one.
+///
+/// Discrimination: with `cpu.rs`'s `pubdigest_last * (HASH_LEFT - active_sum)` line commented
+/// out, this exact witness proves *and* verifies (`m.verify(&p.digest(), &pr).is_ok()`); with it
+/// restored, that single constraint is what rejects it. The report records the run.
+#[test]
+fn a_pubdigest_region_declaring_more_words_than_it_absorbs_is_rejected() {
+    use randprotocol_zkvm::hash;
+    let public = [11u32, 22, 33, 44];
+    let (m, p, mut t) = setup_with_public(&public);
+    let w = cpu::col::WIDTH;
+    let offset = p.digest_rows() + hash::input_digest_row_count(0);
+    assert_eq!(t.cpu.values[offset * w + cpu::col::PUBDIGEST_LAST], F::ONE, "n_pub = 4 is a single pubdigest row");
+    assert_eq!(t.cpu.values[(offset + 1) * w + cpu::col::HASH_LEFT], F::ZERO, "and the row after it is an ordinary instruction row");
+
+    // `hash::public_digest_rows(&public)` with the header's `n_pub` lane forged to 5 — a shape no
+    // honest call produces, so it is built here directly. One block, four active lanes, but a
+    // `left_before` of 5.
+    const FORGED_N_PUB: u32 = 5;
+    let mut state_in = [F::ZERO; 8];
+    state_in[4] = F::from_u32(randprotocol_zkvm::notes::domain::PUB);
+    state_in[5] = F::from_u32(FORGED_N_PUB);
+    let mut merged = state_in;
+    for k in 0..4 { merged[k] = F::from_u32(public[k]); }
+    let state_out = hash::permute_state(merged);
+    let forged = hash::DigestBlock {
+        idx: 0,
+        left_before: FORGED_N_PUB,
+        words: public,
+        active: [true; 4],
+        state_in,
+        state_out,
+    };
+
+    let mut edits: Vec<(u32, u32)> = Vec::new();
+    let r = offset * w;
+    t.cpu.values[r + cpu::col::HASH_N] = F::from_u32(FORGED_N_PUB);
+    set_hash_left(&mut t, offset, FORGED_N_PUB, &mut edits);
+    for k in 0..8 { t.cpu.values[r + cpu::col::HS0 + k] = state_in[k]; }
+    // Every lane stays active with the same word, so `HV0..3` and `ACT0..3` are unchanged.
+    // The drain *chain* deposits the undeclared remainder here, in the instruction row's free
+    // cell — satisfied, and exactly what the local rule refuses to let stand.
+    t.cpu.values[(offset + 1) * w + cpu::col::HASH_LEFT] = F::from_u32(FORGED_N_PUB - 4);
+    // The first ordinary instruction row also carries the region's own permutation output.
+    for k in 0..8 { t.cpu.values[(offset + 1) * w + cpu::col::HS0 + k] = state_out[k]; }
+    let hpub = set_digest_encoding(&mut t, offset, state_out, cpu::col::PHVL0, cpu::col::PHIMAX0, cpu::col::PINV0, &mut edits);
+    for k in 0..8 { t.public_values[cpu::pv::PUB0 + k] = F::from_u32(hpub[k]); }
+    shift_range8(&mut t, &edits);
+    rebuild_digest_permutations(&mut t, &p, &hash::input_digest_rows(TEST_SALT, &[]), &[forged]);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ---- the digest side of the C1 split (review round 1) --------------------------------------------
+//
+// Everything above tampers the `public` *table*. The attack `tables::public`'s module doc names —
+// the one the mandatory `PUBLIC_DIGEST`/`PUBLIC_READ` split exists to stop — comes from the other
+// side: shrink the **digest's** own declared `n_pub` so it stops demanding index `k`, and leave
+// the table's real row `k` (and its `MULT_READ`) alone so a genuine `READ_PUBLIC(k)` still
+// succeeds. These are the public duals of `declaring_n_in_smaller_than_the_reads_is_rejected` and
+// `the_c1_witness_shrinking_n_in_while_still_reading_the_dropped_word_is_rejected`.
+
+/// Rewrites `t`'s pubdigest region in place as if `H_PUB` had only ever committed to
+/// `new_public` — a prefix of the vector `t` was built with, short enough to need the *same*
+/// number of pubdigest rows (`hash::public_digest_row_count`) — while leaving the `public`
+/// witness table, and hence the guest's own reads, completely untouched. `shrink_declared_n_in`'s
+/// pubdigest twin, and a far shorter one: the pubdigest region has no salt row, and the helpers
+/// above already carry the `HASH_LEFT` limb, `H` encoding, RANGE8 and permutation bookkeeping.
+fn shrink_declared_n_pub(t: &mut Traces, p: &randprotocol_zkvm::isa::Program, new_public: &[u32]) {
+    use randprotocol_zkvm::hash;
+    let w = cpu::col::WIDTH;
+    let offset = p.digest_rows() + hash::input_digest_row_count(0);
+    let blocks = hash::public_digest_rows(new_public);
+    let n = blocks.len();
+    let mut edits: Vec<(u32, u32)> = Vec::new();
+    for (i, blk) in blocks.iter().enumerate() {
+        let r = (offset + i) * w;
+        t.cpu.values[r + cpu::col::HASH_N] = F::from_u32(new_public.len() as u32);
+        set_hash_left(t, offset + i, blk.left_before, &mut edits);
+        for k in 0..8 { t.cpu.values[r + cpu::col::HS0 + k] = blk.state_in[k]; }
+        for k in 0..4 {
+            t.cpu.values[r + cpu::col::ACT0 + k] = F::from_bool(blk.active[k]);
+            // An inactive lane carries the entering state forward instead of absorbing a word.
+            t.cpu.values[r + cpu::col::HV0 + k] = if blk.active[k] { F::from_u32(blk.words[k]) } else { blk.state_in[k] };
+        }
+    }
+    let last = *blocks.last().expect("public_digest_rows always returns at least one block");
+    // The first ordinary instruction row carries the region's own permutation output.
+    for k in 0..8 { t.cpu.values[(offset + n) * w + cpu::col::HS0 + k] = last.state_out[k]; }
+    let hpub = set_digest_encoding(t, offset + n - 1, last.state_out, cpu::col::PHVL0, cpu::col::PHIMAX0, cpu::col::PINV0, &mut edits);
+    for k in 0..8 { t.public_values[cpu::pv::PUB0 + k] = F::from_u32(hpub[k]); }
+    shift_range8(t, &edits);
+    rebuild_digest_permutations(t, p, &hash::input_digest_rows(TEST_SALT, &[]), &blocks);
+}
+
+/// (13) The pubdigest dual of `declaring_n_in_smaller_than_the_reads_is_rejected`: shrink *only*
+/// the digest's declared `n_pub` (4 → 3, recomputing everything the digest itself is responsible
+/// for so no other check trips first) and leave the `public` table exactly as built. Index 3's
+/// real row then supplies `PUBLIC_DIGEST` one unit nothing demands any more, while its
+/// `MULT_READ = 1` keeps the guest's genuine `READ_PUBLIC(3)` perfectly balanced on
+/// `PUBLIC_READ` — so `PUBLIC_DIGEST`, and only `PUBLIC_DIGEST`, is what rejects this.
+///
+/// This is the property brief test (3) cannot show: there the read dies with the row it drops.
+#[test]
+fn declaring_n_pub_smaller_than_the_reads_is_rejected() {
+    use randprotocol_zkvm::tables::public::col;
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    shrink_declared_n_pub(&mut t, &p, &[11, 22, 33]);
+    let w = col::WIDTH;
+    assert_eq!(t.public.values[3 * w + col::IS_REAL], F::ONE, "index 3's row is left real — the orphaned PUBLIC_DIGEST supply");
+    assert_eq!(t.public.values[3 * w + col::MULT_READ], F::ONE, "and its read multiplicity is left alone, so PUBLIC_READ stays balanced");
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// (14) The literal C1 witness against the pre-split single-bus design, and the dual of
+/// `the_c1_witness_shrinking_n_in_while_still_reading_the_dropped_word_is_rejected`: (1) shrink
+/// the digest's declared `n_pub` as in (13), then (2) additionally zero the orphaned row's
+/// `MULT_READ` to "pay for" its now-unclaimed mandatory-copy slot.
+///
+/// Under a *single* bus counting `IS_REAL * (1 + MULT_READ)` this is exactly the witness that
+/// verifies: row 3 would supply `1 + 0 = 1` against a demand of 1 (the surviving
+/// `READ_PUBLIC(3)`), balanced — and `H_PUB` would commit to fewer words than the guest actually
+/// read. Split, step (2) is powerless *and* self-defeating: `MULT_READ` does not feed
+/// `PUBLIC_DIGEST` at all, so row 3's `IS_REAL = 1` supply there stays unclaimed regardless,
+/// and zeroing it merely strands the read's own demand on `PUBLIC_READ` as well.
+#[test]
+fn the_c1_witness_shrinking_n_pub_while_still_reading_the_dropped_word_is_rejected() {
+    use randprotocol_zkvm::tables::public::col;
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    shrink_declared_n_pub(&mut t, &p, &[11, 22, 33]);
+    let w = col::WIDTH;
+    t.public.values[3 * w + col::MULT_READ] = F::ZERO;
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// (15) `MULT_READ` inflated on a *real* row (index 0, read once, claimed twice) — the witness
+/// `tables::public::col::MULT_READ`'s "needs no range check of its own" argument rests on. `IDX`
+/// is pinned to the row's own position, so an over-claim can only ever inflate this one row's
+/// `PUBLIC_READ` supply; it cannot be spread across rows to hide an over-count, and `PUBLIC_READ`
+/// balancing against the true `SYS_READ_PUBLIC` demand catches it however large it is.
+/// `PUBLIC_DIGEST` is untouched by this tamper — its count is `IS_REAL` alone — which is the
+/// other half of the same argument.
+#[test]
+fn an_inflated_mult_read_on_a_real_public_row_is_rejected() {
+    use randprotocol_zkvm::tables::public::col;
+    let (m, p, mut t) = setup_with_public(&[11, 22, 33, 44]);
+    assert_eq!(t.public.values[col::MULT_READ], F::ONE, "public_echo reads public[0] exactly once");
+    t.public.values[col::MULT_READ] = F::from_u32(2);
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}

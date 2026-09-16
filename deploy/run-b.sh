@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 # libp2p 0.57) — the whole fleet must run this one build, because a constraint-set change is a
 # fork and a mixed fleet stalls. Override with BINDIR= to test a build.
 BINDIR=${BINDIR:-bin-5f8c6f9}
-BIN=$BINDIR/shrugg-node
+BIN=$BINDIR/rand-node
 [ -x $BIN ] || { echo "$BIN missing — build it at 5f8c6f9 or set BINDIR" >&2; exit 1; }
 DATA=data-b-dbb7498b   # keyed on the genesis hash so a regenerated genesis gets a fresh db
 [ -d $DATA/db ] || $BIN init --datadir $DATA --genesis deploy/genesis-chain9.json

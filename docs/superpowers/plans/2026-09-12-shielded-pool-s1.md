@@ -2,25 +2,25 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the transparent account ledger of the SHRUGG full node with a notes ledger: every balance is a set of unspent notes, every transfer is a 2-in-2-out `Bundle` carrying a STARK proof from the zkVM's `bundle` guest, the faucet mints deposit notes, the wallet (`shrugg`) derives shielded keys, scans envelopes, proves and sends, the RPC exposes commitments/nullifiers/anchors/witnesses instead of balances, and genesis seeds deposit notes. Deploy and Call ride on bundles from day one (the bundle pays the fee; call effect kind 1 is gone). Staking, bridge and call-input envelopes stay for S2/S3.
+**Goal:** Replace the transparent account ledger of the RAND full node with a notes ledger: every balance is a set of unspent notes, every transfer is a 2-in-2-out `Bundle` carrying a STARK proof from the zkVM's `bundle` guest, the faucet mints deposit notes, the wallet (`rand`) derives shielded keys, scans envelopes, proves and sends, the RPC exposes commitments/nullifiers/anchors/witnesses instead of balances, and genesis seeds deposit notes. Deploy and Call ride on bundles from day one (the bundle pays the fee; call effect kind 1 is gone). Staking, bridge and call-input envelopes stay for S2/S3.
 
-**Architecture:** `shrugg-core` stays free of the zkVM's field-arithmetic crates: it holds the pure data types (`Word8`, `Envelope`, `Bundle`, `Action`, `Transaction`, `ShieldedAddress`), an incremental (frontier) commitment tree and a reference full tree that are generic over a node-hash supplied through the existing `ConfidentialExecutor` trait, and the ledger rules (admission order of spec §7, state root of §9). `shrugg-zkvm` vendors the research crate's note layer (`notes.rs`, `viewing.rs`, `ledger.rs`) and its `bundle` guest, and implements the executor's new methods (`node_hash`, `bundle_digest`, `bundle_proof_digest`, `verify_bundle`) plus wallet-side proving. `shrugg-node` swaps the `accounts` column family for `notes`/`nullifiers`/`anchors`/`validators`, keeps the tree frontier in `meta`, rewrites the mempool around nullifier conflicts instead of nonces, redacts the RPC, and signs faucet mints with the validator key. `shrugg-client` becomes a shielded wallet with a spend-key file and a local note store. Every task keeps its own crate green; the workspace as a whole compiles again at Task 4.
+**Architecture:** `randprotocol-core` stays free of the zkVM's field-arithmetic crates: it holds the pure data types (`Word8`, `Envelope`, `Bundle`, `Action`, `Transaction`, `ShieldedAddress`), an incremental (frontier) commitment tree and a reference full tree that are generic over a node-hash supplied through the existing `ConfidentialExecutor` trait, and the ledger rules (admission order of spec §7, state root of §9). `randprotocol-zkvm` vendors the research crate's note layer (`notes.rs`, `viewing.rs`, `ledger.rs`) and its `bundle` guest, and implements the executor's new methods (`node_hash`, `bundle_digest`, `bundle_proof_digest`, `verify_bundle`) plus wallet-side proving. `rand-node` swaps the `accounts` column family for `notes`/`nullifiers`/`anchors`/`validators`, keeps the tree frontier in `meta`, rewrites the mempool around nullifier conflicts instead of nonces, redacts the RPC, and signs faucet mints with the validator key. `randprotocol-client` becomes a shielded wallet with a spend-key file and a local note store. Every task keeps its own crate green; the workspace as a whole compiles again at Task 4.
 
-**Tech Stack:** Rust 1.98.1 (`rust-toolchain.toml`), Plonky3 `=0.7.0` (in `shrugg-zkvm` only), `ml-kem =0.3.2`, `chacha20poly1305 =0.11.0` (new, `shrugg-zkvm` only), RocksDB 0.22, bincode 1.3, serde_json, bs58, blake3.
+**Tech Stack:** Rust 1.98.1 (`rust-toolchain.toml`), Plonky3 `=0.7.0` (in `randprotocol-zkvm` only), `ml-kem =0.3.2`, `chacha20poly1305 =0.11.0` (new, `randprotocol-zkvm` only), RocksDB 0.22, bincode 1.3, serde_json, bs58, blake3.
 
 **Spec:** `docs/superpowers/specs/2026-09-11-shielded-pool-design.md` §3 (transaction shape), §4 (relation, 47-word digest with `bad` fixed to 0), §5 (notes, keys, addresses), §6 (actions; S1 implements None, Mint, Deploy, Call), §7 (admission order), §9 (state, storage, state root), §11 (RPC), §12 (S1 row), §13 (rulings). Research-side facts this plan relies on: `circuits/research/src/{notes,viewing,ledger}.rs` at the commit named in the Task 2 dispatch (phase Z merged, `SpendKey` = `Word8`, `bundle_input::COUNT = 612`, bundle proves at tier 14, `notes::bundle_digest(anchor, nf1, nf2, cm1, cm2, fee, burn, asset, time)` fixes the taint word to 0 itself).
 
 ## Global Constraints
 
 - **Toolchain**: every cargo command is run with the pinned 1.98.1 toolchain from the repo root (`rust-toolchain.toml` selects it; `cargo test -p <crate>` as written below).
-- **`shrugg-core` must not depend on any `p3-*` crate, `ml-kem` or `chacha20poly1305`**: every Poseidon2 hash it needs goes through `ConfidentialExecutor`. Verified by `grep -E 'p3-|ml-kem|chacha' crates/shrugg-core/Cargo.toml` being empty.
-- **Amounts are `u64` units** (`UNITS_PER_SHRUGG = 1_000_000_000`), fees are `u64`; validator stake stays `u128` in `ValidatorSet` (consensus code is not touched).
+- **`randprotocol-core` must not depend on any `p3-*` crate, `ml-kem` or `chacha20poly1305`**: every Poseidon2 hash it needs goes through `ConfidentialExecutor`. Verified by `grep -E 'p3-|ml-kem|chacha' crates/randprotocol-core/Cargo.toml` being empty.
+- **Amounts are `u64` units** (`UNITS_PER_RAND = 1_000_000_000`), fees are `u64`; validator stake stays `u128` in `ValidatorSet` (consensus code is not touched).
 - **Word encoding**: a `Word8` on the wire (bincode) is `[u32; 8]`; as bytes it is 32 little-endian bytes (`word8_to_bytes`); in JSON and CLI it is the 64-hex-char string of those bytes.
 - **Admission order** (spec §7) is exactly the order of `Ledger::validate` in Task 3; the STARK verification of the bundle is the last check before the action's own proof.
-- **State root**: `blake3("shrugg-state-2" || tree_root || nullifier_root || validators_root || programs_root)` (Task 3 defines each root). No bridge root in S1.
-- **Constants**: `BUNDLE_BASE = 1_000_000` units, `ANCHOR_WINDOW = 64` blocks, `TIME_WINDOW = 64` blocks, `MAX_ENVELOPE_BYTES = 2048`, `MAX_PROOF_BYTES = 1 << 20` (unchanged), `FAUCET_MAX_UNITS = 100 * UNITS_PER_SHRUGG`, `DEPTH = 32`, `KEM_EK_BYTES = 1184`, address prefix `shrugg1`.
-- **Vendored files are never hand-edited**: `crates/shrugg-zkvm/src/{notes,viewing,ledger}.rs` come from `deploy/sync-zkvm.sh`; anything node-specific goes in hand-maintained files (`executor.rs`, `address.rs`, `guests.rs`, `asm.rs`).
-- **Bridge is not wired in S1**: a genesis with a `bridge` section is rejected; `shrugg_core::bridge` and `bridge-codec` compile untouched with their own tests; ledger/storage/RPC/client bridge paths are removed (S3 re-adds them as notes).
+- **State root**: `blake3("rand-state-2" || tree_root || nullifier_root || validators_root || programs_root)` (Task 3 defines each root). No bridge root in S1.
+- **Constants**: `BUNDLE_BASE = 1_000_000` units, `ANCHOR_WINDOW = 64` blocks, `TIME_WINDOW = 64` blocks, `MAX_ENVELOPE_BYTES = 2048`, `MAX_PROOF_BYTES = 1 << 20` (unchanged), `FAUCET_MAX_UNITS = 100 * UNITS_PER_RAND`, `DEPTH = 32`, `KEM_EK_BYTES = 1184`, address prefix `rand1`.
+- **Vendored files are never hand-edited**: `crates/randprotocol-zkvm/src/{notes,viewing,ledger}.rs` come from `deploy/sync-zkvm.sh`; anything node-specific goes in hand-maintained files (`executor.rs`, `address.rs`, `guests.rs`, `asm.rs`).
+- **Bridge is not wired in S1**: a genesis with a `bridge` section is rejected; `randprotocol_core::bridge` and `bridge-codec` compile untouched with their own tests; ledger/storage/RPC/client bridge paths are removed (S3 re-adds them as notes).
 - **Cluster tests** use `fri_profile: "test"` and prove real bundles (about 35 s per proof at tier 14 with the test profile); mark nothing `#[ignore]`.
 - **Commit style**: `<crate or area>: <what>` as in `git log` (`core: ...`, `node: ...`, `client: ...`, `zkvm: ...`, `docs: ...`).
 
@@ -34,11 +34,11 @@
 | anchors are recorded once per block (block-end tree root, keyed by height), window = last 64 blocks | spec §7 "64 gives a prover about a minute at 1 s blocks" is a per-block window | a bundle cannot cite a root produced mid-block; harmless |
 | `time` is a `u32` block height on the wire | the guest's digest has one word for it; `u64` would not fit the 47-word preimage | none before block 4.29e9 |
 | the ledger keeps the full commitment set in memory (`BTreeSet<Word8>`) for spec §7 item 6 | the frontier tree cannot answer membership | memory O(notes); an on-disk check is a later change |
-| `shrugg_getWitness` takes a leaf index and the node builds the path from the `notes` column family with a full tree in memory | spec §9 stores only the frontier for appends; a witness needs the leaves, which `notes` has | O(notes) hashing per witness call; fine below ~10^5 notes |
+| `rand_getWitness` takes a leaf index and the node builds the path from the `notes` column family with a full tree in memory | spec §9 stores only the frontier for appends; a witness needs the leaves, which `notes` has | O(notes) hashing per witness call; fine below ~10^5 notes |
 | the wallet asks the node for witnesses instead of keeping a local tree | simplest correct wallet; spec §11 allows it | the node learns which leaf indices a wallet spends — a testnet-grade privacy leak, documented in `docs/shielded.md` as the first wallet follow-up |
 | fees accrue to a per-validator `rewards` field in a `validators` register seeded from genesis (`ValidatorEntry { public_key, stake, rewards }`) | spec §8's register minus Bond/Unbond/Withdraw; S2 adds the rest without moving the root | none |
 | the node's `hc_bundle` (digest of the vendored `bundle` guest) must equal the genesis `hc_bundle` or the node refuses to start | spec §13 "hc_bundle pinned in genesis" | a build with a different guest cannot join, by design |
-| genesis `build` takes the executor (`Genesis::build(&self, executor)`) because alloc notes are appended to the tree | the tree root needs Poseidon2 | genesis hashes computed with `StubExecutor` differ from real ones; tests use the stub consistently and the pinned-hash test lives in `shrugg-node` |
+| genesis `build` takes the executor (`Genesis::build(&self, executor)`) because alloc notes are appended to the tree | the tree root needs Poseidon2 | genesis hashes computed with `StubExecutor` differ from real ones; tests use the stub consistently and the pinned-hash test lives in `rand-node` |
 | the size cap "transaction ≤ 8 KiB before the proof" is realized as per-field caps (envelopes ≤ 2 KiB each, proofs ≤ 1 MiB, program ≤ 4096 words, everything else fixed-size) | a Deploy alone is up to 16 KiB | none |
 | `DisabledExecutor` is deleted; `confidential: false` gates Deploy/Call inside the ledger (`TxError::ConfidentialDisabled`) | bundles always need the zkVM verifier | none |
 | `SpendKey` is 256 bits (research follow-up plan `circuits/docs/superpowers/plans/2026-09-12-shielded-z-spend-key.md`) | `pk` is known to every counterparty; a 64-bit key is a brute-force target | none |
@@ -46,7 +46,7 @@
 ## File structure
 
 ```
-crates/shrugg-core/src/
+crates/randprotocol-core/src/
   notes.rs            [new]  Word8 helpers, Envelope, Bundle, BundleDigestInput, ShieldedAddress,
                              CommitmentTree (frontier), FullTree (reference + witness paths)
   confidential.rs     [edit] trait gains node_hash / bundle_digest / bundle_proof_digest / verify_bundle;
@@ -58,7 +58,7 @@ crates/shrugg-core/src/
   program.rs          [edit] ProgramRecord loses `deployer`; CallReceipt loses `effect`
   effect.rs           [delete]
   lib.rs              [edit] exports
-crates/shrugg-zkvm/
+crates/randprotocol-zkvm/
   Cargo.toml          [edit] ml-kem, chacha20poly1305
   src/{notes,viewing,ledger}.rs [vendored] from research (sync script)
   src/guests.rs, src/asm.rs     [edit] bundle guest + Z asm helpers copied from research
@@ -67,14 +67,14 @@ crates/shrugg-zkvm/
   src/address.rs      [new]  ShieldedAddress <-> viewing::Address, key derivation helpers for the wallet
   tests/executor.rs   [edit] bundle prove/verify e2e, tree cross-check against the vendored tree
   deploy/sync-zkvm.sh [edit] vendor notes/viewing/ledger; exclude their tests
-crates/shrugg-node/src/
+crates/randprotocol-node/src/
   storage.rs          [rewrite parts] CFs notes/nullifiers/anchors/validators, meta tree, commit, load, truncate, verify_chain
   mempool.rs          [rewrite] nullifier/commitment conflicts, fee ordering
   node.rs             [edit] Mint command builds a note, hc_bundle startup check, warm_bundle
   rpc.rs              [edit] redaction + the five new methods
   main.rs             [edit] genesis with shielded alloc; balance/transfer subcommands removed
   tests/cluster.rs    [rewrite] shielded helpers
-crates/shrugg-client/src/
+crates/randprotocol-client/src/
   lib.rs              [edit] RpcClient: new methods, account/balance/transfer removed
   wallet.rs           [new]  key file v2, note store, scan, select, build+prove+send
   main.rs             [edit] commands
@@ -87,21 +87,21 @@ deploy/README.md, deploy/genesis.json [edit] (a new chain is cut by the fleet op
 ### Task 1: Core shielded types, the commitment tree, and the executor extension
 
 **Files:**
-- Create: `crates/shrugg-core/src/notes.rs`
-- Modify: `crates/shrugg-core/src/confidential.rs`
-- Modify: `crates/shrugg-core/src/lib.rs` (add `pub mod notes;` and `pub use notes::{Word8, Envelope, Bundle, ShieldedAddress};`)
+- Create: `crates/randprotocol-core/src/notes.rs`
+- Modify: `crates/randprotocol-core/src/confidential.rs`
+- Modify: `crates/randprotocol-core/src/lib.rs` (add `pub mod notes;` and `pub use notes::{Word8, Envelope, Bundle, ShieldedAddress};`)
 - Test: unit tests inside `notes.rs` and `confidential.rs`
 
 **Interfaces:**
 - Produces (consumed by every later task):
 
 ```rust
-// crates/shrugg-core/src/notes.rs
+// crates/randprotocol-core/src/notes.rs
 pub type Word8 = [u32; 8];
 pub const DEPTH: usize = 32;
 pub const MAX_ENVELOPE_BYTES: usize = 2048;
 pub const KEM_EK_BYTES: usize = 1184;
-pub const ADDRESS_PREFIX: &str = "shrugg1";
+pub const ADDRESS_PREFIX: &str = "rand1";
 pub fn word8_to_bytes(w: &Word8) -> [u8; 32];            // little-endian words
 pub fn word8_from_bytes(b: &[u8]) -> Option<Word8>;       // None unless b.len() == 32
 pub fn word8_to_hex(w: &Word8) -> String;
@@ -132,7 +132,7 @@ impl FullTree {
 ```
 
 ```rust
-// crates/shrugg-core/src/confidential.rs — additions to the trait
+// crates/randprotocol-core/src/confidential.rs — additions to the trait
 pub trait ConfidentialExecutor: Send + Sync {
     fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError>;
     fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError>;
@@ -155,7 +155,7 @@ pub trait ConfidentialExecutor: Send + Sync {
 
 - [ ] **Step 1: Write the failing tests for words, envelopes and addresses**
 
-Create `crates/shrugg-core/src/notes.rs` with only a `#[cfg(test)] mod tests` block for now:
+Create `crates/randprotocol-core/src/notes.rs` with only a `#[cfg(test)] mod tests` block for now:
 
 ```rust
 #[cfg(test)]
@@ -189,7 +189,7 @@ mod tests {
         assert!(s.starts_with(ADDRESS_PREFIX));
         assert_eq!(ShieldedAddress::parse(&s).unwrap(), a);
         assert_eq!(ShieldedAddress::parse("abc").unwrap_err(), AddressError::Prefix);
-        assert_eq!(ShieldedAddress::parse("shrugg10OIl").unwrap_err(), AddressError::Base58);
+        assert_eq!(ShieldedAddress::parse("rand10OIl").unwrap_err(), AddressError::Base58);
         let short = format!("{ADDRESS_PREFIX}{}", bs58::encode([1u8; 40]).into_string());
         assert_eq!(ShieldedAddress::parse(&short).unwrap_err(), AddressError::Length(40));
     }
@@ -198,7 +198,7 @@ mod tests {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p shrugg-core notes::`
+Run: `cargo test -p randprotocol-core notes::`
 Expected: compile errors (`word8_to_bytes`, `Envelope`, `ShieldedAddress` undefined).
 
 - [ ] **Step 3: Implement words, envelopes, bundles and addresses**
@@ -219,7 +219,7 @@ pub const DEPTH: usize = 32;
 pub const MAX_ENVELOPE_BYTES: usize = 2048;
 /// ML-KEM-768 encapsulation key length (FIPS 203).
 pub const KEM_EK_BYTES: usize = 1184;
-pub const ADDRESS_PREFIX: &str = "shrugg1";
+pub const ADDRESS_PREFIX: &str = "rand1";
 
 pub fn word8_to_bytes(w: &Word8) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -245,7 +245,7 @@ pub fn word8_from_hex(s: &str) -> Option<Word8> {
 }
 
 /// What travels with a created note besides its commitment. The chain checks nothing about it;
-/// it exists so the right keys can open the note later (`shrugg-zkvm`'s vendored `viewing.rs`
+/// it exists so the right keys can open the note later (`randprotocol-zkvm`'s vendored `viewing.rs`
 /// seals and opens it; this is the same four-part layout).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -308,7 +308,7 @@ impl Bundle {
 }
 
 /// A shielded address: the note owner field `pk` plus the ML-KEM-768 encapsulation key
-/// envelopes are sealed to. Text form: `shrugg1` + base58(pk bytes || kem_ek).
+/// envelopes are sealed to. Text form: `rand1` + base58(pk bytes || kem_ek).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShieldedAddress {
     pub pk: Word8,
@@ -349,21 +349,21 @@ impl std::fmt::Display for ShieldedAddress {
 }
 ```
 
-(`hex` and `bs58` are already `shrugg-core` dependencies.) Run `cargo test -p shrugg-core notes::` — the three tests pass.
+(`hex` and `bs58` are already `randprotocol-core` dependencies.) Run `cargo test -p randprotocol-core notes::` — the three tests pass.
 
 - [ ] **Step 4: Extend the executor trait and the stub**
 
 In `confidential.rs`, add the imports `use crate::notes::{BundleDigestInput, Word8, word8_to_bytes, word8_from_bytes};`, the four trait methods and `warm_bundle` from the Interfaces block above, the `InvalidBundleProof(String)` error variant, delete `DisabledExecutor` and its test, and implement the stub:
 
 ```rust
-/// Stub bundle proof: `STUB` || 32-byte digest || blake3("shrugg-stub-bundle", hc_bundle bytes)[..8].
+/// Stub bundle proof: `STUB` || 32-byte digest || blake3("rand-stub-bundle", hc_bundle bytes)[..8].
 const STUB_BUNDLE_LEN: usize = 4 + 32 + 8;
 
 impl StubExecutor {
     pub fn make_bundle_proof(hc_bundle: &Word8, digest: &Word8) -> Vec<u8> {
         let mut v = STUB_MARKER.to_vec();
         v.extend_from_slice(&word8_to_bytes(digest));
-        v.extend_from_slice(&Hash::digest_domain(b"shrugg-stub-bundle", &word8_to_bytes(hc_bundle)).0[..8]);
+        v.extend_from_slice(&Hash::digest_domain(b"rand-stub-bundle", &word8_to_bytes(hc_bundle)).0[..8]);
         v
     }
     fn hash_words(domain: &[u8], parts: &[&[u8]]) -> Word8 {
@@ -378,11 +378,11 @@ impl StubExecutor {
 impl ConfidentialExecutor for StubExecutor {
     // check_program / verify_call unchanged
     fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
-        Self::hash_words(b"shrugg-stub-node", &[&word8_to_bytes(left), &word8_to_bytes(right)])
+        Self::hash_words(b"rand-stub-node", &[&word8_to_bytes(left), &word8_to_bytes(right)])
     }
     fn bundle_digest(&self, i: &BundleDigestInput) -> Word8 {
         Self::hash_words(
-            b"shrugg-stub-bundle-digest",
+            b"rand-stub-bundle-digest",
             &[
                 &word8_to_bytes(&i.anchor),
                 &word8_to_bytes(&i.nullifiers[0]),
@@ -404,7 +404,7 @@ impl ConfidentialExecutor for StubExecutor {
     }
     fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<(), ConfidentialError> {
         self.bundle_proof_digest(proof)?;
-        let expected = &Hash::digest_domain(b"shrugg-stub-bundle", &word8_to_bytes(hc_bundle)).0[..8];
+        let expected = &Hash::digest_domain(b"rand-stub-bundle", &word8_to_bytes(hc_bundle)).0[..8];
         if &proof[36..] != expected {
             return Err(ConfidentialError::WrongProgram);
         }
@@ -429,7 +429,7 @@ fn stub_bundle_proof_carries_its_digest_and_binds_hc() {
 }
 ```
 
-`cargo test -p shrugg-core confidential::` passes. (The `ledger.rs` code that names `DisabledExecutor` — `default_executor` does not; `grep -rn DisabledExecutor crates/` must be empty after this step, fix any use in `shrugg-node` only by leaving a `// S1: removed` note if that crate is not compiled by this task's gate.)
+`cargo test -p randprotocol-core confidential::` passes. (The `ledger.rs` code that names `DisabledExecutor` — `default_executor` does not; `grep -rn DisabledExecutor crates/` must be empty after this step, fix any use in `rand-node` only by leaving a `// S1: removed` note if that crate is not compiled by this task's gate.)
 
 - [ ] **Step 5: Write the failing tree tests**
 
@@ -500,7 +500,7 @@ Append to the `tests` module in `notes.rs`:
 
 - [ ] **Step 6: Run to verify they fail**
 
-Run: `cargo test -p shrugg-core notes::`
+Run: `cargo test -p randprotocol-core notes::`
 Expected: compile errors (`CommitmentTree`, `FullTree` undefined).
 
 - [ ] **Step 7: Implement the frontier tree and the full tree**
@@ -575,7 +575,7 @@ impl CommitmentTree {
 }
 
 /// Every level materialized — the reference for `CommitmentTree` and the witness source for
-/// `shrugg_getWitness` and the cluster tests. `O(leaves)` memory and hashing.
+/// `rand_getWitness` and the cluster tests. `O(leaves)` memory and hashing.
 #[derive(Clone, Debug)]
 pub struct FullTree {
     levels: Vec<Vec<Word8>>,
@@ -629,36 +629,36 @@ impl FullTree {
 
 - [ ] **Step 8: Run the tests**
 
-Run: `cargo test -p shrugg-core notes:: confidential::`
-Expected: all pass. Then `cargo test -p shrugg-core` — every existing test still passes (nothing else changed yet).
+Run: `cargo test -p randprotocol-core notes:: confidential::`
+Expected: all pass. Then `cargo test -p randprotocol-core` — every existing test still passes (nothing else changed yet).
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/shrugg-core/src/notes.rs crates/shrugg-core/src/confidential.rs crates/shrugg-core/src/lib.rs
+git add crates/randprotocol-core/src/notes.rs crates/randprotocol-core/src/confidential.rs crates/randprotocol-core/src/lib.rs
 git commit -m "core: shielded-pool types — Word8, Envelope, Bundle, ShieldedAddress, frontier and full commitment trees; executor gains node_hash/bundle_digest/verify_bundle"
 ```
 
 ---
 
-### Task 2: Vendor the note layer and the bundle guest into `shrugg-zkvm`
+### Task 2: Vendor the note layer and the bundle guest into `randprotocol-zkvm`
 
 **Files:**
 - Modify: `deploy/sync-zkvm.sh` (stop excluding `notes.rs`, `viewing.rs`, `ledger.rs`; keep excluding `tests/viewing.rs` and add `tests/bundle.rs` to the excluded tests)
-- Modify: `crates/shrugg-zkvm/Cargo.toml` (add `ml-kem = "=0.3.2"`, `chacha20poly1305 = "=0.11.0"`)
-- Vendored: `crates/shrugg-zkvm/src/notes.rs`, `src/viewing.rs`, `src/ledger.rs` (run the script; they now compile against `hash.rs` which already exists — the script's `HC_DOMAIN`/`IN_DOMAIN` patch must be reverted for `hash.rs` and `tables/cpu.rs` now that `notes::domain` is present, or kept with `notes::domain::HC == hash::HC_DOMAIN` asserted by a test: choose the latter, it is smaller)
-- Modify: `crates/shrugg-zkvm/src/guests.rs`, `src/asm.rs` (copy from research, at the commit named in the dispatch: `asm.rs`'s phase Z helpers `emit_merkle_verify` (looped), `copy_word8_from_reg`, `emit_eq8`, `emit_bool_or`, `emit_range_check_u63`, `emit_add64_carry`; `guests.rs`'s `transfer()`, `bundle()`, `note_commit_probe()`, `merkle_probe()`; keep the node-local `private_payment`/`balance_check` and `emit_transfer`)
-- Modify: `crates/shrugg-zkvm/src/lib.rs` (`pub mod notes; pub mod viewing; pub mod ledger; pub mod address;`)
-- Create: `crates/shrugg-zkvm/src/address.rs`
-- Modify: `crates/shrugg-zkvm/src/executor.rs`
-- Test: `crates/shrugg-zkvm/tests/executor.rs`, `crates/shrugg-zkvm/tests/shielded.rs` (new)
+- Modify: `crates/randprotocol-zkvm/Cargo.toml` (add `ml-kem = "=0.3.2"`, `chacha20poly1305 = "=0.11.0"`)
+- Vendored: `crates/randprotocol-zkvm/src/notes.rs`, `src/viewing.rs`, `src/ledger.rs` (run the script; they now compile against `hash.rs` which already exists — the script's `HC_DOMAIN`/`IN_DOMAIN` patch must be reverted for `hash.rs` and `tables/cpu.rs` now that `notes::domain` is present, or kept with `notes::domain::HC == hash::HC_DOMAIN` asserted by a test: choose the latter, it is smaller)
+- Modify: `crates/randprotocol-zkvm/src/guests.rs`, `src/asm.rs` (copy from research, at the commit named in the dispatch: `asm.rs`'s phase Z helpers `emit_merkle_verify` (looped), `copy_word8_from_reg`, `emit_eq8`, `emit_bool_or`, `emit_range_check_u63`, `emit_add64_carry`; `guests.rs`'s `transfer()`, `bundle()`, `note_commit_probe()`, `merkle_probe()`; keep the node-local `private_payment`/`balance_check` and `emit_transfer`)
+- Modify: `crates/randprotocol-zkvm/src/lib.rs` (`pub mod notes; pub mod viewing; pub mod ledger; pub mod address;`)
+- Create: `crates/randprotocol-zkvm/src/address.rs`
+- Modify: `crates/randprotocol-zkvm/src/executor.rs`
+- Test: `crates/randprotocol-zkvm/tests/executor.rs`, `crates/randprotocol-zkvm/tests/shielded.rs` (new)
 
 **Interfaces:**
 - Consumes: Task 1's `Word8`, `Envelope`, `BundleDigestInput`, `ShieldedAddress`, `FullTree`, `CommitmentTree`, the trait methods.
 - Produces:
 
 ```rust
-// crates/shrugg-zkvm/src/executor.rs
+// crates/randprotocol-zkvm/src/executor.rs
 impl ZkExecutor {
     /// Digest of the vendored `bundle` guest — the value a genesis pins as `hc_bundle`.
     pub fn hc_bundle() -> Word8;
@@ -668,7 +668,7 @@ impl ZkExecutor {
 /// (postcard proof bytes, published digest, tier).
 pub fn prove_bundle(profile: FriProfile, inputs: &[u32], backend: Backend) -> Result<(Vec<u8>, Word8, u8), String>;
 
-// crates/shrugg-zkvm/src/address.rs
+// crates/randprotocol-zkvm/src/address.rs
 pub fn address_of(vk: &notes::ViewingKey) -> ShieldedAddress;          // pk + kem_ek
 pub fn to_research(a: &ShieldedAddress) -> viewing::Address;
 pub fn envelope_to_core(e: &viewing::Envelope) -> Envelope;
@@ -679,37 +679,37 @@ pub fn digest_input_of(anchor: Word8, nf: [Word8; 2], cm: [Word8; 2], fee: u64, 
 
 - [ ] **Step 1: Update the sync script and vendor**
 
-Edit `deploy/sync-zkvm.sh`: remove `--exclude notes.rs --exclude viewing.rs --exclude ledger.rs` from the `src/` rsync; add `--exclude bundle.rs` next to `--exclude viewing.rs` on the `tests/` rsync; update the header comment (the note layer is vendored from S1 on; `tests/viewing.rs` and `tests/bundle.rs` stay upstream because they take minutes). Run `deploy/sync-zkvm.sh <research commit>` as the script documents. Add the two dependencies to `crates/shrugg-zkvm/Cargo.toml` (also `rand = "0.10"` is already there; `viewing.rs` needs `rand::Rng` — it compiles upstream with the same versions).
+Edit `deploy/sync-zkvm.sh`: remove `--exclude notes.rs --exclude viewing.rs --exclude ledger.rs` from the `src/` rsync; add `--exclude bundle.rs` next to `--exclude viewing.rs` on the `tests/` rsync; update the header comment (the note layer is vendored from S1 on; `tests/viewing.rs` and `tests/bundle.rs` stay upstream because they take minutes). Run `deploy/sync-zkvm.sh <research commit>` as the script documents. Add the two dependencies to `crates/randprotocol-zkvm/Cargo.toml` (also `rand = "0.10"` is already there; `viewing.rs` needs `rand::Rng` — it compiles upstream with the same versions).
 
-Run: `cargo build -p shrugg-zkvm`
+Run: `cargo build -p randprotocol-zkvm`
 Expected: errors only in `guests.rs`/`asm.rs` (missing `bundle`, `emit_eq8`, ...) — resolved in Step 2.
 
 - [ ] **Step 2: Bring the guest and assembler additions across**
 
 Diff `../circuits/research/src/asm.rs` and `src/guests.rs` against the node's copies and copy every phase Z addition (the functions named in Files above) verbatim, keeping the node-local additions. The node's `guests::all()` must now include `("transfer", transfer(), ...)` only if the research `all()` does; mirror research. Then:
 
-Run: `cargo build -p shrugg-zkvm && cargo test -p shrugg-zkvm --test executor`
+Run: `cargo build -p randprotocol-zkvm && cargo test -p randprotocol-zkvm --test executor`
 Expected: builds; existing executor tests pass.
 
 - [ ] **Step 3: Write the failing shielded tests**
 
-Create `crates/shrugg-zkvm/tests/shielded.rs`:
+Create `crates/randprotocol-zkvm/tests/shielded.rs`:
 
 ```rust
-use shrugg_core::confidential::ConfidentialExecutor;
-use shrugg_core::notes::{CommitmentTree, FullTree, Word8, DEPTH};
-use shrugg_zkvm::executor::{prove_bundle, ZkExecutor};
-use shrugg_zkvm::machine::{Backend, FriProfile};
-use shrugg_zkvm::notes::{self, Note, SpendKey};
-use shrugg_zkvm::address::{address_of, digest_input_of, seal_note};
-use shrugg_zkvm::viewing::TxKey;
+use randprotocol_core::confidential::ConfidentialExecutor;
+use randprotocol_core::notes::{CommitmentTree, FullTree, Word8, DEPTH};
+use randprotocol_zkvm::executor::{prove_bundle, ZkExecutor};
+use randprotocol_zkvm::machine::{Backend, FriProfile};
+use randprotocol_zkvm::notes::{self, Note, SpendKey};
+use randprotocol_zkvm::address::{address_of, digest_input_of, seal_note};
+use randprotocol_zkvm::viewing::TxKey;
 
 fn leaf(i: u32) -> Word8 { [i, 7, 7, 7, 0, 0, 0, i] }
 
 #[test]
 fn core_trees_agree_with_the_vendored_research_tree() {
     let ex = ZkExecutor::new(FriProfile::Test);
-    let mut research = shrugg_zkvm::ledger::CommitmentTree::new();
+    let mut research = randprotocol_zkvm::ledger::CommitmentTree::new();
     let mut frontier = CommitmentTree::new(&ex);
     let mut leaves = Vec::new();
     for i in 0..21u32 {
@@ -723,14 +723,14 @@ fn core_trees_agree_with_the_vendored_research_tree() {
             assert_eq!(full.path(idx as u64).unwrap(), research.path(idx), "path {idx} at size {}", i + 1);
         }
     }
-    assert_eq!(CommitmentTree::empty_root(&ex), shrugg_zkvm::ledger::CommitmentTree::new().root());
+    assert_eq!(CommitmentTree::empty_root(&ex), randprotocol_zkvm::ledger::CommitmentTree::new().root());
 }
 
 #[test]
 fn hc_bundle_is_the_vendored_guest_digest_and_domains_agree() {
     assert_eq!(ZkExecutor::hc_bundle(), ZkExecutor::bundle_program().digest());
-    assert_eq!(notes::domain::HC, shrugg_zkvm::hash::HC_DOMAIN);
-    assert_eq!(notes::domain::IN, shrugg_zkvm::hash::IN_DOMAIN);
+    assert_eq!(notes::domain::HC, randprotocol_zkvm::hash::HC_DOMAIN);
+    assert_eq!(notes::domain::IN, randprotocol_zkvm::hash::IN_DOMAIN);
 }
 
 /// A 1-in-1-out-with-dummies bundle proves, its digest matches the core-side recompute, and
@@ -743,7 +743,7 @@ fn a_bundle_proves_and_the_executor_verifies_it() {
     let me = address_of(&vk);
     let time = 5u32;
     let spent = Note::new(vk.pk(), [0; 8], 1_000, 0, time);
-    let mut tree = shrugg_zkvm::ledger::CommitmentTree::new();
+    let mut tree = randprotocol_zkvm::ledger::CommitmentTree::new();
     tree.append(spent.commitment());
     let (path, index) = tree.path_for(&spent.commitment()).unwrap();
     let anchor = tree.root();
@@ -762,22 +762,22 @@ fn a_bundle_proves_and_the_executor_verifies_it() {
     ex.verify_bundle(&ZkExecutor::hc_bundle(), &proof).unwrap();
     assert!(ex.verify_bundle(&[1u32; 8], &proof).is_err());
     let e = seal_note(&vk, &me, &out1, &TxKey::random());
-    assert!(e.len() <= shrugg_core::notes::MAX_ENVELOPE_BYTES);
+    assert!(e.len() <= randprotocol_core::notes::MAX_ENVELOPE_BYTES);
 }
 ```
 
-Run: `cargo test -p shrugg-zkvm --test shielded`
+Run: `cargo test -p randprotocol-zkvm --test shielded`
 Expected: compile errors (`address`, `prove_bundle`, `hc_bundle` undefined).
 
 - [ ] **Step 4: Implement `address.rs`, the executor methods and `prove_bundle`**
 
-`crates/shrugg-zkvm/src/address.rs`:
+`crates/randprotocol-zkvm/src/address.rs`:
 
 ```rust
 //! Bridges the vendored note layer (`notes`, `viewing`) and the node's pure data types.
 use crate::notes::{Note, ViewingKey};
 use crate::viewing::{self, TxKey};
-use shrugg_core::notes::{BundleDigestInput, Envelope, ShieldedAddress, Word8};
+use randprotocol_core::notes::{BundleDigestInput, Envelope, ShieldedAddress, Word8};
 
 pub fn address_of(vk: &ViewingKey) -> ShieldedAddress {
     let a = vk.address();
@@ -856,29 +856,29 @@ pub fn prove_bundle(profile: FriProfile, inputs: &[u32], backend: Backend) -> Re
 
 - [ ] **Step 5: Run the shielded tests and the crate suite**
 
-Run: `cargo test -p shrugg-zkvm --test shielded -- --nocapture` (the proving test takes about a minute), then `cargo test -p shrugg-zkvm`.
+Run: `cargo test -p randprotocol-zkvm --test shielded -- --nocapture` (the proving test takes about a minute), then `cargo test -p randprotocol-zkvm`.
 Expected: all pass. Record the printed tier and the wall-clock of the proof in the report.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add deploy/sync-zkvm.sh crates/shrugg-zkvm
+git add deploy/sync-zkvm.sh crates/randprotocol-zkvm
 git commit -m "zkvm: vendor the note layer (notes/viewing/ledger) and the bundle guest; executor implements node_hash/bundle_digest/verify_bundle; prove_bundle for wallets"
 ```
 
 ---
 
-### Task 3: The notes ledger, transactions, gas and genesis in `shrugg-core`
+### Task 3: The notes ledger, transactions, gas and genesis in `randprotocol-core`
 
 **Files:**
-- Rewrite: `crates/shrugg-core/src/types/transaction.rs`
-- Modify: `crates/shrugg-core/src/gas.rs`
-- Rewrite: `crates/shrugg-core/src/ledger.rs`
-- Modify: `crates/shrugg-core/src/genesis.rs`, `src/program.rs`, `src/lib.rs`, `src/types/mod.rs`
-- Delete: `crates/shrugg-core/src/effect.rs`
-- Modify: `crates/shrugg-core/src/consensus/hotstuff.rs` only where it calls `apply_tx`/`state_root` (signatures below keep those calls unchanged; check `consensus/tests.rs` fixtures that build `Transaction::transfer` — replace with `Transaction::mint` fixtures or bundle-less blocks)
-- Modify: `crates/shrugg-zkvm/tests/executor.rs` and `src/executor.rs` only if they construct `ProgramRecord { deployer, .. }` (drop the field)
-- Test gate for this task: `cargo test -p shrugg-core` green and `cargo build -p shrugg-zkvm --tests` green. `shrugg-node` and `shrugg-client` do not compile until Task 4/5 — expected.
+- Rewrite: `crates/randprotocol-core/src/types/transaction.rs`
+- Modify: `crates/randprotocol-core/src/gas.rs`
+- Rewrite: `crates/randprotocol-core/src/ledger.rs`
+- Modify: `crates/randprotocol-core/src/genesis.rs`, `src/program.rs`, `src/lib.rs`, `src/types/mod.rs`
+- Delete: `crates/randprotocol-core/src/effect.rs`
+- Modify: `crates/randprotocol-core/src/consensus/hotstuff.rs` only where it calls `apply_tx`/`state_root` (signatures below keep those calls unchanged; check `consensus/tests.rs` fixtures that build `Transaction::transfer` — replace with `Transaction::mint` fixtures or bundle-less blocks)
+- Modify: `crates/randprotocol-zkvm/tests/executor.rs` and `src/executor.rs` only if they construct `ProgramRecord { deployer, .. }` (drop the field)
+- Test gate for this task: `cargo test -p randprotocol-core` green and `cargo build -p randprotocol-zkvm --tests` green. `rand-node` and `randprotocol-client` do not compile until Task 4/5 — expected.
 
 **Interfaces:**
 - Consumes: Task 1 types and trait.
@@ -886,9 +886,9 @@ git commit -m "zkvm: vendor the note layer (notes/viewing/ledger) and the bundle
 
 ```rust
 // types/transaction.rs
-pub const TOKEN_SYMBOL: &str = "SHRUGG"; pub const TOKEN_DECIMALS: u32 = 9;
-pub const UNITS_PER_SHRUGG: u64 = 1_000_000_000;
-pub const FAUCET_MAX_UNITS: u64 = 100 * UNITS_PER_SHRUGG;
+pub const TOKEN_SYMBOL: &str = "RAND"; pub const TOKEN_DECIMALS: u32 = 9;
+pub const UNITS_PER_RAND: u64 = 1_000_000_000;
+pub const FAUCET_MAX_UNITS: u64 = 100 * UNITS_PER_RAND;
 pub fn format_amount(units: u64) -> String; pub fn parse_amount(s: &str) -> Result<u64, AmountError>;
 pub enum Action {
     None,
@@ -899,7 +899,7 @@ pub enum Action {
 pub struct Transaction { pub chain_id: u64, pub bundle: Option<Bundle>, pub action: Action }
 impl Transaction {
     pub fn encode(&self) -> Vec<u8>; pub fn decode(b: &[u8]) -> Result<Transaction, bincode::Error>;
-    pub fn hash(&self) -> Hash;                       // blake3 "shrugg-txid" over encode()
+    pub fn hash(&self) -> Hash;                       // blake3 "rand-txid" over encode()
     pub fn encoded_len(&self) -> usize;
     pub fn fee(&self) -> u64;                         // bundle fee or 0
     pub fn nullifiers(&self) -> Vec<Word8>;           // the bundle's, or empty
@@ -993,7 +993,7 @@ impl Transaction {
     }
     pub fn mint_signing_hash(chain_id: u64, cm: &Word8, envelope: &Envelope, amount: u64) -> Hash {
         let bytes = bincode::serialize(&(chain_id, cm, envelope, amount)).expect("serializes");
-        Hash::digest_domain(b"shrugg-mint", &bytes)
+        Hash::digest_domain(b"rand-mint", &bytes)
     }
     pub fn mint(chain_id: u64, cm: Word8, envelope: Envelope, amount: u64, minter: &Keypair) -> Transaction {
         let signature = minter.sign(&Self::mint_signing_hash(chain_id, &cm, &envelope, amount));
@@ -1001,7 +1001,7 @@ impl Transaction {
     }
     pub fn encode(&self) -> Vec<u8> { bincode::serialize(self).expect("Transaction serializes") }
     pub fn decode(b: &[u8]) -> Result<Transaction, bincode::Error> { bincode::deserialize(b) }
-    pub fn hash(&self) -> Hash { Hash::digest_domain(b"shrugg-txid", &self.encode()) }
+    pub fn hash(&self) -> Hash { Hash::digest_domain(b"rand-txid", &self.encode()) }
     pub fn encoded_len(&self) -> usize { self.encode().len() }
     pub fn fee(&self) -> u64 { self.bundle.as_ref().map_or(0, |b| b.fee) }
     pub fn nullifiers(&self) -> Vec<Word8> { self.bundle.as_ref().map_or(Vec::new(), |b| b.nullifiers.to_vec()) }
@@ -1047,7 +1047,7 @@ mod tests {
         assert!(!minter.verify(&Transaction::mint_signing_hash(8, cm, envelope, *amount), signature));
     }
     #[test]
-    fn amounts_format_and_parse_in_shrugg() {
+    fn amounts_format_and_parse_in_rand() {
         assert_eq!(format_amount(1_500_000_000), "1.5");
         assert_eq!(parse_amount("0.000001").unwrap(), 1_000);
         assert!(parse_amount("1.0000000001").is_err());
@@ -1055,7 +1055,7 @@ mod tests {
 }
 ```
 
-Run: `cargo test -p shrugg-core types::transaction::` — passes once `types/mod.rs`/`lib.rs` re-export `Action`, `Transaction`, the constants, and drop `TxKind`/`TxBody`/`Account`.
+Run: `cargo test -p randprotocol-core types::transaction::` — passes once `types/mod.rs`/`lib.rs` re-export `Action`, `Transaction`, the constants, and drop `TxKind`/`TxBody`/`Account`.
 
 - [ ] **Step 2: `gas.rs` and `program.rs`**
 
@@ -1263,7 +1263,7 @@ mod tests {
 
 - [ ] **Step 4: Run to verify they fail**
 
-Run: `cargo test -p shrugg-core ledger::`
+Run: `cargo test -p randprotocol-core ledger::`
 Expected: compile errors.
 
 - [ ] **Step 5: Rewrite `ledger.rs`**
@@ -1477,30 +1477,30 @@ impl Ledger {
         Ok(data.into_iter().map(|(index, r)| CallReceipt { tx: block.transactions[index].hash(), program: r.program, tier: r.tier, outputs: r.outputs, height: block.height(), index: index as u32 }).collect())
     }
 
-    /// `blake3("shrugg-state-2" || tree_root || nullifier_root || validators_root || programs_root)`.
+    /// `blake3("rand-state-2" || tree_root || nullifier_root || validators_root || programs_root)`.
     pub fn state_root(&self) -> Hash {
-        let nf_leaves: Vec<Hash> = self.nullifiers.iter().map(|nf| Hash::digest_domain(b"shrugg-nullifier-leaf", &word8_to_bytes(nf))).collect();
+        let nf_leaves: Vec<Hash> = self.nullifiers.iter().map(|nf| Hash::digest_domain(b"rand-nullifier-leaf", &word8_to_bytes(nf))).collect();
         let val_leaves: Vec<Hash> = self.validators.iter().map(|(addr, v)| {
             let mut buf = Vec::with_capacity(32 + 16 + 8);
             buf.extend_from_slice(addr.as_bytes());
             buf.extend_from_slice(&v.stake.to_be_bytes());
             buf.extend_from_slice(&v.rewards.to_be_bytes());
-            Hash::digest_domain(b"shrugg-validator-leaf", &buf)
+            Hash::digest_domain(b"rand-validator-leaf", &buf)
         }).collect();
-        let prog_leaves: Vec<Hash> = self.programs.keys().map(|id| Hash::digest_domain(b"shrugg-program-leaf", id.as_bytes())).collect();
+        let prog_leaves: Vec<Hash> = self.programs.keys().map(|id| Hash::digest_domain(b"rand-program-leaf", id.as_bytes())).collect();
         let mut buf = Vec::with_capacity(128);
         buf.extend_from_slice(&word8_to_bytes(&self.tree.root()));
         buf.extend_from_slice(merkle_root(&nf_leaves).as_bytes());
         buf.extend_from_slice(merkle_root(&val_leaves).as_bytes());
         buf.extend_from_slice(merkle_root(&prog_leaves).as_bytes());
-        Hash::digest_domain(b"shrugg-state-2", &buf)
+        Hash::digest_domain(b"rand-state-2", &buf)
     }
 }
 ```
 
 Note the proposer check in `apply_block` (`UnknownProposer`) makes the `ok_or(Overflow)` in `apply_tx` unreachable from block application; the mempool and `HotStuff::propose` call `apply_tx` with the node's own address, which is a validator whenever it proposes.
 
-Run: `cargo test -p shrugg-core ledger::` — passes.
+Run: `cargo test -p randprotocol-core ledger::` — passes.
 
 - [ ] **Step 6: Genesis**
 
@@ -1531,7 +1531,7 @@ pub fn build(&self, executor: &dyn ConfidentialExecutor) -> Result<GenesisState,
     commit.extend_from_slice(self.fri_profile.as_bytes());
     commit.extend_from_slice(&word8_to_bytes(&hc_bundle));
     for (cm, _, amount) in &notes { commit.extend_from_slice(&word8_to_bytes(cm)); commit.extend_from_slice(&amount.to_be_bytes()); }
-    let genesis_binding = Hash::digest_domain(b"shrugg-genesis-2", &commit);
+    let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
     // header/block as today, state_root = ledger.state_root()
     ...
 }
@@ -1543,13 +1543,13 @@ pub fn build(&self, executor: &dyn ConfidentialExecutor) -> Result<GenesisState,
 
 `consensus/tests.rs` builds transfer transactions for block bodies; replace those fixtures with `Transaction::mint(chain_id, [i; 8], env(), 1, &validator_key)` (mints are valid without notes) and give the fixture ledgers `set_faucet(true)`. `HotStuff::propose` calls `apply_tx(tx, &self_address, executor)` — the signature is unchanged. Delete anything referencing `Account`, `TxKind`, `balance`, `nonce`, `effect`, `bridge` in `ledger.rs`/`genesis.rs`/`consensus/`.
 
-Run: `cargo test -p shrugg-core 2>&1 | tail -5` → green; `cargo build -p shrugg-zkvm --tests` → green (fix `ProgramRecord` constructions).
+Run: `cargo test -p randprotocol-core 2>&1 | tail -5` → green; `cargo build -p randprotocol-zkvm --tests` → green (fix `ProgramRecord` constructions).
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/shrugg-core crates/shrugg-zkvm
-git commit -m "core: the notes ledger — Bundle/Action transactions, spec §7 admission order, shrugg-state-2 root, genesis with deposit notes and hc_bundle; accounts, effects and bridge wiring removed"
+git add crates/randprotocol-core crates/randprotocol-zkvm
+git commit -m "core: the notes ledger — Bundle/Action transactions, spec §7 admission order, rand-state-2 root, genesis with deposit notes and hc_bundle; accounts, effects and bridge wiring removed"
 ```
 
 ---
@@ -1557,9 +1557,9 @@ git commit -m "core: the notes ledger — Bundle/Action transactions, spec §7 a
 ### Task 4: Storage, mempool, node and RPC
 
 **Files:**
-- Modify: `crates/shrugg-node/src/storage.rs`, `mempool.rs`, `node.rs`, `rpc.rs`, `main.rs`, `keyfile.rs` (unchanged), `network/wire.rs` (type only)
-- Test: unit tests in `storage.rs`, `mempool.rs`, `rpc.rs`; `crates/shrugg-node/tests/cluster.rs` compiles but is rewritten in Task 6 — for this task make it compile with the minimal helper changes (genesis with `alloc: vec![]`, `hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle())`) and `#[ignore]` nothing; tests that no longer make sense (`two_validators_commit_and_transfer`, `faucet_*`, `confidential_call_*`, `bridge_mint_*`) are deleted here and rebuilt in Task 6.
-- Gate: `cargo test -p shrugg-node` green (unit tests + the surviving cluster tests).
+- Modify: `crates/randprotocol-node/src/storage.rs`, `mempool.rs`, `node.rs`, `rpc.rs`, `main.rs`, `keyfile.rs` (unchanged), `network/wire.rs` (type only)
+- Test: unit tests in `storage.rs`, `mempool.rs`, `rpc.rs`; `crates/randprotocol-node/tests/cluster.rs` compiles but is rewritten in Task 6 — for this task make it compile with the minimal helper changes (genesis with `alloc: vec![]`, `hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle())`) and `#[ignore]` nothing; tests that no longer make sense (`two_validators_commit_and_transfer`, `faucet_*`, `confidential_call_*`, `bridge_mint_*`) are deleted here and rebuilt in Task 6.
+- Gate: `cargo test -p randprotocol-node` green (unit tests + the surviving cluster tests).
 
 **Interfaces:**
 - Consumes: Tasks 1–3.
@@ -1602,15 +1602,15 @@ impl Mempool {
     pub fn len(&self) -> usize;
 }
 // rpc.rs — method table
-shrugg_chainId, shrugg_tokenInfo, shrugg_sendTransaction(hex), shrugg_mint(address: shrugg1.., amount?: units),
-shrugg_getCommitments(from_index, limit<=1000) -> [{index, cm, envelope{kem_ct,to_receiver,to_sender,body}, height}],
-shrugg_getNullifiers(from_height, limit<=1000) -> [{height, nullifier}],
-shrugg_getAnchor(height?) -> {height, root},
-shrugg_getWitness(index) -> {index, root, path: [hex; 32]},
-shrugg_getTreeInfo -> {next_index, root, nullifiers},
-shrugg_getProgram, shrugg_getProgramCode, shrugg_getReceipt (no `effect`), shrugg_estimateFee ({kind: "bundle"|"deploy"|"call", ...}),
-shrugg_getTransaction, shrugg_getBlockByHeight, shrugg_getBlockByHash, shrugg_getHead, shrugg_status, shrugg_getPeers, shrugg_getValidators (-> [{address, stake, rewards}])
-// removed: shrugg_getBalance, shrugg_getAccount, every shrugg_*Asset*/*Bridge* method
+rand_chainId, rand_tokenInfo, rand_sendTransaction(hex), rand_mint(address: rand1.., amount?: units),
+rand_getCommitments(from_index, limit<=1000) -> [{index, cm, envelope{kem_ct,to_receiver,to_sender,body}, height}],
+rand_getNullifiers(from_height, limit<=1000) -> [{height, nullifier}],
+rand_getAnchor(height?) -> {height, root},
+rand_getWitness(index) -> {index, root, path: [hex; 32]},
+rand_getTreeInfo -> {next_index, root, nullifiers},
+rand_getProgram, rand_getProgramCode, rand_getReceipt (no `effect`), rand_estimateFee ({kind: "bundle"|"deploy"|"call", ...}),
+rand_getTransaction, rand_getBlockByHeight, rand_getBlockByHash, rand_getHead, rand_status, rand_getPeers, rand_getValidators (-> [{address, stake, rewards}])
+// removed: rand_getBalance, rand_getAccount, every rand_*Asset*/*Bridge* method
 // NodeCommand::Mint { to: ShieldedAddress, amount: u64 }  (node builds the note; errors if this node is not a validator)
 ```
 
@@ -1671,7 +1671,7 @@ Replace `CF_ACCOUNTS` and the three bridge families with the four new families i
 
 `verify_chain` keeps its structure; the per-block re-execution is `ledger.apply_block(block, executor)` semantics via `apply_transactions` + `record_anchor` + state-root compare, exactly mirroring `Ledger::apply_block`; simplest is to call `apply_block` itself now that the bridge timestamp rule is gone. Remove the bridge cross-checks.
 
-Run: `cargo test -p shrugg-node storage::` — passes.
+Run: `cargo test -p randprotocol-node storage::` — passes.
 
 - [ ] **Step 3: Mempool**
 
@@ -1688,33 +1688,33 @@ Rewrite `mempool.rs` per the interface; tests:
 
 - [ ] **Step 4: Node and RPC**
 
-`node.rs`: at startup, after loading genesis, `if ZkExecutor::hc_bundle() != gs.hc_bundle { bail!("this build's bundle guest ({}) differs from the genesis hc_bundle ({}); rebuild from the chain's pinned commit", ..) }`; spawn `executor.warm_bundle()` in the background like program warms; `NodeCommand::Mint { to, amount }`: if `!validator` → error "faucet mints are signed by validators; ask a validator node"; else build `Note::new(to.pk, [0; 8], amount, 0, head_height as u32)` (from `shrugg_zkvm::notes`), seal with a throwaway `SpendKey::random().viewing_key()` via `address::seal_note`, `Transaction::mint(chain_id, note.commitment(), envelope, amount, &node_keypair)`, insert into the mempool and gossip, return the tx hash. `propose` uses `candidates_within(tip_ledger, MAX_BLOCK_TXS, MAX_BLOCK_BYTES)`; after every commit `mempool.prune(&ledger)`.
+`node.rs`: at startup, after loading genesis, `if ZkExecutor::hc_bundle() != gs.hc_bundle { bail!("this build's bundle guest ({}) differs from the genesis hc_bundle ({}); rebuild from the chain's pinned commit", ..) }`; spawn `executor.warm_bundle()` in the background like program warms; `NodeCommand::Mint { to, amount }`: if `!validator` → error "faucet mints are signed by validators; ask a validator node"; else build `Note::new(to.pk, [0; 8], amount, 0, head_height as u32)` (from `randprotocol_zkvm::notes`), seal with a throwaway `SpendKey::random().viewing_key()` via `address::seal_note`, `Transaction::mint(chain_id, note.commitment(), envelope, amount, &node_keypair)`, insert into the mempool and gossip, return the tx hash. `propose` uses `candidates_within(tip_ledger, MAX_BLOCK_TXS, MAX_BLOCK_BYTES)`; after every commit `mempool.prune(&ledger)`.
 
-`rpc.rs`: implement the method table above; `shrugg_mint` parses `ShieldedAddress::parse`; `shrugg_getCommitments` clamps `limit` to 1000; `shrugg_getWitness` uses `storage.witness(index, &*executor)`; `shrugg_estimateFee` takes `{"kind":"bundle"}` → `BUNDLE_BASE`, `{"kind":"deploy","words":n}` → `fee_floor(Deploy)`, `{"kind":"call","tier":t}` → `BUNDLE_BASE + call_fee(t)`; `NodeStatus` gains `notes`, `nullifiers`, `tree_root`, `hc_bundle`. RPC unit tests (replace the six bridge tests): `get_commitments_pages_in_order`, `get_witness_matches_storage`, `mint_rejects_a_bad_address` (`-32602` with the `AddressError` text), `send_transaction_rejects_a_stale_anchor` (`-32000`, error text contains "unknown anchor"), `status_reports_note_and_nullifier_counts`.
+`rpc.rs`: implement the method table above; `rand_mint` parses `ShieldedAddress::parse`; `rand_getCommitments` clamps `limit` to 1000; `rand_getWitness` uses `storage.witness(index, &*executor)`; `rand_estimateFee` takes `{"kind":"bundle"}` → `BUNDLE_BASE`, `{"kind":"deploy","words":n}` → `fee_floor(Deploy)`, `{"kind":"call","tier":t}` → `BUNDLE_BASE + call_fee(t)`; `NodeStatus` gains `notes`, `nullifiers`, `tree_root`, `hc_bundle`. RPC unit tests (replace the six bridge tests): `get_commitments_pages_in_order`, `get_witness_matches_storage`, `mint_rejects_a_bad_address` (`-32602` with the `AddressError` text), `send_transaction_rejects_a_stale_anchor` (`-32000`, error text contains "unknown anchor"), `status_reports_note_and_nullifier_counts`.
 
-`main.rs`: `Cmd::Genesis` takes `--alloc <shrugg1address>=<amount in SHRUGG>` (repeatable) and writes `hc_bundle` from `ZkExecutor::hc_bundle()`; it builds each note as the mint path does (throwaway sender) and prints the amounts; `Cmd::Balance`/`Cmd::Transfer` are deleted. Add the pinned-genesis-hash test here (a genesis built in the test from two seeded validators and one alloc note from `SpendKey([7; 8])`, hashed with `ZkExecutor::new(FriProfile::Test)`; pin the hex the first run prints and comment "changes whenever the bundle guest, the note format, or the genesis binding changes").
+`main.rs`: `Cmd::Genesis` takes `--alloc <rand1address>=<amount in RAND>` (repeatable) and writes `hc_bundle` from `ZkExecutor::hc_bundle()`; it builds each note as the mint path does (throwaway sender) and prints the amounts; `Cmd::Balance`/`Cmd::Transfer` are deleted. Add the pinned-genesis-hash test here (a genesis built in the test from two seeded validators and one alloc note from `SpendKey([7; 8])`, hashed with `ZkExecutor::new(FriProfile::Test)`; pin the hex the first run prints and comment "changes whenever the bundle guest, the note format, or the genesis binding changes").
 
 - [ ] **Step 5: Gate**
 
-Run: `cargo test -p shrugg-node 2>&1 | grep -E 'test result|FAILED'`
-Expected: unit tests green; the surviving cluster tests (`four_validators_plus_late_observer_syncs`, `validator_restarts_from_disk_and_resumes`, `restart_cycles_keep_all_nodes_in_sync`, `two_of_four_down_halts_and_recovers_without_fork`, `node_behind_by_more_than_one_sync_batch_catches_up`, `corrupted_rocksdb_is_detected_truncated_and_resynced`) green with faucet mints as their traffic where they used transfers (a validator node's `rpc.mint(...)` with a shielded address derived from `SpendKey([1; 8])`; add `RpcClient::mint_shielded(address: &str, amount: u64)` to the client crate in this task since these tests need it — the rest of the client is Task 5). `cargo build --workspace` still fails only in `shrugg-client` binaries; that is Task 5.
+Run: `cargo test -p randprotocol-node 2>&1 | grep -E 'test result|FAILED'`
+Expected: unit tests green; the surviving cluster tests (`four_validators_plus_late_observer_syncs`, `validator_restarts_from_disk_and_resumes`, `restart_cycles_keep_all_nodes_in_sync`, `two_of_four_down_halts_and_recovers_without_fork`, `node_behind_by_more_than_one_sync_batch_catches_up`, `corrupted_rocksdb_is_detected_truncated_and_resynced`) green with faucet mints as their traffic where they used transfers (a validator node's `rpc.mint(...)` with a shielded address derived from `SpendKey([1; 8])`; add `RpcClient::mint_shielded(address: &str, amount: u64)` to the client crate in this task since these tests need it — the rest of the client is Task 5). `cargo build --workspace` still fails only in `randprotocol-client` binaries; that is Task 5.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/shrugg-node crates/shrugg-client/src/lib.rs
+git add crates/randprotocol-node crates/randprotocol-client/src/lib.rs
 git commit -m "node: notes/nullifiers/anchors/validators storage, nullifier-conflict mempool, validator-signed faucet mints, redacted RPC with commitments/nullifiers/anchors/witness methods"
 ```
 
 ---
 
-### Task 5: The shielded wallet (`shrugg`)
+### Task 5: The shielded wallet (`rand`)
 
 **Files:**
-- Modify: `crates/shrugg-client/src/lib.rs` (`RpcClient`)
-- Create: `crates/shrugg-client/src/wallet.rs`
-- Modify: `crates/shrugg-client/src/main.rs`
-- Test: unit tests in `wallet.rs` (key file, note store, coin selection) and `crates/shrugg-client/tests/wallet_flow.rs` (one node, mint → scan → send → scan; proves a real bundle)
+- Modify: `crates/randprotocol-client/src/lib.rs` (`RpcClient`)
+- Create: `crates/randprotocol-client/src/wallet.rs`
+- Modify: `crates/randprotocol-client/src/main.rs`
+- Test: unit tests in `wallet.rs` (key file, note store, coin selection) and `crates/randprotocol-client/tests/wallet_flow.rs` (one node, mint → scan → send → scan; proves a real bundle)
 
 **Interfaces:**
 - Consumes: Task 2's `address_of`, `seal_note`, `prove_bundle`, `envelope_from_core`; vendored `notes::{SpendKey, ViewingKey, Note, bundle_inputs, expected_bundle_outputs}`, `viewing::{Envelope, TxKey}`; Task 4's RPC.
@@ -1767,16 +1767,16 @@ pub async fn send(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, to: &Shiel
 
 - [ ] **Step 4: Integration test**
 
-`crates/shrugg-client/tests/wallet_flow.rs`: start one validator node in-process (as `cluster.rs` does; `fri_profile: "test"`, faucet on), wallet A and B from `SpendKey([1; 8])`/`SpendKey([2; 8])`; `mint_shielded(A, 100 SHRUGG)`; `scan` → A balance 100 SHRUGG, one note; `send(A → B, 1 SHRUGG, BUNDLE_BASE)`; `scan` both → B has 1 SHRUGG, A has `100 - 1 - 0.001` SHRUGG in one change note, the spent note marked spent; a second `send` from A works (the change note is spendable). About 2 minutes.
+`crates/randprotocol-client/tests/wallet_flow.rs`: start one validator node in-process (as `cluster.rs` does; `fri_profile: "test"`, faucet on), wallet A and B from `SpendKey([1; 8])`/`SpendKey([2; 8])`; `mint_shielded(A, 100 RAND)`; `scan` → A balance 100 RAND, one note; `send(A → B, 1 RAND, BUNDLE_BASE)`; `scan` both → B has 1 RAND, A has `100 - 1 - 0.001` RAND in one change note, the spent note marked spent; a second `send` from A works (the change note is spendable). About 2 minutes.
 
 - [ ] **Step 5: Gate**
 
-Run: `cargo test -p shrugg-client 2>&1 | grep -E 'test result|FAILED'` → green; `cargo build --workspace` → green.
+Run: `cargo test -p randprotocol-client 2>&1 | grep -E 'test result|FAILED'` → green; `cargo build --workspace` → green.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/shrugg-client
+git add crates/randprotocol-client
 git commit -m "client: shielded wallet — spend-key file v2, envelope scanning, largest-first coin selection, bundle proving and send; deploy/call ride on bundles"
 ```
 
@@ -1785,34 +1785,34 @@ git commit -m "client: shielded wallet — spend-key file v2, envelope scanning,
 ### Task 6: Cluster end-to-end, docs and deploy notes
 
 **Files:**
-- Rewrite: `crates/shrugg-node/tests/cluster.rs` (helpers + the tests deleted in Task 4)
+- Rewrite: `crates/randprotocol-node/tests/cluster.rs` (helpers + the tests deleted in Task 4)
 - Create: `docs/shielded.md`
 - Modify: `docs/rpc.md`, `docs/architecture.md`, `docs/cli.md`, `docs/confidential.md`, `docs/bridge.md` (banner), `deploy/README.md`, `README.md`
-- Modify: `deploy/genesis.json` is NOT regenerated here (the fleet operator cuts the shielded chain); add `deploy/genesis-shielded.example.json` produced by `shrugg-node genesis` with the four validator keys and one alloc note per test wallet, and document the command.
+- Modify: `deploy/genesis.json` is NOT regenerated here (the fleet operator cuts the shielded chain); add `deploy/genesis-shielded.example.json` produced by `rand-node genesis` with the four validator keys and one alloc note per test wallet, and document the command.
 
 - [ ] **Step 1: Cluster helpers and tests**
 
-Helpers: `wallet(i) -> Wallet` from `SpendKey([i; 8])`; `genesis(validators, funded: &[&Wallet])` with one 1,000 SHRUGG alloc note per funded wallet (built exactly as `shrugg-node genesis` does) and `hc_bundle` from the executor; `balance(node, wallet) -> u64` = a fresh `NoteStore` scanned against that node's RPC. Tests:
+Helpers: `wallet(i) -> Wallet` from `SpendKey([i; 8])`; `genesis(validators, funded: &[&Wallet])` with one 1,000 RAND alloc note per funded wallet (built exactly as `rand-node genesis` does) and `hc_bundle` from the executor; `balance(node, wallet) -> u64` = a fresh `NoteStore` scanned against that node's RPC. Tests:
 
-- `two_validators_commit_and_shielded_transfer`: genesis funds A; A sends 1 SHRUGG to B; every node reports B's balance 1 SHRUGG and A's `999 - 0.001`; a replay of the same transaction is rejected (`send_transaction` error contains "spent").
-- `faucet_mint_via_rpc_reaches_every_node`: validator mints to C; C's balance is 100 SHRUGG on every node; an observer's `mint_shielded` errors; an over-cap mint errors.
+- `two_validators_commit_and_shielded_transfer`: genesis funds A; A sends 1 RAND to B; every node reports B's balance 1 RAND and A's `999 - 0.001`; a replay of the same transaction is rejected (`send_transaction` error contains "spent").
+- `faucet_mint_via_rpc_reaches_every_node`: validator mints to C; C's balance is 100 RAND on every node; an observer's `mint_shielded` errors; an over-cap mint errors.
 - `faucet_is_rejected_when_genesis_disables_it`.
 - `confidential_call_rides_on_a_bundle`: A deploys `private_payment` via a bundle, then calls it via a bundle; receipt visible on every node; A's balance dropped by exactly the two fee floors.
 - `two_bundles_spending_one_note_only_one_commits`: submit two conflicting bundles (same input note, different outputs) to two different validators simultaneously; exactly one commits, the other is rejected or pruned, and every node agrees on the state root.
 - keep the six structural tests from Task 4.
 
-Run: `cargo test -p shrugg-node --test cluster -- --test-threads=1 2>&1 | grep -E 'test result|FAILED'` → green (expect 10–15 minutes; record the time).
+Run: `cargo test -p randprotocol-node --test cluster -- --test-threads=1 2>&1 | grep -E 'test result|FAILED'` → green (expect 10–15 minutes; record the time).
 
 - [ ] **Step 2: Docs**
 
-`docs/shielded.md` (new, the user guide): keys and addresses, what is on chain, `shrugg keygen/address/faucet/balance/send`, what the node sees, the admission order, the RPC methods with one example each, privacy notes (what the node learns from witness requests; what an explorer can and cannot show), and the S2/S3 roadmap. `docs/rpc.md`: replace the removed methods and the "Building a transaction without the wallet" section with the `Transaction { chain_id, bundle, action }` layout and bincode sizes. `docs/architecture.md`: the ledger section, column families, state root formula. `docs/cli.md`: commands. `docs/confidential.md`: calls pay through a bundle; effect kind 1 removed. `docs/bridge.md`: a top banner "not wired on the shielded chain until phase S3". `deploy/README.md`: how to cut a shielded genesis, and that the fleet's chain is unchanged until the operator forks.
+`docs/shielded.md` (new, the user guide): keys and addresses, what is on chain, `rand keygen/address/faucet/balance/send`, what the node sees, the admission order, the RPC methods with one example each, privacy notes (what the node learns from witness requests; what an explorer can and cannot show), and the S2/S3 roadmap. `docs/rpc.md`: replace the removed methods and the "Building a transaction without the wallet" section with the `Transaction { chain_id, bundle, action }` layout and bincode sizes. `docs/architecture.md`: the ledger section, column families, state root formula. `docs/cli.md`: commands. `docs/confidential.md`: calls pay through a bundle; effect kind 1 removed. `docs/bridge.md`: a top banner "not wired on the shielded chain until phase S3". `deploy/README.md`: how to cut a shielded genesis, and that the fleet's chain is unchanged until the operator forks.
 
 - [ ] **Step 3: Final gate and commit**
 
 Run: `cargo test --workspace 2>&1 | grep -E 'test result|FAILED'` → every binary green.
 
 ```bash
-git add crates/shrugg-node/tests/cluster.rs docs deploy/README.md deploy/genesis-shielded.example.json README.md
+git add crates/randprotocol-node/tests/cluster.rs docs deploy/README.md deploy/genesis-shielded.example.json README.md
 git commit -m "node: shielded cluster end-to-end; docs: shielded pool user guide, RPC/CLI/architecture updates, bridge parked until S3"
 ```
 

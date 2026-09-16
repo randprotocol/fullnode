@@ -1,15 +1,15 @@
-# Confidential arbitrary computation on the SHRUGG chain — design
+# Confidential arbitrary computation on the RAND chain — design
 
 Date: 2026-09-10
 Status: approved by the user on 2026-09-10 (decisions recorded at the end)
 
 ## Goal
 
-Make SHRUGG the gas coin for confidential computation. A user runs a program off-chain inside the
+Make RAND the gas coin for confidential computation. A user runs a program off-chain inside the
 Rand zkVM (`circuits/research`, crate `rand_zkvm`: RV32I under a Plonky3 batch STARK, Goldilocks,
 Poseidon2, ZK-hiding FRI) on private inputs, and submits only a proof plus the eight public output
-words. Every node verifies the proof against the program stored on chain, charges SHRUGG gas by tier,
-records the outputs, and optionally applies a value transfer gated by the outcome. Plain SHRUGG
+words. Every node verifies the proof against the program stored on chain, charges RAND gas by tier,
+records the outputs, and optionally applies a value transfer gated by the outcome. Plain RAND
 transfers keep working exactly as today.
 
 What the chain learns per call: the program id, the gas tier, the eight outputs, who paid.
@@ -45,12 +45,12 @@ Toolchain: Plonky3 0.7 needs Rust ≥ 1.98 (`maybe_uninit_slice`); the node work
 
 ## Integration shape
 
-`rand_zkvm` is copied into the workspace as `crates/shrugg-zkvm` (its own `Cargo.toml`, tests and
+`rand_zkvm` is copied into the workspace as `crates/randprotocol-zkvm` (its own `Cargo.toml`, tests and
 demo binary kept; no code changes except the crate name and a `Program`/`Proof` byte codec). The
 research tree stays the upstream; a `deploy/sync-zkvm.sh` copies it over and the commit message
 records the upstream revision. Reason: droplets and the other laptop build from this repo alone.
 
-`shrugg-core::confidential` becomes real:
+`randprotocol-core::confidential` becomes real:
 
 ```rust
 pub trait ConfidentialExecutor: Send + Sync {
@@ -58,7 +58,7 @@ pub trait ConfidentialExecutor: Send + Sync {
     fn verify(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError>;
 }
 pub struct CallOutcome { pub tier: u8, pub outputs: [u32; 8] }
-pub struct ZkExecutor { machine: Machine, keys: Mutex<LruCache<(ProgramId, Tier), CommonData>> }   // in shrugg-zkvm, implements the trait
+pub struct ZkExecutor { machine: Machine, keys: Mutex<LruCache<(ProgramId, Tier), CommonData>> }   // in randprotocol-zkvm, implements the trait
 pub struct StubExecutor;   // kept for tests and for chains with `confidential: false`
 ```
 
@@ -73,7 +73,7 @@ recompute on miss).
 ### Programs (on-chain code)
 
 ```rust
-pub type ProgramId = Hash;                      // blake3("shrugg-program" || base_pc || words)
+pub type ProgramId = Hash;                      // blake3("rand-program" || base_pc || words)
 pub struct ProgramRecord {
     pub id: ProgramId,
     pub base_pc: u32,
@@ -104,7 +104,7 @@ Call {
 ```
 
 **Program-driven effects.** The eight public output words are the program's instruction to the
-chain (`shrugg_core::effect`):
+chain (`randprotocol_core::effect`):
 
 | word | meaning |
 |---|---|
@@ -132,16 +132,16 @@ Validity (ledger):
 Receipts: `CallReceipt { tx: Hash, program: ProgramId, tier: u8, outputs: [u32; 8], effect: Option<(Address, u128)>, height, index }`
 stored in a `receipts` column family (not part of the state root; derivable from blocks).
 
-### Gas (v0 schedule, in SHRUGG smallest units; 1 SHRUGG = 1e9)
+### Gas (v0 schedule, in RAND smallest units; 1 RAND = 1e9)
 
 | operation | minimum fee | rationale |
 |---|---|---|
 | Transfer / Mint | 0 (unchanged; fee is a tip) | |
-| Deploy | `DEPLOY_PER_WORD = 100_000` per word → 1 KiB program = 0.0256 SHRUGG | pays for the 2 s key computation every node does once, and permanent code storage |
-| Call | `CALL_BASE = 1_000_000` (0.001 SHRUGG) + `CALL_PER_TIER_STEP = 100_000` × (tier − 10) / 2 | a proof is ~0.9 MB of bandwidth and block storage on every node; bytes barely grow with tier, so the tier surcharge is small |
+| Deploy | `DEPLOY_PER_WORD = 100_000` per word → 1 KiB program = 0.0256 RAND | pays for the 2 s key computation every node does once, and permanent code storage |
+| Call | `CALL_BASE = 1_000_000` (0.001 RAND) + `CALL_PER_TIER_STEP = 100_000` × (tier − 10) / 2 | a proof is ~0.9 MB of bandwidth and block storage on every node; bytes barely grow with tier, so the tier surcharge is small |
 
 The minimum is the gas; anything above is a tip. All of it goes to the block proposer, as today.
-All numbers are constants in `shrugg_core::gas`, easy to retune.
+All numbers are constants in `randprotocol_core::gas`, easy to retune.
 
 Block limits, driven by proof size: `MAX_BLOCK_BYTES = 4 MiB` of transactions (the proposer stops
 adding candidates past it), which is 4 calls per block, about 4 confidential calls per second at the
@@ -154,27 +154,27 @@ peers to re-check history); pruning proofs after finality is a follow-on.
 Proofs are verified once at mempool admission; the tx hash is remembered in a bounded set of
 verified hashes so block application and sync do not verify again on the same node. Blocks received
 from peers are verified fully (their calls were not seen in this node's mempool unless gossiped).
-`shrugg-node verify --mode full` re-verifies every proof in history; `quick` trusts the QCs.
+`rand-node verify --mode full` re-verifies every proof in history; `quick` trusts the QCs.
 
 ## RPC and wallet
 
 | method | params | result |
 |---|---|---|
-| `shrugg_getProgram` | `[program_id]` | record without words, plus `words_len`, `code_hash` |
-| `shrugg_getProgramCode` | `[program_id]` | `{ base_pc, words: [u32] }` |
-| `shrugg_getReceipt` | `[tx_hash]` | `CallReceipt` or null |
-| `shrugg_estimateFee` | `[kind, size_or_tier]` | minimum fee in units |
-| `shrugg_sendTransaction` | unchanged; carries Deploy/Call like any other tx | |
+| `rand_getProgram` | `[program_id]` | record without words, plus `words_len`, `code_hash` |
+| `rand_getProgramCode` | `[program_id]` | `{ base_pc, words: [u32] }` |
+| `rand_getReceipt` | `[tx_hash]` | `CallReceipt` or null |
+| `rand_estimateFee` | `[kind, size_or_tier]` | minimum fee in units |
+| `rand_sendTransaction` | unchanged; carries Deploy/Call like any other tx | |
 
-Wallet (`shrugg`):
+Wallet (`rand`):
 ```
-shrugg program build --guest balance_check --arg 1000 --out prog.bin   # built-in guests, until a RISC-V toolchain flow exists
-shrugg program deploy prog.bin                                         # prints the program id, pays deploy gas
-shrugg program show <id>
-shrugg program deploy prog.bin | prog.json                            # .bin = raw little-endian u32 words; .json = {base_pc, words}
-shrugg call <id> --input 400 --input 250 ... [--tier 12] [--to <addr>]...  # proves locally, submits, waits, prints outputs + receipt
+rand program build --guest balance_check --arg 1000 --out prog.bin   # built-in guests, until a RISC-V toolchain flow exists
+rand program deploy prog.bin                                         # prints the program id, pays deploy gas
+rand program show <id>
+rand program deploy prog.bin | prog.json                            # .bin = raw little-endian u32 words; .json = {base_pc, words}
+rand call <id> --input 400 --input 250 ... [--tier 12] [--to <addr>]...  # proves locally, submits, waits, prints outputs + receipt
                                                                          # --to builds the public recipient list the program may pick from
-shrugg receipt <tx>
+rand receipt <tx>
 ```
 `call` runs the prover on the user's machine; only the proof leaves it. The wallet links the zkVM
 crate for proving; the node links it for verifying.
@@ -188,12 +188,12 @@ without the executor for tests.
 
 ## Testing
 
-- shrugg-zkvm: upstream tests unchanged (e2e, zk, cheating).
-- shrugg-core: gas schedule; effect decoding (kinds, index range, u64 amount); Deploy validity (bad
+- randprotocol-zkvm: upstream tests unchanged (e2e, zk, cheating).
+- randprotocol-core: gas schedule; effect decoding (kinds, index range, u64 amount); Deploy validity (bad
   opcode, too large); Call validity with a real proof (test FRI profile for speed): wrong program,
   tampered outputs, wrong tier, too-small fee, transfer effect applied vs kind 0, index out of range,
   insufficient balance for the emitted amount; state root covers programs.
-- shrugg-node: storage round trips for programs/receipts; mempool admission of a call; a cluster
+- rand-node: storage round trips for programs/receipts; mempool admission of a call; a cluster
   test that deploys a program, proves a call on the client side, submits it to one node, and checks
   every node stored the same receipt and applied the gated transfer identically; restart with a
   program on chain re-verifies in `full` mode.
@@ -211,7 +211,7 @@ notes/nullifiers), fee markets. Each is a follow-on with this step as its base.
 - Deploy validation must be cheap because it runs inside block application on every node. The
   zkVM's Poseidon2 code commitment costs 2 s, so `code_hash` on chain is the content id, and the
   verifier key (which embeds the zk commitment) is computed by a background task when a deploy
-  commits (`ConfidentialExecutor::warm`) and at startup for stored programs. `shrugg_zkvm::executor::zk_code_hash`
+  commits (`ConfidentialExecutor::warm`) and at startup for stored programs. `randprotocol_zkvm::executor::zk_code_hash`
   computes the zk commitment on demand for explorers.
 - Receipts travel inside `CommittedBlock` (consensus attaches them when a block is applied); a
   syncing node recomputes them and rejects a batch whose receipts differ.
@@ -221,7 +221,7 @@ notes/nullifiers), fee markets. Each is a follow-on with this step as its base.
 1. Call effect: **program-driven transfers** (outputs choose recipient index and amount, see the
    effect table), not a caller-supplied gated transfer.
 2. Gas schedule v0 as listed.
-3. zkVM vendored into `crates/shrugg-zkvm`; workspace toolchain 1.98.1.
+3. zkVM vendored into `crates/randprotocol-zkvm`; workspace toolchain 1.98.1.
 4. Programs: built-in guests plus raw `.bin`/`.json` word files.
 
 ## Measurements

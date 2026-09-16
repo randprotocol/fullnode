@@ -23,7 +23,7 @@ nullifiers and two commitments (128 bytes), two envelopes (ML-KEM-768 ciphertext
 the sealed note, about 1.4 KB each), the fee and burn fields, the 47-word digest preimage. Call
 a transfer **1.3 MB, 99.7 % of it proof**.
 
-The node's caps (`crates/shrugg-core/src/gas.rs`):
+The node's caps (`crates/randprotocol-core/src/gas.rs`):
 
 | cap | value | effect at 80 queries |
 |---|---|---|
@@ -49,11 +49,11 @@ which for the two privacy chains is a shielded 2-in-2-out.
 | Solana | ~48 M compute units; a few MB of shreds | 0.4 s | ≤ 1 232 B (packet cap) | ~1 000–2 000 non-vote | multiple TB per year; validators keep a window, archives keep all | hundreds of TB unpruned |
 | Monero | dynamic; 300 KB penalty-free floor, median × 2 | 120 s | ~2.2 KB (RingCT, 16-ring) | ~140 at the floor | ~0.2 GB at the floor | ~230 GB |
 | Zcash | 2 MB | 75 s | ~2.7 KB Sapling, ~3–5 KB Orchard | ~400–700 | ~2.3 GB | ~300 GB |
-| **SHRUGG, 27 queries** | 4 MiB | ~2 s | ~450 KB | ~9 | ~170 GB | testnet |
-| **SHRUGG, 80 queries** | 4 MiB | ~2 s | **~1.3 MB** | **~3** | ~170 GB | testnet |
+| **RAND, 27 queries** | 4 MiB | ~2 s | ~450 KB | ~9 | ~170 GB | testnet |
+| **RAND, 80 queries** | 4 MiB | ~2 s | **~1.3 MB** | **~3** | ~170 GB | testnet |
 
-Two things stand out. Per transfer, a SHRUGG bundle is 300–600× a Zcash or Monero shielded
-transaction and about 5 000× a Bitcoin payment. Per block, SHRUGG's 4 MiB every 2 s is already
+Two things stand out. Per transfer, a RAND bundle is 300–600× a Zcash or Monero shielded
+transaction and about 5 000× a Bitcoin payment. Per block, RAND's 4 MiB every 2 s is already
 the most bandwidth-hungry row in the table except Solana; only the tiny transfer count keeps it
 from being obvious.
 
@@ -66,24 +66,24 @@ works the arithmetic).
 
 ## 3. What the fee schedule does and does not price
 
-Fees are flat floors (`docs/fees.md`): 0.001 SHRUGG per bundle regardless of size, because a
+Fees are flat floors (`docs/fees.md`): 0.001 RAND per bundle regardless of size, because a
 validator's cost is one nearly constant STARK verification. That was true at 27 queries and
 remains true at 80: verification moved from 809 ms to 838 ms uncached, 16 ms warm. The floor
 prices **verification**, not **bytes**.
 
-Bytes are the scarce thing now. Three slots per block with a flat 0.001 SHRUGG floor and a
+Bytes are the scarce thing now. Three slots per block with a flat 0.001 RAND floor and a
 first-come mempool means demand above 1.5 transfers per second is rationed by arrival order,
 not price. Before mainnet the mempool has to order candidates by fee above the floor. That is a
 fee market without gas: the unit is a bundle, the price is whatever the sender attaches, and the
 block picks the top three. Nothing in the proof system changes; `candidates_within` in
-`crates/shrugg-node/src/node.rs` changes its sort key.
+`crates/randprotocol-node/src/node.rs` changes its sort key.
 
 ## 4. How the number comes down
 
 In the order they are worth doing:
 
 1. **Do not store proofs forever.** A proof is not part of the state root
-   (`blake3("shrugg-state-2" || tree || nullifiers || validators || programs)`); only the
+   (`blake3("rand-state-2" || tree || nullifiers || validators || programs)`); only the
    commitments, nullifiers and anchors it authorised are. A node that has verified a block and
    seen it finalised can drop the proof bytes and keep the ~3 KB of public fields per transfer.
    Chain growth then falls from ~1.3 MB to ~3 KB per transfer, into Zcash's range, while

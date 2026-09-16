@@ -23,7 +23,7 @@ each commit, `docs/core/node: <area> — <what>` style, no push.
    the registered aggregate program (spec §2.3).
 3. **Cheap before expensive, exactly as `validate_inner` has it.** The rVM verify (~1–2 s warm)
    is the *last* thing admission does, and it runs on the RPC-hardening task's workers off the
-   consensus loop (`crates/shrugg-node/src/admission.rs`), with gossipsub reported exactly once
+   consensus loop (`crates/randprotocol-node/src/admission.rs`), with gossipsub reported exactly once
    (spec §4 step 8).
 4. **Measured numbers in the docs** (`AGENTS.md` rule): the registered shape's digests, the
    startup key-build time, the warm aggregate verify, the cluster run's walls —
@@ -40,22 +40,22 @@ each commit, `docs/core/node: <area> — <what>` style, no push.
 
 | # | ruling | basis |
 |---|---|---|
-| R1 | **Vendor `circuits/recursion` into `crates/shrugg-rvm` via `deploy/sync-zkvm.sh`, pinned at circuits main `271679d`** — not a path dependency. A path dep `fullnode → circuits/recursion` pulls recursion's own `rand_zkvm = { path = "../research" }` along with it, giving two *distinct* `rand_zkvm` crates (`circuits/research` and the vendored `crates/shrugg-zkvm`): `recursion::InnerProof` and `shrugg_zkvm::machine::Proof` would be different types, and the executor could not pass a bundle's proof to `recursion::aggregate` at all. The sync script's existing `rand_zkvm → shrugg_zkvm` rename (its `@@RAND_ZKVM@@` two-step) applied to the recursion copy makes the types unify — the same mechanism `shrugg-zkvm` itself lands by. `circuits/` must still sit beside `fullnode/` for the *source*; the build consumes only `crates/`. | `deploy/sync-zkvm.sh`'s comment block and rename; `recursion/Cargo.toml`'s `rand_zkvm = { path = "../research" }` |
+| R1 | **Vendor `circuits/recursion` into `crates/randprotocol-rvm` via `deploy/sync-zkvm.sh`, pinned at circuits main `271679d`** — not a path dependency. A path dep `fullnode → circuits/recursion` pulls recursion's own `rand_zkvm = { path = "../research" }` along with it, giving two *distinct* `rand_zkvm` crates (`circuits/research` and the vendored `crates/randprotocol-zkvm`): `recursion::InnerProof` and `randprotocol_zkvm::machine::Proof` would be different types, and the executor could not pass a bundle's proof to `recursion::aggregate` at all. The sync script's existing `rand_zkvm → randprotocol_zkvm` rename (its `@@RAND_ZKVM@@` two-step) applied to the recursion copy makes the types unify — the same mechanism `randprotocol-zkvm` itself lands by. `circuits/` must still sit beside `fullnode/` for the *source*; the build consumes only `crates/`. | `deploy/sync-zkvm.sh`'s comment block and rename; `recursion/Cargo.toml`'s `rand_zkvm = { path = "../research" }` |
 | R2 | **`AdmittedShape` carries `profile` + `tier` + the six heights (the "declared shape") and the chain-9 genesis pins `aggregate_program_digest` per admitted shape; the `InnerKey` cap is derived at startup, never stored.** Spec §2.3 verbatim; the startup key-build (~30–70 s at 2²¹ production, 18.31 s measured at 2¹⁹) is a node-startup obligation documented for ops, cached in recursion's own 64-entry FIFO. | `circuits/recursion/docs/02-aggregate.md` "Startup: the key-build story" |
 | R3 | **The pruned record is a `CF_TXS` value-level form, not a new column family**: `TxRecord { Raw(Transaction), Pruned { tx: Transaction, proof_hash: Hash, public_values: [u64; 34], shape: DeclaredShape } }`. A new family would split every tx lookup across two reads for zero benefit; the marker lives on the value, and `verify_chain` reads the same key either way. `CF_SEALS` *is* new: `bundle_hash → aggregate_tx_hash` (`sealed_by`) plus per-block `sealed: bool`, both derived state. | storage.rs's existing CF list (`CF_TXS` at storage.rs:25) |
 | R4 | **`AGGREGATION_WINDOW = 256` and `MAX_COVERS = 3` are genesis parameters with those defaults, not shared constants.** The window shares its *value* with the anchor/time window by default but is independently configurable (the subsidy schedule and the pruning gate hang off it; tying it to the anchor window would couple two policies). | spec §3.3 |
 | R5 | **`Action::Aggregate`'s fee floor is 0** (it is bundle-less, and `fee_floor`'s own rule says a bundle-less action has nothing to pay *from*). The proving share is collected from the *covered bundles'* excess, not from the aggregate's author; a fee field on the action would double-count. | gas.rs:68–74, spec §5.2 |
-| R6 | **The executor surface is two methods, not the recursion API re-exported**: `aggregate_program_digest(shape) -> Word8` (startup constant) and `verify_aggregate(shape, covered, proof) -> Result<Vec<[u32; 8]>, _>`. The ledger never sees `recursion` types; `CoveredBundle { public_values: [u64; 34], shape: DeclaredShape }` is a shrugg-core type. The stub executor for tests implements the same two methods with a recorded-calls fake; the conformance suite (Task 4) exercises the real one byte-for-byte before anything trusts the stubbed path. | spec §4 steps 6–8; `circuits/recursion/docs/02-aggregate.md`'s vectors |
-| R7 | **The proving slot covers the cluster's aggregate proof.** The fullnode's proving-slot discipline (`crates/shrugg-node/tests/proving_slot/`) hands out one permit at a time; the cluster suite's recursion prove (test profile, ~2–4 min at N=3 over the small fixture shape) takes it, exactly as the wallet-flow bundles do. | AGENTS.md "Proving concurrency is capped" |
-| R8 | **`shrugg_getUnsealed` is a node-side view over `CF_TXS` + `CF_SEALS`, paginated by height, and deliberately read-only for the daemon's polling pattern.** It answers `(hash, height, excess_fee)` for bundles that are finalised, chain-9, inside the window, and `sealed_by`-absent. | spec §8 |
+| R6 | **The executor surface is two methods, not the recursion API re-exported**: `aggregate_program_digest(shape) -> Word8` (startup constant) and `verify_aggregate(shape, covered, proof) -> Result<Vec<[u32; 8]>, _>`. The ledger never sees `recursion` types; `CoveredBundle { public_values: [u64; 34], shape: DeclaredShape }` is a randprotocol-core type. The stub executor for tests implements the same two methods with a recorded-calls fake; the conformance suite (Task 4) exercises the real one byte-for-byte before anything trusts the stubbed path. | spec §4 steps 6–8; `circuits/recursion/docs/02-aggregate.md`'s vectors |
+| R7 | **The proving slot covers the cluster's aggregate proof.** The fullnode's proving-slot discipline (`crates/randprotocol-node/tests/proving_slot/`) hands out one permit at a time; the cluster suite's recursion prove (test profile, ~2–4 min at N=3 over the small fixture shape) takes it, exactly as the wallet-flow bundles do. | AGENTS.md "Proving concurrency is capped" |
+| R8 | **`rand_getUnsealed` is a node-side view over `CF_TXS` + `CF_SEALS`, paginated by height, and deliberately read-only for the daemon's polling pattern.** It answers `(hash, height, excess_fee)` for bundles that are finalised, chain-9, inside the window, and `sealed_by`-absent. | spec §8 |
 
 ## File structure
 
 ```
-crates/shrugg-core/src/
+crates/randprotocol-core/src/
   types/transaction.rs        [Task 1] Action::{Aggregate,RegisterAggregator,UnbondAggregator,
                                  WithdrawAggregator,SlashAggregator}; bundle_less(); AggregatorRegistration
-  types/mod.rs                [Task 1] DeclaredShape, CoveredBundle (R6's shrugg-core types)
+  types/mod.rs                [Task 1] DeclaredShape, CoveredBundle (R6's randprotocol-core types)
   genesis.rs                  [Task 1][Task 9] genesis.aggregation: Option<AggregationConfig>
   gas.rs                      [Task 1] MAX_AGGREGATE_BYTES; [Task 5] subsidy()
   ledger/mod.rs               [Task 2] validate_inner/apply_tx arms for the five actions
@@ -65,10 +65,10 @@ crates/shrugg-core/src/
                               [Task 5] subsidy/sealed_blocks/unsealed_fees/payout note
   ledger/supply.rs            [Task 5] the four counters and the issued − slashed invariant
   ledger/staking.rs           [Task 1] derived_commitment gains the two new note arms
-crates/shrugg-zkvm/src/
+crates/randprotocol-zkvm/src/
   executor.rs                 [Task 3] ConfidentialExecutor gains the aggregate surface
-crates/shrugg-rvm/            [Task 3] NEW: vendored circuits/recursion at 271679d (R1)
-crates/shrugg-node/src/
+crates/randprotocol-rvm/            [Task 3] NEW: vendored circuits/recursion at 271679d (R1)
+crates/randprotocol-node/src/
   storage.rs                  [Task 6] CF_SEALS; the TxRecord pruned form (R3)
   mempool.rs                  [Task 4] the payout-cm and (aggregator, nonce) claims
   admission.rs                [Task 4] is_permanent arms for the new permanent verdicts
@@ -90,9 +90,9 @@ AGENTS.md                     [Task 10] the aggregation project-memory entry
 
 ### Task 1: Core types, the register state, genesis gating
 
-**Files:** `crates/shrugg-core/src/types/{transaction.rs,mod.rs}`, `crates/shrugg-core/src/genesis.rs`,
-`crates/shrugg-core/src/gas.rs`, `crates/shrugg-core/src/ledger/aggregation.rs` (new),
-`crates/shrugg-core/src/ledger/staking.rs` (derived_commitment only).
+**Files:** `crates/randprotocol-core/src/types/{transaction.rs,mod.rs}`, `crates/randprotocol-core/src/genesis.rs`,
+`crates/randprotocol-core/src/gas.rs`, `crates/randprotocol-core/src/ledger/aggregation.rs` (new),
+`crates/randprotocol-core/src/ledger/staking.rs` (derived_commitment only).
 
 **Interfaces:**
 
@@ -177,8 +177,8 @@ pub fn subsidy(n: u64, cfg: &AggregationConfig) -> u64 {
   `210 000`, and the 64th halving's zero.
 - [x] **Step 2: Run to verify it fails** — no such types exist.
 - [x] **Step 3: Implement** — the types, the register map with the leaf
-  `blake3("shrugg-aggregator-leaf-1", addr || bond || nonce || release || payout pk || payout
-  kem_ek)`, the `shrugg-state-3`-domained `aggregators_root` joined into `Ledger::state_root`
+  `blake3("rand-aggregator-leaf-1", addr || bond || nonce || release || payout pk || payout
+  kem_ek)`, the `rand-state-3`-domained `aggregators_root` joined into `Ledger::state_root`
   exactly when `genesis.aggregation.is_some()`; the `Genesis` section with the same gating
   pattern `bridge` uses; `derived_commitment` in `ledger/staking.rs:161` extended to the two
   new derived-note actions (an `Aggregate`'s payout note and a `WithdrawAggregator`'s) so the
@@ -189,8 +189,8 @@ pub fn subsidy(n: u64, cfg: &AggregationConfig) -> u64 {
 
 ### Task 2: The four register actions
 
-**Files:** `crates/shrugg-core/src/ledger/aggregation.rs`, `crates/shrugg-core/src/ledger/mod.rs`
-(the two `match &tx.action` arms), `crates/shrugg-core/src/gas.rs` (`fee_floor` arms).
+**Files:** `crates/randprotocol-core/src/ledger/aggregation.rs`, `crates/randprotocol-core/src/ledger/mod.rs`
+(the two `match &tx.action` arms), `crates/randprotocol-core/src/gas.rs` (`fee_floor` arms).
 
 **Interfaces** (the `staking.rs` shape, mirrored):
 
@@ -214,7 +214,7 @@ impl Ledger {
 
 Semantics, point-for-point from spec §2.2: `RegisterAggregator` requires a bundle whose
 `burn == AGGREGATION.bond` (the `Bond` arm's check in `validate_inner`'s burn match — extended
-with the register arm), the signature over `blake3("shrugg-aggregator-register", chain_id ||
+with the register arm), the signature over `blake3("rand-aggregator-register", chain_id ||
 payout)`, refusal when the address is registered, entry created at `nonce = 0`;
 `UnbondAggregator` sets `unbonding = Some(head + window)` and bars submissions;
 `WithdrawAggregator` is the S2 `Withdraw` verbatim (release check, derived note of
@@ -237,16 +237,16 @@ deletes the entry. One monotonic nonce per entry, consumed per accepted action.
 
 ### Task 3: The rVM executor capability and the vendoring (R1)
 
-**Files:** `deploy/sync-zkvm.sh` (the recursion section), `crates/shrugg-rvm/` (produced by it),
-`crates/shrugg-zkvm/src/executor.rs`, `crates/shrugg-zkvm/Cargo.toml`.
+**Files:** `deploy/sync-zkvm.sh` (the recursion section), `crates/randprotocol-rvm/` (produced by it),
+`crates/randprotocol-zkvm/src/executor.rs`, `crates/randprotocol-zkvm/Cargo.toml`.
 
 **Interfaces:**
 
 ```rust
-// shrugg-core (types/mod.rs) — the executor surface's own types, so the trait stays shrugg-core's.
+// randprotocol-core (types/mod.rs) — the executor surface's own types, so the trait stays randprotocol-core's.
 impl DeclaredShape { pub fn from_proof_header(header: &ProofHeader) -> DeclaredShape; }
 
-// shrugg-zkvm/src/executor.rs — the trait, extended (R6)
+// randprotocol-zkvm/src/executor.rs — the trait, extended (R6)
 pub trait ConfidentialExecutor {
     /* … today … */
     /// The registered aggregate program's digest for an admitted shape: a startup constant.
@@ -257,16 +257,16 @@ pub trait ConfidentialExecutor {
     fn verify_aggregate(&self, shape: &DeclaredShape, covered: &[CoveredBundle],
                         proof: &[u8]) -> Result<Vec<[u32; 8]>, ConfidentialError>;
 }
-// ZkExecutor: builds the shrugg_rvm Machine at startup (the key-build — R2), and a stub for
+// ZkExecutor: builds the randprotocol_rvm Machine at startup (the key-build — R2), and a stub for
 // tests with the same surface and recorded calls.
 ```
 
 The vendoring itself, as R1 rules: a `sync_recursion()` section in `deploy/sync-zkvm.sh` that
-rsyncs `../../../circuits/recursion/{src,Cargo.toml}` into `crates/shrugg-rvm/` with the
-`@@RAND_ZKVM@@` two-step rename applied (`rand_zkvm` → `shrugg_zkvm` in its Cargo.toml and
-sources, so its `rand_zkvm` dep resolves to the vendored `crates/shrugg-zkvm`), the
+rsyncs `../../../circuits/recursion/{src,Cargo.toml}` into `crates/randprotocol-rvm/` with the
+`@@RAND_ZKVM@@` two-step rename applied (`rand_zkvm` → `randprotocol_zkvm` in its Cargo.toml and
+sources, so its `rand_zkvm` dep resolves to the vendored `crates/randprotocol-zkvm`), the
 `rand_zkvm_cuda` references left alone (recursion does not depend on it by default), and the
-pin recorded as circuits main `271679d` in the script's header and in `crates/shrugg-rvm/AGENTS.md`
+pin recorded as circuits main `271679d` in the script's header and in `crates/randprotocol-rvm/AGENTS.md`
 (one paragraph: what it is, whence, how to re-sync).
 
 - [x] **Step 1: Write the failing tests** — (a) `ZkExecutor::aggregate_program_digest` for the
@@ -275,20 +275,20 @@ pin recorded as circuits main `271679d` in the script's header and in `crates/sh
   the vendored crate and recorded in `docs/aggregation.md` at activation); (b) the stub
   executor records `verify_aggregate` calls and replays canned answers, so ledger tests never
   touch a proof.
-- [x] **Step 2: Run to verify it fails** — no `shrugg-rvm` crate, no such methods.
-- [x] **Step 3: Implement** — the vendoring section, run it (produces `crates/shrugg-rvm`), the
+- [x] **Step 2: Run to verify it fails** — no `randprotocol-rvm` crate, no such methods.
+- [x] **Step 3: Implement** — the vendoring section, run it (produces `crates/randprotocol-rvm`), the
   trait extension and the real `ZkExecutor` wiring (the startup key-build at `Node` startup
   when `genesis.aggregation` is present: build the registered program, call recursion's
   `verifier_key`, cache; log the build's wall time — R2's measured number).
-- [x] **Step 4: Run to verify it passes** — the digest test green; `cargo check -p shrugg-zkvm
-  -p shrugg-rvm` clean (this is the one build step of the plan; it stays off the heavy suite
+- [x] **Step 4: Run to verify it passes** — the digest test green; `cargo check -p randprotocol-zkvm
+  -p randprotocol-rvm` clean (this is the one build step of the plan; it stays off the heavy suite
   until Task 10).
-- [x] **Step 5: Commit** — `zkvm: vendored recursion as shrugg-rvm (circuits 271679d) + the executor's aggregate surface and the startup key-build`
+- [x] **Step 5: Commit** — `zkvm: vendored recursion as randprotocol-rvm (circuits 271679d) + the executor's aggregate surface and the startup key-build`
 
 ### Task 4: Aggregate admission (spec §4) and the conformance suite
 
-**Files:** `crates/shrugg-core/src/ledger/aggregation.rs`, `crates/shrugg-node/src/mempool.rs`,
-`crates/shrugg-node/src/admission.rs`, `crates/shrugg-node/src/node.rs`.
+**Files:** `crates/randprotocol-core/src/ledger/aggregation.rs`, `crates/randprotocol-node/src/mempool.rs`,
+`crates/randprotocol-node/src/admission.rs`, `crates/randprotocol-node/src/node.rs`.
 
 **Interfaces:**
 
@@ -307,7 +307,7 @@ pub struct ValidatedAggregate {
 ```
 
 Steps, exactly the spec's §4: (1) size caps, `chain_id`; (2) registered, not unbonding, nonce,
-signature over `blake3("shrugg-aggregate", chain_id || nonce || time || r || covers || proof
+signature over `blake3("rand-aggregate", chain_id || nonce || time || r || covers || proof
 hash)`; (3) `time` window; (4) the cover set (`1 ≤ covers.len() ≤ max_covers`, no duplicates,
 every hash a coverable bundle — finalised, chain-9, in-window, unsealed); (5) the payout
 commitment is new (`derived_commitment`, claimed in the mempool like a `BridgeAttest`'s); (6)
@@ -341,9 +341,9 @@ stay uncached, exactly the file's own rule.
 
 ### Task 5: Subsidy, the proving share, and the supply audit
 
-**Files:** `crates/shrugg-core/src/ledger/aggregation.rs`, `crates/shrugg-core/src/ledger/mod.rs`
-(the bundle-inclusion split), `crates/shrugg-core/src/ledger/supply.rs`,
-`crates/shrugg-core/src/gas.rs`, `crates/shrugg-node/src/rpc.rs` (the `shrugg_getSupply`
+**Files:** `crates/randprotocol-core/src/ledger/aggregation.rs`, `crates/randprotocol-core/src/ledger/mod.rs`
+(the bundle-inclusion split), `crates/randprotocol-core/src/ledger/supply.rs`,
+`crates/randprotocol-core/src/gas.rs`, `crates/randprotocol-node/src/rpc.rs` (the `rand_getSupply`
 extension — folded here, not in Task 8, because the audit's test lives here).
 
 **Interfaces:**
@@ -377,7 +377,7 @@ and appended at apply with `withdraw_deposited` *not* touched — the subsidy is
   aggregator; expired → to the recorded proposer; never-included → still bucketed); the subsidy
   schedule at the halving edges; the supply invariant holding across a register, an aggregate,
   a withdraw and a slash (`total_supply == issued − slashed` exactly); `sealed_blocks`
-  incrementing per included aggregate and not per block; `shrugg_getSupply` reporting the four
+  incrementing per included aggregate and not per block; `rand_getSupply` reporting the four
   new counters separately from `faucet_minted`.
 - [x] **Step 2: Run to verify it fails.**
 - [x] **Step 3: Implement** — the split in `apply_tx` (the proposer credit becomes
@@ -389,9 +389,9 @@ and appended at apply with `withdraw_deposited` *not* touched — the subsidy is
 
 ### Task 6: Sealing and pruning
 
-**Files:** `crates/shrugg-node/src/storage.rs` (CF_SEALS, the `TxRecord` form),
-`crates/shrugg-node/src/node.rs` (marking on commit, the pruning pass, the
-`--keep-raw-proofs` flag), `crates/shrugg-node/src/main.rs` (the flag).
+**Files:** `crates/randprotocol-node/src/storage.rs` (CF_SEALS, the `TxRecord` form),
+`crates/randprotocol-node/src/node.rs` (marking on commit, the pruning pass, the
+`--keep-raw-proofs` flag), `crates/randprotocol-node/src/main.rs` (the flag).
 
 **Interfaces:**
 
@@ -427,9 +427,9 @@ impl Storage {
 
 ### Task 7: Sealed-form sync
 
-**Files:** `crates/shrugg-node/src/network/` (the second block form on the wire),
-`crates/shrugg-node/src/node.rs` (`apply_synced`'s acceptance rule), the cluster tests
-(`crates/shrugg-node/tests/`).
+**Files:** `crates/randprotocol-node/src/network/` (the second block form on the wire),
+`crates/randprotocol-node/src/node.rs` (`apply_synced`'s acceptance rule), the cluster tests
+(`crates/randprotocol-node/tests/`).
 
 **Interfaces:**
 
@@ -457,18 +457,18 @@ enum SyncedBlock { Raw(Block), Sealed(Block) }   // Sealed carries pruned bundle
 
 ### Task 8: RPC, CLI, and the changelog
 
-**Files:** `crates/shrugg-node/src/rpc.rs`, `crates/shrugg-node/src/main.rs`,
+**Files:** `crates/randprotocol-node/src/rpc.rs`, `crates/randprotocol-node/src/main.rs`,
 `docs/rpc.md`, `docs/cli.md`.
 
-**Interfaces (spec §8, in `docs/rpc.md`'s conventions):** `shrugg_submitAggregate` (an alias of
-`shrugg_sendTransaction`, no new path); `shrugg_getBlockByHeight`/`ByHash` gain `sealed` and
-per-bundle `sealed_by`; `shrugg_getAggregate(hash) -> { covers, aggregator, subsidy,
-proving_share, n }`; `shrugg_getAggregators` (the register); `shrugg_getUnsealed(from, limit)
--> { bundles: [{ hash, height, excess }], next_from }` (R8); `shrugg_getSupply` with the four
-counters; `shrugg_status.aggregation: { registered, unsealed, verify_queue }`; `tx_json` for
-the five actions. The node CLI: `shrugg-node aggregator register --bond --payout`, `unbond`,
-`withdraw`, and `shrugg-node aggregate --watch --rpc <url>` (poll `shrugg_getUnsealed`, fetch
-raw bundles, call `shrugg_rvm::aggregate::aggregate`, submit — a separate process, RPC-only).
+**Interfaces (spec §8, in `docs/rpc.md`'s conventions):** `rand_submitAggregate` (an alias of
+`rand_sendTransaction`, no new path); `rand_getBlockByHeight`/`ByHash` gain `sealed` and
+per-bundle `sealed_by`; `rand_getAggregate(hash) -> { covers, aggregator, subsidy,
+proving_share, n }`; `rand_getAggregators` (the register); `rand_getUnsealed(from, limit)
+-> { bundles: [{ hash, height, excess }], next_from }` (R8); `rand_getSupply` with the four
+counters; `rand_status.aggregation: { registered, unsealed, verify_queue }`; `tx_json` for
+the five actions. The node CLI: `rand-node aggregator register --bond --payout`, `unbond`,
+`withdraw`, and `rand-node aggregate --watch --rpc <url>` (poll `rand_getUnsealed`, fetch
+raw bundles, call `randprotocol_rvm::aggregate::aggregate`, submit — a separate process, RPC-only).
 
 - [x] **Step 1: Write the failing tests** — the methods' shapes against the spec (request/
   response fixtures), `tx_json`'s five renderings, the changelog entry's presence in
@@ -481,7 +481,7 @@ raw bundles, call `shrugg_rvm::aggregate::aggregate`, submit — a separate proc
 
 ### Task 9: The chain-9 genesis
 
-**Files:** `crates/shrugg-core/src/genesis.rs`, `deploy/cut-chain9-genesis.sh` (new),
+**Files:** `crates/randprotocol-core/src/genesis.rs`, `deploy/cut-chain9-genesis.sh` (new),
 `docs/deploy.md`.
 
 **Interfaces:** the `genesis` CLI gains
@@ -504,7 +504,7 @@ digest so the placeholder can never reach a fleet).
 
 ### Task 10: End-to-end, the full suite, and the docs
 
-**Files:** `crates/shrugg-node/tests/` (the cluster suite), `docs/aggregation.md`,
+**Files:** `crates/randprotocol-node/tests/` (the cluster suite), `docs/aggregation.md`,
 `AGENTS.md`.
 
 **The end-to-end** (R7's discipline): register an aggregator → bond it → a window of real
@@ -543,7 +543,7 @@ sequenced here as a checklist, not a date:
    aggregator daemon started on the GPU host as M5.4 delivers it (CPU-first is supported and
    is how the cluster test runs).
 4. **Go/no-go gates**: the conformance suite green on the fleet build; the cluster end-to-end
-   green on the release candidate; `shrugg_getSupply`'s invariant holding from block 0.
+   green on the release candidate; `rand_getSupply`'s invariant holding from block 0.
 
 ## Self-review
 

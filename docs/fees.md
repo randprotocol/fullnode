@@ -1,18 +1,18 @@
 # Fees, tiers and why there is no gas
 
-This page explains what a transaction pays on SHRUGG, what the sender pays with its own machine
+This page explains what a transaction pays on RAND, what the sender pays with its own machine
 instead, and why the chain has no gas metering. `docs/confidential.md` has the on-chain call
 model, `docs/zkvm.md` the machine, `docs/shielded.md` the pool.
 
 ## 1. What a transaction pays the chain
 
-Fees are flat floors, in units of 10⁻⁹ SHRUGG (`crates/shrugg-core/src/gas.rs`):
+Fees are flat floors, in units of 10⁻⁹ RAND (`crates/randprotocol-core/src/gas.rs`):
 
 | transaction | floor | today |
 |---|---|---|
-| any bundle: a transfer, a bond, the fee bundle of a bridge burn | `BUNDLE_BASE` = 1,000,000 | 0.001 SHRUGG |
-| Deploy | `BUNDLE_BASE` + `DEPLOY_PER_WORD` (100,000) × program words | a 4,096-word program: 0.4106 SHRUGG |
-| Call | `BUNDLE_BASE` + `call_fee(tier)`, `call_fee` = `CALL_BASE` (1,000,000) + 100,000 per two tiers above 10 | tier 10: 0.002; tier 14: 0.0022; tier 20: 0.0025 SHRUGG |
+| any bundle: a transfer, a bond, the fee bundle of a bridge burn | `BUNDLE_BASE` = 1,000,000 | 0.001 RAND |
+| Deploy | `BUNDLE_BASE` + `DEPLOY_PER_WORD` (100,000) × program words | a 4,096-word program: 0.4106 RAND |
+| Call | `BUNDLE_BASE` + `call_fee(tier)`, `call_fee` = `CALL_BASE` (1,000,000) + 100,000 per two tiers above 10 | tier 10: 0.002; tier 14: 0.0022; tier 20: 0.0025 RAND |
 | Mint (testnet faucet) | 0 (no bundle; validator-signed) | — |
 
 The fee is a public word of the bundle. The `bundle` guest binds it into its balance proof
@@ -23,7 +23,7 @@ before any verification work, the tier-exact floor after. Paying more than the f
 the mempool orders candidates by fee, so a higher fee only matters under congestion.
 
 The wallet's defaults are exactly the floors: `deploy_fee_default = fee_floor(Deploy)`,
-`call_fee_default(tier) = BUNDLE_BASE + call_fee(tier)`; `shrugg fee bundle|deploy <words>|call
+`call_fee_default(tier) = BUNDLE_BASE + call_fee(tier)`; `rand fee bundle|deploy <words>|call
 <tier>` prints them.
 
 Value also leaves the pool through `burn`: a `Bond` burns exactly its amount into the
@@ -77,7 +77,7 @@ validator would have to run it to find out. Metering each opcode solves three pr
    per-opcode cost, hence the fee table and its revisions.
 3. **Block sizing.** The block gas limit bounds the replay work a block can impose.
 
-On SHRUGG the premise is gone: **no node executes anything.** The sender runs the program once,
+On RAND the premise is gone: **no node executes anything.** The sender runs the program once,
 off chain, and hands the chain a proof. A node's work per transaction is a fixed sequence: decode
 the public fields, run the free checks, verify one STARK. That verification's cost depends on the
 tier and the tables present, never on what the program did, and it is bounded by construction: a
@@ -124,4 +124,4 @@ accounting (M4.4).
 | `MAX_PROGRAM_WORDS` | 4,096 | `gas.rs` |
 | `MAX_PROOF_BYTES` | 2 MiB (constraint set 5's 80-query profile; re-measured and kept at constraint set 6) | `gas.rs` |
 | `MAX_BLOCK_BYTES`, `MAX_BLOCK_TXS` | 4 MiB, 2,000 | `gas.rs` |
-| tiers | 10, 12, 14, 16, 18, 20 cycles = `2ᵗ − 1` | `shrugg-zkvm` `machine::TIERS` |
+| tiers | 10, 12, 14, 16, 18, 20 cycles = `2ᵗ − 1` | `randprotocol-zkvm` `machine::TIERS` |

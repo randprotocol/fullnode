@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy/sync-zkvm.sh — copy the research zkVM into crates/shrugg-zkvm. Run from the repo root.
+# deploy/sync-zkvm.sh — copy the research zkVM into crates/randprotocol-zkvm. Run from the repo root.
 #
 # Local additions (executor.rs, codec.rs, address.rs, call_envelope.rs, the extended guests.rs
 # and asm.rs, tests/executor.rs, tests/shielded.rs, tests/call_envelope.rs) are preserved;
@@ -13,9 +13,9 @@
 # Shielded pool S1: the note layer — `notes.rs`, `viewing.rs`, `ledger.rs` — IS vendored now. The
 # node's shielded pool is built on exactly the research crate's note commitments, nullifiers,
 # key hierarchy, envelope format and commitment tree, so a second hand-written copy on this side
-# would be a soundness bug waiting to happen; `crates/shrugg-zkvm/Cargo.toml` therefore carries
+# would be a soundness bug waiting to happen; `crates/randprotocol-zkvm/Cargo.toml` therefore carries
 # `ml-kem`/`chacha20poly1305` (the same pinned versions upstream uses) and `src/lib.rs` names the
-# three modules. Node-specific code that bridges them to `shrugg-core`'s pure data types lives in
+# three modules. Node-specific code that bridges them to `randprotocol-core`'s pure data types lives in
 # the hand-maintained `src/address.rs`; the three vendored files are never hand-edited.
 #
 # Still not vendored: arx.rs (no longer exists upstream since M3.3's Poseidon2 switch, kept in the
@@ -23,8 +23,8 @@
 # modules that only exist on one side or the other); and, on the test side, `tests/viewing.rs` and
 # `tests/bundle.rs`. Those two are excluded purely for runtime: each proves several `bundle`/
 # `transfer` guests at tier 14 and takes minutes, so they stay upstream, where they are the
-# authority on the note layer's behaviour. `crates/shrugg-zkvm/tests/shielded.rs` is this side's
-# own, much smaller check that the vendored layer agrees with `shrugg-core`'s types (trees, the
+# authority on the note layer's behaviour. `crates/randprotocol-zkvm/tests/shielded.rs` is this side's
+# own, much smaller check that the vendored layer agrees with `randprotocol-core`'s types (trees, the
 # pinned `hc_bundle`, one end-to-end bundle proof).
 #
 # `hash.rs` IS vendored (M3.4): it is core, not note-layer-specific — the program digest `hc`
@@ -48,7 +48,7 @@
 # `guests::compiled` module — `tests/e2e.rs` (vendored wholesale) now calls
 # `guests::compiled::fib()` — is mirrored by hand into the local `guests.rs`, with its
 # `include_bytes!` path adjusted for this crate's shallower layout (`guests-compiled/` sits
-# directly under `crates/shrugg-zkvm/`, not two levels up as it does from `research/src/`). The
+# directly under `crates/randprotocol-zkvm/`, not two levels up as it does from `research/src/`). The
 # compiled binary itself, `guests-compiled/bin/fib.bin`, is not part of `research/src` or
 # `research/tests` either, so it needs its own copy step (below) rather than riding along with
 # either rsync.
@@ -57,7 +57,7 @@
 # (1) A ninth AIR table, `tables/keccak.rs` (Keccak-f[1600]), plus its host reference `src/keccak.rs`
 # and its own `tests/keccak.rs`: all three ride along with the two rsyncs, but `src/lib.rs` is
 # hand-maintained on this side, so `pub mod keccak;` has to be added there by hand, and
-# `crates/shrugg-zkvm/Cargo.toml` needs upstream's `p3-keccak = "=0.7.0"` (the table's AIR) and the
+# `crates/randprotocol-zkvm/Cargo.toml` needs upstream's `p3-keccak = "=0.7.0"` (the table's AIR) and the
 # `hex = "0.4"` dev-dependency `tests/keccak.rs`'s known-answer vectors use.
 # (2) The keccak table is *optional per proof*: `Proof::keccak_log_height == 0` means the batch has
 # eight instances and no keccak table at all, and `Proof::mem_log_height` is proof-declared too.
@@ -73,7 +73,7 @@
 # pointer bound, ZH1-ZH4's tier/length caps) arrives entirely through the rsyncs — nothing here.
 # (5) The production FRI profile is back to 80 queries / blowup 8 / 20 PoW bits, so proofs are
 # ~1.20 MB (tier 10) / ~1.25 MB (tier 12) and a keccak-bearing proof is ~1.91 MB larger. That is
-# not a sync-script concern, but it is why `shrugg-core`'s `MAX_PROOF_BYTES` moved to 2 MiB.
+# not a sync-script concern, but it is why `randprotocol-core`'s `MAX_PROOF_BYTES` moved to 2 MiB.
 # `guests.rs` and `asm.rs` stay excluded, so M4.2's `guests::compiled::keccak256()`,
 # `guests::keccak_demo()` and `asm::call_keccak()` are mirrored by hand into the local copies —
 # the vendored `tests/{asm,cheating,e2e,emulator}.rs` call all three by name.
@@ -84,7 +84,7 @@
 # `tables/sha256.rs`, `tests/{evm_u256,evm_storage,evm_interp,evm_abi}.rs`,
 # `tests/{sbpf_isa,sbpf_interp,sbpf_elf,sbpf_abi}.rs`, `tests/sha256.rs` and
 # `tests/common/{sbpf_oracle,sbpf_elf_builder}.rs`. `src/lib.rs` is hand-maintained, so
-# `pub mod {evm,sbpf,sha256}` go in by hand, and `crates/shrugg-zkvm/Cargo.toml` needs
+# `pub mod {evm,sbpf,sha256}` go in by hand, and `crates/randprotocol-zkvm/Cargo.toml` needs
 # upstream's pins: `evm-core`/`sbpf-core` as *path* dependencies (`../../../circuits/
 # guests-compiled/{evm-core,sbpf-core}` — beside the repo, like `rand-zkvm-cuda`, but NOT
 # optional: `src/evm.rs`/`src/sbpf.rs` are library code) and the dev-dependencies
@@ -116,12 +116,12 @@
 # rsyncs: `call_envelope.rs` (src and tests) is node-local S3 code that arrived after the cs5
 # sync script's exclude list was written — without it `--delete` would remove both files.
 #
-# The CUDA backend is *not* vendored either: crates/shrugg-zkvm depends on it by path, as
+# The CUDA backend is *not* vendored either: crates/randprotocol-zkvm depends on it by path, as
 # ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building
 # with --features cuda or --features mock-cuda.
 set -euo pipefail
 SRC=${1:-../circuits/research}
-DST=crates/shrugg-zkvm
+DST=crates/randprotocol-zkvm
 mkdir -p "$DST/src" "$DST/tests"
 rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude rust-toolchain.toml \
       --exclude executor.rs --exclude codec.rs --exclude guests.rs --exclude asm.rs \
@@ -155,16 +155,16 @@ for ASSET in evm/contracts/erc20.runtime.hex sbpf/programs/spl_token.so; do
   fi
   cp "$SRC/../guests-compiled/$ASSET" "$DST/guests-compiled/$ASSET"
 done
-# rand_zkvm -> shrugg_zkvm, but the *dependency* rand_zkvm_cuda keeps its own name (it is an
+# rand_zkvm -> randprotocol_zkvm, but the *dependency* rand_zkvm_cuda keeps its own name (it is an
 # unmodified external crate), so park it behind a placeholder while the rename runs.
 grep -rl "rand_zkvm" "$DST/src" "$DST/tests" | xargs -I{} sed -i '' \
       -e 's/rand_zkvm_cuda/@@RAND_ZKVM_CUDA@@/g' \
-      -e 's/rand_zkvm/shrugg_zkvm/g' \
+      -e 's/rand_zkvm/randprotocol_zkvm/g' \
       -e 's/@@RAND_ZKVM_CUDA@@/rand_zkvm_cuda/g' {} 2>/dev/null || true
 # Constraint set 6 (M4.3/M4.4): three vendored files `include!` assets from upstream's
 # `guests-compiled/`, spelled `../../guests-compiled/` (two levels up from `research/src` and
 # `research/tests`). This crate's layout is one level shallower — the copy step above puts the
-# same files under `crates/shrugg-zkvm/guests-compiled/` — so the paths become
+# same files under `crates/randprotocol-zkvm/guests-compiled/` — so the paths become
 # `../guests-compiled/`, the same adjustment hand-maintained `guests.rs` has always had. A
 # no-match here means upstream moved the asset; the include would then fail at compile time
 # naming the file, which is loud enough — so this patches whatever matches and asserts nothing.
@@ -266,21 +266,21 @@ REV=$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
 echo "synced zkVM from $SRC at $REV into $DST"
 echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../../circuits/rand-zkvm-cuda (i.e. circuits/ beside fullnode/)"
 
-# ── the recursion VM (rVM) → crates/shrugg-rvm ────────────────────────────────────────────────
+# ── the recursion VM (rVM) → crates/randprotocol-rvm ────────────────────────────────────────────────
 # M5.3/M5.4's recursion VM, vendored at circuits main `271679d` ("Merge zkvm-m5-4"). What the
 # rename has to achieve (the block-aggregation plan's R1): recursion's own
 # `rand_zkvm = { path = "../research" }` dependency must land on the *vendored*
-# `crates/shrugg-zkvm`, not on `circuits/research` — a path dependency on this repo from
-# `crates/shrugg-rvm` to `circuits/recursion` would drag `circuits/research` in as a second,
+# `crates/randprotocol-zkvm`, not on `circuits/research` — a path dependency on this repo from
+# `crates/randprotocol-rvm` to `circuits/recursion` would drag `circuits/research` in as a second,
 # distinct `rand_zkvm` crate beside the vendored one, and `recursion::InnerProof` and
-# `shrugg_zkvm::machine::Proof` would then be *different types* (the aggregate's covered bundles
+# `randprotocol_zkvm::machine::Proof` would then be *different types* (the aggregate's covered bundles
 # could never be handed to the verifier). The two-step rename below — the same one the research
 # sync runs, over the whole vendored tree plus its Cargo.toml — makes the vendored recursion's
-# `rand_zkvm` references point at the vendored `shrugg_zkvm`, so the proof types unify.
+# `rand_zkvm` references point at the vendored `randprotocol_zkvm`, so the proof types unify.
 #
 # `rand-zkvm-cuda` is an *optional* path dependency of recursion (`reference-backend` /
 # `mock-cuda` / `cuda` features, all off by default): the vendored copy repoints it outside the
-# repo to `../../../circuits/rand-zkvm-cuda` exactly as `crates/shrugg-zkvm`'s own optional cuda
+# repo to `../../../circuits/rand-zkvm-cuda` exactly as `crates/randprotocol-zkvm`'s own optional cuda
 # dep already works — default features off, the CUDA feature stays unvendored. Building the
 # vendored crate's *tests* wants the fixture cache: `RECURSION_FIXTURES` pointing at a warm
 # `recursion/target/recursion-fixtures` saves the first run's re-proving (the cache re-verifies
@@ -290,31 +290,31 @@ echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../.
 # `--skip round_trips --skip two_test_profile` (they are the M5.3 exit's own runs, not this
 # repo's gate).
 RVM_SRC=${RVM_SRC:-../circuits/recursion}
-RVM_DST=crates/shrugg-rvm
+RVM_DST=crates/randprotocol-rvm
 mkdir -p "$RVM_DST/src" "$RVM_DST/tests"
 rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude rust-toolchain.toml \
       "$RVM_SRC/src/" "$RVM_DST/src/"
 rsync -a --delete --exclude target "$RVM_SRC/tests/" "$RVM_DST/tests/"
 cp "$RVM_SRC/Cargo.toml" "$RVM_DST/Cargo.toml"
-# The rename, over the vendored tree and the manifest alike: `rand_zkvm` -> `shrugg_zkvm`, with
+# The rename, over the vendored tree and the manifest alike: `rand_zkvm` -> `randprotocol_zkvm`, with
 # the external `rand_zkvm_cuda` parked behind the placeholder as above; then the three path
 # adjustments the manifest and the crate name need.
 grep -rl "rand_zkvm" "$RVM_DST" | xargs -I{} sed -i '' \
       -e 's/rand_zkvm_cuda/@@RAND_ZKVM_CUDA@@/g' \
-      -e 's/rand_zkvm/shrugg_zkvm/g' \
+      -e 's/rand_zkvm/randprotocol_zkvm/g' \
       -e 's/@@RAND_ZKVM_CUDA@@/rand_zkvm_cuda/g' {} 2>/dev/null || true
 sed -i '' \
-      -e 's|^name = "recursion"|name = "shrugg-rvm"|' \
-      -e 's|path = "../research"|path = "../shrugg-zkvm"|' \
+      -e 's|^name = "recursion"|name = "randprotocol-rvm"|' \
+      -e 's|path = "../research"|path = "../randprotocol-zkvm"|' \
       -e 's|path = "../rand-zkvm-cuda"|path = "../../../circuits/rand-zkvm-cuda"|' \
       "$RVM_DST/Cargo.toml"
 # Two manifest adjustments the rename cannot express: the dependency key must match the
-# *package* name (`shrugg-zkvm`, hyphenated) even though the lib it links is `shrugg_zkvm` —
+# *package* name (`randprotocol-zkvm`, hyphenated) even though the lib it links is `randprotocol_zkvm` —
 # the rename underscored it too — and recursion's own `[profile.*]` sections have to go: they
 # were written for recursion as its own workspace root, cargo ignores (and warns on) profile
 # tables in a member manifest, and this workspace's root profiles already cover it (the
-# `profile.dev.package.shrugg-rvm` entry mirrors the zkVM's).
-sed -i '' 's|^shrugg_zkvm = { path = "../shrugg-zkvm" }|shrugg-zkvm = { path = "../shrugg-zkvm" }|' "$RVM_DST/Cargo.toml"
+# `profile.dev.package.randprotocol-rvm` entry mirrors the zkVM's).
+sed -i '' 's|^randprotocol_zkvm = { path = "../randprotocol-zkvm" }|randprotocol-zkvm = { path = "../randprotocol-zkvm" }|' "$RVM_DST/Cargo.toml"
 python3 - "$RVM_DST/Cargo.toml" <<'PY'
 import sys
 p = sys.argv[1]
@@ -324,18 +324,18 @@ if anchor in s:
     s = s[:s.index(anchor)]
     open(p, 'w').write(s.rstrip() + "\n")
 PY
-# The lib name and every test-side `recursion::` path become `shrugg_rvm` (the vendored sources
+# The lib name and every test-side `recursion::` path become `randprotocol_rvm` (the vendored sources
 # use `crate::` internally; only the integration tests name the crate).
 python3 - "$RVM_DST/Cargo.toml" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p).read()
 anchor = '[lib]\npath = "src/lib.rs"'
-want = '[lib]\nname = "shrugg_rvm"\npath = "src/lib.rs"'
+want = '[lib]\nname = "randprotocol_rvm"\npath = "src/lib.rs"'
 assert anchor in s, "recursion's Cargo.toml lost its [lib] path anchor; update sync-zkvm.sh"
 s = s.replace(anchor, want, 1)
 open(p, 'w').write(s)
 PY
-grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/shrugg_rvm::/g' {} 2>/dev/null || true
+grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/randprotocol_rvm::/g' {} 2>/dev/null || true
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
 echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 271679d) into $RVM_DST"

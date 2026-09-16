@@ -1,0 +1,40 @@
+[package]
+name = "randprotocol-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "RAND wallet client: JSON-RPC client library and the `rand` command-line wallet"
+
+[[bin]]
+name = "rand"
+path = "src/main.rs"
+
+[dependencies]
+randprotocol-core = { workspace = true }
+randprotocol-zkvm = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+
+[features]
+default = []
+# `rand call --cuda` proves on an attached NVIDIA GPU. Needs a CUDA 13 toolkit at build time
+# and the sibling `circuits` checkout for the backend crate.
+cuda = ["randprotocol-zkvm/cuda"]
+# The same `--cuda` path with the kernels running on the host mock driver: no GPU, no toolkit.
+mock-cuda = ["randprotocol-zkvm/mock-cuda"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `tests/wallet_flow.rs` drives a real one-node chain in-process. Cargo allows this cycle
+# because it goes through dev-dependencies only: `randprotocol-node` depends on this crate for its
+# own binary, and nothing in this crate's library depends on the node.
+randprotocol-node = { path = "../randprotocol-node" }
+libp2p = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,6 +1,6 @@
 # Architecture
 
-The original design spec is in `docs/superpowers/specs/2026-09-09-shrugg-fullnode-design.md` and
+The original design spec is in `docs/superpowers/specs/2026-09-09-rand-fullnode-design.md` and
 the shielded pool's is `docs/superpowers/specs/2026-09-11-shielded-pool-design.md`; this page
 describes what is implemented, and walks one confidential transaction end to end. Where the code
 and an older doc disagreed, this page follows the code.
@@ -12,9 +12,9 @@ guide to what took their place.
 ## 1. Overview
 
 ```
- WALLET (shrugg-client)                           EVERY NODE (shrugg-node)
+ WALLET (randprotocol-client)                           EVERY NODE (rand-node)
  ───────────────────────                          ─────────────────────────────────────
-  scan the tree with the viewing key                 JSON-RPC (shrugg_sendTransaction, ...)
+  scan the tree with the viewing key                 JSON-RPC (rand_sendTransaction, ...)
   select ≤ 2 notes, fetch anchor + witnesses                │
        │                                                     ▼
        │  every value-moving tx:                     ┌───────────────┐
@@ -26,7 +26,7 @@ guide to what took their place.
        │  └─────────────────────────┘                        │           ledger.validate() probe
        │  Call also: prove the program                       ▼           (anchor, spends, digest,
        ▼                                             ┌───────────────┐    proof verification)
-  bincode(Transaction) ───── shrugg_sendTransaction ─▶│   HotStuff     │◀─── gossipsub / libp2p ──▶
+  bincode(Transaction) ───── rand_sendTransaction ─▶│   HotStuff     │◀─── gossipsub / libp2p ──▶
   { chain_id, bundle, action }                       │  (chained BFT) │
                                                      │  leader proposes a block of candidates │
                                                      │  votes → QC → lock → 3-chain commit    │
@@ -35,7 +35,7 @@ guide to what took their place.
                                                              ▼
                                                      ┌───────────────┐
                                                      │     Ledger     │  apply_block:
-                                                     │  (shrugg-core) │  bundle → digest + verify_bundle
+                                                     │  (randprotocol-core) │  bundle → digest + verify_bundle
                                                      │                │  Deploy → check_program (cheap)
                                                      │                │  Call   → verify_call ──────┐
                                                      └───────┬────────┘                             │
@@ -43,9 +43,9 @@ guide to what took their place.
                                                              ▼                                       ▼
                                                      ┌───────────────┐                     ┌──────────────────┐
                                                      │    RocksDB     │  one fsynced        │ ZkExecutor::      │
-                                                     │  (shrugg-node) │  WriteBatch per      │ verify_bundle /   │
+                                                     │  (rand-node) │  WriteBatch per      │ verify_bundle /   │
                                                      │  blocks/qcs/   │  commit              │ verify_call       │
-                                                     │  notes/nulli-  │                      │ (shrugg-zkvm):    │
+                                                     │  notes/nulli-  │                      │ (randprotocol-zkvm):    │
                                                      │  fiers/anchors/│                      │ Machine::verify   │
                                                      │  validators/   │                      │ (STARK verifier,  │
                                                      │  programs/     │                      │ cached key)       │
@@ -63,7 +63,7 @@ on every node, on public bytes (a proof, a digest, eight output words) that anyo
 
 ## 2. Crates and their boundaries
 
-- **`shrugg-core`** has no I/O, no async runtime, and no Plonky3 dependency. It holds cryptography
+- **`randprotocol-core`** has no I/O, no async runtime, and no Plonky3 dependency. It holds cryptography
   (Dilithium2 via `crystals-dilithium`, BLAKE3), the transaction/block/validator types, the ledger
   and its transaction rules, the note/commitment-tree/address types, gas, genesis derivation, the
   `ConfidentialExecutor` trait (an interface, not an implementation), and the HotStuff state
@@ -72,19 +72,19 @@ on every node, on public bytes (a proof, a digest, eight output words) that anyo
   deterministic across every validator — can be unit-tested and simulated (a whole multi-replica
   network) in-process, in milliseconds, without RocksDB, sockets, or a STARK prover in the loop.
   `StubExecutor` (a crypto-free fake proof format) stands in for the real verifier in that world.
-- **`shrugg-zkvm`** is the Rand zkVM itself (vendored from `circuits/research`, resynced with
+- **`randprotocol-zkvm`** is the Rand zkVM itself (vendored from `circuits/research`, resynced with
   `deploy/sync-zkvm.sh`): an RV32I-subset emulator, a Plonky3 batch STARK prover/verifier, and
   `executor.rs`, which is the only place `ConfidentialExecutor` gets a real implementation
   (`ZkExecutor`). `codec.rs` reads/writes program files. This is the one crate allowed to depend on
   Plonky3, and the boundary means a chain can run with `confidential: false` (`DisabledExecutor`,
-  in `shrugg-core`) without linking any of it in.
-- **`shrugg-node`** wraps `shrugg-core` in I/O: RocksDB storage, libp2p networking, the mempool,
-  block sync, the JSON-RPC server, the node event loop, and the `shrugg-node` CLI. It picks which
+  in `randprotocol-core`) without linking any of it in.
+- **`rand-node`** wraps `randprotocol-core` in I/O: RocksDB storage, libp2p networking, the mempool,
+  block sync, the JSON-RPC server, the node event loop, and the `rand-node` CLI. It picks which
   executor to construct (`ZkExecutor`, or `DisabledExecutor` per genesis) and hands it to the
   ledger and consensus layers underneath.
-- **`shrugg-client`** is the RPC client library and the `shrugg` wallet binary: no RocksDB or
+- **`randprotocol-client`** is the RPC client library and the `rand` wallet binary: no RocksDB or
   libp2p dependency. It is where proving happens — `executor::prove` calls straight into
-  `shrugg-zkvm`'s `Machine`, so the wallet links the zkVM prover but never a node's storage or
+  `randprotocol-zkvm`'s `Machine`, so the wallet links the zkVM prover but never a node's storage or
   networking stack.
 
 ## 3. Identity, addresses, keys
@@ -93,19 +93,19 @@ A node or wallet key is a 32-byte seed. From it:
 
 - A Dilithium2 (post-quantum lattice signature) key pair: 1312-byte public key, 2420-byte
   signatures.
-- The address: `blake3("shrugg-address" || public_key)`, shown base58.
-- A libp2p identity: an ed25519 key derived as `blake3("shrugg-p2p-identity" || seed)`, stable
+- The address: `blake3("rand-address" || public_key)`, shown base58.
+- A libp2p identity: an ed25519 key derived as `blake3("rand-p2p-identity" || seed)`, stable
   across restarts.
 
 Signed objects (votes, blocks, faucet mints) carry the full public key, not just the address, so a
 verifier checks `blake3(public_key) == address` rather than trusting a bare address. The node key
-file format (`{ "seed", "address", "public_key" }`, mode 0600) is written by `shrugg-node keygen`;
+file format (`{ "seed", "address", "public_key" }`, mode 0600) is written by `rand-node keygen`;
 only the seed is secret, everything else is re-derived on load (`docs/cli.md`).
 
 A **wallet** key is a different object entirely, and this is where the spending/viewing split
 lives: a 256-bit `SpendKey` from which the viewing key `nk = H(NK, sk)` is derived, and from that
 the note-owner field `pk`, the nullifier function `H_NF(nk, cm)`, the outgoing viewing key, the
-ML-KEM-768 decapsulation key, and the `shrugg1…` address (32-byte `pk` plus the 1184-byte
+ML-KEM-768 decapsulation key, and the `rand1…` address (32-byte `pk` plus the 1184-byte
 encapsulation key, base58, ~1668 characters). A wallet key never signs a transaction: a bundle
 authorises itself by its proof. See `docs/shielded.md` §1.
 
@@ -135,7 +135,7 @@ were. There is no `Action` that pays an address, because there are no addresses 
 
 **Identity and replay.** There is no signature over the transaction and no sender field. The
 transaction id used everywhere (mempool keys, receipts, RPC) is
-`blake3("shrugg-txid" || bincode(Transaction))`. Replay protection is the nullifier set: a bundle
+`blake3("rand-txid" || bincode(Transaction))`. Replay protection is the nullifier set: a bundle
 publishes `H_NF(nk, cm)` for each input, and a second transaction spending the same note is
 rejected with `nullifier already spent` — no nonces, and nothing per-sender to order.
 
@@ -152,8 +152,8 @@ answered before the ledger probe runs at all (§8).
 
 **Fees.** The fee is a public field of the bundle, and all of it — tip above the minimum included
 — is credited to the block proposer's `rewards` in the validator register. There is no burn and no
-split. Minimums come from `shrugg_core::gas`: every bundle pays `BUNDLE_BASE = 1,000,000` units
-(0.001 SHRUGG); a `Deploy` adds `100,000` units per program word; a `Call` adds `1,000,000` units
+split. Minimums come from `randprotocol_core::gas`: every bundle pays `BUNDLE_BASE = 1,000,000` units
+(0.001 RAND); a `Deploy` adds `100,000` units per program word; a `Call` adds `1,000,000` units
 at the lowest tier (10) plus `100,000` per two tiers above it, to `1,500,000` at tier 20
 (`call_fee`). A `BridgeBurn` pays `BUNDLE_BASE` twice, because it is the one transaction that
 carries two bundles and a node verifies both. A mint carries no bundle and pays nothing. Blocks
@@ -192,23 +192,23 @@ rejected transaction leaves the ledger byte-identical.
 `Ledger::state_root()`:
 
 1. `nullifier_root` = a BLAKE3 pairwise Merkle root over
-   `blake3("shrugg-nullifier-leaf" || nf(32))` for every nullifier, in sorted (BTreeSet) order.
+   `blake3("rand-nullifier-leaf" || nf(32))` for every nullifier, in sorted (BTreeSet) order.
    It is recomputed per block: `O(n)`, which is fine until the set passes about 10^6 entries and
    wants an incremental accumulator.
 2. `validators_root` = the same construction over
-   `blake3("shrugg-validator-leaf-2" || address(32) || stake_be(8) || rewards_be(8) ||
+   `blake3("rand-validator-leaf-2" || address(32) || stake_be(8) || rewards_be(8) ||
    nonce_be(8) || pending_len_be(8) || (release_epoch_be(8) || amount_be(8))* ||
    payout_pk(32) || payout_kem_ek(1184))`, in address-sorted order. That is the whole v2
    register entry (phase S2): the bonded stake, the proposer rewards, the replay nonce, the
    unbonding queue and the shielded address a withdraw pays. The queue is length-prefixed so
    the leaf is injective; every other field is fixed width.
-3. `programs_root` = the same over `blake3("shrugg-program-leaf" || program_id)`, in id order.
-4. `state_root = blake3("shrugg-state-2" || tree_root(32) || nullifier_root(32) ||
+3. `programs_root` = the same over `blake3("rand-program-leaf" || program_id)`, in id order.
+4. `state_root = blake3("rand-state-2" || tree_root(32) || nullifier_root(32) ||
    validators_root(32) || programs_root(32))`.
 
 `tree_root` is the commitment tree's own Poseidon2 root — the same value a wallet anchors a proof
 to — so the pool's contents are committed by the state root without any of them being readable
-from it. The `-2` in the domain is the S1 break from the account-era `"shrugg-state"`.
+from it. The `-2` in the domain is the S1 break from the account-era `"rand-state"`.
 
 The order transactions were applied in is not separately hashed into the state root; the block's
 `tx_root` (a Merkle root over `tx.hash()` in block order, checked before any transaction is
@@ -229,7 +229,7 @@ a STARK proof against that commitment and records the eight public output words 
 There is no longer an `Effect`: output kind 1, the program-driven transfer to an account, was
 deleted with the accounts, and a call moves value only through the bundle that pays for it.
 `Mint` exists only for testnets: gated by the genesis `faucet` flag (itself part of the genesis
-hash), capped at 100 SHRUGG per call, signed by a validator's own key, and admitted through the
+hash), capped at 100 RAND per call, signed by a validator's own key, and admitted through the
 mempool and consensus like anything else — its commitment can be created only once, so it cannot
 be replayed.
 
@@ -237,7 +237,7 @@ be replayed.
 
 Each block carries a quorum certificate (QC) for its parent — a set of Dilithium2 votes from
 validators holding strictly more than 2/3 of total stake (`ValidatorSet::has_quorum`). Rules
-currently implemented in `crates/shrugg-core/src/consensus/hotstuff.rs`:
+currently implemented in `crates/randprotocol-core/src/consensus/hotstuff.rs`:
 
 - **Leader schedule.** Pure round robin: the leader of view `v` is `validators[v mod n]`, validators
   sorted and deduplicated by address at genesis. No stake weighting in leader selection — stake
@@ -303,7 +303,7 @@ One RocksDB per data directory, eleven column families:
 | `meta` | small blobs: head height, genesis hash, chain id, the consensus `SafetyState`, the commitment-tree frontier (`tree`), and `hc_bundle` |
 
 `accounts` is gone, and so are the three bridge families. `notes` is dense from zero and keyed in
-tree order, which is what makes `shrugg_getCommitments` a straight range scan and
+tree order, which is what makes `rand_getCommitments` a straight range scan and
 `notes_count()` the next leaf index; it is also the only copy of the leaf set, since consensus
 state keeps the frontier alone (§5). `anchors` is pruned to the newest `ANCHOR_WINDOW` heights.
 
@@ -322,14 +322,14 @@ proposer signature and every QC's votes. On the first inconsistency the node tru
 the last good height — deleting the `notes` rows above the replayed ledger's next index, the
 `nullifiers` and `anchors` rows above that height, and rewriting every validator row and the tree
 frontier from the replayed ledger, while keeping its consensus safety state so it never
-double-votes — and lets sync refetch the rest from peers. `shrugg-node verify --repair` does the
+double-votes — and lets sync refetch the rest from peers. `rand-node verify --repair` does the
 same thing offline, without running the node.
 
 **Why a constraint-set change is a hard fork.** `--verify-chain quick`/`full` re-verify every
 historical `Call`'s proof through whatever zkVM constraints the running binary implements. A STARK
 proof is a proof *about a specific constraint system* — different FRI parameters, a different table
 set, or a different program-digest construction all change what "a valid proof" even means. A node
-built from a newer `shrugg-zkvm` therefore fails startup replay at the first historical block that
+built from a newer `randprotocol-zkvm` therefore fails startup replay at the first historical block that
 contains a confidential call proved under the old constraints, and truncates its own chain at that
 point (`docs/confidential.md` documents two such transitions already, "constraint set 2" and
 "constraint set 3"). The only ways forward on a chain whose constraints changed are to start a new
@@ -339,9 +339,9 @@ chain id, or to run the old-constraint nodes (or the new ones, on old history) w
 ## 8. Networking and sync; mempool
 
 libp2p 0.54 over TCP with Noise and Yamux. Behaviours: **gossipsub** (topics
-`shrugg/<chain-id>/consensus`, `/tx`, `/status`), **Kademlia** (protocol `/shrugg/<chain-id>/kad/1`)
+`rand/<chain-id>/consensus`, `/tx`, `/status`), **Kademlia** (protocol `/rand/<chain-id>/kad/1`)
 seeded from `--bootstrap`, **identify**, optional **mDNS** for LAN discovery, **request-response**
-(`/shrugg/sync/1`, CBOR) for block sync, and **ping** every 15 s. A node remembers every address it
+(`/rand/sync/1`, CBOR) for block sync, and **ping** every 15 s. A node remembers every address it
 dialled or learnt through identify and redials disconnected known peers every 30 s, in addition to
 the bootstrap list.
 
@@ -409,9 +409,9 @@ moving it would change when a vote is emitted.
 
 ## 9. End-to-end confidential transaction
 
-This section follows one `private_payment` call — `shrugg call <program-id> --input 400 --input 250
+This section follows one `private_payment` call — `rand call <program-id> --input 400 --input 250
 --input 300 --input 75` — from the wallet to a settled receipt. `private_payment`
-(`shrugg-zkvm::guests::private_payment`) reads four private balances and, if their sum is at least a
+(`randprotocol-zkvm::guests::private_payment`) reads four private balances and, if their sum is at least a
 threshold baked into the program, publishes the surplus in its output words; on this chain those
 words are recorded and nothing else follows from them, because the effect that used to pay an
 account was deleted with the accounts (§5).
@@ -425,12 +425,12 @@ the way a transfer's action rides on one; the chain verifies both.
 Before anyone can call a program, someone deploys it:
 
 ```
-shrugg program build --guest private_payment --arg 1000 --out pp.json
-shrugg program deploy pp.json
+rand program build --guest private_payment --arg 1000 --out pp.json
+rand program deploy pp.json
 ```
 
 The wallet assembles (or loads, for a hand-written `.json`/`.bin` file) `{ base_pc, words }` and
-computes the content address `program_id = blake3("shrugg-program" || base_pc(LE32) ||
+computes the content address `program_id = blake3("rand-program" || base_pc(LE32) ||
 words(LE32 each))` — this is a plain content hash, purely for addressing, distinct from the zkVM's
 own in-circuit digest below. It then builds a transaction whose action is `Deploy { base_pc, words }` and whose bundle pays at
 least `BUNDLE_BASE + deploy_fee(words.len()) = 1,000,000 + 100,000 * words.len()` units — a
@@ -464,8 +464,8 @@ typically finds already built by an earlier verify.
 
 ### b. Prove (wallet, off-chain)
 
-`shrugg call` fetches the deployed code back from the chain (`shrugg_getProgramCode`) rather than
-trusting a local copy, reads the chain's declared FRI profile from `shrugg_status`, and warns if it
+`rand call` fetches the deployed code back from the chain (`rand_getProgramCode`) rather than
+trusting a local copy, reads the chain's declared FRI profile from `rand_status`, and warns if it
 is the insecure `test` profile. It then runs the program once in the plain emulator to find how many
 cycles it takes, and picks the smallest tier `t` with `2^t - 1 >= cycles` — a tier is a proof-of-work
 sized padding bucket (10, 12, 14, 16, 18, or 20), and the proof reveals only which tier was used,
@@ -514,7 +514,7 @@ is what deploy-time warming amortizes away).
 The wallet builds `Call { program: program_id, proof }` and a bundle paying at least
 `BUNDLE_BASE + call_fee(tier)` — 2,000,000 units at tier 10, rising by 100,000 per two tiers to
 2,500,000 at tier 20 — then proves that bundle (about 100 s at tier 14) and submits the pair over
-`shrugg_sendTransaction`. The RPC handler hands it to the admission path, which runs the order
+`rand_sendTransaction`. The RPC handler hands it to the admission path, which runs the order
 from §8: the pre-screen first — duplicate hash, nullifier/commitment conflicts, pool space, the
 state-dependent half of validation — then the full `ledger.validate` probe (chain id, fee floor,
 anchor, time, spends, the bundle digest, the bundle proof, and finally the call's own proof) on a
@@ -574,9 +574,9 @@ one fsynced `WriteBatch`.
 
 ### f. Afterwards
 
-`shrugg_getReceipt` (or `shrugg receipt <tx>`) now returns
+`rand_getReceipt` (or `rand receipt <tx>`) now returns
 `{ tx, program, tier, outputs, height, index }` — no `effect` field. An explorer, or anyone else
-watching the chain, sees: the program id and its `hc` (via `shrugg_getProgram`), the tier the call
+watching the chain, sees: the program id and its `hc` (via `rand_getProgram`), the tier the call
 was proven at, the eight output words, and the bundle's public fields (two nullifiers, two
 commitments, a fee). It never sees: the four private input balances, any register or memory value,
 which branch the program took, the real cycle count (only which padded tier bucket it fit in), who
@@ -637,8 +637,8 @@ through the real executor); full mode additionally re-checks every proposer sign
   bridged holding is a note whose `asset` word is the registry's index for it, an attestation
   deposits one note the chain computes itself, and a burn is the chain's one two-bundle transaction.
   A chain turns it on with a `bridge` section in its genesis.
-- `docs/rpc.md` — every JSON-RPC method, including the ones this page names (`shrugg_getReceipt`,
-  `shrugg_getProgram`, `shrugg_sendTransaction`, `shrugg_status`) with full parameter and result
+- `docs/rpc.md` — every JSON-RPC method, including the ones this page names (`rand_getReceipt`,
+  `rand_getProgram`, `rand_sendTransaction`, `rand_status`) with full parameter and result
   shapes.
-- `docs/cli.md` — every `shrugg-node` and `shrugg` command this page references
+- `docs/cli.md` — every `rand-node` and `rand` command this page references
   (`genesis`, `verify`, `program deploy`, `call`), with arguments and defaults.

@@ -3,7 +3,7 @@
 What each of the M4.x and M5.x milestones delivered, with the measured numbers, the audits and
 hard forks along the way, and what is deferred to which hardware. Upstream work lives in
 `circuits/` (`research/` is the RV32 machine, `recursion/` the recursion VM); this repo vendors
-both (`crates/shrugg-zkvm`, `crates/shrugg-rvm`) via `deploy/sync-zkvm.sh`. Deeper detail:
+both (`crates/randprotocol-zkvm`, `crates/randprotocol-rvm`) via `deploy/sync-zkvm.sh`. Deeper detail:
 `docs/zkvm-milestones.md` (M1–M4 design history), `circuits/recursion/docs/00–03` (the M5
 measured records), `circuits/docs/superpowers/` (specs and plans), `docs/confidential.md`
 (the constraint-set history from the chain's side).
@@ -80,7 +80,7 @@ field-native machine makes it a few hundred thousand rows.
   ≥ 128 GB, N=3 ≥ 160 GB host** — production N≥2 belongs to the GPU backend. The N=2/N=3
   test-profile twins jetsam'd at this laptop's ~33 GB per-process ceiling (written,
   emulation-proven, runbook rows 4–5). The fullnode admission stub's 5-step algorithm + pinned
-  hex vectors delivered (now the conformance suite in `crates/shrugg-node`).
+  hex vectors delivered (now the conformance suite in `crates/randprotocol-node`).
 - **M5.4 (`271679d`)** — the proving-backend split: `Backend::{Reference, Cuda}`,
   `prove_with`/`prove_on`, the mock-driven equivalence suite — **zero new kernels** (the RV32
   CUDA crate's ten kernels cover the rVM's eight instances as-is). Measured device model: an

@@ -1,17 +1,17 @@
 # Command-line reference
 
-Two binaries are built by `cargo build --release`: `shrugg-node` (node and operator commands) and
-`shrugg` (the shielded wallet client). Every command accepts `-h/--help`.
+Two binaries are built by `cargo build --release`: `rand-node` (node and operator commands) and
+`rand` (the shielded wallet client). Every command accepts `-h/--help`.
 
 The two hold different kinds of key and must not be confused. A **node key** is a 32-byte seed and
 a Dilithium2 key pair whose base58 address is public and signs blocks. A **wallet key** is a
-256-bit shielded spend key whose `shrugg1…` address receives notes and which never signs anything
+256-bit shielded spend key whose `rand1…` address receives notes and which never signs anything
 on chain (`docs/shielded.md` §1).
 
-## `shrugg-node`
+## `rand-node`
 
 ```
-shrugg-node <COMMAND>
+rand-node <COMMAND>
   keygen    Generate a new Dilithium2 key file
   address   Print the address, public key, and libp2p peer id of a key file
   genesis   Write a genesis.json: every validator key is staked, each --alloc becomes a deposit note
@@ -25,9 +25,9 @@ shrugg-node <COMMAND>
 ```
 
 There is no `balance` and no `transfer` subcommand: this chain has no accounts to query and a
-transfer needs a shielded spend key, which only the wallet holds. Use `shrugg` for both.
+transfer needs a shielded spend key, which only the wallet holds. Use `rand` for both.
 
-### `shrugg-node keygen`
+### `rand-node keygen`
 
 | argument | default | meaning |
 |---|---|---|
@@ -36,7 +36,7 @@ transfer needs a shielded spend key, which only the wallet holds. Use `shrugg` f
 Writes `{ "seed": <32-byte hex>, "address": <base58>, "public_key": <hex> }` with mode 0600. Only the
 seed is secret; the Dilithium2 key pair is re-derived from it on every load.
 
-### `shrugg-node address`
+### `rand-node address`
 
 | argument | default | meaning |
 |---|---|---|
@@ -45,16 +45,16 @@ seed is secret; the Dilithium2 key pair is re-derived from it on every load.
 Prints `address`, `public_key` (hex, 1312 bytes) and `peer_id` (the libp2p identity derived from the
 same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap address.
 
-### `shrugg-node genesis`
+### `rand-node genesis`
 
 | argument | default | meaning |
 |---|---|---|
 | `--chain-id <CHAIN_ID>` | `1` | chain id; transactions and gossip topics are bound to it |
-| `--validator <KEY,STAKE,PAYOUT>` | required, repeatable | one register entry: key file path **or** hex public key, the stake in SHRUGG (at least 1000, the staking minimum), and the `shrugg1…` address its rewards and unbonded stake are paid to |
+| `--validator <KEY,STAKE,PAYOUT>` | required, repeatable | one register entry: key file path **or** hex public key, the stake in RAND (at least 1000, the staking minimum), and the `rand1…` address its rewards and unbonded stake are paid to |
 | `--epoch-blocks <N>` | `1000` | blocks per epoch: how often the validator set is re-derived from the register (spec §8). Part of the genesis hash |
-| `--alloc <ALLOCS>` | none, repeatable | a deposit note: `shrugg1<address>=<amount in SHRUGG>` |
+| `--alloc <ALLOCS>` | none, repeatable | a deposit note: `rand1<address>=<amount in RAND>` |
 | `--out <OUT>` | `genesis.json` | output path |
-| `--faucet` | off | **testnet only**: enable `Mint` transactions (`shrugg_mint`, up to 100 SHRUGG per call). Part of the genesis hash |
+| `--faucet` | off | **testnet only**: enable `Mint` transactions (`rand_mint`, up to 100 RAND per call). Part of the genesis hash |
 | `--no-confidential` | off | disable Deploy/Call transactions on this chain. Part of the genesis hash |
 | `--fri-profile <production\|test>` | `production` | zkVM FRI profile every node must use; `test` is insecure and for the test suite. Part of the genesis hash |
 
@@ -79,7 +79,7 @@ Genesis JSON shape:
 {
   "chain_id": 6,
   "timestamp_ms": 1788000000000,
-  "validators": [ { "public_key": "<hex>", "stake": 1000000000000, "payout": "shrugg1…" } ],
+  "validators": [ { "public_key": "<hex>", "stake": 1000000000000, "payout": "rand1…" } ],
   "alloc": [
     { "cm": "<64 hex>",
       "envelope": { "kem_ct": "<hex>", "to_receiver": "<hex>", "to_sender": "<hex>", "body": "<hex>" },
@@ -104,7 +104,7 @@ and unbonded stake are withdrawn to, and it is register state, so it is part of 
 zkVM relation every bundle proof on this chain is checked against; a node whose build assembles a
 different guest refuses to start and names both digests.
 
-### `shrugg-node register` / `unbond` / `withdraw`
+### `rand-node register` / `unbond` / `withdraw`
 
 The three staking commands a validator operator runs (spec §8). `register` is offline apart from
 reading the chain id; the other two submit a real transaction, which commits in a block's time —
@@ -112,14 +112,14 @@ there is no proof to build.
 
 | command | arguments | meaning |
 |---|---|---|
-| `register` | `--key`, `--payout <shrugg1…>`, `--rpc` | print a `Registration` (hex) signed by this node's key, for a wallet to attach to the bond that registers it |
-| `unbond <amount SHRUGG>` | `--key`, `--rpc`, `--no-wait` | move bonded stake into unbonding; withdrawable two epochs later. Free |
-| `withdraw <amount SHRUGG>` | same | pay released stake and rewards into a note at the register's payout address, less the bundle base |
+| `register` | `--key`, `--payout <rand1…>`, `--rpc` | print a `Registration` (hex) signed by this node's key, for a wallet to attach to the bond that registers it |
+| `unbond <amount RAND>` | `--key`, `--rpc`, `--no-wait` | move bonded stake into unbonding; withdrawable two epochs later. Free |
+| `withdraw <amount RAND>` | same | pay released stake and rewards into a note at the register's payout address, less the bundle base |
 
 The bond itself is a wallet command: it burns the stake out of shielded notes, and a validator key
 owns none. `unbond` and `withdraw` need no wallet at all — they ride without a bundle, exactly as a
 faucet mint does, and the register's nonce is their replay protection. `unbond` pays nothing;
-`withdraw` pays the 0.001 SHRUGG bundle base out of the amount it withdraws, to the proposer of
+`withdraw` pays the 0.001 RAND bundle base out of the amount it withdraws, to the proposer of
 the block that applies it, so the note it creates is worth `amount − 0.001` and an amount that
 cannot cover the base is refused.
 
@@ -134,21 +134,21 @@ payout wallet finds by scanning.
 `docs/staking.md` is the whole picture these three sit in: the register, the epochs, what each action
 publishes, and a worked join-and-leave.
 
-### `shrugg-node aggregator register` / `unbond` / `withdraw` (chain 9)
+### `rand-node aggregator register` / `unbond` / `withdraw` (chain 9)
 
 The validator trio's twins, one register over — the three actions an aggregator operator runs on
 a chain whose genesis carries an `aggregation` section (block aggregation, spec §2.2):
 
 | command | arguments | meaning |
 |---|---|---|
-| `aggregator register` | `--key`, `--bond <SHRUGG>`, `--payout <shrugg1…>`, `--rpc` | print an `AggregatorRegistration` (hex) signed by this node's key; the bond itself burns through the wallet's `submit` as the register bundle's burn |
+| `aggregator register` | `--key`, `--bond <RAND>`, `--payout <rand1…>`, `--rpc` | print an `AggregatorRegistration` (hex) signed by this node's key; the bond itself burns through the wallet's `submit` as the register bundle's burn |
 | `aggregator unbond` | `--key`, `--rpc`, `--no-wait` | stop this aggregator submitting; the bond releases after the chain's aggregation window |
 | `aggregator withdraw` | same | pay the released bond into a note at the register's payout address, less the bundle base |
 
 `unbond` and `withdraw` are bundle-less and free of proving, exactly the validator twins;
 `withdraw`'s note is the bond less the base, sealed to the payout address the register holds.
 
-### `shrugg-node aggregate` (chain 9)
+### `rand-node aggregate` (chain 9)
 
 The aggregate daemon (spec §8): a separate process from the validator, needing only an RPC
 endpoint and the registered aggregator key.
@@ -161,18 +161,18 @@ endpoint and the registered aggregator key.
 | `--interval-secs <N>` | 15 | poll interval in `--watch` mode |
 | `--no-wait` | off | return once the node accepts the aggregate |
 
-One pass polls `shrugg_getUnsealed`, fetches up to `max_covers` raw bundles with
-`shrugg_getRawTransaction`, proves one rVM aggregate over them (CPU; the test profile lands at
+One pass polls `rand_getUnsealed`, fetches up to `max_covers` raw bundles with
+`rand_getRawTransaction`, proves one rVM aggregate over them (CPU; the test profile lands at
 tier 19, production at 21 — minutes and tens of GB on this tree, so run it on the proof batch
 machine), seals the payment note (subsidy at the current schedule index plus the covered
-bundles' proving shares) to the register's payout address, signs and submits. `shrugg_status`'s
+bundles' proving shares) to the register's payout address, signs and submits. `rand_status`'s
 `aggregation` section carries the chain parameters the payment is computed from.
 
-`shrugg-node run` gains **`--keep-raw-proofs`**: an archive node keeps sealed bundles' raw
+`rand-node run` gains **`--keep-raw-proofs`**: an archive node keeps sealed bundles' raw
 proofs; by default the pruning pass rewrites their records (34 public values + the 7 declared
 shape bytes) once the sealing window passes.
 
-### `shrugg-node init`
+### `rand-node init`
 
 | argument | default | meaning |
 |---|---|---|
@@ -183,7 +183,7 @@ Creates `<datadir>/db` (RocksDB) with block 0, the deposit notes as the tree's f
 the validator register. Re-running with the same genesis is a no-op; a different genesis is
 refused.
 
-### `shrugg-node run`
+### `rand-node run`
 
 | argument | default | meaning |
 |---|---|---|
@@ -192,7 +192,7 @@ refused.
 | `--listen <LISTEN>` | `/ip4/0.0.0.0/tcp/30303` | libp2p listen multiaddr, repeatable |
 | `--bootstrap <BOOTSTRAP>` | none, repeatable | peer to dial at start and every 30 s while disconnected: `/ip4/<ip>/tcp/<port>/p2p/<peer-id>` |
 | `--rpc <RPC>` | `127.0.0.1:8545` | JSON-RPC listen address; bind `0.0.0.0` only behind a firewall |
-| `--validator` | off | this node holds a validator key and takes part in consensus. A key in no current epoch's set observes until an epoch admits it, so a validator that bonds in after genesis needs no restart; `shrugg_status` reports `is_validator` (the key is here) and `active_validator` (it is in the current set) separately |
+| `--validator` | off | this node holds a validator key and takes part in consensus. A key in no current epoch's set observes until an epoch admits it, so a validator that bonds in after genesis needs no restart; `rand_status` reports `is_validator` (the key is here) and `active_validator` (it is in the current set) separately |
 | `--no-mdns` | off | disable LAN discovery (recommended on servers) |
 | `--block-interval-ms <MS>` | `1000` | minimum spacing between proposals |
 | `--view-timeout-ms <MS>` | `3000` | base view timeout; doubles per consecutive timeout up to 8x |
@@ -209,7 +209,7 @@ takes about 100 seconds, and its anchor is only valid for 256 blocks. At the def
 is a little over four minutes of headroom; a chain paced much faster than that will reject honest
 transfers whose anchor expired mid-proof.
 
-### `shrugg-node verify`
+### `rand-node verify`
 
 | argument | default | meaning |
 |---|---|---|
@@ -221,56 +221,56 @@ Exit code 0 if the chain is consistent, 2 if a problem was found and `--repair` 
 Replay re-verifies every bundle proof, so a build whose zkVM constraints differ from the one that
 made the chain will stop at the first bundle (`docs/confidential.md`).
 
-### `shrugg-node status`
+### `rand-node status`
 
 | argument | default | meaning |
 |---|---|---|
 | `--rpc <URL>` | `http://127.0.0.1:8545` | node to ask |
 
-Prints `shrugg_status` verbatim: height, view, peers, mempool, notes, nullifiers, tree root,
+Prints `rand_status` verbatim: height, view, peers, mempool, notes, nullifiers, tree root,
 `hc_bundle`, sync state, and the two validator flags — `is_validator` (this node holds a key) and
 `active_validator` (that key is in the current epoch's set).
 
-## `shrugg` (wallet)
+## `rand` (wallet)
 
 Global options, accepted before or after the subcommand:
 
 | option | env | default | meaning |
 |---|---|---|---|
-| `--rpc <RPC>` | `SHRUGG_RPC` | `http://127.0.0.1:8545` | node JSON-RPC endpoint |
-| `--key <KEY>` | `SHRUGG_KEY` | `wallet.key.json` | spend-key file; the note store lives beside it at `<key>.notes.json` |
+| `--rpc <RPC>` | `RAND_RPC` | `http://127.0.0.1:8545` | node JSON-RPC endpoint |
+| `--key <KEY>` | `RAND_KEY` | `wallet.key.json` | spend-key file; the note store lives beside it at `<key>.notes.json` |
 
 | command | arguments | behaviour |
 |---|---|---|
 | `keygen` | | write a new spend-key file at `--key`, mode 0600; refuses to overwrite |
-| `address` | | print this wallet's `shrugg1…` shielded address |
+| `address` | | print this wallet's `rand1…` shielded address |
 | `balance` | | scan the tree, save the store, print spendable value and the unspent note count |
 | `sync` | | scan without printing a balance; prints how far it got |
 | `notes` | | every note this wallet has opened: index, `asset`, amount, height, `spent`, `pending` |
 | `asset-balance [INDEX]` | | scan, then print what this wallet holds in one bridged asset, or a row per asset held; amounts are in the asset's own smallest unit |
 | `history` | | every note this wallet created for someone else, opened through its own outgoing viewing key |
-| `send <TO> <AMOUNT>` | `--fee <SHRUGG>` (default `0.001`), `--no-wait`, `--cuda` | scan, select at most two notes, prove a 2-in-2-out bundle locally, submit; waits for the commit unless `--no-wait` |
-| `bond <VALIDATOR> <AMOUNT>` | `--registration <hex>`, `--fee <SHRUGG>` (default `0.001`), `--no-wait`, `--cuda` | stake onto a validator: the bundle burns the amount out of this wallet's notes. `--registration` (from `shrugg-node register`) exactly when the validator is not in the register yet, and then at least 1000 SHRUGG; prints the new stake and the epoch it counts from (`docs/staking.md`) |
-| `faucet [ADDRESS]` | `--amount <SHRUGG>` (default `100`, max `100`) | testnet only: ask a validator node to mint into a note for `ADDRESS` (default: this wallet), wait for the commit |
+| `send <TO> <AMOUNT>` | `--fee <RAND>` (default `0.001`), `--no-wait`, `--cuda` | scan, select at most two notes, prove a 2-in-2-out bundle locally, submit; waits for the commit unless `--no-wait` |
+| `bond <VALIDATOR> <AMOUNT>` | `--registration <hex>`, `--fee <RAND>` (default `0.001`), `--no-wait`, `--cuda` | stake onto a validator: the bundle burns the amount out of this wallet's notes. `--registration` (from `rand-node register`) exactly when the validator is not in the register yet, and then at least 1000 RAND; prints the new stake and the epoch it counts from (`docs/staking.md`) |
+| `faucet [ADDRESS]` | `--amount <RAND>` (default `100`, max `100`) | testnet only: ask a validator node to mint into a note for `ADDRESS` (default: this wallet), wait for the commit |
 | `program build` | `--guest <fib\|memcpy\|bubble_sort\|balance_check\|private_payment>`, `--arg N` (repeatable), `--out <file>` (default `program.json`) | assemble a built-in guest to `{base_pc, words}` JSON; prints the program id |
 | `program deploy <FILE>` | `.json` or `.bin` (raw LE words), `--cuda` | pay the deploy floor through a bundle, wait for the commit, print the program id |
 | `program show <ID>` | | deployed program metadata |
-| `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--tier T`, `--fee <SHRUGG>`, `--auditor <shrugg1…>`, `--no-envelope`, `--print-call-key`, `--cuda` | fetch the code from the node, prove the call locally with the chain's FRI profile, seal its input transcript, pay through a bundle, wait, print the receipt |
+| `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--tier T`, `--fee <RAND>`, `--auditor <rand1…>`, `--no-envelope`, `--print-call-key`, `--cuda` | fetch the code from the node, prove the call locally with the chain's FRI profile, seal its input transcript, pay through a bundle, wait, print the receipt |
 | `open-call <TXHASH>` | `--call-key <hex>`, `--as-auditor` | fetch the receipt and the sealed transcript, open it, check it against the receipt's `H_IN`, re-run the program on the recovered inputs and compare the outputs with the receipt's. **Exits non-zero** if the transcript is not the preimage of that `H_IN`, or if the re-run disagrees with the receipt |
 | `receipt <TX>` | | receipt of a committed call, or "no receipt" |
-| `bridge-mint <ATTESTATION>` | hex or `@path`, `--to <shrugg1…>`, `--fee <SHRUGG>`, `--no-wait`, `--cuda` | deposit a guardian-signed attestation as a note: seal the deposit's envelope for its recipient and pay through a bundle from this wallet. Prints the note's `owner`, `time` and `r` every time, and on the waiting path checks the asset index the chain actually deposited under |
-| `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | `--relayer-fee N`, `--fee <SHRUGG>` (default `0.002`), `--no-wait`, `--cuda` | burn a bridged asset to another chain: check the chain has a bridge and holds `ASSET` in its registry, select that asset's notes for the asset bundle and SHRUGG for the fee bundle, prove **both**, submit one transaction. `--relayer-fee` is a *portion* of `AMOUNT` paid to the relayer on the destination chain, not an extra charge: the asset bundle burns exactly `AMOUNT` |
+| `bridge-mint <ATTESTATION>` | hex or `@path`, `--to <rand1…>`, `--fee <RAND>`, `--no-wait`, `--cuda` | deposit a guardian-signed attestation as a note: seal the deposit's envelope for its recipient and pay through a bundle from this wallet. Prints the note's `owner`, `time` and `r` every time, and on the waiting path checks the asset index the chain actually deposited under |
+| `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | `--relayer-fee N`, `--fee <RAND>` (default `0.002`), `--no-wait`, `--cuda` | burn a bridged asset to another chain: check the chain has a bridge and holds `ASSET` in its registry, select that asset's notes for the asset bundle and RAND for the fee bundle, prove **both**, submit one transaction. `--relayer-fee` is a *portion* of `AMOUNT` paid to the relayer on the destination chain, not an extra charge: the asset bundle burns exactly `AMOUNT` |
 | `bridge` | | the bridge's public state: guardians, emitters, the asset registry, `next_index`, the burn sequence |
 | `bridge-message <SEQUENCE>` | | one outbound burn message, verbatim, for a guardian to sign |
 | `fee bundle` / `fee deploy <words>` / `fee call <tier>` | | minimum fee from the node's schedule |
 | `tx <HASH>` | | committed transaction with its block height and index, or "not found" |
 | `block <ID>` | | block by height (integer) or by hash (hex) |
 | `head` | | `{height, hash, view}` |
-| `status` | | node status object (see docs/rpc.md `shrugg_status`) |
+| `status` | | node status object (see docs/rpc.md `rand_status`) |
 | `peers` | | connected peers |
 | `validators` | | the validator register: one row per entry — address, stake, unbonding queue, rewards, payout address, nonce, and whether it is in the current epoch's set |
 
-Amounts are decimal SHRUGG strings with up to 9 decimal places (`1`, `1.5`, `.25`, `0.000000001`).
+Amounts are decimal RAND strings with up to 9 decimal places (`1`, `1.5`, `.25`, `0.000000001`).
 
 There is no `balance <ADDRESS>`, and no way to ask about anyone else's address: a balance is a
 fact about this machine's key file, not about the chain. That holds for a bridged asset too:
@@ -284,7 +284,7 @@ then no key opens the call's inputs, ever — the transcript is the only record.
 one: every backend but the CPU draws the `H_IN` salt inside the prover and never returns it.
 
 Amounts in a bridged asset are plain integers in that asset's own smallest unit, not decimal
-SHRUGG: only index 0 has this chain's nine decimals, and what a bridged token's unit means belongs
+RAND: only index 0 has this chain's nine decimals, and what a bridged token's unit means belongs
 to its source chain.
 
 The one number `bridge-mint` cannot be certain of is the `asset` index of a token this chain has
@@ -292,7 +292,7 @@ never seen: the ledger assigns it from the registry's `next_index` when the tran
 *applied*, and the wallet spends about 90 seconds proving the fee bundle in between. The
 transaction names the index it sealed for, and the chain refuses it if that is not the index the
 registry would give the deposit — so losing that race to another first sighting looks like
-`the attestation deposits under asset 2, and the transaction names 1` from `shrugg_sendTransaction`
+`the attestation deposits under asset 2, and the transaction names 1` from `rand_sendTransaction`
 (or, if the race resolves after the transaction was pooled, a submission that never commits),
 never a note the recipient cannot open. Re-run the command and it seals and proves against the
 registry as it now stands. The command also prints the note's `owner`, `time` and `r` (all already
@@ -306,26 +306,26 @@ fallback: a missing driver is an error rather than a silent CPU run.
 ### A first shielded transfer
 
 ```bash
-shrugg keygen                                   # wallet.key.json
-shrugg address                                  # shrugg1… — give this to whoever pays you
-shrugg faucet                                   # testnet: 100 SHRUGG into a note only you can open
-shrugg balance                                  # balance: 100 SHRUGG
-shrugg send shrugg1q9f… 1.5                     # ~100 s of local proving, then the commit
-shrugg notes                                    # the spent note, and the change note
+rand keygen                                   # wallet.key.json
+rand address                                  # rand1… — give this to whoever pays you
+rand faucet                                   # testnet: 100 RAND into a note only you can open
+rand balance                                  # balance: 100 RAND
+rand send rand1q9f… 1.5                     # ~100 s of local proving, then the commit
+rand notes                                    # the spent note, and the change note
 ```
 
 ### A confidential call you can open again later
 
 ```bash
-shrugg program build --guest balance_check --arg 1000 --out bc.json
-shrugg program deploy bc.json                   # prints the program id
-shrugg call <id> --input 100 --input 200 --input 300 --input 400
-shrugg open-call <txhash>                       # inputs: [100, 200, 300, 400] — verdict: faithful (exit 0)
+rand program build --guest balance_check --arg 1000 --out bc.json
+rand program deploy bc.json                   # prints the program id
+rand call <id> --input 100 --input 200 --input 300 --input 400
+rand open-call <txhash>                       # inputs: [100, 200, 300, 400] — verdict: faithful (exit 0)
 ```
 
 ### Key file formats
 
-Node key (both binaries' `keygen` used to share this; only `shrugg-node` writes it now):
+Node key (both binaries' `keygen` used to share this; only `rand-node` writes it now):
 
 ```json
 {
@@ -342,6 +342,6 @@ outgoing viewing key, ML-KEM decapsulation key, address) is a pure derivation of
 { "version": 2, "spend_key": "hex of 8 little-endian u32 words (64 characters)" }
 ```
 
-The libp2p peer id is derived as an ed25519 key from `blake3("shrugg-p2p-identity" || seed)`, so it
+The libp2p peer id is derived as an ed25519 key from `blake3("rand-p2p-identity" || seed)`, so it
 is stable across restarts. Losing a wallet key loses every note it could open; there is no
 recovery phrase in this release.

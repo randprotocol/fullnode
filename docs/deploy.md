@@ -17,7 +17,7 @@ The repository ships scripts used for the live testnet (`deploy/`):
 
 | script | runs on | purpose |
 |---|---|---|
-| `deploy/push-to-vps.sh <ip> <letter> "<bootstraps>" [validator\|observer]` | your machine | rsync the source to `/root/fullnode`, build, install `/usr/local/bin/{shrugg-node,shrugg}`, init a datadir keyed on the genesis hash, install and start a `shrugg-node` systemd service |
+| `deploy/push-to-vps.sh <ip> <letter> "<bootstraps>" [validator\|observer]` | your machine | rsync the source to `/root/fullnode`, build, install `/usr/local/bin/{rand-node,rand}`, init a datadir keyed on the genesis hash, install and start a `rand-node` systemd service |
 | `deploy/rebuild-vps.sh <ip>` | your machine | rsync new source, incremental build, reinstall binaries, restart the service (data kept) |
 | `deploy/vps-setup.sh` | the server | what `push-to-vps.sh` executes remotely |
 | `deploy/run-a.sh`, `deploy/run-b.sh` | laptops behind NAT | run a validator bootstrapping to the public nodes |
@@ -30,10 +30,10 @@ scripts).
 Service management on the server:
 
 ```bash
-systemctl status shrugg-node
-journalctl -u shrugg-node -f
-shrugg status
-shrugg-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop the service first
+systemctl status rand-node
+journalctl -u rand-node -f
+rand status
+rand-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop the service first
 ```
 
 ## Rolling out a new commit
@@ -103,12 +103,12 @@ from the same commit.
    hash differs every run — cut once, copy everywhere).
 4. **Bring the fleet up as usual**; each node logs the startup key-build's wall time once
    (`aggregation: aggregate program built and the tier-21 verifier key warmed`).
-5. **Aggregators register** (`shrugg-node aggregator register --bond --payout` prints the
+5. **Aggregators register** (`rand-node aggregator register --bond --payout` prints the
    signed registration; the bond burns through the wallet's `submit` as the register bundle's
-   burn) and run **`shrugg-node aggregate --watch`** on a proof machine (≥ 64 GB at N=1, the
+   burn) and run **`rand-node aggregate --watch`** on a proof machine (≥ 64 GB at N=1, the
    GPU node for N≥2 — see `docs/aggregation.md`'s machine classes), pointed at any fleet RPC.
-6. **Ops checks**: `shrugg_status`'s `aggregation` section (registered, unsealed, the schedule
-   index), `shrugg_getUnsealed` for the work list, `shrugg_getSupply` for the four counters
+6. **Ops checks**: `rand_status`'s `aggregation` section (registered, unsealed, the schedule
+   index), `rand_getUnsealed` for the work list, `rand_getSupply` for the four counters
    (`subsidised` against `sealed_blocks` is the schedule audit). Archive nodes run with
    `--keep-raw-proofs`; everyone else lets the pruning pass reclaim sealed bundles after the
    256-block window.
@@ -117,9 +117,9 @@ from the same commit.
 
 | symptom | action |
 |---|---|
-| height not advancing, `peer_count` low | check bootstrap addresses and port 30303; `shrugg peers` |
+| height not advancing, `peer_count` low | check bootstrap addresses and port 30303; `rand peers` |
 | height not advancing, peers fine | fewer than 2/3 of stake online: start the missing validators |
-| `CORRUPT CHAIN` in the log at startup | nothing; the node truncated and is resyncing. To inspect first, run `shrugg-node verify` before starting |
+| `CORRUPT CHAIN` in the log at startup | nothing; the node truncated and is resyncing. To inspect first, run `rand-node verify` before starting |
 | node refuses to start: `already initialized with a different genesis` | the datadir belongs to another chain; use a fresh `--datadir` |
 | a validator warns it is not in the validator set | the key is not in genesis; it runs as an observer |
 | views advance but nothing commits after nodes restarted | validators are waiting for uncommitted blocks behind the newest certificate that no reachable peer holds; since `f5b8dfd` they fall back to the committed head after failed fetches (log: `falling back to the committed head QC`). Make sure every node runs the same build: the sync protocol is chain-scoped and builds cannot fetch across versions |

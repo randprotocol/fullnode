@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let SHRUGG pay for confidential zkVM calls: programs are deployed on chain, calls carry a STARK proof plus eight public outputs, every node verifies the proof, charges gas, and applies the transfer the program's outputs request.
+**Goal:** Let RAND pay for confidential zkVM calls: programs are deployed on chain, calls carry a STARK proof plus eight public outputs, every node verifies the proof, charges gas, and applies the transfer the program's outputs request.
 
-**Architecture:** The zkVM (`rand_zkvm`, RV32I under a Plonky3 batch STARK) is vendored as `crates/shrugg-zkvm`. `shrugg-core` stays free of Plonky3: it defines programs, the two new transaction kinds, gas, the output-effect encoding, and an executor trait; `shrugg-zkvm` implements that trait with cached verifier keys; `shrugg-node` stores programs and receipts and exposes RPC; `shrugg-client` proves locally and submits.
+**Architecture:** The zkVM (`rand_zkvm`, RV32I under a Plonky3 batch STARK) is vendored as `crates/randprotocol-zkvm`. `randprotocol-core` stays free of Plonky3: it defines programs, the two new transaction kinds, gas, the output-effect encoding, and an executor trait; `randprotocol-zkvm` implements that trait with cached verifier keys; `rand-node` stores programs and receipts and exposes RPC; `randprotocol-client` proves locally and submits.
 
 **Tech Stack:** Rust 1.98.1, Plonky3 0.7 (Goldilocks, Poseidon2), postcard, RocksDB, libp2p, axum, clap.
 
@@ -13,9 +13,9 @@
 ## Global Constraints
 
 - Toolchain: `rust-toolchain.toml` pins `1.98.1` (Plonky3 0.7 needs `maybe_uninit_slice`); everything must build on it.
-- `shrugg-core` must not depend on any `p3-*` crate. Only `shrugg-zkvm` does.
-- Limits (constants in `shrugg_core::gas`): `MAX_PROGRAM_WORDS = 4096`, `MAX_PROOF_BYTES = 1 << 20`, `MAX_RECIPIENTS = 8`, `MAX_BLOCK_BYTES = 4 << 20`.
-- Gas v0 (units, 1 SHRUGG = 1e9): `DEPLOY_PER_WORD = 100_000`, `CALL_BASE = 1_000_000`, `CALL_PER_TIER_STEP = 100_000`; transfers and mints stay free.
+- `randprotocol-core` must not depend on any `p3-*` crate. Only `randprotocol-zkvm` does.
+- Limits (constants in `randprotocol_core::gas`): `MAX_PROGRAM_WORDS = 4096`, `MAX_PROOF_BYTES = 1 << 20`, `MAX_RECIPIENTS = 8`, `MAX_BLOCK_BYTES = 4 << 20`.
+- Gas v0 (units, 1 RAND = 1e9): `DEPLOY_PER_WORD = 100_000`, `CALL_BASE = 1_000_000`, `CALL_PER_TIER_STEP = 100_000`; transfers and mints stay free.
 - Effect encoding: `out0` kind (0 none, 1 transfer), `out1` recipient index, `out2|out3` amount as LE u64, `out4..7` free.
 - Every task ends with `cargo test -p <crate>` green and a commit. Commit messages end with the session attribution lines already used in this repo.
 - Existing behaviour (transfers, mint, faucet, consensus, sync, integrity check) must keep passing its tests.
@@ -27,21 +27,21 @@
 | path | responsibility |
 |---|---|
 | `rust-toolchain.toml` (new) | pin 1.98.1 |
-| `crates/shrugg-zkvm/` (new, vendored) | upstream `rand_zkvm` unchanged + `src/executor.rs` (ZkExecutor, key cache), `src/codec.rs` (program file formats), guest `private_payment` in `src/guests.rs` |
+| `crates/randprotocol-zkvm/` (new, vendored) | upstream `rand_zkvm` unchanged + `src/executor.rs` (ZkExecutor, key cache), `src/codec.rs` (program file formats), guest `private_payment` in `src/guests.rs` |
 | `deploy/sync-zkvm.sh` (new) | copy `../circuits/research/{src,tests}` into the vendored crate |
-| `crates/shrugg-core/src/gas.rs` (new) | limits and fee schedule |
-| `crates/shrugg-core/src/effect.rs` (new) | decode the eight outputs into an `Effect` |
-| `crates/shrugg-core/src/program.rs` (new) | `ProgramId`, `ProgramRecord`, `CallOutcome`, `CallReceipt` |
-| `crates/shrugg-core/src/confidential.rs` (rewrite) | executor trait, `StubExecutor` v2 (no crypto, test only) |
-| `crates/shrugg-core/src/types/transaction.rs` | `TxKind::{Deploy, Call}`, constructors |
-| `crates/shrugg-core/src/ledger.rs` | programs map, Deploy/Call rules, receipts, state root |
-| `crates/shrugg-core/src/genesis.rs` | `confidential`, `fri_profile` fields |
-| `crates/shrugg-node/src/storage.rs` | `programs`, `receipts` column families |
-| `crates/shrugg-node/src/mempool.rs` | byte accounting, verified-tx set |
-| `crates/shrugg-node/src/node.rs` | executor construction, block byte cap, receipts on commit |
-| `crates/shrugg-node/src/rpc.rs` | `shrugg_getProgram`, `shrugg_getProgramCode`, `shrugg_getReceipt`, `shrugg_estimateFee` |
-| `crates/shrugg-client/src/{lib,main}.rs` | `program build/deploy/show`, `call`, `receipt` |
-| `crates/shrugg-node/tests/cluster.rs` | end-to-end deploy + call |
+| `crates/randprotocol-core/src/gas.rs` (new) | limits and fee schedule |
+| `crates/randprotocol-core/src/effect.rs` (new) | decode the eight outputs into an `Effect` |
+| `crates/randprotocol-core/src/program.rs` (new) | `ProgramId`, `ProgramRecord`, `CallOutcome`, `CallReceipt` |
+| `crates/randprotocol-core/src/confidential.rs` (rewrite) | executor trait, `StubExecutor` v2 (no crypto, test only) |
+| `crates/randprotocol-core/src/types/transaction.rs` | `TxKind::{Deploy, Call}`, constructors |
+| `crates/randprotocol-core/src/ledger.rs` | programs map, Deploy/Call rules, receipts, state root |
+| `crates/randprotocol-core/src/genesis.rs` | `confidential`, `fri_profile` fields |
+| `crates/randprotocol-node/src/storage.rs` | `programs`, `receipts` column families |
+| `crates/randprotocol-node/src/mempool.rs` | byte accounting, verified-tx set |
+| `crates/randprotocol-node/src/node.rs` | executor construction, block byte cap, receipts on commit |
+| `crates/randprotocol-node/src/rpc.rs` | `rand_getProgram`, `rand_getProgramCode`, `rand_getReceipt`, `rand_estimateFee` |
+| `crates/randprotocol-client/src/{lib,main}.rs` | `program build/deploy/show`, `call`, `receipt` |
+| `crates/randprotocol-node/tests/cluster.rs` | end-to-end deploy + call |
 | `docs/{cli,rpc,architecture}.md`, `README.md` | documentation |
 
 ---
@@ -49,11 +49,11 @@
 ### Task 1: Vendor the zkVM and move the workspace to Rust 1.98.1
 
 **Files:**
-- Create: `rust-toolchain.toml`, `deploy/sync-zkvm.sh`, `crates/shrugg-zkvm/Cargo.toml`, `crates/shrugg-zkvm/src/**`, `crates/shrugg-zkvm/tests/**` (copied)
+- Create: `rust-toolchain.toml`, `deploy/sync-zkvm.sh`, `crates/randprotocol-zkvm/Cargo.toml`, `crates/randprotocol-zkvm/src/**`, `crates/randprotocol-zkvm/tests/**` (copied)
 - Modify: `Cargo.toml` (workspace members, dependency entry)
 
 **Interfaces:**
-- Produces: crate `shrugg-zkvm` (lib name `shrugg_zkvm`) re-exporting upstream modules `isa, asm, guests, emulator, tables, machine`.
+- Produces: crate `randprotocol-zkvm` (lib name `randprotocol_zkvm`) re-exporting upstream modules `isa, asm, guests, emulator, tables, machine`.
 
 - [ ] **Step 1: Pin the toolchain and confirm the existing workspace builds on it**
 
@@ -63,17 +63,17 @@
 channel = "1.98.1"
 ```
 
-Run: `cargo build --release && cargo test -p shrugg-core`
+Run: `cargo build --release && cargo test -p randprotocol-core`
 Expected: builds; 47 core tests pass (this was already verified with `cargo +1.98.1 check --workspace`).
 
 - [ ] **Step 2: Write the sync script and run it**
 
 ```bash
 #!/usr/bin/env bash
-# deploy/sync-zkvm.sh — copy the research zkVM into crates/shrugg-zkvm. Run from the repo root.
+# deploy/sync-zkvm.sh — copy the research zkVM into crates/randprotocol-zkvm. Run from the repo root.
 set -euo pipefail
 SRC=${1:-../circuits/research}
-DST=crates/shrugg-zkvm
+DST=crates/randprotocol-zkvm
 mkdir -p "$DST"
 rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude rust-toolchain.toml \
       --exclude src/executor.rs --exclude src/codec.rs --exclude src/guests.rs "$SRC/src" "$SRC/tests" "$DST/"
@@ -88,25 +88,25 @@ Run: `chmod +x deploy/sync-zkvm.sh && ./deploy/sync-zkvm.sh`
 - [ ] **Step 3: Write the crate manifest (renamed, same dependencies as upstream)**
 
 ```toml
-# crates/shrugg-zkvm/Cargo.toml
+# crates/randprotocol-zkvm/Cargo.toml
 [package]
-name = "shrugg-zkvm"
+name = "randprotocol-zkvm"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
-description = "Rand zkVM (RV32I under a Plonky3 batch STARK) plus the SHRUGG chain executor"
+description = "Rand zkVM (RV32I under a Plonky3 batch STARK) plus the RAND chain executor"
 
 [lib]
-name = "shrugg_zkvm"
+name = "randprotocol_zkvm"
 path = "src/lib.rs"
 
 [[bin]]
-name = "shrugg-zkvm-demo"
+name = "randprotocol-zkvm-demo"
 path = "src/main.rs"
 
 [dependencies]
-shrugg-core = { workspace = true }
+randprotocol-core = { workspace = true }
 p3-air = "=0.7.0"
 p3-uni-stark = "=0.7.0"
 p3-batch-stark = "=0.7.0"
@@ -131,31 +131,31 @@ Note: upstream uses `rand 0.10`; the workspace uses `rand 0.8` for the node. Bot
 - [ ] **Step 4: Fix upstream references to the crate name**
 
 Upstream code refers to itself as `rand_zkvm` in `src/main.rs` and `tests/*.rs`. Run:
-`grep -rl "rand_zkvm" crates/shrugg-zkvm | xargs sed -i '' 's/rand_zkvm/shrugg_zkvm/g'`
+`grep -rl "rand_zkvm" crates/randprotocol-zkvm | xargs sed -i '' 's/rand_zkvm/randprotocol_zkvm/g'`
 
 - [ ] **Step 5: Add the crate to the workspace**
 
-In `Cargo.toml`: `members = ["crates/shrugg-core", "crates/shrugg-zkvm", "crates/shrugg-client", "crates/shrugg-node"]` and under `[workspace.dependencies]`: `shrugg-zkvm = { path = "crates/shrugg-zkvm" }`.
+In `Cargo.toml`: `members = ["crates/randprotocol-core", "crates/randprotocol-zkvm", "crates/randprotocol-client", "crates/randprotocol-node"]` and under `[workspace.dependencies]`: `randprotocol-zkvm = { path = "crates/randprotocol-zkvm" }`.
 
 - [ ] **Step 6: Run the upstream tests inside the workspace**
 
-Run: `cargo test -p shrugg-zkvm --release` (release: the STARK tests take minutes in debug)
+Run: `cargo test -p randprotocol-zkvm --release` (release: the STARK tests take minutes in debug)
 Expected: all upstream tests pass (e2e, zk, cheating, emulator, isa, asm, tables).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add rust-toolchain.toml deploy/sync-zkvm.sh crates/shrugg-zkvm Cargo.toml Cargo.lock
-git commit -m "zkvm: vendor rand_zkvm as shrugg-zkvm; workspace on Rust 1.98.1"
+git add rust-toolchain.toml deploy/sync-zkvm.sh crates/randprotocol-zkvm Cargo.toml Cargo.lock
+git commit -m "zkvm: vendor rand_zkvm as randprotocol-zkvm; workspace on Rust 1.98.1"
 ```
 
 ---
 
-### Task 2: Gas schedule and output-effect decoding (pure, in shrugg-core)
+### Task 2: Gas schedule and output-effect decoding (pure, in randprotocol-core)
 
 **Files:**
-- Create: `crates/shrugg-core/src/gas.rs`, `crates/shrugg-core/src/effect.rs`
-- Modify: `crates/shrugg-core/src/lib.rs` (add `pub mod gas; pub mod effect;`)
+- Create: `crates/randprotocol-core/src/gas.rs`, `crates/randprotocol-core/src/effect.rs`
+- Modify: `crates/randprotocol-core/src/lib.rs` (add `pub mod gas; pub mod effect;`)
 
 **Interfaces:**
 - Produces: `gas::{MAX_PROGRAM_WORDS, MAX_PROOF_BYTES, MAX_RECIPIENTS, MAX_BLOCK_BYTES, DEPLOY_PER_WORD, CALL_BASE, CALL_PER_TIER_STEP, deploy_fee(words: usize) -> u128, call_fee(tier: u8) -> u128, MIN_TIER, MAX_TIER}` and `effect::{Effect, EffectError, decode(outputs: &[u32; 8], recipients: &[Address]) -> Result<Effect, EffectError>}`.
@@ -163,7 +163,7 @@ git commit -m "zkvm: vendor rand_zkvm as shrugg-zkvm; workspace on Rust 1.98.1"
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-// crates/shrugg-core/src/gas.rs
+// crates/randprotocol-core/src/gas.rs
 //! Limits and the v0 fee schedule for confidential computation.
 
 /// Largest program, in 32-bit words (16 KiB of code).
@@ -201,7 +201,7 @@ mod tests {
     fn deploy_fee_is_linear_in_words() {
         assert_eq!(deploy_fee(0), 0);
         assert_eq!(deploy_fee(1), 100_000);
-        assert_eq!(deploy_fee(256), 25_600_000); // 0.0256 SHRUGG for a 1 KiB program
+        assert_eq!(deploy_fee(256), 25_600_000); // 0.0256 RAND for a 1 KiB program
     }
 
     #[test]
@@ -215,7 +215,7 @@ mod tests {
 ```
 
 ```rust
-// crates/shrugg-core/src/effect.rs
+// crates/randprotocol-core/src/effect.rs
 //! The eight public output words of a call are the program's instruction to the chain.
 
 use crate::crypto::Address;
@@ -285,25 +285,25 @@ mod tests {
 
 - [ ] **Step 2: Wire the modules and run**
 
-In `crates/shrugg-core/src/lib.rs` add `pub mod effect;` and `pub mod gas;` next to the other modules.
-Run: `cargo test -p shrugg-core gas effect`
+In `crates/randprotocol-core/src/lib.rs` add `pub mod effect;` and `pub mod gas;` next to the other modules.
+Run: `cargo test -p randprotocol-core gas effect`
 Expected: 5 new tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/shrugg-core/src/gas.rs crates/shrugg-core/src/effect.rs crates/shrugg-core/src/lib.rs
+git add crates/randprotocol-core/src/gas.rs crates/randprotocol-core/src/effect.rs crates/randprotocol-core/src/lib.rs
 git commit -m "core: gas schedule and call-effect decoding"
 ```
 
 ---
 
-### Task 3: Programs, new transaction kinds, and the executor trait (shrugg-core)
+### Task 3: Programs, new transaction kinds, and the executor trait (randprotocol-core)
 
 **Files:**
-- Create: `crates/shrugg-core/src/program.rs`
-- Rewrite: `crates/shrugg-core/src/confidential.rs`
-- Modify: `crates/shrugg-core/src/types/transaction.rs`, `crates/shrugg-core/src/types/mod.rs`, `crates/shrugg-core/src/lib.rs`
+- Create: `crates/randprotocol-core/src/program.rs`
+- Rewrite: `crates/randprotocol-core/src/confidential.rs`
+- Modify: `crates/randprotocol-core/src/types/transaction.rs`, `crates/randprotocol-core/src/types/mod.rs`, `crates/randprotocol-core/src/lib.rs`
 
 **Interfaces:**
 - Produces:
@@ -315,7 +315,7 @@ git commit -m "core: gas schedule and call-effect decoding"
 - [ ] **Step 1: Write `program.rs` with its tests**
 
 ```rust
-// crates/shrugg-core/src/program.rs
+// crates/randprotocol-core/src/program.rs
 //! On-chain programs and call receipts.
 
 use crate::crypto::{Address, Hash};
@@ -330,7 +330,7 @@ pub fn program_id(base_pc: u32, words: &[u32]) -> ProgramId {
     for w in words {
         buf.extend_from_slice(&w.to_le_bytes());
     }
-    Hash::digest_domain(b"shrugg-program", &buf)
+    Hash::digest_domain(b"rand-program", &buf)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,9 +381,9 @@ mod tests {
 - [ ] **Step 2: Rewrite `confidential.rs`**
 
 ```rust
-// crates/shrugg-core/src/confidential.rs
+// crates/randprotocol-core/src/confidential.rs
 //! Confidential computation: the executor the ledger calls to validate programs and verify
-//! call proofs. `shrugg-zkvm` provides the real implementation; `StubExecutor` is a
+//! call proofs. `randprotocol-zkvm` provides the real implementation; `StubExecutor` is a
 //! crypto-free stand-in for fast tests and for chains started with `confidential: false`.
 
 use crate::crypto::Hash;
@@ -425,7 +425,7 @@ impl StubExecutor {
         for o in outputs {
             v.extend_from_slice(&o.to_le_bytes());
         }
-        v.extend_from_slice(&Hash::digest_domain(b"shrugg-stub-binding", program.as_bytes()).0[..8]);
+        v.extend_from_slice(&Hash::digest_domain(b"rand-stub-binding", program.as_bytes()).0[..8]);
         v
     }
 }
@@ -439,7 +439,7 @@ impl ConfidentialExecutor for StubExecutor {
         if proof.len() != STUB_LEN || &proof[..4] != STUB_MARKER {
             return Err(ConfidentialError::MalformedProof);
         }
-        let expected = &Hash::digest_domain(b"shrugg-stub-binding", program.id.as_bytes()).0[..8];
+        let expected = &Hash::digest_domain(b"rand-stub-binding", program.id.as_bytes()).0[..8];
         if &proof[STUB_LEN - 8..] != expected {
             return Err(ConfidentialError::WrongProgram);
         }
@@ -493,7 +493,7 @@ mod tests {
 
 - [ ] **Step 3: Replace `TxKind::Confidential` with `Deploy` and `Call`**
 
-In `crates/shrugg-core/src/types/transaction.rs`:
+In `crates/randprotocol-core/src/types/transaction.rs`:
 
 ```rust
 use crate::program::ProgramId;   // add to imports
@@ -549,17 +549,17 @@ Add a test:
 
 - [ ] **Step 4: Fix every other use of the old variant**
 
-`grep -rn "Confidential {" crates/` and update: `crates/shrugg-core/src/ledger.rs` (validate/apply arms: temporarily map `Deploy`/`Call` to `Err(TxError::Overflow)`-style placeholders is NOT allowed; instead leave these arms returning `Err(TxError::FaucetDisabled)` only until Task 4 replaces them — better: do Task 3 and Task 4 in one commit if the placeholder feels wrong), `crates/shrugg-node/src/storage.rs` (touched set: `TxKind::Deploy { .. } | TxKind::Call { .. } => {}` for now; Task 7 completes it), `crates/shrugg-node/src/rpc.rs` (`tx_json`: `Deploy` → `{"type":"deploy","base_pc","words_len"}`, `Call` → `{"type":"call","program","proof_len","recipients":[...]}`), the ledger test `confidential_tx_pays_fee_and_requires_valid_stub_proof` (delete it; Task 4 adds the replacements).
+`grep -rn "Confidential {" crates/` and update: `crates/randprotocol-core/src/ledger.rs` (validate/apply arms: temporarily map `Deploy`/`Call` to `Err(TxError::Overflow)`-style placeholders is NOT allowed; instead leave these arms returning `Err(TxError::FaucetDisabled)` only until Task 4 replaces them — better: do Task 3 and Task 4 in one commit if the placeholder feels wrong), `crates/randprotocol-node/src/storage.rs` (touched set: `TxKind::Deploy { .. } | TxKind::Call { .. } => {}` for now; Task 7 completes it), `crates/randprotocol-node/src/rpc.rs` (`tx_json`: `Deploy` → `{"type":"deploy","base_pc","words_len"}`, `Call` → `{"type":"call","program","proof_len","recipients":[...]}`), the ledger test `confidential_tx_pays_fee_and_requires_valid_stub_proof` (delete it; Task 4 adds the replacements).
 
 Export from `lib.rs`: `pub mod program;` and `pub use program::{CallOutcome, CallReceipt, ProgramId, ProgramRecord};`.
 
-Run: `cargo test -p shrugg-core`
+Run: `cargo test -p randprotocol-core`
 Expected: everything except the deleted test passes.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/shrugg-core crates/shrugg-node/src/storage.rs crates/shrugg-node/src/rpc.rs
+git add crates/randprotocol-core crates/randprotocol-node/src/storage.rs crates/randprotocol-node/src/rpc.rs
 git commit -m "core: programs, Deploy/Call transactions, executor trait v2, stub executor"
 ```
 
@@ -568,7 +568,7 @@ git commit -m "core: programs, Deploy/Call transactions, executor trait v2, stub
 ### Task 4: Ledger rules for Deploy and Call, receipts, state root
 
 **Files:**
-- Modify: `crates/shrugg-core/src/ledger.rs`
+- Modify: `crates/randprotocol-core/src/ledger.rs`
 
 **Interfaces:**
 - Consumes: Task 2 `gas`, `effect`; Task 3 `program`, `confidential`.
@@ -820,12 +820,12 @@ Note the double `check_call` in validate + apply: to avoid verifying a real STAR
 ```rust
     pub fn state_root(&self) -> Hash {
         let accounts_root = merkle_root(&/* existing leaves */);
-        let program_leaves: Vec<Hash> = self.programs.keys().map(|id| Hash::digest_domain(b"shrugg-program-leaf", id.as_bytes())).collect();
+        let program_leaves: Vec<Hash> = self.programs.keys().map(|id| Hash::digest_domain(b"rand-program-leaf", id.as_bytes())).collect();
         let programs_root = merkle_root(&program_leaves);
         let mut buf = [0u8; 64];
         buf[..32].copy_from_slice(accounts_root.as_bytes());
         buf[32..].copy_from_slice(programs_root.as_bytes());
-        Hash::digest_domain(b"shrugg-state", &buf)
+        Hash::digest_domain(b"rand-state", &buf)
     }
 ```
 
@@ -835,13 +835,13 @@ This changes every state root, including genesis: that is intended (new chain).
 
 `grep -rn "apply_transactions\|apply_block" crates/` — the consensus state machine (`hotstuff.rs`), storage `verify_chain`, node sync, and tests use `apply_block(..)?` / `apply_transactions(..)?` as `Result<(), _>`; change to `let _ = ...?;` where receipts are not needed (Task 8 uses them in the node). `PartialEq` on `Ledger` still derives (add `programs`, `height` fields; height must be excluded from equality: implement `PartialEq` manually comparing chain_id, faucet, accounts, programs).
 
-Run: `cargo test -p shrugg-core`
+Run: `cargo test -p randprotocol-core`
 Expected: all pass, including the four new tests.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/shrugg-core
+git add crates/randprotocol-core
 git commit -m "core: ledger rules for Deploy and Call, receipts, programs in state root"
 ```
 
@@ -850,7 +850,7 @@ git commit -m "core: ledger rules for Deploy and Call, receipts, programs in sta
 ### Task 5: Genesis flags `confidential` and `fri_profile`
 
 **Files:**
-- Modify: `crates/shrugg-core/src/genesis.rs`, `crates/shrugg-node/src/main.rs` (genesis flags), `deploy/genesis.json` regenerated later (Task 11)
+- Modify: `crates/randprotocol-core/src/genesis.rs`, `crates/randprotocol-node/src/main.rs` (genesis flags), `deploy/genesis.json` regenerated later (Task 11)
 
 **Interfaces:**
 - Produces: `Genesis { ..., confidential: bool (default true), fri_profile: String (default "production") }`, `GenesisState { confidential, fri_profile }`; both are folded into the genesis hash binding.
@@ -897,43 +897,43 @@ pub struct Genesis {
 // GenesisState: add `pub confidential: bool, pub fri_profile: String`
 ```
 
-`shrugg-node genesis` gets `--no-confidential` and `--fri-profile <production|test>` flags. Update every `Genesis { .. }` literal in tests (`consensus/tests.rs`, `storage.rs`, `cluster.rs`, `genesis.rs`) with `confidential: true, fri_profile: "test".into()` for cluster/storage tests and `"production"` elsewhere.
+`rand-node genesis` gets `--no-confidential` and `--fri-profile <production|test>` flags. Update every `Genesis { .. }` literal in tests (`consensus/tests.rs`, `storage.rs`, `cluster.rs`, `genesis.rs`) with `confidential: true, fri_profile: "test".into()` for cluster/storage tests and `"production"` elsewhere.
 
-Run: `cargo test -p shrugg-core && cargo test -p shrugg-node --lib`
+Run: `cargo test -p randprotocol-core && cargo test -p randprotocol-node --lib`
 Expected: pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/shrugg-core/src/genesis.rs crates/shrugg-node crates/shrugg-core/src/consensus/tests.rs
+git add crates/randprotocol-core/src/genesis.rs crates/randprotocol-node crates/randprotocol-core/src/consensus/tests.rs
 git commit -m "genesis: confidential and fri_profile flags"
 ```
 
 ---
 
-### Task 6: The real executor in shrugg-zkvm (verifier-key cache, program codec, new guest)
+### Task 6: The real executor in randprotocol-zkvm (verifier-key cache, program codec, new guest)
 
 **Files:**
-- Create: `crates/shrugg-zkvm/src/executor.rs`, `crates/shrugg-zkvm/src/codec.rs`, `crates/shrugg-zkvm/tests/executor.rs`
-- Modify: `crates/shrugg-zkvm/src/lib.rs` (add modules), `crates/shrugg-zkvm/src/guests.rs` (add `private_payment`), `crates/shrugg-zkvm/src/asm.rs` (add `emit_transfer`)
+- Create: `crates/randprotocol-zkvm/src/executor.rs`, `crates/randprotocol-zkvm/src/codec.rs`, `crates/randprotocol-zkvm/tests/executor.rs`
+- Modify: `crates/randprotocol-zkvm/src/lib.rs` (add modules), `crates/randprotocol-zkvm/src/guests.rs` (add `private_payment`), `crates/randprotocol-zkvm/src/asm.rs` (add `emit_transfer`)
 
 **Interfaces:**
-- Consumes: `shrugg_core::confidential::{ConfidentialExecutor, ConfidentialError}`, `shrugg_core::program::{ProgramRecord, CallOutcome}`; upstream `machine::{Machine, FriProfile, Tier, Proof, chips, Val}`, `isa::{Program, Instr}`.
+- Consumes: `randprotocol_core::confidential::{ConfidentialExecutor, ConfidentialError}`, `randprotocol_core::program::{ProgramRecord, CallOutcome}`; upstream `machine::{Machine, FriProfile, Tier, Proof, chips, Val}`, `isa::{Program, Instr}`.
 - Produces: `executor::ZkExecutor::new(profile: FriProfile) -> ZkExecutor` (implements the trait), `ZkExecutor::profile_from_str(&str) -> Option<FriProfile>`, `codec::{program_from_bytes(&[u8]) -> Result<Program, String>  (raw LE u32 words, base_pc 0), program_from_json(&str) -> Result<Program, String> ({"base_pc","words"}), program_to_json(&Program) -> String}`, `guests::private_payment(threshold: u32) -> Program`, `asm::ops::emit_transfer(index: u32, amount_lo_reg: u32, amount_hi_reg: u32) -> Vec<Instr>`.
 - Prover helper for clients/tests: `executor::prove(profile, program, inputs, tier: Option<u8>) -> Result<(Vec<u8> /*proof bytes*/, [u32; 8], u8), String>`.
 
 - [ ] **Step 1: Write the failing tests** (`tests/executor.rs`, run in release)
 
 ```rust
-use shrugg_core::confidential::{ConfidentialError, ConfidentialExecutor};
-use shrugg_core::program::{program_id, ProgramRecord};
-use shrugg_core::Keypair;
-use shrugg_zkvm::executor::{prove, ZkExecutor};
-use shrugg_zkvm::guests;
-use shrugg_zkvm::machine::FriProfile;
+use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor};
+use randprotocol_core::program::{program_id, ProgramRecord};
+use randprotocol_core::Keypair;
+use randprotocol_zkvm::executor::{prove, ZkExecutor};
+use randprotocol_zkvm::guests;
+use randprotocol_zkvm::machine::FriProfile;
 use std::sync::OnceLock;
 
-fn record(p: &shrugg_zkvm::isa::Program) -> ProgramRecord {
+fn record(p: &randprotocol_zkvm::isa::Program) -> ProgramRecord {
     let ex = ZkExecutor::new(FriProfile::Test);
     let code_hash = ex.check_program(p.base_pc, &p.words).unwrap();
     ProgramRecord { id: program_id(p.base_pc, &p.words), base_pc: p.base_pc, words: p.words.clone(), code_hash, deployer: Keypair::from_seed([1; 32]).unwrap().address(), deployed_at: 0 }
@@ -995,13 +995,13 @@ fn private_payment_emits_no_transfer_below_threshold() {
 - [ ] **Step 2: Implement `executor.rs`**
 
 ```rust
-//! The chain-side verifier: implements shrugg-core's executor trait with the zkVM.
+//! The chain-side verifier: implements randprotocol-core's executor trait with the zkVM.
 use crate::isa::{Instr, Program};
 use crate::machine::{chips, FriProfile, Machine, Proof, Tier, Val, TIERS};
 use p3_batch_stark::{verify_batch, CommonData};
 use p3_field::PrimeCharacteristicRing;
-use shrugg_core::confidential::{ConfidentialError, ConfidentialExecutor};
-use shrugg_core::program::{CallOutcome, ProgramId, ProgramRecord};
+use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor};
+use randprotocol_core::program::{CallOutcome, ProgramId, ProgramRecord};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -1137,13 +1137,13 @@ Add it to `guests::all()` as `("private_payment", private_payment(1000), vec![40
 
 - [ ] **Step 4: Run**
 
-Run: `cargo test -p shrugg-zkvm --release --test executor`
+Run: `cargo test -p randprotocol-zkvm --release --test executor`
 Expected: 4 tests pass (about a minute: three proofs).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/shrugg-zkvm deploy/sync-zkvm.sh
+git add crates/randprotocol-zkvm deploy/sync-zkvm.sh
 git commit -m "zkvm: ZkExecutor with verifier-key cache, program codec, private_payment guest"
 ```
 
@@ -1152,7 +1152,7 @@ git commit -m "zkvm: ZkExecutor with verifier-key cache, program codec, private_
 ### Task 7: Storage for programs and receipts
 
 **Files:**
-- Modify: `crates/shrugg-node/src/storage.rs`
+- Modify: `crates/randprotocol-node/src/storage.rs`
 
 **Interfaces:**
 - Produces: column families `programs` (id → bincode ProgramRecord), `receipts` (tx hash → bincode CallReceipt); `Storage::{program(&ProgramId) -> Result<Option<ProgramRecord>>, programs_count() -> Result<u64>, receipt(&Hash) -> Result<Option<CallReceipt>>, load_ledger() (now also loads programs), commit(blocks, ledger_after, receipts: &[CallReceipt])}` and `verify_chain`/`truncate_to` cover programs and receipts.
@@ -1163,7 +1163,7 @@ git commit -m "zkvm: ZkExecutor with verifier-key cache, program codec, private_
     #[test]
     fn programs_and_receipts_round_trip_and_truncate() {
         let (_d, st, gs, blocks) = chain_fixture(2);
-        let deployer = shrugg_core::Keypair::from_seed([9u8; 32]).unwrap().address();
+        let deployer = randprotocol_core::Keypair::from_seed([9u8; 32]).unwrap().address();
         let rec = ProgramRecord { id: Hash::digest(b"prog"), base_pc: 0, words: vec![0x13; 3], code_hash: vec![1, 2], deployer, deployed_at: 3 };
         let mut ledger = st.load_ledger().unwrap();
         // pretend block 3 deployed it and block 3 also carried a call
@@ -1195,13 +1195,13 @@ git commit -m "zkvm: ZkExecutor with verifier-key cache, program codec, private_
 - `truncate_to(gs, height, ledger)`: delete receipts whose `height > height` (iterate CF, decode, compare) and programs whose `deployed_at > height`; rewrite the accounts CF as today.
 - `verify_chain`: `ledger.set_height(h)` before applying each block; collect `apply_transactions` receipts and check each stored receipt matches (`receipt(tx)` equals the replayed one) — a mismatch is a `problem` at that height; after the loop, `stored.programs()` must equal `ledger.programs()` (else "programs snapshot does not match").
 
-Run: `cargo test -p shrugg-node storage`
+Run: `cargo test -p randprotocol-node storage`
 Expected: 11 storage tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/shrugg-node/src/storage.rs
+git add crates/randprotocol-node/src/storage.rs
 git commit -m "storage: programs and receipts column families; verify and truncate cover them"
 ```
 
@@ -1210,11 +1210,11 @@ git commit -m "storage: programs and receipts column families; verify and trunca
 ### Task 8: Node wiring: executor from genesis, block byte cap, receipts, RPC
 
 **Files:**
-- Modify: `crates/shrugg-node/src/node.rs`, `crates/shrugg-node/src/mempool.rs`, `crates/shrugg-node/src/rpc.rs`, `crates/shrugg-node/Cargo.toml` (add `shrugg-zkvm`)
+- Modify: `crates/randprotocol-node/src/node.rs`, `crates/randprotocol-node/src/mempool.rs`, `crates/randprotocol-node/src/rpc.rs`, `crates/randprotocol-node/Cargo.toml` (add `randprotocol-zkvm`)
 
 **Interfaces:**
 - Consumes: `ZkExecutor`, `DisabledExecutor`, `StubExecutor`; `Ledger::apply_block -> Vec<CallReceipt>`; storage from Task 7.
-- Produces: `Mempool::candidates(ledger, max_txs, max_bytes) -> Vec<Transaction>`; `NodeStatus.confidential: bool, fri_profile: String, programs: u64`; RPC methods `shrugg_getProgram [id]`, `shrugg_getProgramCode [id]`, `shrugg_getReceipt [tx]`, `shrugg_estimateFee ["deploy", words | "call", tier]`; `tx_json` renders deploy/call.
+- Produces: `Mempool::candidates(ledger, max_txs, max_bytes) -> Vec<Transaction>`; `NodeStatus.confidential: bool, fri_profile: String, programs: u64`; RPC methods `rand_getProgram [id]`, `rand_getProgramCode [id]`, `rand_getReceipt [tx]`, `rand_estimateFee ["deploy", words | "call", tier]`; `tx_json` renders deploy/call.
 
 - [ ] **Step 1: Mempool byte cap test**
 
@@ -1257,30 +1257,30 @@ Receipts: the consensus state machine applies blocks inside `HotStuff::on_propos
 In `rpc.rs` `dispatch`:
 
 ```rust
-        "shrugg_getProgram" => {
+        "rand_getProgram" => {
             let id = parse_hash(p, 0)?;
             match st.storage.program(&id).map_err(RpcError::internal)? {
                 None => Ok(Value::Null),
                 Some(r) => Ok(json!({ "id": r.id.to_hex(), "base_pc": r.base_pc, "words_len": r.words.len(), "code_hash": hex::encode(&r.code_hash), "deployer": r.deployer.to_base58(), "deployed_at": r.deployed_at })),
             }
         }
-        "shrugg_getProgramCode" => {
+        "rand_getProgramCode" => {
             let id = parse_hash(p, 0)?;
             Ok(st.storage.program(&id).map_err(RpcError::internal)?.map(|r| json!({ "base_pc": r.base_pc, "words": r.words })).unwrap_or(Value::Null))
         }
-        "shrugg_getReceipt" => {
+        "rand_getReceipt" => {
             let h = parse_hash(p, 0)?;
             Ok(st.storage.receipt(&h).map_err(RpcError::internal)?.map(|r| json!({
                 "tx": r.tx.to_hex(), "program": r.program.to_hex(), "tier": r.tier, "outputs": r.outputs,
                 "effect": r.effect.map(|(to, amt)| json!({ "to": to.to_base58(), "amount": amt.to_string() })),
                 "height": r.height, "index": r.index })).unwrap_or(Value::Null))
         }
-        "shrugg_estimateFee" => {
+        "rand_estimateFee" => {
             let kind: String = param(p, 0, "kind")?;
             let n: u64 = param(p, 1, "size_or_tier")?;
             let fee = match kind.as_str() {
-                "deploy" => shrugg_core::gas::deploy_fee(n as usize),
-                "call" => shrugg_core::gas::call_fee(n as u8),
+                "deploy" => randprotocol_core::gas::deploy_fee(n as usize),
+                "call" => randprotocol_core::gas::call_fee(n as u8),
                 _ => return Err(RpcError::invalid_params("kind must be deploy or call")),
             };
             Ok(json!(fee.to_string()))
@@ -1291,13 +1291,13 @@ In `rpc.rs` `dispatch`:
 
 - [ ] **Step 4: Run**
 
-Run: `cargo test -p shrugg-node --lib && cargo test -p shrugg-core`
+Run: `cargo test -p randprotocol-node --lib && cargo test -p randprotocol-core`
 Expected: pass. (Cluster tests use `fri_profile: "test"` and `StubExecutor`-free paths; they get real proofs in Task 10.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/shrugg-node Cargo.lock
+git add crates/randprotocol-node Cargo.lock
 git commit -m "node: zk executor from genesis, receipts, program/receipt RPC, block byte cap"
 ```
 
@@ -1306,7 +1306,7 @@ git commit -m "node: zk executor from genesis, receipts, program/receipt RPC, bl
 ### Task 9: Wallet: program build/deploy/show, call, receipt
 
 **Files:**
-- Modify: `crates/shrugg-client/Cargo.toml` (add `shrugg-zkvm`, `hex`), `crates/shrugg-client/src/lib.rs`, `crates/shrugg-client/src/main.rs`
+- Modify: `crates/randprotocol-client/Cargo.toml` (add `randprotocol-zkvm`, `hex`), `crates/randprotocol-client/src/lib.rs`, `crates/randprotocol-client/src/main.rs`
 
 **Interfaces:**
 - Produces: `RpcClient::{program(&ProgramId) -> Result<Option<Value>>, program_code(&ProgramId) -> Result<Option<(u32, Vec<u32>)>>, receipt(&Hash) -> Result<Option<Value>>, estimate_fee(kind: &str, n: u64) -> Result<u128>, deploy(key, base_pc, words) -> Result<(ProgramId, Hash)>, call(key, program, proof, recipients, fee) -> Result<Hash>}`; CLI commands below.
@@ -1316,23 +1316,23 @@ git commit -m "node: zk executor from genesis, receipts, program/receipt RPC, bl
 - [ ] **Step 2: CLI**
 
 ```
-shrugg program build --guest <fib|memcpy|bubble_sort|balance_check|private_payment> [--arg N]... --out prog.json
-shrugg program deploy <prog.json|prog.bin>          # waits for commit; prints program id
-shrugg program show <id>
-shrugg call <id> --input N... [--to <addr>]... [--tier T] [--fee <SHRUGG>]   # proves locally (prints prove time), submits, waits, prints outputs and receipt
-shrugg receipt <tx>
-shrugg fee deploy <words> | fee call <tier>
+rand program build --guest <fib|memcpy|bubble_sort|balance_check|private_payment> [--arg N]... --out prog.json
+rand program deploy <prog.json|prog.bin>          # waits for commit; prints program id
+rand program show <id>
+rand call <id> --input N... [--to <addr>]... [--tier T] [--fee <RAND>]   # proves locally (prints prove time), submits, waits, prints outputs and receipt
+rand receipt <tx>
+rand fee deploy <words> | fee call <tier>
 ```
 
-`program build` maps guest names to `shrugg_zkvm::guests::*` (args: `fib n`, `memcpy n`, `bubble_sort v...`, `balance_check threshold`, `private_payment threshold`) and writes `codec::program_to_json`. `program deploy` reads `.json` via `codec::program_from_json` or `.bin` via `program_from_bytes`. `call` loads the program code from the node (`shrugg_getProgramCode`), runs `shrugg_zkvm::executor::prove(profile, ...)` with the profile from `shrugg_status.fri_profile`, sets the fee to `estimate_fee("call", tier)` unless `--fee` is given, submits, waits, prints `outputs` and the receipt.
+`program build` maps guest names to `randprotocol_zkvm::guests::*` (args: `fib n`, `memcpy n`, `bubble_sort v...`, `balance_check threshold`, `private_payment threshold`) and writes `codec::program_to_json`. `program deploy` reads `.json` via `codec::program_from_json` or `.bin` via `program_from_bytes`. `call` loads the program code from the node (`rand_getProgramCode`), runs `randprotocol_zkvm::executor::prove(profile, ...)` with the profile from `rand_status.fri_profile`, sets the fee to `estimate_fee("call", tier)` unless `--fee` is given, submits, waits, prints `outputs` and the receipt.
 
 - [ ] **Step 3: Smoke test by hand against a local node** (cluster test in Task 10 covers it automatically):
-`cargo run --release -p shrugg-client -- program build --guest private_payment --arg 1000 --out /tmp/pp.json` then inspect the JSON.
+`cargo run --release -p randprotocol-client -- program build --guest private_payment --arg 1000 --out /tmp/pp.json` then inspect the JSON.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/shrugg-client Cargo.lock
+git add crates/randprotocol-client Cargo.lock
 git commit -m "client: program build/deploy/show, confidential call, receipt"
 ```
 
@@ -1341,7 +1341,7 @@ git commit -m "client: program build/deploy/show, confidential call, receipt"
 ### Task 10: End-to-end cluster test
 
 **Files:**
-- Modify: `crates/shrugg-node/tests/cluster.rs`
+- Modify: `crates/randprotocol-node/tests/cluster.rs`
 
 - [ ] **Step 1: Test**
 
@@ -1359,16 +1359,16 @@ async fn confidential_call_moves_funds_on_every_node() {
     wait_height(&[&n0, &n1, &n2, &n3], 2, Duration::from_secs(40)).await;
 
     // deploy
-    let program = shrugg_zkvm::guests::private_payment(1000);
+    let program = randprotocol_zkvm::guests::private_payment(1000);
     let (pid, dtx) = n0.rpc.deploy(&ks[0], program.base_pc, program.words.clone()).await.unwrap();
     n0.rpc.wait_for_transaction(&dtx, Duration::from_secs(60)).await.unwrap();
     wait_for("program on n3", Duration::from_secs(60), || n3.handle.storage.program(&pid).unwrap().is_some()).await;
 
     // prove off-chain (test profile, ~20 s) and call with bob as recipient 0
     let bob = Keypair::from_seed([9; 32]).unwrap().address();
-    let (proof, outputs, tier) = shrugg_zkvm::executor::prove(shrugg_zkvm::machine::FriProfile::Test, &program, &[400, 250, 300, 75], None).unwrap();
+    let (proof, outputs, tier) = randprotocol_zkvm::executor::prove(randprotocol_zkvm::machine::FriProfile::Test, &program, &[400, 250, 300, 75], None).unwrap();
     assert_eq!(outputs[0], 1);
-    let fee = shrugg_core::gas::call_fee(tier);
+    let fee = randprotocol_core::gas::call_fee(tier);
     let ctx = n1.rpc.call(&ks[0], pid, proof, vec![bob], fee).await.unwrap();
     let r = n1.rpc.wait_for_transaction(&ctx, Duration::from_secs(90)).await.unwrap();
     wait_for("receipt on all nodes", Duration::from_secs(60), || [&n0, &n1, &n2, &n3].iter().all(|n| n.handle.storage.receipt(&ctx).unwrap().is_some())).await;
@@ -1386,13 +1386,13 @@ async fn confidential_call_moves_funds_on_every_node() {
 
 (Replace the last line with a real check: resubmit the same call bytes with the next nonce; the node must reject it because the mempool/ledger verify the proof against `pid` again and it verifies fine — so instead deploy `private_payment(1001)`, and submit the *old* proof against that id: expect an RPC error containing "invalid proof".)
 
-- [ ] **Step 2: Run** `cargo test -p shrugg-node --release --test cluster confidential_call` (release: proving in debug is far too slow).
+- [ ] **Step 2: Run** `cargo test -p randprotocol-node --release --test cluster confidential_call` (release: proving in debug is far too slow).
 Expected: pass in about 1 to 2 minutes.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/shrugg-node/tests/cluster.rs
+git add crates/randprotocol-node/tests/cluster.rs
 git commit -m "tests: end-to-end confidential deploy and call across a cluster"
 ```
 
@@ -1404,9 +1404,9 @@ git commit -m "tests: end-to-end confidential deploy and call across a cluster"
 - Modify: `README.md`, `docs/cli.md`, `docs/rpc.md`, `docs/architecture.md`, `deploy/README.md`, `deploy/genesis.json`, `deploy/run-a.sh`, `deploy/run-b.sh`, `deploy/nodes.env`, `deploy/vps-setup.sh` (if the systemd unit needs `LimitNOFILE` or memory notes)
 
 - [ ] **Step 1: Documentation** — add the transaction kinds, effect table, gas table, RPC methods and wallet commands from the spec to the four docs; replace the "confidential computation is a stub" sentences.
-- [ ] **Step 2: Genesis** — `shrugg-node genesis --chain-id 4 --validator deploy/node-a.key.json ... --alloc-each 100 --faucet --out deploy/genesis.json` (confidential on, production profile); update run scripts' datadir suffix and `deploy/README.md`/`nodes.env` (addresses and peer ids do not change this time).
+- [ ] **Step 2: Genesis** — `rand-node genesis --chain-id 4 --validator deploy/node-a.key.json ... --alloc-each 100 --faucet --out deploy/genesis.json` (confidential on, production profile); update run scripts' datadir suffix and `deploy/README.md`/`nodes.env` (addresses and peer ids do not change this time).
 - [ ] **Step 3: Rollout** — `cargo test` green; push; `deploy/push-to-vps.sh` for C, D, E, F (the droplets must install Rust 1.98.1: `rust-toolchain.toml` makes rustup do it automatically; the first build recompiles Plonky3, ~20 min); restart A with `deploy/run-a.sh`; signal B's session.
-- [ ] **Step 4: Live check** — `shrugg program build --guest private_payment --arg 1000 --out pp.json`, `shrugg program deploy pp.json`, `shrugg call <id> --input 400 --input 250 --input 300 --input 75 --to <B address>`; verify the receipt and B's balance on every node; note prove time on the laptop and verify time in the droplet logs.
+- [ ] **Step 4: Live check** — `rand program build --guest private_payment --arg 1000 --out pp.json`, `rand program deploy pp.json`, `rand call <id> --input 400 --input 250 --input 300 --input 75 --to <B address>`; verify the receipt and B's balance on every node; note prove time on the laptop and verify time in the droplet logs.
 - [ ] **Step 5: Commit and push.**
 
 ---
