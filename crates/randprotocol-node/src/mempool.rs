@@ -1289,10 +1289,12 @@ mod tests {
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d);
-        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
+        // The registry, not the register, owns the note key (short-shielded-address task 4): the
+        // aggregator's payout id has to resolve before `RegisterAggregator` will.
+        let payout = fixtures::registered_receiver(&mut l, &fixtures::key(1).address(), [nf(90), nf(91)], [cm(90), cm(91)], 7, [7; 8]);
         let registration = AggregatorRegistration {
             public_key: kp.public_key().clone(),
-            payout: payout.clone(),
+            payout,
             signature: kp.sign(aggregator_register_message(1, &payout).as_bytes()),
         };
         let register = Transaction::shielded(1, b, Action::RegisterAggregator { registration });

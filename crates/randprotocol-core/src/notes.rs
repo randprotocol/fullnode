@@ -5,6 +5,7 @@
 
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::Hash;
+use crate::receiver::ReceiverRecord;
 use serde::{Deserialize, Serialize};
 
 pub type Word8 = [u32; 8];
@@ -139,6 +140,11 @@ pub enum AddressError {
 }
 
 impl ShieldedAddress {
+    /// Kept through the short-address migration (spec docs §5), unlike `Registration`'s and
+    /// `AggregatorRegistration`'s payout and the genesis validator, which now name a
+    /// [`crate::receiver::ReceiverId`] instead: the bridge (`bridge_notes.rs`, the node's
+    /// `mempool.rs`/`storage.rs`, the client's `wallet.rs`/`main.rs`) still renders and parses a
+    /// recipient this way until Task 5 migrates it, so `to_string`/`parse`/`Display` stay too.
     #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         let mut raw = word8_to_bytes(&self.pk).to_vec();
@@ -173,6 +179,15 @@ impl ShieldedAddress {
 impl std::fmt::Display for ShieldedAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&ShieldedAddress::to_string(self))
+    }
+}
+
+/// The short-address migration's bridge: a resolved receiver record carries everything a
+/// `ShieldedAddress` is, so anything that still wants one (the bridge's `recipient_hash`, until
+/// Task 5) can build it from a record the registry already holds.
+impl From<&ReceiverRecord> for ShieldedAddress {
+    fn from(r: &ReceiverRecord) -> Self {
+        ShieldedAddress { pk: r.pk, kem_ek: r.kem_ek.clone() }
     }
 }
 
@@ -324,7 +339,23 @@ mod tests {
     }
 
     #[test]
-    fn shielded_address_roundtrips_and_rejects_bad_input() {
+    fn shielded_address_recipient_hash_is_domain_separated_and_from_a_record_copies_its_fields() {
+        let a = ShieldedAddress { pk: [9; 8], kem_ek: vec![7; KEM_EK_BYTES] };
+        let b = ShieldedAddress { pk: [9; 8], kem_ek: vec![8; KEM_EK_BYTES] };
+        assert_ne!(a.recipient_hash(), b.recipient_hash());
+        assert_eq!(a.recipient_hash(), a.recipient_hash(), "deterministic");
+
+        // The short-address migration's bridge: a resolved record converts to exactly the
+        // address it names.
+        let kp = crate::receiver::receiver_signing_keypair(&[1; 32]);
+        let rec = crate::receiver::ReceiverRecord::sign(&kp, 1, 1, a.pk, a.kem_ek.clone());
+        assert_eq!(ShieldedAddress::from(&rec), a);
+    }
+
+    /// The bridge (Task 5) still names a recipient with the long text form, so it stays
+    /// alongside the short receiver id `Registration`/`AggregatorRegistration` payouts now use.
+    #[test]
+    fn shielded_address_still_roundtrips_and_rejects_bad_input_for_the_bridge() {
         let a = ShieldedAddress { pk: [9; 8], kem_ek: vec![7; KEM_EK_BYTES] };
         let s = a.to_string();
         assert!(s.starts_with(ADDRESS_PREFIX));

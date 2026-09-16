@@ -161,7 +161,7 @@ impl Audit {
 mod tests {
     use super::*;
     use crate::crypto::Keypair;
-    use crate::notes::ShieldedAddress;
+    use crate::receiver::ReceiverId;
 
     fn entry(stake: u64, pending: Vec<(u64, u64)>, rewards: u64) -> ValidatorEntry {
         ValidatorEntry {
@@ -169,7 +169,7 @@ mod tests {
             stake,
             pending,
             rewards,
-            payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+            payout: ReceiverId([1; 32]),
             nonce: 0,
         }
     }

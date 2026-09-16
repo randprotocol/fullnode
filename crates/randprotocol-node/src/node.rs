@@ -1994,12 +1994,41 @@ mod tests {
         ledger.set_height(1);
         let fee = randprotocol_core::gas::BUNDLE_BASE + 60;
         let fee_tx = bundle_tx(&ledger, [[41; 8], [42; 8]], [[43; 8], [44; 8]], fee);
+        // The registry, not the register, owns the note key (short-shielded-address task 4): the
+        // aggregator's payout id has to resolve before `RegisterAggregator` will, so its record
+        // rides its own bundle in the same block, anchored to the same block-start root.
+        let receiver_tx = {
+            let payout_kp = randprotocol_core::receiver::receiver_signing_keypair(&[7; 32]);
+            let record = randprotocol_core::receiver::ReceiverRecord::sign(
+                &payout_kp,
+                ledger.chain_id(),
+                1,
+                [7; 8],
+                vec![8; randprotocol_core::notes::KEM_EK_BYTES],
+            );
+            let mut b = randprotocol_core::notes::Bundle {
+                anchor: ledger.root(),
+                nullifiers: [[55; 8], [56; 8]],
+                commitments: [[57; 8], [58; 8]],
+                fee: randprotocol_core::gas::BUNDLE_BASE,
+                burn: 0,
+                asset: 0,
+                time: 1,
+                envelopes: [env(3), env(4)],
+                proof: vec![],
+            };
+            let d = StubExecutor.bundle_digest(&b.digest_input());
+            b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+            Transaction::shielded(7, b, randprotocol_core::types::Action::RegisterReceiver { record })
+        };
         let register_tx = {
             let kp = key(7);
-            let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
+            let payout = randprotocol_core::receiver::ReceiverId::from(
+                randprotocol_core::receiver::receiver_signing_keypair(&[7; 32]).public_key(),
+            );
             let registration = AggregatorRegistration {
                 public_key: kp.public_key().clone(),
-                payout: payout.clone(),
+                payout,
                 signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
             };
             let mut b = randprotocol_core::notes::Bundle {
@@ -2017,9 +2046,13 @@ mod tests {
             b.proof = StubExecutor::make_bundle_proof(&HC, &d);
             Transaction::shielded(7, b, randprotocol_core::types::Action::RegisterAggregator { registration })
         };
-        let b1 = make_block(&gs.block, &mut ledger, vec![fee_tx, register_tx], &key(1));
+        let b1 = make_block(&gs.block, &mut ledger, vec![fee_tx, receiver_tx, register_tx], &key(1));
         storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
-        assert_eq!(ledger.unsealed_fees().len(), 2, "every bundle is recorded: the excess, and the register's at 0");
+        assert_eq!(
+            ledger.unsealed_fees().len(),
+            3,
+            "every bundle is recorded: the excess, and the receiver's and the aggregator's registration at 0"
+        );
         assert_eq!(ledger.aggregators().len(), 1, "the aggregator is registered");
 
         let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
@@ -2096,9 +2129,42 @@ mod tests {
 
     /// Register `kp` as an aggregator on a stub-executor ledger: the registration bundle burns
     /// exactly the bond, its stub proof publishing the digest the ledger recomputes.
+    ///
+    /// Registers its payout id's record first (short-shielded-address task 4): the registry, not
+    /// the register, owns the note key, so `RegisterAggregator` refuses until it resolves.
     fn register_aggregator(l: &mut Ledger, kp: &Keypair, bond: u64) {
+        let proposer = *l.validators().keys().next().unwrap();
+        // Both bundles anchor to this one already-recorded root (`is_anchor`'s "within one
+        // block" rule): applying the first moves `l`'s live root without recording a new
+        // anchor, so a `l.root()` read after it would not itself be an anchor yet.
+        let anchor = l.root();
+        let payout_kp = randprotocol_core::receiver::receiver_signing_keypair(&[7; 32]);
+        let record = randprotocol_core::receiver::ReceiverRecord::sign(
+            &payout_kp,
+            l.chain_id(),
+            1,
+            [7; 8],
+            vec![8; randprotocol_core::notes::KEM_EK_BYTES],
+        );
+        let payout = record.id();
+        let mut rb = randprotocol_core::notes::Bundle {
+            anchor,
+            nullifiers: [[5; 8], [6; 8]],
+            commitments: [[7; 8], [8; 8]],
+            fee: gas::BUNDLE_BASE,
+            burn: 0,
+            asset: 0,
+            time: l.height() as u32,
+            envelopes: [env(5), env(6)],
+            proof: vec![],
+        };
+        let rd = StubExecutor.bundle_digest(&rb.digest_input());
+        rb.proof = StubExecutor::make_bundle_proof(&HC, &rd);
+        let receiver_tx = Transaction::shielded(l.chain_id(), rb, randprotocol_core::types::Action::RegisterReceiver { record });
+        l.apply_tx(&receiver_tx, &proposer, &StubExecutor).unwrap();
+
         let mut b = randprotocol_core::notes::Bundle {
-            anchor: l.root(),
+            anchor,
             nullifiers: [[1; 8], [2; 8]],
             commitments: [[3; 8], [4; 8]],
             fee: gas::BUNDLE_BASE,
@@ -2110,14 +2176,12 @@ mod tests {
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d);
-        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
         let registration = AggregatorRegistration {
             public_key: kp.public_key().clone(),
-            payout: payout.clone(),
+            payout,
             signature: kp.sign(aggregator_register_message(l.chain_id(), &payout).as_bytes()),
         };
         let tx = Transaction::shielded(l.chain_id(), b, randprotocol_core::types::Action::RegisterAggregator { registration });
-        let proposer = *l.validators().keys().next().unwrap();
         l.apply_tx(&tx, &proposer, &StubExecutor).unwrap();
     }
 

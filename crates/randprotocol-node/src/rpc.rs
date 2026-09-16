@@ -1531,14 +1531,40 @@ mod tests {
         covered_tx.bundle.as_mut().unwrap().proof = proof.to_bytes();
         let stub_twin = bundle_tx(&gs.ledger, [nf(1), nf(2)], [cm(1), cm(2)], fee);
         let kp = key(7);
-        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
+        // The registry, not the register, owns the note key (short-shielded-address task 4): the
+        // aggregator's payout id has to resolve before `RegisterAggregator` will, so its record
+        // rides its own bundle in the same block, anchored to the same block-start root.
+        let anchor = gs.ledger.root();
+        let payout_kp = randprotocol_core::receiver::receiver_signing_keypair(&[7; 32]);
+        let record = randprotocol_core::receiver::ReceiverRecord::sign(
+            &payout_kp,
+            7,
+            1,
+            [7; 8],
+            vec![8; randprotocol_core::notes::KEM_EK_BYTES],
+        );
+        let payout = record.id();
+        let mut rb = randprotocol_core::notes::Bundle {
+            anchor,
+            nullifiers: [nf(90), nf(91)],
+            commitments: [cm(90), cm(91)],
+            fee: bundle_fee(),
+            burn: 0,
+            asset: 0,
+            time: 1,
+            envelopes: [fixtures::env(5), fixtures::env(6)],
+            proof: vec![],
+        };
+        let rd = StubExecutor.bundle_digest(&rb.digest_input());
+        rb.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &rd);
+        let receiver_reg = Transaction::shielded(7, rb, Action::RegisterReceiver { record });
         let registration = AggregatorRegistration {
             public_key: kp.public_key().clone(),
-            payout: payout.clone(),
+            payout,
             signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
         };
         let mut b = randprotocol_core::notes::Bundle {
-            anchor: gs.ledger.root(),
+            anchor,
             nullifiers: [nf(3), nf(4)],
             commitments: [cm(3), cm(4)],
             fee: bundle_fee(),
@@ -1554,7 +1580,8 @@ mod tests {
         let mut l1 = gs.ledger.clone();
         l1.set_height(1);
         l1.set_timestamp_ms(1);
-        l1.apply_transactions(&[stub_twin.clone(), register.clone()], &key(1).address(), &StubExecutor).unwrap();
+        l1.apply_transactions(&[stub_twin.clone(), receiver_reg.clone(), register.clone()], &key(1).address(), &StubExecutor)
+            .unwrap();
         l1.record_anchor(1);
         // The ledger applied the stub twin, so its coverable entry is keyed by the twin's hash;
         // the stored bundle (and the aggregate's cover) is the real-proof one. Re-key it.
@@ -1562,7 +1589,7 @@ mod tests {
         let entry = fees.remove(&stub_twin.hash()).expect("the twin was bucketed");
         fees.insert(covered_tx.hash(), entry);
         l1.set_unsealed_fees(fees);
-        let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), register], &key(1));
+        let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), receiver_reg, register], &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
 
         let r = [9u32; 8];
@@ -1618,7 +1645,8 @@ mod tests {
         assert_eq!(b1["sealed"], false, "block 1's covered bundle is the only one sealed yet");
         let txs = b1["transactions"].as_array().unwrap();
         assert_eq!(txs[0]["sealed_by"], aggregate.hash().to_hex(), "the covered bundle names its aggregate");
-        assert_eq!(txs[1]["sealed_by"], Value::Null, "the register's bundle is uncovered");
+        assert_eq!(txs[1]["sealed_by"], Value::Null, "the receiver registration's bundle is uncovered");
+        assert_eq!(txs[2]["sealed_by"], Value::Null, "the aggregator registration's bundle is uncovered");
         let b2 = ok(&st, "rand_getBlockByHeight", json!([2])).await;
         assert_eq!(b2["transactions"].as_array().unwrap()[0]["action"]["kind"], "aggregate");
 
@@ -1650,7 +1678,7 @@ mod tests {
         assert!(bundles.iter().all(|b| b["hash"] != covered_tx.hash().to_hex()), "a sealed bundle is not work");
         assert!(bundles.iter().all(|b| b["hash"] != aggregate.hash().to_hex()), "an aggregate is not a bundle");
         // But before the seal it was exactly the work an aggregator wanted: hash, height, excess.
-        let register_tx = &st.storage.block_by_height(1).unwrap().unwrap().transactions[1];
+        let register_tx = &st.storage.block_by_height(1).unwrap().unwrap().transactions[2];
         assert!(
             bundles.iter().any(|b| b["hash"] == register_tx.hash().to_hex() && b["height"] == 1 && b["excess"] == "0"),
             "the register's bundle (no excess) is still coverable: {v}"
@@ -1682,7 +1710,7 @@ mod tests {
         use randprotocol_core::types::actions::{AggregatorRegistration, SignedAggregateHeader};
         let kp = key(7);
         let addr = kp.public_key().address();
-        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; 32] };
+        let payout = randprotocol_core::receiver::ReceiverId([7; 32]);
         let sig = randprotocol_core::Signature::empty();
         let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
         let tx = |action| Transaction {
@@ -1690,7 +1718,7 @@ mod tests {
             bundle: None,
             action,
         };
-        let registration = AggregatorRegistration { public_key: kp.public_key().clone(), payout: payout.clone(), signature: sig.clone() };
+        let registration = AggregatorRegistration { public_key: kp.public_key().clone(), payout, signature: sig.clone() };
         let header = |covers: Vec<Hash>| SignedAggregateHeader {
             aggregator: addr,
             nonce: 3,
@@ -2035,7 +2063,7 @@ mod tests {
     async fn validators_report_the_whole_register_and_who_is_active() {
         let (_d, st, _gs) = chain();
         let newcomer = key(9);
-        let payout = ShieldedAddress { pk: [3; 8], kem_ek: vec![4; randprotocol_core::notes::KEM_EK_BYTES] };
+        let payout = randprotocol_core::receiver::ReceiverId([3; 32]);
         st.storage
             .overwrite_validator_for_testing(
                 &newcomer.address(),
@@ -2044,7 +2072,7 @@ mod tests {
                     stake: 700,
                     pending: vec![(4, 250)],
                     rewards: 11,
-                    payout: payout.clone(),
+                    payout,
                     nonce: 3,
                 },
             )
@@ -2134,19 +2162,41 @@ mod tests {
         // Block 1: a registration, whose bundle burns exactly the bond.
         let mut ledger = gs.ledger.clone();
         let kp = key(7);
-        let payout = randprotocol_core::notes::ShieldedAddress {
-            pk: [7; 8],
-            kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES],
+        // The registry, not the register, owns the note key (short-shielded-address task 4): the
+        // aggregator's payout id has to resolve before `RegisterAggregator` will.
+        let anchor = ledger.root();
+        let payout_kp = randprotocol_core::receiver::receiver_signing_keypair(&[7; 32]);
+        let record = randprotocol_core::receiver::ReceiverRecord::sign(
+            &payout_kp,
+            1,
+            1,
+            [7; 8],
+            vec![8; randprotocol_core::notes::KEM_EK_BYTES],
+        );
+        let payout = record.id();
+        let mut rb = randprotocol_core::notes::Bundle {
+            anchor,
+            nullifiers: [nf(90), nf(91)],
+            commitments: [cm(90), cm(91)],
+            fee: bundle_fee(),
+            burn: 0,
+            asset: 0,
+            time: 1,
+            envelopes: [fixtures::env(5), fixtures::env(6)],
+            proof: vec![],
         };
+        let rd = StubExecutor.bundle_digest(&rb.digest_input());
+        rb.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &rd);
+        let receiver_reg = Transaction::shielded(1, rb, randprotocol_core::types::Action::RegisterReceiver { record });
         let registration = randprotocol_core::types::actions::AggregatorRegistration {
             public_key: kp.public_key().clone(),
-            payout: payout.clone(),
+            payout,
             signature: kp.sign(
                 randprotocol_core::types::actions::aggregator_register_message(1, &payout).as_bytes(),
             ),
         };
         let mut b = randprotocol_core::notes::Bundle {
-            anchor: ledger.root(),
+            anchor,
             nullifiers: [nf(1), nf(2)],
             commitments: [cm(1), cm(2)],
             fee: bundle_fee(),
@@ -2159,7 +2209,7 @@ mod tests {
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d);
         let register = Transaction::shielded(1, b, randprotocol_core::types::Action::RegisterAggregator { registration });
-        let b1 = make_block(&gs.block, &mut ledger, vec![register], &key(1));
+        let b1 = make_block(&gs.block, &mut ledger, vec![receiver_reg, register], &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
         let v = ok(&st, "rand_getSupply", json!([])).await;

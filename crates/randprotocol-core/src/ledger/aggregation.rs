@@ -8,7 +8,8 @@
 //! with a named error rather than applied.
 
 use crate::crypto::{merkle_root, Address, Hash, PublicKey};
-use crate::notes::{word8_to_bytes, ShieldedAddress, Word8};
+use crate::notes::Word8;
+use crate::receiver::ReceiverId;
 use crate::types::DeclaredShape;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -52,24 +53,25 @@ pub struct AdmittedShape {
 pub struct AggregatorEntry {
     pub public_key: PublicKey,
     pub bond: u64,
-    pub payout: ShieldedAddress,
+    pub payout: ReceiverId,
     pub nonce: u64,
     pub unbonding: Option<u64>,
 }
 
-/// The register's leaf (spec §2.1): `blake3("rand-aggregator-leaf-1", addr ‖ bond ‖ nonce ‖
-/// presence+release ‖ payout pk ‖ payout kem_ek)`. The unbonding option is a presence byte plus
-/// the height, so `None` and `Some(0)` can never collide.
+/// The register's leaf (spec §2.1): `blake3("rand-aggregator-leaf-2", addr ‖ bond ‖ nonce ‖
+/// presence+release ‖ payout id)`. The unbonding option is a presence byte plus the height, so
+/// `None` and `Some(0)` can never collide. v2 (the short-address registry, spec §6): the payout
+/// is the 32-byte receiver id in place of the pk and KEM key it used to carry directly — the
+/// note key now resolves through the registry.
 pub fn aggregator_leaf(addr: &Address, entry: &AggregatorEntry) -> Hash {
-    let mut buf = Vec::with_capacity(32 + 8 + 8 + 1 + 8 + 8 + entry.payout.kem_ek.len());
+    let mut buf = Vec::with_capacity(32 + 8 + 8 + 1 + 8 + 32);
     buf.extend_from_slice(addr.as_bytes());
     buf.extend_from_slice(&entry.bond.to_be_bytes());
     buf.extend_from_slice(&entry.nonce.to_be_bytes());
     buf.push(entry.unbonding.is_some() as u8);
     buf.extend_from_slice(&entry.unbonding.unwrap_or(0).to_be_bytes());
-    buf.extend_from_slice(&word8_to_bytes(&entry.payout.pk));
-    buf.extend_from_slice(&entry.payout.kem_ek);
-    Hash::digest_domain(b"rand-aggregator-leaf-1", &buf)
+    buf.extend_from_slice(&entry.payout.0);
+    Hash::digest_domain(b"rand-aggregator-leaf-2", &buf)
 }
 
 /// The register's component of the state root: the merkle root of every entry's leaf, empty at
@@ -103,6 +105,8 @@ pub enum AggregationError {
     AlreadyRegistered(Address),
     #[error("the registration is for another aggregator or its payout is not an address")]
     BadRegistration,
+    #[error("receiver {0} is not in the registry")]
+    UnknownReceiver(ReceiverId),
     #[error("bad aggregator signature")]
     BadSignature,
     #[error("wrong nonce: expected {expected}, got {actual}")]
@@ -336,7 +340,7 @@ impl Ledger {
         cfg: &AggregationConfig,
         time: u32,
         r: &Word8,
-        payout: &ShieldedAddress,
+        payout_pk: &Word8,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Payment, TxError> {
         let subsidy = gas::subsidy(self.supply.sealed_blocks, cfg);
@@ -347,13 +351,14 @@ impl Ledger {
             acc.checked_add(e).ok_or(TxError::Overflow)
         })?;
         let total = subsidy.checked_add(proving_shares).ok_or(TxError::Overflow)?;
-        let note = executor.note_commitment(&payout.pk, &[0; 8], total, 0, time, r);
+        let note = executor.note_commitment(payout_pk, &[0; 8], total, 0, time, r);
         Ok(Payment { subsidy, proving_shares, total, note })
     }
 }
 
 /// The aggregate's payout note (spec §5.4), derived for admission and the mempool's claim:
-/// the entry's payout address looked up, then [`Ledger::aggregate_payment`]'s note.
+/// the entry's payout id resolved against the registry, then [`Ledger::aggregate_payment`]'s
+/// note.
 pub(crate) fn payout_note(
     ledger: &Ledger,
     aggregator: &Address,
@@ -367,7 +372,10 @@ pub(crate) fn payout_note(
         .aggregators()
         .get(aggregator)
         .ok_or(TxError::Aggregation(AggregationError::UnknownAggregator(*aggregator)))?;
-    Ok(ledger.aggregate_payment(covers, cfg, time, r, &e.payout, executor)?.note)
+    let pk = ledger
+        .resolve_pk(&e.payout)
+        .ok_or(TxError::Aggregation(AggregationError::UnknownReceiver(e.payout)))?;
+    Ok(ledger.aggregate_payment(covers, cfg, time, r, &pk, executor)?.note)
 }
 
 /// Spec §4's nine steps, in order, cheap before expensive (`validate_inner`'s discipline,
@@ -565,8 +573,11 @@ impl Ledger {
         let (covers, aggregator, time, r, envelope) = (covers.clone(), *aggregator, *time, *r, envelope.clone());
         let validated = self.validate_aggregate(tx, covered, executor)?;
         let cfg = self.aggregation().expect("validated above").clone();
-        let payout = self.aggregators().get(&aggregator).expect("validated above").payout.clone();
-        let payment = self.aggregate_payment(&covers, &cfg, time, &r, &payout, executor)?;
+        let payout = self.aggregators().get(&aggregator).expect("validated above").payout;
+        let payout_pk = self
+            .resolve_pk(&payout)
+            .ok_or(TxError::Aggregation(AggregationError::UnknownReceiver(payout)))?;
+        let payment = self.aggregate_payment(&covers, &cfg, time, &r, &payout_pk, executor)?;
         debug_assert_eq!(
             payment.note, validated.payout_cm,
             "admission and apply derive one note from one state"
@@ -682,8 +693,8 @@ fn check_register(
     if ledger.aggregators().contains_key(&aggregator) {
         return Err(AggregationError::AlreadyRegistered(aggregator));
     }
-    if registration.payout.kem_ek.len() != crate::notes::KEM_EK_BYTES {
-        return Err(AggregationError::BadRegistration);
+    if ledger.resolve_record(&registration.payout).is_none() {
+        return Err(AggregationError::UnknownReceiver(registration.payout));
     }
     if !registration
         .public_key
@@ -792,7 +803,10 @@ pub(crate) fn withdraw_note(
         .aggregators()
         .get(aggregator)
         .ok_or(TxError::Aggregation(AggregationError::UnknownAggregator(*aggregator)))?;
-    Ok(executor.note_commitment(&e.payout.pk, &[0; 8], note_amount(e.bond)?, 0, time, r))
+    let pk = ledger
+        .resolve_pk(&e.payout)
+        .ok_or(TxError::Aggregation(AggregationError::UnknownReceiver(e.payout)))?;
+    Ok(executor.note_commitment(&pk, &[0; 8], note_amount(e.bond)?, 0, time, r))
 }
 
 /// What an aggregator withdraw's note is worth: the bond, less the bundle base it pays the
@@ -825,7 +839,7 @@ mod tests {
                 stake,
                 pending: Vec::new(),
                 rewards: 0,
-                payout: crate::notes::ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+                payout: crate::receiver::ReceiverId([1; 32]),
                 nonce: 0,
             },
         )
@@ -879,9 +893,8 @@ mod tests {
                     buf.extend_from_slice(&release_epoch.to_be_bytes());
                     buf.extend_from_slice(&amount.to_be_bytes());
                 }
-                buf.extend_from_slice(&word8_to_bytes(&v.payout.pk));
-                buf.extend_from_slice(&v.payout.kem_ek);
-                Hash::digest_domain(b"rand-validator-leaf-2", &buf)
+                buf.extend_from_slice(&v.payout.0);
+                Hash::digest_domain(b"rand-validator-leaf-3", &buf)
             })
             .collect();
         let prog_leaves: Vec<Hash> = l
@@ -923,14 +936,14 @@ mod tests {
     }
 
     /// The register's leaf: every field of the entry is in the hash, in the documented order —
-    /// addr ‖ bond ‖ nonce ‖ presence+release ‖ payout pk ‖ payout kem_ek.
+    /// addr ‖ bond ‖ nonce ‖ presence+release ‖ payout id.
     #[test]
     fn the_aggregator_leaf_hashes_every_field() {
-        let payout = crate::notes::ShieldedAddress { pk: [7; 8], kem_ek: vec![8; 32] };
+        let payout = crate::receiver::ReceiverId([7; 32]);
         let entry = AggregatorEntry {
             public_key: Keypair::from_seed([1; 32]).unwrap().public_key().clone(),
             bond: 42,
-            payout: payout.clone(),
+            payout,
             nonce: 3,
             unbonding: Some(999),
         };
@@ -940,9 +953,8 @@ mod tests {
         buf.extend_from_slice(&3u64.to_be_bytes());
         buf.push(1u8);
         buf.extend_from_slice(&999u64.to_be_bytes());
-        buf.extend_from_slice(&crate::notes::word8_to_bytes(&payout.pk));
-        buf.extend_from_slice(&payout.kem_ek);
-        assert_eq!(aggregator_leaf(&entry.public_key.address(), &entry), Hash::digest_domain(b"rand-aggregator-leaf-1", &buf));
+        buf.extend_from_slice(&payout.0);
+        assert_eq!(aggregator_leaf(&entry.public_key.address(), &entry), Hash::digest_domain(b"rand-aggregator-leaf-2", &buf));
         // A second entry with `unbonding: None` must not collide with `Some(0)`.
         let none_entry = AggregatorEntry { unbonding: None, ..entry.clone() };
         let zero_entry = AggregatorEntry { unbonding: Some(0), ..entry.clone() };
@@ -958,7 +970,7 @@ mod tests {
     fn the_five_actions_roundtrip_and_their_bundle_shape() {
         let kp = Keypair::from_seed([2; 32]).unwrap();
         let sig = kp.sign(b"test");
-        let payout = crate::notes::ShieldedAddress { pk: [5; 8], kem_ek: vec![6; 32] };
+        let payout = crate::receiver::ReceiverId([5; 32]);
         let registration = AggregatorRegistration {
             public_key: kp.public_key().clone(),
             payout,
@@ -1036,15 +1048,18 @@ mod tests {
     /// a fleet.
     fn genesis() -> crate::genesis::Genesis {
         let k = Keypair::from_seed([9; 32]).unwrap();
+        let signing = crate::receiver::receiver_signing_keypair(&[4; 32]);
+        let rec = crate::receiver::ReceiverRecord::sign(&signing, 42, 1, [4; 8], vec![5; crate::notes::KEM_EK_BYTES]);
         crate::genesis::Genesis {
             chain_id: 42,
             timestamp_ms: 1_700_000_000_000,
             validators: vec![crate::genesis::GenesisValidator {
                 public_key: k.public_key().clone(),
                 stake: crate::ledger::staking::MIN_STAKE as u128,
-                payout: crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![5; crate::notes::KEM_EK_BYTES] }.to_string(),
+                payout: rec.id().to_string(),
             }],
             alloc: vec![],
+            receivers: vec![crate::genesis::ReceiverRecordHex::from_record(&rec)],
             faucet: false,
             confidential: true,
             fri_profile: "production".into(),
@@ -1124,7 +1139,8 @@ mod register_tests {
     use crate::gas;
     use crate::ledger::staking::ValidatorEntry;
     use crate::ledger::Ledger;
-    use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8};
+    use crate::notes::{Bundle, Envelope, Word8};
+    use crate::receiver::ReceiverId;
     use crate::types::actions::{
         aggregator_register_message, aggregator_unbond_message, aggregator_withdraw_message,
         aggregate_signing_hash, AggregatorRegistration,
@@ -1146,16 +1162,23 @@ mod register_tests {
                 stake,
                 pending: Vec::new(),
                 rewards: 0,
-                payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+                payout: ReceiverId([1; 32]),
                 nonce: 0,
             },
         )
+    }
+
+    /// `gated()`'s ledger registers this id (seed 7) so an aggregator registration naming it
+    /// resolves.
+    fn payout_addr() -> ReceiverId {
+        crate::ledger::test_fixtures::receiver_id(7)
     }
 
     fn gated() -> Ledger {
         let (a, b) = keys();
         let register: BTreeMap<Address, ValidatorEntry> = [entry(&a, 10), entry(&b, 10)].into_iter().collect();
         let mut l = Ledger::new(7, HC, register, &StubExecutor);
+        crate::ledger::test_fixtures::registered_receiver(&mut l, 7, [7; 8]);
         l.set_faucet(true);
         l.set_confidential(true);
         l.set_height(1);
@@ -1195,15 +1218,15 @@ mod register_tests {
         b
     }
 
-    fn registration(kp: &Keypair, payout: &ShieldedAddress) -> AggregatorRegistration {
+    fn registration(kp: &Keypair, payout: &ReceiverId) -> AggregatorRegistration {
         AggregatorRegistration {
             public_key: kp.public_key().clone(),
-            payout: payout.clone(),
+            payout: *payout,
             signature: kp.sign(aggregator_register_message(7, payout).as_bytes()),
         }
     }
 
-    fn register_tx(l: &Ledger, kp: &Keypair, payout: &ShieldedAddress, burn: u64) -> Transaction {
+    fn register_tx(l: &Ledger, kp: &Keypair, payout: &ReceiverId, burn: u64) -> Transaction {
         Transaction::shielded(
             7,
             bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, burn),
@@ -1245,10 +1268,6 @@ mod register_tests {
         let aggregator = kp.public_key().address();
         let signature = kp.sign(aggregate_signing_hash(7, nonce, 9, &[1; 8], &covers, &proof_hash).as_bytes());
         Box::new(SignedAggregateHeader { aggregator, nonce, time: 9, r: [1; 8], covers, proof_hash, signature })
-    }
-
-    fn payout_addr() -> ShieldedAddress {
-        ShieldedAddress { pk: [7; 8], kem_ek: vec![8; crate::notes::KEM_EK_BYTES] }
     }
 
     fn proposer(l: &Ledger) -> Address {
@@ -1450,7 +1469,8 @@ mod admission_tests {
     use crate::gas;
     use crate::ledger::staking::ValidatorEntry;
     use crate::ledger::{Ledger, TxError};
-    use crate::notes::{word8_from_bytes, Bundle, Envelope, ShieldedAddress, Word8};
+    use crate::notes::{word8_from_bytes, Bundle, Envelope, Word8};
+    use crate::receiver::ReceiverId;
     use crate::types::actions::{aggregator_register_message, aggregate_signing_hash, AggregatorRegistration};
     use crate::types::{pv, Action, CoveredBundle, DeclaredShape, FriProfile, Transaction};
     use std::collections::BTreeMap;
@@ -1469,7 +1489,7 @@ mod admission_tests {
                 stake,
                 pending: Vec::new(),
                 rewards: 0,
-                payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+                payout: ReceiverId([1; 32]),
                 nonce: 0,
             },
         )
@@ -1536,20 +1556,22 @@ mod admission_tests {
         b
     }
 
-    fn payout_addr() -> ShieldedAddress {
-        ShieldedAddress { pk: [7; 8], kem_ek: vec![8; crate::notes::KEM_EK_BYTES] }
+    /// The note key `register()` registers its aggregator's payout id to.
+    fn payout_pk() -> Word8 {
+        [7; 8]
     }
 
     fn proposer(l: &Ledger) -> Address {
         *l.validators().keys().next().unwrap()
     }
 
-    /// Register `kp` as an aggregator (nonce 0), through the ordinary apply path.
+    /// Register `kp` as an aggregator (nonce 0), through the ordinary apply path — first
+    /// registering its payout id on `l`'s registry, so `check_register` resolves it.
     fn register(l: &mut Ledger, kp: &Keypair) {
-        let payout = payout_addr();
+        let payout = crate::ledger::test_fixtures::registered_receiver(l, 7, payout_pk());
         let registration = AggregatorRegistration {
             public_key: kp.public_key().clone(),
-            payout: payout.clone(),
+            payout,
             signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
         };
         let tx = Transaction::shielded(
@@ -1627,7 +1649,7 @@ mod admission_tests {
         let v = l.validate_aggregate(&tx, &covered, &StubExecutor).expect("a well-formed aggregate validates");
         // The payout note: subsidy(0) = subsidy_base at a chain that has sealed nothing, to the
         // entry's payout address, stamped with the action's own time and blinding (spec §5.4).
-        let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], cfg().subsidy_base, 0, 100, &[9; 8]);
+        let want_cm = StubExecutor.note_commitment(&payout_pk(), &[0; 8], cfg().subsidy_base, 0, 100, &[9; 8]);
         assert_eq!(v.payout_cm, want_cm);
         assert_eq!(
             l.derived_commitment(&tx.action, &StubExecutor),
@@ -1891,7 +1913,8 @@ mod payment_tests {
     use crate::ledger::staking::ValidatorEntry;
     use crate::ledger::{Ledger, TxError};
     use crate::types::{Block, BlockHeader, QuorumCertificate};
-    use crate::notes::{word8_from_bytes, Bundle, Envelope, ShieldedAddress, Word8};
+    use crate::notes::{word8_from_bytes, Bundle, Envelope, Word8};
+    use crate::receiver::ReceiverId;
     use crate::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
     use crate::types::{pv, Action, CoveredBundle, DeclaredShape, FriProfile, Transaction};
     use std::collections::BTreeMap;
@@ -1910,7 +1933,7 @@ mod payment_tests {
                 stake,
                 pending: Vec::new(),
                 rewards: 0,
-                payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+                payout: ReceiverId([1; 32]),
                 nonce: 0,
             },
         )
@@ -1956,8 +1979,9 @@ mod payment_tests {
         Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] }
     }
 
-    fn payout_addr() -> ShieldedAddress {
-        ShieldedAddress { pk: [7; 8], kem_ek: vec![8; crate::notes::KEM_EK_BYTES] }
+    /// The note key `register()` registers its aggregator's payout id to.
+    fn payout_pk() -> Word8 {
+        [7; 8]
     }
 
     fn proposer(l: &Ledger) -> Address {
@@ -1983,10 +2007,10 @@ mod payment_tests {
     }
 
     fn register(l: &mut Ledger, kp: &Keypair, tag: u32) {
-        let payout = payout_addr();
+        let payout = crate::ledger::test_fixtures::registered_receiver(l, 7, payout_pk());
         let registration = AggregatorRegistration {
             public_key: kp.public_key().clone(),
-            payout: payout.clone(),
+            payout,
             signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
         };
         let tx = Transaction::shielded(
@@ -2109,7 +2133,7 @@ mod payment_tests {
         let covered = covered_records(&[1]);
         let v = l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap();
         let subsidy = gas::subsidy(0, &cfg_with_window(256));
-        let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy + 60, 0, 1, &[9; 8]);
+        let want_cm = StubExecutor.note_commitment(&payout_pk(), &[0; 8], subsidy + 60, 0, 1, &[9; 8]);
         assert_eq!(v.payout_cm, want_cm, "the T4 derivation, now with the real amount (spec §5.4)");
         l.apply_aggregate(&tx, &covered, &StubExecutor).unwrap();
         assert!(l.has_commitment(&want_cm), "the payout note is in the tree");
@@ -2293,7 +2317,7 @@ mod payment_tests {
         assert_eq!(l.supply().sealed_blocks, 1);
         assert!(!l.unsealed_fees().contains_key(&covered_tx.hash()), "the covered excess was paid out");
         let subsidy = gas::subsidy(0, &cfg_with_window(256));
-        let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy + 60, 0, 1, &[9; 8]);
+        let want_cm = StubExecutor.note_commitment(&payout_pk(), &[0; 8], subsidy + 60, 0, 1, &[9; 8]);
         assert!(l.has_commitment(&want_cm), "the payout note is in the tree");
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
     }
@@ -2410,7 +2434,7 @@ mod payment_tests {
         l.apply_block_with_covered(&signed_block_with_covered(&l, vec![tx], &a, 2, &sidecar), &sidecar, &StubExecutor)
             .unwrap();
         let subsidy = gas::subsidy(0, &cfg_with_window(256));
-        let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy, 0, 1, &[9; 8]);
+        let want_cm = StubExecutor.note_commitment(&payout_pk(), &[0; 8], subsidy, 0, 1, &[9; 8]);
         assert!(l.has_commitment(&want_cm), "the payout note is the subsidy alone");
         assert!(!l.unsealed_fees().contains_key(&floor.hash()), "covered: never coverable again");
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());

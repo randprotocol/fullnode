@@ -57,20 +57,26 @@ fn genesis(key: &Keypair) -> Genesis {
 
 /// `genesis`, with an `aggregation` section when the test is about one.
 fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core::ledger::aggregation::AggregationConfig>) -> Genesis {
+    // Nothing here withdraws; the receiver record only has to resolve (short-shielded-address
+    // task 4: the validator payout is a receiver id, registered in `receivers` below).
+    let payout_kp = randprotocol_core::receiver::receiver_signing_keypair(&[1; 32]);
+    let record = randprotocol_core::receiver::ReceiverRecord::sign(
+        &payout_kp,
+        7,
+        1,
+        [1; 8],
+        vec![1; randprotocol_core::notes::KEM_EK_BYTES],
+    );
     Genesis {
         chain_id: 7,
         timestamp_ms: 0,
         validators: vec![GenesisValidator {
             public_key: key.public_key().clone(),
             stake: MIN_STAKE as u128,
-            // Nothing here withdraws; this only has to parse.
-            payout: randprotocol_core::notes::ShieldedAddress {
-                pk: [1; 8],
-                kem_ek: vec![1; randprotocol_core::notes::KEM_EK_BYTES],
-            }
-            .to_string(),
+            payout: record.id().to_string(),
         }],
         alloc: vec![],
+        receivers: vec![randprotocol_core::genesis::ReceiverRecordHex::from_record(&record)],
         faucet: true,
         confidential: true,
         fri_profile: "test".into(),

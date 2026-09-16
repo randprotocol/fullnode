@@ -1296,7 +1296,7 @@ impl Ledger {
             .validators
             .iter()
             .map(|(addr, v)| {
-                let mut buf = Vec::with_capacity(96 + 16 * v.pending.len() + v.payout.kem_ek.len());
+                let mut buf = Vec::with_capacity(96 + 16 * v.pending.len() + 32);
                 buf.extend_from_slice(addr.as_bytes());
                 buf.extend_from_slice(&v.stake.to_be_bytes());
                 buf.extend_from_slice(&v.rewards.to_be_bytes());
@@ -1310,9 +1310,11 @@ impl Ledger {
                     buf.extend_from_slice(&release_epoch.to_be_bytes());
                     buf.extend_from_slice(&amount.to_be_bytes());
                 }
-                buf.extend_from_slice(&word8_to_bytes(&v.payout.pk));
-                buf.extend_from_slice(&v.payout.kem_ek);
-                Hash::digest_domain(b"rand-validator-leaf-2", &buf)
+                // v3 (the short-address registry, spec §6): the 32-byte receiver id in place of
+                // the payout's pk and KEM key — the note key itself now resolves through the
+                // registry, so the register no longer carries it.
+                buf.extend_from_slice(&v.payout.0);
+                Hash::digest_domain(b"rand-validator-leaf-3", &buf)
             })
             .collect();
         let prog_leaves: Vec<Hash> =
@@ -1368,7 +1370,8 @@ pub(crate) mod test_fixtures {
     use super::*;
     use crate::confidential::StubExecutor;
     use crate::crypto::Keypair;
-    use crate::notes::ShieldedAddress;
+    use crate::notes::KEM_EK_BYTES;
+    use crate::receiver::{receiver_signing_keypair, ReceiverId, ReceiverRecord};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     pub(crate) const HC: Word8 = [11; 8];
@@ -1381,7 +1384,28 @@ pub(crate) mod test_fixtures {
         (Keypair::from_seed([1; 32]).unwrap(), Keypair::from_seed([2; 32]).unwrap())
     }
 
-    /// A register entry for `k`: the S1 fixture's stake, with the S2 fields at their defaults.
+    /// The receiver id `receiver_signing_keypair(&[seed; 32])`'s public key resolves to — pure,
+    /// so a `ValidatorEntry`/`AggregatorEntry` payout can name it before any ledger exists.
+    /// [`registered_receiver`] later signs and registers the matching record so the id actually
+    /// resolves once a ledger is built.
+    pub(crate) fn receiver_id(seed: u8) -> ReceiverId {
+        ReceiverId::from(receiver_signing_keypair(&[seed; 32]).public_key())
+    }
+
+    /// Signs a receiver record from `seed` (`receiver_signing_keypair(&[seed; 32])`) naming
+    /// `pk` as its note key, registers it on `l`, and returns its id — the id [`receiver_id`]
+    /// computes for the same `seed`. Shared by every fixture (`ledger/mod.rs`, `staking.rs`,
+    /// `aggregation.rs`, `genesis.rs`) that needs a payout the ledger can actually resolve.
+    pub(crate) fn registered_receiver(l: &mut Ledger, seed: u8, pk: Word8) -> ReceiverId {
+        let kp = receiver_signing_keypair(&[seed; 32]);
+        let rec = ReceiverRecord::sign(&kp, l.chain_id(), 1, pk, vec![seed; KEM_EK_BYTES]);
+        let id = rec.id();
+        l.apply_register_receiver(&rec);
+        id
+    }
+
+    /// A register entry for `k`: the S1 fixture's stake, with the S2 fields at their defaults —
+    /// paid to receiver seed 1, which [`ledger_with_validators`] registers.
     pub(crate) fn entry(k: &Keypair, stake: u64) -> (Address, ValidatorEntry) {
         (
             k.address(),
@@ -1390,7 +1414,7 @@ pub(crate) mod test_fixtures {
                 stake,
                 pending: Vec::new(),
                 rewards: 0,
-                payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+                payout: receiver_id(1),
                 nonce: 0,
             },
         )
@@ -1975,18 +1999,18 @@ mod tests {
         assert_eq!(rebuilt, l);
     }
 
-    /// The register is state: every field of the v2 validator leaf — including the two S2
+    /// The register is state: every field of the v3 validator leaf — including the two S2
     /// additions, `pending` and `payout` — moves the state root, so two chains that disagree
     /// about a validator's unbonding queue or where its rewards go cannot both be valid.
     #[test]
-    fn validator_leaf_v2_changes_the_root_when_pending_or_payout_change() {
+    fn validator_leaf_v3_changes_the_root_when_pending_or_payout_change() {
         let k = Keypair::from_seed([1; 32]).unwrap();
         let base = ValidatorEntry {
             public_key: k.public_key().clone(),
             stake: 1_000,
             pending: Vec::new(),
             rewards: 0,
-            payout: crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+            payout: crate::receiver::ReceiverId([4; 32]),
             nonce: 0,
         };
         let root_of = |e: &ValidatorEntry| {
@@ -2004,14 +2028,7 @@ mod tests {
             ValidatorEntry { pending: vec![(4, 10)], ..base.clone() },
             ValidatorEntry { pending: vec![(3, 11)], ..base.clone() },
             ValidatorEntry { pending: vec![(3, 10), (4, 10)], ..base.clone() },
-            ValidatorEntry {
-                payout: crate::notes::ShieldedAddress { pk: [5; 8], kem_ek: vec![6; 32] },
-                ..base.clone()
-            },
-            ValidatorEntry {
-                payout: crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![7; 32] },
-                ..base.clone()
-            },
+            ValidatorEntry { payout: crate::receiver::ReceiverId([5; 32]), ..base.clone() },
         ] {
             let r = root_of(&changed);
             assert!(!roots.contains(&r), "a v2 leaf field does not reach the state root: {changed:?}");

@@ -325,7 +325,7 @@ mod tests {
             stake: 10,
             pending: Vec::new(),
             rewards: 0,
-            payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+            payout: crate::receiver::ReceiverId([1; 32]),
             nonce: 0,
         };
         let mut l = Ledger::new(7, HC, [(k.address(), entry)].into_iter().collect(), &StubExecutor);

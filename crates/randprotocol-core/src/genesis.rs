@@ -5,7 +5,8 @@ use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, PublicKey, Signature};
 use crate::ledger::staking::MIN_STAKE;
 use crate::ledger::{Ledger, ValidatorEntry};
-use crate::notes::{word8_from_hex, word8_to_bytes, Envelope, ShieldedAddress, Word8};
+use crate::notes::{word8_from_hex, word8_to_bytes, word8_to_hex, Envelope, Word8};
+use crate::receiver::{ReceiverId, ReceiverRecord};
 use crate::types::{Block, BlockHeader, QuorumCertificate, ValidatorSet};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -17,10 +18,47 @@ pub struct GenesisValidator {
     /// The register narrows this to a `u64` (spec §8), so a stake above `u64::MAX` is refused
     /// rather than silently truncated. The field itself stays `u128` to match `ValidatorSet`.
     pub stake: u128,
-    /// Phase S2: the shielded address (`rand1…`) this validator's rewards and unbonded stake
-    /// are paid to. Required, and part of the genesis binding: it is register state, so two
-    /// nodes that disagree about it compute different state roots from the first block on.
+    /// The short receiver id (`rand1…`, spec docs §5) this validator's rewards and unbonded
+    /// stake are paid to. Required, and part of the genesis binding: it is register state, so
+    /// two nodes that disagree about it compute different state roots from the first block on.
+    /// Must resolve against `Genesis::receivers` — an id with no record is `UnknownReceiver`.
     pub payout: String,
+}
+
+/// A [`ReceiverRecord`] as genesis-file JSON: every binary field hex text, so the file stays
+/// readable (`EnvelopeHex`'s pattern, one type over). `Genesis::receivers` registers these
+/// first, before any validator payout is resolved against the registry (spec §6).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiverRecordHex {
+    pub version: u32,
+    pub pk: String,
+    pub kem_ek: String,
+    /// Hex-encoded Dilithium2 public key — the record's signing key, whose address is its id.
+    pub signing_key: String,
+    pub signature: String,
+}
+
+impl ReceiverRecordHex {
+    pub fn from_record(r: &ReceiverRecord) -> ReceiverRecordHex {
+        ReceiverRecordHex {
+            version: r.version,
+            pk: word8_to_hex(&r.pk),
+            kem_ek: hex::encode(&r.kem_ek),
+            signing_key: r.signing_key.to_hex(),
+            signature: hex::encode(r.signature.as_bytes()),
+        }
+    }
+
+    pub fn to_record(&self) -> Result<ReceiverRecord, GenesisError> {
+        let bad = |m: String| GenesisError::BadReceiver(m);
+        let pk = word8_from_hex(&self.pk).ok_or_else(|| bad(format!("bad pk hex {}", self.pk)))?;
+        let kem_ek = hex::decode(&self.kem_ek).map_err(|_| bad(format!("bad kem_ek hex {}", self.kem_ek)))?;
+        let signing_key =
+            PublicKey::from_hex(&self.signing_key).map_err(|e| bad(format!("bad signing_key: {e}")))?;
+        let sig_bytes = hex::decode(&self.signature).map_err(|_| bad(format!("bad signature hex {}", self.signature)))?;
+        let signature = Signature::from_bytes(&sig_bytes).map_err(|e| bad(format!("bad signature: {e}")))?;
+        Ok(ReceiverRecord { version: self.version, pk, kem_ek, signing_key, signature })
+    }
 }
 
 /// The four envelope parts as hex text, so a genesis file stays readable JSON.
@@ -72,6 +110,11 @@ pub struct Genesis {
     /// The deposit notes the chain starts with.
     #[serde(default)]
     pub alloc: Vec<GenesisNote>,
+    /// The receiver registry's starting rows (spec §6): registered before any validator payout
+    /// or alloc owner is resolved against it, so every id below has to name one of these.
+    /// Absent on a genesis file with no receivers yet — an empty registry, not an error.
+    #[serde(default)]
+    pub receivers: Vec<ReceiverRecordHex>,
     /// Testnet only: allow `Mint` transactions (up to 100 RAND each). Part of the genesis hash.
     #[serde(default)]
     pub faucet: bool,
@@ -140,6 +183,10 @@ pub enum GenesisError {
     StakeTooLarge(Address),
     #[error("bad payout address {0}")]
     BadPayout(String),
+    #[error("unknown receiver {0}")]
+    UnknownReceiver(String),
+    #[error("bad receiver record: {0}")]
+    BadReceiver(String),
     #[error("duplicate validator {0}")]
     DuplicateValidator(Address),
     #[error("json: {0}")]
@@ -213,6 +260,18 @@ impl Genesis {
         if self.epoch_blocks == 0 || self.epoch_blocks > MAX_EPOCH_BLOCKS {
             return Err(GenesisError::BadEpochBlocks(self.epoch_blocks));
         }
+        // The receiver registry (spec §6): registered first, so every payout below resolves
+        // against it exactly as `RegisterReceiver` would on chain. `to_record` decodes the hex
+        // form; `verify` checks the signature and that the record names the id it is filed
+        // under.
+        let mut receivers: BTreeMap<ReceiverId, ReceiverRecord> = BTreeMap::new();
+        for r in &self.receivers {
+            let rec = r.to_record()?;
+            let id = rec.id();
+            rec.verify(&id, self.chain_id).map_err(|e| GenesisError::BadReceiver(e.to_string()))?;
+            receivers.insert(id, rec);
+        }
+
         // The register (spec §8) is what genesis actually seeds; the validator set for epoch 0
         // is derived from it at the `ValidatorSet` boundary, where the stake widens again.
         let mut register: BTreeMap<Address, ValidatorEntry> = BTreeMap::new();
@@ -229,8 +288,10 @@ impl Genesis {
             if stake < MIN_STAKE {
                 return Err(GenesisError::BelowMinStake { addr, stake: v.stake, min: MIN_STAKE });
             }
-            let payout =
-                ShieldedAddress::parse(&v.payout).map_err(|_| GenesisError::BadPayout(v.payout.clone()))?;
+            let payout = ReceiverId::parse(&v.payout).map_err(|_| GenesisError::BadPayout(v.payout.clone()))?;
+            if !receivers.contains_key(&payout) {
+                return Err(GenesisError::UnknownReceiver(v.payout.clone()));
+            }
             // ValidatorSet::new would silently collapse duplicates (and the genesis hash would
             // commit to the collapsed set): reject instead.
             if register.contains_key(&addr) {
@@ -252,6 +313,7 @@ impl Genesis {
 
         let hc_bundle = word8_from_hex(&self.hc_bundle).ok_or_else(|| GenesisError::BadHcBundle(self.hc_bundle.clone()))?;
         let mut ledger = Ledger::new(self.chain_id, hc_bundle, register.clone(), executor);
+        ledger.set_receivers(receivers);
         ledger.set_epoch_blocks(self.epoch_blocks);
         ledger.set_faucet(self.faucet);
         ledger.set_confidential(self.confidential);
@@ -303,8 +365,7 @@ impl Genesis {
         // list the same validators in a different order still build the same chain).
         commit.extend_from_slice(&self.epoch_blocks.to_be_bytes());
         for e in register.values() {
-            commit.extend_from_slice(&word8_to_bytes(&e.payout.pk));
-            commit.extend_from_slice(&e.payout.kem_ek);
+            commit.extend_from_slice(&e.payout.0);
         }
         // S3, last: appended only when a bridge is configured, so a bridge-less chain's genesis
         // hash is unchanged by this phase. `BridgeCommit` is the plain-bytes twin of
@@ -425,9 +486,22 @@ mod tests {
         }
     }
 
-    /// A valid `rand1…` payout address, distinct per `i`.
+    /// A signed receiver record, distinct per `i`, at chain 42 (every `genesis(n)` below).
+    fn receiver_record(i: u8) -> ReceiverRecord {
+        receiver_record_for(42, i)
+    }
+
+    /// [`receiver_record`], for a chain other than 42 — the id (`Keypair::from_seed`-derived, not
+    /// chain-bound) is the same for a given `i`; only the signature moves with the chain.
+    fn receiver_record_for(chain_id: u64, i: u8) -> ReceiverRecord {
+        let kp = crate::receiver::receiver_signing_keypair(&[i; 32]);
+        ReceiverRecord::sign(&kp, chain_id, 1, [i as u32; 8], vec![i; crate::notes::KEM_EK_BYTES])
+    }
+
+    /// A valid `rand1…` payout id, distinct per `i` — `receiver_record(i)`'s, which `genesis(n)`
+    /// registers for every `i` in `1..=n`.
     fn payout(i: u8) -> String {
-        ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; crate::notes::KEM_EK_BYTES] }.to_string()
+        receiver_record(i).id().to_string()
     }
 
     fn genesis(n: u8) -> Genesis {
@@ -447,6 +521,7 @@ mod tests {
                 })
                 .collect(),
             alloc: vec![note(7, 1_000_000), note(8, 2_000_000)],
+            receivers: (1..=n).map(|i| ReceiverRecordHex::from_record(&receiver_record(i))).collect(),
             faucet: false,
             confidential: true,
             fri_profile: "production".into(),
@@ -558,10 +633,11 @@ mod tests {
         assert!(s.ledger.bridge().is_none());
         assert_eq!(
             s.ledger.state_root().to_hex(),
-            // Moved once by the short-address registry (task 3): every chain now hashes under
-            // `rand-state-4` with an (empty) `receivers_root` appended, gate or no gate.
-            "6b10f3738309fc808d3559c87a2020b688b45f4c6ae8cf48bafd565c7fd23d5a",
-            "a chain without a bridge commits the four components, over S2's v2 register leaf, plus the always-on empty receivers root"
+            // Moved again by task 4: the validator leaf is v3 (a 32-byte receiver id in place of
+            // the payout's pk and KEM key, `rand-validator-leaf-3`), so every genesis state root
+            // that hashes a validator moves even though `rand-state-4` itself did not.
+            "18954e835d73c446cdd4ef80b79ce40c00ccf2b3215ad78b96d18d278fed74d5",
+            "a chain without a bridge commits the four components, over the v3 register leaf, plus the always-on empty receivers root"
         );
         assert!(!plain.to_json().contains("bridge"), "and its genesis file does not mention one");
 
@@ -632,7 +708,7 @@ mod tests {
         let e = &s.ledger.validators()[&addr];
         assert_eq!(e.stake, MIN_STAKE, "the genesis stake, narrowed to the register's u64");
         assert_eq!((e.rewards, e.nonce, e.pending.len()), (0, 0, 0));
-        assert_eq!(e.payout, ShieldedAddress::parse(&g.validators[0].payout).unwrap());
+        assert_eq!(e.payout, ReceiverId::parse(&g.validators[0].payout).unwrap());
 
         let mut faster = g.clone();
         faster.epoch_blocks = 4;
@@ -644,11 +720,12 @@ mod tests {
 
         let mut paid = g.clone();
         paid.validators[0].payout = payout(9);
+        paid.receivers.push(ReceiverRecordHex::from_record(&receiver_record(9)));
         let sp = build(&paid);
         assert_ne!(sp.hash(), s.hash(), "the payout address is bound");
         assert_ne!(sp.ledger.state_root(), s.ledger.state_root(), "and it is state, in the validator leaf");
 
-        // The payout is required and must be a shielded address.
+        // The payout is required and must be a receiver id.
         let mut without = serde_json::to_value(&g).unwrap();
         without["validators"][0].as_object_mut().unwrap().remove("payout");
         assert!(Genesis::from_json(&without.to_string()).is_err(), "payout has no default");
@@ -705,6 +782,9 @@ mod tests {
         let a = genesis(1);
         let mut b = genesis(1);
         b.chain_id = 43;
+        // A record's signature is over its chain (spec §6.2), so `b`'s receiver has to be
+        // re-signed for chain 43 — the id itself (the signing key's address) does not move.
+        b.receivers = vec![ReceiverRecordHex::from_record(&receiver_record_for(43, 1))];
         assert_ne!(build(&a).hash(), build(&b).hash());
     }
 
@@ -741,5 +821,46 @@ mod tests {
         let mut g = genesis(1);
         g.validators[0].stake = u64::MAX as u128 + 1;
         assert!(matches!(g.build(&StubExecutor), Err(GenesisError::StakeTooLarge(_))));
+    }
+
+    /// The short-address migration (spec §6): `Genesis::receivers` is registered before any
+    /// validator payout is resolved against it, so an id with no matching record is refused by
+    /// name, and once the record is added the same file builds and the register holds the id.
+    #[test]
+    fn genesis_registers_its_receivers_first_and_refuses_an_unknown_payout() {
+        let signing = crate::receiver::receiver_signing_keypair(&[4; 32]);
+        let rec = ReceiverRecord::sign(&signing, 42, 1, [4; 8], vec![4; crate::notes::KEM_EK_BYTES]);
+        let id = rec.id();
+        let k = Keypair::from_seed([1; 32]).unwrap();
+        let mut g = Genesis {
+            chain_id: 42,
+            timestamp_ms: 1_700_000_000_000,
+            validators: vec![GenesisValidator { public_key: k.public_key().clone(), stake: MIN_STAKE as u128, payout: id.to_string() }],
+            alloc: vec![],
+            receivers: vec![],
+            faucet: false,
+            confidential: true,
+            fri_profile: "production".into(),
+            hc_bundle: word8_to_hex(&[3; 8]),
+            bridge: None,
+            aggregation: None,
+            epoch_blocks: EPOCH_BLOCKS_DEFAULT,
+        };
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::UnknownReceiver(s)) if s == id.to_string()));
+        g.receivers.push(ReceiverRecordHex::from_record(&rec));
+        let s = g.build(&StubExecutor).unwrap();
+        assert_eq!(s.ledger.receivers().len(), 1);
+        assert_eq!(s.ledger.validators().values().next().unwrap().payout, id);
+    }
+
+    /// A record that fails to verify — tampered after signing, here — is `BadReceiver`, not a
+    /// silent skip: a genesis file cannot register a row nobody actually signed.
+    #[test]
+    fn a_receiver_record_that_fails_to_verify_is_refused() {
+        let mut g = genesis(1);
+        let mut tampered = ReceiverRecordHex::from_record(&receiver_record(1));
+        tampered.pk = crate::notes::word8_to_hex(&[9; 8]);
+        g.receivers = vec![tampered];
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::BadReceiver(_))));
     }
 }

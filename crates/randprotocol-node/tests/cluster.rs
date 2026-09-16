@@ -170,6 +170,18 @@ fn genesis_funding(validators: &[Keypair], funded: &[&Wallet]) -> Genesis {
 /// [`genesis_funding`] with an optional `bridge` section. A chain built with `None` has no bridge
 /// at all — no registry, no bridge root, and both bridge actions inadmissible.
 fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<BridgeConfig>) -> Genesis {
+    // Phase S2 requires a payout id per validator; nothing in this test withdraws, so the record
+    // only has to resolve (short-shielded-address task 4).
+    let receiver_record = |i: usize| {
+        let kp = randprotocol_core::receiver::receiver_signing_keypair(&[i as u8 + 1; 32]);
+        randprotocol_core::receiver::ReceiverRecord::sign(
+            &kp,
+            CHAIN_ID,
+            1,
+            [i as u32 + 1; 8],
+            vec![i as u8 + 1; randprotocol_core::notes::KEM_EK_BYTES],
+        )
+    };
     Genesis {
         chain_id: CHAIN_ID,
         timestamp_ms: 0,
@@ -179,16 +191,13 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
             .map(|(i, k)| GenesisValidator {
                 public_key: k.public_key().clone(),
                 stake: MIN_STAKE as u128,
-                // Phase S2 requires a payout address per validator; nothing in this test
-                // withdraws, so it only has to parse.
-                payout: randprotocol_core::notes::ShieldedAddress {
-                    pk: [i as u32 + 1; 8],
-                    kem_ek: vec![i as u8 + 1; randprotocol_core::notes::KEM_EK_BYTES],
-                }
-                .to_string(),
+                payout: receiver_record(i).id().to_string(),
             })
             .collect(),
         alloc: funded.iter().map(|w| alloc_note(&w.address, ALLOC)).collect(),
+        receivers: (0..validators.len())
+            .map(|i| randprotocol_core::genesis::ReceiverRecordHex::from_record(&receiver_record(i)))
+            .collect(),
         faucet: true,
         confidential: true,
         fri_profile: "test".into(),
@@ -1201,9 +1210,11 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     let ks = keys(5);
     let bonder = wallet(50);
     let payout = wallet(51);
-    // One note has to hold the stake and the fee of the bundle that burns it: 1000 RAND of stake,
-    // and 1 RAND more to pay the 0.001 fee out of and keep as change.
-    let funding = MIN_STAKE + UNITS_PER_RAND;
+    // One note has to hold the stake and the fees of the two bundles that spend it: 1000 RAND of
+    // stake for the bond, and 2 RAND more to pay the receiver record's fee and the bond's own out
+    // of (short-shielded-address task 4: the payout wallet registers its record before the bond
+    // can name it), with change to spare.
+    let funding = MIN_STAKE + 2 * UNITS_PER_RAND;
     let gen = genesis_staking(&ks[..4], &[(&bonder, funding)]);
     let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
     let boot = vec![bootstrap_addr(&n0)];
@@ -1224,15 +1235,45 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     }
     assert!(register_row(&n0, &ks[4].address()).await.is_none(), "and in no register row yet");
 
+    // ---- the receiver record: the registry, not the register, owns the note key
+    // (short-shielded-address task 4), so the payout wallet registers its record first.
+    let payout_record = {
+        let seed = randprotocol_core::notes::word8_to_bytes(&payout.sk.0);
+        let kp = randprotocol_core::receiver::receiver_signing_keypair(&seed);
+        randprotocol_core::receiver::ReceiverRecord::sign(&kp, CHAIN_ID, 1, payout.address.pk, payout.address.kem_ek.clone())
+    };
+    let payout_id = payout_record.id();
+    let mut store = NoteStore::default();
+    let register_receiver_action = Action::RegisterReceiver { record: payout_record };
+    let register_fee = gas::fee_floor(&register_receiver_action);
+    {
+        let slot = proving_slot().await;
+        wallet::submit(
+            &n0.rpc,
+            &bonder,
+            &mut store,
+            None,
+            register_receiver_action,
+            register_fee,
+            Burn::None,
+            FriProfile::Test,
+            Backend::Cpu,
+            CHAIN_ID,
+            true,
+        )
+        .await
+        .expect("the receiver record is accepted and commits");
+        drop(slot);
+    }
+
     // ---- the bond: a wallet's bundle burns the stake, with the validator's registration attached
     let registration = Registration {
         public_key: ks[4].public_key().clone(),
-        payout: payout.address.clone(),
-        signature: ks[4].sign(registration_message(CHAIN_ID, &payout.address).as_bytes()),
+        payout: payout_id,
+        signature: ks[4].sign(registration_message(CHAIN_ID, &payout_id).as_bytes()),
     };
     let action = Action::Bond { validator: ks[4].address(), amount: MIN_STAKE, registration: Some(registration) };
     let fee = gas::fee_floor(&action);
-    let mut store = NoteStore::default();
     let slot = proving_slot().await;
     let bonded =
         wallet::submit(&n0.rpc, &bonder, &mut store, None, action, fee, Burn::Rand(MIN_STAKE), FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
@@ -1243,10 +1284,10 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     assert_eq!(bonded.burn, Burn::Rand(MIN_STAKE), "the bundle burns exactly what is bonded, in RAND");
     assert_eq!(bonded.amount, 0, "a bond pays nobody a note");
 
-    // The register has the entry at once, with the payout address the validator itself signed for.
+    // The register has the entry at once, with the payout id the validator itself signed for.
     let row = register_row(&n0, &ks[4].address()).await.expect("the bond registered the fifth validator");
     assert_eq!(units(&row["stake"]), MIN_STAKE);
-    assert_eq!(row["payout"].as_str().unwrap(), payout.address.to_string(), "the payout it signed, not the bonder's");
+    assert_eq!(row["payout"].as_str().unwrap(), payout_id.to_string(), "the payout it signed, not the bonder's");
     assert_eq!(row["nonce"].as_u64().unwrap(), 0, "a fresh entry's first signed action carries nonce 0");
     let epoch = n0.rpc.epoch().await.unwrap();
     assert_eq!(epoch["epoch_blocks"].as_u64().unwrap(), EPOCH);
@@ -1280,13 +1321,22 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     assert_chains_equal(&all);
 
     // The stake left the pool as the bundle's burn instead of becoming anyone's note, and the
-    // audit accounts for it on the register's side of the boundary (`docs/supply.md`).
-    assert_eq!(balance(&n0, &bonder).await, funding - MIN_STAKE - fee, "the wallet paid the stake and the fee");
+    // audit accounts for it on the register's side of the boundary (`docs/supply.md`) — along
+    // with the receiver record's own fee, paid out of the same funding note.
+    assert_eq!(
+        balance(&n0, &bonder).await,
+        funding - MIN_STAKE - fee - register_fee,
+        "the wallet paid the stake and both fees"
+    );
     let supply = supply_of(&n0).await;
     assert_eq!(units(&supply["burned"]), MIN_STAKE, "a bond is the only thing that burns");
     assert_eq!(units(&supply["genesis_deposited"]), funding);
     assert_eq!(units(&supply["genesis_staked"]), 4 * MIN_STAKE);
-    assert_eq!(units(&supply["register_total"]), 5 * MIN_STAKE + fee, "four genesis stakes, the bond, and the fee");
+    assert_eq!(
+        units(&supply["register_total"]),
+        5 * MIN_STAKE + fee + register_fee,
+        "four genesis stakes, the bond, and both fees"
+    );
     assert!(supply["invariant_holds"].as_bool().unwrap(), "{supply}");
     eprintln!("a_fifth_validator_registers_bonds_and_joins_the_next_epoch in {:.1?}", started.elapsed());
 }
@@ -1305,7 +1355,15 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     let payout = wallet(52);
     let payee = wallet(53);
     let mut gen = genesis_staking(&ks, &[]);
-    gen.validators[3].payout = payout.address.to_string();
+    // The registry, not the register, owns the note key (short-shielded-address task 4): D's
+    // payout is this wallet's record, registered in the genesis file alongside the others.
+    let payout_record = {
+        let seed = randprotocol_core::notes::word8_to_bytes(&payout.sk.0);
+        let kp = randprotocol_core::receiver::receiver_signing_keypair(&seed);
+        randprotocol_core::receiver::ReceiverRecord::sign(&kp, CHAIN_ID, 1, payout.address.pk, payout.address.kem_ek.clone())
+    };
+    gen.validators[3].payout = payout_record.id().to_string();
+    gen.receivers.push(randprotocol_core::genesis::ReceiverRecordHex::from_record(&payout_record));
     let d = ks[3].address();
     let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
     let boot = vec![bootstrap_addr(&n0)];
@@ -1805,17 +1863,44 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
     let n1 = start_node_at(&ks[1], &gen, vec![bootstrap_addr(&n0)], true, PROVING).await;
     wait_height(&[&n0, &n1], 2, Duration::from_secs(60)).await;
 
+    // The registry, not the register, owns the note key (short-shielded-address task 4): the
+    // aggregator's payout id has to resolve before `RegisterAggregator` will, so its record is
+    // registered first, through the same wallet's bundle.
+    let payout_record = {
+        let kp = randprotocol_core::receiver::receiver_signing_keypair(&[7; 32]);
+        randprotocol_core::receiver::ReceiverRecord::sign(&kp, CHAIN_ID, 1, [7; 8], vec![8; randprotocol_core::notes::KEM_EK_BYTES])
+    };
+    let payout = payout_record.id();
+    let mut store = NoteStore::default();
+    {
+        let slot = proving_slot().await;
+        wallet::submit(
+            &n0.rpc,
+            &a,
+            &mut store,
+            None,
+            Action::RegisterReceiver { record: payout_record },
+            gas::BUNDLE_BASE,
+            wallet::Burn::None,
+            FriProfile::Test,
+            Backend::Cpu,
+            CHAIN_ID,
+            true,
+        )
+        .await
+        .expect("the receiver record is accepted and commits");
+        drop(slot);
+    }
+
     // The registration, a wallet submission with a bond-burning bundle (excess 7 over the
     // floor, so the aggregate's payment is the subsidy plus a proving share).
-    let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
     let registration = randprotocol_core::types::actions::AggregatorRegistration {
         public_key: aggregator.public_key().clone(),
-        payout: payout.clone(),
+        payout,
         signature: aggregator.sign(
             randprotocol_core::types::actions::aggregator_register_message(CHAIN_ID, &payout).as_bytes(),
         ),
     };
-    let mut store = NoteStore::default();
     let register = {
         let slot = proving_slot().await;
         let sent = wallet::submit(

@@ -53,21 +53,26 @@ fn init_tracing() {
 }
 
 fn genesis(validator: &Keypair) -> Genesis {
+    // Phase S2 requires a payout id per validator; this test never withdraws, so the record only
+    // has to resolve (short-shielded-address task 4).
+    let payout_kp = randprotocol_core::receiver::receiver_signing_keypair(&[1; 32]);
+    let record = randprotocol_core::receiver::ReceiverRecord::sign(
+        &payout_kp,
+        CHAIN_ID,
+        1,
+        [1; 8],
+        vec![2; randprotocol_core::notes::KEM_EK_BYTES],
+    );
     Genesis {
         chain_id: CHAIN_ID,
         timestamp_ms: 0,
         validators: vec![GenesisValidator {
             public_key: validator.public_key().clone(),
             stake: randprotocol_core::ledger::staking::MIN_STAKE as u128,
-            // Phase S2 requires a payout address per validator; this test never withdraws, so
-            // it only has to parse.
-            payout: randprotocol_core::notes::ShieldedAddress {
-                pk: [1; 8],
-                kem_ek: vec![2; randprotocol_core::notes::KEM_EK_BYTES],
-            }
-            .to_string(),
+            payout: record.id().to_string(),
         }],
         alloc: vec![],
+        receivers: vec![randprotocol_core::genesis::ReceiverRecordHex::from_record(&record)],
         faucet: true,
         confidential: true,
         fri_profile: "test".into(),
