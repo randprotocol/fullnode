@@ -209,7 +209,20 @@ set before it; fleets must run the same build (`docs/confidential.md`, "Constrai
   memory-bound interpreter exit proofs), ~43½ min wall from a cold release target on a loaded
   machine — wallet flow 9m37s, cluster 22m44s (18 tests), zkvm e2e 7m25s.
 
-### Pre-v0.1 security review (2026-09-16): two findings, both gated behind chain 9
+### Pre-v0.1 security review (2026-09-16): two findings, both gated behind chain 9 — FIXED the same day
+
+**Fixes merged to `main` (branch `security-fixes-v0.1`):** L1 `151af5b` (`Ledger::close_block`,
+called by both `propose` and `apply_block_for_sync`); H1 `248a0f7` + `e03f8bd` (the fee bucket
+records every bundle and is the ledger's coverable set — `CoverNotCoverable` at step 4, a
+missing entry is a refusal not a zero share — and `BlockError::SecondAggregate` refuses a
+second aggregate per block; spec §3.4/§4/§6.1 rewritten); M1 `32ec1b8` (`Transaction::hash`
+takes the bundle proof by digest, domain `shrugg-txid-2`, so the marker form hashes to the
+raw hash and the certified tx root binds a sealed block whole — **every transaction id
+changes**, a hard fork like constraint set 6); dependencies `4a07d85` (libp2p 0.54 → 0.57,
+all ten Dependabot alerts cleared). Each fix has a regression test that failed on `v0.1`.
+The report's "Fixes" section records what was deliberately not done (binding the aggregate
+proof to `(aggregator, nonce)` — a circuits change, defence in depth only now).
+
 
 Tag `v0.1` sits on `0b98580`. A four-reviewer pass over `6f112e3..0b98580` (RPC hardening,
 constraint set 6, M5 `shrugg-rvm`, chain-side aggregation, S2/S3 follow-ups), each candidate
