@@ -1,6 +1,7 @@
 # Short shielded addresses — the receiver id and the receiver record
 
-Status: **draft for the user's review, 2026-09-17.** Nothing here is implemented.
+Status: **approved by the user 2026-09-17** (the three §11 questions ruled as recorded there);
+the implementation plan follows. Nothing here is implemented yet.
 
 Design: Anish Mohammad (https://github.com/zeroknowledge), 2026-09-16 — "give users a short,
 stable RAND address; keep the large encryption key behind the scenes; a ~256-bit receiver id
@@ -121,8 +122,8 @@ the current record per id and the explorer indexes it like everything else. The 
 - The wallet **verifies** what the explorer returns exactly as it verifies a payment request. A
   bad or compromised explorer can withhold a record or serve an old version; it cannot forge
   one. A stale version only means the sender seals to a key the receiver rotated away from —
-  the receiver's wallet keeps its previous KEM secret keys, so the note is still openable
-  (`RETIRED_KEM_KEYS = 4`, then a warning in the receiver's wallet).
+  the receiver's wallet keeps **every** previous KEM secret key (§7), so the note is still
+  openable.
 - `rand send` takes `--registry <url>` (default: the explorer at `https://randscan.org/api/v1`)
   and `--record <file>` for the offline path. The node keeps `rand_getReceiver(id)` for the
   explorer's own indexer and for operators; it is not the wallet's default.
@@ -155,7 +156,12 @@ The first payment to an unregistered receiver may carry the record: `Action::Reg
 on the **sender's** transfer bundle, with the same validity rules — the record must verify
 under the id it names, whoever pays for its inclusion. The receiver never needs notes to be
 registered; the sender pays once. A receiver who only ever uses payment requests never appears
-on chain.
+on chain. The registration rides on the paying transaction itself: a sender-paid
+`RegisterReceiver` must sit on a bundle that also creates a note for the record's `pk` (the
+ledger checks one of the bundle's commitments is a note to that `pk` — the wallet passes the
+note's public inputs, the proof already binds them), so nobody can register strangers on their
+own, and the fee is always attached to a real payment. A receiver registering itself needs no
+such note: its own id signs the transaction's bundle.
 
 ### 6.4 Payouts and the bridge
 
@@ -167,9 +173,12 @@ on chain.
   (`RegisterValidator`/`RegisterAggregator` require the record to exist, or to be carried in the
   same transaction). The genesis file carries each validator's record next to its id.
 - `BridgeAttest.recipient`: `ReceiverId`; the guardians' 32-byte `to` field is the id; the
-  deposit note's `pk` comes from the registry, so a bridge deposit to an unregistered receiver
-  is refused (`BridgeError::UnknownReceiver`) — the depositor registers first or the attestation
-  carries the record (§6.3's rule, one action over).
+  deposit note's `pk` comes from the registry, so **a bridge deposit to an unregistered
+  receiver is refused** (`BridgeError::UnknownReceiver`) and the attestation never carries a
+  record: the guardians' payload stays 32 bytes per recipient (source-chain gas, the audited
+  surface), the source chain could not verify a record anyway, and a bridge deposit is never a
+  first contact — the wallet refuses to produce a bridge deposit address for an unregistered
+  wallet and says to register first (one self-transfer).
 
 ### 6.5 What does not change
 
@@ -182,7 +191,9 @@ where the sender found the key changed.
 - `rand address`: the 54-char address. `rand address --record`: the current record as JSON;
   `rand request [--amount] [--memo]`: the payment-request URI (with the record).
 - `rand register [--rotate]`: publishes version 1, or version + 1 with a fresh KEM key,
-  paying with a self-transfer. The wallet file keeps the retired KEM secret keys.
+  paying with a self-transfer. The wallet file keeps **every** retired KEM secret key, forever
+  (2,400 bytes each; a decade of monthly rotation is under 300 KB), tried newest first when
+  opening an envelope — a key discarded is a note that can never be opened.
 - `rand send <address> <amount> [--record f | --registry url]`: resolve → verify → seal → prove
   → submit. With neither flag: the registry; on a 404, the error in §4.
 - `rand balance`/scan: unchanged (`vk` scans; retired KEM keys tried in order for envelopes).
@@ -210,18 +221,18 @@ unchanged; `rand address` simply prints the short form. Explorer: one migration
   a bad checksum and the long form; the state root moves with the registry; a `RegisterReceiver`
   applies standalone and carried; a withdraw resolves its pk from the registry; a bridge attest
   to an unregistered receiver is refused.
-- client: request → send round-trip with no registry; rotation keeps old notes openable; the
-  §4 error text.
+- client: request → send round-trip with no registry; rotation keeps old notes openable across
+  several rotations (every retired key kept); the §4 error text; the wallet refuses a bridge
+  deposit address while unregistered.
 - node: `rand_getReceiver`; a cluster test registering through a sender-paid transfer and paying
   the receiver twice across a rotation.
 - explorer: the `/receivers` endpoints against the mock node and the real node.
 
-## 11. Open questions for the user
+## 11. The user's rulings (2026-09-17)
 
-1. **`RETIRED_KEM_KEYS = 4`** (how many rotated-away KEM secrets a wallet keeps): fine, or
-   unbounded?
-2. **Sender-paid registration (§6.3)**: keep, or require every receiver to register itself?
-   Keeping it is what makes "first payment without registering" true for a wallet with no notes.
-3. **Bridge deposits to unregistered receivers** are refused under §6.4. The alternative — a
-   bridge deposit that carries the record in the attestation — makes the guardians' payload
-   bigger. Refuse, or carry?
+1. **Retired KEM secrets: keep all, forever** (§7). A discarded key is an unopenable note; the
+   storage is negligible.
+2. **Sender-paid registration: kept** (§6.3), tied to the paying transaction — it must create
+   a note for the record's `pk` — so a sender can register a receiver only by paying them.
+3. **Bridge deposits to unregistered receivers: refused** (§6.4); the guardians' payload stays
+   32 bytes and the attestation never carries a record.
