@@ -51,7 +51,7 @@ impl std::str::FromStr for ReceiverId {
 pub enum RecordError {
     #[error("shielded address must start with {ADDRESS_PREFIX}")] Prefix,
     #[error("shielded address is not base58")] Base58,
-    #[error("this is the pre-chain-11 long address form (pk + KEM key); chain 11 addresses are 54 characters — ask the receiver for their current address")] LongForm,
+    #[error("this is the pre-chain-11 long address form (pk + KEM key); chain 11 addresses are 53–55 characters — ask the receiver for their current address")] LongForm,
     #[error("shielded address decodes to {0} bytes, expected 36")] Length(usize),
     #[error("shielded address checksum mismatch")] Checksum,
     #[error("the record's signing key is not the address's")] WrongId,

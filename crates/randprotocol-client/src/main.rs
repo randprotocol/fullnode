@@ -8,7 +8,7 @@
 //! leaves, nullifiers, anchors, witnesses — and handed a finished bundle; it is never told who
 //! anyone is.
 //!
-//! An address is short now (the short-shielded-address spec): `rand1…`, 54 characters, a
+//! An address is short now (the short-shielded-address spec): `rand1…`, 53–55 characters, a
 //! **receiver id** that says who and not how. What a sender needs in order to seal an envelope —
 //! the note key `pk` and the 1,184-byte ML-KEM encapsulation key — lives in a signed record the
 //! id resolves to, delivered either inline with a payment request (`rand request`) or from the
@@ -539,10 +539,13 @@ async fn main() -> Result<()> {
                     w.id
                 ),
             };
-            if w.kem_version != kem_version {
-                // A counter ahead of the chain is what a failed rotation leaves behind. Moving it
-                // back is what keeps the retry publishable — and it is worth a line, because the
-                // wallet's address moves with it.
+            if w.kem_version > kem_version {
+                // A counter ahead of the chain is what a failed rotation leaves behind: this
+                // wallet already moved to a version whose registration never committed. A normal
+                // `--rotate` always asks for `kem_version + 1`, so `w.kem_version < kem_version`
+                // on every ordinary run and this never prints then — only a retry, where the
+                // wallet is ahead of what the chain will accept, is worth a line, because the
+                // wallet's address moves back with it.
                 eprintln!(
                     "this wallet's KEM key version is {}, and the chain's registry implies {kem_version}; \
                      publishing (and moving to) the version the chain will accept",

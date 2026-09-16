@@ -270,8 +270,9 @@ commitment and the registry leaf gained an index — that re-pin *is* the hard f
 The bridge root folds into the chain's state root only when a bridge exists:
 
 ```
-state_root = blake3("rand-state-2" || tree_root || nullifier_root || validators_root || programs_root)
-           = blake3("rand-state-2" || … || programs_root || bridge_root)   with a `bridge` section
+state_root = blake3("rand-state-4" || tree_root || nullifier_root || validators_root || programs_root
+                     [|| bridge_root] [|| aggregators_root] || receivers_root)
+           = blake3("rand-state-4" || … || programs_root || bridge_root || receivers_root)   with a `bridge` section
 ```
 
 A bridge-less chain commits exactly the 128 bytes phase S1 committed — byte-identical, no fifth

@@ -200,18 +200,30 @@ async fn register_row(rpc: &RpcClient, me: &randprotocol_core::Address) -> Resul
     Ok((nonce, payout))
 }
 
-/// The receiver record `id` resolves to on `rpc`'s node, fetched through `rand_getReceiver`
-/// (short-shielded-address task 6). A payout with no record is refused by name — the register can
-/// name an id nobody has registered yet, and a withdraw or an aggregate to it would otherwise
-/// pay a note nobody can ever open.
-async fn resolve_receiver(rpc: &RpcClient, id: &ReceiverId) -> Result<ReceiverRecord> {
+/// A record fetched over RPC, checked against the id it was asked for and this chain, before it
+/// is trusted for anything (final review of short shielded addresses, item 1): a hostile or
+/// buggy RPC endpoint can return a record with the right `pk` glued to an attacker's `kem_ek`
+/// (`verify` covers the id and the signature, but nothing stops a server from serving whatever
+/// bytes it likes for either), and sealing a payout envelope to that record would pay the
+/// attacker, not the receiver who registered `id`. Pure — no RPC — so it is testable on its own.
+fn verified_record(rec: ReceiverRecord, id: &ReceiverId, chain_id: u64) -> Result<ShieldedAddress> {
+    rec.verify(id, chain_id).map_err(|e| anyhow::anyhow!("receiver record for {id} does not verify: {e}"))?;
+    Ok(ShieldedAddress::from(&rec))
+}
+
+/// The shielded address `id` resolves to on `rpc`'s node, fetched through `rand_getReceiver`
+/// (short-shielded-address task 6) and checked by [`verified_record`] before it is handed back. A
+/// payout with no record is refused by name — the register can name an id nobody has registered
+/// yet, and a withdraw or an aggregate to it would otherwise pay a note nobody can ever open.
+async fn resolve_receiver(rpc: &RpcClient, id: &ReceiverId, chain_id: u64) -> Result<ShieldedAddress> {
     let v = rpc.call("rand_getReceiver", serde_json::json!([id.to_string()])).await?;
     if v.is_null() {
         anyhow::bail!("payout {id} has no record: register it first");
     }
     let hex: ReceiverRecordHex =
         serde_json::from_value(v).with_context(|| format!("the node's rand_getReceiver reply for {id} does not decode"))?;
-    hex.to_record().map_err(|e| anyhow::anyhow!("{id}'s record: {e}"))
+    let rec = hex.to_record().map_err(|e| anyhow::anyhow!("{id}'s record: {e}"))?;
+    verified_record(rec, id, chain_id)
 }
 
 /// Submit a bundle-less validator-signed action and report where it landed.
@@ -661,8 +673,7 @@ async fn main() -> Result<()> {
             let rpc = RpcClient::new(staking.rpc.clone());
             let chain_id = rpc.chain_id().await?;
             let (nonce, payout) = register_row(&rpc, &kp.address()).await?;
-            let record = resolve_receiver(&rpc, &payout).await?;
-            let payout_addr = ShieldedAddress::from(&record);
+            let payout_addr = resolve_receiver(&rpc, &payout, chain_id).await?;
             // The chain computes the deposit note itself, from the register's payout address, the
             // amount less the base, the blinding below and this `time` — the head height, which
             // the signature binds. The envelope only the payee can open is sealed against that
@@ -725,8 +736,7 @@ async fn main() -> Result<()> {
                 // the amount itself is not in the action, exactly like the aggregate's payout.
                 let base = randprotocol_core::gas::BUNDLE_BASE;
                 anyhow::ensure!(bond > base, "the bond does not cover the bundle base");
-                let record = resolve_receiver(&rpc, &payout).await?;
-                let payout_addr = ShieldedAddress::from(&record);
+                let payout_addr = resolve_receiver(&rpc, &payout, chain_id).await?;
                 let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
                 let (note, envelope) = sealed_withdraw_note(&payout_addr, bond - base, time)?;
                 let signature = kp.sign(
@@ -842,8 +852,7 @@ async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, int
             // shares, sealed to the register's payout address (spec §5.4).
             let subsidy = subsidy_base.checked_shr((n / halving) as u32).unwrap_or(0);
             let (_, payout, _) = aggregator_row(&rpc, &kp.address()).await?;
-            let record = resolve_receiver(&rpc, &payout).await?;
-            let payout_addr = ShieldedAddress::from(&record);
+            let payout_addr = resolve_receiver(&rpc, &payout, chain_id).await?;
             let time = height as u32 + 1;
             let (note, envelope) = sealed_withdraw_note(&payout_addr, subsidy + shares, time)?;
             let nonce = aggregator_row(&rpc, &kp.address()).await?.0;
@@ -1066,6 +1075,33 @@ mod tests {
             .expect("the payout wallet opens its own note");
         assert_eq!(opened, note);
         assert_eq!(opened.amount, amount - base);
+    }
+
+    /// The payout-resolution path (final review of short shielded addresses, item 1): a
+    /// hostile or buggy RPC endpoint can hand back a record whose signature covers the *wrong*
+    /// chain, or whose `kem_ek` was swapped after signing — either way the id and `pk` can still
+    /// look right at a glance, so only `ReceiverRecord::verify` catches it. `verified_record` must
+    /// refuse both, and only return the address for a record that actually verifies.
+    #[test]
+    fn verified_record_refuses_a_record_that_does_not_verify_and_returns_the_address_for_one_that_does() {
+        let rec = pinned_receiver(); // signed for chain 7 (see `pinned_receiver`)
+        let id = rec.id();
+
+        // Signed for chain 7; asking it to resolve on another chain must fail — the signature
+        // does not cover that chain's registration at all.
+        assert!(verified_record(rec.clone(), &id, 8).is_err(), "wrong chain must not verify");
+
+        // The signature covers `kem_ek` byte for byte, so a tampered `kem_ek` — the whole point
+        // of this fix, a server serving the right `pk` glued to an attacker's KEM key — must not
+        // verify either, even though `id` and `pk` still match.
+        let mut tampered = rec.clone();
+        tampered.kem_ek[0] ^= 0xff;
+        assert!(verified_record(tampered, &id, 7).is_err(), "a tampered kem_ek must not verify");
+
+        // The untampered record, on its own chain, verifies and yields the address it was
+        // actually signed for.
+        let addr = verified_record(rec.clone(), &id, 7).unwrap();
+        assert_eq!(addr, ShieldedAddress::from(&rec));
     }
 
     /// `deposit_note` seals to the record's own `pk`/`kem_ek` (`ShieldedAddress::from`), and two

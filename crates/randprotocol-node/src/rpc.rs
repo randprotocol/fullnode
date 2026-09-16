@@ -1311,9 +1311,36 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let m = st.storage.receivers().map_err(RpcError::internal)?;
             Ok(m.get(&id).map(record_json).unwrap_or(Value::Null))
         }
+        // Paged like `rand_getUnsealed` (final review item 2 — the unbounded form served the
+        // whole registry per call). `from` is a receiver id, exclusive of that row, or absent/null
+        // for the start; rows come back in `ReceiverId`'s own order, which is also the registry's
+        // `BTreeMap` order.
         "rand_getReceivers" => {
+            let from = match p.get(0) {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(parse_receiver_id(p, 0)?),
+            };
+            let limit = parse_limit(p, 1)?;
             let m = st.storage.receivers().map_err(RpcError::internal)?;
-            Ok(json!(m.values().map(record_json).collect::<Vec<_>>()))
+            let iter: Box<dyn Iterator<Item = (&ReceiverId, &ReceiverRecord)>> = match &from {
+                Some(id) => Box::new(m.range((std::ops::Bound::Excluded(id), std::ops::Bound::Unbounded))),
+                None => Box::new(m.iter()),
+            };
+            let mut rows = Vec::new();
+            let mut next_from = None;
+            let mut last = None;
+            for (id, rec) in iter {
+                if rows.len() >= limit {
+                    // `last` is the id of the row actually returned last, not this one — the
+                    // next page must start exclusive of it, or the row between the two pages
+                    // (this one) is dropped by neither page.
+                    next_from = last.map(|i: ReceiverId| i.to_string());
+                    break;
+                }
+                rows.push(record_json(rec));
+                last = Some(*id);
+            }
+            Ok(json!({ "receivers": rows, "next_from": next_from }))
         }
         "rand_getUnsealed" => {
             let from: u64 = param(p, 0, "from")?;
@@ -1795,10 +1822,73 @@ mod tests {
         assert!(none.is_null());
         assert_eq!(call(&st, "rand_getReceiver", json!(["rand1notanaddress"])).await.unwrap_err().code, -32602);
 
-        // `rand_getReceivers`: the whole registry, this one record among it.
+        // `rand_getReceivers`: the whole registry, this one record among it, in the paged shape.
         let all = ok(&st, "rand_getReceivers", json!([])).await;
-        let rows = all.as_array().unwrap();
+        let rows = all["receivers"].as_array().unwrap();
         assert!(rows.iter().any(|r| r["id"] == rec.id().to_string()), "{all}");
+        assert!(all["next_from"].is_null(), "everything fit in one page: {all}");
+    }
+
+    /// `rand_getReceivers` pages (final review item 2): a `limit` of 1 returns one row and a
+    /// `next_from` cursor, and paging with that cursor as `from` walks the rest of the registry
+    /// in `ReceiverId` order without repeating or skipping a row — the same contract
+    /// `rand_getUnsealed` already answers to.
+    #[tokio::test]
+    async fn rand_get_receivers_pages_in_receiver_id_order() {
+        use randprotocol_core::receiver::receiver_signing_keypair;
+        // Five receivers total: the validator's own genesis payout plus four more, all filed in
+        // the genesis registry so the fixture needs no post-hoc storage write.
+        let mut gs = genesis_with(7, vec![]);
+        let mut receivers = gs.ledger.receivers().clone();
+        for seed in 20u8..24 {
+            let signing = receiver_signing_keypair(&[seed; 32]);
+            let r = ReceiverRecord::sign(
+                &signing,
+                gs.chain_id,
+                1,
+                [seed as u32; 8],
+                vec![seed; randprotocol_core::notes::KEM_EK_BYTES],
+            );
+            receivers.insert(r.id(), r);
+        }
+        gs.ledger.set_receivers(receivers);
+        let (dir, st) = state_for(&gs);
+        std::mem::forget(dir);
+
+        let mut want: Vec<ReceiverId> = st.storage.receivers().unwrap().into_keys().collect();
+        want.sort();
+        assert_eq!(want.len(), 5, "the validator's own payout plus the four seeded above");
+
+        // Page through with limit 2 and reassemble the id order.
+        let mut got = Vec::new();
+        let mut from: Option<String> = None;
+        loop {
+            let params = match &from {
+                Some(f) => json!([f, 2]),
+                None => json!([Value::Null, 2]),
+            };
+            let page = ok(&st, "rand_getReceivers", params).await;
+            let rows = page["receivers"].as_array().unwrap();
+            assert!(rows.len() <= 2, "{page}");
+            for r in rows {
+                got.push(ReceiverId::parse(r["id"].as_str().unwrap()).unwrap());
+            }
+            match page["next_from"].as_str() {
+                Some(next) => from = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(got, want, "paging must walk the whole registry, in order, without a repeat or a gap");
+
+        // A limit of 1 against the very first id: exactly one row back, and a cursor that is
+        // that row''s own id — passing it back as the next call''s (exclusive) `from` is what
+        // resumes at `want[1]`, exercised by the loop above.
+        let first = ok(&st, "rand_getReceivers", json!([Value::Null, 1])).await;
+        assert_eq!(first["receivers"].as_array().unwrap().len(), 1);
+        assert_eq!(first["receivers"][0]["id"], want[0].to_string());
+        assert_eq!(first["next_from"], want[0].to_string());
+        let second = ok(&st, "rand_getReceivers", json!([want[0].to_string(), 1])).await;
+        assert_eq!(second["receivers"][0]["id"], want[1].to_string(), "the cursor's own id, passed back, resumes after it");
     }
 
     fn aggregate_agg_addr(_st: &RpcState) -> String {

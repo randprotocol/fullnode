@@ -37,6 +37,17 @@ const PAGE: usize = 500;
 /// block it rides in is large; 180 s leaves room for a few views of consensus.
 pub const COMMIT_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// How far past this wallet's own `kem_version` a scan sweeps looking for a key that opens an
+/// envelope (final review of short-shielded-address, item 4). `register` can reconcile
+/// `kem_version` *downward* to whatever version the chain's record implies (a failed publish
+/// retried at the version that will actually be accepted) — but a sender may already have sealed
+/// to a higher version this wallet advertised before that reconciliation, and a KEM key derives
+/// for any version whether or not this wallet ever published it. Sweeping a margin past the
+/// published version is what lets that envelope still open; the margin is a guess at how far a
+/// sequence of unpublished rotations could plausibly run ahead, not a hard bound enforced anywhere
+/// else.
+const KEM_VERSION_SWEEP: u32 = 8;
+
 // ---------------------------------------------------------------- key file
 
 /// The on-disk key file, version 3: the spend key and the KEM key version, and nothing else.
@@ -70,7 +81,7 @@ pub struct Wallet {
     /// The Dilithium2 keypair whose address is [`Wallet::id`] and which signs this wallet's
     /// receiver records. Derived from the spend key, so there is nothing extra to back up.
     pub signing: Keypair,
-    /// The short shielded address: `rand1…`, 54 characters, the same 32 bytes as this wallet's
+    /// The short shielded address: `rand1…`, 53–55 characters, the same 32 bytes as this wallet's
     /// transparent address.
     pub id: ReceiverId,
     /// Which ML-KEM key version this wallet currently publishes. Envelopes sealed to any earlier
@@ -117,9 +128,13 @@ impl Wallet {
         ReceiverRecord::sign(&self.signing, chain_id, kem_version + 1, self.vk.pk(), address.kem_ek)
     }
 
-    /// Rotate to a fresh ML-KEM key (spec §7), returning the new version. The caller saves the
-    /// key file and publishes the new record (`rand register --rotate`); until the record is
-    /// published, senders holding the old one seal to the old key — which still opens.
+    /// Rotate to a fresh ML-KEM key (spec §7): a plain `kem_version + 1`, returning the new
+    /// version. Not what `rand register --rotate` calls any more — it sets `kem_version`
+    /// directly, to whichever version the chain's own record implies, since a retry after a
+    /// failed publish must target that version rather than one past what this wallet last saved.
+    /// This stays for callers (and tests) that just want the next version; either way, until the
+    /// new record is published, senders holding the old one seal to the old key — which still
+    /// opens.
     pub fn rotate(&mut self) -> u32 {
         self.kem_version += 1;
         self.kem_version
@@ -129,7 +144,9 @@ impl Wallet {
     /// first. `None` when no key of this wallet opens it — which is what most leaves are.
     pub fn open_received(&self, envelope: &Envelope, cm: Word8) -> Option<Note> {
         let env = envelope_from_core(envelope);
-        (0..=self.kem_version).rev().find_map(|v| env.open_as_receiver_at(cm, &self.vk, v).map(|(_, note)| note))
+        (0..=self.kem_version + KEM_VERSION_SWEEP)
+            .rev()
+            .find_map(|v| env.open_as_receiver_at(cm, &self.vk, v).map(|(_, note)| note))
     }
 
     /// The same sweep for a call transcript this wallet was named the auditor of: the caller
@@ -139,7 +156,7 @@ impl Wallet {
         envelope: &randprotocol_core::types::CallEnvelope,
         h_in: &Word8,
     ) -> Option<(randprotocol_zkvm::call_envelope::CallKey, [u32; 4], Vec<u32>)> {
-        (0..=self.kem_version)
+        (0..=self.kem_version + KEM_VERSION_SWEEP)
             .rev()
             .find_map(|v| randprotocol_zkvm::call_envelope::open_call_as_auditor_at(envelope, h_in, &self.vk, v))
     }
@@ -1803,6 +1820,28 @@ mod tests {
         rec.verify(&w.id, 10).unwrap();
         assert_eq!(rec.pk, w.vk.pk());
         assert_eq!(rec.kem_ek, w.current_address().kem_ek);
+    }
+
+    /// The sweep margin (final review item 4): `register` can move `kem_version` *downward* to
+    /// match the chain's own record — a failed rotation retried at the version the chain will
+    /// accept — but a sender who saw this wallet's address before that reconciliation may already
+    /// have sealed to a version above the reconciled one. `open_received` has to keep opening
+    /// that envelope even though `kem_version` no longer reaches it by itself.
+    #[test]
+    fn open_received_opens_an_envelope_sealed_ahead_of_kem_version() {
+        let sender = Wallet::generate();
+        let me = Wallet::from_spend_key(SpendKey([13; 8]));
+        assert_eq!(me.kem_version, 0);
+        let ahead = me.kem_version + 3;
+        assert!(ahead <= me.kem_version + KEM_VERSION_SWEEP, "3 must be inside the sweep margin");
+        let to = randprotocol_zkvm::address::address_of_at(&me.vk, ahead);
+        let note = Note::new(me.vk.pk(), [0; 8], 7, 0, 1);
+        let env = sealed_to(&sender, &to, &note);
+        assert_eq!(
+            me.open_received(&env, note.commitment()),
+            Some(note),
+            "an envelope sealed {ahead} versions ahead of kem_version must still open within the sweep margin"
+        );
     }
 
     /// Rotation (spec §7, ruling 1): the KEM version moves, the key file keeps it, and no

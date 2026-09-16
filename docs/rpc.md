@@ -105,7 +105,7 @@ Acceptance is not commitment: poll `rand_getTransaction` until it returns a bloc
 
 ### `rand_mint` (testnet faucet)
 Params: `[address]`, `[address, amount]` or `[address, amount, record]`, where `address` is a
-`rand1…` receiver id (54 characters since chain 11), `amount` is a string of units, at most
+`rand1…` receiver id (53–55 characters since chain 11), `amount` is a string of units, at most
 `100000000000` (100 RAND; the default, `null` also means the default), and the optional third
 parameter `record` is a receiver record as JSON — the same hex-field shape `rand address --record`
 prints (`ReceiverRecordHex`: `version`, `pk`, `kem_ek`, `signing_key`, `signature`). Result: the
@@ -143,9 +143,14 @@ also the shape of the `register_receiver` action's fields on `rand_getTransactio
 `"kind": "register_receiver"`.
 
 ### `rand_getReceivers`
-Params: `[]`. Result: every published record, as an array in the same shape as
-`rand_getReceiver`'s result, one entry per registered id — the whole registry, for an indexer.
-There is no pagination: a chain's own receiver count is small next to its commitment tree.
+Params: `[from]` or `[from, limit]` (final review of short shielded addresses: the unbounded form
+served the whole registry in one call). `from` is a `rand1…` receiver id, exclusive of that row, or
+`null`/absent for the start of the registry; `limit` is capped at 1000 however large it is asked
+for, like `rand_getUnsealed`. Result: `{ receivers: [...], next_from }`, a page of records in
+`ReceiverId` order (the registry's own `BTreeMap` order), each in the same shape as
+`rand_getReceiver`'s result. `next_from` is the last row's own id — pass it back as the next
+call's `from` to resume just past it — or `null` once the page reaches the end of the registry.
+Page until `next_from` is `null`. A `from` that does not parse is `-32602`.
 
 ### `rand_getCommitments`
 Params: `[from_index]` or `[from_index, limit]`. Result: a page of commitment-tree leaves from

@@ -6,6 +6,11 @@ that validator's block rewards and released (unbonded) stake are paid, as a note
 state, so it is part of the genesis hash and cannot be changed by editing a file — only by the
 validator's own `rand-node register` on a running chain.
 
+Short shielded addresses (chain 11) made a register's `payout` a receiver id rather than an
+address, so this branch also added `<node-name>.record.json` beside each key: the signed
+`ReceiverRecord` that same id resolves to (`rand address --record`'s output for that key), needed
+so a chain-11 genesis can register these same 18 wallets with `rand-node genesis --receiver`.
+
 **These are test keys and they are committed on purpose**, the same convention the node keys in
 `deploy/` follow: any machine can clone the repo and run the fleet. The seeds are public, so
 anyone can spend what these wallets receive. That is acceptable here and wrong anywhere else:

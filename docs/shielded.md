@@ -69,7 +69,7 @@ which is what makes one wallet's shielded and transparent identities the same id
 ‖ id)[..4]` — 53 to 55 characters (base58 is variable length). The prefix stays `rand1`; only the
 length and the checksum tell a short address from the pre-chain-11 long form, which `parse`
 refuses by name: *"this is the pre-chain-11 long address form (pk + KEM key); chain 11 addresses
-are 54 characters — ask the receiver for their current address"*. A bad checksum is refused too,
+are 53–55 characters — ask the receiver for their current address"*. A bad checksum is refused too,
 separately.
 
 **The record.** An id resolves to a signed, versioned `ReceiverRecord`:
@@ -227,7 +227,7 @@ the pool back together.
 
 ```bash
 rand keygen                                      # wrote wallet.key.json
-rand address                                     # rand1x7Qk…  (54 characters, a receiver id)
+rand address                                     # rand1x7Qk…  (53–55 characters, a receiver id)
 rand request --amount 1.5 --memo coffee          # rand:rand1x7Qk…?rec=…&amount=…&memo=coffee
 rand faucet                                      # 100 RAND into a note only you can open
 rand sync                                        # scanned 41 leaves and 37 blocks; 1 notes, 1 unspent
@@ -513,7 +513,7 @@ and `docs/confidential.md` are the references; a chain turns the bridge on with 
 its genesis, which is a hard fork for the chains that take it and a no-op for the ones that do not.
 
 **Chain 11 — short shielded addresses: implemented on this branch, not yet cut.** The address
-shrank from 1,667 characters to 54 (§2): a receiver id resolving to a signed, versioned record,
+shrank from 1,667 characters to 53–55 (§2): a receiver id resolving to a signed, versioned record,
 delivered by a payment request or the explorer's registry, verified by the wallet either way.
 Register-state payouts and the bridge's recipient field are receiver ids now, resolved through the
 registry at apply time. `AGENTS.md` has the per-crate summary and the rulings.

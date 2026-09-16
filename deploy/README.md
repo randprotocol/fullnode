@@ -2,7 +2,7 @@
 
 Test keys only; all seeds are committed on purpose so any machine can pull and run.
 
-> **Chain 11 (cut 2026-09-17) is the short-shielded-address chain.** An address is now a 54-char
+> **Chain 11 (cut 2026-09-17) is the short-shielded-address chain.** An address is now a 53–55-char
 > receiver id (`rand1…`), not the long shielded address chain 10 used: what a sender needs to pay
 > it — the note key and the 1,184-byte ML-KEM encapsulation key — lives in a signed **receiver
 > record** the id resolves to, either delivered inline with a payment request or filed in the

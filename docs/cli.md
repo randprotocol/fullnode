@@ -253,7 +253,7 @@ Global options, accepted before or after the subcommand:
 | command | arguments | behaviour |
 |---|---|---|
 | `keygen` | | write a new spend-key file at `--key`, mode 0600; refuses to overwrite |
-| `address` | `--record` | print this wallet's `rand1…` receiver id (54 characters); `--record` prints the current signed receiver record as JSON instead (the file `rand send --record` and `rand-node genesis --receiver` read) |
+| `address` | `--record` | print this wallet's `rand1…` receiver id (53–55 characters); `--record` prints the current signed receiver record as JSON instead (the file `rand send --record` and `rand-node genesis --receiver` read) |
 | `request` | `--amount <RAND>`, `--memo <TEXT>` | print a `rand:…` payment-request URI carrying this wallet's record inline — payable with no registry and no prior registration (`docs/shielded.md` §2) |
 | `register` | `--rotate`, `--fee <RAND>`, `--cuda` | publish this wallet's receiver record on chain, paying with a self-transfer; `--rotate` first moves to a fresh ML-KEM key (every earlier key stays openable, forever) and publishes that instead |
 | `balance` | | scan the tree, save the store, print spendable value and the unspent note count |
@@ -320,7 +320,7 @@ fallback: a missing driver is an error rather than a silent CPU run.
 
 ```bash
 rand keygen                                   # wallet.key.json
-rand address                                  # rand1… (54 characters) — give this to whoever pays you
+rand address                                  # rand1… (53–55 characters) — give this to whoever pays you
 rand faucet                                   # testnet: 100 RAND into a note only you can open
 rand balance                                  # balance: 100 RAND
 rand send rand1q9f… 1.5                     # resolves the record from the registry, ~100 s of local proving, then the commit

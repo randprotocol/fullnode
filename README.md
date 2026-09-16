@@ -167,7 +167,7 @@ the persisted head. A validator set of `n` needs more than 2/3 of stake online: 
 ```bash
 export RAND_RPC=http://127.0.0.1:8545     # or --rpc on each call
 rand keygen                                # wallet.key.json (or --key <file>, RAND_KEY)
-rand address                               # rand1… — 54 characters, a receiver id
+rand address                               # rand1… — 53–55 characters, a receiver id
 rand balance                               # scans the tree with this key; nobody else can
 rand send <rand1 address> 1.5            # proves a bundle locally (~100 s), submits, waits
 rand bond <validator address> 1000         # stake: the bundle burns it out of this wallet's notes
