@@ -1787,7 +1787,11 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
         max_covers: 3,
         subsidy_base: 100 * UNITS_PER_SHRUGG,
         halving_blocks: 210_000,
-        window: 8,
+        // 32, not 8: the window is a block-validity rule since H1 (the ledger's coverable set),
+        // so the aggregate must land inside it. Resuming after the prove takes a view change or
+        // two, and 8 blocks (24 s) sealed on the last admissible block once and missed it once;
+        // 32 keeps the prune pass (every 16 blocks, gated at sealed_at + window) inside the wait.
+        window: 32,
         admitted_shapes: vec![shrugg_core::ledger::aggregation::AdmittedShape {
             shape,
             hc,
