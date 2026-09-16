@@ -6,24 +6,27 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-15)
 
-### Block aggregation: implementation in flight on `aggregation-spec` (user-owned hardware tasks gate activation)
+### Block aggregation: MERGED to main (856887a, 2026-09-16, linear rebase) — user-owned hardware tasks gate activation
 
 The chain-side block aggregation spec is **approved by the user (2026-09-15)** —
-`docs/superpowers/specs/2026-09-15-block-aggregation.md` — with its ten-task plan at
-`docs/superpowers/plans/2026-09-15-block-aggregation.md`. Work happens on branch
-`aggregation-spec`; **the finish line is merge to main + push** (T7–T10 remain at this writing:
-sealed sync, RPC/CLI, chain-9 genesis, end-to-end). Everything is genesis-gated on
-`genesis.aggregation`: a chain without the section behaves byte-for-byte as today, and the branch
-lands dark — activation waits on hardware below. Landed so far: the five actions and the
-genesis-gated `aggregators_root` (`shrugg-state-3`); the register actions mirrored on S2;
-`crates/shrugg-rvm` vendored from `circuits/recursion` `271679d` via `deploy/sync-zkvm.sh`'s
-two-step rename (a **path dep would fork `rand_zkvm` into two distinct crates — never do it**);
-the nine-step admission with the pinned hex conformance vectors reproduced byte-for-byte; the
-crate-cycle rule (shrugg-rvm → shrugg-zkvm, so the real `AggExecutor` lives in shrugg-node);
-subsidy + the four audit counters; sealing and pruning (CF_SEALS, pruned = full tx + 34 pv + 7
-shape bytes). Two traps already caught and pinned: `main.rs`'s genesis command must set
-`genesis.aggregation`, and `reload_ledger` must restore the gate on restart (fork-at-first-restart
-otherwise).
+`docs/superpowers/specs/2026-09-15-block-aggregation.md` — and all ten plan tasks landed on main
+(15 commits, rebased linear off 5748642; the full workspace suite green, the cluster capstone
+included). Everything is genesis-gated on `genesis.aggregation`: a chain without the section
+behaves byte-for-byte as today, so **chain 8 is unaffected and chain 9 activates only after the
+hardware batch below** (its measurements fill `admitted_shapes[0]`; the zero-digest placeholder
+refuses to init). What landed: the five actions and the genesis-gated `aggregators_root`
+(`shrugg-state-3`); the register actions mirrored on S2; `crates/shrugg-rvm` vendored from
+`circuits/recursion` `271679d` via `deploy/sync-zkvm.sh`'s two-step rename (a **path dep would
+fork `rand_zkvm` into two distinct crates — never do it**); the nine-step admission with the
+pinned hex conformance vectors reproduced byte-for-byte; the crate-cycle rule (shrugg-rvm →
+shrugg-zkvm, so the real `AggExecutor` lives in shrugg-node); subsidy + the four audit counters;
+sealing and pruning (CF_SEALS, pruned = full tx + 34 pv + 7 shape bytes); sealed-form sync with
+coverage-closed serving and the robust sync picker; the RPC surface and the `aggregate --watch`
+daemon; the chain-9 cut script. Traps already caught and pinned: `main.rs`'s genesis command must
+set `genesis.aggregation`; `reload_ledger` must restore the gate on restart (fork-at-first-restart
+otherwise); a resumed replica must re-register its `CoveredSource`; the replay path gets the
+record-only flavor of the window check, admission keeps the policy flavor; the aggregation tests
+need `RECURSION_FIXTURES` set (`docs/aggregation.md`).
 
 **User-owned hardware tasks (accepted 2026-09-15, scheduled 2026-09-16 — see `docs/deploy.md`
 "Deferred proof runs and hardware tasks" and README's "Open ops tasks"):** ① the ≥ 64 GB batch
