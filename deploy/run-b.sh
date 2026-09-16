@@ -2,15 +2,15 @@
 # Run validator B (behind NAT). Bootstraps to the public DigitalOcean nodes C and D; LAN peers are found via mDNS.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-# Prebuilt binaries at commit 5f8c6f9 (chain 9: constraint set 6, the pre-v0.1 security fixes,
-# libp2p 0.57) — the whole fleet must run this one build, because a constraint-set change is a
-# fork and a mixed fleet stalls. Override with BINDIR= to test a build.
-BINDIR=${BINDIR:-bin-5f8c6f9}
+# Prebuilt binaries at the chain-10 build (RAND: every hash domain, id and peer id changed with
+# the rename) — the whole fleet must run this one build, because a hash-domain change is a fork
+# and a mixed fleet stalls. Override with BINDIR= to test a build.
+BINDIR=${BINDIR:-bin-CHAIN10BUILD}
 BIN=$BINDIR/rand-node
-[ -x $BIN ] || { echo "$BIN missing — build it at 5f8c6f9 or set BINDIR" >&2; exit 1; }
-DATA=data-b-dbb7498b   # keyed on the genesis hash so a regenerated genesis gets a fresh db
-[ -d $DATA/db ] || $BIN init --datadir $DATA --genesis deploy/genesis-chain9.json
+[ -x $BIN ] || { echo "$BIN missing — build it at the chain-10 commit or set BINDIR" >&2; exit 1; }
+DATA=data-b-4d757f11   # keyed on the genesis hash so a regenerated genesis gets a fresh db
+[ -d $DATA/db ] || $BIN init --datadir $DATA --genesis deploy/genesis-chain10.json
 exec $BIN run --datadir $DATA --key deploy/node-b.key.json --validator \
     --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 \
-    --bootstrap /ip4/164.90.239.200/tcp/30303/p2p/12D3KooWBKYD5bBRczEhzYQrN4jgfgaoGXb6PzbfdjtTjiy1SA5g \
-    --bootstrap /ip4/165.245.173.74/tcp/30303/p2p/12D3KooWPrdUXsVXsD3RqaV4otq35awpJgMonSfdu3u8gtq5iUYq
+    --bootstrap /ip4/164.90.239.200/tcp/30303/p2p/12D3KooWSsBY2RbzwoFtRTJjVDghUqJ1zTwM5dMNra5JyVjpHxDK \
+    --bootstrap /ip4/165.245.173.74/tcp/30303/p2p/12D3KooWCWS38w4DwVt4vnfBnK7i4VFz3BrMziQpfoczSD7bdFg1

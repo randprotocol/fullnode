@@ -558,7 +558,7 @@ mod tests {
         assert!(s.ledger.bridge().is_none());
         assert_eq!(
             s.ledger.state_root().to_hex(),
-            "3b5306558bbdd5edbda6d9b15ace5fcf0d5d86430626c73cfd5933e557f58bbb",
+            "e845c110b5e366acf87806cb7f09cc212ad47008cac7cafbd141c30da4c738d4",
             "a chain without a bridge commits the four components, over S2's v2 register leaf"
         );
         assert!(!plain.to_json().contains("bridge"), "and its genesis file does not mention one");

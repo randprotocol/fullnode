@@ -1,24 +1,22 @@
-# Testnet: chain id 9 (RAND shielded pool, staking, bridge, zkVM constraint set 6, the pre-v0.1 security fixes)
+# Testnet: chain id 10 (RAND shielded pool, staking, bridge, zkVM constraint set 6)
 
 Test keys only; all seeds are committed on purpose so any machine can pull and run.
 
-> **Chain 9 (cut 2026-09-16) is the constraint-set-6 chain, on build `5f8c6f9`**: the M4.3/M4.4
-> re-vendor (the public input segment, `pv::NUM` 34, the six-keyed verifier key), the RPC
-> hardening, the vendored recursion VM and the chain-side aggregation code, the pre-v0.1
-> security review's three fixes (H1, M1, L1 — `../security/fullnode-security-review-pre-v0.1-2026-09-16.md`),
-> and libp2p 0.57. **Cut without the `aggregation` section** (`AGGREGATION=off
-> deploy/cut-chain9-genesis.sh`): the section's activation values are the user-owned ≥ 64 GB
-> measurements (`docs/deploy.md`, "Chain 9 activation") and a section cannot be added to a
-> running chain, so aggregation activates on a later chain. Chain 8 (build `03c9fb9`,
-> constraint set 5) is retired: a set-6 build cannot join the chain-8 fleet and a set-5 build
-> cannot verify a set-6 chain, in either direction. The chain-8 record is under "History".
+> **Chain 10 (cut 2026-09-16) is the RAND chain.** The coin is RAND; every crate, binary, RPC
+> method (`rand_*`), address prefix (`rand1…`), hash domain, the transaction id, the p2p identity
+> (every peer id changed — `deploy/nodes.env` was regenerated) and the systemd service
+> (`rand-node`) carry the new name, so chain 10 is a fresh chain like every rename before it.
+> Same code otherwise as chain 9 (constraint set 6, the pre-v0.1 security fixes, libp2p 0.57),
+> and like chain 9 **cut without the `aggregation` section** (`deploy/cut-chain10-genesis.sh`
+> defaults to `AGGREGATION=off`; the activation values are the user-owned ≥ 64 GB
+> measurements). The chain-9 and chain-8 records are under "History".
 
 | | |
 |---|---|
-| chain id | **9** |
-| genesis hash | **`dbb7498b83723ccf4de66f3497a50237bff3306e71d9598eb462120c5ae28904`** |
-| genesis file | `deploy/genesis-chain9.json` (cut 2026-09-16; chain 8's stays at `deploy/genesis-chain8.json`) |
-| pinned build | **`5f8c6f9`** — binaries in `bin-5f8c6f9/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `5f8c6f9` |
+| chain id | **10** |
+| genesis hash | **`4d757f11cbbf48daaf2040fbd091d70ca66d5ff6fcb228e8319c9014a99bb7ed`** |
+| genesis file | `deploy/genesis-chain10.json` (cut 2026-09-16; chain 9's stays at `deploy/genesis-chain9.json`) |
+| pinned build | **`CHAIN10BUILD`** — binaries `rand-node` and `rand` in `bin-CHAIN10BUILD/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `CHAIN10BUILD` |
 | zkVM | **constraint set 6** (the public input segment; M4.3 EVM and M4.4 sBPF/sha256 guests ride along) |
 | `hc_bundle` | `4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb` |
 | validators | **18, every one staked at exactly 1000 RAND** (the staking minimum) |
@@ -151,15 +149,15 @@ Nothing about chain 7 is reusable — different chain id, incompatible proofs �
 start on every machine. Keep chain 7's data directory around if you want to keep serving it; the
 new `DATA` name is keyed on the genesis hash, so the two never collide.
 
-1. **Binary**: `bin-5f8c6f9/rand-node` and `bin-5f8c6f9/rand` (or `cargo build --release` at
-   commit `5f8c6f9`; the Linux ones are built once on E and fanned out by `deploy/cutover-droplet.sh`). Every node on the fleet must run this one build — a constraint-set change is a
+1. **Binary**: `bin-CHAIN10BUILD/rand-node` and `bin-CHAIN10BUILD/rand` (or `cargo build --release` at
+   commit `CHAIN10BUILD`; the Linux ones are built once on E and fanned out by `deploy/cutover-droplet-rand.sh`). Every node on the fleet must run this one build — a constraint-set change is a
    fork, and a mixed fleet stalls.
-2. **Genesis**: `deploy/genesis-chain9.json`, byte-identical everywhere. `rand-node init` prints
-   the hash; it must read `dbb7498b83723ccf4de66f3497a50237bff3306e71d9598eb462120c5ae28904`.
-3. **Fresh data dir**: `data-<letter>-dbb7498b` (never reuse a chain-8 directory).
-4. **`.update-pin`** on the MacBook Air (node B, auto-updater): set its content to **`5f8c6f9`**, or
-   the updater drags B back onto the chain-8 build and B drops out of the set.
-5. **Start**, and check `rand-node status`: `height` climbing, `chain id 9`,
+2. **Genesis**: `deploy/genesis-chain10.json`, byte-identical everywhere. `rand-node init` prints
+   the hash; it must read `4d757f11cbbf48daaf2040fbd091d70ca66d5ff6fcb228e8319c9014a99bb7ed`.
+3. **Fresh data dir**: `data-<letter>-4d757f11` (never reuse a chain-9 directory).
+4. **`.update-pin`** on the MacBook Air (node B, auto-updater): set its content to **`CHAIN10BUILD`**, or
+   the updater drags B back onto the chain-9 build and B drops out of the set.
+5. **Start**, and check `rand-node status`: `height` climbing, `chain id 10`,
    `hc_bundle 4a27356f…`, `active_validator: true`, `notes: 5` at genesis,
    `tree_root 1ff293744074aa828b7a63cc26e5591d6f04173606a3b5048981649bbe2b35da` at height 0.
 6. **Quorum**: nothing commits until 13 of the 18 are up. Bring the droplets up before declaring a

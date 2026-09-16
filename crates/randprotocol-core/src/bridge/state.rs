@@ -1318,7 +1318,7 @@ mod tests {
         st.next_index = 2;
         st.spent.insert(Hash([0x44; 32]));
         st.burn_sequence = 7;
-        assert_eq!(st.root().to_hex(), "ee50b48c82eacf7aca2a1bdb33b32b7c98b1a255e645c9ba12dde9d060c43dc8");
+        assert_eq!(st.root().to_hex(), "89555202bad2a2c36210636e3f33a9c559cb6145c7b1be7548352f9ba642cf5b");
         // the emitter and the source-chain emitter table are committed too
         let mut other_emitter = st.clone();
         other_emitter.emitter = [9; 32];
