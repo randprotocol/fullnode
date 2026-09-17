@@ -47,6 +47,7 @@ chacha20poly1305 = "=0.11.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 postcard = { version = "1", features = ["alloc"] }
+zeroize = { workspace = true }
 # The GPU backend lives in the sibling `circuits` checkout and is referenced by path, never
 # vendored: `circuits/` must sit beside `fullnode/` to build any of the features below.
 rand-zkvm-cuda = { path = "../../../circuits/rand-zkvm-cuda", optional = true }

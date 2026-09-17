@@ -3,6 +3,7 @@
 #
 # Local additions (executor.rs, codec.rs, address.rs, call_envelope.rs, the extended guests.rs
 # and asm.rs, tests/executor.rs, tests/shielded.rs, tests/call_envelope.rs) are preserved;
+# delegate.rs (src and tests) is the delegated-proving job layer, node-local.
 # machine.rs gets a small post-sync patch exposing log_ext_degrees_pub (constraint set 6: now a
 # seven-argument (tier, program_log_height, input_log_height, keccak_log_height,
 # sha256_log_height, public_log_height, mem_log_height) function — see the cs6 patch comment
@@ -125,10 +126,10 @@ DST=crates/randprotocol-zkvm
 mkdir -p "$DST/src" "$DST/tests"
 rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude rust-toolchain.toml \
       --exclude executor.rs --exclude codec.rs --exclude guests.rs --exclude asm.rs \
-      --exclude address.rs --exclude arx.rs --exclude call_envelope.rs \
+      --exclude address.rs --exclude arx.rs --exclude call_envelope.rs --exclude delegate.rs \
       --exclude lib.rs --exclude main.rs "$SRC/src/" "$DST/src/"
 rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_envelope.rs \
-      --exclude viewing.rs --exclude bundle.rs "$SRC/tests/" "$DST/tests/"
+      --exclude viewing.rs --exclude bundle.rs --exclude delegate.rs "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local
 # `guests::compiled::{fib,keccak256}()` (see the header comment) need — `fib.bin` since M4.1,

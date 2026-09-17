@@ -16,3 +16,4 @@ pub mod address;
 pub mod call_envelope;
 pub mod executor;
 pub mod codec;
+pub mod delegate;
