@@ -122,7 +122,7 @@ enum Cmd {
     /// Confidential programs: build, deploy, show.
     #[command(subcommand)]
     Program(ProgramCmd),
-    /// Run a confidential call: prove locally, pay from a bundle, wait for the receipt.
+    /// Run a confidential call: prove here or at `--prover`, pay from a bundle, wait for the receipt.
     ///
     /// By default the call also publishes a sealed transcript of its private inputs (spec §6.1),
     /// which nobody but this wallet — and an auditor it names — can open. `--no-envelope` keeps

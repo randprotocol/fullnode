@@ -13,7 +13,9 @@ path = "src/main.rs"
 [dependencies]
 randprotocol-core = { workspace = true }
 randprotocol-zkvm = { workspace = true }
-reqwest = { workspace = true }
+# `rustls-tls` on top of the workspace entry (which carries no TLS backend): a `--prover` url
+# may be `https://`, and without a backend that request would fail where it was made.
+reqwest = { workspace = true, features = ["rustls-tls"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

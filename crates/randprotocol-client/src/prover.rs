@@ -96,7 +96,7 @@ impl RemoteProver {
             return Err(map_refusal(status, &v));
         }
         let id = v["id"].as_str().ok_or_else(|| anyhow!("the prover accepted the job but returned no id"))?.to_string();
-        eprintln!("prover accepted job {} at queue position {}", &id[..8], v["position"]);
+        eprintln!("prover accepted job {} at queue position {}", id.get(..8).unwrap_or(&id), v["position"]);
         let mut wait = Duration::from_secs(1);
         let started = std::time::Instant::now();
         loop {
