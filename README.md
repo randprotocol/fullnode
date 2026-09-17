@@ -288,6 +288,7 @@ Full detail in `docs/architecture.md`.
 | [docs/supply.md](docs/supply.md) | the supply audit: the counters, the invariant a node checks, and how exact it is |
 | [docs/confidential.md](docs/confidential.md) | programs, calls, outputs, gas, privacy |
 | [docs/delegated-proving.md](docs/delegated-proving.md) | delegated proof generation: `rand-prover`, custody, the wallet flags, the errors, the §11 experiment |
+| [docs/proving-benchmark.md](docs/proving-benchmark.md) | the 2026-09-17 two-hour measurement: local versus delegated proving on chain 12, per-operation proving and verification times, throughput, what a GPU would change |
 | [docs/architecture.md](docs/architecture.md) | how the node works end to end: consensus, ledger, storage, networking, sync, and one confidential transaction followed from wallet to receipt |
 | [docs/zkvm-milestones.md](docs/zkvm-milestones.md) | the Rand zkVM milestone by milestone (M1–M4, CUDA backend): what was built and why |
 | [docs/zkvm-m4-m5-progress.md](docs/zkvm-m4-m5-progress.md) | M4 and M5 as delivered: constraint sets 4–6, the recursion VM (M5.1–M5.4) with all measured numbers, what is deferred to which hardware |
