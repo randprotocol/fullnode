@@ -18,6 +18,7 @@
 //! trial-decrypts, exactly as `rand balance` does. A node that served the scan cannot answer
 //! the same question itself.
 
+use randprotocol_client::prover::Prover;
 use randprotocol_client::wallet::{self, Burn, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
 use randprotocol_core::confidential::ConfidentialExecutor;
@@ -796,7 +797,7 @@ async fn two_validators_commit_and_shielded_transfer() {
     let pay = UNITS_PER_RAND;
     let mut store = NoteStore::default();
     let slot = proving_slot().await;
-    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -931,7 +932,7 @@ async fn a_node_that_was_down_syncs_past_a_block_carrying_a_real_proof() {
     let pay = UNITS_PER_RAND;
     let mut store = NoteStore::default();
     let slot = proving_slot().await;
-    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -991,7 +992,7 @@ async fn two_bundles_spending_one_note_only_one_commits() {
             let (a, b) = (wallet(5), wallet(6));
             let mut store = NoteStore::default();
             let out =
-                wallet::send(&rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, false)
+                wallet::send(&rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, false)
                     .await;
             out.map(|s| (s.hash, s.amount))
         })
@@ -1066,7 +1067,7 @@ async fn confidential_call_rides_on_a_bundle() {
     assert_eq!(deploy_fee, gas::BUNDLE_BASE + gas::deploy_fee(program.words.len()));
     let slot = proving_slot().await;
     let deployed =
-        wallet::submit(&n0.rpc, &a, &mut store, None, action, deploy_fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::submit(&n0.rpc, &a, &mut store, None, action, deploy_fee, Burn::None, FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, true)
             .await
             .expect("the deploy bundle commits");
     drop(slot);
@@ -1097,7 +1098,7 @@ async fn confidential_call_rides_on_a_bundle() {
         call_fee,
         Burn::None,
         FriProfile::Test,
-        Backend::Cpu,
+        &Prover::Local(Backend::Cpu),
         CHAIN_ID,
         true,
     )
@@ -1235,7 +1236,7 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     let mut store = NoteStore::default();
     let slot = proving_slot().await;
     let bonded =
-        wallet::submit(&n0.rpc, &bonder, &mut store, None, action, fee, Burn::Rand(MIN_STAKE), FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::submit(&n0.rpc, &bonder, &mut store, None, action, fee, Burn::Rand(MIN_STAKE), FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, true)
             .await
             .expect("the bond's bundle is accepted and commits");
     drop(slot);
@@ -1396,7 +1397,7 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     let pay = UNITS_PER_RAND;
     let slot = proving_slot().await;
     let sent =
-        wallet::send(&n0.rpc, &payout, &mut store, &payee.address, pay, base, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::send(&n0.rpc, &payout, &mut store, &payee.address, pay, base, FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, true)
             .await
             .expect("the withdrawn note pays a real bundle");
     drop(slot);
@@ -1463,7 +1464,7 @@ async fn bridge_mint(
         Action::BridgeAttest { attestation, recipient: to.clone(), r: note.r, time, asset: index, envelope };
     let fee = gas::fee_floor(&action);
     let slot = proving_slot().await;
-    let s = wallet::submit(&node.rpc, relayer, store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let s = wallet::submit(&node.rpc, relayer, store, None, action, fee, Burn::None, FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the attestation's fee bundle commits");
     drop(slot);
@@ -1585,7 +1586,7 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
         EVM_TO,
         burn_fee,
         FriProfile::Test,
-        Backend::Cpu,
+        &Prover::Local(Backend::Cpu),
         CHAIN_ID,
         true,
     )
@@ -1652,7 +1653,7 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
     let deploy = Action::Deploy { base_pc: program.base_pc, words: program.words.clone() };
     let deploy_fee = wallet::deploy_fee_default(&deploy);
     let slot = proving_slot().await;
-    wallet::submit(&n0.rpc, &caller, &mut store, None, deploy, deploy_fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    wallet::submit(&n0.rpc, &caller, &mut store, None, deploy, deploy_fee, Burn::None, FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the deploy bundle commits");
     drop(slot);
@@ -1676,7 +1677,7 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
         wallet::call_fee_default(tier),
         Burn::None,
         FriProfile::Test,
-        Backend::Cpu,
+        &Prover::Local(Backend::Cpu),
         CHAIN_ID,
         true,
     )
@@ -1827,7 +1828,7 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
             gas::BUNDLE_BASE + 7,
             wallet::Burn::Rand(cfg.bond),
             FriProfile::Test,
-            Backend::Cpu,
+            &Prover::Local(Backend::Cpu),
             CHAIN_ID,
             true,
         )

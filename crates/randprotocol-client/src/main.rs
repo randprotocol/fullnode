@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use randprotocol_client::prover::{Prover, RemoteProver};
 use randprotocol_client::wallet::{self, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
 use randprotocol_client::wallet::{Burn, Submission};
@@ -31,6 +32,18 @@ struct Cli {
     /// Spend-key file. The note store lives next to it, at `<key>.notes.json`.
     #[arg(long, global = true, env = "RAND_KEY", default_value = "wallet.key.json")]
     key: PathBuf,
+    /// A `rand-prover` to delegate proving to. Unset: prove on this machine.
+    #[arg(long, global = true, env = "RAND_PROVER")]
+    prover: Option<String>,
+    /// The prover's rand1… address (`rand-prover address`); jobs are sealed to it. Required with --prover.
+    #[arg(long, global = true, env = "RAND_PROVER_ADDRESS")]
+    prover_address: Option<String>,
+    /// Bearer token the prover expects.
+    #[arg(long, global = true, env = "RAND_PROVER_TOKEN")]
+    prover_token: Option<String>,
+    /// Seconds the prover may take to *start* the job before it must refuse it.
+    #[arg(long, global = true, env = "RAND_PROVER_DEADLINE", default_value_t = 120)]
+    prover_deadline: u32,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -310,6 +323,29 @@ fn backend_for(cuda: bool) -> Result<Backend> {
     }
 }
 
+/// What `main` keeps of the delegation flags, read out before `cli.cmd` is matched by value:
+/// the url, the pinned address, the token and the start deadline.
+type Delegation = (Option<String>, Option<String>, Option<String>, u32);
+
+/// Where this run proves. `--cuda` and `--prover` are two answers to one question, so both is
+/// an error; and the first delegated run of a process says what delegation costs.
+fn prover_for(d: &Delegation, cuda: bool) -> Result<Prover> {
+    match &d.0 {
+        None => Ok(Prover::Local(backend_for(cuda)?)),
+        Some(url) => {
+            if cuda {
+                anyhow::bail!("--cuda proves here and --prover proves there; pass one");
+            }
+            let address = d.1.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--prover needs --prover-address (RAND_PROVER_ADDRESS): the rand1… address `rand-prover address` prints")
+            })?;
+            let address = parse_address(address).context("--prover-address")?;
+            eprintln!("warning: delegating to {url} hands it this wallet's spend key with every bundle; only a prover you would give your key file to");
+            Ok(Prover::Remote(RemoteProver::new(url.clone(), address, d.2.clone(), d.3)))
+        }
+    }
+}
+
 /// The summary line, printed. The wording lives in [`Submission::summary`], where a test can read
 /// it back.
 fn report(s: &Submission, what: &str) {
@@ -385,6 +421,8 @@ fn read_hex_arg(arg: &str) -> Result<Vec<u8>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // `cli.cmd` is matched by value below, so what the delegation flags say is read out first.
+    let delegation: Delegation = (cli.prover.clone(), cli.prover_address.clone(), cli.prover_token.clone(), cli.prover_deadline);
     let rpc = RpcClient::new(cli.rpc.clone());
     match cli.cmd {
         Cmd::Keygen => {
@@ -486,7 +524,7 @@ async fn main() -> Result<()> {
             let fee = match fee { Some(f) => parse_amount(&f)?, None => gas::BUNDLE_BASE };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::send(&rpc, &w, &mut store, &to, amount, fee, profile, backend_for(cuda)?, chain_id, !no_wait).await;
+            let s = wallet::send(&rpc, &w, &mut store, &to, amount, fee, profile, &prover_for(&delegation, cuda)?, chain_id, !no_wait).await;
             store.save(&path)?;
             report(&s?, "transfer");
             if !no_wait {
@@ -538,7 +576,7 @@ async fn main() -> Result<()> {
             // note, and the ledger admits a bond only when the bundle burns exactly what is
             // bonded. The unit is RAND, which is now in the type rather than in this comment.
             let s =
-                wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::rand(amount), profile, backend_for(cuda)?, chain_id, !no_wait)
+                wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::rand(amount), profile, &prover_for(&delegation, cuda)?, chain_id, !no_wait)
                     .await;
             store.save(&path)?;
             report(&s?, "bond");
@@ -583,7 +621,7 @@ async fn main() -> Result<()> {
             let fee = wallet::deploy_fee_default(&action);
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, true).await;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, &prover_for(&delegation, cuda)?, chain_id, true).await;
             store.save(&path)?;
             report(&s?, "deploy");
             println!("program id: {id} ({} words)", p.words.len());
@@ -606,23 +644,21 @@ async fn main() -> Result<()> {
             let prog = Program { base_pc, words };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let backend = backend_for(cuda)?;
-            eprintln!("proving the call locally ({} inputs stay private)…", inputs.len());
+            let prover = prover_for(&delegation, cuda)?;
+            eprintln!("proving the call {} ({} inputs stay private)…", prover.where_(), inputs.len());
             let t = std::time::Instant::now();
             // Two provers, one difference: `prove_call` returns the `H_IN` salt as well, which is
             // what the transcript is sealed with. Since `prove_salted_with` it does so on every
-            // backend, so `--cuda` and an envelope go together.
-            let (proof, outputs, tier, envelope, call_key) = if no_envelope {
-                let (proof, outputs, tier) =
-                    executor::prove(profile, &prog, &inputs, tier, backend).map_err(|e| anyhow::anyhow!(e))?;
-                (proof, outputs, tier, None, None)
-            } else {
-                let (proof, outputs, tier, salt) =
-                    executor::prove_call(profile, &prog, &inputs, tier, backend).map_err(|e| anyhow::anyhow!(e))?;
-                let h_in = hash::input_digest(salt, &inputs);
-                let (e, key) = call_envelope::seal_call_envelope(&w.vk, auditor.as_ref(), &h_in, salt, &inputs)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                (proof, outputs, tier, Some(e), Some(key))
+            // backend, so `--cuda` and an envelope go together — and so does a delegated prover.
+            let (proof, outputs, tier, salt) = prover.prove_program(profile, &prog, &inputs, tier, !no_envelope).await?;
+            let (envelope, call_key) = match salt {
+                None => (None, None),
+                Some(salt) => {
+                    let h_in = hash::input_digest(salt, &inputs);
+                    let (e, key) = call_envelope::seal_call_envelope(&w.vk, auditor.as_ref(), &h_in, salt, &inputs)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    (Some(e), Some(key))
+                }
             };
             eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {outputs:?}", t.elapsed(), proof.len());
             let action = Action::Call { program: pid, proof, input_envelope: envelope };
@@ -630,7 +666,7 @@ async fn main() -> Result<()> {
                 Some(f) => parse_amount(&f)?,
                 None => wallet::call_fee_default(tier),
             };
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend, chain_id, true).await;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, &prover, chain_id, true).await;
             store.save(&path)?;
             let s = s?;
             report(&s, "call");
@@ -753,7 +789,7 @@ async fn main() -> Result<()> {
             };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, &prover_for(&delegation, cuda)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -820,7 +856,7 @@ async fn main() -> Result<()> {
                 to,
                 fee,
                 profile,
-                backend_for(cuda)?,
+                &prover_for(&delegation, cuda)?,
                 chain_id,
                 !no_wait,
             )

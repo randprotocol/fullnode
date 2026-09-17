@@ -20,6 +20,7 @@ use randprotocol_core::types::CallEnvelope;
 use randprotocol_core::{Hash, Transaction};
 use std::time::{Duration, Instant};
 
+pub mod prover;
 pub mod wallet;
 
 /// One leaf of the commitment tree as `rand_getCommitments` reports it: the leaf index, the

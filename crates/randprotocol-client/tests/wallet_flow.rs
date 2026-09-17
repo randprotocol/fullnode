@@ -27,6 +27,7 @@
 //! `cargo test` against the same target directory — is ever in flight beside it. The slow blocks
 //! are what covers a slow machine; the slot is what covers a busy one.
 
+use randprotocol_client::prover::Prover;
 use randprotocol_client::wallet::{self, Burn, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
 use randprotocol_core::genesis::{Genesis, GenesisValidator};
@@ -136,7 +137,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     // read and released after the commit, so no other test's proof shares these cores (see
     // `proving_slot`).
     let slot = proving_slot().await;
-    let first = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let first = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, fee, FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -162,7 +163,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
 
     // ---- the change note is spendable ----
     let slot = proving_slot().await;
-    let second = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let second = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, fee, FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the change note pays a second bundle");
     drop(slot);
@@ -183,7 +184,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     let action = randprotocol_core::Action::Bond { validator, amount: bond, registration: None };
     let slot = proving_slot().await;
     let bonded =
-        wallet::submit(&rpc, &a, &mut a_store, None, action, fee, Burn::Rand(bond), FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::submit(&rpc, &a, &mut a_store, None, action, fee, Burn::Rand(bond), FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, true)
             .await
             .expect("the bond's bundle is accepted and commits");
     drop(slot);
@@ -205,7 +206,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     let deploy = Action::Deploy { base_pc: prog.base_pc, words: prog.words.clone() };
     let fee = wallet::deploy_fee_default(&deploy);
     let slot = proving_slot().await;
-    wallet::submit(&rpc, &a, &mut a_store, None, deploy, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    wallet::submit(&rpc, &a, &mut a_store, None, deploy, fee, Burn::None, FriProfile::Test, &Prover::Local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the program deploys");
     drop(slot);
@@ -229,7 +230,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
         wallet::call_fee_default(tier),
         Burn::None,
         FriProfile::Test,
-        Backend::Cpu,
+        &Prover::Local(Backend::Cpu),
         CHAIN_ID,
         true,
     )

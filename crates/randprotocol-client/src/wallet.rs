@@ -11,6 +11,7 @@
 //! the process is exactly what a bundle publishes: an anchor, two nullifiers, two commitments,
 //! the fee, and two envelopes nobody but their recipients can open.
 
+use crate::prover::Prover;
 use crate::{AssetRow, CommitmentRow, RpcClient};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -20,8 +21,7 @@ use randprotocol_core::ledger::{bridge_notes, TIME_WINDOW};
 use randprotocol_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, DEPTH};
 use randprotocol_core::{format_amount, gas, Action, Hash, Transaction};
 use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note};
-use randprotocol_zkvm::executor::prove_bundle;
-use randprotocol_zkvm::machine::{Backend, FriProfile};
+use randprotocol_zkvm::machine::FriProfile;
 use randprotocol_zkvm::notes::{bundle_inputs, expected_bundle_outputs, Note, SpendKey, ViewingKey};
 use randprotocol_zkvm::viewing::TxKey;
 use std::collections::BTreeMap;
@@ -775,7 +775,7 @@ async fn prove_bundles(
     w: &Wallet,
     plans: &[Plan],
     profile: FriProfile,
-    backend: Backend,
+    prover: &Prover,
 ) -> Result<(Vec<Proved>, u32)> {
     let mut attempt = 0;
     let (height, root, paths) = loop {
@@ -810,14 +810,14 @@ async fn prove_bundles(
     let mut proved = Vec::with_capacity(plans.len());
     for (i, (plan, paths)) in plans.iter().zip(&paths).enumerate() {
         let which = if plans.len() > 1 { format!("bundle {} of {}", i + 1, plans.len()) } else { "bundle".to_string() };
-        proved.push(prove_one(w, plan, paths, root, time, &which, profile, backend)?);
+        proved.push(prove_one(w, plan, paths, root, time, &which, profile, prover).await?);
     }
     Ok((proved, time))
 }
 
 /// One planned bundle's proof: the slots, the two outputs, the digest check and the two envelopes.
 #[allow(clippy::too_many_arguments)]
-fn prove_one(
+async fn prove_one(
     w: &Wallet,
     plan: &Plan,
     paths: &[[Word8; DEPTH]],
@@ -825,7 +825,7 @@ fn prove_one(
     time: u32,
     which: &str,
     profile: FriProfile,
-    backend: Backend,
+    prover: &Prover,
 ) -> Result<Proved> {
     // A dummy input is a zero-value note owned by this wallet with an all-zero path at index 0:
     // the guest forces every input's owner to the derived `pk_self` and skips `MERKLE_VERIFY` (and
@@ -858,9 +858,9 @@ fn prove_one(
     let words = bundle_inputs(&w.sk, &inputs, &outputs, root, fee, burn, asset, time);
     let expected = expected_bundle_outputs(&w.sk, &inputs, &outputs, root, fee, burn, asset, time);
 
-    eprintln!("proving {which} (tier 14; about a minute on a laptop)…");
+    eprintln!("proving {which} {} (tier 14)…", prover.where_());
     let started = Instant::now();
-    let (proof, digest, tier) = prove_bundle(profile, &words, backend).map_err(|e| anyhow!("proving the bundle failed: {e}"))?;
+    let (proof, digest, tier) = prover.prove_bundle(profile, &words).await?;
     let proving = started.elapsed();
     eprintln!("proved in {proving:.1?}: tier {tier}, {} bytes", proof.len());
     // The guest taints its digest instead of failing when a witness violates the relation, so a
@@ -869,9 +869,10 @@ fn prove_one(
     // a digest that matches no plaintext.
     if digest != expected {
         return Err(anyhow!(
-            "the bundle proof published digest {} but this wallet built {} — refusing to submit (wallet bug)",
+            "the bundle proof published digest {} but this wallet built {} — refusing to submit (a wallet bug, or a prover {} that proved some other bundle)",
             word8_to_hex(&digest),
             word8_to_hex(&expected),
+            prover.where_(),
         ));
     }
 
@@ -945,7 +946,7 @@ pub async fn submit(
     fee: u64,
     burn: Burn,
     profile: FriProfile,
-    backend: Backend,
+    prover: &Prover,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
@@ -964,7 +965,7 @@ pub async fn submit(
     scan(rpc, w, store).await?;
     let (dest, amount) = to.unwrap_or((&w.address, 0));
     let plans = [Plan::select(store, 0, dest, amount, fee, burn.units())?];
-    let (proved, time) = prove_bundles(rpc, w, &plans, profile, backend).await?;
+    let (proved, time) = prove_bundles(rpc, w, &plans, profile, prover).await?;
     let [one] = <[Proved; 1]>::try_from(proved).ok().expect("one plan, one proof");
 
     let proof_bytes = one.bundle.proof.len();
@@ -1036,7 +1037,7 @@ pub async fn submit_burn(
     to: [u8; 32],
     fee: u64,
     profile: FriProfile,
-    backend: Backend,
+    prover: &Prover,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
@@ -1067,7 +1068,7 @@ pub async fn submit_burn(
             .with_context(|| format!("selecting notes of asset {asset} to burn"))?,
         Plan::select(store, 0, &w.address, 0, fee, 0).context("selecting RAND notes for the fee bundle")?,
     ];
-    let (proved, time) = prove_bundles(rpc, w, &plans, profile, backend).await?;
+    let (proved, time) = prove_bundles(rpc, w, &plans, profile, prover).await?;
     let [asset_proof, fee_proof] = <[Proved; 2]>::try_from(proved).ok().expect("two plans, two proofs");
 
     let proof_bytes = asset_proof.bundle.proof.len() + fee_proof.bundle.proof.len();
@@ -1273,11 +1274,11 @@ pub async fn send(
     amount: u64,
     fee: u64,
     profile: FriProfile,
-    backend: Backend,
+    prover: &Prover,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    submit(rpc, w, store, Some((to, amount)), Action::None, fee, Burn::None, profile, backend, chain_id, wait).await
+    submit(rpc, w, store, Some((to, amount)), Action::None, fee, Burn::None, profile, prover, chain_id, wait).await
 }
 
 #[cfg(test)]
@@ -1820,7 +1821,7 @@ mod tests {
                 [1; 32],
                 burn_fee_default(),
                 FriProfile::Test,
-                Backend::Cpu,
+                &Prover::Local(randprotocol_zkvm::machine::Backend::Cpu),
                 7,
                 false,
             )
