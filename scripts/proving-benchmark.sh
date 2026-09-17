@@ -44,7 +44,7 @@ secs() { awk '{ v=$1; if (v ~ /ms$/) { sub(/ms$/,"",v); print v/1000 } else if (
 hash_of() { grep -o "submitted $2 [0-9a-f]*" <<<"$1" | head -1 | awk '{print $3}'; }
 # Sum of every "proved in X" line (a call prints two: the program proof and its fee bundle).
 proved_total() { local t=0 x; while read -r x; do t=$(awk -v a="$t" -v b="$(secs "$x")" 'BEGIN{print a+b}'); done < <(grep -o 'proved in [0-9.]*[a-zµ]*' <<<"$1" | awk '{print $3}'); echo "$t"; }
-proof_bytes() { grep -o 'proved in [^,]*, tier [0-9]*, [0-9]* bytes' <<<"$1" | awk '{s+=$(NF-1)} END{print s+0}'; }
+proof_bytes() { grep -o 'proved in [^:]*: tier [0-9]*, [0-9]* bytes' <<<"$1" | awk '{s+=$(NF-1)} END{print s+0}'; }
 verify_cold() { grep -o 'verified in [0-9.]*[a-zµ]* (cold)' <<<"$1" | awk '{print $3}' | { t=0; while read -r x; do t=$(awk -v a="$t" -v b="$(secs "$x")" 'BEGIN{print a+b}'); done; echo "$t"; }; }
 verify_warm() { grep -o '(cold), [0-9.]*[a-zµ]* (warm)' <<<"$1" | awk '{print $2}' | { t=0; while read -r x; do t=$(awk -v a="$t" -v b="$(secs "$x")" 'BEGIN{print a+b}'); done; echo "$t"; }; }
 # Poll until the transaction is committed; print "height block_timestamp_ms".
@@ -103,7 +103,7 @@ while [ $(( $(date +%s) - T_START )) -lt "$DURATION" ]; do
       pid=$(rpc rand_getTransaction "[\"$dh\"]" | grep -o '"program":"[0-9a-f]*"' | head -1 | cut -d'"' -f4)
     fi
     if [ -n "$pid" ]; then
-      op "$cycle" call call "$BIN" call "$pid" 400 250 300 75 --key "$WALLET" --rpc "$RPC"
+      op "$cycle" call call "$BIN" call "$pid" --input 400 --input 250 --input 300 --input 75 --key "$WALLET" --rpc "$RPC"
     else
       log "cycle $cycle call SKIP: no program id in the deploy's transaction"
     fi
