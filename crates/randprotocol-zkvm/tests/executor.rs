@@ -107,3 +107,24 @@ fn prove_takes_a_backend_and_cpu_is_unchanged() {
     let out = ex.verify_call(&record(&p), &proof).unwrap();
     assert_eq!((out.outputs, out.tier), (outputs, tier));
 }
+
+/// `prove_salted_with` on the CPU backend is `prove_salted`: same salt in, same `H_IN` out.
+/// This is the contract `executor::prove_call` relies on to return the salt on any backend.
+/// `pv` has no named `IN7` (only `IN0`, with `PUB0 = IN0 + 8` marking the range's end — see
+/// `tables::cpu`), so this compares `pv::IN0..pv::IN0 + 8`, the range every other `IN0..7`
+/// caller in this crate already uses.
+#[test]
+fn prove_salted_with_cpu_publishes_the_same_h_in_as_prove_salted() {
+    use randprotocol_zkvm::machine::{Backend, FriProfile, Machine};
+    use randprotocol_zkvm::tables::cpu::pv;
+    let m = Machine::new(FriProfile::Test);
+    let (_, prog, inputs) = randprotocol_zkvm::guests::all().into_iter().find(|(n, _, _)| *n == "fib(20)").unwrap();
+    let salt = [7u32, 8, 9, 10];
+    let (a, _) = m.prove_salted(&prog, &inputs, &[], salt, None).unwrap();
+    let (b, _) = m.prove_salted_with(Backend::Cpu, &prog, &inputs, &[], salt, None).unwrap();
+    assert_eq!(a.public_values[pv::IN0..pv::IN0 + 8], b.public_values[pv::IN0..pv::IN0 + 8]);
+    let expected = randprotocol_zkvm::hash::input_digest(salt, &inputs);
+    let published: Vec<u64> = expected.iter().map(|w| *w as u64).collect();
+    assert_eq!(&b.public_values[pv::IN0..pv::IN0 + 8], &published[..]);
+    m.verify(&prog.digest(), &b).unwrap();
+}

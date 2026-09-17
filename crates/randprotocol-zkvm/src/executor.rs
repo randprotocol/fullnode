@@ -461,9 +461,7 @@ pub fn prove(
 /// makes `H_IN` a guessable commitment to the private inputs, which is the whole reason M4.1
 /// salts it (`Machine::prove_salted`'s doc comment).
 ///
-/// Only `Backend::Cpu` can answer: the GPU and reference paths run inside the vendored
-/// `Machine::prove_with`, which draws its own salt and never returns it. A caller proving on
-/// one of those backends must prove without an envelope (`prove`) — the chain accepts both.
+/// Any backend: the salt is drawn here and threaded through `Machine::prove_salted_with`.
 pub fn prove_call(
     profile: FriProfile,
     program: &Program,
@@ -481,23 +479,16 @@ pub fn prove_call(
             inputs.len()
         ));
     }
-    match backend {
-        Backend::Cpu => {
-            use rand::RngExt;
-            let salt: [u32; 4] = rand::rng().random();
-            let m = Machine::new(profile);
-            // The empty public segment, as in `prove`.
-            let (proof, exec) = m
-                .prove_salted(program, inputs, &[], salt, tier.map(|t| Tier(t as usize)))
-                .map_err(|e| format!("{e:?}"))?;
-            Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8, salt))
-        }
-        #[allow(unreachable_patterns)]
-        other => Err(format!(
-            "{other:?} draws its H_IN salt inside the prover and cannot return it; \
-             prove a call that publishes an input envelope on the CPU backend"
-        )),
-    }
+    use rand::RngExt;
+    let salt: [u32; 4] = rand::rng().random();
+    let m = Machine::new(profile);
+    // The empty public segment, as in `prove`. Any backend: `prove_salted_with` threads the
+    // salt through `prove_on` for the reference and CUDA engines exactly as `prove_salted`
+    // does on the CPU, which is what lets a GPU call proof publish an input envelope.
+    let (proof, exec) = m
+        .prove_salted_with(backend, program, inputs, &[], salt, tier.map(|t| Tier(t as usize)))
+        .map_err(|e| format!("{e:?}"))?;
+    Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8, salt))
 }
 
 /// Wallet-side prover for a shielded bundle: proves `guests::bundle()` on `inputs` (built by

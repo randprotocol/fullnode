@@ -1289,10 +1289,22 @@ impl Machine {
 
     /// Prove on `backend`. `Backend::Cpu` is exactly `prove`; the other backends run the same
     /// batch STARK with `rand-zkvm-cuda`'s engines and hand back a `Proof` that this
-    /// `Machine`'s own `verify` accepts.
+    /// `Machine`'s own `verify` accepts. Draws the per-proof `H_IN` salt from OS entropy and
+    /// delegates to [`Self::prove_salted_with`], as `prove` does to `prove_salted`.
     pub fn prove_with(&self, backend: Backend, program: &Program, inputs: &[u32], public: &[u32], tier: Option<Tier>) -> Result<(Proof, Execution), ProveError> {
+        use rand::RngExt;
+        let salt: [u32; 4] = rand::rng().random();
+        self.prove_salted_with(backend, program, inputs, public, salt, tier)
+    }
+
+    /// The body of `prove_with`, taking the `H_IN` salt explicitly — the backend-generic
+    /// mirror of `prove_salted`. Exists so a caller that must *return* the salt (a call whose
+    /// input envelope is sealed with it, `executor::prove_call`) can do so on any backend;
+    /// every ordinary caller wants `prove_with`. The salt never leaves the prover except
+    /// folded, non-invertibly, into `pv::IN0..7`.
+    pub fn prove_salted_with(&self, backend: Backend, program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 4], tier: Option<Tier>) -> Result<(Proof, Execution), ProveError> {
         match backend {
-            Backend::Cpu => self.prove(program, inputs, public, tier),
+            Backend::Cpu => self.prove_salted(program, inputs, public, salt, tier),
             #[cfg(feature = "reference-backend")]
             Backend::Reference => {
                 // Fresh entropy for the proving config (hiding), deterministic for the key
@@ -1300,7 +1312,7 @@ impl Machine {
                 let cfg = reference_cfg::config(self.profile, StdRng::from_rng(&mut rand::rng()), StdRng::from_rng(&mut rand::rng()));
                 let (mmcs_rng, pcs_rng) = key_rngs();
                 let key = reference_cfg::config(self.profile, mmcs_rng, pcs_rng);
-                self.prove_on(&cfg, &key, program, inputs, public, tier)
+                self.prove_on(&cfg, &key, program, inputs, public, salt, tier)
             }
             #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
             Backend::Cuda => {
@@ -1308,7 +1320,7 @@ impl Machine {
                 let cfg = cuda_cfg::config(self.profile, gpu.clone(), StdRng::from_rng(&mut rand::rng()), StdRng::from_rng(&mut rand::rng()));
                 let (mmcs_rng, pcs_rng) = key_rngs();
                 let key = cuda_cfg::config(self.profile, gpu, mmcs_rng, pcs_rng);
-                self.prove_on(&cfg, &key, program, inputs, public, tier)
+                self.prove_on(&cfg, &key, program, inputs, public, salt, tier)
             }
         }
     }
@@ -1329,7 +1341,7 @@ impl Machine {
     /// backend proof stops matching what the CPU verifier recomputes. Change one, change the
     /// other.
     #[cfg(any(feature = "reference-backend", feature = "cuda", feature = "mock-cuda"))]
-    fn prove_on<SC>(&self, cfg: &SC, key_cfg: &SC, program: &Program, inputs: &[u32], public: &[u32], tier: Option<Tier>) -> Result<(Proof, Execution), ProveError>
+    fn prove_on<SC>(&self, cfg: &SC, key_cfg: &SC, program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 4], tier: Option<Tier>) -> Result<(Proof, Execution), ProveError>
     where
         SC: StarkGenericConfig<Challenge = Challenge, Challenger = Challenger>,
         // Bounds copied from `p3_batch_stark::prove_batch`'s signature, plus the pin that
@@ -1340,10 +1352,8 @@ impl Machine {
         <SC::Pcs as p3_commit::Pcs<Challenge, Challenger>>::Commitment: Sync,
     {
         // Mirrors `prove`: run up to the largest tier's cycle budget, so `OutOfCycles` and
-        // `TooManyCycles` agree on the limit here exactly as they do on the CPU path, and draw
-        // the same fresh-per-proof H_IN salt from OS entropy `prove`/`prove_salted` do.
-        use rand::RngExt;
-        let salt: [u32; 4] = rand::rng().random();
+        // `TooManyCycles` agree on the limit here exactly as they do on the CPU path, and use
+        // the salt `prove_salted_with` was given.
         let exec = execute(program, inputs, public, Tier(*TIERS.last().unwrap()).max_cycles()).map_err(ProveError::Exec)?;
         let tier = match tier {
             // Audit ZH3 (2026-09-12): an out-of-`TIERS` tier is an error here, not a

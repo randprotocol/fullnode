@@ -610,9 +610,8 @@ async fn main() -> Result<()> {
             eprintln!("proving the call locally ({} inputs stay private)…", inputs.len());
             let t = std::time::Instant::now();
             // Two provers, one difference: `prove_call` returns the `H_IN` salt as well, which is
-            // what the transcript is sealed with. It is CPU-only — every other backend draws that
-            // salt inside the prover and drops it — so a GPU proof has to go without an envelope,
-            // and says so in its own words rather than being quietly downgraded here.
+            // what the transcript is sealed with. Since `prove_salted_with` it does so on every
+            // backend, so `--cuda` and an envelope go together.
             let (proof, outputs, tier, envelope, call_key) = if no_envelope {
                 let (proof, outputs, tier) =
                     executor::prove(profile, &prog, &inputs, tier, backend).map_err(|e| anyhow::anyhow!(e))?;
