@@ -427,8 +427,9 @@ impl BridgeState {
     /// the guardian set named by the envelope, reject an already-consumed
     /// digest, decode and check the payload, and only then verify the quorum.
     ///
-    /// Cheap before expensive: `BridgeAttest` has a zero minimum fee, so
-    /// every check that needs no signature recovery runs first. Otherwise a
+    /// Cheap before expensive: `BridgeAttest`'s attestation-specific fee is
+    /// zero (its floor is the bundle base like any transaction), so every
+    /// check that needs no signature recovery runs first. Otherwise a
     /// replayed (public, already-consumed) or mis-addressed attestation
     /// would buy a full quorum of secp256k1 recoveries on every node that
     /// validates it. The accepted set is identical either way; only which
@@ -1373,7 +1374,8 @@ mod tests {
     /// everything that needs no signature recovery — replay, emitter
     /// binding, payload shape and amounts, the rotation index — is decided
     /// first, so a replayed or mis-addressed attestation cannot buy the
-    /// quorum's secp256k1 recoveries at the zero minimum fee. The set of
+    /// quorum's secp256k1 recoveries at the bridge's zero attestation
+    /// surcharge. The set of
     /// accepted attestations is unchanged; only the order of refusals is.
     #[test]
     fn cheap_checks_run_before_signature_recovery() {

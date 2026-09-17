@@ -414,6 +414,22 @@ fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
     if cfg.guardians.is_empty() {
         return bad("no guardians".into());
     }
+    // A set whose own quorum attestation cannot fit the wire cap is a chain that could not
+    // run: a transfer attestation is 6 envelope bytes + 66 per signature + a 51-byte body
+    // header + a 133-byte payload, and it must fit `MAX_ATTESTATION_BYTES`. Governance keeps
+    // sets far smaller (a Solana release transaction fits about seven signatures), but that is
+    // cross-chain policy; this bound is the one above which no attestation can ever verify.
+    let quorum = crate::bridge::quorum(cfg.guardians.len());
+    let attestation_len = 6 + 66 * quorum + 51 + crate::bridge::TRANSFER_PAYLOAD_LEN;
+    if attestation_len > crate::gas::MAX_ATTESTATION_BYTES {
+        return bad(format!(
+            "guardian set of {} is too large: quorum {} makes a {}-byte attestation, above MAX_ATTESTATION_BYTES ({})",
+            cfg.guardians.len(),
+            quorum,
+            attestation_len,
+            crate::gas::MAX_ATTESTATION_BYTES
+        ));
+    }
     if cfg.guardians.iter().collect::<std::collections::BTreeSet<&GuardianKey>>().len() != cfg.guardians.len() {
         return bad("duplicate guardian key".into());
     }
@@ -691,6 +707,38 @@ mod tests {
             c.emitters.insert(2, [0; 32]);
         })
         .contains("zero emitter address for chain 2"));
+    }
+
+    /// A guardian set too large for its own quorum's attestation to fit
+    /// `MAX_ATTESTATION_BYTES` is a chain that could not run: refused at
+    /// build time, with the boundary itself pinned (quorum 245 fits a
+    /// 16,360-byte attestation, quorum 246 needs 16,426).
+    #[test]
+    fn an_oversized_guardian_set_is_refused() {
+        let key = |i: usize| {
+            let mut k = [0u8; 20];
+            k[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            k[19] = 1; // never the zero key
+            k
+        };
+        let mut g = genesis(1);
+        let mut cfg = bridge_cfg();
+        cfg.guardians = (0..368).map(key).collect();
+        g.bridge = Some(cfg);
+        match g.build(&StubExecutor) {
+            Err(GenesisError::BadBridgeConfig(m)) => {
+                assert!(m.contains("too large"), "{m}");
+                assert!(m.contains("368"), "{m}");
+            }
+            other => panic!("expected BadBridgeConfig, got {other:?}"),
+        }
+        // The largest set whose quorum attestation still fits is accepted:
+        // quorum(367) = 245, so the attestation is 6 + 66*245 + 51 + 133 = 16,360 bytes.
+        let mut g = genesis(1);
+        let mut cfg = bridge_cfg();
+        cfg.guardians = (0..367).map(key).collect();
+        g.bridge = Some(cfg);
+        assert!(g.build(&StubExecutor).is_ok(), "367 guardians is the largest runnable set");
     }
 
     /// Phase S2: genesis seeds the register with each validator's payout address and fixes the
