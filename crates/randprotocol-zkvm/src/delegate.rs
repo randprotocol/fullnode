@@ -158,8 +158,11 @@ pub fn seal_job(to: &ShieldedAddress, job: &JobRequest) -> Result<Sealed, String
 
 pub fn open_job(key: &ProverKey, sealed: &Sealed) -> Result<JobRequest, String> {
     let mut pt = open_with(&key.dk, AAD_JOB, sealed)?;
-    let job: JobRequest = postcard::from_bytes(&pt).map_err(|e| e.to_string())?;
+    // The plaintext is a witness — the spend key among it. It goes back to zero whether or not
+    // it parsed, so a malformed job cannot leave one in a freed allocation.
+    let job = postcard::from_bytes::<JobRequest>(&pt);
     pt.zeroize();
+    let job = job.map_err(|e| e.to_string())?;
     if job.version != VERSION {
         return Err(format!("job version {} is not {VERSION}", job.version));
     }
@@ -174,8 +177,10 @@ pub fn seal_result(reply_ek: &[u8], result: &JobResult) -> Result<Sealed, String
 }
 
 pub fn open_result(key: &ReplyKey, sealed: &Sealed) -> Result<JobResult, String> {
-    let pt = open_with(&key.dk, AAD_RESULT, sealed)?;
-    postcard::from_bytes(&pt).map_err(|e| e.to_string())
+    let mut pt = open_with(&key.dk, AAD_RESULT, sealed)?;
+    let result = postcard::from_bytes::<JobResult>(&pt);
+    pt.zeroize();
+    result.map_err(|e| e.to_string())
 }
 
 pub fn encode(sealed: &Sealed) -> Vec<u8> {
