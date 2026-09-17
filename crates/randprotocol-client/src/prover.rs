@@ -17,6 +17,13 @@ use std::time::Duration;
 
 pub const LOCAL_HINT: &str = "drop --prover to prove here (about a minute and a half per bundle on a laptop)";
 
+/// On top of `--prover-deadline`, which bounds only the wait for a slot: how long the proof
+/// itself may take before this wallet stops waiting for it.
+const PROVING_ALLOWANCE_SECS: u64 = 900;
+
+/// Polls in a row that may fail at the transport before the job is given up on.
+const POLL_RETRIES: u32 = 5;
+
 pub fn profile_name(p: FriProfile) -> &'static str {
     match p {
         FriProfile::Production => "production",
@@ -84,6 +91,9 @@ impl RemoteProver {
             reply_ek: reply.ek.clone(),
         };
         let sealed = delegate::seal_job(&self.address, &job).map_err(|e| anyhow!("sealing the job: {e}"))?;
+        // The witness is on the wire now; the plaintext copy has no further use, and `JobRequest`
+        // zeroizes its inputs on drop.
+        drop(job);
         let r = self
             .req(self.http.post(format!("{}/v1/jobs", self.url)))
             .body(delegate::encode(&sealed))
@@ -96,15 +106,52 @@ impl RemoteProver {
             return Err(map_refusal(status, &v));
         }
         let id = v["id"].as_str().ok_or_else(|| anyhow!("the prover accepted the job but returned no id"))?.to_string();
-        eprintln!("prover accepted job {} at queue position {}", id.get(..8).unwrap_or(&id), v["position"]);
+        let short = id.get(..8).unwrap_or(&id).to_string();
+        match v["position"].as_u64() {
+            Some(p) => eprintln!("prover accepted job {short} at queue position {p}"),
+            None => eprintln!("prover accepted job {short}"),
+        }
         let mut wait = Duration::from_secs(1);
         let started = std::time::Instant::now();
+        let budget = Duration::from_secs(u64::from(self.deadline_secs) + PROVING_ALLOWANCE_SECS);
+        let mut silent = 0u32;
         loop {
             tokio::time::sleep(wait).await;
             wait = (wait * 2).min(Duration::from_secs(5));
-            let s: serde_json::Value = self.req(self.http.get(format!("{}/v1/jobs/{id}", self.url))).send().await?.json().await?;
+            if started.elapsed() > budget {
+                return Err(anyhow!(
+                    "the prover has not finished job {short} after {} s; {LOCAL_HINT}",
+                    started.elapsed().as_secs()
+                ));
+            }
+            // A dropped connection is not a lost job: the proof is still being made, and the next
+            // poll can find it. Only a prover that has gone silent for `POLL_RETRIES` polls running
+            // is one this wallet gives up on.
+            let r = match self.req(self.http.get(format!("{}/v1/jobs/{id}", self.url))).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    silent += 1;
+                    if silent >= POLL_RETRIES {
+                        return Err(anyhow!(
+                            "the prover at {} stopped answering about job {short} ({e}); {LOCAL_HINT}",
+                            self.url
+                        ));
+                    }
+                    eprintln!("  the prover did not answer ({e}); asking again");
+                    continue;
+                }
+            };
+            silent = 0;
+            let status = r.status().as_u16();
+            let s: serde_json::Value = r.json().await.unwrap_or_default();
+            if !(200..300).contains(&status) {
+                return Err(map_refusal(status, &s));
+            }
             match s["state"].as_str().unwrap_or("") {
-                "queued" => eprintln!("  queued, position {} ({:.0?})", s["position"], started.elapsed()),
+                "queued" => match s["position"].as_u64() {
+                    Some(p) => eprintln!("  queued, position {p} ({:.0?})", started.elapsed()),
+                    None => eprintln!("  queued ({:.0?})", started.elapsed()),
+                },
                 "proving" => eprintln!("  proving ({:.0?})", started.elapsed()),
                 "done" | "failed" => break,
                 "expired" => {
@@ -116,7 +163,17 @@ impl RemoteProver {
                 other => return Err(anyhow!("the prover reports an unknown state {other:?}")),
             }
         }
-        let bytes = self.req(self.http.get(format!("{}/v1/jobs/{id}/result", self.url))).send().await?.bytes().await?;
+        let r = self
+            .req(self.http.get(format!("{}/v1/jobs/{id}/result", self.url)))
+            .send()
+            .await
+            .with_context(|| format!("fetching the result of job {short} from {}; {LOCAL_HINT}", self.url))?;
+        let status = r.status().as_u16();
+        if !(200..300).contains(&status) {
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            return Err(map_refusal(status, &v));
+        }
+        let bytes = r.bytes().await.context("reading the prover's result")?;
         let sealed = delegate::decode(&bytes).map_err(|e| anyhow!("the prover's result is not a sealed result: {e}"))?;
         delegate::open_result(&reply, &sealed)
             .map_err(|e| anyhow!("the prover's result did not open under this job's key ({e}); not retrying"))
@@ -132,7 +189,19 @@ pub(crate) fn map_refusal(status: u16, v: &serde_json::Value) -> anyhow::Error {
             anyhow!("the prover is busy (429): {error}; it estimates {retry} s — try again then, raise --prover-deadline, or {LOCAL_HINT}")
         }
         400 => anyhow!("the prover rejected the job (400): {error}"),
+        404 => anyhow!("the prover no longer knows this job (404): it expired or the service restarted; run the command again"),
         s => anyhow!("the prover answered {s}: {error}"),
+    }
+}
+
+/// A program result's salt must match what was asked for, in both directions: without it the
+/// wallet cannot seal the transcript it promised, and *with* one it did not ask for a remote could
+/// turn `--no-envelope` into a published input envelope.
+pub(crate) fn check_salt(want_salt: bool, salt: Option<[u32; 4]>) -> Result<()> {
+    match (want_salt, salt.is_some()) {
+        (true, false) => Err(anyhow!("the prover returned no salt for a call that publishes an input envelope")),
+        (false, true) => Err(anyhow!("the prover returned a salt for a call that must publish no input envelope; refusing it")),
+        _ => Ok(()),
     }
 }
 
@@ -194,9 +263,7 @@ impl Prover {
                 };
                 match r.run(profile, kind).await? {
                     JobResult::Program { proof, outputs, tier, salt } => {
-                        if want_salt && salt.is_none() {
-                            return Err(anyhow!("the prover returned no salt for a call that publishes an input envelope"));
-                        }
+                        check_salt(want_salt, salt)?;
                         Ok((proof, outputs, tier, salt))
                     }
                     JobResult::Failed { error } => Err(anyhow!("prover: {error}")),
@@ -237,6 +304,20 @@ mod tests {
     #[test]
     fn a_401_says_token() {
         assert!(map_refusal(401, &serde_json::json!({})).to_string().contains("token"));
+    }
+
+    #[test]
+    fn a_404_on_a_poll_or_a_result_says_the_job_is_gone() {
+        let text = map_refusal(404, &serde_json::json!({})).to_string();
+        assert!(text.contains("no longer knows this job") && text.contains("run the command again"), "{text}");
+    }
+
+    #[test]
+    fn a_salt_nobody_asked_for_is_refused_along_with_a_missing_one() {
+        assert!(check_salt(false, Some([1, 2, 3, 4])).unwrap_err().to_string().contains("must publish no input envelope"));
+        assert!(check_salt(true, None).unwrap_err().to_string().contains("no salt"));
+        assert!(check_salt(true, Some([1, 2, 3, 4])).is_ok());
+        assert!(check_salt(false, None).is_ok());
     }
 
     #[test]
