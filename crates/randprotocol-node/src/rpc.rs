@@ -1857,7 +1857,7 @@ mod tests {
         let huge = format!("rand1{}", "1".repeat(3000));
         let err = call(&st, "rand_mint", json!([huge])).await.unwrap_err();
         assert_eq!(err.code, -32602);
-        assert!(err.message.contains("3007 characters"), "{}", err.message);
+        assert!(err.message.contains("3005 characters"), "{}", err.message);
         assert!(err.message.contains(&MAX_ADDRESS_CHARS.to_string()), "{}", err.message);
         // The cap is generous: a real address is well under it and still parses.
         let good = randprotocol_zkvm::address::address_of(&randprotocol_zkvm::notes::SpendKey([7; 8]).viewing_key()).to_string();
