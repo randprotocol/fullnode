@@ -6,7 +6,31 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-17)
 
-### Chain 11 (RAND, short shielded addresses) is LIVE — tag v0.2 (2026-09-17)
+### Chain 12 (RAND, the long shielded address again) is LIVE — the short address is reverted (2026-09-17)
+
+Main at the chain-12 record commit (pinned build **`17db41d`** = the revert commit): the twelve
+code and docs commits of the short-address feature (`42a4b5b..ee716d7`, tag `v0.2`) are reverted
+in one commit; the address is `rand1` + base58(pk ‖ kem_ek) again, payouts and alloc owners are
+bare addresses, there is no receiver record, registry, `rand_getReceiver` or versioned KEM key.
+**Why:** a receiver id is a hash and a sender cannot seal a note to a hash — the first payment to
+a wallet that never registered needed a payment request or a hand-carried record, registration
+was a paid self-transfer an empty wallet cannot make, both delivery paths told the registry who
+was about to be paid, and a claimable pay-to-id note would have put amount and recipient on
+chain. **The design that keeps a short address, unconditional sendability and cryptographic
+privacy is a hybrid address** (a 32-byte X25519 key inline, ~93 chars; the ML-KEM key by lookup;
+the first payment to an unregistered wallet confidential against classical adversaries, every
+later one fully post-quantum) — to be specified next; the chain-11 spec and plan stay under
+`docs/superpowers/` for the parts it reuses (the derived signing key, the signed record and its
+verifier, the registry as chain state). Chain 12 genesis `605eb783…` (chain 10's shape, cut by
+`deploy/cut-chain12-genesis.sh`, no aggregation section), rolled out to 16 droplets + A with
+`deploy/cutover-droplet.sh <ip> 79123fa7 605eb783 deploy/genesis-chain12.json` (peer ids
+unchanged); explorer redeployed at randscan `ba6fee6` (its receivers commit `d580e5b` reverted);
+the activity loop's two wallets on E rewritten back to version-2 key files (same spend keys);
+the website's `docs-site` branch repointed to chain 12 (`7f4cafe`). The chain-11 genesis, record
+files and cut script stay under `deploy/` as history. **B still needs `bin-17db41d/` and
+`.update-pin` = `17db41d`.** The guardian-set attestation bound (`544926c`) survived the revert.
+
+### Chain 11 (RAND, short shielded addresses) — LIVE 2026-09-17 for one day, tag v0.2, reverted the same day (see above)
 
 Main at `255618f` (pinned build `ee716d7`, tag **`v0.2`**): the short-address feature merged
 linear (ff) from `short-address`. Chain 11 genesis `79123fa7…` (23 receiver records), rolled
