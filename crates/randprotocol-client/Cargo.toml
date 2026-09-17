@@ -38,5 +38,9 @@ tempfile = { workspace = true }
 # because it goes through dev-dependencies only: `randprotocol-node` depends on this crate for its
 # own binary, and nothing in this crate's library depends on the node.
 randprotocol-node = { path = "../randprotocol-node" }
+# `tests/wallet_flow.rs` runs a real `rand-prover` in-process for the delegated path, and an axum
+# stub for the tampering one. Dev-only, so the wallet library never links the service.
+randprotocol-prover = { path = "../randprotocol-prover" }
+axum = { workspace = true }
 libp2p = { workspace = true }
 tracing-subscriber = { workspace = true }

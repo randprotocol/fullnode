@@ -5192,11 +5192,13 @@ name = "randprotocol-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "hex",
  "libp2p",
  "randprotocol-core",
  "randprotocol-node",
+ "randprotocol-prover",
  "randprotocol-zkvm",
  "reqwest",
  "serde",

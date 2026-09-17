@@ -285,3 +285,185 @@ fn a_wallet_that_cannot_pay_says_so_without_proving() {
     let err = wallet::select_inputs(&store.spendable(), 1).unwrap_err();
     assert_eq!(err, wallet::SelectError::Insufficient { have: 0 });
 }
+
+/// Spec §12: the same send, bond-free, through an in-process `rand-prover`; then a prover that
+/// answers with a proof of a *different* computation, which the wallet's digest check refuses;
+/// then a call through the prover with an input envelope the caller opens back (the §6 salt path).
+///
+/// Three bundle proofs (the send, the deploy's fee, the call's fee) and one program proof, all
+/// made in this process by the service rather than by the wallet — so this test is as slow as the
+/// one above and takes the same proving slot around every proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delegated_proving_sends_calls_and_refuses_a_tampering_prover() {
+    use randprotocol_client::prover::RemoteProver;
+    use randprotocol_prover::{serve, Config};
+    use randprotocol_zkvm::delegate::ProverKey;
+
+    init_tracing();
+    let started = Instant::now();
+    let dir = tempfile::tempdir().unwrap();
+    let key = Keypair::from_seed([102; 32]).unwrap();
+    let handle = start(&dir, &key).await;
+    let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
+
+    // ---- the prover: a real `rand-prover` in this process, jobs sealed to its own wallet ----
+    let prover_wallet = Wallet::from_spend_key(SpendKey([9; 8]));
+    let (prover_addr, _prover) =
+        serve("127.0.0.1:0".parse().unwrap(), Config::test(ProverKey::from_viewing_key(&prover_wallet.vk)))
+            .await
+            .expect("the prover serves");
+    let remote = Prover::Remote(RemoteProver::new(format!("http://{prover_addr}"), prover_wallet.address.clone(), None, 600));
+
+    // ---- two wallets, one funded ----
+    let a = Wallet::from_spend_key(SpendKey([7; 8]));
+    let b = Wallet::from_spend_key(SpendKey([8; 8]));
+    let mut a_store = NoteStore::default();
+    let mut b_store = NoteStore::default();
+    let mint = 100 * UNITS_PER_RAND;
+    let hash = rpc.mint_shielded(&a.address.to_string(), Some(mint)).await.expect("mint accepted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
+    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
+    assert_eq!(a_store.balance(), mint, "A sees the minted note");
+
+    // ---- 1. a delegated send: proved at the prover, submitted by the wallet, found by B ----
+    let fee = gas::BUNDLE_BASE;
+    let pay = 3 * UNITS_PER_RAND;
+    let slot = proving_slot().await;
+    let sent = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, fee, FriProfile::Test, &remote, CHAIN_ID, true)
+        .await
+        .expect("the delegated bundle is accepted and commits");
+    drop(slot);
+    eprintln!("delegated send: tier {}, proved in {:.1?}, {} proof bytes", sent.tier, sent.proving, sent.proof_bytes);
+    assert_eq!(sent.amount, pay);
+    assert_eq!(sent.change, mint - pay - fee);
+    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
+    assert_eq!(b_store.balance(), pay, "B found the payment a prover made for A");
+    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
+    assert_eq!(a_store.balance(), mint - pay - fee, "A keeps its change");
+
+    // ---- the call's program proof, made at the prover with the §6 salt ----
+    // Taken here rather than after the deploy so its bytes can stand in as the tampering prover's
+    // canned proof: a real proof of a *different* computation, which is exactly what a prover that
+    // proved something else would be handing back. (`Submission` carries no proof bytes, and the
+    // node serves proof lengths rather than proofs, so there is nothing else real to can.)
+    let prog = guests::private_payment(1_000);
+    let pid = randprotocol_core::program::program_id(prog.base_pc, &prog.words);
+    let inputs = [400u32, 250, 300, 75];
+    let slot = proving_slot().await;
+    let (proof, outputs, tier, salt) =
+        remote.prove_program(FriProfile::Test, &prog, &inputs, None, true).await.expect("the call proves at the prover");
+    drop(slot);
+    let salt = salt.expect("the prover returns the salt this wallet asked for");
+
+    // ---- 2. a tampering prover: the job is opened and the reply sealed properly, and the only
+    //         thing wrong is which computation the proof is of ----
+    let tamper = tampering_prover(&prover_wallet, proof.clone()).await;
+    let bad = Prover::Remote(RemoteProver::new(format!("http://{tamper}"), prover_wallet.address.clone(), None, 600));
+    let before = a_store.balance();
+    // No proving slot: the stub answers from memory, so this send proves nothing anywhere.
+    let err = wallet::send(&rpc, &a, &mut a_store, &b.address, UNITS_PER_RAND, fee, FriProfile::Test, &bad, CHAIN_ID, true)
+        .await
+        .expect_err("a proof of some other computation is refused");
+    assert!(err.to_string().contains("refusing to submit"), "{err}");
+    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
+    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
+    assert_eq!(b_store.balance(), pay, "nothing was submitted, so B was paid once");
+    assert_eq!(a_store.balance(), before, "and A paid no fee for a proof it would not submit");
+
+    // ---- 3. a delegated deploy and call, with an input transcript A opens back ----
+    let deploy = Action::Deploy { base_pc: prog.base_pc, words: prog.words.clone() };
+    let deploy_fee = wallet::deploy_fee_default(&deploy);
+    let slot = proving_slot().await;
+    wallet::submit(&rpc, &a, &mut a_store, None, deploy, deploy_fee, Burn::None, FriProfile::Test, &remote, CHAIN_ID, true)
+        .await
+        .expect("the program deploys, its fee bundle proved at the prover");
+    drop(slot);
+
+    let h_in = hash::input_digest(salt, &inputs);
+    let (envelope, envelope_key) =
+        call_envelope::seal_call_envelope(&a.vk, None, &h_in, salt, &inputs).expect("the transcript seals");
+    let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
+    let slot = proving_slot().await;
+    let call = wallet::submit(
+        &rpc,
+        &a,
+        &mut a_store,
+        None,
+        action,
+        wallet::call_fee_default(tier),
+        Burn::None,
+        FriProfile::Test,
+        &remote,
+        CHAIN_ID,
+        true,
+    )
+    .await
+    .expect("the delegated call is accepted and commits");
+    drop(slot);
+    let receipt = rpc.wait_for_receipt(&call.hash, Duration::from_secs(120)).await.expect("the call has a receipt");
+    // The `H_IN` comes out of the proof the *prover* made, and it is the one the wallet sealed its
+    // transcript against — the salt survived the round trip, which is the whole of the §6 path.
+    assert_eq!(receipt["h_in"], serde_json::json!(word8_to_hex(&h_in)));
+    assert_eq!(receipt["outputs"], serde_json::json!(outputs));
+
+    let (served_h_in, e) = rpc.call_envelope(&call.hash).await.unwrap().expect("the call published a transcript");
+    assert_eq!(served_h_in, h_in);
+    let (back_key, back_salt, back_inputs) =
+        call_envelope::open_call_as_sender(&e, &h_in, &a.vk).expect("A opens the call a prover proved for it");
+    assert_eq!(back_inputs, inputs.to_vec());
+    assert_eq!((back_salt, back_key), (salt, envelope_key));
+    assert!(call_envelope::call_envelope_is_faithful(&h_in, back_salt, &back_inputs));
+
+    eprintln!("whole delegated flow in {:.1?}", started.elapsed());
+    handle.shutdown().await;
+}
+
+/// A prover that ignores the job and answers with `canned`, sealed properly to the job's reply
+/// key — so the only thing wrong with it is *which* computation it proved, and the digest it
+/// publishes is one no wallet ever built.
+async fn tampering_prover(prover_wallet: &Wallet, canned: Vec<u8>) -> std::net::SocketAddr {
+    use axum::{
+        extract::State,
+        routing::{get, post},
+        Json, Router,
+    };
+    use randprotocol_zkvm::delegate::{self, JobResult, ProverKey};
+    use std::sync::{Arc, Mutex};
+
+    struct S {
+        key: ProverKey,
+        canned: Vec<u8>,
+        last: Mutex<Option<Vec<u8>>>,
+        address: String,
+    }
+    let state = Arc::new(S {
+        key: ProverKey::from_viewing_key(&prover_wallet.vk),
+        canned,
+        last: Mutex::new(None),
+        address: prover_wallet.address.to_string(),
+    });
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|State(s): State<Arc<S>>| async move { Json(serde_json::json!({ "address": s.address, "backend": "cpu" })) }),
+        )
+        .route(
+            "/v1/jobs",
+            post(|State(s): State<Arc<S>>, body: axum::body::Bytes| async move {
+                let job = delegate::open_job(&s.key, &delegate::decode(&body).unwrap()).unwrap();
+                let result = JobResult::Bundle { proof: s.canned.clone(), digest: [0xdead_beef; 8], tier: 14 };
+                *s.last.lock().unwrap() = Some(delegate::encode(&delegate::seal_result(&job.reply_ek, &result).unwrap()));
+                (axum::http::StatusCode::ACCEPTED, Json(serde_json::json!({ "id": "00".repeat(16), "position": 1 })))
+            }),
+        )
+        .route("/v1/jobs/:id", get(|| async { Json(serde_json::json!({ "state": "done" })) }))
+        .route(
+            "/v1/jobs/:id/result",
+            get(|State(s): State<Arc<S>>| async move { s.last.lock().unwrap().clone().unwrap() }),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    addr
+}
