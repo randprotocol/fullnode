@@ -25,7 +25,7 @@ Test keys only; all seeds are committed on purpose so any machine can pull and r
 | chain id | **12** |
 | genesis hash | **`605eb7830963833ef897455b98cd2a641aec58e0291460898a5d19ab88760ef0`** |
 | genesis file | `deploy/genesis-chain12.json` (cut 2026-09-17; chain 11's stays at `deploy/genesis-chain11.json`, chain 10's at `deploy/genesis-chain10.json`) |
-| pinned build | **`17db41d`** — the revert commit; binaries `rand-node` and `rand` in `bin-17db41d/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `17db41d` |
+| pinned build | **`c66e6b8`** — the revert commit `17db41d` plus one test-only line, so the binary is byte-identical to `17db41d` (sha256 `b7983e56…` on Linux, `c7736318…` on macOS); binaries `rand-node` and `rand` in `bin-c66e6b8/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `c66e6b8` |
 | zkVM | **constraint set 6** (the public input segment; M4.3 EVM and M4.4 sBPF/sha256 guests ride along) — unchanged, the revert touches no proof |
 | `hc_bundle` | `4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb` |
 | validators | **18, every one staked at exactly 1000 RAND** (the staking minimum) |
@@ -170,16 +170,17 @@ parse — so this is a clean start on every machine. Keep chain 11's data direct
 want to keep serving it; the new `DATA` name is keyed on the genesis hash, so the two never
 collide.
 
-1. **Binary**: `bin-17db41d/rand-node` and `bin-17db41d/rand` (or `cargo build --release`
-   at the revert commit; the Linux ones are built once on E and fanned out by
-   `deploy/cutover-droplet.sh`). Every node on the fleet must run this one build — a genesis
+1. **Binary**: `bin-c66e6b8/rand-node` and `bin-c66e6b8/rand` (or `cargo build --release`
+   at the pinned commit; the Linux ones are built once on E and fanned out by
+   `deploy/cutover-droplet.sh` at a chain cut, or by `deploy/update-droplet.sh` for a
+   same-chain binary update). Every node on the fleet must run this one build — a genesis
    format change is a fork, and a mixed fleet stalls.
 2. **Genesis**: `deploy/genesis-chain12.json`, byte-identical everywhere. `rand-node init` prints
    the hash; it must read `605eb7830963833ef897455b98cd2a641aec58e0291460898a5d19ab88760ef0`, and
    the file has no `receivers` array.
 3. **Fresh data dir**: `data-<letter>-605eb783` (never reuse a chain-11 directory).
 4. **`.update-pin`** on the MacBook Air (node B, auto-updater): set its content to
-   **`17db41d`**, or the updater drags B onto whatever build it last pinned and B drops out of
+   **`c66e6b8`**, or the updater drags B onto whatever build it last pinned and B drops out of
    the set.
 5. **Start**, and check `rand-node status`: `height` climbing, `chain id 12`,
    `hc_bundle 4a27356f…`, `active_validator: true`, `notes: 5` at genesis.
@@ -257,6 +258,18 @@ On A and B: `./deploy/run-a.sh` / `./deploy/run-b.sh` (they init `data-{a,b}-8c7
 `deploy/push-to-vps.sh <ip> <letter> "<bootstrap multiaddrs>" [validator|observer]` provisions from
 scratch, `deploy/rebuild-vps.sh <ip>` rebuilds on a new commit and restarts. Service name:
 `rand-node`.
+
+### The same-chain re-pin to `c66e6b8` (2026-09-17, later the same day)
+
+Main moved past `17db41d` by a test-only line (`c66e6b8`), and the fleet was re-pinned to it
+without a chain cut: `deploy/rebuild-vps.sh 188.166.235.187` from a detached worktree of
+`c66e6b8` (E rebuilt in 4 minutes and restarted — the same sha256 `b7983e56…` as before, because
+the change is inside `#[cfg(test)]`), then `deploy/update-droplet.sh <ip>` over the other
+fifteen droplets. That script compares the droplet's installed `rand-node` with the build host's
+sha256 and only stops, swaps and restarts on a mismatch, so all fifteen reported "already on
+b7983e56" and were left running. A was restarted from `deploy/run-a.sh` on `bin-c66e6b8/` (the
+laptop build is byte-identical to `bin-17db41d/` too). B was unreachable again; its
+`.update-pin` should read `c66e6b8`, though `17db41d` runs the same bytes.
 
 ### What the chain-12 rollout actually did (2026-09-17, the same day as chain 11)
 
