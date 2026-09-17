@@ -661,6 +661,7 @@ async fn main() -> Result<()> {
                 }
             };
             eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {outputs:?}", t.elapsed(), proof.len());
+            randprotocol_client::prover::time_verify(profile, &prog.digest(), &proof);
             let action = Action::Call { program: pid, proof, input_envelope: envelope };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,

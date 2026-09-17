@@ -875,6 +875,7 @@ async fn prove_one(
             prover.where_(),
         ));
     }
+    crate::prover::time_verify(profile, &randprotocol_zkvm::executor::ZkExecutor::hc_bundle(), &proof);
 
     // One fresh transaction key per envelope: two envelopes sealed under one key would both
     // open under a single-transaction disclosure (see `viewing::TxKey`).

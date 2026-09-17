@@ -17,6 +17,31 @@ use std::time::Duration;
 
 pub const LOCAL_HINT: &str = "drop --prover to prove here (about a minute and a half per bundle on a laptop)";
 
+/// `RAND_TIME_VERIFY=1`: before submitting, verify the proof twice on this machine and print both
+/// timings — the first verify builds the verifier key (cold), the second is the warm check every
+/// validator pays per proof at admission. A benchmark aid (`docs/delegated-proving.md` §11):
+/// the node re-verifies regardless, so this changes nothing about what is submitted.
+pub fn time_verify(profile: FriProfile, hc: &[u32; 8], proof_bytes: &[u8]) {
+    if std::env::var_os("RAND_TIME_VERIFY").is_none() {
+        return;
+    }
+    let Ok(proof) = postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(proof_bytes) else {
+        eprintln!("verify: the proof does not decode");
+        return;
+    };
+    let m = randprotocol_zkvm::machine::Machine::new(profile);
+    let t0 = std::time::Instant::now();
+    let cold = m.verify(hc, &proof);
+    let cold_t = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let warm = m.verify(hc, &proof);
+    let warm_t = t1.elapsed();
+    match (cold, warm) {
+        (Ok(()), Ok(())) => eprintln!("verified in {cold_t:.1?} (cold), {warm_t:.1?} (warm)"),
+        (Err(e), _) | (_, Err(e)) => eprintln!("verify: {e:?}"),
+    }
+}
+
 /// On top of `--prover-deadline`, which bounds only the wait for a slot: how long the proof
 /// itself may take before this wallet stops waiting for it.
 const PROVING_ALLOWANCE_SECS: u64 = 900;
