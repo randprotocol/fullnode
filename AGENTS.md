@@ -539,6 +539,28 @@ never move them.
   **412.20 s** (6m52s). Everything else in the workspace (`randprotocol-core`, `-node`, `-client`,
   `-rvm`, `-zkvm`'s ~40 other test files, `bridge-codec`, doctests) finished in seconds each. No
   code changes were needed — the branch's Tasks 1–9 were already green.
+- **Delegated proof generation, branch `feat/delegated-proof-generation`, 2026-09-17** (spec
+  `docs/superpowers/specs/2026-09-17-delegated-proving-design.md`, plan
+  `docs/superpowers/plans/2026-09-17-delegated-proving.md`): a wallet can now hand a bundle or
+  call's witness to a `rand-prover` instead of proving it locally. What landed, task by task —
+  `prove_salted_with` so every backend returns its H_IN salt (`dac81a7`, mirrored into the
+  `circuits` checkout as `c004586`, unpushed); `randprotocol_zkvm::delegate`, the sealed job and
+  result types over ML-KEM-768 + ChaCha20-Poly1305 with a pinned wire encoding (`f204325`,
+  `31182c2`); `crates/randprotocol-prover` and the `rand-prover` binary — `run`/`address`/
+  `keygen`, a bounded queue costed per job kind, a bearer token, a deadline refusal
+  (`0792764`, `a6543d1`); the wallet's `Prover` replacing `Backend` on every proving path, with
+  `--prover`/`--prover-address`/`--prover-token`/`--prover-deadline` and the matching `RAND_*`
+  env vars (`861858e`, `900e855`, `388fc6d`); and the end-to-end coverage — a delegated send, a
+  tampering-prover refusal, and a delegated call with an envelope, all through an in-process
+  `rand-prover` (`16f194c`). **The chain is untouched**: nothing in `randprotocol-core` or
+  `randprotocol-node/src` changed, so this needs no cut. **v0.3 waits on the spec §11
+  experiment** (`scripts/delegated-experiment.sh`): local vs. delegated-CPU vs. delegated-GPU
+  submit-to-commit latency: no numbers yet. **The one trap**: `crates/randprotocol-zkvm/src/machine.rs`
+  is vendored from `circuits/research/src/machine.rs`, so the `prove_salted_with` hunk had to be
+  hand-mirrored into the sibling checkout (`c004586`) rather than picked up by
+  `deploy/sync-zkvm.sh` — the delegate module is excluded from that sync on purpose, but
+  `machine.rs` is not, so re-running the sync without re-applying this hunk would silently drop
+  it.
 - The whitepaper is `../whitepapers/randprotocol.tex` (Draft 3) — its
   AGENTS.md has the parameter table (FRI 80/8/20, Poseidon2 width 8,
   384-bit soundness-bearing hashes) that this repo's docs should stay

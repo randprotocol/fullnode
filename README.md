@@ -18,7 +18,7 @@ chain with a proof instead of their inputs.
 | Bridged assets | the guardian bridge as notes: a bridged holding is a note whose `asset` word is the registry's index, an attestation deposits one note the chain computes itself, and a burn is the chain's one two-bundle transaction (`docs/bridge.md`) |
 | Confidential computation | Rand zkVM: RV32I under a Plonky3 batch STARK (Goldilocks, Poseidon2, ZK-hiding FRI); programs deployed on chain, calls carry a proof + 8 public outputs, gas by tier, and pay through a bundle like everything else |
 | Storage | one RocksDB per node with column families for blocks, certificates, indexes, notes, nullifiers, anchors, validators, programs and receipts; fsynced commits; startup integrity check with truncate-and-resync |
-| Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` subscription on the same port (`rand-node`), `rand` wallet CLI with a local prover, Rust client library |
+| Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` subscription on the same port (`rand-node`), `rand` wallet CLI with a local prover, Rust client library; `rand-prover`, a trusted delegated prover the wallet can hand its proofs to (`docs/delegated-proving.md`) |
 
 Status: an experimental testnet (see `deploy/README.md`) runs across two laptops and four cloud
 servers. That fleet is still on **chain 5, an account chain**: the shielded pool is a hard fork and
@@ -47,6 +47,7 @@ crates/randprotocol-zkvm     the Rand zkVM (vendored from circuits/research; res
 crates/randprotocol-node     RocksDB storage, libp2p networking, mempool, block sync, JSON-RPC server,
                        the node event loop, and the rand-node binary
 crates/randprotocol-client   the rand wallet binary and the RpcClient library (no RocksDB/libp2p dependency)
+crates/randprotocol-prover   rand-prover: the delegated prover service — a sealed job API, a bounded queue, one slot per backend
 deploy/                testnet genesis, test keys, run scripts, cloud provisioning and rebuild scripts
 docs/                  reference documentation and the design spec / plan
 scripts/               local two-validator testnet
@@ -170,6 +171,7 @@ rand keygen                                # wallet.key.json (or --key <file>, R
 rand address                               # rand1… — about 1.6 KB of base58
 rand balance                               # scans the tree with this key; nobody else can
 rand send <rand1 address> 1.5            # proves a bundle locally (~100 s), submits, waits
+rand --prover https://prover:8600 --prover-address rand1… send rand1… 1.5   # proved there, ~seconds on a GPU; the prover holds your spend key
 rand bond <validator address> 1000         # stake: the bundle burns it out of this wallet's notes
 rand faucet [address]                      # testnet chains only: mint up to 100 RAND
 rand notes | rand history
@@ -285,6 +287,7 @@ Full detail in `docs/architecture.md`.
 | [docs/staking.md](docs/staking.md) | the validator register, epochs, and the four staking commands: register, bond, unbond, withdraw |
 | [docs/supply.md](docs/supply.md) | the supply audit: the counters, the invariant a node checks, and how exact it is |
 | [docs/confidential.md](docs/confidential.md) | programs, calls, outputs, gas, privacy |
+| [docs/delegated-proving.md](docs/delegated-proving.md) | delegated proof generation: `rand-prover`, custody, the wallet flags, the errors, the §11 experiment |
 | [docs/architecture.md](docs/architecture.md) | how the node works end to end: consensus, ledger, storage, networking, sync, and one confidential transaction followed from wallet to receipt |
 | [docs/zkvm-milestones.md](docs/zkvm-milestones.md) | the Rand zkVM milestone by milestone (M1–M4, CUDA backend): what was built and why |
 | [docs/zkvm-m4-m5-progress.md](docs/zkvm-m4-m5-progress.md) | M4 and M5 as delivered: constraint sets 4–6, the recursion VM (M5.1–M5.4) with all measured numbers, what is deferred to which hardware |
