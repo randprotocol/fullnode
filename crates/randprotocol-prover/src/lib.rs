@@ -271,7 +271,14 @@ impl Service {
             };
             let mut g = self.inner.lock().unwrap();
             g.proving -= 1;
-            g.avg.update(kind, secs);
+            // Only a proof that was actually made says anything about how long proving takes. A
+            // job that failed in a millisecond — a bad profile, a witness the guest rejects — is
+            // not a fast proof, and folding a stream of them into the average would drive the
+            // estimate toward zero, which is exactly the estimate that stops refusing deadlines
+            // the prover cannot meet.
+            if !matches!(result, JobResult::Failed { .. }) {
+                g.avg.update(kind, secs);
+            }
             if let Some(e) = g.entries.get_mut(&id) {
                 e.state = state;
                 e.finished = Some(Instant::now());
@@ -322,4 +329,29 @@ pub fn check_bind(addr: SocketAddr, cfg: &Config) -> anyhow::Result<()> {
         anyhow::bail!("refusing to listen on {addr} without --token: every job is seconds of GPU or a minute of CPU. Pass --token <bearer>, or --allow-open to accept that");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use randprotocol_zkvm::delegate::ProverKey;
+    use randprotocol_zkvm::notes::SpendKey;
+
+    fn cfg(token: Option<&str>, allow_open: bool) -> Config {
+        let key = ProverKey::from_viewing_key(&SpendKey([5; 8]).viewing_key());
+        Config { token: token.map(str::to_string), allow_open, ..Config::test(key) }
+    }
+
+    /// The one thing standing between a laptop's spare cycles and the open internet: a prover
+    /// that listens off loopback says who may use it, or says out loud that anyone may.
+    #[test]
+    fn an_open_bind_needs_a_token_or_an_explicit_blessing() {
+        let loopback: SocketAddr = "127.0.0.1:8600".parse().unwrap();
+        let open: SocketAddr = "0.0.0.0:8600".parse().unwrap();
+        assert!(check_bind(loopback, &cfg(None, false)).is_ok(), "loopback with no token is the default");
+        let e = check_bind(open, &cfg(None, false)).unwrap_err().to_string();
+        assert!(e.contains("refusing to listen") && e.contains("--allow-open"), "{e}");
+        assert!(check_bind(open, &cfg(None, true)).is_ok(), "--allow-open accepts the risk");
+        assert!(check_bind(open, &cfg(Some("hunter2"), false)).is_ok(), "a token is the other way to say who may use it");
+    }
 }

@@ -34,16 +34,24 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> anyhow::Result<(SocketAddr,
     Ok((bound, task))
 }
 
+/// The bearer, compared without leaking where it first differs.
+///
+/// A byte-by-byte `==` returns sooner the earlier it disagrees, and a caller who can time a few
+/// thousand 401s can walk a token out of that. Both sides are hashed and the 32-byte digests
+/// compared in constant time: equal digests mean equal tokens, and the digest of a guess tells an
+/// attacker nothing about the secret. The scheme name is matched case-insensitively — RFC 7235
+/// says it is case-insensitive, and a client that sends `bearer` is not an unauthorized one.
 fn authorized(headers: &HeaderMap, svc: &Service) -> bool {
-    match &svc.cfg.token {
-        None => true,
-        Some(t) => headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|got| got == t)
-            .unwrap_or(false),
-    }
+    let Some(t) = &svc.cfg.token else { return true };
+    let Some(got) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim_start)
+        .and_then(|v| v.get(..7).filter(|s| s.eq_ignore_ascii_case("bearer ")).map(|_| &v[7..]))
+    else {
+        return false;
+    };
+    blake3::hash(got.as_bytes()) == blake3::hash(t.as_bytes())
 }
 
 fn unauthorized() -> Response {

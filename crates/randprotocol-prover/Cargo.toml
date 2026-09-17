@@ -11,13 +11,14 @@ name = "rand-prover"
 path = "src/main.rs"
 
 [dependencies]
-randprotocol-core = { workspace = true }
 randprotocol-zkvm = { workspace = true }
 randprotocol-client = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
+# The bearer is compared as a digest rather than byte by byte, so a 401 takes the same time
+# whatever the guess (`http::authorized`).
+blake3 = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
@@ -31,5 +32,7 @@ cuda = ["randprotocol-zkvm/cuda"]
 mock-cuda = ["randprotocol-zkvm/mock-cuda"]
 
 [dev-dependencies]
+# Only the tests name the core note types (`src/` reaches them through `randprotocol-zkvm`).
+randprotocol-core = { workspace = true }
 reqwest = { workspace = true }
 postcard = { version = "1", features = ["alloc"] }

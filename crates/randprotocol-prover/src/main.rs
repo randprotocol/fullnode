@@ -31,7 +31,7 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:8600")]
         listen: SocketAddr,
         /// Bearer token wallets must send. Required off loopback unless --allow-open.
-        #[arg(long, env = "RAND_PROVER_TOKEN")]
+        #[arg(long, env = "RAND_PROVER_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Prove on an attached NVIDIA GPU (needs a build with --features cuda).
         #[arg(long)]
@@ -91,6 +91,15 @@ async fn main() -> Result<()> {
             }
             let w = Wallet::load(&cli.key)?;
             let key = ProverKey::from_viewing_key(&w.vk);
+            // The cap counts the *source* address of the connection. Behind a reverse proxy every
+            // wallet arrives as the proxy, so a low cap there is a cap on the whole service rather
+            // than on one client; v1 does not read a forwarded-for header, so say so at startup
+            // where an operator who has just put nginx in front will see it.
+            if token.is_some() && per_ip < 8 {
+                eprintln!(
+                    "rand-prover: --per-ip {per_ip} counts the connecting address. If a reverse proxy terminates TLS in front of this, every wallet looks like the proxy and this cap applies to all of them together — raise it, or terminate TLS here. A forwarded-for header is not honoured."
+                );
+            }
             let cfg = Config { key, backend: backend_for(cuda)?, slots, max_queue, token, per_ip, result_ttl: Duration::from_secs(result_ttl_secs), allow_open, seed_secs: (100.0, 30.0) };
             eprintln!("rand-prover: every job holds the sending wallet's spend key; run this only for wallets that trust you with custody");
             let (bound, task) = serve(listen, cfg).await?;
