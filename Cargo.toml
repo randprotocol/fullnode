@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/randprotocol-core", "crates/randprotocol-zkvm", "crates/randprotocol-client", "crates/randprotocol-node", "crates/bridge-codec", "crates/randprotocol-rvm"]
+members = ["crates/randprotocol-core", "crates/randprotocol-zkvm", "crates/randprotocol-client", "crates/randprotocol-node", "crates/randprotocol-prover", "crates/bridge-codec", "crates/randprotocol-rvm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ randprotocol-core = { path = "crates/randprotocol-core" }
 randprotocol-client = { path = "crates/randprotocol-client" }
 randprotocol-zkvm = { path = "crates/randprotocol-zkvm" }
 randprotocol-rvm = { path = "crates/randprotocol-rvm" }
+randprotocol-prover = { path = "crates/randprotocol-prover" }
 bridge-codec = { path = "crates/bridge-codec" }
 
 # crypto

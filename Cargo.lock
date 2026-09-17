@@ -5246,6 +5246,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "randprotocol-prover"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "hex",
+ "postcard",
+ "rand 0.8.8",
+ "randprotocol-client",
+ "randprotocol-core",
+ "randprotocol-zkvm",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "randprotocol-rvm"
 version = "0.1.0"
 dependencies = [
