@@ -20,7 +20,9 @@ pub use http::serve;
 pub struct Config {
     pub key: ProverKey,
     pub backend: Backend,
-    /// Concurrent proofs. One per GPU; on a CPU box, one.
+    /// Concurrent proofs. One per GPU; on a CPU box, one. Zero spawns no workers at all, so
+    /// nothing is ever proved — only the tests that want a job to sit in the queue use that,
+    /// and `rand-prover run` rejects `--slots 0`.
     pub slots: usize,
     /// Jobs waiting beyond the ones proving. Zero means "only what the slots can take now".
     pub max_queue: usize,
@@ -31,12 +33,15 @@ pub struct Config {
     /// How long a finished job's sealed result is kept for the wallet to fetch.
     pub result_ttl: Duration,
     pub allow_open: bool,
+    /// What the running averages start at, `(bundle, program)` seconds on the CPU (spec §5),
+    /// before any job has been timed. CUDA scales both down; see [`Averages::seed`].
+    pub seed_secs: (f64, f64),
 }
 
 impl Config {
     /// The in-process configuration the tests use: CPU, one slot, a short queue, no token.
     pub fn test(key: ProverKey) -> Config {
-        Config { key, backend: Backend::Cpu, slots: 1, max_queue: 8, token: None, per_ip: 64, result_ttl: Duration::from_secs(600), allow_open: true }
+        Config { key, backend: Backend::Cpu, slots: 1, max_queue: 8, token: None, per_ip: 64, result_ttl: Duration::from_secs(600), allow_open: true, seed_secs: (100.0, 30.0) }
     }
 }
 
@@ -60,14 +65,15 @@ pub struct Entry {
     pub result: Option<Sealed>,
 }
 
-/// Running averages of proving time per kind, seeded per spec §5 so the very first estimate
-/// is not zero: 100 s for a bundle and 30 s for a program on the CPU, a tenth of that on CUDA.
+/// Running averages of proving time per kind, seeded from [`Config::seed_secs`] so the very
+/// first estimate is not zero: per spec §5, 100 s for a bundle and 30 s for a program on the
+/// CPU, a tenth of that on CUDA.
 pub struct Averages { pub bundle: f64, pub program: f64 }
 
 impl Averages {
-    fn seed(backend: Backend) -> Averages {
+    fn seed(backend: Backend, seed_secs: (f64, f64)) -> Averages {
         let scale = if backend == Backend::Cpu { 1.0 } else { 0.1 };
-        Averages { bundle: 100.0 * scale, program: 30.0 * scale }
+        Averages { bundle: seed_secs.0 * scale, program: seed_secs.1 * scale }
     }
     fn get(&self, kind: &str) -> f64 { if kind == "bundle" { self.bundle } else { self.program } }
     fn update(&mut self, kind: &str, secs: f64) {
@@ -100,9 +106,11 @@ pub enum Refusal {
 
 impl Service {
     pub fn new(cfg: Config) -> Shared {
-        let avg = Averages::seed(cfg.backend);
+        let avg = Averages::seed(cfg.backend, cfg.seed_secs);
         let svc = Arc::new(Service { cfg, inner: Mutex::new(Inner { entries: HashMap::new(), queue: VecDeque::new(), proving: 0, avg }), wake: tokio::sync::Notify::new() });
-        for _ in 0..svc.cfg.slots.max(1) {
+        // No clamp: `slots: 0` deliberately spawns no workers, which is how a test parks a job
+        // in the queue. `rand-prover run` rejects it so a real deployment cannot sit idle.
+        for _ in 0..svc.cfg.slots {
             let s = svc.clone();
             tokio::spawn(async move { s.worker().await });
         }
@@ -121,6 +129,13 @@ impl Service {
         if ZkExecutor::profile_from_str(&job.profile).is_none() {
             return Err(Refusal::Bad(format!("unknown fri profile {:?}", job.profile)));
         }
+        // The result is sealed to `reply_ek`. A key we cannot seal to would only be discovered
+        // after the proof was made, and the job would end `Failed` carrying no result — a
+        // `/result` 404 the wallet polls until it gives up, having paid for the proving. Probe
+        // the seal now, on an empty body, and refuse the job instead.
+        if let Err(e) = delegate::seal_result(&job.reply_ek, &JobResult::Failed { error: String::new() }) {
+            return Err(Refusal::Bad(format!("reply_ek is not a valid ML-KEM-768 encapsulation key: {e}")));
+        }
         let kind = job.kind.name();
         let mut g = self.inner.lock().unwrap();
         self.sweep(&mut g);
@@ -133,10 +148,10 @@ impl Service {
         // worker count toward neither cap, so the bound would hold only once a slot had
         // actually claimed the work — a window in which the service over-admits.
         if g.queue.len() + g.proving >= self.cfg.max_queue + self.cfg.slots.max(1) {
-            let wait = self.estimate(&g, kind);
+            let wait = self.estimate(&g);
             return Err(Refusal::Busy("queue full".into(), wait.ceil() as u64));
         }
-        let wait = self.estimate(&g, kind);
+        let wait = self.estimate(&g);
         if wait > job.deadline_secs as f64 {
             return Err(Refusal::Busy(format!("cannot start within {} s; the estimate is {:.0} s", job.deadline_secs, wait), wait.ceil() as u64));
         }
@@ -151,12 +166,22 @@ impl Service {
         Ok((id, position))
     }
 
-    /// Seconds until a job of `kind` submitted now would start: everything ahead of it,
-    /// queued or proving, at the running average, spread over the slots.
-    fn estimate(&self, g: &Inner, kind: &str) -> f64 {
-        let ahead = g.queue.len() + g.proving;
-        if ahead == 0 { return 0.0; }
-        ahead as f64 * g.avg.get(kind) / self.cfg.slots.max(1) as f64
+    /// Seconds until a job submitted now would start: the work already in flight, spread over
+    /// the slots.
+    ///
+    /// Each job ahead is costed at the running average *for its own kind*, not for the kind of
+    /// the job being admitted — a program queued behind eight bundles waits eight bundle
+    /// proofs, and saying otherwise would under-quote it by most of an order of magnitude. The
+    /// number gates the deadline and is what `retry_after_secs` tells the wallet, so it has to
+    /// describe the queue rather than the caller.
+    fn estimate(&self, g: &Inner) -> f64 {
+        let ahead: f64 = g
+            .entries
+            .values()
+            .filter(|e| matches!(e.state, State::Queued | State::Proving))
+            .map(|e| g.avg.get(e.kind))
+            .sum();
+        ahead / self.cfg.slots.max(1) as f64
     }
 
     /// Drop finished entries past the result TTL.
@@ -165,13 +190,30 @@ impl Service {
         g.entries.retain(|_, e| match e.finished { Some(t) => t.elapsed() < ttl, None => true });
     }
 
+    /// A job's state, its queue position while it is queued, and how long it has been proving.
+    ///
+    /// A queued job past its deadline is expired here, the moment anyone looks, and dropped
+    /// from the queue: waiting for a slot to reach it would have the service answer "queued"
+    /// long after the wallet's deadline had gone, and on a busy prover that could be the whole
+    /// life of the job. The worker repeats the check when it pops, as the second line of
+    /// defence for a job nobody polls.
     pub fn status(&self, id: &str) -> Option<(State, Option<usize>, Option<u128>)> {
         let mut g = self.inner.lock().unwrap();
         self.sweep(&mut g);
-        let e = g.entries.get(id)?;
-        let position = if e.state == State::Queued { g.queue.iter().position(|(i, _)| i == id).map(|p| p + 1) } else { None };
+        let inner = &mut *g;
+        let e = inner.entries.get_mut(id)?;
+        let expired_now = e.state == State::Queued && e.submitted.elapsed() > e.deadline;
+        if expired_now {
+            e.state = State::Expired;
+            e.finished = Some(Instant::now());
+        }
+        let state = e.state;
         let elapsed = e.started.map(|s| e.finished.unwrap_or_else(Instant::now).duration_since(s).as_millis());
-        Some((e.state, position, elapsed))
+        if expired_now {
+            inner.queue.retain(|(i, _)| i != id);
+        }
+        let position = if state == State::Queued { inner.queue.iter().position(|(i, _)| i == id).map(|p| p + 1) } else { None };
+        Some((state, position, elapsed))
     }
 
     pub fn result(&self, id: &str) -> Option<Sealed> {
@@ -190,10 +232,14 @@ impl Service {
                 let mut g = self.inner.lock().unwrap();
                 match g.queue.pop_front() {
                     Some((id, job)) => {
-                        let e = g.entries.get_mut(&id).expect("queued entries exist");
+                        // Swept out from under us, or expired by `status` — either way there
+                        // is nothing to record against, so drop the job (zeroizing it) and
+                        // take the next one rather than panicking under the lock.
+                        let Some(e) = g.entries.get_mut(&id) else { continue };
                         if e.submitted.elapsed() > e.deadline {
                             e.state = State::Expired;
                             e.finished = Some(Instant::now());
+                            drop(g);
                             tracing::info!(job = %id, "expired before it could start");
                             continue;
                         }
@@ -231,6 +277,9 @@ impl Service {
                 e.finished = Some(Instant::now());
                 e.result = sealed;
             }
+            // Nothing logs while the store mutex is held: a slow or blocking subscriber would
+            // otherwise stall every admission and status poll behind it.
+            drop(g);
             tracing::info!(job = %id, kind, state = state.as_str(), secs = format!("{secs:.1}"), "finished");
         }
     }

@@ -86,9 +86,12 @@ async fn main() -> Result<()> {
         }
         Cmd::Address => println!("{}", Wallet::load(&cli.key)?.address),
         Cmd::Run { listen, token, cuda, slots, max_queue, per_ip, result_ttl_secs, allow_open } => {
+            if slots == 0 {
+                anyhow::bail!("--slots must be at least 1: a prover with no slots accepts jobs and never proves any of them");
+            }
             let w = Wallet::load(&cli.key)?;
             let key = ProverKey::from_viewing_key(&w.vk);
-            let cfg = Config { key, backend: backend_for(cuda)?, slots, max_queue, token, per_ip, result_ttl: Duration::from_secs(result_ttl_secs), allow_open };
+            let cfg = Config { key, backend: backend_for(cuda)?, slots, max_queue, token, per_ip, result_ttl: Duration::from_secs(result_ttl_secs), allow_open, seed_secs: (100.0, 30.0) };
             eprintln!("rand-prover: every job holds the sending wallet's spend key; run this only for wallets that trust you with custody");
             let (bound, task) = serve(listen, cfg).await?;
             eprintln!("listening on {bound}; address {}", w.address);

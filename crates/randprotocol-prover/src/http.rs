@@ -76,6 +76,9 @@ async fn status(State(svc): State<Shared>, headers: HeaderMap, Path(id): Path<St
     }
 }
 
+/// The sealed result, once there is one. Only a `done` or `failed` job ever has one: a job
+/// that `expired` was never proved, so this stays 404 for it, and a wallet treats `expired` as
+/// terminal and does not come here.
 async fn result(State(svc): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Response {
     if !authorized(&headers, &svc) {
         return unauthorized();

@@ -144,6 +144,46 @@ async fn health_reports_the_key_files_address_and_the_backend() {
     assert_eq!(h["slots"], 1);
 }
 
+/// A reply key the prover cannot seal to has to be refused at admission. If it were only
+/// discovered after proving, the job would end `failed` with no result and the wallet would
+/// poll a 404 forever, having already paid for the proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_whose_reply_key_cannot_be_sealed_to_is_400_and_is_never_queued() {
+    let (key, address) = prover_key();
+    let (addr, http) = start(Config::test(key)).await;
+    let r = submit(&http, addr, &address, &fib_job(vec![0; 10], 120), None).await;
+    assert_eq!(r.status(), 400);
+    let h: serde_json::Value = http.get(format!("http://{addr}/v1/health")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(h["queue_depth"], 0, "a job we cannot reply to must not reach the queue");
+}
+
+/// `slots = 0` spawns no workers, so the job provably stays queued and the deadline — not a
+/// race with a proving slot — is what the assertion turns on. The zero program seed makes the
+/// estimate zero so that a one-second deadline is still admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_job_past_its_deadline_reports_expired_and_has_no_result() {
+    let (key, address) = prover_key();
+    let mut cfg = Config::test(key);
+    cfg.slots = 0;
+    cfg.seed_secs = (100.0, 0.0);
+    let (addr, http) = start(cfg).await;
+    let r = submit(&http, addr, &address, &fib_job(ReplyKey::generate().ek, 1), None).await;
+    assert_eq!(r.status(), 202);
+    let id = r.json::<serde_json::Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+
+    let v: serde_json::Value = http.get(format!("http://{addr}/v1/jobs/{id}")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(v["state"], "queued", "inside its deadline it is still queued: {v}");
+    assert_eq!(v["position"], 1);
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let v: serde_json::Value = http.get(format!("http://{addr}/v1/jobs/{id}")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(v["state"], "expired", "past its deadline it is expired: {v}");
+    assert!(v["position"].is_null(), "an expired job holds no queue position: {v}");
+    assert_eq!(http.get(format!("http://{addr}/v1/jobs/{id}/result")).send().await.unwrap().status(), 404, "it was never proved");
+    let h: serde_json::Value = http.get(format!("http://{addr}/v1/health")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(h["queue_depth"], 0, "expiring it drops it from the queue");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_job_is_404_on_both_routes() {
     let (key, _) = prover_key();
