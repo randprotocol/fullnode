@@ -68,3 +68,47 @@ fn a_bad_encapsulation_key_is_an_error_not_a_panic() {
     assert!(seal_job(&short, &job).unwrap_err().contains("10 bytes"));
     assert!(seal_result(&[0; 10], &JobResult::Failed { error: "x".into() }).unwrap_err().contains("10 bytes"));
 }
+
+#[test]
+fn a_wrong_version_job_is_rejected_with_a_named_error() {
+    let prover_vk = SpendKey::random().viewing_key();
+    let prover = ProverKey::from_viewing_key(&prover_vk);
+    let reply = ReplyKey::generate();
+    let mut job = a_job(reply.ek.clone());
+    job.version = VERSION + 1;
+    let sealed = seal_job(&address_of(&prover_vk), &job).unwrap();
+    let err = open_job(&prover, &sealed).unwrap_err();
+    assert!(err.contains("version"), "error should mention version: {err}");
+}
+
+#[test]
+fn a_body_shorter_than_the_nonce_is_an_error_not_a_panic() {
+    let prover_vk = SpendKey::random().viewing_key();
+    let prover = ProverKey::from_viewing_key(&prover_vk);
+    let reply = ReplyKey::generate();
+    let job = a_job(reply.ek.clone());
+    let job_sealed = seal_job(&address_of(&prover_vk), &job).unwrap();
+    let short_job = Sealed { kem_ct: job_sealed.kem_ct, body: vec![0; 5] };
+    assert!(open_job(&prover, &short_job).is_err());
+
+    let result = JobResult::Bundle { proof: vec![1; 8], digest: [0; 8], tier: 1 };
+    let result_sealed = seal_result(&reply.ek, &result).unwrap();
+    let short_result = Sealed { kem_ct: result_sealed.kem_ct, body: vec![0; 5] };
+    assert!(open_result(&reply, &short_result).is_err());
+}
+
+#[test]
+fn a_garbage_kem_ciphertext_is_an_error_not_a_panic() {
+    let prover_vk = SpendKey::random().viewing_key();
+    let prover = ProverKey::from_viewing_key(&prover_vk);
+    let reply = ReplyKey::generate();
+    let job = a_job(reply.ek.clone());
+    let job_sealed = seal_job(&address_of(&prover_vk), &job).unwrap();
+    let bad_ct_job = Sealed { kem_ct: vec![1, 2, 3], body: job_sealed.body };
+    assert!(open_job(&prover, &bad_ct_job).is_err());
+
+    let result = JobResult::Bundle { proof: vec![1; 8], digest: [0; 8], tier: 1 };
+    let result_sealed = seal_result(&reply.ek, &result).unwrap();
+    let bad_ct_result = Sealed { kem_ct: vec![1, 2, 3], body: result_sealed.body };
+    assert!(open_result(&reply, &bad_ct_result).is_err());
+}

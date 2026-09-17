@@ -150,8 +150,10 @@ fn open_with(dk: &Dk, aad: &[u8], sealed: &Sealed) -> Result<Vec<u8>, String> {
 }
 
 pub fn seal_job(to: &ShieldedAddress, job: &JobRequest) -> Result<Sealed, String> {
-    let pt = postcard::to_allocvec(job).map_err(|e| e.to_string())?;
-    seal_to(&to.kem_ek, AAD_JOB, &pt)
+    let mut pt = postcard::to_allocvec(job).map_err(|e| e.to_string())?;
+    let sealed = seal_to(&to.kem_ek, AAD_JOB, &pt);
+    pt.zeroize();
+    sealed
 }
 
 pub fn open_job(key: &ProverKey, sealed: &Sealed) -> Result<JobRequest, String> {
@@ -165,8 +167,10 @@ pub fn open_job(key: &ProverKey, sealed: &Sealed) -> Result<JobRequest, String> 
 }
 
 pub fn seal_result(reply_ek: &[u8], result: &JobResult) -> Result<Sealed, String> {
-    let pt = postcard::to_allocvec(result).map_err(|e| e.to_string())?;
-    seal_to(reply_ek, AAD_RESULT, &pt)
+    let mut pt = postcard::to_allocvec(result).map_err(|e| e.to_string())?;
+    let sealed = seal_to(reply_ek, AAD_RESULT, &pt);
+    pt.zeroize();
+    sealed
 }
 
 pub fn open_result(key: &ReplyKey, sealed: &Sealed) -> Result<JobResult, String> {
