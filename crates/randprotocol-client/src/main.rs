@@ -39,7 +39,7 @@ struct Cli {
     #[arg(long, global = true, env = "RAND_PROVER_ADDRESS")]
     prover_address: Option<String>,
     /// Bearer token the prover expects.
-    #[arg(long, global = true, env = "RAND_PROVER_TOKEN")]
+    #[arg(long, global = true, env = "RAND_PROVER_TOKEN", hide_env_values = true)]
     prover_token: Option<String>,
     /// Seconds the prover may take to *start* the job before it must refuse it.
     #[arg(long, global = true, env = "RAND_PROVER_DEADLINE", default_value_t = 120)]

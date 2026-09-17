@@ -5196,6 +5196,7 @@ dependencies = [
  "clap",
  "hex",
  "libp2p",
+ "postcard",
  "randprotocol-core",
  "randprotocol-node",
  "randprotocol-prover",
@@ -5269,6 +5270,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "clap",
  "hex",
  "postcard",
@@ -5277,7 +5279,6 @@ dependencies = [
  "randprotocol-core",
  "randprotocol-zkvm",
  "reqwest",
- "serde",
  "serde_json",
  "tokio",
  "tracing",

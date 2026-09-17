@@ -19,6 +19,9 @@ reqwest = { workspace = true, features = ["rustls-tls"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The wallet decodes a delegated proof to read the `H_IN` it publishes back (`prover::check_h_in`);
+# this is the codec `randprotocol-zkvm` serialises a `Proof` with.
+postcard = { version = "1", features = ["alloc"] }
 hex = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

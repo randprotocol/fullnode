@@ -357,7 +357,7 @@ async fn delegated_proving_sends_calls_and_refuses_a_tampering_prover() {
 
     // ---- 2. a tampering prover: the job is opened and the reply sealed properly, and the only
     //         thing wrong is which computation the proof is of ----
-    let tamper = tampering_prover(&prover_wallet, proof.clone()).await;
+    let tamper = tampering_prover(&prover_wallet, proof.clone(), tier).await;
     let bad = Prover::Remote(RemoteProver::new(format!("http://{tamper}"), prover_wallet.address.clone(), None, 600));
     let before = a_store.balance();
     // No proving slot: the stub answers from memory, so this send proves nothing anywhere.
@@ -369,6 +369,15 @@ async fn delegated_proving_sends_calls_and_refuses_a_tampering_prover() {
     wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
     assert_eq!(b_store.balance(), pay, "nothing was submitted, so B was paid once");
     assert_eq!(a_store.balance(), before, "and A paid no fee for a proof it would not submit");
+
+    // ---- 2b. the same stub on a *program* job: a real proof of this very call, handed back with
+    //          a salt it was not made with. The transcript the wallet would seal against that salt
+    //          is one the proof does not commit to, so the wallet refuses before it publishes it.
+    let err = bad
+        .prove_program(FriProfile::Test, &prog, &inputs, None, true)
+        .await
+        .expect_err("a salt the proof was not made with is refused");
+    assert!(err.to_string().contains("refusing to submit"), "{err}");
 
     // ---- 3. a delegated deploy and call, with an input transcript A opens back ----
     let deploy = Action::Deploy { base_pc: prog.base_pc, words: prog.words.clone() };
@@ -421,24 +430,32 @@ async fn delegated_proving_sends_calls_and_refuses_a_tampering_prover() {
 /// A prover that ignores the job and answers with `canned`, sealed properly to the job's reply
 /// key — so the only thing wrong with it is *which* computation it proved, and the digest it
 /// publishes is one no wallet ever built.
-async fn tampering_prover(prover_wallet: &Wallet, canned: Vec<u8>) -> std::net::SocketAddr {
+///
+/// For a bundle job it answers a bundle result whose digest no wallet built. For a program job it
+/// answers the *real* proof of this test's call with a salt that proof was never made with, which
+/// is the subtler lie: the proof verifies, the wallet would seal an input transcript against the
+/// returned salt, and the `H_IN` the chain reads out of the proof would then commit to something
+/// else entirely.
+async fn tampering_prover(prover_wallet: &Wallet, canned: Vec<u8>, canned_tier: u8) -> std::net::SocketAddr {
     use axum::{
         extract::State,
         routing::{get, post},
         Json, Router,
     };
-    use randprotocol_zkvm::delegate::{self, JobResult, ProverKey};
+    use randprotocol_zkvm::delegate::{self, JobKind, JobResult, ProverKey};
     use std::sync::{Arc, Mutex};
 
     struct S {
         key: ProverKey,
         canned: Vec<u8>,
+        canned_tier: u8,
         last: Mutex<Option<Vec<u8>>>,
         address: String,
     }
     let state = Arc::new(S {
         key: ProverKey::from_viewing_key(&prover_wallet.vk),
         canned,
+        canned_tier,
         last: Mutex::new(None),
         address: prover_wallet.address.to_string(),
     });
@@ -451,7 +468,12 @@ async fn tampering_prover(prover_wallet: &Wallet, canned: Vec<u8>) -> std::net::
             "/v1/jobs",
             post(|State(s): State<Arc<S>>, body: axum::body::Bytes| async move {
                 let job = delegate::open_job(&s.key, &delegate::decode(&body).unwrap()).unwrap();
-                let result = JobResult::Bundle { proof: s.canned.clone(), digest: [0xdead_beef; 8], tier: 14 };
+                let result = match &job.kind {
+                    JobKind::Bundle { .. } => JobResult::Bundle { proof: s.canned.clone(), digest: [0xdead_beef; 8], tier: 14 },
+                    JobKind::Program { .. } => {
+                        JobResult::Program { proof: s.canned.clone(), outputs: [0; 8], tier: s.canned_tier, salt: Some([1, 2, 3, 4]) }
+                    }
+                };
                 *s.last.lock().unwrap() = Some(delegate::encode(&delegate::seal_result(&job.reply_ek, &result).unwrap()));
                 (axum::http::StatusCode::ACCEPTED, Json(serde_json::json!({ "id": "00".repeat(16), "position": 1 })))
             }),

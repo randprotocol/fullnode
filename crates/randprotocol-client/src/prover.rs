@@ -48,7 +48,16 @@ pub struct RemoteProver {
 impl RemoteProver {
     pub fn new(url: String, address: ShieldedAddress, token: Option<String>, deadline_secs: u32) -> RemoteProver {
         let url = url.trim_end_matches('/').to_string();
-        RemoteProver { url, address, token, deadline_secs, http: reqwest::Client::new(), checked: AtomicBool::new(false) }
+        // Without these a socket that opens and then says nothing holds the wallet for as long as
+        // the OS will let it, and neither the poll budget below nor `--prover-deadline` ever gets
+        // to run: both are measured between requests, not inside one. Every request here is a
+        // small JSON exchange or a proof fetch, so a minute is generous for all of them.
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("a reqwest client with timeouts builds");
+        RemoteProver { url, address, token, deadline_secs, http, checked: AtomicBool::new(false) }
     }
 
     fn req(&self, r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -63,15 +72,19 @@ impl RemoteProver {
         if self.checked.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let v: serde_json::Value = self
+        let r = self
             .http
             .get(format!("{}/v1/health", self.url))
             .send()
             .await
-            .with_context(|| format!("the prover at {} is unreachable; {LOCAL_HINT}", self.url))?
-            .json()
-            .await
-            .context("the prover's /v1/health is not JSON")?;
+            .with_context(|| format!("the prover at {} is unreachable; {LOCAL_HINT}", self.url))?;
+        // A 502 from a proxy or a 404 from something that is not a prover has no `address` field,
+        // and reading one out of it would blame the pin for what is really "nothing answered".
+        let status = r.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(anyhow!("the prover's /v1/health answered {status}; {LOCAL_HINT}"));
+        }
+        let v: serde_json::Value = r.json().await.context("the prover's /v1/health is not JSON")?;
         check_pin(&self.address, v["address"].as_str().unwrap_or(""))?;
         if v["backend"] == "cpu" {
             eprintln!("note: the prover at {} proves on a CPU; expect laptop speed, not GPU speed", self.url);
@@ -141,12 +154,29 @@ impl RemoteProver {
                     continue;
                 }
             };
-            silent = 0;
             let status = r.status().as_u16();
-            let s: serde_json::Value = r.json().await.unwrap_or_default();
+            let body = r.json::<serde_json::Value>().await;
             if !(200..300).contains(&status) {
-                return Err(map_refusal(status, &s));
+                return Err(map_refusal(status, &body.unwrap_or_default()));
             }
+            // A 200 whose body did not arrive whole — a truncated response, a proxy that cut the
+            // connection mid-body — is the transport failing, not the prover reporting a state
+            // this wallet does not know. It costs a retry, not the job.
+            let s = match body {
+                Ok(s) => s,
+                Err(e) => {
+                    silent += 1;
+                    if silent >= POLL_RETRIES {
+                        return Err(anyhow!(
+                            "the prover at {} answered about job {short} but the body did not parse ({e}); {LOCAL_HINT}",
+                            self.url
+                        ));
+                    }
+                    eprintln!("  the prover's answer did not parse ({e}); asking again");
+                    continue;
+                }
+            };
+            silent = 0;
             match s["state"].as_str().unwrap_or("") {
                 "queued" => match s["position"].as_u64() {
                     Some(p) => eprintln!("  queued, position {p} ({:.0?})", started.elapsed()),
@@ -190,7 +220,7 @@ pub(crate) fn map_refusal(status: u16, v: &serde_json::Value) -> anyhow::Error {
         }
         400 => anyhow!("the prover rejected the job (400): {error}"),
         404 => anyhow!("the prover no longer knows this job (404): it expired or the service restarted; run the command again"),
-        s => anyhow!("the prover answered {s}: {error}"),
+        s => anyhow!("the prover answered {s}: {error}; {LOCAL_HINT}"),
     }
 }
 
@@ -203,6 +233,31 @@ pub(crate) fn check_salt(want_salt: bool, salt: Option<[u32; 4]>) -> Result<()> 
         (false, true) => Err(anyhow!("the prover returned a salt for a call that must publish no input envelope; refusing it")),
         _ => Ok(()),
     }
+}
+
+/// The salt a remote returns must be the salt the proof was made with.
+///
+/// `check_salt` only asks whether there is one. But the wallet is about to publish an input
+/// envelope sealed against `input_digest(salt, inputs)` and a proof that publishes its own
+/// `H_IN`: if the two disagree the chain accepts the call and the transcript opens to something
+/// the proof never committed to — the envelope is then a lie the wallet signed. A prover that
+/// proved the right computation and returned a different salt is caught here, before submission,
+/// by recomputing `H_IN` from the salt it handed back and asking the proof what it published.
+pub(crate) fn check_h_in(proof: &[u8], salt: [u32; 4], inputs: &[u32]) -> Result<()> {
+    use randprotocol_zkvm::tables::cpu::pv;
+    let decoded: randprotocol_zkvm::machine::Proof =
+        postcard::from_bytes(proof).map_err(|e| anyhow!("the prover's proof does not decode: {e}"))?;
+    let published = decoded
+        .public_values
+        .get(pv::IN0..pv::IN0 + 8)
+        .ok_or_else(|| anyhow!("the prover's proof publishes {} public values, too few to carry H_IN", decoded.public_values.len()))?;
+    let want = randprotocol_zkvm::hash::input_digest(salt, inputs);
+    if published.iter().zip(want).any(|(got, w)| *got != u64::from(w)) {
+        return Err(anyhow!(
+            "the proof publishes an input commitment that is not the one this salt makes: the prover returned a salt the proof was not made with",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn check_pin(pinned: &ShieldedAddress, reported: &str) -> Result<()> {
@@ -264,6 +319,11 @@ impl Prover {
                 match r.run(profile, kind).await? {
                     JobResult::Program { proof, outputs, tier, salt } => {
                         check_salt(want_salt, salt)?;
+                        if let Some(salt) = salt {
+                            check_h_in(&proof, salt, inputs).map_err(|e| {
+                                anyhow!("{e} — refusing to submit a call proved at {} against a transcript it does not commit to", r.url)
+                            })?;
+                        }
                         Ok((proof, outputs, tier, salt))
                     }
                     JobResult::Failed { error } => Err(anyhow!("prover: {error}")),
@@ -318,6 +378,20 @@ mod tests {
         assert!(check_salt(true, None).unwrap_err().to_string().contains("no salt"));
         assert!(check_salt(true, Some([1, 2, 3, 4])).is_ok());
         assert!(check_salt(false, None).is_ok());
+    }
+
+    /// One real proof on the test profile (seconds on a CPU), then the check the wallet runs
+    /// before it publishes a transcript: the salt the proof was made with is accepted, and any
+    /// other salt — which is what a prover that proved something else would hand back — is not.
+    #[test]
+    fn a_salt_the_proof_was_not_made_with_is_caught_before_submission() {
+        let prog = randprotocol_zkvm::guests::fib(20);
+        let (proof, _outputs, _tier, salt) =
+            executor::prove_call(FriProfile::Test, &prog, &[], None, Backend::Cpu).expect("fib(20) proves");
+        check_h_in(&proof, salt, &[]).expect("the real salt matches the H_IN the proof publishes");
+        let other = [salt[0] ^ 1, salt[1], salt[2], salt[3]];
+        let e = check_h_in(&proof, other, &[]).unwrap_err().to_string();
+        assert!(e.contains("not the one this salt makes"), "{e}");
     }
 
     #[test]
