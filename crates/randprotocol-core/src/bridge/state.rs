@@ -214,11 +214,6 @@ pub enum BridgeError {
     /// `apply_attest` cannot fail on an attestation `check_attest` accepted.
     #[error("the asset registry is full")]
     AssetRegistryFull,
-    /// The `BridgeAttest`'s `recipient` is a receiver id the registry holds no record for
-    /// (short-shielded-address task 5): there is no `pk` to deposit the note under, so the
-    /// deposit is refused rather than left unaddressable.
-    #[error("no receiver record for {0}")]
-    UnknownReceiver(crate::receiver::ReceiverId),
 }
 
 /// A transfer attestation as the pool needs it: which asset, under which note
@@ -231,11 +226,9 @@ pub enum BridgeError {
 /// burn the difference and the pool would stop holding what the source chain
 /// locked.
 ///
-/// `to_hash` is the wire `to` field: the recipient's receiver id, 32 bytes
-/// (short-shielded-address task 5). A receiver id is already exactly the size the wire format's
-/// `to` field holds, so — unlike the long shielded address this replaced — no separate hash of it
-/// is needed; the bridge resolves the id to a note-owning `pk` through the ledger's receiver
-/// registry (`Ledger::resolve_pk`), not here.
+/// `to_hash` is the wire `to` field, which on the shielded chain is
+/// `blake3("rand-shielded-recipient", pk || kem_ek)` of the recipient's
+/// address — the bridge never sees the address itself, only its hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BridgeTransfer {
     pub asset: AssetId,

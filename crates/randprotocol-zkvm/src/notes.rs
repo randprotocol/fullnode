@@ -92,13 +92,6 @@ pub mod domain {
     /// salt block: this digest is meant to be recomputed by a verifier who holds the words
     /// (`Machine::verify_public`), which is precisely what a salted `H_IN` cannot support.
     pub const PUB: u32 = 15;
-    /// The versioned KEM seed (fullnode spec 2026-09-17 §7, ruling R1; `ViewingKey::
-    /// kem_seed_at`): `H(KEM_SEED_VERSION, nk(8), version(1))` — a fixed 9-word message, like
-    /// every other domain. Version 0 does *not* use this domain at all — it is `kem_seed()`
-    /// itself, under `KEM_SEED` — so a fresh key rotation (version >= 1) can never collide
-    /// with, or be confused for, the address every already-sealed envelope and every existing
-    /// wallet was built against.
-    pub const KEM_SEED_VERSION: u32 = 16;
     pub const TEST: u32 = 0xff;
 }
 
@@ -179,23 +172,6 @@ impl ViewingKey {
     /// Seed for the ML-KEM decapsulation key (64 bytes, per FIPS 203's `d || z`).
     pub fn kem_seed(&self) -> [u8; 64] {
         let w = wide_hash(domain::KEM_SEED, &self.nk, 16);
-        words_to_bytes(&w).try_into().unwrap()
-    }
-    /// The KEM seed for key version `v` (fullnode spec 2026-09-17 §7, ruling R1): version 0 is
-    /// `kem_seed()` itself, so nothing already sealed changes meaning — every existing wallet
-    /// and every envelope already sealed keeps working. Every version `v >= 1` is a fresh
-    /// domain-tagged hash of `nk` and `v` (`domain::KEM_SEED_VERSION`), not a hash layered on
-    /// top of `kem_seed()`'s output, so it is re-derivable forever from `nk` alone and
-    /// separated from version 0 (a different domain entirely, not just a different message)
-    /// and from every other version (a different `v` in the message).
-    pub fn kem_seed_at(&self, version: u32) -> [u8; 64] {
-        if version == 0 {
-            return self.kem_seed();
-        }
-        let mut msg = [0u32; 9];
-        msg[..8].copy_from_slice(&self.nk);
-        msg[8] = version;
-        let w = wide_hash(domain::KEM_SEED_VERSION, &msg, 16);
         words_to_bytes(&w).try_into().unwrap()
     }
 }

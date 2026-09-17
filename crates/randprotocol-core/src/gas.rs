@@ -99,9 +99,6 @@ pub fn fee_floor(action: &Action) -> u64 {
         | Action::WithdrawAggregator { .. }
         | Action::SlashAggregator { .. }
         | Action::Aggregate { .. } => 0,
-        // A receiver record rides on a bundle exactly like a plain transfer — it moves no
-        // value and needs nothing tier-dependent, so it pays the plain base.
-        Action::RegisterReceiver { .. } => BUNDLE_BASE,
     }
 }
 
@@ -182,7 +179,7 @@ mod tests {
         };
         let attest = Action::BridgeAttest {
             attestation: vec![],
-            recipient: crate::receiver::ReceiverId([0; 32]),
+            recipient: crate::notes::ShieldedAddress { pk: [0; 8], kem_ek: vec![] },
             r: [0; 8],
             time: 0,
             asset: 1,

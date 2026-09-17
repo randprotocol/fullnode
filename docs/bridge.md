@@ -270,9 +270,8 @@ commitment and the registry leaf gained an index — that re-pin *is* the hard f
 The bridge root folds into the chain's state root only when a bridge exists:
 
 ```
-state_root = blake3("rand-state-4" || tree_root || nullifier_root || validators_root || programs_root
-                     [|| bridge_root] [|| aggregators_root] || receivers_root)
-           = blake3("rand-state-4" || … || programs_root || bridge_root || receivers_root)   with a `bridge` section
+state_root = blake3("rand-state-2" || tree_root || nullifier_root || validators_root || programs_root)
+           = blake3("rand-state-2" || … || programs_root || bridge_root)   with a `bridge` section
 ```
 
 A bridge-less chain commits exactly the 128 bytes phase S1 committed — byte-identical, no fifth
@@ -298,7 +297,7 @@ Two `Action` variants (`crates/randprotocol-core/src/types/transaction.rs`), bin
 the three staking actions:
 
 ```
-Action::BridgeAttest { attestation: Vec<u8>, recipient: ReceiverId, r: Word8, time: u32,
+Action::BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, time: u32,
                        asset: u32, envelope: Envelope }
 
 Action::BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee: u64,
@@ -311,24 +310,15 @@ a non-zero fee. See `docs/confidential.md`'s fee table.
 
 ### Inbound: an attestation deposits a note
 
-- **The recipient is a receiver id on the wire, directly (chain 11).** The 32-byte `to` field of
-  the `Transfer` payload *is* the recipient's `ReceiverId` — no hash, since a receiver id is
-  already 32 bytes (`docs/shielded.md` §2). Before chain 11 this field carried
-  `blake3("rand-shielded-recipient", pk || kem_ek)` of the ~1.2 KB long-form shielded address,
-  because the address itself did not fit; a receiver id fits the slot on its own. The source-chain
-  depositor names the id, the guardians sign it, and the ledger checks the action's `recipient`
-  against it by direct equality (`TxError::BridgeRecipientMismatch` on a mismatch) — without that
-  equality the submitter would choose who receives someone else's deposit.
-- **The id has to resolve, or the deposit is refused.** The note's `pk` comes from
-  `ledger.resolve_pk(recipient)` — the receiver registry, not the action — so a deposit to an id
-  the registry holds no record for is refused as `BridgeError::UnknownReceiver(id)`, *"no receiver
-  record for {id}"*, rather than deposited to a key nobody can derive. The attestation never
-  carries a record itself: the guardians' payload stays exactly 32 bytes per recipient (that is
-  the audited, source-chain-gas-metered surface), and a bridge deposit is never a first contact —
-  the wallet's `bridge-deposit-address` command refuses to print an address until this wallet is
-  registered, and says to register first (one self-transfer, `rand register`).
+- **The recipient is a hash on the wire.** The 32-byte `to` field of the `Transfer` payload is
+  `blake3("rand-shielded-recipient", pk || kem_ek)` of the recipient's shielded address
+  (`ShieldedAddress::recipient_hash`): a shielded address is about 1.2 KB and the wire format has
+  room for a hash. The source-chain depositor names the hash, the guardians sign it, the submitter
+  puts the full address in the action, and the ledger recomputes the hash and rejects a mismatch
+  (`TxError::BridgeRecipientMismatch`). Without that equality the submitter would choose who
+  receives someone else's deposit.
 - **The chain computes the note, not the submitter.** The deposit note is
-  `{ pk, from: 0, amount, asset: <registry index>, time, r }` and its commitment is
+  `{ pk: recipient.pk, from: 0, amount, asset: <registry index>, time, r }` and its commitment is
   `bridge_notes::deposit_commitment` — from the amount the guardians signed, so a relayer cannot
   inflate a mint or redirect it. It is the one commitment a transaction does **not** carry on the
   wire (`Transaction::commitments` omits it), which is why a node indexing notes for wallets
@@ -453,7 +443,7 @@ the `commitment` the chain computed from those fields — every word of the depo
 what makes the recovery path below possible; a `bridge_burn` with its asset, amount, relayer fee,
 destination and the asset bundle's public fields. Balances are not among them — there are none.
 
-**Wallet** (`crates/randprotocol-client`, `docs/cli.md`) — six commands:
+**Wallet** (`crates/randprotocol-client`, `docs/cli.md`) — five commands:
 
 | Command | Purpose |
 |---------|---------|
@@ -462,10 +452,9 @@ destination and the asset bundle's public fields. Balances are not among them �
 | `asset-balance [INDEX]` | what this wallet's own notes hold in one bridged asset, or a row per asset |
 | `bridge` | the bridge's public state |
 | `bridge-message <SEQUENCE>` | one outbound message, verbatim, for a guardian to sign |
-| `bridge-deposit-address` | this wallet's 32-byte `to` field for a source-chain depositor — refuses to print one until this wallet has published a receiver record (chain 11, above) |
 
 A wallet needs `--to` only when depositing to an address other than its own, and it checks the
-recipient id, the asset id and the index against the node before paying for a proof.
+recipient hash, the asset id and the index against the node before paying for a proof.
 `wallet::attested_deposit` reads the deposit out of the attestation bytes with no state and no
 signature work, because the envelope has to be sealed before the transaction exists.
 
@@ -568,7 +557,7 @@ For anyone holding an integration written against the pre-S1 bridge:
 | then | now |
 |---|---|
 | `balances: (AssetId, Address) -> u128` | nothing; a holding is a note with `asset = <index>` |
-| a recipient was a Dilithium2 address | a recipient is a receiver id (chain 11: the wire's 32-byte `to` field carries it directly); an id the registry holds no record for is refused |
+| a recipient was a Dilithium2 address | a recipient is `blake3` of a shielded address; the action carries the address |
 | `amount: u128` | `amount: u64` (a note's field); anything larger is refused at attestation time |
 | the registry mapped `AssetId -> (chain, token)` | it maps `AssetId -> { chain, token, index }`, and the note carries the index |
 | the relayer fee was paid to the submitter | inbound it is carried and paid to nobody (the deposit is gross); outbound it is still a portion of `amount`, paid on the destination chain, and a burn destroys exactly `amount` |
@@ -583,7 +572,7 @@ cannot be carried across that boundary (§4).
 
 | what | who sees it |
 |---|---|
-| a deposit's amount, asset index, recipient id | everyone, in that one transaction |
+| a deposit's amount, asset index, recipient address | everyone, in that one transaction |
 | which note a recipient later spends | nobody (the nullifier is a one-way function of `nk`) |
 | a burn's amount, asset, destination, relayer fee | everyone (guardians need it) |
 | which notes funded a burn | nobody |
@@ -597,12 +586,8 @@ mint.
 
 ## 12. What integrators need to know
 
-- Recipients on Rand are identified by a 32-byte receiver id (the raw bytes of the `rand1…`
-  address, chain 11), not a Dilithium2 address and not a hash of one. Wallets print it
-  (`bridge-deposit-address`) and source-chain front ends must accept it — but only once the
-  recipient has published a receiver record: a deposit to an unregistered id is refused
-  (`BridgeError::UnknownReceiver`), and the wallet will not print the address until it is
-  registered.
+- Recipients on Rand are identified by a 32-byte hash of a shielded address, not a Dilithium2
+  address. Wallets print it and source-chain front ends must accept it.
 - Amounts are `u64` in the bridged asset's own units after decimals; anything above `2⁶⁴ − 1` is
   rejected at attestation time. Only index 0 (RAND) has this chain's nine decimals — what a
   bridged token's smallest unit means belongs to its source chain.

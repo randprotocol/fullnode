@@ -32,7 +32,8 @@
 use crate::notes::{words_to_bytes, ViewingKey};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use ml_kem::{Decapsulate, Encapsulate};
+use ml_kem::kem::FromSeed;
+use ml_kem::{Decapsulate, Encapsulate, MlKem768};
 use rand::Rng;
 use randprotocol_core::notes::{ShieldedAddress, Word8};
 use randprotocol_core::types::{CallEnvelope, MAX_CALL_ENVELOPE_BYTES};
@@ -120,12 +121,10 @@ fn parse_plaintext(pt: &[u8]) -> Option<([u32; 4], Vec<u32>)> {
     Some((salt, inputs))
 }
 
-/// The auditor's ML-KEM-768 keys at KEM key version `version`, as `viewing.rs` derives them
-/// (`ViewingKey::kem_keys_at`). Version 0 is the key of a wallet that has never rotated; a
-/// rotated auditor still opens a call sealed to an earlier address by naming that version
-/// (spec §7: no retired key is ever discarded), which is what [`open_call_as_auditor_at`] is for.
-fn kem_keys_at(vk: &ViewingKey, version: u32) -> (Dk, Ek) {
-    vk.kem_keys_at(version)
+/// The auditor's ML-KEM-768 keys, rebuilt from its viewing key exactly as `viewing.rs` does
+/// (its own `kem_keys` is private to that vendored file).
+fn kem_keys(vk: &ViewingKey) -> (Dk, Ek) {
+    MlKem768::from_seed(&ml_kem::Seed::from(vk.kem_seed()))
 }
 
 /// Seals `(salt, inputs)` for the call whose proof publishes `h_in`, under a fresh `K_call`
@@ -205,24 +204,10 @@ pub fn open_call_as_sender(e: &CallEnvelope, h_in: &Word8, vk: &ViewingKey) -> O
     Some((key, salt, inputs))
 }
 
-/// Opens as the auditor named when the envelope was sealed, at KEM key version 0 — the address
-/// of an auditor that has never rotated. Equals `open_call_as_auditor_at(e, h_in, auditor, 0)`.
+/// Opens as the auditor named when the envelope was sealed: decapsulate, unwrap `K_call`, open
+/// the body. `None` for every other viewing key, and for a call sealed without an auditor.
 pub fn open_call_as_auditor(e: &CallEnvelope, h_in: &Word8, auditor: &ViewingKey) -> Option<(CallKey, [u32; 4], Vec<u32>)> {
-    open_call_as_auditor_at(e, h_in, auditor, 0)
-}
-
-/// Opens as the auditor named when the envelope was sealed, under KEM key version `version`:
-/// decapsulate, unwrap `K_call`, open the body. `None` for every other viewing key, for a call
-/// sealed without an auditor, and for the right key at the wrong version — the wrap is bound to
-/// one encapsulation key, so a rotated auditor has to try the version its address was at when
-/// the caller sealed (the wallet tries them newest first).
-pub fn open_call_as_auditor_at(
-    e: &CallEnvelope,
-    h_in: &Word8,
-    auditor: &ViewingKey,
-    version: u32,
-) -> Option<(CallKey, [u32; 4], Vec<u32>)> {
-    let (dk, _) = kem_keys_at(auditor, version);
+    let (dk, _) = kem_keys(auditor);
     let ct = KemCt::try_from(&e.kem_ct[..]).ok()?;
     let ss: [u8; 32] = dk.decapsulate(&ct).into();
     let key = CallKey(open(&ss, AAD_AUDITOR, &e.to_auditor)?.try_into().ok()?);
@@ -273,28 +258,6 @@ mod tests {
         assert_eq!(parse_plaintext(&[0; 15]), None, "shorter than the salt");
         assert_eq!(parse_plaintext(&[0; 18]), None, "a partial word after the salt");
         assert_eq!(parse_plaintext(&[0; 16]), Some(([0; 4], Vec::new())));
-    }
-
-    /// A rotated auditor opens the call it was named in — at the KEM key version its address
-    /// was at when the caller sealed, and at no other. Short-shielded-address task 7: the
-    /// auditor's wallet tries its versions newest first, exactly as it does for note envelopes.
-    #[test]
-    fn an_auditor_opens_at_the_key_version_the_caller_sealed_to() {
-        let caller = SpendKey([5; 8]).viewing_key();
-        let auditor = SpendKey([6; 8]).viewing_key();
-        let inputs = [7u32, 8];
-        let h = crate::hash::input_digest([9, 9, 9, 9], &inputs);
-        // Sealed to the auditor's version-1 address: the one it published after one rotation.
-        let at1 = crate::address::address_of_at(&auditor, 1);
-        let (e, key) = seal_call_envelope(&caller, Some(&at1), &h, [9, 9, 9, 9], &inputs).unwrap();
-        assert_eq!(open_call_as_auditor(&e, &h, &auditor), None, "version 0 is the wrong key here");
-        let (back_key, salt, back) = open_call_as_auditor_at(&e, &h, &auditor, 1).expect("the sealed version opens");
-        assert_eq!((back_key, salt, back), (key, [9, 9, 9, 9], inputs.to_vec()));
-        assert_eq!(open_call_as_auditor_at(&e, &h, &auditor, 2), None, "and no version beyond it");
-        // Version 0 still behaves as it always did for an auditor that never rotated.
-        let at0 = crate::address::address_of(&auditor);
-        let (e0, _) = seal_call_envelope(&caller, Some(&at0), &h, [9, 9, 9, 9], &inputs).unwrap();
-        assert!(open_call_as_auditor(&e0, &h, &auditor).is_some());
     }
 
     /// Two envelopes never share a per-call key, and the wraps are keyed independently.

@@ -7,8 +7,7 @@
 //! until their phase lands.
 
 use crate::crypto::{Address, Hash, PublicKey, Signature};
-use crate::notes::{Envelope, Word8};
-use crate::receiver::ReceiverId;
+use crate::notes::{Envelope, ShieldedAddress, Word8};
 use serde::{Deserialize, Serialize};
 
 /// Largest call-input envelope accepted in a `Call` transaction (spec §6.1).
@@ -36,7 +35,7 @@ pub const MAX_CALL_ENVELOPE_BYTES: usize = 18_432;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Registration {
     pub public_key: PublicKey,
-    pub payout: ReceiverId,
+    pub payout: ShieldedAddress,
     pub signature: Signature,
 }
 
@@ -94,7 +93,7 @@ impl CallEnvelope {
 /// `Action::Bond`'s `validator` field must equal `registration.public_key.address()`, and
 /// S2's validation asserts it. Without that check a bond could register one key's payout
 /// under another key's address.
-pub fn registration_message(chain_id: u64, payout: &ReceiverId) -> Hash {
+pub fn registration_message(chain_id: u64, payout: &ShieldedAddress) -> Hash {
     let bytes = bincode::serialize(&(chain_id, payout)).expect("serializes");
     Hash::digest_domain(b"rand-register", &bytes)
 }
@@ -129,8 +128,8 @@ mod tests {
     use super::*;
     use crate::crypto::Keypair;
 
-    fn addr() -> ReceiverId {
-        ReceiverId([4; 32])
+    fn addr() -> ShieldedAddress {
+        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
     }
 
     fn env() -> Envelope {
@@ -185,7 +184,8 @@ mod tests {
         ] {
             assert_ne!(other, wbase);
         }
-        let other_payout = ReceiverId([5; 32]);
+        let mut other_payout = addr();
+        other_payout.pk = [5; 8];
         assert_ne!(registration_message(7, &addr()), registration_message(7, &other_payout));
         assert_ne!(registration_message(7, &addr()), registration_message(8, &addr()));
         // Different domains, so no message of one kind is ever a message of another.
@@ -202,7 +202,7 @@ mod tests {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatorRegistration {
     pub public_key: PublicKey,
-    pub payout: ReceiverId,
+    pub payout: ShieldedAddress,
     pub signature: Signature,
 }
 
@@ -225,7 +225,7 @@ pub struct SignedAggregateHeader {
 /// [`registration_message`]'s exact construction, one role over. As there, the enclosing
 /// action's `aggregator` field must equal `registration.public_key.address()`, so one key's
 /// payout cannot be registered under another key's address.
-pub fn aggregator_register_message(chain_id: u64, payout: &ReceiverId) -> crate::crypto::Hash {
+pub fn aggregator_register_message(chain_id: u64, payout: &ShieldedAddress) -> crate::crypto::Hash {
     let bytes = bincode::serialize(&(chain_id, payout)).expect("serializes");
     crate::crypto::Hash::digest_domain(b"rand-aggregator-register", &bytes)
 }

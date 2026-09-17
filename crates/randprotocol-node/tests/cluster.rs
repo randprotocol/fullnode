@@ -114,38 +114,9 @@ fn wallet(i: u32) -> Wallet {
     Wallet::from_spend_key(SpendKey([i; 8]))
 }
 
-/// A bare, arbitrary receiver id for the structural faucet-mint tests (short-shielded-address
-/// task 5): pure, so it can be named before any genesis exists. It names no wallet — those tests
-/// only ever check that a minted commitment is present (`TestNode::holds`), never that anyone can
-/// open it — so it is not registered by [`genesis_bridge`], and a test that needs its mint to
-/// resolve has to register it itself (see [`wallet_receiver_id`] for a funded wallet's own id,
-/// which `genesis_bridge` does register).
-fn receiver_id(seed: u8) -> randprotocol_core::receiver::ReceiverId {
-    randprotocol_core::receiver::ReceiverId::from(
-        randprotocol_core::receiver::receiver_signing_keypair(&[seed; 32]).public_key(),
-    )
-}
-
-/// The receiver record a funded wallet's own id resolves to, derived straight from its spend key
-/// (`receiver_signing_keypair`, spec §1) with `pk`/`kem_ek` set to the wallet's real note-owning
-/// address — the same pattern `a_fifth_validator_registers_bonds_and_joins_the_next_epoch` and
-/// `unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_note` register at runtime
-/// for a payout wallet, but built once here so [`genesis_bridge`] can register it for every
-/// wallet it funds. A payment to [`wallet_receiver_id`] therefore seals to a note that wallet's
-/// own viewing key opens — unlike [`receiver_id`], which names nobody.
-fn wallet_receiver_record(w: &Wallet, chain_id: u64) -> randprotocol_core::receiver::ReceiverRecord {
-    w.record(chain_id)
-}
-
-/// The id [`wallet_receiver_record`] registers under — pure, like [`receiver_id`], so it can be
-/// named before any genesis exists.
-fn wallet_receiver_id(w: &Wallet) -> randprotocol_core::receiver::ReceiverId {
-    w.id
-}
-
-/// The receiver id a mint pays, as its `rand1…` text.
+/// The shielded address a mint pays, as its `rand1…` text.
 fn payee(seed: u8) -> String {
-    receiver_id(seed).to_string()
+    wallet(seed as u32).address.to_string()
 }
 
 /// What `wallet` can spend according to `node` — a fresh note store scanned against that node's
@@ -187,7 +158,7 @@ fn genesis(validators: &[Keypair]) -> Genesis {
 fn genesis_staking(validators: &[Keypair], funded: &[(&Wallet, u64)]) -> Genesis {
     let mut gen = genesis_funding(validators, &[]);
     gen.epoch_blocks = EPOCH;
-    gen.alloc = funded.iter().map(|(w, amount)| alloc_note(&w.current_address(), *amount)).collect();
+    gen.alloc = funded.iter().map(|(w, amount)| alloc_note(&w.address, *amount)).collect();
     gen
 }
 
@@ -199,18 +170,6 @@ fn genesis_funding(validators: &[Keypair], funded: &[&Wallet]) -> Genesis {
 /// [`genesis_funding`] with an optional `bridge` section. A chain built with `None` has no bridge
 /// at all — no registry, no bridge root, and both bridge actions inadmissible.
 fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<BridgeConfig>) -> Genesis {
-    // Phase S2 requires a payout id per validator; nothing in this test withdraws, so the record
-    // only has to resolve (short-shielded-address task 4).
-    let receiver_record = |i: usize| {
-        let kp = randprotocol_core::receiver::receiver_signing_keypair(&[i as u8 + 1; 32]);
-        randprotocol_core::receiver::ReceiverRecord::sign(
-            &kp,
-            CHAIN_ID,
-            1,
-            [i as u32 + 1; 8],
-            vec![i as u8 + 1; randprotocol_core::notes::KEM_EK_BYTES],
-        )
-    };
     Genesis {
         chain_id: CHAIN_ID,
         timestamp_ms: 0,
@@ -220,23 +179,16 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
             .map(|(i, k)| GenesisValidator {
                 public_key: k.public_key().clone(),
                 stake: MIN_STAKE as u128,
-                payout: receiver_record(i).id().to_string(),
+                // Phase S2 requires a payout address per validator; nothing in this test
+                // withdraws, so it only has to parse.
+                payout: randprotocol_core::notes::ShieldedAddress {
+                    pk: [i as u32 + 1; 8],
+                    kem_ek: vec![i as u8 + 1; randprotocol_core::notes::KEM_EK_BYTES],
+                }
+                .to_string(),
             })
             .collect(),
-        alloc: funded.iter().map(|w| alloc_note(&w.current_address(), ALLOC)).collect(),
-        // Every id this genesis pays: each validator's payout, and — short-shielded-address
-        // task 6 — every funded wallet's own receiver id, so a payment addressed to it (a bridge
-        // deposit, here) resolves to a note that wallet can actually open. `wallet_receiver_id`,
-        // not `receiver_id`: a funded wallet's real note key, not the structural mint tests'
-        // arbitrary one.
-        receivers: (0..validators.len())
-            .map(|i| randprotocol_core::genesis::ReceiverRecordHex::from_record(&receiver_record(i)))
-            .chain(
-                funded
-                    .iter()
-                    .map(|w| randprotocol_core::genesis::ReceiverRecordHex::from_record(&wallet_receiver_record(w, CHAIN_ID))),
-            )
-            .collect(),
+        alloc: funded.iter().map(|w| alloc_note(&w.address, ALLOC)).collect(),
         faucet: true,
         confidential: true,
         fri_profile: "test".into(),
@@ -291,10 +243,10 @@ const EVM_TO: [u8; 32] = {
 /// One inbound transfer attestation: `amount` units of [`TOKEN`] addressed to `to`, emitted by
 /// chain 2's registered emitter and signed by five of the six guardians.
 ///
-/// The 32-byte recipient slot carries `to.0` directly (short-shielded-address task 5): a receiver
-/// id is already exactly the 32 bytes the wire format holds, unlike the long shielded address
-/// this replaced, which needed a separate hash to fit.
-fn attestation(to: &randprotocol_core::receiver::ReceiverId, amount: u128) -> Vec<u8> {
+/// The 32-byte recipient slot carries `to.recipient_hash()`, not an address: a shielded address is
+/// 1.2 KB and the wire format has room for a hash, so the source-chain depositor names the hash and
+/// the transaction carries the address for the ledger to check against it.
+fn attestation(to: &ShieldedAddress, amount: u128) -> Vec<u8> {
     let secrets = guardian_secrets();
     let body = Body {
         timestamp: 1,
@@ -307,7 +259,7 @@ fn attestation(to: &randprotocol_core::receiver::ReceiverId, amount: u128) -> Ve
             amount: Transfer::u256_from_u128(amount),
             token_address: TOKEN,
             token_chain: TOKEN_CHAIN,
-            to: to.0,
+            to: to.recipient_hash(),
             to_chain: CHAIN_RAND,
             fee: Transfer::u256_from_u128(0),
         })
@@ -400,24 +352,11 @@ async fn wait_height(nodes: &[&TestNode], min: u64, timeout: Duration) {
 }
 
 impl TestNode {
-    /// Mint `amount` units to `w`'s own receiver id through this node's RPC and wait for the
-    /// commit. First-contact path (short-shielded-address task 6's controller ruling): nothing
-    /// has registered `w` before this call, so the mint carries `w`'s own record as
-    /// `rand_mint`'s third parameter rather than relying on the registry already holding it —
-    /// exactly how a fresh wallet actually gets its first note in production. Returns the
-    /// transaction hash and the commitment of the note it created, which is the thing every node
-    /// must agree on afterwards.
-    async fn mint(&self, w: &Wallet, amount: u64) -> (Hash, Word8) {
-        let record = wallet_receiver_record(w, CHAIN_ID);
-        let record_json =
-            serde_json::to_value(randprotocol_core::genesis::ReceiverRecordHex::from_record(&record)).unwrap();
-        let to = wallet_receiver_id(w).to_string();
-        let v = self
-            .rpc
-            .call("rand_mint", json!([to, amount.to_string(), record_json]))
-            .await
-            .expect("mint accepted");
-        let hash = Hash::from_hex(v.as_str().expect("rand_mint returns a hash string")).expect("valid hash hex");
+    /// Mint `amount` units to `payee(seed)` through this node's RPC and wait for the commit.
+    /// Returns the transaction hash and the commitment of the note it created, which is the
+    /// thing every node must agree on afterwards.
+    async fn mint(&self, seed: u8, amount: u64) -> (Hash, Word8) {
+        let hash = self.rpc.mint_shielded(&payee(seed), Some(amount)).await.expect("mint accepted");
         self.rpc.wait_for_transaction(&hash, Duration::from_secs(30)).await.expect("mint commits");
         (hash, self.note_of(&hash).expect("a committed mint has a note"))
     }
@@ -491,7 +430,7 @@ async fn four_validators_plus_late_observer_syncs() {
     let n3 = start_node(&ks[3], &gen, boot.clone(), true).await;
     wait_height(&[&n0, &n1, &n2, &n3], 6, Duration::from_secs(60)).await;
 
-    let (hash, cm) = n2.mint(&wallet(1), 5 * UNITS_PER_RAND).await;
+    let (hash, cm) = n2.mint(1, 5 * UNITS_PER_RAND).await;
     wait_for("mint committed on n0", Duration::from_secs(30), || n0.handle.storage.tx_location(&hash).unwrap().is_some())
         .await;
 
@@ -570,7 +509,7 @@ async fn restart_cycles_keep_all_nodes_in_sync() {
             let target = rest.iter().map(|n| n.height()).max().unwrap() + 4;
             wait_height(&rest, target, Duration::from_secs(60)).await;
             // Also mint while it is down, so it has state to catch up on.
-            let (_, cm) = nodes[0].mint(&wallet((10 + cycle * 4 + i as u8) as u32), UNITS_PER_RAND).await;
+            let (_, cm) = nodes[0].mint(10 + cycle * 4 + i as u8, UNITS_PER_RAND).await;
 
             let restarted = start_in(dir, &ks[i], boot.clone(), true).await;
             assert_eq!(restarted.handle.storage.head().unwrap().height, before, "restart lost committed blocks");
@@ -633,7 +572,7 @@ async fn node_behind_by_more_than_one_sync_batch_catches_up() {
     // With one validator down every fourth view times out, so ~2 s per 3 blocks; give it room
     // (the suite runs several clusters in parallel on a few threads).
     wait_height(&[&n0, &n1, &n3], stopped_at + 130, Duration::from_secs(400)).await;
-    let (_, cm) = n0.mint(&wallet(30), 2 * UNITS_PER_RAND).await;
+    let (_, cm) = n0.mint(30, 2 * UNITS_PER_RAND).await;
 
     let n2 = start_in(d2, &ks[2], boot.clone(), true).await;
     assert_eq!(n2.handle.storage.head().unwrap().height, stopped_at);
@@ -658,7 +597,7 @@ async fn corrupted_rocksdb_is_detected_truncated_and_resynced() {
     let _n3 = start_node(&ks[3], &gen, boot.clone(), true).await;
     let n2 = start_node(&ks[2], &gen, boot.clone(), true).await;
     // A mint early in the chain, so the note must survive the repair.
-    let (hash, cm) = n0.mint(&wallet(40), 3 * UNITS_PER_RAND).await;
+    let (hash, cm) = n0.mint(40, 3 * UNITS_PER_RAND).await;
     let receipt_height = n0.handle.storage.tx_location(&hash).unwrap().unwrap().0;
     wait_height(&[&n0, &n1, &n2], receipt_height + 8, Duration::from_secs(60)).await;
 
@@ -708,7 +647,7 @@ async fn faucet_mint_via_rpc_reaches_every_node() {
 
     // A validator mints the faucet's full 100 RAND to C.
     let c = wallet(3);
-    let (h1, cm1) = b.mint(&c, 100 * UNITS_PER_RAND).await;
+    let (h1, cm1) = b.mint(3, 100 * UNITS_PER_RAND).await;
     wait_for("mint visible on A", Duration::from_secs(30), || a.handle.storage.tx_location(&h1).unwrap().is_some()).await;
     assert!(a.holds(&cm1) && b.holds(&cm1));
     // Every node — the observer included — serves the leaf C's viewing key opens, and none of
@@ -721,7 +660,7 @@ async fn faucet_mint_via_rpc_reaches_every_node() {
 
     // A second mint right away: nothing serialises two mints from one node any more, since
     // there is no nonce to advance — the notes simply differ.
-    let (_, cm2) = b.mint(&wallet(2), 5 * UNITS_PER_RAND).await;
+    let (_, cm2) = b.mint(2, 5 * UNITS_PER_RAND).await;
     assert_ne!(cm1, cm2);
     wait_for("both notes on A", Duration::from_secs(30), || a.holds(&cm1) && a.holds(&cm2)).await;
     assert_eq!(a.handle.storage.notes_count().unwrap(), 2);
@@ -786,7 +725,7 @@ async fn a_refused_transaction_is_not_verified_twice() {
     assert!(again.contains("mint signature"), "{again}");
     assert_eq!(n0.handle.status.read().unwrap().refused_cache, 1);
     // A legitimate transaction still goes through, so the cache is not a blanket refusal.
-    n0.mint(&wallet(7), 5 * UNITS_PER_RAND).await;
+    n0.mint(7, 5 * UNITS_PER_RAND).await;
     stop(n0).await;
 }
 
@@ -857,7 +796,7 @@ async fn two_validators_commit_and_shielded_transfer() {
     let pay = UNITS_PER_RAND;
     let mut store = NoteStore::default();
     let slot = proving_slot().await;
-    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.current_address(), pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -992,7 +931,7 @@ async fn a_node_that_was_down_syncs_past_a_block_carrying_a_real_proof() {
     let pay = UNITS_PER_RAND;
     let mut store = NoteStore::default();
     let slot = proving_slot().await;
-    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.current_address(), pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -1052,7 +991,7 @@ async fn two_bundles_spending_one_note_only_one_commits() {
             let (a, b) = (wallet(5), wallet(6));
             let mut store = NoteStore::default();
             let out =
-                wallet::send(&rpc, &a, &mut store, &b.current_address(), pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, false)
+                wallet::send(&rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, false)
                     .await;
             out.map(|s| (s.hash, s.amount))
         })
@@ -1262,11 +1201,9 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     let ks = keys(5);
     let bonder = wallet(50);
     let payout = wallet(51);
-    // One note has to hold the stake and the fees of the two bundles that spend it: 1000 RAND of
-    // stake for the bond, and 2 RAND more to pay the receiver record's fee and the bond's own out
-    // of (short-shielded-address task 4: the payout wallet registers its record before the bond
-    // can name it), with change to spare.
-    let funding = MIN_STAKE + 2 * UNITS_PER_RAND;
+    // One note has to hold the stake and the fee of the bundle that burns it: 1000 RAND of stake,
+    // and 1 RAND more to pay the 0.001 fee out of and keep as change.
+    let funding = MIN_STAKE + UNITS_PER_RAND;
     let gen = genesis_staking(&ks[..4], &[(&bonder, funding)]);
     let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
     let boot = vec![bootstrap_addr(&n0)];
@@ -1287,41 +1224,15 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     }
     assert!(register_row(&n0, &ks[4].address()).await.is_none(), "and in no register row yet");
 
-    // ---- the receiver record: the registry, not the register, owns the note key
-    // (short-shielded-address task 4), so the payout wallet registers its record first.
-    let payout_record = wallet_receiver_record(&payout, CHAIN_ID);
-    let payout_id = payout_record.id();
-    let mut store = NoteStore::default();
-    let register_receiver_action = Action::RegisterReceiver { record: payout_record };
-    let register_fee = gas::fee_floor(&register_receiver_action);
-    {
-        let slot = proving_slot().await;
-        wallet::submit(
-            &n0.rpc,
-            &bonder,
-            &mut store,
-            None,
-            register_receiver_action,
-            register_fee,
-            Burn::None,
-            FriProfile::Test,
-            Backend::Cpu,
-            CHAIN_ID,
-            true,
-        )
-        .await
-        .expect("the receiver record is accepted and commits");
-        drop(slot);
-    }
-
     // ---- the bond: a wallet's bundle burns the stake, with the validator's registration attached
     let registration = Registration {
         public_key: ks[4].public_key().clone(),
-        payout: payout_id,
-        signature: ks[4].sign(registration_message(CHAIN_ID, &payout_id).as_bytes()),
+        payout: payout.address.clone(),
+        signature: ks[4].sign(registration_message(CHAIN_ID, &payout.address).as_bytes()),
     };
     let action = Action::Bond { validator: ks[4].address(), amount: MIN_STAKE, registration: Some(registration) };
     let fee = gas::fee_floor(&action);
+    let mut store = NoteStore::default();
     let slot = proving_slot().await;
     let bonded =
         wallet::submit(&n0.rpc, &bonder, &mut store, None, action, fee, Burn::Rand(MIN_STAKE), FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
@@ -1332,10 +1243,10 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     assert_eq!(bonded.burn, Burn::Rand(MIN_STAKE), "the bundle burns exactly what is bonded, in RAND");
     assert_eq!(bonded.amount, 0, "a bond pays nobody a note");
 
-    // The register has the entry at once, with the payout id the validator itself signed for.
+    // The register has the entry at once, with the payout address the validator itself signed for.
     let row = register_row(&n0, &ks[4].address()).await.expect("the bond registered the fifth validator");
     assert_eq!(units(&row["stake"]), MIN_STAKE);
-    assert_eq!(row["payout"].as_str().unwrap(), payout_id.to_string(), "the payout it signed, not the bonder's");
+    assert_eq!(row["payout"].as_str().unwrap(), payout.address.to_string(), "the payout it signed, not the bonder's");
     assert_eq!(row["nonce"].as_u64().unwrap(), 0, "a fresh entry's first signed action carries nonce 0");
     let epoch = n0.rpc.epoch().await.unwrap();
     assert_eq!(epoch["epoch_blocks"].as_u64().unwrap(), EPOCH);
@@ -1369,22 +1280,13 @@ async fn a_fifth_validator_registers_bonds_and_joins_the_next_epoch() {
     assert_chains_equal(&all);
 
     // The stake left the pool as the bundle's burn instead of becoming anyone's note, and the
-    // audit accounts for it on the register's side of the boundary (`docs/supply.md`) — along
-    // with the receiver record's own fee, paid out of the same funding note.
-    assert_eq!(
-        balance(&n0, &bonder).await,
-        funding - MIN_STAKE - fee - register_fee,
-        "the wallet paid the stake and both fees"
-    );
+    // audit accounts for it on the register's side of the boundary (`docs/supply.md`).
+    assert_eq!(balance(&n0, &bonder).await, funding - MIN_STAKE - fee, "the wallet paid the stake and the fee");
     let supply = supply_of(&n0).await;
     assert_eq!(units(&supply["burned"]), MIN_STAKE, "a bond is the only thing that burns");
     assert_eq!(units(&supply["genesis_deposited"]), funding);
     assert_eq!(units(&supply["genesis_staked"]), 4 * MIN_STAKE);
-    assert_eq!(
-        units(&supply["register_total"]),
-        5 * MIN_STAKE + fee + register_fee,
-        "four genesis stakes, the bond, and both fees"
-    );
+    assert_eq!(units(&supply["register_total"]), 5 * MIN_STAKE + fee, "four genesis stakes, the bond, and the fee");
     assert!(supply["invariant_holds"].as_bool().unwrap(), "{supply}");
     eprintln!("a_fifth_validator_registers_bonds_and_joins_the_next_epoch in {:.1?}", started.elapsed());
 }
@@ -1403,11 +1305,7 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     let payout = wallet(52);
     let payee = wallet(53);
     let mut gen = genesis_staking(&ks, &[]);
-    // The registry, not the register, owns the note key (short-shielded-address task 4): D's
-    // payout is this wallet's record, registered in the genesis file alongside the others.
-    let payout_record = wallet_receiver_record(&payout, CHAIN_ID);
-    gen.validators[3].payout = payout_record.id().to_string();
-    gen.receivers.push(randprotocol_core::genesis::ReceiverRecordHex::from_record(&payout_record));
+    gen.validators[3].payout = payout.address.to_string();
     let d = ks[3].address();
     let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
     let boot = vec![bootstrap_addr(&n0)];
@@ -1462,8 +1360,8 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     // and the action's public fields, so the note it appends is this one or the withdraw is
     // refused.
     let time = n0.height() as u32;
-    let note = Note::new(payout.current_address().pk, [0; 8], MIN_STAKE - base, 0, time);
-    let envelope = randprotocol_zkvm::address::seal_note(&SpendKey::random().viewing_key(), &payout.current_address(), &note, &TxKey::random())
+    let note = Note::new(payout.address.pk, [0; 8], MIN_STAKE - base, 0, time);
+    let envelope = randprotocol_zkvm::address::seal_note(&SpendKey::random().viewing_key(), &payout.address, &note, &TxKey::random())
         .expect("sealing the payout note");
     let signature = ks[3].sign(withdraw_message(CHAIN_ID, &d, MIN_STAKE, nonce, time, &note.r, &envelope).as_bytes());
     let withdraw = signed_tx(Action::Withdraw {
@@ -1498,7 +1396,7 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     let pay = UNITS_PER_RAND;
     let slot = proving_slot().await;
     let sent =
-        wallet::send(&n0.rpc, &payout, &mut store, &payee.current_address(), pay, base, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::send(&n0.rpc, &payout, &mut store, &payee.address, pay, base, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
             .await
             .expect("the withdrawn note pays a real bundle");
     drop(slot);
@@ -1548,11 +1446,10 @@ async fn bridge_mint(
     relayer: &Wallet,
     store: &mut NoteStore,
     to: &ShieldedAddress,
-    id: randprotocol_core::receiver::ReceiverId,
     attestation: Vec<u8>,
 ) -> (wallet::Submission, u32, Word8) {
     let d = wallet::attested_deposit(&attestation).expect("the attestation decodes to a transfer");
-    assert_eq!(d.to_hash, id.0, "the guardians signed this recipient's id");
+    assert_eq!(d.to_hash, to.recipient_hash(), "the guardians signed this recipient's hash");
     // The asset id from the node, over the two wire fields the guardians signed; a disagreement
     // would mean the two are not talking about the same chain.
     let asset_id = node.rpc.bridge_asset_id(d.token_chain, &d.token).await.expect("the node computes an asset id");
@@ -1562,7 +1459,8 @@ async fn bridge_mint(
     let index = wallet::deposit_index(&state, &assets, &asset_id).expect("an index for this asset").index();
     let time = u32::try_from(node.rpc.head().await.expect("head")["height"].as_u64().expect("height")).unwrap();
     let (note, envelope) = wallet::deposit_note_for(relayer, to, d.amount, index, time).expect("sealing the deposit");
-    let action = Action::BridgeAttest { attestation, recipient: id, r: note.r, time, asset: index, envelope };
+    let action =
+        Action::BridgeAttest { attestation, recipient: to.clone(), r: note.r, time, asset: index, envelope };
     let fee = gas::fee_floor(&action);
     let slot = proving_slot().await;
     let s = wallet::submit(&node.rpc, relayer, store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
@@ -1579,12 +1477,7 @@ async fn bridge_mint(
 /// `docs/shielded.md` §5), so everything before the action passes and the refusal that comes back
 /// is the *attestation's*. That is what makes this a probe worth a second of test time rather than
 /// a second bundle proof.
-async fn replayed_attest(
-    node: &TestNode,
-    id: randprotocol_core::receiver::ReceiverId,
-    attestation: Vec<u8>,
-    asset: u32,
-) -> Transaction {
+async fn replayed_attest(node: &TestNode, to: &ShieldedAddress, attestation: Vec<u8>, asset: u32) -> Transaction {
     let (height, anchor) = node.rpc.anchor(None).await.expect("the head anchor");
     let time = u32::try_from(height).unwrap();
     let empty = Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] };
@@ -1599,7 +1492,8 @@ async fn replayed_attest(
         envelopes: [empty.clone(), empty.clone()],
         proof: vec![0xff; 32],
     };
-    let action = Action::BridgeAttest { attestation, recipient: id, r: [7; 8], time, asset, envelope: empty };
+    let action =
+        Action::BridgeAttest { attestation, recipient: to.clone(), r: [7; 8], time, asset, envelope: empty };
     Transaction::shielded(CHAIN_ID, bundle, action)
 }
 
@@ -1632,16 +1526,11 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     assert!(n0.rpc.assets().await.unwrap().is_empty());
 
     // ---- inbound: one attestation, one deposit note ----
-    // Short-shielded-address task 6: the deposit is addressed to `recipient`'s own receiver id,
-    // registered by `genesis_bridge` (it is one of `funded`) with the record pointing at
-    // `recipient`'s real note key — so the deposit resolves and `recipient`'s wallet opens it,
-    // exactly as the assertions below check.
-    let recipient_id = wallet_receiver_id(&recipient);
     let deposit = 5_000u64;
-    let attested = attestation(&recipient_id, deposit as u128);
+    let attested = attestation(&recipient.address, deposit as u128);
     let mut relayer_store = NoteStore::default();
     let (minted, index, cm) =
-        bridge_mint(&n0, &relayer, &mut relayer_store, &recipient.current_address(), recipient_id, attested.clone()).await;
+        bridge_mint(&n0, &relayer, &mut relayer_store, &recipient.address, attested.clone()).await;
     assert_eq!(index, 1, "a first sighting takes FIRST_ASSET_INDEX");
     eprintln!("bridge-mint: tier {}, proved in {:.1?}, {} proof bytes", minted.tier, minted.proving, minted.proof_bytes);
 
@@ -1671,7 +1560,7 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     assert_eq!(action["asset_index"], index, "and the one the registry resolves, which admission held it to");
 
     // ---- the same attestation again: one digest, one deposit ----
-    let replay = replayed_attest(&n0, recipient_id, attested, index).await;
+    let replay = replayed_attest(&n0, &recipient.address, attested, index).await;
     let err = n0.rpc.send_transaction(&replay).await.unwrap_err().to_string();
     assert!(err.contains("already consumed"), "a replayed attestation must be refused as consumed: {err}");
 
@@ -1776,7 +1665,7 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
         randprotocol_zkvm::executor::prove_call(FriProfile::Test, &program, &inputs, None, Backend::Cpu)
             .expect("the call proves");
     let h_in = hash::input_digest(salt, &inputs);
-    let (sealed, key) = call_envelope::seal_call_envelope(&caller.vk, Some(&auditor.current_address()), &h_in, salt, &inputs)
+    let (sealed, key) = call_envelope::seal_call_envelope(&caller.vk, Some(&auditor.address), &h_in, salt, &inputs)
         .expect("sealing the transcript");
     let called = wallet::submit(
         &n0.rpc,
@@ -1916,44 +1805,17 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
     let n1 = start_node_at(&ks[1], &gen, vec![bootstrap_addr(&n0)], true, PROVING).await;
     wait_height(&[&n0, &n1], 2, Duration::from_secs(60)).await;
 
-    // The registry, not the register, owns the note key (short-shielded-address task 4): the
-    // aggregator's payout id has to resolve before `RegisterAggregator` will, so its record is
-    // registered first, through the same wallet's bundle.
-    let payout_record = {
-        let kp = randprotocol_core::receiver::receiver_signing_keypair(&[7; 32]);
-        randprotocol_core::receiver::ReceiverRecord::sign(&kp, CHAIN_ID, 1, [7; 8], vec![8; randprotocol_core::notes::KEM_EK_BYTES])
-    };
-    let payout = payout_record.id();
-    let mut store = NoteStore::default();
-    {
-        let slot = proving_slot().await;
-        wallet::submit(
-            &n0.rpc,
-            &a,
-            &mut store,
-            None,
-            Action::RegisterReceiver { record: payout_record },
-            gas::BUNDLE_BASE,
-            wallet::Burn::None,
-            FriProfile::Test,
-            Backend::Cpu,
-            CHAIN_ID,
-            true,
-        )
-        .await
-        .expect("the receiver record is accepted and commits");
-        drop(slot);
-    }
-
     // The registration, a wallet submission with a bond-burning bundle (excess 7 over the
     // floor, so the aggregate's payment is the subsidy plus a proving share).
+    let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
     let registration = randprotocol_core::types::actions::AggregatorRegistration {
         public_key: aggregator.public_key().clone(),
-        payout,
+        payout: payout.clone(),
         signature: aggregator.sign(
             randprotocol_core::types::actions::aggregator_register_message(CHAIN_ID, &payout).as_bytes(),
         ),
     };
+    let mut store = NoteStore::default();
     let register = {
         let slot = proving_slot().await;
         let sent = wallet::submit(

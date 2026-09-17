@@ -22,8 +22,7 @@ use super::{bridge_notes, Ledger, TxError};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, PublicKey, Signature};
 use crate::gas;
-use crate::notes::Word8;
-use crate::receiver::ReceiverId;
+use crate::notes::{ShieldedAddress, Word8, KEM_EK_BYTES};
 use crate::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
 use crate::types::{Action, Transaction, ValidatorSet, UNITS_PER_RAND};
 use serde::{Deserialize, Serialize};
@@ -55,9 +54,8 @@ pub struct ValidatorEntry {
     /// Fees credited to this validator as a block proposer (spec §8): a bundle's fee, and the
     /// base a `Withdraw` pays out of the amount it withdraws. Paid out by `Withdraw`.
     pub rewards: u64,
-    /// Where `Withdraw` pays: the receiver id the deposit note's key resolves through the
-    /// registry (spec §6).
-    pub payout: ReceiverId,
+    /// Where `Withdraw` pays: the shielded address the deposit note is created for.
+    pub payout: ShieldedAddress,
     /// Incremented on every accepted `Unbond` and `Withdraw`. There are no accounts on this
     /// chain, so this is the whole of the replay protection for validator-signed actions.
     pub nonce: u64,
@@ -77,8 +75,6 @@ pub enum StakingError {
     RegistrationRequired,
     #[error("the registration is for another validator")]
     BadRegistration,
-    #[error("receiver {0} is not in the registry")]
-    UnknownReceiver(ReceiverId),
     #[error("wrong nonce: expected {expected}, got {actual}")]
     BadNonce { expected: u64, actual: u64 },
     #[error("bad validator signature")]
@@ -195,11 +191,7 @@ impl Ledger {
                 }
                 let (id, amount) = bridge_notes::attested_transfer(attestation)?;
                 let index = self.bridge()?.deposit_index(&id)?;
-                // An unregistered receiver claims nothing either: `validate` refuses it
-                // (`BridgeError::UnknownReceiver`), so a caller screening the pool must not be
-                // able to claim a note for a recipient the chain would never deposit to.
-                let pk = self.resolve_pk(recipient)?;
-                Some(bridge_notes::deposit_commitment(&pk, amount, index, *time, r, executor))
+                Some(bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor))
             }
             _ => None,
         }
@@ -335,11 +327,11 @@ fn check_bond(
             if r.public_key.address() != *validator {
                 return Err(StakingError::BadRegistration);
             }
-            // A payout naming no record is not an address: the withdraw note this register
-            // entry exists to pay would have no key to resolve. Replaces the old fixed-width
-            // `kem_ek` check — the registry, not the register, now owns that shape.
-            if ledger.resolve_record(&r.payout).is_none() {
-                return Err(StakingError::UnknownReceiver(r.payout));
+            // A payout nobody can seal a note to is not an address: the withdraw note this
+            // register entry exists to pay would be unopenable. It also keeps every entry's
+            // `payout` a fixed width, which is what makes the v2 validator leaf unambiguous.
+            if r.payout.kem_ek.len() != KEM_EK_BYTES {
+                return Err(StakingError::BadRegistration);
             }
             if !r.public_key.verify(registration_message(chain_id, &r.payout).as_bytes(), &r.signature) {
                 return Err(StakingError::BadSignature);
@@ -495,10 +487,7 @@ fn withdraw_note(
         .validators()
         .get(validator)
         .ok_or(TxError::Staking(StakingError::UnknownValidator(*validator)))?;
-    let pk = ledger
-        .resolve_pk(&e.payout)
-        .ok_or(TxError::Staking(StakingError::UnknownReceiver(e.payout)))?;
-    Ok(executor.note_commitment(&pk, &[0; 8], note_amount(amount)?, 0, time, r))
+    Ok(executor.note_commitment(&e.payout.pk, &[0; 8], note_amount(amount)?, 0, time, r))
 }
 
 /// What a withdraw's note is worth: the amount, less the bundle base it pays the proposer.
@@ -540,8 +529,7 @@ mod tests {
     use crate::confidential::StubExecutor;
     use crate::crypto::{Address, Keypair, Signature};
     use crate::ledger::TIME_WINDOW;
-    use crate::notes::{Bundle, Envelope, Word8};
-    use crate::receiver::receiver_signing_keypair;
+    use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8};
     use crate::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
     use crate::types::Transaction;
     use std::collections::BTreeMap;
@@ -556,25 +544,15 @@ mod tests {
         Keypair::from_seed([i; 32]).unwrap()
     }
 
-    /// The receiver id `receiver_signing_keypair(&[i; 32])` resolves to — pure, so an entry can
-    /// name it before any ledger exists. [`ledger`] registers `1..=9` (every `payout(i)` used
-    /// below) with the matching [`payout_pk`], so withdraw/registration checks that resolve it
-    /// succeed on any ledger this fixture builds; a higher `i` (the stress tests in
-    /// `derive_set_filters_sorts_and_caps`) names a valid, distinct id that nothing resolves.
-    fn payout(i: u8) -> ReceiverId {
-        ReceiverId::from(receiver_signing_keypair(&[i; 32]).public_key())
-    }
-
-    /// The note key `payout(i)` resolves to once registered.
-    fn payout_pk(i: u8) -> Word8 {
-        [i as u32; 8]
+    fn payout(i: u8) -> ShieldedAddress {
+        ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; KEM_EK_BYTES] }
     }
 
     fn env() -> Envelope {
         Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] }
     }
 
-    fn entry(k: &Keypair, stake: u64, payout: ReceiverId) -> ValidatorEntry {
+    fn entry(k: &Keypair, stake: u64, payout: ShieldedAddress) -> ValidatorEntry {
         ValidatorEntry { public_key: k.public_key().clone(), stake, pending: Vec::new(), rewards: 0, payout, nonce: 0 }
     }
 
@@ -583,14 +561,9 @@ mod tests {
     }
 
     /// A ledger whose register holds `entries`, positioned at height 5 with four-block epochs
-    /// (so `epoch()` is 1 and a two-epoch unbonding release lands at 3) — and whose registry
-    /// already holds receivers `1..=9` (every `payout(i)` a test in this module names), so a
-    /// `Withdraw` or a `Bond`'s registration resolves without every test registering its own.
+    /// (so `epoch()` is 1 and a two-epoch unbonding release lands at 3).
     fn ledger(entries: Vec<ValidatorEntry>) -> Ledger {
         let mut l = Ledger::new(CHAIN, HC, register(entries), &StubExecutor);
-        for i in 1u8..=9 {
-            crate::ledger::test_fixtures::registered_receiver(&mut l, i, payout_pk(i));
-        }
         l.set_epoch_blocks(4);
         l.set_height(5);
         l
@@ -619,7 +592,7 @@ mod tests {
         Transaction::shielded(CHAIN, bundle(l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], burn), action)
     }
 
-    fn registration(k: &Keypair, payout: ReceiverId) -> Registration {
+    fn registration(k: &Keypair, payout: ShieldedAddress) -> Registration {
         let signature = k.sign(registration_message(CHAIN, &payout).as_bytes());
         Registration { public_key: k.public_key().clone(), payout, signature }
     }
@@ -646,7 +619,7 @@ mod tests {
 
     /// The note a withdraw of `amount` at `time` pays to validator `i`'s payout address.
     fn withdrawn_note(i: u8, amount: u64, time: u32, r: Word8) -> Word8 {
-        StubExecutor.note_commitment(&payout_pk(i), &[0; 8], amount - BASE, 0, time, &r)
+        StubExecutor.note_commitment(&payout(i).pk, &[0; 8], amount - BASE, 0, time, &r)
     }
 
     fn staking_err(e: TxError) -> StakingError {
@@ -718,13 +691,10 @@ mod tests {
         let wrong_key = bond_tx(&l, 30, &newcomer, MIN_STAKE, Some(registration(&key(3), payout(2))));
         assert_eq!(staking_err(l.validate(&wrong_key, &StubExecutor).unwrap_err()), StakingError::BadRegistration);
 
-        // A registration naming a receiver the registry has never heard of.
-        let unregistered = payout(200);
-        let stub = bond_tx(&l, 35, &newcomer, MIN_STAKE, Some(registration(&newcomer, unregistered)));
-        assert_eq!(
-            staking_err(l.validate(&stub, &StubExecutor).unwrap_err()),
-            StakingError::UnknownReceiver(unregistered)
-        );
+        // A registration whose payout could never be sealed to.
+        let short = ShieldedAddress { pk: [2; 8], kem_ek: vec![2; 32] };
+        let stub = bond_tx(&l, 35, &newcomer, MIN_STAKE, Some(registration(&newcomer, short)));
+        assert_eq!(staking_err(l.validate(&stub, &StubExecutor).unwrap_err()), StakingError::BadRegistration);
 
         // A registration whose signature is for another payout address.
         let mut forged = registration(&newcomer, payout(2));
@@ -753,38 +723,6 @@ mod tests {
         let e = &l.validators()[&newcomer.address()];
         assert_eq!((e.stake, e.nonce), (MIN_STAKE + 500, 0));
         assert_eq!(e.payout, payout(2), "a top-up cannot move the payout address");
-    }
-
-    /// The short-address migration (spec §6): a registration names a receiver id, and `check_bond`
-    /// refuses it — by that id — until the registry actually holds a record for it.
-    #[test]
-    fn a_registration_names_a_receiver_id_the_registry_must_hold() {
-        let genesis = key(1);
-        let newcomer = key(2);
-        let l = ledger(vec![entry(&genesis, MIN_STAKE, payout(1))]);
-        // A receiver id nothing has registered yet, however honestly the registration is signed.
-        let unregistered = payout(200);
-        let reg = registration(&newcomer, unregistered);
-        assert_eq!(
-            check_bond(&l, &newcomer.address(), MIN_STAKE, Some(&reg), CHAIN).unwrap_err(),
-            StakingError::UnknownReceiver(unregistered)
-        );
-        // `ledger()` already registers receivers `1..=9` (`payout(2)` among them), so the same
-        // registration against one of those succeeds.
-        let reg2 = registration(&newcomer, payout(2));
-        check_bond(&l, &newcomer.address(), MIN_STAKE, Some(&reg2), CHAIN).unwrap();
-    }
-
-    /// A withdraw's note key is not carried in the register at all any more: it is resolved from
-    /// the registry through the entry's payout id every time.
-    #[test]
-    fn a_withdraw_note_is_derived_from_the_registrys_pk() {
-        let v = key(1);
-        let mut e = entry(&v, MIN_STAKE, payout(4));
-        e.rewards = 10 * BASE;
-        let l = ledger(vec![e]);
-        let cm = withdraw_note(&l, &v.address(), 5 * BASE, 9, &[9; 8], &StubExecutor).unwrap();
-        assert_eq!(cm, StubExecutor.note_commitment(&payout_pk(4), &[0; 8], 5 * BASE - BASE, 0, 9, &[9; 8]));
     }
 
     /// Bond is the one action whose bundle may burn: value leaves the pool exactly as stake.

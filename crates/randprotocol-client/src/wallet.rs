@@ -17,10 +17,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use randprotocol_core::bridge::{AssetId, Attestation, Payload};
 use randprotocol_core::ledger::{bridge_notes, TIME_WINDOW};
-use randprotocol_core::notes::{word8_from_hex, word8_to_bytes, word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, DEPTH};
-use randprotocol_core::receiver::{receiver_signing_keypair, ReceiverId, ReceiverRecord};
-use randprotocol_core::{format_amount, gas, Action, Hash, Keypair, Transaction};
-use randprotocol_zkvm::address::{address_of_at, envelope_from_core, seal_note};
+use randprotocol_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, DEPTH};
+use randprotocol_core::{format_amount, gas, Action, Hash, Transaction};
+use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note};
 use randprotocol_zkvm::executor::prove_bundle;
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use randprotocol_zkvm::notes::{bundle_inputs, expected_bundle_outputs, Note, SpendKey, ViewingKey};
@@ -37,161 +36,57 @@ const PAGE: usize = 500;
 /// block it rides in is large; 180 s leaves room for a few views of consensus.
 pub const COMMIT_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// How far past this wallet's own `kem_version` a scan sweeps looking for a key that opens an
-/// envelope (final review of short-shielded-address, item 4). `register` can reconcile
-/// `kem_version` *downward* to whatever version the chain's record implies (a failed publish
-/// retried at the version that will actually be accepted) — but a sender may already have sealed
-/// to a higher version this wallet advertised before that reconciliation, and a KEM key derives
-/// for any version whether or not this wallet ever published it. Sweeping a margin past the
-/// published version is what lets that envelope still open; the margin is a guess at how far a
-/// sequence of unpublished rotations could plausibly run ahead, not a hard bound enforced anywhere
-/// else.
-const KEM_VERSION_SWEEP: u32 = 8;
-
 // ---------------------------------------------------------------- key file
 
-/// The on-disk key file, version 3: the spend key and the KEM key version, and nothing else.
-/// Every other key — the viewing key, the outgoing viewing key, the ML-KEM decapsulation keys,
-/// the receiver signing key, the address, the id — is a pure derivation of the spend key
-/// (`randprotocol_zkvm::notes`, `receiver::receiver_signing_keypair`), so storing them would only
-/// widen what a leaked file discloses without making anything recoverable that is not already.
-///
-/// Version 3 adds `kem_version` for the rotation of spec §7. A retired KEM key is *not* stored:
-/// it is `kem_seed_at(v)` of the same spend key, so keeping the highest version reached keeps
-/// every key below it (the user's ruling 1 — no retired key is ever discarded — in the form a
-/// derived key chain can take it). A version 2 file is read as it always was, with
-/// `kem_version = 0`: it was written by a wallet that could not rotate, so 0 is the whole truth
-/// about it.
+/// The on-disk key file, version 2: the spend key and nothing else. Every other key — the
+/// viewing key, the outgoing viewing key, the ML-KEM decapsulation key, the address — is a
+/// pure derivation of it (`randprotocol_zkvm::notes`), so storing them would only widen what a
+/// leaked file discloses without making anything recoverable that is not already.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyFile {
     pub version: u32,
     /// The spend key's eight words as 64 hex characters (`word8_to_hex`).
     pub spend_key: String,
-    /// The highest ML-KEM key version this wallet has rotated to; 0 for a wallet that never has.
-    #[serde(default)]
-    pub kem_version: u32,
 }
 
-pub const KEY_FILE_VERSION: u32 = 3;
+pub const KEY_FILE_VERSION: u32 = 2;
 
-/// A spend key and everything derived from it — one wallet, one identity (spec §1).
+/// A spend key and everything derived from it.
 pub struct Wallet {
     pub sk: SpendKey,
     pub vk: ViewingKey,
-    /// The Dilithium2 keypair whose address is [`Wallet::id`] and which signs this wallet's
-    /// receiver records. Derived from the spend key, so there is nothing extra to back up.
-    pub signing: Keypair,
-    /// The short shielded address: `rand1…`, 53–55 characters, the same 32 bytes as this wallet's
-    /// transparent address.
-    pub id: ReceiverId,
-    /// Which ML-KEM key version this wallet currently publishes. Envelopes sealed to any earlier
-    /// version still open ([`Wallet::open_received`]).
-    pub kem_version: u32,
+    pub address: ShieldedAddress,
 }
 
 impl Wallet {
     pub fn from_spend_key(sk: SpendKey) -> Wallet {
-        Wallet::from_spend_key_at(sk, 0)
-    }
-
-    /// The same, at a KEM key version a key file recorded.
-    pub fn from_spend_key_at(sk: SpendKey, kem_version: u32) -> Wallet {
         let vk = sk.viewing_key();
-        let signing = receiver_signing_keypair(&word8_to_bytes(&sk.0));
-        let id = ReceiverId::from(signing.public_key());
-        Wallet { sk, vk, signing, id, kem_version }
+        Wallet { sk, vk, address: address_of(&vk) }
     }
 
     pub fn generate() -> Wallet {
         Wallet::from_spend_key(SpendKey::random())
     }
 
-    /// The `pk`/`kem_ek` pair a sender seals to today: this wallet's address at its current KEM
-    /// key version. Not a stored field — a rotation must never leave a stale copy behind.
-    pub fn current_address(&self) -> ShieldedAddress {
-        address_of_at(&self.vk, self.kem_version)
-    }
-
-    /// The signed record this wallet's id resolves to (spec §3), at its current KEM version.
-    ///
-    /// Record versions start at 1 (the ledger requires it of a first registration) and KEM key
-    /// versions start at 0, so the record's version is always `kem_version + 1`: record version 1
-    /// is KEM version 0.
-    pub fn record(&self, chain_id: u64) -> ReceiverRecord {
-        self.record_at(chain_id, self.kem_version)
-    }
-
-    /// The record for one KEM key version — what this wallet published before a rotation, which
-    /// it can still reproduce because no key is ever thrown away.
-    pub fn record_at(&self, chain_id: u64, kem_version: u32) -> ReceiverRecord {
-        let address = address_of_at(&self.vk, kem_version);
-        ReceiverRecord::sign(&self.signing, chain_id, kem_version + 1, self.vk.pk(), address.kem_ek)
-    }
-
-    /// Rotate to a fresh ML-KEM key (spec §7): a plain `kem_version + 1`, returning the new
-    /// version. Not what `rand register --rotate` calls any more — it sets `kem_version`
-    /// directly, to whichever version the chain's own record implies, since a retry after a
-    /// failed publish must target that version rather than one past what this wallet last saved.
-    /// This stays for callers (and tests) that just want the next version; either way, until the
-    /// new record is published, senders holding the old one seal to the old key — which still
-    /// opens.
-    pub fn rotate(&mut self) -> u32 {
-        self.kem_version += 1;
-        self.kem_version
-    }
-
-    /// Open an envelope sealed to any address this wallet has ever published, newest version
-    /// first. `None` when no key of this wallet opens it — which is what most leaves are.
-    pub fn open_received(&self, envelope: &Envelope, cm: Word8) -> Option<Note> {
-        let env = envelope_from_core(envelope);
-        (0..=self.kem_version + KEM_VERSION_SWEEP)
-            .rev()
-            .find_map(|v| env.open_as_receiver_at(cm, &self.vk, v).map(|(_, note)| note))
-    }
-
-    /// The same sweep for a call transcript this wallet was named the auditor of: the caller
-    /// sealed to whichever address it had been handed, so every version is tried.
-    pub fn open_call_as_auditor(
-        &self,
-        envelope: &randprotocol_core::types::CallEnvelope,
-        h_in: &Word8,
-    ) -> Option<(randprotocol_zkvm::call_envelope::CallKey, [u32; 4], Vec<u32>)> {
-        (0..=self.kem_version + KEM_VERSION_SWEEP)
-            .rev()
-            .find_map(|v| randprotocol_zkvm::call_envelope::open_call_as_auditor_at(envelope, h_in, &self.vk, v))
-    }
-
-    fn key_file(&self) -> Result<String> {
-        let kf = KeyFile {
-            version: KEY_FILE_VERSION,
-            spend_key: word8_to_hex(&self.sk.0),
-            kem_version: self.kem_version,
-        };
-        Ok(serde_json::to_string_pretty(&kf)? + "\n")
-    }
-
     pub fn load(path: &Path) -> Result<Wallet> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading key file {}", path.display()))?;
         let kf: KeyFile = serde_json::from_str(&text).with_context(|| format!("{} is not a wallet key file", path.display()))?;
-        // A version 2 file is a version 3 file that never rotated: same spend key, same
-        // derivations, `kem_version` absent and therefore 0. Reading it is not a migration — the
-        // file is only rewritten when the wallet rotates.
-        if kf.version != KEY_FILE_VERSION && kf.version != 2 {
+        if kf.version != KEY_FILE_VERSION {
             return Err(anyhow!(
-                "{} is a version {} key file; this wallet reads version {KEY_FILE_VERSION} (and version 2)",
+                "{} is a version {} key file; this wallet reads version {KEY_FILE_VERSION}",
                 path.display(),
                 kf.version
             ));
         }
         let words = word8_from_hex(&kf.spend_key).context("spend_key must be 64 hex characters")?;
-        let kem_version = if kf.version == 2 { 0 } else { kf.kem_version };
-        Ok(Wallet::from_spend_key_at(SpendKey(words), kem_version))
+        Ok(Wallet::from_spend_key(SpendKey(words)))
     }
 
     /// Write the key file, refusing to touch an existing path. There is no second copy of a
     /// spend key: overwriting one destroys every note it could still open.
     pub fn save_new(&self, path: &Path) -> Result<()> {
-        let text = self.key_file()?;
+        let kf = KeyFile { version: KEY_FILE_VERSION, spend_key: word8_to_hex(&self.sk.0) };
+        let text = serde_json::to_string_pretty(&kf)? + "\n";
         // `create_new` closes the exists-then-write race and `mode(0o600)` makes the file
         // owner-only from the start: writing first and chmodding afterwards leaves the spend
         // key world-readable for a window.
@@ -215,31 +110,6 @@ impl Wallet {
             }
             std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
         }
-    }
-
-    /// Write the key file over an existing one — what a rotation does, and the only thing that
-    /// does. The spend key on disk must be this wallet's: rewriting a *different* key's file is
-    /// the one mistake that destroys notes, so it is refused rather than merged, and a path with
-    /// no file yet falls through to [`Wallet::save_new`].
-    ///
-    /// **Never in place.** Truncating this file and then writing it leaves a window in which the
-    /// only copy of the spend key is a zero-length file, and a crash in that window is every note
-    /// this wallet will ever own. So the new contents go to a sibling temp file that is flushed
-    /// to disk and then renamed over the original: at every instant the path holds a whole key
-    /// file, either the new one or the old one, and the old one is not a loss — it differs only
-    /// in a KEM version, and every version below the current one opens anyway.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if !path.exists() {
-            return self.save_new(path);
-        }
-        let existing = Wallet::load(path)?;
-        if existing.sk != self.sk {
-            return Err(anyhow!(
-                "{} holds another wallet's spend key; refusing to overwrite it",
-                path.display()
-            ));
-        }
-        write_private_atomic(path, self.key_file()?.as_bytes())
     }
 }
 
@@ -398,54 +268,6 @@ impl NoteStore {
     }
 }
 
-/// Replace `path` with `bytes` atomically and owner-only: write a sibling `<path>.tmp` (created
-/// 0600, so the contents are never world-readable even for an instant), flush it to the disk,
-/// then rename it over the original.
-///
-/// The rename is the point. A reader — or a crash — sees the old file or the new one and never a
-/// half-written one, which for a key file is the difference between a rotation and a wallet that
-/// can no longer open anything. `sync_all` before the rename is what makes that true across a
-/// power loss rather than only across a process death: without it the rename can reach the disk
-/// before the bytes it points at.
-///
-/// A leftover temp file from an earlier crash is removed first, since `create_new` would
-/// otherwise refuse — and a stale temp must never be mistaken for the real file, which is why it
-/// is never the thing left behind at `path`.
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = {
-        let mut s = path.as_os_str().to_os_string();
-        s.push(".tmp");
-        PathBuf::from(s)
-    };
-    let _ = std::fs::remove_file(&tmp);
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-        f.write_all(bytes)?;
-        f.sync_all().with_context(|| format!("flushing {}", tmp.display()))?;
-        drop(f);
-        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
-        // The rename carries the temp file's mode, so this is belt and braces — and it is the
-        // line that makes a key file left at 0644 by some earlier hand come back owner-only.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("restricting {} to its owner", path.display()))?;
-        return Ok(());
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
-        Ok(())
-    }
-}
-
 /// Create (or replace) `path` with mode 0600 from the start: writing first and chmodding
 /// afterwards leaves the contents world-readable for a window.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -497,10 +319,7 @@ pub enum Found {
 pub fn classify(w: &Wallet, cm: Word8, envelope: &Envelope) -> Found {
     let env = envelope_from_core(envelope);
     let mut why = "no key of this wallet opens it";
-    // Every KEM key version this wallet has ever published, newest first: a sender holding an
-    // older record seals to an older key, and a rotation that stopped opening those notes would
-    // be a rotation that burned them (spec §7).
-    if let Some(note) = w.open_received(envelope, cm) {
+    if let Some((_, note)) = env.open_as_receiver(cm, &w.vk) {
         if note.pk == w.vk.pk() {
             return Found::Received(note);
         }
@@ -528,19 +347,16 @@ pub fn classify(w: &Wallet, cm: Word8, envelope: &Envelope) -> Found {
 /// (which deposits nothing, so the node renders no index and no commitment), and for a rendering
 /// whose `commitment` is not the note these fields build — the chain computes that commitment, so
 /// it is the authority on which leaf it appended.
-///
-/// Short-shielded-address: `action["recipient"]` is a receiver id, which resolving would cost a
-/// registry lookup per rendered transaction — and would answer a weaker question anyway. So this
-/// does not read `recipient` at all: it builds the candidate note straight from `w`'s own note
-/// key and checks the result against the commitment the chain published, which is strictly
-/// stronger than comparing a claimed recipient ever was. A match means `w`'s key really does
-/// produce the leaf the chain appended, not merely that the wire claims it does.
 pub fn rebuilt_deposit(w: &Wallet, action: &Value) -> Option<Note> {
     if action["kind"].as_str()? != "bridge_attest" {
         return None;
     }
+    let recipient = ShieldedAddress::parse(action["recipient"].as_str()?).ok()?;
+    if recipient.pk != w.vk.pk() {
+        return None;
+    }
     let note = Note {
-        pk: w.vk.pk(),
+        pk: recipient.pk,
         // A deposit has no sender inside the pool, so the note records the zero word — the same
         // constant `bridge_notes::DEPOSIT_FROM` is.
         from: [0; 8],
@@ -916,7 +732,7 @@ struct Plan {
 impl Plan {
     /// Select the notes of one asset that cover what this bundle pays out. A bundle that pays
     /// nobody inside the pool (a deploy, a call, a burn) sends zero to this wallet's own address,
-    /// which is what `dest = &w.current_address(), amount = 0` means.
+    /// which is what `dest = &w.address, amount = 0` means.
     ///
     /// Only ever one asset's notes: RAND cannot pay a burn of a bridged asset, nor the reverse,
     /// and a bundle balances one asset (`NoteStore::spendable_of`).
@@ -1063,7 +879,7 @@ fn prove_one(
     // open under a single-transaction disclosure (see `viewing::TxKey`).
     let envelopes = [
         seal_note(&w.vk, &plan.dest, &out1, &TxKey::random()).map_err(|e| anyhow!("sealing the payment envelope: {e}"))?,
-        seal_note(&w.vk, &w.current_address(), &out2, &TxKey::random()).map_err(|e| anyhow!("sealing the change envelope: {e}"))?,
+        seal_note(&w.vk, &w.address, &out2, &TxKey::random()).map_err(|e| anyhow!("sealing the change envelope: {e}"))?,
     ];
     let bundle = Bundle {
         anchor: root,
@@ -1146,8 +962,7 @@ pub async fn submit(
         }
     };
     scan(rpc, w, store).await?;
-    let own = w.current_address();
-    let (dest, amount) = to.unwrap_or((&own, 0));
+    let (dest, amount) = to.unwrap_or((&w.address, 0));
     let plans = [Plan::select(store, 0, dest, amount, fee, burn.units())?];
     let (proved, time) = prove_bundles(rpc, w, &plans, profile, backend).await?;
     let [one] = <[Proved; 1]>::try_from(proved).ok().expect("one plan, one proof");
@@ -1248,9 +1063,9 @@ pub async fn submit_burn(
     // The asset bundle first, so its notes and the fee bundle's are selected from the same store
     // read; they can never collide, since they hold different assets.
     let plans = [
-        Plan::select(store, asset, &w.current_address(), 0, 0, amount)
+        Plan::select(store, asset, &w.address, 0, 0, amount)
             .with_context(|| format!("selecting notes of asset {asset} to burn"))?,
-        Plan::select(store, 0, &w.current_address(), 0, fee, 0).context("selecting RAND notes for the fee bundle")?,
+        Plan::select(store, 0, &w.address, 0, fee, 0).context("selecting RAND notes for the fee bundle")?,
     ];
     let (proved, time) = prove_bundles(rpc, w, &plans, profile, backend).await?;
     let [asset_proof, fee_proof] = <[Proved; 2]>::try_from(proved).ok().expect("two plans, two proofs");
@@ -1304,9 +1119,9 @@ pub fn burn_fee_default() -> u64 {
 /// wire bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttestedDeposit {
-    /// The recipient's 32-byte receiver id (`ReceiverId`) that the source-chain depositor named
-    /// and the guardians signed. The ledger refuses a transaction whose `recipient` is not this
-    /// same id (short-shielded-address task 5).
+    /// The 32-byte stand-in for the recipient's shielded address that the source-chain depositor
+    /// named and the guardians signed — `ShieldedAddress::recipient_hash`. The ledger refuses a
+    /// transaction whose `recipient` does not hash to it.
     pub to_hash: [u8; 32],
     /// The token as the guardians named it, which is what `rand_bridgeAssetId` turns into an
     /// [`AttestedDeposit::asset`] — the registry's key, and from there the note's `asset` index.
@@ -1532,93 +1347,25 @@ mod tests {
     }
 
     #[test]
-    fn key_file_v3_roundtrips_and_refuses_overwrite() {
+    fn key_file_v2_roundtrips_and_refuses_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("w.key.json");
         let w = Wallet::generate();
         w.save_new(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["version"], 3);
-        assert_eq!(v["kem_version"], 0);
+        assert_eq!(v["version"], 2);
         assert_eq!(v["spend_key"].as_str().unwrap().len(), 64);
         let back = Wallet::load(&path).unwrap();
         assert_eq!(back.sk, w.sk);
         // Overwriting a key file destroys the only copy of the spend authority.
         let err = Wallet::generate().save_new(&path).unwrap_err().to_string();
         assert!(err.contains("refusing to overwrite"), "{err}");
-        // And `save`, which a rotation does use, refuses another wallet's file for the same
-        // reason: the one write that can destroy notes is the one that changes the spend key.
-        let err = Wallet::generate().save(&path).unwrap_err().to_string();
-        assert!(err.contains("another wallet's spend key"), "{err}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
-    }
-
-    /// The rewrite a rotation does never leaves a half-written key file behind. It goes to a
-    /// sibling temp file and is renamed over the original, so a crash at any moment leaves either
-    /// the new file or the old one — and the old one still opens every note, where a truncated
-    /// one would open none of them, ever. The result is owner-only whatever the old file's mode
-    /// was.
-    #[test]
-    fn saving_a_rotated_key_file_is_atomic_and_stays_owner_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("w.key.json");
-        let tmp = {
-            let mut s = path.clone().into_os_string();
-            s.push(".tmp");
-            PathBuf::from(s)
-        };
-        let mut w = Wallet::generate();
-        w.save_new(&path).unwrap();
-        // A file someone left world-readable does not stay that way through a rotation.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        w.rotate();
-        w.save(&path).unwrap();
-        let back = Wallet::load(&path).unwrap();
-        assert_eq!(back.sk, w.sk);
-        assert_eq!(back.kem_version, 1);
-        assert!(!tmp.exists(), "the temp file is renamed over the original, not left beside it");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        }
-        // A temp file left by an earlier crash does not block the next rotation.
-        std::fs::write(&tmp, "leftover").unwrap();
-        w.rotate();
-        w.save(&path).unwrap();
-        assert_eq!(Wallet::load(&path).unwrap().kem_version, 2);
-        assert!(!tmp.exists());
-        // And the refusal that guards the whole path is still the first thing it does.
-        let err = Wallet::generate().save(&path).unwrap_err().to_string();
-        assert!(err.contains("another wallet's spend key"), "{err}");
-        assert_eq!(Wallet::load(&path).unwrap().sk, w.sk, "the refused write touched nothing");
-    }
-
-    /// A version 2 file — written before rotation existed — loads as a wallet at KEM version 0,
-    /// which is the whole truth about it: it could never have published another.
-    #[test]
-    fn a_version_2_key_file_still_loads() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("old.key.json");
-        let w = Wallet::from_spend_key(SpendKey([31; 8]));
-        std::fs::write(&path, format!("{{\"version\":2,\"spend_key\":\"{}\"}}\n", word8_to_hex(&w.sk.0))).unwrap();
-        let back = Wallet::load(&path).unwrap();
-        assert_eq!(back.sk, w.sk);
-        assert_eq!(back.kem_version, 0);
-        assert_eq!(back.current_address(), w.current_address());
-        // A version this wallet does not know is refused rather than guessed at.
-        std::fs::write(&path, format!("{{\"version\":9,\"spend_key\":\"{}\"}}\n", word8_to_hex(&w.sk.0))).unwrap();
-        let refused = Wallet::load(&path).map(|_| ()).unwrap_err().to_string();
-        assert!(refused.contains("version 9 key file"), "{refused}");
     }
 
     #[test]
@@ -1631,12 +1378,10 @@ mod tests {
         Wallet::generate().save_new(&b).unwrap();
         let one = Wallet::load(&a).unwrap();
         let two = Wallet::load(&a).unwrap();
-        assert_eq!(one.current_address(), two.current_address());
-        assert_eq!(one.current_address(), w.current_address());
-        assert_eq!(one.current_address().pk, one.vk.pk());
-        assert_eq!(one.id, w.id, "and the same short address");
-        assert_ne!(Wallet::load(&b).unwrap().current_address(), one.current_address());
-        assert_ne!(Wallet::load(&b).unwrap().id, one.id);
+        assert_eq!(one.address, two.address);
+        assert_eq!(one.address, w.address);
+        assert_eq!(one.address.pk, one.vk.pk());
+        assert_ne!(Wallet::load(&b).unwrap().address, one.address);
     }
 
     #[test]
@@ -1794,77 +1539,7 @@ mod tests {
     /// Seal `note` to `to`, as whichever party `from` is — the wire an attacker has too, since
     /// a shielded address publishes the encapsulation key envelopes are sealed to.
     fn sealed(from: &Wallet, to: &Wallet, note: &Note) -> randprotocol_core::notes::Envelope {
-        sealed_to(from, &to.current_address(), note)
-    }
-
-    /// The same, to one address rather than to whatever address a wallet currently publishes:
-    /// what a sender who was handed an older record does.
-    fn sealed_to(from: &Wallet, to: &ShieldedAddress, note: &Note) -> randprotocol_core::notes::Envelope {
-        randprotocol_zkvm::address::seal_note(&from.vk, to, note, &TxKey::random()).unwrap()
-    }
-
-    /// One wallet, one identity (spec §1): the receiver id is the address of a signing key
-    /// derived from the spend key, and the record the wallet signs is about its own note key and
-    /// its own current encapsulation key.
-    #[test]
-    fn the_wallet_has_one_identity_and_signs_its_own_record() {
-        let w = Wallet::from_spend_key(SpendKey([11; 8]));
-        assert_eq!(w.id, ReceiverId::from(w.signing.public_key()));
-        // Short, and a fixed *range* rather than a fixed length: base58 of 36 bytes is 53–55
-        // characters (spec §2), and this key's happens to be 55. The point of the assertion is
-        // that an address is a line of text now, not the 1,667-character form it replaced.
-        let text = w.id.to_string();
-        assert!((53..=55).contains(&text.len()), "{text} is {} characters", text.len());
-        assert!(text.starts_with("rand1"));
-        let rec = w.record(10);
-        rec.verify(&w.id, 10).unwrap();
-        assert_eq!(rec.pk, w.vk.pk());
-        assert_eq!(rec.kem_ek, w.current_address().kem_ek);
-    }
-
-    /// The sweep margin (final review item 4): `register` can move `kem_version` *downward* to
-    /// match the chain's own record — a failed rotation retried at the version the chain will
-    /// accept — but a sender who saw this wallet's address before that reconciliation may already
-    /// have sealed to a version above the reconciled one. `open_received` has to keep opening
-    /// that envelope even though `kem_version` no longer reaches it by itself.
-    #[test]
-    fn open_received_opens_an_envelope_sealed_ahead_of_kem_version() {
-        let sender = Wallet::generate();
-        let me = Wallet::from_spend_key(SpendKey([13; 8]));
-        assert_eq!(me.kem_version, 0);
-        let ahead = me.kem_version + 3;
-        assert!(ahead <= me.kem_version + KEM_VERSION_SWEEP, "3 must be inside the sweep margin");
-        let to = randprotocol_zkvm::address::address_of_at(&me.vk, ahead);
-        let note = Note::new(me.vk.pk(), [0; 8], 7, 0, 1);
-        let env = sealed_to(&sender, &to, &note);
-        assert_eq!(
-            me.open_received(&env, note.commitment()),
-            Some(note),
-            "an envelope sealed {ahead} versions ahead of kem_version must still open within the sweep margin"
-        );
-    }
-
-    /// Rotation (spec §7, ruling 1): the KEM version moves, the key file keeps it, and no
-    /// retired key is ever discarded — every envelope sealed to an earlier address still opens.
-    #[test]
-    fn a_rotation_bumps_the_version_and_every_earlier_envelope_still_opens() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("w.json");
-        let mut me = Wallet::generate();
-        me.save_new(&path).unwrap();
-        let sender = Wallet::generate();
-        let note0 = Note::new(me.vk.pk(), [0; 8], 5, 0, 1);
-        let env0 = sealed_to(&sender, &me.current_address(), &note0);
-        assert_eq!(me.rotate(), 1);
-        me.save(&path).unwrap();
-        let note1 = Note::new(me.vk.pk(), [0; 8], 6, 0, 1);
-        let env1 = sealed_to(&sender, &me.current_address(), &note1);
-        assert_eq!(me.rotate(), 2);
-        let reloaded = Wallet::load(&path).unwrap();
-        assert_eq!(reloaded.kem_version, 1, "the file keeps the version");
-        assert_eq!(me.open_received(&env0, note0.commitment()).unwrap(), note0);
-        assert_eq!(me.open_received(&env1, note1.commitment()).unwrap(), note1);
-        assert_ne!(me.record(10).kem_ek, me.record_at(10, 0).kem_ek);
+        randprotocol_zkvm::address::seal_note(&from.vk, &to.address, note, &TxKey::random()).unwrap()
     }
 
     #[test]
@@ -1935,16 +1610,16 @@ mod tests {
     /// wallet seals an envelope for is the note the chain will append.
     #[test]
     fn an_attestation_names_its_recipient_its_asset_and_its_amount() {
-        let id = randprotocol_core::receiver::ReceiverId([21; 32]);
-        let d = attested_deposit(&transfer_attestation(1_000, id.0)).unwrap();
-        assert_eq!(d.to_hash, id.0, "the 32-byte receiver id the guardians signed");
+        let me = Wallet::from_spend_key(SpendKey([21; 8]));
+        let d = attested_deposit(&transfer_attestation(1_000, me.address.recipient_hash())).unwrap();
+        assert_eq!(d.to_hash, me.address.recipient_hash(), "the 32-byte stand-in for the address");
         assert_eq!(d.amount, 1_000, "the gross amount, relayer fee and all");
         assert_eq!((d.token_chain, d.token), (TOKEN_CHAIN, TOKEN), "the token the guardians named");
         assert_eq!(d.asset, randprotocol_core::bridge::asset_id(TOKEN_CHAIN, &TOKEN), "the registry's key for the token");
-        // The id the guardians named is one id: another wallet's receiver id is different bytes,
+        // The address the guardians named is one address: another wallet's does not hash to it,
         // which is what the ledger refuses with `BridgeRecipientMismatch`.
-        let other = randprotocol_core::receiver::ReceiverId([22; 32]);
-        assert_ne!(d.to_hash, other.0);
+        let other = Wallet::from_spend_key(SpendKey([22; 8]));
+        assert_ne!(d.to_hash, other.address.recipient_hash());
         // Bytes that are not an attestation, and one that deposits nothing, are refused by name.
         assert!(attested_deposit(&[0xff; 32]).unwrap_err().to_string().contains("not a bridge attestation"));
         assert!(attested_deposit(&rotation_attestation()).unwrap_err().to_string().contains("rotation"));
@@ -2013,20 +1688,20 @@ mod tests {
     fn a_bridge_deposit_note_is_the_one_the_ledger_will_append() {
         use randprotocol_core::confidential::ConfidentialExecutor;
         let me = Wallet::from_spend_key(SpendKey([23; 8]));
-        let (note, envelope) = deposit_note_for(&me, &me.current_address(), 1_000, 3, 41).unwrap();
+        let (note, envelope) = deposit_note_for(&me, &me.address, 1_000, 3, 41).unwrap();
         // `ConfidentialExecutor::note_commitment` is the function `bridge_notes` computes the
         // deposit's commitment through, on the ledger's side of the same wire — over the action's
         // own `r`, which is this note's.
         let ex = randprotocol_zkvm::executor::ZkExecutor::new(FriProfile::Test);
-        assert_eq!(note.commitment(), ex.note_commitment(&me.current_address().pk, &[0; 8], 1_000, 3, 41, &note.r));
+        assert_eq!(note.commitment(), ex.note_commitment(&me.address.pk, &[0; 8], 1_000, 3, 41, &note.r));
         assert_eq!((note.amount, note.asset, note.time, note.from), (1_000, 3, 41, [0; 8]));
         // And the envelope published with it opens back to that note, as the recipient.
         assert_eq!(classify(&me, note.commitment(), &envelope), Found::Received(note));
         // A different `time` is a different note: this is why `time` is on the action. (So is a
         // different blinding, which is why every deposit draws a fresh one.)
-        let (later, _) = deposit_note_for(&me, &me.current_address(), 1_000, 3, 42).unwrap();
+        let (later, _) = deposit_note_for(&me, &me.address, 1_000, 3, 42).unwrap();
         assert_ne!(later.commitment(), note.commitment());
-        assert_ne!(deposit_note_for(&me, &me.current_address(), 1_000, 3, 41).unwrap().0.r, note.r);
+        assert_ne!(deposit_note_for(&me, &me.address, 1_000, 3, 41).unwrap().0.r, note.r);
     }
 
     /// A deposit whose published envelope is garbage — a hostile relayer's, or a broken one — is
@@ -2041,15 +1716,12 @@ mod tests {
         // The note the chain computes for 1000 units of asset 3, deposited at time 12: `from` is
         // the zero word, because a deposit has no sender inside the pool.
         let note = Note { pk: me.vk.pk(), from: [0; 8], amount: 1_000, asset: 3, time: 12, r: [9; 8] };
-        // What `tx_json` renders for that committed attest. `recipient` is a receiver id now
-        // (short-shielded-address task 5) and `rebuilt_deposit` no longer reads it — the only
-        // thing that decides ownership is whether `w`'s own key reproduces `cm` — so it is a
-        // fixed, arbitrary id here rather than one derived from either wallet.
-        let rendered = |cm: Word8| {
+        // What `tx_json` renders for that committed attest.
+        let rendered = |to: &ShieldedAddress, cm: Word8| {
             serde_json::json!({
                 "kind": "bridge_attest",
                 "attestation_len": 520,
-                "recipient": randprotocol_core::receiver::ReceiverId([9; 32]).to_string(),
+                "recipient": to.to_string(),
                 "asset": 3,
                 "asset_index": 3,
                 "amount": 1_000,
@@ -2063,19 +1735,17 @@ mod tests {
         // griefing ever was, and it stops mattering here.
         let garbage = Envelope { kem_ct: vec![0xff; 8], to_receiver: vec![0xff; 16], to_sender: vec![], body: vec![0xff; 16] };
         assert!(matches!(classify(&me, note.commitment(), &garbage), Found::Skipped(_)));
-        assert_eq!(rebuilt_deposit(&me, &rendered(note.commitment())), Some(note));
+        assert_eq!(rebuilt_deposit(&me, &rendered(&me.address, note.commitment())), Some(note));
 
-        // A deposit whose commitment is really someone else's note is not rebuilt as this
-        // wallet's: `me`'s key does not reproduce it.
-        let stranger_note = Note { pk: stranger.vk.pk(), from: [0; 8], amount: 1_000, asset: 3, time: 12, r: [9; 8] };
-        assert_eq!(rebuilt_deposit(&me, &rendered(stranger_note.commitment())), None);
+        // A deposit to someone else is not rebuilt, whoever renders it.
+        assert_eq!(rebuilt_deposit(&me, &rendered(&stranger.address, note.commitment())), None);
         // Nor is a note that does not hash to the commitment the chain published: the chain
         // computes that commitment, so it is the authority on which leaf it appended.
-        assert_eq!(rebuilt_deposit(&me, &rendered([1; 8])), None);
+        assert_eq!(rebuilt_deposit(&me, &rendered(&me.address, [1; 8])), None);
         // A rotation deposits nothing, so the node renders no index, no amount and no commitment.
         let rotation = serde_json::json!({
             "kind": "bridge_attest",
-            "recipient": randprotocol_core::receiver::ReceiverId([9; 32]).to_string(),
+            "recipient": me.address.to_string(),
             "asset": 0,
             "asset_index": serde_json::Value::Null,
             "amount": serde_json::Value::Null,

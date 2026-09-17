@@ -5,10 +5,8 @@ Two binaries are built by `cargo build --release`: `rand-node` (node and operato
 
 The two hold different kinds of key and must not be confused. A **node key** is a 32-byte seed and
 a Dilithium2 key pair whose base58 address is public and signs blocks. A **wallet key** is a
-256-bit shielded spend key whose `rand1…` receiver id receives notes; the only thing it ever signs
-on chain is its own receiver record (`rand register`, a Dilithium2 key derived from the spend key,
-spec docs §1) — it never signs a transfer, which authorises itself by its bundle's proof instead
-(`docs/shielded.md` §1–§2).
+256-bit shielded spend key whose `rand1…` address receives notes and which never signs anything
+on chain (`docs/shielded.md` §1).
 
 ## `rand-node`
 
@@ -52,10 +50,9 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | argument | default | meaning |
 |---|---|---|
 | `--chain-id <CHAIN_ID>` | `1` | chain id; transactions and gossip topics are bound to it |
-| `--receiver <RECORD.JSON>` | none, repeatable | a signed receiver record — the file `rand address --record` writes, bare or under a top-level `"record"` key — registered into the genesis receiver registry before any `--validator` or `--alloc` below is parsed |
-| `--validator <KEY,STAKE,PAYOUT>` | required, repeatable | one register entry: key file path **or** hex public key, the stake in RAND (at least 1000, the staking minimum), and the `rand1…` receiver id its rewards and unbonded stake are paid to — must name one of the `--receiver` records above |
+| `--validator <KEY,STAKE,PAYOUT>` | required, repeatable | one register entry: key file path **or** hex public key, the stake in RAND (at least 1000, the staking minimum), and the `rand1…` address its rewards and unbonded stake are paid to |
 | `--epoch-blocks <N>` | `1000` | blocks per epoch: how often the validator set is re-derived from the register (spec §8). Part of the genesis hash |
-| `--alloc <ALLOCS>` | none, repeatable | a deposit note: `rand1<address>=<amount in RAND>`, where `<address>` is a receiver id one of the `--receiver` records resolves |
+| `--alloc <ALLOCS>` | none, repeatable | a deposit note: `rand1<address>=<amount in RAND>` |
 | `--out <OUT>` | `genesis.json` | output path |
 | `--faucet` | off | **testnet only**: enable `Mint` transactions (`rand_mint`, up to 100 RAND per call). Part of the genesis hash |
 | `--no-confidential` | off | disable Deploy/Call transactions on this chain. Part of the genesis hash |
@@ -88,10 +85,6 @@ Genesis JSON shape:
       "envelope": { "kem_ct": "<hex>", "to_receiver": "<hex>", "to_sender": "<hex>", "body": "<hex>" },
       "amount": 1000000000000 }
   ],
-  "receivers": [
-    { "version": 1, "pk": "<64 hex>", "kem_ek": "<2368 hex>",
-      "signing_key": "<2624 hex>", "signature": "<4840 hex>" }
-  ],
   "faucet": true,
   "confidential": true,
   "fri_profile": "production",
@@ -101,14 +94,11 @@ Genesis JSON shape:
 ```
 
 `bridge` is the one optional field this command never writes (add it by hand, as above); every
-other field it writes, `epoch_blocks` included. `receivers` is absent (an empty registry, not an
-error) on a genesis file with no `--receiver` at all.
+other field it writes, `epoch_blocks` included.
 
 Both `amount` and a validator's `stake` are in smallest units, and both are public: they are what
 let everyone add up the initial supply (`docs/supply.md`). Who owns a note is not — only the address
-the envelope was sealed to can open it. `receivers` is registered first, before any `validators`
-payout or `alloc` owner is resolved against it (spec docs §6): each is a receiver id, and an id
-with no matching record here is refused. A validator's `payout` is the receiver id its rewards
+the envelope was sealed to can open it. A validator's `payout` is the shielded address its rewards
 and unbonded stake are withdrawn to, and it is register state, so it is part of the genesis hash like
 `epoch_blocks`, `faucet`, `confidential`, `fri_profile` and `hc_bundle`. `hc_bundle` pins the one
 zkVM relation every bundle proof on this chain is checked against; a node whose build assembles a
@@ -122,9 +112,9 @@ there is no proof to build.
 
 | command | arguments | meaning |
 |---|---|---|
-| `register` | `--key`, `--payout <rand1…>`, `--rpc` | print a `Registration` (hex) signed by this node's key, for a wallet to attach to the bond that registers it — `--payout` must already resolve in the receiver registry (`rand register` on that wallet first, if it never has) |
+| `register` | `--key`, `--payout <rand1…>`, `--rpc` | print a `Registration` (hex) signed by this node's key, for a wallet to attach to the bond that registers it |
 | `unbond <amount RAND>` | `--key`, `--rpc`, `--no-wait` | move bonded stake into unbonding; withdrawable two epochs later. Free |
-| `withdraw <amount RAND>` | same | pay released stake and rewards into a note at the register's payout id, `pk` resolved from the receiver registry, less the bundle base |
+| `withdraw <amount RAND>` | same | pay released stake and rewards into a note at the register's payout address, less the bundle base |
 
 The bond itself is a wallet command: it burns the stake out of shielded notes, and a validator key
 owns none. `unbond` and `withdraw` need no wallet at all — they ride without a bundle, exactly as a
@@ -253,27 +243,24 @@ Global options, accepted before or after the subcommand:
 | command | arguments | behaviour |
 |---|---|---|
 | `keygen` | | write a new spend-key file at `--key`, mode 0600; refuses to overwrite |
-| `address` | `--record` | print this wallet's `rand1…` receiver id (53–55 characters); `--record` prints the current signed receiver record as JSON instead (the file `rand send --record` and `rand-node genesis --receiver` read) |
-| `request` | `--amount <RAND>`, `--memo <TEXT>` | print a `rand:…` payment-request URI carrying this wallet's record inline — payable with no registry and no prior registration (`docs/shielded.md` §2) |
-| `register` | `--rotate`, `--fee <RAND>`, `--cuda` | publish this wallet's receiver record on chain, paying with a self-transfer; `--rotate` first moves to a fresh ML-KEM key (every earlier key stays openable, forever) and publishes that instead |
+| `address` | | print this wallet's `rand1…` shielded address |
 | `balance` | | scan the tree, save the store, print spendable value and the unspent note count |
 | `sync` | | scan without printing a balance; prints how far it got |
 | `notes` | | every note this wallet has opened: index, `asset`, amount, height, `spent`, `pending` |
 | `asset-balance [INDEX]` | | scan, then print what this wallet holds in one bridged asset, or a row per asset held; amounts are in the asset's own smallest unit |
 | `history` | | every note this wallet created for someone else, opened through its own outgoing viewing key |
-| `send <TO> <AMOUNT>` | `--fee <RAND>` (default `0.001`), `--record <FILE>`, `--registry <URL>` (default `https://randscan.org/api/v1`), `--register`, `--no-wait`, `--cuda` | resolve `TO`'s receiver record (a `rand:…` payment request carries its own; otherwise `--record` or, by default, the registry), verify it, then scan, select at most two notes, prove a 2-in-2-out bundle locally, submit; `--register` also publishes the resolved record, paying to register the receiver; waits for the commit unless `--no-wait` |
+| `send <TO> <AMOUNT>` | `--fee <RAND>` (default `0.001`), `--no-wait`, `--cuda` | scan, select at most two notes, prove a 2-in-2-out bundle locally, submit; waits for the commit unless `--no-wait` |
 | `bond <VALIDATOR> <AMOUNT>` | `--registration <hex>`, `--fee <RAND>` (default `0.001`), `--no-wait`, `--cuda` | stake onto a validator: the bundle burns the amount out of this wallet's notes. `--registration` (from `rand-node register`) exactly when the validator is not in the register yet, and then at least 1000 RAND; prints the new stake and the epoch it counts from (`docs/staking.md`) |
-| `faucet [ADDRESS]` | `--amount <RAND>` (default `100`, max `100`) | testnet only: ask a validator node to mint into a note for `ADDRESS` (default: this wallet), wait for the commit; a mint to this wallet's own id carries its record, so it need not already be registered |
+| `faucet [ADDRESS]` | `--amount <RAND>` (default `100`, max `100`) | testnet only: ask a validator node to mint into a note for `ADDRESS` (default: this wallet), wait for the commit |
 | `program build` | `--guest <fib\|memcpy\|bubble_sort\|balance_check\|private_payment>`, `--arg N` (repeatable), `--out <file>` (default `program.json`) | assemble a built-in guest to `{base_pc, words}` JSON; prints the program id |
 | `program deploy <FILE>` | `.json` or `.bin` (raw LE words), `--cuda` | pay the deploy floor through a bundle, wait for the commit, print the program id |
 | `program show <ID>` | | deployed program metadata |
-| `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--tier T`, `--fee <RAND>`, `--auditor <rand1…>`, `--auditor-record <FILE>`, `--registry <URL>` (default `https://randscan.org/api/v1`), `--no-envelope`, `--print-call-key`, `--cuda` | fetch the code from the node, prove the call locally with the chain's FRI profile, seal its input transcript (also to `--auditor`, resolved via `--auditor-record` or the registry), pay through a bundle, wait, print the receipt |
+| `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--tier T`, `--fee <RAND>`, `--auditor <rand1…>`, `--no-envelope`, `--print-call-key`, `--cuda` | fetch the code from the node, prove the call locally with the chain's FRI profile, seal its input transcript, pay through a bundle, wait, print the receipt |
 | `open-call <TXHASH>` | `--call-key <hex>`, `--as-auditor` | fetch the receipt and the sealed transcript, open it, check it against the receipt's `H_IN`, re-run the program on the recovered inputs and compare the outputs with the receipt's. **Exits non-zero** if the transcript is not the preimage of that `H_IN`, or if the re-run disagrees with the receipt |
 | `receipt <TX>` | | receipt of a committed call, or "no receipt" |
 | `bridge-mint <ATTESTATION>` | hex or `@path`, `--to <rand1…>`, `--fee <RAND>`, `--no-wait`, `--cuda` | deposit a guardian-signed attestation as a note: seal the deposit's envelope for its recipient and pay through a bundle from this wallet. Prints the note's `owner`, `time` and `r` every time, and on the waiting path checks the asset index the chain actually deposited under |
 | `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | `--relayer-fee N`, `--fee <RAND>` (default `0.002`), `--no-wait`, `--cuda` | burn a bridged asset to another chain: check the chain has a bridge and holds `ASSET` in its registry, select that asset's notes for the asset bundle and RAND for the fee bundle, prove **both**, submit one transaction. `--relayer-fee` is a *portion* of `AMOUNT` paid to the relayer on the destination chain, not an extra charge: the asset bundle burns exactly `AMOUNT` |
 | `bridge` | | the bridge's public state: guardians, emitters, the asset registry, `next_index`, the burn sequence |
-| `bridge-deposit-address` | | print this wallet's 32-byte `to` field (the receiver id, hex) for a source-chain depositor; refuses with "register first (rand register) before a bridge deposit can be claimed" until this wallet has published a receiver record |
 | `bridge-message <SEQUENCE>` | | one outbound burn message, verbatim, for a guardian to sign |
 | `fee bundle` / `fee deploy <words>` / `fee call <tier>` | | minimum fee from the node's schedule |
 | `tx <HASH>` | | committed transaction with its block height and index, or "not found" |
@@ -320,21 +307,11 @@ fallback: a missing driver is an error rather than a silent CPU run.
 
 ```bash
 rand keygen                                   # wallet.key.json
-rand address                                  # rand1… (53–55 characters) — give this to whoever pays you
+rand address                                  # rand1… — give this to whoever pays you
 rand faucet                                   # testnet: 100 RAND into a note only you can open
 rand balance                                  # balance: 100 RAND
-rand send rand1q9f… 1.5                     # resolves the record from the registry, ~100 s of local proving, then the commit
+rand send rand1q9f… 1.5                     # ~100 s of local proving, then the commit
 rand notes                                    # the spent note, and the change note
-```
-
-### Getting paid before ever being on chain
-
-```bash
-rand keygen                                             # wallet.key.json, never submitted anywhere
-rand request --amount 1.5 --memo "for the coffee"       # rand:rand1x7Qk…?rec=…&amount=1500000000&memo=for%20the%20coffee
-#   … hand that URI to whoever is paying; their `rand send` resolves and verifies it inline …
-rand register                                           # publish the record too, so `rand send rand1x7Qk… 1` also works later
-rand register --rotate                                  # a fresh KEM key, published as record version 2; every earlier note still opens
 ```
 
 ### A confidential call you can open again later
@@ -358,19 +335,12 @@ Node key (both binaries' `keygen` used to share this; only `rand-node` writes it
 }
 ```
 
-Wallet key, version 3 — the spend key and the highest ML-KEM key version this wallet has rotated
-to, and nothing else, because every other key (viewing key, outgoing viewing key, the ML-KEM
-decapsulation keys, the receiver signing key, the address) is a pure derivation of the spend key:
+Wallet key, version 2 — the spend key and nothing else, because every other key (viewing key,
+outgoing viewing key, ML-KEM decapsulation key, address) is a pure derivation of it:
 
 ```json
-{ "version": 3, "spend_key": "hex of 8 little-endian u32 words (64 characters)", "kem_version": 0 }
+{ "version": 2, "spend_key": "hex of 8 little-endian u32 words (64 characters)" }
 ```
-
-A version 2 file (spend key alone, no `kem_version`) still loads, at `kem_version = 0` — it was
-written before `rand register --rotate` existed, and 0 is the whole truth about it. No retired
-ML-KEM secret is ever written to disk: each is re-derived from the spend key and the version
-number, so keeping the highest version reached keeps every version below it (`docs/shielded.md`
-§2).
 
 The libp2p peer id is derived as an ed25519 key from `blake3("rand-p2p-identity" || seed)`, so it
 is stable across restarts. Losing a wallet key loses every note it could open; there is no

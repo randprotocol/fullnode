@@ -7,22 +7,14 @@
 //! spends them by proving a 2-in-2-out bundle locally. The node is asked for chain state —
 //! leaves, nullifiers, anchors, witnesses — and handed a finished bundle; it is never told who
 //! anyone is.
-//!
-//! An address is short now (the short-shielded-address spec): `rand1…`, 53–55 characters, a
-//! **receiver id** that says who and not how. What a sender needs in order to seal an envelope —
-//! the note key `pk` and the 1,184-byte ML-KEM encapsulation key — lives in a signed record the
-//! id resolves to, delivered either inline with a payment request (`rand request`) or from the
-//! registry the explorer indexes (`rand register` puts it there). This wallet verifies every
-//! record it is handed against the id it is paying, whoever supplied it.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use randprotocol_client::receiver;
 use randprotocol_client::wallet::{self, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
 use randprotocol_client::wallet::{Burn, Submission};
 use randprotocol_core::ledger::staking::MIN_STAKE;
-use randprotocol_core::receiver::ReceiverId;
+use randprotocol_core::notes::ShieldedAddress;
 use randprotocol_core::types::actions::Registration;
 use randprotocol_core::{format_amount, gas, parse_amount, Action, Address, Hash};
 use randprotocol_zkvm::machine::{Backend, FriProfile, Tier, TIERS};
@@ -47,40 +39,8 @@ struct Cli {
 enum Cmd {
     /// Create a new spend-key file (refuses to overwrite).
     Keygen,
-    /// Show this wallet's shielded address: the short `rand1…` receiver id.
-    Address {
-        /// Print the signed receiver record this id resolves to, as JSON — the file
-        /// `rand send --record` and `rand-node genesis --receiver` read.
-        #[arg(long)]
-        record: bool,
-    },
-    /// Print a payment request URI: this wallet's address with its record inline, so a sender
-    /// can pay it without any registry and without this wallet ever being on chain (spec §4).
-    Request {
-        /// Amount in RAND to ask for, e.g. 1.5
-        #[arg(long)]
-        amount: Option<String>,
-        /// A note for the payer; it travels in the URI and nowhere near the chain.
-        #[arg(long)]
-        memo: Option<String>,
-    },
-    /// Publish this wallet's receiver record on chain, paying with a self-transfer bundle.
-    ///
-    /// Registering is how a receiver becomes payable from an address alone — the explorer
-    /// indexes the registry — and it is what a bridge deposit needs. A wallet that only ever
-    /// hands out payment requests never has to.
-    Register {
-        /// Rotate to a fresh ML-KEM key first, and publish that. Every note sealed to an
-        /// earlier key stays openable: no retired key is ever discarded.
-        #[arg(long)]
-        rotate: bool,
-        /// Fee in RAND; the floor is 0.001.
-        #[arg(long)]
-        fee: Option<String>,
-        /// Prove on an attached NVIDIA GPU (requires a build with `--features cuda`).
-        #[arg(long)]
-        cuda: bool,
-    },
+    /// Show this wallet's shielded address.
+    Address,
     /// Scan, then show what this wallet can spend.
     Balance,
     /// Scan, then show what this wallet holds in a bridged asset (or in every asset).
@@ -97,31 +57,15 @@ enum Cmd {
     Notes,
     /// List every note this wallet created for someone else.
     History,
-    /// Send RAND to a shielded address: resolve, verify, scan, select, prove and submit.
-    ///
-    /// The address is a receiver id, which says who and not how: the ML-KEM key the note's
-    /// envelope is sealed to lives in a signed record the id resolves to. `--record` is the
-    /// offline path (the file a payer was handed); otherwise the registry is asked. Whatever
-    /// delivers the record, this wallet verifies the receiver signed it before sealing anything.
+    /// Send RAND to a shielded address: scan, select, prove and submit.
     Send {
-        /// A `rand1…` shielded address, or a `rand:…` payment request URI (which carries the
-        /// record, so it needs neither flag below).
+        /// A `rand1…` shielded address.
         to: String,
         /// Amount in RAND, e.g. 1.5
         amount: String,
         /// Fee in RAND; the floor is 0.001.
         #[arg(long)]
         fee: Option<String>,
-        /// A receiver record JSON file (`rand address --record`), instead of a registry lookup.
-        #[arg(long)]
-        record: Option<PathBuf>,
-        /// The registry to resolve the address through.
-        #[arg(long, default_value = randprotocol_client::receiver::DEFAULT_REGISTRY)]
-        registry: String,
-        /// Also publish the resolved record on this bundle, paying to register the receiver
-        /// (spec §6.3) — what a first payment to a wallet that has never registered does.
-        #[arg(long)]
-        register: bool,
         /// Return once the node accepts the bundle instead of waiting for it to commit.
         #[arg(long)]
         no_wait: bool,
@@ -185,12 +129,6 @@ enum Cmd {
         /// Also seal the transcript to this `rand1…` address, which can then open this one call.
         #[arg(long)]
         auditor: Option<String>,
-        /// The auditor's receiver record as a JSON file, instead of a registry lookup.
-        #[arg(long)]
-        auditor_record: Option<PathBuf>,
-        /// The registry to resolve `--auditor` through.
-        #[arg(long, default_value = randprotocol_client::receiver::DEFAULT_REGISTRY)]
-        registry: String,
         /// Publish no input transcript at all.
         #[arg(long)]
         no_envelope: bool,
@@ -260,12 +198,6 @@ enum Cmd {
     },
     /// The bridge's public state: guardians, emitters, the asset registry, the burn sequence.
     Bridge,
-    /// The 32 bytes a source-chain depositor names to send this wallet a bridge deposit.
-    ///
-    /// A deposit note's `pk` comes from the chain's receiver registry (spec §6.4), so a deposit
-    /// to an unregistered receiver is refused by the ledger and the coins would be stuck on the
-    /// far side. This refuses to print an address until this wallet is registered.
-    BridgeDepositAddress,
     /// The outbound burn message with this sequence, for a guardian to sign.
     BridgeMessage { sequence: u64 },
     /// Minimum fee: `fee bundle`, `fee deploy <words>` or `fee call <tier>`.
@@ -338,40 +270,8 @@ fn pretty(v: &serde_json::Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
 
-/// A `rand1…` receiver id: the form every address argument of this wallet takes, in place of the
-/// 1,667-character shielded address it replaced.
-fn parse_receiver_id(s: &str) -> Result<ReceiverId> {
-    ReceiverId::parse(s).map_err(|e| anyhow::anyhow!("{e}")).context("invalid receiver id")
-}
-
-/// A receiver record as the JSON this wallet writes and reads: `ReceiverRecordHex`, the same
-/// shape `rand-node genesis --receiver` takes, `rand_getReceiver` serves and the explorer
-/// returns. One renderer, so the file `rand address --record` prints is exactly the file
-/// `rand send --record` accepts.
-fn record_json(r: &randprotocol_core::receiver::ReceiverRecord) -> String {
-    pretty(&serde_json::to_value(randprotocol_core::genesis::ReceiverRecordHex::from_record(r)).expect("a record renders"))
-}
-
-/// What the sender of a note needs about a receiver: the `pk`/`kem_ek` pair, from a record the
-/// receiver signed. `to` is either a `rand:` payment request (the record travels with it) or a
-/// bare `rand1…` id (resolved through the record file or the registry, spec §5).
-///
-/// The chain id is the node's, and it is inside every record's signature: a record signed for
-/// another chain does not verify here, which is what stops one chain's request being replayed
-/// on another.
-async fn resolve_recipient(
-    to: &str,
-    chain_id: u64,
-    record_file: Option<&Path>,
-    registry: &str,
-) -> Result<(ReceiverId, randprotocol_core::receiver::ReceiverRecord)> {
-    if let Some(req) = to.starts_with("rand:").then(|| receiver::PaymentRequest::parse(to)).transpose()? {
-        receiver::resolve_from_request(&req, chain_id)?;
-        return Ok((req.id, req.record));
-    }
-    let id = parse_receiver_id(to)?;
-    let record = receiver::resolve_record(&id, chain_id, record_file, Some(registry)).await?;
-    Ok((id, record))
+fn parse_address(s: &str) -> Result<ShieldedAddress> {
+    ShieldedAddress::parse(s).map_err(|e| anyhow::anyhow!("{e}")).context("invalid shielded address")
 }
 
 /// The wallet, where its note store lives, and the store itself.
@@ -490,102 +390,9 @@ async fn main() -> Result<()> {
         Cmd::Keygen => {
             let w = Wallet::generate();
             w.save_new(&cli.key)?;
-            println!(
-                "wrote {}\naddress: {}\nthis address is payable right away with `rand request`; \
-                 `rand register` publishes it on chain",
-                cli.key.display(),
-                w.id
-            );
+            println!("wrote {}\naddress: {}", cli.key.display(), w.address);
         }
-        // The address needs no node; the record does, because the chain id is inside its
-        // signature and only the node this wallet talks to can say which chain that is.
-        Cmd::Address { record } => {
-            let w = Wallet::load(&cli.key)?;
-            if record {
-                println!("{}", record_json(&w.record(rpc.chain_id().await?)));
-            } else {
-                println!("{}", w.id);
-            }
-        }
-        Cmd::Request { amount, memo } => {
-            let w = Wallet::load(&cli.key)?;
-            let req = receiver::PaymentRequest {
-                id: w.id,
-                record: w.record(rpc.chain_id().await?),
-                amount: amount.as_deref().map(parse_amount).transpose()?,
-                memo,
-            };
-            println!("{}", req.to_uri());
-        }
-        Cmd::Register { rotate, fee, cuda } => {
-            let (mut w, path, mut store) = open_wallet(&cli.key)?;
-            let chain_id = rpc.chain_id().await?;
-            // The version comes from the chain, never from this wallet's counter: the ledger
-            // admits exactly `current + 1`, so a rotation that did not commit has to be retried
-            // at the version it failed at (`receiver::registration_target`).
-            let already = rpc.receiver(&w.id).await?;
-            let kem_version = match receiver::registration_target(already.as_ref().map(|r| r.version), rotate) {
-                receiver::RegisterPlan::Publish { kem_version } => kem_version,
-                receiver::RegisterPlan::AlreadyRegistered { version } => {
-                    // Not a failure: the wallet is in the state that was asked for.
-                    println!(
-                        "{} is already registered at version {version}; `rand register --rotate` publishes a fresh KEM key",
-                        w.id
-                    );
-                    return Ok(());
-                }
-                receiver::RegisterPlan::NothingToRotate => anyhow::bail!(
-                    "{} has never been registered, so there is nothing to rotate; run `rand register` first",
-                    w.id
-                ),
-            };
-            if w.kem_version > kem_version {
-                // A counter ahead of the chain is what a failed rotation leaves behind: this
-                // wallet already moved to a version whose registration never committed. A normal
-                // `--rotate` always asks for `kem_version + 1`, so `w.kem_version < kem_version`
-                // on every ordinary run and this never prints then — only a retry, where the
-                // wallet is ahead of what the chain will accept, is worth a line, because the
-                // wallet's address moves back with it.
-                eprintln!(
-                    "this wallet's KEM key version is {}, and the chain's registry implies {kem_version}; \
-                     publishing (and moving to) the version the chain will accept",
-                    w.kem_version
-                );
-                w.kem_version = kem_version;
-            }
-            let record = w.record(chain_id);
-            let action = Action::RegisterReceiver { record: record.clone() };
-            let fee = match fee {
-                Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action),
-            };
-            let profile = profile_of(&rpc).await?;
-            // A self-transfer of zero: the registration rides an ordinary bundle, which is what
-            // pays for it (spec §6.2). `to = None` is exactly that bundle.
-            let s = wallet::submit(
-                &rpc,
-                &w,
-                &mut store,
-                None,
-                action,
-                fee,
-                Burn::None,
-                profile,
-                backend_for(cuda)?,
-                chain_id,
-                true,
-            )
-            .await;
-            store.save(&path)?;
-            let s = s?;
-            // Only now: the node has taken the transaction, so the version this wallet will
-            // advertise from here on is the version the chain holds. Saving before proving would
-            // move the file for a registration that may never land, which is the state the
-            // reconciliation above exists to climb back out of.
-            w.save(&cli.key)?;
-            report(&s, "receiver registration");
-            println!("registered {} at record version {} (KEM key version {})", w.id, record.version, w.kem_version);
-        }
+        Cmd::Address => println!("{}", Wallet::load(&cli.key)?.address),
         Cmd::Balance => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             wallet::scan(&rpc, &w, &mut store).await?;
@@ -672,54 +479,16 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Send { to, amount, fee, record, registry, register, no_wait, cuda } => {
+        Cmd::Send { to, amount, fee, no_wait, cuda } => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
-            let chain_id = rpc.chain_id().await?;
-            // Resolved and verified before anything is proved: a wrong or missing record is an
-            // answer in a second, where a proof is a minute and a half of this machine.
-            let (id, record) = resolve_recipient(&to, chain_id, record.as_deref(), &registry).await?;
-            let dest = randprotocol_core::notes::ShieldedAddress::from(&record);
+            let to = parse_address(&to)?;
             let amount = parse_amount(&amount)?;
-            // Sender-paid registration (spec §6.3): the same record, published on the bundle
-            // that pays the receiver — but only at the one version the ledger will take. A
-            // registration the chain refuses takes the payment down with it, and that payment is
-            // a proof this machine has already spent a minute and a half on, so every other case
-            // pays and says why (`receiver::carried_registration`).
-            let action = if register {
-                let chain = rpc.receiver(&id).await?.map(|r| r.version);
-                match receiver::carried_registration(record.version, chain) {
-                    receiver::CarriedRegistration::Publish => Action::RegisterReceiver { record },
-                    receiver::CarriedRegistration::Skip(why) => {
-                        println!("paying {id} without registering it: {why}");
-                        Action::None
-                    }
-                }
-            } else {
-                Action::None
-            };
-            let fee = match fee {
-                Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action),
-            };
+            let fee = match fee { Some(f) => parse_amount(&f)?, None => gas::BUNDLE_BASE };
+            let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let registering = matches!(action, Action::RegisterReceiver { .. });
-            let s = wallet::submit(
-                &rpc,
-                &w,
-                &mut store,
-                Some((&dest, amount)),
-                action,
-                fee,
-                Burn::None,
-                profile,
-                backend_for(cuda)?,
-                chain_id,
-                !no_wait,
-            )
-            .await;
+            let s = wallet::send(&rpc, &w, &mut store, &to, amount, fee, profile, backend_for(cuda)?, chain_id, !no_wait).await;
             store.save(&path)?;
             report(&s?, "transfer");
-            println!("paid {id}{}", if registering { ", and registered their record" } else { "" });
             if !no_wait {
                 println!("balance: {} RAND", format_amount(store.balance()));
             }
@@ -789,21 +558,14 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Faucet { address, amount } => {
-            let w = Wallet::load(&cli.key)?;
             let to = match address {
-                Some(a) => parse_receiver_id(&a)?,
-                None => w.id,
+                Some(a) => parse_address(&a)?,
+                None => Wallet::load(&cli.key)?.address,
             };
             let units = parse_amount(&amount)?;
-            // First contact (spec §6.3): a mint to this wallet carries the record this wallet
-            // signed, so a brand-new wallet is fundable before it has ever been on chain — the
-            // node verifies it under the id rather than looking the id up in a registry it is
-            // not in yet. A mint to somebody *else's* id carries nothing: this wallet cannot
-            // sign their record, and the node resolves them from the registry.
-            let record = if to == w.id { Some(w.record(rpc.chain_id().await?)) } else { None };
             // An observer node answers "only a validator can mint"; that is the node's own
             // wording and is shown as it came, since it says exactly what to do next.
-            let hash = rpc.mint_shielded_with_record(&to.to_string(), Some(units), record.as_ref()).await?;
+            let hash = rpc.mint_shielded(&to.to_string(), Some(units)).await?;
             println!("submitted mint {hash} ({} RAND to {to})", format_amount(units));
             let r = rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await?;
             println!("committed in block {} (index {})", r.height, r.index);
@@ -833,25 +595,16 @@ async fn main() -> Result<()> {
                 None => println!("unknown program"),
             }
         }
-        Cmd::Call { program, inputs, tier, fee, auditor, auditor_record, registry, no_envelope, print_call_key, cuda } => {
+        Cmd::Call { program, inputs, tier, fee, auditor, no_envelope, print_call_key, cuda } => {
             if no_envelope && (auditor.is_some() || print_call_key) {
                 anyhow::bail!("--no-envelope publishes no transcript, so there is no auditor and no call key");
             }
+            let auditor = auditor.as_deref().map(parse_address).transpose()?;
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let pid = Hash::from_hex(&program).context("invalid program id")?;
             let (base_pc, words) = rpc.program_code(&pid).await?.context("program not found on chain")?;
             let prog = Program { base_pc, words };
             let chain_id = rpc.chain_id().await?;
-            // An auditor is named by receiver id and sealed to by the KEM key its record holds,
-            // resolved and verified exactly as a payee's is — an envelope sealed to a key the
-            // auditor never authorised opens for nobody, and would only be found out later.
-            let auditor = match &auditor {
-                None => None,
-                Some(a) => {
-                    let (_, record) = resolve_recipient(a, chain_id, auditor_record.as_deref(), &registry).await?;
-                    Some(randprotocol_core::notes::ShieldedAddress::from(&record))
-                }
-            };
             let profile = profile_of(&rpc).await?;
             let backend = backend_for(cuda)?;
             eprintln!("proving the call locally ({} inputs stay private)…", inputs.len());
@@ -888,7 +641,7 @@ async fn main() -> Result<()> {
                 println!(
                     "input transcript published{}; open it with `rand open-call {}`",
                     match &auditor {
-                        Some(_) => " (also readable by the auditor named)".to_string(),
+                        Some(a) => format!(" (also readable by the auditor {a})"),
                         None => String::new(),
                     },
                     s.hash
@@ -922,10 +675,7 @@ async fn main() -> Result<()> {
                 (None, auditor) => {
                     let w = Wallet::load(&cli.key)?;
                     let opened = if auditor {
-                        // Every KEM key version this wallet has published, newest first: the
-                        // caller sealed to whichever address it had been handed, which may be
-                        // one this wallet has since rotated away from.
-                        w.open_call_as_auditor(&envelope, &h_in)
+                        call_envelope::open_call_as_auditor(&envelope, &h_in, &w.vk)
                             .context("this wallet is not the auditor of this call")?
                     } else {
                         call_envelope::open_call_as_sender(&envelope, &h_in, &w.vk)
@@ -960,27 +710,20 @@ async fn main() -> Result<()> {
             let bytes = read_hex_arg(&attestation)?;
             let d = wallet::attested_deposit(&bytes)?;
             let recipient = match &to {
-                Some(a) => parse_receiver_id(a)?,
-                None => w.id,
+                Some(a) => parse_address(a)?,
+                None => w.address.clone(),
             };
-            // The guardians signed the recipient's 32-byte receiver id, and the ledger refuses a
-            // transaction naming any other — so this wallet checks before paying for a proof it
-            // could not get admitted.
-            if recipient.0 != d.to_hash {
+            // The guardians signed a 32-byte hash of the recipient's address, and the ledger
+            // refuses a transaction whose address does not hash to it — so this wallet checks
+            // before paying for a proof it could not get admitted.
+            if recipient.recipient_hash() != d.to_hash {
                 anyhow::bail!(
-                    "this attestation deposits to the receiver id {}, and {recipient} is not it; \
-                     pass --to with the id the depositor named",
+                    "this attestation deposits to the address hashing to {}, and {} does not; \
+                     pass --to with the address the depositor named",
                     hex::encode(d.to_hash),
+                    if to.is_some() { "the address given" } else { "this wallet's address" }
                 );
             }
-            // The deposit note's `pk` comes from the *chain's* registry (spec §6.4), not from a
-            // record a payer was handed, so that is what the envelope must be sealed to: any
-            // other key leaves the recipient a leaf they cannot open. An unregistered recipient
-            // is refused by the ledger, and is told here what to do about it.
-            let record = rpc.receiver(&recipient).await?.ok_or_else(|| {
-                anyhow::anyhow!("register first (rand register) before a bridge deposit can be claimed")
-            })?;
-            let address = receiver::verified(&record, &recipient, rpc.chain_id().await?)?;
             // The asset id comes from the node, over the two wire fields the guardians signed — a
             // disagreement with the one this wallet computed would mean the two are not speaking
             // about the same chain.
@@ -998,7 +741,8 @@ async fn main() -> Result<()> {
             // against (`Action::BridgeAttest`). The head is the freshest such time.
             let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
                 .context("chain height does not fit a note's time field")?;
-            let (note, envelope) = wallet::deposit_note_for(&w, &address, d.amount, index, time)?;
+            let (note, envelope) = wallet::deposit_note_for(&w, &recipient, d.amount, index, time)?;
+            let owner = recipient.to_string();
             // The action names the index this envelope was sealed for, and admission refuses a
             // mismatch (`Action::BridgeAttest`): if a competing first sighting registers while
             // this bundle is being proved, the transaction is rejected and re-proved rather than
@@ -1019,7 +763,7 @@ async fn main() -> Result<()> {
             // in this transaction, so printing them discloses nothing — and they are the only way to
             // rebuild the note by hand if the index turns out not to be the predicted one below.
             println!(
-                "deposit: {} units of asset {index}{}\n  note {}\n  owner {recipient}, from 0, time {time}, r {}",
+                "deposit: {} units of asset {index}{}\n  note {}\n  owner {owner}, from 0, time {time}, r {}",
                 d.amount,
                 if asset.is_first_sighting() { " (first sighting — this transaction registers it)" } else { "" },
                 randprotocol_core::notes::word8_to_hex(&note.commitment()),
@@ -1040,7 +784,7 @@ async fn main() -> Result<()> {
                             "warning: this node says the deposit landed under asset {committed}, not the {predicted} \
                              the envelope was sealed for — which admission should have refused, so treat this node's \
                              registry as suspect.\n  \
-                             If it is right, the envelope opens nothing: rebuild the note as (owner {recipient}, from 0, \
+                             If it is right, the envelope opens nothing: rebuild the note as (owner {owner}, from 0, \
                              amount {}, asset {committed}, time {time}, r {}) and import it by hand.",
                             d.amount,
                             randprotocol_core::notes::word8_to_hex(&note.r),
@@ -1055,22 +799,6 @@ async fn main() -> Result<()> {
                 };
                 println!("asset {landed} balance: {} units", store.balance_of(landed));
             }
-        }
-        Cmd::BridgeDepositAddress => {
-            let w = Wallet::load(&cli.key)?;
-            // Spec §6.4 and the user's ruling 3: a bridge deposit is never a first contact. The
-            // guardians' payload is 32 bytes and carries no record, so the chain resolves the
-            // recipient's note key from its own registry — and a deposit to an id that is not in
-            // it is refused, with the coins already gone from the source chain. So the address is
-            // not printed at all until this wallet is in that registry.
-            if rpc.receiver(&w.id).await?.is_none() {
-                anyhow::bail!("register first (rand register) before a bridge deposit can be claimed");
-            }
-            println!(
-                "receiver id: {}\nsource-chain `to` field (32 bytes): {}",
-                w.id,
-                hex::encode(w.id.0)
-            );
         }
         Cmd::BridgeBurn { asset, amount, to_chain, to, relayer_fee, fee, no_wait, cuda } => {
             let (w, path, mut store) = open_wallet(&cli.key)?;

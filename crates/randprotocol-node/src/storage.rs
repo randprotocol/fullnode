@@ -160,11 +160,6 @@ const META_AGGREGATORS: &str = "aggregators";
 /// it from here so every reader of the store (RPC included, which has no genesis file to hand)
 /// sees the same gate the node sees.
 const META_AGGREGATION: &str = "aggregation";
-/// `bincode(BTreeMap<ReceiverId, ReceiverRecord>)`: the receiver registry as of the head
-/// (short-shielded-address task 4, spec §6). `META_AGGREGATORS`'s twin in kind — hashed into the
-/// state root unconditionally, so a restarted node that lost it would fork at the next block that
-/// resolves a payout, or simply on the state root of the very next block.
-const META_RECEIVERS: &str = "receivers";
 /// `bincode(BridgeMeta)`: the whole-state half of the bridge — emitter, source emitters,
 /// guardian sets, the asset registry with its indices and `next_index`, and the burn sequence.
 /// Its presence is what makes a chain "bridged" on disk; the two collections it leaves out live
@@ -234,12 +229,12 @@ fn sync_opts() -> WriteOptions {
 ///
 /// A `BridgeAttest`'s deposit is the one commitment the wire does not carry: the chain computes
 /// it from the amount the guardians signed, the `time` the action published and the asset the
-/// registry named and the receiver id resolved to, so this recomputes it the same way, through
-/// the ledger's own function. `ledger` carries both registries this needs — absent a bridge
-/// section only on a chain without one, where a `BridgeAttest` is inadmissible.
+/// registry named, so this recomputes it the same way, through the ledger's own function.
+/// `bridge` is that registry — absent only on a chain without a bridge, where a `BridgeAttest`
+/// is inadmissible.
 fn created_notes(
     tx: &randprotocol_core::Transaction,
-    ledger: &Ledger,
+    bridge: Option<&BridgeState>,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<Vec<(Word8, Envelope)>> {
     let mut out = Vec::new();
@@ -251,22 +246,18 @@ fn created_notes(
     match &tx.action {
         Action::Mint { cm, envelope, .. } => out.push((*cm, envelope.clone())),
         Action::BridgeAttest { attestation, .. } => {
-            if ledger.bridge().is_none() {
-                return Err(
-                    StorageError::Corrupt("committed block has a bridge attestation but no bridge state".into())
-                        .into(),
-                );
-            }
+            let bridge = bridge.ok_or_else(|| {
+                StorageError::Corrupt("committed block has a bridge attestation but no bridge state".into())
+            })?;
             // A guardian-set rotation is the one attestation that deposits nothing. Everything
-            // else was admitted, so it decodes, its asset is registered and its receiver id
-            // resolves; failing to find the note here is a torn block, and leaving the leaf out
-            // would put the notes family one short of the tree the ledger committed to.
+            // else was admitted, so it decodes and its asset is registered; failing to find the
+            // note here is a torn block, and leaving the leaf out would put the notes family one
+            // short of the tree the ledger committed to.
             if randprotocol_core::ledger::bridge_notes::attested_transfer(attestation).is_some() {
-                let note = randprotocol_core::ledger::bridge_notes::deposit_note(tx, ledger, executor)
+                let note = randprotocol_core::ledger::bridge_notes::deposit_note(tx, bridge, executor)
                     .ok_or_else(|| {
                         StorageError::Corrupt(
-                            "committed attestation deposits an asset or a receiver the registry does not hold"
-                                .into(),
+                            "committed attestation deposits an asset the registry does not hold".into(),
                         )
                     })?;
                 out.push(note);
@@ -384,7 +375,6 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
-        batch.put_cf(self.cf(CF_META), META_RECEIVERS, bincode::serialize(gs.ledger.receivers())?);
         batch.put_cf(self.cf(CF_ANCHORS), height_key(0), word8_to_bytes(&gs.ledger.root()));
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(gs.ledger.tree())?);
         batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
@@ -657,12 +647,6 @@ impl Storage {
     /// The aggregator register as of the head — the same rule again.
     pub fn aggregators(&self) -> Result<std::collections::BTreeMap<randprotocol_core::Address, randprotocol_core::ledger::aggregation::AggregatorEntry>> {
         Ok(self.get_meta_raw(META_AGGREGATORS)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
-    }
-
-    /// The receiver registry as of the head (short-shielded-address task 4) — the same rule
-    /// again: empty for a database written before the key existed.
-    pub fn receivers(&self) -> Result<std::collections::BTreeMap<randprotocol_core::receiver::ReceiverId, randprotocol_core::receiver::ReceiverRecord>> {
-        Ok(self.get_meta_raw(META_RECEIVERS)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
     }
 
     /// Every leaf in tree order. The witness source, and the check `load_ledger` runs the
@@ -1073,7 +1057,6 @@ impl Storage {
         ledger.set_supply(self.supply()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
-        ledger.set_receivers(self.receivers()?);
         if let Some(cfg) = self.get_meta_raw(META_AGGREGATION)? {
             let cfg: Option<randprotocol_core::ledger::aggregation::AggregationConfig> = bincode::deserialize(&cfg)?;
             ledger.set_aggregation(cfg);
@@ -1232,7 +1215,7 @@ impl Storage {
                 for nf in tx.nullifiers() {
                     batch.put_cf(self.cf(CF_NULLIFIERS), word8_to_bytes(&nf), hk);
                 }
-                for (cm, envelope) in created_notes(tx, ledger_after, executor)? {
+                for (cm, envelope) in created_notes(tx, ledger_after.bridge(), executor)? {
                     let row = NoteRow { cm, envelope, height: block.height() };
                     batch.put_cf(self.cf(CF_NOTES), height_key(next_index), bincode::serialize(&row)?);
                     next_index += 1;
@@ -1347,7 +1330,6 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger_after.supply())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
-        batch.put_cf(self.cf(CF_META), META_RECEIVERS, bincode::serialize(ledger_after.receivers())?);
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
         self.db.write_opt(batch, &sync_opts())?;
         // The sealing marks' per-block half (spec §6.1): the bundle marks went in with the
@@ -1732,7 +1714,6 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger.supply())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
-        batch.put_cf(self.cf(CF_META), META_RECEIVERS, bincode::serialize(ledger.receivers())?);
         if height == 0 {
             let hk = height_key(0);
             batch.put_cf(self.cf(CF_BLOCKS), hk, gs.block.encode());
@@ -1776,9 +1757,8 @@ pub(crate) mod fixtures {
     use super::*;
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::bridge::{guardian_address, BridgeConfig};
-    use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator, ReceiverRecordHex};
-    use randprotocol_core::notes::{word8_to_hex, Bundle, KEM_EK_BYTES};
-    use randprotocol_core::receiver::{receiver_signing_keypair, ReceiverId, ReceiverRecord};
+    use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
+    use randprotocol_core::notes::{word8_to_hex, Bundle, ShieldedAddress};
     use randprotocol_core::{gas, BlockHeader, Keypair, Transaction};
 
     /// The bundle guest commitment the fixture chains pin. Arbitrary: `StubExecutor` checks a
@@ -1809,18 +1789,10 @@ pub(crate) mod fixtures {
         genesis_of(chain_id, &[&key(1)], alloc, epoch_blocks)
     }
 
-    /// A validator's payout id. Pure — the id (a signing key's address) does not depend on the
-    /// chain, only the record that resolves it does, so it can be named before a genesis or a
-    /// ledger exists.
-    pub(crate) fn payout(i: u8) -> ReceiverId {
-        ReceiverId::from(receiver_signing_keypair(&[i; 32]).public_key())
-    }
-
-    /// The receiver record `payout(i)` resolves to, on chain `chain_id` — every fixture genesis
-    /// registers `1..=n` of these so its validators' payouts resolve from block 0.
-    pub(crate) fn receiver_record_for(chain_id: u64, i: u8) -> ReceiverRecord {
-        let kp = receiver_signing_keypair(&[i; 32]);
-        ReceiverRecord::sign(&kp, chain_id, 1, [i as u32; 8], vec![i; randprotocol_core::notes::KEM_EK_BYTES])
+    /// A validator's payout address. It only has to parse and be a fixed width; nothing in these
+    /// tests opens the note a withdraw would seal to it.
+    pub(crate) fn payout(i: u8) -> randprotocol_core::notes::ShieldedAddress {
+        randprotocol_core::notes::ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; randprotocol_core::notes::KEM_EK_BYTES] }
     }
 
     /// A genesis staking each of `validators` at the minimum — below it an entry is in the
@@ -1844,9 +1816,6 @@ pub(crate) mod fixtures {
                 })
                 .collect(),
             alloc,
-            receivers: (1..=validators.len() as u8)
-                .map(|i| ReceiverRecordHex::from_record(&receiver_record_for(chain_id, i)))
-                .collect(),
             faucet: true,
             confidential: true,
             fri_profile: "test".into(),
@@ -1892,10 +1861,6 @@ pub(crate) mod fixtures {
                 payout: payout(1).to_string(),
             }],
             alloc: Vec::new(),
-            receivers: vec![
-                ReceiverRecordHex::from_record(&receiver_record_for(chain_id, 1)),
-                ReceiverRecordHex::from_record(&recipient_record(chain_id)),
-            ],
             faucet: true,
             confidential: true,
             fri_profile: "test".into(),
@@ -1924,25 +1889,15 @@ pub(crate) mod fixtures {
         t
     };
 
-    /// The receiver every fixture deposit is addressed to, distinct from any validator payout
-    /// (seed 200, where genesis payouts are seeded `1..=validators.len()`). [`bridged_genesis`]
-    /// registers it, so a deposit built against it always resolves.
-    const RECIPIENT_SEED: u8 = 200;
-
-    pub(crate) fn recipient() -> ReceiverId {
-        ReceiverId::from(receiver_signing_keypair(&[RECIPIENT_SEED; 32]).public_key())
-    }
-
-    /// The receiver record [`recipient`] resolves to, on chain `chain_id`.
-    pub(crate) fn recipient_record(chain_id: u64) -> ReceiverRecord {
-        let kp = receiver_signing_keypair(&[RECIPIENT_SEED; 32]);
-        ReceiverRecord::sign(&kp, chain_id, 1, [4; 8], vec![6; KEM_EK_BYTES])
+    /// The shielded address every fixture deposit is addressed to.
+    pub(crate) fn recipient() -> ShieldedAddress {
+        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
     }
 
     /// An attestation of `amount` units of [`TOKEN`] to `to`, emitted by chain 2's registered
     /// emitter and signed by five of the six guardians in [`bridge_config`]. `sequence`
     /// distinguishes otherwise identical bodies, and so their digests.
-    pub(crate) fn attestation(secrets: &[[u8; 32]], to: &ReceiverId, amount: u128, sequence: u64) -> Vec<u8> {
+    pub(crate) fn attestation(secrets: &[[u8; 32]], to: &ShieldedAddress, amount: u128, sequence: u64) -> Vec<u8> {
         use randprotocol_core::bridge::{digest, sign_digest, Attestation, Body, Payload, Transfer, CHAIN_RAND};
         let body = Body {
             timestamp: 1,
@@ -1955,7 +1910,7 @@ pub(crate) mod fixtures {
                 amount: Transfer::u256_from_u128(amount),
                 token_address: TOKEN,
                 token_chain: 2,
-                to: to.0,
+                to: to.recipient_hash(),
                 to_chain: CHAIN_RAND,
                 fee: Transfer::u256_from_u128(0),
             })
@@ -2041,46 +1996,10 @@ pub(crate) mod fixtures {
         (dir, s, gs)
     }
 
-    /// An unopened database plus a one-validator genesis with no alloc notes — the smallest fixture
-    /// a test can still register an extra receiver into before calling `init_genesis`.
-    pub(crate) fn fresh_genesis_state() -> (tempfile::TempDir, Storage, GenesisState) {
-        let gs = genesis(7);
-        let dir = tempfile::tempdir().unwrap();
-        let s = Storage::open(dir.path()).unwrap();
-        (dir, s, gs)
-    }
-
     /// A bundle whose stub proof publishes exactly the digest the ledger recomputes, anchored to
     /// the newest root `ledger` has recorded and timed at its current height.
     pub(crate) fn bundle_tx(ledger: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64) -> Transaction {
         Transaction::shielded(ledger.chain_id(), bundle(ledger, nfs, cms, fee), Action::None)
-    }
-
-    /// A `RegisterReceiver` transaction naming `record`, riding a bundle at the base fee like
-    /// any other action (`ledger::receivers`'s own fixture, node-crate side).
-    pub(crate) fn register_receiver_tx(ledger: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], record: ReceiverRecord) -> Transaction {
-        Transaction::shielded(ledger.chain_id(), bundle(ledger, nfs, cms, bundle_fee()), Action::RegisterReceiver { record })
-    }
-
-    /// Signs `payout(seed)`'s record with note key `pk`, applies it to `ledger` (bundle-carrying,
-    /// nullifiers/commitments from `nfs`/`cms` — the caller picks values nothing else in the test
-    /// uses) and returns its id: the node-crate equivalent of
-    /// `randprotocol_core::ledger::test_fixtures::registered_receiver`, which is crate-private to
-    /// core and so not callable from here.
-    pub(crate) fn registered_receiver(
-        ledger: &mut Ledger,
-        proposer: &randprotocol_core::Address,
-        nfs: [Word8; 2],
-        cms: [Word8; 2],
-        seed: u8,
-        pk: Word8,
-    ) -> ReceiverId {
-        let kp = receiver_signing_keypair(&[seed; 32]);
-        let rec = ReceiverRecord::sign(&kp, ledger.chain_id(), 1, pk, vec![seed; randprotocol_core::notes::KEM_EK_BYTES]);
-        let id = rec.id();
-        let tx = register_receiver_tx(ledger, nfs, cms, rec);
-        ledger.apply_tx(&tx, proposer, &StubExecutor).unwrap();
-        id
     }
 
     /// A bundle anchored to the ledger's newest recorded root, whose stub proof publishes
@@ -2194,8 +2113,6 @@ mod tests {
     use super::*;
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::ledger::ANCHOR_WINDOW;
-    use randprotocol_core::notes::KEM_EK_BYTES;
-    use randprotocol_core::receiver::{receiver_signing_keypair, ReceiverRecord};
     use randprotocol_core::Transaction;
 
     /// Fold a witness back to the root, the way the bundle guest's `MERKLE_VERIFY` does.
@@ -2257,28 +2174,6 @@ mod tests {
         assert_eq!(reloaded, gs.ledger);
     }
 
-    /// The receiver registry persists through `init_genesis` and comes back byte for byte on
-    /// reload (short-shielded-address task 6, `META_RECEIVERS` — task 4's storage work, exercised
-    /// here for the first time): `Storage::receivers()` answers the same map `Ledger::receivers`
-    /// held before the write, and a restarting node's ledger (`reload_ledger`) carries it too, so
-    /// the state root the registry contributes agrees before and after a restart.
-    #[test]
-    fn the_receiver_registry_round_trips_through_meta_and_reload() {
-        let (_d, storage, mut gs) = fresh_genesis_state();
-        let signing = receiver_signing_keypair(&[4; 32]);
-        let rec = ReceiverRecord::sign(&signing, gs.chain_id, 1, [4; 8], vec![4; KEM_EK_BYTES]);
-        // `Ledger::apply_register_receiver` is `pub(crate)` to `randprotocol-core` and unreachable
-        // from this crate's tests; `set_receivers` (public) does the same insert directly.
-        let mut receivers = gs.ledger.receivers().clone();
-        receivers.insert(rec.id(), rec.clone());
-        gs.ledger.set_receivers(receivers);
-        storage.init_genesis(&gs).unwrap();
-        assert_eq!(storage.receivers().unwrap().get(&rec.id()), Some(&rec));
-        let reloaded = crate::node::reload_ledger(&storage, &gs, &StubExecutor).unwrap();
-        assert_eq!(reloaded.receivers(), gs.ledger.receivers());
-        assert_eq!(reloaded.state_root(), gs.ledger.state_root());
-    }
-
     /// S3: the bridge column families, end to end. A bridged chain's state root has a fifth
     /// component, so a node that reloaded without the bridge would compute a different root
     /// than the blocks it produced before the restart — and one that reloaded only the
@@ -2325,7 +2220,7 @@ mod tests {
 
         // The deposit note is leaf 2 — after the fee bundle's two — and is served like any
         // other, so a wallet scanning the tree finds its bridged deposit.
-        let deposit = randprotocol_core::ledger::bridge_notes::deposit_note(&att, &reloaded, &StubExecutor).unwrap();
+        let deposit = randprotocol_core::ledger::bridge_notes::deposit_note(&att, back, &StubExecutor).unwrap();
         let row = s.note(2).unwrap().expect("the deposit note is indexed");
         assert_eq!((row.cm, row.envelope), deposit);
         assert_eq!(row.height, 1);
@@ -2642,7 +2537,8 @@ mod tests {
                 s.note(withdraw_leaf).unwrap().expect("the withdraw's deposit is indexed at the leaf it named");
             assert_eq!(withdraw_row.height, 2, "attest_first={attest_first}");
 
-            let expected_deposit = randprotocol_core::ledger::bridge_notes::deposit_note(&att, &ledger, &StubExecutor)
+            let bridge = ledger.bridge().expect("bridged genesis");
+            let expected_deposit = randprotocol_core::ledger::bridge_notes::deposit_note(&att, bridge, &StubExecutor)
                 .expect("the attestation registered an asset and deposits into it");
             let deposit_leaf = (base..base + 4)
                 .find(|&i| s.note(i).unwrap().expect("leaf in range").cm == expected_deposit.0)
@@ -3269,7 +3165,6 @@ mod seal_tests {
     use super::*;
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
-    use randprotocol_core::receiver::{receiver_signing_keypair, ReceiverRecord};
     use randprotocol_core::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
     use randprotocol_core::types::{CoveredBundle, DeclaredShape, FriProfile};
     use randprotocol_core::{Keypair, Transaction};
@@ -3316,33 +3211,12 @@ mod seal_tests {
         }
     }
 
-    /// The receiver-registration transaction and the aggregator-registration transaction that
-    /// names it, in that order — a caller applies (and blocks) both, the receiver's first, so the
-    /// aggregator's payout id resolves (short-shielded-address task 4: the registry, not the
-    /// register, now owns the note key).
-    fn register_tx(l: &Ledger, kp: &Keypair, bond: u64) -> (Transaction, Transaction) {
-        let payout_kp = receiver_signing_keypair(&[7; 32]);
-        let record = ReceiverRecord::sign(&payout_kp, l.chain_id(), 1, [7; 8], vec![8; randprotocol_core::notes::KEM_EK_BYTES]);
-        let payout = record.id();
-        let mut rb = randprotocol_core::notes::Bundle {
-            anchor: l.root(),
-            nullifiers: [[15; 8], [16; 8]],
-            commitments: [[17; 8], [18; 8]],
-            fee: randprotocol_core::gas::BUNDLE_BASE,
-            burn: 0,
-            asset: 0,
-            time: 1,
-            envelopes: [env(5), env(6)],
-            proof: vec![],
-        };
-        let rd = StubExecutor.bundle_digest(&rb.digest_input());
-        rb.proof = StubExecutor::make_bundle_proof(&HC, &rd);
-        let receiver_tx = Transaction::shielded(l.chain_id(), rb, Action::RegisterReceiver { record });
-
+    fn register_tx(l: &Ledger, kp: &Keypair, bond: u64) -> Transaction {
+        let payout = randprotocol_core::notes::ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
         let registration = AggregatorRegistration {
             public_key: kp.public_key().clone(),
-            payout,
-            signature: kp.sign(aggregator_register_message(l.chain_id(), &payout).as_bytes()),
+            payout: payout.clone(),
+            signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
         };
         let mut b = randprotocol_core::notes::Bundle {
             anchor: l.root(),
@@ -3357,8 +3231,7 @@ mod seal_tests {
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d);
-        let aggregator_tx = Transaction::shielded(l.chain_id(), b, Action::RegisterAggregator { registration });
-        (receiver_tx, aggregator_tx)
+        Transaction::shielded(7, b, Action::RegisterAggregator { registration })
     }
 
     /// A gated chain of two committed blocks: block 1 carries the covered bundle (a real
@@ -3378,12 +3251,11 @@ mod seal_tests {
         let mut covered_tx = bundle_tx(&gs.ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee);
         covered_tx.bundle.as_mut().unwrap().proof = proof.to_bytes();
         let stub_twin = bundle_tx(&gs.ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee);
-        let (receiver_reg, register) = register_tx(&gs.ledger, &key(7), cfg.bond);
+        let register = register_tx(&gs.ledger, &key(7), cfg.bond);
         let mut l1 = gs.ledger.clone();
         l1.set_height(1);
         l1.set_timestamp_ms(1);
-        l1.apply_transactions(&[stub_twin.clone(), receiver_reg.clone(), register.clone()], &key(1).address(), &StubExecutor)
-            .unwrap();
+        l1.apply_transactions(&[stub_twin.clone(), register.clone()], &key(1).address(), &StubExecutor).unwrap();
         l1.record_anchor(1);
         // The ledger applied the stub twin, so its coverable entry is keyed by the twin's hash;
         // the stored bundle (and the aggregate's cover) is the real-proof one. Re-key it.
@@ -3391,7 +3263,7 @@ mod seal_tests {
         let entry = fees.remove(&stub_twin.hash()).expect("the twin was bucketed");
         fees.insert(covered_tx.hash(), entry);
         l1.set_unsealed_fees(fees);
-        let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), receiver_reg, register], &key(1));
+        let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), register], &key(1));
         storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
 
         let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
@@ -3417,14 +3289,12 @@ mod seal_tests {
             Some((aggregate.hash(), 2)),
             "the mark: sealed by this aggregate, at its block"
         );
-        // Block 1 carries the receiver's and the register's bundles too, and nobody covers
-        // either: its flag stays down...
+        // Block 1 carries the register's bundle too, which nobody covers: its flag stays down...
         let block1 = storage.block_by_height(1).unwrap().unwrap();
         assert!(!storage.block_sealed(&block1.hash()).unwrap(), "a bundle short of full coverage keeps the flag down");
-        // ...until a second aggregate covers both of them as well.
-        let receiver_tx = &block1.transactions[1];
-        let register_tx = &block1.transactions[2];
-        let second = aggregate_tx(&key(7), 1, 3, vec![receiver_tx.hash(), register_tx.hash()], b"ok".to_vec());
+        // ...until a second aggregate covers the register's bundle as well.
+        let register_tx = &block1.transactions[1];
+        let second = aggregate_tx(&key(7), 1, 3, vec![register_tx.hash()], b"ok".to_vec());
         let l3 = {
             let mut l = storage.load_ledger(&StubExecutor).unwrap();
             l.set_height(3);
@@ -3473,7 +3343,7 @@ mod seal_tests {
         // unsealed bundle both stay raw.
         assert!(matches!(storage.tx_record(&aggregate.hash()).unwrap().unwrap(), TxRecord::Raw { .. }), "an aggregate is never pruned");
         let block1 = storage.block_by_height(1).unwrap().unwrap();
-        let register_tx = &block1.transactions[2];
+        let register_tx = &block1.transactions[1];
         assert!(matches!(storage.tx_record(&register_tx.hash()).unwrap().unwrap(), TxRecord::Raw { .. }), "an unsealed bundle is never pruned");
     }
 
@@ -3507,14 +3377,13 @@ mod seal_tests {
         // the registration.
         let fee = randprotocol_core::gas::BUNDLE_BASE + 60;
         let covered_tx = bundle_tx(&gs.ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee);
-        let (receiver_reg, register) = register_tx(&gs.ledger, &key(7), 100 * randprotocol_core::UNITS_PER_RAND);
+        let register = register_tx(&gs.ledger, &key(7), 100 * randprotocol_core::UNITS_PER_RAND);
         let mut l1 = gs.ledger.clone();
         l1.set_height(1);
         l1.set_timestamp_ms(1);
-        l1.apply_transactions(&[covered_tx.clone(), receiver_reg.clone(), register.clone()], &key(1).address(), &StubExecutor)
-            .unwrap();
+        l1.apply_transactions(&[covered_tx.clone(), register.clone()], &key(1).address(), &StubExecutor).unwrap();
         l1.record_anchor(1);
-        let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), receiver_reg, register], &key(1));
+        let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), register], &key(1));
         storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
 
         // The covered record as the pruned form carries it: the 34 public values (with the

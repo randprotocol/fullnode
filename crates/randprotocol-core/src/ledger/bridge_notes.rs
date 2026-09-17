@@ -20,10 +20,10 @@
 
 use super::{Ledger, TxError};
 use crate::bridge::{
-    asset_id, Attestation, AssetId, AttestOutcome, AttestPlan, BridgeError, CheckedAttestation, Payload,
+    asset_id, Attestation, AssetId, AttestOutcome, AttestPlan, BridgeError, BridgeState, CheckedAttestation, Payload,
 };
 use crate::confidential::ConfidentialExecutor;
-use crate::notes::{Envelope, Word8};
+use crate::notes::{Envelope, ShieldedAddress, Word8};
 use crate::types::{Action, Transaction};
 
 /// The `from` field of a deposit note: a deposit has no sender inside the pool, so the note
@@ -83,22 +83,18 @@ pub(super) fn validate(
                 if t.info.index != *asset {
                     return Err(TxError::AttestAssetMismatch { expected: t.info.index, actual: *asset });
                 }
-                // The wire format's 32-byte recipient slot is a receiver id itself now
-                // (short-shielded-address task 5), so this is a direct equality rather than a
-                // hash compare. Without it the submitter would choose who receives it.
-                if recipient.0 != t.to_hash {
+                // The wire format has 32 bytes for a recipient and a shielded address is
+                // ~1.2 KB, so the depositor named a hash and this transaction carries the
+                // address. Without this equality the submitter would choose who receives it.
+                if recipient.recipient_hash() != t.to_hash {
                     return Err(TxError::BridgeRecipientMismatch);
                 }
-                // The id has to resolve to a note-owning `pk` before there is anything to deposit
-                // into: an id the registry holds no record for is refused rather than deposited
-                // to nowhere.
-                let pk = ledger.resolve_pk(recipient).ok_or(TxError::Bridge(BridgeError::UnknownReceiver(*recipient)))?;
                 // The deposit note is this transaction's third commitment, and `apply` appends
                 // it after the fee bundle's two. Checking it against both the tree and that
                 // bundle keeps `validate` and `apply` in agreement — the mempool admits on
                 // `validate`, so a gap here would be a transaction that is accepted and then
                 // fails the block it lands in.
-                let cm = deposit_commitment(&pk, t.amount, t.info.index, *time, r, executor);
+                let cm = deposit_commitment(recipient, t.amount, t.info.index, *time, r, executor);
                 let in_fee_bundle = tx.bundle.as_ref().is_some_and(|b| b.commitments.contains(&cm));
                 if ledger.has_commitment(&cm) || in_fee_bundle {
                     return Err(TxError::CommitmentExists(cm));
@@ -165,16 +161,13 @@ pub(super) fn apply(
     match action {
         Action::BridgeAttest { recipient, r, time, .. } => {
             let checked = checked.expect("validate returns the checked attestation for an attest");
-            // Resolved before the mutable borrow below: `validate` already required this to
-            // resolve, so this can only fail here on a torn apply.
-            let pk = ledger.resolve_pk(recipient).ok_or(TxError::Bridge(BridgeError::UnknownReceiver(*recipient)))?;
             let bridge = ledger.bridge_mut().ok_or(TxError::Bridge(BridgeError::Disabled))?;
             // Consumes the digest and registers the asset if this is its first sighting. No
             // signature work: the quorum was verified once, in `validate`, and this is the
             // token that proves it.
             match bridge.apply_attest(checked) {
                 AttestOutcome::Minted(t) => {
-                    let cm = deposit_commitment(&pk, t.amount, t.info.index, *time, r, executor);
+                    let cm = deposit_commitment(recipient, t.amount, t.info.index, *time, r, executor);
                     ledger.deposit(cm, executor)?;
                 }
                 // Governance only: a rotation moves guardian keys and no value.
@@ -214,23 +207,19 @@ pub(super) fn apply(
 /// no identity to pay. Minting the gross keeps what the pool holds equal to what the source
 /// chain locked; netting it would burn the difference forever.
 ///
-/// Public because every one of these five inputs is public on the wire or in the registry, so a
-/// recipient can rebuild the note the chain appended without opening any envelope — which is what
-/// the node's `tx_json` renders the commitment from and what a wallet recovers a griefed deposit
-/// with (`docs/bridge.md` §8).
-///
-/// `pk` is the note-owning key the receiver id resolved to (`Ledger::resolve_pk`), not the id
-/// itself (short-shielded-address task 5): the id is 32 bytes of identity, and `pk` is the
-/// separate word the note is actually keyed to.
+/// Public because every one of these five inputs is public on the wire, so a recipient can
+/// rebuild the note the chain appended without opening any envelope — which is what the node's
+/// `tx_json` renders the commitment from and what a wallet recovers a griefed deposit with
+/// (`docs/bridge.md` §8).
 pub fn deposit_commitment(
-    pk: &Word8,
+    recipient: &ShieldedAddress,
     amount: u64,
     asset: u32,
     time: u32,
     r: &Word8,
     executor: &dyn ConfidentialExecutor,
 ) -> Word8 {
-    executor.note_commitment(pk, &DEPOSIT_FROM, amount, asset, time, r)
+    executor.note_commitment(&recipient.pk, &DEPOSIT_FROM, amount, asset, time, r)
 }
 
 /// What an attestation's payload would deposit, from the wire bytes alone: the asset it names
@@ -256,27 +245,24 @@ pub fn attested_transfer(attestation: &[u8]) -> Option<(AssetId, u64)> {
 /// amount or the owner. A node that indexes every note for wallets to scan has to compute it
 /// the same way, and this is that one function.
 ///
-/// `ledger` may be the state from either side of the transaction: an asset index is assigned
-/// once and never changes and a receiver record's `pk` never moves across a rotation either, so
-/// the registries *after* the attestation answer exactly as they did before it.
+/// `bridge` may be the state from either side of the transaction: an asset index is assigned
+/// once and never changes, so the registry *after* the attestation answers exactly as the
+/// registry before it did.
 ///
 /// `None` for any other action, and for an attestation that deposits nothing (a rotation) or
 /// that does not decode — the latter being a torn block, not a live possibility, for a
-/// transaction that was committed. Also `None` for a receiver id the registry does not hold,
-/// which is likewise unreachable on a committed transaction: `validate` refuses it
-/// (`BridgeError::UnknownReceiver`) before it is ever admitted.
+/// transaction that was committed.
 pub fn deposit_note(
     tx: &Transaction,
-    ledger: &Ledger,
+    bridge: &BridgeState,
     executor: &dyn ConfidentialExecutor,
 ) -> Option<(Word8, Envelope)> {
     let Action::BridgeAttest { attestation, recipient, r, time, asset: _, envelope } = &tx.action else {
         return None;
     };
     let (asset, amount) = attested_transfer(attestation)?;
-    let index = ledger.bridge()?.asset_index(&asset)?;
-    let pk = ledger.resolve_pk(recipient)?;
-    Some((deposit_commitment(&pk, amount, index, *time, r, executor), envelope.clone()))
+    let index = bridge.asset_index(&asset)?;
+    Some((deposit_commitment(recipient, amount, index, *time, r, executor), envelope.clone()))
 }
 
 #[cfg(test)]
@@ -290,9 +276,8 @@ mod tests {
     use crate::crypto::{Address, Keypair};
     use crate::gas;
     use crate::ledger::TIME_WINDOW;
-    use crate::notes::{Bundle, Envelope, KEM_EK_BYTES};
+    use crate::notes::{Bundle, Envelope, ShieldedAddress};
     use crate::ledger::ValidatorEntry;
-    use crate::receiver::{receiver_signing_keypair, ReceiverId, ReceiverRecord};
 
     const HC: Word8 = [11; 8];
     /// The canonical test token, native to chain 2, which registers as asset index 1.
@@ -331,8 +316,6 @@ mod tests {
     }
 
     /// A ledger at height 1 with a bridge, and the guardian secrets that can attest to it.
-    /// [`recipient_id`] is registered from the start, so every happy-path deposit test lands on
-    /// a receiver the registry already resolves.
     fn ledger() -> (Ledger, Vec<[u8; 32]>) {
         let k = proposer();
         // Phase S2's v2 register leaf; nothing in this module reads a field of it beyond the
@@ -342,7 +325,7 @@ mod tests {
             stake: 10,
             pending: Vec::new(),
             rewards: 0,
-            payout: crate::receiver::ReceiverId([1; 32]),
+            payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
             nonce: 0,
         };
         let mut l = Ledger::new(7, HC, [(k.address(), entry)].into_iter().collect(), &StubExecutor);
@@ -350,13 +333,6 @@ mod tests {
         l.set_bridge(Some(BridgeState::from_config(&config)));
         l.set_height(1);
         l.set_timestamp_ms(1_000_000);
-        l.apply_register_receiver(&ReceiverRecord::sign(
-            &recipient_signing(),
-            l.chain_id(),
-            1,
-            recipient_pk(),
-            vec![6; KEM_EK_BYTES],
-        ));
         (l, secrets)
     }
 
@@ -385,23 +361,8 @@ mod tests {
         bundle(l, nfs, cms, fee, 0, 0)
     }
 
-    /// The receiver every happy-path deposit in this module lands on: [`ledger`] registers it
-    /// up front, at seed [`RECIPIENT_SEED`] — distinct from the guardian secrets (`1..=6`) and
-    /// from the unregistered id [`a_deposit_to_an_unregistered_receiver_is_refused_and_a_registered_one_lands_on_its_pk`]
-    /// builds itself, so neither collides with the other.
-    const RECIPIENT_SEED: u8 = 50;
-
-    fn recipient_signing() -> Keypair {
-        receiver_signing_keypair(&[RECIPIENT_SEED; 32])
-    }
-
-    fn recipient_id() -> ReceiverId {
-        ReceiverId::from(recipient_signing().public_key())
-    }
-
-    /// The note-owning key [`recipient_id`]'s record resolves to.
-    fn recipient_pk() -> Word8 {
-        [4; 8]
+    fn recipient() -> ShieldedAddress {
+        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
     }
 
     /// The same `body` signed by five keys that are in no guardian set. Everything about it
@@ -459,7 +420,7 @@ mod tests {
     /// The transaction a relayer submits for `attestation`, naming `to` as the recipient and the
     /// index the ledger would deposit under. Its fee bundle's four words are `seed..seed + 3`, so
     /// transactions with different seeds never collide on a nullifier or a commitment.
-    fn attest_tx(l: &Ledger, attestation: Vec<u8>, to: ReceiverId, seed: u32) -> Transaction {
+    fn attest_tx(l: &Ledger, attestation: Vec<u8>, to: ShieldedAddress, seed: u32) -> Transaction {
         let asset = expected_index(l, &attestation);
         Transaction::shielded(
             7,
@@ -485,15 +446,15 @@ mod tests {
 
     /// Applies one attestation of `amount` to `recipient()`, registering [`TOKEN`] as asset 1.
     fn deposit(l: &mut Ledger, secrets: &[[u8; 32]], amount: u128, sequence: u64, seed: u32) -> Transaction {
-        let a = attest(secrets, transfer(amount, 0, recipient_id().0, sequence));
-        let tx = attest_tx(l, a, recipient_id(), seed);
+        let a = attest(secrets, transfer(amount, 0, recipient().recipient_hash(), sequence));
+        let tx = attest_tx(l, a, recipient(), seed);
         l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
         tx
     }
 
     /// What the ledger must have computed for the deposit note of `amount` in asset `asset`.
     fn expected_cm(height: u32, amount: u64, asset: u32) -> Word8 {
-        StubExecutor.note_commitment(&recipient_pk(), &[0; 8], amount, asset, height, &[7; 8])
+        StubExecutor.note_commitment(&recipient().pk, &[0; 8], amount, asset, height, &[7; 8])
     }
 
     /// The whole deposit path: the guardians' amount, the registry's index and the recipient's
@@ -511,32 +472,10 @@ mod tests {
         assert_eq!(bridge.spent.len(), 1, "the digest is consumed");
         // The relayer fee has no payee on a shielded chain, so the gross amount is deposited:
         // a second attestation of the same amount with a fee produces the same note.
-        let a = attest(&secrets, transfer(1_000, 250, recipient_id().0, 1));
-        let with_fee = attest_tx(&l, a, recipient_id(), 30);
+        let a = attest(&secrets, transfer(1_000, 250, recipient().recipient_hash(), 1));
+        let with_fee = attest_tx(&l, a, recipient(), 30);
         assert_eq!(l.validate(&with_fee, &StubExecutor), Err(TxError::CommitmentExists(cm)));
         assert_ne!(tx.hash(), with_fee.hash());
-    }
-
-    /// A deposit to a receiver id the registry does not hold is refused — there is no `pk` to
-    /// deposit the note under — and registering it is exactly what makes the same transaction
-    /// admissible and its note land on the record's `pk`. `id` is fresh (seed 4, distinct from
-    /// [`RECIPIENT_SEED`]'s 50 and the guardian secrets' `1..=6`), so it starts out unregistered.
-    #[test]
-    fn a_deposit_to_an_unregistered_receiver_is_refused_and_a_registered_one_lands_on_its_pk() {
-        let (mut l, secrets) = ledger();
-        let signing = receiver_signing_keypair(&[4; 32]);
-        let id = ReceiverId::from(signing.public_key());
-        let a = attest(&secrets, transfer(500, 0, id.0, 0));
-        let tx = attest_tx(&l, a, id, 60);
-        assert!(matches!(
-            l.validate(&tx, &StubExecutor),
-            Err(TxError::Bridge(BridgeError::UnknownReceiver(r))) if r == id
-        ));
-        l.apply_register_receiver(&ReceiverRecord::sign(&signing, l.chain_id(), 1, [4; 8], vec![4; KEM_EK_BYTES]));
-        l.validate(&tx, &StubExecutor).unwrap();
-        let cm = l.derived_commitment(&tx.action, &StubExecutor).unwrap();
-        let Action::BridgeAttest { time, r, .. } = &tx.action else { panic!("an attest") };
-        assert_eq!(cm, StubExecutor.note_commitment(&[4; 8], &DEPOSIT_FROM, 500, 1, *time, r));
     }
 
     /// The deposit note's `time` word is the one the action published, never the height the
@@ -548,8 +487,8 @@ mod tests {
         let (mut l, secrets) = ledger();
         l.set_height(9);
         l.record_anchor(9);
-        let a = attest(&secrets, transfer(1_000, 0, recipient_id().0, 0));
-        let mut tx = attest_tx(&l, a, recipient_id(), 20);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let mut tx = attest_tx(&l, a, recipient(), 20);
         let Action::BridgeAttest { time, .. } = &mut tx.action else { panic!("an attest") };
         *time = 5;
         // The same note, named before the transaction is applied: this is what a mempool claims
@@ -561,7 +500,7 @@ mod tests {
         assert!(!l.has_commitment(&expected_cm(9, 1_000, 1)), "and not the one the apply height would");
         // The recompute-after-the-fact path reads the same word off the committed action, so a
         // node's note index agrees with the tree whatever height it asks about.
-        let (cm, _) = deposit_note(&tx, &l, &StubExecutor).expect("a transfer deposits a note");
+        let (cm, _) = deposit_note(&tx, l.bridge().unwrap(), &StubExecutor).expect("a transfer deposits a note");
         assert_eq!(cm, expected_cm(5, 1_000, 1));
     }
 
@@ -573,14 +512,14 @@ mod tests {
     #[test]
     fn an_oversized_attestation_derives_no_note() {
         let (l, secrets) = ledger();
-        let a = attest(&secrets, transfer(1_000, 0, recipient_id().0, 0));
-        let tx = attest_tx(&l, a, recipient_id(), 20);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let tx = attest_tx(&l, a, recipient(), 20);
         assert!(l.derived_commitment(&tx.action, &StubExecutor).is_some(), "the admissible one names its note");
 
         // Bytes that really do decode — the same body with its quorum's first signature repeated
         // to the codec's 255-signature ceiling — so what the check stops is the decode itself and
         // not a parse failure standing in for it.
-        let body = transfer(1_000, 0, recipient_id().0, 0);
+        let body = transfer(1_000, 0, recipient().recipient_hash(), 0);
         let d = digest(&body.encode());
         let one = sign_digest(&secrets[0], 0, &d);
         let big = Attestation { guardian_set_index: 0, signatures: vec![one; 250], body }.encode();
@@ -604,8 +543,8 @@ mod tests {
         let height = TIME_WINDOW + 20;
         l.set_height(height);
         l.record_anchor(height);
-        let a = attest(&secrets, transfer(1_000, 0, recipient_id().0, 0));
-        let tx = attest_tx(&l, a, recipient_id(), 20);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let tx = attest_tx(&l, a, recipient(), 20);
         let at = |time: u32| {
             let mut tx = tx.clone();
             let Action::BridgeAttest { time: t, .. } = &mut tx.action else { panic!("an attest") };
@@ -637,7 +576,8 @@ mod tests {
     fn a_deposit_note_is_recomputable_from_the_committed_transaction() {
         let (mut l, secrets) = ledger();
         let tx = deposit(&mut l, &secrets, 1_000, 0, 20);
-        let (cm, envelope) = deposit_note(&tx, &l, &StubExecutor).expect("a transfer deposits a note");
+        let bridge = l.bridge().unwrap();
+        let (cm, envelope) = deposit_note(&tx, bridge, &StubExecutor).expect("a transfer deposits a note");
         assert_eq!(cm, expected_cm(1, 1_000, 1));
         assert!(l.has_commitment(&cm));
         assert_eq!(envelope, env(), "paired with the envelope that opens it");
@@ -656,19 +596,19 @@ mod tests {
             })
             .encode(),
         };
-        let upgrade = attest_tx(&l, attest(&secrets, rotation), recipient_id(), 30);
-        assert_eq!(deposit_note(&upgrade, &l, &StubExecutor), None);
+        let upgrade = attest_tx(&l, attest(&secrets, rotation), recipient(), 30);
+        assert_eq!(deposit_note(&upgrade, bridge, &StubExecutor), None);
         let plain = Transaction { chain_id: 7, bundle: None, action: Action::None };
-        assert_eq!(deposit_note(&plain, &l, &StubExecutor), None);
+        assert_eq!(deposit_note(&plain, bridge, &StubExecutor), None);
     }
 
-    /// The 32-byte `to` field binds the deposit to one receiver id. A submitter who swaps in
-    /// their own id is refused rather than handed someone else's deposit.
+    /// The 32-byte `to` field binds the deposit to one shielded address. A submitter who swaps
+    /// in their own address is refused rather than handed someone else's deposit.
     #[test]
     fn an_attestation_for_a_different_recipient_is_refused() {
         let (l, secrets) = ledger();
-        let a = attest(&secrets, transfer(1_000, 0, recipient_id().0, 0));
-        let thief = ReceiverId([9; 32]);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let thief = ShieldedAddress { pk: [9; 8], kem_ek: vec![6; 32] };
         let tx = attest_tx(&l, a, thief, 20);
         assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::BridgeRecipientMismatch));
     }
@@ -683,8 +623,8 @@ mod tests {
         deposit(&mut l, &secrets, 1_000, 0, 20);
         // A second transfer of the same, now registered, token: index 1 for as long as the chain
         // exists, which is what makes every other index a mistake rather than a race.
-        let a = attest(&secrets, transfer(500, 0, recipient_id().0, 1));
-        let honest = attest_tx(&l, a, recipient_id(), 30);
+        let a = attest(&secrets, transfer(500, 0, recipient().recipient_hash(), 1));
+        let honest = attest_tx(&l, a, recipient(), 30);
         assert_eq!(l.validate(&honest, &StubExecutor), Ok(()));
         let mu = honest.bridge_digests()[0];
         for wrong in [0, 2, 9] {
@@ -715,8 +655,8 @@ mod tests {
     fn a_wrong_asset_index_is_refused_before_any_signature_recovery() {
         let (mut l, secrets) = ledger();
         deposit(&mut l, &secrets, 1_000, 0, 20);
-        let forged = misattest(transfer(500, 0, recipient_id().0, 1));
-        let tx = attest_tx(&l, forged, recipient_id(), 30);
+        let forged = misattest(transfer(500, 0, recipient().recipient_hash(), 1));
+        let tx = attest_tx(&l, forged, recipient(), 30);
         assert_eq!(
             l.validate(&naming_asset(tx.clone(), 2), &StubExecutor),
             Err(TxError::AttestAssetMismatch { expected: 1, actual: 2 }),
@@ -728,8 +668,8 @@ mod tests {
         );
         // A first sighting is screened the same way, off `next_index` rather than an entry: no
         // registry row exists for this token, and still no signature is recovered to say so.
-        let other = misattest(transfer_of(OTHER_TOKEN, 700, 0, recipient_id().0, 2));
-        let tx = attest_tx(&l, other, recipient_id(), 40);
+        let other = misattest(transfer_of(OTHER_TOKEN, 700, 0, recipient().recipient_hash(), 2));
+        let tx = attest_tx(&l, other, recipient(), 40);
         assert_eq!(
             l.validate(&naming_asset(tx.clone(), 1), &StubExecutor),
             Err(TxError::AttestAssetMismatch { expected: 2, actual: 1 }),
@@ -747,8 +687,8 @@ mod tests {
     fn a_first_sighting_attest_binds_the_index_it_will_be_assigned() {
         let (mut l, secrets) = ledger();
         // Nothing is registered, so this transfer's note will be asset 1 (`FIRST_ASSET_INDEX`).
-        let a = attest(&secrets, transfer(1_000, 0, recipient_id().0, 0));
-        let pending = attest_tx(&l, a, recipient_id(), 40);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let pending = attest_tx(&l, a, recipient(), 40);
         assert_eq!(
             l.validate(&naming_asset(pending.clone(), 2), &StubExecutor),
             Err(TxError::AttestAssetMismatch { expected: 1, actual: 2 }),
@@ -758,8 +698,8 @@ mod tests {
 
         // Another token's first sighting commits in the window the first was being proved in, and
         // takes index 1.
-        let other = attest(&secrets, transfer_of(OTHER_TOKEN, 700, 0, recipient_id().0, 1));
-        let winner = attest_tx(&l, other, recipient_id(), 50);
+        let other = attest(&secrets, transfer_of(OTHER_TOKEN, 700, 0, recipient().recipient_hash(), 1));
+        let winner = attest_tx(&l, other, recipient(), 50);
         l.apply_tx(&winner, &proposer().address(), &StubExecutor).unwrap();
         let bridge = l.bridge().unwrap();
         assert_eq!(bridge.asset_index(&asset_id(2, &OTHER_TOKEN)), Some(1), "the race winner took 1");
@@ -786,8 +726,8 @@ mod tests {
     fn a_replayed_attestation_is_refused() {
         let (mut l, secrets) = ledger();
         deposit(&mut l, &secrets, 1_000, 0, 20);
-        let a = attest(&secrets, transfer(1_000, 0, recipient_id().0, 0));
-        let again = attest_tx(&l, a, recipient_id(), 30);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let again = attest_tx(&l, a, recipient(), 30);
         assert_eq!(l.validate(&again, &StubExecutor), Err(TxError::Bridge(BridgeError::Replay)));
     }
 
@@ -947,8 +887,8 @@ mod tests {
     #[test]
     fn the_bridge_actions_are_refused_without_a_bridge() {
         let (mut l, secrets) = ledger();
-        let a = attest(&secrets, transfer(1_000, 0, recipient_id().0, 0));
-        let tx = attest_tx(&l, a, recipient_id(), 20);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let tx = attest_tx(&l, a, recipient(), 20);
         let burn = burn_tx(&l, 1, 400, 100, |_| {});
         l.set_bridge(None);
         for t in [&tx, &burn] {

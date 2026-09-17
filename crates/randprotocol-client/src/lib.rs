@@ -20,7 +20,6 @@ use randprotocol_core::types::CallEnvelope;
 use randprotocol_core::{Hash, Transaction};
 use std::time::{Duration, Instant};
 
-pub mod receiver;
 pub mod wallet;
 
 /// One leaf of the commitment tree as `rand_getCommitments` reports it: the leaf index, the
@@ -215,53 +214,12 @@ impl RpcClient {
     /// answers with an error rather than forwarding, since only a validator's signature admits
     /// a mint (spec §6).
     pub async fn mint_shielded(&self, to: &str, amount: Option<u64>) -> Result<Hash> {
-        self.mint_shielded_with_record(to, amount, None).await
-    }
-
-    /// The same mint, carrying the recipient's own record as `rand_mint`'s third parameter —
-    /// the first-contact path (spec §6.3). A node resolves `to` from its registry when the
-    /// parameter is absent, which a wallet that has never registered is not in; handing over the
-    /// record it signed itself is how a fresh wallet gets its first note, and the node verifies
-    /// it under the id like everyone else.
-    pub async fn mint_shielded_with_record(
-        &self,
-        to: &str,
-        amount: Option<u64>,
-        record: Option<&randprotocol_core::receiver::ReceiverRecord>,
-    ) -> Result<Hash> {
-        let amount = amount.map(|a| a.to_string());
-        let record = record.map(|r| {
-            serde_json::to_value(randprotocol_core::genesis::ReceiverRecordHex::from_record(r))
-                .expect("a record's hex form serializes")
-        });
-        let params = match (amount, record) {
-            (Some(a), Some(r)) => json!([to, a, r]),
-            (Some(a), None) => json!([to, a]),
-            (None, Some(r)) => json!([to, Value::Null, r]),
-            (None, None) => json!([to]),
+        let params = match amount {
+            Some(a) => json!([to, a.to_string()]),
+            None => json!([to]),
         };
         let v = self.call("rand_mint", params).await?;
         Hash::from_hex(v.as_str().unwrap_or("")).map_err(|e| anyhow!("bad hash in reply: {e}"))
-    }
-
-    /// The receiver registry as the chain holds it (`rand_getReceiver`): the current record for
-    /// `id`, or `None` for an id nobody has registered — which is an answer, not a failure.
-    ///
-    /// Deliberately not what `rand send` resolves through (spec §5 ruling 2: lookups are the
-    /// explorer's). It is here for the paths where the *chain's own* registry is the authority
-    /// rather than a convenience: a bridge deposit, whose note `pk` the ledger takes from this
-    /// map, and a wallet asking whether it is registered yet.
-    pub async fn receiver(
-        &self,
-        id: &randprotocol_core::receiver::ReceiverId,
-    ) -> Result<Option<randprotocol_core::receiver::ReceiverRecord>> {
-        let v = self.call("rand_getReceiver", json!([id.to_string()])).await?;
-        if v.is_null() {
-            return Ok(None);
-        }
-        let hex: randprotocol_core::genesis::ReceiverRecordHex =
-            serde_json::from_value(v).context("rand_getReceiver did not return a receiver record")?;
-        Ok(Some(hex.to_record().map_err(|e| anyhow!("{e}"))?))
     }
 
     // ---- confidential computation ----

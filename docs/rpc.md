@@ -15,10 +15,8 @@ Conventions:
 - Validator addresses are base58 strings (32 bytes). Hashes are 64 hex characters, with or
   without `0x`. Shielded values (commitments, nullifiers, anchors, tree roots, witness levels) are
   `Word8` — eight little-endian `u32` words as 64 lowercase hex characters.
-- Shielded addresses are receiver ids, `rand1` + base58, 53–55 characters (chain 11; the
-  pre-chain-11 long form was `rand1` + base58(`pk` ‖ `kem_ek`), about 1668 characters, and is
-  refused by name — `docs/shielded.md` §2). A parameter longer than 2000 characters is refused on
-  its length before it is parsed.
+- Shielded addresses are `rand1` + base58, about 1668 characters. A parameter longer than 2000
+  characters is refused on its length before it is parsed.
 - Amounts are strings of smallest units (`"1500000000"` = 1.5 RAND); 1 RAND = 10^9 units.
   Amounts *inside a decoded transaction* are JSON integers instead — a bundle's `fee` and `burn`, a
   mint's amount, a staking action's amount — because they are being reported as the transaction's own
@@ -104,19 +102,9 @@ and the transaction names 1`, `the burn's asset bundle burns 399, not the 400 th
 Acceptance is not commitment: poll `rand_getTransaction` until it returns a block.
 
 ### `rand_mint` (testnet faucet)
-Params: `[address]`, `[address, amount]` or `[address, amount, record]`, where `address` is a
-`rand1…` receiver id (53–55 characters since chain 11), `amount` is a string of units, at most
-`100000000000` (100 RAND; the default, `null` also means the default), and the optional third
-parameter `record` is a receiver record as JSON — the same hex-field shape `rand address --record`
-prints (`ReceiverRecordHex`: `version`, `pk`, `kem_ek`, `signing_key`, `signature`). Result: the
-mint transaction hash.
-
-`record` is what makes a faucet mint a wallet's first contact with the chain: without it the node
-resolves `address` from its own receiver registry, which a brand-new wallet is not in yet, so a
-mint to *another* id is unaffected but a mint to a wallet's own id can carry the record it just
-signed. An address over 2000 characters or one that fails to parse is `-32602`
-`address: <the parser's own reason>`; a `record` that is not valid JSON in that shape, or that
-fails `ReceiverRecord::verify`, is `-32602` `record: <the reason>`.
+Params: `[address]` or `[address, amount]`, where `address` is a `rand1…` shielded address and
+`amount` is a string of units, at most `100000000000` (100 RAND; the default). Result: the mint
+transaction hash.
 
 Only available when the genesis file has `"faucet": true`; otherwise error `-32000`
 `faucet is disabled on this chain`. The node builds the note, seals an envelope to `address`
@@ -124,33 +112,6 @@ under a throwaway sender key, signs the `Mint` with its own validator key and su
 the normal mempool, so the mint goes through consensus and every node applies it. An observer has
 no validator key and answers `faucet mints are signed by validators; ask a validator node`. Poll
 `rand_getTransaction` for the commit.
-
-### `rand_getReceiver`
-Params: `[id]`, a `rand1…` receiver id. Result: the current `ReceiverRecord` as JSON, or `null` if
-nobody has ever registered that id — not an error, since asking is how a wallet finds out. An `id`
-that does not parse is `-32602`.
-
-```json
-→ {"method":"rand_getReceiver","params":["rand1q9f…"]}
-← {"id": "rand1q9f…", "version": 1,
-   "pk": "1111…1111", "kem_ek": "2222…2222", "signing_key": "3333…3333", "signature": "4444…4444"}
-```
-
-`id` in the reply is derived (`record.id()`), not a separate field to trust — a record's id is a
-function of its `signing_key`. `pk` is 64 hex characters (a `Word8`), `kem_ek` 2368 (1184 bytes),
-`signing_key` 2624 (the 1312-byte Dilithium2 public key) and `signature` 4840 (2420 bytes). This is
-also the shape of the `register_receiver` action's fields on `rand_getTransaction` (below), plus
-`"kind": "register_receiver"`.
-
-### `rand_getReceivers`
-Params: `[from]` or `[from, limit]` (final review of short shielded addresses: the unbounded form
-served the whole registry in one call). `from` is a `rand1…` receiver id, exclusive of that row, or
-`null`/absent for the start of the registry; `limit` is capped at 1000 however large it is asked
-for, like `rand_getUnsealed`. Result: `{ receivers: [...], next_from }`, a page of records in
-`ReceiverId` order (the registry's own `BTreeMap` order), each in the same shape as
-`rand_getReceiver`'s result. `next_from` is the last row's own id — pass it back as the next
-call's `from` to resume just past it — or `null` once the page reaches the end of the registry.
-Page until `next_from` is `null`. A `from` that does not parse is `-32602`.
 
 ### `rand_getCommitments`
 Params: `[from_index]` or `[from_index, limit]`. Result: a page of commitment-tree leaves from
@@ -385,7 +346,7 @@ The staking (phase S2) and bridge (phase S3) actions:
 - `{ "kind": "withdraw", "validator": "<base58>", "amount": 9, "nonce": 3, "time": 1994 }` — the
   deposit note's blinding and envelope are not rendered. `time` is the note's time word, which the
   withdrawing node chose; the note itself is worth `amount` less the bundle base.
-- `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "rand1…" /* the receiver id */,
+- `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>",
   "asset": 1, "asset_index": 1, "amount": 1000, "time": 41, "r": "<64 hex>",
   "commitment": "<64 hex>" }` — the amount and the asset are
   inside the attestation, so they are decoded out of it; `asset_index` is what the registry gave
@@ -404,10 +365,6 @@ The staking (phase S2) and bridge (phase S3) actions:
 - `{ "kind": "bridge_burn", "asset": 2, "amount": 400, "relayer_fee": 100, "to_chain": 5, "to":
   "abab…", "asset_bundle": { …same shape as `bundle`… } }` — `to` is the 32-byte destination
   address, hex. The asset bundle renders exactly like the fee bundle: same public fields, no more.
-- `register_receiver`: the record itself, in `record_json`'s shape (the same as
-  `rand_getReceiver`'s result — `id`, `version`, `pk`, `kem_ek`, `signing_key`, `signature`) with
-  `"kind": "register_receiver"` merged in. A record is meant to be public, so this is the one
-  action whose full contents are rendered rather than summarised.
 
 No reply from this method carries the sender, recipient, nonce or amount of a *transfer*: no such
 field exists in a stored transfer. The staking and bridge actions above are the deliberate
@@ -575,10 +532,9 @@ validator that has ever bonded, not the genesis set: `active` is the ones in the
 current epoch, and those are what the leader rotation runs over. Amounts are **decimal strings**,
 because a JSON number is not an exact integer past 2^53 and a stake is 10^9 units per RAND.
 `pending` is the unbonding queue, oldest first; `rewards` is the bundle fees credited to that
-validator as proposer; `payout` is the receiver id a `Withdraw` pays — resolved against
-`rand_getReceiver`'s registry at withdraw time, not carried in this row; `nonce` is what its next
-signed `Unbond` or `Withdraw` must carry. The register is the only place this chain stores amounts
-in the clear — `docs/staking.md` is the guide to it.
+validator as proposer; `payout` is where a `Withdraw` pays; `nonce` is what its next signed
+`Unbond` or `Withdraw` must carry. The register is the only place this chain stores amounts in the
+clear — `docs/staking.md` is the guide to it.
 
 ### `rand_getEpoch`
 Params: `[]`. Result: `{ "epoch": 41, "epoch_blocks": 1000, "next_set": ["…", "…"] }`. `epoch` is
@@ -717,24 +673,13 @@ Action::Bond { validator: Address, amount: u64, registration: Option<Registratio
 Action::Unbond { validator: Address, amount: u64, nonce: u64, signature: Signature }
 Action::Withdraw { validator: Address, amount: u64, nonce: u64, time: u32, r: Word8,
                    envelope: Envelope, signature: Signature }
-Action::BridgeAttest { attestation: Vec<u8>, recipient: ReceiverId, r: Word8, time: u32,
+Action::BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, time: u32,
                        asset: u32, envelope: Envelope }
 Action::BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee: u64,
                      to_chain: u16, to: [u8; 32] }
-Action::RegisterReceiver { record: ReceiverRecord }                     // chain 11
 
-Registration { public_key: PublicKey, payout: ReceiverId, signature: Signature }
-ReceiverRecord { version: u32, pk: Word8, kem_ek: Vec<u8>,              // 1184 bytes
-                 signing_key: PublicKey, signature: Signature }
+Registration { public_key: PublicKey, payout: ShieldedAddress, signature: Signature }
 ```
-
-`recipient`, `payout` and every staking/aggregation register's payout field are `ReceiverId` —
-32 bytes, `rand1…` text — since chain 11 (`docs/shielded.md` §2); the `pk`/`kem_ek` pair an
-envelope is sealed to lives in the `ReceiverRecord` the id resolves to, resolved from the receiver
-registry at validate/apply time, never carried inline in these fields. `RegisterReceiver` is a
-bundle-carrying action like `Bond`: its record must verify under the id it names for this chain,
-and its version must be exactly 1 (first registration) or the current version + 1 with the same
-`pk` (a rotation) — `rand_getReceiver`/`rand_getReceivers` above are its read side.
 
 A `Bond` must carry a bundle whose `burn` equals its `amount` — that is how the stake leaves the
 pool — and `registration` is present exactly when the validator is not in the register yet
@@ -783,39 +728,6 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
-
-### 2026-09-17 — short shielded addresses (chain 11): a hard fork
-
-**The address text form, the register/registry state, the bridge wire format and the state root
-change: a hard fork.** Implemented on branch `short-address`; chain 11 is not yet cut. A shielded
-address shrank from 1,667 characters (`rand1` + base58(`pk` ‖ `kem_ek`)) to 53–55 characters
-(`rand1` + base58(`id` ‖ `checksum`)) — a **receiver id**, `blake3` of a Dilithium2 signing key
-derived from the wallet's spend key, resolving to a signed, versioned **receiver record** that
-carries the `pk`/`kem_ek` pair a sender needs (`docs/shielded.md` §2). What a client can see:
-
-- **`rand_getReceiver(id)` / `rand_getReceivers()`** are new: the receiver registry, `Action::
-  RegisterReceiver { record }`'s read side.
-- **`rand_mint`** gains an optional third parameter, `record` — a receiver record JSON, for a
-  mint that is a brand-new wallet's first contact with the chain.
-- **`ReceiverId` replaces `ShieldedAddress`** in every register-state and bridge field that used
-  to carry a full address or a hash of one: `ValidatorEntry.payout`, `AggregatorEntry.payout`,
-  `Registration.payout`, `AggregatorRegistration.payout`, `BridgeAttest.recipient` (the wire's
-  32-byte `to` field carries the id directly now, not a hash of a ~1.2 KB address). Every one of
-  these resolves its `pk` from the receiver registry at validate/apply time; an id with no record
-  is refused (`UnknownReceiver`).
-- **`tx_json`** renders the new action as `register_receiver`, with the record's own fields
-  (`record_json`'s shape) merged in — a record is meant to be public.
-- **The state root** gains a new, always-present final component, the registry's merkle root over
-  per-id leaves (domain `rand-receiver-leaf-1`, `Ledger::state_root`) — appended after tree,
-  nullifiers, validators, programs and the optional bridge/aggregator roots, on every chain,
-  gated or not; the domain bumps to `rand-state-4`. The validator leaf domain bumps to
-  `rand-validator-leaf-3` and the aggregator leaf to `rand-aggregator-leaf-2`, both to carry a
-  payout id instead of a payout address/pk pair.
-- **The wallet** gains `rand request` (a payment-request URI carrying the record inline), `rand
-  register [--rotate]` (publish the record, or rotate to a fresh KEM key first), `rand address
-  --record`, and `rand send --record <file>` / `--registry <url>` / `--register`. `rand-node
-  genesis` gains repeatable `--receiver <RECORD.JSON>`, registered before any `--validator` or
-  `--alloc` is parsed.
 
 ### 2026-09-15 — block aggregation (chain 9): a hard fork
 

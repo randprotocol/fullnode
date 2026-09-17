@@ -26,19 +26,10 @@ struct Sim {
     down: Vec<bool>,
 }
 
-/// The receiver record a test validator (or a would-be one) registers under seed `i`, at the
-/// one chain id every simulation in this file uses. Deterministic, so `build`'s genesis and any
-/// later reference to the same `i` (a `Bond`'s registration, an aggregator's) name one record.
-fn receiver_record(i: u8) -> crate::receiver::ReceiverRecord {
-    let kp = crate::receiver::receiver_signing_keypair(&[i; 32]);
-    crate::receiver::ReceiverRecord::sign(&kp, 1, 1, [i as u32; 8], vec![i; crate::notes::KEM_EK_BYTES])
-}
-
 /// A payout address for a test validator: phase S2 makes it a required genesis field, and
-/// nothing in consensus reads it — it only has to resolve. Short form (spec docs
-/// 2026-09-17): the receiver id `receiver_record(i)` registers.
+/// nothing in consensus reads it — it only has to parse.
 fn payout(i: u8) -> String {
-    receiver_record(i).id().to_string()
+    crate::notes::ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; crate::notes::KEM_EK_BYTES] }.to_string()
 }
 
 /// The genesis every simulation runs: no notes, faucet on, so a block body can be built out
@@ -69,10 +60,6 @@ fn build(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool) -> Sim {
             })
             .collect(),
         alloc: Vec::new(),
-        // Every key in the simulation, not only the genesis validators: a joiner bonds with a
-        // registration naming one of these (`bond_tx`'s `payout_index`), and the record has to
-        // resolve on every replica's identical genesis ledger.
-        receivers: (1..=n).map(|i| crate::genesis::ReceiverRecordHex::from_record(&receiver_record(i))).collect(),
         faucet: true,
         confidential: true,
         fri_profile: "production".into(),
@@ -892,7 +879,6 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         timestamp_ms: 0,
         validators: vec![GenesisValidator { public_key: key.public_key().clone(), stake: crate::ledger::staking::MIN_STAKE as u128, payout: payout(1) }],
         alloc: Vec::new(),
-        receivers: vec![crate::genesis::ReceiverRecordHex::from_record(&receiver_record(1))],
         faucet: true,
         confidential: true,
         fri_profile: "production".into(),
@@ -1002,13 +988,11 @@ fn speculative_tree_is_capped() {
 
 use crate::ledger::staking::MIN_STAKE;
 use crate::ledger::Ledger;
-use crate::receiver::ReceiverId;
+use crate::notes::ShieldedAddress;
 use crate::types::actions::{registration_message, unbond_message, Registration};
 
-/// The receiver id `receiver_record(i)` registers — every `build`/`setup_epochs` genesis in
-/// this file registers `receiver_record(1..=n)`, so a `Bond`'s registration can name any of them.
-fn payout_addr(i: u8) -> ReceiverId {
-    receiver_record(i).id()
+fn payout_addr(i: u8) -> ShieldedAddress {
+    ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; crate::notes::KEM_EK_BYTES] }
 }
 
 /// A shielded bundle carrying `action`, anchored to `l`'s root and burning `burn`. The stub
@@ -1342,10 +1326,6 @@ fn aggregation_node_with(
             payout: payout(1),
         }],
         alloc: Vec::new(),
-        receivers: vec![
-            crate::genesis::ReceiverRecordHex::from_record(&receiver_record(1)),
-            crate::genesis::ReceiverRecordHex::from_record(&receiver_record(7)),
-        ],
         faucet: true,
         confidential: true,
         fri_profile: "production".into(),
@@ -1357,12 +1337,10 @@ fn aggregation_node_with(
     let mut gs = genesis.build(&StubExecutor).unwrap();
     // Register the aggregator directly on the genesis ledger the node builds on (the register
     // move is what a first block would have done anyway; nothing here re-verifies genesis).
-    // The genesis itself already registered receiver 7 (above), so the aggregator's payout id
-    // resolves the moment `RegisterAggregator` is checked.
-    let payout_addr = receiver_record(7).id();
+    let payout_addr = crate::notes::ShieldedAddress { pk: [7; 8], kem_ek: vec![8; crate::notes::KEM_EK_BYTES] };
     let registration = AggregatorRegistration {
         public_key: key.public_key().clone(),
-        payout: payout_addr,
+        payout: payout_addr.clone(),
         signature: key.sign(aggregator_register_message(1, &payout_addr).as_bytes()),
     };
     let mut b = crate::notes::Bundle {

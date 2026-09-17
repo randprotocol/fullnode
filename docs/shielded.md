@@ -24,26 +24,20 @@ spend key   SpendKey([u32; 8])           256 bits, in <key>.key.json, mode 0600
    │     ├─ pk      = H(PK, nk)          the field a note names its owner by
    │     ├─ nullifier(cm) = H(NF, nk, cm)  what a spend publishes
    │     ├─ ovk                          opens envelopes this wallet sent
-   │     └─ ML-KEM-768 decapsulation key (versioned, §2) opens envelopes sent to this wallet
-   ├─ receiver signing key   Keypair::from_seed(H("rand-receiver-sign-1", sk))   Dilithium2
-   └─ address       rand1 + base58(id || checksum)     53–55 characters, id = blake3(signing pk)
+   │     └─ ML-KEM-768 decapsulation key opens envelopes sent to this wallet
+   └─ address       rand1 + base58(pk || kem_ek)     1668 characters
 ```
 
-Since **chain 11** a shielded address is short: a **receiver id**, not the record itself. What a
-sender needs to seal an envelope — `pk` and the current ML-KEM-768 encapsulation key — lives in a
-signed, versioned **receiver record** the id resolves to, not in the address text. §2 is the whole
-of that: the id, the record, rotation, and the two ways a sender gets one.
+A **shielded address** is 32 bytes of `pk` plus the 1184-byte ML-KEM-768 encapsulation key
+envelopes are sealed to, base58 after the `rand1` prefix — about 1.6 KB of text. It is public
+by design: anyone may pay it, and holding it tells you nothing about what it holds.
 
-The key file is version 3 and carries the spend key plus the highest ML-KEM key version this
-wallet has rotated to — nothing else, because every other key above is a pure derivation of the
-spend key:
+The key file is version 2 and carries the spend key alone, because every other key above is a
+pure derivation of it:
 
 ```json
-{ "version": 3, "spend_key": "0101010101010101010101010101010101010101010101010101010101010101", "kem_version": 0 }
+{ "version": 2, "spend_key": "0101010101010101010101010101010101010101010101010101010101010101" }
 ```
-
-A version 2 file (spend key alone) still loads, at `kem_version = 0`: it was written before
-rotation existed, and 0 is the whole truth about it.
 
 `rand keygen` refuses to overwrite an existing file: there is no second copy of a spend key,
 and overwriting one destroys every note it could still open. Next to it lives
@@ -53,81 +47,9 @@ mode 0600 like the key itself.
 
 A validator key is a different thing entirely: a 32-byte seed and a Dilithium2 key pair, whose
 base58 address is public and appears in blocks as a proposer. Validators have addresses; wallets
-have shielded addresses; the two never mix — though since chain 11 both kinds of address are the
-same 32 bytes, blake3 of a Dilithium2 public key, base58 after `rand1`: one wallet, one identity,
-shielded and transparent.
+have shielded addresses; the two never mix.
 
-## 2. The address and the receiver record
-
-**The id.** The receiver signing key is derived, not a second secret to back up:
-`sign_seed = blake3("rand-receiver-sign-1" ‖ sk)`, `signing = Keypair::from_seed(sign_seed)`. It
-exists whenever the spend key does. The **receiver id** is `id = blake3(signing.public_key())`,
-32 bytes, the type `ReceiverId` — the same 32 bytes as the transparent `Address` of that key,
-which is what makes one wallet's shielded and transparent identities the same id.
-
-**The text form.** `rand1` + base58(`id` ‖ `checksum`), `checksum = blake3("rand-receiver-addr-1"
-‖ id)[..4]` — 53 to 55 characters (base58 is variable length). The prefix stays `rand1`; only the
-length and the checksum tell a short address from the pre-chain-11 long form, which `parse`
-refuses by name: *"this is the pre-chain-11 long address form (pk + KEM key); chain 11 addresses
-are 53–55 characters — ask the receiver for their current address"*. A bad checksum is refused too,
-separately.
-
-**The record.** An id resolves to a signed, versioned `ReceiverRecord`:
-
-```
-ReceiverRecord {
-    version:     u32,          // strictly increasing per id; 1 at first publication
-    pk:          Word8,        // the note public value envelopes are addressed to
-    kem_ek:      [u8; 1184],   // the current ML-KEM-768 encapsulation key
-    signing_key: PublicKey,    // Dilithium2, 1312 bytes — what the id is the hash of
-    signature:   Signature,    // Dilithium2 over the signing hash, ~2420 bytes
-}
-signing_hash = blake3("rand-receiver-record-1" ‖ chain_id ‖ version ‖ pk ‖ kem_ek)
-```
-
-About 5 KB, dominated by the signature. `ReceiverRecord::verify(&self, id, chain_id)` is the one
-verifier — the wallet, the ledger and the explorer all call it, and nothing about who supplied the
-record enters the check:
-
-1. `blake3(signing_key) == id` — the record belongs to this address;
-2. the signature verifies under `signing_key` over `signing_hash` — the receiver authorised
-   exactly this `pk`, `kem_ek` and `version`, for this chain (`chain_id` in the hash keeps a
-   record published on one chain from being replayed on another with the same key).
-
-**Rotation and version numbering.** `rand register --rotate` publishes a fresh ML-KEM key at
-`version + 1`; `pk` never changes (a changed `pk` would orphan every note the old `pk` owns — a
-receiver who wants a new `pk` makes a new wallet), so the address never changes either. KEM key
-versions start at 0 and record versions start at 1, so **record version = KEM key version + 1**:
-record version 1 is KEM version 0, the key every pre-chain-11 wallet already had. No retired KEM
-secret is ever discarded — each is `kem_seed_at(v)` of the same spend key, re-derived rather than
-stored, so keeping the current version keeps every version below it. Opening an envelope tries
-every version this wallet has ever published, newest first, so a note sealed to a key retired
-years ago still opens.
-
-**Getting a record to a sender**, two paths:
-
-- **The payment request** (`rand request`): `rand:<address>?rec=<base64url(record)>[&amount=…]
-  [&memo=…]`, about 6.8 KB — a receiver who has never been on chain can still be paid. The
-  sender's wallet parses it, verifies the record against the address in the same URI, seals to
-  `kem_ek`, and addresses the note to `pk`.
-- **The registry** (`rand send`'s default): `GET {registry}/receivers/{id}` — the explorer,
-  `https://randscan.org/api/v1` by default — indexing every published `RegisterReceiver`. `404`
-  means never registered. `rand send <address> <amount>` with no `--record` file and no answer
-  from the registry refuses with:
-
-  ```
-  no receiver record for rand1…: ask the receiver for a payment request, or for them to register
-  ```
-
-**Privacy.** A registry lookup tells the explorer which receiver a sender is about to pay — the
-ENS trade-off, not hidden here. The payment-request path leaks nothing at all: no chain, no
-explorer, nobody but the two parties ever sees it.
-
-**What does not change.** Notes, commitments, nullifiers, envelopes, the bundle guest and its
-proof: the receiver id is never inside a proof, and `Envelope` is still sealed to a `kem_ek`
-exactly as before — only where the sender found the key changed.
-
-## 3. Notes, bundles and what is on chain
+## 2. Notes, bundles and what is on chain
 
 A **note** is `{ pk, from, amount, asset, time, r }` — 28 words, 112 bytes. It never appears on
 chain. What appears is:
@@ -150,7 +72,6 @@ Action = None | Mint { .. } | Deploy { base_pc, words } | Call { program, proof,
        | Bond { validator, amount, registration } | Unbond { .. } | Withdraw { .. } // phase S2
        | BridgeAttest { attestation, recipient, r, time, asset, envelope }         // phase S3
        | BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to }
-       | RegisterReceiver { record }                                             // chain 11, §2
 ```
 
 A note's `asset` word is `0` for RAND and, since phase S3, the bridge registry's dense index for
@@ -171,9 +92,8 @@ transaction that looked different when there was no change would leak that there
 | **Deploy** | everything above, plus `base_pc` and the program's words (so the program id and its code) | who deployed it, and what the paying notes were worth |
 | **Call** | everything a transfer publishes, plus the program id, the call proof, and the receipt's tier and eight output words | the private inputs, registers, memory, branches taken, the real cycle count (only the padded tier shows), who called it |
 | **Mint** (faucet) | the new note's commitment, its envelope, the **amount in the clear**, and the minting validator's public key (shown as its address) and signature | who the note is for — only the address holder can open the envelope; the address itself is never published |
-| **BridgeAttest** | the attestation (so the source chain, the token, the **amount**, the recipient's receiver id and the guardian signatures), the recipient's receiver id, the deposit note's `asset` index, `r` and `time`, and the fee bundle | which notes paid the fee, and everything about the deposit note's later spend |
+| **BridgeAttest** | the attestation (so the source chain, the token, the **amount**, the recipient's address hash and the guardian signatures), the recipient's shielded address, the deposit note's `asset` index, `r` and `time`, and the fee bundle | which notes paid the fee, and everything about the deposit note's later spend |
 | **BridgeBurn** | the asset index, the **amount**, the relayer fee and the destination chain and address, plus both bundles' public fields | which notes were burned, and who burned them |
-| **RegisterReceiver** | the whole record: version, `pk`, `kem_ek`, signing key and signature | nothing — a record is meant to be public |
 
 A `Call`'s `input_envelope` is the one optional publication in that table: the call's private inputs,
 sealed so that the caller, a per-call key, or a named auditor can open them later
@@ -195,7 +115,7 @@ payout address. What stays hidden is which notes paid for a bond, and what becom
 note afterwards. See `docs/staking.md`, and `docs/supply.md` for the audit that ties the register and
 the pool back together.
 
-## 4. The wallet
+## 3. The wallet
 
 `rand` talks to a node's JSON-RPC and does all the private work locally. Global options:
 `--rpc` (`RAND_RPC`, default `http://127.0.0.1:8545`) and `--key` (`RAND_KEY`, default
@@ -204,14 +124,12 @@ the pool back together.
 | command | what it does |
 |---|---|
 | `rand keygen` | write a new spend-key file; refuses to overwrite |
-| `rand address` | print this wallet's `rand1…` receiver id; `--record` prints the signed record as JSON |
-| `rand request` | print a `rand:…` payment request URI carrying the record inline (§2); `--amount`, `--memo` |
-| `rand register [--rotate]` | publish this wallet's receiver record, paying with a self-transfer; `--rotate` publishes a fresh KEM key first |
+| `rand address` | print this wallet's `rand1…` address |
 | `rand balance` | scan, then print what this wallet can spend |
 | `rand sync` | scan without printing a balance |
 | `rand notes` | every note this wallet has opened, with `spent` and `pending` |
 | `rand history` | every note this wallet created for someone else |
-| `rand send <TO> <AMOUNT>` | resolve the receiver record (`--record <file>` or `--registry <url>`), verify it, then select, prove a bundle, submit, wait for the commit; `--register` also publishes the resolved record |
+| `rand send <TO> <AMOUNT>` | select, prove a bundle, submit, wait for the commit |
 | `rand bond <VALIDATOR> <AMOUNT>` | stake onto a validator: the bundle burns the amount (`docs/staking.md`) |
 | `rand faucet [ADDRESS]` | ask a validator to mint (testnet chains only) |
 | `rand program build/deploy/show` | assemble, deploy (paid by a bundle), inspect a program |
@@ -227,8 +145,7 @@ the pool back together.
 
 ```bash
 rand keygen                                      # wrote wallet.key.json
-rand address                                     # rand1x7Qk…  (53–55 characters, a receiver id)
-rand request --amount 1.5 --memo coffee          # rand:rand1x7Qk…?rec=…&amount=…&memo=coffee
+rand address                                     # rand1x7Qk…  (1668 characters)
 rand faucet                                      # 100 RAND into a note only you can open
 rand sync                                        # scanned 41 leaves and 37 blocks; 1 notes, 1 unspent
 rand balance                                     # balance: 100 RAND / notes: 1 unspent
@@ -271,7 +188,7 @@ Three things to know about spending:
 - **The fee floor is 0.001 RAND** for a transfer, plus the action's own floor for a deploy or a
   call. `rand fee` asks the node rather than guessing.
 
-## 5. RPC
+## 4. RPC
 
 Full parameter and error detail is in `docs/rpc.md`; this is the shielded subset with one example
 each. Every example is one HTTP POST of
@@ -312,7 +229,7 @@ serves the head, which is the only anchor a wallet should use.
 **`rand_importViewingKey(nk[, rescan_from_height])`** and **`rand_getViewingNotes(nk[, from_index, limit])`** —
 the explorer's path: hand the *node* a viewing key (in memory, capped at 64, gone at restart) and
 it scans on the holder's behalf, the Zcash `z_importviewingkey` analogue. This is the one
-exception to "the node never holds a key"; see §7.
+exception to "the node never holds a key"; see §6.
 
 ```json
 → {"method":"rand_importViewingKey","params":["0c31…9e", 0]}
@@ -325,7 +242,7 @@ exception to "the node never holds a key"; see §7.
 ```
 
 **`rand_getWitness(index)`** — the Merkle path of one leaf, leaf-first, 32 levels. `null` past
-the end of the tree. See §7: this is the one request that says something about the caller.
+the end of the tree. See §6: this is the one request that says something about the caller.
 
 ```json
 → {"method":"rand_getWitness","params":[40]}
@@ -340,21 +257,14 @@ acceptance is not commitment, so poll `rand_getTransaction`.
 ← "4f2c8b31…e7"
 ```
 
-**`rand_mint(address[, amount[, record]])`** — the testnet faucet, on chains whose genesis says
+**`rand_mint(address[, amount])`** — the testnet faucet, on chains whose genesis says
 `"faucet": true`. The node signs the mint with its own validator key; an observer answers
-`faucet mints are signed by validators; ask a validator node`. `record` is an optional receiver
-record (the JSON `rand address --record` prints) — a mint to a wallet's own id can carry the
-record it just signed, so a brand-new wallet is fundable before it has ever been on chain; without
-it the node resolves `address` from its own registry.
+`faucet mints are signed by validators; ask a validator node`.
 
 ```json
 → {"method":"rand_mint","params":["rand1x7Qk…", "100000000000"]}
 ← "9ab1c0…4f"
 ```
-
-**`rand_getReceiver(id)` / `rand_getReceivers()`** — the receiver registry (§2): a record by id
-(`null` if never registered) or the whole registry. Full detail, including the JSON shape, is
-`docs/rpc.md`.
 
 **`rand_getTransaction(hash)`** — what an explorer can say, which is almost nothing:
 
@@ -381,7 +291,7 @@ with the call), and a wrong key is indistinguishable from one that sealed nothin
                   "note": {"pk": "…", "from": "…", "amount": "1500000000", "asset": 0, "time": 5}}]}
 ```
 
-## 6. How a node admits a transaction
+## 5. How a node admits a transaction
 
 Cheap before expensive, in this exact order (`Ledger::validate_inner`, spec §7). The mempool runs
 the same check before gossiping, so a bad transaction is refused once, at the edge.
@@ -409,11 +319,7 @@ the same check before gossiping, so a bad transaction is refused once, at the ed
    validator's signature, enough stake to unbond, enough released to withdraw, and the deposit note
    a withdraw derives not already in the tree; and the bridge's own rules for the two bridge
    actions, including a burn's asset bundle in full — all of it before either bundle's proof, so a
-   bridge transaction that cannot apply costs no verification (`docs/bridge.md` §5); and
-   `RegisterReceiver` (§2): the record verifies under the id it names, for this chain, and its
-   version is exactly 1 for a first registration or `current + 1` with the same `pk` otherwise —
-   the whole rule, whether the record registers its own id or rides someone else's paying
-   transaction (a sender-paid registration, §2): nothing else about the bundle is checked.
+   bridge transaction that cannot apply costs no verification (`docs/bridge.md` §5).
 8. **Bundle digest** — the ledger recomputes the digest from the bundle's published plaintext and
    it must equal what the proof published. A proof whose witness broke the relation publishes a
    tainted digest, which matches no plaintext.
@@ -430,7 +336,7 @@ The windows are 256 blocks because proving takes real time: a tier-14 bundle pro
 minutes of anchor validity. On a faster chain a wallet can still lose the race, in which case the
 node answers `anchor is not one of the last 256 roots` and the wallet reproves.
 
-## 7. What still leaks
+## 6. What still leaks
 
 The pool hides amounts, senders and recipients. It does not hide everything, and the gaps are
 worth naming.
@@ -491,7 +397,7 @@ per-call key (`--print-call-key`), or by an auditor named when the call was made
 the program on it, and exits non-zero rather than believing it if either check fails. `--no-envelope` publishes nothing at all, which is irreversible: once the salt is
 gone, nobody can open that call. See `docs/confidential.md` §call input envelopes.
 
-## 8. What is next
+## 7. What is next
 
 S1 was the pool itself. Two phases follow it, each a hard fork (see spec §12), and both are in this
 release — S3 landed first, which is the order they arrived in, not the order they were planned in:
@@ -502,7 +408,7 @@ accumulated `rewards` (which S1 already credited on every bundle fee) are withdr
 its payout address. Epochs re-derive the validator set from the register, `rand-node genesis` seeds
 it, and `rand_getSupply` audits the pool against it. The whole of it is `docs/staking.md` and
 `docs/supply.md`. What S2 did **not** bring is the wallet's local commitment tree — the answer to the
-witness leak in §7 — which is still the first follow-up.
+witness leak in §6 — which is still the first follow-up.
 
 **S3 — the bridge, and private call inputs — has landed.** A bridged asset is a note whose `asset`
 word is the registry's index for it; `BridgeAttest` deposits one note that the *chain* computes from
@@ -511,12 +417,6 @@ bundle that burns, and a RAND bundle that pays for both). Call inputs have their
 (spec §6.1), so a caller can disclose what a program ran on without publishing it. `docs/bridge.md`
 and `docs/confidential.md` are the references; a chain turns the bridge on with a `bridge` section in
 its genesis, which is a hard fork for the chains that take it and a no-op for the ones that do not.
-
-**Chain 11 — short shielded addresses: implemented on this branch, not yet cut.** The address
-shrank from 1,667 characters to 53–55 (§2): a receiver id resolving to a signed, versioned record,
-delivered by a payment request or the explorer's registry, verified by the wallet either way.
-Register-state payouts and the bridge's recipient field are receiver ids now, resolved through the
-registry at apply time. `AGENTS.md` has the per-crate summary and the rulings.
 
 Not scheduled yet: slashing and jailing, a nullifier accumulator to replace the per-block
 recomputation of the nullifier root, and proof batching to amortize the ~16 ms warm verify.

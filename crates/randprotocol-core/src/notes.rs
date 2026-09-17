@@ -4,7 +4,7 @@
 //! free of the zkVM's field-arithmetic crates.
 
 use crate::confidential::ConfidentialExecutor;
-use crate::receiver::ReceiverRecord;
+use crate::crypto::Hash;
 use serde::{Deserialize, Serialize};
 
 pub type Word8 = [u32; 8];
@@ -12,6 +12,7 @@ pub const DEPTH: usize = 32;
 pub const MAX_ENVELOPE_BYTES: usize = 2048;
 /// ML-KEM-768 encapsulation key length (FIPS 203).
 pub const KEM_EK_BYTES: usize = 1184;
+pub const ADDRESS_PREFIX: &str = "rand1";
 
 /// The 32 little-endian bytes of a word octet.
 pub fn word8_to_bytes(w: &Word8) -> [u8; 32] {
@@ -120,25 +121,58 @@ impl Bundle {
 }
 
 /// A shielded address: the note owner field `pk` plus the ML-KEM-768 encapsulation key
-/// envelopes are sealed to.
-///
-/// Short-shielded-address task 5 removed its text form (`to_string`/`parse`/`Display`,
-/// `recipient_hash` and `ADDRESS_PREFIX`): the bridge was the last place this crate rendered or
-/// parsed one, and a `BridgeAttest`'s wire `recipient` is a [`crate::receiver::ReceiverId`] now,
-/// not this struct's ~1.2 KB text. The struct itself stays — sealing an envelope still needs the
-/// `pk`/`kem_ek` pair, built from a resolved [`ReceiverRecord`] via [`From<&ReceiverRecord>`].
+/// envelopes are sealed to. Text form: `rand1` + base58(pk bytes || kem_ek).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShieldedAddress {
     pub pk: Word8,
     pub kem_ek: Vec<u8>,
 }
 
-/// The short-address migration's bridge: a resolved receiver record carries everything a
-/// `ShieldedAddress` is, so anywhere that needs one to seal an envelope builds it from a record
-/// the registry already holds, rather than from text nobody sends over the wire any more.
-impl From<&ReceiverRecord> for ShieldedAddress {
-    fn from(r: &ReceiverRecord) -> Self {
-        ShieldedAddress { pk: r.pk, kem_ek: r.kem_ek.clone() }
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
+pub enum AddressError {
+    #[error("shielded address must start with {ADDRESS_PREFIX}")]
+    Prefix,
+    #[error("shielded address is not base58")]
+    Base58,
+    #[error("shielded address decodes to {0} bytes, expected {expected}", expected = 32 + KEM_EK_BYTES)]
+    Length(usize),
+}
+
+impl ShieldedAddress {
+    #[allow(clippy::inherent_to_string_shadow_display)]
+    pub fn to_string(&self) -> String {
+        let mut raw = word8_to_bytes(&self.pk).to_vec();
+        raw.extend_from_slice(&self.kem_ek);
+        format!("{ADDRESS_PREFIX}{}", bs58::encode(raw).into_string())
+    }
+
+    /// The 32-byte stand-in for this address in a place that has room for 32 bytes and no
+    /// more: the `to` field of a bridge transfer payload (spec §10).
+    ///
+    /// A shielded address is ~1.2 KB — the ML-KEM encapsulation key dominates — and the wire
+    /// format guardians sign is fixed at 32 bytes, so a source-chain depositor names its
+    /// recipient by this hash and the `BridgeAttest` transaction carries the address itself for
+    /// the ledger to check against it. Domain-separated like every other hash here, over
+    /// exactly the two fields the address is: `pk` bytes then `kem_ek`.
+    pub fn recipient_hash(&self) -> [u8; 32] {
+        let mut raw = word8_to_bytes(&self.pk).to_vec();
+        raw.extend_from_slice(&self.kem_ek);
+        Hash::digest_domain(b"rand-shielded-recipient", &raw).0
+    }
+
+    pub fn parse(s: &str) -> Result<ShieldedAddress, AddressError> {
+        let rest = s.strip_prefix(ADDRESS_PREFIX).ok_or(AddressError::Prefix)?;
+        let raw = bs58::decode(rest).into_vec().map_err(|_| AddressError::Base58)?;
+        if raw.len() != 32 + KEM_EK_BYTES {
+            return Err(AddressError::Length(raw.len()));
+        }
+        Ok(ShieldedAddress { pk: word8_from_bytes(&raw[..32]).unwrap(), kem_ek: raw[32..].to_vec() })
+    }
+}
+
+impl std::fmt::Display for ShieldedAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&ShieldedAddress::to_string(self))
     }
 }
 
@@ -289,15 +323,16 @@ mod tests {
         assert!(e.len() <= MAX_ENVELOPE_BYTES);
     }
 
-    /// Short-shielded-address task 5: the struct stays even though its text form is gone, because
-    /// sealing an envelope still needs the `pk`/`kem_ek` pair — built from a resolved receiver
-    /// record, which converts to exactly the address it names.
     #[test]
-    fn shielded_address_from_a_record_copies_its_fields() {
+    fn shielded_address_roundtrips_and_rejects_bad_input() {
         let a = ShieldedAddress { pk: [9; 8], kem_ek: vec![7; KEM_EK_BYTES] };
-        let kp = crate::receiver::receiver_signing_keypair(&[1; 32]);
-        let rec = crate::receiver::ReceiverRecord::sign(&kp, 1, 1, a.pk, a.kem_ek.clone());
-        assert_eq!(ShieldedAddress::from(&rec), a);
+        let s = a.to_string();
+        assert!(s.starts_with(ADDRESS_PREFIX));
+        assert_eq!(ShieldedAddress::parse(&s).unwrap(), a);
+        assert_eq!(ShieldedAddress::parse("abc").unwrap_err(), AddressError::Prefix);
+        assert_eq!(ShieldedAddress::parse("rand10OIl").unwrap_err(), AddressError::Base58);
+        let short = format!("{ADDRESS_PREFIX}{}", bs58::encode([1u8; 40]).into_string());
+        assert_eq!(ShieldedAddress::parse(&short).unwrap_err(), AddressError::Length(40));
     }
 
     /// Naive reference: hash every level over the padded leaf list.

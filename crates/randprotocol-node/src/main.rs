@@ -3,9 +3,8 @@ use clap::{Parser, Subcommand};
 use libp2p::Multiaddr;
 use randprotocol_client::wallet;
 use randprotocol_client::RpcClient;
-use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator, ReceiverRecordHex};
+use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
 use randprotocol_core::notes::{word8_to_hex, Envelope, ShieldedAddress};
-use randprotocol_core::receiver::{ReceiverId, ReceiverRecord};
 use randprotocol_core::types::actions::{
     aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message, aggregator_withdraw_message,
     registration_message, unbond_message, withdraw_message, AggregatorRegistration, Registration,
@@ -23,19 +22,15 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// One genesis deposit note: `amount` units owned by `record`'s receiver.
+/// One genesis deposit note: `amount` units owned by the shielded address `addr`.
 ///
 /// The note carries fresh commitment randomness, so writing the same allocation twice produces
 /// two different notes with two different genesis hashes. That is the point of a commitment
 /// scheme rather than an oversight: a deterministic `r` would let anyone confirm a guess at who
 /// a genesis note pays and how much it holds, simply by recomputing the commitment. A genesis
 /// file is written once and its hash is fixed from then on.
-///
-/// `record` is the `--receiver` entry matching the alloc's `rand1…` id (short-shielded-address
-/// task 6): the caller resolves it from `Genesis::receivers` before calling this, so the note is
-/// always sealed to the id's own registered `pk`/`kem_ek`, never to a stray one.
-fn deposit_note(record: &ReceiverRecord, amount: u64) -> Result<GenesisNote> {
-    let to = ShieldedAddress::from(record);
+fn deposit_note(addr: &str, amount: u64) -> Result<GenesisNote> {
+    let to = ShieldedAddress::parse(addr).with_context(|| format!("{addr} is not a shielded address"))?;
     seal_deposit(&to, &Note::new(to.pk, [0; 8], amount, 0, 0))
 }
 
@@ -48,7 +43,7 @@ fn deposit_note(record: &ReceiverRecord, amount: u64) -> Result<GenesisNote> {
 fn seal_deposit(to: &ShieldedAddress, note: &Note) -> Result<GenesisNote> {
     let throwaway = SpendKey::random().viewing_key();
     let envelope = randprotocol_zkvm::address::seal_note(&throwaway, to, note, &TxKey::random())
-        .map_err(|e| anyhow::anyhow!("sealing a note to {}: {e}", word8_to_hex(&to.pk)))?;
+        .map_err(|e| anyhow::anyhow!("sealing a note to {}: {e}", to.to_string()))?;
     Ok(GenesisNote {
         cm: word8_to_hex(&note.commitment()),
         envelope: EnvelopeHex::from_envelope(&envelope),
@@ -64,10 +59,6 @@ fn seal_deposit(to: &ShieldedAddress, note: &Note) -> Result<GenesisNote> {
 /// (`ledger::staking::withdraw_note`), so these five fields have to be exactly the five the ledger
 /// hashes, or the withdraw pays a note whose envelope opens to nothing the payee can use. That
 /// agreement is what `the_cli_withdraw_note_is_the_note_the_ledger_derives` pins.
-///
-/// `payout` is the payout id's resolved record turned into a `ShieldedAddress`
-/// (short-shielded-address task 6): `Cmd::Withdraw`, `AggregatorCmd::Withdraw` and the aggregate
-/// daemon all fetch it via `rand_getReceiver` before calling this.
 fn sealed_withdraw_note(payout: &ShieldedAddress, amount: u64, time: u32) -> Result<(Note, Envelope)> {
     let note = Note::new(payout.pk, [0; 8], amount, 0, time);
     let throwaway = SpendKey::random().viewing_key();
@@ -143,17 +134,6 @@ fn parse_admitted_shape(spec: &str) -> Result<randprotocol_core::ledger::aggrega
     })
 }
 
-/// A `--receiver` file: a `ReceiverRecordHex` JSON object, either bare or wrapped under a
-/// top-level `"record"` key — the shape `rand address --record` is expected to print, so a
-/// wallet's own output can be handed straight to this flag.
-fn load_receiver_record_hex(path: &PathBuf) -> Result<ReceiverRecordHex> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&text).with_context(|| format!("{} is not JSON", path.display()))?;
-    let obj = v.get("record").cloned().unwrap_or(v);
-    serde_json::from_value(obj).with_context(|| format!("{} is not a receiver record", path.display()))
-}
-
 /// One `--validator key,stake,payout` triple. The three fields travel together because they are
 /// one register entry (spec §8): three parallel repeatable flags would silently pair the wrong
 /// stake with the wrong key the moment one of them was left out.
@@ -168,10 +148,7 @@ fn parse_genesis_validator(spec: &str) -> Result<GenesisValidator> {
         PublicKey::from_hex(key).with_context(|| format!("{key} is neither a key file nor a hex public key"))?
     };
     let stake = parse_amount(stake).with_context(|| format!("{stake} is not an amount in RAND"))?;
-    // Short form only: the matching record has to come from a `--receiver` file (loaded into
-    // `Genesis::receivers` before this validator is parsed) — `Genesis::build` refuses with
-    // `UnknownReceiver` if none names this id.
-    ReceiverId::parse(payout).with_context(|| format!("{payout} is not a receiver id"))?;
+    ShieldedAddress::parse(payout).with_context(|| format!("{payout} is not a shielded address"))?;
     // `Genesis::build` is what refuses a stake below the minimum; saying so here too means the
     // operator hears it before a genesis hash has been printed anywhere.
     anyhow::ensure!(
@@ -187,7 +164,7 @@ fn parse_genesis_validator(spec: &str) -> Result<GenesisValidator> {
 /// This validator's row of the register, as `rand_getValidators` reports it: the nonce its
 /// next signed action must carry, and the payout address a withdraw pays to. A node that is not
 /// in the register has nothing to sign yet — it has to be bonded in first.
-async fn register_row(rpc: &RpcClient, me: &randprotocol_core::Address) -> Result<(u64, ReceiverId)> {
+async fn register_row(rpc: &RpcClient, me: &randprotocol_core::Address) -> Result<(u64, ShieldedAddress)> {
     let rows = rpc.validators().await?;
     let want = me.to_base58();
     let row = rows
@@ -195,35 +172,9 @@ async fn register_row(rpc: &RpcClient, me: &randprotocol_core::Address) -> Resul
         .and_then(|rows| rows.iter().find(|r| r["address"].as_str() == Some(want.as_str())))
         .with_context(|| format!("{want} is not in the validator register; bond it in first (`rand-node register`)"))?;
     let nonce = row["nonce"].as_u64().context("the node's getValidators reply has no nonce")?;
-    let payout = row["payout"].as_str().context("the node's getValidators reply has no payout id")?;
-    let payout = ReceiverId::parse(payout).map_err(|e| anyhow::anyhow!("register payout id: {e}"))?;
+    let payout = row["payout"].as_str().context("the node's getValidators reply has no payout address")?;
+    let payout = ShieldedAddress::parse(payout).map_err(|e| anyhow::anyhow!("register payout address: {e}"))?;
     Ok((nonce, payout))
-}
-
-/// A record fetched over RPC, checked against the id it was asked for and this chain, before it
-/// is trusted for anything (final review of short shielded addresses, item 1): a hostile or
-/// buggy RPC endpoint can return a record with the right `pk` glued to an attacker's `kem_ek`
-/// (`verify` covers the id and the signature, but nothing stops a server from serving whatever
-/// bytes it likes for either), and sealing a payout envelope to that record would pay the
-/// attacker, not the receiver who registered `id`. Pure — no RPC — so it is testable on its own.
-fn verified_record(rec: ReceiverRecord, id: &ReceiverId, chain_id: u64) -> Result<ShieldedAddress> {
-    rec.verify(id, chain_id).map_err(|e| anyhow::anyhow!("receiver record for {id} does not verify: {e}"))?;
-    Ok(ShieldedAddress::from(&rec))
-}
-
-/// The shielded address `id` resolves to on `rpc`'s node, fetched through `rand_getReceiver`
-/// (short-shielded-address task 6) and checked by [`verified_record`] before it is handed back. A
-/// payout with no record is refused by name — the register can name an id nobody has registered
-/// yet, and a withdraw or an aggregate to it would otherwise pay a note nobody can ever open.
-async fn resolve_receiver(rpc: &RpcClient, id: &ReceiverId, chain_id: u64) -> Result<ShieldedAddress> {
-    let v = rpc.call("rand_getReceiver", serde_json::json!([id.to_string()])).await?;
-    if v.is_null() {
-        anyhow::bail!("payout {id} has no record: register it first");
-    }
-    let hex: ReceiverRecordHex =
-        serde_json::from_value(v).with_context(|| format!("the node's rand_getReceiver reply for {id} does not decode"))?;
-    let rec = hex.to_record().map_err(|e| anyhow::anyhow!("{id}'s record: {e}"))?;
-    verified_record(rec, id, chain_id)
 }
 
 /// Submit a bundle-less validator-signed action and report where it landed.
@@ -274,20 +225,13 @@ enum Cmd {
         /// hash: it is register state.
         #[arg(long = "validator", required = true, value_name = "KEY,STAKE,PAYOUT")]
         validators: Vec<String>,
-        /// A receiver record, as a JSON file holding a `ReceiverRecordHex` object — either bare
-        /// or wrapped in a top-level `"record"` key (what `rand address --record` prints);
-        /// repeatable. Registered into `Genesis::receivers` before any `--validator` payout or
-        /// `--alloc` owner is resolved against it, so every id either flag names must have one
-        /// of these.
-        #[arg(long = "receiver", value_name = "RECORD.JSON")]
-        receivers: Vec<PathBuf>,
         /// Blocks per epoch (spec §8): the validator set for epoch `e` is derived from the
         /// register as of the last block of epoch `e - 1`. Part of the genesis hash.
         #[arg(long, default_value_t = randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT)]
         epoch_blocks: u64,
-        /// Deposit notes `<rand1 id>=<amount in RAND>`, repeatable. A redacted chain has no
-        /// accounts, so there is no per-validator allocation: value only exists as a note
-        /// someone holds the spend key for. The id must name one of the `--receiver` records.
+        /// Deposit notes `rand1<address>=<amount in RAND>`, repeatable. A redacted chain has
+        /// no accounts, so there is no per-validator allocation: value only exists as a note
+        /// someone holds the spend key for.
         #[arg(long = "alloc")]
         allocs: Vec<String>,
         #[arg(long, default_value = "genesis.json")]
@@ -492,7 +436,7 @@ async fn main() -> Result<()> {
             let id = libp2p::identity::Keypair::ed25519_from_bytes(kp.derive_subkey(b"rand-p2p-identity"))?;
             println!("address: {}\npublic_key: {}\npeer_id: {}", kp.address(), kp.public_key().to_hex(), id.public().to_peer_id());
         }
-        Cmd::Genesis { chain_id, validators, receivers, epoch_blocks, allocs, out, faucet, no_confidential, fri_profile, aggregation, admitted_shapes } => {
+        Cmd::Genesis { chain_id, validators, epoch_blocks, allocs, out, faucet, no_confidential, fri_profile, aggregation, admitted_shapes } => {
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -500,10 +444,6 @@ async fn main() -> Result<()> {
                     .as_millis() as u64,
                 validators: Vec::new(),
                 alloc: Vec::new(),
-                // Filled in first, below, from `--receiver` — every `--validator` payout and
-                // `--alloc` owner is resolved against these, exactly as `Genesis::build` itself
-                // resolves them (`UnknownReceiver` on a miss).
-                receivers: Vec::new(),
                 faucet,
                 confidential: !no_confidential,
                 fri_profile,
@@ -541,28 +481,13 @@ async fn main() -> Result<()> {
                 },
                 epoch_blocks,
             };
-            // `--receiver` first: every payout below (validator or alloc) resolves against these,
-            // the same order `Genesis::build` itself checks in.
-            let mut receiver_records: std::collections::BTreeMap<ReceiverId, ReceiverRecord> = std::collections::BTreeMap::new();
-            for path in &receivers {
-                let rh = load_receiver_record_hex(path)?;
-                let rec = rh
-                    .to_record()
-                    .map_err(|e| anyhow::anyhow!("{} is not a valid receiver record: {e}", path.display()))?;
-                receiver_records.insert(rec.id(), rec);
-                gen.receivers.push(rh);
-            }
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
             }
             for a in &allocs {
-                let (addr, amt) = a.split_once('=').context("--alloc must be <rand1 id>=<amount>")?;
+                let (addr, amt) = a.split_once('=').context("--alloc must be rand1address=amount")?;
                 let amount = parse_amount(amt)?;
-                let id = ReceiverId::parse(addr).with_context(|| format!("{addr} is not a receiver id"))?;
-                let record = receiver_records
-                    .get(&id)
-                    .ok_or_else(|| anyhow::anyhow!("alloc owner {addr} has no --receiver record"))?;
-                gen.alloc.push(deposit_note(record, amount)?);
+                gen.alloc.push(deposit_note(addr, amount)?);
                 println!("  alloc {} RAND to {addr}", format_amount(amount));
             }
             let executor = node::executor_for_profile(&gen.fri_profile)?;
@@ -640,8 +565,8 @@ async fn main() -> Result<()> {
         Cmd::Register { key, payout, rpc } => {
             let kp = load_keypair(&key)?;
             let chain_id = RpcClient::new(rpc).chain_id().await?;
-            let payout = ReceiverId::parse(&payout)
-                .map_err(|e| anyhow::anyhow!("{payout} is not a receiver id: {e}"))?;
+            let payout = ShieldedAddress::parse(&payout)
+                .map_err(|e| anyhow::anyhow!("{payout} is not a shielded address: {e}"))?;
             let signature = kp.sign(registration_message(chain_id, &payout).as_bytes());
             let registration = Registration { public_key: kp.public_key().clone(), payout, signature };
             println!(
@@ -673,7 +598,6 @@ async fn main() -> Result<()> {
             let rpc = RpcClient::new(staking.rpc.clone());
             let chain_id = rpc.chain_id().await?;
             let (nonce, payout) = register_row(&rpc, &kp.address()).await?;
-            let payout_addr = resolve_receiver(&rpc, &payout, chain_id).await?;
             // The chain computes the deposit note itself, from the register's payout address, the
             // amount less the base, the blinding below and this `time` — the head height, which
             // the signature binds. The envelope only the payee can open is sealed against that
@@ -681,7 +605,7 @@ async fn main() -> Result<()> {
             // applying the transaction: that height does not exist yet. Admission takes any
             // `time` within the window (256 blocks), so the head is simply the freshest one.
             let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
-            let (note, envelope) = sealed_withdraw_note(&payout_addr, amount - base, time)?;
+            let (note, envelope) = sealed_withdraw_note(&payout, amount - base, time)?;
             let signature = kp
                 .sign(withdraw_message(chain_id, &kp.address(), amount, nonce, time, &note.r, &envelope).as_bytes());
             let action = randprotocol_core::Action::Withdraw {
@@ -707,8 +631,8 @@ async fn main() -> Result<()> {
             AggregatorCmd::Register { key, bond, payout, rpc } => {
                 let kp = load_keypair(&key)?;
                 let chain_id = RpcClient::new(rpc).chain_id().await?;
-                let payout = ReceiverId::parse(&payout)
-                    .map_err(|e| anyhow::anyhow!("{payout} is not a receiver id: {e}"))?;
+                let payout = ShieldedAddress::parse(&payout)
+                    .map_err(|e| anyhow::anyhow!("{payout} is not a shielded address: {e}"))?;
                 let signature = kp.sign(aggregator_register_message(chain_id, &payout).as_bytes());
                 let registration = AggregatorRegistration { public_key: kp.public_key().clone(), payout, signature };
                 println!(
@@ -731,14 +655,14 @@ async fn main() -> Result<()> {
                 let kp = load_keypair(&staking.key)?;
                 let rpc = RpcClient::new(staking.rpc.clone());
                 let chain_id = rpc.chain_id().await?;
-                let (nonce, payout, bond) = aggregator_row(&rpc, &kp.address()).await?;
+                let (nonce, payout, _) = aggregator_row(&rpc, &kp.address()).await?;
                 // The note is the bond less the base, derived by the chain from the register —
                 // the amount itself is not in the action, exactly like the aggregate's payout.
+                let bond = aggregator_row(&rpc, &kp.address()).await?.2;
                 let base = randprotocol_core::gas::BUNDLE_BASE;
                 anyhow::ensure!(bond > base, "the bond does not cover the bundle base");
-                let payout_addr = resolve_receiver(&rpc, &payout, chain_id).await?;
                 let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
-                let (note, envelope) = sealed_withdraw_note(&payout_addr, bond - base, time)?;
+                let (note, envelope) = sealed_withdraw_note(&payout, bond - base, time)?;
                 let signature = kp.sign(
                     aggregator_withdraw_message(chain_id, &kp.address(), nonce, time, &note.r, &envelope).as_bytes(),
                 );
@@ -750,12 +674,6 @@ async fn main() -> Result<()> {
                     envelope,
                     signature,
                 };
-                println!(
-                    "withdrawing the bond: a note worth {} RAND to {}, the {} RAND base to the block's proposer",
-                    format_amount(bond - base),
-                    payout,
-                    format_amount(base)
-                );
                 submit_staking(&staking, chain_id, action, "aggregator withdraw").await?;
             }
         },
@@ -768,7 +686,7 @@ async fn main() -> Result<()> {
 }
 
 /// The aggregator register row for `me`: nonce, payout and bond, from `rand_getAggregators`.
-async fn aggregator_row(rpc: &RpcClient, me: &randprotocol_core::Address) -> Result<(u64, ReceiverId, u64)> {
+async fn aggregator_row(rpc: &RpcClient, me: &randprotocol_core::Address) -> Result<(u64, ShieldedAddress, u64)> {
     let rows = rpc.call("rand_getAggregators", serde_json::json!([])).await?;
     let want = me.to_base58();
     let row = rows
@@ -776,8 +694,8 @@ async fn aggregator_row(rpc: &RpcClient, me: &randprotocol_core::Address) -> Res
         .and_then(|rows| rows.iter().find(|r| r["address"].as_str() == Some(want.as_str())))
         .with_context(|| format!("{want} is not in the aggregator register; register it first (`rand-node aggregator register`)"))?;
     let nonce = row["nonce"].as_u64().context("the node's getAggregators reply has no nonce")?;
-    let payout = row["payout"].as_str().context("the node's getAggregators reply has no payout id")?;
-    let payout = ReceiverId::parse(payout).map_err(|e| anyhow::anyhow!("register payout id: {e}"))?;
+    let payout = row["payout"].as_str().context("the node's getAggregators reply has no payout address")?;
+    let payout = ShieldedAddress::parse(payout).map_err(|e| anyhow::anyhow!("register payout address: {e}"))?;
     let bond = row["bond"].as_str().and_then(|b| b.parse::<u64>().ok()).context("the node's getAggregators reply has no bond")?;
     Ok((nonce, payout, bond))
 }
@@ -852,9 +770,8 @@ async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, int
             // shares, sealed to the register's payout address (spec §5.4).
             let subsidy = subsidy_base.checked_shr((n / halving) as u32).unwrap_or(0);
             let (_, payout, _) = aggregator_row(&rpc, &kp.address()).await?;
-            let payout_addr = resolve_receiver(&rpc, &payout, chain_id).await?;
             let time = height as u32 + 1;
-            let (note, envelope) = sealed_withdraw_note(&payout_addr, subsidy + shares, time)?;
+            let (note, envelope) = sealed_withdraw_note(&payout, subsidy + shares, time)?;
             let nonce = aggregator_row(&rpc, &kp.address()).await?.0;
             let signature = kp.sign(
                 aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes))
@@ -879,7 +796,8 @@ async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, int
                 println!("submitted aggregate {hash} ({} covered)", proofs.len());
             } else {
                 let receipt = rpc.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
-                println!("submitted aggregate {hash} ({} covered)\n  committed in block {}", proofs.len(), receipt.height);
+                println!("submitted aggregate {hash} ({} covered)
+  committed in block {}", proofs.len(), receipt.height);
             }
             if !watch {
                 return Ok(());
@@ -962,15 +880,6 @@ mod tests {
         randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key())
     }
 
-    /// The receiver record both pinned validators are paid to (short-shielded-address task 4):
-    /// a fixed signing seed, so the record — and the id it registers under — never move, which
-    /// is what lets `the_genesis_hash_is_pinned` pin anything at all.
-    fn pinned_receiver() -> randprotocol_core::receiver::ReceiverRecord {
-        let to = pinned_payee();
-        let kp = randprotocol_core::receiver::receiver_signing_keypair(&[9; 32]);
-        randprotocol_core::receiver::ReceiverRecord::sign(&kp, 7, 1, to.pk, to.kem_ek)
-    }
-
     /// The exact genesis this test builds, so the pinned hash below has one definition.
     ///
     /// The note's commitment randomness is fixed here rather than drawn, which is the one thing
@@ -981,7 +890,6 @@ mod tests {
     fn pinned_genesis() -> Genesis {
         let to = pinned_payee();
         let note = Note { pk: to.pk, from: [0; 8], amount: 5 * UNITS_PER_RAND, asset: 0, time: 0, r: [7; 8] };
-        let rec = pinned_receiver();
         Genesis {
             chain_id: 7,
             timestamp_ms: 1_700_000_000_000,
@@ -989,16 +897,15 @@ mod tests {
                 GenesisValidator {
                     public_key: Keypair::from_seed([1; 32]).unwrap().public_key().clone(),
                     stake: MIN_STAKE as u128,
-                    payout: rec.id().to_string(),
+                    payout: pinned_payee().to_string(),
                 },
                 GenesisValidator {
                     public_key: Keypair::from_seed([2; 32]).unwrap().public_key().clone(),
                     stake: 2 * MIN_STAKE as u128,
-                    payout: rec.id().to_string(),
+                    payout: pinned_payee().to_string(),
                 },
             ],
             alloc: vec![seal_deposit(&to, &note).unwrap()],
-            receivers: vec![randprotocol_core::genesis::ReceiverRecordHex::from_record(&rec)],
             faucet: true,
             confidential: true,
             fri_profile: "test".into(),
@@ -1023,16 +930,7 @@ mod tests {
         // validator leaf is `rand-validator-leaf-2` over the v2 entry (a length-prefixed
         // unbonding queue, the payout address, the nonce), and this genesis's stakes are the
         // staking minimum, which genesis now requires.
-        //
-        // Moved again from fb5881c8… (short shielded addresses, task 3): the genesis block
-        // header's hash covers `state_root`, and every chain's state root now hashes under
-        // `rand-state-4` with an (empty) `receivers_root` appended, gate or no gate.
-        //
-        // Moved a third time (short shielded addresses, task 4): validator payouts are receiver
-        // ids now, resolved through a registry `Genesis::receivers` seeds — the validator leaf is
-        // v3 (`rand-validator-leaf-3`, the 32-byte id in place of the pk and KEM key) and this
-        // genesis's `receivers_root` is no longer empty.
-        assert_eq!(state.hash().to_hex(), "80ef682d37c59256311361750898336dec7954b348d667f8a2b9e7c0d475293c");
+        assert_eq!(state.hash().to_hex(), "fb5881c8d5bb5dcf634a1f036caa4cbfb49d0f3407f0d87419fbfa57686ceb4a");
         // The envelope is resealed on every call and must not move the hash: only the
         // commitment and the amount are bound.
         let again = pinned_genesis().build(&ex).unwrap();
@@ -1077,54 +975,19 @@ mod tests {
         assert_eq!(opened.amount, amount - base);
     }
 
-    /// The payout-resolution path (final review of short shielded addresses, item 1): a
-    /// hostile or buggy RPC endpoint can hand back a record whose signature covers the *wrong*
-    /// chain, or whose `kem_ek` was swapped after signing — either way the id and `pk` can still
-    /// look right at a glance, so only `ReceiverRecord::verify` catches it. `verified_record` must
-    /// refuse both, and only return the address for a record that actually verifies.
+    /// Two allocations of the same amount to the same address are two different notes. A
+    /// deterministic commitment would let anyone confirm a guess at a genesis note's owner and
+    /// value by recomputing it, which is the property the whole scheme exists to deny.
     #[test]
-    fn verified_record_refuses_a_record_that_does_not_verify_and_returns_the_address_for_one_that_does() {
-        let rec = pinned_receiver(); // signed for chain 7 (see `pinned_receiver`)
-        let id = rec.id();
-
-        // Signed for chain 7; asking it to resolve on another chain must fail — the signature
-        // does not cover that chain's registration at all.
-        assert!(verified_record(rec.clone(), &id, 8).is_err(), "wrong chain must not verify");
-
-        // The signature covers `kem_ek` byte for byte, so a tampered `kem_ek` — the whole point
-        // of this fix, a server serving the right `pk` glued to an attacker's KEM key — must not
-        // verify either, even though `id` and `pk` still match.
-        let mut tampered = rec.clone();
-        tampered.kem_ek[0] ^= 0xff;
-        assert!(verified_record(tampered, &id, 7).is_err(), "a tampered kem_ek must not verify");
-
-        // The untampered record, on its own chain, verifies and yields the address it was
-        // actually signed for.
-        let addr = verified_record(rec.clone(), &id, 7).unwrap();
-        assert_eq!(addr, ShieldedAddress::from(&rec));
-    }
-
-    /// `deposit_note` seals to the record's own `pk`/`kem_ek` (`ShieldedAddress::from`), and two
-    /// allocations of the same amount are two different notes — the whole point of drawing fresh
-    /// commitment randomness rather than deriving it from the amount and owner (short-shielded-
-    /// address task 6, the record replacing the stub's bare id argument).
-    #[test]
-    fn deposit_note_seals_to_the_records_address_and_never_repeats_a_note() {
-        let rec = pinned_receiver();
-        let amount = 5 * UNITS_PER_RAND;
-        let n1 = deposit_note(&rec, amount).unwrap();
-        let n2 = deposit_note(&rec, amount).unwrap();
-        assert_eq!(n1.amount, amount);
-        assert_ne!(n1.cm, n2.cm, "fresh commitment randomness each time");
-        assert_ne!(n1.envelope, n2.envelope);
-        // `pinned_receiver` signs over `pinned_payee`'s own `pk`/`kem_ek`, so that wallet opens
-        // the note the record's id was credited.
-        let payee = SpendKey([7; 8]);
-        let cm = randprotocol_core::notes::word8_from_hex(&n1.cm).unwrap();
-        let envelope = n1.envelope.to_envelope().unwrap();
-        let (_, opened) = randprotocol_zkvm::address::envelope_from_core(&envelope)
-            .open_as_receiver(cm, &payee.viewing_key())
-            .expect("the payout wallet opens its own note");
-        assert_eq!(opened.amount, amount);
+    fn deposit_notes_are_never_the_same_note_twice() {
+        let addr = pinned_payee().to_string();
+        let a = deposit_note(&addr, 5).unwrap();
+        let b = deposit_note(&addr, 5).unwrap();
+        assert_eq!(a.amount, b.amount);
+        assert_ne!(a.cm, b.cm, "genesis notes must carry fresh commitment randomness");
+        assert_ne!(a.envelope.kem_ct, b.envelope.kem_ct, "a fresh KEM ciphertext per note");
+        // Anything that is not a shielded address is refused, with the address in the message.
+        let err = deposit_note("not-an-address", 1).unwrap_err().to_string();
+        assert!(err.contains("not-an-address"), "{err}");
     }
 }

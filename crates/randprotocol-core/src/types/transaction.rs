@@ -2,9 +2,8 @@
 
 use crate::bridge::{digest as attestation_digest, Attestation};
 use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
-use crate::notes::{Bundle, Envelope, Word8};
+use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8};
 use crate::program::ProgramId;
-use crate::receiver::ReceiverId;
 use crate::types::actions::{AggregatorRegistration, CallEnvelope, Registration, SignedAggregateHeader};
 use serde::{Deserialize, Serialize};
 
@@ -117,15 +116,9 @@ pub enum Action {
     /// sighting can commit while this one is being proved. Admission refuses a mismatch
     /// (`TxError::AttestAssetMismatch`), so a lost race costs a fee bundle and a re-proof rather
     /// than a deposit nobody can open. A rotation deposits no note and binds nothing here.
-    ///
-    /// `recipient` is a receiver id (short-shielded-address task 5), not the long shielded
-    /// address: a receiver id is already the 32 bytes the wire format's `to` field holds, so the
-    /// wire no longer needs a separate hash of one. The ledger resolves it through the registry
-    /// (`Ledger::resolve_pk`) to the `pk` the deposit note is actually keyed to, and refuses a
-    /// deposit to an id the registry does not hold (`BridgeError::UnknownReceiver`).
     BridgeAttest {
         attestation: Vec<u8>,
-        recipient: ReceiverId,
+        recipient: ShieldedAddress,
         r: Word8,
         time: u32,
         asset: u32,
@@ -163,9 +156,6 @@ pub enum Action {
         envelope: Envelope,
         signature: Signature,
     },
-    /// Publishes (or rotates) a receiver record (spec §6.2/§6.3). Anyone may carry a valid
-    /// record — it is authorisation by construction — and pays the bundle's fee for it.
-    RegisterReceiver { record: crate::receiver::ReceiverRecord },
 }
 
 impl Action {
@@ -455,7 +445,7 @@ mod tests {
             bundle(),
             Action::BridgeAttest {
                 attestation: vec![1, 2, 3],
-                recipient: ReceiverId([4; 32]),
+                recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
                 r: [5; 8],
                 time: 9,
                 asset: 1,
@@ -504,7 +494,7 @@ mod tests {
                 b,
                 Action::BridgeAttest {
                     attestation: attestation.clone(),
-                    recipient: ReceiverId([4; 32]),
+                    recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
                     r,
                     time: 9,
                     asset: 1,

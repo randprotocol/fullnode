@@ -16,9 +16,7 @@ use serde_json::{json, Value};
 use randprotocol_core::bridge::{asset_id, AssetInfo, BridgeMeta};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::notes::{word8_to_hex, Envelope};
-use randprotocol_core::receiver::{ReceiverId, ReceiverRecord};
-use randprotocol_core::{Action, Hash, Transaction, TOKEN_DECIMALS, TOKEN_SYMBOL};
-use std::collections::BTreeMap;
+use randprotocol_core::{Action, Hash, ShieldedAddress, Transaction, TOKEN_DECIMALS, TOKEN_SYMBOL};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
@@ -40,10 +38,8 @@ const MAX_COMPACT_BLOCKS: u64 = 128;
 /// a batch of submissions is refused on size at the extractor long before this count is consulted.
 const MAX_BATCH: usize = 20;
 
-/// The longest string any RPC parameter may offer as a receiver id (spec ruling 3, updated by
-/// short-shielded-address task 5: a receiver id is ~54-55 characters, not the long shielded
-/// address's ~1663, but the cap stays generous rather than exact). See `parse_receiver_id` for
-/// why this is checked before the id is parsed rather than after.
+/// The longest string any RPC parameter may offer as a shielded address (spec ruling 3). See
+/// `parse_shielded` for why this is checked before the address is parsed rather than after.
 const MAX_ADDRESS_CHARS: usize = 2000;
 
 /// Snapshot the node loop keeps up to date for RPC readers.
@@ -148,11 +144,7 @@ pub enum NodeCommand {
     /// Testnet faucet: mint `amount` units into a note owned by `to`, signed by this node.
     /// Only a validator can serve it, so the reply carries a message rather than a
     /// `MempoolError` — "this node is an observer" is not a mempool outcome.
-    ///
-    /// `to` is a receiver id (short-shielded-address task 5). `record` is the optional record
-    /// `rand_mint`'s third parameter carries verbatim; `None` means "resolve it from the
-    /// registry" (task 6, see `Node::mint`'s doc).
-    Mint { to: ReceiverId, amount: u64, record: Option<ReceiverRecord>, reply: oneshot::Sender<Result<Hash, String>> },
+    Mint { to: ShieldedAddress, amount: u64, reply: oneshot::Sender<Result<Hash, String>> },
     /// Where the chain is in its epoch schedule, and which validators run this epoch and the
     /// next. It comes from the node loop rather than from storage because the *next* epoch's set
     /// is derived from the tip's register, which only the replica holds — and deriving it on
@@ -458,14 +450,14 @@ fn parse_hash(params: &Value, idx: usize) -> Result<Hash, RpcError> {
     Hash::from_hex(&s).map_err(|e| RpcError::invalid_params(format!("hash: {e}")))
 }
 
-/// A `rand1…` receiver id.
+/// A `rand1…` shielded address.
 ///
-/// The length is checked *before* parsing: `ReceiverId::parse` base58-decodes the whole string
-/// before it ever looks at the decoded length, and base58 decoding is quadratic in the input.
-/// This runs on a tokio worker shared with the node loop, so an unbounded parameter would let one
-/// request stall consensus. A real receiver id is `rand1` plus ~49-50 base58 characters (32 id
-/// bytes plus a 4-byte checksum), so 2000 is generous.
-fn parse_receiver_id(params: &Value, idx: usize) -> Result<ReceiverId, RpcError> {
+/// The length is checked *before* parsing: `ShieldedAddress::parse` base58-decodes the whole
+/// string before it ever looks at the decoded length, and base58 decoding is quadratic in the
+/// input. This runs on a tokio worker shared with the node loop, so an unbounded parameter would
+/// let one request stall consensus. A real address is `rand1` plus ~1663 base58 characters
+/// (32-byte `pk` + a 1184-byte ML-KEM-768 encapsulation key), so 2000 is generous.
+fn parse_shielded(params: &Value, idx: usize) -> Result<ShieldedAddress, RpcError> {
     let s: String = param(params, idx, "address")?;
     if s.len() > MAX_ADDRESS_CHARS {
         return Err(RpcError::invalid_params(format!(
@@ -473,7 +465,7 @@ fn parse_receiver_id(params: &Value, idx: usize) -> Result<ReceiverId, RpcError>
             s.len()
         )));
     }
-    ReceiverId::parse(&s).map_err(|e| RpcError::invalid_params(format!("address: {e}")))
+    ShieldedAddress::parse(&s).map_err(|e| RpcError::invalid_params(format!("address: {e}")))
 }
 
 /// A 32-byte value as hex, with or without `0x`: a bridge token address or emitter.
@@ -590,15 +582,11 @@ fn compact_block_json(b: &randprotocol_core::Block, notes: &[(u64, crate::storag
 
 fn block_json(b: &randprotocol_core::Block, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor, storage: &crate::storage::Storage) -> Value {
     let sealed = storage.block_sealed(&b.hash()).unwrap_or(false);
-    // The receiver registry, for a `BridgeAttest`'s rendered `commitment` (`tx_json`): a
-    // committed deposit's recipient always resolves, so this is only ever empty on a chain with
-    // no receivers at all.
-    let receivers = storage.receivers().unwrap_or_default();
     let txs: Vec<Value> = b
         .transactions
         .iter()
         .map(|t| {
-            let mut j = tx_json(t, bridge, &receivers, executor);
+            let mut j = tx_json(t, bridge, executor);
             // Per-bundle `sealed_by` (spec §8): the aggregate that covered it, `null` while it
             // is coverable — and for a bundle-less transaction, `null` by construction.
             let sealed_by = match &t.bundle {
@@ -683,21 +671,6 @@ pub(crate) fn unsealed_bundles(
 /// envelope — is served on the receipt (`rand_getReceipt`, `rand_getCallEnvelope`).
 /// A bundle's public fields — none of which names a party. Used for the transaction's own
 /// bundle and, since S3's `BridgeBurn`, for the asset bundle riding inside the action.
-/// A receiver record as RPC JSON (`rand_getReceiver`/`rand_getReceivers`, and the
-/// `register_receiver` action): every binary field hex, like `ReceiverRecordHex` — the id is
-/// derived (`record.id()`), not carried on the wire form, since a record's id is a function of
-/// its signing key rather than a field to trust separately.
-fn record_json(r: &ReceiverRecord) -> Value {
-    json!({
-        "id": r.id().to_string(),
-        "version": r.version,
-        "pk": word8_to_hex(&r.pk),
-        "kem_ek": hex::encode(&r.kem_ek),
-        "signing_key": r.signing_key.to_hex(),
-        "signature": hex::encode(r.signature.as_bytes()),
-    })
-}
-
 fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
     json!({
         "anchor": word8_to_hex(&b.anchor),
@@ -712,16 +685,10 @@ fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
     })
 }
 
-/// `bridge` is the asset registry and `receivers` the receiver registry, which a `BridgeAttest`
-/// needs and nothing else does: the deposit's asset index and its recipient's note-owning `pk`
-/// are both state, not fields of the transaction. `executor` is what computes that deposit's
-/// commitment, the one note commitment the wire does not carry.
-fn tx_json(
-    t: &Transaction,
-    bridge: Option<&BridgeMeta>,
-    receivers: &BTreeMap<ReceiverId, ReceiverRecord>,
-    executor: &dyn ConfidentialExecutor,
-) -> Value {
+/// `bridge` is the asset registry, which a `BridgeAttest` needs and nothing else does: the
+/// deposit's asset index is state, not a field of the transaction. `executor` is what computes
+/// that deposit's commitment, the one note commitment the wire does not carry.
+fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor) -> Value {
     let bundle = t.bundle.as_ref().map(bundle_json);
     let action = match &t.action {
         Action::None => json!({ "kind": "none" }),
@@ -763,8 +730,6 @@ fn tx_json(
                 "kind": "bridge_attest",
                 "attestation_len": attestation.len(),
                 "recipient": recipient.to_string(),
-                // short-shielded-address task 5: `recipient` is a receiver id and `Display`
-                // gives it in `rand1…` text directly — no separate address field to render.
                 // The index the action itself names — what the recipient's envelope was sealed
                 // for — beside the one the registry resolves. Admission refuses a transaction
                 // where they differ, so on a committed attest they agree; `asset_index` is still
@@ -784,14 +749,12 @@ fn tx_json(
                 "r": word8_to_hex(r),
                 // The leaf the chain appended for this deposit — the one note commitment the wire
                 // does not carry, since the chain computes it rather than the submitter. `null`
-                // for a rotation, which deposits nothing, and for a receiver id the registry does
-                // not (yet, on this node's view) hold — both are refusals to guess.
-                "commitment": deposit.and_then(|(index, amount)| {
-                    let pk = receivers.get(recipient)?.pk;
+                // for a rotation, which deposits nothing.
+                "commitment": deposit.map(|(index, amount)| {
                     let cm = randprotocol_core::ledger::bridge_notes::deposit_commitment(
-                        &pk, amount, index, *time, r, executor,
+                        recipient, amount, index, *time, r, executor,
                     );
-                    Some(word8_to_hex(&cm))
+                    word8_to_hex(&cm)
                 }),
             })
         }
@@ -821,11 +784,6 @@ fn tx_json(
             "kind": "aggregate", "covers": covers.len(), "proof_len": proof.len(),
             "aggregator": aggregator.to_base58(), "nonce": nonce, "time": time
         }),
-        Action::RegisterReceiver { record } => {
-            let mut v = record_json(record);
-            v["kind"] = json!("register_receiver");
-            v
-        }
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -874,7 +832,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             }
         }
         "rand_mint" => {
-            let to = parse_receiver_id(p, 0)?;
+            let to = parse_shielded(p, 0)?;
             let amount: u64 = match p.get(1) {
                 None | Some(Value::Null) => randprotocol_core::FAUCET_MAX_UNITS,
                 Some(v) => {
@@ -883,19 +841,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     s.parse().map_err(|_| RpcError::invalid_params("amount must be a string of units"))?
                 }
             };
-            // The third, optional parameter: a record as `record_json` renders one (hex fields).
-            // Without it the node resolves `to` from its own registry.
-            let record: Option<ReceiverRecord> = match p.get(2) {
-                None | Some(Value::Null) => None,
-                Some(v) => {
-                    let hex: randprotocol_core::genesis::ReceiverRecordHex = serde_json::from_value(v.clone())
-                        .map_err(|e| RpcError::invalid_params(format!("record: {e}")))?;
-                    Some(hex.to_record().map_err(|e| RpcError::invalid_params(format!("record: {e}")))?)
-                }
-            };
             let (reply, rx) = oneshot::channel();
             st.node
-                .send(NodeCommand::Mint { to, amount, record, reply })
+                .send(NodeCommand::Mint { to, amount, reply })
                 .await
                 .map_err(|_| RpcError::internal("node loop closed"))?;
             match rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))? {
@@ -1184,12 +1132,11 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                         .map_err(RpcError::internal)?
                         .ok_or_else(|| RpcError::not_found("block missing"))?;
                     let tx = b.transactions.get(index as usize).ok_or_else(|| RpcError::not_found("tx index"))?;
-                    let receivers = st.storage.receivers().map_err(RpcError::internal)?;
                     Ok(json!({
                         "height": height,
                         "index": index,
                         "block_hash": b.hash().to_hex(),
-                        "tx": tx_json(tx, bridge.as_ref(), &receivers, st.executor.as_ref()),
+                        "tx": tx_json(tx, bridge.as_ref(), st.executor.as_ref()),
                     }))
                 }
             }
@@ -1216,17 +1163,15 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let deposit_cm = match &tx.action {
                 Action::BridgeAttest { attestation, recipient, r, time, .. } => {
                     let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
-                    let receivers = st.storage.receivers().map_err(RpcError::internal)?;
-                    attest_deposit(attestation, bridge.as_ref()).and_then(|(index, amount)| {
-                        let pk = receivers.get(recipient)?.pk;
-                        Some(randprotocol_core::ledger::bridge_notes::deposit_commitment(
-                            &pk,
+                    attest_deposit(attestation, bridge.as_ref()).map(|(index, amount)| {
+                        randprotocol_core::ledger::bridge_notes::deposit_commitment(
+                            recipient,
                             amount,
                             index,
                             *time,
                             r,
                             st.executor.as_ref(),
-                        ))
+                        )
                     })
                 }
                 _ => None,
@@ -1303,44 +1248,6 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     "unbonding": e.unbonding,
                 }))
                 .collect::<Vec<_>>()))
-        }
-        // The receiver registry (spec §6): a record by id, or the whole registry. `null` for an
-        // id nobody has registered — not an error, since asking is how a wallet finds out.
-        "rand_getReceiver" => {
-            let id = parse_receiver_id(p, 0)?;
-            let m = st.storage.receivers().map_err(RpcError::internal)?;
-            Ok(m.get(&id).map(record_json).unwrap_or(Value::Null))
-        }
-        // Paged like `rand_getUnsealed` (final review item 2 — the unbounded form served the
-        // whole registry per call). `from` is a receiver id, exclusive of that row, or absent/null
-        // for the start; rows come back in `ReceiverId`'s own order, which is also the registry's
-        // `BTreeMap` order.
-        "rand_getReceivers" => {
-            let from = match p.get(0) {
-                None | Some(Value::Null) => None,
-                Some(_) => Some(parse_receiver_id(p, 0)?),
-            };
-            let limit = parse_limit(p, 1)?;
-            let m = st.storage.receivers().map_err(RpcError::internal)?;
-            let iter: Box<dyn Iterator<Item = (&ReceiverId, &ReceiverRecord)>> = match &from {
-                Some(id) => Box::new(m.range((std::ops::Bound::Excluded(id), std::ops::Bound::Unbounded))),
-                None => Box::new(m.iter()),
-            };
-            let mut rows = Vec::new();
-            let mut next_from = None;
-            let mut last = None;
-            for (id, rec) in iter {
-                if rows.len() >= limit {
-                    // `last` is the id of the row actually returned last, not this one — the
-                    // next page must start exclusive of it, or the row between the two pages
-                    // (this one) is dropped by neither page.
-                    next_from = last.map(|i: ReceiverId| i.to_string());
-                    break;
-                }
-                rows.push(record_json(rec));
-                last = Some(*id);
-            }
-            Ok(json!({ "receivers": rows, "next_from": next_from }))
         }
         "rand_getUnsealed" => {
             let from: u64 = param(p, 0, "from")?;
@@ -1512,6 +1419,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
 mod tests {
     use super::*;
     use crate::storage::fixtures::{self, alloc_note, bundle_fee, bundle_tx, genesis_with, key, make_block, make_block_unchecked};
+    use std::collections::BTreeMap;
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::genesis::GenesisState;
     use randprotocol_core::notes::DEPTH;
@@ -1566,23 +1474,6 @@ mod tests {
         call(st, method, params).await.unwrap_or_else(|e| panic!("{method}: {}", e.message))
     }
 
-    /// A chain with exactly one receiver registered beyond its validator's own payout, and that
-    /// record — for `rand_getReceiver`/`rand_getReceivers` to serve. Leaks its temp directory
-    /// (`std::mem::forget`) since `RpcState` outlives the fixture function; acceptable for a
-    /// short-lived test process, like the RocksDB handle it keeps open past the drop either way.
-    async fn state_with_one_receiver() -> (RpcState, ReceiverRecord) {
-        use randprotocol_core::receiver::receiver_signing_keypair;
-        let mut gs = genesis_with(7, vec![]);
-        let signing = receiver_signing_keypair(&[9; 32]);
-        let rec = ReceiverRecord::sign(&signing, gs.chain_id, 1, [9; 8], vec![9; randprotocol_core::notes::KEM_EK_BYTES]);
-        let mut receivers = gs.ledger.receivers().clone();
-        receivers.insert(rec.id(), rec.clone());
-        gs.ledger.set_receivers(receivers);
-        let (dir, st) = state_for(&gs);
-        std::mem::forget(dir);
-        (st, rec)
-    }
-
     fn nf(n: u8) -> Word8 {
         [n as u32 + 1000; 8]
     }
@@ -1635,40 +1526,14 @@ mod tests {
         covered_tx.bundle.as_mut().unwrap().proof = proof.to_bytes();
         let stub_twin = bundle_tx(&gs.ledger, [nf(1), nf(2)], [cm(1), cm(2)], fee);
         let kp = key(7);
-        // The registry, not the register, owns the note key (short-shielded-address task 4): the
-        // aggregator's payout id has to resolve before `RegisterAggregator` will, so its record
-        // rides its own bundle in the same block, anchored to the same block-start root.
-        let anchor = gs.ledger.root();
-        let payout_kp = randprotocol_core::receiver::receiver_signing_keypair(&[7; 32]);
-        let record = randprotocol_core::receiver::ReceiverRecord::sign(
-            &payout_kp,
-            7,
-            1,
-            [7; 8],
-            vec![8; randprotocol_core::notes::KEM_EK_BYTES],
-        );
-        let payout = record.id();
-        let mut rb = randprotocol_core::notes::Bundle {
-            anchor,
-            nullifiers: [nf(90), nf(91)],
-            commitments: [cm(90), cm(91)],
-            fee: bundle_fee(),
-            burn: 0,
-            asset: 0,
-            time: 1,
-            envelopes: [fixtures::env(5), fixtures::env(6)],
-            proof: vec![],
-        };
-        let rd = StubExecutor.bundle_digest(&rb.digest_input());
-        rb.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &rd);
-        let receiver_reg = Transaction::shielded(7, rb, Action::RegisterReceiver { record });
+        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
         let registration = AggregatorRegistration {
             public_key: kp.public_key().clone(),
-            payout,
+            payout: payout.clone(),
             signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
         };
         let mut b = randprotocol_core::notes::Bundle {
-            anchor,
+            anchor: gs.ledger.root(),
             nullifiers: [nf(3), nf(4)],
             commitments: [cm(3), cm(4)],
             fee: bundle_fee(),
@@ -1684,8 +1549,7 @@ mod tests {
         let mut l1 = gs.ledger.clone();
         l1.set_height(1);
         l1.set_timestamp_ms(1);
-        l1.apply_transactions(&[stub_twin.clone(), receiver_reg.clone(), register.clone()], &key(1).address(), &StubExecutor)
-            .unwrap();
+        l1.apply_transactions(&[stub_twin.clone(), register.clone()], &key(1).address(), &StubExecutor).unwrap();
         l1.record_anchor(1);
         // The ledger applied the stub twin, so its coverable entry is keyed by the twin's hash;
         // the stored bundle (and the aggregate's cover) is the real-proof one. Re-key it.
@@ -1693,7 +1557,7 @@ mod tests {
         let entry = fees.remove(&stub_twin.hash()).expect("the twin was bucketed");
         fees.insert(covered_tx.hash(), entry);
         l1.set_unsealed_fees(fees);
-        let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), receiver_reg, register], &key(1));
+        let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), register], &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
 
         let r = [9u32; 8];
@@ -1749,8 +1613,7 @@ mod tests {
         assert_eq!(b1["sealed"], false, "block 1's covered bundle is the only one sealed yet");
         let txs = b1["transactions"].as_array().unwrap();
         assert_eq!(txs[0]["sealed_by"], aggregate.hash().to_hex(), "the covered bundle names its aggregate");
-        assert_eq!(txs[1]["sealed_by"], Value::Null, "the receiver registration's bundle is uncovered");
-        assert_eq!(txs[2]["sealed_by"], Value::Null, "the aggregator registration's bundle is uncovered");
+        assert_eq!(txs[1]["sealed_by"], Value::Null, "the register's bundle is uncovered");
         let b2 = ok(&st, "rand_getBlockByHeight", json!([2])).await;
         assert_eq!(b2["transactions"].as_array().unwrap()[0]["action"]["kind"], "aggregate");
 
@@ -1782,7 +1645,7 @@ mod tests {
         assert!(bundles.iter().all(|b| b["hash"] != covered_tx.hash().to_hex()), "a sealed bundle is not work");
         assert!(bundles.iter().all(|b| b["hash"] != aggregate.hash().to_hex()), "an aggregate is not a bundle");
         // But before the seal it was exactly the work an aggregator wanted: hash, height, excess.
-        let register_tx = &st.storage.block_by_height(1).unwrap().unwrap().transactions[2];
+        let register_tx = &st.storage.block_by_height(1).unwrap().unwrap().transactions[1];
         assert!(
             bundles.iter().any(|b| b["hash"] == register_tx.hash().to_hex() && b["height"] == 1 && b["excess"] == "0"),
             "the register's bundle (no excess) is still coverable: {v}"
@@ -1803,94 +1666,6 @@ mod tests {
         assert_eq!(v["aggregation"]["verify_queue"], 0);
     }
 
-    /// The receiver registry's RPC surface (short-shielded-address task 6): a record by id,
-    /// `null` for one nobody has registered, and `-32602` for a string that is not an address at
-    /// all — the same three-way split `rand_getValidators`'s payout field and `rand_mint`'s first
-    /// parameter already answer to.
-    #[tokio::test]
-    async fn rand_get_receiver_serves_the_record_and_null_for_the_unknown() {
-        let (st, rec) = state_with_one_receiver().await;
-        let v = ok(&st, "rand_getReceiver", json!([rec.id().to_string()])).await;
-        assert_eq!(v["id"], rec.id().to_string());
-        assert_eq!(v["version"], 1);
-        assert_eq!(v["pk"], word8_to_hex(&rec.pk));
-        assert_eq!(v["kem_ek"].as_str().unwrap().len(), randprotocol_core::notes::KEM_EK_BYTES * 2);
-        assert_eq!(v["kem_ek"], hex::encode(&rec.kem_ek));
-        assert_eq!(v["signing_key"], rec.signing_key.to_hex());
-        assert_eq!(v["signature"], hex::encode(rec.signature.as_bytes()));
-        let none = ok(&st, "rand_getReceiver", json!([ReceiverId([1; 32]).to_string()])).await;
-        assert!(none.is_null());
-        assert_eq!(call(&st, "rand_getReceiver", json!(["rand1notanaddress"])).await.unwrap_err().code, -32602);
-
-        // `rand_getReceivers`: the whole registry, this one record among it, in the paged shape.
-        let all = ok(&st, "rand_getReceivers", json!([])).await;
-        let rows = all["receivers"].as_array().unwrap();
-        assert!(rows.iter().any(|r| r["id"] == rec.id().to_string()), "{all}");
-        assert!(all["next_from"].is_null(), "everything fit in one page: {all}");
-    }
-
-    /// `rand_getReceivers` pages (final review item 2): a `limit` of 1 returns one row and a
-    /// `next_from` cursor, and paging with that cursor as `from` walks the rest of the registry
-    /// in `ReceiverId` order without repeating or skipping a row — the same contract
-    /// `rand_getUnsealed` already answers to.
-    #[tokio::test]
-    async fn rand_get_receivers_pages_in_receiver_id_order() {
-        use randprotocol_core::receiver::receiver_signing_keypair;
-        // Five receivers total: the validator's own genesis payout plus four more, all filed in
-        // the genesis registry so the fixture needs no post-hoc storage write.
-        let mut gs = genesis_with(7, vec![]);
-        let mut receivers = gs.ledger.receivers().clone();
-        for seed in 20u8..24 {
-            let signing = receiver_signing_keypair(&[seed; 32]);
-            let r = ReceiverRecord::sign(
-                &signing,
-                gs.chain_id,
-                1,
-                [seed as u32; 8],
-                vec![seed; randprotocol_core::notes::KEM_EK_BYTES],
-            );
-            receivers.insert(r.id(), r);
-        }
-        gs.ledger.set_receivers(receivers);
-        let (dir, st) = state_for(&gs);
-        std::mem::forget(dir);
-
-        let mut want: Vec<ReceiverId> = st.storage.receivers().unwrap().into_keys().collect();
-        want.sort();
-        assert_eq!(want.len(), 5, "the validator's own payout plus the four seeded above");
-
-        // Page through with limit 2 and reassemble the id order.
-        let mut got = Vec::new();
-        let mut from: Option<String> = None;
-        loop {
-            let params = match &from {
-                Some(f) => json!([f, 2]),
-                None => json!([Value::Null, 2]),
-            };
-            let page = ok(&st, "rand_getReceivers", params).await;
-            let rows = page["receivers"].as_array().unwrap();
-            assert!(rows.len() <= 2, "{page}");
-            for r in rows {
-                got.push(ReceiverId::parse(r["id"].as_str().unwrap()).unwrap());
-            }
-            match page["next_from"].as_str() {
-                Some(next) => from = Some(next.to_string()),
-                None => break,
-            }
-        }
-        assert_eq!(got, want, "paging must walk the whole registry, in order, without a repeat or a gap");
-
-        // A limit of 1 against the very first id: exactly one row back, and a cursor that is
-        // that row''s own id — passing it back as the next call''s (exclusive) `from` is what
-        // resumes at `want[1]`, exercised by the loop above.
-        let first = ok(&st, "rand_getReceivers", json!([Value::Null, 1])).await;
-        assert_eq!(first["receivers"].as_array().unwrap().len(), 1);
-        assert_eq!(first["receivers"][0]["id"], want[0].to_string());
-        assert_eq!(first["next_from"], want[0].to_string());
-        let second = ok(&st, "rand_getReceivers", json!([want[0].to_string(), 1])).await;
-        assert_eq!(second["receivers"][0]["id"], want[1].to_string(), "the cursor's own id, passed back, resumes after it");
-    }
-
     fn aggregate_agg_addr(_st: &RpcState) -> String {
         key(7).public_key().address().to_base58()
     }
@@ -1902,7 +1677,7 @@ mod tests {
         use randprotocol_core::types::actions::{AggregatorRegistration, SignedAggregateHeader};
         let kp = key(7);
         let addr = kp.public_key().address();
-        let payout = randprotocol_core::receiver::ReceiverId([7; 32]);
+        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; 32] };
         let sig = randprotocol_core::Signature::empty();
         let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
         let tx = |action| Transaction {
@@ -1910,7 +1685,7 @@ mod tests {
             bundle: None,
             action,
         };
-        let registration = AggregatorRegistration { public_key: kp.public_key().clone(), payout, signature: sig.clone() };
+        let registration = AggregatorRegistration { public_key: kp.public_key().clone(), payout: payout.clone(), signature: sig.clone() };
         let header = |covers: Vec<Hash>| SignedAggregateHeader {
             aggregator: addr,
             nonce: 3,
@@ -1973,7 +1748,7 @@ mod tests {
             ),
         ];
         for (t, kind, want) in cases {
-            let j = tx_json(&t, None, &BTreeMap::new(), &StubExecutor);
+            let j = tx_json(&t, None, &StubExecutor);
             assert_eq!(j["action"]["kind"], kind, "{t:?}");
             for (k, v) in want.as_object().unwrap() {
                 assert_eq!(&j["action"][k], v, "{kind}.{k}: {j}");
@@ -2065,19 +1840,16 @@ mod tests {
         let (_d, st) = state_for(&gs);
         let err = call(&st, "rand_mint", json!(["not-an-address"])).await.unwrap_err();
         assert_eq!(err.code, -32602);
-        // The message carries the id parser's own reason, not a generic one.
-        let reason = ReceiverId::parse("not-an-address").unwrap_err().to_string();
+        // The message carries the address parser's own reason, not a generic one.
+        let reason = ShieldedAddress::parse("not-an-address").unwrap_err().to_string();
         assert!(err.message.contains(&reason), "{} does not contain {reason}", err.message);
-        // A well-formed id gets past parsing and dies at the (dropped) node channel.
-        let good = fixtures::recipient().to_string();
+        // A well-formed address gets past parsing and dies at the (dropped) node channel.
+        let good = randprotocol_zkvm::address::address_of(&randprotocol_zkvm::notes::SpendKey([7; 8]).viewing_key()).to_string();
         assert_eq!(call(&st, "rand_mint", json!([good])).await.unwrap_err().code, -32603);
     }
 
     /// An over-long address parameter is refused on its length, before it reaches the base58
-    /// decoder — which is quadratic in its input and runs on a worker the node loop shares. The
-    /// expected count is derived from `huge` itself rather than pinned, so this never goes stale
-    /// the way the pre-short-shielded-address literal (a `ShieldedAddress`-sized "3007 characters")
-    /// did.
+    /// decoder — which is quadratic in its input and runs on a worker the node loop shares.
     #[tokio::test]
     async fn an_oversized_address_is_refused_before_it_is_parsed() {
         let gs = fixtures::genesis(1);
@@ -2085,12 +1857,12 @@ mod tests {
         let huge = format!("rand1{}", "1".repeat(3000));
         let err = call(&st, "rand_mint", json!([huge])).await.unwrap_err();
         assert_eq!(err.code, -32602);
-        assert!(err.message.contains(&format!("{} characters", huge.len())), "{}", err.message);
+        assert!(err.message.contains("3007 characters"), "{}", err.message);
         assert!(err.message.contains(&MAX_ADDRESS_CHARS.to_string()), "{}", err.message);
-        // The cap is generous: a real id is well under it and still parses.
-        let good = fixtures::recipient().to_string();
-        assert!(good.len() < MAX_ADDRESS_CHARS, "a real id is {} characters", good.len());
-        assert!(ReceiverId::parse(&good).is_ok());
+        // The cap is generous: a real address is well under it and still parses.
+        let good = randprotocol_zkvm::address::address_of(&randprotocol_zkvm::notes::SpendKey([7; 8]).viewing_key()).to_string();
+        assert!(good.len() < MAX_ADDRESS_CHARS, "a real address is {} characters", good.len());
+        assert!(ShieldedAddress::parse(&good).is_ok());
     }
 
     #[tokio::test]
@@ -2258,7 +2030,7 @@ mod tests {
     async fn validators_report_the_whole_register_and_who_is_active() {
         let (_d, st, _gs) = chain();
         let newcomer = key(9);
-        let payout = randprotocol_core::receiver::ReceiverId([3; 32]);
+        let payout = ShieldedAddress { pk: [3; 8], kem_ek: vec![4; randprotocol_core::notes::KEM_EK_BYTES] };
         st.storage
             .overwrite_validator_for_testing(
                 &newcomer.address(),
@@ -2267,7 +2039,7 @@ mod tests {
                     stake: 700,
                     pending: vec![(4, 250)],
                     rewards: 11,
-                    payout,
+                    payout: payout.clone(),
                     nonce: 3,
                 },
             )
@@ -2357,41 +2129,19 @@ mod tests {
         // Block 1: a registration, whose bundle burns exactly the bond.
         let mut ledger = gs.ledger.clone();
         let kp = key(7);
-        // The registry, not the register, owns the note key (short-shielded-address task 4): the
-        // aggregator's payout id has to resolve before `RegisterAggregator` will.
-        let anchor = ledger.root();
-        let payout_kp = randprotocol_core::receiver::receiver_signing_keypair(&[7; 32]);
-        let record = randprotocol_core::receiver::ReceiverRecord::sign(
-            &payout_kp,
-            1,
-            1,
-            [7; 8],
-            vec![8; randprotocol_core::notes::KEM_EK_BYTES],
-        );
-        let payout = record.id();
-        let mut rb = randprotocol_core::notes::Bundle {
-            anchor,
-            nullifiers: [nf(90), nf(91)],
-            commitments: [cm(90), cm(91)],
-            fee: bundle_fee(),
-            burn: 0,
-            asset: 0,
-            time: 1,
-            envelopes: [fixtures::env(5), fixtures::env(6)],
-            proof: vec![],
+        let payout = randprotocol_core::notes::ShieldedAddress {
+            pk: [7; 8],
+            kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES],
         };
-        let rd = StubExecutor.bundle_digest(&rb.digest_input());
-        rb.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &rd);
-        let receiver_reg = Transaction::shielded(1, rb, randprotocol_core::types::Action::RegisterReceiver { record });
         let registration = randprotocol_core::types::actions::AggregatorRegistration {
             public_key: kp.public_key().clone(),
-            payout,
+            payout: payout.clone(),
             signature: kp.sign(
                 randprotocol_core::types::actions::aggregator_register_message(1, &payout).as_bytes(),
             ),
         };
         let mut b = randprotocol_core::notes::Bundle {
-            anchor,
+            anchor: ledger.root(),
             nullifiers: [nf(1), nf(2)],
             commitments: [cm(1), cm(2)],
             fee: bundle_fee(),
@@ -2404,7 +2154,7 @@ mod tests {
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d);
         let register = Transaction::shielded(1, b, randprotocol_core::types::Action::RegisterAggregator { registration });
-        let b1 = make_block(&gs.block, &mut ledger, vec![receiver_reg, register], &key(1));
+        let b1 = make_block(&gs.block, &mut ledger, vec![register], &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
         let v = ok(&st, "rand_getSupply", json!([])).await;
@@ -2430,12 +2180,12 @@ mod tests {
         };
         let v = randprotocol_core::Address([3; 32]);
         let sig = randprotocol_core::Signature::empty();
-        let recipient = ReceiverId([4; 32]);
+        let recipient = ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
         let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
 
         let j = |action| {
             let tx = Transaction::shielded(1, b([nf(1), nf(2)], [cm(1), cm(2)]), action);
-            tx_json(&tx, None, &BTreeMap::new(), &StubExecutor)["action"].clone()
+            tx_json(&tx, None, &StubExecutor)["action"].clone()
         };
 
         let bond = j(Action::Bond { validator: v, amount: 500, registration: None });
@@ -2446,7 +2196,7 @@ mod tests {
 
         // The two validator-signed actions ride bundle-less, so they are rendered as they ride.
         let bundle_less =
-            |action| tx_json(&Transaction { chain_id: 1, bundle: None, action }, None, &BTreeMap::new(), &StubExecutor);
+            |action| tx_json(&Transaction { chain_id: 1, bundle: None, action }, None, &StubExecutor);
         let unbond = bundle_less(Action::Unbond { validator: v, amount: 7, nonce: 2, signature: sig.clone() });
         assert!(unbond["bundle"].is_null(), "an unbond carries no bundle");
         let unbond = unbond["action"].clone();
@@ -2603,7 +2353,7 @@ mod tests {
     /// deposit's amount and the note's asset index, neither of which is a field of the action.
     #[tokio::test]
     async fn an_attestation_renders_its_deposit_against_the_registry() {
-        let (_d, st, gs, att) = bridged_chain();
+        let (_d, st, _gs, att) = bridged_chain();
         let v = ok(&st, "rand_getTransaction", json!([att.hash().to_hex()])).await;
         let action = &v["tx"]["action"];
         assert_eq!(action["kind"], "bridge_attest");
@@ -2620,7 +2370,7 @@ mod tests {
         assert_eq!(action["time"], 0, "the note's own time word, not the height it applied at");
         // And the commitment the chain computed from exactly those fields is the leaf it appended.
         let cm = randprotocol_core::ledger::bridge_notes::deposit_commitment(
-            &fixtures::recipient_record(gs.chain_id).pk,
+            &fixtures::recipient(),
             1_000,
             1,
             0,
@@ -2941,8 +2691,12 @@ mod tests {
             let b2 = fixtures::make_block_voted(&b1.block, &mut ledger, txs, &v, &[&v]);
             let withdraw_leaf = b2.deposits[0].index;
             storage.commit(&[b1, b2], &ledger, &[], &StubExecutor).unwrap();
-            let expected_deposit = randprotocol_core::ledger::bridge_notes::deposit_note(&att, &ledger, &StubExecutor)
-                .expect("the attestation deposits into a registered asset");
+            let expected_deposit = randprotocol_core::ledger::bridge_notes::deposit_note(
+                &att,
+                ledger.bridge().expect("bridged genesis"),
+                &StubExecutor,
+            )
+            .expect("the attestation deposits into a registered asset");
 
             let v_json = ok(&st, "rand_getCompactBlocks", json!([2, 2])).await;
             let rows = v_json.as_array().unwrap();

@@ -10,12 +10,10 @@ pub mod genesis;
 pub mod ledger;
 pub mod notes;
 pub mod program;
-pub mod receiver;
 pub mod types;
 
 pub use crypto::{Address, Hash, Keypair, PublicKey, Signature};
 pub use ledger::{BlockError, Ledger, TxError};
 pub use notes::{Bundle, Envelope, ShieldedAddress, Word8};
 pub use program::{CallOutcome, CallReceipt, ProgramId, ProgramRecord};
-pub use receiver::{ReceiverId, ReceiverRecord};
 pub use types::*;

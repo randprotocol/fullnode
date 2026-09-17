@@ -537,7 +537,7 @@ mod tests {
     use randprotocol_core::bridge::{digest, sign_digest, Attestation, Body, Payload, Transfer, CHAIN_RAND};
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::ledger::ANCHOR_WINDOW;
-    use randprotocol_core::receiver::ReceiverId;
+    use randprotocol_core::notes::ShieldedAddress;
     use randprotocol_core::types::Action;
 
     /// A ledger at the fixtures' genesis, with the faucet on and a height past 0 so bundles can
@@ -981,8 +981,8 @@ mod tests {
         (gs.ledger.clone(), secrets)
     }
 
-    fn recipient() -> ReceiverId {
-        fixtures::recipient()
+    fn recipient() -> ShieldedAddress {
+        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
     }
 
     /// The one attestation both relayers see: 1,000 of chain 2's token to `recipient()`,
@@ -1005,7 +1005,7 @@ mod tests {
                 amount: Transfer::u256_from_u128(1_000),
                 token_address: token,
                 token_chain: 2,
-                to: recipient().0,
+                to: recipient().recipient_hash(),
                 to_chain: CHAIN_RAND,
                 fee: Transfer::u256_from_u128(0),
             })
@@ -1289,12 +1289,10 @@ mod tests {
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d);
-        // The registry, not the register, owns the note key (short-shielded-address task 4): the
-        // aggregator's payout id has to resolve before `RegisterAggregator` will.
-        let payout = fixtures::registered_receiver(&mut l, &fixtures::key(1).address(), [nf(90), nf(91)], [cm(90), cm(91)], 7, [7; 8]);
+        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
         let registration = AggregatorRegistration {
             public_key: kp.public_key().clone(),
-            payout,
+            payout: payout.clone(),
             signature: kp.sign(aggregator_register_message(1, &payout).as_bytes()),
         };
         let register = Transaction::shielded(1, b, Action::RegisterAggregator { registration });
