@@ -72,7 +72,7 @@ Three pieces of code, one of them new:
 
 | piece | crate | what |
 |---|---|---|
-| **job codec and sealing** | `randprotocol-zkvm`, new module `delegate` (node-owned, like `address.rs` and `call_envelope.rs`; never touched by `deploy/sync-zkvm.sh`) | the `JobRequest` / `JobResult` types, their bincode form, and the seal/open functions both ends share |
+| **job codec and sealing** | `randprotocol-zkvm`, new module `delegate` (node-owned, like `address.rs` and `call_envelope.rs`; never touched by `deploy/sync-zkvm.sh`) | the `JobRequest` / `JobResult` types, their postcard form, and the seal/open functions both ends share |
 | **the prover service** | new crate `crates/randprotocol-prover`, binary `rand-prover` | HTTP server, queue, one proving slot per backend, key file, auth, zeroization |
 | **the wallet side** | `randprotocol-client` | a `Prover` value (local or remote) threaded where a `Backend` is today; three flags; the digest and salt handling that already exists, reused |
 
@@ -133,9 +133,9 @@ upstream).
   makes a prover key, `rand address` prints what a wallet pins, and no new key format exists.
 - **Job:** `SealedJob { kem_ct, body }`. `kem_ct` is the encapsulation to the prover's
   `kem_ek`; `body` is ChaCha20-Poly1305 under the shared secret, random 12-byte nonce
-  prepended, associated data `b"rand-prover-job-v1"`, plaintext `bincode(JobRequest)`.
+  prepended, associated data `b"rand-prover-job-v1"`, plaintext `postcard(JobRequest)`.
 - **Result:** `SealedResult { kem_ct, body }`, the same construction to the job's `reply_ek`,
-  associated data `b"rand-prover-result-v1"`, plaintext `bincode(JobResult)`. The wallet draws
+  associated data `b"rand-prover-result-v1"`, plaintext `postcard(JobResult)`. The wallet draws
   a fresh ML-KEM keypair per job from OS entropy and forgets it after opening the result.
 - TLS is the operator's (a reverse proxy in front of `rand-prover`). The sealing is what
   protects the witness; TLS protects the bearer token and hides which wallet talks to which
@@ -151,9 +151,9 @@ yield a job the prover proves or a result the wallet submits.
 
 | route | body | answer |
 |---|---|---|
-| `POST /v1/jobs` | `application/octet-stream`, `bincode(SealedJob)` | `202 {"id": "<32 hex>", "position": n}` or `429 {"error": "...", "retry_after_secs": n}` when the queue is full or the job cannot start before its deadline |
+| `POST /v1/jobs` | `application/octet-stream`, `postcard(SealedJob)` | `202 {"id": "<32 hex>", "position": n}` or `429 {"error": "...", "retry_after_secs": n}` when the queue is full or the job cannot start before its deadline |
 | `GET /v1/jobs/{id}` | — | `{"state": "queued" \| "proving" \| "done" \| "failed" \| "expired", "position"?: n, "elapsed_ms"?: n}` |
-| `GET /v1/jobs/{id}/result` | — | `200 application/octet-stream bincode(SealedResult)` once done or failed; `404` before; results are kept for 10 minutes after completion, then dropped |
+| `GET /v1/jobs/{id}/result` | — | `200 application/octet-stream postcard(SealedResult)` once done or failed; `404` before; results are kept for 10 minutes after completion, then dropped |
 | `GET /v1/health` | — | `{"version", "backend": "cpu" \| "cuda", "slots", "queue_depth", "proving", "address": "rand1…"}` — the address so a wallet can check its pin |
 
 - **One proving slot per backend** by default (`--slots`), a bounded FIFO queue

@@ -31,7 +31,7 @@ rand-prover run --key prover.key.json --listen 127.0.0.1:8600 --token "$(openssl
 | `--cuda` | off | prove on the GPU; needs a build with `--features cuda` |
 | `--slots` | 1 | concurrent proofs, one per GPU (zero is refused at startup) |
 | `--max-queue` | 8 | jobs waiting beyond the slots |
-| `--per-ip` | 2 | jobs one client address may have in flight |
+| `--per-ip` | 2 | jobs one client address may have in flight — the *source* address of the connection, which behind a reverse proxy is the proxy itself, so every wallet shares one cap: raise it there, or terminate TLS on the prover. A forwarded-for header is not honoured in v1 |
 | `--result-ttl-secs` | 600 | how long a finished result waits to be fetched |
 | `--allow-open` | off | listen off loopback with no token — every job is then free compute for anyone who finds it |
 
@@ -72,7 +72,10 @@ polls (surviving a dropped poll — up to five transport-error retries — and b
 wait at the deadline plus 900 s), fetches the sealed result, opens it, and — this is the part
 that makes a *wrong* prover harmless short of custody — checks that the proof publishes the
 digest the wallet computed from its own plaintext, and that the salt in the result is the one
-it asked for. A proof of any other bundle, or an unrequested salt, is refused before the chain
+it asked for *and the one the proof was made with* (it recomputes `H_IN` from the returned salt
+and compares it to the commitment the proof publishes, so a salt that would make the wallet seal
+a transcript the proof does not commit to is caught before submission). A proof of any other
+bundle, an unrequested salt, or a salt that does not match the proof, is refused before the chain
 sees it. Envelopes, transaction keys and submission are the same code as the local path.
 
 **Deadline.** `--prover-deadline` (default 120 s) is how long the prover may take to *start*
@@ -90,7 +93,7 @@ local proving: a phone that delegated because it cannot prove would only hang.
 | `refused the token (401)` | wrong or missing bearer | set `--prover-token` |
 | `is busy (429): …; it estimates N s` | queue full or the deadline cannot be met | wait N s, raise `--prover-deadline`, or prove locally |
 | `reports a different address than --prover-address pins` | wrong pin, or a different prover behind that URL | fix the pin; nothing was sent |
-| `refusing to submit` | the returned proof is for some other bundle, or an unrequested salt | stop using that prover |
+| `refusing to submit` | the returned proof is for some other bundle, or the salt is not the one the proof was made with | stop using that prover |
 | `could not start the job within N s` | it queued past the deadline | run the command again |
 
 ## What the experiment measures
