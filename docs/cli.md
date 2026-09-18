@@ -266,17 +266,17 @@ Global options, accepted before or after the subcommand:
 | `send <TO> <AMOUNT>` | `--fee <RAND>` (default `0.001`), `--no-wait`, `--cuda` | scan, select at most two notes, prove a 2-in-2-out bundle locally, submit; waits for the commit unless `--no-wait` |
 | `bond <VALIDATOR> <AMOUNT>` | `--registration <hex>`, `--fee <RAND>` (default `0.001`), `--no-wait`, `--cuda` | stake onto a validator: the bundle burns the amount out of this wallet's notes. `--registration` (from `rand-node register`) exactly when the validator is not in the register yet, and then at least 1000 RAND; prints the new stake and the epoch it counts from (`docs/staking.md`) |
 | `faucet [ADDRESS]` | `--amount <RAND>` (default `100`, max `100`) | testnet only: ask a validator node to mint into a note for `ADDRESS` (default: this wallet), wait for the commit |
-| `program build` | `--guest <fib\|memcpy\|bubble_sort\|balance_check\|private_payment>`, `--arg N` (repeatable), `--out <file>` (default `program.json`) | assemble a built-in guest to `{base_pc, words}` JSON; prints the program id |
-| `program deploy <FILE>` | `.json`, `.bin` (raw LE words), or `.bin` as the image container `rand-guest build` emits, `--cuda` | print the program id, `hc` and word count; check this chain's program cap with `rand_estimateFee` (refuses an over-cap program before any proving); pay the deploy floor through a bundle, wait for the commit |
+| `program build` | `--guest <fib\|memcpy\|bubble_sort\|balance_check\|private_payment\|public_echo>`, `--arg N` (repeatable), `--out <file>` (default `program.json`) | assemble a built-in guest to `{base_pc, words}` JSON; prints the program id |
+| `program deploy <FILE>` | `.json`, `.bin` (raw LE words), or `.bin` as the image container `rand-guest build` emits, `--public <FILE>`, `--cuda` | print the program id, `hc` and word count (and, with `--public`, the public input's word count and digest); check this chain's program cap with `rand_estimateFee`, and a public input's length against `max_program_public_words` from `rand_getLimits` (refuses either before any proving); pay the deploy floor, public words included, through a bundle, wait for the commit |
 | `program show <ID>` | | deployed program metadata |
-| `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--tier T`, `--fee <RAND>`, `--auditor <rand1…>`, `--no-envelope`, `--print-call-key`, `--cuda` | fetch the code from the node, prove the call locally with the chain's FRI profile, seal its input transcript, pay through a bundle, wait, print the receipt |
+| `call <PROGRAM-ID>` | `--input N` (repeatable, private), `--expect-public <FILE>`, `--tier T`, `--fee <RAND>`, `--auditor <rand1…>`, `--no-envelope`, `--print-call-key`, `--cuda` | fetch the code and the program's public input from the node and check that they hash to `PROGRAM-ID`; read the chain's limits (`rand_getLimits`); prove the call locally with the chain's FRI profile over that public input; refuse a proof over `max_proof_bytes` before the paying bundle is proved; seal its input transcript; pay through a bundle, wait, print the receipt (with `h_pub`) |
 | `open-call <TXHASH>` | `--call-key <hex>`, `--as-auditor` | fetch the receipt and the sealed transcript, open it, check it against the receipt's `H_IN`, re-run the program on the recovered inputs and compare the outputs with the receipt's. **Exits non-zero** if the transcript is not the preimage of that `H_IN`, or if the re-run disagrees with the receipt |
 | `receipt <TX>` | | receipt of a committed call, or "no receipt" |
 | `bridge-mint <ATTESTATION>` | hex or `@path`, `--to <rand1…>`, `--fee <RAND>`, `--no-wait`, `--cuda` | deposit a guardian-signed attestation as a note: seal the deposit's envelope for its recipient and pay through a bundle from this wallet. Prints the note's `owner`, `time` and `r` every time, and on the waiting path checks the asset index the chain actually deposited under |
 | `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | `--relayer-fee N`, `--fee <RAND>` (default `0.002`), `--no-wait`, `--cuda` | burn a bridged asset to another chain: check the chain has a bridge and holds `ASSET` in its registry, select that asset's notes for the asset bundle and RAND for the fee bundle, prove **both**, submit one transaction. `--relayer-fee` is a *portion* of `AMOUNT` paid to the relayer on the destination chain, not an extra charge: the asset bundle burns exactly `AMOUNT` |
 | `bridge` | | the bridge's public state: guardians, emitters, the asset registry, `next_index`, the burn sequence |
 | `bridge-message <SEQUENCE>` | | one outbound burn message, verbatim, for a guardian to sign |
-| `fee bundle` / `fee deploy <words>` / `fee call <tier>` | | minimum fee from the node's schedule |
+| `fee bundle` / `fee deploy <words>` / `fee call <tier>` | `--public-words M` (`deploy`), `--bytes B` (`call`) | minimum fee from the node's schedule. `--public-words` prices a public input like code words; `--bytes` is the call's proof plus input-envelope bytes, and only bytes past the free 2 MiB + 18 432 add to the fee (1 000 units per KiB) |
 | `tx <HASH>` | | committed transaction with its block height and index, or "not found" |
 | `tx-key <HASH>` | | one row per output of that transaction this wallet sent, received or kept as change: `output` (`bundle:0`, `bundle:1`, `asset_bundle:N`, `mint:0`), role, amount, and the per-transaction key it was sealed under. Recovered from the chain through the envelope's sender or receiver half, so it works for any past transaction; hand a `sent` row's key to a payee or auditor and `rand_checkTransaction <HASH> <KEY>` discloses that one output. Errors if the wallet opens no output of the transaction |
 | `block <ID>` | | block by height (integer) or by hash (hex) |
@@ -318,6 +318,34 @@ registry already names cannot move: an index is assigned once, forever.
 `--cuda` proves on an attached NVIDIA GPU and requires a build with `--features cuda`. There is no
 fallback: a missing driver is an error rather than a silent CPU run.
 
+**Public inputs.** `program deploy --public <FILE>` stores a public input with the program, on a
+chain whose genesis sets `max_program_public_words` (0, none, by default). The file is one of two
+forms:
+
+- whitespace-separated u32 words, each decimal or `0x` hex;
+- an ELF (`\x7fELF` magic; a `.so` name must be one), word-encoded as the sBPF guest reads its
+  program: the byte length, then the bytes four per word, little-endian, the last word
+  zero-padded. The committed SPL Token ELF (108 600 bytes) is 27 151 words.
+
+The program id then binds the public input too (`program_id_with_public`), so the id `deploy`
+prints differs from the one `program build` printed for the same code. A call carries no public
+words of its own. `rand call` fetches the program's (`rand_getProgramPublic`), checks that code and
+public input hash to the id, and proves over them. The chain checks the proof's `H_PUB` against
+the digest it recorded at deploy, so a proof over any other public input is refused.
+`--expect-public <FILE>` refuses before proving when the program's public input is not that
+file's words.
+
+**Call limits.** `rand call` reads the chain's limits from `rand_getLimits`:
+
+- the most private input words a call with an input transcript may carry is
+  `(max_call_envelope_bytes − 1 252) / 4`, where 1 252 bytes is the transcript's fixed overhead
+  with an auditor named. That is 4 295 on a default chain, and 16 071 at 65 536 bytes. A node
+  without `rand_getLimits` gets the old 4 096;
+- a proof over `max_proof_bytes` (default 2 MiB) is refused before the paying bundle is proved.
+
+The default fee is `0.001 + call_fee(tier, bytes)`, where `bytes` is the proof plus the sealed
+transcript.
+
 ### A first shielded transfer
 
 ```bash
@@ -336,6 +364,17 @@ rand program build --guest balance_check --arg 1000 --out bc.json
 rand program deploy bc.json                   # prints the program id
 rand call <id> --input 100 --input 200 --input 300 --input 400
 rand open-call <txhash>                       # inputs: [100, 200, 300, 400] — verdict: faithful (exit 0)
+```
+
+### A program with a public input
+
+```bash
+rand program build --guest public_echo --out echo.json   # reads four public words
+echo "1 2 3 4" > public.txt
+rand program deploy echo.json --public public.txt    # program id binds the four words
+rand call <id>                                       # proves over [1, 2, 3, 4]: out0 = 12, receipt has h_pub
+rand call <id> --expect-public other.txt             # refused before proving if the words differ
+rand program deploy sbpf.bin --public spl_token.so   # an ELF as 27 151 public words (needs max_program_public_words ≥ 27 151)
 ```
 
 ### Key file formats
