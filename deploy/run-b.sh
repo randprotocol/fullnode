@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 # the long ML-KEM address is back, chain 10's form; no hash-domain or peer-id change, so this is the same p2p
 # identity as chain 10) — the whole fleet must run this one build, because a genesis-format
 # change is a fork and a mixed fleet stalls. Override with BINDIR= to test a build.
-BINDIR=${BINDIR:-bin-c66e6b8}
+BINDIR=${BINDIR:-bin-4504a03}
 BIN=$BINDIR/rand-node
 [ -x $BIN ] || { echo "$BIN missing — build it at the chain-12 commit or set BINDIR" >&2; exit 1; }
 DATA=data-b-605eb783   # keyed on the genesis hash so a regenerated genesis gets a fresh db

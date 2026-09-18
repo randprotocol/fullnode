@@ -4,7 +4,37 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-17)
+## Project memory (state as of 2026-09-18)
+
+### v0.3 — the RPC release — LIVE on chain 12 (2026-09-18), pinned build `4504a03`
+
+Eleven JSON-RPC methods (`rand_getVersion`, `rand_getGenesisHash`, `rand_getHealth`,
+`rand_getTransactionStatus`, `rand_getReceipts`, `rand_getWitnesses`, `rand_getBlocks`,
+`rand_getFinality`, `rand_getProposer`, `rand_getMempoolInfo`, `rand_getEmission`) and two
+WebSocket topics (`receipts`, `transaction`), from the Ethereum/Solana comparison
+(`docs/rpc-comparison.md`). Spec `docs/superpowers/specs/2026-09-18-rpc-v0.3-design.md` (§9 lists
+every decision changed in implementation), plan `…/plans/2026-09-18-rpc-v0.3.md`; built on branch
+`rpc-v0.4` (the release was renamed v0.3 mid-run; **v0.4 is now the rand-guest toolchain and the
+sBPF/EVM → RV32 transpilers**). Node-only: no consensus, wire or genesis change; rolled to 16
+droplets + A as a same-chain update (`deploy/README.md`, "The v0.3 same-chain update").
+**Traps learned:**
+- **The database is forward-only.** v0.3 adds the `receipts_by_program` column family; RocksDB in
+  a pre-v0.3 binary refuses to open it. Roll back with `rand-node db drop-receipts-index --datadir
+  <dir>` (v0.3 binary, node stopped) *before* re-pinning — rehearsed on A's real database.
+- **Node startup is ~4 min** (quick chain verify before the RPC opens, 239 s at 59k blocks). A
+  rolling update waits on `rand_getHealth` = `ok` per node, not a sleep.
+- **`rand_getVersion`'s sha**: `rebuild-vps.sh` passes `RAND_BUILD_SHA` because E's
+  `/root/fullnode/.git` is stale (rsync `--exclude .git` protects it from `--delete`). The
+  `version` field still reads the crate's `0.1.0` — the workspace version was never bumped.
+- **`rejected` in `rand_getTransactionStatus` / the `transaction` topic is byte-level refusals
+  only** (`admission::is_permanent`); a spent nullifier or expired anchor is not remembered and
+  reads `unknown` once out of the pool.
+- `main.rs`'s `the_genesis_hash_is_pinned` fails on main before and after v0.3 (left `78390828…`,
+  right `fb5881c8…`) — pre-existing, not investigated.
+Follow-ups (deferred Minors, all non-blocking): `CommitSummary` cloned per WebSocket receiver
+(`Arc` it); `select!` not biased commit-before-refusal; `rand_getUnsealed` still `load_ledger`s
+on the async thread; the client's `-32601` fallback is sticky per process; untested: cap across
+WS topics, lag close on commits/refusals, `receipts` topic end to end.
 
 ### Chain 12 (RAND, the long shielded address again) is LIVE — the short address is reverted (2026-09-17)
 

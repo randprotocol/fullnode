@@ -25,7 +25,7 @@ Test keys only; all seeds are committed on purpose so any machine can pull and r
 | chain id | **12** |
 | genesis hash | **`605eb7830963833ef897455b98cd2a641aec58e0291460898a5d19ab88760ef0`** |
 | genesis file | `deploy/genesis-chain12.json` (cut 2026-09-17; chain 11's stays at `deploy/genesis-chain11.json`, chain 10's at `deploy/genesis-chain10.json`) |
-| pinned build | **`c66e6b8`** — the revert commit `17db41d` plus one test-only line, so the binary is byte-identical to `17db41d` (sha256 `b7983e56…` on Linux, `c7736318…` on macOS); binaries `rand-node` and `rand` in `bin-c66e6b8/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `c66e6b8` |
+| pinned build | **`4504a03`** — tag **`v0.3`**, the RPC release (eleven methods, two WebSocket topics, the `receipts_by_program` index); node-only, same chain (sha256 `16e41293…` on Linux, `059a999d…` on macOS); binaries `rand-node` and `rand` in `bin-4504a03/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `4504a03`. **The database is forward-only**: see "Rolling back v0.3" before re-pinning an older build |
 | zkVM | **constraint set 6** (the public input segment; M4.3 EVM and M4.4 sBPF/sha256 guests ride along) — unchanged, the revert touches no proof |
 | `hc_bundle` | `4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb` |
 | validators | **18, every one staked at exactly 1000 RAND** (the staking minimum) |
@@ -170,7 +170,7 @@ parse — so this is a clean start on every machine. Keep chain 11's data direct
 want to keep serving it; the new `DATA` name is keyed on the genesis hash, so the two never
 collide.
 
-1. **Binary**: `bin-c66e6b8/rand-node` and `bin-c66e6b8/rand` (or `cargo build --release`
+1. **Binary**: `bin-4504a03/rand-node` and `bin-4504a03/rand` (or `cargo build --release`
    at the pinned commit; the Linux ones are built once on E and fanned out by
    `deploy/cutover-droplet.sh` at a chain cut, or by `deploy/update-droplet.sh` for a
    same-chain binary update). Every node on the fleet must run this one build — a genesis
@@ -180,7 +180,7 @@ collide.
    the file has no `receivers` array.
 3. **Fresh data dir**: `data-<letter>-605eb783` (never reuse a chain-11 directory).
 4. **`.update-pin`** on the MacBook Air (node B, auto-updater): set its content to
-   **`c66e6b8`**, or the updater drags B onto whatever build it last pinned and B drops out of
+   **`4504a03`**, or the updater drags B onto whatever build it last pinned and B drops out of
    the set.
 5. **Start**, and check `rand-node status`: `height` climbing, `chain id 12`,
    `hc_bundle 4a27356f…`, `active_validator: true`, `notes: 5` at genesis.
@@ -258,6 +258,39 @@ On A and B: `./deploy/run-a.sh` / `./deploy/run-b.sh` (they init `data-{a,b}-8c7
 `deploy/push-to-vps.sh <ip> <letter> "<bootstrap multiaddrs>" [validator|observer]` provisions from
 scratch, `deploy/rebuild-vps.sh <ip>` rebuilds on a new commit and restarts. Service name:
 `rand-node`.
+
+### The v0.3 same-chain update to `4504a03` (2026-09-18)
+
+The RPC release (tag `v0.3`: eleven methods, the `receipts` and `transaction` WebSocket topics,
+the `receipts_by_program` column family) went out as a same-chain binary update, no chain cut:
+
+1. `deploy/rebuild-vps.sh 188.166.235.187` from a detached worktree of `4504a03`. The script now
+   writes `.git-rev` and passes `RAND_BUILD_SHA` to the build, so `rand_getVersion` reports
+   `4504a03d…` even though E's tree still carries a stale `.git`. E built in 4 min 17 s; its first
+   start logged `built the receipts-by-program index from 117 receipts`.
+2. **Startup is ~4 minutes, not ~20 s**: the node runs a quick chain verification before the RPC
+   opens (239 s at 59 183 blocks). A rolling update must wait for `rand_getHealth` = `ok` on each
+   node before the next, which the loop did (a fixed sleep would stop two validators at once).
+3. `deploy/update-droplet.sh <ip>` over the other fifteen, one at a time, each waited to
+   `rand_getHealth` `ok`: 06:33–07:38 UTC, ~4–6 min per droplet, all fifteen `updated to
+   16e41293`, chain producing throughout.
+4. A: stopped, its 10 GB data dir copied, restarted from `deploy/run-a.sh` on `bin-4504a03/`
+   (121 receipts indexed; height 62 276, 16 peers, `active_validator: true`). B was not reached;
+   its `.update-pin` should read `4504a03`.
+5. **Rollback rehearsed on the copy of A's database**: v0.3 migrated it (121 receipts); the
+   `c66e6b8` binary then refused it with `Column families not opened: receipts_by_program`;
+   `rand-node db drop-receipts-index` dropped the family and the marker; `c66e6b8` then verified
+   all 62 202 blocks. The procedure is "Rolling back v0.3" above.
+6. **Live test against E** (every new method, and the `transaction` topic both for a fresh faucet
+   mint and for a call committed before the subscribe), all as specified:
+   `rand_getVersion` git_sha `4504a03d…`; genesis `605eb783…`; health `ok`; `rand_getFinality`
+   `committed` by height and by head hash; `rand_getProposer [0, 2^64-1]` refused with `-32602`
+   before any work; `rand_getReceipts` for program `509fee7a…` found its call at 62 201;
+   `rand_getTransactionStatus` read the call and the deploy `committed` and a zero hash
+   `unknown`; `rand_getWitnesses [0, 1, 10^12]` gave two 32-step paths and a `null`; the fresh
+   mint's subscription fired 0.9 s after submit, and the late subscription to the 62 201 call
+   fired 0.8 s after subscribing with its original height and index; both subscriptions removed
+   themselves (`rand_unsubscribe` answered `false`).
 
 ### The same-chain re-pin to `c66e6b8` (2026-09-17, later the same day)
 
