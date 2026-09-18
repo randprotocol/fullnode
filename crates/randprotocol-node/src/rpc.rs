@@ -166,10 +166,34 @@ pub enum NodeCommand {
     /// (committed, at a height and index) is read by the dispatcher itself; this only covers what
     /// the node loop holds.
     TxStatus { hashes: Vec<Hash>, reply: oneshot::Sender<Vec<PoolStatus>> },
+    /// Where `hash` sits in this replica's consensus state, for `rand_getFinality`. The
+    /// dispatcher answers a committed block from storage itself; this covers the tree — certified
+    /// (a QC names it) or merely proposed — and the "never heard of it" case.
+    Finality { hash: Hash, reply: oneshot::Sender<Finality> },
+    /// The leader of each view in `views`, under the current validator set, for
+    /// `rand_getProposer`. `epoch` is the tip's epoch, the same for every view in the answer.
+    Proposer { views: Vec<u64>, reply: oneshot::Sender<(u64, Vec<randprotocol_core::Address>)> },
 }
 
 /// The most hashes one `rand_getTransactionStatus` call may ask about.
 pub const MAX_STATUS_HASHES: usize = 64;
+
+/// The most views one `rand_getProposer` range may cover.
+pub const MAX_PROPOSER_VIEWS: usize = 64;
+
+/// The answer to [`NodeCommand::Finality`] and `rand_getFinality`'s hash-lookup branch: where a
+/// block hash sits in this replica's consensus state.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Finality {
+    /// Part of the committed chain.
+    Committed { height: u64, hash: Hash },
+    /// In the tree, not yet committed, but a quorum certificate names it.
+    Certified { height: u64, hash: Hash, qc_view: u64 },
+    /// In the tree, proposed but not yet certified.
+    Proposed { height: u64, hash: Hash },
+    /// Not a block this replica has ever held.
+    Unknown,
+}
 
 /// What the node loop knows about a hash that storage does not: pooled, refused, or neither.
 #[derive(Clone, Debug, PartialEq)]
@@ -645,6 +669,19 @@ fn header_json(b: &randprotocol_core::Block, sealed: bool) -> Value {
         "tx_root": b.header.tx_root.to_hex(), "state_root": b.header.state_root.to_hex(),
         "justify_view": b.header.justify.view, "sealed": sealed, "tx_count": b.transactions.len(),
     })
+}
+
+/// `rand_getFinality`'s response body, from either the storage-side committed answer or a
+/// [`Finality`] the node loop sent back.
+fn finality_json(f: &Finality) -> Value {
+    match f {
+        Finality::Committed { height, hash } => json!({ "status": "committed", "height": height, "hash": hash.to_hex() }),
+        Finality::Certified { height, hash, qc_view } => {
+            json!({ "status": "certified", "height": height, "hash": hash.to_hex(), "qc_view": qc_view })
+        }
+        Finality::Proposed { height, hash } => json!({ "status": "proposed", "height": height, "hash": hash.to_hex() }),
+        Finality::Unknown => json!({ "status": "unknown" }),
+    }
 }
 
 fn block_json(b: &randprotocol_core::Block, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor, storage: &crate::storage::Storage) -> Value {
@@ -1537,6 +1574,60 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             }
             Ok(Value::Array(out))
         }
+        // `p[0]` is a height or a hash. A height only ever names a committed block (or none),
+        // which storage answers alone; a hash might be committed (storage again), or it might be
+        // a block only the replica's tree still holds — certified, merely proposed, or unknown to
+        // it altogether — which only the node loop can say.
+        "rand_getFinality" => {
+            let v = p.get(0).ok_or_else(|| RpcError::invalid_params("missing param 0"))?;
+            if let Some(h) = v.as_u64() {
+                return Ok(match st.storage.block_by_height(h).map_err(RpcError::internal)? {
+                    Some(b) => json!({ "status": "committed", "height": h, "hash": b.hash().to_hex() }),
+                    None => json!({ "status": "unknown" }),
+                });
+            }
+            let Some(s) = v.as_str() else {
+                return Err(RpcError::invalid_params("param 0 must be a height or a block hash"));
+            };
+            let hash = Hash::from_hex(s).map_err(|e| RpcError::invalid_params(format!("hash: {e}")))?;
+            if let Some(b) = st.storage.block_by_hash(&hash).map_err(RpcError::internal)? {
+                return Ok(json!({ "status": "committed", "height": b.height(), "hash": hash.to_hex() }));
+            }
+            let (reply, rx) = oneshot::channel();
+            st.node.send(NodeCommand::Finality { hash, reply }).await.map_err(|_| RpcError::internal("node loop closed"))?;
+            let f = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
+            Ok(finality_json(&f))
+        }
+        // `[view]` or `[from, to]` (inclusive): the leader of each view under the current
+        // validator set, which only the node loop's replica derives.
+        "rand_getProposer" => {
+            let from: u64 = param(p, 0, "view")?;
+            let to: u64 = match p.get(1) {
+                Some(v) if !v.is_null() => {
+                    serde_json::from_value(v.clone()).map_err(|e| RpcError::invalid_params(format!("bad param to: {e}")))?
+                }
+                _ => from,
+            };
+            if to < from {
+                return Err(RpcError::invalid_params("to must be >= from"));
+            }
+            let views: Vec<u64> = (from..=to).collect();
+            if views.len() > MAX_PROPOSER_VIEWS {
+                return Err(RpcError::invalid_params(format!("views must hold at most {MAX_PROPOSER_VIEWS} entries")));
+            }
+            let (reply, rx) = oneshot::channel();
+            st.node
+                .send(NodeCommand::Proposer { views: views.clone(), reply })
+                .await
+                .map_err(|_| RpcError::internal("node loop closed"))?;
+            let (epoch, proposers) = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
+            Ok(json!({
+                "epoch": epoch,
+                "proposers": views.iter().zip(proposers.iter())
+                    .map(|(v, a)| json!({ "view": v, "proposer": a.to_base58() }))
+                    .collect::<Vec<_>>(),
+            }))
+        }
         // The supply audit (`ledger::supply`). Note values are hidden, but every crossing of the
         // pool's boundary is public, so this is exact rather than an estimate — and
         // `--verify-chain` recomputes every counter in it by replaying the chain.
@@ -1637,6 +1728,19 @@ mod tests {
                             })
                             .collect();
                         let _ = reply.send(out);
+                    }
+                    NodeCommand::Finality { hash, reply } => {
+                        let f = if hash == Hash([0xAA; 32]) {
+                            Finality::Certified { height: 9, hash, qc_view: 12 }
+                        } else if hash == Hash([0xBB; 32]) {
+                            Finality::Proposed { height: 9, hash }
+                        } else {
+                            Finality::Unknown
+                        };
+                        let _ = reply.send(f);
+                    }
+                    NodeCommand::Proposer { views, reply } => {
+                        let _ = reply.send((3, views.iter().map(|v| randprotocol_core::Address([*v as u8; 32])).collect()));
                     }
                     _ => {}
                 }
@@ -2360,6 +2464,42 @@ mod tests {
         assert_eq!(v[3]["hash"], Hash([0xCC; 32]).to_hex());
         let many: Vec<String> = (0..65).map(|i| Hash([i as u8; 32]).to_hex()).collect();
         assert_eq!(call(&st, "rand_getTransactionStatus", json!([many])).await.err().unwrap().code, -32602);
+    }
+
+    /// A height or a hash, each answered by storage when committed; a hash storage has never
+    /// heard of falls through to the node loop's tree state (the `0xAA`/`0xBB`/else stub).
+    #[tokio::test]
+    async fn get_finality_by_height_hash_and_tree_state() {
+        let (_d, storage, gs, blocks) = fixtures::chain_fixture(2);
+        let st = state_over(Arc::new(storage), &gs);
+        let v = ok(&st, "rand_getFinality", json!([1])).await;
+        assert_eq!(v["status"], "committed");
+        assert_eq!(v["hash"], blocks[0].block.hash().to_hex());
+        let v = ok(&st, "rand_getFinality", json!([blocks[1].block.hash().to_hex()])).await;
+        assert_eq!(v["status"], "committed");
+        assert_eq!(v["height"], 2);
+        let v = ok(&st, "rand_getFinality", json!([Hash([0xAA; 32]).to_hex()])).await;
+        assert_eq!(v["status"], "certified");
+        assert_eq!(v["qc_view"], 12);
+        let v = ok(&st, "rand_getFinality", json!([Hash([0xBB; 32]).to_hex()])).await;
+        assert_eq!(v["status"], "proposed");
+        assert_eq!(ok(&st, "rand_getFinality", json!([99])).await["status"], "unknown");
+        assert_eq!(ok(&st, "rand_getFinality", json!([Hash([0xCC; 32]).to_hex()])).await["status"], "unknown");
+    }
+
+    /// A single view or an inclusive `[from, to]` range, under the current set (epoch 3, per the
+    /// node loop's stub); a range wider than `MAX_PROPOSER_VIEWS` is refused.
+    #[tokio::test]
+    async fn get_proposer_maps_views_under_the_current_set() {
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_d, st) = state_for(&gs);
+        let v = ok(&st, "rand_getProposer", json!([5])).await;
+        assert_eq!(v["epoch"], 3);
+        assert_eq!(v["proposers"].as_array().unwrap().len(), 1);
+        assert_eq!(v["proposers"][0]["view"], 5);
+        let v = ok(&st, "rand_getProposer", json!([5, 8])).await;
+        assert_eq!(v["proposers"].as_array().unwrap().len(), 4);
+        assert_eq!(call(&st, "rand_getProposer", json!([1, 100])).await.err().unwrap().code, -32602);
     }
 
     /// The supply audit: hidden note values, public boundary crossings. The one number that

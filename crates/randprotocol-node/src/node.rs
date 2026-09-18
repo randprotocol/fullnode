@@ -1267,6 +1267,29 @@ impl Node {
                     .collect();
                 let _ = reply.send(out);
             }
+            NodeCommand::Finality { hash, reply } => {
+                // The tree holds only the committed head plus uncommitted blocks (older
+                // committed blocks are pruned), so a hash in it is the committed head exactly
+                // when it equals `committed_hash`; otherwise it is certified (a QC names it) or
+                // merely proposed.
+                let f = if let Some(b) = self.hs.block(&hash) {
+                    let height = b.height();
+                    if hash == self.hs.committed_hash() {
+                        rpc::Finality::Committed { height, hash }
+                    } else if let Some(qc_view) = self.hs.certified(&hash) {
+                        rpc::Finality::Certified { height, hash, qc_view }
+                    } else {
+                        rpc::Finality::Proposed { height, hash }
+                    }
+                } else {
+                    rpc::Finality::Unknown
+                };
+                let _ = reply.send(f);
+            }
+            NodeCommand::Proposer { views, reply } => {
+                let epoch = self.hs.tip_ledger().epoch();
+                let _ = reply.send((epoch, views.iter().map(|v| self.hs.leader(*v)).collect()));
+            }
         }
         Ok(())
     }

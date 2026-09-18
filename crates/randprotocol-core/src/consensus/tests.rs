@@ -292,7 +292,19 @@ fn proposal_timestamp_never_drops_below_the_parent() {
 #[test]
 fn four_validators_commit_empty_blocks_in_lockstep() {
     let mut sim = setup(4, 4);
-    for _ in 0..8 {
+    for _ in 0..3 {
+        sim.step(vec![]);
+    }
+    // Three proposals in: the third's votes just closed `high_qc`, certifying that block, but
+    // the 3-chain commit rule hasn't closed on it yet (`committed_height` is still 0).
+    let hs = &sim.nodes[0];
+    let proposed_hash = hs.high_qc().block_hash;
+    let qc_view = hs.high_qc().view;
+    assert_eq!(hs.committed_height(), 0);
+    assert_eq!(hs.certified(&proposed_hash), Some(qc_view));
+    assert!(hs.has_block(&proposed_hash));
+    assert_eq!(hs.certified(&Hash([7; 32])), None);
+    for _ in 0..5 {
         sim.step(vec![]);
     }
     sim.assert_consistent();

@@ -191,6 +191,18 @@ impl HotStuff {
     pub fn high_qc(&self) -> &QuorumCertificate {
         &self.high_qc
     }
+    pub fn locked_qc(&self) -> &QuorumCertificate {
+        &self.locked_qc
+    }
+    /// The view of a quorum certificate this replica holds for `hash`, if any: the high, locked or
+    /// head QC, or the `justify` a child in the tree carries for it.
+    pub fn certified(&self, hash: &Hash) -> Option<u64> {
+        [&self.high_qc, &self.locked_qc, &self.head_qc]
+            .iter()
+            .find(|qc| qc.block_hash == *hash)
+            .map(|qc| qc.view)
+            .or_else(|| self.tree.values().map(|e| &e.block.header.justify).find(|qc| qc.block_hash == *hash).map(|qc| qc.view))
+    }
     pub fn committed_height(&self) -> u64 {
         self.committed_height
     }
