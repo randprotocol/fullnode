@@ -36,6 +36,10 @@ const CF_SEALS: &str = "seals";
 const CF_META: &str = "meta";
 const CF_PROGRAMS: &str = "programs";
 const CF_RECEIPTS: &str = "receipts";
+/// Program id (32 bytes) -> `bincode(Vec<u32>)`: the public input a program was deployed with
+/// (the call limits, spec §5), for provers to fetch. Only programs deployed with a non-empty one
+/// have a row; the record in `programs` carries just its digest, so it stays small.
+const CF_PROGRAM_PUBLIC: &str = "program_public";
 /// Receipts by program: `program (32) || height (8 BE) || index (4 BE)` -> the transaction hash.
 /// Serves `rand_getReceipts`; built from `receipts` on first open (`META_RECEIPTS_INDEX_BUILT`).
 const CF_RECEIPTS_BY_PROGRAM: &str = "receipts_by_program";
@@ -63,7 +67,7 @@ const CF_BRIDGE_SPENT: &str = "bridge_spent";
 /// Burn sequence (big-endian u64) -> `bincode(BridgeBurnRecord)`: the outbound messages
 /// guardians read back, oldest first.
 const CF_BRIDGE_BURNS: &str = "bridge_burns";
-const ALL_CFS: [&str; 16] = [
+const ALL_CFS: [&str; 17] = [
     CF_BLOCKS,
     CF_QCS,
     CF_BLOCK_INDEX,
@@ -71,6 +75,7 @@ const ALL_CFS: [&str; 16] = [
     CF_SEALS,
     CF_META,
     CF_PROGRAMS,
+    CF_PROGRAM_PUBLIC,
     CF_RECEIPTS,
     CF_RECEIPTS_BY_PROGRAM,
     CF_NOTES,
@@ -1081,6 +1086,12 @@ impl Storage {
         self.get(CF_PROGRAMS, id.as_bytes())
     }
 
+    /// The public input `id` was deployed with; `None` for a program deployed without one (or
+    /// not deployed at all).
+    pub fn program_public(&self, id: &ProgramId) -> Result<Option<Vec<u32>>> {
+        self.get(CF_PROGRAM_PUBLIC, id.as_bytes())
+    }
+
     pub fn programs_count(&self) -> Result<u64> {
         Ok(self.db.iterator_cf(self.cf(CF_PROGRAMS), IteratorMode::Start).count() as u64)
     }
@@ -1472,6 +1483,17 @@ impl Storage {
                 batch.put_cf(self.cf(CF_PROGRAMS), rec.id.as_bytes(), bincode::serialize(rec)?);
             }
         }
+        // The public words are read off the deploys themselves — the ledger keeps only their
+        // digest. A redeploy of a program already on chain rewrites the same words under the
+        // same content-addressed id, which is harmless.
+        for tx in blocks.iter().flat_map(|cb| cb.block.transactions.iter()) {
+            if let Action::Deploy { base_pc, words, public } = &tx.action {
+                let id = randprotocol_core::program::program_id_with_public(*base_pc, words, public);
+                if !public.is_empty() && ledger_after.program(&id).is_some() {
+                    batch.put_cf(self.cf(CF_PROGRAM_PUBLIC), id.as_bytes(), bincode::serialize(public)?);
+                }
+            }
+        }
         for (epoch, set) in epoch_sets {
             batch.put_cf(self.cf(CF_EPOCH_SETS), height_key(*epoch), bincode::serialize(set)?);
         }
@@ -1844,6 +1866,16 @@ impl Storage {
         }
         for rec in ledger.programs().values() {
             batch.put_cf(self.cf(CF_PROGRAMS), rec.id.as_bytes(), bincode::serialize(rec)?);
+        }
+        // The replayed ledger holds no public words to rewrite, only which programs survive: a
+        // row whose program is gone goes with it, and the rest are content-addressed, so still
+        // right.
+        for item in self.db.iterator_cf(self.cf(CF_PROGRAM_PUBLIC), IteratorMode::Start) {
+            let (k, _) = item?;
+            let keep = <[u8; 32]>::try_from(&k[..]).is_ok_and(|id| ledger.program(&Hash(id)).is_some());
+            if !keep {
+                batch.delete_cf(self.cf(CF_PROGRAM_PUBLIC), k);
+            }
         }
         // The bridge families have no per-height key — a consumed digest does not say which
         // block consumed it — so they are rebuilt wholesale from the replayed ledger rather
@@ -3359,6 +3391,53 @@ mod tests {
         assert_eq!(st.load_ledger(&StubExecutor).unwrap(), at_two);
     }
 
+    /// The call limits (spec §5): a deploy's public words land in `program_public` under the
+    /// program's id, with the record holding only their digest; a plain deploy stores none; a
+    /// restart keeps them, and truncating below the deploy removes them with the program.
+    #[test]
+    fn program_public_words_round_trip_survive_a_restart_and_truncate() {
+        let (dir, st, gs, blocks) = chain_fixture(2);
+        let k = key(1);
+        let mut ledger = st.load_ledger(&StubExecutor).unwrap();
+        ledger.set_faucet(true);
+        ledger.set_max_program_public_words(8);
+        ledger.set_height(3);
+        let words = vec![0x13u32; 3];
+        let public = vec![7u32, 8, 9];
+        let with = Action::Deploy { base_pc: 0, words: words.clone(), public: public.clone() };
+        let plain = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
+        let b1 = bundle_tx(&ledger, [[90; 8], [91; 8]], [[92; 8], [93; 8]], randprotocol_core::gas::fee_floor(&with));
+        let b2 = bundle_tx(&ledger, [[94; 8], [95; 8]], [[96; 8], [97; 8]], randprotocol_core::gas::fee_floor(&plain));
+        let txs = vec![
+            Transaction::shielded(gs.chain_id, b1.bundle.clone().unwrap(), with),
+            Transaction::shielded(gs.chain_id, b2.bundle.clone().unwrap(), plain),
+        ];
+        let cb3 = make_block(&blocks[1].block, &mut ledger, txs, &k);
+        st.commit(std::slice::from_ref(&cb3), &ledger, &[], &StubExecutor).unwrap();
+        let pid = randprotocol_core::program::program_id_with_public(0, &words, &public);
+        let plain_id = randprotocol_core::program::program_id(0, &words);
+        assert_eq!(st.program_public(&pid).unwrap(), Some(public.clone()));
+        assert_eq!(st.program(&pid).unwrap().unwrap().public_digest, Some(StubExecutor.public_digest(&public)));
+        assert_eq!(st.program_public(&plain_id).unwrap(), None, "no public input, no row");
+        assert!(st.program(&plain_id).unwrap().is_some());
+        // A restart keeps them.
+        drop(st);
+        let st = Storage::open(dir.path()).unwrap();
+        assert_eq!(st.program_public(&pid).unwrap(), Some(public.clone()));
+        assert_eq!(st.load_ledger(&StubExecutor).unwrap().program(&pid).unwrap().public_digest, Some(StubExecutor.public_digest(&public)));
+        // Truncating below the deploy removes them with the program.
+        let at_two = {
+            let mut l = gs.ledger.clone();
+            for cb in &blocks {
+                l.apply_block(&cb.block, &StubExecutor).unwrap();
+            }
+            l
+        };
+        st.truncate_to(&gs, 2, &at_two).unwrap();
+        assert!(st.program(&pid).unwrap().is_none());
+        assert_eq!(st.program_public(&pid).unwrap(), None);
+    }
+
     #[test]
     fn receipts_by_program_index_round_trips_pages_and_truncates() {
         let (_d, st, gs, blocks) = chain_fixture(2);
@@ -3482,9 +3561,12 @@ mod tests {
     }
 
     /// The column families a pre-v0.3 build opens with: `ALL_CFS` without
-    /// `receipts_by_program`. Exactly the list the build the fleet rolls back to passes RocksDB.
+    /// `receipts_by_program` — and without `program_public`, which arrived later still (the call
+    /// limits, on a fresh chain, so no database ever needs rolling back across it). Exactly the
+    /// list the build the fleet rolls back to passes RocksDB.
     fn pre_v03_cfs() -> Vec<&'static str> {
-        let cfs: Vec<&str> = ALL_CFS.iter().copied().filter(|c| *c != CF_RECEIPTS_BY_PROGRAM).collect();
+        let cfs: Vec<&str> =
+            ALL_CFS.iter().copied().filter(|c| *c != CF_RECEIPTS_BY_PROGRAM && *c != CF_PROGRAM_PUBLIC).collect();
         assert_eq!(cfs.len(), 15);
         cfs
     }
@@ -3542,7 +3624,18 @@ mod tests {
         let gs = genesis_with_two_notes_state();
         let pid = randprotocol_core::program::program_id(0, &[0x13u32; 3]);
         {
-            let st = Storage::open(dir.path()).unwrap();
+            // A v0.3 database, as `Storage::open` wrote it before `program_public` existed: the
+            // rollback this command serves is v0.3 to pre-v0.3, and a database with the call
+            // limits' family belongs to a later chain no pre-v0.3 build could follow anyway.
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let cfs = ALL_CFS
+                .iter()
+                .filter(|c| **c != CF_PROGRAM_PUBLIC)
+                .map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
+            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap() };
+            st.backfill_receipts_index().unwrap();
             st.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);
             st.db.put_cf(st.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(&r).unwrap()).unwrap();
