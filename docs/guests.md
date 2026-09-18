@@ -274,6 +274,10 @@ The `hc` the wallet prints is spelled differently from `rand-guest`'s. §7.1 exp
 
 ### 4.6 Call it
 
+This session was captured before chain 13. On a chain-13 node `rand program show` also prints
+`public_words_len` (0) and `public_digest` (null), and the receipt carries `"h_pub": null`: the
+call was checked against the empty public input (`docs/rpc.md`, `rand_getReceipt`).
+
 ```
 $ rand program show b2d5b50cbb2f2d686eccef01711be7f0eed9c335be20e01c9bbb29465fa428f4
 {

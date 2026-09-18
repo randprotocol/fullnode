@@ -360,8 +360,8 @@ file's words.
   without `rand_getLimits` gets the old 4 096;
 - a proof over `max_proof_bytes` (default 2 MiB) is refused before the paying bundle is proved.
 
-The default fee is `0.001 + call_fee(tier, bytes)`, where `bytes` is the proof plus the sealed
-transcript.
+The default fee is `BUNDLE_BASE + call_fee(tier, bytes)` (0.001 RAND plus the call fee, in
+units), where `bytes` is the proof plus the sealed transcript.
 
 ### A first shielded transfer
 

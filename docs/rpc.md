@@ -692,7 +692,7 @@ Errors: `-32602` for an empty list or more than 64 hashes.
 Params: `[program_id, from_height, to_height, limit?]`. Result:
 ```json
 { "receipts": [ { "tx": "…", "program": "…", "tier": 14, "outputs": [1, 0, 25, 0, 0, 0, 0, 0],
-    "height": 17, "index": 0, "h_in": "9c0e…7f" }, … ],
+    "height": 17, "index": 0, "h_in": "9c0e…7f", "h_pub": null }, … ],
   "next_height": 2051 }
 ```
 Receipts for `program_id` with `from_height <= height <= to_height`, ordered by height then index;
@@ -848,7 +848,7 @@ other way round. There is no ordering promise *between* topics, only *within* on
 { "jsonrpc": "2.0", "method": "rand_subscription",
   "params": { "subscription": "2", "result": { "height": 2051, "hash": "…",
     "receipts": [ { "tx": "…", "program": "…", "tier": 14, "outputs": [1,0,25,0,0,0,0,0],
-      "height": 2051, "index": 0, "h_in": "9c0e…7f" } ] } } }
+      "height": 2051, "index": 0, "h_in": "9c0e…7f", "h_pub": null } ] } } }
 { "jsonrpc": "2.0", "method": "rand_subscription",
   "params": { "subscription": "3",
     "result": { "status": "committed", "height": 2051, "index": 3 } } }

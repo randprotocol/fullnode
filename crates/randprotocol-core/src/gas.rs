@@ -99,7 +99,7 @@ pub fn deploy_fee(words: usize) -> u64 {
 /// costs exactly what it cost before the byte term existed.
 pub const CALL_FREE_BYTES: usize = 2_097_152 + 18_432;
 /// What each KiB (or part of one) of call bytes past [`CALL_FREE_BYTES`] adds to a call's fee:
-/// 1 000 base units, 0.00001 RAND. A testnet economics knob, not a security bound — the block
+/// 1 000 base units, 0.000001 RAND per KiB (`UNITS_PER_RAND` = 10⁹). A testnet economics knob, not a security bound — the block
 /// cap is the bound — so it is kept small (spec §7).
 pub const CALL_PER_KIB: u64 = 1_000;
 

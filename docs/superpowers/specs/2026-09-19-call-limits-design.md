@@ -108,7 +108,7 @@ Calls today are priced by tier alone, and the mempool orders by total fee. With 
 call_fee(tier, bytes) = CALL_BASE + CALL_PER_TIER_STEP·step(tier) + CALL_PER_KIB · ceil(max(0, bytes − CALL_FREE_BYTES) / 1024)
 bytes = len(call proof) + len(input envelope)
 CALL_FREE_BYTES = 2 MiB + 18 432   (today's two caps)
-CALL_PER_KIB    = 1 000 base units (0.00001 RAND per KiB; a 3.5 MB keccak call pays ~0.015 RAND extra)
+CALL_PER_KIB    = 1 000 base units (0.000001 RAND per KiB; a 3.5 MB keccak call pays ~0.0014 RAND extra)
 ```
 
 The ledger checks `fee ≥ BUNDLE_BASE + call_fee(outcome.tier, bytes)`. The pre-verify floor is unchanged.
