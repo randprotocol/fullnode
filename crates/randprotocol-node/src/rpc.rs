@@ -1670,6 +1670,36 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "invariant_holds": audit.invariant_holds(),
             }))
         }
+        // Emission (spec §5.1): inflation is a fixed zero — nothing here ever mints outside a
+        // genesis allocation, the testnet faucet, or the bounded aggregation subsidy below — so
+        // the field is constant rather than computed. `subsidy` is `null` without an aggregation
+        // section (there is then no schedule to report), otherwise the current per-block amount
+        // and the halving math `sealed_blocks` indexes into. One `load_ledger` supplies both the
+        // config and `sealed_blocks`: it is the only source for the former, and reading the
+        // latter off the same rebuild (rather than a second `storage.supply()` call) keeps them
+        // from a database write landing between two separate reads.
+        "rand_getEmission" => {
+            let faucet = st.status.read().unwrap_or_else(|e| e.into_inner()).faucet;
+            let storage = st.storage.clone();
+            let executor = st.executor.clone();
+            let (cfg, sealed) = blocking(move || {
+                let ledger = storage.load_ledger(executor.as_ref())?;
+                Ok((ledger.aggregation().cloned(), ledger.supply().sealed_blocks))
+            })
+            .await?;
+            let subsidy = cfg.map(|cfg| {
+                let current = randprotocol_core::gas::subsidy(sealed, &cfg);
+                let next_halving_at = (sealed / cfg.halving_blocks + 1) * cfg.halving_blocks;
+                json!({
+                    "current": current.to_string(),
+                    "base": cfg.subsidy_base.to_string(),
+                    "halving_blocks": cfg.halving_blocks,
+                    "sealed_blocks": sealed,
+                    "next_halving_at": next_halving_at,
+                })
+            });
+            Ok(json!({ "inflation": "0", "subsidy": subsidy, "faucet": faucet }))
+        }
         other => Err(RpcError { code: -32601, message: format!("unknown method {other}") }),
     }
 }
@@ -2604,6 +2634,29 @@ mod tests {
         assert_eq!(v["slashed"], Value::String("0".into()));
         assert_eq!(v["burned"], Value::String(bond.to_string()));
         assert_eq!(v["invariant_holds"], true, "{v}");
+    }
+
+    /// Emission (spec §5.1): inflation is a fixed zero (every RAND in existence traces to a
+    /// genesis allocation or a bounded subsidy, never an unbounded mint), and the subsidy
+    /// schedule is `null` on a chain with no aggregation section at all — `rand_getSupply`'s
+    /// counters exist regardless, but the schedule they are measured against does not.
+    #[tokio::test]
+    async fn get_emission_is_zero_inflation_and_the_subsidy_schedule() {
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_d, st) = state_for(&gs);
+        let v = ok(&st, "rand_getEmission", json!([])).await;
+        assert_eq!(v["inflation"], "0");
+        assert!(v["subsidy"].is_null(), "no aggregation section on this genesis");
+        assert_eq!(v["faucet"], false);
+
+        let (_d2, st2, ..) = gated_chain();
+        let v = ok(&st2, "rand_getEmission", json!([])).await;
+        let s = &v["subsidy"];
+        assert_eq!(s["base"], (100 * randprotocol_core::UNITS_PER_RAND).to_string());
+        assert_eq!(s["halving_blocks"], 210_000);
+        assert_eq!(s["sealed_blocks"], 1, "the fixture's one committed aggregate");
+        assert_eq!(s["current"], (100 * randprotocol_core::UNITS_PER_RAND).to_string());
+        assert_eq!(s["next_halving_at"], 210_000);
     }
 
     /// An explorer can name and summarise every new action. Amounts that are public by design
