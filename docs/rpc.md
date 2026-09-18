@@ -920,8 +920,10 @@ What changed for clients, in one place. Newest first.
 
 ### 2026-09-18 — v0.3: eleven methods and two WebSocket topics
 
-No wire, consensus or genesis change: old and new nodes interoperate, and the fleet takes this as
-a same-chain update (`deploy/update-droplet.sh`), not a chain cut. What a client can see:
+No wire, consensus or genesis change: old and new nodes interoperate on the wire, and the fleet
+takes this as a same-chain update (`deploy/update-droplet.sh`), not a chain cut. The database is
+forward-only, though, unless `rand-node db drop-receipts-index` is run before downgrading (see
+**Storage** below). What a client can see:
 
 - **Node identity and health** — `rand_getVersion` (crate version, full git sha, chain id,
   `hc_bundle`, FRI profile), `rand_getGenesisHash`, `rand_getHealth` (`ok` / `syncing` / `behind`).
@@ -950,7 +952,10 @@ a same-chain update (`deploy/update-droplet.sh`), not a chain cut. What a client
 **Storage.** First start of a node running this release builds a new `receipts_by_program` index
 from the existing `receipts` family, once — the fleet's 22 000-odd receipts take under a second;
 an empty node is a no-op. `rand_getReceipts` and the `receipts` topic read this index; nothing
-else about how receipts are stored changed.
+else about how receipts are stored changed. The new column family is also what makes the database
+forward-only: a pre-v0.3 binary refuses to open it until `rand-node db drop-receipts-index
+--datadir <dir>` (run with this release, node stopped) drops the family and its built marker —
+the rollback procedure is in `deploy/README.md`, "Rolling back v0.3".
 
 ### 2026-09-15 — block aggregation (chain 9): a hard fork
 

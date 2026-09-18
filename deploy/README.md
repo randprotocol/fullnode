@@ -338,6 +338,32 @@ Three things went wrong and are fixed in the scripts:
   Resize those two before chain 9 grows past ~20 GB.
 - Chain 9 is cut **without the aggregation section** — see the note at the top.
 
+## Rolling back v0.3
+
+v0.3 (the RPC release) is interoperable on the wire, but its database is forward-only: its first
+start adds a sixteenth column family, `receipts_by_program`, and RocksDB refuses to open a
+database holding a family the caller does not list. A pre-v0.3 binary lists fifteen, so a plain
+re-pin to the old build leaves the node failing at startup with `Column families not opened:
+receipts_by_program`. Drop the index first, **with the v0.3 binary**, per node:
+
+```bash
+systemctl stop rand-node
+# the --datadir the unit runs with (`systemctl cat rand-node`); on A it is data-a-605eb783
+rand-node db drop-receipts-index --datadir /root/data-rand-node-<name>-605eb783
+```
+
+It prints what it removed (the family and the `receipts_by_program_built` meta key) and is safe
+to re-run: a second run reports both absent. It fails while the node still holds the database
+lock, which is why the stop comes first. Nothing else is touched — the receipts themselves stay,
+and a later v0.3 start rebuilds the index from them.
+
+Then re-pin as for any same-chain update: rebuild the old commit on E with
+`deploy/rebuild-vps.sh 188.166.235.187` from a detached worktree of it (E is the build host, so
+stop E and drop its index before this — the script restarts E on the rebuilt binary), then
+`deploy/update-droplet.sh <ip>` over the other droplets one at a time; it installs the old
+binaries and restarts the stopped service. On A, run `deploy/run-a.sh` with `BINDIR` set to the
+old build's `bin-<sha>/`.
+
 ## Using the chain
 
 ```bash

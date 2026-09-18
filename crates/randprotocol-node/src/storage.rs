@@ -206,6 +206,14 @@ pub struct Storage {
     db: DB,
 }
 
+/// What [`Storage::drop_receipts_index`] found and removed: whether the `receipts_by_program`
+/// family was there to drop, and whether its built marker was there to delete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DroppedReceiptsIndex {
+    pub family: bool,
+    pub marker: bool,
+}
+
 fn height_key(h: u64) -> [u8; 8] {
     h.to_be_bytes()
 }
@@ -336,6 +344,40 @@ impl Storage {
         let storage = Storage { db };
         storage.backfill_receipts_index()?;
         Ok(storage)
+    }
+
+    /// Undo v0.3's one on-disk addition so a pre-v0.3 build can open the database again (the
+    /// rollback path, `rand-node db drop-receipts-index`): drop the `receipts_by_program` family
+    /// and delete its built marker.
+    ///
+    /// RocksDB refuses to open a database holding a column family the caller does not list,
+    /// and the old build lists fifteen, so the family itself has to go — emptying it is not
+    /// enough. This opens raw, with whatever families are on disk, and never through
+    /// [`Storage::open`], which would re-create the family and backfill it first. The marker
+    /// goes before the family: a crash between the two leaves a family with no marker, which
+    /// the next `open` simply rebuilds over (the rows are idempotent), and which a rerun of this
+    /// drops. Either half already absent is not an error, so a rerun is harmless.
+    ///
+    /// Takes the data directory, like `open`. Fails while a node holds the database's lock.
+    pub fn drop_receipts_index(path: &Path) -> Result<DroppedReceiptsIndex> {
+        let db_path = path.join("db");
+        if !db_path.join("CURRENT").exists() {
+            return Err(StorageError::Corrupt(format!("no database at {}", db_path.display())));
+        }
+        let names = DB::list_cf(&Options::default(), &db_path)?;
+        let mut db = DB::open_cf(&Options::default(), &db_path, &names)?;
+        let meta = db
+            .cf_handle(CF_META)
+            .ok_or_else(|| StorageError::Corrupt("database has no meta family".into()))?;
+        let marker = db.get_cf(meta, META_RECEIPTS_INDEX_BUILT.as_bytes())?.is_some();
+        if marker {
+            db.delete_cf_opt(meta, META_RECEIPTS_INDEX_BUILT.as_bytes(), &sync_opts())?;
+        }
+        let family = names.iter().any(|n| n == CF_RECEIPTS_BY_PROGRAM);
+        if family {
+            db.drop_cf(CF_RECEIPTS_BY_PROGRAM)?;
+        }
+        Ok(DroppedReceiptsIndex { family, marker })
     }
 
     fn cf(&self, name: &str) -> &rocksdb::ColumnFamily {
@@ -3239,6 +3281,99 @@ mod tests {
         let st = Storage::open(dir.path()).unwrap();
         assert!(st.receipts_index_built().unwrap());
         assert_eq!(st.receipts_for_program(&pid, 0, 5, 10).unwrap().0.len(), 1);
+    }
+
+    /// The column families a pre-v0.3 build opens with: `ALL_CFS` without
+    /// `receipts_by_program`. Exactly the list the build the fleet rolls back to passes RocksDB.
+    fn pre_v03_cfs() -> Vec<&'static str> {
+        let cfs: Vec<&str> = ALL_CFS.iter().copied().filter(|c| *c != CF_RECEIPTS_BY_PROGRAM).collect();
+        assert_eq!(cfs.len(), 15);
+        cfs
+    }
+
+    /// Open `<dir>/db` the way a pre-v0.3 binary does: its fifteen families, nothing else.
+    fn open_as_pre_v03(dir: &Path, create: bool) -> std::result::Result<DB, rocksdb::Error> {
+        let mut opts = Options::default();
+        opts.create_if_missing(create);
+        opts.create_missing_column_families(create);
+        let cfs = pre_v03_cfs().into_iter().map(|n| ColumnFamilyDescriptor::new(n, Options::default()));
+        DB::open_cf_descriptors(&opts, dir.join("db"), cfs)
+    }
+
+    fn a_receipt(pid: ProgramId) -> CallReceipt {
+        randprotocol_core::program::CallReceipt {
+            tx: Hash([9; 32]), program: pid, tier: 1, outputs: [0; 8], height: 1, index: 0, h_in: [0; 8],
+            input_envelope: None,
+        }
+    }
+
+    /// The forward path: a database a pre-v0.3 build wrote — fifteen families, a genesis, a
+    /// receipt — gains the family and the marker on its first v0.3 open, and the receipt is
+    /// served by program.
+    #[test]
+    fn a_pre_v03_database_gains_the_receipts_index_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let gs = genesis_with_two_notes_state();
+        let pid = randprotocol_core::program::program_id(0, &[0x13u32; 3]);
+        {
+            // `init_genesis` touches no family the old build lacks, so it runs over the raw
+            // fifteen-family handle exactly as the old build's own did.
+            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap() };
+            old.init_genesis(&gs).unwrap();
+            let r = a_receipt(pid);
+            old.db.put_cf(old.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(&r).unwrap()).unwrap();
+        }
+        let names = DB::list_cf(&Options::default(), dir.path().join("db")).unwrap();
+        assert!(!names.iter().any(|n| n == CF_RECEIPTS_BY_PROGRAM), "the old layout has no index family");
+
+        let st = Storage::open(dir.path()).unwrap();
+        let names = DB::list_cf(&Options::default(), dir.path().join("db")).unwrap();
+        assert!(names.iter().any(|n| n == CF_RECEIPTS_BY_PROGRAM), "open created the family");
+        assert!(st.receipts_index_built().unwrap(), "and set the marker");
+        let (page, _) = st.receipts_for_program(&pid, 0, 5, 10).unwrap();
+        assert_eq!(page, vec![a_receipt(pid)]);
+        assert_eq!(st.genesis_hash().unwrap(), gs.hash());
+    }
+
+    /// The rollback path: once v0.3 has opened a database the old build cannot, the drop makes
+    /// it openable with the old fifteen-family list again, and a later v0.3 open rebuilds the
+    /// index from scratch because the marker went with the family.
+    #[test]
+    fn dropping_the_receipts_index_lets_the_old_build_open_and_v03_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let gs = genesis_with_two_notes_state();
+        let pid = randprotocol_core::program::program_id(0, &[0x13u32; 3]);
+        {
+            let st = Storage::open(dir.path()).unwrap();
+            st.init_genesis(&gs).unwrap();
+            let r = a_receipt(pid);
+            st.db.put_cf(st.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(&r).unwrap()).unwrap();
+            st.db.put_cf(st.cf(CF_RECEIPTS_BY_PROGRAM), receipt_index_key(&pid, 1, 0), r.tx.as_bytes()).unwrap();
+            assert!(st.receipts_index_built().unwrap());
+        }
+        // This is the halt C1 is about: the old build's list no longer opens the database.
+        assert!(open_as_pre_v03(dir.path(), false).is_err(), "sixteen families on disk, fifteen listed");
+
+        let dropped = Storage::drop_receipts_index(dir.path()).unwrap();
+        assert_eq!(dropped, DroppedReceiptsIndex { family: true, marker: true });
+        {
+            let old = open_as_pre_v03(dir.path(), false).expect("the old build opens it again");
+            assert!(old.get_cf(old.cf_handle(CF_META).unwrap(), META_RECEIPTS_INDEX_BUILT.as_bytes()).unwrap().is_none());
+            assert!(old.get_cf(old.cf_handle(CF_RECEIPTS).unwrap(), Hash([9; 32]).as_bytes()).unwrap().is_some(), "the receipts themselves stay");
+        }
+        // A rerun finds nothing left to remove and says so.
+        assert_eq!(Storage::drop_receipts_index(dir.path()).unwrap(), DroppedReceiptsIndex { family: false, marker: false });
+
+        let st = Storage::open(dir.path()).unwrap();
+        assert!(st.receipts_index_built().unwrap(), "the marker was deleted, so the backfill ran again");
+        assert_eq!(st.receipts_for_program(&pid, 0, 5, 10).unwrap().0, vec![a_receipt(pid)]);
+    }
+
+    #[test]
+    fn dropping_the_receipts_index_refuses_a_directory_with_no_database() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(Storage::drop_receipts_index(dir.path()), Err(StorageError::Corrupt(_))));
+        assert!(!dir.path().join("db").exists(), "and does not create one");
     }
 
     #[test]

@@ -310,6 +310,11 @@ enum Cmd {
         #[arg(long)]
         repair: bool,
     },
+    /// Database maintenance on a stopped node's data directory.
+    Db {
+        #[command(subcommand)]
+        cmd: DbCmd,
+    },
     /// Show node status.
     Status {
         #[arg(long, default_value = "http://127.0.0.1:8545")]
@@ -368,6 +373,20 @@ enum Cmd {
         /// Return once the node accepts the aggregate instead of waiting for it to commit.
         #[arg(long)]
         no_wait: bool,
+    },
+}
+
+/// `rand-node db …`: offline maintenance, run with the node stopped (RocksDB's lock refuses a
+/// second opener).
+#[derive(Subcommand)]
+enum DbCmd {
+    /// Before rolling back to a pre-v0.3 build: drop the `receipts_by_program` column family and
+    /// its built marker. The old build lists fifteen families and RocksDB refuses to open a
+    /// database with a sixteenth, so without this the downgraded node never starts. A later
+    /// v0.3 start rebuilds the index from the receipts.
+    DropReceiptsIndex {
+        #[arg(long)]
+        datadir: PathBuf,
     },
 }
 
@@ -557,6 +576,19 @@ async fn main() -> Result<()> {
                 r = &mut handle.task => { r??; }
                 _ = tokio::signal::ctrl_c() => { tracing::info!("shutting down"); handle.shutdown().await; }
             }
+        }
+        Cmd::Db { cmd: DbCmd::DropReceiptsIndex { datadir } } => {
+            let dropped = Storage::drop_receipts_index(&datadir)?;
+            let db = datadir.join("db");
+            match dropped.family {
+                true => println!("dropped column family receipts_by_program from {}", db.display()),
+                false => println!("no receipts_by_program column family in {}", db.display()),
+            }
+            match dropped.marker {
+                true => println!("deleted meta key receipts_by_program_built"),
+                false => println!("no meta key receipts_by_program_built"),
+            }
+            println!("a pre-v0.3 build can open this database; a v0.3 start rebuilds the index");
         }
         Cmd::Status { rpc } => {
             let v = RpcClient::new(rpc).status().await?;
