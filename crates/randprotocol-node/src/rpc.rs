@@ -1319,8 +1319,16 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                             st.limits.max_program_words
                         )));
                     }
-                    // The deploy-time public input (spec §5), paid for per word like code.
-                    let public = spec.get("public_words").and_then(|w| w.as_u64()).unwrap_or(0) as usize;
+                    // The deploy-time public input (spec §5), paid for per word like code. Parsed
+                    // strictly, as a call's `bytes` is: absent or null is 0, anything but a
+                    // non-negative integer is refused rather than silently priced as 0.
+                    let public = match spec.get("public_words") {
+                        None | Some(Value::Null) => 0,
+                        Some(w) => w
+                            .as_u64()
+                            .and_then(|w| usize::try_from(w).ok())
+                            .ok_or_else(|| RpcError::invalid_params("public_words must be a non-negative integer"))?,
+                    };
                     if public > st.limits.max_program_public_words {
                         return Err(RpcError::invalid_params(format!(
                             "public_words must be at most {} (this chain's public input cap)",
@@ -1861,6 +1869,7 @@ mod tests {
 
     /// The same state over a database a storage fixture already opened and initialised.
     fn state_over(storage: Arc<crate::storage::Storage>, gs: &GenesisState) -> RpcState {
+        let limits = ChainLimits::of(&gs.ledger);
         let (tx, mut rx) = mpsc::channel(4);
         let info = EpochInfo {
             epoch: 0,
@@ -1919,8 +1928,8 @@ mod tests {
             status: Arc::new(RwLock::new(NodeStatus::default())),
             node: tx,
             chain_id: gs.chain_id,
-            limits: ChainLimits::of(&gs.ledger),
-            max_body_bytes: ChainLimits::of(&gs.ledger).rpc_max_body_bytes(),
+            limits,
+            max_body_bytes: limits.rpc_max_body_bytes(),
             executor: Arc::new(StubExecutor),
             heads: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
             commits: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
@@ -2485,6 +2494,17 @@ mod tests {
         let e = call(&st, "rand_estimateFee", deploy(10, 65)).await.unwrap_err();
         assert_eq!(e.code, -32602);
         assert!(e.message.contains("64"), "the error names the cap: {}", e.message);
+        // `public_words` is parsed strictly, like `bytes`: optional, but never silently 0.
+        let no_public = json!([{"kind": "deploy", "words": 10}]);
+        assert_eq!(ok(&st, "rand_estimateFee", no_public).await, floor(10, 0), "public_words is optional");
+        let null_public = json!([{"kind": "deploy", "words": 10, "public_words": null}]);
+        assert_eq!(ok(&st, "rand_estimateFee", null_public).await, floor(10, 0));
+        for bad in [json!("many"), json!(-1), json!(1.5), json!("5")] {
+            let spec = json!([{"kind": "deploy", "words": 10, "public_words": bad}]);
+            let e = call(&st, "rand_estimateFee", spec).await.unwrap_err();
+            assert_eq!(e.code, -32602, "public_words {bad}");
+            assert!(e.message.contains("public_words must be a non-negative integer"), "{}", e.message);
+        }
 
         let call_spec = |bytes: Value| json!([{"kind": "call", "tier": 12, "bytes": bytes}]);
         let plain = (BUNDLE_BASE + call_fee(12, 0)).to_string();

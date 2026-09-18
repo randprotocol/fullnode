@@ -714,6 +714,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // Viewing keys imported over RPC (`rand_importViewingKey`), in memory only. Shared with the
     // node loop purely so `rand_status` can say how many keys this process is holding.
     let viewing = Arc::new(RwLock::new(crate::viewing::Registry::default()));
+    // The RPC's limits, computed once from the genesis ledger.
+    let rpc_limits = rpc::ChainLimits::of(&gs.ledger);
     let (rpc_addr, rpc_task) = rpc::serve(
         cfg.rpc_addr,
         RpcState {
@@ -722,8 +724,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             node: cmd_tx,
             chain_id: gs.chain_id,
             // The RPC's limits follow the genesis (call limits spec §8), like the wire's above.
-            limits: rpc::ChainLimits::of(&gs.ledger),
-            max_body_bytes: rpc::ChainLimits::of(&gs.ledger).rpc_max_body_bytes(),
+            limits: rpc_limits,
+            max_body_bytes: rpc_limits.rpc_max_body_bytes(),
             executor: executor.clone(),
             heads: heads.clone(),
             commits: commits.clone(),
