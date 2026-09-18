@@ -348,6 +348,7 @@ wallet can ask before it proves.
 `public_words` (optional, default 0) is the deploy's public input length. Public words are paid for
 per word like code, so the fee is the deploy fee of `n + m` words. More than the chain's
 `max_program_public_words` (0 by default) is `-32602`, naming the cap, in the same shape.
+Anything but a non-negative integer (or `null`) is `-32602` as well.
 
 `bytes` (optional, default 0) is the call's proof length plus its input envelope's length. A call
 at or under the free allowance (2 097 152 + 18 432 bytes) costs what it did before this field
