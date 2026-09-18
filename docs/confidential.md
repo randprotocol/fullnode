@@ -359,7 +359,8 @@ old chain. A fleet must run one build.
 ## On-chain model
 
 **Programs** are content addressed: `program_id = blake3("rand-program" || base_pc || words)`.
-A `Deploy` transaction stores `{ base_pc, words }` (at most 4096 words); every word must decode as an
+A `Deploy` transaction stores `{ base_pc, words }` (at most the chain's program cap: 4096 words, or
+the genesis file's `max_program_words`, at most 65 535, when it sets one); every word must decode as an
 instruction. Programs are immutable and part of the state root.
 
 **Calls** carry `{ program, proof }`. The proof is `postcard(rand_zkvm::Proof)` (tier, public
@@ -382,7 +383,8 @@ is no `effect` field.
   (`docs/shielded.md` §5) — anchor in the 256-block window, neither note already spent, the
   recomputed digest equal to what the bundle proof published, and the bundle proof valid against
   the genesis-pinned `hc_bundle`.
-- Deploy: `words.len() <= 4096`, `base_pc % 4 == 0`, every word decodes,
+- Deploy: `words.len() <= max_program_words` (genesis; 4096 when the file does not set it, and never
+  above 65 535, the word count the zkVM can prove), `base_pc % 4 == 0`, every word decodes,
   `fee >= BUNDLE_BASE + 100_000 * words`.
 - Call: program exists; `proof.len() <= 2 MiB` (`gas::MAX_PROOF_BYTES`, raised for constraint
   set 5's proof sizes, re-measured and kept at constraint set 6's); the proof verifies against the stored program's

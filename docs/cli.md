@@ -52,6 +52,7 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--chain-id <CHAIN_ID>` | `1` | chain id; transactions and gossip topics are bound to it |
 | `--validator <KEY,STAKE,PAYOUT>` | required, repeatable | one register entry: key file path **or** hex public key, the stake in RAND (at least 1000, the staking minimum), and the `rand1…` address its rewards and unbonded stake are paid to |
 | `--epoch-blocks <N>` | `1000` | blocks per epoch: how often the validator set is re-derived from the register (spec §8). Part of the genesis hash |
+| `--max-program-words <N>` | none (4096) | the largest program a `Deploy` may carry, in words, `1..=65535` (the zkVM's own limit). Omitted, the file has no `max_program_words` field and the chain runs the 4096-word cap with the genesis hash it always had; given, the field is written and is part of the genesis hash |
 | `--alloc <ALLOCS>` | none, repeatable | a deposit note: `rand1<address>=<amount in RAND>` |
 | `--out <OUT>` | `genesis.json` | output path |
 | `--faucet` | off | **testnet only**: enable `Mint` transactions (`rand_mint`, up to 100 RAND per call). Part of the genesis hash |
@@ -94,7 +95,9 @@ Genesis JSON shape:
 ```
 
 `bridge` is the one optional field this command never writes (add it by hand, as above); every
-other field it writes, `epoch_blocks` included.
+other field it writes, `epoch_blocks` included. `max_program_words` (a number) is written only with
+`--max-program-words`, and `aggregation` only with `--aggregation`; a file without them hashes as it
+did before those fields existed.
 
 Both `amount` and a validator's `stake` are in smallest units, and both are public: they are what
 let everyone add up the initial supply (`docs/supply.md`). Who owns a note is not — only the address

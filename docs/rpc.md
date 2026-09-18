@@ -303,7 +303,10 @@ receipt for that hash.
 ### `rand_estimateFee`
 Params: `[spec]`, one of `{"kind":"bundle"}`, `{"kind":"deploy","words":n}` or
 `{"kind":"call","tier":t}` (`t` one of 10, 12, 14, 16, 18, 20). Result: the minimum fee in units,
-as a string. `{"kind":"bundle"}` is the floor for a plain transfer: `1000000`.
+as a string. `{"kind":"bundle"}` is the floor for a plain transfer: `1000000`. A deploy of more words
+than the chain's program cap (4096, or the genesis file's `max_program_words`) is an invalid-params
+error (`-32602`) naming the cap — the same program admission would refuse, so a wallet can ask
+before it proves.
 
 ### `rand_getTransaction`
 Params: `[hash]`. Result: `null` until committed, then:
@@ -932,7 +935,8 @@ Encoded sizes (bincode's default configuration: fixed-width integers, 8-byte len
 
 So a shielded transfer on the wire is about 1.3 MB at constraint set 5's 80-query profile,
 essentially all proof (it was ~300 KB at 27 queries). The ledger caps a proof at 2 MiB, an envelope
-at 2048 bytes, a program at 4096 words, and a block at 4 MiB of transaction bytes — three bundles
+at 2048 bytes, a program at 4096 words (or the genesis file's `max_program_words`, at most 65 535),
+and a block at 4 MiB of transaction bytes — three bundles
 per block (`docs/block-space.md`).
 
 A wallet builds all of this through `randprotocol_client::wallet::{send, submit}`, which selects the
@@ -942,6 +946,14 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-18 — for the v0.4 chain: the program cap is a genesis parameter
+
+A genesis file may set `max_program_words` (`1..=65535`); absent, the cap stays 4096 words and the
+genesis hash is unchanged, so running chains (chain 12) see no difference. `rand_estimateFee` for a
+deploy now refuses past the chain's cap rather than the constant, with the cap in the message.
+No method, parameter or result shape changed. (The v0.3 entry below is the RPC release; this one
+lands after it and takes effect on the chain cut that sets the field.)
 
 ### 2026-09-18 — v0.3: eleven methods and two WebSocket topics
 
