@@ -285,11 +285,14 @@ Full detail in `docs/architecture.md`.
 | [docs/staking.md](docs/staking.md) | the validator register, epochs, and the four staking commands: register, bond, unbond, withdraw |
 | [docs/supply.md](docs/supply.md) | the supply audit: the counters, the invariant a node checks, and how exact it is |
 | [docs/confidential.md](docs/confidential.md) | programs, calls, outputs, gas, privacy |
+| [docs/guests.md](docs/guests.md) | writing and deploying a RISC-V program: the Rand ISA, the syscall ABI, the image container, `rand-guest` build/check/run/pack, `hc` versus program id, the program-size cap |
+| [docs/translators.md](docs/translators.md) | the Solana (`sbpf2rv`) and Ethereum (`evm2rv`) translators: trust model, parity, the ERC-20 and SPL Token walkthroughs, measured cycles, limits |
 | [docs/architecture.md](docs/architecture.md) | how the node works end to end: consensus, ledger, storage, networking, sync, and one confidential transaction followed from wallet to receipt |
 | [docs/zkvm-milestones.md](docs/zkvm-milestones.md) | the Rand zkVM milestone by milestone (M1–M4, CUDA backend): what was built and why |
 | [docs/zkvm-m4-m5-progress.md](docs/zkvm-m4-m5-progress.md) | M4 and M5 as delivered: constraint sets 4–6, the recursion VM (M5.1–M5.4) with all measured numbers, what is deferred to which hardware |
 | [docs/bridge.md](docs/bridge.md) | the guardian bridge: trust model, wire format, guardian sets, state, the two bridge actions, and what stays public |
 | [docs/deploy.md](docs/deploy.md) | multi-machine and cloud deployment, rebuilds, fault tests |
+| [docs/node-hardware.md](docs/node-hardware.md) | what validators, wallets and aggregators compute; measured RAM, disk and prover memory per tier; DigitalOcean sizes; setup |
 | [deploy/README.md](deploy/README.md) | the live testnet: nodes, addresses, peer ids |
 | [docs/superpowers/specs](docs/superpowers/specs) | design specs (node, confidential computation, fully shielded pool) |
 
@@ -305,8 +308,7 @@ caller can disclose what a program ran on to an auditor, or to itself later, wit
 Both are here, in this release. Still outstanding from S2's own plan: the local wallet commitment
 tree, so a wallet stops telling its node which leaf it is about to spend.
 
-Not yet implemented beyond that: persistent per-program state and cross-program calls; a RISC-V
-compiler flow for programs (today: the built-in assembler or raw word files); slashing and jailing;
+Not yet implemented beyond that: persistent per-program state and cross-program calls; slashing and jailing;
 a nullifier accumulator in place of the per-block recomputation; block rewards; the hash-sortition
 leader beacon; proof pruning after finality; fee markets.
 

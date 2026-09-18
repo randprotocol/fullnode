@@ -3,6 +3,56 @@
 Every tagged release of the RAND full node, newest first. The client-facing RPC changes are also
 logged, method by method, in [`docs/rpc.md`](docs/rpc.md#changelog).
 
+## v0.4 (unreleased)
+
+**Draft. The controller finalises this section at tagging.** Release date: `TODO-CONTROLLER`
+(estimate 2026-09-25). Chain: 13, genesis `TODO-CONTROLLER`, pinned build `TODO-CONTROLLER`.
+
+v0.4 is the RISC-V developer release: the `rand-guest` toolchain and the two bytecode
+translators, `sbpf2rv` (Solana) and `evm2rv` (Ethereum). They live in the circuits repo (main
+`7ef3220`). Fullnode's side is the program cap as a genesis parameter and the deploy of a
+`rand-guest` image. Those commits are already listed under v0.3's
+[Also included: the program cap as a genesis parameter](#-also-included-the-program-cap-as-a-genesis-parameter)
+and are not repeated here. They take effect on the first chain whose genesis sets
+`max_program_words`.
+
+### Claims, measurements and methods
+
+| claim | measurement | method |
+|---|---|---|
+| `rand-guest` builds a Rust or C guest into an image the chain accepts | a Rust and a C guest built, checked, run and deployed; the call's receipt outputs equal `rand-guest run`'s | a local one-validator chain, test FRI profile, 2026-09-19 (`docs/guests.md`) |
+| the build is reproducible | the Rust `fib` guest rebuilt at a different checkout path gives the committed `hc ed475c16…b99e` | rebuild and compare; `rand-guest/tests/build.rs` gates the four committed guests |
+| the raised cap admits large images | the 11 686-word ERC-20 image deployed on a chain cut with `--max-program-words 65535` (fee 1.1696 RAND); the same deploy on a 4096-word chain is refused before any proving | the same local chain setup |
+| `evm2rv` output equals the interpreter's | identical eight words for `transfer`, `approve` and `transferFrom`; 66 235 / 48 119 / 88 824 cycles against 121 638 / 85 645 / 161 434 on `evm.bin` (54.5–56.2 %) | `rand-guest run` on both images and `diff`, re-run 2026-09-19; `evm2rv/tests/parity.rs` (8 vectors, both stages) and `tests/fuzz.rs` (10 000 random programs) |
+| `sbpf2rv` output equals the interpreter's | identical eight words for SPL Token `Transfer` 250; 765 851 cycles against 694 498 on `sbpf.bin`; all 8 vectors in tier 20; image 65 096 words | `sbpf2rv/tests/parity.rs`, 2026-09-18 |
+| SPL Token translation does not pay off today | about 98 % of each run is the fixed sBPF ABI harness; the translated image is 69–75 k cycles dearer per vector | per-stage cycle attribution (`sbpf2rv/README.md`) |
+| no translated program has been proven yet | tier 18 (ERC-20): OOM-killed at 24.7 GB on a 48 GB laptop, above 47 GB at 25 min on a 64 GB droplet. Tier 20 (SPL Token): OOM-killed at 65.1 GB on a 64 GB droplet. Final numbers: `TODO-CONTROLLER` | `/usr/bin/time`, watchdogs; the prover is single-threaded (99 % of one core on 16 vCPUs) |
+
+### Docs
+
+- `docs/guests.md`: the Rand ISA, the syscall ABI, the image container, step-by-step Rust, C and
+  hand-built deploys, `hc` versus program id (and `hc`'s two spellings), the hermetic build, the
+  cap.
+- `docs/translators.md`: the trust model, the parity guarantee and its accepted divergences, the
+  ERC-20 and SPL Token walkthroughs, measured tables, limits.
+- `docs/node-hardware.md`: what each role proves or verifies, measured RAM and disk, DigitalOcean
+  sizes, prover memory per tier, setup.
+
+### Known limits
+
+- A call to either translated image cannot land on chain yet. The EVM harness uses the `KECCAK`
+  syscall, and a keccak-carrying production proof (3 198 430 bytes at tier 10) exceeds
+  `MAX_PROOF_BYTES` (2 MiB). The SPL image reads a 27 151-word public tape, and the chain verifies
+  every call against the empty public segment.
+- EVM: the nine block-context opcodes trap; a `CALL` with nonzero value traps; ecrecover,
+  bn256 mul and pairing, large modexp and long blake2f exceed the 2^20-cycle tier cap.
+- sBPF: CPI and unknown syscalls trap at run time; Ed25519 and secp256k1 exist in software but are
+  unlinked.
+- `deploy/vps-setup.sh` deletes the unit it has just written (a leftover of the rename) and inits
+  from chain 5's genesis. `docs/node-hardware.md` gives the manual steps.
+
+---
+
 ## 🚀 RAND fullnode v0.3 — the RPC catches up with Ethereum and Solana
 
 **Released 2026-09-18 · chain 12 (genesis `605eb783…`) · same-chain update, no fork**

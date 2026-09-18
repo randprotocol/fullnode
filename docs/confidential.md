@@ -542,6 +542,10 @@ the same words big-endian and reads different for the same program). Then it cal
 the cost of one RPC round trip — rather than after the minutes it takes to prove a bundle the
 ledger would then throw away.
 
+Writing, building and deploying a guest step by step (Rust, C, or a hand-built image) is in
+[`guests.md`](guests.md). Deploying translated Solana and Ethereum programs is in
+[`translators.md`](translators.md).
+
 ## GPU proving (--cuda)
 
 Proving is the only expensive half of a confidential call, and it happens in the wallet, never on
