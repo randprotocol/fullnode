@@ -72,6 +72,9 @@ struct Pooled {
     claim: Option<(Address, u64)>,
     /// When this transaction entered the pool, for `Mempool::info`'s oldest-entry age.
     since: Instant,
+    /// `tx.encoded_len()`, taken once at admission: that is a full re-encode (a ~1.2 MB proof
+    /// included), and `info` and `candidates_within` would otherwise pay it per entry per call.
+    len: usize,
 }
 
 /// The register nonce a bundle-less `Unbond` or `Withdraw` claims — and the aggregator
@@ -125,6 +128,9 @@ pub struct Mempool {
     /// once, like a nullifier, but it is not a field of the transaction — see
     /// `Transaction::bridge_digests`.
     digests: HashMap<Hash, Hash>,
+    /// The sum of every pooled entry's `len`, kept on insert and on `remove_one` — the only two
+    /// places `txs` changes — so `info` reads it rather than summing the pool on the node loop.
+    bytes: usize,
     max_size: usize,
 }
 
@@ -158,6 +164,7 @@ impl Mempool {
             commitments: HashMap::new(),
             claims: HashMap::new(),
             digests: HashMap::new(),
+            bytes: 0,
             max_size,
         }
     }
@@ -179,7 +186,7 @@ impl Mempool {
     pub fn info(&self, now: Instant) -> MempoolInfo {
         MempoolInfo {
             count: self.txs.len(),
-            bytes: self.txs.values().map(|p| p.tx.encoded_len()).sum(),
+            bytes: self.bytes,
             oldest_ms: self.txs.values().map(|p| now.saturating_duration_since(p.since).as_millis() as u64).max(),
             max_count: self.max_size,
         }
@@ -320,7 +327,13 @@ impl Mempool {
         for mu in tx.bridge_digests() {
             self.digests.insert(mu, hash);
         }
-        self.txs.insert(hash, Pooled { tx, commitments, claim, since: Instant::now() });
+        let len = tx.encoded_len();
+        self.bytes += len;
+        // `pool_conflicts` refuses a hash already pooled, so nothing is replaced here; if that
+        // ever changes, the replaced entry's bytes must leave the total with it.
+        if let Some(old) = self.txs.insert(hash, Pooled { tx, commitments, claim, since: Instant::now(), len }) {
+            self.bytes -= old.len;
+        }
         hash
     }
 
@@ -356,7 +369,7 @@ impl Mempool {
         let mut out = Vec::new();
         let mut bytes = 0usize;
         for (_, p) in ready.into_iter().take(max) {
-            let len = p.tx.encoded_len();
+            let len = p.len;
             if bytes + len > max_bytes {
                 // Skip it, do not end the block. `break` meant one transaction that cannot fit —
                 // sorted first because it pays the highest fee — produced *empty* blocks for as
@@ -516,6 +529,7 @@ impl Mempool {
 
     fn remove_one(&mut self, hash: &Hash) -> Option<Transaction> {
         let p = self.txs.remove(hash)?;
+        self.bytes -= p.len;
         for nf in p.tx.nullifiers() {
             // Only withdraw the index entries this transaction owns: a conflicting one was never
             // admitted, so an entry pointing elsewhere cannot exist, but checking keeps the two
@@ -616,6 +630,41 @@ mod tests {
         assert_eq!(info.count, 1);
         assert_eq!(info.bytes, tx.encoded_len());
         assert!(info.oldest_ms.unwrap() >= 1_500);
+    }
+
+    /// The running byte total: two entries sum, the older one dates the pool, and removing
+    /// both — one committed, one pruned — brings the total back to zero rather than leaving
+    /// either's bytes behind.
+    #[test]
+    fn info_keeps_a_running_byte_total_across_insert_remove_and_prune() {
+        let l = ledger();
+        let mut pool = Mempool::new(100);
+        let a = fixtures::bundle_tx(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee());
+        let b = fixtures::bundle_tx(&l, [nf(3), nf(4)], [cm(3), cm(4)], fixtures::bundle_fee() * 2);
+        pool.insert(a.clone(), &l, &StubExecutor).unwrap();
+        pool.insert(b.clone(), &l, &StubExecutor).unwrap();
+        // `a` has waited ten seconds longer; `since` is only ever set by admission, so move it.
+        let older = Instant::now().checked_sub(Duration::from_secs(10)).expect("the clock is past ten seconds");
+        pool.txs.get_mut(&a.hash()).unwrap().since = older;
+        let now = Instant::now();
+        let info = pool.info(now);
+        assert_eq!(info.count, 2);
+        assert_eq!(info.bytes, a.encoded_len() + b.encoded_len());
+        assert_eq!(info.oldest_ms, Some(now.duration_since(older).as_millis() as u64), "the older entry dates the pool");
+        assert!(info.oldest_ms.unwrap() >= 10_000);
+
+        // Asked about an instant before either entry arrived, the age saturates at zero.
+        let before = older.checked_sub(Duration::from_secs(1)).unwrap();
+        assert_eq!(pool.info(before).oldest_ms, Some(0));
+
+        pool.remove(&[a.hash()]);
+        assert_eq!(pool.info(now).bytes, b.encoded_len());
+        // `b` lands on the ledger by some other route: its nullifiers are spent, so it is pruned.
+        let mut spent = l.clone();
+        spent.apply_tx(&b, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        pool.prune(&spent);
+        let info = pool.info(now);
+        assert_eq!((info.count, info.bytes, info.oldest_ms), (0, 0, None));
     }
 
     /// A transaction larger than a block never enters the pool.
