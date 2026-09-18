@@ -63,6 +63,10 @@ pub struct ProgramRecord {
     /// this in `pv::PUB0..7` (or `public_digest(&[])` when `None`). The words themselves are not
     /// here — the node keeps them in its `program_public` column, so the record stays small.
     pub public_digest: Option<Word8>,
+    /// The length of that public input, in words (0 when there is none). A proof's public table
+    /// height is a function of it (`tables::public::public_log_height`), so the executor's `warm`
+    /// needs it to precompute the verifier key every call against this program uses.
+    pub public_len: u32,
 }
 
 /// What a verified call proved: its gas tier, the eight public outputs, and the public

@@ -298,17 +298,18 @@ impl ConfidentialExecutor for ZkExecutor {
     /// `NO_SHA256` (no deployed guest calls `SYS_SHA256` either) and
     /// `public::public_log_height(0)` (the empty public segment's declared height,
     /// `tables::public::MIN_LOG_HEIGHT`). A program deployed with a public input (the call
-    /// limits, spec §5) proves at `public_log_height(len)`, which this does not warm: the record
-    /// carries only the input's digest, not its length, so its first call pays the key build
-    /// once per class, like an unwarmed tier.
+    /// limits, spec §5) proves at `public_log_height(record.public_len)` instead — every call
+    /// against it commits to exactly that input, so that one class is warmed in place of the
+    /// empty one, and its first call pays no key build.
     fn warm(&self, record: &ProgramRecord) {
         let log_height = program::program_log_height(record.words.len());
         let smallest = input::MIN_LOG_HEIGHT;
         let typical = input::input_log_height(4);
         let input_heights: &[u8] = if typical == smallest { &[smallest] } else { &[smallest, typical] };
+        let public_height = public::public_log_height(record.public_len as usize);
         for t in &TIERS[..3] {
             for &in_h in input_heights {
-                self.machine.verifier_key(Tier(*t), log_height, in_h, NO_KECCAK, NO_SHA256, public::public_log_height(0));
+                self.machine.verifier_key(Tier(*t), log_height, in_h, NO_KECCAK, NO_SHA256, public_height);
             }
         }
     }

@@ -1125,6 +1125,7 @@ impl Ledger {
                             code_hash,
                             deployed_at: self.height,
                             public_digest,
+                            public_len: public.len() as u32,
                         },
                     );
                 }
@@ -2001,6 +2002,7 @@ mod tests {
         assert_ne!(id, program_id(0, &words));
         let rec = l.program(&id).expect("deployed under the new id");
         assert_eq!(rec.public_digest, Some(StubExecutor.public_digest(&public)));
+        assert_eq!(rec.public_len, 3);
         assert_eq!(rec.words, words);
         assert!(l.program(&program_id(0, &words)).is_none(), "the same code without the input is another program");
         // A program deployed without a public input keeps today's id and records no digest.
@@ -2009,6 +2011,7 @@ mod tests {
         let t = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::fee_floor(&plain)), plain);
         l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
         assert_eq!(l.program(&program_id(0, &words)).unwrap().public_digest, None);
+        assert_eq!(l.program(&program_id(0, &words)).unwrap().public_len, 0);
     }
 
     /// The public-input cap is the ledger's `max_program_public_words`, checked at step 1 before

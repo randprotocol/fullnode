@@ -279,7 +279,7 @@ mod tests {
     use super::*;
 
     fn record(id: Hash) -> ProgramRecord {
-        ProgramRecord { id, base_pc: 0, words: vec![0x13], code_hash: vec![], deployed_at: 0, public_digest: None }
+        ProgramRecord { id, base_pc: 0, words: vec![0x13], code_hash: vec![], deployed_at: 0, public_digest: None, public_len: 0 }
     }
 
     /// The stub checks the proof's public-input digest against the record's exactly as the zkVM
@@ -291,7 +291,7 @@ mod tests {
         let digest = StubExecutor.public_digest(&public);
         assert_ne!(digest, StubExecutor.public_digest(&[]));
         assert_ne!(StubExecutor.public_digest(&[]), [0; 8]);
-        let with = ProgramRecord { public_digest: Some(digest), ..record(id) };
+        let with = ProgramRecord { public_digest: Some(digest), public_len: 3, ..record(id) };
         let proof = StubExecutor::make_proof_with_public(&id, 12, [1; 8], &public);
         assert_eq!(StubExecutor.verify_call(&with, &proof).unwrap().outputs, [1; 8]);
         let bad = ConfidentialError::InvalidProof("PublicValues".into());

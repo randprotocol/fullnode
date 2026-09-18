@@ -15,6 +15,7 @@ fn record(p: &randprotocol_zkvm::isa::Program) -> ProgramRecord {
         code_hash,
         deployed_at: 0,
         public_digest: None,
+        public_len: 0,
     }
 }
 
@@ -122,6 +123,7 @@ fn a_call_is_checked_against_the_records_public_digest() {
     let with = ProgramRecord {
         id: randprotocol_core::program::program_id_with_public(p.base_pc, &p.words, &public),
         public_digest: Some(ex.public_digest(&public)),
+        public_len: public.len() as u32,
         ..record(&p)
     };
     let (proof, exec) = m.prove(&p, &[], &public, None).unwrap();
@@ -140,7 +142,7 @@ fn a_call_is_checked_against_the_records_public_digest() {
     // The empty input against a program deployed with one (a guest that never reads its public
     // segment still commits to it, so the empty-input proof is a different statement).
     let f = guests::fib(10);
-    let fib_with = ProgramRecord { public_digest: Some(ex.public_digest(&public)), ..record(&f) };
+    let fib_with = ProgramRecord { public_digest: Some(ex.public_digest(&public)), public_len: public.len() as u32, ..record(&f) };
     let (empty, _) = m.prove(&f, &[], &[], None).unwrap();
     assert!(public_values(ex.verify_call(&fib_with, &empty.to_bytes())));
     let (committed, _) = m.prove(&f, &[], &public, None).unwrap();
@@ -156,4 +158,27 @@ fn a_program_without_a_public_input_keeps_its_id_and_its_empty_input_proofs() {
     assert_eq!(rec.public_digest, None);
     let (proof, outputs, _) = shared();
     assert_eq!(ZkExecutor::new(FriProfile::Test).verify_call(&rec, proof).unwrap().outputs, *outputs);
+}
+
+/// `warm` precomputes the verifier key a call against a program with a public input needs: the
+/// public table's height follows the record's `public_len`, so after warming, a call's verify
+/// builds no new key.
+#[test]
+fn a_program_with_a_public_input_is_warmed() {
+    use randprotocol_zkvm::machine::Machine;
+    let p = guests::public_echo();
+    let public = [11u32, 22, 33, 44, 55, 66, 77, 88, 99];
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let rec = ProgramRecord {
+        public_digest: Some(ex.public_digest(&public)),
+        public_len: public.len() as u32,
+        ..record(&p)
+    };
+    let (proof, _) = Machine::new(FriProfile::Test).prove(&p, &[], &public, Some(randprotocol_zkvm::machine::Tier(10))).unwrap();
+    assert_eq!(proof.public_log_height, randprotocol_zkvm::tables::public::public_log_height(public.len()));
+    assert_ne!(proof.public_log_height, randprotocol_zkvm::tables::public::public_log_height(0), "a class of its own");
+    ex.warm(&rec);
+    let warmed = ex.cached_keys();
+    ex.verify_call(&rec, &proof.to_bytes()).unwrap();
+    assert_eq!(ex.cached_keys(), warmed, "the call's key was already warm");
 }
