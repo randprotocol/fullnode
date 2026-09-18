@@ -2608,7 +2608,7 @@ mod tests {
         s.init_genesis(&gs).unwrap();
 
         let deploy_tx = |ledger: &Ledger, seed: u32, word: u32| {
-            let action = Action::Deploy { base_pc: 0, words: vec![word; 5_000] };
+            let action = Action::Deploy { base_pc: 0, words: vec![word; 5_000], public: vec![] };
             let fee = randprotocol_core::gas::fee_floor(&action);
             let b = bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], fee);
             Transaction::shielded(ledger.chain_id(), b, action)
@@ -2663,7 +2663,7 @@ mod tests {
         let proposer = key(1);
         let mut ledger = gs.ledger.clone();
         ledger.set_height(1);
-        let action = Action::Deploy { base_pc: 0, words: vec![0x13; 16] };
+        let action = Action::Deploy { base_pc: 0, words: vec![0x13; 16], public: vec![] };
         let fee = gas::fee_floor(&action);
         let b = bundle(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee);
         let tx = Transaction::shielded(ledger.chain_id(), b, action);
@@ -3333,8 +3333,8 @@ mod tests {
         ledger.set_faucet(true);
         let words = vec![0x13u32; 3];
         ledger.set_height(3);
-        let deploy_bundle = bundle_tx(&ledger, [[90; 8], [91; 8]], [[92; 8], [93; 8]], randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: words.clone() }));
-        let deploy = Transaction::shielded(gs.chain_id, deploy_bundle.bundle.clone().unwrap(), Action::Deploy { base_pc: 0, words: words.clone() });
+        let deploy_bundle = bundle_tx(&ledger, [[90; 8], [91; 8]], [[92; 8], [93; 8]], randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] }));
+        let deploy = Transaction::shielded(gs.chain_id, deploy_bundle.bundle.clone().unwrap(), Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] });
         // The bundle's digest commits to its own fields only, so swapping the action is fine.
         let cb3 = make_block(&blocks[1].block, &mut ledger, vec![deploy.clone()], &k);
         let pid = randprotocol_core::program::program_id(0, &words);
@@ -3374,7 +3374,7 @@ mod tests {
         let pid_b = randprotocol_core::program::program_id(0, &[0x14u32; 3]);
         let mut cb3 = make_block(&blocks[1].block, &mut ledger, vec![], &k);
         let rec = |pid, height, index, tx: u8| randprotocol_core::program::CallReceipt {
-            tx: Hash([tx; 32]), program: pid, tier: 1, outputs: [0; 8], height, index, h_in: [0; 8],
+            tx: Hash([tx; 32]), program: pid, tier: 1, outputs: [0; 8], height, index, h_in: [0; 8], h_pub: None,
             input_envelope: None,
         };
         cb3.receipts = vec![rec(pid_a, 3, 1, 1), rec(pid_a, 3, 2, 2), rec(pid_b, 3, 3, 3)];
@@ -3416,7 +3416,7 @@ mod tests {
             st.init_genesis(&gs).unwrap();
             // Write a receipt straight into the receipts family, as a pre-v0.3 node would have.
             let r = randprotocol_core::program::CallReceipt {
-                tx: Hash([9; 32]), program: pid, tier: 1, outputs: [0; 8], height: 1, index: 0, h_in: [0; 8],
+                tx: Hash([9; 32]), program: pid, tier: 1, outputs: [0; 8], height: 1, index: 0, h_in: [0; 8], h_pub: None,
                 input_envelope: None,
             };
             st.db.put_cf(st.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(&r).unwrap()).unwrap();
@@ -3500,7 +3500,7 @@ mod tests {
 
     fn a_receipt(pid: ProgramId) -> CallReceipt {
         randprotocol_core::program::CallReceipt {
-            tx: Hash([9; 32]), program: pid, tier: 1, outputs: [0; 8], height: 1, index: 0, h_in: [0; 8],
+            tx: Hash([9; 32]), program: pid, tier: 1, outputs: [0; 8], height: 1, index: 0, h_in: [0; 8], h_pub: None,
             input_envelope: None,
         }
     }

@@ -207,7 +207,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     // so the transcript is the only record of what it was fed — and it is sealed to A alone.
     let prog = guests::balance_check(1_000);
     let pid = randprotocol_core::program::program_id(prog.base_pc, &prog.words);
-    let deploy = Action::Deploy { base_pc: prog.base_pc, words: prog.words.clone() };
+    let deploy = Action::Deploy { base_pc: prog.base_pc, words: prog.words.clone(), public: vec![] };
     let fee = wallet::deploy_fee_default(&deploy);
     let slot = proving_slot().await;
     wallet::submit(&rpc, &a, &mut a_store, None, deploy, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)

@@ -69,8 +69,11 @@ pub enum Action {
     /// Carried by a bundle-less transaction; `signature` is `minter`'s Dilithium2 signature over
     /// [`Transaction::mint_signing_hash`].
     Mint { cm: Word8, envelope: Envelope, amount: u64, minter: PublicKey, signature: Signature },
-    /// Put a zkVM program on chain. Content addressed; see `program::program_id`.
-    Deploy { base_pc: u32, words: Vec<u32> },
+    /// Put a zkVM program on chain. Content addressed; see `program::program_id_with_public`.
+    /// `public` is the program's public input, fixed at deploy (the call limits, spec §5): every
+    /// call's proof commits to exactly these words. Empty for a program without one, which keeps
+    /// the program's id what it was before public inputs existed.
+    Deploy { base_pc: u32, words: Vec<u32>, public: Vec<u32> },
     /// A confidential call: a STARK proof that `program` ran on private inputs and published
     /// the eight public outputs carried in the proof. `input_envelope` is the optional
     /// encrypted transcript of those private inputs (spec §6.1); the chain checks only its size.
@@ -390,7 +393,7 @@ mod tests {
         }
         for a in [
             Action::None,
-            Action::Deploy { base_pc: 0, words: vec![0x13] },
+            Action::Deploy { base_pc: 0, words: vec![0x13], public: vec![] },
             Action::Call { program: Hash::ZERO, proof: vec![], input_envelope: None },
             Action::Bond { validator: v, amount: 1, registration: None },
         ] {

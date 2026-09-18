@@ -655,6 +655,7 @@ mod tests {
             height: 5,
             index: 0,
             h_in: [0; 8],
+            h_pub: None,
             input_envelope: None,
         };
         let c = CommitSummary { height: 5, hash: Hash([5; 32]), tx_hashes: vec![Hash([3; 32])], receipts: vec![rec(pid_a)] };

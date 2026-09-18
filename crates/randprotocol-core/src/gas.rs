@@ -133,7 +133,8 @@ pub fn fee_floor(action: &Action) -> u64 {
     match action {
         Action::Mint { .. } | Action::Unbond { .. } | Action::Withdraw { .. } => 0,
         Action::None => BUNDLE_BASE,
-        Action::Deploy { words, .. } => BUNDLE_BASE + deploy_fee(words.len()),
+        // Public words are charged like code words (spec §5): the chain stores both.
+        Action::Deploy { words, public, .. } => BUNDLE_BASE + deploy_fee(words.len() + public.len()),
         Action::Call { .. } => BUNDLE_BASE + CALL_BASE,
         // A bond is the one staking action that rides on a bundle — the bundle is what burns the
         // stake out of the pool — so it pays the plain base like a transfer.
@@ -173,7 +174,12 @@ mod tests {
     #[test]
     fn fee_floor_adds_the_bundle_base() {
         assert_eq!(fee_floor(&Action::None), 1_000_000);
-        assert_eq!(fee_floor(&Action::Deploy { base_pc: 0, words: vec![0x13; 10] }), 1_000_000 + 1_000_000);
+        assert_eq!(fee_floor(&Action::Deploy { base_pc: 0, words: vec![0x13; 10], public: vec![] }), 1_000_000 + 1_000_000);
+        assert_eq!(
+            fee_floor(&Action::Deploy { base_pc: 0, words: vec![0x13; 10], public: vec![7; 3] }),
+            BUNDLE_BASE + deploy_fee(13),
+            "public words pay DEPLOY_PER_WORD too"
+        );
         assert_eq!(
             fee_floor(&Action::Call { program: crate::crypto::Hash::ZERO, proof: vec![], input_envelope: None }),
             2_000_000

@@ -1051,7 +1051,7 @@ mod tests {
     fn a_non_staking_action_routed_here_is_refused() {
         let mut l = ledger(vec![entry(&key(1), MIN_STAKE, payout(1))]);
         let t = Transaction { chain_id: CHAIN, bundle: None, action: Action::None };
-        for a in [Action::None, Action::Deploy { base_pc: 0, words: vec![0x13; 2] }] {
+        for a in [Action::None, Action::Deploy { base_pc: 0, words: vec![0x13; 2], public: vec![] }] {
             assert_eq!(validate(&l, &t, &a, &StubExecutor), Err(NOT_STAKING), "{a:?}");
             assert_eq!(apply(&mut l, &t, &a, &key(1).address(), &StubExecutor), Err(NOT_STAKING), "{a:?}");
         }

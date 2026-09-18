@@ -643,7 +643,7 @@ async fn main() -> Result<()> {
             // `max_program_words` admission (Task 1), so a program over the cap is refused here
             // rather than after a proof the ledger would then throw away.
             wallet::deploy_precheck(&rpc, p.words.len()).await?;
-            let action = Action::Deploy { base_pc: p.base_pc, words: p.words.clone() };
+            let action = Action::Deploy { base_pc: p.base_pc, words: p.words.clone(), public: vec![] };
             let fee = wallet::deploy_fee_default(&action);
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;

@@ -1066,7 +1066,7 @@ async fn confidential_call_rides_on_a_bundle() {
     let mut store = NoteStore::default();
 
     // ---- deploy, paid by a bundle ----
-    let action = Action::Deploy { base_pc: program.base_pc, words: program.words.clone() };
+    let action = Action::Deploy { base_pc: program.base_pc, words: program.words.clone(), public: vec![] };
     let deploy_fee = wallet::deploy_fee_default(&action);
     assert_eq!(deploy_fee, gas::BUNDLE_BASE + gas::deploy_fee(program.words.len()));
     let slot = proving_slot().await;
@@ -1654,7 +1654,7 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
     let program = randprotocol_zkvm::guests::private_payment(1_000);
     let id = randprotocol_core::program::program_id(program.base_pc, &program.words);
     let mut store = NoteStore::default();
-    let deploy = Action::Deploy { base_pc: program.base_pc, words: program.words.clone() };
+    let deploy = Action::Deploy { base_pc: program.base_pc, words: program.words.clone(), public: vec![] };
     let deploy_fee = wallet::deploy_fee_default(&deploy);
     let slot = proving_slot().await;
     wallet::submit(&n0.rpc, &caller, &mut store, None, deploy, deploy_fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)

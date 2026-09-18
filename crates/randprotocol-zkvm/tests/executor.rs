@@ -14,6 +14,7 @@ fn record(p: &randprotocol_zkvm::isa::Program) -> ProgramRecord {
         words: p.words.clone(),
         code_hash,
         deployed_at: 0,
+        public_digest: None,
     }
 }
 

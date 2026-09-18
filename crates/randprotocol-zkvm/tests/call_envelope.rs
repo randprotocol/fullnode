@@ -188,6 +188,7 @@ fn prove_call_returns_the_salt_behind_the_proofs_h_in() {
         words: program.words.clone(),
         code_hash,
         deployed_at: 0,
+        public_digest: None,
     };
     let outcome = executor.verify_call(&record, &bytes).expect("the proof this test just produced");
     assert_eq!(outcome.h_in, input_digest(salt, &inputs), "the receipt's H_IN is the transcript's digest");

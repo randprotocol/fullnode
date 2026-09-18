@@ -332,6 +332,11 @@ impl ConfidentialExecutor for ZkExecutor {
         Ok(CallOutcome { tier: proof.tier.0 as u8, outputs, h_in })
     }
 
+    /// `H_PUB` exactly as the circuit publishes it in `pv::PUB0..7`.
+    fn public_digest(&self, words: &[u32]) -> Word8 {
+        crate::hash::public_digest(words)
+    }
+
     fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
         let mut msg = [0u32; 16];
         msg[..8].copy_from_slice(left);

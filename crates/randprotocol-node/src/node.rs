@@ -1257,8 +1257,8 @@ impl Node {
             .iter()
             .flat_map(|cb| cb.block.transactions.iter())
             .filter_map(|tx| match &tx.action {
-                randprotocol_core::Action::Deploy { base_pc, words } => {
-                    ledger.program(&randprotocol_core::program::program_id(*base_pc, words)).cloned()
+                randprotocol_core::Action::Deploy { base_pc, words, public } => {
+                    ledger.program(&randprotocol_core::program::program_id_with_public(*base_pc, words, public)).cloned()
                 }
                 _ => None,
             })

@@ -83,6 +83,10 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.warm(program)
     }
 
+    fn public_digest(&self, words: &[u32]) -> Word8 {
+        self.inner.public_digest(words)
+    }
+
     fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
         self.inner.node_hash(left, right)
     }

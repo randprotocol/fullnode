@@ -19,7 +19,7 @@ use crate::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor}
 use crate::crypto::{merkle_root, Address, Hash};
 use crate::gas;
 use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Envelope, Word8, MAX_ENVELOPE_BYTES};
-use crate::program::{program_id, CallOutcome, CallReceipt, ProgramId, ProgramRecord};
+use crate::program::{program_id_with_public, CallOutcome, CallReceipt, ProgramId, ProgramRecord};
 use crate::types::{Action, Block, Transaction, ValidatorSet, FAUCET_MAX_UNITS};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -93,6 +93,10 @@ pub enum TxError {
     TransactionTooLarge { size: usize, max: usize },
     #[error("program too large")]
     ProgramTooLarge,
+    /// A deploy's public input is longer than the chain's `max_program_public_words` (the call
+    /// limits, spec §5; 0, no public input at all, unless the genesis raises it).
+    #[error("program public input too large")]
+    ProgramPublicTooLarge,
     #[error("asset {0} is not supported in this release")]
     UnsupportedAsset(u32),
     #[error("burn of {0} is not supported in this release")]
@@ -229,6 +233,9 @@ pub struct CallReceiptData {
     /// `H_IN`, the verified proof's public commitment to the call's private inputs — what the
     /// envelope below is sealed against (spec §6.1).
     pub h_in: Word8,
+    /// The program's public-input digest the proof was checked against; `None` for a program
+    /// deployed without a public input.
+    pub h_pub: Option<Word8>,
     /// The call's input envelope, carried through to the receipt unread (spec §6.1); see
     /// [`call_envelope`] for the one rule the chain applies to it.
     pub input_envelope: Option<crate::types::CallEnvelope>,
@@ -878,6 +885,9 @@ impl Ledger {
             Action::Deploy { words, .. } if words.len() > self.max_program_words => {
                 return Err(TxError::ProgramTooLarge)
             }
+            Action::Deploy { public, .. } if public.len() > self.max_program_public_words => {
+                return Err(TxError::ProgramPublicTooLarge)
+            }
             Action::Call { proof, .. } if proof.len() > self.max_proof_bytes => return Err(TxError::ProofTooLarge),
             Action::Withdraw { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
                 return Err(TxError::EnvelopeTooLarge)
@@ -986,7 +996,7 @@ impl Ledger {
                     return Err(TxError::CommitmentExists(*cm));
                 }
             }
-            Action::Deploy { base_pc, words } => {
+            Action::Deploy { base_pc, words, .. } => {
                 if !self.confidential {
                     return Err(TxError::ConfidentialDisabled);
                 }
@@ -1099,13 +1109,23 @@ impl Ledger {
                 self.commitments.insert(*cm);
                 self.tree.append(*cm, executor);
             }
-            Action::Deploy { base_pc, words } => {
-                let id = program_id(*base_pc, words);
+            Action::Deploy { base_pc, words, public } => {
+                let id = program_id_with_public(*base_pc, words, public);
                 if !self.programs.contains_key(&id) {
                     let code_hash = executor.check_program(*base_pc, words).map_err(TxError::BadProgram)?;
+                    // Hashed once, here: a call compares its proof's `H_PUB` with this and never
+                    // re-hashes the words (spec §5).
+                    let public_digest = (!public.is_empty()).then(|| executor.public_digest(public));
                     self.programs.insert(
                         id,
-                        ProgramRecord { id, base_pc: *base_pc, words: words.clone(), code_hash, deployed_at: self.height },
+                        ProgramRecord {
+                            id,
+                            base_pc: *base_pc,
+                            words: words.clone(),
+                            code_hash,
+                            deployed_at: self.height,
+                            public_digest,
+                        },
                     );
                 }
             }
@@ -1116,6 +1136,8 @@ impl Ledger {
                     tier: o.tier,
                     outputs: o.outputs,
                     h_in: o.h_in,
+                    // The digest the proof was just checked against (`verify_call`).
+                    h_pub: self.programs.get(program).and_then(|r| r.public_digest),
                     input_envelope: input_envelope.clone(),
                 });
             }
@@ -1318,6 +1340,7 @@ impl Ledger {
                 height: block.height(),
                 index: index as u32,
                 h_in: r.h_in,
+                h_pub: r.h_pub,
                 input_envelope: r.input_envelope,
             })
             .collect())
@@ -1422,6 +1445,7 @@ pub fn default_executor() -> StubExecutor {
 mod tests {
     use super::*;
     use crate::confidential::StubExecutor;
+    use crate::program::program_id;
     use crate::crypto::Keypair;
     use crate::notes::{Envelope, ShieldedAddress};
     use crate::types::{BlockHeader, QuorumCertificate};
@@ -1708,7 +1732,7 @@ mod tests {
         let mut l = ledger();
         let (a, _) = keys();
         let words = vec![0x13u32; 4];
-        let deploy = Action::Deploy { base_pc: 0, words: words.clone() };
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
         let under =
             Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE), deploy.clone());
         assert_eq!(
@@ -1822,7 +1846,7 @@ mod tests {
         let mut l = ledger();
         let (a, _) = keys();
         let words = vec![0x13u32; 4];
-        let deploy = Action::Deploy { base_pc: 0, words: words.clone() };
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
         let d = Transaction::shielded(
             7,
             bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)),
@@ -1861,7 +1885,7 @@ mod tests {
         let mut l = ledger();
         let (a, _) = keys();
         let words = vec![0x13u32; 4];
-        let deploy = Action::Deploy { base_pc: 0, words: words.clone() };
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
         let d = Transaction::shielded(
             7,
             bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)),
@@ -1905,7 +1929,7 @@ mod tests {
         let mut l = ledger();
         let (a, _) = keys();
         // An oversized program is refused by the size cap, before any fee or code check.
-        let big = Action::Deploy { base_pc: 0, words: vec![0x13; gas::MAX_PROGRAM_WORDS + 1] };
+        let big = Action::Deploy { base_pc: 0, words: vec![0x13; gas::MAX_PROGRAM_WORDS + 1], public: vec![] };
         let t = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE), big);
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::ProgramTooLarge));
         // A call naming a program nobody deployed.
@@ -1921,7 +1945,7 @@ mod tests {
         let words = vec![0x13u32; 4];
         let other = vec![0x73u32; 4];
         for (n, code) in [(0u32, &words), (1, &other)] {
-            let deploy = Action::Deploy { base_pc: 0, words: code.clone() };
+            let deploy = Action::Deploy { base_pc: 0, words: code.clone(), public: vec![] };
             let d = Transaction::shielded(
                 7,
                 bundle(&l, [[10 + n; 8], [20 + n; 8]], [[30 + n; 8], [40 + n; 8]], gas::fee_floor(&deploy)),
@@ -1939,7 +1963,7 @@ mod tests {
         // Redeploying the same code is a no-op: the record keeps its original height.
         assert_eq!(l.program(&id).unwrap().deployed_at, 1);
         l.set_height(9);
-        let deploy = Action::Deploy { base_pc: 0, words: words.clone() };
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
         let again = Transaction::shielded(
             7,
             bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], gas::fee_floor(&deploy)),
@@ -1948,6 +1972,119 @@ mod tests {
         l.apply_tx(&again, &a.address(), &StubExecutor).unwrap();
         assert_eq!(l.programs().len(), 2);
         assert_eq!(l.program(&id).unwrap().deployed_at, 1, "a redeploy does not move deployed_at");
+    }
+
+    /// A public input fixed at deploy (the call limits, spec §5): the program gets the
+    /// `rand-program-2` id, pays `DEPLOY_PER_WORD` for its public words as for its code, and its
+    /// record carries the executor's digest of them.
+    #[test]
+    fn a_deploy_with_public_words_gets_the_new_id_pays_for_them_and_stores_the_digest() {
+        let mut l = ledger();
+        l.set_max_program_public_words(16);
+        let (a, _) = keys();
+        let words = vec![0x13u32; 4];
+        let public = vec![7u32, 8, 9];
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: public.clone() };
+        assert_eq!(gas::fee_floor(&deploy), gas::BUNDLE_BASE + gas::deploy_fee(7));
+        let code_only = gas::BUNDLE_BASE + gas::deploy_fee(words.len());
+        let under = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], code_only), deploy.clone());
+        assert_eq!(
+            l.validate(&under, &StubExecutor),
+            Err(TxError::FeeTooLow { min: gas::fee_floor(&deploy), fee: code_only }),
+            "the public words are paid for"
+        );
+        let ok =
+            Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)), deploy);
+        l.apply_tx(&ok, &a.address(), &StubExecutor).unwrap();
+        l.record_anchor(l.height());
+        let id = crate::program::program_id_with_public(0, &words, &public);
+        assert_ne!(id, program_id(0, &words));
+        let rec = l.program(&id).expect("deployed under the new id");
+        assert_eq!(rec.public_digest, Some(StubExecutor.public_digest(&public)));
+        assert_eq!(rec.words, words);
+        assert!(l.program(&program_id(0, &words)).is_none(), "the same code without the input is another program");
+        // A program deployed without a public input keeps today's id and records no digest.
+        let plain = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
+        assert_eq!(gas::fee_floor(&plain), gas::BUNDLE_BASE + gas::deploy_fee(4));
+        let t = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::fee_floor(&plain)), plain);
+        l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
+        assert_eq!(l.program(&program_id(0, &words)).unwrap().public_digest, None);
+    }
+
+    /// The public-input cap is the ledger's `max_program_public_words`, checked at step 1 before
+    /// any fee or code work; today's default, 0, admits no public input at all.
+    #[test]
+    fn a_deploy_over_the_public_cap_is_refused() {
+        let deploy = |l: &Ledger, n: usize| {
+            let action = Action::Deploy { base_pc: 0, words: vec![0x13; 4], public: vec![1; n] };
+            Transaction::shielded(7, bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&action)), action)
+        };
+        let l = ledger();
+        assert_eq!(l.validate(&deploy(&l, 0), &StubExecutor), Ok(()));
+        assert_eq!(l.validate(&deploy(&l, 1), &StubExecutor), Err(TxError::ProgramPublicTooLarge));
+        let mut raised = ledger();
+        raised.set_max_program_public_words(3);
+        assert_eq!(raised.validate(&deploy(&raised, 3), &StubExecutor), Ok(()));
+        assert_eq!(raised.validate(&deploy(&raised, 4), &StubExecutor), Err(TxError::ProgramPublicTooLarge));
+        // Before the fee: an underpaying oversized deploy is refused for its size.
+        let action = Action::Deploy { base_pc: 0, words: vec![0x13; 4], public: vec![1; 4] };
+        let t = Transaction::shielded(7, bundle(&raised, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE), action);
+        assert_eq!(raised.validate(&t, &StubExecutor), Err(TxError::ProgramPublicTooLarge));
+    }
+
+    /// A call against a program with a public input verifies only with a proof committed to
+    /// exactly those words, and its receipt carries the digest it was checked against; a program
+    /// without one takes only empty-input proofs and its receipts carry no digest.
+    #[test]
+    fn a_call_is_checked_against_the_programs_public_digest_and_the_receipt_carries_it() {
+        let mut l = ledger();
+        l.set_max_program_public_words(16);
+        let (a, _) = keys();
+        let words = vec![0x13u32; 4];
+        let public = vec![7u32, 8, 9];
+        let mut n = 0u32;
+        let mut next = || {
+            n += 4;
+            [[n; 8], [n + 1; 8], [n + 2; 8], [n + 3; 8]]
+        };
+        for p in [public.clone(), vec![]] {
+            let d = Action::Deploy { base_pc: 0, words: words.clone(), public: p };
+            let [n0, n1, c0, c1] = next();
+            let t = Transaction::shielded(7, bundle(&l, [n0, n1], [c0, c1], gas::fee_floor(&d)), d);
+            l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
+            l.record_anchor(l.height());
+        }
+        let id = crate::program::program_id_with_public(0, &words, &public);
+        let plain = program_id(0, &words);
+        let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
+        let mut call = |l: &mut Ledger, program: ProgramId, proof: Vec<u8>, apply: bool| {
+            let [n0, n1, c0, c1] = next();
+            let t = Transaction::shielded(
+                7,
+                bundle(l, [n0, n1], [c0, c1], fee),
+                Action::Call { program, proof, input_envelope: None },
+            );
+            if apply {
+                let r = l.apply_tx(&t, &a.address(), &StubExecutor).map(|r| r.unwrap());
+                l.record_anchor(l.height());
+                r
+            } else {
+                l.validate(&t, &StubExecutor).map(|_| unreachable!("refused"))
+            }
+        };
+        let bad = Err(TxError::InvalidProof(ConfidentialError::InvalidProof("PublicValues".into())));
+        let right = StubExecutor::make_proof_with_public(&id, 12, [1; 8], &public);
+        let r = call(&mut l, id, right, true).unwrap();
+        assert_eq!(r.h_pub, Some(StubExecutor.public_digest(&public)));
+        assert_eq!(r.outputs, [1; 8]);
+        let other = StubExecutor::make_proof_with_public(&id, 12, [1; 8], &[7, 8, 10]);
+        assert_eq!(call(&mut l, id, other, false), bad);
+        assert_eq!(call(&mut l, id, StubExecutor::make_proof(&id, 12, [1; 8]), false), bad);
+        // The plain program: empty-input proofs, as today, and no digest on the receipt.
+        let r = call(&mut l, plain, StubExecutor::make_proof(&plain, 12, [2; 8]), true).unwrap();
+        assert_eq!(r.h_pub, None);
+        let with_input = StubExecutor::make_proof_with_public(&plain, 12, [2; 8], &public);
+        assert_eq!(call(&mut l, plain, with_input, false), bad);
     }
 
     /// The deploy cap is the ledger's, set from genesis, not the constant: a default ledger keeps
@@ -1960,7 +2097,7 @@ mod tests {
     fn the_deploy_cap_is_the_ledgers_and_defaults_to_4096_words() {
         let (a, _) = keys();
         let deploy = |l: &Ledger, n: usize| {
-            let action = Action::Deploy { base_pc: 0, words: vec![0x13; n] };
+            let action = Action::Deploy { base_pc: 0, words: vec![0x13; n], public: vec![] };
             Transaction::shielded(7, bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&action)), action)
         };
         let l = ledger();
@@ -2037,6 +2174,9 @@ mod tests {
             let n = StubExecutor::make_proof(&program.id, 0, [0; 8]).len();
             StubExecutor.verify_call(program, &proof[..n.min(proof.len())])
         }
+        fn public_digest(&self, words: &[u32]) -> Word8 {
+            StubExecutor.public_digest(words)
+        }
         fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
             StubExecutor.node_hash(left, right)
         }
@@ -2071,7 +2211,7 @@ mod tests {
         configure(&mut l);
         let (a, _) = keys();
         let words = vec![0x13u32; 4];
-        let deploy = Action::Deploy { base_pc: 0, words: words.clone() };
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
         let d = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)), deploy);
         l.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
         l.record_anchor(l.height());

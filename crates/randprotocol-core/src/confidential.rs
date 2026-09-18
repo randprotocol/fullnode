@@ -41,10 +41,19 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// and return the code commitment recorded on chain.
     fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError>;
     /// Verify `proof` against `program`; on success return the tier and the eight outputs.
+    ///
+    /// The proof's public-input digest (`pv::PUB0..7`) must equal `program.public_digest`, or
+    /// `public_digest(&[])` for a program deployed without a public input; a mismatch is
+    /// `InvalidProof("PublicValues")`. The public words are never re-hashed here: the digest was
+    /// computed once, at deploy.
     fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError>;
     /// Precompute whatever makes `verify_call` fast for `program` (the zkVM verifier key,
     /// ~2 s). Called from a background task after a deploy commits and at startup; may be a no-op.
     fn warm(&self, _program: &ProgramRecord) {}
+    /// `H_PUB` of a public input (`randprotocol_zkvm::hash::public_digest`): what a call's proof
+    /// publishes in `pv::PUB0..7`. The ledger calls it once per deploy with a non-empty public
+    /// input and stores the result on the program's record.
+    fn public_digest(&self, words: &[u32]) -> Word8;
     /// Poseidon2 tree-node hash `H(NODE, left || right)` — the hash `MERKLE_VERIFY` checks against.
     fn node_hash(&self, left: &Word8, right: &Word8) -> Word8;
     /// The note commitment `H(CM, pk(8) from(8) amount_lo amount_hi asset time r(8))` — the
@@ -88,12 +97,13 @@ pub trait ConfidentialExecutor: Send + Sync {
 }
 
 /// Test executor. A "proof" is `STUB` || tier (1 byte) || 8 outputs (LE u32) || `H_IN`
-/// (8 LE u32) || blake3(program id)[..8]. Any code is accepted. Never use on a real chain.
+/// (8 LE u32) || `H_PUB` (8 LE u32) || blake3(program id)[..8]. Any code is accepted. Never use
+/// on a real chain.
 #[derive(Debug, Default, Clone)]
 pub struct StubExecutor;
 
 pub const STUB_MARKER: &[u8; 4] = b"STUB";
-const STUB_LEN: usize = 4 + 1 + 32 + 32 + 8;
+const STUB_LEN: usize = 4 + 1 + 32 + 32 + 32 + 8;
 /// Stub bundle proof: `STUB` || 32-byte digest || blake3("rand-stub-bundle", hc_bundle bytes)[..8].
 const STUB_BUNDLE_LEN: usize = 4 + 32 + 8;
 
@@ -107,12 +117,23 @@ impl StubExecutor {
     /// A stub call proof publishing `h_in` as its private-input commitment (`pv::IN0..7` on a
     /// real proof) — what a call-input envelope is sealed against (spec §6.1).
     pub fn make_proof_with_h_in(program: &Hash, tier: u8, outputs: [u32; 8], h_in: Word8) -> Vec<u8> {
+        Self::make_proof_full(program, tier, outputs, h_in, &[])
+    }
+
+    /// A stub call proof committed to the public input `public` (`pv::PUB0..7` on a real proof):
+    /// what a call against a program deployed with that public input must carry.
+    pub fn make_proof_with_public(program: &Hash, tier: u8, outputs: [u32; 8], public: &[u32]) -> Vec<u8> {
+        Self::make_proof_full(program, tier, outputs, [0; 8], public)
+    }
+
+    fn make_proof_full(program: &Hash, tier: u8, outputs: [u32; 8], h_in: Word8, public: &[u32]) -> Vec<u8> {
         let mut v = STUB_MARKER.to_vec();
         v.push(tier);
         for o in outputs {
             v.extend_from_slice(&o.to_le_bytes());
         }
         v.extend_from_slice(&word8_to_bytes(&h_in));
+        v.extend_from_slice(&word8_to_bytes(&StubExecutor.public_digest(public)));
         v.extend_from_slice(&Hash::digest_domain(b"rand-stub-binding", program.as_bytes()).0[..8]);
         v
     }
@@ -153,7 +174,21 @@ impl ConfidentialExecutor for StubExecutor {
             *o = u32::from_le_bytes(proof[5 + 4 * i..9 + 4 * i].try_into().unwrap());
         }
         let h_in = word8_from_bytes(&proof[37..69]).expect("32 bytes");
+        let h_pub = word8_from_bytes(&proof[69..101]).expect("32 bytes");
+        if h_pub != program.public_digest.unwrap_or_else(|| self.public_digest(&[])) {
+            return Err(ConfidentialError::InvalidProof("PublicValues".into()));
+        }
         Ok(CallOutcome { tier, outputs, h_in })
+    }
+
+    /// A blake3 stand-in for `H_PUB`, length-prefixed like the real one's header, so the empty
+    /// input has its own fixed, non-zero digest as it does in the zkVM.
+    fn public_digest(&self, words: &[u32]) -> Word8 {
+        let mut buf = (words.len() as u32).to_le_bytes().to_vec();
+        for w in words {
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+        Self::hash_words(b"rand-stub-public", &[&buf])
     }
 
     fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
@@ -244,7 +279,29 @@ mod tests {
     use super::*;
 
     fn record(id: Hash) -> ProgramRecord {
-        ProgramRecord { id, base_pc: 0, words: vec![0x13], code_hash: vec![], deployed_at: 0 }
+        ProgramRecord { id, base_pc: 0, words: vec![0x13], code_hash: vec![], deployed_at: 0, public_digest: None }
+    }
+
+    /// The stub checks the proof's public-input digest against the record's exactly as the zkVM
+    /// executor does: the deploy-time digest when there is one, the empty input's otherwise.
+    #[test]
+    fn stub_checks_the_public_digest_against_the_record() {
+        let id = Hash::digest(b"p");
+        let public = [7u32, 8, 9];
+        let digest = StubExecutor.public_digest(&public);
+        assert_ne!(digest, StubExecutor.public_digest(&[]));
+        assert_ne!(StubExecutor.public_digest(&[]), [0; 8]);
+        let with = ProgramRecord { public_digest: Some(digest), ..record(id) };
+        let proof = StubExecutor::make_proof_with_public(&id, 12, [1; 8], &public);
+        assert_eq!(StubExecutor.verify_call(&with, &proof).unwrap().outputs, [1; 8]);
+        let bad = ConfidentialError::InvalidProof("PublicValues".into());
+        let other = StubExecutor::make_proof_with_public(&id, 12, [1; 8], &[7, 8, 10]);
+        assert_eq!(StubExecutor.verify_call(&with, &other), Err(bad.clone()));
+        let empty = StubExecutor::make_proof(&id, 12, [1; 8]);
+        assert_eq!(StubExecutor.verify_call(&with, &empty), Err(bad.clone()));
+        // A program without a public input takes only the empty input's proofs.
+        assert!(StubExecutor.verify_call(&record(id), &empty).is_ok());
+        assert_eq!(StubExecutor.verify_call(&record(id), &proof), Err(bad));
     }
 
     #[test]

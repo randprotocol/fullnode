@@ -1867,7 +1867,7 @@ mod tests {
 
     #[test]
     fn the_fee_defaults_are_the_schedule_floors_and_no_more() {
-        let deploy = Action::Deploy { base_pc: 0, words: vec![0x13; 40] };
+        let deploy = Action::Deploy { base_pc: 0, words: vec![0x13; 40], public: vec![] };
         assert_eq!(deploy_fee_default(&deploy), gas::fee_floor(&deploy));
         assert_eq!(deploy_fee_default(&deploy), gas::BUNDLE_BASE + gas::deploy_fee(40));
         for tier in [10u8, 12, 14, 20] {

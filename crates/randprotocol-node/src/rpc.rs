@@ -811,8 +811,8 @@ fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>, executor: &dyn Confiden
         Action::Mint { cm, amount, minter, .. } => json!({
             "kind": "mint", "cm": word8_to_hex(cm), "amount": amount, "minter": minter.address().to_base58()
         }),
-        Action::Deploy { base_pc, words } => json!({
-            "kind": "deploy", "program": randprotocol_core::program::program_id(*base_pc, words).to_hex(), "words": words.len()
+        Action::Deploy { base_pc, words, public } => json!({
+            "kind": "deploy", "program": randprotocol_core::program::program_id_with_public(*base_pc, words, public).to_hex(), "words": words.len()
         }),
         Action::Call { program, proof, input_envelope } => json!({
             "kind": "call", "program": program.to_hex(), "proof_len": proof.len(),
@@ -2253,7 +2253,7 @@ mod tests {
         assert_eq!(fee(json!({"kind": "bundle"})).await, randprotocol_core::gas::BUNDLE_BASE.to_string());
         assert_eq!(
             fee(json!({"kind": "deploy", "words": 10})).await,
-            randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: vec![0; 10] }).to_string()
+            randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: vec![0; 10], public: vec![] }).to_string()
         );
         assert_eq!(
             fee(json!({"kind": "call", "tier": 12})).await,
@@ -2273,7 +2273,7 @@ mod tests {
     async fn estimate_fee_for_a_deploy_reads_the_chains_program_cap() {
         let spec = |words: usize| json!([{"kind": "deploy", "words": words}]);
         let floor = |words: usize| {
-            randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: vec![0; words] }).to_string()
+            randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: vec![0; words], public: vec![] }).to_string()
         };
         // A chain without `max_program_words`: today's 4 096.
         let gs = fixtures::genesis(1);
@@ -2362,7 +2362,7 @@ mod tests {
 
         let words = vec![0x13u32; 4];
         let pid = randprotocol_core::program::program_id(0, &words);
-        let deploy_fee = randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: words.clone() });
+        let deploy_fee = randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] });
         let call_fee = randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(12, 0);
         let with_bundle = |nfs: [Word8; 2], cms: [Word8; 2], fee: u64, action| {
             let b = bundle_tx(&ledger, nfs, cms, fee).bundle.expect("bundle_tx always carries one");
@@ -2375,7 +2375,7 @@ mod tests {
             to_auditor: vec![0xef; 60],
             body: vec![0x12; 96],
         };
-        let deploy = with_bundle([nf(1), nf(2)], [cm(1), cm(2)], deploy_fee, Action::Deploy { base_pc: 0, words });
+        let deploy = with_bundle([nf(1), nf(2)], [cm(1), cm(2)], deploy_fee, Action::Deploy { base_pc: 0, words, public: vec![] });
         let sealed = with_bundle(
             [nf(3), nf(4)],
             [cm(3), cm(4)],
@@ -3092,7 +3092,7 @@ mod tests {
     #[test]
     fn a_deploy_at_the_zkvm_program_limit_fits_every_byte_cap() {
         let mut tx = largest_transaction_the_part_caps_allow();
-        tx.action = Action::Deploy { base_pc: 0, words: vec![0x13; randprotocol_core::gas::MAX_PROGRAM_WORDS_LIMIT] };
+        tx.action = Action::Deploy { base_pc: 0, words: vec![0x13; randprotocol_core::gas::MAX_PROGRAM_WORDS_LIMIT], public: vec![] };
         let encoded = tx.encode();
         assert!(encoded.len() > 4 * randprotocol_core::gas::MAX_PROGRAM_WORDS_LIMIT, "the words are all there");
         assert!(
