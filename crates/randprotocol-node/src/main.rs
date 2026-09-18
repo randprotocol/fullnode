@@ -235,6 +235,24 @@ enum Cmd {
         /// it is part of the genesis hash.
         #[arg(long)]
         max_program_words: Option<u32>,
+        /// The largest proof a transaction may carry, in bytes (1048576..=33554432). Omitted,
+        /// the file has no such field and the chain runs today's 2 MiB; given, it is part of the
+        /// genesis hash.
+        #[arg(long)]
+        max_proof_bytes: Option<u32>,
+        /// The largest block, and so the largest transaction, in bytes (4194304..=67108864, and
+        /// at least 2 * the proof cap + 1 MiB). Omitted, today's 4 MiB; given, it is part of the
+        /// genesis hash.
+        #[arg(long)]
+        max_block_bytes: Option<u32>,
+        /// The largest call input envelope, in bytes (18432..=1048576). Omitted, today's 18 432;
+        /// given, it is part of the genesis hash.
+        #[arg(long)]
+        max_call_envelope_bytes: Option<u32>,
+        /// The largest public input a `Deploy` may fix, in words (0..=65535). Omitted, 0 (no
+        /// public input); given, it is part of the genesis hash.
+        #[arg(long)]
+        max_program_public_words: Option<u32>,
         /// Deposit notes `rand1<address>=<amount in RAND>`, repeatable. A redacted chain has
         /// no accounts, so there is no per-validator allocation: value only exists as a note
         /// someone holds the spend key for.
@@ -466,6 +484,10 @@ async fn main() -> Result<()> {
             validators,
             epoch_blocks,
             max_program_words,
+            max_proof_bytes,
+            max_block_bytes,
+            max_call_envelope_bytes,
+            max_program_public_words,
             allocs,
             out,
             faucet,
@@ -518,6 +540,10 @@ async fn main() -> Result<()> {
                 },
                 epoch_blocks,
                 max_program_words,
+                max_proof_bytes,
+                max_block_bytes,
+                max_call_envelope_bytes,
+                max_program_public_words,
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -532,13 +558,17 @@ async fn main() -> Result<()> {
             let state = gen.build(executor.as_ref())?;
             std::fs::write(&out, gen.to_json())?;
             println!(
-                "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, programs up to {} words, faucet {}, confidential {}, fri {}, hc_bundle {})",
+                "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, programs up to {} words, proofs up to {} bytes, blocks up to {} bytes, call envelopes up to {} bytes, program public input up to {} words, faucet {}, confidential {}, fri {}, hc_bundle {})",
                 out.display(),
                 state.hash(),
                 state.validators.len(),
                 state.notes.len(),
                 state.epoch_blocks,
                 state.ledger.max_program_words(),
+                state.ledger.max_proof_bytes(),
+                state.ledger.max_block_bytes(),
+                state.ledger.max_call_envelope_bytes(),
+                state.ledger.max_program_public_words(),
                 if faucet { "on" } else { "off" },
                 if no_confidential { "off" } else { "on" },
                 state.fri_profile,
@@ -936,10 +966,24 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain12.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(gen.max_program_words, None, "chain 12 predates the field");
+        assert_eq!(
+            (gen.max_proof_bytes, gen.max_block_bytes, gen.max_call_envelope_bytes, gen.max_program_public_words),
+            (None, None, None, None),
+            "and the call-limits fields"
+        );
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
         assert_eq!(state.hash().to_hex(), "605eb7830963833ef897455b98cd2a641aec58e0291460898a5d19ab88760ef0");
         assert_eq!(state.ledger.max_program_words(), randprotocol_core::gas::MAX_PROGRAM_WORDS);
+        assert_eq!(state.ledger.max_proof_bytes(), randprotocol_core::gas::MAX_PROOF_BYTES);
+        assert_eq!(state.ledger.max_block_bytes(), randprotocol_core::gas::MAX_BLOCK_BYTES);
+        assert_eq!(state.ledger.max_call_envelope_bytes(), randprotocol_core::types::actions::MAX_CALL_ENVELOPE_BYTES);
+        assert_eq!(state.ledger.max_program_public_words(), 0);
+        // Rewriting the file through today's serializer adds none of the new fields.
+        let rewritten = gen.to_json();
+        for name in ["max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes", "max_program_public_words"] {
+            assert!(!rewritten.contains(name), "{name} appeared in chain 12's file");
+        }
     }
 
     /// `rand-node genesis --max-program-words N` writes the field; without the flag the file has
@@ -960,6 +1004,47 @@ mod tests {
         g.max_program_words = Some(65_535);
         let built = g.build(&ZkExecutor::new(FriProfile::Test)).unwrap();
         assert_eq!(built.ledger.max_program_words(), 65_535);
+        assert_ne!(built.hash(), pinned_genesis().build(&ZkExecutor::new(FriProfile::Test)).unwrap().hash());
+    }
+
+    /// `rand-node genesis` takes the four call-limits flags; each writes its field, and without
+    /// them the file has none of them.
+    #[test]
+    fn the_genesis_command_takes_the_call_limits() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["rand-node", "genesis", "--validator", "k,1000,p"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().cmd {
+                Cmd::Genesis { max_proof_bytes, max_block_bytes, max_call_envelope_bytes, max_program_public_words, .. } => {
+                    (max_proof_bytes, max_block_bytes, max_call_envelope_bytes, max_program_public_words)
+                }
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(parse(&[]), (None, None, None, None));
+        let chain13 = parse(&[
+            "--max-proof-bytes",
+            "8388608",
+            "--max-block-bytes",
+            "20971520",
+            "--max-call-envelope-bytes",
+            "65536",
+            "--max-program-public-words",
+            "32768",
+        ]);
+        assert_eq!(chain13, (Some(8 << 20), Some(20 << 20), Some(65_536), Some(32_768)));
+        let mut g = pinned_genesis();
+        (g.max_proof_bytes, g.max_block_bytes, g.max_call_envelope_bytes, g.max_program_public_words) = chain13;
+        let json = g.to_json();
+        assert!(json.contains("\"max_proof_bytes\": 8388608"));
+        assert!(json.contains("\"max_block_bytes\": 20971520"));
+        assert!(json.contains("\"max_call_envelope_bytes\": 65536"));
+        assert!(json.contains("\"max_program_public_words\": 32768"));
+        let built = g.build(&ZkExecutor::new(FriProfile::Test)).unwrap();
+        assert_eq!(built.ledger.max_proof_bytes(), 8 << 20);
+        assert_eq!(built.ledger.max_block_bytes(), 20 << 20);
+        assert_eq!(built.ledger.max_call_envelope_bytes(), 65_536);
+        assert_eq!(built.ledger.max_program_public_words(), 32_768);
         assert_ne!(built.hash(), pinned_genesis().build(&ZkExecutor::new(FriProfile::Test)).unwrap().hash());
     }
 
@@ -1002,6 +1087,10 @@ mod tests {
             aggregation: None,
             epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
+            max_proof_bytes: None,
+            max_block_bytes: None,
+            max_call_envelope_bytes: None,
+            max_program_public_words: None,
         }
     }
 

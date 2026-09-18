@@ -276,6 +276,16 @@ pub struct Ledger {
     /// reloading node sets it from its genesis file (`reload_ledger`), or it would come back at
     /// the default and refuse deploys its peers admit.
     max_program_words: usize,
+    /// The call-limits parameters (genesis `max_proof_bytes`, `max_block_bytes`,
+    /// `max_call_envelope_bytes`, `max_program_public_words`), each at today's value
+    /// ([`gas::MAX_PROOF_BYTES`], [`gas::MAX_BLOCK_BYTES`],
+    /// [`crate::types::actions::MAX_CALL_ENVELOPE_BYTES`], [`gas::MAX_PROGRAM_PUBLIC_WORDS`]) on a
+    /// chain whose file does not set it. Genesis parameters like `max_program_words`: outside the
+    /// state root and `Ledger`'s equality, and restored by `reload_ledger` on every restart.
+    max_proof_bytes: usize,
+    max_block_bytes: usize,
+    max_call_envelope_bytes: usize,
+    max_program_public_words: usize,
     /// The aggregator register, hashed into the state root (spec §2.1) when `aggregation` is
     /// set; empty otherwise and at chain-9 block 0.
     aggregators: BTreeMap<Address, aggregation::AggregatorEntry>,
@@ -303,8 +313,8 @@ pub struct Ledger {
 }
 
 /// Equality is over consensus state only. `height` and `timestamp_ms` are the position of the
-/// block being applied, and `faucet`/`confidential`/`epoch_blocks`/`max_program_words` are
-/// genesis parameters a reloading node sets from its genesis file rather than from storage, so
+/// block being applied, and `faucet`/`confidential`/`epoch_blocks`/`max_program_words` and the
+/// four call limits are genesis parameters a reloading node sets from its genesis file rather than from storage, so
 /// two ledgers holding the same notes, nullifiers, anchors, validators and programs are the same
 /// ledger.
 ///
@@ -356,6 +366,10 @@ impl Ledger {
             bridge: None,
             aggregation: None,
             max_program_words: gas::MAX_PROGRAM_WORDS,
+            max_proof_bytes: gas::MAX_PROOF_BYTES,
+            max_block_bytes: gas::MAX_BLOCK_BYTES,
+            max_call_envelope_bytes: crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
+            max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             aggregators: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
@@ -395,6 +409,10 @@ impl Ledger {
             bridge: None,
             aggregation: None,
             max_program_words: gas::MAX_PROGRAM_WORDS,
+            max_proof_bytes: gas::MAX_PROOF_BYTES,
+            max_block_bytes: gas::MAX_BLOCK_BYTES,
+            max_call_envelope_bytes: crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
+            max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             aggregators: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
@@ -588,6 +606,51 @@ impl Ledger {
     /// enforce; this is only where the ledger keeps what it was told.
     pub fn set_max_program_words(&mut self, words: usize) {
         self.max_program_words = words;
+    }
+
+    /// The largest proof a transaction may carry, in bytes, as genesis set it (default
+    /// [`gas::MAX_PROOF_BYTES`]).
+    pub fn max_proof_bytes(&self) -> usize {
+        self.max_proof_bytes
+    }
+
+    /// Set by genesis from `max_proof_bytes`, and by `reload_ledger` on every restart. The bound
+    /// is the genesis file's to enforce.
+    pub fn set_max_proof_bytes(&mut self, bytes: usize) {
+        self.max_proof_bytes = bytes;
+    }
+
+    /// The largest block, and so the largest transaction, in bytes, as genesis set it (default
+    /// [`gas::MAX_BLOCK_BYTES`]).
+    pub fn max_block_bytes(&self) -> usize {
+        self.max_block_bytes
+    }
+
+    /// Set by genesis from `max_block_bytes`, and by `reload_ledger` on every restart.
+    pub fn set_max_block_bytes(&mut self, bytes: usize) {
+        self.max_block_bytes = bytes;
+    }
+
+    /// The largest call input envelope, in bytes, as genesis set it (default
+    /// [`crate::types::actions::MAX_CALL_ENVELOPE_BYTES`]).
+    pub fn max_call_envelope_bytes(&self) -> usize {
+        self.max_call_envelope_bytes
+    }
+
+    /// Set by genesis from `max_call_envelope_bytes`, and by `reload_ledger` on every restart.
+    pub fn set_max_call_envelope_bytes(&mut self, bytes: usize) {
+        self.max_call_envelope_bytes = bytes;
+    }
+
+    /// The largest public input a `Deploy` may fix, in words, as genesis set it (default
+    /// [`gas::MAX_PROGRAM_PUBLIC_WORDS`], none).
+    pub fn max_program_public_words(&self) -> usize {
+        self.max_program_public_words
+    }
+
+    /// Set by genesis from `max_program_public_words`, and by `reload_ledger` on every restart.
+    pub fn set_max_program_public_words(&mut self, words: usize) {
+        self.max_program_public_words = words;
     }
 
     /// The aggregator register (spec §2.1): every row that has ever registered, keyed by
@@ -1912,6 +1975,31 @@ mod tests {
         assert_eq!(raised.program(&id).unwrap().words.len(), 5000);
         // A clone — speculative execution, the tip ledger — keeps the cap.
         assert_eq!(raised.clone().max_program_words(), gas::MAX_PROGRAM_WORDS_LIMIT);
+    }
+
+    /// The four call-limits parameters (spec §3) live on the ledger the way `max_program_words`
+    /// does: today's caps by default, set from genesis, outside the state root and equality, and
+    /// kept by a clone. Nothing reads them yet (Task 2 moves the rules onto them).
+    #[test]
+    fn the_call_limits_are_ledger_parameters_with_todays_defaults() {
+        let l = ledger();
+        assert_eq!(l.max_proof_bytes(), gas::MAX_PROOF_BYTES);
+        assert_eq!(l.max_block_bytes(), gas::MAX_BLOCK_BYTES);
+        assert_eq!(l.max_call_envelope_bytes(), crate::types::actions::MAX_CALL_ENVELOPE_BYTES);
+        assert_eq!(l.max_program_public_words(), 0);
+
+        let mut raised = ledger();
+        raised.set_max_proof_bytes(8 << 20);
+        raised.set_max_block_bytes(20 << 20);
+        raised.set_max_call_envelope_bytes(65_536);
+        raised.set_max_program_public_words(32_768);
+        assert_eq!(raised, l, "the limits are not part of equality");
+        assert_eq!(raised.state_root(), l.state_root(), "nor of the state root");
+        let c = raised.clone();
+        assert_eq!(
+            (c.max_proof_bytes(), c.max_block_bytes(), c.max_call_envelope_bytes(), c.max_program_public_words()),
+            (8 << 20, 20 << 20, 65_536, 32_768)
+        );
     }
 
     #[test]

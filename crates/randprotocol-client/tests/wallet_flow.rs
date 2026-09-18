@@ -77,6 +77,10 @@ fn genesis(validator: &Keypair) -> Genesis {
         aggregation: None,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words: None,
+        max_proof_bytes: None,
+        max_block_bytes: None,
+        max_call_envelope_bytes: None,
+        max_program_public_words: None,
     }
 }
 

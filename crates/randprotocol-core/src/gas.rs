@@ -29,7 +29,15 @@ pub const MAX_PROGRAM_WORDS_LIMIT: usize = 65_535;
 /// tier 10 / 1 359 978 at tier 12 and the keccak-carrying one to 3 198 430 (`crates/randprotocol-zkvm`'s
 /// `tests/e2e.rs::measure_production_profile_at_tier_10_and_12`, run `--ignored`). Both properties
 /// above hold unchanged, so the cap does not move.
+///
+/// Since the call-limits change this is the *default*: a genesis file may set `max_proof_bytes`
+/// (`MAX_PROOF_BYTES_MIN..=MAX_PROOF_BYTES_LIMIT`), and the ledger holds what it set
+/// (`Ledger::max_proof_bytes`). Chain 12 and every chain without the field run this value.
 pub const MAX_PROOF_BYTES: usize = 2 << 20;
+/// The smallest `max_proof_bytes` a genesis file may set: 1 MiB, below every production proof.
+pub const MAX_PROOF_BYTES_MIN: usize = 1 << 20;
+/// The largest `max_proof_bytes` a genesis file may set: 32 MiB.
+pub const MAX_PROOF_BYTES_LIMIT: usize = 32 << 20;
 /// Largest bridge attestation accepted in a `BridgeAttest` transaction.
 ///
 /// A real attestation is tiny: 6 envelope bytes, 66 per signature, a
@@ -47,7 +55,28 @@ pub const MAX_ATTESTATION_BYTES: usize = 16_384;
 /// cap buys throughput linearly and nothing else, while every validator pays the bandwidth and
 /// the disk for it — a full 4 MiB block every ~2 s is already ~170 GB/day — and block-level
 /// aggregation, not a bigger block, is the queued remedy (§6).
+///
+/// Since the call-limits change this is the *default*: a genesis file may set `max_block_bytes`
+/// (`MAX_BLOCK_BYTES_MIN..=MAX_BLOCK_BYTES_LIMIT`, and at least `2 · max_proof_bytes +
+/// BLOCK_PROOF_HEADROOM`), and the ledger holds what it set (`Ledger::max_block_bytes`).
 pub const MAX_BLOCK_BYTES: usize = 4 << 20;
+/// The smallest `max_block_bytes` a genesis file may set: today's 4 MiB.
+pub const MAX_BLOCK_BYTES_MIN: usize = 4 << 20;
+/// The largest `max_block_bytes` a genesis file may set: 64 MiB.
+pub const MAX_BLOCK_BYTES_LIMIT: usize = 64 << 20;
+/// What a block must hold beyond two worst-case proofs (the fee bundle's and a call's) when a
+/// genesis file sets either size cap: `max_block_bytes ≥ 2 · max_proof_bytes + 1 MiB`, so the
+/// largest proof the proof cap admits is one a transaction can actually carry.
+pub const BLOCK_PROOF_HEADROOM: usize = 1 << 20;
+/// The largest `max_call_envelope_bytes` a genesis file may set: 1 MiB. The smallest is today's
+/// cap, [`crate::types::actions::MAX_CALL_ENVELOPE_BYTES`] (18 432), which stays the default.
+pub const MAX_CALL_ENVELOPE_BYTES_LIMIT: usize = 1 << 20;
+/// A program's public input, in words, on a chain whose genesis file does not set
+/// `max_program_public_words`: none, today's behaviour.
+pub const MAX_PROGRAM_PUBLIC_WORDS: usize = 0;
+/// The largest `max_program_public_words` a genesis file may set: the zkVM's own limit, the
+/// public table's 16-bit length (`rand_zkvm::machine::ProveError::PublicTooLong`).
+pub const MAX_PROGRAM_PUBLIC_WORDS_LIMIT: usize = 65_535;
 /// Transactions per block.
 pub const MAX_BLOCK_TXS: usize = 2_000;
 /// zkVM tiers (log2 of the CPU table height).

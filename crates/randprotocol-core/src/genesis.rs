@@ -111,6 +111,28 @@ pub struct Genesis {
     /// parameter the ledger runs with, and a reloading node sets it from this file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_program_words: Option<u32>,
+    /// Call limits (spec §3): the largest proof a transaction may carry, in bytes,
+    /// `gas::MAX_PROOF_BYTES_MIN..=gas::MAX_PROOF_BYTES_LIMIT` (1 MiB ..= 32 MiB). Absent means
+    /// [`gas::MAX_PROOF_BYTES`]. Like `max_program_words`: omitted when absent, bound into the
+    /// genesis hash by name when present, never part of the state root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_proof_bytes: Option<u32>,
+    /// Call limits: the largest block, and so the largest transaction, in bytes,
+    /// `gas::MAX_BLOCK_BYTES_MIN..=gas::MAX_BLOCK_BYTES_LIMIT` (4 MiB ..= 64 MiB) and at least
+    /// `2 · max_proof_bytes + 1 MiB` (the effective proof cap: the default when that field is
+    /// absent). Absent means [`gas::MAX_BLOCK_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_block_bytes: Option<u32>,
+    /// Call limits: the largest call input envelope, in bytes, 18 432 ..=
+    /// `gas::MAX_CALL_ENVELOPE_BYTES_LIMIT` (1 MiB). Absent means
+    /// [`crate::types::actions::MAX_CALL_ENVELOPE_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_call_envelope_bytes: Option<u32>,
+    /// Call limits: the largest public input a `Deploy` may fix, in words, 0 ..=
+    /// `gas::MAX_PROGRAM_PUBLIC_WORDS_LIMIT` (the zkVM's 16-bit bound). Absent means
+    /// [`gas::MAX_PROGRAM_PUBLIC_WORDS`], no public input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_program_public_words: Option<u32>,
 }
 
 fn default_true() -> bool {
@@ -169,6 +191,23 @@ pub enum GenesisError {
     BadEpochBlocks(u64),
     #[error("bad max_program_words {0} (1..={limit})", limit = gas::MAX_PROGRAM_WORDS_LIMIT)]
     BadMaxProgramWords(u32),
+    #[error("bad max_proof_bytes {0} ({min}..={limit})", min = gas::MAX_PROOF_BYTES_MIN, limit = gas::MAX_PROOF_BYTES_LIMIT)]
+    BadMaxProofBytes(u32),
+    #[error(
+        "bad max_block_bytes {0} ({min}..={limit}, and at least 2 * max_proof_bytes + {headroom})",
+        min = gas::MAX_BLOCK_BYTES_MIN,
+        limit = gas::MAX_BLOCK_BYTES_LIMIT,
+        headroom = gas::BLOCK_PROOF_HEADROOM
+    )]
+    BadMaxBlockBytes(u32),
+    #[error(
+        "bad max_call_envelope_bytes {0} ({min}..={limit})",
+        min = crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
+        limit = gas::MAX_CALL_ENVELOPE_BYTES_LIMIT
+    )]
+    BadMaxCallEnvelopeBytes(u32),
+    #[error("bad max_program_public_words {0} (0..={limit})", limit = gas::MAX_PROGRAM_PUBLIC_WORDS_LIMIT)]
+    BadMaxProgramPublicWords(u32),
     #[error("the genesis supply (alloc notes plus validator stakes) sums past u64::MAX")]
     SupplyOverflow,
 }
@@ -231,6 +270,38 @@ impl Genesis {
                 return Err(GenesisError::BadMaxProgramWords(n));
             }
         }
+        // The call limits (spec §3). Each bound keeps a chain runnable: a proof cap under 1 MiB
+        // refuses every production proof, and one past 32 MiB, or a block past 64 MiB, is more
+        // than any validator is asked to carry.
+        if let Some(n) = self.max_proof_bytes {
+            if !(gas::MAX_PROOF_BYTES_MIN..=gas::MAX_PROOF_BYTES_LIMIT).contains(&(n as usize)) {
+                return Err(GenesisError::BadMaxProofBytes(n));
+            }
+        }
+        // A block must carry a transaction with two worst-case proofs — the fee bundle's and the
+        // call's — plus 1 MiB for the rest, or the proof cap admits proofs no block can hold. The
+        // rule reads the effective proof cap, the default when the file leaves it out. A file
+        // with neither field is today's chain, whose 4 MiB block predates the rule, and is not
+        // judged by it.
+        if self.max_proof_bytes.is_some() || self.max_block_bytes.is_some() {
+            let proof = self.max_proof_bytes.map_or(gas::MAX_PROOF_BYTES, |n| n as usize);
+            let block = self.max_block_bytes.map_or(gas::MAX_BLOCK_BYTES, |n| n as usize);
+            if !(gas::MAX_BLOCK_BYTES_MIN..=gas::MAX_BLOCK_BYTES_LIMIT).contains(&block)
+                || block < 2 * proof + gas::BLOCK_PROOF_HEADROOM
+            {
+                return Err(GenesisError::BadMaxBlockBytes(block as u32));
+            }
+        }
+        if let Some(n) = self.max_call_envelope_bytes {
+            if !(crate::types::actions::MAX_CALL_ENVELOPE_BYTES..=gas::MAX_CALL_ENVELOPE_BYTES_LIMIT).contains(&(n as usize)) {
+                return Err(GenesisError::BadMaxCallEnvelopeBytes(n));
+            }
+        }
+        if let Some(n) = self.max_program_public_words {
+            if n as usize > gas::MAX_PROGRAM_PUBLIC_WORDS_LIMIT {
+                return Err(GenesisError::BadMaxProgramPublicWords(n));
+            }
+        }
         // The register (spec §8) is what genesis actually seeds; the validator set for epoch 0
         // is derived from it at the `ValidatorSet` boundary, where the stake widens again.
         let mut register: BTreeMap<Address, ValidatorEntry> = BTreeMap::new();
@@ -276,6 +347,12 @@ impl Genesis {
         ledger.set_bridge(self.bridge.as_ref().map(BridgeState::from_config));
         ledger.set_aggregation(self.aggregation.clone());
         ledger.set_max_program_words(self.max_program_words.map_or(gas::MAX_PROGRAM_WORDS, |n| n as usize));
+        ledger.set_max_proof_bytes(self.max_proof_bytes.map_or(gas::MAX_PROOF_BYTES, |n| n as usize));
+        ledger.set_max_block_bytes(self.max_block_bytes.map_or(gas::MAX_BLOCK_BYTES, |n| n as usize));
+        ledger.set_max_call_envelope_bytes(
+            self.max_call_envelope_bytes.map_or(crate::types::actions::MAX_CALL_ENVELOPE_BYTES, |n| n as usize),
+        );
+        ledger.set_max_program_public_words(self.max_program_public_words.map_or(gas::MAX_PROGRAM_PUBLIC_WORDS, |n| n as usize));
         // The genesis ledger is positioned at the genesis block, so it carries that block's
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
@@ -344,6 +421,19 @@ impl Genesis {
         if let Some(n) = self.max_program_words {
             commit.extend_from_slice(b"max_program_words");
             commit.extend_from_slice(&n.to_be_bytes());
+        }
+        // The call limits, the same way and in this fixed order after `max_program_words`: each
+        // appended with its name only when the file sets it.
+        for (tag, value) in [
+            (&b"max_proof_bytes"[..], self.max_proof_bytes),
+            (&b"max_block_bytes"[..], self.max_block_bytes),
+            (&b"max_call_envelope_bytes"[..], self.max_call_envelope_bytes),
+            (&b"max_program_public_words"[..], self.max_program_public_words),
+        ] {
+            if let Some(n) = value {
+                commit.extend_from_slice(tag);
+                commit.extend_from_slice(&n.to_be_bytes());
+            }
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -498,6 +588,10 @@ mod tests {
             aggregation: None,
             epoch_blocks: EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
+            max_proof_bytes: None,
+            max_block_bytes: None,
+            max_call_envelope_bytes: None,
+            max_program_public_words: None,
         }
     }
 
@@ -811,6 +905,165 @@ mod tests {
             let mut fine = g.clone();
             fine.max_program_words = Some(ok);
             assert_eq!(build(&fine).ledger.max_program_words(), ok as usize);
+        }
+    }
+
+    /// `g` with one of the four call-limits parameters (spec §3) set, by name.
+    fn with_limit(g: &Genesis, field: &str, v: u32) -> Genesis {
+        let mut g = g.clone();
+        match field {
+            "max_proof_bytes" => g.max_proof_bytes = Some(v),
+            "max_block_bytes" => g.max_block_bytes = Some(v),
+            "max_call_envelope_bytes" => g.max_call_envelope_bytes = Some(v),
+            "max_program_public_words" => g.max_program_public_words = Some(v),
+            _ => unreachable!(),
+        }
+        g
+    }
+
+    /// The four call-limits parameters are opt-in per chain, like `max_program_words`: absent,
+    /// the file and the hash are today's and the ledger runs today's caps; present, each is
+    /// bound into the hash by name (so even the default spelled out is a new chain), the ledger
+    /// runs it, and the state root never sees it.
+    #[test]
+    fn the_call_limits_are_optional_and_bound_into_the_hash_only_when_present() {
+        let plain = genesis(2);
+        let s = build(&plain);
+        let json = plain.to_json();
+        for name in ["max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes", "max_program_public_words"] {
+            assert!(!json.contains(name), "an absent {name} is absent from the file");
+        }
+        assert_eq!(s.ledger.max_proof_bytes(), crate::gas::MAX_PROOF_BYTES);
+        assert_eq!(s.ledger.max_block_bytes(), crate::gas::MAX_BLOCK_BYTES);
+        assert_eq!(s.ledger.max_call_envelope_bytes(), crate::types::actions::MAX_CALL_ENVELOPE_BYTES);
+        assert_eq!(s.ledger.max_program_public_words(), crate::gas::MAX_PROGRAM_PUBLIC_WORDS);
+        assert_eq!(crate::gas::MAX_PROGRAM_PUBLIC_WORDS, 0, "no public input is today's behaviour");
+        let old = Genesis::from_json(&json).unwrap();
+        assert_eq!(build(&old).hash(), s.hash(), "a file without the fields builds the same chain");
+
+        // Chain 13's values (spec §3), all four at once.
+        let mut c13 = plain.clone();
+        c13.max_program_words = Some(65_535);
+        c13.max_proof_bytes = Some(8 << 20);
+        c13.max_block_bytes = Some(20 << 20);
+        c13.max_call_envelope_bytes = Some(65_536);
+        c13.max_program_public_words = Some(32_768);
+        let c = build(&c13);
+        assert_eq!(c.ledger.max_proof_bytes(), 8 << 20);
+        assert_eq!(c.ledger.max_block_bytes(), 20 << 20);
+        assert_eq!(c.ledger.max_call_envelope_bytes(), 65_536);
+        assert_eq!(c.ledger.max_program_public_words(), 32_768);
+        assert_eq!(c.ledger.state_root(), s.ledger.state_root(), "the limits are parameters, not state");
+        assert_eq!(Genesis::from_json(&c13.to_json()).unwrap(), c13, "and they round-trip");
+        assert!(c13.to_json().contains("\"max_proof_bytes\": 8388608"));
+        // A reloaded clone keeps them.
+        assert_eq!(c.ledger.clone().max_block_bytes(), 20 << 20);
+
+        // Each field alone, at its default and at another value: every one is a different chain,
+        // from the plain one and from each other.
+        let cases: [(&str, u32, u32); 4] = [
+            ("max_proof_bytes", 1 << 20, 3 << 19),
+            // 5 MiB is the smallest block the default 2 MiB proof cap allows (2 · 2 + 1).
+            ("max_block_bytes", 5 << 20, 8 << 20),
+            ("max_call_envelope_bytes", 18_432, 65_536),
+            ("max_program_public_words", 0, 32_768),
+        ];
+        let mut hashes = vec![s.hash(), c.hash()];
+        for (name, a, b) in cases {
+            for v in [a, b] {
+                let built = build(&with_limit(&plain, name, v));
+                let h = built.hash();
+                assert!(!hashes.contains(&h), "{name} = {v} must be its own chain");
+                hashes.push(h);
+                assert_eq!(built.ledger.state_root(), s.ledger.state_root());
+            }
+        }
+        assert_eq!(build(&with_limit(&plain, "max_proof_bytes", 1 << 20)).ledger.max_proof_bytes(), 1 << 20);
+        assert_eq!(build(&with_limit(&plain, "max_block_bytes", 8 << 20)).ledger.max_block_bytes(), 8 << 20);
+        assert_eq!(build(&with_limit(&plain, "max_call_envelope_bytes", 65_536)).ledger.max_call_envelope_bytes(), 65_536);
+        assert_eq!(build(&with_limit(&plain, "max_program_public_words", 7)).ledger.max_program_public_words(), 7);
+    }
+
+    /// Each limit's bounds (spec §3), and the block rule: a block must hold two worst-case
+    /// proofs — the fee bundle's and the call's — plus 1 MiB for everything else, judged on the
+    /// effective proof cap (the default when the file leaves it out).
+    #[test]
+    fn the_call_limits_are_refused_out_of_bounds() {
+        let g = genesis(1);
+        let refused = |g: &Genesis| g.build(&StubExecutor).err();
+
+        for bad in [0u32, (1 << 20) - 1, (32 << 20) + 1, u32::MAX] {
+            let mut b = with_limit(&g, "max_proof_bytes", bad);
+            b.max_block_bytes = Some(64 << 20);
+            assert!(matches!(refused(&b), Some(GenesisError::BadMaxProofBytes(n)) if n == bad), "proof {bad}");
+        }
+        // 32 MiB is inside the proof bound itself; the block rule, not this one, is what refuses
+        // it with a 64 MiB block (below). Checked here against the bound alone.
+        for ok in [1u32 << 20, 3 << 20, 63 << 19] {
+            let mut o = with_limit(&g, "max_proof_bytes", ok);
+            o.max_block_bytes = Some(64 << 20);
+            assert_eq!(build(&o).ledger.max_proof_bytes(), ok as usize);
+        }
+        let mut top = with_limit(&g, "max_proof_bytes", 32 << 20);
+        top.max_block_bytes = Some(64 << 20);
+        assert!(matches!(refused(&top), Some(GenesisError::BadMaxBlockBytes(_))), "32 MiB passes the proof bound");
+
+        for bad in [0u32, (4 << 20) - 1, (64 << 20) + 1, u32::MAX] {
+            let mut b = with_limit(&g, "max_block_bytes", bad);
+            b.max_proof_bytes = Some(1 << 20);
+            assert!(matches!(refused(&b), Some(GenesisError::BadMaxBlockBytes(n)) if n == bad), "block {bad}");
+        }
+        for ok in [4u32 << 20, 20 << 20, 64 << 20] {
+            let mut o = with_limit(&g, "max_block_bytes", ok);
+            o.max_proof_bytes = Some(1 << 20);
+            assert_eq!(build(&o).ledger.max_block_bytes(), ok as usize);
+        }
+
+        // The block rule: block >= 2 * proof + 1 MiB.
+        let pair = |proof: Option<u32>, block: Option<u32>| {
+            let mut p = g.clone();
+            p.max_proof_bytes = proof;
+            p.max_block_bytes = block;
+            p
+        };
+        // Chain 13: 8 MiB proofs need 17 MiB of block; 20 MiB passes, 17 MiB exactly passes,
+        // one byte under refuses.
+        assert!(pair(Some(8 << 20), Some(20 << 20)).build(&StubExecutor).is_ok());
+        assert!(pair(Some(8 << 20), Some(17 << 20)).build(&StubExecutor).is_ok());
+        assert!(matches!(
+            refused(&pair(Some(8 << 20), Some((17 << 20) - 1))),
+            Some(GenesisError::BadMaxBlockBytes(n)) if n == (17 << 20) - 1
+        ));
+        // A raised proof cap with the block cap left at its 4 MiB default is refused.
+        assert!(matches!(refused(&pair(Some(8 << 20), None)), Some(GenesisError::BadMaxBlockBytes(n)) if n == 4 << 20));
+        // A block cap given alone is judged against the default 2 MiB proof cap: 5 MiB is the floor.
+        assert!(matches!(refused(&pair(None, Some(4 << 20))), Some(GenesisError::BadMaxBlockBytes(n)) if n == 4 << 20));
+        assert!(pair(None, Some(5 << 20)).build(&StubExecutor).is_ok());
+        // 32 MiB proofs need 65 MiB of block, past the 64 MiB ceiling: the largest proof cap a
+        // chain can actually run is 31.5 MiB.
+        assert!(matches!(refused(&pair(Some(32 << 20), Some(64 << 20))), Some(GenesisError::BadMaxBlockBytes(_))));
+        assert!(pair(Some(63 << 19), Some(64 << 20)).build(&StubExecutor).is_ok());
+        // Both absent: today's chain, where the 4 MiB block predates the rule, is untouched.
+        assert!(pair(None, None).build(&StubExecutor).is_ok());
+
+        for bad in [0u32, 18_431, (1 << 20) + 1, u32::MAX] {
+            assert!(
+                matches!(refused(&with_limit(&g, "max_call_envelope_bytes", bad)), Some(GenesisError::BadMaxCallEnvelopeBytes(n)) if n == bad),
+                "envelope {bad}"
+            );
+        }
+        for ok in [18_432u32, 65_536, 1 << 20] {
+            assert_eq!(build(&with_limit(&g, "max_call_envelope_bytes", ok)).ledger.max_call_envelope_bytes(), ok as usize);
+        }
+
+        for bad in [65_536u32, u32::MAX] {
+            assert!(
+                matches!(refused(&with_limit(&g, "max_program_public_words", bad)), Some(GenesisError::BadMaxProgramPublicWords(n)) if n == bad),
+                "public {bad}"
+            );
+        }
+        for ok in [0u32, 1, 27_151, 65_535] {
+            assert_eq!(build(&with_limit(&g, "max_program_public_words", ok)).ledger.max_program_public_words(), ok as usize);
         }
     }
 

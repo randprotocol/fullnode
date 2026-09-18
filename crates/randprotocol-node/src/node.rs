@@ -144,6 +144,13 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // default, and a node that kept it would refuse deploys its peers admit — a fork at the
     // first large program after its first restart.
     ledger.set_max_program_words(gs.ledger.max_program_words());
+    // And the call limits, for the same reason: `load_ledger` comes back at today's caps, and a
+    // node that kept them would disagree with its peers about which proofs, blocks, envelopes
+    // and deploys fit.
+    ledger.set_max_proof_bytes(gs.ledger.max_proof_bytes());
+    ledger.set_max_block_bytes(gs.ledger.max_block_bytes());
+    ledger.set_max_call_envelope_bytes(gs.ledger.max_call_envelope_bytes());
+    ledger.set_max_program_public_words(gs.ledger.max_program_public_words());
     Ok(ledger)
 }
 
@@ -2065,6 +2072,32 @@ mod tests {
         assert_eq!(storage.load_ledger(&StubExecutor).unwrap().max_program_words(), gas::MAX_PROGRAM_WORDS);
         let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
         assert_eq!(reloaded.max_program_words(), gas::MAX_PROGRAM_WORDS_LIMIT);
+        assert_eq!(reloaded, gs.ledger);
+    }
+
+    /// The four call-limits parameters survive a restart the same way: `load_ledger` comes back
+    /// at today's caps, and a node that kept them would disagree with its peers about which
+    /// proofs, blocks, envelopes and deploys fit.
+    #[test]
+    fn a_restart_restores_the_call_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_max_proof_bytes(8 << 20);
+        gs.ledger.set_max_block_bytes(20 << 20);
+        gs.ledger.set_max_call_envelope_bytes(65_536);
+        gs.ledger.set_max_program_public_words(32_768);
+        storage.init_genesis(&gs).unwrap();
+        let stored = storage.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(stored.max_proof_bytes(), gas::MAX_PROOF_BYTES);
+        assert_eq!(stored.max_block_bytes(), gas::MAX_BLOCK_BYTES);
+        assert_eq!(stored.max_call_envelope_bytes(), randprotocol_core::types::actions::MAX_CALL_ENVELOPE_BYTES);
+        assert_eq!(stored.max_program_public_words(), gas::MAX_PROGRAM_PUBLIC_WORDS);
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.max_proof_bytes(), 8 << 20);
+        assert_eq!(reloaded.max_block_bytes(), 20 << 20);
+        assert_eq!(reloaded.max_call_envelope_bytes(), 65_536);
+        assert_eq!(reloaded.max_program_public_words(), 32_768);
         assert_eq!(reloaded, gs.ledger);
     }
 

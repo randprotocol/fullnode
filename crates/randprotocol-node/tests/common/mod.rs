@@ -79,6 +79,10 @@ fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core
         aggregation,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words: None,
+        max_proof_bytes: None,
+        max_block_bytes: None,
+        max_call_envelope_bytes: None,
+        max_program_public_words: None,
     }
 }
 

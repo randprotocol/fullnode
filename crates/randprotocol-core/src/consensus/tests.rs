@@ -66,6 +66,10 @@ fn build(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool) -> Sim {
         hc_bundle: word8_to_hex(&[3; 8]),
         epoch_blocks,
         max_program_words: None,
+        max_proof_bytes: None,
+        max_block_bytes: None,
+        max_call_envelope_bytes: None,
+        max_program_public_words: None,
         bridge: None,
         aggregation: None,
     };
@@ -898,6 +902,10 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         hc_bundle: word8_to_hex(&[3; 8]),
         epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words: None,
+        max_proof_bytes: None,
+        max_block_bytes: None,
+        max_call_envelope_bytes: None,
+        max_program_public_words: None,
         bridge: None,
         aggregation: None,
     };
@@ -1346,6 +1354,10 @@ fn aggregation_node_with(
         hc_bundle: word8_to_hex(&[3; 8]),
         epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words: None,
+        max_proof_bytes: None,
+        max_block_bytes: None,
+        max_call_envelope_bytes: None,
+        max_program_public_words: None,
         bridge: None,
         aggregation: Some(cfg.clone()),
     };

@@ -2001,6 +2001,10 @@ pub(crate) mod fixtures {
             aggregation: None,
             epoch_blocks,
             max_program_words: None,
+            max_proof_bytes: None,
+            max_block_bytes: None,
+            max_call_envelope_bytes: None,
+            max_program_public_words: None,
         }
     }
 
@@ -2045,6 +2049,10 @@ pub(crate) mod fixtures {
             aggregation: None,
             epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
+            max_proof_bytes: None,
+            max_block_bytes: None,
+            max_call_envelope_bytes: None,
+            max_program_public_words: None,
         }
         .build(&StubExecutor)
         .unwrap();
@@ -2625,6 +2633,61 @@ mod tests {
         // A different program (`addi x0, x0, 1`), so it is a new deploy rather than a no-op.
         let again = deploy_tx(&reloaded, 10, 0x0010_0013);
         assert_eq!(reloaded.validate(&again, &StubExecutor), Ok(()));
+    }
+
+    /// The four call-limits parameters hold through replay and restart the way the program cap
+    /// does. Nothing enforces them yet (call-limits Task 2), so this pins the plumbing: a chain
+    /// with chain 13's values replays its own committed block from the genesis ledger, the
+    /// stored snapshot alone is at today's caps, and `reload_ledger` restores all four.
+    #[test]
+    fn the_call_limits_hold_through_replay_and_restart() {
+        use randprotocol_core::gas;
+        let mut file = genesis_file_of(
+            7,
+            &[&key(1)],
+            vec![alloc_note(20, 1_000), alloc_note(21, 2_000)],
+            randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
+        );
+        file.max_proof_bytes = Some(8 << 20);
+        file.max_block_bytes = Some(20 << 20);
+        file.max_call_envelope_bytes = Some(65_536);
+        file.max_program_public_words = Some(32_768);
+        let gs = file.build(&StubExecutor).unwrap();
+        let limits = |l: &Ledger| (l.max_proof_bytes(), l.max_block_bytes(), l.max_call_envelope_bytes(), l.max_program_public_words());
+        let chain13 = (8 << 20, 20 << 20, 65_536, 32_768);
+        assert_eq!(limits(&gs.ledger), chain13);
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        s.init_genesis(&gs).unwrap();
+
+        let proposer = key(1);
+        let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+        let action = Action::Deploy { base_pc: 0, words: vec![0x13; 16] };
+        let fee = gas::fee_floor(&action);
+        let b = bundle(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee);
+        let tx = Transaction::shielded(ledger.chain_id(), b, action);
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &proposer);
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(limits(&ledger), chain13, "applying a block keeps them");
+
+        // The stored snapshot alone is at today's caps: this is what replay must not start from.
+        assert_eq!(
+            limits(&s.load_ledger(&StubExecutor).unwrap()),
+            (
+                gas::MAX_PROOF_BYTES,
+                gas::MAX_BLOCK_BYTES,
+                randprotocol_core::types::actions::MAX_CALL_ENVELOPE_BYTES,
+                gas::MAX_PROGRAM_PUBLIC_WORDS
+            )
+        );
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(check.is_ok(), "replay refused the chain's own block: {:?}", check.problem);
+        assert_eq!(check.last_good, 1);
+
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(limits(&reloaded), chain13);
+        assert_eq!(reloaded, ledger);
     }
 
     /// A faucet mint creates its note through the action rather than a bundle slot, and the row
