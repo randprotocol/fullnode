@@ -13,9 +13,9 @@ use randprotocol_core::types::MAX_CALL_ENVELOPE_BYTES;
 use randprotocol_zkvm::address::address_of;
 use randprotocol_zkvm::call_envelope::{
     call_envelope_is_faithful, open_call_as_auditor, open_call_as_sender, open_call_with_key, seal_call_envelope,
-    CallKey, MAX_CALL_INPUT_WORDS,
+    CallCaps, CallKey, ENVELOPE_FIXED_BYTES, FALLBACK_MAX_CALL_INPUT_WORDS,
 };
-use randprotocol_zkvm::executor::{prove_call, ZkExecutor};
+use randprotocol_zkvm::executor::{prove, prove_call, ZkExecutor};
 use randprotocol_zkvm::hash::input_digest;
 use randprotocol_zkvm::machine::{Backend, FriProfile, Proof};
 use randprotocol_zkvm::notes::{SpendKey, ViewingKey};
@@ -46,7 +46,7 @@ fn a_sealed_call_opens_for_the_caller_the_per_call_key_and_the_auditor() {
     let inputs = inputs();
     let h = h_in(SALT, &inputs);
 
-    let (env, key) = seal_call_envelope(&caller, Some(&auditor_addr), &h, SALT, &inputs).unwrap();
+    let (env, key) = seal_call_envelope(&caller, Some(&auditor_addr), &h, SALT, &inputs, CallCaps::FALLBACK).unwrap();
     assert!(!env.kem_ct.is_empty() && !env.to_auditor.is_empty(), "an auditor was named");
     assert!(env.len() <= randprotocol_core::types::MAX_CALL_ENVELOPE_BYTES);
 
@@ -71,7 +71,7 @@ fn an_envelope_without_an_auditor_carries_no_kem_parts() {
     let caller = vk(21);
     let inputs = inputs();
     let h = h_in(SALT, &inputs);
-    let (env, key) = seal_call_envelope(&caller, None, &h, SALT, &inputs).unwrap();
+    let (env, key) = seal_call_envelope(&caller, None, &h, SALT, &inputs, CallCaps::FALLBACK).unwrap();
     assert!(env.kem_ct.is_empty() && env.to_auditor.is_empty());
     assert_eq!(open_call_as_sender(&env, &h, &caller).map(|(k, s, i)| (k, s, i)), Some((key, SALT, inputs.clone())));
     assert_eq!(open_call_with_key(&env, &h, &key), Some((SALT, inputs)));
@@ -87,7 +87,7 @@ fn a_tampered_h_in_opens_for_nobody() {
     let auditor = vk(32);
     let inputs = inputs();
     let h = h_in(SALT, &inputs);
-    let (env, key) = seal_call_envelope(&caller, Some(&address_of(&auditor)), &h, SALT, &inputs).unwrap();
+    let (env, key) = seal_call_envelope(&caller, Some(&address_of(&auditor)), &h, SALT, &inputs, CallCaps::FALLBACK).unwrap();
 
     let mut wrong = h;
     wrong[3] ^= 1;
@@ -118,29 +118,86 @@ fn faithfulness_is_the_digest_recomputation() {
     assert!(!call_envelope_is_faithful(&h, SALT, &lied), "a single flipped word is not");
 }
 
-/// The spec's 4096-word input cap is enforced where the envelope is built, so a caller never
-/// pays for a proof and then finds the transaction rejected — and the largest envelope that cap
-/// admits, auditor included, is inside the ledger's byte cap with room to spare.
+/// The input cap is enforced where the envelope is built, so a caller never pays for a proof and
+/// then finds the transaction rejected. With the fallback caps (a node too old to report its
+/// limits) the cap is the old 4 096 words, and the largest envelope it admits, auditor included,
+/// is inside the default 18 432-byte ledger cap.
 #[test]
-fn sealing_refuses_an_input_vector_past_the_spec_cap_and_the_largest_one_still_fits() {
+fn sealing_refuses_an_input_vector_past_the_fallback_cap_and_the_largest_one_still_fits() {
     let caller = vk(41);
     let auditor = address_of(&vk(42));
-    let too_many = vec![0u32; MAX_CALL_INPUT_WORDS + 1];
-    let err = seal_call_envelope(&caller, None, &[0; 8], SALT, &too_many).unwrap_err();
-    assert!(err.contains(&MAX_CALL_INPUT_WORDS.to_string()), "{err}");
+    assert_eq!(FALLBACK_MAX_CALL_INPUT_WORDS, 4096);
+    assert_eq!(CallCaps::FALLBACK, CallCaps { max_input_words: 4096, max_envelope_bytes: MAX_CALL_ENVELOPE_BYTES });
+    let too_many = vec![0u32; FALLBACK_MAX_CALL_INPUT_WORDS + 1];
+    let err = seal_call_envelope(&caller, None, &[0; 8], SALT, &too_many, CallCaps::FALLBACK).unwrap_err();
+    assert!(err.contains(&FALLBACK_MAX_CALL_INPUT_WORDS.to_string()), "{err}");
 
-    let full = vec![0u32; MAX_CALL_INPUT_WORDS];
-    let (env, _) = seal_call_envelope(&caller, Some(&auditor), &h_in(SALT, &full), SALT, &full).unwrap();
+    let full = vec![0u32; FALLBACK_MAX_CALL_INPUT_WORDS];
+    let (env, _) =
+        seal_call_envelope(&caller, Some(&auditor), &h_in(SALT, &full), SALT, &full, CallCaps::FALLBACK).unwrap();
     // nonce + salt + inputs + tag, an ML-KEM-768 ciphertext, and two nonce + key + tag wraps.
-    let expected = (12 + 16 + 4 * MAX_CALL_INPUT_WORDS + 16) + 1088 + 2 * (12 + 32 + 16);
+    let expected = (12 + 16 + 4 * FALLBACK_MAX_CALL_INPUT_WORDS + 16) + 1088 + 2 * (12 + 32 + 16);
     assert_eq!(env.len(), expected, "the worst case the format can produce");
     assert!(
         expected <= MAX_CALL_ENVELOPE_BYTES,
         "the ledger's {MAX_CALL_ENVELOPE_BYTES}-byte cap must admit {expected}"
     );
     // Unaudited, the same vector is two wraps and a KEM ciphertext smaller.
-    let (bare, _) = seal_call_envelope(&caller, None, &h_in(SALT, &full), SALT, &full).unwrap();
+    let (bare, _) = seal_call_envelope(&caller, None, &h_in(SALT, &full), SALT, &full, CallCaps::FALLBACK).unwrap();
     assert_eq!(bare.len(), expected - 1088 - 60);
+}
+
+/// The envelope's fixed overhead is exactly what the format adds to `4 × inputs` in its largest
+/// shape (an auditor named): measured on a real zero-input envelope, not restated.
+#[test]
+fn the_fixed_overhead_is_the_audited_envelope_with_no_inputs() {
+    let caller = vk(43);
+    let auditor = address_of(&vk(44));
+    assert_eq!(ENVELOPE_FIXED_BYTES, 1088 + 2 * (12 + 32 + 16) + (12 + 16 + 16));
+    let (env, _) = seal_call_envelope(&caller, Some(&auditor), &h_in(SALT, &[]), SALT, &[], CallCaps::FALLBACK).unwrap();
+    assert_eq!(env.len(), ENVELOPE_FIXED_BYTES);
+    let (env, _) =
+        seal_call_envelope(&caller, Some(&auditor), &h_in(SALT, &[1, 2, 3]), SALT, &[1, 2, 3], CallCaps::FALLBACK).unwrap();
+    assert_eq!(env.len(), ENVELOPE_FIXED_BYTES + 12);
+}
+
+/// The caps a chain's `max_call_envelope_bytes` implies, at the boundary: the largest input vector
+/// they admit seals, auditor included, to an envelope of at most that many bytes (exactly that
+/// many when the difference divides by four), and one word more is refused before sealing.
+#[test]
+fn the_caps_derived_from_the_envelope_limit_hold_at_the_boundary() {
+    let caller = vk(45);
+    let auditor = address_of(&vk(46));
+    // The default chain: (18 432 - 1 252) / 4 = 4 295 words, and 4 295 words fill it exactly.
+    let caps = CallCaps::for_envelope_bytes(MAX_CALL_ENVELOPE_BYTES);
+    assert_eq!(caps, CallCaps { max_input_words: 4295, max_envelope_bytes: 18_432 });
+    // A raised chain, and one whose difference does not divide by four (rounded down).
+    assert_eq!(CallCaps::for_envelope_bytes(65_536).max_input_words, (65_536 - 1252) / 4);
+    assert_eq!(CallCaps::for_envelope_bytes(18_435).max_input_words, 4295);
+    // Nothing underflows below the overhead.
+    assert_eq!(CallCaps::for_envelope_bytes(100).max_input_words, 0);
+
+    for limit in [MAX_CALL_ENVELOPE_BYTES, 18_435, 20_000] {
+        let caps = CallCaps::for_envelope_bytes(limit);
+        let full = vec![7u32; caps.max_input_words];
+        let (env, _) = seal_call_envelope(&caller, Some(&auditor), &h_in(SALT, &full), SALT, &full, caps).unwrap();
+        assert!(env.len() <= limit, "{} > {limit}", env.len());
+        assert!(limit - env.len() < 4, "the cap wastes no whole word: {} of {limit}", env.len());
+        let over = vec![7u32; caps.max_input_words + 1];
+        let err = seal_call_envelope(&caller, Some(&auditor), &h_in(SALT, &over), SALT, &over, caps).unwrap_err();
+        assert!(err.contains(&caps.max_input_words.to_string()), "{err}");
+    }
+    let caps = CallCaps::for_envelope_bytes(MAX_CALL_ENVELOPE_BYTES);
+    let (env, _) = seal_call_envelope(
+        &caller,
+        Some(&auditor),
+        &h_in(SALT, &vec![0; 4295]),
+        SALT,
+        &vec![0; 4295],
+        caps,
+    )
+    .unwrap();
+    assert_eq!(env.len(), MAX_CALL_ENVELOPE_BYTES, "exactly at the cap is admitted");
 }
 
 /// A malformed auditor address is an error, not a panic inside ML-KEM.
@@ -148,7 +205,7 @@ fn sealing_refuses_an_input_vector_past_the_spec_cap_and_the_largest_one_still_f
 fn a_wrong_length_auditor_key_is_reported() {
     let caller = vk(51);
     let bad = ShieldedAddress { pk: [1; 8], kem_ek: vec![0; 7] };
-    let err = seal_call_envelope(&caller, Some(&bad), &h_in(SALT, &[1, 2]), SALT, &[1, 2]).unwrap_err();
+    let err = seal_call_envelope(&caller, Some(&bad), &h_in(SALT, &[1, 2]), SALT, &[1, 2], CallCaps::FALLBACK).unwrap_err();
     assert!(err.contains("7 bytes"), "{err}");
 }
 
@@ -160,7 +217,7 @@ fn prove_call_returns_the_salt_behind_the_proofs_h_in() {
     let program = randprotocol_zkvm::guests::fib(10);
     let inputs = inputs();
     let (bytes, outputs, tier, salt) =
-        prove_call(FriProfile::Test, &program, &inputs, Some(10), Backend::Cpu).expect("fib proves at tier 10");
+        prove_call(FriProfile::Test, &program, &inputs, &[], Some(10), Backend::Cpu, FALLBACK_MAX_CALL_INPUT_WORDS).expect("fib proves at tier 10");
     assert_eq!(tier, 10);
     assert_eq!(outputs[0], 55, "fib(10)");
 
@@ -170,12 +227,12 @@ fn prove_call_returns_the_salt_behind_the_proofs_h_in() {
 
     // Which is exactly what makes the sealed transcript checkable by whoever opens it.
     let caller = vk(61);
-    let (env, key) = seal_call_envelope(&caller, None, &published, salt, &inputs).unwrap();
+    let (env, key) = seal_call_envelope(&caller, None, &published, salt, &inputs, CallCaps::FALLBACK).unwrap();
     let (opened_salt, opened_inputs) = open_call_with_key(&env, &published, &key).expect("opens under the call's H_IN");
     assert!(call_envelope_is_faithful(&published, opened_salt, &opened_inputs));
 
     // Two calls never share a salt: the freshness `H_IN`'s hiding rests on.
-    let (_, _, _, salt2) = prove_call(FriProfile::Test, &program, &inputs, Some(10), Backend::Cpu).unwrap();
+    let (_, _, _, salt2) = prove_call(FriProfile::Test, &program, &inputs, &[], Some(10), Backend::Cpu, FALLBACK_MAX_CALL_INPUT_WORDS).unwrap();
     assert_ne!(salt, salt2);
 
     // And the chain-side verifier publishes that same `H_IN` on the call's outcome, which is
@@ -204,10 +261,36 @@ fn prove_call_refuses_an_input_vector_past_the_cap_before_proving() {
     let err = prove_call(
         FriProfile::Test,
         &randprotocol_zkvm::guests::fib(10),
-        &vec![0; MAX_CALL_INPUT_WORDS + 1],
+        &vec![0; 101],
+        &[],
         Some(10),
         Backend::Cpu,
+        100,
     )
     .unwrap_err();
-    assert!(err.contains(&MAX_CALL_INPUT_WORDS.to_string()), "{err}");
+    assert!(err.contains("at most 100 input words"), "{err}");
+}
+
+/// Both provers take the program's deploy-time public input and bind it: the proof's `H_PUB`
+/// (`pv::PUB0..7`) is `public_digest(public)`, and the guest reads those words. `public_echo`
+/// sums the four public words and `public[1]` again.
+#[test]
+fn both_provers_prove_over_the_public_input_they_are_given() {
+    let program = randprotocol_zkvm::guests::public_echo();
+    let public = [1u32, 2, 3, 4];
+    let digest = randprotocol_zkvm::hash::public_digest(&public);
+    let h_pub = |bytes: &[u8]| -> Word8 {
+        let proof: Proof = postcard::from_bytes(bytes).expect("a proof this crate just produced");
+        std::array::from_fn(|i| proof.public_values[pv::PUB0 + i] as u32)
+    };
+
+    let (bytes, outputs, _, _) =
+        prove_call(FriProfile::Test, &program, &[], &public, None, Backend::Cpu, FALLBACK_MAX_CALL_INPUT_WORDS)
+            .expect("public_echo proves");
+    assert_eq!(outputs[0], 1 + 2 + 3 + 4 + 2);
+    assert_eq!(h_pub(&bytes), digest);
+
+    let (bytes, outputs, _) = prove(FriProfile::Test, &program, &[], &public, None, Backend::Cpu).expect("proves");
+    assert_eq!(outputs[0], 12);
+    assert_eq!(h_pub(&bytes), digest);
 }

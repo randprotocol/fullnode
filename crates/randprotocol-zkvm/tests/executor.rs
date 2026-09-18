@@ -22,7 +22,7 @@ fn record(p: &randprotocol_zkvm::isa::Program) -> ProgramRecord {
 /// One proof shared by every test (proving takes ~20 s).
 fn shared() -> &'static (Vec<u8>, [u32; 8], u8) {
     static P: OnceLock<(Vec<u8>, [u32; 8], u8)> = OnceLock::new();
-    P.get_or_init(|| prove(FriProfile::Test, &guests::private_payment(1000), &[400, 250, 300, 75], None, Backend::Cpu).unwrap())
+    P.get_or_init(|| prove(FriProfile::Test, &guests::private_payment(1000), &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap())
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn zh4_rejects_a_program_that_wraps_the_u32_pc_space() {
 
 #[test]
 fn private_payment_emits_no_transfer_below_threshold() {
-    let (_, outputs, _) = prove(FriProfile::Test, &guests::private_payment(2000), &[400, 250, 300, 75], None, Backend::Cpu).unwrap();
+    let (_, outputs, _) = prove(FriProfile::Test, &guests::private_payment(2000), &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap();
     assert_eq!(outputs, [0; 8]);
 }
 
@@ -104,7 +104,7 @@ fn private_payment_emits_no_transfer_below_threshold() {
 fn prove_takes_a_backend_and_cpu_is_unchanged() {
     let p = guests::private_payment(1000);
     let (proof, outputs, tier) =
-        prove(FriProfile::Test, &p, &[400, 250, 300, 75], None, randprotocol_zkvm::machine::Backend::Cpu).unwrap();
+        prove(FriProfile::Test, &p, &[400, 250, 300, 75], &[], None, randprotocol_zkvm::machine::Backend::Cpu).unwrap();
     let ex = ZkExecutor::new(FriProfile::Test);
     let out = ex.verify_call(&record(&p), &proof).unwrap();
     assert_eq!((out.outputs, out.tier), (outputs, tier));

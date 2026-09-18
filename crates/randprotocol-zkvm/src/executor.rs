@@ -447,18 +447,22 @@ pub fn zk_code_hash(program: &Program) -> String {
 /// S3: a caller that will publish a call-input envelope needs the salt back and uses
 /// [`prove_call`] instead, which draws an equally fresh one on this side of `Machine`. This
 /// function stays as it is — it is the path every backend can serve.
+///
+/// `public` is the program's deploy-time public input (`rand_getProgramPublic`), empty for a
+/// program deployed without one. The proof's `H_PUB` commits to it, and the chain checks that
+/// against the program's recorded digest (`ZkExecutor::verify_call`), so a proof over any other
+/// public input is refused.
 pub fn prove(
     profile: FriProfile,
     program: &Program,
     inputs: &[u32],
+    public: &[u32],
     tier: Option<u8>,
     backend: Backend,
 ) -> Result<(Vec<u8>, [u32; 8], u8), String> {
     let m = Machine::new(profile);
-    // The empty public segment (`&[]`): no guest provable through this entry point reads one —
-    // and no proof carrying another segment would pass the chain's `verify_public(.., &[], ..)`.
     let (proof, exec) = m
-        .prove_with(backend, program, inputs, &[], tier.map(|t| Tier(t as usize)))
+        .prove_with(backend, program, inputs, public, tier.map(|t| Tier(t as usize)))
         .map_err(|e| format!("{e:?}"))?;
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }
@@ -479,31 +483,32 @@ pub fn prove(
 /// Only `Backend::Cpu` can answer: the GPU and reference paths run inside the vendored
 /// `Machine::prove_with`, which draws its own salt and never returns it. A caller proving on
 /// one of those backends must prove without an envelope (`prove`) — the chain accepts both.
+///
+/// `public` is the program's deploy-time public input, as for [`prove`]. `max_input_words` is the
+/// envelope's input cap (`call_envelope::CallCaps::max_input_words`, derived from the chain's
+/// `max_call_envelope_bytes`).
 pub fn prove_call(
     profile: FriProfile,
     program: &Program,
     inputs: &[u32],
+    public: &[u32],
     tier: Option<u8>,
     backend: Backend,
+    max_input_words: usize,
 ) -> Result<(Vec<u8>, [u32; 8], u8, [u32; 4]), String> {
-    // The envelope this proof is for cannot carry more than the spec's input cap, and proving
+    // The envelope this proof is for cannot carry more than the chain's input cap, and proving
     // is minutes: refuse now rather than after the work is done (`call_envelope`'s own check is
     // the same one, reached by a caller that seals without proving).
-    if inputs.len() > crate::call_envelope::MAX_CALL_INPUT_WORDS {
-        return Err(format!(
-            "a call may prove at most {} input words, got {}",
-            crate::call_envelope::MAX_CALL_INPUT_WORDS,
-            inputs.len()
-        ));
+    if inputs.len() > max_input_words {
+        return Err(format!("a call may prove at most {max_input_words} input words, got {}", inputs.len()));
     }
     match backend {
         Backend::Cpu => {
             use rand::RngExt;
             let salt: [u32; 4] = rand::rng().random();
             let m = Machine::new(profile);
-            // The empty public segment, as in `prove`.
             let (proof, exec) = m
-                .prove_salted(program, inputs, &[], salt, tier.map(|t| Tier(t as usize)))
+                .prove_salted(program, inputs, public, salt, tier.map(|t| Tier(t as usize)))
                 .map_err(|e| format!("{e:?}"))?;
             Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8, salt))
         }

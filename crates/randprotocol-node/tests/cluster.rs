@@ -1089,7 +1089,7 @@ async fn confidential_call_rides_on_a_bundle() {
     // proof is prover work like any other, and the bundle follows it immediately.
     let slot = proving_slot().await;
     let (proof, outputs, tier) =
-        randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], None, Backend::Cpu)
+        randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu)
             .expect("the call proves");
     eprintln!("call: tier {tier}, {} proof bytes, outputs {outputs:?}", proof.len());
     let call_fee = wallet::call_fee_default(tier, randprotocol_core::gas::call_bytes(&proof, None));
@@ -1667,10 +1667,18 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
     let inputs = [400u32, 250, 300, 75];
     let slot = proving_slot().await;
     let (proof, outputs, tier, salt) =
-        randprotocol_zkvm::executor::prove_call(FriProfile::Test, &program, &inputs, None, Backend::Cpu)
-            .expect("the call proves");
+        randprotocol_zkvm::executor::prove_call(
+            FriProfile::Test,
+            &program,
+            &inputs,
+            &[],
+            None,
+            Backend::Cpu,
+            call_envelope::FALLBACK_MAX_CALL_INPUT_WORDS,
+        )
+        .expect("the call proves");
     let h_in = hash::input_digest(salt, &inputs);
-    let (sealed, key) = call_envelope::seal_call_envelope(&caller.vk, Some(&auditor.address), &h_in, salt, &inputs)
+    let (sealed, key) = call_envelope::seal_call_envelope(&caller.vk, Some(&auditor.address), &h_in, salt, &inputs, call_envelope::CallCaps::FALLBACK)
         .expect("sealing the transcript");
     let fee = wallet::call_fee_default(tier, randprotocol_core::gas::call_bytes(&proof, Some(&sealed)));
     let called = wallet::submit(

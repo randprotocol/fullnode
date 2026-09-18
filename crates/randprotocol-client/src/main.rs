@@ -682,13 +682,13 @@ async fn main() -> Result<()> {
             // and says so in its own words rather than being quietly downgraded here.
             let (proof, outputs, tier, envelope, call_key) = if no_envelope {
                 let (proof, outputs, tier) =
-                    executor::prove(profile, &prog, &inputs, tier, backend).map_err(|e| anyhow::anyhow!(e))?;
+                    executor::prove(profile, &prog, &inputs, &[], tier, backend).map_err(|e| anyhow::anyhow!(e))?;
                 (proof, outputs, tier, None, None)
             } else {
                 let (proof, outputs, tier, salt) =
-                    executor::prove_call(profile, &prog, &inputs, tier, backend).map_err(|e| anyhow::anyhow!(e))?;
+                    executor::prove_call(profile, &prog, &inputs, &[], tier, backend, call_envelope::FALLBACK_MAX_CALL_INPUT_WORDS).map_err(|e| anyhow::anyhow!(e))?;
                 let h_in = hash::input_digest(salt, &inputs);
-                let (e, key) = call_envelope::seal_call_envelope(&w.vk, auditor.as_ref(), &h_in, salt, &inputs)
+                let (e, key) = call_envelope::seal_call_envelope(&w.vk, auditor.as_ref(), &h_in, salt, &inputs, call_envelope::CallCaps::FALLBACK)
                     .map_err(|e| anyhow::anyhow!(e))?;
                 (proof, outputs, tier, Some(e), Some(key))
             };

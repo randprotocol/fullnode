@@ -221,9 +221,11 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     // slot — a program proof is prover work like any other, and the bundle follows it immediately.
     let slot = proving_slot().await;
     let (proof, outputs, tier, salt) =
-        executor::prove_call(FriProfile::Test, &prog, &inputs, None, Backend::Cpu).expect("the call proves");
+        executor::prove_call(FriProfile::Test, &prog, &inputs, &[], None, Backend::Cpu, call_envelope::FALLBACK_MAX_CALL_INPUT_WORDS)
+            .expect("the call proves");
     let h_in = hash::input_digest(salt, &inputs);
-    let (envelope, key) = call_envelope::seal_call_envelope(&a.vk, None, &h_in, salt, &inputs).expect("the transcript seals");
+    let (envelope, key) = call_envelope::seal_call_envelope(&a.vk, None, &h_in, salt, &inputs, call_envelope::CallCaps::FALLBACK)
+        .expect("the transcript seals");
     let fee = wallet::call_fee_default(tier, randprotocol_core::gas::call_bytes(&proof, Some(&envelope)));
     let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
     let call = wallet::submit(

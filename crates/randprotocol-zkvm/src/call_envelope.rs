@@ -42,13 +42,44 @@ type Dk = ml_kem::ml_kem_768::DecapsulationKey;
 type Ek = ml_kem::ml_kem_768::EncapsulationKey;
 type KemCt = ml_kem::ml_kem_768::Ciphertext;
 
-/// Longest private-input vector a call may seal a transcript for (spec §6.1). The cap is the
-/// program's, not the envelope's: 4096 words is 16 KiB of plaintext, and the ledger's
-/// [`MAX_CALL_ENVELOPE_BYTES`] is sized to admit that much *plus* the auditor parts (see that
-/// constant's table). [`seal_call_envelope`] enforces this one, so a wallet learns about an
-/// over-long input vector before it pays for a proof rather than when a block refuses the
-/// transaction; `executor::prove_call` enforces it one step earlier still.
-pub const MAX_CALL_INPUT_WORDS: usize = 4096;
+/// The input cap a wallet uses when its node is too old to report its limits
+/// (`rand_getLimits` absent): the spec §6.1 cap every chain before the call limits had. It fits
+/// the default [`MAX_CALL_ENVELOPE_BYTES`] with the auditor parts included (see that constant's
+/// table), so it is safe on any chain.
+pub const FALLBACK_MAX_CALL_INPUT_WORDS: usize = 4096;
+
+/// What an envelope adds to its `4 × inputs` plaintext bytes in its largest shape, an auditor
+/// named: an ML-KEM-768 ciphertext (1 088), two key wraps (nonce 12 + key 32 + tag 16 each), and
+/// the body's nonce, salt and tag (12 + 16 + 16). 1 252 bytes.
+pub const ENVELOPE_FIXED_BYTES: usize = 1088 + 2 * (12 + 32 + 16) + (12 + 16 + 16);
+
+/// The two caps [`seal_call_envelope`] enforces, both derived from the chain's
+/// `max_call_envelope_bytes` (`rand_getLimits`) rather than fixed (spec §6).
+///
+/// `max_input_words` is checked before sealing — and by `executor::prove_call` before proving —
+/// so a wallet learns about an over-long input vector before it pays for a proof;
+/// `max_envelope_bytes` is the ledger's own cap, checked once more on the sealed envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallCaps {
+    pub max_input_words: usize,
+    pub max_envelope_bytes: usize,
+}
+
+impl CallCaps {
+    /// For a node that does not report its limits: 4 096 words under the default byte cap.
+    pub const FALLBACK: CallCaps =
+        CallCaps { max_input_words: FALLBACK_MAX_CALL_INPUT_WORDS, max_envelope_bytes: MAX_CALL_ENVELOPE_BYTES };
+
+    /// The caps a chain whose envelope cap is `max_call_envelope_bytes` implies: the most input
+    /// words whose audited envelope still fits, `(max_call_envelope_bytes − ENVELOPE_FIXED_BYTES) / 4`.
+    /// A default chain (18 432) gives 4 295 words, whose audited envelope is exactly 18 432 bytes.
+    pub fn for_envelope_bytes(max_call_envelope_bytes: usize) -> CallCaps {
+        CallCaps {
+            max_input_words: max_call_envelope_bytes.saturating_sub(ENVELOPE_FIXED_BYTES) / 4,
+            max_envelope_bytes: max_call_envelope_bytes,
+        }
+    }
+}
 
 /// The per-call disclosure key, `K_call`. Handing it over discloses exactly one call's inputs.
 ///
@@ -127,7 +158,8 @@ fn kem_keys(vk: &ViewingKey) -> (Dk, Ek) {
     MlKem768::from_seed(&ml_kem::Seed::from(vk.kem_seed()))
 }
 
-/// Seals `(salt, inputs)` for the call whose proof publishes `h_in`, under a fresh `K_call`
+/// Seals `(salt, inputs)` for the call whose proof publishes `h_in`, within `caps` (the chain's,
+/// from [`CallCaps::for_envelope_bytes`], or [`CallCaps::FALLBACK`]), under a fresh `K_call`
 /// that is wrapped to the caller's outgoing viewing key and, when `auditor` is given, to that
 /// address's ML-KEM-768 encapsulation key. With no auditor the `kem_ct` and `to_auditor` parts
 /// are empty — the shape the chain sees for a call that keeps only the caller's own path open.
@@ -141,9 +173,10 @@ pub fn seal_call_envelope(
     h_in: &Word8,
     salt: [u32; 4],
     inputs: &[u32],
+    caps: CallCaps,
 ) -> Result<(CallEnvelope, CallKey), String> {
-    if inputs.len() > MAX_CALL_INPUT_WORDS {
-        return Err(format!("a call may seal at most {MAX_CALL_INPUT_WORDS} input words, got {}", inputs.len()));
+    if inputs.len() > caps.max_input_words {
+        return Err(format!("a call may seal at most {} input words, got {}", caps.max_input_words, inputs.len()));
     }
     let key = CallKey::random();
     let (kem_ct, to_auditor) = match auditor {
@@ -175,16 +208,17 @@ pub fn seal_call_envelope(
         to_auditor,
         body: seal(&key.0, &body_aad(h_in), &plaintext(salt, inputs)),
     };
-    // Belt and braces: with `MAX_CALL_INPUT_WORDS` words and an auditor the four parts come to
-    // 17 636 bytes, inside `MAX_CALL_ENVELOPE_BYTES`, so this cannot fire for any input the
-    // check above admits. It is here because the two constants live in different crates and a
-    // wallet must learn about a mismatch now — the proof is already paid for by this point —
-    // rather than from a rejected block.
-    if envelope.len() > MAX_CALL_ENVELOPE_BYTES {
+    // Belt and braces: with caps from `CallCaps::for_envelope_bytes`, `max_input_words` words and
+    // an auditor come to at most `max_envelope_bytes`, so this cannot fire for any input the check
+    // above admits. It is here because a caller may build its caps by hand, and a wallet must
+    // learn about a mismatch now — the proof is already paid for by this point — rather than from
+    // a rejected block.
+    if envelope.len() > caps.max_envelope_bytes {
         return Err(format!(
-            "the sealed call envelope is {} bytes, over the {MAX_CALL_ENVELOPE_BYTES}-byte cap; \
+            "the sealed call envelope is {} bytes, over the {}-byte cap; \
              seal fewer input words or drop the auditor",
-            envelope.len()
+            envelope.len(),
+            caps.max_envelope_bytes
         ));
     }
     Ok((envelope, key))
@@ -236,7 +270,7 @@ mod tests {
         let auditor = crate::address::address_of(&SpendKey([2; 8]).viewing_key());
         let inputs = [4u32, 5, 6];
         let h = crate::hash::input_digest([1, 2, 3, 4], &inputs);
-        let (e, key) = seal_call_envelope(&caller, Some(&auditor), &h, [1, 2, 3, 4], &inputs).unwrap();
+        let (e, key) = seal_call_envelope(&caller, Some(&auditor), &h, [1, 2, 3, 4], &inputs, CallCaps::FALLBACK).unwrap();
         assert_eq!(e.kem_ct.len(), 1088, "an ML-KEM-768 ciphertext");
         assert_eq!(e.to_sender.len(), 12 + 32 + 16, "nonce + K_call + tag");
         assert_eq!(e.to_auditor.len(), 12 + 32 + 16);
@@ -248,7 +282,7 @@ mod tests {
         assert_eq!(parse_plaintext(&pt), Some(([1, 2, 3, 4], inputs.to_vec())));
         // A zero-input call is still a well-formed transcript: the salt alone.
         let h = crate::hash::input_digest([1, 2, 3, 4], &[]);
-        let (e, key) = seal_call_envelope(&caller, None, &h, [1, 2, 3, 4], &[]).unwrap();
+        let (e, key) = seal_call_envelope(&caller, None, &h, [1, 2, 3, 4], &[], CallCaps::FALLBACK).unwrap();
         assert_eq!(open_call_with_key(&e, &h, &key), Some(([1, 2, 3, 4], Vec::new())));
     }
 
@@ -265,8 +299,8 @@ mod tests {
     fn every_call_gets_a_fresh_key() {
         let caller = SpendKey([3; 8]).viewing_key();
         let h = crate::hash::input_digest([0; 4], &[1]);
-        let (a, ka) = seal_call_envelope(&caller, None, &h, [0; 4], &[1]).unwrap();
-        let (b, kb) = seal_call_envelope(&caller, None, &h, [0; 4], &[1]).unwrap();
+        let (a, ka) = seal_call_envelope(&caller, None, &h, [0; 4], &[1], CallCaps::FALLBACK).unwrap();
+        let (b, kb) = seal_call_envelope(&caller, None, &h, [0; 4], &[1], CallCaps::FALLBACK).unwrap();
         assert_ne!(ka, kb);
         assert_ne!(a.body, b.body, "a fresh key and a fresh nonce per envelope");
         assert_eq!(open_call_with_key(&a, &h, &kb), None, "one call's key opens one call");
