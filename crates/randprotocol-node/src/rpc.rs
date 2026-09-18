@@ -34,7 +34,7 @@ const MAX_COMPACT_BLOCKS: u64 = 128;
 /// `rand_getWitness` rebuilds the whole commitment tree per call, so this is deliberately
 /// small: the realistic batch is a head, a tree info and two pages, which is four.
 ///
-/// The *byte* bound is `RPC_MAX_BODY_BYTES`, which is sized for one proof-carrying transaction, so
+/// The *byte* bound is `RpcState::max_body_bytes`, which is sized for one proof-carrying transaction, so
 /// a batch of submissions is refused on size at the extractor long before this count is consulted.
 const MAX_BATCH: usize = 20;
 
@@ -270,10 +270,13 @@ pub struct RpcState {
     pub status: Arc<RwLock<NodeStatus>>,
     pub node: mpsc::Sender<NodeCommand>,
     pub chain_id: u64,
-    /// The chain's deploy cap in words, from its genesis ledger (`max_program_words`, default
-    /// `gas::MAX_PROGRAM_WORDS`): what `rand_estimateFee` refuses a deploy estimate past, so it
-    /// agrees with admission.
-    pub max_program_words: usize,
+    /// The chain's five call limits, from its genesis ledger ([`ChainLimits::of`]): what
+    /// `rand_getLimits` reports, what `rand_estimateFee` refuses a deploy estimate past (so it
+    /// agrees with admission), and the block cap `rand_sendTransaction` pre-checks against.
+    pub limits: ChainLimits,
+    /// The largest request body the RPC accepts, computed at startup from `limits`
+    /// ([`ChainLimits::rpc_max_body_bytes`]; [`RPC_MAX_BODY_BYTES`] on a default chain).
+    pub max_body_bytes: usize,
     /// Needed by `rand_getWitness`, which rebuilds the tree to fold a path.
     pub executor: Arc<dyn ConfidentialExecutor>,
     /// Committed heads, one per block, fanned out to WebSocket subscribers. Bounded: a subscriber
@@ -341,41 +344,80 @@ impl RpcError {
     }
 }
 
-/// The largest request body the RPC accepts, derived from the largest transaction the chain can
-/// admit rather than guessed.
+/// A chain's call limits (spec §3), read once off its genesis ledger. What `rand_getLimits`
+/// returns, field for field, so wallets derive their caps instead of hard-coding them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ChainLimits {
+    pub max_program_words: usize,
+    pub max_proof_bytes: usize,
+    pub max_block_bytes: usize,
+    pub max_call_envelope_bytes: usize,
+    pub max_program_public_words: usize,
+}
+
+impl ChainLimits {
+    pub fn of(ledger: &randprotocol_core::Ledger) -> ChainLimits {
+        ChainLimits {
+            max_program_words: ledger.max_program_words(),
+            max_proof_bytes: ledger.max_proof_bytes(),
+            max_block_bytes: ledger.max_block_bytes(),
+            max_call_envelope_bytes: ledger.max_call_envelope_bytes(),
+            max_program_public_words: ledger.max_program_public_words(),
+        }
+    }
+
+    /// The request-body limit for this chain: [`RPC_MAX_BODY_BYTES`]'s formula over the chain's
+    /// own proof and call-envelope caps (spec §8).
+    pub const fn rpc_max_body_bytes(&self) -> usize {
+        rpc_max_body_bytes(self.max_proof_bytes, self.max_call_envelope_bytes)
+    }
+}
+
+/// The largest request body the RPC accepts on a chain whose proofs are capped at
+/// `max_proof_bytes` and call-input envelopes at `max_call_envelope_bytes`, derived from the
+/// largest transaction the chain can admit rather than guessed.
 ///
 /// `rand_sendTransaction` carries `hex(bincode(tx))` inside a JSON envelope, so every byte of the
 /// transaction costs two here. The terms, all per single transaction:
 ///
-/// - `2 * MAX_PROOF_BYTES` — a `Call` carries **two** proofs, the fee bundle's and the call's own,
+/// - `2 * max_proof_bytes` — a `Call` carries **two** proofs, the fee bundle's and the call's own,
 ///   and a `BridgeBurn` likewise carries two bundles. This is the term the retired limit missed: it
 ///   allowed `2 * MAX_PROOF_BYTES + 256 KiB` *in total*, which is one hex-encoded proof, so a
 ///   constraint-set-5 `Call` — measured at 1 321 773 bytes for the fee bundle's proof plus ~1.2 MB
 ///   for the call's — was refused after about a hundred seconds of proving.
 /// - `2 * MAX_ENVELOPE_BYTES` — the bundle's two output envelopes.
-/// - `MAX_CALL_ENVELOPE_BYTES` — the call's input envelope.
+/// - `max_call_envelope_bytes` — the call's input envelope.
 /// - `MAX_ATTESTATION_BYTES` — a `BridgeAttest`'s attestation.
 /// - 64 KiB for the rest: public keys, signatures, hashes, nullifiers and bincode framing.
 ///
 /// Then doubled for the hex encoding, plus 256 KiB for the JSON envelope and headers.
-pub const RPC_MAX_BODY_BYTES: usize = 2
-    * (2 * randprotocol_core::gas::MAX_PROOF_BYTES
+pub const fn rpc_max_body_bytes(max_proof_bytes: usize, max_call_envelope_bytes: usize) -> usize {
+    2 * (2 * max_proof_bytes
         + 2 * randprotocol_core::notes::MAX_ENVELOPE_BYTES
-        + randprotocol_core::types::actions::MAX_CALL_ENVELOPE_BYTES
+        + max_call_envelope_bytes
         + randprotocol_core::gas::MAX_ATTESTATION_BYTES
         + 64 * 1024)
-    + 256 * 1024;
+        + 256 * 1024
+}
+
+/// [`rpc_max_body_bytes`] on a default chain (no call-limit fields in its genesis). A running
+/// node uses `RpcState::max_body_bytes`, computed from its own genesis.
+pub const RPC_MAX_BODY_BYTES: usize = rpc_max_body_bytes(
+    randprotocol_core::gas::MAX_PROOF_BYTES,
+    randprotocol_core::types::actions::MAX_CALL_ENVELOPE_BYTES,
+);
 
 pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    let max_body_bytes = state.max_body_bytes;
     let app = Router::new()
         // Same port, two protocols: `POST /` is the JSON-RPC this file serves, `GET /` and
         // `GET /ws` are the WebSocket upgrade. A client that knows only the POST sees no change.
         .route("/", post(handle).get(crate::ws::upgrade))
         .route("/ws", axum::routing::get(crate::ws::upgrade))
-        // `RPC_MAX_BODY_BYTES`, unchanged — it bounds the POST. A WebSocket upgrade is a GET with
-        // no body, so the layer costs it nothing; frames are bounded by `ws::WS_MAX_FRAME_BYTES`
-        // instead.
-        .layer(axum::extract::DefaultBodyLimit::max(RPC_MAX_BODY_BYTES))
+        // `RpcState::max_body_bytes`, from the genesis limits — it bounds the POST. A WebSocket
+        // upgrade is a GET with no body, so the layer costs it nothing; frames are bounded by
+        // `ws::WS_MAX_FRAME_BYTES` instead.
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
@@ -438,7 +480,7 @@ async fn handle(
         Err(rejection) => {
             // The HTTP status stays what axum decided (413 for an oversized body); only the body
             // becomes something a client can parse. The id is `null`: we never saw the request.
-            return (rejection.status(), Json(error_value(Value::Null, rejection_error(&rejection))));
+            return (rejection.status(), Json(error_value(Value::Null, rejection_error(&rejection, st.max_body_bytes))));
         }
     };
     // Everything past here parsed, so the HTTP status is 200 and the errors are in the body.
@@ -466,10 +508,10 @@ async fn handle(
 }
 
 /// Turn a body axum would not give us into a JSON-RPC error, naming the limit when that is why.
-fn rejection_error(rejection: &axum::extract::rejection::JsonRejection) -> RpcError {
+fn rejection_error(rejection: &axum::extract::rejection::JsonRejection, max_body_bytes: usize) -> RpcError {
     if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
         return RpcError::invalid_request(format!(
-            "request body is larger than the {RPC_MAX_BODY_BYTES}-byte limit; \
+            "request body is larger than the {max_body_bytes}-byte limit; \
              a transaction is sent as hex, so it may be at most half of that"
         ));
     }
@@ -680,6 +722,10 @@ pub(crate) fn receipt_json(r: &CallReceipt) -> Value {
         // receipt field, and the associated data a call-input envelope is sealed against:
         // without it `rand_getCallEnvelope`'s bytes could not be opened by anyone (spec §6.1).
         "h_in": word8_to_hex(&r.h_in),
+        // The digest of the program's deploy-time public input the proof was checked against
+        // (call limits spec §5). `null` for a program deployed without one: its proofs were checked
+        // against the empty input's digest, `public_digest(&[])`, which is not repeated here.
+        "h_pub": r.h_pub.as_ref().map(word8_to_hex),
     })
 }
 
@@ -812,7 +858,10 @@ fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>, executor: &dyn Confiden
             "kind": "mint", "cm": word8_to_hex(cm), "amount": amount, "minter": minter.address().to_base58()
         }),
         Action::Deploy { base_pc, words, public } => json!({
-            "kind": "deploy", "program": randprotocol_core::program::program_id_with_public(*base_pc, words, public).to_hex(), "words": words.len()
+            "kind": "deploy", "program": randprotocol_core::program::program_id_with_public(*base_pc, words, public).to_hex(), "words": words.len(),
+            // The deploy-time public input's length (0 without one); the words themselves are
+            // `rand_getProgramPublic`'s, once the deploy has committed.
+            "public_words_len": public.len()
         }),
         Action::Call { program, proof, input_envelope } => json!({
             "kind": "call", "program": program.to_hex(), "proof_len": proof.len(),
@@ -938,15 +987,16 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let bytes = hex::decode(raw.strip_prefix("0x").unwrap_or(&raw))
                 .map_err(|_| RpcError::invalid_params("tx must be hex"))?;
             let tx = Transaction::decode(&bytes).map_err(|e| RpcError::invalid_params(format!("tx decode: {e}")))?;
-            // The body limit admits more than a block can carry — two `MAX_PROOF_BYTES` proofs are
-            // a legal `Call` by the per-part caps and still over `MAX_BLOCK_BYTES` — so refuse one
-            // here rather than handing the node loop a transaction no block could ever include.
-            // Admission refuses it too (`TxError::TransactionTooLarge`); this keeps it off the loop.
+            // The body limit admits more than a block can carry — two `max_proof_bytes` proofs
+            // are a legal `Call` by the per-part caps and can still be over `max_block_bytes` — so
+            // refuse one here rather than handing the node loop a transaction no block could ever
+            // include. Admission refuses it too (`TxError::TransactionTooLarge`); this keeps it off
+            // the loop. The chain's own block cap, from its genesis.
             let encoded_len = tx.encoded_len();
-            if encoded_len > randprotocol_core::gas::MAX_BLOCK_BYTES {
+            let max_block_bytes = st.limits.max_block_bytes;
+            if encoded_len > max_block_bytes {
                 return Err(RpcError::rejected(format!(
-                    "transaction of {encoded_len} bytes exceeds the {} byte block limit",
-                    randprotocol_core::gas::MAX_BLOCK_BYTES
+                    "transaction of {encoded_len} bytes exceeds the {max_block_bytes} byte block limit"
                 )));
             }
             let (reply, rx) = oneshot::channel();
@@ -1175,10 +1225,26 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 None => Ok(Value::Null),
                 Some(r) => Ok(json!({
                     "id": r.id.to_hex(), "base_pc": r.base_pc, "words_len": r.words.len(),
-                    "code_hash": hex::encode(&r.code_hash), "deployed_at": r.deployed_at
+                    "code_hash": hex::encode(&r.code_hash), "deployed_at": r.deployed_at,
+                    // The deploy-time public input (spec §5): its length, and the digest every
+                    // call's proof is checked against — `null` for a program without one.
+                    "public_words_len": r.public_len,
+                    "public_digest": r.public_digest.as_ref().map(word8_to_hex),
                 })),
             }
         }
+        // A program's deploy-time public words, as hex of their little-endian bytes (8 hex digits
+        // a word, the encoding `word8_to_hex` uses for a digest); `""` for a program without a
+        // public input and `null` for an id no program has.
+        "rand_getProgramPublic" => {
+            let id = parse_hash(p, 0)?;
+            if st.storage.program(&id).map_err(RpcError::internal)?.is_none() {
+                return Ok(Value::Null);
+            }
+            let words = st.storage.program_public(&id).map_err(RpcError::internal)?.unwrap_or_default();
+            Ok(json!(hex::encode(words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())))
+        }
+        "rand_getLimits" => Ok(json!(st.limits)),
         "rand_getProgramCode" => {
             let id = parse_hash(p, 0)?;
             Ok(st
@@ -1247,10 +1313,18 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "bundle" => randprotocol_core::gas::BUNDLE_BASE,
                 "deploy" => {
                     let words = spec.get("words").and_then(|w| w.as_u64()).unwrap_or(0) as usize;
-                    if words > st.max_program_words {
+                    if words > st.limits.max_program_words {
                         return Err(RpcError::invalid_params(format!(
                             "words must be at most {} (this chain's program cap)",
-                            st.max_program_words
+                            st.limits.max_program_words
+                        )));
+                    }
+                    // The deploy-time public input (spec §5), paid for per word like code.
+                    let public = spec.get("public_words").and_then(|w| w.as_u64()).unwrap_or(0) as usize;
+                    if public > st.limits.max_program_public_words {
+                        return Err(RpcError::invalid_params(format!(
+                            "public_words must be at most {} (this chain's public input cap)",
+                            st.limits.max_program_public_words
                         )));
                     }
                     // `fee_floor(&Action::Deploy { words: vec![0; words], .. })` would compute the
@@ -1258,7 +1332,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     // (up to `max_program_words`, i.e. up to 256 KiB) on every estimate call —
                     // `deploy_fee` is the pure per-word term `fee_floor` itself adds to
                     // `BUNDLE_BASE` for a deploy, so call it directly instead.
-                    randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::deploy_fee(words)
+                    randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::deploy_fee(words + public)
                 }
                 "call" => {
                     let Some(n) = spec.get("tier").and_then(|t| t.as_u64()) else {
@@ -1272,9 +1346,18 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     if !(randprotocol_core::gas::MIN_TIER..=randprotocol_core::gas::MAX_TIER).contains(&tier) || tier % 2 != 0 {
                         return Err(RpcError::invalid_params("tier must be one of 10, 12, 14, 16, 18, 20"));
                     }
-                    // The byte term is zero here: this is the fee of a call under the free
-                    // allowance, which is every call a default chain admits (spec §7).
-                    randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(tier, 0)
+                    // The call's proof plus input-envelope bytes (`gas::call_bytes`), for the byte
+                    // term (spec §7). Optional: without it this is the fee of a call under the free
+                    // allowance, which is every call a default chain admits, and what this method
+                    // answered before it took `bytes`.
+                    let bytes = match spec.get("bytes") {
+                        None | Some(Value::Null) => 0,
+                        Some(b) => b
+                            .as_u64()
+                            .and_then(|b| usize::try_from(b).ok())
+                            .ok_or_else(|| RpcError::invalid_params("bytes must be a non-negative integer"))?,
+                    };
+                    randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(tier, bytes)
                 }
                 _ => return Err(RpcError::invalid_params("kind must be bundle, deploy or call")),
             };
@@ -1836,7 +1919,8 @@ mod tests {
             status: Arc::new(RwLock::new(NodeStatus::default())),
             node: tx,
             chain_id: gs.chain_id,
-            max_program_words: gs.ledger.max_program_words(),
+            limits: ChainLimits::of(&gs.ledger),
+            max_body_bytes: ChainLimits::of(&gs.ledger).rpc_max_body_bytes(),
             executor: Arc::new(StubExecutor),
             heads: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
             commits: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
@@ -2292,6 +2376,200 @@ mod tests {
         assert!(e.message.contains("65535"), "{}", e.message);
     }
 
+    /// A genesis whose ledger raises every call limit (spec §3): 8 MiB proofs, 20 MiB blocks, a
+    /// 64 KiB call envelope, 64 public words and an 8 192-word program cap.
+    fn raised_genesis() -> GenesisState {
+        let mut gs = genesis_with(7, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)]);
+        gs.ledger.set_max_program_words(8192);
+        gs.ledger.set_max_proof_bytes(8 << 20);
+        gs.ledger.set_max_block_bytes(20 << 20);
+        gs.ledger.set_max_call_envelope_bytes(64 << 10);
+        gs.ledger.set_max_program_public_words(64);
+        gs
+    }
+
+    /// `rand_getLimits`: the chain's five limits, so a wallet derives its caps instead of
+    /// hard-coding them. A default chain reports today's constants.
+    #[tokio::test]
+    async fn get_limits_reports_the_chains_five_limits() {
+        let gs = fixtures::genesis(1);
+        let (_d, st) = state_for(&gs);
+        assert_eq!(
+            ok(&st, "rand_getLimits", json!([])).await,
+            json!({
+                "max_program_words": 4096,
+                "max_proof_bytes": 2_097_152,
+                "max_block_bytes": 4_194_304,
+                "max_call_envelope_bytes": 18_432,
+                "max_program_public_words": 0,
+            })
+        );
+        let gs = raised_genesis();
+        let (_d, st) = state_for(&gs);
+        assert_eq!(
+            ok(&st, "rand_getLimits", json!([])).await,
+            json!({
+                "max_program_words": 8192,
+                "max_proof_bytes": 8 << 20,
+                "max_block_bytes": 20 << 20,
+                "max_call_envelope_bytes": 64 << 10,
+                "max_program_public_words": 64,
+            })
+        );
+    }
+
+    /// The RPC's local limits follow a 20 MiB ledger (spec §8): the body limit is the same formula
+    /// over the genesis proof and envelope caps, and `rand_sendTransaction`'s pre-check is the
+    /// chain's block cap — a transaction over 4 MiB reaches the node loop instead of being refused.
+    #[tokio::test]
+    async fn the_rpc_limits_follow_a_20_mib_ledger() {
+        use randprotocol_core::gas::MAX_ATTESTATION_BYTES;
+        use randprotocol_core::notes::MAX_ENVELOPE_BYTES;
+        let default = ChainLimits::of(&fixtures::genesis(1).ledger);
+        assert_eq!(default.rpc_max_body_bytes(), RPC_MAX_BODY_BYTES, "a default chain keeps today's limit");
+
+        let gs = raised_genesis();
+        let (_d, st) = state_for(&gs);
+        let want = 2 * (2 * (8 << 20) + 2 * MAX_ENVELOPE_BYTES + (64 << 10) + MAX_ATTESTATION_BYTES + 64 * 1024) + 256 * 1024;
+        assert_eq!(st.max_body_bytes, want);
+        assert_eq!(ChainLimits::of(&gs.ledger).rpc_max_body_bytes(), want);
+
+        let tx = largest_transaction_the_part_caps_allow();
+        assert!(tx.encoded_len() > randprotocol_core::gas::MAX_BLOCK_BYTES);
+        let err = call(&st, "rand_sendTransaction", json!([hex::encode(tx.encode())])).await.unwrap_err();
+        // The stand-in loop drops the reply: the transaction got past the RPC's own check.
+        assert_eq!(err.code, -32603, "{}", err.message);
+        assert!(!err.message.contains("block limit"), "{}", err.message);
+
+        // And the served body limit is the state's: a body past today's limit is dispatched.
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), st).await.unwrap();
+        let filler = "zz".repeat(RPC_MAX_BODY_BYTES / 2);
+        let raw = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": 1, "method": "rand_sendTransaction", "params": [filler] })).unwrap();
+        assert!(raw.len() > RPC_MAX_BODY_BYTES && raw.len() < want);
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}"))
+            .header("content-type", "application/json")
+            .body(raw)
+            .send()
+            .await
+            .expect("the server answers");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let v: Value = resp.json().await.unwrap();
+        assert_eq!(v["error"]["code"], -32602, "the dispatcher saw it: {v}");
+        task.abort();
+    }
+
+    /// `rand_estimateFee` prices a deploy's public words like code words, refuses more than the
+    /// chain's public cap in the shape of its program-cap error, and takes a call's bytes (optional,
+    /// default 0) into the byte term.
+    #[tokio::test]
+    async fn estimate_fee_prices_public_words_and_call_bytes() {
+        use randprotocol_core::gas::{call_fee, fee_floor, BUNDLE_BASE, CALL_FREE_BYTES, CALL_PER_KIB};
+        let deploy = |words: usize, public: usize| json!([{"kind": "deploy", "words": words, "public_words": public}]);
+        let floor = |words: usize, public: usize| {
+            fee_floor(&Action::Deploy { base_pc: 0, words: vec![0; words], public: vec![0; public] }).to_string()
+        };
+        // A default chain: public cap 0, so 0 public words is the old estimate and 1 is refused.
+        let gs = fixtures::genesis(1);
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_estimateFee", deploy(10, 0)).await, floor(10, 0));
+        let e = call(&st, "rand_estimateFee", deploy(10, 1)).await.unwrap_err();
+        assert_eq!(e.code, -32602);
+        assert!(e.message.contains("public_words must be at most 0"), "{}", e.message);
+
+        let gs = raised_genesis();
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_estimateFee", deploy(10, 5)).await, floor(10, 5));
+        assert_eq!(ok(&st, "rand_estimateFee", deploy(10, 64)).await, floor(10, 64));
+        assert_ne!(floor(10, 5), floor(10, 0), "public words are paid for");
+        let e = call(&st, "rand_estimateFee", deploy(10, 65)).await.unwrap_err();
+        assert_eq!(e.code, -32602);
+        assert!(e.message.contains("64"), "the error names the cap: {}", e.message);
+
+        let call_spec = |bytes: Value| json!([{"kind": "call", "tier": 12, "bytes": bytes}]);
+        let plain = (BUNDLE_BASE + call_fee(12, 0)).to_string();
+        assert_eq!(ok(&st, "rand_estimateFee", json!([{"kind": "call", "tier": 12}])).await, plain, "bytes is optional");
+        assert_eq!(ok(&st, "rand_estimateFee", call_spec(json!(0))).await, plain);
+        assert_eq!(ok(&st, "rand_estimateFee", call_spec(json!(CALL_FREE_BYTES))).await, plain, "the free allowance");
+        let over = CALL_FREE_BYTES + 1;
+        let fee = BUNDLE_BASE + call_fee(12, over);
+        assert_eq!(fee, BUNDLE_BASE + call_fee(12, 0) + CALL_PER_KIB);
+        assert_eq!(ok(&st, "rand_estimateFee", call_spec(json!(over))).await, fee.to_string());
+        for bad in [json!("many"), json!(-1), json!(1.5)] {
+            let e = call(&st, "rand_estimateFee", call_spec(bad.clone())).await.unwrap_err();
+            assert_eq!(e.code, -32602, "bytes {bad}");
+        }
+    }
+
+    /// A chain with a program deployed with public words and one without, and a call to the
+    /// first; returns the two ids, the call and the public words.
+    async fn public_program_chain() -> (tempfile::TempDir, RpcState, ProgramId, ProgramId, Transaction, Vec<u32>) {
+        let gs = raised_genesis();
+        let (dir, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let mut probe = gs.ledger.clone();
+        let words = vec![0x13u32; 4];
+        let public = vec![1u32, 2, 0xdead_beef];
+        let pid = randprotocol_core::program::program_id_with_public(0, &words, &public);
+        let plain_words = vec![0x93u32; 4];
+        let plain = randprotocol_core::program::program_id(0, &plain_words);
+        let with_bundle = |nfs: [Word8; 2], cms: [Word8; 2], fee: u64, action| {
+            let b = bundle_tx(&ledger, nfs, cms, fee).bundle.expect("bundle_tx always carries one");
+            Transaction::shielded(gs.chain_id, b, action)
+        };
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: public.clone() };
+        let deploy = with_bundle([nf(1), nf(2)], [cm(1), cm(2)], randprotocol_core::gas::fee_floor(&deploy), deploy);
+        let deploy_plain = Action::Deploy { base_pc: 0, words: plain_words, public: vec![] };
+        let deploy_plain = with_bundle([nf(3), nf(4)], [cm(3), cm(4)], randprotocol_core::gas::fee_floor(&deploy_plain), deploy_plain);
+        let call_tx = with_bundle(
+            [nf(5), nf(6)],
+            [cm(5), cm(6)],
+            randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(12, 0),
+            Action::Call {
+                program: pid,
+                proof: StubExecutor::make_proof_with_public(&pid, 12, [7; 8], &public),
+                input_envelope: None,
+            },
+        );
+        let mut b1 = make_block(&gs.block, &mut ledger, vec![deploy, deploy_plain, call_tx.clone()], &key(1));
+        b1.receipts = probe.apply_block(&b1.block, &StubExecutor).unwrap();
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        (dir, st, pid, plain, call_tx, public)
+    }
+
+    /// A program's public input over the RPC: `rand_getProgram` gains its length and digest,
+    /// `rand_getProgramPublic` serves the words as hex of their little-endian bytes, and the
+    /// call's receipt carries `h_pub`. A program without one reports 0, `null` and `""`.
+    #[tokio::test]
+    async fn a_programs_public_input_is_served_with_its_digest_and_the_receipts_h_pub() {
+        let (_d, st, pid, plain, call_tx, public) = public_program_chain().await;
+        let digest = word8_to_hex(&StubExecutor.public_digest(&public));
+
+        let v = ok(&st, "rand_getProgram", json!([pid.to_hex()])).await;
+        assert_eq!(v["public_words_len"], 3);
+        assert_eq!(v["public_digest"], digest);
+        assert_eq!(v["words_len"], 4, "the existing fields are unchanged");
+        let v = ok(&st, "rand_getProgram", json!([plain.to_hex()])).await;
+        assert_eq!(v["public_words_len"], 0);
+        assert_eq!(v["public_digest"], Value::Null);
+
+        assert_eq!(ok(&st, "rand_getProgramPublic", json!([pid.to_hex()])).await, json!("0100000002000000efbeadde"));
+        assert_eq!(ok(&st, "rand_getProgramPublic", json!([plain.to_hex()])).await, json!(""));
+        assert_eq!(ok(&st, "rand_getProgramPublic", json!([Hash::ZERO.to_hex()])).await, Value::Null);
+        assert_eq!(call(&st, "rand_getProgramPublic", json!(["zz"])).await.unwrap_err().code, -32602);
+
+        let r = ok(&st, "rand_getReceipt", json!([call_tx.hash().to_hex()])).await;
+        assert_eq!(r["h_pub"], digest);
+
+        // A deploy transaction shows its public input's length beside its code's.
+        let block = st.storage.block_by_height(1).unwrap().unwrap();
+        let v = ok(&st, "rand_getTransaction", json!([block.transactions[0].hash().to_hex()])).await;
+        assert_eq!((&v["tx"]["action"]["kind"], &v["tx"]["action"]["program"]), (&json!("deploy"), &json!(pid.to_hex())));
+        assert_eq!((&v["tx"]["action"]["words"], &v["tx"]["action"]["public_words_len"]), (&json!(4), &json!(3)));
+        let v = ok(&st, "rand_getTransaction", json!([block.transactions[1].hash().to_hex()])).await;
+        assert_eq!(v["tx"]["action"]["public_words_len"], 0);
+    }
+
     #[tokio::test]
     async fn send_transaction_rejects_a_stale_anchor() {
         let (_d, st, gs) = chain();
@@ -2437,6 +2715,7 @@ mod tests {
         assert_eq!((&r["program"], &r["tier"], &r["height"]), (&json!(pid.to_hex()), &json!(12), &json!(1)));
         assert_eq!(r["h_in"], word8_to_hex(&h_in), "the receipt carries H_IN whether or not there is an envelope");
         assert!(r["kem_ct"].is_null(), "the transcript itself is a separate request");
+        assert!(r["h_pub"].is_null(), "a program without a public input has no H_PUB");
         let bare_receipt = ok(&st, "rand_getReceipt", json!([bare.hash().to_hex()])).await;
         assert_eq!(bare_receipt["h_in"], word8_to_hex(&[0; 8]));
 

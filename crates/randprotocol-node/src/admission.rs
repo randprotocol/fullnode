@@ -187,7 +187,7 @@ pub struct TokenBucket {
 /// that authored it — `NetworkEvent::Gossip.from` is the author and may be a peer we hold no
 /// connection to at all (see `node::Peer`'s doc comment, and `connected_peers` in `rand_status`).
 /// RPC submissions are not metered: that port is the operator's own and is bounded by
-/// `rpc::RPC_MAX_BODY_BYTES`.
+/// `rpc::RpcState::max_body_bytes`.
 pub struct PeerLimiter {
     burst: f64,
     per_sec: f64,

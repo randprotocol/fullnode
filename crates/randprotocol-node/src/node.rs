@@ -719,7 +719,9 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             status: status.clone(),
             node: cmd_tx,
             chain_id: gs.chain_id,
-            max_program_words: gs.ledger.max_program_words(),
+            // The RPC's limits follow the genesis (call limits spec §8), like the wire's above.
+            limits: rpc::ChainLimits::of(&gs.ledger),
+            max_body_bytes: rpc::ChainLimits::of(&gs.ledger).rpc_max_body_bytes(),
             executor: executor.clone(),
             heads: heads.clone(),
             commits: commits.clone(),
@@ -1059,7 +1061,7 @@ impl Node {
 
     /// An RPC submission takes the same queue as a gossiped transaction, with the caller's oneshot
     /// in place of a message id. Not metered: that port is the operator's own, and it is already
-    /// bounded by `rpc::RPC_MAX_BODY_BYTES`.
+    /// bounded by `RpcState::max_body_bytes`.
     async fn submit_tx(&mut self, tx: Transaction, reply: oneshot::Sender<Result<Hash, MempoolError>>) {
         let hash = tx.hash();
         let outcome = GossipOutcome::for_transaction(
