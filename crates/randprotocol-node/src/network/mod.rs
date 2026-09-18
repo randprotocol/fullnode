@@ -70,6 +70,13 @@ pub const SYNC_RESPONSE_WIRE_LIMIT: u64 = 2 * SYNC_MAX_WIRE_BYTES + (256 << 10);
 /// The reader limit on a sync *request*. A request is a height and a count, or a block hash.
 pub const SYNC_REQUEST_WIRE_LIMIT: u64 = 64 << 10;
 
+/// gossipsub's own transmit-size ceiling for this swarm (`start`, below): the largest message
+/// (a gossiped transaction, wrapped in [`GossipMessage`]) any peer will forward rather than drop.
+/// Named so a byte-budget test — e.g. `rpc::tests::a_deploy_at_the_zkvm_program_limit_fits_every_byte_cap`
+/// — can check the same number the swarm is actually configured with, instead of a copy of the
+/// literal that could drift from it.
+pub const GOSSIP_MAX_TRANSMIT_SIZE: usize = 16 << 20;
+
 /// How reachable an address a peer advertised for itself actually is, from our side of the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddrScope {
@@ -276,7 +283,7 @@ pub async fn start(
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_millis(500))
         .validation_mode(ValidationMode::Permissive)
-        .max_transmit_size(16 * 1024 * 1024)
+        .max_transmit_size(GOSSIP_MAX_TRANSMIT_SIZE)
         .message_id_fn(|m: &gossipsub::Message| MessageId::from(blake3::hash(&m.data).as_bytes().to_vec()))
         // Application-level validation: this node forwards a transaction only after it has
         // verified here, off the consensus loop. Local to this node — the wire is unchanged, so it

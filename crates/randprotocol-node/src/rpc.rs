@@ -1253,7 +1253,12 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                             st.max_program_words
                         )));
                     }
-                    randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: vec![0; words] })
+                    // `fee_floor(&Action::Deploy { words: vec![0; words], .. })` would compute the
+                    // same number, but only after allocating a throwaway `words`-long `Vec<u32>`
+                    // (up to `max_program_words`, i.e. up to 256 KiB) on every estimate call —
+                    // `deploy_fee` is the pure per-word term `fee_floor` itself adds to
+                    // `BUNDLE_BASE` for a deploy, so call it directly instead.
+                    randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::deploy_fee(words)
                 }
                 "call" => {
                     let Some(n) = spec.get("tier").and_then(|t| t.as_u64()) else {
@@ -3078,7 +3083,9 @@ mod tests {
     /// A deploy at the zkVM's own limit (`max_program_words` = 65 535, a v0.4 genesis's ceiling)
     /// fits every byte cap on its way to a block, even beside a bundle proof at the proof cap: the
     /// ledger's whole-transaction cap (`MAX_BLOCK_BYTES`, which is also the block's), the RPC
-    /// request body, and gossip's 16 MiB transmit size (`network::spawn`). So raising the program
+    /// request body, gossip's transmit size (`network::GOSSIP_MAX_TRANSMIT_SIZE`, `network::start`),
+    /// and the sync reader's limit on a `CommittedBlock` carrying it
+    /// (`network::SYNC_RESPONSE_WIRE_LIMIT`, `network::codec::cbor_size`). So raising the program
     /// cap needs no byte cap raised with it.
     #[test]
     fn a_deploy_at_the_zkvm_program_limit_fits_every_byte_cap() {
@@ -3095,7 +3102,24 @@ mod tests {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "rand_sendTransaction", "params": [hex::encode(&encoded)] });
         let posted = serde_json::to_vec(&body).unwrap().len();
         assert!(posted <= RPC_MAX_BODY_BYTES, "{posted} B posted against a {RPC_MAX_BODY_BYTES} B limit");
-        assert!(encoded.len() <= 16 * 1024 * 1024, "gossip carries bincode, under its 16 MiB transmit size");
+        assert!(
+            encoded.len() <= crate::network::GOSSIP_MAX_TRANSMIT_SIZE,
+            "gossip carries bincode, under its {} B transmit size",
+            crate::network::GOSSIP_MAX_TRANSMIT_SIZE
+        );
+
+        // The sync reader's limit: a peer catching up receives this transaction wrapped in a
+        // `CommittedBlock`, cbor-encoded (`network::codec`), not the bincode `encoded` above — a
+        // different wire form with its own overhead, so it gets its own assertion against its own
+        // limit rather than reusing `encoded.len()`.
+        let gs = fixtures::genesis(1);
+        let cb = make_block_unchecked(&gs.block, &gs.ledger, vec![tx], &key(1));
+        let wire = crate::network::codec::cbor_size(&cb).unwrap() as u64;
+        assert!(
+            wire <= crate::network::SYNC_RESPONSE_WIRE_LIMIT,
+            "{wire} B against the {} B sync reader limit",
+            crate::network::SYNC_RESPONSE_WIRE_LIMIT
+        );
     }
 
     /// The body limit is never the thing that refuses a transaction: it is wide enough for anything
