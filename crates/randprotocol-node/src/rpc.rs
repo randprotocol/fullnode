@@ -161,6 +161,22 @@ pub enum NodeCommand {
     /// `rand_getMempoolInfo`. Answered by the node loop rather than read from a shared snapshot
     /// because the pool itself lives there.
     MempoolInfo { reply: oneshot::Sender<crate::mempool::MempoolInfo> },
+    /// What the mempool and the refusal cache know about each hash, for `rand_getTransactionStatus`
+    /// — pooled, refused (with the admission reason), or neither. Storage's half of the answer
+    /// (committed, at a height and index) is read by the dispatcher itself; this only covers what
+    /// the node loop holds.
+    TxStatus { hashes: Vec<Hash>, reply: oneshot::Sender<Vec<PoolStatus>> },
+}
+
+/// The most hashes one `rand_getTransactionStatus` call may ask about.
+pub const MAX_STATUS_HASHES: usize = 64;
+
+/// What the node loop knows about a hash that storage does not: pooled, refused, or neither.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PoolStatus {
+    Pending,
+    Rejected(String),
+    Unknown,
 }
 
 /// The answer to [`NodeCommand::Epoch`]: the current epoch, its length, and the sets of this
@@ -1482,6 +1498,45 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let info = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
             Ok(serde_json::to_value(info).map_err(RpcError::internal)?)
         }
+        // Committed comes straight from storage; pending, rejected (with the admission reason)
+        // and unknown come from the node loop, which alone holds the mempool and the refused
+        // cache. A rejection is not permanent — the cache can evict — but a client polling
+        // `wait_for_transaction` sees it before that happens, which is the point.
+        "rand_getTransactionStatus" => {
+            let raw: Vec<String> = param(p, 0, "hashes")?;
+            if raw.is_empty() || raw.len() > MAX_STATUS_HASHES {
+                return Err(RpcError::invalid_params(format!(
+                    "hashes must hold 1 to {MAX_STATUS_HASHES} entries"
+                )));
+            }
+            let hashes = raw
+                .iter()
+                .map(|s| Hash::from_hex(s).map_err(|e| RpcError::invalid_params(format!("hash: {e}"))))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (reply, rx) = oneshot::channel();
+            st.node
+                .send(NodeCommand::TxStatus { hashes: hashes.clone(), reply })
+                .await
+                .map_err(|_| RpcError::internal("node loop closed"))?;
+            let pool = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
+            let mut out = Vec::with_capacity(hashes.len());
+            for (h, ps) in hashes.iter().zip(pool) {
+                let entry = match st.storage.tx_location(h).map_err(RpcError::internal)? {
+                    Some((height, index)) => {
+                        json!({ "hash": h.to_hex(), "status": "committed", "height": height, "index": index })
+                    }
+                    None => match ps {
+                        PoolStatus::Pending => json!({ "hash": h.to_hex(), "status": "pending" }),
+                        PoolStatus::Rejected(reason) => {
+                            json!({ "hash": h.to_hex(), "status": "rejected", "reason": reason })
+                        }
+                        PoolStatus::Unknown => json!({ "hash": h.to_hex(), "status": "unknown" }),
+                    },
+                };
+                out.push(entry);
+            }
+            Ok(Value::Array(out))
+        }
         // The supply audit (`ledger::supply`). Note values are hidden, but every crossing of the
         // pool's boundary is public, so this is exact rather than an estimate — and
         // `--verify-chain` recomputes every counter in it by replaying the chain.
@@ -1567,6 +1622,21 @@ mod tests {
                             oldest_ms: Some(5),
                             max_count: 10_000,
                         });
+                    }
+                    NodeCommand::TxStatus { hashes, reply } => {
+                        let out = hashes
+                            .iter()
+                            .map(|h| {
+                                if *h == Hash([0xAA; 32]) {
+                                    PoolStatus::Pending
+                                } else if *h == Hash([0xBB; 32]) {
+                                    PoolStatus::Rejected("nullifier already spent".into())
+                                } else {
+                                    PoolStatus::Unknown
+                                }
+                            })
+                            .collect();
+                        let _ = reply.send(out);
                     }
                     _ => {}
                 }
@@ -2265,6 +2335,31 @@ mod tests {
         let (_d, st) = state_for(&gs);
         let v = ok(&st, "rand_getMempoolInfo", json!([])).await;
         assert_eq!(v, json!({ "count": 2, "bytes": 100, "oldest_ms": 5, "max_count": 10_000 }));
+    }
+
+    /// Four hashes, four outcomes: committed (found in storage), pending and rejected (the
+    /// node loop's stub answers, keyed by the `0xAA`/`0xBB` fixture bytes), and unknown (neither).
+    #[tokio::test]
+    async fn get_transaction_status_distinguishes_committed_pending_rejected_unknown() {
+        let (_d, storage, gs, blocks) = fixtures::chain_fixture(1);
+        let st = state_over(Arc::new(storage), &gs);
+        let committed = blocks[0].block.transactions[0].hash();
+        let v = ok(
+            &st,
+            "rand_getTransactionStatus",
+            json!([[committed.to_hex(), Hash([0xAA; 32]).to_hex(), Hash([0xBB; 32]).to_hex(), Hash([0xCC; 32]).to_hex()]]),
+        )
+        .await;
+        assert_eq!(v[0]["status"], "committed");
+        assert_eq!(v[0]["height"], 1);
+        assert_eq!(v[0]["index"], 0);
+        assert_eq!(v[1]["status"], "pending");
+        assert_eq!(v[2]["status"], "rejected");
+        assert_eq!(v[2]["reason"], "nullifier already spent");
+        assert_eq!(v[3]["status"], "unknown");
+        assert_eq!(v[3]["hash"], Hash([0xCC; 32]).to_hex());
+        let many: Vec<String> = (0..65).map(|i| Hash([i as u8; 32]).to_hex()).collect();
+        assert_eq!(call(&st, "rand_getTransactionStatus", json!([many])).await.err().unwrap().code, -32602);
     }
 
     /// The supply audit: hidden note values, public boundary crossings. The one number that

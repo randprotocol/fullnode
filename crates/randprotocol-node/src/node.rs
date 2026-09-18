@@ -1252,6 +1252,21 @@ impl Node {
             NodeCommand::MempoolInfo { reply } => {
                 let _ = reply.send(self.mempool.info(Instant::now()));
             }
+            NodeCommand::TxStatus { hashes, reply } => {
+                let out = hashes
+                    .iter()
+                    .map(|h| {
+                        if self.mempool.contains(h) {
+                            rpc::PoolStatus::Pending
+                        } else if let Some(e) = self.refused.get(h) {
+                            rpc::PoolStatus::Rejected(e.to_string())
+                        } else {
+                            rpc::PoolStatus::Unknown
+                        }
+                    })
+                    .collect();
+                let _ = reply.send(out);
+            }
         }
         Ok(())
     }

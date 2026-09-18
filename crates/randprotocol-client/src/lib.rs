@@ -65,6 +65,11 @@ fn envelope_at(v: &Value) -> Result<Envelope> {
 pub struct RpcClient {
     url: String,
     http: reqwest::Client,
+    /// Set on the first `-32601` `rand_getTransactionStatus` reply: this node predates v0.4, so
+    /// `wait_for_transaction` stops asking for it and falls back to the pre-v0.4
+    /// `rand_getTransaction` polling loop instead of paying for a round trip to a method the
+    /// node does not have on every subsequent call.
+    legacy_status: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +118,7 @@ impl RpcClient {
             // The per-request timeout for an upload is set on the request itself, which overrides
             // this one; this is the read timeout.
             http: reqwest::Client::builder().timeout(READ_TIMEOUT).build().expect("client"),
+            legacy_status: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -194,8 +200,65 @@ impl RpcClient {
         }))
     }
 
-    /// Poll until the transaction is committed or `timeout` elapses.
+    /// `rand_getTransactionStatus`: committed (with height and index), pending, rejected (with the
+    /// admission reason), or unknown, one entry per hash asked about. Kept as raw `Value`s —
+    /// `wait_for_transaction` is the only caller today, and it only ever reads
+    /// `status`/`reason`/`hash`.
+    pub async fn transaction_status(&self, hashes: &[Hash]) -> Result<Vec<Value>> {
+        let v = self
+            .call("rand_getTransactionStatus", json!([hashes.iter().map(|h| h.to_hex()).collect::<Vec<_>>()]))
+            .await?;
+        v.as_array().cloned().context("status list")
+    }
+
+    /// Poll until the transaction is committed, fails fast on a rejection, or `timeout` elapses.
+    ///
+    /// A rejection — a double-spent nullifier, say — is permanent, so there is no reason to keep
+    /// polling until `timeout`: `rand_getTransactionStatus` reports it directly, with the
+    /// admission reason, and this returns as soon as it sees one. Against a node older than
+    /// v0.4, which has no such method and answers `-32601`, it falls back to the old
+    /// `rand_getTransaction` loop for good — `legacy_status` remembers that so later calls do
+    /// not pay for the round trip that will only fail again.
     pub async fn wait_for_transaction(&self, hash: &Hash, timeout: Duration) -> Result<TxReceipt> {
+        use std::sync::atomic::Ordering;
+
+        if self.legacy_status.load(Ordering::Relaxed) {
+            return self.wait_for_transaction_legacy(hash, timeout).await;
+        }
+        let start = Instant::now();
+        loop {
+            let status = match self.transaction_status(std::slice::from_ref(hash)).await {
+                Ok(s) => s,
+                Err(e) if e.to_string().contains("(rpc -32601)") => {
+                    self.legacy_status.store(true, Ordering::Relaxed);
+                    return self.wait_for_transaction_legacy(hash, timeout).await;
+                }
+                Err(e) => return Err(e),
+            };
+            match status.first().and_then(|s| s["status"].as_str()) {
+                Some("committed") => {
+                    if let Some(r) = self.transaction(hash).await? {
+                        return Ok(r);
+                    }
+                }
+                Some("rejected") => {
+                    let reason = status[0]["reason"].as_str().unwrap_or("refused");
+                    return Err(anyhow!("transaction {hash} rejected: {reason}"));
+                }
+                _ => {}
+            }
+            if start.elapsed() > timeout {
+                return Err(anyhow!("transaction {hash} not committed within {timeout:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    /// The pre-v0.4 wait: poll `rand_getTransaction` until it is committed or `timeout` elapses.
+    /// It never sees a rejection — that node has nowhere to report one — so it can only time out.
+    /// Shared by [`wait_for_transaction`](Self::wait_for_transaction)'s legacy fallback, so the
+    /// two paths keep one loop body between them.
+    async fn wait_for_transaction_legacy(&self, hash: &Hash, timeout: Duration) -> Result<TxReceipt> {
         let start = Instant::now();
         loop {
             if let Some(r) = self.transaction(hash).await? {
@@ -612,5 +675,33 @@ mod tests {
             seen.load(std::sync::atomic::Ordering::SeqCst) >= posted - 1024,
             "the server should have received the whole body"
         );
+    }
+
+    // ------------------------------------------------- the transaction-status fast fail
+    //
+    // A rejection (a double-spent nullifier, say) is permanent: `wait_for_transaction` should
+    // report it as soon as `rand_getTransactionStatus` says so, rather than polling until its
+    // timeout as the pre-v0.4 client did.
+
+    #[tokio::test]
+    async fn wait_for_transaction_fails_fast_on_a_rejected_status() {
+        let hash = Hash([9u8; 32]);
+        let reply = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":[{{"hash":"{}","status":"rejected","reason":"nullifier already spent"}}]}}"#,
+            hash.to_hex()
+        );
+        // `slow_server` answers one connection with one canned reply — exactly what this needs:
+        // `wait_for_transaction` returns on the very first status call, so there is no second
+        // request to answer.
+        let (url, _seen) = slow_server(Duration::ZERO, Box::leak(reply.into_boxed_str())).await;
+        let client = RpcClient::new(url);
+
+        let timeout = Duration::from_secs(5);
+        let started = Instant::now();
+        let err = client.wait_for_transaction(&hash, timeout).await.unwrap_err();
+        let waited = started.elapsed();
+
+        assert!(err.to_string().contains("rejected: nullifier already spent"), "{err}");
+        assert!(waited < timeout, "should fail fast, not wait out the timeout: {waited:?}");
     }
 }
