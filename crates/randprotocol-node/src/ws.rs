@@ -684,11 +684,11 @@ mod tests {
         assert!(subs.is_empty(), "delivered once, then gone");
 
         let id = sub(&mut subs, &mut next, json!(["transaction", h.to_hex()]));
-        let frames = refusal_frames(&mut subs, &h, "nullifier already spent");
+        let frames = refusal_frames(&mut subs, &h, "bad mint signature");
         assert_eq!(frames.len(), 1);
         let f: Value = serde_json::from_str(&frames[0]).unwrap();
         assert_eq!(f["params"]["subscription"], id);
-        assert_eq!(f["params"]["result"]["reason"], "nullifier already spent");
+        assert_eq!(f["params"]["result"]["reason"], "bad mint signature");
         assert!(subs.is_empty());
         assert!(refusal_frames(&mut subs, &Hash([1; 32]), "x").is_empty());
     }

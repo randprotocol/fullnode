@@ -1556,7 +1556,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         }
         // Committed comes straight from storage; pending, rejected (with the admission reason)
         // and unknown come from the node loop, which alone holds the mempool and the refused
-        // cache. A rejection is not permanent — the cache can evict — but a client polling
+        // cache. That cache holds only refusals about the transaction's own bytes
+        // (`admission::is_permanent`); a state-dependent one (a spent nullifier, an expired
+        // anchor) is never remembered and reads `unknown` once the transaction is out of the pool.
+        // Nor is a rejection kept forever — the cache can evict — but a client polling
         // `wait_for_transaction` sees it before that happens, which is the point.
         "rand_getTransactionStatus" => {
             let raw: Vec<String> = param(p, 0, "hashes")?;
@@ -1792,7 +1795,7 @@ mod tests {
                                 if *h == Hash([0xAA; 32]) {
                                     PoolStatus::Pending
                                 } else if *h == Hash([0xBB; 32]) {
-                                    PoolStatus::Rejected("nullifier already spent".into())
+                                    PoolStatus::Rejected("bad mint signature".into())
                                 } else {
                                     PoolStatus::Unknown
                                 }
@@ -2532,7 +2535,7 @@ mod tests {
         assert_eq!(v[0]["index"], 0);
         assert_eq!(v[1]["status"], "pending");
         assert_eq!(v[2]["status"], "rejected");
-        assert_eq!(v[2]["reason"], "nullifier already spent");
+        assert_eq!(v[2]["reason"], "bad mint signature");
         assert_eq!(v[3]["status"], "unknown");
         assert_eq!(v[3]["hash"], Hash([0xCC; 32]).to_hex());
         let many: Vec<String> = (0..65).map(|i| Hash([i as u8; 32]).to_hex()).collect();

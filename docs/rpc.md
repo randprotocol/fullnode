@@ -603,14 +603,29 @@ Params: `[[hash, …]]`, 1 to 64 hashes. Result: one entry per hash, in order:
 ```json
 [ { "hash": "…", "status": "committed", "height": 1998, "index": 0 },
   { "hash": "…", "status": "pending" },
-  { "hash": "…", "status": "rejected", "reason": "nullifier already spent" },
+  { "hash": "…", "status": "rejected", "reason": "bad mint signature" },
   { "hash": "…", "status": "unknown" } ]
 ```
 Lookup order per hash: committed (storage), then pending (the mempool), then rejected (the refused
 cache — the same cache `rand_status`'s `refused_cache` counts), else `unknown`. A hash this node
 never saw and one a peer refused both read `unknown`; that is honest, since a wallet's submit goes
-to one node, not to every node that might have an opinion. A rejection is not permanent — the
+to one node, not to every node that might have an opinion. A rejection is not kept forever — the
 cache evicts at 8192 entries — but a client polling sees it long before that.
+
+**`rejected` covers refusals about the transaction's own bytes only** — the ones no later block can
+change (`admission::is_permanent`): an invalid bundle, call or aggregate proof; a bundle digest that
+is not what its proof published; a bad mint signature or a malformed program; the wrong chain id; a
+bundle on an action that must not carry one, or none where one is required; an envelope, proof,
+attestation, program, aggregate or whole transaction over its size cap; a nullifier or commitment
+repeated inside the transaction itself; a burn or bridge attestation inconsistent with itself; and
+an aggregate's own signature and cover-set verdicts (empty, too many, duplicated, an unregistered or
+mismatched shape or guest, a cover that is not a bundle or is already sealed). A refusal that
+depends on this node's state at that moment — a spent nullifier, a commitment already in the tree,
+an anchor or `time` outside the window, a fee below the floor, an unknown program, the staking and
+aggregator registers — is **not** remembered: a double-spend refused at submit reads `unknown`
+straight away (the submitter got the reason as `rand_sendTransaction`'s error), and a pooled
+transaction that a block makes unspendable reads `pending` and then `unknown` once it leaves the
+pool.
 
 `randprotocol_client::RpcClient::wait_for_transaction` calls this method and fails as soon as a
 poll reads `rejected`, rather than waiting out its timeout on a transaction that is never coming
@@ -746,7 +761,11 @@ Three topics exist:
 - **`transaction <hash>`** — one notification for that hash, then the node removes the
   subscription itself: `{ "status": "committed", "height", "index" }` on commit, or
   `{ "status": "rejected", "reason" }` when this node refuses it for good — the same reason
-  `rand_getTransactionStatus` would report, from the same refused cache. A hash that had
+  `rand_getTransactionStatus` would report, from the same refused cache, so the same limit: only
+  a refusal about the transaction's own bytes (a bad proof, digest or signature, the wrong chain,
+  an oversize part) is announced. A state-dependent refusal — a spent nullifier, an expired
+  anchor — is not, and neither is a transaction pruned from the pool; the subscription then waits
+  until the socket closes, so pair it with your own timeout. A hash that had
   **already** committed or been refused when the subscribe request arrived is not answered
   synchronously in the subscribe reply; it is answered on the next committed block, exactly like a
   hash that settles afterwards, so a client has one code path whether it subscribes before or

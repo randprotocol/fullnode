@@ -213,9 +213,12 @@ impl RpcClient {
 
     /// Poll until the transaction is committed, fails fast on a rejection, or `timeout` elapses.
     ///
-    /// A rejection — a double-spent nullifier, say — is permanent, so there is no reason to keep
-    /// polling until `timeout`: `rand_getTransactionStatus` reports it directly, with the
-    /// admission reason, and this returns as soon as it sees one. Against a node older than
+    /// A rejection — a bad proof or mint signature, say — is permanent, so there is no reason to
+    /// keep polling until `timeout`: `rand_getTransactionStatus` reports it directly, with the
+    /// admission reason, and this returns as soon as it sees one. Only refusals about the
+    /// transaction's own bytes are reported that way: one that depends on the node's state (a
+    /// spent nullifier, an expired anchor) is not remembered, reads `unknown` once the
+    /// transaction leaves the pool, and so still runs to `timeout` here. Against a node older than
     /// v0.3, which has no such method and answers `-32601`, it falls back to the old
     /// `rand_getTransaction` loop for good — `legacy_status` remembers that so later calls do
     /// not pay for the round trip that will only fail again.
@@ -679,15 +682,15 @@ mod tests {
 
     // ------------------------------------------------- the transaction-status fast fail
     //
-    // A rejection (a double-spent nullifier, say) is permanent: `wait_for_transaction` should
-    // report it as soon as `rand_getTransactionStatus` says so, rather than polling until its
-    // timeout as the pre-v0.3 client did.
+    // A rejection (a bad mint signature, say — a refusal about the transaction's own bytes) is
+    // permanent: `wait_for_transaction` should report it as soon as `rand_getTransactionStatus`
+    // says so, rather than polling until its timeout as the pre-v0.3 client did.
 
     #[tokio::test]
     async fn wait_for_transaction_fails_fast_on_a_rejected_status() {
         let hash = Hash([9u8; 32]);
         let reply = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"result":[{{"hash":"{}","status":"rejected","reason":"nullifier already spent"}}]}}"#,
+            r#"{{"jsonrpc":"2.0","id":1,"result":[{{"hash":"{}","status":"rejected","reason":"bad mint signature"}}]}}"#,
             hash.to_hex()
         );
         // `slow_server` answers one connection with one canned reply — exactly what this needs:
@@ -701,7 +704,7 @@ mod tests {
         let err = client.wait_for_transaction(&hash, timeout).await.unwrap_err();
         let waited = started.elapsed();
 
-        assert!(err.to_string().contains("rejected: nullifier already spent"), "{err}");
+        assert!(err.to_string().contains("rejected: bad mint signature"), "{err}");
         assert!(waited < timeout, "should fail fast, not wait out the timeout: {waited:?}");
     }
 }
