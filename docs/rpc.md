@@ -661,7 +661,8 @@ Params: `[[index, …]]`, 1 to 32 leaf indices. Result:
 `rand_getWitness` folded over many leaves in one tree build: a wallet proving several notes at once
 pays for the rebuild once instead of once per note. An index past the end of the tree reads
 `path: null` for that entry rather than failing the whole call. `rand_getWitness` is unchanged and
-is implemented as this call's one-index case.
+is not implemented through this call: it keeps its own arm and its own one-leaf tree build
+(`Storage::witness`), and still answers `null` for an index past the tree.
 
 Errors: `-32602` for an empty list or more than 32 indices.
 
@@ -690,8 +691,9 @@ Params: `[height]` or `[hash]`. Result, one of:
 `committed` is a block at or below the committed head — the only answer a height can give, since
 two proposals can share an uncommitted height, so a height is only ever checked against the
 committed chain. A hash can also read `certified` (in HotStuff's uncommitted tree with a quorum
-certificate for it — `high_qc`, `locked_qc`, or a child's `justify`) or `proposed` (in the tree
-without one yet); `unknown` is a hash this replica's tree has never held.
+certificate for it — `high_qc`, `locked_qc`, the committed head's `head_qc`, or a child's
+`justify`) or `proposed` (in the tree without one yet); `unknown` is a hash this replica's tree has
+never held.
 
 Errors: `-32602` for a missing param 0, or one that is neither a height nor a block hash.
 
@@ -814,9 +816,9 @@ This endpoint is unauthenticated, so it is bounded four ways:
 - **8 subscriptions per connection.** The ninth `rand_subscribe` is `-32000`; the eight it holds
   are untouched.
 - **64 KiB per frame from the client.** A larger frame is refused and the socket ends. (This is a
-  bound on what the node will *read*; what it writes is a request reply or a head notification,
-  neither of which comes near it.) Proof-carrying bodies go to `POST /`, which has its own much
-  larger limit.
+  bound on what the node will *read*; what it writes is a request reply or a `newHeads`,
+  `receipts` or `transaction` notification, none of which comes near it.) Proof-carrying bodies go
+  to `POST /`, which has its own much larger limit.
 - **5 seconds to take a frame, and a ping every 30 seconds.** A write that does not complete in
   5 s means a client that has stopped reading, and the socket is dropped rather than written to
   again. Without that deadline the node's task parks in the kernel's send buffer until the link is
