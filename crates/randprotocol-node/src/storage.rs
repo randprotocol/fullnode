@@ -1169,8 +1169,10 @@ impl Storage {
     /// no other node recognises. Rebuilding a `FullTree` from the leaves is `O(leaves)` hashing,
     /// paid once at startup.
     ///
-    /// The faucet and confidential switches come from genesis, not from storage, so the caller
-    /// sets them afterwards.
+    /// The genesis parameters — the faucet and confidential switches, `epoch_blocks` and
+    /// `max_program_words` — come from the genesis file, not from storage, so the ledger this
+    /// returns carries their defaults. It is not a ledger to run a chain on:
+    /// [`crate::node::reload_ledger`] is the one way to get a runnable one, and it sets them.
     pub fn load_ledger(&self, executor: &dyn ConfidentialExecutor) -> Result<Ledger> {
         let chain_id = self.chain_id()?;
         let hc_bundle = self.hc_bundle()?;
@@ -1968,6 +1970,16 @@ pub(crate) mod fixtures {
         alloc: Vec<GenesisNote>,
         epoch_blocks: u64,
     ) -> GenesisState {
+        genesis_file_of(chain_id, validators, alloc, epoch_blocks).build(&StubExecutor).unwrap()
+    }
+
+    /// The genesis file [`genesis_of`] builds, for a test that needs to set a field first.
+    pub(crate) fn genesis_file_of(
+        chain_id: u64,
+        validators: &[&Keypair],
+        alloc: Vec<GenesisNote>,
+        epoch_blocks: u64,
+    ) -> Genesis {
         Genesis {
             chain_id,
             timestamp_ms: 0,
@@ -1990,8 +2002,6 @@ pub(crate) mod fixtures {
             epoch_blocks,
             max_program_words: None,
         }
-        .build(&StubExecutor)
-        .unwrap()
     }
 
     /// A chain with no alloc notes: the empty tree.
@@ -2566,6 +2576,55 @@ mod tests {
         assert_eq!(reloaded, ledger);
         assert_eq!(reloaded.state_root(), ledger.state_root());
         assert!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().is_ok());
+    }
+
+    /// A v0.4 chain's raised program cap holds through replay and restart. The block below
+    /// carries a deploy only a raised cap admits, so `verify_chain` passing proves the replay
+    /// starts from the genesis ledger (which carries the cap) rather than from `load_ledger`
+    /// (which comes back at 4 096 words), and `reload_ledger` admitting a second one proves a
+    /// restarted node runs the genesis cap too — either one missed forks the node off at the
+    /// first large program.
+    #[test]
+    fn a_raised_program_cap_holds_through_replay_and_restart() {
+        let mut file = genesis_file_of(
+            7,
+            &[&key(1)],
+            vec![alloc_note(20, 1_000), alloc_note(21, 2_000)],
+            randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
+        );
+        file.max_program_words = Some(65_535);
+        let gs = file.build(&StubExecutor).unwrap();
+        assert_eq!(gs.ledger.max_program_words(), 65_535);
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        s.init_genesis(&gs).unwrap();
+
+        let deploy_tx = |ledger: &Ledger, seed: u32, word: u32| {
+            let action = Action::Deploy { base_pc: 0, words: vec![word; 5_000] };
+            let fee = randprotocol_core::gas::fee_floor(&action);
+            let b = bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], fee);
+            Transaction::shielded(ledger.chain_id(), b, action)
+        };
+        let proposer = key(1);
+        let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+        let tx = deploy_tx(&ledger, 1, 0x13);
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &proposer);
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(ledger.programs().len(), 1, "the 5 000-word program landed");
+
+        // The stored snapshot alone is at the default: this is what replay must not start from.
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap().max_program_words(), randprotocol_core::gas::MAX_PROGRAM_WORDS);
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(check.is_ok(), "replay refused the chain's own block: {:?}", check.problem);
+        assert_eq!(check.last_good, 1);
+
+        let mut reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.max_program_words(), 65_535);
+        reloaded.set_height(2);
+        // A different program (`addi x0, x0, 1`), so it is a new deploy rather than a no-op.
+        let again = deploy_tx(&reloaded, 10, 0x0010_0013);
+        assert_eq!(reloaded.validate(&again, &StubExecutor), Ok(()));
     }
 
     /// A faucet mint creates its note through the action rather than a bundle slot, and the row

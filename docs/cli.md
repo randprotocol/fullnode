@@ -52,15 +52,17 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--chain-id <CHAIN_ID>` | `1` | chain id; transactions and gossip topics are bound to it |
 | `--validator <KEY,STAKE,PAYOUT>` | required, repeatable | one register entry: key file path **or** hex public key, the stake in RAND (at least 1000, the staking minimum), and the `rand1…` address its rewards and unbonded stake are paid to |
 | `--epoch-blocks <N>` | `1000` | blocks per epoch: how often the validator set is re-derived from the register (spec §8). Part of the genesis hash |
-| `--max-program-words <N>` | none (4096) | the largest program a `Deploy` may carry, in words, `1..=65535` (the zkVM's own limit). Omitted, the file has no `max_program_words` field and the chain runs the 4096-word cap with the genesis hash it always had; given, the field is written and is part of the genesis hash |
+| `--max-program-words <N>` | none (4096) | the largest program a `Deploy` may carry, in words, `1..=65535` (the zkVM's own limit). Omitted, the file has no `max_program_words` field and the chain runs the 4096-word cap with the genesis hash it always had. `--max-program-words 4096` (or `"max_program_words": 4096`) is a different chain from leaving the field out: the field is part of the genesis hash whenever it is present. Omit it to keep a chain's hash. Every node must run a build that knows the field (v0.4) before `init` on such a file — see `rand-node init` |
 | `--alloc <ALLOCS>` | none, repeatable | a deposit note: `rand1<address>=<amount in RAND>` |
 | `--out <OUT>` | `genesis.json` | output path |
 | `--faucet` | off | **testnet only**: enable `Mint` transactions (`rand_mint`, up to 100 RAND per call). Part of the genesis hash |
 | `--no-confidential` | off | disable Deploy/Call transactions on this chain. Part of the genesis hash |
 | `--fri-profile <production\|test>` | `production` | zkVM FRI profile every node must use; `test` is insecure and for the test suite. Part of the genesis hash |
 
-Prints the genesis hash, the validator and note counts, the epoch length and `hc_bundle`. Every
-node of a chain must use a byte-identical genesis file.
+Prints one `alloc` line per `--alloc`, then the genesis hash, the validator and note counts, the
+blocks per epoch, the program cap (`programs up to N words`: 4096 unless `--max-program-words` set
+it), the faucet and confidential switches, the FRI profile and `hc_bundle`. Every node of a chain
+must use a byte-identical genesis file.
 
 There is no `--alloc-each`: a shielded chain has no per-validator allocation, because value only
 exists as a note someone holds the spend key for. Each `--alloc` builds one deposit note with
@@ -97,7 +99,9 @@ Genesis JSON shape:
 `bridge` is the one optional field this command never writes (add it by hand, as above); every
 other field it writes, `epoch_blocks` included. `max_program_words` (a number) is written only with
 `--max-program-words`, and `aggregation` only with `--aggregation`; a file without them hashes as it
-did before those fields existed.
+did before those fields existed. `--max-program-words 4096` (or `"max_program_words": 4096`) is a
+different chain from leaving the field out: the field is part of the genesis hash whenever it is
+present. Omit it to keep a chain's hash.
 
 Both `amount` and a validator's `stake` are in smallest units, and both are public: they are what
 let everyone add up the initial supply (`docs/supply.md`). Who owns a note is not — only the address
@@ -185,6 +189,12 @@ shape bytes) once the sealing window passes.
 Creates `<datadir>/db` (RocksDB) with block 0, the deposit notes as the tree's first leaves, and
 the validator register. Re-running with the same genesis is a no-op; a different genesis is
 refused.
+
+**A v0.4 genesis needs a v0.4 binary on every node before `init`.** A build older than the
+`max_program_words` field does not refuse a file that sets it: the genesis parser ignores fields
+it does not know, so it silently drops the cap, builds the no-cap chain's genesis hash and ledger,
+and then cannot join — its block 0 is not the fleet's. Check the hash `init` prints against the
+one the cut announced; a mismatch on one node is almost always an old binary.
 
 ### `rand-node run`
 

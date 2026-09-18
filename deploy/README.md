@@ -174,7 +174,10 @@ collide.
    at the pinned commit; the Linux ones are built once on E and fanned out by
    `deploy/cutover-droplet.sh` at a chain cut, or by `deploy/update-droplet.sh` for a
    same-chain binary update). Every node on the fleet must run this one build — a genesis
-   format change is a fork, and a mixed fleet stalls.
+   format change is a fork, and a mixed fleet stalls. From the v0.4 chain on, whose genesis
+   sets `max_program_words`, the binary must be a v0.4 build **before** `init`: an older one
+   silently drops the field it does not know, builds a different genesis hash and fails to join
+   (`docs/cli.md`, `rand-node init`).
 2. **Genesis**: `deploy/genesis-chain12.json`, byte-identical everywhere. `rand-node init` prints
    the hash; it must read `605eb7830963833ef897455b98cd2a641aec58e0291460898a5d19ab88760ef0`, and
    the file has no `receivers` array.
