@@ -286,6 +286,97 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------- keys a holder hands out
+
+impl Wallet {
+    /// This wallet's viewing key `nk` as 64 hex — exactly the parameter `rand_importViewingKey`
+    /// takes. It is one hash below the spend key (`docs/shielded.md` §1): it opens every note this
+    /// wallet has sent or received, and it can spend none of them.
+    pub fn viewing_key_hex(&self) -> String {
+        word8_to_hex(&self.vk.nk)
+    }
+}
+
+/// How one output of a transaction relates to the wallet looking at it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyRole {
+    /// This wallet sealed it for someone else: a payment.
+    Sent,
+    /// Someone else sealed it to this wallet, and the note names this wallet's `pk`.
+    Received,
+    /// This wallet sealed it to itself: change, or a merge.
+    Change,
+}
+
+impl KeyRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyRole::Sent => "sent",
+            KeyRole::Received => "received",
+            KeyRole::Change => "change",
+        }
+    }
+}
+
+/// One output of a transaction this wallet can open, with the per-transaction key its envelope
+/// was sealed under. Handing `key` to anyone discloses exactly this output (`rand_checkTransaction`)
+/// and nothing else the wallet holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputKey {
+    /// `bundle`, `asset_bundle` or `mint` — the same names `rand_checkTransaction` reports.
+    pub output: &'static str,
+    pub slot: u8,
+    pub cm: Word8,
+    pub role: KeyRole,
+    pub note: Note,
+    pub key: TxKey,
+}
+
+/// Every output of `tx` that carries a commitment and its envelope together, in the order and
+/// under the names `rand_checkTransaction` uses. A bridge deposit is not here: its commitment is
+/// derived by the ledger, not carried by the transaction.
+fn sealed_outputs(tx: &Transaction) -> Vec<(&'static str, u8, Word8, &Envelope)> {
+    let mut out = Vec::new();
+    if let Some(b) = &tx.bundle {
+        for (i, (cm, e)) in b.commitments.iter().zip(&b.envelopes).enumerate() {
+            out.push(("bundle", i as u8, *cm, e));
+        }
+    }
+    match &tx.action {
+        Action::BridgeBurn { asset_bundle, .. } => {
+            for (i, (cm, e)) in asset_bundle.commitments.iter().zip(&asset_bundle.envelopes).enumerate() {
+                out.push(("asset_bundle", i as u8, *cm, e));
+            }
+        }
+        Action::Mint { cm, envelope, .. } => out.push(("mint", 0, *cm, envelope)),
+        _ => {}
+    }
+    out
+}
+
+/// The per-transaction key of every output of `tx` this wallet sent or received, recovered from
+/// the chain alone. Nothing is stored at send time: each envelope carries its key twice — under
+/// the receiver's KEM secret and under the sender's `ovk` — so the sender reopens it through
+/// `ovk` and the receiver through the KEM, and both arrive at the same key.
+pub fn output_keys(w: &Wallet, tx: &Transaction) -> Vec<OutputKey> {
+    let mut rows = Vec::new();
+    for (output, slot, cm, e) in sealed_outputs(tx) {
+        let env = envelope_from_core(e);
+        // Opening under the KEM is not ownership (see [`Found`]): only a note naming this
+        // wallet's `pk` is received.
+        let received = env.open_as_receiver(cm, &w.vk).filter(|(_, n)| n.pk == w.vk.pk());
+        let sent = env.open_as_sender(cm, &w.vk);
+        let (role, (key, note)) = match (received, sent) {
+            (Some(r), Some(_)) => (KeyRole::Change, r),
+            (Some(r), None) => (KeyRole::Received, r),
+            (None, Some(s)) => (KeyRole::Sent, s),
+            (None, None) => continue,
+        };
+        rows.push(OutputKey { output, slot, cm, role, note, key });
+    }
+    rows
+}
+
 // ---------------------------------------------------------------- scanning
 
 /// What one leaf turned out to be for this wallet.
@@ -1925,4 +2016,77 @@ mod tests {
         assert_eq!(back.sent[0].amount, 11);
         assert_eq!(back.balance(), 5);
     }
+
+    // ---------------------------------------------------------------- keys a holder hands out
+
+    #[test]
+    fn the_viewing_key_is_nk_as_the_node_imports_it() {
+        let w = Wallet::from_spend_key(SpendKey([11; 8]));
+        let hex = w.viewing_key_hex();
+        assert_eq!(hex.len(), 64);
+        assert_eq!(word8_from_hex(&hex), Some(w.vk.nk), "rand_importViewingKey parses exactly this");
+        assert_ne!(hex, Wallet::from_spend_key(SpendKey([12; 8])).viewing_key_hex());
+    }
+
+    /// A payment from `me` to `you` with change back to `me`, each output under its own key.
+    fn payment(me: &Wallet, you: &Wallet) -> (Transaction, TxKey, TxKey, Note, Note) {
+        let pay = Note::new(you.vk.pk(), me.vk.pk(), 7, 0, 1);
+        let change = Note::new(me.vk.pk(), me.vk.pk(), 3, 0, 1);
+        let (k_pay, k_change) = (TxKey::random(), TxKey::random());
+        let bundle = Bundle {
+            anchor: [0; 8],
+            nullifiers: [[1; 8], [2; 8]],
+            commitments: [pay.commitment(), change.commitment()],
+            fee: 1,
+            burn: 0,
+            asset: 0,
+            time: 1,
+            envelopes: [
+                seal_note(&me.vk, &you.address, &pay, &k_pay).unwrap(),
+                seal_note(&me.vk, &me.address, &change, &k_change).unwrap(),
+            ],
+            proof: vec![],
+        };
+        (Transaction::shielded(7, bundle, Action::None), k_pay, k_change, pay, change)
+    }
+
+    #[test]
+    fn the_sender_recovers_each_outputs_key_from_the_chain_alone() {
+        let (me, you) = (Wallet::from_spend_key(SpendKey([11; 8])), Wallet::from_spend_key(SpendKey([12; 8])));
+        let (tx, k_pay, k_change, pay, change) = payment(&me, &you);
+        let rows = output_keys(&me, &tx);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!((rows[0].output, rows[0].slot, rows[0].role), ("bundle", 0, KeyRole::Sent));
+        assert_eq!((rows[0].key, rows[0].note.clone()), (k_pay, pay.clone()));
+        assert_eq!((rows[1].output, rows[1].slot, rows[1].role), ("bundle", 1, KeyRole::Change));
+        assert_eq!((rows[1].key, rows[1].note.clone()), (k_change, change));
+        // The recovered key is the disclosure key: it opens that output and no other.
+        let env = envelope_from_core(&tx.bundle.as_ref().unwrap().envelopes[0]);
+        assert_eq!(env.open_with_tx_key(pay.commitment(), &rows[0].key), Some(pay));
+        let other = envelope_from_core(&tx.bundle.as_ref().unwrap().envelopes[1]);
+        assert_eq!(other.open_with_tx_key(rows[1].note.commitment(), &rows[0].key), None);
+    }
+
+    #[test]
+    fn the_receiver_recovers_the_same_key_and_a_stranger_recovers_none() {
+        let (me, you) = (Wallet::from_spend_key(SpendKey([11; 8])), Wallet::from_spend_key(SpendKey([12; 8])));
+        let (tx, k_pay, _, pay, _) = payment(&me, &you);
+        let rows = output_keys(&you, &tx);
+        assert_eq!(rows.len(), 1, "the change is none of the receiver's business: {rows:?}");
+        assert_eq!((rows[0].role, rows[0].key, rows[0].note.clone()), (KeyRole::Received, k_pay, pay));
+        assert!(output_keys(&Wallet::from_spend_key(SpendKey([13; 8])), &tx).is_empty());
+    }
+
+    #[test]
+    fn a_faucet_mint_is_an_output_its_recipient_can_key() {
+        let (minter, me) = (Wallet::from_spend_key(SpendKey([14; 8])), Wallet::from_spend_key(SpendKey([11; 8])));
+        let note = Note::new(me.vk.pk(), minter.vk.pk(), 100, 0, 1);
+        let k = TxKey::random();
+        let env = seal_note(&minter.vk, &me.address, &note, &k).unwrap();
+        let tx = Transaction::mint(7, note.commitment(), env, 100, &randprotocol_core::Keypair::generate());
+        let rows = output_keys(&me, &tx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].output, rows[0].slot, rows[0].role, rows[0].key), ("mint", 0, KeyRole::Received, k));
+    }
+
 }

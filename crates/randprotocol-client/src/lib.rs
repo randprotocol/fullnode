@@ -186,6 +186,16 @@ impl RpcClient {
         Hash::from_hex(v.as_str().unwrap_or("")).map_err(|e| anyhow!("bad hash in reply: {e}"))
     }
 
+    /// The committed transaction itself, decoded from `rand_getRawTransaction` — what reading its
+    /// envelopes needs, which `rand_getTransaction`'s rendering deliberately leaves out. `None` for
+    /// a hash this node has not committed.
+    pub async fn raw_transaction(&self, hash: &Hash) -> Result<Option<Transaction>> {
+        let v = self.call("rand_getRawTransaction", json!([hash.to_hex()])).await?;
+        let Some(raw) = v.as_str() else { return Ok(None) };
+        let bytes = hex::decode(raw).map_err(|e| anyhow!("raw transaction is not hex: {e}"))?;
+        Ok(Some(Transaction::decode(&bytes).map_err(|e| anyhow!("raw transaction does not decode: {e}"))?))
+    }
+
     /// `None` until the transaction is in a committed block.
     pub async fn transaction(&self, hash: &Hash) -> Result<Option<TxReceipt>> {
         let v = self.call("rand_getTransaction", json!([hash.to_hex()])).await?;

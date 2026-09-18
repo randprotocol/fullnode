@@ -244,6 +244,7 @@ Global options, accepted before or after the subcommand:
 |---|---|---|
 | `keygen` | | write a new spend-key file at `--key`, mode 0600; refuses to overwrite |
 | `address` | | print this wallet's `rand1…` shielded address |
+| `viewing-key` | | print this wallet's viewing key `nk`, 64 hex — the parameter `rand_importViewingKey` takes. It reads every note the wallet has sent or received and spends none; derived from the spend key on each run, never stored |
 | `balance` | | scan the tree, save the store, print spendable value and the unspent note count |
 | `sync` | | scan without printing a balance; prints how far it got |
 | `notes` | | every note this wallet has opened: index, `asset`, amount, height, `spent`, `pending` |
@@ -264,6 +265,7 @@ Global options, accepted before or after the subcommand:
 | `bridge-message <SEQUENCE>` | | one outbound burn message, verbatim, for a guardian to sign |
 | `fee bundle` / `fee deploy <words>` / `fee call <tier>` | | minimum fee from the node's schedule |
 | `tx <HASH>` | | committed transaction with its block height and index, or "not found" |
+| `tx-key <HASH>` | | one row per output of that transaction this wallet sent, received or kept as change: `output` (`bundle:0`, `bundle:1`, `asset_bundle:N`, `mint:0`), role, amount, and the per-transaction key it was sealed under. Recovered from the chain through the envelope's sender or receiver half, so it works for any past transaction; hand a `sent` row's key to a payee or auditor and `rand_checkTransaction <HASH> <KEY>` discloses that one output. Errors if the wallet opens no output of the transaction |
 | `block <ID>` | | block by height (integer) or by hash (hex) |
 | `head` | | `{height, hash, view}` |
 | `status` | | node status object (see docs/rpc.md `rand_status`) |

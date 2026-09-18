@@ -387,8 +387,10 @@ node's scan found, the Zcash `z_importviewingkey` shape an explorer such as Rand
 That is the one place "the node never holds a key" stops being true, and it is a property of an
 explicit operator decision, scoped to that node: the RPC layer has no type for a spend key, so an
 imported key can disclose notes but never move them, and a port that has seen an import should be
-treated as key-bearing. Exporting either key out of the wallet remains a wallet change, not a
-chain change.
+treated as key-bearing. Both keys can now leave the wallet on the holder's say-so: `rand viewing-key` prints `nk`, and
+`rand tx-key <hash>` prints each of a transaction's output keys this wallet can open — recovered
+from the chain, since every envelope carries its key under the sender's `ovk` and under the
+receiver's KEM secret, so nothing had to be stored when it was sealed.
 
 Phase S3 added the same two grains for *computation*, and these the CLI does offer: a call may
 publish its private inputs as a sealed transcript, openable by the caller's viewing key, by a

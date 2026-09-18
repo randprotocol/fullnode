@@ -41,6 +41,20 @@ enum Cmd {
     Keygen,
     /// Show this wallet's shielded address.
     Address,
+    /// Print this wallet's viewing key: 64 hex, the form `rand_importViewingKey` takes.
+    ///
+    /// It reads every note this wallet has sent or received and can spend none of them. Anyone
+    /// holding it sees this wallet's whole history, so hand it only to whoever should.
+    ViewingKey,
+    /// Print the per-transaction key of each output of a transaction this wallet sent or received.
+    ///
+    /// Each key discloses exactly one output: hand the `sent` row's key to a payee or an auditor
+    /// and `rand_checkTransaction <hash> <key>` shows them that payment and nothing else. The keys
+    /// are recovered from the chain, so this works for any transaction, however old.
+    TxKey {
+        /// The transaction hash.
+        hash: String,
+    },
     /// Scan, then show what this wallet can spend.
     Balance,
     /// Scan, then show what this wallet holds in a bridged asset (or in every asset).
@@ -393,6 +407,32 @@ async fn main() -> Result<()> {
             println!("wrote {}\naddress: {}", cli.key.display(), w.address);
         }
         Cmd::Address => println!("{}", Wallet::load(&cli.key)?.address),
+        Cmd::ViewingKey => {
+            println!("{}", Wallet::load(&cli.key)?.viewing_key_hex());
+            eprintln!("reads every note this wallet sent or received; spends nothing. A node imports it with rand_importViewingKey.");
+        }
+        Cmd::TxKey { hash } => {
+            let w = Wallet::load(&cli.key)?;
+            let h = Hash::from_hex(&hash).context("invalid hash")?;
+            let tx = rpc
+                .raw_transaction(&h)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("{} is not a committed transaction on this node", h.to_hex()))?;
+            let rows = wallet::output_keys(&w, &tx);
+            if rows.is_empty() {
+                anyhow::bail!("this wallet neither sent nor received an output of {}", h.to_hex());
+            }
+            println!("{:<15} {:<9} {:>22}  tx key", "output", "role", "amount");
+            for r in &rows {
+                let amount = if r.note.asset == 0 {
+                    format!("{} RAND", format_amount(r.note.amount))
+                } else {
+                    format!("{} (asset {})", r.note.amount, r.note.asset)
+                };
+                println!("{:<15} {:<9} {:>22}  {}", format!("{}:{}", r.output, r.slot), r.role.as_str(), amount, hex::encode(r.key.0));
+            }
+            eprintln!("each key discloses exactly its own output: rand_checkTransaction <hash> <key> shows it to anyone holding it.");
+        }
         Cmd::Balance => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             wallet::scan(&rpc, &w, &mut store).await?;
