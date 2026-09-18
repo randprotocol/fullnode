@@ -94,10 +94,32 @@ pub fn deploy_fee(words: usize) -> u64 {
     DEPLOY_PER_WORD * words as u64
 }
 
-/// Minimum fee for a call proven at `tier` (10, 12, ..., 20).
-pub fn call_fee(tier: u8) -> u64 {
+/// The call bytes that ride free (spec §7): today's two caps, a 2 MiB proof and an 18 432-byte
+/// input envelope. Every call a chain without the call limits admits is at or under this, so it
+/// costs exactly what it cost before the byte term existed.
+pub const CALL_FREE_BYTES: usize = 2_097_152 + 18_432;
+/// What each KiB (or part of one) of call bytes past [`CALL_FREE_BYTES`] adds to a call's fee:
+/// 1 000 base units, 0.00001 RAND. A testnet economics knob, not a security bound — the block
+/// cap is the bound — so it is kept small (spec §7).
+pub const CALL_PER_KIB: u64 = 1_000;
+
+/// Minimum fee for a call proven at `tier` (10, 12, ..., 20) that carries `bytes` of call proof
+/// and input envelope ([`call_bytes`]):
+///
+/// `CALL_BASE + CALL_PER_TIER_STEP·step(tier) + CALL_PER_KIB·ceil(max(0, bytes − CALL_FREE_BYTES)/1024)`
+///
+/// The byte term is what keeps a proof the raised `max_proof_bytes` admits from buying block
+/// space at the price of a small one; at or under the allowance it is zero.
+pub fn call_fee(tier: u8, bytes: usize) -> u64 {
     let steps = (tier.saturating_sub(MIN_TIER) / 2) as u64;
-    CALL_BASE + CALL_PER_TIER_STEP * steps
+    let kib = bytes.saturating_sub(CALL_FREE_BYTES).div_ceil(1024) as u64;
+    (CALL_BASE + CALL_PER_TIER_STEP * steps).saturating_add(CALL_PER_KIB.saturating_mul(kib))
+}
+
+/// The bytes a call's fee is charged on: its proof and its input envelope, each measured the way
+/// its own cap measures it (`proof.len()`, [`crate::types::CallEnvelope::len`]).
+pub fn call_bytes(proof: &[u8], envelope: Option<&crate::types::CallEnvelope>) -> usize {
+    proof.len() + envelope.map_or(0, |e| e.len())
 }
 
 /// The floor a bundle must pay before the action's proof is verified. A call's tier-dependent
@@ -227,10 +249,53 @@ mod tests {
 
     #[test]
     fn call_fee_steps_every_two_tiers() {
-        assert_eq!(call_fee(10), 1_000_000);
-        assert_eq!(call_fee(12), 1_100_000);
-        assert_eq!(call_fee(20), 1_500_000);
-        assert_eq!(call_fee(0), 1_000_000, "below MIN_TIER saturates");
+        assert_eq!(call_fee(10, 0), 1_000_000);
+        assert_eq!(call_fee(12, 0), 1_100_000);
+        assert_eq!(call_fee(20, 0), 1_500_000);
+        assert_eq!(call_fee(0, 0), 1_000_000, "below MIN_TIER saturates");
+    }
+
+    /// Spec §7: the byte term charges only above today's two caps, so every call a chain-12
+    /// ledger admits costs exactly what it cost before, and each KiB (or part of one) past the
+    /// allowance adds `CALL_PER_KIB`.
+    #[test]
+    fn the_call_fee_charges_only_bytes_past_todays_allowance() {
+        assert_eq!(CALL_FREE_BYTES, 2_097_152 + 18_432);
+        assert_eq!(CALL_FREE_BYTES, MAX_PROOF_BYTES + crate::types::actions::MAX_CALL_ENVELOPE_BYTES);
+        assert_eq!(CALL_PER_KIB, 1_000);
+        // Today's schedule, by tier alone.
+        let today = |tier: u8| CALL_BASE + CALL_PER_TIER_STEP * (tier.saturating_sub(MIN_TIER) / 2) as u64;
+        for tier in [0u8, 10, 12, 14, 16, 18, 20] {
+            for bytes in [0, 77, 1 << 20, CALL_FREE_BYTES - 1, CALL_FREE_BYTES] {
+                assert_eq!(call_fee(tier, bytes), today(tier), "tier {tier}, {bytes} B");
+            }
+            assert_eq!(call_fee(tier, CALL_FREE_BYTES + 1), today(tier) + 1_000, "a part-KiB is a KiB");
+            assert_eq!(call_fee(tier, CALL_FREE_BYTES + 1024), today(tier) + 1_000, "one KiB over adds 1 000");
+            assert_eq!(call_fee(tier, CALL_FREE_BYTES + 1025), today(tier) + 2_000);
+            assert_eq!(call_fee(tier, CALL_FREE_BYTES + (6 << 20)), today(tier) + 6 * 1024 * 1_000);
+        }
+        // Monotonic in both arguments.
+        let mut last = 0;
+        for bytes in (0..(40usize << 20)).step_by(4093) {
+            let f = call_fee(12, bytes);
+            assert!(f >= last, "{bytes} B: {f} < {last}");
+            last = f;
+        }
+        for tier in MIN_TIER..MAX_TIER {
+            assert!(call_fee(tier + 1, 5 << 20) >= call_fee(tier, 5 << 20));
+        }
+        // No overflow at the largest transaction any genesis can admit, or beyond.
+        assert!(call_fee(MAX_TIER, usize::MAX) > call_fee(MAX_TIER, MAX_BLOCK_BYTES_LIMIT));
+    }
+
+    /// What the byte term counts: the call proof and the input envelope, measured the way their
+    /// caps measure them.
+    #[test]
+    fn call_bytes_counts_the_proof_and_the_envelope() {
+        let e = crate::types::CallEnvelope { kem_ct: vec![1; 1088], to_sender: vec![2; 60], to_auditor: vec![], body: vec![3; 100] };
+        assert_eq!(call_bytes(&[0; 500], None), 500);
+        assert_eq!(call_bytes(&[0; 500], Some(&e)), 500 + e.len());
+        assert_eq!(call_bytes(&[], Some(&e)), 1248);
     }
 }
 

@@ -1200,12 +1200,15 @@ pub fn deploy_fee_default(action: &Action) -> u64 {
     gas::fee_floor(action)
 }
 
-/// What a `call` pays by default — and deliberately NOT `fee_floor(Call) + call_fee(tier)`.
+/// What a `call` pays by default — and deliberately NOT `fee_floor(Call) + call_fee(..)`.
 /// `fee_floor(Call)` is `BUNDLE_BASE + CALL_BASE`, and `CALL_BASE` is already `call_fee`'s own
 /// constant term, so adding the two overpays by `CALL_BASE`. The node's floor, once it has
 /// decoded the proof and knows the tier, is precisely this (`Ledger::validate_inner`).
-pub fn call_fee_default(tier: u8) -> u64 {
-    gas::BUNDLE_BASE + gas::call_fee(tier)
+///
+/// `bytes` is the call's proof plus its input envelope (`gas::call_bytes`); only what is past
+/// `gas::CALL_FREE_BYTES` costs anything, so a call under today's caps pays today's fee.
+pub fn call_fee_default(tier: u8, bytes: usize) -> u64 {
+    gas::BUNDLE_BASE + gas::call_fee(tier, bytes)
 }
 
 /// What a `bridge-burn` pays by default: the bundle base for each of its two bundles, which is
@@ -1868,12 +1871,21 @@ mod tests {
         assert_eq!(deploy_fee_default(&deploy), gas::fee_floor(&deploy));
         assert_eq!(deploy_fee_default(&deploy), gas::BUNDLE_BASE + gas::deploy_fee(40));
         for tier in [10u8, 12, 14, 20] {
-            assert_eq!(call_fee_default(tier), gas::BUNDLE_BASE + gas::call_fee(tier));
+            assert_eq!(call_fee_default(tier, 0), gas::BUNDLE_BASE + gas::call_fee(tier, 0));
             // The floor `Ledger::validate_inner` applies, not a cent over it: adding
             // `fee_floor(Call)` to `call_fee` would double-count `CALL_BASE`.
             let floor = gas::fee_floor(&Action::Call { program: randprotocol_core::Hash::ZERO, proof: vec![], input_envelope: None });
-            let doubled = floor + gas::call_fee(tier);
-            assert_eq!(doubled - call_fee_default(tier), gas::CALL_BASE, "tier {tier}");
+            let doubled = floor + gas::call_fee(tier, 0);
+            assert_eq!(doubled - call_fee_default(tier, 0), gas::CALL_BASE, "tier {tier}");
+            // The byte term (spec §7): nothing at or under the free allowance, so every call a
+            // chain-12 node admits pays what it paid before, and `CALL_PER_KIB` per KiB past it.
+            assert_eq!(call_fee_default(tier, gas::CALL_FREE_BYTES), call_fee_default(tier, 0));
+            assert_eq!(call_fee_default(tier, gas::CALL_FREE_BYTES + 1024), call_fee_default(tier, 0) + gas::CALL_PER_KIB);
+            assert_eq!(
+                call_fee_default(tier, 5 << 20),
+                gas::BUNDLE_BASE + gas::call_fee(tier, 5 << 20),
+                "the wallet pays the ledger's step-10 floor exactly"
+            );
         }
         // A burn pays the bundle base per verified bundle, and it has two. Checked against the
         // schedule itself, since `burn_fee_default` cannot ask `fee_floor` — the action it would

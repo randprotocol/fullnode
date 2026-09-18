@@ -693,10 +693,13 @@ async fn main() -> Result<()> {
                 (proof, outputs, tier, Some(e), Some(key))
             };
             eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {outputs:?}", t.elapsed(), proof.len());
+            // The fee's byte term counts the proof and the envelope (spec §7); a call under the
+            // free allowance, every call a default chain admits, pays the tier's fee alone.
+            let bytes = gas::call_bytes(&proof, envelope.as_ref());
             let action = Action::Call { program: pid, proof, input_envelope: envelope };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => wallet::call_fee_default(tier),
+                None => wallet::call_fee_default(tier, bytes),
             };
             let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend, chain_id, true).await;
             store.save(&path)?;

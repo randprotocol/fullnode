@@ -1272,7 +1272,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     if !(randprotocol_core::gas::MIN_TIER..=randprotocol_core::gas::MAX_TIER).contains(&tier) || tier % 2 != 0 {
                         return Err(RpcError::invalid_params("tier must be one of 10, 12, 14, 16, 18, 20"));
                     }
-                    randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(tier)
+                    // The byte term is zero here: this is the fee of a call under the free
+                    // allowance, which is every call a default chain admits (spec §7).
+                    randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(tier, 0)
                 }
                 _ => return Err(RpcError::invalid_params("kind must be bundle, deploy or call")),
             };
@@ -2255,7 +2257,7 @@ mod tests {
         );
         assert_eq!(
             fee(json!({"kind": "call", "tier": 12})).await,
-            (randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(12)).to_string()
+            (randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(12, 0)).to_string()
         );
         // An odd or out-of-range tier is a parameter error, never a truncated `as u8`.
         for bad in [11u64, 9, 22, 256] {
@@ -2361,7 +2363,7 @@ mod tests {
         let words = vec![0x13u32; 4];
         let pid = randprotocol_core::program::program_id(0, &words);
         let deploy_fee = randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: words.clone() });
-        let call_fee = randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(12);
+        let call_fee = randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(12, 0);
         let with_bundle = |nfs: [Word8; 2], cms: [Word8; 2], fee: u64, action| {
             let b = bundle_tx(&ledger, nfs, cms, fee).bundle.expect("bundle_tx always carries one");
             Transaction::shielded(gs.chain_id, b, action)

@@ -1092,7 +1092,7 @@ async fn confidential_call_rides_on_a_bundle() {
         randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], None, Backend::Cpu)
             .expect("the call proves");
     eprintln!("call: tier {tier}, {} proof bytes, outputs {outputs:?}", proof.len());
-    let call_fee = wallet::call_fee_default(tier);
+    let call_fee = wallet::call_fee_default(tier, randprotocol_core::gas::call_bytes(&proof, None));
     let called = wallet::submit(
         &n0.rpc,
         &a,
@@ -1672,13 +1672,14 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
     let h_in = hash::input_digest(salt, &inputs);
     let (sealed, key) = call_envelope::seal_call_envelope(&caller.vk, Some(&auditor.address), &h_in, salt, &inputs)
         .expect("sealing the transcript");
+    let fee = wallet::call_fee_default(tier, randprotocol_core::gas::call_bytes(&proof, Some(&sealed)));
     let called = wallet::submit(
         &n0.rpc,
         &caller,
         &mut store,
         None,
         Action::Call { program: id, proof, input_envelope: Some(sealed.clone()) },
-        wallet::call_fee_default(tier),
+        fee,
         Burn::None,
         FriProfile::Test,
         Backend::Cpu,

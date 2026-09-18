@@ -85,12 +85,12 @@ pub enum TxError {
     /// The whole transaction is larger than a block, so no block could ever carry it.
     ///
     /// The per-part caps above do not imply this one: a `Call` carries two proofs, each admissible
-    /// at `MAX_PROOF_BYTES`, whose sum with envelopes is over `MAX_BLOCK_BYTES`. `apply_block`
-    /// already refuses such a transaction as part of the block's cumulative byte rule, so nothing
-    /// about block validity changes here — this only stops one from being accepted for a block it
-    /// can never be in.
-    #[error("transaction of {0} bytes exceeds the {max} byte block limit", max = gas::MAX_BLOCK_BYTES)]
-    TransactionTooLarge(usize),
+    /// at the ledger's `max_proof_bytes`, whose sum with envelopes can be over its
+    /// `max_block_bytes`. `apply_block` already refuses such a transaction as part of the block's
+    /// cumulative byte rule, so nothing about block validity changes here — this only stops one
+    /// from being accepted for a block it can never be in. `max` is this chain's block cap.
+    #[error("transaction of {size} bytes exceeds the {max} byte block limit")]
+    TransactionTooLarge { size: usize, max: usize },
     #[error("program too large")]
     ProgramTooLarge,
     #[error("asset {0} is not supported in this release")]
@@ -142,8 +142,9 @@ pub enum TxError {
     #[error("invalid bundle proof: {0}")]
     InvalidBundleProof(ConfidentialError),
     /// The whole `Aggregate` action's encoding (block aggregation, spec §3.1's wire cap).
-    #[error("the aggregate action of {0} bytes exceeds the {max} byte cap", max = gas::MAX_AGGREGATE_BYTES)]
-    AggregateTooLarge(usize),
+    /// `max` is this chain's composite cap, [`Ledger::max_aggregate_bytes`].
+    #[error("the aggregate action of {size} bytes exceeds the {max} byte cap")]
+    AggregateTooLarge { size: usize, max: usize },
     /// The aggregate proof failed the executor (spec §4 step 8): the interface-digest compare
     /// or the rVM's `Machine::verify`.
     #[error("invalid aggregate proof: {0}")]
@@ -642,6 +643,14 @@ impl Ledger {
         self.max_call_envelope_bytes = bytes;
     }
 
+    /// The `Aggregate` action's composite wire cap on this chain: [`gas::MAX_AGGREGATE_BYTES`]
+    /// with its proof term at the ledger's `max_proof_bytes` instead of the default, so a proof
+    /// the proof cap admits is never refused by the composite cap instead. Today's value on a
+    /// chain that does not set `max_proof_bytes`.
+    pub fn max_aggregate_bytes(&self) -> usize {
+        gas::MAX_AGGREGATE_BYTES - gas::MAX_PROOF_BYTES + self.max_proof_bytes
+    }
+
     /// The largest public input a `Deploy` may fix, in words, as genesis set it (default
     /// [`gas::MAX_PROGRAM_PUBLIC_WORDS`], none).
     pub fn max_program_public_words(&self) -> usize {
@@ -847,17 +856,18 @@ impl Ledger {
         // 1. size caps
         //
         // The whole transaction first: a transaction bigger than a block can never be mined, and
-        // every per-part cap below can be satisfied by one that is (two `MAX_PROOF_BYTES` proofs
-        // already exceed `MAX_BLOCK_BYTES`).
+        // every per-part cap below can be satisfied by one that is (two proofs at the default
+        // 2 MiB cap already exceed the default 4 MiB block). Every cap in this step is the
+        // ledger's, as its genesis set it (the call limits, spec §4).
         let encoded_len = tx.encoded_len();
-        if encoded_len > gas::MAX_BLOCK_BYTES {
-            return Err(TxError::TransactionTooLarge(encoded_len));
+        if encoded_len > self.max_block_bytes {
+            return Err(TxError::TransactionTooLarge { size: encoded_len, max: self.max_block_bytes });
         }
         if let Some(b) = &tx.bundle {
             if b.envelopes.iter().any(|e| e.len() > MAX_ENVELOPE_BYTES) {
                 return Err(TxError::EnvelopeTooLarge);
             }
-            if b.proof.len() > gas::MAX_PROOF_BYTES {
+            if b.proof.len() > self.max_proof_bytes {
                 return Err(TxError::ProofTooLarge);
             }
         }
@@ -868,7 +878,7 @@ impl Ledger {
             Action::Deploy { words, .. } if words.len() > self.max_program_words => {
                 return Err(TxError::ProgramTooLarge)
             }
-            Action::Call { proof, .. } if proof.len() > gas::MAX_PROOF_BYTES => return Err(TxError::ProofTooLarge),
+            Action::Call { proof, .. } if proof.len() > self.max_proof_bytes => return Err(TxError::ProofTooLarge),
             Action::Withdraw { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
                 return Err(TxError::EnvelopeTooLarge)
             }
@@ -883,9 +893,9 @@ impl Ledger {
             Action::Aggregate { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
                 return Err(TxError::EnvelopeTooLarge)
             }
-            Action::Aggregate { proof, .. } if proof.len() > gas::MAX_PROOF_BYTES => return Err(TxError::ProofTooLarge),
-            Action::Aggregate { .. } if encoded_len > gas::MAX_AGGREGATE_BYTES => {
-                return Err(TxError::AggregateTooLarge(encoded_len))
+            Action::Aggregate { proof, .. } if proof.len() > self.max_proof_bytes => return Err(TxError::ProofTooLarge),
+            Action::Aggregate { .. } if encoded_len > self.max_aggregate_bytes() => {
+                return Err(TxError::AggregateTooLarge { size: encoded_len, max: self.max_aggregate_bytes() })
             }
             // A burn's second bundle is a bundle: the caps above it are the caps every bundle
             // gets, applied here because `tx.bundle` is only the fee bundle.
@@ -894,14 +904,14 @@ impl Ledger {
             {
                 return Err(TxError::EnvelopeTooLarge)
             }
-            Action::BridgeBurn { asset_bundle, .. } if asset_bundle.proof.len() > gas::MAX_PROOF_BYTES => {
+            Action::BridgeBurn { asset_bundle, .. } if asset_bundle.proof.len() > self.max_proof_bytes => {
                 return Err(TxError::ProofTooLarge)
             }
             _ => {}
         }
         // Every variable-length field that reaches a node before any signature or proof work is
         // capped above, with one exception: a `Call`'s `input_envelope` has its own cap
-        // (`MAX_CALL_ENVELOPE_BYTES`, larger than a note envelope's) and is checked in
+        // (`max_call_envelope_bytes`, larger than a note envelope's) and is checked in
         // `call_envelope::validate` at step 7. Nothing between here and there reads it.
         // 2. chain id
         if tx.chain_id != self.chain_id {
@@ -986,7 +996,7 @@ impl Ledger {
                 if !self.confidential {
                     return Err(TxError::ConfidentialDisabled);
                 }
-                call_envelope::validate(input_envelope)?;
+                call_envelope::validate(input_envelope, self.max_call_envelope_bytes)?;
                 call_record = Some(self.programs.get(program).ok_or(TxError::UnknownProgram(*program))?);
             }
             a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. }) => {
@@ -1014,10 +1024,12 @@ impl Ledger {
         if let Some(b) = bundle {
             self.check_bundle_proof(b, executor)?;
         }
-        // 10. the call's own proof, then its tier-dependent fee
-        if let (Some(record), Action::Call { proof, .. }) = (call_record, &tx.action) {
+        // 10. the call's own proof, then its fee: the tier's, and the byte term for proof and
+        // envelope bytes past the free allowance (spec §7)
+        if let (Some(record), Action::Call { proof, input_envelope, .. }) = (call_record, &tx.action) {
             let outcome = executor.verify_call(record, proof).map_err(TxError::InvalidProof)?;
-            let min = gas::BUNDLE_BASE + gas::call_fee(outcome.tier);
+            let bytes = gas::call_bytes(proof, input_envelope.as_ref());
+            let min = gas::BUNDLE_BASE + gas::call_fee(outcome.tier, bytes);
             let fee = tx.fee();
             if fee < min {
                 return Err(TxError::FeeTooLow { min, fee });
@@ -1238,7 +1250,7 @@ impl Ledger {
         let mut bytes = 0usize;
         for tx in &block.transactions {
             bytes += tx.encoded_len();
-            if bytes > gas::MAX_BLOCK_BYTES {
+            if bytes > self.max_block_bytes {
                 return Err(BlockError::TooLarge);
             }
         }
@@ -1714,7 +1726,7 @@ mod tests {
         assert!(l.program(&id).is_some());
         let proof = StubExecutor::make_proof(&id, 12, [1, 2, 3, 4, 5, 6, 7, 8]);
         let call = Action::Call { program: id, proof, input_envelope: None };
-        let fee = gas::BUNDLE_BASE + gas::call_fee(12);
+        let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
         let t = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], fee), call.clone());
         let r = l.apply_tx(&t, &a.address(), &StubExecutor).unwrap().unwrap();
         l.record_anchor(l.height());
@@ -1819,7 +1831,7 @@ mod tests {
         l.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
         l.record_anchor(l.height());
         let id = program_id(0, &words);
-        let fee = gas::BUNDLE_BASE + gas::call_fee(12);
+        let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
         let envelope = |body: usize| crate::types::CallEnvelope {
             kem_ct: vec![1; 1088],
             to_sender: vec![2; 60],
@@ -1858,7 +1870,7 @@ mod tests {
         l.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
         l.record_anchor(l.height());
         let id = program_id(0, &words);
-        let fee = gas::BUNDLE_BASE + gas::call_fee(12);
+        let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
         let envelope = crate::types::CallEnvelope {
             kem_ct: vec![1; 1088],
             to_sender: vec![2; 60],
@@ -1921,7 +1933,7 @@ mod tests {
         let (id, other_id) = (program_id(0, &words), program_id(0, &other));
         let wrong_proof = StubExecutor::make_proof(&other_id, 12, [0; 8]);
         let call = Action::Call { program: id, proof: wrong_proof, input_envelope: None };
-        let fee = gas::BUNDLE_BASE + gas::call_fee(12);
+        let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
         let t = Transaction::shielded(7, bundle(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]], fee), call);
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::InvalidProof(ConfidentialError::WrongProgram)));
         // Redeploying the same code is a no-op: the record keeps its original height.
@@ -1979,7 +1991,8 @@ mod tests {
 
     /// The four call-limits parameters (spec §3) live on the ledger the way `max_program_words`
     /// does: today's caps by default, set from genesis, outside the state root and equality, and
-    /// kept by a clone. Nothing reads them yet (Task 2 moves the rules onto them).
+    /// kept by a clone. The rules that read them are tested below (`every_proof_cap_is_the_ledgers_max_proof_bytes`
+    /// and its neighbours).
     #[test]
     fn the_call_limits_are_ledger_parameters_with_todays_defaults() {
         let l = ledger();
@@ -2000,6 +2013,258 @@ mod tests {
             (c.max_proof_bytes(), c.max_block_bytes(), c.max_call_envelope_bytes(), c.max_program_public_words()),
             (8 << 20, 20 << 20, 65_536, 32_768)
         );
+    }
+
+    /// `StubExecutor`, except that a call proof may carry padding after the stub's own bytes:
+    /// how a test gets a proof the ledger has to *verify* at a size only the call limits admit.
+    struct PaddedStub;
+
+    impl PaddedStub {
+        /// A stub call proof for `program` at tier 12, zero-padded to exactly `len` bytes.
+        fn proof(program: &Hash, len: usize) -> Vec<u8> {
+            let mut p = StubExecutor::make_proof(program, 12, [9; 8]);
+            assert!(len >= p.len());
+            p.resize(len, 0);
+            p
+        }
+    }
+
+    impl ConfidentialExecutor for PaddedStub {
+        fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
+            StubExecutor.check_program(base_pc, words)
+        }
+        fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            let n = StubExecutor::make_proof(&program.id, 0, [0; 8]).len();
+            StubExecutor.verify_call(program, &proof[..n.min(proof.len())])
+        }
+        fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
+            StubExecutor.node_hash(left, right)
+        }
+        fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+            StubExecutor.note_commitment(pk, from, amount, asset, time, r)
+        }
+        fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest(input)
+        }
+        fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.bundle_proof_digest(proof)
+        }
+        fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<(), ConfidentialError> {
+            StubExecutor.verify_bundle(hc_bundle, proof)
+        }
+        fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+            StubExecutor.aggregate_program_digest(shape)
+        }
+        fn verify_aggregate(
+            &self,
+            shape: &crate::types::DeclaredShape,
+            covered: &[crate::types::CoveredBundle],
+            proof: &[u8],
+        ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+            StubExecutor.verify_aggregate(shape, covered, proof)
+        }
+    }
+
+    /// A ledger with the four-word test program deployed, and its id.
+    fn ledger_with_program(configure: impl FnOnce(&mut Ledger)) -> (Ledger, ProgramId) {
+        let mut l = ledger();
+        configure(&mut l);
+        let (a, _) = keys();
+        let words = vec![0x13u32; 4];
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone() };
+        let d = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)), deploy);
+        l.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
+        l.record_anchor(l.height());
+        (l, program_id(0, &words))
+    }
+
+    /// A call to `id` with `proof` and no envelope, paying `fee`, on nullifiers derived from `n`.
+    fn call_tx(l: &Ledger, n: u32, id: ProgramId, proof: Vec<u8>, fee: u64) -> Transaction {
+        let b = bundle(l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], fee);
+        Transaction::shielded(7, b, Action::Call { program: id, proof, input_envelope: None })
+    }
+
+    /// What a call carrying `bytes` of proof and envelope pays: the bundle base and `call_fee`.
+    fn fee_for(bytes: usize) -> u64 {
+        gas::BUNDLE_BASE + gas::call_fee(12, bytes)
+    }
+
+    /// Spec §4, step 1: every proof cap — the fee bundle's, a call's, a burn's asset bundle's —
+    /// is the ledger's `max_proof_bytes`, not the constant. A proof one byte over 2 MiB is
+    /// refused by a default ledger and passes the cap on one whose genesis set 8 MiB.
+    #[test]
+    fn every_proof_cap_is_the_ledgers_max_proof_bytes() {
+        let over = gas::MAX_PROOF_BYTES + 1;
+        let raise = |l: &mut Ledger| {
+            l.set_max_proof_bytes(8 << 20);
+            l.set_max_block_bytes(17 << 20);
+        };
+        let (default, id) = ledger_with_program(|_| {});
+        let (raised, _) = ledger_with_program(raise);
+        let size_error = |r: &Result<(), TxError>| matches!(r, Err(TxError::ProofTooLarge));
+
+        // The call's own proof: refused by default, and verified and admitted when raised.
+        let call = |l: &Ledger| call_tx(l, 20, id, PaddedStub::proof(&id, over), fee_for(over));
+        assert_eq!(default.validate(&call(&default), &PaddedStub), Err(TxError::ProofTooLarge));
+        assert_eq!(raised.validate(&call(&raised), &PaddedStub), Ok(()));
+        let at_cap = call_tx(&raised, 30, id, PaddedStub::proof(&id, 8 << 20), fee_for(8 << 20));
+        assert_eq!(raised.validate(&at_cap, &PaddedStub), Ok(()), "exactly at the raised cap");
+        let past = call_tx(&raised, 40, id, PaddedStub::proof(&id, (8 << 20) + 1), fee_for((8 << 20) + 1));
+        assert_eq!(raised.validate(&past, &PaddedStub), Err(TxError::ProofTooLarge));
+
+        // The fee bundle's proof.
+        let fat_bundle = |l: &Ledger| {
+            let mut b = bundle(l, [[50; 8], [51; 8]], [[52; 8], [53; 8]], gas::BUNDLE_BASE);
+            b.proof = vec![0; over];
+            Transaction::shielded(7, b, Action::None)
+        };
+        assert_eq!(default.validate(&fat_bundle(&default), &StubExecutor), Err(TxError::ProofTooLarge));
+        let got = raised.validate(&fat_bundle(&raised), &StubExecutor);
+        assert!(!size_error(&got), "the raised cap admits the bundle's size: {got:?}");
+
+        // A burn's asset bundle.
+        let burn = |l: &Ledger| {
+            let mut asset_bundle = bundle(l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], 0);
+            asset_bundle.proof = vec![0; over];
+            let action =
+                Action::BridgeBurn { asset_bundle, asset: 1, amount: 400, relayer_fee: 100, to_chain: 2, to: [9; 32] };
+            let b = bundle(l, [[64; 8], [65; 8]], [[66; 8], [67; 8]], gas::fee_floor(&action));
+            Transaction::shielded(7, b, action)
+        };
+        assert_eq!(default.validate(&burn(&default), &StubExecutor), Err(TxError::ProofTooLarge));
+        let got = raised.validate(&burn(&raised), &StubExecutor);
+        assert!(!size_error(&got), "the raised cap admits the asset bundle's size: {got:?}");
+    }
+
+    /// Spec §4, step 1: the whole-transaction cap is the ledger's `max_block_bytes`. Two proofs
+    /// at the default proof cap are over a default 4 MiB block, and fit a raised one.
+    #[test]
+    fn the_whole_transaction_cap_is_the_ledgers_max_block_bytes() {
+        let (default, id) = ledger_with_program(|_| {});
+        let (raised, _) = ledger_with_program(|l| l.set_max_block_bytes(5 << 20));
+        let fat = |l: &Ledger| {
+            let mut t = call_tx(l, 20, id, PaddedStub::proof(&id, gas::MAX_PROOF_BYTES), fee_for(gas::MAX_PROOF_BYTES));
+            t.bundle.as_mut().unwrap().proof = vec![0; gas::MAX_PROOF_BYTES];
+            t
+        };
+        let t = fat(&default);
+        let size = t.encoded_len();
+        assert!(size > gas::MAX_BLOCK_BYTES && size <= 5 << 20, "{size}");
+        assert_eq!(
+            default.validate(&t, &PaddedStub),
+            Err(TxError::TransactionTooLarge { size, max: gas::MAX_BLOCK_BYTES })
+        );
+        let got = raised.validate(&fat(&raised), &PaddedStub);
+        assert!(!matches!(got, Err(TxError::TransactionTooLarge { .. })), "{got:?}");
+        // And a lowered cap bites a transaction the default admits: the rule reads the field.
+        let (mut small, _) = ledger_with_program(|_| {});
+        let ok = call_tx(&small, 70, id, StubExecutor::make_proof(&id, 12, [0; 8]), fee_for(0));
+        assert_eq!(small.validate(&ok, &StubExecutor), Ok(()));
+        small.set_max_block_bytes(ok.encoded_len() - 1);
+        assert_eq!(
+            small.validate(&ok, &StubExecutor),
+            Err(TxError::TransactionTooLarge { size: ok.encoded_len(), max: ok.encoded_len() - 1 })
+        );
+    }
+
+    /// Spec §4, step 7: the call envelope's cap is the ledger's `max_call_envelope_bytes`.
+    #[test]
+    fn the_call_envelope_cap_is_the_ledgers() {
+        let (default, id) = ledger_with_program(|_| {});
+        let (raised, _) = ledger_with_program(|l| l.set_max_call_envelope_bytes(65_536));
+        let envelope = |total: usize| crate::types::CallEnvelope {
+            kem_ct: vec![1; 1088],
+            to_sender: vec![2; 60],
+            to_auditor: vec![3; 60],
+            body: vec![4; total - (1088 + 60 + 60)],
+        };
+        let call = |l: &Ledger, n: u32, total: usize| {
+            let proof = StubExecutor::make_proof(&id, 12, [0; 8]);
+            let bytes = proof.len() + total;
+            let b = bundle(l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], fee_for(bytes));
+            Transaction::shielded(7, b, Action::Call { program: id, proof, input_envelope: Some(envelope(total)) })
+        };
+        let today = crate::types::MAX_CALL_ENVELOPE_BYTES;
+        assert_eq!(default.validate(&call(&default, 10, today), &StubExecutor), Ok(()));
+        assert_eq!(default.validate(&call(&default, 20, today + 1), &StubExecutor), Err(TxError::EnvelopeTooLarge));
+        assert_eq!(raised.validate(&call(&raised, 20, today + 1), &StubExecutor), Ok(()));
+        assert_eq!(raised.validate(&call(&raised, 30, 65_536), &StubExecutor), Ok(()));
+        assert_eq!(raised.validate(&call(&raised, 40, 65_537), &StubExecutor), Err(TxError::EnvelopeTooLarge));
+    }
+
+    /// The state root `txs` leave behind, like `root_after`, under `executor`.
+    fn root_after_with(
+        l: &Ledger,
+        txs: &[Transaction],
+        proposer: &Address,
+        height: u64,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Hash {
+        let mut scratch = l.clone();
+        scratch.set_height(height);
+        scratch.apply_transactions(txs, proposer, executor).unwrap();
+        scratch.record_anchor(height);
+        scratch.state_root()
+    }
+
+    /// Spec §4: `apply_block_for_sync`'s byte cap is the ledger's `max_block_bytes`. A block
+    /// carrying one 5 MiB call is refused as too large by a default ledger, and applied — the
+    /// call verified, its receipt produced — by one whose genesis raised both caps.
+    #[test]
+    fn apply_block_for_sync_uses_the_ledgers_block_cap() {
+        let (a, _) = keys();
+        let limits = |l: &mut Ledger| {
+            l.set_max_proof_bytes(8 << 20);
+            l.set_max_block_bytes(17 << 20);
+        };
+        let (mut raised, id) = ledger_with_program(limits);
+        let big = 5 << 20;
+        let t = call_tx(&raised, 20, id, PaddedStub::proof(&id, big), fee_for(big));
+        let txs = vec![t.clone()];
+        let block = signed_block(txs.clone(), &a, 2, root_after_with(&raised, &txs, &a.address(), 2, &PaddedStub));
+
+        let (mut default, _) = ledger_with_program(|_| {});
+        assert_eq!(
+            default.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub),
+            Err(BlockError::TooLarge)
+        );
+        let receipts = raised.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].tx, t.hash());
+        assert_eq!(receipts[0].outputs, [9; 8]);
+
+        // One byte under the block's size, the raised ledger refuses the same block.
+        let (mut tight, _) = ledger_with_program(|l| {
+            limits(l);
+            l.set_max_block_bytes(t.encoded_len() - 1);
+        });
+        assert_eq!(tight.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub), Err(BlockError::TooLarge));
+    }
+
+    /// Spec §7: step 10 charges the byte term. A call that pays today's fee with a proof past the
+    /// free allowance is refused for its fee, naming the fee it owes, and admitted paying it.
+    #[test]
+    fn a_call_paying_todays_fee_with_an_oversized_proof_is_refused_for_its_fee() {
+        let (l, id) = ledger_with_program(|l| l.set_max_proof_bytes(8 << 20));
+        let today = gas::BUNDLE_BASE + gas::call_fee(12, 0);
+        let bytes = gas::CALL_FREE_BYTES + 1;
+        let under = call_tx(&l, 20, id, PaddedStub::proof(&id, bytes), today);
+        assert_eq!(
+            l.validate(&under, &PaddedStub),
+            Err(TxError::FeeTooLow { min: today + gas::CALL_PER_KIB, fee: today })
+        );
+        let paid = call_tx(&l, 20, id, PaddedStub::proof(&id, bytes), today + gas::CALL_PER_KIB);
+        assert_eq!(l.validate(&paid, &PaddedStub), Ok(()));
+        // At the allowance exactly, today's fee is still enough.
+        let free = call_tx(&l, 30, id, PaddedStub::proof(&id, gas::CALL_FREE_BYTES), today);
+        assert_eq!(l.validate(&free, &PaddedStub), Ok(()));
+        // The envelope counts too: a proof at the allowance plus any envelope owes the byte term.
+        let (le, _) = ledger_with_program(|l| l.set_max_proof_bytes(8 << 20));
+        let proof = PaddedStub::proof(&id, gas::CALL_FREE_BYTES);
+        let envelope = crate::types::CallEnvelope { kem_ct: vec![], to_sender: vec![2; 60], to_auditor: vec![], body: vec![] };
+        let b = bundle(&le, [[40; 8], [41; 8]], [[42; 8], [43; 8]], today);
+        let t = Transaction::shielded(7, b, Action::Call { program: id, proof, input_envelope: Some(envelope) });
+        assert_eq!(le.validate(&t, &PaddedStub), Err(TxError::FeeTooLow { min: today + gas::CALL_PER_KIB, fee: today }));
     }
 
     #[test]

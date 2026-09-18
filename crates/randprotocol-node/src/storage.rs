@@ -2636,7 +2636,7 @@ mod tests {
     }
 
     /// The four call-limits parameters hold through replay and restart the way the program cap
-    /// does. Nothing enforces them yet (call-limits Task 2), so this pins the plumbing: a chain
+    /// does. This pins the plumbing (the rules that read them have their own ledger tests): a chain
     /// with chain 13's values replays its own committed block from the genesis ledger, the
     /// stored snapshot alone is at today's caps, and `reload_ledger` restores all four.
     #[test]

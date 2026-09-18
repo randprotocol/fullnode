@@ -13,7 +13,6 @@ use anyhow::{Context, Result};
 use libp2p::{Multiaddr, PeerId};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
-use randprotocol_core::gas;
 use randprotocol_core::genesis::{Genesis, GenesisState};
 use randprotocol_core::{Hash, Keypair, Ledger, ShieldedAddress, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
 use randprotocol_zkvm::executor::ZkExecutor;
@@ -1093,7 +1092,7 @@ impl Node {
     }
 
     async fn propose(&mut self, view: u64) -> Result<()> {
-        let txs = self.mempool.candidates_within(self.hs.tip_ledger(), gas::MAX_BLOCK_TXS, gas::MAX_BLOCK_BYTES);
+        let txs = self.mempool.block_candidates(self.hs.tip_ledger());
         match self.hs.propose(view, txs, now_ms()) {
             Ok(acts) => {
                 self.last_block_at = Instant::now();
@@ -1903,6 +1902,7 @@ mod tests {
     use crate::storage::fixtures::{alloc_note, bundle_fee, bundle_tx, genesis_of, key, make_block_voted};
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::consensus::{EpochSets, HotStuff};
+    use randprotocol_core::gas;
     use randprotocol_core::genesis::GenesisState;
     use randprotocol_core::{Block, BlockHeader, QuorumCertificate, Vote};
 

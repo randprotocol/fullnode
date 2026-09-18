@@ -355,6 +355,13 @@ impl Mempool {
             .collect()
     }
 
+    /// What a proposer packs on top of `ledger`: at most `gas::MAX_BLOCK_TXS` transactions within
+    /// the ledger's `max_block_bytes` — this chain's block cap as its genesis set it, the same cap
+    /// `Ledger::apply_block_for_sync` enforces on the block.
+    pub fn block_candidates(&self, ledger: &Ledger) -> Vec<Transaction> {
+        self.candidates_within(ledger, randprotocol_core::gas::MAX_BLOCK_TXS, ledger.max_block_bytes())
+    }
+
     /// Like `candidates`, but keeps the encoded size of the selection within `max_bytes`, skipping
     /// any transaction that would not fit rather than ending the selection at it.
     ///
@@ -617,6 +624,23 @@ mod tests {
         assert_eq!(m.candidates_within(&l, 10, usize::MAX).len(), 2);
     }
 
+    /// The proposer's selection (spec §4, proposer packing) is bounded by the ledger's
+    /// `max_block_bytes` and `MAX_BLOCK_TXS`, not the default block constant.
+    #[test]
+    fn block_candidates_pack_to_the_ledgers_block_cap() {
+        let mut l = ledger();
+        let mut m = Mempool::new(100);
+        let cheap = fixtures::bundle_tx(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee());
+        let dear = fixtures::bundle_tx(&l, [nf(3), nf(4)], [cm(3), cm(4)], fixtures::bundle_fee() * 3);
+        m.insert(cheap.clone(), &l, &StubExecutor).unwrap();
+        m.insert(dear.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.block_candidates(&l), vec![dear.clone(), cheap.clone()], "a default block carries both");
+        l.set_max_block_bytes(dear.encoded_len() + cheap.encoded_len() - 1);
+        assert_eq!(m.block_candidates(&l), vec![dear.clone()], "the ledger's cap, not the constant");
+        l.set_max_block_bytes(dear.encoded_len() + cheap.encoded_len());
+        assert_eq!(m.block_candidates(&l), vec![dear, cheap]);
+    }
+
     #[test]
     fn info_counts_bytes_and_the_oldest_entry() {
         let l = ledger();
@@ -696,8 +720,9 @@ mod tests {
 
         let err = m.insert(tx, &l, &StubExecutor).unwrap_err();
         match err {
-            MempoolError::Invalid(randprotocol_core::ledger::TxError::TransactionTooLarge(n)) => {
+            MempoolError::Invalid(randprotocol_core::ledger::TxError::TransactionTooLarge { size: n, max }) => {
                 assert!(n > randprotocol_core::gas::MAX_BLOCK_BYTES, "the error should carry the size: {n}");
+                assert_eq!(max, randprotocol_core::gas::MAX_BLOCK_BYTES, "and the ledger's cap");
             }
             other => panic!("expected TransactionTooLarge, got {other}"),
         }

@@ -393,14 +393,14 @@ pub(super) fn validate_aggregate(
     let Some(cfg) = ledger.aggregation() else { return Err(NOT_AGGREGATION) };
     // 1. The wire caps (`validate_inner`'s step 1 has them too — this entry must stand alone)
     //    and the chain id, before any register work.
-    if proof.len() > gas::MAX_PROOF_BYTES {
+    if proof.len() > ledger.max_proof_bytes() {
         return Err(TxError::ProofTooLarge);
     }
     if envelope.len() > crate::notes::MAX_ENVELOPE_BYTES {
         return Err(TxError::EnvelopeTooLarge);
     }
-    if tx.encoded_len() > gas::MAX_AGGREGATE_BYTES {
-        return Err(TxError::AggregateTooLarge(tx.encoded_len()));
+    if tx.encoded_len() > ledger.max_aggregate_bytes() {
+        return Err(TxError::AggregateTooLarge { size: tx.encoded_len(), max: ledger.max_aggregate_bytes() });
     }
     if tx.chain_id != ledger.chain_id() {
         return Err(TxError::WrongChain { expected: ledger.chain_id(), actual: tx.chain_id });
@@ -512,14 +512,14 @@ impl Ledger {
         if self.aggregation().is_none() {
             return Err(NOT_AGGREGATION);
         }
-        if proof.len() > gas::MAX_PROOF_BYTES {
+        if proof.len() > self.max_proof_bytes() {
             return Err(TxError::ProofTooLarge);
         }
         if envelope.len() > crate::notes::MAX_ENVELOPE_BYTES {
             return Err(TxError::EnvelopeTooLarge);
         }
-        if tx.encoded_len() > gas::MAX_AGGREGATE_BYTES {
-            return Err(TxError::AggregateTooLarge(tx.encoded_len()));
+        if tx.encoded_len() > self.max_aggregate_bytes() {
+            return Err(TxError::AggregateTooLarge { size: tx.encoded_len(), max: self.max_aggregate_bytes() });
         }
         if tx.chain_id != self.chain_id {
             return Err(TxError::WrongChain { expected: self.chain_id, actual: tx.chain_id });
@@ -1687,7 +1687,7 @@ mod admission_tests {
         // the cheapest way over it without tripping a per-field cap.
         let giant = aggregate_tx(&kp, 0, 100, vec![Hash::ZERO; gas::MAX_AGGREGATE_BYTES / 32], b"ok".to_vec());
         match l.preflight_aggregate(&giant) {
-            Err(TxError::AggregateTooLarge(_)) => {}
+            Err(TxError::AggregateTooLarge { .. }) => {}
             other => panic!("expected the composite cap, got {other:?}"),
         }
         // And the wrong chain id is step 1's other half, refused before the aggregator is consulted.
@@ -1697,6 +1697,34 @@ mod admission_tests {
             Err(TxError::WrongChain { expected: 7, actual: 99 }) => {}
             other => panic!("expected WrongChain, got {other:?}"),
         }
+    }
+
+    /// The call limits (spec §4): an aggregate's proof cap is the ledger's `max_proof_bytes`, in
+    /// all three places it is checked, and the composite wire cap grows with it — so a proof the
+    /// raised cap admits is not refused by the composite one instead.
+    #[test]
+    fn the_aggregate_proof_cap_is_the_ledgers_max_proof_bytes() {
+        let (l, kp) = setup();
+        let (mut raised, _) = setup();
+        raised.set_max_proof_bytes(8 << 20);
+        raised.set_max_block_bytes(17 << 20);
+        assert_eq!(l.max_aggregate_bytes(), gas::MAX_AGGREGATE_BYTES, "the default is today's cap");
+        assert_eq!(raised.max_aggregate_bytes(), gas::MAX_AGGREGATE_BYTES + (6 << 20));
+        let over = aggregate_tx(&kp, 0, 100, covers(1), vec![0; gas::MAX_PROOF_BYTES + 1]);
+        let covered = covered_records(&shape(), &[1]);
+        assert_eq!(l.preflight_aggregate(&over), Err(TxError::ProofTooLarge));
+        assert_eq!(l.validate(&over, &StubExecutor), Err(TxError::ProofTooLarge));
+        assert!(matches!(l.validate_aggregate(&over, &covered, &StubExecutor), Err(TxError::ProofTooLarge)));
+        let not_size = |r: Result<(), TxError>| {
+            !matches!(r, Err(TxError::ProofTooLarge | TxError::AggregateTooLarge { .. } | TxError::TransactionTooLarge { .. }))
+        };
+        assert_eq!(raised.preflight_aggregate(&over), Ok(()), "the byte-level pre-screen passes");
+        assert!(not_size(raised.validate(&over, &StubExecutor)));
+        assert!(not_size(raised.validate_aggregate(&over, &covered, &StubExecutor).map(|_| ())));
+        let at = aggregate_tx(&kp, 0, 100, covers(1), vec![0; 8 << 20]);
+        assert_eq!(raised.preflight_aggregate(&at), Ok(()));
+        let past = aggregate_tx(&kp, 0, 100, covers(1), vec![0; (8 << 20) + 1]);
+        assert_eq!(raised.preflight_aggregate(&past), Err(TxError::ProofTooLarge));
     }
 
     /// Step 2: the aggregator must be registered, not unbonding, at the action's nonce, and the

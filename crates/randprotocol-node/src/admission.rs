@@ -148,12 +148,12 @@ pub fn is_permanent(e: &TxError) -> bool {
             // fix-sync-stall's: the whole transaction is bigger than a block. A byte length is a
             // function of the bytes, and `validate` refuses it at step 1 before anything about
             // this node's state is consulted, so it is as permanent as a size cap gets.
-            | TxError::TransactionTooLarge(_)
+            | TxError::TransactionTooLarge { .. }
             | TxError::ProgramTooLarge
             // The aggregate action's wire cap is a byte length, and its proof's verdicts are
             // against genesis-pinned artifacts (the registered shapes and the aggregate
             // program), exactly `InvalidBundleProof`'s argument.
-            | TxError::AggregateTooLarge(_)
+            | TxError::AggregateTooLarge { .. }
             | TxError::InvalidAggregateProof(_)
             // A transaction colliding with *itself* — no other transaction and no state involved.
             | TxError::DuplicateNullifierInBundle
@@ -412,7 +412,7 @@ mod tests {
             TxError::BadMintSignature,
             TxError::ProofTooLarge,
             TxError::EnvelopeTooLarge,
-            TxError::TransactionTooLarge(9_000_000),
+            TxError::TransactionTooLarge { size: 9_000_000, max: 4 << 20 },
             TxError::DuplicateNullifierInBundle,
             TxError::WrongChain { expected: 7, actual: 8 },
         ] {
@@ -453,7 +453,7 @@ mod tests {
             agg(A::CoveredGuestMismatch(h(4))),
             agg(A::CoverNotABundle(h(5))),
             agg(A::CoverSealed(h(5))),
-            TxError::AggregateTooLarge(9_000_000),
+            TxError::AggregateTooLarge { size: 9_000_000, max: 2 << 20 },
             TxError::InvalidAggregateProof(ConfidentialError::MalformedProof),
         ] {
             assert!(is_permanent(&e), "{e} is a statement about the bytes or genesis constants");

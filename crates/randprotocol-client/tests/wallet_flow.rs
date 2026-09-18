@@ -224,6 +224,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
         executor::prove_call(FriProfile::Test, &prog, &inputs, None, Backend::Cpu).expect("the call proves");
     let h_in = hash::input_digest(salt, &inputs);
     let (envelope, key) = call_envelope::seal_call_envelope(&a.vk, None, &h_in, salt, &inputs).expect("the transcript seals");
+    let fee = wallet::call_fee_default(tier, randprotocol_core::gas::call_bytes(&proof, Some(&envelope)));
     let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
     let call = wallet::submit(
         &rpc,
@@ -231,7 +232,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
         &mut a_store,
         None,
         action,
-        wallet::call_fee_default(tier),
+        fee,
         Burn::None,
         FriProfile::Test,
         Backend::Cpu,
