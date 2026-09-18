@@ -4,6 +4,12 @@ set -euo pipefail
 IP=$1
 cd "$(dirname "$0")/.."
 KEY=${SSH_KEY:-~/.ssh/id_ed25519}
+# rand_getVersion's git_sha: the tree reaches the host without .git, so the node's build.rs reads
+# the commit from .git-rev there. Written fresh on every rebuild (a stale one reports the wrong
+# build); -dirty when tracked files differ from HEAD, exactly as a checkout's own build marks it.
+REV=$(git rev-parse HEAD)
+[ -z "$(git status --porcelain --untracked-files=no)" ] || REV="$REV-dirty"
+echo "$REV" > .git-rev
 rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" \
     --exclude target --exclude 'data-*' --exclude testnet --exclude .git ./ root@$IP:/root/fullnode/
 CUDA=$(cd "$(dirname "$0")/../../circuits/rand-zkvm-cuda" 2>/dev/null && pwd || true)

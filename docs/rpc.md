@@ -574,7 +574,9 @@ Params: `[]`. Result:
 ```
 `version` is the workspace crate version. `git_sha` is the full commit hash captured at build time
 by `randprotocol-node`'s `build.rs` — `git rev-parse HEAD` in a checkout, else the `.git-rev` file
-the deploy worktrees write, else `"unknown"` — with `-dirty` appended for an uncommitted tree. This
+`deploy/rebuild-vps.sh` writes into the tree it ships to the build host (which has no `.git`), else
+`"unknown"` — with `-dirty` appended when tracked files differ from that commit (untracked files do
+not count). This
 is how a caller outside the fleet (an explorer, a survey script) confirms which build a node is
 running without shelling in; the deploy's own sha-compare stays on the binary.
 

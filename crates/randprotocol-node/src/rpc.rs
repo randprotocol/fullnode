@@ -3674,7 +3674,14 @@ mod tests {
         let (_d, st) = state_for(&gs);
         let v = ok(&st, "rand_getVersion", json!([])).await;
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
-        assert!(v["git_sha"].as_str().unwrap().len() >= 7, "{v}");
+        // The full 40-hex commit, `-dirty` when tracked files differed at build time, or
+        // "unknown" when neither git nor a `.git-rev` could say — never a short or stale form.
+        let sha = v["git_sha"].as_str().unwrap();
+        let commit = sha.strip_suffix("-dirty").unwrap_or(sha);
+        assert!(
+            sha == "unknown" || (commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
+            "{v}"
+        );
         assert_eq!(v["chain_id"], 7);
         assert!(v["hc_bundle"].is_string());
         assert!(v["fri_profile"].is_string());
