@@ -191,9 +191,9 @@ shorten a proof today; more RAM decides whether it finishes.
 |---|---:|---|---|---|---|
 | 10 | 1 023 | `fib` (production, constraint set 5) | not recorded | 6.05 s | — |
 | 14 | 16 383 | the bundle (wallet, test profile) | 5.74 GB whole `rand call` | 97.0 s | production: `TODO-CONTROLLER` |
-| 18 | 262 143 | ERC-20, about 66 k–162 k cycles | OOM-killed on a 48 GB laptop at 24.7 GB. On a 64 GB droplet: above 47 GB at 25 min, still running | killed after 1 016 s on the laptop | `TODO-CONTROLLER` (bound: more than 47 GB) |
+| 18 | 262 143 | ERC-20, about 66 k–162 k cycles | OOM-killed on a 48 GB laptop at 24.7 GB. On a 64 GB droplet: above 47 GB at 25 min, still running | killed after 1 016 s on the laptop | translated `transfer`: 85.0 GB, 3 230.5 s (53.8 min), 811 600 B proof. Interpreter `evm.bin`: 85.5 GB, 3 143.3 s (52.4 min), 805 108 B proof. Verify: 101.4 s (droplet), 50.2 s at 3.66 GB RSS (laptop). Measured on m-16vcpu-128gb, 2026-09-19 |
 | 19 (rVM) | — | rVM aggregate, N=1, test profile | about 30 GB peak | 1568.2 s | — |
-| 20 | 1 048 575 | SPL Token, about 700 k–770 k cycles | stopped on a 48 GB laptop at about 31 GB (30.77 GB peak footprint); OOM-killed on a 64 GB droplet at 65.1 GB | 10 m 41 s on the droplet before the kill | `TODO-CONTROLLER` (bound: more than 64 GB; a 128 GB rerun is pending) |
+| 20 | 1 048 575 | SPL Token, about 700 k–770 k cycles | stopped on a 48 GB laptop at about 31 GB (30.77 GB peak footprint); OOM-killed on a 64 GB droplet at 65.1 GB | 10 m 41 s on the droplet before the kill | not yet proven. Extrapolated from the measured tier-16/18 scaling (memory about ×3.9, time about ×4.1 per +2 tiers): about 330 GB and about 3.6 h, more than DigitalOcean's largest memory droplet (m-32vcpu-256gb, 256 GB) |
 | 21 (rVM) | — | rVM aggregate, N=1, production | 48.6 GB oracle | not run | `TODO-CONTROLLER` |
 
 The cycle column is `2^t − 1` for the RV32 zkVM (`docs/confidential.md`). The rVM (the
@@ -205,8 +205,8 @@ recursion machine) has its own tiers, sized in rows (`docs/zkvm-m4-m5-progress.m
 | workload | size | status |
 |---|---|---|
 | a tier-14 bundle (any wallet) | any machine with more than 5.74 GB free (test profile) | measured |
-| tier 18 | a 64 GB droplet (size slug `TODO-CONTROLLER`) | run in progress, above 47 GB at 25 min |
-| tier 20 | more than 64 GB. A 128 GB droplet (size slug `TODO-CONTROLLER`) | a 64 GB droplet was OOM-killed at 65.1 GB; the 128 GB rerun is pending |
+| tier 18 | a 128 GB droplet (size slug `m-16vcpu-128gb`, Memory-Optimized, 16 vCPU). OOM-killed on a 64 GB droplet (`g-16vcpu-64gb`) at 65.1 GB after 32 min | measured: 85.0 GB (translated) / 85.5 GB (interpreted) peak RSS, 3 230.5 s / 3 143.3 s |
+| tier 20 | more than 64 GB. OOM-killed on a 64 GB droplet (`g-16vcpu-64gb`) at 65.1 GB after 10 m 41 s | not yet proven; extrapolated at about 330 GB and about 3.6 h (see §5), more than DigitalOcean's largest memory droplet (m-32vcpu-256gb, 256 GB) |
 | aggregate N=1, production | ≥ 64 GB | not run |
 
 No proof above tier 14 is part of normal chain operation today. Tier 18 and 20 matter for calls to

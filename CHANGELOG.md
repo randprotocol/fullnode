@@ -26,7 +26,7 @@ and are not repeated here. They take effect on the first chain whose genesis set
 | `evm2rv` output equals the interpreter's | identical eight words for `transfer`, `approve` and `transferFrom`; 66 235 / 48 119 / 88 824 cycles against 121 638 / 85 645 / 161 434 on `evm.bin` (54.5–56.2 %) | `rand-guest run` on both images and `diff`, re-run 2026-09-19; `evm2rv/tests/parity.rs` (8 vectors, both stages) and `tests/fuzz.rs` (10 000 random programs) |
 | `sbpf2rv` output equals the interpreter's | identical eight words for SPL Token `Transfer` 250; 765 851 cycles against 694 498 on `sbpf.bin`; all 8 vectors in tier 20; image 65 096 words | `sbpf2rv/tests/parity.rs`, 2026-09-18 |
 | SPL Token translation does not pay off today | about 98 % of each run is the fixed sBPF ABI harness; the translated image is 69–75 k cycles dearer per vector | per-stage cycle attribution (`sbpf2rv/README.md`) |
-| no translated program has been proven yet | tier 18 (ERC-20): OOM-killed at 24.7 GB on a 48 GB laptop, above 47 GB at 25 min on a 64 GB droplet. Tier 20 (SPL Token): OOM-killed at 65.1 GB on a 64 GB droplet. Final numbers: `TODO-CONTROLLER` | `/usr/bin/time`, watchdogs; the prover is single-threaded (99 % of one core on 16 vCPUs) |
+| ERC-20 is proven; SPL Token is not | tier 18 (ERC-20 `transfer`): OOM-killed at 24.7 GB on a 48 GB laptop, above 47 GB at 25 min on a 64 GB droplet; proved on a 128 GB droplet (m-16vcpu-128gb) at 85.0 GB (translated) / 85.5 GB (interpreted) peak RSS, 3 230.5 s / 3 143.3 s, 811 600 / 805 108-byte proofs. Tier 16 (ERC-20 `approve`, translated): 21.7 GB, 786.7 s (13.1 min), 798 930-byte proof. Tier 20 (SPL Token): OOM-killed at 65.1 GB on a 64 GB droplet after 10 m 41 s; not yet proven — extrapolated at about 330 GB and about 3.6 h, more than DigitalOcean's largest memory droplet (m-32vcpu-256gb, 256 GB) | `/usr/bin/time`, watchdogs; the prover is single-threaded (99 % of one core on 16 vCPUs) |
 
 ### Docs
 
@@ -45,7 +45,8 @@ and are not repeated here. They take effect on the first chain whose genesis set
   (the wallet caps call input at 4 096, `MAX_CALL_INPUT_WORDS`).
 - The ERC-20 call's input fits (921 words for `transfer`). Its proof size may not: the EVM harness
   uses the `KECCAK` syscall, and a keccak-carrying production proof measured 3 198 430 bytes at
-  tier 10, above `MAX_PROOF_BYTES` (2 MiB). Tier-18 size: `TODO-CONTROLLER`.
+  tier 10, above `MAX_PROOF_BYTES` (2 MiB). Tier-18 size (test profile): 811 600 bytes translated,
+  805 108 bytes interpreted.
 - EVM: the nine block-context opcodes trap; a `CALL` with nonzero value traps; ecrecover,
   bn256 mul and pairing, large modexp and long blake2f exceed the 2^20-cycle tier cap.
 - sBPF: CPI and unknown syscalls trap at run time; Ed25519 and secp256k1 exist in software but are

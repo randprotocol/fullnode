@@ -561,12 +561,18 @@ in tier 20.
 
 | workload | tier | measured | final number |
 |---|---|---|---|
-| ERC-20 (66 k–162 k cycles) | 18 | OOM-killed on a 48 GB laptop at 24.7 GB after 1 016 s. A 64 GB droplet run was above 47 GB at 25 min | `TODO-CONTROLLER` (peak memory, wall time, proof bytes) |
-| SPL Token (about 700 k–770 k cycles) | 20 | stopped on a 48 GB laptop at about 31 GB; OOM-killed on a 64 GB droplet at 65.1 GB after 10 m 41 s. Needs more than 64 GB | `TODO-CONTROLLER` (the 128 GB rerun) |
+| ERC-20 (66 k–162 k cycles) | 18 | OOM-killed on a 48 GB laptop at 24.7 GB after 1 016 s. A 64 GB droplet run was above 47 GB at 25 min | translated `transfer` (`a0feae92…`): 85.0 GB peak RSS, 3 230.5 s (53.8 min), 811 600-byte proof. Interpreter `evm.bin` (`7e1aea2b…`): 85.5 GB peak RSS, 3 143.3 s (52.4 min), 805 108-byte proof. Measured on a DigitalOcean m-16vcpu-128gb, 2026-09-19 |
+| SPL Token (about 700 k–770 k cycles) | 20 | stopped on a 48 GB laptop at about 31 GB; OOM-killed on a 64 GB droplet at 65.1 GB after 10 m 41 s. Needs more than 64 GB | not yet proven. Extrapolated from the measured tier-16/18 scaling (memory about ×3.9, time about ×4.1 per +2 tiers): about 330 GB and about 3.6 h, more than DigitalOcean's largest memory droplet (m-32vcpu-256gb, 256 GB) |
 
-No translated proof has been produced yet. The circuits READMEs' proof runs used
-`FriProfile::Test`. [`node-hardware.md`](node-hardware.md#5-prover-memory-per-tier) has the full
-table.
+The translated ERC-20 `transfer` and `approve` proofs have been produced and verified; the SPL
+Token proof has not (see the extrapolation above). Proving cost is set by the tier, not the cycle
+count: translated and interpreted `transfer` are both tier 18 and cost the same to prove.
+Translation lowers proving cost only when it drops a call into a smaller tier, as it does for
+`approve` (tier 16 translated against tier 18 interpreted): 786.7 s (13.1 min) and 21.7 GB peak
+RSS instead of about 53 min and 85 GB. The translated and interpreted `transfer` proofs carry
+identical public output words, so parity is confirmed on the real prover. The circuits READMEs'
+proof runs used `FriProfile::Test`. [`node-hardware.md`](node-hardware.md#5-prover-memory-per-tier)
+has the full table.
 
 ## 7. What works on chain today
 
@@ -579,7 +585,7 @@ fullnode.
 | deploy on chain 12 (cap 4 096) | refused: 11 686 words | refused: 65 096 words |
 | deploy on a chain with `max_program_words >= N` | admitted (not yet run) | admitted (not yet run) |
 | call inputs | 649–1 201 private words (921 for `transfer`), under the wallet's 4 096-word cap. Fits | 27 151 public and 10 458 private words. Blocked twice: the node verifies every call with the empty public segment (`Machine::verify_public(hc, &[], proof)`, `docs/confidential.md`), and `rand call` has no public-input option; the wallet also refuses more than 4 096 private input words (`MAX_CALL_INPUT_WORDS`, checked in `executor::prove_call` before proving) |
-| call proof size | the harness calls the `KECCAK` syscall, so the proof carries the keccak table. A keccak-carrying production proof measured 3 198 430 bytes at tier 10, above `MAX_PROOF_BYTES` (2 MiB, `docs/confidential.md`). Tier-18 size: `TODO-CONTROLLER` | tier 20; size `TODO-CONTROLLER` |
+| call proof size | the harness calls the `KECCAK` syscall, so the proof carries the keccak table. A keccak-carrying production proof measured 3 198 430 bytes at tier 10, above `MAX_PROOF_BYTES` (2 MiB, `docs/confidential.md`). Tier-18 size (test profile): 811 600 bytes translated, 805 108 bytes interpreted | tier 20; size: not yet proven — the proof itself has not been produced (see §6.5's extrapolation) |
 | call proof memory | tier 16 or 18, see §6.5 | tier 20, see §6.5 |
 
 In short: v0.4 delivers the translation, the parity evidence and the deploy path. On-chain calls to
