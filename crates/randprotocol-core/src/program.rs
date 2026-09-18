@@ -27,6 +27,19 @@ pub fn program_id(base_pc: u32, words: &[u32]) -> ProgramId {
 /// Both lengths are bound. With only the public input's, the boundary between the code and the
 /// public input would be ambiguous: `words = [a, 2], public = [d]` and `words = [a], public = [1, d]`
 /// would hash the same bytes, and whoever deployed first would own the other's id.
+///
+/// **Separation from the old rule is by length parity.** [`Hash::digest_domain`] concatenates the
+/// domain raw in front of the data, with no length or separator, so the two rules hash:
+///
+/// - old: `"rand-program"` (12 bytes) ‖ `base_pc` (4) ‖ `4n` bytes of code: `16 + 4n ≡ 0 (mod 4)`;
+/// - new: `"rand-program-2"` (14 bytes) ‖ `base_pc` (4) ‖ two lengths (8) ‖ `4(n + m)` bytes:
+///   `26 + 4(n + m) ≡ 2 (mod 4)`.
+///
+/// An old-rule blake3 input is therefore never byte-equal to a new-rule one, whatever the words
+/// (the domains' shared prefix `"rand-program"` does not matter), and a new-rule id equals an
+/// old-rule id only by a blake3 collision. Changing either domain's length, or the width of any
+/// field, must keep the two residues apart; `the_two_id_rules_hash_inputs_of_different_length_parity`
+/// pins them.
 pub fn program_id_with_public(base_pc: u32, words: &[u32], public: &[u32]) -> ProgramId {
     if public.is_empty() {
         return program_id(base_pc, words);
@@ -148,6 +161,42 @@ mod tests {
     fn the_code_and_public_boundary_is_bound() {
         let (a, d) = (0x13u32, 0x99u32);
         assert_ne!(program_id_with_public(0, &[a, 2], &[d]), program_id_with_public(0, &[a], &[1, d]));
+    }
+
+    /// The separation argument on [`program_id_with_public`]: the old rule's blake3 input is
+    /// `≡ 0 (mod 4)` bytes long, the new rule's `≡ 2 (mod 4)`, for any word counts. Rebuilt here
+    /// from the two domains and checked against both functions, so a change to either domain or
+    /// either layout that closed the gap fails here.
+    #[test]
+    fn the_two_id_rules_hash_inputs_of_different_length_parity() {
+        let old_input = |base_pc: u32, words: &[u32]| {
+            let mut v = b"rand-program".to_vec();
+            v.extend_from_slice(&base_pc.to_le_bytes());
+            words.iter().for_each(|w| v.extend_from_slice(&w.to_le_bytes()));
+            v
+        };
+        let new_input = |base_pc: u32, words: &[u32], public: &[u32]| {
+            let mut v = b"rand-program-2".to_vec();
+            v.extend_from_slice(&base_pc.to_le_bytes());
+            v.extend_from_slice(&(words.len() as u32).to_le_bytes());
+            words.iter().for_each(|w| v.extend_from_slice(&w.to_le_bytes()));
+            v.extend_from_slice(&(public.len() as u32).to_le_bytes());
+            public.iter().for_each(|w| v.extend_from_slice(&w.to_le_bytes()));
+            v
+        };
+        for n in 0..6usize {
+            let words: Vec<u32> = (0..n as u32).map(|i| 0x13 + i).collect();
+            let old = old_input(4, &words);
+            assert_eq!(old.len() % 4, 0, "old rule, {n} words");
+            assert_eq!(program_id(4, &words), Hash(*blake3::hash(&old).as_bytes()));
+            for m in 1..5usize {
+                let public: Vec<u32> = (0..m as u32).collect();
+                let new = new_input(4, &words, &public);
+                assert_eq!(new.len() % 4, 2, "new rule, {n} words, {m} public");
+                assert_eq!(program_id_with_public(4, &words, &public), Hash(*blake3::hash(&new).as_bytes()));
+                assert_ne!(program_id_with_public(4, &words, &public), program_id(4, &words));
+            }
+        }
     }
 
     /// Every split of one concatenation into non-empty code and non-empty public input is a

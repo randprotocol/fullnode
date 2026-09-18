@@ -1975,6 +1975,43 @@ mod tests {
         assert_eq!(l.program(&id).unwrap().deployed_at, 1, "a redeploy does not move deployed_at");
     }
 
+    /// Redeploying a program with the same code *and the same public input* is what a redeploy
+    /// has always been (`deploy_and_call_rejections_and_redeploy_idempotence`): it validates and
+    /// applies, pays its full floor — code and public words — to the proposer like any deploy,
+    /// spends its bundle's nullifiers, and leaves the record exactly as the first deploy wrote it
+    /// (same `deployed_at`, digest and `public_len`), with no second record.
+    #[test]
+    fn a_redeploy_with_the_same_public_input_is_a_no_op_that_pays_its_fee() {
+        let mut l = ledger();
+        l.set_max_program_public_words(16);
+        let (a, _) = keys();
+        let words = vec![0x13u32; 4];
+        let public = vec![7u32, 8, 9];
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: public.clone() };
+        let floor = gas::fee_floor(&deploy);
+        assert_eq!(floor, gas::BUNDLE_BASE + gas::deploy_fee(words.len() + public.len()));
+        let first = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], floor), deploy.clone());
+        l.apply_tx(&first, &a.address(), &StubExecutor).unwrap();
+        l.record_anchor(l.height());
+        let id = crate::program::program_id_with_public(0, &words, &public);
+        let before = l.program(&id).cloned().expect("deployed");
+        assert_eq!(before.deployed_at, 1);
+
+        l.set_height(9);
+        // The redeploy is refused below its floor like any deploy: the public words are paid for again.
+        let cheap = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], floor - 1), deploy.clone());
+        assert_eq!(l.validate(&cheap, &StubExecutor), Err(TxError::FeeTooLow { min: floor, fee: floor - 1 }));
+        let again = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], floor), deploy);
+        assert_eq!(l.validate(&again, &StubExecutor), Ok(()));
+        let (fees, rewards) = (l.supply().fees_paid, l.validators()[&a.address()].rewards);
+        assert_eq!(l.apply_tx(&again, &a.address(), &StubExecutor).unwrap(), None, "a deploy has no receipt");
+        assert_eq!(l.supply().fees_paid, fees + floor, "the redeploy's fee is charged");
+        assert_eq!(l.validators()[&a.address()].rewards, rewards + floor, "and paid to the proposer");
+        assert!(l.is_spent(&[5; 8]) && l.is_spent(&[6; 8]), "its bundle's nullifiers are spent");
+        assert_eq!(l.programs().len(), 1, "no second record");
+        assert_eq!(l.program(&id), Some(&before), "the record is untouched: deployed_at, digest, public_len");
+    }
+
     /// A public input fixed at deploy (the call limits, spec §5): the program gets the
     /// `rand-program-2` id, pays `DEPLOY_PER_WORD` for its public words as for its code, and its
     /// record carries the executor's digest of them.
