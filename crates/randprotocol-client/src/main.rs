@@ -280,6 +280,20 @@ fn load_program(file: &Path) -> Result<Program> {
     }
 }
 
+/// `hc` in the one form the chain ever shows it in: `rand_getProgram` / `rand program show` hex
+/// `ProgramRecord.code_hash`, which `check_program` (`executor.rs`) fills as `Program::digest`'s
+/// eight `u32` words, each in *little-endian* byte order, concatenated. `Program::code_hash()`
+/// hex-encodes the same words big-endian instead (`{w:08x}` per word) — a different string for
+/// the same digest — so the wallet must not call it here; this function is the RPC's spelling,
+/// computed locally before any proof or submission exists to ask the RPC for it.
+fn rpc_hc_hex(p: &Program) -> String {
+    let mut bytes = Vec::with_capacity(32);
+    for w in p.digest() {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    hex::encode(bytes)
+}
+
 fn pretty(v: &serde_json::Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
@@ -619,10 +633,12 @@ async fn main() -> Result<()> {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let p = load_program(&file)?;
             let id = randprotocol_core::program::program_id(p.base_pc, &p.words);
-            // Printed before anything is proved: the program id and `hc` (`Program::digest`) are
-            // what `rand-guest build` itself reports for the same guest, so this is the wallet's
-            // confirmation that the file it loaded is the one the toolchain built.
-            println!("program id: {id}, hc {}, {} words", p.code_hash(), p.words.len());
+            // Printed before anything is proved: the program id and `hc` are what `rand program
+            // show`/`rand_getProgram` will report back for this same program once it lands, so
+            // this is the wallet's confirmation that the file it loaded is the one that will show
+            // up on chain — in the same spelling, not `Program::code_hash()`'s byte-swapped one
+            // (see `rpc_hc_hex`).
+            println!("program id: {id} ({} words, hc {})", p.words.len(), rpc_hc_hex(&p));
             // One RPC call, before any proof: `rand_estimateFee` applies this chain's own
             // `max_program_words` admission (Task 1), so a program over the cap is refused here
             // rather than after a proof the ledger would then throw away.
@@ -633,8 +649,11 @@ async fn main() -> Result<()> {
             let profile = profile_of(&rpc).await?;
             let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, true).await;
             store.save(&path)?;
+            // No repeat of the program id/hc line after submission: both are pure functions of
+            // the file the wallet loaded (checked above, before the proof), never of the chain's
+            // response, so printing them again here would only be a duplicate of the pre-proof
+            // line — `report` below is what actually changed.
             report(&s?, "deploy");
-            println!("program id: {id} ({} words)", p.words.len());
         }
         Cmd::Program(ProgramCmd::Show { id }) => {
             let id = Hash::from_hex(&id).context("invalid program id")?;
@@ -968,5 +987,27 @@ mod tests {
             let e = transcript_verdict(true, &outputs, &bad).unwrap_err().to_string();
             assert!(e.contains("not eight numbers"), "{bad}: {e}");
         }
+    }
+
+    /// The two-spellings-of-`hc` bug (final review, item 1): `rpc_hc_hex` is what `rand program
+    /// deploy` now prints before proving, and it must equal what a node's `check_program` — the
+    /// function `rand_getProgram`'s `code_hash` field is built from — computes for the very same
+    /// program. Exercised against the vendored `evm.bin`, the one image `rand program deploy`
+    /// actually ships in this repo, so this is not just `rpc_hc_hex` checked against its own
+    /// formula: `check_program` is the real admission path (`ConfidentialExecutor`), run here the
+    /// same way a node would run it at deploy time.
+    #[test]
+    fn the_wallets_hc_string_matches_what_the_rpc_would_return_for_the_same_program() {
+        use randprotocol_core::confidential::ConfidentialExecutor;
+
+        let p = guests::compiled::evm();
+        let node_code_hash = executor::ZkExecutor::new(FriProfile::Test)
+            .check_program(p.base_pc, &p.words)
+            .expect("evm.bin is a committed, known-good build");
+
+        assert_eq!(rpc_hc_hex(&p), hex::encode(&node_code_hash));
+        // And it must differ from `Program::code_hash()`'s big-endian spelling of the same eight
+        // words — that mismatch is exactly the bug this fixes.
+        assert_ne!(rpc_hc_hex(&p), p.code_hash());
     }
 }
