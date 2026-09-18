@@ -13,6 +13,10 @@ HASH=$(/usr/local/bin/rand-node init --datadir /root/probe-$$ --genesis deploy/g
 DATA=/root/data-$NODE-${HASH:0:8}
 [ -d $DATA/db ] || /usr/local/bin/rand-node init --datadir $DATA --genesis deploy/genesis.json
 BOOT_ARGS=""; for b in $BOOTSTRAPS; do BOOT_ARGS="$BOOT_ARGS --bootstrap $b"; done
+# Retire the pre-rename service if this box ran one (shrugg-node, the name before RAND). This runs
+# before the rand-node unit is written: the rename once turned this line into `rand-node` itself,
+# which deleted the unit just written below.
+systemctl disable --now shrugg-node 2>/dev/null || true; rm -f /etc/systemd/system/shrugg-node.service
 cat > /etc/systemd/system/rand-node.service <<UNIT
 [Unit]
 Description=RAND full node ($NODE)
@@ -25,8 +29,6 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 UNIT
-# Retire the pre-rename service if this box ran one.
-systemctl disable --now rand-node 2>/dev/null || true; rm -f /etc/systemd/system/rand-node.service
 systemctl daemon-reload
 systemctl enable rand-node
 systemctl restart rand-node
