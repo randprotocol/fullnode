@@ -350,6 +350,89 @@ mod tests {
         }
     }
 
+    /// The golden encodings (final review, item 3): the byte-vector fields that ride the CBOR
+    /// sync wire serialize as bytes, not as a sequence of integers. Bincode writes both forms
+    /// identically (a u64 length, then the bytes), so `encode()` and `hash()` of these fixtures
+    /// were captured at b9026b3, *before* that change, and must never move: the transaction id
+    /// and the consensus encoding are the same on either side of it.
+    #[test]
+    fn the_consensus_encoding_and_txid_are_pinned() {
+        let call = Transaction::shielded(
+            13,
+            bundle(),
+            Action::Call {
+                program: Hash([7; 32]),
+                proof: (0..=255u8).collect(),
+                input_envelope: Some(CallEnvelope {
+                    kem_ct: vec![0xa1; 5],
+                    to_sender: vec![0xb2; 3],
+                    to_auditor: vec![0xc3; 2],
+                    body: vec![0xd4; 7],
+                }),
+            },
+        );
+        let attest = Transaction::shielded(
+            13,
+            bundle(),
+            Action::BridgeAttest {
+                attestation: vec![1, 2, 3, 250],
+                recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                r: [5; 8],
+                time: 9,
+                asset: 1,
+                envelope: env(),
+            },
+        );
+        let aggregate = Transaction {
+            chain_id: 13,
+            bundle: None,
+            action: Action::Aggregate {
+                covers: vec![Hash([1; 32]), Hash([2; 32])],
+                proof: vec![0xee; 300],
+                aggregator: Address([3; 32]),
+                nonce: 4,
+                time: 5,
+                r: [6; 8],
+                envelope: env(),
+                signature: Signature::empty(),
+            },
+        };
+        let got = |tx: &Transaction| {
+            assert_eq!(&Transaction::decode(&tx.encode()).unwrap(), tx);
+            (hex::encode(tx.encode()), hex::encode(blake3::hash(&tx.encode()).as_bytes()), hex::encode(tx.hash().0))
+        };
+        let (call_hex, _, call_id) = got(&call);
+        assert_eq!(call_hex, CALL_HEX);
+        assert_eq!(call_id, CALL_ID);
+        let (_, attest_digest, attest_id) = got(&attest);
+        assert_eq!((attest_digest.as_str(), attest_id.as_str()), (ATTEST_ENCODING_BLAKE3, ATTEST_ID));
+        let (_, aggregate_digest, aggregate_id) = got(&aggregate);
+        assert_eq!((aggregate_digest.as_str(), aggregate_id.as_str()), (AGGREGATE_ENCODING_BLAKE3, AGGREGATE_ID));
+    }
+
+    const CALL_HEX: &str = concat!(
+        "0d0000000000000001010000000100000001000000010000000100000001000000010000000100000002000000020000",
+        "000200000002000000020000000200000002000000020000000300000003000000030000000300000003000000030000",
+        "000300000003000000040000000400000004000000040000000400000004000000040000000400000005000000050000",
+        "0005000000050000000500000005000000050000000500000040420f0000000000000000000000000000000000090000",
+        "000800000000000000010101010101010104000000000000000202020204000000000000000303030310000000000000",
+        "000404040404040404040404040404040408000000000000000101010101010101040000000000000002020202040000",
+        "000000000003030303100000000000000004040404040404040404040404040404280000000000000009090909090909",
+        "090909090909090909090909090909090909090909090909090909090909090909030000000707070707070707070707",
+        "0707070707070707070707070707070707070707070001000000000000000102030405060708090a0b0c0d0e0f101112",
+        "131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142",
+        "434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172",
+        "737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2",
+        "a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2",
+        "d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff010500",
+        "000000000000a1a1a1a1a10300000000000000b2b2b20200000000000000c3c30700000000000000d4d4d4d4d4d4d4",
+    );
+    const CALL_ID: &str = "4596e09bc519323974a0ac14f4679f70c6c6a66e141e7a1d47f44fc7d42f9a97";
+    const ATTEST_ENCODING_BLAKE3: &str = "ad26f941abb2c5e3d320a4206dd9e8b3cd6e6de2dd5df3242d3379c20ba16642";
+    const ATTEST_ID: &str = "ad1d1bb94f68f475e5b98cc49392f838d8ca0b569da812d747bd2f8350c6101a";
+    const AGGREGATE_ENCODING_BLAKE3: &str = "c5f06333b3d6f2e744f6edeb66b612723c1bc4fcf7f98fd8249b40226af64d64";
+    const AGGREGATE_ID: &str = "a25cb696d9d92cecb09c0b4d4c818ae30c6e29ecda1d73944395843e3f350e0f";
+
     #[test]
     fn transactions_roundtrip_and_hash_their_full_encoding() {
         let tx = Transaction::shielded(7, bundle(), Action::None);
