@@ -1054,10 +1054,13 @@ impl Storage {
     }
 
     /// Receipts a program's calls produced, height then index, from `from` up to and including
-    /// `to`, at most `limit` of them. The second return is `None` when the page reached `to` or
-    /// ran out of receipts, and otherwise the height of the first receipt that did not fit — a
-    /// page boundary inside one height re-serves that height's earlier receipts, so a caller
-    /// resuming from it de-duplicates by `tx`.
+    /// `to`, at least `limit` of them: `limit` is a soft floor at height granularity, so a page
+    /// never splits a height — once it is reached, the page keeps taking the rest of the height
+    /// already in progress before it stops, which can exceed `limit` by the rest of that
+    /// height's calls (bounded by however many calls one block can hold). The second return is
+    /// `None` when the page reached `to` or ran out of receipts, and otherwise the first height
+    /// this page did not serve at all — always strictly above every height it did, so a caller
+    /// resuming from it never sees a receipt twice.
     pub fn receipts_for_program(&self, program: &ProgramId, from: u64, to: u64, limit: usize) -> Result<(Vec<CallReceipt>, Option<u64>)> {
         // A zero limit never consumes a receipt, so it must never hand back a `next` either —
         // otherwise a caller that follows the cursor loops forever on the same height.
@@ -1067,6 +1070,7 @@ impl Storage {
         let start = receipt_index_key(program, from, 0);
         let mut out = Vec::new();
         let mut next = None;
+        let mut last_height = None;
         for item in self.db.iterator_cf(self.cf(CF_RECEIPTS_BY_PROGRAM), IteratorMode::From(&start, rocksdb::Direction::Forward)) {
             let (k, v) = item?;
             if k.len() != 44 || &k[..32] != program.as_bytes() {
@@ -1076,13 +1080,16 @@ impl Storage {
             if height > to {
                 break;
             }
-            if out.len() >= limit {
+            // The floor is reached: stop, but only at the first row from a height that is not
+            // the one already in progress, so this height's remaining rows are still served.
+            if out.len() >= limit && last_height != Some(height) {
                 next = Some(height);
                 break;
             }
             let tx = Hash(v[..].try_into().map_err(|_| StorageError::Corrupt("receipt index value".into()))?);
             if let Some(r) = self.receipt(&tx)? {
                 out.push(r);
+                last_height = Some(height);
             }
         }
         Ok((out, next))
@@ -3173,30 +3180,41 @@ mod tests {
         let mut ledger = st.load_ledger(&StubExecutor).unwrap();
         ledger.set_faucet(true);
         ledger.set_height(3);
-        // Two programs, three calls at height 3 (index order 1, 2 for pid_a; 3 for pid_b).
+        // Two programs, three calls at height 3 (index order 1, 2 for pid_a; 3 for pid_b), plus
+        // one more pid_a call alone at height 4 — enough for a `limit` that lands inside height
+        // 3's pair to prove a page never splits a height.
         // Build receipts by hand: the index only needs (program, height, index, tx).
         let pid_a = randprotocol_core::program::program_id(0, &[0x13u32; 3]);
         let pid_b = randprotocol_core::program::program_id(0, &[0x14u32; 3]);
         let mut cb3 = make_block(&blocks[1].block, &mut ledger, vec![], &k);
-        let rec = |pid, index, tx: u8| randprotocol_core::program::CallReceipt {
-            tx: Hash([tx; 32]), program: pid, tier: 1, outputs: [0; 8], height: 3, index, h_in: [0; 8],
+        let rec = |pid, height, index, tx: u8| randprotocol_core::program::CallReceipt {
+            tx: Hash([tx; 32]), program: pid, tier: 1, outputs: [0; 8], height, index, h_in: [0; 8],
             input_envelope: None,
         };
-        cb3.receipts = vec![rec(pid_a, 1, 1), rec(pid_a, 2, 2), rec(pid_b, 3, 3)];
+        cb3.receipts = vec![rec(pid_a, 3, 1, 1), rec(pid_a, 3, 2, 2), rec(pid_b, 3, 3, 3)];
         st.commit(std::slice::from_ref(&cb3), &ledger, &[], &StubExecutor).unwrap();
+        let mut cb4 = make_block(&cb3.block, &mut ledger, vec![], &k);
+        cb4.receipts = vec![rec(pid_a, 4, 0, 4)];
+        st.commit(std::slice::from_ref(&cb4), &ledger, &[], &StubExecutor).unwrap();
 
         let (page, next) = st.receipts_for_program(&pid_a, 0, 10, 10).unwrap();
-        assert_eq!(page.iter().map(|r| r.index).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(page.iter().map(|r| (r.height, r.index)).collect::<Vec<_>>(), vec![(3, 1), (3, 2), (4, 0)]);
         assert_eq!(next, None);
+        // `limit` 1 lands inside height 3's pair: the page keeps both rather than splitting the
+        // height, and `next` is the first height it did not serve at all.
         let (page, next) = st.receipts_for_program(&pid_a, 0, 10, 1).unwrap();
-        assert_eq!(page.len(), 1);
-        assert_eq!(next, Some(3), "the truncated page resumes at the height it stopped in");
+        assert_eq!(page.iter().map(|r| (r.height, r.index)).collect::<Vec<_>>(), vec![(3, 1), (3, 2)]);
+        assert_eq!(next, Some(4), "next is strictly above every height the page served");
+        // Resuming from that cursor picks up exactly where the last page left off.
+        let (page, next) = st.receipts_for_program(&pid_a, 4, 10, 1).unwrap();
+        assert_eq!(page.iter().map(|r| (r.height, r.index)).collect::<Vec<_>>(), vec![(4, 0)]);
+        assert_eq!(next, None, "nothing above height 4 to resume from");
         let (page, next) = st.receipts_for_program(&pid_a, 0, 10, 0).unwrap();
         assert!(page.is_empty(), "limit 0 consumes nothing");
         assert_eq!(next, None, "and must not hand back a cursor a caller could loop on forever");
         let (page, _) = st.receipts_for_program(&pid_b, 4, 10, 10).unwrap();
         assert!(page.is_empty(), "from above the receipt's height");
-        // Truncating below height 3 drops the index rows with the receipts.
+        // Truncating below height 3 drops both heights' index rows with the receipts.
         let at_two = { let mut l = gs.ledger.clone(); for cb in &blocks { l.apply_block(&cb.block, &StubExecutor).unwrap(); } l };
         st.truncate_to(&gs, 2, &at_two).unwrap();
         assert!(st.receipts_for_program(&pid_a, 0, 10, 10).unwrap().0.is_empty());

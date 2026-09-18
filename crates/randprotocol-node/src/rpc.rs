@@ -1113,8 +1113,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             Ok(st.storage.receipt(&h).map_err(RpcError::internal)?.map(|r| receipt_json(&r)).unwrap_or(Value::Null))
         }
         // A program's receipts, height then index, the index Task 2 built for it. `limit` is
-        // clamped rather than refused, like `rand_getCompactBlocks`'s page; `next_height` is the
-        // height to resume from, `null` once the range is exhausted.
+        // clamped rather than refused, like `rand_getCompactBlocks`'s page, but it is a soft
+        // floor: a page never splits a height, so it may exceed `limit` by the rest of its last
+        // height's calls, bounded by however many calls one block can hold. `next_height` is the
+        // first height this page did not serve, `null` once the range is exhausted.
         "rand_getReceipts" => {
             let program: ProgramId = parse_hash(p, 0)?;
             let from: u64 = param(p, 1, "from_height")?;
@@ -2115,7 +2117,8 @@ mod tests {
 
     /// A program's receipts, height then index, paged the way `rand_getCompactBlocks` pages
     /// blocks: an unbounded or oversized `limit` is clamped, an empty range is an empty page,
-    /// and `next_height` is the height to resume from.
+    /// `next_height` is the first height the page did not serve, and a page never splits a
+    /// height — a `limit` that lands inside one still returns that whole height's receipts.
     #[tokio::test]
     async fn get_receipts_pages_one_program_by_height_and_index() {
         let (_d, st, pid, sealed, bare) = receipt_chain().await;
@@ -2124,15 +2127,17 @@ mod tests {
         assert_eq!(txs, vec![sealed.hash().to_hex(), bare.hash().to_hex()]);
         assert!(v["next_height"].is_null());
         assert_eq!(v["receipts"][0], ok(&st, "rand_getReceipt", json!([sealed.hash().to_hex()])).await, "one object shape");
+        // `limit` 1 lands inside height 1's pair of receipts: the page still holds both rather
+        // than splitting the height, and there is nothing above it to resume from.
         let v = ok(&st, "rand_getReceipts", json!([pid.to_hex(), 0, 10, 1])).await;
-        assert_eq!(v["receipts"].as_array().unwrap().len(), 1);
-        assert_eq!(v["next_height"], 1);
+        assert_eq!(v["receipts"].as_array().unwrap().len(), 2);
+        assert!(v["next_height"].is_null());
         let v = ok(&st, "rand_getReceipts", json!([pid.to_hex(), 2, 10])).await;
         assert!(v["receipts"].as_array().unwrap().is_empty());
         let e = call(&st, "rand_getReceipts", json!([pid.to_hex(), 5, 2])).await.err().unwrap();
         assert_eq!(e.code, -32602);
         let v = ok(&st, "rand_getReceipts", json!([pid.to_hex(), 0, 10, 100_000])).await;
-        assert!(v["receipts"].as_array().unwrap().len() <= MAX_RECEIPTS_PAGE, "the limit is capped, not refused");
+        assert_eq!(v["receipts"].as_array().unwrap().len(), 2, "the limit is capped, not refused");
     }
 
     /// `rand_getWitness`, folded over several leaves at once: one root, one path per index, and
