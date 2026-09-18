@@ -108,3 +108,52 @@ fn prove_takes_a_backend_and_cpu_is_unchanged() {
     let out = ex.verify_call(&record(&p), &proof).unwrap();
     assert_eq!((out.outputs, out.tier), (outputs, tier));
 }
+
+/// A program deployed with a public input (the call limits, spec §5): `verify_call` compares the
+/// proof's `pv::PUB0..7` with the record's deploy-time digest, never re-hashing any words.
+#[test]
+fn a_call_is_checked_against_the_records_public_digest() {
+    use randprotocol_zkvm::machine::Machine;
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::public_echo();
+    let public = [11u32, 22, 33, 44];
+    let ex = ZkExecutor::new(FriProfile::Test);
+    assert_eq!(ex.public_digest(&public), randprotocol_zkvm::hash::public_digest(&public));
+    let with = ProgramRecord {
+        id: randprotocol_core::program::program_id_with_public(p.base_pc, &p.words, &public),
+        public_digest: Some(ex.public_digest(&public)),
+        ..record(&p)
+    };
+    let (proof, exec) = m.prove(&p, &[], &public, None).unwrap();
+    let proof = proof.to_bytes();
+    let out = ex.verify_call(&with, &proof).expect("proved with the program's public input");
+    assert_eq!(out.outputs, exec.outputs);
+    let public_values = |r: Result<_, ConfidentialError>| match r {
+        Err(ConfidentialError::InvalidProof(e)) => e == "PublicValues",
+        _ => false,
+    };
+    // Other words, and the empty input, against the same program.
+    let (other, _) = m.prove(&p, &[], &[11, 22, 33, 45], None).unwrap();
+    assert!(public_values(ex.verify_call(&with, &other.to_bytes())));
+    // A record without a digest takes only the empty input: the same proof is refused.
+    assert!(public_values(ex.verify_call(&record(&p), &proof)));
+    // The empty input against a program deployed with one (a guest that never reads its public
+    // segment still commits to it, so the empty-input proof is a different statement).
+    let f = guests::fib(10);
+    let fib_with = ProgramRecord { public_digest: Some(ex.public_digest(&public)), ..record(&f) };
+    let (empty, _) = m.prove(&f, &[], &[], None).unwrap();
+    assert!(public_values(ex.verify_call(&fib_with, &empty.to_bytes())));
+    let (committed, _) = m.prove(&f, &[], &public, None).unwrap();
+    assert!(ex.verify_call(&fib_with, &committed.to_bytes()).is_ok());
+}
+
+/// A program deployed without a public input keeps its old id and still verifies `&[]` proofs.
+#[test]
+fn a_program_without_a_public_input_keeps_its_id_and_its_empty_input_proofs() {
+    let p = guests::private_payment(1000);
+    let rec = record(&p);
+    assert_eq!(rec.id, randprotocol_core::program::program_id_with_public(p.base_pc, &p.words, &[]));
+    assert_eq!(rec.public_digest, None);
+    let (proof, outputs, _) = shared();
+    assert_eq!(ZkExecutor::new(FriProfile::Test).verify_call(&rec, proof).unwrap().outputs, *outputs);
+}

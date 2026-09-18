@@ -29,10 +29,12 @@
 //! segment's `public_log_height` (**mandatory**: every proof commits to a public segment, even
 //! an empty one, which declares `tables::public::MIN_LOG_HEIGHT`). The public segment also
 //! changes *what* verification means: `H_PUB` (`pv::PUB0..7`) is unsalted, so a verifier that
-//! holds the words can recompute it — `Machine::verify_public`. This chain publishes no public
-//! words with any transaction today, so the only public segment a proof may commit to here is
-//! the empty one: both `verify_call` and `verify_bundle` run `verify_public(hc, &[], proof)`,
-//! which pins `H_PUB` to `hash::public_digest(&[])`. Plain `verify` would leave `pv::PUB0..7`
+//! holds the words can recompute it — `Machine::verify_public`. `verify_bundle` runs
+//! `verify_public(hc, &[], proof)`, which pins `H_PUB` to `hash::public_digest(&[])`. Since the
+//! call limits (spec §5) a program may be deployed with a public input, whose digest the ledger
+//! records once at deploy (`ProgramRecord::public_digest`); `verify_call` runs `verify` and then
+//! compares `pv::PUB0..7` with that digest, or with `public_digest(&[])` for a program without
+//! one — the same check as `verify_public`, without re-hashing the words on every call. Plain `verify` would leave `pv::PUB0..7`
 //! unchecked against anything outside the proof — a guest reading a prover-chosen public
 //! segment the chain never saw — and every honest proof by today's guests (none of which calls
 //! `SYS_READ_PUBLIC`) has the empty segment anyway, so the stronger check costs nothing.
@@ -183,8 +185,8 @@ impl ZkExecutor {
         // are the eight `H_IN` words (`CallOutcome::h_in`, which a call receipt publishes); a
         // slot outside 32 bits cannot come from an honest trace — an output is a register word
         // and `H_IN` is a digest encoded as byte sums. The eight `H_PUB` words need no range
-        // check of their own: `verify_public(.., &[], ..)` compares them against the empty
-        // segment's digest wholesale, and `Machine::verify` has already insisted every public
+        // check of their own: `verify_call` and `verify_bundle` compare them against an expected
+        // digest wholesale, and `Machine::verify` has already insisted every public
         // value is a canonical field element.
         if proof.public_values.len() != pv::NUM {
             return Err(ConfidentialError::MalformedProof);
@@ -295,9 +297,10 @@ impl ConfidentialExecutor for ZkExecutor {
     /// and this warms exactly one value of each, on the same grounds as the keccak class —
     /// `NO_SHA256` (no deployed guest calls `SYS_SHA256` either) and
     /// `public::public_log_height(0)` (the empty public segment's declared height,
-    /// `tables::public::MIN_LOG_HEIGHT`; `verify_call` admits no other segment — see its
-    /// `verify_public` call — so no proof this chain accepts can declare another public class
-    /// honestly).
+    /// `tables::public::MIN_LOG_HEIGHT`). A program deployed with a public input (the call
+    /// limits, spec §5) proves at `public_log_height(len)`, which this does not warm: the record
+    /// carries only the input's digest, not its length, so its first call pays the key build
+    /// once per class, like an unwarmed tier.
     fn warm(&self, record: &ProgramRecord) {
         let log_height = program::program_log_height(record.words.len());
         let smallest = input::MIN_LOG_HEIGHT;
@@ -319,11 +322,17 @@ impl ConfidentialExecutor for ZkExecutor {
         // neither the program's word count (only its `hc`) nor its private-input width.
         let proof = self.decode_and_check(proof, 0, 0, false)?;
         let hc = Self::hc_of(record)?;
-        // Constraint set 6: `verify_public` with the empty segment. The chain publishes no
-        // public words with any transaction, so the only `H_PUB` a proof may commit to is
-        // `hash::public_digest(&[])` — plain `verify` would accept any value there, bound
-        // in-circuit to a public segment the chain never saw (see the module doc comment).
-        self.machine.verify_public(&hc, &[], &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+        // The call limits (spec §5): `verify`, then `pv::PUB0..7` against the public input the
+        // program was deployed with — its record's digest, computed once at deploy, so no word is
+        // re-hashed here. A program deployed without one takes only `hash::public_digest(&[])`,
+        // exactly `verify_public(hc, &[], proof)`, today's rule. Plain `verify` alone would
+        // accept any `H_PUB`, bound in-circuit to a public segment the chain never saw (see the
+        // module doc comment). A mismatch reports as `verify_public`'s own `PublicValues`.
+        self.machine.verify(&hc, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+        let want = record.public_digest.unwrap_or_else(|| crate::hash::public_digest(&[]));
+        if (0..8).any(|i| proof.public_values[pv::PUB0 + i] != want[i] as u64) {
+            return Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
+        }
         let outputs = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
         // M4.1/S3: `H_IN` travels to the receipt so a call-input envelope sealed against it can
         // be opened and checked later (spec §6.1). `decode_and_check` has already refused a
