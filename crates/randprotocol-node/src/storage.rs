@@ -709,6 +709,14 @@ impl Storage {
         Ok(self.get_meta_raw(META_AGGREGATORS)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
     }
 
+    /// The chain's genesis aggregation section, `None` without one — and equally for a database
+    /// written before the key existed, which is what `Ledger::from_parts` would have left it.
+    /// Genesis truth, never changed after `init_genesis`, so a reader that needs only the config
+    /// (`rand_getEmission`) reads it here rather than rebuilding the ledger through `load_ledger`.
+    pub fn aggregation_config(&self) -> Result<Option<randprotocol_core::ledger::aggregation::AggregationConfig>> {
+        Ok(self.get_meta_raw(META_AGGREGATION)?.map(|b| bincode::deserialize(&b)).transpose()?.flatten())
+    }
+
     /// Every leaf in tree order. The witness source, and the check `load_ledger` runs the
     /// stored frontier against.
     fn leaves(&self) -> Result<Vec<Word8>> {
@@ -1213,10 +1221,7 @@ impl Storage {
         ledger.set_supply(self.supply()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
-        if let Some(cfg) = self.get_meta_raw(META_AGGREGATION)? {
-            let cfg: Option<randprotocol_core::ledger::aggregation::AggregationConfig> = bincode::deserialize(&cfg)?;
-            ledger.set_aggregation(cfg);
-        }
+        ledger.set_aggregation(self.aggregation_config()?);
         ledger.set_bridge(self.load_bridge()?);
         Ok(ledger)
     }
@@ -3298,6 +3303,18 @@ mod tests {
         assert_eq!(st.receipts_for_program(&pid, 0, 5, 10).unwrap().0.len(), 1);
     }
 
+    /// A chain without an aggregation section reads back `None`, and so does a database whose
+    /// meta predates the key; the gated half of this is in `seal_tests`.
+    #[test]
+    fn aggregation_config_is_none_on_an_ungated_genesis() {
+        let (_d, s, gs) = genesis_with_two_notes();
+        assert!(gs.ledger.aggregation().is_none());
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.aggregation_config().unwrap(), None);
+        s.db.delete_cf(s.cf(CF_META), META_AGGREGATION.as_bytes()).unwrap();
+        assert_eq!(s.aggregation_config().unwrap(), None, "a key never written is no section");
+    }
+
     /// `tx_location` decodes only the two leading fields of a record; for both forms it must
     /// agree with the full decode, including when the rest of the record is a large proof it
     /// never reads.
@@ -3714,6 +3731,30 @@ mod seal_tests {
         let block1 = storage.block_by_height(1).unwrap().unwrap();
         let register_tx = &block1.transactions[1];
         assert!(matches!(storage.tx_record(&register_tx.hash()).unwrap().unwrap(), TxRecord::Raw { .. }), "an unsealed bundle is never pruned");
+    }
+
+    /// A gated genesis's section round-trips through the accessor `rand_getEmission` reads, and
+    /// agrees with what `load_ledger` restores.
+    #[test]
+    fn aggregation_config_round_trips_a_gated_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let shape = DeclaredShape {
+            profile: FriProfile::Test,
+            tier: 14,
+            program_log_height: 13,
+            input_log_height: 12,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 2,
+            mem_log_height: 18,
+        };
+        let cfg = gated_cfg(shape, Hash::digest(b"the bundle guest"), 256);
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 100);
+        gs.ledger.set_aggregation(Some(cfg.clone()));
+        storage.init_genesis(&gs).unwrap();
+        assert_eq!(storage.aggregation_config().unwrap(), Some(cfg.clone()));
+        assert_eq!(storage.load_ledger(&StubExecutor).unwrap().aggregation(), Some(&cfg));
     }
 
     /// `verify_chain` on a pruned store recomputes the direct ledger exactly (spec §6.2's

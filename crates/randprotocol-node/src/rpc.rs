@@ -1700,22 +1700,22 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // genesis allocation, the testnet faucet, or the bounded aggregation subsidy below — so
         // the field is constant rather than computed. `subsidy` is `null` without an aggregation
         // section (there is then no schedule to report), otherwise the current per-block amount
-        // and the halving math `sealed_blocks` indexes into. One `load_ledger` supplies both the
-        // config and `sealed_blocks`: it is the only source for the former, and reading the
-        // latter off the same rebuild (rather than a second `storage.supply()` call) keeps them
-        // from a database write landing between two separate reads.
+        // and the halving math `sealed_blocks` indexes into. Two meta reads, never a
+        // `load_ledger` (spec §1: no second way to trigger a commitment-tree rebuild): the config
+        // is genesis truth and never changes after `init_genesis`, so a commit landing between
+        // the two reads can only move `sealed_blocks`, and the answer is then as of that commit.
         "rand_getEmission" => {
             let faucet = st.status.read().unwrap_or_else(|e| e.into_inner()).faucet;
             let storage = st.storage.clone();
-            let executor = st.executor.clone();
-            let (cfg, sealed) = blocking(move || {
-                let ledger = storage.load_ledger(executor.as_ref())?;
-                Ok((ledger.aggregation().cloned(), ledger.supply().sealed_blocks))
-            })
-            .await?;
+            let (cfg, sealed) =
+                blocking(move || Ok((storage.aggregation_config()?, storage.supply()?.sealed_blocks))).await?;
             let subsidy = cfg.map(|cfg| {
                 let current = randprotocol_core::gas::subsidy(sealed, &cfg);
-                let next_halving_at = (sealed / cfg.halving_blocks + 1) * cfg.halving_blocks;
+                // Saturating: past the last representable halving the multiply would overflow
+                // (a debug-build panic on the RPC thread); `u64::MAX` reads as "never". Genesis
+                // validation refuses a zero `halving_blocks`, which `subsidy` divides by too.
+                let next_halving_at =
+                    (sealed / cfg.halving_blocks).saturating_add(1).saturating_mul(cfg.halving_blocks);
                 json!({
                     "current": current.to_string(),
                     "base": cfg.subsidy_base.to_string(),
@@ -2685,6 +2685,41 @@ mod tests {
         assert_eq!(s["sealed_blocks"], 1, "the fixture's one committed aggregate");
         assert_eq!(s["current"], (100 * randprotocol_core::UNITS_PER_RAND).to_string());
         assert_eq!(s["next_halving_at"], 210_000);
+    }
+
+    /// The emission arm reads the config and `sealed_blocks` from meta alone (no ledger
+    /// rebuild), and its halving math saturates instead of overflowing at the top of `u64`.
+    /// Needs no recursion fixture: the section is synthetic, since only its numbers are read.
+    #[tokio::test]
+    async fn get_emission_reads_meta_and_saturates_the_next_halving() {
+        use randprotocol_core::ledger::aggregation::AggregationConfig;
+        let mut gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let cfg = AggregationConfig {
+            bond: 100,
+            max_covers: 4,
+            subsidy_base: 1_000,
+            halving_blocks: 3,
+            window: 16,
+            admitted_shapes: vec![],
+        };
+        gs.ledger.set_aggregation(Some(cfg));
+        let mut supply = gs.ledger.supply();
+        supply.sealed_blocks = 7;
+        gs.ledger.set_supply(supply);
+        let (_d, st) = state_for(&gs);
+        let s = &ok(&st, "rand_getEmission", json!([])).await["subsidy"];
+        assert_eq!(s["sealed_blocks"], 7);
+        assert_eq!(s["current"], "250", "two halvings in: 1000 >> 2");
+        assert_eq!(s["next_halving_at"], 9);
+
+        let mut top = gs.clone();
+        let mut supply = top.ledger.supply();
+        supply.sealed_blocks = u64::MAX;
+        top.ledger.set_supply(supply);
+        let (_d2, st2) = state_for(&top);
+        let s = &ok(&st2, "rand_getEmission", json!([])).await["subsidy"];
+        assert_eq!(s["current"], "0");
+        assert_eq!(s["next_halving_at"], u64::MAX, "saturates rather than overflowing");
     }
 
     /// An explorer can name and summarise every new action. Amounts that are public by design
