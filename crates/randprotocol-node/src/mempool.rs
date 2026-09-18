@@ -21,7 +21,9 @@ use randprotocol_core::ledger::bridge_notes;
 use randprotocol_core::ledger::staking::StakingError;
 use randprotocol_core::notes::{word8_from_bytes, word8_to_hex};
 use randprotocol_core::{Action, Address, Hash, Ledger, Transaction, TxError, Word8};
+use serde::Serialize;
 use std::collections::HashMap;
+use std::time::Instant;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
 pub enum MempoolError {
@@ -68,6 +70,8 @@ struct Pooled {
     /// The register nonce this transaction claims, for an `Unbond`, a `Withdraw` or an
     /// `Aggregate` — see [`claimed_nonce`].
     claim: Option<(Address, u64)>,
+    /// When this transaction entered the pool, for `Mempool::info`'s oldest-entry age.
+    since: Instant,
 }
 
 /// The register nonce a bundle-less `Unbond` or `Withdraw` claims — and the aggregator
@@ -135,6 +139,17 @@ fn claimed_commitments(tx: &Transaction, ledger: &Ledger, executor: &dyn Confide
     v
 }
 
+/// A snapshot of the pool's occupancy for `rand_getMempoolInfo`: how many transactions it
+/// holds, their combined encoded size, and how long the oldest of them has waited — `None` when
+/// the pool is empty, since there is no entry to date it against.
+#[derive(Clone, Debug, Serialize)]
+pub struct MempoolInfo {
+    pub count: usize,
+    pub bytes: usize,
+    pub oldest_ms: Option<u64>,
+    pub max_count: usize,
+}
+
 impl Mempool {
     pub fn new(max_size: usize) -> Mempool {
         Mempool {
@@ -157,6 +172,17 @@ impl Mempool {
 
     pub fn contains(&self, hash: &Hash) -> bool {
         self.txs.contains_key(hash)
+    }
+
+    /// The pool's occupancy as of `now`: count, combined encoded size, and the oldest entry's
+    /// age in milliseconds (`None` when the pool is empty).
+    pub fn info(&self, now: Instant) -> MempoolInfo {
+        MempoolInfo {
+            count: self.txs.len(),
+            bytes: self.txs.values().map(|p| p.tx.encoded_len()).sum(),
+            oldest_ms: self.txs.values().map(|p| now.saturating_duration_since(p.since).as_millis() as u64).max(),
+            max_count: self.max_size,
+        }
     }
 
     pub fn get(&self, hash: &Hash) -> Option<&Transaction> {
@@ -294,7 +320,7 @@ impl Mempool {
         for mu in tx.bridge_digests() {
             self.digests.insert(mu, hash);
         }
-        self.txs.insert(hash, Pooled { tx, commitments, claim });
+        self.txs.insert(hash, Pooled { tx, commitments, claim, since: Instant::now() });
         hash
     }
 
@@ -539,6 +565,7 @@ mod tests {
     use randprotocol_core::ledger::ANCHOR_WINDOW;
     use randprotocol_core::notes::ShieldedAddress;
     use randprotocol_core::types::Action;
+    use std::time::Duration;
 
     /// A ledger at the fixtures' genesis, with the faucet on and a height past 0 so bundles can
     /// carry a `time` inside the window.
@@ -574,6 +601,21 @@ mod tests {
         assert_eq!(m.candidates_within(&l, 10, one).len(), 1);
         assert_eq!(m.candidates_within(&l, 10, 1).len(), 0);
         assert_eq!(m.candidates_within(&l, 10, usize::MAX).len(), 2);
+    }
+
+    #[test]
+    fn info_counts_bytes_and_the_oldest_entry() {
+        let l = ledger();
+        let mut pool = Mempool::new(100);
+        let tx = fixtures::bundle_tx(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee());
+        pool.insert(tx.clone(), &l, &StubExecutor).unwrap();
+        let t0 = Instant::now();
+        let empty = Mempool::new(10).info(t0);
+        assert_eq!((empty.count, empty.bytes, empty.oldest_ms, empty.max_count), (0, 0, None, 10));
+        let info = pool.info(t0 + Duration::from_millis(1_500));
+        assert_eq!(info.count, 1);
+        assert_eq!(info.bytes, tx.encoded_len());
+        assert!(info.oldest_ms.unwrap() >= 1_500);
     }
 
     /// A transaction larger than a block never enters the pool.

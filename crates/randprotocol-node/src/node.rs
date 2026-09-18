@@ -1249,6 +1249,9 @@ impl Node {
                     next: tip.derive_next_set().iter().map(|v| v.address()).collect(),
                 });
             }
+            NodeCommand::MempoolInfo { reply } => {
+                let _ = reply.send(self.mempool.info(Instant::now()));
+            }
         }
         Ok(())
     }

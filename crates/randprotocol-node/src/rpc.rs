@@ -157,6 +157,10 @@ pub enum NodeCommand {
     /// is derived from the tip's register, which only the replica holds — and deriving it on
     /// every pass of the loop, to keep a snapshot fresh, would cost a set clone per message.
     Epoch { reply: oneshot::Sender<EpochInfo> },
+    /// The pool's occupancy — count, combined encoded size, oldest entry's age — for
+    /// `rand_getMempoolInfo`. Answered by the node loop rather than read from a shared snapshot
+    /// because the pool itself lives there.
+    MempoolInfo { reply: oneshot::Sender<crate::mempool::MempoolInfo> },
 }
 
 /// The answer to [`NodeCommand::Epoch`]: the current epoch, its length, and the sets of this
@@ -1472,6 +1476,12 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "next_set": info.next.iter().map(|a| a.to_base58()).collect::<Vec<_>>(),
             }))
         }
+        "rand_getMempoolInfo" => {
+            let (reply, rx) = oneshot::channel();
+            st.node.send(NodeCommand::MempoolInfo { reply }).await.map_err(|_| RpcError::internal("node loop closed"))?;
+            let info = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
+            Ok(serde_json::to_value(info).map_err(RpcError::internal)?)
+        }
         // The supply audit (`ledger::supply`). Note values are hidden, but every crossing of the
         // pool's boundary is public, so this is exact rather than an estimate — and
         // `--verify-chain` recomputes every counter in it by replaying the chain.
@@ -1546,8 +1556,19 @@ mod tests {
         };
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
-                if let NodeCommand::Epoch { reply } = cmd {
-                    let _ = reply.send(info.clone());
+                match cmd {
+                    NodeCommand::Epoch { reply } => {
+                        let _ = reply.send(info.clone());
+                    }
+                    NodeCommand::MempoolInfo { reply } => {
+                        let _ = reply.send(crate::mempool::MempoolInfo {
+                            count: 2,
+                            bytes: 100,
+                            oldest_ms: Some(5),
+                            max_count: 10_000,
+                        });
+                    }
+                    _ => {}
                 }
             }
         });
@@ -2236,6 +2257,14 @@ mod tests {
         assert_eq!(v["epoch_blocks"], gs.epoch_blocks);
         // The only validator meets the minimum, so it is what the next epoch would run with.
         assert_eq!(v["next_set"], json!([key(1).address().to_base58()]));
+    }
+
+    #[tokio::test]
+    async fn get_mempool_info_reports_the_node_loops_answer() {
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_d, st) = state_for(&gs);
+        let v = ok(&st, "rand_getMempoolInfo", json!([])).await;
+        assert_eq!(v, json!({ "count": 2, "bytes": 100, "oldest_ms": 5, "max_count": 10_000 }));
     }
 
     /// The supply audit: hidden note values, public boundary crossings. The one number that
