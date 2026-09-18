@@ -101,6 +101,12 @@ and the transaction names 1`, `the burn's asset bundle burns 399, not the 400 th
 
 Acceptance is not commitment: poll `rand_getTransaction` until it returns a block.
 
+A transaction larger than the chain's block cap (`max_block_bytes` from `rand_getLimits`; 4 MiB by
+default) is refused here with `-32000`, naming both sizes, before it reaches the mempool. The
+request body itself is capped at `2 × (2 × max_proof_bytes + 2 × 2048 + max_call_envelope_bytes +
+16 384 + 64 KiB) + 256 KiB` — 8 859 648 bytes on a default chain — computed from the genesis at
+startup; a body over it is `-32600` naming the limit.
+
 ### `rand_mint` (testnet faucet)
 Params: `[address]` or `[address, amount]`, where `address` is a `rand1…` shielded address and
 `amount` is a string of units, at most `100000000000` (100 RAND; the default). Result: the mint
@@ -257,8 +263,34 @@ imported.
 
 ### `rand_getProgram`
 Params: `[program_id]`. Result: `null` or
-`{ "id", "base_pc", "words_len", "code_hash", "deployed_at" }`. There is no `deployer` field: a
-deploy is paid by a bundle, so the chain does not know who deployed it.
+`{ "id", "base_pc", "words_len", "code_hash", "deployed_at", "public_words_len", "public_digest" }`.
+There is no `deployer` field: a deploy is paid by a bundle, so the chain does not know who deployed
+it.
+
+`public_words_len` is the length of the program's deploy-time public input (0 without one), and
+`public_digest` is its `Word8` hex digest — the value every call's proof is checked against — or
+`null` for a program deployed without a public input. The words themselves are
+`rand_getProgramPublic`'s.
+
+### `rand_getProgramPublic`
+Params: `[program_id]`. Result: the program's deploy-time public words as one hex string, each word
+as its 4 little-endian bytes (8 hex digits a word, the same byte order as a `Word8` digest):
+`[1, 2, 0xdeadbeef]` is `"0100000002000000efbeadde"`. `""` for a program deployed without a public
+input, `null` for an id no program has. A wallet proving a call passes these words to the prover:
+the proof commits to them and the ledger checks that commitment against `public_digest`.
+
+### `rand_getLimits`
+Params: `[]`. Result: the chain's five call limits, from its genesis:
+
+```json
+{ "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+  "max_call_envelope_bytes": 18432, "max_program_public_words": 0 }
+```
+
+Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
+from these instead of hard-coding them: the most words a program may have, the largest proof, the
+largest transaction (a block's worth), the largest call-input envelope, and the most public words a
+deploy may carry.
 
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -269,13 +301,18 @@ Params: `[tx_hash]`. Result: `null` until the call is committed, then
 
 ```json
 { "tx": "…", "program": "…", "tier": 14, "outputs": [1, 0, 25, 0, 0, 0, 0, 0], "height": 17,
-  "index": 0, "h_in": "9c0e…7f" }
+  "index": 0, "h_in": "9c0e…7f", "h_pub": null }
 ```
 
 `h_in` is the proof's public commitment to the call's *private* inputs (`Word8` hex, zkVM M4.1).
 It discloses nothing on its own — it is a salted digest — and it is what a call-input envelope is
 sealed against, so a holder needs it to open one (`rand_getCallEnvelope`) and to check an
 opened transcript with `hash::input_digest(salt, inputs)`.
+
+`h_pub` is the digest of the program's deploy-time public input the call's proof was checked
+against (`Word8` hex, the program's `public_digest`). `null` means the program was deployed without
+a public input, and the proof was checked against the digest of the *empty* public input,
+`public_digest([])`. The node does not repeat that constant digest in every receipt.
 
 There is no `effect` field: effect kind 1 (the program-driven transfer to an account) was deleted
 with the accounts. A call's outputs are recorded and nothing else moves; value moves only through
@@ -301,12 +338,21 @@ published no envelope (`--no-envelope`), the transaction is not a call, or this 
 receipt for that hash.
 
 ### `rand_estimateFee`
-Params: `[spec]`, one of `{"kind":"bundle"}`, `{"kind":"deploy","words":n}` or
-`{"kind":"call","tier":t}` (`t` one of 10, 12, 14, 16, 18, 20). Result: the minimum fee in units,
-as a string. `{"kind":"bundle"}` is the floor for a plain transfer: `1000000`. A deploy of more words
-than the chain's program cap (4096, or the genesis file's `max_program_words`) is an invalid-params
-error (`-32602`) naming the cap — the same program admission would refuse, so a wallet can ask
-before it proves.
+Params: `[spec]`, one of `{"kind":"bundle"}`, `{"kind":"deploy","words":n,"public_words":m}` or
+`{"kind":"call","tier":t,"bytes":b}` (`t` one of 10, 12, 14, 16, 18, 20). Result: the minimum fee
+in units, as a string. `{"kind":"bundle"}` is the floor for a plain transfer: `1000000`. A deploy of
+more words than the chain's program cap (4096, or the genesis file's `max_program_words`) is an
+invalid-params error (`-32602`) naming the cap — the same program admission would refuse, so a
+wallet can ask before it proves.
+
+`public_words` (optional, default 0) is the deploy's public input length. Public words are paid for
+per word like code, so the fee is the deploy fee of `n + m` words. More than the chain's
+`max_program_public_words` (0 by default) is `-32602`, naming the cap, in the same shape.
+
+`bytes` (optional, default 0) is the call's proof length plus its input envelope's length. A call
+at or under the free allowance (2 097 152 + 18 432 bytes) costs what it did before this field
+existed; each KiB over it, a partial KiB counting as whole, adds 1000 units. Without `bytes` the
+answer is the old one. Anything but a non-negative integer is `-32602`.
 
 ### `rand_getTransaction`
 Params: `[hash]`. Result: `null` until committed, then:
@@ -332,8 +378,11 @@ Params: `[hash]`. Result: `null` until committed, then:
 by length only; anyone who wants the bytes can fetch the block. Other actions:
 
 - `{ "kind": "mint", "cm": "…", "amount": 100000000000, "minter": "<validator base58>" }`
-- `{ "kind": "deploy", "program": "<program id>", "words": 412 }`
+- `{ "kind": "deploy", "program": "<program id>", "words": 412, "public_words_len": 0 }`
 - `{ "kind": "call", "program": "<program id>", "proof_len": 268123, "input_envelope_len": 1280 }`
+
+`public_words_len` is the length of the deploy-time public input; the words are
+`rand_getProgramPublic`'s once the deploy commits.
 
 `input_envelope_len` is the size of the call's encrypted input transcript, or `null` when the call
 carries none. Like every other envelope it is reported by length alone: the transcript opens for
@@ -946,6 +995,27 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-19 — call limits: two methods, new fields, limits from the genesis
+
+For the chain cut that sets the call-limit genesis fields (`max_proof_bytes`, `max_block_bytes`,
+`max_call_envelope_bytes`, `max_program_public_words`). A default chain's answers are unchanged,
+apart from the new fields. Changes:
+
+- **`rand_getLimits`**, new: the chain's five limits, so wallets stop hard-coding them.
+- **`rand_getProgramPublic(program_id)`**, new: a program's deploy-time public words, as hex of
+  their little-endian bytes. It returns `""` for a program without a public input.
+- **`rand_getProgram`** adds `public_words_len` and `public_digest`, which is `null` without a public
+  input.
+- **Receipts** (`rand_getReceipt`, `rand_getReceipts`, the `receipts` topic) add `h_pub`. It is
+  `null` when the proof was checked against the empty public input.
+- **`rand_getTransaction`** and the blocks: a deploy action adds `public_words_len`.
+- **`rand_estimateFee`** takes `public_words` for a deploy and `bytes` for a call. Both are
+  optional and default to 0, so old callers get the old answers.
+- **Limits from the genesis.** The request-body limit and `rand_sendTransaction`'s block-size
+  pre-check now come from the genesis. So do the node's sync budget (`max_block_bytes + 2 MiB`)
+  and its gossip transmit size (`max(16 MiB, max_block_bytes + 1 MiB)`). On a default chain they
+  are the old constants.
 
 ### 2026-09-18 — for the v0.4 chain: the program cap is a genesis parameter
 
