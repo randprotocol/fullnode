@@ -5,9 +5,12 @@ logged, method by method, in [`docs/rpc.md`](docs/rpc.md#changelog).
 
 ## 🚀 RAND fullnode v0.3 — the RPC catches up with Ethereum and Solana
 
-**Released 2026-09-18 · tag commit `c36d690` · chain 12 (genesis `605eb783…`) · same-chain update, no fork**
+**Released 2026-09-18 · chain 12 (genesis `605eb783…`) · same-chain update, no fork**
 
-The fleet runs `4504a03`. The tag sits two commits later, adding the `rand viewing-key` and `rand tx-key` wallet commands and one node-side fix. See [Keys you can hand out](#-keys-you-can-hand-out).
+The fleet runs `4504a03`. The tag also carries two later groups of commits, neither deployed yet:
+
+- `3ee3913`, `c36d690`: the `rand viewing-key` and `rand tx-key` wallet commands and one node-side fix. See [Keys you can hand out](#-keys-you-can-hand-out).
+- `3cfc0a2..10422b6`: the program cap as an optional genesis parameter, and deploys of `rand-guest` images. See [Also included](#-also-included-the-program-cap-as-a-genesis-parameter).
 
 v0.3 is an RPC release. We lined the node's JSON-RPC up against Ethereum's execution API and
 Solana's RPC, method by method. Then we added the methods a wallet or explorer author reaches for
@@ -115,6 +118,22 @@ bundle:1        change               99.979 RAND  b5624451…9654
 **Node change:** `rand_checkTransaction` now also discloses a faucet mint's note (`mint:0`).
 Its recipient recovers the key through the envelope's KEM half. The chain-12 fleet runs
 `4504a03`, so this check applies once nodes are rebuilt at or after `c36d690`.
+
+---
+
+### 🧩 Also included: the program cap as a genesis parameter
+
+These ten commits were written for the v0.4 chain and change nothing on chain 12.
+
+- A genesis file may set `max_program_words` (`1..=65535`). Absent, the cap stays 4096 words and
+  the genesis hash is unchanged, so running chains see no difference. The ledger, admission,
+  reload and `rand_estimateFee` all read it.
+- `rand_estimateFee` for a deploy refuses past the chain's cap, with the cap in the message. No
+  method, parameter or result shape changed.
+- `rand program deploy` accepts the image container `rand-guest build` emits, prints `hc` in
+  `rand_getProgram`'s spelling, and refuses an over-cap program before any proving.
+- It takes effect on the chain cut that sets the field. Details are in `docs/rpc.md`, entry
+  "for the v0.4 chain".
 
 ---
 
