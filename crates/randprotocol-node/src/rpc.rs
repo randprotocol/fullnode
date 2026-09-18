@@ -1611,16 +1611,22 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             if to < from {
                 return Err(RpcError::invalid_params("to must be >= from"));
             }
-            let views: Vec<u64> = (from..=to).collect();
-            if views.len() > MAX_PROPOSER_VIEWS {
+            // Overflow-safe count check, and checked *before* any allocation: `to - from + 1`
+            // overflows at `[u64::MAX - 1, u64::MAX]`, and collecting `from..=to` first would let
+            // `[0, u64::MAX]` try to allocate 2^64 entries before this ever ran.
+            if to - from >= MAX_PROPOSER_VIEWS as u64 {
                 return Err(RpcError::invalid_params(format!("views must hold at most {MAX_PROPOSER_VIEWS} entries")));
             }
+            let views: Vec<u64> = (from..=to).collect();
             let (reply, rx) = oneshot::channel();
             st.node
                 .send(NodeCommand::Proposer { views: views.clone(), reply })
                 .await
                 .map_err(|_| RpcError::internal("node loop closed"))?;
             let (epoch, proposers) = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
+            if proposers.len() != views.len() {
+                return Err(RpcError::internal("proposer reply length mismatch"));
+            }
             Ok(json!({
                 "epoch": epoch,
                 "proposers": views.iter().zip(proposers.iter())
@@ -2488,7 +2494,9 @@ mod tests {
     }
 
     /// A single view or an inclusive `[from, to]` range, under the current set (epoch 3, per the
-    /// node loop's stub); a range wider than `MAX_PROPOSER_VIEWS` is refused.
+    /// node loop's stub); a range wider than `MAX_PROPOSER_VIEWS` is refused, without ever
+    /// allocating the range first — `[0, u64::MAX]` must answer promptly rather than try to
+    /// build a 2^64-entry `Vec`.
     #[tokio::test]
     async fn get_proposer_maps_views_under_the_current_set() {
         let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
@@ -2497,9 +2505,18 @@ mod tests {
         assert_eq!(v["epoch"], 3);
         assert_eq!(v["proposers"].as_array().unwrap().len(), 1);
         assert_eq!(v["proposers"][0]["view"], 5);
+        assert_eq!(v["proposers"][0]["proposer"], randprotocol_core::Address([5u8; 32]).to_base58());
         let v = ok(&st, "rand_getProposer", json!([5, 8])).await;
-        assert_eq!(v["proposers"].as_array().unwrap().len(), 4);
+        let proposers = v["proposers"].as_array().unwrap();
+        assert_eq!(proposers.len(), 4);
+        assert_eq!(proposers[3]["view"], 8);
+        assert_eq!(proposers[3]["proposer"], randprotocol_core::Address([8u8; 32]).to_base58());
         assert_eq!(call(&st, "rand_getProposer", json!([1, 100])).await.err().unwrap().code, -32602);
+        assert_eq!(call(&st, "rand_getProposer", json!([8, 5])).await.err().unwrap().code, -32602);
+        // Overflow-safe count check: refused before any allocation, and no timeout/OOM.
+        assert_eq!(call(&st, "rand_getProposer", json!([0, u64::MAX])).await.err().unwrap().code, -32602);
+        let v = ok(&st, "rand_getProposer", json!([u64::MAX - 1, u64::MAX])).await;
+        assert_eq!(v["proposers"].as_array().unwrap().len(), 2);
     }
 
     /// The supply audit: hidden note values, public boundary crossings. The one number that
