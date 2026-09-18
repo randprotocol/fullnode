@@ -532,8 +532,11 @@ all: the M4.1 flat-binary loader populated instruction space only, so a guest wi
 zeros. A file that starts with `IMAGE_MAGIC` but is not a well-formed container is a deploy error,
 not a silent fallback to raw words.
 
-Before proving anything, `program deploy` prints the program id, `hc` (`Program::digest`, what
-`rand-guest build` itself reports for the same guest) and the word count, then calls
+Before proving anything, `program deploy` prints the program id, the word count, and `hc` — the
+in-circuit `Program::digest`, hex-encoded the one way the chain ever shows it: the eight digest
+words each in little-endian byte order, concatenated, the same form `rand_getProgram` and
+`rand program show` print as `code_hash` (*not* `Program::code_hash()`'s own string, which hex-encodes
+the same words big-endian and reads different for the same program). Then it calls
 `rand_estimateFee` for a `deploy` of that word count. That RPC applies this chain's own
 `max_program_words` admission (the cap above), so a program over the cap is refused there — for
 the cost of one RPC round trip — rather than after the minutes it takes to prove a bundle the
