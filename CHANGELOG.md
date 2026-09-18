@@ -68,6 +68,14 @@ New in v0.4 on the fullnode side (branch `feat/call-limits`, spec
 
 ### Known limits
 
+- **This build is chain-13-only. It must not be same-chain-updated onto chain 12.** The
+  encodings of `Action::Deploy` (it carries the public words), `ProgramRecord` (`public_digest`,
+  `public_len`) and `CallReceipt` (`h_pub`) changed, so a chain-12 database and chain-12 blocks do
+  not decode under it. A proof whose bytes are not the canonical postcard encoding is now
+  refused, which is a consensus tightening. The sync wire carries proofs and envelopes as CBOR
+  byte strings, which an older node cannot read. A chain-12 genesis file still hashes to
+  `605eb783…`, but that says only that the genesis is unchanged, not that the build can run on
+  the chain. Roll it out as a chain cut (`deploy/cut-chain13-genesis.sh`).
 - The chain side of both translated programs needs chain 13's limits. On chain 12 (no limit
   fields) the images are over the program cap, SPL Token's public input is refused, its 10 458
   private words are over the default 4 295-word input cap, and a keccak-carrying ERC-20 call

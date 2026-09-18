@@ -958,9 +958,14 @@ mod tests {
     }
 
     /// Chain 12, the running chain, byte for byte: its genesis file has no `max_program_words`,
-    /// so it must build the very hash its fleet runs on (`deploy/run-a.sh`'s `data-a-605eb783`).
-    /// This is what makes the v0.4 program cap safe to ship before the v0.4 chain is cut: a
-    /// field that moved an absent-cap genesis would fork every chain-12 node at its next init.
+    /// so it must build the very hash its fleet runs on (`deploy/run-a.sh`'s `data-a-605eb783`):
+    /// an optional genesis field must never move a genesis that leaves it out.
+    ///
+    /// That is all this pins. It does **not** make this build safe to run on chain 12: the build
+    /// is chain-13-only. `Action::Deploy`, `ProgramRecord` and `CallReceipt` changed encoding (the
+    /// public words, `public_digest`/`public_len`, `h_pub`), non-canonical proof encodings are now
+    /// refused, and the sync wire carries byte strings, so it must not be same-chain-updated onto
+    /// chain 12 (CHANGELOG, v0.4 Known limits).
     #[test]
     fn chain_12s_genesis_file_still_builds_chain_12() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain12.json");
