@@ -1049,6 +1049,11 @@ impl Storage {
     /// page boundary inside one height re-serves that height's earlier receipts, so a caller
     /// resuming from it de-duplicates by `tx`.
     pub fn receipts_for_program(&self, program: &ProgramId, from: u64, to: u64, limit: usize) -> Result<(Vec<CallReceipt>, Option<u64>)> {
+        // A zero limit never consumes a receipt, so it must never hand back a `next` either —
+        // otherwise a caller that follows the cursor loops forever on the same height.
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
         let start = receipt_index_key(program, from, 0);
         let mut out = Vec::new();
         let mut next = None;
@@ -3176,6 +3181,9 @@ mod tests {
         let (page, next) = st.receipts_for_program(&pid_a, 0, 10, 1).unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(next, Some(3), "the truncated page resumes at the height it stopped in");
+        let (page, next) = st.receipts_for_program(&pid_a, 0, 10, 0).unwrap();
+        assert!(page.is_empty(), "limit 0 consumes nothing");
+        assert_eq!(next, None, "and must not hand back a cursor a caller could loop on forever");
         let (page, _) = st.receipts_for_program(&pid_b, 4, 10, 10).unwrap();
         assert!(page.is_empty(), "from above the receipt's height");
         // Truncating below height 3 drops the index rows with the receipts.
