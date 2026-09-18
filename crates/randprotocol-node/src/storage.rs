@@ -2214,6 +2214,35 @@ pub(crate) mod fixtures {
         let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![] };
         CommittedBlock { block, pruned: Vec::new(), qc, receipts: Vec::new(), deposits: ledger.deposits().to_vec() }
     }
+
+    /// `n` blocks, each carrying one bundle that spends a fresh pair of nullifiers.
+    pub(crate) fn chain_fixture(n: u64) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
+        use randprotocol_core::Vote;
+        let (dir, st, gs) = genesis_with_two_notes();
+        st.init_genesis(&gs).unwrap();
+        let k = key(1);
+        let mut ledger = gs.ledger.clone();
+        let mut parent = gs.block.clone();
+        let mut out = Vec::new();
+        for h in 1..=n {
+            let seed = (h * 4) as u32;
+            ledger.set_height(h);
+            let txs = vec![bundle_tx(
+                &ledger,
+                [[seed; 8], [seed + 1; 8]],
+                [[seed + 2; 8], [seed + 3; 8]],
+                bundle_fee(),
+            )];
+            let cb = make_block(&parent, &mut ledger, txs, &k);
+            let block = cb.block.clone();
+            let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(block.view(), block.hash(), &k)] };
+            let cb = CommittedBlock { qc, ..cb };
+            st.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
+            out.push(cb);
+            parent = block;
+        }
+        (dir, st, gs, out)
+    }
 }
 
 #[cfg(test)]
@@ -2994,35 +3023,6 @@ mod tests {
         };
         s.save_safety(&state).unwrap();
         assert_eq!(s.load_safety().unwrap(), Some(state));
-    }
-
-    /// `n` blocks, each carrying one bundle that spends a fresh pair of nullifiers.
-    fn chain_fixture(n: u64) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
-        use randprotocol_core::Vote;
-        let (dir, st, gs) = genesis_with_two_notes();
-        st.init_genesis(&gs).unwrap();
-        let k = key(1);
-        let mut ledger = gs.ledger.clone();
-        let mut parent = gs.block.clone();
-        let mut out = Vec::new();
-        for h in 1..=n {
-            let seed = (h * 4) as u32;
-            ledger.set_height(h);
-            let txs = vec![bundle_tx(
-                &ledger,
-                [[seed; 8], [seed + 1; 8]],
-                [[seed + 2; 8], [seed + 3; 8]],
-                bundle_fee(),
-            )];
-            let cb = make_block(&parent, &mut ledger, txs, &k);
-            let block = cb.block.clone();
-            let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(block.view(), block.hash(), &k)] };
-            let cb = CommittedBlock { qc, ..cb };
-            st.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
-            out.push(cb);
-            parent = block;
-        }
-        (dir, st, gs, out)
     }
 
     #[test]

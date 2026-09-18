@@ -616,6 +616,17 @@ pub(crate) fn receipt_json(r: &CallReceipt) -> Value {
     })
 }
 
+/// A block's header fields alone — everything `block_json` reports except `transactions`, and
+/// what `rand_getBlocks` pages over instead of the full block.
+fn header_json(b: &randprotocol_core::Block, sealed: bool) -> Value {
+    json!({
+        "hash": b.hash().to_hex(), "height": b.height(), "view": b.view(), "parent": b.parent().to_hex(),
+        "proposer": b.proposer().to_base58(), "timestamp_ms": b.header.timestamp_ms,
+        "tx_root": b.header.tx_root.to_hex(), "state_root": b.header.state_root.to_hex(),
+        "justify_view": b.header.justify.view, "sealed": sealed, "tx_count": b.transactions.len(),
+    })
+}
+
 fn block_json(b: &randprotocol_core::Block, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor, storage: &crate::storage::Storage) -> Value {
     let sealed = storage.block_sealed(&b.hash()).unwrap_or(false);
     let txs: Vec<Value> = b
@@ -636,20 +647,9 @@ fn block_json(b: &randprotocol_core::Block, bridge: Option<&BridgeMeta>, executo
             j
         })
         .collect();
-    json!({
-        "hash": b.hash().to_hex(),
-        "height": b.height(),
-        "view": b.view(),
-        "parent": b.parent().to_hex(),
-        "proposer": b.proposer().to_base58(),
-        "timestamp_ms": b.header.timestamp_ms,
-        "tx_root": b.header.tx_root.to_hex(),
-        "state_root": b.header.state_root.to_hex(),
-        "justify_view": b.header.justify.view,
-        "sealed": sealed,
-        "tx_count": b.transactions.len(),
-        "transactions": txs,
-    })
+    let mut j = header_json(b, sealed);
+    j["transactions"] = Value::Array(txs);
+    j
 }
 
 /// The bundles an aggregator may still cover (spec §3.2, R8's view): committed
@@ -1286,6 +1286,30 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
             let block = st.storage.block_by_hash(&h).map_err(RpcError::internal)?;
             Ok(block.map(|b| block_json(&b, bridge.as_ref(), st.executor.as_ref(), &st.storage)).unwrap_or(Value::Null))
+        }
+        // Headers over a range, capped like `rand_getCompactBlocks`: the block list a client
+        // pages through without paying for every transaction in it.
+        "rand_getBlocks" => {
+            let from: u64 = param(p, 0, "from_height")?;
+            let to: u64 = param(p, 1, "to_height")?;
+            if to < from {
+                return Err(RpcError::invalid_params(format!("to_height {to} is below from_height {from}")));
+            }
+            let head = st.storage.head().map_err(RpcError::internal)?.height;
+            let to = to.min(head).min(from.saturating_add(MAX_COMPACT_BLOCKS - 1));
+            let storage = st.storage.clone();
+            let headers = blocking(move || {
+                let mut out = Vec::new();
+                for h in from..=to {
+                    if let Some(b) = storage.block_by_height(h)? {
+                        let sealed = storage.block_sealed(&b.hash())?;
+                        out.push(header_json(&b, sealed));
+                    }
+                }
+                Ok(out)
+            })
+            .await?;
+            Ok(Value::Array(headers))
         }
         // ---- block aggregation (spec §8) ----
         // The register is public by design (spec §2), so its rows and the sealing facts are too.
@@ -2875,6 +2899,25 @@ mod tests {
                 "attest_first={attest_first}: the envelope the chain sealed, not the action's"
             );
         }
+    }
+
+    /// Headers over a range, capped like `rand_getCompactBlocks` and truncated at the head — no
+    /// `transactions` field, since that is `rand_getBlockByHeight`'s job.
+    #[tokio::test]
+    async fn get_blocks_serves_headers_in_a_capped_range() {
+        let (_d, storage, gs, blocks) = fixtures::chain_fixture(3);
+        let st = state_over(Arc::new(storage), &gs);
+        let v = ok(&st, "rand_getBlocks", json!([1, 3])).await;
+        let list = v.as_array().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0]["height"], 1);
+        assert_eq!(list[2]["hash"], blocks[2].block.hash().to_hex());
+        assert!(list[0].get("transactions").is_none(), "headers only");
+        assert_eq!(list[0]["tx_count"], blocks[0].block.transactions.len());
+        let v = ok(&st, "rand_getBlocks", json!([2, 500])).await;
+        assert_eq!(v.as_array().unwrap().len(), 2, "past the head is truncated");
+        let e = call(&st, "rand_getBlocks", json!([3, 1])).await.err().unwrap();
+        assert_eq!(e.code, -32602);
     }
 
     // --------------------------------------------------------- viewing keys
