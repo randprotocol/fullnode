@@ -22,13 +22,18 @@ pub fn program_id(base_pc: u32, words: &[u32]) -> ProgramId {
 ///
 /// - `public` empty: exactly [`program_id`], so every id a chain without public inputs issued
 ///   still holds;
-/// - otherwise `blake3("rand-program-2", base_pc ‖ words ‖ u32_le(len(public)) ‖ public)`.
+/// - otherwise `blake3("rand-program-2", base_pc ‖ u32_le(len(words)) ‖ words ‖ u32_le(len(public)) ‖ public)`.
+///
+/// Both lengths are bound. With only the public input's, the boundary between the code and the
+/// public input would be ambiguous: `words = [a, 2], public = [d]` and `words = [a], public = [1, d]`
+/// would hash the same bytes, and whoever deployed first would own the other's id.
 pub fn program_id_with_public(base_pc: u32, words: &[u32], public: &[u32]) -> ProgramId {
     if public.is_empty() {
         return program_id(base_pc, words);
     }
-    let mut buf = Vec::with_capacity(8 + 4 * (words.len() + public.len()));
+    let mut buf = Vec::with_capacity(12 + 4 * (words.len() + public.len()));
     buf.extend_from_slice(&base_pc.to_le_bytes());
+    buf.extend_from_slice(&(words.len() as u32).to_le_bytes());
     for w in words {
         buf.extend_from_slice(&w.to_le_bytes());
     }
@@ -123,9 +128,31 @@ mod tests {
         assert_ne!(with, program_id_with_public(4, &[1, 2, 3], &[7]));
         assert_ne!(with, program_id_with_public(0, &[1, 2, 3], &[7, 8]));
         let mut buf = Vec::new();
-        for w in [4u32, 1, 2, 3, 2, 7, 8] {
+        for w in [4u32, 3, 1, 2, 3, 2, 7, 8] {
             buf.extend_from_slice(&w.to_le_bytes());
         }
-        assert_eq!(with, Hash::digest_domain(b"rand-program-2", &buf), "base_pc ‖ words ‖ u32_le(len) ‖ public");
+        assert_eq!(
+            with,
+            Hash::digest_domain(b"rand-program-2", &buf),
+            "base_pc ‖ u32_le(len(words)) ‖ words ‖ u32_le(len(public)) ‖ public"
+        );
+    }
+
+    /// The collision the single-length rule had: without the code's length, these two hashed
+    /// the same bytes, `pc ‖ a ‖ 2 ‖ 1 ‖ d`.
+    #[test]
+    fn the_code_and_public_boundary_is_bound() {
+        let (a, d) = (0x13u32, 0x99u32);
+        assert_ne!(program_id_with_public(0, &[a, 2], &[d]), program_id_with_public(0, &[a], &[1, d]));
+    }
+
+    /// Every split of one concatenation into non-empty code and non-empty public input is a
+    /// different program.
+    #[test]
+    fn every_split_of_the_same_words_is_a_different_id() {
+        let all = [1u32, 2, 3, 1, 2, 1, 1];
+        let ids: std::collections::BTreeSet<ProgramId> =
+            (1..all.len()).map(|k| program_id_with_public(0, &all[..k], &all[k..])).collect();
+        assert_eq!(ids.len(), all.len() - 1);
     }
 }
