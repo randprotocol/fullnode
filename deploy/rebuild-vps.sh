@@ -14,8 +14,14 @@ rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" \
     --exclude target --exclude 'data-*' --exclude testnet --exclude .git ./ root@$IP:/root/fullnode/
 CUDA=$(cd "$(dirname "$0")/../../circuits/rand-zkvm-cuda" 2>/dev/null && pwd || true)
 if [ -n "$CUDA" ]; then ssh -i $KEY -o StrictHostKeyChecking=accept-new root@$IP 'mkdir -p /root/circuits/rand-zkvm-cuda'; rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" --exclude target "$CUDA/" root@$IP:/root/circuits/rand-zkvm-cuda/; fi
+# RAND_BUILD_SHA overrides build.rs's own git lookup: E's tree keeps a stale .git left over
+# from long ago (rsync's --exclude .git above protects it from --delete), so git rev-parse HEAD
+# there would answer with some other commit even though .git-rev was just written fresh. Pass
+# the same $REV straight into the remote build's environment instead of trusting that repo.
+# The value is a local shell variable going into a single-quoted remote script, so the quote is
+# closed and reopened around it.
 ssh -i $KEY -o StrictHostKeyChecking=accept-new root@$IP 'set -e; source /root/.cargo/env; cd /root/fullnode
   git_rev=$(cat .git-rev 2>/dev/null || echo unknown)
-  cargo build --release -p randprotocol-node -p randprotocol-client 2>&1 | grep -E "^(error|warning: unused)|Finished" || true
+  RAND_BUILD_SHA='"$REV"' cargo build --release -p randprotocol-node -p randprotocol-client 2>&1 | grep -E "^(error|warning: unused)|Finished" || true
   install -m 755 target/release/rand-node target/release/rand /usr/local/bin/
   systemctl restart rand-node; sleep 5; systemctl is-active rand-node; rand status | grep -E "\"(height|peer_count)\""'

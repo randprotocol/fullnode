@@ -1,10 +1,26 @@
 //! Captures the git commit the node was built from, for `rand_getVersion`. A checkout answers
 //! `git rev-parse HEAD`; a deploy worktree without `.git` answers the `.git-rev` file the
 //! deploy scripts write at the workspace root; anything else is "unknown".
+//!
+//! `RAND_BUILD_SHA`, checked first, overrides all of that. A deploy tree can carry a stale
+//! `.git` left over from long ago — rsync's `--exclude .git` protects it from `--delete` even
+//! after the tree it belonged to is gone — so `git rev-parse HEAD` there answers with some
+//! other commit even though `.git-rev` was written fresh. The deploy script passes the same sha
+//! it writes to `.git-rev` through this variable, so the build never has to trust that repo.
 use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    // Emitted unconditionally: setting, changing, or clearing the override must re-run this
+    // script even on a build where it isn't used this time.
+    println!("cargo:rerun-if-env-changed=RAND_BUILD_SHA");
+    if let Ok(sha) = std::env::var("RAND_BUILD_SHA") {
+        if !sha.is_empty() {
+            println!("cargo:rustc-env=RAND_GIT_SHA={sha}");
+            return;
+        }
+    }
+
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let git = |args: &[&str]| {
         Command::new("git").args(args).current_dir(&root).output().ok()
