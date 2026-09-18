@@ -1049,6 +1049,7 @@ mod tests {
             bridge: None,
             aggregation: None,
             epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
+            max_program_words: None,
         }
     }
 

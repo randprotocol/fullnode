@@ -270,6 +270,12 @@ pub struct Ledger {
     /// `epoch_blocks` — a genesis parameter, not consensus state. `None` makes the five
     /// aggregation actions inadmissible and keeps the state root byte-for-byte today's.
     aggregation: Option<aggregation::AggregationConfig>,
+    /// The largest program a `Deploy` may carry, in words: genesis's `max_program_words`, or
+    /// [`gas::MAX_PROGRAM_WORDS`] on a chain whose file does not set it. A genesis parameter like
+    /// `epoch_blocks` — not state, outside the state root and `Ledger`'s equality — so a
+    /// reloading node sets it from its genesis file (`reload_ledger`), or it would come back at
+    /// the default and refuse deploys its peers admit.
+    max_program_words: usize,
     /// The aggregator register, hashed into the state root (spec §2.1) when `aggregation` is
     /// set; empty otherwise and at chain-9 block 0.
     aggregators: BTreeMap<Address, aggregation::AggregatorEntry>,
@@ -297,9 +303,10 @@ pub struct Ledger {
 }
 
 /// Equality is over consensus state only. `height` and `timestamp_ms` are the position of the
-/// block being applied, and `faucet`/`confidential` are genesis switches a reloading node sets
-/// from its genesis file rather than from storage, so two ledgers holding the same notes,
-/// nullifiers, anchors, validators and programs are the same ledger.
+/// block being applied, and `faucet`/`confidential`/`epoch_blocks`/`max_program_words` are
+/// genesis parameters a reloading node sets from its genesis file rather than from storage, so
+/// two ledgers holding the same notes, nullifiers, anchors, validators and programs are the same
+/// ledger.
 ///
 /// The [`supply`] counters are deliberately **out**: nothing in the state root covers them, and
 /// `Ledger::from_parts` cannot know them, so a rebuilt ledger would never compare equal to the
@@ -348,6 +355,7 @@ impl Ledger {
             epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             bridge: None,
             aggregation: None,
+            max_program_words: gas::MAX_PROGRAM_WORDS,
             aggregators: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
@@ -386,6 +394,7 @@ impl Ledger {
             epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             bridge: None,
             aggregation: None,
+            max_program_words: gas::MAX_PROGRAM_WORDS,
             aggregators: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
@@ -566,6 +575,19 @@ impl Ledger {
     /// actions are inadmissible and the state root is byte-for-byte today's.
     pub fn aggregation(&self) -> Option<&aggregation::AggregationConfig> {
         self.aggregation.as_ref()
+    }
+
+    /// The largest program a `Deploy` may carry, in words, as genesis set it (default
+    /// [`gas::MAX_PROGRAM_WORDS`]).
+    pub fn max_program_words(&self) -> usize {
+        self.max_program_words
+    }
+
+    /// Set by genesis from `max_program_words`, and by `reload_ledger` from the genesis state on
+    /// every restart. The bound (`1..=gas::MAX_PROGRAM_WORDS_LIMIT`) is the genesis file's to
+    /// enforce; this is only where the ledger keeps what it was told.
+    pub fn set_max_program_words(&mut self, words: usize) {
+        self.max_program_words = words;
     }
 
     /// The aggregator register (spec §2.1): every row that has ever registered, keyed by
@@ -780,7 +802,7 @@ impl Ledger {
             Action::Mint { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
                 return Err(TxError::EnvelopeTooLarge)
             }
-            Action::Deploy { words, .. } if words.len() > gas::MAX_PROGRAM_WORDS => {
+            Action::Deploy { words, .. } if words.len() > self.max_program_words => {
                 return Err(TxError::ProgramTooLarge)
             }
             Action::Call { proof, .. } if proof.len() > gas::MAX_PROOF_BYTES => return Err(TxError::ProofTooLarge),
@@ -1851,6 +1873,45 @@ mod tests {
         l.apply_tx(&again, &a.address(), &StubExecutor).unwrap();
         assert_eq!(l.programs().len(), 2);
         assert_eq!(l.program(&id).unwrap().deployed_at, 1, "a redeploy does not move deployed_at");
+    }
+
+    /// The deploy cap is the ledger's, set from genesis, not the constant: a default ledger keeps
+    /// today's 4 096 words exactly, and a ledger built with the zkVM's limit admits what the
+    /// `rand-guest` toolchain produces (the EVM interpreter guest is 18 009 words). The cap is a
+    /// genesis parameter, so it is outside both the state root and `Ledger`'s equality — a
+    /// reloaded ledger, which starts at the default until `reload_ledger` sets it, still compares
+    /// equal to the replayed one.
+    #[test]
+    fn the_deploy_cap_is_the_ledgers_and_defaults_to_4096_words() {
+        let (a, _) = keys();
+        let deploy = |l: &Ledger, n: usize| {
+            let action = Action::Deploy { base_pc: 0, words: vec![0x13; n] };
+            Transaction::shielded(7, bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&action)), action)
+        };
+        let l = ledger();
+        assert_eq!(l.max_program_words(), gas::MAX_PROGRAM_WORDS);
+        assert_eq!(l.validate(&deploy(&l, gas::MAX_PROGRAM_WORDS + 1), &StubExecutor), Err(TxError::ProgramTooLarge));
+        assert_eq!(l.validate(&deploy(&l, gas::MAX_PROGRAM_WORDS), &StubExecutor), Ok(()));
+        assert_eq!(l.validate(&deploy(&l, 5000), &StubExecutor), Err(TxError::ProgramTooLarge));
+
+        let mut raised = ledger();
+        raised.set_max_program_words(gas::MAX_PROGRAM_WORDS_LIMIT);
+        assert_eq!(raised.max_program_words(), gas::MAX_PROGRAM_WORDS_LIMIT);
+        assert_eq!(raised, l, "the cap is not part of equality");
+        assert_eq!(raised.state_root(), l.state_root(), "nor of the state root");
+        assert_eq!(raised.validate(&deploy(&raised, 5000), &StubExecutor), Ok(()));
+        assert_eq!(raised.validate(&deploy(&raised, gas::MAX_PROGRAM_WORDS_LIMIT), &StubExecutor), Ok(()));
+        assert_eq!(
+            raised.validate(&deploy(&raised, gas::MAX_PROGRAM_WORDS_LIMIT + 1), &StubExecutor),
+            Err(TxError::ProgramTooLarge)
+        );
+        // And applying one stores the whole program.
+        let t = deploy(&raised, 5000);
+        raised.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
+        let id = program_id(0, &vec![0x13; 5000]);
+        assert_eq!(raised.program(&id).unwrap().words.len(), 5000);
+        // A clone — speculative execution, the tip ledger — keeps the cap.
+        assert_eq!(raised.clone().max_program_words(), gas::MAX_PROGRAM_WORDS_LIMIT);
     }
 
     #[test]

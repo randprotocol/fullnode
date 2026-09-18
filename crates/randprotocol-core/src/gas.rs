@@ -2,8 +2,14 @@
 
 use crate::types::Action;
 
-/// Largest program, in 32-bit words (16 KiB of code).
+/// Largest program, in 32-bit words (16 KiB of code), on a chain whose genesis file does not set
+/// `max_program_words` — every chain cut before v0.4, chain 12 included. The ledger holds the cap
+/// its genesis gave it (`Ledger::max_program_words`); this is only the default.
 pub const MAX_PROGRAM_WORDS: usize = 4096;
+/// The largest `max_program_words` a genesis file may set: the zkVM's own limit. The CPU AIR
+/// range-checks a program's word count to 16 bits (`rand_zkvm::machine::ProveError::ProgramTooLong`,
+/// `isa::Program::from_flat_image`), so a longer program could be deployed and never called.
+pub const MAX_PROGRAM_WORDS_LIMIT: usize = 65_535;
 /// Largest proof accepted in a transaction.
 ///
 /// Constraint set 5 (upstream `ffd9e1e`, milestone 4.2) restored the whitepaper's production FRI

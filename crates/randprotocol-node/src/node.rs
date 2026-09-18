@@ -124,14 +124,14 @@ pub fn load_genesis(datadir: &std::path::Path) -> Result<(GenesisState, Arc<dyn 
 /// Verify the on-disk chain. If the tail is damaged, truncate to the last good
 /// block (keeping safety state); the missing blocks are re-fetched from peers by
 /// the normal sync path. Returns the height the node will resume from.
-/// The ledger a restarting node runs on: the persisted state, plus the three things that live
-/// in the genesis file rather than in the database.
+/// The ledger a restarting node runs on: the persisted state, plus the things that live in the
+/// genesis file rather than in the database.
 ///
 /// `epoch_blocks` is one of them, and it is not cosmetic: `Unbond` writes `epoch() +
 /// UNBONDING_EPOCHS` into the register, which the state root hashes. A node that came back up
 /// with the default 1000 on a chain that runs shorter epochs would compute a release epoch
 /// nobody else does, disagree about the state root from its first unbond on, and never rejoin.
-/// One function, so a restart cannot pick up two of the three and be wrong about the chain.
+/// One function, so a restart cannot pick up some of them and be wrong about the chain.
 pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn ConfidentialExecutor) -> Result<Ledger> {
     let mut ledger = storage.load_ledger(executor)?;
     ledger.set_faucet(gs.faucet);
@@ -140,6 +140,10 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // The aggregation gate lives in the genesis file too: without this a restarted chain-9 node
     // would compute state-2 roots and refuse every aggregation action by name.
     ledger.set_aggregation(gs.ledger.aggregation().cloned());
+    // The program cap too (v0.4 `max_program_words`): `load_ledger` comes back at the 4 096-word
+    // default, and a node that kept it would refuse deploys its peers admit — a fork at the
+    // first large program after its first restart.
+    ledger.set_max_program_words(gs.ledger.max_program_words());
     Ok(ledger)
 }
 
@@ -702,6 +706,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             status: status.clone(),
             node: cmd_tx,
             chain_id: gs.chain_id,
+            max_program_words: gs.ledger.max_program_words(),
             executor: executor.clone(),
             heads: heads.clone(),
             commits: commits.clone(),
@@ -2044,6 +2049,23 @@ mod tests {
             gs.ledger.state_root(),
             "the reloaded ledger hashes the gated state-3 root, not state-2"
         );
+    }
+
+    /// The program cap survives a restart the same way: it lives in the genesis file, and
+    /// `load_ledger` alone comes back at the 4 096-word default — so a v0.4 node that resumed
+    /// without `reload_ledger` setting it would refuse, as `ProgramTooLarge`, a deploy its peers
+    /// admit, and fork off at the first large program after its first restart.
+    #[test]
+    fn a_restart_restores_the_program_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_max_program_words(gas::MAX_PROGRAM_WORDS_LIMIT);
+        storage.init_genesis(&gs).unwrap();
+        assert_eq!(storage.load_ledger(&StubExecutor).unwrap().max_program_words(), gas::MAX_PROGRAM_WORDS);
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.max_program_words(), gas::MAX_PROGRAM_WORDS_LIMIT);
+        assert_eq!(reloaded, gs.ledger);
     }
 
     /// The register and the bucket survive the same restart, hashed into and computed into the

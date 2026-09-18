@@ -270,6 +270,10 @@ pub struct RpcState {
     pub status: Arc<RwLock<NodeStatus>>,
     pub node: mpsc::Sender<NodeCommand>,
     pub chain_id: u64,
+    /// The chain's deploy cap in words, from its genesis ledger (`max_program_words`, default
+    /// `gas::MAX_PROGRAM_WORDS`): what `rand_estimateFee` refuses a deploy estimate past, so it
+    /// agrees with admission.
+    pub max_program_words: usize,
     /// Needed by `rand_getWitness`, which rebuilds the tree to fold a path.
     pub executor: Arc<dyn ConfidentialExecutor>,
     /// Committed heads, one per block, fanned out to WebSocket subscribers. Bounded: a subscriber
@@ -1243,10 +1247,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "bundle" => randprotocol_core::gas::BUNDLE_BASE,
                 "deploy" => {
                     let words = spec.get("words").and_then(|w| w.as_u64()).unwrap_or(0) as usize;
-                    if words > randprotocol_core::gas::MAX_PROGRAM_WORDS {
+                    if words > st.max_program_words {
                         return Err(RpcError::invalid_params(format!(
-                            "words must be at most {}",
-                            randprotocol_core::gas::MAX_PROGRAM_WORDS
+                            "words must be at most {} (this chain's program cap)",
+                            st.max_program_words
                         )));
                     }
                     randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: vec![0; words] })
@@ -1825,6 +1829,7 @@ mod tests {
             status: Arc::new(RwLock::new(NodeStatus::default())),
             node: tx,
             chain_id: gs.chain_id,
+            max_program_words: gs.ledger.max_program_words(),
             executor: Arc::new(StubExecutor),
             heads: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
             commits: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
@@ -2253,6 +2258,31 @@ mod tests {
             assert_eq!(e.code, -32602, "tier {bad}");
         }
         assert_eq!(call(&st, "rand_estimateFee", json!([{"kind": "transfer"}])).await.unwrap_err().code, -32602);
+    }
+
+    /// The deploy estimate refuses what the chain's own cap refuses — the genesis cap, not the
+    /// constant — so a wallet asking first learns about an oversized program before it proves.
+    #[tokio::test]
+    async fn estimate_fee_for_a_deploy_reads_the_chains_program_cap() {
+        let spec = |words: usize| json!([{"kind": "deploy", "words": words}]);
+        let floor = |words: usize| {
+            randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: vec![0; words] }).to_string()
+        };
+        // A chain without `max_program_words`: today's 4 096.
+        let gs = fixtures::genesis(1);
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_estimateFee", spec(4096)).await, floor(4096));
+        let e = call(&st, "rand_estimateFee", spec(5000)).await.unwrap_err();
+        assert_eq!(e.code, -32602);
+        assert!(e.message.contains("4096"), "the error names the cap: {}", e.message);
+        // A chain cut with the zkVM's limit.
+        let mut gs = fixtures::genesis(1);
+        gs.ledger.set_max_program_words(randprotocol_core::gas::MAX_PROGRAM_WORDS_LIMIT);
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_estimateFee", spec(5000)).await, floor(5000));
+        assert_eq!(ok(&st, "rand_estimateFee", spec(65_535)).await, floor(65_535));
+        let e = call(&st, "rand_estimateFee", spec(65_536)).await.unwrap_err();
+        assert!(e.message.contains("65535"), "{}", e.message);
     }
 
     #[tokio::test]
@@ -3043,6 +3073,29 @@ mod tests {
             }),
         };
         Transaction::shielded(7, bundle, call)
+    }
+
+    /// A deploy at the zkVM's own limit (`max_program_words` = 65 535, a v0.4 genesis's ceiling)
+    /// fits every byte cap on its way to a block, even beside a bundle proof at the proof cap: the
+    /// ledger's whole-transaction cap (`MAX_BLOCK_BYTES`, which is also the block's), the RPC
+    /// request body, and gossip's 16 MiB transmit size (`network::spawn`). So raising the program
+    /// cap needs no byte cap raised with it.
+    #[test]
+    fn a_deploy_at_the_zkvm_program_limit_fits_every_byte_cap() {
+        let mut tx = largest_transaction_the_part_caps_allow();
+        tx.action = Action::Deploy { base_pc: 0, words: vec![0x13; randprotocol_core::gas::MAX_PROGRAM_WORDS_LIMIT] };
+        let encoded = tx.encode();
+        assert!(encoded.len() > 4 * randprotocol_core::gas::MAX_PROGRAM_WORDS_LIMIT, "the words are all there");
+        assert!(
+            encoded.len() <= randprotocol_core::gas::MAX_BLOCK_BYTES,
+            "{} B against the {} B transaction and block cap",
+            encoded.len(),
+            randprotocol_core::gas::MAX_BLOCK_BYTES
+        );
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "rand_sendTransaction", "params": [hex::encode(&encoded)] });
+        let posted = serde_json::to_vec(&body).unwrap().len();
+        assert!(posted <= RPC_MAX_BODY_BYTES, "{posted} B posted against a {RPC_MAX_BODY_BYTES} B limit");
+        assert!(encoded.len() <= 16 * 1024 * 1024, "gossip carries bincode, under its 16 MiB transmit size");
     }
 
     /// The body limit is never the thing that refuses a transaction: it is wide enough for anything

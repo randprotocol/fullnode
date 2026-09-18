@@ -65,6 +65,7 @@ fn build(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool) -> Sim {
         fri_profile: "production".into(),
         hc_bundle: word8_to_hex(&[3; 8]),
         epoch_blocks,
+        max_program_words: None,
         bridge: None,
         aggregation: None,
     };
@@ -896,6 +897,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         fri_profile: "production".into(),
         hc_bundle: word8_to_hex(&[3; 8]),
         epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
+        max_program_words: None,
         bridge: None,
         aggregation: None,
     };
@@ -1343,6 +1345,7 @@ fn aggregation_node_with(
         fri_profile: "production".into(),
         hc_bundle: word8_to_hex(&[3; 8]),
         epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
+        max_program_words: None,
         bridge: None,
         aggregation: Some(cfg.clone()),
     };

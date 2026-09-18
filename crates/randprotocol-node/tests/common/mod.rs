@@ -78,6 +78,7 @@ fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core
         bridge: None,
         aggregation,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
+        max_program_words: None,
     }
 }
 
@@ -146,6 +147,7 @@ pub async fn serve_heads(capacity: usize) -> (SocketAddr, broadcast::Sender<Head
         status: Arc::new(RwLock::new(NodeStatus::default())),
         node: node_tx,
         chain_id: gs.chain_id,
+        max_program_words: gs.ledger.max_program_words(),
         executor: Arc::new(StubExecutor),
         heads: heads.clone(),
         commits: broadcast::channel(capacity).0,

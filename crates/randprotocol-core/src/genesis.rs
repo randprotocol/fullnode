@@ -3,6 +3,7 @@
 use crate::bridge::{BridgeCommit, BridgeConfig, BridgeState, GuardianKey, CHAIN_RAND, GOVERNANCE_EMITTER};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, PublicKey, Signature};
+use crate::gas;
 use crate::ledger::staking::MIN_STAKE;
 use crate::ledger::{Ledger, ValidatorEntry};
 use crate::notes::{word8_from_hex, word8_to_bytes, Envelope, ShieldedAddress, Word8};
@@ -102,6 +103,14 @@ pub struct Genesis {
     /// disagree about it derive different sets from the same register.
     #[serde(default = "default_epoch_blocks")]
     pub epoch_blocks: u64,
+    /// v0.4: the largest program a `Deploy` may carry, in words, `1..=`
+    /// [`gas::MAX_PROGRAM_WORDS_LIMIT`] (the zkVM's own 16-bit limit). Absent means
+    /// [`gas::MAX_PROGRAM_WORDS`], today's 4 096. Part of the genesis hash when present; omitted
+    /// entirely when absent, so a chain cut without it (chain 12 included) keeps its genesis
+    /// file and hash byte-for-byte. Never part of the state root: like `epoch_blocks` it is a
+    /// parameter the ledger runs with, and a reloading node sets it from this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_program_words: Option<u32>,
 }
 
 fn default_true() -> bool {
@@ -158,6 +167,8 @@ pub enum GenesisError {
     DuplicateNote(String),
     #[error("bad epoch_blocks {0} (1..={MAX_EPOCH_BLOCKS})")]
     BadEpochBlocks(u64),
+    #[error("bad max_program_words {0} (1..={limit})", limit = gas::MAX_PROGRAM_WORDS_LIMIT)]
+    BadMaxProgramWords(u32),
     #[error("the genesis supply (alloc notes plus validator stakes) sums past u64::MAX")]
     SupplyOverflow,
 }
@@ -213,6 +224,13 @@ impl Genesis {
         if self.epoch_blocks == 0 || self.epoch_blocks > MAX_EPOCH_BLOCKS {
             return Err(GenesisError::BadEpochBlocks(self.epoch_blocks));
         }
+        // A zero cap refuses every program; one past the zkVM's 16-bit word count admits
+        // programs no call could ever prove, so a deployer would pay for dead code.
+        if let Some(n) = self.max_program_words {
+            if n == 0 || n as usize > gas::MAX_PROGRAM_WORDS_LIMIT {
+                return Err(GenesisError::BadMaxProgramWords(n));
+            }
+        }
         // The register (spec §8) is what genesis actually seeds; the validator set for epoch 0
         // is derived from it at the `ValidatorSet` boundary, where the stake widens again.
         let mut register: BTreeMap<Address, ValidatorEntry> = BTreeMap::new();
@@ -257,6 +275,7 @@ impl Genesis {
         ledger.set_confidential(self.confidential);
         ledger.set_bridge(self.bridge.as_ref().map(BridgeState::from_config));
         ledger.set_aggregation(self.aggregation.clone());
+        ledger.set_max_program_words(self.max_program_words.map_or(gas::MAX_PROGRAM_WORDS, |n| n as usize));
         // The genesis ledger is positioned at the genesis block, so it carries that block's
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
@@ -317,6 +336,14 @@ impl Genesis {
         // aggregation-less chain's genesis hash is byte-for-byte today's.
         if let Some(aggregation) = &self.aggregation {
             commit.extend_from_slice(&bincode::serialize(aggregation).expect("serializes"));
+        }
+        // v0.4's program cap, likewise: appended only when the file sets it, so a genesis
+        // without one — chain 12's — hashes byte-for-byte as before. Tagged, unlike the two
+        // sections above: it is a bare four bytes appended after optional variable-length ones,
+        // so the tag names them rather than leaving a cap to read as the tail of a section.
+        if let Some(n) = self.max_program_words {
+            commit.extend_from_slice(b"max_program_words");
+            commit.extend_from_slice(&n.to_be_bytes());
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -470,6 +497,7 @@ mod tests {
             bridge: None,
             aggregation: None,
             epoch_blocks: EPOCH_BLOCKS_DEFAULT,
+            max_program_words: None,
         }
     }
 
@@ -729,6 +757,60 @@ mod tests {
             let s = build(&fine);
             assert_eq!(s.epoch_blocks, ok);
             assert_eq!(s.ledger.epoch_blocks(), ok);
+        }
+    }
+
+    /// v0.4's program cap is opt-in per chain, like the bridge and aggregation sections: a file
+    /// without `max_program_words` is today's file, builds today's hash and runs today's 4 096-word
+    /// cap; a file with it is a different chain (the binding is the field's *presence*, so even
+    /// spelling out the default moves the hash) whose ledger runs the cap it names. It is a
+    /// genesis parameter, not state, so the state root never sees it.
+    #[test]
+    fn max_program_words_is_optional_and_bound_into_the_hash_only_when_present() {
+        let plain = genesis(2);
+        assert_eq!(plain.max_program_words, None);
+        assert!(!plain.to_json().contains("max_program_words"), "an absent cap is absent from the file");
+        let s = build(&plain);
+        assert_eq!(s.ledger.max_program_words(), crate::gas::MAX_PROGRAM_WORDS, "absent means the old cap");
+        // A file written before the field existed parses to `None` and builds the same chain.
+        let old = Genesis::from_json(&plain.to_json()).unwrap();
+        assert_eq!(old.max_program_words, None);
+        assert_eq!(build(&old).hash(), s.hash());
+
+        let mut raised = plain.clone();
+        raised.max_program_words = Some(65_535);
+        let r = build(&raised);
+        assert_eq!(r.ledger.max_program_words(), 65_535, "the ledger runs the cap genesis names");
+        assert_ne!(r.hash(), s.hash(), "a raised cap is a different chain");
+        assert_eq!(r.ledger.state_root(), s.ledger.state_root(), "the cap is a parameter, not state");
+        assert!(raised.to_json().contains("\"max_program_words\": 65535"));
+        assert_eq!(Genesis::from_json(&raised.to_json()).unwrap(), raised, "and it round-trips");
+
+        let mut explicit = plain.clone();
+        explicit.max_program_words = Some(crate::gas::MAX_PROGRAM_WORDS as u32);
+        let e = build(&explicit);
+        assert_eq!(e.ledger.max_program_words(), crate::gas::MAX_PROGRAM_WORDS);
+        assert_ne!(e.hash(), s.hash(), "the binding is presence: spelling out the default is a new chain");
+        assert_ne!(e.hash(), r.hash(), "and two caps are two chains");
+    }
+
+    /// The cap must be a program length the zkVM can prove: at least one word, and no more than
+    /// the 16-bit word count the CPU AIR range-checks.
+    #[test]
+    fn max_program_words_must_be_a_provable_length() {
+        let g = genesis(1);
+        for bad in [0u32, crate::gas::MAX_PROGRAM_WORDS_LIMIT as u32 + 1, u32::MAX] {
+            let mut broken = g.clone();
+            broken.max_program_words = Some(bad);
+            match broken.build(&StubExecutor) {
+                Err(GenesisError::BadMaxProgramWords(n)) => assert_eq!(n, bad),
+                other => panic!("expected BadMaxProgramWords for {bad}, got {other:?}"),
+            }
+        }
+        for ok in [1u32, 4096, 18_009, crate::gas::MAX_PROGRAM_WORDS_LIMIT as u32] {
+            let mut fine = g.clone();
+            fine.max_program_words = Some(ok);
+            assert_eq!(build(&fine).ledger.max_program_words(), ok as usize);
         }
     }
 

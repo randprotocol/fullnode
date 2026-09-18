@@ -229,6 +229,12 @@ enum Cmd {
         /// register as of the last block of epoch `e - 1`. Part of the genesis hash.
         #[arg(long, default_value_t = randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT)]
         epoch_blocks: u64,
+        /// The largest program a `Deploy` may carry, in words (1..=65535, the zkVM's limit).
+        /// Omitted, the file has no such field and the chain runs the 4 096-word default with a
+        /// genesis hash byte-for-byte what it would have been before the flag existed; given,
+        /// it is part of the genesis hash.
+        #[arg(long)]
+        max_program_words: Option<u32>,
         /// Deposit notes `rand1<address>=<amount in RAND>`, repeatable. A redacted chain has
         /// no accounts, so there is no per-validator allocation: value only exists as a note
         /// someone holds the spend key for.
@@ -455,7 +461,19 @@ async fn main() -> Result<()> {
             let id = libp2p::identity::Keypair::ed25519_from_bytes(kp.derive_subkey(b"rand-p2p-identity"))?;
             println!("address: {}\npublic_key: {}\npeer_id: {}", kp.address(), kp.public_key().to_hex(), id.public().to_peer_id());
         }
-        Cmd::Genesis { chain_id, validators, epoch_blocks, allocs, out, faucet, no_confidential, fri_profile, aggregation, admitted_shapes } => {
+        Cmd::Genesis {
+            chain_id,
+            validators,
+            epoch_blocks,
+            max_program_words,
+            allocs,
+            out,
+            faucet,
+            no_confidential,
+            fri_profile,
+            aggregation,
+            admitted_shapes,
+        } => {
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -499,6 +517,7 @@ async fn main() -> Result<()> {
                     (None, _) => None,
                 },
                 epoch_blocks,
+                max_program_words,
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -513,12 +532,13 @@ async fn main() -> Result<()> {
             let state = gen.build(executor.as_ref())?;
             std::fs::write(&out, gen.to_json())?;
             println!(
-                "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, faucet {}, confidential {}, fri {}, hc_bundle {})",
+                "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, programs up to {} words, faucet {}, confidential {}, fri {}, hc_bundle {})",
                 out.display(),
                 state.hash(),
                 state.validators.len(),
                 state.notes.len(),
                 state.epoch_blocks,
+                state.ledger.max_program_words(),
                 if faucet { "on" } else { "off" },
                 if no_confidential { "off" } else { "on" },
                 state.fri_profile,
@@ -907,6 +927,42 @@ mod tests {
         assert!(built.ledger.aggregation().is_some());
     }
 
+    /// Chain 12, the running chain, byte for byte: its genesis file has no `max_program_words`,
+    /// so it must build the very hash its fleet runs on (`deploy/run-a.sh`'s `data-a-605eb783`).
+    /// This is what makes the v0.4 program cap safe to ship before the v0.4 chain is cut: a
+    /// field that moved an absent-cap genesis would fork every chain-12 node at its next init.
+    #[test]
+    fn chain_12s_genesis_file_still_builds_chain_12() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain12.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(gen.max_program_words, None, "chain 12 predates the field");
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), "605eb7830963833ef897455b98cd2a641aec58e0291460898a5d19ab88760ef0");
+        assert_eq!(state.ledger.max_program_words(), randprotocol_core::gas::MAX_PROGRAM_WORDS);
+    }
+
+    /// `rand-node genesis --max-program-words N` writes the field; without the flag the file has
+    /// no such field at all.
+    #[test]
+    fn the_genesis_command_takes_max_program_words() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["rand-node", "genesis", "--validator", "k,1000,p"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().cmd {
+                Cmd::Genesis { max_program_words, .. } => max_program_words,
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&["--max-program-words", "65535"]), Some(65_535));
+        let mut g = pinned_genesis();
+        g.max_program_words = Some(65_535);
+        let built = g.build(&ZkExecutor::new(FriProfile::Test)).unwrap();
+        assert_eq!(built.ledger.max_program_words(), 65_535);
+        assert_ne!(built.hash(), pinned_genesis().build(&ZkExecutor::new(FriProfile::Test)).unwrap().hash());
+    }
+
     /// The owner of the pinned genesis's one deposit note.
     fn pinned_payee() -> ShieldedAddress {
         randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key())
@@ -945,6 +1001,7 @@ mod tests {
             bridge: None,
             aggregation: None,
             epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
+            max_program_words: None,
         }
     }
 

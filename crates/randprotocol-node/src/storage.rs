@@ -1988,6 +1988,7 @@ pub(crate) mod fixtures {
             bridge: None,
             aggregation: None,
             epoch_blocks,
+            max_program_words: None,
         }
         .build(&StubExecutor)
         .unwrap()
@@ -2033,6 +2034,7 @@ pub(crate) mod fixtures {
             bridge: Some(config),
             aggregation: None,
             epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
+            max_program_words: None,
         }
         .build(&StubExecutor)
         .unwrap();
