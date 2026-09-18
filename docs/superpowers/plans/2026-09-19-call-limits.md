@@ -32,7 +32,7 @@
   | `max_program_public_words` | 0 ..= 65 535 |
 
 - Hash binding: each field is appended with its name tag only when present, in the order `max_program_words`, `max_proof_bytes`, `max_block_bytes`, `max_call_envelope_bytes`, `max_program_public_words`.
-- Program id with no public input is unchanged: `blake3("rand-program", base_pc ‖ words)`. With a public input it is `blake3("rand-program-2", base_pc ‖ words ‖ u32_le(len) ‖ public)`.
+- Program id with no public input is unchanged: `blake3("rand-program", base_pc ‖ words)`. With a public input it is `blake3("rand-program-2", base_pc ‖ u32_le(len(words)) ‖ words ‖ u32_le(len(public)) ‖ public)`.
 - There are no per-call public words.
 - The call fee is:
 

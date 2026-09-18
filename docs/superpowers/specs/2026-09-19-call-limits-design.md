@@ -70,7 +70,7 @@ A chain-12-shaped genesis (no fields) keeps its hash byte for byte, and a test p
 - The ledger refuses `public.len() > self.max_program_public_words`, with a new `ValidationError::ProgramPublicTooLarge`.
 - **Program id:**
   - with `public` empty: unchanged, `blake3("rand-program", base_pc ‖ words)`, so every existing id and test holds;
-  - with `public` non-empty: `blake3("rand-program-2", base_pc ‖ words ‖ len(public) ‖ public)`.
+  - with `public` non-empty: `blake3("rand-program-2", base_pc ‖ u32_le(len(words)) ‖ words ‖ u32_le(len(public)) ‖ public)`.
 
   The same code with a different public input is a different program.
 - **The program record** stores `public_digest: Option<[u32; 8]>`: `hash::public_digest(public)` when non-empty, else `None`. It also stores the words themselves, so provers can fetch them. The words go in a separate storage column (CF `program_public`), keyed by program id; `ProgramRecord` stays small.
