@@ -1575,18 +1575,25 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .await
                 .map_err(|_| RpcError::internal("node loop closed"))?;
             let pool = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
-            let mut out = Vec::with_capacity(hashes.len());
-            for (h, ps) in hashes.iter().zip(pool) {
-                let entry = match st.storage.tx_location(h).map_err(RpcError::internal)? {
+            // Up to 64 RocksDB reads: one blocking task for all of them, not one per hash.
+            let storage = st.storage.clone();
+            let located = blocking(move || {
+                hashes.into_iter().map(|h| Ok((h, storage.tx_location(&h)?))).collect::<crate::storage::Result<Vec<_>>>()
+            })
+            .await?;
+            let mut out = Vec::with_capacity(located.len());
+            for ((h, loc), ps) in located.into_iter().zip(pool) {
+                let h = h.to_hex();
+                let entry = match loc {
                     Some((height, index)) => {
-                        json!({ "hash": h.to_hex(), "status": "committed", "height": height, "index": index })
+                        json!({ "hash": h, "status": "committed", "height": height, "index": index })
                     }
                     None => match ps {
-                        PoolStatus::Pending => json!({ "hash": h.to_hex(), "status": "pending" }),
+                        PoolStatus::Pending => json!({ "hash": h, "status": "pending" }),
                         PoolStatus::Rejected(reason) => {
-                            json!({ "hash": h.to_hex(), "status": "rejected", "reason": reason })
+                            json!({ "hash": h, "status": "rejected", "reason": reason })
                         }
-                        PoolStatus::Unknown => json!({ "hash": h.to_hex(), "status": "unknown" }),
+                        PoolStatus::Unknown => json!({ "hash": h, "status": "unknown" }),
                     },
                 };
                 out.push(entry);

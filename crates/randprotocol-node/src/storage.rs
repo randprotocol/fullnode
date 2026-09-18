@@ -834,8 +834,23 @@ impl Storage {
         }
     }
 
+    /// Where a committed transaction sits, `(height, index)`, read without decoding the rest of
+    /// its record: a `Raw` one carries the whole ~1.2 MB proof, and this is the lookup
+    /// `rand_getTransactionStatus` makes up to 64 times a call and every `transaction`
+    /// subscription makes once. Bincode's leading enum tag then `height` and `index` are the
+    /// same two fields in the same order in both forms, and bincode 1's `deserialize` stops
+    /// once the mirror's fields are read, ignoring the bytes after them.
     pub fn tx_location(&self, h: &Hash) -> Result<Option<(u64, u32)>> {
-        Ok(self.tx_record(h)?.map(|r| r.location()))
+        /// `TxRecord`'s two variants cut down to their first two fields. The variant order and
+        /// the field order must stay `TxRecord`'s (the test pins both forms to the full decode).
+        #[derive(serde::Deserialize)]
+        enum TxLocation {
+            Raw { height: u64, index: u32 },
+            Pruned { height: u64, index: u32 },
+        }
+        Ok(self.get::<TxLocation>(CF_TXS, h.as_bytes())?.map(|l| match l {
+            TxLocation::Raw { height, index } | TxLocation::Pruned { height, index } => (height, index),
+        }))
     }
 
     /// The transaction itself, either record form (a pruned one's proof is the marker form).
@@ -3281,6 +3296,48 @@ mod tests {
         let st = Storage::open(dir.path()).unwrap();
         assert!(st.receipts_index_built().unwrap());
         assert_eq!(st.receipts_for_program(&pid, 0, 5, 10).unwrap().0.len(), 1);
+    }
+
+    /// `tx_location` decodes only the two leading fields of a record; for both forms it must
+    /// agree with the full decode, including when the rest of the record is a large proof it
+    /// never reads.
+    #[test]
+    fn tx_location_reads_the_location_of_either_record_form_without_the_rest() {
+        let (_d, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+        let mut tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        // A proof the size a real one is, so the record's tail is nowhere near empty.
+        tx.bundle.as_mut().unwrap().proof = vec![0xab; 1 << 20];
+        let raw = TxRecord::Raw { height: 7, index: 3, tx: tx.clone() };
+        let pruned = TxRecord::Pruned {
+            height: u64::MAX - 1,
+            index: u32::MAX,
+            tx_hash: Hash([5; 32]),
+            tx,
+            proof_hash: Hash([6; 32]),
+            public_values: vec![11; 34],
+            shape: randprotocol_core::types::DeclaredShape {
+                profile: randprotocol_core::types::FriProfile::Test,
+                tier: 14,
+                program_log_height: 13,
+                input_log_height: 12,
+                keccak_log_height: 0,
+                sha256_log_height: 0,
+                public_log_height: 2,
+                mem_log_height: 18,
+            },
+        };
+        for (key, rec) in [(Hash([1; 32]), &raw), (Hash([2; 32]), &pruned)] {
+            s.db.put_cf(s.cf(CF_TXS), key.as_bytes(), bincode::serialize(rec).unwrap()).unwrap();
+            let full = s.tx_record(&key).unwrap().unwrap();
+            assert_eq!(&full, rec);
+            assert_eq!(s.tx_location(&key).unwrap(), Some(full.location()));
+        }
+        assert_eq!(s.tx_location(&Hash([1; 32])).unwrap(), Some((7, 3)));
+        assert_eq!(s.tx_location(&Hash([2; 32])).unwrap(), Some((u64::MAX - 1, u32::MAX)));
+        assert_eq!(s.tx_location(&Hash([3; 32])).unwrap(), None);
     }
 
     /// The column families a pre-v0.3 build opens with: `ALL_CFS` without
