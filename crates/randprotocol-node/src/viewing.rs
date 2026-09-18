@@ -175,7 +175,8 @@ pub fn advance(storage: &Storage, import: &mut Import, max_rows: u64) -> Result<
 pub struct Opening {
     /// Which of the transaction's envelope sets this came from: `"bundle"` (the transaction's
     /// own, the fee bundle of a `BridgeBurn`), `"asset_bundle"` (a `BridgeBurn`'s second
-    /// bundle), or `"deposit"` (a `BridgeAttest`'s deposit envelope).
+    /// bundle), `"deposit"` (a `BridgeAttest`'s deposit envelope), or `"mint"` (a faucet mint's
+    /// one envelope).
     pub output: &'static str,
     /// The slot inside `output`; meaningless for `"deposit"`, which carries exactly one
     /// envelope.
@@ -223,6 +224,8 @@ pub fn disclosed(tx: &Transaction, deposit_cm: Option<Word8>, key: &TxKey) -> Ve
                 try_env("deposit", 0, cm, envelope);
             }
         }
+        // A faucet mint carries its one commitment and envelope on the wire.
+        Action::Mint { cm, envelope, .. } => try_env("mint", 0, *cm, envelope),
         _ => {}
     }
     out
@@ -456,5 +459,19 @@ mod tests {
         assert_eq!(opened[0].note, deposit);
         assert!(disclosed(&attest, None, &deposit_key).is_empty(), "no commitment, no opening");
         assert!(disclosed(&attest, Some([6; 8]), &deposit_key).is_empty(), "the AEAD binds the real one");
+    }
+
+    #[test]
+    fn a_faucet_mint_discloses_its_one_note() {
+        // A mint carries its commitment and envelope on the wire, like a bundle's outputs, so the
+        // key its minter sealed under discloses it — the `rand tx-key` a recipient prints.
+        let note = note_for(&alice(), &bob(), 100);
+        let k = TxKey([31; 32]);
+        let mint = Transaction::mint(7, note.commitment(), sealed(&bob(), &alice(), &note, &k), 100, &randprotocol_core::Keypair::generate());
+        let opened = disclosed(&mint, None, &k);
+        assert_eq!(opened.len(), 1);
+        assert_eq!((opened[0].output, opened[0].slot, opened[0].cm), ("mint", 0, note.commitment()));
+        assert_eq!(opened[0].note, note);
+        assert!(disclosed(&mint, None, &TxKey([32; 32])).is_empty());
     }
 }
