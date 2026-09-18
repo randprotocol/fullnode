@@ -2,11 +2,10 @@
 # Run validator A (behind NAT). Bootstraps to the public DigitalOcean nodes C and D; LAN peers are found via mDNS.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-# Prebuilt binaries at the chain-12 build (c66e6b8 = 17db41d plus a test-only fix, byte-identical binary;
-# 17db41d: the short-shielded-address feature reverted —
-# the long ML-KEM address is back, chain 10's form; no hash-domain or peer-id change, so this is the same p2p
-# identity as chain 10) — the whole fleet must run this one build, because a genesis-format
-# change is a fork and a mixed fleet stalls. Override with BINDIR= to test a build.
+# Prebuilt binaries at the fleet's pinned build, 4504a03 (tag v0.3, a same-chain update on chain 12;
+# chain 12 itself was cut from 17db41d, the short-shielded-address revert, and c66e6b8 was a
+# byte-identical re-pin). The whole fleet runs one build: a genesis-format change is a fork and a
+# mixed fleet stalls. Override with BINDIR= to test a build.
 BINDIR=${BINDIR:-bin-4504a03}
 BIN=$BINDIR/rand-node
 [ -x $BIN ] || { echo "$BIN missing — build it at the chain-12 commit or set BINDIR" >&2; exit 1; }

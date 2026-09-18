@@ -40,16 +40,19 @@ and are not repeated here. They take effect on the first chain whose genesis set
 
 ### Known limits
 
-- A call to either translated image cannot land on chain yet. The EVM harness uses the `KECCAK`
-  syscall, and a keccak-carrying production proof (3 198 430 bytes at tier 10) exceeds
-  `MAX_PROOF_BYTES` (2 MiB). The SPL image reads a 27 151-word public tape, and the chain verifies
-  every call against the empty public segment.
+- A translated SPL Token can be deployed on a raised-cap chain but not called. Its call needs
+  27 151 public words (the chain accepts only an empty public segment) and 10 458 private words
+  (the wallet caps call input at 4 096, `MAX_CALL_INPUT_WORDS`).
+- The ERC-20 call's input fits (921 words for `transfer`). Its proof size may not: the EVM harness
+  uses the `KECCAK` syscall, and a keccak-carrying production proof measured 3 198 430 bytes at
+  tier 10, above `MAX_PROOF_BYTES` (2 MiB). Tier-18 size: `TODO-CONTROLLER`.
 - EVM: the nine block-context opcodes trap; a `CALL` with nonzero value traps; ecrecover,
   bn256 mul and pairing, large modexp and long blake2f exceed the 2^20-cycle tier cap.
 - sBPF: CPI and unknown syscalls trap at run time; Ed25519 and secp256k1 exist in software but are
   unlinked.
-- `deploy/vps-setup.sh` deletes the unit it has just written (a leftover of the rename) and inits
-  from chain 5's genesis. `docs/node-hardware.md` gives the manual steps.
+- Fixed: `deploy/vps-setup.sh` deleted the `rand-node` unit it had just written (a leftover of the
+  rename). It still inits from chain 5's `deploy/genesis.json`; `docs/node-hardware.md` gives the
+  manual steps.
 
 ---
 

@@ -74,16 +74,15 @@ The fleet's droplets were provisioned by `deploy/push-to-vps.sh`, which runs `de
 on the server. The server needs `build-essential clang cmake pkg-config libssl-dev` and a Rust
 toolchain, and ports 22 and 30303 open (`docs/deploy.md`).
 
-> **Known issue at `0cfd1e3`.** `deploy/vps-setup.sh` is not usable as-is for a new node:
+> **Two caveats about `deploy/vps-setup.sh`.**
 >
-> - It writes `/etc/systemd/system/rand-node.service` and then runs its "retire the pre-rename
->   service" line, which the rename (`ed96c39`) turned into
->   `systemctl disable --now rand-node; rm -f /etc/systemd/system/rand-node.service`. That line
->   deletes the unit just written, so the later `systemctl enable rand-node` fails.
-> - It initialises from `deploy/genesis.json`, which is chain 5.
+> - Up to `0cfd1e3` it wrote `/etc/systemd/system/rand-node.service` and then deleted it: the
+>   rename (`ed96c39`) had turned its "retire the pre-rename service" line into `rand-node`
+>   itself. The `docs-v04` branch fixes this (`deploy: vps-setup.sh keeps the rand-node unit it
+>   just wrote`). Use a checkout that has the fix.
+> - It still initialises from `deploy/genesis.json`, which is chain 5, not the live chain.
 >
-> Use the manual steps below until the script is fixed. They are the script's own commands with
-> the chain's genesis file.
+> The manual steps below are the script's own commands with the live chain's genesis file.
 
 On the build host (E), build the pinned commit from your machine:
 

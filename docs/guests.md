@@ -71,6 +71,8 @@ comes back in `a0`. Pointer arguments are **word** addresses (the byte pointer d
 | 6 | read public input | `a0` index; returns the word | `rand_read_public(idx)` | `read_public(idx)` |
 
 - Private inputs are bound to the salted commitment `H_IN`. A read past the end cannot be proven.
+- `rand call` proves at most 4 096 private input words (`MAX_CALL_INPUT_WORDS`). The call
+  envelope is sized for that cap.
 - Public inputs are bound to the unsalted `H_PUB`.
 - The eight output words are published in the call's receipt. What they mean is up to the program.
 

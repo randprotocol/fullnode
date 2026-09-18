@@ -430,8 +430,9 @@ This needs a chain whose genesis sets `max_program_words >= 65096`, the image's 
 Chain 12 caps a deploy at 4 096 words, about 16× too small. The command has not been run on any
 chain. Chain 13 values: genesis `TODO-CONTROLLER`, `max_program_words` `TODO-CONTROLLER`.
 
-Before a call on chain, read [§7](#7-what-works-on-chain-today): a call to this image needs a
-public tape, which no transaction can carry today.
+A translated SPL Token can be deployed on a raised-cap chain but **not called yet**. A call needs
+27 151 public words, and the chain accepts only an empty public segment. It also needs 10 458
+private words, above the wallet's 4 096-word input cap. See [§7](#7-what-works-on-chain-today).
 
 ### 5.5 SPL Token numbers
 
@@ -577,7 +578,7 @@ fullnode.
 |---|---|---|
 | deploy on chain 12 (cap 4 096) | refused: 11 686 words | refused: 65 096 words |
 | deploy on a chain with `max_program_words >= N` | admitted (not yet run) | admitted (not yet run) |
-| call inputs | 649–1 201 private words, `--input` only | needs a 27 151-word public tape. `rand call` has no public-input option, and the node verifies every call with the empty public segment (`Machine::verify_public(hc, &[], proof)`, `docs/confidential.md`) |
+| call inputs | 649–1 201 private words (921 for `transfer`), under the wallet's 4 096-word cap. Fits | 27 151 public and 10 458 private words. Blocked twice: the node verifies every call with the empty public segment (`Machine::verify_public(hc, &[], proof)`, `docs/confidential.md`), and `rand call` has no public-input option; the wallet also refuses more than 4 096 private input words (`MAX_CALL_INPUT_WORDS`, checked in `executor::prove_call` before proving) |
 | call proof size | the harness calls the `KECCAK` syscall, so the proof carries the keccak table. A keccak-carrying production proof measured 3 198 430 bytes at tier 10, above `MAX_PROOF_BYTES` (2 MiB, `docs/confidential.md`). Tier-18 size: `TODO-CONTROLLER` | tier 20; size `TODO-CONTROLLER` |
 | call proof memory | tier 16 or 18, see §6.5 | tier 20, see §6.5 |
 
