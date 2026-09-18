@@ -458,8 +458,9 @@ sha256_log_height, public_log_height)` — constraint set 6's six components —
 content, so this warms shared keys that every program of the same shape reuses, not a per-program
 cache. `warm` covers two input-height classes (the smallest table and the 4-word-call class the
 current guests use) at `keccak_log_height = 0` and `sha256_log_height = 0`, since no guest this
-chain deploys calls either hash syscall, and at the empty public segment's height, since the
-chain admits no other (`verify_call` below): twelve keys total, one of which a first call
+chain deploys calls either hash syscall, and at the program's own public segment height
+(`public_log_height(ProgramRecord.public_len)`: the empty segment's for a program deployed without
+a public input, `verify_call` below): twelve keys total, one of which a first call
 typically finds already built by an earlier verify.
 
 ### b. Prove (wallet, off-chain)
@@ -608,11 +609,11 @@ through the real executor); full mode additionally re-checks every proposer sign
 | Declared `sha256_log_height` neither 0 nor in `[6, 20]`, or above `tier + 6` | same two layers | `invalid proof: sha256 height out of range` |
 | Declared `public_log_height` outside `[2, 20]` (mandatory — no `0` escape) | same two layers | `invalid proof: public height out of range` |
 | Declared `mem_log_height` out of `[tier + 2, 24]` | same two layers | `invalid proof: memory height out of range` |
-| Proof commits to a non-empty public segment (`H_PUB` ≠ `public_digest(&[])`) | `verify_public`, inside both `verify_call` and `verify_bundle` | `invalid proof: ...` (opaque `VerifyError`, no separate error code) |
+| Call proof's `H_PUB` ≠ the program's recorded public digest (`public_digest(&[])` for a program deployed without a public input) | `verify_call`, after `Machine::verify`; bundles still `verify_public(hc, &[], proof)` | `invalid proof: …` naming `PublicValues` |
 | Proof's degree bits don't match the declared heights | `verify_call`'s pre-check | `invalid proof: degree bits` |
 | Stale/wrong program (proof's `hc` doesn't match `record.code_hash`) | `Machine::verify`'s public-value check | `invalid proof: ...` (opaque `VerifyError`, no separate error code) |
 | Unknown program id | `Ledger::check_call` | `unknown program <id>` |
-| Oversized proof (> 2 MiB) | `Ledger::validate_inner` step 1, before any decoding | `proof too large` |
+| Oversized proof (> `max_proof_bytes`, 2 MiB unless the genesis sets it) | `Ledger::validate_inner` step 1, before any decoding | `proof too large` |
 | Fee below the action's floor | `Ledger::validate_inner` step 3 | `fee N below minimum M` |
 | Fee below `BUNDLE_BASE + call_fee(tier)` | `Ledger::validate_inner` step 10, after the tier is known from a successful verify | `fee N below minimum M` |
 | Bundle anchored to a root outside the window | step 4 | `anchor is not one of the last 256 roots` |

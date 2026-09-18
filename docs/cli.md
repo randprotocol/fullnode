@@ -54,6 +54,10 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--epoch-blocks <N>` | `1000` | blocks per epoch: how often the validator set is re-derived from the register (spec §8). Part of the genesis hash |
 | `--max-program-words <N>` | none (4096) | the largest program a `Deploy` may carry, in words, `1..=65535` (the zkVM's own limit). Omitted, the file has no `max_program_words` field and the chain runs the 4096-word cap with the genesis hash it always had. `--max-program-words 4096` (or `"max_program_words": 4096`) is a different chain from leaving the field out: the field is part of the genesis hash whenever it is present. Omit it to keep a chain's hash. Every node must run a build that knows the field (v0.4) before `init` on such a file — see `rand-node init` |
 | `--alloc <ALLOCS>` | none, repeatable | a deposit note: `rand1<address>=<amount in RAND>` |
+| `--max-proof-bytes <N>` | none (2 097 152) | the largest proof a transaction may carry, in bytes, `1048576..=33554432` (1–32 MiB). Every proof cap follows it: the call's, each bundle's, the bridge burn's, and the aggregate's |
+| `--max-block-bytes <N>` | none (4 194 304) | the largest block, and so the largest transaction, in bytes, `4194304..=67108864`, and at least `2 × max_proof_bytes + 1 MiB` (the fee bundle's proof and the call's, plus room). When either this or `--max-proof-bytes` is given, the rule is checked with the default standing in for the other, so a proof cap above 1.5 MiB needs this flag too. The node's sync budget, sync reader limit and gossip transmit size follow it, and `rand_sendTransaction` refuses a transaction over it (the RPC body limit follows the proof and envelope caps) |
+| `--max-call-envelope-bytes <N>` | none (18 432) | the largest call input envelope, in bytes, `18432..=1048576`. `rand call` derives its input-word cap from it: `(N − 1 252) / 4` |
+| `--max-program-public-words <N>` | none (0) | the largest public input a `Deploy` may fix (`rand program deploy --public`), in words, `0..=65535`. 0, the default, admits no public input |
 | `--out <OUT>` | `genesis.json` | output path |
 | `--faucet` | off | **testnet only**: enable `Mint` transactions (`rand_mint`, up to 100 RAND per call). Part of the genesis hash |
 | `--no-confidential` | off | disable Deploy/Call transactions on this chain. Part of the genesis hash |
@@ -61,8 +65,20 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 
 Prints one `alloc` line per `--alloc`, then the genesis hash, the validator and note counts, the
 blocks per epoch, the program cap (`programs up to N words`: 4096 unless `--max-program-words` set
-it), the faucet and confidential switches, the FRI profile and `hc_bundle`. Every node of a chain
-must use a byte-identical genesis file.
+it), the four call limits (`proofs up to … bytes, blocks up to … bytes, call envelopes up to …
+bytes, program public input up to … words`), the faucet and confidential switches, the FRI profile
+and `hc_bundle`. Every node of a chain must use a byte-identical genesis file.
+
+The five limit flags (`--max-program-words` and the four above) behave alike: omitted, the file has
+no such field, the chain runs the default, and the genesis hash is what it would have been before
+the field existed; given, the field is part of the genesis hash, even at its default value. A
+running chain cannot change them. `rand_getLimits` reports all five. Chain 13's values, which
+`deploy/cut-chain13-genesis.sh` writes:
+
+```
+--max-program-words 65535 --max-proof-bytes 8388608 --max-block-bytes 20971520 \
+--max-call-envelope-bytes 65536 --max-program-public-words 32768
+```
 
 There is no `--alloc-each`: a shielded chain has no per-validator allocation, because value only
 exists as a note someone holds the spend key for. Each `--alloc` builds one deposit note with
@@ -98,8 +114,9 @@ Genesis JSON shape:
 
 `bridge` is the one optional field this command never writes (add it by hand, as above); every
 other field it writes, `epoch_blocks` included. `max_program_words` (a number) is written only with
-`--max-program-words`, and `aggregation` only with `--aggregation`; a file without them hashes as it
-did before those fields existed. `--max-program-words 4096` (or `"max_program_words": 4096`) is a
+`--max-program-words`, each of `max_proof_bytes`, `max_block_bytes`, `max_call_envelope_bytes` and
+`max_program_public_words` only with its flag, and `aggregation` only with `--aggregation`; a file
+without them hashes as it did before those fields existed. `--max-program-words 4096` (or `"max_program_words": 4096`) is a
 different chain from leaving the field out: the field is part of the genesis hash whenever it is
 present. Omit it to keep a chain's hash.
 

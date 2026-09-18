@@ -16,6 +16,21 @@ translators, `sbpf2rv` (Solana) and `evm2rv` (Ethereum). They live in the circui
 and are not repeated here. They take effect on the first chain whose genesis sets
 `max_program_words`.
 
+New in v0.4 on the fullnode side (branch `feat/call-limits`, spec
+`docs/superpowers/specs/2026-09-19-call-limits-design.md`):
+
+- **The call limits are genesis parameters**: `max_proof_bytes`, `max_block_bytes`,
+  `max_call_envelope_bytes` and `max_program_public_words`, threaded like `max_program_words`
+  (optional, bound into the hash only when present). Every proof cap, the whole-transaction and
+  block caps, the envelope cap, the node's sync and gossip limits and the RPC's body limit and
+  pre-check follow them. A call's fee gains a byte term past today's allowance.
+- **A program's public input is fixed at deploy**: `rand program deploy --public <words | ELF>`,
+  a new program id rule (`rand-program-2`), `H_PUB` checked on every call against the digest
+  recorded at deploy, `h_pub` in receipts, and `rand_getLimits` / `rand_getProgramPublic`.
+  There are no per-call public words.
+- `deploy/cut-chain13-genesis.sh` cuts chain 13 with 65 535 / 8 MiB / 20 MiB / 65 536 /
+  32 768.
+
 ### Claims, measurements and methods
 
 | claim | measurement | method |
@@ -26,6 +41,14 @@ and are not repeated here. They take effect on the first chain whose genesis set
 | `evm2rv` output equals the interpreter's | identical eight words for `transfer`, `approve` and `transferFrom`; 66 235 / 48 119 / 88 824 cycles against 121 638 / 85 645 / 161 434 on `evm.bin` (54.5–56.2 %) | `rand-guest run` on both images and `diff`, re-run 2026-09-19; `evm2rv/tests/parity.rs` (8 vectors, both stages) and `tests/fuzz.rs` (10 000 random programs) |
 | `sbpf2rv` output equals the interpreter's | identical eight words for SPL Token `Transfer` 250; 765 851 cycles against 694 498 on `sbpf.bin`; all 8 vectors in tier 20; image 65 096 words | `sbpf2rv/tests/parity.rs`, 2026-09-18 |
 | SPL Token translation does not pay off today | about 98 % of each run is the fixed sBPF ABI harness; the translated image is 69–75 k cycles dearer per vector | per-stage cycle attribution (`sbpf2rv/README.md`) |
+| the call limits are genesis parameters, and a genesis without them is chain 12 byte for byte | each field bounded, refused out of range (including block ≥ 2 × proof + 1 MiB) and bound into the hash only when present; the chain-12 file still hashes to `605eb783…`; all five restored after a restart and replay | `the_call_limits_are_optional_and_bound_into_the_hash_only_when_present`, `the_call_limits_are_refused_out_of_bounds`, `chain_12s_genesis_file_still_builds_chain_12`, `the_call_limits_hold_through_replay_and_restart` |
+| the ledger enforces the chain's limits, not constants | a 2 MiB + 1 B proof refused by default and admitted at 8 MiB (call, fee bundle, burn); a 5 MiB call block refused by default and applied on a raised chain; the envelope cap is the genesis value | `every_proof_cap_is_the_ledgers_max_proof_bytes`, `the_whole_transaction_cap_is_the_ledgers_max_block_bytes`, `apply_block_for_sync_uses_the_ledgers_block_cap`, `the_call_envelope_cap_is_the_ledgers` |
+| a call costs what it cost before up to the free allowance | `call_fee` unchanged at ≤ 2 097 152 + 18 432 bytes, +1 000 units per KiB (or part) past it; the node answers `rand fee call 16 --bytes 2115584` with 0.0023 RAND and `--bytes 2115585` with 0.002301 RAND | `the_call_fee_charges_only_bytes_past_todays_allowance`; `rand fee` against the local chain below |
+| the node's transport follows the block cap | a ~14 MiB block syncs between two libp2p nodes on 20 MiB limits and is refused between two on the defaults; a default chain keeps 6 MiB / 12.25 MiB / 16 MiB | `two_nodes_on_a_20_mib_chain_sync_a_block_over_the_default_reader_limit`, `the_wire_limits_follow_the_ledgers_block_cap` |
+| a public input is fixed at deploy and binds every call | the id with a public input is injective over the code/public split; the deploy pays for its public words and stores the digest; a call proved over the right words verifies and its receipt carries `h_pub`, one over other words or `&[]` fails with `PublicValues` (stub and real zkVM proofs) | `a_public_input_changes_the_id_and_an_empty_one_does_not`, `the_code_and_public_boundary_is_bound`, `a_deploy_with_public_words_gets_the_new_id_pays_for_them_and_stores_the_digest`, `a_call_is_checked_against_the_programs_public_digest_and_the_receipt_carries_it`, zkvm `a_call_is_checked_against_the_records_public_digest`, `a_program_with_a_public_input_is_warmed` |
+| the RPC and the wallet expose both | `rand_getLimits` returns the five limits; `rand_getProgramPublic` serves the words; end to end on a test-profile chain: deploy `public_echo` with `--public`, call it, receipt `h_pub` equals the digest, `--expect-public` refuses before proving, a proof over other words is refused by the chain (354 s) | `get_limits_reports_the_chains_five_limits`, `a_programs_public_input_is_served_with_its_digest_and_the_receipts_h_pub`, `wallet_flow::a_program_with_a_public_input_is_deployed_and_called_over_it` |
+| the translated ERC-20 is called on chain 13's limits | `approve` (649 private words, tier 16) through `rand call`: receipt outputs `[1, 942495465, 790002515, 1351749335, 1059083501, 2923046783, 2814575942, 696258848]`, equal to `rand-guest run`'s and the native interpreter's; call proof 796 019 bytes, transcript 2 700 bytes, fee 0.0023 RAND; 505.6 s end to end (call proof 392.6 s, fee bundle 95.8 s), 19.8 GB max RSS, 22.9 GB peak footprint; `rand open-call` re-opened the words: faithful | a local one-validator chain with chain 13's five limits, test FRI profile, 48 GB laptop, `/usr/bin/time -l`, 2026-09-19 (`docs/translators.md` §4.6.1) |
+| the translated SPL Token deploys with its ELF as the public input | program id `74023691…d00a` (the bare image's is `65d234ce…`), 65 096 code + 27 151 public words, `public_digest ec57b10e…d67e`, fee 9.2257 RAND, 97.3 s (bundle 93.2 s); `rand call --expect-public` with a one-byte-changed ELF or a 4-word file refused in ≤ 0.01 s at 11 MB RSS, nothing proved. The call proof (tier 20, about 330 GB) was not run | the same local chain (`docs/translators.md` §5.4–5.5) |
 | ERC-20 is proven; SPL Token is not | tier 18 (ERC-20 `transfer`): OOM-killed at 24.7 GB on a 48 GB laptop, above 47 GB at 25 min on a 64 GB droplet; proved on a 128 GB droplet (m-16vcpu-128gb) at 85.0 GB (translated) / 85.5 GB (interpreted) peak RSS, 3 230.5 s / 3 143.3 s, 811 600 / 805 108-byte proofs. Tier 16 (ERC-20 `approve`, translated): 21.7 GB, 786.7 s (13.1 min), 798 930-byte proof. Tier 20 (SPL Token): OOM-killed at 65.1 GB on a 64 GB droplet after 10 m 41 s; not yet proven — extrapolated at about 330 GB and about 3.6 h, more than DigitalOcean's largest memory droplet (m-32vcpu-256gb, 256 GB) | `/usr/bin/time`, watchdogs; the prover is single-threaded (99 % of one core on 16 vCPUs) |
 
 ### Docs
@@ -37,16 +60,23 @@ and are not repeated here. They take effect on the first chain whose genesis set
   ERC-20 and SPL Token walkthroughs, measured tables, limits.
 - `docs/node-hardware.md`: what each role proves or verifies, measured RAM and disk, DigitalOcean
   sizes, prover memory per tier, setup.
+- The call limits and the public input: `docs/cli.md` (the four `rand-node genesis` flags,
+  `deploy --public`, `call --expect-public`, `fee --public-words` / `--bytes`), `docs/rpc.md`
+  (`rand_getLimits`, `rand_getProgramPublic`, `h_pub`), `docs/guests.md` §8.1,
+  `docs/confidential.md` (Call limits and a program's public input), and `docs/translators.md`
+  (calling the ERC-20; the SPL deploy with `--public spl_token.so`).
 
 ### Known limits
 
-- A translated SPL Token can be deployed on a raised-cap chain but not called. Its call needs
-  27 151 public words (the chain accepts only an empty public segment) and 10 458 private words
-  (the wallet caps call input at 4 096, `MAX_CALL_INPUT_WORDS`).
-- The ERC-20 call's input fits (921 words for `transfer`). Its proof size may not: the EVM harness
-  uses the `KECCAK` syscall, and a keccak-carrying production proof measured 3 198 430 bytes at
-  tier 10, above `MAX_PROOF_BYTES` (2 MiB). Tier-18 size (test profile): 811 600 bytes translated,
-  805 108 bytes interpreted.
+- The chain side of both translated programs needs chain 13's limits. On chain 12 (no limit
+  fields) the images are over the program cap, SPL Token's public input is refused, its 10 458
+  private words are over the default 4 295-word input cap, and a keccak-carrying ERC-20 call
+  proof (3 198 430 bytes at tier 10, production) is over the 2 MiB proof cap.
+- A translated SPL Token call is not proven: tier 20 needs about 330 GB. Its deploy, public input
+  and refusal paths are run; its call proof is not. The ERC-20 `transfer` and `transferFrom` calls
+  are tier 18 and need about 85 GB; only `approve` (tier 16) was called on chain, on a 48 GB
+  laptop.
+- `rand call --no-envelope` applies no input-word cap, since nothing is sealed.
 - EVM: the nine block-context opcodes trap; a `CALL` with nonzero value traps; ecrecover,
   bn256 mul and pairing, large modexp and long blake2f exceed the 2^20-cycle tier cap.
 - sBPF: CPI and unknown syscalls trap at run time; Ed25519 and secp256k1 exist in software but are

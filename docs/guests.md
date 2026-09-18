@@ -71,18 +71,24 @@ comes back in `a0`. Pointer arguments are **word** addresses (the byte pointer d
 | 6 | read public input | `a0` index; returns the word | `rand_read_public(idx)` | `read_public(idx)` |
 
 - Private inputs are bound to the salted commitment `H_IN`. A read past the end cannot be proven.
-- `rand call` proves at most 4 096 private input words (`MAX_CALL_INPUT_WORDS`). The call
-  envelope is sized for that cap.
-- Public inputs are bound to the unsalted `H_PUB`.
+- `rand call` seals the private inputs into the call envelope, so the envelope cap bounds them:
+  at most `(max_call_envelope_bytes − 1 252) / 4` words, read from `rand_getLimits`. That is
+  4 295 words on a chain without the field (18 432 bytes) and 16 071 on chain 13 (65 536 bytes). A
+  node without `rand_getLimits` gets the old 4 096. `--no-envelope` seals nothing and applies no
+  word cap.
+- Public inputs are bound to the unsalted `H_PUB`. A program's public input is fixed at deploy
+  (`rand program deploy --public <FILE>`, §8.1): every call proves over the same words, and a call
+  carries none of its own.
 - The eight output words are published in the call's receipt. What they mean is up to the program.
 
-Three chain rules limit which syscalls a deployed program can use today:
+Three chain rules limit which syscalls a deployed program can use. Each depends on the chain's
+genesis limits (§8.1):
 
-| syscall | chain rule | effect |
+| syscall | chain without the limit fields (chain 12) | chain 13 |
 |---|---|---|
-| 6, read public | every call is verified with the **empty** public segment (`docs/confidential.md`, constraint set 6) | a program that reads public words cannot be called on chain yet |
-| 4, Keccak | a proof that carries the keccak table measured 3 198 430 bytes at tier 10, production profile. `MAX_PROOF_BYTES` is 2 MiB | such a call proof is refused by size |
-| 5, SHA-256 | the sha256 table adds 400 563 bytes to a production proof (measured upstream). A hash-free production proof is 1 298 729 bytes at tier 10 | the sum, about 1.70 MB, is under 2 MiB at tier 10. This is an addition of two measurements, not a measured proof; larger tiers are unmeasured |
+| 6, read public | every call is verified against the **empty** public segment, so a program that reads public words cannot be called | the program's public input is fixed at deploy (up to `max_program_public_words`, 32 768) and every call is verified against its digest |
+| 4, Keccak | a proof that carries the keccak table measured 3 198 430 bytes at tier 10, production profile, above the 2 MiB proof cap: refused by size | the proof cap is 8 MiB (`max_proof_bytes`), so such a proof fits; bytes past 2 MiB + 18 432 cost 1 000 units per KiB |
+| 5, SHA-256 | the sha256 table adds 400 563 bytes to a production proof (measured upstream); with a hash-free 1 298 729-byte tier-10 proof, about 1.70 MB, under 2 MiB. This is a sum of two measurements, not a measured proof | fits under 8 MiB |
 
 ## 2. The image container
 
@@ -545,6 +551,47 @@ A wallet's note store is per key file, not per chain. Use a separate key file (o
 `<key>.notes.json` aside) when you switch between chains, or the wallet fails with `no leaf at
 index N`.
 
+### 8.1 The call limits and a program's public input
+
+Four more genesis fields follow the same rules as `max_program_words`: optional, bound into the
+genesis hash only when present, fixed for the life of the chain, and reported by
+`rand_getLimits`.
+
+| field | absent (chain 12) | bounds | chain 13 |
+|---|---:|---|---:|
+| `max_proof_bytes` | 2 097 152 | 1 MiB ..= 32 MiB | 8 388 608 |
+| `max_block_bytes` | 4 194 304 | 4 MiB ..= 64 MiB, and ≥ 2 × `max_proof_bytes` + 1 MiB | 20 971 520 |
+| `max_call_envelope_bytes` | 18 432 | 18 432 ..= 1 MiB | 65 536 |
+| `max_program_public_words` | 0 (no public input) | 0 ..= 65 535 | 32 768 |
+
+`rand-node genesis` writes each with its flag (`--max-proof-bytes`, `--max-block-bytes`,
+`--max-call-envelope-bytes`, `--max-program-public-words`; [`cli.md`](cli.md#rand-node-genesis)).
+
+**A public input fixed at deploy.** A program that reads public words (syscall 6) gets them from
+its deploy:
+
+```
+rand program deploy image.bin --public words.txt     # whitespace-separated u32 words
+rand program deploy image.bin --public program.so    # an ELF, word-encoded as the sBPF guest reads it
+```
+
+- The program id then binds the public input:
+  `blake3("rand-program-2", base_pc ‖ u32_le(len(words)) ‖ words ‖ u32_le(len(public)) ‖ public)`.
+  Without `--public` the id is unchanged, `blake3("rand-program", base_pc ‖ words)`, so
+  `rand-guest info` prints the no-public id. The id `deploy` prints is the one to call.
+- The deploy pays for its public words as code words (`0.001 RAND + 100 000 units per word` over
+  both), and the node stores the words and their digest `H_PUB`.
+- `rand call <id>` fetches the public input (`rand_getProgramPublic`), checks that code and public
+  input hash to the id, and proves over them. The chain checks the proof's `H_PUB` against the
+  deploy's digest, so a proof over any other public words is refused (`PublicValues`). The receipt
+  carries `h_pub`.
+- `rand call <id> --expect-public <FILE>` refuses before proving unless the program's public input
+  is exactly that file's words.
+
+**Call fee over the free allowance.** A call is priced as before up to 2 097 152 + 18 432 bytes of
+call proof plus input envelope; every KiB (or part of one) past that adds 1 000 units (0.000001 RAND). `rand fee call <tier> --bytes
+B` asks the node.
+
 ### The testnet chain with a raised cap
 
 | | |
@@ -554,4 +601,5 @@ index N`.
 | `max_program_words` | `TODO-CONTROLLER` |
 | pinned build | `TODO-CONTROLLER` |
 
-Until chain 13 is live, deploy only images of at most 4096 words on the testnet.
+Chain 13's call limits are the values in §8.1 (`deploy/cut-chain13-genesis.sh`). Until chain 13
+is live, deploy only images of at most 4096 words, and no `--public`, on the testnet.

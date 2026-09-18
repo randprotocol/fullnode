@@ -271,6 +271,8 @@ power-of-two cap above the measured sizes with room for the per-proof variation,
 deliberately below the ~3.11 MB a keccak-bearing proof costs. **`MAX_BLOCK_BYTES` stays 4 MiB** —
 `docs/block-space.md` §5 records that decision: at ~1.3 MB per shielded transfer that is three
 transfers per block, and block-level aggregation rather than a bigger block is the queued remedy.
+(Both are now genesis parameters with these values as defaults; chain 13 raises them to 8 MiB and
+20 MiB: [Call limits and a program's public input](#call-limits-and-a-programs-public-input).)
 
 Proofs made under constraint set 4 (or earlier) do not verify under constraint set 5, in either
 direction — the FRI profile differs (a 27-query proof and an 80-query verifier reject each other),
@@ -335,7 +337,9 @@ constraint-set-6 merge, which also brings milestones 4.3 (the EVM interpreter gu
   in-circuit to a public segment the chain never saw — and every honest proof by today's guests
   (none of which calls `SYS_READ_PUBLIC`) has the empty segment anyway, so the stronger check
   costs nothing. A future action type that publishes words (a public-ELF program in the upstream
-  sBPF shape is the obvious one) would pass them in place of `&[]`.
+  sBPF shape is the obvious one) would pass them in place of `&[]`. (That is now the deploy's
+  public input: a call is checked against the digest recorded at deploy, and a program deployed
+  without one still against the empty segment's. See [Call limits and a program's public input](#call-limits-and-a-programs-public-input).)
 - **`MAX_PROOF_BYTES` stays 2 MiB.** Measured on this tree
   (`cargo test -p randprotocol-zkvm --release --test e2e
   measure_production_profile_at_tier_10_and_12 -- --ignored --nocapture`): a keccak-free
@@ -358,10 +362,15 @@ old chain. A fleet must run one build.
 
 ## On-chain model
 
-**Programs** are content addressed: `program_id = blake3("rand-program" || base_pc || words)`.
-A `Deploy` transaction stores `{ base_pc, words }` (at most the chain's program cap: 4096 words, or
-the genesis file's `max_program_words`, at most 65 535, when it sets one); every word must decode as an
-instruction. Programs are immutable and part of the state root.
+**Programs** are content addressed: `program_id = blake3("rand-program" || base_pc || words)`,
+or, for a program deployed with a public input,
+`blake3("rand-program-2" || base_pc || u32_le(len(words)) || words || u32_le(len(public)) || public)`.
+A `Deploy` transaction stores `{ base_pc, words, public }` (at most the chain's program cap: 4096 words, or
+the genesis file's `max_program_words`, at most 65 535, when it sets one; `public` at most
+`max_program_public_words`, 0 unless the genesis sets it); every word must decode as an
+instruction. Programs are immutable and part of the state root. The record keeps `public_len`
+and `public_digest` (`H_PUB` of the public words); the node keeps the words themselves and serves
+them with `rand_getProgramPublic`.
 
 **Calls** carry `{ program, proof }`. The proof is `postcard(rand_zkvm::Proof)` (tier, public
 values, batch STARK proof). There is no recipient list: it existed only for effect kind 1.
@@ -373,8 +382,9 @@ program and its caller agree they mean. The old layout (`out0` effect kind, `out
 `private_payment`, which still writes `[1, 0, amount_lo, amount_hi, …]`; on this chain that is a
 statement, not a payment.
 
-**Receipts** `{ tx, program, tier, outputs, height, index }` are stored per call and served by
-`rand_getReceipt`; they are recomputed and checked when a node syncs or verifies its chain. There
+**Receipts** `{ tx, program, tier, outputs, height, index, h_pub }` are stored per call and served by
+`rand_getReceipt` (`h_pub` is the program's public digest, `null` for a program without a public
+input); they are recomputed and checked when a node syncs or verifies its chain. There
 is no `effect` field.
 
 ## Validity rules
@@ -385,11 +395,17 @@ is no `effect` field.
   the genesis-pinned `hc_bundle`.
 - Deploy: `words.len() <= max_program_words` (genesis; 4096 when the file does not set it, and never
   above 65 535, the word count the zkVM can prove), `base_pc % 4 == 0`, every word decodes,
-  `fee >= BUNDLE_BASE + 100_000 * words`.
-- Call: program exists; `proof.len() <= 2 MiB` (`gas::MAX_PROOF_BYTES`, raised for constraint
-  set 5's proof sizes, re-measured and kept at constraint set 6's); the proof verifies against the stored program's
-  `hc` for the tier it declares; `fee >= BUNDLE_BASE + call_fee(tier)`, checked last, once a
-  verified proof has revealed the tier.
+  `public.len() <= max_program_public_words` (checked first, before any fee or code work),
+  `fee >= BUNDLE_BASE + 100_000 * (words + public)`.
+- Call: program exists; `proof.len() <= max_proof_bytes` (genesis; 2 MiB, `gas::MAX_PROOF_BYTES`,
+  when the file does not set it: raised for constraint set 5's proof sizes, re-measured and kept at
+  constraint set 6's); the input envelope within `max_call_envelope_bytes` (18 432 by default); the
+  proof verifies against the stored program's `hc` for the tier it declares, and its `H_PUB`
+  equals the program's recorded public digest (the empty input's for a program without one), or
+  the call fails with `PublicValues`; `fee >= BUNDLE_BASE + call_fee(tier, bytes)`, checked last,
+  once a verified proof has revealed the tier.
+- Any transaction: its encoding at most `max_block_bytes` (4 MiB by default), and a block's
+  transactions within the same cap.
 - A block with an invalid call is invalid, like any other invalid transaction.
 
 ## Gas (v0)
@@ -399,7 +415,8 @@ is no `effect` field.
 | any bundle (`BUNDLE_BASE`) | 0.001 RAND |
 | shielded transfer | 0.001 RAND (the base alone) |
 | Deploy | 0.001 RAND + 100,000 units per word (0.0266 RAND for 256 words) |
-| Call | 0.002 RAND at tier 10, plus 0.0001 RAND per two tiers above it (0.0025 at tier 20) |
+| Deploy with a public input | as Deploy, counting the public words with the code words |
+| Call | 0.002 RAND at tier 10, plus 0.0001 RAND per two tiers above it (0.0025 at tier 20), plus 0.000001 RAND per KiB (or part) of call proof and input envelope past 2 097 152 + 18 432 bytes |
 | BridgeAttest | 0.001 RAND (the base alone) |
 | BridgeBurn | 0.002 RAND — the base twice, for its two bundles |
 | Mint (faucet) | free, and carries no bundle |
@@ -412,8 +429,8 @@ asset bundle inside the action — both of which every node verifies. The asset 
 
 Anything above the minimum is a tip; all of it is credited to the block proposer's `rewards` in
 the validator register, which phase S2's `Withdraw` turns back into a note. Blocks hold at most
-4 MiB of transactions, and at constraint set 5's 80 queries a bundle proof is ~1.3 MB, so **three**
-shielded transactions per block (it was roughly a dozen at 27 queries; `docs/block-space.md`). Constants live in `randprotocol_core::gas`; `rand fee bundle|deploy <words>|call <tier>`
+4 MiB of transactions on a chain without `max_block_bytes` (20 MiB on chain 13), and at constraint set 5's 80 queries a bundle proof is ~1.3 MB, so **three**
+shielded transactions per block (it was roughly a dozen at 27 queries; `docs/block-space.md`). Constants live in `randprotocol_core::gas`; `rand fee bundle|deploy <words> [--public-words M]|call <tier> [--bytes B]`
 asks the node.
 
 ## Privacy
@@ -465,8 +482,10 @@ from any other key: handing one over says nothing about any other call.
 | the auditor's viewing key | the auditor named when sealing | that one call |
 
 **What the chain does and does not do.** It checks the envelope's *size* and nothing else:
-`MAX_CALL_ENVELOPE_BYTES` = 18,432, sized to admit the 4096-word input cap plus the auditor parts
-(`call_envelope::validate`, step 7 of admission). It holds no key that opens any of it, never looks
+`max_call_envelope_bytes` from the genesis, 18,432 (`MAX_CALL_ENVELOPE_BYTES`) when the file does not
+set it (`call_envelope::validate`, step 7 of admission). The wallet derives its input-word cap from
+it: `(max_call_envelope_bytes − 1 252) / 4`, where 1 252 bytes is an envelope with an auditor and no
+inputs — 4 295 words by default, 16 071 on chain 13's 65 536. It holds no key that opens any of it, never looks
 inside, and serves it verbatim to anyone who asks (`rand_getCallEnvelope`, alongside the receipt's
 `h_in`). (A viewing key imported for note scanning — `rand_importViewingKey`, `docs/shielded.md` —
 opens *note* envelopes only; a caller's viewing key would open its own calls' sender wraps, but
@@ -504,6 +523,39 @@ Covered end to end by `a_call_envelope_is_opened_by_the_caller_and_the_auditor_o
 (`crates/randprotocol-node/tests/cluster.rs`), which opens the bytes a *node* served as the caller and as
 the auditor, fails to open them as a third wallet that is neither, and catches both a tampered
 transcript (the faithfulness check) and a tampered ciphertext (the AEAD).
+
+## Call limits and a program's public input
+
+Chain 13 (spec `docs/superpowers/specs/2026-09-19-call-limits-design.md`) makes four call limits
+genesis parameters and lets a deploy fix a program's public input. A genesis without the fields
+hashes, and behaves, exactly as before.
+
+| field | absent | bounds | chain 13 |
+|---|---:|---|---:|
+| `max_proof_bytes` | 2 097 152 | 1 MiB ..= 32 MiB | 8 388 608 |
+| `max_block_bytes` | 4 194 304 | 4 MiB ..= 64 MiB, ≥ 2 × `max_proof_bytes` + 1 MiB | 20 971 520 |
+| `max_call_envelope_bytes` | 18 432 | 18 432 ..= 1 MiB | 65 536 |
+| `max_program_public_words` | 0 | 0 ..= 65 535 | 32 768 |
+
+- **Every proof cap follows `max_proof_bytes`**: the call's, each bundle's, the bridge burn's and
+  the aggregate's. A keccak-carrying call proof (3 198 430 bytes at tier 10, production) fits
+  under 8 MiB.
+- **The node's transport limits follow the block cap**: the sync budget is `max_block_bytes + 2 MiB`,
+  the sync reader limit twice that plus 256 KiB, and the gossip transmit size
+  `max(16 MiB, max_block_bytes + 1 MiB)`. A default chain keeps 6 MiB, 12.25 MiB and 16 MiB.
+- **A public input is fixed at deploy, never per call.** A proof's public input is visible to
+  every verifier, so the chain accepts it once, with the program: every call to the program shows
+  the same public words, already on chain since the deploy, and everything that varies per call
+  goes through the private tape and the sealed envelope. The ledger records `H_PUB` at deploy and
+  `verify_call` compares the proof's `pv::PUB0..7` with it after `verify`.
+- **The wallet**: `rand program deploy <image> --public <words file | ELF>`; `rand call` fetches
+  the public input, checks it against the program id, and proves over it; `--expect-public <FILE>`
+  refuses before proving on a mismatch; a proof over `max_proof_bytes` is refused before the
+  paying bundle is proved ([`cli.md`](cli.md#rand-wallet)).
+
+The translated SPL Token (`docs/translators.md`) is the program this was built for: its image reads
+the 27 151-word ELF from the public tape and 10 458 private words, so it needs all three raised
+limits.
 
 ## Chains without confidential computation
 
