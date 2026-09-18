@@ -37,7 +37,9 @@ const SYNC_BATCH_MIN: u32 = 1;
 /// Generous on purpose — the budget should over-estimate the response, never under-estimate it.
 const SYNC_RESPONSE_FRAMING_BYTES: u64 = 64;
 
-/// How long the node waits for a sync response before it abandons the request.
+/// How long the node waits for a sync response before it abandons the request, on a default
+/// chain; a running node uses its own [`network::WireLimits::sync_request_timeout`] (the same
+/// floor, raised for a chain whose sync responses may weigh more).
 ///
 /// The wire's own timeout, deliberately. A shorter deadline here abandons a request that is still
 /// alive, and the node then discarded the response when it arrived: the 10 s give-up this replaces
@@ -1599,7 +1601,7 @@ impl Node {
     /// Only *connected* peers are candidates; see [`Peer`].
     async fn sync_from(&mut self, skip: Option<PeerId>) {
         if let Some((peer, id, started)) = self.sync_inflight {
-            if started.elapsed() < SYNC_GIVE_UP {
+            if started.elapsed() < self.wire.sync_request_timeout {
                 return;
             }
             // Past the wire's own timeout, so the request is gone rather than merely slow.
@@ -2764,7 +2766,21 @@ mod tests {
     }
 
     /// A shielded transaction carrying a `proof_bytes`-byte proof, standing in for a real one.
+    ///
+    /// The proof bytes are pseudo-random (a splitmix64 stream seeded by the length), as a real
+    /// proof's are: a run of one small value would measure the CBOR wire at one byte per byte
+    /// even as an integer array (CBOR writes an integer below 24 in one byte), hiding the ~1.9x an
+    /// integer array costs on real proof bytes.
     fn fat_tx(proof_bytes: usize) -> Transaction {
+        let mut state = proof_bytes as u64 ^ 0x5eed_5eed_5eed_5eed;
+        let mut next = || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let proof: Vec<u8> = (0..proof_bytes.div_ceil(8)).flat_map(|_| next().to_le_bytes()).take(proof_bytes).collect();
         let bundle = randprotocol_core::notes::Bundle {
             anchor: [1; 8],
             nullifiers: [[2; 8], [3; 8]],
@@ -2774,9 +2790,25 @@ mod tests {
             asset: 0,
             time: 1,
             envelopes: [crate::storage::fixtures::env(1), crate::storage::fixtures::env(2)],
-            proof: vec![7u8; proof_bytes],
+            proof,
         };
         Transaction::shielded(7, bundle, randprotocol_core::Action::None)
+    }
+
+    /// The byte-vector fields ride the CBOR sync wire as byte strings (`crypto::wire_bytes`), not
+    /// as integer arrays: a block of pseudo-random proof bytes weighs on the wire what it weighs
+    /// in bincode, plus the CBOR map keys and headers — about 500 B here, where an integer array
+    /// would have been ~1.9x.
+    #[test]
+    fn a_block_of_random_proof_bytes_is_no_larger_in_cbor_than_in_bincode() {
+        let ks = validators(4);
+        let cb = sized_block(1, &ks, 4, vec![fat_tx(2 << 20), fat_tx(1 << 20), fat_tx(300_000)]);
+        let bincode_len = bincode::serialize(&cb).unwrap().len() as u64;
+        let cbor_len = wire_size(std::slice::from_ref(&cb));
+        // Measured: 3 480 995 B bincode, 3 481 497 B CBOR (6 604 236 B as integer arrays).
+        let margin = 16 << 10;
+        assert!(bincode_len > 3 << 20, "{bincode_len} B");
+        assert!(cbor_len <= bincode_len + margin, "cbor {cbor_len} B vs bincode {bincode_len} B");
     }
 
     fn wire_size(blocks: &[CommittedBlock]) -> u64 {
@@ -2904,7 +2936,7 @@ mod tests {
         let batch = fill_sync_batch(vec![block], serve_sync_budget(&limits));
         b.send_sync_response(channel, SyncResponse::Blocks(batch)).await;
         let b_id = b.local_peer_id;
-        let out = wait_for_event(&mut a_rx, network::SYNC_REQUEST_TIMEOUT + Duration::from_secs(10), |e| match e {
+        let out = wait_for_event(&mut a_rx, limits.sync_request_timeout + Duration::from_secs(10), |e| match e {
             NetworkEvent::SyncResponse { peer, request_id, response: SyncResponse::Blocks(v) } if peer == b_id && request_id == req_id => {
                 Some(Ok(v))
             }
@@ -3134,6 +3166,12 @@ mod tests {
     #[test]
     fn the_client_give_up_is_not_shorter_than_the_wire_timeout() {
         assert!(SYNC_GIVE_UP >= network::SYNC_REQUEST_TIMEOUT);
+        // The running node gives up on its chain's own wire timeout, the one `network::start`
+        // hands to request-response — the same value, so neither side is shorter.
+        for block_bytes in [randprotocol_core::gas::MAX_BLOCK_BYTES, 20 << 20] {
+            let wire = network::WireLimits::for_block_bytes(block_bytes);
+            assert!(wire.sync_request_timeout >= SYNC_GIVE_UP);
+        }
     }
 
     // ------------------------------------- gossip validation: one acceptance per delivery

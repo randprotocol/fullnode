@@ -28,7 +28,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
-/// How long the request-response protocol waits for a sync response before reporting `SyncFailed`.
+/// How long the request-response protocol waits for a sync response before reporting `SyncFailed`,
+/// on a **default** chain. A running node uses [`WireLimits::sync_request_timeout`], which is this
+/// floor or one second per MiB of its reader limit, whichever is longer.
 ///
 /// The node's own give-up (`node::SYNC_GIVE_UP`) is this same constant. A client deadline *shorter*
 /// than the wire's abandons a request id that is still perfectly alive, re-requests the same range
@@ -96,6 +98,19 @@ const fn response_limit_for(budget: u64) -> u64 {
 
 /// gossip's transmit size for a chain's block cap: never below today's 16 MiB, and always a whole
 /// block plus 1 MiB, so a proposal carrying a full block is never dropped.
+/// The sync request timeout over a reader limit: one second per MiB the response may weigh
+/// (rounded up), never below [`SYNC_REQUEST_TIMEOUT`]. A default chain's 12.25 MiB limit keeps the
+/// 30 s floor; a 20 MiB-block chain's 44.25 MiB gets 45 s, so a response that is legitimately
+/// larger is not cut off by a deadline sized for a smaller one.
+const fn request_timeout_for(response_limit: u64) -> Duration {
+    let secs = response_limit.div_ceil(1 << 20);
+    if secs > SYNC_REQUEST_TIMEOUT.as_secs() {
+        Duration::from_secs(secs)
+    } else {
+        SYNC_REQUEST_TIMEOUT
+    }
+}
+
 const fn gossip_transmit_for(max_block_bytes: usize) -> usize {
     let block = max_block_bytes + (1 << 20);
     if block > (16 << 20) {
@@ -118,15 +133,20 @@ pub struct WireLimits {
     pub sync_response_wire_limit: u64,
     /// gossipsub's `max_transmit_size`: `max(16 MiB, max_block_bytes + 1 MiB)`.
     pub gossip_max_transmit_size: usize,
+    /// The request-response timeout on a sync request, and the node's own give-up
+    /// (`Node::sync_from` abandons an in-flight request after it): `max(30 s, ⌈sync_response_wire_limit / 1 MiB⌉ s)`.
+    pub sync_request_timeout: Duration,
 }
 
 impl WireLimits {
     pub const fn for_block_bytes(max_block_bytes: usize) -> WireLimits {
         let budget = sync_budget_for(max_block_bytes);
+        let limit = response_limit_for(budget);
         WireLimits {
             sync_max_wire_bytes: budget,
-            sync_response_wire_limit: response_limit_for(budget),
+            sync_response_wire_limit: limit,
             gossip_max_transmit_size: gossip_transmit_for(max_block_bytes),
+            sync_request_timeout: request_timeout_for(limit),
         }
     }
 
@@ -386,7 +406,7 @@ pub async fn start(
     let sync = request_response::Behaviour::with_codec(
         codec::Codec::<SyncRequest, SyncResponse>::new(SYNC_REQUEST_WIRE_LIMIT, cfg.limits.sync_response_wire_limit),
         [(StreamProtocol::try_from_owned(format!("/rand/{}/sync/1", cfg.chain_id))?, ProtocolSupport::Full)],
-        request_response::Config::default().with_request_timeout(SYNC_REQUEST_TIMEOUT),
+        request_response::Config::default().with_request_timeout(cfg.limits.sync_request_timeout),
     );
 
     let ping = libp2p::ping::Behaviour::new(libp2p::ping::Config::new().with_interval(Duration::from_secs(15)).with_timeout(Duration::from_secs(20)));
@@ -728,6 +748,8 @@ mod tests {
         assert_eq!(d.sync_max_wire_bytes, SYNC_MAX_WIRE_BYTES);
         assert_eq!(d.sync_response_wire_limit, SYNC_RESPONSE_WIRE_LIMIT);
         assert_eq!(d.gossip_max_transmit_size, GOSSIP_MAX_TRANSMIT_SIZE);
+        assert_eq!(d.sync_request_timeout, SYNC_REQUEST_TIMEOUT, "a default chain keeps 30 s");
+        assert_eq!(SYNC_REQUEST_TIMEOUT, Duration::from_secs(30));
 
         let mut ledger = crate::storage::fixtures::genesis(1).ledger;
         ledger.set_max_block_bytes(20 << 20);
@@ -737,6 +759,12 @@ mod tests {
         assert_eq!(raised.sync_response_wire_limit, 2 * (22 << 20) + (256 << 10));
         assert_eq!(raised.gossip_max_transmit_size, 21 << 20);
         assert!(2 * raised.sync_max_wire_bytes <= raised.sync_response_wire_limit);
+        // 44.25 MiB of reader limit: ⌈44.25⌉ = 45 s.
+        assert_eq!(raised.sync_request_timeout, Duration::from_secs(45));
+        // The floor holds up to a 30 MiB reader limit, and one byte over a whole MiB rounds up.
+        assert_eq!(request_timeout_for(30 << 20), Duration::from_secs(30));
+        assert_eq!(request_timeout_for((30 << 20) + 1), Duration::from_secs(31));
+        assert_eq!(WireLimits::for_block_bytes(64 << 20).sync_request_timeout, Duration::from_secs(133));
 
         // Gossip never drops below today's 16 MiB: an 8 MiB chain keeps it.
         assert_eq!(WireLimits::for_block_bytes(8 << 20).gossip_max_transmit_size, 16 << 20);
