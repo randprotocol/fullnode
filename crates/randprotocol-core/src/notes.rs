@@ -46,9 +46,13 @@ pub fn word8_from_hex(s: &str) -> Option<Word8> {
 /// seals and opens it; this is the same four-part layout).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
+    #[serde(with = "crate::crypto::wire_bytes")]
     pub kem_ct: Vec<u8>,
+    #[serde(with = "crate::crypto::wire_bytes")]
     pub to_receiver: Vec<u8>,
+    #[serde(with = "crate::crypto::wire_bytes")]
     pub to_sender: Vec<u8>,
+    #[serde(with = "crate::crypto::wire_bytes")]
     pub body: Vec<u8>,
 }
 
@@ -77,6 +81,7 @@ pub struct Bundle {
     /// `envelopes[i]` is sealed against `commitments[i]`.
     pub envelopes: [Envelope; 2],
     /// `postcard(rand_zkvm::Proof)` of the `bundle` guest.
+    #[serde(with = "crate::crypto::wire_bytes")]
     pub proof: Vec<u8>,
 }
 

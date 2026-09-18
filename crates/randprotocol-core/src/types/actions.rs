@@ -64,12 +64,16 @@ impl Registration {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallEnvelope {
     /// ML-KEM-768 ciphertext sealing the per-call key to the auditor; empty when there is none.
+    #[serde(with = "crate::crypto::wire_bytes")]
     pub kem_ct: Vec<u8>,
     /// The per-call key wrapped under the caller's outgoing viewing key.
+    #[serde(with = "crate::crypto::wire_bytes")]
     pub to_sender: Vec<u8>,
     /// The per-call key wrapped under the auditor's KEM shared secret; empty when there is none.
+    #[serde(with = "crate::crypto::wire_bytes")]
     pub to_auditor: Vec<u8>,
     /// The inputs themselves, sealed under the per-call key with `H_IN` as associated data.
+    #[serde(with = "crate::crypto::wire_bytes")]
     pub body: Vec<u8>,
 }
 

@@ -77,7 +77,12 @@ pub enum Action {
     /// A confidential call: a STARK proof that `program` ran on private inputs and published
     /// the eight public outputs carried in the proof. `input_envelope` is the optional
     /// encrypted transcript of those private inputs (spec §6.1); the chain checks only its size.
-    Call { program: ProgramId, proof: Vec<u8>, input_envelope: Option<CallEnvelope> },
+    Call {
+        program: ProgramId,
+        #[serde(with = "crate::crypto::wire_bytes")]
+        proof: Vec<u8>,
+        input_envelope: Option<CallEnvelope>,
+    },
     /// Phase S2: add `amount` (burned by the bundle) to `validator`'s stake. `registration` is
     /// present exactly when the validator is not yet in the register.
     Bond { validator: Address, amount: u64, registration: Option<Registration> },
@@ -120,6 +125,7 @@ pub enum Action {
     /// (`TxError::AttestAssetMismatch`), so a lost race costs a fee bundle and a re-proof rather
     /// than a deposit nobody can open. A rotation deposits no note and binds nothing here.
     BridgeAttest {
+        #[serde(with = "crate::crypto::wire_bytes")]
         attestation: Vec<u8>,
         recipient: ShieldedAddress,
         r: Word8,
@@ -151,6 +157,7 @@ pub enum Action {
     /// recomputed, not carried; the nine admission steps of spec §4.
     Aggregate {
         covers: Vec<Hash>,
+        #[serde(with = "crate::crypto::wire_bytes")]
         proof: Vec<u8>,
         aggregator: Address,
         nonce: u64,

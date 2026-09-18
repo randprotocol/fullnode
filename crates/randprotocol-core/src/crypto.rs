@@ -322,6 +322,58 @@ impl fmt::Debug for Keypair {
 }
 
 /// Serialize Vec<u8> as bytes for bincode and as hex for JSON.
+/// `#[serde(with = "crate::crypto::wire_bytes")]` for the large byte-vector fields of the
+/// transaction types (proofs, envelope parts, attestations) — what the `serde_bytes` crate does,
+/// kept local. Non-human-readable formats get a byte string: the CBOR sync wire then carries a
+/// proof byte for byte instead of as a sequence of integers (about 1.9x larger), and bincode —
+/// the consensus encoding, the transaction id and storage — writes a byte string exactly as it
+/// wrote the `Vec<u8>` sequence (a u64 length, then the bytes), so nothing consensus-visible
+/// moves (`types::transaction`'s golden test pins it). Human-readable formats keep the plain
+/// `Vec<u8>` form, an array of integers both ways, unlike [`serde_bytes_vec`], which hex-encodes.
+///
+/// The visitor accepts a byte string (borrowed or owned) and a sequence of `u8`, so a peer that
+/// still sends the integer-array form decodes too. A sequence's declared length only sizes the
+/// first allocation up to 64 KiB: the length is the peer's to choose.
+pub mod wire_bytes {
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.collect_seq(v)
+        } else {
+            s.serialize_bytes(v)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a byte string or a sequence of bytes")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(v.to_vec())
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
+                Ok(v)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(64 * 1024));
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+        if d.is_human_readable() {
+            d.deserialize_seq(V)
+        } else {
+            d.deserialize_byte_buf(V)
+        }
+    }
+}
+
 mod serde_bytes_vec {
     use serde::{Deserialize, Deserializer, Serializer};
 
