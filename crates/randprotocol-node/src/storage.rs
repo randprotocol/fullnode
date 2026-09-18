@@ -3228,7 +3228,7 @@ mod tests {
         {
             let st = Storage::open(dir.path()).unwrap();
             st.init_genesis(&gs).unwrap();
-            // Write a receipt straight into the receipts family, as a pre-v0.4 node would have.
+            // Write a receipt straight into the receipts family, as a pre-v0.3 node would have.
             let r = randprotocol_core::program::CallReceipt {
                 tx: Hash([9; 32]), program: pid, tier: 1, outputs: [0; 8], height: 1, index: 0, h_in: [0; 8],
                 input_envelope: None,

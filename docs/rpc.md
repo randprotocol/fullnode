@@ -918,7 +918,7 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
-### 2026-09-18 — v0.3: thirteen methods and two WebSocket topics
+### 2026-09-18 — v0.3: eleven methods and two WebSocket topics
 
 No wire, consensus or genesis change: old and new nodes interoperate, and the fleet takes this as
 a same-chain update (`deploy/update-droplet.sh`), not a chain cut. What a client can see:

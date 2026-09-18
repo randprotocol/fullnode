@@ -65,8 +65,8 @@ fn envelope_at(v: &Value) -> Result<Envelope> {
 pub struct RpcClient {
     url: String,
     http: reqwest::Client,
-    /// Set on the first `-32601` `rand_getTransactionStatus` reply: this node predates v0.4, so
-    /// `wait_for_transaction` stops asking for it and falls back to the pre-v0.4
+    /// Set on the first `-32601` `rand_getTransactionStatus` reply: this node predates v0.3, so
+    /// `wait_for_transaction` stops asking for it and falls back to the pre-v0.3
     /// `rand_getTransaction` polling loop instead of paying for a round trip to a method the
     /// node does not have on every subsequent call.
     legacy_status: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -216,7 +216,7 @@ impl RpcClient {
     /// A rejection — a double-spent nullifier, say — is permanent, so there is no reason to keep
     /// polling until `timeout`: `rand_getTransactionStatus` reports it directly, with the
     /// admission reason, and this returns as soon as it sees one. Against a node older than
-    /// v0.4, which has no such method and answers `-32601`, it falls back to the old
+    /// v0.3, which has no such method and answers `-32601`, it falls back to the old
     /// `rand_getTransaction` loop for good — `legacy_status` remembers that so later calls do
     /// not pay for the round trip that will only fail again.
     pub async fn wait_for_transaction(&self, hash: &Hash, timeout: Duration) -> Result<TxReceipt> {
@@ -254,7 +254,7 @@ impl RpcClient {
         }
     }
 
-    /// The pre-v0.4 wait: poll `rand_getTransaction` until it is committed or `timeout` elapses.
+    /// The pre-v0.3 wait: poll `rand_getTransaction` until it is committed or `timeout` elapses.
     /// It never sees a rejection — that node has nowhere to report one — so it can only time out.
     /// Shared by [`wait_for_transaction`](Self::wait_for_transaction)'s legacy fallback, so the
     /// two paths keep one loop body between them.
@@ -681,7 +681,7 @@ mod tests {
     //
     // A rejection (a double-spent nullifier, say) is permanent: `wait_for_transaction` should
     // report it as soon as `rand_getTransactionStatus` says so, rather than polling until its
-    // timeout as the pre-v0.4 client did.
+    // timeout as the pre-v0.3 client did.
 
     #[tokio::test]
     async fn wait_for_transaction_fails_fast_on_a_rejected_status() {
