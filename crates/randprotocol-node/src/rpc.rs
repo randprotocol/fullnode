@@ -1622,6 +1622,15 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let (reply, rx) = oneshot::channel();
             st.node.send(NodeCommand::Finality { hash, reply }).await.map_err(|_| RpcError::internal("node loop closed"))?;
             let f = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
+            // The block may have committed between the storage miss above and the node loop's
+            // answer — and a committed block below the head is pruned from the tree, so the loop
+            // no longer knows it. One more storage look turns that race's `unknown` into the
+            // `committed` it really is; a hash neither side has is still `unknown`.
+            if f == Finality::Unknown {
+                if let Some(b) = st.storage.block_by_hash(&hash).map_err(RpcError::internal)? {
+                    return Ok(json!({ "status": "committed", "height": b.height(), "hash": hash.to_hex() }));
+                }
+            }
             Ok(finality_json(&f))
         }
         // `[view]` or `[from, to]` (inclusive): the leader of each view under the current
@@ -2548,6 +2557,38 @@ mod tests {
         let v = ok(&st, "rand_getFinality", json!([Hash([0xBB; 32]).to_hex()])).await;
         assert_eq!(v["status"], "proposed");
         assert_eq!(ok(&st, "rand_getFinality", json!([99])).await["status"], "unknown");
+        assert_eq!(ok(&st, "rand_getFinality", json!([Hash([0xCC; 32]).to_hex()])).await["status"], "unknown");
+    }
+
+    /// The race M3 names: storage misses, the block commits, and the node loop — which prunes a
+    /// committed block from its tree — answers `unknown`. The dispatcher's second storage look
+    /// must turn that into `committed`. The stand-in loop commits the block itself, between
+    /// the dispatcher's first look and its reply, to place the commit exactly there.
+    #[tokio::test]
+    async fn get_finality_by_hash_reads_committed_when_the_block_commits_mid_lookup() {
+        let (_d, storage, gs, blocks) = fixtures::chain_fixture(2);
+        let storage = Arc::new(storage);
+        let mut ledger = storage.load_ledger(&StubExecutor).unwrap();
+        ledger.set_height(3);
+        let cb3 = make_block(&blocks[1].block, &mut ledger, vec![], &key(1));
+        let hash = cb3.block.hash();
+        let mut st = state_over(storage.clone(), &gs);
+        let (tx, mut rx) = mpsc::channel(4);
+        st.node = tx;
+        tokio::spawn(async move {
+            let mut pending = Some(cb3);
+            while let Some(cmd) = rx.recv().await {
+                if let NodeCommand::Finality { reply, .. } = cmd {
+                    if let Some(cb) = pending.take() {
+                        storage.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
+                    }
+                    let _ = reply.send(Finality::Unknown);
+                }
+            }
+        });
+        let v = ok(&st, "rand_getFinality", json!([hash.to_hex()])).await;
+        assert_eq!(v, json!({ "status": "committed", "height": 3, "hash": hash.to_hex() }));
+        // A hash nobody has stays `unknown` through the second look.
         assert_eq!(ok(&st, "rand_getFinality", json!([Hash([0xCC; 32]).to_hex()])).await["status"], "unknown");
     }
 
