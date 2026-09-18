@@ -48,6 +48,7 @@ async fn a_gossiped_transaction_is_verified_off_the_loop_and_its_refusal_cached(
             listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             bootstrap: vec![target],
             enable_mdns: false,
+            limits: Default::default(),
         },
         [77u8; 32],
     )
@@ -151,6 +152,7 @@ async fn a_gossiped_aggregate_is_verified_off_the_loop_and_its_refusal_cached() 
             listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             bootstrap: vec![target],
             enable_mdns: false,
+            limits: Default::default(),
         },
         [78u8; 32],
     )

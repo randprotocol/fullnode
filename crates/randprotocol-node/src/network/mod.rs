@@ -36,11 +36,14 @@ use tokio::sync::{mpsc, oneshot};
 /// other half of why chain-8 catch-up advanced one batch per 30-40 s.
 pub const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// What a sync batch is allowed to weigh on the wire, measured with the codec's own serializer.
+/// What a sync batch is allowed to weigh on the wire on a **default** chain (4 MiB blocks),
+/// measured with the codec's own serializer. A running node uses its chain's own figure,
+/// [`WireLimits::sync_max_wire_bytes`] — `max_block_bytes + 2 MiB` (call limits spec §8) — of
+/// which this is the value at `gas::MAX_BLOCK_BYTES`.
 ///
 /// The server fills a batch up to this and stops; one block is always included even if it alone is
-/// larger, so a fat block is never unservable. A single block cannot exceed `MAX_BLOCK_BYTES`
-/// (4 MiB of transactions) plus its two QCs and receipts, so one always fits inside this budget.
+/// larger, so a fat block is never unservable. A single block cannot exceed `max_block_bytes`
+/// of transactions plus its two QCs and receipts, so one always fits inside this budget.
 ///
 /// The number matters because a chain-8 block is 140 KB when *empty* — two 18-validator Dilithium2
 /// QCs, the `justify` one in its header and the one that certifies it, each 18 votes of a
@@ -57,25 +60,88 @@ pub const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// codec cut it at 10 MiB. At a bare 13-vote quorum the same batch measures 9.91 MiB and *just*
 /// fit, which is why catch-up sync advanced in fits and starts instead of not at all — and why a
 /// node behind a block carrying a 1.3 MB proof could not get past it at any batch size it tried.
-pub const SYNC_MAX_WIRE_BYTES: u64 = 6 << 20;
+pub const SYNC_MAX_WIRE_BYTES: u64 = sync_budget_for(randprotocol_core::gas::MAX_BLOCK_BYTES);
 
-/// The reader limit our codec enforces on a sync response.
+/// The reader limit our codec enforces on a sync response, on a default chain; a running node
+/// uses [`WireLimits::sync_response_wire_limit`], the same formula over its own budget.
 ///
 /// Twice the server's batch budget plus framing headroom, so the budget sits at half of it — the
 /// invariant [`codec`] exists to keep honest. Going over this is an *error* naming the limit, not
 /// the silent truncation libp2p's hard-coded 10 MiB produced, which resurfaced on the reader as
 /// `Eof { name: "bytes", .. }` and named nothing.
-pub const SYNC_RESPONSE_WIRE_LIMIT: u64 = 2 * SYNC_MAX_WIRE_BYTES + (256 << 10);
+pub const SYNC_RESPONSE_WIRE_LIMIT: u64 = response_limit_for(SYNC_MAX_WIRE_BYTES);
 
 /// The reader limit on a sync *request*. A request is a height and a count, or a block hash.
 pub const SYNC_REQUEST_WIRE_LIMIT: u64 = 64 << 10;
 
-/// gossipsub's own transmit-size ceiling for this swarm (`start`, below): the largest message
-/// (a gossiped transaction, wrapped in [`GossipMessage`]) any peer will forward rather than drop.
-/// Named so a byte-budget test — e.g. `rpc::tests::a_deploy_at_the_zkvm_program_limit_fits_every_byte_cap`
-/// — can check the same number the swarm is actually configured with, instead of a copy of the
-/// literal that could drift from it.
-pub const GOSSIP_MAX_TRANSMIT_SIZE: usize = 16 << 20;
+/// gossipsub's own transmit-size ceiling on a default chain: the largest message (a gossiped
+/// transaction or proposal, wrapped in [`GossipMessage`]) any peer will forward rather than drop.
+/// A running node configures its swarm (`start`, below) with
+/// [`WireLimits::gossip_max_transmit_size`], `max(16 MiB, max_block_bytes + 1 MiB)`, which is this
+/// at the default block cap. Named so a byte-budget test — e.g.
+/// `rpc::tests::a_deploy_at_the_zkvm_program_limit_fits_every_byte_cap` — can check the same number
+/// instead of a copy of the literal that could drift from it.
+pub const GOSSIP_MAX_TRANSMIT_SIZE: usize = gossip_transmit_for(randprotocol_core::gas::MAX_BLOCK_BYTES);
+
+/// The sync budget for a chain whose blocks carry up to `max_block_bytes` of transactions: the
+/// block plus 2 MiB for its two QCs, receipts and the CBOR framing.
+const fn sync_budget_for(max_block_bytes: usize) -> u64 {
+    max_block_bytes as u64 + (2 << 20)
+}
+
+/// The reader limit over a sync budget: twice it plus framing headroom, so the budget is half.
+const fn response_limit_for(budget: u64) -> u64 {
+    2 * budget + (256 << 10)
+}
+
+/// gossip's transmit size for a chain's block cap: never below today's 16 MiB, and always a whole
+/// block plus 1 MiB, so a proposal carrying a full block is never dropped.
+const fn gossip_transmit_for(max_block_bytes: usize) -> usize {
+    let block = max_block_bytes + (1 << 20);
+    if block > (16 << 20) {
+        block
+    } else {
+        16 << 20
+    }
+}
+
+/// The node's local wire limits, computed once at startup from the chain's genesis
+/// `max_block_bytes` (call limits spec §8) and carried in [`NetworkConfig`] rather than read off
+/// constants, so a chain cut with bigger blocks can gossip and sync them. Local to this node: none
+/// of them is a consensus rule, and every node on one chain computes the same numbers from the same
+/// genesis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WireLimits {
+    /// The byte budget a served sync batch fills to: `max_block_bytes + 2 MiB`.
+    pub sync_max_wire_bytes: u64,
+    /// The codec's reader limit on a sync response: `2 × sync_max_wire_bytes + 256 KiB`.
+    pub sync_response_wire_limit: u64,
+    /// gossipsub's `max_transmit_size`: `max(16 MiB, max_block_bytes + 1 MiB)`.
+    pub gossip_max_transmit_size: usize,
+}
+
+impl WireLimits {
+    pub const fn for_block_bytes(max_block_bytes: usize) -> WireLimits {
+        let budget = sync_budget_for(max_block_bytes);
+        WireLimits {
+            sync_max_wire_bytes: budget,
+            sync_response_wire_limit: response_limit_for(budget),
+            gossip_max_transmit_size: gossip_transmit_for(max_block_bytes),
+        }
+    }
+
+    /// The limits for the chain `ledger` is the genesis ledger of.
+    pub fn for_ledger(ledger: &randprotocol_core::Ledger) -> WireLimits {
+        WireLimits::for_block_bytes(ledger.max_block_bytes())
+    }
+}
+
+/// A default chain's limits: exactly the named constants above.
+impl Default for WireLimits {
+    fn default() -> WireLimits {
+        WireLimits::for_block_bytes(randprotocol_core::gas::MAX_BLOCK_BYTES)
+    }
+}
 
 /// How reachable an address a peer advertised for itself actually is, from our side of the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +214,8 @@ pub struct NetworkConfig {
     pub listen: Vec<Multiaddr>,
     pub bootstrap: Vec<Multiaddr>,
     pub enable_mdns: bool,
+    /// The sync and gossip byte limits, from the genesis block cap ([`WireLimits::for_ledger`]).
+    pub limits: WireLimits,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -283,7 +351,7 @@ pub async fn start(
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_millis(500))
         .validation_mode(ValidationMode::Permissive)
-        .max_transmit_size(GOSSIP_MAX_TRANSMIT_SIZE)
+        .max_transmit_size(cfg.limits.gossip_max_transmit_size)
         .message_id_fn(|m: &gossipsub::Message| MessageId::from(blake3::hash(&m.data).as_bytes().to_vec()))
         // Application-level validation: this node forwards a transaction only after it has
         // verified here, off the consensus loop. Local to this node — the wire is unchanged, so it
@@ -316,7 +384,7 @@ pub async fn start(
     // Our codec, not `request_response::cbor::Behaviour`: that one's size limits are private
     // constants and it enforces them by truncation (see `codec`).
     let sync = request_response::Behaviour::with_codec(
-        codec::Codec::<SyncRequest, SyncResponse>::new(SYNC_REQUEST_WIRE_LIMIT, SYNC_RESPONSE_WIRE_LIMIT),
+        codec::Codec::<SyncRequest, SyncResponse>::new(SYNC_REQUEST_WIRE_LIMIT, cfg.limits.sync_response_wire_limit),
         [(StreamProtocol::try_from_owned(format!("/rand/{}/sync/1", cfg.chain_id))?, ProtocolSupport::Full)],
         request_response::Config::default().with_request_timeout(SYNC_REQUEST_TIMEOUT),
     );
@@ -641,6 +709,41 @@ mod tests {
     use super::*;
     use randprotocol_core::Hash;
 
+    // ------------------------------------------- local limits from the genesis block cap
+    //
+    // Call limits spec §8: the sync budget, the reader limit it sits under and gossip's transmit
+    // size are computed at startup from the chain's `max_block_bytes`, not read off constants.
+
+    /// A default chain (4 MiB blocks) keeps today's numbers exactly — 6 MiB, 12.25 MiB, 16 MiB —
+    /// and a 20 MiB chain gets `block + 2 MiB`, the same reader formula over it, and
+    /// `max(16 MiB, block + 1 MiB)`.
+    #[test]
+    fn the_wire_limits_follow_the_ledgers_block_cap() {
+        let d = WireLimits::default();
+        assert_eq!(d, WireLimits::for_block_bytes(randprotocol_core::gas::MAX_BLOCK_BYTES));
+        assert_eq!(d.sync_max_wire_bytes, 6 << 20);
+        assert_eq!(d.sync_response_wire_limit, 2 * (6 << 20) + (256 << 10));
+        assert_eq!(d.gossip_max_transmit_size, 16 << 20);
+        // The named constants are the default chain's values, not a second source of truth.
+        assert_eq!(d.sync_max_wire_bytes, SYNC_MAX_WIRE_BYTES);
+        assert_eq!(d.sync_response_wire_limit, SYNC_RESPONSE_WIRE_LIMIT);
+        assert_eq!(d.gossip_max_transmit_size, GOSSIP_MAX_TRANSMIT_SIZE);
+
+        let mut ledger = crate::storage::fixtures::genesis(1).ledger;
+        ledger.set_max_block_bytes(20 << 20);
+        let raised = WireLimits::for_ledger(&ledger);
+        assert_eq!(raised, WireLimits::for_block_bytes(20 << 20));
+        assert_eq!(raised.sync_max_wire_bytes, 22 << 20);
+        assert_eq!(raised.sync_response_wire_limit, 2 * (22 << 20) + (256 << 10));
+        assert_eq!(raised.gossip_max_transmit_size, 21 << 20);
+        assert!(2 * raised.sync_max_wire_bytes <= raised.sync_response_wire_limit);
+
+        // Gossip never drops below today's 16 MiB: an 8 MiB chain keeps it.
+        assert_eq!(WireLimits::for_block_bytes(8 << 20).gossip_max_transmit_size, 16 << 20);
+        assert_eq!(WireLimits::for_block_bytes(15 << 20).gossip_max_transmit_size, 16 << 20);
+        assert_eq!(WireLimits::for_block_bytes(64 << 20).gossip_max_transmit_size, 65 << 20);
+    }
+
     // ------------------------------------------- advertised-address filtering
     //
     // Chain 8's other catch-up defect: every node listens on `/ip4/0.0.0.0/tcp/30303` and so
@@ -742,6 +845,7 @@ mod tests {
             listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             bootstrap: vec![],
             enable_mdns: false,
+            limits: WireLimits::default(),
         };
         let (a, mut a_rx) = start(cfg_a, [3u8; 32]).await.unwrap();
         let a_addr = wait_for(&mut a_rx, Duration::from_secs(5), |e| match e {
@@ -757,6 +861,7 @@ mod tests {
             listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             bootstrap: vec![a_full],
             enable_mdns: false,
+            limits: WireLimits::default(),
         };
         let (b, b_rx) = start(cfg_b, [4u8; 32]).await.unwrap();
         let a_saw = wait_for(&mut a_rx, Duration::from_secs(10), |e| match e {
@@ -827,6 +932,7 @@ mod tests {
             listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             bootstrap: vec![],
             enable_mdns: false,
+            limits: WireLimits::default(),
         };
         let (a, mut a_rx) = start(cfg_a, [1u8; 32]).await.unwrap();
         let a_addr = wait_for(&mut a_rx, Duration::from_secs(5), |e| match e {
@@ -842,6 +948,7 @@ mod tests {
             listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             bootstrap: vec![a_full],
             enable_mdns: false,
+            limits: WireLimits::default(),
         };
         let (b, mut b_rx) = start(cfg_b, [2u8; 32]).await.unwrap();
 

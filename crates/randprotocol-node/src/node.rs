@@ -429,6 +429,9 @@ struct Node {
     /// `NodeStatus::ws_clients`.
     ws_conns: Arc<AtomicUsize>,
     peers: HashMap<PeerId, Peer>,
+    /// This chain's sync and gossip byte limits, from its genesis `max_block_bytes`; the same
+    /// value the swarm was started with.
+    wire: network::WireLimits,
     timeout: Option<(u64, Instant)>,
     propose_at: Option<(u64, Instant)>,
     last_block_at: Instant,
@@ -502,9 +505,9 @@ struct Peer {
 /// chain, half the payload. `deposits` is `#[serde(skip)]`, so it costs nothing here, matching the
 /// wire.
 fn committed_block_wire_size(cb: &CommittedBlock) -> u64 {
-    // A block that cannot be sized is charged the whole budget, which ends the batch rather than
-    // letting an unmeasured block through.
-    network::codec::cbor_size(cb).map(|n| n as u64).unwrap_or(network::SYNC_MAX_WIRE_BYTES)
+    // A block that cannot be sized is charged more than any budget or reader limit, which ends the
+    // batch rather than letting an unmeasured block through.
+    network::codec::cbor_size(cb).map(|n| n as u64).unwrap_or(u64::MAX)
 }
 
 /// The two decisions to make about an arriving `Blocks` response.
@@ -559,14 +562,15 @@ fn fill_sync_batch(blocks: impl IntoIterator<Item = CommittedBlock>, budget: u64
     out
 }
 
-/// How many bytes of blocks one sync response may carry.
+/// How many bytes of blocks one sync response may carry, on the chain `limits` were computed for
+/// (`max_block_bytes + 2 MiB`, call limits spec §8).
 ///
 /// Half the reader limit the codec enforces, by construction: the budget is the server's promise
 /// and the limit is the client's check, and keeping the first at half the second leaves room for
 /// framing and for a peer on a slightly different build.
-pub(crate) fn serve_sync_budget() -> u64 {
-    debug_assert!(network::SYNC_MAX_WIRE_BYTES * 2 <= network::SYNC_RESPONSE_WIRE_LIMIT);
-    network::SYNC_MAX_WIRE_BYTES
+pub(crate) fn serve_sync_budget(limits: &network::WireLimits) -> u64 {
+    debug_assert!(limits.sync_max_wire_bytes * 2 <= limits.sync_response_wire_limit);
+    limits.sync_max_wire_bytes
 }
 
 /// The coverage-closure half of serving (spec §7): a batch that ends between a pruned block
@@ -582,7 +586,7 @@ pub(crate) fn serve_sync_budget() -> u64 {
 /// cover is in. The extension's only ceiling is the reader's own wire limit: a batch that
 /// cannot close inside it serves as far as it can, and the syncer's fallback is then the
 /// genuine archive case it exists for.
-fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>) {
+fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>, limits: &network::WireLimits) {
     let farthest_cover = |batch: &[CommittedBlock]| -> Option<u64> {
         batch
             .iter()
@@ -605,7 +609,7 @@ fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>) {
         let Ok(Some(cb)) = storage.committed_block(h) else { return };
         let cb = sealed_form_of(storage, &cb);
         bytes = bytes.saturating_add(committed_block_wire_size(&cb));
-        if bytes > network::SYNC_RESPONSE_WIRE_LIMIT {
+        if bytes > limits.sync_response_wire_limit {
             return;
         }
         // The extension can cross another pruned window whose own covers sit farther out.
@@ -655,14 +659,17 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         }));
     }
 
-    // Network.
+    // Network. The sync and gossip byte limits follow the genesis block cap (call limits
+    // spec §8), computed once here and handed to the swarm and the serve path.
     let identity = key.derive_subkey(b"rand-p2p-identity");
+    let wire = network::WireLimits::for_ledger(&gs.ledger);
     let (net, mut events) = network::start(
         NetworkConfig {
             chain_id: gs.chain_id,
             listen: cfg.listen.clone(),
             bootstrap: cfg.bootstrap.clone(),
             enable_mdns: cfg.enable_mdns,
+            limits: wire,
         },
         identity,
     )
@@ -777,6 +784,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         refusals,
         ws_conns,
         peers: HashMap::new(),
+        wire,
         timeout: None,
         propose_at: None,
         last_block_at: Instant::now(),
@@ -1493,8 +1501,8 @@ impl Node {
                 let blocks = heights
                     .map_while(|h| self.storage.committed_block(h).ok().flatten())
                     .map(|cb| sealed_form_of(&self.storage, &cb));
-                let mut batch = fill_sync_batch(blocks, serve_sync_budget());
-                close_batch_coverage(&self.storage, &mut batch);
+                let mut batch = fill_sync_batch(blocks, serve_sync_budget(&self.wire));
+                close_batch_coverage(&self.storage, &mut batch, &self.wire);
                 SyncResponse::Blocks(batch)
             }
             SyncRequest::BlockByHash(h) => {
@@ -2564,8 +2572,8 @@ mod tests {
         let blocks = heights
             .map_while(|h| storage.committed_block(h).ok().flatten())
             .map(|cb| sealed_form_of(storage, &cb));
-        let mut batch = fill_sync_batch(blocks, serve_sync_budget());
-        close_batch_coverage(storage, &mut batch);
+        let mut batch = fill_sync_batch(blocks, serve_sync_budget(&network::WireLimits::default()));
+        close_batch_coverage(storage, &mut batch, &network::WireLimits::default());
         batch
     }
 
@@ -2603,7 +2611,7 @@ mod tests {
         let blocks = heights
             .map_while(|h| storage.committed_block(h).ok().flatten())
             .map(|cb| sealed_form_of(&storage, &cb));
-        let cut = fill_sync_batch(blocks, serve_sync_budget());
+        let cut = fill_sync_batch(blocks, serve_sync_budget(&network::WireLimits::default()));
         assert_eq!(cut.len(), 3);
         assert_eq!(cut[1].pruned.len(), 1, "block 2 rides in marker form");
         assert!(accepted_by_a_fresh_store(&cut).unwrap_err().downcast_ref::<RawFallback>().is_some());
@@ -2797,14 +2805,148 @@ mod tests {
     #[test]
     fn the_batch_budget_is_at_most_half_the_reader_limit() {
         assert!(2 * network::SYNC_MAX_WIRE_BYTES <= network::SYNC_RESPONSE_WIRE_LIMIT);
-        assert_eq!(serve_sync_budget(), network::SYNC_MAX_WIRE_BYTES);
+        assert_eq!(serve_sync_budget(&network::WireLimits::default()), network::SYNC_MAX_WIRE_BYTES);
+        // A raised chain's budget is its own, and keeps the same relation to its reader limit.
+        let raised = network::WireLimits::for_block_bytes(20 << 20);
+        assert_eq!(serve_sync_budget(&raised), 22 << 20);
+        assert!(2 * serve_sync_budget(&raised) <= raised.sync_response_wire_limit);
+    }
+
+    /// Twenty-mebibyte blocks (call limits spec §8): the worst block a 20 MiB chain admits is
+    /// over the default reader limit, so the limits must come from the ledger — and with them it
+    /// is servable alone and readable.
+    #[test]
+    fn the_largest_block_a_20_mib_chain_admits_is_servable_and_readable_alone() {
+        let mut ledger = crate::storage::fixtures::genesis(1).ledger;
+        ledger.set_max_proof_bytes(8 << 20);
+        ledger.set_max_block_bytes(20 << 20);
+        let limits = network::WireLimits::for_ledger(&ledger);
+        let ks = validators(18);
+        let txs = vec![fat_tx(8 << 20), fat_tx(8 << 20), fat_tx(3 << 20)];
+        let tx_bytes: usize = txs.iter().map(|t| bincode::serialize(t).unwrap().len()).sum();
+        assert!(tx_bytes <= ledger.max_block_bytes(), "a block the chain admits: {tx_bytes} B");
+        let block = sized_block(1, &ks, 18, txs);
+
+        let batch = fill_sync_batch(vec![block], serve_sync_budget(&limits));
+        assert_eq!(batch.len(), 1);
+        let on_the_wire = wire_size(&batch);
+        assert!(on_the_wire > network::SYNC_RESPONSE_WIRE_LIMIT, "the default reader would refuse it: {on_the_wire} B");
+        assert!(
+            on_the_wire <= limits.sync_response_wire_limit,
+            "the chain's own reader takes it: {on_the_wire} B over {} B",
+            limits.sync_response_wire_limit
+        );
+    }
+
+    async fn wait_for_event<T>(
+        rx: &mut mpsc::Receiver<NetworkEvent>,
+        timeout: Duration,
+        mut f: impl FnMut(NetworkEvent) -> Option<T>,
+    ) -> Option<T> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(ev)) => {
+                    if let Some(v) = f(ev) {
+                        return Some(v);
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Two swarms on loopback with `limits`, B bootstrapped to A, both sides connected.
+    async fn two_swarms(
+        limits: network::WireLimits,
+        seeds: (u8, u8),
+    ) -> (NetworkHandle, mpsc::Receiver<NetworkEvent>, NetworkHandle, mpsc::Receiver<NetworkEvent>) {
+        let cfg = |bootstrap| NetworkConfig {
+            chain_id: 7,
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            bootstrap,
+            enable_mdns: false,
+            limits,
+        };
+        let (a, mut a_rx) = network::start(cfg(vec![]), [seeds.0; 32]).await.unwrap();
+        let a_addr = wait_for_event(&mut a_rx, Duration::from_secs(5), |e| match e {
+            NetworkEvent::Listening(addr) => Some(addr),
+            _ => None,
+        })
+        .await
+        .expect("A listening");
+        let a_full = a_addr.with(libp2p::multiaddr::Protocol::P2p(a.local_peer_id));
+        let (b, mut b_rx) = network::start(cfg(vec![a_full]), [seeds.1; 32]).await.unwrap();
+        let b_id = b.local_peer_id;
+        let a_id = a.local_peer_id;
+        assert!(wait_for_event(&mut a_rx, Duration::from_secs(10), |e| matches!(e, NetworkEvent::PeerConnected(p) if p == b_id).then_some(())).await.is_some());
+        assert!(wait_for_event(&mut b_rx, Duration::from_secs(10), |e| matches!(e, NetworkEvent::PeerConnected(p) if p == a_id).then_some(())).await.is_some());
+        (a, a_rx, b, b_rx)
+    }
+
+    /// A asks B for block 1; B serves `block` through the node's own batch fill. What A hears.
+    async fn sync_one_block(limits: network::WireLimits, seeds: (u8, u8), block: CommittedBlock) -> Result<Vec<CommittedBlock>, String> {
+        let (a, mut a_rx, b, mut b_rx) = two_swarms(limits, seeds).await;
+        let req_id = a
+            .send_sync_request(b.local_peer_id, SyncRequest::Blocks { from_height: 1, max: 1 })
+            .await
+            .expect("request id");
+        let a_id = a.local_peer_id;
+        let channel = wait_for_event(&mut b_rx, Duration::from_secs(10), |e| match e {
+            NetworkEvent::SyncRequest { peer, channel, .. } if peer == a_id => Some(channel),
+            _ => None,
+        })
+        .await
+        .expect("B got the sync request");
+        let batch = fill_sync_batch(vec![block], serve_sync_budget(&limits));
+        b.send_sync_response(channel, SyncResponse::Blocks(batch)).await;
+        let b_id = b.local_peer_id;
+        let out = wait_for_event(&mut a_rx, network::SYNC_REQUEST_TIMEOUT + Duration::from_secs(10), |e| match e {
+            NetworkEvent::SyncResponse { peer, request_id, response: SyncResponse::Blocks(v) } if peer == b_id && request_id == req_id => {
+                Some(Ok(v))
+            }
+            NetworkEvent::SyncFailed { peer, request_id, error } if peer == b_id && request_id == req_id => Some(Err(error)),
+            _ => None,
+        })
+        .await
+        .expect("A heard back about its request");
+        a.shutdown().await;
+        b.shutdown().await;
+        out
+    }
+
+    /// Two local nodes sync a block larger than 6 MiB — larger, in fact, than the whole default
+    /// reader limit (12.25 MiB) — on a chain whose genesis raised `max_block_bytes` to 20 MiB,
+    /// because both ends size their sync codec from the ledger. The same block between nodes on
+    /// today's constants is refused: the limits are what moved.
+    #[tokio::test]
+    async fn two_nodes_on_a_20_mib_chain_sync_a_block_over_the_default_reader_limit() {
+        let ks = validators(4);
+        let block = sized_block(1, &ks, 4, (0..7).map(|_| fat_tx(2 << 20)).collect());
+        let on_the_wire = wire_size(std::slice::from_ref(&block));
+        assert!(on_the_wire > 6 << 20, "{on_the_wire} B");
+        assert!(on_the_wire > network::SYNC_RESPONSE_WIRE_LIMIT, "{on_the_wire} B");
+        let want = block.block.hash();
+
+        let mut ledger = crate::storage::fixtures::genesis(1).ledger;
+        ledger.set_max_proof_bytes(8 << 20);
+        ledger.set_max_block_bytes(20 << 20);
+        let got = sync_one_block(network::WireLimits::for_ledger(&ledger), (31, 32), block.clone())
+            .await
+            .expect("a 20 MiB chain's nodes sync it");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].block.hash(), want);
+
+        let refused = sync_one_block(network::WireLimits::default(), (33, 34), block).await;
+        assert!(refused.is_err(), "today's limits cannot carry it");
     }
 
     #[test]
     fn a_capped_batch_of_chain_8_blocks_fits_on_the_wire() {
         let ks = validators(18);
         let blocks: Vec<CommittedBlock> = (1..=SYNC_BATCH as u64).map(|h| sized_block(h, &ks, 18, vec![])).collect();
-        let batch = fill_sync_batch(blocks, serve_sync_budget());
+        let batch = fill_sync_batch(blocks, serve_sync_budget(&network::WireLimits::default()));
         assert!(batch.len() < SYNC_BATCH as usize, "the budget should have cut the batch short");
         assert!(!batch.is_empty());
         let on_the_wire = wire_size(&batch);
@@ -2830,7 +2972,7 @@ mod tests {
         assert!(tx_bytes >= gas::MAX_BLOCK_BYTES / 2, "the fixture should be a fat block: {tx_bytes} B");
         let block = sized_block(1, &ks, 18, txs);
 
-        let batch = fill_sync_batch(vec![block], serve_sync_budget());
+        let batch = fill_sync_batch(vec![block], serve_sync_budget(&network::WireLimits::default()));
         assert_eq!(batch.len(), 1, "a fat block must never be dropped from an empty batch");
         let on_the_wire = wire_size(&batch);
         assert!(
