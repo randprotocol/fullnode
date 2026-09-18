@@ -410,6 +410,11 @@ struct Node {
     /// Committed heads, for whatever WebSocket clients are subscribed. Held here rather than read
     /// back out of the `RpcState` because this is the only place that writes it.
     heads: broadcast::Sender<rpc::HeadSummary>,
+    /// Committed blocks' transaction hashes and receipts, sent beside each head, for the
+    /// `receipts` and `transaction` topics. Written only here, like `heads`.
+    commits: broadcast::Sender<rpc::CommitSummary>,
+    /// Refusals that entered the refused cache, with their reason, for the `transaction` topic.
+    refusals: broadcast::Sender<(Hash, String)>,
     /// The live WebSocket connection count `ws::upgrade` maintains; reported as
     /// `NodeStatus::ws_clients`.
     ws_conns: Arc<AtomicUsize>,
@@ -684,6 +689,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // The receiver is dropped: every subscriber makes its own at upgrade, and a channel with no
     // receiver simply drops what is sent, which is the normal case for a node nobody watches.
     let (heads, _) = broadcast::channel(rpc::HEAD_CHANNEL);
+    let (commits, _) = broadcast::channel(rpc::HEAD_CHANNEL);
+    let (refusals, _) = broadcast::channel(rpc::HEAD_CHANNEL);
     let ws_conns = Arc::new(AtomicUsize::new(0));
     // Viewing keys imported over RPC (`rand_importViewingKey`), in memory only. Shared with the
     // node loop purely so `rand_status` can say how many keys this process is holding.
@@ -697,6 +704,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             chain_id: gs.chain_id,
             executor: executor.clone(),
             heads: heads.clone(),
+            commits: commits.clone(),
+            refusals: refusals.clone(),
             ws_conns: ws_conns.clone(),
             viewing: viewing.clone(),
         },
@@ -753,6 +762,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         status: status.clone(),
         viewing,
         heads,
+        commits,
+        refusals,
         ws_conns,
         peers: HashMap::new(),
         timeout: None,
@@ -957,6 +968,7 @@ impl Node {
         self.verify_in_flight = self.verify_in_flight.saturating_sub(1);
         let hash = v.tx.hash();
         let acceptance = admission::acceptance_for(&v.result, hash, &mut self.refused);
+        self.note_refusal(hash);
         // A verified transaction is pooled against the *current* tip, not the snapshot it was
         // verified on: `insert_verified` re-runs `precheck` there, so a nullifier spent or an anchor
         // scrolled out in the meantime is caught on the state it is actually being pooled on.
@@ -1015,7 +1027,9 @@ impl Node {
         // Everything the pool can answer for free, before a ~20 ms proof is scheduled for it. A
         // duplicate or a conflict never reaches the queue.
         if let Err(e) = self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref()) {
-            let a = admission::acceptance_for_pool(&e, tx.hash(), &mut self.refused);
+            let hash = tx.hash();
+            let a = admission::acceptance_for_pool(&e, hash, &mut self.refused);
+            self.note_refusal(hash);
             self.report(id, GossipOutcome::Report(a)).await;
             return Ok(());
         }
@@ -1038,6 +1052,7 @@ impl Node {
             Instant::now(),
         );
         if let GossipOutcome::Report(a) = outcome {
+            self.note_refusal(hash);
             let _ = reply.send(Err(admission::rpc_refusal(a, &hash, &self.refused)));
             return;
         }
@@ -1047,6 +1062,7 @@ impl Node {
         // a permanently bad transaction is answered for free.
         if let Err(e) = self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref()) {
             let _ = admission::acceptance_for_pool(&e, hash, &mut self.refused);
+            self.note_refusal(hash);
             let _ = reply.send(Err(e));
             return;
         }
@@ -1183,6 +1199,8 @@ impl Node {
     /// One `newHeads` notification per committed block, in order — a light wallet tracking heads
     /// must not silently skip heights, so a commit of three blocks is three notifications and not
     /// one for the tip. `send` fails only when nobody is subscribed, which is the normal case.
+    /// Each head is followed by its block's [`rpc::CommitSummary`] on the `commits` channel, for
+    /// the `receipts` and `transaction` topics, under the same rules.
     ///
     /// Called after `storage.commit` has returned, on both paths a block becomes committed by: a
     /// subscriber must never be told about a head this node could still lose. On the sync path
@@ -1199,6 +1217,25 @@ impl Node {
                 hash: cb.block.hash().to_hex(),
                 view: cb.block.view(),
             });
+            let _ = self.commits.send(rpc::CommitSummary {
+                height: cb.block.height(),
+                hash: cb.block.hash(),
+                tx_hashes: cb.block.transactions.iter().map(|t| t.hash()).collect(),
+                receipts: cb.receipts.clone(),
+            });
+        }
+    }
+
+    /// Tell `transaction` subscribers that `hash` was refused, if it was refused for good — that
+    /// is, if the refusal is now in the refused cache. Called right after each decision that can
+    /// put it there, so the set announced is exactly the set `rand_getTransactionStatus` reports
+    /// as `rejected`, with the same reason: a `Duplicate`, a pool conflict or a full queue is a
+    /// "not now" about this node, never enters the cache, and is not announced. A resubmission of
+    /// an already-refused hash is announced again, which costs nothing — a `transaction`
+    /// subscription removes itself after one delivery.
+    fn note_refusal(&self, hash: Hash) {
+        if let Some(e) = self.refused.get(&hash) {
+            let _ = self.refusals.send((hash, e.to_string()));
         }
     }
 

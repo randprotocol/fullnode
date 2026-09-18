@@ -1,8 +1,12 @@
-//! The WebSocket half of the RPC: a `newHeads` subscription, so an explorer or a wallet stops
-//! polling `rand_getHead`.
+//! The WebSocket half of the RPC: three subscription topics, so an explorer or a wallet stops
+//! polling. `newHeads` pushes every committed head, as `rand_getHead` reports it. `receipts`
+//! pushes each block's call receipts, all of them or one program's, as `rand_getReceipt` reports
+//! them, and says nothing about a block with none. `transaction <hash>` fires once — when that
+//! transaction commits, or when this node refuses it for good — and then removes itself; it is
+//! subscribed *before* submitting, since a hash that has already committed is never announced.
 //!
 //! Four bounds hold this endpoint, because it is unauthenticated: a per-node connection cap, a
-//! per-connection subscription cap, a bounded broadcast channel whose lagging receivers are
+//! per-connection subscription cap, bounded broadcast channels whose lagging receivers are
 //! *closed* rather than buffered, and a deadline on every write. Buffering a slow subscriber is
 //! how a node runs out of memory; a dropped one reconnects and resyncs from
 //! `rand_getCompactBlocks`, which is the documented recovery.
@@ -21,11 +25,12 @@
 //! read is `rand_getWitness` rebuilding the commitment tree, and serving those over a socket
 //! would need its own blocking-pool and concurrency discipline to gain what `POST /` already does.
 
-use crate::rpc::{HeadSummary, RpcState};
+use crate::rpc::{CommitSummary, HeadSummary, RpcState};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use randprotocol_core::{Hash, ProgramId};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -36,8 +41,9 @@ use tokio::sync::broadcast::error::RecvError;
 /// WebSocket clients one node will carry at once. The 65th is refused at the upgrade.
 pub const MAX_WS_CONNECTIONS: usize = 64;
 
-/// Subscriptions one connection may hold. One topic exists, so eight is already generous; the cap
-/// is here because the map is the one thing a client can make grow without limit.
+/// Subscriptions one connection may hold, across all three topics. A wallet watching its head,
+/// its program and a pending transaction or two is well inside eight; the cap is here because the
+/// map is the one thing a client can make grow without limit.
 pub const MAX_WS_SUBSCRIPTIONS: usize = 8;
 
 /// The largest frame either direction may carry. A request here is a hundred bytes and a head
@@ -45,8 +51,23 @@ pub const MAX_WS_SUBSCRIPTIONS: usize = 8;
 /// enough for the proof-carrying bodies `POST /` takes.
 pub const WS_MAX_FRAME_BYTES: usize = 64 * 1024;
 
-/// The one topic this node serves.
+/// The topics this node serves, as `rand_subscribe`'s first parameter names them.
 const NEW_HEADS: &str = "newHeads";
+const RECEIPTS: &str = "receipts";
+const TRANSACTION: &str = "transaction";
+
+/// The topic list every refused subscribe quotes, so a client learns the vocabulary from its error.
+const TOPICS: &str = "newHeads, receipts [program_id], transaction <hash>";
+
+/// What one subscription listens for.
+#[derive(Clone, Debug, PartialEq)]
+enum Topic {
+    NewHeads,
+    /// Every call receipt, or only one program's.
+    Receipts(Option<ProgramId>),
+    /// One transaction's fate, delivered once.
+    Transaction(Hash),
+}
 
 /// How long one outbound frame may take before the client is treated as dead.
 ///
@@ -141,16 +162,18 @@ async fn deadline(at: Option<tokio::time::Instant>) {
     }
 }
 
-/// One connection: its own receiver on the head channel, and its own subscription map.
+/// One connection: its own receiver on each of the three channels, and its own subscription map.
 ///
 /// `slot` is never read. It is this connection's claim on [`MAX_WS_CONNECTIONS`], and dropping it
 /// — on any exit from this function, a panic included — is what gives the slot back.
 async fn run(mut socket: WebSocket, st: RpcState, slot: ConnSlot) {
     let _slot = slot;
     let mut heads = st.heads.subscribe();
-    // Subscription id -> topic. One topic today; the map is what makes unsubscribe a lookup rather
-    // than a boolean, and what the per-connection cap counts.
-    let mut subs: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut commits = st.commits.subscribe();
+    let mut refusals = st.refusals.subscribe();
+    // Subscription id -> topic. The map is what makes unsubscribe a lookup, what a delivered
+    // `transaction` subscription removes itself from, and what the per-connection cap counts.
+    let mut subs: BTreeMap<String, Topic> = BTreeMap::new();
     let mut next_id = 1u64;
     // The first ping is one interval away, not immediate: a client that has just connected has
     // said everything it needs to.
@@ -159,45 +182,51 @@ async fn run(mut socket: WebSocket, st: RpcState, slot: ConnSlot) {
     // outstanding.
     let mut pong_due: Option<tokio::time::Instant> = None;
     loop {
-        tokio::select! {
+        // Each channel arm yields the frames to write, or ends the connection. A socket with no
+        // subscription skips the frame builders entirely: that is the common case for a client
+        // that has connected and not yet subscribed, and it must not cost a serialization.
+        let frames = tokio::select! {
             incoming = socket.recv() => {
                 let Some(Ok(msg)) = incoming else { break };
                 match msg {
-                    Message::Text(text) => {
-                        let reply = on_request(&text, &mut subs, &mut next_id);
-                        if !send_or_give_up(&mut socket, Message::Text(reply)).await { break }
-                    }
+                    Message::Text(text) => vec![on_request(&text, &mut subs, &mut next_id)],
                     // The keepalive came back, so this client is alive whether or not it has
                     // anything subscribed.
-                    Message::Pong(_) => pong_due = None,
+                    Message::Pong(_) => {
+                        pong_due = None;
+                        continue;
+                    }
                     // A client's ping is answered by axum; a close ends the stream on the next
                     // poll; binary is not a request here.
-                    _ => {}
+                    _ => continue,
                 }
             }
             head = heads.recv() => match head {
-                Ok(h) => {
-                    let Some(frames) = notifications(&subs, &h) else { continue };
-                    let mut ok = true;
-                    for frame in frames {
-                        if !send_or_give_up(&mut socket, Message::Text(frame)).await { ok = false; break }
-                    }
-                    if !ok { break }
-                }
-                // The subscriber missed `n` heads: it cannot be made whole from here, and
-                // buffering it is what this cap exists to prevent.
+                Ok(_) if subs.is_empty() => continue,
+                Ok(h) => head_frames(&subs, &h),
                 Err(RecvError::Lagged(n)) => {
-                    tracing::debug!("closing a websocket subscriber that fell {n} heads behind");
-                    let reason =
-                        format!("subscriber fell {n} heads behind; reconnect and catch up with rand_getCompactBlocks");
-                    let frame = CloseFrame { code: CLOSE_POLICY, reason: reason.into() };
-                    // On its own deadline like every other write: a subscriber that lagged because
-                    // it stopped reading will not take this frame either, and waiting on it is the
-                    // same parked task the deadline exists to prevent.
-                    let _ = send_or_give_up(&mut socket, Message::Close(Some(frame))).await;
+                    close_lagged(&mut socket, format!("{n} heads"), "rand_getCompactBlocks").await;
                     break;
                 }
                 // The node loop is gone: so is this node.
+                Err(RecvError::Closed) => break,
+            },
+            commit = commits.recv() => match commit {
+                Ok(_) if subs.is_empty() => continue,
+                Ok(c) => commit_frames(&mut subs, &c),
+                Err(RecvError::Lagged(n)) => {
+                    close_lagged(&mut socket, format!("{n} committed blocks"), "rand_getReceipts").await;
+                    break;
+                }
+                Err(RecvError::Closed) => break,
+            },
+            refusal = refusals.recv() => match refusal {
+                Ok(_) if subs.is_empty() => continue,
+                Ok((hash, reason)) => refusal_frames(&mut subs, &hash, &reason),
+                Err(RecvError::Lagged(n)) => {
+                    close_lagged(&mut socket, format!("{n} refusals"), "rand_getTransactionStatus").await;
+                    break;
+                }
                 Err(RecvError::Closed) => break,
             },
             _ = ping.tick() => {
@@ -205,40 +234,125 @@ async fn run(mut socket: WebSocket, st: RpcState, slot: ConnSlot) {
                 // Only the *first* unanswered ping sets the deadline, so a client that has gone
                 // quiet is not given a fresh grace period every interval.
                 pong_due.get_or_insert(tokio::time::Instant::now() + WS_SEND_TIMEOUT);
+                continue;
             }
             _ = deadline(pong_due) => {
                 tracing::debug!("closing a websocket client that did not answer a ping in {WS_SEND_TIMEOUT:?}");
                 break;
             }
+        };
+        let mut ok = true;
+        for frame in frames {
+            if !send_or_give_up(&mut socket, Message::Text(frame)).await { ok = false; break }
         }
+        if !ok { break }
     }
 }
 
-/// One `rand_subscription` frame per subscription this connection holds, or `None` when it
-/// holds none — the common case for a socket that has connected and not yet subscribed, and the
-/// one that must not cost a serialization.
-fn notifications(subs: &BTreeMap<String, &'static str>, head: &HeadSummary) -> Option<Vec<String>> {
-    if subs.is_empty() {
-        return None;
+/// Close a subscriber that missed `what` on one of the broadcast channels: it cannot be made
+/// whole from here, and buffering it is what the channel's bound exists to prevent. `recover` is
+/// the read that catches it up after it reconnects.
+async fn close_lagged(socket: &mut WebSocket, what: String, recover: &str) {
+    tracing::debug!("closing a websocket subscriber that fell {what} behind");
+    let reason = format!("subscriber fell {what} behind; reconnect and catch up with {recover}");
+    let frame = CloseFrame { code: CLOSE_POLICY, reason: reason.into() };
+    // On its own deadline like every other write: a subscriber that lagged because it stopped
+    // reading will not take this frame either, and waiting on it is the same parked task the
+    // deadline exists to prevent.
+    let _ = send_or_give_up(socket, Message::Close(Some(frame))).await;
+}
+
+/// One `rand_subscription` frame.
+fn frame(id: &str, result: Value) -> String {
+    json!({ "jsonrpc": "2.0", "method": "rand_subscription", "params": { "subscription": id, "result": result } })
+        .to_string()
+}
+
+/// One frame per `newHeads` subscription this connection holds, carrying exactly the three fields
+/// `rand_getHead` returns. Nothing is serialized when there is no such subscription.
+fn head_frames(subs: &BTreeMap<String, Topic>, head: &HeadSummary) -> Vec<String> {
+    let mut ids = subs.iter().filter(|(_, t)| **t == Topic::NewHeads).map(|(id, _)| id).peekable();
+    if ids.peek().is_none() {
+        return Vec::new();
     }
-    let result = serde_json::to_value(head).ok()?;
-    Some(
-        subs.keys()
-            .map(|id| {
-                json!({
-                    "jsonrpc": "2.0",
-                    "method": "rand_subscription",
-                    "params": { "subscription": id, "result": result },
-                })
-                .to_string()
-            })
-            .collect(),
-    )
+    let Ok(result) = serde_json::to_value(head) else { return Vec::new() };
+    ids.map(|id| frame(id, result.clone())).collect()
+}
+
+/// The frames one committed block earns: for each `receipts` subscription, the block's receipts
+/// that pass its program filter — no frame at all when none do, so a quiet chain is a quiet
+/// socket — and for each `transaction` subscription whose hash is in the block, its height and
+/// index. A delivered `transaction` subscription is removed: its question has been answered.
+fn commit_frames(subs: &mut BTreeMap<String, Topic>, c: &CommitSummary) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut done = Vec::new();
+    for (id, topic) in subs.iter() {
+        match topic {
+            Topic::Receipts(filter) => {
+                let rows: Vec<Value> = c
+                    .receipts
+                    .iter()
+                    .filter(|r| filter.is_none_or(|p| r.program == p))
+                    .map(crate::rpc::receipt_json)
+                    .collect();
+                if !rows.is_empty() {
+                    out.push(frame(id, json!({ "height": c.height, "hash": c.hash.to_hex(), "receipts": rows })));
+                }
+            }
+            Topic::Transaction(h) => {
+                if let Some(index) = c.tx_hashes.iter().position(|t| t == h) {
+                    out.push(frame(id, json!({ "status": "committed", "height": c.height, "index": index })));
+                    done.push(id.clone());
+                }
+            }
+            Topic::NewHeads => {}
+        }
+    }
+    for id in done {
+        subs.remove(&id);
+    }
+    out
+}
+
+/// The frames one refusal earns: one per `transaction` subscription to that hash, each then
+/// removed. The reason is the one `rand_getTransactionStatus` reports for it.
+fn refusal_frames(subs: &mut BTreeMap<String, Topic>, hash: &Hash, reason: &str) -> Vec<String> {
+    let done: Vec<String> =
+        subs.iter().filter(|(_, t)| **t == Topic::Transaction(*hash)).map(|(id, _)| id.clone()).collect();
+    done.iter()
+        .map(|id| {
+            subs.remove(id);
+            frame(id, json!({ "status": "rejected", "reason": reason }))
+        })
+        .collect()
+}
+
+/// `rand_subscribe`'s parameters, as a topic, or the message a `-32602` carries.
+fn parse_topic(params: &Value) -> Result<Topic, String> {
+    match params.get(0).and_then(Value::as_str) {
+        Some(NEW_HEADS) => Ok(Topic::NewHeads),
+        Some(RECEIPTS) => match params.get(1) {
+            None | Some(Value::Null) => Ok(Topic::Receipts(None)),
+            Some(v) => v
+                .as_str()
+                .and_then(|s| ProgramId::from_hex(s).ok())
+                .map(|p| Topic::Receipts(Some(p)))
+                .ok_or_else(|| "receipts takes an optional program id, as hex".to_string()),
+        },
+        Some(TRANSACTION) => params
+            .get(1)
+            .and_then(Value::as_str)
+            .and_then(|s| Hash::from_hex(s).ok())
+            .map(Topic::Transaction)
+            .ok_or_else(|| "transaction takes one transaction hash, as hex".to_string()),
+        Some(other) => Err(format!("unknown subscription topic {other}; this node serves {TOPICS}")),
+        None => Err(format!("rand_subscribe takes a topic: {TOPICS}")),
+    }
 }
 
 /// One text frame in, one response object out — as a string, because every outcome here is a
 /// reply and nothing on this socket is fire-and-forget.
-fn on_request(text: &str, subs: &mut BTreeMap<String, &'static str>, next_id: &mut u64) -> String {
+fn on_request(text: &str, subs: &mut BTreeMap<String, Topic>, next_id: &mut u64) -> String {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return err(Value::Null, -32600, "invalid request: not JSON".into());
     };
@@ -254,8 +368,8 @@ fn on_request(text: &str, subs: &mut BTreeMap<String, &'static str>, next_id: &m
     };
     let params = v.get("params").cloned().unwrap_or(Value::Null);
     match method {
-        "rand_subscribe" => match params.get(0).and_then(Value::as_str) {
-            Some(NEW_HEADS) => {
+        "rand_subscribe" => match parse_topic(&params) {
+            Ok(topic) => {
                 if subs.len() >= MAX_WS_SUBSCRIPTIONS {
                     return err(
                         id,
@@ -265,11 +379,10 @@ fn on_request(text: &str, subs: &mut BTreeMap<String, &'static str>, next_id: &m
                 }
                 let sub = next_id.to_string();
                 *next_id += 1;
-                subs.insert(sub.clone(), NEW_HEADS);
+                subs.insert(sub.clone(), topic);
                 json!({ "jsonrpc": "2.0", "id": id, "result": sub }).to_string()
             }
-            Some(other) => err(id, -32602, format!("unknown subscription topic {other}; this node serves {NEW_HEADS}")),
-            None => err(id, -32602, format!("rand_subscribe takes one topic, which must be {NEW_HEADS}")),
+            Err(m) => err(id, -32602, m),
         },
         "rand_unsubscribe" => match params.get(0).and_then(Value::as_str) {
             // A bool, `false` for an id this socket never held rather than an error: that is what
@@ -293,13 +406,19 @@ fn err(id: Value, code: i64, message: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use randprotocol_core::CallReceipt;
 
-    fn fresh() -> (BTreeMap<String, &'static str>, u64) {
+    fn fresh() -> (BTreeMap<String, Topic>, u64) {
         (BTreeMap::new(), 1)
     }
 
-    fn call(subs: &mut BTreeMap<String, &'static str>, next: &mut u64, req: Value) -> Value {
+    fn call(subs: &mut BTreeMap<String, Topic>, next: &mut u64, req: Value) -> Value {
         serde_json::from_str(&on_request(&req.to_string(), subs, next)).unwrap()
+    }
+
+    fn sub(subs: &mut BTreeMap<String, Topic>, next: &mut u64, params: Value) -> String {
+        let r = call(subs, next, json!({ "id": 1, "method": "rand_subscribe", "params": params }));
+        r["result"].as_str().expect(&r.to_string()).to_string()
     }
 
     #[test]
@@ -390,11 +509,13 @@ mod tests {
     fn a_head_goes_to_every_subscription_the_connection_holds_and_to_no_others() {
         let (mut subs, mut next) = fresh();
         let head = HeadSummary { height: 7, hash: "ab".repeat(32), view: 9 };
-        assert!(notifications(&subs, &head).is_none(), "a socket with no subscription is not written to");
+        assert!(head_frames(&subs, &head).is_empty(), "a socket with no subscription is not written to");
         for i in 0..3 {
             call(&mut subs, &mut next, json!({ "id": i, "method": "rand_subscribe", "params": ["newHeads"] }));
         }
-        let frames = notifications(&subs, &head).expect("three frames");
+        // A subscription to another topic hears nothing about heads.
+        sub(&mut subs, &mut next, json!(["receipts"]));
+        let frames = head_frames(&subs, &head);
         assert_eq!(frames.len(), 3);
         for (frame, want) in frames.iter().zip(["1", "2", "3"]) {
             let v: Value = serde_json::from_str(frame).unwrap();
@@ -404,5 +525,70 @@ mod tests {
             assert_eq!(v["params"]["result"], json!({ "height": 7, "hash": "ab".repeat(32), "view": 9 }));
             assert!(v.get("id").is_none(), "a notification carries no id");
         }
+    }
+
+    #[test]
+    fn receipts_topic_filters_by_program_and_skips_empty_blocks() {
+        let (mut subs, mut next) = fresh();
+        let pid_a = Hash([1; 32]);
+        let pid_b = Hash([2; 32]);
+        let all = sub(&mut subs, &mut next, json!(["receipts"]));
+        let only_b = sub(&mut subs, &mut next, json!(["receipts", pid_b.to_hex()]));
+        let rec = |pid| CallReceipt {
+            tx: Hash([3; 32]),
+            program: pid,
+            tier: 1,
+            outputs: [0; 8],
+            height: 5,
+            index: 0,
+            h_in: [0; 8],
+            input_envelope: None,
+        };
+        let c = CommitSummary { height: 5, hash: Hash([5; 32]), tx_hashes: vec![Hash([3; 32])], receipts: vec![rec(pid_a)] };
+        let frames = commit_frames(&mut subs, &c);
+        assert_eq!(frames.len(), 1, "only the unfiltered subscription hears a pid_a receipt");
+        let f: Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(f["params"]["subscription"], all);
+        assert_eq!(f["params"]["result"]["height"], 5);
+        assert_eq!(f["params"]["result"]["receipts"][0]["program"], pid_a.to_hex());
+        let empty = CommitSummary { height: 6, hash: Hash([6; 32]), tx_hashes: vec![], receipts: vec![] };
+        assert!(commit_frames(&mut subs, &empty).is_empty());
+        let _ = only_b;
+    }
+
+    #[test]
+    fn transaction_topic_fires_once_on_commit_or_refusal_and_removes_itself() {
+        let (mut subs, mut next) = fresh();
+        let h = Hash([9; 32]);
+        let id = sub(&mut subs, &mut next, json!(["transaction", h.to_hex()]));
+        let c = CommitSummary { height: 5, hash: Hash([5; 32]), tx_hashes: vec![h], receipts: vec![] };
+        let frames = commit_frames(&mut subs, &c);
+        assert_eq!(frames.len(), 1);
+        let f: Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(f["params"]["subscription"], id);
+        assert_eq!(f["params"]["result"]["status"], "committed");
+        assert_eq!(f["params"]["result"]["index"], 0);
+        assert!(subs.is_empty(), "delivered once, then gone");
+
+        let id = sub(&mut subs, &mut next, json!(["transaction", h.to_hex()]));
+        let frames = refusal_frames(&mut subs, &h, "nullifier already spent");
+        assert_eq!(frames.len(), 1);
+        let f: Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(f["params"]["subscription"], id);
+        assert_eq!(f["params"]["result"]["reason"], "nullifier already spent");
+        assert!(subs.is_empty());
+        assert!(refusal_frames(&mut subs, &Hash([1; 32]), "x").is_empty());
+    }
+
+    #[test]
+    fn bad_topics_are_refused_with_the_topic_list() {
+        let (mut subs, mut next) = fresh();
+        let r = call(&mut subs, &mut next, json!({ "id": 1, "method": "rand_subscribe", "params": ["logs"] }));
+        assert_eq!(r["error"]["code"], -32602);
+        assert!(r["error"]["message"].as_str().unwrap().contains("receipts"));
+        let r = call(&mut subs, &mut next, json!({ "id": 1, "method": "rand_subscribe", "params": ["transaction"] }));
+        assert_eq!(r["error"]["code"], -32602, "a transaction subscription needs its hash");
+        let r = call(&mut subs, &mut next, json!({ "id": 1, "method": "rand_subscribe", "params": ["receipts", "zz"] }));
+        assert_eq!(r["error"]["code"], -32602);
     }
 }

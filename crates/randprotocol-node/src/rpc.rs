@@ -244,6 +244,18 @@ pub struct HeadSummary {
     pub view: u64,
 }
 
+/// One committed block, as the WebSocket's `receipts` and `transaction` topics read it: the
+/// transaction hashes in block order, so a `transaction` subscriber hears its index, and the
+/// block's call receipts, which a `receipts` subscriber is sent through [`receipt_json`] — the
+/// same object `rand_getReceipt` answers with.
+#[derive(Clone, Debug)]
+pub struct CommitSummary {
+    pub height: u64,
+    pub hash: Hash,
+    pub tx_hashes: Vec<Hash>,
+    pub receipts: Vec<CallReceipt>,
+}
+
 /// The head as `rand_getHead` reports it — one function, so the RPC and the subscription can
 /// never drift apart.
 pub fn head_summary(storage: &Storage, status: &RwLock<NodeStatus>) -> crate::storage::Result<HeadSummary> {
@@ -263,6 +275,13 @@ pub struct RpcState {
     /// Committed heads, one per block, fanned out to WebSocket subscribers. Bounded: a subscriber
     /// that falls more than [`HEAD_CHANNEL`] behind is closed, not buffered.
     pub heads: tokio::sync::broadcast::Sender<HeadSummary>,
+    /// Committed blocks, one per head and sent right after it, for the `receipts` and
+    /// `transaction` topics. [`HEAD_CHANNEL`] slots, closed-not-buffered like `heads`.
+    pub commits: tokio::sync::broadcast::Sender<CommitSummary>,
+    /// Transactions this node refused for a reason about their bytes — exactly the set
+    /// `rand_getTransactionStatus` reports as `rejected` — with that reason, for the `transaction`
+    /// topic. [`HEAD_CHANNEL`] slots.
+    pub refusals: tokio::sync::broadcast::Sender<(Hash, String)>,
     /// Live WebSocket connections, against [`crate::ws::MAX_WS_CONNECTIONS`].
     pub ws_conns: Arc<std::sync::atomic::AtomicUsize>,
     /// Viewing keys imported for node-side scanning (`rand_importViewingKey`), in memory only:
@@ -647,8 +666,8 @@ fn compact_block_json(b: &randprotocol_core::Block, notes: &[(u64, crate::storag
 }
 
 /// The object `rand_getReceipt` returns: a call's public outcome, without the sealed transcript
-/// (`rand_getCallEnvelope`'s job). Shared with `rand_getReceipts`' rows and, from Task 9, the
-/// WebSocket topic that pushes a program's receipts as they land.
+/// (`rand_getCallEnvelope`'s job). Shared with `rand_getReceipts`' rows and the WebSocket's
+/// `receipts` topic, which pushes a program's receipts as they land.
 pub(crate) fn receipt_json(r: &CallReceipt) -> Value {
     json!({
         "tx": r.tx.to_hex(), "program": r.program.to_hex(), "tier": r.tier, "outputs": r.outputs,
@@ -1789,6 +1808,8 @@ mod tests {
             chain_id: gs.chain_id,
             executor: Arc::new(StubExecutor),
             heads: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
+            commits: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
+            refusals: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
             ws_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             viewing: Arc::new(RwLock::new(crate::viewing::Registry::default())),
         }

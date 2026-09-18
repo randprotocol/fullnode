@@ -108,7 +108,7 @@ async fn the_socket_serves_only_subscribe_and_unsubscribe() {
     let second = wait_frame(&mut sock, Duration::from_secs(5), |v| (v["id"] == json!(2)).then(|| v.clone()))
         .await
         .expect("a reply");
-    assert_eq!(second["error"]["code"], -32602, "newHeads is the only topic");
+    assert_eq!(second["error"]["code"], -32602, "an unknown topic is refused");
     let third = wait_frame(&mut sock, Duration::from_secs(5), |v| (v["id"] == json!(3)).then(|| v.clone()))
         .await
         .expect("a reply");
@@ -306,4 +306,85 @@ async fn a_subscriber_that_falls_behind_is_closed_with_1008() {
     pump.abort();
     assert_eq!(u16::from(frame.code), 1008, "policy violation, so the client knows it was dropped on purpose");
     assert!(frame.reason.contains("behind"), "the reason says what happened: {}", frame.reason);
+}
+
+/// The `transaction` topic over a live node loop. Subscribed before submitting, a good mint's
+/// subscription hears its commit and a bad mint's hears its refusal — with the reason
+/// `rand_getTransactionStatus` gives, because both read the same refused cache. Mints, as in
+/// `tests/submit.rs`: the same path through the verify queue as a proof, at a thousandth of the
+/// cost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transaction_subscription_hears_its_commit_or_its_refusal_once() {
+    use randprotocol_core::notes::Envelope;
+    use randprotocol_core::{Action, Keypair, Transaction};
+
+    let node = common::start_one_validator().await;
+    let validator = Keypair::from_seed([101; 32]).unwrap();
+    let env = |tag: u8| Envelope { kem_ct: vec![tag; 8], to_receiver: vec![tag; 4], to_sender: vec![], body: vec![tag; 16] };
+    let good = Transaction::mint(7, [9; 8], env(1), 1000, &validator);
+    // A signature over a different amount: a permanent refusal, so it enters the refused cache.
+    let mut bad = Transaction::mint(7, [8; 8], env(2), 1000, &validator);
+    if let Action::Mint { amount, .. } = &mut bad.action {
+        *amount = 999;
+    }
+
+    let (mut sock, _) = tokio_tungstenite::connect_async(format!("ws://{}/ws", node.rpc_addr)).await.expect("upgrade");
+    let mut subs = Vec::new();
+    for (id, tx) in [(1, &good), (2, &bad)] {
+        sock.send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": id, "method": "rand_subscribe", "params": ["transaction", tx.hash().to_hex()] })
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+        let sub = wait_frame(&mut sock, Duration::from_secs(5), |v| {
+            (v["id"] == json!(id)).then(|| v["result"].as_str().expect("a subscription id").to_string())
+        })
+        .await
+        .expect("a reply");
+        subs.push(sub);
+    }
+
+    let client = reqwest::Client::new();
+    let post = |method: &'static str, params: Value| {
+        let req = client
+            .post(format!("http://{}/", node.rpc_addr))
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }));
+        async move { req.send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    for tx in [&good, &bad] {
+        post("rand_sendTransaction", json!([hex::encode(tx.encode())])).await;
+    }
+
+    // Both arrive, in whichever order the node reaches them; every frame is kept, since waiting
+    // for one would throw the other away.
+    let mut got: Vec<Value> = Vec::new();
+    while got.len() < 2 {
+        let n = wait_frame(&mut sock, Duration::from_secs(20), |v| {
+            (v["method"] == json!("rand_subscription")).then(|| v["params"].clone())
+        })
+        .await
+        .expect("a transaction notification");
+        got.push(n);
+    }
+    let of = |sub: &String| got.iter().find(|n| n["subscription"] == json!(sub)).expect("one per subscription");
+    let committed = &of(&subs[0])["result"];
+    assert_eq!(committed["status"], json!("committed"), "{committed}");
+    assert!(committed["height"].as_u64().unwrap() > 0 && committed["index"].is_u64(), "{committed}");
+    let rejected = &of(&subs[1])["result"];
+    assert_eq!(rejected["status"], json!("rejected"), "{rejected}");
+    let status = post("rand_getTransactionStatus", json!([[bad.hash().to_hex()]])).await;
+    assert_eq!(rejected["reason"], status["result"][0]["reason"], "the same reason: {status}");
+
+    // Delivered once, then gone: unsubscribing either is `false`.
+    for (id, sub) in [(3, &subs[0]), (4, &subs[1])] {
+        sock.send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": id, "method": "rand_unsubscribe", "params": [sub] }).to_string(),
+        ))
+        .await
+        .unwrap();
+        let r = wait_frame(&mut sock, Duration::from_secs(5), |v| (v["id"] == json!(id)).then(|| v["result"].clone())).await;
+        assert_eq!(r, Some(json!(false)), "a delivered transaction subscription removes itself");
+    }
+    node.shutdown().await;
 }

@@ -148,6 +148,8 @@ pub async fn serve_heads(capacity: usize) -> (SocketAddr, broadcast::Sender<Head
         chain_id: gs.chain_id,
         executor: Arc::new(StubExecutor),
         heads: heads.clone(),
+        commits: broadcast::channel(capacity).0,
+        refusals: broadcast::channel(capacity).0,
         ws_conns: Arc::new(AtomicUsize::new(0)),
         viewing: Arc::new(RwLock::new(randprotocol_node::viewing::Registry::default())),
     };
