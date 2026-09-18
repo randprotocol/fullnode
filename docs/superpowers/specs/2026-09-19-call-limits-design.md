@@ -1,6 +1,6 @@
 # Call limits as genesis parameters, and a program's public input fixed at deploy
 
-Status: design, 2026-09-19, awaiting the user's review. Target: chain 13 and the v0.4 tag.
+Status: approved by the user 2026-09-19. Target: chain 13 and the v0.4 tag.
 
 ## 1. Problem
 
