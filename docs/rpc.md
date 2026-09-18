@@ -566,6 +566,154 @@ every one of them by replaying the chain, which is what makes them auditable. `d
 works the identity through a bond and a withdraw and says where it rests on a claim (the genesis
 file's own amounts) rather than on a check.
 
+### `rand_getVersion`
+Params: `[]`. Result:
+```json
+{ "version": "0.1.0", "git_sha": "c66e6b8…", "chain_id": 12, "hc_bundle": "f07a…19",
+  "fri_profile": "production" }
+```
+`version` is the workspace crate version. `git_sha` is the full commit hash captured at build time
+by `randprotocol-node`'s `build.rs` — `git rev-parse HEAD` in a checkout, else the `.git-rev` file
+the deploy worktrees write, else `"unknown"` — with `-dirty` appended for an uncommitted tree. This
+is how a caller outside the fleet (an explorer, a survey script) confirms which build a node is
+running without shelling in; the deploy's own sha-compare stays on the binary.
+
+### `rand_getGenesisHash`
+Params: `[]`. Result: the genesis hash as hex, e.g. `"605eb783…"`.
+
+Chain id alone is not enough on a project that cuts chains as often as this one: chain 11 and
+chain 12 could carry the same id on a misconfigured node, and this call catches that before a sync
+is wasted on the wrong chain.
+
+### `rand_getHealth`
+Params: `[]`. Result, one of:
+```json
+{ "status": "ok" }
+{ "status": "syncing", "behind": 412 }
+{ "status": "behind", "behind": 30 }
+```
+`ok` when `sync_target - height` is at most 2 and no sync batch request is outstanding. `syncing`
+while one is. `behind` when the node is not syncing and the lag is still above 2 — the chain-8
+stall shape. A load balancer reads `status` alone; an operator reads `behind` too.
+
+### `rand_getTransactionStatus`
+Params: `[[hash, …]]`, 1 to 64 hashes. Result: one entry per hash, in order:
+```json
+[ { "hash": "…", "status": "committed", "height": 1998, "index": 0 },
+  { "hash": "…", "status": "pending" },
+  { "hash": "…", "status": "rejected", "reason": "nullifier already spent" },
+  { "hash": "…", "status": "unknown" } ]
+```
+Lookup order per hash: committed (storage), then pending (the mempool), then rejected (the refused
+cache — the same cache `rand_status`'s `refused_cache` counts), else `unknown`. A hash this node
+never saw and one a peer refused both read `unknown`; that is honest, since a wallet's submit goes
+to one node, not to every node that might have an opinion. A rejection is not permanent — the
+cache evicts at 8192 entries — but a client polling sees it long before that.
+
+`randprotocol_client::RpcClient::wait_for_transaction` calls this method and fails as soon as a
+poll reads `rejected`, rather than waiting out its timeout on a transaction that is never coming
+back; against a node too old for this method (`-32601`), it falls back to its previous polling
+loop.
+
+Errors: `-32602` for an empty list or more than 64 hashes.
+
+### `rand_getReceipts`
+Params: `[program_id, from_height, to_height, limit?]`. Result:
+```json
+{ "receipts": [ { "tx": "…", "program": "…", "tier": 14, "outputs": [1, 0, 25, 0, 0, 0, 0, 0],
+    "height": 17, "index": 0, "h_in": "9c0e…7f" }, … ],
+  "next_height": 2051 }
+```
+Receipts for `program_id` with `from_height <= height <= to_height`, ordered by height then index;
+the receipt object is exactly `rand_getReceipt`'s. `limit` defaults to and is capped at 256, and a
+`limit` of 0 is clamped up to 1.
+
+`limit` is a soft floor, not a hard page size: a page never splits a height. Once it holds `limit`
+receipts it still serves the rest of that height's matching receipts before it stops, so a receipt
+is never split across two pages and a caller never has to de-duplicate one across a page boundary.
+`next_height` is the first height not served at all — resume from it — or `null` when the range's
+own `to_height` ended the page rather than `limit`.
+
+Errors: `-32602` for `to_height` below `from_height`.
+
+### `rand_getWitnesses`
+Params: `[[index, …]]`, 1 to 32 leaf indices. Result:
+```json
+{ "root": "…", "witnesses": [ { "index": 7, "path": ["…", …] }, { "index": 9, "path": null } ] }
+```
+`rand_getWitness` folded over many leaves in one tree build: a wallet proving several notes at once
+pays for the rebuild once instead of once per note. An index past the end of the tree reads
+`path: null` for that entry rather than failing the whole call. `rand_getWitness` is unchanged and
+is implemented as this call's one-index case.
+
+Errors: `-32602` for an empty list or more than 32 indices.
+
+### `rand_getBlocks`
+Params: `[from_height, to_height]`. Result: a list of headers, oldest first, at most 128 (the
+compact-block cap) starting at `from_height`:
+```json
+[ { "hash": "647b…", "height": 50, "view": 92, "parent": "2d41…", "proposer": "3v3VBJ…",
+    "timestamp_ms": 1788000123456, "tx_root": "0000…", "state_root": "a1b2…",
+    "justify_view": 91, "sealed": true, "tx_count": 0 } ]
+```
+The same header fields as `rand_getBlockByHeight` / `rand_getBlockByHash`, minus `transactions` —
+the block list a client pages through without paying for every transaction in it; those two serve
+the transactions. A range wider than 128, or past the head, is truncated, not refused.
+
+Errors: `-32602` for `to_height` below `from_height`.
+
+### `rand_getFinality`
+Params: `[height]` or `[hash]`. Result, one of:
+```json
+{ "status": "committed", "height": 1998, "hash": "…" }
+{ "status": "certified", "height": 1999, "hash": "…", "qc_view": 2251 }
+{ "status": "proposed", "height": 2000, "hash": "…" }
+{ "status": "unknown" }
+```
+`committed` is a block at or below the committed head — the only answer a height can give, since
+two proposals can share an uncommitted height, so a height is only ever checked against the
+committed chain. A hash can also read `certified` (in HotStuff's uncommitted tree with a quorum
+certificate for it — `high_qc`, `locked_qc`, or a child's `justify`) or `proposed` (in the tree
+without one yet); `unknown` is a hash this replica's tree has never held.
+
+Errors: `-32602` for a missing param 0, or one that is neither a height nor a block hash.
+
+### `rand_getProposer`
+Params: `[view]` or `[from_view, to_view]`, at most 64 views. Result:
+```json
+{ "epoch": 3, "proposers": [ { "view": 2251, "proposer": "2nRdFC…" }, … ] }
+```
+The leader of each view under the **current** validator set (`HotStuff::leader`), not the set that
+actually ran at that view historically — views are not mapped to past epochs, so a view from an
+earlier epoch answers with the current set's leader, and `epoch` says which epoch's set was used.
+
+Errors: `-32602` for `to` below `from`, or a range of more than 64 views. The count is checked
+before any allocation, so `[0, u64::MAX]` is refused on the count rather than an attempt to
+collect the range first.
+
+### `rand_getMempoolInfo`
+Params: `[]`. Result:
+```json
+{ "count": 2, "bytes": 2611200, "oldest_ms": 1450, "max_count": 10000 }
+```
+`bytes` is the sum of every pooled transaction's encoded length. `oldest_ms` is how long the
+longest-pooled transaction has waited, `null` when the pool is empty.
+
+### `rand_getEmission`
+Params: `[]`. Result:
+```json
+{ "inflation": "0",
+  "subsidy": { "current": "250", "base": "1000", "halving_blocks": 210000,
+               "sealed_blocks": 420001, "next_halving_at": 630000 },
+  "faucet": true }
+```
+`inflation` is a fixed `"0"` — nothing on this chain mints outside a genesis allocation, the
+testnet faucet, or the bounded aggregation subsidy, so a client expecting Solana's
+`getInflationRate` gets a number instead of a missing method. `subsidy` is the block-aggregation
+schedule (`gas::subsidy`, the 2026-09-15 changelog entry below); it is `null` on a chain whose
+genesis carries no `aggregation` section, which chain 12 does not. `faucet` mirrors `rand_status`'s
+field of the same name.
+
 ## Subscriptions (WebSocket)
 
 The same port also speaks WebSocket: `ws://127.0.0.1:8545/` or `ws://127.0.0.1:8545/ws`, either
@@ -578,31 +726,64 @@ One thing did change for non-WebSocket clients: `GET /` is now the upgrade handl
 `405 Method Not Allowed`. Nothing reads that status — the RPC has always been `POST` — but a
 health check that asserted on `405` needs to assert on `400`.
 
-One topic exists, `newHeads`, and its payload is exactly `rand_getHead`'s three fields, in the
-same shape — one `HeadSummary` serves both, so they cannot drift apart. The one difference is what
-`view` means: a notification carries the *block's own* view, the one its quorum certificate is for,
-while `rand_getHead` reports the node's current consensus view. For the tip of a healthy chain
-they are the same number. A notification is sent **once per committed
-block, in order**, including during sync: a batch of 100 synced blocks is 100 notifications, not one
-for the tip, so a wallet tracking heads never silently skips a height. Nothing is sent before the
-block is committed to storage, so a head you are told about is a head this node will not lose.
+Three topics exist:
+
+- **`newHeads`** — payload exactly `rand_getHead`'s three fields, in the same shape — one
+  `HeadSummary` serves both, so they cannot drift apart. The one difference is what `view` means:
+  a notification carries the *block's own* view, the one its quorum certificate is for, while
+  `rand_getHead` reports the node's current consensus view. For the tip of a healthy chain they
+  are the same number. A notification is sent **once per committed block, in order**, including
+  during sync: a batch of 100 synced blocks is 100 notifications, not one for the tip, so a wallet
+  tracking heads never silently skips a height. Nothing is sent before the block is committed to
+  storage, so a head you are told about is a head this node will not lose.
+- **`receipts`** or **`receipts <program_id>`** — one notification per committed block that
+  carries at least one matching call receipt, in `rand_getReceipt`'s shape; a block with none
+  sends nothing, so a quiet chain (for that filter) is a quiet socket. A filtered subscription
+  accepts a program id this node has never seen, since the program may be deployed after the
+  subscribe.
+- **`transaction <hash>`** — one notification for that hash, then the node removes the
+  subscription itself: `{ "status": "committed", "height", "index" }` on commit, or
+  `{ "status": "rejected", "reason" }` when this node refuses it for good — the same reason
+  `rand_getTransactionStatus` would report, from the same refused cache. A hash that had
+  **already** committed or been refused when the subscribe request arrived is not answered
+  synchronously in the subscribe reply; it is answered on the next committed block, exactly like a
+  hash that settles afterwards, so a client has one code path whether it subscribes before or
+  after submitting. A duplicate submission or a pool conflict is never announced here — only a
+  permanent refusal that lands in the refused cache is.
+
+The three topics are independent streams, not one feed kept in step: a connection subscribed to
+more than one may see block N's `receipts` notification before its `newHeads` notification, or the
+other way round. There is no ordering promise *between* topics, only *within* one.
 
 ```jsonc
 // client -> node
 { "jsonrpc": "2.0", "id": 1, "method": "rand_subscribe",   "params": ["newHeads"] }
 { "jsonrpc": "2.0", "id": 2, "method": "rand_unsubscribe", "params": ["1"] }
+{ "jsonrpc": "2.0", "id": 3, "method": "rand_subscribe", "params": ["receipts", "<program_id>"] }
+{ "jsonrpc": "2.0", "id": 4, "method": "rand_subscribe", "params": ["transaction", "<hash>"] }
 // node -> client
 { "jsonrpc": "2.0", "id": 1, "result": "1" }        // the subscription id, a decimal string
 { "jsonrpc": "2.0", "id": 2, "result": true }
+{ "jsonrpc": "2.0", "id": 3, "result": "2" }
+{ "jsonrpc": "2.0", "id": 4, "result": "3" }
 { "jsonrpc": "2.0", "method": "rand_subscription",
   "params": { "subscription": "1", "result": { "height": 1998, "hash": "…", "view": 2251 } } }
+{ "jsonrpc": "2.0", "method": "rand_subscription",
+  "params": { "subscription": "2", "result": { "height": 2051, "hash": "…",
+    "receipts": [ { "tx": "…", "program": "…", "tier": 14, "outputs": [1,0,25,0,0,0,0,0],
+      "height": 2051, "index": 0, "h_in": "9c0e…7f" } ] } } }
+{ "jsonrpc": "2.0", "method": "rand_subscription",
+  "params": { "subscription": "3",
+    "result": { "status": "committed", "height": 2051, "index": 3 } } }
 ```
 
 `rand_unsubscribe` answers `true` when this connection held that id and `false` when it did not —
 a `false` is not an error, because a client tearing down after a reconnect has no way to know which
 ids survived. Ids are per connection, are never reused within one, and all of them go when the
-socket does. A frame with no `id` member is a notification and is refused with `-32600`, as over
-HTTP. An unknown topic is `-32602`.
+socket does — a delivered `transaction` subscription also removes its own id, the moment its one
+notification is sent. A frame with no `id` member is a notification and is refused with `-32600`,
+as over HTTP. An unknown topic, or a malformed `receipts` program id or `transaction` hash, is
+`-32602`.
 
 This endpoint is unauthenticated, so it is bounded four ways:
 
@@ -624,14 +805,22 @@ This endpoint is unauthenticated, so it is bounded four ways:
   same 5 s. Any WebSocket library answers pings for you; a client that does not must send
   `Pong` itself.
 
-**Backpressure closes, it does not buffer.** The node keeps 256 committed heads in flight per
-subscriber. A client that falls further behind than that — because it stopped reading, or its link
-cannot carry what the chain produces — is closed with WebSocket code `1008` (policy violation) and
-a reason saying how many heads it missed. Buffering a slow subscriber is how a node runs out of
-memory. The recovery is to reconnect, subscribe again, and fill the gap with
-[`rand_getCompactBlocks`](#rand_getcompactblocks) from the last height you did see; at 3 s
-blocks, 256 heads is about thirteen minutes, so a subscriber that hits this was not going to catch
-up on the socket anyway.
+**Backpressure closes, it does not buffer.** Three broadcast channels feed this endpoint, each
+keeping 256 entries in flight per subscriber: heads (for `newHeads`), committed blocks (which
+answers both `receipts` and a settled `transaction`), and refusals (which answers a `transaction`
+still waiting). A client that falls further behind on one than its 256 entries — because it
+stopped reading, or its link cannot carry what the chain produces — is closed with WebSocket code
+`1008` (policy violation) and a reason naming the stream and how many entries it missed. Buffering
+a slow subscriber is how a node runs out of memory.
+
+A lag only closes a connection that actually holds a subscription the lagging channel feeds: a
+`newHeads`-only client is untouched by a flood of receipts or refusals elsewhere on the chain, and
+a `receipts`-only client is untouched by a lag on refusals. The recovery matches whichever stream
+you fell behind on — reconnect, subscribe again, and fill the gap with
+[`rand_getCompactBlocks`](#rand_getcompactblocks) (heads), [`rand_getReceipts`](#rand_getreceipts)
+(committed blocks), or [`rand_getTransactionStatus`](#rand_gettransactionstatus) (refusals) from
+the last point you did see. At 3 s blocks, 256 entries is about thirteen minutes, so a subscriber
+that hits this was not going to catch up on the socket anyway.
 
 ## Errors
 
@@ -728,6 +917,40 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-18 — v0.3: thirteen methods and two WebSocket topics
+
+No wire, consensus or genesis change: old and new nodes interoperate, and the fleet takes this as
+a same-chain update (`deploy/update-droplet.sh`), not a chain cut. What a client can see:
+
+- **Node identity and health** — `rand_getVersion` (crate version, full git sha, chain id,
+  `hc_bundle`, FRI profile), `rand_getGenesisHash`, `rand_getHealth` (`ok` / `syncing` / `behind`).
+- **`rand_getTransactionStatus(hashes)`** — up to 64 hashes at once, each `committed` / `pending`
+  / `rejected` (with the refusal reason) / `unknown`. `randprotocol_client::wait_for_transaction`
+  now uses it and fails fast on `rejected`, falling back to its old polling loop against a node
+  older than this release.
+- **`rand_getReceipts(program_id, from_height, to_height, limit?)`** — a program's receipts over a
+  height range, paged with a soft-floor `limit` (default and cap 256) that never splits a height.
+- **`rand_getWitnesses(indices)`** — `rand_getWitness` folded over up to 32 leaves in one tree
+  build.
+- **`rand_getBlocks(from_height, to_height)`** — up to 128 headers, `rand_getBlockByHeight`'s
+  fields minus `transactions`.
+- **`rand_getFinality(height_or_hash)`** — `committed` / `certified` / `proposed` / `unknown`
+  from the replica's own HotStuff tree and quorum certificates.
+- **`rand_getProposer(view)` or `(from_view, to_view)`** — the leader per view under the
+  *current* validator set, at most 64 views per call.
+- **`rand_getMempoolInfo`** — pool count, byte total, and the oldest pooled transaction's age.
+- **`rand_getEmission`** — a fixed `"0"` inflation, the block-aggregation subsidy schedule
+  (`null` without an `aggregation` genesis section, which chain 12 lacks), and the faucet flag.
+- **Two new WebSocket topics**, `receipts [program_id]` and `transaction <hash>`, beside
+  `newHeads`: see [Subscriptions](#subscriptions-websocket) for their shapes, the once-then-gone
+  behaviour of `transaction`, and why a lag on one topic's channel no longer closes a connection
+  that does not listen to it.
+
+**Storage.** First start of a node running this release builds a new `receipts_by_program` index
+from the existing `receipts` family, once — the fleet's 22 000-odd receipts take under a second;
+an empty node is a no-op. `rand_getReceipts` and the `receipts` topic read this index; nothing
+else about how receipts are stored changed.
 
 ### 2026-09-15 — block aggregation (chain 9): a hard fork
 

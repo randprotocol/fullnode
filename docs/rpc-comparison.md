@@ -8,18 +8,18 @@ marked *S2* arrive with the staking phase.
 
 | concern | Ethereum JSON-RPC | Solana JSON-RPC | RAND |
 |---|---|---|---|
-| chain identity | `eth_chainId`, `net_version` | `getGenesisHash`, `getVersion` | `rand_chainId`, `rand_status` (also `hc_bundle`, `tree_root`, the FRI profile) |
-| balances / accounts | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | `getBalance`, `getAccountInfo`, `getProgramAccounts`, `getTokenAccountBalance` | none, by design: balances exist only in wallets. The node serves `rand_getCommitments`, `rand_getNullifiers`, `rand_getWitness`, `rand_getTreeInfo` and the wallet does the rest |
+| chain identity | `eth_chainId`, `net_version` | `getGenesisHash`, `getVersion`, `getHealth` | `rand_chainId`, `rand_status` (also `hc_bundle`, `tree_root`, the FRI profile); `rand_getVersion`, `rand_getGenesisHash`, `rand_getHealth` |
+| balances / accounts | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | `getBalance`, `getAccountInfo`, `getProgramAccounts`, `getTokenAccountBalance`, `getMultipleAccounts` | none, by design: balances exist only in wallets. The node serves `rand_getCommitments`, `rand_getNullifiers`, `rand_getWitness`, `rand_getWitnesses` (a multi-get, one tree build), `rand_getTreeInfo` and the wallet does the rest |
 | submit | `eth_sendRawTransaction` | `sendTransaction` | `rand_sendTransaction` (bincode, hex) |
 | dry-run | `eth_call`, `eth_estimateGas` | `simulateTransaction` | none on the node. A confidential call is dry-run in the wallet's emulator before proving; fees come from `rand_estimateFee` (flat floors, no gas model) |
-| fees | `eth_gasPrice`, `eth_feeHistory`, EIP-1559 fields | `getFeeForMessage`, `getRecentPrioritizationFees` | `rand_estimateFee` only: fixed floors, no market |
-| blocks and transactions | `eth_blockNumber`, `eth_getBlockBy*`, `eth_getTransactionByHash` | `getSlot`, `getBlock`, `getTransaction`, `getLatestBlockhash` | `rand_getHead`, `rand_getBlockByHeight`, `rand_getBlockByHash`, `rand_getTransaction`, `rand_getAnchor` |
-| receipts and events | `eth_getTransactionReceipt`, `eth_getLogs` (topics, bloom filters) | `getSignatureStatuses`, program logs inside `getTransaction` | `rand_getReceipt` (tier, 8 output words, `H_IN`), `rand_getCallEnvelope`; no event log, no filters |
+| fees | `eth_gasPrice`, `eth_feeHistory`, EIP-1559 fields | `getFeeForMessage`, `getRecentPrioritizationFees` | `rand_estimateFee` only: fixed floors, no market; `rand_getMempoolInfo` (count, bytes, oldest pooled age) is the congestion signal a flat floor otherwise hides |
+| blocks and transactions | `eth_blockNumber`, `eth_getBlockBy*`, `eth_getTransactionByHash` | `getSlot`, `getBlock`, `getTransaction`, `getLatestBlockhash` | `rand_getHead`, `rand_getBlockByHeight`, `rand_getBlockByHash`, `rand_getBlocks` (headers only, up to 128), `rand_getTransaction`, `rand_getAnchor` |
+| receipts and events | `eth_getTransactionReceipt`, `eth_getLogs` (topics, bloom filters), `logsSubscribe` | `getSignatureStatuses`, program logs inside `getTransaction` | `rand_getReceipt` (tier, 8 output words, `H_IN`), `rand_getCallEnvelope`; `rand_getTransactionStatus` (committed / pending / rejected / unknown, next to `getSignatureStatuses`); `rand_getReceipts` and the `receipts` WebSocket topic (per-program, next to `eth_getLogs` / `logsSubscribe`); no event log, no filters |
 | history by address | `eth_getLogs` by address; external indexers | `getSignaturesForAddress` | impossible by design; a viewing-key holder reconstructs it client-side |
-| validators and epochs | none (the consensus client's beacon API) | `getVoteAccounts`, `getEpochInfo`, `getLeaderSchedule` | `rand_getValidators`, `rand_getPeers`; `rand_getEpoch` (*S2*) |
-| supply | none | `getSupply`, `getInflationRate` | `rand_getSupply` (*S2*, `docs/supply.md`); no inflation |
-| subscriptions | WebSocket `newHeads`, `logs`, `pendingTransactions` | WebSocket `accountSubscribe`, `logsSubscribe`, `slotSubscribe` | `newHeads` over WebSocket, same port (`rand_subscribe`/`rand_unsubscribe`) |
-| batching and paging | JSON-RPC batch requests | batch, plus cursors on `getSignaturesForAddress` | JSON-RPC batch (cap 20); limit-based paging on commitments and nullifiers, plus the compact-block range |
+| validators and epochs | none (the consensus client's beacon API) | `getVoteAccounts`, `getEpochInfo`, `getLeaderSchedule`, `getBlockCommitment` | `rand_getValidators`, `rand_getPeers`; `rand_getEpoch` (*S2*); `rand_getProposer` (leader per view, next to `getLeaderSchedule`), `rand_getFinality` (committed / certified / proposed, next to `getBlockCommitment`) |
+| supply | none | `getSupply`, `getInflationRate` | `rand_getSupply` (*S2*, `docs/supply.md`); `rand_getEmission` (fixed `"0"` inflation plus the aggregation subsidy schedule, next to `getInflationRate`) |
+| subscriptions | WebSocket `newHeads`, `logs`, `pendingTransactions` | WebSocket `accountSubscribe`, `logsSubscribe`, `slotSubscribe` | `newHeads`, `receipts [program_id]`, `transaction <hash>` over WebSocket, same port (`rand_subscribe`/`rand_unsubscribe`) |
+| batching and paging | JSON-RPC batch requests | batch, plus cursors on `getSignaturesForAddress` | JSON-RPC batch (cap 20); limit-based paging on commitments, nullifiers and receipts (`rand_getReceipts`, soft-floor limit), plus the compact-block range and the header range (`rand_getBlocks`) |
 | state proofs | `eth_getProof` (Merkle-Patricia) | none | `rand_getWitness` (a Poseidon2 Merkle path the zkVM consumes) |
 
 ## 2. What the differences mean
@@ -41,6 +41,18 @@ non-consensus additions closed them:
 - a WebSocket `newHeads` subscription (`rand_subscribe`/`rand_unsubscribe`, same port), so
   nothing has to poll.
 - JSON-RPC batch requests, capped at 20.
+
+**What v0.3 closed.** The remaining gaps were the ones a wallet or explorer hits right after
+those three: no way to ask "is my transaction in, dropped, or just slow" without polling
+`rand_getTransaction` to timeout, no per-program receipt query (an indexer had to walk every
+block), no batching for the one unbounded read (`rand_getWitness`), and no build or health
+string to check a node from outside. Eleven methods and two more WebSocket topics closed them —
+`rand_getTransactionStatus` and the `transaction` topic answer the first; `rand_getReceipts` and
+the `receipts` topic the second; `rand_getWitnesses` the third; `rand_getVersion` /
+`rand_getGenesisHash` / `rand_getHealth` the fourth. `rand_getBlocks`, `rand_getFinality`,
+`rand_getProposer`, `rand_getMempoolInfo` and `rand_getEmission` round out the set an Ethereum or
+Solana client expects and this node did not yet serve. All of it is node-only: no wire, consensus
+or genesis change, so it shipped as a same-chain update.
 
 **Where the shape differs deliberately and should stay that way.** No gas market (fees are flat
 floors because verification cost is nearly constant per proof); no event logs (a call publishes
