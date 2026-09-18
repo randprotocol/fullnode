@@ -170,6 +170,21 @@ pub struct EpochInfo {
 /// catch up, and is closed rather than buffered.
 pub const HEAD_CHANNEL: usize = 256;
 
+/// The commit this binary was built from (`build.rs`), for `rand_getVersion`.
+pub const GIT_SHA: &str = env!("RAND_GIT_SHA");
+
+/// `rand_getHealth`: one word a load balancer can read, and the lag an operator can.
+pub fn health_json(s: &NodeStatus) -> Value {
+    let behind = s.sync_target.saturating_sub(s.height);
+    if s.sync_inflight_age_ms.is_some() {
+        json!({ "status": "syncing", "behind": behind })
+    } else if behind > 2 {
+        json!({ "status": "behind", "behind": behind })
+    } else {
+        json!({ "status": "ok" })
+    }
+}
+
 /// One committed head, as `rand_getHead` reports it. What a `newHeads` notification carries.
 #[derive(Clone, Debug, Serialize)]
 pub struct HeadSummary {
@@ -805,6 +820,18 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
     match req.method.as_str() {
         "rand_chainId" => Ok(json!(st.chain_id)),
         "rand_tokenInfo" => Ok(json!({ "symbol": TOKEN_SYMBOL, "decimals": TOKEN_DECIMALS })),
+        "rand_getVersion" => {
+            let s = st.status.read().unwrap_or_else(|e| e.into_inner());
+            Ok(json!({
+                "version": env!("CARGO_PKG_VERSION"), "git_sha": GIT_SHA, "chain_id": st.chain_id,
+                "hc_bundle": s.hc_bundle, "fri_profile": s.fri_profile,
+            }))
+        }
+        "rand_getGenesisHash" => Ok(json!(st.storage.genesis_hash().map_err(RpcError::internal)?.to_hex())),
+        "rand_getHealth" => {
+            let s = st.status.read().unwrap_or_else(|e| e.into_inner()).clone();
+            Ok(health_json(&s))
+        }
         "rand_sendTransaction" => {
             let raw: String = param(p, 0, "tx")?;
             let bytes = hex::decode(raw.strip_prefix("0x").unwrap_or(&raw))
@@ -3092,5 +3119,36 @@ mod tests {
             assert_eq!(rows[i]["id"], Value::Null, "row {i}: nothing to echo");
             assert!(rows[i].get("result").is_none(), "row {i}: an error response carries no result");
         }
+    }
+
+    #[tokio::test]
+    async fn version_reports_build_and_chain() {
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_d, st) = state_for(&gs);
+        let v = ok(&st, "rand_getVersion", json!([])).await;
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert!(v["git_sha"].as_str().unwrap().len() >= 7, "{v}");
+        assert_eq!(v["chain_id"], 7);
+        assert!(v["hc_bundle"].is_string());
+        assert!(v["fri_profile"].is_string());
+    }
+
+    #[tokio::test]
+    async fn genesis_hash_is_the_stored_one() {
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_d, st) = state_for(&gs);
+        let v = ok(&st, "rand_getGenesisHash", json!([])).await;
+        assert_eq!(v, json!(gs.hash().to_hex()));
+    }
+
+    #[test]
+    fn health_reads_ok_syncing_and_behind() {
+        let mut s = NodeStatus { height: 100, sync_target: 101, ..NodeStatus::default() };
+        assert_eq!(health_json(&s), json!({ "status": "ok" }));
+        s.sync_target = 140;
+        s.sync_inflight_age_ms = Some(20);
+        assert_eq!(health_json(&s), json!({ "status": "syncing", "behind": 40 }));
+        s.sync_inflight_age_ms = None;
+        assert_eq!(health_json(&s), json!({ "status": "behind", "behind": 40 }));
     }
 }
