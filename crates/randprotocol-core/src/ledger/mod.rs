@@ -2281,7 +2281,10 @@ mod tests {
         };
         let (default, id) = ledger_with_program(|_| {});
         let (raised, _) = ledger_with_program(raise);
-        let size_error = |r: &Result<(), TxError>| matches!(r, Err(TxError::ProofTooLarge));
+        // Either size refusal counts: a proof the proof cap admits must not then trip the
+        // whole-transaction cap on the raised ledger either.
+        let size_error =
+            |r: &Result<(), TxError>| matches!(r, Err(TxError::ProofTooLarge) | Err(TxError::TransactionTooLarge { .. }));
 
         // The call's own proof: refused by default, and verified and admitted when raised.
         let call = |l: &Ledger| call_tx(l, 20, id, PaddedStub::proof(&id, over), fee_for(over));
@@ -2344,6 +2347,21 @@ mod tests {
         assert_eq!(
             small.validate(&ok, &StubExecutor),
             Err(TxError::TransactionTooLarge { size: ok.encoded_len(), max: ok.encoded_len() - 1 })
+        );
+        // Exactly at the cap is admitted: the rule is `size > max`, not `>=`.
+        small.set_max_block_bytes(ok.encoded_len());
+        assert_eq!(small.validate(&ok, &StubExecutor), Ok(()), "a transaction exactly at the cap");
+        // And the 4 MiB transaction on a ledger whose cap is exactly its size passes the size
+        // check (its zero-filled bundle proof is then refused by the stub, a later step).
+        let (exact, _) = ledger_with_program(|_| {});
+        let t = fat(&exact);
+        let (mut exact, _) = ledger_with_program(|l| l.set_max_block_bytes(t.encoded_len()));
+        let got = exact.validate(&t, &PaddedStub);
+        assert!(!matches!(got, Err(TxError::TransactionTooLarge { .. })), "{} B at a {} B cap: {got:?}", t.encoded_len(), exact.max_block_bytes());
+        exact.set_max_block_bytes(t.encoded_len() - 1);
+        assert_eq!(
+            exact.validate(&t, &PaddedStub),
+            Err(TxError::TransactionTooLarge { size: t.encoded_len(), max: t.encoded_len() - 1 })
         );
     }
 
@@ -2419,6 +2437,13 @@ mod tests {
             l.set_max_block_bytes(t.encoded_len() - 1);
         });
         assert_eq!(tight.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub), Err(BlockError::TooLarge));
+        // Exactly at the block's size, it is applied: the block cap is `bytes > max`, not `>=`.
+        let (mut exact, _) = ledger_with_program(|l| {
+            limits(l);
+            l.set_max_block_bytes(t.encoded_len());
+        });
+        let receipts = exact.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub).unwrap();
+        assert_eq!(receipts.len(), 1, "a block exactly at the cap");
     }
 
     /// Spec §7: step 10 charges the byte term. A call that pays today's fee with a proof past the
