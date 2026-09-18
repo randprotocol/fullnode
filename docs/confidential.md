@@ -515,8 +515,29 @@ genesis hash, so nodes with different settings cannot join the same chain.
 
 `rand program build --guest <name> --arg ...` assembles the built-in guests: `fib n`, `memcpy n`,
 `bubble_sort v...`, `balance_check threshold`, `private_payment threshold`. Any RV32I program in the
-supported subset can be deployed from a `.json` (`{ "base_pc", "words" }`) or `.bin` (raw
-little-endian words) file.
+supported subset can be deployed from a `.json` (`{ "base_pc", "words" }`), a raw `.bin`
+(little-endian words, loaded from base 0), or a `.bin` produced by the sibling `circuits` repo's
+`rand-guest build` — a real `riscv32im-unknown-none-elf` toolchain build, as opposed to a guest
+assembled by hand against `randprotocol-zkvm::asm`.
+
+`rand-guest build` emits the M4.3 **image container**: six little-endian header words
+(`[0x444e4152, 1, text_base, n_text, data_base, n_data]`), then the guest's text, then its data
+segment. `rand program deploy` recognises the container by its first word — `0x444e4152`
+(`IMAGE_MAGIC`, `b"RAND"` read little-endian) never decodes as an RV32 instruction, so a raw
+`.bin` can never be confused for one — and loads it the same way the prover does,
+`isa::Program::from_flat_image`, which synthesises a prologue below the text that writes the data
+segment into RAM before the guest's own code runs. That is what makes a compiled guest with a
+`.rodata` (jump tables, panic locations, any constant LLVM did not rematerialise) deployable at
+all: the M4.1 flat-binary loader populated instruction space only, so a guest with real data read
+zeros. A file that starts with `IMAGE_MAGIC` but is not a well-formed container is a deploy error,
+not a silent fallback to raw words.
+
+Before proving anything, `program deploy` prints the program id, `hc` (`Program::digest`, what
+`rand-guest build` itself reports for the same guest) and the word count, then calls
+`rand_estimateFee` for a `deploy` of that word count. That RPC applies this chain's own
+`max_program_words` admission (the cap above), so a program over the cap is refused there — for
+the cost of one RPC round trip — rather than after the minutes it takes to prove a bundle the
+ledger would then throw away.
 
 ## GPU proving (--cuda)
 
