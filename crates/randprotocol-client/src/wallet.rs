@@ -1182,6 +1182,18 @@ pub async fn submit_burn(
     })
 }
 
+/// The one fact a deploy needs from the chain before any proving: whether `words` words fits this
+/// chain's program cap (`max_program_words`, a genesis parameter — Task 1). `rand_estimateFee`
+/// applies the same check the ledger's own `Action::Deploy` admission does, so a program over the
+/// cap is refused here, for the price of one RPC call, rather than after a proof — minutes on a
+/// laptop for a `deploy` transaction the chain would then throw away. The node's own reply already
+/// names the cap (`rand_estimateFee`'s `"words must be at most N (this chain's program cap)"` in
+/// `randprotocol-node/src/rpc.rs`), so it is passed through rather than restated here. Returns the
+/// fee estimate when the program is within the cap.
+pub async fn deploy_precheck(rpc: &RpcClient, words: usize) -> Result<u64> {
+    rpc.estimate_fee(serde_json::json!({ "kind": "deploy", "words": words })).await
+}
+
 /// What a `deploy` pays by default: the bundle base plus the program's per-word charge, which
 /// is exactly `gas::fee_floor` for a `Deploy`.
 pub fn deploy_fee_default(action: &Action) -> u64 {
@@ -1922,6 +1934,78 @@ mod tests {
         assert!(attempt(0, 100, 0).await.contains("not a bridged asset"));
         assert!(attempt(1, 0, 0).await.contains("moves nothing"));
         assert!(attempt(1, 100, 101).await.contains("more than the 100"));
+    }
+
+    /// A minimal one-shot JSON-RPC mock: answers exactly one HTTP request with `body`, no delay.
+    /// Adapted from `RpcClient`'s own `slow_server` test helper (`lib.rs`) with the artificial
+    /// delay dropped — this is only ever used to hand back an error reply fast, never to test
+    /// timing.
+    async fn one_shot_rpc(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 16 * 1024];
+            let header_end = loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+            let len: usize = headers
+                .split("content-length:")
+                .nth(1)
+                .and_then(|r| r.split("\r\n").next())
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut got = buf.len() - header_end;
+            while got < len {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got += n;
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// `deploy_precheck` is the wallet's whole defence against paying for a proof the chain will
+    /// then refuse: it is one `rand_estimateFee` call, made before any bundle is proved, and it
+    /// surfaces the node's own cap-naming message rather than inventing its own. Modelled on
+    /// `rand_estimateFee`'s actual reply for an over-cap deploy (`randprotocol-node/src/rpc.rs`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_over_cap_deploy_is_refused_by_one_fee_estimate_before_any_proving() {
+        let reply = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"words must be at most 4096 (this chain's program cap)"}}"#;
+        let url = one_shot_rpc(reply).await;
+        let rpc = RpcClient::new(url);
+        let err = deploy_precheck(&rpc, 5000).await.expect_err("refused").to_string();
+        assert!(err.contains("at most 4096"), "{err}");
+        assert!(err.contains("program cap"), "{err}");
+    }
+
+    /// And a program within the cap is not refused: the estimate comes back as the fee.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_in_cap_deploy_gets_back_the_fee_estimate() {
+        let reply = r#"{"jsonrpc":"2.0","id":1,"result":"1000000"}"#;
+        let url = one_shot_rpc(reply).await;
+        let rpc = RpcClient::new(url);
+        assert_eq!(deploy_precheck(&rpc, 100).await.unwrap(), 1_000_000);
     }
 
     #[test]

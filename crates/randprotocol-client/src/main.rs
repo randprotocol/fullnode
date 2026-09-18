@@ -619,6 +619,14 @@ async fn main() -> Result<()> {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let p = load_program(&file)?;
             let id = randprotocol_core::program::program_id(p.base_pc, &p.words);
+            // Printed before anything is proved: the program id and `hc` (`Program::digest`) are
+            // what `rand-guest build` itself reports for the same guest, so this is the wallet's
+            // confirmation that the file it loaded is the one the toolchain built.
+            println!("program id: {id}, hc {}, {} words", p.code_hash(), p.words.len());
+            // One RPC call, before any proof: `rand_estimateFee` applies this chain's own
+            // `max_program_words` admission (Task 1), so a program over the cap is refused here
+            // rather than after a proof the ledger would then throw away.
+            wallet::deploy_precheck(&rpc, p.words.len()).await?;
             let action = Action::Deploy { base_pc: p.base_pc, words: p.words.clone() };
             let fee = wallet::deploy_fee_default(&action);
             let chain_id = rpc.chain_id().await?;
