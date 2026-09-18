@@ -137,6 +137,12 @@ impl ConfidentialExecutor for AggExecutor {
         }
         let rvm_proof: randprotocol_rvm::machine::Proof =
             postcard::from_bytes(proof).map_err(|_| ConfidentialError::MalformedProof)?;
+        // Canonical encoding only, as `randprotocol_zkvm::executor::decode_canonical` insists for
+        // every bundle and call proof: postcard ignores trailing bytes and accepts overlong
+        // varints, so a padded or re-encoded aggregate would otherwise verify under another txid.
+        if rvm_proof.to_bytes() != proof {
+            return Err(ConfidentialError::MalformedProof);
+        }
         let vk = Self::inner_key(shape)?;
         let pvs: Vec<Vec<u64>> = covered.iter().map(|c| c.public_values.to_vec()).collect();
         let public = randprotocol_rvm::public_values::interface_words(&vk.shape, &vk.key, &pvs);
