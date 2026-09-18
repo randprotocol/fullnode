@@ -695,6 +695,16 @@ impl Storage {
         Ok(tree.path(index).map(|p| (tree.root(), p)))
     }
 
+    /// Paths for many leaves from one tree build (`rand_getWitnesses`); `None` for an index past
+    /// the tree. The root is the same for every path, so it is returned once.
+    pub fn witnesses(&self, indices: &[u64], executor: &dyn ConfidentialExecutor) -> Result<(Word8, Vec<Option<[Word8; DEPTH]>>)> {
+        let leaves = self.leaves()?;
+        let len = leaves.len() as u64;
+        let tree = FullTree::new(leaves, executor);
+        let paths = indices.iter().map(|&i| if i < len { tree.path(i) } else { None }).collect();
+        Ok((tree.root(), paths))
+    }
+
     pub fn genesis_hash(&self) -> Result<Hash> {
         let bytes = self.get_meta_raw(META_GENESIS_HASH)?.ok_or(StorageError::NotInitialized)?;
         let arr: [u8; 32] = bytes

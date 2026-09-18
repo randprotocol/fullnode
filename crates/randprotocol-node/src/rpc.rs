@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use randprotocol_core::bridge::{asset_id, AssetInfo, BridgeMeta};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::notes::{word8_to_hex, Envelope};
-use randprotocol_core::{Action, Hash, ShieldedAddress, Transaction, TOKEN_DECIMALS, TOKEN_SYMBOL};
+use randprotocol_core::{Action, CallReceipt, Hash, ProgramId, ShieldedAddress, Transaction, TOKEN_DECIMALS, TOKEN_SYMBOL};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
@@ -41,6 +41,13 @@ const MAX_BATCH: usize = 20;
 /// The longest string any RPC parameter may offer as a shielded address (spec ruling 3). See
 /// `parse_shielded` for why this is checked before the address is parsed rather than after.
 const MAX_ADDRESS_CHARS: usize = 2000;
+
+/// The most receipts one `rand_getReceipts` page may return; an out-of-range `limit` is clamped
+/// to it rather than refused.
+pub const MAX_RECEIPTS_PAGE: usize = 256;
+
+/// The most leaf indices one `rand_getWitnesses` call may fold into a single tree build.
+pub const MAX_WITNESSES: usize = 32;
 
 /// Snapshot the node loop keeps up to date for RPC readers.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -595,6 +602,20 @@ fn compact_block_json(b: &randprotocol_core::Block, notes: &[(u64, crate::storag
     })
 }
 
+/// The object `rand_getReceipt` returns: a call's public outcome, without the sealed transcript
+/// (`rand_getCallEnvelope`'s job). Shared with `rand_getReceipts`' rows and, from Task 9, the
+/// WebSocket topic that pushes a program's receipts as they land.
+pub(crate) fn receipt_json(r: &CallReceipt) -> Value {
+    json!({
+        "tx": r.tx.to_hex(), "program": r.program.to_hex(), "tier": r.tier, "outputs": r.outputs,
+        "height": r.height, "index": r.index,
+        // The proof's public commitment to the call's private inputs. Public like every other
+        // receipt field, and the associated data a call-input envelope is sealed against:
+        // without it `rand_getCallEnvelope`'s bytes could not be opened by anyone (spec §6.1).
+        "h_in": word8_to_hex(&r.h_in),
+    })
+}
+
 fn block_json(b: &randprotocol_core::Block, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor, storage: &crate::storage::Storage) -> Value {
     let sealed = storage.block_sealed(&b.hash()).unwrap_or(false);
     let txs: Vec<Value> = b
@@ -975,6 +996,26 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 })),
             }
         }
+        // `rand_getWitness`, folded over many leaves in one tree build: a wallet proving several
+        // notes at once pays for the rebuild once instead of once per note.
+        "rand_getWitnesses" => {
+            let indices: Vec<u64> = param(p, 0, "indices")?;
+            if indices.is_empty() || indices.len() > MAX_WITNESSES {
+                return Err(RpcError::invalid_params(format!("indices must hold 1 to {MAX_WITNESSES} leaf indices")));
+            }
+            let (storage, executor) = (st.storage.clone(), st.executor.clone());
+            let idx = indices.clone();
+            let (root, paths) = blocking(move || storage.witnesses(&idx, executor.as_ref())).await?;
+            let witnesses: Vec<Value> = indices
+                .iter()
+                .zip(paths)
+                .map(|(i, p)| json!({
+                    "index": i,
+                    "path": p.map(|p| p.iter().map(word8_to_hex).collect::<Vec<_>>()),
+                }))
+                .collect();
+            Ok(json!({ "root": word8_to_hex(&root), "witnesses": witnesses }))
+        }
         "rand_getTreeInfo" => {
             let next_index = st.storage.notes_count().map_err(RpcError::internal)?;
             let root = st.storage.tree().map_err(RpcError::internal)?.root();
@@ -1069,22 +1110,25 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         }
         "rand_getReceipt" => {
             let h = parse_hash(p, 0)?;
-            Ok(st
-                .storage
-                .receipt(&h)
-                .map_err(RpcError::internal)?
-                .map(|r| {
-                    json!({
-                        "tx": r.tx.to_hex(), "program": r.program.to_hex(), "tier": r.tier, "outputs": r.outputs,
-                        "height": r.height, "index": r.index,
-                        // The proof's public commitment to the call's private inputs. Public
-                        // like every other receipt field, and the associated data a call-input
-                        // envelope is sealed against: without it `rand_getCallEnvelope`'s
-                        // bytes could not be opened by anyone (spec §6.1).
-                        "h_in": word8_to_hex(&r.h_in),
-                    })
-                })
-                .unwrap_or(Value::Null))
+            Ok(st.storage.receipt(&h).map_err(RpcError::internal)?.map(|r| receipt_json(&r)).unwrap_or(Value::Null))
+        }
+        // A program's receipts, height then index, the index Task 2 built for it. `limit` is
+        // clamped rather than refused, like `rand_getCompactBlocks`'s page; `next_height` is the
+        // height to resume from, `null` once the range is exhausted.
+        "rand_getReceipts" => {
+            let program: ProgramId = parse_hash(p, 0)?;
+            let from: u64 = param(p, 1, "from_height")?;
+            let to: u64 = param(p, 2, "to_height")?;
+            if to < from {
+                return Err(RpcError::invalid_params(format!("to_height {to} is below from_height {from}")));
+            }
+            let limit = match p.get(3) {
+                Some(Value::Null) | None => MAX_RECEIPTS_PAGE,
+                Some(_) => param::<usize>(p, 3, "limit")?.clamp(1, MAX_RECEIPTS_PAGE),
+            };
+            let storage = st.storage.clone();
+            let (rows, next) = blocking(move || storage.receipts_for_program(&program, from, to, limit)).await?;
+            Ok(json!({ "receipts": rows.iter().map(receipt_json).collect::<Vec<_>>(), "next_height": next }))
         }
         // The sealed transcript of a call's private inputs (spec §6.1), verbatim, in hex. The
         // node holds no key that opens it and never looks inside: it is served so that the
@@ -1973,13 +2017,12 @@ mod tests {
         assert_eq!(ok(&st, "rand_getTransaction", json!([Hash::ZERO.to_hex()])).await, Value::Null);
     }
 
-    /// The call-input envelope's read path (spec §6.1): a receipt carries the sealed transcript,
-    /// and one method hands it back verbatim in hex so a viewing key — never the node — can open
-    /// it. A call made without one, or a transaction that is not a call at all, is `null`.
-    #[tokio::test]
-    async fn get_call_envelope_serves_the_sealed_transcript_of_a_call() {
+    /// A deploy and two calls — one with a sealed input envelope, one without — committed at
+    /// height 1 under one program. Shared by the call-envelope test and the receipts-paging
+    /// tests below, which only need the program id and the two call hashes.
+    async fn receipt_chain() -> (tempfile::TempDir, RpcState, ProgramId, Transaction, Transaction) {
         let gs = genesis_with(1, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)]);
-        let (_d, st) = state_for(&gs);
+        let (dir, st) = state_for(&gs);
         let mut ledger = gs.ledger.clone();
         let mut probe = gs.ledger.clone();
 
@@ -2025,6 +2068,26 @@ mod tests {
         b1.receipts = probe.apply_block(&b1.block, &StubExecutor).unwrap();
         st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
+        (dir, st, pid, sealed, bare)
+    }
+
+    /// The call-input envelope's read path (spec §6.1): a receipt carries the sealed transcript,
+    /// and one method hands it back verbatim in hex so a viewing key — never the node — can open
+    /// it. A call made without one, or a transaction that is not a call at all, is `null`.
+    #[tokio::test]
+    async fn get_call_envelope_serves_the_sealed_transcript_of_a_call() {
+        let (_d, st, pid, sealed, bare) = receipt_chain().await;
+        // The deploy `receipt_chain` committed alongside `sealed` and `bare`, at index 0 of the
+        // same block — a transaction that is not a call at all.
+        let deploy = st.storage.block_by_height(1).unwrap().unwrap().transactions[0].clone();
+        let h_in: Word8 = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let envelope = randprotocol_core::types::CallEnvelope {
+            kem_ct: vec![0xab; 1088],
+            to_sender: vec![0xcd; 60],
+            to_auditor: vec![0xef; 60],
+            body: vec![0x12; 96],
+        };
+
         let v = ok(&st, "rand_getCallEnvelope", json!([sealed.hash().to_hex()])).await;
         assert_eq!(v["tx"], sealed.hash().to_hex());
         // The associated data the four parts below are bound to: without it nothing opens.
@@ -2048,6 +2111,45 @@ mod tests {
         for h in [bare.hash(), deploy.hash(), Hash::ZERO] {
             assert_eq!(ok(&st, "rand_getCallEnvelope", json!([h.to_hex()])).await, Value::Null, "{h}");
         }
+    }
+
+    /// A program's receipts, height then index, paged the way `rand_getCompactBlocks` pages
+    /// blocks: an unbounded or oversized `limit` is clamped, an empty range is an empty page,
+    /// and `next_height` is the height to resume from.
+    #[tokio::test]
+    async fn get_receipts_pages_one_program_by_height_and_index() {
+        let (_d, st, pid, sealed, bare) = receipt_chain().await;
+        let v = ok(&st, "rand_getReceipts", json!([pid.to_hex(), 0, 10])).await;
+        let txs: Vec<&str> = v["receipts"].as_array().unwrap().iter().map(|r| r["tx"].as_str().unwrap()).collect();
+        assert_eq!(txs, vec![sealed.hash().to_hex(), bare.hash().to_hex()]);
+        assert!(v["next_height"].is_null());
+        assert_eq!(v["receipts"][0], ok(&st, "rand_getReceipt", json!([sealed.hash().to_hex()])).await, "one object shape");
+        let v = ok(&st, "rand_getReceipts", json!([pid.to_hex(), 0, 10, 1])).await;
+        assert_eq!(v["receipts"].as_array().unwrap().len(), 1);
+        assert_eq!(v["next_height"], 1);
+        let v = ok(&st, "rand_getReceipts", json!([pid.to_hex(), 2, 10])).await;
+        assert!(v["receipts"].as_array().unwrap().is_empty());
+        let e = call(&st, "rand_getReceipts", json!([pid.to_hex(), 5, 2])).await.err().unwrap();
+        assert_eq!(e.code, -32602);
+        let v = ok(&st, "rand_getReceipts", json!([pid.to_hex(), 0, 10, 100_000])).await;
+        assert!(v["receipts"].as_array().unwrap().len() <= MAX_RECEIPTS_PAGE, "the limit is capped, not refused");
+    }
+
+    /// `rand_getWitness`, folded over several leaves at once: one root, one path per index, and
+    /// an index past the tree is `null` rather than an error.
+    #[tokio::test]
+    async fn get_witnesses_folds_many_paths_from_one_tree() {
+        let gs = genesis_with(1, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)]);
+        let (_d, st) = state_for(&gs);
+        let v = ok(&st, "rand_getWitnesses", json!([[0, 1, 7]])).await;
+        let one = ok(&st, "rand_getWitness", json!([1])).await;
+        assert_eq!(v["root"], one["root"]);
+        assert_eq!(v["witnesses"][1]["path"], one["path"]);
+        assert_eq!(v["witnesses"][1]["index"], 1);
+        assert!(v["witnesses"][2]["path"].is_null(), "past the tree is null, not an error");
+        let too_many: Vec<u64> = (0..33).collect();
+        let e = call(&st, "rand_getWitnesses", json!([too_many])).await.err().unwrap();
+        assert_eq!(e.code, -32602);
     }
 
     /// Phase S2: the register, not the genesis set. A validator that has bonded in but whose
