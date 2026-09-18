@@ -134,6 +134,11 @@ enum Cmd {
         /// Private inputs (u32), in order; never leave this machine.
         #[arg(long = "input")]
         inputs: Vec<u32>,
+        /// Refuse, before proving, unless the program's deploy-time public input is exactly this
+        /// file's words (same forms as `program deploy --public`). A call carries no public words
+        /// of its own: it always proves over the program's.
+        #[arg(long)]
+        expect_public: Option<PathBuf>,
         /// Force a gas tier (10, 12, ..., 20); default: smallest that fits.
         #[arg(long)]
         tier: Option<u8>,
@@ -214,12 +219,20 @@ enum Cmd {
     Bridge,
     /// The outbound burn message with this sequence, for a guardian to sign.
     BridgeMessage { sequence: u64 },
-    /// Minimum fee: `fee bundle`, `fee deploy <words>` or `fee call <tier>`.
+    /// Minimum fee: `fee bundle`, `fee deploy <words> [--public-words M]` or
+    /// `fee call <tier> [--bytes B]`.
     Fee {
         /// bundle | deploy | call
         kind: String,
         /// Program words for `deploy`, the tier for `call`.
         n: Option<u64>,
+        /// `deploy`: public-input words, priced like code words.
+        #[arg(long)]
+        public_words: Option<u64>,
+        /// `call`: the call's proof plus input-envelope bytes; only bytes past the free allowance
+        /// (2 MiB + 18 432) add to the fee.
+        #[arg(long)]
+        bytes: Option<u64>,
     },
     /// Look up a transaction by hash.
     Tx { hash: String },
@@ -239,7 +252,7 @@ enum Cmd {
 enum ProgramCmd {
     /// Assemble a built-in guest program to a JSON file.
     Build {
-        /// fib | memcpy | bubble_sort | balance_check | private_payment
+        /// fib | memcpy | bubble_sort | balance_check | private_payment | public_echo
         #[arg(long)]
         guest: String,
         /// Guest argument(s): fib n, memcpy n, bubble_sort v..., balance_check threshold, private_payment threshold
@@ -251,6 +264,11 @@ enum ProgramCmd {
     /// Deploy a program from a .json ({base_pc, words}) or .bin (raw LE words) file.
     Deploy {
         file: PathBuf,
+        /// Deploy-time public input: a file of whitespace-separated u32 words (decimal or 0x hex),
+        /// or an ELF `.so`, word-encoded as the sBPF guest reads it. The chain stores it with the
+        /// program, and every call proves over it.
+        #[arg(long)]
+        public: Option<PathBuf>,
         /// Prove the paying bundle on an attached NVIDIA GPU.
         #[arg(long)]
         cuda: bool,
@@ -267,6 +285,8 @@ fn build_guest(name: &str, args: &[u32]) -> Result<Program> {
         "bubble_sort" => { need(1)?; guests::bubble_sort(args) }
         "balance_check" => { need(1)?; guests::balance_check(args[0]) }
         "private_payment" => { need(1)?; guests::private_payment(args[0]) }
+        // Reads four public words (deploy it with `--public`): out0 = their sum + public[1].
+        "public_echo" => guests::public_echo(),
         other => anyhow::bail!("unknown guest {other}"),
     })
 }
@@ -627,23 +647,42 @@ async fn main() -> Result<()> {
         Cmd::Program(ProgramCmd::Build { guest, args, out }) => {
             let p = build_guest(&guest, &args)?;
             std::fs::write(&out, codec::program_to_json(&p))?;
-            println!("wrote {} ({} words, program id {})", out.display(), p.words.len(), randprotocol_core::program::program_id(p.base_pc, &p.words));
+            // No public input at build time; `program deploy --public` gives the id one changes it to.
+            println!(
+                "wrote {} ({} words, program id {})",
+                out.display(),
+                p.words.len(),
+                randprotocol_core::program::program_id_with_public(p.base_pc, &p.words, &[])
+            );
         }
-        Cmd::Program(ProgramCmd::Deploy { file, cuda }) => {
+        Cmd::Program(ProgramCmd::Deploy { file, public, cuda }) => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let p = load_program(&file)?;
-            let id = randprotocol_core::program::program_id(p.base_pc, &p.words);
+            let public = public.as_deref().map(wallet::public_file_words).transpose()?.unwrap_or_default();
+            // The id binds the public input too (`program_id_with_public`); without one it is the
+            // plain `program_id`, unchanged.
+            let id = randprotocol_core::program::program_id_with_public(p.base_pc, &p.words, &public);
             // Printed before anything is proved: the program id and `hc` are what `rand program
             // show`/`rand_getProgram` will report back for this same program once it lands, so
             // this is the wallet's confirmation that the file it loaded is the one that will show
             // up on chain — in the same spelling, not `Program::code_hash()`'s byte-swapped one
             // (see `rpc_hc_hex`).
-            println!("program id: {id} ({} words, hc {})", p.words.len(), rpc_hc_hex(&p));
-            // One RPC call, before any proof: `rand_estimateFee` applies this chain's own
-            // `max_program_words` admission (Task 1), so a program over the cap is refused here
-            // rather than after a proof the ledger would then throw away.
-            wallet::deploy_precheck(&rpc, p.words.len()).await?;
-            let action = Action::Deploy { base_pc: p.base_pc, words: p.words.clone(), public: vec![] };
+            if public.is_empty() {
+                println!("program id: {id} ({} words, hc {})", p.words.len(), rpc_hc_hex(&p));
+            } else {
+                println!(
+                    "program id: {id} ({} words, hc {}, public input {} words, digest {})",
+                    p.words.len(),
+                    rpc_hc_hex(&p),
+                    public.len(),
+                    randprotocol_core::notes::word8_to_hex(&hash::public_digest(&public))
+                );
+            }
+            // Before any proof: `rand_getLimits` and `rand_estimateFee` apply this chain's own
+            // `max_program_words` and `max_program_public_words` admission, so a program over
+            // either cap is refused here rather than after a proof the ledger would throw away.
+            wallet::deploy_precheck(&rpc, p.words.len(), public.len()).await?;
+            let action = Action::Deploy { base_pc: p.base_pc, words: p.words.clone(), public };
             let fee = wallet::deploy_fee_default(&action);
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
@@ -662,19 +701,41 @@ async fn main() -> Result<()> {
                 None => println!("unknown program"),
             }
         }
-        Cmd::Call { program, inputs, tier, fee, auditor, no_envelope, print_call_key, cuda } => {
+        Cmd::Call { program, inputs, expect_public, tier, fee, auditor, no_envelope, print_call_key, cuda } => {
             if no_envelope && (auditor.is_some() || print_call_key) {
                 anyhow::bail!("--no-envelope publishes no transcript, so there is no auditor and no call key");
             }
             let auditor = auditor.as_deref().map(parse_address).transpose()?;
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let pid = Hash::from_hex(&program).context("invalid program id")?;
-            let (base_pc, words) = rpc.program_code(&pid).await?.context("program not found on chain")?;
-            let prog = Program { base_pc, words };
+            // The code and the deploy-time public input, checked against the id before proving.
+            let (prog, public) = wallet::load_call_program(&rpc, &pid).await?;
+            if let Some(file) = &expect_public {
+                wallet::check_expected_public(&public, &wallet::public_file_words(file)?)?;
+            }
+            // The caps come from the chain (`rand_getLimits`); an older node gets the old ones.
+            let limits = rpc.limits().await?;
+            let caps = wallet::call_caps(limits.as_ref());
+            if !no_envelope && inputs.len() > caps.max_input_words {
+                anyhow::bail!(
+                    "{} input words is over this chain's call-input cap of {} (from max_call_envelope_bytes {})",
+                    inputs.len(),
+                    caps.max_input_words,
+                    caps.max_envelope_bytes
+                );
+            }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
             let backend = backend_for(cuda)?;
-            eprintln!("proving the call locally ({} inputs stay private)…", inputs.len());
+            if public.is_empty() {
+                eprintln!("proving the call locally ({} inputs stay private)…", inputs.len());
+            } else {
+                eprintln!(
+                    "proving the call locally ({} inputs stay private, over the program's {}-word public input)…",
+                    inputs.len(),
+                    public.len()
+                );
+            }
             let t = std::time::Instant::now();
             // Two provers, one difference: `prove_call` returns the `H_IN` salt as well, which is
             // what the transcript is sealed with. It is CPU-only — every other backend draws that
@@ -682,17 +743,19 @@ async fn main() -> Result<()> {
             // and says so in its own words rather than being quietly downgraded here.
             let (proof, outputs, tier, envelope, call_key) = if no_envelope {
                 let (proof, outputs, tier) =
-                    executor::prove(profile, &prog, &inputs, &[], tier, backend).map_err(|e| anyhow::anyhow!(e))?;
+                    executor::prove(profile, &prog, &inputs, &public, tier, backend).map_err(|e| anyhow::anyhow!(e))?;
                 (proof, outputs, tier, None, None)
             } else {
                 let (proof, outputs, tier, salt) =
-                    executor::prove_call(profile, &prog, &inputs, &[], tier, backend, call_envelope::FALLBACK_MAX_CALL_INPUT_WORDS).map_err(|e| anyhow::anyhow!(e))?;
+                    executor::prove_call(profile, &prog, &inputs, &public, tier, backend, caps.max_input_words).map_err(|e| anyhow::anyhow!(e))?;
                 let h_in = hash::input_digest(salt, &inputs);
-                let (e, key) = call_envelope::seal_call_envelope(&w.vk, auditor.as_ref(), &h_in, salt, &inputs, call_envelope::CallCaps::FALLBACK)
+                let (e, key) = call_envelope::seal_call_envelope(&w.vk, auditor.as_ref(), &h_in, salt, &inputs, caps)
                     .map_err(|e| anyhow::anyhow!(e))?;
                 (proof, outputs, tier, Some(e), Some(key))
             };
             eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {outputs:?}", t.elapsed(), proof.len());
+            // Before the paying bundle is proved: a proof over the chain's cap would be refused.
+            wallet::check_proof_size(proof.len(), wallet::proof_cap(limits.as_ref()))?;
             // The fee's byte term counts the proof and the envelope (spec §7); a call under the
             // free allowance, every call a default chain admits, pays the tier's fee alone.
             let bytes = gas::call_bytes(&proof, envelope.as_ref());
@@ -920,11 +983,25 @@ async fn main() -> Result<()> {
                 None => println!("no receipt (not a call, or not yet committed)"),
             }
         }
-        Cmd::Fee { kind, n } => {
+        Cmd::Fee { kind, n, public_words, bytes } => {
+            if public_words.is_some() && kind != "deploy" {
+                anyhow::bail!("--public-words is for `fee deploy`");
+            }
+            if bytes.is_some() && kind != "call" {
+                anyhow::bail!("--bytes is for `fee call`");
+            }
+            // The optional fields are sent only when given, so an older node is asked exactly
+            // what it always was.
             let spec = match (kind.as_str(), n) {
                 ("bundle", _) => serde_json::json!({ "kind": "bundle" }),
-                ("deploy", Some(words)) => serde_json::json!({ "kind": "deploy", "words": words }),
-                ("call", Some(tier)) => serde_json::json!({ "kind": "call", "tier": tier }),
+                ("deploy", Some(words)) => match public_words {
+                    Some(m) => serde_json::json!({ "kind": "deploy", "words": words, "public_words": m }),
+                    None => serde_json::json!({ "kind": "deploy", "words": words }),
+                },
+                ("call", Some(tier)) => match bytes {
+                    Some(b) => serde_json::json!({ "kind": "call", "tier": tier, "bytes": b }),
+                    None => serde_json::json!({ "kind": "call", "tier": tier }),
+                },
                 ("deploy", None) => anyhow::bail!("`fee deploy` needs a word count"),
                 ("call", None) => anyhow::bail!("`fee call` needs a tier"),
                 (other, _) => anyhow::bail!("unknown fee kind {other}; expected bundle, deploy or call"),

@@ -22,6 +22,52 @@ use std::time::{Duration, Instant};
 
 pub mod wallet;
 
+/// A node's JSON-RPC error reply. It prints as it always has, `"<message> (rpc <code>)"`, and
+/// keeps its code, so a caller can tell an older node (no such method, [`METHOD_NOT_FOUND`]) from
+/// every other failure: `err.downcast_ref::<RpcError>()`, or [`is_method_not_found`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpcError {
+    pub code: i64,
+    pub message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (rpc {})", self.message, self.code)
+    }
+}
+
+impl std::error::Error for RpcError {}
+
+/// JSON-RPC's "method not found": what a node too old to know a method answers.
+pub const METHOD_NOT_FOUND: i64 = -32601;
+
+/// True when `e` is a node saying it has no such method — the one error a wallet falls back on.
+pub fn is_method_not_found(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RpcError>().is_some_and(|r| r.code == METHOD_NOT_FOUND)
+}
+
+/// `rand_getLimits`: the chain's five genesis limits, which a wallet derives its caps from
+/// instead of hard-coding them (spec §6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct ChainLimits {
+    pub max_program_words: usize,
+    pub max_proof_bytes: usize,
+    pub max_block_bytes: usize,
+    pub max_call_envelope_bytes: usize,
+    pub max_program_public_words: usize,
+}
+
+/// Words from `rand_getProgramPublic`'s one hex string: each word as its four little-endian bytes,
+/// so eight hex digits a word; `""` is no words.
+pub fn words_from_le_hex(s: &str) -> Result<Vec<u32>> {
+    let bytes = hex::decode(s).context("the public input is not hex")?;
+    if bytes.len() % 4 != 0 {
+        return Err(anyhow!("the public input is {} bytes, not whole words", bytes.len()));
+    }
+    Ok(bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes"))).collect())
+}
+
 /// One leaf of the commitment tree as `rand_getCommitments` reports it: the leaf index, the
 /// commitment, the envelope published with it, and the block it landed in.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,9 +216,9 @@ impl RpcClient {
             .await
             .context("decoding rpc response")?;
         if let Some(err) = resp.get("error") {
-            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            let message = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown").to_string();
             let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-            return Err(anyhow!("{msg} (rpc {code})"));
+            return Err(RpcError { code, message }.into());
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -242,7 +288,7 @@ impl RpcClient {
         loop {
             let status = match self.transaction_status(std::slice::from_ref(hash)).await {
                 Ok(s) => s,
-                Err(e) if e.to_string().contains("(rpc -32601)") => {
+                Err(e) if is_method_not_found(&e) => {
                     self.legacy_status.store(true, Ordering::Relaxed);
                     return self.wait_for_transaction_legacy(hash, timeout).await;
                 }
@@ -315,6 +361,32 @@ impl RpcClient {
         Ok(Some((base_pc, words)))
     }
 
+    /// A program's deploy-time public input (`rand_getProgramPublic`): its words, empty for a
+    /// program deployed without one, `None` for an unknown program. A node that predates the
+    /// method predates public inputs too, so every program it holds has none.
+    pub async fn program_public(&self, id: &ProgramId) -> Result<Option<Vec<u32>>> {
+        let v = match self.call("rand_getProgramPublic", json!([id.to_hex()])).await {
+            Ok(v) => v,
+            Err(e) if is_method_not_found(&e) => return Ok(Some(Vec::new())),
+            Err(e) => return Err(e),
+        };
+        if v.is_null() {
+            return Ok(None);
+        }
+        let hex = v.as_str().context("rand_getProgramPublic did not return a hex string")?;
+        words_from_le_hex(hex).map(Some)
+    }
+
+    /// The chain's limits (`rand_getLimits`), or `None` from a node that predates the method —
+    /// the one case a wallet falls back to the old fixed caps for. Any other failure is an error.
+    pub async fn limits(&self) -> Result<Option<ChainLimits>> {
+        match self.call("rand_getLimits", json!([])).await {
+            Ok(v) => Ok(Some(serde_json::from_value(v).context("decoding rand_getLimits")?)),
+            Err(e) if is_method_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn receipt(&self, tx: &Hash) -> Result<Option<Value>> {
         let v = self.call("rand_getReceipt", json!([tx.to_hex()])).await?;
         Ok(if v.is_null() { None } else { Some(v) })
@@ -335,7 +407,8 @@ impl RpcClient {
     }
 
     /// The fee floor for one action, in units. `params` is the node's `rand_estimateFee`
-    /// object — `{"kind":"bundle"}`, `{"kind":"deploy","words":n}` or `{"kind":"call","tier":t}`.
+    /// object — `{"kind":"bundle"}`, `{"kind":"deploy","words":n,"public_words":m}` or
+    /// `{"kind":"call","tier":t,"bytes":b}` (`public_words` and `bytes` optional).
     pub async fn estimate_fee(&self, params: Value) -> Result<u64> {
         let v = self.call("rand_estimateFee", json!([params])).await?;
         v.as_str().unwrap_or("0").parse().context("fee")
@@ -542,6 +615,79 @@ pub fn hex32(s: &str) -> Result<[u8; 32]> {
     bytes.try_into().map_err(|v: Vec<u8>| anyhow!("expected 32 bytes, got {}", v.len()))
 }
 
+/// A scripted JSON-RPC node for the unit tests here and in [`wallet`]: every connection gets one
+/// reply, chosen by the request's `method` from `script` (a `result` value, or an `error` with
+/// its code), and a method the script does not name gets `-32601`, as a real node answers an
+/// unknown method. It answers with `connection: close`, so each call is a fresh connection.
+#[cfg(test)]
+pub(crate) mod test_rpc {
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    pub enum Reply {
+        Ok(Value),
+        Err(i64, &'static str),
+    }
+
+    pub async fn scripted_rpc(script: Vec<(&'static str, Reply)>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let script = std::sync::Arc::new(script);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let script = script.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 16 * 1024];
+                    let header_end = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+                    let len: usize = headers
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|r| r.split("\r\n").next())
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() - header_end < len {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let req: Value = serde_json::from_slice(&buf[header_end..]).unwrap_or(Value::Null);
+                    let method = req["method"].as_str().unwrap_or_default().to_string();
+                    let body = match script.iter().find(|(m, _)| *m == method) {
+                        Some((_, Reply::Ok(v))) => json!({ "jsonrpc": "2.0", "id": 1, "result": v }),
+                        Some((_, Reply::Err(code, msg))) => {
+                            json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": msg } })
+                        }
+                        None => json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32601, "message": format!("unknown method {method}") } }),
+                    }
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +862,74 @@ mod tests {
 
         assert!(err.to_string().contains("rejected: bad mint signature"), "{err}");
         assert!(waited < timeout, "should fail fast, not wait out the timeout: {waited:?}");
+    }
+
+    // ---------------------------------------------------- the call limits (Task 5)
+
+    /// `rand_getProgramPublic`'s one hex string: each word as its four little-endian bytes, the
+    /// example in `docs/rpc.md`; `""` is the empty public input.
+    #[test]
+    fn public_words_decode_from_little_endian_hex() {
+        assert_eq!(words_from_le_hex("0100000002000000efbeadde").unwrap(), vec![1, 2, 0xdead_beef]);
+        assert_eq!(words_from_le_hex("").unwrap(), Vec::<u32>::new());
+        assert!(words_from_le_hex("010000").unwrap_err().to_string().contains("whole words"));
+        assert!(words_from_le_hex("zz000000").is_err());
+    }
+
+    /// An error reply keeps its code, so a caller can tell "this node has no such method" (an older
+    /// node) from every other failure, and the message still reads as it always did.
+    #[tokio::test]
+    async fn an_rpc_error_keeps_its_code() {
+        use test_rpc::{scripted_rpc, Reply};
+        let url = scripted_rpc(vec![("rand_estimateFee", Reply::Err(-32602, "words must be at most 4096"))]).await;
+        let rpc = RpcClient::new(url);
+        let e = rpc.call("rand_estimateFee", json!([])).await.unwrap_err();
+        assert_eq!(e.to_string(), "words must be at most 4096 (rpc -32602)");
+        assert_eq!(e.downcast_ref::<RpcError>().map(|e| e.code), Some(-32602));
+        assert!(!is_method_not_found(&e));
+        let e = rpc.call("rand_nope", json!([])).await.unwrap_err();
+        assert!(is_method_not_found(&e), "{e}");
+    }
+
+    /// `rand_getLimits`, decoded; `None` from a node that predates it, and an error for anything
+    /// else going wrong (never a silent fallback on a real failure).
+    #[tokio::test]
+    async fn limits_are_read_or_absent_on_an_older_node() {
+        use test_rpc::{scripted_rpc, Reply};
+        let reply = json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64
+        });
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(reply))]).await);
+        assert_eq!(
+            rpc.limits().await.unwrap(),
+            Some(ChainLimits {
+                max_program_words: 4096,
+                max_proof_bytes: 2_097_152,
+                max_block_bytes: 4_194_304,
+                max_call_envelope_bytes: 18_432,
+                max_program_public_words: 64,
+            })
+        );
+        let older = RpcClient::new(scripted_rpc(vec![]).await);
+        assert_eq!(older.limits().await.unwrap(), None);
+        let broken = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Err(-32603, "db closed"))]).await);
+        assert!(broken.limits().await.is_err());
+    }
+
+    /// `rand_getProgramPublic`: words for a program with a public input, none for one without,
+    /// `None` for an unknown program — and an older node without the method has no public inputs.
+    #[tokio::test]
+    async fn a_programs_public_input_is_read_back_as_words() {
+        use test_rpc::{scripted_rpc, Reply};
+        let id = Hash([3; 32]);
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getProgramPublic", Reply::Ok(json!("0100000002000000")))]).await);
+        assert_eq!(rpc.program_public(&id).await.unwrap(), Some(vec![1, 2]));
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getProgramPublic", Reply::Ok(json!("")))]).await);
+        assert_eq!(rpc.program_public(&id).await.unwrap(), Some(vec![]));
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getProgramPublic", Reply::Ok(Value::Null))]).await);
+        assert_eq!(rpc.program_public(&id).await.unwrap(), None);
+        let older = RpcClient::new(scripted_rpc(vec![]).await);
+        assert_eq!(older.program_public(&id).await.unwrap(), Some(vec![]));
     }
 }

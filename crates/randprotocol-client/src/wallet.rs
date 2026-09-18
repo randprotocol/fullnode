@@ -11,7 +11,7 @@
 //! the process is exactly what a bundle publishes: an anchor, two nullifiers, two commitments,
 //! the fee, and two envelopes nobody but their recipients can open.
 
-use crate::{AssetRow, CommitmentRow, RpcClient};
+use crate::{AssetRow, ChainLimits, CommitmentRow, RpcClient};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -1182,16 +1182,146 @@ pub async fn submit_burn(
     })
 }
 
-/// The one fact a deploy needs from the chain before any proving: whether `words` words fits this
-/// chain's program cap (`max_program_words`, a genesis parameter — Task 1). `rand_estimateFee`
-/// applies the same check the ledger's own `Action::Deploy` admission does, so a program over the
-/// cap is refused here, for the price of one RPC call, rather than after a proof — minutes on a
-/// laptop for a `deploy` transaction the chain would then throw away. The node's own reply already
-/// names the cap (`rand_estimateFee`'s `"words must be at most N (this chain's program cap)"` in
-/// `randprotocol-node/src/rpc.rs`), so it is passed through rather than restated here. Returns the
-/// fee estimate when the program is within the cap.
-pub async fn deploy_precheck(rpc: &RpcClient, words: usize) -> Result<u64> {
-    rpc.estimate_fee(serde_json::json!({ "kind": "deploy", "words": words })).await
+/// The facts a deploy needs from the chain before any proving: whether `words` code words fit this
+/// chain's program cap (`max_program_words`, a genesis parameter — Task 1), and whether
+/// `public_words` public-input words fit its public-input cap (`max_program_public_words`).
+///
+/// A public input is checked against `rand_getLimits` first, so the refusal names the cap; a node
+/// without that method predates public inputs, and a deploy carrying one is refused outright.
+/// Then `rand_estimateFee` applies the same checks the ledger's own `Action::Deploy` admission
+/// does, so a program over either cap is refused here, for the price of an RPC call or two,
+/// rather than after a proof — minutes on a laptop for a `deploy` the chain would then throw away.
+/// The node's own reply names the code cap (`"words must be at most N (this chain's program
+/// cap)"`), so it is passed through. Without a public input the node is asked exactly what it
+/// always was, so an older node still answers. Returns the fee estimate.
+pub async fn deploy_precheck(rpc: &RpcClient, words: usize, public_words: usize) -> Result<u64> {
+    if public_words == 0 {
+        return rpc.estimate_fee(serde_json::json!({ "kind": "deploy", "words": words })).await;
+    }
+    let limits = rpc.limits().await?.ok_or_else(|| {
+        anyhow!("this node does not answer rand_getLimits, so it predates deploy-time public inputs; deploy without --public")
+    })?;
+    let cap = limits.max_program_public_words;
+    if cap == 0 {
+        return Err(anyhow!(
+            "this chain admits no public input (max_program_public_words is 0); deploy without --public"
+        ));
+    }
+    if public_words > cap {
+        return Err(anyhow!(
+            "a public input of {public_words} words is over this chain's cap of {cap} (max_program_public_words)"
+        ));
+    }
+    rpc.estimate_fee(serde_json::json!({ "kind": "deploy", "words": words, "public_words": public_words })).await
+}
+
+/// `--public <file>` for `rand program deploy`, as the words the program's public input will be.
+///
+/// Two forms. An ELF (`\x7fELF` magic, or a `.so` name, which must then be an ELF) is
+/// word-encoded by [`elf_public_words`], as the sBPF guest reads its program. Anything else is
+/// text: u32 words separated by whitespace, each decimal or `0x` hex.
+pub fn public_file_words(path: &Path) -> Result<Vec<u32>> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let is_so = path.extension().and_then(|e| e.to_str()) == Some("so");
+    if bytes.starts_with(b"\x7fELF") {
+        return Ok(elf_public_words(&bytes));
+    }
+    if is_so {
+        return Err(anyhow!("{} is named .so but is not an ELF (no \\x7fELF magic)", path.display()));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{} is neither an ELF nor text of u32 words", path.display()))?;
+    let words = text
+        .split_whitespace()
+        .map(|t| {
+            let parsed = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                Some(h) => u32::from_str_radix(h, 16),
+                None => t.parse::<u32>(),
+            };
+            parsed.map_err(|_| anyhow!("{}: {t:?} is not a u32 word", path.display()))
+        })
+        .collect::<Result<Vec<u32>>>()?;
+    if words.is_empty() {
+        return Err(anyhow!("{} has no words; a public input has at least one", path.display()));
+    }
+    Ok(words)
+}
+
+/// An ELF as public-input words, exactly as research's `SbpfCall::public_words` encodes it (the
+/// vendored `randprotocol_zkvm::sbpf`, reused here rather than restated): the byte length, then
+/// the bytes four per word, little-endian, the last word zero-padded.
+pub fn elf_public_words(elf: &[u8]) -> Vec<u32> {
+    randprotocol_zkvm::sbpf::SbpfCall { elf: elf.to_vec(), input: Vec::new() }.public_words()
+}
+
+/// The envelope caps a call is proved and sealed within: derived from the chain's
+/// `max_call_envelope_bytes` (`CallCaps::for_envelope_bytes`: less the envelope's fixed overhead,
+/// over four), or the old 4 096 words under the default byte cap when the node does not report
+/// its limits.
+pub fn call_caps(limits: Option<&ChainLimits>) -> randprotocol_zkvm::call_envelope::CallCaps {
+    use randprotocol_zkvm::call_envelope::CallCaps;
+    limits.map_or(CallCaps::FALLBACK, |l| CallCaps::for_envelope_bytes(l.max_call_envelope_bytes))
+}
+
+/// The largest call proof the chain admits: its `max_proof_bytes`, or the default 2 MiB from a
+/// node that does not report its limits.
+pub fn proof_cap(limits: Option<&ChainLimits>) -> usize {
+    limits.map_or(gas::MAX_PROOF_BYTES, |l| l.max_proof_bytes)
+}
+
+/// The proof-size pre-check `rand call` makes after proving and before the paying bundle is
+/// proved: a proof the chain refuses by size would cost that second proof for nothing.
+pub fn check_proof_size(proof_bytes: usize, cap: usize) -> Result<()> {
+    if proof_bytes > cap {
+        return Err(anyhow!(
+            "the call proof is {proof_bytes} bytes, over this chain's {cap}-byte cap (max_proof_bytes); \
+             it would be refused, so nothing was submitted"
+        ));
+    }
+    Ok(())
+}
+
+/// What `rand call` proves over: the program's code and its deploy-time public input
+/// (`rand_getProgramCode`, `rand_getProgramPublic`), checked locally against the program id asked
+/// for. The id commits to both (`program_id_with_public`), so a node serving any other code or
+/// public input is caught here, before a proof the chain would refuse.
+pub async fn load_call_program(
+    rpc: &RpcClient,
+    id: &randprotocol_core::program::ProgramId,
+) -> Result<(randprotocol_zkvm::isa::Program, Vec<u32>)> {
+    let (base_pc, words) = rpc.program_code(id).await?.context("program not found on chain")?;
+    let public = rpc.program_public(id).await?.context("program not found on chain")?;
+    let served = randprotocol_core::program::program_id_with_public(base_pc, &words, &public);
+    if served != *id {
+        return Err(anyhow!(
+            "the node served code ({} words) and a public input ({} words) that do not hash to program {id} \
+             (they hash to {served}); not proving against them",
+            words.len(),
+            public.len()
+        ));
+    }
+    Ok((randprotocol_zkvm::isa::Program { base_pc, words }, public))
+}
+
+/// `rand call --expect-public <file>`: the caller's own copy of the public input it means to run
+/// against, compared with the program's before anything is proved. A call carries no public words
+/// of its own (spec §6) — this only refuses early.
+pub fn check_expected_public(on_chain: &[u32], expected: &[u32]) -> Result<()> {
+    if on_chain.len() != expected.len() {
+        return Err(anyhow!(
+            "the program's public input is {} words and --expect-public has {}; not proving",
+            on_chain.len(),
+            expected.len()
+        ));
+    }
+    if let Some(i) = on_chain.iter().zip(expected).position(|(a, b)| a != b) {
+        return Err(anyhow!(
+            "the program's public input differs from --expect-public at word {i} ({} on chain, {} expected); not proving",
+            on_chain[i],
+            expected[i]
+        ));
+    }
+    Ok(())
 }
 
 /// What a `deploy` pays by default: the bundle base plus the program's per-word charge, which
@@ -2006,7 +2136,7 @@ mod tests {
         let reply = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"words must be at most 4096 (this chain's program cap)"}}"#;
         let url = one_shot_rpc(reply).await;
         let rpc = RpcClient::new(url);
-        let err = deploy_precheck(&rpc, 5000).await.expect_err("refused").to_string();
+        let err = deploy_precheck(&rpc, 5000, 0).await.expect_err("refused").to_string();
         assert!(err.contains("at most 4096"), "{err}");
         assert!(err.contains("program cap"), "{err}");
     }
@@ -2017,7 +2147,7 @@ mod tests {
         let reply = r#"{"jsonrpc":"2.0","id":1,"result":"1000000"}"#;
         let url = one_shot_rpc(reply).await;
         let rpc = RpcClient::new(url);
-        assert_eq!(deploy_precheck(&rpc, 100).await.unwrap(), 1_000_000);
+        assert_eq!(deploy_precheck(&rpc, 100, 0).await.unwrap(), 1_000_000);
     }
 
     #[test]
@@ -2185,4 +2315,160 @@ mod tests {
         assert_eq!((rows[0].output, rows[0].slot, rows[0].role, rows[0].key), ("mint", 0, KeyRole::Received, k));
     }
 
+
+    // ---------------------------------------------------- the call limits (Task 5)
+
+    fn limits(max_call_envelope_bytes: usize, max_proof_bytes: usize) -> ChainLimits {
+        ChainLimits {
+            max_program_words: 4096,
+            max_proof_bytes,
+            max_block_bytes: 4 << 20,
+            max_call_envelope_bytes,
+            max_program_public_words: 64,
+        }
+    }
+
+    /// The input cap comes from the chain's envelope cap, less the envelope's fixed overhead, over
+    /// four; a node without `rand_getLimits` gets the old 4 096 words under the default byte cap.
+    #[test]
+    fn the_call_caps_derive_from_the_chains_limits_and_fall_back_to_4096_words() {
+        use randprotocol_zkvm::call_envelope::{CallCaps, ENVELOPE_FIXED_BYTES};
+        assert_eq!(call_caps(None), CallCaps { max_input_words: 4096, max_envelope_bytes: 18_432 });
+        assert_eq!(call_caps(Some(&limits(18_432, 2 << 20))), CallCaps { max_input_words: 4295, max_envelope_bytes: 18_432 });
+        let raised = call_caps(Some(&limits(65_536, 8 << 20)));
+        assert_eq!(raised, CallCaps { max_input_words: (65_536 - ENVELOPE_FIXED_BYTES) / 4, max_envelope_bytes: 65_536 });
+        assert_eq!(raised.max_input_words, 16_071, "chain 13's 65 536-byte envelope admits SPL's 10 458 private words");
+
+        assert_eq!(proof_cap(None), gas::MAX_PROOF_BYTES);
+        assert_eq!(proof_cap(Some(&limits(18_432, 8 << 20))), 8 << 20);
+    }
+
+    /// The proof-size pre-check, at the boundary: exactly the cap is fine, one byte over is refused
+    /// with both numbers named — before the bundle that would pay for it is proved.
+    #[test]
+    fn a_proof_over_the_chains_cap_is_refused_before_submitting() {
+        check_proof_size(2 << 20, 2 << 20).expect("exactly at the cap");
+        let e = check_proof_size((2 << 20) + 1, 2 << 20).unwrap_err().to_string();
+        assert!(e.contains("2097153") && e.contains("2097152") && e.contains("max_proof_bytes"), "{e}");
+    }
+
+    /// `--public <file>` as words: whitespace-separated u32s, decimal or `0x` hex, any layout.
+    #[test]
+    fn a_public_file_of_words_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("public.txt");
+        std::fs::write(&p, "1 2\n0x10\t4294967295\n").unwrap();
+        assert_eq!(public_file_words(&p).unwrap(), vec![1, 2, 16, u32::MAX]);
+        std::fs::write(&p, "1 two").unwrap();
+        assert!(public_file_words(&p).unwrap_err().to_string().contains("two"));
+        std::fs::write(&p, "4294967296").unwrap();
+        assert!(public_file_words(&p).is_err(), "over u32");
+        std::fs::write(&p, " \n").unwrap();
+        assert!(public_file_words(&p).unwrap_err().to_string().contains("no words"));
+        assert!(public_file_words(&dir.path().join("missing")).is_err());
+    }
+
+    /// `--public <file.so>`: the ELF is word-encoded exactly as research's
+    /// `SbpfCall::public_words` does — its byte length, then its bytes four per word,
+    /// little-endian, zero-padded. The committed SPL Token ELF is 108 600 bytes, so 27 151 words.
+    #[test]
+    fn a_public_elf_is_word_encoded_as_the_sbpf_guest_reads_it() {
+        use randprotocol_zkvm::sbpf::{SbpfCall, SPL_TOKEN_ELF};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("spl_token.so");
+        std::fs::write(&p, SPL_TOKEN_ELF).unwrap();
+        let words = public_file_words(&p).unwrap();
+        assert_eq!(words.len(), 27_151);
+        assert_eq!(&words[..8], &[108_600, 1_179_403_647, 65_794, 0, 0, 17_235_971, 1, 2_088]);
+        assert_eq!(words, SbpfCall { elf: SPL_TOKEN_ELF.to_vec(), input: vec![] }.public_words());
+        // The ELF magic decides, not only the extension.
+        let bare = dir.path().join("program");
+        std::fs::write(&bare, SPL_TOKEN_ELF).unwrap();
+        assert_eq!(public_file_words(&bare).unwrap(), words);
+        // A zero-padded tail: 5 bytes are the length and two words.
+        assert_eq!(elf_public_words(&[0x7f, b'E', b'L', b'F', 9]), vec![5, 0x464c_457f, 9]);
+        // A `.so` that is not an ELF is an error, not a text file of words.
+        let fake = dir.path().join("fake.so");
+        std::fs::write(&fake, "1 2 3").unwrap();
+        assert!(public_file_words(&fake).unwrap_err().to_string().contains("ELF"));
+    }
+
+    /// The deploy pre-check with a public input: over this chain's cap it is refused from
+    /// `rand_getLimits` before any proof, and a node without `rand_getLimits` predates public
+    /// inputs altogether. Within the cap the fee estimate names the public words.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deploys_public_input_is_checked_against_the_chains_cap() {
+        use crate::test_rpc::{scripted_rpc, Reply};
+        let limits = serde_json::json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64
+        });
+        let rpc = RpcClient::new(
+            scripted_rpc(vec![("rand_getLimits", Reply::Ok(limits.clone())), ("rand_estimateFee", Reply::Ok(serde_json::json!("7400000")))])
+                .await,
+        );
+        assert_eq!(deploy_precheck(&rpc, 10, 64).await.unwrap(), 7_400_000);
+        let e = deploy_precheck(&rpc, 10, 65).await.unwrap_err().to_string();
+        assert!(e.contains("65") && e.contains("64") && e.contains("max_program_public_words"), "{e}");
+
+        let mut closed = limits.clone();
+        closed["max_program_public_words"] = serde_json::json!(0);
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(closed))]).await);
+        let e = deploy_precheck(&rpc, 10, 1).await.unwrap_err().to_string();
+        assert!(e.contains("admits no public input"), "{e}");
+
+        let older = RpcClient::new(scripted_rpc(vec![("rand_estimateFee", Reply::Ok(serde_json::json!("2000000")))]).await);
+        let e = deploy_precheck(&older, 10, 1).await.unwrap_err().to_string();
+        assert!(e.contains("rand_getLimits"), "{e}");
+        // Without a public input an older node is asked exactly what it always was.
+        assert_eq!(deploy_precheck(&older, 10, 0).await.unwrap(), 2_000_000);
+    }
+
+    /// What a call proves over is what the chain holds, checked locally: the code and the public
+    /// input the node serves must hash to the program id asked for. A node that serves a
+    /// different public input would otherwise cost a whole proof the chain then refuses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_proves_over_the_public_input_the_program_id_commits_to() {
+        use crate::test_rpc::{scripted_rpc, Reply};
+        use randprotocol_core::program::program_id_with_public;
+        let (base_pc, words, public) = (0u32, vec![0x13u32, 0x73], vec![1u32, 2, 3, 4]);
+        let id = program_id_with_public(base_pc, &words, &public);
+        let code = serde_json::json!({ "base_pc": base_pc, "words": words });
+        let hex = |p: &[u32]| hex::encode(p.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>());
+        let node = |public: &[u32]| {
+            vec![("rand_getProgramCode", Reply::Ok(code.clone())), ("rand_getProgramPublic", Reply::Ok(serde_json::json!(hex(public))))]
+        };
+
+        let rpc = RpcClient::new(scripted_rpc(node(&public)).await);
+        let (prog, got) = load_call_program(&rpc, &id).await.unwrap();
+        assert_eq!((prog.base_pc, prog.words, got), (base_pc, words.clone(), public.clone()));
+
+        let lying = RpcClient::new(scripted_rpc(node(&[1, 2, 3, 5])).await);
+        let e = load_call_program(&lying, &id).await.unwrap_err().to_string();
+        assert!(e.contains("do not hash to"), "{e}");
+        let dropped = RpcClient::new(scripted_rpc(node(&[])).await);
+        assert!(load_call_program(&dropped, &id).await.is_err(), "a public input the node forgets is caught too");
+
+        // A plain program: no public input, and the old id rule.
+        let plain = randprotocol_core::program::program_id(base_pc, &words);
+        let rpc = RpcClient::new(scripted_rpc(node(&[])).await);
+        assert_eq!(load_call_program(&rpc, &plain).await.unwrap().1, Vec::<u32>::new());
+        // An unknown program is an error, not an empty public input.
+        let none = RpcClient::new(
+            scripted_rpc(vec![("rand_getProgramCode", Reply::Ok(serde_json::Value::Null)), ("rand_getProgramPublic", Reply::Ok(serde_json::Value::Null))])
+                .await,
+        );
+        assert!(load_call_program(&none, &id).await.unwrap_err().to_string().contains("not found"));
+    }
+
+    /// `rand call --expect-public`: a caller who knows which public input it means to run against
+    /// is refused before proving when the program on chain carries another one.
+    #[test]
+    fn an_expected_public_input_that_differs_is_refused_before_proving() {
+        check_expected_public(&[1, 2, 3, 4], &[1, 2, 3, 4]).expect("the same words");
+        let e = check_expected_public(&[1, 2, 3, 4], &[1, 2, 3, 5]).unwrap_err().to_string();
+        assert!(e.contains("word 3"), "{e}");
+        let e = check_expected_public(&[1, 2, 3, 4], &[1, 2, 3]).unwrap_err().to_string();
+        assert!(e.contains("4 words") && e.contains("3"), "{e}");
+    }
 }

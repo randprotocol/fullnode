@@ -53,6 +53,12 @@ fn init_tracing() {
 }
 
 fn genesis(validator: &Keypair) -> Genesis {
+    genesis_with(validator, None, None)
+}
+
+/// The same chain, with the two program caps the public-input test sets (the genesis CLI's
+/// `--max-program-words` and `--max-program-public-words`).
+fn genesis_with(validator: &Keypair, max_program_words: Option<u32>, max_program_public_words: Option<u32>) -> Genesis {
     Genesis {
         chain_id: CHAIN_ID,
         timestamp_ms: 0,
@@ -76,16 +82,20 @@ fn genesis(validator: &Keypair) -> Genesis {
         bridge: None,
         aggregation: None,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
-        max_program_words: None,
+        max_program_words,
         max_proof_bytes: None,
         max_block_bytes: None,
         max_call_envelope_bytes: None,
-        max_program_public_words: None,
+        max_program_public_words,
     }
 }
 
 async fn start(dir: &tempfile::TempDir, key: &Keypair) -> NodeHandle {
-    std::fs::write(dir.path().join("genesis.json"), genesis(key).to_json()).unwrap();
+    start_with(dir, key, genesis(key)).await
+}
+
+async fn start_with(dir: &tempfile::TempDir, key: &Keypair, genesis: Genesis) -> NodeHandle {
+    std::fs::write(dir.path().join("genesis.json"), genesis.to_json()).unwrap();
     node::start(NodeConfig {
         datadir: dir.path().to_path_buf(),
         seed: *key.seed(),
@@ -266,6 +276,104 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     assert!(call_envelope::open_call_as_auditor(&e, &h_in, &b.vk).is_none(), "and this call named no auditor");
 
     eprintln!("whole flow in {:.1?}", started.elapsed());
+    handle.shutdown().await;
+}
+
+/// A program deployed with a public input (spec §5, §6), end to end on a test-profile chain whose
+/// genesis admits 64 public words: `--public` on deploy, a call proved over the public input the
+/// wallet fetched back, a receipt carrying `h_pub`, and a call proved against any other public
+/// input refused — by the wallet before proving, and by the chain if it is proved anyway.
+///
+/// `public_echo` sums its four public words and adds `public[1]` again, so the output shows the
+/// guest really read the deploy-time words.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
+    use randprotocol_core::program::program_id_with_public;
+    use randprotocol_zkvm::call_envelope::CallCaps;
+
+    init_tracing();
+    let started = Instant::now();
+    let dir = tempfile::tempdir().unwrap();
+    let key = Keypair::from_seed([102; 32]).unwrap();
+    let handle = start_with(&dir, &key, genesis_with(&key, Some(4096), Some(64))).await;
+    let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
+    let a = Wallet::from_spend_key(SpendKey([4; 8]));
+    let mut store = NoteStore::default();
+    let hash = rpc.mint_shielded(&a.address.to_string(), Some(100 * UNITS_PER_RAND)).await.expect("mint accepted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
+
+    // ---- the chain's limits, as the wallet reads them ----
+    let limits = rpc.limits().await.unwrap().expect("this node reports its limits");
+    assert_eq!((limits.max_program_words, limits.max_program_public_words), (4096, 64));
+    let caps = wallet::call_caps(Some(&limits));
+    assert_eq!(caps, CallCaps { max_input_words: 4295, max_envelope_bytes: 18_432 });
+
+    // ---- deploy with --public ----
+    let public_file = dir.path().join("public.txt");
+    std::fs::write(&public_file, "1 2 3 4\n").unwrap();
+    let public = wallet::public_file_words(&public_file).unwrap();
+    assert_eq!(public, vec![1, 2, 3, 4]);
+    let prog = guests::public_echo();
+    // Over the chain's 64-word cap: refused by the pre-check, before any proof.
+    let e = wallet::deploy_precheck(&rpc, prog.words.len(), 65).await.unwrap_err().to_string();
+    assert!(e.contains("max_program_public_words"), "{e}");
+    let estimate = wallet::deploy_precheck(&rpc, prog.words.len(), public.len()).await.expect("within the caps");
+    let deploy = Action::Deploy { base_pc: prog.base_pc, words: prog.words.clone(), public: public.clone() };
+    let fee = wallet::deploy_fee_default(&deploy);
+    assert_eq!(fee, estimate, "the node prices the public words as the wallet does");
+    assert_eq!(fee, gas::BUNDLE_BASE + gas::deploy_fee(prog.words.len() + public.len()));
+    let pid = program_id_with_public(prog.base_pc, &prog.words, &public);
+    let slot = proving_slot().await;
+    wallet::submit(&rpc, &a, &mut store, None, deploy, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the program deploys with its public input");
+    drop(slot);
+    let shown = rpc.program(&pid).await.unwrap().expect("the program is on chain under its public-input id");
+    assert_eq!(shown["public_words_len"], 4);
+    let digest = word8_to_hex(&hash::public_digest(&public));
+    assert_eq!(shown["public_digest"], serde_json::json!(digest));
+
+    // ---- call: the wallet fetches the public input back and proves over it ----
+    let (onchain, fetched) = wallet::load_call_program(&rpc, &pid).await.expect("code and public input check out");
+    assert_eq!(fetched, public);
+    assert_eq!((onchain.base_pc, &onchain.words), (prog.base_pc, &prog.words));
+    let inputs = [9u32];
+    let slot = proving_slot().await;
+    let (proof, outputs, tier, salt) =
+        executor::prove_call(FriProfile::Test, &onchain, &inputs, &fetched, None, Backend::Cpu, caps.max_input_words)
+            .expect("the call proves");
+    assert_eq!(outputs[0], 1 + 2 + 3 + 4 + 2, "the guest read the deploy-time words");
+    wallet::check_proof_size(proof.len(), wallet::proof_cap(Some(&limits))).expect("inside the proof cap");
+    let h_in = hash::input_digest(salt, &inputs);
+    let (envelope, _) = call_envelope::seal_call_envelope(&a.vk, None, &h_in, salt, &inputs, caps).expect("seals");
+    let fee = wallet::call_fee_default(tier, gas::call_bytes(&proof, Some(&envelope)));
+    let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
+    let call = wallet::submit(&rpc, &a, &mut store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the call is accepted and commits");
+    drop(slot);
+    let receipt = rpc.wait_for_receipt(&call.hash, Duration::from_secs(120)).await.expect("the call has a receipt");
+    assert_eq!(receipt["h_pub"], serde_json::json!(digest), "the receipt carries the program's H_PUB");
+    assert_eq!(receipt["outputs"], serde_json::json!(outputs));
+
+    // ---- a mismatched public input is refused ----
+    let other = [1u32, 2, 3, 5];
+    // By the wallet, before proving, when the caller says which public input it expects.
+    let e = wallet::check_expected_public(&fetched, &other).unwrap_err().to_string();
+    assert!(e.contains("word 3"), "{e}");
+    // And by the chain, when a proof over it is made anyway: its H_PUB is not the program's.
+    let slot = proving_slot().await;
+    let (proof, _, _, _) =
+        executor::prove_call(FriProfile::Test, &onchain, &inputs, &other, None, Backend::Cpu, caps.max_input_words)
+            .expect("a proof over another public input still proves");
+    let fee = wallet::call_fee_default(tier, gas::call_bytes(&proof, None));
+    let action = Action::Call { program: pid, proof, input_envelope: None };
+    let refused = wallet::submit(&rpc, &a, &mut store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true).await;
+    drop(slot);
+    let e = refused.expect_err("the chain refuses a call proved over another public input").to_string();
+    assert!(e.contains("PublicValues"), "{e}");
+
+    eprintln!("public-input flow in {:.1?}", started.elapsed());
     handle.shutdown().await;
 }
 
