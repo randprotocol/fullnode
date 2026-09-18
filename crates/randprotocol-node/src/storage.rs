@@ -36,6 +36,10 @@ const CF_SEALS: &str = "seals";
 const CF_META: &str = "meta";
 const CF_PROGRAMS: &str = "programs";
 const CF_RECEIPTS: &str = "receipts";
+/// Receipts by program: `program (32) || height (8 BE) || index (4 BE)` -> the transaction hash.
+/// Serves `rand_getReceipts`; built from `receipts` on first open (`META_RECEIPTS_INDEX_BUILT`).
+const CF_RECEIPTS_BY_PROGRAM: &str = "receipts_by_program";
+const META_RECEIPTS_INDEX_BUILT: &str = "receipts_by_program_built";
 /// Leaf index (big-endian u64, so the family iterates in tree order) -> `bincode(NoteRow)`.
 /// Dense from zero: `notes_count` is the last key plus one, and a wallet pages it to scan.
 const CF_NOTES: &str = "notes";
@@ -59,7 +63,7 @@ const CF_BRIDGE_SPENT: &str = "bridge_spent";
 /// Burn sequence (big-endian u64) -> `bincode(BridgeBurnRecord)`: the outbound messages
 /// guardians read back, oldest first.
 const CF_BRIDGE_BURNS: &str = "bridge_burns";
-const ALL_CFS: [&str; 15] = [
+const ALL_CFS: [&str; 16] = [
     CF_BLOCKS,
     CF_QCS,
     CF_BLOCK_INDEX,
@@ -68,6 +72,7 @@ const ALL_CFS: [&str; 15] = [
     CF_META,
     CF_PROGRAMS,
     CF_RECEIPTS,
+    CF_RECEIPTS_BY_PROGRAM,
     CF_NOTES,
     CF_NULLIFIERS,
     CF_ANCHORS,
@@ -205,6 +210,17 @@ fn height_key(h: u64) -> [u8; 8] {
     h.to_be_bytes()
 }
 
+/// `CF_RECEIPTS_BY_PROGRAM`'s key: `program || height (BE) || index (BE)`. Big-endian height
+/// and index put a program's receipts in call order under the iterator, which is what
+/// `receipts_for_program` and the backfill both rely on.
+fn receipt_index_key(program: &ProgramId, height: u64, index: u32) -> [u8; 44] {
+    let mut k = [0u8; 44];
+    k[..32].copy_from_slice(program.as_bytes());
+    k[32..40].copy_from_slice(&height.to_be_bytes());
+    k[40..].copy_from_slice(&index.to_be_bytes());
+    k
+}
+
 fn be_u64(bytes: &[u8], what: &str) -> Result<u64> {
     let arr: [u8; 8] = bytes
         .try_into()
@@ -317,7 +333,9 @@ impl Storage {
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()));
         let db = DB::open_cf_descriptors(&opts, &db_path, cfs)?;
-        Ok(Storage { db })
+        let storage = Storage { db };
+        storage.backfill_receipts_index()?;
+        Ok(storage)
     }
 
     fn cf(&self, name: &str) -> &rocksdb::ColumnFamily {
@@ -996,6 +1014,65 @@ impl Storage {
         self.get(CF_RECEIPTS, tx.as_bytes())
     }
 
+    pub fn receipts_index_built(&self) -> Result<bool> {
+        Ok(self.get_meta_raw(META_RECEIPTS_INDEX_BUILT)?.is_some())
+    }
+
+    /// Builds `receipts_by_program` from `receipts` once. The marker, not the family's
+    /// emptiness, is the guard, so a node killed mid-backfill finishes on its next open.
+    fn backfill_receipts_index(&self) -> Result<()> {
+        if self.receipts_index_built()? {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        let mut n = 0u64;
+        for item in self.db.iterator_cf(self.cf(CF_RECEIPTS), IteratorMode::Start) {
+            let (_, v) = item?;
+            let r: CallReceipt = bincode::deserialize(&v)?;
+            batch.put_cf(self.cf(CF_RECEIPTS_BY_PROGRAM), receipt_index_key(&r.program, r.height, r.index), r.tx.as_bytes());
+            n += 1;
+            if n % 1_000 == 0 {
+                self.db.write(std::mem::take(&mut batch))?;
+            }
+        }
+        batch.put_cf(self.cf(CF_META), META_RECEIPTS_INDEX_BUILT.as_bytes(), [1u8]);
+        self.db.write(batch)?;
+        if n > 0 {
+            tracing::info!("built the receipts-by-program index from {n} receipts");
+        }
+        Ok(())
+    }
+
+    /// Receipts a program's calls produced, height then index, from `from` up to and including
+    /// `to`, at most `limit` of them. The second return is `None` when the page reached `to` or
+    /// ran out of receipts, and otherwise the height of the first receipt that did not fit — a
+    /// page boundary inside one height re-serves that height's earlier receipts, so a caller
+    /// resuming from it de-duplicates by `tx`.
+    pub fn receipts_for_program(&self, program: &ProgramId, from: u64, to: u64, limit: usize) -> Result<(Vec<CallReceipt>, Option<u64>)> {
+        let start = receipt_index_key(program, from, 0);
+        let mut out = Vec::new();
+        let mut next = None;
+        for item in self.db.iterator_cf(self.cf(CF_RECEIPTS_BY_PROGRAM), IteratorMode::From(&start, rocksdb::Direction::Forward)) {
+            let (k, v) = item?;
+            if k.len() != 44 || &k[..32] != program.as_bytes() {
+                break;
+            }
+            let height = u64::from_be_bytes(k[32..40].try_into().unwrap());
+            if height > to {
+                break;
+            }
+            if out.len() >= limit {
+                next = Some(height);
+                break;
+            }
+            let tx = Hash(v[..].try_into().map_err(|_| StorageError::Corrupt("receipt index value".into()))?);
+            if let Some(r) = self.receipt(&tx)? {
+                out.push(r);
+            }
+        }
+        Ok((out, next))
+    }
+
     /// Rebuild the in-memory ledger from the note, nullifier, anchor, validator and program
     /// families plus the stored frontier.
     ///
@@ -1255,6 +1332,7 @@ impl Storage {
                     )));
                 }
                 batch.put_cf(self.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(r)?);
+                batch.put_cf(self.cf(CF_RECEIPTS_BY_PROGRAM), receipt_index_key(&r.program, r.height, r.index), r.tx.as_bytes());
             }
             touched.insert(block.proposer());
             for tx in &block.transactions {
@@ -1693,6 +1771,9 @@ impl Storage {
             let keep = bincode::deserialize::<CallReceipt>(&v).map(|r| r.height <= height).unwrap_or(false);
             if !keep {
                 batch.delete_cf(self.cf(CF_RECEIPTS), k);
+                if let Ok(r) = bincode::deserialize::<CallReceipt>(&v) {
+                    batch.delete_cf(self.cf(CF_RECEIPTS_BY_PROGRAM), receipt_index_key(&r.program, r.height, r.index));
+                }
             }
         }
         // Epoch sets above the epoch the new head is in describe blocks this chain no longer
@@ -1994,6 +2075,12 @@ pub(crate) mod fixtures {
         let dir = tempfile::tempdir().unwrap();
         let s = Storage::open(dir.path()).unwrap();
         (dir, s, gs)
+    }
+
+    /// [`genesis_with_two_notes`]'s genesis alone, for a test that opens its own database more
+    /// than once and so cannot reuse that fixture's tempdir.
+    pub(crate) fn genesis_with_two_notes_state() -> GenesisState {
+        genesis_with(1, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)])
     }
 
     /// A bundle whose stub proof publishes exactly the digest the ledger recomputes, anchored to
@@ -3062,6 +3149,60 @@ mod tests {
         st.truncate_to(&gs, 2, &at_two).unwrap();
         assert!(st.program(&pid).unwrap().is_none());
         assert_eq!(st.load_ledger(&StubExecutor).unwrap(), at_two);
+    }
+
+    #[test]
+    fn receipts_by_program_index_round_trips_pages_and_truncates() {
+        let (_d, st, gs, blocks) = chain_fixture(2);
+        let k = key(1);
+        let mut ledger = st.load_ledger(&StubExecutor).unwrap();
+        ledger.set_faucet(true);
+        ledger.set_height(3);
+        // Two programs, three calls at height 3 (index order 1, 2 for pid_a; 3 for pid_b).
+        // Build receipts by hand: the index only needs (program, height, index, tx).
+        let pid_a = randprotocol_core::program::program_id(0, &[0x13u32; 3]);
+        let pid_b = randprotocol_core::program::program_id(0, &[0x14u32; 3]);
+        let mut cb3 = make_block(&blocks[1].block, &mut ledger, vec![], &k);
+        let rec = |pid, index, tx: u8| randprotocol_core::program::CallReceipt {
+            tx: Hash([tx; 32]), program: pid, tier: 1, outputs: [0; 8], height: 3, index, h_in: [0; 8],
+            input_envelope: None,
+        };
+        cb3.receipts = vec![rec(pid_a, 1, 1), rec(pid_a, 2, 2), rec(pid_b, 3, 3)];
+        st.commit(std::slice::from_ref(&cb3), &ledger, &[], &StubExecutor).unwrap();
+
+        let (page, next) = st.receipts_for_program(&pid_a, 0, 10, 10).unwrap();
+        assert_eq!(page.iter().map(|r| r.index).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(next, None);
+        let (page, next) = st.receipts_for_program(&pid_a, 0, 10, 1).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(next, Some(3), "the truncated page resumes at the height it stopped in");
+        let (page, _) = st.receipts_for_program(&pid_b, 4, 10, 10).unwrap();
+        assert!(page.is_empty(), "from above the receipt's height");
+        // Truncating below height 3 drops the index rows with the receipts.
+        let at_two = { let mut l = gs.ledger.clone(); for cb in &blocks { l.apply_block(&cb.block, &StubExecutor).unwrap(); } l };
+        st.truncate_to(&gs, 2, &at_two).unwrap();
+        assert!(st.receipts_for_program(&pid_a, 0, 10, 10).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn receipts_index_is_backfilled_once_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let gs = genesis_with_two_notes_state();
+        let pid = randprotocol_core::program::program_id(0, &[0x13u32; 3]);
+        {
+            let st = Storage::open(dir.path()).unwrap();
+            st.init_genesis(&gs).unwrap();
+            // Write a receipt straight into the receipts family, as a pre-v0.4 node would have.
+            let r = randprotocol_core::program::CallReceipt {
+                tx: Hash([9; 32]), program: pid, tier: 1, outputs: [0; 8], height: 1, index: 0, h_in: [0; 8],
+                input_envelope: None,
+            };
+            st.db.put_cf(st.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(&r).unwrap()).unwrap();
+            st.db.delete_cf(st.cf(CF_META), META_RECEIPTS_INDEX_BUILT.as_bytes()).unwrap();
+        }
+        let st = Storage::open(dir.path()).unwrap();
+        assert!(st.receipts_index_built().unwrap());
+        assert_eq!(st.receipts_for_program(&pid, 0, 5, 10).unwrap().0.len(), 1);
     }
 
     #[test]
