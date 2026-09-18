@@ -182,3 +182,52 @@ fn a_program_with_a_public_input_is_warmed() {
     ex.verify_call(&rec, &proof.to_bytes()).unwrap();
     assert_eq!(ex.cached_keys(), warmed, "the call's key was already warm");
 }
+
+/// Canonical proof decoding (final review): `postcard::from_bytes` ignores trailing bytes and
+/// accepts overlong varints, so the executor re-encodes and compares. An honest proof passes; the
+/// same proof with one trailing byte, or with its leading `tier` varint re-encoded overlong,
+/// decodes to the same `Proof` and is still refused, as `MalformedProof`.
+#[test]
+fn a_call_proof_must_be_canonically_encoded() {
+    let p = guests::private_payment(1000);
+    let (proof, outputs, _) = shared();
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let rec = record(&p);
+    assert_eq!(ex.verify_call(&rec, proof).unwrap().outputs, *outputs, "the honest encoding passes");
+    assert!(randprotocol_zkvm::executor::decode_canonical(proof).is_ok());
+
+    let mut trailing = proof.clone();
+    trailing.push(0);
+    assert!(postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(&trailing).is_ok(), "postcard alone accepts it");
+    assert_eq!(ex.verify_call(&rec, &trailing), Err(ConfidentialError::MalformedProof));
+
+    // `Proof.tier` is the first field, a `usize` varint; an honest tier is < 128, one byte.
+    assert!(proof[0] < 0x80);
+    let mut overlong = vec![proof[0] | 0x80, 0x00];
+    overlong.extend_from_slice(&proof[1..]);
+    let decoded = postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(&overlong).expect("postcard alone accepts it");
+    assert_eq!(decoded.to_bytes(), *proof, "the same proof, differently encoded");
+    assert_eq!(ex.verify_call(&rec, &overlong), Err(ConfidentialError::MalformedProof));
+}
+
+/// The early reject (final review): a call whose declared public-table height is not the one the
+/// record's `public_len` implies is refused as `PublicValues` before `Machine::verify`, so it builds
+/// no verifier key.
+#[test]
+fn a_call_with_the_wrong_public_height_is_refused_before_verify() {
+    use randprotocol_zkvm::machine::Machine;
+    use randprotocol_zkvm::tables::public::public_log_height;
+    let public = [11u32, 22, 33, 44];
+    let f = guests::fib(10);
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let with = ProgramRecord { public_digest: Some(ex.public_digest(&public)), public_len: public.len() as u32, ..record(&f) };
+    assert_ne!(public_log_height(0), public_log_height(public.len()), "the test needs two height classes");
+    let (empty, _) = Machine::new(FriProfile::Test).prove(&f, &[], &[], None).unwrap();
+    assert_eq!(empty.public_log_height, public_log_height(0));
+    let before = ex.cached_keys();
+    assert_eq!(
+        ex.verify_call(&with, &empty.to_bytes()),
+        Err(ConfidentialError::InvalidProof("PublicValues".into()))
+    );
+    assert_eq!(ex.cached_keys(), before, "no verifier key was built for the refused call");
+}

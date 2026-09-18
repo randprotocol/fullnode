@@ -10,7 +10,7 @@
 //! inlines into `hash.rs` still equal the vendored `notes::domain` ones, and that a bundle proof
 //! this crate produces is one `ZkExecutor` — the chain-side verifier — accepts.
 
-use randprotocol_core::confidential::ConfidentialExecutor;
+use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor};
 use randprotocol_core::notes::{CommitmentTree, FullTree, Word8, DEPTH};
 use randprotocol_zkvm::address::{address_of, digest_input_of, seal_note};
 use randprotocol_zkvm::executor::{prove_bundle, ZkExecutor};
@@ -142,6 +142,12 @@ fn a_bundle_proves_and_the_executor_verifies_it() {
     assert_eq!(ex.bundle_proof_digest(&proof).unwrap(), digest);
     ex.verify_bundle(&ZkExecutor::hc_bundle(), &proof).unwrap();
     assert!(ex.verify_bundle(&[1u32; 8], &proof).is_err());
+    // Canonical decoding (final review): the same proof with one trailing byte decodes to the same
+    // `Proof` under plain postcard, and is refused by both bundle entry points.
+    let mut trailing = proof.clone();
+    trailing.push(0);
+    assert_eq!(ex.bundle_proof_digest(&trailing), Err(ConfidentialError::MalformedProof));
+    assert_eq!(ex.verify_bundle(&ZkExecutor::hc_bundle(), &trailing), Err(ConfidentialError::MalformedProof));
     let e = seal_note(&vk, &me, &out1, &TxKey::random()).unwrap();
     assert!(e.len() <= randprotocol_core::notes::MAX_ENVELOPE_BYTES);
 }

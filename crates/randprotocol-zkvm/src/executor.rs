@@ -146,7 +146,7 @@ impl ZkExecutor {
         input_log_height: u8,
         exact: bool,
     ) -> Result<Proof, ConfidentialError> {
-        let proof: Proof = postcard::from_bytes(proof).map_err(|_| ConfidentialError::MalformedProof)?;
+        let proof = decode_canonical(proof)?;
         check_declared_heights(
             proof.tier,
             proof.program_log_height,
@@ -228,6 +228,25 @@ impl ZkExecutor {
             input::input_log_height(crate::notes::bundle_input::COUNT),
         )
     }
+}
+
+/// Decode a proof and refuse it unless its bytes are the *canonical* postcard encoding of what
+/// they decode to — `decode(bytes).to_bytes() == bytes`. `postcard::from_bytes` alone ignores
+/// trailing bytes and accepts overlong varints, so without this a proof could be padded (riding
+/// free under a byte-priced fee, since the fee is charged on the bytes the chain stores) or
+/// re-encoded into a different transaction id for the same statement. Every proof the chain
+/// decodes — fee bundle, burn bundle and call, all through `decode_and_check` — passes here
+/// first; a non-canonical one is the same `MalformedProof` as an undecodable one. The re-encode
+/// costs a linear pass over bytes that are about to be verified anyway.
+///
+/// A consensus tightening: a chain-12 block holding a non-canonical proof would be refused by
+/// this build, which is one more reason the build is chain-13-only (CHANGELOG, v0.4).
+pub fn decode_canonical(bytes: &[u8]) -> Result<Proof, ConfidentialError> {
+    let proof: Proof = postcard::from_bytes(bytes).map_err(|_| ConfidentialError::MalformedProof)?;
+    if proof.to_bytes() != bytes {
+        return Err(ConfidentialError::MalformedProof);
+    }
+    Ok(proof)
 }
 
 impl ConfidentialExecutor for ZkExecutor {
@@ -322,6 +341,16 @@ impl ConfidentialExecutor for ZkExecutor {
         // `verify`. A call's program and input heights are ranged, not exact: the chain knows
         // neither the program's word count (only its `hc`) nor its private-input width.
         let proof = self.decode_and_check(proof, 0, 0, false)?;
+        // A deterministic early reject, before `hc_of` and `Machine::verify`: a call against a
+        // program deployed with a public input must declare exactly the public-table height the
+        // prover derives from that input's length (`Machine::prove` uses
+        // `public_log_height(public.len())`, and the record's `public_len` is that length). Any
+        // other height is a proof over a different public segment, which the `PUB0..7` compare
+        // below would refuse anyway — but only after `verify` had built (and cached, evicting an
+        // honest one) a verifier key for the junk height. Same error as that compare.
+        if proof.public_log_height != public::public_log_height(record.public_len as usize) {
+            return Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
+        }
         let hc = Self::hc_of(record)?;
         // The call limits (spec §5): `verify`, then `pv::PUB0..7` against the public input the
         // program was deployed with — its record's digest, computed once at deploy, so no word is
