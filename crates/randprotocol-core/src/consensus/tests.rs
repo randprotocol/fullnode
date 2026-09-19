@@ -44,7 +44,17 @@ fn setup_epochs(n: u8, validators: u8, epoch_blocks: u64) -> Sim {
     build(n, validators, epoch_blocks, true)
 }
 
+/// A simulation of a chain with a `bridge` section (and the `tokens` section it requires), where
+/// B2's timestamp rules apply: block time is consensus input there.
+fn setup_bridged(n: u8, validators: u8) -> Sim {
+    build_with(n, validators, crate::genesis::EPOCH_BLOCKS_DEFAULT, false, true)
+}
+
 fn build(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool) -> Sim {
+    build_with(n, validators, epoch_blocks, all_signers, false)
+}
+
+fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridged: bool) -> Sim {
     let keys: Vec<Keypair> = (1..=n).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
     let genesis = Genesis {
         chain_id: 1,
@@ -70,8 +80,15 @@ fn build(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool) -> Sim {
         max_block_bytes: None,
         max_call_envelope_bytes: None,
         max_program_public_words: None,
-        bridge: None,
-        tokens: None,
+        bridge: bridged.then(|| crate::bridge::BridgeConfig {
+            emitter: [1; 32],
+            guardians: vec![[2; 20]],
+            emitters: BTreeMap::from([(2u16, [9u8; 32])]),
+        }),
+        tokens: bridged.then(|| crate::genesis::TokensConfig {
+            registration_fee: crate::genesis::MIN_REGISTRATION_FEE,
+            tokens: vec![],
+        }),
         aggregation: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
@@ -266,10 +283,16 @@ fn proposal_of(actions: &[Action]) -> Block {
         .expect("a proposal was broadcast")
 }
 
-/// The shielded chain reads no clock: `time` is bounded in block heights, so a replica votes on
-/// a proposal however far ahead of its own clock the header's timestamp is.
+/// Whether `actions` carry this replica's vote (a broadcast `Vote`).
+fn votes(actions: &[Action]) -> bool {
+    actions.iter().any(|a| matches!(a, Action::Broadcast(ConsensusMessage::Vote(_))))
+}
+
+/// A chain without a bridge reads no clock: `time` is bounded in block heights, so a replica
+/// votes on a proposal however far ahead of its own clock the header's timestamp is — B2's drift
+/// rule is gated on the bridge exactly like the rewind rule, so this chain is unchanged.
 #[test]
-fn a_proposal_far_ahead_of_the_local_clock_is_accepted() {
+fn a_bridgeless_proposal_far_ahead_of_the_local_clock_is_still_voted_for() {
     let mut sim = setup(2, 2);
     sim.now = 1_000_000;
     let (leader, view) = pending_leader(&sim);
@@ -277,7 +300,66 @@ fn a_proposal_far_ahead_of_the_local_clock_is_accepted() {
     let acts = sim.nodes[leader].propose(view, vec![], sim.now + 10_000_000).unwrap();
     let block = proposal_of(&acts);
     assert_eq!(block.header.timestamp_ms, sim.now + 10_000_000);
-    sim.nodes[follower].on_proposal(block, sim.now).expect("a far-future timestamp is not a validity rule");
+    let acts = sim.nodes[follower].on_proposal(block, sim.now).expect("no bridge, no clock rule");
+    assert!(votes(&acts));
+}
+
+/// B2's vote rule (bridge hardening spec §3), inverting the test above for a bridged chain: a
+/// validator does not vote for a block more than `MAX_CLOCK_DRIFT_MS` ahead of its own clock. The
+/// block is still valid — it enters the tree, and a replica replaying committed history accepts
+/// it — the rule only withholds this replica's vote. Exactly `+15 000` still gets the vote.
+#[test]
+fn a_bridged_proposal_far_ahead_of_the_local_clock_gets_no_vote_but_replays() {
+    assert_eq!(MAX_CLOCK_DRIFT_MS, 15_000);
+    // Every `setup_bridged` replica set is identical, so each case gets a fresh one.
+    let fresh = || {
+        let sim = setup_bridged(2, 2);
+        let (leader, view) = pending_leader(&sim);
+        (sim, leader, view)
+    };
+    // Within the step rule (the parent is genesis, at 0), and 30 s ahead of the follower.
+    let (mut sim, leader, view) = fresh();
+    let block = proposal_of(&sim.nodes[leader].propose(view, vec![], 30_000).unwrap());
+    assert_eq!(block.header.timestamp_ms, 30_000);
+
+    let (mut early, leader, _) = fresh();
+    let follower = (leader + 1) % 2;
+    let acts = early.nodes[follower].on_proposal(block.clone(), 30_000 - MAX_CLOCK_DRIFT_MS - 1).expect("a valid block");
+    assert!(!votes(&acts), "a far-future timestamp withholds the vote");
+    assert!(early.nodes[follower].has_block(&block.hash()), "but the block is valid and kept");
+
+    let (mut edge, _, _) = fresh();
+    let acts = edge.nodes[follower].on_proposal(block.clone(), 30_000 - MAX_CLOCK_DRIFT_MS).expect("a valid block");
+    assert!(votes(&acts), "exactly the drift bound still votes");
+
+    // Replay of committed history reads no local clock: the ledger path accepts it.
+    let mut ledger = sim.gs.ledger.clone();
+    ledger.apply_block(&block, &StubExecutor).expect("replay uses only the step rule");
+}
+
+/// A bridged leader's own proposal honours both B2 rules: after a stall its time is clamped to
+/// `parent + MAX_TIMESTAMP_STEP_MS` (so its peers accept it), and a leader whose clock is ahead
+/// of the parent stamps its own clock (never past its own drift bound). The chain then commits.
+#[test]
+fn a_bridged_leader_clamps_its_proposal_to_the_step_and_commits() {
+    let mut sim = setup_bridged(4, 4);
+    let (leader, view) = pending_leader(&sim);
+    // Genesis is at 0 and the leader's clock is a day later: the block may only step 60 s.
+    let now = 86_400_000;
+    let acts = sim.nodes[leader].propose(view, vec![], now).unwrap();
+    let block = proposal_of(&acts);
+    assert_eq!(block.header.timestamp_ms, crate::ledger::MAX_TIMESTAMP_STEP_MS);
+    assert!(votes(&acts), "the leader votes for its own block: it is behind, not ahead, of its clock");
+    sim.handle(leader, acts);
+    sim.now = now;
+    sim.deliver_all();
+    // A leader whose clock is inside the step stamps its own clock.
+    sim.run_to_height(4, 40);
+    sim.assert_consistent();
+    for k in 1..sim.committed[0].len() {
+        let (p, b) = (&sim.committed[0][k - 1].block.header, &sim.committed[0][k].block.header);
+        assert!(b.timestamp_ms >= p.timestamp_ms && b.timestamp_ms <= p.timestamp_ms + crate::ledger::MAX_TIMESTAMP_STEP_MS);
+    }
 }
 
 /// A leader whose clock lags its peers still never emits a block that moves

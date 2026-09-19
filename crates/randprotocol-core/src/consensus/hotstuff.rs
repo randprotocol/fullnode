@@ -497,9 +497,12 @@ impl HotStuff {
         // The shielded chain reads no clock: `time` is bounded in block heights (spec §7
         // item 5), so a block's timestamp constrains nothing a replica must agree on. A
         // proposer still never moves it backwards (see `propose`). The one exception is a
-        // bridged chain, where block time decides guardian-set expiry — `apply_block` below
-        // refuses a rewind there with `BlockError::TimestampRewind`, which reaches this
-        // function's caller as `ConsensusError::Execution` like any other block rule.
+        // bridged chain, where block time decides guardian-set expiry and the mint-cap day —
+        // `apply_block` below refuses a rewind there with `BlockError::TimestampRewind` and a
+        // leap past the parent with `BlockError::TimestampLeap` (B2's step rule), which reach
+        // this function's caller as `ConsensusError::Execution` like any other block rule. B2's
+        // drift rule is a vote rule, applied at `try_vote` below: never a validity rule.
+        let bridged = parent.ledger_after.bridge().is_some();
 
         // Execute on top of the parent's state.
         if self.tree.len() >= self.cfg.max_tree_blocks {
@@ -518,7 +521,13 @@ impl HotStuff {
             self.enter_view(block.view(), &mut out);
         }
         self.update_lock_and_commit(&block, &mut out);
-        self.try_vote(&block, &mut out);
+        // B2's vote rule (bridge hardening spec §3): on a bridged chain, no vote for a block
+        // more than `MAX_CLOCK_DRIFT_MS` ahead of this replica's clock. The block stays in the
+        // tree — it is valid, and a quorum of validators whose clocks agree with it may still
+        // certify it. Replay (`apply_block_for_sync`) never comes through here.
+        if !(bridged && block.header.timestamp_ms > now_ms.saturating_add(super::MAX_CLOCK_DRIFT_MS)) {
+            self.try_vote(&block, &mut out);
+        }
         self.maybe_ready_to_propose(&mut out);
 
         // Children that were waiting for this block.
@@ -682,8 +691,14 @@ impl HotStuff {
             _ => return Err(ConsensusError::NotReady),
         }
         // Block time never moves backwards, whatever this leader's clock says:
-        // a lagging clock would otherwise produce a block its peers reject.
-        let timestamp_ms = now_ms.max(parent.block.header.timestamp_ms);
+        // a lagging clock would otherwise produce a block its peers reject. On a bridged chain
+        // it never steps more than `MAX_TIMESTAMP_STEP_MS` past the parent either (B2): after a
+        // stall the chain's time catches up a step per block instead of leaping.
+        let parent_ms = parent.block.header.timestamp_ms;
+        let mut timestamp_ms = now_ms.max(parent_ms);
+        if parent.ledger_after.bridge().is_some() {
+            timestamp_ms = timestamp_ms.min(parent_ms.saturating_add(crate::ledger::MAX_TIMESTAMP_STEP_MS));
+        }
         let mut ledger = parent.ledger_after.clone();
         ledger.set_height(parent.block.height() + 1);
         // Select against the time this block will carry, so a validator
@@ -750,10 +765,11 @@ impl HotStuff {
         let block = Block::sign(header, txs, signer);
         self.proposed_in_view = true;
         let mut out = vec![Action::Broadcast(ConsensusMessage::Proposal(block.clone()))];
-        // The block may carry the parent's later time rather than this clock's,
-        // so feed its own time as "now": a leader never rejects the proposal it
-        // just built, and `timestamp_ms >= now_ms` makes this no weaker.
-        out.extend(self.on_proposal(block, timestamp_ms)?);
+        // The leader's own clock is "now": its vote on its own block follows B2's drift rule
+        // like any validator's. `timestamp_ms` exceeds `now_ms` only when the parent already
+        // did (monotonicity), so a leader withholds its own vote only when its clock lags the
+        // certified parent by more than the drift bound. `now_ms` is read nowhere else here.
+        out.extend(self.on_proposal(block, now_ms)?);
         Ok(out)
     }
 

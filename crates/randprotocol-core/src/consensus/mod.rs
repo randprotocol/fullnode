@@ -11,6 +11,12 @@ mod tests;
 
 pub use hotstuff::{CoveredSource, HotStuff};
 
+/// B2 (bridge hardening spec §3): on a chain with a bridge, a validator does not vote for a block
+/// whose timestamp runs more than this many milliseconds ahead of its own clock. A vote rule
+/// only — replay of committed history reads no local clock and applies just the step rule
+/// ([`crate::ledger::MAX_TIMESTAMP_STEP_MS`]).
+pub const MAX_CLOCK_DRIFT_MS: u64 = 15_000;
+
 use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
 use crate::types::{Block, QuorumCertificate, ValidatorSet, Vote};
 use serde::{Deserialize, Serialize};

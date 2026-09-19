@@ -259,7 +259,18 @@ pub enum BlockError {
     /// allowed — the rule forbids a rewind, not a repeat (`docs/bridge.md` §3, §8).
     #[error("block timestamp {block} is before its parent's {parent}")]
     TimestampRewind { parent: u64, block: u64 },
+    /// B2 (bridge hardening spec §3): on a chain with a bridge, a block may run at most
+    /// [`MAX_TIMESTAMP_STEP_MS`] past its parent, so a leader cannot jump the clock to expire a
+    /// rotated guardian set's grace window or skip a mint-cap day. A validity rule — replay of
+    /// committed history applies it too — and, like the rewind rule, absent on a bridge-less
+    /// chain.
+    #[error("block timestamp {block} is more than {max_step} ms past its parent's {parent}")]
+    TimestampLeap { parent: u64, block: u64, max_step: u64 },
 }
+
+/// B2: the most a bridged chain's block timestamp may exceed its parent's, in milliseconds (a
+/// validity rule, [`BlockError::TimestampLeap`]).
+pub const MAX_TIMESTAMP_STEP_MS: u64 = 60_000;
 
 /// Receipt data for a call, before it is placed in a block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1494,6 +1505,16 @@ impl Ledger {
         // `max(now_ms, parent.timestamp_ms)`, so no honest leader builds a block this refuses.
         if self.bridge.is_some() && block.header.timestamp_ms < self.timestamp_ms {
             return Err(BlockError::TimestampRewind { parent: self.timestamp_ms, block: block.header.timestamp_ms });
+        }
+        // B2, the forward bound: a leader cannot leap the clock either (to expire a rotated
+        // guardian set's grace window, or skip a mint-cap day). `HotStuff::propose` clamps to
+        // `parent + MAX_TIMESTAMP_STEP_MS`, so no honest leader builds a block this refuses.
+        if self.bridge.is_some() && block.header.timestamp_ms > self.timestamp_ms.saturating_add(MAX_TIMESTAMP_STEP_MS) {
+            return Err(BlockError::TimestampLeap {
+                parent: self.timestamp_ms,
+                block: block.header.timestamp_ms,
+                max_step: MAX_TIMESTAMP_STEP_MS,
+            });
         }
         let mut scratch = self.clone();
         scratch.set_height(block.height());
@@ -2999,6 +3020,50 @@ mod tests {
         plain.set_timestamp_ms(1_000_000);
         plain.apply_block(&empty(&plain, 2, 999_999), &StubExecutor).unwrap();
         assert_eq!(plain.timestamp_ms(), 999_999);
+    }
+
+    /// B2 (bridge hardening spec §3): on a bridged chain a block may run at most
+    /// `MAX_TIMESTAMP_STEP_MS` past its parent — a validity rule, so it binds replay of committed
+    /// history too (`apply_block` is the replay path). Exactly +60 000 is accepted, +60 001 is
+    /// refused and leaves the ledger where it was; a chain without a bridge is unchanged.
+    #[test]
+    fn a_bridged_chain_refuses_a_block_whose_timestamp_leaps_past_the_step() {
+        use crate::bridge::{BridgeConfig, BridgeState};
+
+        let (a, _) = keys();
+        let empty = |l: &Ledger, height: u64, timestamp_ms: u64| {
+            let header = BlockHeader {
+                height,
+                view: height,
+                parent: Hash::ZERO,
+                proposer: a.public_key().clone(),
+                timestamp_ms,
+                tx_root: Block::tx_root(&[]),
+                state_root: root_after(l, &[], &a.address(), height),
+                justify: QuorumCertificate::genesis(Hash::ZERO),
+            };
+            Block::sign(header, Vec::new(), &a)
+        };
+        assert_eq!(MAX_TIMESTAMP_STEP_MS, 60_000);
+
+        let config =
+            BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::from([(2u16, [9u8; 32])]) };
+        let mut l = ledger();
+        l.set_bridge(Some(BridgeState::from_config(&config)));
+        l.set_timestamp_ms(1_000_000);
+
+        assert_eq!(
+            l.apply_block(&empty(&l, 2, 1_060_001), &StubExecutor),
+            Err(BlockError::TimestampLeap { parent: 1_000_000, block: 1_060_001, max_step: 60_000 })
+        );
+        assert_eq!(l.timestamp_ms(), 1_000_000, "a refused block leaves the ledger where it was");
+        l.apply_block(&empty(&l, 2, 1_060_000), &StubExecutor).unwrap();
+        assert_eq!(l.timestamp_ms(), 1_060_000);
+
+        // The same leap on a chain with no bridge is accepted, as it always was.
+        let mut plain = ledger();
+        plain.set_timestamp_ms(1_000_000);
+        plain.apply_block(&empty(&plain, 2, 1_000_000 + 10_000_000), &StubExecutor).unwrap();
     }
 
     #[test]
