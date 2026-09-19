@@ -294,6 +294,57 @@ In `bridge_notes.rs` tests: a deposit raises `total_supply` by the gross amount;
 
 ---
 
+### Task 3b: one bridged token, many backings (zUSD)
+
+Spec amendment (user, 2026-09-19): spec §12 — read it first.
+
+**Files:**
+- Modify: `crates/randprotocol-core/src/ledger/tokens.rs` (`MintAuthority::Bridge`, `TokenRegistry`)
+- Modify: `crates/randprotocol-core/src/genesis.rs` (`GenesisToken`, the commitment twin, validation)
+- Modify: `crates/randprotocol-core/src/bridge/state.rs`, `ledger/bridge_notes.rs`, `types/transaction.rs` (`BridgeBurn.token`)
+- Modify callers: `crates/randprotocol-node/src/{rpc,storage,mempool}.rs`, `crates/randprotocol-client/src/{wallet,main}.rs`
+
+**Interfaces — produces:**
+
+```rust
+pub const MAX_BACKINGS: usize = 32;
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Backing { pub chain: u16, pub token: [u8; 32], pub locked: u64 }
+pub enum MintAuthority { None, Key(PublicKey), Bridge { backings: Vec<Backing> }, Program(ProgramId) }
+
+impl TokenRegistry {
+    /// (chain, token) → index; many-to-one; a pair backs at most one token in the whole registry.
+    pub fn bridged(&self, chain: u16, token: &[u8; 32]) -> Option<&TokenInfo>;
+    pub fn backing(&self, index: u32, chain: u16, token: &[u8; 32]) -> Option<&Backing>;
+    pub fn add_backing(&mut self, index: u32, chain: u16, token: [u8; 32]) -> Result<(), TokenError>;
+    /// Deposit: locked += amount and total_supply += amount, both checked, atomically.
+    pub fn lock(&mut self, index: u32, chain: u16, token: &[u8; 32], amount: u64) -> Result<(), TokenError>;
+    /// Redemption: refuses amount > locked (InsufficientBacking); locked -= amount, total_supply -= amount.
+    pub fn release(&mut self, index: u32, chain: u16, token: &[u8; 32], amount: u64) -> Result<(), TokenError>;
+    /// total_supply == Σ locked for every Bridge token. Cheap; asserted in tests and debug builds at block close.
+    pub fn backing_invariant_holds(&self) -> bool;
+}
+// TokenError += NotABacking { index: u32, chain: u16 }, InsufficientBacking { locked: u64, amount: u64 },
+//               BackingTaken { chain: u16 }, TooManyBackings, NoBackings
+// Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, token: [u8; 32], to }
+// genesis: GenesisToken { name, symbol, salt: [u8;32] (hex), backings: Vec<GenesisBacking { chain, token (hex) }> }
+```
+
+A bridged token's asset id is `native_asset_id`-style over its registration fields (name, symbol, 8, salt) under domain `rand-rpl-asset` — NOT `bridge::asset_id(chain, token)`, which stays as the per-backing wire id `rand_bridgeAssetId` computes. Backings are not part of the id (they grow).
+
+Rules: 1..=32 backings; a `(chain, token)` pair unique across the registry (`BackingTaken`); `chain` must have a registered emitter in the genesis bridge section (genesis validation: `BadTokens`); `check_attest` resolves the attested `(token_chain, token_address)` through `bridged()` → `UnlistedToken` on a miss, and validates `lock` would not overflow; `check_burn` requires `(to_chain, token)` be a backing of `asset` (`NotABacking`), `amount <= locked` (`InsufficientBacking`), and builds the outbound burn message from that backing's chain/token. Refusals happen in validate so apply stays infallible. The token leaf (`rand-token-leaf-1`, bincode of `TokenInfo`) now commits every `locked`.
+
+RPC shapes kept: `rand_getAssets` / `rand_getBridgeState.assets` = one row per backing `{asset: per-backing id, chain, token, index, locked}`. `tx_json`'s `bridge_burn` gains `token`.
+Client: `rand bridge-burn` gains `--token <hex>`; `submit_burn` pre-checks the backing's `locked` from `rand_getAssets` before any proving: *"only {locked} is locked in that coin on chain {to_chain}; choose another backing or a smaller amount"*.
+
+**Tests (write first):** a deposit of backing A and of backing B mint the same index and both raise supply; `backing_invariant_holds` after a mixed sequence of deposits and burns; a burn into B greater than B's locked is `InsufficientBacking` even though total supply covers it, and the same amount into A succeeds; a burn naming a pair that backs nothing, or another token, is `NotABacking`; a second token listing an already-taken pair is `BackingTaken`; 0 and 33 backings refused; genesis with one zUSD and seven backings (USDT, USDC × chains 2, 3, 5; USDT on chain 4) builds, `get(1).symbol == "zUSD"`, decimals 8; the genesis commitment moves when one backing byte changes; the state root moves when `locked` moves; a chain without `tokens` is untouched (chain-13 pin test stays green); the outbound burn record carries the chosen backing's chain and token; wallet pre-check error text.
+
+**Gates:** `cargo test -p randprotocol-core --lib`, `cargo test -p bridge-codec`, `cargo check --workspace --tests`, `cargo test -p randprotocol-node --lib`, `cargo test -p randprotocol-client --lib` (known unrelated failures: ~21 node aggregation tests needing RECURSION_FIXTURES; `the_genesis_hash_is_pinned`). No proving suites.
+
+**Commit:** `tokens: one bridged token, many backings — zUSD's backing set, per-backing locked, a burn names its coin, InsufficientBacking`.
+
+---
+
 ### Task 4: `RegisterToken`, `TokenMint`, `SetAuthority`
 
 **Files:**
@@ -470,7 +521,9 @@ CLI: `rand token approve --asset --delegate ADDR --amount` (= `send_token` to `W
 
 ---
 
-### Task 10: Listing a bridged token after genesis
+### Task 10: Listing a bridged token, or adding a backing, after genesis
+
+> Amended by spec §12: payload 3 is `AddBacking { asset_index, chain, token }` for an existing bridged token, and `RegisterToken` carries the new token's first backing. Apply the rules below to both.
 
 **Files:** `crates/bridge-codec/src/payload.rs` (:138 `Payload`), `bridge/state.rs` (`check_attest`'s governance arm, `AttestPlan`, `AttestOutcome`), `ledger/bridge_notes.rs` (apply), `docs/bridge.md`. **Check first** whether main's bridge-codec has moved (another session had uncommitted edits there): `git log main -- crates/bridge-codec` and rebase if so.
 

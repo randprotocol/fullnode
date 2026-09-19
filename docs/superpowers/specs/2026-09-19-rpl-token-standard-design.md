@@ -1,7 +1,8 @@
 # RPL: the RandProtocol token standard
 
 Status: approved by the user 2026-09-19 (design section by section, then this document). Target: chain 14
-and v0.5 (the bridge). First two registrations: zUSDT and zUSDC.
+and v0.5 (the bridge). First bridged registration: **zUSD** (amended 2026-09-19, §12 — it supersedes every
+mention of separate zUSDT and zUSDC below, and of one `(chain, token)` pair per bridged token).
 
 ## 1. Problem
 
@@ -226,3 +227,36 @@ Branch `rpl`, worktree `/tmp/fullnode-rpl`, merged by rebase and fast-forward.
 - **Attributable allowances**: an owner-signed ticket checked in the circuit, with an on-chain
   spend counter; enforceable expiry, at the cost of linkable spends.
 - Fees payable in a token; freeze and compliance controls for natively issued regulated tokens.
+
+## 12. Amendment (user, 2026-09-19): one zUSD, many backings
+
+Decision: instead of zUSDT and zUSDC, one bridged RPL token **zUSD**. Invariant, in the user's words:
+total USDT + USDC locked on Tron, BNB Chain, Solana and Ethereum = total zUSD on RandProtocol.
+The user accepted the depeg-contagion and drain risk "for now": no Rand-side per-backing share cap (the source endpoints already have a pauser, per-token rate caps
+and a 10 bps release fee). Per-backing locked accounting stays — it is what makes the invariant checkable and what
+keeps a burn from succeeding on Rand and failing to release on the source chain.
+
+Spec changes:
+- §2 decision 1: first registration is zUSD (one token), not zUSDT/zUSDC.
+- §3 MintAuthority::Bridge { backings: Vec<Backing> }, Backing { chain: u16, token: [u8;32], locked: u64 }.
+  1..=32 backings, (chain, token) unique across the whole registry (a many-to-one map
+  (chain, token) → index). Asset id of a bridged token = blake3("rand-rpl-asset", name ‖ symbol ‖ salt)
+  style (registration fields), no longer blake3("rand-bridge-asset", chain‖token); the whitepaper's
+  asset_z needs a note. rand_bridgeAssetId keeps computing the old per-(chain,token) value for wire use.
+- Invariant (consensus, asserted in tests and cheap to check): total_supply == Σ backings.locked.
+- §4 BridgeAttest: resolves (token_chain, token_address) → (index, backing); locked += amount, supply += amount.
+  BridgeBurn gains `token: [u8; 32]`: (to_chain, token) must be a backing of `asset`, else
+  BridgeError::NotABacking; amount > backing.locked → BridgeError::InsufficientBacking { locked, amount };
+  locked -= amount, supply -= amount. The outbound burn message names that backing's chain/token.
+- §5 genesis: GenesisToken { name, symbol, backings: Vec<{chain, token}> }; chain 14 lists one zUSD with
+  SEVEN backings (USDT, USDC × Ethereum 2, BSC 3, Solana 5; USDT only on Tron 4 — Tron USDC is discontinued). Governance payload 3 (Task 10)
+  becomes AddBacking { asset_index, chain, token } (plus RegisterToken with its first backing).
+- §6 RPC: token row's authority = {"kind":"bridge","backings":[{"chain","token","locked"}]};
+  rand_getAssets rows = one per backing (asset = old per-backing id, index = zUSD's index).
+- Wallet: `rand bridge-burn` takes --token (or --coin usdt|usdc resolved through the backings of the
+  destination chain) and pre-checks the backing's locked amount before proving.
+- §11 future work gains: per-backing caps and a source-chain deposit pause (declined for now).
+
+Plan change: new Task 3b after Task 3 (core + node + client callers), Task 2's GenesisToken shape
+changes inside 3b, Task 10 re-scoped to AddBacking.
+
