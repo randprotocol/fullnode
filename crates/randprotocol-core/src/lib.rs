@@ -10,6 +10,7 @@ pub mod genesis;
 pub mod ledger;
 pub mod notes;
 pub mod program;
+pub mod token_id;
 pub mod types;
 
 pub use crypto::{Address, Hash, Keypair, PublicKey, Signature};
