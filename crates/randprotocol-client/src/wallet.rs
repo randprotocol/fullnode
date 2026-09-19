@@ -1076,25 +1076,32 @@ pub async fn submit(
     })
 }
 
-/// The two facts about the chain a burn needs before any proving: the chain has a bridge at all, and
-/// the asset index it names is one the registry holds.
+/// The three facts about the chain a burn needs before any proving: the chain has a bridge at
+/// all, the asset index it names is one the registry holds, and the coin it asks to redeem —
+/// `(to_chain, token)` — backs that asset and is holding at least `amount`.
 ///
-/// Neither is something a wallet can know locally — both are state — and getting either wrong costs
-/// *two* bundle proofs (minutes of a laptop) for a transaction the ledger refuses outright:
-/// `Bridge(Disabled)` for a chain with no bridge, `Bridge(UnknownAsset)` for an index nothing was
-/// ever registered under. `rand bridge-mint` already reads the chain before proving for the same
-/// reason (`deposit_index`); this is a burn's half of it, off the one `rand_getBridgeState` reply,
-/// whose `assets` array is the registry.
+/// None of them is something a wallet can know locally — all three are state — and getting any of
+/// them wrong costs *two* bundle proofs (minutes of a laptop) for a transaction the ledger
+/// refuses outright: `Bridge(Disabled)` for a chain with no bridge, `Bridge(UnknownAsset)` for an
+/// index nothing was ever registered under, `NotABacking` for a coin that does not back it and
+/// `InsufficientBacking` for one that does but is not holding enough. `rand bridge-mint` already
+/// reads the chain before proving for the same reason (`deposit_index`); this is a burn's half of
+/// it, off the one `rand_getBridgeState` reply, whose `assets` array is the registry — one row
+/// per coin, carrying that coin's `locked`.
 ///
-/// Deliberately not the rest of `BridgeState::check_burn` — the destination chain must be the
-/// asset's own, the recipient must be shaped for it — which is the bridge's own policy and stays
-/// stated in one place.
-fn burn_is_possible(bridge_state: &Value, asset: u32) -> Result<()> {
+/// The `locked` check is the one this amendment adds (spec §12): one bridged token is backed by
+/// several coins, so a burn of 700 zUSD may be well within the token's supply and still more than
+/// the chain it names is holding — and the far side would refuse to release it.
+///
+/// Deliberately not the rest of `BridgeState::check_burn` — the recipient must be shaped for the
+/// destination chain — which is the bridge's own policy and stays stated in one place.
+fn burn_is_possible(bridge_state: &Value, asset: u32, to_chain: u16, token: &[u8; 32], amount: u64) -> Result<()> {
     if bridge_state["enabled"] != Value::Bool(true) {
         return Err(anyhow!("this chain has no bridge, so there is nothing to burn to"));
     }
     let rows = bridge_state["assets"].as_array().context("bridge state has no asset registry")?;
-    if !rows.iter().any(|r| r["index"].as_u64() == Some(asset as u64)) {
+    let of_asset: Vec<&Value> = rows.iter().filter(|r| r["index"].as_u64() == Some(asset as u64)).collect();
+    if of_asset.is_empty() {
         let known: Vec<String> = rows.iter().filter_map(|r| r["index"].as_u64()).map(|i| i.to_string()).collect();
         return Err(anyhow!(
             "asset {asset} is not in this chain's registry, so no note of it was ever deposited{}",
@@ -1103,6 +1110,26 @@ fn burn_is_possible(bridge_state: &Value, asset: u32) -> Result<()> {
             } else {
                 format!(" (registered: {})", known.join(", "))
             }
+        ));
+    }
+    let hex_token = hex::encode(token);
+    let Some(backing) = of_asset
+        .iter()
+        .find(|r| r["chain"].as_u64() == Some(to_chain as u64) && r["token"].as_str() == Some(hex_token.as_str()))
+    else {
+        let coins: Vec<String> = of_asset
+            .iter()
+            .filter_map(|r| Some(format!("chain {} token {}", r["chain"].as_u64()?, r["token"].as_str()?)))
+            .collect();
+        return Err(anyhow!(
+            "coin {hex_token} on chain {to_chain} does not back asset {asset}; its backings are: {}",
+            coins.join(", ")
+        ));
+    };
+    let locked = backing["locked"].as_u64().context("an asset row without a locked amount")?;
+    if amount > locked {
+        return Err(anyhow!(
+            "only {locked} is locked in that coin on chain {to_chain}; choose another backing or a smaller amount"
         ));
     }
     Ok(())
@@ -1124,6 +1151,7 @@ pub async fn submit_burn(
     amount: u64,
     relayer_fee: u64,
     to_chain: u16,
+    token: [u8; 32],
     to: [u8; 32],
     fee: u64,
     profile: FriProfile,
@@ -1145,8 +1173,9 @@ pub async fn submit_burn(
     if relayer_fee > amount {
         return Err(anyhow!("the relayer fee {relayer_fee} is more than the {amount} being burned"));
     }
-    // One read of the chain, before any proving, for the two facts only the chain knows.
-    burn_is_possible(&rpc.bridge_state().await?, asset)?;
+    // One read of the chain, before any proving, for the three facts only the chain knows —
+    // the coin's locked amount among them, since one token's backings are held apart.
+    burn_is_possible(&rpc.bridge_state().await?, asset, to_chain, &token, amount)?;
     scan(rpc, w, store).await?;
     // `burn == amount`, not `amount + relayer_fee`: the wire format's fee is a *portion* of the
     // amount (`fee <= amount`), carved out on the destination chain by the release contract. A
@@ -1162,7 +1191,8 @@ pub async fn submit_burn(
     let [asset_proof, fee_proof] = <[Proved; 2]>::try_from(proved).ok().expect("two plans, two proofs");
 
     let proof_bytes = asset_proof.bundle.proof.len() + fee_proof.bundle.proof.len();
-    let action = Action::BridgeBurn { asset_bundle: asset_proof.bundle, asset, amount, relayer_fee, to_chain, to };
+    let action =
+        Action::BridgeBurn { asset_bundle: asset_proof.bundle, asset, amount, relayer_fee, to_chain, token, to };
     let tx = Transaction::shielded(chain_id, fee_proof.bundle, action);
     let hash = rpc.send_transaction(&tx).await?;
     settle(rpc, w, store, &hash, &plans, time, wait).await?;
@@ -1384,11 +1414,14 @@ pub fn attested_deposit(attestation: &[u8]) -> Result<AttestedDeposit> {
     let Payload::Transfer(t) = payload else {
         return Err(anyhow!("this attestation is a guardian-set rotation; it deposits nothing"));
     };
-    // Whatever this says about the amount and the asset, the ledger's helper is what the chain
+    // Whatever this says about the amount and the coin, the ledger's helper is what the chain
     // itself will read, so it — not the decode above — is what the note is built from.
-    let (asset, amount) = bridge_notes::attested_transfer(attestation)
+    let (token_chain, token, amount) = bridge_notes::attested_transfer(attestation)
         .ok_or_else(|| anyhow!("this attestation's amount does not fit a note"))?;
-    Ok(AttestedDeposit { to_hash: t.to, token_chain: t.token_chain, token: t.token_address, asset, amount })
+    // The per-backing wire id, which is what `rand_bridgeAssetId` computes and what a
+    // `rand_getAssets` row is keyed by — one row per coin, whichever token they back.
+    let asset = randprotocol_core::bridge::asset_id(token_chain, &token);
+    Ok(AttestedDeposit { to_hash: t.to, token_chain, token, asset, amount })
 }
 
 /// The `asset` word a deposit note will carry: the index the registry holds for this token.
@@ -1611,32 +1644,67 @@ mod tests {
         assert_eq!(spendable, vec![5, 2]);
     }
 
-    /// A burn costs two bundle proofs, so the two things only the chain knows are checked before
-    /// any of that work: the chain has a bridge, and the registry holds the asset being burned.
+    /// A burn costs two bundle proofs, so everything only the chain knows is checked before any
+    /// of that work: the chain has a bridge, the registry holds the asset being burned, the coin
+    /// named backs *that* asset, and that coin is holding at least what is being redeemed.
     #[test]
-    fn a_burn_checks_the_bridge_and_the_registry_before_proving() {
+    fn a_burn_checks_the_bridge_the_registry_and_the_backing_before_proving() {
+        // One zUSD (index 1) backed by USDT on chain 2 and USDC on chain 5, plus a second token
+        // beside it — the shape `rand_getAssets` serves: one row per coin, `index` shared.
+        let usdt = [0xd7u8; 32];
+        let usdc = [0xdcu8; 32];
+        let other = [0xeeu8; 32];
+        let row = |index: u32, chain: u16, token: [u8; 32], locked: u64| {
+            serde_json::json!({
+                "index": index, "chain": chain, "token": hex::encode(token),
+                "asset_id": hex::encode([index as u8; 32]), "locked": locked,
+            })
+        };
         let registry = serde_json::json!([
-            { "index": 1, "chain": 2, "token": "aa", "asset_id": "00" },
-            { "index": 2, "chain": 2, "token": "bb", "asset_id": "01" },
+            row(1, 2, usdt, 1_000),
+            row(1, 5, usdc, 400),
+            row(2, 2, other, 50),
         ]);
         let bridged = serde_json::json!({ "enabled": true, "assets": registry });
-        burn_is_possible(&bridged, 1).expect("a registered asset can be burned");
-        burn_is_possible(&bridged, 2).expect("and so can the second one");
+        burn_is_possible(&bridged, 1, 2, &usdt, 1_000).expect("exactly what that coin holds");
+        burn_is_possible(&bridged, 1, 5, &usdc, 1).expect("the other coin of the same token");
+        burn_is_possible(&bridged, 2, 2, &other, 50).expect("and the token beside it");
+
+        // More of one coin than its own contract is holding, though the token's supply (1 400
+        // across its two coins) would cover it. This is the line a user reads.
+        let e = burn_is_possible(&bridged, 1, 5, &usdc, 700).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "only 400 is locked in that coin on chain 5; choose another backing or a smaller amount"
+        );
+        // A coin that backs nothing, and one that backs the *other* token: both name the
+        // backings the asset does have.
+        let e = burn_is_possible(&bridged, 1, 3, &usdt, 1).unwrap_err().to_string();
+        assert!(e.contains("does not back asset 1") && e.contains("chain 5 token"), "{e}");
+        let e = burn_is_possible(&bridged, 1, 2, &other, 1).unwrap_err().to_string();
+        assert!(e.contains("does not back asset 1"), "{e}");
 
         // An index the registry does not hold: no note of it was ever deposited, so the ledger
         // would refuse the transaction after both proofs.
-        let e = burn_is_possible(&bridged, 3).unwrap_err().to_string();
-        assert!(e.contains("asset 3 is not in this chain's registry") && e.contains("registered: 1, 2"), "{e}");
+        let e = burn_is_possible(&bridged, 3, 2, &usdt, 1).unwrap_err().to_string();
+        assert!(e.contains("asset 3 is not in this chain's registry") && e.contains("registered: 1, 1, 2"), "{e}");
 
         // A chain with no bridge at all, which is what `rand_getBridgeState` says with one field.
-        let e = burn_is_possible(&serde_json::json!({ "enabled": false }), 1).unwrap_err().to_string();
+        let e = burn_is_possible(&serde_json::json!({ "enabled": false }), 1, 2, &usdt, 1).unwrap_err().to_string();
         assert!(e.contains("no bridge"), "{e}");
         // A bridged chain whose registry is still empty names that rather than listing nothing.
         let empty = serde_json::json!({ "enabled": true, "assets": [] });
-        let e = burn_is_possible(&empty, 1).unwrap_err().to_string();
+        let e = burn_is_possible(&empty, 1, 2, &usdt, 1).unwrap_err().to_string();
         assert!(e.contains("registry is empty"), "{e}");
         // And a reply with no registry at all is an error, not an empty registry.
-        assert!(burn_is_possible(&serde_json::json!({ "enabled": true }), 1).is_err());
+        assert!(burn_is_possible(&serde_json::json!({ "enabled": true }), 1, 2, &usdt, 1).is_err());
+        // A row from a node that predates per-backing accounting has no `locked` to check
+        // against, which is an error rather than a burn proved against a number nobody sent.
+        let old = serde_json::json!({
+            "enabled": true,
+            "assets": [{ "index": 1, "chain": 2, "token": hex::encode(usdt), "asset_id": "00" }],
+        });
+        assert!(burn_is_possible(&old, 1, 2, &usdt, 1).is_err());
     }
 
     /// One submission per shape of [`Burn`], as `rand` prints it. This is the line a user reads
@@ -2011,6 +2079,7 @@ mod tests {
             amount: 400,
             relayer_fee: 100,
             to_chain: 2,
+            token: [9; 32],
             to: [0; 32],
         };
         assert_eq!(burn_fee_default(), gas::fee_floor(&burn));
@@ -2037,6 +2106,7 @@ mod tests {
                 amount,
                 relayer_fee,
                 2,
+                [0xaa; 32],
                 [1; 32],
                 burn_fee_default(),
                 FriProfile::Test,

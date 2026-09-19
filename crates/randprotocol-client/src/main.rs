@@ -200,6 +200,10 @@ enum Cmd {
         amount: u64,
         /// Destination chain id.
         to_chain: u16,
+        /// The source-chain token address to release, 32 bytes of hex: which of the asset's
+        /// backings this burn redeems (`rand bridge` lists them, one row per coin with its
+        /// locked amount). One bridged token is backed by several coins on several chains.
+        token: String,
         /// 32-byte destination address, hex.
         to: String,
         /// A portion of AMOUNT paid to the relayer on the destination chain, in the same asset.
@@ -482,10 +486,20 @@ async fn main() -> Result<()> {
             // chain with no bridge at all, which answers with an empty registry — or a node too old
             // to answer: the balance is this wallet's own, and the registry only adds a name to it.
             let assets = rpc.assets().await.unwrap_or_default();
-            let token_of = |index: u32| match assets.iter().find(|a| a.index == index) {
-                Some(a) => format!("chain {} token {}", a.chain, hex::encode(&a.token)),
-                None if index == 0 => "RAND".to_string(),
-                None => "not in this chain's registry".to_string(),
+            // One bridged token can be backed by several coins (spec §12), and the registry
+            // serves one row per coin under the one index — so every coin behind an index is
+            // named, not just whichever happens to be listed first.
+            let token_of = |index: u32| {
+                let coins: Vec<String> = assets
+                    .iter()
+                    .filter(|a| a.index == index)
+                    .map(|a| format!("chain {} token {}", a.chain, hex::encode(&a.token)))
+                    .collect();
+                match (coins.is_empty(), index) {
+                    (false, _) => coins.join(", "),
+                    (true, 0) => "RAND".to_string(),
+                    (true, _) => "not in this chain's registry".to_string(),
+                }
             };
             match index {
                 Some(index) => {
@@ -893,7 +907,7 @@ async fn main() -> Result<()> {
             report(&s, "bridge attestation");
             // Everything the deposit note is made of, every time. `r` and `time` are already public
             // in this transaction, so printing them discloses nothing — and they are the only way to
-            // rebuild the note by hand if the index turns out not to be the predicted one below.
+            // rebuild the note by hand if the node's registry turns out to disagree, below.
             println!(
                 "deposit: {} units of asset {index}\n  note {}\n  owner {owner}, from 0, time {time}, r {}",
                 d.amount,
@@ -930,9 +944,11 @@ async fn main() -> Result<()> {
                 println!("asset {landed} balance: {} units", store.balance_of(landed));
             }
         }
-        Cmd::BridgeBurn { asset, amount, to_chain, to, relayer_fee, fee, no_wait, cuda } => {
+        Cmd::BridgeBurn { asset, amount, to_chain, token, to, relayer_fee, fee, no_wait, cuda } => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let to = randprotocol_client::hex32(&to).context("the destination address must be 32 bytes of hex")?;
+            let token = randprotocol_client::hex32(&token)
+                .context("the source-chain token address must be 32 bytes of hex")?;
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => wallet::burn_fee_default(),
@@ -948,6 +964,7 @@ async fn main() -> Result<()> {
                 amount,
                 relayer_fee,
                 to_chain,
+                token,
                 to,
                 fee,
                 profile,
