@@ -133,13 +133,15 @@ pub enum Action {
     /// recent without having to be exact, and the envelope sealed for the recipient names exactly
     /// the note the ledger will append.
     ///
-    /// `asset` is the registry index the envelope was sealed for, and it is on the action for the
-    /// same reason `time` is: the depositor has to name the note it sealed against. For a token
-    /// the registry already holds the index is a fact, but the first sighting of a token is given
-    /// the `next_index` the registry has *when the transaction is applied* — and another first
-    /// sighting can commit while this one is being proved. Admission refuses a mismatch
-    /// (`TxError::AttestAssetMismatch`), so a lost race costs a fee bundle and a re-proof rather
-    /// than a deposit nobody can open. A rotation deposits no note and binds nothing here.
+    /// `asset` is the token registry's index for the deposited asset — the word the envelope was
+    /// sealed for — and it is on the action for the same reason `time` is: the depositor has to
+    /// name the note it sealed against. It is always a fact, never a prediction: a bridged token
+    /// is *listed* (at genesis, or by a governance message) before an attestation of it is
+    /// admissible, and a listing's index never moves, so nothing can take it from a transaction
+    /// while its bundle is being proved. Admission still refuses a mismatch
+    /// (`TxError::AttestAssetMismatch`) — a transaction built against another chain's registry, or
+    /// against a node that has not seen a listing yet, would otherwise deposit under a word no key
+    /// of the recipient's opens. A rotation deposits no note and binds nothing here.
     BridgeAttest {
         #[serde(with = "crate::crypto::wire_bytes")]
         attestation: Vec<u8>,

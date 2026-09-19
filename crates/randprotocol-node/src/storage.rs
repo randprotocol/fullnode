@@ -494,11 +494,24 @@ impl Storage {
         Ok(())
     }
 
-    /// The bridge's whole-state half — emitters, guardian sets, the asset registry with its
-    /// indices — or `None` on a chain without a bridge.
+    /// The bridge's whole-state half — the emitter, the source emitters, the guardian sets and
+    /// the burn sequence — or `None` on a chain without a bridge.
+    ///
+    /// Decoded **strictly**: the blob lost two fields with the RPL token standard (the asset
+    /// registry and its `next_index`, which moved to [`META_TOKENS`]), and plain
+    /// `bincode::deserialize` ignores trailing bytes — it would read a pre-RPL blob's `assets`
+    /// map length as this struct's `burn_sequence` and answer `Ok` with a bridge that never
+    /// existed. Rejecting the trailing bytes turns that into the decode error it is. Chain 14 is
+    /// a fresh datadir, so no live node has such a blob; what this rules out is a node pointed at
+    /// an old one reading nonsense as state.
     pub fn bridge_meta(&self) -> Result<Option<BridgeMeta>> {
+        use bincode::Options as _;
         match self.get_meta_raw(META_BRIDGE_STATE)? {
-            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            // `with_fixint_encoding` is what plain `bincode::serialize` writes (`put_bridge`);
+            // `DefaultOptions` rejects trailing bytes, which is the whole point here.
+            Some(bytes) => Ok(Some(
+                bincode::DefaultOptions::new().with_fixint_encoding().deserialize(&bytes)?,
+            )),
             None => Ok(None),
         }
     }
@@ -2574,6 +2587,52 @@ mod tests {
         s.init_genesis(&gs).unwrap();
         assert_eq!(s.bridge_meta().unwrap(), None);
         assert!(s.load_ledger(&StubExecutor).unwrap().bridge().is_none());
+    }
+
+    /// The `BridgeMeta` blob lost two fields with the RPL token standard — the asset registry and
+    /// its `next_index`, which live in the token registry now. A pre-RPL blob must therefore fail
+    /// to decode rather than be *mis*-decoded: the fields left line up until `current_set`, and
+    /// the next eight bytes of an old blob are the `assets` map's length, which plain bincode
+    /// (which ignores trailing bytes) would hand back as `burn_sequence`. Chain 14 is a fresh
+    /// datadir, so nothing live holds one; what must never happen is a node reading one as state.
+    #[test]
+    fn a_pre_rpl_bridge_blob_is_refused_rather_than_misread() {
+        use randprotocol_core::bridge::GuardianSet;
+        /// The blob as it was written before the registry moved out.
+        #[derive(serde::Serialize)]
+        struct OldBridgeMeta {
+            emitter: [u8; 32],
+            emitters: std::collections::BTreeMap<u16, [u8; 32]>,
+            guardian_sets: std::collections::BTreeMap<u32, GuardianSet>,
+            current_set: u32,
+            /// `AssetId -> (chain, token, index)`, keyed by the 32-byte asset id.
+            assets: std::collections::BTreeMap<[u8; 32], (u16, [u8; 32], u32)>,
+            next_index: u32,
+            burn_sequence: u64,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, _) = bridged_genesis(21);
+        s.init_genesis(&gs).unwrap();
+        assert!(s.bridge_meta().unwrap().is_some(), "a blob this build wrote decodes");
+
+        let old = OldBridgeMeta {
+            emitter: [1; 32],
+            emitters: std::collections::BTreeMap::from([(2u16, [2u8; 32])]),
+            guardian_sets: std::collections::BTreeMap::new(),
+            current_set: 0,
+            assets: std::collections::BTreeMap::from([([0xaa; 32], (2u16, [0xaa; 32], 1u32))]),
+            next_index: 2,
+            burn_sequence: 7,
+        };
+        let bytes = bincode::serialize(&old).unwrap();
+        // Plain bincode is exactly the trap: it stops at the last field it wants and drops the
+        // rest, reading the one-entry `assets` map's length as the burn sequence.
+        let loose: BridgeMeta = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(loose.burn_sequence, 1, "a map length read as a sequence — the silent mis-decode");
+        // The strict decode `bridge_meta` uses refuses it instead.
+        s.db.put_cf(s.cf(CF_META), META_BRIDGE_STATE, &bytes).unwrap();
+        assert!(s.bridge_meta().is_err(), "a pre-RPL blob is a decode error, never a bridge");
     }
 
     /// A chain that starts with no notes still round trips: the stored frontier is the empty

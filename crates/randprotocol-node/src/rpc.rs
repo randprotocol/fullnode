@@ -913,10 +913,10 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
             "time": time
         }),
         // The amount and the asset are inside the attestation, so they are decoded out of it
-        // rather than read off a field; the index is what the registry gave that asset. Both
-        // are `null` for a guardian-set rotation, which deposits nothing, and on a chain whose
-        // registry does not name the asset yet. The recipient is public in this transaction
-        // only — the note's later spend is not.
+        // rather than read off a field; the index is the one the token registry lists that asset
+        // under. Both are `null` for a guardian-set rotation, which deposits nothing, and for a
+        // token this chain has not listed — which no committed attestation can be. The recipient
+        // is public in this transaction only — the note's later spend is not.
         Action::BridgeAttest { attestation, recipient, r, time, asset, .. } => {
             let deposit = attest_deposit(attestation, tokens);
             json!({

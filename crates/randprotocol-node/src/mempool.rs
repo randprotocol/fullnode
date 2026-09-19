@@ -1116,8 +1116,8 @@ mod tests {
         attestation_of(secrets, [0xaa; 32], 0)
     }
 
-    /// [`attestation`] for a chosen `token` and `sequence`, so two attestations can name two
-    /// different tokens — each a first sighting racing the other for the registry's next index.
+    /// [`attestation`] for a chosen `token` and `sequence`, so an attestation can name a token
+    /// the chain has not listed as easily as the one it has.
     fn attestation_of(secrets: &[[u8; 32]], token: [u8; 32], sequence: u64) -> Vec<u8> {
         let body = Body {
             timestamp: 1,

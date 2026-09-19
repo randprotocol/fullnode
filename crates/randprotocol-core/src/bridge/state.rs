@@ -173,7 +173,7 @@ pub enum BridgeError {
     /// message — and never registered by first sighting, so this is the
     /// refusal that used to be a fresh index. It replaces `AssetRegistryFull`,
     /// which only existed because first sighting could run out of indices.
-    #[error("token {token:?} of chain {chain} is not listed on this chain")]
+    #[error("token {} of chain {chain} is not listed on this chain", hex::encode(token))]
     UnlistedToken { chain: u16, token: [u8; 32] },
 }
 
