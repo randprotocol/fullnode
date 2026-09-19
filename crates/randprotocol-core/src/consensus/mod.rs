@@ -183,6 +183,12 @@ pub enum Action {
     FetchBlock(Hash),
     /// Persist before executing any later action in the same batch.
     PersistSafety(SafetyState),
+    /// A three-chain committed a block that does not descend from this replica's committed head:
+    /// either the set finalized a branch conflicting with what this node already treats as final,
+    /// or this node's own committed history is wrong. Either way its answers about finality cannot
+    /// be trusted from here on, so the node layer stops rather than serving them (audit v3, the
+    /// CON-3 candidate: this used to be a log line and a `return`).
+    SafetyViolation { committed: Hash, attempted: Hash },
 }
 
 #[derive(Clone, Debug)]

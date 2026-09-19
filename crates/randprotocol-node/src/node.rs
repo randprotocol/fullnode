@@ -1169,6 +1169,14 @@ impl Node {
         while let Some(a) = queue.pop_front() {
             match a {
                 Action::PersistSafety(s) => self.storage.save_safety(&s)?,
+                // Nothing is persisted and nothing else in the batch runs: this node's committed
+                // history and the set's disagree, so every finality answer it could give from here
+                // is suspect. Stop; startup's `verify_chain` decides what the restart does with the
+                // store (audit v3).
+                Action::SafetyViolation { committed, attempted } => {
+                    tracing::error!(?committed, ?attempted, "conflicting finality: stopping this node");
+                    anyhow::bail!("consensus safety violation: committed {committed:?}, attempted {attempted:?}");
+                }
                 Action::Broadcast(m) | Action::SendTo(_, m) => {
                     self.net.broadcast(GossipMessage::Consensus(m)).await;
                 }
