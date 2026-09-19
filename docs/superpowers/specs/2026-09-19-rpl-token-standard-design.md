@@ -75,7 +75,13 @@ line is corrected to say so.
 - `Bridge`: `blake3("rand-bridge-asset", chain ‖ token)`, unchanged, so the whitepaper's
   `asset_z` and the contracts stay valid.
 - Everything else: `blake3("rand-rpl-asset", bincode(name, symbol, decimals, authority,
-  initial_supply, salt))` with a 32-byte creator-chosen `salt`. Content-addressed like a program
+  initial: Option<InitialMint>, salt))` with a 32-byte creator-chosen `salt`. The **whole**
+  `InitialMint` is in the id — amount, recipient, `r`, `time` and envelope — because a
+  `RegisterToken` is unsigned and its fee bundle is not bound to it: were only the amount bound, an
+  observer could copy a gossiped registration, swap in its own recipient, and take the id and the
+  entire initial supply (for a fixed-supply token, permanently). With the recipient in the id a
+  redirected copy is a *different* token, which is all a non-unique symbol ever promised
+  (amended 2026-09-19 after Task 4's review). Content-addressed like a program
   id; registering an id that exists is refused (`TokenError::AlreadyRegistered`).
 
 **The gate.** `Genesis::tokens: Option<TokensConfig>`, omitted from the file and the genesis
@@ -124,7 +130,10 @@ recipient can then move the note with a shielded transfer.
 
 **Signatures.** `Key` mints and `SetAuthority` sign
 `blake3("rand-rpl-mint-1" | "rand-rpl-authority-1", chain_id ‖ asset_id ‖ nonce ‖ body)`, where
-`body` is `(amount, commitment)` or the new key. `nonce` must equal the token's `mint_nonce`, which
+`body` is `(amount, commitment, blake3(bincode(envelope)))` or the new key. The envelope digest is
+signed because the commitment does not cover the envelope: without it a third party could re-wrap a
+gossiped mint with a garbage envelope and spend the nonce, leaving the recipient to rebuild the note
+from the public fields (amended 2026-09-19). `nonce` must equal the token's `mint_nonce`, which
 then increments: no replay on this chain or another.
 
 **Two-bundle rules** are `BridgeBurn`'s, factored into one function the three actions share: the
