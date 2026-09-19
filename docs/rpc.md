@@ -138,6 +138,12 @@ the normal mempool, so the mint goes through consensus and every node applies it
 no validator key and answers `faucet mints are signed by validators; ask a validator node`. Poll
 `rand_getTransaction` for the commit.
 
+The faucet is rate limited per node process: eight mints back to back, refilling at one a
+second. Past that the call answers `faucet is rate limited on this node (8 mints back to back,
+refilling at 1/s); try again shortly`, so a faucet flood cannot fill the pool ahead of a bridge
+`PauseMints`, which is also exempt from the pool's `mempool full` refusal and ordered first in a
+block, like the other three governance actions.
+
 ### `rand_getCommitments`
 Params: `[from_index]` or `[from_index, limit]`. Result: a page of commitment-tree leaves from
 leaf `from_index`, oldest first, at most 1000 rows however large `limit` is (a missing or null
