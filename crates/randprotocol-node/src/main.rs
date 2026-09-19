@@ -1146,6 +1146,12 @@ mod tests {
     /// or the genesis binding changes — all three are consensus-breaking, so a diff here is the
     /// intended alarm, not a nuisance. Regenerate it deliberately (print `state.hash()`), and
     /// only together with a chain restart.
+    ///
+    /// **KNOWN FAILING — do not re-pin casually.** It fails on `main` and on this branch: the
+    /// hidden-asset bundle guest (chain 14) moved the hash again, and an older drift (the hash
+    /// computed as `78390828…` against the pinned `fb5881c8…`, seen on `main` before and after
+    /// v0.3) was never investigated. Re-pinning without explaining that drift would silence the
+    /// alarm this test exists to raise.
     #[test]
     fn the_genesis_hash_is_pinned() {
         let ex = ZkExecutor::new(FriProfile::Test);

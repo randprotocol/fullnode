@@ -449,10 +449,15 @@ The RPL token actions:
   public by design (they audit the token's `total_supply`), and the bundle's `burn_asset`/`burn_a`
   repeat them.
 - `{ "kind": "token_mint", "asset": 3, "amount": 700, "recipient": "<shielded address>", "time": 41,
-  "nonce": 0 }`, `{ "kind": "register_token", "name": …, "symbol": …, "decimals": 6, "authority":
-  …, "index": 2, "initial_amount": 5000 }` and `{ "kind": "set_authority", "asset": 3, "nonce": 1,
-  "new_authority": "<base58>" | null }` — a token's registration and mints are public, as a bridge
-  deposit is.
+  "r": "<64 hex>", "nonce": 0 }`, `{ "kind": "register_token", "name": …, "symbol": …, "decimals":
+  6, "authority": "none" | "key" | "bridge" | "program", "index": 2, "initial_amount": 5000,
+  "initial": { "amount": 5000, "recipient": "<shielded address>", "time": 40, "r": "<64 hex>" } |
+  null }` and `{ "kind": "set_authority", "asset": 3, "nonce": 1, "new_authority": "<base58>" |
+  null }` — a token's registration and mints are public, as a bridge deposit is. Every word of a
+  minted note is here (its `from` is the chain's fixed `MINT_FROM`), so a recipient rebuilds the
+  note from these fields with nothing decrypted, whatever envelope the minter published — the
+  wallet's scan does exactly that. **The kind strings `bridge_attest`, `token_mint` and
+  `register_token` are what that scan keys on and are pinned by a test.**
 
 There is no `token_transfer`: a token transfer is `none`, indistinguishable from a RAND payment.
 
@@ -480,7 +485,8 @@ a fresh `TxKey` can hand `(hash, key)` to anyone — a recipient proving they we
 checking a claim — and this call is the whole verification. Each entry of `disclosed` is one
 envelope the key opened: `output` names the envelope set (`bundle:0` … `bundle:3` for the
 transaction's bundle, one per output slot — slots 0–1 the private-asset outputs, slots 2–3 the
-RAND outputs, dummies included — `deposit` for a `BridgeAttest`'s deposit envelope, `mint:0` for a
+RAND outputs, dummies included — `deposit` for a `BridgeAttest`'s deposit envelope, `token_mint`
+for a `TokenMint`'s note, `initial_mint` for a `RegisterToken`'s initial mint, `mint:0` for a
 faucet mint's one envelope), `cm` the on-chain commitment the note commits to, and `index` its
 leaf. The disclosed `note` carries its `asset`: this call — with the key the sender sealed under —
 is the one place the RPC reveals which asset a transfer moved. The binding is the proof: the AEAD
@@ -488,7 +494,9 @@ authenticates the note *and* checks it against `cm`, so a key lifted onto anothe
 or a note that is not the commitment's preimage — yields an empty list, never a forged row. A
 withdraw's and a genesis alloc's envelopes are not tried: they are sealed inside the node under
 keys dropped at once, so no `TxKey` for them can exist. A mint's is sealed the same way, but its
-recipient recovers the key through the envelope's KEM half (`rand tx-key`), so a mint is tried.
+recipient recovers the key through the envelope's KEM half (`rand tx-key`), so a mint is tried. A
+token mint's and an initial mint's envelopes are sealed by the minter, and open against the
+commitment the chain computed for that note.
 
 The call is **stateless**: the key is used for this one request and dropped — it is not imported,
 stored, or learnable from anything the node keeps (unlike `rand_importViewingKey`, which
@@ -611,6 +619,52 @@ Params: `[sequence]` (integer). Result: `null` if this chain has emitted no such
 `body_hex` is the outbound message as guardians must hash and sign it; `digest` is its hash.
 `tx` is the burn transaction that emitted it — a burn is funded by notes, so the transaction
 hash stands in for the sender identity the message has no room for.
+
+### `rand_getTokens`
+Params: `[from_index, limit]`, both optional (`0` and `1000`; `limit` is clamped to 1000). Result:
+the RPL token registry — every token, bridged and native — ascending by index from `from_index`:
+```json
+{ "enabled": true, "registration_fee": 1000000000, "next_index": 3,
+  "tokens": [
+    { "index": 2, "id": "<64 hex>", "id_text": "rpl1…", "name": "Test Coin", "symbol": "TST",
+      "decimals": 6,
+      "authority": { "kind": "key", "key": "<Dilithium2 key, hex>", "address": "<base58>" },
+      "mint_nonce": 1, "total_supply": "5700", "registered_at": 3 }
+  ] }
+```
+On a chain without a `tokens` section: `{ "enabled": false, "tokens": [] }`. `index` is the
+`asset` word a note of the token carries (0 is RAND and is never listed). `id` is the token's
+asset id and `id_text` its checksummed text form — bech32m, HRP `rpl`, over the 32 id bytes, 62
+characters. `authority` is `{ "kind": "none" }` (fixed supply, or renounced), `{ "kind": "key",
+"key", "address" }`, `{ "kind": "bridge", "backings": [{ "chain": 2, "token": "<32 bytes hex>",
+"decimals": 6, "locked": "600" }] }` (each backing's **source** decimals and the amount its
+contract holds for this chain) or `{ "kind": "program", "program": "<hex>" }`. Supplies and
+`locked` are decimal strings; `registration_fee` and `next_index` are numbers. A page shorter
+than `limit` is the last.
+
+A wallet resolves a token id **through this listing** (`wallet::resolve_asset`), never through
+`rand_getToken`: a transfer's asset is private on chain, and reading the whole registry costs the
+same whichever token is meant.
+
+### `rand_getToken`
+Params: `[token]` — a registry index (a number or a decimal string), the 64-hex id (with or
+without `0x`, any case) or the `rpl1…` text form (all lower or all upper case). Result: that
+token's `rand_getTokens` row, or `null` when there is none (and on a chain without tokens). A
+malformed id — a bad checksum, another HRP, a wrong length, mixed case, not hex — is `-32602`, so
+a typo is never some other token.
+
+**Privacy:** a per-token lookup tells the node which token the caller cares about. It is for
+explorers and one-off reads; a wallet about to send uses `rand_getTokens`.
+
+### `rand_getTokenSupply`
+Params: `[token]`, the same forms as `rand_getToken`. Result: `null`, or
+```json
+{ "total_supply": "600",
+  "backings": [{ "chain": 2, "token": "<32 bytes hex>", "decimals": 6, "locked": "600" }] }
+```
+Decimal strings. `backings` is empty for a native token; for a bridged one the `locked` amounts
+sum to `total_supply`, and each is what `rand-bridge-audit` reconciles against that coin's custody
+on its source chain. The same privacy note as `rand_getToken`.
 
 ### `rand_getValidators`
 Params: `[]`. Result: array of
@@ -973,7 +1027,7 @@ Action::None                                            // a plain shielded tran
 Action::Mint { cm: Word8, pk: Word8, time: u32, r: Word8,   // cm = commitment of (pk, no sender,
                envelope: Envelope, amount: u64,          //   amount, asset 0, time, r), checked
                minter: PublicKey, signature: Signature } //   by admission (audit v3, POOL-1)
-Action::Deploy { base_pc: u32, words: Vec<u32> }
+Action::Deploy { base_pc: u32, words: Vec<u32>, public: Vec<u32> }
 Action::Call { program: Hash, proof: Vec<u8>,           // postcard(rand_zkvm::Proof)
                input_envelope: Option<CallEnvelope> }
 Action::Bond { validator: Address, amount: u64, registration: Option<Registration> }
@@ -984,7 +1038,15 @@ Action::BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word
                        asset: u32, envelope: Envelope }
 Action::BridgeBurn { asset: u32, amount: u64, relayer_fee: u64, to_chain: u16,
                      token: [u8; 32], to: [u8; 32] }
+Action::RegisterToken { name: String, symbol: String, decimals: u8, authority: MintAuthority,
+                        initial: Option<InitialMint>, salt: [u8; 32], index: u32 }
+Action::TokenMint { asset: u32, amount: u64, recipient: ShieldedAddress, r: Word8, time: u32,
+                    envelope: Envelope, nonce: u64, signature: Signature }
+Action::SetAuthority { asset: u32, new: Option<PublicKey>, nonce: u64, signature: Signature }
 Action::TokenBurn { asset: u32, amount: u64 }
+
+MintAuthority = None | Key(PublicKey) | Bridge { backings: Vec<Backing> } | Program(Hash)
+InitialMint { amount: u64, recipient: ShieldedAddress, r: Word8, time: u32, envelope: Envelope }
 
 Registration { public_key: PublicKey, payout: ShieldedAddress, signature: Signature }
 ```
@@ -1029,8 +1091,8 @@ Encoded sizes (bincode's default configuration: fixed-width integers, 8-byte len
 So a shielded transfer on the wire is about 1.43 MB at the 80-query production profile,
 essentially all proof. The ledger caps a proof at 2 MiB, an envelope
 at 2048 bytes, a program at 4096 words (or the genesis file's `max_program_words`, at most 65 535),
-and a block at 4 MiB of transaction bytes — three bundles
-per block (`docs/block-space.md`).
+and a block at 4 MiB of transaction bytes — two bundles
+per block at that default (`docs/block-space.md`; a genesis may raise the caps).
 
 A wallet builds all of this through `randprotocol_client::wallet::{send, submit}`, which selects the
 inputs, fetches the anchor and the witnesses, proves the bundle, seals all four envelopes, and checks
@@ -1039,6 +1101,21 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-20 — the token RPC and `rpl1…` token ids
+
+- **New methods:** `rand_getTokens` (the whole registry, paged), `rand_getToken` (one token by
+  index, hex or `rpl1…`) and `rand_getTokenSupply` (supply and each backing's locked amount).
+  `rand_getAssets` is unchanged.
+- **Token ids have a text form**, `rpl1…` (bech32m, HRP `rpl`, 62 characters): `id_text` on every
+  token row, and accepted wherever a token is looked up. Hex stays accepted.
+- **`rand_getTransaction`:** `token_mint` gains `r`; `register_token` gains `initial` (`{ amount,
+  recipient, time, r }` or `null`). Existing fields are unchanged.
+- **`rand_checkTransaction`:** also opens a `TokenMint`'s envelope (`output`: `token_mint`) and a
+  registration's initial-mint envelope (`initial_mint`).
+- **Pool:** two transactions at one token's `mint_nonce` (a `TokenMint` or a `SetAuthority`) or at
+  one registration index conflict at submission, and one whose nonce or index the chain has
+  already moved past is refused (`wrong mint nonce`, `wrong token index`) and pruned.
 
 ### 2026-09-19 — the hidden-asset bundle (chain 14): a hard fork
 
