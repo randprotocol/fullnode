@@ -123,33 +123,18 @@ pub(super) fn validate(
             // a comparison or a set lookup, and it all runs before either bundle's proof is
             // verified — the fee bundle's at step 9 of `validate_inner`, the asset bundle's at
             // the end of this arm. A burn that names the wrong asset costs no verification.
-            if asset_bundle.asset != *asset {
-                return Err(TxError::BurnAssetMismatch { expected: *asset, actual: asset_bundle.asset });
-            }
-            if asset_bundle.fee != 0 {
-                return Err(TxError::BurnAssetBundleFee(asset_bundle.fee));
-            }
-            // A burn destroys exactly what the outbound message sends. The wire format's `fee` is
-            // a *portion* of `amount` — that is what `fee <= amount` means (`check_burn`, and
-            // inbound `check_attest` reads it the same way) — so the release contract pays
-            // `amount - fee` to `to` and `fee` to the relayer, releasing `amount` in total.
-            // Burning `amount + relayer_fee` here would destroy more than the far side ever
-            // releases and strand the difference in the source-chain contract forever.
-            if asset_bundle.burn != *amount {
-                return Err(TxError::BurnAmountMismatch { expected: *amount, actual: asset_bundle.burn });
-            }
-            // `check_bundle` sees each bundle alone and the fee bundle's notes are not in the
-            // ledger yet, so the pairs *between* the two bundles are checked here: all four
-            // nullifiers and all four commitments of a burn must differ.
-            if let Some(fee_bundle) = &tx.bundle {
-                if fee_bundle.nullifiers.iter().any(|nf| asset_bundle.nullifiers.contains(nf)) {
-                    return Err(TxError::DuplicateNullifierInBundle);
-                }
-                if fee_bundle.commitments.iter().any(|cm| asset_bundle.commitments.contains(cm)) {
-                    return Err(TxError::DuplicateCommitmentInBundle);
-                }
-            }
-            ledger.check_bundle(asset_bundle)?;
+            //
+            // The two-bundle rule itself is [`super::tokens::check_asset_bundle`], shared with
+            // the RPL transfer and holder burn, which have exactly this shape: the bundle's asset
+            // matches, its fee is zero, it burns what the action declares, it shares no word with
+            // the fee bundle, and `check_bundle`. A burn's `burn == amount` is this action's own
+            // rule inside it: the wire format's `fee` is a *portion* of `amount` — that is what
+            // `fee <= amount` means (`check_burn`, and inbound `check_attest` reads it the same
+            // way) — so the release contract pays `amount - fee` to `to` and `fee` to the relayer,
+            // releasing `amount` in total. Burning `amount + relayer_fee` would destroy more than
+            // the far side ever releases and strand the difference in the source-chain contract
+            // forever.
+            super::tokens::check_asset_bundle(ledger, tx, asset_bundle, *asset, *amount)?;
             // The release `apply` makes, decided here for the same reason the deposit's lock is:
             // apply writes the asset bundle's notes before it touches the registry.
             // `check_burn` ends in `TokenRegistry::check_release`, which is exactly what the
@@ -202,10 +187,16 @@ pub(super) fn apply(
                     // signed is what the note carries — the relayer fee is a portion of it and is
                     // paid on the far side. `check_attest` ruled out every refusal `lock` has, so
                     // this cannot fail on a transaction that was admitted.
+                    //
+                    // The registry's refusal is reported through the bridge, exactly as the
+                    // validate half reports it (`check_attest` ends in `TokenRegistry::check_lock`
+                    // and carries its error as `BridgeError::Token`). One shape for one refusal:
+                    // the unreachable path and the reachable one must not print differently.
                     ledger
                         .tokens_mut()
                         .ok_or(TxError::Token(TokenError::Disabled))?
-                        .lock(t.index, t.chain, &t.token, t.amount)?;
+                        .lock(t.index, t.chain, &t.token, t.amount)
+                        .map_err(|e| TxError::Bridge(BridgeError::Token(e)))?;
                 }
                 // Governance only: a rotation moves guardian keys and no value.
                 AttestOutcome::GuardianSetUpgraded(_) => {}
@@ -232,11 +223,14 @@ pub(super) fn apply(
             // together, so each source contract's locked amount stays equal to what this chain
             // says it is holding — and their sum stays the token's supply (spec §12).
             // `validate` ruled out every refusal `release` has, so this cannot fail on a
-            // transaction that was admitted.
+            // transaction that was admitted — and if it somehow did, it says so in the shape
+            // `validate` would have said it in (`BridgeError::Token`, through `check_burn`'s
+            // `check_release`) rather than in a second shape for the same refusal.
             ledger
                 .tokens_mut()
                 .ok_or(TxError::Token(TokenError::Disabled))?
-                .release(*asset, *to_chain, token, *amount)?;
+                .release(*asset, *to_chain, token, *amount)
+                .map_err(|e| TxError::Bridge(BridgeError::Token(e)))?;
             Ok(())
         }
         _ => Err(TxError::UnsupportedAction("bridge")),
@@ -288,13 +282,6 @@ pub fn attested_transfer(attestation: &[u8]) -> Option<(u16, [u8; 32], u64)> {
     };
     let amount = u64::try_from(t.amount_u128()?).ok()?;
     Some((t.token_chain, t.token_address, amount))
-}
-
-/// The `(chain, token)` pair an attestation's transfer names, for a caller that wants the coin
-/// and not the amount. One decode, [`attested_transfer`]'s — the two used to duplicate it.
-/// `None` in exactly the same cases.
-pub fn attested_token(attestation: &[u8]) -> Option<(u16, [u8; 32])> {
-    attested_transfer(attestation).map(|(chain, token, _)| (chain, token))
 }
 
 /// The deposit note a `BridgeAttest` appended — the commitment and the envelope sealed against

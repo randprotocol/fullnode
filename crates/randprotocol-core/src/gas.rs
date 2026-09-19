@@ -148,13 +148,16 @@ pub fn fee_floor(action: &Action) -> u64 {
         // verify, and the bundle base already covers the one bundle it carries. No bridge
         // charge on top: the relayer pays this one, for a depositor who has no RAND yet.
         Action::BridgeAttest { .. } => BUNDLE_BASE,
-        // Spec §7 item 3 charges the bundle base "for every bundle", and a `BridgeBurn` is the
-        // one transaction that carries two: the RAND fee bundle and the asset bundle inside
-        // the action. Both are verified, so both are paid for — and by this bundle, because the
-        // asset bundle's `fee` must be zero (the guest's "`asset != 0` => `fee = 0`" rule).
-        // [`BRIDGE_BURN_FEE`] is those two bases plus the bridge's charge, which falls on the
-        // burn because that is the one bridge transaction whose sender is sure to hold RAND.
+        // Spec §7 item 3 charges the bundle base "for every bundle", and these are the
+        // transactions that carry two ([`Action::asset_bundle`]): the RAND fee bundle and the
+        // asset bundle inside the action. Both are verified, so both are paid for — and by the
+        // fee bundle, because the asset bundle's `fee` must be zero (the guest's "`asset != 0`
+        // => `fee = 0`" rule). A `BridgeBurn` pays [`BRIDGE_BURN_FEE`]: those two bases plus the
+        // bridge's charge, which falls on the burn because that is the one bridge transaction
+        // whose sender is sure to hold RAND. RPL's `TokenTransfer` and `TokenBurn` pay the two
+        // bases alone.
         Action::BridgeBurn { .. } => BRIDGE_BURN_FEE,
+        Action::TokenTransfer { .. } | Action::TokenBurn { .. } => 2 * BUNDLE_BASE,
         // Block aggregation: registering burns the genesis bond through its bundle, so the
         // bundle pays the plain base like a transfer or a `Bond`. The four bundle-less
         // aggregation actions have nothing to pay *from* (this function's own rule for
@@ -242,9 +245,11 @@ mod tests {
         }
     }
 
-    /// A `BridgeAttest` — one bundle, sent by a relayer for a depositor with no RAND — pays the
-    /// plain base. A `BridgeBurn` pays the bridge's 0.01 RAND, which has to cover the base for
-    /// both of its bundles (spec §7 item 3) out of the one bundle allowed a non-zero fee.
+    /// Spec §7 item 3 charges the bundle base per *bundle*. A `BridgeAttest` — one bundle, sent
+    /// by a relayer for a depositor with no RAND — pays the plain base. A `BridgeBurn` pays the
+    /// bridge's 0.01 RAND, which has to cover the base for both of its bundles out of the one
+    /// bundle allowed a non-zero fee. RPL's two-bundle actions, `TokenTransfer` and `TokenBurn`,
+    /// pay the base twice.
     #[test]
     fn a_burn_pays_the_bridge_fee_and_an_attest_only_the_base() {
         let b = crate::notes::Bundle {
@@ -268,10 +273,19 @@ mod tests {
         };
         assert_eq!(fee_floor(&attest), BUNDLE_BASE);
         let burn =
-            Action::BridgeBurn { asset_bundle: b, asset: 1, amount: 1, relayer_fee: 0, to_chain: 2, token: [9; 32], to: [0; 32] };
+            Action::BridgeBurn { asset_bundle: b.clone(), asset: 1, amount: 1, relayer_fee: 0, to_chain: 2, token: [9; 32], to: [0; 32] };
         assert_eq!(fee_floor(&burn), BRIDGE_BURN_FEE);
         assert_eq!(BRIDGE_BURN_FEE, 10_000_000, "0.01 RAND");
         assert!(BRIDGE_BURN_FEE >= 2 * BUNDLE_BASE, "both bundles are still paid for");
+        // RPL's two, the same shape, and the two-bundle floor.
+        for a in [
+            Action::TokenTransfer { asset_bundle: b.clone(), memo: Some(vec![7; 2_048]) },
+            Action::TokenBurn { asset_bundle: b, asset: 1, amount: 1 },
+        ] {
+            assert_eq!(fee_floor(&a), 2 * BUNDLE_BASE, "{a:?}");
+            assert!(a.bundle_less().is_none(), "both ride a RAND fee bundle: {a:?}");
+            assert!(a.asset_bundle().is_some(), "and both carry an asset bundle: {a:?}");
+        }
     }
 
     /// The three RPL actions each ride one RAND fee bundle, so each pays the plain bundle base

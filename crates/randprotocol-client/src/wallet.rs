@@ -342,14 +342,15 @@ fn sealed_outputs(tx: &Transaction) -> Vec<(&'static str, u8, Word8, &Envelope)>
             out.push(("bundle", i as u8, *cm, e));
         }
     }
-    match &tx.action {
-        Action::BridgeBurn { asset_bundle, .. } => {
-            for (i, (cm, e)) in asset_bundle.commitments.iter().zip(&asset_bundle.envelopes).enumerate() {
-                out.push(("asset_bundle", i as u8, *cm, e));
-            }
+    if let Action::Mint { cm, envelope, .. } = &tx.action {
+        out.push(("mint", 0, *cm, envelope));
+    }
+    // Every two-bundle action's asset bundle — a `BridgeBurn`'s, a `TokenTransfer`'s or a
+    // `TokenBurn`'s — seals its outputs exactly as the fee bundle does.
+    if let Some(asset_bundle) = tx.action.asset_bundle() {
+        for (i, (cm, e)) in asset_bundle.commitments.iter().zip(&asset_bundle.envelopes).enumerate() {
+            out.push(("asset_bundle", i as u8, *cm, e));
         }
-        Action::Mint { cm, envelope, .. } => out.push(("mint", 0, *cm, envelope)),
-        _ => {}
     }
     out
 }

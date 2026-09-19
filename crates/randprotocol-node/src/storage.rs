@@ -260,9 +260,10 @@ fn sync_opts() -> WriteOptions {
 }
 
 /// Every note a transaction creates, paired with the envelope that opens it: the bundle's two
-/// output slots in that order, then a mint's single note, a bridge deposit, or a
-/// `BridgeBurn`'s asset bundle — exactly the order the ledger appends them in, so the index a
-/// leaf gets on disk is the index the ledger gave it.
+/// output slots in that order, then a mint's single note or a bridge deposit, then — for a
+/// two-bundle action ([`Action::asset_bundle`]: a `BridgeBurn`, a `TokenTransfer` or a
+/// `TokenBurn`) — its asset bundle's two slots. Exactly the order the ledger appends them in, so
+/// the index a leaf gets on disk is the index the ledger gave it.
 ///
 /// A `BridgeAttest`'s deposit is the one commitment the wire does not carry: the chain computes
 /// it from the amount the guardians signed, the `time` the action published and the index the
@@ -301,11 +302,6 @@ fn created_notes(
                 out.push(note);
             }
         }
-        Action::BridgeBurn { asset_bundle, .. } => {
-            for i in 0..2 {
-                out.push((asset_bundle.commitments[i], asset_bundle.envelopes[i].clone()));
-            }
-        }
         // RPL (spec §4): a minted note is chain-computed exactly as a bridge deposit is, so it is
         // not on the wire either and has to be recomputed here — from the action's own public
         // fields alone, with no registry lookup: a mint names its asset index and a registration
@@ -327,6 +323,17 @@ fn created_notes(
             out.push((cm, m.envelope.clone()));
         }
         _ => {}
+    }
+    // The asset bundle of a two-bundle action — a `BridgeBurn`, a `TokenTransfer` or a
+    // `TokenBurn` — appends its two notes after the fee bundle's, which is the order
+    // `Ledger::apply_tx` writes them in: the fee bundle on the common path, the asset bundle in
+    // the action step. One list of those actions ([`Action::asset_bundle`]), so a fourth cannot
+    // silently leave two leaves out of the notes family and slide every wallet's leaf indices
+    // after it.
+    if let Some(asset_bundle) = tx.action.asset_bundle() {
+        for i in 0..2 {
+            out.push((asset_bundle.commitments[i], asset_bundle.envelopes[i].clone()));
+        }
     }
     Ok(out)
 }
@@ -2256,6 +2263,38 @@ pub(crate) mod fixtures {
         )
     }
 
+    /// A `TokenTransfer` of asset index `asset` whose asset bundle spends `nfs` and creates `cms`,
+    /// with a RAND fee bundle at `fee_seed..fee_seed + 3` paying for both bundles.
+    pub(crate) fn transfer_tx_with(
+        ledger: &Ledger,
+        asset: u32,
+        nfs: [Word8; 2],
+        cms: [Word8; 2],
+        fee_seed: u32,
+        memo: Option<Vec<u8>>,
+    ) -> Transaction {
+        let mut asset_bundle = bundle(ledger, nfs, cms, 0);
+        asset_bundle.asset = asset;
+        let d = StubExecutor.bundle_digest(&asset_bundle.digest_input());
+        asset_bundle.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        Transaction::shielded(
+            ledger.chain_id(),
+            bundle(
+                ledger,
+                [[fee_seed; 8], [fee_seed + 1; 8]],
+                [[fee_seed + 2; 8], [fee_seed + 3; 8]],
+                2 * gas::BUNDLE_BASE,
+            ),
+            Action::TokenTransfer { asset_bundle, memo },
+        )
+    }
+
+    /// [`transfer_tx_with`] laid out like [`burn_tx`]: the asset bundle's words are
+    /// `seed..seed + 3` and the fee bundle's `seed + 4..seed + 7`.
+    pub(crate) fn transfer_tx(ledger: &Ledger, asset: u32, seed: u32, memo: Option<Vec<u8>>) -> Transaction {
+        transfer_tx_with(ledger, asset, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], seed + 4, memo)
+    }
+
     /// A bridged chain funded for a withdraw (one bundle fee, one validator staked) — the shared
     /// setup under the S2×S3 seam tests, their `BridgeBurn` variant, and the RPC test that renders
     /// both derived-note mechanisms through a compact block.
@@ -2599,6 +2638,45 @@ mod tests {
         assert_eq!(check.problem, None);
         assert_eq!(check.last_good, 2);
         assert_eq!(check.ledger.bridge(), ledger.bridge(), "the replay rebuilt the bridge");
+    }
+
+    /// A `TokenTransfer` creates **four** notes — its fee bundle's two and its asset bundle's two
+    /// — and the note index has to agree with the ledger leaf for leaf: a count one short would
+    /// slide every wallet's leaf index after it, and every merkle path with them. All four are on
+    /// the wire, so the ledger derives none of them.
+    #[test]
+    fn a_token_transfer_indexes_four_notes_in_the_ledgers_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, secrets) = bridged_genesis(12);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let att = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000, 0), 20);
+        let b1 = make_block(&gs.block, &mut ledger, vec![att], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+
+        let before = ledger.next_index();
+        let t = transfer_tx(&ledger, 1, 30, Some(vec![9; 32]));
+        let b2 = make_block(&b1.block, &mut ledger, vec![t.clone()], &key(1));
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+
+        assert_eq!(ledger.next_index(), before + 4, "two bundles, four leaves");
+        assert_eq!(t.commitments().len(), 4, "and the wire carries all four");
+        assert_eq!(derived_note_count(&t), 0, "so the ledger derives none of them");
+        let notes = created_notes(&t, ledger.tokens(), &StubExecutor).unwrap();
+        assert_eq!(
+            notes.iter().map(|(cm, _)| *cm).collect::<Vec<_>>(),
+            t.commitments(),
+            "the fee bundle's two slots, then the asset bundle's — the order the ledger appends"
+        );
+        let rows = s.notes_in_heights(2, 2, 100).unwrap();
+        assert_eq!(
+            rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (before..before + 4).collect::<Vec<_>>(),
+            "and the four rows on disk carry the indices the ledger gave them"
+        );
+        // A transfer moves notes and nothing else: the token's public count is the deposit's.
+        assert_eq!(ledger.tokens().unwrap().get(1).unwrap().total_supply, 1_000);
     }
 
     /// A chain whose genesis has no `bridge` section stores no bridge state at all, and

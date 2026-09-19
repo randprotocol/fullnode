@@ -258,6 +258,36 @@ pub enum Action {
     /// [`crate::types::actions::set_authority_message`]; any other authority kind is
     /// `TokenError::NotKeyAuthority`, which makes a renunciation final.
     SetAuthority { asset: u32, new: Option<PublicKey>, nonce: u64, signature: Signature },
+    /// RPL (spec §4): move notes of a registered token. The chain's second two-bundle
+    /// transaction, built exactly as [`Action::BridgeBurn`] is: `asset_bundle` spends and creates
+    /// the token's notes, the transaction's own `bundle` pays the RAND fee. There is no `asset`
+    /// field — the bundle's own `asset` word *is* the token, which must be a registered index and
+    /// never 0 (that is RAND, and a RAND transfer is a plain bundle).
+    ///
+    /// A transfer moves any registered token, bridged ones included, and touches neither a
+    /// token's `total_supply` nor any backing: it creates no value and destroys none.
+    ///
+    /// `memo` is **opaque to the chain**, which checks only that it is at most
+    /// [`crate::ledger::tokens::MAX_MEMO_BYTES`] bytes (SPL's memo). Nothing reads it — a wallet's
+    /// allowance grant (spec §6) is one thing it can carry — and it is public, so a wallet that
+    /// wants one transfer to look like every other attaches a random memo of the same length.
+    TokenTransfer {
+        asset_bundle: Bundle,
+        #[serde(with = "crate::crypto::wire_bytes_opt")]
+        memo: Option<Vec<u8>>,
+    },
+    /// RPL (spec §4): destroy `amount` of token `asset` held in the pool, lowering its public
+    /// `total_supply` by exactly that. [`Action::TokenTransfer`]'s two-bundle shape with a burning
+    /// asset bundle: `asset_bundle.burn == amount`.
+    ///
+    /// Refused for a [`MintAuthority::Bridge`] token (`TokenError::BridgedToken`): a bridged
+    /// token's supply moves only with one of its backings, so it leaves through
+    /// [`Action::BridgeBurn`], which names the coin being released. Unsigned by design — burning
+    /// needs no authority, only the notes, and the asset bundle's proof is what shows they were
+    /// held.
+    ///
+    /// [`MintAuthority::Bridge`]: crate::ledger::tokens::MintAuthority::Bridge
+    TokenBurn { asset_bundle: Bundle, asset: u32, amount: u64 },
 }
 
 impl Action {
@@ -278,6 +308,23 @@ impl Action {
             Action::WithdrawAggregator { .. } => Some("withdraw_aggregator"),
             Action::SlashAggregator { .. } => Some("slash_aggregator"),
             Action::Aggregate { .. } => Some("aggregate"),
+            _ => None,
+        }
+    }
+
+    /// This action's *asset* bundle — the second bundle of a two-bundle transaction, the one that
+    /// is not the RAND fee bundle — or `None` for the actions that carry only one.
+    ///
+    /// The one list of the three actions that have one (`BridgeBurn`, `TokenTransfer`,
+    /// `TokenBurn`), so that everything which has to treat an asset bundle as a bundle — the size
+    /// caps at admission step 1, the transaction's nullifiers and commitments, the node's note
+    /// index and its mempool conflict keys — reads it from here rather than keeping a list of its
+    /// own that a fourth such action could be left out of.
+    pub fn asset_bundle(&self) -> Option<&Bundle> {
+        match self {
+            Action::BridgeBurn { asset_bundle, .. }
+            | Action::TokenTransfer { asset_bundle, .. }
+            | Action::TokenBurn { asset_bundle, .. } => Some(asset_bundle),
             _ => None,
         }
     }
@@ -396,18 +443,19 @@ impl Transaction {
         self.bundle.as_ref().map_or(0, |b| b.fee)
     }
 
-    /// The nullifiers this transaction spends: the fee bundle's, then — for a `BridgeBurn` —
-    /// the asset bundle's, which are spent by the same transaction and must be just as unique.
+    /// The nullifiers this transaction spends: the fee bundle's, then — for a two-bundle action
+    /// ([`Action::asset_bundle`]) — the asset bundle's, which are spent by the same transaction
+    /// and must be just as unique.
     pub fn nullifiers(&self) -> Vec<Word8> {
         let mut v: Vec<Word8> = self.bundle.as_ref().map_or(Vec::new(), |b| b.nullifiers.to_vec());
-        if let Action::BridgeBurn { asset_bundle, .. } = &self.action {
+        if let Some(asset_bundle) = self.action.asset_bundle() {
             v.extend_from_slice(&asset_bundle.nullifiers);
         }
         v
     }
 
     /// Every note commitment this transaction creates: the bundle's two output slots in order,
-    /// then a mint's note, then — for a `BridgeBurn` — the asset bundle's two slots.
+    /// then a mint's note, then — for a two-bundle action — the asset bundle's two slots.
     ///
     /// A `Withdraw`'s and a `BridgeAttest`'s deposit notes are deliberately absent — and so are
     /// RPL's two minted ones, a `TokenMint`'s and a `RegisterToken`'s `initial`: their commitment
@@ -417,10 +465,11 @@ impl Transaction {
     /// where the note index recomputes them for a committed block.
     pub fn commitments(&self) -> Vec<Word8> {
         let mut v: Vec<Word8> = self.bundle.as_ref().map_or(Vec::new(), |b| b.commitments.to_vec());
-        match &self.action {
-            Action::Mint { cm, .. } => v.push(*cm),
-            Action::BridgeBurn { asset_bundle, .. } => v.extend_from_slice(&asset_bundle.commitments),
-            _ => {}
+        if let Action::Mint { cm, .. } = &self.action {
+            v.push(*cm);
+        }
+        if let Some(asset_bundle) = self.action.asset_bundle() {
+            v.extend_from_slice(&asset_bundle.commitments);
         }
         v
     }
@@ -616,6 +665,47 @@ mod tests {
         ] {
             assert_eq!(a.bundle_less(), None, "{a:?}");
         }
+    }
+
+    /// RPL's two-bundle pair reports both bundles' words exactly as a `BridgeBurn` does — the
+    /// mempool's conflict index and the ledger's uniqueness checks read them from here — and the
+    /// memo survives bincode in both of its shapes, which is what [`crate::crypto::wire_bytes_opt`]
+    /// is for: a byte string under a serde `Option`, never a sequence of integers.
+    #[test]
+    fn the_rpl_two_bundle_actions_report_both_bundles_and_their_memo_roundtrips() {
+        let asset_bundle = || {
+            let mut b = bundle();
+            b.nullifiers = [[6; 8], [7; 8]];
+            b.commitments = [[8; 8], [9; 8]];
+            b.asset = 3;
+            b
+        };
+        for memo in [None, Some(Vec::new()), Some(vec![0xab; 2_048])] {
+            let t = Transaction::shielded(
+                7,
+                bundle(),
+                Action::TokenTransfer { asset_bundle: asset_bundle(), memo: memo.clone() },
+            );
+            assert_eq!(t.nullifiers(), vec![[2; 8], [3; 8], [6; 8], [7; 8]]);
+            assert_eq!(t.commitments(), vec![[4; 8], [5; 8], [8; 8], [9; 8]]);
+            assert_eq!(t.action.asset_bundle(), Some(&asset_bundle()));
+            let back = Transaction::decode(&t.encode()).unwrap();
+            assert_eq!(back, t, "{:?} bytes", memo.as_ref().map(|m| m.len()));
+            let Action::TokenTransfer { memo: got, .. } = &back.action else { panic!("a transfer") };
+            assert_eq!(got, &memo);
+            // JSON is self-describing and keeps the integer-sequence form, as `wire_bytes` does.
+            assert_eq!(serde_json::from_str::<Action>(&serde_json::to_string(&t.action).unwrap()).unwrap(), t.action);
+        }
+        let mut burning = asset_bundle();
+        burning.burn = 400;
+        let b = Transaction::shielded(7, bundle(), Action::TokenBurn { asset_bundle: burning, asset: 3, amount: 400 });
+        assert_eq!(b.nullifiers(), vec![[2; 8], [3; 8], [6; 8], [7; 8]]);
+        assert_eq!(b.commitments(), vec![[4; 8], [5; 8], [8; 8], [9; 8]]);
+        assert_eq!(Transaction::decode(&b.encode()).unwrap(), b);
+        // Neither rides without a bundle: both pay a RAND fee bundle.
+        assert!(b.action.bundle_less().is_none());
+        // And an action with only one bundle has no asset bundle to report.
+        assert_eq!(Action::None.asset_bundle(), None);
     }
 
     #[test]

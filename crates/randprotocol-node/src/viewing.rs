@@ -174,9 +174,9 @@ pub fn advance(storage: &Storage, import: &mut Import, max_rows: u64) -> Result<
 #[derive(Clone, Debug)]
 pub struct Opening {
     /// Which of the transaction's envelope sets this came from: `"bundle"` (the transaction's
-    /// own, the fee bundle of a `BridgeBurn`), `"asset_bundle"` (a `BridgeBurn`'s second
-    /// bundle), `"deposit"` (a `BridgeAttest`'s deposit envelope), or `"mint"` (a faucet mint's
-    /// one envelope).
+    /// own, the fee bundle of a two-bundle action), `"asset_bundle"` (that action's second
+    /// bundle — a `BridgeBurn`'s, a `TokenTransfer`'s or a `TokenBurn`'s), `"deposit"` (a
+    /// `BridgeAttest`'s deposit envelope), or `"mint"` (a faucet mint's one envelope).
     pub output: &'static str,
     /// The slot inside `output`; meaningless for `"deposit"`, which carries exactly one
     /// envelope.
@@ -213,12 +213,14 @@ pub fn disclosed(tx: &Transaction, deposit_cm: Option<Word8>, key: &TxKey) -> Ve
             try_env("bundle", i as u8, *cm, e);
         }
     }
-    match &tx.action {
-        Action::BridgeBurn { asset_bundle, .. } => {
-            for (i, (cm, e)) in asset_bundle.commitments.iter().zip(&asset_bundle.envelopes).enumerate() {
-                try_env("asset_bundle", i as u8, *cm, e);
-            }
+    // The asset bundle of any two-bundle action — a `BridgeBurn`, a `TokenTransfer` or a
+    // `TokenBurn` — carries envelopes exactly as the fee bundle does, sealed by the same sender.
+    if let Some(asset_bundle) = tx.action.asset_bundle() {
+        for (i, (cm, e)) in asset_bundle.commitments.iter().zip(&asset_bundle.envelopes).enumerate() {
+            try_env("asset_bundle", i as u8, *cm, e);
         }
+    }
+    match &tx.action {
         Action::BridgeAttest { envelope, .. } => {
             if let Some(cm) = deposit_cm {
                 try_env("deposit", 0, cm, envelope);

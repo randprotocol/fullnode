@@ -131,10 +131,12 @@ pub fn is_permanent(e: &TxError) -> bool {
     // The RPL registry's verdicts, split the same way: only the ones a transaction's *own bytes*
     // decide are cacheable — the metadata rules (`BadName`, `BadSymbol`, `TooManyDecimals`), the
     // authority kind a registration may choose, a fixed-supply registration with no initial mint,
-    // and a zero amount. Everything else is a statement about this node's registry at this
-    // moment: `BadNonce`, `UnknownToken`, `AlreadyRegistered`, `IndexMismatch`, `SupplyOverflow`,
-    // `Disabled`, `RegistrationFeeTooLow` and `NotKeyAuthority` all move as blocks arrive, and a
-    // node one block behind would poison itself against transactions that are about to be valid.
+    // a zero amount, and a transfer's memo size. Everything else is a statement about this node's
+    // registry at this moment: `BadNonce`, `UnknownToken`, `AlreadyRegistered`, `IndexMismatch`,
+    // `SupplyOverflow`, `SupplyUnderflow`, `BridgedToken`, `Disabled`, `RegistrationFeeTooLow` and
+    // `NotKeyAuthority` all move as blocks arrive, and a node one block behind would poison itself
+    // against transactions that are about to be valid. `BridgedToken` is the subtle one: it reads
+    // a token's authority, which a `SetAuthority` can rotate, so it is state like the rest.
     //
     // `BadSignature` is deliberately **not** here, unlike the staking and aggregation registers':
     // there the key is the address, so no state can turn a bad signature good, but a token's mint
@@ -150,6 +152,7 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | T::AuthorityNotAllowed
                 | T::InitialMintRequired
                 | T::ZeroAmount
+                | T::MemoTooLarge(_)
         );
     }
     matches!(
@@ -494,6 +497,43 @@ mod tests {
             agg(A::CoverStoreCorrupt(h(8))),
             // The covered-carrying path's signpost is not a verdict on the transaction at all.
             TxError::AggregateNeedsCovered,
+        ] {
+            assert!(!is_permanent(&e), "{e} depends on state and must not be cached");
+        }
+    }
+
+    /// The RPL verdicts, split the same way the aggregate's are: a refusal the transaction's own
+    /// bytes decide is cacheable, a refusal about this node's registry is not — and the registry
+    /// moves with every block, so caching one would make a node one block behind refuse
+    /// transactions that are about to be valid, for good.
+    #[test]
+    fn token_verdicts_are_cached_only_when_they_are_about_the_bytes() {
+        use randprotocol_core::ledger::tokens::TokenError as T;
+        let tok = |t: T| TxError::Token(t);
+        for e in [
+            tok(T::BadName),
+            tok(T::BadSymbol),
+            tok(T::TooManyDecimals(10)),
+            tok(T::AuthorityNotAllowed),
+            tok(T::InitialMintRequired),
+            tok(T::ZeroAmount),
+            tok(T::MemoTooLarge(2_049)),
+        ] {
+            assert!(is_permanent(&e), "{e} is a statement about the bytes");
+        }
+        for e in [
+            tok(T::Disabled),
+            tok(T::UnknownToken(3)),
+            tok(T::BridgedToken(3)),
+            tok(T::SupplyUnderflow),
+            tok(T::SupplyOverflow),
+            tok(T::BadNonce { expected: 1, got: 0 }),
+            tok(T::IndexMismatch { expected: 4, got: 3 }),
+            tok(T::NotKeyAuthority(3)),
+            tok(T::RegistrationFeeTooLow { min: 2, fee: 1 }),
+            // A token's mint authority is state — `SetAuthority` rotates it — so the very same
+            // bytes are refused before that commits and accepted after it.
+            tok(T::BadSignature),
         ] {
             assert!(!is_permanent(&e), "{e} depends on state and must not be cached");
         }

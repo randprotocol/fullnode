@@ -403,7 +403,8 @@ impl ChainLimits {
 /// transaction costs two here. The terms, all per single transaction:
 ///
 /// - `2 * max_proof_bytes` — a `Call` carries **two** proofs, the fee bundle's and the call's own,
-///   and a `BridgeBurn` likewise carries two bundles. This is the term the retired limit missed: it
+///   and a two-bundle action (`BridgeBurn`, `TokenTransfer`, `TokenBurn`) likewise carries two
+///   bundles. This is the term the retired limit missed: it
 ///   allowed `2 * MAX_PROOF_BYTES + 256 KiB` *in total*, which is one hex-encoded proof, so a
 ///   constraint-set-5 `Call` — measured at 1 321 773 bytes for the fee bundle's proof plus ~1.2 MB
 ///   for the call's — was refused after about a hundred seconds of proving.
@@ -882,7 +883,8 @@ pub(crate) fn unsealed_bundles(
 /// call's public input commitment `H_IN` — the one thing a holder needs to open its input
 /// envelope — is served on the receipt (`rand_getReceipt`, `rand_getCallEnvelope`).
 /// A bundle's public fields — none of which names a party. Used for the transaction's own
-/// bundle and, since S3's `BridgeBurn`, for the asset bundle riding inside the action.
+/// bundle and, since S3's `BridgeBurn`, for the asset bundle riding inside a two-bundle action
+/// (RPL's `TokenTransfer` and `TokenBurn` are the other two).
 fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
     json!({
         "anchor": word8_to_hex(&b.anchor),
@@ -1021,6 +1023,21 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
             "kind": "set_authority", "asset": asset, "nonce": nonce,
             // `null` is a renunciation: the token can never be minted again.
             "new_authority": new.as_ref().map(|pk| pk.address().to_base58()),
+        }),
+        // The two shielded RPL actions. A transfer reveals its asset index and nothing else about
+        // the value moved — the asset bundle's four words are what every bundle publishes — and a
+        // holder burn reveals its amount, which is the point: it is what makes `total_supply`
+        // auditable. The memo is opaque to the chain, so only its **size** is rendered: it is
+        // arbitrary submitter bytes, and a JSON field a client might print is no place to put them
+        // (a client that wants the bytes reads them off the transaction's own encoding).
+        Action::TokenTransfer { asset_bundle, memo } => json!({
+            "kind": "token_transfer", "asset": asset_bundle.asset,
+            "memo_bytes": memo.as_ref().map(|m| m.len()),
+            "asset_bundle": bundle_json(asset_bundle),
+        }),
+        Action::TokenBurn { asset_bundle, asset, amount } => json!({
+            "kind": "token_burn", "asset": asset, "amount": amount,
+            "asset_bundle": bundle_json(asset_bundle),
         }),
     };
     json!({
@@ -3292,6 +3309,32 @@ mod tests {
         // The asset bundle renders exactly like the fee bundle: same public fields, no more.
         assert_eq!(burn["asset_bundle"]["nullifiers"][0], word8_to_hex(&nf(3)));
         assert_eq!(burn["asset_bundle"]["fee"], bundle_fee());
+
+        // RPL's two shielded actions. A transfer publishes its asset index and its asset bundle's
+        // four words, and *only the size* of its memo: the bytes are opaque submitter data and no
+        // explorer field is the place for them.
+        let mut asset_bundle = b([nf(5), nf(6)], [cm(5), cm(6)]);
+        asset_bundle.asset = 3;
+        asset_bundle.fee = 0;
+        let t = j(Action::TokenTransfer { asset_bundle: asset_bundle.clone(), memo: Some(vec![0xab; 40]) });
+        assert_eq!(t["kind"], "token_transfer");
+        assert_eq!(t["asset"], 3, "the bundle's own word is the token a transfer moves");
+        assert_eq!(t["memo_bytes"], 40);
+        assert_eq!(t["asset_bundle"]["nullifiers"][0], word8_to_hex(&nf(5)));
+        assert_eq!(t["asset_bundle"]["commitments"][1], word8_to_hex(&cm(6)));
+        assert_eq!(t["asset_bundle"]["fee"], 0, "the RAND bundle pays the fee");
+        assert!(
+            !serde_json::to_string(&t).unwrap().contains("abab"),
+            "the memo's bytes are never rendered, only its length"
+        );
+        assert!(j(Action::TokenTransfer { asset_bundle: asset_bundle.clone(), memo: None })["memo_bytes"].is_null());
+
+        let mut burning = asset_bundle.clone();
+        burning.burn = 400;
+        let tb = j(Action::TokenBurn { asset_bundle: burning, asset: 3, amount: 400 });
+        assert_eq!(tb["kind"], "token_burn");
+        assert_eq!((&tb["asset"], &tb["amount"]), (&json!(3), &json!(400)));
+        assert_eq!(tb["asset_bundle"]["burn"], 400, "a holder burn is public: that is what audits the supply");
 
         // A call reports its envelope's size, or null when it carries none.
         let plain = j(Action::Call { program: Hash::ZERO, proof: vec![1; 40], input_envelope: None });

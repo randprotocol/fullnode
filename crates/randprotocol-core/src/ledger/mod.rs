@@ -178,9 +178,16 @@ pub enum TxError {
     /// key of theirs opens.
     #[error("the attestation deposits under asset {expected}, and the transaction names {actual}")]
     AttestAssetMismatch { expected: u32, actual: u32 },
-    /// A `BridgeBurn`'s asset bundle is in the wrong asset, pays a fee, or burns the wrong
-    /// amount. All three are the same mistake — the asset bundle does not match the burn the
-    /// action declares — and all three are caught before either bundle's proof is verified.
+    /// A two-bundle action's asset bundle is in the wrong asset, pays a fee, or burns the wrong
+    /// amount. All three are the same mistake — the asset bundle does not match what the action
+    /// declares — and all three are caught by [`tokens::check_asset_bundle`] before either
+    /// bundle's proof is verified.
+    ///
+    /// Named for the `BridgeBurn` they were written for and shared unchanged by
+    /// [`crate::types::Action::TokenTransfer`] and [`crate::types::Action::TokenBurn`], whose
+    /// asset bundle is the same bundle under the same three rules: a transfer's declared burn is
+    /// simply zero, so "burns the wrong amount" is how a transfer that tried to destroy something
+    /// is reported.
     #[error("the burn's asset bundle is in asset {actual}, not the declared {expected}")]
     BurnAssetMismatch { expected: u32, actual: u32 },
     #[error("the burn's asset bundle pays a fee of {0}; the fee is paid by the RAND bundle")]
@@ -196,11 +203,19 @@ pub enum TxError {
     /// [`aggregation::AggregationError`]).
     #[error("aggregation: {0}")]
     Aggregation(#[from] aggregation::AggregationError),
-    /// The RPL token registry refused something: today, a chain with no `tokens` section at all
-    /// ([`tokens::TokenError::Disabled`]) and the two supply bounds a bridged deposit or burn
-    /// can reach ([`tokens::TokenError::SupplyOverflow`] / `SupplyUnderflow`), both decided in
-    /// `validate` so that `apply` cannot fail on them. A later task's `RegisterToken`/`Mint`
-    /// actions ride the same variant, as `Staking` and `Aggregation` carry their registers'.
+    /// The RPL token registry refused something (see [`tokens::TokenError`]), the way `Staking`
+    /// and `Aggregation` carry their own registers' verdicts: the gate itself
+    /// ([`tokens::TokenError::Disabled`], a chain with no `tokens` section, which every RPL action
+    /// meets before any check of its own) and everything the five RPL actions decide —
+    /// a registration's metadata, identity, index, authority and fee; a mint's nonce, signature
+    /// and supply bound; a transfer's memo size and unknown index; a holder burn's zero amount,
+    /// bridged token and supply bound. Every one of them is decided in `validate`, so `apply`
+    /// cannot fail on a transaction that was admitted.
+    ///
+    /// The registry's *bridge*-side refusals are deliberately not here: a deposit's and a
+    /// `BridgeBurn`'s supply and backing bounds are reported through
+    /// [`crate::bridge::BridgeError::Token`], from both halves alike, because the action that hit
+    /// them is the bridge's.
     #[error("token: {0}")]
     Token(#[from] tokens::TokenError),
     #[error("arithmetic overflow")]
@@ -942,6 +957,17 @@ impl Ledger {
                 return Err(TxError::ProofTooLarge);
             }
         }
+        // A two-bundle action's second bundle is a bundle: the caps above are the caps every
+        // bundle gets, applied here because `tx.bundle` is only the fee bundle. One check for all
+        // three such actions ([`Action::asset_bundle`]), so a fourth cannot be admitted uncapped.
+        if let Some(ab) = tx.action.asset_bundle() {
+            if ab.envelopes.iter().any(|e| e.len() > MAX_ENVELOPE_BYTES) {
+                return Err(TxError::EnvelopeTooLarge);
+            }
+            if ab.proof.len() > self.max_proof_bytes {
+                return Err(TxError::ProofTooLarge);
+            }
+        }
         match &tx.action {
             Action::Mint { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
                 return Err(TxError::EnvelopeTooLarge)
@@ -970,16 +996,6 @@ impl Ledger {
             Action::Aggregate { proof, .. } if proof.len() > self.max_proof_bytes => return Err(TxError::ProofTooLarge),
             Action::Aggregate { .. } if encoded_len > self.max_aggregate_bytes() => {
                 return Err(TxError::AggregateTooLarge { size: encoded_len, max: self.max_aggregate_bytes() })
-            }
-            // A burn's second bundle is a bundle: the caps above it are the caps every bundle
-            // gets, applied here because `tx.bundle` is only the fee bundle.
-            Action::BridgeBurn { asset_bundle, .. }
-                if asset_bundle.envelopes.iter().any(|e| e.len() > MAX_ENVELOPE_BYTES) =>
-            {
-                return Err(TxError::EnvelopeTooLarge)
-            }
-            Action::BridgeBurn { asset_bundle, .. } if asset_bundle.proof.len() > self.max_proof_bytes => {
-                return Err(TxError::ProofTooLarge)
             }
             // RPL: the envelope sealed against a minted note is a note envelope like any other,
             // and gets the cap every note envelope gets. The rest of a token action's
@@ -1105,7 +1121,11 @@ impl Ledger {
             }
             // RPL (spec §4). Gated absolutely on the `tokens` genesis section, which
             // `tokens::validate` checks before anything else it does.
-            a @ (Action::RegisterToken { .. } | Action::TokenMint { .. } | Action::SetAuthority { .. }) => {
+            a @ (Action::RegisterToken { .. }
+            | Action::TokenMint { .. }
+            | Action::SetAuthority { .. }
+            | Action::TokenTransfer { .. }
+            | Action::TokenBurn { .. }) => {
                 tokens::validate(self, tx, a, executor)?;
             }
             Action::Aggregate { .. } => {
@@ -1243,7 +1263,11 @@ impl Ledger {
             | Action::SlashAggregator { .. }) => {
                 aggregation::apply(self, tx, a, proposer, executor)?;
             }
-            a @ (Action::RegisterToken { .. } | Action::TokenMint { .. } | Action::SetAuthority { .. }) => {
+            a @ (Action::RegisterToken { .. }
+            | Action::TokenMint { .. }
+            | Action::SetAuthority { .. }
+            | Action::TokenTransfer { .. }
+            | Action::TokenBurn { .. }) => {
                 tokens::apply(self, tx, a, executor)?;
             }
             Action::Aggregate { .. } => {

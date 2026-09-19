@@ -297,8 +297,10 @@ impl Mempool {
     /// what can go *stale*; it does not re-check, and cannot, what `validate` alone looks at — the
     /// bundle and call proofs, the attestation's guardian quorum, the fee floor, a
     /// `BridgeAttest`'s derived deposit colliding with its own fee bundle's outputs, and a
-    /// `BridgeBurn`'s asset bundle's anchor and `time` (`applies` sees only `tx.bundle`, the fee
-    /// bundle). Pool a transaction here whose proof nobody verified and the pool will offer the
+    /// two-bundle action's asset bundle's anchor and `time` — a `BridgeBurn`'s, a
+    /// `TokenTransfer`'s or a `TokenBurn`'s (`applies` sees only `tx.bundle`, the fee bundle; its
+    /// *nullifiers* and *commitments* are claimed, through `Transaction::nullifiers`
+    /// /`commitments`, so two transfers spending one token note do conflict in the pool). Pool a transaction here whose proof nobody verified and the pool will offer the
     /// proposer a block that dies on its own candidate.
     pub fn insert_verified(
         &mut self,
@@ -1183,6 +1185,35 @@ mod tests {
         }
         assert_eq!(l.released(&v.address()), 2 * fixtures::bundle_fee());
         (l, secrets)
+    }
+
+    /// A token transfer's notes are spent by its *asset* bundle, not by the RAND fee bundle, and
+    /// the pool's conflict index has to see them: `Transaction::nullifiers` reports both bundles'
+    /// words, so two transfers spending one token note collide on that word and only the first is
+    /// pooled. Without it the pool would offer the proposer a block whose second transfer dies on
+    /// `Spent` — and their fee bundles, which are entirely different notes, say nothing about it.
+    #[test]
+    fn two_transfers_spending_one_token_note_do_not_both_enter_the_pool() {
+        let (l, _) = bridged_ledger();
+        let first = fixtures::transfer_tx_with(&l, 1, [nf(10), nf(11)], [cm(10), cm(11)], 60, None);
+        // A different fee bundle and a different second input, sharing only the first token note.
+        let second = fixtures::transfer_tx_with(&l, 1, [nf(10), nf(12)], [cm(12), cm(13)], 70, None);
+        assert!(
+            first.bundle.as_ref().unwrap().nullifiers.iter().all(|x| !second.nullifiers().contains(x)),
+            "their RAND bundles share nothing"
+        );
+        // Both are independently valid: the clash is a race, not a validation failure.
+        assert_eq!(l.validate(&first, &StubExecutor), Ok(()));
+        assert_eq!(l.validate(&second, &StubExecutor), Ok(()));
+
+        let mut m = Mempool::new(100);
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.insert(second.clone(), &l, &StubExecutor), Err(MempoolError::Conflict(nf(10))));
+        // And so do their output slots: a commitment claimed by the asset bundle is claimed.
+        let third = fixtures::transfer_tx_with(&l, 1, [nf(14), nf(15)], [cm(10), cm(16)], 80, None);
+        assert_eq!(m.insert(third, &l, &StubExecutor), Err(MempoolError::Conflict(cm(10))));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.candidates(&l, 10), vec![first]);
     }
 
     /// A bridge is permissionless, so two relayers racing one attestation is the normal case,

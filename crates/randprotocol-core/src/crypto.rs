@@ -376,6 +376,48 @@ pub mod wire_bytes {
     }
 }
 
+/// [`wire_bytes`] for an `Option<Vec<u8>>`: `#[serde(with = "crate::crypto::wire_bytes_opt")]`.
+///
+/// The `Option`'s own tag is serde's — bincode writes the usual `0`/`1` byte — and a `Some`'s
+/// payload is encoded byte for byte as [`wire_bytes`] would encode the bare vector, so a field
+/// that gains an `Option` wrapper and a field that has one always agree on the bytes inside it.
+/// The one caller today is a `TokenTransfer`'s memo, which is opaque to the chain and up to
+/// [`crate::ledger::tokens::MAX_MEMO_BYTES`] bytes long — exactly the size where the byte-string
+/// form is worth having over a sequence of integers.
+pub mod wire_bytes_opt {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// A borrowed `&[u8]` that serializes through [`super::wire_bytes`], so the `Option` arm below
+    /// is the only thing this module adds to that encoding.
+    struct Bytes<'a>(&'a [u8]);
+
+    impl Serialize for Bytes<'_> {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            super::wire_bytes::serialize(self.0, s)
+        }
+    }
+
+    /// The owned twin, for the deserializing half.
+    struct Owned(Vec<u8>);
+
+    impl<'de> Deserialize<'de> for Owned {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Owned, D::Error> {
+            super::wire_bytes::deserialize(d).map(Owned)
+        }
+    }
+
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(bytes) => s.serialize_some(&Bytes(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        Ok(Option::<Owned>::deserialize(d)?.map(|o| o.0))
+    }
+}
+
 mod serde_bytes_vec {
     use serde::{Deserialize, Deserializer, Serializer};
 

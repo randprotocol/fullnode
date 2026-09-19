@@ -28,12 +28,16 @@ use crate::bridge::AssetId;
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{merkle_root, Hash, PublicKey};
 use crate::gas;
-use crate::notes::{ShieldedAddress, Word8};
+use crate::notes::{Bundle, ShieldedAddress, Word8};
 use crate::program::ProgramId;
 use crate::types::actions::{set_authority_message, token_mint_message, InitialMint};
 use crate::types::{Action, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Longest a [`Action::TokenTransfer`]'s memo may be, in bytes (spec §4, SPL's memo). The chain
+/// checks the size and nothing else: the bytes are opaque to it.
+pub const MAX_MEMO_BYTES: usize = 2048;
 
 /// The first index [`TokenRegistry::new`] hands out. 0 is RAND and is never registered here,
 /// the same reservation the bridge's own registry used to make before this one replaced it.
@@ -368,17 +372,28 @@ impl TokenRegistry {
         // (`check_lock`), so what admission pre-checks is by construction what this would
         // refuse — and so the writes below cannot half-apply.
         self.check_lock(index, chain, token, amount)?;
-        let info = self.by_index.get_mut(&index).expect("check_lock resolved the index");
-        info.total_supply += amount;
+        self.move_backing(index, chain, token, amount, true);
+        Ok(())
+    }
+
+    /// The write half [`Self::lock`] and [`Self::release`] share: the token's `total_supply` and
+    /// the named backing's `locked` move by the same `amount`, up or down together, which is what
+    /// keeps `total_supply == Σ locked` true through every call (spec §12).
+    ///
+    /// Private and infallible: each caller has just run its own `check_*` against this same state,
+    /// so every `expect` below is that check's guarantee and the arithmetic cannot wrap. It is one
+    /// function rather than two so the two directions cannot drift — they differed only in a sign.
+    fn move_backing(&mut self, index: u32, chain: u16, token: &[u8; 32], amount: u64, up: bool) {
+        let info = self.by_index.get_mut(&index).expect("the checked half resolved the index");
+        info.total_supply = if up { info.total_supply + amount } else { info.total_supply - amount };
         let MintAuthority::Bridge { backings } = &mut info.authority else {
-            unreachable!("check_lock resolved a backing")
+            unreachable!("the checked half resolved a backing")
         };
         let backing = backings
             .iter_mut()
             .find(|b| b.chain == chain && &b.token == token)
-            .expect("check_lock resolved the backing");
-        backing.locked += amount;
-        Ok(())
+            .expect("the checked half resolved the backing");
+        backing.locked = if up { backing.locked + amount } else { backing.locked - amount };
     }
 
     /// Exactly what [`Self::lock`] would refuse, without touching anything: the supply's
@@ -400,16 +415,7 @@ impl TokenRegistry {
     /// whole supply is not what bounds a burn, the coin being released is.
     pub fn release(&mut self, index: u32, chain: u16, token: &[u8; 32], amount: u64) -> Result<(), TokenError> {
         self.check_release(index, chain, token, amount)?;
-        let info = self.by_index.get_mut(&index).expect("check_release resolved the index");
-        info.total_supply -= amount;
-        let MintAuthority::Bridge { backings } = &mut info.authority else {
-            unreachable!("check_release resolved a backing")
-        };
-        let backing = backings
-            .iter_mut()
-            .find(|b| b.chain == chain && &b.token == token)
-            .expect("check_release resolved the backing");
-        backing.locked -= amount;
+        self.move_backing(index, chain, token, amount, false);
         Ok(())
     }
 
@@ -619,7 +625,7 @@ pub fn bridged_asset_id(name: &str, symbol: &str, salt: &[u8; 32]) -> AssetId {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// The three RPL actions: RegisterToken, TokenMint, SetAuthority (spec §4)
+// The five RPL actions: RegisterToken, TokenMint, SetAuthority, TokenTransfer, TokenBurn (§4)
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 /// The `from` word of a minted note: an RPL mint has no sender inside the pool, exactly as a
@@ -663,9 +669,58 @@ pub fn mint_commitment(
 /// would let a mis-routed action skip the rules of the module that does own it.
 const NOT_TOKENS: TxError = TxError::UnsupportedAction("tokens");
 
-/// The action step of admission (spec §7 step 7) for the three RPL actions.
+/// The two-bundle rule, in one function for all three actions that carry an *asset* bundle
+/// ([`Action::asset_bundle`]): `BridgeBurn`, [`Action::TokenTransfer`] and [`Action::TokenBurn`].
+/// It is `BridgeBurn`'s rule, factored out of [`super::bridge_notes::validate`] unchanged — the
+/// error variants are still named for the burn it was written for, because the three refusals are
+/// the same three mistakes whichever action makes them.
 ///
-/// Cheap before expensive throughout, and in one order for all three: **the gate** (a chain with
+/// In order, and every one of them a comparison or a set lookup:
+///
+/// 1. the bundle is in the asset the action declares ([`TxError::BurnAssetMismatch`]) — trivially
+///    true for a transfer, whose declared asset *is* `asset_bundle.asset`, and a real check for
+///    the two actions that name one separately;
+/// 2. it pays no fee ([`TxError::BurnAssetBundleFee`]): the fee is RAND and the other bundle pays
+///    it, which is also why `gas::fee_floor` charges these actions two bundle bases;
+/// 3. it burns exactly what the action says (`0` for a transfer, which destroys nothing);
+/// 4. it shares no nullifier and no commitment with the fee bundle — [`Ledger::check_bundle`]
+///    sees each bundle alone and the fee bundle's notes are not in the ledger yet, so the pairs
+///    *between* the two are checked here;
+/// 5. [`Ledger::check_bundle`] itself: the anchor, the window, and the four words against the
+///    ledger.
+///
+/// The caller runs [`Ledger::check_bundle_proof`] **last**, after its own remaining cheap checks,
+/// so a transaction that gets any of this wrong costs no verification (spec §7).
+pub(super) fn check_asset_bundle(
+    ledger: &Ledger,
+    tx: &Transaction,
+    asset_bundle: &Bundle,
+    asset: u32,
+    burn: u64,
+) -> Result<(), TxError> {
+    if asset_bundle.asset != asset {
+        return Err(TxError::BurnAssetMismatch { expected: asset, actual: asset_bundle.asset });
+    }
+    if asset_bundle.fee != 0 {
+        return Err(TxError::BurnAssetBundleFee(asset_bundle.fee));
+    }
+    if asset_bundle.burn != burn {
+        return Err(TxError::BurnAmountMismatch { expected: burn, actual: asset_bundle.burn });
+    }
+    if let Some(fee_bundle) = &tx.bundle {
+        if fee_bundle.nullifiers.iter().any(|nf| asset_bundle.nullifiers.contains(nf)) {
+            return Err(TxError::DuplicateNullifierInBundle);
+        }
+        if fee_bundle.commitments.iter().any(|cm| asset_bundle.commitments.contains(cm)) {
+            return Err(TxError::DuplicateCommitmentInBundle);
+        }
+    }
+    ledger.check_bundle(asset_bundle)
+}
+
+/// The action step of admission (spec §7 step 7) for the five RPL actions.
+///
+/// Cheap before expensive throughout, and in one order for all five: **the gate** (a chain with
 /// no `tokens` section has no RPL at all, and says so before any other token check), then the
 /// action's own byte-level rules, then the state lookups, then the fee, then the time window and
 /// the tree, and the Dilithium2 signature **last** — it is by far the most expensive thing here,
@@ -684,7 +739,14 @@ pub(super) fn validate(
     // Fail closed before anything else, so that this half and [`apply`] answer a mis-routed
     // action alike whether or not the chain has a registry. A discriminant compare, and not a
     // *token* check: the gate below is still the first thing any RPL action meets.
-    if !matches!(action, Action::RegisterToken { .. } | Action::TokenMint { .. } | Action::SetAuthority { .. }) {
+    if !matches!(
+        action,
+        Action::RegisterToken { .. }
+            | Action::TokenMint { .. }
+            | Action::SetAuthority { .. }
+            | Action::TokenTransfer { .. }
+            | Action::TokenBurn { .. }
+    ) {
         return Err(NOT_TOKENS);
     }
     // The gate is absolute (spec §4, and the `aggregation` section's rule before it): on a chain
@@ -795,6 +857,51 @@ pub(super) fn validate(
                 return Err(TokenError::BadSignature.into());
             }
         }
+        Action::TokenTransfer { asset_bundle, memo } => {
+            // The bytes first, before the registry is consulted at all: the memo is opaque and its
+            // size is the only thing about it the chain knows, so an oversized one is a statement
+            // about the transaction alone — which is also what lets admission cache the refusal
+            // (`is_permanent`).
+            if let Some(memo) = memo {
+                if memo.len() > MAX_MEMO_BYTES {
+                    return Err(TokenError::MemoTooLarge(memo.len()).into());
+                }
+            }
+            // A transfer has no `asset` field: the bundle's own word is the token. It must be a
+            // registered index, which rules out 0 in the same breath — 0 is RAND, never a row here,
+            // so a "transfer" of it is a plain bundle wearing a token action's clothes.
+            let asset = asset_bundle.asset;
+            if registry.get(asset).is_none() {
+                return Err(TokenError::UnknownToken(asset).into());
+            }
+            // Any registered token, bridged ones included: a transfer moves notes and no public
+            // counter, so neither a supply nor a backing is involved.
+            check_asset_bundle(ledger, tx, asset_bundle, asset, 0)?;
+            ledger.check_bundle_proof(asset_bundle, executor)?;
+        }
+        Action::TokenBurn { asset_bundle, asset, amount } => {
+            let info = registry.get(*asset).ok_or(TokenError::UnknownToken(*asset))?;
+            // A bridged token's supply moves only with one of its backings
+            // (`TokenRegistry::release`), so it leaves this chain through a `BridgeBurn`, which
+            // names the coin being released. Burning one here would drop the supply while every
+            // source contract kept holding its coins — `total_supply == Σ locked` broken on the
+            // spot — and `sub_supply` refuses it too, which makes this the first of two locks on
+            // one door rather than the only one.
+            if matches!(info.authority, MintAuthority::Bridge { .. }) {
+                return Err(TokenError::BridgedToken(*asset).into());
+            }
+            if *amount == 0 {
+                return Err(TokenError::ZeroAmount.into());
+            }
+            // A checked sub, decided here so `apply`'s `sub_supply` cannot fail: a supply that
+            // wrapped would stop counting what exists. Two burns in one block are safe for the
+            // same reason two mints at one nonce are — block application re-validates each
+            // transaction against the ledger the ones before it left, so the second of two burns
+            // that do not both fit is refused where it sits.
+            info.total_supply.checked_sub(*amount).ok_or(TokenError::SupplyUnderflow)?;
+            check_asset_bundle(ledger, tx, asset_bundle, *asset, *amount)?;
+            ledger.check_bundle_proof(asset_bundle, executor)?;
+        }
         _ => return Err(NOT_TOKENS),
     }
     Ok(())
@@ -820,6 +927,24 @@ pub(super) fn apply(
     action: &Action,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<(), TxError> {
+    // The same two guards `validate` opens with, in the same order and for the same reasons: fail
+    // closed on an action this module does not own (only a routing mistake in `validate_inner`
+    // produces one, and `Ok(())` would let it skip the rules of the module that does), then the
+    // gate — **before any write**. `apply` is only ever reached through `validate`, which has
+    // already refused both cases, so this is the second of two locks on one door; it matters
+    // because several arms below append a note or spend a nullifier before they first touch the
+    // registry, and a direct caller on a gated-off chain would otherwise leave those writes behind.
+    if !matches!(
+        action,
+        Action::RegisterToken { .. }
+            | Action::TokenMint { .. }
+            | Action::SetAuthority { .. }
+            | Action::TokenTransfer { .. }
+            | Action::TokenBurn { .. }
+    ) {
+        return Err(NOT_TOKENS);
+    }
+    gate(ledger)?;
     match action {
         Action::RegisterToken { name, symbol, decimals, authority, initial, salt, index: _ } => {
             // The same id `validate` resolved, from the same fields — the whole initial mint
@@ -857,6 +982,22 @@ pub(super) fn apply(
             // the other.
             registry.bump_nonce(*asset);
         }
+        // The fee bundle's notes were written by `apply_tx`'s common path; the asset bundle's are
+        // written here, through that same path, so a transfer spends four nullifiers and appends
+        // four commitments in total — `BridgeBurn`'s arrangement exactly. The asset bundle's fee
+        // is zero, so no proposer reward follows from it, and no counter moves: a transfer creates
+        // no value and destroys none.
+        Action::TokenTransfer { asset_bundle, .. } => {
+            ledger.apply_bundle_notes(asset_bundle, executor);
+        }
+        Action::TokenBurn { asset_bundle, asset, amount } => {
+            ledger.apply_bundle_notes(asset_bundle, executor);
+            // What the asset bundle destroyed leaves the token's public count, so `total_supply`
+            // keeps saying what exists. `validate` ruled out every refusal `sub_supply` has — the
+            // index, the bridged authority and the underflow — so this cannot fail on a
+            // transaction that was admitted.
+            ledger.tokens_mut().ok_or(TxError::Token(TokenError::Disabled))?.sub_supply(*asset, *amount)?;
+        }
         _ => return Err(NOT_TOKENS),
     }
     Ok(())
@@ -887,6 +1028,17 @@ fn key_authority(
         return Err(TokenError::BadNonce { expected: info.mint_nonce, got: nonce });
     }
     Ok((info, pk))
+}
+
+/// The gate, as a refusal rather than a registry: a chain whose genesis has no `tokens` section
+/// has no RPL at all. [`apply`] reads it once, before any write, because several of its arms
+/// append a note or spend a nullifier before they first touch the registry; [`validate`] takes
+/// the registry itself at the same point, which is the same read.
+fn gate(ledger: &Ledger) -> Result<(), TxError> {
+    match ledger.tokens() {
+        Some(_) => Ok(()),
+        None => Err(TxError::Token(TokenError::Disabled)),
+    }
 }
 
 /// A note the chain is about to create must be one nobody has created yet — in the tree, and in
@@ -1442,7 +1594,7 @@ mod tests {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// The three RPL actions through the ledger (spec §4)
+// The five RPL actions through the ledger (spec §4)
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1496,15 +1648,16 @@ mod action_tests {
         l
     }
 
-    /// A RAND fee bundle paying `fee`, whose four words are `seed..seed + 3`.
-    fn fee_bundle(l: &Ledger, seed: u32, fee: u64) -> Bundle {
+    /// A bundle whose stub proof publishes exactly the digest the ledger recomputes, with its
+    /// four words at `seed..seed + 3`.
+    fn bundle(l: &Ledger, seed: u32, fee: u64, asset: u32, burn: u64) -> Bundle {
         let mut b = Bundle {
             anchor: l.anchors().back().expect("the genesis anchor").1,
             nullifiers: [[seed; 8], [seed + 1; 8]],
             commitments: [[seed + 2; 8], [seed + 3; 8]],
             fee,
-            burn: 0,
-            asset: 0,
+            burn,
+            asset,
             time: l.height() as u32,
             envelopes: [env(), env()],
             proof: vec![],
@@ -1512,6 +1665,17 @@ mod action_tests {
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d);
         b
+    }
+
+    /// A RAND fee bundle paying `fee`, whose four words are `seed..seed + 3`.
+    fn fee_bundle(l: &Ledger, seed: u32, fee: u64) -> Bundle {
+        bundle(l, seed, fee, 0, 0)
+    }
+
+    /// The *asset* bundle of a transfer or a holder burn: no fee — the RAND bundle pays it — the
+    /// token's index as its `asset`, and `burn` destroyed.
+    fn asset_bundle(l: &Ledger, seed: u32, asset: u32, burn: u64) -> Bundle {
+        bundle(l, seed, 0, asset, burn)
     }
 
     /// The initial mint a registration carries: `amount` to [`recipient`], stamped at the
@@ -1630,6 +1794,62 @@ mod action_tests {
 
     fn tok(e: TokenError) -> TxError {
         TxError::Token(e)
+    }
+
+    /// What a two-bundle action's RAND bundle pays: the bundle base for each of its two bundles
+    /// ([`gas::fee_floor`]).
+    const TWO_BUNDLES: u64 = 2 * gas::BUNDLE_BASE;
+
+    /// A `TokenTransfer` of the notes in an asset bundle at `seed..seed + 3`, its RAND fee bundle
+    /// at `seed + 4..seed + 7`. `mutate` breaks the asset bundle after its proof was made, which
+    /// is what makes "refused before any proof work" observable.
+    fn transfer_tx(
+        l: &Ledger,
+        asset: u32,
+        memo: Option<Vec<u8>>,
+        seed: u32,
+        mutate: impl FnOnce(&mut Bundle),
+    ) -> Transaction {
+        let mut asset_bundle = asset_bundle(l, seed, asset, 0);
+        mutate(&mut asset_bundle);
+        Transaction::shielded(
+            CHAIN,
+            fee_bundle(l, seed + 4, TWO_BUNDLES),
+            Action::TokenTransfer { asset_bundle, memo },
+        )
+    }
+
+    /// A `TokenBurn` of `amount` of `asset`, laid out like [`transfer_tx`].
+    fn burn_tx(l: &Ledger, asset: u32, amount: u64, seed: u32, mutate: impl FnOnce(&mut Bundle)) -> Transaction {
+        let mut asset_bundle = asset_bundle(l, seed, asset, amount);
+        mutate(&mut asset_bundle);
+        Transaction::shielded(
+            CHAIN,
+            fee_bundle(l, seed + 4, TWO_BUNDLES),
+            Action::TokenBurn { asset_bundle, asset, amount },
+        )
+    }
+
+    /// USDT on chain 2, the one coin behind the bridged token the tests below list.
+    const USDT: [u8; 32] = [0xd7; 32];
+
+    /// Lists a `Bridge`-authority token backed by [`USDT`] and locks `supply` of it, returning its
+    /// index — the shape a bridged chain's genesis leaves behind, built directly because no RPL
+    /// action may create one.
+    fn list_bridged(l: &mut Ledger, supply: u64) -> u32 {
+        let registry = l.tokens_mut().expect("the gate is on");
+        let index = registry
+            .register(
+                bridged_asset_id("Rand USD", "zUSD", &[0x5a; 32]),
+                "Rand USD".into(),
+                "zUSD".into(),
+                BRIDGE_DECIMALS,
+                MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: USDT, locked: 0 }] },
+                1,
+            )
+            .expect("a fresh listing");
+        registry.lock(index, 2, &USDT, supply).expect("a deposit of the listed coin");
+        index
     }
 
     // ── RegisterToken ────────────────────────────────────────────────────────────────────────
@@ -2094,9 +2314,269 @@ mod action_tests {
         );
     }
 
+    // ── TokenTransfer and TokenBurn: the two-bundle shape ────────────────────────────────────
+
+    /// The whole transfer path: two bundles, four nullifiers spent and four commitments appended,
+    /// and nothing public moved — a transfer creates no value and destroys none, so the token's
+    /// `total_supply` is exactly what it was.
+    #[test]
+    fn a_token_transfer_moves_notes_and_touches_no_supply() {
+        let mut l = ledger();
+        let asset = register_keyed(&mut l, 20);
+        let supply = l.tokens().unwrap().get(asset).unwrap().total_supply;
+        let leaves = l.next_index();
+        let tx = transfer_tx(&l, asset, None, 40, |_| {});
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
+        l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
+
+        for nf in [[40; 8], [41; 8], [44; 8], [45; 8]] {
+            assert!(l.is_spent(&nf), "{nf:?} is spent");
+        }
+        for cm in [[42; 8], [43; 8], [46; 8], [47; 8]] {
+            assert!(l.has_commitment(&cm), "{cm:?} is in the tree");
+        }
+        assert_eq!(l.next_index(), leaves + 4, "two bundles, four leaves");
+        assert_eq!(l.tokens().unwrap().get(asset).unwrap().total_supply, supply, "a transfer mints nothing");
+        // Replayed, the fee bundle's nullifiers are spent — the first refusal the second copy meets.
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::Spent([44; 8])));
+    }
+
+    /// A transfer moves **any** registered token, a bridged one included: its notes are notes like
+    /// any other, and neither the token's supply nor the source contract's locked amount is
+    /// involved — only a `BridgeBurn` moves those.
+    #[test]
+    fn a_transfer_moves_a_bridged_token_and_leaves_its_backing_alone() {
+        let mut l = ledger();
+        let asset = list_bridged(&mut l, 1_000);
+        let tx = transfer_tx(&l, asset, None, 40, |_| {});
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
+        l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
+        let t = l.tokens().unwrap();
+        assert_eq!(t.get(asset).unwrap().total_supply, 1_000);
+        assert_eq!(t.backing(asset, 2, &USDT).unwrap().locked, 1_000);
+        assert!(t.backing_invariant_holds());
+    }
+
+    /// Asset 0 is RAND, which is never a registry row: a transfer naming it is a RAND transfer
+    /// wearing a token action's clothes, and it gets the same refusal an index nobody registered
+    /// gets. The fee bundle's own `asset != 0` rule (`TxError::UnsupportedAsset`) is untouched —
+    /// that bundle is always RAND.
+    #[test]
+    fn a_transfer_of_asset_zero_is_refused() {
+        let mut l = ledger();
+        register_keyed(&mut l, 20);
+        let tx = transfer_tx(&l, 0, None, 40, |_| {});
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(tok(TokenError::UnknownToken(0))));
+    }
+
+    #[test]
+    fn a_transfer_of_an_unregistered_index_is_refused() {
+        let mut l = ledger();
+        register_keyed(&mut l, 20);
+        let tx = transfer_tx(&l, 9, None, 40, |_| {});
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(tok(TokenError::UnknownToken(9))));
+        // And a burn of one likewise.
+        let burn = burn_tx(&l, 9, 100, 50, |_| {});
+        assert_eq!(l.validate(&burn, &StubExecutor), Err(tok(TokenError::UnknownToken(9))));
+    }
+
+    /// The fee is RAND and it is the *other* bundle's to pay: an asset bundle that also charged a
+    /// fee would be paying the proposer in a token. Refused on a comparison, before any proof work
+    /// — each case hands the asset bundle a proof that could never verify, so reaching the
+    /// verification step would be visible.
+    #[test]
+    fn an_asset_bundle_paying_a_fee_is_refused() {
+        let mut l = ledger();
+        let asset = register_keyed(&mut l, 20);
+        let break_proof = |b: &mut Bundle| b.proof = vec![0xff; 16];
+        let tx = transfer_tx(&l, asset, None, 40, |b| {
+            b.fee = 7;
+            break_proof(b);
+        });
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::BurnAssetBundleFee(7)));
+        let burn = burn_tx(&l, asset, 100, 50, |b| {
+            b.fee = 7;
+            break_proof(b);
+        });
+        assert_eq!(l.validate(&burn, &StubExecutor), Err(TxError::BurnAssetBundleFee(7)));
+        // With nothing else wrong, the broken proof is what is left to refuse the transfer —
+        // which is what makes the two answers above an ordering statement.
+        let last = transfer_tx(&l, asset, None, 60, break_proof);
+        assert!(matches!(l.validate(&last, &StubExecutor), Err(TxError::InvalidBundleProof(_))));
+    }
+
+    /// A transfer destroys nothing: value leaves a token's supply through `TokenBurn`, which says
+    /// so publicly, or through `BridgeBurn`, which names a backing. A transfer whose bundle burned
+    /// would take supply out of the count without either.
+    #[test]
+    fn an_asset_bundle_that_burns_inside_a_transfer_is_refused() {
+        let mut l = ledger();
+        let asset = register_keyed(&mut l, 20);
+        let tx = transfer_tx(&l, asset, None, 40, |b| {
+            b.burn = 5;
+            b.proof = vec![0xff; 16];
+        });
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::BurnAmountMismatch { expected: 0, actual: 5 }));
+        // And a burn's bundle must destroy exactly what the action declares, neither more nor less.
+        let over = burn_tx(&l, asset, 100, 50, |b| {
+            b.burn = 101;
+            b.proof = vec![0xff; 16];
+        });
+        assert_eq!(l.validate(&over, &StubExecutor), Err(TxError::BurnAmountMismatch { expected: 100, actual: 101 }));
+    }
+
+    /// `check_bundle` sees each bundle alone, so the pairs *between* the two are checked by the
+    /// shared two-bundle rule: all four nullifiers and all four commitments of a transfer must
+    /// differ, or one note would be spent twice — or appended twice — inside one transaction.
+    #[test]
+    fn a_nullifier_shared_between_the_two_bundles_is_refused() {
+        let mut l = ledger();
+        let asset = register_keyed(&mut l, 20);
+        let tx = transfer_tx(&l, asset, None, 40, |_| {});
+        let Action::TokenTransfer { asset_bundle, .. } = &tx.action else { panic!("a transfer") };
+        let (shared_nf, shared_cm) = (asset_bundle.nullifiers[0], asset_bundle.commitments[1]);
+        let mut clash = tx.clone();
+        clash.bundle.as_mut().unwrap().nullifiers[0] = shared_nf;
+        assert_eq!(l.validate(&clash, &StubExecutor), Err(TxError::DuplicateNullifierInBundle));
+        let mut clash = tx.clone();
+        clash.bundle.as_mut().unwrap().commitments[1] = shared_cm;
+        assert_eq!(l.validate(&clash, &StubExecutor), Err(TxError::DuplicateCommitmentInBundle));
+    }
+
+    /// The memo is opaque and the chain checks only its size (spec §4): [`MAX_MEMO_BYTES`] bytes
+    /// pass, one more does not, and no memo at all is the ordinary transfer.
+    #[test]
+    fn a_memo_over_2048_bytes_is_refused_and_one_at_the_cap_is_not() {
+        let mut l = ledger();
+        let asset = register_keyed(&mut l, 20);
+        assert_eq!(MAX_MEMO_BYTES, 2_048);
+        let over = transfer_tx(&l, asset, Some(vec![7; MAX_MEMO_BYTES + 1]), 40, |_| {});
+        assert_eq!(l.validate(&over, &StubExecutor), Err(tok(TokenError::MemoTooLarge(MAX_MEMO_BYTES + 1))));
+        for memo in [None, Some(Vec::new()), Some(vec![7; MAX_MEMO_BYTES])] {
+            let tx = transfer_tx(&l, asset, memo.clone(), 50, |_| {});
+            assert_eq!(l.validate(&tx, &StubExecutor), Ok(()), "{:?} bytes", memo.map(|m| m.len()));
+        }
+        // A byte-level rule, so it is decided before the registry is consulted at all: an
+        // oversized memo on a transfer of a token nobody registered still reports the memo.
+        let unknown = transfer_tx(&l, 9, Some(vec![7; MAX_MEMO_BYTES + 1]), 60, |_| {});
+        assert_eq!(l.validate(&unknown, &StubExecutor), Err(tok(TokenError::MemoTooLarge(MAX_MEMO_BYTES + 1))));
+    }
+
+    /// The holder burn: the asset bundle destroys `amount`, the token's public supply falls by
+    /// exactly that, and the four words of both bundles are spent and appended as in a transfer.
+    #[test]
+    fn a_token_burn_lowers_supply_by_exactly_the_burn() {
+        let mut l = ledger();
+        let asset = register_keyed(&mut l, 20);
+        assert_eq!(l.tokens().unwrap().get(asset).unwrap().total_supply, 1_000);
+        let tx = burn_tx(&l, asset, 400, 40, |_| {});
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
+        l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
+        assert_eq!(l.tokens().unwrap().get(asset).unwrap().total_supply, 600);
+        for nf in [[40; 8], [41; 8], [44; 8], [45; 8]] {
+            assert!(l.is_spent(&nf), "{nf:?} is spent");
+        }
+        for cm in [[42; 8], [43; 8], [46; 8], [47; 8]] {
+            assert!(l.has_commitment(&cm), "{cm:?} is in the tree");
+        }
+        // A zero burn would spend two notes to destroy nothing, and a burn past the supply would
+        // leave a count no longer describing what exists — both refused before any proof work.
+        let zero = burn_tx(&l, asset, 0, 60, |b| b.proof = vec![0xff; 16]);
+        assert_eq!(l.validate(&zero, &StubExecutor), Err(tok(TokenError::ZeroAmount)));
+        let past = burn_tx(&l, asset, 601, 70, |b| b.proof = vec![0xff; 16]);
+        assert_eq!(l.validate(&past, &StubExecutor), Err(tok(TokenError::SupplyUnderflow)));
+        // Exactly the supply is fine, and leaves the token at zero.
+        let all = burn_tx(&l, asset, 600, 80, |_| {});
+        assert_eq!(l.validate(&all, &StubExecutor), Ok(()));
+        l.apply_tx(&all, &proposer().address(), &StubExecutor).unwrap();
+        assert_eq!(l.tokens().unwrap().get(asset).unwrap().total_supply, 0);
+    }
+
+    /// A bridged token leaves this chain through `BridgeBurn`, which names the coin it redeems and
+    /// moves that backing's `locked` in the same step. A holder burn of one would drop the supply
+    /// while every source contract kept holding its coins — `total_supply == Σ locked` broken on
+    /// the spot — so it is refused outright.
+    #[test]
+    fn a_token_burn_of_a_bridged_token_is_refused() {
+        let mut l = ledger();
+        let asset = list_bridged(&mut l, 1_000);
+        let tx = burn_tx(&l, asset, 400, 40, |_| {});
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(tok(TokenError::BridgedToken(asset))));
+        let t = l.tokens().unwrap();
+        assert_eq!(t.get(asset).unwrap().total_supply, 1_000);
+        assert!(t.backing_invariant_holds());
+    }
+
+    /// Two burns of one token that each fit alone but not together: block application re-validates
+    /// every transaction against the ledger the ones before it left, so the second is refused where
+    /// it sits rather than driving the supply below zero — which is what lets `apply`'s
+    /// `sub_supply` be infallible on anything that was admitted.
+    #[test]
+    fn two_token_burns_in_one_block_that_each_fit_alone_do_not_both_fit() {
+        let mut l = ledger();
+        let asset = register_keyed(&mut l, 20);
+        let first = burn_tx(&l, asset, 600, 40, |_| {});
+        let second = burn_tx(&l, asset, 600, 50, |_| {});
+        assert_eq!(l.validate(&first, &StubExecutor), Ok(()), "each fits against the tip");
+        assert_eq!(l.validate(&second, &StubExecutor), Ok(()));
+        let mut block = l.clone();
+        block.apply_tx(&first, &proposer().address(), &StubExecutor).unwrap();
+        assert_eq!(block.tokens().unwrap().get(asset).unwrap().total_supply, 400);
+        assert_eq!(
+            block.apply_tx(&second, &proposer().address(), &StubExecutor).map(|_| ()),
+            Err(tok(TokenError::SupplyUnderflow)),
+            "1 000 - 600 - 600 would be -200"
+        );
+    }
+
+    /// The asset bundle is a bundle, so it gets the size caps every bundle gets — at step 1, before
+    /// the chain id, the fee floor or anything the action itself owns, and long before either
+    /// proof is verified.
+    #[test]
+    fn an_oversized_asset_bundle_proof_is_refused_before_verification() {
+        let mut l = ledger();
+        let asset = register_keyed(&mut l, 20);
+        let fat = l.max_proof_bytes() + 1;
+        for tx in [
+            transfer_tx(&l, asset, None, 40, |b| b.proof = vec![0; fat]),
+            burn_tx(&l, asset, 400, 50, |b| b.proof = vec![0; fat]),
+        ] {
+            assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::ProofTooLarge), "{:?}", tx.action);
+        }
+        // And the envelope cap, the other half of what a bundle's size rules are.
+        let fat_env = transfer_tx(&l, asset, None, 60, |b| {
+            b.envelopes[1].body = vec![0; crate::notes::MAX_ENVELOPE_BYTES + 1]
+        });
+        assert_eq!(l.validate(&fat_env, &StubExecutor), Err(TxError::EnvelopeTooLarge));
+    }
+
+    /// Both two-bundle actions pay for both of their bundles, and the floor is checked at step 3 —
+    /// before the asset bundle's shape or any proof.
+    #[test]
+    fn a_transfer_and_a_burn_pay_for_both_of_their_bundles() {
+        let mut l = ledger();
+        let asset = register_keyed(&mut l, 20);
+        let short = |mut tx: Transaction| {
+            tx.bundle.as_mut().unwrap().fee = TWO_BUNDLES - 1;
+            let b = tx.bundle.as_mut().unwrap();
+            let d = StubExecutor.bundle_digest(&b.digest_input());
+            b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+            tx
+        };
+        for tx in [transfer_tx(&l, asset, None, 40, |_| {}), burn_tx(&l, asset, 400, 50, |_| {})] {
+            assert_eq!(
+                l.validate(&short(tx.clone()), &StubExecutor),
+                Err(TxError::FeeTooLow { min: TWO_BUNDLES, fee: TWO_BUNDLES - 1 }),
+                "{:?}",
+                tx.action
+            );
+            assert_eq!(l.validate(&tx, &StubExecutor), Ok(()), "exactly the floor is admitted");
+        }
+    }
+
     // ── the gate, the block, and fail-closed routing ─────────────────────────────────────────
 
-    /// The gate is absolute: with no `tokens` section every one of the three is refused before
+    /// The gate is absolute: with no `tokens` section every one of the five is refused before
     /// any other check of its own, whatever else is wrong with it.
     #[test]
     fn every_token_action_is_disabled_without_the_gate() {
@@ -2110,6 +2590,10 @@ mod action_tests {
             // A rotation of a token that really is registered, so its verdict with the gate on
             // comes from the token's own rules rather than from the index being unknown.
             rotate_tx(&l, asset, None, 7, 50, &Keypair::from_seed([98; 32]).unwrap()),
+            // The two-bundle pair, each with a defect of its own (an unregistered index, an
+            // oversized memo) so that `Disabled` below is the gate speaking and not those.
+            transfer_tx(&l, 99, Some(vec![7; MAX_MEMO_BYTES + 1]), 60, |_| {}),
+            burn_tx(&l, 99, 400, 70, |_| {}),
         ];
         // With the gate on, each of the three is refused for a reason of its own and *never*
         // `Disabled` — which is what makes the answer below the gate speaking rather than some
@@ -2127,6 +2611,13 @@ mod action_tests {
                 scratch.apply_tx(tx, &proposer().address(), &StubExecutor).map(|_| ()),
                 Err(tok(TokenError::Disabled))
             );
+            // And the apply half on its own, which only a routing mistake reaches: the two
+            // two-bundle actions write notes before they would otherwise read the registry, so
+            // they read the gate first and leave the tree exactly as they found it.
+            let mut scratch = l.clone();
+            let leaves = scratch.next_index();
+            assert_eq!(apply(&mut scratch, tx, &tx.action, &StubExecutor), Err(tok(TokenError::Disabled)));
+            assert_eq!(scratch.next_index(), leaves, "nothing was appended: {:?}", tx.action);
         }
     }
 
