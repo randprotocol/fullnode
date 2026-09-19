@@ -1930,6 +1930,71 @@ pub async fn resolve_asset(rpc: &RpcClient, text: &str) -> Result<u32> {
     }
 }
 
+/// The PQ co-signature file `rand bridge-mint --pq` and `rand bridge-rotate --pq` read (bridge
+/// hardening B3, `spec/PQ-COSIGNATURE.md` §6): a JSON array
+/// `[{"index": 0, "signature": "<4840 hex>"}, …]`, as the relayer assembles it from the guardians'
+/// `pq_signature` fields. Parsed as written — the order and lengths are the chain's to judge, and
+/// [`check_pq_cosignatures`] judges them first, before any proving.
+pub fn parse_pq_signatures(text: &str) -> Result<Vec<randprotocol_core::bridge::PqSignature>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Row {
+        index: u8,
+        signature: String,
+    }
+    let rows: Vec<Row> = serde_json::from_str(text)
+        .context(r#"expected a JSON array of {"index": <0-255>, "signature": "<hex>"}"#)?;
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let sig = r.signature.trim();
+            let bytes = hex::decode(sig.strip_prefix("0x").unwrap_or(sig))
+                .with_context(|| format!("PQ co-signature {i} (index {}) is not hex", r.index))?;
+            Ok(randprotocol_core::bridge::PqSignature { index: r.index, signature: bytes })
+        })
+        .collect()
+}
+
+/// The chain's own five co-signature rules (`randprotocol_core::bridge::check_pq_quorum`), run
+/// here against the PQ guardian set the node serves (`rand_getBridgeState.pq_guardians`) and this
+/// chain's id, before a bundle is proved: a list the ledger would refuse is an error in seconds
+/// rather than a refused transaction after a minute and a half of proving. The chain checks again
+/// at admission; this only saves the proof.
+pub fn check_pq_cosignatures(
+    bridge_state: &Value,
+    chain_id: u64,
+    attestation: &[u8],
+    sigs: &[randprotocol_core::bridge::PqSignature],
+) -> Result<()> {
+    if bridge_state["enabled"] != Value::Bool(true) {
+        return Err(anyhow!("this chain has no bridge"));
+    }
+    let keys = bridge_state["pq_guardians"]
+        .as_array()
+        .ok_or_else(|| anyhow!("the node serves no pq_guardians (a node older than the PQ co-signature?)"))?
+        .iter()
+        .map(|k| {
+            randprotocol_core::PublicKey::from_hex(k.as_str().unwrap_or_default())
+                .map_err(|e| anyhow!("the node's pq_guardians entry is not a Dilithium2 key: {e}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let body = Attestation::body_bytes(attestation).map_err(|e| anyhow!("not a bridge attestation: {e:?}"))?;
+    let mu = randprotocol_core::bridge::digest(body);
+    randprotocol_core::bridge::check_pq_quorum(sigs, &keys, chain_id, &mu)
+        .map_err(|e| anyhow!("the PQ co-signatures would be refused: {e}"))
+}
+
+/// A guardian-set rotation (payload 2) `rand bridge-rotate` submits: the index it rotates to.
+/// Anything else — a transfer, bytes that do not decode — is an error, so the command cannot
+/// spend a fee bundle on an attestation that is not a rotation.
+pub fn attested_rotation(attestation: &[u8]) -> Result<u32> {
+    let att = Attestation::decode(attestation).map_err(|e| anyhow!("not a bridge attestation: {e:?}"))?;
+    match Payload::decode(&att.body.payload).map_err(|e| anyhow!("attestation payload: {e:?}"))? {
+        Payload::GuardianSetUpgrade(g) => Ok(g.new_index),
+        Payload::Transfer(_) => Err(anyhow!("this attestation is a transfer; submit it with `rand bridge-mint`")),
+    }
+}
+
 /// A plain shielded RAND transfer: [`send_asset`] of asset 0.
 #[allow(clippy::too_many_arguments)]
 pub async fn send(
@@ -2052,6 +2117,56 @@ mod tests {
             .encode(),
         };
         Attestation { guardian_set_index: 0, signatures: Vec::new(), body }.encode()
+    }
+
+    /// `--pq`'s file: the relayer's array, parsed as written; not-hex and a wrong shape are
+    /// errors, and the chain's five rules then run locally against the node's PQ set and chain id
+    /// — a short list, a foreign chain's list and an honest one each get the chain's verdict.
+    #[test]
+    fn a_pq_file_parses_and_is_checked_against_the_nodes_pq_set() {
+        use randprotocol_core::bridge::{pq_cosign, PqSignature};
+        let sig = hex::encode([7u8; 4]);
+        let parsed = parse_pq_signatures(&format!(r#"[{{"index":0,"signature":"{sig}"}},{{"index":3,"signature":"0x{sig}"}}]"#)).unwrap();
+        assert_eq!(
+            parsed,
+            vec![PqSignature { index: 0, signature: vec![7; 4] }, PqSignature { index: 3, signature: vec![7; 4] }]
+        );
+        assert!(parse_pq_signatures(r#"[{"index":0,"signature":"zz"}]"#).is_err());
+        assert!(parse_pq_signatures(r#"[{"index":300,"signature":"00"}]"#).is_err());
+        assert!(parse_pq_signatures(r#"{"index":0}"#).is_err());
+
+        let keys: Vec<randprotocol_core::Keypair> =
+            (0..6u8).map(|i| randprotocol_core::Keypair::from_seed([0x70 + i; 32]).unwrap()).collect();
+        let state = serde_json::json!({
+            "enabled": true,
+            "pq_guardians": keys.iter().map(|k| k.public_key().to_hex()).collect::<Vec<_>>(),
+        });
+        let att = transfer_attestation(1_000, [4; 32]);
+        let mu = randprotocol_core::bridge::digest(Attestation::body_bytes(&att).unwrap());
+        let quorum = |chain: u64, n: usize| -> Vec<PqSignature> {
+            keys.iter().take(n).enumerate().map(|(i, k)| pq_cosign(k, i as u8, chain, &mu)).collect()
+        };
+        check_pq_cosignatures(&state, 13, &att, &quorum(13, 5)).unwrap();
+        // Round trip through the file format the relayer writes.
+        let file = serde_json::to_string(
+            &quorum(13, 5).iter().map(|s| serde_json::json!({"index": s.index, "signature": hex::encode(&s.signature)})).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        check_pq_cosignatures(&state, 13, &att, &parse_pq_signatures(&file).unwrap()).unwrap();
+        let short = check_pq_cosignatures(&state, 13, &att, &quorum(13, 4)).unwrap_err().to_string();
+        assert!(short.contains("need 5 of 6"), "{short}");
+        let foreign = check_pq_cosignatures(&state, 13, &att, &quorum(14, 5)).unwrap_err().to_string();
+        assert!(foreign.contains("does not verify"), "{foreign}");
+        assert!(check_pq_cosignatures(&serde_json::json!({"enabled": false}), 13, &att, &quorum(13, 5)).is_err());
+        assert!(check_pq_cosignatures(&serde_json::json!({"enabled": true}), 13, &att, &quorum(13, 5)).is_err());
+    }
+
+    /// `rand bridge-rotate` takes a rotation and nothing else.
+    #[test]
+    fn a_rotation_is_told_apart_from_a_transfer() {
+        assert_eq!(attested_rotation(&rotation_attestation()).unwrap(), 1);
+        assert!(attested_rotation(&transfer_attestation(1, [4; 32])).unwrap_err().to_string().contains("bridge-mint"));
+        assert!(attested_rotation(&[1, 2, 3]).is_err());
     }
 
     #[test]
@@ -2730,6 +2845,7 @@ mod tests {
                 time: 1,
                 asset: 3,
                 envelope: garbage(),
+                pq_signatures: vec![],
             },
         );
         let mint = Transaction::shielded(
@@ -2796,6 +2912,7 @@ mod tests {
                 time: 1,
                 asset: 0,
                 envelope: garbage(),
+                pq_signatures: vec![],
             },
         );
         assert!(rebuilt_notes(&me, &rotation).is_empty(), "a rotation deposits nothing");

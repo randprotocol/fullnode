@@ -143,6 +143,12 @@ pub enum Action {
     /// (`TxError::AttestAssetMismatch`) — a transaction built against another chain's registry, or
     /// against a node that has not seen a listing yet, would otherwise deposit under a word no key
     /// of the recipient's opens. A rotation deposits no note and binds nothing here.
+    ///
+    /// `pq_signatures` (bridge hardening B3, the last field) is the guardians' Dilithium2
+    /// co-signature quorum over `b"rand-bridge-pq-cosign-1" ‖ chain_id ‖ mu`
+    /// ([`crate::bridge::pq`]), required on every attest, a rotation's included. It travels beside
+    /// the attestation, whose wire format it leaves untouched, and it is inside the transaction
+    /// binding — it is not a proof, so [`Action::blanked`] keeps it.
     BridgeAttest {
         #[serde(with = "crate::crypto::wire_bytes")]
         attestation: Vec<u8>,
@@ -151,6 +157,7 @@ pub enum Action {
         time: u32,
         asset: u32,
         envelope: Envelope,
+        pq_signatures: Vec<crate::bridge::PqSignature>,
     },
     /// Phase S3: burn `amount` of asset `asset` to a destination chain. Single-bundle since the
     /// hidden-asset bundle (spec §3.7): the transaction's one bundle spends the asset notes in
@@ -352,14 +359,19 @@ impl Action {
                 envelope: envelope.clone(),
                 signature: signature.clone(),
             },
-            Action::BridgeAttest { attestation, recipient, r, time, asset, envelope } => Action::BridgeAttest {
-                attestation: attestation.clone(),
-                recipient: recipient.clone(),
-                r: *r,
-                time: *time,
-                asset: *asset,
-                envelope: envelope.clone(),
-            },
+            // `pq_signatures` is kept: a co-signature is a signature, not a proof, and a copy
+            // that stripped or swapped it must not keep the fee bundle's proof.
+            Action::BridgeAttest { attestation, recipient, r, time, asset, envelope, pq_signatures } => {
+                Action::BridgeAttest {
+                    attestation: attestation.clone(),
+                    recipient: recipient.clone(),
+                    r: *r,
+                    time: *time,
+                    asset: *asset,
+                    envelope: envelope.clone(),
+                    pq_signatures: pq_signatures.clone(),
+                }
+            }
             Action::BridgeBurn { asset, amount, relayer_fee, to_chain, token, to } => {
                 Action::BridgeBurn {
                     asset: *asset,
@@ -725,6 +737,7 @@ mod tests {
                 time: 9,
                 asset: 1,
                 envelope: env(),
+                pq_signatures: Vec::new(),
             },
         );
         let aggregate = Transaction {
@@ -778,8 +791,17 @@ mod tests {
         "000000000000c3c30700000000000000d4d4d4d4d4d4d4",
     );
     const CALL_ID: &str = "07801ac23f33f0d8b00d6e369f947ddee6afcab406f0d7905cd41bd3775bf1d5";
-    const ATTEST_ENCODING_BLAKE3: &str = "f0f13c7cec3d5fee1f3944c7725cf175f44e55d3787d0bcbd610bf956ed56b65";
-    const ATTEST_ID: &str = "04aa8e8f2dadcd9f93cdeeb79850f0f535f4ca901e7ea162d5e560f2d8f3d690";
+    /// Moved by the bridge hardening's B3, deliberately: `BridgeAttest` gained its last field,
+    /// `pq_signatures`, so an attest's encoding grows by that list (here empty — an 8-byte zero
+    /// length) and its id moves with it. A hard fork for a bridged chain only — no running chain
+    /// has a bridge, and on a chain without one an attest is inadmissible. The values before, on
+    /// the hidden-asset bundle, were
+    /// `f0f13c7cec3d5fee1f3944c7725cf175f44e55d3787d0bcbd610bf956ed56b65` (encoding) and
+    /// `04aa8e8f2dadcd9f93cdeeb79850f0f535f4ca901e7ea162d5e560f2d8f3d690` (id); the new encoding is
+    /// exactly that one followed by the eight zero bytes. The call and the aggregate pins did not
+    /// move.
+    const ATTEST_ENCODING_BLAKE3: &str = "a6ec2084406fa08c02c05bd50142daf06a723fdbdda856d68cd41a34e02772c6";
+    const ATTEST_ID: &str = "a6fe97af73dda142415401c7e755f8532f081bd3fcacfae3fc833e057be1ea23";
     const AGGREGATE_ENCODING_BLAKE3: &str = "c5f06333b3d6f2e744f6edeb66b612723c1bc4fcf7f98fd8249b40226af64d64";
     const AGGREGATE_ID: &str = "a25cb696d9d92cecb09c0b4d4c818ae30c6e29ecda1d73944395843e3f350e0f";
 
@@ -914,6 +936,7 @@ mod tests {
                 time: 9,
                 asset: 1,
                 envelope: env(),
+                pq_signatures: Vec::new(),
             },
         );
         assert_eq!(a.commitments(), vec![[4; 8], [5; 8], [14; 8], [15; 8]]);
@@ -963,6 +986,7 @@ mod tests {
                     time: 9,
                     asset: 1,
                     envelope: env(),
+                    pq_signatures: Vec::new(),
                 },
             )
         };
@@ -1113,6 +1137,10 @@ mod tests {
                 time: 9,
                 asset: 1,
                 envelope: env(),
+                pq_signatures: vec![
+                    crate::bridge::PqSignature { index: 0, signature: vec![0x5c; 8] },
+                    crate::bridge::PqSignature { index: 2, signature: vec![0x5d; 8] },
+                ],
             },
             8 => Action::BridgeBurn {
                 asset: 3,
@@ -1338,6 +1366,20 @@ mod tests {
             (7, "attest attestation", |t| {
                 let Action::BridgeAttest { attestation, .. } = &mut t.action else { panic!() };
                 attestation[0] ^= 1;
+            }),
+            // B3: the PQ co-signatures are inside the binding — stripped, swapped or re-indexed,
+            // a copy no longer carries the original's fee-bundle proof.
+            (7, "attest pq signatures stripped", |t| {
+                let Action::BridgeAttest { pq_signatures, .. } = &mut t.action else { panic!() };
+                pq_signatures.clear();
+            }),
+            (7, "attest pq signature byte", |t| {
+                let Action::BridgeAttest { pq_signatures, .. } = &mut t.action else { panic!() };
+                pq_signatures[1].signature[0] ^= 1;
+            }),
+            (7, "attest pq signature index", |t| {
+                let Action::BridgeAttest { pq_signatures, .. } = &mut t.action else { panic!() };
+                pq_signatures[1].index = 1;
             }),
             (14, "register initial recipient", |t| {
                 let Action::RegisterToken { initial: Some(m), .. } = &mut t.action else { panic!() };

@@ -256,6 +256,7 @@ mod tests {
             time: 0,
             asset: 1,
             envelope: env(),
+            pq_signatures: Vec::new(),
         };
         assert_eq!(fee_floor(&attest), BUNDLE_BASE);
         let burn = Action::BridgeBurn { asset: 1, amount: 1, relayer_fee: 0, to_chain: 2, token: [9; 32], to: [0; 32] };

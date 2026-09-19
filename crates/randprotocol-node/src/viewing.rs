@@ -454,6 +454,7 @@ mod tests {
                 time: 4,
                 asset: 1,
                 envelope: sealed(&bob(), &alice(), &deposit, &deposit_key),
+                pq_signatures: Vec::new(),
             },
         };
         let opened = disclosed(&attest, Some(deposit.commitment()), &deposit_key);

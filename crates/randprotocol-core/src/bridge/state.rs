@@ -27,7 +27,8 @@ use crate::bridge::{
     digest, verify_decoded, Attestation, Body, GuardianKey, GuardianSet, GuardianSetUpgrade,
     Payload, Transfer, VerifyError, AssetId, CHAIN_RAND, GOVERNANCE_EMITTER, GUARDIAN_GRACE_SECS,
 };
-use crate::crypto::{merkle_root, Hash};
+use crate::bridge::pq::{check_pq_structure, verify_pq_signatures, PqSignature};
+use crate::crypto::{merkle_root, Hash, PublicKey};
 use crate::ledger::tokens::{MintAuthority, TokenError, TokenRegistry};
 
 /// The genesis-facing `bridge` section: the Rand emitter address published
@@ -39,8 +40,15 @@ use crate::ledger::tokens::{MintAuthority, TokenError, TokenRegistry};
 /// decimal chain id as a string:
 ///
 /// ```json
-/// { "emitter": "<64 hex>", "guardians": ["<40 hex>"], "emitters": { "2": "<64 hex>" } }
+/// { "emitter": "<64 hex>", "guardians": ["<40 hex>"], "emitters": { "2": "<64 hex>" },
+///   "pq_guardians": ["<2624 hex>"] }
 /// ```
+///
+/// `pq_guardians` (bridge hardening spec §4, B3) are the guardians' Dilithium2 public keys,
+/// **index-aligned with `guardians`**: `pq_guardians[i]` belongs to the operator of
+/// `guardians[i]`. Genesis validation holds the two lists to the same length and each key to a
+/// Dilithium2 key's exact length, unique. Parsing defaults it to empty only so that validation,
+/// not the JSON decoder, reports the mismatch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeConfig {
@@ -50,6 +58,8 @@ pub struct BridgeConfig {
     pub guardians: Vec<GuardianKey>,
     #[serde(default, with = "hex_emitters")]
     pub emitters: BTreeMap<u16, [u8; 32]>,
+    #[serde(default)]
+    pub pq_guardians: Vec<PublicKey>,
 }
 
 /// The plain-bytes twin of [`BridgeConfig`], used for the genesis
@@ -64,17 +74,19 @@ pub struct BridgeCommit {
     pub emitter: [u8; 32],
     pub guardians: Vec<GuardianKey>,
     pub emitters: BTreeMap<u16, [u8; 32]>,
+    pub pq_guardians: Vec<PublicKey>,
 }
 
 impl From<&BridgeConfig> for BridgeCommit {
     /// Destructured on purpose: a new `BridgeConfig` field must not silently
     /// fall out of the genesis commitment — it has to break this conversion.
     fn from(cfg: &BridgeConfig) -> BridgeCommit {
-        let BridgeConfig { emitter, guardians, emitters } = cfg;
+        let BridgeConfig { emitter, guardians, emitters, pq_guardians } = cfg;
         BridgeCommit {
             emitter: *emitter,
             guardians: guardians.clone(),
             emitters: emitters.clone(),
+            pq_guardians: pq_guardians.clone(),
         }
     }
 }
@@ -108,6 +120,11 @@ pub struct BridgeState {
     /// cloned on every speculative block execution: known linear growth,
     /// to be drained into storage per block before ~100k burns (spec 6.3).
     pub burns: BTreeMap<u64, BridgeBurnRecord>,
+    /// The PQ guardian set (B3): the genesis `bridge.pq_guardians`, index-aligned with guardian
+    /// set 0. Every `BridgeAttest` needs a quorum of Dilithium2 co-signatures by it. Fixed for
+    /// the chain's life: a payload-2 rotation moves the ECDSA set only (a PQ rotation is the
+    /// deferred payload 3).
+    pub pq_guardians: Vec<PublicKey>,
 }
 
 /// The small, whole-state half of a [`BridgeState`]: everything except the
@@ -126,6 +143,7 @@ pub struct BridgeMeta {
     pub guardian_sets: BTreeMap<u32, GuardianSet>,
     pub current_set: u32,
     pub burn_sequence: u64,
+    pub pq_guardians: Vec<PublicKey>,
 }
 
 /// Why a bridge transaction was rejected.
@@ -183,6 +201,23 @@ pub enum BridgeError {
     /// registry's verdicts to give and the bridge carries them rather than restating them.
     #[error("{0}")]
     Token(#[from] TokenError),
+    /// The Dilithium2 co-signature (bridge hardening spec §4, [`crate::bridge::pq`]), rule 1:
+    /// fewer than `need = quorum(n)` co-signatures, or more than the `n` PQ guardians.
+    #[error("{have} PQ co-signatures, need {need} of {n}")]
+    PqNoQuorum { have: usize, need: usize, n: usize },
+    /// Rule 2: the co-signers' indices are not strictly increasing (so one would count twice).
+    #[error("PQ co-signature indices are not strictly increasing")]
+    PqIndexOrder,
+    /// Rule 2: a co-signer's index names no PQ guardian.
+    #[error("PQ co-signature index {index} is out of range for {n} PQ guardians")]
+    PqIndexOutOfRange { index: u8, n: usize },
+    /// Rule 3: a co-signature that is not exactly a Dilithium2 signature's 2 420 bytes.
+    #[error("PQ co-signature {index} is {len} bytes, not 2420")]
+    PqBadSignatureLength { index: u8, len: usize },
+    /// Rule 4: a co-signature that does not verify under its PQ guardian's key over
+    /// `b"rand-bridge-pq-cosign-1" ‖ chain_id ‖ mu`.
+    #[error("PQ co-signature {index} does not verify")]
+    PqBadSignature { index: u8 },
 }
 
 /// A transfer attestation as the pool needs it: which asset, under which note
@@ -287,6 +322,7 @@ impl BridgeState {
             emitters: cfg.emitters.clone(),
             guardian_sets,
             current_set: 0,
+            pq_guardians: cfg.pq_guardians.clone(),
             ..Default::default()
         }
     }
@@ -304,6 +340,7 @@ impl BridgeState {
             spent: _,
             burn_sequence,
             burns: _,
+            pq_guardians,
         } = self;
         BridgeMeta {
             emitter: *emitter,
@@ -311,6 +348,7 @@ impl BridgeState {
             guardian_sets: guardian_sets.clone(),
             current_set: *current_set,
             burn_sequence: *burn_sequence,
+            pq_guardians: pq_guardians.clone(),
         }
     }
 
@@ -327,6 +365,7 @@ impl BridgeState {
             guardian_sets,
             current_set,
             burn_sequence,
+            pq_guardians,
         } = meta;
         BridgeState {
             emitter,
@@ -336,6 +375,7 @@ impl BridgeState {
             spent,
             burn_sequence,
             burns,
+            pq_guardians,
         }
     }
 
@@ -364,12 +404,27 @@ impl BridgeState {
     /// a transfer's note index is read from it, and a `(chain, token)` pair
     /// nobody listed is [`BridgeError::UnlistedToken`]. A lookup, so it runs
     /// with the other cheap checks, before the quorum.
+    ///
+    /// `pq_signatures` is the attestation's Dilithium2 co-signature quorum (B3,
+    /// [`crate::bridge::pq`]), required on every attestation — rotations
+    /// included — over `M = b"rand-bridge-pq-cosign-1" ‖ chain_id ‖ mu`, where
+    /// `chain_id` is this Rand chain's. The cost order: the PQ list's
+    /// structural rules (count, index order, index range, lengths) first,
+    /// before anything else here; then every existing check, the ECDSA
+    /// quorum's own structural rules and recoveries last among them; then the
+    /// Dilithium verifications, last of all. The PQ signers are counted on
+    /// their own, independent of which guardians signed the ECDSA quorum.
     pub fn check_attest(
         &self,
         tokens: &TokenRegistry,
         bytes: &[u8],
+        pq_signatures: &[PqSignature],
+        chain_id: u64,
         now: u64,
     ) -> Result<CheckedAttestation, BridgeError> {
+        // The PQ quorum's structure, which needs neither the attestation nor
+        // any key: rules 1-3 of the co-signature, in the vectors' order.
+        check_pq_structure(pq_signatures, self.pq_guardians.len())?;
         // One decode for the whole check: the envelope is parsed here and
         // the already-decoded value handed to `verify_decoded`, which
         // hashes the wire body bytes rather than a re-encoding.
@@ -474,6 +529,9 @@ impl BridgeState {
         // and one recovery per signature.
         let verified = verify_decoded(&att, body_bytes, set, now)?;
         debug_assert_eq!(verified, mu);
+        // Last of all: one Dilithium2 verification per co-signature, over the
+        // same `mu` the ECDSA quorum signed, bound to this chain's id.
+        verify_pq_signatures(pq_signatures, &self.pq_guardians, chain_id, &mu)?;
         Ok(CheckedAttestation { digest: mu, now, plan })
     }
 
@@ -654,14 +712,21 @@ impl BridgeState {
     }
 
     /// Deterministic bridge commitment (spec 6.3, as the RPL token standard
-    /// left it):
+    /// and then the bridge hardening's B3 left it):
     ///
     /// ```text
-    /// blake3("rand-bridge-state-2"
+    /// blake3("rand-bridge-state-3"
     ///     || bincode(emitter, emitters, current_set, guardian_sets)
     ///     || merkle(sorted spent digests)
-    ///     || burn_sequence BE)
+    ///     || burn_sequence BE
+    ///     || bincode(pq_guardians))
     /// ```
+    ///
+    /// B3 appended the PQ guardian set and bumped the domain to
+    /// `rand-bridge-state-3`: the set decides which attestations are
+    /// admissible exactly as the ECDSA sets do, so two nodes that disagree
+    /// about it must disagree at the state root, not only at the genesis hash.
+    /// Still byte-for-byte nothing for a chain without a `bridge` section.
     ///
     /// The outbound emitter and the source-chain emitter table are part of
     /// the commitment: they are consensus-relevant genesis configuration.
@@ -690,7 +755,8 @@ impl BridgeState {
         .expect("bridge configuration and guardian sets serialize");
         buf.extend_from_slice(merkle_root(&spent_leaves).as_bytes());
         buf.extend_from_slice(&self.burn_sequence.to_be_bytes());
-        Hash::digest_domain(b"rand-bridge-state-2", &buf)
+        buf.extend_from_slice(&bincode::serialize(&self.pq_guardians).expect("PQ guardian keys serialize"));
+        Hash::digest_domain(b"rand-bridge-state-3", &buf)
     }
 }
 
@@ -775,6 +841,7 @@ mod hex_emitters {
 mod tests {
     use super::*;
     use crate::bridge::{guardian_address, sign_digest, GuardianSetUpgrade, TRANSFER_PAYLOAD_LEN};
+    use crate::bridge::pq::{pq_cosign, PqSignature, PQ_SIGNATURE_LEN};
     use crate::crypto::Keypair;
 
     fn key(n: u8) -> Keypair {
@@ -849,8 +916,39 @@ mod tests {
             emitter: [1; 32],
             guardians: secrets.iter().map(guardian_address).collect(),
             emitters: (2u16..=5).map(|c| (c, [c as u8; 32])).collect(),
+            pq_guardians: pq_keys().iter().map(|k| k.public_key().clone()).collect(),
         };
         (config, secrets)
+    }
+
+    /// The chain id every test here checks against.
+    const CHAIN: u64 = 7;
+
+    /// The six PQ guardians' Dilithium2 keys, index-aligned with [`cfg`]'s guardians.
+    fn pq_keys() -> Vec<Keypair> {
+        (0..6u8).map(|i| Keypair::from_seed([0x70 + i; 32]).unwrap()).collect()
+    }
+
+    /// `mu` of an encoded attestation, or zeros for bytes that do not decode (whose check is
+    /// refused before any co-signature is read).
+    fn mu_of(bytes: &[u8]) -> [u8; 32] {
+        Attestation::body_bytes(bytes).map(digest).unwrap_or([0; 32])
+    }
+
+    /// A PQ quorum by the PQ guardians at `indices`, over `bytes`' `mu` for `chain_id`.
+    fn cosign_by(indices: &[u8], bytes: &[u8], chain_id: u64) -> Vec<PqSignature> {
+        let keys = pq_keys();
+        indices.iter().map(|&i| pq_cosign(&keys[i as usize], i, chain_id, &mu_of(bytes))).collect()
+    }
+
+    /// The lowest-five PQ quorum a relayer submits for `bytes` on [`CHAIN`].
+    fn cosign(bytes: &[u8]) -> Vec<PqSignature> {
+        cosign_by(&[0, 1, 2, 3, 4], bytes, CHAIN)
+    }
+
+    /// `check_attest` with an honest PQ quorum, for the tests whose subject is the attestation.
+    fn check(st: &BridgeState, tokens: &TokenRegistry, bytes: &[u8], now: u64) -> Result<CheckedAttestation, BridgeError> {
+        st.check_attest(tokens, bytes, &cosign(bytes), CHAIN, now)
     }
 
     /// Check then apply, which is what a test wants when the plan in between
@@ -863,7 +961,7 @@ mod tests {
         bytes: &[u8],
         now: u64,
     ) -> Result<AttestOutcome, BridgeError> {
-        let checked = st.check_attest(tokens, bytes, now)?;
+        let checked = check(st, tokens, bytes, now)?;
         Ok(st.apply_attest(checked))
     }
 
@@ -940,7 +1038,7 @@ mod tests {
         let mu = digest(&body.encode());
         let bytes = attest(&s, 0, body);
 
-        let checked = st.check_attest(&tk, &bytes, 1).unwrap();
+        let checked = check(&st, &tk, &bytes, 1).unwrap();
         assert_eq!(checked.digest(), mu);
         assert!(matches!(checked.plan(), AttestPlan::Transfer(_)));
         // No `unwrap`: applying a checked attestation cannot fail.
@@ -949,7 +1047,7 @@ mod tests {
         assert!(st.spent.contains(&Hash(mu)));
         // And the token cannot be made again: the digest is consumed, so a second attempt is a
         // replay — which is refused before any signature is recovered.
-        assert_eq!(st.check_attest(&tk, &bytes, 1).unwrap_err(), BridgeError::Replay);
+        assert_eq!(check(&st, &tk, &bytes, 1).unwrap_err(), BridgeError::Replay);
     }
 
     #[test]
@@ -962,7 +1060,7 @@ mod tests {
         // The plan is available before anything is applied, and names the index the listing gave
         // the token, plus the coin the attestation deposits against — the ledger needs the first
         // to compute the deposit note's commitment and the second to lock the right backing.
-        let plan = st.check_attest(&tk, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap().plan().clone();
+        let plan = check(&st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap().plan().clone();
         let want = BridgeTransfer { asset, index: 1, chain: 2, token: TOKEN, amount: 1_000, to_hash: to_hash(), relayer_fee: 10 };
         assert_eq!(plan, AttestPlan::Transfer(want.clone()));
         let out = apply(&mut st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap();
@@ -980,11 +1078,11 @@ mod tests {
         let mut tk = tokens();
         let att = attest(&s, 0, transfer_body(2, 1_000, 10, 1));
         assert!(matches!(
-            st.check_attest(&tk, &att, 1),
+            check(&st, &tk, &att, 1),
             Err(BridgeError::UnlistedToken { chain: 2, token }) if token == TOKEN
         ));
         assert_eq!(list(&mut tk, 2, TOKEN), 1);
-        let checked = st.check_attest(&tk, &att, 1).unwrap();
+        let checked = check(&st, &tk, &att, 1).unwrap();
         assert!(matches!(checked.plan(), AttestPlan::Transfer(BridgeTransfer { index: 1, .. })));
     }
 
@@ -1021,21 +1119,21 @@ mod tests {
         assert_eq!(apply(&mut st, &tk, &a, 1).unwrap_err(), BridgeError::Replay);
         let mut b = transfer_body(2, 1, 0, 1);
         b.emitter_address = [9; 32];
-        assert_eq!(st.check_attest(&tk, &attest(&s, 0, b), 1).unwrap_err(), BridgeError::WrongEmitter);
+        assert_eq!(check(&st, &tk, &attest(&s, 0, b), 1).unwrap_err(), BridgeError::WrongEmitter);
         let mut b = transfer_body(2, 1, 0, 1);
         b.emitter_chain = 3; // chain-2 address presented as chain 3
-        assert_eq!(st.check_attest(&tk, &attest(&s, 0, b), 1).unwrap_err(), BridgeError::WrongEmitter);
+        assert_eq!(check(&st, &tk, &attest(&s, 0, b), 1).unwrap_err(), BridgeError::WrongEmitter);
         assert_eq!(
-            st.check_attest(&tk, &attest(&s, 0, transfer_body(2, 1, 0, 2)), 1).unwrap_err(),
+            check(&st, &tk, &attest(&s, 0, transfer_body(2, 1, 0, 2)), 1).unwrap_err(),
             BridgeError::WrongToChain
         );
         assert_eq!(
-            st.check_attest(&tk, &attest(&s, 0, transfer_body(2, 1, 2, 1)), 1).unwrap_err(),
+            check(&st, &tk, &attest(&s, 0, transfer_body(2, 1, 2, 1)), 1).unwrap_err(),
             BridgeError::FeeExceedsAmount
         );
         let mut b = transfer_body(2, 1, 0, 1);
         b.payload[1] = 1; // amount top byte
-        assert_eq!(st.check_attest(&tk, &attest(&s, 0, b), 1).unwrap_err(), BridgeError::AmountOverflow);
+        assert_eq!(check(&st, &tk, &attest(&s, 0, b), 1).unwrap_err(), BridgeError::AmountOverflow);
     }
 
     /// A note's `amount` is a `u64`, so a transfer the wire format can carry
@@ -1051,11 +1149,11 @@ mod tests {
         assert_eq!(list(&mut tk, 2, TOKEN), 1);
         let over = u64::MAX as u128 + 1;
         assert_eq!(
-            st.check_attest(&tk, &attest(&s, 0, transfer_body(2, over, 0, 1)), 1).unwrap_err(),
+            check(&st, &tk, &attest(&s, 0, transfer_body(2, over, 0, 1)), 1).unwrap_err(),
             BridgeError::AmountTooLarge
         );
         // The largest amount that does fit still validates, fee and all.
-        let plan = st.check_attest(&tk, &attest(&s, 0, transfer_body(2, u64::MAX as u128, 7, 1)), 1).unwrap().plan().clone();
+        let plan = check(&st, &tk, &attest(&s, 0, transfer_body(2, u64::MAX as u128, 7, 1)), 1).unwrap().plan().clone();
         assert_eq!(
             plan,
             AttestPlan::Transfer(BridgeTransfer {
@@ -1073,7 +1171,7 @@ mod tests {
         // ledger's apply step cannot be the thing that discovers it.
         tk.lock(1, 2, &TOKEN, 1).unwrap();
         assert_eq!(
-            st.check_attest(&tk, &attest(&s, 0, transfer_body(2, u64::MAX as u128, 7, 1)), 1).unwrap_err(),
+            check(&st, &tk, &attest(&s, 0, transfer_body(2, u64::MAX as u128, 7, 1)), 1).unwrap_err(),
             BridgeError::Token(TokenError::SupplyOverflow)
         );
     }
@@ -1099,7 +1197,7 @@ mod tests {
         assert_eq!(st.check_burn(&tk, 1, 1, 2, &TOKEN, &EVM_TO, 0), Ok(()));
         // And an attestation of the *unlisted* pair is still refused, listing or no listing.
         assert!(matches!(
-            st.check_attest(&tk, &attest(&s, 0, token_body(3, OTHER_TOKEN, 10, 0, 1)), 1),
+            check(&st, &tk, &attest(&s, 0, token_body(3, OTHER_TOKEN, 10, 0, 1)), 1),
             Err(BridgeError::UnlistedToken { chain: 3, .. })
         ));
     }
@@ -1198,7 +1296,7 @@ mod tests {
             .encode(),
         };
         assert_eq!(
-            st.check_attest(&tk, &attest(&s, 0, up(2)), 100).unwrap_err(),
+            check(&st, &tk, &attest(&s, 0, up(2)), 100).unwrap_err(),
             BridgeError::BadUpgradeIndex { expected: 1, got: 2 }
         );
         assert_eq!(apply(&mut st, &tk, &attest(&s, 0, up(1)), 100).unwrap(), AttestOutcome::GuardianSetUpgraded(1));
@@ -1206,11 +1304,10 @@ mod tests {
         assert_eq!(st.guardian_sets[&0].expires_at, 100 + GUARDIAN_GRACE_SECS);
         assert_eq!(st.guardian_sets[&1].keys, new_keys);
         // old set still mints inside grace, not after
-        assert!(st
-            .check_attest(&tk, &attest(&s, 0, transfer_body(2, 1, 0, 1)), 100 + GUARDIAN_GRACE_SECS)
+        assert!(check(&st, &tk, &attest(&s, 0, transfer_body(2, 1, 0, 1)), 100 + GUARDIAN_GRACE_SECS)
             .is_ok());
         assert_eq!(
-            st.check_attest(&tk, &attest(&s, 0, transfer_body(2, 1, 0, 1)), 101 + GUARDIAN_GRACE_SECS)
+            check(&st, &tk, &attest(&s, 0, transfer_body(2, 1, 0, 1)), 101 + GUARDIAN_GRACE_SECS)
                 .unwrap_err(),
             BridgeError::Verify(VerifyError::SetExpired)
         );
@@ -1284,17 +1381,17 @@ mod tests {
         let mut duplicated = keys.clone();
         duplicated[2] = duplicated[1];
         assert_eq!(
-            st.check_attest(&tk, &attest(&s, 0, upgrade_body(1, duplicated)), 100).unwrap_err(),
+            check(&st, &tk, &attest(&s, 0, upgrade_body(1, duplicated)), 100).unwrap_err(),
             BridgeError::DuplicateGuardian
         );
         let mut zeroed = keys.clone();
         zeroed[3] = [0u8; 20];
         assert_eq!(
-            st.check_attest(&tk, &attest(&s, 0, upgrade_body(1, zeroed)), 100).unwrap_err(),
+            check(&st, &tk, &attest(&s, 0, upgrade_body(1, zeroed)), 100).unwrap_err(),
             BridgeError::DuplicateGuardian
         );
         // the same upgrade with distinct, non-zero keys clears every rung
-        assert!(st.check_attest(&tk, &attest(&s, 0, upgrade_body(1, keys)), 100).is_ok());
+        assert!(check(&st, &tk, &attest(&s, 0, upgrade_body(1, keys)), 100).is_ok());
     }
 
     #[test]
@@ -1303,7 +1400,7 @@ mod tests {
         let st = BridgeState::from_config(&c);
         let tk = tokens_with_the_test_token();
         assert_eq!(
-            st.check_attest(&tk, &attest(&s, 5, transfer_body(2, 1, 0, 1)), 1).unwrap_err(),
+            check(&st, &tk, &attest(&s, 5, transfer_body(2, 1, 0, 1)), 1).unwrap_err(),
             BridgeError::Verify(VerifyError::UnknownGuardianSet(5))
         );
     }
@@ -1315,11 +1412,11 @@ mod tests {
         let tk = tokens_with_the_test_token();
         let mut unknown_id = transfer_body(2, 1, 0, 1);
         unknown_id.payload = vec![9u8; TRANSFER_PAYLOAD_LEN]; // payload id 9
-        assert_eq!(st.check_attest(&tk, &attest(&s, 0, unknown_id), 1).unwrap_err(), BridgeError::BadPayload);
+        assert_eq!(check(&st, &tk, &attest(&s, 0, unknown_id), 1).unwrap_err(), BridgeError::BadPayload);
         let mut short = transfer_body(2, 1, 0, 1);
         short.payload.truncate(TRANSFER_PAYLOAD_LEN - 1); // a 132-byte transfer
         assert_eq!(short.payload.len(), 132);
-        assert_eq!(st.check_attest(&tk, &attest(&s, 0, short), 1).unwrap_err(), BridgeError::BadPayload);
+        assert_eq!(check(&st, &tk, &attest(&s, 0, short), 1).unwrap_err(), BridgeError::BadPayload);
     }
 
     #[test]
@@ -1330,7 +1427,7 @@ mod tests {
         let mut b = transfer_body(2, 1, 0, 1);
         // token_chain lives at payload[65..67]: id (1) + amount (32) + token_address (32)
         b.payload[65..67].copy_from_slice(&3u16.to_be_bytes());
-        assert_eq!(st.check_attest(&tk, &attest(&s, 0, b), 1).unwrap_err(), BridgeError::WrongTokenChain);
+        assert_eq!(check(&st, &tk, &attest(&s, 0, b), 1).unwrap_err(), BridgeError::WrongTokenChain);
     }
 
     #[test]
@@ -1372,7 +1469,7 @@ mod tests {
         let set2_keys: Vec<GuardianKey> = (10u8..=15).map(|i| [i; 20]).collect();
         // ... which buys it nothing on a rotation.
         assert_eq!(
-            st.check_attest(&tk, &attest(&s, 0, upgrade_body(2, set2_keys.clone())), 100).unwrap_err(),
+            check(&st, &tk, &attest(&s, 0, upgrade_body(2, set2_keys.clone())), 100).unwrap_err(),
             BridgeError::Verify(VerifyError::SetExpired)
         );
         // The very same upgrade signed by the current set is accepted.
@@ -1383,7 +1480,7 @@ mod tests {
         assert_eq!(st.current_set, 2);
         assert_eq!(st.guardian_sets[&2].keys, set2_keys);
         // Transfers, by contrast, still ride the grace window (spec 3.4).
-        assert!(st.check_attest(&tk, &attest(&s, 0, transfer_body(2, 1, 0, 1)), 100).is_ok());
+        assert!(check(&st, &tk, &attest(&s, 0, transfer_body(2, 1, 0, 1)), 100).is_ok());
     }
 
     /// Symmetry with `check_burn`: a zero-value mint would consume a digest
@@ -1394,11 +1491,11 @@ mod tests {
         let st = BridgeState::from_config(&c);
         let tk = tokens_with_the_test_token();
         assert_eq!(
-            st.check_attest(&tk, &attest(&s, 0, transfer_body(2, 0, 0, 1)), 1).unwrap_err(),
+            check(&st, &tk, &attest(&s, 0, transfer_body(2, 0, 0, 1)), 1).unwrap_err(),
             BridgeError::ZeroAmount
         );
         // ... and a non-zero amount over the same path still validates.
-        assert!(st.check_attest(&tk, &attest(&s, 0, transfer_body(2, 1, 0, 1)), 1).is_ok());
+        assert!(check(&st, &tk, &attest(&s, 0, transfer_body(2, 1, 0, 1)), 1).is_ok());
     }
 
     /// A burn is irreversible once guardians sign it, so an unspendable
@@ -1517,16 +1614,27 @@ mod tests {
     /// commitment and the domain became `rand-bridge-state-2` — the value
     /// before that was
     /// 89555202bad2a2c36210636e3f33a9c559cb6145c7b1be7548352f9ba642cf5b.
+    /// The bridge hardening's B3 appended the PQ guardian set and bumped the
+    /// domain to `rand-bridge-state-3` — the value before that was
+    /// 2504a9da5f62f2ef092493e4c38a8a47560340d0394b1d3721b5aceb6366e141.
     #[test]
     fn root_is_pinned_for_a_fixed_state() {
         let mut st = BridgeState::from_config(&BridgeConfig {
             emitter: [1; 32],
             guardians: vec![[0x11; 20], [0x22; 20]],
             emitters: BTreeMap::from([(2u16, [2u8; 32])]),
+            pq_guardians: vec![
+                PublicKey::from_bytes(&[0x33; crate::crypto::PUBLIC_KEY_LEN]).unwrap(),
+                PublicKey::from_bytes(&[0x44; crate::crypto::PUBLIC_KEY_LEN]).unwrap(),
+            ],
         });
         st.spent.insert(Hash([0x44; 32]));
         st.burn_sequence = 7;
-        assert_eq!(st.root().to_hex(), "2504a9da5f62f2ef092493e4c38a8a47560340d0394b1d3721b5aceb6366e141");
+        assert_eq!(st.root().to_hex(), "2f1798b1aa25286958e333718b3d606590b97f0fa20ce3690499dd6550e63c46");
+        // and so is the PQ guardian set (B3)
+        let mut other_pq = st.clone();
+        other_pq.pq_guardians.reverse();
+        assert_ne!(other_pq.root(), st.root());
         // the emitter and the source-chain emitter table are committed too
         let mut other_emitter = st.clone();
         other_emitter.emitter = [9; 32];
@@ -1585,40 +1693,235 @@ mod tests {
         apply(&mut st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap();
         // A consumed digest is public knowledge and free to resubmit.
         assert_eq!(
-            st.check_attest(&tk, &misattest(0, transfer_body(2, 1_000, 10, 1)), 1).unwrap_err(),
+            check(&st, &tk, &misattest(0, transfer_body(2, 1_000, 10, 1)), 1).unwrap_err(),
             BridgeError::Replay
         );
         let mut b = transfer_body(2, 1, 0, 1);
         b.emitter_address = [9; 32];
-        assert_eq!(st.check_attest(&tk, &misattest(0, b), 1).unwrap_err(), BridgeError::WrongEmitter);
+        assert_eq!(check(&st, &tk, &misattest(0, b), 1).unwrap_err(), BridgeError::WrongEmitter);
         assert_eq!(
-            st.check_attest(&tk, &misattest(0, transfer_body(2, 1, 0, 2)), 1).unwrap_err(),
+            check(&st, &tk, &misattest(0, transfer_body(2, 1, 0, 2)), 1).unwrap_err(),
             BridgeError::WrongToChain
         );
         assert_eq!(
-            st.check_attest(&tk, &misattest(0, transfer_body(2, 1, 2, 1)), 1).unwrap_err(),
+            check(&st, &tk, &misattest(0, transfer_body(2, 1, 2, 1)), 1).unwrap_err(),
             BridgeError::FeeExceedsAmount
         );
         assert_eq!(
-            st.check_attest(&tk, &misattest(0, transfer_body(2, 0, 0, 1)), 1).unwrap_err(),
+            check(&st, &tk, &misattest(0, transfer_body(2, 0, 0, 1)), 1).unwrap_err(),
             BridgeError::ZeroAmount
         );
         assert_eq!(
-            st.check_attest(&tk, &misattest(0, transfer_body(2, u64::MAX as u128 + 1, 0, 1)), 1).unwrap_err(),
+            check(&st, &tk, &misattest(0, transfer_body(2, u64::MAX as u128 + 1, 0, 1)), 1).unwrap_err(),
             BridgeError::AmountTooLarge
         );
         let mut b = transfer_body(2, 1, 0, 1);
         b.payload[0] = 9; // unknown payload id
-        assert_eq!(st.check_attest(&tk, &misattest(0, b), 1).unwrap_err(), BridgeError::BadPayload);
+        assert_eq!(check(&st, &tk, &misattest(0, b), 1).unwrap_err(), BridgeError::BadPayload);
         let keys = vec![guardian_address(&[21; 32])];
         assert_eq!(
-            st.check_attest(&tk, &misattest(0, upgrade_body(5, keys)), 1).unwrap_err(),
+            check(&st, &tk, &misattest(0, upgrade_body(5, keys)), 1).unwrap_err(),
             BridgeError::BadUpgradeIndex { expected: 1, got: 5 }
         );
         // Well-formed and fresh: now the quorum is what fails.
         assert!(matches!(
-            st.check_attest(&tk, &misattest(0, transfer_body(2, 1, 0, 1)), 1).unwrap_err(),
+            check(&st, &tk, &misattest(0, transfer_body(2, 1, 0, 1)), 1).unwrap_err(),
             BridgeError::Verify(VerifyError::WrongGuardian(_))
         ));
+    }
+
+    // ---- B3: the Dilithium2 co-signature on every attestation --------------------------------
+
+    /// A mint with a valid ECDSA quorum and no PQ co-signatures is refused — and so is a rotation:
+    /// the PQ quorum is required on every `BridgeAttest`. Nothing is consumed by a refusal.
+    #[test]
+    fn a_valid_ecdsa_quorum_without_pq_signatures_is_refused() {
+        let (c, s) = cfg();
+        let st = BridgeState::from_config(&c);
+        let tk = tokens_with_the_test_token();
+        let mint = attest(&s, 0, transfer_body(2, 1_000, 10, 1));
+        assert_eq!(
+            st.check_attest(&tk, &mint, &[], CHAIN, 1).unwrap_err(),
+            BridgeError::PqNoQuorum { have: 0, need: 5, n: 6 }
+        );
+        let rotation = attest(&s, 0, upgrade_body(1, vec![[7u8; 20], [8u8; 20]]));
+        assert_eq!(
+            st.check_attest(&tk, &rotation, &[], CHAIN, 100).unwrap_err(),
+            BridgeError::PqNoQuorum { have: 0, need: 5, n: 6 }
+        );
+        // Four of six is short too; five is the quorum.
+        assert!(matches!(
+            st.check_attest(&tk, &mint, &cosign_by(&[0, 1, 2, 3], &mint, CHAIN), CHAIN, 1),
+            Err(BridgeError::PqNoQuorum { have: 4, .. })
+        ));
+        assert!(st.check_attest(&tk, &mint, &cosign(&mint), CHAIN, 1).is_ok());
+    }
+
+    /// The co-signature names the Rand chain: a quorum made for another chain id never verifies
+    /// here, whatever keys were reused, and one made over another attestation's `mu` does not
+    /// either.
+    #[test]
+    fn a_pq_quorum_for_another_chain_or_another_body_is_refused() {
+        let (c, s) = cfg();
+        let st = BridgeState::from_config(&c);
+        let tk = tokens_with_the_test_token();
+        let mint = attest(&s, 0, transfer_body(2, 1_000, 10, 1));
+        assert_eq!(
+            st.check_attest(&tk, &mint, &cosign_by(&[0, 1, 2, 3, 4], &mint, CHAIN + 1), CHAIN, 1).unwrap_err(),
+            BridgeError::PqBadSignature { index: 0 }
+        );
+        let other = attest(&s, 0, transfer_body(2, 2_000, 10, 1));
+        assert_eq!(
+            st.check_attest(&tk, &mint, &cosign(&other), CHAIN, 1).unwrap_err(),
+            BridgeError::PqBadSignature { index: 0 }
+        );
+    }
+
+    /// Rule 5: each quorum is counted on its own. The ECDSA quorum here is guardians 0-4 and the
+    /// PQ quorum guardians 1-5 — accepted; and a PQ signature filed under another guardian's
+    /// index fails even though that guardian is an ECDSA signer.
+    #[test]
+    fn the_pq_signers_are_independent_of_the_ecdsa_signers() {
+        let (c, s) = cfg();
+        let st = BridgeState::from_config(&c);
+        let tk = tokens_with_the_test_token();
+        let mint = attest(&s, 0, transfer_body(2, 1_000, 10, 1));
+        assert!(st.check_attest(&tk, &mint, &cosign_by(&[1, 2, 3, 4, 5], &mint, CHAIN), CHAIN, 1).is_ok());
+        let mut misfiled = cosign(&mint);
+        misfiled[4].signature = cosign_by(&[5], &mint, CHAIN)[0].signature.clone();
+        assert_eq!(
+            st.check_attest(&tk, &mint, &misfiled, CHAIN, 1).unwrap_err(),
+            BridgeError::PqBadSignature { index: 4 }
+        );
+    }
+
+    /// The cost order (spec §4 and §10): the PQ list's structure before *anything* else —
+    /// even a replayed digest or a mis-addressed body is refused for its co-signature shape first
+    /// — and the Dilithium verifications after every other check, the ECDSA recoveries included:
+    /// a structurally sound but forged PQ list on an attestation whose ECDSA quorum is wrong is
+    /// refused for the ECDSA quorum.
+    #[test]
+    fn pq_structure_runs_first_and_dilithium_verification_last() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        let tk = tokens_with_the_test_token();
+        let mint = attest(&s, 0, transfer_body(2, 1_000, 10, 1));
+        apply(&mut st, &tk, &mint, 1).unwrap();
+        let replayed = mint;
+        assert_eq!(st.check_attest(&tk, &replayed, &[], CHAIN, 1).unwrap_err(), BridgeError::PqNoQuorum { have: 0, need: 5, n: 6 });
+        let mut long = cosign(&replayed);
+        long[2].signature.push(0);
+        assert_eq!(
+            st.check_attest(&tk, &replayed, &long, CHAIN, 1).unwrap_err(),
+            BridgeError::PqBadSignatureLength { index: 2, len: PQ_SIGNATURE_LEN + 1 }
+        );
+        assert_eq!(st.check_attest(&tk, &replayed, &cosign(&replayed), CHAIN, 1).unwrap_err(), BridgeError::Replay);
+        // Well-formed zeros: they pass the structure and would fail verification — but the ECDSA
+        // quorum is by strangers, and that is what is reported.
+        let zeros: Vec<PqSignature> =
+            (0..5).map(|i| PqSignature { index: i, signature: vec![0; PQ_SIGNATURE_LEN] }).collect();
+        let forged = misattest(0, transfer_body(2, 5, 0, 1));
+        assert!(matches!(
+            st.check_attest(&tk, &forged, &zeros, CHAIN, 1).unwrap_err(),
+            BridgeError::Verify(VerifyError::WrongGuardian(_))
+        ));
+        // With the ECDSA quorum honest, the zeros are what is left to refuse.
+        let honest = attest(&s, 0, transfer_body(2, 5, 0, 1));
+        assert_eq!(st.check_attest(&tk, &honest, &zeros, CHAIN, 1).unwrap_err(), BridgeError::PqBadSignature { index: 0 });
+    }
+
+    /// A payload-2 rotation must itself carry a PQ quorum by the *current* PQ set, and it moves
+    /// the ECDSA set only: the PQ guardians are the genesis set before and after, and the next
+    /// mint — ECDSA-signed by the new set — is co-signed by the same PQ keys.
+    #[test]
+    fn a_rotation_needs_a_pq_quorum_and_does_not_change_the_pq_set() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        let tk = tokens_with_the_test_token();
+        let pq_before = st.pq_guardians.clone();
+        let new_secrets: Vec<[u8; 32]> = (21u8..=26).map(|i| [i; 32]).collect();
+        let rotation = attest(&s, 0, upgrade_body(1, new_secrets.iter().map(guardian_address).collect()));
+        let checked = st.check_attest(&tk, &rotation, &cosign(&rotation), CHAIN, 100).unwrap();
+        assert_eq!(st.apply_attest(checked), AttestOutcome::GuardianSetUpgraded(1));
+        assert_eq!(st.pq_guardians, pq_before, "a payload-2 rotation leaves the PQ set alone");
+        assert_eq!(st.meta().pq_guardians, pq_before);
+        let mint = attest(&new_secrets, 1, transfer_body(2, 1_000, 10, 1));
+        assert!(st.check_attest(&tk, &mint, &cosign(&mint), CHAIN, 101).is_ok());
+    }
+
+    /// The PQ guardian set is committed by the bridge root (`rand-bridge-state-3`) and carried in
+    /// storage's meta blob.
+    #[test]
+    fn the_pq_set_is_in_the_root_and_the_meta_blob() {
+        let (c, _) = cfg();
+        let st = BridgeState::from_config(&c);
+        assert_eq!(st.pq_guardians, c.pq_guardians);
+        let mut other = st.clone();
+        other.pq_guardians.swap(0, 1);
+        assert_ne!(other.root(), st.root());
+        let meta: BridgeMeta = bincode::deserialize(&bincode::serialize(&st.meta()).unwrap()).unwrap();
+        assert_eq!(BridgeState::from_parts(meta, BTreeSet::new(), BTreeMap::new()), st);
+    }
+
+    /// Every case of the bridge repo's `pq-cosignatures.json`, end to end through `check_attest`:
+    /// the attestation vector the cases were made over (`transfer_eth_usdt_6dp_ok`, with its real
+    /// ECDSA quorum from `vectors.json`), on a bridge whose ECDSA set, emitters and PQ set are the
+    /// vectors' own, at the case's `rand_chain_id`. Each gets its expected verdict — and the
+    /// rotation body in the file, `upgrade_set1_ok`, is admitted with its lowest five co-signers.
+    #[test]
+    fn every_pq_vector_case_through_check_attest() {
+        use crate::bridge::pq::tests::{hex32, vector_keys, vector_sigs, vectors, verdict};
+        let pq = vectors();
+        let att: serde_json::Value = serde_json::from_str(include_str!("vectors.json")).unwrap();
+        let guardians: Vec<GuardianKey> = att["guardians"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| hex::decode(g["address"].as_str().unwrap()).unwrap().try_into().unwrap())
+            .collect();
+        let emitters: BTreeMap<u16, [u8; 32]> = att["emitters"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(chain, a)| (chain.parse().unwrap(), hex32(a)))
+            .collect();
+        let st = BridgeState::from_config(&BridgeConfig {
+            emitter: hex32(&att["rand_emitter"]),
+            guardians,
+            emitters,
+            pq_guardians: vector_keys(&pq),
+        });
+        let now = att["now"].as_u64().unwrap();
+        let by_name = |name: &str| {
+            let v = att["vectors"].as_array().unwrap().iter().find(|v| v["name"] == name).unwrap().clone();
+            hex::decode(v["attestation"].as_str().unwrap()).unwrap()
+        };
+        // The cases' body: a transfer of an Ethereum token, listed here as a bridged coin.
+        let transfer = by_name("transfer_eth_usdt_6dp_ok");
+        let Payload::Transfer(t) =
+            Payload::decode(&Attestation::decode(&transfer).unwrap().body.payload).unwrap()
+        else {
+            panic!("a transfer")
+        };
+        let mut tk = tokens();
+        list(&mut tk, t.token_chain, t.token_address);
+        let mut checked = 0;
+        for case in pq["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            assert_eq!(hex32(&case["mu"]), mu_of(&transfer), "{name}: the cases are over this body");
+            let got = st
+                .check_attest(&tk, &transfer, &vector_sigs(&case["pq_signatures"]), case["rand_chain_id"].as_u64().unwrap(), now)
+                .map(|_| ());
+            assert_eq!(verdict(&got), case["expect"].as_str().unwrap(), "{name}: {got:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, 12);
+        // The rotation body, with the lowest-five co-signers out of its six.
+        let chain_id = pq["rand_chain_id"].as_u64().unwrap();
+        let rotation = by_name("upgrade_set1_ok");
+        let body = pq["bodies"].as_array().unwrap().iter().find(|b| b["attestation_vector"] == "upgrade_set1_ok").unwrap();
+        let five: Vec<PqSignature> = vector_sigs(&body["pq_signatures"]).into_iter().take(5).collect();
+        assert!(st.check_attest(&tk, &rotation, &five, chain_id, now).is_ok());
+        assert!(matches!(st.check_attest(&tk, &rotation, &[], chain_id, now), Err(BridgeError::PqNoQuorum { .. })));
     }
 }

@@ -1068,7 +1068,7 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
         // under. Both are `null` for a guardian-set rotation, which deposits nothing, and for a
         // token this chain has not listed — which no committed attestation can be. The recipient
         // is public in this transaction only — the note's later spend is not.
-        Action::BridgeAttest { attestation, recipient, r, time, asset, .. } => {
+        Action::BridgeAttest { attestation, recipient, r, time, asset, pq_signatures, .. } => {
             let deposit = attest_deposit(attestation, tokens);
             json!({
                 "kind": "bridge_attest",
@@ -1100,6 +1100,10 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
                     );
                     word8_to_hex(&cm)
                 }),
+                // B3: the PQ guardians who co-signed, by index (the signatures themselves are
+                // 2 420 bytes each and verified at admission; the indices are what an explorer
+                // shows beside the ECDSA quorum).
+                "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
             })
         }
         Action::BridgeBurn { asset, amount, relayer_fee, to_chain, token, to } => json!({
@@ -1795,6 +1799,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     .collect::<serde_json::Map<String, Value>>(),
                 "guardian_set_index": bridge.current_set,
                 "guardians": guardians,
+                // B3: the genesis PQ guardian set, index-aligned with guardian set 0, whose
+                // Dilithium2 quorum every `BridgeAttest` carries. A relayer reads it to verify
+                // and order the co-signatures it collects; a payload-2 rotation never moves it.
+                "pq_guardians": bridge.pq_guardians.iter().map(|k| k.to_hex()).collect::<Vec<_>>(),
                 "burn_sequence": bridge.burn_sequence,
                 // `next_index` is gone with the bridge's own registry: there is no index to
                 // predict any more, because a bridged token is listed before it can be deposited
@@ -3440,8 +3448,14 @@ mod tests {
             time: 4,
             asset: 1,
             envelope,
+            pq_signatures: vec![
+                randprotocol_core::bridge::PqSignature { index: 0, signature: vec![1; 4] },
+                randprotocol_core::bridge::PqSignature { index: 3, signature: vec![2; 4] },
+            ],
         });
         assert_eq!(at["kind"], "bridge_attest");
+        // B3: which PQ guardians co-signed, by index — public, and what an explorer shows.
+        assert_eq!(at["pq_signers"], json!([0, 3]));
         assert_eq!(at["attestation_len"], 520);
         assert_eq!(at["recipient"], recipient.to_string());
         assert_eq!(at["asset"], 1, "the index the action names, which is a field of it");
@@ -3664,6 +3678,9 @@ mod tests {
         assert_eq!(v["emitters"]["2"], hex::encode([2u8; 32]));
         assert_eq!(v["guardian_set_index"], 0);
         assert_eq!(v["guardians"].as_array().unwrap().len(), 6);
+        // B3: the PQ guardian set, hex, index-aligned with the guardians.
+        let pq: Vec<String> = fixtures::pq_keys().iter().map(|k| k.public_key().to_hex()).collect();
+        assert_eq!(v["pq_guardians"], json!(pq));
         assert_eq!(v["burn_sequence"], 1);
         // `next_index` is gone with the bridge's own registry: there is no index left to predict,
         // because a bridged token is listed before it can be deposited.

@@ -42,7 +42,7 @@ pub(super) fn validate(
     executor: &dyn ConfidentialExecutor,
 ) -> Result<Option<CheckedAttestation>, TxError> {
     match action {
-        Action::BridgeAttest { attestation, recipient, r, time, asset, envelope: _ } => {
+        Action::BridgeAttest { attestation, recipient, r, time, asset, envelope: _, pq_signatures } => {
             // The cheapest check this action has, and the one that must run before any decode or
             // signature recovery: the deposit note is stamped with this `time` rather than the
             // apply height (see [`Action::BridgeAttest`]), so it gets the window a bundle's
@@ -74,9 +74,13 @@ pub(super) fn validate(
                 }
             }
             // The attestation's size cap ran at step 1, before this decode. `check_attest` is
-            // itself ordered cheap-before-expensive: it decodes, resolves the guardian set,
-            // rejects a replayed digest and checks the payload before recovering a signature.
-            let checked = bridge.check_attest(tokens, attestation, ledger.now_secs()).map_err(TxError::Bridge)?;
+            // itself ordered cheap-before-expensive: the PQ co-signature list's structure first
+            // (B3), then it decodes, resolves the guardian set, rejects a replayed digest and
+            // checks the payload before recovering a signature — and verifies the Dilithium2
+            // co-signatures, over this chain's id, last of all.
+            let checked = bridge
+                .check_attest(tokens, attestation, pq_signatures, ledger.chain_id(), ledger.now_secs())
+                .map_err(TxError::Bridge)?;
             if let AttestPlan::Transfer(t) = checked.plan() {
                 // Redundant by construction with the pre-screen above — both read the same asset
                 // id out of the same bytes and the same registry — and kept because it is a
@@ -307,7 +311,7 @@ pub fn deposit_note(
     tokens: &TokenRegistry,
     executor: &dyn ConfidentialExecutor,
 ) -> Option<(Word8, Envelope)> {
-    let Action::BridgeAttest { attestation, recipient, r, time, asset: _, envelope } = &tx.action else {
+    let Action::BridgeAttest { attestation, recipient, r, time, asset: _, envelope, pq_signatures: _ } = &tx.action else {
         return None;
     };
     let (chain, token, amount) = attested_transfer(attestation)?;
@@ -319,8 +323,8 @@ pub fn deposit_note(
 mod tests {
     use super::*;
     use crate::bridge::{
-        asset_id, digest, guardian_address, sign_digest, Attestation, Body, BridgeConfig, BridgeState, Payload,
-        Transfer, CHAIN_RAND,
+        asset_id, digest, guardian_address, pq_cosign, sign_digest, Attestation, Body, BridgeConfig, BridgeState,
+        Payload, PqSignature, Transfer, CHAIN_RAND,
     };
     use crate::confidential::StubExecutor;
     use crate::crypto::{Address, Keypair};
@@ -363,8 +367,22 @@ mod tests {
             emitter: [1; 32],
             guardians: secrets.iter().map(guardian_address).collect(),
             emitters: (2u16..=5).map(|c| (c, [c as u8; 32])).collect(),
+            pq_guardians: pq_keys().iter().map(|k| k.public_key().clone()).collect(),
         };
         (config, secrets)
+    }
+
+    /// The six PQ guardians' Dilithium2 keys (B3), index-aligned with [`cfg`]'s guardians.
+    fn pq_keys() -> Vec<Keypair> {
+        (0..6u8).map(|i| Keypair::from_seed([0x70 + i; 32]).unwrap()).collect()
+    }
+
+    /// The PQ co-signatures by `indices` over `attestation`'s `mu` on this module's chain (7) —
+    /// what a relayer collects from the guardians and submits beside the attestation.
+    fn cosign_by(indices: &[u8], attestation: &[u8]) -> Vec<PqSignature> {
+        let mu = Attestation::body_bytes(attestation).map(digest).unwrap_or([0; 32]);
+        let keys = pq_keys();
+        indices.iter().map(|&i| pq_cosign(&keys[i as usize], i, 7, &mu)).collect()
     }
 
     /// The registry a bridged chain's genesis leaves behind: [`TOKEN`] at index 1 and
@@ -503,7 +521,13 @@ mod tests {
     /// index the ledger would deposit under. Its fee bundle's four words are `seed..seed + 3`, so
     /// transactions with different seeds never collide on a nullifier or a commitment.
     fn attest_tx(l: &Ledger, attestation: Vec<u8>, to: ShieldedAddress, seed: u32) -> Transaction {
+        attest_tx_cosigned(l, attestation, to, seed, &[0, 1, 2, 3, 4])
+    }
+
+    /// [`attest_tx`] with the PQ co-signatures of `pq` (the lowest five is what a relayer sends).
+    fn attest_tx_cosigned(l: &Ledger, attestation: Vec<u8>, to: ShieldedAddress, seed: u32, pq: &[u8]) -> Transaction {
         let asset = expected_index(l, &attestation);
+        let pq_signatures = cosign_by(pq, &attestation);
         StubExecutor::bound(Transaction::shielded(
             7,
             fee_bundle(l, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
@@ -514,6 +538,7 @@ mod tests {
                 time: l.height() as u32,
                 asset,
                 envelope: env(),
+                pq_signatures,
             },
         ))
     }
@@ -1506,5 +1531,66 @@ mod tests {
         assert_eq!(l.validate(&plain, &StubExecutor), Ok(()));
         assert_eq!(l.validate(&honest_attest, &StubExecutor), Ok(()));
         assert_eq!(l.validate(&burn, &StubExecutor), Ok(()));
+    }
+
+    // ---- B3: the Dilithium2 co-signature ------------------------------------------------------
+
+    /// A mint whose ECDSA quorum is valid but that carries no PQ co-signatures is refused at
+    /// admission, and so is one short of the PQ quorum; the relayer's lowest five is admitted and
+    /// deposits. The digest is not consumed by a refusal.
+    #[test]
+    fn a_mint_without_its_pq_quorum_is_refused() {
+        let (mut l, secrets) = ledger();
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let none = attest_tx_cosigned(&l, a.clone(), recipient(), 20, &[]);
+        assert_eq!(
+            l.validate(&none, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::PqNoQuorum { have: 0, need: 5, n: 6 }))
+        );
+        let four = attest_tx_cosigned(&l, a.clone(), recipient(), 20, &[0, 1, 2, 3]);
+        assert!(matches!(l.validate(&four, &StubExecutor), Err(TxError::Bridge(BridgeError::PqNoQuorum { have: 4, .. }))));
+        assert!(l.bridge().unwrap().spent.is_empty());
+        let five = attest_tx_cosigned(&l, a, recipient(), 20, &[1, 2, 3, 4, 5]);
+        l.apply_tx(&five, &proposer().address(), &StubExecutor).unwrap();
+        assert!(l.has_commitment(&expected_cm(1, 1_000, 1)));
+    }
+
+    /// The co-signatures are inside the transaction binding: a copy of an honest attest whose PQ
+    /// list is swapped for another *valid* quorum (so nothing but the binding can object) keeps
+    /// none of the original's fee-bundle proof — and a copy with the list stripped is refused too.
+    #[test]
+    fn the_binding_covers_the_pq_signatures() {
+        let (l, secrets) = ledger();
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let original = attest_tx(&l, a.clone(), recipient(), 20);
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+        let other_quorum = cosign_by(&[1, 2, 3, 4, 5], &a);
+        let swapped = altered(&original, |act| {
+            let Action::BridgeAttest { pq_signatures, .. } = act else { panic!("an attest") };
+            *pq_signatures = other_quorum.clone();
+        });
+        assert!(matches!(l.validate(&swapped, &StubExecutor), Err(TxError::InvalidBundleProof(_))), "a swapped PQ quorum");
+        let stripped = altered(&original, |act| {
+            let Action::BridgeAttest { pq_signatures, .. } = act else { panic!("an attest") };
+            pq_signatures.clear();
+        });
+        assert!(l.validate(&stripped, &StubExecutor).is_err(), "a stripped PQ quorum");
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+    }
+
+    /// The co-signature is over this chain's id: a quorum signed for another Rand chain is refused
+    /// here, even with every other byte of the transaction honest.
+    #[test]
+    fn a_pq_quorum_for_another_chain_is_refused_at_admission() {
+        let (l, secrets) = ledger();
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let mu = digest(Attestation::body_bytes(&a).unwrap());
+        let keys = pq_keys();
+        let foreign: Vec<PqSignature> = (0..5u8).map(|i| pq_cosign(&keys[i as usize], i, 8, &mu)).collect();
+        let mut tx = attest_tx(&l, a, recipient(), 20);
+        let Action::BridgeAttest { pq_signatures, .. } = &mut tx.action else { panic!("an attest") };
+        *pq_signatures = foreign;
+        let tx = StubExecutor::bound(tx);
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::Bridge(BridgeError::PqBadSignature { index: 0 })));
     }
 }

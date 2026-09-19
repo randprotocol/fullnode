@@ -1236,6 +1236,7 @@ mod tests {
     fn attest_tx_with_r(l: &Ledger, attestation: Vec<u8>, seed: u8, r: Word8) -> Transaction {
         let b = fixtures::bundle(l, [nf(seed), nf(seed + 1)], [cm(seed), cm(seed + 1)], fixtures::bundle_fee());
         let asset = fixtures::deposit_index(l, &attestation);
+        let pq_signatures = fixtures::pq_quorum(l.chain_id(), &attestation);
         randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(
             l.chain_id(),
             b,
@@ -1246,6 +1247,7 @@ mod tests {
                 time: l.height() as u32,
                 asset,
                 envelope: fixtures::env(seed),
+                pq_signatures,
             },
         ))
     }

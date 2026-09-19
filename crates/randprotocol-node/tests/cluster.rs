@@ -245,7 +245,27 @@ fn bridge_config() -> BridgeConfig {
         emitter: [1; 32],
         guardians: guardian_secrets().iter().map(guardian_address).collect(),
         emitters: std::collections::BTreeMap::from([(TOKEN_CHAIN, [TOKEN_CHAIN as u8; 32])]),
+        pq_guardians: pq_guardian_keys().iter().map(|k| k.public_key().clone()).collect(),
     }
+}
+
+/// The six PQ guardians' Dilithium2 keys (bridge hardening B3), index-aligned with
+/// [`guardian_secrets`].
+fn pq_guardian_keys() -> Vec<Keypair> {
+    (0..6u8).map(|i| Keypair::from_seed([0x70 + i; 32]).unwrap()).collect()
+}
+
+/// The lowest-five PQ co-signature quorum over `attestation`'s `mu` on this cluster's chain.
+fn pq_quorum(attestation: &[u8]) -> Vec<randprotocol_core::bridge::PqSignature> {
+    let mu = randprotocol_core::bridge::Attestation::body_bytes(attestation)
+        .map(randprotocol_core::bridge::digest)
+        .expect("a decodable attestation");
+    pq_guardian_keys()
+        .iter()
+        .take(5)
+        .enumerate()
+        .map(|(i, k)| randprotocol_core::bridge::pq_cosign(k, i as u8, CHAIN_ID, &mu))
+        .collect()
 }
 
 /// The bridged token these tests move: chain 2's `0xaa…`, the one coin backing the single token
@@ -1487,8 +1507,16 @@ async fn bridge_mint(
     let index = wallet::deposit_index(&state, &assets, &asset_id).expect("the token is listed on this chain");
     let time = u32::try_from(node.rpc.head().await.expect("head")["height"].as_u64().expect("height")).unwrap();
     let (note, envelope) = wallet::deposit_note_for(relayer, to, d.amount, index, time).expect("sealing the deposit");
-    let action =
-        Action::BridgeAttest { attestation, recipient: to.clone(), r: note.r, time, asset: index, envelope };
+    let pq_signatures = pq_quorum(&attestation);
+    let action = Action::BridgeAttest {
+        attestation,
+        recipient: to.clone(),
+        r: note.r,
+        time,
+        asset: index,
+        envelope,
+        pq_signatures,
+    };
     let fee = gas::fee_floor(&action);
     let slot = proving_slot().await;
     let s = wallet::submit(&node.rpc, relayer, store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
@@ -1531,8 +1559,18 @@ async fn replayed_attest(node: &TestNode, to: &ShieldedAddress, attestation: Vec
         envelopes: [empty.clone(), empty.clone(), empty.clone(), empty.clone()],
         proof: vec![0xff; 32],
     };
-    let action =
-        Action::BridgeAttest { attestation, recipient: to.clone(), r: [7; 8], time, asset, envelope: empty };
+    // A full PQ quorum, so the refusal that comes back is the replay, not the co-signature's shape
+    // (which `check_attest` checks first).
+    let pq_signatures = pq_quorum(&attestation);
+    let action = Action::BridgeAttest {
+        attestation,
+        recipient: to.clone(),
+        r: [7; 8],
+        time,
+        asset,
+        envelope: empty,
+        pq_signatures,
+    };
     Transaction::shielded(CHAIN_ID, bundle, action)
 }
 

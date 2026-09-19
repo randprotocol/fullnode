@@ -669,6 +669,30 @@ fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
     if cfg.guardians.contains(&[0u8; 20]) {
         return bad("zero guardian key".into());
     }
+    // B3: the Dilithium2 co-signers, index-aligned with `guardians` — one PQ key per operator,
+    // each exactly a Dilithium2 public key, none repeated (a repeated key would let one operator
+    // count twice toward the PQ quorum).
+    if cfg.pq_guardians.len() != cfg.guardians.len() {
+        return bad(format!(
+            "pq_guardians has {} keys, guardians has {}: the two lists are index-aligned",
+            cfg.pq_guardians.len(),
+            cfg.guardians.len()
+        ));
+    }
+    if let Some((i, k)) =
+        cfg.pq_guardians.iter().enumerate().find(|(_, k)| k.as_bytes().len() != crate::bridge::PQ_PUBLIC_KEY_LEN)
+    {
+        return bad(format!(
+            "pq_guardians[{i}] is {} bytes, not a Dilithium2 public key's {}",
+            k.as_bytes().len(),
+            crate::bridge::PQ_PUBLIC_KEY_LEN
+        ));
+    }
+    if cfg.pq_guardians.iter().map(|k| k.as_bytes()).collect::<std::collections::BTreeSet<&[u8]>>().len()
+        != cfg.pq_guardians.len()
+    {
+        return bad("duplicate pq_guardians key".into());
+    }
     if cfg.emitter == [0u8; 32] {
         return bad("zero emitter address".into());
     }
@@ -920,8 +944,26 @@ mod tests {
         assert!(a.to_json().contains("\"confidential\": true"));
     }
 
+    /// A real Dilithium2 public key, from seed `[0x70 + i; 32]`.
+    fn pq_key(i: u8) -> crate::crypto::PublicKey {
+        crate::crypto::Keypair::from_seed([0x70 + i; 32]).unwrap().public_key().clone()
+    }
+
+    /// A distinct key of the right length that no seed derives — genesis checks a PQ key's
+    /// length and uniqueness, and hundreds of real key generations would only slow a test down.
+    fn synthetic_pq_key(i: usize) -> crate::crypto::PublicKey {
+        let mut b = vec![0x5a; crate::crypto::PUBLIC_KEY_LEN];
+        b[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        crate::crypto::PublicKey::from_bytes(&b).unwrap()
+    }
+
     fn bridge_cfg() -> BridgeConfig {
-        BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::from([(2u16, [9u8; 32])]) }
+        BridgeConfig {
+            emitter: [1; 32],
+            guardians: vec![[2; 20]],
+            emitters: BTreeMap::from([(2u16, [9u8; 32])]),
+            pq_guardians: vec![pq_key(0)],
+        }
     }
 
     /// The hard fork phase S3 ships is opt-in per chain: a genesis without a `bridge` section
@@ -981,6 +1023,28 @@ mod tests {
             }
         };
         assert_eq!(bad(|c| c.guardians.clear()), "no guardians");
+        // B3: the PQ guardians — index-aligned with `guardians`, each a Dilithium2 key's exact
+        // length, none repeated.
+        assert_eq!(bad(|c| c.pq_guardians.clear()), "pq_guardians has 0 keys, guardians has 1: the two lists are index-aligned");
+        assert_eq!(
+            bad(|c| c.pq_guardians.push(pq_key(1))),
+            "pq_guardians has 2 keys, guardians has 1: the two lists are index-aligned"
+        );
+        assert_eq!(
+            bad(|c| {
+                let mut b = c.pq_guardians[0].as_bytes().to_vec();
+                b.pop();
+                c.pq_guardians[0] = serde_json::from_value(serde_json::json!(hex::encode(b))).unwrap();
+            }),
+            "pq_guardians[0] is 1311 bytes, not a Dilithium2 public key's 1312"
+        );
+        assert_eq!(
+            bad(|c| {
+                c.guardians.push([3; 20]);
+                c.pq_guardians.push(c.pq_guardians[0].clone());
+            }),
+            "duplicate pq_guardians key"
+        );
         assert_eq!(bad(|c| c.guardians = vec![[2; 20], [2; 20]]), "duplicate guardian key");
         assert_eq!(bad(|c| c.guardians = vec![[0; 20]]), "zero guardian key");
         assert_eq!(bad(|c| c.emitter = [0; 32]), "zero emitter address");
@@ -1029,6 +1093,7 @@ mod tests {
         let mut g = genesis(1);
         let mut cfg = bridge_cfg();
         cfg.guardians = (0..367).map(key).collect();
+        cfg.pq_guardians = (0..367).map(synthetic_pq_key).collect();
         g.bridge = Some(cfg);
         g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![] });
         assert!(g.build(&StubExecutor).is_ok(), "367 guardians is the largest runnable set");

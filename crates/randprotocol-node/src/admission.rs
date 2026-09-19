@@ -170,6 +170,29 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | T::ZeroAmount
         );
     }
+    // The Dilithium2 co-signature's verdicts (bridge hardening B3). Every other bridge verdict
+    // stays out: a digest's `Replay`, a guardian set's expiry and the registry's listings all move
+    // with this node's state. Of the five PQ refusals only the three that are about the list's
+    // own bytes are cached:
+    //
+    // - `PqIndexOrder` — the indices as written, and nothing else;
+    // - `PqBadSignatureLength` — a byte length, like every other length above;
+    // - `PqIndexOutOfRange` — the index against `n`, the size of the genesis PQ set, which no
+    //   action changes (a payload-2 rotation moves the ECDSA set only; a PQ rotation is the
+    //   deferred payload 3, and when it lands this arm must be revisited, as `WrongChain` would
+    //   be if chain ids could move).
+    //
+    // `PqNoQuorum` also reads only the list's length and `n`, and `PqBadSignature` only the bytes,
+    // the genesis keys and the chain id, so both would qualify on `InvalidBundleProof`'s argument —
+    // they stay out on the conservative side of this line, like `MintTooLarge`: the quorum formula
+    // is shared with the governance quorums a later PQ-set change would move, and re-refusing
+    // either is cheap next to what a wrongly cached refusal costs (a relayer's mint censored on
+    // this node until restart). `PqNoQuorum` is decided before any other attest check and
+    // `PqBadSignature` only after a valid ECDSA quorum over an unconsumed digest.
+    if let TxError::Bridge(b) = e {
+        use randprotocol_core::bridge::BridgeError as B;
+        return matches!(b, B::PqIndexOrder | B::PqIndexOutOfRange { .. } | B::PqBadSignatureLength { .. });
+    }
     matches!(
         e,
         // The proofs and the digest are over the transaction's own fields.
@@ -485,6 +508,22 @@ mod tests {
         let mut c = RefusedCache::new(4);
         c.insert(h(1), TxError::UnknownAnchor);
         assert_eq!(c.len(), 0);
+    }
+
+    /// B3's co-signature verdicts: the list's own bytes (order, lengths) and its indices against
+    /// the genesis PQ set's size are cached; the count and a failed verification are not, and no
+    /// other bridge verdict is either.
+    #[test]
+    fn only_the_byte_level_pq_verdicts_are_cached() {
+        use randprotocol_core::bridge::BridgeError as B;
+        for b in [B::PqIndexOrder, B::PqIndexOutOfRange { index: 6, n: 6 }, B::PqBadSignatureLength { index: 4, len: 2419 }] {
+            let e = TxError::Bridge(b);
+            assert!(is_permanent(&e), "{e} is a statement about the list's bytes");
+        }
+        for b in [B::PqNoQuorum { have: 4, need: 5, n: 6 }, B::PqBadSignature { index: 0 }, B::Replay, B::WrongEmitter] {
+            let e = TxError::Bridge(b);
+            assert!(!is_permanent(&e), "{e} is kept out of the cache");
+        }
     }
 
     /// The aggregate verdicts, split: the byte-verdicts and the genesis-constant ones are

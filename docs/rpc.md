@@ -589,6 +589,9 @@ Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false 
   "emitters": { "2": "02…" },            // source chain id -> the emitter address trusted there
   "guardian_set_index": 0,
   "guardians": ["aabb…"],                // the current set's 20-byte addresses, hex
+  "pq_guardians": ["…"],                 // the genesis PQ set: Dilithium2 public keys (1 312 bytes), hex,
+                                         // index-aligned with guardian set 0; every BridgeAttest carries a
+                                         // quorum of co-signatures by it, and a rotation never moves it
   "burn_sequence": 1,                    // outbound messages emitted so far
   "next_index": 2,                       // the note index the next newly registered asset gets
   "assets": [ …the rows of `rand_getAssets`… ]

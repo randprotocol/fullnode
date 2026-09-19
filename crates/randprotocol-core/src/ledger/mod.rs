@@ -2223,6 +2223,7 @@ mod tests {
             time: l.height() as u32,
             asset: 1,
             envelope,
+            pq_signatures: Vec::new(),
         };
         check(208, attest(vec![1; 32], fat(MAX_ENVELOPE_BYTES)), Ok(()));
         check(212, attest(vec![1; 32], fat(MAX_ENVELOPE_BYTES + 1)), Err(TxError::EnvelopeTooLarge));
@@ -2949,7 +2950,12 @@ mod tests {
         let unbridged = plain.state_root();
 
         let config =
-            BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::from([(2u16, [9u8; 32])]) };
+            BridgeConfig {
+                emitter: [1; 32],
+                guardians: vec![[2; 20]],
+                emitters: BTreeMap::from([(2u16, [9u8; 32])]),
+                pq_guardians: vec![],
+            };
         let mut bridged = plain.clone();
         bridged.set_bridge(Some(BridgeState::from_config(&config)));
         assert_ne!(bridged.state_root(), unbridged, "the bridge root joins the commitment");
@@ -2995,7 +3001,12 @@ mod tests {
         };
 
         let config =
-            BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::from([(2u16, [9u8; 32])]) };
+            BridgeConfig {
+                emitter: [1; 32],
+                guardians: vec![[2; 20]],
+                emitters: BTreeMap::from([(2u16, [9u8; 32])]),
+                pq_guardians: vec![],
+            };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));
         l.set_timestamp_ms(1_000_000);
@@ -3047,7 +3058,12 @@ mod tests {
         assert_eq!(MAX_TIMESTAMP_STEP_MS, 60_000);
 
         let config =
-            BridgeConfig { emitter: [1; 32], guardians: vec![[2; 20]], emitters: BTreeMap::from([(2u16, [9u8; 32])]) };
+            BridgeConfig {
+                emitter: [1; 32],
+                guardians: vec![[2; 20]],
+                emitters: BTreeMap::from([(2u16, [9u8; 32])]),
+                pq_guardians: vec![],
+            };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));
         l.set_timestamp_ms(1_000_000);

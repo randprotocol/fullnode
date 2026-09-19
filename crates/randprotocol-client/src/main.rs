@@ -188,9 +188,33 @@ enum Cmd {
     BridgeMint {
         /// The attestation as hex, or `@path` to read the hex from a file.
         attestation: String,
+        /// The guardians' Dilithium2 co-signatures, required on every mint: a JSON array
+        /// `[{"index":0,"signature":"<4840 hex>"},…]`, or `@path` to read it from a file.
+        #[arg(long)]
+        pq: String,
         /// The shielded address the depositor named; defaults to this wallet's.
         #[arg(long)]
         to: Option<String>,
+        /// Fee in RAND; the floor is 0.001.
+        #[arg(long)]
+        fee: Option<String>,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+        /// Prove the paying bundle on an attached NVIDIA GPU.
+        #[arg(long)]
+        cuda: bool,
+    },
+    /// Submit a guardian-set rotation (payload 2) with its Dilithium2 co-signature quorum: a
+    /// `BridgeAttest` whose fee bundle pays for it and which deposits nothing. Prints the
+    /// guardian-set index Rand is on afterwards.
+    BridgeRotate {
+        /// The rotation attestation as hex, or `@path` to read the hex from a file.
+        rotation: String,
+        /// The current PQ guardian set's co-signatures: a JSON array
+        /// `[{"index":0,"signature":"<4840 hex>"},…]`, or `@path` to read it from a file.
+        #[arg(long)]
+        pq: String,
         /// Fee in RAND; the floor is 0.001.
         #[arg(long)]
         fee: Option<String>,
@@ -455,6 +479,14 @@ fn transcript_verdict(faithful: bool, emulated: &[u32], receipt_outputs: &serde_
         );
     }
     Ok(())
+}
+
+/// A command-line argument that is either text outright or `@path` to read it from a file.
+fn read_text_arg(arg: &str) -> Result<String> {
+    match arg.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path).with_context(|| format!("reading {path}")),
+        None => Ok(arg.to_string()),
+    }
 }
 
 /// A command-line argument that is either hex outright or `@path` to read the hex from a file.
@@ -898,10 +930,14 @@ async fn main() -> Result<()> {
             transcript_verdict(faithful, &exec.outputs, &receipt["outputs"])?;
             println!("verdict: faithful — these are the words the proof was made over, and they reproduce its outputs");
         }
-        Cmd::BridgeMint { attestation, to, fee, no_wait, cuda } => {
+        Cmd::BridgeMint { attestation, pq, to, fee, no_wait, cuda } => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let bytes = read_hex_arg(&attestation)?;
             let d = wallet::attested_deposit(&bytes)?;
+            // The Dilithium2 co-signatures (B3), checked here under the chain's own rules against
+            // the node's PQ set and chain id — before anything is proved.
+            let pq_signatures = wallet::parse_pq_signatures(&read_text_arg(&pq)?)?;
+            wallet::check_pq_cosignatures(&rpc.bridge_state().await?, rpc.chain_id().await?, &bytes, &pq_signatures)?;
             let recipient = match &to {
                 Some(a) => parse_address(a)?,
                 None => w.address.clone(),
@@ -939,7 +975,15 @@ async fn main() -> Result<()> {
             // The action names the index this envelope was sealed for, and admission refuses a
             // mismatch (`Action::BridgeAttest`) — which nothing on a listed token can now cause,
             // since no transaction hands an index out and a listing's index never moves.
-            let action = Action::BridgeAttest { attestation: bytes, recipient, r: note.r, time, asset: index, envelope };
+            let action = Action::BridgeAttest {
+                attestation: bytes,
+                recipient,
+                r: note.r,
+                time,
+                asset: index,
+                envelope,
+                pq_signatures,
+            };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => gas::fee_floor(&action),
@@ -988,6 +1032,59 @@ async fn main() -> Result<()> {
                     }
                 };
                 println!("asset {landed} balance: {} units", store.balance_of(landed));
+            }
+        }
+        Cmd::BridgeRotate { rotation, pq, fee, no_wait, cuda } => {
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            let bytes = read_hex_arg(&rotation)?;
+            let new_index = wallet::attested_rotation(&bytes)?;
+            let state = rpc.bridge_state().await?;
+            let chain_id = rpc.chain_id().await?;
+            // A rotation must step the current set by one (the ledger's `BadUpgradeIndex`); said
+            // here, before a proof, rather than after one.
+            let current = state["guardian_set_index"].as_u64().context("the node serves no guardian_set_index")?;
+            if u64::from(new_index) != current + 1 {
+                anyhow::bail!("this rotation is to guardian set {new_index}, but Rand is on set {current}: it must be {}", current + 1);
+            }
+            // Every attest carries the PQ quorum, a rotation's included — by the *current* PQ set,
+            // which a payload-2 rotation does not change.
+            let pq_signatures = wallet::parse_pq_signatures(&read_text_arg(&pq)?)?;
+            wallet::check_pq_cosignatures(&state, chain_id, &bytes, &pq_signatures)?;
+            // A rotation deposits nothing: the deposit fields are placeholders the ledger reads for
+            // a transfer only — this wallet's address, a zero blinding, asset 0 and an empty
+            // envelope. `time` still gets the admission window every attest's does.
+            let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
+                .context("chain height does not fit a note's time field")?;
+            let empty = randprotocol_core::notes::Envelope {
+                kem_ct: Vec::new(),
+                to_receiver: Vec::new(),
+                to_sender: Vec::new(),
+                body: Vec::new(),
+            };
+            let action = Action::BridgeAttest {
+                attestation: bytes,
+                recipient: w.address.clone(),
+                r: [0; 8],
+                time,
+                asset: 0,
+                envelope: empty,
+                pq_signatures,
+            };
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => gas::fee_floor(&action),
+            };
+            let profile = profile_of(&rpc).await?;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, !no_wait)
+                .await;
+            store.save(&path)?;
+            let s = s?;
+            report(&s, "guardian-set rotation");
+            if no_wait {
+                println!("submitted the rotation to guardian set {new_index}; `rand` did not wait for it to commit");
+            } else {
+                let after = rpc.bridge_state().await?;
+                println!("guardian_set_index: {}", after["guardian_set_index"]);
             }
         }
         Cmd::BridgeBurn { asset, amount, to_chain, token, to, relayer_fee, fee, no_wait, cuda } => {

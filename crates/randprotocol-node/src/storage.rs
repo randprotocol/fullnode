@@ -2127,8 +2127,23 @@ pub(crate) mod fixtures {
             emitter: [1; 32],
             guardians: secrets.iter().map(guardian_address).collect(),
             emitters: std::collections::BTreeMap::from([(2u16, [2u8; 32])]),
+            pq_guardians: pq_keys().iter().map(|k| k.public_key().clone()).collect(),
         };
         (config, secrets)
+    }
+
+    /// The six PQ guardians' Dilithium2 keys (bridge hardening B3), index-aligned with
+    /// [`bridge_config`]'s guardians.
+    pub(crate) fn pq_keys() -> Vec<Keypair> {
+        (0..6u8).map(|i| Keypair::from_seed([0x70 + i; 32]).unwrap()).collect()
+    }
+
+    /// The lowest-five PQ co-signature quorum over `attestation`'s `mu` on `chain_id` — what a
+    /// relayer submits beside every attestation.
+    pub(crate) fn pq_quorum(chain_id: u64, attestation: &[u8]) -> Vec<randprotocol_core::bridge::PqSignature> {
+        use randprotocol_core::bridge::{digest, pq_cosign, Attestation};
+        let mu = Attestation::body_bytes(attestation).map(digest).unwrap_or([0; 32]);
+        pq_keys().iter().take(5).enumerate().map(|(i, k)| pq_cosign(k, i as u8, chain_id, &mu)).collect()
     }
 
     /// [`genesis`] with a `bridge` section, and the guardian secrets that can attest to it.
@@ -2234,6 +2249,7 @@ pub(crate) mod fixtures {
     /// `seed..seed + 3`, so two fixtures with different seeds never collide.
     pub(crate) fn attest_tx(ledger: &Ledger, attestation: Vec<u8>, seed: u32) -> Transaction {
         let asset = deposit_index(ledger, &attestation);
+        let pq_signatures = pq_quorum(ledger.chain_id(), &attestation);
         randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(
             ledger.chain_id(),
             bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
@@ -2244,6 +2260,7 @@ pub(crate) mod fixtures {
                 time: ledger.height() as u32,
                 asset,
                 envelope: env(seed as u8),
+                pq_signatures,
             },
         ))
     }
@@ -2877,12 +2894,35 @@ mod tests {
         };
         let bytes = bincode::serialize(&old).unwrap();
         // Plain bincode is exactly the trap: it stops at the last field it wants and drops the
-        // rest, reading the one-entry `assets` map's length as the burn sequence.
-        let loose: BridgeMeta = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(loose.burn_sequence, 1, "a map length read as a sequence — the silent mis-decode");
+        // rest. Before B3 it read the one-entry `assets` map's length as the burn sequence and
+        // stopped there; B3 appended `pq_guardians`, so it now also reads the map's first entry as
+        // that list's length and runs out of bytes. Either way plain bincode is not the guard.
+        if let Ok(loose) = bincode::deserialize::<BridgeMeta>(&bytes) {
+            assert_eq!(loose.burn_sequence, 1, "a map length read as a sequence — the silent mis-decode");
+        }
         // The strict decode `bridge_meta` uses refuses it instead.
         s.db.put_cf(s.cf(CF_META), META_BRIDGE_STATE, &bytes).unwrap();
         assert!(s.bridge_meta().is_err(), "a pre-RPL blob is a decode error, never a bridge");
+
+        // And a blob written before B3 — this layout without `pq_guardians` — is refused too,
+        // rather than read as a bridge with no PQ guardians (which would refuse every attest).
+        #[derive(serde::Serialize)]
+        struct PreB3BridgeMeta {
+            emitter: [u8; 32],
+            emitters: std::collections::BTreeMap<u16, [u8; 32]>,
+            guardian_sets: std::collections::BTreeMap<u32, GuardianSet>,
+            current_set: u32,
+            burn_sequence: u64,
+        }
+        let pre_b3 = PreB3BridgeMeta {
+            emitter: [1; 32],
+            emitters: std::collections::BTreeMap::from([(2u16, [2u8; 32])]),
+            guardian_sets: std::collections::BTreeMap::new(),
+            current_set: 0,
+            burn_sequence: 7,
+        };
+        s.db.put_cf(s.cf(CF_META), META_BRIDGE_STATE, bincode::serialize(&pre_b3).unwrap()).unwrap();
+        assert!(s.bridge_meta().is_err(), "a pre-B3 blob is a decode error, never a bridge");
     }
 
     /// A chain that starts with no notes still round trips: the stored frontier is the empty
