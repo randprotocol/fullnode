@@ -16,7 +16,6 @@ use randprotocol_client::wallet::{self, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
 use randprotocol_client::wallet::{Burn, Submission};
 use randprotocol_core::ledger::staking::MIN_STAKE;
-use randprotocol_core::ledger::tokens::{native_asset_id, MintAuthority};
 use randprotocol_core::notes::ShieldedAddress;
 use randprotocol_core::types::actions::Registration;
 use randprotocol_core::{format_amount, gas, parse_amount, Action, Address, Hash, Keypair};
@@ -1427,52 +1426,54 @@ async fn main() -> Result<()> {
                 }
                 (Some(Keypair::generate()), initial)
             };
+            // `wallet::create_token` writes this branch's fresh key to `<out>.pending` only after
+            // `build_register_token`'s own checks pass, right before the one call that can refuse
+            // the registration — so a stale `.pending` from an earlier crashed run, or an
+            // already-taken target, is worth refusing here, before any network read or proof,
+            // rather than inside that write (review round 1).
+            if let Some(out) = &authority_key_out {
+                if out.exists() {
+                    anyhow::bail!("{} already exists; refusing to overwrite", out.display());
+                }
+                let pending = wallet::pending_authority_key_path(out);
+                if pending.exists() {
+                    anyhow::bail!(
+                        "{} already exists (an earlier `token create` may have crashed right after writing it); \
+                         move or remove it before retrying",
+                        pending.display()
+                    );
+                }
+            }
             let recipient = to.as_deref().map(parse_address).transpose()?;
             let salt = match salt {
                 Some(s) => randprotocol_client::hex32(&s).context("--salt must be 32 bytes of hex")?,
                 None => random_salt(),
             };
-            let authority = match &authority_keypair {
-                Some(kp) => MintAuthority::Key(kp.public_key().clone()),
-                None => MintAuthority::None,
-            };
+            let fee = fee.map(|f| parse_amount(&f)).transpose()?;
             let (w, path, mut store) = open_wallet(&cli.key)?;
-            let plan = wallet::build_register_token(
+            let chain_id = rpc.chain_id().await?;
+            let profile = profile_of(&rpc).await?;
+            let authority = authority_keypair.as_ref().map(|kp| (kp, authority_key_out.as_deref().expect("checked above")));
+            let result = wallet::create_token(
                 &rpc,
                 &w,
+                &mut store,
                 &name,
                 &symbol,
                 decimals,
-                authority.clone(),
+                authority,
                 initial_amount.map(|amount| (amount, recipient.clone().expect("checked above"))),
                 salt,
+                fee,
+                profile,
+                backend_for(cuda)?,
+                chain_id,
+                !no_wait,
             )
-            .await?;
-            let id = match &plan.action {
-                Action::RegisterToken { name, symbol, decimals, authority, initial, salt, .. } => {
-                    native_asset_id(name, symbol, *decimals, authority, initial, salt)
-                }
-                _ => unreachable!("build_register_token always returns a RegisterToken action"),
-            };
-            // The key file is written only now, right before proving: every refusal above and
-            // `build_register_token`'s own reads (the registry gate, a zero initial mint) have
-            // already run, so a rejected combination never strands a key file on disk.
-            if let (Some(out), Some(kp)) = (&authority_key_out, &authority_keypair) {
-                wallet::write_authority_key(kp, out)?;
-                println!("wrote authority key {}", out.display());
-            }
-            let fee = match fee {
-                Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&plan.action).saturating_add(plan.registration_fee),
-            };
-            let chain_id = rpc.chain_id().await?;
-            let profile = profile_of(&rpc).await?;
-            let index = plan.index;
-            let s = wallet::submit_register_token(&rpc, &w, &mut store, plan.action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
-                .await;
+            .await;
             store.save(&path)?;
-            let s = match s {
-                Ok(s) => s,
+            let result = match result {
+                Ok(r) => r,
                 Err(e) => {
                     if let Some(rpc_err) = e.downcast_ref::<randprotocol_client::RpcError>() {
                         if let Some((expected, got)) = parse_index_mismatch(&rpc_err.message) {
@@ -1482,22 +1483,26 @@ async fn main() -> Result<()> {
                     return Err(e);
                 }
             };
-            report(&s, "token registration");
-            println!("index {index}, id {} ({})", id.to_hex(), randprotocol_core::token_id::encode(&id));
+            report(&result.submission, "token registration");
+            println!("index {}, id {} ({})", result.index, result.id.to_hex(), randprotocol_core::token_id::encode(&result.id));
             if !no_wait {
-                let committed = rpc.call("rand_getTransaction", serde_json::json!([s.hash.to_hex()])).await?;
+                let committed = rpc.call("rand_getTransaction", serde_json::json!([result.submission.hash.to_hex()])).await?;
                 println!("committed at height {}", committed["height"]);
             }
         }
         Cmd::Token(TokenCmd::Mint { asset, to, amount, authority_key, fee, no_wait, cuda }) => {
-            let asset = wallet::resolve_asset(&rpc, &asset).await?;
+            // One whole-listing read serves both the index and the row `build_token_mint` needs
+            // (`mint_nonce`, id, authority) — never a second one (review round 1).
+            let row = wallet::find_token_row(&rpc, &asset).await?;
+            let asset = u32::try_from(row["index"].as_u64().context("a token row without its index")?)
+                .context("a token row whose index is not a u32")?;
             let recipient = parse_address(&to)?;
             let authority = wallet::load_authority_key(&authority_key)?;
             let chain_id = rpc.chain_id().await?;
             let (w, path, mut store) = open_wallet(&cli.key)?;
             // Refused up front (not the token's authority, or not Key-authorised at all) inside
             // `build_token_mint`, before any RAND is touched.
-            let action = wallet::build_token_mint(&rpc, &w, chain_id, asset, &recipient, amount, &authority).await?;
+            let action = wallet::build_token_mint(&rpc, &w, chain_id, asset, &row, &recipient, amount, &authority).await?;
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => gas::fee_floor(&action),
@@ -1512,14 +1517,19 @@ async fn main() -> Result<()> {
             if renounce == new_key.is_some() {
                 anyhow::bail!("pass exactly one of --new-key or --renounce");
             }
-            let asset = wallet::resolve_asset(&rpc, &asset).await?;
+            // One whole-listing read, reused for the index and the row (review round 1).
+            let row = wallet::find_token_row(&rpc, &asset).await?;
+            let asset = u32::try_from(row["index"].as_u64().context("a token row without its index")?)
+                .context("a token row whose index is not a u32")?;
             let authority = wallet::load_authority_key(&authority_key)?;
+            // Only the successor's public key is ever read — never its seed, which this command
+            // has no reason to hold (review round 1).
             let new = match &new_key {
-                Some(path) => Some(wallet::load_authority_key(path)?.public_key().clone()),
+                Some(path) => Some(wallet::load_authority_public_key(path)?),
                 None => None,
             };
             let chain_id = rpc.chain_id().await?;
-            let action = wallet::build_token_set_authority(&rpc, chain_id, asset, &authority, new.clone()).await?;
+            let action = wallet::build_token_set_authority(chain_id, asset, &row, &authority, new.clone())?;
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => gas::fee_floor(&action),

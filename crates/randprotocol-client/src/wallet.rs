@@ -186,6 +186,56 @@ pub fn write_authority_key(kp: &Keypair, path: &Path) -> Result<()> {
     }
 }
 
+/// Read only a Dilithium2 key file's `public_key` field — never its `seed` — for `rand token
+/// set-authority --new-key`, which needs a successor's public key and nothing else about that key
+/// (T8b review round 1): the file may hold a live secret this command has no reason to decode.
+pub fn load_authority_public_key(path: &Path) -> Result<PublicKey> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let v: Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not a Dilithium2 key file (rand-node keygen's shape)", path.display()))?;
+    let hex = v["public_key"].as_str().ok_or_else(|| anyhow!("{} has no public_key field", path.display()))?;
+    PublicKey::from_hex(hex).map_err(|e| anyhow!("{}: {e}", path.display()))
+}
+
+/// `<path>.pending` — where `rand token create --authority-key-out <path>` writes its fresh
+/// authority key *before* submitting the registration (T8b review round 1): a `RegisterToken` can
+/// lose a race (`IndexMismatch`) only at submission, since another registration can commit
+/// between `build_register_token`'s read of `next_index` and this wallet's own submission — so
+/// the only copy of the key this command ever generates has to already be safely on disk before
+/// that submission is attempted, never after. [`promote_pending_authority_key`] moves it to `path`
+/// once the chain has accepted the registration; [`discard_pending_authority_key`] removes it on
+/// a refusal the node itself made.
+pub fn pending_authority_key_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".pending");
+    PathBuf::from(s)
+}
+
+/// Promote an accepted registration's pending authority key to its final path. Refuses to
+/// overwrite an existing file there — vanishingly unlikely (the same submission cannot have
+/// landed twice), but if it ever happens the secret stays recoverable at `pending` rather than
+/// being silently lost under a rename.
+pub fn promote_pending_authority_key(pending: &Path, path: &Path) -> Result<()> {
+    if path.exists() {
+        return Err(anyhow!(
+            "{} already exists; the registered token's authority key is still safe at {} — move it there by hand",
+            path.display(),
+            pending.display()
+        ));
+    }
+    std::fs::rename(pending, path).with_context(|| format!("renaming {} to {}", pending.display(), path.display()))
+}
+
+/// Discard a pending authority key file after a refusal the *node itself* made
+/// (`rand_sendTransaction`'s synchronous JSON-RPC error — nothing was admitted, so nothing was
+/// ever registered under this key, an `IndexMismatch` lost race among them). Never call this for
+/// a transport-level failure (a timeout, a dropped connection): the submission's fate is unknown
+/// there, and discarding the only copy of a key that may have gone through would orphan a live
+/// token for good.
+pub fn discard_pending_authority_key(pending: &Path) -> Result<()> {
+    std::fs::remove_file(pending).with_context(|| format!("removing {}", pending.display()))
+}
+
 // ---------------------------------------------------------------- the note store
 
 mod hex_word8 {
@@ -2100,19 +2150,22 @@ pub async fn find_token_row(rpc: &RpcClient, text: &str) -> Result<Value> {
 /// `rand token create`'s action, plus the two registry facts it was built from: `index` (which
 /// `IndexMismatch` on submission names, for the wallet's own "another token took index N first"
 /// hint) and `registration_fee` (the default fee's other half, on top of `gas::fee_floor`).
+#[derive(Debug)]
 pub struct RegisterTokenPlan {
     pub action: Action,
     pub index: u32,
     pub registration_fee: u64,
 }
 
-/// Build `rand token create`'s `RegisterToken` action: reads `next_index` and
-/// `registration_fee` from `rand_getTokens` — the index an `initial` mint's envelope is sealed
-/// for, and the registry's own fee floor — before anything is proved. `initial` is `(amount,
-/// recipient)`; `None` registers a `Key`-authorised token empty. The caller has already refused
-/// `authority == MintAuthority::None` without an `initial` (the ledger's own rule,
-/// `TokenError::InitialMintRequired`) and a zero `--fixed-supply`/`--initial` amount, so this
-/// only reads the chain and builds the note.
+/// Build `rand token create`'s `RegisterToken` action: `check_metadata` (the name/symbol/decimals
+/// rules `register_bridged_action` already runs first, T8b review round 1 — a bad name would
+/// otherwise burn a ~100 s proof before the chain ever saw a byte of it) before anything else,
+/// then reads `next_index` and `registration_fee` from `rand_getTokens` — the index an `initial`
+/// mint's envelope is sealed for, and the registry's own fee floor — before anything is proved.
+/// `initial` is `(amount, recipient)`; `None` registers a `Key`-authorised token empty. The caller
+/// has already refused `authority == MintAuthority::None` without an `initial` (the ledger's own
+/// rule, `TokenError::InitialMintRequired`) and a zero `--fixed-supply`/`--initial` amount, so
+/// this only checks the metadata, reads the chain and builds the note.
 pub async fn build_register_token(
     rpc: &RpcClient,
     w: &Wallet,
@@ -2123,6 +2176,7 @@ pub async fn build_register_token(
     initial: Option<(u64, ShieldedAddress)>,
     salt: [u8; 32],
 ) -> Result<RegisterTokenPlan> {
+    randprotocol_core::ledger::tokens::check_metadata(name, symbol, decimals).map_err(|e| anyhow!("{e}"))?;
     let reply = rpc.call("rand_getTokens", serde_json::json!([0, 1])).await.map_err(|e| {
         if crate::is_method_not_found(&e) {
             anyhow!("this node cannot list its token registry (it has no rand_getTokens); this chain may not have RPL tokens enabled")
@@ -2152,15 +2206,41 @@ pub async fn build_register_token(
     Ok(RegisterTokenPlan { action, index, registration_fee })
 }
 
-/// Build `rand token mint`'s `TokenMint` action: `asset`'s row (`find_token_row`) for its
-/// `mint_nonce`, id and authority, refused up front if it is not `Key`-authorised or `authority`
-/// is not that key, then the note the chain will compute and `authority`'s Dilithium2 signature
-/// over [`token_mint_message`], which binds the note's commitment and the envelope's digest.
+/// The two refusals `build_token_mint` and `build_token_set_authority` share, against an
+/// already-fetched `rand_getTokens` row (T8b review round 1 — one whole-listing read serves both
+/// the index resolution and this, never two): the token is `Key`-authorised, and `authority` is
+/// that very key.
+fn check_key_authority(row: &Value, asset: u32, authority: &Keypair, verb: &str) -> Result<()> {
+    if row["authority"]["kind"].as_str() != Some("key") {
+        return Err(anyhow!("token {asset} is not Key-authorised: there is no authority to {verb}"));
+    }
+    let key_hex = row["authority"]["key"].as_str().context("a key-authority row without its key")?;
+    if key_hex != authority.public_key().to_hex() {
+        return Err(anyhow!("this key is not token {asset}'s mint authority"));
+    }
+    Ok(())
+}
+
+/// The token's [`AssetId`] and current `mint_nonce`, off an already-fetched `rand_getTokens` row.
+fn row_id_and_nonce(row: &Value, asset: u32) -> Result<(Hash, u64)> {
+    let asset_id =
+        Hash::from_hex(row["id"].as_str().context("a token row without its id")?).map_err(|e| anyhow!("token {asset}'s id: {e}"))?;
+    let nonce = row["mint_nonce"].as_u64().context("a token row without its mint_nonce")?;
+    Ok((asset_id, nonce))
+}
+
+/// Build `rand token mint`'s `TokenMint` action against `row` — `asset`'s already-fetched
+/// `rand_getTokens` row (the caller reads it once, with [`find_token_row`], and reuses it for the
+/// index too — T8b review round 1) — refused up front if it is not `Key`-authorised or
+/// `authority` is not that key, then the note the chain will compute and `authority`'s Dilithium2
+/// signature over [`token_mint_message`], which binds the note's commitment and the envelope's
+/// digest.
 pub async fn build_token_mint(
     rpc: &RpcClient,
     w: &Wallet,
     chain_id: u64,
     asset: u32,
+    row: &Value,
     recipient: &ShieldedAddress,
     amount: u64,
     authority: &Keypair,
@@ -2168,17 +2248,8 @@ pub async fn build_token_mint(
     if amount == 0 {
         return Err(anyhow!("a mint of zero moves nothing"));
     }
-    let row = find_token_row(rpc, &asset.to_string()).await?;
-    if row["authority"]["kind"].as_str() != Some("key") {
-        return Err(anyhow!("token {asset} is not Key-authorised: there is no authority to mint with"));
-    }
-    let key_hex = row["authority"]["key"].as_str().context("a key-authority row without its key")?;
-    if key_hex != authority.public_key().to_hex() {
-        return Err(anyhow!("this key is not token {asset}'s mint authority"));
-    }
-    let asset_id =
-        Hash::from_hex(row["id"].as_str().context("a token row without its id")?).map_err(|e| anyhow!("token {asset}'s id: {e}"))?;
-    let nonce = row["mint_nonce"].as_u64().context("a token row without its mint_nonce")?;
+    check_key_authority(row, asset, authority, "mint with")?;
+    let (asset_id, nonce) = row_id_and_nonce(row, asset)?;
     let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
         .context("chain height does not fit a note's time field")?;
     let (note, envelope) = mint_note_for(w, recipient, amount, asset, time)?;
@@ -2187,27 +2258,13 @@ pub async fn build_token_mint(
     Ok(Action::TokenMint { asset, amount, recipient: recipient.clone(), r: note.r, time, envelope, nonce, signature })
 }
 
-/// Build `rand token set-authority`'s `SetAuthority` action: the same row and refusals as
-/// [`build_token_mint`], then `authority`'s signature over [`set_authority_message`] for `new` —
-/// a key to hand the token to, or `None` to renounce minting for good.
-pub async fn build_token_set_authority(
-    rpc: &RpcClient,
-    chain_id: u64,
-    asset: u32,
-    authority: &Keypair,
-    new: Option<PublicKey>,
-) -> Result<Action> {
-    let row = find_token_row(rpc, &asset.to_string()).await?;
-    if row["authority"]["kind"].as_str() != Some("key") {
-        return Err(anyhow!("token {asset} is not Key-authorised: there is no authority to hand on"));
-    }
-    let key_hex = row["authority"]["key"].as_str().context("a key-authority row without its key")?;
-    if key_hex != authority.public_key().to_hex() {
-        return Err(anyhow!("this key is not token {asset}'s mint authority"));
-    }
-    let asset_id =
-        Hash::from_hex(row["id"].as_str().context("a token row without its id")?).map_err(|e| anyhow!("token {asset}'s id: {e}"))?;
-    let nonce = row["mint_nonce"].as_u64().context("a token row without its mint_nonce")?;
+/// Build `rand token set-authority`'s `SetAuthority` action against `row` — the same
+/// already-fetched row and refusals as [`build_token_mint`] — then `authority`'s signature over
+/// [`set_authority_message`] for `new`: a key to hand the token to, or `None` to renounce minting
+/// for good.
+pub fn build_token_set_authority(chain_id: u64, asset: u32, row: &Value, authority: &Keypair, new: Option<PublicKey>) -> Result<Action> {
+    check_key_authority(row, asset, authority, "hand on")?;
+    let (asset_id, nonce) = row_id_and_nonce(row, asset)?;
     let signature = authority.sign(set_authority_message(chain_id, &asset_id, nonce, &new).as_bytes());
     Ok(Action::SetAuthority { asset, new, nonce, signature })
 }
@@ -2245,6 +2302,107 @@ async fn submit_register_token_with(
         return Err(anyhow!("submit_register_token carries a RegisterToken action, nothing else"));
     }
     submit_with(rpc, w, store, None, action, fee, Burn::None, proving, chain_id, wait).await
+}
+
+/// What `rand token create` reports: the submission, the index it registered at, the asset id it
+/// registered under, and the fee it actually paid (the caller's `fee` override, or the default
+/// [`build_register_token`]'s reads computed).
+#[derive(Debug)]
+pub struct CreateTokenResult {
+    pub submission: Submission,
+    pub index: u32,
+    pub id: Hash,
+    pub fee: u64,
+}
+
+/// `rand token create`, past its flags: build the action ([`build_register_token`], which checks
+/// the metadata before any network read), write the `Key` branch's fresh authority key to
+/// `pending_authority_key_path`, submit, then resolve the pending file (T8b review round 1) —
+/// promoted to its final path on acceptance, discarded on a refusal the node itself made, left
+/// exactly where it is on anything else, whose outcome this wallet cannot know. `authority` is
+/// `(the fresh keypair, the file it will end up at)` for the `Key` branch, `None` for fixed
+/// supply; `fee` is `None` for the default (`gas::fee_floor` plus the registry's
+/// `registration_fee`).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_token(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    name: &str,
+    symbol: &str,
+    decimals: u8,
+    authority: Option<(&Keypair, &Path)>,
+    initial: Option<(u64, ShieldedAddress)>,
+    salt: [u8; 32],
+    fee: Option<u64>,
+    profile: FriProfile,
+    backend: Backend,
+    chain_id: u64,
+    wait: bool,
+) -> Result<CreateTokenResult> {
+    create_token_with(rpc, w, store, name, symbol, decimals, authority, initial, salt, fee, Proving::Real(profile, backend), chain_id, wait)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_token_with(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    name: &str,
+    symbol: &str,
+    decimals: u8,
+    authority: Option<(&Keypair, &Path)>,
+    initial: Option<(u64, ShieldedAddress)>,
+    salt: [u8; 32],
+    fee: Option<u64>,
+    proving: Proving,
+    chain_id: u64,
+    wait: bool,
+) -> Result<CreateTokenResult> {
+    let mint_authority = match authority {
+        Some((kp, _)) => MintAuthority::Key(kp.public_key().clone()),
+        None => MintAuthority::None,
+    };
+    let plan = build_register_token(rpc, w, name, symbol, decimals, mint_authority, initial, salt).await?;
+    let index = plan.index;
+    let id = match &plan.action {
+        Action::RegisterToken { name, symbol, decimals, authority, initial, salt, .. } => {
+            randprotocol_core::ledger::tokens::native_asset_id(name, symbol, *decimals, authority, initial, salt)
+        }
+        _ => unreachable!("build_register_token always returns a RegisterToken action"),
+    };
+    let fee = fee.unwrap_or_else(|| gas::fee_floor(&plan.action).saturating_add(plan.registration_fee));
+
+    // The only secret this command ever generates goes to disk before the one call that can
+    // refuse the registration is even attempted — see `pending_authority_key_path`'s doc.
+    let pending = match authority {
+        Some((kp, path)) => {
+            let pending = pending_authority_key_path(path);
+            write_authority_key(kp, &pending)?;
+            Some((pending, path))
+        }
+        None => None,
+    };
+    let result = submit_register_token_with(rpc, w, store, plan.action, fee, proving, chain_id, wait).await;
+    match (&result, &pending) {
+        (Ok(_), Some((pending_path, path))) => {
+            if let Err(e) = promote_pending_authority_key(pending_path, path) {
+                eprintln!("warning: the registration committed, but the authority key could not be promoted: {e}");
+            }
+        }
+        (Err(e), Some((pending_path, _))) if e.downcast_ref::<crate::RpcError>().is_some() => {
+            // The node answered `rand_sendTransaction` with a JSON-RPC error, synchronously:
+            // nothing was admitted, so nothing was ever registered under this key.
+            if let Err(re) = discard_pending_authority_key(pending_path) {
+                eprintln!("warning: discarding the unused pending authority key {}: {re}", pending_path.display());
+            }
+        }
+        // Anything else (a transport failure, a decode error) leaves the submission's fate
+        // unknown, so the pending file stays exactly where it is — the only safe choice.
+        _ => {}
+    }
+    result.map(|submission| CreateTokenResult { submission, index, id, fee })
 }
 
 /// `rand token mint`'s submission: one RAND fee bundle, `to = None`, the mint's own Dilithium2
@@ -3614,6 +3772,96 @@ mod tests {
         assert!(slots_for(&me, &tx).iter().all(opens_to_nobody));
     }
 
+    /// `build_register_token` refuses bad metadata (`check_metadata`, the same rule
+    /// `register_bridged_action` already runs first) before any network read — T8b review round
+    /// 1: a bad name, symbol or decimals count would otherwise burn a real proof before the chain
+    /// ever saw a byte of it. The stub RPC panics if called at all, so a call reaching it would
+    /// fail the test on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_register_token_checks_metadata_before_any_network_read() {
+        let me = Wallet::from_spend_key(SpendKey([65; 8]));
+        let rpc =
+            RpcClient::new(rpc_fn(|_m, _p| panic!("build_register_token must refuse bad metadata before any RPC call")).await);
+        let e = build_register_token(&rpc, &me, "", "FIX", 6, MintAuthority::None, None, [0; 32]).await.unwrap_err().to_string();
+        assert!(e.to_lowercase().contains("name"), "{e}");
+        let e = build_register_token(&rpc, &me, "Fixed", "", 6, MintAuthority::None, None, [0; 32]).await.unwrap_err().to_string();
+        assert!(e.to_lowercase().contains("symbol"), "{e}");
+        let e = build_register_token(&rpc, &me, "Fixed", "FIX", 250, MintAuthority::None, None, [0; 32]).await.unwrap_err().to_string();
+        assert!(e.to_lowercase().contains("decimals"), "{e}");
+    }
+
+    /// `create_token`'s authority-key lifecycle (T8b review round 1's fix): a node-side refusal
+    /// of `rand_sendTransaction` (an `IndexMismatch` lost race is one of them) leaves no file at
+    /// all — not at the target path, not at its `.pending` — so a re-run to the very same path
+    /// works; an accepted registration promotes the pending file to the target path, and never
+    /// touches the note the failed attempt did not spend (a submission error is raised before
+    /// `settle` marks anything pending).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_token_discards_the_pending_key_on_a_node_refusal_and_promotes_it_on_acceptance() {
+        let me = Wallet::from_spend_key(SpendKey([66; 8]));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("authority.key.json");
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.tokens = serde_json::json!({ "enabled": true, "registration_fee": 0, "next_index": 1, "tokens": [] });
+            c.fund(&me, 3 * gas::BUNDLE_BASE, 0);
+            c.fail = Some("rand_sendTransaction");
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let kp = Keypair::generate();
+
+        let e = create_token_with(
+            &rpc,
+            &me,
+            &mut store,
+            "Fixed",
+            "FIX",
+            6,
+            Some((&kp, out.as_path())),
+            None,
+            [3; 32],
+            None,
+            Proving::Emulated,
+            7,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.downcast_ref::<crate::RpcError>().is_some(), "{e}");
+        assert!(!out.exists(), "no file at the target path after a node refusal");
+        assert!(!pending_authority_key_path(&out).exists(), "the pending file is discarded, not stranded");
+        // The failed submission never reached `settle`, so the note it would have spent is still
+        // whole — no need to fund a second note for the re-run below.
+        assert_eq!(store.balance(), 3 * gas::BUNDLE_BASE);
+
+        // A re-run to the very same path, this time accepted.
+        chain.lock().unwrap().fail = None;
+        let result = create_token_with(
+            &rpc,
+            &me,
+            &mut store,
+            "Fixed",
+            "FIX",
+            6,
+            Some((&kp, out.as_path())),
+            None,
+            [3; 32],
+            None,
+            Proving::Emulated,
+            7,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.index, 1);
+        assert!(out.exists(), "the accepted registration's key is promoted to the target path");
+        assert!(!pending_authority_key_path(&out).exists());
+        let saved = load_authority_key(&out).unwrap();
+        assert_eq!(saved.public_key(), kp.public_key());
+    }
+
     /// `rand token create`'s two authority branches build a `RegisterToken` that rides one RAND
     /// fee bundle, `to = None`, nothing burned — exactly a bridged registration's shape — reading
     /// `next_index` and `registration_fee` off `rand_getTokens` first: fixed supply
@@ -3712,25 +3960,29 @@ mod tests {
         }
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
+        let row = |index: u32| {
+            let c = chain.lock().unwrap();
+            c.tokens["tokens"].as_array().unwrap().iter().find(|r| r["index"].as_u64() == Some(index as u64)).unwrap().clone()
+        };
 
         // A non-`Key` token refuses a mint and a rotation alike, before any network read past the
         // registry itself.
-        let e = build_token_mint(&rpc, &me, 7, 1, &me.address, 500, &authority_kp).await.unwrap_err().to_string();
+        let e = build_token_mint(&rpc, &me, 7, 1, &row(1), &me.address, 500, &authority_kp).await.unwrap_err().to_string();
         assert!(e.contains("not Key-authorised"), "{e}");
-        let e = build_token_set_authority(&rpc, 7, 1, &authority_kp, None).await.unwrap_err().to_string();
+        let e = build_token_set_authority(7, 1, &row(1), &authority_kp, None).unwrap_err().to_string();
         assert!(e.contains("not Key-authorised"), "{e}");
 
         // A stranger's key is refused too, against the `Key` token.
         let stranger = Keypair::generate();
-        let e = build_token_mint(&rpc, &me, 7, 2, &me.address, 500, &stranger).await.unwrap_err().to_string();
+        let e = build_token_mint(&rpc, &me, 7, 2, &row(2), &me.address, 500, &stranger).await.unwrap_err().to_string();
         assert!(e.contains("not token 2's mint authority"), "{e}");
 
         // Zero moves nothing either way, refused before the registry is even read.
-        let e = build_token_mint(&rpc, &me, 7, 2, &me.address, 0, &authority_kp).await.unwrap_err().to_string();
+        let e = build_token_mint(&rpc, &me, 7, 2, &row(2), &me.address, 0, &authority_kp).await.unwrap_err().to_string();
         assert!(e.contains("zero"), "{e}");
 
         // The right key mints: `TokenMint` at `mint_nonce` 0, signed, riding a fee bundle.
-        let action = build_token_mint(&rpc, &me, 7, 2, &me.address, 500, &authority_kp).await.unwrap();
+        let action = build_token_mint(&rpc, &me, 7, 2, &row(2), &me.address, 500, &authority_kp).await.unwrap();
         assert!(matches!(&action, Action::TokenMint { asset: 2, amount: 500, nonce: 0, .. }));
         submit_token_mint_with(&rpc, &me, &mut store, action, gas::BUNDLE_BASE, Proving::Emulated, 7, false).await.unwrap();
         let tx = chain.lock().unwrap().sent.pop().unwrap();
@@ -3740,8 +3992,8 @@ mod tests {
         // And hands the token on: `SetAuthority` at the same nonce it reads, signed by the
         // current key over the new one.
         let successor = Keypair::generate();
-        let action = build_token_set_authority(&rpc, 7, 2, &authority_kp, Some(successor.public_key().clone())).await.unwrap();
-        assert!(matches!(&action, Action::SetAuthority { asset: 2, new: Some(pk), nonce: 0, .. } if pk == successor.public_key()));
+        let action = build_token_set_authority(7, 2, &row(2), &authority_kp, Some(successor.public_key().clone())).unwrap();
+        assert!(matches!(&action, Action::SetAuthority { asset: 2, new: Some(pk), nonce: 0, .. } if *pk == *successor.public_key()));
         submit_token_set_authority_with(&rpc, &me, &mut store, action, gas::BUNDLE_BASE, Proving::Emulated, 7, false).await.unwrap();
         let tx = chain.lock().unwrap().sent.pop().unwrap();
         assert_admissible_shape(&tx);

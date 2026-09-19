@@ -398,7 +398,6 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
     use randprotocol_core::genesis::{TokensConfig, MIN_REGISTRATION_FEE};
-    use randprotocol_core::ledger::tokens::MintAuthority;
 
     init_tracing();
     let started = Instant::now();
@@ -415,34 +414,43 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
     rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
 
     // ---- `token create`: a `Key`-authorised token, registering empty ----
+    // `wallet::create_token` is `rand token create`'s own function (T8b review round 1's fix):
+    // the fresh authority key goes to `<authority_out>.pending` before the one call that can
+    // refuse the registration, and is promoted to `authority_out` only once it is accepted.
     let authority = Keypair::generate();
-    let plan = wallet::build_register_token(
+    let authority_out = dir.path().join("authority.key.json");
+    let created = wallet::create_token(
         &rpc,
         &a,
+        &mut a_store,
         "Wallet Flow Dollar",
         "WFD",
         6,
-        MintAuthority::Key(authority.public_key().clone()),
+        Some((&authority, authority_out.as_path())),
         None,
         [7; 32],
-    )
-    .await
-    .expect("build_register_token reads next_index and registration_fee");
-    assert_eq!((plan.index, plan.registration_fee), (1, MIN_REGISTRATION_FEE));
-    let register_fee = gas::fee_floor(&plan.action) + plan.registration_fee;
+        None,
+        FriProfile::Test,
+        Backend::Cpu,
+        CHAIN_ID,
+        true,
+    );
     let slot = proving_slot().await;
-    let registered =
-        wallet::submit_register_token(&rpc, &a, &mut a_store, plan.action, register_fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
-            .await
-            .expect("the registration's bundle commits");
+    let created = created.await.expect("the registration's bundle commits");
     drop(slot);
-    eprintln!("register bundle: tier {}, proved in {:.1?}", registered.tier, registered.proving);
+    assert_eq!(created.index, 1);
+    assert_eq!(created.fee, gas::BUNDLE_BASE + MIN_REGISTRATION_FEE);
+    let register_fee = created.fee;
+    eprintln!("register bundle: tier {}, proved in {:.1?}", created.submission.tier, created.submission.proving);
     assert_eq!(a_store.balance_of(1), 0, "registering empty mints nothing yet");
     assert_eq!(a_store.balance(), mint - register_fee);
+    assert!(authority_out.exists(), "the accepted registration promoted the pending authority key");
+    assert!(!wallet::pending_authority_key_path(&authority_out).exists(), "no leftover .pending file");
 
     // ---- `token mint`: A mints its own supply against the authority key ----
     let supply = 1_000_000u64;
-    let mint_action = wallet::build_token_mint(&rpc, &a, CHAIN_ID, 1, &a.address, supply, &authority)
+    let row = wallet::find_token_row(&rpc, "1").await.unwrap();
+    let mint_action = wallet::build_token_mint(&rpc, &a, CHAIN_ID, 1, &row, &a.address, supply, &authority)
         .await
         .expect("the authority mints against its own token");
     assert!(matches!(&mint_action, Action::TokenMint { asset: 1, amount: 1_000_000, nonce: 0, .. }));
