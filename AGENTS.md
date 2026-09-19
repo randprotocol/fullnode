@@ -6,12 +6,12 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-19)
 
-### v0.5 — zUSD on RPL, the bridge launch — IN PROGRESS (2026-09-19), branch `rpl`
+### v0.5 — zUSD on RPL, the bridge launch — IN PROGRESS (2026-09-19), branch `feat/rpl`
 
 **Take-over document: `docs/superpowers/handoffs/2026-09-19-zusd-v0.5.md`** — the goal, every user
 decision, the invariant, task state, the remaining path, the fixed chain-14 inputs and the traps.
 Spec `docs/superpowers/specs/2026-09-19-rpl-token-standard-design.md` (§12 = one zUSD), plan
-`docs/superpowers/plans/2026-09-19-rpl-token-standard.md`; live ledger (git-ignored) in the `rpl`
+`docs/superpowers/plans/2026-09-19-rpl-token-standard.md`; live ledger (git-ignored) in the `feat/rpl`
 worktree's `.superpowers/sdd/2026-09-19-rpl-token-standard/progress.md`.
 - **Goal**: zUSD mint/transfer/burn backed by USDT + USDC bridged from Tron, Solana, BNB Chain and
   Ethereum, and bridging back; custody on the four chains always >= zUSD supply, checked before every
