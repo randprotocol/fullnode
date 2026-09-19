@@ -898,7 +898,7 @@ fn emit_read_inputs(a: &mut Assembler, label: &str, base: u32, idx: u32, ptr: u3
 ///
 /// Private inputs: `hidden::hidden_input` (1 204 words, built by `hidden::hidden_bundle_inputs`).
 /// Publishes `hidden::hidden_bundle_digest(anchor, nf0..3, cm0..3, fee, burn_a, burn_r,
-/// burn_asset, time)` at `notes::output::DIGEST` — 82 words under `HIDDEN_BUNDLE_DOMAIN` (16),
+/// burn_asset, time)` at `notes::output::DIGEST` — 82 words under `HIDDEN_BUNDLE_DOMAIN` (64),
 /// with `bad` as the last word. **`A` is not in it.** Lives beside `bundle()`; nothing on the
 /// chain path proves or verifies it yet (spec §7: H3–H5).
 ///
@@ -1193,7 +1193,7 @@ pub fn bundle_hidden() -> Program {
     }
     a.push(sw(BASE, BAD, off));
     off += 4;
-    debug_assert_eq!((off - BUF) / 4, 1 + crate::hidden::PREIMAGE_WORDS as i32);
+    assert_eq!((off - BUF) / 4, 1 + crate::hidden::PREIMAGE_WORDS as i32, "the staged digest preimage is not hidden_bundle_preimage's");
     a.extend(call_poseidon2(ptr_words(BUF), 1 + crate::hidden::PREIMAGE_WORDS));
     for i in 0..8 {
         a.push(lw(T1, BASE, BUF + 4 * i));

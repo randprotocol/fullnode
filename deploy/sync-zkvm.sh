@@ -119,14 +119,15 @@
 #
 # The hidden-asset bundle (2026-09-19, spec `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-
 # design.md`, task H1) adds two more node-local files, both excluded below: `src/hidden.rs` (the
-# guest's private-input layout, its digest under domain tag 16 and the wallet's witness builder)
+# guest's private-input layout, its digest under domain tag 64 and the wallet's witness builder)
 # and `tests/hidden_bundle.rs`. The layout and digest would naturally sit beside `bundle_input`/
 # `bundle_digest` in `notes.rs`, but `notes.rs` is vendored and a resync would erase them — so they
 # live in their own module; the guest itself is in the (already excluded) `guests.rs`, its prover
-# and verifier in `executor.rs`. Before the next resync: upstream's `notes::domain` has since
-# gained `KEM_SEED_VERSION = 16` (the short-address feature this repository reverted), which would
-# collide with `hidden::HIDDEN_BUNDLE_DOMAIN`; renumber one of them first
-# (`tests/hidden_bundle.rs` asserts the hidden tag is unique among `notes::domain`'s).
+# and verifier in `executor.rs`. The digest's tag, 64, was chosen to stay clear of upstream's
+# allocation range: `notes::domain` hands out tags sequentially from 1 (upstream is already at 16,
+# `KEM_SEED_VERSION`, not vendored here) plus `TEST = 0xff`. `tests/hidden_bundle.rs` asserts the
+# tag is outside `1..=0x3f`, not `0xff`, and distinct from every vendored tag, so a resync that
+# ever reached it would fail there rather than collide silently.
 #
 # The CUDA backend is *not* vendored either: crates/randprotocol-zkvm depends on it by path, as
 # ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building

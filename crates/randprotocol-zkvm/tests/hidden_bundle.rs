@@ -22,7 +22,7 @@
 use randprotocol_core::confidential::ConfidentialError;
 use randprotocol_zkvm::emulator::{execute, HashRow};
 use randprotocol_zkvm::executor::{prove_hidden_bundle, ZkExecutor};
-use randprotocol_zkvm::hidden::{self, hidden_input as hi, HiddenDigestInput, HIDDEN_BUNDLE_DOMAIN};
+use randprotocol_zkvm::hidden::{self, hidden_input as hi, HiddenDigestInput, HiddenOutput, HIDDEN_BUNDLE_DOMAIN};
 use randprotocol_zkvm::ledger::CommitmentTree;
 use randprotocol_zkvm::machine::{build_traces, Backend, FriProfile, Machine, Tier};
 use randprotocol_zkvm::notes::{self, Note, SpendKey, Word8, DEPTH};
@@ -99,9 +99,12 @@ impl Case {
         Case { sk, ins, outs, anchor, fee, burn_a, burn_r, asset_a, time: TIME }
     }
 
+    /// The witness. The outputs go in as the sender's choices only (`pk`, `amount`, `r`); the
+    /// test keeps whole notes in `outs` to model what a wallet believes it is committing to.
     fn inputs(&self) -> Vec<u32> {
+        let outs = self.outs.map(|o| HiddenOutput { pk: o.pk, amount: o.amount, r: o.r });
         hidden::hidden_bundle_inputs(
-            &self.sk, &self.ins, &self.outs, self.anchor, self.fee, self.burn_a, self.burn_r, self.asset_a, self.time,
+            &self.sk, &self.ins, &outs, self.anchor, self.fee, self.burn_a, self.burn_r, self.asset_a, self.time,
         )
     }
 
@@ -259,7 +262,11 @@ fn every_shape_lands_at_tier_14_with_identical_table_heights() {
 /// `bundle_digest` for comparable fields.
 #[test]
 fn the_digest_is_domain_separated_and_has_no_asset_field() {
-    assert_eq!(HIDDEN_BUNDLE_DOMAIN, 16);
+    assert_eq!(HIDDEN_BUNDLE_DOMAIN, 64);
+    // Outside the range upstream's `notes::domain` allocates sequentially (1, 2, …; 16 upstream
+    // already) and not its TEST tag, so a tag a future resync brings in cannot equal it silently.
+    assert!(HIDDEN_BUNDLE_DOMAIN > 0x3f && HIDDEN_BUNDLE_DOMAIN != 0xff && HIDDEN_BUNDLE_DOMAIN != notes::domain::TEST);
+    assert!(randprotocol_zkvm::hash::HC_DOMAIN <= 0x3f && randprotocol_zkvm::hash::IN_DOMAIN <= 0x3f && randprotocol_zkvm::hash::PUB_DOMAIN <= 0x3f);
     for tag in [
         notes::domain::NK, notes::domain::PK, notes::domain::NF, notes::domain::CM, notes::domain::OVK,
         notes::domain::KEM_SEED, notes::domain::NODE, notes::domain::HC, notes::domain::OUT, notes::domain::IN,
@@ -363,12 +370,33 @@ fn a_note_owned_by_another_key_taints() {
     let (p, i) = tree.path_for(&theirs.commitment()).unwrap();
     let mut c = rand_only();
     c.anchor = tree.root();
-    c.ins[2] = (theirs, p, i);
-    // What the guest actually nullifies: the note with the spender's own key in the owner slot.
-    let mut claimed = c.claimed();
-    let me = c.sk.viewing_key();
-    claimed.nullifiers[2] = me.nullifier(&Note { pk: me.pk(), ..theirs }.commitment());
-    assert_taints(&c.inputs(), &claimed, "another owner's note");
+    // The witness words of `theirs` (the builder refuses a foreign owner, so the cheat relabels
+    // it): the guest stages it under the spender's own key, a note that is not in the tree, and
+    // nullifies that one.
+    c.ins[2] = (Note { pk: c.sk.viewing_key().pk(), ..theirs }, p, i);
+    assert_taints(&c.inputs(), &c.claimed(), "another owner's note");
+}
+
+/// The builder refuses an input note owned by another key: the guest would stage it under the
+/// spender's own key, so the proof would nullify a note the caller does not hold.
+#[test]
+#[should_panic(expected = "input 2 is not owned by this spend key")]
+fn the_builder_refuses_an_input_owned_by_another_key() {
+    let mut c = rand_only();
+    c.ins[2].0.pk = [1; 8];
+    let _ = c.inputs();
+}
+
+/// `HiddenOutput::note` is the note the guest commits: the wallet's envelope and the chain's
+/// commitment agree.
+#[test]
+fn hidden_output_note_is_what_the_guest_commits() {
+    let c = mixed();
+    let me = c.sk.viewing_key().pk();
+    for k in 0..4 {
+        let o = HiddenOutput { pk: c.outs[k].pk, amount: c.outs[k].amount, r: c.outs[k].r };
+        assert_eq!(o.note(k, me, c.asset_a, c.time), c.outs[k], "slot {k}");
+    }
 }
 
 /// §3.3: a dummy (amount 0) skips Merkle/anchor/asset but cannot carry value — a note not in
@@ -547,12 +575,18 @@ fn an_outputs_asset_is_its_slots() {
         assert_eq!(c.inputs(), honest.inputs());
         assert_eq!(out, hidden::hidden_bundle_digest(&honest.claimed()));
     }
-    // Likewise an output's `from` (always pk_self) and `time` (always the bundle's).
+    // Likewise an output's `from` (always pk_self) and `time` (always the bundle's), one at a time.
     let honest = mixed();
-    let mut c = honest.clone();
-    c.outs[2].from = [1; 8];
-    c.outs[3].time = TIME + 1;
-    assert_ne!(emulate(&c.inputs()), hidden::hidden_bundle_digest(&c.claimed()));
+    let mut from = honest.clone();
+    from.outs[2].from = [1; 8];
+    let out = emulate(&from.inputs());
+    assert_ne!(out, hidden::hidden_bundle_digest(&from.claimed()), "output 2 with another from");
+    assert_eq!(out, hidden::hidden_bundle_digest(&honest.claimed()), "the guest committed from = pk_self");
+    let mut time = honest.clone();
+    time.outs[3].time = TIME + 1;
+    let out = emulate(&time.inputs());
+    assert_ne!(out, hidden::hidden_bundle_digest(&time.claimed()), "output 3 with another time");
+    assert_eq!(out, hidden::hidden_bundle_digest(&honest.claimed()), "the guest committed the bundle's time");
 }
 
 /// §3.3: `burn_asset = A if burn_a != 0 else 0` — computed, never a witness word, so a burn cannot

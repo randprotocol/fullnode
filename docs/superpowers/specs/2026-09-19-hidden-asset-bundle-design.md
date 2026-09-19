@@ -45,7 +45,7 @@ tier 16: ~400 s and 21–22 GB, which excludes 16 GB wallets. Headroom at tier 1
    - Two conservation sums, carry-checked: `in0 + in1 = out0 + out1 + burn_a` and
      `in2 + in3 = out2 + out3 + fee + burn_r`.
    - `burn_asset = A` if `burn_a != 0`, else 0 (branch-free).
-4. **Public digest** (a new domain tag, 16): `H(anchor, nf0..3, cm0..3, fee, burn_a, burn_r,
+4. **Public digest** (a new domain tag, 64 — clear of upstream `notes::domain`'s sequential range, which already reaches 16): `H(anchor, nf0..3, cm0..3, fee, burn_a, burn_r,
    burn_asset, time, bad)` — 82 words. **`A` is not in it.** A burn names its asset because a burn is
    a public boundary anyway (the chain must debit that token's supply).
 5. **The transaction binding (Task 5b) carries over unchanged**: the new guest is proved against the
@@ -108,7 +108,7 @@ if the check were missing:
 
 ## 7. Scope of the change (planned as tasks H1–H5)
 
-H1 the guest, its layouts (`notes::hidden_input`, `hidden_digest`), the prover/verifier-key heights,
+H1 the guest, its layouts (`hidden::hidden_input`, `hidden::hidden_bundle_digest`), the prover/verifier-key heights,
 and the honest-path proof tests · H2 the cheating suite and its review · H3 core: the `Bundle`
 shape, the stub executor, the ledger rules above, deleting the two-bundle machinery · H4 node:
 note indexing (4 per bundle), mempool keys, sealed/pruned forms, RPC `tx_json`, genesis `hc_bundle`

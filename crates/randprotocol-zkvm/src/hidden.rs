@@ -16,12 +16,13 @@
 
 use crate::notes::{hash, Note, SpendKey, Word8, DEPTH};
 
-/// The hidden bundle digest's domain tag. Unique among this crate's `notes::domain` tags
-/// (1–15 and `TEST = 0xff`; `tests/hidden_bundle.rs` asserts it). Upstream's research crate
-/// uses 16 for a host-only `KEM_SEED_VERSION` tag of the short-address feature that this
-/// repository reverted (chain 12) and never vendored; the two messages differ in length (11
-/// words against 82), but a resync that brings that tag in must renumber one of them.
-pub const HIDDEN_BUNDLE_DOMAIN: u32 = 16;
+/// The hidden bundle digest's domain tag. `notes::domain` is vendored, and upstream allocates
+/// its tags sequentially from 1 (1–15 here; upstream's research crate is already at 16, a
+/// host-only `KEM_SEED_VERSION` this repository never vendored) plus `TEST = 0xff`. A node-local
+/// tag therefore sits well clear of that range: 64 (`0x40`), so a future resync cannot collide
+/// with it silently — `tests/hidden_bundle.rs` asserts it is outside `1..=0x3f` and not `0xff`,
+/// as well as distinct from every tag this crate has.
+pub const HIDDEN_BUNDLE_DOMAIN: u32 = 64;
 
 /// Number of input and of output slots.
 pub const SLOTS: usize = 4;
@@ -129,22 +130,46 @@ pub fn hidden_bundle_digest(i: &HiddenDigestInput) -> Word8 {
     hash(HIDDEN_BUNDLE_DOMAIN, &hidden_bundle_preimage(i))
 }
 
+/// The asset of slot `k` (input or output) in a bundle whose private asset is `asset_a`.
+pub const fn slot_asset(k: usize, asset_a: u32) -> u32 {
+    if k < A_SLOTS { asset_a } else { 0 }
+}
+
+/// An output as the witness carries it: only what the sender chooses. Its `from`, asset and time
+/// are not the sender's to choose — the guest commits every output with `from = pk_self`, its
+/// slot's asset and the bundle's time — so they are not fields here, and a wallet cannot build a
+/// witness whose output commitments differ from the notes it seals (use [`HiddenOutput::note`]
+/// for those).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HiddenOutput {
+    pub pk: Word8,
+    pub amount: u64,
+    pub r: Word8,
+}
+
+impl HiddenOutput {
+    /// The note the guest commits for this output in slot `k`: `from = pk_self`, asset
+    /// `slot_asset(k, asset_a)`, the bundle's `time`. What the wallet seals in the envelope.
+    pub fn note(&self, k: usize, pk_self: Word8, asset_a: u32, time: u32) -> Note {
+        Note { pk: self.pk, from: pk_self, amount: self.amount, asset: slot_asset(k, asset_a), time, r: self.r }
+    }
+}
+
 /// Builds `guests::bundle_hidden()`'s private-input vector ([`hidden_input::COUNT`] words).
 ///
 /// `inputs[k]` is `(note, path, index)` for input slot `k`; a dummy is `Note::new(pk_self, _, 0,
 /// _, _)` with any path (the guest never dereferences a dummy's path) — but, like every note, a
-/// **fresh `r`**: two identical dummies share a nullifier and taint the proof. An input note's
-/// `pk` is not written (the guest stages every input under its own `pk_self`).
+/// **fresh `r`**: two identical dummies share a nullifier and taint the proof. The guest stages
+/// every input under its own `pk_self`, so an input note owned by any other key is refused here
+/// (panics): its proof would nullify a note that is not the one the caller holds.
 ///
-/// `outputs[k]`'s `pk`, `amount` and `r` are written; its `from`, `asset` and `time` are not — the
-/// guest commits every output with `from = pk_self`, asset `asset_a` (slots 0–1) or 0 (slots
-/// 2–3) and the bundle's `time`, so a caller whose output notes say otherwise gets a digest
-/// matching none of its own commitments. Dummy outputs need a fresh `r` too.
+/// `outputs[k]` gives the output's `pk`, `amount` and `r` ([`HiddenOutput`]). Dummy outputs need
+/// a fresh `r` too: two identical outputs taint the proof.
 #[allow(clippy::too_many_arguments)]
 pub fn hidden_bundle_inputs(
     sk: &SpendKey,
     inputs: &[(Note, [Word8; DEPTH], u32); SLOTS],
-    outputs: &[Note; SLOTS],
+    outputs: &[HiddenOutput; SLOTS],
     anchor: Word8,
     fee: u64,
     burn_a: u64,
@@ -155,7 +180,9 @@ pub fn hidden_bundle_inputs(
     use hidden_input::*;
     let mut v = vec![0u32; COUNT];
     v[SK..SK + 8].copy_from_slice(&sk.0);
+    let pk_self = sk.viewing_key().pk();
     for (k, (note, path, index)) in inputs.iter().enumerate() {
+        assert_eq!(note.pk, pk_self, "input {k} is not owned by this spend key");
         let b = in_slot(k);
         v[b + S_FROM..b + S_FROM + 8].copy_from_slice(&note.from);
         v[b + S_AMOUNT_LO] = note.amount as u32;
