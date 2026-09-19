@@ -600,7 +600,10 @@ fn resume_from_persisted_head_continues_chain() {
     );
     assert_eq!(resumed.committed_height(), head.block.height());
     assert!(resumed.view() >= safety.view);
-    assert_eq!(resumed.high_qc().block_hash, head.block.hash());
+    // The persisted `high_qc`/`locked_qc` come back when they are ahead of the head's QC (audit
+    // v3, CON-1b); a node whose safety state is no newer than its head resumes on the head's QC.
+    assert!(resumed.high_qc().view >= head.qc.view);
+    assert_eq!(resumed.locked_qc().view, safety.locked_qc.view.max(head.qc.view));
 }
 
 /// The config a restarting node rebuilds from its genesis file.
@@ -732,6 +735,71 @@ impl Sim {
             assert_eq!(node.committed_ledger().state_root(), root, "node {i} ledger differs");
         }
     }
+}
+
+/// Audit v3 CON-1b: the lock is a promise, and a restart must not break it. A validator locked on
+/// a branch at view v, restarted, must still refuse a proposal on a conflicting branch whose
+/// justify is older than its lock. Before the fix `resume` threw the persisted `locked_qc` away
+/// and reset the lock to the committed head's QC, so the restarted node voted.
+#[test]
+fn a_resumed_validator_keeps_its_lock() {
+    let mut sim = setup(4, 4);
+    for _ in 0..4 {
+        sim.step(vec![]);
+    }
+    // A node whose lock is ahead of its committed head: that is the promise a restart must keep.
+    let victim = (0..4)
+        .find(|&i| {
+            let hs = &sim.nodes[i];
+            hs.locked_qc().view > hs.committed_qc_view()
+        })
+        .expect("someone is locked past its committed head");
+    let locked_before = sim.nodes[victim].locked_qc().clone();
+
+    sim.restart(victim);
+
+    assert_eq!(
+        sim.nodes[victim].locked_qc().view,
+        locked_before.view,
+        "the lock must survive a restart"
+    );
+    assert_eq!(sim.nodes[victim].locked_qc().block_hash, locked_before.block_hash);
+}
+
+/// The same promise on the sync path: `apply_synced` rebuilds the replica through `resume` after
+/// every batch, so a node that syncs must not forget its lock either.
+#[test]
+fn a_stale_safety_state_never_lowers_the_lock() {
+    let mut sim = setup(4, 4);
+    for _ in 0..4 {
+        sim.step(vec![]);
+    }
+    let victim = 0;
+    let head_qc_view = sim.nodes[victim].committed_qc_view();
+    let mut safety = sim.nodes[victim].safety_state();
+    // A safety state older than the committed head (what a node that fell behind persists) must
+    // leave the lock at the head's QC, never below it.
+    safety.locked_qc = QuorumCertificate::genesis(sim.nodes[victim].committed_hash());
+    safety.high_qc = safety.locked_qc.clone();
+    let cfg = config_of(&sim);
+    let old = &sim.nodes[victim];
+    let ledger = old.committed_ledger().clone();
+    let (head, qc) = match sim.committed[victim].last() {
+        Some(cb) => (cb.block.clone(), cb.qc.clone()),
+        None => panic!("the chain committed above"),
+    };
+    let epoch_sets = old.epoch_sets().clone();
+    let hs = HotStuff::resume(
+        cfg,
+        Some(Keypair::from_seed(*sim.keys[victim].seed()).unwrap()),
+        head,
+        qc,
+        ledger,
+        Some(safety),
+        epoch_sets,
+        std::sync::Arc::new(StubExecutor),
+    );
+    assert_eq!(hs.locked_qc().view, head_qc_view, "a stale lock is raised to the head, never lowered");
 }
 
 #[test]
