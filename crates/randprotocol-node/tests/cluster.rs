@@ -24,7 +24,7 @@ use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::bridge::{
     digest, guardian_address, sign_digest, Attestation, Body, BridgeConfig, Payload, Transfer, CHAIN_RAND,
 };
-use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator, TokensConfig};
+use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisToken, GenesisValidator, TokensConfig};
 use randprotocol_core::ledger::staking::{MIN_STAKE, UNBONDING_EPOCHS};
 use randprotocol_core::notes::{word8_to_hex, Bundle, Envelope, ShieldedAddress};
 use randprotocol_core::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
@@ -193,10 +193,20 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         confidential: true,
         fri_profile: "test".into(),
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
-        // A bridge section now needs a tokens section (the RPL gate rides the same fork); a
-        // bridge-less chain (`bridge: None`) still needs none, so a plain `genesis_funding` chain
-        // stays exactly what it always was.
-        tokens: bridge.is_some().then(|| TokensConfig { registration_fee: 1_000_000_000, tokens: vec![] }),
+        // A bridge section needs a tokens section (the RPL gate rides the same fork), and a
+        // bridged token is *listed* there: an attestation of a token nobody listed is refused, so
+        // the chain that is about to be attested lists [`TOKEN`] and it takes index 1. A
+        // bridge-less chain (`bridge: None`) still needs no section at all, so a plain
+        // `genesis_funding` chain stays exactly what it always was.
+        tokens: bridge.is_some().then(|| TokensConfig {
+            registration_fee: 1_000_000_000,
+            tokens: vec![GenesisToken {
+                name: "Tether USD".into(),
+                symbol: "zUSDT".into(),
+                chain: TOKEN_CHAIN,
+                token: TOKEN,
+            }],
+        }),
         bridge,
         aggregation: None,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
@@ -1468,7 +1478,7 @@ async fn bridge_mint(
     assert_eq!(asset_id, d.asset.to_hex(), "and computes the same one this wallet did");
     let state = node.rpc.bridge_state().await.expect("bridge state");
     let assets = node.rpc.assets().await.expect("the registry");
-    let index = wallet::deposit_index(&state, &assets, &asset_id).expect("an index for this asset").index();
+    let index = wallet::deposit_index(&state, &assets, &asset_id).expect("the token is listed on this chain");
     let time = u32::try_from(node.rpc.head().await.expect("head")["height"].as_u64().expect("height")).unwrap();
     let (note, envelope) = wallet::deposit_note_for(relayer, to, d.amount, index, time).expect("sealing the deposit");
     let action =
@@ -1529,13 +1539,14 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     let n1 = start_node_at(&ks[1], &gen, vec![bootstrap_addr(&n0)], true, PROVING).await;
     wait_height(&[&n0, &n1], 2, Duration::from_secs(90)).await;
 
-    // A bridged genesis names guardians and emitters, and nothing else: the registry is empty, so
-    // the attestation below is a first sighting and its deposit takes the first index.
+    // A bridged genesis names guardians, emitters and the tokens it will accept: the registry
+    // holds the listed token at index 1 before any attestation arrives, which is the index the
+    // deposit below carries.
     let state = n0.rpc.bridge_state().await.unwrap();
     assert_eq!(state["enabled"], true);
     assert_eq!(state["guardians"].as_array().unwrap().len(), 6);
-    assert_eq!(state["next_index"], 1, "nothing registered yet");
-    assert!(n0.rpc.assets().await.unwrap().is_empty());
+    assert!(state.get("next_index").is_none(), "nothing left to predict: tokens are listed");
+    assert_eq!(n0.rpc.assets().await.unwrap().len(), 1, "the genesis listing");
 
     // ---- inbound: one attestation, one deposit note ----
     let deposit = 5_000u64;
@@ -1543,7 +1554,7 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     let mut relayer_store = NoteStore::default();
     let (minted, index, cm) =
         bridge_mint(&n0, &relayer, &mut relayer_store, &recipient.address, attested.clone()).await;
-    assert_eq!(index, 1, "a first sighting takes FIRST_ASSET_INDEX");
+    assert_eq!(index, 1, "the index the genesis listing gave the token");
     eprintln!("bridge-mint: tier {}, proved in {:.1?}, {} proof bytes", minted.tier, minted.proving, minted.proof_bytes);
 
     wait_for("the attestation reaches n1", Duration::from_secs(120), || {
@@ -1556,11 +1567,11 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
         assert_eq!(asset_balance(n, &relayer, index).await, 0, "and the relayer, who paid for it, holds none");
         assert_eq!(balance(n, &relayer).await, ALLOC - gas::BUNDLE_BASE, "the relayer paid one bundle base");
         assert_eq!(balance(n, &recipient).await, ALLOC, "the recipient paid nothing");
-        // Both nodes registered the same token under the same index.
+        // Both nodes hold the same listed token under the same index, and the deposit is its
+        // whole supply.
         let rows = n.rpc.assets().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].index, rows[0].chain, rows[0].token.as_slice()), (index, TOKEN_CHAIN, &TOKEN[..]));
-        assert_eq!(n.rpc.bridge_state().await.unwrap()["next_index"], index + 1);
     }
     // The explorer's view of it: the amount and the asset decoded out of the attestation, and the
     // index the action named, which admission held to the registry's answer.

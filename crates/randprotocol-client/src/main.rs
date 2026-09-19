@@ -864,11 +864,11 @@ async fn main() -> Result<()> {
             if asset_id != d.asset.to_hex() {
                 anyhow::bail!("the node computes a different asset id ({asset_id}) than this wallet ({})", d.asset.to_hex());
             }
-            // The index a note carries is state, so it is asked of the node too. For a token the
-            // registry already names it is a fact; for a first sighting it is a prediction this
-            // wallet has to check afterwards (`wallet::DepositIndex`).
-            let asset = wallet::deposit_index(&rpc.bridge_state().await?, &rpc.assets().await?, &asset_id)?;
-            let index = asset.index();
+            // The index a note carries is state, so it is asked of the node too — and it is a
+            // fact, not a guess: a bridged token is listed before any attestation of it is
+            // admissible, and a listing's index never moves. A token this chain has not listed is
+            // an error here rather than a refused transaction an hour later (`wallet::deposit_index`).
+            let index = wallet::deposit_index(&rpc.bridge_state().await?, &rpc.assets().await?, &asset_id)?;
             // The note is stamped with a `time` this wallet chooses, inside the window admission
             // allows, which is what makes its commitment predictable enough to seal an envelope
             // against (`Action::BridgeAttest`). The head is the freshest such time.
@@ -877,9 +877,8 @@ async fn main() -> Result<()> {
             let (note, envelope) = wallet::deposit_note_for(&w, &recipient, d.amount, index, time)?;
             let owner = recipient.to_string();
             // The action names the index this envelope was sealed for, and admission refuses a
-            // mismatch (`Action::BridgeAttest`): if a competing first sighting registers while
-            // this bundle is being proved, the transaction is rejected and re-proved rather than
-            // depositing a note under an `asset` word the envelope does not match.
+            // mismatch (`Action::BridgeAttest`) — which nothing on a listed token can now cause,
+            // since no transaction hands an index out and a listing's index never moves.
             let action = Action::BridgeAttest { attestation: bytes, recipient, r: note.r, time, asset: index, envelope };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
@@ -896,19 +895,17 @@ async fn main() -> Result<()> {
             // in this transaction, so printing them discloses nothing — and they are the only way to
             // rebuild the note by hand if the index turns out not to be the predicted one below.
             println!(
-                "deposit: {} units of asset {index}{}\n  note {}\n  owner {owner}, from 0, time {time}, r {}",
+                "deposit: {} units of asset {index}\n  note {}\n  owner {owner}, from 0, time {time}, r {}",
                 d.amount,
-                if asset.is_first_sighting() { " (first sighting — this transaction registers it)" } else { "" },
                 randprotocol_core::notes::word8_to_hex(&note.commitment()),
                 randprotocol_core::notes::word8_to_hex(&note.r),
             );
             if !no_wait {
-                // Belt and braces. A first sighting's index was a prediction, but the action names
-                // it and admission refuses a transaction that disagrees with the registry, so a
-                // *committed* attest cannot have landed under another index — a lost race is a
-                // rejected submission above, not a note in the wrong asset. What is left for this
-                // to catch is a node whose registry disagrees with the one the prediction came
-                // from, which is worth a line rather than a silence.
+                // Belt and braces. The action names its index and admission refuses a transaction
+                // that disagrees with the registry, so a *committed* attest cannot have landed
+                // under another index. What is left for this to catch is a node whose registry
+                // disagrees with the one the index was read from, which is worth a line rather
+                // than a silence.
                 let committed = rpc.call("rand_getTransaction", serde_json::json!([s.hash.to_hex()])).await?;
                 let landed = match wallet::deposit_index_check(index, &committed) {
                     wallet::DepositIndexCheck::Agrees => index,

@@ -558,15 +558,17 @@ impl RpcClient {
 
     // ---- the bridge (spec §10) ----
 
-    /// The bridge's own public state: guardians, source emitters, the asset registry, the
-    /// outbound burn sequence, and `next_index` — the index the registry would give an asset it
-    /// has not seen yet. `{"enabled": false}` on a chain without a bridge.
+    /// The bridge's own public state: guardians, source emitters, the asset registry (the token
+    /// registry's bridged rows) and the outbound burn sequence. `{"enabled": false}` on a chain
+    /// without a bridge. There is no `next_index`: a bridged token is listed before it can be
+    /// deposited, so its index is a fact to read rather than a number to predict.
     pub async fn bridge_state(&self) -> Result<Value> {
         self.call("rand_getBridgeState", json!([])).await
     }
 
     /// The asset registry, ascending by index: what a wallet reads to turn a note's `asset` word
-    /// into a token, or a token into the index its notes carry. Empty without a bridge.
+    /// into a token, or a token into the index its notes carry — the `Bridge`-authority rows of
+    /// this chain's token registry. Empty without a bridge.
     pub async fn assets(&self) -> Result<Vec<AssetRow>> {
         let v = self.call("rand_getAssets", json!([])).await?;
         let rows = v.as_array().context("getAssets did not return a list")?;
