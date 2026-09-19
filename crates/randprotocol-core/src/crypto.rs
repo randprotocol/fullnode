@@ -331,9 +331,11 @@ impl fmt::Debug for Keypair {
 /// moves (`types::transaction`'s golden test pins it). Human-readable formats keep the plain
 /// `Vec<u8>` form, an array of integers both ways, unlike [`serde_bytes_vec`], which hex-encodes.
 ///
-/// The visitor accepts a byte string (borrowed or owned) and a sequence of `u8`, so a peer that
-/// still sends the integer-array form decodes too. A sequence's declared length only sizes the
-/// first allocation up to 64 KiB: the length is the peer's to choose.
+/// The visitor accepts a byte string (borrowed or owned) and a sequence of `u8`. The sequence arm
+/// serves self-describing formats (JSON, which writes the array form); the CBOR sync codec
+/// (cbor4ii) reads only a byte string here, so a peer still sending the old integer-array form is
+/// refused, not decoded — chain 13 starts fresh, so no such peer exists. A sequence's declared
+/// length only sizes the first allocation up to 64 KiB: the length is the peer's to choose.
 pub mod wire_bytes {
     use serde::{Deserializer, Serializer};
 

@@ -47,6 +47,7 @@ const SYNC_RESPONSE_FRAMING_BYTES: u64 = 64;
 /// RocksDB on the same event loop that verifies proofs frequently took longer. This is an upper
 /// bound rather than the usual case — a request that fails reports `SyncFailed` and is re-picked at
 /// once.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SYNC_GIVE_UP: Duration = network::SYNC_REQUEST_TIMEOUT;
 
 #[derive(Clone, Debug)]

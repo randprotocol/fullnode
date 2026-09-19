@@ -96,8 +96,6 @@ const fn response_limit_for(budget: u64) -> u64 {
     2 * budget + (256 << 10)
 }
 
-/// gossip's transmit size for a chain's block cap: never below today's 16 MiB, and always a whole
-/// block plus 1 MiB, so a proposal carrying a full block is never dropped.
 /// The sync request timeout over a reader limit: one second per MiB the response may weigh
 /// (rounded up), never below [`SYNC_REQUEST_TIMEOUT`]. A default chain's 12.25 MiB limit keeps the
 /// 30 s floor; a 20 MiB-block chain's 44.25 MiB gets 45 s, so a response that is legitimately
@@ -111,6 +109,8 @@ const fn request_timeout_for(response_limit: u64) -> Duration {
     }
 }
 
+/// gossip's transmit size for a chain's block cap: never below today's 16 MiB, and always a whole
+/// block plus 1 MiB, so a proposal carrying a full block is never dropped.
 const fn gossip_transmit_for(max_block_bytes: usize) -> usize {
     let block = max_block_bytes + (1 << 20);
     if block > (16 << 20) {
