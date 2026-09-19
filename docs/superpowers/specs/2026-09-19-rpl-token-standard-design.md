@@ -103,7 +103,7 @@ Every token action rides on a transaction whose `tx.bundle` is a RAND fee bundle
 
 | action | fields | fee floor | effect |
 |---|---|---|---|
-| `RegisterToken` | `name, symbol, decimals, authority, initial: Option<InitialMint>, salt` | `BUNDLE_BASE + registration_fee` | assigns `next_index`; mints `initial` if present |
+| `RegisterToken` | `name, symbol, decimals, authority, initial: Option<InitialMint>, salt, index` | `BUNDLE_BASE + registration_fee` | assigns `next_index`; mints `initial` if present |
 | `TokenMint` | `asset, amount, recipient, r, time, envelope, nonce, signature` | `BUNDLE_BASE` | `Key` authority only; appends one note; `total_supply += amount` |
 | `TokenTransfer` | `asset_bundle, memo: Option<Vec<u8>>` | `2 * BUNDLE_BASE` | shielded; `asset_bundle.fee == 0`, `.burn == 0`, `.asset` registered; `memo` is opaque, at most 2 048 bytes, and the chain checks only its size (SPL's memo) |
 | `TokenBurn` | `asset_bundle, asset, amount` | `2 * BUNDLE_BASE` | `asset_bundle.burn == amount`; `total_supply -= amount`; refused for a `Bridge` token (use `BridgeBurn`) |
@@ -111,7 +111,9 @@ Every token action rides on a transaction whose `tx.bundle` is a RAND fee bundle
 | `BridgeAttest` | unchanged | unchanged | now also `total_supply += amount`; refuses an unlisted token (§5) |
 | `BridgeBurn` | unchanged | unchanged | now also `total_supply -= amount` |
 
-`InitialMint { amount, recipient, r, time, envelope }`. `authority: None` requires `initial`;
+`InitialMint { amount, recipient, r, time, envelope }`. `index` names the registry index the
+creator sealed the initial note for; a mismatch with `next_index` is refused (`IndexMismatch`), as
+`BridgeAttest.asset` is, so a lost registration race costs a re-proof and never strands a note. `authority: None` requires `initial`;
 `Bridge` and `Program` are refused in a `RegisterToken` (`TokenError::AuthorityNotAllowed`).
 
 **Minted notes** are chain-computed exactly as a deposit is:
