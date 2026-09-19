@@ -6,6 +6,37 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-18)
 
+### Final audit v3 (2026-09-19): POOL-1 and RPC-1 fixed in code; OPS-1 rotation rides chain 14
+
+The external audit (`../security/Rand_Final_Audit_v3_Key_Findings.pdf`, nine passes 10–18 Sep,
+closed out at v0.3 `c0ffc74`; 79 findings, 33 open critical/high — read its findings table
+before re-reporting) confirmed the v0.1 fixes (AGG-1, AGG-5, SYNC-2) and named two exposures
+live on chain 12, **both also live on chain 13** (faucet on, chain 12's validator keys):
+
+- **POOL-1 (critical) — fixed in code, a hard fork for chain 14.** `Action::Mint` carried a
+  `cm` the ledger never related to `amount`, so a validator could mint a note worth anything
+  while the supply counted the declared amount. The mint now carries the opening (`pk`, `time`,
+  `r`); admission recomputes `ledger::mint_commitment` (no sender, native asset) and refuses a
+  mismatch (`TxError::MintCommitmentMismatch`, permanent), `time` is held to the bundle window,
+  and the minter signs `rand-mint-2` over every field. `Transaction::mint` takes the executor
+  and derives `cm` itself. Regression test:
+  `a_mint_whose_commitment_opens_to_more_than_its_amount_is_refused`. **Chain 13 cannot take
+  this as a same-chain update** — the wire format changed, so its committed mints no longer
+  decode; it ships with the chain-14 cut.
+- **OPS-1 (critical) — not fixable in code alone.** `deploy/node-a..f.key.json` are committed
+  to a public repository and chains 8–13 all run on them. `deploy/lib/key-guard.sh`
+  (`refuse_in_tree_key`) is for the chain-14 cut script: fresh keys from a `KEYS_DIR` outside
+  the tree, refused otherwise. The old files stay tracked until the cut, because untracking
+  them would delete the working copies node A's scripts read when a checkout fast-forwards.
+  Drop the `!deploy/*.key.json` exception from `.gitignore` at the cut.
+- **RPC-1 (medium) — fixed.** `rand_getWitness(es)` rebuilds the whole tree per call on the
+  blocking pool; at most `MAX_CONCURRENT_WITNESS_BUILDS` (2) run at once per process, and a
+  request that waits more than 10 s is refused `-32000` busy. PRIV-1 (the operator learns which
+  leaves a wallet spends) stays open: the fix is wallet-side witnesses.
+Still open from the audit's work order: AGG-2 (bind the aggregator before the production batch
+pins the digest), AGG-4/AGG-3, CON-1a/1b + SYNC-1 (the commit rule on the sync path), VK-1/2/3,
+BRG-7's forward timestamp bound, and decisions D1–D13.
+
 ### v0.3 — the RPC release — LIVE on chain 12 (2026-09-18), pinned build `4504a03`
 
 Eleven JSON-RPC methods (`rand_getVersion`, `rand_getGenesisHash`, `rand_getHealth`,

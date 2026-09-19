@@ -932,7 +932,9 @@ Bundle {
 Envelope { kem_ct: Vec<u8>, to_receiver: Vec<u8>, to_sender: Vec<u8>, body: Vec<u8> }
 
 Action::None                                            // a plain shielded transfer
-Action::Mint { cm: Word8, envelope: Envelope, amount: u64, minter: PublicKey, signature: Signature }
+Action::Mint { cm: Word8, pk: Word8, time: u32, r: Word8,   // cm = commitment of (pk, no sender,
+               envelope: Envelope, amount: u64,          //   amount, asset 0, time, r), checked
+               minter: PublicKey, signature: Signature } //   by admission (audit v3, POOL-1)
 Action::Deploy { base_pc: u32, words: Vec<u32> }
 Action::Call { program: Hash, proof: Vec<u8>,           // postcard(rand_zkvm::Proof)
                input_envelope: Option<CallEnvelope> }
@@ -996,6 +998,20 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-19 — audit v3: the faucet mint's opening, a witness-build cap
+
+A hard fork (the `Mint` wire format), for the next chain cut; nothing else in this list changes a
+format.
+
+- **`Action::Mint`** gains the note's opening, `pk`, `time` and `r`. Admission refuses a `cm` that is
+  not the commitment of `(pk, no sender, amount, native asset, time, r)` with *"the mint's
+  commitment does not open to its published note and amount"*, and holds `time` to the bundle
+  window. The minter signs under the domain `rand-mint-2` over all seven fields. A faucet note's
+  owner is therefore public, as a withdraw's payout is. `rand_mint`'s parameters are unchanged.
+- **`rand_getWitness` / `rand_getWitnesses`** run at most two tree rebuilds at a time per node. A
+  request that waits more than 10 s for a slot is refused with `-32000` *"witness builds are busy
+  on this node; retry shortly"*.
 
 ### 2026-09-19 — call limits: two methods, new fields, limits from the genesis
 
