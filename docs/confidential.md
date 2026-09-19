@@ -418,7 +418,7 @@ is no `effect` field.
 | Deploy with a public input | as Deploy, counting the public words with the code words |
 | Call | 0.002 RAND at tier 10, plus 0.0001 RAND per two tiers above it (0.0025 at tier 20), plus 0.000001 RAND per KiB (or part) of call proof and input envelope past 2 097 152 + 18 432 bytes |
 | BridgeAttest | 0.001 RAND (the base alone) |
-| BridgeBurn | 0.002 RAND — the base twice, for its two bundles |
+| BridgeBurn | 0.01 RAND (`BRIDGE_BURN_FEE`) — the bridge fee; it covers the base for both of its bundles. A deposit (`BridgeAttest`) pays only the base: the depositor has no RAND yet |
 | Mint (faucet) | free, and carries no bundle |
 
 Every floor above the mint's includes `BUNDLE_BASE`, because every one of those transactions

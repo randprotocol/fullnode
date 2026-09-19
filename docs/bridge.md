@@ -305,8 +305,10 @@ Action::BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee:
 ```
 
 Both are carried by an ordinary shielded transaction, and both pay their fee in RAND: an attest
-pays `BUNDLE_BASE` (one bundle), a burn pays `2 * BUNDLE_BASE` (two), out of the one bundle allowed
-a non-zero fee. See `docs/confidential.md`'s fee table.
+pays `BUNDLE_BASE` (one bundle) and nothing more, because its relayer is paying for a depositor who
+holds no RAND yet; a burn pays `BRIDGE_BURN_FEE` (0.01 RAND), the bridge's charge towards the
+validators' infrastructure, which also covers the base for its two bundles, out of the one bundle
+allowed a non-zero fee. On a chain without aggregation the whole fee is the block proposer's. See `docs/confidential.md`'s fee table.
 
 ### Inbound: an attestation deposits a note
 
@@ -346,7 +348,7 @@ a non-zero fee. See `docs/confidential.md`'s fee table.
 ```
 Transaction {
   chain_id,
-  bundle: <RAND bundle: asset 0, burn 0, fee = 2 * BUNDLE_BASE>,   // pays for both bundles
+  bundle: <RAND bundle: asset 0, burn 0, fee = BRIDGE_BURN_FEE>,   // 0.01 RAND; covers both bundles
   action: BridgeBurn {
     asset_bundle: <bundle: asset = index, fee 0, burn = amount>,
     asset, amount, relayer_fee, to_chain, to }

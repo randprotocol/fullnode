@@ -2177,7 +2177,7 @@ pub(crate) mod fixtures {
         asset_bundle.proof = StubExecutor::make_bundle_proof(&HC, &d);
         Transaction::shielded(
             ledger.chain_id(),
-            bundle(ledger, [[seed + 4; 8], [seed + 5; 8]], [[seed + 6; 8], [seed + 7; 8]], 2 * gas::BUNDLE_BASE),
+            bundle(ledger, [[seed + 4; 8], [seed + 5; 8]], [[seed + 6; 8], [seed + 7; 8]], gas::BRIDGE_BURN_FEE),
             Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain: 2, to: EVM_TO },
         )
     }

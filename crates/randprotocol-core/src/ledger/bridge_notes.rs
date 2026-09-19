@@ -738,7 +738,7 @@ mod tests {
     }
 
     /// The fee a valid burn's outer bundle pays: the bundle base for each of its two bundles.
-    const BURN_FEE: u64 = 2 * gas::BUNDLE_BASE;
+    const BURN_FEE: u64 = gas::BRIDGE_BURN_FEE;
 
     /// [`burn_tx`] with the outer bundle's fee chosen, for the fee-floor test.
     fn burn_tx_paying(
@@ -770,13 +770,13 @@ mod tests {
         let short = burn_tx_paying(&l, 1, 400, 100, gas::BUNDLE_BASE, |b| b.proof = vec![0xff; 16]);
         assert_eq!(
             l.validate(&short, &StubExecutor),
-            Err(TxError::FeeTooLow { min: 2 * gas::BUNDLE_BASE, fee: gas::BUNDLE_BASE })
+            Err(TxError::FeeTooLow { min: gas::BRIDGE_BURN_FEE, fee: gas::BUNDLE_BASE })
         );
         // One unit short is still short; exactly the floor is accepted.
         let short = burn_tx_paying(&l, 1, 400, 100, BURN_FEE - 1, |_| {});
         assert_eq!(
             l.validate(&short, &StubExecutor),
-            Err(TxError::FeeTooLow { min: 2 * gas::BUNDLE_BASE, fee: BURN_FEE - 1 })
+            Err(TxError::FeeTooLow { min: gas::BRIDGE_BURN_FEE, fee: BURN_FEE - 1 })
         );
         assert_eq!(l.validate(&burn_tx_paying(&l, 1, 400, 100, BURN_FEE, |_| {}), &StubExecutor), Ok(()));
     }

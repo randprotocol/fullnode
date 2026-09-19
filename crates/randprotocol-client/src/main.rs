@@ -205,7 +205,7 @@ enum Cmd {
         /// A portion of AMOUNT paid to the relayer on the destination chain, in the same asset.
         #[arg(long, default_value_t = 0)]
         relayer_fee: u64,
-        /// Fee in RAND; the floor is 0.002 — the bundle base for each of the two bundles.
+        /// Fee in RAND; the floor is 0.01 — the bridge fee, which covers the base for both bundles.
         #[arg(long)]
         fee: Option<String>,
         /// Return once the node accepts the transaction instead of waiting for it to commit.

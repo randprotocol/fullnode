@@ -1341,12 +1341,12 @@ pub fn call_fee_default(tier: u8, bytes: usize) -> u64 {
     gas::BUNDLE_BASE + gas::call_fee(tier, bytes)
 }
 
-/// What a `bridge-burn` pays by default: the bundle base for each of its two bundles, which is
-/// `gas::fee_floor` for a `BridgeBurn`. Written as the arithmetic rather than by calling
+/// What a `bridge-burn` pays by default: the bridge fee (0.01 RAND, covering the bundle base for
+/// each of its two bundles), which is `gas::fee_floor` for a `BridgeBurn`. Written as the constant rather than by calling
 /// `fee_floor` because the action does not exist yet — the asset bundle inside it is the thing
 /// this fee is being selected in order to prove.
 pub fn burn_fee_default() -> u64 {
-    2 * gas::BUNDLE_BASE
+    gas::BRIDGE_BURN_FEE
 }
 
 // ---------------------------------------------------------------- the bridge
@@ -2039,7 +2039,7 @@ mod tests {
             to: [0; 32],
         };
         assert_eq!(burn_fee_default(), gas::fee_floor(&burn));
-        assert_eq!(burn_fee_default(), 2 * gas::BUNDLE_BASE);
+        assert_eq!(burn_fee_default(), gas::BRIDGE_BURN_FEE);
     }
 
     /// The three things a burn is refused for before it costs anything: RAND, which is not a

@@ -1573,9 +1573,9 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     let (burn, relayer_fee) = (2_000u64, 100u64);
     let burn_fee = wallet::burn_fee_default();
     // Pinned here rather than taken on trust from the wallet: the floor this transaction has to
-    // clear is the bundle base once per bundle a node verifies, and a burn is the one transaction
-    // with two (spec §7 item 3). The balance assertion below would hold against a wrong default.
-    assert_eq!(burn_fee, 2 * gas::BUNDLE_BASE);
+    // clear is the bridge's burn fee, which covers the bundle base for each of the two bundles a
+    // node verifies (spec §7 item 3). The balance assertion below would hold against a wrong default.
+    assert_eq!(burn_fee, gas::BRIDGE_BURN_FEE);
     let mut recipient_store = NoteStore::default();
     // A burn proves twice under one anchor, which is the longest single hold of the slot there is.
     let slot = proving_slot().await;

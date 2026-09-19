@@ -85,6 +85,11 @@ pub const MAX_TIER: u8 = 20;
 
 /// What every bundle pays before its action's own floor (0.001 RAND, spec §7 item 3).
 pub const BUNDLE_BASE: u64 = 1_000_000;
+/// What a `BridgeBurn` pays, all in: 0.01 RAND. It covers the bundle base for each of its two
+/// bundles and the bridge's share of the validators' infrastructure. A deposit
+/// (`BridgeAttest`) carries no such charge on purpose: a depositor holds no RAND until the
+/// bridge has delivered their first note, so the bridge's RAND fee is collected on the way out.
+pub const BRIDGE_BURN_FEE: u64 = 10 * BUNDLE_BASE;
 pub const DEPLOY_PER_WORD: u64 = 100_000;
 pub const CALL_BASE: u64 = 1_000_000;
 pub const CALL_PER_TIER_STEP: u64 = 100_000;
@@ -140,13 +145,16 @@ pub fn fee_floor(action: &Action) -> u64 {
         // stake out of the pool — so it pays the plain base like a transfer.
         Action::Bond { .. } => BUNDLE_BASE,
         // An attestation's decode and guardian signature recovery are cheap next to a STARK
-        // verify, and the bundle base already covers the one bundle it carries.
+        // verify, and the bundle base already covers the one bundle it carries. No bridge
+        // charge on top: the relayer pays this one, for a depositor who has no RAND yet.
         Action::BridgeAttest { .. } => BUNDLE_BASE,
         // Spec §7 item 3 charges the bundle base "for every bundle", and a `BridgeBurn` is the
         // one transaction that carries two: the RAND fee bundle and the asset bundle inside
         // the action. Both are verified, so both are paid for — and by this bundle, because the
         // asset bundle's `fee` must be zero (the guest's "`asset != 0` => `fee = 0`" rule).
-        Action::BridgeBurn { .. } => 2 * BUNDLE_BASE,
+        // [`BRIDGE_BURN_FEE`] is those two bases plus the bridge's charge, which falls on the
+        // burn because that is the one bridge transaction whose sender is sure to hold RAND.
+        Action::BridgeBurn { .. } => BRIDGE_BURN_FEE,
         // Block aggregation: registering burns the genesis bond through its bundle, so the
         // bundle pays the plain base like a transfer or a `Bond`. The four bundle-less
         // aggregation actions have nothing to pay *from* (this function's own rule for
@@ -224,11 +232,11 @@ mod tests {
         }
     }
 
-    /// Spec §7 item 3 charges the bundle base per *bundle*, so a `BridgeAttest` — one bundle —
-    /// pays it once and a `BridgeBurn` — the chain's only two-bundle transaction — pays it
-    /// twice, out of the one bundle that is allowed a non-zero fee.
+    /// A `BridgeAttest` — one bundle, sent by a relayer for a depositor with no RAND — pays the
+    /// plain base. A `BridgeBurn` pays the bridge's 0.01 RAND, which has to cover the base for
+    /// both of its bundles (spec §7 item 3) out of the one bundle allowed a non-zero fee.
     #[test]
-    fn a_burn_pays_the_bundle_base_for_both_of_its_bundles() {
+    fn a_burn_pays_the_bridge_fee_and_an_attest_only_the_base() {
         let b = crate::notes::Bundle {
             anchor: [0; 8],
             nullifiers: [[0; 8], [1; 8]],
@@ -250,7 +258,9 @@ mod tests {
         };
         assert_eq!(fee_floor(&attest), BUNDLE_BASE);
         let burn = Action::BridgeBurn { asset_bundle: b, asset: 1, amount: 1, relayer_fee: 0, to_chain: 2, to: [0; 32] };
-        assert_eq!(fee_floor(&burn), 2 * BUNDLE_BASE);
+        assert_eq!(fee_floor(&burn), BRIDGE_BURN_FEE);
+        assert_eq!(BRIDGE_BURN_FEE, 10_000_000, "0.01 RAND");
+        assert!(BRIDGE_BURN_FEE >= 2 * BUNDLE_BASE, "both bundles are still paid for");
     }
 
     #[test]
