@@ -87,3 +87,26 @@ and no PQ signatures refused, a PQ signature from another chain id refused, the 
 `bridge` = bridge-06's fixed section (handoff §6) **plus** `pq_guardians` (six keys generated on the
 operators' hosts by the bridge session) and `pause_key`; `tokens` = zUSD with its seven backings and
 `mint_cap_per_day = 100_000 × 10^8`.
+
+## 7. B4 — listing after genesis by the PQ guardian quorum (user, 2026-09-19)
+
+A new bundle-less action `ListBacking { token_index, chain, token: [u8; 32], decimals, nonce,
+pq_signatures }` adds a backing to an existing bridged token — or, with `token_index` = the next
+index plus `name`/`symbol`/`salt`, registers a new bridged token with its first backing (one action,
+two shapes; pick the simpler encoding in the plan). Authorised by a **PQ guardian quorum** (B3's set
+and five rules) over the Rand-only message
+`b"rand-bridge-pq-list-1" ‖ chain_id (u64 BE) ‖ nonce (u64 BE) ‖ bincode(the action minus signatures)`,
+with its own ledger counter `list_nonce`. The same checks as a genesis listing apply (chain has a
+registered emitter; `(chain, token)` backs nothing yet; 1..=32 backings; decimals ≤ 18); the new
+backing starts with `locked = 0` and the token's `mint_cap_per_day`. No codec, wire or endpoint change —
+this replaces the deferred guardian payload id 3 (RPL plan Task 10). The source endpoint must still
+`setToken` the coin separately; an attestation for a coin listed on one side only is refused on
+Rand (`UnlistedToken`) or reverts on the endpoint (`TokenDisabled`).
+
+## 8. Token text form `rpl1…` (user, 2026-09-19)
+
+A token's asset id gets a checksummed text form: **bech32m** with HRP `rpl` over the 32-byte asset id
+(`rpl1…`, 59 characters). Shown and accepted everywhere a token is named: `rand_getToken` (accepts an
+index, 64 hex, or `rpl1…`; returns `id_text`), `rand_getTokens` rows, the `rand token` CLI, randscan's
+token pages, genesis docs. Parsing refuses a bad checksum, a wrong HRP, a wrong length and mixed case.
+Hex stays accepted as input. Test vectors: a fixed asset id ↔ its `rpl1…` string, and each refusal.
