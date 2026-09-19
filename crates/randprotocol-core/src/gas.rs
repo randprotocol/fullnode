@@ -260,7 +260,8 @@ mod tests {
             envelope: env(),
         };
         assert_eq!(fee_floor(&attest), BUNDLE_BASE);
-        let burn = Action::BridgeBurn { asset_bundle: b, asset: 1, amount: 1, relayer_fee: 0, to_chain: 2, to: [0; 32] };
+        let burn =
+            Action::BridgeBurn { asset_bundle: b, asset: 1, amount: 1, relayer_fee: 0, to_chain: 2, token: [9; 32], to: [0; 32] };
         assert_eq!(fee_floor(&burn), BRIDGE_BURN_FEE);
         assert_eq!(BRIDGE_BURN_FEE, 10_000_000, "0.01 RAND");
         assert!(BRIDGE_BURN_FEE >= 2 * BUNDLE_BASE, "both bundles are still paid for");

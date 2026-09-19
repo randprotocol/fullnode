@@ -1429,6 +1429,18 @@ impl Ledger {
     pub fn close_block(&mut self, height: u64, proposer: &Address) {
         self.sweep_expired_excesses(height, proposer);
         self.record_anchor(height);
+        // Spec §12's invariant, checked once per block in a debug build: every bridged token's
+        // supply is exactly the sum of what its source-chain coins are holding locked. It holds
+        // by construction — `lock`/`release` move both sides together and are the only writers of
+        // a bridged supply — so this is the assertion that a *new* writer has not appeared, not a
+        // consensus rule. Release builds skip it: it is a whole pass over the registry, and a
+        // check that can only fire on a code change does not belong in every node's hot path.
+        if let Some(tokens) = &self.tokens {
+            debug_assert!(
+                tokens.backing_invariant_holds(),
+                "a bridged token's supply left the sum of its backings at height {height}"
+            );
+        }
     }
 
     /// Deterministic state commitment (spec §9):
@@ -1960,7 +1972,7 @@ mod tests {
             let mut asset_bundle = bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], 0);
             asset_bundle.envelopes = envelopes;
             asset_bundle.proof = proof;
-            Action::BridgeBurn { asset_bundle, asset: 1, amount: 400, relayer_fee: 100, to_chain: 2, to: [9; 32] }
+            Action::BridgeBurn { asset_bundle, asset: 1, amount: 400, relayer_fee: 100, to_chain: 2, token: [9; 32], to: [9; 32] }
         };
         check(224, burn([fat(MAX_ENVELOPE_BYTES), env()], vec![]), Ok(()));
         check(228, burn([env(), fat(MAX_ENVELOPE_BYTES + 1)], vec![]), Err(TxError::EnvelopeTooLarge));
@@ -2437,7 +2449,7 @@ mod tests {
             let mut asset_bundle = bundle(l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], 0);
             asset_bundle.proof = vec![0; over];
             let action =
-                Action::BridgeBurn { asset_bundle, asset: 1, amount: 400, relayer_fee: 100, to_chain: 2, to: [9; 32] };
+                Action::BridgeBurn { asset_bundle, asset: 1, amount: 400, relayer_fee: 100, to_chain: 2, token: [9; 32], to: [9; 32] };
             let b = bundle(l, [[64; 8], [65; 8]], [[66; 8], [67; 8]], gas::fee_floor(&action));
             Transaction::shielded(7, b, action)
         };

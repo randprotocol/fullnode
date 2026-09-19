@@ -190,11 +190,12 @@ impl Ledger {
                 if attestation.len() > gas::MAX_ATTESTATION_BYTES {
                     return None;
                 }
-                let (id, amount) = bridge_notes::attested_transfer(attestation)?;
+                let (chain, token, amount) = bridge_notes::attested_transfer(attestation)?;
                 // A bridged holding's index is the token registry's, and an attestation naming a
-                // token nobody listed deposits nothing — `validate` refuses it outright
-                // (`BridgeError::UnlistedToken`), which is what makes a missing claim safe.
-                let index = self.bridge().and(self.tokens())?.get_by_id(&id)?.index;
+                // coin nobody listed as a backing deposits nothing — `validate` refuses it
+                // outright (`BridgeError::UnlistedToken`), which is what makes a missing claim
+                // safe.
+                let index = self.bridge().and(self.tokens())?.bridged(chain, &token)?.index;
                 Some(bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor))
             }
             _ => None,

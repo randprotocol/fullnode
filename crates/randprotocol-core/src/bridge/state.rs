@@ -24,11 +24,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::bridge::{
-    asset_id, digest, verify_decoded, Attestation, Body, GuardianKey, GuardianSet, GuardianSetUpgrade,
+    digest, verify_decoded, Attestation, Body, GuardianKey, GuardianSet, GuardianSetUpgrade,
     Payload, Transfer, VerifyError, AssetId, CHAIN_RAND, GOVERNANCE_EMITTER, GUARDIAN_GRACE_SECS,
 };
 use crate::crypto::{merkle_root, Hash};
-use crate::ledger::tokens::{MintAuthority, TokenRegistry};
+use crate::ledger::tokens::{MintAuthority, TokenError, TokenRegistry};
 
 /// The genesis-facing `bridge` section: the Rand emitter address published
 /// in outbound burn messages, the initial guardian set, and the registered
@@ -175,6 +175,14 @@ pub enum BridgeError {
     /// which only existed because first sighting could run out of indices.
     #[error("token {} of chain {chain} is not listed on this chain", hex::encode(token))]
     UnlistedToken { chain: u16, token: [u8; 32] },
+    /// What the token registry refused about a deposit or a redemption: the named
+    /// `(chain, token)` is not a backing of the asset
+    /// ([`crate::ledger::tokens::TokenError::NotABacking`]), the backing holds less than the
+    /// burn asks for ([`crate::ledger::tokens::TokenError::InsufficientBacking`]), or a lock
+    /// would overflow it. One bridged token has many backings (spec §12), so these are the
+    /// registry's verdicts to give and the bridge carries them rather than restating them.
+    #[error("{0}")]
+    Token(#[from] TokenError),
 }
 
 /// A transfer attestation as the pool needs it: which asset, under which note
@@ -192,12 +200,20 @@ pub enum BridgeError {
 /// address — the bridge never sees the address itself, only its hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BridgeTransfer {
+    /// The registry id of the token this deposit mints — the *token's* id (its registration
+    /// fields, `tokens::bridged_asset_id`), not the per-backing wire id: one bridged token has
+    /// many backings and they all mint the same asset.
     pub asset: AssetId,
     /// The token registry's dense index for `asset` — the note's `asset` word.
     /// A fact, not a prediction: the token was listed before this attestation
     /// arrived and its index never moves, so check and apply cannot disagree
     /// about it and no submitter can lose a race for it.
     pub index: u32,
+    /// The backing this deposit locks against: the source chain and token address the
+    /// attestation named, which is the pair whose `locked` moves (spec §12). Carried on the plan
+    /// so apply locks exactly the backing check resolved.
+    pub chain: u16,
+    pub token: [u8; 32],
     pub amount: u64,
     pub to_hash: [u8; 32],
     /// Carried for the record — the figure the source chain meant for whoever
@@ -394,17 +410,35 @@ impl BridgeState {
                 // above so a malformed transfer is still reported as malformed.
                 let amount = u64::try_from(amount).map_err(|_| BridgeError::AmountTooLarge)?;
                 let relayer_fee = fee as u64; // fee <= amount, which fits
-                let asset = asset_id(t.token_chain, &t.token_address);
                 // The one registry: a bridged token is listed there before it
                 // can be deposited, and its index is what a note carries. An
                 // unlisted pair is refused rather than given a fresh index —
                 // no first sighting, so no race for the index an envelope was
                 // sealed against.
-                let index = tokens
+                //
+                // `bridged` resolves through the backing map, into which only a
+                // `MintAuthority::Bridge` registration ever writes, so an
+                // attestation cannot reach a token of any other authority: the
+                // asymmetry `check_burn` has always had (it demands a `Bridge`
+                // token) is closed here rather than assumed.
+                let info = tokens
                     .bridged(t.token_chain, &t.token_address)
-                    .ok_or(BridgeError::UnlistedToken { chain: t.token_chain, token: t.token_address })?
-                    .index;
-                AttestPlan::Transfer(BridgeTransfer { asset, index, amount, to_hash: t.to, relayer_fee })
+                    .ok_or(BridgeError::UnlistedToken { chain: t.token_chain, token: t.token_address })?;
+                let (asset, index) = (info.id, info.index);
+                // Everything the ledger's `lock` would refuse, decided here, while this is still
+                // a comparison: this backing's `locked` overflowing, then the token's supply.
+                // The ledger applies the deposit note *before* it locks, so a refusal there
+                // would be a half-applied transaction.
+                tokens.check_lock(index, t.token_chain, &t.token_address, amount)?;
+                AttestPlan::Transfer(BridgeTransfer {
+                    asset,
+                    index,
+                    chain: t.token_chain,
+                    token: t.token_address,
+                    amount,
+                    to_hash: t.to,
+                    relayer_fee,
+                })
             }
             Payload::GuardianSetUpgrade(g) => {
                 if (att.body.emitter_chain, att.body.emitter_address)
@@ -480,35 +514,48 @@ impl BridgeState {
 
     /// Validates an outbound burn: `asset_index` must name a **bridged** token
     /// in `tokens` — one whose mint authority is [`MintAuthority::Bridge`],
-    /// which is the only kind with a home chain to release on — `to_chain`
-    /// must be that home chain, `to` must be a usable recipient on it, and
-    /// `relayer_fee <= amount != 0`.
+    /// which is the only kind with source-chain coins to release — the pair
+    /// `(to_chain, token)` must be one of that token's backings, that backing
+    /// must hold at least `amount`, `to` must be a usable recipient on
+    /// `to_chain`, and `relayer_fee <= amount != 0`.
     ///
     /// A registered but non-bridged token (a native RPL token, whose supply
     /// moves by its own mint authority and never crossed this bridge) is
     /// [`BridgeError::UnknownAsset`], exactly as an index nothing was ever
     /// registered under: from the bridge's side there is no such asset. The
-    /// registry cannot name a home chain and token address for it, which is
+    /// registry cannot name a source chain and token address for it, which is
     /// what an outbound message is made of.
     ///
-    /// There is no balance to check any more: what bounds a burn on the
-    /// shielded chain is the asset bundle's proof, which the ledger verifies
-    /// (`burn == amount` in that bundle, spec §10; the fee is a portion of the
-    /// amount, paid on the destination chain, not something extra destroyed here).
-    /// The token's own `total_supply` is the ledger's to debit, in the same
-    /// step that appends the asset bundle's notes.
+    /// One bridged token has many backings (spec §12), so a burn names the coin
+    /// it redeems: a pair that backs nothing, or that backs a *different* token,
+    /// is [`crate::ledger::tokens::TokenError::NotABacking`], and asking for
+    /// more than that coin's contract is holding is
+    /// [`crate::ledger::tokens::TokenError::InsufficientBacking`] — even when
+    /// the token's whole supply would cover it. That is the check that keeps a
+    /// burn from succeeding here and failing to release on the source chain.
+    ///
+    /// The pool-side bound is elsewhere: what a burner may destroy is what the
+    /// asset bundle's proof says they hold (`burn == amount` in that bundle,
+    /// spec §10). The registry's own move is the ledger's to make, in the same
+    /// step that appends the asset bundle's notes — and everything it could
+    /// refuse is decided here ([`TokenRegistry::check_release`]), so that step
+    /// cannot fail.
+    #[allow(clippy::too_many_arguments)]
     pub fn check_burn(
         &self,
         tokens: &TokenRegistry,
         asset_index: u32,
         amount: u64,
         to_chain: u16,
+        token: &[u8; 32],
         to: &[u8; 32],
         relayer_fee: u64,
     ) -> Result<(), BridgeError> {
-        let (chain, _) = bridged_identity(tokens, asset_index)?;
-        if to_chain != chain {
-            return Err(BridgeError::WrongTokenChain);
+        // A bridged token at all, before anything about the coin: an index that names no token,
+        // or one of another authority, is the bridge's `UnknownAsset` rather than a backing
+        // refusal about a token this bridge has nothing to do with.
+        if !is_bridged(tokens, asset_index) {
+            return Err(BridgeError::UnknownAsset);
         }
         // The burn is one-way and irreversible once the message is signed,
         // so screen the recipient here rather than leaving the source
@@ -529,14 +576,23 @@ impl BridgeState {
         if amount == 0 {
             return Err(BridgeError::ZeroAmount);
         }
+        // The coin: it must back *this* token, and hold what is being redeemed. Exactly what
+        // `TokenRegistry::release` would refuse, so the ledger's apply step cannot.
+        tokens.check_release(asset_index, to_chain, token, amount)?;
         Ok(())
     }
 
     /// Records the outbound message guardians will sign for a burn of
-    /// `amount` of the asset at `asset_index`. `tx` is the transaction hash,
-    /// which stands in for the sender slot: a burn is funded by notes, so
-    /// there is no sender identity to record. `timestamp` is the block time
-    /// in unix seconds. Leaves `self` untouched on error.
+    /// `amount` of the asset at `asset_index`, releasing the backing
+    /// `(to_chain, token)`. `tx` is the transaction hash, which stands in for
+    /// the sender slot: a burn is funded by notes, so there is no sender
+    /// identity to record. `timestamp` is the block time in unix seconds.
+    /// Leaves `self` untouched on error.
+    ///
+    /// The message names the *backing's* chain and token address, which is the
+    /// pair the burner chose and the pair whose `locked` the ledger releases —
+    /// so the coin this chain stops counting is the coin the source contract
+    /// pays out (spec §12).
     #[allow(clippy::too_many_arguments)]
     pub fn apply_burn(
         &mut self,
@@ -545,15 +601,16 @@ impl BridgeState {
         asset_index: u32,
         amount: u64,
         to_chain: u16,
+        token: [u8; 32],
         to: [u8; 32],
         relayer_fee: u64,
         height: u64,
         timestamp: u32,
     ) -> Result<BridgeBurnRecord, BridgeError> {
-        self.check_burn(tokens, asset_index, amount, to_chain, &to, relayer_fee)?;
-        // The check above resolved exactly this pair; re-reading it is the
-        // same one-map lookup the old `self.assets[&asset]` was.
-        let (token_chain, token_address) = bridged_identity(tokens, asset_index)?;
+        self.check_burn(tokens, asset_index, amount, to_chain, &token, &to, relayer_fee)?;
+        // The check above resolved exactly this backing, so the message is built from what the
+        // burn named rather than from a second lookup that could disagree with it.
+        let (token_chain, token_address) = (to_chain, token);
         let (amount, fee) = (amount as u128, relayer_fee as u128);
         let sequence = self.burn_sequence;
         let body = Body {
@@ -627,17 +684,16 @@ impl BridgeState {
     }
 }
 
-/// The home chain and token address behind a note's `asset` word, from the one
-/// registry: the [`MintAuthority::Bridge`] the token registered with.
+/// Whether a note's `asset` word names a token this bridge can release at all: one registered
+/// with a [`MintAuthority::Bridge`], which is the only kind that has source-chain coins behind
+/// it.
 ///
-/// [`BridgeError::UnknownAsset`] for an index nothing is registered under and
-/// for one whose token is not bridged — from the bridge's side those are the
-/// same thing, an index it can name no source-chain identity for.
-fn bridged_identity(tokens: &TokenRegistry, asset_index: u32) -> Result<(u16, [u8; 32]), BridgeError> {
-    match tokens.get(asset_index).map(|info| &info.authority) {
-        Some(MintAuthority::Bridge { chain, token }) => Ok((*chain, *token)),
-        _ => Err(BridgeError::UnknownAsset),
-    }
+/// An index nothing is registered under and an index whose token is native are the same thing
+/// from the bridge's side — [`BridgeError::UnknownAsset`], an index it can name no source-chain
+/// identity for. *Which* coin is released is the burn's own `(to_chain, token)`, checked against
+/// the token's backings by [`TokenRegistry::check_release`].
+fn is_bridged(tokens: &TokenRegistry, asset_index: u32) -> bool {
+    matches!(tokens.get(asset_index).map(|info| &info.authority), Some(MintAuthority::Bridge { .. }))
 }
 
 // ---------------------------------------------------------------------------
@@ -738,26 +794,40 @@ mod tests {
         TokenRegistry::new(1_000_000_000)
     }
 
-    /// Lists `(chain, token)` as a bridged token — what genesis (or a
-    /// governance message) does before any attestation of it can be accepted.
-    /// Returns the index it was given.
-    fn list(tokens: &mut TokenRegistry, chain: u16, token: [u8; 32]) -> u32 {
+    /// Lists a bridged token backed by `pairs` — what genesis (or a governance
+    /// message) does before any attestation of one of those coins can be
+    /// accepted. Returns the index it was given. `salt` keeps two listings in
+    /// one test distinct, since a bridged id is over the registration fields
+    /// and no longer over a `(chain, token)` pair.
+    fn list_backed_by(tokens: &mut TokenRegistry, salt: u8, pairs: &[(u16, [u8; 32])]) -> u32 {
         tokens
             .register(
-                asset_id(chain, &token),
-                "Tether USD".into(),
-                "zUSDT".into(),
+                crate::ledger::tokens::bridged_asset_id("Rand USD", "zUSD", &[salt; 32]),
+                "Rand USD".into(),
+                "zUSD".into(),
                 8,
-                MintAuthority::Bridge { chain, token },
+                MintAuthority::Bridge {
+                    backings: pairs
+                        .iter()
+                        .map(|&(chain, token)| crate::ledger::tokens::Backing { chain, token, locked: 0 })
+                        .collect(),
+                },
                 0,
             )
             .expect("a fresh listing")
     }
 
-    /// A registry with [`TOKEN`] listed at index 1, the shape most tests want.
+    /// One coin as its own token, the shape the tests that predate many-backings assume.
+    fn list(tokens: &mut TokenRegistry, chain: u16, token: [u8; 32]) -> u32 {
+        list_backed_by(tokens, chain as u8 ^ token[0], &[(chain, token)])
+    }
+
+    /// A registry with [`TOKEN`] listed at index 1, the shape most tests want, with enough
+    /// locked against its one backing that a burn in these tests is never the thing refused.
     fn tokens_with_the_test_token() -> TokenRegistry {
         let mut t = tokens();
         assert_eq!(list(&mut t, 2, TOKEN), 1);
+        t.lock(1, 2, &TOKEN, 1_000_000).expect("the fixture's locked backing");
         t
     }
 
@@ -877,11 +947,13 @@ mod tests {
         let (c, s) = cfg();
         let mut st = BridgeState::from_config(&c);
         let tk = tokens_with_the_test_token();
-        let asset = asset_id(2, &TOKEN);
+        // The token's own registry id, not the per-backing wire id: one token, many coins.
+        let asset = tk.get(1).unwrap().id;
         // The plan is available before anything is applied, and names the index the listing gave
-        // the token — the ledger needs it to compute the deposit note's commitment.
+        // the token, plus the coin the attestation deposits against — the ledger needs the first
+        // to compute the deposit note's commitment and the second to lock the right backing.
         let plan = st.check_attest(&tk, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap().plan().clone();
-        let want = BridgeTransfer { asset, index: 1, amount: 1_000, to_hash: to_hash(), relayer_fee: 10 };
+        let want = BridgeTransfer { asset, index: 1, chain: 2, token: TOKEN, amount: 1_000, to_hash: to_hash(), relayer_fee: 10 };
         assert_eq!(plan, AttestPlan::Transfer(want.clone()));
         let out = apply(&mut st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap();
         assert_eq!(out, AttestOutcome::Minted(want));
@@ -963,7 +1035,10 @@ mod tests {
     fn an_amount_above_u64_is_rejected() {
         let (c, s) = cfg();
         let st = BridgeState::from_config(&c);
-        let tk = tokens_with_the_test_token();
+        // Nothing locked yet, so the largest amount a note can hold is still lockable: with the
+        // fixture's million already against this coin it would be the backing that overflowed.
+        let mut tk = tokens();
+        assert_eq!(list(&mut tk, 2, TOKEN), 1);
         let over = u64::MAX as u128 + 1;
         assert_eq!(
             st.check_attest(&tk, &attest(&s, 0, transfer_body(2, over, 0, 1)), 1).unwrap_err(),
@@ -974,12 +1049,22 @@ mod tests {
         assert_eq!(
             plan,
             AttestPlan::Transfer(BridgeTransfer {
-                asset: asset_id(2, &TOKEN),
+                asset: tk.get(1).unwrap().id,
                 index: 1,
+                chain: 2,
+                token: TOKEN,
                 amount: u64::MAX,
                 to_hash: to_hash(),
                 relayer_fee: 7,
             })
+        );
+        // And once that coin is holding anything at all, the same transfer is refused before a
+        // single signature is recovered: `check_attest` decides what `lock` would refuse, so the
+        // ledger's apply step cannot be the thing that discovers it.
+        tk.lock(1, 2, &TOKEN, 1).unwrap();
+        assert_eq!(
+            st.check_attest(&tk, &attest(&s, 0, transfer_body(2, u64::MAX as u128, 7, 1)), 1).unwrap_err(),
+            BridgeError::Token(TokenError::SupplyOverflow)
         );
     }
 
@@ -995,13 +1080,13 @@ mod tests {
         let pk = crate::crypto::Keypair::from_seed([9; 32]).unwrap().public_key().clone();
         let native = crate::ledger::tokens::native_asset_id("Native", "NTV", 9, &MintAuthority::Key(pk.clone()), 0, &[7; 32]);
         assert_eq!(tk.register(native, "Native".into(), "NTV".into(), 9, MintAuthority::Key(pk), 0).unwrap(), 2);
-        assert_eq!(st.check_burn(&tk, 2, 1, 2, &EVM_TO, 0).unwrap_err(), BridgeError::UnknownAsset);
+        assert_eq!(st.check_burn(&tk, 2, 1, 2, &TOKEN, &EVM_TO, 0).unwrap_err(), BridgeError::UnknownAsset);
         assert_eq!(
-            st.apply_burn(&tk, Hash::ZERO, 2, 1, 2, EVM_TO, 0, 1, 1_700).unwrap_err(),
+            st.apply_burn(&tk, Hash::ZERO, 2, 1, 2, TOKEN, EVM_TO, 0, 1, 1_700).unwrap_err(),
             BridgeError::UnknownAsset
         );
         // The bridged one beside it is unaffected.
-        assert_eq!(st.check_burn(&tk, 1, 1, 2, &EVM_TO, 0), Ok(()));
+        assert_eq!(st.check_burn(&tk, 1, 1, 2, &TOKEN, &EVM_TO, 0), Ok(()));
         // And an attestation of the *unlisted* pair is still refused, listing or no listing.
         assert!(matches!(
             st.check_attest(&tk, &attest(&s, 0, token_body(3, OTHER_TOKEN, 10, 0, 1)), 1),
@@ -1016,7 +1101,7 @@ mod tests {
         let tk = tokens_with_the_test_token();
         apply(&mut st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 0, 1)), 1).unwrap();
         let tx = Hash::digest(b"burn-tx");
-        let rec = st.apply_burn(&tk, tx, 1, 400, 2, EVM_TO, 5, 12, 1_700).unwrap();
+        let rec = st.apply_burn(&tk, tx, 1, 400, 2, TOKEN, EVM_TO, 5, 12, 1_700).unwrap();
         assert_eq!(rec.sequence, 0);
         assert_eq!(st.burn_sequence, 1);
         assert_eq!(rec.tx, tx, "the transaction hash stands in for the absent sender");
@@ -1034,13 +1119,28 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(rec.digest, digest(&rec.body));
-        // There is no balance to run out of any more: the asset bundle's proof is what bounds
-        // a burn. What is left here is the registry and the destination.
-        assert_eq!(st.check_burn(&tk, 1, u64::MAX, 2, &EVM_TO, 0), Ok(()));
-        assert_eq!(st.check_burn(&tk, 1, 1, 3, &EVM_TO, 0).unwrap_err(), BridgeError::WrongTokenChain);
-        assert_eq!(st.check_burn(&tk, 2, 1, 2, &EVM_TO, 0).unwrap_err(), BridgeError::UnknownAsset);
-        assert_eq!(st.check_burn(&tk, 0, 1, 2, &EVM_TO, 0).unwrap_err(), BridgeError::UnknownAsset, "0 is RAND");
-        assert_eq!(st.check_burn(&tk, 1, 10, 2, &EVM_TO, 11).unwrap_err(), BridgeError::FeeExceedsAmount);
+        // The pool-side bound is the asset bundle's proof; what is left here is the registry,
+        // the coin and the destination. The coin is bounded by its *own* locked amount — this
+        // fixture locked a million against chain 2's TOKEN — not by the whole supply.
+        assert_eq!(
+            st.check_burn(&tk, 1, u64::MAX, 2, &TOKEN, &EVM_TO, 0).unwrap_err(),
+            BridgeError::Token(TokenError::InsufficientBacking { locked: 1_000_000, amount: u64::MAX })
+        );
+        assert_eq!(st.check_burn(&tk, 1, 1_000_000, 2, &TOKEN, &EVM_TO, 0), Ok(()), "exactly what is locked");
+        // A chain this token has no coin on is not a backing of it — the verdict that replaced
+        // `WrongTokenChain`, which could only ever mean one home chain.
+        assert_eq!(
+            st.check_burn(&tk, 1, 1, 3, &TOKEN, &EVM_TO, 0).unwrap_err(),
+            BridgeError::Token(TokenError::NotABacking { index: 1, chain: 3 })
+        );
+        // And the right chain with the wrong coin on it is the same refusal.
+        assert_eq!(
+            st.check_burn(&tk, 1, 1, 2, &OTHER_TOKEN, &EVM_TO, 0).unwrap_err(),
+            BridgeError::Token(TokenError::NotABacking { index: 1, chain: 2 })
+        );
+        assert_eq!(st.check_burn(&tk, 2, 1, 2, &TOKEN, &EVM_TO, 0).unwrap_err(), BridgeError::UnknownAsset);
+        assert_eq!(st.check_burn(&tk, 0, 1, 2, &TOKEN, &EVM_TO, 0).unwrap_err(), BridgeError::UnknownAsset, "0 is RAND");
+        assert_eq!(st.check_burn(&tk, 1, 10, 2, &TOKEN, &EVM_TO, 11).unwrap_err(), BridgeError::FeeExceedsAmount);
     }
 
     /// `meta` + the two row-wise collections must reassemble the exact same
@@ -1051,7 +1151,7 @@ mod tests {
         let mut st = BridgeState::from_config(&c);
         let tk = tokens_with_the_test_token();
         apply(&mut st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 7, 1)), 1).unwrap();
-        st.apply_burn(&tk, Hash::ZERO, 1, 400, 2, EVM_TO, 5, 12, 1_700).unwrap();
+        st.apply_burn(&tk, Hash::ZERO, 1, 400, 2, TOKEN, EVM_TO, 5, 12, 1_700).unwrap();
         apply(&mut st, &tk, &attest(&s, 0, upgrade_body(1, vec![[7u8; 20], [8u8; 20]])), 1).unwrap();
         assert!(!st.spent.is_empty() && !st.burns.is_empty());
         // The blob itself must survive bincode, which is how storage keeps it.
@@ -1115,7 +1215,7 @@ mod tests {
         apply(&mut st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 0, 1)), 1).unwrap();
         let minted_root = st.root();
         assert_ne!(minted_root, empty_root, "a consumed digest");
-        st.apply_burn(&tk, Hash::ZERO, 1, 400, 2, EVM_TO, 0, 12, 1_700).unwrap();
+        st.apply_burn(&tk, Hash::ZERO, 1, 400, 2, TOKEN, EVM_TO, 0, 12, 1_700).unwrap();
         let burned_root = st.root();
         assert_ne!(burned_root, minted_root, "the burn sequence moved");
         // burn records are derivable and deliberately excluded from the root
@@ -1143,7 +1243,7 @@ mod tests {
         let before = st.root();
         let tokens_before = tk.root();
         list(&mut tk, 3, OTHER_TOKEN);
-        tk.add_supply(1, 1_000).unwrap();
+        tk.lock(1, 2, &TOKEN, 1_000).unwrap();
         assert_eq!(st.root(), before, "the bridge root is blind to the registry");
         assert_ne!(tk.root(), tokens_before, "which is exactly what the tokens root is for");
     }
@@ -1229,9 +1329,9 @@ mod tests {
         let mut st = BridgeState::from_config(&c);
         let tk = tokens_with_the_test_token();
         apply(&mut st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 0, 1)), 1).unwrap();
-        assert_eq!(st.check_burn(&tk, 1, 0, 2, &EVM_TO, 0).unwrap_err(), BridgeError::ZeroAmount);
+        assert_eq!(st.check_burn(&tk, 1, 0, 2, &TOKEN, &EVM_TO, 0).unwrap_err(), BridgeError::ZeroAmount);
         assert_eq!(
-            st.apply_burn(&tk, Hash::ZERO, 1, 0, 2, EVM_TO, 0, 1, 1_700).unwrap_err(),
+            st.apply_burn(&tk, Hash::ZERO, 1, 0, 2, TOKEN, EVM_TO, 0, 1, 1_700).unwrap_err(),
             BridgeError::ZeroAmount
         );
         assert_eq!(st.burn_sequence, 0);
@@ -1303,23 +1403,26 @@ mod tests {
         // scoped to the EVM-family chains.
         let (evm, sol) = (1u32, list(&mut tk, 5, OTHER_TOKEN));
         assert_eq!(sol, 2);
+        // Both coins have to be holding something for a burn of them to get past the backing
+        // check at all — that is the registry's business, not this state's.
+        tk.lock(sol, 5, &OTHER_TOKEN, 1_000).unwrap();
         apply(&mut st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 0, 1)), 1).unwrap();
         apply(&mut st, &tk, &attest(&s, 0, token_body(5, OTHER_TOKEN, 1_000, 0, 1)), 1).unwrap();
 
         // Zero recipient: unspendable on every chain.
-        assert_eq!(st.check_burn(&tk, evm, 1, 2, &[0u8; 32], 0).unwrap_err(), BridgeError::BadRecipient);
-        assert_eq!(st.check_burn(&tk, sol, 1, 5, &[0u8; 32], 0).unwrap_err(), BridgeError::BadRecipient);
+        assert_eq!(st.check_burn(&tk, evm, 1, 2, &TOKEN, &[0u8; 32], 0).unwrap_err(), BridgeError::BadRecipient);
+        assert_eq!(st.check_burn(&tk, sol, 1, 5, &OTHER_TOKEN, &[0u8; 32], 0).unwrap_err(), BridgeError::BadRecipient);
         // Dirty upper 12 bytes on an EVM-family chain (2, 3, 4).
         let mut dirty = EVM_TO;
         dirty[11] = 1;
-        assert_eq!(st.check_burn(&tk, evm, 1, 2, &dirty, 0).unwrap_err(), BridgeError::BadRecipient);
+        assert_eq!(st.check_burn(&tk, evm, 1, 2, &TOKEN, &dirty, 0).unwrap_err(), BridgeError::BadRecipient);
         // A full 32-byte Solana pubkey is fine on chain 5.
-        assert!(st.check_burn(&tk, sol, 1, 5, &[0x22u8; 32], 0).is_ok());
+        assert!(st.check_burn(&tk, sol, 1, 5, &OTHER_TOKEN, &[0x22u8; 32], 0).is_ok());
         // ... and a left-padded address is fine on chain 2.
-        assert!(st.check_burn(&tk, evm, 1, 2, &EVM_TO, 0).is_ok());
+        assert!(st.check_burn(&tk, evm, 1, 2, &TOKEN, &EVM_TO, 0).is_ok());
         // `apply_burn` refuses it too and records nothing.
         assert_eq!(
-            st.apply_burn(&tk, Hash::ZERO, evm, 1, 2, dirty, 0, 1, 1_700).unwrap_err(),
+            st.apply_burn(&tk, Hash::ZERO, evm, 1, 2, TOKEN, dirty, 0, 1, 1_700).unwrap_err(),
             BridgeError::BadRecipient
         );
         assert_eq!(st.burn_sequence, 0);

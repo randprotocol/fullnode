@@ -154,7 +154,22 @@ pub enum Action {
     /// Phase S3: burn `amount` of asset `asset` to a destination chain. `asset_bundle` is the
     /// second bundle of the transaction — the one spending the asset notes; the transaction's
     /// own `bundle` pays the RAND fee.
-    BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee: u64, to_chain: u16, to: [u8; 32] },
+    ///
+    /// `token` is the source-chain token address being redeemed, and `(to_chain, token)` must be
+    /// one of `asset`'s backings (spec §12): one bridged token is backed by several coins on
+    /// several chains — zUSD by USDT and USDC on four of them — so a burn names *which* coin it
+    /// wants released, and the outbound message carries that pair. It is bounded by that
+    /// backing's own locked amount, not by the token's whole supply
+    /// (`TokenError::InsufficientBacking`).
+    BridgeBurn {
+        asset_bundle: Bundle,
+        asset: u32,
+        amount: u64,
+        relayer_fee: u64,
+        to_chain: u16,
+        token: [u8; 32],
+        to: [u8; 32],
+    },
     /// Block aggregation (spec §2.2): register the sender as an aggregator. Rides a bundle
     /// whose `burn` equals the genesis bond — the only aggregation action that carries one.
     RegisterAggregator { registration: AggregatorRegistration },
@@ -567,7 +582,7 @@ mod tests {
         let burn = Transaction::shielded(
             7,
             bundle(),
-            Action::BridgeBurn { asset_bundle, asset: 3, amount: 400, relayer_fee: 100, to_chain: 2, to: [1; 32] },
+            Action::BridgeBurn { asset_bundle, asset: 3, amount: 400, relayer_fee: 100, to_chain: 2, token: [7; 32], to: [1; 32] },
         );
         assert_eq!(burn.nullifiers(), vec![[2; 8], [3; 8], [6; 8], [7; 8]]);
         assert_eq!(burn.commitments(), vec![[4; 8], [5; 8], [8; 8], [9; 8]]);

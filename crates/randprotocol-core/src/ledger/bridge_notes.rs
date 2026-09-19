@@ -21,9 +21,7 @@
 
 use super::tokens::{TokenError, TokenRegistry};
 use super::{Ledger, TxError};
-use crate::bridge::{
-    asset_id, Attestation, AssetId, AttestOutcome, AttestPlan, BridgeError, CheckedAttestation, Payload,
-};
+use crate::bridge::{Attestation, AttestOutcome, AttestPlan, BridgeError, CheckedAttestation, Payload};
 use crate::confidential::ConfidentialExecutor;
 use crate::notes::{Envelope, ShieldedAddress, Word8};
 use crate::types::{Action, Transaction};
@@ -69,8 +67,8 @@ pub(super) fn validate(
             // an amount no note could hold, a token nobody listed — each of which is
             // `check_attest`'s refusal to make and reports a better error than a mismatched index
             // would.
-            if let Some((id, _)) = attested_transfer(attestation) {
-                if let Some(index) = tokens.get_by_id(&id).map(|info| info.index) {
+            if let Some((chain, token, _)) = attested_transfer(attestation) {
+                if let Some(index) = tokens.bridged(chain, &token).map(|info| info.index) {
                     if index != *asset {
                         return Err(TxError::AttestAssetMismatch { expected: index, actual: *asset });
                     }
@@ -91,13 +89,14 @@ pub(super) fn validate(
                 if t.index != *asset {
                     return Err(TxError::AttestAssetMismatch { expected: t.index, actual: *asset });
                 }
-                // The token's supply takes the gross amount at `apply`, so the one thing that
-                // could make that step fail is decided here instead: `apply` writes a deposit
-                // note before it credits the supply, and an overflow there would be a half-applied
-                // transaction. Checked, not saturating — a bridged supply that stopped counting
-                // would stop matching what the source chain has locked.
-                let supply = tokens.get(t.index).ok_or(TokenError::UnknownToken(t.index))?.total_supply;
-                supply.checked_add(t.amount).ok_or(TokenError::SupplyOverflow)?;
+                // No supply check here any more: the backing's `locked` and the token's supply
+                // both take the gross amount at `apply`, and everything that could refuse that
+                // move was decided inside `check_attest` (`TokenRegistry::check_lock`, run
+                // before the guardian quorum). `apply` writes a deposit note before it locks, so
+                // a refusal there would be a half-applied transaction — and the check is a
+                // checked add, not a saturating one, because a bridged supply that stopped
+                // counting would stop matching what the source chains have locked.
+
                 // The wire format has 32 bytes for a recipient and a shielded address is
                 // ~1.2 KB, so the depositor named a hash and this transaction carries the
                 // address. Without this equality the submitter would choose who receives it.
@@ -117,7 +116,7 @@ pub(super) fn validate(
             }
             Ok(Some(checked))
         }
-        Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to } => {
+        Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, token, to } => {
             let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
             let tokens = ledger.tokens().ok_or(TxError::Token(TokenError::Disabled))?;
             // Cheap before expensive (spec §7), and across *both* bundles: everything here is
@@ -151,14 +150,18 @@ pub(super) fn validate(
                 }
             }
             ledger.check_bundle(asset_bundle)?;
-            bridge.check_burn(tokens, *asset, *amount, *to_chain, to, *relayer_fee).map_err(TxError::Bridge)?;
-            // The debit `apply` makes, decided here for the same reason the deposit's credit is:
-            // apply writes the asset bundle's notes before it touches the supply. A burn of more
-            // than the token's whole supply is a chain that would owe the source contract more
-            // than it ever locked, so it is refused rather than clamped. Still a comparison, and
-            // still before the asset bundle's proof.
-            let supply = tokens.get(*asset).ok_or(TokenError::UnknownToken(*asset))?.total_supply;
-            supply.checked_sub(*amount).ok_or(TokenError::SupplyUnderflow)?;
+            // The release `apply` makes, decided here for the same reason the deposit's lock is:
+            // apply writes the asset bundle's notes before it touches the registry.
+            // `check_burn` ends in `TokenRegistry::check_release`, which is exactly what the
+            // apply step's `release` would refuse — the named pair being a backing of this token
+            // at all, and that backing holding at least `amount`. A burn of more of one coin
+            // than its own source contract is holding would ask that contract to release value it
+            // never took in, so it is refused rather than clamped, even when the token's whole
+            // supply (every other coin's `locked` included) would cover it. Still a comparison,
+            // and still before the asset bundle's proof.
+            bridge
+                .check_burn(tokens, *asset, *amount, *to_chain, token, to, *relayer_fee)
+                .map_err(TxError::Bridge)?;
             ledger.check_bundle_proof(asset_bundle, executor)?;
             Ok(None)
         }
@@ -192,21 +195,24 @@ pub(super) fn apply(
                 AttestOutcome::Minted(t) => {
                     let cm = deposit_commitment(recipient, t.amount, t.index, *time, r, executor);
                     ledger.deposit(cm, executor)?;
-                    // The deposited note is new supply of that token: the gross amount the
-                    // guardians signed, which is what the note carries (the relayer fee is a
-                    // portion of it and is paid on the far side). `validate` ruled out the
-                    // overflow, so this cannot fail on a transaction that was admitted.
+                    // The deposited note is new supply of that token, and the coin the
+                    // attestation named is what now backs it: `lock` moves the backing's
+                    // `locked` and the token's `total_supply` together, which is what keeps
+                    // `total_supply == Σ locked` true (spec §12). The gross amount the guardians
+                    // signed is what the note carries — the relayer fee is a portion of it and is
+                    // paid on the far side. `check_attest` ruled out every refusal `lock` has, so
+                    // this cannot fail on a transaction that was admitted.
                     ledger
                         .tokens_mut()
                         .ok_or(TxError::Token(TokenError::Disabled))?
-                        .add_supply(t.index, t.amount)?;
+                        .lock(t.index, t.chain, &t.token, t.amount)?;
                 }
                 // Governance only: a rotation moves guardian keys and no value.
                 AttestOutcome::GuardianSetUpgraded(_) => {}
             }
             Ok(())
         }
-        Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to } => {
+        Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, token, to } => {
             // The fee bundle's notes were written by `apply_tx`'s common path; the asset
             // bundle's are written here, through that same path, so a burn spends four
             // nullifiers and appends four commitments in total. The asset bundle's fee is zero,
@@ -220,15 +226,17 @@ pub(super) fn apply(
             // The record's sender slot is the transaction hash: a burn is funded by notes, so
             // there is no sender identity to write there.
             bridge
-                .apply_burn(tokens, tx_hash, *asset, *amount, *to_chain, *to, *relayer_fee, height, timestamp)
+                .apply_burn(tokens, tx_hash, *asset, *amount, *to_chain, *token, *to, *relayer_fee, height, timestamp)
                 .map_err(TxError::Bridge)?;
-            // What the asset bundle destroyed leaves the token's supply, so a bridged token's
-            // `total_supply` stays equal to what the source chain holds locked. `validate` ruled
-            // out the underflow, so this cannot fail on a transaction that was admitted.
+            // What the asset bundle destroyed leaves the named backing and the token's supply
+            // together, so each source contract's locked amount stays equal to what this chain
+            // says it is holding — and their sum stays the token's supply (spec §12).
+            // `validate` ruled out every refusal `release` has, so this cannot fail on a
+            // transaction that was admitted.
             ledger
                 .tokens_mut()
                 .ok_or(TxError::Token(TokenError::Disabled))?
-                .sub_supply(*asset, *amount)?;
+                .release(*asset, *to_chain, token, *amount)?;
             Ok(())
         }
         _ => Err(TxError::UnsupportedAction("bridge")),
@@ -262,34 +270,31 @@ pub fn deposit_commitment(
     executor.note_commitment(&recipient.pk, &DEPOSIT_FROM, amount, asset, time, r)
 }
 
-/// What an attestation's payload would deposit, from the wire bytes alone: the asset it names
-/// and the amount, with no reference to any state and no signature work.
+/// What an attestation's payload would deposit, from the wire bytes alone: the source
+/// `(chain, token)` pair it names and the amount, with no reference to any state and no
+/// signature work.
+///
+/// The pair rather than a hash of it: since one bridged token has many backings (spec §12) the
+/// registry is keyed on the pair itself ([`TokenRegistry::bridged`]), and the pair is also what
+/// [`crate::bridge::BridgeError::UnlistedToken`] has to report.
 ///
 /// `None` for a guardian-set rotation, which moves no value, for bytes that do not decode, and
 /// for an amount no note could hold — all of which [`validate`] refuses before a transaction is
 /// admitted, so on a *committed* transaction this only ever answers `Some`.
-pub fn attested_transfer(attestation: &[u8]) -> Option<(AssetId, u64)> {
+pub fn attested_transfer(attestation: &[u8]) -> Option<(u16, [u8; 32], u64)> {
     let att = Attestation::decode(attestation).ok()?;
     let Payload::Transfer(t) = Payload::decode(&att.body.payload).ok()? else {
         return None;
     };
     let amount = u64::try_from(t.amount_u128()?).ok()?;
-    Some((asset_id(t.token_chain, &t.token_address), amount))
+    Some((t.token_chain, t.token_address, amount))
 }
 
-/// The `(chain, token)` pair an attestation's transfer names, from the wire bytes alone — the
-/// key the token registry lists a bridged token under, and the two fields
-/// [`crate::bridge::BridgeError::UnlistedToken`] reports.
-///
-/// [`attested_transfer`] answers the same question hashed into an [`AssetId`], which is what a
-/// registry lookup wants; this is for the caller that has to *name* the pair, such as the
-/// mempool reporting why a pooled attestation deposits nothing. `None` in exactly the same cases.
+/// The `(chain, token)` pair an attestation's transfer names, for a caller that wants the coin
+/// and not the amount. One decode, [`attested_transfer`]'s — the two used to duplicate it.
+/// `None` in exactly the same cases.
 pub fn attested_token(attestation: &[u8]) -> Option<(u16, [u8; 32])> {
-    let att = Attestation::decode(attestation).ok()?;
-    let Payload::Transfer(t) = Payload::decode(&att.body.payload).ok()? else {
-        return None;
-    };
-    Some((t.token_chain, t.token_address))
+    attested_transfer(attestation).map(|(chain, token, _)| (chain, token))
 }
 
 /// The deposit note a `BridgeAttest` appended — the commitment and the envelope sealed against
@@ -318,8 +323,8 @@ pub fn deposit_note(
     let Action::BridgeAttest { attestation, recipient, r, time, asset: _, envelope } = &tx.action else {
         return None;
     };
-    let (asset, amount) = attested_transfer(attestation)?;
-    let index = tokens.get_by_id(&asset)?.index;
+    let (chain, token, amount) = attested_transfer(attestation)?;
+    let index = tokens.bridged(chain, &token)?.index;
     Some((deposit_commitment(recipient, amount, index, *time, r, executor), envelope.clone()))
 }
 
@@ -383,11 +388,13 @@ mod tests {
         for (i, token) in [TOKEN, OTHER_TOKEN].into_iter().enumerate() {
             let index = t
                 .register(
-                    asset_id(2, &token),
+                    crate::ledger::tokens::bridged_asset_id("Tether USD", "zUSDT", &token),
                     "Tether USD".into(),
                     "zUSDT".into(),
                     8,
-                    crate::ledger::tokens::MintAuthority::Bridge { chain: 2, token },
+                    crate::ledger::tokens::MintAuthority::Bridge {
+                        backings: vec![crate::ledger::tokens::Backing { chain: 2, token, locked: 0 }],
+                    },
                     0,
                 )
                 .expect("a fresh listing");
@@ -498,7 +505,7 @@ mod tests {
     /// is refused).
     fn expected_index(l: &Ledger, attestation: &[u8]) -> u32 {
         attested_transfer(attestation)
-            .and_then(|(asset, _)| l.tokens().and_then(|t| t.get_by_id(&asset)).map(|info| info.index))
+            .and_then(|(chain, token, _)| l.tokens().and_then(|t| t.bridged(chain, &token)).map(|info| info.index))
             .unwrap_or(0)
     }
 
@@ -802,7 +809,9 @@ mod tests {
                 "Late Coin".into(),
                 "zLATE".into(),
                 8,
-                crate::ledger::tokens::MintAuthority::Bridge { chain: 2, token: UNLISTED_TOKEN },
+                crate::ledger::tokens::MintAuthority::Bridge {
+                    backings: vec![crate::ledger::tokens::Backing { chain: 2, token: UNLISTED_TOKEN, locked: 0 }],
+                },
                 1,
             )
             .unwrap();
@@ -834,6 +843,31 @@ mod tests {
     /// The fee a valid burn's outer bundle pays: the bundle base for each of its two bundles.
     const BURN_FEE: u64 = gas::BRIDGE_BURN_FEE;
 
+    /// [`burn_tx`] with the redeemed coin and the destination chosen, for the many-backings
+    /// tests. `seed` picks the two bundles' four words apiece, so two burns in one test never
+    /// collide on a nullifier or a commitment.
+    #[allow(clippy::too_many_arguments)]
+    fn burn_tx_to(
+        l: &Ledger,
+        asset: u32,
+        amount: u64,
+        relayer_fee: u64,
+        to_chain: u16,
+        token: [u8; 32],
+        to: [u8; 32],
+        seed: u32,
+        mutate: impl FnOnce(&mut Bundle),
+    ) -> Transaction {
+        let s = |n: u32| [seed + n; 8];
+        let mut asset_bundle = bundle(l, [s(0), s(1)], [s(2), s(3)], 0, asset, amount);
+        mutate(&mut asset_bundle);
+        Transaction::shielded(
+            7,
+            fee_bundle(l, [s(4), s(5)], [s(6), s(7)], BURN_FEE),
+            Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, token, to },
+        )
+    }
+
     /// [`burn_tx`] with the outer bundle's fee chosen, for the fee-floor test.
     fn burn_tx_paying(
         l: &Ledger,
@@ -850,7 +884,7 @@ mod tests {
         Transaction::shielded(
             7,
             fee_bundle(l, [[44; 8], [45; 8]], [[46; 8], [47; 8]], fee),
-            Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain: 2, to: EVM_TO },
+            Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain: 2, token: TOKEN, to: EVM_TO },
         )
     }
 
@@ -979,17 +1013,20 @@ mod tests {
         assert_eq!(sent.fee_u128(), Some(100), "and the relayer is paid out of it, not on top of it");
     }
 
-    /// A burn cannot destroy more of a token than the bridge ever deposited: the registry's
-    /// `total_supply` is what this chain says the source contract has locked, and a burn past it
-    /// would ask the far side to release value it never took in. Refused in `validate` — so
+    /// A burn cannot destroy more of a *coin* than the bridge ever deposited of it: a backing's
+    /// `locked` is what this chain says that one source contract is holding, and a burn past it
+    /// would ask that contract to release value it never took in. Refused in `validate` — so
     /// `apply` never half-applies one — and refused for a token that is registered but not
-    /// bridged, which has no home chain to release on at all.
+    /// bridged, which has no source chain to release on at all.
     #[test]
-    fn a_burn_cannot_outrun_the_tokens_supply_or_name_a_token_that_is_not_bridged() {
+    fn a_burn_cannot_outrun_the_backing_or_name_a_token_that_is_not_bridged() {
         let (mut l, secrets) = ledger();
         deposit(&mut l, &secrets, 1_000, 0, 20);
         let over = burn_tx(&l, 1, 1_001, 0, |_| {});
-        assert_eq!(l.validate(&over, &StubExecutor), Err(TxError::Token(TokenError::SupplyUnderflow)));
+        assert_eq!(
+            l.validate(&over, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Token(TokenError::InsufficientBacking { locked: 1_000, amount: 1_001 })))
+        );
 
         // A `Key`-authority token — a native RPL token, no bridge behind it — is no asset of this
         // bridge's: `check_burn` resolves the outbound message's `(chain, token)` from a
@@ -1005,11 +1042,124 @@ mod tests {
         let t = burn_tx(&l, index, 400, 0, |_| {});
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::Bridge(BridgeError::UnknownAsset)));
 
-        // Exactly the bridged token's supply is fine, and leaves it at zero.
+        // Exactly what the coin has locked is fine, and leaves both it and the supply at zero.
         let all = burn_tx(&l, 1, 1_000, 0, |_| {});
         assert_eq!(l.validate(&all, &StubExecutor), Ok(()));
         l.apply_tx(&all, &proposer().address(), &StubExecutor).unwrap();
         assert_eq!(l.tokens().unwrap().get(1).unwrap().total_supply, 0);
+    }
+
+    /// The amendment's whole shape, through the ledger (spec §12): one token — zUSD — backed by
+    /// two coins on two chains. A deposit of either mints the *same* index and raises the same
+    /// supply; each coin's own `locked` records which source contract is holding what; a burn
+    /// names the coin it redeems and the outbound message carries that coin's chain and address.
+    #[test]
+    fn one_token_two_coins_mint_one_index_and_a_burn_names_the_coin_it_redeems() {
+        /// USDT on chain 2 and USDC on chain 5, the two coins behind this test's zUSD.
+        const USDT: [u8; 32] = [0xd7; 32];
+        const USDC: [u8; 32] = [0xdc; 32];
+        /// A 32-byte Solana recipient: chain 5 takes a whole pubkey, not a padded EVM address.
+        const SOL_TO: [u8; 32] = [0x77; 32];
+
+        let (mut l, secrets) = ledger();
+        // One listing, two backings — what chain 14's genesis does with seven.
+        let mut registry = TokenRegistry::new(1_000_000_000);
+        let zusd = registry
+            .register(
+                crate::ledger::tokens::bridged_asset_id("Rand USD", "zUSD", &[0x5a; 32]),
+                "Rand USD".into(),
+                "zUSD".into(),
+                8,
+                crate::ledger::tokens::MintAuthority::Bridge {
+                    backings: vec![
+                        crate::ledger::tokens::Backing { chain: 2, token: USDT, locked: 0 },
+                        crate::ledger::tokens::Backing { chain: 5, token: USDC, locked: 0 },
+                    ],
+                },
+                0,
+            )
+            .unwrap();
+        l.set_tokens(Some(registry));
+
+        // An inbound transfer of `token` from `chain`, signed by that chain's registered emitter.
+        let inbound = |chain: u16, token: [u8; 32], amount: u128, sequence: u64| Body {
+            timestamp: 1,
+            nonce: 0,
+            emitter_chain: chain,
+            emitter_address: [chain as u8; 32],
+            sequence,
+            consistency_level: 0,
+            payload: Payload::Transfer(Transfer {
+                amount: Transfer::u256_from_u128(amount),
+                token_address: token,
+                token_chain: chain,
+                to: recipient().recipient_hash(),
+                to_chain: CHAIN_RAND,
+                fee: Transfer::u256_from_u128(0),
+            })
+            .encode(),
+        };
+        // USDT on chain 2, then USDC on chain 5: both deposit under zUSD's one index.
+        for (i, (chain, token, amount)) in [(2u16, USDT, 1_000u128), (5, USDC, 400)].into_iter().enumerate() {
+            let tx = attest_tx(&l, attest(&secrets, inbound(chain, token, amount, i as u64)), recipient(), 20 + 10 * i as u32);
+            let Action::BridgeAttest { asset, .. } = &tx.action else { panic!("an attest") };
+            assert_eq!(*asset, zusd, "either coin deposits under the one token's index");
+            l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
+            assert!(l.has_commitment(&expected_cm(1, amount as u64, zusd)));
+        }
+        let t = l.tokens().unwrap();
+        assert_eq!(t.get(zusd).unwrap().total_supply, 1_400, "one token, both coins' worth");
+        assert_eq!(t.backing(zusd, 2, &USDT).unwrap().locked, 1_000);
+        assert_eq!(t.backing(zusd, 5, &USDC).unwrap().locked, 400);
+        assert!(t.backing_invariant_holds());
+
+        // A burn of more USDC than chain 5 is holding, though 1 400 of zUSD exists.
+        let over = burn_tx_to(&l, zusd, 700, 0, 5, USDC, SOL_TO, 50, |_| {});
+        assert_eq!(
+            l.validate(&over, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Token(TokenError::InsufficientBacking { locked: 400, amount: 700 })))
+        );
+        // A coin that backs nothing on this chain, and the right chain with the wrong coin.
+        let nothing = burn_tx_to(&l, zusd, 100, 0, 3, USDT, EVM_TO, 60, |_| {});
+        assert_eq!(
+            l.validate(&nothing, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Token(TokenError::NotABacking { index: 1, chain: 3 })))
+        );
+        let swapped = burn_tx_to(&l, zusd, 100, 0, 2, USDC, EVM_TO, 70, |_| {});
+        assert_eq!(
+            l.validate(&swapped, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Token(TokenError::NotABacking { index: 1, chain: 2 })))
+        );
+
+        // The same amount against the coin that does hold it is admitted, and the outbound
+        // message names *that* coin — not the token's first backing, and not the other chain's.
+        let ok = burn_tx_to(&l, zusd, 700, 0, 2, USDT, EVM_TO, 80, |_| {});
+        assert_eq!(l.validate(&ok, &StubExecutor), Ok(()));
+        l.apply_tx(&ok, &proposer().address(), &StubExecutor).unwrap();
+        let body = Body::decode(&l.bridge().unwrap().burns[&0].body).expect("the record's body decodes");
+        let Ok(Payload::Transfer(sent)) = Payload::decode(&body.payload) else { panic!("a transfer") };
+        assert_eq!((sent.token_chain, sent.token_address, sent.to_chain), (2, USDT, 2));
+        let t = l.tokens().unwrap();
+        assert_eq!(t.backing(zusd, 2, &USDT).unwrap().locked, 300, "only the coin that was redeemed moved");
+        assert_eq!(t.backing(zusd, 5, &USDC).unwrap().locked, 400);
+        assert_eq!(t.get(zusd).unwrap().total_supply, 700);
+        assert!(t.backing_invariant_holds());
+
+        // Two burns into one coin that each fit alone but not together: block application
+        // re-validates every transaction against the ledger the ones before it left, so the
+        // second is refused rather than draining a backing past what its contract holds.
+        let first = burn_tx_to(&l, zusd, 200, 0, 2, USDT, EVM_TO, 90, |_| {});
+        let second = burn_tx_to(&l, zusd, 200, 0, 2, USDT, EVM_TO, 100, |_| {});
+        assert_eq!(l.validate(&first, &StubExecutor), Ok(()), "each fits against the tip");
+        assert_eq!(l.validate(&second, &StubExecutor), Ok(()));
+        let mut block = l.clone();
+        block.apply_tx(&first, &proposer().address(), &StubExecutor).unwrap();
+        assert_eq!(block.tokens().unwrap().backing(zusd, 2, &USDT).unwrap().locked, 100);
+        assert_eq!(
+            block.apply_tx(&second, &proposer().address(), &StubExecutor).map(|_| ()),
+            Err(TxError::Bridge(BridgeError::Token(TokenError::InsufficientBacking { locked: 100, amount: 200 }))),
+            "300 - 200 - 200 would be -100, so the second is refused where it sits"
+        );
     }
 
     /// Both actions are inadmissible on a chain whose genesis has no `bridge` section, and
