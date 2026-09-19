@@ -6,7 +6,7 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-20)
 
-### v0.5 — RPL, zUSD and bridge hardening — BUILT AND REVIEWED (2026-09-20), integration branch `feat/bridge-hardening` at `da3a8af`
+### v0.5 — RPL, zUSD and bridge hardening — BUILT AND REVIEWED (2026-09-20), integration branch `feat/bridge-hardening`, linear on `origin/main` at `cba5fef`
 
 **Take-over document: `docs/superpowers/handoffs/2026-09-19-zusd-v0.5.md`** (its §§4–5 now current) —
 the goal, every user decision, the invariant, task state, the remaining path, the fixed chain-14
@@ -18,11 +18,13 @@ bridge repo); plans `docs/superpowers/plans/2026-09-19-rpl-token-standard.md`; l
 (git-ignored) in `.superpowers/sdd/2026-09-19-rpl-token-standard/progress.md` in the `feat/rpl`
 worktree (`/tmp/fullnode-rpl`) — the full task-by-task history (H1–H5 the hidden-asset guest, B1–B4
 the bridge hardening, R1 the token RPC + `rpl1…`, T8b the `rand token` CLI, S1 the randscan side in
-`../randscan`). **Everything through T8b is DONE, reviewed clean, on `feat/bridge-hardening` at
-`da3a8af`** — not yet merged to `main`, not yet chain-cut. Docs (this pass) and the E2E gate
-(`task-E2E-brief.md`: a real multi-node cluster, real proofs, test guardians, the full
-faucet→register→deposit→transfer→burn→audit path) are the two tasks left before the final
-whole-branch review, the rebase onto `origin/main` and the chain-14 cut (handoff §5, steps 5–10).
+`../randscan`). **Everything through T8b is DONE, reviewed clean** (see git log for the branch's
+current tip — it moves; do not pin a sha here). **The local 9-phase E2E gate
+(`crates/randprotocol-node/tests/zusd_e2e.rs`: a real four-validator cluster, real proofs, test
+guardians, the full faucet→register→deposit→transfer→burn→audit path) has passed 9/9 twice** — once
+after `e2205f7`'s persistence fix and again after F1's deposit-blinding fix, 1671 s each run. Docs
+(this pass) is what is left before the final whole-branch review, the rebase onto `origin/main` and
+the chain-14 cut (handoff §5, steps 5–10).
 
 - **Goal**: zUSD mint/transfer/burn backed by USDT + USDC bridged from Tron, Solana, BNB Chain and
   Ethereum, and bridging back; custody on the four chains always >= zUSD supply, checked before every
@@ -65,15 +67,38 @@ whole-branch review, the rebase onto `origin/main` and the chain-14 cut (handoff
   - **Number-vs-string amount encoding was inconsistent across the node.** `rand_getBridgeState`'s
     `assets` rows and the token RPC's rows disagreed on whether a `u64` amount is a JSON number or a
     decimal string — masked in randscan by hand-written, already-quoted mock fixtures (S1's review
-    found it: a live chain's numeric amounts silently failed to render). Decimal strings are the
-    rule going forward for any amount that can exceed 2^53; every consumer (wallet, `rand-bridge-audit`,
-    randscan) now tolerates both, but a new field should be a string from the start.
+    found it: a live chain's numeric amounts silently failed to render). **The rule, settled**: every
+    RPL/bridge-hardening (chain 14) amount field is a decimal string, no exception, because a
+    9-decimal token passes 2^53 at a few tens of millions of units — `docs/rpc.md`'s conventions
+    section states it once. This is *not* "every consumer already tolerates both": the wallet and
+    other RAND-side readers of these specific fields had to be fixed alongside the node in the same
+    change, or they silently misread a number as a string or vice versa. The older, pre-chain-14
+    exception (a bundle's `fee`, `burn_a`/`burn_r`, a mint's or a staking action's `amount` inside a
+    decoded transaction) is left as a JSON integer on purpose — already shipped that way — and is
+    not a precedent for anything new.
   - **The `.pending` key file.** `rand token create --authority-key-out FILE` writes the fresh
     authority key to `FILE.pending` immediately before the one call that can lose an index race
     (`IndexMismatch`), not before — promoted to `FILE` only once the chain accepts the registration,
-    discarded only on an explicit chain refusal, and left at `.pending` on a transport failure of
-    unknown outcome (never guessed at). Any command that must write a secret before an outcome it
-    cannot yet know should follow this shape, not write the final file first.
+    and otherwise **kept at `.pending` unless the send itself was refused**: only a synchronous
+    `rand_sendTransaction` refusal (nothing was ever admitted) discards it, and any later-stage
+    failure — waiting for the commit, the post-commit scan — leaves `.pending` in place, because by
+    then the registration may already be live on chain under that key. Any command that must write a
+    secret before an outcome it cannot yet know should follow this shape, not write the final file
+    first, and should discard only on the one verdict that proves nothing was submitted.
+  - **Bridge and token registry state must be persisted on every commit, not only on a block that
+    carries a bridge/token action** (`e2205f7`). Keying a state write on which actions a block
+    happens to carry is the restart-fork class: a node that restarts between such blocks loses
+    `BridgeMeta` or the token registry's in-flight counters and either forks at the next state root
+    or serves stale RPC nonces to a client that then builds a transaction the chain refuses.
+    `Storage::commit` now writes the whole `META_BRIDGE_STATE` and `META_TOKENS` blobs, fsynced,
+    every commit of a chain that has them — not conditionally.
+  - **The validator register is written by difference, not whole, on every commit** — and an
+    undecodable stored row fails the commit outright rather than being skipped, so a register-format
+    change needs a real migration, not a silent partial write.
+  - **A `BridgeAttest`'s deposit blinding `r` is derived, not submitter-chosen** (F1):
+    `blake3("rand-deposit-r-1" ‖ mu)` over the guardians' own signed digest, enforced by
+    `BridgeError::WrongDepositBlinding`, a permanent refusal. `docs/rpc.md`'s changelog and wire
+    section carry the detail.
   - **The index front-run, and list-after-register.** `ListBacking` signs a `token_index`, and
     registering a *native* token is permissionless, so a `ListBacking` pre-signed against a
     predicted index could be invalidated by an unrelated registration taking that index first (a
@@ -85,9 +110,14 @@ whole-branch review, the rebase onto `origin/main` and the chain-14 cut (handoff
     by it.
   - **Aggregation stays gated off until re-measured.** Block aggregation's admitted shape assumed
     today's bundle declares `public 2` (the empty segment); the transaction-bound bundle declares
-    `public 4`, so no bundle proved on this branch matches the old admitted shape. Chain 14 is cut
-    without an `aggregation` section; re-measure the shape (and consider checking a covered bundle's
-    `PUB0..7` against its transaction's binding) before any future chain activates it.
+    `public 4`, so no bundle proved on this branch matches the old admitted shape. `node::
+    check_build_runs_genesis` now refuses to start any genesis carrying an `aggregation` section at
+    all, so chain 14 is cut without one; re-measure the shape (and consider checking a covered
+    bundle's `PUB0..7` against its transaction's binding) before any future chain activates it. Two
+    integration tests whose subject is aggregation itself — `tests/submit.rs`'s gossiped-aggregate
+    test and `tests/cluster.rs`'s sync-with-aggregation capstone — are `#[ignore]`d against this
+    startup refusal, with a shared reason string pointing back at it; un-ignore both together with
+    the re-measurement work, not separately.
   - **Fleet-wide key rotation is a chain-14 precondition, not a nice-to-have.** This repository is
     public and tracks chain 13's six validator seeds and 18 payout spend keys — see the security
     review entry below and the handoff's §5 step 7.
