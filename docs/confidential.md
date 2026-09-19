@@ -700,6 +700,48 @@ Writing, building and deploying a guest step by step (Rust, C, or a hand-built i
 [`guests.md`](guests.md). Deploying translated Solana and Ethereum programs is in
 [`translators.md`](translators.md).
 
+## The hidden-asset bundle guest: soundness (v0.5, not yet on chain)
+
+`guests::bundle_hidden()` (spec `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`)
+is the four-slot shielded transfer whose asset `A` is private. It enforces each check of spec §3.3
+in one of two ways. **Structural** means the guest supplies the value itself, so a prover cannot
+choose it. **Taint** means the check ORs a 0/1 failure bit into `BAD` (x9). `BAD` is the last word
+of the published digest, and the ledger recomputes the digest with `bad = 0`, so a tainted proof
+still verifies but matches no plaintext. Three suites back each row:
+
+- the emulator tests in `crates/randprotocol-zkvm/tests/hidden_bundle.rs` (H1);
+- the real Production proofs in `tests/hidden_cheating.rs` (`real_proof_*`, H2): each cheat
+  proves and verifies, and its digest is not the one the ledger recomputes;
+- the mutation fuzz in the same file (`mutation_fuzz_*`). It runs 25 000 seeded mutated witnesses
+  against an independent host model of §3.3 and requires the guest to publish exactly the model's
+  digest: honest if the model finds the witness valid, `bad = 1` otherwise.
+
+The fuzz was checked for teeth. Each taint and the dummy skip were weakened one at a time in a
+throwaway copy of the guest, and the fuzz failed on every one of the ten weakened copies within a
+few seconds.
+
+| §3.3 check | Enforced by (`guests.rs`, `bundle_hidden`) | Emulator test (`hidden_bundle.rs`) | Real proof (`hidden_cheating.rs`) | Fuzz (model label; weakened copy caught) |
+|---|---|---|---|---|
+| `nk`, `pk_self` from `sk`; every input owned by `pk_self` | structural: `emit_derive_keys`; `emit_stage_note(.., PK, ..)` for every input (there is no owner word in the input) | `a_note_owned_by_another_key_taints` | covered by the membership rows (a foreign note stages to a leaf not in the tree) | mutations of `sk` and note words (reported as membership failures) |
+| Non-dummy input: its Merkle root equals `anchor` | taint: the fused `MERKLE_VERIFY` loop (`li PTR, in_slot(k)+S_PATH`, stride 8, `DEPTH` levels), then `emit_eq8(ANCHOR, ROOT_TMP)` → `xori` → `emit_or_into` | `a_real_input_under_another_root_taints` | `real_proof_a_path_that_proves_a_different_leaf`, `real_proof_a_path_to_a_root_other_than_the_anchor` | `membership: root != anchor`; the anchor taint removed: caught |
+| Fused-loop sibling index cannot be redirected | structural: `PTR`/`CTR` are program constants plus a fixed stride, pinned by `hc`; the prover chooses only the path words | the tampered-sibling and tampered-index cases in `a_real_input_under_another_root_taints` | the two Merkle proofs above | every path word of every slot is mutated (a dummy's path words are unread and stay valid) |
+| Non-dummy input's asset equals its slot's (`A` / 0) | taint: `xor` + `sltu` of `slot(S_ASSET)` against `ASSET_A` or the guest-zeroed `ZERO` → `emit_or_into` | `an_input_of_the_wrong_asset_taints` | `real_proof_an_a_slot_input_of_another_asset` | `input asset != slot asset`; the asset taint removed: caught |
+| A dummy carries no value | structural: the skip branch tests `or(T1, T2)` of the same registers stored to `IN_AMT`, and nothing reloads them | `a_dummy_cannot_carry_value` | `real_proof_a_dummy_carrying_value_in_its_high_word`, `…_in_its_low_word` | amount-word mutations of dummies; a skip that reads only the low word: caught |
+| `nf_k = H_NF(nk, cm_in_k)` for all four inputs | structural: `emit_nullify` for every slot, dummies included | `every_honest_shape_publishes_the_host_digest` | `real_proof_honest_control_publishes_the_ledgers_digest` | every run compares all four nullifiers with the model's |
+| Outputs: `from = pk_self`, the slot's asset, the bundle's time | structural: `emit_stage_note(.., PK, .., slot_asset(k), hdr(TIME), ..)`; the input has no field for these | `an_outputs_asset_is_its_slots` | the control (the published commitments are the model's) | mutations of `A` and `time` move every commitment exactly as the model does |
+| The 6 nullifier pairs differ | taint: `emit_eq8` over `NF` pairs → `emit_or_into` | `every_duplicated_nullifier_pair_taints` | — (emulator only; the proof of a tainted run is shown by the other taint rows) | `duplicate nullifier` (a whole input slot copied); the NF loop removed: caught |
+| The 6 output-commitment pairs differ | taint: `emit_eq8` over `CM_OUT` pairs → `emit_or_into` | `every_duplicated_output_pair_taints` | — | `duplicate output commitment` (an output copied); the CM loop removed: caught |
+| `< 2^63` on 8 amounts, `fee`, `burn_a`, `burn_r` | taint: `emit_range_check_u63` on each high word → `emit_or_into` | `each_of_the_eleven_range_checks_taints` | `real_proof_an_r_output_at_2_63_with_only_the_range_check_to_stop_it` | `amount >= 2^63`; the range taint removed: caught |
+| Each sum is carry-checked | taint: `emit_add64_carry` → `emit_or_into` per addition | `a_wrapping_sum_taints_in_either_group` | `real_proof_an_r_sum_that_wraps_with_only_the_carry_check_to_stop_it` | `asset-A sum passes 2^64` / `RAND sum passes 2^64`; the carry taint removed: caught |
+| `in0+in1 = out0+out1+burn_a`, `in2+in3 = out2+out3+fee+burn_r` | taint: `sub`/`or`/`sltu` on the two totals → `emit_or_into`, once per group | `value_cannot_cross_between_the_asset_groups` | `real_proof_value_moved_from_an_a_slot_into_an_r_slot` | `asset-A conservation` / `RAND conservation`; the compare taint removed: caught |
+| `burn_asset = A` if `burn_a != 0`, else 0 | structural: `sltu`/`sub` mask `and` `ASSET_A`; there is no witness word for it | `burn_asset_is_a_exactly_when_burn_a_is_nonzero` | `real_proof_a_burn_claiming_another_asset` | every run compares `burn_asset` with the model's; the mask removed: caught |
+| Digest: tag 64, `bad` last, no `A` | structural: the staging at step 8, checked against `hidden_bundle_preimage` by `assert_eq!` at assembly | `the_digest_is_domain_separated_and_has_no_asset_field` | every `real_proof_*` (the verifier's `hidden_bundle_proof_digest` equals the emulator's) | every run |
+
+Commands: the fast suite is `cargo test --release -p randprotocol-zkvm --test hidden_cheating --
+--skip real_proof_` (about a minute). The real proofs are `… --test hidden_cheating real_proof_`
+(nine proofs, run one at a time behind the file's lock, about 100 s and 5.7 GB each). To replay a
+fuzz failure, set `HIDDEN_FUZZ_SEED` and `HIDDEN_FUZZ_ITERS`.
+
 ## GPU proving (--cuda)
 
 Proving is the only expensive half of a confidential call, and it happens in the wallet, never on

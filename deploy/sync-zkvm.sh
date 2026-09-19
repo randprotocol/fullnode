@@ -3,7 +3,7 @@
 #
 # Local additions (executor.rs, codec.rs, address.rs, call_envelope.rs, hidden.rs, the extended
 # guests.rs and asm.rs, tests/executor.rs, tests/shielded.rs, tests/call_envelope.rs,
-# tests/hidden_bundle.rs) are preserved;
+# tests/hidden_bundle.rs, tests/hidden_cheating.rs) are preserved;
 # machine.rs gets a small post-sync patch exposing log_ext_degrees_pub (constraint set 6: now a
 # seven-argument (tier, program_log_height, input_log_height, keccak_log_height,
 # sha256_log_height, public_log_height, mem_log_height) function — see the cs6 patch comment
@@ -129,6 +129,11 @@
 # tag is outside `1..=0x3f`, not `0xff`, and distinct from every vendored tag, so a resync that
 # ever reached it would fail there rather than collide silently.
 #
+# Task H2 adds `tests/hidden_cheating.rs` (excluded below, same reason): the guest's cheating
+# suite — real Production proofs of each spec §6 cheat, which verify but publish a digest the
+# ledger refuses, and a seeded mutation fuzz over every private-input word against a host model of
+# spec §3.3. Upstream has no such file; without the exclusion `--delete` would remove it.
+#
 # The CUDA backend is *not* vendored either: crates/randprotocol-zkvm depends on it by path, as
 # ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building
 # with --features cuda or --features mock-cuda.
@@ -141,7 +146,8 @@ rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude
       --exclude address.rs --exclude arx.rs --exclude call_envelope.rs --exclude hidden.rs \
       --exclude lib.rs --exclude main.rs "$SRC/src/" "$DST/src/"
 rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_envelope.rs \
-      --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs "$SRC/tests/" "$DST/tests/"
+      --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs \
+      --exclude hidden_cheating.rs "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local
 # `guests::compiled::{fib,keccak256}()` (see the header comment) need — `fib.bin` since M4.1,
