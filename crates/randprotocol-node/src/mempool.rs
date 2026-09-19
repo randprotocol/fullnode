@@ -19,6 +19,7 @@ use randprotocol_core::bridge::BridgeError;
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::ledger::bridge_notes;
 use randprotocol_core::ledger::staking::StakingError;
+use randprotocol_core::ledger::tokens::TokenError;
 use randprotocol_core::notes::{word8_from_bytes, word8_to_hex};
 use randprotocol_core::{Action, Address, Hash, Ledger, Transaction, TxError, Word8};
 use serde::Serialize;
@@ -56,6 +57,45 @@ pub struct Claims {
     /// See [`claimed_nonce`]: `None` for every action but a bundle-less `Unbond` or `Withdraw`,
     /// or an `Aggregate`.
     pub claim: Option<(Address, u64)>,
+    /// See [`claimed_token_slot`]: a token's `mint_nonce` for a `TokenMint` or `SetAuthority`,
+    /// the registry index for a `RegisterToken`, `None` otherwise.
+    pub token: Option<TokenClaim>,
+}
+
+/// A token-registry slot at most one pooled transaction may hold (H4 review minor): the ledger
+/// accepts exactly one transaction per slot, so two pooled holders are a block that dies on its
+/// own candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TokenClaim {
+    /// Token `asset`'s `mint_nonce` — consumed by a `TokenMint` *and* by a `SetAuthority`,
+    /// which share the counter.
+    Nonce { asset: u32, nonce: u64 },
+    /// The registry index a `RegisterToken` is held to (`TokenError::IndexMismatch`).
+    Index(u32),
+}
+
+impl TokenClaim {
+    /// A display key for the conflict, through the same `Conflict(Word8)` the other maps use:
+    /// a tag word (`"tokn"` or `"tidx"`), the index, and the nonce's two halves.
+    fn conflict_key(&self) -> Word8 {
+        match *self {
+            TokenClaim::Nonce { asset, nonce } => {
+                [u32::from_le_bytes(*b"tokn"), asset, nonce as u32, (nonce >> 32) as u32, 0, 0, 0, 0]
+            }
+            TokenClaim::Index(index) => [u32::from_le_bytes(*b"tidx"), index, 0, 0, 0, 0, 0, 0],
+        }
+    }
+}
+
+/// The token-registry slot `action` consumes, if any — see [`TokenClaim`].
+fn claimed_token_slot(action: &Action) -> Option<TokenClaim> {
+    match action {
+        Action::TokenMint { asset, nonce, .. } | Action::SetAuthority { asset, nonce, .. } => {
+            Some(TokenClaim::Nonce { asset: *asset, nonce: *nonce })
+        }
+        Action::RegisterToken { index, .. } => Some(TokenClaim::Index(*index)),
+        _ => None,
+    }
 }
 
 /// A pooled transaction and the commitments it claims.
@@ -70,6 +110,8 @@ struct Pooled {
     /// The register nonce this transaction claims, for an `Unbond`, a `Withdraw` or an
     /// `Aggregate` — see [`claimed_nonce`].
     claim: Option<(Address, u64)>,
+    /// The token-registry slot it claims — see [`claimed_token_slot`].
+    token: Option<TokenClaim>,
     /// When this transaction entered the pool, for `Mempool::info`'s oldest-entry age.
     since: Instant,
     /// `tx.encoded_len()`, taken once at admission: that is a full re-encode (a ~1.2 MB proof
@@ -124,6 +166,9 @@ pub struct Mempool {
     /// `(validator, nonce)`, an `Aggregate`'s `(aggregator, nonce)` — keyed by register and
     /// address the same way `commitments` claims a note (see [`claim_key`]).
     claims: HashMap<(u8, Address, u64), Hash>,
+    /// Which pooled transaction holds each token-registry slot: a token's `mint_nonce`, or the
+    /// next registration index (see [`TokenClaim`]).
+    token_claims: HashMap<TokenClaim, Hash>,
     /// Which pooled transaction consumes each bridge attestation digest. A digest is spendable
     /// once, like a nullifier, but it is not a field of the transaction — see
     /// `Transaction::bridge_digests`.
@@ -163,6 +208,7 @@ impl Mempool {
             nullifiers: HashMap::new(),
             commitments: HashMap::new(),
             claims: HashMap::new(),
+            token_claims: HashMap::new(),
             digests: HashMap::new(),
             bytes: 0,
             max_size,
@@ -214,7 +260,7 @@ impl Mempool {
     ) -> Result<Hash, MempoolError> {
         let c = self.pool_conflicts(&tx, ledger, executor)?;
         ledger.validate(&tx, executor).map_err(MempoolError::Invalid)?;
-        Ok(self.admit(tx, c.commitments, c.claim))
+        Ok(self.admit(tx, c))
     }
 
     /// The pool's own half of admission: this transaction against the ones already held, and
@@ -251,6 +297,12 @@ impl Mempool {
                 return Err(MempoolError::Conflict(claim_conflict_key(&claim.0)));
             }
         }
+        let token = claimed_token_slot(&tx.action);
+        if let Some(t) = token {
+            if self.token_claims.contains_key(&t) {
+                return Err(MempoolError::Conflict(t.conflict_key()));
+            }
+        }
         for mu in tx.bridge_digests() {
             if self.digests.contains_key(&mu) {
                 return Err(MempoolError::AttestationConflict(mu));
@@ -259,7 +311,7 @@ impl Mempool {
         if self.txs.len() >= self.max_size {
             return Err(MempoolError::Full);
         }
-        Ok(Claims { commitments, claim })
+        Ok(Claims { commitments, claim, token })
     }
 
     /// Everything the pool can decide about a transaction without verifying a proof: the pool
@@ -307,13 +359,14 @@ impl Mempool {
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Hash, MempoolError> {
         let c = self.precheck(&tx, ledger, executor)?;
-        Ok(self.admit(tx, c.commitments, c.claim))
+        Ok(self.admit(tx, c))
     }
 
     /// Take ownership of `tx`'s claims and pool it. Every caller has just run
     /// [`Mempool::pool_conflicts`] for this transaction, so no index entry written here can collide
     /// with one that exists.
-    fn admit(&mut self, tx: Transaction, commitments: Vec<Word8>, claim: Option<(Address, u64)>) -> Hash {
+    fn admit(&mut self, tx: Transaction, c: Claims) -> Hash {
+        let Claims { commitments, claim, token } = c;
         let hash = tx.hash();
         for nf in tx.nullifiers() {
             self.nullifiers.insert(nf, hash);
@@ -324,6 +377,9 @@ impl Mempool {
         if let Some(claim) = claim {
             self.claims.insert(claim_key(&tx.action, &claim), hash);
         }
+        if let Some(t) = token {
+            self.token_claims.insert(t, hash);
+        }
         for mu in tx.bridge_digests() {
             self.digests.insert(mu, hash);
         }
@@ -331,7 +387,7 @@ impl Mempool {
         self.bytes += len;
         // `pool_conflicts` refuses a hash already pooled, so nothing is replaced here; if that
         // ever changes, the replaced entry's bytes must leave the total with it.
-        if let Some(old) = self.txs.insert(hash, Pooled { tx, commitments, claim, since: Instant::now(), len }) {
+        if let Some(old) = self.txs.insert(hash, Pooled { tx, commitments, claim, token, since: Instant::now(), len }) {
             self.bytes -= old.len;
         }
         hash
@@ -516,6 +572,26 @@ impl Mempool {
                 }
             }
         }
+        // A token slot goes stale the same way a register nonce does: once the token's
+        // `mint_nonce` has moved past the one signed over, or the registry has handed out the
+        // index a registration is held to, the transaction can never apply again. On a chain
+        // without the tokens gate, and for a token the registry does not hold, `validate` gives
+        // its own answer; there is nothing to go stale here.
+        if let Some(tokens) = ledger.tokens() {
+            match claimed_token_slot(&tx.action) {
+                Some(TokenClaim::Nonce { asset, nonce }) => {
+                    if let Some(info) = tokens.get(asset) {
+                        if info.mint_nonce != nonce {
+                            return Err(TxError::Token(TokenError::BadNonce { expected: info.mint_nonce, got: nonce }));
+                        }
+                    }
+                }
+                Some(TokenClaim::Index(index)) if index != tokens.next_index() => {
+                    return Err(TxError::Token(TokenError::IndexMismatch { expected: tokens.next_index(), got: index }));
+                }
+                _ => {}
+            }
+        }
         let nullifiers = tx.nullifiers();
         if let Some(nf) = nullifiers.iter().find(|nf| ledger.is_spent(nf)) {
             return Err(TxError::Spent(*nf));
@@ -563,6 +639,11 @@ impl Mempool {
             let key = claim_key(&p.tx.action, &claim);
             if self.claims.get(&key) == Some(hash) {
                 self.claims.remove(&key);
+            }
+        }
+        if let Some(t) = p.token {
+            if self.token_claims.get(&t) == Some(hash) {
+                self.token_claims.remove(&t);
             }
         }
         for mu in p.tx.bridge_digests() {
@@ -1183,6 +1264,73 @@ mod tests {
         }
         assert_eq!(l.released(&v.address()), 2 * fixtures::bundle_fee());
         (l, secrets)
+    }
+
+    /// A `SetAuthority` of `asset` at `nonce`, signed by the fixture issuer, handing the token to
+    /// `key(new)`; its fee bundle keyed at `seed..seed + 3`.
+    fn set_authority_tx(l: &Ledger, asset: u32, nonce: u64, new: u8, seed: u32) -> Transaction {
+        let id = l.tokens().and_then(|t| t.get(asset)).map(|i| i.id).unwrap();
+        let new = Some(fixtures::key(new).public_key().clone());
+        let msg = randprotocol_core::types::actions::set_authority_message(l.chain_id(), &id, nonce, &new);
+        let signature = fixtures::issuer().sign(msg.as_bytes());
+        StubExecutor::bound(Transaction::shielded(
+            l.chain_id(),
+            fixtures::bundle(l, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], randprotocol_core::gas::BUNDLE_BASE),
+            Action::SetAuthority { asset, new, nonce, signature },
+        ))
+    }
+
+    /// Two pooled transactions at one token's `mint_nonce` — two `TokenMint`s, or a mint and a
+    /// `SetAuthority`, which share the counter — and two `RegisterToken`s at one registry index
+    /// can never both apply, so the pool holds one of each pair (H4 review minor). Removing the
+    /// owner frees the slot; once the ledger has moved past it, a pooled rival is stale and
+    /// pruned, and a new one is refused before any proof is verified.
+    #[test]
+    fn a_token_nonce_and_a_registration_index_are_claimed_once_in_the_pool() {
+        let (gs, _secrets) = fixtures::bridged_genesis(1);
+        let mut l = gs.ledger.clone();
+        let register = fixtures::register_token_tx(&l, 5_000, 210);
+        l.apply_tx(&register, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        l.record_anchor(0);
+
+        // Two mints at nonce 0, and a rotation at nonce 0.
+        let mint_a = fixtures::token_mint_tx(&l, 2, 700, 0, 300);
+        let mint_b = fixtures::token_mint_tx(&l, 2, 800, 0, 320);
+        let rotate = set_authority_tx(&l, 2, 0, 22, 340);
+        for t in [&mint_a, &mint_b, &rotate] {
+            assert_eq!(l.validate(t, &StubExecutor), Ok(()), "each alone is valid: a race, not a bad tx");
+        }
+        let mut m = Mempool::new(100);
+        m.insert(mint_a.clone(), &l, &StubExecutor).unwrap();
+        assert!(matches!(m.insert(mint_b.clone(), &l, &StubExecutor), Err(MempoolError::Conflict(_))));
+        assert!(matches!(m.precheck(&rotate, &l, &StubExecutor), Err(MempoolError::Conflict(_))));
+        m.remove(&[mint_a.hash()]);
+        m.insert(rotate.clone(), &l, &StubExecutor).unwrap();
+        assert!(matches!(m.insert(mint_b.clone(), &l, &StubExecutor), Err(MempoolError::Conflict(_))));
+
+        // Two registrations at the next index (3), neither with an initial mint, so no commitment
+        // is shared: only the index makes them rivals.
+        let reg_a = fixtures::register_token_tx(&l, 0, 400);
+        let reg_b = fixtures::register_token_tx(&l, 0, 420);
+        assert_ne!(reg_a.hash(), reg_b.hash());
+        for t in [&reg_a, &reg_b] {
+            assert_eq!(l.validate(t, &StubExecutor), Ok(()));
+        }
+        m.insert(reg_a.clone(), &l, &StubExecutor).unwrap();
+        assert!(matches!(m.insert(reg_b.clone(), &l, &StubExecutor), Err(MempoolError::Conflict(_))));
+        assert_eq!(m.len(), 2, "the rotation and the first registration");
+
+        // The chain applies a mint at nonce 0 and a registration at index 3 from elsewhere: the
+        // pooled rotation and registration can never apply and leave at the next prune.
+        l.apply_tx(&mint_b, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        l.apply_tx(&reg_b, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        m.prune(&l);
+        assert_eq!(m.len(), 0, "a spent nonce and a taken index are stale");
+        let stale = fixtures::token_mint_tx(&l, 2, 900, 0, 500);
+        assert!(matches!(
+            m.precheck(&stale, &l, &StubExecutor),
+            Err(MempoolError::Invalid(TxError::Token(TokenError::BadNonce { expected: 1, got: 0 })))
+        ));
     }
 
     /// Every bundle-carrying kind the hidden-asset bundle reshaped — a plain transfer (`None`), a
