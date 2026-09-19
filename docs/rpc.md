@@ -1158,10 +1158,13 @@ What changed for clients, in one place. Newest first.
   `unpause_mints` (`{ "kind": "unpause_mints", "nonce", "pq_signers" }`, a PQ guardian quorum over
   `b"rand-bridge-pq-unpause-1" ‖ chain_id ‖ nonce`). Both carry the bridge's `pause_nonce` and bump
   it; the pause key can never unpause.
-- New refusals, none cached (state, not bytes): `bridge minting is paused` (`MintsPaused`) on a
+- New refusals, not cached (state, not bytes): `bridge minting is paused` (`MintsPaused`) on a
   transfer attest while paused; `mint cap … per backing per day` (`MintCapExceeded`); and the
-  pause's own `already paused`, `not paused`, `wrong pause nonce`, `the pause signature does not
-  verify`.
+  pause's own `already paused`, `not paused`, `wrong pause nonce`. `the pause signature does not
+  verify` **is** cached as a permanent refusal: it is judged after the nonce, over the
+  transaction's own nonce and chain id under the genesis pause key, so it depends on the bytes
+  alone — and a bundle-less, fee-less pause should not buy a free Dilithium2 verification per
+  replay.
 
 ### 2026-09-19 — the hidden-asset bundle (chain 14): a hard fork
 

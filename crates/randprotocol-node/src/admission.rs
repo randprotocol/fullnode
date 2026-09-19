@@ -189,9 +189,22 @@ pub fn is_permanent(e: &TxError) -> bool {
     // either is cheap next to what a wrongly cached refusal costs (a relayer's mint censored on
     // this node until restart). `PqNoQuorum` is decided before any other attest check and
     // `PqBadSignature` only after a valid ECDSA quorum over an unconsumed digest.
+    //
+    // B1's `BadPauseSignature` is cached: it depends on the transaction's bytes alone. The ledger
+    // checks the nonce first (`BadPauseNonce`, state, never cached) and the flag second, and only
+    // then verifies the signature over `pause_message(tx.chain_id, nonce)` — built from the
+    // transaction's own nonce and chain id — under the genesis `pause_key`, which no action
+    // changes. So a signature that fails once fails at every tip. Caching it matters because a
+    // `PauseMints` is bundle-less and fee-less: without the cache a peer could replay one bad
+    // pause and buy a Dilithium2 verification per delivery for free (the per-peer token bucket
+    // bounds the rate; this makes the repeats cost nothing). If a later action ever rotates the
+    // pause key, this arm must move out, as `PqIndexOutOfRange` would with a PQ rotation.
     if let TxError::Bridge(b) = e {
         use randprotocol_core::bridge::BridgeError as B;
-        return matches!(b, B::PqIndexOrder | B::PqIndexOutOfRange { .. } | B::PqBadSignatureLength { .. });
+        return matches!(
+            b,
+            B::PqIndexOrder | B::PqIndexOutOfRange { .. } | B::PqBadSignatureLength { .. } | B::BadPauseSignature
+        );
     }
     matches!(
         e,
@@ -526,12 +539,11 @@ mod tests {
         }
     }
 
-    /// Bridge hardening B1: every verdict of the cap and the brake is state — the day's counter,
-    /// the pause flag, the pause nonce — and so is the pause signature's (it is judged against
-    /// the nonce the bridge is at). None is cached: a deposit over today's cap is admissible
-    /// tomorrow, a paused mint after the unpause.
+    /// Bridge hardening B1: every verdict of the cap and the brake but one is state — the day's
+    /// counter, the pause flag, the pause nonce. None of those is cached: a deposit over today's
+    /// cap is admissible tomorrow, a paused mint after the unpause.
     #[test]
-    fn the_cap_and_pause_verdicts_are_never_cached() {
+    fn the_cap_and_pause_state_verdicts_are_never_cached() {
         use randprotocol_core::bridge::BridgeError as B;
         use randprotocol_core::ledger::tokens::TokenError as T;
         for b in [
@@ -541,11 +553,25 @@ mod tests {
             B::AlreadyPaused,
             B::NotPaused,
             B::BadPauseNonce { expected: 1, got: 0 },
-            B::BadPauseSignature,
         ] {
             let e = TxError::Bridge(b);
             assert!(!is_permanent(&e), "{e} is state, not bytes");
         }
+    }
+
+    /// The one pause verdict that is about the bytes: a `PauseMints` whose signature fails under
+    /// the genesis pause key over `pause_message(its own chain id, its own nonce)` fails at every
+    /// tip, so it is cached — a replayed bad pause, bundle-less and fee-less, costs no second
+    /// Dilithium2 verification. (The ledger reaches it only after the nonce and flag checks,
+    /// which stay uncached: `bridge_gov`'s tests pin that order.)
+    #[test]
+    fn a_bad_pause_signature_is_a_byte_verdict_and_is_cached() {
+        use randprotocol_core::bridge::BridgeError as B;
+        let e = TxError::Bridge(B::BadPauseSignature);
+        assert!(is_permanent(&e), "{e} depends on the transaction's bytes alone");
+        let mut c = RefusedCache::new(4);
+        c.insert(h(7), e.clone());
+        assert_eq!(c.get(&h(7)), Some(&e), "the cache keeps it");
     }
 
     /// The aggregate verdicts, split: the byte-verdicts and the genesis-constant ones are

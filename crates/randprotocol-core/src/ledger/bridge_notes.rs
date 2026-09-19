@@ -1636,6 +1636,13 @@ mod tests {
         // A wrong key, then a pause signed for another nonce or another chain, are refused.
         let stranger = Keypair::from_seed([0x55; 32]).unwrap();
         assert_eq!(l.validate(&pause_tx(&stranger, 0), &StubExecutor), Err(TxError::Bridge(BridgeError::BadPauseSignature)));
+        // The nonce is judged before the signature, so the one cached pause verdict
+        // (`BadPauseSignature`, node admission's `is_permanent`) is reached only by a transaction
+        // whose own nonce, chain id and signature bytes decide it.
+        assert_eq!(
+            l.validate(&pause_tx(&stranger, 3), &StubExecutor),
+            Err(TxError::Bridge(BridgeError::BadPauseNonce { expected: 0, got: 3 }))
+        );
         assert_eq!(
             l.validate(&pause_tx(&pause_key(), 1), &StubExecutor),
             Err(TxError::Bridge(BridgeError::BadPauseNonce { expected: 0, got: 1 }))
