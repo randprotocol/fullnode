@@ -128,6 +128,8 @@ pub enum TxError {
     MinterNotValidator(Address),
     #[error("bad mint signature")]
     BadMintSignature,
+    #[error("the mint's commitment does not open to its published note and amount")]
+    MintCommitmentMismatch,
     #[error("confidential computation is disabled on this chain")]
     ConfidentialDisabled,
     #[error("bad program: {0}")]
@@ -248,6 +250,13 @@ pub struct CallReceiptData {
 struct Verified {
     call: Option<CallOutcome>,
     attestation: Option<CheckedAttestation>,
+}
+
+/// The commitment of the note a faucet mint creates: owner `pk`, no sender, `amount` of the
+/// native asset, the action's `time` and blinding `r`. Admission refuses a `Mint` whose `cm` is
+/// anything else; the wallet-side builder ([`Transaction::mint`]) computes it the same way.
+pub fn mint_commitment(executor: &dyn ConfidentialExecutor, pk: &Word8, amount: u64, time: u32, r: &Word8) -> Word8 {
+    executor.note_commitment(pk, &[0; 8], amount, 0, time, r)
 }
 
 /// In-memory chain state: the note commitment tree, the nullifier set, the validator register
@@ -969,7 +978,9 @@ impl Ledger {
         // node chose — and it is held to the same window by the same rule; a `WithdrawAggregator`'s
         // note time is its twin, one register over. Checked here, at the step a bundle's time is
         // checked, so a stale one is refused before any signature work.
-        if let Action::Withdraw { time, .. } | Action::WithdrawAggregator { time, .. } = &tx.action {
+        if let Action::Withdraw { time, .. } | Action::WithdrawAggregator { time, .. } | Action::Mint { time, .. } =
+            &tx.action
+        {
             self.check_time(*time)?;
         }
         // 7. action-specific cheap checks
@@ -977,7 +988,7 @@ impl Ledger {
         let mut call_record = None;
         match &tx.action {
             Action::None => {}
-            Action::Mint { cm, envelope, amount, minter, signature } => {
+            Action::Mint { cm, pk, time, r, envelope, amount, minter, signature } => {
                 if !self.faucet {
                     return Err(TxError::FaucetDisabled);
                 }
@@ -988,9 +999,15 @@ impl Ledger {
                 if !self.validators.contains_key(&addr) {
                     return Err(TxError::MinterNotValidator(addr));
                 }
-                let signing_hash = Transaction::mint_signing_hash(tx.chain_id, cm, envelope, *amount);
+                let signing_hash = Transaction::mint_signing_hash(tx.chain_id, cm, pk, *time, r, envelope, *amount);
                 if !minter.verify(signing_hash.as_bytes(), signature) {
                     return Err(TxError::BadMintSignature);
+                }
+                // The value rule (audit v3, POOL-1): the note the tree gains is worth exactly the
+                // `amount` the supply counts. A validator's signature is not enough — it signs
+                // whatever `cm` it likes — so the ledger derives the commitment itself.
+                if mint_commitment(executor, pk, *amount, *time, r) != *cm {
+                    return Err(TxError::MintCommitmentMismatch);
                 }
                 if self.commitments.contains(cm) {
                     return Err(TxError::CommitmentExists(*cm));
@@ -1700,17 +1717,16 @@ mod tests {
         let mut l = ledger();
         let (a, _) = keys();
         let stranger = Keypair::from_seed([9; 32]).unwrap();
-        let t = Transaction::mint(7, [5; 8], env(), FAUCET_MAX_UNITS, &a);
+        let mint = |amount, k: &Keypair| Transaction::mint(7, [5; 8], 0, [6; 8], env(), amount, k, &StubExecutor);
+        let t = mint(FAUCET_MAX_UNITS, &a);
+        let cm = t.commitments()[0];
         assert_eq!(l.validate(&t, &StubExecutor), Ok(()));
         assert_eq!(
-            l.validate(&Transaction::mint(7, [5; 8], env(), FAUCET_MAX_UNITS + 1, &a), &StubExecutor),
+            l.validate(&mint(FAUCET_MAX_UNITS + 1, &a), &StubExecutor),
             Err(TxError::MintTooLarge { amount: FAUCET_MAX_UNITS + 1, cap: FAUCET_MAX_UNITS })
         );
-        assert_eq!(
-            l.validate(&Transaction::mint(7, [5; 8], env(), 1, &stranger), &StubExecutor),
-            Err(TxError::MinterNotValidator(stranger.address()))
-        );
-        let mut forged = Transaction::mint(7, [5; 8], env(), 1, &a);
+        assert_eq!(l.validate(&mint(1, &stranger), &StubExecutor), Err(TxError::MinterNotValidator(stranger.address())));
+        let mut forged = mint(1, &a);
         if let Action::Mint { amount, .. } = &mut forged.action {
             *amount = 2;
         }
@@ -1724,8 +1740,43 @@ mod tests {
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::FaucetDisabled));
         l.set_faucet(true);
         l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
-        assert!(l.has_commitment(&[5; 8]));
-        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::CommitmentExists([5; 8])));
+        assert!(l.has_commitment(&cm));
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::CommitmentExists(cm)));
+    }
+
+    /// Audit v3, POOL-1: a validator declares one unit, signs, and appends the commitment of a note
+    /// worth far more. The signature is honest — the validator signed exactly these bytes — so only
+    /// a ledger-derived commitment refuses it. Accepted before the fix (the supply would have
+    /// counted one unit for a note worth a million).
+    #[test]
+    fn a_mint_whose_commitment_opens_to_more_than_its_amount_is_refused() {
+        let mut l = ledger();
+        let (a, _) = keys();
+        let (pk, time, r) = ([5; 8], 0, [6; 8]);
+        let big = mint_commitment(&StubExecutor, &pk, 1_000_000, time, &r);
+        let signing = Transaction::mint_signing_hash(7, &big, &pk, time, &r, &env(), 1);
+        let forged = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::Mint {
+                cm: big,
+                pk,
+                time,
+                r,
+                envelope: env(),
+                amount: 1,
+                minter: a.public_key().clone(),
+                signature: a.sign(signing.as_bytes()),
+            },
+        };
+        assert_eq!(l.validate(&forged, &StubExecutor), Err(TxError::MintCommitmentMismatch));
+        let before = l.clone();
+        assert_eq!(l.apply_tx(&forged, &a.address(), &StubExecutor), Err(TxError::MintCommitmentMismatch));
+        assert_eq!(l, before, "nothing minted");
+        // A stale opening time is refused like a withdraw's, before any signature work.
+        l.set_height(TIME_WINDOW + 1);
+        let stale = Transaction::mint(7, pk, 0, r, env(), 1, &a, &StubExecutor);
+        assert_eq!(l.validate(&stale, &StubExecutor), Err(TxError::TimeOutOfWindow { time: 0, height: TIME_WINDOW + 1 }));
     }
 
     #[test]

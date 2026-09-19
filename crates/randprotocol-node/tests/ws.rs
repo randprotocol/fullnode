@@ -322,9 +322,9 @@ async fn a_transaction_subscription_hears_its_commit_or_its_refusal_once() {
     let node = common::start_one_validator().await;
     let validator = Keypair::from_seed([101; 32]).unwrap();
     let env = |tag: u8| Envelope { kem_ct: vec![tag; 8], to_receiver: vec![tag; 4], to_sender: vec![], body: vec![tag; 16] };
-    let good = Transaction::mint(7, [9; 8], env(1), 1000, &validator);
+    let good = Transaction::mint(7, [9; 8], 0, [9; 8], env(1), 1000, &validator, &real_executor());
     // A signature over a different amount: a permanent refusal, so it enters the refused cache.
-    let mut bad = Transaction::mint(7, [8; 8], env(2), 1000, &validator);
+    let mut bad = Transaction::mint(7, [8; 8], 0, [8; 8], env(2), 1000, &validator, &real_executor());
     if let Action::Mint { amount, .. } = &mut bad.action {
         *amount = 999;
     }
@@ -409,4 +409,10 @@ async fn a_transaction_subscription_hears_its_commit_or_its_refusal_once() {
     assert_eq!(of(&got, &late[0]), committed, "the stored location, as it was announced live");
     assert_eq!(of(&got, &late[1]), rejected, "the cached refusal, as it was announced live");
     node.shutdown().await;
+}
+
+/// The node's own commitment function (a mint's `cm` must be the one admission derives), without
+/// the prover: `note_commitment` is a plain hash, the same under every FRI profile.
+fn real_executor() -> randprotocol_zkvm::executor::ZkExecutor {
+    randprotocol_zkvm::executor::ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test)
 }

@@ -465,9 +465,12 @@ mod tests {
     fn a_faucet_mint_discloses_its_one_note() {
         // A mint carries its commitment and envelope on the wire, like a bundle's outputs, so the
         // key its minter sealed under discloses it — the `rand tx-key` a recipient prints.
-        let note = note_for(&alice(), &bob(), 100);
+        // A faucet note has no sender: the ledger derives its commitment with `from` zero.
+        let note = Note { from: [0; 8], ..note_for(&alice(), &bob(), 100) };
         let k = TxKey([31; 32]);
-        let mint = Transaction::mint(7, note.commitment(), sealed(&bob(), &alice(), &note, &k), 100, &randprotocol_core::Keypair::generate());
+        let ex = randprotocol_zkvm::executor::ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
+        let env = sealed(&bob(), &alice(), &note, &k);
+        let mint = Transaction::mint(7, note.pk, note.time, note.r, env, 100, &randprotocol_core::Keypair::generate(), &ex);
         let opened = disclosed(&mint, None, &k);
         assert_eq!(opened.len(), 1);
         assert_eq!((opened[0].output, opened[0].slot, opened[0].cm), ("mint", 0, note.commitment()));

@@ -245,9 +245,9 @@ fn env() -> Envelope {
     Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] }
 }
 
-/// A faucet mint of one unit into note `[n; 8]`, signed by validator `key`.
+/// A faucet mint of one unit to owner `[n; 8]` with blinding `[n; 8]`, signed by validator `key`.
 fn mint(key: &Keypair, n: u32) -> Transaction {
-    Transaction::mint(1, [n; 8], env(), 1, key)
+    Transaction::mint(1, [n; 8], 0, [n; 8], env(), 1, key, &StubExecutor)
 }
 
 /// The node with a pending `ReadyToPropose`, and the view it is for.
@@ -357,7 +357,7 @@ fn a_mint_is_included_and_applied_on_every_node() {
     assert!(found.is_some(), "mint committed");
     for node in &sim.nodes {
         let l = node.committed_ledger();
-        assert!(l.has_commitment(&[5; 8]));
+        assert!(l.has_commitment(&tx.commitments()[0]));
         assert_eq!(l.next_index(), 1);
     }
     // The same tx offered again is skipped by proposers (its commitment exists).
@@ -756,7 +756,7 @@ fn restart_with_mints_keeps_ledgers_identical() {
         let tx = mint(&alice, n + 1);
         // The simulator has no mempool: keep offering the tx until a proposer includes it.
         let mut tries = 0;
-        while !sim.nodes[0].tip_ledger().has_commitment(&[n + 1; 8]) {
+        while !sim.nodes[0].tip_ledger().has_commitment(&tx.commitments()[0]) {
             sim.step(vec![tx.clone()]);
             tries += 1;
             assert!(tries < 20, "tx {n} never included");
@@ -772,7 +772,7 @@ fn restart_with_mints_keeps_ledgers_identical() {
         let l = node.committed_ledger();
         assert_eq!(l.next_index(), 3);
         for n in 1..=3u32 {
-            assert!(l.has_commitment(&[n; 8]), "note {n} missing");
+            assert!(l.has_commitment(&mint(&alice, n).commitments()[0]), "note {n} missing");
         }
     }
 }

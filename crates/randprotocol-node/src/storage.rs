@@ -2266,10 +2266,10 @@ pub(crate) mod fixtures {
         }
     }
 
-    /// A faucet mint of `amount` to a note nobody can open; the envelope is a placeholder, which
-    /// the chain never inspects.
-    pub(crate) fn mint_tx(chain_id: u64, cm: Word8, amount: u64, minter: &Keypair) -> Transaction {
-        Transaction::mint(chain_id, cm, env(cm[0] as u8), amount, minter)
+    /// A faucet mint of `amount` to a note nobody can open, owner and blinding both `tag`, its
+    /// commitment the stub's; the envelope is a placeholder, which the chain never inspects.
+    pub(crate) fn mint_tx(chain_id: u64, tag: Word8, amount: u64, minter: &Keypair) -> Transaction {
+        Transaction::mint(chain_id, tag, 0, tag, env(tag[0] as u8), amount, minter, &StubExecutor)
     }
 
     pub(crate) fn bundle_fee() -> u64 {
@@ -2734,7 +2734,7 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![tx.clone()], &minter);
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         assert_eq!(s.notes_count().unwrap(), 3);
-        assert_eq!(s.note(2).unwrap().unwrap(), NoteRow { cm: [77; 8], envelope: env(77), height: 1 });
+        assert_eq!(s.note(2).unwrap().unwrap(), NoteRow { cm: tx.commitments()[0], envelope: env(77), height: 1 });
         // A mint spends nothing and pays no fee.
         assert_eq!(s.nullifiers_count().unwrap(), 0);
         assert_eq!(s.validator(&minter.address()).unwrap().unwrap().rewards, 0);
@@ -3207,7 +3207,9 @@ mod tests {
         assert_eq!(s.notes_count().unwrap(), 5);
         assert_eq!(s.notes_count().unwrap(), ledger.next_index());
         for (index, (cm, height)) in
-            [([20; 8], 0), ([21; 8], 0), ([43; 8], 1), ([44; 8], 1), ([45; 8], 2)].into_iter().enumerate()
+            [([20; 8], 0), ([21; 8], 0), ([43; 8], 1), ([44; 8], 1), (b2.block.transactions[0].commitments()[0], 2)]
+                .into_iter()
+                .enumerate()
         {
             let row = s.note(index as u64).unwrap().unwrap_or_else(|| panic!("note {index} missing"));
             assert_eq!(row.cm, cm, "note {index} commitment");

@@ -2306,10 +2306,11 @@ mod tests {
     #[test]
     fn a_faucet_mint_is_an_output_its_recipient_can_key() {
         let (minter, me) = (Wallet::from_spend_key(SpendKey([14; 8])), Wallet::from_spend_key(SpendKey([11; 8])));
-        let note = Note::new(me.vk.pk(), minter.vk.pk(), 100, 0, 1);
+        let note = Note::new(me.vk.pk(), [0; 8], 100, 0, 1);
         let k = TxKey::random();
         let env = seal_note(&minter.vk, &me.address, &note, &k).unwrap();
-        let tx = Transaction::mint(7, note.commitment(), env, 100, &randprotocol_core::Keypair::generate());
+        let ex = randprotocol_zkvm::executor::ZkExecutor::new(FriProfile::Test);
+        let tx = Transaction::mint(7, note.pk, note.time, note.r, env, 100, &randprotocol_core::Keypair::generate(), &ex);
         let rows = output_keys(&me, &tx);
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].output, rows[0].slot, rows[0].role, rows[0].key), ("mint", 0, KeyRole::Received, k));

@@ -135,6 +135,8 @@ pub fn is_permanent(e: &TxError) -> bool {
             | TxError::InvalidBundleProof(_)
             | TxError::BadDigest
             | TxError::BadMintSignature
+            // A mint's commitment is a function of its own bytes (`ledger::mint_commitment`).
+            | TxError::MintCommitmentMismatch
             | TxError::BadProgram(_)
             // The chain id is a per-chain constant, and the shape of an action — bundle or no
             // bundle — is on the wire.
@@ -410,6 +412,7 @@ mod tests {
             TxError::InvalidProof(ConfidentialError::MalformedProof),
             TxError::InvalidBundleProof(ConfidentialError::MalformedProof),
             TxError::BadMintSignature,
+            TxError::MintCommitmentMismatch,
             TxError::ProofTooLarge,
             TxError::EnvelopeTooLarge,
             TxError::TransactionTooLarge { size: 9_000_000, max: 4 << 20 },

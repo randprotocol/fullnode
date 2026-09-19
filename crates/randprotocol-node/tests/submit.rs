@@ -55,7 +55,7 @@ async fn a_gossiped_transaction_is_verified_off_the_loop_and_its_refusal_cached(
     .await
     .unwrap();
 
-    let mut bad = Transaction::mint(7, [7; 8], env(3), 1000, &validator);
+    let mut bad = Transaction::mint(7, [7; 8], 0, [7; 8], env(3), 1000, &validator, &real_executor());
     if let Action::Mint { amount, .. } = &mut bad.action {
         *amount = 998;
     }
@@ -85,14 +85,14 @@ async fn the_rpc_submission_path_runs_through_the_verify_queue() {
 
     // 1. A valid mint, signed by the chain's one validator: precheck passes, the verdict comes back
     //    from a blocking worker, and the caller hears a hash.
-    let good = Transaction::mint(7, [9; 8], env(1), 1000, &validator);
+    let good = Transaction::mint(7, [9; 8], 0, [9; 8], env(1), 1000, &validator, &real_executor());
     let r = rpc(addr, "rand_sendTransaction", json!([hex::encode(good.encode())])).await;
     assert!(r.get("result").is_some(), "valid mint refused: {r}");
     assert_eq!(r["result"].as_str().unwrap(), good.hash().to_hex());
 
     // 2. A mint whose signature covers a different amount: validate answers BadMintSignature, which
     //    is permanent, so it is rejected and cached.
-    let mut bad = Transaction::mint(7, [8; 8], env(2), 1000, &validator);
+    let mut bad = Transaction::mint(7, [8; 8], 0, [8; 8], env(2), 1000, &validator, &real_executor());
     if let Action::Mint { amount, .. } = &mut bad.action {
         *amount = 999;
     }
@@ -207,4 +207,10 @@ async fn a_gossiped_aggregate_is_verified_off_the_loop_and_its_refusal_cached() 
 
     peer.shutdown().await;
     node.shutdown().await;
+}
+
+/// The node's own commitment function (a mint's `cm` must be the one admission derives), without
+/// the prover: `note_commitment` is a plain hash, the same under every FRI profile.
+fn real_executor() -> randprotocol_zkvm::executor::ZkExecutor {
+    randprotocol_zkvm::executor::ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test)
 }

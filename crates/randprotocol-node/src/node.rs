@@ -1383,7 +1383,9 @@ impl Node {
         let note = Note::new(to.pk, [0; 8], amount, 0, height as u32);
         let throwaway = SpendKey::random().viewing_key();
         let envelope = randprotocol_zkvm::address::seal_note(&throwaway, &to, &note, &TxKey::random())?;
-        let tx = Transaction::mint(self.gs.chain_id, note.commitment(), envelope, amount, &key);
+        let tx =
+            Transaction::mint(self.gs.chain_id, note.pk, note.time, note.r, envelope, amount, &key, self.executor.as_ref());
+        debug_assert_eq!(tx.commitments(), vec![note.commitment()], "the sealed note is the one admission derives");
         let hash = self
             .mempool
             .insert(tx.clone(), self.hs.tip_ledger(), self.executor.as_ref())
@@ -2282,7 +2284,7 @@ mod tests {
         // The stored set: the fixture-proof bundle and the mint.
         let mut covered_tx = bundle_tx(&gs.ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
         covered_tx.bundle.as_mut().unwrap().proof = crate::agg_executor::fixture_proof(0).to_bytes();
-        let mint_tx = Transaction::mint(7, [31; 8], env(3), 1000, &key(1));
+        let mint_tx = Transaction::mint(7, [31; 8], 0, [31; 8], env(3), 1000, &key(1), &StubExecutor);
         // The applied set: identical apart from the bundle's proof, which is the stub's.
         let stub_tx = bundle_tx(&gs.ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
         let mut ledger_after = gs.ledger.clone();
@@ -2698,7 +2700,7 @@ mod tests {
             Err(randprotocol_core::TxError::UnsupportedAction("aggregation"))
         );
         // Not an aggregate: delegated. A valid mint validates; a forged one is the ledger's answer.
-        let mint = Transaction::mint(7, [41; 8], env(4), 1000, &key(1));
+        let mint = Transaction::mint(7, [41; 8], 0, [41; 8], env(4), 1000, &key(1), &StubExecutor);
         assert!(
             validate_for_pool(&mint, &gs.ledger, &storage, randprotocol_core::types::FriProfile::Test, &StubExecutor).is_ok()
         );

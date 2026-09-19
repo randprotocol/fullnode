@@ -713,6 +713,9 @@ async fn a_refused_transaction_is_not_verified_twice() {
         bundle: None,
         action: Action::Mint {
             cm: [9; 8],
+            pk: [9; 8],
+            time: 0,
+            r: [9; 8],
             envelope: Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] },
             amount: 1_000,
             minter: ks[0].public_key().clone(),

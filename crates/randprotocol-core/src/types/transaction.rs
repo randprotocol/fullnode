@@ -68,7 +68,23 @@ pub enum Action {
     /// Testnet faucet deposit (spec §6): a note of public `amount` created by a validator.
     /// Carried by a bundle-less transaction; `signature` is `minter`'s Dilithium2 signature over
     /// [`Transaction::mint_signing_hash`].
-    Mint { cm: Word8, envelope: Envelope, amount: u64, minter: PublicKey, signature: Signature },
+    ///
+    /// The note's opening rides in the clear — owner `pk`, `time` and blinding `r`, with no
+    /// sender and the native asset — and admission refuses a `cm` that is not the commitment of
+    /// exactly that note at exactly `amount` (`TxError::MintCommitmentMismatch`), as a withdraw's
+    /// and an aggregator payout's notes are derived. Before that check a validator could declare
+    /// a small `amount` and append a `cm` opening to any value (audit v3, POOL-1). `time` is held
+    /// to the bundle window, like a withdraw's.
+    Mint {
+        cm: Word8,
+        pk: Word8,
+        time: u32,
+        r: Word8,
+        envelope: Envelope,
+        amount: u64,
+        minter: PublicKey,
+        signature: Signature,
+    },
     /// Put a zkVM program on chain. Content addressed; see `program::program_id_with_public`.
     /// `public` is the program's public input, fixed at deploy (the call limits, spec §5): every
     /// call's proof commits to exactly these words. Empty for a program without one, which keeps
@@ -206,19 +222,42 @@ impl Transaction {
         Transaction { chain_id, bundle: Some(bundle), action }
     }
 
-    /// What a faucet minter signs: the chain, the new note's commitment, its envelope and the
-    /// public amount. Binding the chain keeps a testnet mint off another chain.
-    pub fn mint_signing_hash(chain_id: u64, cm: &Word8, envelope: &Envelope, amount: u64) -> Hash {
-        let bytes = bincode::serialize(&(chain_id, cm, envelope, amount)).expect("serializes");
-        Hash::digest_domain(b"rand-mint", &bytes)
+    /// What a faucet minter signs: the chain, the new note's commitment and opening, its envelope
+    /// and the public amount. Binding the chain keeps a testnet mint off another chain.
+    pub fn mint_signing_hash(
+        chain_id: u64,
+        cm: &Word8,
+        pk: &Word8,
+        time: u32,
+        r: &Word8,
+        envelope: &Envelope,
+        amount: u64,
+    ) -> Hash {
+        let bytes = bincode::serialize(&(chain_id, cm, pk, time, r, envelope, amount)).expect("serializes");
+        Hash::digest_domain(b"rand-mint-2", &bytes)
     }
 
-    pub fn mint(chain_id: u64, cm: Word8, envelope: Envelope, amount: u64, minter: &Keypair) -> Transaction {
-        let signature = minter.sign(Self::mint_signing_hash(chain_id, &cm, &envelope, amount).as_bytes());
+    /// A faucet mint of `amount` to the note `(pk, no sender, amount, native asset, time, r)`,
+    /// its commitment computed by `executor` exactly as admission recomputes it
+    /// ([`crate::ledger::mint_commitment`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint(
+        chain_id: u64,
+        pk: Word8,
+        time: u32,
+        r: Word8,
+        envelope: Envelope,
+        amount: u64,
+        minter: &Keypair,
+        executor: &dyn crate::confidential::ConfidentialExecutor,
+    ) -> Transaction {
+        let cm = crate::ledger::mint_commitment(executor, &pk, amount, time, &r);
+        let signature =
+            minter.sign(Self::mint_signing_hash(chain_id, &cm, &pk, time, &r, &envelope, amount).as_bytes());
         Transaction {
             chain_id,
             bundle: None,
-            action: Action::Mint { cm, envelope, amount, minter: minter.public_key().clone(), signature },
+            action: Action::Mint { cm, pk, time, r, envelope, amount, minter: minter.public_key().clone(), signature },
         }
     }
 
@@ -461,7 +500,16 @@ mod tests {
         let minter = Keypair::from_seed([1; 32]).unwrap().public_key().clone();
         let bundle_less = [
             (
-                Action::Mint { cm: [1; 8], envelope: env(), amount: 1, minter, signature: Signature::empty() },
+                Action::Mint {
+                    cm: [1; 8],
+                    pk: [1; 8],
+                    time: 0,
+                    r: [1; 8],
+                    envelope: env(),
+                    amount: 1,
+                    minter,
+                    signature: Signature::empty(),
+                },
                 "mint",
             ),
             (Action::Unbond { validator: v, amount: 1, nonce: 0, signature: Signature::empty() }, "unbond"),
@@ -494,13 +542,15 @@ mod tests {
     #[test]
     fn a_mint_is_signed_by_its_minter_and_has_no_bundle() {
         let k = Keypair::from_seed([5; 32]).unwrap();
-        let tx = Transaction::mint(7, [8; 8], env(), 100, &k);
+        let tx = Transaction::mint(7, [8; 8], 0, [3; 8], env(), 100, &k, &crate::confidential::StubExecutor);
         assert!(tx.bundle.is_none());
         assert_eq!(tx.fee(), 0);
-        assert_eq!(tx.commitments(), vec![[8; 8]]);
-        let Action::Mint { cm, envelope, amount, minter, signature } = &tx.action else { panic!() };
-        assert!(minter.verify(Transaction::mint_signing_hash(7, cm, envelope, *amount).as_bytes(), signature));
-        assert!(!minter.verify(Transaction::mint_signing_hash(8, cm, envelope, *amount).as_bytes(), signature));
+        let want = crate::ledger::mint_commitment(&crate::confidential::StubExecutor, &[8; 8], 100, 0, &[3; 8]);
+        assert_eq!(tx.commitments(), vec![want]);
+        let Action::Mint { cm, pk, time, r, envelope, amount, minter, signature } = &tx.action else { panic!() };
+        let signed = |chain| Transaction::mint_signing_hash(chain, cm, pk, *time, r, envelope, *amount);
+        assert!(minter.verify(signed(7).as_bytes(), signature));
+        assert!(!minter.verify(signed(8).as_bytes(), signature));
     }
 
     /// A burn spends and creates through two bundles, so both must be visible to the mempool's

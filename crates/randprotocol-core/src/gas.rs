@@ -195,6 +195,9 @@ mod tests {
         assert_eq!(
             fee_floor(&Action::Mint {
                 cm: [0; 8],
+                pk: [0; 8],
+                time: 0,
+                r: [0; 8],
                 envelope: crate::notes::Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] },
                 amount: 5,
                 minter: crate::crypto::Keypair::from_seed([1; 32]).unwrap().public_key().clone(),

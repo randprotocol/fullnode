@@ -1084,10 +1084,11 @@ mod tests {
         let l = ledger();
         let mut m = Mempool::new(100);
         let mint = fixtures::mint_tx(l.chain_id(), cm(1), 5, &fixtures::key(1));
+        let minted = mint.commitments()[0];
         m.insert(mint.clone(), &l, &StubExecutor).unwrap();
         // A bundle that would create the same note is a conflict, not a second copy of it.
-        let clash = fixtures::bundle_tx(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee());
-        assert_eq!(m.insert(clash, &l, &StubExecutor), Err(MempoolError::Conflict(cm(1))));
+        let clash = fixtures::bundle_tx(&l, [nf(1), nf(2)], [minted, cm(2)], fixtures::bundle_fee());
+        assert_eq!(m.insert(clash, &l, &StubExecutor), Err(MempoolError::Conflict(minted)));
         assert_eq!(m.candidates(&l, 10), vec![mint]);
     }
 
