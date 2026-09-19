@@ -170,11 +170,12 @@ pub enum TxError {
     #[error("the attestation names a different recipient")]
     BridgeRecipientMismatch,
     /// The `BridgeAttest` names an asset index that is not the one this deposit would be given.
-    /// Only a first sighting can reach it in practice: the index a registered asset deposits
-    /// under never changes, while a new token's is the registry's `next_index` at apply time, and
-    /// a competing first sighting moves it. Refusing costs the submitter a fee bundle and a
-    /// re-proof; accepting would append a note whose `asset` word is not the one the recipient's
-    /// envelope was sealed against, which no key of theirs opens.
+    /// A plain mistake now that bridged tokens are listed rather than registered by first
+    /// sighting: the index a listed token deposits under is decided before any attestation of it
+    /// exists and never moves, so nothing can take it from a pooled transaction and a wallet that
+    /// read the registry cannot lose a race for it. Accepting a wrong one would append a note
+    /// whose `asset` word is not the one the recipient's envelope was sealed against, which no
+    /// key of theirs opens.
     #[error("the attestation deposits under asset {expected}, and the transaction names {actual}")]
     AttestAssetMismatch { expected: u32, actual: u32 },
     /// A `BridgeBurn`'s asset bundle is in the wrong asset, pays a fee, or burns the wrong
@@ -195,6 +196,13 @@ pub enum TxError {
     /// [`aggregation::AggregationError`]).
     #[error("aggregation: {0}")]
     Aggregation(#[from] aggregation::AggregationError),
+    /// The RPL token registry refused something: today, a chain with no `tokens` section at all
+    /// ([`tokens::TokenError::Disabled`]) and the two supply bounds a bridged deposit or burn
+    /// can reach ([`tokens::TokenError::SupplyOverflow`] / `SupplyUnderflow`), both decided in
+    /// `validate` so that `apply` cannot fail on them. A later task's `RegisterToken`/`Mint`
+    /// actions ride the same variant, as `Staking` and `Aggregation` carry their registers'.
+    #[error("token: {0}")]
+    Token(#[from] tokens::TokenError),
     #[error("arithmetic overflow")]
     Overflow,
 }
@@ -620,11 +628,30 @@ impl Ledger {
         self.tokens.as_ref()
     }
 
-    /// For the token actions a later task wires up (`Action::RegisterToken` and friends): unused
-    /// until then, so `#[allow(dead_code)]` rather than a warning on every build.
-    #[allow(dead_code)]
+    /// The registry to write: a bridged deposit credits a token's supply and a burn debits it
+    /// (`bridge_notes::apply`), and a later task's `Action::RegisterToken` and friends mint
+    /// through the same handle.
     pub(crate) fn tokens_mut(&mut self) -> Option<&mut tokens::TokenRegistry> {
         self.tokens.as_mut()
+    }
+
+    /// The bridge to write *and* the registry to read, in one borrow: an outbound burn needs
+    /// both at once (the wire message's `(chain, token)` comes from the token's mint authority)
+    /// and `bridge_mut()` beside `tokens()` is two borrows of one `Ledger`, which the borrow
+    /// checker will not have.
+    ///
+    /// Both sections are present together or not at all on any chain genesis builds
+    /// (`GenesisError::BridgeNeedsTokens`), so the two errors here are the same "this chain has
+    /// no bridge" in practice; they are kept apart so a mis-assembled ledger names which half is
+    /// missing rather than blaming the other.
+    pub(crate) fn bridge_and_tokens_mut(
+        &mut self,
+    ) -> Result<(&mut BridgeState, &tokens::TokenRegistry), TxError> {
+        match (self.bridge.as_mut(), self.tokens.as_ref()) {
+            (Some(bridge), Some(tokens)) => Ok((bridge, tokens)),
+            (None, _) => Err(TxError::Bridge(BridgeError::Disabled)),
+            (_, None) => Err(TxError::Token(tokens::TokenError::Disabled)),
+        }
     }
 
     /// Install (or clear) the aggregation section. Genesis calls this once from its

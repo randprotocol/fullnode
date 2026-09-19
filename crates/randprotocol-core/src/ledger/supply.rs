@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 /// from one register entry to another.
 ///
 /// Phase S3's bridge adds no counter, and deliberately: asset index 0 is reserved for RAND and
-/// the asset registry never hands it out ([`crate::bridge::FIRST_ASSET_INDEX`]), so a
+/// the token registry never hands it out ([`crate::ledger::tokens::FIRST_TOKEN_INDEX`]), so a
 /// `BridgeAttest` always deposits a note of some *other* asset and a `BridgeBurn`'s asset bundle
 /// always destroys one. Neither crosses the RAND boundary, which is why `apply_tx` counts
 /// `fees_paid`/`burned` on the fee bundle's path only and not inside

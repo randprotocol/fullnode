@@ -1,9 +1,11 @@
-//! The RPL token registry: dense indices for fungible assets minted on this chain, alongside
-//! the ones the bridge already indexes (`crate::bridge::state::AssetInfo`).
+//! The RPL token registry: dense indices for every fungible asset on this chain, bridged ones
+//! included — the bridge (`crate::bridge::state::BridgeState`) is a reader of this registry and
+//! no longer keeps one of its own.
 //!
 //! A note's `asset` word is one `u32`, so every asset — bridged or native — needs a dense index
-//! rather than its 32-byte [`AssetId`]. The bridge earns its index the moment an attestation
-//! first names it; an RPL token earns its the moment someone pays to register it (a later task's
+//! rather than its 32-byte [`AssetId`]. A bridged token earns its index by being *listed* (in
+//! genesis, or by a governance message), never by an attestation naming it; an RPL token earns
+//! its the moment someone pays to register it (a later task's
 //! `Action::RegisterToken`). This module is only the registry's shape and its bookkeeping rules:
 //! what a name/symbol/decimals triple must look like, how supply is tracked and checked both
 //! ways, and the root that folds the registry into the state root. Nothing here decides which
@@ -25,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// The first index [`TokenRegistry::new`] hands out. 0 is RAND and is never registered here,
-/// same reasoning as the bridge's own `FIRST_ASSET_INDEX`.
+/// the same reservation the bridge's own registry used to make before this one replaced it.
 pub const FIRST_TOKEN_INDEX: u32 = 1;
 /// Longest a token's display name may be, in bytes.
 pub const MAX_NAME_BYTES: usize = 32;
@@ -75,8 +77,8 @@ pub struct TokenInfo {
 /// by its [`AssetId`], plus the next index to hand out.
 ///
 /// No `Default`: a defaulted `next_index` of 0 would be RAND's index. [`TokenRegistry::new`] is
-/// the only constructor, and it starts at [`FIRST_TOKEN_INDEX`] the same way
-/// `BridgeState::default()` is written out by hand for its own `next_index` (`bridge/state.rs`).
+/// the only constructor, and it starts at [`FIRST_TOKEN_INDEX`] — the reservation the bridge's
+/// own retired registry made for the same reason.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenRegistry {
     pub registration_fee: u64,

@@ -143,8 +143,9 @@ impl Ledger {
     /// - a `Withdraw` (S2), whose owner is known only to the register — the validator's payout
     ///   address — and whose amount is the withdrawal less the bundle base;
     /// - a `BridgeAttest` (S3), whose amount is the one the guardians signed and whose `asset` is
-    ///   the index the registry assigns, neither of which the submitter chooses. Read off the wire
-    ///   bytes and the registry alone (`bridge_notes::attested_transfer`, `deposit_index`): no
+    ///   the index the token registry holds for it, neither of which the submitter chooses. Read
+    ///   off the wire bytes and the registry alone (`bridge_notes::attested_transfer`,
+    ///   `TokenRegistry::get_by_id`): no
     ///   guardian signature is recovered, because a caller screening a pool must not be able to
     ///   buy that work. The action's own `asset` word is deliberately not consulted: it is the
     ///   submitter's claim, and admission holds it to this very index
@@ -190,7 +191,10 @@ impl Ledger {
                     return None;
                 }
                 let (id, amount) = bridge_notes::attested_transfer(attestation)?;
-                let index = self.bridge()?.deposit_index(&id)?;
+                // A bridged holding's index is the token registry's, and an attestation naming a
+                // token nobody listed deposits nothing — `validate` refuses it outright
+                // (`BridgeError::UnlistedToken`), which is what makes a missing claim safe.
+                let index = self.bridge().and(self.tokens())?.get_by_id(&id)?.index;
                 Some(bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor))
             }
             _ => None,

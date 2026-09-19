@@ -91,6 +91,41 @@ pub struct TokensConfig {
     pub tokens: Vec<GenesisToken>,
 }
 
+/// The plain-bytes twin of [`TokensConfig`], used for the genesis commitment — exactly what
+/// [`BridgeCommit`] is to [`BridgeConfig`], and for the same reason.
+///
+/// [`GenesisToken::token`] serializes as 64 hex characters so the genesis file is editable, and
+/// `bincode` of that commits to the hex *string*: two files whose token bytes differ only in the
+/// case of their hex would commit differently, and — worse — the bytes the commitment covers
+/// would not be the bytes the chain runs on. The genesis hash commits to this struct instead,
+/// whose token is the 32 bytes themselves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokensCommit {
+    pub registration_fee: u64,
+    /// `(name, symbol, chain, token)` per listed token, in file order — which is registration
+    /// order, which is index order.
+    pub tokens: Vec<(String, String, u16, [u8; 32])>,
+}
+
+impl From<&TokensConfig> for TokensCommit {
+    /// Destructured on purpose, like [`BridgeCommit::from`]: a new [`TokensConfig`] or
+    /// [`GenesisToken`] field must not silently fall out of the genesis commitment — it has to
+    /// break this conversion.
+    fn from(cfg: &TokensConfig) -> TokensCommit {
+        let TokensConfig { registration_fee, tokens } = cfg;
+        TokensCommit {
+            registration_fee: *registration_fee,
+            tokens: tokens
+                .iter()
+                .map(|t| {
+                    let GenesisToken { name, symbol, chain, token } = t;
+                    (name.clone(), symbol.clone(), *chain, *token)
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Smallest `registration_fee` a `tokens` section may set, in RAND's base unit.
 pub const MIN_REGISTRATION_FEE: u64 = 1_000_000_000;
 /// Largest `registration_fee` a `tokens` section may set.
@@ -494,9 +529,12 @@ impl Genesis {
             commit.extend_from_slice(&bincode::serialize(&BridgeCommit::from(bridge)).expect("serializes"));
         }
         // RPL tokens, after the bridge bytes: appended only when the section is configured, so a
-        // chain without one hashes byte-for-byte as before.
+        // chain without one hashes byte-for-byte as before. `TokensCommit` is the plain-bytes
+        // twin of `TokensConfig`, whose own serde renders a token address as hex text — bincode
+        // of that would commit to hex *strings* rather than to the bytes the chain runs on,
+        // exactly as `BridgeCommit` exists for `BridgeConfig`.
         if let Some(tokens) = &self.tokens {
-            commit.extend_from_slice(&bincode::serialize(tokens).expect("serializes"));
+            commit.extend_from_slice(&bincode::serialize(&TokensCommit::from(tokens)).expect("serializes"));
         }
         // Block aggregation, likewise: appended only when the section is configured, so an
         // aggregation-less chain's genesis hash is byte-for-byte today's.
@@ -925,6 +963,66 @@ mod tests {
         let st = build(&tok);
         assert_ne!(st.ledger.state_root(), s.ledger.state_root());
         assert_ne!(st.hash(), s.hash(), "and so is the genesis hash");
+    }
+
+    /// The genesis hash commits to a listed token's 32 *bytes*, not to the hex string its serde
+    /// renders: `TokensCommit` is the plain-bytes twin `BridgeCommit` is for the bridge section.
+    /// Without it a one-byte change to a token address that happens to keep the same hex length
+    /// would still move the hash — bincode of a `String` does commit to its contents — but the
+    /// bytes covered would be the file's text rather than the chain's state, and a file written
+    /// with upper-case hex would hash as a different chain while building the identical one.
+    #[test]
+    fn the_genesis_hash_commits_to_a_listed_tokens_bytes_not_its_hex() {
+        let listing = |token: [u8; 32]| TokensConfig {
+            registration_fee: MIN_REGISTRATION_FEE,
+            tokens: vec![GenesisToken { name: "Tether USD".into(), symbol: "zUSDT".into(), chain: 2, token }],
+        };
+        let mut g = base_genesis();
+        g.bridge = Some(bridge_cfg());
+        g.tokens = Some(listing([0x11; 32]));
+        let base = build(&g).hash();
+
+        // One byte of the token address, and the genesis is a different chain.
+        let mut other_token = g.clone();
+        other_token.tokens = Some(listing({
+            let mut t = [0x11; 32];
+            t[31] = 0x12;
+            t
+        }));
+        assert_ne!(build(&other_token).hash(), base, "a token byte is committed");
+        // So are the rest of a listing's fields and the fee.
+        let mut other_chain = g.clone();
+        other_chain.tokens.as_mut().unwrap().tokens[0].chain = 3;
+        assert_ne!(build(&other_chain).hash(), base);
+        let mut other_symbol = g.clone();
+        other_symbol.tokens.as_mut().unwrap().tokens[0].symbol = "zUSDC".into();
+        assert_ne!(build(&other_symbol).hash(), base);
+        let mut other_name = g.clone();
+        other_name.tokens.as_mut().unwrap().tokens[0].name = "Tether".into();
+        assert_ne!(build(&other_name).hash(), base);
+        let mut other_fee = g.clone();
+        other_fee.tokens.as_mut().unwrap().registration_fee = MIN_REGISTRATION_FEE + 1;
+        assert_ne!(build(&other_fee).hash(), base);
+
+        // The twin is the bytes, not the text: the hex spelling is not what is hashed.
+        let commit = TokensCommit::from(g.tokens.as_ref().unwrap());
+        assert_eq!(commit.tokens[0].3, [0x11; 32]);
+        let bytes = bincode::serialize(&commit).unwrap();
+        assert!(
+            bytes.windows(32).any(|w| w == [0x11u8; 32]),
+            "the 32 bytes themselves are in the commitment"
+        );
+        assert!(
+            !bytes.windows(4).any(|w| w == b"1111"),
+            "and their hex spelling is not"
+        );
+
+        // And a chain with no `tokens` section hashes exactly as it did before this section
+        // existed: nothing is appended for it at all.
+        let plain = base_genesis();
+        let before = build(&plain).hash();
+        assert_eq!(build(&plain).hash(), before);
+        assert!(!plain.to_json().contains("tokens"));
     }
 
     /// A `bridge` section needs a `tokens` section (the RPL gate rides the same fork); and a

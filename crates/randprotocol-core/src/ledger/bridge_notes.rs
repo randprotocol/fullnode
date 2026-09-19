@@ -1,8 +1,9 @@
 //! The bridge as notes: `BridgeAttest` and `BridgeBurn` (phase S3, spec §10).
 //!
-//! A bridged holding on the shielded chain is a note whose `asset` word is the bridge
-//! registry's dense index for that asset, so the two bridge actions are the two places value
-//! crosses between the pool and the bridge:
+//! A bridged holding on the shielded chain is a note whose `asset` word is the token registry's
+//! dense index for that asset ([`super::tokens`], the one registry for bridged and native assets
+//! alike), so the two bridge actions are the two places value crosses between the pool and the
+//! bridge — and the two places a bridged token's `total_supply` moves:
 //!
 //! - **`BridgeAttest`** turns a guardian-signed transfer into one deposit note. The amount is
 //!   public in that transaction, like a `Mint` or a `Withdraw`; the note then sits in the tree
@@ -18,9 +19,10 @@
 //! The bridge's own public state lives in [`crate::bridge::BridgeState`] and is committed by
 //! the fifth component of the state root; this module is only the ledger's half.
 
+use super::tokens::{TokenError, TokenRegistry};
 use super::{Ledger, TxError};
 use crate::bridge::{
-    asset_id, Attestation, AssetId, AttestOutcome, AttestPlan, BridgeError, BridgeState, CheckedAttestation, Payload,
+    asset_id, Attestation, AssetId, AttestOutcome, AttestPlan, BridgeError, CheckedAttestation, Payload,
 };
 use crate::confidential::ConfidentialExecutor;
 use crate::notes::{Envelope, ShieldedAddress, Word8};
@@ -50,6 +52,11 @@ pub(super) fn validate(
             // `time` gets. A comparison, bought before an attestation buys any work.
             ledger.check_time(*time)?;
             let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
+            // The one asset registry (the RPL token standard). A chain with a `bridge` section
+            // always has a `tokens` section — genesis refuses the pair apart
+            // (`GenesisError::BridgeNeedsTokens`) — so this is the same "not on this chain"
+            // verdict as the line above, named for the half that is missing.
+            let tokens = ledger.tokens().ok_or(TxError::Token(TokenError::Disabled))?;
             // The `asset` compare, bought before the quorum. The action names the index its
             // envelope was sealed for, and `check_attest` below would not report it until after a
             // quorum of secp256k1 recoveries — which is exactly the cost that method's own
@@ -59,10 +66,11 @@ pub(super) fn validate(
             // screens pooled attests with (`Mempool::still_applies`).
             //
             // Silent on anything this pair cannot answer — a rotation, bytes that do not decode,
-            // an amount no note could hold, a full registry — each of which is `check_attest`'s
-            // refusal to make and reports a better error than a mismatched index would.
+            // an amount no note could hold, a token nobody listed — each of which is
+            // `check_attest`'s refusal to make and reports a better error than a mismatched index
+            // would.
             if let Some((id, _)) = attested_transfer(attestation) {
-                if let Some(index) = bridge.deposit_index(&id) {
+                if let Some(index) = tokens.get_by_id(&id).map(|info| info.index) {
                     if index != *asset {
                         return Err(TxError::AttestAssetMismatch { expected: index, actual: *asset });
                     }
@@ -71,18 +79,25 @@ pub(super) fn validate(
             // The attestation's size cap ran at step 1, before this decode. `check_attest` is
             // itself ordered cheap-before-expensive: it decodes, resolves the guardian set,
             // rejects a replayed digest and checks the payload before recovering a signature.
-            let checked = bridge.check_attest(attestation, ledger.now_secs()).map_err(TxError::Bridge)?;
+            let checked = bridge.check_attest(tokens, attestation, ledger.now_secs()).map_err(TxError::Bridge)?;
             if let AttestPlan::Transfer(t) = checked.plan() {
                 // Redundant by construction with the pre-screen above — both read the same asset
-                // id out of the same bytes and the same `next_index` — and kept because it is a
+                // id out of the same bytes and the same registry — and kept because it is a
                 // single integer compare and it is *this* index that `apply` stamps into the note
-                // (`AttestPlan::Transfer`'s own `info.index`). If the two paths ever drifted, a
+                // (`AttestPlan::Transfer`'s own `index`). If the two paths ever drifted, a
                 // deposit would land under a word the envelope was not sealed for, which is the
                 // whole failure this field exists to prevent; free is a good price for ruling it
-                // out. Nothing here changes which asset `apply` registers.
-                if t.info.index != *asset {
-                    return Err(TxError::AttestAssetMismatch { expected: t.info.index, actual: *asset });
+                // out.
+                if t.index != *asset {
+                    return Err(TxError::AttestAssetMismatch { expected: t.index, actual: *asset });
                 }
+                // The token's supply takes the gross amount at `apply`, so the one thing that
+                // could make that step fail is decided here instead: `apply` writes a deposit
+                // note before it credits the supply, and an overflow there would be a half-applied
+                // transaction. Checked, not saturating — a bridged supply that stopped counting
+                // would stop matching what the source chain has locked.
+                let supply = tokens.get(t.index).ok_or(TokenError::UnknownToken(t.index))?.total_supply;
+                supply.checked_add(t.amount).ok_or(TokenError::SupplyOverflow)?;
                 // The wire format has 32 bytes for a recipient and a shielded address is
                 // ~1.2 KB, so the depositor named a hash and this transaction carries the
                 // address. Without this equality the submitter would choose who receives it.
@@ -94,7 +109,7 @@ pub(super) fn validate(
                 // bundle keeps `validate` and `apply` in agreement — the mempool admits on
                 // `validate`, so a gap here would be a transaction that is accepted and then
                 // fails the block it lands in.
-                let cm = deposit_commitment(recipient, t.amount, t.info.index, *time, r, executor);
+                let cm = deposit_commitment(recipient, t.amount, t.index, *time, r, executor);
                 let in_fee_bundle = tx.bundle.as_ref().is_some_and(|b| b.commitments.contains(&cm));
                 if ledger.has_commitment(&cm) || in_fee_bundle {
                     return Err(TxError::CommitmentExists(cm));
@@ -104,6 +119,7 @@ pub(super) fn validate(
         }
         Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to } => {
             let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
+            let tokens = ledger.tokens().ok_or(TxError::Token(TokenError::Disabled))?;
             // Cheap before expensive (spec §7), and across *both* bundles: everything here is
             // a comparison or a set lookup, and it all runs before either bundle's proof is
             // verified — the fee bundle's at step 9 of `validate_inner`, the asset bundle's at
@@ -135,7 +151,14 @@ pub(super) fn validate(
                 }
             }
             ledger.check_bundle(asset_bundle)?;
-            bridge.check_burn(*asset, *amount, *to_chain, to, *relayer_fee).map_err(TxError::Bridge)?;
+            bridge.check_burn(tokens, *asset, *amount, *to_chain, to, *relayer_fee).map_err(TxError::Bridge)?;
+            // The debit `apply` makes, decided here for the same reason the deposit's credit is:
+            // apply writes the asset bundle's notes before it touches the supply. A burn of more
+            // than the token's whole supply is a chain that would owe the source contract more
+            // than it ever locked, so it is refused rather than clamped. Still a comparison, and
+            // still before the asset bundle's proof.
+            let supply = tokens.get(*asset).ok_or(TokenError::UnknownToken(*asset))?.total_supply;
+            supply.checked_sub(*amount).ok_or(TokenError::SupplyUnderflow)?;
             ledger.check_bundle_proof(asset_bundle, executor)?;
             Ok(None)
         }
@@ -162,13 +185,21 @@ pub(super) fn apply(
         Action::BridgeAttest { recipient, r, time, .. } => {
             let checked = checked.expect("validate returns the checked attestation for an attest");
             let bridge = ledger.bridge_mut().ok_or(TxError::Bridge(BridgeError::Disabled))?;
-            // Consumes the digest and registers the asset if this is its first sighting. No
-            // signature work: the quorum was verified once, in `validate`, and this is the
-            // token that proves it.
+            // Consumes the digest. It registers nothing — a bridged token is listed before any
+            // attestation of it is admissible — and does no signature work: the quorum was
+            // verified once, in `validate`, and this is the token that proves it.
             match bridge.apply_attest(checked) {
                 AttestOutcome::Minted(t) => {
-                    let cm = deposit_commitment(recipient, t.amount, t.info.index, *time, r, executor);
+                    let cm = deposit_commitment(recipient, t.amount, t.index, *time, r, executor);
                     ledger.deposit(cm, executor)?;
+                    // The deposited note is new supply of that token: the gross amount the
+                    // guardians signed, which is what the note carries (the relayer fee is a
+                    // portion of it and is paid on the far side). `validate` ruled out the
+                    // overflow, so this cannot fail on a transaction that was admitted.
+                    ledger
+                        .tokens_mut()
+                        .ok_or(TxError::Token(TokenError::Disabled))?
+                        .add_supply(t.index, t.amount)?;
                 }
                 // Governance only: a rotation moves guardian keys and no value.
                 AttestOutcome::GuardianSetUpgraded(_) => {}
@@ -183,12 +214,21 @@ pub(super) fn apply(
             ledger.apply_bundle_notes(asset_bundle, executor);
             let (height, timestamp) = (ledger.height(), ledger.now_secs() as u32);
             let tx_hash = tx.hash();
-            let bridge = ledger.bridge_mut().ok_or(TxError::Bridge(BridgeError::Disabled))?;
+            // The bridge to write and the registry to read in one borrow: the outbound message's
+            // `(chain, token)` is the burned token's own mint authority.
+            let (bridge, tokens) = ledger.bridge_and_tokens_mut()?;
             // The record's sender slot is the transaction hash: a burn is funded by notes, so
             // there is no sender identity to write there.
             bridge
-                .apply_burn(tx_hash, *asset, *amount, *to_chain, *to, *relayer_fee, height, timestamp)
+                .apply_burn(tokens, tx_hash, *asset, *amount, *to_chain, *to, *relayer_fee, height, timestamp)
                 .map_err(TxError::Bridge)?;
+            // What the asset bundle destroyed leaves the token's supply, so a bridged token's
+            // `total_supply` stays equal to what the source chain holds locked. `validate` ruled
+            // out the underflow, so this cannot fail on a transaction that was admitted.
+            ledger
+                .tokens_mut()
+                .ok_or(TxError::Token(TokenError::Disabled))?
+                .sub_supply(*asset, *amount)?;
             Ok(())
         }
         _ => Err(TxError::UnsupportedAction("bridge")),
@@ -245,23 +285,26 @@ pub fn attested_transfer(attestation: &[u8]) -> Option<(AssetId, u64)> {
 /// amount or the owner. A node that indexes every note for wallets to scan has to compute it
 /// the same way, and this is that one function.
 ///
-/// `bridge` may be the state from either side of the transaction: an asset index is assigned
-/// once and never changes, so the registry *after* the attestation answers exactly as the
-/// registry before it did.
+/// `tokens` may be the registry from either side of the transaction: a listed token's index is
+/// assigned once and never changes, and an attestation registers nothing, so the registry
+/// *after* the attestation answers exactly as the registry before it did.
+///
+/// It takes the registry rather than the bridge because that is where a note's `asset` word now
+/// comes from (the RPL token standard); the bridge holds no registry of its own to consult.
 ///
 /// `None` for any other action, and for an attestation that deposits nothing (a rotation) or
 /// that does not decode — the latter being a torn block, not a live possibility, for a
 /// transaction that was committed.
 pub fn deposit_note(
     tx: &Transaction,
-    bridge: &BridgeState,
+    tokens: &TokenRegistry,
     executor: &dyn ConfidentialExecutor,
 ) -> Option<(Word8, Envelope)> {
     let Action::BridgeAttest { attestation, recipient, r, time, asset: _, envelope } = &tx.action else {
         return None;
     };
     let (asset, amount) = attested_transfer(attestation)?;
-    let index = bridge.asset_index(&asset)?;
+    let index = tokens.get_by_id(&asset)?.index;
     Some((deposit_commitment(recipient, amount, index, *time, r, executor), envelope.clone()))
 }
 
@@ -280,10 +323,12 @@ mod tests {
     use crate::ledger::ValidatorEntry;
 
     const HC: Word8 = [11; 8];
-    /// The canonical test token, native to chain 2, which registers as asset index 1.
+    /// The canonical test token, native to chain 2, listed at genesis as asset index 1.
     const TOKEN: [u8; 32] = [0xaa; 32];
-    /// A second token of the same chain, for the two-first-sightings race.
+    /// A second token of the same chain, listed second and so asset index 2.
     const OTHER_TOKEN: [u8; 32] = [0xbb; 32];
+    /// A chain-2 token that is deliberately *not* listed, for the refusal an unlisted token gets.
+    const UNLISTED_TOKEN: [u8; 32] = [0xcc; 32];
     /// A well-formed EVM burn destination: 12 zero bytes then 20 address bytes (spec 3.5).
     const EVM_TO: [u8; 32] = {
         let mut t = [0u8; 32];
@@ -315,6 +360,27 @@ mod tests {
         (config, secrets)
     }
 
+    /// The registry a bridged chain's genesis leaves behind: [`TOKEN`] at index 1 and
+    /// [`OTHER_TOKEN`] at index 2, both `Bridge`-authority tokens of chain 2 at eight decimals.
+    /// [`UNLISTED_TOKEN`] is deliberately absent — listing is what makes a token depositable.
+    fn token_registry() -> TokenRegistry {
+        let mut t = TokenRegistry::new(1_000_000_000);
+        for (i, token) in [TOKEN, OTHER_TOKEN].into_iter().enumerate() {
+            let index = t
+                .register(
+                    asset_id(2, &token),
+                    "Tether USD".into(),
+                    "zUSDT".into(),
+                    8,
+                    crate::ledger::tokens::MintAuthority::Bridge { chain: 2, token },
+                    0,
+                )
+                .expect("a fresh listing");
+            assert_eq!(index as usize, i + 1, "listing order is index order");
+        }
+        t
+    }
+
     /// A ledger at height 1 with a bridge, and the guardian secrets that can attest to it.
     fn ledger() -> (Ledger, Vec<[u8; 32]>) {
         let k = proposer();
@@ -331,6 +397,9 @@ mod tests {
         let mut l = Ledger::new(7, HC, [(k.address(), entry)].into_iter().collect(), &StubExecutor);
         let (config, secrets) = cfg();
         l.set_bridge(Some(BridgeState::from_config(&config)));
+        // A bridge without a token registry can deposit nothing: the two sections ride the same
+        // genesis gate, and the index a note carries is the registry's.
+        l.set_tokens(Some(token_registry()));
         l.set_height(1);
         l.set_timestamp_ms(1_000_000);
         (l, secrets)
@@ -409,11 +478,12 @@ mod tests {
     }
 
     /// The `asset` word an honest submitter fills in: the index the registry says this
-    /// attestation's token deposits under, or 0 for a rotation, which deposits nothing and binds
-    /// no index.
+    /// attestation's token deposits under, or 0 for a rotation (which deposits nothing and binds
+    /// no index) and for a token nobody listed (which deposits nothing either — the attestation
+    /// is refused).
     fn expected_index(l: &Ledger, attestation: &[u8]) -> u32 {
         attested_transfer(attestation)
-            .and_then(|(asset, _)| l.bridge().and_then(|b| b.deposit_index(&asset)))
+            .and_then(|(asset, _)| l.tokens().and_then(|t| t.get_by_id(&asset)).map(|info| info.index))
             .unwrap_or(0)
     }
 
@@ -444,7 +514,7 @@ mod tests {
         tx
     }
 
-    /// Applies one attestation of `amount` to `recipient()`, registering [`TOKEN`] as asset 1.
+    /// Applies one attestation of `amount` of [`TOKEN`] — asset 1 — to `recipient()`.
     fn deposit(l: &mut Ledger, secrets: &[[u8; 32]], amount: u128, sequence: u64, seed: u32) -> Transaction {
         let a = attest(secrets, transfer(amount, 0, recipient().recipient_hash(), sequence));
         let tx = attest_tx(l, a, recipient(), seed);
@@ -458,17 +528,20 @@ mod tests {
     }
 
     /// The whole deposit path: the guardians' amount, the registry's index and the recipient's
-    /// key become one note the recipient can recompute and find in the tree.
+    /// key become one note the recipient can recompute and find in the tree — and the token's
+    /// supply moves by the gross amount, so what this chain says exists equals what the source
+    /// chain has locked.
     #[test]
     fn an_attestation_deposits_a_note_the_recipient_can_check() {
         let (mut l, secrets) = ledger();
+        assert_eq!(l.tokens().unwrap().get(1).unwrap().total_supply, 0, "nothing bridged yet");
         let tx = deposit(&mut l, &secrets, 1_000, 0, 20);
         let cm = expected_cm(1, 1_000, 1);
         assert!(l.has_commitment(&cm), "the deposit note is in the tree");
         // The fee bundle's two notes plus the deposit note.
         assert_eq!(l.next_index(), 3);
+        assert_eq!(l.tokens().unwrap().get(1).unwrap().total_supply, 1_000, "the gross amount is new supply");
         let bridge = l.bridge().unwrap();
-        assert_eq!(bridge.asset_index(&asset_id(2, &TOKEN)), Some(1), "first sighting registers the asset");
         assert_eq!(bridge.spent.len(), 1, "the digest is consumed");
         // The relayer fee has no payee on a shielded chain, so the gross amount is deposited:
         // a second attestation of the same amount with a fee produces the same note.
@@ -500,7 +573,7 @@ mod tests {
         assert!(!l.has_commitment(&expected_cm(9, 1_000, 1)), "and not the one the apply height would");
         // The recompute-after-the-fact path reads the same word off the committed action, so a
         // node's note index agrees with the tree whatever height it asks about.
-        let (cm, _) = deposit_note(&tx, l.bridge().unwrap(), &StubExecutor).expect("a transfer deposits a note");
+        let (cm, _) = deposit_note(&tx, l.tokens().unwrap(), &StubExecutor).expect("a transfer deposits a note");
         assert_eq!(cm, expected_cm(5, 1_000, 1));
     }
 
@@ -576,8 +649,8 @@ mod tests {
     fn a_deposit_note_is_recomputable_from_the_committed_transaction() {
         let (mut l, secrets) = ledger();
         let tx = deposit(&mut l, &secrets, 1_000, 0, 20);
-        let bridge = l.bridge().unwrap();
-        let (cm, envelope) = deposit_note(&tx, bridge, &StubExecutor).expect("a transfer deposits a note");
+        let tokens = l.tokens().unwrap();
+        let (cm, envelope) = deposit_note(&tx, tokens, &StubExecutor).expect("a transfer deposits a note");
         assert_eq!(cm, expected_cm(1, 1_000, 1));
         assert!(l.has_commitment(&cm));
         assert_eq!(envelope, env(), "paired with the envelope that opens it");
@@ -597,9 +670,9 @@ mod tests {
             .encode(),
         };
         let upgrade = attest_tx(&l, attest(&secrets, rotation), recipient(), 30);
-        assert_eq!(deposit_note(&upgrade, bridge, &StubExecutor), None);
+        assert_eq!(deposit_note(&upgrade, tokens, &StubExecutor), None);
         let plain = Transaction { chain_id: 7, bundle: None, action: Action::None };
-        assert_eq!(deposit_note(&plain, bridge, &StubExecutor), None);
+        assert_eq!(deposit_note(&plain, tokens, &StubExecutor), None);
     }
 
     /// The 32-byte `to` field binds the deposit to one shielded address. A submitter who swaps
@@ -621,8 +694,8 @@ mod tests {
     fn an_attest_with_the_wrong_asset_index_is_refused() {
         let (mut l, secrets) = ledger();
         deposit(&mut l, &secrets, 1_000, 0, 20);
-        // A second transfer of the same, now registered, token: index 1 for as long as the chain
-        // exists, which is what makes every other index a mistake rather than a race.
+        // A second transfer of the same listed token: index 1 for as long as the chain exists,
+        // which is what makes every other index a mistake rather than a race.
         let a = attest(&secrets, transfer(500, 0, recipient().recipient_hash(), 1));
         let honest = attest_tx(&l, a, recipient(), 30);
         assert_eq!(l.validate(&honest, &StubExecutor), Ok(()));
@@ -646,7 +719,7 @@ mod tests {
     /// back as a mismatched index, which is only possible if the compare happens before the quorum
     /// is verified. `BridgeState::check_attest`'s contract is that nothing unverified buys a round
     /// of secp256k1 recoveries, and resolving the index needs no signature work at all — the wire
-    /// bytes and the registry answer it (`attested_transfer` + `BridgeState::deposit_index`).
+    /// bytes and the registry answer it (`attested_transfer` + `TokenRegistry::get_by_id`).
     ///
     /// The second half is what makes the first half meaningful: the *same* transaction with the
     /// right index goes on to fail on the quorum, so the ordering is what the two answers differ
@@ -666,58 +739,64 @@ mod tests {
             matches!(l.validate(&tx, &StubExecutor), Err(TxError::Bridge(BridgeError::Verify(_)))),
             "and with the index right, the quorum is what is left to refuse it"
         );
-        // A first sighting is screened the same way, off `next_index` rather than an entry: no
-        // registry row exists for this token, and still no signature is recovered to say so.
+        // The second listed token is screened the same way, off its own row: index 2 is the one
+        // the listing gave it, and still no signature is recovered to say so.
         let other = misattest(transfer_of(OTHER_TOKEN, 700, 0, recipient().recipient_hash(), 2));
         let tx = attest_tx(&l, other, recipient(), 40);
         assert_eq!(
             l.validate(&naming_asset(tx.clone(), 1), &StubExecutor),
             Err(TxError::AttestAssetMismatch { expected: 2, actual: 1 }),
-            "index 1 is taken; a new token gets next_index"
+            "index 1 is the first listing's; this token was listed second"
         );
         assert!(matches!(l.validate(&tx, &StubExecutor), Err(TxError::Bridge(BridgeError::Verify(_)))));
     }
 
-    /// A first sighting is the one case the index is a *prediction*: the ledger hands the token
-    /// the registry's `next_index` as it stands when the transaction is applied. The action names
-    /// the number it sealed for, and admission holds it to exactly that — so the wallet that
-    /// loses a race to another first sighting pays a fee bundle and re-proves instead of leaving
-    /// the recipient a leaf no key opens.
+    /// The rule this task installs, from the ledger's side: a bridged token is listed before any
+    /// attestation of it is admissible, so an unlisted `(chain, token)` pair is refused outright
+    /// rather than registered on sight. Nothing is deposited, no digest is consumed, and no index
+    /// is invented — which is what removes the first-sighting race the `asset` word used to have
+    /// to survive: a listed token's index is decided before the transaction exists and cannot be
+    /// taken from it while its bundle is being proved.
     #[test]
-    fn a_first_sighting_attest_binds_the_index_it_will_be_assigned() {
+    fn an_attestation_of_an_unlisted_token_is_refused_and_registers_nothing() {
         let (mut l, secrets) = ledger();
-        // Nothing is registered, so this transfer's note will be asset 1 (`FIRST_ASSET_INDEX`).
-        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
-        let pending = attest_tx(&l, a, recipient(), 40);
-        assert_eq!(
-            l.validate(&naming_asset(pending.clone(), 2), &StubExecutor),
-            Err(TxError::AttestAssetMismatch { expected: 1, actual: 2 }),
-            "next_index + 1 is not what registration will assign"
-        );
-        assert_eq!(l.validate(&pending, &StubExecutor), Ok(()));
+        let a = attest(&secrets, transfer_of(UNLISTED_TOKEN, 1_000, 0, recipient().recipient_hash(), 0));
+        // `attest_tx` fills in the index the registry names, which for an unlisted token is 0 —
+        // no row, no index — so the transaction is what an honest wallet could build at all.
+        let tx = attest_tx(&l, a, recipient(), 40);
+        let unlisted = Err(TxError::Bridge(BridgeError::UnlistedToken { chain: 2, token: UNLISTED_TOKEN }));
+        assert_eq!(l.validate(&tx, &StubExecutor), unlisted);
+        // Naming a listed token's index does not help: the attestation's own pair is what is
+        // resolved, and it is still unlisted.
+        assert_eq!(l.validate(&naming_asset(tx.clone(), 1), &StubExecutor), unlisted);
 
-        // Another token's first sighting commits in the window the first was being proved in, and
-        // takes index 1.
-        let other = attest(&secrets, transfer_of(OTHER_TOKEN, 700, 0, recipient().recipient_hash(), 1));
-        let winner = attest_tx(&l, other, recipient(), 50);
-        l.apply_tx(&winner, &proposer().address(), &StubExecutor).unwrap();
-        let bridge = l.bridge().unwrap();
-        assert_eq!(bridge.asset_index(&asset_id(2, &OTHER_TOKEN)), Some(1), "the race winner took 1");
-        assert_eq!(bridge.asset_index(&asset_id(2, &TOKEN)), None, "and the loser is still unregistered");
+        let mu = tx.bridge_digests()[0];
+        let mut scratch = l.clone();
+        assert_eq!(scratch.apply_tx(&tx, &proposer().address(), &StubExecutor).map(|_| ()), unlisted);
+        assert!(!scratch.is_digest_spent(&mu), "the attestation is unconsumed");
+        assert_eq!(scratch.tokens().unwrap().len(), 2, "and nothing was registered on sight");
+        assert!(scratch.tokens().unwrap().get_by_id(&asset_id(2, &UNLISTED_TOKEN)).is_none());
 
-        // The pending transaction named 1 and would now be given 2. This is the refusal the field
-        // exists for: without it the chain would append a note under asset 2 while the envelope
-        // was sealed for asset 1.
-        assert_eq!(
-            l.validate(&pending, &StubExecutor),
-            Err(TxError::AttestAssetMismatch { expected: 2, actual: 1 })
-        );
-        // Re-sealed and re-proved against the registry as it now stands, the same deposit lands.
-        let reproved = naming_asset(pending, 2);
-        assert_eq!(l.validate(&reproved, &StubExecutor), Ok(()));
-        l.apply_tx(&reproved, &proposer().address(), &StubExecutor).unwrap();
-        assert!(l.has_commitment(&expected_cm(1, 1_000, 2)), "the note the action named");
-        assert_eq!(l.bridge().unwrap().asset_index(&asset_id(2, &TOKEN)), Some(2));
+        // Listed — as genesis or a governance message would — the very same attestation deposits
+        // under the index the listing gave it, with no re-proof and no race.
+        let index = l
+            .tokens_mut()
+            .unwrap()
+            .register(
+                asset_id(2, &UNLISTED_TOKEN),
+                "Late Coin".into(),
+                "zLATE".into(),
+                8,
+                crate::ledger::tokens::MintAuthority::Bridge { chain: 2, token: UNLISTED_TOKEN },
+                1,
+            )
+            .unwrap();
+        assert_eq!(index, 3);
+        let listed = naming_asset(tx, 3);
+        assert_eq!(l.validate(&listed, &StubExecutor), Ok(()));
+        l.apply_tx(&listed, &proposer().address(), &StubExecutor).unwrap();
+        assert!(l.has_commitment(&expected_cm(1, 1_000, 3)), "the note the listing's index names");
+        assert_eq!(l.tokens().unwrap().get(3).unwrap().total_supply, 1_000);
     }
 
     /// A digest is spendable once: the same attestation resubmitted — in a fresh transaction,
@@ -840,6 +919,9 @@ mod tests {
         deposit(&mut l, &secrets, 1_000, 0, 20);
         let t = burn_tx(&l, 1, 400, 100, |_| {});
         l.apply_tx(&t, &proposer().address(), &StubExecutor).unwrap();
+        // What the asset bundle destroyed leaves the token's supply, so the registry keeps saying
+        // what the source chain still holds locked: 1 000 deposited, 400 burned.
+        assert_eq!(l.tokens().unwrap().get(1).unwrap().total_supply, 600);
         for nf in [[40; 8], [41; 8], [44; 8], [45; 8]] {
             assert!(l.is_spent(&nf), "{nf:?} is spent");
         }
@@ -880,6 +962,39 @@ mod tests {
         let Ok(Payload::Transfer(sent)) = Payload::decode(&body.payload) else { panic!("a transfer") };
         assert_eq!(sent.amount_u128(), Some(400), "what left the pool is what the far side releases");
         assert_eq!(sent.fee_u128(), Some(100), "and the relayer is paid out of it, not on top of it");
+    }
+
+    /// A burn cannot destroy more of a token than the bridge ever deposited: the registry's
+    /// `total_supply` is what this chain says the source contract has locked, and a burn past it
+    /// would ask the far side to release value it never took in. Refused in `validate` — so
+    /// `apply` never half-applies one — and refused for a token that is registered but not
+    /// bridged, which has no home chain to release on at all.
+    #[test]
+    fn a_burn_cannot_outrun_the_tokens_supply_or_name_a_token_that_is_not_bridged() {
+        let (mut l, secrets) = ledger();
+        deposit(&mut l, &secrets, 1_000, 0, 20);
+        let over = burn_tx(&l, 1, 1_001, 0, |_| {});
+        assert_eq!(l.validate(&over, &StubExecutor), Err(TxError::Token(TokenError::SupplyUnderflow)));
+
+        // A `Key`-authority token — a native RPL token, no bridge behind it — is no asset of this
+        // bridge's: `check_burn` resolves the outbound message's `(chain, token)` from a
+        // `MintAuthority::Bridge` and there is none, so the index names nothing it can send.
+        let pk = crate::crypto::Keypair::from_seed([9; 32]).unwrap().public_key().clone();
+        let native = crate::ledger::tokens::native_asset_id("Native", "NTV", 9, &crate::ledger::tokens::MintAuthority::Key(pk.clone()), 0, &[7; 32]);
+        let index = l
+            .tokens_mut()
+            .unwrap()
+            .register(native, "Native".into(), "NTV".into(), 9, crate::ledger::tokens::MintAuthority::Key(pk), 1)
+            .unwrap();
+        l.tokens_mut().unwrap().add_supply(index, 5_000).unwrap();
+        let t = burn_tx(&l, index, 400, 0, |_| {});
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::Bridge(BridgeError::UnknownAsset)));
+
+        // Exactly the bridged token's supply is fine, and leaves it at zero.
+        let all = burn_tx(&l, 1, 1_000, 0, |_| {});
+        assert_eq!(l.validate(&all, &StubExecutor), Ok(()));
+        l.apply_tx(&all, &proposer().address(), &StubExecutor).unwrap();
+        assert_eq!(l.tokens().unwrap().get(1).unwrap().total_supply, 0);
     }
 
     /// Both actions are inadmissible on a chain whose genesis has no `bridge` section, and
