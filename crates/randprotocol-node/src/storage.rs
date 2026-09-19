@@ -306,6 +306,26 @@ fn created_notes(
                 out.push((asset_bundle.commitments[i], asset_bundle.envelopes[i].clone()));
             }
         }
+        // RPL (spec §4): a minted note is chain-computed exactly as a bridge deposit is, so it is
+        // not on the wire either and has to be recomputed here — from the action's own public
+        // fields alone, with no registry lookup: a mint names its asset index and a registration
+        // names the index it was held to (`TokenError::IndexMismatch`), so both are facts on a
+        // *committed* transaction. A registration without an initial mint creates no note.
+        Action::TokenMint { asset, amount, recipient, r, time, envelope, .. } => {
+            let cm = randprotocol_core::ledger::tokens::mint_commitment(recipient, *amount, *asset, *time, r, executor);
+            out.push((cm, envelope.clone()));
+        }
+        Action::RegisterToken { initial: Some(m), index, .. } => {
+            let cm = randprotocol_core::ledger::tokens::mint_commitment(
+                &m.recipient,
+                m.amount,
+                *index,
+                m.time,
+                &m.r,
+                executor,
+            );
+            out.push((cm, m.envelope.clone()));
+        }
         _ => {}
     }
     Ok(out)
@@ -338,6 +358,11 @@ pub fn derived_note_count(tx: &randprotocol_core::Transaction) -> usize {
         Action::BridgeAttest { attestation, .. } => {
             usize::from(randprotocol_core::ledger::bridge_notes::attested_transfer(attestation).is_some())
         }
+        // RPL: the minted note `created_notes` recomputes above — one per `TokenMint`, one per
+        // registration that carries an initial mint, none for a registration without one. Get
+        // this wrong and every wallet leaf index after the transaction slides.
+        Action::TokenMint { .. } => 1,
+        Action::RegisterToken { initial, .. } => usize::from(initial.is_some()),
         _ => 0,
     }
 }

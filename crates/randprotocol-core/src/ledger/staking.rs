@@ -198,6 +198,17 @@ impl Ledger {
                 let index = self.bridge().and(self.tokens())?.bridged(chain, &token)?.index;
                 Some(bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor))
             }
+            // RPL's two minting actions (spec §4), which derive their note the same way and from
+            // the action alone: the recipient, the amount, the index and the blinding are all on
+            // the wire, and the chain computes the leaf from them. A registration's index is the
+            // one it claims — admission holds it to the registry's next index, so a pooled
+            // registration claims exactly the note it would create.
+            Action::TokenMint { asset, amount, recipient, r, time, .. } => {
+                Some(super::tokens::mint_commitment(recipient, *amount, *asset, *time, r, executor))
+            }
+            Action::RegisterToken { initial: Some(m), index, .. } => {
+                Some(super::tokens::mint_commitment(&m.recipient, m.amount, *index, m.time, &m.r, executor))
+            }
             _ => None,
         }
     }

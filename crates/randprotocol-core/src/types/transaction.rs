@@ -2,9 +2,10 @@
 
 use crate::bridge::{digest as attestation_digest, Attestation};
 use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
+use crate::ledger::tokens::MintAuthority;
 use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8};
 use crate::program::ProgramId;
-use crate::types::actions::{AggregatorRegistration, CallEnvelope, Registration, SignedAggregateHeader};
+use crate::types::actions::{AggregatorRegistration, CallEnvelope, InitialMint, Registration, SignedAggregateHeader};
 use serde::{Deserialize, Serialize};
 
 /// Native token symbol. The whitepaper (Draft 3) calls this RAND; rename here if needed.
@@ -199,6 +200,61 @@ pub enum Action {
         envelope: Envelope,
         signature: Signature,
     },
+    /// RPL (spec §4): create a token. Permissionless — anyone who pays the bundle base plus the
+    /// registry's `registration_fee` gets the next dense index — and content-addressed: the
+    /// token's [`AssetId`] is `native_asset_id(name, symbol, decimals, authority, initial.amount,
+    /// salt)`, so the same declaration twice is the same asset and the second is refused.
+    ///
+    /// `authority` may only be [`MintAuthority::None`] (fixed supply, which then *must* carry an
+    /// `initial`) or [`MintAuthority::Key`]: a bridged token is listed by genesis or governance
+    /// and `Program` is reserved, so both are `TokenError::AuthorityNotAllowed` here.
+    ///
+    /// `index` is the registry index the creator sealed `initial`'s envelope for — the note's
+    /// `asset` word — and it is on the action for [`Action::BridgeAttest`]'s reason, one step
+    /// further along: unlike a listed bridged token's index, this one is *not* yet a fact when
+    /// the transaction is built, because another registration can commit while this one's bundle
+    /// is being proved. A mismatch with the registry's next index is `TokenError::IndexMismatch`,
+    /// checked whether or not there is an `initial`, so a lost race costs a re-proof and never
+    /// strands a note nobody can open. It is deliberately not part of the asset id: the identity
+    /// is what was declared, not where it landed.
+    ///
+    /// [`AssetId`]: crate::bridge::AssetId
+    /// [`MintAuthority::None`]: crate::ledger::tokens::MintAuthority::None
+    /// [`MintAuthority::Key`]: crate::ledger::tokens::MintAuthority::Key
+    RegisterToken {
+        name: String,
+        symbol: String,
+        decimals: u8,
+        authority: MintAuthority,
+        initial: Option<InitialMint>,
+        salt: [u8; 32],
+        index: u32,
+    },
+    /// RPL (spec §4): mint `amount` of token `asset` to `recipient`, by its `Key` mint authority.
+    ///
+    /// The note is the chain's to compute, exactly as a bridge deposit's is
+    /// (`ledger::tokens::mint_commitment`), and `signature` is the authority's over
+    /// [`crate::types::actions::token_mint_message`] — which carries that very commitment, so the
+    /// leaf the ledger appends is the leaf the authority signed for. `nonce` is the token's own
+    /// `mint_nonce`, the whole of the replay protection: there are no accounts on this chain.
+    ///
+    /// `time` is the note's `time` word, chosen by the minter and held to the usual window, for
+    /// [`InitialMint`]'s reason.
+    TokenMint {
+        asset: u32,
+        amount: u64,
+        recipient: ShieldedAddress,
+        r: Word8,
+        time: u32,
+        envelope: Envelope,
+        nonce: u64,
+        signature: Signature,
+    },
+    /// RPL (spec §4): hand token `asset` to another key, or — with `new: None` — retire minting
+    /// for good. Signed by the token's **current** `Key` authority over
+    /// [`crate::types::actions::set_authority_message`]; any other authority kind is
+    /// `TokenError::NotKeyAuthority`, which makes a renunciation final.
+    SetAuthority { asset: u32, new: Option<PublicKey>, nonce: u64, signature: Signature },
 }
 
 impl Action {
@@ -350,9 +406,12 @@ impl Transaction {
     /// Every note commitment this transaction creates: the bundle's two output slots in order,
     /// then a mint's note, then — for a `BridgeBurn` — the asset bundle's two slots.
     ///
-    /// A `Withdraw`'s and a `BridgeAttest`'s deposit notes are deliberately absent: their
-    /// commitment is not carried on the wire at all, it is computed by the ledger from the
-    /// action's `r` and the amount it is paying out (spec §7).
+    /// A `Withdraw`'s and a `BridgeAttest`'s deposit notes are deliberately absent — and so are
+    /// RPL's two minted ones, a `TokenMint`'s and a `RegisterToken`'s `initial`: their commitment
+    /// is not carried on the wire at all, it is computed by the ledger from the action's `r` and
+    /// the amount it is paying out (spec §7). `Ledger::derived_commitment` is where a caller that
+    /// needs them — the mempool's conflict index — gets them, and the node's `created_notes` is
+    /// where the note index recomputes them for a committed block.
     pub fn commitments(&self) -> Vec<Word8> {
         let mut v: Vec<Word8> = self.bundle.as_ref().map_or(Vec::new(), |b| b.commitments.to_vec());
         match &self.action {

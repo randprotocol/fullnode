@@ -128,6 +128,30 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | A::CoverSealed(_)
         );
     }
+    // The RPL registry's verdicts, split the same way: only the ones a transaction's *own bytes*
+    // decide are cacheable — the metadata rules (`BadName`, `BadSymbol`, `TooManyDecimals`), the
+    // authority kind a registration may choose, a fixed-supply registration with no initial mint,
+    // and a zero amount. Everything else is a statement about this node's registry at this
+    // moment: `BadNonce`, `UnknownToken`, `AlreadyRegistered`, `IndexMismatch`, `SupplyOverflow`,
+    // `Disabled`, `RegistrationFeeTooLow` and `NotKeyAuthority` all move as blocks arrive, and a
+    // node one block behind would poison itself against transactions that are about to be valid.
+    //
+    // `BadSignature` is deliberately **not** here, unlike the staking and aggregation registers':
+    // there the key is the address, so no state can turn a bad signature good, but a token's mint
+    // authority is state — a `SetAuthority` hands it to another key — so the very same bytes are
+    // refused before that rotation commits and accepted after it.
+    if let TxError::Token(t) = e {
+        use randprotocol_core::ledger::tokens::TokenError as T;
+        return matches!(
+            t,
+            T::BadName
+                | T::BadSymbol
+                | T::TooManyDecimals(_)
+                | T::AuthorityNotAllowed
+                | T::InitialMintRequired
+                | T::ZeroAmount
+        );
+    }
     matches!(
         e,
         // The proofs and the digest are over the transaction's own fields.

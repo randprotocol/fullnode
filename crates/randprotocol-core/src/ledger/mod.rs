@@ -981,6 +981,16 @@ impl Ledger {
             Action::BridgeBurn { asset_bundle, .. } if asset_bundle.proof.len() > self.max_proof_bytes => {
                 return Err(TxError::ProofTooLarge)
             }
+            // RPL: the envelope sealed against a minted note is a note envelope like any other,
+            // and gets the cap every note envelope gets. The rest of a token action's
+            // variable-length fields — name, symbol, salt — are bounded by `check_metadata` at
+            // step 7, which costs two length compares.
+            Action::TokenMint { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
+                return Err(TxError::EnvelopeTooLarge)
+            }
+            Action::RegisterToken { initial: Some(m), .. } if m.envelope.len() > MAX_ENVELOPE_BYTES => {
+                return Err(TxError::EnvelopeTooLarge)
+            }
             _ => {}
         }
         // Every variable-length field that reaches a node before any signature or proof work is
@@ -1092,6 +1102,11 @@ impl Ledger {
             | Action::WithdrawAggregator { .. }
             | Action::SlashAggregator { .. }) => {
                 aggregation::validate(self, tx, a, executor)?;
+            }
+            // RPL (spec §4). Gated absolutely on the `tokens` genesis section, which
+            // `tokens::validate` checks before anything else it does.
+            a @ (Action::RegisterToken { .. } | Action::TokenMint { .. } | Action::SetAuthority { .. }) => {
+                tokens::validate(self, tx, a, executor)?;
             }
             Action::Aggregate { .. } => {
                 // The covered bundles' records live in node storage, which the ledger cannot
@@ -1227,6 +1242,9 @@ impl Ledger {
             | Action::WithdrawAggregator { .. }
             | Action::SlashAggregator { .. }) => {
                 aggregation::apply(self, tx, a, proposer, executor)?;
+            }
+            a @ (Action::RegisterToken { .. } | Action::TokenMint { .. } | Action::SetAuthority { .. }) => {
+                tokens::apply(self, tx, a, executor)?;
             }
             Action::Aggregate { .. } => {
                 // Unreachable through `validate_inner` (its action arm refuses first); named

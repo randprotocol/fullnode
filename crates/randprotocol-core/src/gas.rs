@@ -165,6 +165,13 @@ pub fn fee_floor(action: &Action) -> u64 {
         | Action::WithdrawAggregator { .. }
         | Action::SlashAggregator { .. }
         | Action::Aggregate { .. } => 0,
+        // RPL (spec §4): each of the three rides one RAND fee bundle, so each pays the plain
+        // base. A `RegisterToken` owes the registry's `registration_fee` on top — a *ledger*
+        // fact, and this function has no ledger — so `ledger::tokens::validate` charges it
+        // (`TokenError::RegistrationFeeTooLow`), the way a call's tier-dependent part is charged
+        // once its proof has been decoded. Nothing here is a lower floor than that check, so a
+        // transaction under the base is still refused at step 3, before the action is reached.
+        Action::RegisterToken { .. } | Action::TokenMint { .. } | Action::SetAuthority { .. } => BUNDLE_BASE,
     }
 }
 
@@ -265,6 +272,43 @@ mod tests {
         assert_eq!(fee_floor(&burn), BRIDGE_BURN_FEE);
         assert_eq!(BRIDGE_BURN_FEE, 10_000_000, "0.01 RAND");
         assert!(BRIDGE_BURN_FEE >= 2 * BUNDLE_BASE, "both bundles are still paid for");
+    }
+
+    /// The three RPL actions each ride one RAND fee bundle, so each pays the plain bundle base
+    /// here. A registration owes the registry's `registration_fee` on top — a *ledger* fact this
+    /// function has no way to read, so `ledger::tokens::validate` charges it
+    /// (`TokenError::RegistrationFeeTooLow`), exactly as a call's tier-dependent part is charged
+    /// after its proof is decoded.
+    #[test]
+    fn the_three_token_actions_pay_the_bundle_base() {
+        use crate::ledger::tokens::MintAuthority;
+        use crate::notes::ShieldedAddress;
+        let pk = crate::crypto::Keypair::from_seed([1; 32]).unwrap().public_key().clone();
+        let register = Action::RegisterToken {
+            name: "Test Coin".into(),
+            symbol: "TST".into(),
+            decimals: 6,
+            authority: MintAuthority::Key(pk.clone()),
+            initial: None,
+            salt: [3; 32],
+            index: 1,
+        };
+        let mint = Action::TokenMint {
+            asset: 1,
+            amount: 5,
+            recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+            r: [7; 8],
+            time: 0,
+            envelope: env(),
+            nonce: 0,
+            signature: crate::crypto::Signature::empty(),
+        };
+        let authority =
+            Action::SetAuthority { asset: 1, new: Some(pk), nonce: 0, signature: crate::crypto::Signature::empty() };
+        for a in [register, mint, authority] {
+            assert_eq!(fee_floor(&a), BUNDLE_BASE, "{a:?}");
+            assert!(a.bundle_less().is_none(), "every token action rides a RAND fee bundle: {a:?}");
+        }
     }
 
     #[test]

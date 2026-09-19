@@ -88,6 +88,67 @@ impl CallEnvelope {
     }
 }
 
+/// The supply an [`Action::RegisterToken`] creates in the same transaction that registers the
+/// token (the RPL token standard, spec §4): a public `amount` of the brand-new asset, as one
+/// note the *chain* computes — `note_commitment(recipient.pk, MINT_FROM, amount, index, time, r)`
+/// — exactly as a bridge deposit is computed, so the creator cannot mint a note for an amount or
+/// an owner the registration does not declare.
+///
+/// `time` is the note's own `time` word and not the height the registration is applied at, for
+/// [`Action::BridgeAttest`]'s reason: the creator seals `envelope` against this note before
+/// submitting, and cannot predict which block will take it. Admission holds it to the window a
+/// bundle's `time` gets.
+///
+/// `amount` is part of the token's [`AssetId`] (`ledger::tokens::native_asset_id`'s
+/// `initial_supply`), so a registration cannot be replayed at a different initial supply under
+/// the same identity.
+///
+/// [`Action::RegisterToken`]: crate::types::Action::RegisterToken
+/// [`Action::BridgeAttest`]: crate::types::Action::BridgeAttest
+/// [`AssetId`]: crate::bridge::AssetId
+/// [`MINT_FROM`]: crate::ledger::tokens::MINT_FROM
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitialMint {
+    pub amount: u64,
+    pub recipient: ShieldedAddress,
+    pub r: Word8,
+    pub time: u32,
+    pub envelope: Envelope,
+}
+
+/// What a `Key` mint authority signs to mint `amount` of its token (the RPL token standard,
+/// spec §4): the chain, the token's [`AssetId`], the register's `mint_nonce`, the amount, and
+/// the commitment of the note the chain is about to append.
+///
+/// The commitment stands in for the note's other four words — the recipient's `pk`, the asset
+/// index, the `time` and the blinding `r` — because it *is* their hash: a signature over it is a
+/// signature over exactly the leaf the ledger will create, and nothing about that leaf can be
+/// changed without changing it. The asset id rather than the index: an index is this chain's
+/// dense numbering, while the id is the token's identity, so a mint signed for one token is
+/// never a mint for another chain's token that happens to sit at the same index.
+///
+/// [`AssetId`]: crate::bridge::AssetId
+pub fn token_mint_message(chain_id: u64, asset_id: &crate::bridge::AssetId, nonce: u64, amount: u64, cm: &Word8) -> Hash {
+    let bytes = bincode::serialize(&(chain_id, asset_id, nonce, amount, cm)).expect("serializes");
+    Hash::digest_domain(b"rand-rpl-mint-1", &bytes)
+}
+
+/// What a `Key` mint authority signs to hand its token to another key — or to no key at all,
+/// which retires minting for good ([`token_mint_message`]'s twin, one action over).
+///
+/// `new` is in the message as the `Option` it is, so a rotation to a key and a renunciation are
+/// never the same message; the nonce is the same per-token counter a mint spends, so neither
+/// can be replayed after the other.
+pub fn set_authority_message(
+    chain_id: u64,
+    asset_id: &crate::bridge::AssetId,
+    nonce: u64,
+    new: &Option<PublicKey>,
+) -> Hash {
+    let bytes = bincode::serialize(&(chain_id, asset_id, nonce, new)).expect("serializes");
+    Hash::digest_domain(b"rand-rpl-authority-1", &bytes)
+}
+
 /// What a validator signs to claim an address in the register: the chain and the payout
 /// address. The key itself is not in the message — it is what verifies the signature, so a
 /// valid signature already proves possession of `registration.public_key`.
@@ -194,6 +255,40 @@ mod tests {
         assert_ne!(registration_message(7, &addr()), registration_message(8, &addr()));
         // Different domains, so no message of one kind is ever a message of another.
         assert_ne!(base.to_hex(), wbase.to_hex());
+    }
+
+    /// The two RPL signing messages (spec §4): each binds the chain, the token's asset id, the
+    /// mint nonce and its own body, and the two domains never collide — a mint signature is
+    /// never a rotation signature, on this chain or another.
+    #[test]
+    fn the_token_messages_bind_the_chain_the_asset_the_nonce_and_their_body() {
+        let a = Hash([1; 32]);
+        let b = Hash([2; 32]);
+        let pk = Keypair::from_seed([5; 32]).unwrap().public_key().clone();
+        let other = Keypair::from_seed([6; 32]).unwrap().public_key().clone();
+
+        let m = token_mint_message(7, &a, 1, 500, &[3; 8]);
+        for x in [
+            token_mint_message(8, &a, 1, 500, &[3; 8]),
+            token_mint_message(7, &b, 1, 500, &[3; 8]),
+            token_mint_message(7, &a, 2, 500, &[3; 8]),
+            token_mint_message(7, &a, 1, 501, &[3; 8]),
+            token_mint_message(7, &a, 1, 500, &[4; 8]),
+        ] {
+            assert_ne!(x, m);
+        }
+
+        let s = set_authority_message(7, &a, 1, &Some(pk.clone()));
+        for x in [
+            set_authority_message(8, &a, 1, &Some(pk.clone())),
+            set_authority_message(7, &b, 1, &Some(pk.clone())),
+            set_authority_message(7, &a, 2, &Some(pk.clone())),
+            set_authority_message(7, &a, 1, &Some(other)),
+            set_authority_message(7, &a, 1, &None),
+        ] {
+            assert_ne!(x, s);
+        }
+        assert_ne!(m, s, "distinct domains");
     }
 }
 

@@ -715,6 +715,18 @@ fn assets_json(tokens: &TokenRegistry) -> Vec<Value> {
         .collect()
 }
 
+/// The kind of a mint authority, as `tx_json` names it: `"none"` (fixed supply, or renounced),
+/// `"key"`, `"bridge"` or `"program"`. The key itself is not rendered here — a registration's
+/// full row, the asset id included, is `rand_getToken`'s (Task 7).
+fn authority_kind(a: &MintAuthority) -> &'static str {
+    match a {
+        MintAuthority::None => "none",
+        MintAuthority::Key(_) => "key",
+        MintAuthority::Bridge { .. } => "bridge",
+        MintAuthority::Program(_) => "program",
+    }
+}
+
 /// One block as a light wallet reads it: the header fields it chains on, and per transaction
 /// the notes it created (leaf index, commitment, envelope) and the nullifiers it spent. No
 /// proof, no action, no receipt — those are `rand_getBlockByHeight`'s job.
@@ -988,6 +1000,27 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
         Action::Aggregate { covers, proof, aggregator, nonce, time, .. } => json!({
             "kind": "aggregate", "covers": covers.len(), "proof_len": proof.len(),
             "aggregator": aggregator.to_base58(), "nonce": nonce, "time": time
+        }),
+        // RPL (spec §4). A token's whole registration is public by design — that is what makes
+        // its supply auditable — as is every mint's amount and recipient; only the later
+        // *transfers* of a token's notes are shielded. These three render the public fields and
+        // nothing derived: the asset id, the index a registration was given, and the minted
+        // note's commitment are the registry's to report, and Task 7 adds them here with
+        // `rand_getToken`.
+        Action::RegisterToken { name, symbol, decimals, authority, initial, index, .. } => json!({
+            "kind": "register_token", "name": name, "symbol": symbol, "decimals": decimals,
+            "authority": authority_kind(authority),
+            "index": index,
+            "initial_amount": initial.as_ref().map(|m| m.amount),
+        }),
+        Action::TokenMint { asset, amount, recipient, time, nonce, .. } => json!({
+            "kind": "token_mint", "asset": asset, "amount": amount,
+            "recipient": recipient.to_string(), "time": time, "nonce": nonce
+        }),
+        Action::SetAuthority { asset, new, nonce, .. } => json!({
+            "kind": "set_authority", "asset": asset, "nonce": nonce,
+            // `null` is a renunciation: the token can never be minted again.
+            "new_authority": new.as_ref().map(|pk| pk.address().to_base58()),
         }),
     };
     json!({
