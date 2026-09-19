@@ -109,7 +109,7 @@ Rand (`UnlistedToken`) or reverts on the endpoint (`TokenDisabled`).
 ## 8. Token text form `rpl1…` (user, 2026-09-19)
 
 A token's asset id gets a checksummed text form: **bech32m** with HRP `rpl` over the 32-byte asset id
-(`rpl1…`, 59 characters). Shown and accepted everywhere a token is named: `rand_getToken` (accepts an
+(`rpl1…`, 62 characters). Shown and accepted everywhere a token is named: `rand_getToken` (accepts an
 index, 64 hex, or `rpl1…`; returns `id_text`), `rand_getTokens` rows, the `rand token` CLI, randscan's
 token pages, genesis docs. Parsing refuses a bad checksum, a wrong HRP, a wrong length and mixed case.
 Hex stays accepted as input. Test vectors: a fixed asset id ↔ its `rpl1…` string, and each refusal.
