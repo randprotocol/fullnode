@@ -100,8 +100,9 @@ impl CallEnvelope {
 /// bundle's `time` gets.
 ///
 /// **The whole of this struct is part of the token's [`AssetId`]** (`ledger::tokens::
-/// native_asset_id`'s `initial`), not just `amount`: a `RegisterToken` carries no signature and
-/// its fee bundle is not bound to it, so an observer could otherwise copy a gossiped registration
+/// native_asset_id`'s `initial`), not just `amount`: a `RegisterToken` carries no signature, and
+/// while the transaction binding keeps the creator's fee bundle from riding a copy, an observer can
+/// pay for a copy with a fee bundle of its own — so it could otherwise copy a gossiped registration
 /// with `recipient` swapped and take both the identity and the whole initial supply. With all
 /// five fields in the id, a redirected copy is a different token (spec §3, amended 2026-09-19).
 ///

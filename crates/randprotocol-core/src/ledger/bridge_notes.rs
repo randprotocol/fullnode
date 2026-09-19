@@ -121,8 +121,8 @@ pub(super) fn validate(
             let tokens = ledger.tokens().ok_or(TxError::Token(TokenError::Disabled))?;
             // Cheap before expensive (spec §7), and across *both* bundles: everything here is
             // a comparison or a set lookup, and it all runs before either bundle's proof is
-            // verified — the fee bundle's at step 9 of `validate_inner`, the asset bundle's at
-            // the end of this arm. A burn that names the wrong asset costs no verification.
+            // verified — both at steps 8-9 of `validate_inner`, against the one transaction
+            // binding. A burn that names the wrong asset costs no verification.
             //
             // The two-bundle rule itself is [`super::tokens::check_asset_bundle`], shared with
             // the RPL transfer and holder burn, which have exactly this shape: the bundle's asset
@@ -151,7 +151,8 @@ pub(super) fn validate(
             bridge
                 .check_burn(tokens, *asset, *amount, *to_chain, token, to, *relayer_fee)
                 .map_err(TxError::Bridge)?;
-            ledger.check_bundle_proof(asset_bundle, executor)?;
+            // The asset bundle's proof is not verified here: `validate_inner`'s steps 8-9 verify
+            // both bundles' proofs, after every cheap check, against the one transaction binding.
             Ok(None)
         }
         // Fail closed: an action this module does not own can only arrive through a routing
@@ -434,7 +435,7 @@ mod tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         b
     }
 
@@ -505,7 +506,7 @@ mod tests {
     /// transactions with different seeds never collide on a nullifier or a commitment.
     fn attest_tx(l: &Ledger, attestation: Vec<u8>, to: ShieldedAddress, seed: u32) -> Transaction {
         let asset = expected_index(l, &attestation);
-        Transaction::shielded(
+        StubExecutor::bound(Transaction::shielded(
             7,
             fee_bundle(l, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
             Action::BridgeAttest {
@@ -516,7 +517,7 @@ mod tests {
                 asset,
                 envelope: env(),
             },
-        )
+        ))
     }
 
     /// The same transaction with the `asset` word overwritten — a submitter that named an index
@@ -577,6 +578,7 @@ mod tests {
         let mut tx = attest_tx(&l, a, recipient(), 20);
         let Action::BridgeAttest { time, .. } = &mut tx.action else { panic!("an attest") };
         *time = 5;
+        StubExecutor::bind(&mut tx);
         // The same note, named before the transaction is applied: this is what a mempool claims
         // for an attest (`Ledger::derived_commitment`, one derivation for a withdraw and an attest
         // alike), and it reads the registry rather than the action's `asset` word.
@@ -635,6 +637,7 @@ mod tests {
             let mut tx = tx.clone();
             let Action::BridgeAttest { time: t, .. } = &mut tx.action else { panic!("an attest") };
             *t = time;
+            StubExecutor::bind(&mut tx);
             l.validate(&tx, &StubExecutor)
         };
         let oldest = (height - TIME_WINDOW) as u32;
@@ -807,7 +810,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index, 3);
-        let listed = naming_asset(tx, 3);
+        let listed = StubExecutor::bound(naming_asset(tx, 3));
         assert_eq!(l.validate(&listed, &StubExecutor), Ok(()));
         l.apply_tx(&listed, &proposer().address(), &StubExecutor).unwrap();
         assert!(l.has_commitment(&expected_cm(1, 1_000, 3)), "the note the listing's index names");
@@ -852,11 +855,11 @@ mod tests {
         let s = |n: u32| [seed + n; 8];
         let mut asset_bundle = bundle(l, [s(0), s(1)], [s(2), s(3)], 0, asset, amount);
         mutate(&mut asset_bundle);
-        Transaction::shielded(
+        StubExecutor::bound(Transaction::shielded(
             7,
             fee_bundle(l, [s(4), s(5)], [s(6), s(7)], BURN_FEE),
             Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, token, to },
-        )
+        ))
     }
 
     /// [`burn_tx`] with the outer bundle's fee chosen, for the fee-floor test.
@@ -872,11 +875,11 @@ mod tests {
         // relayer on the far side out of what the release contract pays out (see `validate`).
         let mut asset_bundle = bundle(l, [[40; 8], [41; 8]], [[42; 8], [43; 8]], 0, asset, amount);
         mutate(&mut asset_bundle);
-        Transaction::shielded(
+        StubExecutor::bound(Transaction::shielded(
             7,
             fee_bundle(l, [[44; 8], [45; 8]], [[46; 8], [47; 8]], fee),
             Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain: 2, token: TOKEN, to: EVM_TO },
-        )
+        ))
     }
 
     /// Spec §7 item 3 charges the bundle base per verified bundle, and a burn has two. The
@@ -1274,5 +1277,232 @@ mod tests {
             assert_eq!(validate(&l, &tx, &a, &StubExecutor), Err(TxError::UnsupportedAction("bridge")), "{a:?}");
             assert_eq!(apply(&mut l, &tx, &a, &StubExecutor, None), Err(TxError::UnsupportedAction("bridge")), "{a:?}");
         }
+    }
+
+    // ---- Task 5b: every bundle proof is bound to the transaction it rides in ----------------
+
+    /// An EVM-shaped destination other than [`EVM_TO`]: 12 zero bytes then 20 bytes of `0x33`.
+    const THIEF_TO: [u8; 32] = {
+        let mut t = [0u8; 32];
+        let mut i = 12;
+        while i < 32 {
+            t[i] = 0x33;
+            i += 1;
+        }
+        t
+    };
+
+    /// `original` with `change` applied to its action, and no proof touched: what a gossip peer
+    /// or a proposer can build from a transaction it has only seen.
+    fn altered(original: &Transaction, change: impl FnOnce(&mut Action)) -> Transaction {
+        let mut t = original.clone();
+        change(&mut t.action);
+        t
+    }
+
+    /// The bridge redirect (the defect Task 5b closes): a copy of an honest burn with its proofs
+    /// kept byte for byte and its destination, its relayer fee, its amount or its asset changed.
+    /// Before the binding, the `to` and `relayer_fee` copies were *admitted* — the source chain's
+    /// release would then have paid the attacker. Each is refused now, and the original still
+    /// validates.
+    #[test]
+    fn a_burns_proofs_cannot_ride_a_changed_destination_fee_amount_or_asset() {
+        let (mut l, secrets) = ledger();
+        deposit(&mut l, &secrets, 1_000, 0, 20);
+        let original = burn_tx(&l, 1, 400, 100, |_| {});
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+        // Every case is checked before anything is asserted, so a failure lists all of them.
+        let mut wrong = Vec::new();
+        let mut proof_refusal = |t: &Transaction, what: &str| match l.validate(t, &StubExecutor) {
+            Err(TxError::InvalidBundleProof(_)) => {}
+            other => wrong.push(format!("{what}: expected the bundle-proof refusal, got {other:?}")),
+        };
+        let to = altered(&original, |a| {
+            let Action::BridgeBurn { to, .. } = a else { panic!("a burn") };
+            *to = THIEF_TO;
+        });
+        proof_refusal(&to, "`to` swapped");
+        let fee = altered(&original, |a| {
+            let Action::BridgeBurn { relayer_fee, .. } = a else { panic!("a burn") };
+            *relayer_fee = 200;
+        });
+        proof_refusal(&fee, "`relayer_fee` raised");
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // `amount` and `asset` are also bound by the asset bundle's own words (its `burn` and its
+        // `asset`), so a cheap rule may refuse them first — what matters is that they are refused.
+        let amount = altered(&original, |a| {
+            let Action::BridgeBurn { amount, .. } = a else { panic!("a burn") };
+            *amount = 500;
+        });
+        assert!(l.validate(&amount, &StubExecutor).is_err(), "`amount` changed");
+        let asset = altered(&original, |a| {
+            let Action::BridgeBurn { asset, .. } = a else { panic!("a burn") };
+            *asset = 2;
+        });
+        assert!(l.validate(&asset, &StubExecutor).is_err(), "`asset` changed");
+        // The original is untouched by all of that.
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+    }
+
+    /// The same redirect across backings (spec §12): a burn of zUSD naming USDT on chain 2 copied
+    /// to name USDC on chain 5 — another coin, another source contract.
+    #[test]
+    fn a_burns_proofs_cannot_ride_another_backing() {
+        const USDT: [u8; 32] = [0xd7; 32];
+        const USDC: [u8; 32] = [0xdc; 32];
+        let (mut l, secrets) = ledger();
+        let mut registry = TokenRegistry::new(1_000_000_000);
+        let zusd = registry
+            .register(
+                crate::ledger::tokens::bridged_asset_id("Rand USD", "zUSD", &[0x5a; 32]),
+                "Rand USD".into(),
+                "zUSD".into(),
+                8,
+                crate::ledger::tokens::MintAuthority::Bridge {
+                    backings: vec![
+                        crate::ledger::tokens::Backing { chain: 2, token: USDT, decimals: 8, locked: 0 },
+                        crate::ledger::tokens::Backing { chain: 5, token: USDC, decimals: 8, locked: 0 },
+                    ],
+                },
+                0,
+            )
+            .unwrap();
+        l.set_tokens(Some(registry));
+        let inbound = |chain: u16, token: [u8; 32], amount: u128, sequence: u64| Body {
+            timestamp: 1,
+            nonce: 0,
+            emitter_chain: chain,
+            emitter_address: [chain as u8; 32],
+            sequence,
+            consistency_level: 0,
+            payload: Payload::Transfer(Transfer {
+                amount: Transfer::u256_from_u128(amount),
+                token_address: token,
+                token_chain: chain,
+                to: recipient().recipient_hash(),
+                to_chain: CHAIN_RAND,
+                fee: Transfer::u256_from_u128(0),
+            })
+            .encode(),
+        };
+        for (i, (chain, token, amount)) in [(2u16, USDT, 1_000u128), (5, USDC, 400)].into_iter().enumerate() {
+            let tx = attest_tx(&l, attest(&secrets, inbound(chain, token, amount, i as u64)), recipient(), 20 + 10 * i as u32);
+            l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
+        }
+        let original = burn_tx_to(&l, zusd, 300, 0, 2, USDT, EVM_TO, 50, |_| {});
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+        let other_coin = altered(&original, |a| {
+            let Action::BridgeBurn { to_chain, token, to, .. } = a else { panic!("a burn") };
+            (*to_chain, *token, *to) = (5, USDC, [0x77; 32]);
+        });
+        assert!(
+            matches!(l.validate(&other_coin, &StubExecutor), Err(TxError::InvalidBundleProof(_))),
+            "{:?}",
+            l.validate(&other_coin, &StubExecutor)
+        );
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+    }
+
+    /// An attestation's deposit fields are the relayer's to choose, and a copier could otherwise
+    /// swap the ones the guardians do not sign — the blinding `r`, the note's `time`, the envelope
+    /// the recipient needs to open the note (garbage there strands the deposit). The recipient is
+    /// also bound by the attestation itself. Each copy is refused, and the original validates.
+    #[test]
+    fn an_attests_fee_bundle_cannot_ride_a_changed_deposit() {
+        let (mut l, secrets) = ledger();
+        l.set_height(9);
+        l.record_anchor(9);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let original = attest_tx(&l, a, recipient(), 20);
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+        let recipient_swapped = altered(&original, |a| {
+            let Action::BridgeAttest { recipient, .. } = a else { panic!("an attest") };
+            *recipient = ShieldedAddress { pk: [9; 8], kem_ek: vec![6; 32] };
+        });
+        assert!(l.validate(&recipient_swapped, &StubExecutor).is_err(), "`recipient` changed");
+        type Change = Box<dyn Fn(&mut Action)>;
+        let cases: Vec<(&str, Change)> = vec![
+            (
+                "r",
+                Box::new(|a| {
+                    let Action::BridgeAttest { r, .. } = a else { panic!("an attest") };
+                    *r = [8; 8];
+                }),
+            ),
+            (
+                "time",
+                Box::new(|a| {
+                    let Action::BridgeAttest { time, .. } = a else { panic!("an attest") };
+                    *time = 5;
+                }),
+            ),
+            (
+                "envelope",
+                Box::new(|a| {
+                    let Action::BridgeAttest { envelope, .. } = a else { panic!("an attest") };
+                    envelope.body = vec![0xee; 8];
+                }),
+            ),
+        ];
+        let accepted: Vec<String> = cases
+            .into_iter()
+            .map(|(what, change)| (what, l.validate(&altered(&original, change), &StubExecutor)))
+            .filter(|(_, got)| !matches!(got, Err(TxError::InvalidBundleProof(_))))
+            .map(|(what, got)| format!("`{what}` changed: {got:?}"))
+            .collect();
+        assert!(accepted.is_empty(), "{accepted:#?}");
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+    }
+
+    /// A fee bundle lifted whole — proof and all — off a plain transfer and put under an attest,
+    /// and an asset bundle lifted off one burn into another transaction with a fresh fee bundle
+    /// and a destination of the thief's choosing. Neither proof was made for the transaction it
+    /// is now in.
+    #[test]
+    fn a_bundle_lifted_into_another_transaction_is_refused() {
+        let (mut l, secrets) = ledger();
+        deposit(&mut l, &secrets, 1_000, 0, 20);
+        let plain = StubExecutor::bound(Transaction::shielded(
+            7,
+            fee_bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], gas::BUNDLE_BASE),
+            Action::None,
+        ));
+        assert_eq!(l.validate(&plain, &StubExecutor), Ok(()));
+        let a = attest(&secrets, transfer(2_000, 0, recipient().recipient_hash(), 1));
+        let honest_attest = attest_tx(&l, a, recipient(), 70);
+        assert_eq!(l.validate(&honest_attest, &StubExecutor), Ok(()));
+        let lifted_fee = Transaction { bundle: plain.bundle.clone(), ..honest_attest.clone() };
+
+        let burn = burn_tx(&l, 1, 400, 100, |_| {});
+        assert_eq!(l.validate(&burn, &StubExecutor), Ok(()));
+        let Action::BridgeBurn { asset_bundle, .. } = &burn.action else { panic!("a burn") };
+        let mut lifted_asset = Transaction::shielded(
+            7,
+            fee_bundle(&l, [[80; 8], [81; 8]], [[82; 8], [83; 8]], BURN_FEE),
+            Action::BridgeBurn {
+                asset_bundle: asset_bundle.clone(),
+                asset: 1,
+                amount: 400,
+                relayer_fee: 100,
+                to_chain: 2,
+                token: TOKEN,
+                to: THIEF_TO,
+            },
+        );
+        // The thief's own fee bundle is honestly proved for the new transaction — it holds those
+        // notes — so only the lifted asset bundle's proof is the stolen one.
+        let binding = lifted_asset.binding();
+        let fee = lifted_asset.bundle.as_mut().unwrap();
+        fee.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&fee.digest_input()), &binding);
+        let accepted: Vec<String> = [("fee bundle onto an attest", &lifted_fee), ("asset bundle into a new burn", &lifted_asset)]
+            .into_iter()
+            .map(|(what, t)| (what, l.validate(t, &StubExecutor)))
+            .filter(|(_, got)| !matches!(got, Err(TxError::InvalidBundleProof(_))))
+            .map(|(what, got)| format!("{what}: {got:?}"))
+            .collect();
+        assert!(accepted.is_empty(), "{accepted:#?}");
+        assert_eq!(l.validate(&plain, &StubExecutor), Ok(()));
+        assert_eq!(l.validate(&honest_attest, &StubExecutor), Ok(()));
+        assert_eq!(l.validate(&burn, &StubExecutor), Ok(()));
     }
 }

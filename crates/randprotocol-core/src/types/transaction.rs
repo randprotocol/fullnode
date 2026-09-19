@@ -203,8 +203,9 @@ pub enum Action {
     /// RPL (spec §4): create a token. Permissionless — anyone who pays the bundle base plus the
     /// registry's `registration_fee` gets the next dense index — and content-addressed: the
     /// token's [`AssetId`] is `native_asset_id(name, symbol, decimals, authority, initial, salt)`
-    /// — the **whole** `initial`, not just its amount, because this action is unsigned and its
-    /// fee bundle is not bound to it (see [`InitialMint`]) — so the same declaration twice is the
+    /// — the **whole** `initial`, not just its amount, because this action is unsigned and anyone
+    /// can pay for a copy with a fee bundle of their own (see [`InitialMint`]) — so the same
+    /// declaration twice is the
     /// same asset and the second is refused, while a copy with the recipient swapped is a
     /// different token that can take nothing from the original.
     ///
@@ -328,7 +329,178 @@ impl Action {
             _ => None,
         }
     }
+
+    /// [`Action::asset_bundle`], mutably — the same three actions, for a caller that fills the
+    /// asset bundle's proof in after the transaction around it is assembled (a wallet proving
+    /// against [`Transaction::binding`], a test stubbing one).
+    pub fn asset_bundle_mut(&mut self) -> Option<&mut Bundle> {
+        match self {
+            Action::BridgeBurn { asset_bundle, .. }
+            | Action::TokenTransfer { asset_bundle, .. }
+            | Action::TokenBurn { asset_bundle, .. } => Some(asset_bundle),
+            _ => None,
+        }
+    }
+
+    /// This action with every **proof** byte string replaced by the empty vector — what
+    /// [`Transaction::binding`] hashes. Exactly three fields are proofs: an asset bundle's
+    /// `proof` ([`Action::asset_bundle`]'s three actions), a `Call`'s `proof` and an `Aggregate`'s
+    /// `proof`. Every other field — envelopes, memo, destination, validator, recipient,
+    /// signatures, a guardian attestation, a signed header's `proof_hash` — is kept as it is, so
+    /// the binding moves with it.
+    ///
+    /// The match is exhaustive and every arm names every field, with no wildcard and no `..`: a
+    /// new variant, or a new field on an existing one, does not compile until it is classified
+    /// here as a proof (blanked) or not (kept). That is deliberate — a field left out of the
+    /// binding is a field a copier can change under someone else's proof.
+    pub fn blanked(&self) -> Action {
+        match self {
+            Action::None => Action::None,
+            Action::Mint { cm, pk, time, r, envelope, amount, minter, signature } => Action::Mint {
+                cm: *cm,
+                pk: *pk,
+                time: *time,
+                r: *r,
+                envelope: envelope.clone(),
+                amount: *amount,
+                minter: minter.clone(),
+                signature: signature.clone(),
+            },
+            Action::Deploy { base_pc, words, public } => {
+                Action::Deploy { base_pc: *base_pc, words: words.clone(), public: public.clone() }
+            }
+            Action::Call { program, proof: _, input_envelope } => {
+                Action::Call { program: *program, proof: Vec::new(), input_envelope: input_envelope.clone() }
+            }
+            Action::Bond { validator, amount, registration } => {
+                Action::Bond { validator: *validator, amount: *amount, registration: registration.clone() }
+            }
+            Action::Unbond { validator, amount, nonce, signature } => Action::Unbond {
+                validator: *validator,
+                amount: *amount,
+                nonce: *nonce,
+                signature: signature.clone(),
+            },
+            Action::Withdraw { validator, amount, nonce, time, r, envelope, signature } => Action::Withdraw {
+                validator: *validator,
+                amount: *amount,
+                nonce: *nonce,
+                time: *time,
+                r: *r,
+                envelope: envelope.clone(),
+                signature: signature.clone(),
+            },
+            Action::BridgeAttest { attestation, recipient, r, time, asset, envelope } => Action::BridgeAttest {
+                attestation: attestation.clone(),
+                recipient: recipient.clone(),
+                r: *r,
+                time: *time,
+                asset: *asset,
+                envelope: envelope.clone(),
+            },
+            Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, token, to } => {
+                Action::BridgeBurn {
+                    asset_bundle: blank_bundle(asset_bundle),
+                    asset: *asset,
+                    amount: *amount,
+                    relayer_fee: *relayer_fee,
+                    to_chain: *to_chain,
+                    token: *token,
+                    to: *to,
+                }
+            }
+            Action::RegisterAggregator { registration } => {
+                Action::RegisterAggregator { registration: registration.clone() }
+            }
+            Action::UnbondAggregator { aggregator, nonce, signature } => Action::UnbondAggregator {
+                aggregator: *aggregator,
+                nonce: *nonce,
+                signature: signature.clone(),
+            },
+            Action::WithdrawAggregator { aggregator, nonce, time, r, envelope, signature } => {
+                Action::WithdrawAggregator {
+                    aggregator: *aggregator,
+                    nonce: *nonce,
+                    time: *time,
+                    r: *r,
+                    envelope: envelope.clone(),
+                    signature: signature.clone(),
+                }
+            }
+            Action::SlashAggregator { a, b } => Action::SlashAggregator { a: a.clone(), b: b.clone() },
+            Action::Aggregate { covers, proof: _, aggregator, nonce, time, r, envelope, signature } => {
+                Action::Aggregate {
+                    covers: covers.clone(),
+                    proof: Vec::new(),
+                    aggregator: *aggregator,
+                    nonce: *nonce,
+                    time: *time,
+                    r: *r,
+                    envelope: envelope.clone(),
+                    signature: signature.clone(),
+                }
+            }
+            Action::RegisterToken { name, symbol, decimals, authority, initial, salt, index } => {
+                Action::RegisterToken {
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                    decimals: *decimals,
+                    authority: authority.clone(),
+                    initial: initial.clone(),
+                    salt: *salt,
+                    index: *index,
+                }
+            }
+            Action::TokenMint { asset, amount, recipient, r, time, envelope, nonce, signature } => Action::TokenMint {
+                asset: *asset,
+                amount: *amount,
+                recipient: recipient.clone(),
+                r: *r,
+                time: *time,
+                envelope: envelope.clone(),
+                nonce: *nonce,
+                signature: signature.clone(),
+            },
+            Action::SetAuthority { asset, new, nonce, signature } => Action::SetAuthority {
+                asset: *asset,
+                new: new.clone(),
+                nonce: *nonce,
+                signature: signature.clone(),
+            },
+            Action::TokenTransfer { asset_bundle, memo } => {
+                Action::TokenTransfer { asset_bundle: blank_bundle(asset_bundle), memo: memo.clone() }
+            }
+            Action::TokenBurn { asset_bundle, asset, amount } => {
+                Action::TokenBurn { asset_bundle: blank_bundle(asset_bundle), asset: *asset, amount: *amount }
+            }
+        }
+    }
 }
+
+/// `b` with its `proof` replaced by the empty vector and every other field kept — the bundle
+/// half of [`Action::blanked`]. Every field is named, for the same reason: a new `Bundle` field
+/// does not compile until it is classified.
+fn blank_bundle(b: &Bundle) -> Bundle {
+    let Bundle { anchor, nullifiers, commitments, fee, burn, asset, time, envelopes, proof: _ } = b;
+    Bundle {
+        anchor: *anchor,
+        nullifiers: *nullifiers,
+        commitments: *commitments,
+        fee: *fee,
+        burn: *burn,
+        asset: *asset,
+        time: *time,
+        envelopes: envelopes.clone(),
+        proof: Vec::new(),
+    }
+}
+
+/// How many `u32` words [`Transaction::binding`] is: a 32-byte digest, as the eight words of the
+/// public input segment every bundle proof of the transaction is proved with and verified against.
+pub const TX_BINDING_WORDS: usize = 8;
+
+/// The binding's hash domain.
+pub const TX_BINDING_DOMAIN: &[u8] = b"rand-tx-bind-1";
 
 /// A transaction: a shielded bundle, an action, or (for a faucet mint) an action alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +603,43 @@ impl Transaction {
         });
         let view = TxView { chain_id: self.chain_id, bundle, action: &self.action };
         Hash::digest_domain(b"rand-txid-2", &bincode::serialize(&view).expect("Transaction serializes"))
+    }
+
+    /// What every bundle proof of this transaction is bound to: blake3 under
+    /// [`TX_BINDING_DOMAIN`] of the canonical bincode of `(chain_id, bundle', action')`, where `'`
+    /// means "with every proof byte string replaced by the empty vector" — `bundle.proof`, an
+    /// asset bundle's `proof`, a `Call`'s and an `Aggregate`'s (see [`Action::blanked`]) — as
+    /// eight little-endian `u32` words.
+    ///
+    /// A bundle's proof is made over these words as its public input segment and verified
+    /// against them (`ConfidentialExecutor::verify_bundle`), so a proof copied onto a
+    /// transaction with any other field changed — the action, an envelope, the chain id, the
+    /// other bundle of a two-bundle transaction — no longer verifies. Proofs are blanked because
+    /// a proof cannot commit to itself; they are *replaced* by the empty vector, never skipped, so
+    /// the encoding keeps its shape and a proof field cannot be confused with its neighbour.
+    ///
+    /// This is the one function both sides call — the wallet before proving, the ledger before
+    /// verifying — and it hashes the *decoded* transaction, never received bytes. The bincode
+    /// configuration is pinned here rather than inherited: fixed-width integers, little-endian,
+    /// which is what `bincode::serialize` (and so [`Transaction::encode`]) writes today; a
+    /// test holds the two equal.
+    ///
+    /// Not the transaction id: [`Transaction::hash`] is unchanged and still takes each bundle
+    /// proof by its digest.
+    pub fn binding(&self) -> [u32; TX_BINDING_WORDS] {
+        use bincode::Options;
+        let blanked = Transaction {
+            chain_id: self.chain_id,
+            bundle: self.bundle.as_ref().map(blank_bundle),
+            action: self.action.blanked(),
+        };
+        let bytes = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_little_endian()
+            .serialize(&(blanked.chain_id, &blanked.bundle, &blanked.action))
+            .expect("Transaction serializes");
+        let digest = Hash::digest_domain(TX_BINDING_DOMAIN, &bytes);
+        std::array::from_fn(|i| u32::from_le_bytes(digest.0[4 * i..4 * i + 4].try_into().expect("four bytes")))
     }
 
     /// Wire size, used for block byte accounting.
@@ -866,4 +1075,350 @@ mod tests {
         assert_eq!(format_amount(42_000_000_000), "42");
         assert_eq!(format_amount(1), "0.000000001");
     }
+
+    // ---- Task 5b: the transaction binding ------------------------------------------------------
+
+    fn sig() -> Signature {
+        Keypair::from_seed([3; 32]).unwrap().sign(b"x")
+    }
+
+    fn pk() -> PublicKey {
+        Keypair::from_seed([3; 32]).unwrap().public_key().clone()
+    }
+
+    fn header() -> Box<SignedAggregateHeader> {
+        Box::new(SignedAggregateHeader {
+            aggregator: Address([4; 32]),
+            nonce: 1,
+            time: 2,
+            r: [3; 8],
+            covers: vec![Hash([5; 32])],
+            proof_hash: Hash([6; 32]),
+            signature: sig(),
+        })
+    }
+
+    /// The number of `Action` variants, and each one's position — an exhaustive match with no
+    /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
+    /// [`Action::blanked`] has an arm).
+    const VARIANTS: usize = 19;
+    fn variant_index(a: &Action) -> usize {
+        match a {
+            Action::None => 0,
+            Action::Mint { .. } => 1,
+            Action::Deploy { .. } => 2,
+            Action::Call { .. } => 3,
+            Action::Bond { .. } => 4,
+            Action::Unbond { .. } => 5,
+            Action::Withdraw { .. } => 6,
+            Action::BridgeAttest { .. } => 7,
+            Action::BridgeBurn { .. } => 8,
+            Action::RegisterAggregator { .. } => 9,
+            Action::UnbondAggregator { .. } => 10,
+            Action::WithdrawAggregator { .. } => 11,
+            Action::SlashAggregator { .. } => 12,
+            Action::Aggregate { .. } => 13,
+            Action::RegisterToken { .. } => 14,
+            Action::TokenMint { .. } => 15,
+            Action::SetAuthority { .. } => 16,
+            Action::TokenTransfer { .. } => 17,
+            Action::TokenBurn { .. } => 18,
+        }
+    }
+
+    /// One action of variant `i` with every proof field set to `proof` and every other byte
+    /// string non-empty — so blanking visibly empties the proofs and visibly keeps the rest.
+    fn sample(i: usize, proof: Vec<u8>) -> Action {
+        let mut asset_bundle = bundle();
+        asset_bundle.asset = 3;
+        asset_bundle.proof = proof.clone();
+        let reg = Registration { public_key: pk(), payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] }, signature: sig() };
+        match i {
+            0 => Action::None,
+            1 => Action::Mint {
+                cm: [1; 8],
+                pk: [2; 8],
+                time: 3,
+                r: [4; 8],
+                envelope: env(),
+                amount: 1,
+                minter: pk(),
+                signature: sig(),
+            },
+            2 => Action::Deploy { base_pc: 0, words: vec![0x13, 0x13], public: vec![7] },
+            3 => Action::Call {
+                program: Hash([7; 32]),
+                proof,
+                input_envelope: Some(CallEnvelope {
+                    kem_ct: vec![1; 4],
+                    to_sender: vec![2; 4],
+                    to_auditor: vec![3; 4],
+                    body: vec![4; 4],
+                }),
+            },
+            4 => Action::Bond { validator: Address([1; 32]), amount: 5, registration: Some(reg) },
+            5 => Action::Unbond { validator: Address([1; 32]), amount: 5, nonce: 1, signature: sig() },
+            6 => Action::Withdraw {
+                validator: Address([1; 32]),
+                amount: 5,
+                nonce: 1,
+                time: 2,
+                r: [3; 8],
+                envelope: env(),
+                signature: sig(),
+            },
+            7 => Action::BridgeAttest {
+                attestation: vec![1, 2, 3],
+                recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                r: [5; 8],
+                time: 9,
+                asset: 1,
+                envelope: env(),
+            },
+            8 => Action::BridgeBurn {
+                asset_bundle,
+                asset: 3,
+                amount: 400,
+                relayer_fee: 100,
+                to_chain: 2,
+                token: [7; 32],
+                to: [1; 32],
+            },
+            9 => Action::RegisterAggregator {
+                registration: AggregatorRegistration {
+                    public_key: pk(),
+                    payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+                    signature: sig(),
+                },
+            },
+            10 => Action::UnbondAggregator { aggregator: Address([4; 32]), nonce: 1, signature: sig() },
+            11 => Action::WithdrawAggregator {
+                aggregator: Address([4; 32]),
+                nonce: 1,
+                time: 2,
+                r: [3; 8],
+                envelope: env(),
+                signature: sig(),
+            },
+            12 => Action::SlashAggregator { a: header(), b: header() },
+            13 => Action::Aggregate {
+                covers: vec![Hash([1; 32])],
+                proof,
+                aggregator: Address([4; 32]),
+                nonce: 1,
+                time: 2,
+                r: [3; 8],
+                envelope: env(),
+                signature: sig(),
+            },
+            14 => Action::RegisterToken {
+                name: "Test Coin".into(),
+                symbol: "TST".into(),
+                decimals: 6,
+                authority: MintAuthority::Key(pk()),
+                initial: Some(InitialMint {
+                    amount: 1,
+                    recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                    r: [5; 8],
+                    time: 9,
+                    envelope: env(),
+                }),
+                salt: [3; 32],
+                index: 1,
+            },
+            15 => Action::TokenMint {
+                asset: 1,
+                amount: 5,
+                recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                r: [5; 8],
+                time: 9,
+                envelope: env(),
+                nonce: 0,
+                signature: sig(),
+            },
+            16 => Action::SetAuthority { asset: 1, new: Some(pk()), nonce: 0, signature: sig() },
+            17 => Action::TokenTransfer { asset_bundle, memo: Some(vec![0xab; 4]) },
+            18 => Action::TokenBurn { asset_bundle, asset: 3, amount: 5 },
+            _ => panic!("no variant {i}"),
+        }
+    }
+
+    /// The classification [`Action::blanked`] makes, stated independently: exactly these variants
+    /// carry a proof, and blanking one empties exactly its proof and keeps everything else — every
+    /// signature, envelope, attestation, memo, destination and recipient stays inside the binding.
+    /// Table-driven over *every* variant: [`variant_index`] is exhaustive, so a new variant fails
+    /// to compile until it has a row here, and `blanked` names every field of every variant, so a
+    /// new field fails to compile until it is classified there.
+    #[test]
+    fn blanking_empties_exactly_the_proofs_of_every_variant() {
+        let carries_a_proof = [3usize, 8, 13, 17, 18];
+        let mut seen = [false; VARIANTS];
+        for i in 0..VARIANTS {
+            let with = sample(i, vec![0x99; 7]);
+            let without = sample(i, Vec::new());
+            assert_eq!(variant_index(&with), i, "the table's row {i} is variant {i}");
+            seen[i] = true;
+            assert_eq!(with.blanked(), without, "variant {i}: blanking keeps every non-proof field and empties the proofs");
+            assert_eq!(without.blanked(), without, "variant {i}: blanking is idempotent");
+            assert_eq!(with != without, carries_a_proof.contains(&i), "variant {i}: carries a proof field");
+            // The binding sees the blanked form only: the proof bytes never move it.
+            let t = |a: Action| Transaction::shielded(7, bundle(), a);
+            assert_eq!(t(with).binding(), t(without).binding(), "variant {i}");
+        }
+        assert!(seen.iter().all(|s| *s), "every variant has a row");
+    }
+
+    /// The binding ignores every proof byte — the fee bundle's, an asset bundle's, a call's, an
+    /// aggregate's, and a pruned marker in place of any of them — so a wallet can compute it before
+    /// it proves, and the ledger after.
+    #[test]
+    fn the_binding_ignores_proof_bytes() {
+        for i in [0usize, 3, 8, 13, 17, 18] {
+            let base = Transaction::shielded(7, bundle(), sample(i, vec![1; 5]));
+            let mut other = Transaction::shielded(7, bundle(), sample(i, vec![2; 900]));
+            other.bundle.as_mut().unwrap().proof = vec![0xee; 3];
+            assert_eq!(base.binding(), other.binding(), "variant {i}");
+            let mut marker = base.clone();
+            let mut pruned = crate::notes::PRUNED_PROOF_MARKER.to_vec();
+            pruned.extend_from_slice(&[9; 32]);
+            marker.bundle.as_mut().unwrap().proof = pruned;
+            assert_eq!(base.binding(), marker.binding(), "variant {i}: the pruned form binds the same");
+        }
+    }
+
+    /// …and moves with every other field: the chain id, each fee-bundle field and envelope, each
+    /// asset-bundle field and envelope, and every field of the actions the Task 5b attacks change.
+    #[test]
+    fn the_binding_moves_with_every_non_proof_field() {
+        type Change = fn(&mut Transaction);
+        fn burn(t: &mut Transaction) -> (&mut Bundle, &mut u32, &mut u64, &mut u64, &mut u16, &mut [u8; 32], &mut [u8; 32]) {
+            let Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, token, to } = &mut t.action else {
+                panic!("a burn")
+            };
+            (asset_bundle, asset, amount, relayer_fee, to_chain, token, to)
+        }
+        let burn_cases: Vec<(&str, Change)> = vec![
+            ("chain_id", |t| t.chain_id += 1),
+            ("fee anchor", |t| t.bundle.as_mut().unwrap().anchor[0] ^= 1),
+            ("fee nullifier", |t| t.bundle.as_mut().unwrap().nullifiers[1][0] ^= 1),
+            ("fee commitment", |t| t.bundle.as_mut().unwrap().commitments[0][0] ^= 1),
+            ("fee fee", |t| t.bundle.as_mut().unwrap().fee += 1),
+            ("fee burn", |t| t.bundle.as_mut().unwrap().burn += 1),
+            ("fee asset", |t| t.bundle.as_mut().unwrap().asset += 1),
+            ("fee time", |t| t.bundle.as_mut().unwrap().time += 1),
+            ("fee envelope 0", |t| t.bundle.as_mut().unwrap().envelopes[0].body[0] ^= 1),
+            ("fee envelope 1", |t| t.bundle.as_mut().unwrap().envelopes[1].kem_ct.push(0)),
+            ("asset bundle nullifier", |t| burn(t).0.nullifiers[0][0] ^= 1),
+            ("asset bundle burn", |t| burn(t).0.burn += 1),
+            ("asset bundle envelope", |t| burn(t).0.envelopes[1].to_sender.push(1)),
+            ("burn asset", |t| *burn(t).1 += 1),
+            ("burn amount", |t| *burn(t).2 += 1),
+            ("burn relayer_fee", |t| *burn(t).3 += 1),
+            ("burn to_chain", |t| *burn(t).4 += 1),
+            ("burn token", |t| burn(t).5[0] ^= 1),
+            ("burn to", |t| burn(t).6[31] ^= 1),
+        ];
+        let base = Transaction::shielded(7, bundle(), sample(8, vec![1; 5]));
+        for (what, change) in burn_cases {
+            let mut t = base.clone();
+            change(&mut t);
+            assert_ne!(t.binding(), base.binding(), "{what}");
+        }
+        // Every other action's fields, variant by variant: each row edits one field of `sample(i)`.
+        let action_cases: Vec<(usize, &str, Change)> = vec![
+            (3, "call program", |t| {
+                let Action::Call { program, .. } = &mut t.action else { panic!() };
+                program.0[0] ^= 1;
+            }),
+            (3, "call input envelope", |t| {
+                let Action::Call { input_envelope, .. } = &mut t.action else { panic!() };
+                *input_envelope = None;
+            }),
+            (4, "bond validator", |t| {
+                let Action::Bond { validator, .. } = &mut t.action else { panic!() };
+                validator.0[0] ^= 1;
+            }),
+            (4, "bond registration", |t| {
+                let Action::Bond { registration, .. } = &mut t.action else { panic!() };
+                *registration = None;
+            }),
+            (7, "attest recipient", |t| {
+                let Action::BridgeAttest { recipient, .. } = &mut t.action else { panic!() };
+                recipient.pk[0] ^= 1;
+            }),
+            (7, "attest r", |t| {
+                let Action::BridgeAttest { r, .. } = &mut t.action else { panic!() };
+                r[0] ^= 1;
+            }),
+            (7, "attest time", |t| {
+                let Action::BridgeAttest { time, .. } = &mut t.action else { panic!() };
+                *time += 1;
+            }),
+            (7, "attest asset", |t| {
+                let Action::BridgeAttest { asset, .. } = &mut t.action else { panic!() };
+                *asset += 1;
+            }),
+            (7, "attest envelope", |t| {
+                let Action::BridgeAttest { envelope, .. } = &mut t.action else { panic!() };
+                envelope.body[0] ^= 1;
+            }),
+            (7, "attest attestation", |t| {
+                let Action::BridgeAttest { attestation, .. } = &mut t.action else { panic!() };
+                attestation[0] ^= 1;
+            }),
+            (14, "register initial recipient", |t| {
+                let Action::RegisterToken { initial: Some(m), .. } = &mut t.action else { panic!() };
+                m.recipient.pk[0] ^= 1;
+            }),
+            (17, "transfer memo stripped", |t| {
+                let Action::TokenTransfer { memo, .. } = &mut t.action else { panic!() };
+                *memo = None;
+            }),
+            (17, "transfer memo replaced", |t| {
+                let Action::TokenTransfer { memo, .. } = &mut t.action else { panic!() };
+                *memo = Some(vec![0xcd; 4]);
+            }),
+            (18, "token burn amount", |t| {
+                let Action::TokenBurn { amount, .. } = &mut t.action else { panic!() };
+                *amount += 1;
+            }),
+        ];
+        for (i, what, change) in action_cases {
+            let base = Transaction::shielded(7, bundle(), sample(i, vec![1; 5]));
+            let mut t = base.clone();
+            change(&mut t);
+            assert_ne!(t.binding(), base.binding(), "{what}");
+        }
+        // And the action as a whole: the same fee bundle under `None` and under an attest.
+        let none = Transaction::shielded(7, bundle(), Action::None);
+        let attest = Transaction::shielded(7, bundle(), sample(7, Vec::new()));
+        assert_ne!(none.binding(), attest.binding());
+    }
+
+    /// The pinned bincode configuration is exactly what `bincode::serialize` writes — the
+    /// consensus encoding (`Transaction::encode`) — and a golden value pins the binding itself, so
+    /// a wallet written against this function and a ledger built from it can never disagree
+    /// silently, and a change to the blanking or the encoding shows up here as a hard fork.
+    #[test]
+    fn the_binding_encoding_is_pinned() {
+        use bincode::Options;
+        let tx = Transaction::shielded(13, bundle(), sample(8, vec![0x99; 7]));
+        // The blanked transaction, written out by hand.
+        let mut blank = tx.clone();
+        blank.bundle.as_mut().unwrap().proof.clear();
+        blank.action.asset_bundle_mut().unwrap().proof.clear();
+        let pinned = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_little_endian()
+            .serialize(&(blank.chain_id, &blank.bundle, &blank.action))
+            .unwrap();
+        assert_eq!(pinned, blank.encode(), "fixint little-endian is the consensus encoding");
+        let digest = Hash::digest_domain(TX_BINDING_DOMAIN, &pinned);
+        let words: [u32; TX_BINDING_WORDS] =
+            std::array::from_fn(|i| u32::from_le_bytes(digest.0[4 * i..4 * i + 4].try_into().unwrap()));
+        assert_eq!(tx.binding(), words);
+        assert_eq!(hex::encode(digest.0), BURN_BINDING);
+    }
+
+    const BURN_BINDING: &str = "ef0382194d472e23bb2d55465e21ac72bb63bf18e0c084a88179f0d16d62ebb6";
 }

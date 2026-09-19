@@ -100,11 +100,10 @@ fn the_executors_note_commitment_is_the_vendored_notes_own() {
     );
 }
 
-/// A 1-in-1-out-with-dummies bundle proves, its digest matches the core-side recompute, and
-/// the executor verifies it (about a minute at the test profile).
-#[test]
-fn a_bundle_proves_and_the_executor_verifies_it() {
-    let ex = ZkExecutor::new(FriProfile::Test);
+/// A 1-in-1-out-with-dummies bundle's private inputs, and the digest input the ledger recomputes
+/// from its plaintext — emulated first, in milliseconds, so a tainted witness fails here and not
+/// after a minute of proving.
+fn bundle_witness(ex: &ZkExecutor) -> (Vec<u32>, randprotocol_core::notes::BundleDigestInput) {
     let sk = SpendKey::random();
     let vk = sk.viewing_key();
     let me = address_of(&vk);
@@ -134,20 +133,76 @@ fn a_bundle_proves_and_the_executor_verifies_it() {
     // can reproduce, and finding that out after the prover has run costs minutes.
     let emulated = randprotocol_zkvm::emulator::execute(ZkExecutor::bundle_program(), &inputs, &[], 50_000_000).unwrap();
     assert_eq!(ex.bundle_digest(&di), emulated.outputs, "the witness is tainted or the digest preimage disagrees");
+    let e = seal_note(&vk, &me, &out1, &TxKey::random()).unwrap();
+    assert!(e.len() <= randprotocol_core::notes::MAX_ENVELOPE_BYTES);
+    (inputs, di)
+}
+
+/// Two transactions' bindings (`Transaction::binding`): the words a bundle is proved with, and
+/// the words of some other transaction it could be copied into.
+const BINDING_A: [u32; 8] = [0x1111_1111, 2, 3, 4, 5, 6, 7, 0xffff_ffff];
+const BINDING_B: [u32; 8] = [0x1111_1111, 2, 3, 4, 5, 6, 7, 0xffff_fffe];
+
+/// A bundle proves against its transaction's binding, its digest matches the core-side recompute,
+/// and the executor verifies it against *those* words — and refuses it against any other
+/// transaction's (Task 5b: the copied-proof attack), against another guest, with a trailing byte,
+/// and when its declared public height is not the binding's (about a minute at the test profile).
+#[test]
+fn a_bundle_proves_against_its_binding_and_verifies_only_against_it() {
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let (inputs, di) = bundle_witness(&ex);
     let started = std::time::Instant::now();
-    let (proof, digest, tier) = prove_bundle(FriProfile::Test, &inputs, Backend::Cpu).unwrap();
+    let (proof, digest, tier) = prove_bundle(FriProfile::Test, &inputs, &BINDING_A, Backend::Cpu).unwrap();
     println!("bundle proved at tier {tier} in {:.1?} ({} proof bytes)", started.elapsed(), proof.len());
-    assert_eq!(tier, 14);
+    assert_eq!(tier, 14, "the eight binding words do not move the bundle off its tier");
     assert_eq!(ex.bundle_digest(&di), digest);
     assert_eq!(ex.bundle_proof_digest(&proof).unwrap(), digest);
-    ex.verify_bundle(&ZkExecutor::hc_bundle(), &proof).unwrap();
-    assert!(ex.verify_bundle(&[1u32; 8], &proof).is_err());
+    let hc = ZkExecutor::hc_bundle();
+    ex.verify_bundle(&hc, &proof, &BINDING_A).unwrap();
+    // The attack: the same proof, verified for another transaction. One bit of one word differs.
+    assert_eq!(
+        ex.verify_bundle(&hc, &proof, &BINDING_B),
+        Err(ConfidentialError::InvalidBundleProof("PublicValues".into())),
+        "a proof bound to one transaction is refused for any other"
+    );
+    assert!(ex.verify_bundle(&[1u32; 8], &proof, &BINDING_A).is_err());
+    // The declared public height is pinned to the binding's (4, for eight words) and anything
+    // else is refused before any verifier key is built — here the empty segment's height, 2.
+    let decoded = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();
+    assert_eq!(decoded.public_log_height, ZkExecutor::bundle_heights().2);
+    assert_eq!(ZkExecutor::bundle_heights().2, 4);
+    let refused = ConfidentialError::InvalidProof("public height not the transaction binding's".into());
+    for height in [2u8, 3, 5] {
+        let mut other = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();
+        other.public_log_height = height;
+        let bytes = other.to_bytes();
+        assert_eq!(ex.bundle_proof_digest(&bytes), Err(refused.clone()), "height {height}");
+        assert_eq!(ex.verify_bundle(&hc, &bytes, &BINDING_A), Err(refused.clone()), "height {height}");
+    }
     // Canonical decoding (final review): the same proof with one trailing byte decodes to the same
     // `Proof` under plain postcard, and is refused by both bundle entry points.
     let mut trailing = proof.clone();
     trailing.push(0);
     assert_eq!(ex.bundle_proof_digest(&trailing), Err(ConfidentialError::MalformedProof));
-    assert_eq!(ex.verify_bundle(&ZkExecutor::hc_bundle(), &trailing), Err(ConfidentialError::MalformedProof));
-    let e = seal_note(&vk, &me, &out1, &TxKey::random()).unwrap();
-    assert!(e.len() <= randprotocol_core::notes::MAX_ENVELOPE_BYTES);
+    assert_eq!(ex.verify_bundle(&hc, &trailing, &BINDING_A), Err(ConfidentialError::MalformedProof));
+}
+
+/// A bundle proved the pre-fork way — against the *empty* public segment, which is every bundle
+/// proof made before Task 5b and what an old wallet still makes — is refused, whatever binding it
+/// is checked against: it is bound to no transaction at all.
+#[test]
+fn a_bundle_proved_against_the_empty_segment_is_refused() {
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let (inputs, di) = bundle_witness(&ex);
+    let (proof, exec) = randprotocol_zkvm::machine::Machine::new(FriProfile::Test)
+        .prove_with(Backend::Cpu, ZkExecutor::bundle_program(), &inputs, &[], None)
+        .unwrap();
+    assert_eq!(exec.outputs, ex.bundle_digest(&di), "an honest witness: only the segment is wrong");
+    assert_eq!(proof.public_log_height, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT);
+    let bytes = proof.to_bytes();
+    let refused = ConfidentialError::InvalidProof("public height not the transaction binding's".into());
+    assert_eq!(ex.bundle_proof_digest(&bytes), Err(refused.clone()));
+    for binding in [BINDING_A, [0; 8]] {
+        assert_eq!(ex.verify_bundle(&ZkExecutor::hc_bundle(), &bytes, &binding), Err(refused.clone()));
+    }
 }

@@ -347,14 +347,14 @@ mod tests {
             sealed(&bob(), &alice(), &alice_note_1, &TxKey([11; 32])),
             sealed(&alice(), &bob(), &bob_note, &TxKey([12; 32])),
         ];
-        let tx1 = Transaction::shielded(gs.chain_id, b1_bundle, Action::None);
+        let tx1 = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, b1_bundle, Action::None));
         let b1 = make_block(&gs.block, &mut ledger, vec![tx1], &key(1));
         storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
         let alice_note_2 = note_for(&alice(), &bob(), 900);
         let mut b2_bundle = fixtures::bundle(&ledger, [[33; 8], [34; 8]], [alice_note_2.commitment(), [44; 8]], bundle_fee());
         b2_bundle.envelopes = [sealed(&bob(), &alice(), &alice_note_2, &TxKey([13; 32])), fixtures::env(9)];
-        let tx2 = Transaction::shielded(gs.chain_id, b2_bundle, Action::None);
+        let tx2 = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, b2_bundle, Action::None));
         let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &key(1));
         storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 
@@ -427,7 +427,7 @@ mod tests {
             sealed(&bob(), &alice(), &alice_note, &payment_key),
             seal_note(&bob(), &address_of(&bob()), &change, &change_key).unwrap(),
         ];
-        let tx = Transaction::shielded(7, bundle, Action::None);
+        let tx = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, bundle, Action::None));
 
         // The payment key discloses the payment and nothing else.
         let opened = disclosed(&tx, None, &payment_key);

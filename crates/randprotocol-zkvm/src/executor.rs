@@ -30,7 +30,13 @@
 //! an empty one, which declares `tables::public::MIN_LOG_HEIGHT`). The public segment also
 //! changes *what* verification means: `H_PUB` (`pv::PUB0..7`) is unsalted, so a verifier that
 //! holds the words can recompute it — `Machine::verify_public`. `verify_bundle` runs
-//! `verify_public(hc, &[], proof)`, which pins `H_PUB` to `hash::public_digest(&[])`. Since the
+//! `verify_public(hc, &binding, proof)`, which pins `H_PUB` to `hash::public_digest(&binding)`:
+//! since Task 5b (the transaction binding, a hard fork like constraint set 6) every bundle proof is
+//! made over, and verified against, the eight words of `Transaction::binding` of the transaction it
+//! rides in — so a proof copied onto a transaction with a changed action, changed envelopes or a
+//! different companion bundle no longer verifies. The bundle guest never reads the segment
+//! (`SYS_READ_PUBLIC`); it does not need to, because the public table's `PUBLIC_DIGEST` bus binds
+//! the committed words into `H_PUB` whether or not the guest reads them. Since the
 //! call limits (spec §5) a program may be deployed with a public input, whose digest the ledger
 //! records once at deploy (`ProgramRecord::public_digest`); `verify_call` runs `verify` and then
 //! compares `pv::PUB0..7` with that digest, or with `public_digest(&[])` for a program without
@@ -51,6 +57,7 @@ use crate::tables::{input, program, public};
 use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor};
 use randprotocol_core::notes::{BundleDigestInput, Word8};
 use randprotocol_core::program::{CallOutcome, ProgramRecord};
+use randprotocol_core::types::TX_BINDING_WORDS;
 
 /// M4.2: the `keccak_log_height` of a proof that declares no keccak table — the batch shape
 /// every guest this chain deploys produces, and the only keccak class `warm`/`warm_bundle`
@@ -135,15 +142,21 @@ impl ZkExecutor {
     /// guest never fills is padding the prover pays for, not something a verifier must forbid —
     /// at the production profile a keccak-bearing proof is ~1.91 MB larger (3 106 757 bytes at
     /// tier 10, upstream `docs/03-privacy.md`), so `randprotocol-core`'s 2 MiB `MAX_PROOF_BYTES`
-    /// rejects it long before this would — and the public height's real binding is
-    /// cryptographic anyway: `verify_public(.., &[], ..)` pins `H_PUB` to the empty segment's
-    /// digest, so a bundle proof whose public table holds anything else fails there regardless
-    /// of what height it declared.
+    /// rejects it long before this would.
+    ///
+    /// The public height *is* pinned in the exact case since Task 5b: a bundle proof carries the
+    /// transaction binding — always [`TX_BINDING_WORDS`] words — so its public table has exactly
+    /// one honest height, `public_log_height(TX_BINDING_WORDS)` (`public_log_height`, passed in
+    /// here). Any other declared height is a proof over a segment of some other length — the empty
+    /// segment of a pre-fork bundle proof among them — which `verify_public` would refuse anyway,
+    /// but only after building (and caching, evicting an honest one) a verifier key for the junk
+    /// height; refusing it here is deterministic and costs a comparison.
     fn decode_and_check(
         &self,
         proof: &[u8],
         program_log_height: u8,
         input_log_height: u8,
+        public_log_height: u8,
         exact: bool,
     ) -> Result<Proof, ConfidentialError> {
         let proof = decode_canonical(proof)?;
@@ -162,6 +175,9 @@ impl ZkExecutor {
         }
         if exact && proof.input_log_height != input_log_height {
             return Err(ConfidentialError::InvalidProof("input height not the pinned guest's".into()));
+        }
+        if exact && proof.public_log_height != public_log_height {
+            return Err(ConfidentialError::InvalidProof("public height not the transaction binding's".into()));
         }
         // Reproduces `Machine::verify`'s own equality check, which is simultaneously the check
         // that the batch's *instance count* matches what `chips` would build — nine mandatory
@@ -218,14 +234,18 @@ impl ZkExecutor {
         Self::bundle_program().digest()
     }
 
-    /// The `(program_log_height, input_log_height)` a bundle proof must declare. Both are fixed:
-    /// the guest is one pinned program and its private-input vector is always
-    /// `notes::bundle_input::COUNT` words wide (a dummy input is a zero-amount note, not a
-    /// shorter witness — that is the whole point of the fixed 2-in-2-out shape).
-    fn bundle_heights() -> (u8, u8) {
+    /// The `(program_log_height, input_log_height, public_log_height)` a bundle proof must
+    /// declare. All three are fixed: the guest is one pinned program, its private-input vector is
+    /// always `notes::bundle_input::COUNT` words wide (a dummy input is a zero-amount note, not a
+    /// shorter witness — that is the whole point of the fixed 2-in-2-out shape), and its public
+    /// segment is always the transaction binding, [`TX_BINDING_WORDS`] words (Task 5b) — whose
+    /// height, `public_log_height(8) == 4`, is not the empty segment's `MIN_LOG_HEIGHT == 2`, so a
+    /// pre-fork bundle proof is refused on the declared height alone.
+    pub fn bundle_heights() -> (u8, u8, u8) {
         (
             program::program_log_height(Self::bundle_program().words.len()),
             input::input_log_height(crate::notes::bundle_input::COUNT),
+            public::public_log_height(TX_BINDING_WORDS),
         )
     }
 }
@@ -339,8 +359,9 @@ impl ConfidentialExecutor for ZkExecutor {
         // inside `decode_and_check` shifts by them too, so it runs that same function in front of
         // it, to avoid panicking on an attacker-chosen out-of-range value before ever reaching
         // `verify`. A call's program and input heights are ranged, not exact: the chain knows
-        // neither the program's word count (only its `hc`) nor its private-input width.
-        let proof = self.decode_and_check(proof, 0, 0, false)?;
+        // neither the program's word count (only its `hc`) nor its private-input width. (Its
+        // public height is checked just below, against the record.)
+        let proof = self.decode_and_check(proof, 0, 0, 0, false)?;
         // A deterministic early reject, before `hc_of` and `Machine::verify`: a call against a
         // program deployed with a public input must declare exactly the public-table height the
         // prover derives from that input's length (`Machine::prove` uses
@@ -405,18 +426,25 @@ impl ConfidentialExecutor for ZkExecutor {
     }
 
     fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-        let (plh, ilh) = Self::bundle_heights();
-        let p = self.decode_and_check(proof, plh, ilh, true)?;
+        let (plh, ilh, pubh) = Self::bundle_heights();
+        let p = self.decode_and_check(proof, plh, ilh, pubh, true)?;
         Ok(std::array::from_fn(|k| p.public_values[pv::OUT0 + k] as u32))
     }
 
-    fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<(), ConfidentialError> {
-        let (plh, ilh) = Self::bundle_heights();
-        let p = self.decode_and_check(proof, plh, ilh, true)?;
-        // `verify_public` with the empty segment, exactly as `verify_call` — the bundle guest
-        // issues no `SYS_READ_PUBLIC`, so its only honest `H_PUB` is the empty segment's digest.
+    fn verify_bundle(
+        &self,
+        hc_bundle: &Word8,
+        proof: &[u8],
+        binding: &[u32; TX_BINDING_WORDS],
+    ) -> Result<(), ConfidentialError> {
+        let (plh, ilh, pubh) = Self::bundle_heights();
+        let p = self.decode_and_check(proof, plh, ilh, pubh, true)?;
+        // `verify_public` against the transaction binding (Task 5b): `H_PUB` must be the digest
+        // of exactly the eight words of `Transaction::binding` for the transaction this bundle
+        // rides in. The empty segment (every pre-fork bundle proof) and any other transaction's
+        // words fail here as `PublicValues`.
         self.machine
-            .verify_public(hc_bundle, &[], &p)
+            .verify_public(hc_bundle, binding, &p)
             .map_err(|e| ConfidentialError::InvalidBundleProof(format!("{e:?}")))
     }
 
@@ -424,11 +452,11 @@ impl ConfidentialExecutor for ZkExecutor {
     /// pinned, so its `(tier, program_log_height, input_log_height, keccak_log_height,
     /// sha256_log_height, public_log_height)` is a single known sextuple — tier 14, which is
     /// where the 3811-word guest's trace lands (`tests/shielded.rs` asserts it), `NO_KECCAK`
-    /// and `NO_SHA256` since the guest issues neither hash syscall, and the empty public
-    /// segment's height since it issues no `SYS_READ_PUBLIC`.
+    /// and `NO_SHA256` since the guest issues neither hash syscall, and the transaction
+    /// binding's public height (`bundle_heights`), since every bundle proof commits to it.
     fn warm_bundle(&self) {
-        let (plh, ilh) = Self::bundle_heights();
-        let _ = self.machine.verifier_key(Tier(14), plh, ilh, NO_KECCAK, NO_SHA256, public::public_log_height(0));
+        let (plh, ilh, pubh) = Self::bundle_heights();
+        let _ = self.machine.verifier_key(Tier(14), plh, ilh, NO_KECCAK, NO_SHA256, pubh);
     }
 
     /// The bare zkVM executor cannot build or verify aggregate proofs: the rVM lives in
@@ -550,7 +578,14 @@ pub fn prove_call(
 }
 
 /// Wallet-side prover for a shielded bundle: proves `guests::bundle()` on `inputs` (built by
-/// `notes::bundle_inputs`) and returns (postcard proof bytes, the published bundle digest, tier).
+/// `notes::bundle_inputs`) with `binding` as its public input segment, and returns (postcard proof
+/// bytes, the published bundle digest, tier).
+///
+/// `binding` is `Transaction::binding` of the transaction this bundle will ride in (Task 5b), so
+/// the caller builds that transaction — every field but the proofs — *before* proving, and
+/// proves every bundle of it with the same words. The chain verifies against the binding it
+/// recomputes (`ZkExecutor::verify_bundle`), so a proof made for any other transaction, or
+/// against the empty segment, is refused.
 ///
 /// The tier is not chosen here — `Machine::prove_with` picks the smallest one the trace fits, and
 /// the caller asserts what it got rather than pinning it, so a guest that grows past its tier is
@@ -562,7 +597,12 @@ pub fn prove_call(
 /// instead of failing — so a successful return here says nothing about admissibility. What it
 /// yields is a digest the ledger can recompute from the bundle's published plaintext
 /// (`ConfidentialExecutor::bundle_digest`); a tainted run's digest matches no such plaintext.
-pub fn prove_bundle(profile: FriProfile, inputs: &[u32], backend: Backend) -> Result<(Vec<u8>, Word8, u8), String> {
+pub fn prove_bundle(
+    profile: FriProfile,
+    inputs: &[u32],
+    binding: &[u32; TX_BINDING_WORDS],
+    backend: Backend,
+) -> Result<(Vec<u8>, Word8, u8), String> {
     // The guest reads a fixed-width private-input vector (`notes::bundle_input::COUNT`); a
     // shorter one makes the emulator read past the end and a longer one silently ignores the
     // tail, so neither is a prove request that could ever produce an admissible bundle.
@@ -575,8 +615,9 @@ pub fn prove_bundle(profile: FriProfile, inputs: &[u32], backend: Backend) -> Re
     }
     let m = Machine::new(profile);
     let program = ZkExecutor::bundle_program();
-    // The empty public segment: the bundle guest issues no `SYS_READ_PUBLIC`.
-    let (proof, exec) = m.prove_with(backend, program, inputs, &[], None).map_err(|e| format!("{e:?}"))?;
+    // The transaction binding as the public segment. The guest never reads it; the public
+    // table's `PUBLIC_DIGEST` bus commits it into `H_PUB` regardless.
+    let (proof, exec) = m.prove_with(backend, program, inputs, binding, None).map_err(|e| format!("{e:?}"))?;
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }
 

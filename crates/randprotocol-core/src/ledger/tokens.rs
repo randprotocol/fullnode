@@ -687,9 +687,11 @@ pub fn check_metadata(name: &str, symbol: &str, decimals: u8) -> Result<(), Toke
 ///
 /// **The whole `initial` is in the id — amount, recipient, blinding, time and envelope — not just
 /// the amount** (spec §3, amended 2026-09-19 after Task 4's review). An
-/// [`Action::RegisterToken`] carries no signature, and a transaction's fee bundle is not bound to
-/// the action it rides under, so an observer can lift a pending registration off gossip, attach a
-/// fee bundle of its own and race it. Were only the amount bound, the copy would land under the
+/// [`Action::RegisterToken`] carries no signature, so an observer can lift a pending registration
+/// off gossip, attach a fee bundle of its own and race it. (Since the transaction binding the
+/// creator's *own* fee bundle cannot ride the copy — its proof is bound to the original
+/// transaction, `Transaction::binding` — but the observer's fee bundle is honestly proved for the
+/// copy, because those are the observer's notes.) Were only the amount bound, the copy would land under the
 /// *same* id: whichever won took the identity and the entire initial supply — permanently, for a
 /// fixed-supply token — and the loser died at [`TokenError::AlreadyRegistered`]. With the whole
 /// mint in the id a redirected copy is simply a *different* token, which is all a non-unique
@@ -799,8 +801,10 @@ const NOT_TOKENS: TxError = TxError::UnsupportedAction("tokens");
 /// 5. [`Ledger::check_bundle`] itself: the anchor, the window, and the four words against the
 ///    ledger.
 ///
-/// The caller runs [`Ledger::check_bundle_proof`] **last**, after its own remaining cheap checks,
-/// so a transaction that gets any of this wrong costs no verification (spec §7).
+/// The asset bundle's proof is verified by `Ledger::validate_inner`'s steps 8-9, after every
+/// cheap check of the transaction and against the same transaction binding as the fee bundle's
+/// ([`Ledger::check_bundle_proof`]), so a transaction that gets any of this wrong costs no
+/// verification (spec §7).
 pub(super) fn check_asset_bundle(
     ledger: &Ledger,
     tx: &Transaction,
@@ -987,7 +991,6 @@ pub(super) fn validate(
             // Any registered token, bridged ones included: a transfer moves notes and no public
             // counter, so neither a supply nor a backing is involved.
             check_asset_bundle(ledger, tx, asset_bundle, asset, 0)?;
-            ledger.check_bundle_proof(asset_bundle, executor)?;
         }
         Action::TokenBurn { asset_bundle, asset, amount } => {
             let info = registry.get(*asset).ok_or(TokenError::UnknownToken(*asset))?;
@@ -1010,7 +1013,6 @@ pub(super) fn validate(
             // that do not both fit is refused where it sits.
             info.total_supply.checked_sub(*amount).ok_or(TokenError::SupplyUnderflow)?;
             check_asset_bundle(ledger, tx, asset_bundle, *asset, *amount)?;
-            ledger.check_bundle_proof(asset_bundle, executor)?;
         }
         _ => return Err(NOT_TOKENS),
     }
@@ -1291,7 +1293,8 @@ mod tests {
 
     /// A native id binds every field a registration declares — and the **whole** of its initial
     /// mint, not just the amount (spec §3, amended 2026-09-19): a `RegisterToken` carries no
-    /// signature and its fee bundle is not bound to it, so an observer that could swap the
+    /// signature and an observer may pay for a copy with a fee bundle of its own (the transaction
+    /// binding stops only the creator's), so an observer that could swap the
     /// recipient, the blinding or the envelope of a gossiped registration and keep its id would
     /// take the initial supply outright. With all five in the id, a redirected copy is a
     /// *different* token — which is all a non-unique symbol ever promised.
@@ -1904,7 +1907,7 @@ mod action_tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         b
     }
 
@@ -1940,7 +1943,7 @@ mod action_tests {
         index: u32,
         fee: u64,
     ) -> Transaction {
-        Transaction::shielded(
+        StubExecutor::bound(Transaction::shielded(
             CHAIN,
             fee_bundle(l, seed, fee),
             Action::RegisterToken {
@@ -1952,7 +1955,7 @@ mod action_tests {
                 salt: [3; 32],
                 index,
             },
-        )
+        ))
     }
 
     /// The asset id `register_tx`'s registration lands under, with the whole initial mint in it.
@@ -1994,7 +1997,7 @@ mod action_tests {
         let cm = mint_commitment(&recipient(), amount, asset, time, &r, &StubExecutor);
         let id = l.tokens().unwrap().get(asset).map(|i| i.id).unwrap_or(crate::crypto::Hash::ZERO);
         let signature = signer.sign(token_mint_message(chain_id, &id, nonce, amount, &cm, &env()).as_bytes());
-        Transaction::shielded(
+        StubExecutor::bound(Transaction::shielded(
             CHAIN,
             fee_bundle(l, seed, gas::BUNDLE_BASE),
             Action::TokenMint {
@@ -2007,7 +2010,7 @@ mod action_tests {
                 nonce,
                 signature,
             },
-        )
+        ))
     }
 
     /// The honest mint: this chain, the issuer's key, the register's nonce.
@@ -2026,11 +2029,11 @@ mod action_tests {
     ) -> Transaction {
         let id = l.tokens().unwrap().get(asset).map(|i| i.id).unwrap_or(crate::crypto::Hash::ZERO);
         let signature = signer.sign(set_authority_message(CHAIN, &id, nonce, &new).as_bytes());
-        Transaction::shielded(
+        StubExecutor::bound(Transaction::shielded(
             CHAIN,
             fee_bundle(l, seed, gas::BUNDLE_BASE),
             Action::SetAuthority { asset, new, nonce, signature },
-        )
+        ))
     }
 
     fn tok(e: TokenError) -> TxError {
@@ -2053,22 +2056,22 @@ mod action_tests {
     ) -> Transaction {
         let mut asset_bundle = asset_bundle(l, seed, asset, 0);
         mutate(&mut asset_bundle);
-        Transaction::shielded(
+        StubExecutor::bound(Transaction::shielded(
             CHAIN,
             fee_bundle(l, seed + 4, TWO_BUNDLES),
             Action::TokenTransfer { asset_bundle, memo },
-        )
+        ))
     }
 
     /// A `TokenBurn` of `amount` of `asset`, laid out like [`transfer_tx`].
     fn burn_tx(l: &Ledger, asset: u32, amount: u64, seed: u32, mutate: impl FnOnce(&mut Bundle)) -> Transaction {
         let mut asset_bundle = asset_bundle(l, seed, asset, amount);
         mutate(&mut asset_bundle);
-        Transaction::shielded(
+        StubExecutor::bound(Transaction::shielded(
             CHAIN,
             fee_bundle(l, seed + 4, TWO_BUNDLES),
             Action::TokenBurn { asset_bundle, asset, amount },
-        )
+        ))
     }
 
     /// USDT on chain 2, the one coin behind the bridged token the tests below list.
@@ -2255,9 +2258,9 @@ mod action_tests {
     }
 
     /// The attack the amended id formula closes (spec §3, amended 2026-09-19): a `RegisterToken`
-    /// carries no signature, and a fee bundle is not bound to the action it rides under, so an
-    /// observer can lift a pending registration off gossip, swap one field of its initial mint,
-    /// attach a fee bundle of its own and race it. With the **whole** `InitialMint` in the asset
+    /// carries no signature, so an observer can lift a pending registration off gossip, swap one
+    /// field of its initial mint, attach a fee bundle of its own (the transaction binding keeps the
+    /// creator's from riding the copy, not the observer's own) and race it. With the **whole** `InitialMint` in the asset
     /// id, the redirected copy is a *different* token: it cannot take the original's id, the
     /// original is never `AlreadyRegistered`, and only the index it claimed is gone — which costs
     /// a re-issue at the next index and nothing else. The original's supply still lands on the
@@ -2284,6 +2287,11 @@ mod action_tests {
                 }
             }
             assert_ne!(id_of(&honest), id_of(&stolen), "{field}: a redirected copy is a different token");
+            // Since the transaction binding (Task 5b) the creator's own fee bundle cannot ride the
+            // copy — its proof is bound to the original — so the attacker proves a fee bundle of
+            // its own for the copy, which it can: those are its notes. The id formula is what is
+            // left standing between that copy and the original's identity.
+            StubExecutor::bind(&mut stolen);
 
             // The copy wins the race and takes index 1 — under *its own* id.
             l.apply_tx(&stolen, &proposer().address(), &StubExecutor).expect("the copy is a valid registration");
@@ -2824,7 +2832,7 @@ mod action_tests {
             tx.bundle.as_mut().unwrap().fee = TWO_BUNDLES - 1;
             let b = tx.bundle.as_mut().unwrap();
             let d = StubExecutor.bundle_digest(&b.digest_input());
-            b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+            b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
             tx
         };
         for tx in [transfer_tx(&l, asset, None, 40, |_| {}), burn_tx(&l, asset, 400, 50, |_| {})] {
@@ -2958,5 +2966,29 @@ mod action_tests {
         ] {
             assert_ne!(cm, other);
         }
+    }
+
+    /// Task 5b: a transfer's memo is opaque to the chain, which is exactly why nothing but the
+    /// binding keeps a copier from stripping it or replacing it (it can carry a wallet's
+    /// allowance grant, spec §6). Both copies are refused; the original still validates.
+    #[test]
+    fn a_transfers_proofs_cannot_ride_a_changed_memo() {
+        let mut l = ledger();
+        let asset = list_bridged(&mut l, 1_000);
+        let original = transfer_tx(&l, asset, Some(vec![0xab; 16]), 40, |_| {});
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+        let accepted: Vec<String> = [("stripped", None), ("replaced", Some(vec![0xcd; 16]))]
+            .into_iter()
+            .map(|(what, memo)| {
+                let mut copy = original.clone();
+                let Action::TokenTransfer { memo: m, .. } = &mut copy.action else { panic!("a transfer") };
+                *m = memo;
+                (what, l.validate(&copy, &StubExecutor))
+            })
+            .filter(|(_, got)| !matches!(got, Err(TxError::InvalidBundleProof(_))))
+            .map(|(what, got)| format!("memo {what}: {got:?}"))
+            .collect();
+        assert!(accepted.is_empty(), "{accepted:#?}");
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
     }
 }

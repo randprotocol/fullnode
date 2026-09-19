@@ -2123,8 +2123,8 @@ mod tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d);
-        let register = Transaction::shielded(7, b, Action::RegisterAggregator { registration });
+        b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d, &[0; 8]);
+        let register = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, b, Action::RegisterAggregator { registration }));
         let mut l1 = gs.ledger.clone();
         l1.set_height(1);
         l1.set_timestamp_ms(1);
@@ -2641,7 +2641,7 @@ mod tests {
         let plain = randprotocol_core::program::program_id(0, &plain_words);
         let with_bundle = |nfs: [Word8; 2], cms: [Word8; 2], fee: u64, action| {
             let b = bundle_tx(&ledger, nfs, cms, fee).bundle.expect("bundle_tx always carries one");
-            Transaction::shielded(gs.chain_id, b, action)
+            randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, b, action))
         };
         let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: public.clone() };
         let deploy = with_bundle([nf(1), nf(2)], [cm(1), cm(2)], randprotocol_core::gas::fee_floor(&deploy), deploy);
@@ -2770,7 +2770,7 @@ mod tests {
         let call_fee = randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(12, 0);
         let with_bundle = |nfs: [Word8; 2], cms: [Word8; 2], fee: u64, action| {
             let b = bundle_tx(&ledger, nfs, cms, fee).bundle.expect("bundle_tx always carries one");
-            Transaction::shielded(gs.chain_id, b, action)
+            randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, b, action))
         };
         let h_in: Word8 = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         let envelope = randprotocol_core::types::CallEnvelope {
@@ -3151,8 +3151,8 @@ mod tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d);
-        let register = Transaction::shielded(1, b, randprotocol_core::types::Action::RegisterAggregator { registration });
+        b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d, &[0; 8]);
+        let register = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(1, b, randprotocol_core::types::Action::RegisterAggregator { registration }));
         let b1 = make_block(&gs.block, &mut ledger, vec![register], &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
@@ -3241,7 +3241,7 @@ mod tests {
         let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
 
         let j = |action| {
-            let tx = Transaction::shielded(1, b([nf(1), nf(2)], [cm(1), cm(2)]), action);
+            let tx = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(1, b([nf(1), nf(2)], [cm(1), cm(2)]), action));
             tx_json(&tx, None, &StubExecutor)["action"].clone()
         };
 
@@ -3534,7 +3534,7 @@ mod tests {
                 body: vec![4u8; MAX_CALL_ENVELOPE_BYTES / 4],
             }),
         };
-        Transaction::shielded(7, bundle, call)
+        randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, bundle, call))
     }
 
     /// A deploy at the zkVM's own limit (`max_program_words` = 65 535, a v0.4 genesis's ceiling)
@@ -3930,14 +3930,14 @@ mod tests {
             sealed_to(&bob, &alice, &a500, &TxKey([11; 32])),
             sealed_to(&alice, &bob, &b700, &TxKey([12; 32])),
         ];
-        let tx1 = Transaction::shielded(gs.chain_id, bundle, Action::None);
+        let tx1 = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, bundle, Action::None));
         let b1 = make_block(&gs.block, &mut ledger, vec![tx1], &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
         let a900 = note_for(&alice, &bob, 900);
         let mut bundle = fixtures::bundle(&ledger, [[33; 8], [34; 8]], [a900.commitment(), [44; 8]], bundle_fee());
         bundle.envelopes = [sealed_to(&bob, &alice, &a900, &TxKey([13; 32])), fixtures::env(9)];
-        let tx2 = Transaction::shielded(gs.chain_id, bundle, Action::None);
+        let tx2 = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, bundle, Action::None));
         let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &key(1));
         st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 

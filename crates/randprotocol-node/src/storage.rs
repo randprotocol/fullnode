@@ -2226,7 +2226,7 @@ pub(crate) mod fixtures {
     /// `seed..seed + 3`, so two fixtures with different seeds never collide.
     pub(crate) fn attest_tx(ledger: &Ledger, attestation: Vec<u8>, seed: u32) -> Transaction {
         let asset = deposit_index(ledger, &attestation);
-        Transaction::shielded(
+        randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(
             ledger.chain_id(),
             bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
             Action::BridgeAttest {
@@ -2237,7 +2237,7 @@ pub(crate) mod fixtures {
                 asset,
                 envelope: env(seed as u8),
             },
-        )
+        ))
     }
 
     /// The `asset` word an honest submitter fills in: the index `ledger`'s token registry says
@@ -2258,12 +2258,12 @@ pub(crate) mod fixtures {
         asset_bundle.asset = asset;
         asset_bundle.burn = amount;
         let d = StubExecutor.bundle_digest(&asset_bundle.digest_input());
-        asset_bundle.proof = StubExecutor::make_bundle_proof(&HC, &d);
-        Transaction::shielded(
+        asset_bundle.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+        randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(
             ledger.chain_id(),
             bundle(ledger, [[seed + 4; 8], [seed + 5; 8]], [[seed + 6; 8], [seed + 7; 8]], gas::BRIDGE_BURN_FEE),
             Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain: 2, token: TOKEN, to: EVM_TO },
-        )
+        ))
     }
 
     /// A `TokenTransfer` of asset index `asset` whose asset bundle spends `nfs` and creates `cms`,
@@ -2279,8 +2279,8 @@ pub(crate) mod fixtures {
         let mut asset_bundle = bundle(ledger, nfs, cms, 0);
         asset_bundle.asset = asset;
         let d = StubExecutor.bundle_digest(&asset_bundle.digest_input());
-        asset_bundle.proof = StubExecutor::make_bundle_proof(&HC, &d);
-        Transaction::shielded(
+        asset_bundle.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+        randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(
             ledger.chain_id(),
             bundle(
                 ledger,
@@ -2289,7 +2289,7 @@ pub(crate) mod fixtures {
                 2 * gas::BUNDLE_BASE,
             ),
             Action::TokenTransfer { asset_bundle, memo },
-        )
+        ))
     }
 
     /// [`transfer_tx_with`] laid out like [`burn_tx`]: the asset bundle's words are
@@ -2338,7 +2338,7 @@ pub(crate) mod fixtures {
     /// A bundle whose stub proof publishes exactly the digest the ledger recomputes, anchored to
     /// the newest root `ledger` has recorded and timed at its current height.
     pub(crate) fn bundle_tx(ledger: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64) -> Transaction {
-        Transaction::shielded(ledger.chain_id(), bundle(ledger, nfs, cms, fee), Action::None)
+        randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(ledger.chain_id(), bundle(ledger, nfs, cms, fee), Action::None))
     }
 
     /// A bundle anchored to the ledger's newest recorded root, whose stub proof publishes
@@ -2356,7 +2356,7 @@ pub(crate) mod fixtures {
             proof: Vec::new(),
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         b
     }
 
@@ -2854,7 +2854,7 @@ mod tests {
             let action = Action::Deploy { base_pc: 0, words: vec![word; 5_000], public: vec![] };
             let fee = randprotocol_core::gas::fee_floor(&action);
             let b = bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], fee);
-            Transaction::shielded(ledger.chain_id(), b, action)
+            randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(ledger.chain_id(), b, action))
         };
         let proposer = key(1);
         let mut ledger = gs.ledger.clone();
@@ -2909,7 +2909,7 @@ mod tests {
         let action = Action::Deploy { base_pc: 0, words: vec![0x13; 16], public: vec![] };
         let fee = gas::fee_floor(&action);
         let b = bundle(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee);
-        let tx = Transaction::shielded(ledger.chain_id(), b, action);
+        let tx = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(ledger.chain_id(), b, action));
         let b1 = make_block(&gs.block, &mut ledger, vec![tx], &proposer);
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         assert_eq!(limits(&ledger), chain13, "applying a block keeps them");
@@ -3580,7 +3580,7 @@ mod tests {
         let words = vec![0x13u32; 3];
         ledger.set_height(3);
         let deploy_bundle = bundle_tx(&ledger, [[90; 8], [91; 8]], [[92; 8], [93; 8]], randprotocol_core::gas::fee_floor(&Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] }));
-        let deploy = Transaction::shielded(gs.chain_id, deploy_bundle.bundle.clone().unwrap(), Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] });
+        let deploy = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, deploy_bundle.bundle.clone().unwrap(), Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] }));
         // The bundle's digest commits to its own fields only, so swapping the action is fine.
         let cb3 = make_block(&blocks[1].block, &mut ledger, vec![deploy.clone()], &k);
         let pid = randprotocol_core::program::program_id(0, &words);
@@ -3623,8 +3623,8 @@ mod tests {
         let b1 = bundle_tx(&ledger, [[90; 8], [91; 8]], [[92; 8], [93; 8]], randprotocol_core::gas::fee_floor(&with));
         let b2 = bundle_tx(&ledger, [[94; 8], [95; 8]], [[96; 8], [97; 8]], randprotocol_core::gas::fee_floor(&plain));
         let txs = vec![
-            Transaction::shielded(gs.chain_id, b1.bundle.clone().unwrap(), with),
-            Transaction::shielded(gs.chain_id, b2.bundle.clone().unwrap(), plain),
+            randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, b1.bundle.clone().unwrap(), with)),
+            randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, b2.bundle.clone().unwrap(), plain)),
         ];
         let cb3 = make_block(&blocks[1].block, &mut ledger, txs, &k);
         st.commit(std::slice::from_ref(&cb3), &ledger, &[], &StubExecutor).unwrap();
@@ -4047,8 +4047,8 @@ mod seal_tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
-        Transaction::shielded(7, b, Action::RegisterAggregator { registration })
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+        randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, b, Action::RegisterAggregator { registration }))
     }
 
     /// A gated chain of two committed blocks: block 1 carries the covered bundle (a real

@@ -1,8 +1,9 @@
 //! The call-input envelope a `Call` may carry (spec §6.1).
 //!
 //! This module is the whole chain-side rule, and it is deliberately tiny: the ledger checks the
-//! envelope's size and nothing else. The ciphertext is not bound to the call by consensus but
-//! by the AEAD — the sealing uses the proof's public input commitment `H_IN` as associated
+//! envelope's size and nothing else. The ciphertext is not bound to the call's *proof* by
+//! consensus (it is inside the transaction binding, so the fee bundle's proof covers it, but that
+//! says only that the fee payer chose it) but by the AEAD — the sealing uses the proof's public input commitment `H_IN` as associated
 //! data, so an envelope that does not belong to this call simply fails to open for everyone.
 //! Checking more here would cost every node work that buys no security.
 //!

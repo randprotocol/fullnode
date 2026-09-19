@@ -2164,8 +2164,8 @@ mod tests {
                 proof: vec![],
             };
             let d = StubExecutor.bundle_digest(&b.digest_input());
-            b.proof = StubExecutor::make_bundle_proof(&HC, &d);
-            Transaction::shielded(7, b, randprotocol_core::types::Action::RegisterAggregator { registration })
+            b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+            randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, b, randprotocol_core::types::Action::RegisterAggregator { registration }))
         };
         let b1 = make_block(&gs.block, &mut ledger, vec![fee_tx, register_tx], &key(1));
         storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
@@ -2259,14 +2259,14 @@ mod tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
         let registration = AggregatorRegistration {
             public_key: kp.public_key().clone(),
             payout: payout.clone(),
             signature: kp.sign(aggregator_register_message(l.chain_id(), &payout).as_bytes()),
         };
-        let tx = Transaction::shielded(l.chain_id(), b, randprotocol_core::types::Action::RegisterAggregator { registration });
+        let tx = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(l.chain_id(), b, randprotocol_core::types::Action::RegisterAggregator { registration }));
         let proposer = *l.validators().keys().next().unwrap();
         l.apply_tx(&tx, &proposer, &StubExecutor).unwrap();
     }
@@ -2797,7 +2797,7 @@ mod tests {
             envelopes: [crate::storage::fixtures::env(1), crate::storage::fixtures::env(2)],
             proof,
         };
-        Transaction::shielded(7, bundle, randprotocol_core::Action::None)
+        randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, bundle, randprotocol_core::Action::None))
     }
 
     /// The byte-vector fields ride the CBOR sync wire as byte strings (`crypto::wire_bytes`), not
@@ -3201,7 +3201,7 @@ mod tests {
             envelopes: [crate::storage::fixtures::env(tag), crate::storage::fixtures::env(tag.wrapping_add(1))],
             proof: vec![tag; 32],
         };
-        Transaction::shielded(7, bundle, randprotocol_core::Action::None)
+        randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, bundle, randprotocol_core::Action::None))
     }
 
     #[test]

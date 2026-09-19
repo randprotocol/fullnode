@@ -578,8 +578,8 @@ fn a_ledger_resumed_at_height_h_accepts_a_bundle_timed_at_h() {
         proof: vec![],
     };
     let d = StubExecutor.bundle_digest(&b.digest_input());
-    b.proof = StubExecutor::make_bundle_proof(&tip.hc_bundle(), &d);
-    let tx = Transaction::shielded(1, b, Action::None);
+    b.proof = StubExecutor::make_bundle_proof(&tip.hc_bundle(), &d, &[0; 8]);
+    let tx = StubExecutor::bound(Transaction::shielded(1, b, Action::None));
     tip.validate(&tx, &StubExecutor).expect("a bundle timed at the head height is admissible after a restart");
 }
 
@@ -1036,8 +1036,8 @@ fn staking_tx(l: &Ledger, n: u32, burn: u64, action: crate::types::Action) -> Tr
         proof: vec![],
     };
     let d = StubExecutor.bundle_digest(&b.digest_input());
-    b.proof = StubExecutor::make_bundle_proof(&l.hc_bundle(), &d);
-    Transaction::shielded(1, b, action)
+    b.proof = StubExecutor::make_bundle_proof(&l.hc_bundle(), &d, &[0; 8]);
+    StubExecutor::bound(Transaction::shielded(1, b, action))
 }
 
 /// A `Bond` that registers `v` with `amount` of stake, burning the amount out of the pool.
@@ -1388,8 +1388,8 @@ fn aggregation_node_with(
         proof: vec![],
     };
     let d = StubExecutor.bundle_digest(&b.digest_input());
-    b.proof = StubExecutor::make_bundle_proof(&[3; 8], &d);
-    let register_tx = Transaction::shielded(1, b, crate::types::Action::RegisterAggregator { registration });
+    b.proof = StubExecutor::make_bundle_proof(&[3; 8], &d, &[0; 8]);
+    let register_tx = StubExecutor::bound(Transaction::shielded(1, b, crate::types::Action::RegisterAggregator { registration }));
     gs.ledger.apply_tx(&register_tx, &key.address(), &StubExecutor).unwrap();
     // The synthetic covers the tests name, in the ledger's coverable set (H1's block rule):
     // the single-byte digests 40.. and the two named ones, excess-free, never expiring.

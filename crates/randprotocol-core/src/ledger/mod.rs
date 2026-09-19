@@ -904,16 +904,32 @@ impl Ledger {
     }
 
     /// Spec §7 items 8-9 for one bundle: the digest its proof publishes is the digest its
-    /// plaintext fields hash to, and the proof verifies against the pinned bundle guest. This
-    /// is the expensive half of admission and runs only after every cheap check of *every*
-    /// bundle in the transaction.
-    fn check_bundle_proof(&self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Result<(), TxError> {
+    /// plaintext fields hash to, and the proof verifies against the pinned bundle guest *and*
+    /// against `binding`, the [`Transaction::binding`] of the transaction it rides in. This is
+    /// the expensive half of admission and runs only after every cheap check of *every* bundle in
+    /// the transaction; `validate_inner` computes the binding once and hands the same words to
+    /// both bundles of a two-bundle transaction.
+    ///
+    /// The binding is what ties a proof to everything its digest does not cover — the action, the
+    /// envelopes, the chain id, the other bundle. Without it a copier could keep a transaction's
+    /// proofs byte for byte and change the rest (a burn's destination, a bond's validator, an
+    /// envelope), and whichever copy committed first would spend the notes.
+    fn check_bundle_proof(
+        &self,
+        b: &Bundle,
+        binding: &[u32; crate::types::TX_BINDING_WORDS],
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<(), TxError> {
         // A pruned bundle (spec §6.2's marker form) carries no proof to check: the covering
         // aggregate — verified when its own block applied — is what this bundle's validity
         // rests on. Two checks stand in for it (spec §7's acceptance, the ledger's half): the
         // proof hash must be one the sync side vouched for, and the bundle's own public fields
         // must hash to the digest the covering aggregate's verified public values commit to —
-        // the binding that keeps a peer from substituting the bundle's content.
+        // the binding that keeps a peer from substituting the bundle's content. The transaction
+        // binding (`binding`) is not checked on this path: there is no proof here to carry it.
+        // What authenticates a pruned transaction's action and envelopes is its id — the
+        // certified tx root covers `Transaction::hash`, which covers both (`docs/confidential.md`,
+        // "Transaction binding").
         if let Some(proof_hash) = crate::notes::pruned_proof_hash(&b.proof) {
             let Some((_, pv)) = self.pruned_side.get(&proof_hash) else {
                 return Err(TxError::InvalidBundleProof(crate::confidential::ConfidentialError::MalformedProof));
@@ -928,7 +944,7 @@ impl Ledger {
         if published != executor.bundle_digest(&b.digest_input()) {
             return Err(TxError::BadDigest);
         }
-        executor.verify_bundle(&self.hc_bundle, &b.proof).map_err(TxError::InvalidBundleProof)
+        executor.verify_bundle(&self.hc_bundle, &b.proof, binding).map_err(TxError::InvalidBundleProof)
     }
 
     /// Check a transaction against the current state without applying it.
@@ -1137,9 +1153,16 @@ impl Ledger {
                 return Err(TxError::AggregateNeedsCovered);
             }
         }
-        // 8-9. the bundle's digest, then its proof
+        // 8-9. each bundle's digest, then its proof — the fee bundle's, then a two-bundle
+        // action's asset bundle's ([`Action::asset_bundle`]), both against the one binding of
+        // this transaction, computed once. Every cheap check of both bundles (the asset bundle's
+        // in step 7's arm for its action) has run by now.
         if let Some(b) = bundle {
-            self.check_bundle_proof(b, executor)?;
+            let binding = tx.binding();
+            self.check_bundle_proof(b, &binding, executor)?;
+            if let Some(asset_bundle) = tx.action.asset_bundle() {
+                self.check_bundle_proof(asset_bundle, &binding, executor)?;
+            }
         }
         // 10. the call's own proof, then its fee: the tier's, and the byte term for proof and
         // envelope bytes past the free allowance (spec §7)
@@ -1647,12 +1670,12 @@ mod tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         b
     }
 
     fn tx(l: &Ledger, nfs: [Word8; 2], cms: [Word8; 2]) -> Transaction {
-        Transaction::shielded(7, bundle(l, nfs, cms, gas::BUNDLE_BASE), Action::None)
+        StubExecutor::bound(Transaction::shielded(7, bundle(l, nfs, cms, gas::BUNDLE_BASE), Action::None))
     }
 
     /// A block signed by `key`, carrying `state_root` verbatim so a test can commit to a wrong one.
@@ -1706,11 +1729,11 @@ mod tests {
         t.bundle.as_mut().unwrap().envelopes[0].body = vec![0; MAX_ENVELOPE_BYTES + 1];
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::EnvelopeTooLarge));
         // fee floor
-        let t = Transaction::shielded(
+        let t = StubExecutor::bound(Transaction::shielded(
             7,
             bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE - 1),
             Action::None,
-        );
+        ));
         assert_eq!(
             l.validate(&t, &StubExecutor),
             Err(TxError::FeeTooLow { min: gas::BUNDLE_BASE, fee: gas::BUNDLE_BASE - 1 })
@@ -1739,8 +1762,9 @@ mod tests {
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time: oldest - 1, height: H }));
         t.bundle.as_mut().unwrap().time = oldest; // exactly height - TIME_WINDOW is allowed
         let mut b = t.bundle.clone().unwrap();
-        b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()));
+        b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
         t.bundle = Some(b);
+        StubExecutor::bind(&mut t);
         assert_eq!(l.validate(&t, &StubExecutor), Ok(()));
         // duplicate nullifier inside the bundle, duplicate commitment inside the bundle
         assert_eq!(
@@ -1765,7 +1789,7 @@ mod tests {
         // proof for another guest
         let mut t = tx(&l, [[5; 8], [6; 8]], [[8; 8], [9; 8]]);
         let d = StubExecutor.bundle_digest(&t.bundle.as_ref().unwrap().digest_input());
-        t.bundle.as_mut().unwrap().proof = StubExecutor::make_bundle_proof(&[12; 8], &d);
+        t.bundle.as_mut().unwrap().proof = StubExecutor::make_bundle_proof(&[12; 8], &d, &[0; 8]);
         assert!(matches!(l.validate(&t, &StubExecutor), Err(TxError::InvalidBundleProof(_))));
     }
 
@@ -1916,16 +1940,16 @@ mod tests {
         let words = vec![0x13u32; 4];
         let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
         let under =
-            Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE), deploy.clone());
+            StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE), deploy.clone()));
         assert_eq!(
             l.validate(&under, &StubExecutor),
             Err(TxError::FeeTooLow { min: gas::fee_floor(&deploy), fee: gas::BUNDLE_BASE })
         );
-        let ok = Transaction::shielded(
+        let ok = StubExecutor::bound(Transaction::shielded(
             7,
             bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)),
             deploy.clone(),
-        );
+        ));
         l.apply_tx(&ok, &a.address(), &StubExecutor).unwrap();
         l.record_anchor(l.height());
         let id = program_id(0, &words);
@@ -1933,16 +1957,16 @@ mod tests {
         let proof = StubExecutor::make_proof(&id, 12, [1, 2, 3, 4, 5, 6, 7, 8]);
         let call = Action::Call { program: id, proof, input_envelope: None };
         let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
-        let t = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], fee), call.clone());
+        let t = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], fee), call.clone()));
         let r = l.apply_tx(&t, &a.address(), &StubExecutor).unwrap().unwrap();
         l.record_anchor(l.height());
         assert_eq!(r.outputs, [1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(r.tier, 12);
-        let cheap = Transaction::shielded(7, bundle(&l, [[9; 8], [10; 8]], [[11; 8], [12; 8]], fee - 1), call.clone());
+        let cheap = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[9; 8], [10; 8]], [[11; 8], [12; 8]], fee - 1), call.clone()));
         assert_eq!(l.validate(&cheap, &StubExecutor), Err(TxError::FeeTooLow { min: fee, fee: fee - 1 }));
         l.set_confidential(false);
         // A fresh transaction: `t`'s nullifiers are spent by now, and `Spent` would fire first.
-        let disabled = Transaction::shielded(7, bundle(&l, [[13; 8], [14; 8]], [[15; 8], [16; 8]], fee), call);
+        let disabled = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[13; 8], [14; 8]], [[15; 8], [16; 8]], fee), call));
         assert_eq!(l.validate(&disabled, &StubExecutor), Err(TxError::ConfidentialDisabled));
     }
 
@@ -1966,7 +1990,7 @@ mod tests {
                 Some(_) => Transaction { chain_id: 7, bundle: None, action },
                 None => {
                     let b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::fee_floor(&action));
-                    Transaction::shielded(7, b, action)
+                    StubExecutor::bound(Transaction::shielded(7, b, action))
                 }
             };
             let got = l.validate(&t, &StubExecutor);
@@ -2029,11 +2053,11 @@ mod tests {
         let (a, _) = keys();
         let words = vec![0x13u32; 4];
         let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
-        let d = Transaction::shielded(
+        let d = StubExecutor::bound(Transaction::shielded(
             7,
             bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)),
             deploy,
-        );
+        ));
         l.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
         l.record_anchor(l.height());
         let id = program_id(0, &words);
@@ -2054,7 +2078,7 @@ mod tests {
             let proof = StubExecutor::make_proof(&id, 12, [0; 8]);
             let action = Action::Call { program: id, proof, input_envelope };
             let b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], fee);
-            assert_eq!(l.validate(&Transaction::shielded(7, b, action), &StubExecutor), expect, "n={n}");
+            assert_eq!(l.validate(&StubExecutor::bound(Transaction::shielded(7, b, action)), &StubExecutor), expect, "n={n}");
         }
     }
 
@@ -2068,11 +2092,11 @@ mod tests {
         let (a, _) = keys();
         let words = vec![0x13u32; 4];
         let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
-        let d = Transaction::shielded(
+        let d = StubExecutor::bound(Transaction::shielded(
             7,
             bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)),
             deploy,
-        );
+        ));
         l.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
         l.record_anchor(l.height());
         let id = program_id(0, &words);
@@ -2090,8 +2114,8 @@ mod tests {
         };
         let bare =
             Action::Call { program: id, proof: StubExecutor::make_proof(&id, 12, [6; 8]), input_envelope: None };
-        let t1 = Transaction::shielded(7, bundle(&l, [[10; 8], [11; 8]], [[12; 8], [13; 8]], fee), sealed);
-        let t2 = Transaction::shielded(7, bundle(&l, [[20; 8], [21; 8]], [[22; 8], [23; 8]], fee), bare);
+        let t1 = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[10; 8], [11; 8]], [[12; 8], [13; 8]], fee), sealed));
+        let t2 = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[20; 8], [21; 8]], [[22; 8], [23; 8]], fee), bare));
         let txs = vec![t1.clone(), t2.clone()];
         let block = signed_block(txs.clone(), &a, 2, root_after(&l, &txs, &a.address(), 2));
         let receipts = l.apply_block(&block, &StubExecutor).unwrap();
@@ -2112,27 +2136,27 @@ mod tests {
         let (a, _) = keys();
         // An oversized program is refused by the size cap, before any fee or code check.
         let big = Action::Deploy { base_pc: 0, words: vec![0x13; gas::MAX_PROGRAM_WORDS + 1], public: vec![] };
-        let t = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE), big);
+        let t = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE), big));
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::ProgramTooLarge));
         // A call naming a program nobody deployed.
         let ghost = Hash::digest(b"never deployed");
         let unknown = Action::Call { program: ghost, proof: Vec::new(), input_envelope: None };
-        let t = Transaction::shielded(
+        let t = StubExecutor::bound(Transaction::shielded(
             7,
             bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&unknown)),
             unknown,
-        );
+        ));
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::UnknownProgram(ghost)));
         // Deploy two programs, then call one with the other's proof.
         let words = vec![0x13u32; 4];
         let other = vec![0x73u32; 4];
         for (n, code) in [(0u32, &words), (1, &other)] {
             let deploy = Action::Deploy { base_pc: 0, words: code.clone(), public: vec![] };
-            let d = Transaction::shielded(
+            let d = StubExecutor::bound(Transaction::shielded(
                 7,
                 bundle(&l, [[10 + n; 8], [20 + n; 8]], [[30 + n; 8], [40 + n; 8]], gas::fee_floor(&deploy)),
                 deploy,
-            );
+            ));
             l.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
             l.record_anchor(l.height());
         }
@@ -2140,17 +2164,17 @@ mod tests {
         let wrong_proof = StubExecutor::make_proof(&other_id, 12, [0; 8]);
         let call = Action::Call { program: id, proof: wrong_proof, input_envelope: None };
         let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
-        let t = Transaction::shielded(7, bundle(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]], fee), call);
+        let t = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]], fee), call));
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::InvalidProof(ConfidentialError::WrongProgram)));
         // Redeploying the same code is a no-op: the record keeps its original height.
         assert_eq!(l.program(&id).unwrap().deployed_at, 1);
         l.set_height(9);
         let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
-        let again = Transaction::shielded(
+        let again = StubExecutor::bound(Transaction::shielded(
             7,
             bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], gas::fee_floor(&deploy)),
             deploy,
-        );
+        ));
         l.apply_tx(&again, &a.address(), &StubExecutor).unwrap();
         assert_eq!(l.programs().len(), 2);
         assert_eq!(l.program(&id).unwrap().deployed_at, 1, "a redeploy does not move deployed_at");
@@ -2171,7 +2195,7 @@ mod tests {
         let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: public.clone() };
         let floor = gas::fee_floor(&deploy);
         assert_eq!(floor, gas::BUNDLE_BASE + gas::deploy_fee(words.len() + public.len()));
-        let first = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], floor), deploy.clone());
+        let first = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], floor), deploy.clone()));
         l.apply_tx(&first, &a.address(), &StubExecutor).unwrap();
         l.record_anchor(l.height());
         let id = crate::program::program_id_with_public(0, &words, &public);
@@ -2180,9 +2204,9 @@ mod tests {
 
         l.set_height(9);
         // The redeploy is refused below its floor like any deploy: the public words are paid for again.
-        let cheap = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], floor - 1), deploy.clone());
+        let cheap = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], floor - 1), deploy.clone()));
         assert_eq!(l.validate(&cheap, &StubExecutor), Err(TxError::FeeTooLow { min: floor, fee: floor - 1 }));
-        let again = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], floor), deploy);
+        let again = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], floor), deploy));
         assert_eq!(l.validate(&again, &StubExecutor), Ok(()));
         let (fees, rewards) = (l.supply().fees_paid, l.validators()[&a.address()].rewards);
         assert_eq!(l.apply_tx(&again, &a.address(), &StubExecutor).unwrap(), None, "a deploy has no receipt");
@@ -2206,14 +2230,14 @@ mod tests {
         let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: public.clone() };
         assert_eq!(gas::fee_floor(&deploy), gas::BUNDLE_BASE + gas::deploy_fee(7));
         let code_only = gas::BUNDLE_BASE + gas::deploy_fee(words.len());
-        let under = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], code_only), deploy.clone());
+        let under = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], code_only), deploy.clone()));
         assert_eq!(
             l.validate(&under, &StubExecutor),
             Err(TxError::FeeTooLow { min: gas::fee_floor(&deploy), fee: code_only }),
             "the public words are paid for"
         );
         let ok =
-            Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)), deploy);
+            StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)), deploy));
         l.apply_tx(&ok, &a.address(), &StubExecutor).unwrap();
         l.record_anchor(l.height());
         let id = crate::program::program_id_with_public(0, &words, &public);
@@ -2226,7 +2250,7 @@ mod tests {
         // A program deployed without a public input keeps today's id and records no digest.
         let plain = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
         assert_eq!(gas::fee_floor(&plain), gas::BUNDLE_BASE + gas::deploy_fee(4));
-        let t = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::fee_floor(&plain)), plain);
+        let t = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::fee_floor(&plain)), plain));
         l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
         assert_eq!(l.program(&program_id(0, &words)).unwrap().public_digest, None);
         assert_eq!(l.program(&program_id(0, &words)).unwrap().public_len, 0);
@@ -2238,7 +2262,7 @@ mod tests {
     fn a_deploy_over_the_public_cap_is_refused() {
         let deploy = |l: &Ledger, n: usize| {
             let action = Action::Deploy { base_pc: 0, words: vec![0x13; 4], public: vec![1; n] };
-            Transaction::shielded(7, bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&action)), action)
+            StubExecutor::bound(Transaction::shielded(7, bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&action)), action))
         };
         let l = ledger();
         assert_eq!(l.validate(&deploy(&l, 0), &StubExecutor), Ok(()));
@@ -2249,7 +2273,7 @@ mod tests {
         assert_eq!(raised.validate(&deploy(&raised, 4), &StubExecutor), Err(TxError::ProgramPublicTooLarge));
         // Before the fee: an underpaying oversized deploy is refused for its size.
         let action = Action::Deploy { base_pc: 0, words: vec![0x13; 4], public: vec![1; 4] };
-        let t = Transaction::shielded(7, bundle(&raised, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE), action);
+        let t = StubExecutor::bound(Transaction::shielded(7, bundle(&raised, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE), action));
         assert_eq!(raised.validate(&t, &StubExecutor), Err(TxError::ProgramPublicTooLarge));
     }
 
@@ -2271,7 +2295,7 @@ mod tests {
         for p in [public.clone(), vec![]] {
             let d = Action::Deploy { base_pc: 0, words: words.clone(), public: p };
             let [n0, n1, c0, c1] = next();
-            let t = Transaction::shielded(7, bundle(&l, [n0, n1], [c0, c1], gas::fee_floor(&d)), d);
+            let t = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [n0, n1], [c0, c1], gas::fee_floor(&d)), d));
             l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
             l.record_anchor(l.height());
         }
@@ -2280,11 +2304,11 @@ mod tests {
         let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
         let mut call = |l: &mut Ledger, program: ProgramId, proof: Vec<u8>, apply: bool| {
             let [n0, n1, c0, c1] = next();
-            let t = Transaction::shielded(
+            let t = StubExecutor::bound(Transaction::shielded(
                 7,
                 bundle(l, [n0, n1], [c0, c1], fee),
                 Action::Call { program, proof, input_envelope: None },
-            );
+            ));
             if apply {
                 let r = l.apply_tx(&t, &a.address(), &StubExecutor).map(|r| r.unwrap());
                 l.record_anchor(l.height());
@@ -2319,7 +2343,7 @@ mod tests {
         let (a, _) = keys();
         let deploy = |l: &Ledger, n: usize| {
             let action = Action::Deploy { base_pc: 0, words: vec![0x13; n], public: vec![] };
-            Transaction::shielded(7, bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&action)), action)
+            StubExecutor::bound(Transaction::shielded(7, bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&action)), action))
         };
         let l = ledger();
         assert_eq!(l.max_program_words(), gas::MAX_PROGRAM_WORDS);
@@ -2410,8 +2434,8 @@ mod tests {
         fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
             StubExecutor.bundle_proof_digest(proof)
         }
-        fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<(), ConfidentialError> {
-            StubExecutor.verify_bundle(hc_bundle, proof)
+        fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
+            StubExecutor.verify_bundle(hc_bundle, proof, binding)
         }
         fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
             StubExecutor.aggregate_program_digest(shape)
@@ -2433,7 +2457,7 @@ mod tests {
         let (a, _) = keys();
         let words = vec![0x13u32; 4];
         let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
-        let d = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)), deploy);
+        let d = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)), deploy));
         l.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
         l.record_anchor(l.height());
         (l, program_id(0, &words))
@@ -2442,7 +2466,7 @@ mod tests {
     /// A call to `id` with `proof` and no envelope, paying `fee`, on nullifiers derived from `n`.
     fn call_tx(l: &Ledger, n: u32, id: ProgramId, proof: Vec<u8>, fee: u64) -> Transaction {
         let b = bundle(l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], fee);
-        Transaction::shielded(7, b, Action::Call { program: id, proof, input_envelope: None })
+        StubExecutor::bound(Transaction::shielded(7, b, Action::Call { program: id, proof, input_envelope: None }))
     }
 
     /// What a call carrying `bytes` of proof and envelope pays: the bundle base and `call_fee`.
@@ -2480,7 +2504,7 @@ mod tests {
         let fat_bundle = |l: &Ledger| {
             let mut b = bundle(l, [[50; 8], [51; 8]], [[52; 8], [53; 8]], gas::BUNDLE_BASE);
             b.proof = vec![0; over];
-            Transaction::shielded(7, b, Action::None)
+            StubExecutor::bound(Transaction::shielded(7, b, Action::None))
         };
         assert_eq!(default.validate(&fat_bundle(&default), &StubExecutor), Err(TxError::ProofTooLarge));
         let got = raised.validate(&fat_bundle(&raised), &StubExecutor);
@@ -2493,7 +2517,7 @@ mod tests {
             let action =
                 Action::BridgeBurn { asset_bundle, asset: 1, amount: 400, relayer_fee: 100, to_chain: 2, token: [9; 32], to: [9; 32] };
             let b = bundle(l, [[64; 8], [65; 8]], [[66; 8], [67; 8]], gas::fee_floor(&action));
-            Transaction::shielded(7, b, action)
+            StubExecutor::bound(Transaction::shielded(7, b, action))
         };
         assert_eq!(default.validate(&burn(&default), &StubExecutor), Err(TxError::ProofTooLarge));
         let got = raised.validate(&burn(&raised), &StubExecutor);
@@ -2561,7 +2585,7 @@ mod tests {
             let proof = StubExecutor::make_proof(&id, 12, [0; 8]);
             let bytes = proof.len() + total;
             let b = bundle(l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], fee_for(bytes));
-            Transaction::shielded(7, b, Action::Call { program: id, proof, input_envelope: Some(envelope(total)) })
+            StubExecutor::bound(Transaction::shielded(7, b, Action::Call { program: id, proof, input_envelope: Some(envelope(total)) }))
         };
         let today = crate::types::MAX_CALL_ENVELOPE_BYTES;
         assert_eq!(default.validate(&call(&default, 10, today), &StubExecutor), Ok(()));
@@ -2649,7 +2673,7 @@ mod tests {
         let proof = PaddedStub::proof(&id, gas::CALL_FREE_BYTES);
         let envelope = crate::types::CallEnvelope { kem_ct: vec![], to_sender: vec![2; 60], to_auditor: vec![], body: vec![] };
         let b = bundle(&le, [[40; 8], [41; 8]], [[42; 8], [43; 8]], today);
-        let t = Transaction::shielded(7, b, Action::Call { program: id, proof, input_envelope: Some(envelope) });
+        let t = StubExecutor::bound(Transaction::shielded(7, b, Action::Call { program: id, proof, input_envelope: Some(envelope) }));
         assert_eq!(le.validate(&t, &PaddedStub), Err(TxError::FeeTooLow { min: today + gas::CALL_PER_KIB, fee: today }));
     }
 
@@ -2844,5 +2868,30 @@ mod tests {
         }
         assert_eq!(scratch.next_index(), 4, "four new leaves in tree order");
         assert_eq!(scratch.validators()[&a.address()].rewards, 2 * gas::BUNDLE_BASE);
+    }
+
+    /// Task 5b: a plain transfer's envelopes are what its recipients open their notes with, and
+    /// the proof never saw them — so before the binding a copier could replace one with garbage
+    /// and, by committing first, strand the payment forever. Refused now; so is the same
+    /// transaction under another chain id. The original still validates.
+    #[test]
+    fn a_transfers_proof_cannot_ride_a_changed_envelope_or_chain() {
+        let l = ledger();
+        let original = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+        let accepted: Vec<String> = (0..2)
+            .map(|slot| {
+                let mut copy = original.clone();
+                copy.bundle.as_mut().unwrap().envelopes[slot].body = vec![0xee; 8];
+                (slot, l.validate(&copy, &StubExecutor))
+            })
+            .filter(|(_, got)| !matches!(got, Err(TxError::InvalidBundleProof(_))))
+            .map(|(slot, got)| format!("envelope {slot} replaced: {got:?}"))
+            .collect();
+        assert!(accepted.is_empty(), "{accepted:#?}");
+        let mut other_chain = original.clone();
+        other_chain.chain_id = 8;
+        assert!(l.validate(&other_chain, &StubExecutor).is_err());
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
     }
 }

@@ -599,13 +599,13 @@ mod tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         b
     }
 
     /// A transaction carrying `action`, with fresh nullifiers and commitments keyed off `n`.
     fn tx(l: &Ledger, n: u32, burn: u64, action: Action) -> Transaction {
-        Transaction::shielded(CHAIN, bundle(l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], burn), action)
+        StubExecutor::bound(Transaction::shielded(CHAIN, bundle(l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], burn), action))
     }
 
     fn registration(k: &Keypair, payout: ShieldedAddress) -> Registration {
@@ -890,8 +890,9 @@ mod tests {
         {
             let b = transfer.bundle.as_mut().unwrap();
             b.commitments = [collide, [43; 8]];
-            b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()));
+            b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
         }
+        StubExecutor::bind(&mut transfer);
         l.apply_tx(&transfer, &proposer, &StubExecutor).unwrap();
         let t = withdraw_tx(&v, 30 * BASE, 1, 5, [9; 8]);
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::CommitmentExists(collide)));
@@ -1144,5 +1145,24 @@ mod tests {
         assert_eq!(after_transfer.supply.fees_paid, 2 * fee);
         assert_eq!(after_transfer.supply.burned, MIN_STAKE, "only a bond burns");
         assert_eq!(after_transfer.register_total, after_withdraw.register_total + fee);
+    }
+
+    /// Task 5b: a `Bond`'s bundle burns the stake, and before the binding a copier could keep the
+    /// bundle and its proof and name *another* registered validator — the burned stake credited
+    /// to someone the sender never chose. Refused now; the original still validates.
+    #[test]
+    fn a_bonds_proof_cannot_ride_a_changed_validator() {
+        let l = ledger(vec![entry(&key(1), MIN_STAKE, payout(1)), entry(&key(2), MIN_STAKE, payout(2))]);
+        let original = bond_tx(&l, 10, &key(2), 500, None);
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+        let mut copy = original.clone();
+        let Action::Bond { validator, .. } = &mut copy.action else { panic!("a bond") };
+        *validator = key(1).address();
+        assert!(
+            matches!(l.validate(&copy, &StubExecutor), Err(TxError::InvalidBundleProof(_))),
+            "{:?}",
+            l.validate(&copy, &StubExecutor)
+        );
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
     }
 }

@@ -5,6 +5,7 @@
 use crate::crypto::Hash;
 use crate::notes::{word8_from_bytes, word8_to_bytes, BundleDigestInput, Word8};
 use crate::program::{CallOutcome, ProgramRecord};
+use crate::types::{Transaction, TX_BINDING_WORDS};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
 pub enum ConfidentialError {
@@ -70,8 +71,18 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// Cheap: decode `proof`, check its declared tier/heights/public-value canonicity, and return
     /// the digest it publishes in `OUT0..OUT7`. Verifies nothing cryptographic.
     fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError>;
-    /// Expensive: the STARK verification of a bundle proof against the pinned bundle guest.
-    fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<(), ConfidentialError>;
+    /// Expensive: the STARK verification of a bundle proof against the pinned bundle guest, and
+    /// against `binding` — the [`crate::types::Transaction::binding`] of the transaction the
+    /// bundle rides in, which the proof must carry as its public input segment
+    /// (`pv::PUB0..7 == H_PUB(binding)`). A proof made for any other transaction, or against the
+    /// empty segment, is refused: that is what keeps a copied proof from riding a changed action,
+    /// changed envelopes or a different companion bundle.
+    fn verify_bundle(
+        &self,
+        hc_bundle: &Word8,
+        proof: &[u8],
+        binding: &[u32; crate::types::TX_BINDING_WORDS],
+    ) -> Result<(), ConfidentialError>;
     /// Precompute the bundle verifier key. May be a no-op.
     fn warm_bundle(&self) {}
 
@@ -104,8 +115,12 @@ pub struct StubExecutor;
 
 pub const STUB_MARKER: &[u8; 4] = b"STUB";
 const STUB_LEN: usize = 4 + 1 + 32 + 32 + 32 + 8;
-/// Stub bundle proof: `STUB` || 32-byte digest || blake3("rand-stub-bundle", hc_bundle bytes)[..8].
-const STUB_BUNDLE_LEN: usize = 4 + 32 + 8;
+/// Stub bundle proof: `STUB` || 32-byte digest || blake3("rand-stub-bundle", hc_bundle bytes)[..8]
+/// || the 8 binding words (32 bytes, little-endian) — the stand-in for a real proof's public
+/// input segment, compared word for word by `verify_bundle` exactly as the zkVM compares `H_PUB`.
+const STUB_BUNDLE_LEN: usize = 4 + 32 + 8 + 32;
+/// Where the binding words start inside a stub bundle proof.
+const STUB_BUNDLE_BINDING: usize = 4 + 32 + 8;
 
 impl StubExecutor {
     /// A stub call proof publishing an all-zero `H_IN` — what a test that is not about the
@@ -138,12 +153,43 @@ impl StubExecutor {
         v
     }
 
-    /// Build a stub bundle proof publishing `digest` and bound to the guest commitment `hc_bundle`.
-    pub fn make_bundle_proof(hc_bundle: &Word8, digest: &Word8) -> Vec<u8> {
+    /// Build a stub bundle proof publishing `digest`, bound to the guest commitment `hc_bundle`
+    /// and to `binding` — the [`Transaction::binding`] of the transaction it will ride in.
+    pub fn make_bundle_proof(hc_bundle: &Word8, digest: &Word8, binding: &[u32; TX_BINDING_WORDS]) -> Vec<u8> {
         let mut v = STUB_MARKER.to_vec();
         v.extend_from_slice(&word8_to_bytes(digest));
         v.extend_from_slice(&Hash::digest_domain(b"rand-stub-bundle", &word8_to_bytes(hc_bundle)).0[..8]);
+        v.extend_from_slice(&word8_to_bytes(binding));
         v
+    }
+
+    /// Re-bind every stub bundle proof `tx` carries — the fee bundle's and an asset bundle's — to
+    /// `tx.binding()`, leaving each proof's digest and guest commitment as they were, and leaving
+    /// anything that is not a well-formed stub bundle proof (a pruned marker, deliberately broken
+    /// bytes) untouched. What a test calls once it has finished assembling a transaction: the
+    /// stub's analogue of a wallet proving after it has built everything but the proofs.
+    ///
+    /// Binding blanks every proof, so the order in which the two proofs are rewritten does not
+    /// matter: the binding is the same before and after.
+    pub fn bind(tx: &mut Transaction) {
+        let binding = word8_to_bytes(&tx.binding());
+        let rebind = |b: &mut crate::notes::Bundle| {
+            if b.proof.len() == STUB_BUNDLE_LEN && &b.proof[..4] == STUB_MARKER {
+                b.proof[STUB_BUNDLE_BINDING..].copy_from_slice(&binding);
+            }
+        };
+        if let Some(b) = tx.bundle.as_mut() {
+            rebind(b);
+        }
+        if let Some(b) = tx.action.asset_bundle_mut() {
+            rebind(b);
+        }
+    }
+
+    /// [`Self::bind`], by value.
+    pub fn bound(mut tx: Transaction) -> Transaction {
+        Self::bind(&mut tx);
+        tx
     }
 
     fn hash_words(domain: &[u8], parts: &[&[u8]]) -> Word8 {
@@ -236,11 +282,21 @@ impl ConfidentialExecutor for StubExecutor {
         Ok(word8_from_bytes(&proof[4..36]).unwrap())
     }
 
-    fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<(), ConfidentialError> {
+    fn verify_bundle(
+        &self,
+        hc_bundle: &Word8,
+        proof: &[u8],
+        binding: &[u32; TX_BINDING_WORDS],
+    ) -> Result<(), ConfidentialError> {
         self.bundle_proof_digest(proof)?;
         let expected = &Hash::digest_domain(b"rand-stub-bundle", &word8_to_bytes(hc_bundle)).0[..8];
-        if &proof[36..] != expected {
+        if &proof[36..STUB_BUNDLE_BINDING] != expected {
             return Err(ConfidentialError::WrongProgram);
+        }
+        // The binding, as the zkVM checks `H_PUB`: a proof made for another transaction is
+        // refused with the same words `Machine::verify_public` reports (`PublicValues`).
+        if proof[STUB_BUNDLE_BINDING..] != word8_to_bytes(binding) {
+            return Err(ConfidentialError::InvalidBundleProof("PublicValues".into()));
         }
         Ok(())
     }
@@ -321,10 +377,17 @@ mod tests {
     fn stub_bundle_proof_carries_its_digest_and_binds_hc() {
         let hc = [3u32; 8];
         let d = [5u32; 8];
-        let p = StubExecutor::make_bundle_proof(&hc, &d);
+        let binding = [6u32; 8];
+        let p = StubExecutor::make_bundle_proof(&hc, &d, &binding);
         assert_eq!(StubExecutor.bundle_proof_digest(&p).unwrap(), d);
-        assert_eq!(StubExecutor.verify_bundle(&hc, &p), Ok(()));
-        assert_eq!(StubExecutor.verify_bundle(&[4u32; 8], &p), Err(ConfidentialError::WrongProgram));
+        assert_eq!(StubExecutor.verify_bundle(&hc, &p, &binding), Ok(()));
+        assert_eq!(StubExecutor.verify_bundle(&[4u32; 8], &p, &binding), Err(ConfidentialError::WrongProgram));
+        // Task 5b: the stub enforces the binding as the zkVM does — another transaction's words
+        // are refused, and so is a proof made against no transaction at all.
+        let public_values = Err(ConfidentialError::InvalidBundleProof("PublicValues".into()));
+        assert_eq!(StubExecutor.verify_bundle(&hc, &p, &[7u32; 8]), public_values);
+        let unbound = StubExecutor::make_bundle_proof(&hc, &d, &[0; 8]);
+        assert_eq!(StubExecutor.verify_bundle(&hc, &unbound, &binding), public_values);
         assert_eq!(StubExecutor.bundle_proof_digest(b"junk"), Err(ConfidentialError::MalformedProof));
         assert_ne!(StubExecutor.node_hash(&[1; 8], &[2; 8]), StubExecutor.node_hash(&[2; 8], &[1; 8]));
     }

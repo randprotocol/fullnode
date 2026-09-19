@@ -10,7 +10,7 @@ pub use actions::{
 pub use block::{Block, BlockHeader, QuorumCertificate, Vote};
 pub use transaction::{
     format_amount, parse_amount, Action, AmountError, Transaction, FAUCET_MAX_UNITS, TOKEN_DECIMALS, TOKEN_SYMBOL,
-    UNITS_PER_RAND,
+    TX_BINDING_DOMAIN, TX_BINDING_WORDS, UNITS_PER_RAND,
 };
 pub use validator::{Validator, ValidatorSet};
 

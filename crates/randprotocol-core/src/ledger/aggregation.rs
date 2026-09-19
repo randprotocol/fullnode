@@ -1194,7 +1194,7 @@ mod register_tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         b
     }
 
@@ -1207,11 +1207,11 @@ mod register_tests {
     }
 
     fn register_tx(l: &Ledger, kp: &Keypair, payout: &ShieldedAddress, burn: u64) -> Transaction {
-        Transaction::shielded(
+        StubExecutor::bound(Transaction::shielded(
             7,
             bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, burn),
             Action::RegisterAggregator { registration: registration(kp, payout) },
-        )
+        ))
     }
 
     fn unbond_tx(kp: &Keypair, nonce: u64) -> Transaction {
@@ -1309,7 +1309,7 @@ mod register_tests {
         tx2.bundle.as_mut().unwrap().nullifiers = [[5; 8], [6; 8]];
         tx2.bundle.as_mut().unwrap().commitments = [[7; 8], [8; 8]];
         let d = StubExecutor.bundle_digest(&tx2.bundle.as_ref().unwrap().digest_input());
-        tx2.bundle.as_mut().unwrap().proof = StubExecutor::make_bundle_proof(&HC, &d);
+        tx2.bundle.as_mut().unwrap().proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         assert!(l.apply_tx(&tx2, &proposer(&l), &StubExecutor).is_err());
     }
 
@@ -1342,11 +1342,11 @@ mod register_tests {
         let payout = payout_addr();
         let mut registration = registration(&kp, &payout);
         registration.signature = kp.sign(b"not the registration message");
-        let tx = Transaction::shielded(
+        let tx = StubExecutor::bound(Transaction::shielded(
             7,
             bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, cfg().bond),
             Action::RegisterAggregator { registration },
-        );
+        ));
         assert!(l.apply_tx(&tx, &proposer(&l), &StubExecutor).is_err());
     }
 
@@ -1535,7 +1535,7 @@ mod admission_tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         b
     }
 
@@ -1555,11 +1555,11 @@ mod admission_tests {
             payout: payout.clone(),
             signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
         };
-        let tx = Transaction::shielded(
+        let tx = StubExecutor::bound(Transaction::shielded(
             7,
             bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, cfg().bond),
             Action::RegisterAggregator { registration },
-        );
+        ));
         l.apply_tx(&tx, &proposer(l), &StubExecutor).unwrap();
     }
 
@@ -2009,7 +2009,7 @@ mod payment_tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&HC, &d);
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         b
     }
 
@@ -2020,11 +2020,11 @@ mod payment_tests {
             payout: payout.clone(),
             signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
         };
-        let tx = Transaction::shielded(
+        let tx = StubExecutor::bound(Transaction::shielded(
             7,
             bundle(l, [[tag; 8], [tag + 1; 8]], [[tag + 2; 8], [tag + 3; 8]], gas::BUNDLE_BASE, cfg_with_window(256).bond),
             Action::RegisterAggregator { registration },
-        );
+        ));
         l.apply_tx(&tx, &proposer(l), &StubExecutor).unwrap();
         l.record_anchor(l.height());
     }
@@ -2096,7 +2096,7 @@ mod payment_tests {
         let mut l = gated(256);
         let p = proposer(&l);
         let fee = gas::BUNDLE_BASE + 60;
-        let tx = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), Action::None);
+        let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), Action::None));
         l.apply_tx(&tx, &p, &StubExecutor).unwrap();
         assert_eq!(l.validators()[&p].rewards, gas::BUNDLE_BASE, "the proposer keeps the floor");
         assert_eq!(l.supply().fees_paid, gas::BUNDLE_BASE, "only the floor has left the pool so far");
@@ -2114,7 +2114,7 @@ mod payment_tests {
         u.set_faucet(true);
         u.set_confidential(true);
         u.set_height(1);
-        let tx = Transaction::shielded(7, bundle(&u, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), Action::None);
+        let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&u, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), Action::None));
         u.apply_tx(&tx, &p, &StubExecutor).unwrap();
         assert_eq!(u.validators()[&p].rewards, fee);
         assert_eq!(u.supply().fees_paid, fee);
@@ -2132,7 +2132,7 @@ mod payment_tests {
         l.record_anchor(1);
         let p = proposer(&l);
         let fee = gas::BUNDLE_BASE + 60;
-        let covered_tx = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None);
+        let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None));
         l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
         let before = l.supply();
 
@@ -2161,7 +2161,7 @@ mod payment_tests {
         let (a, _) = keys();
         let p = proposer(&l);
         let fee = gas::BUNDLE_BASE + 60;
-        let tx = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), Action::None);
+        let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), Action::None));
         l.apply_block(&signed_block(&l, vec![tx.clone()], &a, 1), &StubExecutor).unwrap();
         assert_eq!(l.unsealed_fees().get(&tx.hash()), Some(&(60, p, 3)), "bucketed, coverable until 1 + 2");
         assert!(l.audit().invariant_holds());
@@ -2230,11 +2230,11 @@ mod payment_tests {
 
         // A fee-paying bundle, then the aggregate covering it: subsidy minted, excess paid.
         let p = proposer(&l);
-        let covered_tx = Transaction::shielded(
+        let covered_tx = StubExecutor::bound(Transaction::shielded(
             7,
             bundle(&l, [[31; 8], [32; 8]], [[33; 8], [34; 8]], gas::BUNDLE_BASE + 60, 0),
             Action::None,
-        );
+        ));
         l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
         check(&l, "a fee-paying bundle");
         let agg_tx = aggregate_tx(&a, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
@@ -2308,7 +2308,7 @@ mod payment_tests {
         let (kp, _) = keys();
         register(&mut l, &kp, 10);
         let fee = gas::BUNDLE_BASE + 60;
-        let covered_tx = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None);
+        let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None));
         l.apply_block(&signed_block(&l, vec![covered_tx.clone()], &a, 1), &StubExecutor).unwrap();
 
         let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
@@ -2352,8 +2352,8 @@ mod payment_tests {
         let (kp, _) = keys();
         register(&mut l, &kp, 10);
         let fee = gas::BUNDLE_BASE + 60;
-        let c1 = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None);
-        let c2 = Transaction::shielded(7, bundle(&l, [[31; 8], [32; 8]], [[33; 8], [34; 8]], fee, 0), Action::None);
+        let c1 = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None));
+        let c2 = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[31; 8], [32; 8]], [[33; 8], [34; 8]], fee, 0), Action::None));
         l.apply_block(&signed_block(&l, vec![c1.clone(), c2.clone()], &a, 1), &StubExecutor).unwrap();
         (l, a, kp, c1, c2)
     }
@@ -2432,7 +2432,7 @@ mod payment_tests {
         let mut l = gated(256);
         let (kp, _) = keys();
         register(&mut l, &kp, 10);
-        let floor = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE, 0), Action::None);
+        let floor = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE, 0), Action::None));
         l.apply_block(&signed_block(&l, vec![floor.clone()], &a, 1), &StubExecutor).unwrap();
         assert_eq!(l.unsealed_fees().get(&floor.hash()).map(|e| e.0), Some(0), "coverable, with no excess");
         let tx = aggregate_tx(&kp, 0, 1, vec![floor.hash()], b"ok".to_vec());
@@ -2456,7 +2456,7 @@ mod payment_tests {
         use crate::consensus::PrunedBundle;
         let (a, _) = keys();
         let l = gated(256);
-        let tx = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, 0), Action::None);
+        let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, 0), Action::None));
         let digest = StubExecutor.bundle_digest(&tx.bundle.as_ref().unwrap().digest_input());
         let mut pv = [0u64; 34];
         for k in 0..8 {
@@ -2504,7 +2504,7 @@ mod payment_tests {
         let p = proposer(&l);
         // A bundle whose "proof" is the marker form: the side table's pv carries the digest
         // its own public fields hash to.
-        let tx = Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, 0), Action::None);
+        let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, 0), Action::None));
         let digest = StubExecutor.bundle_digest(&tx.bundle.as_ref().unwrap().digest_input());
         let mut pv = [0u64; 34];
         for k in 0..8 {
@@ -2562,7 +2562,7 @@ mod payment_tests {
         assert_eq!(m.validators()[&p].rewards, gas::BUNDLE_BASE);
         // The pruned bundle's excess is bucketed under the *raw* hash — the hash an aggregate's
         // covers name — not the marker form's (spec §6.2's byte-identical replay).
-        let mut rich_tx = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE + 60, 0), Action::None);
+        let mut rich_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE + 60, 0), Action::None));
         let rich_digest = StubExecutor.bundle_digest(&rich_tx.bundle.as_ref().unwrap().digest_input());
         let mut rich_pv = [0u64; 34];
         for k in 0..8 {
@@ -2578,7 +2578,7 @@ mod payment_tests {
             tx_hash: {
                 // The raw hash: recompute the tx with a placeholder raw proof (any bytes —
                 // the hash covers them, which is the point of the side table attesting it).
-                let mut raw = Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE + 60, 0), Action::None);
+                let mut raw = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE + 60, 0), Action::None));
                 raw.bundle.as_mut().unwrap().proof = b"the rich raw proof".to_vec();
                 raw.hash()
             },
@@ -2636,7 +2636,7 @@ mod payment_tests {
         let mut l = gated(256);
         let (kp, _) = keys();
         register(&mut l, &kp, 10);
-        let covered_tx = Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE + 60, 0), Action::None);
+        let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE + 60, 0), Action::None));
         l.apply_block(&signed_block(&l, vec![covered_tx.clone()], &a, 1), &StubExecutor).unwrap();
 
         let tx = aggregate_tx(&kp, 0, 2, vec![covered_tx.hash()], b"ok".to_vec());

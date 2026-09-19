@@ -714,7 +714,7 @@ mod tests {
         let mut big = fixtures::bundle(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee());
         // A proof inside its own cap, twice over once the action carries one too.
         big.proof = vec![3u8; randprotocol_core::gas::MAX_PROOF_BYTES];
-        let tx = Transaction::shielded(
+        let tx = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(
             l.chain_id(),
             big,
             Action::Call {
@@ -722,7 +722,7 @@ mod tests {
                 proof: vec![4u8; randprotocol_core::gas::MAX_PROOF_BYTES],
                 input_envelope: None,
             },
-        );
+        ));
         assert!(
             tx.encoded_len() > randprotocol_core::gas::MAX_BLOCK_BYTES,
             "the fixture must be unminable: {} B",
@@ -757,7 +757,7 @@ mod tests {
         for e in &mut big.envelopes {
             e.body = vec![7u8; 512];
         }
-        let dear = Transaction::shielded(l.chain_id(), big, Action::None);
+        let dear = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(l.chain_id(), big, Action::None));
         m.insert(cheap.clone(), &l, &StubExecutor).unwrap();
         m.insert(dear.clone(), &l, &StubExecutor).unwrap();
         assert_eq!(m.candidates(&l, 10), vec![dear.clone(), cheap.clone()], "the dear one sorts first");
@@ -1157,7 +1157,7 @@ mod tests {
     fn attest_tx_with_r(l: &Ledger, attestation: Vec<u8>, seed: u8, r: Word8) -> Transaction {
         let b = fixtures::bundle(l, [nf(seed), nf(seed + 1)], [cm(seed), cm(seed + 1)], fixtures::bundle_fee());
         let asset = fixtures::deposit_index(l, &attestation);
-        Transaction::shielded(
+        randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(
             l.chain_id(),
             b,
             Action::BridgeAttest {
@@ -1168,7 +1168,7 @@ mod tests {
                 asset,
                 envelope: fixtures::env(seed),
             },
-        )
+        ))
     }
 
     /// [`bridged_ledger`] with validator 1 holding more rewards than the bundle base, so it has
@@ -1444,14 +1444,14 @@ mod tests {
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
-        b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d);
+        b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d, &[0; 8]);
         let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
         let registration = AggregatorRegistration {
             public_key: kp.public_key().clone(),
             payout: payout.clone(),
             signature: kp.sign(aggregator_register_message(1, &payout).as_bytes()),
         };
-        let register = Transaction::shielded(1, b, Action::RegisterAggregator { registration });
+        let register = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(1, b, Action::RegisterAggregator { registration }));
         l.apply_tx(&register, &fixtures::key(1).address(), &StubExecutor).unwrap();
 
         let aggregate = |covers: Vec<Hash>, nonce: u64, r: Word8| {

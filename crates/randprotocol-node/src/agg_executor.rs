@@ -103,8 +103,13 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.bundle_proof_digest(proof)
     }
 
-    fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<(), ConfidentialError> {
-        self.inner.verify_bundle(hc_bundle, proof)
+    fn verify_bundle(
+        &self,
+        hc_bundle: &Word8,
+        proof: &[u8],
+        binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS],
+    ) -> Result<(), ConfidentialError> {
+        self.inner.verify_bundle(hc_bundle, proof, binding)
     }
 
     fn warm_bundle(&self) {
