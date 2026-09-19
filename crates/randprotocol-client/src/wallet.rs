@@ -1616,7 +1616,9 @@ fn burn_is_possible(
              the amount and the relayer fee must be multiples of {unit}"
         ));
     }
-    let locked = backing["locked"].as_u64().context("an asset row without a locked amount")?;
+    // `amount_field`, not `as_u64`: the node renders every amount as a decimal string since
+    // chain 14 (node I3), and an older one as a number. Both are read here.
+    let locked = crate::amount_field(&backing["locked"]).context("an asset row without a locked amount")?;
     if amount > locked {
         return Err(anyhow!(
             "only {locked} is locked in that coin on chain {to_chain}; choose another backing or a smaller amount"
@@ -2204,7 +2206,8 @@ pub async fn build_register_token(
     }
     let index = u32::try_from(reply["next_index"].as_u64().context("rand_getTokens has no next_index")?)
         .context("next_index does not fit a u32")?;
-    let registration_fee = reply["registration_fee"].as_u64().context("rand_getTokens has no registration_fee")?;
+    let registration_fee =
+        crate::amount_field(&reply["registration_fee"]).context("rand_getTokens has no registration_fee")?;
     let initial = match initial {
         Some((amount, recipient)) => {
             if amount == 0 {
@@ -2842,6 +2845,16 @@ mod tests {
         burn_is_possible(&bridged, 1, 5, &usdc, 1, 0).expect("the other coin of the same token");
         burn_is_possible(&bridged, 2, 2, &other, 50, 0).expect("and the token beside it");
 
+        // Node I3: the same rows from a node older than chain 14, where `locked` is a JSON
+        // number. `amount_field` reads either, so the pre-check is not "an asset row without a
+        // locked amount" against every node on either side of the change.
+        let old_node = serde_json::json!({
+            "enabled": true,
+            "assets": [asset_row_numeric(1, 2, usdt, 8, 1_000), asset_row_numeric(1, 5, usdc, 8, 400)],
+        });
+        burn_is_possible(&old_node, 1, 2, &usdt, 1_000, 0).expect("a numeric locked reads the same");
+        assert!(burn_is_possible(&old_node, 1, 5, &usdc, 700, 0).unwrap_err().to_string().contains("only 400 is locked"));
+
         // More of one coin than its own contract is holding, though the token's supply (1 400
         // across its two coins) would cover it. This is the line a user reads.
         let e = burn_is_possible(&bridged, 1, 5, &usdc, 700, 0).unwrap_err().to_string();
@@ -2892,11 +2905,21 @@ mod tests {
 
     /// One `rand_getAssets` row, as the node serves it: the note's `asset` word, the coin's wire
     /// identity, that coin's **source** decimals and what its contract is holding.
+    /// `locked` as the node renders it since chain 14: a decimal **string** (node I3). Every
+    /// reader here goes through `crate::amount_field`, which takes either encoding, and
+    /// [`asset_row_numeric`] is the same row as an older node sends it.
     fn asset_row(index: u32, chain: u16, token: [u8; 32], decimals: u8, locked: u64) -> serde_json::Value {
         serde_json::json!({
             "index": index, "chain": chain, "token": hex::encode(token),
-            "asset_id": hex::encode([index as u8; 32]), "decimals": decimals, "locked": locked,
+            "asset_id": hex::encode([index as u8; 32]), "decimals": decimals, "locked": locked.to_string(),
         })
+    }
+
+    /// [`asset_row`] with `locked` as a JSON number — a node older than chain 14.
+    fn asset_row_numeric(index: u32, chain: u16, token: [u8; 32], decimals: u8, locked: u64) -> serde_json::Value {
+        let mut row = asset_row(index, chain, token, decimals, locked);
+        row["locked"] = serde_json::json!(locked);
+        row
     }
 
     /// [`asset_row`] with one field taken out — an older node's reply, or a corrupted one.

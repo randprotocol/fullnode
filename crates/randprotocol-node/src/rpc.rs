@@ -701,6 +701,13 @@ fn attest_deposit(attestation: &[u8], tokens: Option<&TokenRegistry>) -> Option<
 /// counter: a counter left from an earlier day reads zero, as the ledger reads it, rather than as
 /// a stale figure a relayer would take for today's headroom. `mint_day` is the day that figure is
 /// for (the counter's own day never runs ahead of the head's: block timestamps are monotonic).
+///
+/// `locked`, `mint_cap_per_day` and `minted_today` are decimal **strings** since chain 14 — the
+/// one rule this RPC now follows everywhere (node I3): every u64 *amount* is a string, while
+/// indices, heights, nonces, counts, lengths, decimals and days stay numbers. A 9-decimal token
+/// with a 10 M supply is 1e16, past `Number.MAX_SAFE_INTEGER`, and zUSD passes it at ~90 M
+/// locked; a JS client reading these as numbers got a silently wrong integer. `mint_day`,
+/// `decimals`, `chain` and `index` are not amounts and stay numbers.
 fn asset_json(index: u32, b: &Backing, mint_cap_per_day: u64, day: u32) -> Value {
     let (minted_today, mint_day) = backing_mint_figures(b, day);
     json!({
@@ -709,9 +716,9 @@ fn asset_json(index: u32, b: &Backing, mint_cap_per_day: u64, day: u32) -> Value
         "token": hex::encode(b.token),
         "asset_id": randprotocol_core::bridge::asset_id(b.chain, &b.token).to_hex(),
         "decimals": b.decimals,
-        "locked": b.locked,
-        "mint_cap_per_day": mint_cap_per_day,
-        "minted_today": minted_today,
+        "locked": b.locked.to_string(),
+        "mint_cap_per_day": mint_cap_per_day.to_string(),
+        "minted_today": minted_today.to_string(),
         "mint_day": mint_day,
     })
 }
@@ -773,12 +780,12 @@ const MAX_TOKEN_KEY_CHARS: usize = 100;
 
 /// One source-chain coin behind a bridged token, as the token RPC serves it: its chain, its
 /// source token address, its **source** decimals and the amount its contract holds locked for
-/// this chain — a decimal string, like every supply this RPC serves. Bridge hardening B1's
+/// this chain — a decimal string, like every amount this RPC serves. Bridge hardening B1's
 /// per-backing daily mint cap joins this row: `mint_cap_per_day` (the registry's, shared by every
-/// backing), `minted_today` (a decimal string, same reasoning as `locked`) and `mint_day`, from
-/// the same `backing_mint_figures` `asset_json` uses for `rand_getAssets`/`rand_getBridgeState` —
-/// one computation, two wire shapes (this one strings its amounts; that one, being the older,
-/// already-deployed shape, keeps them as numbers).
+/// backing), `minted_today` (same reasoning as `locked`) and `mint_day`, from the same
+/// `backing_mint_figures` `asset_json` uses for `rand_getAssets`/`rand_getBridgeState` — one
+/// computation, and since chain 14 one encoding too (node I3: every u64 amount is a decimal
+/// string on both, `mint_day` and `decimals` numbers on both).
 fn backing_json(b: &Backing, mint_cap_per_day: u64, day: u32) -> Value {
     let (minted_today, mint_day) = backing_mint_figures(b, day);
     json!({
@@ -786,7 +793,7 @@ fn backing_json(b: &Backing, mint_cap_per_day: u64, day: u32) -> Value {
         "token": hex::encode(b.token),
         "decimals": b.decimals,
         "locked": b.locked.to_string(),
-        "mint_cap_per_day": mint_cap_per_day,
+        "mint_cap_per_day": mint_cap_per_day.to_string(),
         "minted_today": minted_today.to_string(),
         "mint_day": mint_day,
     })
@@ -1059,9 +1066,10 @@ fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
         "anchor": word8_to_hex(&b.anchor),
         "nullifiers": b.nullifiers.iter().map(word8_to_hex).collect::<Vec<_>>(),
         "commitments": b.commitments.iter().map(word8_to_hex).collect::<Vec<_>>(),
-        "fee": b.fee,
-        "burn_a": b.burn_a,
-        "burn_r": b.burn_r,
+        "fee": b.fee.to_string(),
+        "burn_a": b.burn_a.to_string(),
+        "burn_r": b.burn_r.to_string(),
+        // Not an amount: the registry index `burn_a` names (0 for RAND).
         "burn_asset": b.burn_asset,
         "time": b.time,
         "proof_len": b.proof.len(),
@@ -1077,7 +1085,7 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
     let action = match &t.action {
         Action::None => json!({ "kind": "none" }),
         Action::Mint { cm, amount, minter, .. } => json!({
-            "kind": "mint", "cm": word8_to_hex(cm), "amount": amount, "minter": minter.address().to_base58()
+            "kind": "mint", "cm": word8_to_hex(cm), "amount": amount.to_string(), "minter": minter.address().to_base58()
         }),
         Action::Deploy { base_pc, words, public } => json!({
             "kind": "deploy", "program": randprotocol_core::program::program_id_with_public(*base_pc, words, public).to_hex(), "words": words.len(),
@@ -1094,16 +1102,16 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
         // The staking actions are the one place this chain has public amounts by design
         // (spec §8): the register is public, so its inputs are too.
         Action::Bond { validator, amount, registration } => json!({
-            "kind": "bond", "validator": validator.to_base58(), "amount": amount,
+            "kind": "bond", "validator": validator.to_base58(), "amount": amount.to_string(),
             "registered": registration.is_some(),
         }),
         Action::Unbond { validator, amount, nonce, .. } => json!({
-            "kind": "unbond", "validator": validator.to_base58(), "amount": amount, "nonce": nonce
+            "kind": "unbond", "validator": validator.to_base58(), "amount": amount.to_string(), "nonce": nonce
         }),
         // `time` is the note's time word, which the withdrawing node chose: public like the
         // amount, and the one field an explorer needs to say which note this paid.
         Action::Withdraw { validator, amount, nonce, time, .. } => json!({
-            "kind": "withdraw", "validator": validator.to_base58(), "amount": amount, "nonce": nonce,
+            "kind": "withdraw", "validator": validator.to_base58(), "amount": amount.to_string(), "nonce": nonce,
             "time": time
         }),
         // The amount and the asset are inside the attestation, so they are decoded out of it
@@ -1123,7 +1131,7 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
                 // the one to read, because it is `null` exactly when there is no deposit.
                 "asset": asset,
                 "asset_index": deposit.map(|(index, _)| index),
-                "amount": deposit.map(|(_, amount)| amount),
+                "amount": deposit.map(|(_, amount)| amount.to_string()),
                 // The deposit note's own `time` word, which is what a recipient rebuilding that
                 // note needs and the window rule this action was admitted under.
                 "time": time,
@@ -1150,7 +1158,7 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
             })
         }
         Action::BridgeBurn { asset, amount, relayer_fee, to_chain, token, to } => json!({
-            "kind": "bridge_burn", "asset": asset, "amount": amount, "relayer_fee": relayer_fee,
+            "kind": "bridge_burn", "asset": asset, "amount": amount.to_string(), "relayer_fee": relayer_fee.to_string(),
             // The coin being redeemed, which is a field of the action since one bridged token has
             // many backings (spec §12) — the outbound message names this pair.
             "to_chain": to_chain, "token": hex::encode(token), "to": hex::encode(to),
@@ -1192,14 +1200,14 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
             "kind": "register_token", "name": name, "symbol": symbol, "decimals": decimals,
             "authority": authority_kind(authority),
             "index": index,
-            "initial_amount": initial.as_ref().map(|m| m.amount),
+            "initial_amount": initial.as_ref().map(|m| m.amount.to_string()),
             // `null` for a registration without an initial mint.
             "initial": initial.as_ref().map(|m| json!({
-                "amount": m.amount, "recipient": m.recipient.to_string(), "time": m.time, "r": word8_to_hex(&m.r),
+                "amount": m.amount.to_string(), "recipient": m.recipient.to_string(), "time": m.time, "r": word8_to_hex(&m.r),
             })),
         }),
         Action::TokenMint { asset, amount, recipient, r, time, nonce, .. } => json!({
-            "kind": "token_mint", "asset": asset, "amount": amount,
+            "kind": "token_mint", "asset": asset, "amount": amount.to_string(),
             "recipient": recipient.to_string(), "time": time, "r": word8_to_hex(r), "nonce": nonce
         }),
         Action::SetAuthority { asset, new, nonce, .. } => json!({
@@ -1211,7 +1219,7 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
         // `total_supply` auditable. (A transfer of a token is a plain `none` bundle: its asset is
         // private.)
         Action::TokenBurn { asset, amount } => json!({
-            "kind": "token_burn", "asset": asset, "amount": amount,
+            "kind": "token_burn", "asset": asset, "amount": amount.to_string(),
         }),
         // Bridge hardening B1: the pause and its lifting. The nonce is the bridge's
         // `pause_nonce` they spent; an unpause names its PQ signers (indices only, like an
@@ -1878,7 +1886,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "pause_key": bridge.pause_key.as_ref().map(|k| k.to_hex()),
                 // B4: what a `RegisterBridgedToken`'s fee bundle owes on top of the bundle base —
                 // the registry's registration fee, read here so the wallet can pay it exactly.
-                "registration_fee": tokens.as_ref().map(|t| t.registration_fee),
+                "registration_fee": tokens.as_ref().map(|t| t.registration_fee.to_string()),
                 "burn_sequence": bridge.burn_sequence,
                 // `next_index` is gone with the bridge's own registry: there is no index to
                 // predict any more, because a bridged token is listed before it can be deposited
@@ -1913,7 +1921,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .collect();
             Ok(json!({
                 "enabled": true,
-                "registration_fee": tokens.registration_fee,
+                "registration_fee": tokens.registration_fee.to_string(),
                 "next_index": tokens.next_index(),
                 "tokens": rows,
             }))
@@ -2999,7 +3007,8 @@ mod tests {
         assert_eq!(v["height"], 1);
         let j = &v["tx"];
         assert_eq!(j["action"]["kind"], "none");
-        assert_eq!(j["bundle"]["fee"], bundle_fee());
+        // Node I3: every u64 amount the RPC serves is a decimal string.
+        assert_eq!(j["bundle"]["fee"], bundle_fee().to_string());
         assert_eq!(j["bundle"]["nullifiers"][0], word8_to_hex(&nf(1)));
         // No sender, no recipient, no amount: the redacted shape is the point.
         let text = serde_json::to_string(j).unwrap();
@@ -3540,7 +3549,7 @@ mod tests {
         let bond = j(Action::Bond { validator: v, amount: 500, registration: None });
         assert_eq!(bond["kind"], "bond");
         assert_eq!(bond["validator"], v.to_base58());
-        assert_eq!(bond["amount"], 500);
+        assert_eq!(bond["amount"], "500");
         assert_eq!(bond["registered"], false);
 
         // The two validator-signed actions ride bundle-less, so they are rendered as they ride.
@@ -3549,7 +3558,7 @@ mod tests {
         let unbond = bundle_less(Action::Unbond { validator: v, amount: 7, nonce: 2, signature: sig.clone() });
         assert!(unbond["bundle"].is_null(), "an unbond carries no bundle");
         let unbond = unbond["action"].clone();
-        assert_eq!((&unbond["kind"], &unbond["amount"], &unbond["nonce"]), (&json!("unbond"), &json!(7), &json!(2)));
+        assert_eq!((&unbond["kind"], &unbond["amount"], &unbond["nonce"]), (&json!("unbond"), &json!("7"), &json!(2)));
         assert!(!serde_json::to_string(&unbond).unwrap().contains("signature"), "a signature is not explorer data");
 
         let w = bundle_less(Action::Withdraw {
@@ -3565,7 +3574,7 @@ mod tests {
         let w = w["action"].clone();
         assert_eq!(
             (&w["kind"], &w["validator"], &w["amount"], &w["nonce"], &w["time"]),
-            (&json!("withdraw"), &json!(v.to_base58()), &json!(9), &json!(3), &json!(42))
+            (&json!("withdraw"), &json!(v.to_base58()), &json!("9"), &json!(3), &json!(42))
         );
         assert!(!serde_json::to_string(&w).unwrap().contains("\"r\""), "the note's blinding is not explorer data");
 
@@ -3605,7 +3614,7 @@ mod tests {
         assert_eq!(burn["kind"], "bridge_burn");
         assert_eq!(
             (&burn["asset"], &burn["amount"], &burn["relayer_fee"], &burn["to_chain"]),
-            (&json!(2), &json!(400), &json!(100), &json!(5))
+            (&json!(2), &json!("400"), &json!("100"), &json!(5))
         );
         assert_eq!(burn["to"], "ab".repeat(32));
         assert!(burn.get("asset_bundle").is_none(), "a burn is single-bundle: no second bundle to render");
@@ -3614,7 +3623,7 @@ mod tests {
         // else of its own.
         let tb = j(Action::TokenBurn { asset: 3, amount: 400 });
         assert_eq!(tb["kind"], "token_burn");
-        assert_eq!((&tb["asset"], &tb["amount"]), (&json!(3), &json!(400)));
+        assert_eq!((&tb["asset"], &tb["amount"]), (&json!(3), &json!("400")));
         assert!(tb.get("asset_bundle").is_none());
 
         // A call reports its envelope's size, or null when it carries none.
@@ -3673,17 +3682,17 @@ mod tests {
         assert_eq!(transfer["commitments"].as_array().unwrap().len(), 4);
         assert_eq!(transfer["envelope_len"], json!(b.envelopes.iter().map(|e| e.len()).collect::<Vec<_>>()));
         assert_eq!(transfer["envelope_len"].as_array().unwrap().len(), 4);
-        assert_eq!((&transfer["fee"], &transfer["time"]), (&json!(bundle_fee()), &json!(b.time)));
+        assert_eq!((&transfer["fee"], &transfer["time"]), (&json!(bundle_fee().to_string()), &json!(b.time)));
         assert_eq!(
             (&transfer["burn_a"], &transfer["burn_r"], &transfer["burn_asset"]),
-            (&json!(0), &json!(0), &json!(0)),
+            (&json!("0"), &json!("0"), &json!(0)),
             "a transfer — of RAND or of any token — burns nothing"
         );
 
         let (burn, _) = with(Action::TokenBurn { asset: 3, amount: 400 }, 3, 400, 0);
         assert_eq!(
             (&burn["burn_a"], &burn["burn_r"], &burn["burn_asset"]),
-            (&json!(400), &json!(0), &json!(3)),
+            (&json!("400"), &json!("0"), &json!(3)),
             "a holder burn's public amount and asset"
         );
         let (bridge_burn, _) = with(
@@ -3692,9 +3701,9 @@ mod tests {
             900,
             0,
         );
-        assert_eq!((&bridge_burn["burn_a"], &bridge_burn["burn_asset"]), (&json!(900), &json!(2)));
+        assert_eq!((&bridge_burn["burn_a"], &bridge_burn["burn_asset"]), (&json!("900"), &json!(2)));
         let (bond, _) = with(Action::Bond { validator: randprotocol_core::Address([3; 32]), amount: 500, registration: None }, 0, 0, 500);
-        assert_eq!((&bond["burn_a"], &bond["burn_r"], &bond["burn_asset"]), (&json!(0), &json!(500), &json!(0)));
+        assert_eq!((&bond["burn_a"], &bond["burn_r"], &bond["burn_asset"]), (&json!("0"), &json!("500"), &json!(0)));
         // The whole rendered transaction of a transfer names no asset anywhere.
         let text = serde_json::to_string(&tx_json(&tx, None, &StubExecutor)).unwrap();
         assert!(!text.contains("\"asset\""), "{text}");
@@ -3813,7 +3822,7 @@ mod tests {
         assert_eq!(v["mint_paused"], false);
         assert_eq!((&v["pause_nonce"], &v["list_nonce"]), (&json!(0), &json!(0)));
         assert_eq!(v["pause_key"], fixtures::key(0x7f).public_key().to_hex());
-        assert_eq!(v["registration_fee"], 1_000_000_000u64, "B4: what a registration owes past the base");
+        assert_eq!(v["registration_fee"], "1000000000", "B4: what a registration owes past the base");
         assert_eq!(v["burn_sequence"], 1);
         // `next_index` is gone with the bridge's own registry: there is no index left to predict,
         // because a bridged token is listed before it can be deposited.
@@ -3828,10 +3837,10 @@ mod tests {
         let asset = randprotocol_core::bridge::asset_id(2, &fixtures::TOKEN);
         let row = json!({
             "index": 1, "chain": 2, "token": hex::encode(fixtures::TOKEN), "asset_id": asset.to_hex(),
-            "decimals": 8, "locked": 600,
+            "decimals": 8, "locked": "600",
             // B1: the registry's per-backing daily cap, and this coin's counter — the 1 000
             // deposited on the fixture's day 0; the burn released custody, not the counter.
-            "mint_cap_per_day": 100_000u64 * 100_000_000, "minted_today": 1_000, "mint_day": 0,
+            "mint_cap_per_day": (100_000u64 * 100_000_000).to_string(), "minted_today": "1000", "mint_day": 0,
         });
         assert_eq!(ok(&st, "rand_getAssets", json!([])).await, json!([row]));
         assert_eq!(v["assets"], json!([row]));
@@ -3852,7 +3861,7 @@ mod tests {
         let (_d, st, _gs, _) = bridged_chain();
         let row = |v: &Value| (v[0]["minted_today"].clone(), v[0]["mint_day"].clone());
         let assets = ok(&st, "rand_getAssets", json!([])).await;
-        assert_eq!(row(&assets), (json!(1_000), json!(0)), "day 0: the 1 000 deposited today");
+        assert_eq!(row(&assets), (json!("1000"), json!(0)), "day 0: the 1 000 deposited today");
 
         // An empty block one day and a second later.
         let mut ledger = st.storage.load_ledger(&StubExecutor).unwrap();
@@ -3864,7 +3873,7 @@ mod tests {
         assert_eq!((b.minted_today, b.mint_day), (1_000, 0), "the stored counter is untouched");
 
         let assets = ok(&st, "rand_getAssets", json!([])).await;
-        assert_eq!(row(&assets), (json!(0), json!(1)), "day 1: nothing minted yet, not the stale 1 000");
+        assert_eq!(row(&assets), (json!("0"), json!(1)), "day 1: nothing minted yet, not the stale 1 000");
         let state = ok(&st, "rand_getBridgeState", json!([])).await;
         assert_eq!(state["assets"], assets, "both reads serve the same rows");
     }
@@ -3977,7 +3986,7 @@ mod tests {
         let tokens = st.storage.tokens().unwrap().unwrap();
         let v = ok(&st, "rand_getTokens", json!([0, 1000])).await;
         assert_eq!(v["enabled"], true);
-        assert_eq!(v["registration_fee"], json!(tokens.registration_fee));
+        assert_eq!(v["registration_fee"], json!(tokens.registration_fee.to_string()));
         assert_eq!(v["next_index"], 3);
         let rows = v["tokens"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
@@ -3994,7 +4003,7 @@ mod tests {
             json!({ "kind": "bridge", "backings": [
                 {
                     "chain": 2, "token": hex::encode(fixtures::TOKEN), "decimals": 8, "locked": "600",
-                    "mint_cap_per_day": 100_000u64 * 100_000_000, "minted_today": "1000", "mint_day": 0,
+                    "mint_cap_per_day": (100_000u64 * 100_000_000).to_string(), "minted_today": "1000", "mint_day": 0,
                 }
             ] })
         );
@@ -4051,7 +4060,7 @@ mod tests {
             json!({ "total_supply": "600", "backings": [
                 {
                     "chain": 2, "token": hex::encode(fixtures::TOKEN), "decimals": 8, "locked": "600",
-                    "mint_cap_per_day": 100_000u64 * 100_000_000, "minted_today": "1000", "mint_day": 0,
+                    "mint_cap_per_day": (100_000u64 * 100_000_000).to_string(), "minted_today": "1000", "mint_day": 0,
                 }
             ] })
         );
@@ -4105,21 +4114,21 @@ mod tests {
         assert_eq!(m["kind"], "token_mint");
         assert_eq!(
             (&m["asset"], &m["amount"], &m["recipient"], &m["time"], &m["r"]),
-            (&json!(2), &json!(700), &json!(fixtures::recipient().to_string()), &json!(time), &json!(word8_to_hex(r)))
+            (&json!(2), &json!("700"), &json!(fixtures::recipient().to_string()), &json!(time), &json!(word8_to_hex(r)))
         );
 
         let g = tx_json(&register, tokens.as_ref(), &StubExecutor)["action"].clone();
         let Action::RegisterToken { initial: Some(init), .. } = &register.action else { unreachable!() };
         assert_eq!(g["kind"], "register_token");
         assert_eq!(g["index"], 2);
-        assert_eq!(g["initial_amount"], 5_000);
+        assert_eq!(g["initial_amount"], "5000");
         assert_eq!(
             (&g["initial"]["recipient"], &g["initial"]["time"], &g["initial"]["r"], &g["initial"]["amount"]),
             (
                 &json!(fixtures::recipient().to_string()),
                 &json!(init.time),
                 &json!(word8_to_hex(&init.r)),
-                &json!(5_000)
+                &json!("5000")
             )
         );
         // A registration without an initial mint renders `initial: null`, not a note.
@@ -4157,7 +4166,7 @@ mod tests {
         let v = ok(&st, "rand_getTransaction", json!([att.hash().to_hex()])).await;
         let action = &v["tx"]["action"];
         assert_eq!(action["kind"], "bridge_attest");
-        assert_eq!(action["amount"], 1_000);
+        assert_eq!(action["amount"], "1000");
         assert_eq!(action["asset_index"], 1);
         // On a committed attest the two indices agree by rule, not by luck: admission refuses a
         // transaction whose `asset` is not the one the registry resolves.

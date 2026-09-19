@@ -65,6 +65,26 @@ impl std::fmt::Display for SubmitRefused {
 
 impl std::error::Error for SubmitRefused {}
 
+/// A u64 amount off an RPC reply, however the node encoded it: a JSON number or a decimal
+/// string.
+///
+/// Since chain 14 the node's rule is that every u64 *amount* — RAND units or token units — is a
+/// decimal string, while indices, heights, nonces, counts, lengths, decimals and days stay
+/// numbers (node I3): a 9-decimal token with a 10 M supply is 1e16, past a JS client's
+/// `Number.MAX_SAFE_INTEGER`, and zUSD passes it at ~90 M locked. Older nodes send numbers, and
+/// a wallet has to talk to both — so every amount this crate reads goes through here rather than
+/// through `as_u64()`, which silently answers `None` for a string and turns a correct reply into
+/// "an asset row without a locked amount".
+///
+/// `None` for absent, null, a non-integral number, a non-numeral string or anything else.
+pub fn amount_field(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
 /// Re-label a `rand_sendTransaction` failure that is a JSON-RPC error reply as
 /// [`SubmitRefused`], and leave every other failure exactly as it is.
 pub fn submit_refused(e: anyhow::Error) -> anyhow::Error {

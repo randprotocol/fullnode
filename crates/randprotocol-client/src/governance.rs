@@ -76,7 +76,8 @@ impl GovState {
                 .as_object()
                 .map(|m| m.keys().filter_map(|k| k.parse().ok()).collect())
                 .unwrap_or_default(),
-            registration_fee: v["registration_fee"].as_u64(),
+            // Either encoding (node I3): a decimal string on chain 14, a number before it.
+            registration_fee: crate::amount_field(&v["registration_fee"]),
         })
     }
 }

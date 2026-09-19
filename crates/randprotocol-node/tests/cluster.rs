@@ -1421,7 +1421,8 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
     let rendered = n0.rpc.call("rand_getTransaction", serde_json::json!([minted.hash.to_hex()])).await.unwrap();
     let action = &rendered["tx"]["action"];
     assert_eq!(action["kind"], "bridge_attest");
-    assert_eq!(action["amount"], deposit);
+    // Every u64 amount the RPC serves is a decimal string since chain 14 (node I3).
+    assert_eq!(units(&action["amount"]), deposit);
     assert_eq!(action["asset"], index, "the index the action named");
     assert_eq!(action["asset_index"], index, "and the one the registry resolves, which admission held it to");
 
