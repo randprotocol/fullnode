@@ -3255,6 +3255,38 @@ mod tests {
         );
     }
 
+    /// Task 5b review, fix round 1: a marker-form copy must not poison the refused cache. The
+    /// copy — the honest transaction with `bundle.proof` replaced by the sealed form's marker —
+    /// hashes to the honest transaction's id by design (M1). If its refusal were cached, the node
+    /// would then refuse the honest transaction from the cache without verifying it: any gossip
+    /// peer that saw a transaction first could censor it network-wide. The copy first, then the
+    /// honest one: the honest one is verified and admitted.
+    #[test]
+    fn a_marker_form_copy_does_not_poison_the_refused_cache_for_the_raw_transaction() {
+        use crate::admission::{acceptance_for, Acceptance, GossipOutcome, PeerLimiter, RefusedCache};
+        let (_d, storage, gs) = crate::storage::fixtures::genesis_with_two_notes();
+        let raw = bundle_tx(&gs.ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        let mut marker = raw.clone();
+        let b = marker.bundle.as_mut().unwrap();
+        let mut m = randprotocol_core::notes::PRUNED_PROOF_MARKER.to_vec();
+        m.extend_from_slice(Hash::digest(&b.proof).as_bytes());
+        b.proof = m;
+        assert_eq!(marker.hash(), raw.hash(), "the marker form carries the raw id");
+        let profile = randprotocol_core::types::FriProfile::Test;
+        let mut refused = RefusedCache::new(8);
+        let limiter = PeerLimiter::new(16, 4.0);
+        let now = std::time::Instant::now();
+        // The copy arrives first and is verified — and refused, but not as a statement about the id.
+        assert_eq!(GossipOutcome::for_transaction(&marker, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
+        let verdict = validate_for_pool(&marker, &gs.ledger, &storage, profile, &StubExecutor);
+        assert!(verdict.is_err(), "the marker form is not admissible outside sync");
+        assert_ne!(acceptance_for(&verdict, marker.hash(), &mut refused), Acceptance::Reject);
+        assert!(refused.is_empty(), "nothing cached under the shared id: {:?}", refused.get(&raw.hash()));
+        // The honest transaction is then verified, not answered from the cache, and admitted.
+        assert_eq!(GossipOutcome::for_transaction(&raw, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
+        assert_eq!(validate_for_pool(&raw, &gs.ledger, &storage, profile, &StubExecutor), Ok(()));
+    }
+
     /// A verdict decides the acceptance, and only a permanent one reaches the cache.
     #[test]
     fn a_verdict_reports_and_caches_by_permanence() {

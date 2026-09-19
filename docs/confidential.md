@@ -425,6 +425,15 @@ proof is blanked, so it is not bound to the transaction either: the fee bundle's
 call's `program` and `input_envelope`, but another valid proof of the same program could be swapped
 in (it changes only the receipt the fee payer paid for).
 
+**The marker form outside sync (fix round 1).** A sealed block's pruned bundle carries
+`PRUNED_PROOF_MARKER ‖ digest(proof)` in place of its proof, and hashes to the raw transaction's id
+by design (M1). Outside sealed-form sync — admission, gossip, RPC, a proposer — a marker-form proof
+in `tx.bundle` (no side-table entry vouching for it) or in any asset bundle is refused at step 1
+with `TxError::PrunedFormOutsideSync`, which is deliberately **not** a permanent admission verdict:
+the refused cache keys on `tx.hash()`, and caching a marker-form copy's refusal under the shared id
+would let any gossip peer censor the honest transaction. The ledger also drops a block's side table
+once the block has applied.
+
 **Pruned (sealed) transactions.** A pruned bundle's proof is a marker, verified through its
 covering aggregate rather than `verify_bundle`, so the binding is not checked on that path. What
 authenticates a pruned transaction's action and envelopes is its id: `Transaction::hash` covers

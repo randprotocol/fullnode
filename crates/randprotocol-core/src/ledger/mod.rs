@@ -148,6 +148,15 @@ pub enum TxError {
     BadDigest,
     #[error("invalid bundle proof: {0}")]
     InvalidBundleProof(ConfidentialError),
+    /// A bundle proof in the sealed (pruned) marker form outside sealed-form sync: the marker is
+    /// only ever admissible inside a synced block whose side table vouches for it (spec §7).
+    ///
+    /// Deliberately its own variant and **not** a permanent admission verdict: the marker form
+    /// hashes to the raw transaction's id by design (the pre-v0.1 review's M1), so a node that
+    /// cached this refusal by `tx.hash()` would then refuse the honest raw transaction for free —
+    /// a censorship lever any gossip peer could pull (Task 5b review, fix round 1).
+    #[error("a pruned (marker-form) bundle proof is admissible only in sealed-form sync")]
+    PrunedFormOutsideSync,
     /// The whole `Aggregate` action's encoding (block aggregation, spec §3.1's wire cap).
     /// `max` is this chain's composite cap, [`Ledger::max_aggregate_bytes`].
     #[error("the aggregate action of {size} bytes exceeds the {max} byte cap")]
@@ -984,6 +993,20 @@ impl Ledger {
                 return Err(TxError::ProofTooLarge);
             }
         }
+        // The sealed (pruned) marker form is admissible only inside sealed-form sync, where the
+        // block's side table vouches for it (`pruned_side`, spec §7) — and only for the fee bundle,
+        // the one bundle sealing ever prunes. Everywhere else it is refused here, before any proof
+        // work, with a verdict that is *not* about the transaction id: the marker form hashes to
+        // the raw transaction's id by design (M1), so a cached refusal would censor the honest
+        // raw transaction (Task 5b review, fix round 1).
+        if let Some(ph) = tx.bundle.as_ref().and_then(|b| crate::notes::pruned_proof_hash(&b.proof)) {
+            if !self.pruned_side.contains_key(&ph) {
+                return Err(TxError::PrunedFormOutsideSync);
+            }
+        }
+        if tx.action.asset_bundle().is_some_and(|ab| crate::notes::pruned_proof_hash(&ab.proof).is_some()) {
+            return Err(TxError::PrunedFormOutsideSync);
+        }
         match &tx.action {
             Action::Mint { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
                 return Err(TxError::EnvelopeTooLarge)
@@ -1364,6 +1387,10 @@ impl Ledger {
                 receipts.push((index, r));
             }
         }
+        // The side table vouches for this block's marker-form proofs and nothing after it: a
+        // ledger left holding it would admit a marker-form copy of a later transaction whose proof
+        // hash happened to match.
+        scratch.pruned_side.clear();
         *self = scratch;
         Ok(receipts)
     }
@@ -2893,5 +2920,25 @@ mod tests {
         other_chain.chain_id = 8;
         assert!(l.validate(&other_chain, &StubExecutor).is_err());
         assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+    }
+
+    /// Fix round 1, item 2: a marker-form copy of a raw transaction — `bundle.proof` replaced by
+    /// `PRUNED_PROOF_MARKER ‖ digest(proof)` — hashes to the raw transaction's id by design (M1).
+    /// Outside sealed-form sync it must be refused with an error that is *not* a statement about
+    /// the id (a node caches permanent refusals by `tx.hash()`), and before any proof work; the
+    /// honest transaction still validates afterwards. The asset bundle of a two-bundle action
+    /// gets the same rule.
+    #[test]
+    fn a_marker_form_copy_is_refused_as_not_admissible_and_the_raw_one_still_validates() {
+        let l = ledger();
+        let raw = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let mut marker = raw.clone();
+        let b = marker.bundle.as_mut().unwrap();
+        let mut m = crate::notes::PRUNED_PROOF_MARKER.to_vec();
+        m.extend_from_slice(Hash::digest(&b.proof).as_bytes());
+        b.proof = m;
+        assert_eq!(marker.hash(), raw.hash(), "the marker form is the raw id by design");
+        assert_eq!(l.validate(&marker, &StubExecutor), Err(TxError::PrunedFormOutsideSync));
+        assert_eq!(l.validate(&raw, &StubExecutor), Ok(()));
     }
 }
