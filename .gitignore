@@ -2,10 +2,12 @@
 /data
 /data-*
 /testnet
+# No exceptions (audit v3, OPS-1). `deploy/*.key.json` and `deploy/payout/*.key.json` were
+# whitelisted here and tracked in a PUBLIC repository, so chains 8–13 all ran on validator seeds
+# and payout spend keys anyone could read. Chain 14's keys are generated off-repo by
+# deploy/gen-chain14-keys.sh into $KEYDIR and never enter the tree; deploy/lib/key-guard.sh
+# refuses a cut that names a key inside it.
 *.key.json
-!deploy/*.key.json
-# Chain-8 per-validator payout wallets: test keys, committed on purpose (deploy/payout/README.md).
-!deploy/payout/*.key.json
 .git-rev
 bin-b00bc72/
 bin-03c9fb9/

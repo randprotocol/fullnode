@@ -1,4 +1,15 @@
-# Chain-8 payout wallets
+# Payout wallets for chains 8–13 (retired at the chain-14 cut)
+
+> **Untracked since the chain-14 preparation, and burned.** These eighteen spend keys were
+> committed to a PUBLIC repository for chains 8–13 — audit v3's OPS-1, critical. `git rm --cached`
+> took all eighteen `*.key.json` out of the index and `.gitignore`'s `!deploy/payout/*.key.json`
+> exception is gone, so the working copies below still run chains 8–13 locally and **nothing here
+> may ever be committed again**. They are published seeds: treat every note they hold as spendable
+> by anyone. Chain 14's eighteen payout wallets are generated off-repo by
+> `deploy/gen-chain14-keys.sh` into `$KEYDIR` (default `~/.rand-chain14`), and
+> `deploy/lib/key-guard.sh`'s `refuse_in_tree_key` refuses a cut that names a key inside the tree.
+> The `*.record.json` files stay tracked: a signed `ReceiverRecord` is public by construction, and
+> chain 11 — the only chain that read them — is reverted.
 
 One shielded wallet per validator, 18 in all: `<node-name>.key.json` is the spend key whose
 address is that validator's `payout` in `deploy/genesis-chain8.json`. A payout address is where
@@ -11,11 +22,14 @@ address, so this branch also added `<node-name>.record.json` beside each key: th
 `ReceiverRecord` that same id resolves to (`rand address --record`'s output for that key), needed
 so a chain-11 genesis can register these same 18 wallets with `rand-node genesis --receiver`.
 
-**These are test keys and they are committed on purpose**, the same convention the node keys in
-`deploy/` follow: any machine can clone the repo and run the fleet. The seeds are public, so
-anyone can spend what these wallets receive. That is acceptable here and wrong anywhere else:
-on a real chain a payout address is public in the register from the first block on, so give each
-validator a wallet that holds nothing else and whose key nobody else has.
+**These were test keys committed on purpose**, the same convention the node keys in `deploy/`
+followed: any machine could clone the repo and run the fleet. That convention ended with chain 13.
+It was defensible while the chain carried nothing but test value and no bridge; it stopped being
+defensible the moment chain 14 was going to hold bridged USDT and USDC, because a published
+validator seed on a bridged chain lets anyone finalize conflicting blocks. On a real chain a payout
+address is public in the register from the first block on, so give each validator a wallet that
+holds nothing else and whose key nobody else has — which is exactly what
+`deploy/gen-chain14-keys.sh` does, outside this tree.
 
 Chain 7 had no payout addresses at all (its genesis validator entries are `public_key` + `stake`
 only — it predates phase S2), so there is nothing to carry over; every one of these was generated

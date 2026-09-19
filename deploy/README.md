@@ -1,6 +1,14 @@
 # Testnet: chain id 13 (the call limits and a program's public input, v0.4)
 
-Test keys only; all seeds are committed on purpose so any machine can pull and run.
+> **No key in this repository is tracked any more** (audit v3, OPS-1). `deploy/node-a..f.key.json`
+> and `deploy/payout/*.key.json` were committed on purpose for chains 8–13 so any machine could
+> pull and run the fleet; they are untracked as of the chain-14 preparation and `.gitignore` has no
+> `!deploy/*.key.json` exception left. The working copies are still on disk and still run chains
+> 8–13, but they are **published seeds**. Chain 14 runs on eighteen validator keys and eighteen
+> payout wallets generated off-repo by `deploy/gen-chain14-keys.sh` into `$KEYDIR`
+> (default `~/.rand-chain14`) — see `deploy/cut-chain14-genesis.sh` and
+> `deploy/cutover-droplet-chain14.sh`. Peer ids change with those keys, so `deploy/nodes.env` is
+> replaced by the generated `$KEYDIR/public/nodes-chain14.env` at the cut.
 
 > **Chain 13 (cut 2026-09-19) is chain 12 plus five call limits in its genesis.** The genesis
 > sets `max_program_words`, `max_proof_bytes`, `max_block_bytes`, `max_call_envelope_bytes` and
