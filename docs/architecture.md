@@ -155,8 +155,13 @@ answered before the ledger probe runs at all (§8).
 split. Minimums come from `randprotocol_core::gas`: every bundle pays `BUNDLE_BASE = 1,000,000` units
 (0.001 RAND); a `Deploy` adds `100,000` units per program word; a `Call` adds `1,000,000` units
 at the lowest tier (10) plus `100,000` per two tiers above it, to `1,500,000` at tier 20
-(`call_fee`). A `BridgeBurn` pays `BUNDLE_BASE` twice, because it is the one transaction that
-carries two bundles and a node verifies both. A mint carries no bundle and pays nothing. Blocks
+(`call_fee`). Since the hidden-asset bundle (chain 14) every transaction carries exactly one
+4-in-4-out bundle: a `BridgeBurn` or `TokenBurn` burns the asset out of that bundle's slots 0–1
+and pays the RAND fee from slots 2–3 of the same proof, rather than carrying a second bundle. A
+`BridgeBurn` pays `BRIDGE_BURN_FEE` (10× `BUNDLE_BASE`, 0.01 RAND) — the base plus the bridge's
+own charge, which falls on the burn because that is the one bridge transaction whose sender is
+sure to hold RAND; a `TokenBurn` pays the plain base like any other one-bundle action. A mint
+carries no bundle and pays nothing. Blocks
 are capped at 2,000 transactions and 4 MiB of encoded bytes (`gas::MAX_BLOCK_TXS`,
 `gas::MAX_BLOCK_BYTES`) — enforced both where the proposer selects candidates and inside
 `Ledger::apply_block`, so a Byzantine leader cannot stuff an
@@ -636,8 +641,8 @@ through the real executor); full mode additionally re-checks every proposer sign
   wallet commands, the RPC surface, the admission order, and what still leaks.
 - `docs/bridge.md` — the cross-chain bridge, wired up on the shielded chain since phase S3: a
   bridged holding is a note whose `asset` word is the registry's index for it, an attestation
-  deposits one note the chain computes itself, and a burn is the chain's one two-bundle transaction.
-  A chain turns it on with a `bridge` section in its genesis.
+  deposits one note the chain computes itself, and a burn is a single hidden-asset bundle, not a
+  second one. A chain turns it on with a `bridge` section in its genesis.
 - `docs/rpc.md` — every JSON-RPC method, including the ones this page names (`rand_getReceipt`,
   `rand_getProgram`, `rand_sendTransaction`, `rand_status`) with full parameter and result
   shapes.

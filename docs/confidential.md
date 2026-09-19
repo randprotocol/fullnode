@@ -415,10 +415,17 @@ proof or not. `the_binding_encoding_is_pinned` holds a golden value.
   `decode_and_check` refuses a bundle proof declaring any other public height before any verifier
   key is built.
 - `prove_bundle(profile, inputs, binding, backend)`: the wallet (`randprotocol-client`'s
-  `wallet::prepare_bundles` → `prove_transaction`) builds the whole transaction first — witnesses,
+  `wallet::prepare_bundle` → `prove_transaction`) builds the whole transaction first — witnesses,
   outputs, envelopes (sealed against the output notes, never the proof), the action — takes its
   binding, then proves its bundle with it. The bundle still lands at tier 14 (`tests/shielded.rs`, 101.9 s at the test profile,
   324 387 bytes).
+
+**The hidden-asset bundle's proof is pinned to tier 14, with neither the keccak nor the sha256
+table** — a token transfer, mint, burn or bridge deposit runs the same guest as a plain RAND
+transfer, and none of them call either hash's syscall, so both tables stay absent regardless of
+which asset the bundle moves. A bundle whose declared shape asks for a different tier or either
+table is refused before any proof is verified, the same cheap-before-expensive rule every other
+declared shape gets (`ZkExecutor::check_program`/`decode_and_check`).
 - `Transaction::hash` (the txid) is unchanged.
 
 **What this does not cover.** The bundle-less actions (`Mint`, `Unbond`, `Withdraw`,

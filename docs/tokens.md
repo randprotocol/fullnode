@@ -45,6 +45,15 @@ before any other check (`TokenError::Disabled`) and the chain hashes, roots and 
 byte-for-byte as one without RPL. A genesis with a `bridge` section must also have a `tokens`
 section.
 
+**Genesis alloc notes, chain 14 rule.** When a `tokens` section is present, every genesis `alloc`
+note must carry its opening — `pk`, `time` and `r`, beside its `cm` and `amount` — and the node
+recomputes `note_commitment(pk, [0; 8], amount, 0, time, r)` at asset 0 and refuses a genesis file
+whose `cm` does not match. An opaque, unopened `cm` is otherwise how a genesis states a note today,
+and once RPL gives a note an `asset` word to name, an opaque alloc `cm` is the one way a genesis
+author could put an unbacked note of any asset into the pool without anyone able to check it —
+this closes that for the alloc set the same way the faucet mint was already closed (audit v3,
+POOL-1).
+
 **State root.** A `tokens_root` component — the merkle root of `blake3("rand-token-leaf-1",
 bincode(TokenInfo))` leaves in index order — folds into the state root under domain `rand-state-4`
 when the gate is on. `TokenRegistry::root()` itself uses domain `rand-token-registry-2`.
@@ -95,6 +104,13 @@ AuthorityNotAllowed`) — a `Bridge`-authority token exists only through the bri
 actions of `docs/bridge.md` §18 — and `TokenMint`/`SetAuthority` on any token whose authority is
 not `Key` is refused separately (`TokenError::NotKeyAuthority`). `Program` is reserved: a mint
 authorised by a call receipt is future work (spec §11).
+
+**A `Key` authority is exactly one Dilithium2 public key, never longer.** `RegisterToken` and
+`SetAuthority` both refuse a `Key`/`new` whose byte length is not `PUBLIC_KEY_LEN`
+(`TokenError::BadAuthorityKey`) — otherwise a flat-fee, faucet-funded registration could carry an
+arbitrarily large "key" into permanent, per-block-rehashed registry state. `InitialMint` and
+`TokenMint`'s `recipient.kem_ek` are held to the ML-KEM key length the same way, for the same
+reason: both are consensus state or block space bought at a fee that does not scale with size.
 
 ## 4. Creating a token
 
@@ -253,9 +269,13 @@ explorer or a one-off read, wrong for a wallet about to send. `rand_getAssets` s
 bridge's own per-backing view (`docs/bridge.md` §6).
 
 A token row's `authority` is `{"kind":"none"}`, `{"kind":"key","key":<hex>,"address":<base58>}`,
-`{"kind":"bridge","backings":[{"chain","token","decimals","locked"}]}` (each backing's *source*
-decimals and its locked amount) or `{"kind":"program","program":<hex>}`. Supplies and `locked`
-amounts are decimal strings, because a JSON number is not exact past 2^53.
+`{"kind":"bridge","backings":[{"chain","token","decimals","locked","mint_cap_per_day",
+"minted_today","mint_day"}]}` (each backing's *source* decimals, its locked amount, and bridge
+hardening B1's per-backing daily mint cap: the genesis cap, what it has minted on `mint_day` — the
+UTC day of the head block — and that day number itself) or `{"kind":"program","program":<hex>}`.
+Every amount here — `locked`, `mint_cap_per_day`, `minted_today`, a token's `total_supply`, and
+`rand_getTokens`'/`rand_getBridgeState`'s `registration_fee` — is a decimal string, because a
+JSON number is not exact past 2^53; `mint_day`, like `index` and `next_index`, is a plain integer.
 
 ## 12. Key disclosure: a tx key, a viewing key, and randscan
 

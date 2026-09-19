@@ -12,10 +12,10 @@ chain with a proof instead of their inputs.
 | Consensus | chained HotStuff BFT, stake-weighted quorums (more than 2/3), round-robin leaders, three-chain commit, view synchronisation, exponential timeouts |
 | Signatures / hashes | Dilithium2 (post-quantum) / BLAKE3 for validators and blocks; Poseidon2 for notes, the tree and nullifiers; ML-KEM-768 + ChaCha20-Poly1305 for note envelopes |
 | Networking | libp2p 0.54: TCP + Noise + Yamux, gossipsub, Kademlia + bootstrap list, mDNS on LANs, request-response block sync, ping keepalive, automatic redial |
-| Ledger | shielded note pool: a depth-32 Poseidon2 commitment tree, a nullifier set, 2-in-2-out proved bundles, public fees to the proposer's register entry, BLAKE3 Merkle state root over tree, nullifiers, validators and programs, plus the bridge on a bridged chain |
+| Ledger | shielded note pool: a depth-32 Poseidon2 commitment tree, a nullifier set, 4-in-4-out hidden-asset proved bundles (one bundle moves any asset — RAND, a bridged coin or an RPL token — and nobody without a key can tell which), public fees to the proposer's register entry, BLAKE3 Merkle state root over tree, nullifiers, validators and programs, plus the bridge and the RPL token registry on a chain that carries them |
 | Staking | a public validator register — bond out of a bundle's burn, unbond over two epochs, withdraw into a shielded note — epochs that re-derive the validator set from it, and a supply audit that adds the register and the pool back up to what the chain issued |
 | Wallet keys | a 256-bit spend key; viewing key, note-owner field, nullifier key, outgoing viewing key, ML-KEM-768 decapsulation key and `rand1…` address all derived from it |
-| Bridged assets | the guardian bridge as notes: a bridged holding is a note whose `asset` word is the registry's index, an attestation deposits one note the chain computes itself, and a burn is the chain's one two-bundle transaction (`docs/bridge.md`) |
+| Bridged assets | the guardian bridge as notes: a bridged holding is a note whose `asset` word is the registry's index, an attestation deposits one note the chain computes itself, and a burn is a single hidden-asset bundle — the same bundle spends the bridged asset from slots 0–1 and pays the RAND fee from slots 2–3 (`docs/bridge.md`) |
 | Confidential computation | Rand zkVM: RV32I under a Plonky3 batch STARK (Goldilocks, Poseidon2, ZK-hiding FRI); programs deployed on chain, calls carry a proof + 8 public outputs, gas by tier, and pay through a bundle like everything else |
 | Storage | one RocksDB per node with column families for blocks, certificates, indexes, notes, nullifiers, anchors, validators, programs and receipts; fsynced commits; startup integrity check with truncate-and-resync |
 | Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` / `receipts` / `transaction` subscription on the same port (`rand-node`), `rand` wallet CLI with a local prover, Rust client library |
@@ -73,7 +73,7 @@ real one-node chain (mint, scan, send, spend the change, bond, and a confidentia
 transcript it opens back), and 18 cluster tests that start real nodes over TCP: a shielded transfer
 between wallets, a double-spend race between two validators, a deploy-and-call paid by bundles, a
 call whose input envelope only its caller and its auditor open, a guardian-attested bridge deposit
-and a two-bundle burn, a fifth validator that registers and bonds itself into the next epoch, a
+and a burn, a fifth validator that registers and bonds itself into the next epoch, a
 validator that unbonds out of the set and withdraws into a note its payout wallet spends, late
 joiners, restart cycles, quorum loss and recovery, corrupted database recovery, and the faucet.
 
@@ -189,15 +189,21 @@ depth-32 tree, and an **envelope** carrying the plaintext sealed to the owner's 
 + ChaCha20-Poly1305). Spending a note publishes its **nullifier** `H_NF(nk, cm)`, which nobody can
 link back to the commitment without the owner's viewing key.
 
-Every transfer is one fixed 2-in-2-out **bundle**, proved by a pinned zkVM guest:
+Every transfer is one fixed 4-in-4-out **bundle** — the hidden-asset bundle, since chain 14 —
+proved by a pinned zkVM guest. One bundle moves any asset (RAND, a bridged coin, an RPL token) and
+nobody without a key can tell which:
 
 ```
-Bundle { anchor, nullifiers[2], commitments[2], fee, burn, asset, time, envelopes[2], proof }
+Bundle { anchor, nullifiers[4], commitments[4], fee, burn_a, burn_r, burn_asset, time, envelopes[4], proof }
 ```
 
-The proof says: both inputs are leaves under `anchor`, their nullifiers are the published ones,
-inputs balance outputs plus the fee, and the spender holds the keys — without revealing which
-leaves, which amounts, or who. A wallet finds its own notes by trial-decrypting every envelope on
+Slots 0–1 carry the private asset moved (dummies on a RAND-only transfer); a token or bridge burn
+accounts for it there, in `burn_a`/`burn_asset`. Slots 2–3 always carry RAND — the `fee`, and, on
+a bond or an aggregator registration, the stake burned in `burn_r`. The proof says: all four
+inputs are leaves under `anchor`, their nullifiers are the published ones, each pair's inputs
+balance its outputs plus whatever it burns or pays as fee, and the spender holds the keys —
+without revealing which leaves, which amounts, which asset, or who. A wallet finds its own notes
+by trial-decrypting every envelope on
 the chain with its viewing key, so a node answers "here is the whole tree" and never "here is your
 balance". `docs/howto.md` (five questions, end to end) and `docs/shielded.md` is the full guide, including the public/hidden table per action and
 what still leaks (a witness request names the leaf you are about to spend).
@@ -257,10 +263,10 @@ commits; `docs/deploy.md` describes the rollout and the fault tests that have be
 
 ## How it works
 
-1. A wallet scans the commitment tree, picks at most two of its own notes, proves a 2-in-2-out
-   bundle locally, and submits `{ chain_id, bundle, action }` over RPC. There is no signature and
-   no sender: the proof is the authorisation. A faucet mint is the one exception — a validator
-   signs it with its own key.
+1. A wallet scans the commitment tree, picks at most two of its own notes per asset it is moving,
+   proves a 4-in-4-out hidden-asset bundle locally, and submits `{ chain_id, bundle, action }` over
+   RPC. There is no signature and no sender: the proof is the authorisation. A faucet mint is the
+   one exception — a validator signs it with its own key.
 2. The node validates against the tip state — cheap checks first, the bundle's STARK last — refuses
    anything conflicting with a pending transaction over a nullifier or a commitment, and gossips
    the rest.
