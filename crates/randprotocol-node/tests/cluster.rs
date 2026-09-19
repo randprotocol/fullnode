@@ -203,8 +203,8 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
             tokens: vec![GenesisToken {
                 name: "Tether USD".into(),
                 symbol: "zUSDT".into(),
-                chain: TOKEN_CHAIN,
-                token: TOKEN,
+                salt: [0x5a; 32],
+                backings: vec![randprotocol_core::genesis::GenesisBacking { chain: TOKEN_CHAIN, token: TOKEN }],
             }],
         }),
         bridge,
@@ -242,8 +242,8 @@ fn bridge_config() -> BridgeConfig {
     }
 }
 
-/// The bridged token these tests move: chain 2's `0xaa…`, which the first attestation registers as
-/// asset index 1.
+/// The bridged token these tests move: chain 2's `0xaa…`, the one coin backing the single token
+/// the fixture's genesis lists, which that listing gives asset index 1.
 const TOKEN: [u8; 32] = [0xaa; 32];
 const TOKEN_CHAIN: u16 = 2;
 
@@ -1605,6 +1605,9 @@ async fn bridge_mint_deposits_a_note_and_a_burn_spends_it() {
         burn,
         relayer_fee,
         TOKEN_CHAIN,
+        // The coin being redeemed: this chain's one listed token has one backing, and a burn
+        // names it (spec §12).
+        TOKEN,
         EVM_TO,
         burn_fee,
         FriProfile::Test,

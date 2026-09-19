@@ -459,7 +459,7 @@ impl Mempool {
             // yet seen a listing, would otherwise sit in the pool until restart. Decoding the
             // attestation costs no signature work, and a rotation (which decodes to no transfer)
             // binds no index.
-            if let Some((id, _)) = bridge_notes::attested_transfer(attestation) {
+            if let Some((chain, token, _)) = bridge_notes::attested_transfer(attestation) {
                 // No bridge is the bridge's own verdict rather than a mismatch — the error
                 // `Ledger::validate` gives it, so a caller that prechecks before validating hears
                 // the same thing either way. A pooled attest can only exist on a bridged chain, so
@@ -467,22 +467,23 @@ impl Mempool {
                 if ledger.bridge().is_none() {
                     return Err(TxError::Bridge(BridgeError::Disabled));
                 }
-                // A token nobody listed deposits nothing at all, and `validate`'s answer for it is
-                // the bridge's `UnlistedToken` rather than a mismatched index — the index the
-                // action names is not wrong, there is simply nothing to deposit. `validate`'s own
-                // pre-screen is silent in that case for the same reason; this one cannot be,
-                // because a `false` from `still_applies` is what takes the transaction out of the
-                // pool.
-                match ledger.tokens().and_then(|t| t.get_by_id(&id)).map(|info| info.index) {
+                // A coin nobody listed as a backing deposits nothing at all, and `validate`'s
+                // answer for it is the bridge's `UnlistedToken` rather than a mismatched index —
+                // the index the action names is not wrong, there is simply nothing to deposit.
+                // `validate`'s own pre-screen is silent in that case for the same reason; this
+                // one cannot be, because a `false` from `still_applies` is what takes the
+                // transaction out of the pool.
+                //
+                // The pair is destructured out of the same decode, so there is nothing left to
+                // re-derive here and no second decode to be surprised by: `attested_transfer`
+                // answered `Some`, so the `(chain, token)` in hand is the one this attestation
+                // names. (It used to be re-read with an `expect` on gossip-fed bytes.)
+                match ledger.tokens().and_then(|t| t.bridged(chain, &token)).map(|info| info.index) {
                     Some(index) if index == *asset => {}
                     Some(index) => {
                         return Err(TxError::AttestAssetMismatch { expected: index, actual: *asset })
                     }
-                    None => {
-                        let (chain, token) = bridge_notes::attested_token(attestation)
-                            .expect("a decoded transfer names its (chain, token) pair");
-                        return Err(TxError::Bridge(BridgeError::UnlistedToken { chain, token }));
-                    }
+                    None => return Err(TxError::Bridge(BridgeError::UnlistedToken { chain, token })),
                 }
             }
         }

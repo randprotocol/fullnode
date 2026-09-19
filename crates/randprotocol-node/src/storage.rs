@@ -2122,8 +2122,8 @@ pub(crate) mod fixtures {
                 tokens: vec![GenesisToken {
                     name: "Tether USD".into(),
                     symbol: "zUSDT".into(),
-                    chain: 2,
-                    token: TOKEN,
+                    salt: [0x5a; 32],
+                    backings: vec![randprotocol_core::genesis::GenesisBacking { chain: 2, token: TOKEN }],
                 }],
             }),
             aggregation: None,
@@ -2210,7 +2210,7 @@ pub(crate) mod fixtures {
     /// token this chain has not listed (which is refused outright).
     pub(crate) fn deposit_index(ledger: &Ledger, attestation: &[u8]) -> u32 {
         randprotocol_core::ledger::bridge_notes::attested_transfer(attestation)
-            .and_then(|(asset, _)| ledger.tokens().and_then(|t| t.get_by_id(&asset)).map(|info| info.index))
+            .and_then(|(chain, token, _)| ledger.tokens().and_then(|t| t.bridged(chain, &token)).map(|info| info.index))
             .unwrap_or(0)
     }
 
@@ -2227,7 +2227,7 @@ pub(crate) mod fixtures {
         Transaction::shielded(
             ledger.chain_id(),
             bundle(ledger, [[seed + 4; 8], [seed + 5; 8]], [[seed + 6; 8], [seed + 7; 8]], gas::BRIDGE_BURN_FEE),
-            Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain: 2, to: EVM_TO },
+            Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain: 2, token: TOKEN, to: EVM_TO },
         )
     }
 

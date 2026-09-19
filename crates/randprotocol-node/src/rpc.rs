@@ -14,7 +14,7 @@ use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use randprotocol_core::bridge::asset_id;
-use randprotocol_core::ledger::tokens::{MintAuthority, TokenInfo, TokenRegistry};
+use randprotocol_core::ledger::tokens::{Backing, MintAuthority, TokenRegistry};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::notes::{word8_to_hex, Envelope};
 use randprotocol_core::{Action, CallReceipt, Hash, ProgramId, ShieldedAddress, Transaction, TOKEN_DECIMALS, TOKEN_SYMBOL};
@@ -676,31 +676,41 @@ fn envelope_json(e: &Envelope) -> Value {
 /// this chain has not listed — the last of which only a transaction that is not committed yet
 /// can be.
 fn attest_deposit(attestation: &[u8], tokens: Option<&TokenRegistry>) -> Option<(u32, u64)> {
-    let (asset, amount) = randprotocol_core::ledger::bridge_notes::attested_transfer(attestation)?;
-    Some((tokens?.get_by_id(&asset)?.index, amount))
+    let (chain, token, amount) = randprotocol_core::ledger::bridge_notes::attested_transfer(attestation)?;
+    Some((tokens?.bridged(chain, &token)?.index, amount))
 }
 
-/// One bridged token as the asset registry serves it: the note's `asset` word and the wire
-/// identity guardians sign about, which is the token's `Bridge` mint authority. The row shape is
-/// the one `rand_getAssets` has always had — the registry behind it moved, the JSON did not.
-fn asset_json(info: &TokenInfo, chain: u16, token: &[u8; 32]) -> Value {
+/// One *backing* as the asset registry serves it: the note's `asset` word, the wire identity
+/// guardians sign about (this coin's chain and token address), and how much of that coin its
+/// source contract is holding for this chain.
+///
+/// The row shape is the one `rand_getAssets` has always had, plus `locked`. `asset_id` stays the
+/// **per-backing** id `rand_bridgeAssetId` computes — one row, one coin, one id — even though a
+/// bridged token's own registry id is now over its registration fields: a relayer matches a row
+/// by the id it derives from the two wire fields, and that is the id that answers.
+fn asset_json(index: u32, b: &Backing) -> Value {
     json!({
-        "index": info.index,
-        "chain": chain,
-        "token": hex::encode(token),
-        "asset_id": info.id.to_hex(),
+        "index": index,
+        "chain": b.chain,
+        "token": hex::encode(b.token),
+        "asset_id": randprotocol_core::bridge::asset_id(b.chain, &b.token).to_hex(),
+        "locked": b.locked,
     })
 }
 
-/// The bridged half of the token registry as `rand_getAssets` serves it: one row per
-/// `Bridge`-authority token, ascending by index, which is listing order. A native RPL token is
-/// not a bridged asset and is not here (Task 7's `rand_getTokens` is the whole registry).
+/// The bridged half of the token registry as `rand_getAssets` serves it: one row **per backing**,
+/// ascending by index — which is listing order — and within an index in the order the token lists
+/// its coins. One zUSD backed by seven coins is seven rows all carrying `index` 1 (spec §12). A
+/// native RPL token is not a bridged asset and is not here (Task 7's `rand_getTokens` is the
+/// whole registry).
 fn assets_json(tokens: &TokenRegistry) -> Vec<Value> {
     tokens
         .iter()
-        .filter_map(|info| match &info.authority {
-            MintAuthority::Bridge { chain, token } => Some(asset_json(info, *chain, token)),
-            _ => None,
+        .flat_map(|info| match &info.authority {
+            MintAuthority::Bridge { backings } => {
+                backings.iter().map(|b| asset_json(info.index, b)).collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
         })
         .collect()
 }
@@ -951,9 +961,11 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
                 }),
             })
         }
-        Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to } => json!({
+        Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, token, to } => json!({
             "kind": "bridge_burn", "asset": asset, "amount": amount, "relayer_fee": relayer_fee,
-            "to_chain": to_chain, "to": hex::encode(to),
+            // The coin being redeemed, which is a field of the action since one bridged token has
+            // many backings (spec §12) — the outbound message names this pair.
+            "to_chain": to_chain, "token": hex::encode(token), "to": hex::encode(to),
             "asset_bundle": bundle_json(asset_bundle),
         }),
         // Block aggregation: the register is public by design (spec §2), so its inputs are too —
@@ -3235,6 +3247,7 @@ mod tests {
             amount: 400,
             relayer_fee: 100,
             to_chain: 5,
+            token: [0xcd; 32],
             to: [0xab; 32],
         });
         assert_eq!(burn["kind"], "bridge_burn");
@@ -3302,10 +3315,13 @@ mod tests {
         assert!(!serde_json::to_string(&v).unwrap().contains("balance"));
 
         // The registry alone, which is what a wallet needs to read a note's `asset` word. Its
-        // rows are the token registry's bridged half now, in the shape they have always had.
+        // rows are the token registry's backings now — one per coin, in the shape they have
+        // always had plus the `locked` a burn is bounded by (spec §12). This fixture's one token
+        // has one coin, 1 000 deposited and 400 burned.
         let asset = randprotocol_core::bridge::asset_id(2, &fixtures::TOKEN);
         let row = json!({
             "index": 1, "chain": 2, "token": hex::encode(fixtures::TOKEN), "asset_id": asset.to_hex(),
+            "locked": 600,
         });
         assert_eq!(ok(&st, "rand_getAssets", json!([])).await, json!([row]));
         assert_eq!(v["assets"], json!([row]));
