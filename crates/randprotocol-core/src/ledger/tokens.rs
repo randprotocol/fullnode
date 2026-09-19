@@ -99,13 +99,20 @@ impl Backing {
         Backing { chain, token, decimals, locked: 0, minted_today: 0, mint_day: 0 }
     }
 
-    /// What this backing has minted on `day`: `minted_today` if its counter is for that day, zero
-    /// if the counter is for an earlier one (the reset a new day brings, read without a write).
+    /// What this backing has minted on `day`: zero if the counter is for an earlier day (the reset
+    /// a new day brings, read without a write), `minted_today` otherwise.
+    ///
+    /// Only a **newer** day resets. `day` comes from the block timestamp, and the counter can only
+    /// ever be behind it because block timestamps are monotonic (a child's is never below its
+    /// parent's on a bridged chain: `BlockError::TimestampRewind`, beside B2's forward bound). Were a day ever to go backwards,
+    /// resetting on any *different* day would hand the cap out a second time — `day - 1` would read
+    /// zero while `day`'s mints still stand — so an older day reads the newer counter instead: the
+    /// cap can only ever be counted too strictly, never twice.
     pub fn minted_on(&self, day: u32) -> u64 {
-        if self.mint_day == day {
-            self.minted_today
-        } else {
+        if day > self.mint_day {
             0
+        } else {
+            self.minted_today
         }
     }
 }
@@ -497,7 +504,8 @@ impl TokenRegistry {
         let backing = self.backing_mut(index, chain, token).expect("the checked half resolved the backing");
         // `check_lock` bounded `minted_on(day) + amount` by the cap, so this cannot wrap.
         backing.minted_today = backing.minted_on(day) + amount;
-        backing.mint_day = day;
+        // Never moves back (see `Backing::minted_on`): an older day added to the newer counter.
+        backing.mint_day = backing.mint_day.max(day);
         Ok(())
     }
 
@@ -1412,6 +1420,35 @@ mod tests {
             0,
         )
         .expect("a fresh listing")
+    }
+
+    /// B1's daily counter resets only on a newer day: an older day (impossible under monotonic
+    /// block timestamps, and the case this guards) reads the newer counter and never moves the
+    /// counter's day back, so the cap cannot be handed out twice.
+    #[test]
+    fn the_mint_counter_resets_only_on_a_newer_day() {
+        let mut b = Backing::new(2, [1; 32], 8);
+        b.minted_today = 700;
+        b.mint_day = 10;
+        assert_eq!(b.minted_on(10), 700, "the same day");
+        assert_eq!(b.minted_on(11), 0, "a newer day starts from zero");
+        assert_eq!(b.minted_on(9), 700, "an older day never resets");
+        assert_eq!(b.minted_on(0), 700);
+
+        let mut r = reg().with_mint_cap(1_000);
+        let i = list_zusd(&mut r, &[USDT2]);
+        r.lock(i, USDT2.0, &USDT2.1, 800, 10).unwrap();
+        assert_eq!(
+            r.lock(i, USDT2.0, &USDT2.1, 800, 9),
+            Err(TokenError::MintCapExceeded { cap: 1_000, minted_today: 800, amount: 800 }),
+            "a day going backwards does not re-open the cap"
+        );
+        r.lock(i, USDT2.0, &USDT2.1, 200, 9).unwrap();
+        let b = r.backing(i, USDT2.0, &USDT2.1).unwrap();
+        assert_eq!((b.minted_today, b.mint_day), (1_000, 10), "the counter's day never moves back");
+        r.lock(i, USDT2.0, &USDT2.1, 1_000, 11).unwrap();
+        let b = r.backing(i, USDT2.0, &USDT2.1).unwrap();
+        assert_eq!((b.minted_today, b.mint_day), (1_000, 11), "day 11 counts from zero");
     }
 
     /// The whole point of the amendment: two source coins, one Rand-side token. A deposit of
