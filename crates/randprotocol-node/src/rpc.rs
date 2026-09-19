@@ -49,6 +49,27 @@ pub const MAX_RECEIPTS_PAGE: usize = 256;
 /// The most leaf indices one `rand_getWitnesses` call may fold into a single tree build.
 pub const MAX_WITNESSES: usize = 32;
 
+/// The most tree rebuilds (`rand_getWitness`/`rand_getWitnesses`) this process runs at once
+/// (audit v3, RPC-1). Each reads every leaf and hashes a full depth-32 tree on the blocking pool,
+/// which tokio grows to 512 threads: without a cap a few hundred concurrent calls pin every core
+/// of a process that is also a validator. Process-wide, not per connection, because the cost is.
+pub const MAX_CONCURRENT_WITNESS_BUILDS: usize = 2;
+
+/// How long a witness request waits for a build slot before it is refused as busy. A wallet
+/// retries; a flood waits here as parked futures, not threads.
+const WITNESS_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+static WITNESS_BUILDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_WITNESS_BUILDS);
+
+/// A slot for one tree rebuild, held until the rebuild's blocking task has returned.
+async fn witness_slot() -> Result<tokio::sync::SemaphorePermit<'static>, RpcError> {
+    match tokio::time::timeout(WITNESS_SLOT_WAIT, WITNESS_BUILDS.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(RpcError::internal("witness semaphore closed")),
+        Err(_) => Err(RpcError::rejected("witness builds are busy on this node; retry shortly")),
+    }
+}
+
 /// Snapshot the node loop keeps up to date for RPC readers.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct NodeStatus {
@@ -1117,6 +1138,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             // Reads every leaf and rebuilds a full depth-32 tree to fold one path: the most
             // expensive read this node serves, and unbounded in the chain's size.
             let (storage, executor) = (st.storage.clone(), st.executor.clone());
+            let _slot = witness_slot().await?;
             match blocking(move || storage.witness(index, executor.as_ref())).await? {
                 None => Ok(Value::Null),
                 Some((root, path)) => Ok(json!({
@@ -1135,6 +1157,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             }
             let (storage, executor) = (st.storage.clone(), st.executor.clone());
             let idx = indices.clone();
+            let _slot = witness_slot().await?;
             let (root, paths) = blocking(move || storage.witnesses(&idx, executor.as_ref())).await?;
             let witnesses: Vec<Value> = indices
                 .iter()
@@ -2786,6 +2809,22 @@ mod tests {
         let too_many: Vec<u64> = (0..33).collect();
         let e = call(&st, "rand_getWitnesses", json!([too_many])).await.err().unwrap();
         assert_eq!(e.code, -32602);
+    }
+
+    /// Audit v3, RPC-1: tree rebuilds are capped process-wide. With every slot taken a witness
+    /// request waits rather than spawning another full-tree build, and runs once a slot frees.
+    #[tokio::test]
+    async fn witness_rebuilds_wait_for_a_slot_when_every_slot_is_taken() {
+        let gs = genesis_with(1, vec![alloc_note(20, 1_000), alloc_note(21, 2_000)]);
+        let (_d, st) = state_for(&gs);
+        let held = WITNESS_BUILDS.acquire_many(MAX_CONCURRENT_WITNESS_BUILDS as u32).await.unwrap();
+        let st2 = st.clone();
+        let pending = tokio::spawn(async move { ok(&st2, "rand_getWitnesses", json!([[0, 1]])).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!pending.is_finished(), "a rebuild ran with no slot free");
+        drop(held);
+        let v = tokio::time::timeout(std::time::Duration::from_secs(5), pending).await.unwrap().unwrap();
+        assert_eq!(v["witnesses"][0]["index"], 0);
     }
 
     /// Phase S2: the register, not the genesis set. A validator that has bonded in but whose
