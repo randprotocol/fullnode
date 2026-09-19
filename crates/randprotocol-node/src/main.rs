@@ -282,6 +282,19 @@ enum Cmd {
         /// validation refuses a zero digest.
         #[arg(long = "admitted-shape", value_name = "PROFILE,TIER,HEIGHTS…,HC,DIGEST")]
         admitted_shapes: Vec<String>,
+        /// Short addresses (spec §7.5): give the chain a receiver registry. Omitted (and with no
+        /// `--receiver`), the file has no `receivers` section and the chain's hash and state root
+        /// are byte-for-byte what they were.
+        #[arg(long)]
+        receivers: bool,
+        /// Registrations per block, with the registry on (default 64).
+        #[arg(long, default_value_t = randprotocol_core::ledger::receivers::DEFAULT_MAX_PER_BLOCK)]
+        receivers_max_per_block: u32,
+        /// A record registered at genesis, as a direct (`trnd1q…`) or legacy (`rand1…`) address;
+        /// repeatable, in seq order, and turns the registry on. Validator payout wallets and
+        /// allocation owners are the natural candidates (spec §8).
+        #[arg(long = "receiver", value_name = "ADDRESS")]
+        genesis_receivers: Vec<String>,
     },
     /// Initialise a data directory from a genesis file.
     Init {
@@ -495,6 +508,9 @@ async fn main() -> Result<()> {
             fri_profile,
             aggregation,
             admitted_shapes,
+            receivers,
+            receivers_max_per_block,
+            genesis_receivers,
         } => {
             let mut gen = Genesis {
                 chain_id,
@@ -544,6 +560,21 @@ async fn main() -> Result<()> {
                 max_block_bytes,
                 max_call_envelope_bytes,
                 max_program_public_words,
+                // C-19: the genesis command sets the section whenever the registry is asked for,
+                // or a chain cut with `--receiver` would come out without its gate.
+                receivers: (receivers || !genesis_receivers.is_empty())
+                    .then(|| -> Result<randprotocol_core::genesis::ReceiversGenesis> {
+                        let records = genesis_receivers
+                            .iter()
+                            .map(|a| {
+                                ShieldedAddress::parse(a)
+                                    .map(|addr| randprotocol_core::genesis::ReceiverRecordHex::from_address(&addr))
+                                    .map_err(|e| anyhow::anyhow!("--receiver {a}: {e}"))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok(randprotocol_core::genesis::ReceiversGenesis { max_per_block: receivers_max_per_block, records })
+                    })
+                    .transpose()?,
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);

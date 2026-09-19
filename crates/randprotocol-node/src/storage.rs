@@ -17,8 +17,11 @@ use randprotocol_core::{
     Action, Address, Block, CallReceipt, Hash, Ledger, ProgramId, ProgramRecord, QuorumCertificate, Transaction,
     ValidatorSet,
 };
+use randprotocol_core::address::ReceiverId;
+use randprotocol_core::ledger::receivers::{MemoryReceivers, ReceiverRecord, ReceiversConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 const CF_BLOCKS: &str = "blocks";
 const CF_QCS: &str = "qcs";
@@ -67,7 +70,14 @@ const CF_BRIDGE_SPENT: &str = "bridge_spent";
 /// Burn sequence (big-endian u64) -> `bincode(BridgeBurnRecord)`: the outbound messages
 /// guardians read back, oldest first.
 const CF_BRIDGE_BURNS: &str = "bridge_burns";
-const ALL_CFS: [&str; 17] = [
+/// Short addresses (spec §6.3): receiver id (32 bytes) -> `bincode(ReceiverRow)`, the registry's
+/// records. Append-only: written with the block that registered them, deleted only by a
+/// truncation below that block.
+const CF_RECEIVERS: &str = "receivers";
+/// Registration seq (big-endian u64) -> receiver id: the registry in registration order, what
+/// `rand_getReceivers` streams and what the in-memory index is rebuilt from at open.
+const CF_RECEIVERS_BY_SEQ: &str = "receivers_by_seq";
+const ALL_CFS: [&str; 19] = [
     CF_BLOCKS,
     CF_QCS,
     CF_BLOCK_INDEX,
@@ -85,6 +95,8 @@ const ALL_CFS: [&str; 17] = [
     CF_EPOCH_SETS,
     CF_BRIDGE_SPENT,
     CF_BRIDGE_BURNS,
+    CF_RECEIVERS,
+    CF_RECEIVERS_BY_SEQ,
 ];
 /// The bridge families, which (unlike notes and anchors) have no per-height key and so are
 /// rewritten wholesale wherever the state is installed rather than appended to.
@@ -175,6 +187,9 @@ const META_AGGREGATION: &str = "aggregation";
 /// Its presence is what makes a chain "bridged" on disk; the two collections it leaves out live
 /// in [`CF_BRIDGE_SPENT`] and [`CF_BRIDGE_BURNS`].
 const META_BRIDGE_STATE: &str = "bridge_state";
+/// `bincode(Option<ReceiversConfig>)`: the genesis `receivers` section, the registry's gate —
+/// persisted like `META_AGGREGATION` so a restarted node cannot come back without it.
+const META_RECEIVERS: &str = "receivers";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -209,6 +224,18 @@ pub struct NoteRow {
 
 pub struct Storage {
     db: DB,
+    /// The committed registry as `id -> seq`, rebuilt from `CF_RECEIVERS_BY_SEQ` at open and
+    /// extended after every commit's batch lands. It is the ledger's [`ReceiverSource`]: every
+    /// ledger `load_ledger` builds carries a handle on it (spec C-17), and clones inherit it.
+    receivers: Arc<RwLock<MemoryReceivers>>,
+}
+
+/// One registered record as stored: its seq, the height that registered it, the record.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReceiverRow {
+    pub seq: u64,
+    pub height: u64,
+    pub record: ReceiverRecord,
 }
 
 /// What [`Storage::drop_receipts_index`] found and removed: whether the `receipts_by_program`
@@ -346,7 +373,7 @@ impl Storage {
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()));
         let db = DB::open_cf_descriptors(&opts, &db_path, cfs)?;
-        let storage = Storage { db };
+        let storage = Storage::from_db(db)?;
         storage.backfill_receipts_index()?;
         Ok(storage)
     }
@@ -383,6 +410,92 @@ impl Storage {
             db.drop_cf(CF_RECEIPTS_BY_PROGRAM)?;
         }
         Ok(DroppedReceiptsIndex { family, marker })
+    }
+
+    /// Wrap an open database, building the registry index from whatever it holds. A handle
+    /// without the registry families (an old layout a test opens raw) has an empty index.
+    fn from_db(db: DB) -> Result<Storage> {
+        let mut index = MemoryReceivers::default();
+        if let Some(cf) = db.cf_handle(CF_RECEIVERS_BY_SEQ) {
+            for item in db.iterator_cf(cf, IteratorMode::Start) {
+                let (k, v) = item?;
+                let seq = be_u64(k.as_ref(), "receiver seq key")?;
+                let id: [u8; 32] = v.as_ref().try_into().map_err(|_| StorageError::Corrupt("receiver id is not 32 bytes".into()))?;
+                if seq != index.seqs.len() as u64 {
+                    return Err(StorageError::Corrupt(format!("receiver seq {seq} out of order")));
+                }
+                index.insert(ReceiverId(id));
+            }
+        }
+        Ok(Storage { db, receivers: Arc::new(RwLock::new(index)) })
+    }
+
+    /// The registry index, as the proof source a ledger carries.
+    pub fn receiver_source(&self) -> Arc<RwLock<MemoryReceivers>> {
+        self.receivers.clone()
+    }
+
+    fn put_receiver(&self, batch: &mut WriteBatch, seq: u64, height: u64, record: &ReceiverRecord) -> Result<()> {
+        let id = record.id();
+        let row = ReceiverRow { seq, height, record: record.clone() };
+        batch.put_cf(self.cf(CF_RECEIVERS), id.0, bincode::serialize(&row)?);
+        batch.put_cf(self.cf(CF_RECEIVERS_BY_SEQ), height_key(seq), id.0);
+        Ok(())
+    }
+
+    /// The registry's gate as genesis set it; `None` on a chain without the section.
+    pub fn receivers_config(&self) -> Result<Option<ReceiversConfig>> {
+        Ok(self.get_meta_raw(META_RECEIVERS)?.map(|b| bincode::deserialize(&b)).transpose()?.flatten())
+    }
+
+    pub fn receivers_count(&self) -> u64 {
+        self.receivers.read().expect("receiver index lock").seqs.len() as u64
+    }
+
+    /// The committed record for `id`. An exact lookup: for this node's own use and the
+    /// loopback-only RPC (spec N-3), never a public endpoint.
+    pub fn receiver(&self, id: &ReceiverId) -> Result<Option<ReceiverRow>> {
+        self.get(CF_RECEIVERS, &id.0)
+    }
+
+    /// Up to `limit` records from `from_seq` on, in registration order (spec §10.1).
+    pub fn receivers_from(&self, from_seq: u64, limit: usize) -> Result<Vec<ReceiverRow>> {
+        let mut out = Vec::new();
+        let start = height_key(from_seq);
+        for item in self.db.iterator_cf(self.cf(CF_RECEIVERS_BY_SEQ), IteratorMode::From(&start, rocksdb::Direction::Forward)) {
+            if out.len() >= limit {
+                break;
+            }
+            let (_, id) = item?;
+            let row: ReceiverRow = self
+                .get(CF_RECEIVERS, &id)?
+                .ok_or_else(|| StorageError::Corrupt("receiver seq index names a missing record".into()))?;
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    /// Every record whose id starts with `prefix`'s first `bits` bits (spec §10.2), by a range
+    /// scan over the id-keyed family; `None` when there are more than `cap`.
+    pub fn receivers_bucket(&self, prefix: &[u8; 32], bits: u8, cap: usize) -> Result<Option<Vec<ReceiverRow>>> {
+        let (mut lo, mut hi) = (*prefix, *prefix);
+        for i in bits as usize..256 {
+            let m = 1u8 << (7 - i % 8);
+            lo[i / 8] &= !m;
+            hi[i / 8] |= m;
+        }
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_RECEIVERS), IteratorMode::From(&lo, rocksdb::Direction::Forward)) {
+            let (k, v) = item?;
+            if k.as_ref() > &hi[..] {
+                break;
+            }
+            if out.len() == cap {
+                return Ok(None);
+            }
+            out.push(bincode::deserialize(&v)?);
+        }
+        Ok(Some(out))
     }
 
     fn cf(&self, name: &str) -> &rocksdb::ColumnFamily {
@@ -452,7 +565,21 @@ impl Storage {
         if let Some(bridge) = gs.ledger.bridge() {
             self.put_bridge(&mut batch, bridge)?;
         }
+        // The registry's gate and its genesis records, seq 0.. in file order (spec C-10). A
+        // chain without the section writes nothing here, so its database is chain 13's.
+        if let Some(cfg) = gs.ledger.receivers() {
+            batch.put_cf(self.cf(CF_META), META_RECEIVERS, bincode::serialize(&Some(cfg.clone()))?);
+            for (seq, rec) in gs.receivers.iter().enumerate() {
+                self.put_receiver(&mut batch, seq as u64, 0, rec)?;
+            }
+        }
         self.db.write_opt(batch, &sync_opts())?;
+        let mut index = self.receivers.write().expect("receiver index lock");
+        if index.seqs.is_empty() {
+            for rec in &gs.receivers {
+                index.insert(rec.id());
+            }
+        }
         Ok(())
     }
 
@@ -1236,6 +1363,22 @@ impl Storage {
         ledger.set_aggregators(self.aggregators()?);
         ledger.set_aggregation(self.aggregation_config()?);
         ledger.set_bridge(self.load_bridge()?);
+        // The registry: its gate, its root recomputed from the committed records (the store is
+        // the only copy, so there is nothing to compare against — `verify_chain` replays it),
+        // and the store itself as the ledger's proof source (spec C-17).
+        if let Some(cfg) = self.receivers_config()? {
+            let index = self.receivers.read().expect("receiver index lock");
+            let count = index.seqs.len() as u64;
+            let root = randprotocol_core::ledger::receivers::root(&randprotocol_core::ledger::receivers::SeqView::new(
+                &index.seqs,
+                count,
+                &[],
+            ));
+            drop(index);
+            ledger.set_receivers(Some(cfg));
+            ledger.set_receivers_state(root, count);
+            ledger.set_receiver_source(self.receivers.clone());
+        }
         Ok(ledger)
     }
 
@@ -1517,7 +1660,34 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
+        // The registry rows these blocks add, in the same batch (spec C-2). Seqs continue from
+        // what the store holds; every registration in a committed block applied, so the count
+        // they reach must be the ledger's.
+        let mut registered = Vec::new();
+        let first_seq = self.receivers_count();
+        for cb in blocks {
+            for tx in &cb.block.transactions {
+                if let Action::RegisterReceiver { pk, kem_ek } = &tx.action {
+                    let rec = ReceiverRecord { pk: *pk, kem_ek: kem_ek.clone() };
+                    self.put_receiver(&mut batch, first_seq + registered.len() as u64, cb.block.height(), &rec)?;
+                    registered.push(rec.id());
+                }
+            }
+        }
+        if ledger_after.receivers().is_some() && first_seq + registered.len() as u64 != ledger_after.receivers_count() {
+            return Err(StorageError::Corrupt(format!(
+                "committing {} registrations over {first_seq} stored, but the ledger counts {}",
+                registered.len(),
+                ledger_after.receivers_count()
+            )));
+        }
         self.db.write_opt(batch, &sync_opts())?;
+        if !registered.is_empty() {
+            let mut index = self.receivers.write().expect("receiver index lock");
+            for id in registered {
+                index.insert(id);
+            }
+        }
         // The sealing marks' per-block half (spec §6.1): the bundle marks went in with the
         // batch above; the flags read them, so they refresh after it lands.
         for cb in blocks {
@@ -1608,6 +1778,11 @@ impl Storage {
             _ => 0,
         };
         let mut ledger = gs.ledger.clone();
+        // Replay registers against the store: a ledger at count `c` sees exactly the records
+        // with seq below `c` (spec §6.4), so the committed index answers for every height.
+        if ledger.receivers().is_some() {
+            ledger.set_receiver_source(self.receivers.clone());
+        }
         let mut check = ChainCheck { head, last_good: 0, problem: None, ledger: ledger.clone(), genesis_ok: true };
 
         // Genesis block must be byte-for-byte what the genesis file derives.
@@ -1923,7 +2098,22 @@ impl Storage {
             batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
         }
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(height));
+        // The registry back to the ledger's count: every record above it was registered by a
+        // block this truncation removes.
+        let keep = ledger.receivers_count();
+        let dropped: Vec<ReceiverId> = {
+            let index = self.receivers.read().expect("receiver index lock");
+            index.seqs.iter().filter(|(_, s)| **s >= keep).map(|(id, _)| ReceiverId(*id)).collect()
+        };
+        for id in &dropped {
+            let seq = self.receivers.read().expect("receiver index lock").seqs[&id.0];
+            batch.delete_cf(self.cf(CF_RECEIVERS), id.0);
+            batch.delete_cf(self.cf(CF_RECEIVERS_BY_SEQ), height_key(seq));
+        }
         self.db.write_opt(batch, &sync_opts())?;
+        if !dropped.is_empty() {
+            self.receivers.write().expect("receiver index lock").seqs.retain(|_, s| *s < keep);
+        }
         Ok(())
     }
 
@@ -2368,6 +2558,74 @@ mod tests {
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::ledger::ANCHOR_WINDOW;
     use randprotocol_core::Transaction;
+
+    /// A registration of `payout(n)`'s record, riding a self-transfer bundle tagged `tag`.
+    fn register_tx(ledger: &Ledger, n: u8, tag: u32) -> Transaction {
+        let rec = payout(n);
+        let fee = randprotocol_core::gas::fee_floor(&Action::RegisterReceiver { pk: rec.pk, kem_ek: vec![] });
+        let b = bundle(ledger, [[500 + tag; 8], [600 + tag; 8]], [[700 + tag; 8], [800 + tag; 8]], fee);
+        Transaction::shielded(ledger.chain_id(), b, Action::RegisterReceiver { pk: rec.pk, kem_ek: rec.kem_ek })
+    }
+
+    /// Short addresses (spec §§6.3, 7.7): genesis records land at seq 0.., a committed block's
+    /// registrations follow in the same batch, `load_ledger` recomputes the root and hands the
+    /// store over as the proof source, a reopened database rebuilds its index, `verify_chain`
+    /// replays the registrations against the store, and a truncation takes them back out.
+    #[test]
+    fn the_registry_commits_reloads_replays_and_truncates() {
+        use randprotocol_core::genesis::{ReceiverRecordHex, ReceiversGenesis};
+        let mut g = genesis_file_of(7, &[&key(1)], vec![], randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT);
+        g.receivers = Some(ReceiversGenesis { max_per_block: 64, records: vec![ReceiverRecordHex::from_address(&payout(50))] });
+        let gs = g.build(&StubExecutor).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.receivers_count(), 1);
+        let mut ledger = s.load_ledger(&StubExecutor).unwrap();
+        assert!(ledger.has_receiver_source(), "C-17: a loaded ledger carries the store");
+        assert_eq!(ledger.receivers_root(), gs.ledger.receivers_root());
+
+        let txs = vec![register_tx(&ledger, 51, 1), register_tx(&ledger, 52, 2)];
+        let b1 = make_block(&gs.block, &mut ledger, txs, &key(1));
+        assert_eq!(ledger.receivers_count(), 3);
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.receivers_count(), 3);
+        let rows = s.receivers_from(0, 10).unwrap();
+        let ids: Vec<ReceiverId> = [50, 51, 52].iter().map(|n| ReceiverId::of_address(&payout(*n))).collect();
+        assert_eq!(rows.iter().map(|r| (r.seq, r.record.id())).collect::<Vec<_>>(), vec![(0, ids[0]), (1, ids[1]), (2, ids[2])]);
+        assert_eq!(rows[1].height, 1);
+        assert_eq!(s.receivers_from(2, 10).unwrap().len(), 1);
+        assert_eq!(s.receivers_bucket(&[0; 32], 0, 10).unwrap().unwrap().len(), 3, "bits = 0 is the whole registry");
+        assert_eq!(s.receivers_bucket(&[0; 32], 0, 2).unwrap(), None, "over the cap");
+        let first_bit = ids[0].0[0] & 0x80;
+        let half = s.receivers_bucket(&ids[0].0, 1, 10).unwrap().unwrap();
+        assert!(half.iter().all(|r| r.record.id().0[0] & 0x80 == first_bit));
+        assert!(half.iter().any(|r| r.record.id() == ids[0]));
+
+        let reloaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(reloaded.receivers_root(), ledger.receivers_root());
+        assert_eq!(reloaded.receivers_count(), 3);
+        drop(s);
+        let s = Storage::open(dir.path()).unwrap();
+        assert_eq!(s.receivers_count(), 3, "the index is rebuilt at open");
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap().receivers_root(), ledger.receivers_root());
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        s.truncate_to(&gs, 0, &gs.ledger).unwrap();
+        assert_eq!(s.receivers_count(), 1);
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap().receivers_root(), gs.ledger.receivers_root());
+    }
+
+    /// A chain without the section writes no registry rows and loads a ledger with no gate.
+    #[test]
+    fn a_chain_without_receivers_has_no_registry() {
+        let (_dir, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.receivers_config().unwrap(), None);
+        let l = s.load_ledger(&StubExecutor).unwrap();
+        assert!(l.receivers().is_none());
+        assert!(!l.has_receiver_source());
+    }
 
     /// Fold a witness back to the root, the way the bundle guest's `MERKLE_VERIFY` does.
     fn fold(leaf: Word8, index: u64, path: &[Word8; DEPTH]) -> Word8 {
@@ -3566,11 +3824,12 @@ mod tests {
 
     /// The column families a pre-v0.3 build opens with: `ALL_CFS` without
     /// `receipts_by_program` — and without `program_public`, which arrived later still (the call
-    /// limits, on a fresh chain, so no database ever needs rolling back across it). Exactly the
+    /// limits, on a fresh chain, so no database ever needs rolling back across it) and without the
+    /// two receiver-registry families (short addresses, likewise a fresh chain's). Exactly the
     /// list the build the fleet rolls back to passes RocksDB.
     fn pre_v03_cfs() -> Vec<&'static str> {
-        let cfs: Vec<&str> =
-            ALL_CFS.iter().copied().filter(|c| *c != CF_RECEIPTS_BY_PROGRAM && *c != CF_PROGRAM_PUBLIC).collect();
+        let later = [CF_RECEIPTS_BY_PROGRAM, CF_PROGRAM_PUBLIC, CF_RECEIVERS, CF_RECEIVERS_BY_SEQ];
+        let cfs: Vec<&str> = ALL_CFS.iter().copied().filter(|c| !later.contains(c)).collect();
         assert_eq!(cfs.len(), 15);
         cfs
     }
@@ -3602,7 +3861,7 @@ mod tests {
         {
             // `init_genesis` touches no family the old build lacks, so it runs over the raw
             // fifteen-family handle exactly as the old build's own did.
-            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap() };
+            let old = Storage::from_db(open_as_pre_v03(dir.path(), true).unwrap()).unwrap();
             old.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);
             old.db.put_cf(old.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(&r).unwrap()).unwrap();
@@ -3636,9 +3895,9 @@ mod tests {
             opts.create_missing_column_families(true);
             let cfs = ALL_CFS
                 .iter()
-                .filter(|c| **c != CF_PROGRAM_PUBLIC)
+                .filter(|c| ![CF_PROGRAM_PUBLIC, CF_RECEIVERS, CF_RECEIVERS_BY_SEQ].contains(c))
                 .map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
-            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap() };
+            let st = Storage::from_db(DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap()).unwrap();
             st.backfill_receipts_index().unwrap();
             st.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);
