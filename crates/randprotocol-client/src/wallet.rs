@@ -2010,7 +2010,8 @@ pub fn deposit_index(bridge_state: &Value, assets: &[AssetRow], asset_id: &str) 
 pub fn mint_is_possible(bridge_state: &Value, token_chain: u16, token: &[u8; 32], amount: u64) -> Result<()> {
     if bridge_state["mint_paused"] == Value::Bool(true) {
         return Err(anyhow!(
-            "bridge minting is paused on this chain; a PQ guardian quorum must lift the pause              (rand bridge-unpause) before any deposit can be minted"
+            "bridge minting is paused on this chain; a PQ guardian quorum must lift the pause \
+             (rand bridge-unpause) before any deposit can be minted"
         ));
     }
     let hex_token = hex::encode(token);
@@ -2034,7 +2035,9 @@ pub fn mint_is_possible(bridge_state: &Value, token_chain: u16, token: &[u8; 32]
     let left = cap.saturating_sub(minted);
     if amount > left {
         return Err(anyhow!(
-            "that coin's daily mint cap is {cap} and {minted} has been minted against it today,              so only {left} is left and this deposit is {amount}; it becomes mintable on the next              UTC day of the chain's block timestamp"
+            "that coin's daily mint cap is {cap} and {minted} has been minted against it today, \
+             so only {left} is left and this deposit is {amount}; it becomes mintable on the next \
+             UTC day of the chain's block timestamp"
         ));
     }
     Ok(())
@@ -3398,6 +3401,10 @@ mod tests {
         tokens: serde_json::Value,
         /// A method that answers with an error, for the failure paths.
         fail: Option<&'static str>,
+        /// The error code `fail` answers with — `-32000` by default (a verdict, as `rejected`
+        /// replies are), overridden to exercise `-32603` (node N-2: not a verdict, so not
+        /// `SubmitRefused`).
+        fail_code: i64,
     }
 
     fn kind(a: &Action) -> &'static str {
@@ -3428,6 +3435,7 @@ mod tests {
                 assets: serde_json::json!([]),
                 tokens: serde_json::json!({ "enabled": false, "tokens": [] }),
                 fail: None,
+                fail_code: -32000,
             }
         }
 
@@ -3455,7 +3463,7 @@ mod tests {
         fn answer(&mut self, method: &str, p: &serde_json::Value) -> Reply {
             use serde_json::json;
             if self.fail == Some(method) {
-                return Reply::Err(-32000, "injected failure");
+                return Reply::Err(self.fail_code, "injected failure");
             }
             let n = |i: usize| p[i].as_u64().unwrap_or(0);
             let head = self.head();
@@ -4093,6 +4101,58 @@ mod tests {
         .unwrap_err();
         assert!(e.downcast_ref::<crate::SubmitRefused>().is_some(), "{e}");
         assert!(!out2.exists() && !pending_authority_key_path(&out2).exists());
+    }
+
+    /// Node N-2: a `-32603` reply **to `rand_sendTransaction` itself** is not a verdict either.
+    /// `Node::on_verdict`'s RPC arm pools and broadcasts the transaction before it replies, so a
+    /// node that stops (or drops the reply channel) inside that window answers `-32603` ("node
+    /// loop closed" / "node loop dropped reply") for a registration it may already have admitted
+    /// and gossiped. `submit_refused` must not label that `SubmitRefused` — only `-32000`
+    /// (rejected) and `-32602` (undecodable) are verdicts on the send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_token_keeps_the_pending_key_when_the_send_itself_answers_internal_error() {
+        let me = Wallet::from_spend_key(SpendKey([68; 8]));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("authority.key.json");
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.tokens = serde_json::json!({ "enabled": true, "registration_fee": 0, "next_index": 1, "tokens": [] });
+            c.fund(&me, 3 * gas::BUNDLE_BASE, 0);
+            c.fail = Some("rand_sendTransaction");
+            c.fail_code = -32603;
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let kp = Keypair::generate();
+
+        let e = create_token_with(
+            &rpc,
+            &me,
+            &mut store,
+            "Fixed",
+            "FIX",
+            6,
+            Some((&kp, out.as_path())),
+            None,
+            [3; 32],
+            None,
+            Proving::Emulated,
+            7,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        // It is an `RpcError` carrying `-32603` — and it is not a `SubmitRefused`.
+        let rpc_err = e.downcast_ref::<crate::RpcError>().unwrap_or_else(|| panic!("{e}"));
+        assert_eq!(rpc_err.code, -32603);
+        assert!(e.downcast_ref::<crate::SubmitRefused>().is_none(), "a -32603 send reply is not a refusal: {e}");
+        // Fate unknown: the key is kept at `.pending`, not discarded, not promoted.
+        let pending = pending_authority_key_path(&out);
+        assert!(pending.exists(), "the authority key of a possibly-admitted registration is kept");
+        assert!(!out.exists());
+        assert_eq!(load_authority_key(&pending).unwrap().public_key(), kp.public_key());
     }
 
     /// `rand token create`'s two authority branches build a `RegisterToken` that rides one RAND

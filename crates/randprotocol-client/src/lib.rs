@@ -85,11 +85,22 @@ pub fn amount_field(v: &serde_json::Value) -> Option<u64> {
     }
 }
 
-/// Re-label a `rand_sendTransaction` failure that is a JSON-RPC error reply as
-/// [`SubmitRefused`], and leave every other failure exactly as it is.
+/// Re-label a `rand_sendTransaction` failure as [`SubmitRefused`] only when the reply is a
+/// **verdict** on the transaction — `-32000` (`RpcError::rejected`, admission refused it) or
+/// `-32602` (`RpcError::invalid_params`, it could not even be decoded) — and leave every other
+/// failure, error codes included, exactly as it is (node N-2).
+///
+/// `-32603` (`RpcError::internal`, "node loop closed" / "node loop dropped reply") is not a
+/// verdict: `Node::on_verdict`'s RPC arm pools and broadcasts the transaction *before* it replies,
+/// so a node that stops or drops the channel in that window can have already admitted and gossiped
+/// what it never got to answer for. Labelling that `-32603` as refused was node I1's bug reborn
+/// through a narrower window — deleting the only copy of a fresh key for a registration that may
+/// still commit through another validator. Any code besides `-32000`/`-32602` therefore keeps the
+/// caller's fate-unknown handling (the `.pending` key stays, in `wallet.rs`'s terms).
 pub fn submit_refused(e: anyhow::Error) -> anyhow::Error {
     match e.downcast::<RpcError>() {
-        Ok(rpc) => anyhow::Error::new(SubmitRefused(rpc)),
+        Ok(rpc) if rpc.code == -32000 || rpc.code == -32602 => anyhow::Error::new(SubmitRefused(rpc)),
+        Ok(rpc) => anyhow::Error::new(rpc),
         Err(other) => other,
     }
 }
