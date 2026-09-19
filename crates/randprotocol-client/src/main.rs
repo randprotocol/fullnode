@@ -82,7 +82,8 @@ enum Cmd {
         /// Amount: in RAND for RAND (e.g. 1.5); in the token's own smallest unit for a token.
         amount: String,
         /// The asset to send: a registry index (0, the default, is RAND), or a token id — `rpl1…`
-        /// or 64 hex — which the node resolves to its index.
+        /// or 64 hex — found in the node's whole token listing (never a lookup of that one token,
+        /// which would tell the node what is about to move).
         #[arg(long, default_value = "0")]
         asset: String,
         /// Fee in RAND; the floor is 0.001.

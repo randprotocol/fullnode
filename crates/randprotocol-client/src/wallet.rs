@@ -490,11 +490,14 @@ pub fn rebuilt_notes(w: &Wallet, tx: &Transaction) -> Vec<Note> {
 /// that carries that commitment, which is what turns a rebuilt note into an owned one at a known
 /// index.
 ///
-/// Blocks are read once: `scanned_attest_height` moves past them whether or not they held a note
-/// for this wallet. The pass reads headers 128 at a time (`rand_getBlocks`), a block only when it
+/// Blocks are read once: the height returned is where `scanned_attest_height` moves to, past them
+/// whether or not they held a note for this wallet — but only once [`scan`] has placed every note
+/// found here at its leaf. The cursor lives in a store that is saved even when a scan fails, so
+/// moving it here, before the notes are placed, would let a failed scan persist a cursor past a
+/// garbage-envelope deposit that was never recorded — and nothing would ever read it again. The pass reads headers 128 at a time (`rand_getBlocks`), a block only when it
 /// carries a transaction, and a raw transaction only for the three kinds that append a public
 /// note — so an idle chain costs a header page per 128 blocks.
-async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<BTreeMap<Word8, Note>> {
+async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &NoteStore) -> Result<(BTreeMap<Word8, Note>, u64)> {
     let head = rpc.head().await?["height"].as_u64().context("getHead did not return a height")?;
     let mut out = BTreeMap::new();
     let mut from = store.scanned_attest_height;
@@ -531,8 +534,7 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -
         }
         from = last + 1;
     }
-    store.scanned_attest_height = store.scanned_attest_height.max(head + 1);
-    Ok(out)
+    Ok((out, store.scanned_attest_height.max(head + 1)))
 }
 
 /// Headers per `rand_getBlocks` page: the node's own cap.
@@ -581,7 +583,7 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
     // What the envelope layer cannot be trusted to deliver, read off the wire instead. Done
     // before the leaves are paged, so a deposit or a mint is placed by the same pass that first sees its
     // leaf rather than a scan later.
-    let mut rebuilt = rebuildable_notes(rpc, w, store).await?;
+    let (mut rebuilt, rebuilt_through) = rebuildable_notes(rpc, w, store).await?;
 
     loop {
         let rows = rpc.commitments(store.scanned_index, PAGE).await?;
@@ -632,6 +634,12 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
             ));
         }
     }
+
+    // Every rebuilt note is at its leaf now, so the blocks they came from need not be read again.
+    // Only here: any error above returns before this line, leaving the cursor where it was, and
+    // the next scan re-reads those blocks and places what this one could not.
+    debug_assert!(rebuilt.is_empty());
+    store.scanned_attest_height = rebuilt_through;
 
     // The head as it stands *before* the nullifier pages below. The pages read every nullifier
     // that exists at read time from `scanned_height` upward, so once the loop has finished, every
@@ -934,6 +942,17 @@ impl Plan {
             let need_r = bundle_need(0, fee, burn_r)?;
             let rand = store.spendable_of(0);
             if rand.is_empty() && need_r > 0 {
+                // RAND held back by a `--no-wait` submission is not spendable yet, but it is not
+                // missing either: say which, so the answer is "wait", not "go and get some".
+                let pending: u64 =
+                    store.notes.iter().filter(|n| n.note.asset == 0 && !n.spent && n.pending.is_some()).map(|n| n.note.amount).sum();
+                if pending > 0 {
+                    return Err(anyhow!(
+                        "a transfer pays its fee in RAND, and this wallet holds no spendable RAND: {} RAND is held \
+                         by a pending submission — `rand sync` once it commits (or expires) and retry",
+                        format_amount(pending)
+                    ));
+                }
                 return Err(anyhow!(
                     "a transfer pays its fee in RAND, and this wallet holds no spendable RAND: \
                      receive some RAND (on a testnet, `rand faucet`) and retry"
@@ -1862,25 +1881,53 @@ pub fn deposit_note_for(
     Ok((note, envelope))
 }
 
+/// Rows per `rand_getTokens` page when [`resolve_asset`] reads the registry.
+const TOKEN_PAGE: u64 = 1000;
+
 /// `--asset`: a registry index as a number (0 is RAND), or a token's id — its `rpl1…` text form or
-/// 64 hex — which only the node can turn into an index, through `rand_getToken` (bridge-hardening
-/// spec §8). A node without that method is told to take the index instead.
+/// 64 hex — looked up in the **whole** token registry (`rand_getTokens`, paged from index 0).
+///
+/// Never a per-token lookup: a transfer's asset is private on chain, and asking the node about the
+/// one token a wallet is about to send (`rand_getToken <id>`) right before it submits would tell the
+/// node's operator exactly what the hidden-asset bundle hides. Reading every row costs the same
+/// whichever token is meant, so the reply carries nothing about the choice. A number never reaches
+/// the node at all. A node without `rand_getTokens` is told to take the index instead.
 pub async fn resolve_asset(rpc: &RpcClient, text: &str) -> Result<u32> {
     if let Ok(index) = text.parse::<u32>() {
         return Ok(index);
     }
-    let reply = rpc.call("rand_getToken", serde_json::json!([text])).await.map_err(|e| {
-        if crate::is_method_not_found(&e) {
-            anyhow!("this node cannot resolve a token id (it has no rand_getToken); pass the token's registry index instead")
-        } else {
-            e
+    let want = text.trim().to_ascii_lowercase();
+    let want_hex = want.strip_prefix("0x").unwrap_or(&want).to_string();
+    let mut from = 0u64;
+    loop {
+        let reply = rpc.call("rand_getTokens", serde_json::json!([from, TOKEN_PAGE])).await.map_err(|e| {
+            if crate::is_method_not_found(&e) {
+                anyhow!("this node cannot list its token registry (it has no rand_getTokens); pass the token's registry index instead")
+            } else {
+                e
+            }
+        })?;
+        // A page is a list of rows, or `{ "tokens": [...] }`.
+        let rows = reply
+            .as_array()
+            .or_else(|| reply["tokens"].as_array())
+            .context("rand_getTokens did not return a list of tokens")?;
+        for row in rows {
+            let names = [&row["id_text"], &row["id"], &row["asset_id"]];
+            if names.iter().filter_map(|v| v.as_str()).any(|n| {
+                let n = n.to_ascii_lowercase();
+                n == want || n == want_hex
+            }) {
+                let index = row["index"].as_u64().context("a rand_getTokens row without an index")?;
+                return u32::try_from(index).map_err(|_| anyhow!("rand_getTokens lists index {index}, which is not a u32"));
+            }
         }
-    })?;
-    if reply.is_null() {
-        return Err(anyhow!("no token {text} on this chain"));
+        let last = rows.iter().filter_map(|r| r["index"].as_u64()).max();
+        match last {
+            Some(last) if (rows.len() as u64) >= TOKEN_PAGE && last >= from => from = last + 1,
+            _ => return Err(anyhow!("no token {text} in this chain's registry")),
+        }
     }
-    let index = reply["index"].as_u64().context("rand_getToken's reply has no index")?;
-    u32::try_from(index).map_err(|_| anyhow!("rand_getToken returned index {index}, which is not a u32"))
 }
 
 /// A plain shielded RAND transfer: [`send_asset`] of asset 0.
@@ -2504,6 +2551,8 @@ mod tests {
         sent: Vec<Transaction>,
         bridge: serde_json::Value,
         assets: serde_json::Value,
+        /// A method that answers with an error, for the failure paths.
+        fail: Option<&'static str>,
     }
 
     fn kind(a: &Action) -> &'static str {
@@ -2532,6 +2581,7 @@ mod tests {
                 sent: Vec::new(),
                 bridge: serde_json::json!({ "enabled": false }),
                 assets: serde_json::json!([]),
+                fail: None,
             }
         }
 
@@ -2558,6 +2608,9 @@ mod tests {
 
         fn answer(&mut self, method: &str, p: &serde_json::Value) -> Reply {
             use serde_json::json;
+            if self.fail == Some(method) {
+                return Reply::Err(-32000, "injected failure");
+            }
             let n = |i: usize| p[i].as_u64().unwrap_or(0);
             let head = self.head();
             Reply::Ok(match method {
@@ -2802,6 +2855,87 @@ mod tests {
         assert_eq!(store.balance(), 0);
     }
 
+    /// A save round trip, as `rand` does after every command whether or not it failed.
+    fn saved(store: &NoteStore) -> NoteStore {
+        serde_json::from_str(&serde_json::to_string(store).unwrap()).unwrap()
+    }
+
+    /// A scan that fails after reading the blocks but before placing the rebuilt notes at their
+    /// leaves does not move the public-rebuild cursor — the store `rand` saves on that failure
+    /// still re-reads those blocks, and the next scan finds the garbage-envelope deposit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_scan_never_saves_a_cursor_past_an_unplaced_deposit() {
+        let me = Wallet::from_spend_key(SpendKey([55; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let (txs, notes) = public_notes_for(&me);
+        {
+            let mut c = chain.lock().unwrap();
+            for (tx, note) in txs.into_iter().zip(&notes) {
+                c.commit(vec![tx], vec![(note.commitment(), garbage())]);
+            }
+            c.fail = Some("rand_getCommitments");
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        assert!(scan(&rpc, &me, &mut store).await.unwrap_err().to_string().contains("injected"));
+        let mut store = saved(&store);
+        assert_eq!(store.scanned_attest_height, 0, "the blocks are still unread as far as the store knows");
+        assert!(store.notes.is_empty());
+
+        // And a failure after the leaves were read but in the nullifier pages: the notes were placed,
+        // so the cursor may move — but it did not have to for correctness; either way nothing is lost.
+        chain.lock().unwrap().fail = Some("rand_getNullifiers");
+        assert!(scan(&rpc, &me, &mut store).await.is_err());
+        let mut store = saved(&store);
+
+        chain.lock().unwrap().fail = None;
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.asset_balances(), vec![(3, 1_000), (5, 250), (6, 90)], "every public note found");
+        assert_eq!(store.scanned_attest_height, chain.lock().unwrap().head() + 1);
+    }
+
+    /// The recovery pass: a store whose leaf cursor is already past a deposit's leaf (an older
+    /// build scanned it, and its garbage envelope opened nothing) but whose block cursor is 0 —
+    /// what a store written before the public-rebuild path looks like. The rescan reads the blocks,
+    /// rebuilds the note, and places it by re-reading the leaves from the start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rebuilt_note_below_the_leaf_cursor_is_placed_by_the_recovery_pass() {
+        let me = Wallet::from_spend_key(SpendKey([56; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let (txs, notes) = public_notes_for(&me);
+        {
+            let mut c = chain.lock().unwrap();
+            let (tx, note) = (txs.into_iter().next().unwrap(), notes[0]);
+            c.commit(vec![tx], vec![(note.commitment(), garbage())]);
+            c.fund(&me, 5, 0);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore { scanned_index: 2, scanned_height: 0, scanned_attest_height: 0, ..NoteStore::default() };
+        scan(&rpc, &me, &mut store).await.unwrap();
+        let deposit: Vec<(u64, u64, u32)> = store.notes.iter().map(|n| (n.index, n.note.amount, n.note.asset)).collect();
+        // The deposit at leaf 0, below the cursor; the recovery pass re-offers every leaf, so the
+        // RAND note at leaf 1 is recorded on the way (once — a leaf is keyed by its index).
+        assert_eq!(deposit, vec![(0, 1_000, 3), (1, 5, 0)]);
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.notes.len(), 2, "a second scan adds nothing");
+        assert_eq!(store.scanned_index, 2);
+    }
+
+    /// RAND held by a `--no-wait` submission is not spendable, but it is not missing: the refusal
+    /// says to wait, not to go and get RAND.
+    #[test]
+    fn a_fee_refusal_names_rand_held_by_a_pending_submission() {
+        let you = Wallet::from_spend_key(SpendKey([57; 8]));
+        let mut store = NoteStore { notes: vec![owned_asset(0, 500, false, 4), owned_asset(1, 3_000_000, false, 0)], ..NoteStore::default() };
+        store.notes[1].pending = Some(9);
+        let spend = Spend { asset: 4, to: Some((&you.address, 100)), fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0 };
+        let e = Plan::select(&store, spend).unwrap_err().to_string();
+        assert!(e.contains("0.003 RAND is held by a pending submission") && e.contains("rand sync"), "{e}");
+        store.notes[1].spent = true;
+        let e = Plan::select(&store, spend).unwrap_err().to_string();
+        assert!(e.contains("receive some RAND"), "{e}");
+    }
+
     /// A RAND payment keeps today's shape: value and fee in slots 2–3, slots 0–1 dummies that open
     /// to nobody — the sender included — so they are never a balance or a history row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3004,19 +3138,39 @@ mod tests {
         let _ = me;
     }
 
-    /// `--asset`: a number is the index as it stands; a token id goes to `rand_getToken`, and a node
-    /// without that method is told to take the index instead.
+    /// `--asset`: a number is the index as it stands and never reaches the node; a token id is
+    /// found in the whole registry listing (`rand_getTokens`), never by a per-token lookup that
+    /// would name the token about to move; a node without the listing is told to take the index.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_asset_is_an_index_or_a_token_id_the_node_resolves() {
-        use crate::test_rpc::scripted_rpc;
-        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getToken", Reply::Ok(serde_json::json!({ "index": 5 })))]).await);
+    async fn an_asset_is_an_index_or_a_token_id_found_in_the_whole_registry() {
+        let asked = Arc::new(Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+        let log = asked.clone();
+        let rows = serde_json::json!([
+            { "index": 1, "id": "aa".repeat(32), "id_text": "rpl1first" },
+            { "index": 5, "id": "bb".repeat(32), "id_text": "rpl1fifth" },
+        ]);
+        let rpc = RpcClient::new(
+            rpc_fn(move |m, p| {
+                log.lock().unwrap().push((m.to_string(), p.clone()));
+                match m {
+                    "rand_getTokens" => Reply::Ok(rows.clone()),
+                    _ => Reply::Err(-32601, "unknown method"),
+                }
+            })
+            .await,
+        );
         assert_eq!(resolve_asset(&rpc, "0").await.unwrap(), 0);
-        assert_eq!(resolve_asset(&rpc, "7").await.unwrap(), 7, "a number never reaches the node");
-        assert_eq!(resolve_asset(&rpc, "rpl1qqqq").await.unwrap(), 5);
-        let unknown = RpcClient::new(scripted_rpc(vec![("rand_getToken", Reply::Ok(serde_json::Value::Null))]).await);
-        assert!(resolve_asset(&unknown, "rpl1qqqq").await.unwrap_err().to_string().contains("no token rpl1qqqq"));
-        let older = RpcClient::new(scripted_rpc(vec![]).await);
-        let e = resolve_asset(&older, "rpl1qqqq").await.unwrap_err().to_string();
+        assert_eq!(resolve_asset(&rpc, "7").await.unwrap(), 7);
+        assert!(asked.lock().unwrap().is_empty(), "a number never reaches the node");
+        assert_eq!(resolve_asset(&rpc, "rpl1fifth").await.unwrap(), 5);
+        assert_eq!(resolve_asset(&rpc, &format!("0x{}", "AA".repeat(32))).await.unwrap(), 1);
+        assert!(resolve_asset(&rpc, "rpl1nothere").await.unwrap_err().to_string().contains("no token rpl1nothere"));
+        // Every request was the same whole-registry page: nothing in any of them names a token.
+        for (method, params) in asked.lock().unwrap().iter() {
+            assert_eq!((method.as_str(), params), ("rand_getTokens", &serde_json::json!([0, TOKEN_PAGE])));
+        }
+        let older = RpcClient::new(crate::test_rpc::scripted_rpc(vec![]).await);
+        let e = resolve_asset(&older, "rpl1fifth").await.unwrap_err().to_string();
         assert!(e.contains("registry index instead"), "{e}");
     }
 
