@@ -79,6 +79,25 @@ source of guardian-set rotations: `keccak256("rand-bridge-governance")`, pinned 
 (`governance_emitter_matches_string`). It is a slot in the `(emitter_chain, emitter_address)` pair
 that only a `GuardianSetUpgrade` payload may claim, and only as `(CHAIN_RAND, GOVERNANCE_EMITTER)`.
 
+**The redirect attack, and why it is closed (2026-09-19, Task 5b, chain 14).** A Rand transaction
+carries no signature: a burn is authorised by the STARK proofs of its two bundles, which show the
+burner held the notes. Until the transaction binding, those proofs committed only to each bundle's
+own digest (anchor, nullifiers, commitments, fee, burn, asset, time) — nothing tied them to the
+`BridgeBurn` action around them. Anyone who saw a pending burn in gossip (a peer, a proposer) could
+copy it, keep both proofs byte for byte, swap `to` for their own address (or raise `relayer_fee`
+and relay it themselves, or name another backing's `(to_chain, token)`), and race it; whichever
+copy committed first spent the notes, and the source-chain release contract would then pay the
+attacker — theft, with nothing on Rand to show it was not the burner's intent. An attest could be
+copied the same way with its deposit `r`, `time` or envelope changed (stranding the recipient's
+note), or its fee bundle lifted onto another transaction. Now every bundle proof is made over, and
+verified against, the eight words of `Transaction::binding` — a hash of the whole transaction
+(chain id, both bundles including their envelopes, the action) with only the proof bytes blanked —
+as its public input segment, so any copy that changes any field fails the proof
+(`TxError::InvalidBundleProof`, `PublicValues`); the ledger tests named in `docs/confidential.md`
+admitted each of these copies before the fix and refuse them after. **Every wallet and relayer
+must run the new binary at the fork**: an old `rand` makes empty-segment proofs, which the chain
+now refuses.
+
 **What this does not protect against.** The trust model is entirely the guardian committee's
 signatures — no fallback or dispute mechanism, no independent light client. If `n*2/3 + 1`
 guardians collude they can mint arbitrary value or authorize an illegitimate rotation; nothing
@@ -364,7 +383,9 @@ contract, which pays `amount - fee` to `to` and `fee` to the relayer and so rele
 total. A pool that burned `amount + relayer_fee` would destroy more than the far side ever releases
 and strand the difference in the source-chain contract forever. Both bundles go through the *same*
 admission: four distinct unspent nullifiers, four new commitments (checked across the pair, not just
-within each), both digests recomputed, both STARK proofs verified. `apply_burn` records the outbound
+within each), both digests recomputed, both STARK proofs verified — each against the transaction's
+binding, so neither bundle can be copied under a changed `to`, `relayer_fee`, `(to_chain, token)`
+or companion bundle (§1, "The redirect attack"). `apply_burn` records the outbound
 message with the **transaction hash** in the sender slot — a burn is funded by notes, so there is no
 sender identity — and the next `burn_sequence`; guardians read the burn log exactly as before.
 
@@ -388,8 +409,10 @@ sender identity — and the next `burn_sequence`; guardians read the burn log ex
    - `BridgeBurn`: `asset_bundle.asset == action.asset` → its `fee == 0` →
      `burn == amount` → no nullifier or commitment shared with the fee bundle → the
      asset bundle's own bundle checks → `check_burn` (registered asset, `to_chain` is the asset's
-     home chain, recipient shape, `relayer_fee <= amount`, `amount != 0`) → the asset bundle's
-     proof.
+     home chain, recipient shape, `relayer_fee <= amount`, `amount != 0`).
+4. At steps 8–9, both bundles' digests and proofs — the fee bundle's, then the asset bundle's —
+   each verified against the **same** transaction binding (`Transaction::binding`, computed once;
+   `docs/confidential.md`, "Transaction binding").
 
 `apply_tx` writes the fee bundle's notes and then runs the action, so `bridge_notes::apply` consumes
 the `CheckedAttestation` that `validate` produced rather than verifying the guardian quorum a second

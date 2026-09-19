@@ -196,5 +196,12 @@ shape. The cluster capstone pins this distinction by asserting the committed bun
 equals the admitted shape; a genesis cut with the fixtures' classes would admit a shape no
 fleet bundle can ever match.
 
+**Re-measure before activating (2026-09-19).** That shape's `public 2` is the empty public
+segment's height. Since the transaction binding (`docs/confidential.md`, "Transaction binding")
+every bundle proof carries eight binding words and declares `public 4`, so no bundle proved after
+that fork matches the chain-9 shape. Aggregation is inactive on every chain and chain 14 is cut
+without it; re-measure the admitted shape (and the recursion fixtures) before any chain is cut
+with an `aggregation` section.
+
 Related: `docs/block-space.md` (the numbers and the three remedies), `docs/fees.md`,
 `docs/supply.md`, `docs/staking.md`, `docs/zkvm.md`.

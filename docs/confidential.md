@@ -330,7 +330,9 @@ constraint-set-6 merge, which also brings milestones 4.3 (the EVM interpreter gu
   (`tests/evm_*.rs`, `tests/sbpf_*.rs`, `tests/sha256.rs`, the grown `tests/e2e.rs`) are vendored
   wholesale as always, because they are the upstream authority on the machine's behaviour; the
   EVM tier-16 call proof in `e2e.rs` is part of this suite now.
-- **The chain admits only the empty public segment.** No transaction on this chain publishes
+- **The chain admits only the empty public segment.** *(Superseded for bundles by the
+  transaction binding below: a bundle proof now carries its transaction's eight binding words.)*
+  No transaction on this chain publishes
   public words, so `ZkExecutor::verify_call` and `verify_bundle` both run
   `Machine::verify_public(hc, &[], proof)`, pinning `H_PUB` to `hash::public_digest(&[])`. Plain
   `verify` would leave `pv::PUB0..7` unchecked against anything outside the proof — bound
@@ -359,6 +361,92 @@ constraint sets 2–5 already documented: a node built from this commit will fai
 replay of any chain with a confidential call proved under an older constraint set and truncate
 its chain. Start a new chain id, or run `--verify-chain off` on nodes that must keep serving an
 old chain. A fleet must run one build.
+
+### Transaction binding (2026-09-19, Task 5b — a hard fork, chain 14)
+
+**The hole it closes.** A transaction is `{chain_id, bundle, action}` and carries no signature;
+a bundle's STARK proof commits only to `Bundle::digest_input` — anchor, nullifiers, commitments,
+fee, burn, asset, time. Until this fix nothing tied a proved bundle to the *action* it rode with,
+nor to its own `envelopes`, nor to the other bundle of a two-bundle transaction. Anyone who saw a
+transaction — a gossip peer, a proposer — could copy it, keep every proof byte for byte and change
+the rest: a `BridgeBurn`'s `to`, `relayer_fee` or `(to_chain, token)` (the source-chain release
+then pays the attacker), a `Bond`'s `validator` (the burned stake credited to someone else), a
+`TokenTransfer`'s memo, an attest's `r`/`time`/`envelope`, any bundle's envelopes (the recipient
+can never open the note), or lift a bundle into a different transaction altogether. Whichever copy
+committed first spent the nullifiers. The ledger tests
+`a_burns_proofs_cannot_ride_a_changed_destination_fee_amount_or_asset`,
+`a_burns_proofs_cannot_ride_another_backing`, `an_attests_fee_bundle_cannot_ride_a_changed_deposit`,
+`a_bundle_lifted_into_another_transaction_is_refused`, `a_bonds_proof_cannot_ride_a_changed_validator`,
+`a_transfers_proofs_cannot_ride_a_changed_memo` and
+`a_transfers_proof_cannot_ride_a_changed_envelope_or_chain` each *admitted* its altered copy before
+the fix.
+
+**The fix — no guest or circuit change.** Since constraint set 6 every proof carries a public
+input segment whose digest `H_PUB` (`pv::PUB0..7`) is bound in-circuit to the words the prover
+supplied — by the public table's `PUBLIC_DIGEST` bus, whether or not the guest ever reads them. A
+bundle proof is now made with, and verified against, its transaction's binding:
+
+```text
+binding(tx) = blake3("rand-tx-bind-1" || bincode(chain_id, bundle', action'))   as 8 LE u32 words
+```
+
+where `'` means "every proof byte string replaced by the empty vector": `bundle.proof`, an asset
+bundle's `proof` (`BridgeBurn`, `TokenTransfer`, `TokenBurn` — `Action::asset_bundle`), `Call.proof`
+and `Aggregate.proof`. Everything else — envelopes, memo, destination, validator, recipient,
+signatures, the guardian attestation — is inside. `Transaction::binding` is the one function the
+wallet (before proving) and the ledger (before verifying) both call; it hashes the *decoded*
+transaction with the bincode configuration pinned inside it (fixed-width integers, little-endian —
+what `bincode::serialize` writes), and `Action::blanked` is an exhaustive match that names every
+field of every variant, so a new variant or field does not compile until it is classified as a
+proof or not. `the_binding_encoding_is_pinned` holds a golden value.
+
+- `ConfidentialExecutor::verify_bundle(hc_bundle, proof, binding)`: the zkVM runs
+  `Machine::verify_public(hc_bundle, &binding, proof)`; the stub executor carries the eight words in
+  its stub proof and compares them, so every ledger test runs with the binding enforced.
+- `Ledger::validate_inner` computes the binding once per transaction and verifies the fee bundle
+  and then the asset bundle against the same words, at steps 8–9, after every cheap check of both.
+- The bundle verifier key's `public_log_height` is `public_log_height(8) == 4` (the empty segment's
+  is 2), a single known value: `ZkExecutor::bundle_heights` returns it, `warm_bundle` warms it, and
+  `decode_and_check` refuses a bundle proof declaring any other public height before any verifier
+  key is built.
+- `prove_bundle(profile, inputs, binding, backend)`: the wallet (`randprotocol-client`'s
+  `wallet::prepare_bundles` → `prove_transaction`) builds the whole transaction first — witnesses,
+  outputs, envelopes (sealed against the output notes, never the proof), the action — takes its
+  binding, then proves every bundle with it. A two-bundle transaction's two proofs carry the same
+  words. The bundle still lands at tier 14 (`tests/shielded.rs`, 101.9 s at the test profile,
+  324 387 bytes).
+- `Transaction::hash` (the txid) is unchanged.
+
+**What this does not cover.** The bundle-less actions (`Mint`, `Unbond`, `Withdraw`,
+`UnbondAggregator`, `WithdrawAggregator`, `SlashAggregator`, `Aggregate`) have no proof to bind;
+they rest on their own signatures (audited with this fix; `Aggregate`'s `envelope` is outside its
+signed message — a recorded follow-up, aggregation being inactive on every chain). A `Call`'s own
+proof is blanked, so it is not bound to the transaction either: the fee bundle's proof binds the
+call's `program` and `input_envelope`, but another valid proof of the same program could be swapped
+in (it changes only the receipt the fee payer paid for).
+
+**Pruned (sealed) transactions.** A pruned bundle's proof is a marker, verified through its
+covering aggregate rather than `verify_bundle`, so the binding is not checked on that path. What
+authenticates a pruned transaction's action and envelopes is its id: `Transaction::hash` covers
+`chain_id`, every bundle field including both envelopes (the proof by its digest) and the action
+as-is; `Block::verify_tx_root` recomputes the root from the served transactions' hashes inside
+`Ledger::apply_block_for_sync`, before any transaction is applied; the header commits to that root
+(`BlockHeader::hash`); and `node.rs`'s `apply_synced` verifies the QC over that header hash against
+the epoch's set before it applies the block. A marker-form transaction hashes to its raw hash, so
+a peer that changes anything outside the proof bytes fails the root. The honest raw transaction was
+verified against its binding when the validators first admitted it.
+
+**Block aggregation must be re-measured before it is ever activated.** Its admitted shape
+(`docs/aggregation.md`, "The fleet bundle's declared shape") was measured with the empty public
+segment — `public 2` — and a bound bundle declares `public 4`, so no bundle proved after this fork
+matches it. Aggregation is inactive on every chain (chain 14 is cut without it); re-measure the
+shape (and consider checking a covered bundle's `PUB0..7` against its transaction's binding in the
+covered-record path) before cutting a chain with an `aggregation` section.
+
+**Operational.** Every wallet and relayer must run the new binary at the fork: an old `rand`
+produces empty-segment bundle proofs, which are refused (`public height not the transaction
+binding's`). A chain-13 genesis still builds, but every chain-13 transaction carrying a bundle is
+refused by this build — the intended hard fork; it ships with chain 14.
 
 ## On-chain model
 
@@ -392,7 +480,8 @@ is no `effect` field.
 - Both: the transaction carries a bundle, and that bundle passes the shielded admission order
   (`docs/shielded.md` §5) — anchor in the 256-block window, neither note already spent, the
   recomputed digest equal to what the bundle proof published, and the bundle proof valid against
-  the genesis-pinned `hc_bundle`.
+  the genesis-pinned `hc_bundle` and against the transaction's binding (see "Transaction binding"
+  above).
 - Deploy: `words.len() <= max_program_words` (genesis; 4096 when the file does not set it, and never
   above 65 535, the word count the zkVM can prove), `base_pc % 4 == 0`, every word decodes,
   `public.len() <= max_program_public_words` (checked first, before any fee or code work),

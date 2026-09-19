@@ -318,12 +318,18 @@ the same check before gossiping, so a bad transaction is refused once, at the ed
    registration present exactly when the validator is unknown, the register's nonce and the
    validator's signature, enough stake to unbond, enough released to withdraw, and the deposit note
    a withdraw derives not already in the tree; and the bridge's own rules for the two bridge
-   actions, including a burn's asset bundle in full — all of it before either bundle's proof, so a
-   bridge transaction that cannot apply costs no verification (`docs/bridge.md` §5).
+   actions, including a burn's asset bundle's cheap checks in full — all of it before either
+   bundle's proof, so a bridge transaction that cannot apply costs no verification
+   (`docs/bridge.md` §5).
 8. **Bundle digest** — the ledger recomputes the digest from the bundle's published plaintext and
    it must equal what the proof published. A proof whose witness broke the relation publishes a
    tainted digest, which matches no plaintext.
-9. **Bundle proof** — `Machine::verify` against the genesis-pinned `hc_bundle`.
+9. **Bundle proof** — `Machine::verify_public` against the genesis-pinned `hc_bundle` and the
+   transaction's binding (`Transaction::binding`: a hash of the whole transaction with every proof
+   blanked, eight words the proof carries as its public input). A two-bundle transaction's fee and
+   asset bundles are both verified here, against the same words. This is what keeps a proof from
+   being copied onto a changed transaction — another action, another envelope, another chain id,
+   another companion bundle (`docs/confidential.md`, "Transaction binding").
 10. **Call proof and its tier fee** — the call's own STARK against the program's `code_hash`, then
     `fee ≥ BUNDLE_BASE + call_fee(tier)`, which is only knowable once the tier is.
 
@@ -335,6 +341,11 @@ The windows are 256 blocks because proving takes real time: a tier-14 bundle pro
 100 seconds, and a chain making a block every two seconds gives such a proof roughly eight
 minutes of anchor validity. On a faster chain a wallet can still lose the race, in which case the
 node answers `anchor is not one of the last 256 roots` and the wallet reproves.
+
+Since the transaction binding (chain 14) the wallet builds the whole transaction — outputs,
+envelopes, action — *before* it proves, because each bundle's proof commits to all of it. A wallet
+built before that fork proves against the empty public segment and is refused; every wallet must
+run the new `rand` at the fork.
 
 ## 6. What still leaks
 
