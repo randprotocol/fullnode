@@ -18,11 +18,12 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use randprotocol_core::bridge::{AssetId, Attestation, Payload};
-use randprotocol_core::ledger::tokens::MINT_FROM;
+use randprotocol_core::ledger::tokens::{MintAuthority, MINT_FROM};
 use randprotocol_core::ledger::{bridge_notes, TIME_WINDOW};
 use randprotocol_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, DEPTH};
 use randprotocol_core::types::TX_BINDING_WORDS;
-use randprotocol_core::{format_amount, gas, Action, Hash, Transaction};
+use randprotocol_core::{format_amount, gas, Action, Hash, InitialMint, Keypair, PublicKey, Transaction};
+use randprotocol_core::{set_authority_message, token_mint_message};
 use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note};
 use randprotocol_zkvm::executor::prove_hidden_bundle;
 use randprotocol_zkvm::hidden::{self, HiddenDigestInput, HiddenOutput, A_SLOTS, SLOTS};
@@ -123,6 +124,66 @@ pub fn store_path(key: &Path) -> PathBuf {
     let mut s = key.as_os_str().to_os_string();
     s.push(".notes.json");
     PathBuf::from(s)
+}
+
+// ---------------------------------------------------------------- an RPL token's authority key
+//
+// A `Key`-authorised token's authority is a Dilithium2 keypair (`randprotocol_core::Keypair`),
+// the same key kind a validator or a bridge guardian holds — unrelated to the shielded spend key
+// above, which never signs anything. `rand-node keygen` already writes this exact shape
+// (`crates/randprotocol-node/src/keyfile.rs`: `{"seed", "address", "public_key"}`), and duplicating
+// it here rather than depending on that crate is deliberate: `rand-node`'s own binary already
+// depends on `randprotocol_client` (its RPC client and this wallet module), so depending back
+// would be the crate cycle `randprotocol-rvm`/`randprotocol-zkvm` avoids for the same reason
+// (AGENTS.md). The two stay byte-compatible because both are exactly `{seed, address,
+// public_key}`, so a file either tool writes is a file the other reads.
+
+#[derive(Serialize, Deserialize)]
+struct TokenAuthorityKeyFile {
+    seed: String,
+    address: String,
+    public_key: String,
+}
+
+/// Read a token authority's Dilithium2 key file: `rand-node keygen`'s own shape, or `rand token
+/// create --authority-key-out`'s. Only the seed is read back; `address` and `public_key` are
+/// informational, exactly as `rand-node`'s own reader treats them.
+pub fn load_authority_key(path: &Path) -> Result<Keypair> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let kf: TokenAuthorityKeyFile = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not a Dilithium2 key file (rand-node keygen's shape)", path.display()))?;
+    let seed = hex::decode(kf.seed.trim()).context("seed must be hex")?;
+    let seed: [u8; 32] = seed.try_into().map_err(|_| anyhow!("seed must be 32 bytes"))?;
+    Keypair::from_seed(seed).map_err(|e| anyhow!("{e}"))
+}
+
+/// Write a fresh Dilithium2 authority key file at `path` for `rand token create
+/// --authority-key-out`, refusing to overwrite an existing one. The same 0600-from-creation
+/// discipline as [`Wallet::save_new`] and `rand-node keygen`'s own writer: the seed is a secret,
+/// and writing the file then chmodding it afterwards would leave it world-readable for a window.
+pub fn write_authority_key(kp: &Keypair, path: &Path) -> Result<()> {
+    let kf = TokenAuthorityKeyFile { seed: hex::encode(kp.seed()), address: kp.address().to_base58(), public_key: kp.public_key().to_hex() };
+    let text = serde_json::to_string_pretty(&kf)? + "\n";
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("{} already exists or cannot be created; refusing to overwrite", path.display()))?;
+        f.write_all(text.as_bytes())?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        if path.exists() {
+            return Err(anyhow!("{} already exists; refusing to overwrite", path.display()));
+        }
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+    }
 }
 
 // ---------------------------------------------------------------- the note store
@@ -1926,6 +1987,25 @@ pub fn deposit_note_for(
     Ok((note, envelope))
 }
 
+/// The note an RPL mint creates — `rand token create`'s initial supply, or `rand token mint`'s —
+/// and the envelope only its recipient can open. [`deposit_note_for`]'s twin, one action over:
+/// same reasoning (`time` is chosen here so the commitment is predictable enough to seal against,
+/// the blinding is drawn by `Note::new` and read back for the action's `r`), but from RPL's own
+/// [`MINT_FROM`] word rather than a deposit's zero — a mint has no sender inside the pool either,
+/// but a different constant, so the two note families can never collide at the same leaf.
+pub fn mint_note_for(
+    w: &Wallet,
+    recipient: &ShieldedAddress,
+    amount: u64,
+    asset: u32,
+    time: u32,
+) -> Result<(Note, Envelope)> {
+    let note = Note::new(recipient.pk, MINT_FROM, amount, asset, time);
+    let envelope =
+        seal_note(&w.vk, recipient, &note, &TxKey::random()).map_err(|e| anyhow!("sealing the mint envelope: {e}"))?;
+    Ok((note, envelope))
+}
+
 /// Rows per `rand_getTokens` page when [`resolve_asset`] reads the registry.
 const TOKEN_PAGE: u64 = 1000;
 
@@ -1973,6 +2053,265 @@ pub async fn resolve_asset(rpc: &RpcClient, text: &str) -> Result<u32> {
             _ => return Err(anyhow!("no token {text} in this chain's registry")),
         }
     }
+}
+
+/// One `rand_getTokens` row, found the way [`resolve_asset`] finds an index: by paging the whole
+/// registry and matching `text` against a row's `index`, `id_text` or `id` (hex, `0x` optional,
+/// case-insensitive) — never `rand_getToken`, so a wallet reading one token's row after
+/// [`resolve_asset`] already read the same listing costs this node nothing more than asking after
+/// any other token. `rand token info`'s reader; `rand token mint` and `rand token set-authority`
+/// use it too, for the row's `mint_nonce`, id and authority key.
+pub async fn find_token_row(rpc: &RpcClient, text: &str) -> Result<Value> {
+    let want_index: Option<u64> = text.trim().parse::<u64>().ok();
+    let want = text.trim().to_ascii_lowercase();
+    let want_hex = want.strip_prefix("0x").unwrap_or(&want).to_string();
+    let mut from = 0u64;
+    loop {
+        let reply = rpc.call("rand_getTokens", serde_json::json!([from, TOKEN_PAGE])).await.map_err(|e| {
+            if crate::is_method_not_found(&e) {
+                anyhow!("this node cannot list its token registry (it has no rand_getTokens)")
+            } else {
+                e
+            }
+        })?;
+        let rows = reply
+            .as_array()
+            .or_else(|| reply["tokens"].as_array())
+            .context("rand_getTokens did not return a list of tokens")?;
+        for row in rows {
+            let idx_match = want_index.is_some() && row["index"].as_u64() == want_index;
+            let names = [&row["id_text"], &row["id"], &row["asset_id"]];
+            let name_match = names.iter().filter_map(|v| v.as_str()).any(|n| {
+                let n = n.to_ascii_lowercase();
+                n == want || n == want_hex
+            });
+            if idx_match || name_match {
+                return Ok(row.clone());
+            }
+        }
+        let last = rows.iter().filter_map(|r| r["index"].as_u64()).max();
+        match last {
+            Some(last) if (rows.len() as u64) >= TOKEN_PAGE && last >= from => from = last + 1,
+            _ => return Err(anyhow!("no token {text} in this chain's registry")),
+        }
+    }
+}
+
+/// `rand token create`'s action, plus the two registry facts it was built from: `index` (which
+/// `IndexMismatch` on submission names, for the wallet's own "another token took index N first"
+/// hint) and `registration_fee` (the default fee's other half, on top of `gas::fee_floor`).
+pub struct RegisterTokenPlan {
+    pub action: Action,
+    pub index: u32,
+    pub registration_fee: u64,
+}
+
+/// Build `rand token create`'s `RegisterToken` action: reads `next_index` and
+/// `registration_fee` from `rand_getTokens` — the index an `initial` mint's envelope is sealed
+/// for, and the registry's own fee floor — before anything is proved. `initial` is `(amount,
+/// recipient)`; `None` registers a `Key`-authorised token empty. The caller has already refused
+/// `authority == MintAuthority::None` without an `initial` (the ledger's own rule,
+/// `TokenError::InitialMintRequired`) and a zero `--fixed-supply`/`--initial` amount, so this
+/// only reads the chain and builds the note.
+pub async fn build_register_token(
+    rpc: &RpcClient,
+    w: &Wallet,
+    name: &str,
+    symbol: &str,
+    decimals: u8,
+    authority: MintAuthority,
+    initial: Option<(u64, ShieldedAddress)>,
+    salt: [u8; 32],
+) -> Result<RegisterTokenPlan> {
+    let reply = rpc.call("rand_getTokens", serde_json::json!([0, 1])).await.map_err(|e| {
+        if crate::is_method_not_found(&e) {
+            anyhow!("this node cannot list its token registry (it has no rand_getTokens); this chain may not have RPL tokens enabled")
+        } else {
+            e
+        }
+    })?;
+    if reply["enabled"] == Value::Bool(false) {
+        return Err(anyhow!("this chain has no RPL token registry (genesis has no tokens section)"));
+    }
+    let index = u32::try_from(reply["next_index"].as_u64().context("rand_getTokens has no next_index")?)
+        .context("next_index does not fit a u32")?;
+    let registration_fee = reply["registration_fee"].as_u64().context("rand_getTokens has no registration_fee")?;
+    let initial = match initial {
+        Some((amount, recipient)) => {
+            if amount == 0 {
+                return Err(anyhow!("an initial mint of zero mints nothing"));
+            }
+            let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
+                .context("chain height does not fit a note's time field")?;
+            let (note, envelope) = mint_note_for(w, &recipient, amount, index, time)?;
+            Some(InitialMint { amount, recipient, r: note.r, time, envelope })
+        }
+        None => None,
+    };
+    let action = Action::RegisterToken { name: name.to_string(), symbol: symbol.to_string(), decimals, authority, initial, salt, index };
+    Ok(RegisterTokenPlan { action, index, registration_fee })
+}
+
+/// Build `rand token mint`'s `TokenMint` action: `asset`'s row (`find_token_row`) for its
+/// `mint_nonce`, id and authority, refused up front if it is not `Key`-authorised or `authority`
+/// is not that key, then the note the chain will compute and `authority`'s Dilithium2 signature
+/// over [`token_mint_message`], which binds the note's commitment and the envelope's digest.
+pub async fn build_token_mint(
+    rpc: &RpcClient,
+    w: &Wallet,
+    chain_id: u64,
+    asset: u32,
+    recipient: &ShieldedAddress,
+    amount: u64,
+    authority: &Keypair,
+) -> Result<Action> {
+    if amount == 0 {
+        return Err(anyhow!("a mint of zero moves nothing"));
+    }
+    let row = find_token_row(rpc, &asset.to_string()).await?;
+    if row["authority"]["kind"].as_str() != Some("key") {
+        return Err(anyhow!("token {asset} is not Key-authorised: there is no authority to mint with"));
+    }
+    let key_hex = row["authority"]["key"].as_str().context("a key-authority row without its key")?;
+    if key_hex != authority.public_key().to_hex() {
+        return Err(anyhow!("this key is not token {asset}'s mint authority"));
+    }
+    let asset_id =
+        Hash::from_hex(row["id"].as_str().context("a token row without its id")?).map_err(|e| anyhow!("token {asset}'s id: {e}"))?;
+    let nonce = row["mint_nonce"].as_u64().context("a token row without its mint_nonce")?;
+    let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
+        .context("chain height does not fit a note's time field")?;
+    let (note, envelope) = mint_note_for(w, recipient, amount, asset, time)?;
+    let cm = note.commitment();
+    let signature = authority.sign(token_mint_message(chain_id, &asset_id, nonce, amount, &cm, &envelope).as_bytes());
+    Ok(Action::TokenMint { asset, amount, recipient: recipient.clone(), r: note.r, time, envelope, nonce, signature })
+}
+
+/// Build `rand token set-authority`'s `SetAuthority` action: the same row and refusals as
+/// [`build_token_mint`], then `authority`'s signature over [`set_authority_message`] for `new` —
+/// a key to hand the token to, or `None` to renounce minting for good.
+pub async fn build_token_set_authority(
+    rpc: &RpcClient,
+    chain_id: u64,
+    asset: u32,
+    authority: &Keypair,
+    new: Option<PublicKey>,
+) -> Result<Action> {
+    let row = find_token_row(rpc, &asset.to_string()).await?;
+    if row["authority"]["kind"].as_str() != Some("key") {
+        return Err(anyhow!("token {asset} is not Key-authorised: there is no authority to hand on"));
+    }
+    let key_hex = row["authority"]["key"].as_str().context("a key-authority row without its key")?;
+    if key_hex != authority.public_key().to_hex() {
+        return Err(anyhow!("this key is not token {asset}'s mint authority"));
+    }
+    let asset_id =
+        Hash::from_hex(row["id"].as_str().context("a token row without its id")?).map_err(|e| anyhow!("token {asset}'s id: {e}"))?;
+    let nonce = row["mint_nonce"].as_u64().context("a token row without its mint_nonce")?;
+    let signature = authority.sign(set_authority_message(chain_id, &asset_id, nonce, &new).as_bytes());
+    Ok(Action::SetAuthority { asset, new, nonce, signature })
+}
+
+/// `rand token create`'s submission: one RAND fee bundle, `to = None`, exactly a bridged
+/// registration's shape ([`submit_bridge_action`]'s twin, one action over — `RegisterToken`
+/// carries no PQ quorum, so it needs none of that path's checks).
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_register_token(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    action: Action,
+    fee: u64,
+    profile: FriProfile,
+    backend: Backend,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    submit_register_token_with(rpc, w, store, action, fee, Proving::Real(profile, backend), chain_id, wait).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_register_token_with(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    action: Action,
+    fee: u64,
+    proving: Proving,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    if !matches!(action, Action::RegisterToken { .. }) {
+        return Err(anyhow!("submit_register_token carries a RegisterToken action, nothing else"));
+    }
+    submit_with(rpc, w, store, None, action, fee, Burn::None, proving, chain_id, wait).await
+}
+
+/// `rand token mint`'s submission: one RAND fee bundle, `to = None`, the mint's own Dilithium2
+/// signature already inside the action.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_token_mint(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    action: Action,
+    fee: u64,
+    profile: FriProfile,
+    backend: Backend,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    submit_token_mint_with(rpc, w, store, action, fee, Proving::Real(profile, backend), chain_id, wait).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_token_mint_with(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    action: Action,
+    fee: u64,
+    proving: Proving,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    if !matches!(action, Action::TokenMint { .. }) {
+        return Err(anyhow!("submit_token_mint carries a TokenMint action, nothing else"));
+    }
+    submit_with(rpc, w, store, None, action, fee, Burn::None, proving, chain_id, wait).await
+}
+
+/// `rand token set-authority`'s submission: one RAND fee bundle, `to = None`.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_token_set_authority(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    action: Action,
+    fee: u64,
+    profile: FriProfile,
+    backend: Backend,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    submit_token_set_authority_with(rpc, w, store, action, fee, Proving::Real(profile, backend), chain_id, wait).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_token_set_authority_with(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    action: Action,
+    fee: u64,
+    proving: Proving,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    if !matches!(action, Action::SetAuthority { .. }) {
+        return Err(anyhow!("submit_token_set_authority carries a SetAuthority action, nothing else"));
+    }
+    submit_with(rpc, w, store, None, action, fee, Burn::None, proving, chain_id, wait).await
 }
 
 /// The PQ co-signature file `rand bridge-mint --pq` and `rand bridge-rotate --pq` read (bridge
@@ -2228,6 +2567,34 @@ mod tests {
         assert_eq!(back.sk, w.sk);
         // Overwriting a key file destroys the only copy of the spend authority.
         let err = Wallet::generate().save_new(&path).unwrap_err().to_string();
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    /// A fresh authority key file is `{seed, address, public_key}` — `rand-node keygen`'s own
+    /// shape — 0600 from creation, and refuses to overwrite; [`load_authority_key`] reads back a
+    /// keypair that signs the way the one that wrote it would have.
+    #[test]
+    fn a_token_authority_key_file_roundtrips_rand_node_keygens_shape_and_refuses_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authority.key.json");
+        let kp = Keypair::generate();
+        write_authority_key(&kp, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["seed"].as_str().unwrap(), hex::encode(kp.seed()));
+        assert_eq!(v["address"].as_str().unwrap(), kp.address().to_base58());
+        assert_eq!(v["public_key"].as_str().unwrap(), kp.public_key().to_hex());
+        let back = load_authority_key(&path).unwrap();
+        assert_eq!(back.public_key(), kp.public_key());
+        let msg = b"a message only the loaded key should be able to sign for";
+        assert!(kp.public_key().verify(msg, &back.sign(msg)));
+
+        let err = write_authority_key(&Keypair::generate(), &path).unwrap_err().to_string();
         assert!(err.contains("refusing to overwrite"), "{err}");
         #[cfg(unix)]
         {
@@ -2711,6 +3078,10 @@ mod tests {
         sent: Vec<Transaction>,
         bridge: serde_json::Value,
         assets: serde_json::Value,
+        /// `rand_getTokens`' whole reply, `{"enabled":.., "registration_fee":.., "next_index":..,
+        /// "tokens":[..]}` — a token test sets it directly, since the registry itself lives on
+        /// the real node this fake stands in for, not on this struct.
+        tokens: serde_json::Value,
         /// A method that answers with an error, for the failure paths.
         fail: Option<&'static str>,
     }
@@ -2741,6 +3112,7 @@ mod tests {
                 sent: Vec::new(),
                 bridge: serde_json::json!({ "enabled": false }),
                 assets: serde_json::json!([]),
+                tokens: serde_json::json!({ "enabled": false, "tokens": [] }),
                 fail: None,
             }
         }
@@ -2815,6 +3187,7 @@ mod tests {
                 }
                 "rand_getBridgeState" => self.bridge.clone(),
                 "rand_getAssets" => self.assets.clone(),
+                "rand_getTokens" => self.tokens.clone(),
                 _ => return Reply::Err(-32601, "unknown method"),
             })
         }
@@ -3241,6 +3614,152 @@ mod tests {
         assert!(slots_for(&me, &tx).iter().all(opens_to_nobody));
     }
 
+    /// `rand token create`'s two authority branches build a `RegisterToken` that rides one RAND
+    /// fee bundle, `to = None`, nothing burned — exactly a bridged registration's shape — reading
+    /// `next_index` and `registration_fee` off `rand_getTokens` first: fixed supply
+    /// (`authority = None`) with its required initial mint, and a `Key`-authorised token
+    /// registering empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_token_fixed_supply_and_key_authority_ride_a_rand_fee_bundle() {
+        let me = Wallet::from_spend_key(SpendKey([61; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.tokens = serde_json::json!({ "enabled": true, "registration_fee": 1_000, "next_index": 1, "tokens": [] });
+            c.fund(&me, 3 * gas::BUNDLE_BASE, 0);
+            c.fund(&me, 3 * gas::BUNDLE_BASE, 0);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+
+        // ---- fixed supply: authority None, the whole initial mint required ----
+        let plan = build_register_token(&rpc, &me, "Fixed", "FIX", 6, MintAuthority::None, Some((1_000, me.address.clone())), [1; 32])
+            .await
+            .unwrap();
+        assert_eq!((plan.index, plan.registration_fee), (1, 1_000));
+        let fee = gas::fee_floor(&plan.action) + plan.registration_fee;
+        let id1 = match &plan.action {
+            Action::RegisterToken { name, symbol, decimals, authority, initial, salt, .. } => {
+                randprotocol_core::ledger::tokens::native_asset_id(name, symbol, *decimals, authority, initial, salt)
+            }
+            _ => unreachable!(),
+        };
+        submit_register_token_with(&rpc, &me, &mut store, plan.action, fee, Proving::Emulated, 7, false).await.unwrap();
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        let b = tx.bundle.as_ref().unwrap();
+        assert_eq!((b.fee, b.burn_a, b.burn_r, b.burn_asset), (fee, 0, 0, 0));
+        match tx.action {
+            Action::RegisterToken { authority: MintAuthority::None, index: 1, initial: Some(m), .. } => {
+                assert_eq!((m.amount, m.recipient), (1_000, me.address.clone()));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // ---- Key authority, registering empty: a second next_index, a different id ----
+        chain.lock().unwrap().tokens["next_index"] = serde_json::json!(2);
+        let authority_kp = Keypair::generate();
+        let plan = build_register_token(&rpc, &me, "Keyed", "KEY", 6, MintAuthority::Key(authority_kp.public_key().clone()), None, [2; 32])
+            .await
+            .unwrap();
+        assert_eq!(plan.index, 2);
+        let fee = gas::fee_floor(&plan.action) + plan.registration_fee;
+        let id2 = match &plan.action {
+            Action::RegisterToken { name, symbol, decimals, authority, initial, salt, .. } => {
+                randprotocol_core::ledger::tokens::native_asset_id(name, symbol, *decimals, authority, initial, salt)
+            }
+            _ => unreachable!(),
+        };
+        assert_ne!(id1, id2, "two different registrations are two different assets");
+        submit_register_token_with(&rpc, &me, &mut store, plan.action, fee, Proving::Emulated, 7, false).await.unwrap();
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        assert!(matches!(tx.action, Action::RegisterToken { authority: MintAuthority::Key(_), index: 2, initial: None, .. }));
+
+        // A submission of anything but a `RegisterToken` is refused outright.
+        let e = submit_register_token_with(&rpc, &me, &mut store, Action::None, fee, Proving::Emulated, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("RegisterToken"), "{e}");
+    }
+
+    /// `rand token mint` and `rand token set-authority` both start from the token's own
+    /// `rand_getTokens` row (never `rand_getToken`): refused up front, before any note is built
+    /// or any RAND is touched, for a token that is not `Key`-authorised or for a key that is not
+    /// its authority — then, against the right key, each rides one RAND fee bundle carrying the
+    /// authority's own Dilithium2 signature.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn token_mint_and_set_authority_refuse_the_wrong_key_and_a_non_key_token_first() {
+        let me = Wallet::from_spend_key(SpendKey([62; 8]));
+        let authority_kp = Keypair::generate();
+        let id = Hash([9; 32]);
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.tokens = serde_json::json!({
+                "enabled": true, "registration_fee": 0, "next_index": 3,
+                "tokens": [
+                    { "index": 1, "id": hex::encode([1u8; 32]), "authority": { "kind": "none" }, "mint_nonce": 0 },
+                    { "index": 2, "id": id.to_hex(), "authority": { "kind": "key", "key": authority_kp.public_key().to_hex() }, "mint_nonce": 0 },
+                ],
+            });
+            // Two separate notes: a `wait: false` submission only marks its input pending (it
+            // does not scan for the change), so the mint and the rotation below each need their
+            // own spendable note rather than sharing one via unseen change.
+            c.fund(&me, 3 * gas::BUNDLE_BASE, 0);
+            c.fund(&me, 3 * gas::BUNDLE_BASE, 0);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+
+        // A non-`Key` token refuses a mint and a rotation alike, before any network read past the
+        // registry itself.
+        let e = build_token_mint(&rpc, &me, 7, 1, &me.address, 500, &authority_kp).await.unwrap_err().to_string();
+        assert!(e.contains("not Key-authorised"), "{e}");
+        let e = build_token_set_authority(&rpc, 7, 1, &authority_kp, None).await.unwrap_err().to_string();
+        assert!(e.contains("not Key-authorised"), "{e}");
+
+        // A stranger's key is refused too, against the `Key` token.
+        let stranger = Keypair::generate();
+        let e = build_token_mint(&rpc, &me, 7, 2, &me.address, 500, &stranger).await.unwrap_err().to_string();
+        assert!(e.contains("not token 2's mint authority"), "{e}");
+
+        // Zero moves nothing either way, refused before the registry is even read.
+        let e = build_token_mint(&rpc, &me, 7, 2, &me.address, 0, &authority_kp).await.unwrap_err().to_string();
+        assert!(e.contains("zero"), "{e}");
+
+        // The right key mints: `TokenMint` at `mint_nonce` 0, signed, riding a fee bundle.
+        let action = build_token_mint(&rpc, &me, 7, 2, &me.address, 500, &authority_kp).await.unwrap();
+        assert!(matches!(&action, Action::TokenMint { asset: 2, amount: 500, nonce: 0, .. }));
+        submit_token_mint_with(&rpc, &me, &mut store, action, gas::BUNDLE_BASE, Proving::Emulated, 7, false).await.unwrap();
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        assert!(matches!(tx.action, Action::TokenMint { asset: 2, amount: 500, nonce: 0, .. }));
+
+        // And hands the token on: `SetAuthority` at the same nonce it reads, signed by the
+        // current key over the new one.
+        let successor = Keypair::generate();
+        let action = build_token_set_authority(&rpc, 7, 2, &authority_kp, Some(successor.public_key().clone())).await.unwrap();
+        assert!(matches!(&action, Action::SetAuthority { asset: 2, new: Some(pk), nonce: 0, .. } if pk == successor.public_key()));
+        submit_token_set_authority_with(&rpc, &me, &mut store, action, gas::BUNDLE_BASE, Proving::Emulated, 7, false).await.unwrap();
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        assert!(matches!(tx.action, Action::SetAuthority { asset: 2, new: Some(_), .. }));
+
+        // A submission of anything but the right variant is refused outright.
+        let e = submit_token_mint_with(&rpc, &me, &mut store, Action::None, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("TokenMint"), "{e}");
+        let e = submit_token_set_authority_with(&rpc, &me, &mut store, Action::None, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("SetAuthority"), "{e}");
+    }
+
     /// Every bridge command's action — a deposit's and a rotation's `BridgeAttest`, a
     /// `RegisterBridgedToken`, a `ListBacking` — rides one fee bundle built by the shared path: the
     /// fee in RAND from slots 2–3, slots 0–1 dummies, nothing burned, the proof bound to the whole
@@ -3413,6 +3932,37 @@ mod tests {
         let older = RpcClient::new(crate::test_rpc::scripted_rpc(vec![]).await);
         let e = resolve_asset(&older, "rpl1fifth").await.unwrap_err().to_string();
         assert!(e.contains("registry index instead"), "{e}");
+    }
+
+    /// `find_token_row` — `rand token info`'s reader, and `token mint`/`set-authority`'s way to
+    /// the row's `mint_nonce` and authority — matches by index, hex id or `rpl1…`, exactly as
+    /// `resolve_asset` does, and only ever calls `rand_getTokens`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn find_token_row_matches_index_hex_or_rpl1_over_the_whole_listing() {
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = asked.clone();
+        let rows = serde_json::json!({
+            "enabled": true,
+            "tokens": [
+                { "index": 1, "id": "aa".repeat(32), "id_text": "rpl1first", "authority": { "kind": "key", "key": "k1" }, "mint_nonce": 3 },
+                { "index": 5, "id": "bb".repeat(32), "id_text": "rpl1fifth", "authority": { "kind": "none" }, "mint_nonce": 0 },
+            ],
+        });
+        let rpc = RpcClient::new(
+            rpc_fn(move |m, _p| {
+                log.lock().unwrap().push(m.to_string());
+                match m {
+                    "rand_getTokens" => Reply::Ok(rows.clone()),
+                    _ => Reply::Err(-32601, "unknown method"),
+                }
+            })
+            .await,
+        );
+        assert_eq!(find_token_row(&rpc, "1").await.unwrap()["mint_nonce"], 3);
+        assert_eq!(find_token_row(&rpc, "rpl1fifth").await.unwrap()["index"], 5);
+        assert_eq!(find_token_row(&rpc, &format!("0x{}", "AA".repeat(32))).await.unwrap()["index"], 1);
+        assert!(find_token_row(&rpc, "9").await.unwrap_err().to_string().contains("no token 9"));
+        assert!(asked.lock().unwrap().iter().all(|m| m == "rand_getTokens"), "never a per-token lookup");
     }
 
     /// Every dummy is fresh: two bundles built from the same plan share no nullifier and no

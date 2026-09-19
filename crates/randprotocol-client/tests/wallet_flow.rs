@@ -389,17 +389,16 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
     handle.shutdown().await;
 }
 
-/// An RPL token on the hidden-asset bundle, end to end: A registers a fixed-supply token whose
-/// initial mint to A is published with a **garbage** envelope — A finds the note anyway, from the
-/// registration's public fields — then sends part of it to B in a plain bundle that names no
-/// asset and pays its fee in RAND, and burns part of the rest (`TokenBurn`, `burn_a`). B, holding
-/// the token but no RAND, is refused before proving when it tries to pay it on.
+/// The RPL token standard's own commands, end to end (T8b): `token create` (`Key` authority, no
+/// initial mint) registers A's authority, `token mint` mints A's supply against it, `send
+/// --asset rpl1…` (the id resolved through the whole `rand_getTokens` listing, never a per-token
+/// lookup) pays part of it to B in a plain bundle, `token burn` destroys part of the rest, and
+/// `token info` reads the row back with the supply and nonce both moved. B, holding the token but
+/// no RAND, is refused before proving when it tries to pay it on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_token_is_registered_found_sent_privately_and_burned() {
+async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
     use randprotocol_core::genesis::{TokensConfig, MIN_REGISTRATION_FEE};
     use randprotocol_core::ledger::tokens::MintAuthority;
-    use randprotocol_core::notes::Envelope;
-    use randprotocol_core::types::actions::InitialMint;
 
     init_tracing();
     let started = Instant::now();
@@ -415,36 +414,60 @@ async fn a_token_is_registered_found_sent_privately_and_burned() {
     let hash = rpc.mint_shielded(&a.address.to_string(), Some(mint)).await.expect("mint accepted");
     rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
 
-    // ---- register: index 1, 1 000 000 units to A, the initial note's envelope garbage ----
-    let supply = 1_000_000u64;
-    let time = u32::try_from(rpc.head().await.unwrap()["height"].as_u64().unwrap()).unwrap();
-    let garbage = Envelope { kem_ct: vec![0xff; 8], to_receiver: vec![0xff; 16], to_sender: vec![], body: vec![0xff; 16] };
-    let initial = InitialMint { amount: supply, recipient: a.address.clone(), r: SpendKey::random().0, time, envelope: garbage };
-    let action = Action::RegisterToken {
-        name: "Wallet Flow Dollar".into(),
-        symbol: "WFD".into(),
-        decimals: 6,
-        authority: MintAuthority::None,
-        initial: Some(initial),
-        salt: [7; 32],
-        index: 1,
-    };
-    let fee = gas::BUNDLE_BASE + MIN_REGISTRATION_FEE;
+    // ---- `token create`: a `Key`-authorised token, registering empty ----
+    let authority = Keypair::generate();
+    let plan = wallet::build_register_token(
+        &rpc,
+        &a,
+        "Wallet Flow Dollar",
+        "WFD",
+        6,
+        MintAuthority::Key(authority.public_key().clone()),
+        None,
+        [7; 32],
+    )
+    .await
+    .expect("build_register_token reads next_index and registration_fee");
+    assert_eq!((plan.index, plan.registration_fee), (1, MIN_REGISTRATION_FEE));
+    let register_fee = gas::fee_floor(&plan.action) + plan.registration_fee;
     let slot = proving_slot().await;
-    let registered = wallet::submit(&rpc, &a, &mut a_store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
-        .await
-        .expect("the registration's bundle commits");
+    let registered =
+        wallet::submit_register_token(&rpc, &a, &mut a_store, plan.action, register_fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+            .await
+            .expect("the registration's bundle commits");
     drop(slot);
     eprintln!("register bundle: tier {}, proved in {:.1?}", registered.tier, registered.proving);
-    assert_eq!(a_store.balance_of(1), supply, "the initial mint is found from the public fields, garbage envelope and all");
-    assert_eq!(a_store.balance(), mint - fee);
+    assert_eq!(a_store.balance_of(1), 0, "registering empty mints nothing yet");
+    assert_eq!(a_store.balance(), mint - register_fee);
 
-    // ---- send 400 000 of token 1 to B: a plain bundle, the fee in RAND ----
+    // ---- `token mint`: A mints its own supply against the authority key ----
+    let supply = 1_000_000u64;
+    let mint_action = wallet::build_token_mint(&rpc, &a, CHAIN_ID, 1, &a.address, supply, &authority)
+        .await
+        .expect("the authority mints against its own token");
+    assert!(matches!(&mint_action, Action::TokenMint { asset: 1, amount: 1_000_000, nonce: 0, .. }));
+    let slot = proving_slot().await;
+    let minted = wallet::submit_token_mint(&rpc, &a, &mut a_store, mint_action, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the mint's bundle commits");
+    drop(slot);
+    eprintln!("mint bundle: tier {}, proved in {:.1?}", minted.tier, minted.proving);
+    assert_eq!(a_store.balance_of(1), supply, "the sealed mint note is found by the ordinary scan");
+    let after_register_and_mint = mint - register_fee - gas::BUNDLE_BASE;
+    assert_eq!(a_store.balance(), after_register_and_mint);
+
+    // ---- `send --asset rpl1…`: the id resolved through the whole listing, never a lookup ----
+    let row = wallet::find_token_row(&rpc, "1").await.unwrap();
+    let id_text = row["id_text"].as_str().unwrap().to_string();
+    assert!(id_text.starts_with("rpl1"));
+    let resolved = wallet::resolve_asset(&rpc, &id_text).await.expect("resolved from the whole rand_getTokens listing");
+    assert_eq!(resolved, 1);
     let pay = 400_000u64;
     let slot = proving_slot().await;
-    let sent = wallet::send_asset(&rpc, &a, &mut a_store, &b.address, 1, pay, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
-        .await
-        .expect("the token transfer commits");
+    let sent =
+        wallet::send_asset(&rpc, &a, &mut a_store, &b.address, resolved, pay, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+            .await
+            .expect("the token transfer commits");
     drop(slot);
     eprintln!("token bundle: tier {}, proved in {:.1?}, {} proof bytes", sent.tier, sent.proving, sent.proof_bytes);
     assert_eq!((sent.amount, sent.change, sent.asset), (pay, supply - pay, 1));
@@ -457,7 +480,7 @@ async fn a_token_is_registered_found_sent_privately_and_burned() {
     assert_eq!(b_store.balance_of(1), pay, "B holds the token");
     assert_eq!(b_store.balance(), 0, "and no RAND");
     assert_eq!(a_store.balance_of(1), supply - pay);
-    assert_eq!(a_store.balance(), mint - fee - gas::BUNDLE_BASE);
+    assert_eq!(a_store.balance(), after_register_and_mint - gas::BUNDLE_BASE);
 
     // ---- B cannot pay it on without RAND for the fee: refused before any proof ----
     let e = wallet::send_asset(&rpc, &b, &mut b_store, &a.address, 1, 1, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
@@ -466,7 +489,7 @@ async fn a_token_is_registered_found_sent_privately_and_burned() {
         .to_string();
     assert!(e.contains("fee in RAND"), "{e}");
 
-    // ---- A burns 100 000: the token's supply drops by exactly that ----
+    // ---- `token burn`: A burns 100 000, the token's supply drops by exactly that ----
     let burn = 100_000u64;
     let slot = proving_slot().await;
     let burned =
@@ -480,6 +503,13 @@ async fn a_token_is_registered_found_sent_privately_and_burned() {
     let bundle = shown.bundle.as_ref().expect("a bundle");
     assert_eq!((bundle.burn_a, bundle.burn_r, bundle.burn_asset), (burn, 0, 1));
     assert_eq!(a_store.balance_of(1), supply - pay - burn);
+
+    // ---- `token info`: the row reads back the moved supply and the spent mint nonce ----
+    let row = wallet::find_token_row(&rpc, &id_text).await.unwrap();
+    assert_eq!(row["total_supply"], (supply - burn).to_string());
+    assert_eq!(row["mint_nonce"], 1, "one TokenMint spent the authority's nonce once");
+    assert_eq!(row["authority"]["kind"], "key");
+    assert_eq!(row["authority"]["key"], authority.public_key().to_hex());
 
     eprintln!("token flow in {:.1?}", started.elapsed());
     handle.shutdown().await;

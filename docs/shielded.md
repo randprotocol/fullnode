@@ -148,6 +148,10 @@ the pool back together.
 | `rand bridge-rotate <ROTATION> --pq <QUORUM>` | submit a guardian-set rotation with the PQ quorum; one RAND fee bundle |
 | `rand bridge-pause --sig <SIG>` / `rand bridge-unpause --pq <QUORUM>` | pause or lift bridge minting; bundle-less, fee-less, no key file |
 | `rand token register-bridged … --pq <QUORUM>` / `rand token list-backing … --pq <QUORUM>` | list a bridged token or a new backing after genesis; one RAND fee bundle |
+| `rand token create --name … --symbol … --decimals … (--fixed-supply <N> --to <ADDR> \| --authority-key-out <FILE> [--initial <N> --to <ADDR>])` | register a token (RPL spec §4) at the next index — fixed supply or `Key`-authorised (a fresh Dilithium2 key file, `rand-node keygen`'s shape); one RAND fee bundle |
+| `rand token mint --asset <A> --to <ADDR> --amount <N> --authority-key <FILE>` | mint more of a `Key`-authorised token, signed by its authority; one RAND fee bundle |
+| `rand token set-authority --asset <A> --authority-key <FILE> (--new-key <FILE> \| --renounce)` | hand a `Key`-authorised token to another key, or renounce minting for good |
+| `rand token info <A>` / `rand token list` | a token's public row, or every token's, from the whole `rand_getTokens` listing |
 | `rand bridge-burn <ASSET> <AMOUNT> <CHAIN> <TOKEN> <TO>` | burn a bridged asset outbound; one bundle burns the asset and pays the RAND fee |
 | `rand bridge` / `rand bridge-message <SEQ>` | the bridge's public state; one outbound message |
 | `rand fee bundle\|deploy <words>\|call <tier>` | the schedule's floor |

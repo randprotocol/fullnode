@@ -16,9 +16,10 @@ use randprotocol_client::wallet::{self, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
 use randprotocol_client::wallet::{Burn, Submission};
 use randprotocol_core::ledger::staking::MIN_STAKE;
+use randprotocol_core::ledger::tokens::{native_asset_id, MintAuthority};
 use randprotocol_core::notes::ShieldedAddress;
 use randprotocol_core::types::actions::Registration;
-use randprotocol_core::{format_amount, gas, parse_amount, Action, Address, Hash};
+use randprotocol_core::{format_amount, gas, parse_amount, Action, Address, Hash, Keypair};
 use randprotocol_zkvm::machine::{Backend, FriProfile, Tier, TIERS};
 use randprotocol_zkvm::{call_envelope, codec, emulator, executor, guests, hash, isa::Program};
 use std::path::{Path, PathBuf};
@@ -399,6 +400,110 @@ enum TokenCmd {
         #[arg(long)]
         cuda: bool,
     },
+    /// Create an RPL token at the registry's next index: fixed supply (`--fixed-supply`, minted
+    /// once, at registration) or `Key`-authorised (`--authority-key-out`, mintable again with
+    /// `rand token mint`), with or without an initial mint.
+    Create {
+        /// Display name, 1 to 32 bytes.
+        #[arg(long)]
+        name: String,
+        /// Ticker, 1 to 12 ASCII graphic characters.
+        #[arg(long)]
+        symbol: String,
+        /// Smallest-unit decimals, 0 to 9.
+        #[arg(long)]
+        decimals: u8,
+        /// The 32-byte salt the asset id is over, hex. Random if not given.
+        #[arg(long)]
+        salt: Option<String>,
+        /// Fixed supply: mint exactly this many units at registration, forever — `authority` is
+        /// `none`. Needs `--to`; mutually exclusive with `--authority-key-out`.
+        #[arg(long)]
+        fixed_supply: Option<u64>,
+        /// A fresh Dilithium2 key file is written here (0600, refusing to overwrite) and becomes
+        /// the token's mint authority. Mutually exclusive with `--fixed-supply`.
+        #[arg(long)]
+        authority_key_out: Option<PathBuf>,
+        /// With `--authority-key-out`: mint this many units at registration too. Needs `--to`.
+        #[arg(long)]
+        initial: Option<u64>,
+        /// The initial mint's recipient. Required with `--fixed-supply` or `--initial`.
+        #[arg(long)]
+        to: Option<String>,
+        /// Fee in RAND; default the bundle base plus the registry's registration fee.
+        #[arg(long)]
+        fee: Option<String>,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+        /// Prove the paying bundle on an attached NVIDIA GPU.
+        #[arg(long)]
+        cuda: bool,
+    },
+    /// Mint more of a `Key`-authorised token, signed by its authority key.
+    Mint {
+        /// The token: its registry index, or its id (`rpl1…` or 64 hex).
+        #[arg(long)]
+        asset: String,
+        /// The recipient's shielded address.
+        #[arg(long)]
+        to: String,
+        /// Amount in the token's own smallest unit.
+        #[arg(long)]
+        amount: u64,
+        /// The token's mint authority: a Dilithium2 key file (`rand-node keygen`'s shape, or
+        /// `rand token create --authority-key-out`'s).
+        #[arg(long)]
+        authority_key: PathBuf,
+        /// Fee in RAND; the floor is 0.001.
+        #[arg(long)]
+        fee: Option<String>,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+        /// Prove the paying bundle on an attached NVIDIA GPU.
+        #[arg(long)]
+        cuda: bool,
+    },
+    /// Hand a `Key`-authorised token to another key, or renounce minting for good.
+    SetAuthority {
+        /// The token: its registry index, or its id (`rpl1…` or 64 hex).
+        #[arg(long)]
+        asset: String,
+        /// The token's current mint authority: a Dilithium2 key file.
+        #[arg(long)]
+        authority_key: PathBuf,
+        /// Hand the token to this key file's public key. Mutually exclusive with `--renounce`.
+        #[arg(long)]
+        new_key: Option<PathBuf>,
+        /// Retire minting for good: no key can ever mint this token again. Mutually exclusive
+        /// with `--new-key`.
+        #[arg(long)]
+        renounce: bool,
+        /// Fee in RAND; the floor is 0.001.
+        #[arg(long)]
+        fee: Option<String>,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+        /// Prove the paying bundle on an attached NVIDIA GPU.
+        #[arg(long)]
+        cuda: bool,
+    },
+    /// One token's public row: name, symbol, decimals, authority, supply, registration height,
+    /// id (hex and `rpl1…`) and, if bridged, each backing (chain, token, decimals, locked,
+    /// minted_today).
+    Info {
+        /// The token: its registry index, or its id (`rpl1…` or 64 hex).
+        token: String,
+    },
+    /// Every registered token, paged.
+    List {
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        #[arg(long, default_value_t = 1000)]
+        limit: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -521,6 +626,24 @@ fn report(s: &Submission, what: &str) {
 fn parse_registration(text: &str) -> Result<Registration> {
     let bytes = hex::decode(text.strip_prefix("0x").unwrap_or(text)).context("--registration must be hex")?;
     Registration::decode(&bytes).context("--registration is not a registration from `rand-node register`")
+}
+
+/// 32 fresh random bytes, for `rand token create --salt` when none is given. Reuses
+/// `randprotocol_zkvm`'s own random source (`TxKey::random`, already a dependency here for
+/// sealing envelopes) rather than adding a direct `rand` crate dependency to this binary.
+fn random_salt() -> [u8; 32] {
+    randprotocol_zkvm::viewing::TxKey::random().0
+}
+
+/// `TokenError::IndexMismatch`'s wire text (`"token: wrong token index: expected {expected}, got
+/// {got}"`, `ledger::tokens::TokenError`'s `Display`, wrapped once by `TxError::Token`) —
+/// `rand token create`'s only refusal that a fresh chain read cannot prevent, because it is a
+/// race: another registration can commit between this wallet's read of `next_index` and its own
+/// submission. `None` for any other message, which is reported as it always is.
+fn parse_index_mismatch(message: &str) -> Option<(u32, u32)> {
+    let rest = message.strip_prefix("token: wrong token index: expected ")?;
+    let (expected, rest) = rest.split_once(", got ")?;
+    Some((expected.parse().ok()?, rest.trim().parse().ok()?))
 }
 
 /// A validator's bonded stake as the register reports it, or `None` when it holds no entry for
@@ -1278,6 +1401,149 @@ async fn main() -> Result<()> {
             report(&s, "backing listing");
             println!("listed chain {chain} token {} under asset {asset}, at list_nonce {}", hex::encode(token), state.list_nonce);
         }
+        Cmd::Token(TokenCmd::Create { name, symbol, decimals, salt, fixed_supply, authority_key_out, initial, to, fee, no_wait, cuda }) => {
+            // Every cheap refusal — the flag combination — before any key file, network read or
+            // proof.
+            if fixed_supply.is_some() == authority_key_out.is_some() {
+                anyhow::bail!("pass exactly one of --fixed-supply or --authority-key-out");
+            }
+            let (authority_keypair, initial_amount) = if let Some(supply) = fixed_supply {
+                if initial.is_some() {
+                    anyhow::bail!("--fixed-supply is the whole initial supply; do not also pass --initial");
+                }
+                if supply == 0 {
+                    anyhow::bail!("a fixed supply of zero mints nothing");
+                }
+                if to.is_none() {
+                    anyhow::bail!("--fixed-supply needs --to (the initial mint's recipient)");
+                }
+                (None, Some(supply))
+            } else {
+                if initial.is_some() != to.is_some() {
+                    anyhow::bail!("--initial and --to must be given together");
+                }
+                if initial == Some(0) {
+                    anyhow::bail!("an initial mint of zero mints nothing");
+                }
+                (Some(Keypair::generate()), initial)
+            };
+            let recipient = to.as_deref().map(parse_address).transpose()?;
+            let salt = match salt {
+                Some(s) => randprotocol_client::hex32(&s).context("--salt must be 32 bytes of hex")?,
+                None => random_salt(),
+            };
+            let authority = match &authority_keypair {
+                Some(kp) => MintAuthority::Key(kp.public_key().clone()),
+                None => MintAuthority::None,
+            };
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            let plan = wallet::build_register_token(
+                &rpc,
+                &w,
+                &name,
+                &symbol,
+                decimals,
+                authority.clone(),
+                initial_amount.map(|amount| (amount, recipient.clone().expect("checked above"))),
+                salt,
+            )
+            .await?;
+            let id = match &plan.action {
+                Action::RegisterToken { name, symbol, decimals, authority, initial, salt, .. } => {
+                    native_asset_id(name, symbol, *decimals, authority, initial, salt)
+                }
+                _ => unreachable!("build_register_token always returns a RegisterToken action"),
+            };
+            // The key file is written only now, right before proving: every refusal above and
+            // `build_register_token`'s own reads (the registry gate, a zero initial mint) have
+            // already run, so a rejected combination never strands a key file on disk.
+            if let (Some(out), Some(kp)) = (&authority_key_out, &authority_keypair) {
+                wallet::write_authority_key(kp, out)?;
+                println!("wrote authority key {}", out.display());
+            }
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => gas::fee_floor(&plan.action).saturating_add(plan.registration_fee),
+            };
+            let chain_id = rpc.chain_id().await?;
+            let profile = profile_of(&rpc).await?;
+            let index = plan.index;
+            let s = wallet::submit_register_token(&rpc, &w, &mut store, plan.action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+                .await;
+            store.save(&path)?;
+            let s = match s {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(rpc_err) = e.downcast_ref::<randprotocol_client::RpcError>() {
+                        if let Some((expected, got)) = parse_index_mismatch(&rpc_err.message) {
+                            eprintln!("another token took index {got} first — re-run to register at {expected}");
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+            report(&s, "token registration");
+            println!("index {index}, id {} ({})", id.to_hex(), randprotocol_core::token_id::encode(&id));
+            if !no_wait {
+                let committed = rpc.call("rand_getTransaction", serde_json::json!([s.hash.to_hex()])).await?;
+                println!("committed at height {}", committed["height"]);
+            }
+        }
+        Cmd::Token(TokenCmd::Mint { asset, to, amount, authority_key, fee, no_wait, cuda }) => {
+            let asset = wallet::resolve_asset(&rpc, &asset).await?;
+            let recipient = parse_address(&to)?;
+            let authority = wallet::load_authority_key(&authority_key)?;
+            let chain_id = rpc.chain_id().await?;
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            // Refused up front (not the token's authority, or not Key-authorised at all) inside
+            // `build_token_mint`, before any RAND is touched.
+            let action = wallet::build_token_mint(&rpc, &w, chain_id, asset, &recipient, amount, &authority).await?;
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => gas::fee_floor(&action),
+            };
+            let profile = profile_of(&rpc).await?;
+            let s = wallet::submit_token_mint(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait).await;
+            store.save(&path)?;
+            report(&s?, "token mint");
+            println!("minted {amount} of asset {asset} to {to}");
+        }
+        Cmd::Token(TokenCmd::SetAuthority { asset, authority_key, new_key, renounce, fee, no_wait, cuda }) => {
+            if renounce == new_key.is_some() {
+                anyhow::bail!("pass exactly one of --new-key or --renounce");
+            }
+            let asset = wallet::resolve_asset(&rpc, &asset).await?;
+            let authority = wallet::load_authority_key(&authority_key)?;
+            let new = match &new_key {
+                Some(path) => Some(wallet::load_authority_key(path)?.public_key().clone()),
+                None => None,
+            };
+            let chain_id = rpc.chain_id().await?;
+            let action = wallet::build_token_set_authority(&rpc, chain_id, asset, &authority, new.clone()).await?;
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => gas::fee_floor(&action),
+            };
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            let profile = profile_of(&rpc).await?;
+            let s =
+                wallet::submit_token_set_authority(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+                    .await;
+            store.save(&path)?;
+            report(&s?, "set token authority");
+            match new {
+                Some(pk) => println!("asset {asset}'s mint authority is now {}", pk.to_hex()),
+                None => println!("asset {asset}'s mint authority is renounced for good"),
+            }
+        }
+        Cmd::Token(TokenCmd::Info { token }) => {
+            let row = wallet::find_token_row(&rpc, &token).await?;
+            println!("{}", pretty(&row));
+        }
+        Cmd::Token(TokenCmd::List { from, limit }) => {
+            let reply = rpc.call("rand_getTokens", serde_json::json!([from, limit])).await?;
+            println!("{}", pretty(&reply));
+        }
         Cmd::BridgePause { sig, no_wait } => {
             // No key file: a pause must work from a machine holding no spend key and no RAND.
             let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?;
@@ -1393,6 +1659,66 @@ mod tests {
         assert_eq!((asset, chain, decimals), (1, 3, 18));
         assert!(matches!(parse(&["bridge-pause", "--sig", "@pause.sig"]), Ok(Cmd::BridgePause { .. })));
         assert!(matches!(parse(&["bridge-unpause", "--pq", "@unpause.json", "--no-wait"]), Ok(Cmd::BridgeUnpause { no_wait: true, .. })));
+    }
+
+    /// The five `rand token` commands (T8b): `create` (both authority branches), `mint`,
+    /// `set-authority` (both of `--new-key`/`--renounce`), `info` and `list`.
+    #[test]
+    fn the_token_standard_commands_parse_with_their_documented_flags() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("rand").chain(args.iter().copied())).map(|c| c.cmd);
+        let to = "rand1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+
+        let Ok(Cmd::Token(TokenCmd::Create { name, symbol, decimals, fixed_supply, to: to_arg, .. })) =
+            parse(&["token", "create", "--name", "Fixed Coin", "--symbol", "FIX", "--decimals", "6", "--fixed-supply", "1000000", "--to", to])
+        else {
+            panic!("create --fixed-supply parses")
+        };
+        assert_eq!((name.as_str(), symbol.as_str(), decimals, fixed_supply, to_arg.as_deref()), ("Fixed Coin", "FIX", 6, Some(1_000_000), Some(to)));
+
+        let Ok(Cmd::Token(TokenCmd::Create { authority_key_out, initial, .. })) = parse(&[
+            "token", "create", "--name", "Keyed Coin", "--symbol", "KEY", "--decimals", "8",
+            "--authority-key-out", "authority.key.json", "--initial", "500", "--to", to,
+        ]) else {
+            panic!("create --authority-key-out parses")
+        };
+        assert_eq!((authority_key_out.as_deref(), initial), (Some(Path::new("authority.key.json")), Some(500)));
+
+        let Ok(Cmd::Token(TokenCmd::Mint { asset, to: to_arg, amount, authority_key, .. })) =
+            parse(&["token", "mint", "--asset", "rpl1keyed", "--to", to, "--amount", "500", "--authority-key", "authority.key.json"])
+        else {
+            panic!("mint parses")
+        };
+        assert_eq!((asset.as_str(), to_arg.as_str(), amount, authority_key.as_path()), ("rpl1keyed", to, 500, Path::new("authority.key.json")));
+
+        let Ok(Cmd::Token(TokenCmd::SetAuthority { asset, new_key, renounce, .. })) =
+            parse(&["token", "set-authority", "--asset", "2", "--authority-key", "authority.key.json", "--new-key", "successor.key.json"])
+        else {
+            panic!("set-authority --new-key parses")
+        };
+        assert_eq!((asset.as_str(), new_key.as_deref(), renounce), ("2", Some(Path::new("successor.key.json")), false));
+        assert!(matches!(
+            parse(&["token", "set-authority", "--asset", "2", "--authority-key", "authority.key.json", "--renounce"]),
+            Ok(Cmd::Token(TokenCmd::SetAuthority { renounce: true, new_key: None, .. }))
+        ));
+
+        assert!(matches!(parse(&["token", "info", "2"]), Ok(Cmd::Token(TokenCmd::Info { token })) if token == "2"));
+        assert!(matches!(parse(&["token", "list"]), Ok(Cmd::Token(TokenCmd::List { from: 0, limit: 1000 }))));
+        assert!(matches!(
+            parse(&["token", "list", "--from", "5", "--limit", "10"]),
+            Ok(Cmd::Token(TokenCmd::List { from: 5, limit: 10 }))
+        ));
+    }
+
+    /// `parse_index_mismatch` reads `TokenError::IndexMismatch`'s exact wire text
+    /// (`TxError::Token`'s `"token: {0}"` wrapping the ledger's own `Display`) and nothing else,
+    /// so `rand token create`'s lost-race hint fires only on that one refusal.
+    #[test]
+    fn parse_index_mismatch_reads_the_ledgers_own_error_text_and_nothing_else() {
+        assert_eq!(parse_index_mismatch("token: wrong token index: expected 3, got 2"), Some((3, 2)));
+        assert_eq!(parse_index_mismatch("token: wrong token index: expected 10, got 9"), Some((10, 9)));
+        assert_eq!(parse_index_mismatch("token: registration fee 100 is below the minimum 1000000"), None);
+        assert_eq!(parse_index_mismatch("wrong mint nonce: expected 1, got 0"), None);
+        assert_eq!(parse_index_mismatch(""), None);
     }
 
     /// `open-call`'s verdict is its exit status. A transcript that is not the preimage of the
