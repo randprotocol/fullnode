@@ -857,7 +857,15 @@ mod tests {
         assert_eq!(cr, cc, "one note, whoever submits it");
         assert_eq!(relayer.bridge_digests(), copier.bridge_digests());
         l.apply_tx(&relayer, &proposer().address(), &StubExecutor).unwrap();
-        assert!(l.validate(&copier, &StubExecutor).is_err(), "the second is refused once the first lands");
+        // Pinned, not just `is_err` (F1 review Minor 5): the digest check precedes the
+        // commitment check, so the copier dies on the spent attestation digest. A future reorder
+        // that refused it for the *wrong* reason — `CommitmentExists`, say — would still be an
+        // `Err` and would silently change what this test is about.
+        assert_eq!(
+            l.validate(&copier, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Replay)),
+            "the second is refused once the first lands, on the digest"
+        );
 
         // The residual: another `time` in the window is another note of the same recipient.
         let (l, secrets) = ledger();

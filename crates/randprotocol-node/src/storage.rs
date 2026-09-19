@@ -707,9 +707,22 @@ impl Storage {
         self.get(CF_VALIDATORS, a.as_bytes())
     }
 
-    /// The whole register, in address order. Small by construction (`MAX_VALIDATORS` rows plus
-    /// whatever has fallen below the minimum), so RPC reads it directly rather than through a
-    /// ledger reload.
+    /// The whole register, in address order.
+    ///
+    /// **Read on every commit**, not just by the RPC: F1b's write-by-difference (`Storage::commit`)
+    /// compares the ledger's entries against these stored rows and writes only the ones that
+    /// moved, so this is an O(register) read and bincode decode on the consensus loop per block.
+    /// At 18 validators that is noise, and the unbounded-growth argument F1b was written for
+    /// applies to the read as well as to the write — if it ever matters, compare raw stored bytes
+    /// against `bincode::serialize(entry)` through a raw iterator, or diff against the pre-block
+    /// in-memory ledger. (The earlier claim that this is "small by construction —
+    /// `MAX_VALIDATORS` rows plus whatever has fallen below the minimum" was wrong twice over:
+    /// nothing bounds how many entries fall below the minimum, and `commit` now depends on this
+    /// function every block. F1 review Minor 2.)
+    ///
+    /// The commit diff has **no delete pass** because nothing in `randprotocol-core` ever removes
+    /// a register entry (no `validators.remove`/`retain` exists). If a removal is ever added,
+    /// `commit` must gain one, or a deleted validator would stay on disk for ever.
     pub fn register(&self) -> Result<BTreeMap<Address, ValidatorEntry>> {
         let mut out = BTreeMap::new();
         for item in self.db.iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::Start) {
@@ -3060,7 +3073,13 @@ mod tests {
         let tx = bundle_tx(&ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], randprotocol_core::gas::BUNDLE_BASE);
         let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
-        assert_eq!(written() - before, 1, "one row moved, one row written");
+        // `checked_sub`: `rocksdb.num-entries-active-mem-table` is reset by a memtable flush, so
+        // an unsigned subtraction on it can underflow (a debug-build panic). Unlikely in a
+        // three-row test, but it is a property the engine may reset under us (F1 review Minor 4).
+        let moved = |after: u64, before: u64| {
+            after.checked_sub(before).expect("the memtable counter went backwards: it was flushed mid-test")
+        };
+        assert_eq!(moved(written(), before), 1, "one row moved, one row written");
         assert_eq!(s.register().unwrap(), *ledger.validators(), "and the register is the ledger's");
 
         // An empty block by another validator: its proposer collects nothing, so no row moves at
@@ -3068,7 +3087,7 @@ mod tests {
         let before = written();
         let b2 = make_block(&b1.block, &mut ledger, vec![], &key(2));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
-        assert_eq!(written() - before, 0, "nothing moved, nothing written");
+        assert_eq!(moved(written(), before), 0, "nothing moved, nothing written");
         assert_eq!(s.register().unwrap(), *ledger.validators());
 
         // And the diff is against what is *stored*, not against what this batch names: a row that

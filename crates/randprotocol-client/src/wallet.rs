@@ -1991,6 +1991,55 @@ pub fn deposit_index(bridge_state: &Value, assets: &[AssetRow], asset_id: &str) 
     }
 }
 
+/// `rand bridge-mint`'s pre-check, the mirror of `burn_is_possible` (node M4): the two ledger
+/// rules that can refuse an otherwise perfect attestation, read off the `rand_getBridgeState`
+/// reply the command already fetches, *before* buying ~100 s of proving to hear
+/// `Bridge(MintsPaused)` or `Token(MintCapExceeded)`.
+///
+/// - **The pause** (bridge hardening B1). Read only in the transfer arm, so a burn or a rotation
+///   is unaffected — and only a PQ guardian quorum can lift it, so this is not a wait of seconds.
+/// - **The backing's remaining daily cap.** `minted_today` on the reply is already
+///   `Backing::minted_on(head day)` — the figure `check_lock` compares against, with a counter
+///   left from an earlier day reading zero — so the headroom here is the ledger's own, at the
+///   head this wallet just read. It can still move under the transaction (another relayer's
+///   deposit, or the day rolling over, which only ever *adds* headroom), which is why this is a
+///   pre-check and the ledger stays the authority.
+///
+/// A row this chain does not list is **not** an error here: `deposit_index` is the check for
+/// that, and it says so far better than a missing cap row could.
+pub fn mint_is_possible(bridge_state: &Value, token_chain: u16, token: &[u8; 32], amount: u64) -> Result<()> {
+    if bridge_state["mint_paused"] == Value::Bool(true) {
+        return Err(anyhow!(
+            "bridge minting is paused on this chain; a PQ guardian quorum must lift the pause              (rand bridge-unpause) before any deposit can be minted"
+        ));
+    }
+    let hex_token = hex::encode(token);
+    let Some(row) = bridge_state["assets"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter().find(|r| {
+                r["chain"].as_u64() == Some(token_chain as u64) && r["token"].as_str() == Some(hex_token.as_str())
+            })
+        })
+    else {
+        // No row, no cap to check: `deposit_index` reports an unlisted token.
+        return Ok(());
+    };
+    let (Some(cap), Some(minted)) =
+        (crate::amount_field(&row["mint_cap_per_day"]), crate::amount_field(&row["minted_today"]))
+    else {
+        // A node predating the cap (B1) serves neither field. Nothing to pre-check.
+        return Ok(());
+    };
+    let left = cap.saturating_sub(minted);
+    if amount > left {
+        return Err(anyhow!(
+            "that coin's daily mint cap is {cap} and {minted} has been minted against it today,              so only {left} is left and this deposit is {amount}; it becomes mintable on the next              UTC day of the chain's block timestamp"
+        ));
+    }
+    Ok(())
+}
+
 /// What a committed `BridgeAttest` deposited under, against the index the wallet sealed for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DepositIndexCheck {
@@ -2913,6 +2962,54 @@ mod tests {
             "index": index, "chain": chain, "token": hex::encode(token),
             "asset_id": hex::encode([index as u8; 32]), "decimals": decimals, "locked": locked.to_string(),
         })
+    }
+
+    /// Node M4: `rand bridge-mint` hears the two ledger rules that can refuse a perfect
+    /// attestation — the B1 pause and the backing's remaining daily cap — before it buys ~100 s
+    /// of proving, off the `rand_getBridgeState` reply it already fetches.
+    #[test]
+    fn a_mint_checks_the_pause_and_the_daily_cap_before_proving() {
+        let token = [0xd7u8; 32];
+        let state = |paused: bool, cap: &str, minted: &str| {
+            serde_json::json!({
+                "enabled": true, "mint_paused": paused,
+                "assets": [{
+                    "index": 1, "chain": 2, "token": hex::encode(token),
+                    "asset_id": "aa", "decimals": 8,
+                    "locked": "1000", "mint_cap_per_day": cap, "minted_today": minted, "mint_day": 0,
+                }],
+            })
+        };
+        let cap = 100_000u64 * 100_000_000;
+        let open = state(false, &cap.to_string(), "0");
+        mint_is_possible(&open, 2, &token, cap).expect("exactly the day's cap");
+        let e = mint_is_possible(&open, 2, &token, cap + 1).unwrap_err().to_string();
+        assert!(e.contains("daily mint cap") && e.contains("UTC day"), "{e}");
+
+        // Part of the day already spent: the headroom is what is left, not the whole cap.
+        let partly = state(false, &cap.to_string(), "400");
+        mint_is_possible(&partly, 2, &token, cap - 400).expect("the headroom");
+        let e = mint_is_possible(&partly, 2, &token, cap - 399).unwrap_err().to_string();
+        assert!(e.contains("400 has been minted against it today"), "{e}");
+
+        // The pause is read first and is about the whole bridge, not this coin.
+        let e = mint_is_possible(&state(true, &cap.to_string(), "0"), 2, &token, 1).unwrap_err().to_string();
+        assert!(e.contains("paused") && e.contains("quorum"), "{e}");
+
+        // A coin with no row is `deposit_index`'s error to report, not this one's; and a node
+        // predating the cap serves neither field, which is nothing to pre-check.
+        mint_is_possible(&open, 3, &token, u64::MAX).expect("an unlisted coin is not this check's refusal");
+        let mut old_node = open.clone();
+        let row = &mut old_node["assets"][0];
+        row.as_object_mut().unwrap().remove("mint_cap_per_day");
+        row.as_object_mut().unwrap().remove("minted_today");
+        mint_is_possible(&old_node, 2, &token, u64::MAX).expect("a node predating B1 has no cap to check");
+        // And the figures are read whichever way the node encodes them (node I3).
+        let numeric = state(false, &cap.to_string(), "400");
+        let mut numeric = numeric;
+        numeric["assets"][0]["mint_cap_per_day"] = serde_json::json!(cap);
+        numeric["assets"][0]["minted_today"] = serde_json::json!(400);
+        assert!(mint_is_possible(&numeric, 2, &token, cap - 399).is_err(), "a numeric cap reads the same");
     }
 
     /// [`asset_row`] with `locked` as a JSON number — a node older than chain 14.

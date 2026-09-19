@@ -1176,7 +1176,12 @@ async fn main() -> Result<()> {
             // fact, not a guess: a bridged token is listed before any attestation of it is
             // admissible, and a listing's index never moves. A token this chain has not listed is
             // an error here rather than a refused transaction an hour later (`wallet::deposit_index`).
-            let index = wallet::deposit_index(&rpc.bridge_state().await?, &rpc.assets().await?, &asset_id)?;
+            let bridge = rpc.bridge_state().await?;
+            let index = wallet::deposit_index(&bridge, &rpc.assets().await?, &asset_id)?;
+            // The two ledger rules that can refuse a perfect attestation (node M4): the B1 pause,
+            // and this coin's remaining share of the daily mint cap. Both are on the reply just
+            // read, and hearing either of them after ~100 s of proving is the wrong order.
+            wallet::mint_is_possible(&bridge, d.token_chain, &d.token, d.amount)?;
             // The note is stamped with a `time` this wallet chooses, inside the window admission
             // allows, which is what makes its commitment predictable enough to seal an envelope
             // against (`Action::BridgeAttest`). The head is the freshest such time.
