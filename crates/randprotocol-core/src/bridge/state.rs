@@ -1078,7 +1078,7 @@ mod tests {
         let mut st = BridgeState::from_config(&c);
         let mut tk = tokens_with_the_test_token();
         let pk = crate::crypto::Keypair::from_seed([9; 32]).unwrap().public_key().clone();
-        let native = crate::ledger::tokens::native_asset_id("Native", "NTV", 9, &MintAuthority::Key(pk.clone()), 0, &[7; 32]);
+        let native = crate::ledger::tokens::native_asset_id("Native", "NTV", 9, &MintAuthority::Key(pk.clone()), &None, &[7; 32]);
         assert_eq!(tk.register(native, "Native".into(), "NTV".into(), 9, MintAuthority::Key(pk), 0).unwrap(), 2);
         assert_eq!(st.check_burn(&tk, 2, 1, 2, &TOKEN, &EVM_TO, 0).unwrap_err(), BridgeError::UnknownAsset);
         assert_eq!(

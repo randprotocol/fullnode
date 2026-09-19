@@ -202,8 +202,11 @@ pub enum Action {
     },
     /// RPL (spec §4): create a token. Permissionless — anyone who pays the bundle base plus the
     /// registry's `registration_fee` gets the next dense index — and content-addressed: the
-    /// token's [`AssetId`] is `native_asset_id(name, symbol, decimals, authority, initial.amount,
-    /// salt)`, so the same declaration twice is the same asset and the second is refused.
+    /// token's [`AssetId`] is `native_asset_id(name, symbol, decimals, authority, initial, salt)`
+    /// — the **whole** `initial`, not just its amount, because this action is unsigned and its
+    /// fee bundle is not bound to it (see [`InitialMint`]) — so the same declaration twice is the
+    /// same asset and the second is refused, while a copy with the recipient swapped is a
+    /// different token that can take nothing from the original.
     ///
     /// `authority` may only be [`MintAuthority::None`] (fixed supply, which then *must* carry an
     /// `initial`) or [`MintAuthority::Key`]: a bridged token is listed by genesis or governance

@@ -99,9 +99,11 @@ impl CallEnvelope {
 /// submitting, and cannot predict which block will take it. Admission holds it to the window a
 /// bundle's `time` gets.
 ///
-/// `amount` is part of the token's [`AssetId`] (`ledger::tokens::native_asset_id`'s
-/// `initial_supply`), so a registration cannot be replayed at a different initial supply under
-/// the same identity.
+/// **The whole of this struct is part of the token's [`AssetId`]** (`ledger::tokens::
+/// native_asset_id`'s `initial`), not just `amount`: a `RegisterToken` carries no signature and
+/// its fee bundle is not bound to it, so an observer could otherwise copy a gossiped registration
+/// with `recipient` swapped and take both the identity and the whole initial supply. With all
+/// five fields in the id, a redirected copy is a different token (spec §3, amended 2026-09-19).
 ///
 /// [`Action::RegisterToken`]: crate::types::Action::RegisterToken
 /// [`Action::BridgeAttest`]: crate::types::Action::BridgeAttest
@@ -117,8 +119,9 @@ pub struct InitialMint {
 }
 
 /// What a `Key` mint authority signs to mint `amount` of its token (the RPL token standard,
-/// spec §4): the chain, the token's [`AssetId`], the register's `mint_nonce`, the amount, and
-/// the commitment of the note the chain is about to append.
+/// spec §4): the chain, the token's [`AssetId`], the register's `mint_nonce`, the amount, the
+/// commitment of the note the chain is about to append, and the digest of the envelope that
+/// opens it.
 ///
 /// The commitment stands in for the note's other four words — the recipient's `pk`, the asset
 /// index, the `time` and the blinding `r` — because it *is* their hash: a signature over it is a
@@ -127,10 +130,32 @@ pub struct InitialMint {
 /// dense numbering, while the id is the token's identity, so a mint signed for one token is
 /// never a mint for another chain's token that happens to sit at the same index.
 ///
+/// **The envelope is in the message too** (amended 2026-09-19 after Task 4's review), as
+/// `blake3(bincode(envelope))`: the commitment binds the note but not the ciphertext that opens
+/// it, so without this a third party could lift a gossiped mint, re-wrap it with a garbage
+/// envelope and spend the authority's nonce on a note whose recipient would have to rebuild it
+/// from the public fields to find it. It is hashed rather than inlined because an envelope is
+/// kilobytes and this message is hashed on every admission.
+///
 /// [`AssetId`]: crate::bridge::AssetId
-pub fn token_mint_message(chain_id: u64, asset_id: &crate::bridge::AssetId, nonce: u64, amount: u64, cm: &Word8) -> Hash {
-    let bytes = bincode::serialize(&(chain_id, asset_id, nonce, amount, cm)).expect("serializes");
+pub fn token_mint_message(
+    chain_id: u64,
+    asset_id: &crate::bridge::AssetId,
+    nonce: u64,
+    amount: u64,
+    cm: &Word8,
+    envelope: &Envelope,
+) -> Hash {
+    let bytes = bincode::serialize(&(chain_id, asset_id, nonce, amount, cm, envelope_digest(envelope)))
+        .expect("serializes");
     Hash::digest_domain(b"rand-rpl-mint-1", &bytes)
+}
+
+/// `blake3(bincode(envelope))` — the envelope as [`token_mint_message`] binds it. Its own
+/// function so the signer and the verifier cannot compute it two ways, and public so a wallet
+/// can pre-compute what it is about to sign.
+pub fn envelope_digest(envelope: &Envelope) -> Hash {
+    Hash::digest(&bincode::serialize(envelope).expect("an envelope serializes"))
 }
 
 /// What a `Key` mint authority signs to hand its token to another key — or to no key at all,
@@ -267,13 +292,20 @@ mod tests {
         let pk = Keypair::from_seed([5; 32]).unwrap().public_key().clone();
         let other = Keypair::from_seed([6; 32]).unwrap().public_key().clone();
 
-        let m = token_mint_message(7, &a, 1, 500, &[3; 8]);
+        // The envelope is in the message because the commitment is not over it: without this a
+        // third party could re-wrap a gossiped mint with a garbage envelope and spend the
+        // authority's nonce (spec §4, amended 2026-09-19). Every part of it is bound.
+        let m = token_mint_message(7, &a, 1, 500, &[3; 8], &env());
         for x in [
-            token_mint_message(8, &a, 1, 500, &[3; 8]),
-            token_mint_message(7, &b, 1, 500, &[3; 8]),
-            token_mint_message(7, &a, 2, 500, &[3; 8]),
-            token_mint_message(7, &a, 1, 501, &[3; 8]),
-            token_mint_message(7, &a, 1, 500, &[4; 8]),
+            token_mint_message(8, &a, 1, 500, &[3; 8], &env()),
+            token_mint_message(7, &b, 1, 500, &[3; 8], &env()),
+            token_mint_message(7, &a, 2, 500, &[3; 8], &env()),
+            token_mint_message(7, &a, 1, 501, &[3; 8], &env()),
+            token_mint_message(7, &a, 1, 500, &[4; 8], &env()),
+            token_mint_message(7, &a, 1, 500, &[3; 8], &Envelope { body: vec![9], ..env() }),
+            token_mint_message(7, &a, 1, 500, &[3; 8], &Envelope { kem_ct: vec![9], ..env() }),
+            token_mint_message(7, &a, 1, 500, &[3; 8], &Envelope { to_receiver: vec![9], ..env() }),
+            token_mint_message(7, &a, 1, 500, &[3; 8], &Envelope { to_sender: vec![9], ..env() }),
         ] {
             assert_ne!(x, m);
         }

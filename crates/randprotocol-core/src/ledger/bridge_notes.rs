@@ -1032,7 +1032,7 @@ mod tests {
         // bridge's: `check_burn` resolves the outbound message's `(chain, token)` from a
         // `MintAuthority::Bridge` and there is none, so the index names nothing it can send.
         let pk = crate::crypto::Keypair::from_seed([9; 32]).unwrap().public_key().clone();
-        let native = crate::ledger::tokens::native_asset_id("Native", "NTV", 9, &crate::ledger::tokens::MintAuthority::Key(pk.clone()), 0, &[7; 32]);
+        let native = crate::ledger::tokens::native_asset_id("Native", "NTV", 9, &crate::ledger::tokens::MintAuthority::Key(pk.clone()), &None, &[7; 32]);
         let index = l
             .tokens_mut()
             .unwrap()

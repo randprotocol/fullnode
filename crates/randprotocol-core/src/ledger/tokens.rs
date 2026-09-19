@@ -564,19 +564,35 @@ pub fn check_metadata(name: &str, symbol: &str, decimals: u8) -> Result<(), Toke
 }
 
 /// The [`AssetId`] a native (non-bridged) token registers under: domain-separated over every
-/// field a registration commits to, plus a caller-chosen `salt` so the same name/symbol/
-/// decimals/authority/supply combination can still be registered more than once as a distinct
-/// asset. Built the same way `crate::bridge::asset_id` builds a bridged one — a plain
-/// `Hash::digest_domain` call, since [`AssetId`] and [`Hash`] are the same type.
+/// field a registration commits to, plus a caller-chosen `salt` so the same declaration can still
+/// be made twice as two distinct assets. Built the same way `crate::bridge::asset_id` builds a
+/// bridged one — a plain `Hash::digest_domain` call, since [`AssetId`] and [`Hash`] are the same
+/// type.
+///
+/// **The whole `initial` is in the id — amount, recipient, blinding, time and envelope — not just
+/// the amount** (spec §3, amended 2026-09-19 after Task 4's review). An
+/// [`Action::RegisterToken`] carries no signature, and a transaction's fee bundle is not bound to
+/// the action it rides under, so an observer can lift a pending registration off gossip, attach a
+/// fee bundle of its own and race it. Were only the amount bound, the copy would land under the
+/// *same* id: whichever won took the identity and the entire initial supply — permanently, for a
+/// fixed-supply token — and the loser died at [`TokenError::AlreadyRegistered`]. With the whole
+/// mint in the id a redirected copy is simply a *different* token, which is all a non-unique
+/// symbol ever promised; the original then costs one re-issue at the next index
+/// ([`TokenError::IndexMismatch`]) and nothing more.
+///
+/// `initial` is `None` for a `Key` token that registers empty, and that is a different id from
+/// any registration that mints.
+///
+/// [`Action::RegisterToken`]: crate::types::Action::RegisterToken
 pub fn native_asset_id(
     name: &str,
     symbol: &str,
     decimals: u8,
     authority: &MintAuthority,
-    initial_supply: u64,
+    initial: &Option<InitialMint>,
     salt: &[u8; 32],
 ) -> AssetId {
-    let bytes = bincode::serialize(&(name, symbol, decimals, authority, initial_supply, salt))
+    let bytes = bincode::serialize(&(name, symbol, decimals, authority, initial, salt))
         .expect("native asset id fields serialize");
     Hash::digest_domain(b"rand-rpl-asset", &bytes)
 }
@@ -594,7 +610,8 @@ pub fn native_asset_id(
 ///
 /// It cannot collide with a [`native_asset_id`]: this hashes a four-field tuple and that a
 /// six-field one, and bincode's encoding of the shorter can never be the encoding of the longer
-/// (the tail past `decimals` is 32 bytes here and at least 44 there, whatever the authority).
+/// (the tail past `decimals` is exactly 32 bytes here — the salt — and at least 37 there: four
+/// for the authority's variant tag at its shortest, one for the `Option`'s, and the same 32).
 pub fn bridged_asset_id(name: &str, symbol: &str, salt: &[u8; 32]) -> AssetId {
     let bytes =
         bincode::serialize(&(name, symbol, BRIDGE_DECIMALS, salt)).expect("bridged asset id fields serialize");
@@ -701,10 +718,11 @@ pub(super) fn validate(
                     return Err(TokenError::ZeroAmount.into());
                 }
             }
-            // The state lookups. The id binds every declared field including the initial supply,
+            // The state lookups. The id binds every declared field and the *whole* initial mint,
             // so the identical declaration twice is the same asset — and the second is refused
-            // rather than handed a second index.
-            let id = registration_id(name, symbol, *decimals, authority, initial.as_ref(), salt);
+            // rather than handed a second index — while a copy of this registration with the
+            // recipient swapped is a different asset that can take nothing from it.
+            let id = native_asset_id(name, symbol, *decimals, authority, initial, salt);
             if registry.get_by_id(&id).is_some() {
                 return Err(TokenError::AlreadyRegistered(id).into());
             }
@@ -739,22 +757,15 @@ pub(super) fn validate(
                 check_new_note(ledger, tx, &cm)?;
             }
         }
-        Action::TokenMint { asset, amount, recipient, r, time, envelope: _, nonce, signature } => {
-            let info = registry.get(*asset).ok_or(TokenError::UnknownToken(*asset))?;
-            // Only a `Key` authority signs a mint. A `Bridge` token's supply moves through its
-            // backings alone (`TokenRegistry::lock`), a `None` token's never moves again, and
-            // `Program` is reserved — the same one refusal for all three, naming the index.
-            let MintAuthority::Key(pk) = &info.authority else {
-                return Err(TokenError::NotKeyAuthority(*asset).into());
-            };
+        Action::TokenMint { asset, amount, recipient, r, time, envelope, nonce, signature } => {
+            // A byte-level rule, so it comes before the registry is consulted at all: a zero mint
+            // would spend the authority's nonce to append a leaf worth nothing.
             if *amount == 0 {
                 return Err(TokenError::ZeroAmount.into());
             }
-            // The token's own counter is the whole of the replay protection: there are no
-            // accounts here, and the authority key may hold many tokens at once.
-            if *nonce != info.mint_nonce {
-                return Err(TokenError::BadNonce { expected: info.mint_nonce, got: *nonce }.into());
-            }
+            // Registered, `Key`-authorised, at the nonce its row expects — the triple
+            // `SetAuthority` shares (see [`key_authority`]).
+            let (info, pk) = key_authority(registry, *asset, *nonce)?;
             ledger.check_time(*time)?;
             // A checked add, decided here so `apply`'s `add_supply` cannot fail: a supply that
             // wrapped would stop counting what exists.
@@ -763,24 +774,21 @@ pub(super) fn validate(
             check_new_note(ledger, tx, &cm)?;
             // Last, and the most expensive check in this module by a wide margin. The message
             // carries the commitment, so it binds the recipient, the amount, the asset, the time
-            // and the blinding all at once: the leaf the ledger appends is the leaf the authority
-            // signed for, and nothing about it can be altered in flight.
-            if !pk.verify(token_mint_message(tx.chain_id, &info.id, *nonce, *amount, &cm).as_bytes(), signature) {
+            // and the blinding all at once — and the envelope digest beside it, because the
+            // commitment does *not* cover the ciphertext that opens the note: without it a third
+            // party could re-wrap a gossiped mint with garbage and spend the authority's nonce
+            // (spec §4, amended 2026-09-19). So the leaf the ledger appends is the leaf the
+            // authority signed for, and the envelope that travels with it is the one it sealed.
+            if !pk.verify(token_mint_message(tx.chain_id, &info.id, *nonce, *amount, &cm, envelope).as_bytes(), signature)
+            {
                 return Err(TokenError::BadSignature.into());
             }
         }
         Action::SetAuthority { asset, new, nonce, signature } => {
-            let info = registry.get(*asset).ok_or(TokenError::UnknownToken(*asset))?;
-            // Explicitly, and before anything is charged: only a `Key` token rotates. A `Bridge`
-            // token's authority holds its backings, a renounced token has no key left to sign
-            // with, and `Program` is reserved — so this is refused outright rather than applied
-            // as a no-op that took a fee and changed nothing.
-            let MintAuthority::Key(pk) = &info.authority else {
-                return Err(TokenError::NotKeyAuthority(*asset).into());
-            };
-            if *nonce != info.mint_nonce {
-                return Err(TokenError::BadNonce { expected: info.mint_nonce, got: *nonce }.into());
-            }
+            // Explicitly, and before anything is charged: only a registered, `Key`-authorised
+            // token at the right nonce rotates — [`key_authority`] again, so a rotation and a
+            // mint can never read the same row differently.
+            let (info, pk) = key_authority(registry, *asset, *nonce)?;
             // By the **current** key: handing the token on is the holder's decision, never the
             // heir's. Last, as in the mint arm.
             if !pk.verify(set_authority_message(tx.chain_id, &info.id, *nonce, new).as_bytes(), signature) {
@@ -814,7 +822,9 @@ pub(super) fn apply(
 ) -> Result<(), TxError> {
     match action {
         Action::RegisterToken { name, symbol, decimals, authority, initial, salt, index: _ } => {
-            let id = registration_id(name, symbol, *decimals, authority, initial.as_ref(), salt);
+            // The same id `validate` resolved, from the same fields — the whole initial mint
+            // included, so `apply` cannot land under an identity `validate` did not check.
+            let id = native_asset_id(name, symbol, *decimals, authority, initial, salt);
             let height = ledger.height();
             let registry = ledger.tokens_mut().ok_or(TxError::Token(TokenError::Disabled))?;
             // The index `validate` held the action's `index` to, and the only place it is handed
@@ -852,19 +862,31 @@ pub(super) fn apply(
     Ok(())
 }
 
-/// The [`AssetId`] a registration lands under: every field it declares, the initial supply
-/// included (absent counts as zero, which is what a `Key` token registering empty commits to).
-/// One function so [`validate`] and [`apply`] cannot compute two different identities for one
-/// transaction.
-fn registration_id(
-    name: &str,
-    symbol: &str,
-    decimals: u8,
-    authority: &MintAuthority,
-    initial: Option<&InitialMint>,
-    salt: &[u8; 32],
-) -> AssetId {
-    native_asset_id(name, symbol, decimals, authority, initial.map_or(0, |m| m.amount), salt)
+/// The three checks a `Key`-authorised action shares, in one place and in this order: the token
+/// is registered, its authority really is a `Key`, and the nonce is the one that key's register
+/// row expects. Returns the row and the key that has to have signed.
+///
+/// One function because [`Action::TokenMint`] and [`Action::SetAuthority`] must not drift apart
+/// on it: they spend the same counter, and a mint that read the nonce differently from a rotation
+/// would let one be replayed after the other.
+fn key_authority(
+    registry: &TokenRegistry,
+    asset: u32,
+    nonce: u64,
+) -> Result<(&TokenInfo, &PublicKey), TokenError> {
+    let info = registry.get(asset).ok_or(TokenError::UnknownToken(asset))?;
+    // A `Bridge` token's supply moves through its backings alone (`TokenRegistry::lock`), a
+    // `None` token's never moves again — which is what makes a renunciation final — and
+    // `Program` is reserved. One refusal for all three, naming the index.
+    let MintAuthority::Key(pk) = &info.authority else {
+        return Err(TokenError::NotKeyAuthority(asset));
+    };
+    // The token's own counter is the whole of the replay protection: there are no accounts here,
+    // and one authority key may hold many tokens at once.
+    if nonce != info.mint_nonce {
+        return Err(TokenError::BadNonce { expected: info.mint_nonce, got: nonce });
+    }
+    Ok((info, pk))
 }
 
 /// A note the chain is about to create must be one nobody has created yet — in the tree, and in
@@ -1005,12 +1027,56 @@ mod tests {
         assert_ne!(r.root(), listed, "the state root moves when a backing's locked moves");
     }
 
+    /// A native id binds every field a registration declares — and the **whole** of its initial
+    /// mint, not just the amount (spec §3, amended 2026-09-19): a `RegisterToken` carries no
+    /// signature and its fee bundle is not bound to it, so an observer that could swap the
+    /// recipient, the blinding or the envelope of a gossiped registration and keep its id would
+    /// take the initial supply outright. With all five in the id, a redirected copy is a
+    /// *different* token — which is all a non-unique symbol ever promised.
     #[test]
     fn a_native_id_binds_every_registration_field() {
-        let a = native_asset_id("A", "A", 9, &MintAuthority::None, 10, &[0; 32]);
-        assert_ne!(a, native_asset_id("A", "A", 9, &MintAuthority::None, 10, &[1; 32]));
-        assert_ne!(a, native_asset_id("A", "A", 9, &MintAuthority::None, 11, &[0; 32]));
-        assert_ne!(a, native_asset_id("B", "A", 9, &MintAuthority::None, 10, &[0; 32]));
+        let mint = |amount: u64, pk: Word8, r: Word8, time: u32, body: u8| {
+            Some(InitialMint {
+                amount,
+                recipient: ShieldedAddress { pk, kem_ek: vec![6; 32] },
+                r,
+                time,
+                envelope: crate::notes::Envelope {
+                    kem_ct: vec![1; 8],
+                    to_receiver: vec![],
+                    to_sender: vec![],
+                    body: vec![body; 8],
+                },
+            })
+        };
+        let base = mint(10, [4; 8], [7; 8], 9, 2);
+        let a = native_asset_id("A", "A", 9, &MintAuthority::None, &base, &[0; 32]);
+        assert_eq!(a, native_asset_id("A", "A", 9, &MintAuthority::None, &base, &[0; 32]), "and it is a function");
+        for (other, what) in [
+            (native_asset_id("A", "A", 9, &MintAuthority::None, &base, &[1; 32]), "the salt"),
+            (native_asset_id("B", "A", 9, &MintAuthority::None, &base, &[0; 32]), "the name"),
+            (native_asset_id("A", "B", 9, &MintAuthority::None, &base, &[0; 32]), "the symbol"),
+            (native_asset_id("A", "A", 8, &MintAuthority::None, &base, &[0; 32]), "the decimals"),
+            (
+                native_asset_id(
+                    "A",
+                    "A",
+                    9,
+                    &MintAuthority::Key(crate::crypto::Keypair::from_seed([1; 32]).unwrap().public_key().clone()),
+                    &base,
+                    &[0; 32],
+                ),
+                "the authority",
+            ),
+            (native_asset_id("A", "A", 9, &MintAuthority::None, &mint(11, [4; 8], [7; 8], 9, 2), &[0; 32]), "the amount"),
+            (native_asset_id("A", "A", 9, &MintAuthority::None, &mint(10, [5; 8], [7; 8], 9, 2), &[0; 32]), "the recipient"),
+            (native_asset_id("A", "A", 9, &MintAuthority::None, &mint(10, [4; 8], [8; 8], 9, 2), &[0; 32]), "the blinding"),
+            (native_asset_id("A", "A", 9, &MintAuthority::None, &mint(10, [4; 8], [7; 8], 10, 2), &[0; 32]), "the time"),
+            (native_asset_id("A", "A", 9, &MintAuthority::None, &mint(10, [4; 8], [7; 8], 9, 3), &[0; 32]), "the envelope"),
+            (native_asset_id("A", "A", 9, &MintAuthority::None, &None, &[0; 32]), "no initial mint at all"),
+        ] {
+            assert_ne!(a, other, "{what}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1484,9 +1550,19 @@ mod action_tests {
         )
     }
 
-    /// The asset id `register_tx`'s registration lands under.
-    fn tst_id(authority: &MintAuthority, initial_supply: u64) -> AssetId {
-        native_asset_id("Test Coin", "TST", 6, authority, initial_supply, &[3; 32])
+    /// The asset id `register_tx`'s registration lands under, with the whole initial mint in it.
+    fn tst_id(authority: &MintAuthority, initial: &Option<InitialMint>) -> AssetId {
+        native_asset_id("Test Coin", "TST", 6, authority, initial, &[3; 32])
+    }
+
+    /// The id a `RegisterToken` transaction registers under, read off the action itself — which
+    /// is what makes the redirect test able to compare two transactions rather than two
+    /// hand-built field lists.
+    fn id_of(tx: &Transaction) -> AssetId {
+        let Action::RegisterToken { name, symbol, decimals, authority, initial, salt, .. } = &tx.action else {
+            panic!("a registration")
+        };
+        native_asset_id(name, symbol, *decimals, authority, initial, salt)
     }
 
     /// Registers "Test Coin" under `issuer()`'s key with no initial mint, returning its index.
@@ -1512,7 +1588,7 @@ mod action_tests {
         let time = l.height() as u32;
         let cm = mint_commitment(&recipient(), amount, asset, time, &r, &StubExecutor);
         let id = l.tokens().unwrap().get(asset).map(|i| i.id).unwrap_or(crate::crypto::Hash::ZERO);
-        let signature = signer.sign(token_mint_message(chain_id, &id, nonce, amount, &cm).as_bytes());
+        let signature = signer.sign(token_mint_message(chain_id, &id, nonce, amount, &cm, &env()).as_bytes());
         Transaction::shielded(
             CHAIN,
             fee_bundle(l, seed, gas::BUNDLE_BASE),
@@ -1572,7 +1648,7 @@ mod action_tests {
 
         let info = l.tokens().unwrap().get(1).expect("index 1, the first one handed out");
         assert_eq!((info.name.as_str(), info.symbol.as_str(), info.decimals), ("Test Coin", "TST", 6));
-        assert_eq!(info.id, tst_id(&authority, 1_000), "the id binds every registration field");
+        assert_eq!(info.id, tst_id(&authority, &Some(initial(&l, 1_000))), "the id binds every registration field");
         assert_eq!(info.authority, authority);
         assert_eq!((info.total_supply, info.mint_nonce, info.registered_at), (1_000, 0, 1));
         assert_eq!(l.tokens().unwrap().next_index(), 2, "and the index is spent");
@@ -1648,7 +1724,7 @@ mod action_tests {
         let again = register_tx_at(&l, MintAuthority::None, Some(initial(&l, 5)), 30, 2, gas::BUNDLE_BASE + REG_FEE);
         assert_eq!(
             l.validate(&again, &StubExecutor),
-            Err(tok(TokenError::AlreadyRegistered(tst_id(&MintAuthority::None, 5))))
+            Err(tok(TokenError::AlreadyRegistered(tst_id(&MintAuthority::None, &Some(initial(&l, 5))))))
         );
     }
 
@@ -1717,6 +1793,84 @@ mod action_tests {
         assert_eq!(at(oldest), Ok(()));
     }
 
+    /// The attack the amended id formula closes (spec §3, amended 2026-09-19): a `RegisterToken`
+    /// carries no signature, and a fee bundle is not bound to the action it rides under, so an
+    /// observer can lift a pending registration off gossip, swap one field of its initial mint,
+    /// attach a fee bundle of its own and race it. With the **whole** `InitialMint` in the asset
+    /// id, the redirected copy is a *different* token: it cannot take the original's id, the
+    /// original is never `AlreadyRegistered`, and only the index it claimed is gone — which costs
+    /// a re-issue at the next index and nothing else. The original's supply still lands on the
+    /// original's recipient.
+    ///
+    /// Run for each of the three fields that are outside the note's `amount`: the recipient (the
+    /// theft), the blinding and the envelope (which would strand or grief the note).
+    #[test]
+    fn a_redirected_registration_is_a_different_token_and_cannot_take_the_originals_id() {
+        let attacker = ShieldedAddress { pk: [66; 8], kem_ek: vec![6; 32] };
+        for field in ["recipient", "r", "envelope"] {
+            let mut l = ledger();
+            // What the creator built and gossiped: a fixed-supply token, where a stolen initial
+            // mint would be the entire supply for ever.
+            let honest = register_tx(&l, MintAuthority::None, Some(initial(&l, 1_000)), 20);
+            let mut stolen = register_tx(&l, MintAuthority::None, Some(initial(&l, 1_000)), 30);
+            let Action::RegisterToken { initial: Some(m), .. } = &mut stolen.action else { panic!("a registration") };
+            match field {
+                "recipient" => m.recipient = attacker.clone(),
+                "r" => m.r = [0x5a; 8],
+                _ => {
+                    m.envelope =
+                        Envelope { kem_ct: vec![9; 8], to_receiver: vec![], to_sender: vec![], body: vec![9; 8] }
+                }
+            }
+            assert_ne!(id_of(&honest), id_of(&stolen), "{field}: a redirected copy is a different token");
+
+            // The copy wins the race and takes index 1 — under *its own* id.
+            l.apply_tx(&stolen, &proposer().address(), &StubExecutor).expect("the copy is a valid registration");
+            assert_eq!(l.tokens().unwrap().get(1).unwrap().id, id_of(&stolen), "{field}");
+            assert_ne!(l.tokens().unwrap().get(1).unwrap().id, id_of(&honest), "{field}: not the original's id");
+
+            // The original is not dead: the only thing stopping it is the index it named, which
+            // is what `IndexMismatch` exists to say. `AlreadyRegistered` would be the theft.
+            assert_eq!(
+                l.validate(&honest, &StubExecutor),
+                Err(tok(TokenError::IndexMismatch { expected: 2, got: 1 })),
+                "{field}"
+            );
+
+            // Re-issued at the index that is now next, it registers under its own id and the
+            // supply lands on the *original* recipient.
+            let reissued = register_tx(&l, MintAuthority::None, Some(initial(&l, 1_000)), 40);
+            assert_eq!(id_of(&reissued), id_of(&honest), "{field}: the index is not part of the id");
+            assert_eq!(l.validate(&reissued, &StubExecutor), Ok(()), "{field}");
+            l.apply_tx(&reissued, &proposer().address(), &StubExecutor).unwrap();
+            assert_eq!(l.tokens().unwrap().get(2).unwrap().id, id_of(&honest), "{field}");
+            assert_eq!(l.tokens().unwrap().get(2).unwrap().total_supply, 1_000);
+            assert!(
+                l.has_commitment(&mint_commitment(&recipient(), 1_000, 2, 1, &[7; 8], &StubExecutor)),
+                "{field}: the original recipient holds the original's supply"
+            );
+            // And what the attacker took is its own token's supply, at its own index — never the
+            // original's.
+            if field == "recipient" {
+                assert!(l.has_commitment(&mint_commitment(&attacker, 1_000, 1, 1, &[7; 8], &StubExecutor)));
+                assert!(!l.has_commitment(&mint_commitment(&attacker, 1_000, 2, 1, &[7; 8], &StubExecutor)));
+            }
+        }
+    }
+
+    /// The registry's last index, through the action: `RegistryFull` before the index compare,
+    /// so a chain that has handed out four billion indices says what is actually wrong.
+    #[test]
+    fn a_registration_is_refused_when_the_registry_is_full() {
+        let mut l = ledger();
+        // `next_index` is private to this module; `action_tests` is a child of it and can drive
+        // the registry to its last index without registering four billion tokens.
+        l.tokens_mut().unwrap().next_index = u32::MAX;
+        let tx = register_tx(&l, MintAuthority::None, Some(initial(&l, 5)), 20);
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(tok(TokenError::RegistryFull)));
+        assert_eq!(l.tokens().unwrap().len(), 0, "and nothing was registered");
+    }
+
     /// The initial note is a leaf like any other: one that is already in the tree cannot be
     /// appended again.
     #[test]
@@ -1757,7 +1911,11 @@ mod action_tests {
         let fixed = {
             let tx = register_tx(&l, MintAuthority::None, Some(initial(&l, 5)), 20);
             l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
-            1
+            // The index the registry actually handed out, not a literal that would keep agreeing
+            // with itself if the registration had landed somewhere else.
+            let index = l.tokens().unwrap().next_index() - 1;
+            assert!(matches!(l.tokens().unwrap().get(index).unwrap().authority, MintAuthority::None));
+            index
         };
         assert_eq!(
             l.validate(&mint_tx(&l, fixed, 1, 0, 30), &StubExecutor),
@@ -1831,6 +1989,31 @@ mod action_tests {
             Err(tok(TokenError::BadSignature)),
             "the signed message binds the chain"
         );
+    }
+
+    /// The envelope is inside the signed message (spec §4, amended 2026-09-19): the commitment
+    /// binds the note's six words but not the ciphertext that opens it, so without the envelope
+    /// digest a third party could lift a gossiped mint, re-wrap it with a garbage envelope and
+    /// spend the authority's nonce on a note its recipient can only recover the hard way. Every
+    /// part of the envelope is bound, not just the body.
+    #[test]
+    fn a_mint_whose_envelope_was_altered_after_signing_is_refused() {
+        let mut l = ledger();
+        let asset = register_keyed(&mut l, 20);
+        let signed = mint_tx(&l, asset, 250, 0, 30);
+        assert_eq!(l.validate(&signed, &StubExecutor), Ok(()), "as signed");
+        let swapped = [
+            Envelope { body: vec![0xff; 8], ..env() },
+            Envelope { kem_ct: vec![0xff; 8], ..env() },
+            Envelope { to_receiver: vec![0xff; 4], ..env() },
+            Envelope { to_sender: vec![0xff; 4], ..env() },
+        ];
+        for e in swapped {
+            let mut tx = signed.clone();
+            let Action::TokenMint { envelope, .. } = &mut tx.action else { panic!("a mint") };
+            *envelope = e.clone();
+            assert_eq!(l.validate(&tx, &StubExecutor), Err(tok(TokenError::BadSignature)), "{e:?}");
+        }
     }
 
     /// The per-token nonce is the whole of a mint's replay protection: the same transaction
@@ -1924,8 +2107,18 @@ mod action_tests {
             // `Disabled` would name the check that ran first.
             register_tx_at(&l, MintAuthority::Program(crate::crypto::Hash([5; 32])), None, 30, 9, gas::BUNDLE_BASE + REG_FEE),
             mint_tx_signed(&l, 99, 0, 7, 40, &Keypair::from_seed([98; 32]).unwrap(), CHAIN + 1, [9; 8]),
-            rotate_tx(&l, 99, None, 7, 50, &Keypair::from_seed([98; 32]).unwrap()),
+            // A rotation of a token that really is registered, so its verdict with the gate on
+            // comes from the token's own rules rather than from the index being unknown.
+            rotate_tx(&l, asset, None, 7, 50, &Keypair::from_seed([98; 32]).unwrap()),
         ];
+        // With the gate on, each of the three is refused for a reason of its own and *never*
+        // `Disabled` — which is what makes the answer below the gate speaking rather than some
+        // check that would have refused either way.
+        for tx in &txs {
+            let with_gate = l.validate(tx, &StubExecutor);
+            assert!(with_gate.is_err(), "{:?} -> {with_gate:?}", tx.action);
+            assert_ne!(with_gate, Err(tok(TokenError::Disabled)), "{:?}", tx.action);
+        }
         l.set_tokens(None);
         for tx in &txs {
             assert_eq!(l.validate(tx, &StubExecutor), Err(tok(TokenError::Disabled)), "{:?}", tx.action);
@@ -1935,7 +2128,6 @@ mod action_tests {
                 Err(tok(TokenError::Disabled))
             );
         }
-        assert_eq!(asset, 1);
     }
 
     /// Block application re-validates every transaction against the ledger the ones before it
