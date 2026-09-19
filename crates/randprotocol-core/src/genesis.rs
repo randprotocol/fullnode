@@ -150,7 +150,14 @@ pub struct GenesisToken {
 /// `100_000 × 10^8`. It applies to the tokens listed here and to every bridged token registered
 /// later (`Action::RegisterBridgedToken`). A bridged chain must set it above zero; a chain without
 /// a bridge has no bridged token for it to bound.
+///
+/// `deny_unknown_fields` like its children (core M-4 / node M5): both of the fields below are
+/// `#[serde(default)]`, so a misspelt `tokens` key used to cut a chain with an empty token list
+/// and a misspelt `mint_cap_per_day` a chain with a zero cap — the second is caught on a bridged
+/// chain (`validate` refuses a zero cap there), the first is not caught anywhere. It is **not**
+/// on [`Genesis`]: older genesis files must keep parsing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokensConfig {
     pub registration_fee: u64,
     #[serde(default)]

@@ -290,8 +290,10 @@ pub enum TokenError {
     #[error("a bridged token needs at least one backing")]
     NoBackings,
     /// A backing's declared source-chain decimals is over [`MAX_BACKING_DECIMALS`] — not a
-    /// meaningful precision for any real coin, and unbounded decimals would make
-    /// [`Backing::release_unit`]'s `10^(8-d)` overflow for `d` deep enough below the wire's eight.
+    /// meaningful precision for any real coin. (The overflow reason this doc used to give was
+    /// false and is dropped: [`Backing::release_unit`] is `10^(8-d)` only for `d < 8`, where the
+    /// exponent is at most 8, and is 1 at or above the wire's eight decimals — nothing here can
+    /// overflow. The bound is a sanity rule, not an arithmetic one; core M-8.)
     #[error("backing decimals {0} exceeds the maximum {MAX_BACKING_DECIMALS}")]
     BadBackingDecimals(u8),
     /// A burn (or the relayer fee carved out of it) is not a whole number of the backing's
