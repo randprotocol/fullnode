@@ -1153,6 +1153,102 @@ mod tests {
         );
     }
 
+    /// The release-unit rule through the whole ledger (bridge-06/audit O-5), which is where it
+    /// has to hold: a coin whose source token declares **6** decimals against an eight-decimal
+    /// attestation wire releases in units of 100, so a burn of 199 would release 1 native unit
+    /// and strand 99 in that contract's custody for ever, and a burn of 99 would release nothing
+    /// at all. `validate` refuses both before the asset bundle's proof is verified, and the
+    /// relayer fee — which the far side carves out of the amount in native units — is held to the
+    /// same unit.
+    ///
+    /// The registry's own tests cover the arithmetic; this one covers the wiring, because that is
+    /// what a real burn travels through: `validate` → `BridgeState::check_burn` →
+    /// `TokenRegistry::check_release`, and then `apply` reaching the very same verdict through
+    /// `release`.
+    #[test]
+    fn a_burn_that_is_not_a_whole_release_unit_is_refused_in_validate() {
+        /// Ethereum USDT's real wire address, and its real 6 decimals.
+        const USDT: [u8; 32] = [0xd7; 32];
+
+        let (mut l, secrets) = ledger();
+        let mut registry = TokenRegistry::new(1_000_000_000);
+        let zusd = registry
+            .register(
+                crate::ledger::tokens::bridged_asset_id("Rand USD", "zUSD", &[0x5a; 32]),
+                "Rand USD".into(),
+                "zUSD".into(),
+                8,
+                crate::ledger::tokens::MintAuthority::Bridge {
+                    backings: vec![crate::ledger::tokens::Backing { chain: 2, token: USDT, decimals: 6, locked: 0 }],
+                },
+                0,
+            )
+            .unwrap();
+        l.set_tokens(Some(registry));
+
+        // A deposit always attests a whole number of units, so there is nothing to refuse
+        // inbound: 10 000 wire units is 100 native USDT.
+        let deposit = attest_tx(
+            &l,
+            attest(
+                &secrets,
+                Body {
+                    timestamp: 1,
+                    nonce: 0,
+                    emitter_chain: 2,
+                    emitter_address: [2; 32],
+                    sequence: 0,
+                    consistency_level: 0,
+                    payload: Payload::Transfer(Transfer {
+                        amount: Transfer::u256_from_u128(10_000),
+                        token_address: USDT,
+                        token_chain: 2,
+                        to: recipient().recipient_hash(),
+                        to_chain: CHAIN_RAND,
+                        fee: Transfer::u256_from_u128(0),
+                    })
+                    .encode(),
+                },
+            ),
+            recipient(),
+            20,
+        );
+        l.apply_tx(&deposit, &proposer().address(), &StubExecutor).unwrap();
+        assert_eq!(l.tokens().unwrap().backing(zusd, 2, &USDT).unwrap().release_unit(), 100);
+
+        // 199 wire units: one native USDT released and 99 stranded. Refused.
+        let ragged = burn_tx_to(&l, zusd, 199, 0, 2, USDT, EVM_TO, 30, |_| {});
+        assert_eq!(
+            l.validate(&ragged, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Token(TokenError::NotReleasable { amount: 199, unit: 100 })))
+        );
+        // Below one unit: the endpoint would revert `ZeroAmount`. Same refusal, before it exists.
+        let dust = burn_tx_to(&l, zusd, 99, 0, 2, USDT, EVM_TO, 40, |_| {});
+        assert_eq!(
+            l.validate(&dust, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Token(TokenError::NotReleasable { amount: 99, unit: 100 })))
+        );
+        // A clean amount with a ragged fee is refused on the fee, naming the fee's own figure.
+        let ragged_fee = burn_tx_to(&l, zusd, 1_000, 150, 2, USDT, EVM_TO, 50, |_| {});
+        assert_eq!(
+            l.validate(&ragged_fee, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Token(TokenError::NotReleasable { amount: 150, unit: 100 })))
+        );
+        // Nothing moved through any of that.
+        assert_eq!(l.tokens().unwrap().backing(zusd, 2, &USDT).unwrap().locked, 10_000);
+
+        // Two whole units, with a whole-unit fee: admitted, applied, and custody still equals
+        // `locked` to the last native unit.
+        let ok = burn_tx_to(&l, zusd, 200, 100, 2, USDT, EVM_TO, 60, |_| {});
+        assert_eq!(l.validate(&ok, &StubExecutor), Ok(()));
+        l.apply_tx(&ok, &proposer().address(), &StubExecutor).unwrap();
+        let t = l.tokens().unwrap();
+        assert_eq!(t.backing(zusd, 2, &USDT).unwrap().locked, 9_800);
+        assert_eq!(t.get(zusd).unwrap().total_supply, 9_800);
+        assert_eq!(9_800 % 100, 0, "and what is left is still a whole number of native units");
+        assert!(t.backing_invariant_holds());
+    }
+
     /// Both actions are inadmissible on a chain whose genesis has no `bridge` section, and
     /// nothing this module owns can reach a bridge that is not there.
     #[test]
