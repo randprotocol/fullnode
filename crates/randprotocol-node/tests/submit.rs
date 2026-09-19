@@ -128,7 +128,18 @@ async fn the_rpc_submission_path_runs_through_the_verify_queue() {
 /// cached, exactly like the mint's. The chain is aggregation-gated (the gate is the
 /// preflight's first check) and the transaction's chain id is wrong: a permanent refusal,
 /// reached before any state — no aggregator registered, no cover looked up — is consulted.
+///
+/// **Ignored since the hidden-asset bundle (node I2).** `node::check_build_runs_genesis` bails on
+/// any genesis carrying an `aggregation` section until the admitted shapes and the recursion
+/// fixtures are re-measured for the new bundle guest, and this is the only caller of
+/// `start_one_validator_aggregating`. It cannot be moved to an ungated chain either: on one,
+/// `preflight_aggregate` answers `UnsupportedAction` (deliberately not permanent) *before*
+/// `WrongChain`, so nothing is cached and the assertion has nothing to observe — and the generic
+/// gossip → queue → worker → refused-cache path is already pinned by
+/// `a_gossiped_transaction_is_verified_off_the_loop_and_its_refusal_cached` in this file.
+/// Un-ignore with the re-measurement work.
 #[tokio::test]
+#[ignore = "aggregation is refused at startup on the hidden-asset bundle until its admitted shape is re-measured (b053a76)"]
 async fn a_gossiped_aggregate_is_verified_off_the_loop_and_its_refusal_cached() {
     let node = common::start_one_validator_aggregating(randprotocol_core::ledger::aggregation::AggregationConfig {
         bond: 100 * randprotocol_core::UNITS_PER_RAND,
