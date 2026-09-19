@@ -1,17 +1,19 @@
 //! The shielded wallet against a real chain: mint, scan, send, scan both sides, spend the change,
-//! bond a validator, then make a confidential call and open its input transcript back.
+//! bond a validator, then make a confidential call and open its input transcript back; and, on a
+//! chain with an RPL token registry, register a token, send it privately and burn some of it.
 //!
 //! One validator node runs in-process (the same `node::start` the cluster tests use) so the
 //! whole loop is exercised end to end — a faucet mint lands a note only wallet A's viewing key
-//! opens; A proves a real 2-in-2-out bundle; B finds its payment by trial-decrypting the tree;
+//! opens; A proves a real four-slot hidden-asset bundle; B finds its payment by trial-decrypting
+//! the tree;
 //! A's spent note comes back marked spent by the chain's own nullifier set; the change note
 //! is spendable, which is the part a wallet gets wrong if it forgets its own second output; the
 //! bond is the one bundle whose value does not land in anybody's note (it burns, and the
 //! register's stake is where it turns up instead); and a call's private inputs come back off the
 //! chain under A's viewing key alone, checked against the `H_IN` its proof published (spec §6.1).
 //!
-//! Six bundle proofs and one call proof, so this is the slowest test in the workspace by a wide
-//! margin — minutes, not seconds. The bridge commands are not here: they need a chain with a
+//! Eleven bundle proofs and three call proofs across the three tests, so this is the slowest test
+//! binary in the workspace by a wide margin — minutes, not seconds. The bridge commands are not here: they need a chain with a
 //! guardian set, which the node's cluster tests configure.
 //!
 //! Two things about the chain this test configures deliberately. The FRI profile is `test` (16
@@ -59,6 +61,15 @@ fn genesis(validator: &Keypair) -> Genesis {
 /// The same chain, with the two program caps the public-input test sets (the genesis CLI's
 /// `--max-program-words` and `--max-program-public-words`).
 fn genesis_with(validator: &Keypair, max_program_words: Option<u32>, max_program_public_words: Option<u32>) -> Genesis {
+    genesis_full(validator, max_program_words, max_program_public_words, None)
+}
+
+fn genesis_full(
+    validator: &Keypair,
+    max_program_words: Option<u32>,
+    max_program_public_words: Option<u32>,
+    tokens: Option<randprotocol_core::genesis::TokensConfig>,
+) -> Genesis {
     Genesis {
         chain_id: CHAIN_ID,
         timestamp_ms: 0,
@@ -80,7 +91,7 @@ fn genesis_with(validator: &Keypair, max_program_words: Option<u32>, max_program
         // Must be this build's own guest, or `node::start` refuses to run at all.
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
         bridge: None,
-        tokens: None,
+        tokens,
         aggregation: None,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words,
@@ -378,6 +389,102 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
     handle.shutdown().await;
 }
 
+/// An RPL token on the hidden-asset bundle, end to end: A registers a fixed-supply token whose
+/// initial mint to A is published with a **garbage** envelope — A finds the note anyway, from the
+/// registration's public fields — then sends part of it to B in a plain bundle that names no
+/// asset and pays its fee in RAND, and burns part of the rest (`TokenBurn`, `burn_a`). B, holding
+/// the token but no RAND, is refused before proving when it tries to pay it on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_is_registered_found_sent_privately_and_burned() {
+    use randprotocol_core::genesis::{TokensConfig, MIN_REGISTRATION_FEE};
+    use randprotocol_core::ledger::tokens::MintAuthority;
+    use randprotocol_core::notes::Envelope;
+    use randprotocol_core::types::actions::InitialMint;
+
+    init_tracing();
+    let started = Instant::now();
+    let dir = tempfile::tempdir().unwrap();
+    let key = Keypair::from_seed([103; 32]).unwrap();
+    let tokens = TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![] };
+    let handle = start_with(&dir, &key, genesis_full(&key, None, None, Some(tokens))).await;
+    let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
+    let a = Wallet::from_spend_key(SpendKey([5; 8]));
+    let b = Wallet::from_spend_key(SpendKey([6; 8]));
+    let (mut a_store, mut b_store) = (NoteStore::default(), NoteStore::default());
+    let mint = 100 * UNITS_PER_RAND;
+    let hash = rpc.mint_shielded(&a.address.to_string(), Some(mint)).await.expect("mint accepted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
+
+    // ---- register: index 1, 1 000 000 units to A, the initial note's envelope garbage ----
+    let supply = 1_000_000u64;
+    let time = u32::try_from(rpc.head().await.unwrap()["height"].as_u64().unwrap()).unwrap();
+    let garbage = Envelope { kem_ct: vec![0xff; 8], to_receiver: vec![0xff; 16], to_sender: vec![], body: vec![0xff; 16] };
+    let initial = InitialMint { amount: supply, recipient: a.address.clone(), r: SpendKey::random().0, time, envelope: garbage };
+    let action = Action::RegisterToken {
+        name: "Wallet Flow Dollar".into(),
+        symbol: "WFD".into(),
+        decimals: 6,
+        authority: MintAuthority::None,
+        initial: Some(initial),
+        salt: [7; 32],
+        index: 1,
+    };
+    let fee = gas::BUNDLE_BASE + MIN_REGISTRATION_FEE;
+    let slot = proving_slot().await;
+    let registered = wallet::submit(&rpc, &a, &mut a_store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the registration's bundle commits");
+    drop(slot);
+    eprintln!("register bundle: tier {}, proved in {:.1?}", registered.tier, registered.proving);
+    assert_eq!(a_store.balance_of(1), supply, "the initial mint is found from the public fields, garbage envelope and all");
+    assert_eq!(a_store.balance(), mint - fee);
+
+    // ---- send 400 000 of token 1 to B: a plain bundle, the fee in RAND ----
+    let pay = 400_000u64;
+    let slot = proving_slot().await;
+    let sent = wallet::send_asset(&rpc, &a, &mut a_store, &b.address, 1, pay, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the token transfer commits");
+    drop(slot);
+    eprintln!("token bundle: tier {}, proved in {:.1?}, {} proof bytes", sent.tier, sent.proving, sent.proof_bytes);
+    assert_eq!((sent.amount, sent.change, sent.asset), (pay, supply - pay, 1));
+    // What everyone else sees: a plain transaction whose bundle burns nothing and names no asset.
+    let shown = rpc.raw_transaction(&sent.hash).await.unwrap().expect("committed");
+    assert_eq!(shown.action, Action::None);
+    let bundle = shown.bundle.as_ref().expect("a bundle");
+    assert_eq!((bundle.burn_a, bundle.burn_r, bundle.burn_asset), (0, 0, 0));
+    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
+    assert_eq!(b_store.balance_of(1), pay, "B holds the token");
+    assert_eq!(b_store.balance(), 0, "and no RAND");
+    assert_eq!(a_store.balance_of(1), supply - pay);
+    assert_eq!(a_store.balance(), mint - fee - gas::BUNDLE_BASE);
+
+    // ---- B cannot pay it on without RAND for the fee: refused before any proof ----
+    let e = wallet::send_asset(&rpc, &b, &mut b_store, &a.address, 1, 1, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect_err("no RAND, no transfer")
+        .to_string();
+    assert!(e.contains("fee in RAND"), "{e}");
+
+    // ---- A burns 100 000: the token's supply drops by exactly that ----
+    let burn = 100_000u64;
+    let slot = proving_slot().await;
+    let burned =
+        wallet::submit_token_burn(&rpc, &a, &mut a_store, 1, burn, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+            .await
+            .expect("the token burn commits");
+    drop(slot);
+    assert_eq!((burned.amount, burned.burn), (burn, Burn::Asset { index: 1, amount: burn }));
+    let shown = rpc.raw_transaction(&burned.hash).await.unwrap().expect("committed");
+    assert_eq!(shown.action, Action::TokenBurn { asset: 1, amount: burn });
+    let bundle = shown.bundle.as_ref().expect("a bundle");
+    assert_eq!((bundle.burn_a, bundle.burn_r, bundle.burn_asset), (burn, 0, 1));
+    assert_eq!(a_store.balance_of(1), supply - pay - burn);
+
+    eprintln!("token flow in {:.1?}", started.elapsed());
+    handle.shutdown().await;
+}
+
 /// One validator's bonded stake, as `rand_getValidators` reports it: amounts go out as decimal
 /// strings, since a stake in units does not fit a JSON number safely.
 async fn stake_of(rpc: &RpcClient, address: &str) -> u64 {
@@ -391,7 +498,7 @@ async fn stake_of(rpc: &RpcClient, address: &str) -> u64 {
     row["stake"].as_str().expect("stake is a decimal string").parse().expect("stake parses")
 }
 
-/// Coin selection refuses what a 2-in-2-out bundle cannot do, before any proving starts.
+/// Coin selection refuses what a four-slot bundle cannot do, before any proving starts.
 #[test]
 fn a_wallet_that_cannot_pay_says_so_without_proving() {
     let a = Wallet::from_spend_key(SpendKey([3; 8]));

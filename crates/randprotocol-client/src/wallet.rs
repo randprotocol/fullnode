@@ -1,27 +1,31 @@
 //! The shielded wallet: the key file, the note store, scanning, coin selection and sending.
 //!
 //! What a wallet is, on a redacted chain (design spec §11): a spend key, a cache of the notes
-//! that key can open, and the ability to turn some of them into a proved 2-in-2-out bundle. The
-//! chain answers no question about ownership — `rand_getCommitments` hands out every leaf and
-//! every envelope to everyone, and only a viewing key tells the two apart — so scanning is a
-//! local trial decryption of the whole tree, and a balance is a fact about this file, not about
-//! the node.
+//! that key can open, and the ability to turn some of them into a proved hidden-asset bundle —
+//! four input and four output slots, slots 0–1 carrying one private asset and slots 2–3 RAND for
+//! the fee (`docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`). The chain answers
+//! no question about ownership — `rand_getCommitments` hands out every leaf and every envelope to
+//! everyone, and only a viewing key tells the two apart — so scanning is a local trial decryption
+//! of the whole tree, and a balance is a fact about this file, not about the node.
 //!
 //! Nothing here ever sends a spend key, a viewing key or a note plaintext anywhere. What leaves
-//! the process is exactly what a bundle publishes: an anchor, two nullifiers, two commitments,
-//! the fee, and two envelopes nobody but their recipients can open.
+//! the process is exactly what a bundle publishes: an anchor, four nullifiers, four commitments,
+//! the fee, the burn fields, and four envelopes nobody but their recipients can open — the
+//! dummies' envelopes open to nobody at all.
 
 use crate::{AssetRow, ChainLimits, CommitmentRow, RpcClient};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use randprotocol_core::bridge::{AssetId, Attestation, Payload};
+use randprotocol_core::ledger::tokens::MINT_FROM;
 use randprotocol_core::ledger::{bridge_notes, TIME_WINDOW};
 use randprotocol_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, DEPTH};
 use randprotocol_core::types::TX_BINDING_WORDS;
 use randprotocol_core::{format_amount, gas, Action, Hash, Transaction};
 use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note};
-use randprotocol_zkvm::executor::prove_bundle;
+use randprotocol_zkvm::executor::prove_hidden_bundle;
+use randprotocol_zkvm::hidden::{self, HiddenDigestInput, HiddenOutput, A_SLOTS, SLOTS};
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use randprotocol_zkvm::notes::{Note, SpendKey, ViewingKey};
 use randprotocol_zkvm::viewing::TxKey;
@@ -198,9 +202,10 @@ pub struct NoteStore {
     pub scanned_index: u64,
     /// The next block height to read nullifiers from.
     pub scanned_height: u64,
-    /// The next block height to read committed `bridge_attest` transactions from, for the
-    /// deposit-rebuild path in [`scan`]. Zero on a store written before that path existed, which
-    /// is what makes an older store re-read its blocks once and recover anything it missed.
+    /// The next block height to read committed deposits and mints from (`bridge_attest`,
+    /// `token_mint`, `register_token`), for the public-rebuild path in [`scan`]. Zero on a store
+    /// written before that path existed, which is what makes an older store re-read its blocks
+    /// once and recover anything it missed. (The name is the first of those kinds'.)
     #[serde(default)]
     pub scanned_attest_height: u64,
     pub notes: Vec<OwnedNote>,
@@ -324,7 +329,8 @@ impl KeyRole {
 /// and nothing else the wallet holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputKey {
-    /// `bundle`, `asset_bundle` or `mint` — the same names `rand_checkTransaction` reports.
+    /// `bundle` (the one bundle's slots 0–3) or `mint` — the same names `rand_checkTransaction`
+    /// reports.
     pub output: &'static str,
     pub slot: u8,
     pub cm: Word8,
@@ -334,8 +340,9 @@ pub struct OutputKey {
 }
 
 /// Every output of `tx` that carries a commitment and its envelope together, in the order and
-/// under the names `rand_checkTransaction` uses. A bridge deposit is not here: its commitment is
-/// derived by the ledger, not carried by the transaction.
+/// under the names `rand_checkTransaction` uses: the bundle's four slots, dummies included (their
+/// envelopes open to nobody), then a faucet mint's note. A bridge deposit is not here: its
+/// commitment is derived by the ledger, not carried by the transaction.
 fn sealed_outputs(tx: &Transaction) -> Vec<(&'static str, u8, Word8, &Envelope)> {
     let mut out = Vec::new();
     if let Some(b) = &tx.bundle {
@@ -367,6 +374,10 @@ pub fn output_keys(w: &Wallet, tx: &Transaction) -> Vec<OutputKey> {
             (None, Some(s)) => (KeyRole::Sent, s),
             (None, None) => continue,
         };
+        // A zero-value output is a dummy slot: nothing to disclose, and no payment to prove.
+        if is_dummy(&note) {
+            continue;
+        }
         rows.push(OutputKey { output, slot, cm, role, note, key });
     }
     rows
@@ -401,94 +412,137 @@ pub enum Found {
     Skipped(&'static str),
 }
 
+/// Why [`classify`] skips a leaf no key of this wallet opens — the ordinary case, never logged.
+const NOT_OURS: &str = "no key of this wallet opens it";
+/// Why [`classify`] skips a zero-value note — a dummy slot's, never logged either.
+const DUMMY: &str = "a zero-value dummy";
+
+/// A zero-value note: what a bundle's unused slots carry. It is a real leaf with a real
+/// nullifier-to-be, but it holds nothing, so it is neither a balance nor a payment.
+fn is_dummy(note: &Note) -> bool {
+    note.amount == 0
+}
+
 /// Decide what a single leaf is for `w`, with no I/O — the whole of [`scan`]'s per-row logic.
+///
+/// A four-slot bundle carries a dummy in every slot it does not need. This wallet seals its own
+/// dummies to a throwaway key, so they open to nobody; a dummy that does open (another wallet's
+/// choice, or a zero-value change) is recognised by its zero amount and skipped, so it is never a
+/// balance, a spendable input or a history row.
 pub fn classify(w: &Wallet, cm: Word8, envelope: &Envelope) -> Found {
     let env = envelope_from_core(envelope);
-    let mut why = "no key of this wallet opens it";
+    let mut why = NOT_OURS;
     if let Some((_, note)) = env.open_as_receiver(cm, &w.vk) {
         if note.pk == w.vk.pk() {
-            return Found::Received(note);
+            return if is_dummy(&note) { Found::Skipped(DUMMY) } else { Found::Received(note) };
         }
         why = "sealed to this wallet but owned by another key";
     }
     // Still worth the sender path: an envelope this wallet sealed for someone else is opened
     // through `ovk`, not through the KEM, so the two openings are independent.
     if let Some((_, note)) = env.open_as_sender(cm, &w.vk) {
-        return Found::Sent(note);
+        return if is_dummy(&note) { Found::Skipped(DUMMY) } else { Found::Sent(note) };
     }
     Found::Skipped(why)
 }
 
-/// The deposit note a committed `bridge_attest` appended for `w`, rebuilt from the public fields
-/// the node renders and nothing else.
+/// Transaction kinds (`tx_json`'s `kind`) whose one chain-computed note is public in full.
+const PUBLIC_NOTE_KINDS: [&str; 3] = ["bridge_attest", "token_mint", "register_token"];
+
+/// The notes a committed transaction appended for `w` from its **public** fields alone: a bridge
+/// deposit (`BridgeAttest`), a token mint (`TokenMint`) and a registration's initial mint
+/// (`RegisterToken`'s `initial`).
 ///
-/// Every word of a deposit note is public in that one transaction: the recipient address, the
-/// amount the guardians signed, the registry index, the action's `time` and its blinding `r`
-/// (`docs/bridge.md` §8). Nothing binds the envelope a submitter publishes to the note the chain
-/// computes, and anyone may submit an attestation — so a hostile relayer can seal garbage, consume
-/// the attestation's digest, and leave the recipient a leaf no trial decryption finds. This is the
-/// path that finds it anyway, with nothing decrypted.
+/// Every word of each of those notes is public in the one transaction that appends it — the
+/// recipient, the amount (a deposit's is the one the guardians signed), the asset index, the
+/// action's `time` and its blinding `r`, and the `from` word the chain fixes (zero for a deposit,
+/// [`MINT_FROM`] for a mint) — and nothing binds the envelope a submitter publishes to the note
+/// the chain computes: anyone may relay an attestation, and a careless or hostile minter may seal
+/// garbage. So the envelope layer is not what the recipient depends on here; this path finds the
+/// note with nothing decrypted (`docs/bridge.md` §8, one action over for the two mints).
 ///
-/// `None` for any other action, for a deposit to another address, for a guardian-set rotation
-/// (which deposits nothing, so the node renders no index and no commitment), and for a rendering
-/// whose `commitment` is not the note these fields build — the chain computes that commitment, so
-/// it is the authority on which leaf it appended.
-pub fn rebuilt_deposit(w: &Wallet, action: &Value) -> Option<Note> {
-    if action["kind"].as_str()? != "bridge_attest" {
-        return None;
+/// Empty for any other action, for a note to another key, and for a guardian-set rotation (which
+/// deposits nothing). A rebuilt note is only a candidate: [`scan`] records it at the leaf whose
+/// commitment it hashes to, so the chain's own tree is the authority on what was appended.
+pub fn rebuilt_notes(w: &Wallet, tx: &Transaction) -> Vec<Note> {
+    let me = w.vk.pk();
+    match &tx.action {
+        Action::BridgeAttest { attestation, recipient, r, time, asset, .. } if recipient.pk == me => {
+            // The ledger's own reading of the wire, so the amount cannot disagree with the one the
+            // chain deposited. `None` is a rotation, which deposits nothing.
+            bridge_notes::attested_transfer(attestation)
+                .map(|(_, _, amount)| Note { pk: me, from: [0; 8], amount, asset: *asset, time: *time, r: *r })
+                .into_iter()
+                .collect()
+        }
+        Action::TokenMint { asset, amount, recipient, r, time, .. } if recipient.pk == me => {
+            vec![Note { pk: me, from: MINT_FROM, amount: *amount, asset: *asset, time: *time, r: *r }]
+        }
+        Action::RegisterToken { initial: Some(m), index, .. } if m.recipient.pk == me => {
+            vec![Note { pk: me, from: MINT_FROM, amount: m.amount, asset: *index, time: m.time, r: m.r }]
+        }
+        _ => Vec::new(),
     }
-    let recipient = ShieldedAddress::parse(action["recipient"].as_str()?).ok()?;
-    if recipient.pk != w.vk.pk() {
-        return None;
-    }
-    let note = Note {
-        pk: recipient.pk,
-        // A deposit has no sender inside the pool, so the note records the zero word — the same
-        // constant `bridge_notes::DEPOSIT_FROM` is.
-        from: [0; 8],
-        amount: action["amount"].as_u64()?,
-        asset: u32::try_from(action["asset_index"].as_u64()?).ok()?,
-        time: u32::try_from(action["time"].as_u64()?).ok()?,
-        r: word8_from_hex(action["r"].as_str()?)?,
-    };
-    (word8_to_hex(&note.commitment()) == action["commitment"].as_str()?).then_some(note)
 }
 
-/// Every deposit this wallet can rebuild out of blocks it has not read yet, keyed by the
-/// commitment the chain appended for it. [`scan`] matches each against the leaf that carries that
-/// commitment, which is what turns a rebuilt note into an owned one at a known index.
+/// Every note this wallet can rebuild out of blocks it has not read yet ([`rebuilt_notes`]),
+/// keyed by the commitment the chain appended for it. [`scan`] matches each against the leaf
+/// that carries that commitment, which is what turns a rebuilt note into an owned one at a known
+/// index.
 ///
-/// Blocks are read once: `scanned_attest_height` moves past them whether or not they held a
-/// deposit for this wallet. On a chain with no bridge there is nothing to read at all — a
-/// `BridgeAttest` is inadmissible there — so the whole pass costs one `rand_getBridgeState`.
-async fn rebuildable_deposits(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<BTreeMap<Word8, Note>> {
+/// Blocks are read once: `scanned_attest_height` moves past them whether or not they held a note
+/// for this wallet. The pass reads headers 128 at a time (`rand_getBlocks`), a block only when it
+/// carries a transaction, and a raw transaction only for the three kinds that append a public
+/// note — so an idle chain costs a header page per 128 blocks.
+async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<BTreeMap<Word8, Note>> {
     let head = rpc.head().await?["height"].as_u64().context("getHead did not return a height")?;
-    if store.scanned_attest_height > head {
-        return Ok(BTreeMap::new());
-    }
-    if !rpc.bridge_state().await?["enabled"].as_bool().unwrap_or(false) {
-        store.scanned_attest_height = head + 1;
-        return Ok(BTreeMap::new());
-    }
     let mut out = BTreeMap::new();
-    for height in store.scanned_attest_height..=head {
-        let block = rpc.block_by_height(height).await?;
-        let Some(txs) = block["transactions"].as_array() else { continue };
-        for tx in txs {
-            if let Some(note) = rebuilt_deposit(w, &tx["action"]) {
-                out.insert(note.commitment(), note);
+    let mut from = store.scanned_attest_height;
+    while from <= head {
+        let headers = rpc.blocks(from, head.min(from.saturating_add(BLOCK_PAGE - 1))).await?;
+        let Some(last) = headers.iter().filter_map(|h| h["height"].as_u64()).max() else {
+            return Err(anyhow!("getBlocks returned no header from height {from} though the head is {head}"));
+        };
+        if last < from {
+            return Err(anyhow!("getBlocks returned headers below height {from}"));
+        }
+        for header in &headers {
+            if header["tx_count"].as_u64().unwrap_or(0) == 0 {
+                continue;
+            }
+            let height = header["height"].as_u64().context("a block header without a height")?;
+            let block = rpc.block_by_height(height).await?;
+            let Some(txs) = block["transactions"].as_array() else { continue };
+            for tx in txs {
+                let kind = tx["action"]["kind"].as_str().unwrap_or_default();
+                if !PUBLIC_NOTE_KINDS.contains(&kind) {
+                    continue;
+                }
+                let hash = Hash::from_hex(tx["hash"].as_str().unwrap_or_default())
+                    .map_err(|e| anyhow!("block {height} renders a transaction hash that does not parse: {e}"))?;
+                let raw = rpc
+                    .raw_transaction(&hash)
+                    .await?
+                    .with_context(|| format!("the node serves no raw transaction for {hash}, committed in block {height}"))?;
+                for note in rebuilt_notes(w, &raw) {
+                    out.insert(note.commitment(), note);
+                }
             }
         }
+        from = last + 1;
     }
-    store.scanned_attest_height = head + 1;
+    store.scanned_attest_height = store.scanned_attest_height.max(head + 1);
     Ok(out)
 }
 
-/// Record what one leaf is for this wallet. `deposits` is what [`rebuildable_deposits`] found:
-/// a leaf whose commitment is in it is this wallet's deposit whatever its envelope says, so it is
-/// tried first and the envelope is never consulted for it.
-fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, deposits: &mut BTreeMap<Word8, Note>) {
-    let found = match deposits.remove(&row.cm) {
+/// Headers per `rand_getBlocks` page: the node's own cap.
+const BLOCK_PAGE: u64 = 128;
+
+/// Record what one leaf is for this wallet. `rebuilt` is what [`rebuildable_notes`] found: a
+/// leaf whose commitment is in it is this wallet's deposit or mint whatever its envelope says, so
+/// it is tried first and the envelope is never consulted for it.
+fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, rebuilt: &mut BTreeMap<Word8, Note>) {
+    let found = match rebuilt.remove(&row.cm) {
         Some(note) => Found::Received(note),
         None => classify(w, row.cm, &row.envelope),
     };
@@ -513,7 +567,7 @@ fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, deposits: 
             }
         }
         Found::Skipped(why) => {
-            if why != "no key of this wallet opens it" {
+            if why != NOT_OURS && why != DUMMY {
                 eprintln!("warning: ignoring leaf {}: {why}", row.index);
             }
         }
@@ -525,9 +579,9 @@ fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, deposits: 
 /// owns the file.
 pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<()> {
     // What the envelope layer cannot be trusted to deliver, read off the wire instead. Done
-    // before the leaves are paged, so a deposit is placed by the same pass that first sees its
+    // before the leaves are paged, so a deposit or a mint is placed by the same pass that first sees its
     // leaf rather than a scan later.
-    let mut deposits = rebuildable_deposits(rpc, w, store).await?;
+    let mut rebuilt = rebuildable_notes(rpc, w, store).await?;
 
     loop {
         let rows = rpc.commitments(store.scanned_index, PAGE).await?;
@@ -536,7 +590,7 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
         }
         let before = store.scanned_index;
         for row in &rows {
-            place_leaf(w, store, row, &mut deposits);
+            place_leaf(w, store, row, &mut rebuilt);
             store.scanned_index = store.scanned_index.max(row.index + 1);
         }
         // A non-empty page that leaves the cursor where it was would loop forever.
@@ -554,19 +608,19 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
     // keyed by its index), and this loop runs at most once per recovered deposit, because the
     // deposit is in the store from then on.
     let mut from = 0;
-    while !deposits.is_empty() {
+    while !rebuilt.is_empty() {
         let rows = rpc.commitments(from, PAGE).await?;
         if rows.is_empty() {
             // Every leaf there is has been offered and some deposit still has no leaf: the node
             // rendered an attestation whose commitment its own tree does not hold.
             return Err(anyhow!(
-                "{} rebuilt deposit(s) match no leaf of the tree; the node's blocks and notes disagree",
-                deposits.len()
+                "{} rebuilt deposit or mint note(s) match no leaf of the tree; the node's blocks and notes disagree",
+                rebuilt.len()
             ));
         }
         let before = from;
         for row in &rows {
-            place_leaf(w, store, row, &mut deposits);
+            place_leaf(w, store, row, &mut rebuilt);
             from = from.max(row.index + 1);
         }
         // Same guard the forward pass has: a non-empty page that does not move the cursor would
@@ -654,8 +708,9 @@ fn clear_pending(store: &mut NoteStore, read_through: u64) {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SelectError {
-    /// The wallet holds enough, but not in two notes. Consolidate first: a bundle spends
-    /// exactly two inputs (design spec §3), so no amount of dust adds up to a third slot.
+    /// The wallet holds enough, but not in two notes. Consolidate first: each group of a bundle
+    /// (the asset's slots 0–1, RAND's slots 2–3) spends at most two inputs (design spec §3), so no
+    /// amount of dust adds up to a third slot.
     #[error("need more than two notes; the largest two hold {largest_two} units — consolidate first")]
     NeedsMoreThanTwo { largest_two: u64 },
     #[error("insufficient balance: {have} units")]
@@ -664,12 +719,13 @@ pub enum SelectError {
 
 /// Largest-first, at most two notes: take the biggest note, then the next biggest if the first
 /// does not cover `need`. Largest-first minimises the number of notes a wallet fragments into,
-/// which matters more here than change minimisation — a two-input bundle cannot spend a third
-/// note, so a wallet that shreds itself into dust becomes unspendable.
+/// which matters more here than change minimisation — a group of two input slots cannot spend a
+/// third note, so a wallet that shreds itself into dust becomes unspendable.
 ///
 /// One asset at a time: `spendable` is what `NoteStore::spendable_of` returned for a single asset,
-/// and this does not look at the field — a bundle balances one asset, so a mixed list would select
-/// notes that cannot go in one bundle at all.
+/// and this does not look at the field — each group of a bundle balances one asset, so a mixed
+/// list would select notes that cannot share a group at all. [`Plan::select`] calls it once per
+/// group.
 pub fn select_inputs(spendable: &[&OwnedNote], need: u64) -> Result<Vec<OwnedNote>, SelectError> {
     let mut sorted: Vec<&OwnedNote> = spendable.to_vec();
     sorted.sort_by(|a, b| b.note.amount.cmp(&a.note.amount));
@@ -694,10 +750,11 @@ pub fn select_inputs(spendable: &[&OwnedNote], need: u64) -> Result<Vec<OwnedNot
 
 // ---------------------------------------------------------------- sending
 
-/// What a bundle's inputs must cover: the guest's own balance equation `in = out + fee + burn`
-/// (design spec §3), so the wallet asks coin selection for exactly that. The burn is the part that
-/// leaves the shielded pool instead of becoming somebody's note — a `Bond`'s stake in RAND, or a
-/// `BridgeBurn`'s amount in a bridged asset.
+/// What one group of a bundle's inputs must cover: the guest's balance equation for that group
+/// (design spec §3.3) — `in0 + in1 = out0 + out1 + burn_a` in the asset's slots,
+/// `in2 + in3 = out2 + out3 + fee + burn_r` in RAND's — so the wallet asks coin selection for
+/// exactly that. The burn is the part that leaves the shielded pool instead of becoming somebody's
+/// note: a `Bond`'s stake in RAND, a `BridgeBurn`'s or `TokenBurn`'s amount in its token.
 fn bundle_need(amount: u64, fee: u64, burn: u64) -> Result<u64> {
     amount
         .checked_add(fee)
@@ -707,21 +764,21 @@ fn bundle_need(amount: u64, fee: u64, burn: u64) -> Result<u64> {
 
 /// What a bundle took out of the shielded pool, in the unit it is measured in.
 ///
-/// The two burns this chain has are denominated differently: a `Bond` burns its stake in RAND,
-/// and a `BridgeBurn`'s asset bundle burns its amount in the units of a bridged asset, which owe
-/// nothing to RAND's nine decimals. As one `u64` the field was two values in a trench coat,
-/// disambiguated by [`Submission::asset`] and read correctly only by a caller that remembered to
-/// look — which is why the printer used to gate it (`asset == 0 && burn > 0`). Spelled as a sum
-/// type there is nothing to remember and no gate to forget.
+/// The burns this chain has are denominated differently: a `Bond` (and a `RegisterAggregator`)
+/// burns RAND through the bundle's `burn_r`, and a `BridgeBurn` or `TokenBurn` burns its token
+/// through `burn_a`, in units that owe nothing to RAND's nine decimals. As one `u64` the field
+/// was two values in a trench coat, disambiguated by [`Submission::asset`] and read correctly
+/// only by a caller that remembered to look. Spelled as a sum type there is nothing to remember.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Burn {
-    /// Nothing left the pool: every action except a bond and a bridge burn.
+    /// Nothing left the pool: every action but a bond, an aggregator registration and a burn.
     #[default]
     None,
-    /// A `Bond`'s stake, in RAND units — the one burn a transaction's own bundle can carry.
+    /// RAND out of the pool (`burn_r`): a `Bond`'s stake.
     Rand(u64),
-    /// A `BridgeBurn`'s amount, in the units of the bridged asset at registry index `index` (the
-    /// same index as [`Submission::asset`]; carried here too so a burn describes itself).
+    /// A token's amount out of the pool (`burn_a`, `burn_asset = index`): a `BridgeBurn` or a
+    /// `TokenBurn`. `index` is the same as [`Submission::asset`], carried here too so a burn
+    /// describes itself.
     Asset { index: u32, amount: u64 },
 }
 
@@ -736,8 +793,7 @@ impl Burn {
         }
     }
 
-    /// The `burn` word a bundle carries for this, in that bundle's own asset: zero when nothing
-    /// is burned.
+    /// The units burned, zero when nothing is.
     pub fn units(self) -> u64 {
         match self {
             Burn::None => 0,
@@ -748,8 +804,11 @@ impl Burn {
 
 /// What a submitted transaction did, for the caller to print.
 ///
-/// For a burn of a token, `amount` is what left the pool (the burn), `change` what came back as a
-/// note, `asset` the index both are denominated in. `fee` is always the RAND the bundle paid.
+/// `amount`, `change` and `asset` describe the bundle's asset slots: for a RAND transfer, a bond,
+/// a deploy or a call that is RAND (and `change` is all the RAND that came back); for a token
+/// transfer or a burn it is the token — `amount` what was paid or burned, `change` what came back
+/// as a note of it — and `rand_change` is what came back from the RAND slots that paid the fee.
+/// `fee` is always RAND.
 #[derive(Clone, Debug)]
 pub struct Submission {
     pub hash: Hash,
@@ -760,6 +819,9 @@ pub struct Submission {
     pub burn: Burn,
     pub time: u32,
     pub asset: u32,
+    /// RAND change from the fee slots when `asset` is a token; zero when `asset` is RAND, whose
+    /// change is `change`.
+    pub rand_change: u64,
     pub tier: u8,
     pub proof_bytes: usize,
     pub proving: Duration,
@@ -772,22 +834,26 @@ impl Submission {
     /// Here rather than in `main` so that the one line a user reads after paying for a proof is
     /// covered by a test.
     pub fn summary(&self, what: &str) -> String {
-        // A bridge burn's figures are its asset bundle's, in that asset's own units; everything
-        // else moves RAND. The fee is always RAND.
-        let (out, change) = if self.asset == 0 {
-            (format!("{} RAND", format_amount(self.amount)), format!("{} RAND", format_amount(self.change)))
+        // A token's figures are in that token's own units; everything else moves RAND. The fee
+        // is always RAND, and so is the change of the slots that paid it.
+        let (out, change, fee_change) = if self.asset == 0 {
+            (format!("{} RAND", format_amount(self.amount)), format!("{} RAND", format_amount(self.change)), String::new())
         } else {
-            (format!("{} of asset {}", self.amount, self.asset), format!("{} of asset {}", self.change, self.asset))
+            (
+                format!("{} of asset {}", self.amount, self.asset),
+                format!("{} of asset {}", self.change, self.asset),
+                format!(", {} RAND change", format_amount(self.rand_change)),
+            )
         };
         // What left the pool without becoming anybody's note. A bond's stake is RAND and says
-        // so. A bridge burn's is the `out` figure above — the same number in the same units,
+        // so. A token burn's is the `out` figure above — the same number in the same units,
         // already printed — and repeating it would only raise the question of why two lines agree.
         let burned = match self.burn {
             Burn::None | Burn::Asset { .. } => String::new(),
             Burn::Rand(amount) => format!("{} RAND burned, ", format_amount(amount)),
         };
         format!(
-            "submitted {what} {}\n  {out} out, {burned}{change} change, fee {} RAND, anchored at height {}",
+            "submitted {what} {}\n  {out} out, {burned}{change} change, fee {} RAND{fee_change}, anchored at height {}",
             self.hash,
             format_amount(self.fee),
             self.time,
@@ -795,52 +861,158 @@ impl Submission {
     }
 }
 
-/// One bundle of a transaction as the wallet plans it, before any witness or proof: the notes it
-/// spends, the payment its first output carries, and the three words that say what kind of bundle
-/// it is.
+/// Who an output slot pays.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Payee {
+    /// Someone else (or this wallet by its address): a payment.
+    To(ShieldedAddress),
+    /// This wallet: change.
+    Me,
+    /// Nobody: a zero-value dummy whose envelope is sealed to a throwaway key, so it opens to no
+    /// one, the sender included.
+    Nobody,
+}
+
+/// One hidden-asset bundle as the wallet plans it, before any witness or proof: the notes each
+/// group spends and what each output slot pays.
 ///
-/// Still the two-slot, one-asset plan of the retired bundle: the hidden-asset bundle (four slots,
-/// a private asset in slots 0–1 and RAND in 2–3, one bundle per transaction) needs a plan across
-/// two assets, which is H5's (`docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`
-/// §7). Until then [`prepare_one`] refuses to build a bundle from it, and the payment fields are
-/// not read — H5's planner reads them again.
-#[allow(dead_code)]
-struct Plan {
-    /// One or two notes, all of `asset`; a second slot the wallet does not need becomes a dummy.
-    chosen: Vec<OwnedNote>,
-    dest: ShieldedAddress,
-    amount: u64,
-    fee: u64,
-    burn: u64,
+/// Slots 0–1 carry the bundle's private asset `A` ([`Plan::asset`]); slots 2–3 carry RAND and pay
+/// the fee. A bundle whose asset is RAND itself (`A = 0`: a RAND payment, a bond, a deploy, a
+/// call) keeps today's shape — the value and the fee both in slots 2–3, slots 0–1 dummies (spec
+/// §3.1) — so it can spend two RAND notes, as before. A token bundle spends up to two notes of
+/// the token in slots 0–1 and up to two RAND notes for the fee in slots 2–3.
+#[derive(Clone, Debug)]
+pub(crate) struct Plan {
     asset: u32,
-    /// `amount + fee + burn` — what the chosen notes had to cover.
-    need: u64,
+    /// The notes of `asset` spent in slots 0–1: empty when `asset` is RAND.
+    a_notes: Vec<OwnedNote>,
+    /// The RAND notes spent in slots 2–3.
+    r_notes: Vec<OwnedNote>,
+    /// The payment, if the bundle pays anyone: the recipient and the amount, in `asset`.
+    to: Option<(ShieldedAddress, u64)>,
+    fee: u64,
+    /// Burned from the asset's slots (`asset` must then be a token).
+    burn_a: u64,
+    /// RAND burned from slots 2–3.
+    burn_r: u64,
+}
+
+/// What [`Plan::select`] is asked for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Spend<'a> {
+    /// The asset of slots 0–1: 0 for RAND, otherwise a token's registry index.
+    pub asset: u32,
+    /// The payment, in `asset`; `None` for a bundle that pays nobody (a deploy, a bond, a burn).
+    pub to: Option<(&'a ShieldedAddress, u64)>,
+    pub fee: u64,
+    pub burn_a: u64,
+    pub burn_r: u64,
 }
 
 impl Plan {
-    /// Select the notes of one asset that cover what this bundle pays out. A bundle that pays
-    /// nobody inside the pool (a deploy, a call, a burn) sends zero to this wallet's own address,
-    /// which is what `dest = &w.address, amount = 0` means.
+    /// Select both groups' notes in one plan, largest-first and at most two per group
+    /// ([`select_inputs`]).
     ///
-    /// Only ever one asset's notes: RAND cannot pay a burn of a bridged asset, nor the reverse,
-    /// and a bundle balances one asset (`NoteStore::spendable_of`).
-    fn select(
-        store: &NoteStore,
-        asset: u32,
-        dest: &ShieldedAddress,
-        amount: u64,
-        fee: u64,
-        burn: u64,
-    ) -> Result<Plan> {
-        let need = bundle_need(amount, fee, burn)?;
-        let chosen = select_inputs(&store.spendable_of(asset), need)?;
-        Ok(Plan { chosen, dest: dest.clone(), amount, fee, burn, asset, need })
+    /// The fee is RAND, always (spec §3.9): a token bundle whose wallet holds no spendable RAND is
+    /// refused here, with the reason, before anything is proved.
+    pub(crate) fn select(store: &NoteStore, spend: Spend<'_>) -> Result<Plan> {
+        let Spend { asset, to, fee, burn_a, burn_r } = spend;
+        let amount = to.map_or(0, |(_, a)| a);
+        let (a_notes, r_notes) = if asset == 0 {
+            // RAND is burned through `burn_r` only; the ledger refuses a RAND `burn_a`
+            // (`NonCanonicalRandBurn`), so a plan that asked for one is this wallet's bug.
+            if burn_a != 0 {
+                return Err(anyhow!("a RAND burn goes through burn_r, never burn_a"));
+            }
+            let need = bundle_need(amount, fee, burn_r)?;
+            (Vec::new(), select_inputs(&store.spendable_of(0), need)?)
+        } else {
+            let need_a = bundle_need(amount, 0, burn_a)?;
+            if need_a == 0 {
+                return Err(anyhow!("a bundle of asset {asset} that neither pays nor burns any of it"));
+            }
+            let need_r = bundle_need(0, fee, burn_r)?;
+            let rand = store.spendable_of(0);
+            if rand.is_empty() && need_r > 0 {
+                return Err(anyhow!(
+                    "a transfer pays its fee in RAND, and this wallet holds no spendable RAND: \
+                     receive some RAND (on a testnet, `rand faucet`) and retry"
+                ));
+            }
+            let a_notes = select_inputs(&store.spendable_of(asset), need_a).map_err(|e| anyhow!("asset {asset}: {e}"))?;
+            let r_notes = select_inputs(&rand, need_r).map_err(|e| anyhow!("the RAND fee: {e}"))?;
+            (a_notes, r_notes)
+        };
+        Ok(Plan { asset, a_notes, r_notes, to: to.map(|(d, a)| (d.clone(), a)), fee, burn_a, burn_r })
     }
 
-    /// What comes back as this wallet's own note: everything the inputs held over `need`.
-    fn change(&self) -> u64 {
-        self.chosen.iter().map(|n| n.note.amount).sum::<u64>() - self.need
+    fn amount(&self) -> u64 {
+        self.to.as_ref().map_or(0, |(_, a)| *a)
     }
+
+    /// Every note this bundle spends, slot order: the asset's, then RAND's.
+    fn inputs(&self) -> impl Iterator<Item = &OwnedNote> {
+        self.a_notes.iter().chain(&self.r_notes)
+    }
+
+    /// The asset change (slots 0–1). Zero for a RAND bundle, whose change is all [`Plan::change_r`].
+    fn change_a(&self) -> u64 {
+        if self.asset == 0 {
+            return 0;
+        }
+        let have: u64 = self.a_notes.iter().map(|n| n.note.amount).sum();
+        have - self.amount() - self.burn_a
+    }
+
+    /// The RAND change (slots 2–3).
+    fn change_r(&self) -> u64 {
+        let have: u64 = self.r_notes.iter().map(|n| n.note.amount).sum();
+        let paid_here = if self.asset == 0 { self.amount() } else { 0 };
+        have - paid_here - self.fee - self.burn_r
+    }
+
+    /// What each output slot pays, and how much. A zero amount is a dummy sealed to nobody —
+    /// including a change of exactly zero, which is worth nothing to keep.
+    fn outputs(&self) -> [(Payee, u64); SLOTS] {
+        let pay = |amount: u64| match &self.to {
+            Some((dest, _)) if amount > 0 => (Payee::To(dest.clone()), amount),
+            _ => (Payee::Nobody, 0),
+        };
+        let mine = |amount: u64| if amount > 0 { (Payee::Me, amount) } else { (Payee::Nobody, 0) };
+        if self.asset == 0 {
+            [(Payee::Nobody, 0), (Payee::Nobody, 0), pay(self.amount()), mine(self.change_r())]
+        } else {
+            [pay(self.amount()), mine(self.change_a()), mine(self.change_r()), (Payee::Nobody, 0)]
+        }
+    }
+
+    /// The fields a [`Submission`] reports for this plan.
+    fn report(&self, hash: Hash, burn: Burn, time: u32, proved: &Proved) -> Submission {
+        let (amount, change, rand_change) = match burn {
+            // A token burn's figures are the token's: what left the pool, and what came back.
+            Burn::Asset { amount, .. } => (amount, self.change_a(), self.change_r()),
+            _ if self.asset == 0 => (self.amount(), self.change_r(), 0),
+            _ => (self.amount(), self.change_a(), self.change_r()),
+        };
+        Submission {
+            hash,
+            amount,
+            change,
+            fee: self.fee,
+            burn,
+            time,
+            asset: self.asset,
+            rand_change,
+            tier: proved.tier,
+            proof_bytes: proved.proof.len(),
+            proving: proved.proving,
+        }
+    }
+}
+
+/// A fresh random word: a blinding `r`.
+fn fresh_word() -> Word8 {
+    SpendKey::random().0
 }
 
 /// A planned bundle with its witness built, its outputs chosen and its envelopes sealed — every
@@ -848,18 +1020,16 @@ impl Plan {
 ///
 /// A bundle is proved only once the whole transaction around it exists (Task 5b): its proof
 /// carries [`Transaction::binding`] as its public input segment, and the binding covers every
-/// field of the transaction except the proofs — the action, both bundles' envelopes, the chain
-/// id. So the wallet builds the transaction from these first, takes its binding, and then proves
-/// each bundle with it ([`Prepared::prove`]).
+/// field of the transaction except the proof — the action, the four envelopes, the chain id. So
+/// the wallet builds the transaction from this first, takes its binding, and then proves the
+/// bundle with it ([`Prepared::prove`]).
 struct Prepared {
     /// The bundle, `proof` empty.
     bundle: Bundle,
-    /// The guest's private inputs (`hidden::hidden_bundle_inputs`, from H5 on).
+    /// The guest's private inputs (`hidden::hidden_bundle_inputs`).
     words: Vec<u32>,
     /// The digest this wallet computed from its own plaintext, which the proof must publish.
     expected: Word8,
-    /// How the progress line names this bundle ("bundle", "bundle 1 of 2").
-    which: String,
 }
 
 /// One bundle's proof, made against its transaction's binding.
@@ -869,102 +1039,185 @@ struct Proved {
     proving: Duration,
 }
 
+/// The guest taints its digest instead of failing when a witness violates the relation, so a
+/// proof that does not publish the digest this wallet computed from its own plaintext is a bug in
+/// this wallet — not something the node would explain, since the node only ever sees a digest
+/// that matches no plaintext.
+fn check_published_digest(digest: &Word8, expected: &Word8) -> Result<()> {
+    if digest != expected {
+        return Err(anyhow!(
+            "the bundle proof published digest {} but this wallet built {} — refusing to submit (wallet bug)",
+            word8_to_hex(digest),
+            word8_to_hex(expected),
+        ));
+    }
+    Ok(())
+}
+
 impl Prepared {
     /// Prove this bundle with `binding` — the [`Transaction::binding`] of the transaction it has
-    /// already been placed in — as the public input segment. Every bundle of one transaction is
-    /// proved with the same words; the chain recomputes them from the transaction it receives and
-    /// refuses a proof made for any other.
+    /// already been placed in — as the public input segment. The chain recomputes the binding from
+    /// the transaction it receives and refuses a proof made for any other.
     fn prove(&self, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, backend: Backend) -> Result<Proved> {
-        eprintln!("proving {} (tier 14; about a minute on a laptop)…", self.which);
+        eprintln!("proving the bundle (tier 14; about a minute and a half on a laptop)…");
         let started = Instant::now();
-        let (proof, digest, tier) =
-            prove_bundle(profile, &self.words, binding, backend).map_err(|e| anyhow!("proving the bundle failed: {e}"))?;
+        let (proof, digest, tier) = prove_hidden_bundle(profile, &self.words, binding, backend)
+            .map_err(|e| anyhow!("proving the bundle failed: {e}"))?;
         let proving = started.elapsed();
         eprintln!("proved in {proving:.1?}: tier {tier}, {} bytes", proof.len());
-        // The guest taints its digest instead of failing when a witness violates the relation, so
-        // a proof that does not publish the digest this wallet computed from its own plaintext is
-        // a bug in this wallet — not something the node would explain, since the node only ever
-        // sees a digest that matches no plaintext.
-        if digest != self.expected {
-            return Err(anyhow!(
-                "the bundle proof published digest {} but this wallet built {} — refusing to submit (wallet bug)",
-                word8_to_hex(&digest),
-                word8_to_hex(&self.expected),
-            ));
-        }
+        check_published_digest(&digest, &self.expected)?;
         Ok(Proved { proof, tier, proving })
     }
 }
 
-/// Builds every bundle of one transaction — witnesses, outputs, envelopes, everything but the
-/// proofs — and returns them in order, with the `time` they all carry. Proving is the caller's
-/// next step, once it has placed them in the transaction ([`Prepared::prove`]).
-///
-/// One anchor for all of them, and one witness per real input folded against it. A witness is
-/// folded against the tree's *current* root, so a leaf appended between the calls makes the
-/// witness prove membership in a tree the anchor does not name — and the bundle would be rejected
-/// as `UnknownAnchor` or fail `MERKLE_VERIFY`. Refetching all of it together is the fix; three
-/// attempts is enough unless the chain is committing notes faster than this wallet can read them.
-async fn prepare_bundles(rpc: &RpcClient, w: &Wallet, plans: &[Plan]) -> Result<(Vec<Prepared>, u32)> {
-    let mut attempt = 0;
-    let (height, root, paths) = loop {
-        attempt += 1;
-        let (height, root) = rpc.anchor(None).await?;
-        let mut paths: Vec<Vec<[Word8; DEPTH]>> = Vec::with_capacity(plans.len());
-        let mut moved = false;
-        for plan in plans {
-            let mut bundle_paths = Vec::with_capacity(plan.chosen.len());
-            for n in &plan.chosen {
-                let (witness_root, path) = rpc.witness(n.index).await?;
-                if witness_root != root {
-                    moved = true;
-                    break;
-                }
-                bundle_paths.push(path);
-            }
-            if moved {
-                break;
-            }
-            paths.push(bundle_paths);
-        }
-        if !moved {
-            break (height, root, paths);
-        }
-        if attempt >= 3 {
-            return Err(anyhow!("tree moved; retry"));
-        }
-    };
-    let time = u32::try_from(height).map_err(|_| anyhow!("chain height {height} does not fit a bundle's time field"))?;
-
-    let mut prepared = Vec::with_capacity(plans.len());
-    for (i, (plan, paths)) in plans.iter().zip(&paths).enumerate() {
-        let which = if plans.len() > 1 { format!("bundle {} of {}", i + 1, plans.len()) } else { "bundle".to_string() };
-        prepared.push(prepare_one(w, plan, paths, root, time, which)?);
-    }
-    Ok((prepared, time))
+/// How a submission proves its bundle: the real prover at the chain's profile, or — in unit
+/// tests — the guest run in the emulator, whose digest is checked exactly as a proof's is.
+#[derive(Clone, Copy)]
+enum Proving {
+    Real(FriProfile, Backend),
+    #[cfg(test)]
+    Emulated,
 }
 
-/// One planned bundle, everything but its proof: the slots, the outputs, the expected digest and
-/// the envelopes. The envelopes are sealed against the output notes, never the proof, so they
-/// exist before it — which is what lets the transaction binding cover them.
+impl Proving {
+    fn prove(self, prepared: &Prepared, binding: &[u32; TX_BINDING_WORDS]) -> Result<Proved> {
+        match self {
+            Proving::Real(profile, backend) => prepared.prove(binding, profile, backend),
+            #[cfg(test)]
+            Proving::Emulated => tests::emulated_proof(prepared, binding),
+        }
+    }
+}
+
+/// Builds the one bundle of a transaction — witness, outputs, envelopes, everything but the proof
+/// — from a plan, the anchor, one Merkle path per spent note (in [`Plan::inputs`] order, folded
+/// against `anchor`) and the bundle's `time`. No I/O.
 ///
-/// **Not built yet for the hidden-asset bundle** (chain 14): the wallet's four-slot, two-asset
-/// witness and its four envelopes are H5's. Until then this refuses — clearly, before any proof
-/// is paid for — rather than build a two-slot witness the chain's guest would never accept.
-fn prepare_one(
-    _w: &Wallet,
-    plan: &Plan,
-    _paths: &[[Word8; DEPTH]],
-    _root: Word8,
-    _time: u32,
-    _which: String,
-) -> Result<Prepared> {
-    Err(anyhow!(
-        "building a hidden-asset bundle (asset {}, burn {}) is rebuilt in H5: this wallet cannot \
-         send on the four-slot bundle yet",
-        plan.asset,
-        plan.burn
-    ))
+/// Every slot the plan does not fill is a dummy: a zero-value input under this wallet's own key
+/// and a zero-value output to a throwaway key, **each with a fresh blinding** — two identical
+/// dummies would repeat a nullifier or a commitment and taint the proof (spec §3.3), and a
+/// repeated one across transactions would be refused as spent. Every output envelope is sealed
+/// under its own fresh transaction key.
+fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]], time: u32) -> Result<Prepared> {
+    let pk_self = w.vk.pk();
+    let asset = plan.asset;
+    if paths.len() != plan.inputs().count() {
+        return Err(anyhow!("{} Merkle paths for {} spent notes", paths.len(), plan.inputs().count()));
+    }
+    let mut paths = paths.iter();
+    let mut slot_input = |k: usize, spent: Option<&OwnedNote>| -> Result<(Note, [Word8; DEPTH], u32)> {
+        match spent {
+            Some(n) => {
+                // The guest stages every input under this key; a note owned by any other would
+                // nullify a note that is not the one this wallet holds (and the builder panics).
+                if n.note.pk != pk_self {
+                    return Err(anyhow!("note {} is not owned by this wallet's key", n.index));
+                }
+                let index = u32::try_from(n.index).map_err(|_| anyhow!("leaf index {} does not fit the witness", n.index))?;
+                Ok((n.note, *paths.next().expect("counted above"), index))
+            }
+            None => Ok((Note::new(pk_self, [0; 8], 0, hidden::slot_asset(k, asset), time), [[0; 8]; DEPTH], 0)),
+        }
+    };
+    let inputs: [(Note, [Word8; DEPTH], u32); SLOTS] = [
+        slot_input(0, plan.a_notes.first())?,
+        slot_input(1, plan.a_notes.get(1))?,
+        slot_input(2, plan.r_notes.first())?,
+        slot_input(3, plan.r_notes.get(1))?,
+    ];
+    debug_assert!(A_SLOTS == 2 && SLOTS == 4, "the slot layout this builder fills");
+
+    let mut outs = [HiddenOutput { pk: [0; 8], amount: 0, r: [0; 8] }; SLOTS];
+    let mut envelopes: Vec<Envelope> = Vec::with_capacity(SLOTS);
+    let mut commitments = [[0u32; 8]; SLOTS];
+    for (k, (payee, amount)) in plan.outputs().into_iter().enumerate() {
+        // The throwaway key a dummy is sealed to — and owned by — exists only for this call.
+        let nobody = matches!(payee, Payee::Nobody).then(Wallet::generate);
+        let pk = match (&payee, &nobody) {
+            (Payee::To(dest), _) => dest.pk,
+            (Payee::Me, _) => pk_self,
+            (Payee::Nobody, Some(t)) => t.vk.pk(),
+            (Payee::Nobody, None) => unreachable!("a throwaway key for every dummy"),
+        };
+        outs[k] = HiddenOutput { pk, amount, r: fresh_word() };
+        let note = outs[k].note(k, pk_self, asset, time);
+        commitments[k] = note.commitment();
+        let key = TxKey::random();
+        let sealed = match (&payee, &nobody) {
+            (Payee::To(dest), _) => seal_note(&w.vk, dest, &note, &key),
+            (Payee::Me, _) => seal_note(&w.vk, &w.address, &note, &key),
+            (Payee::Nobody, Some(t)) => seal_note(&t.vk, &t.address, &note, &key),
+            (Payee::Nobody, None) => unreachable!("a throwaway key for every dummy"),
+        };
+        envelopes.push(sealed.map_err(|e| anyhow!("sealing output {k}'s envelope: {e}"))?);
+    }
+    let nullifiers: [Word8; SLOTS] = std::array::from_fn(|k| w.vk.nullifier(&inputs[k].0.commitment()));
+    // The ledger refuses a repeated nullifier or commitment and the guest taints on one; with a
+    // fresh blinding per slot neither can happen, so one here is a bug worth stopping on before
+    // a proof is paid for.
+    for i in 0..SLOTS {
+        for j in i + 1..SLOTS {
+            if nullifiers[i] == nullifiers[j] || commitments[i] == commitments[j] {
+                return Err(anyhow!("slots {i} and {j} repeat a nullifier or a commitment (wallet bug)"));
+            }
+        }
+    }
+    let burn_asset = if plan.burn_a != 0 { asset } else { 0 };
+    let expected = hidden::hidden_bundle_digest(&HiddenDigestInput {
+        anchor,
+        nullifiers,
+        commitments,
+        fee: plan.fee,
+        burn_a: plan.burn_a,
+        burn_r: plan.burn_r,
+        burn_asset,
+        time,
+    });
+    let words = hidden::hidden_bundle_inputs(&w.sk, &inputs, &outs, anchor, plan.fee, plan.burn_a, plan.burn_r, asset, time);
+    let envelopes: [Envelope; SLOTS] = envelopes.try_into().map_err(|_| anyhow!("four envelopes"))?;
+    let bundle = Bundle {
+        anchor,
+        nullifiers,
+        commitments,
+        fee: plan.fee,
+        burn_a: plan.burn_a,
+        burn_r: plan.burn_r,
+        burn_asset,
+        time,
+        envelopes,
+        proof: Vec::new(),
+    };
+    Ok(Prepared { bundle, words, expected })
+}
+
+/// Fetches the anchor and a witness for every spent note, then builds the bundle
+/// ([`build_bundle`]), returning it with the `time` it carries.
+///
+/// One anchor, and every witness folded against it. A witness is folded against the tree's
+/// *current* root, so a leaf appended between the calls makes the witness prove membership in a
+/// tree the anchor does not name — and the bundle would be rejected as `UnknownAnchor` or taint.
+/// Refetching all of it together is the fix; three attempts is enough unless the chain is
+/// committing notes faster than this wallet can read them.
+async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, plan: &Plan) -> Result<(Prepared, u32)> {
+    let mut attempt = 0;
+    let (height, root, paths) = 'fetch: loop {
+        attempt += 1;
+        let (height, root) = rpc.anchor(None).await?;
+        let mut paths = Vec::with_capacity(SLOTS);
+        for n in plan.inputs() {
+            let (witness_root, path) = rpc.witness(n.index).await?;
+            if witness_root != root {
+                if attempt >= 3 {
+                    return Err(anyhow!("tree moved; retry"));
+                }
+                continue 'fetch;
+            }
+            paths.push(path);
+        }
+        break (height, root, paths);
+    };
+    let time = u32::try_from(height).map_err(|_| anyhow!("chain height {height} does not fit a bundle's time field"))?;
+    Ok((build_bundle(w, plan, root, &paths, time)?, time))
 }
 
 /// Prove `tx`'s one bundle against `tx`'s own binding, in place. The binding is taken with the
@@ -990,7 +1243,7 @@ async fn settle(
     w: &Wallet,
     store: &mut NoteStore,
     hash: &Hash,
-    plans: &[Plan],
+    plan: &Plan,
     time: u32,
     wait: bool,
 ) -> Result<()> {
@@ -1007,7 +1260,7 @@ async fn settle(
         // spent: `pending` keeps them out of coin selection without the one-way write that
         // stranded them when a bundle failed to commit. The next `scan` decides which it was.
         for n in store.notes.iter_mut() {
-            if plans.iter().any(|p| p.chosen.iter().any(|c| c.index == n.index)) {
+            if plan.inputs().any(|c| c.index == n.index) {
                 n.pending = Some(time);
             }
         }
@@ -1015,15 +1268,44 @@ async fn settle(
     Ok(())
 }
 
-/// Everything that rides on one bundle goes through here: a transfer (`to = Some(..)`), a deploy,
-/// a call, a bond or a bridge attestation (`to = None`, i.e. a self-transfer of zero whose only
-/// purpose is to pay the action's fee floor — and, for a bond, to burn the stake). One code path,
-/// so the fee, the anchor, the witnesses and the digest check cannot drift apart between them.
+/// Every bundle-carrying submission goes through here: scan, plan both groups, fetch the anchor
+/// and the witnesses, build the bundle, assemble the transaction with the proof empty, take its
+/// binding, prove against it, fill the proof in, submit. One code path, so the fee, the anchor,
+/// the witnesses and the digest check cannot drift apart between a transfer, a bond, a deploy, a
+/// call, an attestation and a burn.
+#[allow(clippy::too_many_arguments)]
+async fn submit_spend(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    spend: Spend<'_>,
+    action: Action,
+    burn: Burn,
+    proving: Proving,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    scan(rpc, w, store).await?;
+    let plan = Plan::select(store, spend)?;
+    let (prepared, time) = prepare_bundle(rpc, w, &plan).await?;
+    // The whole transaction first, its bundle's proof empty; then the proof, bound to it. Nothing
+    // is set on the transaction after the proof but the proof itself.
+    let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), action);
+    let proved = prove_transaction(&mut tx, &prepared, &|p, b| proving.prove(p, b))?;
+    let hash = rpc.send_transaction(&tx).await?;
+    settle(rpc, w, store, &hash, &plan, time, wait).await?;
+    Ok(plan.report(hash, burn, time, &proved))
+}
+
+/// A RAND-paying bundle for any action: a transfer (`to = Some(..)`), a deploy, a call, a bond or
+/// a bridge attestation (`to = None`: the bundle pays nobody and exists to pay the action's fee
+/// floor — and, for a bond, to burn the stake). The bundle's asset is RAND, so its value and fee
+/// share slots 2–3 and slots 0–1 are dummies.
 ///
 /// `burn` is what the bundle takes out of the shielded pool, which a `Bond` must set to the staked
-/// amount (`Ledger::validate_inner` rejects a bond whose bundle burns anything else) and every
-/// other action leaves at [`Burn::None`]. A burn of a *bridged* asset is not this path, so
-/// [`Burn::Asset`] is an error here and goes through [`submit_burn`].
+/// amount (`burn_r`; the ledger refuses a bond whose bundle burns anything else) and every other
+/// action here leaves at [`Burn::None`]. A burn of a *token* is not this path, so [`Burn::Asset`]
+/// is an error here: it is [`submit_burn`] or [`submit_token_burn`].
 #[allow(clippy::too_many_arguments)]
 pub async fn submit(
     rpc: &RpcClient,
@@ -1038,40 +1320,36 @@ pub async fn submit(
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    // The transaction's own bundle is always RAND, so this path can burn only RAND. Answered
-    // before the chain is asked anything: a caller holding notes of a bridged asset is one
-    // function away from what it meant, and a proof away from finding out the hard way.
+    submit_with(rpc, w, store, to, action, fee, burn, Proving::Real(profile, backend), chain_id, wait).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_with(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    to: Option<(&ShieldedAddress, u64)>,
+    action: Action,
+    fee: u64,
+    burn: Burn,
+    proving: Proving,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    // This path burns only RAND. Answered before the chain is asked anything: a caller holding
+    // notes of a token is one function away from what it meant, and a proof away from finding out
+    // the hard way.
     let burn = match burn {
         Burn::Rand(amount) => Burn::rand(amount),
         Burn::None => Burn::None,
         Burn::Asset { index, amount } => {
-            return Err(anyhow!("burning {amount} of asset {index} is a bridge burn: that is `submit_burn`, not `submit`"))
+            return Err(anyhow!(
+                "burning {amount} of asset {index} is a token burn: that is `submit_burn` or `submit_token_burn`, not `submit`"
+            ))
         }
     };
-    scan(rpc, w, store).await?;
-    let (dest, amount) = to.unwrap_or((&w.address, 0));
-    let plans = [Plan::select(store, 0, dest, amount, fee, burn.units())?];
-    let (prepared, time) = prepare_bundles(rpc, w, &plans).await?;
-    let [one] = <[Prepared; 1]>::try_from(prepared).ok().expect("one plan, one bundle");
-
-    // The whole transaction first, its bundle's proof empty; then the proof, bound to it.
-    let mut tx = Transaction::shielded(chain_id, one.bundle.clone(), action);
-    let one = prove_transaction(&mut tx, &one, &|p, b| p.prove(b, profile, backend))?;
-    let proof_bytes = one.proof.len();
-    let hash = rpc.send_transaction(&tx).await?;
-    settle(rpc, w, store, &hash, &plans, time, wait).await?;
-    Ok(Submission {
-        hash,
-        amount,
-        change: plans[0].change(),
-        fee,
-        burn,
-        time,
-        asset: 0,
-        tier: one.tier,
-        proof_bytes,
-        proving: one.proving,
-    })
+    let spend = Spend { asset: 0, to, fee, burn_a: 0, burn_r: burn.units() };
+    submit_spend(rpc, w, store, spend, action, burn, proving, chain_id, wait).await
 }
 
 /// The four facts about the chain a burn needs before any proving: the chain has a bridge at
@@ -1161,50 +1439,132 @@ fn burn_is_possible(
     Ok(())
 }
 
-/// Burn `amount` of a bridged asset to `to_chain`/`to` (spec §10) — on the hidden-asset bundle a
-/// single bundle that spends the asset in its slots 0–1 (`burn_a == amount`,
-/// `burn_asset == asset`) and pays the RAND fee from slots 2–3.
+/// Burn `amount` of a bridged asset to `to_chain`/`to` (spec §10): one hidden-asset bundle that
+/// spends the asset in its slots 0–1 and burns exactly `amount` of it (`burn_a == amount`,
+/// `burn_asset == asset`, `burn_r == 0`), paying the RAND fee from slots 2–3.
 ///
-/// **The proving half is rebuilt in H5.** What runs today is everything that can refuse a burn
-/// before a proof is paid for — the definitional checks and one read of the chain
-/// ([`burn_is_possible`]) — and then a clear error: no transaction is built or submitted.
+/// Everything that can refuse a burn before a proof is paid for runs first: the definitional
+/// checks, then one read of the chain ([`burn_is_possible`] — the bridge, the registry, the
+/// backing, the release unit and the locked amount), then note selection, which refuses a wallet
+/// without the asset or without RAND for the fee.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_burn(
     rpc: &RpcClient,
-    _w: &Wallet,
-    _store: &mut NoteStore,
+    w: &Wallet,
+    store: &mut NoteStore,
     asset: u32,
     amount: u64,
     relayer_fee: u64,
     to_chain: u16,
     token: [u8; 32],
-    _to: [u8; 32],
-    _fee: u64,
-    _profile: FriProfile,
-    _backend: Backend,
-    _chain_id: u64,
-    _wait: bool,
+    to: [u8; 32],
+    fee: u64,
+    profile: FriProfile,
+    backend: Backend,
+    chain_id: u64,
+    wait: bool,
 ) -> Result<Submission> {
+    let burn = BurnRequest { asset, amount, relayer_fee, to_chain, token, to };
+    submit_burn_with(rpc, w, store, burn, fee, Proving::Real(profile, backend), chain_id, wait).await
+}
+
+/// [`submit_burn`]'s arguments that become the action.
+#[derive(Clone, Copy, Debug)]
+struct BurnRequest {
+    asset: u32,
+    amount: u64,
+    relayer_fee: u64,
+    to_chain: u16,
+    token: [u8; 32],
+    to: [u8; 32],
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_burn_with(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    burn: BurnRequest,
+    fee: u64,
+    proving: Proving,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    let BurnRequest { asset, amount, relayer_fee, to_chain, token, to } = burn;
     if asset == 0 {
         return Err(anyhow!("asset 0 is RAND, which is not a bridged asset and cannot be burned"));
     }
     // The bridge owns the rest of a burn's rules (`BridgeState::check_burn`: the destination must be
     // the asset's own chain, the recipient must be shaped for it) and this wallet deliberately does
     // not restate them. These two are the exception, because they are definitional rather than
-    // policy and because the alternative is a bundle proof — minutes of a laptop — thrown away
-    // on a typo.
+    // policy and because the alternative is a bundle proof — a minute and a half of a laptop —
+    // thrown away on a typo.
     if amount == 0 {
         return Err(anyhow!("a burn of zero moves nothing"));
     }
     if relayer_fee > amount {
         return Err(anyhow!("the relayer fee {relayer_fee} is more than the {amount} being burned"));
     }
-    // One read of the chain, before any proving, for the three facts only the chain knows —
-    // the coin's locked amount among them, since one token's backings are held apart.
+    // One read of the chain, before any proving, for the facts only the chain knows — the coin's
+    // release unit and its locked amount among them, since one token's backings are held apart.
     burn_is_possible(&rpc.bridge_state().await?, asset, to_chain, &token, amount, relayer_fee)?;
-    Err(anyhow!(
-        "a bridge burn on the hidden-asset bundle is rebuilt in H5: this wallet cannot prove one yet"
-    ))
+    let action = Action::BridgeBurn { asset, amount, relayer_fee, to_chain, token, to };
+    let spend = Spend { asset, to: None, fee, burn_a: amount, burn_r: 0 };
+    submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, proving, chain_id, wait).await
+}
+
+/// Burn `amount` of token `asset` held in this wallet (`Action::TokenBurn`, RPL spec §4): the
+/// token's public `total_supply` drops by exactly that. One hidden-asset bundle, shaped like a
+/// bridge burn's (`burn_a == amount`, `burn_asset == asset`, `burn_r == 0`, the RAND fee from
+/// slots 2–3).
+///
+/// Refused before any proof: RAND (which burns through `burn_r`, by a bond), a burn of zero, and a
+/// *bridged* token — its supply moves only with one of its backings, so it leaves through
+/// `rand bridge-burn`, which names the coin being released (`TokenError::BridgedToken`); the
+/// bridged tokens are the rows `rand_getAssets` lists. An index nothing was ever minted under has
+/// no notes here to burn, so note selection refuses it too.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_token_burn(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    asset: u32,
+    amount: u64,
+    fee: u64,
+    profile: FriProfile,
+    backend: Backend,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    submit_token_burn_with(rpc, w, store, asset, amount, fee, Proving::Real(profile, backend), chain_id, wait).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_token_burn_with(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    asset: u32,
+    amount: u64,
+    fee: u64,
+    proving: Proving,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    if asset == 0 {
+        return Err(anyhow!("asset 0 is RAND, which is not a token: RAND leaves the pool by a bond, not a burn"));
+    }
+    if amount == 0 {
+        return Err(anyhow!("a burn of zero moves nothing"));
+    }
+    if rpc.assets().await?.iter().any(|a| a.index == asset) {
+        return Err(anyhow!(
+            "asset {asset} is a bridged token: its supply leaves through `rand bridge-burn`, which names the coin released"
+        ));
+    }
+    let action = Action::TokenBurn { asset, amount };
+    let spend = Spend { asset, to: None, fee, burn_a: amount, burn_r: 0 };
+    submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, proving, chain_id, wait).await
 }
 
 /// The facts a deploy needs from the chain before any proving: whether `words` code words fit this
@@ -1502,7 +1862,28 @@ pub fn deposit_note_for(
     Ok((note, envelope))
 }
 
-/// A plain shielded transfer: `submit` with `Action::None`.
+/// `--asset`: a registry index as a number (0 is RAND), or a token's id — its `rpl1…` text form or
+/// 64 hex — which only the node can turn into an index, through `rand_getToken` (bridge-hardening
+/// spec §8). A node without that method is told to take the index instead.
+pub async fn resolve_asset(rpc: &RpcClient, text: &str) -> Result<u32> {
+    if let Ok(index) = text.parse::<u32>() {
+        return Ok(index);
+    }
+    let reply = rpc.call("rand_getToken", serde_json::json!([text])).await.map_err(|e| {
+        if crate::is_method_not_found(&e) {
+            anyhow!("this node cannot resolve a token id (it has no rand_getToken); pass the token's registry index instead")
+        } else {
+            e
+        }
+    })?;
+    if reply.is_null() {
+        return Err(anyhow!("no token {text} on this chain"));
+    }
+    let index = reply["index"].as_u64().context("rand_getToken's reply has no index")?;
+    u32::try_from(index).map_err(|_| anyhow!("rand_getToken returned index {index}, which is not a u32"))
+}
+
+/// A plain shielded RAND transfer: [`send_asset`] of asset 0.
 #[allow(clippy::too_many_arguments)]
 pub async fn send(
     rpc: &RpcClient,
@@ -1516,7 +1897,48 @@ pub async fn send(
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    submit(rpc, w, store, Some((to, amount)), Action::None, fee, Burn::None, profile, backend, chain_id, wait).await
+    send_asset(rpc, w, store, to, 0, amount, fee, profile, backend, chain_id, wait).await
+}
+
+/// A shielded transfer of any asset — RAND (`asset` 0) or a token by its registry index — as a
+/// plain `Action::None` bundle. On chain it is indistinguishable from any other transfer: the
+/// asset is a private word of the witness, and the fee is RAND whatever moves (spec §3–§4). A
+/// token transfer therefore needs RAND for the fee, and is refused before proving without it.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_asset(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    to: &ShieldedAddress,
+    asset: u32,
+    amount: u64,
+    fee: u64,
+    profile: FriProfile,
+    backend: Backend,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    send_asset_with(rpc, w, store, to, asset, amount, fee, Proving::Real(profile, backend), chain_id, wait).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_asset_with(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    to: &ShieldedAddress,
+    asset: u32,
+    amount: u64,
+    fee: u64,
+    proving: Proving,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    if amount == 0 {
+        return Err(anyhow!("a transfer of zero moves nothing"));
+    }
+    let spend = Spend { asset, to: Some((to, amount)), fee, burn_a: 0, burn_r: 0 };
+    submit_spend(rpc, w, store, spend, Action::None, Burn::None, proving, chain_id, wait).await
 }
 
 #[cfg(test)]
@@ -1637,7 +2059,7 @@ mod tests {
         assert_eq!(spendable, vec![5, 2]);
     }
 
-    /// A burn costs two bundle proofs, so everything only the chain knows is checked before any
+    /// A burn costs a bundle proof, so everything only the chain knows is checked before any
     /// of that work: the chain has a bridge, the registry holds the asset being burned, the coin
     /// named backs *that* asset, and that coin is holding at least what is being redeemed.
     #[test]
@@ -1674,7 +2096,7 @@ mod tests {
         assert!(e.contains("does not back asset 1"), "{e}");
 
         // An index the registry does not hold: no note of it was ever deposited, so the ledger
-        // would refuse the transaction after both proofs.
+        // would refuse the transaction after the proof.
         let e = burn_is_possible(&bridged, 3, 2, &usdt, 1, 0).unwrap_err().to_string();
         assert!(e.contains("asset 3 is not in this chain's registry") && e.contains("registered: 1, 1, 2"), "{e}");
 
@@ -1727,7 +2149,7 @@ mod tests {
     /// whole units of `10^(8-d)`, so an amount — or a relayer fee, which the far side carves out
     /// of it in native units — that is not a multiple of one would strand the remainder in
     /// custody forever, or below one unit release nothing at all. The chain refuses it
-    /// (`TokenError::NotReleasable`); the wallet says so before buying two bundle proofs.
+    /// (`TokenError::NotReleasable`); the wallet says so before buying a bundle proof.
     #[test]
     fn a_burn_must_be_a_whole_number_of_the_coins_release_unit() {
         // zUSD's real chain-2 (6 decimals) and chain-3 (18) USDT backings, the two sides of the
@@ -1779,6 +2201,7 @@ mod tests {
             burn,
             time: 42,
             asset,
+            rand_change: if asset == 0 { 0 } else { 5 * randprotocol_core::UNITS_PER_RAND },
             tier: 14,
             proof_bytes: 1 << 20,
             proving: Duration::from_secs(98),
@@ -1806,11 +2229,13 @@ mod tests {
             bond.summary("bond")
         );
 
-        // A bridge burn: asset units throughout, and the burn is the `out` figure — said once.
+        // A bridge burn: asset units throughout, and the burn is the `out` figure — said once. The
+        // RAND that came back from the fee slots is named after the fee it paid.
         let burn = submission(Burn::Asset { index: 3, amount: 2_000 }, 3, 2_000, 3_000);
         assert!(
-            burn.summary("bridge burn")
-                .ends_with("2000 of asset 3 out, 3000 of asset 3 change, fee 0.001 RAND, anchored at height 42"),
+            burn.summary("bridge burn").ends_with(
+                "2000 of asset 3 out, 3000 of asset 3 change, fee 0.001 RAND, 5 RAND change, anchored at height 42"
+            ),
             "{}",
             burn.summary("bridge burn")
         );
@@ -2040,59 +2465,597 @@ mod tests {
         assert_ne!(deposit_note_for(&me, &me.address, 1_000, 3, 41).unwrap().0.r, note.r);
     }
 
-    /// A deposit whose published envelope is garbage — a hostile relayer's, or a broken one — is
-    /// still this wallet's note. Anyone may submit an attestation and nothing binds its envelope to
-    /// the note the chain computes, so the envelope layer is not what a deposit's recipient depends
-    /// on: every word of that note is public in the same transaction, and the wallet rebuilds it
-    /// from what the node renders and checks it against the commitment the chain appended.
+    // ------------------------------------------------ the hidden-asset bundle, end to end
+    //
+    // Every test below drives the real submission path — scan, plan, anchor and witnesses, build,
+    // assemble, bind, prove, submit — against `FakeChain`, a node kept in memory behind a real
+    // HTTP socket. "Proving" is the hidden guest run in the emulator on the witness the wallet
+    // built, against the transaction's own binding: the digest it publishes is checked against
+    // the wallet's exactly as a real proof's is, and it is what the stub proof then carries. So
+    // a witness that would taint, a slot out of place or a digest the ledger would not recompute
+    // fails here in a second rather than in the wallet flow after minutes.
+
+    use crate::test_rpc::{rpc_fn, Reply};
+    use randprotocol_core::confidential::{ConfidentialExecutor, StubExecutor};
+    use randprotocol_zkvm::executor::ZkExecutor;
+    use std::sync::{Arc, Mutex};
+
+    /// The `hc` the emulated "proof" is made under — any word: the stub verifier only checks it
+    /// is the one the proof names.
+    const EMULATED_HC: Word8 = [0xe0; 8];
+
+    /// [`Proving::Emulated`]: the hidden guest run on `p.words` against `binding`, its digest
+    /// checked as a real proof's is, and a stub proof carrying it.
+    pub(super) fn emulated_proof(p: &Prepared, binding: &[u32; TX_BINDING_WORDS]) -> Result<Proved> {
+        let run = randprotocol_zkvm::emulator::execute(ZkExecutor::hidden_bundle_program(), &p.words, binding, 1 << 20)
+            .map_err(|e| anyhow!("the hidden guest did not run: {e:?}"))?;
+        let digest: Word8 = run.outputs;
+        check_published_digest(&digest, &p.expected)?;
+        Ok(Proved { proof: StubExecutor::make_bundle_proof(&EMULATED_HC, &digest, binding), tier: 14, proving: Duration::ZERO })
+    }
+
+    /// A node in memory: the commitment tree and its envelopes, the blocks, the nullifiers, what
+    /// was submitted, and the bridge's two replies.
+    struct FakeChain {
+        tree: randprotocol_zkvm::ledger::CommitmentTree,
+        leaves: Vec<(Word8, Envelope, u64)>,
+        /// `blocks[h]` is block `h`'s transactions; block 0 is genesis.
+        blocks: Vec<Vec<Transaction>>,
+        sent: Vec<Transaction>,
+        bridge: serde_json::Value,
+        assets: serde_json::Value,
+    }
+
+    fn kind(a: &Action) -> &'static str {
+        match a {
+            Action::None => "none",
+            Action::BridgeAttest { .. } => "bridge_attest",
+            Action::TokenMint { .. } => "token_mint",
+            Action::RegisterToken { .. } => "register_token",
+            _ => "other",
+        }
+    }
+
+    fn envelope_json(e: &Envelope) -> serde_json::Value {
+        serde_json::json!({
+            "kem_ct": hex::encode(&e.kem_ct), "to_receiver": hex::encode(&e.to_receiver),
+            "to_sender": hex::encode(&e.to_sender), "body": hex::encode(&e.body),
+        })
+    }
+
+    impl FakeChain {
+        fn new() -> FakeChain {
+            FakeChain {
+                tree: randprotocol_zkvm::ledger::CommitmentTree::new(),
+                leaves: Vec::new(),
+                blocks: vec![Vec::new()],
+                sent: Vec::new(),
+                bridge: serde_json::json!({ "enabled": false }),
+                assets: serde_json::json!([]),
+            }
+        }
+
+        fn head(&self) -> u64 {
+            self.blocks.len() as u64 - 1
+        }
+
+        /// A new block carrying `txs`, which appended the leaves `leaves`.
+        fn commit(&mut self, txs: Vec<Transaction>, leaves: Vec<(Word8, Envelope)>) {
+            let height = self.blocks.len() as u64;
+            for (cm, e) in leaves {
+                self.tree.append(cm);
+                self.leaves.push((cm, e, height));
+            }
+            self.blocks.push(txs);
+        }
+
+        /// A note of `amount` of `asset` for `to`, sealed to it by a stranger, in a block of its own.
+        fn fund(&mut self, to: &Wallet, amount: u64, asset: u32) {
+            let stranger = Wallet::from_spend_key(SpendKey([77; 8]));
+            let note = Note::new(to.vk.pk(), stranger.vk.pk(), amount, asset, self.head() as u32);
+            self.commit(Vec::new(), vec![(note.commitment(), sealed(&stranger, to, &note))]);
+        }
+
+        fn answer(&mut self, method: &str, p: &serde_json::Value) -> Reply {
+            use serde_json::json;
+            let n = |i: usize| p[i].as_u64().unwrap_or(0);
+            let head = self.head();
+            Reply::Ok(match method {
+                "rand_getHead" => json!({ "height": head }),
+                "rand_getBlocks" => json!((n(0)..=n(1).min(head).min(n(0) + 127))
+                    .map(|h| json!({ "height": h, "tx_count": self.blocks[h as usize].len() }))
+                    .collect::<Vec<_>>()),
+                "rand_getBlockByHeight" => {
+                    let txs: Vec<_> = self.blocks[n(0) as usize]
+                        .iter()
+                        .map(|t| json!({ "hash": t.hash().to_hex(), "action": { "kind": kind(&t.action) } }))
+                        .collect();
+                    json!({ "height": n(0), "transactions": txs })
+                }
+                "rand_getRawTransaction" => {
+                    let want = p[0].as_str().unwrap_or_default();
+                    self.blocks
+                        .iter()
+                        .flatten()
+                        .find(|t| t.hash().to_hex() == want)
+                        .map_or(serde_json::Value::Null, |t| json!(hex::encode(t.encode())))
+                }
+                "rand_getCommitments" => json!(self
+                    .leaves
+                    .iter()
+                    .enumerate()
+                    .skip(n(0) as usize)
+                    .take(n(1) as usize)
+                    .map(|(i, (cm, e, h))| json!({ "index": i, "cm": word8_to_hex(cm), "envelope": envelope_json(e), "height": h }))
+                    .collect::<Vec<_>>()),
+                "rand_getNullifiers" => json!([]),
+                "rand_getAnchor" => json!({ "height": head, "root": word8_to_hex(&self.tree.root()) }),
+                "rand_getWitness" => json!({
+                    "root": word8_to_hex(&self.tree.root()),
+                    "path": self.tree.path(n(0) as usize).iter().map(word8_to_hex).collect::<Vec<_>>(),
+                }),
+                "rand_sendTransaction" => {
+                    let tx = Transaction::decode(&hex::decode(p[0].as_str().unwrap_or_default()).unwrap()).unwrap();
+                    let hash = tx.hash().to_hex();
+                    self.sent.push(tx);
+                    json!(hash)
+                }
+                "rand_getBridgeState" => self.bridge.clone(),
+                "rand_getAssets" => self.assets.clone(),
+                _ => return Reply::Err(-32601, "unknown method"),
+            })
+        }
+    }
+
+    /// The chain behind a real socket, and a client for it.
+    async fn serve(chain: &Arc<Mutex<FakeChain>>) -> RpcClient {
+        let c = chain.clone();
+        RpcClient::new(rpc_fn(move |m, p| c.lock().unwrap().answer(m, p)).await)
+    }
+
+    /// Everything the chain would check of a submitted bundle without its proof, plus the proof
+    /// check the stub can make: every nullifier and commitment distinct, the digest the ledger
+    /// recomputes (through the real executor) is the one the emulated guest published, and the
+    /// proof verifies against the transaction's own binding.
+    fn assert_admissible_shape(tx: &Transaction) {
+        let b = tx.bundle.as_ref().expect("a bundle");
+        for i in 0..SLOTS {
+            for j in i + 1..SLOTS {
+                assert_ne!(b.nullifiers[i], b.nullifiers[j], "nullifiers {i} and {j}");
+                assert_ne!(b.commitments[i], b.commitments[j], "commitments {i} and {j}");
+            }
+        }
+        let recomputed = ZkExecutor::new(FriProfile::Test).bundle_digest(&b.digest_input());
+        assert_eq!(StubExecutor.bundle_proof_digest(&b.proof).unwrap(), recomputed, "the ledger's digest is the guest's");
+        assert_eq!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &tx.binding()), Ok(()), "bound to this transaction");
+    }
+
+    /// What each slot of `tx`'s bundle is to `w`: the note it received, the note it sent, or
+    /// nothing.
+    fn slots_for(w: &Wallet, tx: &Transaction) -> Vec<Found> {
+        let b = tx.bundle.as_ref().unwrap();
+        (0..SLOTS).map(|k| classify(w, b.commitments[k], &b.envelopes[k])).collect()
+    }
+
+    fn opens_to_nobody(found: &Found) -> bool {
+        *found == Found::Skipped(NOT_OURS)
+    }
+
+    /// A bundle for the actions a test commits to a block — never proved, never read.
+    fn unread_bundle() -> Bundle {
+        Bundle {
+            anchor: [0; 8],
+            nullifiers: [[1; 8], [2; 8], [3; 8], [4; 8]],
+            commitments: [[5; 8], [6; 8], [7; 8], [8; 8]],
+            fee: gas::BUNDLE_BASE,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
+            time: 1,
+            envelopes: [env(), env(), env(), env()],
+            proof: vec![],
+        }
+    }
+
+    fn garbage() -> Envelope {
+        Envelope { kem_ct: vec![0xff; 8], to_receiver: vec![0xff; 16], to_sender: vec![], body: vec![0xff; 16] }
+    }
+
+    /// A deposit (asset 3), a token mint (asset 5) and a registration's initial mint (asset 6) to
+    /// `me`, each published with a garbage envelope, each in a block of its own; plus the notes
+    /// they append.
+    fn public_notes_for(me: &Wallet) -> (Vec<Transaction>, Vec<Note>) {
+        use randprotocol_core::ledger::tokens::MintAuthority;
+        use randprotocol_core::types::actions::InitialMint;
+        let deposit = Transaction::shielded(
+            7,
+            unread_bundle(),
+            Action::BridgeAttest {
+                attestation: transfer_attestation(1_000, me.address.recipient_hash()),
+                recipient: me.address.clone(),
+                r: [9; 8],
+                time: 1,
+                asset: 3,
+                envelope: garbage(),
+            },
+        );
+        let mint = Transaction::shielded(
+            7,
+            unread_bundle(),
+            Action::TokenMint {
+                asset: 5,
+                amount: 250,
+                recipient: me.address.clone(),
+                r: [10; 8],
+                time: 2,
+                envelope: garbage(),
+                nonce: 0,
+                signature: randprotocol_core::Keypair::generate().sign(b"not checked by a wallet"),
+            },
+        );
+        let register = Transaction::shielded(
+            7,
+            unread_bundle(),
+            Action::RegisterToken {
+                name: "Test".into(),
+                symbol: "TST".into(),
+                decimals: 6,
+                authority: MintAuthority::None,
+                initial: Some(InitialMint { amount: 90, recipient: me.address.clone(), r: [11; 8], time: 3, envelope: garbage() }),
+                salt: [0; 32],
+                index: 6,
+            },
+        );
+        let pk = me.vk.pk();
+        let notes = vec![
+            Note { pk, from: [0; 8], amount: 1_000, asset: 3, time: 1, r: [9; 8] },
+            Note { pk, from: MINT_FROM, amount: 250, asset: 5, time: 2, r: [10; 8] },
+            Note { pk, from: MINT_FROM, amount: 90, asset: 6, time: 3, r: [11; 8] },
+        ];
+        (vec![deposit, mint, register], notes)
+    }
+
+    /// The three notes a deposit and two mints append are rebuilt, word for word, as the notes the
+    /// ledger computes (`deposit_commitment`, `mint_commitment`, through the real executor) — for
+    /// their recipient and nobody else, and not for a rotation.
     #[test]
-    fn a_deposit_with_a_garbage_envelope_is_still_rebuilt_from_the_wire() {
+    fn deposits_and_mints_are_rebuilt_from_their_public_fields_as_the_ledger_computes_them() {
         let me = Wallet::from_spend_key(SpendKey([41; 8]));
         let stranger = Wallet::from_spend_key(SpendKey([42; 8]));
-        // The note the chain computes for 1000 units of asset 3, deposited at time 12: `from` is
-        // the zero word, because a deposit has no sender inside the pool.
-        let note = Note { pk: me.vk.pk(), from: [0; 8], amount: 1_000, asset: 3, time: 12, r: [9; 8] };
-        // What `tx_json` renders for that committed attest.
-        let rendered = |to: &ShieldedAddress, cm: Word8| {
-            serde_json::json!({
-                "kind": "bridge_attest",
-                "attestation_len": 520,
-                "recipient": to.to_string(),
-                "asset": 3,
-                "asset_index": 3,
-                "amount": 1_000,
-                "time": 12,
-                "r": word8_to_hex(&[9; 8]),
-                "commitment": word8_to_hex(&cm),
-            })
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let (txs, notes) = public_notes_for(&me);
+        assert_eq!(notes[0].commitment(), bridge_notes::deposit_commitment(&me.address, 1_000, 3, 1, &[9; 8], &ex));
+        assert_eq!(notes[1].commitment(), randprotocol_core::ledger::tokens::mint_commitment(&me.address, 250, 5, 2, &[10; 8], &ex));
+        assert_eq!(notes[2].commitment(), randprotocol_core::ledger::tokens::mint_commitment(&me.address, 90, 6, 3, &[11; 8], &ex));
+        for (tx, note) in txs.iter().zip(&notes) {
+            assert_eq!(rebuilt_notes(&me, tx), vec![*note], "{}", kind(&tx.action));
+            assert!(rebuilt_notes(&stranger, tx).is_empty(), "not the stranger's");
+            // The envelope opens to nobody, which is the whole point of this path.
+            assert!(matches!(classify(&me, note.commitment(), &garbage()), Found::Skipped(_)));
+        }
+        let rotation = Transaction::shielded(
+            7,
+            unread_bundle(),
+            Action::BridgeAttest {
+                attestation: rotation_attestation(),
+                recipient: me.address.clone(),
+                r: [9; 8],
+                time: 1,
+                asset: 0,
+                envelope: garbage(),
+            },
+        );
+        assert!(rebuilt_notes(&me, &rotation).is_empty(), "a rotation deposits nothing");
+        assert!(rebuilt_notes(&me, &Transaction::shielded(7, unread_bundle(), Action::None)).is_empty());
+    }
+
+    /// A deposit and two mints whose envelopes are garbage are still found by their recipient —
+    /// from the public action fields — and are spendable: the recipient sends 400 of the deposited
+    /// token in a hidden-asset bundle the (emulated) guest accepts, paying the fee in RAND.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_garbage_envelope_deposit_is_still_found_and_spendable_by_its_recipient() {
+        let me = Wallet::from_spend_key(SpendKey([41; 8]));
+        let you = Wallet::from_spend_key(SpendKey([43; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let (txs, notes) = public_notes_for(&me);
+        {
+            let mut c = chain.lock().unwrap();
+            c.fund(&Wallet::from_spend_key(SpendKey([50; 8])), 5, 0); // someone else's leaf first
+            for (tx, note) in txs.into_iter().zip(&notes) {
+                c.commit(vec![tx], vec![(note.commitment(), garbage())]);
+            }
+            c.fund(&me, 2 * gas::BUNDLE_BASE, 0);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.asset_balances(), vec![(0, 2 * gas::BUNDLE_BASE), (3, 1_000), (5, 250), (6, 90)]);
+        let deposit = store.spendable_of(3)[0].clone();
+        assert_eq!((deposit.index, deposit.nf), (1, me.vk.nullifier(&notes[0].commitment())), "at its own leaf");
+        // A second scan re-reads nothing and finds nothing new.
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.notes.len(), 4);
+
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 3, 400, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .expect("the deposit is spendable");
+        assert_eq!((s.amount, s.change, s.asset, s.rand_change), (400, 600, 3, gas::BUNDLE_BASE));
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        assert_eq!(tx.action, Action::None, "a token transfer is a plain bundle");
+        let b = tx.bundle.as_ref().unwrap();
+        assert_eq!((b.fee, b.burn_a, b.burn_r, b.burn_asset), (gas::BUNDLE_BASE, 0, 0, 0), "nothing public names the asset");
+        assert!(b.nullifiers.contains(&deposit.nf), "the deposit is what was spent");
+        // The payee finds 400 of asset 3 in slot 0; the sender's change is slot 1 (asset) and slot 2
+        // (RAND); slot 3 is a dummy nobody opens.
+        let theirs = slots_for(&you, &tx);
+        let Found::Received(paid) = theirs[0] else { panic!("slot 0 pays the payee: {theirs:?}") };
+        assert_eq!((paid.amount, paid.asset, paid.from), (400, 3, me.vk.pk()));
+        assert!(theirs[1..].iter().all(opens_to_nobody), "{theirs:?}");
+        let mine = slots_for(&me, &tx);
+        assert!(matches!(mine[0], Found::Sent(n) if n.amount == 400));
+        assert!(matches!(mine[1], Found::Received(n) if n.amount == 600 && n.asset == 3));
+        assert!(matches!(mine[2], Found::Received(n) if n.amount == gas::BUNDLE_BASE && n.asset == 0));
+        assert!(opens_to_nobody(&mine[3]), "{:?}", mine[3]);
+        // `--no-wait`: the two spent notes are held back until the chain answers.
+        assert_eq!(store.balance_of(3), 0);
+        assert_eq!(store.balance(), 0);
+    }
+
+    /// A RAND payment keeps today's shape: value and fee in slots 2–3, slots 0–1 dummies that open
+    /// to nobody — the sender included — so they are never a balance or a history row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rand_payment_rides_slots_2_and_3_and_its_dummies_open_to_nobody() {
+        let me = Wallet::from_spend_key(SpendKey([44; 8]));
+        let you = Wallet::from_spend_key(SpendKey([45; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        chain.lock().unwrap().fund(&me, 7_000_000, 0);
+        chain.lock().unwrap().fund(&me, 3_000_000, 0);
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        // Needs both notes: neither alone covers 8 000 000 + the fee.
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap();
+        assert_eq!((s.amount, s.change, s.asset, s.burn), (8_000_000, 2_000_000 - gas::BUNDLE_BASE, 0, Burn::None));
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        let theirs = slots_for(&you, &tx);
+        assert!(matches!(theirs[2], Found::Received(n) if n.amount == 8_000_000 && n.asset == 0), "{theirs:?}");
+        let mine = slots_for(&me, &tx);
+        assert!(matches!(mine[3], Found::Received(n) if n.amount == 2_000_000 - gas::BUNDLE_BASE));
+        for k in [0, 1] {
+            assert!(opens_to_nobody(&mine[k]) && opens_to_nobody(&theirs[k]), "slot {k}: {:?} {:?}", mine[k], theirs[k]);
+        }
+        // Scanning the committed transaction back: the payee has one note, the sender one change
+        // note and one history row — no dummy anywhere.
+        {
+            let mut c = chain.lock().unwrap();
+            let b = tx.bundle.clone().unwrap();
+            c.commit(vec![tx.clone()], b.commitments.iter().copied().zip(b.envelopes.iter().cloned()).collect());
+        }
+        let mut theirs = NoteStore::default();
+        scan(&rpc, &you, &mut theirs).await.unwrap();
+        assert_eq!((theirs.balance(), theirs.notes.len(), theirs.sent.len()), (8_000_000, 1, 0));
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.notes.iter().filter(|n| n.note.amount == 2_000_000 - gas::BUNDLE_BASE).count(), 1);
+        assert_eq!(store.notes.len(), 3, "two funding notes and the change");
+        assert_eq!(store.sent.len(), 1, "one payment in the history");
+        assert_eq!(output_keys(&me, &tx).len(), 2, "the payment and the change, never a dummy");
+    }
+
+    /// A token transfer pays its fee in RAND, so a wallet holding only the token is refused before
+    /// anything is proved or submitted — and so is one short of the token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_transfer_without_rand_for_the_fee_is_refused_before_proving() {
+        let me = Wallet::from_spend_key(SpendKey([46; 8]));
+        let you = Wallet::from_spend_key(SpendKey([47; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        chain.lock().unwrap().fund(&me, 500, 4);
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 100, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("a transfer pays its fee in RAND"), "{e}");
+        chain.lock().unwrap().fund(&me, gas::BUNDLE_BASE, 0);
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 501, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("asset 4") && e.contains("insufficient"), "{e}");
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 0, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("zero"), "{e}");
+        assert!(chain.lock().unwrap().sent.is_empty(), "nothing was submitted");
+        assert!(store.notes.iter().all(|n| n.pending.is_none()), "and nothing held back");
+    }
+
+    /// A bridge burn is one bundle: the asset's slots burn exactly the amount (`burn_a`,
+    /// `burn_asset`), the RAND slots pay the fee, and nothing is burned in RAND. A burn the locked
+    /// amount cannot cover is refused before proving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bridge_burn_is_one_bundle_burning_the_asset_and_paying_rand() {
+        let me = Wallet::from_spend_key(SpendKey([48; 8]));
+        let token = [0xd7u8; 32];
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.bridge = serde_json::json!({ "enabled": true, "assets": [asset_row(3, 2, token, 8, 700)] });
+            c.fund(&me, 1_000, 3);
+            c.fund(&me, gas::BRIDGE_BURN_FEE + 5, 0);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let burn = |amount| BurnRequest { asset: 3, amount, relayer_fee: 0, to_chain: 2, token, to: [1; 32] };
+        let e = submit_burn_with(&rpc, &me, &mut store, burn(800), gas::BRIDGE_BURN_FEE, Proving::Emulated, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("only 700 is locked"), "{e}");
+        assert!(chain.lock().unwrap().sent.is_empty());
+
+        let s = submit_burn_with(&rpc, &me, &mut store, burn(400), gas::BRIDGE_BURN_FEE, Proving::Emulated, 7, false).await.unwrap();
+        assert_eq!((s.amount, s.change, s.asset, s.burn, s.rand_change), (400, 600, 3, Burn::Asset { index: 3, amount: 400 }, 5));
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        let b = tx.bundle.as_ref().unwrap();
+        assert_eq!((b.fee, b.burn_a, b.burn_r, b.burn_asset), (gas::BRIDGE_BURN_FEE, 400, 0, 3));
+        assert!(matches!(tx.action, Action::BridgeBurn { asset: 3, amount: 400, .. }));
+    }
+
+    /// A token burn is the same one bundle under `TokenBurn`; a bridged token is refused up front
+    /// (its supply leaves through a bridge burn), and so is RAND.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_burn_burns_through_burn_a_and_a_bridged_token_is_refused_before_proving() {
+        let me = Wallet::from_spend_key(SpendKey([49; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.assets = serde_json::json!([{ "index": 2, "chain": 2, "token": hex::encode([1u8; 32]), "asset_id": hex::encode([2u8; 32]) }]);
+            c.fund(&me, 300, 5);
+            c.fund(&me, 300, 2);
+            c.fund(&me, gas::BUNDLE_BASE, 0);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let e = submit_token_burn_with(&rpc, &me, &mut store, 2, 100, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("bridged token") && e.contains("bridge-burn"), "{e}");
+        let e = submit_token_burn_with(&rpc, &me, &mut store, 0, 100, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("RAND"), "{e}");
+        assert!(chain.lock().unwrap().sent.is_empty());
+
+        let s = submit_token_burn_with(&rpc, &me, &mut store, 5, 300, gas::BUNDLE_BASE, Proving::Emulated, 7, false).await.unwrap();
+        assert_eq!((s.amount, s.change, s.rand_change), (300, 0, 0));
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        let b = tx.bundle.as_ref().unwrap();
+        assert_eq!((b.burn_a, b.burn_r, b.burn_asset), (300, 0, 5));
+        assert_eq!(tx.action, Action::TokenBurn { asset: 5, amount: 300 });
+        // No change at all in either group: every output is a dummy nobody opens.
+        assert!(slots_for(&me, &tx).iter().all(opens_to_nobody));
+    }
+
+    /// A bond burns RAND through `burn_r`, never `burn_a`, and names no asset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bond_burns_rand_through_burn_r() {
+        let me = Wallet::from_spend_key(SpendKey([51; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        chain.lock().unwrap().fund(&me, 10_000_000, 0);
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let action = Action::Bond { validator: randprotocol_core::Keypair::generate().address(), amount: 4_000_000, registration: None };
+        let s = submit_with(&rpc, &me, &mut store, None, action, gas::BUNDLE_BASE, Burn::Rand(4_000_000), Proving::Emulated, 7, false)
+            .await
+            .unwrap();
+        assert_eq!((s.amount, s.change, s.burn), (0, 6_000_000 - gas::BUNDLE_BASE, Burn::Rand(4_000_000)));
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        let b = tx.bundle.as_ref().unwrap();
+        assert_eq!((b.burn_a, b.burn_r, b.burn_asset), (0, 4_000_000, 0));
+    }
+
+    /// One plan covers both groups, largest-first and at most two notes each; a RAND bundle uses
+    /// the RAND slots alone; and the change of each group is what its inputs held over its need.
+    #[test]
+    fn the_plan_selects_both_groups_largest_first() {
+        let me = Wallet::from_spend_key(SpendKey([52; 8]));
+        let you = Wallet::from_spend_key(SpendKey([53; 8]));
+        let store = NoteStore {
+            notes: vec![
+                owned_asset(0, 50, false, 7),
+                owned_asset(1, 30, false, 7),
+                owned_asset(2, 10, false, 7),
+                owned_asset(3, 4, false, 0),
+                owned_asset(4, 9, false, 0),
+            ],
+            ..NoteStore::default()
         };
+        let spend = |asset, amount, fee| Spend { asset, to: Some((&you.address, amount)), fee, burn_a: 0, burn_r: 0 };
+        let plan = Plan::select(&store, spend(7, 60, 5)).unwrap();
+        assert_eq!(plan.a_notes.iter().map(|n| n.index).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(plan.r_notes.iter().map(|n| n.index).collect::<Vec<_>>(), vec![4]);
+        assert_eq!((plan.change_a(), plan.change_r()), (20, 4));
+        let slots = plan.outputs();
+        assert_eq!(slots[0], (Payee::To(you.address.clone()), 60));
+        assert_eq!(slots[1], (Payee::Me, 20));
+        assert_eq!(slots[2], (Payee::Me, 4));
+        assert_eq!(slots[3], (Payee::Nobody, 0));
+        // A RAND payment: both RAND notes in slots 2–3, and slots 0–1 empty.
+        let plan = Plan::select(&store, spend(0, 10, 3)).unwrap();
+        assert!(plan.a_notes.is_empty());
+        assert_eq!(plan.r_notes.iter().map(|n| n.index).collect::<Vec<_>>(), vec![4, 3]);
+        assert_eq!(plan.outputs()[2], (Payee::To(you.address.clone()), 10));
+        assert_eq!(plan.outputs()[3], (Payee::Nobody, 0), "13 in, 10 + 3 out: no change, so a dummy");
+        // Three notes of the token would be needed: a group spends two at most.
+        assert!(Plan::select(&store, spend(7, 85, 5)).unwrap_err().to_string().contains("consolidate"));
+        // A RAND burn through `burn_a` is never planned.
+        let bad = Spend { asset: 0, to: None, fee: 1, burn_a: 1, burn_r: 0 };
+        assert!(Plan::select(&store, bad).is_err());
+        let _ = me;
+    }
 
-        // The envelope the relayer published opens with no key of this wallet's — which is all the
-        // griefing ever was, and it stops mattering here.
-        let garbage = Envelope { kem_ct: vec![0xff; 8], to_receiver: vec![0xff; 16], to_sender: vec![], body: vec![0xff; 16] };
-        assert!(matches!(classify(&me, note.commitment(), &garbage), Found::Skipped(_)));
-        assert_eq!(rebuilt_deposit(&me, &rendered(&me.address, note.commitment())), Some(note));
+    /// `--asset`: a number is the index as it stands; a token id goes to `rand_getToken`, and a node
+    /// without that method is told to take the index instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_asset_is_an_index_or_a_token_id_the_node_resolves() {
+        use crate::test_rpc::scripted_rpc;
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getToken", Reply::Ok(serde_json::json!({ "index": 5 })))]).await);
+        assert_eq!(resolve_asset(&rpc, "0").await.unwrap(), 0);
+        assert_eq!(resolve_asset(&rpc, "7").await.unwrap(), 7, "a number never reaches the node");
+        assert_eq!(resolve_asset(&rpc, "rpl1qqqq").await.unwrap(), 5);
+        let unknown = RpcClient::new(scripted_rpc(vec![("rand_getToken", Reply::Ok(serde_json::Value::Null))]).await);
+        assert!(resolve_asset(&unknown, "rpl1qqqq").await.unwrap_err().to_string().contains("no token rpl1qqqq"));
+        let older = RpcClient::new(scripted_rpc(vec![]).await);
+        let e = resolve_asset(&older, "rpl1qqqq").await.unwrap_err().to_string();
+        assert!(e.contains("registry index instead"), "{e}");
+    }
 
-        // A deposit to someone else is not rebuilt, whoever renders it.
-        assert_eq!(rebuilt_deposit(&me, &rendered(&stranger.address, note.commitment())), None);
-        // Nor is a note that does not hash to the commitment the chain published: the chain
-        // computes that commitment, so it is the authority on which leaf it appended.
-        assert_eq!(rebuilt_deposit(&me, &rendered(&me.address, [1; 8])), None);
-        // A rotation deposits nothing, so the node renders no index, no amount and no commitment.
-        let rotation = serde_json::json!({
-            "kind": "bridge_attest",
-            "recipient": me.address.to_string(),
-            "asset": 0,
-            "asset_index": serde_json::Value::Null,
-            "amount": serde_json::Value::Null,
-            "time": 12,
-            "r": word8_to_hex(&[9; 8]),
-            "commitment": serde_json::Value::Null,
-        });
-        assert_eq!(rebuilt_deposit(&me, &rotation), None);
-        // And nothing else is a deposit at all.
-        assert_eq!(rebuilt_deposit(&me, &serde_json::json!({ "kind": "mint", "amount": 5 })), None);
-        assert_eq!(rebuilt_deposit(&me, &serde_json::Value::Null), None);
+    /// Every dummy is fresh: two bundles built from the same plan share no nullifier and no
+    /// commitment, and inside one bundle the four of each are distinct (the ledger's rule, and the
+    /// guest's taint).
+    #[test]
+    fn every_dummy_is_fresh() {
+        let me = Wallet::from_spend_key(SpendKey([54; 8]));
+        let mut tree = randprotocol_zkvm::ledger::CommitmentTree::new();
+        let note = Note::new(me.vk.pk(), [1; 8], 50, 0, 1);
+        tree.append(note.commitment());
+        let store = NoteStore {
+            notes: vec![OwnedNote { index: 0, cm: note.commitment(), nf: me.vk.nullifier(&note.commitment()), note, spent: false, pending: None, height: 1 }],
+            ..NoteStore::default()
+        };
+        let plan = Plan::select(&store, Spend { asset: 0, to: None, fee: 50, burn_a: 0, burn_r: 0 }).unwrap();
+        let build = || build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2).unwrap();
+        let (one, two) = (build(), build());
+        for k in 0..SLOTS {
+            if k != 2 {
+                assert!(!two.bundle.nullifiers.contains(&one.bundle.nullifiers[k]), "dummy input {k} repeated");
+            }
+            assert!(!two.bundle.commitments.contains(&one.bundle.commitments[k]), "output {k} repeated");
+        }
+        assert_eq!(one.bundle.nullifiers[2], two.bundle.nullifiers[2], "the real input is the same note both times");
+        // The blinding itself, not only the throwaway key a dummy is owned by: every output's `r`
+        // is drawn afresh, in one bundle and across two.
+        use randprotocol_zkvm::hidden::hidden_input::{out, O_R};
+        let r = |p: &Prepared, k: usize| p.words[out(k) + O_R..out(k) + O_R + 8].to_vec();
+        let all: Vec<Vec<u32>> = (0..SLOTS).flat_map(|k| [r(&one, k), r(&two, k)]).collect();
+        for i in 0..all.len() {
+            for j in i + 1..all.len() {
+                assert_ne!(all[i], all[j], "two outputs share a blinding");
+            }
+        }
+        // And the witness is one the guest accepts: every output a dummy, the one input real.
+        let run = randprotocol_zkvm::emulator::execute(ZkExecutor::hidden_bundle_program(), &one.words, &[0; TX_BINDING_WORDS], 1 << 20).unwrap();
+        assert_eq!(run.outputs, one.expected);
     }
 
     #[test]
@@ -2344,8 +3307,8 @@ mod tests {
     }
 
     /// A payment from `me` to `you` with change back to `me`, each output under its own key, in
-    /// slots 0–1 of a four-slot bundle; slots 2–3 carry envelopes nobody can open (they stand for
-    /// the dummies, whose sealing is H5's).
+    /// slots 0–1 of a four-slot bundle; slots 2–3 carry envelopes nobody can open (stand-ins for
+    /// the dummies `build_bundle` seals to a throwaway key).
     fn payment(me: &Wallet, you: &Wallet) -> (Transaction, TxKey, TxKey, Note, Note) {
         let pay = Note::new(you.vk.pk(), me.vk.pk(), 7, 0, 1);
         let change = Note::new(me.vk.pk(), me.vk.pk(), 3, 0, 1);
@@ -2592,7 +3555,6 @@ mod tests {
             },
             words: Vec::new(),
             expected: [0; 8],
-            which: "bundle".into(),
         };
         let action = Action::BridgeBurn { asset: 3, amount: 400, relayer_fee: 100, to_chain: 2, token: [7; 32], to: [1; 32] };
         let mut tx = Transaction::shielded(13, prepared.bundle.clone(), action);

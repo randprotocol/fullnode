@@ -438,6 +438,13 @@ impl RpcClient {
     pub async fn block_by_hash(&self, h: &Hash) -> Result<Value> {
         self.call("rand_getBlockByHash", json!([h.to_hex()])).await
     }
+    /// `rand_getBlocks`: the headers of `from..=to`, oldest first — each with its `height` and
+    /// `tx_count`. The node caps one reply (at 128 headers today) and at its head, so a caller
+    /// advances from the last height it got back rather than from `to`.
+    pub async fn blocks(&self, from: u64, to: u64) -> Result<Vec<Value>> {
+        let v = self.call("rand_getBlocks", json!([from, to])).await?;
+        Ok(v.as_array().context("getBlocks did not return a list")?.clone())
+    }
 
     // ---- shielded chain state (the wallet's scan surface) ----
 
@@ -632,13 +639,29 @@ pub(crate) mod test_rpc {
     }
 
     pub async fn scripted_rpc(script: Vec<(&'static str, Reply)>) -> String {
+        let script = std::sync::Arc::new(script);
+        rpc_fn(move |method, _| match script.iter().find(|(m, _)| *m == method) {
+            Some((_, Reply::Ok(v))) => Reply::Ok(v.clone()),
+            Some((_, Reply::Err(code, msg))) => Reply::Err(*code, msg),
+            None => Reply::Err(-32601, "unknown method"),
+        })
+        .await
+    }
+
+    /// A node whose every reply is computed by `answer(method, params)` — for a test that needs
+    /// state behind the replies (a paged tree, blocks, a captured submission), which a fixed
+    /// script cannot page through.
+    pub async fn rpc_fn<F>(answer: F) -> String
+    where
+        F: Fn(&str, &Value) -> Reply + Send + Sync + 'static,
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let script = std::sync::Arc::new(script);
+        let answer = std::sync::Arc::new(answer);
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else { return };
-                let script = script.clone();
+                let answer = answer.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 16 * 1024];
@@ -668,12 +691,11 @@ pub(crate) mod test_rpc {
                     }
                     let req: Value = serde_json::from_slice(&buf[header_end..]).unwrap_or(Value::Null);
                     let method = req["method"].as_str().unwrap_or_default().to_string();
-                    let body = match script.iter().find(|(m, _)| *m == method) {
-                        Some((_, Reply::Ok(v))) => json!({ "jsonrpc": "2.0", "id": 1, "result": v }),
-                        Some((_, Reply::Err(code, msg))) => {
+                    let body = match answer(&method, &req["params"]) {
+                        Reply::Ok(v) => json!({ "jsonrpc": "2.0", "id": 1, "result": v }),
+                        Reply::Err(code, msg) => {
                             json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": msg } })
                         }
-                        None => json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32601, "message": format!("unknown method {method}") } }),
                     }
                     .to_string();
                     let resp = format!(

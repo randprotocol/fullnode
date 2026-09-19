@@ -4,7 +4,8 @@
 //! every command that used to be a question for the node ("what is this address worth?") is now
 //! a question for this machine. The wallet keeps a spend key (`--key`) and a note store next to
 //! it (`<key>.notes.json`), scans the commitment tree for notes only that key can open, and
-//! spends them by proving a 2-in-2-out bundle locally. The node is asked for chain state —
+//! spends them by proving a four-slot hidden-asset bundle locally (any asset in slots 0–1, the
+//! RAND fee in slots 2–3). The node is asked for chain state —
 //! leaves, nullifiers, anchors, witnesses — and handed a finished bundle; it is never told who
 //! anyone is.
 
@@ -71,12 +72,19 @@ enum Cmd {
     Notes,
     /// List every note this wallet created for someone else.
     History,
-    /// Send RAND to a shielded address: scan, select, prove and submit.
+    /// Send RAND or a token to a shielded address: scan, select, prove and submit.
+    ///
+    /// Either way the transaction is a plain four-slot bundle that does not say which asset moved,
+    /// and the fee is RAND — a token transfer needs RAND in the wallet for it.
     Send {
         /// A `rand1…` shielded address.
         to: String,
-        /// Amount in RAND, e.g. 1.5
+        /// Amount: in RAND for RAND (e.g. 1.5); in the token's own smallest unit for a token.
         amount: String,
+        /// The asset to send: a registry index (0, the default, is RAND), or a token id — `rpl1…`
+        /// or 64 hex — which the node resolves to its index.
+        #[arg(long, default_value = "0")]
+        asset: String,
         /// Fee in RAND; the floor is 0.001.
         #[arg(long)]
         fee: Option<String>,
@@ -192,7 +200,7 @@ enum Cmd {
         #[arg(long)]
         cuda: bool,
     },
-    /// Burn a bridged asset to another chain: two bundles, two proofs, one transaction.
+    /// Burn a bridged asset to another chain: one bundle burns the asset and pays the RAND fee.
     BridgeBurn {
         /// The asset's registry index (`rand asset-balance`).
         asset: u32,
@@ -209,16 +217,19 @@ enum Cmd {
         /// A portion of AMOUNT paid to the relayer on the destination chain, in the same asset.
         #[arg(long, default_value_t = 0)]
         relayer_fee: u64,
-        /// Fee in RAND; the floor is 0.01 — the bridge fee, which covers the base for both bundles.
+        /// Fee in RAND; the floor is 0.01 — the bridge fee, which covers the bundle's base.
         #[arg(long)]
         fee: Option<String>,
         /// Return once the node accepts the transaction instead of waiting for it to commit.
         #[arg(long)]
         no_wait: bool,
-        /// Prove both bundles on an attached NVIDIA GPU.
+        /// Prove the bundle on an attached NVIDIA GPU.
         #[arg(long)]
         cuda: bool,
     },
+    /// RPL tokens held in this wallet.
+    #[command(subcommand)]
+    Token(TokenCmd),
     /// The bridge's public state: guardians, emitters, the asset registry, the burn sequence.
     Bridge,
     /// The outbound burn message with this sequence, for a guardian to sign.
@@ -250,6 +261,29 @@ enum Cmd {
     Peers,
     /// Validator set.
     Validators,
+}
+
+#[derive(Subcommand)]
+enum TokenCmd {
+    /// Destroy some of a token this wallet holds: its public supply drops by exactly AMOUNT.
+    ///
+    /// One bundle burns the token and pays the RAND fee. A bridged token is burned with
+    /// `rand bridge-burn` instead, which names the coin released on the other chain.
+    Burn {
+        /// The token: its registry index, or its id (`rpl1…` or 64 hex).
+        asset: String,
+        /// Amount in the token's own smallest unit.
+        amount: u64,
+        /// Fee in RAND; the floor is 0.001.
+        #[arg(long)]
+        fee: Option<String>,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+        /// Prove the bundle on an attached NVIDIA GPU.
+        #[arg(long)]
+        cuda: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -567,17 +601,28 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Send { to, amount, fee, no_wait, cuda } => {
+        Cmd::Send { to, amount, asset, fee, no_wait, cuda } => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let to = parse_address(&to)?;
-            let amount = parse_amount(&amount)?;
+            let asset = wallet::resolve_asset(&rpc, &asset).await?;
+            // RAND has this chain's nine decimals; a token's unit is its own, so its amount is a
+            // whole number of that unit.
+            let amount = if asset == 0 {
+                parse_amount(&amount)?
+            } else {
+                amount.parse::<u64>().with_context(|| format!("{amount} is not a whole number of asset {asset}'s units"))?
+            };
             let fee = match fee { Some(f) => parse_amount(&f)?, None => gas::BUNDLE_BASE };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::send(&rpc, &w, &mut store, &to, amount, fee, profile, backend_for(cuda)?, chain_id, !no_wait).await;
+            let s = wallet::send_asset(&rpc, &w, &mut store, &to, asset, amount, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+                .await;
             store.save(&path)?;
             report(&s?, "transfer");
             if !no_wait {
+                if asset != 0 {
+                    println!("asset {asset} balance: {} units", store.balance_of(asset));
+                }
                 println!("balance: {} RAND", format_amount(store.balance()));
             }
         }
@@ -955,7 +1000,6 @@ async fn main() -> Result<()> {
             };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            eprintln!("a burn is two bundles, so this proves twice");
             let s = wallet::submit_burn(
                 &rpc,
                 &w,
@@ -981,6 +1025,23 @@ async fn main() -> Result<()> {
                 hex::encode(to),
                 s.change
             );
+            if !no_wait {
+                println!("asset {asset} balance: {} units", store.balance_of(asset));
+            }
+        }
+        Cmd::Token(TokenCmd::Burn { asset, amount, fee, no_wait, cuda }) => {
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            let asset = wallet::resolve_asset(&rpc, &asset).await?;
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => gas::fee_floor(&Action::TokenBurn { asset, amount }),
+            };
+            let chain_id = rpc.chain_id().await?;
+            let profile = profile_of(&rpc).await?;
+            let s = wallet::submit_token_burn(&rpc, &w, &mut store, asset, amount, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+                .await;
+            store.save(&path)?;
+            report(&s?, "token burn");
             if !no_wait {
                 println!("asset {asset} balance: {} units", store.balance_of(asset));
             }
