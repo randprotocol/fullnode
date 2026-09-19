@@ -1511,10 +1511,12 @@ mod tests {
     }
 
     /// A bridge is permissionless, so two relayers racing one attestation is the normal case,
-    /// not an attack. Their transactions share no nullifier and no commitment — the deposit
-    /// note is computed by the ledger and never appears on the wire — so only the attestation
-    /// digest says they collide. Without claiming it the pool would hold both, offer both, and
-    /// the proposer's block would die on the second with `Bridge(Replay)`.
+    /// not an attack. Their transactions share no nullifier and no commitment *on the wire* —
+    /// the deposit note is computed by the ledger and never appears there — so what says they
+    /// collide is the derived note (at one `time`, since F1 fixes the blinding) or, failing
+    /// that, the attestation digest. Without claiming the digest the pool would hold two
+    /// submissions at two `time`s, offer both, and the proposer's block would die on the second
+    /// with `Bridge(Replay)`.
     #[test]
     fn two_relayers_racing_one_attestation_do_not_both_enter_the_pool() {
         let (mut l, secrets) = bridged_ledger();
