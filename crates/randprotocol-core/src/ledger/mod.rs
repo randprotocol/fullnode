@@ -12,6 +12,7 @@ pub mod aggregation;
 pub mod bridge_notes;
 pub mod call_envelope;
 pub mod staking;
+pub mod receivers;
 pub mod supply;
 
 use crate::bridge::{BridgeError, BridgeState, CheckedAttestation};
@@ -194,6 +195,10 @@ pub enum TxError {
     /// [`aggregation::AggregationError`]).
     #[error("aggregation: {0}")]
     Aggregation(#[from] aggregation::AggregationError),
+    /// Short addresses: a `RegisterReceiver` the registry refused (see
+    /// [`receivers::ReceiverError`]).
+    #[error("receivers: {0}")]
+    Receiver(#[from] receivers::ReceiverError),
     #[error("arithmetic overflow")]
     Overflow,
 }
@@ -250,6 +255,9 @@ pub struct CallReceiptData {
 struct Verified {
     call: Option<CallOutcome>,
     attestation: Option<CheckedAttestation>,
+    /// A `RegisterReceiver`'s id and the registry root after inserting it, from a proof
+    /// verified against the ledger's own root.
+    receiver: Option<(crate::address::ReceiverId, Hash)>,
 }
 
 /// The commitment of the note a faucet mint creates: owner `pk`, no sender, `amount` of the
@@ -327,6 +335,23 @@ pub struct Ledger {
     /// information the chain already holds (the fee is in the bundle, the heights are the
     /// chain's), and `Ledger::from_parts` cannot know it.
     unsealed_fees: BTreeMap<Hash, (u64, Address, u64)>,
+    /// The genesis `receivers` section (short-address spec §7.5), set from the genesis file
+    /// like `aggregation`. `None` refuses `RegisterReceiver` by name and keeps the state root
+    /// byte-for-byte chain 13's.
+    receivers: Option<receivers::ReceiversConfig>,
+    /// The receiver registry's sparse-Merkle root and record count: consensus state, in the
+    /// state root when `receivers` is set. The records live in the node's store (spec §6.3).
+    receivers_root: Hash,
+    receivers_count: u64,
+    /// The `(id, seq)` pairs this branch registered above the last commit (spec §6.5): what a
+    /// store holding only committed records needs to answer for a speculative ledger. Not
+    /// consensus state — derivable from the uncommitted blocks — so outside equality and the
+    /// root; pruned by the node once the store has the records.
+    receivers_pending: Vec<(crate::address::ReceiverId, u64)>,
+    /// Registrations in the block being applied (the per-block cap). Reset by `close_block`.
+    receivers_in_block: u32,
+    /// Where registration proofs come from (spec §6.4). Cloned with the ledger; never compared.
+    receiver_source: Option<receivers::SourceHandle>,
 }
 
 /// Equality is over consensus state only. `height` and `timestamp_ms` are the position of the
@@ -351,6 +376,8 @@ impl PartialEq for Ledger {
             && self.programs == o.programs
             && self.bridge == o.bridge
             && self.aggregators == o.aggregators
+            && self.receivers_root == o.receivers_root
+            && self.receivers_count == o.receivers_count
     }
 }
 impl Eq for Ledger {}
@@ -394,6 +421,12 @@ impl Ledger {
             pruned_side: BTreeMap::new(),
             supply: Supply::default(),
             unsealed_fees: BTreeMap::new(),
+            receivers: None,
+            receivers_root: receivers::empty_root(),
+            receivers_count: 0,
+            receivers_pending: Vec::new(),
+            receivers_in_block: 0,
+            receiver_source: None,
         }
     }
 
@@ -437,6 +470,12 @@ impl Ledger {
             pruned_side: BTreeMap::new(),
             supply: Supply::default(),
             unsealed_fees: BTreeMap::new(),
+            receivers: None,
+            receivers_root: receivers::empty_root(),
+            receivers_count: 0,
+            receivers_pending: Vec::new(),
+            receivers_in_block: 0,
+            receiver_source: None,
         }
     }
 
@@ -604,6 +643,50 @@ impl Ledger {
     /// itself is not touched: it is consensus state, and only the five actions move it.
     pub fn set_aggregation(&mut self, aggregation: Option<aggregation::AggregationConfig>) {
         self.aggregation = aggregation;
+    }
+
+    /// Install (or clear) the receiver registry gate. Genesis calls this from its `receivers`
+    /// section; a reloading node calls it with what storage held.
+    pub fn set_receivers(&mut self, cfg: Option<receivers::ReceiversConfig>) {
+        self.receivers = cfg;
+    }
+
+    pub fn receivers(&self) -> Option<&receivers::ReceiversConfig> {
+        self.receivers.as_ref()
+    }
+
+    pub fn receivers_root(&self) -> Hash {
+        self.receivers_root
+    }
+
+    pub fn receivers_count(&self) -> u64 {
+        self.receivers_count
+    }
+
+    /// Position the registry at a stored root and count (a reloading node, genesis).
+    pub fn set_receivers_state(&mut self, root: Hash, count: u64) {
+        self.receivers_root = root;
+        self.receivers_count = count;
+        self.receivers_pending.clear();
+    }
+
+    pub fn receivers_pending(&self) -> &[(crate::address::ReceiverId, u64)] {
+        &self.receivers_pending
+    }
+
+    /// Drop pending entries the store now holds (seq below `committed`). Consensus-neutral:
+    /// the pending set is not in the state root, and a source ignores entries it already has.
+    pub fn prune_receivers_pending(&mut self, committed: u64) {
+        self.receivers_pending.retain(|(_, s)| *s >= committed);
+    }
+
+    /// Where this ledger (and every clone of it) gets registration proofs (spec C-17).
+    pub fn set_receiver_source(&mut self, source: std::sync::Arc<dyn receivers::ReceiverSource>) {
+        self.receiver_source = Some(receivers::SourceHandle(source));
+    }
+
+    pub fn has_receiver_source(&self) -> bool {
+        self.receiver_source.is_some()
     }
 
     /// The aggregation section, or `None` on a chain without one — where the five aggregation
@@ -901,6 +984,9 @@ impl Ledger {
             Action::Withdraw { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
                 return Err(TxError::EnvelopeTooLarge)
             }
+            Action::RegisterReceiver { kem_ek, .. } if kem_ek.len() != crate::notes::KEM_EK_BYTES => {
+                return Err(receivers::ReceiverError::BadRecordLength(kem_ek.len()).into())
+            }
             Action::BridgeAttest { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
                 return Err(TxError::EnvelopeTooLarge)
             }
@@ -1038,6 +1124,9 @@ impl Ledger {
             | Action::SlashAggregator { .. }) => {
                 aggregation::validate(self, tx, a, executor)?;
             }
+            Action::RegisterReceiver { pk, kem_ek } => {
+                verified.receiver = Some(receivers::validate(self, pk, kem_ek)?);
+            }
             Action::Aggregate { .. } => {
                 // The covered bundles' records live in node storage, which the ledger cannot
                 // see: admission and application of an aggregate run through
@@ -1172,6 +1261,10 @@ impl Ledger {
             | Action::WithdrawAggregator { .. }
             | Action::SlashAggregator { .. }) => {
                 aggregation::apply(self, tx, a, proposer, executor)?;
+            }
+            Action::RegisterReceiver { .. } => {
+                let (id, root) = verified.receiver.expect("validate_inner returns the insertion for registrations");
+                receivers::apply(self, id, root);
             }
             Action::Aggregate { .. } => {
                 // Unreachable through `validate_inner` (its action arm refuses first); named
@@ -1374,6 +1467,7 @@ impl Ledger {
     pub fn close_block(&mut self, height: u64, proposer: &Address) {
         self.sweep_expired_excesses(height, proposer);
         self.record_anchor(height);
+        self.receivers_in_block = 0;
     }
 
     /// Deterministic state commitment (spec §9):
@@ -1445,6 +1539,19 @@ impl Ledger {
         buf.extend_from_slice(prog_root.as_bytes());
         if let Some(bridge) = &self.bridge {
             buf.extend_from_slice(bridge.root().as_bytes());
+        }
+        // Short-address spec §6.6: a chain with a receivers section commits under
+        // `rand-state-5` with a flags byte naming the optional components, since presence can
+        // no longer be read from length. Every other chain is byte-for-byte what it was (C-3).
+        if self.receivers.is_some() {
+            let flags = u8::from(self.bridge.is_some()) | u8::from(self.aggregation.is_some()) << 1 | 1 << 2;
+            if self.aggregation.is_some() {
+                buf.extend_from_slice(aggregation::aggregators_root(&self.aggregators).as_bytes());
+            }
+            buf.extend_from_slice(self.receivers_root.as_bytes());
+            let mut tagged = vec![flags];
+            tagged.extend_from_slice(&buf);
+            return Hash::digest_domain(b"rand-state-5", &tagged);
         }
         if self.aggregation.is_some() {
             buf.extend_from_slice(aggregation::aggregators_root(&self.aggregators).as_bytes());
@@ -2714,5 +2821,218 @@ mod tests {
         }
         assert_eq!(scratch.next_index(), 4, "four new leaves in tree order");
         assert_eq!(scratch.validators()[&a.address()].rewards, 2 * gas::BUNDLE_BASE);
+    }
+
+    // ---- short addresses: the receiver registry (spec §§6–7) ---------------------------------
+
+    fn rcv_record(n: u8) -> crate::ledger::receivers::ReceiverRecord {
+        crate::ledger::receivers::ReceiverRecord { pk: [n as u32; 8], kem_ek: vec![n; crate::notes::KEM_EK_BYTES] }
+    }
+
+    fn reg_fee() -> u64 {
+        gas::fee_floor(&Action::RegisterReceiver { pk: [0; 8], kem_ek: vec![] })
+    }
+
+    /// A registration riding a self-transfer bundle anchored at `l`'s root; `n` keeps the
+    /// bundle's nullifiers and commitments unique.
+    fn reg_tx(l: &Ledger, rec: &crate::ledger::receivers::ReceiverRecord, n: u32, fee: u64) -> Transaction {
+        let b = bundle(l, [[1000 + n; 8], [2000 + n; 8]], [[3000 + n; 8], [4000 + n; 8]], fee);
+        Transaction::shielded(7, b, Action::RegisterReceiver { pk: rec.pk, kem_ek: rec.kem_ek.clone() })
+    }
+
+    type Store = std::sync::Arc<std::sync::RwLock<receivers::MemoryReceivers>>;
+
+    /// A ledger with a receivers section whose committed store holds `committed` (seq order).
+    fn rcv_ledger(max_per_block: u32, committed: &[u8]) -> (Ledger, Store) {
+        let mut l = ledger();
+        let mut mem = receivers::MemoryReceivers::default();
+        for n in committed {
+            mem.insert(rcv_record(*n).id());
+        }
+        let count = mem.seqs.len() as u64;
+        let root = receivers::root(&receivers::SeqView::new(&mem.seqs, count, &[]));
+        let mem = std::sync::Arc::new(std::sync::RwLock::new(mem));
+        l.set_receivers(Some(receivers::ReceiversConfig { max_per_block }));
+        l.set_receivers_state(root, count);
+        l.set_receiver_source(mem.clone());
+        (l, mem)
+    }
+
+    fn root_of(records: &[u8]) -> Hash {
+        let mut mem = receivers::MemoryReceivers::default();
+        for n in records {
+            mem.insert(rcv_record(*n).id());
+        }
+        receivers::root(&receivers::SeqView::new(&mem.seqs, records.len() as u64, &[]))
+    }
+
+    fn rcv_err(e: receivers::ReceiverError) -> Result<(), TxError> {
+        Err(TxError::Receiver(e))
+    }
+
+    #[test]
+    fn a_registration_pays_its_floor_and_inserts_the_record() {
+        assert_eq!(reg_fee(), 31_400_000, "BUNDLE_BASE + 25 000 × 1 216 (spec §7.3)");
+        let (mut l, _) = rcv_ledger(64, &[1, 2]);
+        let (a, _) = keys();
+        let low = reg_tx(&l, &rcv_record(3), 0, reg_fee() - 1);
+        assert_eq!(l.validate(&low, &StubExecutor), Err(TxError::FeeTooLow { min: reg_fee(), fee: reg_fee() - 1 }));
+        let t = reg_tx(&l, &rcv_record(3), 0, reg_fee());
+        l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
+        assert_eq!(l.receivers_count(), 3);
+        assert_eq!(l.receivers_root(), root_of(&[1, 2, 3]));
+        assert_eq!(l.receivers_pending(), &[(rcv_record(3).id(), 2)]);
+    }
+
+    #[test]
+    fn a_chain_without_the_section_refuses_by_name_and_keeps_its_root() {
+        let l = ledger();
+        let t = reg_tx(&l, &rcv_record(1), 0, reg_fee());
+        assert_eq!(l.validate(&t, &StubExecutor), rcv_err(receivers::ReceiverError::Disabled));
+        // C-3: only a chain with the section changes its root's domain.
+        let mut on = l.clone();
+        on.set_receivers(Some(receivers::ReceiversConfig { max_per_block: 64 }));
+        assert_ne!(on.state_root(), l.state_root());
+        on.set_receivers(None);
+        assert_eq!(on.state_root(), l.state_root());
+    }
+
+    #[test]
+    fn duplicates_are_refused_committed_or_pending() {
+        let (mut l, _) = rcv_ledger(64, &[1]);
+        let (a, _) = keys();
+        let base = l.clone();
+        let dup = reg_tx(&base, &rcv_record(1), 0, reg_fee());
+        assert_eq!(l.validate(&dup, &StubExecutor), rcv_err(receivers::ReceiverError::Exists(rcv_record(1).id())));
+        l.apply_tx(&reg_tx(&base, &rcv_record(2), 1, reg_fee()), &a.address(), &StubExecutor).unwrap();
+        let again = reg_tx(&base, &rcv_record(2), 2, reg_fee());
+        assert_eq!(l.validate(&again, &StubExecutor), rcv_err(receivers::ReceiverError::Exists(rcv_record(2).id())));
+    }
+
+    /// Spec §6.5: blocks above the last commit register records the store has never seen, and
+    /// each next block's proof still verifies — the pending set carries them.
+    #[test]
+    fn registrations_in_consecutive_uncommitted_blocks_all_apply() {
+        let (mut l, mem) = rcv_ledger(64, &[]);
+        let (a, _) = keys();
+        for (h, n) in [(2u64, 10u8), (3, 11), (4, 12)] {
+            l.set_height(h);
+            let t = reg_tx(&l, &rcv_record(n), n as u32, reg_fee());
+            l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
+            l.close_block(h, &a.address());
+        }
+        assert_eq!(mem.read().unwrap().seqs.len(), 0, "the store committed nothing");
+        assert_eq!(l.receivers_root(), root_of(&[10, 11, 12]));
+        // The store commits the first two; pruning drops what it holds, and the ledger still
+        // answers for the third through the pending set.
+        {
+            let mut m = mem.write().unwrap();
+            m.insert(rcv_record(10).id());
+            m.insert(rcv_record(11).id());
+        }
+        l.prune_receivers_pending(2);
+        assert_eq!(l.receivers_pending(), &[(rcv_record(12).id(), 2)]);
+        l.set_height(5);
+        l.apply_tx(&reg_tx(&l, &rcv_record(13), 13, reg_fee()), &a.address(), &StubExecutor).unwrap();
+        assert_eq!(l.receivers_root(), root_of(&[10, 11, 12, 13]));
+    }
+
+    #[test]
+    fn two_forks_each_register_against_their_own_pending_set() {
+        let (base, _) = rcv_ledger(64, &[1]);
+        let (a, _) = keys();
+        let mut left = base.clone();
+        let mut right = base.clone();
+        left.apply_tx(&reg_tx(&base, &rcv_record(2), 2, reg_fee()), &a.address(), &StubExecutor).unwrap();
+        right.apply_tx(&reg_tx(&base, &rcv_record(3), 3, reg_fee()), &a.address(), &StubExecutor).unwrap();
+        // Each fork can then register the other's record: nothing leaks across branches.
+        left.apply_tx(&reg_tx(&base, &rcv_record(3), 4, reg_fee()), &a.address(), &StubExecutor).unwrap();
+        right.apply_tx(&reg_tx(&base, &rcv_record(2), 5, reg_fee()), &a.address(), &StubExecutor).unwrap();
+        assert_eq!(left.receivers_root(), root_of(&[1, 2, 3]));
+        assert_eq!(right.receivers_root(), root_of(&[1, 3, 2]));
+        assert_ne!(left.receivers_root(), right.receivers_root(), "seq is in the leaf");
+    }
+
+    #[test]
+    fn the_per_block_cap_is_a_block_rule_and_resets_at_block_end() {
+        let (mut l, _) = rcv_ledger(2, &[]);
+        let (a, _) = keys();
+        let base = l.clone();
+        for n in 0..2 {
+            l.apply_tx(&reg_tx(&base, &rcv_record(n), n as u32, reg_fee()), &a.address(), &StubExecutor).unwrap();
+        }
+        let third = reg_tx(&base, &rcv_record(2), 2, reg_fee());
+        assert_eq!(l.validate(&third, &StubExecutor), rcv_err(receivers::ReceiverError::TooManyInBlock { max: 2 }));
+        l.close_block(1, &a.address());
+        l.set_height(2);
+        let third = reg_tx(&l, &rcv_record(2), 2, reg_fee());
+        l.apply_tx(&third, &a.address(), &StubExecutor).unwrap();
+        // And as a block: three registrations in one block fail at index 2, whoever built it.
+        let (mut l, _) = rcv_ledger(2, &[]);
+        let txs: Vec<Transaction> = (0..3).map(|n| reg_tx(&l, &rcv_record(n), n as u32, reg_fee())).collect();
+        let err = l.apply_transactions(&txs, &a.address(), &StubExecutor).unwrap_err();
+        assert!(matches!(err, BlockError::InvalidTx { index: 2, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn malformed_records_are_refused_before_anything_else() {
+        let (l, _) = rcv_ledger(64, &[]);
+        let mut short = rcv_record(1);
+        short.kem_ek.pop();
+        let t = reg_tx(&l, &short, 0, reg_fee());
+        assert_eq!(
+            l.validate(&t, &StubExecutor),
+            rcv_err(receivers::ReceiverError::BadRecordLength(crate::notes::KEM_EK_BYTES - 1))
+        );
+        let mut bad_pk = rcv_record(1);
+        bad_pk.pk = [1, 0xffff_ffff, 0, 0, 0, 0, 0, 0];
+        let t = reg_tx(&l, &bad_pk, 0, reg_fee());
+        assert_eq!(l.validate(&t, &StubExecutor), rcv_err(receivers::ReceiverError::NonCanonicalPk));
+    }
+
+    /// R6: a store that lies, or has nothing to say, makes the node refuse — never accept.
+    #[test]
+    fn a_lying_or_absent_source_can_only_cause_a_refusal() {
+        use crate::address::ReceiverId;
+        fn empty_proof(id: &ReceiverId) -> receivers::SmtProof {
+            match receivers::lookup(&receivers::SeqView::new(&BTreeMap::new(), 0, &[]), id) {
+                receivers::ReceiverProof::Absent(p) => p,
+                receivers::ReceiverProof::Present { .. } => unreachable!(),
+            }
+        }
+        struct Liar;
+        impl receivers::ReceiverSource for Liar {
+            fn lookup(&self, _: u64, _: &[(ReceiverId, u64)], id: &ReceiverId) -> Option<receivers::ReceiverProof> {
+                Some(receivers::ReceiverProof::Absent(empty_proof(id))) // "absent", over an empty registry
+            }
+        }
+        struct Claims;
+        impl receivers::ReceiverSource for Claims {
+            fn lookup(&self, _: u64, _: &[(ReceiverId, u64)], id: &ReceiverId) -> Option<receivers::ReceiverProof> {
+                Some(receivers::ReceiverProof::Present { seq: 0, proof: empty_proof(id) }) // "present": it is not
+            }
+        }
+        let (mut l, _) = rcv_ledger(64, &[1, 2]);
+        let t = reg_tx(&l, &rcv_record(3), 0, reg_fee());
+        l.set_receiver_source(std::sync::Arc::new(Liar));
+        assert_eq!(l.validate(&t, &StubExecutor), rcv_err(receivers::ReceiverError::BadProof));
+        l.set_receiver_source(std::sync::Arc::new(Claims));
+        assert_eq!(l.validate(&t, &StubExecutor), rcv_err(receivers::ReceiverError::BadProof));
+        l.receiver_source = None;
+        assert_eq!(l.validate(&t, &StubExecutor), rcv_err(receivers::ReceiverError::SourceUnavailable));
+    }
+
+    /// C-9: the proposer's header root and the replica's recomputed root come from the same
+    /// steps — a block carrying registrations applies through `apply_block`.
+    #[test]
+    fn a_block_with_registrations_applies_with_the_proposers_root() {
+        let (l, _) = rcv_ledger(64, &[1]);
+        let (a, _) = keys();
+        let txs = vec![reg_tx(&l, &rcv_record(2), 2, reg_fee()), reg_tx(&l, &rcv_record(3), 3, reg_fee())];
+        let root = root_after(&l, &txs, &a.address(), 2);
+        let mut replica = l.clone();
+        replica.apply_block(&signed_block(txs, &a, 2, root), &StubExecutor).unwrap();
+        assert_eq!(replica.receivers_root(), root_of(&[1, 2, 3]));
+        assert_eq!(replica.state_root(), root);
     }
 }

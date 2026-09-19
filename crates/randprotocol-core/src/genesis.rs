@@ -24,6 +24,39 @@ pub struct GenesisValidator {
     pub payout: String,
 }
 
+/// The genesis `receivers` section (short-address spec §7.5): the per-block registration cap
+/// and the records the chain starts with, registered in list order from seq 0.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiversGenesis {
+    #[serde(default = "default_max_receivers_per_block")]
+    pub max_per_block: u32,
+    #[serde(default)]
+    pub records: Vec<ReceiverRecordHex>,
+}
+
+fn default_max_receivers_per_block() -> u32 {
+    crate::ledger::receivers::DEFAULT_MAX_PER_BLOCK
+}
+
+/// A receiver record as hex text: `pk` (64 hex characters) and `kem_ek` (2 368).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiverRecordHex {
+    pub pk: String,
+    pub kem_ek: String,
+}
+
+impl ReceiverRecordHex {
+    pub fn from_address(a: &ShieldedAddress) -> ReceiverRecordHex {
+        ReceiverRecordHex { pk: hex::encode(word8_to_bytes(&a.pk)), kem_ek: hex::encode(&a.kem_ek) }
+    }
+
+    fn to_record(&self) -> Option<crate::ledger::receivers::ReceiverRecord> {
+        let pk = crate::notes::word8_from_bytes(&hex::decode(&self.pk).ok()?)?;
+        let kem_ek = hex::decode(&self.kem_ek).ok()?;
+        Some(crate::ledger::receivers::ReceiverRecord { pk, kem_ek })
+    }
+}
+
 /// The four envelope parts as hex text, so a genesis file stays readable JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvelopeHex {
@@ -133,6 +166,11 @@ pub struct Genesis {
     /// [`gas::MAX_PROGRAM_PUBLIC_WORDS`], no public input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_program_public_words: Option<u32>,
+    /// Short addresses (spec §7.5): the receiver registry. Part of the genesis hash and of the
+    /// state root when present; omitted entirely when absent, so a chain without it keeps its
+    /// genesis file, hash and state root byte-for-byte (C-3, C-12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receivers: Option<ReceiversGenesis>,
 }
 
 fn default_true() -> bool {
@@ -208,6 +246,8 @@ pub enum GenesisError {
     BadMaxCallEnvelopeBytes(u32),
     #[error("bad max_program_public_words {0} (0..={limit})", limit = gas::MAX_PROGRAM_PUBLIC_WORDS_LIMIT)]
     BadMaxProgramPublicWords(u32),
+    #[error("bad receivers section: {0}")]
+    BadReceivers(String),
     #[error("the genesis supply (alloc notes plus validator stakes) sums past u64::MAX")]
     SupplyOverflow,
 }
@@ -227,6 +267,8 @@ pub struct GenesisState {
     pub block: Block,
     /// The alloc notes in file order: commitment, envelope, amount.
     pub notes: Vec<(Word8, Envelope, u64)>,
+    /// The genesis receiver records in file order — seq 0, 1, … (short-address spec C-10).
+    pub receivers: Vec<crate::ledger::receivers::ReceiverRecord>,
 }
 
 impl GenesisState {
@@ -357,6 +399,37 @@ impl Genesis {
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
         ledger.set_timestamp_ms(self.timestamp_ms);
+        // The receiver registry (spec C-10): records in list order under the rules a
+        // registration gets (length, canonical pk, no duplicate), the root computed directly.
+        let mut receivers = Vec::new();
+        if let Some(section) = &self.receivers {
+            use crate::ledger::receivers::{self as rcv, MemoryReceivers, SeqView};
+            if section.max_per_block == 0 {
+                return Err(GenesisError::BadReceivers("zero max_per_block".into()));
+            }
+            let mut mem = MemoryReceivers::default();
+            for r in &section.records {
+                let rec = r.to_record().ok_or_else(|| GenesisError::BadReceivers(format!("malformed record {}", r.pk)))?;
+                rcv::check_size(&rec.kem_ek).map_err(|e| GenesisError::BadReceivers(e.to_string()))?;
+                if !crate::address::pk_is_canonical(&rec.pk) {
+                    return Err(GenesisError::BadReceivers(format!("non-canonical pk {}", r.pk)));
+                }
+                let id = rec.id();
+                if mem.seqs.contains_key(&id.0) {
+                    return Err(GenesisError::BadReceivers(format!("duplicate record {}", id.to_hex())));
+                }
+                mem.insert(id);
+                receivers.push(rec);
+            }
+            let n = mem.seqs.len() as u64;
+            let root = rcv::root(&SeqView::new(&mem.seqs, n, &[]));
+            ledger.set_receivers(Some(rcv::ReceiversConfig { max_per_block: section.max_per_block }));
+            ledger.set_receivers_state(root, n);
+            // A source that answers for the genesis records, so a ledger built from this file
+            // alone (tests, `verify_chain`'s starting point) can admit registrations. A node
+            // replaces it with its store at load (spec C-17).
+            ledger.set_receiver_source(std::sync::Arc::new(std::sync::RwLock::new(mem)));
+        }
         let mut notes = Vec::new();
         // Everything this chain starts with, for the supply audit (`ledger::supply`). Genesis
         // notes are the only value on the chain that no transaction ever minted, so this is the
@@ -435,6 +508,17 @@ impl Genesis {
                 commit.extend_from_slice(&n.to_be_bytes());
             }
         }
+        // The receivers section, last and tagged like the limits: every field enters the hash
+        // (C-11), and a file without the section hashes byte-for-byte as before.
+        if let Some(section) = &self.receivers {
+            commit.extend_from_slice(b"receivers");
+            commit.extend_from_slice(&section.max_per_block.to_be_bytes());
+            commit.extend_from_slice(&(receivers.len() as u64).to_be_bytes());
+            for r in &receivers {
+                commit.extend_from_slice(&word8_to_bytes(&r.pk));
+                commit.extend_from_slice(&r.kem_ek);
+            }
+        }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -458,6 +542,7 @@ impl Genesis {
             ledger,
             block,
             notes,
+            receivers,
         })
     }
 }
@@ -558,7 +643,7 @@ mod tests {
         }
     }
 
-    /// A valid `rand1…` payout address, distinct per `i`.
+    /// A valid payout address (the direct form), distinct per `i`.
     fn payout(i: u8) -> String {
         ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; crate::notes::KEM_EK_BYTES] }.to_string()
     }
@@ -592,11 +677,57 @@ mod tests {
             max_block_bytes: None,
             max_call_envelope_bytes: None,
             max_program_public_words: None,
+            receivers: None,
         }
     }
 
     fn build(g: &Genesis) -> GenesisState {
         g.build(&StubExecutor).unwrap()
+    }
+
+    fn rec(i: u8) -> ReceiverRecordHex {
+        ReceiverRecordHex::from_address(&ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; crate::notes::KEM_EK_BYTES] })
+    }
+
+    /// Short-address spec C-10–C-12: the section registers its records in order, binds the
+    /// genesis hash, switches the state root's domain, and refuses a duplicate or a bad record;
+    /// a file without it is byte-for-byte what it was.
+    #[test]
+    fn the_receivers_section_registers_binds_and_validates() {
+        let plain = build(&genesis(2));
+        assert!(plain.ledger.receivers().is_none());
+        assert!(plain.receivers.is_empty());
+        let mut g = genesis(2);
+        g.receivers = Some(ReceiversGenesis { max_per_block: 64, records: vec![rec(1), rec(2)] });
+        let s = build(&g);
+        assert_eq!(s.ledger.receivers_count(), 2);
+        assert_eq!(s.receivers.len(), 2);
+        let mut mem = crate::ledger::receivers::MemoryReceivers::default();
+        mem.insert(s.receivers[0].id());
+        mem.insert(s.receivers[1].id());
+        let want = crate::ledger::receivers::root(&crate::ledger::receivers::SeqView::new(&mem.seqs, 2, &[]));
+        assert_eq!(s.ledger.receivers_root(), want);
+        assert_ne!(s.hash(), plain.hash(), "the section enters the genesis hash");
+        assert_ne!(s.block.header.state_root, plain.block.header.state_root);
+        // Order matters: seq is in the leaf.
+        let mut swapped = g.clone();
+        swapped.receivers.as_mut().unwrap().records.reverse();
+        assert_ne!(build(&swapped).hash(), s.hash());
+        // An empty section is still a section: the gate is on.
+        let mut empty = genesis(2);
+        empty.receivers = Some(ReceiversGenesis { max_per_block: 64, records: vec![] });
+        assert_eq!(build(&empty).ledger.receivers_root(), crate::ledger::receivers::empty_root());
+        let mut dup = g.clone();
+        dup.receivers.as_mut().unwrap().records.push(rec(1));
+        assert!(matches!(dup.build(&StubExecutor), Err(GenesisError::BadReceivers(_))));
+        let mut bad = g.clone();
+        bad.receivers.as_mut().unwrap().records[0].kem_ek = "00".into();
+        assert!(matches!(bad.build(&StubExecutor), Err(GenesisError::BadReceivers(_))));
+        let mut zero = g;
+        zero.receivers.as_mut().unwrap().max_per_block = 0;
+        assert!(matches!(zero.build(&StubExecutor), Err(GenesisError::BadReceivers(_))));
+        // A file without the section serializes without the key.
+        assert!(!genesis(2).to_json().contains("receivers"));
     }
 
     #[test]

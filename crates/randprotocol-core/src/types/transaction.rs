@@ -182,6 +182,14 @@ pub enum Action {
         envelope: Envelope,
         signature: Signature,
     },
+    /// Short addresses (spec §7.1): publish a `(pk, kem_ek)` record in the receiver registry
+    /// under its own hash, the receiver id a short address carries. Rides a bundle, which pays
+    /// the fee; anybody may register any record, because the id proves the record.
+    RegisterReceiver {
+        pk: Word8,
+        #[serde(with = "crate::crypto::wire_bytes")]
+        kem_ek: Vec<u8>,
+    },
 }
 
 impl Action {
