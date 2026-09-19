@@ -21,6 +21,8 @@ hex = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true }
+# F-7: the FIPS 203 check on a resolved encapsulation key; the zkVM crate's own pin.
+ml-kem = "=0.3.2"
 
 [features]
 default = []

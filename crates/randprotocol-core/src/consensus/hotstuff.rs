@@ -212,6 +212,17 @@ impl HotStuff {
     pub fn committed_ledger(&self) -> &Ledger {
         &self.committed_ledger
     }
+
+    /// Short addresses (spec C-14): once the store holds the records below `committed`, drop
+    /// them from every speculative ledger's pending set. Consensus-neutral — the pending set is
+    /// outside the state root and a source ignores entries it already has — so this only
+    /// bounds memory; a node that never called it would still agree with its peers.
+    pub fn prune_receivers_pending(&mut self, committed: u64) {
+        for e in self.tree.values_mut() {
+            e.ledger_after.prune_receivers_pending(committed);
+        }
+        self.committed_ledger.prune_receivers_pending(committed);
+    }
     pub fn is_validator(&self) -> bool {
         self.signer.is_some()
     }

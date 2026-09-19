@@ -5179,6 +5179,7 @@ dependencies = [
  "clap",
  "hex",
  "libp2p",
+ "ml-kem",
  "randprotocol-core",
  "randprotocol-node",
  "randprotocol-zkvm",

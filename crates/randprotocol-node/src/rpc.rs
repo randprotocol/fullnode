@@ -602,13 +602,14 @@ fn parse_hash(params: &Value, idx: usize) -> Result<Hash, RpcError> {
     Hash::from_hex(&s).map_err(|e| RpcError::invalid_params(format!("hash: {e}")))
 }
 
-/// A `rand1…` shielded address.
+/// A shielded address carrying keys: the direct form (`trnd1q…`, 1,964 characters) or the
+/// legacy `rand1…` one. A short address is refused by name — it names a receiver id, and a node
+/// that resolved it for the caller would learn who is being paid (short-address spec W-7).
 ///
-/// The length is checked *before* parsing: `ShieldedAddress::parse` base58-decodes the whole
-/// string before it ever looks at the decoded length, and base58 decoding is quadratic in the
-/// input. This runs on a tokio worker shared with the node loop, so an unbounded parameter would
-/// let one request stall consensus. A real address is `rand1` plus ~1663 base58 characters
-/// (32-byte `pk` + a 1184-byte ML-KEM-768 encapsulation key), so 2000 is generous.
+/// The length is checked *before* parsing: legacy parsing base58-decodes the whole string before
+/// it looks at the decoded length, and base58 decoding is quadratic in the input. This runs on a
+/// tokio worker shared with the node loop, so an unbounded parameter would let one request stall
+/// consensus.
 fn parse_shielded(params: &Value, idx: usize) -> Result<ShieldedAddress, RpcError> {
     let s: String = param(params, idx, "address")?;
     if s.len() > MAX_ADDRESS_CHARS {
@@ -868,6 +869,31 @@ fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
     })
 }
 
+/// Short addresses (spec §§9–10): the smallest set a thin wallet asks for, the largest prefix
+/// length, the largest bucket served and `rand_getReceivers`' page.
+const RECEIVER_K_MIN: u64 = 256;
+const RECEIVER_MAX_BITS: u8 = 24;
+const RECEIVER_MAX_BUCKET: usize = 4096;
+const RECEIVERS_PAGE: usize = 512;
+
+/// W-4: the bucket width every thin wallet uses at this registry size, so all of them ask for
+/// buckets of the same shape — `clamp(floor(log2(count / K_MIN)), 0, 24)`.
+pub fn receiver_bucket_bits(count: u64) -> u8 {
+    let q = count / RECEIVER_K_MIN;
+    if q == 0 {
+        0
+    } else {
+        (63 - q.leading_zeros() as u8).min(RECEIVER_MAX_BITS)
+    }
+}
+
+fn receiver_json(r: &crate::storage::ReceiverRow) -> Value {
+    json!({
+        "seq": r.seq, "height": r.height, "id": r.record.id().to_hex(),
+        "pk": hex::encode(randprotocol_core::notes::word8_to_bytes(&r.record.pk)), "kem_ek": hex::encode(&r.record.kem_ek),
+    })
+}
+
 /// `bridge` is the asset registry, which a `BridgeAttest` needs and nothing else does: the
 /// deposit's asset index is state, not a field of the transaction. `executor` is what computes
 /// that deposit's commitment, the one note commitment the wire does not carry.
@@ -970,6 +996,15 @@ fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>, executor: &dyn Confiden
             "kind": "aggregate", "covers": covers.len(), "proof_len": proof.len(),
             "aggregator": aggregator.to_base58(), "nonce": nonce, "time": time
         }),
+        // Short addresses: a registration publishes a record and nothing else (spec §8), so the
+        // whole record is shown, with the id and both text forms it makes payable.
+        Action::RegisterReceiver { pk, kem_ek } => {
+            let id = randprotocol_core::address::ReceiverId::of(pk, kem_ek);
+            json!({
+                "kind": "register_receiver", "id": id.to_hex(), "short": id.to_string(),
+                "pk": hex::encode(randprotocol_core::notes::word8_to_bytes(pk)), "kem_ek_len": kem_ek.len(),
+            })
+        }
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -1268,6 +1303,54 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             Ok(json!(hex::encode(words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())))
         }
         "rand_getLimits" => Ok(json!(st.limits)),
+        // Short addresses (spec §10). The registry is public chain state; what these methods are
+        // careful about is the *question*: they stream it in order or serve it by id prefix, and
+        // there is no exact lookup by id (N-3), so a caller never tells the node who it pays.
+        "rand_getReceiverInfo" => {
+            let s = st.storage.clone();
+            blocking(move || {
+                let count = s.receivers_count();
+                let cfg = s.receivers_config()?;
+                Ok(json!({
+                    "enabled": cfg.is_some(),
+                    "max_per_block": cfg.map(|c| c.max_per_block),
+                    "count": count,
+                    "k_min": RECEIVER_K_MIN,
+                    "bits": receiver_bucket_bits(count),
+                }))
+            })
+            .await
+        }
+        "rand_getReceivers" => {
+            let from: u64 = param(p, 0, "from_seq")?;
+            let limit: usize = p.get(1).map(|_| param(p, 1, "limit")).transpose()?.unwrap_or(RECEIVERS_PAGE).min(RECEIVERS_PAGE);
+            let s = st.storage.clone();
+            blocking(move || {
+                let rows = s.receivers_from(from, limit)?;
+                let next = rows.last().map_or(from, |r| r.seq + 1);
+                Ok(json!({ "records": rows.iter().map(receiver_json).collect::<Vec<_>>(), "next_seq": next, "count": s.receivers_count() }))
+            })
+            .await
+        }
+        "rand_getReceiverBucket" => {
+            let prefix: String = param(p, 0, "prefix")?;
+            let bits: u8 = param(p, 1, "bits")?;
+            if bits > RECEIVER_MAX_BITS {
+                return Err(RpcError::invalid_params(format!("bits must be at most {RECEIVER_MAX_BITS}")));
+            }
+            let raw = hex::decode(&prefix).map_err(|_| RpcError::invalid_params("prefix must be hex"))?;
+            if raw.len() != (bits as usize).div_ceil(8) {
+                return Err(RpcError::invalid_params(format!("prefix must be {} bytes for {bits} bits", (bits as usize).div_ceil(8))));
+            }
+            let mut full = [0u8; 32];
+            full[..raw.len()].copy_from_slice(&raw);
+            let s = st.storage.clone();
+            let rows = blocking(move || s.receivers_bucket(&full, bits, RECEIVER_MAX_BUCKET)).await?;
+            let rows = rows.ok_or_else(|| {
+                RpcError::invalid_params(format!("bucket holds more than {RECEIVER_MAX_BUCKET} records; increase bits"))
+            })?;
+            Ok(json!({ "bits": bits, "prefix": prefix, "records": rows.iter().map(receiver_json).collect::<Vec<_>>() }))
+        }
         "rand_getProgramCode" => {
             let id = parse_hash(p, 0)?;
             Ok(st
@@ -1968,6 +2051,51 @@ mod tests {
 
     async fn ok(st: &RpcState, method: &str, params: Value) -> Value {
         call(st, method, params).await.unwrap_or_else(|e| panic!("{method}: {}", e.message))
+    }
+
+    /// Short addresses (spec §10): the info, stream and bucket methods over a registry of three
+    /// genesis records; W-4's bucket width; and no exact lookup by id exists (N-3).
+    #[tokio::test]
+    async fn the_receiver_methods_stream_and_bucket_the_registry() {
+        use randprotocol_core::address::ReceiverId;
+        use randprotocol_core::genesis::{ReceiverRecordHex, ReceiversGenesis};
+        let (_d, plain) = state_for(&genesis_with(7, vec![]));
+        let v = ok(&plain, "rand_getReceiverInfo", json!([])).await;
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["count"], 0);
+
+        let mut g = fixtures::genesis_file_of(7, &[&key(1)], vec![], randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT);
+        let addrs: Vec<_> = [60u8, 61, 62].iter().map(|n| fixtures::payout(*n)).collect();
+        g.receivers = Some(ReceiversGenesis {
+            max_per_block: 64,
+            records: addrs.iter().map(ReceiverRecordHex::from_address).collect(),
+        });
+        let gs = g.build(&StubExecutor).unwrap();
+        let (_d, st) = state_for(&gs);
+        let v = ok(&st, "rand_getReceiverInfo", json!([])).await;
+        assert_eq!((v["enabled"].clone(), v["count"].clone(), v["bits"].clone(), v["k_min"].clone()), (json!(true), json!(3), json!(0), json!(256)));
+
+        let page = ok(&st, "rand_getReceivers", json!([0, 2])).await;
+        assert_eq!(page["records"].as_array().unwrap().len(), 2);
+        assert_eq!(page["next_seq"], 2);
+        assert_eq!(page["records"][1]["id"], ReceiverId::of_address(&addrs[1]).to_hex());
+        let rest = ok(&st, "rand_getReceivers", json!([2])).await;
+        assert_eq!(rest["records"].as_array().unwrap().len(), 1);
+        assert_eq!(rest["records"][0]["kem_ek"], hex::encode(&addrs[2].kem_ek));
+
+        let all = ok(&st, "rand_getReceiverBucket", json!(["", 0])).await;
+        assert_eq!(all["records"].as_array().unwrap().len(), 3);
+        let id = ReceiverId::of_address(&addrs[0]);
+        let top = id.0[0] & 0xf0;
+        let b = ok(&st, "rand_getReceiverBucket", json!([hex::encode([top]), 4])).await;
+        let ids: Vec<&str> = b["records"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&id.to_hex().as_str()));
+        assert!(call(&st, "rand_getReceiverBucket", json!(["00", 25])).await.is_err(), "bits over 24");
+        assert!(call(&st, "rand_getReceiverBucket", json!(["0000", 4])).await.is_err(), "prefix length must match bits");
+        assert!(call(&st, "rand_getReceiver", json!([id.to_hex()])).await.is_err(), "no exact lookup (N-3)");
+
+        // W-4 at the counts the spec's test plan names.
+        assert_eq!([0, 255, 256, 1_000_000].map(receiver_bucket_bits), [0, 0, 0, 11]);
     }
 
     fn nf(n: u8) -> Word8 {

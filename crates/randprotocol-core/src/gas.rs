@@ -91,6 +91,10 @@ pub const BUNDLE_BASE: u64 = 1_000_000;
 /// bridge has delivered their first note, so the bridge's RAND fee is collected on the way out.
 pub const BRIDGE_BURN_FEE: u64 = 10 * BUNDLE_BASE;
 pub const DEPLOY_PER_WORD: u64 = 100_000;
+/// Short addresses (spec §7.3): the price of one byte of receiver record, `DEPLOY_PER_WORD / 4`
+/// — the chain's existing price of permanent state. A record's floor is
+/// `BUNDLE_BASE + 1216 · REGISTER_PER_BYTE` = 31 400 000 units, 0.0314 RAND.
+pub const REGISTER_PER_BYTE: u64 = DEPLOY_PER_WORD / 4;
 pub const CALL_BASE: u64 = 1_000_000;
 pub const CALL_PER_TIER_STEP: u64 = 100_000;
 
@@ -161,6 +165,9 @@ pub fn fee_floor(action: &Action) -> u64 {
         // bundle-less actions): the aggregate's proving share is collected from the covered
         // bundles' excess, not from the author (spec §5.2, ruling R5).
         Action::RegisterAggregator { .. } => BUNDLE_BASE,
+        // Short addresses (spec §7.3): the registry is permanent state on every validator, so a
+        // record pays the per-byte price the chain already charges deployed program words.
+        Action::RegisterReceiver { .. } => BUNDLE_BASE + REGISTER_PER_BYTE * crate::ledger::receivers::RECORD_BYTES as u64,
         Action::UnbondAggregator { .. }
         | Action::WithdrawAggregator { .. }
         | Action::SlashAggregator { .. }

@@ -1,6 +1,7 @@
 //! RAND chain core: cryptography, types, ledger, and HotStuff consensus.
 //! Pure logic with no I/O so it can be tested deterministically.
 
+pub mod address;
 pub mod bridge;
 pub mod confidential;
 pub mod consensus;

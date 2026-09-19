@@ -39,8 +39,26 @@ struct Cli {
 enum Cmd {
     /// Create a new spend-key file (refuses to overwrite).
     Keygen,
-    /// Show this wallet's shielded address.
-    Address,
+    /// Show this wallet's addresses: the direct form (payable by anyone, no setup) and the short
+    /// form (63–64 characters, payable once the record is registered — `rand register`).
+    Address {
+        /// Print the old `rand1…` base58 form instead (spec F-9).
+        #[arg(long)]
+        legacy: bool,
+    },
+    /// Publish this wallet's record in the receiver registry, so its short address becomes
+    /// payable. A self-transfer that pays the registration fee (0.0314 RAND); anybody may
+    /// register any record, so `--for` registers someone else's direct address instead.
+    Register {
+        /// A direct (`trnd1q…`) address to register on its owner's behalf.
+        #[arg(long = "for", value_name = "ADDRESS")]
+        for_address: Option<String>,
+        /// Return once the node accepts the bundle instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+        #[arg(long)]
+        cuda: bool,
+    },
     /// Print this wallet's viewing key: 64 hex, the form `rand_importViewingKey` takes.
     ///
     /// It reads every note this wallet has sent or received and can spend none of them. Anyone
@@ -73,7 +91,8 @@ enum Cmd {
     History,
     /// Send RAND to a shielded address: scan, select, prove and submit.
     Send {
-        /// A `rand1…` shielded address.
+        /// A shielded address: direct (`trnd1q…`), short (`trnd1s…`, resolved privately through
+        /// the registry) or legacy (`rand1…`).
         to: String,
         /// Amount in RAND, e.g. 1.5
         amount: String,
@@ -440,7 +459,45 @@ async fn main() -> Result<()> {
             w.save_new(&cli.key)?;
             println!("wrote {}\naddress: {}", cli.key.display(), w.address);
         }
-        Cmd::Address => println!("{}", Wallet::load(&cli.key)?.address),
+        Cmd::Address { legacy } => {
+            let a = Wallet::load(&cli.key)?.address;
+            if legacy {
+                println!("{}", a.to_legacy_string());
+            } else {
+                println!("{a}");
+                let id = randprotocol_core::address::ReceiverId::of_address(&a);
+                eprintln!("short: {id}\n  (payable once registered: `rand register`; the address above works with every wallet, no setup)");
+            }
+        }
+        Cmd::Register { for_address, no_wait, cuda } => {
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            let record = match &for_address {
+                Some(s) => parse_address(s)?,
+                None => w.address.clone(),
+            };
+            randprotocol_client::receiver::check_encapsulation_key(&record.kem_ek)?;
+            let id = randprotocol_core::address::ReceiverId::of_address(&record);
+            // Asked the private way, like a payer would (W-13 prefers watching the stream; this
+            // is the same fetch).
+            if randprotocol_client::receiver::is_registered(&rpc, &id).await? {
+                println!("already registered: {id}");
+                return Ok(());
+            }
+            // W-11: the bundle is a self-transfer of this wallet's own notes and pays nobody.
+            let action = Action::RegisterReceiver { pk: record.pk, kem_ek: record.kem_ek.clone() };
+            let fee = gas::fee_floor(&action);
+            if for_address.is_none() {
+                eprintln!(
+                    "note: registering right after a payment arrived links the two in time; the spec (W-12) suggests waiting 16-256 blocks"
+                );
+            }
+            let chain_id = rpc.chain_id().await?;
+            let profile = profile_of(&rpc).await?;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, !no_wait).await;
+            store.save(&path)?;
+            report(&s?, "registration");
+            println!("short address: {id}");
+        }
         Cmd::ViewingKey => {
             println!("{}", Wallet::load(&cli.key)?.viewing_key_hex());
             eprintln!("reads every note this wallet sent or received; spends nothing. A node imports it with rand_importViewingKey.");
@@ -555,7 +612,13 @@ async fn main() -> Result<()> {
         }
         Cmd::Send { to, amount, fee, no_wait, cuda } => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
-            let to = parse_address(&to)?;
+            // Resolved before anything is proved, and a short address through the registry the
+            // private way (spec §9) — the fetch is not adjacent to the proof only by accident of
+            // proving time, which is the best a one-shot command can do for W-8.
+            let cache_path = randprotocol_client::receiver::cache_path(&cli.key);
+            let mut cache = randprotocol_client::receiver::Cache::load(&cache_path);
+            let to = randprotocol_client::receiver::resolve(&rpc, &mut cache, &to).await?;
+            cache.save(&cache_path)?;
             let amount = parse_amount(&amount)?;
             let fee = match fee { Some(f) => parse_amount(&f)?, None => gas::BUNDLE_BASE };
             let chain_id = rpc.chain_id().await?;

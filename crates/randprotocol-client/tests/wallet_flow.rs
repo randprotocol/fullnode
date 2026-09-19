@@ -87,6 +87,7 @@ fn genesis_with(validator: &Keypair, max_program_words: Option<u32>, max_program
         max_block_bytes: None,
         max_call_envelope_bytes: None,
         max_program_public_words,
+        receivers: None,
     }
 }
 

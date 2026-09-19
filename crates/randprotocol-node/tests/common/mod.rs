@@ -83,6 +83,7 @@ fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core
         max_block_bytes: None,
         max_call_envelope_bytes: None,
         max_program_public_words: None,
+        receivers: None,
     }
 }
 

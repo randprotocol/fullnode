@@ -1169,6 +1169,7 @@ impl Node {
         }
         let ledger = self.hs.committed_ledger().clone();
         self.storage.commit(&blocks, &ledger, &epoch_sets, self.executor.as_ref())?;
+        self.hs.prune_receivers_pending(self.storage.receivers_count());
         let mut newly_sealed: Vec<Hash> = Vec::new();
         for cb in &blocks {
             let included: Vec<Hash> = cb.block.transactions.iter().map(|tx| tx.hash()).collect();
@@ -1872,6 +1873,7 @@ impl Node {
             accepted.push(CommittedBlock { receipts, deposits, ..cb });
         }
         self.storage.commit(&accepted, &ledger, &recorded, self.executor.as_ref())?;
+        self.hs.prune_receivers_pending(self.storage.receivers_count());
         for cb in &accepted {
             tracing::info!("synced block {} ({} txs)", cb.block.height(), cb.block.transactions.len());
             let included: Vec<Hash> = cb.block.transactions.iter().map(|tx| tx.hash()).collect();
@@ -1904,6 +1906,10 @@ impl Node {
                 profile: core_profile(&self.gs.fri_profile),
             }));
         }
+        // The receiver source *does* ride the resume — it is on the ledger, and `ledger` came from
+        // `load_ledger` (spec C-17) — but its pending set was built while syncing and the store
+        // now holds all of it.
+        self.hs.prune_receivers_pending(self.storage.receivers_count());
         self.timeout = None;
         self.propose_at = None;
         let acts = self.hs.start();

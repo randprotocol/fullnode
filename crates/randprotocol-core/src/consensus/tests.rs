@@ -45,6 +45,16 @@ fn setup_epochs(n: u8, validators: u8, epoch_blocks: u64) -> Sim {
 }
 
 fn build(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool) -> Sim {
+    build_with(n, validators, epoch_blocks, all_signers, None)
+}
+
+fn build_with(
+    n: u8,
+    validators: u8,
+    epoch_blocks: u64,
+    all_signers: bool,
+    receivers: Option<crate::genesis::ReceiversGenesis>,
+) -> Sim {
     let keys: Vec<Keypair> = (1..=n).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
     let genesis = Genesis {
         chain_id: 1,
@@ -70,6 +80,7 @@ fn build(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool) -> Sim {
         max_block_bytes: None,
         max_call_envelope_bytes: None,
         max_program_public_words: None,
+        receivers,
         bridge: None,
         aggregation: None,
     };
@@ -248,6 +259,65 @@ fn env() -> Envelope {
 /// A faucet mint of one unit to owner `[n; 8]` with blinding `[n; 8]`, signed by validator `key`.
 fn mint(key: &Keypair, n: u32) -> Transaction {
     Transaction::mint(1, [n; 8], 0, [n; 8], env(), 1, key, &StubExecutor)
+}
+
+/// A registration of record `n` riding a stub-proved self-transfer bundle anchored at the
+/// genesis root (in the anchor window for the whole of a short simulation).
+fn register_tx(gs: &crate::genesis::GenesisState, n: u32) -> Transaction {
+    let action = crate::types::Action::RegisterReceiver { pk: [n; 8], kem_ek: vec![n as u8; crate::notes::KEM_EK_BYTES] };
+    let mut b = crate::notes::Bundle {
+        anchor: gs.ledger.root(),
+        nullifiers: [[5000 + n; 8], [6000 + n; 8]],
+        commitments: [[7000 + n; 8], [8000 + n; 8]],
+        fee: crate::gas::fee_floor(&action),
+        burn: 0,
+        asset: 0,
+        time: 0,
+        envelopes: [env(), env()],
+        proof: vec![],
+    };
+    let d = StubExecutor.bundle_digest(&b.digest_input());
+    b.proof = StubExecutor::make_bundle_proof(&gs.hc_bundle, &d);
+    Transaction::shielded(1, b, action)
+}
+
+/// Short addresses end to end through HotStuff (spec §6.5, C-9): every proposal carries a new
+/// registration, so each block registers against a parent the three-chain rule has not
+/// committed yet — and no replica has a store beyond the genesis records, so every proof after
+/// the first comes through the pending set. Every replica votes (the proposer's root is the
+/// replica's), commits the same chain, and ends on the same registry.
+#[test]
+fn registrations_commit_through_consensus_over_uncommitted_parents() {
+    let genesis_record = crate::genesis::ReceiverRecordHex::from_address(&crate::notes::ShieldedAddress {
+        pk: [99; 8],
+        kem_ek: vec![99; crate::notes::KEM_EK_BYTES],
+    });
+    let mut sim = build_with(
+        4,
+        4,
+        crate::genesis::EPOCH_BLOCKS_DEFAULT,
+        false,
+        Some(crate::genesis::ReceiversGenesis { max_per_block: 64, records: vec![genesis_record] }),
+    );
+    let gs = sim.gs.clone();
+    for n in 1..=10u32 {
+        sim.step(vec![register_tx(&gs, n)]);
+    }
+    sim.assert_consistent();
+    let committed = &sim.committed[0];
+    assert!(committed.len() >= 5, "committed {}", committed.len());
+    let registered: usize = committed
+        .iter()
+        .map(|cb| cb.block.transactions.iter().filter(|t| matches!(t.action, crate::types::Action::RegisterReceiver { .. })).count())
+        .sum();
+    assert!(registered >= 5, "registrations committed: {registered}");
+    // Consecutive blocks each carried one: the case a committed-only store could not answer.
+    assert!(committed.windows(2).any(|w| !w[0].block.transactions.is_empty() && !w[1].block.transactions.is_empty()));
+    for node in &sim.nodes {
+        let l = node.committed_ledger();
+        assert_eq!(l.receivers_count(), 1 + registered as u64);
+        assert_eq!(l.receivers_root(), sim.nodes[0].committed_ledger().receivers_root());
+    }
 }
 
 /// The node with a pending `ReadyToPropose`, and the view it is for.
@@ -906,6 +976,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         max_block_bytes: None,
         max_call_envelope_bytes: None,
         max_program_public_words: None,
+        receivers: None,
         bridge: None,
         aggregation: None,
     };
@@ -1358,6 +1429,7 @@ fn aggregation_node_with(
         max_block_bytes: None,
         max_call_envelope_bytes: None,
         max_program_public_words: None,
+        receivers: None,
         bridge: None,
         aggregation: Some(cfg.clone()),
     };

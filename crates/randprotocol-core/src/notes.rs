@@ -4,7 +4,6 @@
 //! free of the zkVM's field-arithmetic crates.
 
 use crate::confidential::ConfidentialExecutor;
-use crate::crypto::Hash;
 use serde::{Deserialize, Serialize};
 
 pub type Word8 = [u32; 8];
@@ -12,7 +11,8 @@ pub const DEPTH: usize = 32;
 pub const MAX_ENVELOPE_BYTES: usize = 2048;
 /// ML-KEM-768 encapsulation key length (FIPS 203).
 pub const KEM_EK_BYTES: usize = 1184;
-pub const ADDRESS_PREFIX: &str = "rand1";
+/// The legacy text prefix; kept as a name for the parsers that still accept it (spec §4.4).
+pub const ADDRESS_PREFIX: &str = crate::address::LEGACY_PREFIX;
 
 /// The 32 little-endian bytes of a word octet.
 pub fn word8_to_bytes(w: &Word8) -> [u8; 32] {
@@ -126,33 +126,35 @@ impl Bundle {
 }
 
 /// A shielded address: the note owner field `pk` plus the ML-KEM-768 encapsulation key
-/// envelopes are sealed to. Text form: `rand1` + base58(pk bytes || kem_ek).
+/// envelopes are sealed to. Text form (short-address spec §4): the Bech32m **direct** address
+/// `trnd1q…` / `rnd1q…` ([`crate::address::encode_direct`]); the legacy `rand1` + base58 form
+/// still parses. A short address (`…1s…`) names a receiver id, not keys, and is resolved through
+/// the registry before it can be parsed into one of these.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShieldedAddress {
     pub pk: Word8,
     pub kem_ek: Vec<u8>,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
-pub enum AddressError {
-    #[error("shielded address must start with {ADDRESS_PREFIX}")]
-    Prefix,
-    #[error("shielded address is not base58")]
-    Base58,
-    #[error("shielded address decodes to {0} bytes, expected {expected}", expected = 32 + KEM_EK_BYTES)]
-    Length(usize),
-}
+pub use crate::address::AddressError;
 
 impl ShieldedAddress {
+    /// The direct form on this process's network ([`crate::address::Network::current`]).
     #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
+        crate::address::encode_direct(self, crate::address::Network::current())
+    }
+
+    /// The legacy `rand1` + base58 form, for `--legacy` output only (spec F-9).
+    pub fn to_legacy_string(&self) -> String {
         let mut raw = word8_to_bytes(&self.pk).to_vec();
         raw.extend_from_slice(&self.kem_ek);
         format!("{ADDRESS_PREFIX}{}", bs58::encode(raw).into_string())
     }
 
     /// The 32-byte stand-in for this address in a place that has room for 32 bytes and no
-    /// more: the `to` field of a bridge transfer payload (spec §10).
+    /// more: the `to` field of a bridge transfer payload (spec §10), and — the same bytes — the
+    /// receiver id a short address carries ([`crate::address::ReceiverId`]).
     ///
     /// A shielded address is ~1.2 KB — the ML-KEM encapsulation key dominates — and the wire
     /// format guardians sign is fixed at 32 bytes, so a source-chain depositor names its
@@ -160,18 +162,13 @@ impl ShieldedAddress {
     /// the ledger to check against it. Domain-separated like every other hash here, over
     /// exactly the two fields the address is: `pk` bytes then `kem_ek`.
     pub fn recipient_hash(&self) -> [u8; 32] {
-        let mut raw = word8_to_bytes(&self.pk).to_vec();
-        raw.extend_from_slice(&self.kem_ek);
-        Hash::digest_domain(b"rand-shielded-recipient", &raw).0
+        crate::address::ReceiverId::of_address(self).0
     }
 
+    /// The keys a direct or legacy string carries. A short address is refused with
+    /// [`AddressError::ShortNotDirect`]: it has to be resolved first.
     pub fn parse(s: &str) -> Result<ShieldedAddress, AddressError> {
-        let rest = s.strip_prefix(ADDRESS_PREFIX).ok_or(AddressError::Prefix)?;
-        let raw = bs58::decode(rest).into_vec().map_err(|_| AddressError::Base58)?;
-        if raw.len() != 32 + KEM_EK_BYTES {
-            return Err(AddressError::Length(raw.len()));
-        }
-        Ok(ShieldedAddress { pk: word8_from_bytes(&raw[..32]).unwrap(), kem_ek: raw[32..].to_vec() })
+        crate::address::parse_keys(s)
     }
 }
 
@@ -332,12 +329,17 @@ mod tests {
     fn shielded_address_roundtrips_and_rejects_bad_input() {
         let a = ShieldedAddress { pk: [9; 8], kem_ek: vec![7; KEM_EK_BYTES] };
         let s = a.to_string();
-        assert!(s.starts_with(ADDRESS_PREFIX));
+        assert!(s.starts_with("trnd1q"), "the direct form on the default (test) network");
         assert_eq!(ShieldedAddress::parse(&s).unwrap(), a);
-        assert_eq!(ShieldedAddress::parse("abc").unwrap_err(), AddressError::Prefix);
+        // The legacy form still parses (spec F-8).
+        assert_eq!(ShieldedAddress::parse(&a.to_legacy_string()).unwrap(), a);
+        assert!(matches!(ShieldedAddress::parse("abc").unwrap_err(), AddressError::NoSeparator | AddressError::UnknownPrefix(_)));
         assert_eq!(ShieldedAddress::parse("rand10OIl").unwrap_err(), AddressError::Base58);
         let short = format!("{ADDRESS_PREFIX}{}", bs58::encode([1u8; 40]).into_string());
-        assert_eq!(ShieldedAddress::parse(&short).unwrap_err(), AddressError::Length(40));
+        assert_eq!(ShieldedAddress::parse(&short).unwrap_err(), AddressError::Length { got: 40, expected: 32 + KEM_EK_BYTES });
+        // A short address names an id, not keys.
+        let id = crate::address::ReceiverId::of_address(&a).to_short(crate::address::Network::Test);
+        assert_eq!(ShieldedAddress::parse(&id).unwrap_err(), AddressError::ShortNotDirect);
     }
 
     /// Naive reference: hash every level over the padded leaf list.
