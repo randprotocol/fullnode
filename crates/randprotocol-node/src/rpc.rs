@@ -810,7 +810,8 @@ fn parse_token_key(params: &Value, idx: usize) -> Result<Result<u64, randprotoco
     if !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()) {
         return s.parse::<u64>().map(Ok).map_err(|_| RpcError::invalid_params("token: index out of range"));
     }
-    if s.len() >= 4 && s[..4].eq_ignore_ascii_case("rpl1") {
+    // `get`, not `[..4]`: a multi-byte character straddling byte 4 would panic a slice.
+    if s.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("rpl1")) {
         return randprotocol_core::token_id::decode(s)
             .map(Err)
             .map_err(|e| RpcError::invalid_params(format!("token: {e}")));
@@ -3821,6 +3822,9 @@ mod tests {
         assert_eq!(call(&st, "rand_getToken", json!([typo])).await.unwrap_err().code, -32602);
         assert_eq!(call(&st, "rand_getToken", json!(["rpl1".repeat(1000)])).await.unwrap_err().code, -32602);
         assert_eq!(call(&st, "rand_getToken", json!(["nonsense"])).await.unwrap_err().code, -32602);
+        // Non-ASCII input is refused, never a panic on a character boundary.
+        assert_eq!(call(&st, "rand_getToken", json!(["rplé"])).await.unwrap_err().code, -32602);
+        assert_eq!(call(&st, "rand_getToken", json!(["ééé"])).await.unwrap_err().code, -32602);
 
         assert_eq!(
             ok(&st, "rand_getTokenSupply", json!([2])).await,
