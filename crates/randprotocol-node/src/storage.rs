@@ -2514,13 +2514,28 @@ pub(crate) mod fixtures {
     /// `make_block` without executing the transactions: the only way to build a block carrying a
     /// transaction the ledger would have rejected, which is what a torn block on disk looks like.
     pub(crate) fn make_block_unchecked(parent: &Block, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
+        make_block_unchecked_at(parent, ledger, txs, k, parent.height() + 1)
+    }
+
+    /// `make_block`, stamped `timestamp_ms` rather than its height — for a test that needs the
+    /// block time to cross a day (B1's mint-cap day).
+    pub(crate) fn make_block_at(parent: &Block, ledger: &mut Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
+        let height = parent.height() + 1;
+        ledger.set_height(height);
+        ledger.set_timestamp_ms(timestamp_ms);
+        ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
+        ledger.record_anchor(height);
+        make_block_unchecked_at(parent, ledger, txs, k, timestamp_ms)
+    }
+
+    fn make_block_unchecked_at(parent: &Block, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
         let height = parent.height() + 1;
         let header = BlockHeader {
             height,
             view: parent.view() + 1,
             parent: parent.hash(),
             proposer: k.public_key().clone(),
-            timestamp_ms: height,
+            timestamp_ms,
             tx_root: Block::tx_root(&txs),
             state_root: ledger.state_root(),
             justify: QuorumCertificate { view: parent.view(), block_hash: parent.hash(), votes: vec![] },

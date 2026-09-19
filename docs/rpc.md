@@ -615,9 +615,10 @@ order), or `[]` on a chain without a bridge:
 `index` is the `asset` word a note of that asset carries — index 0 is RAND and is never in the
 registry. One row per **backing** (source coin). `mint_cap_per_day` (bridge hardening B1) is the
 genesis `tokens.mint_cap_per_day`, the most one backing may mint per UTC day of the block time, in
-the token's eight-decimal units; `minted_today` is what this backing has minted on UTC day
-`mint_day` (`timestamp_ms / 86 400 000`) — a counter from an earlier day starts again from zero at
-the next deposit. A deposit past the cap is refused `MintCapExceeded` and becomes admissible the
+the token's eight-decimal units; `minted_today` is what this backing has minted on `mint_day`, the
+UTC day (`timestamp_ms / 86 400 000`) of the **head block** — the figure the cap would count the
+next deposit against, so a counter left from an earlier day reads `0` once the head crosses
+midnight, never the stale figure. A deposit past the cap is refused `MintCapExceeded` and becomes admissible the
 next day. `chain` and `token` are the wire identity guardians sign about; `asset_id` is
 `blake3` of the two, and is what `rand_bridgeAssetId` computes.
 

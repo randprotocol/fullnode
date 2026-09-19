@@ -696,10 +696,12 @@ fn attest_deposit(attestation: &[u8], tokens: Option<&TokenRegistry>) -> Option<
 /// refuse an unreleasable amount before buying two bundle proofs (bridge-06/audit O-5).
 ///
 /// Bridge hardening B1 adds the daily cap: `mint_cap_per_day` (the registry's, which binds every
-/// backing alike), and this coin's `minted_today` on UTC day `mint_day` of the block time — as
-/// stored, so a counter from an earlier day reads as that day's figure and the next deposit
-/// starts it again from zero.
-fn asset_json(index: u32, b: &Backing, mint_cap_per_day: u64) -> Value {
+/// backing alike), and this coin's `minted_today` on `day`, the UTC day of the head block's
+/// timestamp — `Backing::minted_on(day)`, the figure the cap is checked against, never the raw
+/// counter: a counter left from an earlier day reads zero, as the ledger reads it, rather than as
+/// a stale figure a relayer would take for today's headroom. `mint_day` is the day that figure is
+/// for (the counter's own day never runs ahead of the head's: block timestamps are monotonic).
+fn asset_json(index: u32, b: &Backing, mint_cap_per_day: u64, day: u32) -> Value {
     json!({
         "index": index,
         "chain": b.chain,
@@ -708,9 +710,17 @@ fn asset_json(index: u32, b: &Backing, mint_cap_per_day: u64) -> Value {
         "decimals": b.decimals,
         "locked": b.locked,
         "mint_cap_per_day": mint_cap_per_day,
-        "minted_today": b.minted_today,
-        "mint_day": b.mint_day,
+        "minted_today": b.minted_on(day),
+        "mint_day": day.max(b.mint_day),
     })
+}
+
+/// B1's mint-cap day of the committed head: the UTC day of its block timestamp, the day the
+/// ledger's `check_lock` would count the next deposit against were it applied on the head's
+/// state (`randprotocol_core::bridge::mint_day` of `timestamp_ms / 1000`).
+fn head_mint_day(storage: &Storage) -> Result<u32, RpcError> {
+    let head = storage.head_block().map_err(RpcError::internal)?;
+    Ok(randprotocol_core::bridge::mint_day(head.header.timestamp_ms / 1000))
 }
 
 /// The bridged half of the token registry as `rand_getAssets` serves it: one row **per backing**,
@@ -718,12 +728,12 @@ fn asset_json(index: u32, b: &Backing, mint_cap_per_day: u64) -> Value {
 /// its coins. One zUSD backed by seven coins is seven rows all carrying `index` 1 (spec §12). A
 /// native RPL token is not a bridged asset and is not here (Task 7's `rand_getTokens` is the
 /// whole registry).
-fn assets_json(tokens: &TokenRegistry) -> Vec<Value> {
+fn assets_json(tokens: &TokenRegistry, day: u32) -> Vec<Value> {
     tokens
         .iter()
         .flat_map(|info| match &info.authority {
             MintAuthority::Bridge { backings } => {
-                backings.iter().map(|b| asset_json(info.index, b, tokens.mint_cap_per_day())).collect::<Vec<_>>()
+                backings.iter().map(|b| asset_json(info.index, b, tokens.mint_cap_per_day(), day)).collect::<Vec<_>>()
             }
             _ => Vec::new(),
         })
@@ -1814,6 +1824,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             // there; a bridged chain always has one (`GenesisError::BridgeNeedsTokens`), and a
             // store that somehow lacks it serves an empty registry rather than failing the call.
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
+            let day = head_mint_day(&st.storage)?;
             let guardians = bridge
                 .guardian_sets
                 .get(&bridge.current_set)
@@ -1847,7 +1858,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // `next_index` is gone with the bridge's own registry: there is no index to
                 // predict any more, because a bridged token is listed before it can be deposited
                 // and its index is a fact a wallet reads off `assets` (`rand_getAssets`).
-                "assets": tokens.as_ref().map(assets_json).unwrap_or_default(),
+                "assets": tokens.as_ref().map(|t| assets_json(t, day)).unwrap_or_default(),
             }))
         }
         // ---- the token registry (RPL spec §6) ----
@@ -1898,7 +1909,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "rand_getAssets" => {
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
             let bridged = st.storage.bridge_meta().map_err(RpcError::internal)?.is_some();
-            Ok(json!(tokens.as_ref().filter(|_| bridged).map(assets_json).unwrap_or_default()))
+            let day = head_mint_day(&st.storage)?;
+            Ok(json!(tokens.as_ref().filter(|_| bridged).map(|t| assets_json(t, day)).unwrap_or_default()))
         }
         // The outbound message with this sequence, verbatim, for guardians to sign.
         "rand_getBridgeBurn" => {
@@ -3790,6 +3802,32 @@ mod tests {
         assert_eq!(id, asset.to_hex());
         let bad = call(&st, "rand_bridgeAssetId", json!([2, "aabb"])).await.unwrap_err();
         assert_eq!(bad.code, -32602);
+    }
+
+    /// B1's counter as served: `minted_today` is what the cap would count on the head's day, so a
+    /// counter left from an earlier day reads zero once the head's block time crosses midnight —
+    /// never the stale figure — and `mint_day` names the day the figure is for. The stored counter
+    /// itself does not move until the next deposit.
+    #[tokio::test]
+    async fn minted_today_is_the_heads_day_figure_across_a_day_boundary() {
+        let (_d, st, _gs, _) = bridged_chain();
+        let row = |v: &Value| (v[0]["minted_today"].clone(), v[0]["mint_day"].clone());
+        let assets = ok(&st, "rand_getAssets", json!([])).await;
+        assert_eq!(row(&assets), (json!(1_000), json!(0)), "day 0: the 1 000 deposited today");
+
+        // An empty block one day and a second later.
+        let mut ledger = st.storage.load_ledger(&StubExecutor).unwrap();
+        let parent = st.storage.head_block().unwrap();
+        let b3 = crate::storage::fixtures::make_block_at(&parent, &mut ledger, vec![], &key(1), 86_401_000);
+        st.storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+        let stored = st.storage.tokens().unwrap().unwrap();
+        let b = stored.backing(1, 2, &fixtures::TOKEN).unwrap();
+        assert_eq!((b.minted_today, b.mint_day), (1_000, 0), "the stored counter is untouched");
+
+        let assets = ok(&st, "rand_getAssets", json!([])).await;
+        assert_eq!(row(&assets), (json!(0), json!(1)), "day 1: nothing minted yet, not the stale 1 000");
+        let state = ok(&st, "rand_getBridgeState", json!([])).await;
+        assert_eq!(state["assets"], assets, "both reads serve the same rows");
     }
 
     /// The outbound message a burn emitted, for guardians to sign, keyed by its sequence.
