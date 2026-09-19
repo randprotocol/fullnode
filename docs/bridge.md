@@ -92,8 +92,8 @@ attacker — theft, with nothing on Rand to show it was not the burner's intent.
 copied the same way with its deposit `r`, `time` or envelope changed (stranding the recipient's
 note), or its fee bundle lifted onto another transaction. Now every bundle proof is made over, and
 verified against, the eight words of `Transaction::binding` — a hash of the whole transaction
-(chain id, both bundles including their envelopes, the action) with only the bundle proof bytes
-blanked —
+(chain id, the one bundle including its four envelopes, the action) with only the bundle proof
+bytes blanked —
 as its public input segment, so any copy that changes any field fails the proof
 (`TxError::InvalidBundleProof`, `PublicValues`); the ledger tests named in `docs/confidential.md`
 admitted each of these copies before the fix and refuse them after. **Every wallet and relayer
@@ -241,52 +241,65 @@ Test coverage: `guardian_upgrade_must_be_signed_by_the_current_set`,
 | `emitter` | `[u8; 32]` | Rand's outbound emitter address, stamped into burn messages |
 | `emitters` | `BTreeMap<u16, [u8; 32]>` | registered emitter per source chain |
 | `guardian_sets` | `BTreeMap<u32, GuardianSet>` | every set ever seen, by index |
-| `current_set` | `u32` | index of the authoritative set |
-| `assets` | `BTreeMap<AssetId, AssetInfo>` | registry: id -> `{ chain, token, index }` |
-| `next_index` | `u32` | the note index the next newly registered asset will get |
+| `current_set` | `u32` | index of the authoritative ECDSA set |
 | `spent` | `BTreeSet<Hash>` | consumed attestation digests (inbound replay guard) |
 | `burn_sequence` | `u64` | next outbound sequence number |
 | `burns` | `BTreeMap<u64, BridgeBurnRecord>` | every outbound message, held whole in memory |
+| `pq_guardians` | `Vec<PublicKey>` | B3: the genesis Dilithium2 set, index-aligned with the ECDSA `guardian_sets[0]`; fixed for the chain's life |
+| `pause_key` | `Option<PublicKey>` | B1: the one Dilithium2 key that may `PauseMints` |
+| `mint_paused` | `bool` | B1: while true, every transfer `BridgeAttest` is refused |
+| `pause_nonce` | `u64` | B1: what the next `PauseMints`/`UnpauseMints` must carry |
+| `list_nonce` | `u64` | B4: what the next `ListBacking`/`RegisterBridgedToken` must carry |
 
 **There are no balances.** Phase S3 deleted `balances: BTreeMap<(AssetId, Address), u128>` outright:
 a bridged holding is a note in the ledger's own commitment tree, and the tree is what commits to it.
-What is left here is the *public* half of the bridge — who may attest, which assets exist and under
-which index, which digests are consumed, and what has been burned outbound.
+What is left here is the *public* half of the bridge — who may attest, which digests are consumed,
+what has been burned outbound, and (since bridge hardening) the pause and listing state.
 
 `AssetId = blake3("rand-bridge-asset" || token_chain BE u16 || token_address)` — a pure,
-domain-separated function of `(chain, address)`, computable even without a bridge (§6).
+domain-separated function of `(chain, address)`, computable even without a bridge (§6); it is still
+what `rand_bridgeAssetId` computes and what a `Transfer` payload's `(token_chain, token_address)`
+resolves to, but it is no longer a *registry key*: see §13.
 
-**Asset indices.** A note's `asset` field is one word (`u32`), and a 32-byte `AssetId` does not fit
-in it, so the registry hands out dense indices in registration order: `FIRST_ASSET_INDEX = 1`, and
-0 is RAND, which is never in the registry. The index is assigned at an asset's **first sighting**
-— the first accepted attestation naming it — and never changes afterwards. `next_index` is
-consensus state, not a cache: two nodes disagreeing about it would mint notes with different `asset`
-words from the same attestation. Bridged amounts must also fit a note's `u64`; a transfer above that
-is `BridgeError::AmountTooLarge` rather than a truncated note.
+**Asset indices moved to the RPL token registry (v0.5).** `BridgeState` used to own the map from
+`AssetId` to `{ chain, token, index }` and the counter that assigned the next index; the RPL token
+standard (`docs/tokens.md`) replaced both with `crate::ledger::tokens::TokenRegistry`, a
+ledger-level registry shared by native and bridged tokens alike. `BridgeState::check_attest`/
+`check_burn` now *resolve* an asset through the registry instead of owning it; §13 has the details.
+A note's `asset` field is still one dense `u32` word (`FIRST_TOKEN_INDEX = 1`, 0 is RAND), and
+bridged amounts must still fit a note's `u64` (`BridgeError::AmountOverflow` above that).
 
 ### `root()` and what it commits
 
 ```
-blake3("rand-bridge-state"
+blake3("rand-bridge-state-4"
     || bincode(emitter, emitters, current_set, guardian_sets)
-    || merkle(blake3("rand-asset-registry" || asset || chain BE || token || index BE))
     || merkle(sorted spent digests)
-    || burn_sequence BE || next_index BE)
+    || burn_sequence BE
+    || bincode(pq_guardians)
+    || bincode(pause_key, mint_paused, pause_nonce, list_nonce))
 ```
 
 `emitter`/`emitters` are included because they are consensus-relevant genesis configuration, not
-incidental metadata. So are the note indices and the counter that assigns the next one. `burns` is
-**excluded** — derivable from transaction history; test
-`root_changes_with_the_registry_spent_and_sequence_but_not_burn_records` clears `burns` on a clone
-and confirms the root is unchanged.
+incidental metadata. `burns` is **excluded** — derivable from transaction history; test
+`root_changes_with_the_spent_set_and_the_sequence_but_not_burn_records` clears `burns` on a clone
+and confirms the root is unchanged. **The asset registry and its `next_index` counter are not here
+at all** — both moved to `TokenRegistry`, which the *chain's* state root commits to separately as
+`tokens_root` (§13); committing them here too would only give two places for the same fact to
+disagree.
 
-The root is pinned by `root_is_pinned_for_a_fixed_state`: a fixed state (two guardians, one asset at
-index 1, `next_index = 2`, one spent digest, `burn_sequence = 7`) must hash to
-`ee50b48c82eacf7aca2a1bdb33b32b7c98b1a255e645c9ba12dde9d060c43dc8`. The test's comment: "Changing
+The root is pinned by `root_is_pinned_for_a_fixed_state`: a fixed state (two guardians, two PQ
+guardians, a pause key, one spent digest, `burn_sequence = 7`) must hash to
+`4f2ea1290d513a855ddaaa7aa2ce68a3bd5a54ef3f84819b238a6e9c1da0f712`. The test's comment: "Changing
 this hash changes consensus ... treat a failure here as a hard fork, never as a test to
-re-baseline." It has been re-pinned exactly once, in S3, when the balance leaves left the
-commitment and the registry leaf gained an index — that re-pin *is* the hard fork this phase ships
-(the account-era value was `c757e13d…b043`).
+re-baseline." It has been re-pinned four times: in S3 (`rand-bridge-state`, unnamed domain →
+implicit; balance leaves left, the registry leaf gained an index — account-era value
+`c757e13d…b043`, S3 value `ee50b48c…0c43dc8`), when the RPL token standard moved the registry
+and `next_index` out to `TokenRegistry` (domain `rand-bridge-state-2`, value before B3
+`89555202…52f9ba642cf5b`), when B3 appended the PQ guardian set (domain `rand-bridge-state-3`,
+value before B1/B4 `2504a9da…21b5aceb6366e141`), and when B1/B4 appended the pause key, the pause
+flag and the two governance nonces (domain `rand-bridge-state-4`, value before that
+`2f1798b1…690499dd6550e63c46`).
 
 The bridge root folds into the chain's state root only when a bridge exists:
 
@@ -374,15 +387,14 @@ validators' infrastructure, which also covers the base of its one bundle. On a c
   then collide on the attestation digest claim instead.
 - **`time` and `asset` are the depositor's two predictions.** The envelope that lets the recipient
   open the note is sealed against that commitment *before* submitting, so the depositor has to be
-  able to compute it — and it can predict neither the height the transaction lands at nor, for a new
-  token, the index the registry will assign. So both are fields of the action: `time` is held to the
-  window a bundle's `time` gets (`t <= height`, `height - t <= TIME_WINDOW`, checked before the
-  attestation is even decoded), and `asset` must equal the index the registry resolves — the entry
-  the asset has, or the one this transaction's own registration would assign — else
-  `TxError::AttestAssetMismatch { expected, actual }`. Only a first sighting can hit that, and only
-  by losing a race to another first sighting; the cost is a fee bundle and a re-proof instead of a
-  note whose `asset` word no key of the recipient's opens. The mempool drops a pooled attest the
-  same way once a competing first sighting has moved the number.
+  able to compute it — and it cannot predict the height the transaction lands at. So both are fields
+  of the action: `time` is held to the window a bundle's `time` gets (`t <= height`, `height - t <=
+  TIME_WINDOW`, checked before the attestation is even decoded), and `asset` must equal the index
+  the token registry has already given `(chain, token)` — resolved from the wire bytes alone,
+  before any guardian signature is verified — else `TxError::AttestAssetMismatch { expected,
+  actual }`. **Since v0.5 a token must be listed before its first deposit** (`docs/tokens.md` §5):
+  there is no more first-sighting auto-registration, so an attestation naming a `(chain, token)`
+  nobody has listed is `BridgeError::UnlistedToken`, not a registration.
 - **The relayer fee is not deducted.** The `Transfer` payload's own `fee`, in the bridged asset, is
   carried for the record and paid to nobody: on a shielded chain the submitter has no identity to
   pay, so the deposit note carries the **gross** amount the guardians signed. Netting it would burn
@@ -419,8 +431,8 @@ sender identity — and the next `burn_sequence`; guardians read the burn log ex
 `Ledger::validate_inner` (`docs/shielded.md` §5, spec §7). What is bridge-specific:
 
 1. Size caps first, before a byte is parsed: `attestation.len() <= MAX_ATTESTATION_BYTES`
-   (16 KiB, `crates/randprotocol-core/src/gas.rs`), each envelope ≤ 2048 bytes, and a burn's asset bundle
-   gets the caps every bundle gets (`tx.bundle` is only the fee bundle). A guardian set is at most
+   (16 KiB, `crates/randprotocol-core/src/gas.rs`), each of the bundle's four envelopes ≤ 2048 bytes,
+   and the one bundle a burn carries gets the caps every bundle gets. A guardian set is at most
    255 keys by wire format, so anything past the cap is malformed by construction and must not buy
    verification work.
 2. The fee floor at step 3 (`BRIDGE_BURN_FEE`) refuses an underpaying burn on a comparison.
@@ -475,27 +487,36 @@ height. Startup verification replays the chain and then compares the whole store
 the replayed one, which covers the bridge including the burn log the root deliberately leaves out
 (`verify_chain`; `verify_chain_replays_a_bridged_chain`).
 
-**RPC** (`crates/randprotocol-node/src/rpc.rs`, `docs/rpc.md`) — four methods, none of them per-address:
+**RPC** (`crates/randprotocol-node/src/rpc.rs`, `docs/rpc.md`) — none of it per-address:
 
 | Method | Params | Result |
 |--------|--------|--------|
-| `rand_getBridgeState` | `[]` | emitter, emitter table, current guardian set, the registry, `next_index`, `burn_sequence`; `{"enabled": false}` with no bridge |
-| `rand_getAssets` | `[]` | the registry, ascending by index: `{ index, chain, token, asset_id }` |
+| `rand_getBridgeState` | `[]` | emitter, emitter table, guardian set, `pq_guardians`, `mint_paused`, `pause_nonce`, `list_nonce`, `pause_key`, `registration_fee`, `next_index`, `burn_sequence`, `assets` (the `rand_getAssets` rows); `{"enabled": false}` with no bridge |
+| `rand_getAssets` | `[]` | the registry's backing rows, ascending by index: `{ index, chain, token, asset_id, decimals, locked, mint_cap_per_day, minted_today, mint_day }` |
 | `rand_bridgeAssetId` | `[token_chain, token_address]` | the asset id; pure arithmetic, answers on any chain |
 | `rand_getBridgeBurn` | `[sequence]` | one outbound message (`body_hex`, `digest`, `tx`, `height`), or `null` |
+
+The token-level RPC (`rand_getTokens`, `rand_getToken`, `rand_getTokenSupply`) lives in
+`docs/tokens.md`: a bridged token's row carries every one of its backings, not one row per backing.
 
 `rand_getTransaction` renders a `bridge_attest` with the recipient, the action's `asset`, the
 `asset_index` and `amount` it decodes against the registry, the note's `time` and blinding `r`, and
 the `commitment` the chain computed from those fields — every word of the deposit note, which is
 what makes the recovery path below possible; a `bridge_burn` with its asset, amount, relayer fee,
-destination and the asset bundle's public fields. Balances are not among them — there are none.
+destination and the one bundle's public fields (`burn_asset`, `burn_a`). Balances are not among
+them — there are none.
 
-**Wallet** (`crates/randprotocol-client`, `docs/cli.md`) — five commands:
+**Wallet** (`crates/randprotocol-client`, `docs/cli.md`) — bridge and RPL-registry commands:
 
 | Command | Purpose |
 |---------|---------|
-| `bridge-mint <ATTESTATION>` | deposit an attestation (hex or `@path`): seal the recipient's envelope, pay with a bundle of this wallet's RAND |
-| `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TO>` | burn a bridged asset outbound; checks the bridge and the registry first, then proves **two** bundles |
+| `bridge-mint <ATTESTATION> --pq <QUORUM>` | deposit an attestation (hex or `@path`) with its Dilithium2 co-signature quorum: seal the recipient's envelope, pay with one hidden-asset bundle of this wallet's RAND |
+| `bridge-rotate <ROTATION> --pq <QUORUM>` | submit a guardian-set rotation (payload 2) with the current PQ set's co-signature quorum |
+| `bridge-pause --sig <SIG>` | pause bridge minting with the genesis pause key's signature; bundle-less, fee-less |
+| `bridge-unpause --pq <QUORUM>` | lift a pause with a PQ guardian quorum; bundle-less, fee-less |
+| `bridge-burn <ASSET> <AMOUNT> <TO_CHAIN> <TOKEN> <TO>` | burn a bridged asset outbound: checks the bridge, the backing and its locked amount and release unit first, then proves **one** bundle that burns the asset and pays the RAND fee |
+| `token register-bridged … --pq <QUORUM>` | register a new bridged token after genesis with its first backing (B4) |
+| `token list-backing … --pq <QUORUM>` | add a backing to an existing bridged token (B4) |
 | `asset-balance [INDEX]` | what this wallet's own notes hold in one bridged asset, or a row per asset |
 | `bridge` | the bridge's public state |
 | `bridge-message <SEQUENCE>` | one outbound message, verbatim, for a guardian to sign |
@@ -503,7 +524,8 @@ destination and the asset bundle's public fields. Balances are not among them �
 A wallet needs `--to` only when depositing to an address other than its own, and it checks the
 recipient hash, the asset id and the index against the node before paying for a proof.
 `wallet::attested_deposit` reads the deposit out of the attestation bytes with no state and no
-signature work, because the envelope has to be sealed before the transaction exists.
+signature work, because the envelope has to be sealed before the transaction exists. Full flag
+detail for every command above is `docs/cli.md`'s `rand` (wallet) table.
 
 **Tests.** `bridge_mint_deposits_a_note_and_a_burn_spends_it`
 (`crates/randprotocol-node/tests/cluster.rs`) runs the whole path across two validators on a bridged
@@ -562,13 +584,13 @@ would no longer be caught here.
   re-reads from zero the first time. In-circuit envelope validity (spec §14) is not needed for
   deposits for the same reason: nothing about a deposit note is secret.
 - **The ledger-level vector pass has not been rebuilt** on the note pool (§7).
-- **`bridge-burn` still learns about *some* bad arguments from the node, after paying for two
-  proofs.** The wallet now pre-checks four things before any proving: a zero amount, a relayer fee
-  above the amount, a chain with no bridge at all, and an asset index the registry does not hold —
-  the last two off one `rand_getBridgeState` read (`wallet::burn_is_possible`). What is left is
-  the bridge's own policy, which the wallet deliberately does not restate: a destination that is not
-  that asset's home chain, and a recipient of the wrong shape, both still come back as a rejection
-  once both bundles have been proved (three minutes).
+- **`bridge-burn` still learns about *some* bad arguments from the node, after paying for a
+  proof.** The wallet pre-checks that the chain has a bridge, that it holds `ASSET` in the registry,
+  that the named `(TO_CHAIN, TOKEN)` backs it, that the backing has at least `AMOUNT` locked, and
+  that `AMOUNT` and the relayer fee are whole release units — all off one `rand_getBridgeState`/
+  `rand_getTokens` read, before any proving. What is left is the endpoint's own policy on the
+  destination chain, which the wallet cannot see: a rejection there still costs one proof
+  (~100 s).
 - **Equal-to-parent block timestamps are allowed.** The bridged-chain check in `apply_block` is `<`,
   not `<=` — it forbids a rewind but not a repeat. The residual, in the code's own words: "a
   colluding 2/3 of leaders can hold `timestamp_ms` constant, which freezes outbound burn timestamps
@@ -577,8 +599,8 @@ would no longer be caught here.
   drained into storage per block before ~100k burns (spec 6.3)". Storage persists new rows
   incrementally, but the in-memory map is never pruned and is cloned on every speculative block
   execution.
-- **A burn costs two proofs**, about three minutes on a laptop, and roughly 600 KB of the 4 MiB
-  block limit. Nothing amortizes that yet.
+- **A burn costs one proof**, about 100 s on a laptop, and roughly 1.43 MB of the 4 MiB default
+  block limit (`docs/rpc.md`'s "The transaction on the wire") — two burns fit a block, not more.
 - No light-client or on-chain verification of source-chain state exists or is planned; the guardian
   committee's signatures are the entire trust model (§1).
 - No bridge-specific rate limiting beyond the fee floors and the 16 KiB `MAX_ATTESTATION_BYTES` cap.
@@ -588,10 +610,11 @@ would no longer be caught here.
 Unlike the account era, where the two areas shared only the `Ledger` and the gas module, the bridge
 now rides on the pool's machinery:
 
-- Both bridge actions are carried by a transaction whose bundle is proved by the pinned `bundle`
-  zkVM guest, so every bridge transaction pays for at least one STARK verification, and a burn for
-  two. The guest is what enforces `asset ≠ 0 ⇒ fee = 0` and that a bundle balances one asset —
-  which is *why* a burn needs a second bundle at all.
+- Both bridge actions are carried by a transaction whose one bundle is proved by the pinned
+  hidden-asset zkVM guest (`docs/confidential.md`, "The hidden-asset bundle guest"), so every
+  bridge transaction pays for exactly one STARK verification. The guest is what enforces the burn
+  shape — `burn_asset`/`burn_a` for the token, `burn_r` for RAND — and balances both groups in one
+  proof, which is why a burn no longer needs a second bundle at all (before chain 14 it did).
 - Deposit notes are appended to the same commitment tree as every other note and are
   indistinguishable from them once appended; they are committed by the tree, not by `bridge_root`.
 - The bridge's own work is still plain CPU cryptography: keccak256, secp256k1 recovery, and set
@@ -637,11 +660,280 @@ mint.
 
 - Recipients on Rand are identified by a 32-byte hash of a shielded address, not a Dilithium2
   address. Wallets print it and source-chain front ends must accept it.
-- Amounts are `u64` in the bridged asset's own units after decimals; anything above `2⁶⁴ − 1` is
-  rejected at attestation time. Only index 0 (RAND) has this chain's nine decimals — what a
-  bridged token's smallest unit means belongs to its source chain.
-- The asset **index**, not the asset id, is what a note and a wallet carry; `rand_getAssets` maps
-  between them, and `rand_bridgeAssetId` computes an id for a token the registry has never seen.
-- A deposit of a token this chain has never seen is a first sighting, and the transaction has to
-  name the index it will be given. Submit one at a time, or be ready to re-prove the loser.
-- A burn costs one RAND fee bundle plus two proofs (~100 s each on a laptop today).
+- **Every amount on the wire is normalised to `BRIDGE_DECIMALS` (8), whatever the source token's
+  own decimal count is** (§13): a deposit's `Transfer` payload always names an amount in the
+  bridged token's 8-decimal units, and a `BridgeBurn` releases in the same units, converted back to
+  the source coin's native units on the destination chain. Only index 0 (RAND) has this chain's
+  own nine decimals.
+- **A token must be listed before it can be deposited or burned** — v0.5 removed first-sighting
+  auto-registration (`docs/tokens.md` §5). An attestation naming an unlisted `(chain, token)` is
+  refused `BridgeError::UnlistedToken`, funds safe in the source-chain contract's custody but stuck
+  until a PQ guardian quorum lists it (§18) — **list on Rand before `setToken` on the endpoint**, or
+  a deposit can land on the endpoint before Rand will accept its attestation.
+- The asset **index**, not the asset id, is what a note and a wallet carry; `rand_getAssets` and
+  `rand_getTokens` map between them, and `rand_bridgeAssetId` computes an id for a `(chain, token)`
+  pair whether or not it backs anything yet.
+- A burn costs one RAND fee bundle, one proof (~100 s on a laptop today), and is refused before
+  proving if the amount or the relayer fee is not a whole release unit of the backing's source
+  decimals (§13), or if the backing does not hold enough locked.
+
+## 13. RPL and the bridge: one token, many backings (v0.5)
+
+Full detail on the RPL token standard is `docs/tokens.md`; this section is what a bridge integrator
+needs of it. The asset registry moved from `BridgeState` into a ledger-level
+`crate::ledger::tokens::TokenRegistry` (`docs/superpowers/specs/2026-09-19-rpl-token-standard-design.md`
+§12), shared by native and bridged tokens, so that a token is a registry entry either way — not a
+contract, and not something the bridge owns alone.
+
+**One bridged token, many backings.** A `Bridge`-authority token (`MintAuthority::Bridge {
+backings: Vec<Backing> }`) no longer corresponds to a single `(chain, token)` pair. Its first
+bridged registration, **zUSD**, is backed by USDT and USDC locked on four chains — Ethereum,
+BNB Chain and Solana carry both coins, Tron only USDT (Circle discontinued Tron USDC):
+
+```
+chain  token (32-byte wire form)                                                  coin  decimals
+2      000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7           USDT  6
+2      000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48           USDC  6
+3      00000000000000000000000055d398326f99059ff775485246999027b3197955           USDT  18
+3      0000000000000000000000008ac76a51cc950d9822d68b83fe1ad97b32cd580d           USDC  18
+4      000000000000000000000000a614f803b6fd780986a42c78ec9c7f77e6ded13c           USDT  6
+5      ce010e60afedb22717bd63192f54145a3f965a33bb82d2c7029eb2ce1e208264           USDT  6
+5      c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2f6e0e47ca60203452f5d61           USDC  6
+```
+
+`Backing { chain: u16, token: [u8; 32], decimals: u8, locked: u64, minted_today: u64, mint_day:
+u32 }` (`crates/randprotocol-core/src/ledger/tokens.rs`): `(chain, token)` backs at most one token
+in the whole registry (`TokenError::BackingTaken`), a token has 1..=32 backings
+(`TokenError::TooManyBackings`, `NoBackings`), and `decimals` is the **source** coin's own count,
+`0..=MAX_BACKING_DECIMALS` (18) — never the bridged token's own 8 (`TokenError::
+BadBackingDecimals`). The user accepted the pooled-backing risk (a depeg on any one coin dilutes
+every zUSD holder, and the seven coins are fungible into and out of zUSD at par) in exchange for
+one short token id instead of seven, with no Rand-side per-backing share cap: the source endpoints'
+own pauser and per-token rate caps are the only limit on how much of one coin's risk zUSD carries.
+
+**The invariant: `total_supply == Σ backings.locked`, by construction.** `lock`/`release`
+(`TokenRegistry::lock`, `TokenRegistry::release`) are the only two functions that touch a backing's
+`locked` field, and each moves the token's `total_supply` by the same amount in the same call:
+`lock` (`BridgeAttest`) does `locked += amount; total_supply += amount`, `release` (`BridgeBurn`)
+does `locked -= amount; total_supply -= amount`. Nothing else writes either field, so the identity
+holds after every block — several unit tests carry it through a mixed sequence of locks and
+releases, and it is checked, not merely argued, at the points that matter: the token leaf commits
+every backing's `locked` into `tokens_root`, so two nodes that disagree about one diverge at the
+state root, not only in an off-chain audit. On the source-chain side, the deployed endpoints are
+fee-free on lock and deduct the whole attested amount on release (the 10 bps and the relayer fee
+come out of the release, not the lock), so each backing's `locked` equals that endpoint's on-chain
+custody exactly, modulo messages in flight — the bridge session's `rand-bridge-audit` tool
+reconciles `rand_getTokenSupply`'s per-backing `locked` against each endpoint's custody.
+
+**Before every unbridge, Rand checks `amount <= locked`.** `TokenRegistry::check_release`
+(called from `BridgeState::check_burn`, in `validate_inner`'s step 7, before either the bundle's
+digest or its proof) resolves the named `(to_chain, token)` to a backing of the burned asset
+(`TokenError::NotABacking` if it backs nothing, or backs a different token) and refuses
+`TokenError::InsufficientBacking { locked, amount }` if the backing does not hold enough — the
+token's *total* supply may well cover the release; this one backing's custody is what has to.
+
+**The release-unit rule.** The attestation wire always carries an amount at **8** decimals
+(`BRIDGE_DECIMALS` = `WIRE_DECIMALS` = 8, `crates/randprotocol-core/src/ledger/tokens.rs`),
+whatever the source coin's own `decimals` is — a deposit of 1 USDT (6 decimals on Ethereum) locks
+as `100_000_000` wire units. Releasing an amount that is not a whole multiple of the source coin's
+own smallest unit — `Backing::release_unit()`, `10^(8-d)` for `d < 8`, else `1` — would strand a
+fraction in custody forever (below one unit, the endpoint reverts with nothing released at all).
+So `TokenRegistry::check_release` refuses `TokenError::NotReleasable { amount, unit }` unless both
+`amount % unit == 0` **and** `relayer_fee % unit == 0` — the relayer fee is carved out of the
+amount in native units on the destination chain, so it is exactly as unreleasable — checked before
+the `locked` comparison, byte-cheap. `NotReleasable` is deliberately **not** cached as a permanent
+admission verdict: a coin refused today may be listed tomorrow. `wallet::submit_burn` pre-checks
+the same rule off one `rand_getTokens`/`rand_getBridgeState` read, before any proving:
+*"{coin} on chain {c} has {d} decimals: the amount and the relayer fee must be multiples of
+{unit}"*.
+
+## 14. Bridge hardening (v0.5): what it closes
+
+Per-backing `locked` and `InsufficientBacking` guarantee the custody invariant for
+**redemption** (§13). They do nothing to bound **minting**: a `BridgeAttest` with a valid guardian
+quorum mints whatever it says, and — as of 2026-09-19 — all six mainnet guardian keys live on one
+laptop, so a single compromise could mint zUSD with no custody behind it and redeem it against real
+custody. `docs/superpowers/specs/2026-09-19-bridge-hardening-design.md` is the full spec; three
+independent layers close the gap, none of which changes the deployed source-chain endpoints, the
+attestation wire format or `bridge-codec`:
+
+- **B1** (§15) bounds *how much* a compromised quorum can mint per day, and gives an operator a
+  fast, unilateral brake.
+- **B2** (§16) closes a leader's ability to expire a rotated guardian set's grace window, or a
+  mint cap's day, by jumping the block clock.
+- **B3** (§17) requires a *second*, post-quantum quorum — Dilithium2 — on every mint, so a
+  classical compromise of the guardian committee alone cannot mint.
+- **B4** (§18) lets zUSD (and any later bridged token) be listed without a chain cut, under the
+  same PQ quorum.
+
+## 15. B1 — a per-backing mint cap, and a mint pause
+
+**The cap.** Genesis `tokens.mint_cap_per_day: u64` (8-decimal units) applies **per backing**, not
+per token: chain 14 sets it to `100_000 * 10^8` (100 000 zUSD per backing per day; seven backings
+→ at most 700 000 zUSD/day across all of them). A day is `timestamp_ms / 86_400_000` of the
+**block timestamp**, which B2 (§16) makes trustworthy; each backing's own `minted_today`/`mint_day`
+reset on a newer day (`Backing::minted_on`, read without a write). `TokenRegistry::check_lock`
+refuses `TokenError::MintCapExceeded { cap, minted_today, amount }` — checked in `validate`, cheap,
+before the guardian signature work — and it is **not** cached as a permanent verdict: a deposit
+refused today mints fine tomorrow. Two attestations in one block that together exceed the cap: the
+second is refused, and applying is otherwise infallible on it.
+
+**The pause.** Genesis `bridge.pause_key`: one Dilithium2 public key, distinct from every
+`pq_guardians` entry. Two bundle-less, fee-less actions, routed through `ledger/bridge_gov.rs`:
+
+- `PauseMints { nonce, signature }` — signed by the pause key alone over `M_pause` (§19). It can
+  only pause: `BridgeError::NoPauseKey` if genesis set none, `AlreadyPaused` on a repeat,
+  `BadPauseNonce` on the wrong `pause_nonce`, `BadPauseSignature` on a bad signature — the last **is**
+  cached as a permanent refusal (it is judged after the nonce, over the transaction's own nonce
+  and chain id under the fixed genesis key, so it depends on the bytes alone — a bundle-less,
+  fee-less pause should not buy a free Dilithium2 verification per replay).
+- `UnpauseMints { nonce, pq_signatures }` — needs a **PQ guardian quorum** (§17's rules), never the
+  pause key alone: `NotPaused` if nothing is paused, then the same PQ structural and signature
+  checks as a mint's co-signatures.
+
+Both bump one ledger counter, `pause_nonce`, so neither message replays. **While paused, every
+transfer `BridgeAttest` is refused `BridgeError::MintsPaused`** (not permanent — admissible the
+moment it is lifted). **Burns and guardian-set rotations stay open** — a pause must never trap
+redemption or an in-progress rotation. `rand_getBridgeState` serves `mint_paused`, `pause_nonce`
+and `pause_key`; `rand_getAssets` rows serve `mint_cap_per_day`, `minted_today` and `mint_day`.
+**The pause key must be held on a different machine from the one holding the guardian keys** — the
+whole point is a fast brake that survives a guardian-key compromise.
+
+## 16. B2 — a forward bound on block timestamps
+
+A bridged chain's block timestamp decides guardian-set expiry (§3) and, since B1, the mint-cap
+day — so a leader who can jump the clock forward can expire a rotated set's 86 400 s grace window
+early, or skip past a day's cap. Two rules, both gated on `self.bridge.is_some()` exactly as the
+existing rewind rule is:
+
+- **A validity rule, checked on replay too**: `block.header.timestamp_ms <= parent.timestamp_ms +
+  MAX_TIMESTAMP_STEP_MS` (`MAX_TIMESTAMP_STEP_MS = 60_000`, `crates/randprotocol-core/src/ledger/mod.rs`),
+  else `BlockError::TimestampLeap { parent, block, max_step }`. Together with the existing
+  `TimestampRewind` rule (`<` on the way down, §8), a bridged chain's block time can only move
+  forward, and by at most a minute a block.
+- **A vote rule, never a replay rule**: a validator refuses to vote for a block more than
+  `MAX_CLOCK_DRIFT_MS` (`= 15_000`, `crates/randprotocol-core/src/consensus/mod.rs`) ahead of its own
+  clock (`HotStuff::on_proposal`). The block stays in the speculative tree — it is valid, and a
+  quorum whose clocks agree with it can still certify it — so replaying committed history never
+  applies this rule; only the step bound above does.
+
+**Operational consequence: every validator on a bridged chain needs NTP.** A validator whose clock
+is more than 15 seconds off real time is a **faulty leader** (its own proposals may drift past
+`local_now_ms + MAX_CLOCK_DRIFT_MS` and get no votes) and a **faulty voter** (it may refuse to vote
+for an honest, on-time leader's block because its own clock reads far enough behind). Neither
+failure halts the chain by itself — the honest majority's clocks still agree — but an
+un-synchronised fleet loses liveness margin for nothing. **`genesis.timestamp_ms` must be set close
+to the actual launch time**: block 1 is measured against it, and a stale genesis time makes block
+time visibly lag behind wall clock until B2's step bound lets it catch up, roughly `MAX_TIMESTAMP_
+STEP_MS` per block.
+
+## 17. B3 — a Dilithium2 co-signature on every mint
+
+Full spec: `docs/superpowers/specs/2026-09-19-pq-cosignature-bridge.md` (a verbatim copy of the
+bridge repo's `spec/PQ-COSIGNATURE.md`). Every `BridgeAttest` — a deposit and a guardian-set
+rotation alike — must carry, beside its ECDSA quorum, a quorum of Dilithium2 signatures by the
+**same guardians**, over the **same digest**: `M = b"rand-bridge-pq-cosign-1" ‖ rand_chain_id (u64
+BE) ‖ mu` (63 bytes, deterministic signing), where `mu` is the same `keccak256(keccak256(body))`
+the ECDSA quorum signs. Naming the Rand chain id in `M` means a testnet co-signature never verifies
+on a mainnet Rand chain, even if guardian keys were reused; the guardian-set index is not in `M`,
+so a co-signature survives an ECDSA-set rotation without re-signing.
+
+`Action::BridgeAttest` gains a last field, `pq_signatures: Vec<PqSignature { index: u8, signature:
+Vec<u8> }>` (inside the transaction binding, so it cannot be stripped or swapped on a copy).
+`crate::bridge::pq::check_pq_structure` enforces, in this exact order, cheap before expensive:
+
+1. `quorum(n) <= pq_signatures.len() <= n` (`n = pq_guardians.len()`), else `PqNoQuorum`;
+2. indices strictly increasing, else `PqIndexOrder`;
+3. every index `< n`, else `PqIndexOutOfRange`;
+4. every signature exactly 2 420 bytes, else `PqBadSignatureLength`;
+5. every signature verifies `M` under `pq_guardians[index]`, else `PqBadSignature` — checked last,
+   in `check_pq_quorum_message`.
+
+The PQ signers need not be the same indices as the ECDSA signers — each quorum is counted on its
+own. Genesis `bridge.pq_guardians`, index-aligned with `guardian_sets[0]`, is fixed for the
+chain's life: a payload-2 rotation moves the ECDSA set only, never the PQ set (a PQ rotation would
+be its own governance message, not specified for v0.5). Only `PqIndexOrder`,
+`PqIndexOutOfRange` and `PqBadSignatureLength` are cached as permanent admission verdicts — they
+are statements about the list's bytes; `PqNoQuorum` and `PqBadSignature` are not, since a short or
+wrong quorum today says nothing about a resubmission with a different one. `rand_getBridgeState`
+serves `pq_guardians`; `rand bridge-mint @attestation.hex --pq @pq.json --to <rand1…>` is the CLI
+(`docs/cli.md`). Conformance: the bridge repo's `vectors/pq-cosignatures.json` (rand_chain_id 99,
+quorum 5 of 6 test guardians).
+
+## 18. B4 — listing a bridged token after genesis
+
+Chain 14's genesis lists **no** bridged token: zUSD is registered by transaction, after the cut, by
+a faucet-funded deployer wallet that pays the RAND fee, under a PQ guardian quorum's authorisation
+— an ordinary address alone can never create a `Bridge`-authority token. Two new actions
+(`ledger/bridge_gov.rs`), each on an ordinary RAND fee bundle and each requiring the same PQ quorum
+rules as B3's mints:
+
+- `RegisterBridgedToken { name, symbol, salt, chain, token, decimals, nonce, pq_signatures }` —
+  registers a new `Bridge`-authority token at the next index, at 8 decimals on Rand, under the
+  genesis `mint_cap_per_day`, with its first backing. Its fee owes the bundle base plus the
+  registry's `registration_fee`.
+- `ListBacking { token_index, chain, token, decimals, nonce, pq_signatures }` — adds a further
+  backing to an already-registered bridged token. Its fee owes the bundle base alone.
+
+Both share one ledger counter, `list_nonce` (a message's nonce must equal it; both bump it on
+acceptance), and both run the same checks a genesis listing gets: the named chain has a registered
+emitter (`BridgeError::NoEmitter`), `(chain, token)` backs nothing yet (`BackingTaken`), the token
+has fewer than `MAX_BACKINGS` (32) backings already, and `decimals <= MAX_BACKING_DECIMALS` (18). A
+wrong `list_nonce` is `BadListNonce { expected, got }`. A new backing starts at `locked = 0`.
+
+**The index front-run, and why the operational order matters.** `ListBacking` signs a
+`token_index`, and registering a *native* token is permissionless — so if a native token happened
+to register at the index a pre-signed `ListBacking` names, the pre-signed message would be
+invalidated (a refusal, not a fund-loss risk). The procedure: **the PQ guardians sign the
+`RegisterBridgedToken` message first, wait for it to commit, read back the index chain assigned,
+and only then sign the six `ListBacking` messages** naming that index — never sign a listing ahead
+of the registration it depends on.
+
+**Operational order, and why: list on Rand before `setToken` on the source endpoint.** If a coin
+were enabled on the endpoint first, a deposit could lock there before Rand has a backing to credit
+it against, and the attestation would be refused `UnlistedToken` — funds safe in the endpoint's
+custody, but stuck until Rand is caught up. Listing on Rand first costs nothing (a backing with
+`locked = 0` accepts no deposits until the endpoint also enables it), so there is no symmetric
+failure the other way.
+
+No codec, wire or endpoint change: this is what replaces the RPL spec's originally deferred
+guardian governance payload id 3, kept off the wire because `bridge-codec` is compiled into the
+live Solana program and must stay byte-stable through launch and its external audit.
+
+## 19. Governance message layouts
+
+Fixed bytes, never bincode — what an auditor or a hardware signer reproduces by hand, all integers
+big-endian, no length prefixes except where a variable-length field needs one
+(`crates/randprotocol-core/src/bridge/gov.rs`):
+
+```
+M_pause    = b"rand-bridge-pause-1"         ‖ chain_id u64 ‖ nonce u64
+M_unpause  = b"rand-bridge-pq-unpause-1"    ‖ chain_id u64 ‖ nonce u64
+M_list     = b"rand-bridge-pq-list-1"       ‖ chain_id u64 ‖ nonce u64 ‖ token_index u32 ‖ chain u16 ‖ token [32] ‖ decimals u8
+M_register = b"rand-bridge-pq-register-1"   ‖ chain_id u64 ‖ nonce u64 ‖ u8 len ‖ name ‖ u8 len ‖ symbol ‖ salt [32] ‖ chain u16 ‖ token [32] ‖ decimals u8
+```
+
+`M_pause`/`M_unpause` carry `pause_nonce`; `M_list`/`M_register` carry `list_nonce`. Each is what
+`bridge/gov.rs`'s `pause_message`/`unpause_message`/`list_message`/`register_message` builds and
+what the corresponding validate function re-derives to check a signature against — never bincode,
+so the bytes an operator's hardware signer sees are exactly what gets verified.
+
+## 20. Chain-14 launch order
+
+1. Cut chain 14 with the fixed `bridge` genesis section (§6 of the handoff, `pq_guardians` and
+   `pause_key` added) and a `tokens` section with `registration_fee` and `mint_cap_per_day` set,
+   listing no token.
+2. Enable the chain-14 faucet so a deployer wallet can obtain RAND with no prior balance.
+3. The deployer registers zUSD (`RegisterBridgedToken`, its first backing) under the PQ guardian
+   quorum's signature over `M_register` at `list_nonce = 0` — a deploy transaction, a height and an
+   `rpl1…` id, exactly as any RPL token's registration is.
+4. The guardians read back the assigned index and sign the six remaining `ListBacking` messages
+   naming it, submitted one at a time as `list_nonce` advances.
+5. For each of the seven backings: list on Rand (steps 3–4) **before** `setToken` on the source
+   endpoint (§18).
+6. Only after that: the guardian-set rotation (set 0 → set 1, payload 2, signed 5-of-6 by the
+   *current* set) on the four source endpoints, then the same attestation submitted to Rand, whose
+   genesis starts at set 0 (§3).
+7. A live round trip per source chain, small amounts: bridge in, mint zUSD, transfer, burn back,
+   reconcile `rand_getTokenSupply`'s per-backing `locked` against each endpoint's custody
+   (`rand-bridge-audit`).
