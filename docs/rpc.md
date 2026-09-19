@@ -22,6 +22,16 @@ Conventions:
   `burn_a`/`burn_r`, a
   mint's amount, a staking action's amount — because they are being reported as the transaction's own
   fields rather than as chain state.
+- **Every field the RPL/bridge-hardening work (chain 14) introduced follows the string rule with
+  no exception**: `rand_getTokens`/`rand_getToken`/`rand_getTokenSupply`'s supplies and each
+  backing's `locked`, `mint_cap_per_day` and `minted_today` (token units), `rand_getAssets`'s and
+  `rand_getBridgeState`'s matching asset/backing rows, and both methods' `registration_fee` (RAND
+  units) are all decimal strings. So is a decoded transaction's `bridge_attest`/`bridge_burn`/
+  `token_mint`/`token_burn`/`register_token` `amount` (and `initial_amount`/`initial.amount`).
+  This matters because a 9-decimal token's supply passes 2^53 at a ten-million-unit balance,
+  where the older rule above — kept only for the RAND fields it already shipped with — would
+  silently lose precision in a JS client. Indices, nonces, heights, lengths, decimals and day
+  counters (`mint_day`) are plain JSON integers throughout, new fields included.
 - Heights, leaf indices and views are JSON integers.
 - **Every request must carry an `id` member**, batched or not: an object without one is a JSON-RPC
   notification, and this node refuses it with `-32600` rather than running it silently. An explicit
@@ -428,8 +438,8 @@ The staking (phase S2) and bridge (phase S3) actions:
   deposit note's blinding and envelope are not rendered. `time` is the note's time word, which the
   withdrawing node chose; the note itself is worth `amount` less the bundle base.
 - `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>",
-  "asset": 1, "asset_index": 1, "amount": 1000, "time": 41, "r": "<64 hex>",
-  "commitment": "<64 hex>" }` — the amount and the asset are
+  "asset": 1, "asset_index": 1, "amount": "1000", "time": 41, "r": "<64 hex>",
+  "commitment": "<64 hex>", "pq_signers": [0, 2] }` — the amount and the asset are
   inside the attestation, so they are decoded out of it; `asset_index` is what the registry gave
   that asset, and is the `asset` word of the deposit note. Both are `null` for a guardian-set
   rotation (which deposits nothing) and on a chain whose registry does not name the asset.
@@ -445,27 +455,32 @@ The staking (phase S2) and bridge (phase S3) actions:
   `commitment` is the leaf the chain computed from those five fields and appended — `null` for a
   rotation. Together they are the whole deposit note, which is what lets its recipient rebuild it
   without opening the submitter's envelope (`docs/bridge.md` §8); a transfer's or a withdrawal's
-  blinding is *not* rendered, because those notes are not public.
-- `{ "kind": "bridge_burn", "asset": 2, "amount": 400, "relayer_fee": 100, "to_chain": 5, "token":
-  "cdcd…", "to": "abab…" }` — `token` is the backing being redeemed and `to` the 32-byte destination
-  address, hex. One bundle carries the whole burn: its `burn_asset` and `burn_a` are the action's
-  `asset` and `amount`, and its `fee` pays the bridge fee.
+  blinding is *not* rendered, because those notes are not public. `pq_signers` (bridge hardening
+  B3) is the co-signing guardians' indices into `rand_getBridgeState`'s `pq_guardians` — the
+  signatures themselves are 2 420 bytes each and are not rendered, only which of them signed.
+- `{ "kind": "bridge_burn", "asset": 2, "amount": "400", "relayer_fee": "100", "to_chain": 5,
+  "token": "cdcd…", "to": "abab…" }` — `token` is the backing being redeemed and `to` the 32-byte
+  destination address, hex. One bundle carries the whole burn: its `burn_asset` and `burn_a` are
+  the action's `asset` and `amount`, and its `fee` pays the bridge fee.
 
-The RPL token actions:
+The RPL token actions. **Every amount here is a decimal string** — a token's own units, not
+RAND's — because a 9-decimal token's supply already passes 2^53 at a few tens of millions of
+units:
 
-- `{ "kind": "token_burn", "asset": 3, "amount": 400 }` — a holder burn. Its asset and amount are
+- `{ "kind": "token_burn", "asset": 3, "amount": "400" }` — a holder burn. Its asset and amount are
   public by design (they audit the token's `total_supply`), and the bundle's `burn_asset`/`burn_a`
-  repeat them.
-- `{ "kind": "token_mint", "asset": 3, "amount": 700, "recipient": "<shielded address>", "time": 41,
-  "r": "<64 hex>", "nonce": 0 }`, `{ "kind": "register_token", "name": …, "symbol": …, "decimals":
-  6, "authority": "none" | "key" | "bridge" | "program", "index": 2, "initial_amount": 5000,
-  "initial": { "amount": 5000, "recipient": "<shielded address>", "time": 40, "r": "<64 hex>" } |
-  null }` and `{ "kind": "set_authority", "asset": 3, "nonce": 1, "new_authority": "<base58>" |
-  null }` — a token's registration and mints are public, as a bridge deposit is. Every word of a
-  minted note is here (its `from` is the chain's fixed `MINT_FROM`), so a recipient rebuilds the
-  note from these fields with nothing decrypted, whatever envelope the minter published — the
-  wallet's scan does exactly that. **The kind strings `bridge_attest`, `token_mint` and
-  `register_token` are what that scan keys on and are pinned by a test.**
+  repeat them (`burn_a` itself is a pre-chain-14 bundle field and stays a JSON integer there, per
+  the note above).
+- `{ "kind": "token_mint", "asset": 3, "amount": "700", "recipient": "<shielded address>",
+  "time": 41, "r": "<64 hex>", "nonce": 0 }`, `{ "kind": "register_token", "name": …, "symbol": …,
+  "decimals": 6, "authority": "none" | "key" | "bridge" | "program", "index": 2,
+  "initial_amount": "5000", "initial": { "amount": "5000", "recipient": "<shielded address>",
+  "time": 40, "r": "<64 hex>" } | null }` and `{ "kind": "set_authority", "asset": 3, "nonce": 1,
+  "new_authority": "<base58>" | null }` — a token's registration and mints are public, as a bridge
+  deposit is. Every word of a minted note is here (its `from` is the chain's fixed `MINT_FROM`), so
+  a recipient rebuilds the note from these fields with nothing decrypted, whatever envelope the
+  minter published — the wallet's scan does exactly that. **The kind strings `bridge_attest`,
+  `token_mint` and `register_token` are what that scan keys on and are pinned by a test.**
 
 There is no `token_transfer`: a token transfer is `none`, indistinguishable from a RAND payment.
 
@@ -605,7 +620,7 @@ Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false 
   "pause_nonce": 0,                      // B1: what the next M_pause / M_unpause must carry
   "list_nonce": 0,                       // B4: what the next M_list / M_register must carry
   "pause_key": "…",                      // B1: the one Dilithium2 key that may pause minting, hex
-  "registration_fee": 1000000000,        // B4: what a RegisterBridgedToken owes past the bundle base
+  "registration_fee": "1000000000",      // B4: what a RegisterBridgedToken owes past the bundle base, RAND units
   "burn_sequence": 1,                    // outbound messages emitted so far
   "assets": [ …the rows of `rand_getAssets`… ]
 }
@@ -619,15 +634,17 @@ deposited, so there is no index left to predict; a wallet reads a listed token's
 Params: `[]`. Result: the bridge's asset registry, ascending by index (which is registration
 order), or `[]` on a chain without a bridge:
 ```json
-[{ "index": 1, "chain": 2, "token": "aaaa…", "asset_id": "…", "decimals": 6, "locked": 600,
-   "mint_cap_per_day": 10000000000000, "minted_today": 1000, "mint_day": 20350 }]
+[{ "index": 1, "chain": 2, "token": "aaaa…", "asset_id": "…", "decimals": 6, "locked": "600",
+   "mint_cap_per_day": "10000000000000", "minted_today": "1000", "mint_day": 20350 }]
 ```
 `index` is the `asset` word a note of that asset carries — index 0 is RAND and is never in the
-registry. One row per **backing** (source coin). `mint_cap_per_day` (bridge hardening B1) is the
-genesis `tokens.mint_cap_per_day`, the most one backing may mint per UTC day of the block time, in
-the token's eight-decimal units; `minted_today` is what this backing has minted on `mint_day`, the
+registry. One row per **backing** (source coin). `locked`, `mint_cap_per_day` and `minted_today`
+are decimal strings in the token's own eight-decimal units, never RAND's; `mint_day` is a plain
+integer, a UTC day number, not an amount. `mint_cap_per_day` (bridge hardening B1) is the
+genesis `tokens.mint_cap_per_day`, the most one backing may mint per UTC day of the block time;
+`minted_today` is what this backing has minted on `mint_day`, the
 UTC day (`timestamp_ms / 86 400 000`) of the **head block** — the figure the cap would count the
-next deposit against, so a counter left from an earlier day reads `0` once the head crosses
+next deposit against, so a counter left from an earlier day reads `"0"` once the head crosses
 midnight, never the stale figure. A deposit past the cap is refused `MintCapExceeded` and becomes admissible the
 next day. `chain` and `token` are the wire identity guardians sign about; `asset_id` is
 `blake3` of the two, and is what `rand_bridgeAssetId` computes.
@@ -650,7 +667,7 @@ hash stands in for the sender identity the message has no room for.
 Params: `[from_index, limit]`, both optional (`0` and `1000`; `limit` is clamped to 1000). Result:
 the RPL token registry — every token, bridged and native — ascending by index from `from_index`:
 ```json
-{ "enabled": true, "registration_fee": 1000000000, "next_index": 3,
+{ "enabled": true, "registration_fee": "1000000000", "next_index": 3,
   "tokens": [
     { "index": 2, "id": "<64 hex>", "id_text": "rpl1…", "name": "Test Coin", "symbol": "TST",
       "decimals": 6,
@@ -663,10 +680,13 @@ On a chain without a `tokens` section: `{ "enabled": false, "tokens": [] }`. `in
 asset id and `id_text` its checksummed text form — bech32m, HRP `rpl`, over the 32 id bytes, 62
 characters. `authority` is `{ "kind": "none" }` (fixed supply, or renounced), `{ "kind": "key",
 "key", "address" }`, `{ "kind": "bridge", "backings": [{ "chain": 2, "token": "<32 bytes hex>",
-"decimals": 6, "locked": "600" }] }` (each backing's **source** decimals and the amount its
-contract holds for this chain) or `{ "kind": "program", "program": "<hex>" }`. Supplies and
-`locked` are decimal strings; `registration_fee` and `next_index` are numbers. A page shorter
-than `limit` is the last.
+"decimals": 6, "locked": "600", "mint_cap_per_day": "10000000000000", "minted_today": "1000",
+"mint_day": 20350 }] }` (each backing's **source** decimals, the amount its contract holds for
+this chain, and bridge hardening B1's mint-cap figures — `rand_getAssets`'s fields, one row per
+backing) or `{ "kind": "program", "program": "<hex>" }`. Supplies, `locked`, `mint_cap_per_day`,
+`minted_today` and `registration_fee` are decimal strings (RAND units for `registration_fee`,
+token units for the rest); `next_index` and `mint_day` are numbers. A page shorter than `limit`
+is the last.
 
 A wallet resolves a token id **through this listing** (`wallet::resolve_asset`), never through
 `rand_getToken`: a transfer's asset is private on chain, and reading the whole registry costs the
@@ -686,9 +706,11 @@ explorers and one-off reads; a wallet about to send uses `rand_getTokens`.
 Params: `[token]`, the same forms as `rand_getToken`. Result: `null`, or
 ```json
 { "total_supply": "600",
-  "backings": [{ "chain": 2, "token": "<32 bytes hex>", "decimals": 6, "locked": "600" }] }
+  "backings": [{ "chain": 2, "token": "<32 bytes hex>", "decimals": 6, "locked": "600",
+                 "mint_cap_per_day": "10000000000000", "minted_today": "1000", "mint_day": 20350 }] }
 ```
-Decimal strings. `backings` is empty for a native token; for a bridged one the `locked` amounts
+`total_supply`, `locked`, `mint_cap_per_day` and `minted_today` are decimal strings; `mint_day` is
+a plain integer. `backings` is empty for a native token; for a bridged one the `locked` amounts
 sum to `total_supply`, and each is what `rand-bridge-audit` reconciles against that coin's custody
 on its source chain. The same privacy note as `rand_getToken`.
 
@@ -1061,7 +1083,8 @@ Action::Unbond { validator: Address, amount: u64, nonce: u64, signature: Signatu
 Action::Withdraw { validator: Address, amount: u64, nonce: u64, time: u32, r: Word8,
                    envelope: Envelope, signature: Signature }
 Action::BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, time: u32,
-                       asset: u32, envelope: Envelope }
+                       asset: u32, envelope: Envelope,
+                       pq_signatures: Vec<PqSignature> }   // bridge hardening B3, last field
 Action::BridgeBurn { asset: u32, amount: u64, relayer_fee: u64, to_chain: u16,
                      token: [u8; 32], to: [u8; 32] }
 Action::RegisterToken { name: String, symbol: String, decimals: u8, authority: MintAuthority,
@@ -1070,12 +1093,28 @@ Action::TokenMint { asset: u32, amount: u64, recipient: ShieldedAddress, r: Word
                     envelope: Envelope, nonce: u64, signature: Signature }
 Action::SetAuthority { asset: u32, new: Option<PublicKey>, nonce: u64, signature: Signature }
 Action::TokenBurn { asset: u32, amount: u64 }
+Action::PauseMints { nonce: u64, signature: Signature }               // B1, bundle-less, fee-less
+Action::UnpauseMints { nonce: u64, pq_signatures: Vec<PqSignature> }  // B1, bundle-less
+Action::RegisterBridgedToken { name: String, symbol: String, salt: [u8; 32], chain: u16,
+                               token: [u8; 32], decimals: u8, nonce: u64,
+                               pq_signatures: Vec<PqSignature> }      // B4
+Action::ListBacking { token_index: u32, chain: u16, token: [u8; 32], decimals: u8, nonce: u64,
+                      pq_signatures: Vec<PqSignature> }               // B4
 
 MintAuthority = None | Key(PublicKey) | Bridge { backings: Vec<Backing> } | Program(Hash)
 InitialMint { amount: u64, recipient: ShieldedAddress, r: Word8, time: u32, envelope: Envelope }
 
 Registration { public_key: PublicKey, payout: ShieldedAddress, signature: Signature }
+PqSignature { index: u8, signature: Vec<u8> }   // one guardian's Dilithium2 co-signature, by set index
 ```
+
+This block does not show the five block-aggregation actions (`RegisterAggregator`,
+`UnbondAggregator`, `WithdrawAggregator`, `SlashAggregator`, `Aggregate`) that sit between
+`BridgeBurn` and `RegisterToken` in the enum's declared order — see the 2026-09-15 changelog
+entry below for their fields. They occupy real bincode tags on any chain whose genesis carries an
+`aggregation` section; a chain without one (chain 12 onward, until it returns) never admits them,
+but an encoder that hard-codes tag numbers rather than deriving them from the enum still needs to
+count them.
 
 A `Bond` must carry a bundle whose `burn_r` equals its `amount` (and whose `burn_a` and
 `burn_asset` are 0) — that is how the stake leaves the pool — and `registration` is present exactly when the validator is not in the register yet
@@ -1088,14 +1127,24 @@ no token (`burn_asset` and `burn_a` 0), and RAND is only ever burned through `bu
 `burn_asset` 0 and `burn_a` non-zero is refused everywhere. A `BridgeAttest`'s deposit note is the one commitment the wire does not
 carry — the chain computes it from the amount the guardians signed, the recipient the action
 names, its blinding `r`, its `time` and the registry index it names in `asset`, so a submitter
-cannot choose the amount or the owner. It *can* choose `time`, within the window a bundle's `time`
+cannot choose the amount or the owner. **`r` is derived, not chosen** (chain 14, F1): admission
+requires it to equal `blake3("rand-deposit-r-1" ‖ mu)` over the digest the guardians signed
+(`mu`), and refuses any other value with `BridgeError::WrongDepositBlinding` — a permanent
+refusal, since it depends on the transaction's own bytes alone
+(`docs/bridge.md` §5). A submitter can still choose `time`, within the window a bundle's `time`
 gets, which is what lets the depositor seal an envelope for a note whose commitment it can compute
-before knowing which block will take the transaction. `asset` is the other half of that: the index
-the envelope was sealed for, which admission compares against the index the registry resolves (an
-existing asset's, or the one this transaction's own registration would assign) and refuses on a
-mismatch — `the attestation deposits under asset 2, and the transaction names 1`. Only a *first*
-sighting can hit that, and only by losing a race to another first sighting, which costs the
-submitter a fee bundle and a re-proof instead of depositing a note its recipient cannot open.
+before knowing which block will take the transaction — and, with `r` derived too, two independent
+submitters of the same attestation at the same `time` name the identical note. `asset` is the
+index the envelope was sealed for: a bridged token is *listed* — at genesis or by a
+`RegisterBridgedToken`/`ListBacking` governance message — before any attestation of it is
+admissible, and a listing's index never moves once assigned, so there is no first-sighting
+registration to race for a bridge deposit (that only ever applied to the RPL registry's own
+`RegisterToken`, a different action). An attestation of a coin nobody has listed is refused
+`BridgeError::UnlistedToken` before `asset` is even compared; once the coin is listed, a mismatch
+between the index the attestation resolves to and the index the action names is
+`TxError::AttestAssetMismatch` — `the attestation deposits under asset 2, and the transaction
+names 1` — which only a stale registry view (a node behind the listing) or a hand-built
+transaction can hit.
 
 A `Withdraw` derives its note the same way and for the same reason: `time` is the head height when
 the command ran, and the chain, not the wire, computes the commitment (`docs/staking.md`).
@@ -1142,6 +1191,17 @@ What changed for clients, in one place. Newest first.
 - **Pool:** two transactions at one token's `mint_nonce` (a `TokenMint` or a `SetAuthority`) or at
   one registration index conflict at submission, and one whose nonce or index the chain has
   already moved past is refused (`wrong mint nonce`, `wrong token index`) and pruned.
+
+### 2026-09-19 — chain 14: the deposit blinding is derived, not chosen (F1)
+
+A `BridgeAttest`'s `r` is no longer the submitter's to pick. Admission now requires
+`r == blake3("rand-deposit-r-1" ‖ mu)`, where `mu` is the digest the guardians signed, and refuses
+any other value with a new, **permanent** refusal, `BridgeError::WrongDepositBlinding` — cached
+like every byte-level refusal, so a relayer built against the old free-`r` behaviour gets refused
+once and then silently ignored on every retry rather than told again. `time` is unaffected and
+stays the submitter's choice, inside the usual window. The upside: two independent submitters of
+the same attestation at the same `time` now name the identical note, closing the substitution this
+review round found (`docs/bridge.md` §5).
 
 ### 2026-09-19 — bridged tokens listed after genesis (bridge hardening B4, chain 14)
 
