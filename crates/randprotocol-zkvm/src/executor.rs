@@ -242,12 +242,81 @@ impl ZkExecutor {
     /// height, `public_log_height(8) == 4`, is not the empty segment's `MIN_LOG_HEIGHT == 2`, so a
     /// pre-fork bundle proof is refused on the declared height alone.
     pub fn bundle_heights() -> (u8, u8, u8) {
-        (
-            program::program_log_height(Self::bundle_program().words.len()),
-            input::input_log_height(crate::notes::bundle_input::COUNT),
-            public::public_log_height(TX_BINDING_WORDS),
-        )
+        pinned_heights(Self::bundle_program(), crate::notes::bundle_input::COUNT)
     }
+
+    /// The hidden-asset bundle guest (`guests::bundle_hidden`, spec
+    /// `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`): four slots, the asset
+    /// private. Node-local — unlike `bundle`, there is no upstream copy to pin it against — and,
+    /// until the chain moves to it (spec §7, H3–H5), called by nothing on the chain path.
+    /// Assembled once per process, for the same reason as `bundle_program`.
+    pub fn hidden_bundle_program() -> &'static Program {
+        static HIDDEN: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+        HIDDEN.get_or_init(crate::guests::bundle_hidden)
+    }
+
+    /// Digest of the hidden bundle guest — what a genesis will pin as `hc_bundle` once the chain
+    /// moves to it.
+    pub fn hc_hidden_bundle() -> Word8 {
+        Self::hidden_bundle_program().digest()
+    }
+
+    /// `bundle_heights` for the hidden bundle guest: its program, its fixed
+    /// `hidden::hidden_input::COUNT`-word input vector, and the transaction binding.
+    pub fn hidden_bundle_heights() -> (u8, u8, u8) {
+        pinned_heights(Self::hidden_bundle_program(), crate::hidden::hidden_input::COUNT)
+    }
+
+    /// `ConfidentialExecutor::bundle_proof_digest` for a hidden bundle proof: the digest it
+    /// publishes, after the same structural checks (exact heights, canonical encoding).
+    pub fn hidden_bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+        self.pinned_proof_digest(Self::hidden_bundle_heights(), proof)
+    }
+
+    /// `ConfidentialExecutor::verify_bundle` for a hidden bundle proof: verified against `hc`
+    /// with the transaction binding as its public segment (Task 5b), exactly as a `bundle` proof
+    /// is — the empty segment and any other transaction's words are refused.
+    pub fn verify_hidden_bundle(&self, hc: &Word8, proof: &[u8], binding: &[u32; TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
+        self.verify_pinned_bundle(Self::hidden_bundle_heights(), hc, proof, binding)
+    }
+
+    /// The published digest of a proof of a pinned bundle guest whose heights are `heights`.
+    fn pinned_proof_digest(&self, heights: (u8, u8, u8), proof: &[u8]) -> Result<Word8, ConfidentialError> {
+        let (plh, ilh, pubh) = heights;
+        let p = self.decode_and_check(proof, plh, ilh, pubh, true)?;
+        Ok(std::array::from_fn(|k| p.public_values[pv::OUT0 + k] as u32))
+    }
+
+    /// Verifies a proof of a pinned bundle guest (heights `heights`, digest `hc`) against the
+    /// transaction binding. `verify_public` against the binding (Task 5b): `H_PUB` must be the
+    /// digest of exactly the eight words of `Transaction::binding` for the transaction the bundle
+    /// rides in. The empty segment (every pre-fork bundle proof) is refused on its declared
+    /// height, and any other transaction's words fail as `PublicValues`.
+    fn verify_pinned_bundle(
+        &self,
+        heights: (u8, u8, u8),
+        hc: &Word8,
+        proof: &[u8],
+        binding: &[u32; TX_BINDING_WORDS],
+    ) -> Result<(), ConfidentialError> {
+        let (plh, ilh, pubh) = heights;
+        let p = self.decode_and_check(proof, plh, ilh, pubh, true)?;
+        self.machine
+            .verify_public(hc, binding, &p)
+            .map_err(|e| ConfidentialError::InvalidBundleProof(format!("{e:?}")))
+    }
+}
+
+/// The `(program_log_height, input_log_height, public_log_height)` every proof of a pinned bundle
+/// guest must declare: its program's, its fixed `input_words`-wide private input's, and the
+/// transaction binding's ([`TX_BINDING_WORDS`] words, Task 5b). Shared by `bundle` and the hidden
+/// bundle so the two cannot drift.
+fn pinned_heights(program: &Program, input_words: usize) -> (u8, u8, u8) {
+    (
+        program::program_log_height(program.words.len()),
+        input::input_log_height(input_words),
+        public::public_log_height(TX_BINDING_WORDS),
+    )
 }
 
 /// Decode a proof and refuse it unless its bytes are the *canonical* postcard encoding of what
@@ -426,9 +495,7 @@ impl ConfidentialExecutor for ZkExecutor {
     }
 
     fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-        let (plh, ilh, pubh) = Self::bundle_heights();
-        let p = self.decode_and_check(proof, plh, ilh, pubh, true)?;
-        Ok(std::array::from_fn(|k| p.public_values[pv::OUT0 + k] as u32))
+        self.pinned_proof_digest(Self::bundle_heights(), proof)
     }
 
     fn verify_bundle(
@@ -437,15 +504,7 @@ impl ConfidentialExecutor for ZkExecutor {
         proof: &[u8],
         binding: &[u32; TX_BINDING_WORDS],
     ) -> Result<(), ConfidentialError> {
-        let (plh, ilh, pubh) = Self::bundle_heights();
-        let p = self.decode_and_check(proof, plh, ilh, pubh, true)?;
-        // `verify_public` against the transaction binding (Task 5b): `H_PUB` must be the digest
-        // of exactly the eight words of `Transaction::binding` for the transaction this bundle
-        // rides in. The empty segment (every pre-fork bundle proof) and any other transaction's
-        // words fail here as `PublicValues`.
-        self.machine
-            .verify_public(hc_bundle, binding, &p)
-            .map_err(|e| ConfidentialError::InvalidBundleProof(format!("{e:?}")))
+        self.verify_pinned_bundle(Self::bundle_heights(), hc_bundle, proof, binding)
     }
 
     /// The bundle guest's verifier key. Unlike `warm`, this needs no guessing: the guest is
@@ -603,18 +662,48 @@ pub fn prove_bundle(
     binding: &[u32; TX_BINDING_WORDS],
     backend: Backend,
 ) -> Result<(Vec<u8>, Word8, u8), String> {
-    // The guest reads a fixed-width private-input vector (`notes::bundle_input::COUNT`); a
-    // shorter one makes the emulator read past the end and a longer one silently ignores the
-    // tail, so neither is a prove request that could ever produce an admissible bundle.
-    if inputs.len() != crate::notes::bundle_input::COUNT {
-        return Err(format!(
-            "bundle inputs must be exactly {} words, got {}",
-            crate::notes::bundle_input::COUNT,
-            inputs.len()
-        ));
+    prove_pinned_bundle(profile, ZkExecutor::bundle_program(), crate::notes::bundle_input::COUNT, "bundle", inputs, binding, backend)
+}
+
+/// `prove_bundle` for the hidden-asset bundle guest (`guests::bundle_hidden`): `inputs` built by
+/// `hidden::hidden_bundle_inputs`, proved against the transaction's `binding`, returning (proof
+/// bytes, the published digest, tier). Everything `prove_bundle`'s doc comment says holds here
+/// too — the binding, the auto-picked tier (14 for every witness, honest or not: the worst case
+/// is measured by `tests/hidden_bundle.rs`), the fresh `H_IN` salt, and that a tainted witness
+/// still proves to a digest no plaintext matches.
+pub fn prove_hidden_bundle(
+    profile: FriProfile,
+    inputs: &[u32],
+    binding: &[u32; TX_BINDING_WORDS],
+    backend: Backend,
+) -> Result<(Vec<u8>, Word8, u8), String> {
+    prove_pinned_bundle(
+        profile,
+        ZkExecutor::hidden_bundle_program(),
+        crate::hidden::hidden_input::COUNT,
+        "hidden bundle",
+        inputs,
+        binding,
+        backend,
+    )
+}
+
+fn prove_pinned_bundle(
+    profile: FriProfile,
+    program: &Program,
+    input_words: usize,
+    what: &str,
+    inputs: &[u32],
+    binding: &[u32; TX_BINDING_WORDS],
+    backend: Backend,
+) -> Result<(Vec<u8>, Word8, u8), String> {
+    // The guest reads a fixed-width private-input vector; a shorter one makes the emulator read
+    // past the end and a longer one silently ignores the tail, so neither is a prove request that
+    // could ever produce an admissible bundle.
+    if inputs.len() != input_words {
+        return Err(format!("{what} inputs must be exactly {input_words} words, got {}", inputs.len()));
     }
     let m = Machine::new(profile);
-    let program = ZkExecutor::bundle_program();
     // The transaction binding as the public segment. The guest never reads it; the public
     // table's `PUBLIC_DIGEST` bus commits it into `H_PUB` regardless.
     let (proof, exec) = m.prove_with(backend, program, inputs, binding, None).map_err(|e| format!("{e:?}"))?;

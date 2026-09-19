@@ -9,6 +9,8 @@ pub mod keccak;
 pub mod sha256;
 pub mod sbpf;
 pub mod notes;
+/// Node-local (not vendored): the hidden-asset bundle's layout, digest and witness builder.
+pub mod hidden;
 pub mod evm;
 pub mod viewing;
 pub mod ledger;

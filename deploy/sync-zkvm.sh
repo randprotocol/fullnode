@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # deploy/sync-zkvm.sh — copy the research zkVM into crates/randprotocol-zkvm. Run from the repo root.
 #
-# Local additions (executor.rs, codec.rs, address.rs, call_envelope.rs, the extended guests.rs
-# and asm.rs, tests/executor.rs, tests/shielded.rs, tests/call_envelope.rs) are preserved;
+# Local additions (executor.rs, codec.rs, address.rs, call_envelope.rs, hidden.rs, the extended
+# guests.rs and asm.rs, tests/executor.rs, tests/shielded.rs, tests/call_envelope.rs,
+# tests/hidden_bundle.rs) are preserved;
 # machine.rs gets a small post-sync patch exposing log_ext_degrees_pub (constraint set 6: now a
 # seven-argument (tier, program_log_height, input_log_height, keccak_log_height,
 # sha256_log_height, public_log_height, mem_log_height) function — see the cs6 patch comment
@@ -116,6 +117,17 @@
 # rsyncs: `call_envelope.rs` (src and tests) is node-local S3 code that arrived after the cs5
 # sync script's exclude list was written — without it `--delete` would remove both files.
 #
+# The hidden-asset bundle (2026-09-19, spec `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-
+# design.md`, task H1) adds two more node-local files, both excluded below: `src/hidden.rs` (the
+# guest's private-input layout, its digest under domain tag 16 and the wallet's witness builder)
+# and `tests/hidden_bundle.rs`. The layout and digest would naturally sit beside `bundle_input`/
+# `bundle_digest` in `notes.rs`, but `notes.rs` is vendored and a resync would erase them — so they
+# live in their own module; the guest itself is in the (already excluded) `guests.rs`, its prover
+# and verifier in `executor.rs`. Before the next resync: upstream's `notes::domain` has since
+# gained `KEM_SEED_VERSION = 16` (the short-address feature this repository reverted), which would
+# collide with `hidden::HIDDEN_BUNDLE_DOMAIN`; renumber one of them first
+# (`tests/hidden_bundle.rs` asserts the hidden tag is unique among `notes::domain`'s).
+#
 # The CUDA backend is *not* vendored either: crates/randprotocol-zkvm depends on it by path, as
 # ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building
 # with --features cuda or --features mock-cuda.
@@ -125,10 +137,10 @@ DST=crates/randprotocol-zkvm
 mkdir -p "$DST/src" "$DST/tests"
 rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude rust-toolchain.toml \
       --exclude executor.rs --exclude codec.rs --exclude guests.rs --exclude asm.rs \
-      --exclude address.rs --exclude arx.rs --exclude call_envelope.rs \
+      --exclude address.rs --exclude arx.rs --exclude call_envelope.rs --exclude hidden.rs \
       --exclude lib.rs --exclude main.rs "$SRC/src/" "$DST/src/"
 rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_envelope.rs \
-      --exclude viewing.rs --exclude bundle.rs "$SRC/tests/" "$DST/tests/"
+      --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local
 # `guests::compiled::{fib,keccak256}()` (see the header comment) need — `fib.bin` since M4.1,
