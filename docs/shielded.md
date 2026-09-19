@@ -144,8 +144,11 @@ the pool back together.
 | `rand open-call <TX>` | open a committed call's input transcript and check it against its `H_IN` |
 | `rand receipt <TX>` | the receipt of a committed call |
 | `rand asset-balance [INDEX]` | what this wallet holds in a bridged asset, or a row per asset |
-| `rand bridge-mint <ATTESTATION>` | deposit a guardian-signed attestation as a note |
-| `rand bridge-burn <ASSET> <AMOUNT> <CHAIN> <TO>` | burn a bridged asset outbound; proves one bundle (rebuilt in H5) |
+| `rand bridge-mint <ATTESTATION> --pq <QUORUM>` | deposit a guardian-signed attestation as a note, with its Dilithium2 co-signatures; one RAND fee bundle |
+| `rand bridge-rotate <ROTATION> --pq <QUORUM>` | submit a guardian-set rotation with the PQ quorum; one RAND fee bundle |
+| `rand bridge-pause --sig <SIG>` / `rand bridge-unpause --pq <QUORUM>` | pause or lift bridge minting; bundle-less, fee-less, no key file |
+| `rand token register-bridged … --pq <QUORUM>` / `rand token list-backing … --pq <QUORUM>` | list a bridged token or a new backing after genesis; one RAND fee bundle |
+| `rand bridge-burn <ASSET> <AMOUNT> <CHAIN> <TOKEN> <TO>` | burn a bridged asset outbound; one bundle burns the asset and pays the RAND fee |
 | `rand bridge` / `rand bridge-message <SEQ>` | the bridge's public state; one outbound message |
 | `rand fee bundle\|deploy <words>\|call <tier>` | the schedule's floor |
 | `rand tx/block/head/status/peers/validators` | plain chain reads |

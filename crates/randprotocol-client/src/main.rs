@@ -1080,7 +1080,7 @@ async fn main() -> Result<()> {
             };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -1165,7 +1165,7 @@ async fn main() -> Result<()> {
                 None => gas::fee_floor(&action),
             };
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -1251,7 +1251,7 @@ async fn main() -> Result<()> {
             };
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -1271,7 +1271,7 @@ async fn main() -> Result<()> {
             };
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;

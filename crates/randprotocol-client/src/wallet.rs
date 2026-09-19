@@ -1371,6 +1371,51 @@ async fn submit_with(
     submit_spend(rpc, w, store, spend, action, burn, proving, chain_id, wait).await
 }
 
+/// A bridge action on a fee bundle: `rand bridge-mint`'s and `rand bridge-rotate`'s
+/// `BridgeAttest`, `rand token register-bridged`'s `RegisterBridgedToken` and `rand token
+/// list-backing`'s `ListBacking`. The bundle pays nobody and burns nothing — the RAND fee from
+/// slots 2–3, slots 0–1 dummies, `burn_a`/`burn_r`/`burn_asset` zero — and is built, bound and
+/// proved by the one [`submit_spend`] path every other submission takes, so the action (its PQ
+/// co-signatures included) sits inside the binding the proof is made against.
+///
+/// Every refusable check — the attestation's shape, the PQ quorum's structure against the node's
+/// set, the deposit index, the governance nonce, the listing's metadata — is the caller's, and
+/// runs before this is called: nothing here can refuse the action itself, only the wallet's funds.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_bridge_action(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    action: Action,
+    fee: u64,
+    profile: FriProfile,
+    backend: Backend,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    submit_bridge_action_with(rpc, w, store, action, fee, Proving::Real(profile, backend), chain_id, wait).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_bridge_action_with(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    action: Action,
+    fee: u64,
+    proving: Proving,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    if !matches!(
+        action,
+        Action::BridgeAttest { .. } | Action::RegisterBridgedToken { .. } | Action::ListBacking { .. }
+    ) {
+        return Err(anyhow!("submit_bridge_action carries a bridge attestation or a bridged-token listing, nothing else"));
+    }
+    submit_with(rpc, w, store, None, action, fee, Burn::None, proving, chain_id, wait).await
+}
+
 /// The four facts about the chain a burn needs before any proving: the chain has a bridge at
 /// all, the asset index it names is one the registry holds, the coin it asks to redeem —
 /// `(to_chain, token)` — backs that asset, and both `amount` and `relayer_fee` are whole
@@ -3194,6 +3239,85 @@ mod tests {
         assert_eq!(tx.action, Action::TokenBurn { asset: 5, amount: 300 });
         // No change at all in either group: every output is a dummy nobody opens.
         assert!(slots_for(&me, &tx).iter().all(opens_to_nobody));
+    }
+
+    /// Every bridge command's action — a deposit's and a rotation's `BridgeAttest`, a
+    /// `RegisterBridgedToken`, a `ListBacking` — rides one fee bundle built by the shared path: the
+    /// fee in RAND from slots 2–3, slots 0–1 dummies, nothing burned, the proof bound to the whole
+    /// transaction, PQ co-signatures included (swap them after proving and the proof no longer
+    /// verifies). Any other action is refused before anything is read or proved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_bridge_action_rides_a_rand_fee_bundle_bound_to_its_pq_quorum() {
+        use randprotocol_core::bridge::PqSignature;
+        let me = Wallet::from_spend_key(SpendKey([54; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        for _ in 0..8 {
+            chain.lock().unwrap().fund(&me, 3 * gas::BUNDLE_BASE, 0);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let pq = || vec![PqSignature { index: 0, signature: vec![0xab; 16] }, PqSignature { index: 2, signature: vec![0xcd; 16] }];
+        let empty = Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] };
+        let actions = vec![
+            Action::BridgeAttest {
+                attestation: transfer_attestation(1_000, me.address.recipient_hash()),
+                recipient: me.address.clone(),
+                r: [9; 8],
+                time: 1,
+                asset: 3,
+                envelope: garbage(),
+                pq_signatures: pq(),
+            },
+            Action::BridgeAttest {
+                attestation: rotation_attestation(),
+                recipient: me.address.clone(),
+                r: [0; 8],
+                time: 1,
+                asset: 0,
+                envelope: empty,
+                pq_signatures: pq(),
+            },
+            Action::RegisterBridgedToken {
+                name: "Zed Dollar".into(),
+                symbol: "ZUSD".into(),
+                salt: [7; 32],
+                chain: 2,
+                token: [8; 32],
+                decimals: 6,
+                nonce: 0,
+                pq_signatures: pq(),
+            },
+            Action::ListBacking { token_index: 3, chain: 5, token: [9; 32], decimals: 6, nonce: 1, pq_signatures: pq() },
+        ];
+        for (what, action) in ["deposit", "rotation", "register_bridged", "list_backing"].into_iter().zip(actions) {
+            let s = submit_bridge_action_with(&rpc, &me, &mut store, action.clone(), gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!((s.amount, s.asset, s.burn), (0, 0, Burn::None), "{what}");
+            let tx = chain.lock().unwrap().sent.pop().unwrap();
+            assert_admissible_shape(&tx);
+            assert_eq!(tx.action, action, "{what}: the action is carried as built");
+            let b = tx.bundle.as_ref().unwrap();
+            assert_eq!((b.fee, b.burn_a, b.burn_r, b.burn_asset), (gas::BUNDLE_BASE, 0, 0, 0), "{what}");
+            let mine = slots_for(&me, &tx);
+            assert!(opens_to_nobody(&mine[0]) && opens_to_nobody(&mine[1]), "{what}: slots 0-1 are dummies: {mine:?}");
+            assert!(matches!(mine[3], Found::Received(n) if n.asset == 0 && n.amount > 0), "{what}: RAND change in slot 3: {mine:?}");
+            // The PQ quorum is inside the binding: a relayer cannot swap it after the proof.
+            let mut swapped = tx.clone();
+            match &mut swapped.action {
+                Action::BridgeAttest { pq_signatures, .. }
+                | Action::RegisterBridgedToken { pq_signatures, .. }
+                | Action::ListBacking { pq_signatures, .. } => pq_signatures[1].signature[0] ^= 1,
+                _ => unreachable!(),
+            }
+            assert!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &swapped.binding()).is_err(), "{what}: a swapped quorum unbinds the proof");
+        }
+        let e = submit_bridge_action_with(&rpc, &me, &mut store, Action::None, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("nothing else"), "{e}");
+        assert!(chain.lock().unwrap().sent.is_empty());
     }
 
     /// A bond burns RAND through `burn_r`, never `burn_a`, and names no asset.
