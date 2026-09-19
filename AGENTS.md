@@ -4,33 +4,93 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-19)
+## Project memory (state as of 2026-09-20)
 
-### v0.5 — zUSD on RPL, the bridge launch — IN PROGRESS (2026-09-19), branch `feat/rpl`
+### v0.5 — RPL, zUSD and bridge hardening — BUILT AND REVIEWED (2026-09-20), integration branch `feat/bridge-hardening` at `da3a8af`
 
-**Take-over document: `docs/superpowers/handoffs/2026-09-19-zusd-v0.5.md`** — the goal, every user
-decision, the invariant, task state, the remaining path, the fixed chain-14 inputs and the traps.
-Spec `docs/superpowers/specs/2026-09-19-rpl-token-standard-design.md` (§12 = one zUSD), plan
-`docs/superpowers/plans/2026-09-19-rpl-token-standard.md`; live ledger (git-ignored) in the `feat/rpl`
-worktree's `.superpowers/sdd/2026-09-19-rpl-token-standard/progress.md`.
+**Take-over document: `docs/superpowers/handoffs/2026-09-19-zusd-v0.5.md`** (its §§4–5 now current) —
+the goal, every user decision, the invariant, task state, the remaining path, the fixed chain-14
+inputs and the traps. Spec `docs/superpowers/specs/2026-09-19-rpl-token-standard-design.md` (§12 =
+one zUSD, §13 = per-backing source decimals), `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`
+(the 4-slot guest that replaced the two-bundle transfer), `docs/superpowers/specs/2026-09-19-bridge-hardening-design.md`
+(B1–B4) and `docs/superpowers/specs/2026-09-19-pq-cosignature-bridge.md` (B3, verbatim from the
+bridge repo); plans `docs/superpowers/plans/2026-09-19-rpl-token-standard.md`; live ledger
+(git-ignored) in `.superpowers/sdd/2026-09-19-rpl-token-standard/progress.md` in the `feat/rpl`
+worktree (`/tmp/fullnode-rpl`) — the full task-by-task history (H1–H5 the hidden-asset guest, B1–B4
+the bridge hardening, R1 the token RPC + `rpl1…`, T8b the `rand token` CLI, S1 the randscan side in
+`../randscan`). **Everything through T8b is DONE, reviewed clean, on `feat/bridge-hardening` at
+`da3a8af`** — not yet merged to `main`, not yet chain-cut. Docs (this pass) and the E2E gate
+(`task-E2E-brief.md`: a real multi-node cluster, real proofs, test guardians, the full
+faucet→register→deposit→transfer→burn→audit path) are the two tasks left before the final
+whole-branch review, the rebase onto `origin/main` and the chain-14 cut (handoff §5, steps 5–10).
+
 - **Goal**: zUSD mint/transfer/burn backed by USDT + USDC bridged from Tron, Solana, BNB Chain and
   Ethereum, and bridging back; custody on the four chains always >= zUSD supply, checked before every
   unbridge; then a live round trip on the deployed mainnet endpoints with the `RAND_BRIDGE_TESTER`
   accounts; then tag **v0.5** with a GitHub release.
 - **RPL**: a ledger-level registry of shielded native tokens (`ledger/tokens.rs`), genesis-gated by
-  a `tokens` section (`rand-state-4`), permissionless creation, fees in RAND, symbols not unique.
+  a `tokens` section (`rand-state-4`), permissionless creation, fees in RAND, symbols not unique, a
+  checksummed `rpl1…` text form (bech32m, 62 chars). `docs/tokens.md` is the full user-facing guide.
+- **The transaction-binding fix landed** (Task 5b): every bundle proof is made over, and verified
+  against, `H("rand-tx-bind-1", chain_id ‖ tx with proofs blanked)` via the public input segment —
+  closing the redirect attack that let a copied `BridgeBurn` or `Bond` proof be resubmitted with a
+  changed destination or validator (`docs/confidential.md`, "Transaction binding").
+- **The asset is hidden on a spend** (H1–H5): the two-bundle token transfer is gone, replaced by one
+  4-in/4-out hidden-asset bundle (`guests::bundle_hidden`, tier 14, ~100 s, the old `bundle()` guest
+  kept only as `ZkExecutor::legacy_bundle_program`, pinned by no chain). A transfer of RAND and a
+  transfer of any RPL token publish the identical shape. `docs/confidential.md`'s soundness table
+  and `docs/shielded.md` are current for it.
 - **zUSD** has seven backings (USDT+USDC on chains 2, 3, 5; USDT on 4), each with `decimals` and a
   consensus `locked`; `total_supply == Σ locked` by construction; a `BridgeBurn` names its coin and
-  is refused `NotABacking` / `InsufficientBacking` / `NotReleasable`.
-- **Security finding (pre-existing on main)**: a bundle proof bound nothing about the action or the
-  envelopes, so a gossiped `BridgeBurn`'s `to` could be swapped (theft) and a `Bond`'s validator
-  redirected. Fix approved: bind every bundle to `H(chain_id ‖ tx with proofs blanked)` via the
-  public input segment (Task 5b). bridge-06 keeps every mainnet token un-whitelisted until it is in.
-- **Asset hidden on a spend** before launch (user): a new multi-asset bundle guest replaces the
-  two-bundle token transfer — a new pinned guest digest, not a new constraint set.
+  is refused `NotABacking` / `InsufficientBacking` / `NotReleasable`. Not listed in genesis: it is
+  registered by transaction after the cut, by a faucet-funded deployer, under a PQ guardian quorum
+  (B4). `docs/bridge.md` §§13–20 is the reference.
+- **Bridge hardening (B1–B4) landed**: a per-backing daily mint cap and a Dilithium2 pause key that
+  can only pause (unpause needs the PQ quorum; burns and rotations stay open while paused); a
+  forward bound on block timestamps (`BlockError::TimestampLeap`, 60 s/block) plus a 15 s
+  clock-drift vote rule — **every validator on a bridged chain needs NTP**; a Dilithium2
+  co-signature quorum, independent of the ECDSA one, required on every mint and rotation; and
+  `RegisterBridgedToken`/`ListBacking` to list a token or a backing after genesis under the PQ
+  quorum, no chain cut, no wire change.
 - The source endpoints are live on mainnet and immutable: chain 14's `bridge` genesis section is
-  fixed (handoff §6). The Rand-only governance payload (plan Task 10) is deferred past chain 14 —
-  `bridge-codec` is compiled into the live Solana program and must stay byte-stable.
+  fixed (handoff §6). The Rand-only governance payload (plan Task 10) stays deferred past chain 14
+  — `bridge-codec` is compiled into the live Solana program and must stay byte-stable; B4 is what
+  replaced it for listing.
+- **Traps learned this round**:
+  - **A silent `rpc.rs` mis-merge** (fixed `561346c`): two independent renderers for a backing row
+    (`rand_getAssets`/`rand_getBridgeState` vs. the token RPC) had drifted into existence across
+    parallel branches; neither compile nor tests caught it because both were valid Rust — only a
+    close review noticed the two shapes disagreed. One renderer now serves both call sites. Re-check
+    for this class of bug whenever two branches touch the same RPC method's JSON shape in parallel.
+  - **Number-vs-string amount encoding was inconsistent across the node.** `rand_getBridgeState`'s
+    `assets` rows and the token RPC's rows disagreed on whether a `u64` amount is a JSON number or a
+    decimal string — masked in randscan by hand-written, already-quoted mock fixtures (S1's review
+    found it: a live chain's numeric amounts silently failed to render). Decimal strings are the
+    rule going forward for any amount that can exceed 2^53; every consumer (wallet, `rand-bridge-audit`,
+    randscan) now tolerates both, but a new field should be a string from the start.
+  - **The `.pending` key file.** `rand token create --authority-key-out FILE` writes the fresh
+    authority key to `FILE.pending` immediately before the one call that can lose an index race
+    (`IndexMismatch`), not before — promoted to `FILE` only once the chain accepts the registration,
+    discarded only on an explicit chain refusal, and left at `.pending` on a transport failure of
+    unknown outcome (never guessed at). Any command that must write a secret before an outcome it
+    cannot yet know should follow this shape, not write the final file first.
+  - **The index front-run, and list-after-register.** `ListBacking` signs a `token_index`, and
+    registering a *native* token is permissionless, so a `ListBacking` pre-signed against a
+    predicted index could be invalidated by an unrelated registration taking that index first (a
+    refusal, not a fund-loss risk). Procedure: the PQ guardians sign `RegisterBridgedToken` first,
+    wait for it to commit, read the index back from the chain, and only then sign the listings that
+    name it — never sign a listing ahead of the registration it depends on (`docs/bridge.md` §18).
+  - **`RECURSION_FIXTURES` is still missing on this laptop.** The ~21 node `--lib` aggregation tests
+    that need it remain a known, pre-existing failure set; unrelated to this round's work, not fixed
+    by it.
+  - **Aggregation stays gated off until re-measured.** Block aggregation's admitted shape assumed
+    today's bundle declares `public 2` (the empty segment); the transaction-bound bundle declares
+    `public 4`, so no bundle proved on this branch matches the old admitted shape. Chain 14 is cut
+    without an `aggregation` section; re-measure the shape (and consider checking a covered bundle's
+    `PUB0..7` against its transaction's binding) before any future chain activates it.
+  - **Fleet-wide key rotation is a chain-14 precondition, not a nice-to-have.** This repository is
+    public and tracks chain 13's six validator seeds and 18 payout spend keys — see the security
+    review entry below and the handoff's §5 step 7.
 
 ### Final audit v3 (2026-09-19): POOL-1 and RPC-1 fixed in code; OPS-1 rotation rides chain 14
 
