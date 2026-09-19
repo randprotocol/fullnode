@@ -1482,7 +1482,14 @@ async fn main() -> Result<()> {
             let result = match result {
                 Ok(r) => r,
                 Err(e) => {
-                    if let Some(rpc_err) = e.downcast_ref::<randprotocol_client::RpcError>() {
+                    // A refused send now carries its reply inside `SubmitRefused` (node I1), so
+                    // the lost-race hint reads either label — and a *later* call's `RpcError`
+                    // can never be an `IndexMismatch` anyway.
+                    let reply = e
+                        .downcast_ref::<randprotocol_client::SubmitRefused>()
+                        .map(|s| &s.0)
+                        .or_else(|| e.downcast_ref::<randprotocol_client::RpcError>());
+                    if let Some(rpc_err) = reply {
                         if let Some((expected, got)) = parse_index_mismatch(&rpc_err.message) {
                             eprintln!("another token took index {got} first — re-run to register at {expected}");
                         }

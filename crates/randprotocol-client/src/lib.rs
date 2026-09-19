@@ -40,6 +40,40 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
+/// A JSON-RPC error reply **to `rand_sendTransaction` itself** — the one call whose failure means
+/// nothing was admitted (node I1).
+///
+/// Every submission path wraps that one call's [`RpcError`] in this, and nothing else does, so a
+/// caller can tell "the node refused the transaction, synchronously" from "the node answered some
+/// *later* call with an error" — `rand_getTransactionStatus` during the wait, or any of the six
+/// methods the post-commit rescan makes. Both look identical as an `RpcError`, and the difference
+/// decides whether a freshly generated secret may be deleted: a `-32603` on a restart or a
+/// `-32000` on backpressure *after* a committed registration used to orphan the token's only
+/// authority key.
+///
+/// It prints exactly as the reply it wraps and keeps it reachable by
+/// `err.downcast_ref::<SubmitRefused>()` / `.0`. A transport failure is deliberately **not**
+/// wrapped: the submission's fate is then unknown, which is not the same thing as refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmitRefused(pub RpcError);
+
+impl std::fmt::Display for SubmitRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for SubmitRefused {}
+
+/// Re-label a `rand_sendTransaction` failure that is a JSON-RPC error reply as
+/// [`SubmitRefused`], and leave every other failure exactly as it is.
+pub fn submit_refused(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast::<RpcError>() {
+        Ok(rpc) => anyhow::Error::new(SubmitRefused(rpc)),
+        Err(other) => other,
+    }
+}
+
 /// JSON-RPC's "method not found": what a node too old to know a method answers.
 pub const METHOD_NOT_FOUND: i64 = -32601;
 

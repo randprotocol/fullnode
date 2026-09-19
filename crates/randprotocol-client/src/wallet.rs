@@ -107,6 +107,10 @@ impl Wallet {
                 .open(path)
                 .with_context(|| format!("{} already exists or cannot be created; refusing to overwrite", path.display()))?;
             f.write_all(text.as_bytes())?;
+            // The bytes reach the disk before this returns: a power loss right after a key is
+            // handed out must not leave an empty file where the only copy of a secret should be
+            // (node I1's companion).
+            f.sync_all().with_context(|| format!("flushing {}", path.display()))?;
             return Ok(());
         }
         #[cfg(not(unix))]
@@ -175,6 +179,8 @@ pub fn write_authority_key(kp: &Keypair, path: &Path) -> Result<()> {
             .open(path)
             .with_context(|| format!("{} already exists or cannot be created; refusing to overwrite", path.display()))?;
         f.write_all(text.as_bytes())?;
+        // Durable before the caller submits anything against it (node I1).
+        f.sync_all().with_context(|| format!("flushing {}", path.display()))?;
         Ok(())
     }
     #[cfg(not(unix))]
@@ -1422,7 +1428,12 @@ async fn submit_spend(
     // is set on the transaction after the proof but the proof itself.
     let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), action);
     let proved = prove_transaction(&mut tx, &prepared, &|p, b| proving.prove(p, b))?;
-    let hash = rpc.send_transaction(&tx).await?;
+    // `submit_refused` labels a JSON-RPC error reply *from this call* as `SubmitRefused`
+    // (node I1): it is the only failure here that means nothing was admitted, and `rand token
+    // create` deletes a freshly generated authority key on it and on nothing else. Everything
+    // after this line — the wait, the rescan — can fail with an `RpcError` too, and must not be
+    // mistaken for a refusal.
+    let hash = rpc.send_transaction(&tx).await.map_err(crate::submit_refused)?;
     settle(rpc, w, store, &hash, &plan, time, wait).await?;
     Ok(plan.report(hash, burn, time, &proved))
 }
@@ -2395,15 +2406,29 @@ async fn create_token_with(
                 eprintln!("warning: the registration committed, but the authority key could not be promoted: {e}");
             }
         }
-        (Err(e), Some((pending_path, _))) if e.downcast_ref::<crate::RpcError>().is_some() => {
-            // The node answered `rand_sendTransaction` with a JSON-RPC error, synchronously:
-            // nothing was admitted, so nothing was ever registered under this key.
+        (Err(e), Some((pending_path, _))) if e.downcast_ref::<crate::SubmitRefused>().is_some() => {
+            // `rand_sendTransaction` *itself* answered with a JSON-RPC error, synchronously:
+            // nothing was admitted, so nothing was ever registered under this key. The stage,
+            // not the error type, is what decides this (node I1) — `RpcError` is what *every*
+            // JSON-RPC error reply becomes, the wait's `rand_getTransactionStatus` and the
+            // post-commit rescan's six methods included, and a `-32603` on a node restart or a
+            // `-32000` on backpressure after a *committed* registration would otherwise delete
+            // the only copy of the token's authority key.
             if let Err(re) = discard_pending_authority_key(pending_path) {
                 eprintln!("warning: discarding the unused pending authority key {}: {re}", pending_path.display());
             }
         }
-        // Anything else (a transport failure, a decode error) leaves the submission's fate
-        // unknown, so the pending file stays exactly where it is — the only safe choice.
+        // Anything else — a transport failure, a decode error, and every failure after the send
+        // — leaves the submission's fate unknown, so the pending file stays exactly where it is
+        // and the caller is told where to find it.
+        (Err(e), Some((pending_path, path))) => {
+            eprintln!(
+                "warning: the registration's fate is unknown ({e}); the authority key is kept at {} \
+                 — check whether the token registered, then rename it to {} or delete it",
+                pending_path.display(),
+                path.display()
+            );
+        }
         _ => {}
     }
     result.map(|submission| CreateTokenResult { submission, index, id, fee })
@@ -3844,7 +3869,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(e.downcast_ref::<crate::RpcError>().is_some(), "{e}");
+        // The send itself was refused, so the failure carries the `SubmitRefused` label — which
+        // is what the discard arm keys on (node I1) — with the node's reply inside it.
+        let refused = e.downcast_ref::<crate::SubmitRefused>().unwrap_or_else(|| panic!("{e}"));
+        assert_eq!(refused.0.code, -32000);
         assert!(!out.exists(), "no file at the target path after a node refusal");
         assert!(!pending_authority_key_path(&out).exists(), "the pending file is discarded, not stranded");
         // The failed submission never reached `settle`, so the note it would have spent is still
@@ -3875,6 +3903,76 @@ mod tests {
         assert!(!pending_authority_key_path(&out).exists());
         let saved = load_authority_key(&out).unwrap();
         assert_eq!(saved.public_key(), kp.public_key());
+    }
+
+    /// Node I1: the discard is decided by the **stage**, not by the error type. `RpcError` is
+    /// what every JSON-RPC error reply becomes — the wait's `rand_getTransactionStatus` and the
+    /// post-commit rescan's six methods included — so keying on it deleted the only copy of a
+    /// committed token's authority key whenever a node answered a *later* call with `-32603`
+    /// ("node loop closed" on a restart), `-32000` (backpressure) or anything else. Only
+    /// `rand_sendTransaction` itself refusing means nothing was admitted, and only that is
+    /// labelled `SubmitRefused`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_token_keeps_the_pending_key_when_a_call_after_the_send_fails() {
+        let me = Wallet::from_spend_key(SpendKey([67; 8]));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("authority.key.json");
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.tokens = serde_json::json!({ "enabled": true, "registration_fee": 0, "next_index": 1, "tokens": [] });
+            c.fund(&me, 3 * gas::BUNDLE_BASE, 0);
+            // The send goes through; the wait's very first call does not.
+            c.fail = Some("rand_getTransactionStatus");
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let kp = Keypair::generate();
+
+        let e = create_token_with(
+            &rpc,
+            &me,
+            &mut store,
+            "Fixed",
+            "FIX",
+            6,
+            Some((&kp, out.as_path())),
+            None,
+            [3; 32],
+            None,
+            Proving::Emulated,
+            7,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        // It is an `RpcError`, exactly as a refusal is — and it is not a `SubmitRefused`.
+        assert!(e.downcast_ref::<crate::RpcError>().is_some(), "{e}");
+        assert!(e.downcast_ref::<crate::SubmitRefused>().is_none(), "a post-send failure is not a refusal: {e}");
+        // The registration did reach the node, so the key is kept.
+        assert_eq!(chain.lock().unwrap().sent.len(), 1, "the transaction was submitted");
+        let pending = pending_authority_key_path(&out);
+        assert!(pending.exists(), "the authority key of a possibly-committed registration is kept");
+        assert!(!out.exists(), "and it is not promoted either — the fate is unknown");
+        assert_eq!(load_authority_key(&pending).unwrap().public_key(), kp.public_key());
+
+        // The refusal arm is still the refusal arm: a `rand_sendTransaction` error discards.
+        let dir2 = tempfile::tempdir().unwrap();
+        let out2 = dir2.path().join("authority.key.json");
+        {
+            let mut c = chain.lock().unwrap();
+            c.fail = Some("rand_sendTransaction");
+            c.fund(&me, 3 * gas::BUNDLE_BASE, 0);
+        }
+        let e = create_token_with(
+            &rpc, &me, &mut store, "Fixed", "FIX", 6, Some((&kp, out2.as_path())), None, [3; 32], None,
+            Proving::Emulated, 7, true,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.downcast_ref::<crate::SubmitRefused>().is_some(), "{e}");
+        assert!(!out2.exists() && !pending_authority_key_path(&out2).exists());
     }
 
     /// `rand token create`'s two authority branches build a `RegisterToken` that rides one RAND
