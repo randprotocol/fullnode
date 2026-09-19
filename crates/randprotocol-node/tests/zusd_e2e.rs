@@ -228,8 +228,11 @@ async fn junk_bundle(n: &TestNode, fee: u64, burn_asset: u32, burn_a: u64, seed:
 async fn junk_attest(n: &TestNode, to: &ShieldedAddress, attestation: Vec<u8>, asset: u32, seed: u32) -> Transaction {
     let (bundle, time) = junk_bundle(n, gas::BUNDLE_BASE, 0, 0, seed).await;
     let pq_signatures = pq_quorum(CHAIN_ID, &attestation);
+    // The blinding the attestation's digest derives (F1): the one the ledger admits, so what this
+    // probe is refused for is the rule it is probing and not its `r`.
+    let r = randprotocol_core::ledger::bridge_notes::deposit_r(&attestation).expect("the digest derives it");
     let action =
-        Action::BridgeAttest { attestation, recipient: to.clone(), r: [7; 8], time, asset, envelope: empty_envelope(), pq_signatures };
+        Action::BridgeAttest { attestation, recipient: to.clone(), r, time, asset, envelope: empty_envelope(), pq_signatures };
     Transaction::shielded(CHAIN_ID, bundle, action)
 }
 
@@ -264,7 +267,8 @@ async fn bridge_mint(
     let assets = n.rpc.assets().await.unwrap();
     let index = wallet::deposit_index(&state, &assets, &asset_id).expect("the coin is a listed backing");
     let time = u32::try_from(n.rpc.head().await.unwrap()["height"].as_u64().unwrap()).unwrap();
-    let (note, mut envelope) = wallet::deposit_note_for(relayer, to, d.amount, index, time).unwrap();
+    // The blinding is derived from the attestation digest (F1), inside `deposit_note_for`.
+    let (note, mut envelope) = wallet::deposit_note_for(relayer, to, &attestation, d.amount, index, time).unwrap();
     if garbage {
         // A hostile or careless relayer: bytes that decrypt under no key at all.
         envelope = Envelope {

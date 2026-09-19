@@ -199,11 +199,19 @@ pub fn is_permanent(e: &TxError) -> bool {
     // pause and buy a Dilithium2 verification per delivery for free (the per-peer token bucket
     // bounds the rate; this makes the repeats cost nothing). If a later action ever rotates the
     // pause key, this arm must move out, as `PqIndexOutOfRange` would with a PQ rotation.
+    //
+    // F1's `WrongDepositBlinding` is cached too: it compares the action's `r` with
+    // `blake3("rand-deposit-r-1" ‖ mu)` of the action's own `attestation` bytes — no key, no
+    // registry, no height — so the same bytes are refused at every tip.
     if let TxError::Bridge(b) = e {
         use randprotocol_core::bridge::BridgeError as B;
         return matches!(
             b,
-            B::PqIndexOrder | B::PqIndexOutOfRange { .. } | B::PqBadSignatureLength { .. } | B::BadPauseSignature
+            B::PqIndexOrder
+                | B::PqIndexOutOfRange { .. }
+                | B::PqBadSignatureLength { .. }
+                | B::BadPauseSignature
+                | B::WrongDepositBlinding
         );
     }
     matches!(
@@ -564,6 +572,16 @@ mod tests {
     /// tip, so it is cached — a replayed bad pause, bundle-less and fee-less, costs no second
     /// Dilithium2 verification. (The ledger reaches it only after the nonce and flag checks,
     /// which stay uncached: `bridge_gov`'s tests pin that order.)
+    /// F1's blinding verdict is about the bytes alone — the action's `r` against a hash of its own
+    /// `attestation` field, no key, no state — so no tip can ever admit the same transaction and
+    /// it is cached like a byte length.
+    #[test]
+    fn a_wrong_deposit_blinding_is_a_byte_verdict_and_is_cached() {
+        use randprotocol_core::bridge::BridgeError as B;
+        let e = TxError::Bridge(B::WrongDepositBlinding);
+        assert!(is_permanent(&e), "{e} depends on the transaction's bytes alone");
+    }
+
     #[test]
     fn a_bad_pause_signature_is_a_byte_verdict_and_is_cached() {
         use randprotocol_core::bridge::BridgeError as B;

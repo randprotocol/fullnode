@@ -1182,7 +1182,10 @@ async fn main() -> Result<()> {
             // against (`Action::BridgeAttest`). The head is the freshest such time.
             let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
                 .context("chain height does not fit a note's time field")?;
-            let (note, envelope) = wallet::deposit_note_for(&w, &recipient, d.amount, index, time)?;
+            // The blinding is the attestation digest's, not this wallet's (F1): the same note
+            // whoever submits this attestation at this `time`, which is what makes a copier's
+            // submission a conflict rather than a second, different note.
+            let (note, envelope) = wallet::deposit_note_for(&w, &recipient, &bytes, d.amount, index, time)?;
             let owner = recipient.to_string();
             // The action names the index this envelope was sealed for, and admission refuses a
             // mismatch (`Action::BridgeAttest`) — which nothing on a listed token can now cause,
@@ -1263,8 +1266,10 @@ async fn main() -> Result<()> {
             let pq_signatures = wallet::parse_pq_signatures(&read_text_arg(&pq)?)?;
             wallet::check_pq_cosignatures(&state, chain_id, &bytes, &pq_signatures)?;
             // A rotation deposits nothing: the deposit fields are placeholders the ledger reads for
-            // a transfer only — this wallet's address, a zero blinding, asset 0 and an empty
-            // envelope. `time` still gets the admission window every attest's does.
+            // a transfer only — this wallet's address, asset 0 and an empty envelope. `time` still
+            // gets the admission window every attest's does, and `r` is still the one the
+            // attestation's digest derives (F1): the rule is every attest's, so no attest
+            // transaction carries a field a copier could vary.
             let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
                 .context("chain height does not fit a note's time field")?;
             let empty = randprotocol_core::notes::Envelope {
@@ -1273,10 +1278,12 @@ async fn main() -> Result<()> {
                 to_sender: Vec::new(),
                 body: Vec::new(),
             };
+            let r = randprotocol_core::ledger::bridge_notes::deposit_r(&bytes)
+                .context("the attestation has no body to derive the deposit blinding from")?;
             let action = Action::BridgeAttest {
                 attestation: bytes,
                 recipient: w.address.clone(),
-                r: [0; 8],
+                r,
                 time,
                 asset: 0,
                 envelope: empty,

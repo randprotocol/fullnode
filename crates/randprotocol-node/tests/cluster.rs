@@ -1279,7 +1279,10 @@ async fn bridge_mint(
     let assets = node.rpc.assets().await.expect("the registry");
     let index = wallet::deposit_index(&state, &assets, &asset_id).expect("the token is listed on this chain");
     let time = u32::try_from(node.rpc.head().await.expect("head")["height"].as_u64().expect("height")).unwrap();
-    let (note, envelope) = wallet::deposit_note_for(relayer, to, d.amount, index, time).expect("sealing the deposit");
+    // The blinding is the attestation digest's (F1), derived inside `deposit_note_for`, so the
+    // note this wallet seals against is the one the ledger will append whoever submits it.
+    let (note, envelope) =
+        wallet::deposit_note_for(relayer, to, &attestation, d.amount, index, time).expect("sealing the deposit");
     let pq_signatures = pq_quorum(&attestation);
     let action = Action::BridgeAttest {
         attestation,
@@ -1335,10 +1338,13 @@ async fn replayed_attest(node: &TestNode, to: &ShieldedAddress, attestation: Vec
     // A full PQ quorum, so the refusal that comes back is the replay, not the co-signature's shape
     // (which `check_attest` checks first).
     let pq_signatures = pq_quorum(&attestation);
+    // The derived blinding (F1), so the refusal that comes back is the replay and not the
+    // blinding rule, which is checked before the digest's consumed set.
+    let r = randprotocol_core::ledger::bridge_notes::deposit_r(&attestation).expect("the digest derives it");
     let action = Action::BridgeAttest {
         attestation,
         recipient: to.clone(),
-        r: [7; 8],
+        r,
         time,
         asset,
         envelope: empty,

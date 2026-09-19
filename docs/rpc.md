@@ -433,7 +433,10 @@ The staking (phase S2) and bridge (phase S3) actions:
   the two together say whether this node's registry can resolve the deposit at all. `time` is the
   deposit note's own `time` word, which the action publishes and admission holds to the window a
   bundle's `time` gets — the note is derived from it, not from the height the transaction landed
-  at. `r` is the deposit note's blinding, a field of the action and public like the rest of it, and
+  at. `r` is the deposit note's blinding, a field of the action and public like the rest of it —
+  derived since chain 14 from the attestation digest the guardians signed
+  (`blake3("rand-deposit-r-1" || mu)`, `docs/bridge.md` §5), so a reader can recompute it from the
+  same transaction's attestation bytes — and
   `commitment` is the leaf the chain computed from those five fields and appended — `null` for a
   rotation. Together they are the whole deposit note, which is what lets its recipient rebuild it
   without opening the submitter's envelope (`docs/bridge.md` §8); a transfer's or a withdrawal's

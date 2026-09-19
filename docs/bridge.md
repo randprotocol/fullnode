@@ -345,6 +345,33 @@ validators' infrastructure, which also covers the base of its one bundle. On a c
   inflate a mint or redirect it. It is the one commitment a transaction does **not** carry on the
   wire (`Transaction::commitments` omits it), which is why a node indexing notes for wallets
   recomputes it through `bridge_notes::deposit_note`.
+- **The blinding is derived, not chosen** (F1, chain 14). `r` is
+  `blake3("rand-deposit-r-1" || mu)` read as eight little-endian words
+  (`bridge_notes::derive_deposit_r`), over `mu = keccak256(keccak256(body))` — the 32 bytes the
+  guardian quorum signed. The ledger requires it (`BridgeError::WrongDepositBlinding`) and refuses
+  anything else *before* any signature work: two keccaks and a blake3 over the already
+  size-capped attestation bytes, ahead of the PQ structure check and the secp256k1 quorum. It is a
+  byte verdict, so admission caches it (`admission::is_permanent`). The field stays on the wire —
+  the transaction is self-describing and the wallet's public-field rebuild (§8) reads it there —
+  it is only constrained. The rule applies to every attest, a rotation's included, so no attest
+  carries a field a copier can vary but `time`.
+
+  Why: before it, the deposit note's commitment was not fixed until someone submitted the
+  attestation. Anyone who saw a relayer's transaction could submit the same attestation first
+  under a blinding of its own — the recipient still got a note (the wallet rebuilds it from the
+  public fields), but the relayer's own transaction died on `Bridge(Replay)` or
+  `CommitmentExists` after paying for a bundle proof, and the recipient's envelope was replaced.
+  With `r` fixed, two submitters of one attestation at one `time` name **one** note, so the pool
+  conflicts them on the commitment claim instead of racing them to two different notes.
+
+  `time` is deliberately *not* bound. It must stay the submitter's: the envelope is sealed against
+  the commitment before the transaction exists, and no rule can derive a `time` every submitter
+  would agree on — the attestation body's own timestamp is the source chain's clock, and clamping
+  it into this chain's window is a function of the height the transaction is *judged* at, which
+  is exactly what a depositor cannot predict. The residual: a front-runner may still pick another
+  `time` inside the window, producing a different note — of the same recipient, amount and asset,
+  which its recipient's wallet finds by the same public-field rebuild — and the two submissions
+  then collide on the attestation digest claim instead.
 - **`time` and `asset` are the depositor's two predictions.** The envelope that lets the recipient
   open the note is sealed against that commitment *before* submitting, so the depositor has to be
   able to compute it — and it can predict neither the height the transaction lands at nor, for a new
@@ -524,7 +551,9 @@ would no longer be caught here.
   submit an attestation (the guardians' signatures are the whole authorisation) and admission checks
   nothing about the `envelope` the submitter publishes beyond its size — so a hostile relayer can
   seal garbage, consume the attestation's digest, and leave a note the honest relayer can no longer
-  resubmit. It locks nothing: *every* field of a deposit note is public in that one transaction
+  resubmit. (Since F1 the *note* is no longer the front-runner's to choose: the blinding is the
+  attestation digest's, so at the same `time` both submitters name the same leaf — §5. What is
+  left is the envelope, and another `time` in the window.) It locks nothing: *every* field of a deposit note is public in that one transaction
   (`recipient`, `amount`, `asset`, `time`, `r`), so `wallet::scan` walks committed blocks, rebuilds
   the note of every `bridge_attest` addressed to it with `rebuilt_deposit`, and records it against
   the leaf whose commitment matches — with no envelope opened. The cost of the attack is therefore

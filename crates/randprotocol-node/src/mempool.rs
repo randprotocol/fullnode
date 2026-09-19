@@ -1292,12 +1292,14 @@ mod tests {
     /// so two relayers' transactions have nothing in common but the attestation itself. The
     /// `asset` word is the index `l`'s registry would deposit under, as a wallet would fill it in.
     fn attest_tx(l: &Ledger, attestation: Vec<u8>, seed: u8) -> Transaction {
-        attest_tx_with_r(l, attestation, seed, [seed as u32; 8])
+        let r = randprotocol_core::ledger::bridge_notes::deposit_r(&attestation).unwrap_or([seed as u32; 8]);
+        attest_tx_with_r(l, attestation, seed, r)
     }
 
-    /// [`attest_tx`] with the blinding spelled out. Two relayers that pick the same `r` for the
-    /// same deposit at the same `time` derive the very same note, which is a collision no field of
-    /// either transaction shows.
+    /// [`attest_tx`] with the blinding spelled out, for the pool's own rules — admission requires
+    /// the attestation digest's (F1), so anything else here is a transaction the ledger refuses.
+    /// Two submitters of one attestation at one `time` derive the very same note, which is a
+    /// collision no field of either transaction shows.
     fn attest_tx_with_r(l: &Ledger, attestation: Vec<u8>, seed: u8, r: Word8) -> Transaction {
         let b = fixtures::bundle(l, [nf(seed), nf(seed + 1)], [cm(seed), cm(seed + 1)], fixtures::bundle_fee());
         let asset = fixtures::deposit_index(l, &attestation);
@@ -1515,7 +1517,12 @@ mod tests {
     /// the proposer's block would die on the second with `Bridge(Replay)`.
     #[test]
     fn two_relayers_racing_one_attestation_do_not_both_enter_the_pool() {
-        let (l, secrets) = bridged_ledger();
+        let (mut l, secrets) = bridged_ledger();
+        // Two heights in the window, so a submitter has a `time` to differ on: the one word F1
+        // leaves it (the derived blinding takes every other).
+        l.set_height(5);
+        l.record_anchor(5);
+        let l = l;
         let a = attestation(&secrets);
         let first = attest_tx(&l, a.clone(), 10);
         let second = attest_tx(&l, a.clone(), 20);
@@ -1529,10 +1536,29 @@ mod tests {
         let mut m = Mempool::new(100);
         let mu = first.bridge_digests()[0];
         m.insert(first.clone(), &l, &StubExecutor).unwrap();
+        // Two claims collide now, not one: since F1 both submissions derive the *same* deposit
+        // note (one attestation, one `time`, one blinding), which is the griefing this rule
+        // closes — the copier cannot mint a note of its own. The commitment index is consulted
+        // before the digest index, so that is the conflict reported; the digest claim below is
+        // still the one that catches two relayers at two different `time`s.
         assert_eq!(
             m.insert(second.clone(), &l, &StubExecutor),
+            Err(MempoolError::Conflict(l.derived_commitment(&first.action, &StubExecutor).unwrap())),
+            "one attestation at one time is one note"
+        );
+        let mut later = attest_tx(&l, a.clone(), 20);
+        let Action::BridgeAttest { time, .. } = &mut later.action else { panic!("an attest") };
+        *time = l.height() as u32 - 1;
+        let later = StubExecutor::bound(later);
+        assert_ne!(
+            l.derived_commitment(&later.action, &StubExecutor),
+            l.derived_commitment(&first.action, &StubExecutor),
+            "another `time` is another note"
+        );
+        assert_eq!(
+            m.insert(later, &l, &StubExecutor),
             Err(MempoolError::AttestationConflict(mu)),
-            "the digest is the only thing that tells them apart"
+            "and then the digest is the only thing that tells them apart"
         );
         assert_eq!(m.len(), 1);
         assert_eq!(m.candidates(&l, 10), vec![first.clone()]);
@@ -1606,15 +1632,25 @@ mod tests {
     #[test]
     fn two_attests_deriving_one_note_conflict_at_insert() {
         let (l, secrets) = bridged_ledger();
-        let first = attest_tx_with_r(&l, attestation_of(&secrets, [0xaa; 32], 0), 10, [7; 8]);
-        let second = attest_tx_with_r(&l, attestation_of(&secrets, [0xaa; 32], 1), 20, [7; 8]);
+        let a = attestation_of(&secrets, [0xaa; 32], 0);
+        let r = randprotocol_core::ledger::bridge_notes::deposit_r(&a).unwrap();
+        let first = attest_tx_with_r(&l, a, 10, r);
+        // A *second* attestation of the same transfer (another `sequence`, so another digest)
+        // whose submitter reuses the first's blinding: inadmissible since F1 — the ledger takes
+        // only the blinding its own digest derives — but the pool screens before it validates, so
+        // this is exactly the pair its note claim must still catch.
+        let second = attest_tx_with_r(&l, attestation_of(&secrets, [0xaa; 32], 1), 20, r);
         // Nothing the other indexes track connects them, and both are independently admissible:
         // the collision is between the two transactions, not inside either.
         assert_ne!(first.bridge_digests(), second.bridge_digests(), "two digests, so two attestations");
         assert!(first.nullifiers().iter().all(|x| !second.nullifiers().contains(x)));
         assert!(first.commitments().iter().all(|x| !second.commitments().contains(x)));
         assert_eq!(l.validate(&first, &StubExecutor), Ok(()));
-        assert_eq!(l.validate(&second, &StubExecutor), Ok(()));
+        assert_eq!(
+            l.validate(&second, &StubExecutor),
+            Err(randprotocol_core::ledger::TxError::Bridge(randprotocol_core::bridge::BridgeError::WrongDepositBlinding)),
+            "the ledger's own answer to a reused blinding"
+        );
 
         let derived = l.derived_commitment(&first.action, &StubExecutor).expect("an attest derives one note");
         assert_eq!(
@@ -1638,9 +1674,14 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m.candidates(&l, 10), vec![first.clone()]);
 
-        // And removing the owner frees the note, so the loser can take its place.
+        // And removing the owner frees the note, so another submission can take its place: a
+        // second relayer's transaction over the *same* attestation, which since F1 derives the
+        // very same note (its blinding is that attestation's digest, not the submitter's).
         m.remove(&[first.hash()]);
-        m.insert(second, &l, &StubExecutor).unwrap();
+        let other_relayer = attest_tx(&l, attestation_of(&secrets, [0xaa; 32], 0), 30);
+        assert_ne!(other_relayer.hash(), first.hash());
+        assert_eq!(l.derived_commitment(&other_relayer.action, &StubExecutor), Some(derived));
+        m.insert(other_relayer, &l, &StubExecutor).unwrap();
     }
 
     /// An oversized attestation must not buy a decode from the pre-screen.

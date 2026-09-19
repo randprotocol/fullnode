@@ -127,6 +127,13 @@ pub enum Action {
     /// Phase S3: a guardian-signed bridge attestation, deposited as a note of the bridged
     /// asset to `recipient` with blinding `r`.
     ///
+    /// `r` is not the submitter's choice (F1, from chain 14): admission requires it to be
+    /// `bridge_notes::derive_deposit_r(mu)`, `blake3("rand-deposit-r-1" ‖ mu)` over the digest
+    /// the guardians signed (`BridgeError::WrongDepositBlinding` otherwise, before any signature
+    /// work). It stays on the wire so the transaction is self-describing and a wallet rebuilds the
+    /// note from the public fields alone. With it fixed, two submitters of one attestation at one
+    /// `time` name one note, and a copier of a pooled attest cannot swap in a note of its own.
+    ///
     /// `time` is the deposit note's own `time` word, and it is on the action for the same reason
     /// a bundle carries one: the note's commitment is computed by the chain, so the depositor has
     /// to be able to predict it — and it cannot predict the height its transaction lands at.
@@ -729,14 +736,15 @@ impl Transaction {
     /// admits it once — but unlike a nullifier it is not a field of the transaction, it is the
     /// hash of the attestation body the guardians signed. Two relayers racing the same
     /// attestation therefore build two *entirely different* transactions (different fee bundles,
-    /// different `r`) that share nothing [`Transaction::nullifiers`] or
+    /// possibly different `time`s) that share nothing [`Transaction::nullifiers`] or
     /// [`Transaction::commitments`] can see. Without this method the mempool would hold both,
     /// offer both, and lose the block when the second hit `Bridge(Replay)` — a permissionless
     /// relayer race being the normal operating mode of a bridge, not an attack.
     ///
     /// Naming it here also covers the sibling case: two attest transactions agreeing on
-    /// recipient, amount, asset, height and `r` mint the identical deposit commitment, which
-    /// `commitments()` deliberately does not carry either.
+    /// recipient, amount, asset and `time` mint the identical deposit commitment (their `r` is
+    /// the digest's since F1, so it agrees whenever the attestation does), which `commitments()`
+    /// deliberately does not carry either.
     ///
     /// A malformed attestation claims nothing — it names no resource because it cannot be
     /// decoded, and `Ledger::validate` refuses it on its own.

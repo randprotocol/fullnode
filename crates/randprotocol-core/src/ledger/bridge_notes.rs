@@ -54,6 +54,19 @@ pub(super) fn validate(
             // (`GenesisError::BridgeNeedsTokens`) — so this is the same "not on this chain"
             // verdict as the line above, named for the half that is missing.
             let tokens = ledger.tokens().ok_or(TxError::Token(TokenError::Disabled))?;
+            // F1: the deposit note's blinding is the attestation digest's, not the submitter's
+            // (`derive_deposit_r`), so whoever submits an attestation names the same note at the
+            // same `time` and a copier of a pooled attest cannot swap in a note of its own. Two
+            // keccaks and a blake3 over the size-capped bytes — no key, no state, no signature —
+            // so it runs here, before the PQ structure check and the quorum's recoveries inside
+            // `check_attest`. Every attest, a rotation's included: it deposits nothing, but a free
+            // `r` would still be a field a copier could vary. Silent on bytes with no body, which
+            // `check_attest`'s decode refuses on its own.
+            if let Some(expected) = deposit_r(attestation) {
+                if *r != expected {
+                    return Err(TxError::Bridge(BridgeError::WrongDepositBlinding));
+                }
+            }
             // The `asset` compare, bought before the quorum. The action names the index its
             // envelope was sealed for, and `check_attest` below would not report it until after a
             // quorum of secp256k1 recoveries — which is exactly the cost that method's own
@@ -266,6 +279,42 @@ pub fn deposit_commitment(
     executor: &dyn ConfidentialExecutor,
 ) -> Word8 {
     executor.note_commitment(&recipient.pk, &DEPOSIT_FROM, amount, asset, time, r)
+}
+
+/// The hash domain of a deposit note's blinding: `r = blake3("rand-deposit-r-1" ‖ mu)`, read as
+/// eight little-endian `u32` words ([`crate::notes::word8_from_bytes`]).
+pub const DEPOSIT_R_DOMAIN: &[u8] = b"rand-deposit-r-1";
+
+/// The blinding `r` of the deposit note an attestation with digest `mu` mints (F1, chain 14):
+/// `word8_from_bytes(blake3("rand-deposit-r-1" ‖ mu))`.
+///
+/// `mu = keccak256(keccak256(body))` is the 32 bytes the guardian quorum signs
+/// ([`crate::bridge::digest`]), so it is fixed the moment the attestation exists, and the same
+/// for every submitter. Before this rule the blinding was the submitter's choice, and anyone who
+/// saw a relayer's pooled attest could submit the same attestation first under a blinding of its
+/// own — a different note (still the recipient's: the wallet rebuilds it from the public fields),
+/// the relayer's transaction dead on `Replay`, and the recipient's envelope replaced. With `r`
+/// derived, two submissions at the same `time` name one note, and the pool conflicts them.
+///
+/// BLAKE3 with a domain tag, as every other derived word on the ledger side is
+/// (`Hash::digest_domain`); `mu` is a keccak digest only because the wire format is frozen
+/// (the source-chain contracts sign it). The 32 bytes are read little-endian, four per word,
+/// exactly as a `Word8` is written on the wire, and every `u32` is a valid note word — the
+/// wallet's own blindings are uniform `u32`s (`Note::new`).
+///
+/// `time` is deliberately *not* bound: see [`Action::BridgeAttest`] and `docs/bridge.md` §8.
+pub fn derive_deposit_r(mu: &[u8; 32]) -> Word8 {
+    crate::notes::word8_from_bytes(&crate::crypto::Hash::digest_domain(DEPOSIT_R_DOMAIN, mu).0)
+        .expect("a blake3 hash is 32 bytes")
+}
+
+/// [`derive_deposit_r`] of an attestation's own bytes: the digest over its wire body, exactly as
+/// [`Transaction::bridge_digests`] and `BridgeState::check_attest` compute it. `None` for bytes
+/// with no body to hash, which admission refuses on their own (`check_attest`'s decode).
+///
+/// This is what a relayer puts in the action's `r` field, and what [`validate`] requires there.
+pub fn deposit_r(attestation: &[u8]) -> Option<Word8> {
+    Attestation::body_bytes(attestation).ok().map(|body| derive_deposit_r(&crate::bridge::digest(body)))
 }
 
 /// What an attestation's payload would deposit, from the wire bytes alone: the source
@@ -529,13 +578,16 @@ mod tests {
     fn attest_tx_cosigned(l: &Ledger, attestation: Vec<u8>, to: ShieldedAddress, seed: u32, pq: &[u8]) -> Transaction {
         let asset = expected_index(l, &attestation);
         let pq_signatures = cosign_by(pq, &attestation);
+        // The one blinding the ledger admits (F1); bytes with no body keep a placeholder, since
+        // their decode is what refuses them.
+        let r = deposit_r(&attestation).unwrap_or([7; 8]);
         StubExecutor::bound(Transaction::shielded(
             7,
             fee_bundle(l, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
             Action::BridgeAttest {
                 attestation,
                 recipient: to,
-                r: [7; 8],
+                r,
                 time: l.height() as u32,
                 asset,
                 envelope: env(),
@@ -560,9 +612,13 @@ mod tests {
         tx
     }
 
-    /// What the ledger must have computed for the deposit note of `amount` in asset `asset`.
-    fn expected_cm(height: u32, amount: u64, asset: u32) -> Word8 {
-        StubExecutor.note_commitment(&recipient().pk, &[0; 8], amount, asset, height, &[7; 8])
+    /// What the ledger must have computed for `tx`'s deposit note of `amount` in asset `asset` at
+    /// `time` — under the blinding its attestation's digest derives, which is the only one the
+    /// ledger admits (F1).
+    fn expected_cm(tx: &Transaction, time: u32, amount: u64, asset: u32) -> Word8 {
+        let Action::BridgeAttest { attestation, .. } = &tx.action else { panic!("an attest") };
+        let r = deposit_r(attestation).expect("an attestation with a body");
+        StubExecutor.note_commitment(&recipient().pk, &[0; 8], amount, asset, time, &r)
     }
 
     /// The whole deposit path: the guardians' amount, the registry's index and the recipient's
@@ -574,7 +630,7 @@ mod tests {
         let (mut l, secrets) = ledger();
         assert_eq!(l.tokens().unwrap().get(1).unwrap().total_supply, 0, "nothing bridged yet");
         let tx = deposit(&mut l, &secrets, 1_000, 0, 20);
-        let cm = expected_cm(1, 1_000, 1);
+        let cm = expected_cm(&tx, 1, 1_000, 1);
         assert!(l.has_commitment(&cm), "the deposit note is in the tree");
         // The bundle's four notes plus the deposit note.
         assert_eq!(l.next_index(), 5);
@@ -582,11 +638,16 @@ mod tests {
         let bridge = l.bridge().unwrap();
         assert_eq!(bridge.spent.len(), 1, "the digest is consumed");
         // The relayer fee has no payee on a shielded chain, so the gross amount is deposited:
-        // a second attestation of the same amount with a fee produces the same note.
+        // a second attestation of the same amount with a fee deposits a note of the whole
+        // 1 000. (A different note from the first, not the same one: its digest is different, and
+        // so is the blinding that digest derives — F1.)
         let a = attest(&secrets, transfer(1_000, 250, recipient().recipient_hash(), 1));
         let with_fee = attest_tx(&l, a, recipient(), 30);
-        assert_eq!(l.validate(&with_fee, &StubExecutor), Err(TxError::CommitmentExists(cm)));
-        assert_ne!(tx.hash(), with_fee.hash());
+        l.apply_tx(&with_fee, &proposer().address(), &StubExecutor).unwrap();
+        let gross = expected_cm(&with_fee, 1, 1_000, 1);
+        assert!(l.has_commitment(&gross), "the gross amount, fee included");
+        assert_ne!(gross, cm);
+        assert_eq!(l.tokens().unwrap().get(1).unwrap().total_supply, 2_000);
     }
 
     /// The deposit note's `time` word is the one the action published, never the height the
@@ -606,14 +667,14 @@ mod tests {
         // The same note, named before the transaction is applied: this is what a mempool claims
         // for an attest (`Ledger::derived_commitment`, one derivation for a withdraw and an attest
         // alike), and it reads the registry rather than the action's `asset` word.
-        assert_eq!(l.derived_commitment(&tx.action, &StubExecutor), Some(expected_cm(5, 1_000, 1)));
+        assert_eq!(l.derived_commitment(&tx.action, &StubExecutor), Some(expected_cm(&tx, 5, 1_000, 1)));
         l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
-        assert!(l.has_commitment(&expected_cm(5, 1_000, 1)), "the note the action's time names");
-        assert!(!l.has_commitment(&expected_cm(9, 1_000, 1)), "and not the one the apply height would");
+        assert!(l.has_commitment(&expected_cm(&tx, 5, 1_000, 1)), "the note the action's time names");
+        assert!(!l.has_commitment(&expected_cm(&tx, 9, 1_000, 1)), "and not the one the apply height would");
         // The recompute-after-the-fact path reads the same word off the committed action, so a
         // node's note index agrees with the tree whatever height it asks about.
         let (cm, _) = deposit_note(&tx, l.tokens().unwrap(), &StubExecutor).expect("a transfer deposits a note");
-        assert_eq!(cm, expected_cm(5, 1_000, 1));
+        assert_eq!(cm, expected_cm(&tx, 5, 1_000, 1));
     }
 
     /// The size cap reaches the *pre-validation* derivation too. `derived_commitment` is what a
@@ -682,6 +743,138 @@ mod tests {
         assert!(matches!(junk(height as u32), Err(TxError::Bridge(_))), "the decode is what refuses it now");
     }
 
+    /// The deposit blinding's definition, pinned: `blake3("rand-deposit-r-1" ‖ mu)` read as eight
+    /// little-endian words, for two fixed digests — and `deposit_r` of an attestation is that of
+    /// the very digest the guardians sign (`Transaction::bridge_digests`' `mu`). A wallet, a
+    /// relayer or another implementation reproduces these words or its deposits are refused.
+    #[test]
+    fn the_deposit_blinding_is_pinned() {
+        assert_eq!(DEPOSIT_R_DOMAIN, &b"rand-deposit-r-1"[..]);
+        assert_eq!(
+            crate::notes::word8_to_hex(&derive_deposit_r(&[0; 32])),
+            "bcf6dc32f463ea7159250ae9209a413c4bf631658577aa0275037b765aa17902",
+            "mu = 0^32"
+        );
+        let mu: [u8; 32] = std::array::from_fn(|i| i as u8);
+        assert_eq!(crate::notes::word8_to_hex(&derive_deposit_r(&mu)), "a9d47b2f82ee0f38045a9c01a60d30b49fefc77746b2f3093966412acaa179e7", "mu = 00 01 .. 1f");
+        let manual = crate::crypto::Hash::digest_domain(b"rand-deposit-r-1", &mu).0;
+        assert_eq!(crate::notes::word8_to_bytes(&derive_deposit_r(&mu)), manual, "the hash's own bytes, LE words");
+
+        let (l, secrets) = ledger();
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let tx = attest_tx(&l, a.clone(), recipient(), 20);
+        let mu = tx.bridge_digests()[0];
+        assert_eq!(deposit_r(&a), Some(derive_deposit_r(&mu.0)));
+        assert_eq!(deposit_r(&[0xff; 8]), None, "no body, no blinding");
+    }
+
+    /// The ledger rule (F1): the action's `r` must be the one the attestation's digest derives.
+    /// Any other — one bit off, the old fixtures' constant, zero — is refused, by `validate` and by
+    /// `apply` alike, with nothing written; the derived one deposits.
+    #[test]
+    fn an_attest_with_any_other_blinding_is_refused() {
+        let (l, secrets) = ledger();
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let honest = attest_tx(&l, a, recipient(), 20);
+        let Action::BridgeAttest { r: derived, .. } = &honest.action else { panic!("an attest") };
+        let derived = *derived;
+        let mu = honest.bridge_digests()[0];
+        let mut flipped = derived;
+        flipped[3] ^= 1;
+        for wrong in [flipped, [7; 8], [0; 8]] {
+            let mut tx = honest.clone();
+            let Action::BridgeAttest { r, .. } = &mut tx.action else { panic!("an attest") };
+            *r = wrong;
+            StubExecutor::bind(&mut tx);
+            let refused = Err(TxError::Bridge(BridgeError::WrongDepositBlinding));
+            assert_eq!(l.validate(&tx, &StubExecutor), refused, "r = {wrong:?}");
+            let mut scratch = l.clone();
+            assert_eq!(scratch.apply_tx(&tx, &proposer().address(), &StubExecutor).map(|_| ()), refused);
+            assert!(!scratch.is_digest_spent(&mu), "the attestation is still unconsumed");
+        }
+        let mut l = l;
+        l.apply_tx(&honest, &proposer().address(), &StubExecutor).unwrap();
+        assert!(l.has_commitment(&expected_cm(&honest, 1, 1_000, 1)), "the derived blinding deposits");
+    }
+
+    /// And it is refused before any signature work: an attestation nobody in the guardian set
+    /// signed, and one with no PQ co-signatures at all, still come back as the wrong blinding —
+    /// possible only if the compare runs before the PQ structure check and the secp256k1 quorum.
+    /// A rotation is held to the same rule: `r` is always the digest's, so no attest transaction
+    /// has a free field a copier can vary.
+    #[test]
+    fn a_wrong_blinding_is_refused_before_any_signature_work() {
+        let (l, secrets) = ledger();
+        let forged = misattest(transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let mut tx = attest_tx_cosigned(&l, forged, recipient(), 20, &[]);
+        let Action::BridgeAttest { r, .. } = &mut tx.action else { panic!("an attest") };
+        r[0] ^= 1;
+        StubExecutor::bind(&mut tx);
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::Bridge(BridgeError::WrongDepositBlinding)));
+
+        let rotation = Body {
+            timestamp: 1,
+            nonce: 0,
+            emitter_chain: CHAIN_RAND,
+            emitter_address: crate::bridge::GOVERNANCE_EMITTER,
+            sequence: 9,
+            consistency_level: 0,
+            payload: Payload::GuardianSetUpgrade(crate::bridge::GuardianSetUpgrade {
+                new_index: 1,
+                keys: vec![guardian_address(&[9; 32])],
+            })
+            .encode(),
+        };
+        let honest = attest_tx(&l, attest(&secrets, rotation), recipient(), 30);
+        assert_eq!(l.validate(&honest, &StubExecutor), Ok(()), "the derived blinding rotates");
+        let mut tx = honest;
+        let Action::BridgeAttest { r, .. } = &mut tx.action else { panic!("an attest") };
+        *r = [0; 8];
+        StubExecutor::bind(&mut tx);
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::Bridge(BridgeError::WrongDepositBlinding)));
+    }
+
+    /// The griefing F1 closes: two submitters of one attestation — different fee bundles, so
+    /// different transactions — at the same `time` now name the *same* deposit note, so the pool's
+    /// commitment claim conflicts them rather than letting a copier's note race the relayer's.
+    /// `time` is the residual: it is still the submitter's (inside the window), so a copier who
+    /// picks another `time` derives another note — still the recipient's, at the same amount and
+    /// asset, rebuilt by the wallet from the public fields — and the digest claim is what
+    /// conflicts the pair then.
+    #[test]
+    fn two_submitters_of_one_attestation_at_one_time_derive_one_note() {
+        let (mut l, secrets) = ledger();
+        l.set_height(9);
+        l.record_anchor(9);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let relayer = attest_tx(&l, a.clone(), recipient(), 20);
+        let copier = attest_tx(&l, a, recipient(), 40);
+        assert_ne!(relayer.hash(), copier.hash(), "two different transactions");
+        let (cr, cc) = (
+            l.derived_commitment(&relayer.action, &StubExecutor).unwrap(),
+            l.derived_commitment(&copier.action, &StubExecutor).unwrap(),
+        );
+        assert_eq!(cr, cc, "one note, whoever submits it");
+        assert_eq!(relayer.bridge_digests(), copier.bridge_digests());
+        l.apply_tx(&relayer, &proposer().address(), &StubExecutor).unwrap();
+        assert!(l.validate(&copier, &StubExecutor).is_err(), "the second is refused once the first lands");
+
+        // The residual: another `time` in the window is another note of the same recipient.
+        let (l, secrets) = ledger();
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let now = attest_tx(&l, a.clone(), recipient(), 20);
+        let mut earlier = attest_tx(&l, a, recipient(), 40);
+        let Action::BridgeAttest { time, .. } = &mut earlier.action else { panic!("an attest") };
+        *time = 0;
+        StubExecutor::bind(&mut earlier);
+        assert_ne!(
+            l.derived_commitment(&now.action, &StubExecutor),
+            l.derived_commitment(&earlier.action, &StubExecutor),
+            "time is the one word a copier still chooses"
+        );
+        assert_eq!(l.validate(&earlier, &StubExecutor), Ok(()));
+    }
+
     /// What a node's note index needs: the deposit note recomputed from the committed
     /// transaction alone, matching the one the ledger appended. The registry *after* the
     /// attestation is what a node has on disk, and it answers the same as the one before.
@@ -691,7 +884,7 @@ mod tests {
         let tx = deposit(&mut l, &secrets, 1_000, 0, 20);
         let tokens = l.tokens().unwrap();
         let (cm, envelope) = deposit_note(&tx, tokens, &StubExecutor).expect("a transfer deposits a note");
-        assert_eq!(cm, expected_cm(1, 1_000, 1));
+        assert_eq!(cm, expected_cm(&tx, 1, 1_000, 1));
         assert!(l.has_commitment(&cm));
         assert_eq!(envelope, env(), "paired with the envelope that opens it");
 
@@ -750,7 +943,7 @@ mod tests {
             // design — `apply_tx`'s caller discards the whole ledger on any error.)
             let mut scratch = l.clone();
             assert_eq!(scratch.apply_tx(&tx, &proposer().address(), &StubExecutor).map(|_| ()), expected);
-            assert!(!scratch.has_commitment(&expected_cm(1, 500, 1)), "no deposit note under asset {wrong}");
+            assert!(!scratch.has_commitment(&expected_cm(&honest, 1, 500, 1)), "no deposit note under asset {wrong}");
             assert!(!scratch.is_digest_spent(&mu), "and the attestation is still unconsumed");
         }
     }
@@ -837,7 +1030,7 @@ mod tests {
         let listed = StubExecutor::bound(naming_asset(tx, 3));
         assert_eq!(l.validate(&listed, &StubExecutor), Ok(()));
         l.apply_tx(&listed, &proposer().address(), &StubExecutor).unwrap();
-        assert!(l.has_commitment(&expected_cm(1, 1_000, 3)), "the note the listing's index names");
+        assert!(l.has_commitment(&expected_cm(&listed, 1, 1_000, 3)), "the note the listing's index names");
         assert_eq!(l.tokens().unwrap().get(3).unwrap().total_supply, 1_000);
     }
 
@@ -1123,7 +1316,7 @@ mod tests {
             let Action::BridgeAttest { asset, .. } = &tx.action else { panic!("an attest") };
             assert_eq!(*asset, zusd, "either coin deposits under the one token's index");
             l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
-            assert!(l.has_commitment(&expected_cm(1, amount as u64, zusd)));
+            assert!(l.has_commitment(&expected_cm(&tx, 1, amount as u64, zusd)));
         }
         let t = l.tokens().unwrap();
         assert_eq!(t.get(zusd).unwrap().total_supply, 1_400, "one token, both coins' worth");
@@ -1490,7 +1683,13 @@ mod tests {
         let accepted: Vec<String> = cases
             .into_iter()
             .map(|(what, change)| (what, l.validate(&altered(&original, change), &StubExecutor)))
-            .filter(|(_, got)| !matches!(got, Err(TxError::InvalidBundleProof(_))))
+            // A changed `r` is refused one step earlier since F1, by the blinding rule: no `r`
+            // but the digest's is admissible at all, so there is no other one for the binding to
+            // be the last line against.
+            .filter(|(what, got)| {
+                !matches!(got, Err(TxError::InvalidBundleProof(_)))
+                    && !(*what == "r" && *got == Err(TxError::Bridge(BridgeError::WrongDepositBlinding)))
+            })
             .map(|(what, got)| format!("`{what}` changed: {got:?}"))
             .collect();
         assert!(accepted.is_empty(), "{accepted:#?}");
@@ -1553,7 +1752,7 @@ mod tests {
         assert!(l.bridge().unwrap().spent.is_empty());
         let five = attest_tx_cosigned(&l, a, recipient(), 20, &[1, 2, 3, 4, 5]);
         l.apply_tx(&five, &proposer().address(), &StubExecutor).unwrap();
-        assert!(l.has_commitment(&expected_cm(1, 1_000, 1)));
+        assert!(l.has_commitment(&expected_cm(&five, 1, 1_000, 1)));
     }
 
     /// The co-signatures are inside the transaction binding: a copy of an honest attest whose PQ

@@ -2021,17 +2021,21 @@ pub fn deposit_index_check(predicted: u32, tx: &Value) -> DepositIndexCheck {
 /// transaction lands at: nobody can predict the latter, and an envelope sealed for the wrong note
 /// leaves the recipient a leaf they cannot open.
 ///
-/// `from` is the zero word: a deposit has no sender inside the pool. The blinding is drawn here,
-/// by `Note::new`, and the caller reads it back off the note for the action's `r` — the one place
-/// it is generated, so the note and the action cannot name different ones.
+/// `from` is the zero word: a deposit has no sender inside the pool. The blinding is not drawn:
+/// since chain 14 (F1) the ledger admits exactly one, derived from the digest the guardians
+/// signed (`bridge_notes::deposit_r`, `blake3("rand-deposit-r-1" ‖ mu)`), so it is computed here
+/// from `attestation` and the caller reads it back off the note for the action's `r` — the one
+/// place it is computed, so the note and the action cannot name different ones.
 pub fn deposit_note_for(
     w: &Wallet,
     recipient: &ShieldedAddress,
+    attestation: &[u8],
     amount: u64,
     asset: u32,
     time: u32,
 ) -> Result<(Note, Envelope)> {
-    let note = Note::new(recipient.pk, [0; 8], amount, asset, time);
+    let r = bridge_notes::deposit_r(attestation).ok_or_else(|| anyhow!("the attestation has no body to derive the deposit blinding from"))?;
+    let note = Note { pk: recipient.pk, from: [0; 8], amount, asset, time, r };
     let envelope =
         seal_note(&w.vk, recipient, &note, &TxKey::random()).map_err(|e| anyhow!("sealing the deposit envelope: {e}"))?;
     Ok((note, envelope))
@@ -3181,7 +3185,8 @@ mod tests {
     fn a_bridge_deposit_note_is_the_one_the_ledger_will_append() {
         use randprotocol_core::confidential::ConfidentialExecutor;
         let me = Wallet::from_spend_key(SpendKey([23; 8]));
-        let (note, envelope) = deposit_note_for(&me, &me.address, 1_000, 3, 41).unwrap();
+        let a = transfer_attestation(1_000, me.address.recipient_hash());
+        let (note, envelope) = deposit_note_for(&me, &me.address, &a, 1_000, 3, 41).unwrap();
         // `ConfidentialExecutor::note_commitment` is the function `bridge_notes` computes the
         // deposit's commitment through, on the ledger's side of the same wire — over the action's
         // own `r`, which is this note's.
@@ -3190,11 +3195,17 @@ mod tests {
         assert_eq!((note.amount, note.asset, note.time, note.from), (1_000, 3, 41, [0; 8]));
         // And the envelope published with it opens back to that note, as the recipient.
         assert_eq!(classify(&me, note.commitment(), &envelope), Found::Received(note));
-        // A different `time` is a different note: this is why `time` is on the action. (So is a
-        // different blinding, which is why every deposit draws a fresh one.)
-        let (later, _) = deposit_note_for(&me, &me.address, 1_000, 3, 42).unwrap();
+        // A different `time` is a different note: this is why `time` is on the action.
+        let (later, _) = deposit_note_for(&me, &me.address, &a, 1_000, 3, 42).unwrap();
         assert_ne!(later.commitment(), note.commitment());
-        assert_ne!(deposit_note_for(&me, &me.address, 1_000, 3, 41).unwrap().0.r, note.r);
+        // The blinding is not drawn, it is derived (F1): this attestation's digest fixes it, so
+        // every submitter of it builds the very same note — and the ledger admits no other `r`
+        // (`bridge_notes::deposit_r`, the rule `validate` enforces).
+        assert_eq!(note.r, bridge_notes::deposit_r(&a).unwrap());
+        assert_eq!(deposit_note_for(&me, &me.address, &a, 1_000, 3, 41).unwrap().0.r, note.r);
+        let other = transfer_attestation(999, me.address.recipient_hash());
+        assert_ne!(bridge_notes::deposit_r(&other).unwrap(), note.r, "another attestation, another blinding");
+        assert!(deposit_note_for(&me, &me.address, &[0xff; 4], 1_000, 3, 41).is_err(), "no body, no note");
     }
 
     // ------------------------------------------------ the hidden-asset bundle, end to end
@@ -3411,13 +3422,17 @@ mod tests {
     fn public_notes_for(me: &Wallet) -> (Vec<Transaction>, Vec<Note>) {
         use randprotocol_core::ledger::tokens::MintAuthority;
         use randprotocol_core::types::actions::InitialMint;
+        let attestation = transfer_attestation(1_000, me.address.recipient_hash());
+        // The blinding the ledger admits (F1), so this fixture is the transaction a chain would
+        // actually carry.
+        let deposit_r = bridge_notes::deposit_r(&attestation).unwrap();
         let deposit = Transaction::shielded(
             7,
             unread_bundle(),
             Action::BridgeAttest {
-                attestation: transfer_attestation(1_000, me.address.recipient_hash()),
+                attestation,
                 recipient: me.address.clone(),
-                r: [9; 8],
+                r: deposit_r,
                 time: 1,
                 asset: 3,
                 envelope: garbage(),
@@ -3453,7 +3468,7 @@ mod tests {
         );
         let pk = me.vk.pk();
         let notes = vec![
-            Note { pk, from: [0; 8], amount: 1_000, asset: 3, time: 1, r: [9; 8] },
+            Note { pk, from: [0; 8], amount: 1_000, asset: 3, time: 1, r: deposit_r },
             Note { pk, from: MINT_FROM, amount: 250, asset: 5, time: 2, r: [10; 8] },
             Note { pk, from: MINT_FROM, amount: 90, asset: 6, time: 3, r: [11; 8] },
         ];
@@ -3469,7 +3484,7 @@ mod tests {
         let stranger = Wallet::from_spend_key(SpendKey([42; 8]));
         let ex = ZkExecutor::new(FriProfile::Test);
         let (txs, notes) = public_notes_for(&me);
-        assert_eq!(notes[0].commitment(), bridge_notes::deposit_commitment(&me.address, 1_000, 3, 1, &[9; 8], &ex));
+        assert_eq!(notes[0].commitment(), bridge_notes::deposit_commitment(&me.address, 1_000, 3, 1, &notes[0].r, &ex));
         assert_eq!(notes[1].commitment(), randprotocol_core::ledger::tokens::mint_commitment(&me.address, 250, 5, 2, &[10; 8], &ex));
         assert_eq!(notes[2].commitment(), randprotocol_core::ledger::tokens::mint_commitment(&me.address, 90, 6, 3, &[11; 8], &ex));
         for (tx, note) in txs.iter().zip(&notes) {
@@ -3484,7 +3499,7 @@ mod tests {
             Action::BridgeAttest {
                 attestation: rotation_attestation(),
                 recipient: me.address.clone(),
-                r: [9; 8],
+                r: bridge_notes::deposit_r(&rotation_attestation()).unwrap(),
                 time: 1,
                 asset: 0,
                 envelope: garbage(),

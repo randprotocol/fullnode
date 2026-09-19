@@ -267,6 +267,14 @@ pub enum BridgeError {
     /// B1: the pause key's signature over `M_pause` does not verify.
     #[error("the pause signature does not verify")]
     BadPauseSignature,
+    /// F1 (chain 14): a `BridgeAttest` whose blinding `r` is not the one the attestation's digest
+    /// fixes, `ledger::bridge_notes::derive_deposit_r(mu)`. The deposit note's commitment is then
+    /// a function of the guardians' `mu`, the recipient, the amount, the registry's index and the
+    /// action's `time` — nothing a front-runner of a relayer's transaction can choose but `time`.
+    /// A statement about the transaction's own bytes (the `r` field against a hash of its
+    /// `attestation` field), so it is a permanent admission verdict.
+    #[error("the deposit blinding is not the one the attestation's digest derives")]
+    WrongDepositBlinding,
     /// B4: `M_list`/`M_register` must carry the bridge's current `list_nonce`.
     #[error("wrong list nonce: expected {expected}, got {got}")]
     BadListNonce { expected: u64, got: u64 },

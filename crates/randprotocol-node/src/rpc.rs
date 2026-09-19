@@ -4166,7 +4166,11 @@ mod tests {
         // Every word of the deposit note is here, `r` included, so its recipient can rebuild the
         // note from the wire alone — the recovery path for a hostile or garbage envelope
         // (`docs/bridge.md` §8). Nothing about a deposit is secret; only later spends are.
-        assert_eq!(action["r"], word8_to_hex(&[7; 8]), "the note's blinding, as the action published it");
+        // Since F1 that blinding is the attestation digest's — the ledger admits no other — so the
+        // explorer's `r` is reproducible from the attestation bytes the same transaction carries.
+        let Action::BridgeAttest { attestation, .. } = &att.action else { panic!("an attest") };
+        let r = randprotocol_core::ledger::bridge_notes::deposit_r(attestation).expect("the digest derives it");
+        assert_eq!(action["r"], word8_to_hex(&r), "the note's blinding, as the action published it");
         assert_eq!(action["time"], 0, "the note's own time word, not the height it applied at");
         // And the commitment the chain computed from exactly those fields is the leaf it appended.
         let cm = randprotocol_core::ledger::bridge_notes::deposit_commitment(
@@ -4174,7 +4178,7 @@ mod tests {
             1_000,
             1,
             0,
-            &[7; 8],
+            &r,
             &StubExecutor,
         );
         assert_eq!(action["commitment"], word8_to_hex(&cm));

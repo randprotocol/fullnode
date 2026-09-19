@@ -2272,13 +2272,15 @@ pub(crate) mod fixtures {
     pub(crate) fn attest_tx(ledger: &Ledger, attestation: Vec<u8>, seed: u32) -> Transaction {
         let asset = deposit_index(ledger, &attestation);
         let pq_signatures = pq_quorum(ledger.chain_id(), &attestation);
+        // The one blinding admission takes (F1): the attestation digest's.
+        let r = randprotocol_core::ledger::bridge_notes::deposit_r(&attestation).unwrap_or([7; 8]);
         randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(
             ledger.chain_id(),
             bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
             Action::BridgeAttest {
                 attestation,
                 recipient: recipient(),
-                r: [7; 8],
+                r,
                 time: ledger.height() as u32,
                 asset,
                 envelope: env(seed as u8),
