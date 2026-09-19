@@ -219,6 +219,13 @@ impl HotStuff {
         self.head_qc.view
     }
 
+    /// Tests only: put this replica's committed head somewhere the tree does not reach, which is
+    /// the position conflicting finality leaves a node in (audit v3).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn force_committed_hash_for_testing(&mut self, hash: Hash) {
+        self.committed_hash = hash;
+    }
+
     pub fn committed_hash(&self) -> Hash {
         self.committed_hash
     }
@@ -893,8 +900,18 @@ impl HotStuff {
             cur = entry.block.parent();
         }
         if cur != self.committed_hash {
-            // b does not descend from our committed head: safety violation or we are behind.
-            tracing::error!("commit path does not reach committed head; ignoring");
+            // b does not descend from our committed head. Every ancestor on this path was in the
+            // tree (the walk above would have panicked otherwise), so this is not "we are behind":
+            // it is a certified three-chain on a branch that contradicts what this replica has
+            // already committed. Ignoring it left the node serving a finality answer it had just
+            // been shown to be wrong about, which is how a double-spend against this node's users
+            // goes unnoticed. Hand it to the node layer as fatal.
+            tracing::error!(
+                committed = ?self.committed_hash,
+                attempted = ?b_hash,
+                "commit path does not reach the committed head: conflicting finality"
+            );
+            out.push(Action::SafetyViolation { committed: self.committed_hash, attempted: b_hash });
             return;
         }
         path.reverse();

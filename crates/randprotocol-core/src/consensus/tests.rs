@@ -24,6 +24,9 @@ struct Sim {
     now: u64,
     /// Node indices that are partitioned off (drop everything to/from them).
     down: Vec<bool>,
+    /// `Action::SafetyViolation`s any replica emitted: a real node stops on one, and
+    /// `assert_consistent` refuses to pass while one is recorded (audit v3).
+    safety_violations: Vec<(usize, Hash, Hash)>,
 }
 
 /// A payout address for a test validator: phase S2 makes it a required genesis field, and
@@ -115,6 +118,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         pending_propose: vec![None; n as usize],
         fetches: Vec::new(),
         down: vec![false; n as usize],
+        safety_violations: Vec::new(),
         nodes,
         keys,
         gs,
@@ -144,6 +148,11 @@ impl Sim {
                 Action::ReadyToPropose { view } => self.pending_propose[i] = Some(view),
                 Action::FetchBlock(h) => self.fetches.push((i, h)),
                 Action::PersistSafety(_) => {}
+                // A real node stops here; the simulator records it so a test can assert it, and
+                // `assert_consistent` fails loudly if one ever appears unexpectedly.
+                Action::SafetyViolation { committed, attempted } => {
+                    self.safety_violations.push((i, committed, attempted))
+                }
             }
         }
     }
@@ -248,6 +257,7 @@ impl Sim {
     }
 
     fn assert_consistent(&self) {
+        assert!(self.safety_violations.is_empty(), "safety violations reported: {:?}", self.safety_violations);
         let reference = &self.committed[0];
         for (i, c) in self.committed.iter().enumerate() {
             let n = reference.len().min(c.len());
@@ -735,6 +745,45 @@ impl Sim {
             assert_eq!(node.committed_ledger().state_root(), root, "node {i} ledger differs");
         }
     }
+}
+
+/// Audit v3 (the CON-3 candidate): a three-chain that commits a block which does not descend from
+/// this replica's committed head is conflicting finality — the set finalized a branch that
+/// contradicts what this node already served as final. It used to be a log line and a `return`,
+/// leaving the node answering `rand_getFinality` for a history it had just been shown was wrong.
+/// It is now an `Action::SafetyViolation`, which stops the node.
+#[test]
+fn a_commit_that_skips_the_committed_head_is_reported_as_a_safety_violation() {
+    let mut sim = setup(4, 4);
+    for _ in 0..4 {
+        sim.step(vec![]);
+    }
+    let victim = 0;
+    // Rewrite this replica's committed head to a block nothing descends from: the same position a
+    // node is in when the set commits a branch conflicting with its own committed history.
+    sim.nodes[victim].force_committed_hash_for_testing(Hash::digest(b"a branch we never had"));
+    let mut acts = Vec::new();
+    for _ in 0..8 {
+        sim.propose_all(vec![]);
+        let proposals: Vec<Block> = sim
+            .queue
+            .iter()
+            .filter_map(|(_, _, m)| match m {
+                ConsensusMessage::Proposal(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        for b in proposals {
+            if let Ok(a) = sim.nodes[victim].on_proposal(b, sim.now) {
+                acts.extend(a);
+            }
+        }
+        sim.step(vec![]);
+    }
+    assert!(
+        acts.iter().any(|a| matches!(a, Action::SafetyViolation { .. })),
+        "a commit off the committed head was not reported"
+    );
 }
 
 /// Audit v3 CON-1b: the lock is a promise, and a restart must not break it. A validator locked on
