@@ -68,7 +68,7 @@ from chain 7's validator order and can only be confirmed on the droplet itself.
 | name | where (chain-7 fleet) | validator address | pubkey | payout (`deploy/payout/…`) |
 |---|---|---|---|---|
 | a | laptop, LAN 192.168.100.123 (NAT) | `2nRdFChBXRmKoe2sQE3ZYDzvdg53QmBZJJ9iweY7hk1v` | `15321b04570d7095…` | `rand11qgA3ETvT…uLm4n9` |
-| b | 192.168.100.79 (NAT), MacBook Air, auto-updater | `ByDkxsEfDCR5DrmDufKftvcRsgvufypnZ4SgDQzJAQ7Z` | `4d491d8a5540f005…` | `rand188sGyCRpX…hY5T8k` |
+| b | DigitalOcean sgp1 168.144.102.43 (droplet since 2026-09-19; was the MacBook Air, 192.168.100.79 NAT) | `ByDkxsEfDCR5DrmDufKftvcRsgvufypnZ4SgDQzJAQ7Z` | `4d491d8a5540f005…` | `rand188sGyCRpX…hY5T8k` |
 | c | DigitalOcean fra1 164.90.239.200 | `F6rYLexPhyMmwPNqbEmyyp5FiTmtQqDgZyqScUqYY4F6` | `f3557730c8a76b43…` | `rand14wXebNPJc…rxb3sy` |
 | d | DigitalOcean ric1 165.245.173.74 | `5tMgLSzXL8keU1vg2wtGEXRJkmfBK6GzhjNjxrCFgCaj` | `e95ecd68c5621147…` | `rand13SKXv49EH…thJHN4` |
 | e | DigitalOcean sgp1 188.166.235.187 (RandScan explorer) | `CxeG7vJaxUoKBZZe8U8LGXohH2FvcCbE47AufK6Mp2jf` | `9ffac1e8ff6b687d…` | `rand12nJ3vSqUc…E3YbGt` |
@@ -277,11 +277,18 @@ scratch, `deploy/rebuild-vps.sh <ip>` rebuilds on a new commit and restarts. Ser
    ```
 
 3. **mkc1 (201.79.35.212) and mem1 (168.144.61.10) had full 29 GB disks.** Their dead chain-11
-   data dirs (`data-*-79123fa7`, 7 GB) were deleted first. They now have 7 GB free.
-   **Operator action: resize mkc1 and mem1.** They are the same two droplets whose disks filled
-   before the chain-9 rollout.
+   data dirs (`data-*-79123fa7`, 7 GB) were deleted first, leaving 7 GB free. Later on
+   2026-09-19 both were resized from `s5-1vcpu-2gb-30gb` to `s5-1vcpu-2gb-80gb` (same CPU and
+   memory, an 80 GB disk; `doctl compute droplet-action resize <id> --size s5-1vcpu-2gb-80gb
+   --resize-disk`, one at a time, `rand-node` stopped first). Each now has 77 GB with 55 GB free.
 4. Node A was restarted on `bin-86af6eb/` (`deploy/run-a.sh`).
-5. B (the MacBook Air) is offline and pending. Its `.update-pin` should read `86af6eb`.
+5. **Node B now runs on a droplet**, not the MacBook Air, which is offline. `sesh-node-b`,
+   sgp1, `s-2vcpu-4gb`, 168.144.102.43 (created 2026-09-19): the same build (`cc20bf84…`), key
+   `deploy/node-b.key.json` (peer id `12D3KooWDBrMjejqsbYGLgmDAZd2K4N98yz5VKntcgfpCLsCFUJD`,
+   unchanged), data dir `/root/data-rand-node-b-8123ccac`, a unit like C's plus E as a
+   bootstrap. **Never run node B on the MacBook Air while this droplet runs**: the same validator
+   key in two places signs two different blocks at one height (equivocation). Leave the Air's
+   `.update-pin` on a chain-12 build (it cannot follow chain 13), or retire its auto-updater.
 6. Survey after the cut-over:
 
    | check | result |
