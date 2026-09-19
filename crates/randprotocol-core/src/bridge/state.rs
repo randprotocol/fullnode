@@ -515,9 +515,10 @@ impl BridgeState {
     /// Validates an outbound burn: `asset_index` must name a **bridged** token
     /// in `tokens` — one whose mint authority is [`MintAuthority::Bridge`],
     /// which is the only kind with source-chain coins to release — the pair
-    /// `(to_chain, token)` must be one of that token's backings, that backing
-    /// must hold at least `amount`, `to` must be a usable recipient on
-    /// `to_chain`, and `relayer_fee <= amount != 0`.
+    /// `(to_chain, token)` must be one of that token's backings, `amount` and
+    /// `relayer_fee` must each be a whole number of that backing's release
+    /// unit, that backing must hold at least `amount`, `to` must be a usable
+    /// recipient on `to_chain`, and `relayer_fee <= amount != 0`.
     ///
     /// A registered but non-bridged token (a native RPL token, whose supply
     /// moves by its own mint authority and never crossed this bridge) is
@@ -533,6 +534,14 @@ impl BridgeState {
     /// [`crate::ledger::tokens::TokenError::InsufficientBacking`] — even when
     /// the token's whole supply would cover it. That is the check that keeps a
     /// burn from succeeding here and failing to release on the source chain.
+    ///
+    /// The release unit is the second half of that (bridge-06/audit O-5): the
+    /// attestation wire carries amounts at eight decimals, so a coin declaring
+    /// fewer releases in units of `10^(8-decimals)` and anything else would
+    /// either strand a remainder in custody or, below one unit, release
+    /// nothing — [`crate::ledger::tokens::TokenError::NotReleasable`], for the
+    /// amount and for the relayer fee alike, since the far side carves the fee
+    /// out of the amount in native units too.
     ///
     /// The pool-side bound is elsewhere: what a burner may destroy is what the
     /// asset bundle's proof says they hold (`burn == amount` in that bundle,

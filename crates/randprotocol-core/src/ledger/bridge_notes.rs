@@ -139,11 +139,15 @@ pub(super) fn validate(
             // apply writes the asset bundle's notes before it touches the registry.
             // `check_burn` ends in `TokenRegistry::check_release`, which is exactly what the
             // apply step's `release` would refuse — the named pair being a backing of this token
-            // at all, and that backing holding at least `amount`. A burn of more of one coin
-            // than its own source contract is holding would ask that contract to release value it
+            // at all, `amount` and `relayer_fee` each being a whole number of that coin's release
+            // unit, and that backing holding at least `amount`. A burn of more of one coin than
+            // its own source contract is holding would ask that contract to release value it
             // never took in, so it is refused rather than clamped, even when the token's whole
-            // supply (every other coin's `locked` included) would cover it. Still a comparison,
-            // and still before the asset bundle's proof.
+            // supply (every other coin's `locked` included) would cover it; and a burn that is
+            // not a whole number of units would ask it to release a fraction of a native token,
+            // which it rounds down — stranding the remainder in custody for ever, or releasing
+            // nothing at all below one unit (bridge-06/audit O-5). Still comparisons, and still
+            // before the asset bundle's proof.
             bridge
                 .check_burn(tokens, *asset, *amount, *to_chain, token, to, *relayer_fee)
                 .map_err(TxError::Bridge)?;
