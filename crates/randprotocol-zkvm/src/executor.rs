@@ -69,6 +69,15 @@ const NO_KECCAK: u8 = 0;
 /// this chain deploys calls `SYS_SHA256`, and `warm`/`warm_bundle` precompute no sha256 class.
 const NO_SHA256: u8 = 0;
 
+/// The one tier a bundle proof may declare (zkvm I1). The hidden-asset guest has a single
+/// execution shape up to the dummy skip and the Merkle bit branch, so *every* witness a prover
+/// can build — the ten input shapes and the adversarial cycle-worst one — lands here, measured by
+/// `tests/hidden_bundle.rs`'s `every_shape_lands_at_tier_14_with_identical_table_heights`. It is
+/// a function of cycles and permutations alone (`Tier::for_workload`), so it does not vary with
+/// the FRI profile: `warm_bundle` precomputes this tier's key and `decode_and_check` refuses any
+/// other, which is what keeps a junk header from making a node build one.
+const BUNDLE_TIER: usize = 14;
+
 pub struct ZkExecutor {
     machine: Machine,
 }
@@ -136,13 +145,15 @@ impl ZkExecutor {
     /// range-checked (`Machine::verify` then binds them cryptographically via the program and
     /// input digests). A *bundle* proof is against one pinned guest with one fixed input width,
     /// so both heights are known up front and anything else is a proof for a different shape —
-    /// rejected here rather than paying for a verifier key that could never match. The sha256,
-    /// public and memory heights are *not* pinned even in the exact case: `mem_log_height`
-    /// legitimately varies with how much RAM a given witness touches, a hash table the bundle
-    /// guest never fills is padding the prover pays for, not something a verifier must forbid —
-    /// at the production profile a keccak-bearing proof is ~1.91 MB larger (3 106 757 bytes at
-    /// tier 10, upstream `docs/03-privacy.md`), so `randprotocol-core`'s 2 MiB `MAX_PROOF_BYTES`
-    /// rejects it long before this would.
+    /// rejected here rather than paying for a verifier key that could never match. Since zkvm I1
+    /// the exact case also pins `tier` ([`BUNDLE_TIER`]) and both optional hash-table heights
+    /// (`NO_KECCAK`/`NO_SHA256`), which are the *only* other prover-chosen words in a proof
+    /// header that feed `Machine::verifier_key`; `mem_log_height` stays merely ranged, since it
+    /// is the one header word `verifier_key` does not key on.
+    ///
+    /// Size is no defence here and never was: chain 13 and 14 set `max_proof_bytes` to 8 MiB
+    /// (`deploy/genesis-chain13.json`), and a junk header need not carry a large body at all —
+    /// the key is built from the header before any proof body is looked at.
     ///
     /// The public height *is* pinned in the exact case since Task 5b: a bundle proof carries the
     /// transaction binding — always [`TX_BINDING_WORDS`] words — so its public table has exactly
@@ -178,6 +189,31 @@ impl ZkExecutor {
         }
         if exact && proof.public_log_height != public_log_height {
             return Err(ConfidentialError::InvalidProof("public height not the transaction binding's".into()));
+        }
+        // And the last three prover-chosen words of a bundle proof's header (zkvm I1). `tier`,
+        // `keccak_log_height` and `sha256_log_height` were merely *ranged* by
+        // `check_declared_heights`, so any of a few hundred legal triples reached
+        // `Machine::verify` — which builds the verifier key for the declared shape *before*
+        // verifying anything. That preprocessing pass is multi-second at the high tiers and the
+        // key cache is a 64-entry FIFO, so 65 junk headers (free: no funds, no valid proof, no
+        // deployed program — only a digest that matches the plaintext, which `check_bundle_proof`
+        // compares cheaply) evict the honest bundle key `warm_bundle` built, and a Byzantine
+        // proposer can make every validator rebuild it synchronously inside `on_proposal`.
+        //
+        // The hidden guest closes it because it has exactly one honest shape: every witness a
+        // prover can construct lands at tier 14 — measured over all ten input shapes plus the
+        // cycle-worst adversarial one in `tests/hidden_bundle.rs`
+        // (`every_shape_lands_at_tier_14_with_identical_table_heights`; the lightest shape needs
+        // 1 330 permutations, past tier 12's cap, and the worst fits tier 14 with 2 141 cycles
+        // and 238 permutations to spare) — and it issues neither hash syscall, so both optional
+        // tables are absent. `Tier::for_workload` reads cycles and permutations only, so this
+        // holds at every FRI profile: the test profile's proofs are the same tier 14.
+        if exact
+            && (proof.tier != Tier(BUNDLE_TIER)
+                || proof.keccak_log_height != NO_KECCAK
+                || proof.sha256_log_height != NO_SHA256)
+        {
+            return Err(ConfidentialError::InvalidProof("tier or hash-table height not the pinned guest's".into()));
         }
         // Reproduces `Machine::verify`'s own equality check, which is simultaneously the check
         // that the batch's *instance count* matches what `chips` would build — nine mandatory
@@ -531,7 +567,7 @@ impl ConfidentialExecutor for ZkExecutor {
     /// to it.
     fn warm_bundle(&self) {
         let (plh, ilh, pubh) = Self::bundle_heights();
-        let _ = self.machine.verifier_key(Tier(14), plh, ilh, NO_KECCAK, NO_SHA256, pubh);
+        let _ = self.machine.verifier_key(Tier(BUNDLE_TIER), plh, ilh, NO_KECCAK, NO_SHA256, pubh);
     }
 
     /// The bare zkVM executor cannot build or verify aggregate proofs: the rVM lives in

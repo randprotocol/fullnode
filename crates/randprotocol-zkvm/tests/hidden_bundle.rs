@@ -663,6 +663,51 @@ fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding
     let mut trailing = proof.clone();
     trailing.push(0);
     assert_eq!(ex.verify_hidden_bundle(&hc, &trailing, &BINDING_A), Err(ConfidentialError::MalformedProof));
+
+    // zkvm I1: the last three prover-chosen header words. `tier`, `keccak_log_height` and
+    // `sha256_log_height` used to be merely *ranged*, and `Machine::verify` builds the verifier
+    // key for the declared shape — a multi-second preprocessing pass — *before* it verifies
+    // anything. So a junk header (no funds, no valid proof, no deployed program: only a digest
+    // matching the plaintext, which `check_bundle_proof` compares cheaply) bought an admission
+    // worker one key build each, and 65 distinct triples evicted the honest bundle key from the
+    // 64-entry FIFO; in a block, every validator paid for it on the consensus loop.
+    //
+    // This is that witness, built exactly as an attacker would — every rewritten field is a
+    // public function of the header, `degree_bits` included, so nothing here needs the proving
+    // key. It is refused on the header alone, before `log_ext_degrees_pub` and before any key
+    // is built.
+    let machine = Machine::new(FriProfile::Production);
+    let pinned = ConfidentialError::InvalidProof("tier or hash-table height not the pinned guest's".into());
+    // Each triple is one `check_declared_heights` admits (keccak's floor is 5, sha256's 6, both
+    // capped by `tier + 5`), so every one of them reached `verifier_key` before this pin.
+    for (tier, klh, shh) in [(20u8, 20u8, 20u8), (14, 5, 0), (14, 0, 6), (12, 0, 0), (16, 0, 0), (10, 5, 6)] {
+        let mut junk = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();
+        junk.tier = Tier(tier as usize);
+        junk.keccak_log_height = klh;
+        junk.sha256_log_height = shh;
+        junk.public_values[randprotocol_core::types::pv::TIER] = tier as u64;
+        // `check_declared_heights` floors the memory height at `tier + 2`, so an attacker
+        // raising the tier raises this too — it is prover-chosen as well.
+        junk.mem_log_height = junk.mem_log_height.max(tier + 2);
+        junk.batch.degree_bits = machine.log_ext_degrees_pub(
+            junk.tier,
+            junk.program_log_height,
+            junk.input_log_height,
+            junk.keccak_log_height,
+            junk.sha256_log_height,
+            junk.public_log_height,
+            junk.mem_log_height,
+        );
+        let bytes = junk.to_bytes();
+        assert_eq!(ex.verify_hidden_bundle(&hc, &bytes, &BINDING_A), Err(pinned.clone()), "tier {tier} klh {klh} shh {shh}");
+        assert_eq!(ex.hidden_bundle_proof_digest(&bytes), Err(pinned.clone()), "and the digest path");
+        assert_eq!(ex.bundle_proof_digest(&bytes), Err(pinned.clone()), "and the trait the ledger calls");
+    }
+    // The honest header — tier 14, neither hash table — is what the pin accepts, which the
+    // successful verify above already showed; re-encoding it unchanged must still pass, so the
+    // pin is not an artefact of the re-encode.
+    assert_eq!(ex.verify_hidden_bundle(&hc, &decoded.to_bytes(), &BINDING_A), Ok(()));
+    assert_eq!((decoded.tier, decoded.keccak_log_height, decoded.sha256_log_height), (Tier(14), 0, 0));
 }
 
 /// Proved the pre-binding way — against the empty public segment — the proof is refused whatever

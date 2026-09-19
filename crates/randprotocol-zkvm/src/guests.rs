@@ -899,8 +899,10 @@ fn emit_read_inputs(a: &mut Assembler, label: &str, base: u32, idx: u32, ptr: u3
 /// Private inputs: `hidden::hidden_input` (1 204 words, built by `hidden::hidden_bundle_inputs`).
 /// Publishes `hidden::hidden_bundle_digest(anchor, nf0..3, cm0..3, fee, burn_a, burn_r,
 /// burn_asset, time)` at `notes::output::DIGEST` — 82 words under `HIDDEN_BUNDLE_DOMAIN` (64),
-/// with `bad` as the last word. **`A` is not in it.** Lives beside `bundle()`; nothing on the
-/// chain path proves or verifies it yet (spec §7: H3–H5).
+/// with `bad` as the last word. **`A` is not in it.** Since b053a76 this *is* the chain's bundle
+/// guest — `ZkExecutor::bundle_program`, what a chain-14 genesis pins as `hc_bundle` — and the
+/// retired 2-in-2-out `bundle()` beside it is reachable only as `legacy_bundle_program`, from
+/// tests.
 ///
 /// It is `bundle()`'s relation generalised, built from the same `asm` routines and the same two
 /// mechanisms (see `bundle()`'s doc comment for their full argument):
