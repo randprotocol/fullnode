@@ -34,6 +34,7 @@ validators in the register (see `deploy/README.md`). Not audited; not for real v
 - [Confidential computation](#confidential-computation)
 - [Operating a node](#operating-a-node)
 - [How it works](#how-it-works)
+- [v0.5: RPL, zUSD and bridge hardening](#v05-rpl-zusd-and-bridge-hardening)
 - [Documentation](#documentation)
 - [Roadmap](#roadmap)
 
@@ -275,6 +276,35 @@ commits; `docs/deploy.md` describes the rollout and the fault tests that have be
 
 Full detail in `docs/architecture.md`.
 
+## v0.5: RPL, zUSD and bridge hardening
+
+v0.5 adds **RPL**, RandProtocol's own token standard, and hardens the bridge for its first real
+asset, **zUSD** (backed by USDT and USDC bridged from Ethereum, BSC, Tron and Solana). Built and
+reviewed on `feat/bridge-hardening`; not yet merged to `main` or cut as a chain (see `AGENTS.md`
+for the current state). Highlights, all hard forks together as chain 14:
+
+- **A token is a registry entry, not a contract** — a shielded native asset with an id, an index,
+  and a checksummed `rpl1…` text form; creation is permissionless, under a mint authority fixed at
+  registration (none, a key, or the bridge); symbols are not unique, as with ERC-20 and SPL
+  (`docs/tokens.md`).
+- **Every transfer, of RAND or any RPL token, is one hidden-asset bundle** — a fixed 4-in/4-out
+  proof that hides not only the amount and the parties but *which asset moved at all*
+  (`docs/confidential.md`, "The hidden-asset bundle guest"). A token transfer publishes exactly
+  what a RAND payment does.
+- **A transaction is bound to its whole self.** Every bundle proof is now made over, and verified
+  against, a hash of the entire transaction — closing a redirect attack that let a copied,
+  unmodified proof be resubmitted under a changed destination, validator or memo
+  (`docs/confidential.md`, "Transaction binding"; `docs/bridge.md` §1).
+- **One bridged token can have many backings.** zUSD is one token backed by seven source coins
+  across four chains, with `total_supply == Σ backings.locked` held by construction and a burn
+  refused unless the named backing has enough locked and the amount is a whole release unit
+  (`docs/bridge.md` §13).
+- **Bridge hardening**: a per-backing daily mint cap and an operator pause key (B1); a forward
+  bound on block timestamps, which makes NTP a requirement for a bridged chain's validators (B2); a
+  second, post-quantum (Dilithium2) co-signature quorum on every mint (B3); and listing a new
+  bridged token or backing after genesis under a PQ guardian quorum, with no chain cut and no wire
+  change (B4) — `docs/bridge.md` §§14–20.
+
 ## Documentation
 
 | document | contents |
@@ -285,12 +315,13 @@ Full detail in `docs/architecture.md`.
 | [docs/staking.md](docs/staking.md) | the validator register, epochs, and the four staking commands: register, bond, unbond, withdraw |
 | [docs/supply.md](docs/supply.md) | the supply audit: the counters, the invariant a node checks, and how exact it is |
 | [docs/confidential.md](docs/confidential.md) | programs, calls, outputs, gas, privacy |
+| [docs/tokens.md](docs/tokens.md) | RPL, the token standard (v0.5): a token as a registry entry, asset ids and `rpl1…`, mint authorities, creation, hidden-asset transfers, burning, the CLI and RPC, ERC-20/SPL comparison |
 | [docs/guests.md](docs/guests.md) | writing and deploying a RISC-V program: the Rand ISA, the syscall ABI, the image container, `rand-guest` build/check/run/pack, `hc` versus program id, the program-size cap |
 | [docs/translators.md](docs/translators.md) | the Solana (`sbpf2rv`) and Ethereum (`evm2rv`) translators: trust model, parity, the ERC-20 and SPL Token walkthroughs, measured cycles, limits |
 | [docs/architecture.md](docs/architecture.md) | how the node works end to end: consensus, ledger, storage, networking, sync, and one confidential transaction followed from wallet to receipt |
 | [docs/zkvm-milestones.md](docs/zkvm-milestones.md) | the Rand zkVM milestone by milestone (M1–M4, CUDA backend): what was built and why |
 | [docs/zkvm-m4-m5-progress.md](docs/zkvm-m4-m5-progress.md) | M4 and M5 as delivered: constraint sets 4–6, the recursion VM (M5.1–M5.4) with all measured numbers, what is deferred to which hardware |
-| [docs/bridge.md](docs/bridge.md) | the guardian bridge: trust model, wire format, guardian sets, state, the two bridge actions, and what stays public |
+| [docs/bridge.md](docs/bridge.md) | the guardian bridge: trust model, wire format, guardian sets, state, the two bridge actions, what stays public, and (v0.5) one token with many backings, the mint cap and pause, bounded timestamps, the post-quantum co-signature, and listing a token after genesis |
 | [docs/deploy.md](docs/deploy.md) | multi-machine and cloud deployment, rebuilds, fault tests |
 | [docs/node-hardware.md](docs/node-hardware.md) | what validators, wallets and aggregators compute; measured RAM, disk and prover memory per tier; DigitalOcean sizes; setup |
 | [deploy/README.md](deploy/README.md) | the live testnet: nodes, addresses, peer ids |
