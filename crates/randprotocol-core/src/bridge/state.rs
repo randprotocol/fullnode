@@ -710,7 +710,7 @@ fn from_hex<const N: usize, E: serde::de::Error>(s: &str) -> Result<[u8; N], E> 
         .map_err(|v: Vec<u8>| E::custom(format!("expected {N} bytes, got {}", v.len())))
 }
 
-mod hex_bytes32 {
+pub(crate) mod hex_bytes32 {
     use super::*;
 
     pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {

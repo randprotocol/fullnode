@@ -80,6 +80,7 @@ fn genesis_with(validator: &Keypair, max_program_words: Option<u32>, max_program
         // Must be this build's own guest, or `node::start` refuses to run at all.
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
         bridge: None,
+        tokens: None,
         aggregation: None,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words,

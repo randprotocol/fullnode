@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use libp2p::Multiaddr;
 use randprotocol_client::wallet;
 use randprotocol_client::RpcClient;
-use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
+use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator, TokensConfig};
 use randprotocol_core::notes::{word8_to_hex, Envelope, ShieldedAddress};
 use randprotocol_core::types::actions::{
     aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message, aggregator_withdraw_message,
@@ -282,6 +282,12 @@ enum Cmd {
         /// validation refuses a zero digest.
         #[arg(long = "admitted-shape", value_name = "PROFILE,TIER,HEIGHTS…,HC,DIGEST")]
         admitted_shapes: Vec<String>,
+        /// The RPL `tokens` section, as a `TokensConfig` JSON file (`{"registration_fee": …,
+        /// "tokens": [...]}`). Omitted entirely when absent, so a chain without one hashes
+        /// byte-for-byte as before. A `bridge` section needs one; a listed token needs a
+        /// `bridge` section (`Genesis::build` validates both).
+        #[arg(long, value_name = "TOKENS.JSON")]
+        tokens: Option<PathBuf>,
     },
     /// Initialise a data directory from a genesis file.
     Init {
@@ -495,6 +501,7 @@ async fn main() -> Result<()> {
             fri_profile,
             aggregation,
             admitted_shapes,
+            tokens,
         } => {
             let mut gen = Genesis {
                 chain_id,
@@ -513,6 +520,19 @@ async fn main() -> Result<()> {
                 // more than a flag's worth of surface and belongs with whoever holds the
                 // guardian keys, not with this command.
                 bridge: None,
+                // The RPL `tokens` section: read from a `TokensConfig` JSON file when `--tokens`
+                // is given, so `Genesis::build` can validate it (the gate: a `bridge` section
+                // needs one, a listed token needs a `bridge` section); omitted entirely
+                // otherwise, so a chain without the flag hashes byte-for-byte as before.
+                tokens: match &tokens {
+                    Some(path) => Some(
+                        serde_json::from_str::<TokensConfig>(
+                            &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+                        )
+                        .with_context(|| format!("{} is not a valid tokens config", path.display()))?,
+                    ),
+                    None => None,
+                },
                 // An aggregating chain is cut with the section spelled out on the command
                 // line (chain 9, spec §2.3): the bond, the subsidy schedule and the registered
                 // shapes with their measured program digests.
@@ -991,6 +1011,20 @@ mod tests {
         }
     }
 
+    /// Chain 13, the running chain, byte for byte, after the RPL `tokens` gate (Task 2 of the
+    /// RPL token standard): it has no `bridge` and no `tokens` section, so the gate must not
+    /// move its hash by so much as one bit.
+    #[test]
+    fn chain_13s_genesis_file_still_builds_chain_13() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain13.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(gen.bridge.is_none() && gen.tokens.is_none());
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), "8123ccac1883a45750e4df6964fb7cd3f0b321798cde4c0ef406a0293939ece3");
+        assert!(state.ledger.tokens().is_none());
+    }
+
     /// `rand-node genesis --max-program-words N` writes the field; without the flag the file has
     /// no such field at all.
     #[test]
@@ -1089,6 +1123,7 @@ mod tests {
             fri_profile: "test".into(),
             hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
             bridge: None,
+            tokens: None,
             aggregation: None,
             epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,

@@ -284,6 +284,11 @@ pub struct Ledger {
     /// (spec §10). `None` makes the two bridge actions inadmissible and leaves the state root
     /// with the four components a bridge-less chain has always had.
     bridge: Option<BridgeState>,
+    /// The RPL token registry, present exactly when genesis has a `tokens` section. `None` makes
+    /// the state root byte-for-byte what a chain without one has always committed; `Some` is
+    /// consensus state, folded into the state root right after the bridge root (spec's RPL token
+    /// standard).
+    tokens: Option<tokens::TokenRegistry>,
     /// The aggregation section of genesis (spec §2), set from the genesis file exactly like
     /// `epoch_blocks` — a genesis parameter, not consensus state. `None` makes the five
     /// aggregation actions inadmissible and keeps the state root byte-for-byte today's.
@@ -351,6 +356,7 @@ impl PartialEq for Ledger {
             && self.validators == o.validators
             && self.programs == o.programs
             && self.bridge == o.bridge
+            && self.tokens == o.tokens
             && self.aggregators == o.aggregators
     }
 }
@@ -382,6 +388,7 @@ impl Ledger {
             programs: BTreeMap::new(),
             epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             bridge: None,
+            tokens: None,
             aggregation: None,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
@@ -400,7 +407,7 @@ impl Ledger {
 
     /// Rebuild a ledger from stored state. The faucet and confidential switches come from
     /// genesis, not from storage, so the caller sets them afterwards — and so does the bridge,
-    /// via [`Ledger::set_bridge`].
+    /// via [`Ledger::set_bridge`], and the token registry, via [`Ledger::set_tokens`].
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         chain_id: u64,
@@ -425,6 +432,7 @@ impl Ledger {
             programs,
             epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             bridge: None,
+            tokens: None,
             aggregation: None,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
@@ -598,6 +606,25 @@ impl Ledger {
 
     pub fn bridge_mut(&mut self) -> Option<&mut BridgeState> {
         self.bridge.as_mut()
+    }
+
+    /// Install (or clear) the RPL token registry. Genesis calls this once from its `tokens`
+    /// section; a reloading node calls it with what storage held.
+    pub fn set_tokens(&mut self, t: Option<tokens::TokenRegistry>) {
+        self.tokens = t;
+    }
+
+    /// The token registry, or `None` on a chain without a `tokens` section — where the state
+    /// root has no tokens component.
+    pub fn tokens(&self) -> Option<&tokens::TokenRegistry> {
+        self.tokens.as_ref()
+    }
+
+    /// For the token actions a later task wires up (`Action::RegisterToken` and friends): unused
+    /// until then, so `#[allow(dead_code)]` rather than a warning on every build.
+    #[allow(dead_code)]
+    pub(crate) fn tokens_mut(&mut self) -> Option<&mut tokens::TokenRegistry> {
+        self.tokens.as_mut()
     }
 
     /// Install (or clear) the aggregation section. Genesis calls this once from its
@@ -1426,17 +1453,31 @@ impl Ledger {
     }
 
     /// The component roots of [`Ledger::state_root`], for logging a mismatch: tree, nullifiers,
-    /// validators, programs, aggregators. A divergence between two ledgers names itself here.
+    /// validators, programs, tokens, aggregators. A divergence between two ledgers names itself
+    /// here.
     pub fn debug_state_root_components(&self) -> String {
         let (nf, val, prog) = self.state_root_leaves();
+        let tok = match &self.tokens {
+            Some(t) => format!("{:?}", t.root()),
+            None => "none".into(),
+        };
         let agg = if self.aggregation.is_some() {
             format!("{:?}", aggregation::aggregators_root(&self.aggregators))
         } else {
             "none".into()
         };
-        format!("tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} aggregators {agg}", self.tree.root())
+        format!(
+            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} tokens {tok} aggregators {agg}",
+            self.tree.root()
+        )
     }
 
+    /// `blake3("rand-state-2" || tree || nullifiers || validators || programs)`, with
+    /// `|| bridge_root` appended on a bridged chain and, on a chain whose genesis has a `tokens`
+    /// section, `|| tokens_root` appended right after the bridge root and the whole thing
+    /// re-domained `rand-state-4` — whether or not aggregation is also on, since a tokens-off
+    /// chain must still fall through to today's `rand-state-2`/`rand-state-3` paths unchanged.
+    /// The aggregators root, when present, is still the last component appended.
     pub fn state_root(&self) -> Hash {
         let (nf_root, val_root, prog_root) = self.state_root_leaves();
         let mut buf = Vec::with_capacity(128);
@@ -1446,6 +1487,13 @@ impl Ledger {
         buf.extend_from_slice(prog_root.as_bytes());
         if let Some(bridge) = &self.bridge {
             buf.extend_from_slice(bridge.root().as_bytes());
+        }
+        if let Some(tokens) = &self.tokens {
+            buf.extend_from_slice(tokens.root().as_bytes());
+            if self.aggregation.is_some() {
+                buf.extend_from_slice(aggregation::aggregators_root(&self.aggregators).as_bytes());
+            }
+            return Hash::digest_domain(b"rand-state-4", &buf);
         }
         if self.aggregation.is_some() {
             buf.extend_from_slice(aggregation::aggregators_root(&self.aggregators).as_bytes());

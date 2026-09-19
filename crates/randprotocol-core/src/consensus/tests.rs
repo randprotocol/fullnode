@@ -71,6 +71,7 @@ fn build(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool) -> Sim {
         max_call_envelope_bytes: None,
         max_program_public_words: None,
         bridge: None,
+        tokens: None,
         aggregation: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
@@ -907,6 +908,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         max_call_envelope_bytes: None,
         max_program_public_words: None,
         bridge: None,
+        tokens: None,
         aggregation: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
@@ -1359,6 +1361,7 @@ fn aggregation_node_with(
         max_call_envelope_bytes: None,
         max_program_public_words: None,
         bridge: None,
+        tokens: None,
         aggregation: Some(cfg.clone()),
     };
     let mut gs = genesis.build(&StubExecutor).unwrap();

@@ -175,6 +175,13 @@ const META_AGGREGATION: &str = "aggregation";
 /// Its presence is what makes a chain "bridged" on disk; the two collections it leaves out live
 /// in [`CF_BRIDGE_SPENT`] and [`CF_BRIDGE_BURNS`].
 const META_BRIDGE_STATE: &str = "bridge_state";
+/// `bincode(Option<TokenRegistry>)`: the RPL token registry as of the head, whole — `by_index`,
+/// `index_of`, `next_index` and `registration_fee` all together, the same shape `Ledger::tokens`
+/// holds and `TokenRegistry::root` hashes into the state root. `META_AGGREGATORS`'s twin, not
+/// `META_AGGREGATION`'s: unlike the aggregation *config*, a genesis `tokens` section has no
+/// separate immutable half — the whole registry is state, and `load_ledger` restores it from
+/// here so a restarted node does not fork at its own first block.
+const META_TOKENS: &str = "tokens";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -440,6 +447,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
+        batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&gs.ledger.tokens().cloned())?);
         batch.put_cf(self.cf(CF_ANCHORS), height_key(0), word8_to_bytes(&gs.ledger.root()));
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(gs.ledger.tree())?);
         batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
@@ -720,6 +728,13 @@ impl Storage {
     /// (`rand_getEmission`) reads it here rather than rebuilding the ledger through `load_ledger`.
     pub fn aggregation_config(&self) -> Result<Option<randprotocol_core::ledger::aggregation::AggregationConfig>> {
         Ok(self.get_meta_raw(META_AGGREGATION)?.map(|b| bincode::deserialize(&b)).transpose()?.flatten())
+    }
+
+    /// The RPL token registry as of the head, `None` on a chain without a `tokens` section — and
+    /// equally for a database written before the key existed, which is what `Ledger::from_parts`
+    /// would have left it.
+    pub fn tokens(&self) -> Result<Option<randprotocol_core::ledger::tokens::TokenRegistry>> {
+        Ok(self.get_meta_raw(META_TOKENS)?.map(|b| bincode::deserialize(&b)).transpose()?.flatten())
     }
 
     /// Every leaf in tree order. The witness source, and the check `load_ledger` runs the
@@ -1236,6 +1251,7 @@ impl Storage {
         ledger.set_aggregators(self.aggregators()?);
         ledger.set_aggregation(self.aggregation_config()?);
         ledger.set_bridge(self.load_bridge()?);
+        ledger.set_tokens(self.tokens()?);
         Ok(ledger)
     }
 
@@ -1516,6 +1532,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger_after.supply())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
+        batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger_after.tokens().cloned())?);
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
         self.db.write_opt(batch, &sync_opts())?;
         // The sealing marks' per-block half (spec §6.1): the bundle marks went in with the
@@ -1913,6 +1930,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger.supply())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
+        batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger.tokens().cloned())?);
         if height == 0 {
             let hk = height_key(0);
             batch.put_cf(self.cf(CF_BLOCKS), hk, gs.block.encode());
@@ -1956,7 +1974,7 @@ pub(crate) mod fixtures {
     use super::*;
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::bridge::{guardian_address, BridgeConfig};
-    use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
+    use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator, TokensConfig};
     use randprotocol_core::notes::{word8_to_hex, Bundle, ShieldedAddress};
     use randprotocol_core::{gas, BlockHeader, Keypair, Transaction};
 
@@ -2030,6 +2048,7 @@ pub(crate) mod fixtures {
             fri_profile: "test".into(),
             hc_bundle: word8_to_hex(&HC),
             bridge: None,
+            tokens: None,
             aggregation: None,
             epoch_blocks,
             max_program_words: None,
@@ -2078,6 +2097,10 @@ pub(crate) mod fixtures {
             fri_profile: "test".into(),
             hc_bundle: word8_to_hex(&HC),
             bridge: Some(config),
+            // A bridge section now needs a tokens section (the RPL gate rides the same fork);
+            // no tokens are listed, so the registry it builds is empty and this fixture's state
+            // root moves only from `rand-state-3` to `rand-state-4`, not from anything it tests.
+            tokens: Some(TokensConfig { registration_fee: 1_000_000_000, tokens: vec![] }),
             aggregation: None,
             epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,

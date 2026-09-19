@@ -1047,6 +1047,7 @@ mod tests {
             fri_profile: "production".into(),
             hc_bundle: crate::notes::word8_to_hex(&[3; 8]),
             bridge: None,
+            tokens: None,
             aggregation: None,
             epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,

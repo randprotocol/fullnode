@@ -76,6 +76,7 @@ fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core
         fri_profile: "test".into(),
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
         bridge: None,
+        tokens: None,
         aggregation,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words: None,

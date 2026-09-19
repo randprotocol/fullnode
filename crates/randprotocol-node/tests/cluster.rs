@@ -24,7 +24,7 @@ use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::bridge::{
     digest, guardian_address, sign_digest, Attestation, Body, BridgeConfig, Payload, Transfer, CHAIN_RAND,
 };
-use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator};
+use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator, TokensConfig};
 use randprotocol_core::ledger::staking::{MIN_STAKE, UNBONDING_EPOCHS};
 use randprotocol_core::notes::{word8_to_hex, Bundle, Envelope, ShieldedAddress};
 use randprotocol_core::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
@@ -193,6 +193,10 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         confidential: true,
         fri_profile: "test".into(),
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
+        // A bridge section now needs a tokens section (the RPL gate rides the same fork); a
+        // bridge-less chain (`bridge: None`) still needs none, so a plain `genesis_funding` chain
+        // stays exactly what it always was.
+        tokens: bridge.is_some().then(|| TokensConfig { registration_fee: 1_000_000_000, tokens: vec![] }),
         bridge,
         aggregation: None,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,

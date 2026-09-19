@@ -1,15 +1,17 @@
 //! Genesis configuration and derivation of the genesis block + ledger.
 
+use crate::bridge::state::hex_bytes32;
 use crate::bridge::{BridgeCommit, BridgeConfig, BridgeState, GuardianKey, CHAIN_RAND, GOVERNANCE_EMITTER};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, PublicKey, Signature};
 use crate::gas;
 use crate::ledger::staking::MIN_STAKE;
+use crate::ledger::tokens::{check_metadata, MintAuthority, TokenRegistry, BRIDGE_DECIMALS};
 use crate::ledger::{Ledger, ValidatorEntry};
 use crate::notes::{word8_from_hex, word8_to_bytes, Envelope, ShieldedAddress, Word8};
 use crate::types::{Block, BlockHeader, QuorumCertificate, ValidatorSet};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenesisValidator {
@@ -65,6 +67,35 @@ pub struct GenesisNote {
     pub amount: u64,
 }
 
+/// One token a `tokens` section lists at genesis: always a `Bridge`-authority token (a native
+/// token at genesis has no note to mint into, so a creator registers one after launch — a later
+/// task's `Action::RegisterToken`). Decimals are always [`BRIDGE_DECIMALS`]; that is not
+/// [`crate::ledger::tokens::TokenRegistry::register`]'s rule to enforce (it does not tie a
+/// `Bridge` authority to eight decimals), so this listing code passes the constant itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenesisToken {
+    pub name: String,
+    pub symbol: String,
+    pub chain: u16,
+    #[serde(with = "hex_bytes32")]
+    pub token: [u8; 32],
+}
+
+/// The `tokens` genesis section (spec's RPL token standard): the registration fee every later
+/// `Action::RegisterToken` must pay at least, and the tokens genesis itself lists — bridged
+/// tokens only, registered before any transaction runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokensConfig {
+    pub registration_fee: u64,
+    #[serde(default)]
+    pub tokens: Vec<GenesisToken>,
+}
+
+/// Smallest `registration_fee` a `tokens` section may set, in RAND's base unit.
+pub const MIN_REGISTRATION_FEE: u64 = 1_000_000_000;
+/// Largest `registration_fee` a `tokens` section may set.
+pub const MAX_REGISTRATION_FEE: u64 = 10_000_000_000_000;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Genesis {
     pub chain_id: u64,
@@ -91,6 +122,14 @@ pub struct Genesis {
     /// are byte-for-byte what phase S1 produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge: Option<BridgeConfig>,
+    /// RPL tokens (spec's RPL token standard): the registration fee and any bridged tokens
+    /// listed at genesis. Part of the genesis hash and of the state root when present, right
+    /// after the bridge root; omitted entirely when absent, so a chain without one hashes and
+    /// commits byte-for-byte what it always did. A `bridge` section without this is
+    /// [`GenesisError::BridgeNeedsTokens`]; a listed token without a `bridge` section is
+    /// [`GenesisError::BadTokens`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokensConfig>,
     /// Block aggregation (spec §2): the aggregator bond, cover cap, subsidy schedule, sealing
     /// window and admitted inner shapes. Part of the genesis hash and of the state root when
     /// present; omitted entirely when absent, so an aggregation-less chain's genesis file, hash
@@ -181,6 +220,10 @@ pub enum GenesisError {
     BadBridgeConfig(String),
     #[error("bad aggregation config: {0}")]
     BadAggregationConfig(String),
+    #[error("a bridge section needs a tokens section (RPL tokens key on the same gate)")]
+    BridgeNeedsTokens,
+    #[error("bad tokens config: {0}")]
+    BadTokens(String),
     #[error("bad hc_bundle {0} (64 hex characters)")]
     BadHcBundle(String),
     #[error("bad alloc note {0}")]
@@ -244,7 +287,14 @@ impl Genesis {
         serde_json::to_string_pretty(self).expect("genesis serializes")
     }
 
-    pub fn build(&self, executor: &dyn ConfidentialExecutor) -> Result<GenesisState, GenesisError> {
+    /// Structural checks that need no [`ConfidentialExecutor`]: no validators, an unknown FRI
+    /// profile, an unrunnable `bridge`/`aggregation` section, an unusable `epoch_blocks`, the
+    /// program-words and call-limits caps out of bounds, and the RPL `tokens` gate (a `bridge`
+    /// section needs one; a listed token needs a `bridge` section, no duplicate `(chain, token)`
+    /// listing, and metadata that passes [`crate::ledger::tokens::check_metadata`]). [`Self::build`]
+    /// calls this first; a caller that only wants to know whether a genesis file is well-formed,
+    /// without paying for a ledger, can call it directly.
+    pub fn validate(&self) -> Result<(), GenesisError> {
         if self.validators.is_empty() {
             return Err(GenesisError::NoValidators);
         }
@@ -302,6 +352,19 @@ impl Genesis {
                 return Err(GenesisError::BadMaxProgramPublicWords(n));
             }
         }
+        // RPL tokens: the gate. A bridge without tokens cannot register a bridged token; tokens
+        // listed without a bridge have no chain to attest them.
+        if self.bridge.is_some() && self.tokens.is_none() {
+            return Err(GenesisError::BridgeNeedsTokens);
+        }
+        if let Some(tokens) = &self.tokens {
+            check_tokens(tokens, self.bridge.is_some())?;
+        }
+        Ok(())
+    }
+
+    pub fn build(&self, executor: &dyn ConfidentialExecutor) -> Result<GenesisState, GenesisError> {
+        self.validate()?;
         // The register (spec §8) is what genesis actually seeds; the validator set for epoch 0
         // is derived from it at the `ValidatorSet` boundary, where the stake widens again.
         let mut register: BTreeMap<Address, ValidatorEntry> = BTreeMap::new();
@@ -345,6 +408,27 @@ impl Genesis {
         ledger.set_faucet(self.faucet);
         ledger.set_confidential(self.confidential);
         ledger.set_bridge(self.bridge.as_ref().map(BridgeState::from_config));
+        // RPL tokens: `Bridge`-authority tokens only at genesis (a native token has no note to
+        // mint into yet — a creator registers one after launch, a later task's action). Listed
+        // in file order, so dense indices from `FIRST_TOKEN_INDEX` land exactly where the file
+        // lists them (checked by `check_tokens`, called from `validate`, above).
+        if let Some(tconf) = &self.tokens {
+            let mut registry = TokenRegistry::new(tconf.registration_fee);
+            for t in &tconf.tokens {
+                let id = crate::bridge::asset_id(t.chain, &t.token);
+                registry
+                    .register(
+                        id,
+                        t.name.clone(),
+                        t.symbol.clone(),
+                        BRIDGE_DECIMALS,
+                        MintAuthority::Bridge { chain: t.chain, token: t.token },
+                        0,
+                    )
+                    .map_err(|e| GenesisError::BadTokens(e.to_string()))?;
+            }
+            ledger.set_tokens(Some(registry));
+        }
         ledger.set_aggregation(self.aggregation.clone());
         ledger.set_max_program_words(self.max_program_words.map_or(gas::MAX_PROGRAM_WORDS, |n| n as usize));
         ledger.set_max_proof_bytes(self.max_proof_bytes.map_or(gas::MAX_PROOF_BYTES, |n| n as usize));
@@ -408,6 +492,11 @@ impl Genesis {
         // *strings*.
         if let Some(bridge) = &self.bridge {
             commit.extend_from_slice(&bincode::serialize(&BridgeCommit::from(bridge)).expect("serializes"));
+        }
+        // RPL tokens, after the bridge bytes: appended only when the section is configured, so a
+        // chain without one hashes byte-for-byte as before.
+        if let Some(tokens) = &self.tokens {
+            commit.extend_from_slice(&bincode::serialize(tokens).expect("serializes"));
         }
         // Block aggregation, likewise: appended only when the section is configured, so an
         // aggregation-less chain's genesis hash is byte-for-byte today's.
@@ -537,6 +626,31 @@ fn check_aggregation(cfg: &crate::ledger::aggregation::AggregationConfig) -> Res
     Ok(())
 }
 
+/// Rejects a `tokens` section a chain could not run: a `registration_fee` out of bounds, a
+/// listed token when there is no `bridge` section to attest it, a duplicate `(chain, token)`
+/// listing, or metadata [`check_metadata`] itself would refuse (a genesis token is always
+/// `BRIDGE_DECIMALS`, spec's RPL token standard).
+fn check_tokens(cfg: &TokensConfig, has_bridge: bool) -> Result<(), GenesisError> {
+    let bad = |m: String| Err(GenesisError::BadTokens(m));
+    if !(MIN_REGISTRATION_FEE..=MAX_REGISTRATION_FEE).contains(&cfg.registration_fee) {
+        return bad(format!(
+            "registration_fee {} is out of bounds ({MIN_REGISTRATION_FEE}..={MAX_REGISTRATION_FEE})",
+            cfg.registration_fee
+        ));
+    }
+    if !cfg.tokens.is_empty() && !has_bridge {
+        return bad("listed tokens need a bridge section to attest them".into());
+    }
+    let mut seen: BTreeSet<(u16, [u8; 32])> = BTreeSet::new();
+    for t in &cfg.tokens {
+        if !seen.insert((t.chain, t.token)) {
+            return bad(format!("duplicate token listing for chain {} token {}", t.chain, hex::encode(t.token)));
+        }
+        check_metadata(&t.name, &t.symbol, BRIDGE_DECIMALS).map_err(|e| GenesisError::BadTokens(e.to_string()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +699,7 @@ mod tests {
             fri_profile: "production".into(),
             hc_bundle: word8_to_hex(&[3; 8]),
             bridge: None,
+            tokens: None,
             aggregation: None,
             epoch_blocks: EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
@@ -593,6 +708,12 @@ mod tests {
             max_call_envelope_bytes: None,
             max_program_public_words: None,
         }
+    }
+
+    /// The name the RPL tokens tests use for [`genesis(1)`] — the same one-validator plain
+    /// chain [`a_bridge_section_is_accepted_and_only_a_bridged_chain_changes`] builds from.
+    fn base_genesis() -> Genesis {
+        genesis(1)
     }
 
     fn build(g: &Genesis) -> GenesisState {
@@ -703,6 +824,7 @@ mod tests {
 
         let mut bridged = plain.clone();
         bridged.bridge = Some(bridge_cfg());
+        bridged.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![] });
         let sb = build(&bridged);
         assert!(sb.ledger.bridge().is_some());
         assert_ne!(sb.ledger.state_root(), s.ledger.state_root(), "the bridge root is the fifth component");
@@ -728,6 +850,7 @@ mod tests {
             let mut cfg = bridge_cfg();
             f(&mut cfg);
             g.bridge = Some(cfg);
+            g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![] });
             match g.build(&StubExecutor) {
                 Err(GenesisError::BadBridgeConfig(m)) => m,
                 other => panic!("expected BadBridgeConfig, got {other:?}"),
@@ -769,6 +892,7 @@ mod tests {
         let mut cfg = bridge_cfg();
         cfg.guardians = (0..368).map(key).collect();
         g.bridge = Some(cfg);
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![] });
         match g.build(&StubExecutor) {
             Err(GenesisError::BadBridgeConfig(m)) => {
                 assert!(m.contains("too large"), "{m}");
@@ -782,7 +906,71 @@ mod tests {
         let mut cfg = bridge_cfg();
         cfg.guardians = (0..367).map(key).collect();
         g.bridge = Some(cfg);
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![] });
         assert!(g.build(&StubExecutor).is_ok(), "367 guardians is the largest runnable set");
+    }
+
+    /// The RPL gate is opt-in per chain, like `bridge` and `aggregation`: a genesis without a
+    /// `tokens` section builds a chain whose registry is `None` and whose file never mentions
+    /// one; one with a section — even an empty one — is a different chain, with a different
+    /// state root.
+    #[test]
+    fn a_tokens_section_is_the_only_thing_that_changes_a_chain() {
+        let plain = base_genesis();
+        let s = build(&plain);
+        assert!(s.ledger.tokens().is_none());
+        assert!(!plain.to_json().contains("tokens"));
+        let mut tok = plain.clone();
+        tok.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![] });
+        let st = build(&tok);
+        assert_ne!(st.ledger.state_root(), s.ledger.state_root());
+        assert_ne!(st.hash(), s.hash(), "and so is the genesis hash");
+    }
+
+    /// A `bridge` section needs a `tokens` section (the RPL gate rides the same fork); and a
+    /// listed token is registered `Bridge`-authority, at `BRIDGE_DECIMALS`, in file order.
+    #[test]
+    fn a_bridge_needs_tokens_and_listed_tokens_need_a_bridge_entry() {
+        let mut g = base_genesis();
+        g.bridge = Some(bridge_cfg());
+        assert!(matches!(g.validate(), Err(GenesisError::BridgeNeedsTokens)));
+        g.tokens = Some(TokensConfig {
+            registration_fee: MIN_REGISTRATION_FEE,
+            tokens: vec![
+                GenesisToken { name: "Tether USD".into(), symbol: "zUSDT".into(), chain: 2, token: [0x11; 32] },
+                GenesisToken { name: "USD Coin".into(), symbol: "zUSDC".into(), chain: 2, token: [0x22; 32] },
+            ],
+        });
+        assert!(g.validate().is_ok());
+        let s = build(&g);
+        let t = s.ledger.tokens().unwrap();
+        assert_eq!((t.get(1).unwrap().symbol.as_str(), t.get(2).unwrap().symbol.as_str()), ("zUSDT", "zUSDC"));
+        assert_eq!(t.get(1).unwrap().decimals, 8);
+        assert_eq!(t.get(1).unwrap().authority, MintAuthority::Bridge { chain: 2, token: [0x11; 32] });
+
+        // A listed token with no `bridge` section has no chain to attest it.
+        let mut no_bridge = base_genesis();
+        no_bridge.tokens = g.tokens.clone();
+        assert!(matches!(no_bridge.validate(), Err(GenesisError::BadTokens(_))));
+    }
+
+    /// `registration_fee` has to be a fee a chain can actually run at, and the same `(chain,
+    /// token)` pair cannot be listed twice — it is one `AssetId` either way
+    /// (`crate::bridge::asset_id`), so a second listing can only ever collide.
+    #[test]
+    fn registration_fee_bounds_and_duplicate_listings_are_refused() {
+        let mut g = base_genesis();
+        g.bridge = Some(bridge_cfg());
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE - 1, tokens: vec![] });
+        assert!(matches!(g.validate(), Err(GenesisError::BadTokens(_))));
+        g.tokens = Some(TokensConfig { registration_fee: MAX_REGISTRATION_FEE + 1, tokens: vec![] });
+        assert!(matches!(g.validate(), Err(GenesisError::BadTokens(_))));
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![] });
+        assert!(g.validate().is_ok());
+
+        let dup = GenesisToken { name: "A".into(), symbol: "A".into(), chain: 2, token: [1; 32] };
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![dup.clone(), dup] });
+        assert!(matches!(g.validate(), Err(GenesisError::BadTokens(_))));
     }
 
     /// Phase S2: genesis seeds the register with each validator's payout address and fixes the
