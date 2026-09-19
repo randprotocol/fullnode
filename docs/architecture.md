@@ -609,7 +609,7 @@ through the real executor); full mode additionally re-checks every proposer sign
 | Declared `sha256_log_height` neither 0 nor in `[6, 20]`, or above `tier + 6` | same two layers | `invalid proof: sha256 height out of range` |
 | Declared `public_log_height` outside `[2, 20]` (mandatory — no `0` escape) | same two layers | `invalid proof: public height out of range` |
 | Declared `mem_log_height` out of `[tier + 2, 24]` | same two layers | `invalid proof: memory height out of range` |
-| Call proof's `H_PUB` ≠ the program's recorded public digest (`public_digest(&[])` for a program deployed without a public input) | `verify_call`, after `Machine::verify`; bundles still `verify_public(hc, &[], proof)` | `invalid proof: …` naming `PublicValues` |
+| Call proof's `H_PUB` ≠ the program's recorded public digest (`public_digest(&[])` for a program deployed without a public input) | `verify_call`, after `Machine::verify`; bundles `verify_public(hc, &tx.binding(), proof)` since the transaction binding (`docs/confidential.md`) | `invalid proof: …` naming `PublicValues` |
 | Proof's degree bits don't match the declared heights | `verify_call`'s pre-check | `invalid proof: degree bits` |
 | Stale/wrong program (proof's `hc` doesn't match `record.code_hash`) | `Machine::verify`'s public-value check | `invalid proof: ...` (opaque `VerifyError`, no separate error code) |
 | Unknown program id | `Ledger::check_call` | `unknown program <id>` |

@@ -390,10 +390,15 @@ bundle proof is now made with, and verified against, its transaction's binding:
 binding(tx) = blake3("rand-tx-bind-1" || bincode(chain_id, bundle', action'))   as 8 LE u32 words
 ```
 
-where `'` means "every proof byte string replaced by the empty vector": `bundle.proof`, an asset
-bundle's `proof` (`BridgeBurn`, `TokenTransfer`, `TokenBurn` — `Action::asset_bundle`), `Call.proof`
-and `Aggregate.proof`. Everything else — envelopes, memo, destination, validator, recipient,
-signatures, the guardian attestation — is inside. `Transaction::binding` is the one function the
+where `'` means "every bundle proof byte string replaced by the empty vector": `bundle.proof`, an
+asset bundle's `proof` (`BridgeBurn`, `TokenTransfer`, `TokenBurn` — `Action::asset_bundle`), and
+`Aggregate.proof`. Everything else — envelopes, memo, destination, validator, recipient,
+signatures, the guardian attestation, **and a `Call`'s proof** — is inside. The call proof is kept
+deliberately (fix round 1): a program is public and stateless, so anyone can prove their own run of
+it, and a call proof outside the binding could be swapped in under someone else's fee bundle — the
+victim pays, the receipt's outputs and `H_IN` become the attacker's, and the victim's input
+envelope (AEAD-bound to its own `H_IN`) no longer opens. The wallet proves the call before the fee
+bundle (`rand call`), and sealing prunes only `bundle.proof`, so nothing needs it blanked. `Transaction::binding` is the one function the
 wallet (before proving) and the ledger (before verifying) both call; it hashes the *decoded*
 transaction with the bincode configuration pinned inside it (fixed-width integers, little-endian —
 what `bincode::serialize` writes), and `Action::blanked` is an exhaustive match that names every
@@ -421,9 +426,8 @@ proof or not. `the_binding_encoding_is_pinned` holds a golden value.
 `UnbondAggregator`, `WithdrawAggregator`, `SlashAggregator`, `Aggregate`) have no proof to bind;
 they rest on their own signatures (audited with this fix; `Aggregate`'s `envelope` is outside its
 signed message — a recorded follow-up, aggregation being inactive on every chain). A `Call`'s own
-proof is blanked, so it is not bound to the transaction either: the fee bundle's proof binds the
-call's `program` and `input_envelope`, but another valid proof of the same program could be swapped
-in (it changes only the receipt the fee payer paid for).
+proof is *inside* the binding, so the fee bundle's proof binds the whole call — `program`, `proof`
+and `input_envelope`.
 
 **The marker form outside sync (fix round 1).** A sealed block's pruned bundle carries
 `PRUNED_PROOF_MARKER ‖ digest(proof)` in place of its proof, and hashes to the raw transaction's id

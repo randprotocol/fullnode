@@ -2922,6 +2922,37 @@ mod tests {
         assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
     }
 
+    /// Fix round 1: a `Call`'s proof is inside the transaction binding. A program is public and
+    /// stateless, so anyone can prove their own run of it and swap that proof in under someone
+    /// else's fee bundle — the victim pays, the receipt's outputs and `H_IN` become the
+    /// attacker's, and the victim's input envelope (sealed to its own `H_IN`) no longer opens.
+    /// The swapped copy is refused at the fee bundle's proof; the original validates.
+    #[test]
+    fn a_calls_fee_bundle_cannot_ride_a_swapped_call_proof() {
+        let mut l = ledger();
+        let (a, _) = keys();
+        let words = vec![0x13u32; 4];
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
+        let fee = gas::fee_floor(&deploy);
+        let t = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee), deploy));
+        l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
+        l.record_anchor(l.height());
+        let id = program_id(0, &words);
+        let call = Action::Call { program: id, proof: StubExecutor::make_proof(&id, 12, [1; 8]), input_envelope: None };
+        let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
+        let original = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], fee), call));
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+        let mut swapped = original.clone();
+        let Action::Call { proof, .. } = &mut swapped.action else { panic!("a call") };
+        *proof = StubExecutor::make_proof(&id, 12, [9; 8]);
+        assert!(
+            matches!(l.validate(&swapped, &StubExecutor), Err(TxError::InvalidBundleProof(_))),
+            "a swapped call proof: {:?}",
+            l.validate(&swapped, &StubExecutor)
+        );
+        assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+    }
+
     /// Fix round 1, item 2: a marker-form copy of a raw transaction — `bundle.proof` replaced by
     /// `PRUNED_PROOF_MARKER ‖ digest(proof)` — hashes to the raw transaction's id by design (M1).
     /// Outside sealed-form sync it must be refused with an error that is *not* a statement about

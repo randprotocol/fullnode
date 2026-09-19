@@ -91,7 +91,8 @@ attacker — theft, with nothing on Rand to show it was not the burner's intent.
 copied the same way with its deposit `r`, `time` or envelope changed (stranding the recipient's
 note), or its fee bundle lifted onto another transaction. Now every bundle proof is made over, and
 verified against, the eight words of `Transaction::binding` — a hash of the whole transaction
-(chain id, both bundles including their envelopes, the action) with only the proof bytes blanked —
+(chain id, both bundles including their envelopes, the action) with only the bundle proof bytes
+blanked —
 as its public input segment, so any copy that changes any field fails the proof
 (`TxError::InvalidBundleProof`, `PublicValues`); the ledger tests named in `docs/confidential.md`
 admitted each of these copies before the fix and refuse them after. **Every wallet and relayer

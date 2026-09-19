@@ -321,33 +321,75 @@ impl Action {
     /// caps at admission step 1, the transaction's nullifiers and commitments, the node's note
     /// index and its mempool conflict keys — reads it from here rather than keeping a list of its
     /// own that a fourth such action could be left out of.
+    ///
+    /// Exhaustive, with no wildcard: a new variant does not compile until it is placed on one side
+    /// of this line, so a future two-bundle action cannot silently skip the size caps and the proof
+    /// check that read its asset bundle from here.
     pub fn asset_bundle(&self) -> Option<&Bundle> {
         match self {
             Action::BridgeBurn { asset_bundle, .. }
             | Action::TokenTransfer { asset_bundle, .. }
             | Action::TokenBurn { asset_bundle, .. } => Some(asset_bundle),
-            _ => None,
+            Action::None
+            | Action::Mint { .. }
+            | Action::Deploy { .. }
+            | Action::Call { .. }
+            | Action::Bond { .. }
+            | Action::Unbond { .. }
+            | Action::Withdraw { .. }
+            | Action::BridgeAttest { .. }
+            | Action::RegisterAggregator { .. }
+            | Action::UnbondAggregator { .. }
+            | Action::WithdrawAggregator { .. }
+            | Action::SlashAggregator { .. }
+            | Action::Aggregate { .. }
+            | Action::RegisterToken { .. }
+            | Action::TokenMint { .. }
+            | Action::SetAuthority { .. } => None,
         }
     }
 
     /// [`Action::asset_bundle`], mutably — the same three actions, for a caller that fills the
     /// asset bundle's proof in after the transaction around it is assembled (a wallet proving
     /// against [`Transaction::binding`], a test stubbing one).
+    /// Exhaustive with no wildcard, like [`Action::asset_bundle`].
     pub fn asset_bundle_mut(&mut self) -> Option<&mut Bundle> {
         match self {
             Action::BridgeBurn { asset_bundle, .. }
             | Action::TokenTransfer { asset_bundle, .. }
             | Action::TokenBurn { asset_bundle, .. } => Some(asset_bundle),
-            _ => None,
+            Action::None
+            | Action::Mint { .. }
+            | Action::Deploy { .. }
+            | Action::Call { .. }
+            | Action::Bond { .. }
+            | Action::Unbond { .. }
+            | Action::Withdraw { .. }
+            | Action::BridgeAttest { .. }
+            | Action::RegisterAggregator { .. }
+            | Action::UnbondAggregator { .. }
+            | Action::WithdrawAggregator { .. }
+            | Action::SlashAggregator { .. }
+            | Action::Aggregate { .. }
+            | Action::RegisterToken { .. }
+            | Action::TokenMint { .. }
+            | Action::SetAuthority { .. } => None,
         }
     }
 
     /// This action with every **proof** byte string replaced by the empty vector — what
-    /// [`Transaction::binding`] hashes. Exactly three fields are proofs: an asset bundle's
-    /// `proof` ([`Action::asset_bundle`]'s three actions), a `Call`'s `proof` and an `Aggregate`'s
-    /// `proof`. Every other field — envelopes, memo, destination, validator, recipient,
-    /// signatures, a guardian attestation, a signed header's `proof_hash` — is kept as it is, so
-    /// the binding moves with it.
+    /// [`Transaction::binding`] hashes. Exactly two fields are blanked: an asset bundle's `proof`
+    /// ([`Action::asset_bundle`]'s three actions) and an `Aggregate`'s `proof`. Every other field —
+    /// envelopes, memo, destination, validator, recipient, signatures, a guardian attestation, a
+    /// signed header's `proof_hash` — is kept as it is, so the binding moves with it.
+    ///
+    /// **A `Call`'s `proof` is kept, deliberately** (Task 5b review, fix round 1). It is a proof,
+    /// but not one of *this transaction's bundles*, and it exists before them: the wallet proves
+    /// the call first and the fee bundle after. A program is public and stateless, so anyone can
+    /// prove their own run of it; were the call proof outside the binding, an observer could swap
+    /// theirs in under someone else's fee bundle — the victim pays, the receipt's outputs and
+    /// `H_IN` become the attacker's, and the victim's input envelope (sealed to its own `H_IN`)
+    /// no longer opens. Sealing prunes only `bundle.proof`, so nothing needs it blanked.
     ///
     /// The match is exhaustive and every arm names every field, with no wildcard and no `..`: a
     /// new variant, or a new field on an existing one, does not compile until it is classified
@@ -369,8 +411,9 @@ impl Action {
             Action::Deploy { base_pc, words, public } => {
                 Action::Deploy { base_pc: *base_pc, words: words.clone(), public: public.clone() }
             }
-            Action::Call { program, proof: _, input_envelope } => {
-                Action::Call { program: *program, proof: Vec::new(), input_envelope: input_envelope.clone() }
+            // Kept, not blanked: see the doc comment.
+            Action::Call { program, proof, input_envelope } => {
+                Action::Call { program: *program, proof: proof.clone(), input_envelope: input_envelope.clone() }
             }
             Action::Bond { validator, amount, registration } => {
                 Action::Bond { validator: *validator, amount: *amount, registration: registration.clone() }
@@ -607,9 +650,10 @@ impl Transaction {
 
     /// What every bundle proof of this transaction is bound to: blake3 under
     /// [`TX_BINDING_DOMAIN`] of the canonical bincode of `(chain_id, bundle', action')`, where `'`
-    /// means "with every proof byte string replaced by the empty vector" — `bundle.proof`, an
-    /// asset bundle's `proof`, a `Call`'s and an `Aggregate`'s (see [`Action::blanked`]) — as
-    /// eight little-endian `u32` words.
+    /// means "with every proof byte string this transaction's bundles cannot commit to replaced by
+    /// the empty vector" — `bundle.proof`, an asset bundle's `proof` and an `Aggregate`'s (see
+    /// [`Action::blanked`]); a `Call`'s proof exists before the bundle is proved and stays
+    /// inside — as eight little-endian `u32` words.
     ///
     /// A bundle's proof is made over these words as its public input segment and verified
     /// against them (`ConfidentialExecutor::verify_bundle`), so a proof copied onto a
@@ -1244,36 +1288,44 @@ mod tests {
     }
 
     /// The classification [`Action::blanked`] makes, stated independently: exactly these variants
-    /// carry a proof, and blanking one empties exactly its proof and keeps everything else — every
-    /// signature, envelope, attestation, memo, destination and recipient stays inside the binding.
+    /// carry a proof that is blanked, and blanking one empties exactly that proof and keeps
+    /// everything else — every signature, envelope, attestation, memo, destination and recipient
+    /// stays inside the binding. A `Call` (variant 3) carries a proof that is *kept*: blanking
+    /// leaves it whole and the binding moves with it.
     /// Table-driven over *every* variant: [`variant_index`] is exhaustive, so a new variant fails
     /// to compile until it has a row here, and `blanked` names every field of every variant, so a
     /// new field fails to compile until it is classified there.
     #[test]
     fn blanking_empties_exactly_the_proofs_of_every_variant() {
-        let carries_a_proof = [3usize, 8, 13, 17, 18];
+        let blanked_proof = [8usize, 13, 17, 18];
+        let kept_proof = [3usize];
         let mut seen = [false; VARIANTS];
         for i in 0..VARIANTS {
             let with = sample(i, vec![0x99; 7]);
             let without = sample(i, Vec::new());
             assert_eq!(variant_index(&with), i, "the table's row {i} is variant {i}");
             seen[i] = true;
-            assert_eq!(with.blanked(), without, "variant {i}: blanking keeps every non-proof field and empties the proofs");
+            assert_eq!(with != without, blanked_proof.contains(&i) || kept_proof.contains(&i), "variant {i}: carries a proof field");
             assert_eq!(without.blanked(), without, "variant {i}: blanking is idempotent");
-            assert_eq!(with != without, carries_a_proof.contains(&i), "variant {i}: carries a proof field");
-            // The binding sees the blanked form only: the proof bytes never move it.
             let t = |a: Action| Transaction::shielded(7, bundle(), a);
-            assert_eq!(t(with).binding(), t(without).binding(), "variant {i}");
+            if kept_proof.contains(&i) {
+                assert_eq!(with.blanked(), with, "variant {i}: its proof is kept whole");
+                assert_ne!(t(with).binding(), t(without).binding(), "variant {i}: the binding moves with its proof");
+            } else {
+                assert_eq!(with.blanked(), without, "variant {i}: blanking keeps every non-proof field and empties the proofs");
+                // The binding sees the blanked form only: the proof bytes never move it.
+                assert_eq!(t(with).binding(), t(without).binding(), "variant {i}");
+            }
         }
         assert!(seen.iter().all(|s| *s), "every variant has a row");
     }
 
-    /// The binding ignores every proof byte — the fee bundle's, an asset bundle's, a call's, an
-    /// aggregate's, and a pruned marker in place of any of them — so a wallet can compute it before
-    /// it proves, and the ledger after.
+    /// The binding ignores every blanked proof byte — the fee bundle's, an asset bundle's, an
+    /// aggregate's, and a pruned marker in place of the fee bundle's — so a wallet can compute it
+    /// before it proves its bundles, and the ledger after.
     #[test]
     fn the_binding_ignores_proof_bytes() {
-        for i in [0usize, 3, 8, 13, 17, 18] {
+        for i in [0usize, 8, 13, 17, 18] {
             let base = Transaction::shielded(7, bundle(), sample(i, vec![1; 5]));
             let mut other = Transaction::shielded(7, bundle(), sample(i, vec![2; 900]));
             other.bundle.as_mut().unwrap().proof = vec![0xee; 3];
@@ -1284,6 +1336,22 @@ mod tests {
             marker.bundle.as_mut().unwrap().proof = pruned;
             assert_eq!(base.binding(), marker.binding(), "variant {i}: the pruned form binds the same");
         }
+    }
+
+    /// A `Call`'s proof is *inside* the binding (fix round 1): a different call proof — another
+    /// valid run of the same public program, say — is a different transaction to the bundle's
+    /// proof, so it cannot be swapped in under someone else's fee bundle. The fee bundle's proof
+    /// bytes still do not move it.
+    #[test]
+    fn the_binding_moves_when_the_call_proof_changes() {
+        let base = Transaction::shielded(7, bundle(), sample(3, vec![1; 5]));
+        let swapped = Transaction::shielded(7, bundle(), sample(3, vec![2; 5]));
+        assert_ne!(base.binding(), swapped.binding());
+        let emptied = Transaction::shielded(7, bundle(), sample(3, Vec::new()));
+        assert_ne!(base.binding(), emptied.binding());
+        let mut fee_proof = base.clone();
+        fee_proof.bundle.as_mut().unwrap().proof = vec![0xee; 3];
+        assert_eq!(base.binding(), fee_proof.binding());
     }
 
     /// …and moves with every other field: the chain id, each fee-bundle field and envelope, each

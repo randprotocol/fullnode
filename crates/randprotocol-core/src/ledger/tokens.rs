@@ -2991,4 +2991,40 @@ mod action_tests {
         assert!(accepted.is_empty(), "{accepted:#?}");
         assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
     }
+
+    /// Fix round 1, item 4: the lifted-asset-bundle row for RPL's two two-bundle actions — an
+    /// asset bundle lifted whole out of an honest `TokenTransfer` / `TokenBurn` into a new
+    /// transaction whose fee bundle the thief honestly proves for it. The lifted proof was bound to
+    /// the original transaction and is refused; both originals still validate.
+    #[test]
+    fn an_asset_bundle_lifted_out_of_a_token_transfer_or_burn_is_refused() {
+        let mut l = ledger();
+        let keyed = register_keyed(&mut l, 20);
+        l.record_anchor(l.height());
+        let transfer = transfer_tx(&l, keyed, Some(vec![1; 4]), 40, |_| {});
+        let burn = burn_tx(&l, keyed, 100, 60, |_| {});
+        assert_eq!(l.validate(&transfer, &StubExecutor), Ok(()));
+        assert_eq!(l.validate(&burn, &StubExecutor), Ok(()));
+        // The thief's fee bundle, proved for the new transaction: only the asset bundle is stolen.
+        let rebuilt = |action: Action| {
+            let mut t = Transaction::shielded(CHAIN, fee_bundle(&l, 80, TWO_BUNDLES), action);
+            let binding = t.binding();
+            let fee = t.bundle.as_mut().unwrap();
+            fee.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&fee.digest_input()), &binding);
+            t
+        };
+        let Action::TokenTransfer { asset_bundle, .. } = &transfer.action else { panic!("a transfer") };
+        let lifted_transfer = rebuilt(Action::TokenTransfer { asset_bundle: asset_bundle.clone(), memo: Some(vec![2; 4]) });
+        let Action::TokenBurn { asset_bundle, asset, amount } = &burn.action else { panic!("a burn") };
+        let lifted_burn = rebuilt(Action::TokenBurn { asset_bundle: asset_bundle.clone(), asset: *asset, amount: *amount });
+        let accepted: Vec<String> = [("transfer", &lifted_transfer), ("burn", &lifted_burn)]
+            .into_iter()
+            .map(|(what, t)| (what, l.validate(t, &StubExecutor)))
+            .filter(|(_, got)| !matches!(got, Err(TxError::InvalidBundleProof(_))))
+            .map(|(what, got)| format!("asset bundle lifted out of a token {what}: {got:?}"))
+            .collect();
+        assert!(accepted.is_empty(), "{accepted:#?}");
+        assert_eq!(l.validate(&transfer, &StubExecutor), Ok(()));
+        assert_eq!(l.validate(&burn, &StubExecutor), Ok(()));
+    }
 }

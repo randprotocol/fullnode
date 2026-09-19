@@ -169,7 +169,7 @@ impl StubExecutor {
     /// bytes) untouched. What a test calls once it has finished assembling a transaction: the
     /// stub's analogue of a wallet proving after it has built everything but the proofs.
     ///
-    /// Binding blanks every proof, so the order in which the two proofs are rewritten does not
+    /// Binding blanks every bundle proof, so the order in which the two proofs are rewritten does not
     /// matter: the binding is the same before and after.
     pub fn bind(tx: &mut Transaction) {
         let binding = word8_to_bytes(&tx.binding());
