@@ -14,7 +14,7 @@ use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use randprotocol_core::bridge::asset_id;
-use randprotocol_core::ledger::tokens::{Backing, MintAuthority, TokenRegistry};
+use randprotocol_core::ledger::tokens::{Backing, MintAuthority, TokenInfo, TokenRegistry};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::notes::{word8_to_hex, Envelope};
 use randprotocol_core::{Action, CallReceipt, Hash, ProgramId, ShieldedAddress, Transaction, TOKEN_DECIMALS, TOKEN_SYMBOL};
@@ -734,6 +734,125 @@ fn authority_kind(a: &MintAuthority) -> &'static str {
     }
 }
 
+/// Most rows one `rand_getTokens` page returns — the page the wallet's `resolve_asset` asks for,
+/// and it pages on only while a page comes back this full.
+const MAX_TOKEN_PAGE: usize = 1000;
+/// Longest token key `rand_getToken` parses: an `rpl1…` string is 62 characters, 64 hex 66 with
+/// `0x`. Anything longer is refused before it is decoded.
+const MAX_TOKEN_KEY_CHARS: usize = 100;
+
+/// One source-chain coin behind a bridged token, as the token RPC serves it: its chain, its
+/// source token address, its **source** decimals and the amount its contract holds locked for
+/// this chain — a decimal string, like every supply this RPC serves. (The per-backing daily mint
+/// counter joins this row with bridge hardening B1.)
+fn backing_json(b: &Backing) -> Value {
+    json!({
+        "chain": b.chain,
+        "token": hex::encode(b.token),
+        "decimals": b.decimals,
+        "locked": b.locked.to_string(),
+    })
+}
+
+/// A mint authority in full: `{"kind":"none"}`, `{"kind":"key","key":hex,"address":base58}`,
+/// `{"kind":"bridge","backings":[…]}` or `{"kind":"program","program":hex}`.
+fn authority_json(a: &MintAuthority) -> Value {
+    match a {
+        MintAuthority::None => json!({ "kind": "none" }),
+        MintAuthority::Key(pk) => json!({ "kind": "key", "key": pk.to_hex(), "address": pk.address().to_base58() }),
+        MintAuthority::Bridge { backings } => {
+            json!({ "kind": "bridge", "backings": backings.iter().map(backing_json).collect::<Vec<_>>() })
+        }
+        MintAuthority::Program(id) => json!({ "kind": "program", "program": id.to_hex() }),
+    }
+}
+
+/// One registry row, as `rand_getTokens` lists it and `rand_getToken` returns it. Everything here
+/// is public registry state (RPL spec §4); nothing says which notes hold the token.
+fn token_json(info: &TokenInfo) -> Value {
+    json!({
+        "index": info.index,
+        "id": info.id.to_hex(),
+        "id_text": randprotocol_core::token_id::encode(&info.id),
+        "name": info.name,
+        "symbol": info.symbol,
+        "decimals": info.decimals,
+        "authority": authority_json(&info.authority),
+        "mint_nonce": info.mint_nonce,
+        "total_supply": info.total_supply.to_string(),
+        "registered_at": info.registered_at,
+    })
+}
+
+/// A token's public supply and, for a bridged token, each backing's locked amount — what
+/// `rand-bridge-audit` reconciles against custody on the source chains. `backings` is empty for
+/// a native token.
+fn supply_json(info: &TokenInfo) -> Value {
+    let backings = match &info.authority {
+        MintAuthority::Bridge { backings } => backings.iter().map(backing_json).collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    json!({ "total_supply": info.total_supply.to_string(), "backings": backings })
+}
+
+/// A token named by a caller: its registry index (a JSON number or a decimal string), its 64-hex
+/// id (with or without `0x`, any case) or its `rpl1…` text form. A malformed id is an error, so a
+/// typo is never answered with some other token (or with a silent `null`).
+fn parse_token_key(params: &Value, idx: usize) -> Result<Result<u64, randprotocol_core::bridge::AssetId>, RpcError> {
+    let v = params.get(idx).ok_or_else(|| RpcError::invalid_params("token: missing (an index, 64 hex or rpl1…)"))?;
+    if let Some(n) = v.as_u64() {
+        return Ok(Ok(n));
+    }
+    let s = v.as_str().ok_or_else(|| RpcError::invalid_params("token: an index, 64 hex or rpl1…"))?.trim();
+    if s.len() > MAX_TOKEN_KEY_CHARS {
+        return Err(RpcError::invalid_params(format!("token is {} characters, at most {MAX_TOKEN_KEY_CHARS}", s.len())));
+    }
+    if !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()) {
+        return s.parse::<u64>().map(Ok).map_err(|_| RpcError::invalid_params("token: index out of range"));
+    }
+    if s.len() >= 4 && s[..4].eq_ignore_ascii_case("rpl1") {
+        return randprotocol_core::token_id::decode(s)
+            .map(Err)
+            .map_err(|e| RpcError::invalid_params(format!("token: {e}")));
+    }
+    let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    Hash::from_hex(&h.to_ascii_lowercase())
+        .map(Err)
+        .map_err(|_| RpcError::invalid_params("token: an index, 64 hex or rpl1…"))
+}
+
+/// The token a [`parse_token_key`] result names, if the registry holds it.
+fn find_token<'a>(tokens: &'a TokenRegistry, key: &Result<u64, randprotocol_core::bridge::AssetId>) -> Option<&'a TokenInfo> {
+    match key {
+        Ok(index) => u32::try_from(*index).ok().and_then(|i| tokens.get(i)),
+        Err(id) => tokens.get_by_id(id),
+    }
+}
+
+/// The one note the *chain* computes for `tx` — a `BridgeAttest`'s deposit, a `TokenMint`'s
+/// minted note, a `RegisterToken`'s initial mint — as `storage::created_notes` appended it.
+/// `None` for every other action, for a rotation, for a registration without an initial mint,
+/// and for an attestation whose asset the registry does not hold. `rand_checkTransaction` opens
+/// the action's envelope against it.
+fn derived_note_cm(
+    tx: &Transaction,
+    tokens: Option<&TokenRegistry>,
+    executor: &dyn ConfidentialExecutor,
+) -> Option<randprotocol_core::Word8> {
+    use randprotocol_core::ledger::{bridge_notes, tokens::mint_commitment};
+    match &tx.action {
+        Action::BridgeAttest { attestation, recipient, r, time, .. } => attest_deposit(attestation, tokens)
+            .map(|(index, amount)| bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor)),
+        Action::TokenMint { asset, amount, recipient, r, time, .. } => {
+            Some(mint_commitment(recipient, *amount, *asset, *time, r, executor))
+        }
+        Action::RegisterToken { initial: Some(m), index, .. } => {
+            Some(mint_commitment(&m.recipient, m.amount, *index, m.time, &m.r, executor))
+        }
+        _ => None,
+    }
+}
+
 /// One block as a light wallet reads it: the header fields it chains on, and per transaction
 /// the notes it created (leaf index, commitment, envelope) and the nullifiers it spent. No
 /// proof, no action, no receipt — those are `rand_getBlockByHeight`'s job.
@@ -1015,15 +1134,25 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
         // nothing derived: the asset id, the index a registration was given, and the minted
         // note's commitment are the registry's to report, and Task 7 adds them here with
         // `rand_getToken`.
+        //
+        // The minted note's every word is public — recipient, amount, asset index, `time` and the
+        // blinding `r` (the `from` word is the chain's `MINT_FROM`) — so a recipient rebuilds it
+        // from these fields with nothing decrypted, whatever envelope the minter published
+        // (`docs/bridge.md` §8's argument, one action over). The wallet's public-note scan keys
+        // on the kind strings `register_token` and `token_mint`: do not rename them.
         Action::RegisterToken { name, symbol, decimals, authority, initial, index, .. } => json!({
             "kind": "register_token", "name": name, "symbol": symbol, "decimals": decimals,
             "authority": authority_kind(authority),
             "index": index,
             "initial_amount": initial.as_ref().map(|m| m.amount),
+            // `null` for a registration without an initial mint.
+            "initial": initial.as_ref().map(|m| json!({
+                "amount": m.amount, "recipient": m.recipient.to_string(), "time": m.time, "r": word8_to_hex(&m.r),
+            })),
         }),
-        Action::TokenMint { asset, amount, recipient, time, nonce, .. } => json!({
+        Action::TokenMint { asset, amount, recipient, r, time, nonce, .. } => json!({
             "kind": "token_mint", "asset": asset, "amount": amount,
-            "recipient": recipient.to_string(), "time": time, "nonce": nonce
+            "recipient": recipient.to_string(), "time": time, "r": word8_to_hex(r), "nonce": nonce
         }),
         Action::SetAuthority { asset, new, nonce, .. } => json!({
             "kind": "set_authority", "asset": asset, "nonce": nonce,
@@ -1498,25 +1627,15 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .map_err(RpcError::internal)?
                 .ok_or_else(|| RpcError::not_found("block missing"))?;
             let tx = b.transactions.get(index as usize).ok_or_else(|| RpcError::not_found("tx index"))?;
-            // A `BridgeAttest`'s deposit commitment — the one commitment the wire does not carry
-            // — computed from the registry exactly as `tx_json` renders it.
-            let deposit_cm = match &tx.action {
-                Action::BridgeAttest { attestation, recipient, r, time, .. } => {
-                    let tokens = st.storage.tokens().map_err(RpcError::internal)?;
-                    attest_deposit(attestation, tokens.as_ref()).map(|(index, amount)| {
-                        randprotocol_core::ledger::bridge_notes::deposit_commitment(
-                            recipient,
-                            amount,
-                            index,
-                            *time,
-                            r,
-                            st.executor.as_ref(),
-                        )
-                    })
-                }
+            // The action's chain-computed note — a deposit, a token mint or a registration's
+            // initial mint, the commitments the wire does not carry — as the notes index
+            // appended it. Only an attestation needs the registry.
+            let tokens = match &tx.action {
+                Action::BridgeAttest { .. } => st.storage.tokens().map_err(RpcError::internal)?,
                 _ => None,
             };
-            let opened = crate::viewing::disclosed(tx, deposit_cm, &randprotocol_zkvm::viewing::TxKey(key));
+            let derived_cm = derived_note_cm(tx, tokens.as_ref(), st.executor.as_ref());
+            let opened = crate::viewing::disclosed(tx, derived_cm, &randprotocol_zkvm::viewing::TxKey(key));
             if opened.is_empty() {
                 return Ok(json!({ "tx": h.to_hex(), "height": height, "disclosed": [] }));
             }
@@ -1532,7 +1651,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     .ok_or_else(|| RpcError::internal("the disclosed note's commitment is not a leaf of its block"))?;
                 out.push(json!({
                     "output": match o.output {
-                        "deposit" => "deposit".to_string(),
+                        // The action's one derived note: no slot to number.
+                        single @ ("deposit" | "token_mint" | "initial_mint") => single.to_string(),
                         other => format!("{other}:{}", o.slot),
                     },
                     "cm": word8_to_hex(&o.cm),
@@ -1680,6 +1800,48 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // and its index is a fact a wallet reads off `assets` (`rand_getAssets`).
                 "assets": tokens.as_ref().map(assets_json).unwrap_or_default(),
             }))
+        }
+        // ---- the token registry (RPL spec §6) ----
+        // The whole registry, paged by index: `[from_index, limit ≤ 1000]`. Public registry
+        // state. This listing is what a wallet resolves a token id through (`wallet::
+        // resolve_asset`): reading every row costs the same whichever token is meant, so the
+        // request says nothing about which one a hidden-asset transfer is about to move.
+        "rand_getTokens" => {
+            let Some(tokens) = st.storage.tokens().map_err(RpcError::internal)? else {
+                return Ok(json!({ "enabled": false, "tokens": [] }));
+            };
+            let from: u64 = match p.get(0) {
+                None | Some(Value::Null) => 0,
+                Some(_) => param(p, 0, "from_index")?,
+            };
+            let limit = match p.get(1) {
+                None | Some(Value::Null) => MAX_TOKEN_PAGE,
+                Some(_) => (param::<u64>(p, 1, "limit")? as usize).min(MAX_TOKEN_PAGE),
+            };
+            let rows: Vec<Value> =
+                tokens.iter().filter(|t| u64::from(t.index) >= from).take(limit).map(token_json).collect();
+            Ok(json!({
+                "enabled": true,
+                "registration_fee": tokens.registration_fee,
+                "next_index": tokens.next_index(),
+                "tokens": rows,
+            }))
+        }
+        // One token, by index, 64 hex or `rpl1…`; `null` when there is none. PRIVACY: a
+        // per-token lookup tells this node which token the caller cares about — a wallet about
+        // to send uses `rand_getTokens` instead, and this is for explorers and one-off reads.
+        "rand_getToken" => {
+            let key = parse_token_key(p, 0)?;
+            let tokens = st.storage.tokens().map_err(RpcError::internal)?;
+            Ok(tokens.as_ref().and_then(|t| find_token(t, &key)).map(token_json).unwrap_or(Value::Null))
+        }
+        // A token's supply and each backing's locked amount (decimal strings) — the numbers
+        // `rand-bridge-audit` reconciles against custody. Same key forms and privacy note as
+        // `rand_getToken`; `null` when there is no such token.
+        "rand_getTokenSupply" => {
+            let key = parse_token_key(p, 0)?;
+            let tokens = st.storage.tokens().map_err(RpcError::internal)?;
+            Ok(tokens.as_ref().and_then(|t| find_token(t, &key)).map(supply_json).unwrap_or(Value::Null))
         }
         // The registry alone, which is what a wallet needs to read a note's `asset` word: the
         // bridged (`Bridge`-authority) rows of the token registry. Empty on a chain without a
@@ -3549,6 +3711,219 @@ mod tests {
         assert_eq!(ok(&st, "rand_getBridgeBurn", json!([0])).await, Value::Null);
         // The asset id is arithmetic on its two arguments, so it answers anywhere.
         assert!(ok(&st, "rand_bridgeAssetId", json!([2, hex::encode([7u8; 32])])).await.is_string());
+    }
+
+    // ------------------------------------------------------------ the token registry (RPL §6)
+
+    /// [`bridged_chain`]'s bridged token at index 1 (1 000 deposited, 400 burned), then a native
+    /// token registered at index 2 with an initial 5 000 to the fixture recipient (height 3) and
+    /// 700 more minted at nonce 0 (height 4). Returns the registration and the mint.
+    fn token_chain() -> (tempfile::TempDir, RpcState, GenesisState, Transaction, Transaction) {
+        let (dir, st, gs, _) = bridged_chain();
+        let mut ledger = st.storage.load_ledger(&StubExecutor).unwrap();
+        let parent = st.storage.block_by_height(2).unwrap().unwrap();
+        let register = fixtures::register_token_tx(&ledger, 5_000, 40);
+        let b3 = make_block(&parent, &mut ledger, vec![register.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+        let mint = fixtures::token_mint_tx(&ledger, 2, 700, 0, 50);
+        let b4 = make_block(&b3.block, &mut ledger, vec![mint.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b4), &ledger, &[], &StubExecutor).unwrap();
+        (dir, st, gs, register, mint)
+    }
+
+    /// The native token's full row, as `rand_getTokens` and `rand_getToken` serve it.
+    fn native_row(st: &RpcState) -> Value {
+        let tokens = st.storage.tokens().unwrap().unwrap();
+        let id = tokens.get(2).unwrap().id;
+        let issuer = fixtures::issuer();
+        json!({
+            "index": 2,
+            "id": id.to_hex(),
+            "id_text": randprotocol_core::token_id::encode(&id),
+            "name": "Test Coin",
+            "symbol": "TST",
+            "decimals": 6,
+            "authority": {
+                "kind": "key",
+                "key": issuer.public_key().to_hex(),
+                "address": issuer.public_key().address().to_base58(),
+            },
+            "mint_nonce": 1,
+            "total_supply": "5700",
+            "registered_at": 3,
+        })
+    }
+
+    /// The whole registry, paged, in the shape `wallet::resolve_asset` reads: `{ tokens: [...] }`
+    /// whose rows carry `index`, `id` and `id_text` — plus every public field of a token, the
+    /// bridged token's backings with the amount each coin's contract holds.
+    #[tokio::test]
+    async fn the_token_listing_serves_every_row_paged() {
+        let (_d, st, _gs, _, _) = token_chain();
+        let tokens = st.storage.tokens().unwrap().unwrap();
+        let v = ok(&st, "rand_getTokens", json!([0, 1000])).await;
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["registration_fee"], json!(tokens.registration_fee));
+        assert_eq!(v["next_index"], 3);
+        let rows = v["tokens"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1], native_row(&st));
+
+        let bridged = &rows[0];
+        let id1 = tokens.get(1).unwrap().id;
+        assert_eq!(bridged["index"], 1);
+        assert_eq!(bridged["id"], id1.to_hex());
+        assert_eq!(bridged["id_text"], randprotocol_core::token_id::encode(&id1));
+        assert_eq!(bridged["total_supply"], "600");
+        assert_eq!(
+            bridged["authority"],
+            json!({ "kind": "bridge", "backings": [
+                { "chain": 2, "token": hex::encode(fixtures::TOKEN), "decimals": 8, "locked": "600" }
+            ] })
+        );
+
+        // Paging: from an index, at most `limit` rows, ascending.
+        let from2 = ok(&st, "rand_getTokens", json!([2, 1000])).await;
+        assert_eq!(from2["tokens"], json!([native_row(&st)]));
+        let first = ok(&st, "rand_getTokens", json!([0, 1])).await;
+        assert_eq!(first["tokens"].as_array().unwrap().len(), 1);
+        assert_eq!(first["tokens"][0]["index"], 1);
+        assert_eq!(ok(&st, "rand_getTokens", json!([3])).await["tokens"], json!([]));
+        // No parameters is the first page; an oversized limit is clamped, not refused.
+        assert_eq!(ok(&st, "rand_getTokens", json!([])).await["tokens"].as_array().unwrap().len(), 2);
+        assert_eq!(ok(&st, "rand_getTokens", json!([0, 1_000_000])).await["tokens"].as_array().unwrap().len(), 2);
+    }
+
+    /// One token by index, by 64 hex (any case, `0x` or not) or by its `rpl1…` text form; the
+    /// supply alone, with each backing's locked amount, for the bridge audit.
+    #[tokio::test]
+    async fn one_token_by_index_hex_or_rpl1_and_its_supply() {
+        let (_d, st, _gs, _, _) = token_chain();
+        let row = native_row(&st);
+        let hex_id = row["id"].as_str().unwrap().to_string();
+        let text = row["id_text"].as_str().unwrap().to_string();
+        for key in [
+            json!(2),
+            json!("2"),
+            json!(hex_id),
+            json!(format!("0x{}", hex_id.to_ascii_uppercase())),
+            json!(text),
+            json!(text.to_ascii_uppercase()),
+        ] {
+            assert_eq!(ok(&st, "rand_getToken", json!([key.clone()])).await, row, "{key}");
+        }
+        assert_eq!(ok(&st, "rand_getToken", json!([0])).await, Value::Null, "RAND is not a registered token");
+        assert_eq!(ok(&st, "rand_getToken", json!([9])).await, Value::Null);
+        assert_eq!(ok(&st, "rand_getToken", json!(["ab".repeat(32)])).await, Value::Null);
+        // A mistyped text form is an error, never some other token.
+        let mut typo = text.clone();
+        typo.replace_range(10..11, if &text[10..11] == "q" { "p" } else { "q" });
+        assert_eq!(call(&st, "rand_getToken", json!([typo])).await.unwrap_err().code, -32602);
+        assert_eq!(call(&st, "rand_getToken", json!(["rpl1".repeat(1000)])).await.unwrap_err().code, -32602);
+        assert_eq!(call(&st, "rand_getToken", json!(["nonsense"])).await.unwrap_err().code, -32602);
+
+        assert_eq!(
+            ok(&st, "rand_getTokenSupply", json!([2])).await,
+            json!({ "total_supply": "5700", "backings": [] })
+        );
+        assert_eq!(
+            ok(&st, "rand_getTokenSupply", json!([1])).await,
+            json!({ "total_supply": "600", "backings": [
+                { "chain": 2, "token": hex::encode(fixtures::TOKEN), "decimals": 8, "locked": "600" }
+            ] })
+        );
+        assert_eq!(ok(&st, "rand_getTokenSupply", json!([9])).await, Value::Null);
+    }
+
+    /// A chain without the tokens gate answers every token read: disabled, empty, nothing found.
+    #[tokio::test]
+    async fn the_token_reads_degrade_on_a_chain_without_the_gate() {
+        let (_d, st, _gs) = chain();
+        assert_eq!(ok(&st, "rand_getTokens", json!([0, 1000])).await, json!({ "enabled": false, "tokens": [] }));
+        assert_eq!(ok(&st, "rand_getToken", json!([1])).await, Value::Null);
+        assert_eq!(ok(&st, "rand_getTokenSupply", json!([1])).await, Value::Null);
+    }
+
+    /// The wallet's own parser (`wallet::resolve_asset`) over this node's listing, through a real
+    /// HTTP round trip: an `rpl1…` id, 64 hex, `0x` hex upper case, and a miss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_wallet_resolves_a_token_id_through_the_node_listing() {
+        let (_d, st, _gs, _, _) = token_chain();
+        let row = native_row(&st);
+        let bridged = ok(&st, "rand_getToken", json!([1])).await;
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), st).await.unwrap();
+        let rpc = randprotocol_client::RpcClient::new(format!("http://{addr}"));
+        use randprotocol_client::wallet::resolve_asset;
+        let text = row["id_text"].as_str().unwrap();
+        let hex_id = row["id"].as_str().unwrap();
+        assert_eq!(resolve_asset(&rpc, text).await.unwrap(), 2);
+        assert_eq!(resolve_asset(&rpc, hex_id).await.unwrap(), 2);
+        assert_eq!(resolve_asset(&rpc, &format!("0x{}", hex_id.to_ascii_uppercase())).await.unwrap(), 2);
+        assert_eq!(resolve_asset(&rpc, bridged["id_text"].as_str().unwrap()).await.unwrap(), 1);
+        let miss = randprotocol_core::token_id::encode(&Hash([9; 32]));
+        assert!(resolve_asset(&rpc, &miss).await.is_err());
+        task.abort();
+    }
+
+    /// The three kinds the wallet's public-note rebuild scans for (`PUBLIC_NOTE_KINDS` in
+    /// `randprotocol-client`'s `wallet.rs`) — renaming one silently stops every wallet finding
+    /// its deposits and mints — and every public word of each minted note: recipient, amount,
+    /// asset, `time` and `r`.
+    #[tokio::test]
+    async fn the_public_note_kinds_render_every_word_of_their_note() {
+        let (_d, st, _gs, register, mint) = token_chain();
+        let tokens = st.storage.tokens().unwrap();
+        let (secrets_gs, secrets) = fixtures::bridged_genesis(1);
+        let att = fixtures::attest_tx(&secrets_gs.ledger, fixtures::attestation(&secrets, &fixtures::recipient(), 10, 0), 60);
+        assert_eq!(tx_json(&att, tokens.as_ref(), &StubExecutor)["action"]["kind"], "bridge_attest");
+
+        let m = tx_json(&mint, tokens.as_ref(), &StubExecutor)["action"].clone();
+        let Action::TokenMint { r, time, .. } = &mint.action else { unreachable!() };
+        assert_eq!(m["kind"], "token_mint");
+        assert_eq!(
+            (&m["asset"], &m["amount"], &m["recipient"], &m["time"], &m["r"]),
+            (&json!(2), &json!(700), &json!(fixtures::recipient().to_string()), &json!(time), &json!(word8_to_hex(r)))
+        );
+
+        let g = tx_json(&register, tokens.as_ref(), &StubExecutor)["action"].clone();
+        let Action::RegisterToken { initial: Some(init), .. } = &register.action else { unreachable!() };
+        assert_eq!(g["kind"], "register_token");
+        assert_eq!(g["index"], 2);
+        assert_eq!(g["initial_amount"], 5_000);
+        assert_eq!(
+            (&g["initial"]["recipient"], &g["initial"]["time"], &g["initial"]["r"], &g["initial"]["amount"]),
+            (
+                &json!(fixtures::recipient().to_string()),
+                &json!(init.time),
+                &json!(word8_to_hex(&init.r)),
+                &json!(5_000)
+            )
+        );
+        // A registration without an initial mint renders `initial: null`, not a note.
+        let mut bare = register.clone();
+        if let Action::RegisterToken { initial, .. } = &mut bare.action {
+            *initial = None;
+        }
+        assert_eq!(tx_json(&bare, tokens.as_ref(), &StubExecutor)["action"]["initial"], Value::Null);
+    }
+
+    /// `rand_checkTransaction` computes the chain's one derived note for a `TokenMint` and a
+    /// registration's initial mint exactly as the notes index appended it, so the minter's
+    /// `TxKey` can be checked against it.
+    #[tokio::test]
+    async fn the_derived_note_of_a_mint_and_a_registration_is_the_appended_leaf() {
+        let (_d, st, _gs, register, mint) = token_chain();
+        let tokens = st.storage.tokens().unwrap();
+        for (tx, height) in [(&register, 3), (&mint, 4)] {
+            let rows = st.storage.notes_in_heights(height, height, 100).unwrap();
+            let derived = derived_note_cm(tx, tokens.as_ref(), &StubExecutor).expect("one derived note");
+            assert_eq!(rows.last().unwrap().1.cm, derived, "height {height}: the last leaf is the minted note");
+        }
+        let mut bare = register.clone();
+        if let Action::RegisterToken { initial, .. } = &mut bare.action {
+            *initial = None;
+        }
+        assert_eq!(derived_note_cm(&bare, tokens.as_ref(), &StubExecutor), None);
     }
 
     /// On a bridged chain the explorer resolves an attestation against the registry: the

@@ -174,11 +174,12 @@ pub fn advance(storage: &Storage, import: &mut Import, max_rows: u64) -> Result<
 #[derive(Clone, Debug)]
 pub struct Opening {
     /// Which of the transaction's envelope sets this came from: `"bundle"` (its bundle's four
-    /// output slots), `"deposit"` (a `BridgeAttest`'s deposit envelope), or `"mint"` (a faucet
-    /// mint's one envelope).
+    /// output slots), `"deposit"` (a `BridgeAttest`'s deposit envelope), `"token_mint"` (a
+    /// `TokenMint`'s minted note), `"initial_mint"` (a `RegisterToken`'s initial mint) or
+    /// `"mint"` (a faucet mint's one envelope).
     pub output: &'static str,
-    /// The slot inside `output`; meaningless for `"deposit"`, which carries exactly one
-    /// envelope.
+    /// The slot inside `output`; meaningless for every output but `"bundle"`, each of which
+    /// carries exactly one envelope.
     pub slot: u8,
     /// The on-chain commitment the opened note commits to — what makes the disclosure a proof
     /// rather than a claim: `open_with_tx_key` authenticates the note *and* checks it against
@@ -190,17 +191,18 @@ pub struct Opening {
 
 /// Every envelope of `tx` that `key` opens — the whole of `rand_checkTransaction`'s
 /// disclosure semantics. The envelopes tried are exactly the ones a living `TxKey` can exist
-/// for: the bundle outputs (sealed by the sender, who may hand the key over) and a bridge
-/// deposit (sealed by the depositor). A mint's, a withdraw's and a genesis alloc's envelopes are
-/// sealed inside the node under keys that are dropped at once (`seal_deposit`,
-/// `sealed_withdraw_note`, the faucet's mint), so no `TxKey` for them can ever be presented and
-/// they are not tried.
+/// for: the bundle outputs (sealed by the sender, who may hand the key over), a bridge deposit
+/// (sealed by the depositor), a `TokenMint`'s note and a `RegisterToken`'s initial mint (sealed
+/// by the minter or the creator), and a faucet mint's. A withdraw's and a genesis alloc's
+/// envelopes are sealed inside the node under keys that are dropped at once (`seal_deposit`,
+/// `sealed_withdraw_note`), so no `TxKey` for them can ever be presented and they are not tried.
 ///
-/// `deposit_cm` is the chain-computed commitment of a `BridgeAttest`'s deposit note — the one
-/// commitment the wire does not carry — which the caller computes from the registry the way
-/// `tx_json` does; `None` for any other action, for a rotation (which deposits nothing), and on
-/// a chain whose registry does not hold the asset.
-pub fn disclosed(tx: &Transaction, deposit_cm: Option<Word8>, key: &TxKey) -> Vec<Opening> {
+/// `derived_cm` is the chain-computed commitment of the action's one derived note — a
+/// `BridgeAttest`'s deposit, a `TokenMint`'s note, a `RegisterToken`'s initial mint — which the
+/// wire does not carry and the caller computes as the notes index appended it (`rpc`'s
+/// `derived_note_cm`); `None` for any other action, for a rotation (which deposits nothing), for
+/// a registration without an initial mint, and on a chain whose registry does not hold the asset.
+pub fn disclosed(tx: &Transaction, derived_cm: Option<Word8>, key: &TxKey) -> Vec<Opening> {
     let mut out = Vec::new();
     let mut try_env = |output: &'static str, slot: u8, cm: Word8, e: &Envelope| {
         if let Some(note) = envelope_from_core(e).open_with_tx_key(cm, key) {
@@ -214,8 +216,18 @@ pub fn disclosed(tx: &Transaction, deposit_cm: Option<Word8>, key: &TxKey) -> Ve
     }
     match &tx.action {
         Action::BridgeAttest { envelope, .. } => {
-            if let Some(cm) = deposit_cm {
+            if let Some(cm) = derived_cm {
                 try_env("deposit", 0, cm, envelope);
+            }
+        }
+        Action::TokenMint { envelope, .. } => {
+            if let Some(cm) = derived_cm {
+                try_env("token_mint", 0, cm, envelope);
+            }
+        }
+        Action::RegisterToken { initial: Some(m), .. } => {
+            if let Some(cm) = derived_cm {
+                try_env("initial_mint", 0, cm, &m.envelope);
             }
         }
         // A faucet mint carries its one commitment and envelope on the wire.
@@ -450,6 +462,57 @@ mod tests {
         assert_eq!(opened[0].note, deposit);
         assert!(disclosed(&attest, None, &deposit_key).is_empty(), "no commitment, no opening");
         assert!(disclosed(&attest, Some([6; 8]), &deposit_key).is_empty(), "the AEAD binds the real one");
+    }
+
+    /// A `TokenMint`'s envelope and a registration's initial-mint envelope are sealed by the
+    /// minter, who can hand over the `TxKey`: each opens against the chain-computed commitment,
+    /// and against nothing else.
+    #[test]
+    fn a_token_mint_and_an_initial_mint_disclose_their_note() {
+        use randprotocol_core::ledger::tokens::MintAuthority;
+        use randprotocol_core::types::actions::InitialMint;
+        let note = Note { from: randprotocol_core::ledger::tokens::MINT_FROM, asset: 2, ..note_for(&alice(), &bob(), 700) };
+        let k = TxKey([41; 32]);
+        let env = sealed(&bob(), &alice(), &note, &k);
+        let mint = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::TokenMint {
+                asset: 2,
+                amount: 700,
+                recipient: address_of(&alice()),
+                r: note.r,
+                time: note.time,
+                envelope: env.clone(),
+                nonce: 0,
+                signature: randprotocol_core::Keypair::generate().sign(b"x"),
+            },
+        };
+        let opened = disclosed(&mint, Some(note.commitment()), &k);
+        assert_eq!(opened.len(), 1);
+        assert_eq!((opened[0].output, opened[0].cm), ("token_mint", note.commitment()));
+        assert_eq!(opened[0].note, note);
+        assert!(disclosed(&mint, None, &k).is_empty(), "no commitment, no opening");
+        assert!(disclosed(&mint, Some([6; 8]), &k).is_empty(), "the AEAD binds the real one");
+        assert!(disclosed(&mint, Some(note.commitment()), &TxKey([42; 32])).is_empty());
+
+        let register = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::RegisterToken {
+                name: "T".into(),
+                symbol: "T".into(),
+                decimals: 0,
+                authority: MintAuthority::None,
+                initial: Some(InitialMint { amount: 700, recipient: address_of(&alice()), r: note.r, time: note.time, envelope: env }),
+                salt: [0; 32],
+                index: 2,
+            },
+        };
+        let opened = disclosed(&register, Some(note.commitment()), &k);
+        assert_eq!(opened.len(), 1);
+        assert_eq!((opened[0].output, opened[0].note), ("initial_mint", note));
+        assert!(disclosed(&register, Some([6; 8]), &k).is_empty());
     }
 
     #[test]
