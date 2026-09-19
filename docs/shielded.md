@@ -62,21 +62,28 @@ chain. What appears is:
 Spending a note publishes its **nullifier** `H_NF(nk, cm)`, which is unlinkable to the
 commitment without `nk`. The nullifier set is what prevents a double spend.
 
-Every transaction that moves value carries a **bundle**: a fixed 2-in-2-out shape proved by the
-pinned `bundle` zkVM guest.
+Every transaction that moves value carries exactly one **bundle**: since chain 14 the fixed
+4-in-4-out hidden-asset shape proved by the pinned hidden-asset zkVM guest
+(`docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`). Slots 0–1 carry a *private*
+asset `A`, slots 2–3 carry RAND; a dummy slot is a zero-amount note, so every bundle publishes four
+nullifiers and four commitments whatever it moves.
 
 ```
-Bundle { anchor, nullifiers[2], commitments[2], fee, burn, asset, time, envelopes[2], proof }
+Bundle { anchor, nullifiers[4], commitments[4], fee, burn_a, burn_r, burn_asset, time,
+         envelopes[4], proof }
 Transaction { chain_id, bundle: Option<Bundle>, action }
 Action = None | Mint { .. } | Deploy { base_pc, words } | Call { program, proof, input_envelope }
        | Bond { validator, amount, registration } | Unbond { .. } | Withdraw { .. } // phase S2
        | BridgeAttest { attestation, recipient, r, time, asset, envelope }         // phase S3
-       | BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, to }
+       | BridgeBurn { asset, amount, relayer_fee, to_chain, token, to }
+       | RegisterToken { .. } | TokenMint { .. } | SetAuthority { .. } | TokenBurn { asset, amount }
 ```
 
-A note's `asset` word is `0` for RAND and, since phase S3, the bridge registry's dense index for
-a bridged asset (`docs/bridge.md`). A bundle balances exactly one asset, which is why a `BridgeBurn`
-— the one transaction that spends a bridged asset and pays a RAND fee — carries two bundles. The
+A note's `asset` word is `0` for RAND and otherwise the token registry's dense index
+(`docs/bridge.md`). The asset a bundle moves is not public: a transfer of any asset is
+`Action::None` with `burn_a = burn_r = burn_asset = 0`. Only a burn names an asset — a `TokenBurn`
+or `BridgeBurn` bundle publishes `burn_asset == asset`, `burn_a == amount`, `burn_r == 0` — and
+RAND leaves the pool only through `burn_r` (a `Bond`'s stake, a `RegisterAggregator`'s bond). The
 three staking variants are on the wire but every one of them is still refused
 (`UnsupportedAction`) until phase S2 lands.
 
@@ -138,7 +145,7 @@ the pool back together.
 | `rand receipt <TX>` | the receipt of a committed call |
 | `rand asset-balance [INDEX]` | what this wallet holds in a bridged asset, or a row per asset |
 | `rand bridge-mint <ATTESTATION>` | deposit a guardian-signed attestation as a note |
-| `rand bridge-burn <ASSET> <AMOUNT> <CHAIN> <TO>` | burn a bridged asset outbound; proves two bundles |
+| `rand bridge-burn <ASSET> <AMOUNT> <CHAIN> <TO>` | burn a bridged asset outbound; proves one bundle (rebuilt in H5) |
 | `rand bridge` / `rand bridge-message <SEQ>` | the bridge's public state; one outbound message |
 | `rand fee bundle\|deploy <words>\|call <tier>` | the schedule's floor |
 | `rand tx/block/head/status/peers/validators` | plain chain reads |
@@ -326,8 +333,7 @@ the same check before gossiping, so a bad transaction is refused once, at the ed
    tainted digest, which matches no plaintext.
 9. **Bundle proof** — `Machine::verify_public` against the genesis-pinned `hc_bundle` and the
    transaction's binding (`Transaction::binding`: a hash of the whole transaction with every proof
-   blanked, eight words the proof carries as its public input). A two-bundle transaction's fee and
-   asset bundles are both verified here, against the same words. This is what keeps a proof from
+   blanked, eight words the proof carries as its public input). This is what keeps a proof from
    being copied onto a changed transaction — another action, another envelope, another chain id,
    another companion bundle (`docs/confidential.md`, "Transaction binding").
 10. **Call proof and its tier fee** — the call's own STARK against the program's `code_hash`, then
@@ -425,8 +431,8 @@ witness leak in §6 — which is still the first follow-up.
 
 **S3 — the bridge, and private call inputs — has landed.** A bridged asset is a note whose `asset`
 word is the registry's index for it; `BridgeAttest` deposits one note that the *chain* computes from
-the amount the guardians signed; `BridgeBurn` is the chain's one two-bundle transaction (an asset
-bundle that burns, and a RAND bundle that pays for both). Call inputs have their own envelopes
+the amount the guardians signed; `BridgeBurn` burns the asset from one hidden-asset bundle
+(its slots 0–1) that also pays the RAND fee (slots 2–3); before chain 14 it carried two bundles. Call inputs have their own envelopes
 (spec §6.1), so a caller can disclose what a program ran on without publishing it. `docs/bridge.md`
 and `docs/confidential.md` are the references; a chain turns the bridge on with a `bridge` section in
 its genesis, which is a hard fork for the chains that take it and a no-op for the ones that do not.

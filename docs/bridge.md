@@ -29,8 +29,8 @@ storage/RPC/wallet surface built on them.
    release        │        ┌──────────────────┐   attestation      │                              │
    after guardian │        │ guardian committee│ ◄──────────────────┤                              │
    signatures on  │        │ secp256k1 keys,   │                    │ BridgeBurn transaction       │
-   the burn       │        │ rotated by the    │   guardians read   │   two bundles: one burns the │
-   message        │        │ governance emitter│   the burn log     │   asset, one pays the RAND │
+   the burn       │        │ rotated by the    │   guardians read   │   one bundle: slots 0–1 burn │
+   message        │        │ governance emitter│   the burn log     │   the asset, 2–3 pay the RAND│
                   └────────┤ (Rand, sole)      │ ◄──────────────────┤   fee. Appends a             │
                            └──────────────────┘   sequence          │   BridgeBurnRecord           │
                                                                     └──────────────────────────────┘
@@ -80,9 +80,10 @@ source of guardian-set rotations: `keccak256("rand-bridge-governance")`, pinned 
 that only a `GuardianSetUpgrade` payload may claim, and only as `(CHAIN_RAND, GOVERNANCE_EMITTER)`.
 
 **The redirect attack, and why it is closed (2026-09-19, Task 5b, chain 14).** A Rand transaction
-carries no signature: a burn is authorised by the STARK proofs of its two bundles, which show the
-burner held the notes. Until the transaction binding, those proofs committed only to each bundle's
-own digest (anchor, nullifiers, commitments, fee, burn, asset, time) — nothing tied them to the
+carries no signature: a burn is authorised by the STARK proof of its bundle (two bundles before
+chain 14's hidden-asset bundle), which shows the burner held the notes. Until the transaction
+binding, a proof committed only to its bundle's own digest (anchor, nullifiers, commitments, fee,
+burn fields, time) — nothing tied them to the
 `BridgeBurn` action around them. Anyone who saw a pending burn in gossip (a peer, a proposer) could
 copy it, keep both proofs byte for byte, swap `to` for their own address (or raise `relayer_fee`
 and relay it themselves, or name another backing's `(to_chain, token)`), and race it; whichever
@@ -320,15 +321,14 @@ the three staking actions:
 Action::BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, time: u32,
                        asset: u32, envelope: Envelope }
 
-Action::BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee: u64,
-                     to_chain: u16, to: [u8; 32] }
+Action::BridgeBurn { asset: u32, amount: u64, relayer_fee: u64, to_chain: u16,
+                     token: [u8; 32], to: [u8; 32] }
 ```
 
 Both are carried by an ordinary shielded transaction, and both pay their fee in RAND: an attest
 pays `BUNDLE_BASE` (one bundle) and nothing more, because its relayer is paying for a depositor who
 holds no RAND yet; a burn pays `BRIDGE_BURN_FEE` (0.01 RAND), the bridge's charge towards the
-validators' infrastructure, which also covers the base for its two bundles, out of the one bundle
-allowed a non-zero fee. On a chain without aggregation the whole fee is the block proposer's. See `docs/confidential.md`'s fee table.
+validators' infrastructure, which also covers the base of its one bundle. On a chain without aggregation the whole fee is the block proposer's. See `docs/confidential.md`'s fee table.
 
 ### Inbound: an attestation deposits a note
 
@@ -363,30 +363,27 @@ allowed a non-zero fee. On a chain without aggregation the whole fee is the bloc
 - **A guardian-set rotation deposits nothing**, consumes its digest, and binds neither `asset` nor
   the recipient.
 
-### Outbound: a burn is one transaction with two bundles
+### Outbound: a burn is one transaction with one bundle
 
 ```
 Transaction {
   chain_id,
-  bundle: <RAND bundle: asset 0, burn 0, fee = BRIDGE_BURN_FEE>,   // 0.01 RAND; covers both bundles
-  action: BridgeBurn {
-    asset_bundle: <bundle: asset = index, fee 0, burn = amount>,
-    asset, amount, relayer_fee, to_chain, to }
+  bundle: <hidden-asset bundle: slots 0–1 spend the token, slots 2–3 pay the RAND fee;
+           burn_asset = asset, burn_a = amount, burn_r = 0, fee >= BRIDGE_BURN_FEE>,
+  action: BridgeBurn { asset, amount, relayer_fee, to_chain, token, to }
 }
 ```
 
-A bundle balances one asset and the fee is always RAND — the bundle guest's own rule is that a
-non-RAND bundle's `fee` is zero — so a burn is the chain's only two-bundle transaction. The asset
-bundle proves in the zkVM that the burner owned notes of that asset summing to at least `amount`,
-with `burn` the value leaving the pool — exactly `amount`, because the wire format's `relayer_fee`
+Since the hidden-asset bundle (chain 14) a burn is one bundle: its private slots 0–1 prove in the
+zkVM that the burner owned notes of the asset summing to at least `amount`, with `burn_a` the value
+leaving the pool, and its RAND slots 2–3 pay the fee. `burn_a` is exactly `amount`, because the wire format's `relayer_fee`
 is a *portion* of the amount (`fee <= amount`), carved out on the destination chain by the release
 contract, which pays `amount - fee` to `to` and `fee` to the relayer and so releases `amount` in
 total. A pool that burned `amount + relayer_fee` would destroy more than the far side ever releases
-and strand the difference in the source-chain contract forever. Both bundles go through the *same*
-admission: four distinct unspent nullifiers, four new commitments (checked across the pair, not just
-within each), both digests recomputed, both STARK proofs verified — each against the transaction's
-binding, so neither bundle can be copied under a changed `to`, `relayer_fee`, `(to_chain, token)`
-or companion bundle (§1, "The redirect attack"). `apply_burn` records the outbound
+and strand the difference in the source-chain contract forever. The bundle goes through the
+ordinary admission: four distinct unspent nullifiers, four new commitments, the digest recomputed
+and the STARK proof verified against the transaction's binding, so it cannot be copied under a
+changed `to`, `relayer_fee` or `(to_chain, token)` (§1, "The redirect attack"). `apply_burn` records the outbound
 message with the **transaction hash** in the sender slot — a burn is funded by notes, so there is no
 sender identity — and the next `burn_sequence`; guardians read the burn log exactly as before.
 
@@ -399,23 +396,20 @@ sender identity — and the next `burn_sequence`; guardians read the burn log ex
    gets the caps every bundle gets (`tx.bundle` is only the fee bundle). A guardian set is at most
    255 keys by wire format, so anything past the cap is malformed by construction and must not buy
    verification work.
-2. The fee floor at step 3 already knows a burn has two bundles, so an underpaying burn is refused
-   on a comparison.
+2. The fee floor at step 3 (`BRIDGE_BURN_FEE`) refuses an underpaying burn on a comparison.
 3. At step 7 (the action step, **before** either bundle's proof at step 9):
    - `BridgeAttest`: `time` window → bridge present → `check_attest` (itself ordered cheap-first:
      decode, guardian-set resolution, the replay check against `spent` by digest `mu`, the payload
      decode, the emitter binding, the payload's field checks, and only then set expiry,
      index/quorum, low-s and one recovery per signature) → the `asset` comparison → the recipient
      hash → the deposit commitment against the tree and the fee bundle.
-   - `BridgeBurn`: `asset_bundle.asset == action.asset` → its `fee == 0` →
-     `burn == amount` → no nullifier or commitment shared with the fee bundle → the
-     asset bundle's own bundle checks → `check_burn` (registered asset, `to_chain` is the asset's
-     home chain, recipient shape, `relayer_fee <= amount`, `amount != 0`).
-4. At steps 8–9, both bundles' digests and proofs — the fee bundle's, then the asset bundle's —
-   each verified against the **same** transaction binding (`Transaction::binding`, computed once;
-   `docs/confidential.md`, "Transaction binding").
+   - `BridgeBurn`: `asset != 0` → `burn_asset == asset` → `burn_a == amount` → `burn_r == 0`
+     (`tokens::check_asset_burn`) → `check_burn` (a backing of the asset, recipient shape, release
+     unit, `relayer_fee <= amount`, the backing's `locked` covers `amount`).
+4. At steps 8–9, the bundle's digest and proof, verified against the transaction binding
+   (`Transaction::binding`; `docs/confidential.md`, "Transaction binding").
 
-`apply_tx` writes the fee bundle's notes and then runs the action, so `bridge_notes::apply` consumes
+`apply_tx` writes the bundle's four notes and then runs the action, so `bridge_notes::apply` consumes
 the `CheckedAttestation` that `validate` produced rather than verifying the guardian quorum a second
 time. A transaction that fails at either step leaves no state behind, because the caller applies to
 a scratch clone and keeps it only if the whole block succeeded.
@@ -488,9 +482,9 @@ signature work, because the envelope has to be sealed before the transaction exi
 (`crates/randprotocol-node/tests/cluster.rs`) runs the whole path across two validators on a bridged
 genesis: an attestation deposits a note only its recipient's viewing key opens (the relayer who paid
 for it holds nothing), both nodes register the token under index 1, the same attestation resubmitted
-is refused as already consumed, and a two-bundle burn leaves the change as a note and an identical
+is refused as already consumed, and a burn leaves the change as a note and an identical
 outbound message on both nodes. The unit level is `bridge/state.rs` (the bridge's own rules),
-`ledger/bridge_notes.rs` (the deposit note, the two-bundle burn, the `asset` and `time` bindings),
+`ledger/bridge_notes.rs` (the deposit note, the burn rule, the `asset` and `time` bindings),
 `mempool.rs` (racing relayers, stale indices) and `storage.rs` (the round trip).
 
 ## 7. Test vectors
@@ -587,7 +581,7 @@ For anyone holding an integration written against the pre-S1 bridge:
 | `amount: u128` | `amount: u64` (a note's field); anything larger is refused at attestation time |
 | the registry mapped `AssetId -> (chain, token)` | it maps `AssetId -> { chain, token, index }`, and the note carries the index |
 | the relayer fee was paid to the submitter | inbound it is carried and paid to nobody (the deposit is gross); outbound it is still a portion of `amount`, paid on the destination chain, and a burn destroys exactly `amount` |
-| `BridgeBurn` was one account-debiting transaction | it is two bundles in one transaction |
+| `BridgeBurn` was one account-debiting transaction | it is one hidden-asset bundle (two bundles before chain 14) |
 | `rand_getAssetBalance`, `bridge-status` | gone; `rand_getAssets` + a wallet-local `asset-balance` |
 | the bridge root committed balance leaves | it commits registry leaves with indices, plus `next_index` |
 

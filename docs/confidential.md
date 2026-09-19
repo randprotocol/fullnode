@@ -366,12 +366,12 @@ old chain. A fleet must run one build.
 
 **The hole it closes.** A transaction is `{chain_id, bundle, action}` and carries no signature;
 a bundle's STARK proof commits only to `Bundle::digest_input` — anchor, nullifiers, commitments,
-fee, burn, asset, time. Until this fix nothing tied a proved bundle to the *action* it rode with,
-nor to its own `envelopes`, nor to the other bundle of a two-bundle transaction. Anyone who saw a
+fee, the burn fields, time. Until this fix nothing tied a proved bundle to the *action* it rode
+with, nor to its own `envelopes` (nor, while two-bundle transactions existed, to the other bundle). Anyone who saw a
 transaction — a gossip peer, a proposer — could copy it, keep every proof byte for byte and change
 the rest: a `BridgeBurn`'s `to`, `relayer_fee` or `(to_chain, token)` (the source-chain release
 then pays the attacker), a `Bond`'s `validator` (the burned stake credited to someone else), a
-`TokenTransfer`'s memo, an attest's `r`/`time`/`envelope`, any bundle's envelopes (the recipient
+(then) `TokenTransfer`'s memo, an attest's `r`/`time`/`envelope`, any bundle's envelopes (the recipient
 can never open the note), or lift a bundle into a different transaction altogether. Whichever copy
 committed first spent the nullifiers. The ledger tests
 `a_burns_proofs_cannot_ride_a_changed_destination_fee_amount_or_asset`,
@@ -390,9 +390,9 @@ bundle proof is now made with, and verified against, its transaction's binding:
 binding(tx) = blake3("rand-tx-bind-1" || bincode(chain_id, bundle', action'))   as 8 LE u32 words
 ```
 
-where `'` means "every bundle proof byte string replaced by the empty vector": `bundle.proof`, an
-asset bundle's `proof` (`BridgeBurn`, `TokenTransfer`, `TokenBurn` — `Action::asset_bundle`), and
-`Aggregate.proof`. Everything else — envelopes, memo, destination, validator, recipient,
+where `'` means "every bundle proof byte string replaced by the empty vector": `bundle.proof` and
+`Aggregate.proof` (since the hidden-asset bundle no action carries a second bundle). Everything
+else — all four envelopes, every burn field, destination, validator, recipient,
 signatures, the guardian attestation, **and a `Call`'s proof** — is inside. The call proof is kept
 deliberately (fix round 1): a program is public and stateless, so anyone can prove their own run of
 it, and a call proof outside the binding could be swapped in under someone else's fee bundle — the
@@ -417,8 +417,7 @@ proof or not. `the_binding_encoding_is_pinned` holds a golden value.
 - `prove_bundle(profile, inputs, binding, backend)`: the wallet (`randprotocol-client`'s
   `wallet::prepare_bundles` → `prove_transaction`) builds the whole transaction first — witnesses,
   outputs, envelopes (sealed against the output notes, never the proof), the action — takes its
-  binding, then proves every bundle with it. A two-bundle transaction's two proofs carry the same
-  words. The bundle still lands at tier 14 (`tests/shielded.rs`, 101.9 s at the test profile,
+  binding, then proves its bundle with it. The bundle still lands at tier 14 (`tests/shielded.rs`, 101.9 s at the test profile,
   324 387 bytes).
 - `Transaction::hash` (the txid) is unchanged.
 

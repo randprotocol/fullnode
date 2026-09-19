@@ -2208,13 +2208,21 @@ mod tests {
         check(216, attest(vec![1; gas::MAX_ATTESTATION_BYTES], env()), Ok(()));
         check(220, attest(vec![1; gas::MAX_ATTESTATION_BYTES + 1], env()), Err(TxError::AttestationTooLarge));
 
-        // Every one of the bundle's four envelopes is capped — the dummy slots' too.
-        for slot in 0..4usize {
+        // Every one of the bundle's four envelopes is capped — the dummy slots' too: exactly at
+        // `MAX_ENVELOPE_BYTES` is accepted, one byte over is refused, in each slot.
+        let slot_tx = |slot: usize, body: usize| {
             let n = 240 + slot as u32;
             let mut b = bundle(&l, [[n; 8], [n + 10; 8]], [[n + 20; 8], [n + 30; 8]], gas::BUNDLE_BASE);
-            b.envelopes[slot] = fat(MAX_ENVELOPE_BYTES + 1);
-            let t = StubExecutor::bound(Transaction::shielded(7, b, Action::None));
-            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::EnvelopeTooLarge), "slot {slot}");
+            b.envelopes[slot] = fat(body);
+            StubExecutor::bound(Transaction::shielded(7, b, Action::None))
+        };
+        for slot in 0..4usize {
+            assert_eq!(l.validate(&slot_tx(slot, MAX_ENVELOPE_BYTES), &StubExecutor), Ok(()), "slot {slot} at the cap");
+            assert_eq!(
+                l.validate(&slot_tx(slot, MAX_ENVELOPE_BYTES + 1), &StubExecutor),
+                Err(TxError::EnvelopeTooLarge),
+                "slot {slot} one byte over"
+            );
         }
     }
 

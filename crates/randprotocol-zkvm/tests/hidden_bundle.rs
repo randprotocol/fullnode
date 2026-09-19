@@ -612,8 +612,10 @@ fn burn_asset_is_a_exactly_when_burn_a_is_nonzero() {
 
 /// The hard requirement, measured: a mixed transfer (four real inputs, the worst case) proves at
 /// tier 14 with the Production FRI profile the chain pins, publishes the host digest, and
-/// verifies only against its own transaction binding — not another transaction's, not under
-/// another guest's `hc`, and not through today's `bundle` entry point.
+/// verifies only against its own transaction binding — not another transaction's and not under
+/// another guest's `hc`. Since H3 the chain's `ConfidentialExecutor` entry points
+/// (`bundle_digest`, `bundle_proof_digest`, `verify_bundle`) *are* this guest's, so the proof is
+/// checked through them too, exactly as `Ledger::check_bundle_proof` calls them.
 #[test]
 fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding() {
     let c = mixed();
@@ -641,12 +643,20 @@ fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding
         "a proof bound to one transaction is refused for any other"
     );
     assert!(ex.verify_hidden_bundle(&ZkExecutor::hc_legacy_bundle(), &proof, &BINDING_A).is_err(), "another guest's hc");
-    // Today's bundle entry point pins today's input height (612 words), so the new guest's proof
-    // is refused there before any verifier key is built.
+    // The chain path (H3): the trait methods the ledger calls are the hidden guest's, against
+    // the genesis `hc_bundle` (which is this guest's digest).
     use randprotocol_core::confidential::ConfidentialExecutor;
+    assert_eq!(ZkExecutor::hc_bundle(), hc, "the chain pins the hidden guest");
+    let core = randprotocol_zkvm::address::digest_input_of(
+        di.anchor, di.nullifiers, di.commitments, di.fee, di.burn_a, di.burn_r, di.burn_asset, di.time,
+    );
+    assert_eq!(ex.bundle_digest(&core), digest, "the ledger recomputes the published digest");
+    assert_eq!(ex.bundle_proof_digest(&proof).unwrap(), digest);
+    assert_eq!(ex.verify_bundle(&ZkExecutor::hc_bundle(), &proof, &BINDING_A), Ok(()));
     assert_eq!(
-        ex.verify_bundle(&hc, &proof, &BINDING_A),
-        Err(ConfidentialError::InvalidProof("input height not the pinned guest's".into()))
+        ex.verify_bundle(&ZkExecutor::hc_bundle(), &proof, &BINDING_B),
+        Err(ConfidentialError::InvalidBundleProof("PublicValues".into())),
+        "and through the trait a proof bound to one transaction is refused for any other"
     );
     let decoded = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();
     assert_eq!(decoded.public_log_height, ZkExecutor::hidden_bundle_heights().2);
@@ -671,5 +681,10 @@ fn a_hidden_bundle_proved_against_the_empty_segment_is_refused() {
     assert_eq!(ex.hidden_bundle_proof_digest(&bytes), Err(refused.clone()));
     for binding in [BINDING_A, [0; 8]] {
         assert_eq!(ex.verify_hidden_bundle(&ZkExecutor::hc_hidden_bundle(), &bytes, &binding), Err(refused.clone()));
+        // …and through the trait the ledger calls (H3: the chain's bundle is this guest).
+        use randprotocol_core::confidential::ConfidentialExecutor;
+        assert_eq!(ex.verify_bundle(&ZkExecutor::hc_bundle(), &bytes, &binding), Err(refused.clone()));
     }
+    use randprotocol_core::confidential::ConfidentialExecutor;
+    assert_eq!(ex.bundle_proof_digest(&bytes), Err(refused));
 }

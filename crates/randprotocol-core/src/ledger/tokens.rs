@@ -2592,7 +2592,7 @@ mod action_tests {
         assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::UnsupportedAsset(asset)));
     }
 
-    /// The holder burn: the asset bundle destroys `amount`    /// The holder burn: the bundle's `burn_a` destroys `amount`, the token's public supply falls
+    /// The holder burn: the bundle's `burn_a` destroys `amount`, the token's public supply falls
     /// by exactly that, and the bundle's four nullifiers and four commitments are spent and
     /// appended as in a transfer. The RAND audit's `burned` does not move: a token is not RAND.
     #[test]
