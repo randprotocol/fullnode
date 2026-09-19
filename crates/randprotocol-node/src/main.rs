@@ -829,7 +829,9 @@ async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, int
             _ => FriProfile::Production,
         };
         let max_covers = agg["max_covers"].as_u64().unwrap_or(0) as usize;
-        let subsidy_base = agg["subsidy_base"].as_u64().unwrap_or(0);
+        // `subsidy_base` is a decimal string since node N-3 (2026-09-20); `amount_field` reads
+        // either encoding, so this daemon works against an older node too.
+        let subsidy_base = randprotocol_client::amount_field(&agg["subsidy_base"]).unwrap_or(0);
         let halving = agg["halving_blocks"].as_u64().unwrap_or(1).max(1);
         let n = agg["sealed_blocks"].as_u64().unwrap_or(0);
         let height = status["height"].as_u64().unwrap_or(0);

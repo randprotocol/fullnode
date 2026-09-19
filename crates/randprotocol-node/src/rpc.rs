@@ -143,6 +143,13 @@ pub struct NodeStatus {
     pub aggregation: AggregationStatus,
 }
 
+/// Serialize a `u64` amount as a decimal string, the one rule this RPC follows for every amount
+/// it serves (node I3 / N-3) — used where the field is a plain `u64` internally (so `Default`
+/// still zeroes it) but must render like every other amount.
+fn u64_as_decimal_string<S: serde::Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&v.to_string())
+}
+
 /// `rand_status`'s `aggregation` object (spec §8).
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct AggregationStatus {
@@ -159,7 +166,11 @@ pub struct AggregationStatus {
     pub max_covers: u32,
     /// The cover and pruning window, in blocks (genesis `window`).
     pub window: u64,
-    /// `subsidy(0)` in units (genesis `subsidy_base`).
+    /// `subsidy(0)` in units (genesis `subsidy_base`), serialized as a decimal string like every
+    /// other amount this RPC serves (node N-3, 2026-09-20) — it was the one amount left a JSON
+    /// number. Stored as `u64` so `#[derive(Default)]` still zeroes it on a chain without the
+    /// section.
+    #[serde(serialize_with = "u64_as_decimal_string")]
     pub subsidy_base: u64,
     /// The halving interval of the subsidy schedule, in sealed blocks.
     pub halving_blocks: u64,
