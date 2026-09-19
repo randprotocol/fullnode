@@ -95,12 +95,12 @@ transaction that looked different when there was no change would leak that there
 
 | | public on chain | hidden |
 |---|---|---|
-| **transfer** (`Action::None`) | anchor, both nullifiers, both commitments, fee, `burn = 0`, `asset = 0`, `time`, two envelope ciphertexts, the bundle proof | who sent it, who is paid, the amount, the change, which leaves were spent, whether an input was a dummy |
+| **transfer** (`Action::None`) | anchor, all four nullifiers, all four commitments, fee, `burn_a = burn_r = burn_asset = 0`, `time`, four envelope ciphertexts, the bundle proof | who sent it, who is paid, the amount, which asset (RAND or any RPL token), the change, which leaves were spent, which slots were dummies |
 | **Deploy** | everything above, plus `base_pc` and the program's words (so the program id and its code) | who deployed it, and what the paying notes were worth |
 | **Call** | everything a transfer publishes, plus the program id, the call proof, and the receipt's tier and eight output words | the private inputs, registers, memory, branches taken, the real cycle count (only the padded tier shows), who called it |
 | **Mint** (faucet) | the new note's commitment, its envelope, the **amount in the clear**, and the minting validator's public key (shown as its address) and signature | who the note is for — only the address holder can open the envelope; the address itself is never published |
 | **BridgeAttest** | the attestation (so the source chain, the token, the **amount**, the recipient's address hash and the guardian signatures), the recipient's shielded address, the deposit note's `asset` index, `r` and `time`, and the fee bundle | which notes paid the fee, and everything about the deposit note's later spend |
-| **BridgeBurn** | the asset index, the **amount**, the relayer fee and the destination chain and address, plus both bundles' public fields | which notes were burned, and who burned them |
+| **BridgeBurn** / **TokenBurn** | the asset index, the **amount**, the relayer fee and the destination chain and address (`BridgeBurn` only), and the one bundle's public fields (`burn_a`, `burn_asset` equal the amount and asset) | which notes were burned, and who burned them |
 
 A `Call`'s `input_envelope` is the one optional publication in that table: the call's private inputs,
 sealed so that the caller, a per-call key, or a named auditor can open them later
@@ -186,8 +186,11 @@ balance: 98.499 RAND
 
 Three things to know about spending:
 
-- **A bundle spends exactly two notes.** If a wallet's value is spread over three or more notes,
-  no amount of dust adds up to a third input slot — the wallet says
+- **Each of a bundle's two groups spends at most two notes.** A RAND payment (or a bond, a
+  deploy, a call) uses only slots 2–3, so it spends at most two RAND notes, as before chain 14. A
+  token transfer or burn spends up to two notes of the token in slots 0–1 *and* up to two RAND
+  notes in slots 2–3 for the fee. If either group's value is spread over three or more notes, no
+  amount of dust adds up to a third input slot in that group — the wallet says
   `need more than two notes; the largest two hold N units — consolidate first`. Consolidating is
   a `send` to your own address.
 - **`--no-wait`** returns as soon as the node accepts the bundle. The inputs are then marked
@@ -285,11 +288,17 @@ acceptance is not commitment, so poll `rand_getTransaction`.
 ```json
 ← {"height": 192, "index": 0, "block_hash": "63f6…08",
    "tx": {"hash": "4f2c…e7", "chain_id": 7,
-     "bundle": {"anchor": "6b1d…c4", "nullifiers": ["8c04…d1", "5e77…20"],
-                "commitments": ["2a9f…07", "b310…88"], "fee": 1000000, "burn": 0,
-                "asset": 0, "time": 5, "proof_len": 302857, "envelope_len": [1348, 1348]},
+     "bundle": {"anchor": "6b1d…c4",
+                "nullifiers": ["8c04…d1", "5e77…20", "03aa…6f", "e19b…42"],
+                "commitments": ["2a9f…07", "b310…88", "77c1…0e", "5d20…b3"],
+                "fee": 1000000, "burn_a": 0, "burn_r": 0, "burn_asset": 0, "time": 5,
+                "proof_len": 1431562, "envelope_len": [1380, 1380, 1380, 1380]},
      "action": {"kind": "none"}}}
 ```
+
+Since chain 14 the bundle always has four slots (dummies included) and no public `asset` field —
+slots 0–1 carry a private asset, slots 2–3 RAND, and a transfer of any RPL token is `"kind":
+"none"`, the same shape as a RAND payment (`docs/rpc.md`'s `rand_getTransaction`, `docs/tokens.md`).
 
 There is no `from`, no `to`, no `nonce` and no amount in that reply, and there is nothing in the
 stored block either — the node has nothing more to redact.
@@ -310,39 +319,42 @@ with the call), and a wrong key is indistinguishable from one that sealed nothin
 Cheap before expensive, in this exact order (`Ledger::validate_inner`, spec §7). The mempool runs
 the same check before gossiping, so a bad transaction is refused once, at the edge.
 
-1. **Size caps** — each envelope ≤ 2048 bytes, the bundle proof ≤ 2 MiB, a program ≤ 4096 words,
-   a call proof ≤ 2 MiB (`gas::MAX_PROOF_BYTES`, raised for constraint set 5's 80-query proofs,
-   re-measured and kept at constraint set 6).
+1. **Size caps** — the whole transaction ≤ `max_block_bytes`, each of the bundle's four envelopes
+   ≤ 2048 bytes, the bundle proof ≤ `max_proof_bytes` (2 MiB by default, `gas::MAX_PROOF_BYTES`),
+   a program ≤ `max_program_words`, a call proof ≤ `max_proof_bytes` too, and the same for a
+   `Mint`'s or an `Aggregate`'s envelope and an `Aggregate`'s own proof and wire size. The sealed
+   (pruned) marker form is refused here outside sealed-form sync (`PrunedFormOutsideSync`), before
+   any proof work.
 2. **Chain id** matches this chain.
 3. **Shape and fee floor** — a mint, an `Unbond` and a `Withdraw` carry no bundle and everything
-   else must; the transaction's own bundle is always RAND (`asset = 0`) and burns nothing
-   (`burn = 0`) unless the action is a `Bond`, whose bundle must burn exactly the bonded amount; a
-   `BridgeBurn`'s second bundle is the one bundle exempt from both (it is the bridged asset's, and
-   it burns); `fee ≥ fee_floor(action)` — zero for the three bundle-less actions, since they have
-   nothing to pay a fee *from*, and the bundle base twice for a burn, once per bundle a node has to
-   verify.
+   else must carry exactly one, the hidden-asset bundle (chain 14): `check_burn_shape` fixes which
+   of the bundle's three burn fields (`burn_a`/`burn_r`/`burn_asset`) the action may set — a
+   `TokenBurn` or `BridgeBurn` must burn its own `asset`/`amount` through `burn_a`/`burn_asset`, a
+   `Bond` or `RegisterAggregator` must burn its bonded amount through `burn_r`, and every other
+   action burns nothing; `fee ≥ fee_floor(action)` — zero for the bundle-less actions, since they
+   have nothing to pay a fee *from*.
 4. **Anchor** — the bundle's anchor is one of the last `ANCHOR_WINDOW = 256` *block-end* roots. A
    root the tree only passes through mid-block is never an anchor.
 5. **Time** — `time` is within `[height - 256, height]` (`TIME_WINDOW`).
-6. **Nullifiers and commitments** — the two nullifiers differ and neither is in the spent set;
-   the two commitments differ and neither is already a leaf.
+6. **Nullifiers and commitments** — all four nullifiers differ from each other and none is in the
+   spent set; all four commitments differ from each other and none is already a leaf.
 7. **Action checks** — faucet enabled, mint under the 100 RAND cap, minter is a validator and
    its signature verifies; program decodes (Deploy); program exists and the input envelope is
    within its own cap (Call); for the staking actions the rules of `docs/staking.md` — a
    registration present exactly when the validator is unknown, the register's nonce and the
    validator's signature, enough stake to unbond, enough released to withdraw, and the deposit note
-   a withdraw derives not already in the tree; and the bridge's own rules for the two bridge
-   actions, including a burn's asset bundle's cheap checks in full — all of it before either
-   bundle's proof, so a bridge transaction that cannot apply costs no verification
-   (`docs/bridge.md` §5).
+   a withdraw derives not already in the tree; the bridge's own rules for `BridgeAttest`/
+   `BridgeBurn` (`docs/bridge.md` §5) and for the pause/listing actions (`docs/bridge.md`'s v0.5
+   section); and RPL's rules for its four actions (`docs/tokens.md`) — all of it before the
+   bundle's proof, so a transaction that cannot apply costs no STARK verification.
 8. **Bundle digest** — the ledger recomputes the digest from the bundle's published plaintext and
    it must equal what the proof published. A proof whose witness broke the relation publishes a
    tainted digest, which matches no plaintext.
 9. **Bundle proof** — `Machine::verify_public` against the genesis-pinned `hc_bundle` and the
    transaction's binding (`Transaction::binding`: a hash of the whole transaction with every proof
    blanked, eight words the proof carries as its public input). This is what keeps a proof from
-   being copied onto a changed transaction — another action, another envelope, another chain id,
-   another companion bundle (`docs/confidential.md`, "Transaction binding").
+   being copied onto a changed transaction — another action, another envelope, another chain id
+   (`docs/confidential.md`, "Transaction binding").
 10. **Call proof and its tier fee** — the call's own STARK against the program's `code_hash`, then
     `fee ≥ BUNDLE_BASE + call_fee(tier)`, which is only knowable once the tier is.
 

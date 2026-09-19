@@ -519,20 +519,26 @@ is no `effect` field.
 | Deploy with a public input | as Deploy, counting the public words with the code words |
 | Call | 0.002 RAND at tier 10, plus 0.0001 RAND per two tiers above it (0.0025 at tier 20), plus 0.000001 RAND per KiB (or part) of call proof and input envelope past 2 097 152 + 18 432 bytes |
 | BridgeAttest | 0.001 RAND (the base alone) |
-| BridgeBurn | 0.01 RAND (`BRIDGE_BURN_FEE`) — the bridge fee; it covers the base for both of its bundles. A deposit (`BridgeAttest`) pays only the base: the depositor has no RAND yet |
+| BridgeBurn | 0.01 RAND (`BRIDGE_BURN_FEE`) — the base plus the bridge's charge, both out of the one bundle a burn carries. A deposit (`BridgeAttest`) pays only the base: the depositor has no RAND yet |
+| RPL `TokenBurn` | 0.001 RAND (the base alone) |
 | Mint (faucet) | free, and carries no bundle |
 
 Every floor above the mint's includes `BUNDLE_BASE`, because every one of those transactions
-carries a bundle. A `BridgeBurn` includes it *twice*: spec §7 item 3 charges the base per
-bundle, and a burn is the one transaction that carries two — the RAND fee bundle and the
-asset bundle inside the action — both of which every node verifies. The asset bundle's own
-`fee` must be zero, so the RAND bundle pays for both.
+carries a bundle. Since the hidden-asset bundle (spec §3.7 of
+`docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`) every action carries exactly
+**one**: a burn spends the token from that bundle's slots 0–1 (`burn_a`, `burn_asset`) and pays
+the RAND fee from slots 2–3 (`fee`) of the same proof — there is no longer a second, asset-only
+bundle. `BridgeBurn` pays `BRIDGE_BURN_FEE` because it is the one bridge transaction whose sender
+is sure to hold RAND; RPL's `TokenBurn` pays the plain base like any other one-bundle action.
 
 Anything above the minimum is a tip; all of it is credited to the block proposer's `rewards` in
 the validator register, which phase S2's `Withdraw` turns back into a note. Blocks hold at most
-4 MiB of transactions on a chain without `max_block_bytes` (20 MiB on chain 13), and at constraint set 5's 80 queries a bundle proof is ~1.3 MB, so **three**
-shielded transactions per block (it was roughly a dozen at 27 queries; `docs/block-space.md`). Constants live in `randprotocol_core::gas`; `rand fee bundle|deploy <words> [--public-words M]|call <tier> [--bytes B]`
-asks the node.
+4 MiB of transactions on a chain without `max_block_bytes` (20 MiB on chain 13), and the
+hidden-asset bundle's proof is ~1.43 MB at the 80-query production profile (`docs/rpc.md`'s "The
+transaction on the wire"), so **two** shielded transactions per block at that default (it was
+three at the two-bundle shape's ~1.3 MB, and roughly a dozen at constraint set 3's 27 queries;
+`docs/block-space.md`). Constants live in `randprotocol_core::gas`; `rand fee bundle|deploy <words>
+[--public-words M]|call <tier> [--bytes B]` asks the node.
 
 ## Privacy
 
@@ -699,10 +705,15 @@ Writing, building and deploying a guest step by step (Rust, C, or a hand-built i
 [`guests.md`](guests.md). Deploying translated Solana and Ethereum programs is in
 [`translators.md`](translators.md).
 
-## The hidden-asset bundle guest: soundness (v0.5, not yet on chain)
+## The hidden-asset bundle guest: soundness (v0.5, chain 14's bundle guest)
 
 `guests::bundle_hidden()` (spec `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`)
-is the four-slot shielded transfer whose asset `A` is private. It enforces each check of spec §3.3
+is the four-slot shielded transfer whose asset `A` is private, and it is the only bundle guest
+chain 14 pins: `ZkExecutor::bundle_program()` returns `hidden_bundle_program()`, and
+`genesis.hc_bundle` commits to its `hc`. The two-bundle shape (a separate RAND fee bundle and
+asset bundle) and the old `bundle()` guest are gone from the chain path — `bundle()` survives in
+`guests.rs` only as `ZkExecutor::legacy_bundle_program()`, which no chain pins, kept for the tests
+that still compare against it. It enforces each check of spec §3.3
 in one of two ways. **Structural** means the guest supplies the value itself, so a prover cannot
 choose it. **Taint** means the check ORs a 0/1 failure bit into `BAD` (x9). `BAD` is the last word
 of the published digest, and the ledger recomputes the digest with `bad = 0`, so a tainted proof

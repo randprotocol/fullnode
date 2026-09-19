@@ -100,7 +100,12 @@ in the mempool, and gossips it. Errors come back as code `-32000` with the reaso
 consumed`, `the attestation names a different recipient`, `the attestation deposits under asset 2,
 and the transaction names 1`, `the bundle burns 399, not the 400 the action declares`, and for a
 bundle carrying a burn its action may not carry, `the bundle burns asset 2 on an action that burns
-no token` or `a burn of 5 is not allowed on this action`.
+no token` or `a burn of 5 is not allowed on this action`. A sealed (pruned) bundle's marker-form
+proof submitted outside sealed-form sync — gossip, RPC, a proposer's trial-apply — is refused
+`PrunedFormOutsideSync`, and, deliberately, **not** cached as a permanent verdict: the marker form
+hashes to the raw transaction's own id (M1), so caching that refusal under the shared hash would
+let a fast gossip peer censor the honest transaction network-wide (`docs/confidential.md`,
+"Transaction binding").
 
 Acceptance is not commitment: poll `rand_getTransaction` until it returns a block.
 
@@ -602,11 +607,13 @@ Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false 
   "pause_key": "…",                      // B1: the one Dilithium2 key that may pause minting, hex
   "registration_fee": 1000000000,        // B4: what a RegisterBridgedToken owes past the bundle base
   "burn_sequence": 1,                    // outbound messages emitted so far
-  "next_index": 2,                       // the note index the next newly registered asset gets
   "assets": [ …the rows of `rand_getAssets`… ]
 }
 ```
-No balances: bridged value is notes, not accounts.
+No balances: bridged value is notes, not accounts. **No `next_index` any more** (RPL, B4): a
+bridged token is listed — under an index the registration already fixed — before it can ever be
+deposited, so there is no index left to predict; a wallet reads a listed token's index off
+`assets` (`rand_getAssets`) or `rand_getTokens`.
 
 ### `rand_getAssets`
 Params: `[]`. Result: the bridge's asset registry, ascending by index (which is registration
@@ -1146,7 +1153,10 @@ What changed for clients, in one place. Newest first.
   `nonce`, `pq_signers`), owing the base. The quorum signs `M_register` / `M_list` (fixed
   big-endian layouts, `docs/superpowers/specs/2026-09-19-bridge-hardening-design.md` §9) at the
   bridge's `list_nonce`, which both bump.
-- `rand_getBridgeState` gains `registration_fee`.
+- `rand_getBridgeState` gains `registration_fee` and **drops `next_index`**: a bridged token is
+  listed (under an index its registration already fixed) before it can ever be deposited, so there
+  is no index left to predict. A wallet or an explorer reads a listed token's index off `assets`
+  (`rand_getAssets`) or `rand_getTokens` instead.
 - New refusals, none cached: `wrong list nonce` (`BadListNonce`), `chain N has no registered
   emitter` (`NoEmitter`), and the registry's own (`BackingTaken`, `AlreadyRegistered`,
   `TooManyBackings`, `BadBackingDecimals`, `RegistrationFeeTooLow`, …) under `bridge: `.
