@@ -490,7 +490,7 @@ impl Storage {
 
     /// Write a whole bridge state — the `meta` blob and every row of the two families — into
     /// `batch`. Used where the state is installed wholesale (genesis, truncation); `commit`
-    /// writes only what a block touched.
+    /// writes the meta on every commit and adds the digest and burn rows its blocks produced.
     fn put_bridge(&self, batch: &mut WriteBatch, bridge: &BridgeState) -> Result<()> {
         batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE, bincode::serialize(&bridge.meta())?);
         for digest in &bridge.spent {
@@ -1332,8 +1332,10 @@ impl Storage {
         let mut expected_height = first_height;
         let mut expected_parent = head.hash;
         let mut next_index = self.notes_count()?;
-        // Register rows this commit must rewrite: the proposers and every validator an action
-        // named.
+        // The validators this commit's blocks name — their proposers, and every validator an
+        // action names. Not the set of rows to write (that is the diff below), only the set that
+        // *must* be in the register at all: a block naming a validator the register does not hold
+        // is a corrupt commit.
         let mut touched: BTreeSet<Address> = BTreeSet::new();
         // The bridge rows these blocks add. Digests are read off the transactions rather than
         // diffed against the previous state, so a commit stays O(block); the burn log is a
@@ -1521,30 +1523,34 @@ impl Storage {
                 ledger_after.next_index()
             )));
         }
-        // A proposer's entry changes because it collects the block's fees; since phase S2 a
-        // staking action changes the entry it names, and a registration adds one that was not
-        // there at all. `touched` is both.
+        // The register, written by difference against what is already on disk.
+        //
+        // The rows a block *names* are not the rows that move: on an aggregating chain the
+        // end-of-block sweep (`Ledger::close_block` → `sweep_expired_excesses`) credits an
+        // expired excess to the proposer that *included* the bundle — neither this block's
+        // proposer nor named by any action — and `rewards` feeds the validators root, so a node
+        // that missed it would fork at the state root after a restart. Writing the register whole
+        // fixed that and bought a write amplification in its place: the register is **not**
+        // bounded — `MAX_VALIDATORS` caps the active set, not the number of addresses that have
+        // ever bonded, and nothing ever removes an entry — so every block rewrote a row per
+        // address the chain has ever seen.
+        //
+        // The diff is against the *stored* register, read once here (before this batch is
+        // written), so it cannot miss a mover whatever produced it — and a row that disagrees
+        // with the ledger for any other reason is repaired in the same pass.
+        let stored = self.register()?;
         for addr in &touched {
-            match ledger_after.validators().get(addr) {
-                Some(entry) => batch.put_cf(self.cf(CF_VALIDATORS), addr.as_bytes(), bincode::serialize(entry)?),
-                // A proposer must be in the register (`apply_block` rejects a block otherwise);
-                // an action's target may not be, if the transaction was refused — but a refused
-                // transaction is not in a committed block either.
-                None => {
-                    return Err(StorageError::Corrupt(format!(
-                        "committed block touches validator {addr}, which is not in the register"
-                    )))
-                }
+            // A proposer must be in the register (`apply_block` rejects a block otherwise); an
+            // action's target may not be, if the transaction was refused — but a refused
+            // transaction is not in a committed block either.
+            if !ledger_after.validators().contains_key(addr) {
+                return Err(StorageError::Corrupt(format!(
+                    "committed block touches validator {addr}, which is not in the register"
+                )));
             }
         }
-        // And every other entry, whatever the blocks name. On an aggregating chain the end-of-
-        // block sweep (`Ledger::close_block` → `sweep_expired_excesses`) credits an expired excess
-        // to the proposer that *included* the bundle — a validator neither this block's proposer
-        // nor named by any action — and `rewards` feeds the validators root. Deriving the rows
-        // to write from the blocks is what missed it; the register is bounded (`MAX_VALIDATORS`
-        // plus what fell below the minimum) and nothing removes an entry, so it is written whole.
         for (addr, entry) in ledger_after.validators() {
-            if !touched.contains(addr) {
+            if stored.get(addr) != Some(entry) {
                 batch.put_cf(self.cf(CF_VALIDATORS), addr.as_bytes(), bincode::serialize(entry)?);
             }
         }
@@ -3022,6 +3028,54 @@ mod tests {
         let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
         assert_eq!(reloaded.state_root(), ledger.state_root());
         assert_eq!(reloaded, ledger);
+    }
+
+    /// The register is written by *difference*, not wholesale: a block rewrites the rows whose
+    /// entry actually moved (its proposer, once it collects a fee, and whatever its actions
+    /// touched) and leaves every other row alone. The register is not bounded — `MAX_VALIDATORS`
+    /// caps the active set, not the number of addresses that have ever bonded — so writing it
+    /// whole on every block was a write amplification that grew with the chain's history.
+    ///
+    /// Measured on the column family's own memtable counter, which counts every key written into
+    /// it, overwrites included.
+    #[test]
+    fn a_commit_rewrites_only_the_register_rows_that_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1), &key(2), &key(3)], vec![], 1_000);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let written = || {
+            s.db.property_int_value_cf(s.cf(CF_VALIDATORS), "rocksdb.num-entries-active-mem-table")
+                .unwrap()
+                .expect("the counter is available")
+        };
+
+        // A block with a fee: its proposer's `rewards` move, and nobody else's row does.
+        let before = written();
+        let tx = bundle_tx(&ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], randprotocol_core::gas::BUNDLE_BASE);
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(written() - before, 1, "one row moved, one row written");
+        assert_eq!(s.register().unwrap(), *ledger.validators(), "and the register is the ledger's");
+
+        // An empty block by another validator: its proposer collects nothing, so no row moves at
+        // all and the commit writes none.
+        let before = written();
+        let b2 = make_block(&b1.block, &mut ledger, vec![], &key(2));
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(written() - before, 0, "nothing moved, nothing written");
+        assert_eq!(s.register().unwrap(), *ledger.validators());
+
+        // And the diff is against what is *stored*, not against what this batch names: a row that
+        // disagrees with the ledger is rewritten even though no block touches it.
+        let stale = ValidatorEntry { rewards: 99, ..ledger.validators()[&key(3).address()].clone() };
+        let mut batch = WriteBatch::default();
+        batch.put_cf(s.cf(CF_VALIDATORS), key(3).address().as_bytes(), bincode::serialize(&stale).unwrap());
+        s.db.write_opt(batch, &sync_opts()).unwrap();
+        let b3 = make_block(&b2.block, &mut ledger, vec![], &key(3));
+        s.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.register().unwrap(), *ledger.validators(), "the stale row is back in step");
     }
 
     /// Every bundle creates **four** notes — its four output slots, dummies included — and the
