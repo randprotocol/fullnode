@@ -788,6 +788,33 @@ schedule (`gas::subsidy`, the 2026-09-15 changelog entry below); it is `null` on
 genesis carries no `aggregation` section, which chain 12 does not. `faucet` mirrors `rand_status`'s
 field of the same name.
 
+### `rand_getReceiverInfo`
+Params: `[]`. Result:
+```json
+{ "enabled": true, "max_per_block": 64, "count": 1024, "k_min": 256, "bits": 2 }
+```
+The receiver registry behind short addresses (`docs/superpowers/specs/2026-09-19-short-address-s3-design.md`).
+`enabled` is whether the genesis has a `receivers` section; `bits` is the bucket width every thin
+wallet uses at this size, `clamp(floor(log2(count / k_min)), 0, 24)` (spec W-4), so all of them ask
+for buckets of the same shape.
+
+### `rand_getReceivers`
+Params: `[from_seq, limit?]` (`limit` defaults to and is capped at 512). Result:
+```json
+{ "records": [ { "seq": 0, "height": 0, "id": "<hex32>", "pk": "<hex32>", "kem_ek": "<hex1184>" } ],
+  "next_seq": 1, "count": 1024 }
+```
+The registry in registration order: what a full-sync wallet streams and resolves against locally.
+
+### `rand_getReceiverBucket`
+Params: `[prefix_hex, bits]`, `0 ≤ bits ≤ 24`, `prefix_hex` exactly `ceil(bits / 8)` bytes with the
+unused low bits zero. Result: `{ "bits", "prefix", "records": [ … as above, without height … ] }`.
+Every record whose id starts with those bits; `-32602` *"increase bits"* past 4 096 records.
+
+There is deliberately **no lookup by id**. Asking a node for one id tells it who is about to be
+paid; a wallet fetches the registry or a bucket of at least 256 records and finds the id itself,
+then re-hashes the record it found and compares it with the id before paying (spec W-5, W-7).
+
 ## Subscriptions (WebSocket)
 
 The same port also speaks WebSocket: `ws://127.0.0.1:8545/` or `ws://127.0.0.1:8545/ws`, either
@@ -998,6 +1025,23 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-19 — short addresses (branch `feat/harm-addresses`, not on any chain yet)
+
+A hard fork where it is enabled (a genesis `receivers` section); a chain without the section is
+byte-for-byte chain 13.
+
+- **Address text.** Addresses print in the Bech32m direct form, `trnd1q…` (1,964 characters; `rnd1q…`
+  on a main network), with a checksum, a network prefix and a 4-byte inner check. The short form
+  `trnd1s…` (64 characters) carries the 32-byte receiver id — the same bytes as a bridge
+  deposit's `to`. Every method taking an address accepts the direct and the legacy `rand1…` forms;
+  a short address is refused (*"this is a short address; it names a receiver id and needs
+  resolving before it can be paid"*), because resolving it on the node would tell the node who is
+  paid.
+- **`Action::RegisterReceiver { pk, kem_ek }`** (new last variant), riding a bundle with a floor
+  of 0.0314 RAND. `rand_getTransaction` reports it as `register_receiver` with the id and the short
+  form.
+- **Three methods**: `rand_getReceiverInfo`, `rand_getReceivers`, `rand_getReceiverBucket`.
 
 ### 2026-09-19 — audit v3: the faucet mint's opening, a witness-build cap
 

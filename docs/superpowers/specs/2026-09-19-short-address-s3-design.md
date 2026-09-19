@@ -1,8 +1,10 @@
 # Short addresses: dual-format text and a self-certifying receiver registry (S3)
 
 - **Status:** draft for review. Not approved. Nothing in it is implemented.
-- **Baseline:** fullnode `main` at `a941774` (v0.4, chain 13). File and line references are to
-  that revision.
+- **Baseline:** fullnode `main` at `a941774` (v0.4, chain 13), rebased to `cba5fef`. File
+  references name the function; line numbers are left out because they move.
+- **Implementation:** branch `feat/harm-addresses`; §20 records where the code differs from this
+  text.
 - **Source:** *The S3 address scheme (slimmed HARM), design specification draft 0.1* (Anish
   Mohammed, Dendi Suhubdy, 18 September 2026), written against chain 12 (`c0ffc74`), and the
   *HARM evaluation* it implements. This document restates that design against the current tree
@@ -70,7 +72,7 @@ reverted, stated as requirements. Every later section traces to one of them.
 | Term | Meaning |
 |------|---------|
 | Record | The 1,216 bytes `pk || kem_ek`. `pk` is eight u32 words, little-endian, four canonical Goldilocks elements |
-| Receiver id (`id`) | `BLAKE3("rand-shielded-recipient" || pk || kem_ek)`, 32 bytes. Byte-identical to `ShieldedAddress::recipient_hash` (`notes.rs:164`, via `Hash::digest_domain`, `crypto.rs:46`) |
+| Receiver id (`id`) | `BLAKE3("rand-shielded-recipient" || pk || kem_ek)`, 32 bytes. Byte-identical to `ShieldedAddress::recipient_hash` (`notes.rs`, via `Hash::digest_domain`, `crypto.rs`) |
 | Direct address | The type-`q` text form carrying the record |
 | Short address | The type-`s` text form carrying the id |
 | Legacy address | Today's `rand1` + base58(`pk || kem_ek`) |
@@ -103,7 +105,7 @@ type    = "q" (value 0, direct) / "s" (value 16, short); all other values reserv
 - **F-3** A decoder MUST reject a reserved type value, non-zero padding bits, and a payload whose
   length is not exactly the one defined for its type.
 - **F-4** A decoder MUST check the input length before any decoding: at most 2,000 characters,
-  matching `MAX_ADDRESS_CHARS` (`crates/randprotocol-node/src/rpc.rs:46`).
+  matching `MAX_ADDRESS_CHARS` (`crates/randprotocol-node/src/rpc.rs`).
 - **F-4a** The direct form is longer than Bech32m's 1,023-character code length. The
   implementation MUST use a checksum definition that accepts it (a custom checksum type with a
   2,000-character bound, as ZIP-316 implementations do). Whether the `bech32` crate's stock
@@ -181,7 +183,7 @@ id = BLAKE3( "rand-shielded-recipient" || pk_bytes || kem_ek )
 
 The existing `Hash::digest_domain` construction and domain string, so a wallet's id is the 32
 bytes its bridge deposits already name (`BridgeAttest`'s `to` field, checked at
-`ledger/bridge_notes.rs:107`). One identifier serves the short address, the registry key and the
+`ledger/bridge_notes.rs`). One identifier serves the short address, the registry key and the
 bridge recipient.
 
 | Property | Strength | Why it is enough |
@@ -220,7 +222,7 @@ lines, BLAKE3 only) so the consensus-critical layout is pinned in this repositor
 
 | Location | Holds | Size |
 |----------|-------|------|
-| `Ledger` (cloned per candidate block, `hotstuff.rs:579`) | `receivers_root: Hash`, `receivers_count: u64`, and the branch's pending set (§6.5) | 40 bytes plus 32 bytes per uncommitted registration |
+| `Ledger` (cloned per candidate block, `hotstuff.rs`) | `receivers_root: Hash`, `receivers_count: u64`, and the branch's pending set (§6.5) | 40 bytes plus 32 bytes per uncommitted registration |
 | Node store (RocksDB, never cloned) | `receivers: id -> (seq, height, pk, kem_ek)`; `receivers_by_seq: seq -> id`; `receivers_smt`: tree nodes | ~1.3 KB per record plus tree nodes |
 | State root | `receivers_root` as an appended component (§6.6) | — |
 
@@ -231,7 +233,7 @@ NOT repeat that pattern.
 ### 6.4 The proof source and why the store is not trusted
 
 The ledger stays pure. It obtains proofs through a callback in the pattern of `CoveredSource`
-(`hotstuff.rs:44`):
+(`hotstuff.rs`):
 
 ```rust
 pub trait ReceiverSource: Send + Sync {
@@ -257,7 +259,7 @@ to produce a valid proof, in which case that node refuses the block and recovers
 
 *Not in draft 0.1; added after checking it against `hotstuff.rs`.*
 
-`HotStuff::on_proposal` applies every block to its parent's `ledger_after` (`hotstuff.rs:579`),
+`HotStuff::on_proposal` applies every block to its parent's `ledger_after` (`hotstuff.rs`),
 and a block commits only after three consecutive-view QCs, so two or three uncommitted ancestors
 are normally in flight. The store holds committed state only. If block N registers an id and
 block N+1 registers another, N+1's proof must be valid against the root after N — a root the
@@ -278,8 +280,8 @@ leave every node unable to produce the proof, and the chain would stall.
   wrong produces a proof that fails, never a wrong acceptance.
 - **C-16** A candidate id that is in `pending` is `ReceiverExists` without asking the store.
 - **C-17** Every replica construction MUST register the receiver source: startup, `HotStuff::
-  resume` (`hotstuff.rs:117`), `resume_consensus` (`node.rs:165`) and `apply_synced`
-  (`node.rs:1736`). This is the trap `CoveredSource` fell into (a synced node failed every
+  resume` (`hotstuff.rs`), `resume_consensus` (`node.rs`) and `apply_synced`
+  (`node.rs`). This is the trap `CoveredSource` fell into (a synced node failed every
   aggregate block because `resume` built a replica without it); a replica with no source MUST
   refuse a registration-carrying block with a named error, not panic.
 - **C-18** `receivers_pending` does not enter the state root. It is derivable from the blocks
@@ -289,7 +291,7 @@ leave every node unable to produce the proof, and the chain would stall.
 
 Today the state root is BLAKE3 under `rand-state-2` over four components with the bridge root
 appended when present, and under `rand-state-3` with the aggregators root appended when that
-section is present (`ledger/mod.rs:1592`). Presence is inferred from length, which does not
+section is present (`ledger/mod.rs`). Presence is inferred from length, which does not
 extend to a third optional component. From Phase B:
 
 ```
@@ -313,7 +315,7 @@ It rides a bundle, like `Deploy` and `Bond`; the bundle pays the fee.
 
 ### 7.2 Validation, cheap before expensive
 
-In `validate_inner`'s existing order (`ledger/mod.rs:862`). The same checks run at mempool
+In `validate_inner`'s existing order (`ledger/mod.rs`). The same checks run at mempool
 admission, at propose and at apply.
 
 | Step | Check | Error |
@@ -338,7 +340,7 @@ admission, at propose and at apply.
 - **C-8** Steps 1–6 are block-validity rules. A block containing a `RegisterReceiver` that fails
   any of them MUST be rejected by every replica. The mempool applies them only as a pre-filter.
 - **C-9** `propose` and `apply_block_with_covered` MUST reach the post-state through one
-  function, in the manner of `Ledger::close_block` (`ledger/mod.rs:1357`). There MUST NOT be a
+  function, in the manner of `Ledger::close_block` (`ledger/mod.rs`). There MUST NOT be a
   second implementation of any registry step.
 
 C-8 and C-9 are the two defects of the first aggregation release stated as rules: a coverage rule
@@ -353,7 +355,7 @@ register_per_byte           = 25,000 units (= DEPLOY_PER_WORD / 4, the existing 
                             = 1,000,000 + 30,400,000 = 31,400,000 units = 0.0314 RAND
 ```
 
-`BUNDLE_BASE` and `DEPLOY_PER_WORD` are `crates/randprotocol-core/src/gas.rs:87–88`. The registry
+`BUNDLE_BASE` and `DEPLOY_PER_WORD` are `crates/randprotocol-core/src/gas.rs`. The registry
 is permanent state on every validator, so growth must cost something. `register_per_byte` is a
 genesis parameter.
 
@@ -563,7 +565,7 @@ each envelope rests on ML-KEM's anonymity under chosen-ciphertext attack — pro
 construction in the QROM (Grubbs, Maram and Paterson, EUROCRYPT 2022; Xagawa, EUROCRYPT 2022).
 
 This assumption is already load-bearing today for some wallets: validator payout `kem_ek`s are
-public chain state (the validator leaf, `ledger/mod.rs:1561`). The registry widens it to every
+public chain state (the validator leaf, `ledger/mod.rs`). The registry widens it to every
 registered wallet. The whitepaper's privacy section SHOULD state it and cite it, and the
 implementation MUST keep using the FIPS 203 variant those results cover (implicit rejection).
 
@@ -634,7 +636,7 @@ a new address regardless.
 
 1. **§6.5 added (the pending set, C-13–C-18).** Draft 0.1's C-1 overlay covered earlier
    registrations in the same block only. Blocks apply on uncommitted parents
-   (`hotstuff.rs:579`), and the store holds committed state, so without the pending set any two
+   (`hotstuff.rs`), and the store holds committed state, so without the pending set any two
    registrations in consecutive blocks stall the chain.
 2. **C-17, C-19 added**: register the source on every replica construction, and set and restore
    the genesis gate — the `CoveredSource` and aggregation-section traps, stated as rules.
@@ -674,7 +676,7 @@ a new address regardless.
 | Id domain | `rand-shielded-recipient` (existing) | Consensus |
 | Leaf / node domains | `rand-receiver-leaf-2` / `rand-receiver-node-1` | Consensus |
 | State root domain | `rand-state-5` with a flags byte | Consensus |
-| `register_per_byte` | 25,000 units (genesis) | Consensus |
+| `register_per_byte` | 25,000 units (`gas::REGISTER_PER_BYTE`; §20 item 3) | Consensus |
 | `max_per_block` | 64 (genesis) | Consensus |
 | `K_MIN` | 256 | Wallet |
 | Maximum `bits` | 24 | Wallet and node |
@@ -682,6 +684,37 @@ a new address regardless.
 | `rand_getReceivers` page cap | 512 | Node |
 | `MAX_ADDRESS_CHARS` | 2,000 (existing) | Node |
 | Self-registration delay | uniform in 16–256 blocks | Wallet |
+
+## 20. Implementation notes (`feat/harm-addresses`)
+
+What the code does where this text left room, or where it differs:
+
+1. **The source is asked by count, not by root.** `ReceiverSource::lookup(count, pending, id)`
+   answers over *the records with seq below `count`*: the store's committed records cut at
+   `count`, plus the `pending` entries at or above what the store holds. So one committed store
+   answers for the tip, a speculative block above it, and an old ledger being replayed by
+   `verify_chain`, without keeping per-branch state. It returns `Absent(proof)` or
+   `Present { seq, proof }`, and the ledger verifies either against its own root — a store that
+   falsely claims "present" is a refusal, not a false `ReceiverExists`.
+2. **The per-block cap is a transaction-level check** (`TxError::Receiver(TooManyInBlock)`), counted
+   on the ledger and reset by `close_block`. Because it lives in `apply_tx`, the proposer's
+   trial apply skips the 65th registration and a replica refuses a block carrying one at its
+   index — C-8 and C-9 by construction, with no `BlockError` variant.
+3. **`register_per_byte` is `gas::REGISTER_PER_BYTE`, not a genesis field**: `gas::fee_floor`
+   takes only the action. The genesis section carries `max_per_block` and the records.
+4. **Genesis records** are `{ "pk": hex32, "kem_ek": hex1184 }`; `rand-node genesis --receiver
+   <address>` takes addresses and turns the section on, as does `--receivers`.
+5. **Proofs are recomputed from the index** (`receivers::prove`, O(records × 256) hashes at worst),
+   with no stored interior nodes. The proof format does not change when a node store is added.
+6. **The network** is `address::Network::current()`: `trnd` unless `RAND_NETWORK=main|dev`.
+7. **W-4 at a million records is 11 bits** (`floor(log2(1e6 / 256))`), about 490 records per bucket;
+   §9.2's "about 1,000 at 12 bits" is off by one bit.
+8. **Not implemented yet:** M-1 (a mempool claim on the id — a second pooled registration of one id
+   is refused at propose and apply through the pending set, but stays pooled until the pool drops
+   it); `rand_getCompactBlocks`' `receiver` field (full-sync wallets stream `rand_getReceivers`);
+   W-12's random delay (the CLI warns instead); `--rpc-receiver-lookup` (no exact lookup exists at
+   all, which N-3 allows); the explorer, website and `wallet-core` changes of Phase A, which live
+   in other repositories.
 
 ## Appendix A. Pseudocode
 
