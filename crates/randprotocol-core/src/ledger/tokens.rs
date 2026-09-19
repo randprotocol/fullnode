@@ -1407,6 +1407,57 @@ mod tests {
         assert_ne!(r.root(), listed, "the state root moves when a backing's locked moves");
     }
 
+    /// One fixed registry, one pinned leaf hash per token and one pinned root (core M-3). The
+    /// twin of `bridge::state`'s `root_is_pinned_for_a_fixed_state`, and it exists for the same
+    /// reason: a `rand-token-leaf-1` leaf is `bincode(TokenInfo)`, so reordering two fields,
+    /// widening one, or adding a `#[serde]` attribute changes every leaf — silently, since the
+    /// only other coverage is `assert_ne!` movement tests, which stay green through any such
+    /// change. These hexes are consensus: two nodes that disagree about them disagree about the
+    /// state root from the block the registry is first written in.
+    ///
+    /// Regenerate deliberately, and only with a chain cut. The registry is built from byte
+    /// patterns rather than a generated keypair so the vector depends on nothing but the
+    /// serialization: `PublicKey` is a plain byte vector on the wire.
+    #[test]
+    fn the_token_leaf_and_registry_root_are_pinned_for_a_fixed_registry() {
+        let mut r = TokenRegistry::new(1_000_000_000).with_mint_cap(100_000 * 100_000_000);
+        // A `Key` token: index 1, a nonce and a supply moved off zero.
+        let key = PublicKey::from_bytes(&[0x33; crate::crypto::PUBLIC_KEY_LEN]).unwrap();
+        r.register(id(1), "Test Coin".into(), "TST".into(), 6, MintAuthority::Key(key), 11).unwrap();
+        r.add_supply(1, 1_234_567).unwrap();
+        r.bump_nonce(1);
+        // A `Bridge` token: index 2, two backings, the first of them locked and minted against
+        // on a non-zero day — the counters B1 added, which are inside the leaf.
+        let (c2, t2) = (2u16, [0xaa; 32]);
+        let (c3, t3) = (3u16, [0xbb; 32]);
+        r.register(id(2), "Rand USD".into(), "zUSD".into(), BRIDGE_DECIMALS, bridge(&[(c2, t2), (c3, t3)]), 12).unwrap();
+        r.lock(2, c2, &t2, 500_000, 20_231).unwrap();
+
+        let leaf = |index: u32| {
+            let bytes = bincode::serialize(r.get(index).expect("registered")).expect("TokenInfo serializes");
+            Hash::digest_domain(b"rand-token-leaf-1", &bytes).to_hex()
+        };
+        assert_eq!(leaf(1), "68f28cb7151d025f6ff2218b14371435904d49e4a1ab6d3ee7661a4e9e6d4884", "the Key token's leaf");
+        assert_eq!(leaf(2), "743e65d35660a562b7964e7323b188cbce160d01976652e78347663eedab0473", "the Bridge token's leaf");
+        assert_eq!(r.root().to_hex(), "54c391b9a358a579e2e88e8bb45ac8571317c8013972953cb6a0888407f8cacb", "rand-token-registry-2");
+
+        // And the three registry-level words outside the leaves are in the root too, so a fee,
+        // a cap or an unspent next index cannot move without it.
+        let base = r.root();
+        for change in [
+            (|r: &mut TokenRegistry| r.registration_fee = 2_000_000_000) as fn(&mut TokenRegistry),
+            |r| {
+                r.register(id(3), "C".into(), "C".into(), 0, MintAuthority::None, 13).unwrap();
+            },
+        ] {
+            let mut moved = r.clone();
+            change(&mut moved);
+            assert_ne!(moved.root(), base);
+        }
+        let capped = TokenRegistry::new(1_000_000_000).with_mint_cap(1);
+        assert_ne!(capped.root(), TokenRegistry::new(1_000_000_000).with_mint_cap(2).root(), "the cap is committed");
+    }
+
     /// A native id binds every field a registration declares — and the **whole** of its initial
     /// mint, not just the amount (spec §3, amended 2026-09-19): a `RegisterToken` carries no
     /// signature and an observer may pay for a copy with a fee bundle of its own (the transaction
