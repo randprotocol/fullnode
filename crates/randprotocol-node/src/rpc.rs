@@ -3869,6 +3869,40 @@ mod tests {
         assert_eq!(state["assets"], assets, "both reads serve the same rows");
     }
 
+    /// The governance nonces a signer and the wallet read are the committed ones, the moment the
+    /// block lands: a `RegisterBridgedToken` moves `list_nonce`, a `ListBacking` moves it again,
+    /// and a `PauseMints` flips the brake and moves `pause_nonce` — each in a block that carries
+    /// no attestation and no burn. A stale read here is what built the E2E gate's first
+    /// `ListBacking` on nonce 0.
+    #[tokio::test]
+    async fn bridge_state_serves_the_governance_nonces_as_soon_as_they_commit() {
+        let (_d, st, _gs, _) = bridged_chain();
+        let nonces = |v: &Value| (v["mint_paused"].clone(), v["pause_nonce"].clone(), v["list_nonce"].clone());
+        let v = ok(&st, "rand_getBridgeState", json!([])).await;
+        assert_eq!(nonces(&v), (json!(false), json!(0), json!(0)));
+
+        let mut ledger = st.storage.load_ledger(&StubExecutor).unwrap();
+        let mut parent = st.storage.head_block().unwrap();
+        let mut commit = |tx: randprotocol_core::Transaction, ledger: &mut randprotocol_core::Ledger| {
+            let b = make_block(&parent, ledger, vec![tx], &key(1));
+            st.storage.commit(std::slice::from_ref(&b), ledger, &[], &StubExecutor).unwrap();
+            parent = b.block;
+        };
+
+        commit(fixtures::register_bridged_tx(&ledger, 0, 40), &mut ledger);
+        let v = ok(&st, "rand_getBridgeState", json!([])).await;
+        assert_eq!(nonces(&v), (json!(false), json!(0), json!(1)), "the registration spent list nonce 0");
+
+        let index = ledger.tokens().unwrap().bridged(2, &fixtures::COIN_A).unwrap().index;
+        commit(fixtures::list_backing_tx(&ledger, index, 1, 50), &mut ledger);
+        let v = ok(&st, "rand_getBridgeState", json!([])).await;
+        assert_eq!(nonces(&v), (json!(false), json!(0), json!(2)), "the listing spent list nonce 1");
+
+        commit(fixtures::pause_tx(&ledger, 0), &mut ledger);
+        let v = ok(&st, "rand_getBridgeState", json!([])).await;
+        assert_eq!(nonces(&v), (json!(true), json!(1), json!(2)), "paused, pause nonce spent");
+    }
+
     /// The outbound message a burn emitted, for guardians to sign, keyed by its sequence.
     #[tokio::test]
     async fn bridge_burn_serves_the_outbound_message() {

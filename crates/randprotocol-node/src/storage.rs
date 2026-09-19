@@ -1537,6 +1537,17 @@ impl Storage {
                 }
             }
         }
+        // And every other entry, whatever the blocks name. On an aggregating chain the end-of-
+        // block sweep (`Ledger::close_block` → `sweep_expired_excesses`) credits an expired excess
+        // to the proposer that *included* the bundle — a validator neither this block's proposer
+        // nor named by any action — and `rewards` feeds the validators root. Deriving the rows
+        // to write from the blocks is what missed it; the register is bounded (`MAX_VALIDATORS`
+        // plus what fell below the minimum) and nothing removes an entry, so it is written whole.
+        for (addr, entry) in ledger_after.validators() {
+            if !touched.contains(addr) {
+                batch.put_cf(self.cf(CF_VALIDATORS), addr.as_bytes(), bincode::serialize(entry)?);
+            }
+        }
         for rec in ledger_after.programs().values() {
             if rec.deployed_at >= first_height {
                 batch.put_cf(self.cf(CF_PROGRAMS), rec.id.as_bytes(), bincode::serialize(rec)?);
@@ -1559,10 +1570,19 @@ impl Storage {
         // The bridge's own rows, in the same batch as the blocks that produced them: a node
         // that reloaded a consumed-digest set older than its head would re-admit an attestation
         // the chain has already paid out.
-        if has_bridge_tx {
-            let bridge = ledger_after.bridge().ok_or_else(|| {
-                StorageError::Corrupt("committed block has a bridge transaction but the ledger has no bridge".into())
-            })?;
+        //
+        // The `meta` blob is written on **every** commit of a bridged chain, whatever the blocks
+        // carry — exactly as `META_TOKENS` is below. It used to be written only beside a
+        // `BridgeAttest`/`BridgeBurn`, which left the governance actions' changes (`PauseMints`/
+        // `UnpauseMints`: `mint_paused`, `pause_nonce`; `RegisterBridgedToken`/`ListBacking`:
+        // `list_nonce`) in memory only: `rand_getBridgeState` served stale nonces, and a restarted
+        // node reloaded a stale meta, computed a different bridge root and forked at the state
+        // root — a paused one came back unpaused. Keying the write on a list of actions is what
+        // broke; the blob is small, so it is simply always written.
+        if has_bridge_tx && ledger_after.bridge().is_none() {
+            return Err(StorageError::Corrupt("committed block has a bridge transaction but the ledger has no bridge".into()));
+        }
+        if let Some(bridge) = ledger_after.bridge() {
             for digest in &spent_digests {
                 batch.put_cf(self.cf(CF_BRIDGE_SPENT), digest.as_bytes(), []);
             }
@@ -2292,6 +2312,77 @@ pub(crate) mod fixtures {
         ))
     }
 
+    /// The genesis pause key of [`bridge_config`].
+    pub(crate) fn pause_key() -> Keypair {
+        key(0x7f)
+    }
+
+    /// The five lowest PQ guardians' co-signatures over a governance `message`.
+    pub(crate) fn pq_quorum_message(message: &[u8]) -> Vec<randprotocol_core::bridge::PqSignature> {
+        pq_keys()
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(i, k)| randprotocol_core::bridge::PqSignature { index: i as u8, signature: k.sign(message).as_bytes().to_vec() })
+            .collect()
+    }
+
+    /// B1: a bundle-less `PauseMints` at `nonce`, signed by [`pause_key`].
+    pub(crate) fn pause_tx(ledger: &Ledger, nonce: u64) -> Transaction {
+        let signature = pause_key().sign(&randprotocol_core::bridge::gov::pause_message(ledger.chain_id(), nonce));
+        Transaction { chain_id: ledger.chain_id(), bundle: None, action: Action::PauseMints { nonce, signature } }
+    }
+
+    /// B1: a bundle-less `UnpauseMints` at `nonce`, co-signed by a PQ quorum.
+    pub(crate) fn unpause_tx(ledger: &Ledger, nonce: u64) -> Transaction {
+        let m = randprotocol_core::bridge::gov::unpause_message(ledger.chain_id(), nonce);
+        Transaction {
+            chain_id: ledger.chain_id(),
+            bundle: None,
+            action: Action::UnpauseMints { nonce, pq_signatures: pq_quorum_message(&m) },
+        }
+    }
+
+    /// The coin [`register_bridged_tx`] registers its token on: chain 2, not [`TOKEN`].
+    pub(crate) const COIN_A: [u8; 32] = [0xbb; 32];
+    /// The coin [`list_backing_tx`] lists as a second backing.
+    pub(crate) const COIN_B: [u8; 32] = [0xcc; 32];
+
+    /// B4: a `RegisterBridgedToken` of "Shielded USD" backed by chain 2's [`COIN_A`] (6
+    /// decimals) at `nonce`, PQ-quorum-signed, paying the base plus the registration fee on a
+    /// bundle keyed at `seed..seed + 3`.
+    pub(crate) fn register_bridged_tx(ledger: &Ledger, nonce: u64, seed: u32) -> Transaction {
+        let (name, symbol, salt) = ("Shielded USD", "zUSD", [0x27; 32]);
+        let m = randprotocol_core::bridge::gov::register_message(ledger.chain_id(), nonce, name, symbol, &salt, 2, &COIN_A, 6)
+            .unwrap();
+        let fee = gas::BUNDLE_BASE + ledger.tokens().expect("a tokens section").registration_fee;
+        StubExecutor::bound(Transaction::shielded(
+            ledger.chain_id(),
+            bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], fee),
+            Action::RegisterBridgedToken {
+                name: name.into(),
+                symbol: symbol.into(),
+                salt,
+                chain: 2,
+                token: COIN_A,
+                decimals: 6,
+                nonce,
+                pq_signatures: pq_quorum_message(&m),
+            },
+        ))
+    }
+
+    /// B4: a `ListBacking` of chain 2's [`COIN_B`] (6 decimals) under `token_index` at `nonce`,
+    /// PQ-quorum-signed, on a base-fee bundle keyed at `seed..seed + 3`.
+    pub(crate) fn list_backing_tx(ledger: &Ledger, token_index: u32, nonce: u64, seed: u32) -> Transaction {
+        let m = randprotocol_core::bridge::gov::list_message(ledger.chain_id(), nonce, token_index, 2, &COIN_B, 6);
+        StubExecutor::bound(Transaction::shielded(
+            ledger.chain_id(),
+            bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
+            Action::ListBacking { token_index, chain: 2, token: COIN_B, decimals: 6, nonce, pq_signatures: pq_quorum_message(&m) },
+        ))
+    }
+
     /// The key a native test token is registered under as its `Key` mint authority.
     pub(crate) fn issuer() -> Keypair {
         key(21)
@@ -2741,6 +2832,194 @@ mod tests {
         assert_eq!(check.problem, None);
         assert_eq!(check.last_good, 2);
         assert_eq!(check.ledger.bridge(), ledger.bridge(), "the replay rebuilt the bridge");
+    }
+
+    /// What a restart must give back after `ledger` was committed: `load_ledger` and
+    /// `node::reload_ledger` both equal to it, at its state root, with the served bridge meta
+    /// byte-for-byte the live one and the supply counters (outside `Ledger`'s equality) intact.
+    fn assert_restart_round_trips(s: &Storage, gs: &GenesisState, ledger: &Ledger, what: &str) {
+        // The state root first: it is what a restarted node forks on.
+        let loaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(loaded.state_root(), ledger.state_root(), "{what}: load_ledger's state root");
+        assert_eq!(&loaded, ledger, "{what}: load_ledger");
+        assert_eq!(loaded.supply(), ledger.supply(), "{what}: the supply counters");
+        assert_eq!(loaded.unsealed_fees(), ledger.unsealed_fees(), "{what}: the fee bucket");
+        let live_meta = ledger.bridge().expect("a bridged chain").meta();
+        assert_eq!(
+            s.get_meta_raw(META_BRIDGE_STATE).unwrap(),
+            Some(bincode::serialize(&live_meta).unwrap()),
+            "{what}: the stored bridge meta is the live one, byte for byte"
+        );
+        assert_eq!(s.bridge_meta().unwrap(), Some(live_meta), "{what}: and decodes to it");
+        let reloaded = crate::node::reload_ledger(s, gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.state_root(), ledger.state_root(), "{what}: reload_ledger's state root");
+        assert_eq!(&reloaded, ledger, "{what}: reload_ledger");
+    }
+
+    /// The bridge's governance actions change only the bridge meta (`mint_paused`, `pause_nonce`,
+    /// `list_nonce`) — and the registry, for the two listing actions. A commit that persisted the
+    /// meta only beside an attestation or a burn left these changes in memory: a restarted node
+    /// reloaded a stale meta, computed a different bridge root and forked off at the state root,
+    /// and a paused one came back unpaused.
+    ///
+    /// The chain the four tests below share: block 1 a `PauseMints`, block 2 an `UnpauseMints`,
+    /// block 3 a `RegisterBridgedToken`, block 4 a `ListBacking` — each block carrying exactly
+    /// that one action, committed one at a time. Returns the store after `blocks` of them.
+    fn governance_chain(blocks: u64) -> (tempfile::TempDir, Storage, GenesisState, Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, _) = bridged_genesis(9);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let mut parent = gs.block.clone();
+        for h in 1..=blocks {
+            let tx = match h {
+                1 => pause_tx(&ledger, 0),
+                2 => unpause_tx(&ledger, 1),
+                3 => register_bridged_tx(&ledger, 0, 40),
+                4 => {
+                    let index = ledger.tokens().unwrap().bridged(2, &COIN_A).expect("registered").index;
+                    list_backing_tx(&ledger, index, 1, 50)
+                }
+                _ => unreachable!(),
+            };
+            let b = make_block(&parent, &mut ledger, vec![tx], &key(1));
+            s.commit(std::slice::from_ref(&b), &ledger, &[], &StubExecutor).unwrap();
+            parent = b.block;
+        }
+        (dir, s, gs, ledger)
+    }
+
+    #[test]
+    fn a_committed_pause_survives_a_restart() {
+        let (_d, s, gs, ledger) = governance_chain(1);
+        let b = ledger.bridge().unwrap();
+        assert_eq!((b.mint_paused, b.pause_nonce), (true, 1));
+        assert_restart_round_trips(&s, &gs, &ledger, "PauseMints");
+        assert!(s.bridge_meta().unwrap().unwrap().mint_paused, "a paused node restarts paused");
+    }
+
+    #[test]
+    fn a_committed_unpause_survives_a_restart() {
+        let (_d, s, gs, ledger) = governance_chain(2);
+        let b = ledger.bridge().unwrap();
+        assert_eq!((b.mint_paused, b.pause_nonce), (false, 2));
+        assert_restart_round_trips(&s, &gs, &ledger, "UnpauseMints");
+    }
+
+    #[test]
+    fn a_committed_bridged_registration_survives_a_restart() {
+        let (_d, s, gs, ledger) = governance_chain(3);
+        assert_eq!(ledger.bridge().unwrap().list_nonce, 1);
+        assert!(ledger.tokens().unwrap().bridged(2, &COIN_A).is_some());
+        assert_restart_round_trips(&s, &gs, &ledger, "RegisterBridgedToken");
+    }
+
+    #[test]
+    fn a_committed_listing_survives_a_restart() {
+        let (_d, s, gs, ledger) = governance_chain(4);
+        assert_eq!(ledger.bridge().unwrap().list_nonce, 2);
+        let index = ledger.tokens().unwrap().bridged(2, &COIN_A).unwrap().index;
+        assert_eq!(ledger.tokens().unwrap().bridged(2, &COIN_B).map(|t| t.index), Some(index));
+        assert_restart_round_trips(&s, &gs, &ledger, "ListBacking");
+        // And the replay agrees with what was stored: a startup `--verify-chain` finds nothing
+        // to repair.
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(check.problem, None);
+        assert_eq!(check.last_good, 4);
+    }
+
+    /// Persistence does not depend on what a block carries: a block with no bridge action at all
+    /// — an empty one, then a plain transfer — still leaves the stored meta byte-identical to
+    /// the ledger's, including a pause an earlier block set.
+    #[test]
+    fn a_block_without_a_bridge_action_round_trips_the_bridge_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, _) = bridged_genesis(9);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let b1 = make_block(&gs.block, &mut ledger, vec![], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_restart_round_trips(&s, &gs, &ledger, "an empty block on the genesis bridge");
+
+        let pause = pause_tx(&ledger, 0);
+        let b2 = make_block(&b1.block, &mut ledger, vec![pause], &key(1));
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        let b3 = make_block(&b2.block, &mut ledger, vec![], &key(1));
+        s.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+        assert_restart_round_trips(&s, &gs, &ledger, "an empty block after a pause");
+        let transfer = transfer_tx(&ledger, 60);
+        let b4 = make_block(&b3.block, &mut ledger, vec![transfer], &key(1));
+        s.commit(std::slice::from_ref(&b4), &ledger, &[], &StubExecutor).unwrap();
+        assert_restart_round_trips(&s, &gs, &ledger, "a plain transfer after a pause");
+        assert!(s.bridge_meta().unwrap().unwrap().mint_paused, "still paused on disk");
+    }
+
+    /// Every block touches the register at its proposer and at the validators its actions name —
+    /// but on an aggregating chain the end-of-block sweep also credits an expired excess to the
+    /// proposer that *included* the bundle, which need be neither. Its `rewards` feed the
+    /// validators root, so the register must be persisted whole, not only the touched rows.
+    #[test]
+    fn a_swept_excess_credited_to_an_earlier_proposer_survives_a_restart() {
+        use randprotocol_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use randprotocol_core::types::{DeclaredShape, FriProfile};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let shape = DeclaredShape {
+            profile: FriProfile::Test,
+            tier: 12,
+            program_log_height: 12,
+            input_log_height: 10,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 2,
+            mem_log_height: 16,
+        };
+        let cfg = AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 1,
+            admitted_shapes: vec![AdmittedShape { shape, hc: Hash([3; 32]), aggregate_program_digest: [1; 4] }],
+        };
+        let mut gs = genesis_of(7, &[&key(1), &key(2)], vec![], 1_000);
+        gs.ledger.set_aggregation(Some(cfg));
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+
+        // Block 1, by key 1: a bundle paying 60 over the floor, bucketed against key 1 until
+        // height 2.
+        let fee = randprotocol_core::gas::BUNDLE_BASE + 60;
+        let tx = bundle_tx(&ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee);
+        ledger.set_height(1);
+        ledger.set_timestamp_ms(1);
+        ledger.apply_transactions(std::slice::from_ref(&tx), &key(1).address(), &StubExecutor).unwrap();
+        ledger.close_block(1, &key(1).address());
+        let b1 = make_block_unchecked(&gs.block, &ledger, vec![tx], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let before = ledger.validators()[&key(1).address()].rewards;
+
+        // Block 2, empty, by key 2: the sweep credits the 60 to key 1, whom nothing in the
+        // block names.
+        ledger.set_height(2);
+        ledger.set_timestamp_ms(2);
+        ledger.apply_transactions(&[], &key(2).address(), &StubExecutor).unwrap();
+        ledger.close_block(2, &key(2).address());
+        assert_eq!(ledger.validators()[&key(1).address()].rewards, before + 60, "the sweep credited key 1");
+        let b2 = make_block_unchecked(&b1.block, &ledger, vec![], &key(2));
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+
+        assert_eq!(s.validator(&key(1).address()).unwrap().as_ref(), ledger.validators().get(&key(1).address()));
+        let loaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(loaded.state_root(), ledger.state_root());
+        assert_eq!(loaded, ledger);
+        assert_eq!(loaded.supply(), ledger.supply());
+        assert_eq!(loaded.unsealed_fees(), ledger.unsealed_fees());
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
     }
 
     /// Every bundle creates **four** notes — its four output slots, dummies included — and the
