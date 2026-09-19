@@ -85,12 +85,13 @@ and no PQ signatures refused, a PQ signature from another chain id refused, the 
 ## 6. Genesis for chain 14
 
 `bridge` = bridge-06's fixed section (handoff §6) **plus** `pq_guardians` (six keys generated on the
-operators' hosts by the bridge session) and `pause_key`; `tokens` = zUSD with its seven backings and
-`mint_cap_per_day = 100_000 × 10^8`.
+operators' hosts by the bridge session) and `pause_key`; `tokens` = `registration_fee` and `mint_cap_per_day = 100_000 × 10^8` but **no listed token**: zUSD is registered after the cut by
+`RegisterBridgedToken` (its first backing) plus six `ListBacking`, submitted by a faucet-funded deployer wallet (user,
+2026-09-19). The faucet must be enabled in the chain-14 genesis.
 
 ## 7. B4 — listing after genesis by the PQ guardian quorum (user, 2026-09-19)
 
-Two new bundle-less actions, each authorised by a **PQ guardian quorum** (B3's set and five rules):
+Two new actions, each authorised by a **PQ guardian quorum** (B3's set and five rules) and each carrying a RAND **fee bundle** paid by whoever submits it (user, 2026-09-19: zUSD is deployed by a faucet-funded deployer address, so it has a deploy transaction, a height and an `rpl1…` id):
 - `ListBacking { token_index: u32, chain: u16, token: [u8; 32], decimals: u8, nonce: u64, pq_signatures }`
   adds a backing to an existing bridged token.
 - `RegisterBridgedToken { name, symbol, salt: [u8; 32], chain: u16, token: [u8; 32], decimals: u8,
