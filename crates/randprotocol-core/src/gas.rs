@@ -173,6 +173,10 @@ pub fn fee_floor(action: &Action) -> u64 {
         // once its proof has been decoded. Nothing here is a lower floor than that check, so a
         // transaction under the base is still refused at step 3, before the action is reached.
         Action::RegisterToken { .. } | Action::TokenMint { .. } | Action::SetAuthority { .. } => BUNDLE_BASE,
+        // Bridge hardening B1: bundle-less, so nothing to pay from — a pause must work from a
+        // wallet with no RAND. Neither can be spammed: each needs the pause key's signature or a
+        // PQ guardian quorum over the current `pause_nonce`, and each spends it.
+        Action::PauseMints { .. } | Action::UnpauseMints { .. } => 0,
     }
 }
 

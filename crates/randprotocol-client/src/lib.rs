@@ -20,6 +20,7 @@ use randprotocol_core::types::CallEnvelope;
 use randprotocol_core::{Hash, Transaction};
 use std::time::{Duration, Instant};
 
+pub mod governance;
 pub mod wallet;
 
 /// A node's JSON-RPC error reply. It prints as it always has, `"<message> (rpc <code>)"`, and

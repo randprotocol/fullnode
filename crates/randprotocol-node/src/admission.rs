@@ -526,6 +526,28 @@ mod tests {
         }
     }
 
+    /// Bridge hardening B1: every verdict of the cap and the brake is state — the day's counter,
+    /// the pause flag, the pause nonce — and so is the pause signature's (it is judged against
+    /// the nonce the bridge is at). None is cached: a deposit over today's cap is admissible
+    /// tomorrow, a paused mint after the unpause.
+    #[test]
+    fn the_cap_and_pause_verdicts_are_never_cached() {
+        use randprotocol_core::bridge::BridgeError as B;
+        use randprotocol_core::ledger::tokens::TokenError as T;
+        for b in [
+            B::MintsPaused,
+            B::Token(T::MintCapExceeded { cap: 10, minted_today: 10, amount: 1 }),
+            B::NoPauseKey,
+            B::AlreadyPaused,
+            B::NotPaused,
+            B::BadPauseNonce { expected: 1, got: 0 },
+            B::BadPauseSignature,
+        ] {
+            let e = TxError::Bridge(b);
+            assert!(!is_permanent(&e), "{e} is state, not bytes");
+        }
+    }
+
     /// The aggregate verdicts, split: the byte-verdicts and the genesis-constant ones are
     /// cached, the register's and the window's state is not.
     #[test]

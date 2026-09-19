@@ -212,6 +212,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
                     decimals: 8,
                 }],
             }],
+            mint_cap_per_day: 100_000 * 100_000_000,
         }),
         bridge,
         aggregation: None,
@@ -246,6 +247,7 @@ fn bridge_config() -> BridgeConfig {
         guardians: guardian_secrets().iter().map(guardian_address).collect(),
         emitters: std::collections::BTreeMap::from([(TOKEN_CHAIN, [TOKEN_CHAIN as u8; 32])]),
         pq_guardians: pq_guardian_keys().iter().map(|k| k.public_key().clone()).collect(),
+        pause_key: Some(randprotocol_core::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
     }
 }
 

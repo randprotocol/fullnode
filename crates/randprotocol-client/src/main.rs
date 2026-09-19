@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use randprotocol_client::governance;
 use randprotocol_client::wallet::{self, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
 use randprotocol_client::wallet::{Burn, Submission};
@@ -224,6 +225,30 @@ enum Cmd {
         /// Prove the paying bundle on an attached NVIDIA GPU.
         #[arg(long)]
         cuda: bool,
+    },
+    /// Pause bridge minting with the pause key's signature (bridge hardening B1): a bundle-less,
+    /// fee-less `PauseMints` — no spend key and no RAND needed. The file is what
+    /// `rand-bridge-gov pause` writes, a 2 420-byte signature as hex, made for the bridge's current
+    /// `pause_nonce`; one made for another nonce is refused here, naming it. Burns and rotations
+    /// stay open while paused; only a PQ guardian quorum can unpause.
+    BridgePause {
+        /// The signature as hex, or `@path` to read it from a file.
+        #[arg(long)]
+        sig: String,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Lift a mint pause with a PQ guardian quorum (bridge hardening B1): a bundle-less, fee-less
+    /// `UnpauseMints`. The file is what `rand-bridge-gov pq-unpause` writes,
+    /// `[{"index":0,"signature":"<4840 hex>"},…]`, made for the bridge's current `pause_nonce`.
+    BridgeUnpause {
+        /// The quorum as JSON, or `@path` to read it from a file.
+        #[arg(long)]
+        pq: String,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Burn a bridged asset to another chain: one bundle burns the asset and pays the RAND fee.
     BridgeBurn {
@@ -1142,6 +1167,33 @@ async fn main() -> Result<()> {
             report(&s?, "token burn");
             if !no_wait {
                 println!("asset {asset} balance: {} units", store.balance_of(asset));
+            }
+        }
+        Cmd::BridgePause { sig, no_wait } => {
+            // No key file: a pause must work from a machine holding no spend key and no RAND.
+            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?;
+            let chain_id = rpc.chain_id().await?;
+            let signature = governance::parse_pause_signature(&read_text_arg(&sig)?)?;
+            let action = governance::pause_action(&state, chain_id, signature)?;
+            let hash = governance::submit_bundle_less(&rpc, chain_id, action, !no_wait).await?;
+            if no_wait {
+                println!("submitted the pause at pause_nonce {} as {hash}", state.pause_nonce);
+            } else {
+                let after = rpc.bridge_state().await?;
+                println!("paused: bridge minting is off (tx {hash}); mint_paused {}, pause_nonce {}", after["mint_paused"], after["pause_nonce"]);
+            }
+        }
+        Cmd::BridgeUnpause { pq, no_wait } => {
+            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?;
+            let chain_id = rpc.chain_id().await?;
+            let pq_signatures = wallet::parse_pq_signatures(&read_text_arg(&pq)?)?;
+            let action = governance::unpause_action(&state, chain_id, pq_signatures)?;
+            let hash = governance::submit_bundle_less(&rpc, chain_id, action, !no_wait).await?;
+            if no_wait {
+                println!("submitted the unpause at pause_nonce {} as {hash}", state.pause_nonce);
+            } else {
+                let after = rpc.bridge_state().await?;
+                println!("unpaused: bridge minting is on (tx {hash}); mint_paused {}, pause_nonce {}", after["mint_paused"], after["pause_nonce"]);
             }
         }
         Cmd::Bridge => println!("{}", pretty(&rpc.bridge_state().await?)),

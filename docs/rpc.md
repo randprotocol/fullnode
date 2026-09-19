@@ -592,6 +592,11 @@ Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false 
   "pq_guardians": ["…"],                 // the genesis PQ set: Dilithium2 public keys (1 312 bytes), hex,
                                          // index-aligned with guardian set 0; every BridgeAttest carries a
                                          // quorum of co-signatures by it, and a rotation never moves it
+  "mint_paused": false,                  // B1: while true every transfer attest is refused (burns and
+                                         // rotations stay open)
+  "pause_nonce": 0,                      // B1: what the next M_pause / M_unpause must carry
+  "list_nonce": 0,                       // B4: what the next M_list / M_register must carry
+  "pause_key": "…",                      // B1: the one Dilithium2 key that may pause minting, hex
   "burn_sequence": 1,                    // outbound messages emitted so far
   "next_index": 2,                       // the note index the next newly registered asset gets
   "assets": [ …the rows of `rand_getAssets`… ]
@@ -603,10 +608,16 @@ No balances: bridged value is notes, not accounts.
 Params: `[]`. Result: the bridge's asset registry, ascending by index (which is registration
 order), or `[]` on a chain without a bridge:
 ```json
-[{ "index": 1, "chain": 2, "token": "aaaa…", "asset_id": "…" }]
+[{ "index": 1, "chain": 2, "token": "aaaa…", "asset_id": "…", "decimals": 6, "locked": 600,
+   "mint_cap_per_day": 10000000000000, "minted_today": 1000, "mint_day": 20350 }]
 ```
 `index` is the `asset` word a note of that asset carries — index 0 is RAND and is never in the
-registry. `chain` and `token` are the wire identity guardians sign about; `asset_id` is
+registry. One row per **backing** (source coin). `mint_cap_per_day` (bridge hardening B1) is the
+genesis `tokens.mint_cap_per_day`, the most one backing may mint per UTC day of the block time, in
+the token's eight-decimal units; `minted_today` is what this backing has minted on UTC day
+`mint_day` (`timestamp_ms / 86 400 000`) — a counter from an earlier day starts again from zero at
+the next deposit. A deposit past the cap is refused `MintCapExceeded` and becomes admissible the
+next day. `chain` and `token` are the wire identity guardians sign about; `asset_id` is
 `blake3` of the two, and is what `rand_bridgeAssetId` computes.
 
 ### `rand_bridgeAssetId`
@@ -1119,6 +1130,21 @@ What changed for clients, in one place. Newest first.
 - **Pool:** two transactions at one token's `mint_nonce` (a `TokenMint` or a `SetAuthority`) or at
   one registration index conflict at submission, and one whose nonce or index the chain has
   already moved past is refused (`wrong mint nonce`, `wrong token index`) and pruned.
+
+### 2026-09-19 — the mint cap and the mint pause (bridge hardening B1, chain 14)
+
+- `rand_getBridgeState` gains `mint_paused`, `pause_nonce`, `list_nonce` and `pause_key` (hex).
+- `rand_getAssets` rows (and `rand_getBridgeState.assets`) gain `mint_cap_per_day`,
+  `minted_today` and `mint_day`.
+- Two bundle-less, fee-less actions: `pause_mints` (`{ "kind": "pause_mints", "nonce" }`, the
+  genesis pause key's signature over `b"rand-bridge-pause-1" ‖ chain_id u64 BE ‖ nonce u64 BE`) and
+  `unpause_mints` (`{ "kind": "unpause_mints", "nonce", "pq_signers" }`, a PQ guardian quorum over
+  `b"rand-bridge-pq-unpause-1" ‖ chain_id ‖ nonce`). Both carry the bridge's `pause_nonce` and bump
+  it; the pause key can never unpause.
+- New refusals, none cached (state, not bytes): `bridge minting is paused` (`MintsPaused`) on a
+  transfer attest while paused; `mint cap … per backing per day` (`MintCapExceeded`); and the
+  pause's own `already paused`, `not paused`, `wrong pause nonce`, `the pause signature does not
+  verify`.
 
 ### 2026-09-19 — the hidden-asset bundle (chain 14): a hard fork
 

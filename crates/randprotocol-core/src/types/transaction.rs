@@ -279,6 +279,17 @@ pub enum Action {
     ///
     /// [`MintAuthority::Bridge`]: crate::ledger::tokens::MintAuthority::Bridge
     TokenBurn { asset: u32, amount: u64 },
+    /// Bridge hardening B1: pause bridge minting. `signature` is the genesis `bridge.pause_key`'s
+    /// Dilithium2 signature over [`crate::bridge::gov::pause_message`]`(chain_id, nonce)`, and
+    /// `nonce` must be the bridge's `pause_nonce`. It can only pause: while paused every transfer
+    /// `BridgeAttest` is refused, and burns and rotations stay open. Bundle-less and fee-less — a
+    /// pause must work from a wallet holding no RAND at all.
+    PauseMints { nonce: u64, signature: Signature },
+    /// Bridge hardening B1: lift a pause. `pq_signatures` is a PQ guardian quorum (the
+    /// co-signature's five rules, [`crate::bridge::pq`]) over
+    /// [`crate::bridge::gov::unpause_message`]`(chain_id, nonce)`, `nonce` the bridge's
+    /// `pause_nonce`. The pause key alone can never unpause. Bundle-less, like `PauseMints`.
+    UnpauseMints { nonce: u64, pq_signatures: Vec<crate::bridge::PqSignature> },
 }
 
 impl Action {
@@ -299,6 +310,8 @@ impl Action {
             Action::WithdrawAggregator { .. } => Some("withdraw_aggregator"),
             Action::SlashAggregator { .. } => Some("slash_aggregator"),
             Action::Aggregate { .. } => Some("aggregate"),
+            Action::PauseMints { .. } => Some("pause_mints"),
+            Action::UnpauseMints { .. } => Some("unpause_mints"),
             _ => None,
         }
     }
@@ -441,6 +454,12 @@ impl Action {
                 signature: signature.clone(),
             },
             Action::TokenBurn { asset, amount } => Action::TokenBurn { asset: *asset, amount: *amount },
+            // Bundle-less, so no proof of this transaction's is bound to them; classified all the
+            // same — signatures are kept.
+            Action::PauseMints { nonce, signature } => Action::PauseMints { nonce: *nonce, signature: signature.clone() },
+            Action::UnpauseMints { nonce, pq_signatures } => {
+                Action::UnpauseMints { nonce: *nonce, pq_signatures: pq_signatures.clone() }
+            }
         }
     }
 }
@@ -818,8 +837,9 @@ mod tests {
         assert_ne!(other.hash(), tx.hash());
     }
 
-    /// Exactly three actions ride without a bundle, and each names itself for the shape error
-    /// admission reports when one arrives with a bundle anyway.
+    /// The staking and faucet actions ride without a bundle — and so do B1's pause and unpause —
+    /// and each names itself for the shape error admission reports when one arrives with a bundle
+    /// anyway.
     #[test]
     fn only_a_mint_an_unbond_and_a_withdraw_are_bundle_less() {
         let v = Address([1; 32]);
@@ -851,6 +871,8 @@ mod tests {
                 },
                 "withdraw",
             ),
+            (Action::PauseMints { nonce: 0, signature: Signature::empty() }, "pause_mints"),
+            (Action::UnpauseMints { nonce: 0, pq_signatures: Vec::new() }, "unpause_mints"),
         ];
         for (a, name) in &bundle_less {
             assert_eq!(a.bundle_less(), Some(*name), "{a:?}");
@@ -1068,7 +1090,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 18;
+    const VARIANTS: usize = 20;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -1089,6 +1111,8 @@ mod tests {
             Action::TokenMint { .. } => 15,
             Action::SetAuthority { .. } => 16,
             Action::TokenBurn { .. } => 17,
+            Action::PauseMints { .. } => 18,
+            Action::UnpauseMints { .. } => 19,
         }
     }
 
@@ -1204,6 +1228,14 @@ mod tests {
             },
             16 => Action::SetAuthority { asset: 1, new: Some(pk()), nonce: 0, signature: sig() },
             17 => Action::TokenBurn { asset: 3, amount: 5 },
+            18 => Action::PauseMints { nonce: 4, signature: sig() },
+            19 => Action::UnpauseMints {
+                nonce: 5,
+                pq_signatures: vec![
+                    crate::bridge::PqSignature { index: 1, signature: vec![0x6c; 8] },
+                    crate::bridge::PqSignature { index: 3, signature: vec![0x6d; 8] },
+                ],
+            },
             _ => panic!("no variant {i}"),
         }
     }
@@ -1392,6 +1424,27 @@ mod tests {
             (17, "token burn amount", |t| {
                 let Action::TokenBurn { amount, .. } = &mut t.action else { panic!() };
                 *amount += 1;
+            }),
+            // B1: the pause's nonce and signature, the unpause's nonce and quorum.
+            (18, "pause nonce", |t| {
+                let Action::PauseMints { nonce, .. } = &mut t.action else { panic!() };
+                *nonce += 1;
+            }),
+            (18, "pause signature", |t| {
+                let Action::PauseMints { signature, .. } = &mut t.action else { panic!() };
+                *signature = Signature::empty();
+            }),
+            (19, "unpause nonce", |t| {
+                let Action::UnpauseMints { nonce, .. } = &mut t.action else { panic!() };
+                *nonce += 1;
+            }),
+            (19, "unpause pq signature byte", |t| {
+                let Action::UnpauseMints { pq_signatures, .. } = &mut t.action else { panic!() };
+                pq_signatures[0].signature[0] ^= 1;
+            }),
+            (19, "unpause pq signature index", |t| {
+                let Action::UnpauseMints { pq_signatures, .. } = &mut t.action else { panic!() };
+                pq_signatures[1].index = 2;
             }),
         ];
         for (i, what, change) in action_cases {

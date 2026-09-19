@@ -103,10 +103,18 @@ pub fn verify_pq_signatures(
     chain_id: u64,
     mu: &[u8; 32],
 ) -> Result<(), BridgeError> {
-    let m = pq_cosign_message(chain_id, mu);
+    verify_pq_message(sigs, keys, &pq_cosign_message(chain_id, mu))
+}
+
+/// Rule 4 over any message: every listed signature verifies `message` under `keys[index]`. The
+/// one verification loop behind both the mint co-signature ([`verify_pq_signatures`], over
+/// [`pq_cosign_message`]) and the Rand-only governance messages of bridge hardening B1/B4
+/// ([`crate::bridge::gov`]: unpause, list, register) — so a governance quorum is judged by
+/// exactly the function a mint's is, rule for rule.
+pub fn verify_pq_message(sigs: &[PqSignature], keys: &[PublicKey], message: &[u8]) -> Result<(), BridgeError> {
     for s in sigs {
         let ok = match (keys.get(s.index as usize), Signature::from_bytes(&s.signature)) {
-            (Some(key), Ok(sig)) => key.verify(&m, &sig),
+            (Some(key), Ok(sig)) => key.verify(message, &sig),
             _ => false,
         };
         if !ok {
@@ -114,6 +122,13 @@ pub fn verify_pq_signatures(
         }
     }
     Ok(())
+}
+
+/// All five rules over any message — [`check_pq_structure`] then [`verify_pq_message`]: the
+/// governance twin of [`check_pq_quorum`], and what a wallet runs before it submits one.
+pub fn check_pq_quorum_message(sigs: &[PqSignature], keys: &[PublicKey], message: &[u8]) -> Result<(), BridgeError> {
+    check_pq_structure(sigs, keys.len())?;
+    verify_pq_message(sigs, keys, message)
 }
 
 /// All five rules at once — [`check_pq_structure`] then [`verify_pq_signatures`]. The ledger
@@ -134,7 +149,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::bridge::keccak256;
 
-    /// The bridge repo's `vectors/pq-cosignatures.json` at 80459a3, copied as a fixture.
+    /// The bridge repo's `vectors/pq-cosignatures.json` at ba01afb (its `_source` key says so),
+    /// copied as a fixture.
     pub(crate) fn vectors() -> serde_json::Value {
         serde_json::from_str(include_str!("../../tests/fixtures/pq-cosignatures.json")).expect("the PQ vectors parse")
     }

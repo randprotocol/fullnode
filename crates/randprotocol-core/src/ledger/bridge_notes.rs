@@ -202,7 +202,7 @@ pub(super) fn apply(
                     ledger
                         .tokens_mut()
                         .ok_or(TxError::Token(TokenError::Disabled))?
-                        .lock(t.index, t.chain, &t.token, t.amount)
+                        .lock(t.index, t.chain, &t.token, t.amount, t.day)
                         .map_err(|e| TxError::Bridge(BridgeError::Token(e)))?;
                 }
                 // Governance only: a rotation moves guardian keys and no value.
@@ -368,6 +368,7 @@ mod tests {
             guardians: secrets.iter().map(guardian_address).collect(),
             emitters: (2u16..=5).map(|c| (c, [c as u8; 32])).collect(),
             pq_guardians: pq_keys().iter().map(|k| k.public_key().clone()).collect(),
+            pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
         };
         (config, secrets)
     }
@@ -398,7 +399,7 @@ mod tests {
                     "zUSDT".into(),
                     8,
                     crate::ledger::tokens::MintAuthority::Bridge {
-                        backings: vec![crate::ledger::tokens::Backing { chain: 2, token, decimals: 8, locked: 0 }],
+                        backings: vec![crate::ledger::tokens::Backing { chain: 2, token, decimals: 8, locked: 0, minted_today: 0, mint_day: 0 }],
                     },
                     0,
                 )
@@ -827,7 +828,7 @@ mod tests {
                 "zLATE".into(),
                 8,
                 crate::ledger::tokens::MintAuthority::Bridge {
-                    backings: vec![crate::ledger::tokens::Backing { chain: 2, token: UNLISTED_TOKEN, decimals: 8, locked: 0 }],
+                    backings: vec![crate::ledger::tokens::Backing { chain: 2, token: UNLISTED_TOKEN, decimals: 8, locked: 0, minted_today: 0, mint_day: 0 }],
                 },
                 1,
             )
@@ -1089,8 +1090,8 @@ mod tests {
                 8,
                 crate::ledger::tokens::MintAuthority::Bridge {
                     backings: vec![
-                        crate::ledger::tokens::Backing { chain: 2, token: USDT, decimals: 8, locked: 0 },
-                        crate::ledger::tokens::Backing { chain: 5, token: USDC, decimals: 8, locked: 0 },
+                        crate::ledger::tokens::Backing { chain: 2, token: USDT, decimals: 8, locked: 0, minted_today: 0, mint_day: 0 },
+                        crate::ledger::tokens::Backing { chain: 5, token: USDC, decimals: 8, locked: 0, minted_today: 0, mint_day: 0 },
                     ],
                 },
                 0,
@@ -1205,7 +1206,7 @@ mod tests {
                 "zUSD".into(),
                 8,
                 crate::ledger::tokens::MintAuthority::Bridge {
-                    backings: vec![crate::ledger::tokens::Backing { chain: 2, token: USDT, decimals: 6, locked: 0 }],
+                    backings: vec![crate::ledger::tokens::Backing { chain: 2, token: USDT, decimals: 6, locked: 0, minted_today: 0, mint_day: 0 }],
                 },
                 0,
             )
@@ -1402,8 +1403,8 @@ mod tests {
                 8,
                 crate::ledger::tokens::MintAuthority::Bridge {
                     backings: vec![
-                        crate::ledger::tokens::Backing { chain: 2, token: USDT, decimals: 8, locked: 0 },
-                        crate::ledger::tokens::Backing { chain: 5, token: USDC, decimals: 8, locked: 0 },
+                        crate::ledger::tokens::Backing { chain: 2, token: USDT, decimals: 8, locked: 0, minted_today: 0, mint_day: 0 },
+                        crate::ledger::tokens::Backing { chain: 5, token: USDC, decimals: 8, locked: 0, minted_today: 0, mint_day: 0 },
                     ],
                 },
                 0,
@@ -1592,5 +1593,215 @@ mod tests {
         *pq_signatures = foreign;
         let tx = StubExecutor::bound(tx);
         assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::Bridge(BridgeError::PqBadSignature { index: 0 })));
+    }
+
+    // ---- bridge hardening B1 through the ledger: the pause, the unpause and the daily cap ------
+
+    /// The genesis pause key of [`cfg`] — none of the PQ guardians' keys.
+    fn pause_key() -> Keypair {
+        Keypair::from_seed([0x7f; 32]).unwrap()
+    }
+
+    /// A bundle-less `PauseMints` at `nonce`, signed by `key` on chain 7.
+    fn pause_tx(key: &Keypair, nonce: u64) -> Transaction {
+        let signature = key.sign(&crate::bridge::gov::pause_message(7, nonce));
+        Transaction { chain_id: 7, bundle: None, action: Action::PauseMints { nonce, signature } }
+    }
+
+    /// A bundle-less `UnpauseMints` at `nonce`, co-signed by the PQ guardians at `indices`.
+    fn unpause_tx(indices: &[u8], nonce: u64) -> Transaction {
+        let keys = pq_keys();
+        let m = crate::bridge::gov::unpause_message(7, nonce);
+        let pq_signatures = indices
+            .iter()
+            .map(|&i| PqSignature { index: i, signature: keys[i as usize].sign(&m).as_bytes().to_vec() })
+            .collect();
+        Transaction { chain_id: 7, bundle: None, action: Action::UnpauseMints { nonce, pq_signatures } }
+    }
+
+    fn paused(l: &Ledger) -> (bool, u64) {
+        let b = l.bridge().unwrap();
+        (b.mint_paused, b.pause_nonce)
+    }
+
+    /// The pause, end to end through `validate` and `apply_tx`: the pause key pauses (bundle-less,
+    /// no fee), a replayed pause is refused, a transfer attest is refused `MintsPaused` while a
+    /// burn and a rotation go through, the pause key can never unpause, a short or a stranger's
+    /// quorum is refused, and a PQ quorum unpauses — after which the same attestation mints.
+    #[test]
+    fn the_pause_key_pauses_and_only_a_pq_quorum_unpauses() {
+        let (mut l, secrets) = ledger();
+        let proposer = proposer().address();
+        deposit(&mut l, &secrets, 1_000, 0, 20);
+        // A wrong key, then a pause signed for another nonce or another chain, are refused.
+        let stranger = Keypair::from_seed([0x55; 32]).unwrap();
+        assert_eq!(l.validate(&pause_tx(&stranger, 0), &StubExecutor), Err(TxError::Bridge(BridgeError::BadPauseSignature)));
+        assert_eq!(
+            l.validate(&pause_tx(&pause_key(), 1), &StubExecutor),
+            Err(TxError::Bridge(BridgeError::BadPauseNonce { expected: 0, got: 1 }))
+        );
+        let mut other_chain = pause_tx(&pause_key(), 0);
+        other_chain.action = Action::PauseMints {
+            nonce: 0,
+            signature: pause_key().sign(&crate::bridge::gov::pause_message(8, 0)),
+        };
+        assert_eq!(l.validate(&other_chain, &StubExecutor), Err(TxError::Bridge(BridgeError::BadPauseSignature)));
+        // Unpausing an unpaused bridge is refused: it would only move the nonce past a pause the
+        // key may already have signed.
+        assert_eq!(l.validate(&unpause_tx(&[0, 1, 2, 3, 4], 0), &StubExecutor), Err(TxError::Bridge(BridgeError::NotPaused)));
+
+        // The pause key pauses. No bundle, no fee.
+        let pause = pause_tx(&pause_key(), 0);
+        assert_eq!(pause.bundle, None);
+        l.apply_tx(&pause, &proposer, &StubExecutor).unwrap();
+        assert_eq!(paused(&l), (true, 1));
+        // Replayed: the nonce moved on.
+        assert_eq!(l.validate(&pause, &StubExecutor), Err(TxError::Bridge(BridgeError::BadPauseNonce { expected: 1, got: 0 })));
+        // The key's only other lever, a fresh pause at the current nonce, pauses nothing further.
+        assert_eq!(l.validate(&pause_tx(&pause_key(), 1), &StubExecutor), Err(TxError::Bridge(BridgeError::AlreadyPaused)));
+
+        // A transfer is refused while paused…
+        let a = attest(&secrets, transfer(500, 0, recipient().recipient_hash(), 1));
+        let mint = attest_tx(&l, a, recipient(), 70);
+        assert_eq!(l.validate(&mint, &StubExecutor), Err(TxError::Bridge(BridgeError::MintsPaused)));
+        // …while a burn and a guardian-set rotation go through.
+        l.apply_tx(&burn_tx(&l, 1, 400, 0, |_| {}), &proposer, &StubExecutor).unwrap();
+        assert_eq!(l.tokens().unwrap().get(1).unwrap().total_supply, 600, "redemption is never trapped");
+        let rotation = Body {
+            timestamp: 1,
+            nonce: 0,
+            emitter_chain: CHAIN_RAND,
+            emitter_address: crate::bridge::GOVERNANCE_EMITTER,
+            sequence: 9,
+            consistency_level: 0,
+            payload: Payload::GuardianSetUpgrade(crate::bridge::GuardianSetUpgrade {
+                new_index: 1,
+                keys: (1u8..=6).map(|i| guardian_address(&[i; 32])).collect(),
+            })
+            .encode(),
+        };
+        let rotate = attest_tx(&l, attest(&secrets, rotation), recipient(), 50);
+        l.apply_tx(&rotate, &proposer, &StubExecutor).unwrap();
+        assert_eq!(l.bridge().unwrap().current_set, 1);
+
+        // The pause key cannot unpause: filed as a PQ quorum it is short, and in a full-length
+        // list its signature is not a guardian's.
+        let m = crate::bridge::gov::unpause_message(7, 1);
+        let by_pause_key = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::UnpauseMints {
+                nonce: 1,
+                pq_signatures: vec![PqSignature { index: 0, signature: pause_key().sign(&m).as_bytes().to_vec() }],
+            },
+        };
+        assert!(matches!(l.validate(&by_pause_key, &StubExecutor), Err(TxError::Bridge(BridgeError::PqNoQuorum { have: 1, need: 5, n: 6 }))));
+        let mut padded = unpause_tx(&[0, 1, 2, 3, 4], 1);
+        let Action::UnpauseMints { pq_signatures, .. } = &mut padded.action else { panic!() };
+        pq_signatures[0].signature = pause_key().sign(&m).as_bytes().to_vec();
+        assert_eq!(l.validate(&padded, &StubExecutor), Err(TxError::Bridge(BridgeError::PqBadSignature { index: 0 })));
+        // A short quorum, and a quorum over the wrong nonce, are refused.
+        assert!(matches!(
+            l.validate(&unpause_tx(&[0, 1, 2, 3], 1), &StubExecutor),
+            Err(TxError::Bridge(BridgeError::PqNoQuorum { have: 4, need: 5, n: 6 }))
+        ));
+        assert_eq!(
+            l.validate(&unpause_tx(&[0, 1, 2, 3, 4], 0), &StubExecutor),
+            Err(TxError::Bridge(BridgeError::BadPauseNonce { expected: 1, got: 0 }))
+        );
+        // Still paused through all of that.
+        assert_eq!(paused(&l), (true, 1));
+
+        // Any quorum of the PQ guardians unpauses.
+        let unpause = unpause_tx(&[1, 2, 3, 4, 5], 1);
+        l.apply_tx(&unpause, &proposer, &StubExecutor).unwrap();
+        assert_eq!(paused(&l), (false, 2));
+        assert_eq!(
+            l.validate(&unpause, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::BadPauseNonce { expected: 2, got: 1 })),
+            "an unpause is not replayable either"
+        );
+        // And the refused transfer, signed by the set the rotation superseded (still in its
+        // grace window), now mints.
+        l.apply_tx(&mint, &proposer, &StubExecutor).unwrap();
+        assert_eq!(l.tokens().unwrap().get(1).unwrap().total_supply, 1_100);
+        assert!(l.tokens().unwrap().backing_invariant_holds());
+    }
+
+    /// Pause and unpause ride without a bundle: one carrying a bundle is refused by shape, and a
+    /// chain without a bridge refuses both before anything else.
+    #[test]
+    fn pause_and_unpause_are_bundle_less_and_gated_on_the_bridge() {
+        let (l, _) = ledger();
+        let mut with_bundle = pause_tx(&pause_key(), 0);
+        with_bundle.bundle = Some(fee_bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], gas::BUNDLE_BASE));
+        assert_eq!(l.validate(&with_bundle, &StubExecutor), Err(TxError::ActionCarriesBundle("pause_mints")));
+        let mut plain = l.clone();
+        plain.set_bridge(None);
+        assert_eq!(plain.validate(&pause_tx(&pause_key(), 0), &StubExecutor), Err(TxError::Bridge(BridgeError::Disabled)));
+        assert_eq!(plain.validate(&unpause_tx(&[0, 1, 2, 3, 4], 0), &StubExecutor), Err(TxError::Bridge(BridgeError::Disabled)));
+    }
+
+    /// The daily cap through the ledger, on the block's own timestamp: exactly the cap in one
+    /// block is admitted; two attests that each fit but together pass it cannot share a block —
+    /// the second is refused where it sits and the block leaves the ledger untouched; the next
+    /// UTC day of the block time counts from zero; a second backing of the same token has its
+    /// own allowance.
+    #[test]
+    fn the_daily_cap_binds_per_backing_across_a_block_and_resets_with_the_block_day() {
+        let (mut l, secrets) = ledger();
+        let proposer = proposer().address();
+        // Token 1 gets a second coin, and the registry a cap of 1 000 per backing per day.
+        let mut tokens = l.tokens().unwrap().clone().with_mint_cap(1_000);
+        tokens.add_backing(1, 3, [0xdd; 32], 8).unwrap();
+        l.set_tokens(Some(tokens));
+        let day = |l: &Ledger| (l.timestamp_ms() / 86_400_000) as u32;
+        let attest_of = |l: &Ledger, chain: u16, token: [u8; 32], amount: u128, seq: u64, seed: u32| {
+            let mut body = transfer_of(token, amount, 0, recipient().recipient_hash(), seq);
+            body.emitter_chain = chain;
+            body.emitter_address = [chain as u8; 32];
+            if let Payload::Transfer(mut t) = Payload::decode(&body.payload).unwrap() {
+                t.token_chain = chain;
+                body.payload = Payload::Transfer(t).encode();
+            }
+            attest_tx(l, attest(&secrets, body), recipient(), seed)
+        };
+        let one = attest_of(&l, 2, TOKEN, 600, 1, 100);
+        let two = attest_of(&l, 2, TOKEN, 500, 2, 110);
+        // Each fits on its own…
+        assert_eq!(l.validate(&one, &StubExecutor), Ok(()));
+        assert_eq!(l.validate(&two, &StubExecutor), Ok(()));
+        // …and not both in one block: the second is refused by index, the ledger left as it was.
+        let before = l.clone();
+        let refused = l.apply_transactions(&[one.clone(), two.clone()], &proposer, &StubExecutor).unwrap_err();
+        assert_eq!(
+            refused,
+            crate::ledger::BlockError::InvalidTx {
+                index: 1,
+                error: TxError::Bridge(BridgeError::Token(TokenError::MintCapExceeded { cap: 1_000, minted_today: 600, amount: 500 })),
+            }
+        );
+        assert_eq!(l.tokens(), before.tokens(), "a refused block moved no counter");
+        // Exactly the cap in one block is admitted; one unit more is refused.
+        let rest = attest_of(&l, 2, TOKEN, 400, 3, 120);
+        l.apply_transactions(&[one, rest], &proposer, &StubExecutor).unwrap();
+        let b = l.tokens().unwrap().backing(1, 2, &TOKEN).unwrap().clone();
+        assert_eq!((b.minted_today, b.mint_day, b.locked), (1_000, day(&l), 1_000));
+        let over = attest_of(&l, 2, TOKEN, 1, 4, 130);
+        assert_eq!(
+            l.validate(&over, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Token(TokenError::MintCapExceeded { cap: 1_000, minted_today: 1_000, amount: 1 })))
+        );
+        // The chain-3 coin backs the same token and has its own day's allowance.
+        l.apply_tx(&attest_of(&l, 3, [0xdd; 32], 1_000, 5, 140), &proposer, &StubExecutor).unwrap();
+        assert_eq!(l.tokens().unwrap().get(1).unwrap().total_supply, 2_000);
+        // At the next UTC day of the block time the chain-2 coin counts from zero again.
+        let next_day = (l.timestamp_ms() / 86_400_000 + 1) * 86_400_000;
+        l.set_timestamp_ms(next_day);
+        let over = attest_of(&l, 2, TOKEN, 1, 4, 130);
+        l.apply_tx(&over, &proposer, &StubExecutor).unwrap();
+        let b = l.tokens().unwrap().backing(1, 2, &TOKEN).unwrap().clone();
+        assert_eq!((b.minted_today, b.mint_day, b.locked), (1, day(&l), 1_001));
+        assert!(l.tokens().unwrap().backing_invariant_holds());
     }
 }

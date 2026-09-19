@@ -77,12 +77,37 @@ pub const MAX_BACKING_DECIMALS: u8 = 18;
 /// tokens: USDT at 6 decimals releases `amount / 10^2`, and a burn that is not a whole number of
 /// those units would either strand value in custody (rounded down) or fail to release at all
 /// (below one unit) — [`TokenRegistry::check_release`] refuses both before any note is destroyed.
+///
+/// `minted_today` and `mint_day` are bridge hardening B1's per-backing daily mint cap: how much
+/// this coin's deposits have minted on UTC day `mint_day` (of the block timestamp,
+/// `crate::bridge::mint_day`). A deposit on a later day counts from zero again. They are consensus
+/// state — the token leaf hashes them — because the cap decides which attestations are admissible.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Backing {
     pub chain: u16,
     pub token: [u8; 32],
     pub decimals: u8,
     pub locked: u64,
+    pub minted_today: u64,
+    pub mint_day: u32,
+}
+
+impl Backing {
+    /// A fresh backing of `(chain, token)` at `decimals` source decimals: nothing locked, nothing
+    /// minted — what a listing (genesis, `add_backing`, a registration) starts every coin at.
+    pub fn new(chain: u16, token: [u8; 32], decimals: u8) -> Backing {
+        Backing { chain, token, decimals, locked: 0, minted_today: 0, mint_day: 0 }
+    }
+
+    /// What this backing has minted on `day`: `minted_today` if its counter is for that day, zero
+    /// if the counter is for an earlier one (the reset a new day brings, read without a write).
+    pub fn minted_on(&self, day: u32) -> u64 {
+        if self.mint_day == day {
+            self.minted_today
+        } else {
+            0
+        }
+    }
 }
 
 impl Backing {
@@ -170,6 +195,11 @@ pub struct TokenRegistry {
     /// [`TokenRegistry::add_backing`], the two places a backing comes into existence.
     backing_of: BTreeMap<(u16, [u8; 32]), u32>,
     next_index: u32,
+    /// Bridge hardening B1: the most one backing of any bridged token may mint in one UTC day, in
+    /// the token's own (8-decimal) units — the genesis `tokens.mint_cap_per_day`, applied **per
+    /// backing** ([`TokenError::MintCapExceeded`]). [`TokenRegistry::new`] starts it uncapped
+    /// (`u64::MAX`); genesis sets it with [`TokenRegistry::with_mint_cap`].
+    mint_cap_per_day: u64,
 }
 
 /// Why a registry operation was refused. A later task's `validate`/`apply` for the RPL actions
@@ -246,6 +276,11 @@ pub enum TokenError {
     /// its relayer fee failed the check.
     #[error("{amount} is not a multiple of the release unit {unit}")]
     NotReleasable { amount: u64, unit: u64 },
+    /// Bridge hardening B1: a deposit that would take its backing's `minted_today` past the
+    /// registry's `mint_cap_per_day`. Not a verdict on the attestation — it becomes admissible on
+    /// the next UTC day of the block timestamp.
+    #[error("mint cap {cap} per backing per day: {minted_today} minted today, {amount} more would pass it")]
+    MintCapExceeded { cap: u64, minted_today: u64, amount: u64 },
 }
 
 impl TokenRegistry {
@@ -258,7 +293,20 @@ impl TokenRegistry {
             index_of: BTreeMap::new(),
             backing_of: BTreeMap::new(),
             next_index: FIRST_TOKEN_INDEX,
+            mint_cap_per_day: u64::MAX,
         }
+    }
+
+    /// This registry with its per-backing daily mint cap set (B1) — what genesis builds from
+    /// `tokens.mint_cap_per_day`.
+    pub fn with_mint_cap(mut self, mint_cap_per_day: u64) -> TokenRegistry {
+        self.mint_cap_per_day = mint_cap_per_day;
+        self
+    }
+
+    /// B1's per-backing daily mint cap, in the token's own units.
+    pub fn mint_cap_per_day(&self) -> u64 {
+        self.mint_cap_per_day
     }
 
     pub fn get(&self, index: u32) -> Option<&TokenInfo> {
@@ -361,10 +409,7 @@ impl TokenRegistry {
                     }
                 }
                 MintAuthority::Bridge {
-                    backings: backings
-                        .into_iter()
-                        .map(|b| Backing { chain: b.chain, token: b.token, decimals: b.decimals, locked: 0 })
-                        .collect(),
+                    backings: backings.into_iter().map(|b| Backing::new(b.chain, b.token, b.decimals)).collect(),
                 }
             }
             other => other,
@@ -418,24 +463,36 @@ impl TokenRegistry {
         if backings.len() >= MAX_BACKINGS {
             return Err(TokenError::TooManyBackings);
         }
-        backings.push(Backing { chain, token, decimals, locked: 0 });
+        backings.push(Backing::new(chain, token, decimals));
         self.backing_of.insert((chain, token), index);
         Ok(())
     }
 
-    /// A deposit: `locked += amount` on the named backing and `total_supply += amount` on the
-    /// token, both checked and applied together, so `total_supply == Σ locked` survives every
-    /// refusal as well as every success.
+    /// A deposit on UTC day `day`: `locked += amount` on the named backing and `total_supply +=
+    /// amount` on the token, both checked and applied together, so `total_supply == Σ locked`
+    /// survives every refusal as well as every success — and the backing's daily mint counter
+    /// (B1) moves by the same `amount`, reset first if its day is over.
     ///
     /// [`TokenError::NotABacking`] when `(chain, token)` is not one of `index`'s backings — a
     /// non-bridged token has none at all, so this is also what it answers.
-    pub fn lock(&mut self, index: u32, chain: u16, token: &[u8; 32], amount: u64) -> Result<(), TokenError> {
+    pub fn lock(&mut self, index: u32, chain: u16, token: &[u8; 32], amount: u64, day: u32) -> Result<(), TokenError> {
         // Every refusal first, in one place a validate step can call on its own
         // (`check_lock`), so what admission pre-checks is by construction what this would
         // refuse — and so the writes below cannot half-apply.
-        self.check_lock(index, chain, token, amount)?;
+        self.check_lock(index, chain, token, amount, day)?;
         self.move_backing(index, chain, token, amount, true);
+        let backing = self.backing_mut(index, chain, token).expect("the checked half resolved the backing");
+        // `check_lock` bounded `minted_on(day) + amount` by the cap, so this cannot wrap.
+        backing.minted_today = backing.minted_on(day) + amount;
+        backing.mint_day = day;
         Ok(())
+    }
+
+    fn backing_mut(&mut self, index: u32, chain: u16, token: &[u8; 32]) -> Option<&mut Backing> {
+        match &mut self.by_index.get_mut(&index)?.authority {
+            MintAuthority::Bridge { backings } => backings.iter_mut().find(|b| b.chain == chain && &b.token == token),
+            _ => None,
+        }
     }
 
     /// The write half [`Self::lock`] and [`Self::release`] share: the token's `total_supply` and
@@ -458,10 +515,15 @@ impl TokenRegistry {
         backing.locked = if up { backing.locked + amount } else { backing.locked - amount };
     }
 
-    /// Exactly what [`Self::lock`] would refuse, without touching anything: the supply's
-    /// overflow, the pair being a backing of this token at all, and the backing's own overflow.
-    /// The validate step of a `BridgeAttest` calls this so its apply step cannot fail.
-    pub fn check_lock(&self, index: u32, chain: u16, token: &[u8; 32], amount: u64) -> Result<(), TokenError> {
+    /// Exactly what [`Self::lock`] would refuse, without touching anything: the pair being a
+    /// backing of this token at all, the backing's own overflow and the supply's, then B1's daily
+    /// mint cap for that backing on `day`. The validate step of a `BridgeAttest` calls this so its
+    /// apply step cannot fail.
+    ///
+    /// The cap is per backing: `minted_on(day) + amount <= mint_cap_per_day`, where a counter left
+    /// from an earlier day reads as zero. Exactly the cap is accepted, one unit over is
+    /// [`TokenError::MintCapExceeded`].
+    pub fn check_lock(&self, index: u32, chain: u16, token: &[u8; 32], amount: u64, day: u32) -> Result<(), TokenError> {
         let info = self.by_index.get(&index).ok_or(TokenError::UnknownToken(index))?;
         // The coin before the arithmetic: a pair that does not back this token is a different
         // mistake from an amount that does not fit, and naming the coin is the more useful of
@@ -469,6 +531,12 @@ impl TokenRegistry {
         let backing = self.backing(index, chain, token).ok_or(TokenError::NotABacking { index, chain })?;
         backing.locked.checked_add(amount).ok_or(TokenError::SupplyOverflow)?;
         info.total_supply.checked_add(amount).ok_or(TokenError::SupplyOverflow)?;
+        // B1, after the arithmetic that could not hold the deposit at all: today's counter plus
+        // this deposit against the cap. A sum past `u64::MAX` is past any cap too.
+        let minted_today = backing.minted_on(day);
+        if minted_today.checked_add(amount).is_none_or(|total| total > self.mint_cap_per_day) {
+            return Err(TokenError::MintCapExceeded { cap: self.mint_cap_per_day, minted_today, amount });
+        }
         Ok(())
     }
 
@@ -638,11 +706,14 @@ impl TokenRegistry {
             })
             .collect();
         let leaves_root = merkle_root(&leaves);
-        let mut buf = Vec::with_capacity(32 + 4 + 8);
+        let mut buf = Vec::with_capacity(32 + 4 + 8 + 8);
         buf.extend_from_slice(leaves_root.as_bytes());
         buf.extend_from_slice(&self.next_index.to_be_bytes());
         buf.extend_from_slice(&self.registration_fee.to_be_bytes());
-        Hash::digest_domain(b"rand-token-registry-1", &buf)
+        // B1: the cap decides which deposits are admissible, so it is committed like the fee.
+        // (Each backing's own counters are in its token's leaf, above.)
+        buf.extend_from_slice(&self.mint_cap_per_day.to_be_bytes());
+        Hash::digest_domain(b"rand-token-registry-2", &buf)
     }
 }
 
@@ -1233,7 +1304,7 @@ mod tests {
         assert_eq!(r.bridged(chain, &token).unwrap().index, 2);
         // A backing's `locked` is state, and the leaf commits to it.
         let listed = r.root();
-        r.lock(2, chain, &token, 5).unwrap();
+        r.lock(2, chain, &token, 5, 0).unwrap();
         assert_ne!(r.root(), listed, "the state root moves when a backing's locked moves");
     }
 
@@ -1303,7 +1374,7 @@ mod tests {
         MintAuthority::Bridge {
             backings: pairs
                 .iter()
-                .map(|&(chain, token)| Backing { chain, token, decimals: BRIDGE_DECIMALS, locked: 0 })
+                .map(|&(chain, token)| Backing { chain, token, decimals: BRIDGE_DECIMALS, locked: 0, minted_today: 0, mint_day: 0 })
                 .collect(),
         }
     }
@@ -1313,7 +1384,7 @@ mod tests {
     /// [`BRIDGE_DECIMALS`].
     fn bridge_decimals(pairs: &[(u16, [u8; 32], u8)]) -> MintAuthority {
         MintAuthority::Bridge {
-            backings: pairs.iter().map(|&(chain, token, decimals)| Backing { chain, token, decimals, locked: 0 }).collect(),
+            backings: pairs.iter().map(|&(chain, token, decimals)| Backing { chain, token, decimals, locked: 0, minted_today: 0, mint_day: 0 }).collect(),
         }
     }
 
@@ -1340,8 +1411,8 @@ mod tests {
         assert_eq!(i, 1);
         assert_eq!(r.bridged(USDT2.0, &USDT2.1).unwrap().index, i);
         assert_eq!(r.bridged(USDC2.0, &USDC2.1).unwrap().index, i, "one token, two coins");
-        r.lock(i, USDT2.0, &USDT2.1, 1_000).unwrap();
-        r.lock(i, USDC2.0, &USDC2.1, 400).unwrap();
+        r.lock(i, USDT2.0, &USDT2.1, 1_000, 0).unwrap();
+        r.lock(i, USDC2.0, &USDC2.1, 400, 0).unwrap();
         assert_eq!(r.get(i).unwrap().total_supply, 1_400, "both deposits are the same zUSD");
         assert_eq!(r.backing(i, USDT2.0, &USDT2.1).unwrap().locked, 1_000);
         assert_eq!(r.backing(i, USDC2.0, &USDC2.1).unwrap().locked, 400);
@@ -1355,7 +1426,7 @@ mod tests {
         let mut r = reg();
         let i = list_zusd(&mut r, &[USDT2, USDC2, (3, [0xcc; 32])]);
         for (chain, token, amount) in [(2u16, [0xaa; 32], 900u64), (3, [0xcc; 32], 250), (2, [0xbb; 32], 75)] {
-            r.lock(i, chain, &token, amount).unwrap();
+            r.lock(i, chain, &token, amount, 0).unwrap();
             assert!(r.backing_invariant_holds());
         }
         r.release(i, 2, &[0xaa; 32], 400, 0).unwrap();
@@ -1378,8 +1449,8 @@ mod tests {
     fn a_release_past_one_backing_is_refused_though_the_supply_covers_it() {
         let mut r = reg();
         let i = list_zusd(&mut r, &[USDT2, USDC2]);
-        r.lock(i, USDT2.0, &USDT2.1, 1_000).unwrap();
-        r.lock(i, USDC2.0, &USDC2.1, 100).unwrap();
+        r.lock(i, USDT2.0, &USDT2.1, 1_000, 0).unwrap();
+        r.lock(i, USDC2.0, &USDC2.1, 100, 0).unwrap();
         assert_eq!(
             r.release(i, USDC2.0, &USDC2.1, 400, 0),
             Err(TokenError::InsufficientBacking { locked: 100, amount: 400 }),
@@ -1398,8 +1469,8 @@ mod tests {
     fn two_releases_that_each_fit_alone_do_not_both_fit() {
         let mut r = reg();
         let i = list_zusd(&mut r, &[USDT2, USDC2]);
-        r.lock(i, USDT2.0, &USDT2.1, 100).unwrap();
-        r.lock(i, USDC2.0, &USDC2.1, 900).unwrap();
+        r.lock(i, USDT2.0, &USDT2.1, 100, 0).unwrap();
+        r.lock(i, USDC2.0, &USDC2.1, 900, 0).unwrap();
         r.release(i, USDT2.0, &USDT2.1, 60, 0).unwrap();
         assert_eq!(
             r.release(i, USDT2.0, &USDT2.1, 60, 0),
@@ -1427,7 +1498,7 @@ mod tests {
             0,
         )
         .unwrap();
-        r.lock(1, usdt6.0, &usdt6.1, 1_000).unwrap();
+        r.lock(1, usdt6.0, &usdt6.1, 1_000, 0).unwrap();
         assert_eq!(r.backing(1, usdt6.0, &usdt6.1).unwrap().release_unit(), 100);
         assert_eq!(
             r.release(1, usdt6.0, &usdt6.1, 199, 0),
@@ -1456,7 +1527,7 @@ mod tests {
             0,
         )
         .unwrap();
-        r.lock(1, usdt6.0, &usdt6.1, 10_000).unwrap();
+        r.lock(1, usdt6.0, &usdt6.1, 10_000, 0).unwrap();
         assert_eq!(
             r.release(1, usdt6.0, &usdt6.1, 1_000, 150),
             Err(TokenError::NotReleasable { amount: 150, unit: 100 })
@@ -1482,7 +1553,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.backing(1, dai18.0, &dai18.1).unwrap().release_unit(), 1);
-        r.lock(1, dai18.0, &dai18.1, 12_345_678).unwrap();
+        r.lock(1, dai18.0, &dai18.1, 12_345_678, 0).unwrap();
         r.release(1, dai18.0, &dai18.1, 7, 3).unwrap();
         assert_eq!(r.get(1).unwrap().total_supply, 12_345_671);
     }
@@ -1497,7 +1568,7 @@ mod tests {
             [(0u8, 100_000_000u64), (2, 1_000_000), (6, 100), (7, 10), (8, 1), (9, 1), (18, 1)]
         {
             assert_eq!(release_unit(decimals), unit, "{decimals} decimals");
-            assert_eq!(Backing { chain: 2, token: [0; 32], decimals, locked: 0 }.release_unit(), unit);
+            assert_eq!(Backing { chain: 2, token: [0; 32], decimals, locked: 0, minted_today: 0, mint_day: 0 }.release_unit(), unit);
         }
         assert_eq!(release_unit(WIRE_DECIMALS), 1, "the wire's own precision needs no rounding");
         assert_eq!(WIRE_DECIMALS, BRIDGE_DECIMALS, "one figure under two names");
@@ -1538,7 +1609,7 @@ mod tests {
             .register(bridged_asset_id("Rand EUR", "zEUR", &[1; 32]), "Rand EUR".into(), "zEUR".into(), 8, bridge(&[USDC2]), 0)
             .unwrap();
         assert_eq!(
-            r.lock(zusd, USDC2.0, &USDC2.1, 1),
+            r.lock(zusd, USDC2.0, &USDC2.1, 1, 0),
             Err(TokenError::NotABacking { index: zusd, chain: 2 }),
             "USDC backs zEUR, not zUSD"
         );
@@ -1693,12 +1764,12 @@ mod tests {
     fn lock_and_release_are_checked_both_ways() {
         let mut r = reg();
         let i = list_zusd(&mut r, &[USDT2, USDC2]);
-        r.lock(i, USDT2.0, &USDT2.1, u64::MAX).unwrap();
-        assert_eq!(r.lock(i, USDT2.0, &USDT2.1, 1), Err(TokenError::SupplyOverflow), "the backing");
-        assert_eq!(r.lock(i, USDC2.0, &USDC2.1, 1), Err(TokenError::SupplyOverflow), "and the supply");
+        r.lock(i, USDT2.0, &USDT2.1, u64::MAX, 0).unwrap();
+        assert_eq!(r.lock(i, USDT2.0, &USDT2.1, 1, 0), Err(TokenError::SupplyOverflow), "the backing");
+        assert_eq!(r.lock(i, USDC2.0, &USDC2.1, 1, 0), Err(TokenError::SupplyOverflow), "and the supply");
         assert_eq!(r.get(i).unwrap().total_supply, u64::MAX);
         assert_eq!(r.backing(i, USDC2.0, &USDC2.1).unwrap().locked, 0, "a refused lock moved nothing");
-        assert_eq!(r.lock(7, 2, &[0; 32], 1), Err(TokenError::UnknownToken(7)));
+        assert_eq!(r.lock(7, 2, &[0; 32], 1, 0), Err(TokenError::UnknownToken(7)));
         assert_eq!(r.release(7, 2, &[0; 32], 1, 0), Err(TokenError::UnknownToken(7)));
         r.release(i, USDT2.0, &USDT2.1, u64::MAX, 0).unwrap();
         assert_eq!(r.release(i, USDT2.0, &USDT2.1, 1, 0), Err(TokenError::InsufficientBacking { locked: 0, amount: 1 }));
@@ -1715,7 +1786,7 @@ mod tests {
             "Rand USD".into(),
             "zUSD".into(),
             8,
-            MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], decimals: BRIDGE_DECIMALS, locked: 7 }] },
+            MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], decimals: BRIDGE_DECIMALS, locked: 7, minted_today: 0, mint_day: 0 }] },
             0,
         )
         .unwrap();
@@ -1743,8 +1814,8 @@ mod tests {
         assert_eq!(r.get_by_id(&colliding).unwrap().index, n, "it is in the registry by id");
         assert!(r.bridged(2, &[0xaa; 32]).is_none(), "and unreachable by the coin");
         assert!(r.backing(n, 2, &[0xaa; 32]).is_none());
-        assert_eq!(r.lock(n, 2, &[0xaa; 32], 1), Err(TokenError::NotABacking { index: n, chain: 2 }));
-        assert_eq!(r.check_lock(n, 2, &[0xaa; 32], 1), Err(TokenError::NotABacking { index: n, chain: 2 }));
+        assert_eq!(r.lock(n, 2, &[0xaa; 32], 1, 0), Err(TokenError::NotABacking { index: n, chain: 2 }));
+        assert_eq!(r.check_lock(n, 2, &[0xaa; 32], 1, 0), Err(TokenError::NotABacking { index: n, chain: 2 }));
         // And once the coin really does back a bridged token, it resolves to that one.
         let zusd = list_zusd(&mut r, &[(2, [0xaa; 32])]);
         assert_eq!(r.bridged(2, &[0xaa; 32]).unwrap().index, zusd);
@@ -2015,11 +2086,11 @@ mod action_tests {
                 "Rand USD".into(),
                 "zUSD".into(),
                 BRIDGE_DECIMALS,
-                MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: USDT, decimals: BRIDGE_DECIMALS, locked: 0 }] },
+                MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: USDT, decimals: BRIDGE_DECIMALS, locked: 0, minted_today: 0, mint_day: 0 }] },
                 1,
             )
             .expect("a fresh listing");
-        registry.lock(index, 2, &USDT, supply).expect("a deposit of the listed coin");
+        registry.lock(index, 2, &USDT, supply, 0).expect("a deposit of the listed coin");
         index
     }
 
@@ -2072,7 +2143,7 @@ mod action_tests {
     #[test]
     fn a_registration_may_not_choose_a_bridge_or_program_authority() {
         let l = ledger();
-        let bridge = MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], decimals: BRIDGE_DECIMALS, locked: 0 }] };
+        let bridge = MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], decimals: BRIDGE_DECIMALS, locked: 0, minted_today: 0, mint_day: 0 }] };
         for authority in [bridge, MintAuthority::Program(crate::crypto::Hash([5; 32]))] {
             let tx = register_tx(&l, authority.clone(), Some(initial(&l, 5)), 20);
             assert_eq!(l.validate(&tx, &StubExecutor), Err(tok(TokenError::AuthorityNotAllowed)), "{authority:?}");
@@ -2326,7 +2397,7 @@ mod action_tests {
                 "Rand USD".into(),
                 "zUSD".into(),
                 BRIDGE_DECIMALS,
-                MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], decimals: BRIDGE_DECIMALS, locked: 0 }] },
+                MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], decimals: BRIDGE_DECIMALS, locked: 0, minted_today: 0, mint_day: 0 }] },
                 1,
             )
             .unwrap();

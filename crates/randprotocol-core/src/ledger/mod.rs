@@ -9,6 +9,7 @@
 //! parallel: each phase owns its own file.
 
 pub mod aggregation;
+pub mod bridge_gov;
 pub mod bridge_notes;
 pub mod call_envelope;
 pub mod staking;
@@ -1203,6 +1204,10 @@ impl Ledger {
             | Action::TokenBurn { .. }) => {
                 tokens::validate(self, tx, a, executor)?;
             }
+            // Bridge hardening B1: the pause and its lifting, gated on the `bridge` section.
+            a @ (Action::PauseMints { .. } | Action::UnpauseMints { .. }) => {
+                bridge_gov::validate(self, tx, a)?;
+            }
             Action::Aggregate { .. } => {
                 // The covered bundles' records live in node storage, which the ledger cannot
                 // see: admission and application of an aggregate run through
@@ -1344,6 +1349,9 @@ impl Ledger {
             | Action::SetAuthority { .. }
             | Action::TokenBurn { .. }) => {
                 tokens::apply(self, tx, a, executor)?;
+            }
+            a @ (Action::PauseMints { .. } | Action::UnpauseMints { .. }) => {
+                bridge_gov::apply(self, tx, a)?;
             }
             Action::Aggregate { .. } => {
                 // Unreachable through `validate_inner` (its action arm refuses first); named
@@ -2955,6 +2963,7 @@ mod tests {
                 guardians: vec![[2; 20]],
                 emitters: BTreeMap::from([(2u16, [9u8; 32])]),
                 pq_guardians: vec![],
+                pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
             };
         let mut bridged = plain.clone();
         bridged.set_bridge(Some(BridgeState::from_config(&config)));
@@ -3006,6 +3015,7 @@ mod tests {
                 guardians: vec![[2; 20]],
                 emitters: BTreeMap::from([(2u16, [9u8; 32])]),
                 pq_guardians: vec![],
+                pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));
@@ -3063,6 +3073,7 @@ mod tests {
                 guardians: vec![[2; 20]],
                 emitters: BTreeMap::from([(2u16, [9u8; 32])]),
                 pq_guardians: vec![],
+                pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));

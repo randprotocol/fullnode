@@ -133,6 +133,10 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         Action::Aggregate { aggregator, nonce, .. }
         | Action::UnbondAggregator { aggregator, nonce, .. }
         | Action::WithdrawAggregator { aggregator, nonce, .. } => Some((*aggregator, *nonce)),
+        // Bridge hardening B1: the bridge's one `pause_nonce`, which a pause and an unpause share.
+        // There is no address to key it on — the bridge is one register of one — so the zero
+        // address stands in, and `claim_key`'s role keeps it apart from every validator's.
+        Action::PauseMints { nonce, .. } | Action::UnpauseMints { nonce, .. } => Some((Address([0; 32]), *nonce)),
         _ => None,
     }
 }
@@ -150,6 +154,7 @@ fn claim_conflict_key(validator: &Address) -> Word8 {
 fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
     let role = match action {
         Action::Aggregate { .. } | Action::UnbondAggregator { .. } | Action::WithdrawAggregator { .. } => 1u8,
+        Action::PauseMints { .. } | Action::UnpauseMints { .. } => 2,
         _ => 0,
     };
     (role, claim.0, claim.1)
@@ -550,7 +555,14 @@ impl Mempool {
         // (and every proposal's trial-apply) until the node restarts. An `Aggregate`'s claim is
         // the aggregator register's nonce, so it is read there (spec §4 step 5).
         if let Some((addr, nonce)) = claim {
-            if matches!(
+            if matches!(tx.action, Action::PauseMints { .. } | Action::UnpauseMints { .. }) {
+                // B1: the bridge's `pause_nonce`, which only moves forward — a pooled pause or
+                // unpause signed for a nonce it has passed can never apply again.
+                let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
+                if bridge.pause_nonce != nonce {
+                    return Err(TxError::Bridge(BridgeError::BadPauseNonce { expected: bridge.pause_nonce, got: nonce }));
+                }
+            } else if matches!(
                 tx.action,
                 Action::Aggregate { .. } | Action::UnbondAggregator { .. } | Action::WithdrawAggregator { .. }
             ) {
@@ -1180,6 +1192,50 @@ mod tests {
         let clash = fixtures::bundle_tx(&l, [nf(1), nf(2)], [minted, cm(2)], fixtures::bundle_fee());
         assert_eq!(m.insert(clash, &l, &StubExecutor), Err(MempoolError::Conflict(minted)));
         assert_eq!(m.candidates(&l, 10), vec![mint]);
+    }
+
+    /// Bridge hardening B1: a pause and an unpause are bundle-less and share the bridge's one
+    /// `pause_nonce`, so it is a pool claim like a validator's: one pooled governance message per
+    /// nonce, and it dies once the bridge's nonce moves past it.
+    #[test]
+    fn a_pause_is_pooled_bundle_less_and_claims_the_pause_nonce() {
+        let (l, _) = bridged_ledger();
+        let mut m = Mempool::new(100);
+        let pause_key = fixtures::key(0x7f);
+        let pause = |nonce: u64| Transaction {
+            chain_id: l.chain_id(),
+            bundle: None,
+            action: Action::PauseMints {
+                nonce,
+                signature: pause_key.sign(&randprotocol_core::bridge::gov::pause_message(l.chain_id(), nonce)),
+            },
+        };
+        let first = pause(0);
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&l, 10), vec![first.clone()]);
+        // An unpause at the same nonce claims the same slot: only one can ever apply.
+        let keys = fixtures::pq_keys();
+        let msg = randprotocol_core::bridge::gov::unpause_message(l.chain_id(), 0);
+        let unpause = Transaction {
+            chain_id: l.chain_id(),
+            bundle: None,
+            action: Action::UnpauseMints {
+                nonce: 0,
+                pq_signatures: (0..5u8)
+                    .map(|i| randprotocol_core::bridge::PqSignature {
+                        index: i,
+                        signature: keys[i as usize].sign(&msg).as_bytes().to_vec(),
+                    })
+                    .collect(),
+            },
+        };
+        assert_eq!(m.precheck(&unpause, &l, &StubExecutor).map(|_| ()), Err(MempoolError::Conflict(claim_conflict_key(&Address([0; 32])))));
+        // Once the pause commits, the bridge's nonce is 1 and the pooled pause is dropped.
+        let mut after = l.clone();
+        after.apply_tx(&first, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        assert!(after.bridge().unwrap().mint_paused);
+        m.prune(&after);
+        assert!(m.is_empty());
     }
 
     /// A ledger on a bridged chain, plus the guardian secrets that can attest to it.

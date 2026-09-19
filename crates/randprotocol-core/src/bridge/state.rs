@@ -49,6 +49,12 @@ use crate::ledger::tokens::{MintAuthority, TokenError, TokenRegistry};
 /// `guardians[i]`. Genesis validation holds the two lists to the same length and each key to a
 /// Dilithium2 key's exact length, unique. Parsing defaults it to empty only so that validation,
 /// not the JSON decoder, reports the mismatch.
+///
+/// `pause_key` (bridge hardening spec §2, B1) is the one Dilithium2 key that may **pause** minting
+/// (`Action::PauseMints`, over [`crate::bridge::gov::pause_message`]); lifting a pause needs a PQ
+/// guardian quorum. Genesis validation requires it on every bridged chain, as a Dilithium2 key
+/// that is none of the `pq_guardians` (it must be held away from the guardian keys); parsing
+/// defaults it to absent for the same reason `pq_guardians` defaults to empty.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeConfig {
@@ -60,6 +66,8 @@ pub struct BridgeConfig {
     pub emitters: BTreeMap<u16, [u8; 32]>,
     #[serde(default)]
     pub pq_guardians: Vec<PublicKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_key: Option<PublicKey>,
 }
 
 /// The plain-bytes twin of [`BridgeConfig`], used for the genesis
@@ -75,18 +83,20 @@ pub struct BridgeCommit {
     pub guardians: Vec<GuardianKey>,
     pub emitters: BTreeMap<u16, [u8; 32]>,
     pub pq_guardians: Vec<PublicKey>,
+    pub pause_key: Option<PublicKey>,
 }
 
 impl From<&BridgeConfig> for BridgeCommit {
     /// Destructured on purpose: a new `BridgeConfig` field must not silently
     /// fall out of the genesis commitment — it has to break this conversion.
     fn from(cfg: &BridgeConfig) -> BridgeCommit {
-        let BridgeConfig { emitter, guardians, emitters, pq_guardians } = cfg;
+        let BridgeConfig { emitter, guardians, emitters, pq_guardians, pause_key } = cfg;
         BridgeCommit {
             emitter: *emitter,
             guardians: guardians.clone(),
             emitters: emitters.clone(),
             pq_guardians: pq_guardians.clone(),
+            pause_key: pause_key.clone(),
         }
     }
 }
@@ -125,6 +135,20 @@ pub struct BridgeState {
     /// the chain's life: a payload-2 rotation moves the ECDSA set only (a PQ rotation is the
     /// deferred payload 3).
     pub pq_guardians: Vec<PublicKey>,
+    /// B1: the genesis `bridge.pause_key`, the one key whose signature over
+    /// [`crate::bridge::gov::pause_message`] pauses minting. `None` only on a state not built
+    /// from a validated genesis; a `PauseMints` then has no key to verify against.
+    pub pause_key: Option<PublicKey>,
+    /// B1: while `true`, every `BridgeAttest` carrying a transfer is refused
+    /// [`BridgeError::MintsPaused`]. Burns and guardian-set rotations stay open — a pause must
+    /// never trap redemption.
+    pub mint_paused: bool,
+    /// B1: the nonce `M_pause` and `M_unpause` must carry; each accepted `PauseMints` or
+    /// `UnpauseMints` bumps it, so neither message can be replayed.
+    pub pause_nonce: u64,
+    /// B4: the nonce `M_list` and `M_register` must carry; each accepted `ListBacking` or
+    /// `RegisterBridgedToken` bumps it.
+    pub list_nonce: u64,
 }
 
 /// The small, whole-state half of a [`BridgeState`]: everything except the
@@ -144,6 +168,10 @@ pub struct BridgeMeta {
     pub current_set: u32,
     pub burn_sequence: u64,
     pub pq_guardians: Vec<PublicKey>,
+    pub pause_key: Option<PublicKey>,
+    pub mint_paused: bool,
+    pub pause_nonce: u64,
+    pub list_nonce: u64,
 }
 
 /// Why a bridge transaction was rejected.
@@ -218,6 +246,27 @@ pub enum BridgeError {
     /// `b"rand-bridge-pq-cosign-1" ‖ chain_id ‖ mu`.
     #[error("PQ co-signature {index} does not verify")]
     PqBadSignature { index: u8 },
+    /// B1: minting is paused (`PauseMints`), and this attestation carries a transfer. Not a
+    /// verdict on the transaction — it becomes admissible once a PQ quorum unpauses.
+    #[error("bridge minting is paused")]
+    MintsPaused,
+    /// B1: a `PauseMints` on a chain whose bridge has no pause key.
+    #[error("this bridge has no pause key")]
+    NoPauseKey,
+    /// B1: a `PauseMints` while minting is already paused. Refused rather than accepted as a
+    /// no-op, so a pause spends no nonce it does not need.
+    #[error("bridge minting is already paused")]
+    AlreadyPaused,
+    /// B1: an `UnpauseMints` while minting is not paused. Refused, so an unpause can never be
+    /// used to move `pause_nonce` past a pause the key has already signed.
+    #[error("bridge minting is not paused")]
+    NotPaused,
+    /// B1: `M_pause`/`M_unpause` must carry the bridge's current `pause_nonce`.
+    #[error("wrong pause nonce: expected {expected}, got {got}")]
+    BadPauseNonce { expected: u64, got: u64 },
+    /// B1: the pause key's signature over `M_pause` does not verify.
+    #[error("the pause signature does not verify")]
+    BadPauseSignature,
 }
 
 /// A transfer attestation as the pool needs it: which asset, under which note
@@ -254,6 +303,21 @@ pub struct BridgeTransfer {
     /// Carried for the record — the figure the source chain meant for whoever
     /// relayed this attestation. The pool pays no relayer.
     pub relayer_fee: u64,
+    /// B1: the UTC day this deposit counts against its backing's daily mint cap —
+    /// [`mint_day`] of the block time `check_attest` judged it at — carried so apply moves the
+    /// very counter check compared.
+    pub day: u32,
+}
+
+/// B1: seconds in a mint-cap day. A day is a UTC calendar day of the block timestamp
+/// (bridge hardening spec §2), which B2 bounds.
+pub const MINT_DAY_SECS: u64 = 86_400;
+
+/// B1: the mint-cap day of `now` (unix seconds, `timestamp_ms / 1000`) — `timestamp_ms /
+/// 86_400_000`, since flooring twice is flooring once. Saturates rather than wraps past `u32`
+/// (eleven million years out).
+pub fn mint_day(now: u64) -> u32 {
+    u32::try_from(now / MINT_DAY_SECS).unwrap_or(u32::MAX)
 }
 
 /// What an attestation would do, decoded and validated but not yet applied.
@@ -323,6 +387,7 @@ impl BridgeState {
             guardian_sets,
             current_set: 0,
             pq_guardians: cfg.pq_guardians.clone(),
+            pause_key: cfg.pause_key.clone(),
             ..Default::default()
         }
     }
@@ -341,6 +406,10 @@ impl BridgeState {
             burn_sequence,
             burns: _,
             pq_guardians,
+            pause_key,
+            mint_paused,
+            pause_nonce,
+            list_nonce,
         } = self;
         BridgeMeta {
             emitter: *emitter,
@@ -349,6 +418,10 @@ impl BridgeState {
             current_set: *current_set,
             burn_sequence: *burn_sequence,
             pq_guardians: pq_guardians.clone(),
+            pause_key: pause_key.clone(),
+            mint_paused: *mint_paused,
+            pause_nonce: *pause_nonce,
+            list_nonce: *list_nonce,
         }
     }
 
@@ -366,6 +439,10 @@ impl BridgeState {
             current_set,
             burn_sequence,
             pq_guardians,
+            pause_key,
+            mint_paused,
+            pause_nonce,
+            list_nonce,
         } = meta;
         BridgeState {
             emitter,
@@ -376,6 +453,10 @@ impl BridgeState {
             burn_sequence,
             burns,
             pq_guardians,
+            pause_key,
+            mint_paused,
+            pause_nonce,
+            list_nonce,
         }
     }
 
@@ -442,6 +523,12 @@ impl BridgeState {
         let payload = Payload::decode(&att.body.payload).map_err(|_| BridgeError::BadPayload)?;
         let plan = match payload {
             Payload::Transfer(t) => {
+                // B1: a paused bridge mints nothing. A flag read, before any other transfer
+                // check and long before a signature is looked at; rotations (below) and burns
+                // (`check_burn`) never read it, so a pause cannot trap redemption.
+                if self.mint_paused {
+                    return Err(BridgeError::MintsPaused);
+                }
                 if self.emitters.get(&att.body.emitter_chain) != Some(&att.body.emitter_address) {
                     return Err(BridgeError::WrongEmitter);
                 }
@@ -481,10 +568,12 @@ impl BridgeState {
                     .ok_or(BridgeError::UnlistedToken { chain: t.token_chain, token: t.token_address })?;
                 let (asset, index) = (info.id, info.index);
                 // Everything the ledger's `lock` would refuse, decided here, while this is still
-                // a comparison: this backing's `locked` overflowing, then the token's supply.
-                // The ledger applies the deposit note *before* it locks, so a refusal there
-                // would be a half-applied transaction.
-                tokens.check_lock(index, t.token_chain, &t.token_address, amount)?;
+                // a comparison: B1's per-backing daily mint cap for today's block day, then this
+                // backing's `locked` overflowing, then the token's supply. The ledger applies the
+                // deposit note *before* it locks, so a refusal there would be a half-applied
+                // transaction.
+                let day = mint_day(now);
+                tokens.check_lock(index, t.token_chain, &t.token_address, amount, day)?;
                 AttestPlan::Transfer(BridgeTransfer {
                     asset,
                     index,
@@ -493,6 +582,7 @@ impl BridgeState {
                     amount,
                     to_hash: t.to,
                     relayer_fee,
+                    day,
                 })
             }
             Payload::GuardianSetUpgrade(g) => {
@@ -715,12 +805,18 @@ impl BridgeState {
     /// and then the bridge hardening's B3 left it):
     ///
     /// ```text
-    /// blake3("rand-bridge-state-3"
+    /// blake3("rand-bridge-state-4"
     ///     || bincode(emitter, emitters, current_set, guardian_sets)
     ///     || merkle(sorted spent digests)
     ///     || burn_sequence BE
-    ///     || bincode(pq_guardians))
+    ///     || bincode(pq_guardians)
+    ///     || bincode(pause_key, mint_paused, pause_nonce, list_nonce))
     /// ```
+    ///
+    /// B1/B4 appended the pause key, the pause flag and the two governance
+    /// nonces and bumped the domain to `rand-bridge-state-4`: each decides
+    /// what the next governance message or attestation may do, so two nodes
+    /// that disagree about one must disagree at the state root.
     ///
     /// B3 appended the PQ guardian set and bumped the domain to
     /// `rand-bridge-state-3`: the set decides which attestations are
@@ -756,7 +852,11 @@ impl BridgeState {
         buf.extend_from_slice(merkle_root(&spent_leaves).as_bytes());
         buf.extend_from_slice(&self.burn_sequence.to_be_bytes());
         buf.extend_from_slice(&bincode::serialize(&self.pq_guardians).expect("PQ guardian keys serialize"));
-        Hash::digest_domain(b"rand-bridge-state-3", &buf)
+        buf.extend_from_slice(
+            &bincode::serialize(&(&self.pause_key, self.mint_paused, self.pause_nonce, self.list_nonce))
+                .expect("the pause and listing state serializes"),
+        );
+        Hash::digest_domain(b"rand-bridge-state-4", &buf)
     }
 }
 
@@ -886,7 +986,7 @@ mod tests {
                 MintAuthority::Bridge {
                     backings: pairs
                         .iter()
-                        .map(|&(chain, token)| crate::ledger::tokens::Backing { chain, token, decimals: 8, locked: 0 })
+                        .map(|&(chain, token)| crate::ledger::tokens::Backing { chain, token, decimals: 8, locked: 0, minted_today: 0, mint_day: 0 })
                         .collect(),
                 },
                 0,
@@ -904,7 +1004,7 @@ mod tests {
     fn tokens_with_the_test_token() -> TokenRegistry {
         let mut t = tokens();
         assert_eq!(list(&mut t, 2, TOKEN), 1);
-        t.lock(1, 2, &TOKEN, 1_000_000).expect("the fixture's locked backing");
+        t.lock(1, 2, &TOKEN, 1_000_000, 0).expect("the fixture's locked backing");
         t
     }
 
@@ -917,6 +1017,7 @@ mod tests {
             guardians: secrets.iter().map(guardian_address).collect(),
             emitters: (2u16..=5).map(|c| (c, [c as u8; 32])).collect(),
             pq_guardians: pq_keys().iter().map(|k| k.public_key().clone()).collect(),
+            pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
         };
         (config, secrets)
     }
@@ -1061,7 +1162,7 @@ mod tests {
         // the token, plus the coin the attestation deposits against — the ledger needs the first
         // to compute the deposit note's commitment and the second to lock the right backing.
         let plan = check(&st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap().plan().clone();
-        let want = BridgeTransfer { asset, index: 1, chain: 2, token: TOKEN, amount: 1_000, to_hash: to_hash(), relayer_fee: 10 };
+        let want = BridgeTransfer { asset, index: 1, chain: 2, token: TOKEN, amount: 1_000, to_hash: to_hash(), relayer_fee: 10, day: 0 };
         assert_eq!(plan, AttestPlan::Transfer(want.clone()));
         let out = apply(&mut st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap();
         assert_eq!(out, AttestOutcome::Minted(want));
@@ -1164,12 +1265,13 @@ mod tests {
                 amount: u64::MAX,
                 to_hash: to_hash(),
                 relayer_fee: 7,
+                day: 0,
             })
         );
         // And once that coin is holding anything at all, the same transfer is refused before a
         // single signature is recovered: `check_attest` decides what `lock` would refuse, so the
         // ledger's apply step cannot be the thing that discovers it.
-        tk.lock(1, 2, &TOKEN, 1).unwrap();
+        tk.lock(1, 2, &TOKEN, 1, 0).unwrap();
         assert_eq!(
             check(&st, &tk, &attest(&s, 0, transfer_body(2, u64::MAX as u128, 7, 1)), 1).unwrap_err(),
             BridgeError::Token(TokenError::SupplyOverflow)
@@ -1350,7 +1452,7 @@ mod tests {
         let before = st.root();
         let tokens_before = tk.root();
         list(&mut tk, 3, OTHER_TOKEN);
-        tk.lock(1, 2, &TOKEN, 1_000).unwrap();
+        tk.lock(1, 2, &TOKEN, 1_000, 0).unwrap();
         assert_eq!(st.root(), before, "the bridge root is blind to the registry");
         assert_ne!(tk.root(), tokens_before, "which is exactly what the tokens root is for");
     }
@@ -1512,7 +1614,7 @@ mod tests {
         assert_eq!(sol, 2);
         // Both coins have to be holding something for a burn of them to get past the backing
         // check at all — that is the registry's business, not this state's.
-        tk.lock(sol, 5, &OTHER_TOKEN, 1_000).unwrap();
+        tk.lock(sol, 5, &OTHER_TOKEN, 1_000, 0).unwrap();
         apply(&mut st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 0, 1)), 1).unwrap();
         apply(&mut st, &tk, &attest(&s, 0, token_body(5, OTHER_TOKEN, 1_000, 0, 1)), 1).unwrap();
 
@@ -1570,8 +1672,8 @@ mod tests {
         let mut st = BridgeState::from_config(&c);
         let mut tk = tokens();
         let zusd = list_backed_by(&mut tk, 0x5a, &[(2, eth_usdt), (5, sol_usdt)]);
-        tk.lock(zusd, 2, &eth_usdt, 1_000_000).unwrap();
-        tk.lock(zusd, 5, &sol_usdt, 1_000_000).unwrap();
+        tk.lock(zusd, 2, &eth_usdt, 1_000_000, 0).unwrap();
+        tk.lock(zusd, 5, &sol_usdt, 1_000_000, 0).unwrap();
 
         // Each backing in turn: the chain-2 coin to an EVM recipient, the chain-5 coin to a full
         // 32-byte Solana pubkey.
@@ -1617,6 +1719,10 @@ mod tests {
     /// The bridge hardening's B3 appended the PQ guardian set and bumped the
     /// domain to `rand-bridge-state-3` — the value before that was
     /// 2504a9da5f62f2ef092493e4c38a8a47560340d0394b1d3721b5aceb6366e141.
+    /// B1/B4 appended the pause key, the pause flag and the two governance
+    /// nonces and bumped the domain to `rand-bridge-state-4` — the value
+    /// before that was
+    /// 2f1798b1aa25286958e333718b3d606590b97f0fa20ce3690499dd6550e63c46.
     #[test]
     fn root_is_pinned_for_a_fixed_state() {
         let mut st = BridgeState::from_config(&BridgeConfig {
@@ -1627,10 +1733,22 @@ mod tests {
                 PublicKey::from_bytes(&[0x33; crate::crypto::PUBLIC_KEY_LEN]).unwrap(),
                 PublicKey::from_bytes(&[0x44; crate::crypto::PUBLIC_KEY_LEN]).unwrap(),
             ],
+            pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
         });
         st.spent.insert(Hash([0x44; 32]));
         st.burn_sequence = 7;
-        assert_eq!(st.root().to_hex(), "2f1798b1aa25286958e333718b3d606590b97f0fa20ce3690499dd6550e63c46");
+        assert_eq!(st.root().to_hex(), "4f2ea1290d513a855ddaaa7aa2ce68a3bd5a54ef3f84819b238a6e9c1da0f712");
+        // B1/B4: the pause key, the pause flag and both governance nonces are committed.
+        for change in [
+            (|b: &mut BridgeState| b.pause_key = None) as fn(&mut BridgeState),
+            |b| b.mint_paused = true,
+            |b| b.pause_nonce = 1,
+            |b| b.list_nonce = 1,
+        ] {
+            let mut other = st.clone();
+            change(&mut other);
+            assert_ne!(other.root(), st.root());
+        }
         // and so is the PQ guardian set (B3)
         let mut other_pq = st.clone();
         other_pq.pq_guardians.reverse();
@@ -1890,6 +2008,7 @@ mod tests {
             guardians,
             emitters,
             pq_guardians: vector_keys(&pq),
+            pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
         });
         let now = att["now"].as_u64().unwrap();
         let by_name = |name: &str| {
@@ -1923,5 +2042,101 @@ mod tests {
         let five: Vec<PqSignature> = vector_sigs(&body["pq_signatures"]).into_iter().take(5).collect();
         assert!(st.check_attest(&tk, &rotation, &five, chain_id, now).is_ok());
         assert!(matches!(st.check_attest(&tk, &rotation, &[], chain_id, now), Err(BridgeError::PqNoQuorum { .. })));
+    }
+
+    // ---- bridge hardening B1: the mint pause and the per-backing daily cap ----------------------
+
+    /// A secret set that is no guardian set: its quorum passes every structural check and fails
+    /// at recovery — the expensive half — so a refusal it gets first was decided before any
+    /// signature work.
+    fn strangers() -> Vec<[u8; 32]> {
+        (0x90u8..0x96).map(|i| [i; 32]).collect()
+    }
+
+    /// While paused, every transfer is refused `MintsPaused` — before a single signature is
+    /// recovered — and nothing else is: a rotation is admitted and a burn's check passes, so a
+    /// pause never traps redemption. Unpaused, the same transfer is admitted.
+    #[test]
+    fn a_paused_bridge_refuses_transfers_only() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        let tk = tokens_with_the_test_token();
+        st.mint_paused = true;
+        let transfer = attest(&s, 0, transfer_body(2, 1_000, 0, CHAIN_RAND));
+        assert_eq!(check(&st, &tk, &transfer, 1).unwrap_err(), BridgeError::MintsPaused);
+        // Decided before recovery: a quorum of strangers gets the same answer.
+        let forged = attest(&strangers(), 0, transfer_body(2, 1_000, 0, CHAIN_RAND));
+        assert_eq!(check(&st, &tk, &forged, 1).unwrap_err(), BridgeError::MintsPaused);
+        // Burns stay open, and so do rotations (payload 2).
+        assert_eq!(st.check_burn(&tk, 1, 1_000, 2, &TOKEN, &EVM_TO, 0), Ok(()));
+        let rotation = attest(&s, 0, upgrade_body(1, vec![[7u8; 20], [8u8; 20]]));
+        assert_eq!(apply(&mut st, &tk, &rotation, 1).unwrap(), AttestOutcome::GuardianSetUpgraded(1));
+        st.mint_paused = false;
+        assert!(check(&st, &tk, &transfer, 1).is_ok(), "the signing set is superseded but inside its grace window");
+    }
+
+    /// The cap, per backing and per UTC day of the block time: exactly the cap is admitted, one
+    /// unit over is `MintCapExceeded` with the figures, the next day counts from zero, and one
+    /// coin's deposits leave another coin of the same token untouched. Decided before recovery.
+    #[test]
+    fn the_daily_mint_cap_is_per_backing_and_resets_at_the_next_utc_day() {
+        let (c, s) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        let mut tk = tokens().with_mint_cap(1_000);
+        let zusd = list_backed_by(&mut tk, 1, &[(2, TOKEN), (2, OTHER_TOKEN)]);
+        let day0 = 5 * MINT_DAY_SECS + 17; // any second of day 5
+        let deposit = |st: &mut BridgeState, tk: &mut TokenRegistry, token: [u8; 32], amount: u128, fee: u128, now: u64| {
+            let bytes = attest(&s, 0, token_body(2, token, amount, fee, CHAIN_RAND));
+            let checked = check(st, tk, &bytes, now)?;
+            let AttestPlan::Transfer(t) = checked.plan().clone() else { panic!("a transfer") };
+            assert_eq!(t.day, mint_day(now));
+            st.apply_attest(checked);
+            tk.lock(t.index, t.chain, &t.token, t.amount, t.day).map_err(BridgeError::Token)?;
+            Ok::<_, BridgeError>(())
+        };
+        deposit(&mut st, &mut tk, TOKEN, 600, 0, day0).unwrap();
+        // 400 more is exactly the cap: admitted.
+        deposit(&mut st, &mut tk, TOKEN, 400, 0, day0 + 60).unwrap();
+        let b = tk.backing(zusd, 2, &TOKEN).unwrap();
+        assert_eq!((b.minted_today, b.mint_day, b.locked), (1_000, 5, 1_000));
+        // One unit more is refused, with the figures, and before any signature is recovered.
+        let want = BridgeError::Token(TokenError::MintCapExceeded { cap: 1_000, minted_today: 1_000, amount: 1 });
+        assert_eq!(deposit(&mut st, &mut tk, TOKEN, 1, 0, day0 + 120).unwrap_err(), want);
+        let forged = attest(&strangers(), 0, token_body(2, TOKEN, 1, 0, CHAIN_RAND));
+        assert_eq!(check(&st, &tk, &forged, day0 + 120).unwrap_err(), want);
+        // The other coin of the same token has its own counter.
+        deposit(&mut st, &mut tk, OTHER_TOKEN, 1_000, 0, day0 + 180).unwrap();
+        assert_eq!(tk.get(zusd).unwrap().total_supply, 2_000);
+        // The last second of day 5 is still day 5; the first of day 6 starts from zero.
+        assert_eq!(deposit(&mut st, &mut tk, TOKEN, 1, 1, 6 * MINT_DAY_SECS - 1).unwrap_err(), BridgeError::Token(TokenError::MintCapExceeded { cap: 1_000, minted_today: 1_000, amount: 1 }));
+        deposit(&mut st, &mut tk, TOKEN, 1_000, 2, 6 * MINT_DAY_SECS).unwrap();
+        let b = tk.backing(zusd, 2, &TOKEN).unwrap();
+        assert_eq!((b.minted_today, b.mint_day, b.locked), (1_000, 6, 2_000));
+        assert!(tk.backing_invariant_holds());
+        // A burn releases custody and never touches the day's counter: minting is what is capped.
+        tk.release(zusd, 2, &TOKEN, 500, 0).unwrap();
+        assert_eq!(tk.backing(zusd, 2, &TOKEN).unwrap().minted_today, 1_000);
+    }
+
+    /// The day is the block timestamp's UTC day: `timestamp_ms / 86_400_000`, which is what the
+    /// ledger's `now_secs / 86_400` computes.
+    #[test]
+    fn the_mint_day_is_the_utc_day_of_the_block_time() {
+        for ms in [0u64, 86_399_999, 86_400_000, 1_758_240_000_000, 1_758_326_399_999] {
+            assert_eq!(mint_day(ms / 1000) as u64, ms / 86_400_000, "{ms}");
+        }
+        assert_eq!(mint_day(u64::MAX), u32::MAX, "saturates, never wraps");
+    }
+
+    /// The pause state, both nonces and the pause key ride the storage blob.
+    #[test]
+    fn the_pause_state_is_in_the_meta_blob() {
+        let (c, _) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        assert_eq!(st.pause_key, c.pause_key);
+        assert!(!st.mint_paused);
+        (st.mint_paused, st.pause_nonce, st.list_nonce) = (true, 3, 9);
+        let meta: BridgeMeta = bincode::deserialize(&bincode::serialize(&st.meta()).unwrap()).unwrap();
+        assert_eq!(BridgeState::from_parts(meta, BTreeSet::new(), BTreeMap::new()), st);
     }
 }

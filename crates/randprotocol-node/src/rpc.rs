@@ -694,7 +694,12 @@ fn attest_deposit(attestation: &[u8], tokens: Option<&TokenRegistry>) -> Option<
 /// `decimals` is the source token's, never the bridged token's eight: it is what a burn's release
 /// unit (`10^(8-decimals)`) is derived from, and the wallet's pre-check reads it here so it can
 /// refuse an unreleasable amount before buying two bundle proofs (bridge-06/audit O-5).
-fn asset_json(index: u32, b: &Backing) -> Value {
+///
+/// Bridge hardening B1 adds the daily cap: `mint_cap_per_day` (the registry's, which binds every
+/// backing alike), and this coin's `minted_today` on UTC day `mint_day` of the block time — as
+/// stored, so a counter from an earlier day reads as that day's figure and the next deposit
+/// starts it again from zero.
+fn asset_json(index: u32, b: &Backing, mint_cap_per_day: u64) -> Value {
     json!({
         "index": index,
         "chain": b.chain,
@@ -702,6 +707,9 @@ fn asset_json(index: u32, b: &Backing) -> Value {
         "asset_id": randprotocol_core::bridge::asset_id(b.chain, &b.token).to_hex(),
         "decimals": b.decimals,
         "locked": b.locked,
+        "mint_cap_per_day": mint_cap_per_day,
+        "minted_today": b.minted_today,
+        "mint_day": b.mint_day,
     })
 }
 
@@ -715,7 +723,7 @@ fn assets_json(tokens: &TokenRegistry) -> Vec<Value> {
         .iter()
         .flat_map(|info| match &info.authority {
             MintAuthority::Bridge { backings } => {
-                backings.iter().map(|b| asset_json(info.index, b)).collect::<Vec<_>>()
+                backings.iter().map(|b| asset_json(info.index, b, tokens.mint_cap_per_day())).collect::<Vec<_>>()
             }
             _ => Vec::new(),
         })
@@ -1169,6 +1177,14 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
         // private.)
         Action::TokenBurn { asset, amount } => json!({
             "kind": "token_burn", "asset": asset, "amount": amount,
+        }),
+        // Bridge hardening B1: the pause and its lifting. The nonce is the bridge's
+        // `pause_nonce` they spent; an unpause names its PQ signers (indices only, like an
+        // attest's `pq_signers`).
+        Action::PauseMints { nonce, .. } => json!({ "kind": "pause_mints", "nonce": nonce }),
+        Action::UnpauseMints { nonce, pq_signatures } => json!({
+            "kind": "unpause_mints", "nonce": nonce,
+            "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
         }),
     };
     json!({
@@ -1803,6 +1819,13 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // Dilithium2 quorum every `BridgeAttest` carries. A relayer reads it to verify
                 // and order the co-signatures it collects; a payload-2 rotation never moves it.
                 "pq_guardians": bridge.pq_guardians.iter().map(|k| k.to_hex()).collect::<Vec<_>>(),
+                // B1: the brake. `pause_nonce` is what the next `M_pause`/`M_unpause` must carry,
+                // `list_nonce` (B4) what the next `M_list`/`M_register` must; a signer reads them
+                // here before it signs, and the wallet refuses a file signed for another.
+                "mint_paused": bridge.mint_paused,
+                "pause_nonce": bridge.pause_nonce,
+                "list_nonce": bridge.list_nonce,
+                "pause_key": bridge.pause_key.as_ref().map(|k| k.to_hex()),
                 "burn_sequence": bridge.burn_sequence,
                 // `next_index` is gone with the bridge's own registry: there is no index to
                 // predict any more, because a bridged token is listed before it can be deposited
@@ -3681,6 +3704,10 @@ mod tests {
         // B3: the PQ guardian set, hex, index-aligned with the guardians.
         let pq: Vec<String> = fixtures::pq_keys().iter().map(|k| k.public_key().to_hex()).collect();
         assert_eq!(v["pq_guardians"], json!(pq));
+        // B1/B4: the brake and the two governance nonces a signer reads before it signs.
+        assert_eq!(v["mint_paused"], false);
+        assert_eq!((&v["pause_nonce"], &v["list_nonce"]), (&json!(0), &json!(0)));
+        assert_eq!(v["pause_key"], fixtures::key(0x7f).public_key().to_hex());
         assert_eq!(v["burn_sequence"], 1);
         // `next_index` is gone with the bridge's own registry: there is no index left to predict,
         // because a bridged token is listed before it can be deposited.
@@ -3696,6 +3723,9 @@ mod tests {
         let row = json!({
             "index": 1, "chain": 2, "token": hex::encode(fixtures::TOKEN), "asset_id": asset.to_hex(),
             "decimals": 8, "locked": 600,
+            // B1: the registry's per-backing daily cap, and this coin's counter — the 1 000
+            // deposited on the fixture's day 0; the burn released custody, not the counter.
+            "mint_cap_per_day": 100_000u64 * 100_000_000, "minted_today": 1_000, "mint_day": 0,
         });
         assert_eq!(ok(&st, "rand_getAssets", json!([])).await, json!([row]));
         assert_eq!(v["assets"], json!([row]));

@@ -2128,6 +2128,7 @@ pub(crate) mod fixtures {
             guardians: secrets.iter().map(guardian_address).collect(),
             emitters: std::collections::BTreeMap::from([(2u16, [2u8; 32])]),
             pq_guardians: pq_keys().iter().map(|k| k.public_key().clone()).collect(),
+            pause_key: Some(randprotocol_core::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
         };
         (config, secrets)
     }
@@ -2183,6 +2184,7 @@ pub(crate) mod fixtures {
                     // `randprotocol-core`'s to test.
                     backings: vec![randprotocol_core::genesis::GenesisBacking { chain: 2, token: TOKEN, decimals: 8 }],
                 }],
+                mint_cap_per_day: 100_000 * 100_000_000,
             }),
             aggregation: None,
             epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,

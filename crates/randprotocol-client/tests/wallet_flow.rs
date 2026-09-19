@@ -405,7 +405,7 @@ async fn a_token_is_registered_found_sent_privately_and_burned() {
     let started = Instant::now();
     let dir = tempfile::tempdir().unwrap();
     let key = Keypair::from_seed([103; 32]).unwrap();
-    let tokens = TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![] };
+    let tokens = TokensConfig { registration_fee: MIN_REGISTRATION_FEE, mint_cap_per_day: 0, tokens: vec![] };
     let handle = start_with(&dir, &key, genesis_full(&key, None, None, Some(tokens))).await;
     let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
     let a = Wallet::from_spend_key(SpendKey([5; 8]));
