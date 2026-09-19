@@ -5,6 +5,7 @@
 //! timer). No clocks, sockets, or disks live here, so it is tested with a
 //! simulated network in `tests.rs`.
 
+pub mod commit_rule;
 mod hotstuff;
 #[cfg(test)]
 mod tests;

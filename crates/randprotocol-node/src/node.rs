@@ -1786,6 +1786,34 @@ impl Node {
         if blocks.is_empty() {
             return Ok(());
         }
+        // Audit v3, CON-1a: a QC says a block was *certified*, not that it was committed. Blocks
+        // are certified and then abandoned at every view change, so accepting each block on its
+        // own QC — which is all this path used to check — let any peer, validator or not, hand a
+        // syncing node a certified fork to finalise. Status messages are unsigned, so claiming the
+        // height that wins the sync costs nothing.
+        //
+        // The same three-chain rule the live path uses decides here (`committed_prefix`). The last
+        // blocks of a batch carry no proof of their own commitment — the blocks that would prove
+        // them are the ones the server has not committed yet — so they are handed to the live path
+        // below as ordinary pending blocks instead, and commit when the chain's next blocks
+        // arrive.
+        let views: Vec<u64> = blocks.iter().map(|cb| cb.block.view()).collect();
+        let prefix = randprotocol_core::consensus::commit_rule::committed_prefix(&views);
+        let mut blocks = blocks;
+        let pending = blocks.split_off(prefix);
+        if !pending.is_empty() {
+            tracing::debug!(
+                "sync batch: {} block(s) commit by the three-chain rule, {} held for the live path",
+                blocks.len(),
+                pending.len()
+            );
+        }
+        if blocks.is_empty() {
+            // Nothing in this batch proves a commit. Offer what we were served to the replica: a
+            // block whose parent we hold enters the tree and commits through the live rule, which
+            // is also what stops this turning into a re-request loop.
+            return self.offer_pending(pending).await;
+        }
         let mut ledger: Ledger = self.hs.committed_ledger().clone();
         let mut head_hash = self.hs.committed_hash();
         let mut head_height = self.hs.committed_height();
@@ -1956,6 +1984,27 @@ impl Node {
         let acts = self.hs.start();
         self.handle_actions(acts).await?;
         self.mempool.prune(self.hs.tip_ledger());
+        // The tail the three-chain rule does not prove (audit v3, CON-1a).
+        self.offer_pending(pending).await?;
+        Ok(())
+    }
+
+    /// Blocks a sync batch carried that the commit rule does not commit yet: hand them to the
+    /// replica exactly as if they had been gossiped. `on_proposal` re-verifies each one — leader,
+    /// justify, execution — and commits it once a three-chain forms over it, so nothing here can
+    /// finalise a branch on a peer's say-so. Errors are ordinary: a block whose parent we do not
+    /// hold, or one from an abandoned branch, is not a failure of the sync.
+    async fn offer_pending(&mut self, pending: Vec<CommittedBlock>) -> Result<()> {
+        for cb in pending {
+            let height = cb.block.height();
+            match self.hs.on_proposal(cb.block, now_ms()) {
+                Ok(acts) => self.handle_actions(acts).await?,
+                Err(e) => {
+                    tracing::debug!("synced block {height} not taken by the replica: {e}");
+                    break;
+                }
+            }
+        }
         Ok(())
     }
 }
