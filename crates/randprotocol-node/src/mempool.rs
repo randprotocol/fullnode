@@ -1253,8 +1253,9 @@ mod tests {
         (gs.ledger.clone(), secrets)
     }
 
+    /// Full-length `kem_ek`: every mint recipient is held to `KEM_EK_BYTES` (core I-1).
     fn recipient() -> ShieldedAddress {
-        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
+        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; randprotocol_core::notes::KEM_EK_BYTES] }
     }
 
     /// The one attestation both relayers see: 1,000 of chain 2's token to `recipient()`,

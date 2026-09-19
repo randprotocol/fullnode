@@ -168,6 +168,11 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | T::AuthorityNotAllowed
                 | T::InitialMintRequired
                 | T::ZeroAmount
+                // Two byte lengths, like `TooManyDecimals` above: a `Key` authority's public key
+                // and a mint recipient's `kem_ek`, each compared against a compile-time constant
+                // and nothing else (core I-1). No state can make a wrong-length key right.
+                | T::BadAuthorityKey { .. }
+                | T::BadRecipientKey { .. }
         );
     }
     // The Dilithium2 co-signature's verdicts (bridge hardening B3). Every other bridge verdict

@@ -2242,7 +2242,7 @@ pub(crate) mod fixtures {
 
     /// The shielded address every fixture deposit is addressed to.
     pub(crate) fn recipient() -> ShieldedAddress {
-        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
+        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; randprotocol_core::notes::KEM_EK_BYTES] }
     }
 
     /// An attestation of `amount` units of [`TOKEN`] to `to`, emitted by chain 2's registered

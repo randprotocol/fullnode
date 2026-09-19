@@ -28,7 +28,7 @@ use crate::bridge::AssetId;
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{merkle_root, Hash, PublicKey};
 use crate::gas;
-use crate::notes::{ShieldedAddress, Word8};
+use crate::notes::{ShieldedAddress, Word8, KEM_EK_BYTES};
 use crate::program::ProgramId;
 use crate::types::actions::{set_authority_message, token_mint_message, InitialMint};
 use crate::types::{Action, Transaction};
@@ -233,6 +233,24 @@ pub enum TokenError {
     UnknownToken(u32),
     #[error("this action is not allowed by the token's mint authority")]
     AuthorityNotAllowed,
+    /// A `MintAuthority::Key` whose public key is not exactly [`crypto::PUBLIC_KEY_LEN`] bytes.
+    ///
+    /// `PublicKey` deserialises from the wire as any-length bytes — the length rule lives in
+    /// `PublicKey::from_bytes`, which the wire path never goes through — and a `Key` authority is
+    /// the one field of a registration that lands in *permanent consensus state*: it is inside the
+    /// `rand-token-leaf-1` leaf, so every `state_root()` re-serialises and re-hashes it, the whole
+    /// `Ledger` (registry included) is cloned per speculative tree entry and per candidate
+    /// transaction, and the node persists the registry as one blob per commit. Registration is
+    /// permissionless and its fee is flat, so without this check a faucet-funded attacker buys
+    /// megabytes of that state per RAND (final-review core I-1). Refused byte-for-byte, so it is a
+    /// permanent admission verdict.
+    #[error("a key mint authority must be exactly {expected} bytes, not {got}")]
+    BadAuthorityKey { expected: usize, got: usize },
+    /// A mint recipient whose ML-KEM encapsulation key is not exactly [`notes::KEM_EK_BYTES`]
+    /// bytes — the same rule `staking.rs`/`aggregation.rs` hold a payout address to. A recipient
+    /// nobody can seal a note to is not an address, and an unbounded one is flat-fee block space.
+    #[error("a mint recipient's kem_ek must be exactly {expected} bytes, not {got}")]
+    BadRecipientKey { expected: usize, got: usize },
     #[error("a fixed-supply token must mint its initial supply at registration")]
     InitialMintRequired,
     #[error("token {0}'s mint authority is not a key")]
@@ -392,6 +410,9 @@ impl TokenRegistry {
         height: u64,
     ) -> Result<u32, TokenError> {
         check_metadata(&name, &symbol, decimals)?;
+        // The second of two locks on the leaf's one unbounded field (core I-1): `validate`
+        // refuses it first, and no future caller of the registry can slip past this one.
+        check_authority_key(&authority)?;
         if self.index_of.contains_key(&id) {
             return Err(TokenError::AlreadyRegistered(id));
         }
@@ -703,6 +724,10 @@ impl TokenRegistry {
     /// see. `Action::SetAuthority`'s own `validate` refuses the same cases first, so this is the
     /// second of two locks on one door rather than the only one.
     pub fn set_key(&mut self, index: u32, new: Option<PublicKey>) -> Result<(), TokenError> {
+        // [`TokenRegistry::register`]'s second lock, on the rotation path (core I-1).
+        if let Some(pk) = &new {
+            check_public_key(pk)?;
+        }
         let info = self.by_index.get_mut(&index).ok_or(TokenError::UnknownToken(index))?;
         if !matches!(info.authority, MintAuthority::Key(_)) {
             return Err(TokenError::NotKeyAuthority(index));
@@ -761,6 +786,41 @@ pub fn check_metadata(name: &str, symbol: &str, decimals: u8) -> Result<(), Toke
     }
     if decimals > MAX_DECIMALS {
         return Err(TokenError::TooManyDecimals(decimals));
+    }
+    Ok(())
+}
+
+/// A `Key` mint authority's public key is exactly [`crate::crypto::PUBLIC_KEY_LEN`] bytes; every
+/// other authority kind carries no key and passes.
+///
+/// One comparison, over the action's own bytes, in front of the one field of a registration that
+/// becomes permanent consensus state (see [`TokenError::BadAuthorityKey`]). Called by
+/// `Action::RegisterToken`'s and `Action::SetAuthority`'s `validate` arms, and again by
+/// [`TokenRegistry::register`] and [`TokenRegistry::set_key`] — the second of two locks on one
+/// door, so no future caller of the registry can put an unbounded key in a leaf.
+pub fn check_authority_key(authority: &MintAuthority) -> Result<(), TokenError> {
+    if let MintAuthority::Key(pk) = authority {
+        check_public_key(pk)?;
+    }
+    Ok(())
+}
+
+/// [`check_authority_key`] for a bare key — what `SetAuthority { new: Some(pk) }` carries.
+pub fn check_public_key(pk: &PublicKey) -> Result<(), TokenError> {
+    let got = pk.as_bytes().len();
+    if got != crate::crypto::PUBLIC_KEY_LEN {
+        return Err(TokenError::BadAuthorityKey { expected: crate::crypto::PUBLIC_KEY_LEN, got });
+    }
+    Ok(())
+}
+
+/// A mint recipient's ML-KEM encapsulation key is exactly [`KEM_EK_BYTES`] bytes — the rule
+/// `staking::check_bond` and `aggregation::check_register` hold a payout address to, for the same
+/// reason ([`TokenError::BadRecipientKey`]).
+pub fn check_recipient(recipient: &ShieldedAddress) -> Result<(), TokenError> {
+    let got = recipient.kem_ek.len();
+    if got != KEM_EK_BYTES {
+        return Err(TokenError::BadRecipientKey { expected: KEM_EK_BYTES, got });
     }
     Ok(())
 }
@@ -950,6 +1010,12 @@ pub(super) fn validate(
                     return Err(TokenError::AuthorityNotAllowed.into())
                 }
             }
+            // And a `Key` authority's key is exactly one Dilithium2 public key long. The wire
+            // decodes a `PublicKey` as any-length bytes and this is the only field of a
+            // registration that lands in permanent consensus state, so an unbounded one is a
+            // flat-fee state-bloat DoS (core I-1, [`TokenError::BadAuthorityKey`]). Byte-level,
+            // so it sits here with the metadata rather than after a registry lookup.
+            check_authority_key(authority)?;
             // A fixed-supply token mints once or never: without an initial mint its supply is
             // zero for ever and the registration is a row nobody can use.
             if matches!(authority, MintAuthority::None) && initial.is_none() {
@@ -960,6 +1026,10 @@ pub(super) fn validate(
                 if m.amount == 0 {
                     return Err(TokenError::ZeroAmount.into());
                 }
+                // A recipient nobody can seal a note to is not an address — the payout rule of
+                // `staking::check_bond` and `aggregation::check_register`, here for the note this
+                // registration is about to append.
+                check_recipient(&m.recipient)?;
             }
             // The state lookups. The id binds every declared field and the *whole* initial mint,
             // so the identical declaration twice is the same asset — and the second is refused
@@ -1006,6 +1076,8 @@ pub(super) fn validate(
             if *amount == 0 {
                 return Err(TokenError::ZeroAmount.into());
             }
+            // Byte-level too, and before the registry: the recipient is the note's owner.
+            check_recipient(recipient)?;
             // Registered, `Key`-authorised, at the nonce its row expects — the triple
             // `SetAuthority` shares (see [`key_authority`]).
             let (info, pk) = key_authority(registry, *asset, *nonce)?;
@@ -1028,6 +1100,12 @@ pub(super) fn validate(
             }
         }
         Action::SetAuthority { asset, new, nonce, signature } => {
+            // The heir's key is held to the same length a registration's is, and for the same
+            // reason: it replaces the one in the token's leaf (core I-1). Byte-level, so it comes
+            // before the registry lookup.
+            if let Some(pk) = new {
+                check_public_key(pk)?;
+            }
             // Explicitly, and before anything is charged: only a registered, `Key`-authorised
             // token at the right nonce rotates — [`key_authority`] again, so a rotation and a
             // mint can never read the same row differently.
@@ -1937,8 +2015,13 @@ mod action_tests {
         Keypair::from_seed([21; 32]).unwrap()
     }
 
+    /// A well-formed mint recipient: a full-length ML-KEM encapsulation key, because
+    /// [`check_recipient`] holds every `InitialMint`/`TokenMint` recipient to `KEM_EK_BYTES`
+    /// (core I-1). `mint_commitment` reads only `pk`, so the length is invisible to every
+    /// commitment below — but it *is* inside `native_asset_id`, so the ids move with it and the
+    /// tests compute them through the same helpers.
     fn recipient() -> ShieldedAddress {
-        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }
+        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; KEM_EK_BYTES] }
     }
 
     /// A ledger at height 1 with the `tokens` gate on and an empty registry.
@@ -2200,6 +2283,87 @@ mod action_tests {
         }
     }
 
+    /// Core I-1. A `Key` mint authority is the one field of a registration that lands in
+    /// permanent consensus state (the `rand-token-leaf-1` leaf, re-hashed on every `state_root`,
+    /// cloned per speculative block, persisted per commit), and `PublicKey` decodes from the wire
+    /// as any-length bytes. Registration is permissionless at a flat fee, so an unbounded key is
+    /// a faucet-priced state-bloat DoS. Refused on both paths that can write one — the
+    /// registration and the rotation — and refused by the registry itself as the second lock.
+    #[test]
+    fn a_key_mint_authority_is_held_to_one_public_key_length() {
+        let mut l = ledger();
+        // A `PublicKey` of any length, built the only way one can arrive: off the wire.
+        // `PublicKey::from_bytes` enforces the length; its `Deserialize` does not, and the wire
+        // path never goes through the constructor — that is the gap I-1 closes.
+        let long = |n: usize| -> crate::crypto::PublicKey {
+            bincode::deserialize(&bincode::serialize(&vec![7u8; n]).expect("bytes")).expect("a wire key")
+        };
+        let bad = TokenError::BadAuthorityKey { expected: crate::crypto::PUBLIC_KEY_LEN, got: 1 << 20 };
+
+        // The registration path.
+        let fat = register_tx(&l, MintAuthority::Key(long(1 << 20)), Some(initial(&l, 5)), 20);
+        assert_eq!(l.validate(&fat, &StubExecutor), Err(tok(bad.clone())), "a 1 MiB authority key");
+        assert_eq!(l.apply_tx(&fat, &proposer().address(), &StubExecutor), Err(tok(bad)), "and apply agrees");
+        // One byte either side of the exact length is refused too.
+        for n in [crate::crypto::PUBLIC_KEY_LEN - 1, crate::crypto::PUBLIC_KEY_LEN + 1, 0] {
+            let tx = register_tx(&l, MintAuthority::Key(long(n)), Some(initial(&l, 5)), 20);
+            assert_eq!(
+                l.validate(&tx, &StubExecutor),
+                Err(tok(TokenError::BadAuthorityKey { expected: crate::crypto::PUBLIC_KEY_LEN, got: n })),
+                "{n} bytes"
+            );
+        }
+        // The honest length still registers.
+        let index = register_keyed(&mut l, 30);
+
+        // The rotation path: `SetAuthority { new: Some(fat) }` would replace the leaf's key.
+        let rot = rotate_tx(&l, index, Some(long(9_000)), 0, 40, &issuer());
+        assert_eq!(
+            l.validate(&rot, &StubExecutor),
+            Err(tok(TokenError::BadAuthorityKey { expected: crate::crypto::PUBLIC_KEY_LEN, got: 9_000 })),
+            "the heir's key is held to the same length"
+        );
+        // `new: None` (a renunciation) carries no key and is unaffected.
+        assert_eq!(l.validate(&rotate_tx(&l, index, None, 0, 41, &issuer()), &StubExecutor), Ok(()));
+
+        // And the registry refuses it directly — the second of two locks, for any future caller.
+        let mut r = TokenRegistry::new(REG_FEE);
+        let rid = crate::crypto::Hash([9; 32]);
+        assert_eq!(
+            r.register(rid, "A".into(), "A".into(), 0, MintAuthority::Key(long(3)), 0),
+            Err(TokenError::BadAuthorityKey { expected: crate::crypto::PUBLIC_KEY_LEN, got: 3 })
+        );
+        let ok = r.register(rid, "A".into(), "A".into(), 0, MintAuthority::Key(issuer().public_key().clone()), 0).unwrap();
+        assert_eq!(
+            r.set_key(ok, Some(long(3))),
+            Err(TokenError::BadAuthorityKey { expected: crate::crypto::PUBLIC_KEY_LEN, got: 3 })
+        );
+    }
+
+    /// Core I-1's companion: a mint recipient nobody can seal a note to is not an address, and an
+    /// unbounded `kem_ek` is flat-fee block space. The rule `staking::check_bond` and
+    /// `aggregation::check_register` already hold a payout address to, on both mint paths.
+    #[test]
+    fn a_mint_recipient_is_held_to_one_kem_key_length() {
+        let mut l = ledger();
+        let short = ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
+        let bad = |got: usize| tok(TokenError::BadRecipientKey { expected: KEM_EK_BYTES, got });
+
+        let mut init = initial(&l, 5);
+        init.recipient = short.clone();
+        let tx = register_tx(&l, MintAuthority::None, Some(init), 20);
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(bad(32)), "a registration's initial mint");
+
+        let index = register_keyed(&mut l, 30);
+        let mut mint = mint_tx(&l, index, 5, 0, 40);
+        let Action::TokenMint { recipient, .. } = &mut mint.action else { panic!("a mint") };
+        *recipient = short;
+        let mint = StubExecutor::bound(mint);
+        assert_eq!(l.validate(&mint, &StubExecutor), Err(bad(32)), "and a TokenMint");
+        // The honest recipient is the full-length one every other test here uses.
+        assert_eq!(l.validate(&mint_tx(&l, index, 5, 0, 50), &StubExecutor), Ok(()));
+    }
+
     /// The metadata rules are the registry's own, reported through the action.
     #[test]
     fn a_registration_checks_its_metadata() {
@@ -2318,7 +2482,9 @@ mod action_tests {
     /// theft), the blinding and the envelope (which would strand or grief the note).
     #[test]
     fn a_redirected_registration_is_a_different_token_and_cannot_take_the_originals_id() {
-        let attacker = ShieldedAddress { pk: [66; 8], kem_ek: vec![6; 32] };
+        // Full-length, like every recipient since core I-1: the point here is the redirect, not
+        // a malformed address.
+        let attacker = ShieldedAddress { pk: [66; 8], kem_ek: vec![6; KEM_EK_BYTES] };
         for field in ["recipient", "r", "envelope"] {
             let mut l = ledger();
             // What the creator built and gossiped: a fixed-supply token, where a stolen initial

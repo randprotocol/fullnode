@@ -3529,7 +3529,7 @@ mod tests {
         };
         let v = randprotocol_core::Address([3; 32]);
         let sig = randprotocol_core::Signature::empty();
-        let recipient = ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] };
+        let recipient = ShieldedAddress { pk: [4; 8], kem_ek: vec![6; randprotocol_core::notes::KEM_EK_BYTES] };
         let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
 
         let j = |action| {
