@@ -702,6 +702,7 @@ fn attest_deposit(attestation: &[u8], tokens: Option<&TokenRegistry>) -> Option<
 /// a stale figure a relayer would take for today's headroom. `mint_day` is the day that figure is
 /// for (the counter's own day never runs ahead of the head's: block timestamps are monotonic).
 fn asset_json(index: u32, b: &Backing, mint_cap_per_day: u64, day: u32) -> Value {
+    let (minted_today, mint_day) = backing_mint_figures(b, day);
     json!({
         "index": index,
         "chain": b.chain,
@@ -710,9 +711,20 @@ fn asset_json(index: u32, b: &Backing, mint_cap_per_day: u64, day: u32) -> Value
         "decimals": b.decimals,
         "locked": b.locked,
         "mint_cap_per_day": mint_cap_per_day,
-        "minted_today": b.minted_on(day),
-        "mint_day": day.max(b.mint_day),
+        "minted_today": minted_today,
+        "mint_day": mint_day,
     })
+}
+
+/// Bridge hardening B1's mint-cap figures for one backing on `day`: `minted_today`
+/// (`Backing::minted_on`, the figure the cap is checked against, never the raw counter — a
+/// counter left from an earlier day reads zero rather than a stale figure) and `mint_day` (the
+/// day that figure is for; the counter's own day never runs ahead of the head's, since block
+/// timestamps are monotonic). The one place both `rand_getAssets`/`rand_getBridgeState`
+/// (`asset_json`) and the token RPC (`backing_json`) compute these two numbers, so the
+/// day-boundary rule lives in exactly one place regardless of which endpoint's shape wraps it.
+fn backing_mint_figures(b: &Backing, day: u32) -> (u64, u32) {
+    (b.minted_on(day), day.max(b.mint_day))
 }
 
 /// B1's mint-cap day of the committed head: the UTC day of its block timestamp, the day the
@@ -761,25 +773,36 @@ const MAX_TOKEN_KEY_CHARS: usize = 100;
 
 /// One source-chain coin behind a bridged token, as the token RPC serves it: its chain, its
 /// source token address, its **source** decimals and the amount its contract holds locked for
-/// this chain — a decimal string, like every supply this RPC serves. (The per-backing daily mint
-/// counter joins this row with bridge hardening B1.)
-fn backing_json(b: &Backing) -> Value {
+/// this chain — a decimal string, like every supply this RPC serves. Bridge hardening B1's
+/// per-backing daily mint cap joins this row: `mint_cap_per_day` (the registry's, shared by every
+/// backing), `minted_today` (a decimal string, same reasoning as `locked`) and `mint_day`, from
+/// the same `backing_mint_figures` `asset_json` uses for `rand_getAssets`/`rand_getBridgeState` —
+/// one computation, two wire shapes (this one strings its amounts; that one, being the older,
+/// already-deployed shape, keeps them as numbers).
+fn backing_json(b: &Backing, mint_cap_per_day: u64, day: u32) -> Value {
+    let (minted_today, mint_day) = backing_mint_figures(b, day);
     json!({
         "chain": b.chain,
         "token": hex::encode(b.token),
         "decimals": b.decimals,
         "locked": b.locked.to_string(),
+        "mint_cap_per_day": mint_cap_per_day,
+        "minted_today": minted_today.to_string(),
+        "mint_day": mint_day,
     })
 }
 
 /// A mint authority in full: `{"kind":"none"}`, `{"kind":"key","key":hex,"address":base58}`,
 /// `{"kind":"bridge","backings":[…]}` or `{"kind":"program","program":hex}`.
-fn authority_json(a: &MintAuthority) -> Value {
+fn authority_json(a: &MintAuthority, mint_cap_per_day: u64, day: u32) -> Value {
     match a {
         MintAuthority::None => json!({ "kind": "none" }),
         MintAuthority::Key(pk) => json!({ "kind": "key", "key": pk.to_hex(), "address": pk.address().to_base58() }),
         MintAuthority::Bridge { backings } => {
-            json!({ "kind": "bridge", "backings": backings.iter().map(backing_json).collect::<Vec<_>>() })
+            json!({
+                "kind": "bridge",
+                "backings": backings.iter().map(|b| backing_json(b, mint_cap_per_day, day)).collect::<Vec<_>>(),
+            })
         }
         MintAuthority::Program(id) => json!({ "kind": "program", "program": id.to_hex() }),
     }
@@ -787,7 +810,7 @@ fn authority_json(a: &MintAuthority) -> Value {
 
 /// One registry row, as `rand_getTokens` lists it and `rand_getToken` returns it. Everything here
 /// is public registry state (RPL spec §4); nothing says which notes hold the token.
-fn token_json(info: &TokenInfo) -> Value {
+fn token_json(info: &TokenInfo, mint_cap_per_day: u64, day: u32) -> Value {
     json!({
         "index": info.index,
         "id": info.id.to_hex(),
@@ -795,19 +818,21 @@ fn token_json(info: &TokenInfo) -> Value {
         "name": info.name,
         "symbol": info.symbol,
         "decimals": info.decimals,
-        "authority": authority_json(&info.authority),
+        "authority": authority_json(&info.authority, mint_cap_per_day, day),
         "mint_nonce": info.mint_nonce,
         "total_supply": info.total_supply.to_string(),
         "registered_at": info.registered_at,
     })
 }
 
-/// A token's public supply and, for a bridged token, each backing's locked amount — what
-/// `rand-bridge-audit` reconciles against custody on the source chains. `backings` is empty for
-/// a native token.
-fn supply_json(info: &TokenInfo) -> Value {
+/// A token's public supply and, for a bridged token, each backing's locked amount (and B1's mint
+/// cap figures) — what `rand-bridge-audit` reconciles against custody on the source chains.
+/// `backings` is empty for a native token.
+fn supply_json(info: &TokenInfo, mint_cap_per_day: u64, day: u32) -> Value {
     let backings = match &info.authority {
-        MintAuthority::Bridge { backings } => backings.iter().map(backing_json).collect::<Vec<_>>(),
+        MintAuthority::Bridge { backings } => {
+            backings.iter().map(|b| backing_json(b, mint_cap_per_day, day)).collect::<Vec<_>>()
+        }
         _ => Vec::new(),
     };
     json!({ "total_supply": info.total_supply.to_string(), "backings": backings })
@@ -1878,8 +1903,14 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 None | Some(Value::Null) => MAX_TOKEN_PAGE,
                 Some(_) => (param::<u64>(p, 1, "limit")? as usize).min(MAX_TOKEN_PAGE),
             };
-            let rows: Vec<Value> =
-                tokens.iter().filter(|t| u64::from(t.index) >= from).take(limit).map(token_json).collect();
+            let day = head_mint_day(&st.storage)?;
+            let cap = tokens.mint_cap_per_day();
+            let rows: Vec<Value> = tokens
+                .iter()
+                .filter(|t| u64::from(t.index) >= from)
+                .take(limit)
+                .map(|info| token_json(info, cap, day))
+                .collect();
             Ok(json!({
                 "enabled": true,
                 "registration_fee": tokens.registration_fee,
@@ -1893,7 +1924,11 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "rand_getToken" => {
             let key = parse_token_key(p, 0)?;
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
-            Ok(tokens.as_ref().and_then(|t| find_token(t, &key)).map(token_json).unwrap_or(Value::Null))
+            let day = head_mint_day(&st.storage)?;
+            Ok(tokens
+                .as_ref()
+                .and_then(|t| find_token(t, &key).map(|info| token_json(info, t.mint_cap_per_day(), day)))
+                .unwrap_or(Value::Null))
         }
         // A token's supply and each backing's locked amount (decimal strings) — the numbers
         // `rand-bridge-audit` reconciles against custody. Same key forms and privacy note as
@@ -1901,7 +1936,11 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "rand_getTokenSupply" => {
             let key = parse_token_key(p, 0)?;
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
-            Ok(tokens.as_ref().and_then(|t| find_token(t, &key)).map(supply_json).unwrap_or(Value::Null))
+            let day = head_mint_day(&st.storage)?;
+            Ok(tokens
+                .as_ref()
+                .and_then(|t| find_token(t, &key).map(|info| supply_json(info, t.mint_cap_per_day(), day)))
+                .unwrap_or(Value::Null))
         }
         // The registry alone, which is what a wallet needs to read a note's `asset` word: the
         // bridged (`Bridge`-authority) rows of the token registry. Empty on a chain without a
@@ -3919,7 +3958,10 @@ mod tests {
         assert_eq!(
             bridged["authority"],
             json!({ "kind": "bridge", "backings": [
-                { "chain": 2, "token": hex::encode(fixtures::TOKEN), "decimals": 8, "locked": "600" }
+                {
+                    "chain": 2, "token": hex::encode(fixtures::TOKEN), "decimals": 8, "locked": "600",
+                    "mint_cap_per_day": 100_000u64 * 100_000_000, "minted_today": "1000", "mint_day": 0,
+                }
             ] })
         );
 
@@ -3973,7 +4015,10 @@ mod tests {
         assert_eq!(
             ok(&st, "rand_getTokenSupply", json!([1])).await,
             json!({ "total_supply": "600", "backings": [
-                { "chain": 2, "token": hex::encode(fixtures::TOKEN), "decimals": 8, "locked": "600" }
+                {
+                    "chain": 2, "token": hex::encode(fixtures::TOKEN), "decimals": 8, "locked": "600",
+                    "mint_cap_per_day": 100_000u64 * 100_000_000, "minted_today": "1000", "mint_day": 0,
+                }
             ] })
         );
         assert_eq!(ok(&st, "rand_getTokenSupply", json!([9])).await, Value::Null);
