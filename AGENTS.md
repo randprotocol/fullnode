@@ -4,7 +4,33 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-18)
+## Project memory (state as of 2026-09-19)
+
+### v0.5 — zUSD on RPL, the bridge launch — IN PROGRESS (2026-09-19), branch `rpl`
+
+**Take-over document: `docs/superpowers/handoffs/2026-09-19-zusd-v0.5.md`** — the goal, every user
+decision, the invariant, task state, the remaining path, the fixed chain-14 inputs and the traps.
+Spec `docs/superpowers/specs/2026-09-19-rpl-token-standard-design.md` (§12 = one zUSD), plan
+`docs/superpowers/plans/2026-09-19-rpl-token-standard.md`; live ledger (git-ignored) in the `rpl`
+worktree's `.superpowers/sdd/2026-09-19-rpl-token-standard/progress.md`.
+- **Goal**: zUSD mint/transfer/burn backed by USDT + USDC bridged from Tron, Solana, BNB Chain and
+  Ethereum, and bridging back; custody on the four chains always >= zUSD supply, checked before every
+  unbridge; then a live round trip on the deployed mainnet endpoints with the `RAND_BRIDGE_TESTER`
+  accounts; then tag **v0.5** with a GitHub release.
+- **RPL**: a ledger-level registry of shielded native tokens (`ledger/tokens.rs`), genesis-gated by
+  a `tokens` section (`rand-state-4`), permissionless creation, fees in RAND, symbols not unique.
+- **zUSD** has seven backings (USDT+USDC on chains 2, 3, 5; USDT on 4), each with `decimals` and a
+  consensus `locked`; `total_supply == Σ locked` by construction; a `BridgeBurn` names its coin and
+  is refused `NotABacking` / `InsufficientBacking` / `NotReleasable`.
+- **Security finding (pre-existing on main)**: a bundle proof bound nothing about the action or the
+  envelopes, so a gossiped `BridgeBurn`'s `to` could be swapped (theft) and a `Bond`'s validator
+  redirected. Fix approved: bind every bundle to `H(chain_id ‖ tx with proofs blanked)` via the
+  public input segment (Task 5b). bridge-06 keeps every mainnet token un-whitelisted until it is in.
+- **Asset hidden on a spend** before launch (user): a new multi-asset bundle guest replaces the
+  two-bundle token transfer — a new pinned guest digest, not a new constraint set.
+- The source endpoints are live on mainnet and immutable: chain 14's `bridge` genesis section is
+  fixed (handoff §6). The Rand-only governance payload (plan Task 10) is deferred past chain 14 —
+  `bridge-codec` is compiled into the live Solana program and must stay byte-stable.
 
 ### Final audit v3 (2026-09-19): POOL-1 and RPC-1 fixed in code; OPS-1 rotation rides chain 14
 
