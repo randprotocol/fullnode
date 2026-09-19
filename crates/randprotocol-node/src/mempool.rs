@@ -137,6 +137,8 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         // There is no address to key it on — the bridge is one register of one — so the zero
         // address stands in, and `claim_key`'s role keeps it apart from every validator's.
         Action::PauseMints { nonce, .. } | Action::UnpauseMints { nonce, .. } => Some((Address([0; 32]), *nonce)),
+        // B4: the bridge's `list_nonce`, shared the same way by a registration and a listing.
+        Action::RegisterBridgedToken { nonce, .. } | Action::ListBacking { nonce, .. } => Some((Address([0; 32]), *nonce)),
         _ => None,
     }
 }
@@ -155,6 +157,7 @@ fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
     let role = match action {
         Action::Aggregate { .. } | Action::UnbondAggregator { .. } | Action::WithdrawAggregator { .. } => 1u8,
         Action::PauseMints { .. } | Action::UnpauseMints { .. } => 2,
+        Action::RegisterBridgedToken { .. } | Action::ListBacking { .. } => 3,
         _ => 0,
     };
     (role, claim.0, claim.1)
@@ -561,6 +564,12 @@ impl Mempool {
                 let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
                 if bridge.pause_nonce != nonce {
                     return Err(TxError::Bridge(BridgeError::BadPauseNonce { expected: bridge.pause_nonce, got: nonce }));
+                }
+            } else if matches!(tx.action, Action::RegisterBridgedToken { .. } | Action::ListBacking { .. }) {
+                // B4: the bridge's `list_nonce`, the same rule one counter over.
+                let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
+                if bridge.list_nonce != nonce {
+                    return Err(TxError::Bridge(BridgeError::BadListNonce { expected: bridge.list_nonce, got: nonce }));
                 }
             } else if matches!(
                 tx.action,

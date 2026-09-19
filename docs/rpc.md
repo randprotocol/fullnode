@@ -597,6 +597,7 @@ Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false 
   "pause_nonce": 0,                      // B1: what the next M_pause / M_unpause must carry
   "list_nonce": 0,                       // B4: what the next M_list / M_register must carry
   "pause_key": "…",                      // B1: the one Dilithium2 key that may pause minting, hex
+  "registration_fee": 1000000000,        // B4: what a RegisterBridgedToken owes past the bundle base
   "burn_sequence": 1,                    // outbound messages emitted so far
   "next_index": 2,                       // the note index the next newly registered asset gets
   "assets": [ …the rows of `rand_getAssets`… ]
@@ -1130,6 +1131,21 @@ What changed for clients, in one place. Newest first.
 - **Pool:** two transactions at one token's `mint_nonce` (a `TokenMint` or a `SetAuthority`) or at
   one registration index conflict at submission, and one whose nonce or index the chain has
   already moved past is refused (`wrong mint nonce`, `wrong token index`) and pruned.
+
+### 2026-09-19 — bridged tokens listed after genesis (bridge hardening B4, chain 14)
+
+- Two actions, each on a RAND fee bundle its submitter pays and each authorised by a PQ guardian
+  quorum: `register_bridged_token` (`name`, `symbol`, `salt`, the first backing's `chain`, `token`
+  and source `decimals`, `nonce`, `asset_id`, `pq_signers`) — a new `Bridge`-authority token at the
+  next index, eight decimals on Rand, under the genesis `mint_cap_per_day`; its fee owes the bundle
+  base plus `registration_fee` — and `list_backing` (`token_index`, `chain`, `token`, `decimals`,
+  `nonce`, `pq_signers`), owing the base. The quorum signs `M_register` / `M_list` (fixed
+  big-endian layouts, `docs/superpowers/specs/2026-09-19-bridge-hardening-design.md` §9) at the
+  bridge's `list_nonce`, which both bump.
+- `rand_getBridgeState` gains `registration_fee`.
+- New refusals, none cached: `wrong list nonce` (`BadListNonce`), `chain N has no registered
+  emitter` (`NoEmitter`), and the registry's own (`BackingTaken`, `AlreadyRegistered`,
+  `TooManyBackings`, `BadBackingDecimals`, `RegistrationFeeTooLow`, …) under `bridge: `.
 
 ### 2026-09-19 — the mint cap and the mint pause (bridge hardening B1, chain 14)
 

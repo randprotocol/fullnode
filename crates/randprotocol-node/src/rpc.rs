@@ -1186,6 +1186,20 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
             "kind": "unpause_mints", "nonce": nonce,
             "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
         }),
+        // Bridge hardening B4: listing after genesis. Everything the quorum signed is public;
+        // `decimals` is the backing's source decimals (the token itself is eight on Rand), and
+        // the index a registration was given is the registry's to report (`rand_getAssets`).
+        Action::RegisterBridgedToken { name, symbol, salt, chain, token, decimals, nonce, pq_signatures } => json!({
+            "kind": "register_bridged_token", "name": name, "symbol": symbol, "salt": hex::encode(salt),
+            "chain": chain, "token": hex::encode(token), "decimals": decimals, "nonce": nonce,
+            "asset_id": randprotocol_core::ledger::tokens::bridged_asset_id(name, symbol, salt).to_hex(),
+            "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
+        }),
+        Action::ListBacking { token_index, chain, token, decimals, nonce, pq_signatures } => json!({
+            "kind": "list_backing", "token_index": token_index, "chain": chain, "token": hex::encode(token),
+            "decimals": decimals, "nonce": nonce,
+            "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -1826,6 +1840,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "pause_nonce": bridge.pause_nonce,
                 "list_nonce": bridge.list_nonce,
                 "pause_key": bridge.pause_key.as_ref().map(|k| k.to_hex()),
+                // B4: what a `RegisterBridgedToken`'s fee bundle owes on top of the bundle base —
+                // the registry's registration fee, read here so the wallet can pay it exactly.
+                "registration_fee": tokens.as_ref().map(|t| t.registration_fee),
                 "burn_sequence": bridge.burn_sequence,
                 // `next_index` is gone with the bridge's own registry: there is no index to
                 // predict any more, because a bridged token is listed before it can be deposited
@@ -3416,6 +3433,43 @@ mod tests {
     /// case passes no registry, which is what a bridge-less chain has: an attestation's asset
     /// index and amount then come back `null` rather than guessed at.
     #[test]
+    fn tx_json_renders_the_bridge_governance_actions() {
+        use randprotocol_core::bridge::PqSignature;
+        let gs = fixtures::genesis_with(1, vec![]);
+        let pq = |i: u8| PqSignature { index: i, signature: vec![i; 4] };
+        let bundle_less = |action| tx_json(&Transaction { chain_id: 1, bundle: None, action }, None, &StubExecutor)["action"].clone();
+        let pause = bundle_less(Action::PauseMints { nonce: 3, signature: randprotocol_core::Signature::empty() });
+        assert_eq!(pause, json!({ "kind": "pause_mints", "nonce": 3 }));
+        let unpause = bundle_less(Action::UnpauseMints { nonce: 4, pq_signatures: vec![pq(0), pq(2)] });
+        assert_eq!(unpause, json!({ "kind": "unpause_mints", "nonce": 4, "pq_signers": [0, 2] }));
+        let paid = |action| {
+            let t = fixtures::bundle_tx(&gs.ledger, [nf(1), nf(2)], [cm(1), cm(2)], bundle_fee());
+            let tx = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(1, t.bundle.unwrap(), action));
+            tx_json(&tx, None, &StubExecutor)["action"].clone()
+        };
+        let reg = paid(Action::RegisterBridgedToken {
+            name: "Shielded USD".into(),
+            symbol: "zUSD".into(),
+            salt: [0x27; 32],
+            chain: 2,
+            token: [0xda; 32],
+            decimals: 6,
+            nonce: 0,
+            pq_signatures: vec![pq(0), pq(1)],
+        });
+        assert_eq!(reg["kind"], "register_bridged_token");
+        assert_eq!((&reg["name"], &reg["symbol"], &reg["chain"], &reg["decimals"], &reg["nonce"]), (&json!("Shielded USD"), &json!("zUSD"), &json!(2), &json!(6), &json!(0)));
+        assert_eq!(reg["salt"], hex::encode([0x27; 32]));
+        assert_eq!(reg["asset_id"], randprotocol_core::ledger::tokens::bridged_asset_id("Shielded USD", "zUSD", &[0x27; 32]).to_hex());
+        assert_eq!(reg["pq_signers"], json!([0, 1]));
+        let list = paid(Action::ListBacking { token_index: 1, chain: 5, token: [0xc6; 32], decimals: 6, nonce: 6, pq_signatures: vec![pq(3)] });
+        assert_eq!(
+            list,
+            json!({ "kind": "list_backing", "token_index": 1, "chain": 5, "token": hex::encode([0xc6; 32]), "decimals": 6, "nonce": 6, "pq_signers": [3] })
+        );
+    }
+
+    #[test]
     fn tx_json_renders_every_new_action_kind() {
         let gs = fixtures::genesis_with(1, vec![]);
         let b = |nfs: [Word8; 2], cms: [Word8; 2]| {
@@ -3708,6 +3762,7 @@ mod tests {
         assert_eq!(v["mint_paused"], false);
         assert_eq!((&v["pause_nonce"], &v["list_nonce"]), (&json!(0), &json!(0)));
         assert_eq!(v["pause_key"], fixtures::key(0x7f).public_key().to_hex());
+        assert_eq!(v["registration_fee"], 1_000_000_000u64, "B4: what a registration owes past the base");
         assert_eq!(v["burn_sequence"], 1);
         // `next_index` is gone with the bridge's own registry: there is no index left to predict,
         // because a bridged token is listed before it can be deposited.

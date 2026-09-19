@@ -290,6 +290,38 @@ pub enum Action {
     /// [`crate::bridge::gov::unpause_message`]`(chain_id, nonce)`, `nonce` the bridge's
     /// `pause_nonce`. The pause key alone can never unpause. Bundle-less, like `PauseMints`.
     UnpauseMints { nonce: u64, pq_signatures: Vec<crate::bridge::PqSignature> },
+    /// Bridge hardening B4: register a new bridged token after genesis — a `Bridge`-authority
+    /// token at the registry's next index, eight decimals on Rand, under the genesis
+    /// `mint_cap_per_day`, with one backing `(chain, token)` of `decimals` **source** decimals,
+    /// unlocked. Its asset id is `tokens::bridged_asset_id(name, symbol, salt)`, the rule every
+    /// bridged token's id follows. `pq_signatures` is a PQ guardian quorum over
+    /// [`crate::bridge::gov::register_message`], `nonce` the bridge's `list_nonce`.
+    ///
+    /// Rides a RAND fee bundle paid by whoever submits it (zUSD's is a faucet-funded deployer),
+    /// owing the bundle base plus the registry's `registration_fee`; the quorum, not the payer, is
+    /// the authority, and a copy paid by someone else registers the same token.
+    RegisterBridgedToken {
+        name: String,
+        symbol: String,
+        salt: [u8; 32],
+        chain: u16,
+        token: [u8; 32],
+        decimals: u8,
+        nonce: u64,
+        pq_signatures: Vec<crate::bridge::PqSignature>,
+    },
+    /// Bridge hardening B4: add the backing `(chain, token)` of `decimals` source decimals to the
+    /// bridged token at `token_index`, unlocked. A PQ guardian quorum over
+    /// [`crate::bridge::gov::list_message`], `nonce` the bridge's `list_nonce` (shared with
+    /// `RegisterBridgedToken`). Rides a RAND fee bundle, owing the bundle base.
+    ListBacking {
+        token_index: u32,
+        chain: u16,
+        token: [u8; 32],
+        decimals: u8,
+        nonce: u64,
+        pq_signatures: Vec<crate::bridge::PqSignature>,
+    },
 }
 
 impl Action {
@@ -460,6 +492,28 @@ impl Action {
             Action::UnpauseMints { nonce, pq_signatures } => {
                 Action::UnpauseMints { nonce: *nonce, pq_signatures: pq_signatures.clone() }
             }
+            // B4: every field is kept — the quorum is a signature, not a proof, and a copy that
+            // stripped or swapped it must not keep the fee bundle's proof.
+            Action::RegisterBridgedToken { name, symbol, salt, chain, token, decimals, nonce, pq_signatures } => {
+                Action::RegisterBridgedToken {
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                    salt: *salt,
+                    chain: *chain,
+                    token: *token,
+                    decimals: *decimals,
+                    nonce: *nonce,
+                    pq_signatures: pq_signatures.clone(),
+                }
+            }
+            Action::ListBacking { token_index, chain, token, decimals, nonce, pq_signatures } => Action::ListBacking {
+                token_index: *token_index,
+                chain: *chain,
+                token: *token,
+                decimals: *decimals,
+                nonce: *nonce,
+                pq_signatures: pq_signatures.clone(),
+            },
         }
     }
 }
@@ -1090,7 +1144,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 20;
+    const VARIANTS: usize = 22;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -1113,6 +1167,8 @@ mod tests {
             Action::TokenBurn { .. } => 17,
             Action::PauseMints { .. } => 18,
             Action::UnpauseMints { .. } => 19,
+            Action::RegisterBridgedToken { .. } => 20,
+            Action::ListBacking { .. } => 21,
         }
     }
 
@@ -1234,6 +1290,30 @@ mod tests {
                 pq_signatures: vec![
                     crate::bridge::PqSignature { index: 1, signature: vec![0x6c; 8] },
                     crate::bridge::PqSignature { index: 3, signature: vec![0x6d; 8] },
+                ],
+            },
+            20 => Action::RegisterBridgedToken {
+                name: "Shielded USD".into(),
+                symbol: "zUSD".into(),
+                salt: [0x27; 32],
+                chain: 2,
+                token: [0xda; 32],
+                decimals: 6,
+                nonce: 0,
+                pq_signatures: vec![
+                    crate::bridge::PqSignature { index: 0, signature: vec![0x7c; 8] },
+                    crate::bridge::PqSignature { index: 4, signature: vec![0x7d; 8] },
+                ],
+            },
+            21 => Action::ListBacking {
+                token_index: 1,
+                chain: 5,
+                token: [0xc6; 32],
+                decimals: 6,
+                nonce: 6,
+                pq_signatures: vec![
+                    crate::bridge::PqSignature { index: 1, signature: vec![0x8c; 8] },
+                    crate::bridge::PqSignature { index: 2, signature: vec![0x8d; 8] },
                 ],
             },
             _ => panic!("no variant {i}"),
@@ -1445,6 +1525,63 @@ mod tests {
             (19, "unpause pq signature index", |t| {
                 let Action::UnpauseMints { pq_signatures, .. } = &mut t.action else { panic!() };
                 pq_signatures[1].index = 2;
+            }),
+            // B4: every field of a registration and a listing, the quorum included.
+            (20, "register name", |t| {
+                let Action::RegisterBridgedToken { name, .. } = &mut t.action else { panic!() };
+                name.push('!');
+            }),
+            (20, "register symbol", |t| {
+                let Action::RegisterBridgedToken { symbol, .. } = &mut t.action else { panic!() };
+                symbol.push('C');
+            }),
+            (20, "register salt", |t| {
+                let Action::RegisterBridgedToken { salt, .. } = &mut t.action else { panic!() };
+                salt[0] ^= 1;
+            }),
+            (20, "register chain", |t| {
+                let Action::RegisterBridgedToken { chain, .. } = &mut t.action else { panic!() };
+                *chain += 1;
+            }),
+            (20, "register token", |t| {
+                let Action::RegisterBridgedToken { token, .. } = &mut t.action else { panic!() };
+                token[31] ^= 1;
+            }),
+            (20, "register decimals", |t| {
+                let Action::RegisterBridgedToken { decimals, .. } = &mut t.action else { panic!() };
+                *decimals += 1;
+            }),
+            (20, "register nonce", |t| {
+                let Action::RegisterBridgedToken { nonce, .. } = &mut t.action else { panic!() };
+                *nonce += 1;
+            }),
+            (20, "register pq signatures stripped", |t| {
+                let Action::RegisterBridgedToken { pq_signatures, .. } = &mut t.action else { panic!() };
+                pq_signatures.clear();
+            }),
+            (21, "list token index", |t| {
+                let Action::ListBacking { token_index, .. } = &mut t.action else { panic!() };
+                *token_index += 1;
+            }),
+            (21, "list chain", |t| {
+                let Action::ListBacking { chain, .. } = &mut t.action else { panic!() };
+                *chain += 1;
+            }),
+            (21, "list token", |t| {
+                let Action::ListBacking { token, .. } = &mut t.action else { panic!() };
+                token[0] ^= 1;
+            }),
+            (21, "list decimals", |t| {
+                let Action::ListBacking { decimals, .. } = &mut t.action else { panic!() };
+                *decimals += 1;
+            }),
+            (21, "list nonce", |t| {
+                let Action::ListBacking { nonce, .. } = &mut t.action else { panic!() };
+                *nonce += 1;
+            }),
+            (21, "list pq signature byte", |t| {
+                let Action::ListBacking { pq_signatures, .. } = &mut t.action else { panic!() };
+                pq_signatures[1].signature[0] ^= 1;
             }),
         ];
         for (i, what, change) in action_cases {

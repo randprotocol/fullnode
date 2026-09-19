@@ -1,5 +1,6 @@
-//! The bridge's Rand-only governance messages from the wallet's side (bridge hardening B1):
-//! `rand bridge-pause --sig @file` and `rand bridge-unpause --pq @file`.
+//! The bridge's Rand-only governance messages from the wallet's side: B1's
+//! `rand bridge-pause --sig @file` and `rand bridge-unpause --pq @file`, and B4's
+//! `rand token register-bridged … --pq @file` and `rand token list-backing … --pq @file`.
 //!
 //! The signatures are made elsewhere — the pause key's by `rand-bridge-gov pause`, a PQ guardian
 //! quorum's by `rand-bridge-gov pq-unpause` — over the fixed layouts of
@@ -10,14 +11,18 @@
 //! a refused transaction.
 //!
 //! A pause and an unpause ride without a bundle and pay no fee: a pause must work from a machine
-//! that holds no RAND and no spend key at all. Neither needs this wallet's key file.
+//! that holds no RAND and no spend key at all. Neither needs this wallet's key file. A
+//! registration and a listing ride a fee bundle this wallet pays (zUSD's deployer is a
+//! faucet-funded wallet), so their actions are built here and proved by `wallet::submit`.
 
 use crate::RpcClient;
 use anyhow::{anyhow, bail, Context, Result};
-use randprotocol_core::bridge::gov::{pause_message, unpause_message};
+use randprotocol_core::bridge::gov::{list_message, pause_message, register_message, unpause_message};
 use randprotocol_core::bridge::{check_pq_quorum_message, BridgeError, PqSignature};
+use randprotocol_core::ledger::tokens::{check_metadata, BRIDGE_DECIMALS, MAX_BACKING_DECIMALS};
 use randprotocol_core::{Action, Hash, PublicKey, Signature, Transaction};
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 /// How far past the bridge's nonce [`signed_nonce`] looks when a file does not verify at it, to
 /// say which nonce it *was* signed for. Governance nonces move a handful of times a year.
@@ -32,6 +37,11 @@ pub struct GovState {
     pub mint_paused: bool,
     pub pause_nonce: u64,
     pub list_nonce: u64,
+    /// The source chains the bridge registers an emitter for — the only chains a backing can be on.
+    pub emitter_chains: BTreeSet<u16>,
+    /// The token registry's registration fee, which a `RegisterBridgedToken` owes past the bundle
+    /// base; `None` from a node that does not serve it.
+    pub registration_fee: Option<u64>,
 }
 
 impl GovState {
@@ -62,6 +72,11 @@ impl GovState {
             mint_paused: v["mint_paused"].as_bool().ok_or_else(|| anyhow!("the node serves no mint_paused"))?,
             pause_nonce: n("pause_nonce")?,
             list_nonce: n("list_nonce")?,
+            emitter_chains: v["emitters"]
+                .as_object()
+                .map(|m| m.keys().filter_map(|k| k.parse().ok()).collect())
+                .unwrap_or_default(),
+            registration_fee: v["registration_fee"].as_u64(),
         })
     }
 }
@@ -111,6 +126,70 @@ pub fn unpause_action(state: &GovState, chain_id: u64, pq_signatures: Vec<PqSign
     let nonce = state.pause_nonce;
     check_quorum(state, &pq_signatures, nonce, "pause_nonce", |n| unpause_message(chain_id, n))?;
     Ok(Action::UnpauseMints { nonce, pq_signatures })
+}
+
+/// The `RegisterBridgedToken` a PQ guardian quorum makes on this chain now (B4): refused unless
+/// the name and symbol pass the registry's rules, the source `decimals` is at most 18, the chain
+/// has a registered emitter, and the quorum passes the five rules over `M_register` at the
+/// bridge's `list_nonce`. A quorum made for another nonce says which.
+#[allow(clippy::too_many_arguments)]
+pub fn register_bridged_action(
+    state: &GovState,
+    chain_id: u64,
+    name: &str,
+    symbol: &str,
+    salt: [u8; 32],
+    chain: u16,
+    token: [u8; 32],
+    decimals: u8,
+    pq_signatures: Vec<PqSignature>,
+) -> Result<Action> {
+    check_metadata(name, symbol, BRIDGE_DECIMALS).map_err(|e| anyhow!("{e}"))?;
+    check_backing(state, chain, decimals)?;
+    let nonce = state.list_nonce;
+    check_quorum(state, &pq_signatures, nonce, "list_nonce", |n| {
+        register_message(chain_id, n, name, symbol, &salt, chain, &token, decimals).expect("check_metadata bounds both")
+    })?;
+    Ok(Action::RegisterBridgedToken {
+        name: name.into(),
+        symbol: symbol.into(),
+        salt,
+        chain,
+        token,
+        decimals,
+        nonce,
+        pq_signatures,
+    })
+}
+
+/// The `ListBacking` a PQ guardian quorum makes on this chain now (B4): the source `decimals` at
+/// most 18, the chain with a registered emitter, and the quorum over `M_list` at `list_nonce`.
+/// Whether `token_index` is a bridged token and the coin is free is the chain's to say.
+pub fn list_backing_action(
+    state: &GovState,
+    chain_id: u64,
+    token_index: u32,
+    chain: u16,
+    token: [u8; 32],
+    decimals: u8,
+    pq_signatures: Vec<PqSignature>,
+) -> Result<Action> {
+    check_backing(state, chain, decimals)?;
+    let nonce = state.list_nonce;
+    check_quorum(state, &pq_signatures, nonce, "list_nonce", |n| {
+        list_message(chain_id, n, token_index, chain, &token, decimals)
+    })?;
+    Ok(Action::ListBacking { token_index, chain, token, decimals, nonce, pq_signatures })
+}
+
+fn check_backing(state: &GovState, chain: u16, decimals: u8) -> Result<()> {
+    if decimals > MAX_BACKING_DECIMALS {
+        bail!("--decimals {decimals} is over {MAX_BACKING_DECIMALS}: the backing's source decimals");
+    }
+    if !state.emitter_chains.contains(&chain) {
+        bail!("chain {chain} has no registered emitter on this bridge (it has {:?})", state.emitter_chains);
+    }
+    Ok(())
 }
 
 /// The five rules over `message(nonce)`; on a signature that does not verify, probe the nearby
@@ -172,6 +251,8 @@ pub(crate) mod tests {
         let file = vectors();
         json!({
             "enabled": true,
+            "emitters": { "2": "02", "3": "03", "4": "04", "5": "05" },
+            "registration_fee": 1_000_000_000u64,
             "pq_guardians": keys(&file),
             "pause_key": file["governance"]["pause"]["pause_key"],
             "mint_paused": paused,
@@ -254,5 +335,58 @@ pub(crate) mod tests {
     fn tx_signature(tx: &Transaction) -> Signature {
         let Action::PauseMints { signature, .. } = &tx.action else { panic!("a pause") };
         signature.clone()
+    }
+
+    fn hex32(v: &Value) -> [u8; 32] {
+        hex::decode(v.as_str().unwrap()).unwrap().try_into().unwrap()
+    }
+
+    /// The vectors' `register` (list_nonce 0) and `list` (list_nonce 1): each file builds exactly
+    /// its action at the bridge's nonce; at another nonce the error names the one it was made
+    /// for; the chain's rules on the arguments (an unregistered chain, decimals past 18, a bad
+    /// symbol) refuse before the quorum is looked at, and a register quorum is not a list quorum.
+    #[test]
+    fn the_listing_vectors_build_their_actions() {
+        let file = vectors();
+        let g = &file["governance"];
+        let r = &g["register"];
+        let reg_sigs = pq_file(&r["pq_signatures"]);
+        let (name, symbol, salt, token) =
+            (r["name"].as_str().unwrap(), r["symbol"].as_str().unwrap(), hex32(&r["salt"]), hex32(&r["token"]));
+        let at = |list_nonce| GovState::from_bridge_state(&bridge_state(false, 0, list_nonce)).unwrap();
+        let build = |state: &GovState, sigs: Vec<PqSignature>| register_bridged_action(state, 99, name, symbol, salt, 2, token, 6, sigs);
+        assert_eq!(
+            build(&at(0), reg_sigs.clone()).unwrap(),
+            Action::RegisterBridgedToken {
+                name: name.into(),
+                symbol: symbol.into(),
+                salt,
+                chain: 2,
+                token,
+                decimals: 6,
+                nonce: 0,
+                pq_signatures: reg_sigs.clone(),
+            }
+        );
+        let e = build(&at(4), reg_sigs.clone()).unwrap_err().to_string();
+        assert!(e.contains("made for list_nonce 0; the bridge is at 4"), "{e}");
+        let e = register_bridged_action(&at(0), 99, name, symbol, salt, 7, token, 6, reg_sigs.clone()).unwrap_err().to_string();
+        assert!(e.contains("chain 7 has no registered emitter"), "{e}");
+        let e = register_bridged_action(&at(0), 99, name, symbol, salt, 2, token, 19, reg_sigs.clone()).unwrap_err().to_string();
+        assert!(e.contains("over 18"), "{e}");
+        assert!(register_bridged_action(&at(0), 99, name, "z USD", salt, 2, token, 6, reg_sigs.clone()).is_err());
+
+        let v = &g["list"];
+        let list_sigs = pq_file(&v["pq_signatures"]);
+        let list_token = hex32(&v["token"]);
+        assert_eq!(
+            list_backing_action(&at(1), 99, 1, 5, list_token, 6, list_sigs.clone()).unwrap(),
+            Action::ListBacking { token_index: 1, chain: 5, token: list_token, decimals: 6, nonce: 1, pq_signatures: list_sigs.clone() }
+        );
+        let e = list_backing_action(&at(0), 99, 1, 5, list_token, 6, list_sigs.clone()).unwrap_err().to_string();
+        assert!(e.contains("made for list_nonce 1; the bridge is at 0"), "{e}");
+        // Another index, or the registration's quorum, is no listing's quorum.
+        assert!(list_backing_action(&at(1), 99, 2, 5, list_token, 6, list_sigs).unwrap_err().to_string().contains("does not verify"));
+        assert!(list_backing_action(&at(1), 99, 1, 5, list_token, 6, reg_sigs).unwrap_err().to_string().contains("does not verify"));
     }
 }

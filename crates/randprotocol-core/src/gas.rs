@@ -177,6 +177,11 @@ pub fn fee_floor(action: &Action) -> u64 {
         // wallet with no RAND. Neither can be spammed: each needs the pause key's signature or a
         // PQ guardian quorum over the current `pause_nonce`, and each spends it.
         Action::PauseMints { .. } | Action::UnpauseMints { .. } => 0,
+        // Bridge hardening B4: each rides one RAND fee bundle, paid by the submitter, so each
+        // pays the plain base here. A `RegisterBridgedToken` also owes the registry's
+        // `registration_fee` — a ledger fact, charged by `ledger::bridge_gov::validate`
+        // (`TokenError::RegistrationFeeTooLow`) the way `RegisterToken`'s is.
+        Action::RegisterBridgedToken { .. } | Action::ListBacking { .. } => BUNDLE_BASE,
     }
 }
 

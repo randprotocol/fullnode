@@ -450,21 +450,34 @@ impl TokenRegistry {
     ///
     /// Nothing else can grow a backing set: a registration lists its own, and this adds one.
     pub fn add_backing(&mut self, index: u32, chain: u16, token: [u8; 32], decimals: u8) -> Result<(), TokenError> {
+        self.check_add_backing(index, chain, &token, decimals)?;
+        let info = self.by_index.get_mut(&index).expect("check_add_backing resolved the index");
+        let MintAuthority::Bridge { backings } = &mut info.authority else {
+            unreachable!("check_add_backing resolved a bridged token")
+        };
+        backings.push(Backing::new(chain, token, decimals));
+        self.backing_of.insert((chain, token), index);
+        Ok(())
+    }
+
+    /// Exactly what [`Self::add_backing`] would refuse, without touching anything — the one place
+    /// that decides it, so a `ListBacking`'s validate (bridge hardening B4) and its apply cannot
+    /// drift: the source decimals, the pair free across the whole registry, the token registered
+    /// and bridged, and under [`MAX_BACKINGS`].
+    pub fn check_add_backing(&self, index: u32, chain: u16, token: &[u8; 32], decimals: u8) -> Result<(), TokenError> {
         if decimals > MAX_BACKING_DECIMALS {
             return Err(TokenError::BadBackingDecimals(decimals));
         }
-        if self.backing_of.contains_key(&(chain, token)) {
+        if self.backing_of.contains_key(&(chain, *token)) {
             return Err(TokenError::BackingTaken { chain });
         }
-        let info = self.by_index.get_mut(&index).ok_or(TokenError::UnknownToken(index))?;
-        let MintAuthority::Bridge { backings } = &mut info.authority else {
+        let info = self.by_index.get(&index).ok_or(TokenError::UnknownToken(index))?;
+        let MintAuthority::Bridge { backings } = &info.authority else {
             return Err(TokenError::AuthorityNotAllowed);
         };
         if backings.len() >= MAX_BACKINGS {
             return Err(TokenError::TooManyBackings);
         }
-        backings.push(Backing::new(chain, token, decimals));
-        self.backing_of.insert((chain, token), index);
         Ok(())
     }
 

@@ -6,9 +6,17 @@
 //! ```text
 //! M_pause   = b"rand-bridge-pause-1"      ‖ chain_id u64 ‖ nonce u64    (the one genesis pause key)
 //! M_unpause = b"rand-bridge-pq-unpause-1" ‖ chain_id u64 ‖ nonce u64    (a PQ guardian quorum)
+//! M_list     = b"rand-bridge-pq-list-1"     ‖ chain_id u64 ‖ nonce u64 ‖ token_index u32 ‖ chain u16
+//!              ‖ token [32] ‖ decimals u8
+//! M_register = b"rand-bridge-pq-register-1" ‖ chain_id u64 ‖ nonce u64 ‖ u8 len ‖ name ‖ u8 len
+//!              ‖ symbol ‖ salt [32] ‖ chain u16 ‖ token [32] ‖ decimals u8
 //! ```
 //!
-//! Both carry the bridge's `pause_nonce` ([`crate::bridge::BridgeState::pause_nonce`]). The pause
+//! `M_list` and `M_register` (B4) carry the bridge's `list_nonce` and are signed by a PQ guardian
+//! quorum; `decimals` is always the **backing's source** decimals (the bridged token itself is
+//! eight on Rand and is not in either message).
+//!
+//! `M_pause` and `M_unpause` carry the bridge's `pause_nonce` ([`crate::bridge::BridgeState::pause_nonce`]). The pause
 //! key signs `M_pause` directly (Dilithium2 over the raw bytes, like a co-signature); the unpause
 //! quorum is judged by the co-signature's own five rules
 //! ([`crate::bridge::pq::check_pq_structure`], [`crate::bridge::pq::verify_pq_message`]). The two
@@ -18,6 +26,10 @@
 pub const PAUSE_DOMAIN: &[u8] = b"rand-bridge-pause-1";
 /// `M_unpause`'s domain tag: 24 ASCII bytes, no terminator.
 pub const UNPAUSE_DOMAIN: &[u8] = b"rand-bridge-pq-unpause-1";
+/// `M_list`'s domain tag: 21 ASCII bytes, no terminator.
+pub const LIST_DOMAIN: &[u8] = b"rand-bridge-pq-list-1";
+/// `M_register`'s domain tag: 25 ASCII bytes, no terminator.
+pub const REGISTER_DOMAIN: &[u8] = b"rand-bridge-pq-register-1";
 
 /// `domain ‖ chain_id (u64 BE) ‖ nonce (u64 BE)` — the head every governance message starts with.
 fn head(domain: &[u8], chain_id: u64, nonce: u64) -> Vec<u8> {
@@ -37,6 +49,50 @@ pub fn pause_message(chain_id: u64, pause_nonce: u64) -> Vec<u8> {
 /// `M_unpause`: what a PQ guardian quorum signs to lift a pause at `pause_nonce`.
 pub fn unpause_message(chain_id: u64, pause_nonce: u64) -> Vec<u8> {
     head(UNPAUSE_DOMAIN, chain_id, pause_nonce)
+}
+
+/// `chain u16 ‖ token [32] ‖ decimals u8` — one backing, as both listing messages end.
+fn backing_tail(m: &mut Vec<u8>, chain: u16, token: &[u8; 32], decimals: u8) {
+    m.extend_from_slice(&chain.to_be_bytes());
+    m.extend_from_slice(token);
+    m.push(decimals);
+}
+
+/// `M_list`: what a PQ guardian quorum signs to add the backing `(chain, token)` — a coin of
+/// `decimals` source decimals — to the bridged token at `token_index`, at `list_nonce`.
+pub fn list_message(chain_id: u64, list_nonce: u64, token_index: u32, chain: u16, token: &[u8; 32], decimals: u8) -> Vec<u8> {
+    let mut m = head(LIST_DOMAIN, chain_id, list_nonce);
+    m.extend_from_slice(&token_index.to_be_bytes());
+    backing_tail(&mut m, chain, token, decimals);
+    m
+}
+
+/// `M_register`: what a PQ guardian quorum signs to register a new bridged token `name`/`symbol`
+/// (its asset id salted by `salt`) with its first backing `(chain, token)` of `decimals` source
+/// decimals, at `list_nonce`. `name` and `symbol` each ride behind a one-byte length, so `None`
+/// for either empty or over 255 bytes — neither can be a registrable token anyway
+/// (`tokens::check_metadata` holds them to 32 and 12).
+#[allow(clippy::too_many_arguments)]
+pub fn register_message(
+    chain_id: u64,
+    list_nonce: u64,
+    name: &str,
+    symbol: &str,
+    salt: &[u8; 32],
+    chain: u16,
+    token: &[u8; 32],
+    decimals: u8,
+) -> Option<Vec<u8>> {
+    let len = |s: &str| u8::try_from(s.len()).ok().filter(|n| *n > 0);
+    let (name_len, symbol_len) = (len(name)?, len(symbol)?);
+    let mut m = head(REGISTER_DOMAIN, chain_id, list_nonce);
+    m.push(name_len);
+    m.extend_from_slice(name.as_bytes());
+    m.push(symbol_len);
+    m.extend_from_slice(symbol.as_bytes());
+    m.extend_from_slice(salt);
+    backing_tail(&mut m, chain, token, decimals);
+    Some(m)
 }
 
 #[cfg(test)]
@@ -129,5 +185,100 @@ pub(crate) mod tests {
         forged[0].signature = pause_key.sign(&message).as_bytes().to_vec();
         assert_eq!(check_pq_quorum_message(&forged, &keys, &message), Err(BridgeError::PqBadSignature { index: 0 }));
         assert!(!keys.iter().any(|k: &PublicKey| k == pause_key.public_key()));
+    }
+
+    #[test]
+    fn the_listing_messages_are_laid_out_byte_for_byte() {
+        let l = list_message(0x0102_0304_0506_0708, 9, 0x0a0b_0c0d, 0x0e0f, &[0x11; 32], 6);
+        assert_eq!(&l[..21], b"rand-bridge-pq-list-1");
+        assert_eq!(&l[21..29], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&l[29..37], &9u64.to_be_bytes());
+        assert_eq!(&l[37..41], &[0x0a, 0x0b, 0x0c, 0x0d]);
+        assert_eq!(&l[41..43], &[0x0e, 0x0f]);
+        assert_eq!(&l[43..75], &[0x11; 32]);
+        assert_eq!((l[75], l.len()), (6, 76));
+        let r = register_message(7, 1, "Shielded USD", "zUSD", &[0x5a; 32], 2, &[0x22; 32], 18).unwrap();
+        assert_eq!(&r[..25], b"rand-bridge-pq-register-1");
+        assert_eq!(&r[25..33], &7u64.to_be_bytes());
+        assert_eq!(&r[33..41], &1u64.to_be_bytes());
+        assert_eq!(r[41], 12);
+        assert_eq!(&r[42..54], b"Shielded USD");
+        assert_eq!(r[54], 4);
+        assert_eq!(&r[55..59], b"zUSD");
+        assert_eq!(&r[59..91], &[0x5a; 32]);
+        assert_eq!(&r[91..93], &2u16.to_be_bytes());
+        assert_eq!(&r[93..125], &[0x22; 32]);
+        assert_eq!((r[125], r.len()), (18, 126));
+        // A one-byte length cannot carry an empty or a 256-byte field.
+        assert_eq!(register_message(7, 1, "", "zUSD", &[0; 32], 2, &[0; 32], 6), None);
+        assert_eq!(register_message(7, 1, "x", &"y".repeat(256), &[0; 32], 2, &[0; 32], 6), None);
+        assert!(register_message(7, 1, &"n".repeat(255), "y", &[0; 32], 2, &[0; 32], 6).is_some());
+    }
+
+    /// The `register` and `list` vectors: each message byte for byte from the vector's own fields,
+    /// each quorum `ok` under the five rules and reproduced signature by signature — and a quorum
+    /// for one message authorises no other: not the other kind, not another nonce, not another
+    /// field of the same kind.
+    #[test]
+    fn the_listing_vectors_reproduce_and_their_quorums_verify() {
+        let file = vectors();
+        let chain_id = file["rand_chain_id"].as_u64().unwrap();
+        let keys = vector_keys(&file);
+        let g = governance();
+
+        let v = &g["register"];
+        let (nonce, chain, decimals) =
+            (v["list_nonce"].as_u64().unwrap(), v["chain"].as_u64().unwrap() as u16, v["decimals"].as_u64().unwrap() as u8);
+        let (name, symbol) = (v["name"].as_str().unwrap(), v["symbol"].as_str().unwrap());
+        let (salt, token) = (hex32(&v["salt"]), hex32(&v["token"]));
+        let register = register_message(chain_id, nonce, name, symbol, &salt, chain, &token, decimals).unwrap();
+        assert_eq!(register, bytes(&v["message"]), "M_register byte for byte");
+        let register_sigs = vector_sigs(&v["pq_signatures"]);
+        assert_eq!(register_sigs.len(), 5);
+        assert_eq!(verdict(&check_pq_quorum_message(&register_sigs, &keys, &register)), "ok");
+        reproduces(&register_sigs, &register);
+
+        let v = &g["list"];
+        let (nonce_l, index, chain_l, decimals_l) = (
+            v["list_nonce"].as_u64().unwrap(),
+            v["token_index"].as_u64().unwrap() as u32,
+            v["chain"].as_u64().unwrap() as u16,
+            v["decimals"].as_u64().unwrap() as u8,
+        );
+        let token_l = hex32(&v["token"]);
+        let list = list_message(chain_id, nonce_l, index, chain_l, &token_l, decimals_l);
+        assert_eq!(list, bytes(&v["message"]), "M_list byte for byte");
+        let list_sigs = vector_sigs(&v["pq_signatures"]);
+        assert_eq!(list_sigs.len(), 5);
+        assert_eq!(verdict(&check_pq_quorum_message(&list_sigs, &keys, &list)), "ok");
+        reproduces(&list_sigs, &list);
+
+        // One message's quorum is no other message's.
+        let bad = |sigs: &[PqSignature], m: Vec<u8>| verdict(&check_pq_quorum_message(sigs, &keys, &m));
+        assert_eq!(bad(&register_sigs, list.clone()), "PqBadSignature");
+        assert_eq!(bad(&list_sigs, register.clone()), "PqBadSignature");
+        assert_eq!(bad(&list_sigs, list_message(chain_id, nonce_l + 1, index, chain_l, &token_l, decimals_l)), "PqBadSignature");
+        assert_eq!(bad(&list_sigs, list_message(chain_id + 1, nonce_l, index, chain_l, &token_l, decimals_l)), "PqBadSignature");
+        assert_eq!(bad(&list_sigs, list_message(chain_id, nonce_l, index + 1, chain_l, &token_l, decimals_l)), "PqBadSignature");
+        assert_eq!(bad(&list_sigs, list_message(chain_id, nonce_l, index, chain_l, &token_l, decimals_l + 1)), "PqBadSignature");
+        assert_eq!(
+            bad(&register_sigs, register_message(chain_id, nonce, name, "zUSDC", &salt, chain, &token, decimals).unwrap()),
+            "PqBadSignature"
+        );
+        assert_eq!(
+            bad(&register_sigs, register_message(chain_id, nonce, name, symbol, &[0; 32], chain, &token, decimals).unwrap()),
+            "PqBadSignature"
+        );
+        assert_eq!(bad(&register_sigs, unpause_message(chain_id, nonce)), "PqBadSignature");
+    }
+
+    /// Every vector of the `governance` section, counted: the four kinds the bridge repo ships
+    /// (register, list, unpause, pause), so a kind silently dropped from the file fails here.
+    #[test]
+    fn the_governance_section_has_exactly_the_four_kinds() {
+        let g = governance();
+        let mut kinds: Vec<&str> = g.as_object().unwrap().keys().map(String::as_str).collect();
+        kinds.sort();
+        assert_eq!(kinds, ["list", "pause", "register", "unpause"]);
     }
 }

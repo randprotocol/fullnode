@@ -1204,8 +1204,12 @@ impl Ledger {
             | Action::TokenBurn { .. }) => {
                 tokens::validate(self, tx, a, executor)?;
             }
-            // Bridge hardening B1: the pause and its lifting, gated on the `bridge` section.
-            a @ (Action::PauseMints { .. } | Action::UnpauseMints { .. }) => {
+            // Bridge hardening B1/B4: the pause and its lifting, and listing after genesis — gated
+            // on the `bridge` section.
+            a @ (Action::PauseMints { .. }
+            | Action::UnpauseMints { .. }
+            | Action::RegisterBridgedToken { .. }
+            | Action::ListBacking { .. }) => {
                 bridge_gov::validate(self, tx, a)?;
             }
             Action::Aggregate { .. } => {
@@ -1350,7 +1354,10 @@ impl Ledger {
             | Action::TokenBurn { .. }) => {
                 tokens::apply(self, tx, a, executor)?;
             }
-            a @ (Action::PauseMints { .. } | Action::UnpauseMints { .. }) => {
+            a @ (Action::PauseMints { .. }
+            | Action::UnpauseMints { .. }
+            | Action::RegisterBridgedToken { .. }
+            | Action::ListBacking { .. }) => {
                 bridge_gov::apply(self, tx, a)?;
             }
             Action::Aggregate { .. } => {

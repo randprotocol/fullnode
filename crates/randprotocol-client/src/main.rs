@@ -277,7 +277,8 @@ enum Cmd {
         #[arg(long)]
         cuda: bool,
     },
-    /// RPL tokens held in this wallet.
+    /// RPL tokens: burn one this wallet holds; register a bridged token and list its backings
+    /// after genesis (bridge hardening B4).
     #[command(subcommand)]
     Token(TokenCmd),
     /// The bridge's public state: guardians, emitters, the asset registry, the burn sequence.
@@ -331,6 +332,70 @@ enum TokenCmd {
         #[arg(long)]
         no_wait: bool,
         /// Prove the bundle on an attached NVIDIA GPU.
+        #[arg(long)]
+        cuda: bool,
+    },
+    /// Register a bridged token with its first backing, authorised by a PQ guardian quorum
+    /// (`rand-bridge-gov pq-register`'s file) and paid by this wallet's fee bundle: the bundle base
+    /// plus the registry's registration fee. The token is eight decimals on Rand, at the next
+    /// index. List on Rand FIRST, `setToken` on the endpoint SECOND.
+    RegisterBridged {
+        /// Display name, 1 to 32 bytes.
+        #[arg(long)]
+        name: String,
+        /// Ticker, 1 to 12 ASCII graphic characters.
+        #[arg(long)]
+        symbol: String,
+        /// The 32-byte salt the asset id is over, hex.
+        #[arg(long)]
+        salt: String,
+        /// The first backing's bridge chain id (2 Ethereum, 3 BSC, 4 Tron, 5 Solana).
+        #[arg(long)]
+        chain: u16,
+        /// The first backing's 32-byte wire token address, hex.
+        #[arg(long)]
+        token: String,
+        /// The first backing's decimals on its own chain (the source coin's, not the eight on Rand).
+        #[arg(long)]
+        decimals: u8,
+        /// The PQ guardian quorum over the registration, as JSON or `@path`.
+        #[arg(long)]
+        pq: String,
+        /// Fee in RAND; default the bundle base plus the registration fee.
+        #[arg(long)]
+        fee: Option<String>,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+        /// Prove the paying bundle on an attached NVIDIA GPU.
+        #[arg(long)]
+        cuda: bool,
+    },
+    /// Add a backing to a bridged token, authorised by a PQ guardian quorum
+    /// (`rand-bridge-gov pq-list`'s file) and paid by this wallet's fee bundle.
+    ListBacking {
+        /// The bridged token's registry index.
+        #[arg(long)]
+        asset: u32,
+        /// The backing's bridge chain id (2 Ethereum, 3 BSC, 4 Tron, 5 Solana).
+        #[arg(long)]
+        chain: u16,
+        /// The backing's 32-byte wire token address, hex.
+        #[arg(long)]
+        token: String,
+        /// The backing's decimals on its own chain.
+        #[arg(long)]
+        decimals: u8,
+        /// The PQ guardian quorum over the listing, as JSON or `@path`.
+        #[arg(long)]
+        pq: String,
+        /// Fee in RAND; the floor is 0.001.
+        #[arg(long)]
+        fee: Option<String>,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+        /// Prove the paying bundle on an attached NVIDIA GPU.
         #[arg(long)]
         cuda: bool,
     },
@@ -1169,6 +1234,50 @@ async fn main() -> Result<()> {
                 println!("asset {asset} balance: {} units", store.balance_of(asset));
             }
         }
+        Cmd::Token(TokenCmd::RegisterBridged { name, symbol, salt, chain, token, decimals, pq, fee, no_wait, cuda }) => {
+            let salt = randprotocol_client::hex32(&salt).context("--salt must be 32 bytes of hex")?;
+            let token = randprotocol_client::hex32(&token).context("--token must be 32 bytes of hex")?;
+            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?;
+            let chain_id = rpc.chain_id().await?;
+            let pq_signatures = wallet::parse_pq_signatures(&read_text_arg(&pq)?)?;
+            // Everything refusable is refused here, before a key file is opened or a bundle
+            // proved: the name rules, the backing, and the quorum at the bridge's list_nonce.
+            let action = governance::register_bridged_action(&state, chain_id, &name, &symbol, salt, chain, token, decimals, pq_signatures)?;
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => gas::fee_floor(&action).saturating_add(
+                    state.registration_fee.context("the node serves no registration_fee: pass --fee")?,
+                ),
+            };
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            let profile = profile_of(&rpc).await?;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, !no_wait)
+                .await;
+            store.save(&path)?;
+            let s = s?;
+            report(&s, "bridged-token registration");
+            let id = randprotocol_core::ledger::tokens::bridged_asset_id(&name, &symbol, &salt);
+            println!("registered {symbol} ({name}), asset id {id}, at list_nonce {}", state.list_nonce);
+        }
+        Cmd::Token(TokenCmd::ListBacking { asset, chain, token, decimals, pq, fee, no_wait, cuda }) => {
+            let token = randprotocol_client::hex32(&token).context("--token must be 32 bytes of hex")?;
+            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?;
+            let chain_id = rpc.chain_id().await?;
+            let pq_signatures = wallet::parse_pq_signatures(&read_text_arg(&pq)?)?;
+            let action = governance::list_backing_action(&state, chain_id, asset, chain, token, decimals, pq_signatures)?;
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => gas::fee_floor(&action),
+            };
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            let profile = profile_of(&rpc).await?;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, !no_wait)
+                .await;
+            store.save(&path)?;
+            let s = s?;
+            report(&s, "backing listing");
+            println!("listed chain {chain} token {} under asset {asset}, at list_nonce {}", hex::encode(token), state.list_nonce);
+        }
         Cmd::BridgePause { sig, no_wait } => {
             // No key file: a pause must work from a machine holding no spend key and no RAND.
             let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?;
@@ -1261,6 +1370,30 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The four bridge-governance command lines parse under the names agreed with the bridge
+    /// session (`docs/mainnet-launch.md` §5 in the bridge repo).
+    #[test]
+    fn the_bridge_governance_commands_parse_as_the_launch_doc_writes_them() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("rand").chain(args.iter().copied())).map(|c| c.cmd);
+        let salt = "27e77272ee77a47a6b66a62f3452dac66e681c79be6750d5e236e99f0d1e1d60";
+        let usdt = "000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7";
+        let Ok(Cmd::Token(TokenCmd::RegisterBridged { name, symbol, chain, decimals, pq, .. })) = parse(&[
+            "token", "register-bridged", "--name", "Shielded USD", "--symbol", "zUSD", "--salt", salt, "--chain", "2", "--token", usdt,
+            "--decimals", "6", "--pq", "@zusd-0-register.json",
+        ]) else {
+            panic!("register-bridged parses")
+        };
+        assert_eq!((name.as_str(), symbol.as_str(), chain, decimals, pq.as_str()), ("Shielded USD", "zUSD", 2, 6, "@zusd-0-register.json"));
+        let Ok(Cmd::Token(TokenCmd::ListBacking { asset, chain, decimals, .. })) = parse(&[
+            "token", "list-backing", "--asset", "1", "--chain", "3", "--token", usdt, "--decimals", "18", "--pq", "@zusd-2.json",
+        ]) else {
+            panic!("list-backing parses")
+        };
+        assert_eq!((asset, chain, decimals), (1, 3, 18));
+        assert!(matches!(parse(&["bridge-pause", "--sig", "@pause.sig"]), Ok(Cmd::BridgePause { .. })));
+        assert!(matches!(parse(&["bridge-unpause", "--pq", "@unpause.json", "--no-wait"]), Ok(Cmd::BridgeUnpause { no_wait: true, .. })));
+    }
 
     /// `open-call`'s verdict is its exit status. A transcript that is not the preimage of the
     /// receipt's `H_IN` is a lie its holder can show to anyone, and one whose words do not

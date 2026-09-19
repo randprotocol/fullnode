@@ -267,6 +267,13 @@ pub enum BridgeError {
     /// B1: the pause key's signature over `M_pause` does not verify.
     #[error("the pause signature does not verify")]
     BadPauseSignature,
+    /// B4: `M_list`/`M_register` must carry the bridge's current `list_nonce`.
+    #[error("wrong list nonce: expected {expected}, got {got}")]
+    BadListNonce { expected: u64, got: u64 },
+    /// B4: a backing on a chain this bridge registers no emitter for — no attestation of it could
+    /// ever be admitted, so the listing is refused rather than left unusable.
+    #[error("chain {chain} has no registered emitter on this bridge")]
+    NoEmitter { chain: u16 },
 }
 
 /// A transfer attestation as the pool needs it: which asset, under which note
