@@ -1,8 +1,7 @@
 # RPL: the RandProtocol token standard
 
-Status: design approved by the user 2026-09-19, section by section in conversation; this document
-awaits the user's read-through before the implementation plan. Target: chain 14 and v0.5 (the
-bridge). First two registrations: zUSDT and zUSDC.
+Status: approved by the user 2026-09-19 (design section by section, then this document). Target: chain 14
+and v0.5 (the bridge). First two registrations: zUSDT and zUSDC.
 
 ## 1. Problem
 
@@ -106,7 +105,7 @@ Every token action rides on a transaction whose `tx.bundle` is a RAND fee bundle
 |---|---|---|---|
 | `RegisterToken` | `name, symbol, decimals, authority, initial: Option<InitialMint>, salt` | `BUNDLE_BASE + registration_fee` | assigns `next_index`; mints `initial` if present |
 | `TokenMint` | `asset, amount, recipient, r, time, envelope, nonce, signature` | `BUNDLE_BASE` | `Key` authority only; appends one note; `total_supply += amount` |
-| `TokenTransfer` | `asset_bundle` | `2 * BUNDLE_BASE` | shielded; `asset_bundle.fee == 0`, `.burn == 0`, `.asset` registered |
+| `TokenTransfer` | `asset_bundle, memo: Option<Vec<u8>>` | `2 * BUNDLE_BASE` | shielded; `asset_bundle.fee == 0`, `.burn == 0`, `.asset` registered; `memo` is opaque, at most 2 048 bytes, and the chain checks only its size (SPL's memo) |
 | `TokenBurn` | `asset_bundle, asset, amount` | `2 * BUNDLE_BASE` | `asset_bundle.burn == amount`; `total_supply -= amount`; refused for a `Bridge` token (use `BridgeBurn`) |
 | `SetAuthority` | `asset, new: Option<PublicKey>, nonce, signature` | `BUNDLE_BASE` | `Key → Key` or `Key → None`; nothing else |
 | `BridgeAttest` | unchanged | unchanged | now also `total_supply += amount`; refuses an unlisted token (§5) |
@@ -170,10 +169,13 @@ An allowance is a note under a key both parties hold. No consensus rule knows ab
 - **Key.** `allowance_sk = hash("rand-rpl-allowance-1", owner_sk ‖ delegate_pk ‖ asset ‖ n)`,
   `n` a counter the owner's key file stores per `(delegate, asset)`. Re-derivable from the owner's
   spend key, so a lost key file loses nothing.
-- **`approve(delegate, asset, N)`**: a `TokenTransfer` of `N` to `allowance_sk`'s address. The
-  output's envelope, sealed to the delegate's ML-KEM key, carries a versioned payload
-  `AllowanceGrant { allowance_sk, asset, owner_hint }`. The delegate's wallet imports it as an
-  allowance account on scan. The owner's main spend key is never shared.
+- **`approve(delegate, asset, N)`**: a `TokenTransfer` of `N` to `allowance_sk`'s address whose
+  `memo` carries the grant: `version (1) ‖ kem_ct (1088) ‖ chacha20poly1305(ss, AllowanceGrant {
+  allowance_sk, asset })`, encapsulated to the delegate's ML-KEM key. The delegate's wallet
+  trial-opens every `TokenTransfer` memo on scan and imports a grant as an allowance account. The
+  owner's main spend key is never shared. (The note envelope cannot carry it: its plaintext is the
+  fixed note layout of the vendored `viewing.rs`, which is never hand-edited.) A memo's presence
+  is visible; a wallet may attach a random memo of the same length to an ordinary transfer.
 - **`transfer-from`**: the delegate spends from the allowance account to any recipient, change
   back to the allowance address, and pays the RAND fee from its own wallet.
 - **`allowance`**: the unspent balance under `allowance_sk`. **Increase**: another transfer in.
