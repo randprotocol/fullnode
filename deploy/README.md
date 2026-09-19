@@ -1,39 +1,38 @@
-# Testnet: chain id 12 (the long shielded address again, staking, bridge, zkVM constraint set 6)
+# Testnet: chain id 13 (the call limits and a program's public input, v0.4)
 
 Test keys only; all seeds are committed on purpose so any machine can pull and run.
 
-> **Chain 12 (cut 2026-09-17) is chain 10's form again: the short shielded address of chain 11
-> is reverted.** An address is `rand1` + base58(pk ‖ kem_ek), 1,666–1,667 characters, carrying the
-> 1,184-byte ML-KEM encapsulation key a sender needs to seal a note; payouts and genesis deposit
-> notes are bare addresses; there is no receiver record, no registry, no `rand_getReceiver`.
-> Why: a receiver id is a hash and a sender cannot seal a note to a hash, so on chain 11 the first
-> payment to a wallet that had never registered needed a payment request or a hand-carried record,
-> and registration itself was a paid self-transfer an empty wallet cannot make — the revert commit
-> `17db41d` says the rest, and the design that keeps a short address *and* unconditional
-> sendability *and* privacy (a hybrid address: X25519 inline, ML-KEM by lookup) is the next spec.
-> No hash-domain or peer-id change — same RAND naming, same `rand_*` RPC methods, same libp2p
-> identities as chains 10 and 11 — so `nodes.env` is untouched, but a chain-11 node cannot parse a
-> bare-address payout, which is why this is a fresh chain like every format change before it.
-> Same code otherwise as chain 10 (constraint set 6, the pre-v0.1 security fixes, libp2p 0.57)
-> plus the guardian-set attestation bound (`544926c`), and like chains 9–11 **cut without the
-> `aggregation` section** (`deploy/cut-chain12-genesis.sh` defaults to `AGGREGATION=off`; the
-> activation values are the user-owned ≥ 64 GB measurements). The chain-11, chain-10 and chain-9
-> records are under "History" and "What the … rollout actually did".
+> **Chain 13 (cut 2026-09-19) is chain 12 plus five call limits in its genesis.** The genesis
+> sets `max_program_words`, `max_proof_bytes`, `max_block_bytes`, `max_call_envelope_bytes` and
+> `max_program_public_words`, so the translated ERC-20 and SPL Token images deploy and a
+> production ERC-20 call proof (3 412 405 bytes) fits. A program's public input is fixed at
+> deploy (`rand program deploy --public`). The same 18 validators at 1000 RAND each, the same
+> five 1000 RAND deposit notes, the same peer ids and bootstraps (`nodes.env` is untouched).
+> **The build is chain-13-only**: the `Deploy`, `ProgramRecord` and `CallReceipt` encodings
+> changed, so never same-chain-update it onto chain 12. Like chains 9–12 it is **cut without the
+> `aggregation` section** (`deploy/cut-chain13-genesis.sh` defaults to `AGGREGATION=off`). The
+> chain-12 and earlier records are under "History" and "What the … rollout actually did".
 
 | | |
 |---|---|
-| chain id | **12** |
-| genesis hash | **`605eb7830963833ef897455b98cd2a641aec58e0291460898a5d19ab88760ef0`** |
-| genesis file | `deploy/genesis-chain12.json` (cut 2026-09-17; chain 11's stays at `deploy/genesis-chain11.json`, chain 10's at `deploy/genesis-chain10.json`) |
-| pinned build | **`4504a03`** — tag **`v0.3`**, the RPC release (eleven methods, two WebSocket topics, the `receipts_by_program` index); node-only, same chain (sha256 `16e41293…` on Linux, `059a999d…` on macOS); binaries `rand-node` and `rand` in `bin-4504a03/` (macOS) and E's `/root/fullnode/target/release` (Linux), `.update-pin` content is `4504a03`. **The database is forward-only**: see "Rolling back v0.3" before re-pinning an older build |
-| zkVM | **constraint set 6** (the public input segment; M4.3 EVM and M4.4 sBPF/sha256 guests ride along) — unchanged, the revert touches no proof |
+| chain id | **13** |
+| genesis hash | **`8123ccac1883a45750e4df6964fb7cd3f0b321798cde4c0ef406a0293939ece3`** |
+| genesis file | `deploy/genesis-chain13.json` (cut 2026-09-19 with `deploy/cut-chain13-genesis.sh`; chain 12's stays at `deploy/genesis-chain12.json`, chain 11's at `deploy/genesis-chain11.json`, chain 10's at `deploy/genesis-chain10.json`) |
+| pinned build | **`86af6eb`** (Linux `rand-node` sha256 `cc20bf84…`); binaries `rand-node` and `rand` in `bin-86af6eb/` (macOS) and E's `/root/fullnode/target/release` (Linux); `.update-pin` content is `86af6eb`; `deploy/run-a.sh` and `run-b.sh` point at `bin-86af6eb` and `data-*-8123ccac`. **Chain-13-only**: never same-chain-update it onto chain 12 |
+| `max_program_words` | **65 535** |
+| `max_proof_bytes` | **8 388 608** (8 MiB) |
+| `max_block_bytes` | **20 971 520** (20 MiB) |
+| `max_call_envelope_bytes` | **65 536** |
+| `max_program_public_words` | **32 768** |
+| aggregation | **off** (no `aggregation` section, as chains 9–12) |
+| zkVM | **constraint set 6** (the public input segment; M4.3 EVM and M4.4 sBPF/sha256 guests ride along) — unchanged |
 | `hc_bundle` | `4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb` |
 | validators | **18, every one staked at exactly 1000 RAND** (the staking minimum) |
 | quorum | **13 of 18** (strictly more than two thirds of 18 000 RAND of stake) |
 | epochs | `--epoch-blocks 1000`; `UNBONDING_EPOCHS = 2`, so unbonded stake releases ~2000 blocks later |
 | genesis value | 18 000 RAND staked in the register + 5 × 1000 RAND as deposit notes = 23 000 RAND |
 | faucet | **on** (`rand faucet [address]`, up to 100 RAND per call on any node) |
-| confidential computation | **on**, production FRI profile (80 queries; `MAX_PROOF_BYTES` 2 MiB) |
+| confidential computation | **on**, production FRI profile (80 queries; the proof cap is the genesis `max_proof_bytes`, 8 MiB) |
 | bridge | **no bridge section** — and one cannot be added to this chain later, see below |
 
 Chain 8 is a fresh genesis because **constraint set 5 cannot replay chain 7**: a chain-7 proof and a
@@ -96,7 +95,7 @@ droplets have public IPs and act as bootstrap nodes; A and B are behind NAT and 
 A shielded chain has no per-validator allocation: value exists only as a note someone holds the
 spend key for, so `--alloc` takes a shielded address (the long form: `pk` and the ML-KEM
 encapsulation key the deposit envelope is sealed to) and creates one deposit note for it. As on
-chains 7–11, 1000 RAND goes to each of the five wallets in `wallets/` (gitignored — those keys live
+chains 7–12, 1000 RAND goes to each of the five wallets in `wallets/` (gitignored — those keys live
 on the machine that cut this genesis and nowhere else):
 
 | wallet | address | amount |
@@ -121,6 +120,12 @@ What chain 8 *does* add over chain 7 is the staking half: bonding, unbonding, wi
 and per-validator payouts (phase S2), and call envelopes (S3).
 
 ## The exact command that cut this genesis
+
+Chain 13 was cut on 2026-09-19 with `deploy/cut-chain13-genesis.sh`. It makes the same
+`rand-node genesis` call as chain 12's script below, with `--chain-id 13` and the five limit flags
+added (`--max-program-words 65535 --max-proof-bytes 8388608 --max-block-bytes 20971520
+--max-call-envelope-bytes 65536 --max-program-public-words 32768`). It reads the twelve regional
+public keys from `deploy/genesis-chain12.json`. Chain 12's command, which it extends:
 
 `deploy/cut-chain12-genesis.sh`, run from the repo root against the `17db41d` release binaries:
 
@@ -262,6 +267,42 @@ On A and B: `./deploy/run-a.sh` / `./deploy/run-b.sh` (they init `data-{a,b}-8c7
 scratch, `deploy/rebuild-vps.sh <ip>` rebuilds on a new commit and restarts. Service name:
 `rand-node`.
 
+### What the chain-13 rollout actually did (2026-09-19)
+
+1. E was rebuilt at `86af6eb` with `deploy/rebuild-vps.sh 188.166.235.187`.
+2. All 16 droplets were cut over with
+
+   ```bash
+   deploy/cutover-droplet.sh <ip> 605eb783 8123ccac deploy/genesis-chain13.json
+   ```
+
+3. **mkc1 (201.79.35.212) and mem1 (168.144.61.10) had full 29 GB disks.** Their dead chain-11
+   data dirs (`data-*-79123fa7`, 7 GB) were deleted first. They now have 7 GB free.
+   **Operator action: resize mkc1 and mem1.** They are the same two droplets whose disks filled
+   before the chain-9 rollout.
+4. Node A was restarted on `bin-86af6eb/` (`deploy/run-a.sh`).
+5. B (the MacBook Air) is offline and pending. Its `.update-pin` should read `86af6eb`.
+6. Survey after the cut-over:
+
+   | check | result |
+   |---|---|
+   | droplets active | 16 / 16 |
+   | `rand-node` sha256 | `cc20bf84…` on all 16 |
+   | peers | 16 each |
+   | block rate | about 1 block/s |
+
+7. RandScan re-indexed chain 13 on its own. On E, the randscan activity loop's note stores and
+   program were moved aside (`*.chain12-stale`) and its timer was restarted.
+
+Live results on chain 13 the same day, from the genesis wallet `shielded-1`
+(`docs/translators.md` §4.6, §4.6.1, §5.4):
+
+| action | tx | height | fee |
+|---|---|---|---|
+| deploy the translated ERC-20 (`f074c4eb…`, 11 686 words) | `c7a66dc4…53acd0` | committed at 381 | — |
+| deploy the translated SPL Token (`74023691…`, 65 096 words, 27 151 public words) | `626fc938…927530` | anchored at 400 | 9.2257 RAND |
+| call the ERC-20 (`approve`, tier 16, 3 412 405-byte proof) | `279e1f62…c4bfa7` | anchored at 802, committed at 919 | 0.00357 RAND |
+
 ### The v0.3 same-chain update to `4504a03` (2026-09-18)
 
 The RPC release (tag `v0.3`: eleven methods, the `receipts` and `transaction` WebSocket topics,
@@ -376,6 +417,10 @@ Three things went wrong and are fixed in the scripts:
 
 ## Rolling back v0.3
 
+This applies to chain 12 and is kept as history. Chain 13 cannot be rolled back to a v0.3 build:
+the v0.3 builds cannot run the chain-13 genesis, and the `Deploy`, `ProgramRecord` and
+`CallReceipt` encodings changed.
+
 v0.3 (the RPC release) is interoperable on the wire, but its database is forward-only: its first
 start adds a sixteenth column family, `receipts_by_program`, and RocksDB refuses to open a
 database holding a family the caller does not list. A pre-v0.3 binary lists fifteen, so a plain
@@ -480,3 +525,22 @@ a sender cannot seal a note to a hash, so the first payment to a wallet that had
 needed a payment request or a hand-carried record, and registration was a paid self-transfer an
 empty wallet cannot make. Its genesis, the record files and the cut script are kept here; the
 spec and plan stay under `docs/superpowers/` for the hybrid-address design that succeeds it.
+
+**Chain 12** (cut and rolled out 2026-09-17, build `17db41d`, re-pinned to `c66e6b8` the same
+day and to `4504a03`, tag `v0.3`, on 2026-09-18; genesis
+`605eb7830963833ef897455b98cd2a641aec58e0291460898a5d19ab88760ef0`, `deploy/genesis-chain12.json`)
+was chain 10's form again: the short shielded address of chain 11 was reverted. An address is
+`rand1` + base58(pk ‖ kem_ek), 1,666–1,667 characters, carrying the 1,184-byte ML-KEM
+encapsulation key a sender needs to seal a note; payouts and genesis deposit notes are bare
+addresses; there is no receiver record, no registry, no `rand_getReceiver`. Why: a receiver id
+is a hash and a sender cannot seal a note to a hash, so on chain 11 the first payment to a wallet
+that had never registered needed a payment request or a hand-carried record, and registration
+itself was a paid self-transfer an empty wallet cannot make — the revert commit `17db41d` says
+the rest, and the design that keeps a short address *and* unconditional sendability *and*
+privacy (a hybrid address: X25519 inline, ML-KEM by lookup) is the next spec. No hash-domain or
+peer-id change from chains 10 and 11, so `nodes.env` was untouched. Same code otherwise as chain
+10 (constraint set 6, the pre-v0.1 security fixes, libp2p 0.57) plus the guardian-set
+attestation bound (`544926c`), and like chains 9–11 cut without the `aggregation` section. It set
+none of the call limits, so its program cap was 4 096 words and its proof cap 2 MiB. It ran until
+2026-09-19, when the fleet moved to chain 13 ("What the chain-13 rollout actually did", above).
+The v0.3 builds cannot run chain 13, and the chain-13 build cannot run chain 12.

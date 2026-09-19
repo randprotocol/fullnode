@@ -3,10 +3,25 @@
 Every tagged release of the RAND full node, newest first. The client-facing RPC changes are also
 logged, method by method, in [`docs/rpc.md`](docs/rpc.md#changelog).
 
-## v0.4 (unreleased)
+## v0.4 — 2026-09-19 (chain 13)
 
-**Draft. The controller finalises this section at tagging.** Release date: `TODO-CONTROLLER`
-(estimate 2026-09-25). Chain: 13, genesis `TODO-CONTROLLER`, pinned build `TODO-CONTROLLER`.
+| | |
+|---|---|
+| release date | 2026-09-19 |
+| chain | 13, genesis `8123ccac1883a45750e4df6964fb7cd3f0b321798cde4c0ef406a0293939ece3` (`deploy/genesis-chain13.json`) |
+| pinned build | fullnode `86af6eb` (Linux `rand-node` sha256 `cc20bf84…`; laptop binaries in `bin-86af6eb/`) |
+| circuits | main `7ef3220` (tag `v0.4`) |
+| aggregation | off (no `aggregation` section, as chains 9–12) |
+
+Chain 13's limits:
+
+| limit | value |
+|---|---|
+| `max_program_words` | 65 535 |
+| `max_proof_bytes` | 8 388 608 (8 MiB) |
+| `max_block_bytes` | 20 971 520 (20 MiB) |
+| `max_call_envelope_bytes` | 65 536 |
+| `max_program_public_words` | 32 768 |
 
 v0.4 is the RISC-V developer release: the `rand-guest` toolchain and the two bytecode
 translators, `sbpf2rv` (Solana) and `evm2rv` (Ethereum). They live in the circuits repo (main
@@ -29,7 +44,32 @@ New in v0.4 on the fullnode side (branch `feat/call-limits`, spec
   recorded at deploy, `h_pub` in receipts, and `rand_getLimits` / `rand_getProgramPublic`.
   There are no per-call public words.
 - `deploy/cut-chain13-genesis.sh` cuts chain 13 with 65 535 / 8 MiB / 20 MiB / 65 536 /
-  32 768.
+  32 768. Chain 13 was cut with it on 2026-09-19 and runs on the 16 droplets and node A
+  (`deploy/README.md`, "What the chain-13 rollout actually did").
+
+### Headline evidence: live on chain 13
+
+Both translated programs were deployed from the genesis wallet `shielded-1` on the live chain
+(production FRI profile), and the ERC-20 was called.
+
+| action | wallet output | on chain |
+|---|---|---|
+| deploy the translated ERC-20 (`evm2rv` stage 2, `hc a0feae92…` in `rand-guest`'s spelling) | `program id: f074c4eb834cf01886a8241b6a2e0caf6e1cee5327fee6cb1a1a37436607280d (11686 words, hc 92aefea0951c31a717574962aeb70e10a37012a7d035d48e8713c36df68feae0)`; bundle proved in 92.2 s (tier 14, 1 419 655 bytes) | deploy tx `c7a66dc4…53acd0`, committed at height 381 |
+| call it: `approve(BOB, 5)`, 649 private words | `proved in 388.7s: tier 16, 3412405 bytes, outputs [1, 942495465, 790002515, 1351749335, 1059083501, 2923046783, 2814575942, 696258848]`; bundle proved in 96.0 s (tier 14, 1 420 423 bytes) | call tx `279e1f62…c4bfa7`, anchored at 802, committed at height 919; fee 0.00357 RAND; envelope 2 700 bytes; receipt `h_pub` null |
+| deploy the translated SPL Token (`sbpf2rv`, `hc 8ca905ae…` in `rand-guest`'s spelling) with its ELF as the public input | `program id: 740236918310f8e52bb0c1ef49b2b0e0c018762e289666660685b0694c8dd00a (65096 words, hc ae05a98c…b516ad, public input 27151 words, digest ec57b10e…d67e)`; bundle proved in 94.3 s (tier 14, 1 418 406 bytes) | deploy tx `626fc938…927530`, anchored at height 400; fee 9.2257 RAND |
+
+What the call shows:
+
+| claim | measurement |
+|---|---|
+| the production call proof needs chain 13's proof cap | 3 412 405 bytes, over chain 12's 2 MiB cap: a call chain 12 could not accept |
+| the fee's byte term applies | 0.00357 RAND: the 3.41 MB proof is above the 2 MiB + 18 432 B free allowance |
+| the call is faithful | the receipt's eight outputs equal the interpreter's for the same vector |
+| a laptop can make it | 622.8 s wall time, 22.9 GB peak RSS, on a 48 GB M-series laptop |
+
+Method: `rand program deploy <image.bin>` (with `--public spl_token.so` for SPL Token) and
+`rand call f074c4eb… --input …` against chain 13, 2026-09-19. Full hashes and transcripts:
+`docs/translators.md` §4.6, §4.6.1 and §5.4.
 
 ### Claims, measurements and methods
 
@@ -80,9 +120,10 @@ New in v0.4 on the fullnode side (branch `feat/call-limits`, spec
   fields) the images are over the program cap, SPL Token's public input is refused, its 10 458
   private words are over the default 4 295-word input cap, and a keccak-carrying ERC-20 call
   proof (3 198 430 bytes at tier 10, production) is over the 2 MiB proof cap.
-- A translated SPL Token call is not proven: tier 20 needs about 330 GB. Its deploy, public input
-  and refusal paths are run; its call proof is not. The ERC-20 `transfer` and `transferFrom` calls
-  are tier 18 and need about 85 GB; only `approve` (tier 16) was called on chain, on a 48 GB
+- **SPL Token calls are unproven.** No SPL call proof exists: tier 20 needs about 330 GB, more
+  than any DigitalOcean droplet (256 GB max). Its deploy (live on chain 13), public input and
+  refusal paths are run; its call proof is not. The ERC-20 `transfer` and `transferFrom` calls
+  are tier 18 and need about 85 GB; only `approve` (tier 16) was called on chain 13, from a 48 GB
   laptop.
 - `rand call --no-envelope` applies no input-word cap, since nothing is sealed.
 - EVM: the nine block-context opcodes trap; a `CALL` with nonzero value traps; ecrecover,

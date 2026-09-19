@@ -2,8 +2,11 @@
 
 This page says what each role computes, what hardware it has been measured to need, and how to
 set one up. Every number has a source: this repo's docs and `deploy/`, the circuits READMEs, or a
-command run for this page on 2026-09-19 (local date). Numbers that are not final yet are marked
-`TODO-CONTROLLER`, with the current measured bound beside them.
+command run for this page on 2026-09-19 (local date). Numbers nobody has measured yet are marked
+"not measured yet", with the current bound beside them.
+
+The testnet runs chain 13 (genesis `8123ccac…`, pinned build `86af6eb`, live since 2026-09-19) on
+16 DigitalOcean droplets and node A (`deploy/README.md`).
 
 ## 1. What each role does
 
@@ -20,9 +23,10 @@ How this was confirmed in the code at `0cfd1e3`:
   `randprotocol_rvm::aggregate::aggregate` in `main.rs`, inside the `aggregate` command. The
   `run` path calls the executor's `verify_call`, `verify_bundle` and `verify_aggregate` only.
 - The wallet proves in `crates/randprotocol-client` (`executor::prove`, `executor::prove_call`).
-- Chains 9 to 12 were cut **without** the `aggregation` section (`deploy/README.md`;
-  `deploy/cut-chain12-genesis.sh` defaults to `AGGREGATION=off`). So no aggregator runs on the
-  testnet today. A local chain-12-style node reports `"max_covers": 0` in `rand status`.
+- Chains 9 to 13 were cut **without** the `aggregation` section (`deploy/README.md`;
+  `deploy/cut-chain12-genesis.sh` and `deploy/cut-chain13-genesis.sh` default to
+  `AGGREGATION=off`). So no aggregator runs on the testnet today. A local chain-12-style node
+  reports `"max_covers": 0` in `rand status`.
 
 A validator stays CPU-cheap by design (`docs/aggregation.md` §1). Proving happens in wallets and,
 on an aggregation chain, in aggregators.
@@ -49,9 +53,9 @@ data dir grew by about 4 GB. Plan disk from the chain's age and load, not from t
 
 | size | nodes | status |
 |---|---|---|
-| `s-1vcpu-2gb` | ams3, nyc1, nyc2, sfo2 (validators) | running chain 12 |
-| `s-2vcpu-2gb` | part of the rest of the fleet (the per-node sizes are not recorded in `deploy/`) | running chain 12 |
-| `s5-1vcpu-2gb-30gb` | mkc1, mem1 (validators) | running, but the 30 GB disk filled with three chains' data dirs; resize before the chain grows past about 20 GB |
+| `s-1vcpu-2gb` | ams3, nyc1, nyc2, sfo2 (validators) | running chain 13 |
+| `s-2vcpu-2gb` | part of the rest of the fleet (the per-node sizes are not recorded in `deploy/`) | running chain 13 |
+| `s5-1vcpu-2gb-30gb` | mkc1, mem1 (validators) | running chain 13. Their 29 GB disks were full at the chain-13 cut-over; the dead chain-11 data dirs (7 GB) were deleted, leaving 7 GB free. **They need a resize.** |
 | 4 vCPU, 8 GB | E (validator, explorer, build host) | builds the Linux binaries: 4 min 17 s for `4504a03` |
 
 Sources: `deploy/nodes.env`, `deploy/README.md`.
@@ -66,7 +70,8 @@ Rules that follow from these numbers:
   uplink takes minutes each; droplet-to-droplet takes under a minute for all 15.
 - **An aggregation chain adds a start-up cost.** Each node builds the rVM verifier key once:
   13.0–13.4 s at the test profile (2^19). The production figure at 2^21 is an estimate of about
-  30–70 s. `TODO-CONTROLLER`: measure the production key build and its memory.
+  30–70 s. The production key build and its memory are not measured yet; the bound stays the
+  30–70 s estimate.
 
 ### 2.3 Set up a validator on a droplet
 
@@ -151,12 +156,14 @@ A wallet proves locally. Its hardware sets how fast a user can send or call.
 
 | proof | tier | time | peak memory |
 |---|---|---|---|
-| bundle (every transfer, deploy and call) | 14 | about 100 s (production); 97.0 s measured (test profile) | 5.74 GB for one `rand call` (tier-10 call plus tier-14 bundle), test profile. Production: `TODO-CONTROLLER` |
+| bundle (every transfer, deploy and call) | 14 | 92.2 s, 94.3 s and 96.0 s measured (production, chain 13, laptop); 97.0 s measured (test profile) | 5.74 GB for one `rand call` (tier-10 call plus tier-14 bundle), test profile. Production: the bundle alone is not measured yet; one whole production `rand call` (tier-16 call plus tier-14 bundle) peaked at 22.9 GB RSS |
+| a call at tier 16 (ERC-20 `approve`, production) | 16 | 388.7 s for the call proof; 622.8 s for the whole `rand call` (chain 13, 48 GB M-series laptop) | 22.9 GB peak RSS, whole `rand call` |
 | a call at tier 10 | 10 | 6.0 s measured (test profile); 6.05 s for `fib` (production, constraint set 5) | included above |
 | a call at tier 18 or 20 | 18, 20 | see §5 | see §5 |
 
 The test-profile row is `/usr/bin/time -l rand call …` on this laptop, 2026-09-19
-([`guests.md`](guests.md#46-call-it)).
+([`guests.md`](guests.md#46-call-it)). The production rows are the deploys and the call made on
+the live chain 13 on 2026-09-19 ([`translators.md`](translators.md) §4.6, §4.6.1, §5.4).
 
 ## 4. Aggregator
 
@@ -167,9 +174,9 @@ carries an `aggregation` section; none does today.
 | aggregate | tier | measured | machine class |
 |---|---|---|---|
 | test profile, N=1 | 19 | proven: 1568.2 s wall on a loaded shared box, 327 035 bytes; about 30 GB peak | — |
-| production, N=1 | 21 | 1 968 758 rows; 48.6 GB oracle, not yet proven | ≥ 64 GB host. Final: `TODO-CONTROLLER` |
-| production, N=2 | 22 | about 95.3 GB estimate | ≥ 128 GB host. Final: `TODO-CONTROLLER` |
-| production, N=3 | 23 | about 127 GB estimate | ≥ 160 GB host plus an 80 GB GPU. Final: `TODO-CONTROLLER` |
+| production, N=1 | 21 | 1 968 758 rows; 48.6 GB oracle, not yet proven | ≥ 64 GB host (bound). Not measured yet |
+| production, N=2 | 22 | about 95.3 GB estimate | ≥ 128 GB host (bound). Not measured yet |
+| production, N=3 | 23 | about 127 GB estimate | ≥ 160 GB host plus an 80 GB GPU (bound). Not measured yet |
 
 Sources: `docs/aggregation.md` §6, `docs/zkvm-m4-m5-progress.md`,
 `docs/superpowers/specs/2026-09-15-block-aggregation.md`.
@@ -190,11 +197,12 @@ shorten a proof today; more RAM decides whether it finishes.
 | tier | cycles (up to) | workload measured | memory measured | time measured | final |
 |---|---:|---|---|---|---|
 | 10 | 1 023 | `fib` (production, constraint set 5) | not recorded | 6.05 s | — |
-| 14 | 16 383 | the bundle (wallet, test profile) | 5.74 GB whole `rand call` | 97.0 s | production: `TODO-CONTROLLER` |
+| 14 | 16 383 | the bundle (wallet, test profile) | 5.74 GB whole `rand call` | 97.0 s | production: 92.2–96.0 s and 1 418 406–1 420 423-byte proofs (chain 13, laptop); memory of the bundle alone not measured yet |
+| 16 | 65 535 | ERC-20 `approve`, translated | test profile, DigitalOcean: 21.7 GB. Production, laptop: 22.9 GB peak RSS for the whole `rand call` | test profile: 786.7 s (13.1 min). Production: 388.7 s | production: proved and committed on chain 13, 3 412 405-byte proof |
 | 18 | 262 143 | ERC-20, about 66 k–162 k cycles | OOM-killed on a 48 GB laptop at 24.7 GB. On a 64 GB droplet: above 47 GB at 25 min, still running | killed after 1 016 s on the laptop | translated `transfer`: 85.0 GB, 3 230.5 s (53.8 min), 811 600 B proof. Interpreter `evm.bin`: 85.5 GB, 3 143.3 s (52.4 min), 805 108 B proof. Verify: 101.4 s (droplet), 50.2 s at 3.66 GB RSS (laptop). Measured on m-16vcpu-128gb, 2026-09-19 |
 | 19 (rVM) | — | rVM aggregate, N=1, test profile | about 30 GB peak | 1568.2 s | — |
 | 20 | 1 048 575 | SPL Token, about 700 k–770 k cycles | stopped on a 48 GB laptop at about 31 GB (30.77 GB peak footprint); OOM-killed on a 64 GB droplet at 65.1 GB | 10 m 41 s on the droplet before the kill | not yet proven. Extrapolated from the measured tier-16/18 scaling (memory about ×3.9, time about ×4.1 per +2 tiers): about 330 GB and about 3.6 h, more than DigitalOcean's largest memory droplet (m-32vcpu-256gb, 256 GB) |
-| 21 (rVM) | — | rVM aggregate, N=1, production | 48.6 GB oracle | not run | `TODO-CONTROLLER` |
+| 21 (rVM) | — | rVM aggregate, N=1, production | 48.6 GB oracle | not run | not measured yet; bound: a ≥ 64 GB host |
 
 The cycle column is `2^t − 1` for the RV32 zkVM (`docs/confidential.md`). The rVM (the
 recursion machine) has its own tiers, sized in rows (`docs/zkvm-m4-m5-progress.md`). The tier-18 and tier-20 laptop runs used

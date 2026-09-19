@@ -600,10 +600,17 @@ B` asks the node.
 
 | | |
 |---|---|
-| chain | 13 (not cut yet) |
-| genesis hash | `TODO-CONTROLLER` |
-| `max_program_words` | `TODO-CONTROLLER` |
-| pinned build | `TODO-CONTROLLER` |
+| chain | 13, live since 2026-09-19 |
+| genesis hash | `8123ccac1883a45750e4df6964fb7cd3f0b321798cde4c0ef406a0293939ece3` |
+| genesis file | `deploy/genesis-chain13.json` |
+| `max_program_words` | 65 535 |
+| `max_proof_bytes` | 8 388 608 (8 MiB) |
+| `max_block_bytes` | 20 971 520 (20 MiB) |
+| `max_call_envelope_bytes` | 65 536 |
+| `max_program_public_words` | 32 768 |
+| pinned build | fullnode `86af6eb` (Linux `rand-node` sha256 `cc20bf84…`) |
 
-Chain 13's call limits are the values in §8.1 (`deploy/cut-chain13-genesis.sh`). Until chain 13
-is live, deploy only images of at most 4096 words, and no `--public`, on the testnet.
+Chain 13's call limits are the values in §8.1 (`deploy/cut-chain13-genesis.sh`). Images of up to
+65 535 words, and `--public` inputs of up to 32 768 words, deploy on the testnet. The 11 686-word
+translated ERC-20 and the 65 096-word translated SPL Token are both deployed there
+([`translators.md`](translators.md) §4.6 and §5.4).

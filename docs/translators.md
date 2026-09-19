@@ -274,14 +274,38 @@ rand program deploy evm2rv/target/erc20/image.bin
 It prints the program id, the word count and `hc`, then checks the chain's program cap with
 `rand_estimateFee` before it proves anything. The image is 11 686 words.
 
-- Chain 12 runs the default cap of 4 096 words, so the deploy is refused there.
+- Chain 12 had the default cap of 4 096 words, so the deploy was refused there.
 - On a local test chain cut with `--max-program-words 65535`, this exact deploy was run on
   2026-09-19 and committed (fee 1.1696 RAND; output in
   [`guests.md`](guests.md#8-the-program-size-cap-is-a-genesis-parameter)).
 - It needs a chain whose genesis sets `max_program_words >= 11686`
   ([`guests.md`](guests.md#8-the-program-size-cap-is-a-genesis-parameter)).
-- The chain that raises the cap is chain 13: genesis `TODO-CONTROLLER`, `max_program_words`
-  `TODO-CONTROLLER`, pinned build `TODO-CONTROLLER`. It is not cut yet.
+- The chain that raises the cap is chain 13, live since 2026-09-19: genesis
+  `8123ccac1883a45750e4df6964fb7cd3f0b321798cde4c0ef406a0293939ece3`, `max_program_words`
+  65 535, pinned build `86af6eb`. Its other limits: `max_proof_bytes` 8 388 608 (8 MiB),
+  `max_block_bytes` 20 971 520 (20 MiB), `max_call_envelope_bytes` 65 536,
+  `max_program_public_words` 32 768.
+
+**Live on chain 13.** This deploy was run on 2026-09-19 against the live chain (production FRI
+profile), from the genesis wallet `shielded-1`. The wallet's output, with its progress lines
+elided (`…`):
+
+```
+$ rand program deploy <image.bin>          # evm2rv/target/erc20/image.bin
+program id: f074c4eb834cf01886a8241b6a2e0caf6e1cee5327fee6cb1a1a37436607280d (11686 words, hc 92aefea0951c31a717574962aeb70e10a37012a7d035d48e8713c36df68feae0)
+…
+proved in 92.2s: tier 14, 1419655 bytes
+submitted deploy c7a66dc4d9cdb7f9bfc4bde01f618c356e5abad7097e6bf7dc04e2e49c53acd0
+…
+```
+
+| | |
+|---|---|
+| program id | `f074c4eb834cf01886a8241b6a2e0caf6e1cee5327fee6cb1a1a37436607280d` |
+| image | 11 686 words; `hc a0feae92…` in `rand-guest`'s spelling, `92aefea0…` in the wallet's |
+| fee bundle | tier 14, 1 419 655 bytes, proved in 92.2 s |
+| deploy tx | `c7a66dc4d9cdb7f9bfc4bde01f618c356e5abad7097e6bf7dc04e2e49c53acd0` |
+| committed at height | 381 |
 
 ### 4.6.1 Call it
 
@@ -326,6 +350,37 @@ re-opened the 649 words and reproduced them (`verdict: faithful`).
   laptop.
 - `approve` is tier 16. `transfer` and `transferFrom` are tier 18 and need about 85 GB to prove
   (§6.5), so they were not run on the laptop. Their call path is the same.
+
+**Live on chain 13.** The same call, on the same `approve(BOB, 5)` vector (649 private words),
+was made on 2026-09-19 against the live chain with its production FRI profile, from the genesis
+wallet `shielded-1`. The wallet's output, with its progress lines elided (`…`):
+
+```
+$ rand call f074c4eb834cf01886a8241b6a2e0caf6e1cee5327fee6cb1a1a37436607280d --input <w0> --input <w1> …   # the 649 words of approve(BOB, 5)
+…
+proved in 388.7s: tier 16, 3412405 bytes, outputs [1, 942495465, 790002515, 1351749335, 1059083501, 2923046783, 2814575942, 696258848]
+…
+proved in 96.0s: tier 14, 1420423 bytes
+submitted call 279e1f62abf3f177ca71b08c633e051c37bc4720118c79ddb00936f036c4bfa7
+…
+```
+
+| | |
+|---|---|
+| call proof | tier 16, 3 412 405 bytes, proved in 388.7 s |
+| fee bundle | tier 14, 1 420 423 bytes, proved in 96.0 s |
+| sealed envelope | 2 700 bytes |
+| call tx | `279e1f62abf3f177ca71b08c633e051c37bc4720118c79ddb00936f036c4bfa7` |
+| anchored at / committed at | height 802 / height 919 |
+| fee | 0.00357 RAND |
+| receipt `h_pub` | `null` |
+| receipt outputs | `[1, 942495465, 790002515, 1351749335, 1059083501, 2923046783, 2814575942, 696258848]`, equal to the interpreter's eight words for the same vector |
+| laptop wall time, peak RSS | 622.8 s, 22.9 GB (48 GB M-series laptop) |
+
+- The production call proof is 3 412 405 bytes, over chain 12's 2 MiB proof cap. Chain 12 could
+  not accept this call; chain 13's 8 MiB cap does.
+- The fee includes the byte term: the 3.41 MB proof is above the 2 097 152 + 18 432-byte free
+  allowance, so the call costs 0.00357 RAND, not the 0.0023 RAND of the test-profile run above.
 
 Before a call on the testnet, read [§7, What works on chain today](#7-what-works-on-chain-today).
 
@@ -497,13 +552,39 @@ This ran on 2026-09-19 on the same local chain as §4.6.1 (chain 13's limits, te
 
 - The deploy needs `max_program_words >= 65096` and `max_program_public_words >= 27151`. Chain
   13 sets 65 535 and 32 768. Chain 12 refuses both.
-  Chain 13 values: genesis `TODO-CONTROLLER`, `max_program_words` `TODO-CONTROLLER`.
+  Chain 13 values: genesis `8123ccac1883a45750e4df6964fb7cd3f0b321798cde4c0ef406a0293939ece3`,
+  `max_program_words` 65 535, `max_program_public_words` 32 768.
 - The fee counts the public words with the code words: `0.001 + 100 000 units × (65 096 +
   27 151)` = 9.2257 RAND.
 - The id binds the ELF (`rand-program-2`), so it is not the `65d234ce…` that `rand-guest info`
   prints for the bare image. Call the id `deploy` printed.
 - `rand_getProgramPublic` serves the 27 151 words back; they start `108600 1179403647 65794 0 0
   17235971 1 2088`, the same words as §5.3.
+
+**Live on chain 13.** The same deploy was run on 2026-09-19 against the live chain (production
+FRI profile), from the genesis wallet `shielded-1`. The wallet's output, with its progress lines
+elided (`…`):
+
+```text
+$ rand program deploy <image.bin> --public spl_token.so
+program id: 740236918310f8e52bb0c1ef49b2b0e0c018762e289666660685b0694c8dd00a (65096 words, hc ae05a98c03f5623c68e87dde320f0429538b093efeffa5db1a2fb4098b7516ad, public input 27151 words, digest ec57b10ed6f3a3d5fe87ec072f691322ad747377ba2f0a1788bcfe3e7334d67e)
+…
+proved in 94.3s: tier 14, 1418406 bytes
+submitted deploy 626fc9387ecc1f6b39f44184807303ac2843029d8fb8e28338bf186445927530
+…
+```
+
+| | |
+|---|---|
+| program id | `740236918310f8e52bb0c1ef49b2b0e0c018762e289666660685b0694c8dd00a` |
+| image | 65 096 words; `hc 8ca905ae…` in `rand-guest`'s spelling, `ae05a98c…` in the wallet's |
+| public input | 27 151 words (the ELF), digest `ec57b10ed6f3a3d5fe87ec072f691322ad747377ba2f0a1788bcfe3e7334d67e` |
+| fee bundle | tier 14, 1 418 406 bytes, proved in 94.3 s |
+| deploy tx | `626fc9387ecc1f6b39f44184807303ac2843029d8fb8e28338bf186445927530` |
+| anchored at height | 400 |
+| fee | 9.2257 RAND, as `rand fee deploy 65096 --public-words 27151` predicts |
+
+No call to this program has been proved: see §5.5.
 
 ### 5.5 Call it
 
@@ -537,7 +618,8 @@ Error: the program's public input is 27151 words and --expect-public has 4; not 
 - The chain checks the call proof's `H_PUB` against the deploy's `public_digest`, so a proof over
   any other public words is refused with `PublicValues`.
 - **Not run: the call proof itself.** Every SPL vector is tier 20, which needs about 330 GB to
-  prove (§6.5). That is more than any machine this was tested on.
+  prove (§6.5). That is more than any machine this was tested on, and more than any DigitalOcean
+  droplet (256 GB max). No SPL call proof exists, on chain 13 or anywhere else.
 
 ### 5.6 SPL Token numbers
 
@@ -691,12 +773,15 @@ of them; chain 13 sets all five.
 | step | ERC-20 (stage two) | SPL Token |
 |---|---|---|
 | deploy on chain 12 (cap 4 096, no public input) | refused: 11 686 words | refused: 65 096 words and a 27 151-word public input |
-| deploy on chain 13's limits | admitted: `rand program deploy image.bin`, fee 1.1696 RAND (run, §4.6) | admitted: `rand program deploy image.bin --public spl_token.so`, fee 9.2257 RAND (run, §5.4) |
+| deploy on chain 13's limits | admitted: `rand program deploy image.bin`, fee 1.1696 RAND (run on a local chain, §4.6) | admitted: `rand program deploy image.bin --public spl_token.so`, fee 9.2257 RAND (run on a local chain, §5.4) |
+| deploy on the live chain 13 | deployed 2026-09-19: program `f074c4eb…`, tx `c7a66dc4…`, committed at height 381 (§4.6) | deployed 2026-09-19: program `74023691…`, tx `626fc938…`, fee 9.2257 RAND, anchored at height 400 (§5.4) |
 | call inputs | 649–1 201 private words (921 for `transfer`, 649 for `approve`): under the input cap on any chain (4 295 by default, 16 071 on chain 13) | 10 458 private words, under chain 13's 16 071 and over a default chain's 4 295; the 27 151 ELF words are the deploy's public input, which `rand call` fetches itself |
-| call proof size | the harness calls `KECCAK`, so the proof carries the keccak table: 3 198 430 bytes at tier 10 (production), over chain 12's 2 MiB cap and under chain 13's 8 MiB. Test profile: 796 019 bytes at tier 16 (`approve`), 811 600 at tier 18 (`transfer`) | tier 20; not yet proven |
+| call proof size | the harness calls `KECCAK`, so the proof carries the keccak table: 3 198 430 bytes at tier 10 (production), over chain 12's 2 MiB cap and under chain 13's 8 MiB; 3 412 405 bytes at tier 16 (`approve`, production, live on chain 13). Test profile: 796 019 bytes at tier 16 (`approve`), 811 600 at tier 18 (`transfer`) | tier 20; not yet proven |
 | call on chain 13's limits | `approve` called through `rand call` on a local chain: receipt outputs equal `rand-guest run`'s, fee 0.0023 RAND (§4.6.1). `transfer` needs a tier-18 prover | a mismatched public input is refused before proving (§5.5); the call proof itself needs a tier-20 prover |
+| call on the live chain 13 | `approve` called 2026-09-19: production proof 3 412 405 bytes, fee 0.00357 RAND, tx `279e1f62…` committed at height 919, receipt outputs equal the interpreter's (§4.6.1) | not proved: no SPL call proof exists |
 | call proof memory | tier 16 fits a 48 GB laptop; tier 18 needs about 85 GB (§6.5) | tier 20, about 330 GB extrapolated (§6.5) |
 
-In short: v0.4 delivers the translation, the parity evidence, the deploy path for both images, and
-the call path on chain 13's limits. What remains is hardware: a ≥ 128 GB prover for the tier-18
+In short: v0.4 delivers the translation, the parity evidence, the deploy path for both images
+(both deployed on the live chain 13), and the call path on chain 13's limits (the ERC-20 `approve`
+called on the live chain 13). What remains is hardware: a ≥ 128 GB prover for the tier-18
 ERC-20 calls, and one far larger than any DigitalOcean droplet for SPL Token's tier 20.

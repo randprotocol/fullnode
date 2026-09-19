@@ -20,9 +20,9 @@ chain with a proof instead of their inputs.
 | Storage | one RocksDB per node with column families for blocks, certificates, indexes, notes, nullifiers, anchors, validators, programs and receipts; fsynced commits; startup integrity check with truncate-and-resync |
 | Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` / `receipts` / `transaction` subscription on the same port (`rand-node`), `rand` wallet CLI with a local prover, Rust client library |
 
-Status: an experimental testnet (see `deploy/README.md`) runs across two laptops and four cloud
-servers. That fleet is still on **chain 5, an account chain**: the shielded pool is a hard fork and
-the operator cuts it as a new chain id when they choose to. Not audited; not for real value.
+Status: an experimental testnet runs **chain 13** (v0.4, live since 2026-09-19; genesis
+`8123ccac…`, pinned build `86af6eb`) on 16 DigitalOcean droplets and a laptop validator, with 18
+validators in the register (see `deploy/README.md`). Not audited; not for real value.
 
 ## Contents
 
