@@ -17,21 +17,22 @@ Conventions:
   `Word8` — eight little-endian `u32` words as 64 lowercase hex characters.
 - Shielded addresses are `rand1` + base58, about 1668 characters. A parameter longer than 2000
   characters is refused on its length before it is parsed.
-- Amounts are strings of smallest units (`"1500000000"` = 1.5 RAND); 1 RAND = 10^9 units.
-  Amounts *inside a decoded transaction* are JSON integers instead — a bundle's `fee` and its
-  `burn_a`/`burn_r`, a
-  mint's amount, a staking action's amount — because they are being reported as the transaction's own
-  fields rather than as chain state.
-- **Every field the RPL/bridge-hardening work (chain 14) introduced follows the string rule with
-  no exception**: `rand_getTokens`/`rand_getToken`/`rand_getTokenSupply`'s supplies and each
-  backing's `locked`, `mint_cap_per_day` and `minted_today` (token units), `rand_getAssets`'s and
-  `rand_getBridgeState`'s matching asset/backing rows, and both methods' `registration_fee` (RAND
-  units) are all decimal strings. So is a decoded transaction's `bridge_attest`/`bridge_burn`/
-  `token_mint`/`token_burn`/`register_token` `amount` (and `initial_amount`/`initial.amount`).
-  This matters because a 9-decimal token's supply passes 2^53 at a ten-million-unit balance,
-  where the older rule above — kept only for the RAND fields it already shipped with — would
-  silently lose precision in a JS client. Indices, nonces, heights, lengths, decimals and day
-  counters (`mint_day`) are plain JSON integers throughout, new fields included.
+- **One rule, no exception: every `u64` amount — RAND units or token units, chain state or a
+  decoded transaction's own field — is a decimal string** (`"1500000000"` = 1.5 RAND; 1 RAND =
+  10^9 units), because a JSON number is not an exact integer past 2^53 and a 9-decimal token's
+  supply already passes it at a few tens of millions of units. Indices, nonces, heights, leaf
+  indices, views, lengths, decimals and day counters (`mint_day`) are never amounts and are plain
+  JSON integers throughout. Concretely, every one of these is a string: `rand_getTokens`/
+  `rand_getToken`/`rand_getTokenSupply`'s supplies and each backing's `locked`, `mint_cap_per_day`
+  and `minted_today`; `rand_getAssets`'s and `rand_getBridgeState.assets[]`'s matching rows and
+  both methods' `registration_fee`; a decoded transaction's `bundle.fee`, `burn_a` and `burn_r`;
+  and `action.amount` for `mint`, `bond`, `unbond`, `withdraw`, `bridge_attest`, `bridge_burn`
+  (plus its `relayer_fee`), `token_mint`, `token_burn` and `register_token` (`initial_amount`/
+  `initial.amount`). **Breaking change, 2026-09-20 (v0.5 / chain 14):** the pre-chain-14 fields in
+  that list — `bundle.fee`; `action.amount` for `mint`, `bond`, `unbond`, `withdraw`,
+  `bridge_attest`; `action.amount` and `action.relayer_fee` for `bridge_burn`; and
+  `rand_getAssets`'s / `rand_getBridgeState.assets[]`'s `locked` — used to be JSON integers; see
+  the changelog below for the full list and why it changed.
 - Heights, leaf indices and views are JSON integers.
 - **Every request must carry an `id` member**, batched or not: an object without one is a JSON-RPC
   notification, and this node refuses it with `-32600` rather than running it silently. An explicit
@@ -396,7 +397,7 @@ Params: `[hash]`. Result: `null` until committed, then:
       "anchor": "6b1d…c4",
       "nullifiers": ["8c04…d1", "5e77…20", "03aa…6f", "e19b…42"],
       "commitments": ["2a9f…07", "b310…88", "77c1…0e", "5d20…b3"],
-      "fee": 1000000, "burn_a": 0, "burn_r": 0, "burn_asset": 0, "time": 5,
+      "fee": "1000000", "burn_a": "0", "burn_r": "0", "burn_asset": 0, "time": 5,
       "proof_len": 1431562, "envelope_len": [1380, 1380, 1380, 1380]
     },
     "action": { "kind": "none" }
@@ -422,7 +423,7 @@ three burn fields are the bundle's only public statement about value leaving the
 
 Other actions:
 
-- `{ "kind": "mint", "cm": "…", "amount": 100000000000, "minter": "<validator base58>" }`
+- `{ "kind": "mint", "cm": "…", "amount": "100000000000", "minter": "<validator base58>" }`
 - `{ "kind": "deploy", "program": "<program id>", "words": 412, "public_words_len": 0 }`
 - `{ "kind": "call", "program": "<program id>", "proof_len": 268123, "input_envelope_len": 1280 }`
 
@@ -435,12 +436,12 @@ the caller's viewing key and the auditor, not for whoever is reading the explore
 
 The staking (phase S2) and bridge (phase S3) actions:
 
-- `{ "kind": "bond", "validator": "<base58>", "amount": 500, "registered": false }` — `registered`
+- `{ "kind": "bond", "validator": "<base58>", "amount": "500", "registered": false }` — `registered`
   is whether this bond carried a first-time registration.
-- `{ "kind": "unbond", "validator": "<base58>", "amount": 7, "nonce": 2 }` — rendered with
+- `{ "kind": "unbond", "validator": "<base58>", "amount": "7", "nonce": 2 }` — rendered with
   `"bundle": null`, as a withdraw is: both are signed by the validator's key, and the register's
   nonce, not a bundle, is what keeps them from being replayed.
-- `{ "kind": "withdraw", "validator": "<base58>", "amount": 9, "nonce": 3, "time": 1994 }` — the
+- `{ "kind": "withdraw", "validator": "<base58>", "amount": "9", "nonce": 3, "time": 1994 }` — the
   deposit note's blinding and envelope are not rendered. `time` is the note's time word, which the
   withdrawing node chose; the note itself is worth `amount` less the bundle base.
 - `{ "kind": "bridge_attest", "attestation_len": 520, "recipient": "<shielded address>",
@@ -475,8 +476,7 @@ units:
 
 - `{ "kind": "token_burn", "asset": 3, "amount": "400" }` — a holder burn. Its asset and amount are
   public by design (they audit the token's `total_supply`), and the bundle's `burn_asset`/`burn_a`
-  repeat them (`burn_a` itself is a pre-chain-14 bundle field and stays a JSON integer there, per
-  the note above).
+  repeat them (`burn_a` is a decimal string too, like every amount in this reply).
 - `{ "kind": "token_mint", "asset": 3, "amount": "700", "recipient": "<shielded address>",
   "time": 41, "r": "<64 hex>", "nonce": 0 }`, `{ "kind": "register_token", "name": …, "symbol": …,
   "decimals": 6, "authority": "none" | "key" | "bridge" | "program", "index": 2,
@@ -1183,6 +1183,29 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
+### 2026-09-20 — every amount is a decimal string, legacy fields included (breaking)
+
+The one exception to the amount-is-a-string rule is gone. Every `u64` amount this RPC serves is
+now a decimal string, chain state and a decoded transaction's own fields alike — see
+[Conventions](#json-rpc-reference). **Breaking for a client built against the pre-chain-14 shape**:
+these fields changed from JSON numbers to decimal strings, no other change to their meaning or
+position:
+
+- `bundle.fee` (`rand_getTransaction`'s `.tx`, and `rand_getBlockByHeight`/`rand_getBlockByHash`'s
+  `.transactions[]`, same shape).
+- `action.amount` for `kind` = `mint`, `bond`, `unbond`, `withdraw`, `bridge_attest` (same three
+  methods).
+- `action.amount` and `action.relayer_fee` for `kind` = `bridge_burn` (same three methods; never
+  live on a bridged public chain before this change).
+- `locked` in `rand_getAssets`'s rows and `rand_getBridgeState.assets[]`'s rows.
+
+A client that reads any of these five with `.as_u64()`-style parsing must switch to parsing a
+string. Every other amount this RPC serves was already a string before this change (`rand_getSupply`,
+`rand_getEmission`, `rand_getValidators`, viewing notes, `unsealed.excess`, an aggregate's
+`subsidy`/`proving_share`, and every RPL/bridge-hardening field). `rand_getStatus`'s
+`aggregation.subsidy_base` is now a string too, for the same reason (it was the one amount this
+RPC still served as a number).
+
 ### 2026-09-20 — the token RPC and `rpl1…` token ids
 
 - **New methods:** `rand_getTokens` (the whole registry, paged), `rand_getToken` (one token by
@@ -1378,7 +1401,8 @@ see:
   auditable against `sealed_blocks` directly).
 - **`rand_status` gains `aggregation`**: `registered`, `unsealed`, `verify_queue`, and the
   chain parameters an aggregate daemon computes the payment from (`max_covers`, `window`,
-  `subsidy_base`, `halving_blocks`, `sealed_blocks`).
+  `subsidy_base`, `halving_blocks`, `sealed_blocks`). `subsidy_base` is a decimal string, like
+  every other amount this RPC serves (2026-09-20); the rest of this object is plain integers.
 - **`tx_json`** renders the five new actions (`register_aggregator`, `unbond_aggregator`,
   `withdraw_aggregator`, `slash_aggregator`, `aggregate`) with their public fields.
 - The node CLI gains the role's commands: **`rand-node aggregator register|unbond|withdraw`**

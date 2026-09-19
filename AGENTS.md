@@ -68,14 +68,18 @@ the chain-14 cut (handoff §5, steps 5–10).
     `assets` rows and the token RPC's rows disagreed on whether a `u64` amount is a JSON number or a
     decimal string — masked in randscan by hand-written, already-quoted mock fixtures (S1's review
     found it: a live chain's numeric amounts silently failed to render). **The rule, settled**: every
-    RPL/bridge-hardening (chain 14) amount field is a decimal string, no exception, because a
-    9-decimal token passes 2^53 at a few tens of millions of units — `docs/rpc.md`'s conventions
-    section states it once. This is *not* "every consumer already tolerates both": the wallet and
-    other RAND-side readers of these specific fields had to be fixed alongside the node in the same
-    change, or they silently misread a number as a string or vice versa. The older, pre-chain-14
-    exception (a bundle's `fee`, `burn_a`/`burn_r`, a mint's or a staking action's `amount` inside a
-    decoded transaction) is left as a JSON integer on purpose — already shipped that way — and is
-    not a precedent for anything new.
+    `u64` amount this RPC serves — RAND units or token units, chain state or a decoded transaction's
+    own field — is a decimal string, no exception, because a 9-decimal token passes 2^53 at a few
+    tens of millions of units — `docs/rpc.md`'s conventions section states it once. This is *not*
+    "every consumer already tolerates both": the wallet and other RAND-side readers of these
+    specific fields had to be fixed alongside the node in the same change, or they silently misread
+    a number as a string or vice versa. **The pre-chain-14 exception is gone, 2026-09-20 (breaking):**
+    a bundle's `fee`, `burn_a`/`burn_r`, and a mint's/staking action's/`bridge_attest`'s/
+    `bridge_burn`'s `amount` (and `bridge_burn`'s `relayer_fee`) inside a decoded transaction, plus
+    `rand_getAssets`'s and `rand_getBridgeState.assets[]`'s `locked`, used to stay JSON integers on
+    purpose; they are now decimal strings like everything else, and `rand_getStatus`'s
+    `aggregation.subsidy_base` (the one field this left as a number) moved with them. See
+    `docs/rpc.md`'s changelog for the exact field list.
   - **The `.pending` key file.** `rand token create --authority-key-out FILE` writes the fresh
     authority key to `FILE.pending` immediately before the one call that can lose an index race
     (`IndexMismatch`), not before — promoted to `FILE` only once the chain accepts the registration,

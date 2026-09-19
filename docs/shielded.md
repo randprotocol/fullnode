@@ -291,7 +291,7 @@ acceptance is not commitment, so poll `rand_getTransaction`.
      "bundle": {"anchor": "6b1d…c4",
                 "nullifiers": ["8c04…d1", "5e77…20", "03aa…6f", "e19b…42"],
                 "commitments": ["2a9f…07", "b310…88", "77c1…0e", "5d20…b3"],
-                "fee": 1000000, "burn_a": 0, "burn_r": 0, "burn_asset": 0, "time": 5,
+                "fee": "1000000", "burn_a": "0", "burn_r": "0", "burn_asset": 0, "time": 5,
                 "proof_len": 1431562, "envelope_len": [1380, 1380, 1380, 1380]},
      "action": {"kind": "none"}}}
 ```

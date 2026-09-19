@@ -83,8 +83,10 @@ running chain cannot change them. `rand_getLimits` reports all five. Chain 13's 
 There is no `--alloc-each`: a shielded chain has no per-validator allocation, because value only
 exists as a note someone holds the spend key for. Each `--alloc` builds one deposit note with
 fresh commitment randomness, so writing the same allocation twice produces two different notes and
-two different genesis hashes — a deterministic `r` would let anyone confirm a guess at a genesis
-note's owner and amount by recomputing the commitment. Cut a genesis once and keep the file.
+two different genesis hashes. This command always writes the note's opening (`pk`, `time`, `r`)
+beside `cm` and `amount` (core I-2, required on any chain with a `tokens` section), so a genesis
+note's owner and amount are public by design once the file is published — only when and into what
+it is later spent stays private. Cut a genesis once and keep the file.
 
 There is no `--bridge` flag either, but a bridged chain is cut from this file by hand: add a
 `bridge` section (`{"emitter": "<64 hex>", "guardians": ["<40 hex>"], "emitters": {"2": "<64 hex>"}}`)
@@ -102,7 +104,8 @@ Genesis JSON shape:
   "alloc": [
     { "cm": "<64 hex>",
       "envelope": { "kem_ct": "<hex>", "to_receiver": "<hex>", "to_sender": "<hex>", "body": "<hex>" },
-      "amount": 1000000000000 }
+      "amount": 1000000000000,
+      "opening": { "pk": "<64 hex>", "time": 0, "r": "<64 hex>" } }
   ],
   "faucet": true,
   "confidential": true,
