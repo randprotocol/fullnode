@@ -283,9 +283,11 @@ enum Cmd {
         #[arg(long = "admitted-shape", value_name = "PROFILE,TIER,HEIGHTS…,HC,DIGEST")]
         admitted_shapes: Vec<String>,
         /// The RPL `tokens` section, as a `TokensConfig` JSON file (`{"registration_fee": …,
-        /// "tokens": [...]}`). Omitted entirely when absent, so a chain without one hashes
-        /// byte-for-byte as before. A `bridge` section needs one; a listed token needs a
-        /// `bridge` section (`Genesis::build` validates both).
+        /// "mint_cap_per_day": …, "tokens": [...]}`). Omitted entirely when absent, so a chain
+        /// without one hashes byte-for-byte as before. A `bridge` section needs one, with a
+        /// non-zero `mint_cap_per_day` (bridge hardening B1: per backing, per UTC day, in the
+        /// token's eight-decimal units); a listed token needs a `bridge` section
+        /// (`Genesis::build` validates both).
         #[arg(long, value_name = "TOKENS.JSON")]
         tokens: Option<PathBuf>,
     },

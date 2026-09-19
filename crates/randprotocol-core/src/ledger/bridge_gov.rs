@@ -1,32 +1,32 @@
 //! The bridge's Rand-only governance actions: B1's `PauseMints` and `UnpauseMints` (bridge
-//! hardening spec §2) and B4's `RegisterBridgedToken` and `ListBacking` (spec §7) — every action
-//! a PQ guardian quorum, or the pause key, authorises without an attestation.
+//! hardening spec §2) and B4's `RegisterBridgedToken` and `ListBacking` (spec §7) — the actions
+//! the pause key or a PQ guardian quorum authorises without an attestation.
 //!
-//! **B4, listing after genesis.** A `RegisterBridgedToken` registers a `Bridge`-authority token at
-//! the registry's next index (eight decimals on Rand, the genesis `mint_cap_per_day`) with its
-//! first backing; a `ListBacking` adds a backing to one. Both carry `list_nonce` and bump it, both
-//! pass the same checks a genesis listing does (a registered emitter for the chain, a pair that
-//! backs nothing yet, at most [`super::tokens::MAX_BACKINGS`] backings, source decimals ≤ 18, the name/symbol
-//! rules), and both ride a RAND fee bundle their submitter pays — a registration owing the
-//! registry's `registration_fee` on top of the base. The quorum is the authority, not the payer.
-//! **List on Rand first, `setToken` on the endpoint second** (spec §7).
-//!
-//! Neither moves value. A pause flips [`crate::bridge::BridgeState::mint_paused`] on — every
-//! transfer `BridgeAttest` is then refused `MintsPaused` in `check_attest`, while burns and
-//! rotations stay open — and an unpause flips it off. Both carry the bridge's `pause_nonce` and
-//! bump it, so neither message can be replayed; each refuses the no-op (`AlreadyPaused`,
-//! `NotPaused`) rather than spend a nonce for nothing.
-//!
+//! **B1, the brake.** Neither action moves value. A pause flips
+//! [`crate::bridge::BridgeState::mint_paused`] on — every transfer `BridgeAttest` is then refused
+//! `MintsPaused` in `check_attest`, while burns and rotations stay open — and an unpause flips it
+//! off. Both carry the bridge's `pause_nonce` and bump it, so neither message can be replayed;
+//! each refuses the no-op (`AlreadyPaused`, `NotPaused`) rather than spend a nonce for nothing.
 //! The asymmetry is the point: the one genesis `pause_key` can only pause (its message,
 //! [`crate::bridge::gov::pause_message`], has no unpause twin it can sign), and lifting a pause
 //! needs a PQ guardian quorum over [`crate::bridge::gov::unpause_message`], judged by exactly the
 //! co-signature's five rules ([`crate::bridge::pq`]).
 //!
-//! Cheap before expensive, as everywhere in admission: the gate, the list's structure (no
-//! signature work), the nonce and the flag, and the Dilithium2 verification last. Every refusal
-//! [`apply`] could make is made in [`validate`], so `apply` is infallible on an admitted
-//! transaction — and two of them in one block are safe because block application re-validates
-//! each against the ledger the ones before it left (the second's nonce is stale).
+//! **B4, listing after genesis.** A `RegisterBridgedToken` registers a `Bridge`-authority token at
+//! the registry's next index (eight decimals on Rand, the genesis `mint_cap_per_day`) with its
+//! first backing; a `ListBacking` adds a backing to one. Both carry `list_nonce` and bump it, both
+//! pass the checks a genesis listing does (a registered emitter for the chain, a pair that backs
+//! nothing yet, at most [`super::tokens::MAX_BACKINGS`] backings, source decimals ≤ 18, the
+//! name/symbol rules), and both ride a RAND fee bundle their submitter pays — a registration owing
+//! the registry's `registration_fee` on top of the base. The quorum is the authority, not the
+//! payer. **List on Rand first, `setToken` on the endpoint second** (spec §7).
+//!
+//! Cheap before expensive, as everywhere in admission: the gate, the byte rules and the quorum's
+//! structure (no signature work), the nonce and the state lookups, and the Dilithium2
+//! verification last. Every refusal [`apply`] could make is made in [`validate`], so `apply` is
+//! infallible on an admitted transaction — and two of them in one block are safe because block
+//! application re-validates each against the ledger the ones before it left (the second's nonce
+//! is stale).
 
 use super::tokens::{
     bridged_asset_id, check_metadata, Backing, MintAuthority, TokenError, BRIDGE_DECIMALS,
