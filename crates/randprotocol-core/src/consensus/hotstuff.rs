@@ -141,10 +141,17 @@ impl HotStuff {
         head_ledger.set_timestamp_ms(head.header.timestamp_ms);
         let mut tree = HashMap::new();
         tree.insert(head_hash, Entry { block: head, ledger_after: head_ledger.clone(), receipts: Vec::new() });
+        // The lock is a promise this replica made to the rest of the set, and it outlives the
+        // process (audit v3, CON-1b): a restart that reset the lock to the committed head's QC let
+        // this node vote for a branch conflicting with one it was locked on, which is exactly the
+        // extra vote a conflicting QC needs. So a persisted `locked_qc`/`high_qc` is restored
+        // whenever it is *ahead* of the head's QC, and a stale one is raised to the head — never
+        // lowered below it, because nothing under the committed head can be contradicted any more.
         let (view, high_qc, locked_qc, last_voted_view) = match safety {
             Some(s) => {
                 let view = s.view.max(head_qc.view.saturating_add(1));
-                (view, head_qc.clone(), head_qc.clone(), s.last_voted_view)
+                let newer = |qc: QuorumCertificate| if qc.view > head_qc.view { qc } else { head_qc.clone() };
+                (view, newer(s.high_qc), newer(s.locked_qc), s.last_voted_view)
             }
             None => (head_qc.view.saturating_add(1), head_qc.clone(), head_qc.clone(), 0),
         };
@@ -206,6 +213,12 @@ impl HotStuff {
     pub fn committed_height(&self) -> u64 {
         self.committed_height
     }
+    /// The view of the QC that certifies the committed head — the floor under the lock: a
+    /// persisted `locked_qc` older than this one is stale, and `resume` raises it to this.
+    pub fn committed_qc_view(&self) -> u64 {
+        self.head_qc.view
+    }
+
     pub fn committed_hash(&self) -> Hash {
         self.committed_hash
     }
@@ -421,6 +434,14 @@ impl HotStuff {
             self.head_qc.view
         );
         self.high_qc = self.head_qc.clone();
+        // The lock goes with it, and only here (audit v3, CON-1b: `resume` no longer does this).
+        // This is the deliberate escape hatch, reached only after the node layer's fetches for this
+        // exact block have all failed — every replica holding it is gone. Keeping the lock instead
+        // would be a permanent halt: no replica votes, so no newer QC can form to release it
+        // (regression: `leader_falls_back_when_high_qc_block_is_unobtainable`). Safety rests on the
+        // same argument as before: nothing past the committed head is committed, so no committed
+        // block can be contradicted. It is the one place a promise is taken back, and it needs f+1
+        // failed fetches to be sound in the Byzantine case — see the plan's residual-risk note.
         if self.locked_qc.view > self.head_qc.view && !self.tree.contains_key(&self.locked_qc.block_hash) {
             self.locked_qc = self.head_qc.clone();
         }
@@ -955,8 +976,16 @@ impl HotStuff {
     fn extends_locked(&self, block: &Block) -> bool {
         let locked_hash = self.locked_qc.block_hash;
         let Some(locked) = self.tree.get(&locked_hash) else {
-            // Locked block is committed (pruned) or unknown; everything we hold descends from the head.
-            return true;
+            // A locked block at or under the committed head's QC is committed (and pruned from the
+            // tree): everything we hold descends from the head, so the promise is kept.
+            //
+            // A locked block *above* it that this replica does not hold is the CON-1b case: the
+            // lock was restored from disk by `resume`, or the block was dropped, and this replica
+            // cannot tell whether `block` descends from it. Answering "true" there would be voting
+            // blind on a promise it cannot check, so it answers false and fetches the block; the
+            // vote follows on the replay once the branch is known, or a newer justify releases the
+            // lock on its own (`try_vote`'s first disjunct).
+            return self.locked_qc.view <= self.head_qc.view;
         };
         let locked_height = locked.block.height();
         let mut cur = block.hash();
@@ -987,6 +1016,11 @@ impl HotStuff {
         }
         let safe = block.header.justify.view > self.locked_qc.view || self.extends_locked(block);
         if !safe {
+            // Fetch the locked block when the lock is the reason we are silent and we do not hold
+            // it: without this a restored lock would stall this replica until a newer QC arrives.
+            if !self.tree.contains_key(&self.locked_qc.block_hash) && self.locked_qc.view > self.head_qc.view {
+                out.push(Action::FetchBlock(self.locked_qc.block_hash));
+            }
             return;
         }
         self.last_voted_view = block.view();
