@@ -95,7 +95,7 @@ pub enum TokenError {
     Disabled,
     #[error("token name must be 1 to {MAX_NAME_BYTES} bytes")]
     BadName,
-    #[error("token symbol must be 1 to {MAX_SYMBOL_BYTES} bytes with no whitespace")]
+    #[error("token symbol must be 1 to {MAX_SYMBOL_BYTES} ASCII graphic bytes")]
     BadSymbol,
     #[error("decimals {0} exceeds the maximum {MAX_DECIMALS}")]
     TooManyDecimals(u8),
@@ -272,12 +272,23 @@ impl TokenRegistry {
 
 /// The metadata rules every registration checks, in field order: `name` is 1 to
 /// [`MAX_NAME_BYTES`] bytes (spaces allowed — "Tether USD" is a fine name), `symbol` is 1 to
-/// [`MAX_SYMBOL_BYTES`] bytes with no whitespace, `decimals` is at most [`MAX_DECIMALS`].
+/// [`MAX_SYMBOL_BYTES`] bytes of **ASCII graphic characters** (`0x21..=0x7e` — printable, no
+/// space, no control byte, no DEL, nothing outside ASCII), `decimals` is at most
+/// [`MAX_DECIMALS`].
+///
+/// The symbol rule is a byte range, not "no whitespace": a note's `asset` word and every
+/// display surface downstream (the explorer, a wallet, an RPC response) treat `symbol` as a
+/// short trusted label, so nothing that could be a control sequence, a zero-width character or
+/// a multi-byte encoding surprise belongs in it.
 pub fn check_metadata(name: &str, symbol: &str, decimals: u8) -> Result<(), TokenError> {
     if name.is_empty() || name.len() > MAX_NAME_BYTES {
         return Err(TokenError::BadName);
     }
-    if symbol.is_empty() || symbol.len() > MAX_SYMBOL_BYTES || symbol.chars().any(char::is_whitespace) {
+    const ASCII_GRAPHIC: std::ops::RangeInclusive<u8> = 0x21..=0x7e;
+    if symbol.is_empty()
+        || symbol.len() > MAX_SYMBOL_BYTES
+        || symbol.bytes().any(|b| !ASCII_GRAPHIC.contains(&b))
+    {
         return Err(TokenError::BadSymbol);
     }
     if decimals > MAX_DECIMALS {
@@ -350,6 +361,52 @@ mod tests {
         assert_eq!(check_metadata("n", &"S".repeat(13), 0), Err(TokenError::BadSymbol));
         assert_eq!(check_metadata("n", "S", 10), Err(TokenError::TooManyDecimals(10)));
         assert!(check_metadata("Tether USD", "zUSDT", 8).is_ok());
+    }
+
+    /// The symbol rule is byte-range, not just "no whitespace": every byte must be ASCII
+    /// graphic (`0x21..=0x7e`). Non-ASCII (`"λ"`) and non-whitespace control bytes (`"\x01"`,
+    /// the DEL byte `0x7f`) are refused just as a literal space is; exactly [`MAX_SYMBOL_BYTES`]
+    /// bytes of graphic ASCII is still the boundary that passes.
+    #[test]
+    fn symbol_bytes_must_be_ascii_graphic() {
+        assert_eq!(check_metadata("n", "λ", 0), Err(TokenError::BadSymbol), "non-ASCII");
+        assert_eq!(check_metadata("n", "\x01", 0), Err(TokenError::BadSymbol), "a control byte");
+        assert_eq!(check_metadata("n", "A\x7f", 0), Err(TokenError::BadSymbol), "the DEL byte");
+        assert!(check_metadata("n", &"A".repeat(MAX_SYMBOL_BYTES), 0).is_ok(), "exactly at the length cap");
+    }
+
+    #[test]
+    fn registering_past_the_last_index_is_refused() {
+        let mut r = reg();
+        // `next_index` is private to this module; the tests submodule can still reach it
+        // directly to drive the registry to its last possible index without registering
+        // four billion tokens.
+        r.next_index = u32::MAX;
+        assert_eq!(
+            r.register(id(1), "A".into(), "A".into(), 0, MintAuthority::None, 0),
+            Err(TokenError::RegistryFull)
+        );
+        assert!(r.get_by_id(&id(1)).is_none(), "a refused registration leaves nothing behind");
+    }
+
+    #[test]
+    fn bump_nonce_and_set_key_are_no_ops_on_an_unknown_index() {
+        let mut r = reg();
+        let pk = crate::crypto::Keypair::from_seed([1; 32]).unwrap().public_key().clone();
+        r.bump_nonce(7);
+        r.set_key(7, Some(pk));
+        r.set_key(7, None);
+        assert!(r.get(7).is_none(), "nothing was created for an index that was never registered");
+    }
+
+    #[test]
+    fn is_empty_reflects_len() {
+        let mut r = reg();
+        assert!(r.is_empty());
+        assert_eq!(r.len(), 0);
+        r.register(id(1), "A".into(), "A".into(), 0, MintAuthority::None, 0).unwrap();
+        assert!(!r.is_empty());
+        assert_eq!(r.len(), 1);
     }
 
     #[test]
