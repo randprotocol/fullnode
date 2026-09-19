@@ -664,6 +664,12 @@ pub(super) fn validate(
     action: &Action,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<(), TxError> {
+    // Fail closed before anything else, so that this half and [`apply`] answer a mis-routed
+    // action alike whether or not the chain has a registry. A discriminant compare, and not a
+    // *token* check: the gate below is still the first thing any RPL action meets.
+    if !matches!(action, Action::RegisterToken { .. } | Action::TokenMint { .. } | Action::SetAuthority { .. }) {
+        return Err(NOT_TOKENS);
+    }
     // The gate is absolute (spec §4, and the `aggregation` section's rule before it): on a chain
     // whose genesis has no `tokens` section, every RPL action is inadmissible — before its
     // metadata, its authority, its nonce or its signature is looked at, so nothing about a
@@ -795,6 +801,7 @@ pub(super) fn validate(
 /// The errors are kept rather than unwrapped: `apply_tx`'s caller discards the ledger on any
 /// error, so reporting one is strictly safer than a panic on a state that was not what validate
 /// saw.
+///
 /// `_tx` is unused: everything these three actions take from the transaction — its `chain_id` in
 /// a signed message, its fee, its fee bundle's own notes — was consumed by [`validate`], and the
 /// parameter is kept only so this half reads as [`super::bridge_notes::apply`]'s and
@@ -1965,14 +1972,23 @@ mod action_tests {
     }
 
     /// Fail closed: an action this module does not own is refused rather than waved through, by
-    /// both halves. Only a routing mistake in `validate_inner` can produce one.
+    /// both halves — and by both alike on a chain with no registry at all, where the gate would
+    /// otherwise answer for an action the gate has nothing to do with. Only a routing mistake in
+    /// `validate_inner` can produce one.
     #[test]
     fn a_non_token_action_routed_here_is_refused() {
         let mut l = ledger();
         let tx = Transaction { chain_id: CHAIN, bundle: None, action: Action::None };
-        for a in [Action::None, Action::Unbond { validator: proposer().address(), amount: 1, nonce: 0, signature: Signature::empty() }] {
-            assert_eq!(validate(&l, &tx, &a, &StubExecutor), Err(TxError::UnsupportedAction("tokens")), "{a:?}");
-            assert_eq!(apply(&mut l, &tx, &a, &StubExecutor), Err(TxError::UnsupportedAction("tokens")), "{a:?}");
+        let strays =
+            [Action::None, Action::Unbond { validator: proposer().address(), amount: 1, nonce: 0, signature: Signature::empty() }];
+        for gated in [true, false] {
+            if !gated {
+                l.set_tokens(None);
+            }
+            for a in &strays {
+                assert_eq!(validate(&l, &tx, a, &StubExecutor), Err(TxError::UnsupportedAction("tokens")), "{a:?}");
+                assert_eq!(apply(&mut l, &tx, a, &StubExecutor), Err(TxError::UnsupportedAction("tokens")), "{a:?}");
+            }
         }
     }
 
