@@ -3332,6 +3332,147 @@ mod tests {
         assert!(!text.contains("body") && !text.contains("kem_ct"), "{text}");
     }
 
+    /// `bundle_json` is the hidden-asset bundle's public face, exactly: the anchor, four
+    /// nullifiers, four commitments, the RAND fee, the three burn fields, the time and the
+    /// lengths of the proof and the four envelopes — and no field naming the asset a transfer
+    /// moved, because the bundle has none (spec §4). A holder burn publishes what it burns
+    /// (`burn_a` 400 of `burn_asset` 3, `burn_r` 0); a bond publishes the RAND it burns in
+    /// `burn_r`; a plain transfer shows three zeros.
+    #[test]
+    fn bundle_json_renders_the_four_slots_and_the_three_burn_fields_and_never_an_asset() {
+        let gs = fixtures::genesis_with(1, vec![]);
+        let with = |action: Action, burn_asset: u32, burn_a: u64, burn_r: u64| {
+            let mut b = fixtures::bundle(&gs.ledger, [nf(1), nf(2)], [cm(1), cm(2)], bundle_fee());
+            (b.burn_asset, b.burn_a, b.burn_r) = (burn_asset, burn_a, burn_r);
+            b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
+            let tx = StubExecutor::bound(Transaction::shielded(1, b, action));
+            (tx_json(&tx, None, &StubExecutor)["bundle"].clone(), tx)
+        };
+
+        let (transfer, tx) = with(Action::None, 0, 0, 0);
+        let keys: std::collections::BTreeSet<&str> = transfer.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "anchor", "nullifiers", "commitments", "fee", "burn_a", "burn_r", "burn_asset", "time", "proof_len",
+                "envelope_len"
+            ]
+            .into_iter()
+            .collect(),
+            "exactly the public fields, and no `asset`"
+        );
+        let b = tx.bundle.as_ref().unwrap();
+        assert_eq!(transfer["nullifiers"], json!(b.nullifiers.iter().map(word8_to_hex).collect::<Vec<_>>()));
+        assert_eq!(transfer["commitments"], json!(b.commitments.iter().map(word8_to_hex).collect::<Vec<_>>()));
+        assert_eq!(transfer["nullifiers"].as_array().unwrap().len(), 4);
+        assert_eq!(transfer["commitments"].as_array().unwrap().len(), 4);
+        assert_eq!(transfer["envelope_len"], json!(b.envelopes.iter().map(|e| e.len()).collect::<Vec<_>>()));
+        assert_eq!(transfer["envelope_len"].as_array().unwrap().len(), 4);
+        assert_eq!((&transfer["fee"], &transfer["time"]), (&json!(bundle_fee()), &json!(b.time)));
+        assert_eq!(
+            (&transfer["burn_a"], &transfer["burn_r"], &transfer["burn_asset"]),
+            (&json!(0), &json!(0), &json!(0)),
+            "a transfer — of RAND or of any token — burns nothing"
+        );
+
+        let (burn, _) = with(Action::TokenBurn { asset: 3, amount: 400 }, 3, 400, 0);
+        assert_eq!(
+            (&burn["burn_a"], &burn["burn_r"], &burn["burn_asset"]),
+            (&json!(400), &json!(0), &json!(3)),
+            "a holder burn's public amount and asset"
+        );
+        let (bridge_burn, _) = with(
+            Action::BridgeBurn { asset: 2, amount: 900, relayer_fee: 100, to_chain: 5, token: [0xcd; 32], to: [0xab; 32] },
+            2,
+            900,
+            0,
+        );
+        assert_eq!((&bridge_burn["burn_a"], &bridge_burn["burn_asset"]), (&json!(900), &json!(2)));
+        let (bond, _) = with(Action::Bond { validator: randprotocol_core::Address([3; 32]), amount: 500, registration: None }, 0, 0, 500);
+        assert_eq!((&bond["burn_a"], &bond["burn_r"], &bond["burn_asset"]), (&json!(0), &json!(500), &json!(0)));
+        // The whole rendered transaction of a transfer names no asset anywhere.
+        let text = serde_json::to_string(&tx_json(&tx, None, &StubExecutor)).unwrap();
+        assert!(!text.contains("\"asset\""), "{text}");
+    }
+
+    /// A token transfer and a RAND payment are the same thing to everyone without a key (spec
+    /// §4): both `Action::None`, both four slots, both zero burns — the two rendered bundles have
+    /// the same keys and the same values everywhere except the words themselves. What tells them
+    /// apart is the note plaintext, which only `rand_checkTransaction` with the sender's key
+    /// reveals, slot by slot — `bundle:0` … `bundle:3`, the dummy slots included — each against
+    /// its own leaf. The note's `asset` appears there and nowhere a keyless reader can look:
+    /// `rand_getTransaction`, `rand_getBlockByHeight` and `rand_getCompactBlocks`.
+    #[tokio::test]
+    async fn a_token_transfer_reveals_its_asset_only_to_its_keys_in_any_of_the_four_slots() {
+        use crate::viewing::testkit::{key_vk, sealed_to};
+        use randprotocol_zkvm::notes::Note;
+        use randprotocol_zkvm::viewing::TxKey;
+
+        let gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        let (_dir, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let (alice, bob) = (key_vk(1), key_vk(2));
+        // Bob pays Alice 250 of token 5 (slot 0), keeps 750 of it as change (slot 1), keeps 9 000
+        // RAND of change after the fee (slot 2), and slot 3 is a zero-value RAND dummy to himself.
+        let notes = [
+            Note::new(alice.pk(), bob.pk(), 250, 5, 0),
+            Note::new(bob.pk(), bob.pk(), 750, 5, 0),
+            Note::new(bob.pk(), bob.pk(), 9_000, 0, 0),
+            Note::new(bob.pk(), bob.pk(), 0, 0, 0),
+        ];
+        let keys: [TxKey; 4] = std::array::from_fn(|k| TxKey([40 + k as u8; 32]));
+        let owners = [&alice, &bob, &bob, &bob];
+        let mut b = fixtures::bundle(&ledger, [[31; 8], [32; 8]], [[0; 8], [0; 8]], bundle_fee());
+        for k in 0..4 {
+            b.commitments[k] = notes[k].commitment();
+            b.envelopes[k] = sealed_to(&bob, owners[k], &notes[k], &keys[k]);
+        }
+        b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
+        let token_tx = StubExecutor::bound(Transaction::shielded(gs.chain_id, b, Action::None));
+        let before = ledger.next_index();
+        let b1 = make_block(&gs.block, &mut ledger, vec![token_tx.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+
+        // Each slot's key discloses that slot and only it, at its own leaf, asset included.
+        for k in 0..4 {
+            let v = ok(&st, "rand_checkTransaction", json!([token_tx.hash().to_hex(), hex::encode(keys[k].0)])).await;
+            let d = v["disclosed"].as_array().unwrap();
+            assert_eq!(d.len(), 1, "slot {k}");
+            assert_eq!(d[0]["output"], format!("bundle:{k}"));
+            assert_eq!(d[0]["index"], json!(before + k as u64));
+            assert_eq!(d[0]["cm"], word8_to_hex(&notes[k].commitment()));
+            assert_eq!(d[0]["note"]["asset"], json!(notes[k].asset), "slot {k}");
+            assert_eq!(d[0]["note"]["amount"], json!(notes[k].amount.to_string()));
+        }
+
+        // Without a key: the transaction, the block and the compact block carry no asset field
+        // at all, and the transfer's bundle renders exactly as a RAND payment's does.
+        let as_tx = ok(&st, "rand_getTransaction", json!([token_tx.hash().to_hex()])).await;
+        let as_block = ok(&st, "rand_getBlockByHeight", json!([1])).await;
+        let as_compact = ok(&st, "rand_getCompactBlocks", json!([1, 1])).await;
+        for (what, v) in [("tx", &as_tx), ("block", &as_block), ("compact", &as_compact)] {
+            let text = serde_json::to_string(v).unwrap();
+            assert!(!text.contains("\"asset\""), "{what}: {text}");
+        }
+        let compact_tx = &as_compact[0]["transactions"][0];
+        assert_eq!(compact_tx["commitments"].as_array().unwrap().len(), 4);
+        assert_eq!(compact_tx["nullifiers"].as_array().unwrap().len(), 4);
+        let rand_payment = fixtures::bundle_tx(&ledger, [[33; 8], [34; 8]], [[35; 8], [36; 8]], bundle_fee());
+        let shape = |v: &Value| {
+            let mut o = v.as_object().unwrap().clone();
+            for word in ["anchor", "nullifiers", "commitments", "time", "envelope_len"] {
+                o.remove(word);
+            }
+            o
+        };
+        assert_eq!(
+            shape(&as_tx["tx"]["bundle"]),
+            shape(&tx_json(&rand_payment, None, &StubExecutor)["bundle"]),
+            "the fee, the three zero burns and the proof length: a RAND payment's"
+        );
+        assert_eq!(as_tx["tx"]["action"], json!({ "kind": "none" }));
+    }
+
     /// A bridged chain with one committed attestation (1000 units of the test token — asset 1,
     /// the genesis listing's index — to the fixture recipient) and one committed burn of 400
     /// with a relayer fee of 100.
@@ -3474,8 +3615,18 @@ mod tests {
     /// `TxError::TransactionTooLarge`. It is the right fixture for the *body* limit, which has to be
     /// wide enough that the limit is never what refuses a transaction — the block rule is.
     fn largest_transaction_the_part_caps_allow() -> Transaction {
+        largest_transaction_under(
+            randprotocol_core::gas::MAX_PROOF_BYTES,
+            randprotocol_core::types::actions::MAX_CALL_ENVELOPE_BYTES,
+        )
+    }
+
+    /// [`largest_transaction_the_part_caps_allow`] on a chain whose genesis sets the proof and
+    /// call-envelope caps: a `Call` carrying two proofs at `max_proof_bytes`, the bundle's four
+    /// envelopes at `MAX_ENVELOPE_BYTES` and an input envelope at `max_call_envelope_bytes`.
+    fn largest_transaction_under(max_proof_bytes: usize, max_call_envelope_bytes: usize) -> Transaction {
         use randprotocol_core::notes::{Bundle, MAX_ENVELOPE_BYTES};
-        use randprotocol_core::types::actions::{CallEnvelope, MAX_CALL_ENVELOPE_BYTES};
+        use randprotocol_core::types::actions::CallEnvelope;
 
         let big_envelope = || Envelope {
             kem_ct: vec![1u8; MAX_ENVELOPE_BYTES / 4],
@@ -3493,16 +3644,16 @@ mod tests {
             burn_asset: 0,
             time: 1,
             envelopes: [big_envelope(), big_envelope(), big_envelope(), big_envelope()],
-            proof: vec![9u8; randprotocol_core::gas::MAX_PROOF_BYTES],
+            proof: vec![9u8; max_proof_bytes],
         };
         let call = Action::Call {
             program: Hash::digest(b"program"),
-            proof: vec![8u8; randprotocol_core::gas::MAX_PROOF_BYTES],
+            proof: vec![8u8; max_proof_bytes],
             input_envelope: Some(CallEnvelope {
-                kem_ct: vec![1u8; MAX_CALL_ENVELOPE_BYTES / 4],
-                to_sender: vec![2u8; MAX_CALL_ENVELOPE_BYTES / 4],
-                to_auditor: vec![3u8; MAX_CALL_ENVELOPE_BYTES / 4],
-                body: vec![4u8; MAX_CALL_ENVELOPE_BYTES / 4],
+                kem_ct: vec![1u8; max_call_envelope_bytes / 4],
+                to_sender: vec![2u8; max_call_envelope_bytes / 4],
+                to_auditor: vec![3u8; max_call_envelope_bytes / 4],
+                body: vec![4u8; max_call_envelope_bytes / 4],
             }),
         };
         randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, bundle, call))
@@ -3575,6 +3726,37 @@ mod tests {
         // And the retired limit would have refused it, which is the bug.
         let old_limit = 2 * randprotocol_core::gas::MAX_PROOF_BYTES + 256 * 1024;
         assert!(posted > old_limit, "the old limit should have refused this: {posted} B against {old_limit} B");
+    }
+
+    /// The four-slot bundle's byte headroom on a chain-13-sized genesis (8 MiB proofs, 64 KiB
+    /// call envelopes, 20 MiB blocks), where — unlike a default chain — the widest transaction
+    /// the part caps allow is *admissible*: two 8 MiB proofs, four 2 048-byte envelopes and a
+    /// 64 KiB input envelope come to ~16.07 MiB, under the block. It must then fit every byte
+    /// cap on its way into a block: the RPC body (hex doubles it; the formula's
+    /// `BUNDLE_SLOTS * MAX_ENVELOPE_BYTES` term is the four envelopes, 8 KiB where the two-slot
+    /// bundle's was 4 KiB), gossip's transmit size (`max_block_bytes + 1 MiB`, so any transaction
+    /// the block cap admits fits with 1 MiB of framing to spare) and the sync budget and reader
+    /// limit for a block carrying it.
+    #[test]
+    fn the_widest_four_envelope_transaction_fits_every_byte_cap_on_a_20_mib_chain() {
+        use randprotocol_core::notes::{BUNDLE_SLOTS, MAX_ENVELOPE_BYTES};
+        let gs = raised_genesis();
+        let limits = ChainLimits::of(&gs.ledger);
+        let tx = largest_transaction_under(gs.ledger.max_proof_bytes(), gs.ledger.max_call_envelope_bytes());
+        let bundle = tx.bundle.as_ref().unwrap();
+        assert_eq!(bundle.envelopes.len(), BUNDLE_SLOTS);
+        assert!(bundle.envelopes.iter().all(|e| e.len() == MAX_ENVELOPE_BYTES), "every slot's envelope at the cap");
+        let encoded = tx.encode();
+        assert!(encoded.len() <= gs.ledger.max_block_bytes(), "admissible here: {} B", encoded.len());
+
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "rand_sendTransaction", "params": [hex::encode(&encoded)] });
+        let posted = serde_json::to_vec(&body).unwrap().len();
+        assert!(posted <= limits.rpc_max_body_bytes(), "{posted} B posted against {} B", limits.rpc_max_body_bytes());
+
+        let wire = crate::network::WireLimits::for_ledger(&gs.ledger);
+        assert!(encoded.len() + (1 << 20) <= wire.gossip_max_transmit_size, "gossip carries it with 1 MiB to spare");
+        assert!(encoded.len() as u64 <= wire.sync_max_wire_bytes, "a block of it is inside one sync batch's budget");
+        assert!(2 * wire.sync_max_wire_bytes <= wire.sync_response_wire_limit);
     }
 
     /// A transaction larger than a block is refused at the RPC, before it reaches the node loop, and

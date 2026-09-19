@@ -94,13 +94,26 @@ impl RefusedCache {
 /// until someone decides it may be. Kept out deliberately, for the record, are the chain's own
 /// configuration and this build's reach: `FaucetDisabled` and `ConfidentialDisabled` (genesis flags
 /// the node can also toggle at runtime), `FeeTooLow` (a floor a fee market would make dynamic),
-/// `UnsupportedAsset`, `UnsupportedBurn` and `UnsupportedAction` (the phase this release has
-/// shipped, so a rolling upgrade makes them valid mid-process — an operator restarts the binary, but
-/// the transaction was never about *bytes*), and `Overflow` (arithmetic over amounts this node
-/// holds). `MintTooLarge` is the closest call: `FAUCET_MAX_UNITS` is a compile-time constant, so it
-/// would qualify on the same argument as `WrongChain` — it stays out because a faucet cap is a
-/// policy knob, unlike a chain id or a guest commitment, and a mint is cheap to re-refuse; nothing
-/// is gained by caching it and the conservative side of this line is the safe one.
+/// `UnsupportedAction` (which modules a chain's genesis switched on — a statement about the chain,
+/// not the transaction), and `Overflow` (arithmetic over amounts this node holds). `MintTooLarge`
+/// is the closest call: `FAUCET_MAX_UNITS` is a compile-time constant, so it would qualify on the
+/// same argument as `WrongChain` — it stays out because a faucet cap is a policy knob, unlike a
+/// chain id or a guest commitment, and a mint is cheap to re-refuse; nothing is gained by caching
+/// it and the conservative side of this line is the safe one.
+///
+/// `UnsupportedAsset` and `UnsupportedBurn` used to sit in that list, when they meant "a later
+/// phase than this release". Since the hidden-asset bundle they mean something narrower, and they
+/// are in the allowlist below: each is `Ledger::check_burn_shape` (or `check_asset_burn`) comparing
+/// the bundle's own `burn_asset`/`burn_a`/`burn_r` against the *kind* of its own action — a token
+/// burn field on an action that burns no token, RAND burned on an action that may not burn it, RAND
+/// burned alongside a token burn. Both operands are the transaction's bytes and the rule reads
+/// nothing else, so no registry, register, height or pool state can ever make the same bytes valid;
+/// a node that is behind refuses them exactly as a node at the tip does. The same holds for
+/// `Token(UnknownToken(0))`, the one `UnknownToken` that is a byte verdict: index 0 is RAND's, and
+/// the registry can never hand it to a token (`TokenRegistry::new` starts at `FIRST_TOKEN_INDEX`
+/// and `register` refuses rather than wraps at `u32::MAX`), so a burn, mint or rotation naming
+/// token 0 is refused on every state forever. Every *other* index is state — a registration can
+/// create it one block later — and stays out.
 pub fn is_permanent(e: &TxError) -> bool {
     // The aggregation register's verdicts, split like `Staking`'s: the byte-verdicts (and the
     // ones against genesis-pinned constants) are cacheable, the register's state is not. A
@@ -131,8 +144,9 @@ pub fn is_permanent(e: &TxError) -> bool {
     // The RPL registry's verdicts, split the same way: only the ones a transaction's *own bytes*
     // decide are cacheable — the metadata rules (`BadName`, `BadSymbol`, `TooManyDecimals`), the
     // authority kind a registration may choose, a fixed-supply registration with no initial mint,
-    // a zero amount, and a transfer's memo size. Everything else is a statement about this node's
-    // registry at this moment: `BadNonce`, `UnknownToken`, `AlreadyRegistered`, `IndexMismatch`,
+    // a zero amount, and a token index of 0 (RAND's, never a token's). Everything else is a
+    // statement about this node's registry at this moment: `BadNonce`, `UnknownToken` of any other
+    // index, `AlreadyRegistered`, `IndexMismatch`,
     // `SupplyOverflow`, `SupplyUnderflow`, `BridgedToken`, `Disabled`, `RegistrationFeeTooLow` and
     // `NotKeyAuthority` all move as blocks arrive, and a node one block behind would poison itself
     // against transactions that are about to be valid. `BridgedToken` is the subtle one: it reads
@@ -146,7 +160,9 @@ pub fn is_permanent(e: &TxError) -> bool {
         use randprotocol_core::ledger::tokens::TokenError as T;
         return matches!(
             t,
-            T::BadName
+            // Index 0 is RAND's and no registry state can ever make it a token (see above).
+            T::UnknownToken(0)
+                | T::BadName
                 | T::BadSymbol
                 | T::TooManyDecimals(_)
                 | T::AuthorityNotAllowed
@@ -192,6 +208,10 @@ pub fn is_permanent(e: &TxError) -> bool {
             | TxError::BurnAssetMismatch { .. }
             | TxError::BurnAmountMismatch { .. }
             | TxError::NonCanonicalRandBurn(_)
+            // A burn field the action's kind may not carry: the bundle's own fields against its
+            // own action's kind, nothing else read (see the doc comment).
+            | TxError::UnsupportedAsset(_)
+            | TxError::UnsupportedBurn(_)
             | TxError::BridgeRecipientMismatch
     )
 }
@@ -545,6 +565,64 @@ mod tests {
             tok(T::BadBackingDecimals(19)),
         ] {
             assert!(!is_permanent(&e), "{e} depends on state and must not be cached");
+        }
+    }
+
+    /// The hidden-asset bundle's burn-shape verdicts are byte verdicts: `UnsupportedAsset`,
+    /// `UnsupportedBurn` and `UnknownToken(0)` are cached — and, what makes caching them sound,
+    /// the very same bytes are refused the very same way on a bare bridged chain and on one that
+    /// has since registered a native token, deposited a bridged one and minted: no state the
+    /// registry can reach turns them valid. `UnknownToken` of any *other* index is not cached,
+    /// because a registration one block later does make it valid.
+    #[test]
+    fn the_burn_shape_verdicts_are_byte_verdicts_and_are_cached() {
+        use crate::storage::fixtures;
+        use randprotocol_core::confidential::{ConfidentialExecutor, StubExecutor};
+        use randprotocol_core::ledger::tokens::TokenError as T;
+        use randprotocol_core::{Action, Transaction};
+
+        for e in [TxError::UnsupportedAsset(2), TxError::UnsupportedBurn(5), TxError::Token(T::UnknownToken(0))] {
+            assert!(is_permanent(&e), "{e} is a statement about the bytes");
+        }
+        assert!(!is_permanent(&TxError::Token(T::UnknownToken(2))), "a registration can create index 2");
+
+        let (gs, secrets) = fixtures::bridged_genesis(1);
+        let bare = gs.ledger.clone();
+        let mut grown = gs.ledger.clone();
+        let deposit = fixtures::attest_tx(&grown, fixtures::attestation(&secrets, &fixtures::recipient(), 1_000, 0), 200);
+        grown.apply_tx(&deposit, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        let register = fixtures::register_token_tx(&grown, 5_000, 210);
+        grown.apply_tx(&register, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        grown.record_anchor(0);
+        assert!(grown.tokens().unwrap().get(2).is_some(), "the grown chain holds token 2");
+
+        // A bundle keyed at 10 with its burn fields set, re-proved, on the given action.
+        let tx = |l: &randprotocol_core::Ledger, action: Action, burn_asset: u32, burn_a: u64, burn_r: u64| {
+            let mut b = fixtures::bundle(l, [[10; 8], [11; 8]], [[12; 8], [13; 8]], randprotocol_core::gas::BUNDLE_BASE);
+            (b.burn_asset, b.burn_a, b.burn_r) = (burn_asset, burn_a, burn_r);
+            b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
+            StubExecutor::bound(Transaction::shielded(l.chain_id(), b, action))
+        };
+        for l in [&bare, &grown] {
+            // A transfer that burns a token, or burns RAND: its action burns nothing.
+            let t = tx(l, Action::None, 2, 5, 0);
+            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::UnsupportedAsset(2)));
+            let t = tx(l, Action::None, 0, 0, 5);
+            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::UnsupportedBurn(5)));
+            // A token burn that also burns RAND — on the grown chain past every registry check
+            // (token 2 exists, has supply), on the bare one refused earlier for the missing token:
+            // either way refused, and on the grown chain for the byte reason.
+            let t = tx(l, Action::TokenBurn { asset: 2, amount: 300 }, 2, 300, 7);
+            let got = l.validate(&t, &StubExecutor).unwrap_err();
+            if l.tokens().unwrap().get(2).is_some() {
+                assert_eq!(got, TxError::UnsupportedBurn(7));
+            } else {
+                assert_eq!(got, TxError::Token(T::UnknownToken(2)), "state first here, and state is not cached");
+                assert!(!is_permanent(&got));
+            }
+            // A burn of token 0 — RAND — on either chain.
+            let t = tx(l, Action::TokenBurn { asset: 0, amount: 300 }, 0, 0, 0);
+            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::Token(T::UnknownToken(0))));
         }
     }
 

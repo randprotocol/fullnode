@@ -2516,6 +2516,116 @@ mod tests {
         (dir, storage, gs, cb)
     }
 
+    /// The sealed form of a hidden-asset (four-slot) bundle, end to end and with no recursion
+    /// fixture: the pruned record round-trips through RocksDB with all four nullifiers,
+    /// commitments and envelopes and the three burn fields intact; the marker form hashes to the
+    /// raw hash, so the served block's certified tx root still holds; the serve path swaps in the
+    /// marker and its side-table entry; the coverage rule accepts it once sealed; and a fresh
+    /// replica replaying the sealed block reaches the raw block's state root with four leaves
+    /// appended. A peer substituting any single slot word or envelope — the dummy slots included —
+    /// breaks the root (pre-v0.1 M1, per slot), and a side table whose `OUT` words are not the
+    /// four-slot digest is refused at the ledger's pruned branch.
+    #[test]
+    fn a_four_slot_bundle_round_trips_through_the_pruned_record_and_the_sealed_form() {
+        use crate::storage::fixtures::with_distinct_envelopes;
+        use crate::storage::TxRecord;
+        use randprotocol_core::confidential::ConfidentialExecutor;
+        use randprotocol_core::notes::PRUNED_PROOF_MARKER;
+        use randprotocol_core::types::pv;
+        use randprotocol_core::BlockError;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![], 100);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let raw = with_distinct_envelopes(bundle_tx(&ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee()), 0x30);
+        let b1 = crate::storage::fixtures::make_block(&gs.block, &mut ledger, vec![raw.clone()], &key(1));
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+
+        // The pruned record exactly as the pruning pass writes it: the marker form, the proof
+        // hash, 34 public values whose `OUT` words are the bundle's digest, a declared shape.
+        let bundle = raw.bundle.as_ref().unwrap();
+        let digest = StubExecutor.bundle_digest(&bundle.digest_input());
+        let mut public_values = vec![0u64; pv::NUM];
+        public_values[pv::TIER] = 14;
+        for k in 0..8 {
+            public_values[pv::OUT0 + k] = digest[k] as u64;
+            public_values[pv::HC0 + k] = HC[k] as u64;
+        }
+        let shape = DeclaredShape {
+            profile: randprotocol_core::types::FriProfile::Test,
+            tier: 14,
+            program_log_height: 13,
+            input_log_height: 12,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 2,
+            mem_log_height: 18,
+        };
+        let proof_hash = Hash::digest(&bundle.proof);
+        let mut marker_tx = raw.clone();
+        marker_tx.bundle.as_mut().unwrap().proof = [PRUNED_PROOF_MARKER, proof_hash.as_bytes().as_slice()].concat();
+        let record = TxRecord::Pruned {
+            height: 1,
+            index: 0,
+            tx_hash: raw.hash(),
+            tx: marker_tx.clone(),
+            proof_hash,
+            public_values: public_values.clone(),
+            shape,
+        };
+        storage.put_pruned(&record).unwrap();
+
+        // The round trip: every slot and every burn field survives, and the marker form is the
+        // raw transaction by id.
+        let back = storage.tx_record(&raw.hash()).unwrap().unwrap();
+        assert_eq!(back, record);
+        let (was, now) = (raw.bundle.as_ref().unwrap(), back.transaction().bundle.as_ref().unwrap());
+        assert_eq!((now.nullifiers, now.commitments), (was.nullifiers, was.commitments));
+        assert_eq!(now.envelopes, was.envelopes, "all four envelopes, each in its slot");
+        assert_eq!((now.fee, now.burn_a, now.burn_r, now.burn_asset, now.time), (was.fee, was.burn_a, was.burn_r, was.burn_asset, was.time));
+        assert_eq!(back.transaction().hash(), raw.hash(), "the proof enters the id by digest");
+        assert_eq!(storage.tx_hash_by_proof_hash(&proof_hash).unwrap(), Some(raw.hash()));
+
+        // Serve: the marker form and one side entry, under the block's own certified root.
+        let served = sealed_form_of(&storage, &b1);
+        assert_eq!(served.block.transactions, vec![marker_tx.clone()]);
+        assert_eq!(served.pruned.len(), 1);
+        assert_eq!((served.pruned[0].tx_hash, served.pruned[0].proof_hash), (raw.hash(), proof_hash));
+        assert_eq!(served.pruned[0].public_values, public_values);
+        assert!(served.block.verify_tx_root(), "the marker form hashes to the raw hash");
+
+        // Accept: covered by a local mark, then replayed by a fresh replica to the raw root.
+        assert!(check_sealed_coverage(&storage, &BTreeSet::new(), &served).is_err(), "unsealed: the fallback");
+        storage.mark_sealed(raw.hash(), Hash::digest(b"the covering aggregate"), 2).unwrap();
+        check_sealed_coverage(&storage, &BTreeSet::new(), &served).unwrap();
+        let mut replica = gs.ledger.clone();
+        replica.apply_block_for_sync(&served.block, &BTreeMap::new(), &served.pruned, &StubExecutor).unwrap();
+        assert_eq!(replica.state_root(), ledger.state_root());
+        assert_eq!(replica.next_index(), gs.ledger.next_index() + 4, "four leaves, dummies included");
+
+        // A substituted slot word or envelope — any of the four — breaks the certified root.
+        let substitute = |f: &dyn Fn(&mut randprotocol_core::Bundle)| {
+            let mut bad = served.clone();
+            f(bad.block.transactions[0].bundle.as_mut().unwrap());
+            gs.ledger.clone().apply_block_for_sync(&bad.block, &BTreeMap::new(), &bad.pruned, &StubExecutor)
+        };
+        for slot in 0..4 {
+            assert_eq!(substitute(&|b| b.nullifiers[slot][0] ^= 1), Err(BlockError::TxRootMismatch), "nf {slot}");
+            assert_eq!(substitute(&|b| b.commitments[slot][0] ^= 1), Err(BlockError::TxRootMismatch), "cm {slot}");
+            assert_eq!(substitute(&|b| b.envelopes[slot].body[0] ^= 1), Err(BlockError::TxRootMismatch), "env {slot}");
+        }
+        assert_eq!(substitute(&|b| b.burn_r = 1), Err(BlockError::TxRootMismatch), "a burn field");
+        // And a side table vouching for another digest is refused at the pruned branch.
+        let mut lying = served.clone();
+        lying.pruned[0].public_values[pv::OUT0] ^= 1;
+        assert!(matches!(
+            gs.ledger.clone().apply_block_for_sync(&lying.block, &BTreeMap::new(), &lying.pruned, &StubExecutor),
+            Err(BlockError::InvalidTx { index: 0, error: randprotocol_core::TxError::BadDigest })
+        ));
+    }
+
     /// The coverage rule (spec §7): a pruned bundle is accepted when its raw hash is sealed
     /// locally or carried by an aggregate in the batch — and falls back to the raw form,
     /// never a ban, when neither holds.

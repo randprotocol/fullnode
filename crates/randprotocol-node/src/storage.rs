@@ -1119,17 +1119,25 @@ impl Storage {
                 public_values: public_values.to_vec(),
                 shape,
             };
-            let mut batch = rocksdb::WriteBatch::default();
-            batch.put_cf(self.cf(CF_TXS), bundle_hash.as_bytes(), bincode::serialize(&record)?);
-            batch.put_cf(
-                self.cf(CF_SEALS),
-                [b"p".as_slice(), proof_hash.as_bytes()].concat(),
-                bincode::serialize(&bundle_hash)?,
-            );
-            self.db.write_opt(batch, &sync_opts())?;
+            self.put_pruned(&record)?;
             pruned += 1;
         }
         Ok(pruned)
+    }
+
+    /// Write one `Pruned` record over its raw one, with the proof-hash index entry beside it, in
+    /// one synced batch — the pruning pass's write, and the only way a `Pruned` record reaches
+    /// the store. `pub(crate)` so a test can store the pruned form of a stub-proved bundle, whose
+    /// proof the pass (which decodes a real one) cannot read.
+    pub(crate) fn put_pruned(&self, record: &TxRecord) -> Result<()> {
+        let TxRecord::Pruned { tx_hash, proof_hash, .. } = record else {
+            return Err(StorageError::Corrupt("put_pruned takes a pruned record".into()));
+        };
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(self.cf(CF_TXS), tx_hash.as_bytes(), bincode::serialize(record)?);
+        batch.put_cf(self.cf(CF_SEALS), [b"p".as_slice(), proof_hash.as_bytes()].concat(), bincode::serialize(tx_hash)?);
+        self.db.write_opt(batch, &sync_opts())?;
+        Ok(())
     }
 
     pub fn program(&self, id: &ProgramId) -> Result<Option<ProgramRecord>> {
@@ -2265,6 +2273,84 @@ pub(crate) mod fixtures {
         ))
     }
 
+    /// The key a native test token is registered under as its `Key` mint authority.
+    pub(crate) fn issuer() -> Keypair {
+        key(21)
+    }
+
+    /// A `RegisterToken` of a native "Test Coin" under [`issuer`]'s key, with an initial mint of
+    /// `initial` to [`recipient`] (none when 0), at the registry's own next index, paying the
+    /// base plus [`bridged_genesis`]'s registration fee. Its bundle is keyed at `seed..seed + 3`.
+    pub(crate) fn register_token_tx(ledger: &Ledger, initial: u64, seed: u32) -> Transaction {
+        use randprotocol_core::ledger::tokens::MintAuthority;
+        use randprotocol_core::types::actions::InitialMint;
+        let registry = ledger.tokens().expect("a chain with the tokens gate");
+        let initial = (initial > 0).then(|| InitialMint {
+            amount: initial,
+            recipient: recipient(),
+            r: [seed + 7; 8],
+            time: ledger.height() as u32,
+            envelope: env(seed as u8 ^ 0x40),
+        });
+        StubExecutor::bound(Transaction::shielded(
+            ledger.chain_id(),
+            bundle(
+                ledger,
+                [[seed; 8], [seed + 1; 8]],
+                [[seed + 2; 8], [seed + 3; 8]],
+                gas::BUNDLE_BASE + registry.registration_fee,
+            ),
+            Action::RegisterToken {
+                name: "Test Coin".into(),
+                symbol: "TST".into(),
+                decimals: 6,
+                authority: MintAuthority::Key(issuer().public_key().clone()),
+                initial,
+                salt: [seed as u8; 32],
+                index: registry.next_index(),
+            },
+        ))
+    }
+
+    /// A `TokenMint` of `amount` of `asset` to [`recipient`] at the token's `nonce`, signed by
+    /// [`issuer`]; its fee bundle keyed at `seed..seed + 3`, the minted note's blinding `r`.
+    pub(crate) fn token_mint_tx(ledger: &Ledger, asset: u32, amount: u64, nonce: u64, seed: u32) -> Transaction {
+        use randprotocol_core::types::actions::token_mint_message;
+        let time = ledger.height() as u32;
+        let r = [seed + 9; 8];
+        let envelope = env(seed as u8 ^ 0x40);
+        let cm = randprotocol_core::ledger::tokens::mint_commitment(&recipient(), amount, asset, time, &r, &StubExecutor);
+        let id = ledger.tokens().and_then(|t| t.get(asset)).map(|i| i.id).expect("a registered token");
+        let signature = issuer().sign(token_mint_message(ledger.chain_id(), &id, nonce, amount, &cm, &envelope).as_bytes());
+        StubExecutor::bound(Transaction::shielded(
+            ledger.chain_id(),
+            bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE),
+            Action::TokenMint { asset, amount, recipient: recipient(), r, time, envelope, nonce, signature },
+        ))
+    }
+
+    /// A holder's `TokenBurn` of `amount` of `asset` on one hidden-asset bundle (`burn_asset ==
+    /// asset`, `burn_a == amount`, `burn_r == 0`), paying one bundle base. Keyed like [`burn_tx`].
+    pub(crate) fn token_burn_tx(ledger: &Ledger, asset: u32, amount: u64, seed: u32) -> Transaction {
+        let mut b = bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BUNDLE_BASE);
+        b.burn_asset = asset;
+        b.burn_a = amount;
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+        StubExecutor::bound(Transaction::shielded(ledger.chain_id(), b, Action::TokenBurn { asset, amount }))
+    }
+
+    /// Give `tx`'s bundle four *different* envelopes — `env(tag)`, `env(tag + 1)`, … — and
+    /// re-bind it. [`bundle`]'s envelopes repeat across the two halves of the slots, which is fine
+    /// for a count and useless for a test of which envelope rides beside which commitment.
+    pub(crate) fn with_distinct_envelopes(mut tx: Transaction, tag: u8) -> Transaction {
+        let b = tx.bundle.as_mut().expect("a bundle-carrying transaction");
+        for (k, e) in b.envelopes.iter_mut().enumerate() {
+            *e = env(tag.wrapping_add(k as u8));
+        }
+        StubExecutor::bound(tx)
+    }
+
     /// A token transfer as the chain sees it on the hidden-asset bundle: a plain `Action::None`
     /// bundle spending `nfs` and creating `cms` (its first two slots; the other two derived), the
     /// token nowhere on the wire.
@@ -2664,6 +2750,80 @@ mod tests {
         // The transfer moved nothing public; the burn took its 400 out of the deposit's 1 000.
         assert_eq!(ledger.tokens().unwrap().get(1).unwrap().total_supply, 600);
         assert_eq!(s.notes_count().unwrap(), ledger.next_index());
+    }
+
+    /// The note index against the ledger for every bundle-carrying kind the hidden-asset bundle
+    /// touches, on disk: a plain transfer (`None`), a `BridgeAttest`, a native `RegisterToken`
+    /// with its initial mint, a `TokenMint`, a `TokenBurn` and a `BridgeBurn`. For each,
+    /// `created_notes` is exactly `tx.commitments()` — the four slots, in slot order, each beside
+    /// *its own* envelope — followed by the chain-computed note of a mint or a deposit (one per
+    /// mint/deposit, none otherwise), and the RocksDB rows carry exactly those commitments and
+    /// envelopes at exactly the leaf indices the ledger appended them at. A single transposed or
+    /// missing slot here would slide every later wallet leaf index, and a swapped envelope would
+    /// make a note unfindable by its owner.
+    #[test]
+    fn every_kind_indexes_its_four_slots_then_its_derived_note_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, secrets) = bridged_genesis(12);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let mut parent = gs.block.clone();
+
+        // One block per transaction, built against the ledger the previous ones left: the
+        // registration takes index 2 (the bridged fixture token holds 1), the mint and the token
+        // burn name it, and the bridge burn spends the attested deposit of index 1.
+        type Build = Box<dyn Fn(&Ledger) -> Transaction>;
+        let steps: Vec<(&str, Build, usize)> = vec![
+            ("none", Box::new(|l: &Ledger| transfer_tx(l, 100)), 0),
+            (
+                "bridge_attest",
+                Box::new(move |l: &Ledger| attest_tx(l, attestation(&secrets, &recipient(), 1_000, 0), 110)),
+                1,
+            ),
+            ("register_token", Box::new(|l: &Ledger| register_token_tx(l, 5_000, 120)), 1),
+            ("token_mint", Box::new(|l: &Ledger| token_mint_tx(l, 2, 700, 0, 130)), 1),
+            ("token_burn", Box::new(|l: &Ledger| token_burn_tx(l, 2, 300, 140)), 0),
+            ("bridge_burn", Box::new(|l: &Ledger| burn_tx(l, 1, 400, 100, 150)), 0),
+        ];
+        for (i, (kind, build, derived)) in steps.into_iter().enumerate() {
+            let height = i as u64 + 1;
+            let t = with_distinct_envelopes(build(&ledger), 0x10 * (i as u8 + 1));
+            let before = ledger.next_index();
+            let b = make_block(&parent, &mut ledger, vec![t.clone()], &key(1));
+            s.commit(std::slice::from_ref(&b), &ledger, &[], &StubExecutor).unwrap();
+
+            let bundle = t.bundle.as_ref().unwrap();
+            assert_eq!(t.commitments(), bundle.commitments.to_vec(), "{kind}: the wire carries the four slots");
+            assert_eq!(derived_note_count(&t), derived, "{kind}");
+            assert_eq!(ledger.next_index(), before + 4 + derived as u64, "{kind}: four slots, then {derived} derived");
+
+            let notes = created_notes(&t, ledger.tokens(), &StubExecutor).unwrap();
+            assert_eq!(notes.len(), 4 + derived, "{kind}");
+            let expected_slots: Vec<(Word8, Envelope)> =
+                bundle.commitments.iter().copied().zip(bundle.envelopes.iter().cloned()).collect();
+            assert_eq!(notes[..4], expected_slots[..], "{kind}: slot order, each beside its own envelope");
+
+            let rows = s.notes_in_heights(height, height, 100).unwrap();
+            assert_eq!(
+                rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                (before..before + 4 + derived as u64).collect::<Vec<_>>(),
+                "{kind}: the indices the ledger appended at"
+            );
+            for ((_, row), (cm, e)) in rows.iter().zip(&notes) {
+                assert_eq!((&row.cm, &row.envelope, row.height), (cm, e, height), "{kind}");
+            }
+            parent = b.block;
+        }
+        let registry = ledger.tokens().unwrap();
+        // The deposit's 1 000 less the bridge burn's 400; the native token's 5 000 + 700 − 300.
+        assert_eq!(registry.get(1).unwrap().total_supply, 600);
+        assert_eq!(registry.get(2).unwrap().total_supply, 5_400);
+        assert_eq!(s.notes_count().unwrap(), ledger.next_index());
+        // And the notes family, read back leaf by leaf, rebuilds the ledger's own root — the
+        // tree every wallet witness is proved against.
+        let leaves: Vec<Word8> = s.notes_from(0, usize::MAX).unwrap().into_iter().map(|(_, r)| r.cm).collect();
+        assert_eq!(randprotocol_core::notes::FullTree::new(leaves, &StubExecutor).root(), ledger.root());
     }
 
     /// A chain whose genesis has no `bridge` section stores no bridge state at all, and

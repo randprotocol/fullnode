@@ -1185,6 +1185,74 @@ mod tests {
         (l, secrets)
     }
 
+    /// Every bundle-carrying kind the hidden-asset bundle reshaped — a plain transfer (`None`), a
+    /// holder's `TokenBurn` and a `BridgeBurn` — claims all four of its nullifiers and all four
+    /// of its commitments, no more and no fewer, and each of the eight blocks a rival that shares
+    /// only it. The rival is a plain transfer, so the claim is by word and not by kind. Slots 2
+    /// and 3 are the fixture's derived words, standing for an honest bundle's dummies: the chain
+    /// cannot tell a dummy from a real note (that is the point of the shape), so a dummy's
+    /// nullifier and commitment are claimed exactly like a real one's — a dummy commitment
+    /// reused by a second transaction would die on `CommitmentExists` in the proposer's block.
+    /// Removing the owner frees all eight.
+    #[test]
+    fn every_bundle_kind_claims_its_four_nullifiers_and_four_commitments() {
+        let (gs, secrets) = fixtures::bridged_genesis(1);
+        let mut l = gs.ledger.clone();
+        // Supply for both burns: 1 000 of the bridged token (index 1), 5 000 of a native one (2).
+        let deposit = fixtures::attest_tx(&l, fixtures::attestation(&secrets, &fixtures::recipient(), 1_000, 0), 200);
+        l.apply_tx(&deposit, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        let register = fixtures::register_token_tx(&l, 5_000, 210);
+        l.apply_tx(&register, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        l.record_anchor(0);
+
+        let rival = |slot: usize, nf_of: Option<Word8>, cm_of: Option<Word8>, seed: u32| {
+            let mut t = fixtures::transfer_tx(&l, seed);
+            {
+                let b = t.bundle.as_mut().unwrap();
+                if let Some(x) = nf_of {
+                    b.nullifiers[slot] = x;
+                }
+                if let Some(x) = cm_of {
+                    b.commitments[slot] = x;
+                }
+                b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
+            }
+            StubExecutor::bound(t)
+        };
+
+        let kinds = [
+            ("none", fixtures::transfer_tx(&l, 10)),
+            ("token_burn", fixtures::token_burn_tx(&l, 2, 300, 20)),
+            ("bridge_burn", fixtures::burn_tx(&l, 1, 400, 100, 30)),
+        ];
+        for (kind, owner) in kinds {
+            assert_eq!(l.validate(&owner, &StubExecutor), Ok(()), "{kind}");
+            let (nfs, cms) = (owner.nullifiers(), owner.commitments());
+            assert_eq!((nfs.len(), cms.len()), (4, 4), "{kind}: four and four, dummies included");
+            let mut m = Mempool::new(100);
+            let claims = m.precheck(&owner, &l, &StubExecutor).unwrap();
+            assert_eq!(claims.commitments, cms, "{kind}: exactly its four output slots");
+            m.insert(owner.clone(), &l, &StubExecutor).unwrap();
+            for slot in 0..4 {
+                let seed = 1_000 + 16 * slot as u32;
+                let by_nf = rival(slot, Some(nfs[slot]), None, seed);
+                assert_eq!(l.validate(&by_nf, &StubExecutor), Ok(()), "{kind} slot {slot}: a race, not a bad tx");
+                assert_eq!(m.insert(by_nf, &l, &StubExecutor), Err(MempoolError::Conflict(nfs[slot])), "{kind} nf {slot}");
+                let by_cm = rival(slot, None, Some(cms[slot]), seed + 8);
+                assert_eq!(l.validate(&by_cm, &StubExecutor), Ok(()), "{kind} slot {slot}: a race, not a bad tx");
+                assert_eq!(m.insert(by_cm, &l, &StubExecutor), Err(MempoolError::Conflict(cms[slot])), "{kind} cm {slot}");
+            }
+            assert_eq!(m.len(), 1, "{kind}");
+            m.remove(&[owner.hash()]);
+            for slot in 0..4 {
+                let seed = 2_000 + 16 * slot as u32;
+                m.insert(rival(slot, Some(nfs[slot]), None, seed), &l, &StubExecutor).unwrap();
+                m.insert(rival(slot, None, Some(cms[slot]), seed + 8), &l, &StubExecutor).unwrap();
+            }
+            assert_eq!(m.len(), 8, "{kind}: its removal freed all eight words");
+        }
+    }
+
     /// A transfer — of RAND or of any token, the same bundle since the hidden-asset bundle —
     /// claims all four of its nullifiers and all four of its commitments in the pool's conflict
     /// index, the dummy slots' included: two transfers sharing any one of them do not both enter
