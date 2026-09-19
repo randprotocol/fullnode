@@ -4,6 +4,13 @@
 
 - A chain is defined by its genesis file. Every node needs the identical file; validators are the keys
   listed in it. Changing the validator set means a new genesis and a fresh chain.
+- **Set `genesis.timestamp_ms` close to the actual launch time, never ahead of it.** Too far in
+  the past and block time visibly lags wall clock until the timestamp step bound (60 s per block on
+  a bridged chain, `docs/bridge.md` §16) lets it catch up. **More than 15 seconds in the future and
+  block 1 does not commit at all**: every vote, the leader's own included, is withheld until wall
+  time reaches the genesis timestamp (`MAX_CLOCK_DRIFT_MS`). Check the cut script's timestamp
+  against the clock on the machine that will actually launch the fleet, not the one that cut the
+  file.
 - More than 2/3 of stake must be online to commit. With equal stakes: 2 validators tolerate none down,
   4 tolerate one, 7 tolerate two.
 - Nodes behind NAT dial out to nodes with public addresses (`--bootstrap`). On one LAN, mDNS finds

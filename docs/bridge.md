@@ -799,6 +799,19 @@ and `pause_key`; `rand_getAssets` rows serve `mint_cap_per_day`, `minted_today` 
 **The pause key must be held on a different machine from the one holding the guardian keys** — the
 whole point is a fast brake that survives a guardian-key compromise.
 
+**What the pause does and does not cover.** The pause key can only pause; the PQ guardian quorum
+alone can `UnpauseMints`, and that same quorum can `ListBacking` up to `MAX_BACKINGS = 32` coins
+onto one bridged token, each with its own fresh `mint_cap_per_day` — so the effective Rand-side
+bound after a pause is lifted is up to 32× one backing's daily cap, not the smaller number a
+single-backing token's cap might suggest. The pause is fully effective against the threat it was
+built for — guardian *daemons* tricked or compromised into co-signing a forged mint while the
+humans holding the PQ quorum have not — because the pause key needs no guardian cooperation at
+all. It is not a defence against theft of the PQ quorum itself: a party that holds the quorum can
+unpause in the same block as the next forged attest, or list new backings and mint against their
+caps directly, and — in that threat model — could reach the same coins by draining their
+source-chain contracts without ever touching Rand. Treat the pause as a brake on a tricked or
+compromised bridge operator, not as a lock the PQ quorum cannot open.
+
 ## 16. B2 — a forward bound on block timestamps
 
 A bridged chain's block timestamp decides guardian-set expiry (§3) and, since B1, the mint-cap
@@ -825,7 +838,18 @@ failure halts the chain by itself — the honest majority's clocks still agree �
 un-synchronised fleet loses liveness margin for nothing. **`genesis.timestamp_ms` must be set close
 to the actual launch time**: block 1 is measured against it, and a stale genesis time makes block
 time visibly lag behind wall clock until B2's step bound lets it catch up, roughly `MAX_TIMESTAMP_
-STEP_MS` per block.
+STEP_MS` per block. A `genesis.timestamp_ms` set **more than 15 s in the future** has the opposite
+problem: `MAX_CLOCK_DRIFT_MS` withholds every vote, the leader's own included, until wall time
+reaches it, so block 1 simply does not commit until then — set it at or just before launch, never
+ahead of it.
+
+**Catch-up and the mint-cap day.** After any halt long enough for the chain clock to fall behind
+wall time, B2's step bound lets block time close the gap at up to `MAX_TIMESTAMP_STEP_MS` (60 s)
+per block — which, at 3 s blocks, can advance the chain clock by a full UTC day in about 76
+minutes of real time. B1's cap keys `minted_today`/`mint_day` on that same block timestamp, so a
+mint-cap day can roll over faster than once per real day while a chain is catching up; bounded to
+at most one extra day's cap per full day of accumulated lag, and never during ordinary operation
+where block time already tracks wall time.
 
 ## 17. B3 — a Dilithium2 co-signature on every mint
 
