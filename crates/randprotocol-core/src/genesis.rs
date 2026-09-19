@@ -6,7 +6,9 @@ use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, PublicKey, Signature};
 use crate::gas;
 use crate::ledger::staking::MIN_STAKE;
-use crate::ledger::tokens::{check_metadata, Backing, MintAuthority, TokenRegistry, BRIDGE_DECIMALS, MAX_BACKINGS};
+use crate::ledger::tokens::{
+    check_metadata, Backing, MintAuthority, TokenRegistry, BRIDGE_DECIMALS, MAX_BACKINGS, MAX_BACKING_DECIMALS,
+};
 use crate::ledger::{Ledger, ValidatorEntry};
 use crate::notes::{word8_from_hex, word8_to_bytes, Envelope, ShieldedAddress, Word8};
 use crate::types::{Block, BlockHeader, QuorumCertificate, ValidatorSet};
@@ -67,21 +69,25 @@ pub struct GenesisNote {
     pub amount: u64,
 }
 
-/// One source-chain coin behind a listed token: the chain id and the token address there
-/// (64 hex characters in the genesis file).
+/// One source-chain coin behind a listed token: the chain id, the token address there (64 hex
+/// characters in the genesis file), and that source token's own decimal count (bridge-06/audit
+/// O-5) — never [`BRIDGE_DECIMALS`], which is what the *bridged token* is normalized to on this
+/// chain: USDT is 6 decimals on Ethereum and 18 on BSC, both backing the same eight-decimal zUSD.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenesisBacking {
     pub chain: u16,
     #[serde(with = "hex_bytes32")]
     pub token: [u8; 32],
+    pub decimals: u8,
 }
 
 /// One token a `tokens` section lists at genesis: always a `Bridge`-authority token (a native
 /// token at genesis has no note to mint into, so a creator registers one after launch — a later
-/// task's `Action::RegisterToken`). Decimals are always [`BRIDGE_DECIMALS`]; that is not
-/// [`crate::ledger::tokens::TokenRegistry::register`]'s rule to enforce (it does not tie a
-/// `Bridge` authority to eight decimals), so this listing code passes the constant itself.
+/// task's `Action::RegisterToken`). The *token's* decimals are always [`BRIDGE_DECIMALS`]; that is
+/// not [`crate::ledger::tokens::TokenRegistry::register`]'s rule to enforce (it does not tie a
+/// `Bridge` authority to eight decimals), so this listing code passes the constant itself. Each
+/// backing's own decimals — the source token's — are [`GenesisBacking::decimals`].
 ///
 /// One token, many coins (spec §12): chain 14 lists a single zUSD backed by USDT and USDC on
 /// four source chains at once, so a listing carries a *list* of `(chain, token)` pairs — one to
@@ -93,6 +99,7 @@ pub struct GenesisBacking {
 /// this salt) and no longer over a `(chain, token)` pair, because there is no single pair to hash
 /// any more and the backings grow.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenesisToken {
     pub name: String,
     pub symbol: String,
@@ -124,10 +131,13 @@ pub struct TokensConfig {
 pub struct TokensCommit {
     pub registration_fee: u64,
     /// `(name, symbol, salt, backings)` per listed token, in file order — which is registration
-    /// order, which is index order — each backing as its `(chain, token)` pair, in file order
-    /// too, since the order a token's coins are listed in is the order its `backings` vector
-    /// holds them in and so is part of the state the leaf hashes.
-    pub tokens: Vec<(String, String, [u8; 32], Vec<(u16, [u8; 32])>)>,
+    /// order, which is index order — each backing as its `(chain, token, decimals)` triple, in
+    /// file order too, since the order a token's coins are listed in is the order its `backings`
+    /// vector holds them in and so is part of the state the leaf hashes. `decimals` rides beside
+    /// the pair so a backing's declared source precision is committed exactly like its chain and
+    /// address are — a genesis file that changed only a backing's decimals must build a different
+    /// chain.
+    pub tokens: Vec<(String, String, [u8; 32], Vec<(u16, [u8; 32], u8)>)>,
 }
 
 impl From<&TokensConfig> for TokensCommit {
@@ -145,8 +155,8 @@ impl From<&TokensConfig> for TokensCommit {
                     let backings = backings
                         .iter()
                         .map(|b| {
-                            let GenesisBacking { chain, token } = b;
-                            (*chain, *token)
+                            let GenesisBacking { chain, token, decimals } = b;
+                            (*chain, *token, *decimals)
                         })
                         .collect();
                     (name.clone(), symbol.clone(), *salt, backings)
@@ -495,7 +505,7 @@ impl Genesis {
                             backings: t
                                 .backings
                                 .iter()
-                                .map(|b| Backing { chain: b.chain, token: b.token, locked: 0 })
+                                .map(|b| Backing { chain: b.chain, token: b.token, decimals: b.decimals, locked: 0 })
                                 .collect(),
                         },
                         0,
@@ -706,15 +716,18 @@ fn check_aggregation(cfg: &crate::ledger::aggregation::AggregationConfig) -> Res
 
 /// Rejects a `tokens` section a chain could not run: a `registration_fee` out of bounds, a
 /// listed token when there is no `bridge` section to attest it, a listing with no backings or
-/// more than [`MAX_BACKINGS`], a `(chain, token)` pair listed twice anywhere in the section, a
-/// backing on a chain the `bridge` section registers no emitter for, or metadata
-/// [`check_metadata`] itself would refuse (a genesis token is always `BRIDGE_DECIMALS`, spec's
-/// RPL token standard).
+/// more than [`MAX_BACKINGS`], a backing whose declared source decimals is over
+/// [`MAX_BACKING_DECIMALS`] ([`TokenError::BadBackingDecimals`]'s genesis-time twin), a
+/// `(chain, token)` pair listed twice anywhere in the section, a backing on a chain the `bridge`
+/// section registers no emitter for, or metadata [`check_metadata`] itself would refuse (a
+/// genesis token is always `BRIDGE_DECIMALS`, spec's RPL token standard).
 ///
 /// The emitter rule is the one this amendment adds (spec §12): a coin on a chain with no
 /// registered emitter can never be attested, so a backing naming one is a listing the chain
 /// could not use — caught in the file rather than discovered as an `UnlistedToken` that no
 /// correction can fix without a new genesis.
+///
+/// [`TokenError::BadBackingDecimals`]: crate::ledger::tokens::TokenError::BadBackingDecimals
 fn check_tokens(cfg: &TokensConfig, bridge: Option<&BridgeConfig>) -> Result<(), GenesisError> {
     let bad = |m: String| Err(GenesisError::BadTokens(m));
     if !(MIN_REGISTRATION_FEE..=MAX_REGISTRATION_FEE).contains(&cfg.registration_fee) {
@@ -740,6 +753,14 @@ fn check_tokens(cfg: &TokensConfig, bridge: Option<&BridgeConfig>) -> Result<(),
             return bad(format!("token {} has {} backings, more than {MAX_BACKINGS}", t.symbol, t.backings.len()));
         }
         for b in &t.backings {
+            if b.decimals > MAX_BACKING_DECIMALS {
+                return bad(format!(
+                    "backing for chain {} token {} declares {} decimals, over the maximum {MAX_BACKING_DECIMALS}",
+                    b.chain,
+                    hex::encode(b.token),
+                    b.decimals
+                ));
+            }
             if !seen.insert((b.chain, b.token)) {
                 return bad(format!("duplicate backing for chain {} token {}", b.chain, hex::encode(b.token)));
             }
@@ -1044,7 +1065,7 @@ mod tests {
                 name: "Tether USD".into(),
                 symbol: "zUSDT".into(),
                 salt: [0x55; 32],
-                backings: vec![GenesisBacking { chain: 2, token }],
+                backings: vec![GenesisBacking { chain: 2, token, decimals: BRIDGE_DECIMALS }],
             }],
         };
         let mut g = base_genesis();
@@ -1081,12 +1102,12 @@ mod tests {
         // A second backing on the same token is a different chain too — the whole list is bound.
         let mut two = g.clone();
         two.bridge.as_mut().unwrap().emitters.insert(3, [3; 32]);
-        two.tokens.as_mut().unwrap().tokens[0].backings.push(GenesisBacking { chain: 3, token: [0x33; 32] });
+        two.tokens.as_mut().unwrap().tokens[0].backings.push(GenesisBacking { chain: 3, token: [0x33; 32], decimals: BRIDGE_DECIMALS });
         assert_ne!(build(&two).hash(), base, "a token's backing set is committed whole");
 
         // The twin is the bytes, not the text: the hex spelling is not what is hashed.
         let commit = TokensCommit::from(g.tokens.as_ref().unwrap());
-        assert_eq!(commit.tokens[0].3, vec![(2u16, [0x11u8; 32])]);
+        assert_eq!(commit.tokens[0].3, vec![(2u16, [0x11u8; 32], BRIDGE_DECIMALS)]);
         let bytes = bincode::serialize(&commit).unwrap();
         assert!(
             bytes.windows(32).any(|w| w == [0x11u8; 32]),
@@ -1125,13 +1146,13 @@ mod tests {
                     name: "Tether USD".into(),
                     symbol: "zUSDT".into(),
                     salt: [1; 32],
-                    backings: vec![GenesisBacking { chain: 2, token: [0x11; 32] }],
+                    backings: vec![GenesisBacking { chain: 2, token: [0x11; 32], decimals: BRIDGE_DECIMALS }],
                 },
                 GenesisToken {
                     name: "USD Coin".into(),
                     symbol: "zUSDC".into(),
                     salt: [2; 32],
-                    backings: vec![GenesisBacking { chain: 2, token: [0x22; 32] }],
+                    backings: vec![GenesisBacking { chain: 2, token: [0x22; 32], decimals: BRIDGE_DECIMALS }],
                 },
             ],
         });
@@ -1142,7 +1163,7 @@ mod tests {
         assert_eq!(t.get(1).unwrap().decimals, 8);
         assert_eq!(
             t.get(1).unwrap().authority,
-            MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0x11; 32], locked: 0 }] }
+            MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0x11; 32], decimals: BRIDGE_DECIMALS, locked: 0 }] }
         );
         assert_eq!(t.get(1).unwrap().id, crate::ledger::tokens::bridged_asset_id("Tether USD", "zUSDT", &[1; 32]));
         assert_eq!(t.bridged(2, &[0x22; 32]).unwrap().index, 2, "each coin resolves to its own token");
@@ -1154,21 +1175,29 @@ mod tests {
         assert!(matches!(no_bridge.validate(), Err(GenesisError::BadTokens(_))));
     }
 
-    /// Chain 14's own listing (spec §12): one zUSD backed by USDT and USDC on Ethereum (2), BSC
-    /// (3) and Solana (5), plus USDT on Tron (4) — Tron USDC is discontinued. Seven coins, one
-    /// index, eight decimals, and every coin resolving to it.
+    /// A 32-byte hex string, as the real backings table (`chain14-zusd-backings.md`) and the
+    /// genesis file itself spell a token address.
+    fn hex32(s: &str) -> [u8; 32] {
+        hex::decode(s).unwrap().try_into().unwrap()
+    }
+
+    /// Chain 14's own listing (spec §12, bridge-06 2026-09-19's `chain14-zusd-backings.md`): one
+    /// zUSD backed by USDT and USDC on Ethereum (2), BSC (3) and Solana (5), plus USDT on Tron
+    /// (4) — Tron USDC is discontinued. Seven coins, one index, eight decimals for the *token*,
+    /// and each backing's own **source** decimals — 6 on Ethereum, Tron and Solana, 18 on BSC,
+    /// which is what makes this the release-unit rule's real fixture rather than a synthetic one.
     #[test]
     fn one_zusd_with_seven_backings_builds() {
-        const USDT: [u8; 32] = [0xd7; 32];
-        const USDC: [u8; 32] = [0xdc; 32];
+        // The exact addresses and source decimals bridge-06 will whitelist, verbatim from
+        // `chain14-zusd-backings.md`.
         let backings = vec![
-            GenesisBacking { chain: 2, token: USDT },
-            GenesisBacking { chain: 2, token: USDC },
-            GenesisBacking { chain: 3, token: USDT },
-            GenesisBacking { chain: 3, token: USDC },
-            GenesisBacking { chain: 4, token: USDT },
-            GenesisBacking { chain: 5, token: USDT },
-            GenesisBacking { chain: 5, token: USDC },
+            GenesisBacking { chain: 2, token: hex32("000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7"), decimals: 6 },
+            GenesisBacking { chain: 2, token: hex32("000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"), decimals: 6 },
+            GenesisBacking { chain: 3, token: hex32("00000000000000000000000055d398326f99059ff775485246999027b3197955"), decimals: 18 },
+            GenesisBacking { chain: 3, token: hex32("0000000000000000000000008ac76a51cc950d9822d68b83fe1ad97b32cd580d"), decimals: 18 },
+            GenesisBacking { chain: 4, token: hex32("000000000000000000000000a614f803b6fd780986a42c78ec9c7f77e6ded13c"), decimals: 6 },
+            GenesisBacking { chain: 5, token: hex32("ce010e60afedb22717bd63192f54145a3f965a33bb82d2c7029eb2ce1e208264"), decimals: 6 },
+            GenesisBacking { chain: 5, token: hex32("c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2f6e0e47ca60203452f5d61"), decimals: 6 },
         ];
         let mut g = base_genesis();
         let mut bridge = bridge_cfg();
@@ -1188,18 +1217,24 @@ mod tests {
         let t = s.ledger.tokens().unwrap();
         assert_eq!(t.len(), 1, "one token, not seven");
         assert_eq!(t.get(1).unwrap().symbol, "zUSD");
-        assert_eq!(t.get(1).unwrap().decimals, 8);
+        assert_eq!(t.get(1).unwrap().decimals, 8, "the token itself is always eight decimals");
         for b in &backings {
             assert_eq!(t.bridged(b.chain, &b.token).unwrap().index, 1, "chain {}", b.chain);
-            assert_eq!(t.backing(1, b.chain, &b.token).unwrap().locked, 0);
+            let live = t.backing(1, b.chain, &b.token).unwrap();
+            assert_eq!(live.locked, 0);
+            assert_eq!(live.decimals, b.decimals, "the backing's own source decimals, chain {}", b.chain);
         }
         assert!(t.backing_invariant_holds());
-        // Tron USDC is not listed, and so is not depositable.
-        assert!(t.bridged(4, &USDC).is_none());
+        // Tron is the one chain with a single coin — Tron USDC is discontinued and is not listed,
+        // so chain 4 has exactly one backing. Asked with Ethereum's *USDC* address, which is a
+        // listed coin on chain 2 and nothing at all on chain 4, since a backing is the pair and
+        // never the address alone.
+        assert_eq!(backings.iter().filter(|b| b.chain == 4).count(), 1, "USDT only on Tron");
+        assert!(t.bridged(4, &backings[1].token).is_none(), "Ethereum's USDC does not back anything on Tron");
 
         // A backing on a chain with no registered emitter could never be attested.
         let mut orphan = g.clone();
-        orphan.tokens.as_mut().unwrap().tokens[0].backings.push(GenesisBacking { chain: 9, token: USDT });
+        orphan.tokens.as_mut().unwrap().tokens[0].backings.push(GenesisBacking { chain: 9, token: backings[0].token, decimals: 6 });
         match orphan.validate() {
             Err(GenesisError::BadTokens(m)) => assert!(m.contains("chain 9"), "{m}"),
             other => panic!("expected BadTokens, got {other:?}"),
@@ -1210,7 +1245,7 @@ mod tests {
             name: "Copy USD".into(),
             symbol: "cUSD".into(),
             salt: [0x5b; 32],
-            backings: vec![GenesisBacking { chain: 2, token: USDT }],
+            backings: vec![GenesisBacking { chain: 2, token: backings[0].token, decimals: 6 }],
         });
         match twice.validate() {
             Err(GenesisError::BadTokens(m)) => assert!(m.contains("duplicate backing"), "{m}"),
@@ -1227,11 +1262,56 @@ mod tests {
         bridge.emitters = (2u16..=64).map(|c| (c, [c as u8; 32])).collect();
         too_many.bridge = Some(bridge);
         too_many.tokens.as_mut().unwrap().tokens[0].backings =
-            (2..MAX_BACKINGS as u16 + 3).map(|i| GenesisBacking { chain: i, token: [i as u8; 32] }).collect();
+            (2..MAX_BACKINGS as u16 + 3).map(|i| GenesisBacking { chain: i, token: [i as u8; 32], decimals: BRIDGE_DECIMALS }).collect();
         match too_many.validate() {
             Err(GenesisError::BadTokens(m)) => assert!(m.contains("more than 32"), "{m}"),
             other => panic!("expected BadTokens, got {other:?}"),
         }
+        // A backing whose declared decimals is over the maximum is refused at genesis, the
+        // twin of `TokenRegistry::add_backing`'s own `BadBackingDecimals`.
+        let mut bad_decimals = g.clone();
+        bad_decimals.tokens.as_mut().unwrap().tokens[0].backings[0].decimals = MAX_BACKING_DECIMALS + 1;
+        match bad_decimals.validate() {
+            Err(GenesisError::BadTokens(m)) => assert!(m.contains("decimals"), "{m}"),
+            other => panic!("expected BadTokens, got {other:?}"),
+        }
+
+        // A backing's decimals is state — the token leaf commits it, and `TokensCommit` carries it
+        // beside the pair — so a file that changed only Ethereum USDT's 6 to 18 builds a
+        // different chain, which is what stops a mis-declared coin being "corrected" in place
+        // under a genesis hash operators have already pinned.
+        let mut restated = g.clone();
+        restated.tokens.as_mut().unwrap().tokens[0].backings[0].decimals = 18;
+        let base = build(&g);
+        let moved = build(&restated);
+        assert_ne!(moved.hash(), base.hash(), "decimals is part of the genesis binding");
+        assert_ne!(moved.ledger.state_root(), base.ledger.state_root(), "and of the token leaf");
+    }
+
+    /// `GenesisToken` denies unknown fields, like its child `GenesisBacking` always has: a stray
+    /// or legacy key — such as a single-backing `chain` left over from before a token could have
+    /// many — is refused rather than silently ignored, which is what would otherwise let a typo'd
+    /// or half-migrated genesis file build a chain nobody meant to build.
+    #[test]
+    fn a_genesis_token_with_a_stray_field_is_refused() {
+        let mut g = base_genesis();
+        g.bridge = Some(bridge_cfg());
+        g.tokens = Some(TokensConfig {
+            registration_fee: MIN_REGISTRATION_FEE,
+            tokens: vec![GenesisToken {
+                name: "Tether USD".into(),
+                symbol: "zUSDT".into(),
+                salt: [1; 32],
+                backings: vec![GenesisBacking { chain: 2, token: [0x11; 32], decimals: 6 }],
+            }],
+        });
+        assert!(g.validate().is_ok(), "the well-formed file parses and validates");
+        let mut v = serde_json::to_value(&g).unwrap();
+        v["tokens"]["tokens"][0].as_object_mut().unwrap().insert("chain".into(), serde_json::json!(2));
+        assert!(
+            Genesis::from_json(&v.to_string()).is_err(),
+            "a stray `chain` key beside `backings` is refused, not silently dropped"
+        );
     }
 
     /// `registration_fee` has to be a fee a chain can actually run at, and the same `(chain,
@@ -1252,7 +1332,7 @@ mod tests {
             name: "A".into(),
             symbol: "A".into(),
             salt: [3; 32],
-            backings: vec![GenesisBacking { chain: 2, token: [1; 32] }],
+            backings: vec![GenesisBacking { chain: 2, token: [1; 32], decimals: BRIDGE_DECIMALS }],
         };
         g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![dup.clone(), dup] });
         assert!(matches!(g.validate(), Err(GenesisError::BadTokens(_))));

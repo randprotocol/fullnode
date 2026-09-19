@@ -1077,26 +1077,42 @@ pub async fn submit(
     })
 }
 
-/// The three facts about the chain a burn needs before any proving: the chain has a bridge at
-/// all, the asset index it names is one the registry holds, and the coin it asks to redeem —
-/// `(to_chain, token)` — backs that asset and is holding at least `amount`.
+/// The four facts about the chain a burn needs before any proving: the chain has a bridge at
+/// all, the asset index it names is one the registry holds, the coin it asks to redeem —
+/// `(to_chain, token)` — backs that asset, and both `amount` and `relayer_fee` are whole
+/// numbers of that coin's release unit and within what it is holding.
 ///
-/// None of them is something a wallet can know locally — all three are state — and getting any of
+/// None of them is something a wallet can know locally — all four are state — and getting any of
 /// them wrong costs *two* bundle proofs (minutes of a laptop) for a transaction the ledger
 /// refuses outright: `Bridge(Disabled)` for a chain with no bridge, `Bridge(UnknownAsset)` for an
-/// index nothing was ever registered under, `NotABacking` for a coin that does not back it and
-/// `InsufficientBacking` for one that does but is not holding enough. `rand bridge-mint` already
-/// reads the chain before proving for the same reason (`deposit_index`); this is a burn's half of
-/// it, off the one `rand_getBridgeState` reply, whose `assets` array is the registry — one row
-/// per coin, carrying that coin's `locked`.
+/// index nothing was ever registered under, `NotABacking` for a coin that does not back it,
+/// `NotReleasable` for an amount or fee that is not a whole unit and `InsufficientBacking` for a
+/// coin that does back it but is not holding enough. `rand bridge-mint` already reads the chain
+/// before proving for the same reason (`deposit_index`); this is a burn's half of it, off the one
+/// `rand_getBridgeState` reply, whose `assets` array is the registry — one row per coin, carrying
+/// that coin's source `decimals` and its `locked`.
 ///
-/// The `locked` check is the one this amendment adds (spec §12): one bridged token is backed by
-/// several coins, so a burn of 700 zUSD may be well within the token's supply and still more than
-/// the chain it names is holding — and the far side would refuse to release it.
+/// The `locked` check is the one the zUSD amendment added (spec §12): one bridged token is backed
+/// by several coins, so a burn of 700 zUSD may be well within the token's supply and still more
+/// than the chain it names is holding — and the far side would refuse to release it.
+///
+/// The release-unit check is bridge-06/audit O-5's: the attestation wire carries amounts at eight
+/// decimals, so a source coin declaring `d < 8` releases in units of `10^(8-d)` and anything else
+/// either strands the remainder in custody or, below one unit, releases nothing. It is checked
+/// **before** the locked amount, the order [`randprotocol_core::ledger::tokens::TokenRegistry::check_release`]
+/// itself uses — the cheap, state-independent half first — so the two say the same thing in the
+/// same order.
 ///
 /// Deliberately not the rest of `BridgeState::check_burn` — the recipient must be shaped for the
 /// destination chain — which is the bridge's own policy and stays stated in one place.
-fn burn_is_possible(bridge_state: &Value, asset: u32, to_chain: u16, token: &[u8; 32], amount: u64) -> Result<()> {
+fn burn_is_possible(
+    bridge_state: &Value,
+    asset: u32,
+    to_chain: u16,
+    token: &[u8; 32],
+    amount: u64,
+    relayer_fee: u64,
+) -> Result<()> {
     if bridge_state["enabled"] != Value::Bool(true) {
         return Err(anyhow!("this chain has no bridge, so there is nothing to burn to"));
     }
@@ -1127,6 +1143,18 @@ fn burn_is_possible(bridge_state: &Value, asset: u32, to_chain: u16, token: &[u8
             coins.join(", ")
         ));
     };
+    // The release unit, from the coin's own declared decimals. Derived through the chain's own
+    // `tokens::release_unit` rather than by a second `10^(8-d)` written here, so the wallet and
+    // the ledger can never disagree about what a whole unit is.
+    let decimals = backing["decimals"].as_u64().context("an asset row without the coin's decimals")?;
+    let decimals = u8::try_from(decimals).context("an asset row whose decimals is not a byte")?;
+    let unit = randprotocol_core::ledger::tokens::release_unit(decimals);
+    if amount % unit != 0 || relayer_fee % unit != 0 {
+        return Err(anyhow!(
+            "{hex_token} on chain {to_chain} has {decimals} decimals: \
+             the amount and the relayer fee must be multiples of {unit}"
+        ));
+    }
     let locked = backing["locked"].as_u64().context("an asset row without a locked amount")?;
     if amount > locked {
         return Err(anyhow!(
@@ -1176,7 +1204,7 @@ pub async fn submit_burn(
     }
     // One read of the chain, before any proving, for the three facts only the chain knows —
     // the coin's locked amount among them, since one token's backings are held apart.
-    burn_is_possible(&rpc.bridge_state().await?, asset, to_chain, &token, amount)?;
+    burn_is_possible(&rpc.bridge_state().await?, asset, to_chain, &token, amount, relayer_fee)?;
     scan(rpc, w, store).await?;
     // `burn == amount`, not `amount + relayer_fee`: the wire format's fee is a *portion* of the
     // amount (`fee <= amount`), carved out on the destination chain by the release contract. A
@@ -1655,57 +1683,121 @@ mod tests {
         let usdt = [0xd7u8; 32];
         let usdc = [0xdcu8; 32];
         let other = [0xeeu8; 32];
-        let row = |index: u32, chain: u16, token: [u8; 32], locked: u64| {
-            serde_json::json!({
-                "index": index, "chain": chain, "token": hex::encode(token),
-                "asset_id": hex::encode([index as u8; 32]), "locked": locked,
-            })
-        };
+        // Eight decimals — the wire's own — so the release unit is 1 and cannot be what refuses
+        // anything here; `a_burn_must_be_a_whole_number_of_the_coins_release_unit` is that rule.
         let registry = serde_json::json!([
-            row(1, 2, usdt, 1_000),
-            row(1, 5, usdc, 400),
-            row(2, 2, other, 50),
+            asset_row(1, 2, usdt, 8, 1_000),
+            asset_row(1, 5, usdc, 8, 400),
+            asset_row(2, 2, other, 8, 50),
         ]);
         let bridged = serde_json::json!({ "enabled": true, "assets": registry });
-        burn_is_possible(&bridged, 1, 2, &usdt, 1_000).expect("exactly what that coin holds");
-        burn_is_possible(&bridged, 1, 5, &usdc, 1).expect("the other coin of the same token");
-        burn_is_possible(&bridged, 2, 2, &other, 50).expect("and the token beside it");
+        burn_is_possible(&bridged, 1, 2, &usdt, 1_000, 0).expect("exactly what that coin holds");
+        burn_is_possible(&bridged, 1, 5, &usdc, 1, 0).expect("the other coin of the same token");
+        burn_is_possible(&bridged, 2, 2, &other, 50, 0).expect("and the token beside it");
 
         // More of one coin than its own contract is holding, though the token's supply (1 400
         // across its two coins) would cover it. This is the line a user reads.
-        let e = burn_is_possible(&bridged, 1, 5, &usdc, 700).unwrap_err().to_string();
+        let e = burn_is_possible(&bridged, 1, 5, &usdc, 700, 0).unwrap_err().to_string();
         assert_eq!(
             e,
             "only 400 is locked in that coin on chain 5; choose another backing or a smaller amount"
         );
         // A coin that backs nothing, and one that backs the *other* token: both name the
         // backings the asset does have.
-        let e = burn_is_possible(&bridged, 1, 3, &usdt, 1).unwrap_err().to_string();
+        let e = burn_is_possible(&bridged, 1, 3, &usdt, 1, 0).unwrap_err().to_string();
         assert!(e.contains("does not back asset 1") && e.contains("chain 5 token"), "{e}");
-        let e = burn_is_possible(&bridged, 1, 2, &other, 1).unwrap_err().to_string();
+        let e = burn_is_possible(&bridged, 1, 2, &other, 1, 0).unwrap_err().to_string();
         assert!(e.contains("does not back asset 1"), "{e}");
 
         // An index the registry does not hold: no note of it was ever deposited, so the ledger
         // would refuse the transaction after both proofs.
-        let e = burn_is_possible(&bridged, 3, 2, &usdt, 1).unwrap_err().to_string();
+        let e = burn_is_possible(&bridged, 3, 2, &usdt, 1, 0).unwrap_err().to_string();
         assert!(e.contains("asset 3 is not in this chain's registry") && e.contains("registered: 1, 1, 2"), "{e}");
 
         // A chain with no bridge at all, which is what `rand_getBridgeState` says with one field.
-        let e = burn_is_possible(&serde_json::json!({ "enabled": false }), 1, 2, &usdt, 1).unwrap_err().to_string();
+        let e = burn_is_possible(&serde_json::json!({ "enabled": false }), 1, 2, &usdt, 1, 0).unwrap_err().to_string();
         assert!(e.contains("no bridge"), "{e}");
         // A bridged chain whose registry is still empty names that rather than listing nothing.
         let empty = serde_json::json!({ "enabled": true, "assets": [] });
-        let e = burn_is_possible(&empty, 1, 2, &usdt, 1).unwrap_err().to_string();
+        let e = burn_is_possible(&empty, 1, 2, &usdt, 1, 0).unwrap_err().to_string();
         assert!(e.contains("registry is empty"), "{e}");
         // And a reply with no registry at all is an error, not an empty registry.
-        assert!(burn_is_possible(&serde_json::json!({ "enabled": true }), 1, 2, &usdt, 1).is_err());
-        // A row from a node that predates per-backing accounting has no `locked` to check
-        // against, which is an error rather than a burn proved against a number nobody sent.
+        assert!(burn_is_possible(&serde_json::json!({ "enabled": true }), 1, 2, &usdt, 1, 0).is_err());
+        // A row from a node that predates per-backing accounting has neither `decimals` nor
+        // `locked` to check against, which is an error rather than a burn proved against numbers
+        // nobody sent.
         let old = serde_json::json!({
             "enabled": true,
             "assets": [{ "index": 1, "chain": 2, "token": hex::encode(usdt), "asset_id": "00" }],
         });
-        assert!(burn_is_possible(&old, 1, 2, &usdt, 1).is_err());
+        assert!(burn_is_possible(&old, 1, 2, &usdt, 1, 0).is_err());
+        let no_locked = serde_json::json!({
+            "enabled": true,
+            "assets": [asset_row_without(1, 2, usdt, "locked")],
+        });
+        assert!(burn_is_possible(&no_locked, 1, 2, &usdt, 1, 0).is_err(), "no locked amount to bound the burn");
+        let no_decimals = serde_json::json!({
+            "enabled": true,
+            "assets": [asset_row_without(1, 2, usdt, "decimals")],
+        });
+        assert!(burn_is_possible(&no_decimals, 1, 2, &usdt, 1, 0).is_err(), "no decimals to derive the unit from");
+    }
+
+    /// One `rand_getAssets` row, as the node serves it: the note's `asset` word, the coin's wire
+    /// identity, that coin's **source** decimals and what its contract is holding.
+    fn asset_row(index: u32, chain: u16, token: [u8; 32], decimals: u8, locked: u64) -> serde_json::Value {
+        serde_json::json!({
+            "index": index, "chain": chain, "token": hex::encode(token),
+            "asset_id": hex::encode([index as u8; 32]), "decimals": decimals, "locked": locked,
+        })
+    }
+
+    /// [`asset_row`] with one field taken out — an older node's reply, or a corrupted one.
+    fn asset_row_without(index: u32, chain: u16, token: [u8; 32], field: &str) -> serde_json::Value {
+        let mut row = asset_row(index, chain, token, 6, 1_000);
+        row.as_object_mut().unwrap().remove(field);
+        row
+    }
+
+    /// A source coin with fewer decimals than the eight-decimal attestation wire releases in
+    /// whole units of `10^(8-d)`, so an amount — or a relayer fee, which the far side carves out
+    /// of it in native units — that is not a multiple of one would strand the remainder in
+    /// custody forever, or below one unit release nothing at all. The chain refuses it
+    /// (`TokenError::NotReleasable`); the wallet says so before buying two bundle proofs.
+    #[test]
+    fn a_burn_must_be_a_whole_number_of_the_coins_release_unit() {
+        // zUSD's real chain-2 (6 decimals) and chain-3 (18) USDT backings, the two sides of the
+        // rule: a unit of 100 on Ethereum and a unit of 1 on BSC.
+        let eth_usdt = [0xd7u8; 32];
+        let bsc_usdt = [0xb5u8; 32];
+        let bridged = serde_json::json!({
+            "enabled": true,
+            "assets": [asset_row(1, 2, eth_usdt, 6, 1_000_000), asset_row(1, 3, bsc_usdt, 18, 1_000_000)],
+        });
+
+        let e = burn_is_possible(&bridged, 1, 2, &eth_usdt, 199, 0).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            format!(
+                "{} on chain 2 has 6 decimals: the amount and the relayer fee must be multiples of 100",
+                hex::encode(eth_usdt)
+            )
+        );
+        burn_is_possible(&bridged, 1, 2, &eth_usdt, 200, 0).expect("exactly two whole units");
+
+        // The fee is released in native units too, so it is held to the same unit even when the
+        // amount itself is a clean multiple.
+        let e = burn_is_possible(&bridged, 1, 2, &eth_usdt, 1_000, 150).unwrap_err().to_string();
+        assert!(e.contains("multiples of 100"), "{e}");
+        burn_is_possible(&bridged, 1, 2, &eth_usdt, 1_000, 100).expect("a whole-unit fee");
+
+        // At or above the wire's eight decimals the unit is 1 and nothing is ever refused for it.
+        burn_is_possible(&bridged, 1, 3, &bsc_usdt, 199, 7).expect("every amount is a whole unit");
+
+        // The unit is checked before the locked amount, as the chain checks it
+        // (`TokenRegistry::check_release`): the cheap, state-independent half first.
+        let e = burn_is_possible(&bridged, 1, 2, &eth_usdt, 9_999_999, 0).unwrap_err().to_string();
+        assert!(e.contains("multiples of 100"), "the unit, not the locked amount: {e}");
     }
 
     /// One submission per shape of [`Burn`], as `rand` prints it. This is the line a user reads

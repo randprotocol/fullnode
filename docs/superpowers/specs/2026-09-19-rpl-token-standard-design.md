@@ -269,3 +269,38 @@ Spec changes:
 Plan change: new Task 3b after Task 3 (core + node + client callers), Task 2's GenesisToken shape
 changes inside 3b, Task 10 re-scoped to AddBacking.
 
+
+## 13. Amendment (bridge session, 2026-09-19): a backing knows its source decimals
+
+Closes bridge issue #6 / audit O-5. The attestation wire carries every amount at **8** decimals
+(§3's `BRIDGE_DECIMALS`, here also named `WIRE_DECIMALS`), whatever the source token declares. A
+source coin with `d < 8` decimals therefore releases `amount / 10^(8-d)` native units: a burn of
+199 wire units into a 6-decimal coin releases 1 native unit and strands 99 in custody for ever,
+and a burn below 100 releases nothing at all (the endpoint reverts `ZeroAmount`). §12's invariant
+— endpoint custody == the backing's `locked` — holds only if nothing is ever asked to release a
+fraction of a native unit.
+
+Spec changes on top of §12:
+- §3 `Backing { chain: u16, token: [u8;32], decimals: u8, locked: u64 }` — `decimals` is the
+  **source** token's own count, `0..=MAX_BACKING_DECIMALS` (18), never the bridged token's 8.
+  `Backing::release_unit()` is `10^(8-d)` for `d < 8` and `1` otherwise. `decimals > 18` is
+  `TokenError::BadBackingDecimals`, refused at `TokenRegistry::register` and at `add_backing`,
+  whose signature becomes `add_backing(index, chain, token, decimals)`. The token leaf commits
+  `decimals`, because it is a field of `Backing`.
+- §4 `BridgeBurn`: refused `TokenError::NotReleasable { amount, unit }` unless
+  `amount % unit == 0` **and** `relayer_fee % unit == 0` — the fee is carved out of the amount in
+  native units on the destination chain, so it is exactly as unreleasable. Checked in validate,
+  byte-cheap, **before** the `locked` comparison, in the one place that decides a burn's refusals
+  (`TokenRegistry::check_release`, which gains the `relayer_fee` parameter and is what
+  `BridgeState::check_burn` and `TokenRegistry::release` both call). A deposit needs no rule: a
+  lock always attests a whole number of units. A transfer needs none: it releases nothing.
+  `NotReleasable` stays **out** of the node's `is_permanent` allowlist — a coin can be listed
+  later, so a refusal must not be cached for the life of the process.
+- §5 genesis: `GenesisBacking { chain, token, decimals }`, `decimals > 18` is `BadTokens`;
+  `TokensCommit` carries `(chain, token, decimals)` per backing. Chain 14's seven backings and
+  their source decimals are `chain14-zusd-backings.md` (6 on Ethereum, Tron and Solana; 18 on BSC).
+  `GenesisToken` gains `#[serde(deny_unknown_fields)]`, which its child `GenesisBacking` always
+  had, so a stray or legacy key is refused rather than silently ignored.
+- §6 RPC: `rand_getAssets` / `rand_getBridgeState.assets` rows gain `decimals`.
+- Wallet: `submit_burn` pre-checks the unit off that row before any proving —
+  *"{coin} on chain {c} has {d} decimals: the amount and the relayer fee must be multiples of {unit}"*.

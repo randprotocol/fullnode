@@ -2155,7 +2155,10 @@ pub(crate) mod fixtures {
                     name: "Tether USD".into(),
                     symbol: "zUSDT".into(),
                     salt: [0x5a; 32],
-                    backings: vec![randprotocol_core::genesis::GenesisBacking { chain: 2, token: TOKEN }],
+                    // Eight decimals — the attestation wire's own — so this coin's release unit is 1 and no
+                    // fixture burn here is ever refused for it; the release-unit rule itself is
+                    // `randprotocol-core`'s to test.
+                    backings: vec![randprotocol_core::genesis::GenesisBacking { chain: 2, token: TOKEN, decimals: 8 }],
                 }],
             }),
             aggregation: None,

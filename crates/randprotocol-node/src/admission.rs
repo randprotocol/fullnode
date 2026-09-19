@@ -534,6 +534,16 @@ mod tests {
             // A token's mint authority is state — `SetAuthority` rotates it — so the very same
             // bytes are refused before that commits and accepted after it.
             tok(T::BadSignature),
+            // The release-unit verdicts (bridge-06/audit O-5). `NotReleasable` is the closest
+            // call in this whole function: the unit is `10^(8-decimals)` of a backing whose
+            // decimals never change once listed, so for a *listed* coin it really is a statement
+            // about the bytes. It stays out because a coin is not listed forever-or-never — a
+            // governance `AddBacking` lists a new one, and a burn naming a pair that is about to
+            // become a backing must not be refused for good by a node that saw it first.
+            // `BadBackingDecimals` is a listing's verdict, never a transaction's, and rides
+            // along on the same reasoning.
+            tok(T::NotReleasable { amount: 199, unit: 100 }),
+            tok(T::BadBackingDecimals(19)),
         ] {
             assert!(!is_permanent(&e), "{e} depends on state and must not be cached");
         }

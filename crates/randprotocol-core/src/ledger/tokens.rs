@@ -52,6 +52,17 @@ pub const MAX_DECIMALS: u8 = 9;
 pub const BRIDGE_DECIMALS: u8 = 8;
 /// Most source-chain coins one bridged token may be backed by (spec §12).
 pub const MAX_BACKINGS: usize = 32;
+/// The bridge attestation wire's own decimal precision (bridge-06/audit O-5): every amount
+/// crossing the wire, in either direction, is expressed at this many decimal places, whatever the
+/// source token declares. The same figure as [`BRIDGE_DECIMALS`] — normalizing a deposit to it and
+/// expressing a burn's release unit against it are the same fact — so this is that constant under
+/// the name the wire format's own rule is stated in.
+pub const WIRE_DECIMALS: u8 = BRIDGE_DECIMALS;
+/// Largest decimal count a backing's source token may declare. Chosen generously above every real
+/// ERC-20/SPL token in use (18 covers every EVM coin; Solana coins are typically 6-9): a listing
+/// past it is refused ([`TokenError::BadBackingDecimals`]) rather than accepted and silently
+/// unreleasable.
+pub const MAX_BACKING_DECIMALS: u8 = 18;
 
 /// One source-chain coin behind a bridged token, and how much of it that chain's contract is
 /// holding locked for this one (spec §12).
@@ -62,11 +73,48 @@ pub const MAX_BACKINGS: usize = 32;
 /// cover but that coin's own contract could not would succeed here and fail there, stranding the
 /// note's value. The sum of every `locked` of a token is exactly its
 /// [`TokenInfo::total_supply`] — [`TokenRegistry::backing_invariant_holds`].
+///
+/// `decimals` is the **source** token's own decimal count (bridge-06/audit O-5), 0..=
+/// [`MAX_BACKING_DECIMALS`] — not [`BRIDGE_DECIMALS`], which is what a bridged *token* is
+/// normalized to on this chain. The attestation wire always carries amounts at [`WIRE_DECIMALS`],
+/// so a source coin with fewer decimals releases in units of [`Backing::release_unit`] native
+/// tokens: USDT at 6 decimals releases `amount / 10^2`, and a burn that is not a whole number of
+/// those units would either strand value in custody (rounded down) or fail to release at all
+/// (below one unit) — [`TokenRegistry::check_release`] refuses both before any note is destroyed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Backing {
     pub chain: u16,
     pub token: [u8; 32],
+    pub decimals: u8,
     pub locked: u64,
+}
+
+impl Backing {
+    /// How many wire (8-decimal) units the source contract releases per native unit of this coin:
+    /// `10^(8 - decimals)` for a coin with fewer decimals than the wire, or `1` when it has 8 or
+    /// more (nothing to round — `decimals > 8` still releases one wire unit per native unit,
+    /// since the wire is never asked to express a fraction finer than its own precision).
+    ///
+    /// A burn must destroy a multiple of this ([`TokenRegistry::check_release`]): custody equals
+    /// `locked` exactly, at all times, only when nothing is ever asked to release a fraction of a
+    /// native unit.
+    pub fn release_unit(&self) -> u64 {
+        release_unit(self.decimals)
+    }
+}
+
+/// [`Backing::release_unit`] as a function of the decimals alone, for a caller that has a coin's
+/// declared precision but no [`Backing`] to hand — the wallet reads `decimals` off an
+/// `rand_getAssets` row and must derive the very same unit the ledger will, rather than write a
+/// second `10^(8-d)` that could drift from this one.
+///
+/// Never wraps: the exponent is at most [`WIRE_DECIMALS`], so the largest value is `10^8`.
+pub fn release_unit(decimals: u8) -> u64 {
+    if decimals < WIRE_DECIMALS {
+        10u64.pow((WIRE_DECIMALS - decimals) as u32)
+    } else {
+        1
+    }
 }
 
 /// Who may move a token's [`TokenInfo::total_supply`] and [`TokenInfo::mint_nonce`], in the
@@ -192,6 +240,18 @@ pub enum TokenError {
     TooManyBackings,
     #[error("a bridged token needs at least one backing")]
     NoBackings,
+    /// A backing's declared source-chain decimals is over [`MAX_BACKING_DECIMALS`] — not a
+    /// meaningful precision for any real coin, and unbounded decimals would make
+    /// [`Backing::release_unit`]'s `10^(8-d)` overflow for `d` deep enough below the wire's eight.
+    #[error("backing decimals {0} exceeds the maximum {MAX_BACKING_DECIMALS}")]
+    BadBackingDecimals(u8),
+    /// A burn (or the relayer fee carved out of it) is not a whole number of the backing's
+    /// [`Backing::release_unit`] — the source contract cannot release a fraction of a native
+    /// unit, so `amount` would either strand the remainder in custody or, below one unit, release
+    /// nothing at all (bridge-06/audit O-5). `amount` here is whichever of the burn's amount or
+    /// its relayer fee failed the check.
+    #[error("{amount} is not a multiple of the release unit {unit}")]
+    NotReleasable { amount: u64, unit: u64 },
 }
 
 impl TokenRegistry {
@@ -296,6 +356,9 @@ impl TokenRegistry {
                 }
                 let mut fresh: BTreeSet<(u16, [u8; 32])> = BTreeSet::new();
                 for b in &backings {
+                    if b.decimals > MAX_BACKING_DECIMALS {
+                        return Err(TokenError::BadBackingDecimals(b.decimals));
+                    }
                     let pair = (b.chain, b.token);
                     // Taken by another token, or named twice inside this one listing: the same
                     // collision either way, and the same refusal.
@@ -306,7 +369,7 @@ impl TokenRegistry {
                 MintAuthority::Bridge {
                     backings: backings
                         .into_iter()
-                        .map(|b| Backing { chain: b.chain, token: b.token, locked: 0 })
+                        .map(|b| Backing { chain: b.chain, token: b.token, decimals: b.decimals, locked: 0 })
                         .collect(),
                 }
             }
@@ -342,10 +405,15 @@ impl TokenRegistry {
 
     /// Adds a `(chain, token)` pair to a listed bridged token, unlocked (spec §12; Task 10's
     /// `AddBacking` governance message). The pair must be free across the whole registry, the
-    /// token must be bridged, and it must be under [`MAX_BACKINGS`].
+    /// token must be bridged, it must be under [`MAX_BACKINGS`], and `decimals` — the *source*
+    /// token's own decimal count — must be at most [`MAX_BACKING_DECIMALS`]
+    /// ([`TokenError::BadBackingDecimals`]).
     ///
     /// Nothing else can grow a backing set: a registration lists its own, and this adds one.
-    pub fn add_backing(&mut self, index: u32, chain: u16, token: [u8; 32]) -> Result<(), TokenError> {
+    pub fn add_backing(&mut self, index: u32, chain: u16, token: [u8; 32], decimals: u8) -> Result<(), TokenError> {
+        if decimals > MAX_BACKING_DECIMALS {
+            return Err(TokenError::BadBackingDecimals(decimals));
+        }
         if self.backing_of.contains_key(&(chain, token)) {
             return Err(TokenError::BackingTaken { chain });
         }
@@ -356,7 +424,7 @@ impl TokenRegistry {
         if backings.len() >= MAX_BACKINGS {
             return Err(TokenError::TooManyBackings);
         }
-        backings.push(Backing { chain, token, locked: 0 });
+        backings.push(Backing { chain, token, decimals, locked: 0 });
         self.backing_of.insert((chain, token), index);
         Ok(())
     }
@@ -412,24 +480,66 @@ impl TokenRegistry {
 
     /// A redemption: `locked -= amount` on the named backing and `total_supply -= amount` on the
     /// token. Refuses `amount > locked` with [`TokenError::InsufficientBacking`] — the token's
-    /// whole supply is not what bounds a burn, the coin being released is.
-    pub fn release(&mut self, index: u32, chain: u16, token: &[u8; 32], amount: u64) -> Result<(), TokenError> {
-        self.check_release(index, chain, token, amount)?;
+    /// whole supply is not what bounds a burn, the coin being released is — and refuses an
+    /// `amount`/`relayer_fee` that is not a whole number of the backing's release unit
+    /// ([`TokenError::NotReleasable`], bridge-06/audit O-5): see [`Self::check_release`].
+    pub fn release(
+        &mut self,
+        index: u32,
+        chain: u16,
+        token: &[u8; 32],
+        amount: u64,
+        relayer_fee: u64,
+    ) -> Result<(), TokenError> {
+        self.check_release(index, chain, token, amount, relayer_fee)?;
         self.move_backing(index, chain, token, amount, false);
         Ok(())
     }
 
-    /// Exactly what [`Self::release`] would refuse, without touching anything: the supply's
-    /// underflow (unreachable while the backing invariant holds, checked anyway), the pair being
-    /// a backing of this token, and `amount > locked`. The validate step of a `BridgeBurn` calls
-    /// this — through [`crate::bridge::BridgeState::check_burn`] — so its apply step cannot fail.
-    pub fn check_release(&self, index: u32, chain: u16, token: &[u8; 32], amount: u64) -> Result<(), TokenError> {
+    /// Exactly what [`Self::release`] would refuse, without touching anything — the **one** place
+    /// that decides every refusal of a burn, so `validate` (through
+    /// [`crate::bridge::BridgeState::check_burn`]) and `apply` (through [`Self::release`]) read
+    /// the very same verdict and cannot drift:
+    ///
+    /// 1. the pair being a backing of this token at all ([`TokenError::NotABacking`]);
+    /// 2. byte-cheap and state-independent past that point — `amount` and `relayer_fee` must both
+    ///    be a whole number of the backing's [`Backing::release_unit`]
+    ///    ([`TokenError::NotReleasable`]): the source contract releases in units of
+    ///    `10^(8 - decimals)` wire amounts, so anything else would either strand a remainder in
+    ///    custody forever or, below one unit, release nothing at all — the amendment this method
+    ///    exists for (bridge-06/audit O-5, "custody equals `locked`, exactly, at all times");
+    /// 3. `amount > locked` ([`TokenError::InsufficientBacking`]), the state-dependent check, run
+    ///    last;
+    /// 4. the supply's underflow (unreachable while the backing invariant holds, checked anyway).
+    ///
+    /// `relayer_fee` is checked here rather than ignored because the wire format releases it in
+    /// native units too — it is paid out of `amount` on the destination chain, not on top of it —
+    /// so a fee that is not a whole unit is exactly as unreleasable as an amount that is not one.
+    pub fn check_release(
+        &self,
+        index: u32,
+        chain: u16,
+        token: &[u8; 32],
+        amount: u64,
+        relayer_fee: u64,
+    ) -> Result<(), TokenError> {
         let info = self.by_index.get(&index).ok_or(TokenError::UnknownToken(index))?;
-        // The coin first, as in `check_lock`, and the token's supply last: while the backing
-        // invariant holds, `amount <= locked` implies `amount <= total_supply`, so the underflow
-        // below is unreachable — it is the defensive half of the pair, not the verdict a burn
-        // should ever read.
+        // The coin first, as in `check_lock`: a pair that does not back this token is a different
+        // mistake from an amount that does not fit, and naming the coin is the more useful of the
+        // two answers whenever both are true.
         let backing = self.backing(index, chain, token).ok_or(TokenError::NotABacking { index, chain })?;
+        let unit = backing.release_unit();
+        // Byte-cheap (a modulus against a decimals-derived constant that never changes for this
+        // backing) and ahead of the locked comparison, which is the state-dependent half.
+        if amount % unit != 0 {
+            return Err(TokenError::NotReleasable { amount, unit });
+        }
+        if relayer_fee % unit != 0 {
+            return Err(TokenError::NotReleasable { amount: relayer_fee, unit });
+        }
+        // The token's supply last: while the backing invariant holds, `amount <= locked` implies
+        // `amount <= total_supply`, so the underflow below is unreachable — it is the defensive
+        // half of the pair, not the verdict a burn should ever read.
         backing
             .locked
             .checked_sub(amount)
@@ -1242,7 +1352,19 @@ mod tests {
     /// A `Bridge` authority over `pairs`, every backing starting unlocked.
     fn bridge(pairs: &[(u16, [u8; 32])]) -> MintAuthority {
         MintAuthority::Bridge {
-            backings: pairs.iter().map(|&(chain, token)| Backing { chain, token, locked: 0 }).collect(),
+            backings: pairs
+                .iter()
+                .map(|&(chain, token)| Backing { chain, token, decimals: BRIDGE_DECIMALS, locked: 0 })
+                .collect(),
+        }
+    }
+
+    /// [`bridge`], with each pair's own source decimals instead of the wire's eight — for the
+    /// release-unit tests, where the whole point is that a coin's decimals differ from
+    /// [`BRIDGE_DECIMALS`].
+    fn bridge_decimals(pairs: &[(u16, [u8; 32], u8)]) -> MintAuthority {
+        MintAuthority::Bridge {
+            backings: pairs.iter().map(|&(chain, token, decimals)| Backing { chain, token, decimals, locked: 0 }).collect(),
         }
     }
 
@@ -1287,9 +1409,9 @@ mod tests {
             r.lock(i, chain, &token, amount).unwrap();
             assert!(r.backing_invariant_holds());
         }
-        r.release(i, 2, &[0xaa; 32], 400).unwrap();
+        r.release(i, 2, &[0xaa; 32], 400, 0).unwrap();
         assert!(r.backing_invariant_holds());
-        r.release(i, 3, &[0xcc; 32], 250).unwrap();
+        r.release(i, 3, &[0xcc; 32], 250, 0).unwrap();
         assert!(r.backing_invariant_holds());
         assert_eq!(r.get(i).unwrap().total_supply, 900 - 400 + 75);
         assert_eq!(r.backing(i, 3, &[0xcc; 32]).unwrap().locked, 0, "drained, still a backing");
@@ -1310,12 +1432,12 @@ mod tests {
         r.lock(i, USDT2.0, &USDT2.1, 1_000).unwrap();
         r.lock(i, USDC2.0, &USDC2.1, 100).unwrap();
         assert_eq!(
-            r.release(i, USDC2.0, &USDC2.1, 400),
+            r.release(i, USDC2.0, &USDC2.1, 400, 0),
             Err(TokenError::InsufficientBacking { locked: 100, amount: 400 }),
             "1 100 of supply, but only 100 USDC is locked"
         );
         assert_eq!(r.get(i).unwrap().total_supply, 1_100, "and a refused release moved nothing");
-        r.release(i, USDT2.0, &USDT2.1, 400).unwrap();
+        r.release(i, USDT2.0, &USDT2.1, 400, 0).unwrap();
         assert_eq!(r.get(i).unwrap().total_supply, 700);
         assert!(r.backing_invariant_holds());
     }
@@ -1329,13 +1451,132 @@ mod tests {
         let i = list_zusd(&mut r, &[USDT2, USDC2]);
         r.lock(i, USDT2.0, &USDT2.1, 100).unwrap();
         r.lock(i, USDC2.0, &USDC2.1, 900).unwrap();
-        r.release(i, USDT2.0, &USDT2.1, 60).unwrap();
+        r.release(i, USDT2.0, &USDT2.1, 60, 0).unwrap();
         assert_eq!(
-            r.release(i, USDT2.0, &USDT2.1, 60),
+            r.release(i, USDT2.0, &USDT2.1, 60, 0),
             Err(TokenError::InsufficientBacking { locked: 40, amount: 60 })
         );
         assert_eq!(r.get(i).unwrap().total_supply, 940);
         assert!(r.backing_invariant_holds());
+    }
+
+    // ── The release unit (bridge-06/audit O-5): a burn must be a whole number of it ───────────
+
+    /// A 6-decimal backing (USDT/USDC's real decimals on most chains) releases in units of 100
+    /// wire amounts (`10^(8-6)`): 199 leaves a remainder that would strand 99 in custody forever,
+    /// and 200 — exactly two units — is fine.
+    #[test]
+    fn a_burn_of_199_into_a_6_decimal_backing_is_not_releasable_and_200_succeeds() {
+        let mut r = reg();
+        let usdt6 = (2u16, [0xaa; 32], 6u8);
+        r.register(
+            bridged_asset_id("Rand USD", "zUSD", &[0x5a; 32]),
+            "Rand USD".into(),
+            "zUSD".into(),
+            BRIDGE_DECIMALS,
+            bridge_decimals(&[usdt6]),
+            0,
+        )
+        .unwrap();
+        r.lock(1, usdt6.0, &usdt6.1, 1_000).unwrap();
+        assert_eq!(r.backing(1, usdt6.0, &usdt6.1).unwrap().release_unit(), 100);
+        assert_eq!(
+            r.release(1, usdt6.0, &usdt6.1, 199, 0),
+            Err(TokenError::NotReleasable { amount: 199, unit: 100 })
+        );
+        assert_eq!(r.get(1).unwrap().total_supply, 1_000, "a refused release moved nothing");
+        r.release(1, usdt6.0, &usdt6.1, 200, 0).unwrap();
+        assert_eq!(r.get(1).unwrap().total_supply, 800);
+        assert!(r.backing_invariant_holds());
+    }
+
+    /// The relayer fee is released in native units too (it is carved out of `amount` on the
+    /// destination chain, not paid on top of it), so it is checked against the same unit: a fee
+    /// of 150 against a 100-unit backing is refused even though the amount itself (1 000) is a
+    /// clean multiple.
+    #[test]
+    fn a_relayer_fee_that_is_not_a_whole_unit_is_refused() {
+        let mut r = reg();
+        let usdt6 = (2u16, [0xaa; 32], 6u8);
+        r.register(
+            bridged_asset_id("Rand USD", "zUSD", &[0x5a; 32]),
+            "Rand USD".into(),
+            "zUSD".into(),
+            BRIDGE_DECIMALS,
+            bridge_decimals(&[usdt6]),
+            0,
+        )
+        .unwrap();
+        r.lock(1, usdt6.0, &usdt6.1, 10_000).unwrap();
+        assert_eq!(
+            r.release(1, usdt6.0, &usdt6.1, 1_000, 150),
+            Err(TokenError::NotReleasable { amount: 150, unit: 100 })
+        );
+        assert_eq!(r.get(1).unwrap().total_supply, 10_000, "still refused: nothing moved");
+        r.release(1, usdt6.0, &usdt6.1, 1_000, 100).unwrap();
+        assert_eq!(r.get(1).unwrap().total_supply, 9_000);
+    }
+
+    /// A backing at 18 decimals — at or above the wire's eight — has a release unit of 1: every
+    /// amount, however oddly shaped, is already a whole number of it.
+    #[test]
+    fn any_amount_into_an_18_decimal_backing_passes_the_unit_rule() {
+        let mut r = reg();
+        let dai18 = (3u16, [0xbb; 32], 18u8);
+        r.register(
+            bridged_asset_id("Rand USD", "zUSD", &[0x5a; 32]),
+            "Rand USD".into(),
+            "zUSD".into(),
+            BRIDGE_DECIMALS,
+            bridge_decimals(&[dai18]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(r.backing(1, dai18.0, &dai18.1).unwrap().release_unit(), 1);
+        r.lock(1, dai18.0, &dai18.1, 12_345_678).unwrap();
+        r.release(1, dai18.0, &dai18.1, 7, 3).unwrap();
+        assert_eq!(r.get(1).unwrap().total_supply, 12_345_671);
+    }
+
+    /// The unit itself, across the whole declarable range: `10^(8-d)` strictly below the wire's
+    /// eight decimals, and 1 at eight and above — where the wire is already at least as precise
+    /// as the coin and has no fraction to express. The largest value is `10^8`, so nothing here
+    /// can wrap a `u64`.
+    #[test]
+    fn the_release_unit_is_ten_to_the_shortfall_and_one_at_or_above_the_wire() {
+        for (decimals, unit) in
+            [(0u8, 100_000_000u64), (2, 1_000_000), (6, 100), (7, 10), (8, 1), (9, 1), (18, 1)]
+        {
+            assert_eq!(release_unit(decimals), unit, "{decimals} decimals");
+            assert_eq!(Backing { chain: 2, token: [0; 32], decimals, locked: 0 }.release_unit(), unit);
+        }
+        assert_eq!(release_unit(WIRE_DECIMALS), 1, "the wire's own precision needs no rounding");
+        assert_eq!(WIRE_DECIMALS, BRIDGE_DECIMALS, "one figure under two names");
+    }
+
+    /// Decimals over 18 are refused at the two places a backing is ever declared: a fresh
+    /// listing's [`TokenRegistry::register`] and a later [`TokenRegistry::add_backing`] — never
+    /// silently accepted and left unreleasable.
+    #[test]
+    fn decimals_over_18_are_refused_at_register_and_add_backing() {
+        let mut r = reg();
+        assert_eq!(
+            r.register(
+                bridged_asset_id("Rand USD", "zUSD", &[0x5a; 32]),
+                "Rand USD".into(),
+                "zUSD".into(),
+                BRIDGE_DECIMALS,
+                bridge_decimals(&[(2, [0xaa; 32], 19)]),
+                0,
+            ),
+            Err(TokenError::BadBackingDecimals(19))
+        );
+        assert!(r.is_empty(), "the whole listing is refused, not just the bad backing");
+        let i = list_zusd(&mut r, &[USDT2]);
+        assert_eq!(r.add_backing(i, 3, [0xcc; 32], 19), Err(TokenError::BadBackingDecimals(19)));
+        assert!(r.backing(i, 3, &[0xcc; 32]).is_none(), "nothing was added");
+        r.add_backing(i, 3, [0xcc; 32], 18).unwrap();
+        assert_eq!(r.backing(i, 3, &[0xcc; 32]).unwrap().decimals, 18);
     }
 
     /// A pair that backs nothing, and a pair that backs a *different* token, are both
@@ -1352,7 +1593,7 @@ mod tests {
             Err(TokenError::NotABacking { index: zusd, chain: 2 }),
             "USDC backs zEUR, not zUSD"
         );
-        assert_eq!(r.release(zusd, 9, &[0xff; 32], 1), Err(TokenError::NotABacking { index: zusd, chain: 9 }));
+        assert_eq!(r.release(zusd, 9, &[0xff; 32], 1, 0), Err(TokenError::NotABacking { index: zusd, chain: 9 }));
         assert!(r.backing(zusd, USDC2.0, &USDC2.1).is_none());
         assert_eq!(r.backing(other, USDC2.0, &USDC2.1).unwrap().locked, 0);
         // And the many-to-one map answers each pair with its own token.
@@ -1399,7 +1640,7 @@ mod tests {
         assert_eq!(list_zusd_result(&mut r, &many), Err(TokenError::TooManyBackings));
         assert_eq!(list_zusd_result(&mut r, &many[..MAX_BACKINGS]), Ok(1), "exactly the cap is fine");
         assert_eq!(
-            r.add_backing(1, 99, [99; 32]),
+            r.add_backing(1, 99, [99; 32], BRIDGE_DECIMALS),
             Err(TokenError::TooManyBackings),
             "and a token at the cap takes no more"
         );
@@ -1442,7 +1683,7 @@ mod tests {
         r.register(bridged_asset_id("Rand EUR", "zEUR", &[1; 32]), "Rand EUR".into(), "zEUR".into(), 8, bridge(&[(3, [1; 32])]), 0)
             .unwrap();
         r.register(id(5), "Native".into(), "NTV".into(), 9, MintAuthority::None, 0).unwrap();
-        r.add_backing(1, 4, [0xdd; 32]).unwrap();
+        r.add_backing(1, 4, [0xdd; 32], BRIDGE_DECIMALS).unwrap();
         let rebuilt: BTreeMap<(u16, [u8; 32]), u32> = r
             .iter()
             .flat_map(|info| match &info.authority {
@@ -1468,12 +1709,12 @@ mod tests {
         let mut r = reg();
         let i = list_zusd(&mut r, &[USDT2]);
         let n = r.register(id(5), "Native".into(), "NTV".into(), 9, MintAuthority::None, 0).unwrap();
-        r.add_backing(i, 4, [0xdd; 32]).unwrap();
+        r.add_backing(i, 4, [0xdd; 32], BRIDGE_DECIMALS).unwrap();
         assert_eq!(r.backing(i, 4, &[0xdd; 32]).unwrap().locked, 0);
         assert_eq!(r.bridged(4, &[0xdd; 32]).unwrap().index, i);
-        assert_eq!(r.add_backing(i, USDT2.0, USDT2.1), Err(TokenError::BackingTaken { chain: 2 }));
-        assert_eq!(r.add_backing(9, 6, [6; 32]), Err(TokenError::UnknownToken(9)));
-        assert_eq!(r.add_backing(n, 6, [6; 32]), Err(TokenError::AuthorityNotAllowed));
+        assert_eq!(r.add_backing(i, USDT2.0, USDT2.1, BRIDGE_DECIMALS), Err(TokenError::BackingTaken { chain: 2 }));
+        assert_eq!(r.add_backing(9, 6, [6; 32], BRIDGE_DECIMALS), Err(TokenError::UnknownToken(9)));
+        assert_eq!(r.add_backing(n, 6, [6; 32], BRIDGE_DECIMALS), Err(TokenError::AuthorityNotAllowed));
         assert!(r.backing_invariant_holds());
     }
 
@@ -1509,9 +1750,9 @@ mod tests {
         assert_eq!(r.get(i).unwrap().total_supply, u64::MAX);
         assert_eq!(r.backing(i, USDC2.0, &USDC2.1).unwrap().locked, 0, "a refused lock moved nothing");
         assert_eq!(r.lock(7, 2, &[0; 32], 1), Err(TokenError::UnknownToken(7)));
-        assert_eq!(r.release(7, 2, &[0; 32], 1), Err(TokenError::UnknownToken(7)));
-        r.release(i, USDT2.0, &USDT2.1, u64::MAX).unwrap();
-        assert_eq!(r.release(i, USDT2.0, &USDT2.1, 1), Err(TokenError::InsufficientBacking { locked: 0, amount: 1 }));
+        assert_eq!(r.release(7, 2, &[0; 32], 1, 0), Err(TokenError::UnknownToken(7)));
+        r.release(i, USDT2.0, &USDT2.1, u64::MAX, 0).unwrap();
+        assert_eq!(r.release(i, USDT2.0, &USDT2.1, 1, 0), Err(TokenError::InsufficientBacking { locked: 0, amount: 1 }));
         assert!(r.backing_invariant_holds());
     }
 
@@ -1525,7 +1766,7 @@ mod tests {
             "Rand USD".into(),
             "zUSD".into(),
             8,
-            MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], locked: 7 }] },
+            MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], decimals: BRIDGE_DECIMALS, locked: 7 }] },
             0,
         )
         .unwrap();
@@ -1844,7 +2085,7 @@ mod action_tests {
                 "Rand USD".into(),
                 "zUSD".into(),
                 BRIDGE_DECIMALS,
-                MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: USDT, locked: 0 }] },
+                MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: USDT, decimals: BRIDGE_DECIMALS, locked: 0 }] },
                 1,
             )
             .expect("a fresh listing");
@@ -1901,7 +2142,7 @@ mod action_tests {
     #[test]
     fn a_registration_may_not_choose_a_bridge_or_program_authority() {
         let l = ledger();
-        let bridge = MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], locked: 0 }] };
+        let bridge = MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], decimals: BRIDGE_DECIMALS, locked: 0 }] };
         for authority in [bridge, MintAuthority::Program(crate::crypto::Hash([5; 32]))] {
             let tx = register_tx(&l, authority.clone(), Some(initial(&l, 5)), 20);
             assert_eq!(l.validate(&tx, &StubExecutor), Err(tok(TokenError::AuthorityNotAllowed)), "{authority:?}");
@@ -2150,7 +2391,7 @@ mod action_tests {
                 "Rand USD".into(),
                 "zUSD".into(),
                 BRIDGE_DECIMALS,
-                MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], locked: 0 }] },
+                MintAuthority::Bridge { backings: vec![Backing { chain: 2, token: [0xaa; 32], decimals: BRIDGE_DECIMALS, locked: 0 }] },
                 1,
             )
             .unwrap();
@@ -2378,6 +2619,29 @@ mod action_tests {
         // And a burn of one likewise.
         let burn = burn_tx(&l, 9, 100, 50, |_| {});
         assert_eq!(l.validate(&burn, &StubExecutor), Err(tok(TokenError::UnknownToken(9))));
+    }
+
+    /// A `TokenBurn`'s asset bundle must be in the asset the action itself declares: the two-
+    /// bundle rule's first check ([`TxError::BurnAssetMismatch`]), shared with `TokenTransfer` and
+    /// `BridgeBurn` — this is `TokenBurn`'s own case of it. Refused on a comparison, before any
+    /// proof work: the bundle carries an unverifiable proof, so reaching verification would be
+    /// visible.
+    #[test]
+    fn a_token_burns_asset_bundle_must_match_the_actions_own_asset() {
+        let mut l = ledger();
+        let asset = register_keyed(&mut l, 20);
+        // A second, genuinely different token beside it — `register_keyed` registers one identity
+        // (the id binds the declaration, not the seed), so the other index is a listed one.
+        let other = list_bridged(&mut l, 1_000);
+        assert_ne!(asset, other);
+        let tx = burn_tx(&l, asset, 100, 50, |b| {
+            b.asset = other;
+            b.proof = vec![0xff; 16];
+        });
+        assert_eq!(
+            l.validate(&tx, &StubExecutor),
+            Err(TxError::BurnAssetMismatch { expected: asset, actual: other })
+        );
     }
 
     /// The fee is RAND and it is the *other* bundle's to pay: an asset bundle that also charged a

@@ -229,7 +229,7 @@ pub(super) fn apply(
             ledger
                 .tokens_mut()
                 .ok_or(TxError::Token(TokenError::Disabled))?
-                .release(*asset, *to_chain, token, *amount)
+                .release(*asset, *to_chain, token, *amount, *relayer_fee)
                 .map_err(|e| TxError::Bridge(BridgeError::Token(e)))?;
             Ok(())
         }
@@ -380,7 +380,7 @@ mod tests {
                     "zUSDT".into(),
                     8,
                     crate::ledger::tokens::MintAuthority::Bridge {
-                        backings: vec![crate::ledger::tokens::Backing { chain: 2, token, locked: 0 }],
+                        backings: vec![crate::ledger::tokens::Backing { chain: 2, token, decimals: 8, locked: 0 }],
                     },
                     0,
                 )
@@ -797,7 +797,7 @@ mod tests {
                 "zLATE".into(),
                 8,
                 crate::ledger::tokens::MintAuthority::Bridge {
-                    backings: vec![crate::ledger::tokens::Backing { chain: 2, token: UNLISTED_TOKEN, locked: 0 }],
+                    backings: vec![crate::ledger::tokens::Backing { chain: 2, token: UNLISTED_TOKEN, decimals: 8, locked: 0 }],
                 },
                 1,
             )
@@ -1059,8 +1059,8 @@ mod tests {
                 8,
                 crate::ledger::tokens::MintAuthority::Bridge {
                     backings: vec![
-                        crate::ledger::tokens::Backing { chain: 2, token: USDT, locked: 0 },
-                        crate::ledger::tokens::Backing { chain: 5, token: USDC, locked: 0 },
+                        crate::ledger::tokens::Backing { chain: 2, token: USDT, decimals: 8, locked: 0 },
+                        crate::ledger::tokens::Backing { chain: 5, token: USDC, decimals: 8, locked: 0 },
                     ],
                 },
                 0,

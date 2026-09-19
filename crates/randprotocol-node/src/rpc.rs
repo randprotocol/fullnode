@@ -682,19 +682,25 @@ fn attest_deposit(attestation: &[u8], tokens: Option<&TokenRegistry>) -> Option<
 }
 
 /// One *backing* as the asset registry serves it: the note's `asset` word, the wire identity
-/// guardians sign about (this coin's chain and token address), and how much of that coin its
-/// source contract is holding for this chain.
+/// guardians sign about (this coin's chain and token address), that coin's own **source**
+/// decimals, and how much of it its source contract is holding for this chain.
 ///
-/// The row shape is the one `rand_getAssets` has always had, plus `locked`. `asset_id` stays the
-/// **per-backing** id `rand_bridgeAssetId` computes — one row, one coin, one id — even though a
-/// bridged token's own registry id is now over its registration fields: a relayer matches a row
-/// by the id it derives from the two wire fields, and that is the id that answers.
+/// The row shape is the one `rand_getAssets` has always had, plus `locked` and `decimals`.
+/// `asset_id` stays the **per-backing** id `rand_bridgeAssetId` computes — one row, one coin, one
+/// id — even though a bridged token's own registry id is now over its registration fields: a
+/// relayer matches a row by the id it derives from the two wire fields, and that is the id that
+/// answers.
+///
+/// `decimals` is the source token's, never the bridged token's eight: it is what a burn's release
+/// unit (`10^(8-decimals)`) is derived from, and the wallet's pre-check reads it here so it can
+/// refuse an unreleasable amount before buying two bundle proofs (bridge-06/audit O-5).
 fn asset_json(index: u32, b: &Backing) -> Value {
     json!({
         "index": index,
         "chain": b.chain,
         "token": hex::encode(b.token),
         "asset_id": randprotocol_core::bridge::asset_id(b.chain, &b.token).to_hex(),
+        "decimals": b.decimals,
         "locked": b.locked,
     })
 }
@@ -3392,12 +3398,13 @@ mod tests {
 
         // The registry alone, which is what a wallet needs to read a note's `asset` word. Its
         // rows are the token registry's backings now — one per coin, in the shape they have
-        // always had plus the `locked` a burn is bounded by (spec §12). This fixture's one token
-        // has one coin, 1 000 deposited and 400 burned.
+        // always had plus the `locked` a burn is bounded by (spec §12) and the coin's own source
+        // `decimals`, which the wallet derives a burn's release unit from (bridge-06/audit O-5).
+        // This fixture's one token has one coin, 1 000 deposited and 400 burned.
         let asset = randprotocol_core::bridge::asset_id(2, &fixtures::TOKEN);
         let row = json!({
             "index": 1, "chain": 2, "token": hex::encode(fixtures::TOKEN), "asset_id": asset.to_hex(),
-            "locked": 600,
+            "decimals": 8, "locked": 600,
         });
         assert_eq!(ok(&st, "rand_getAssets", json!([])).await, json!([row]));
         assert_eq!(v["assets"], json!([row]));

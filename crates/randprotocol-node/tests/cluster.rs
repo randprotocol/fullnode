@@ -204,7 +204,13 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
                 name: "Tether USD".into(),
                 symbol: "zUSDT".into(),
                 salt: [0x5a; 32],
-                backings: vec![randprotocol_core::genesis::GenesisBacking { chain: TOKEN_CHAIN, token: TOKEN }],
+                // Eight decimals — the wire's own — so this coin's release unit is 1 and the burn
+                // amounts these tests use need no rounding.
+                backings: vec![randprotocol_core::genesis::GenesisBacking {
+                    chain: TOKEN_CHAIN,
+                    token: TOKEN,
+                    decimals: 8,
+                }],
             }],
         }),
         bridge,

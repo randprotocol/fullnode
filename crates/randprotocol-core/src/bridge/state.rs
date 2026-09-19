@@ -576,9 +576,10 @@ impl BridgeState {
         if amount == 0 {
             return Err(BridgeError::ZeroAmount);
         }
-        // The coin: it must back *this* token, and hold what is being redeemed. Exactly what
-        // `TokenRegistry::release` would refuse, so the ledger's apply step cannot.
-        tokens.check_release(asset_index, to_chain, token, amount)?;
+        // The coin: it must back *this* token, hold what is being redeemed, and release a whole
+        // number of native units of `amount` and of `relayer_fee` (bridge-06/audit O-5) — exactly
+        // what `TokenRegistry::release` would refuse, so the ledger's apply step cannot.
+        tokens.check_release(asset_index, to_chain, token, amount, relayer_fee)?;
         Ok(())
     }
 
@@ -809,7 +810,7 @@ mod tests {
                 MintAuthority::Bridge {
                     backings: pairs
                         .iter()
-                        .map(|&(chain, token)| crate::ledger::tokens::Backing { chain, token, locked: 0 })
+                        .map(|&(chain, token)| crate::ledger::tokens::Backing { chain, token, decimals: 8, locked: 0 })
                         .collect(),
                 },
                 0,
@@ -1427,6 +1428,68 @@ mod tests {
         );
         assert_eq!(st.burn_sequence, 0);
         assert!(st.burns.is_empty());
+    }
+
+    /// The three things bridge-06's guardian signer checks before it will sign an outbound
+    /// transfer — asserted on the body this chain actually emits, because a body that fails any
+    /// of them is a burn whose value nobody can ever release:
+    ///
+    /// 1. `token_chain == to_chain`. The signer refuses to release a coin on a chain that is not
+    ///    the coin's own. A RandProtocol burn is always a redemption of one of the token's
+    ///    backings, so [`BridgeState::apply_burn`] builds both fields from the one backing the
+    ///    burner chose and the two are equal by construction rather than by a later check.
+    /// 2. `emitter_address` is the genesis `bridge.emitter`, the single address the guardians
+    ///    watch — a body from anywhere else is not this chain's.
+    /// 3. On the EVM-family chains (2, 3, 4), the upper 12 bytes of **both** `to` and
+    ///    `token_address` are zero: each is a 20-byte address left-padded to 32, and
+    ///    `RandBridgeBase` reverts on either. `to` is this chain's own rule, refused in validate
+    ///    (`check_burn`, asserted below as well as in
+    ///    `burn_rejects_zero_and_wrongly_shaped_recipients`); `token_address` comes from the
+    ///    genesis listing, which is why this fixture uses chain 14's real Ethereum USDT address
+    ///    rather than a synthetic one — a listing that got it wrong is a genesis mistake, not a
+    ///    per-burn one.
+    #[test]
+    fn the_outbound_burn_body_satisfies_the_guardians_signing_policy() {
+        // Ethereum USDT and Solana USDT, verbatim from `chain14-zusd-backings.md`, behind one
+        // zUSD — the real shape the policy is checked against.
+        let eth_usdt: [u8; 32] = hex::decode("000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let sol_usdt: [u8; 32] = hex::decode("ce010e60afedb22717bd63192f54145a3f965a33bb82d2c7029eb2ce1e208264")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let (c, _) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        let mut tk = tokens();
+        let zusd = list_backed_by(&mut tk, 0x5a, &[(2, eth_usdt), (5, sol_usdt)]);
+        tk.lock(zusd, 2, &eth_usdt, 1_000_000).unwrap();
+        tk.lock(zusd, 5, &sol_usdt, 1_000_000).unwrap();
+
+        // Each backing in turn: the chain-2 coin to an EVM recipient, the chain-5 coin to a full
+        // 32-byte Solana pubkey.
+        for (to_chain, token, to) in [(2u16, eth_usdt, EVM_TO), (5, sol_usdt, [0x22u8; 32])] {
+            let rec = st.apply_burn(&tk, Hash::ZERO, zusd, 100, to_chain, token, to, 0, 1, 1_700).unwrap();
+            let body = Body::decode(&rec.body).unwrap();
+            assert_eq!(body.emitter_address, c.emitter, "the one emitter the guardians watch");
+            assert_eq!(body.emitter_chain, CHAIN_RAND);
+            let Payload::Transfer(t) = Payload::decode(&body.payload).unwrap() else { panic!("a transfer") };
+            assert_eq!(t.token_chain, t.to_chain, "the coin is released on the chain it is sent to");
+            assert_eq!(t.to_chain, to_chain);
+            assert_eq!(t.token_address, token, "the backing the burner chose, not a second lookup");
+            if matches!(to_chain, 2 | 3 | 4) {
+                assert_eq!(t.to[..12], [0u8; 12], "a left-padded 20-byte recipient");
+                assert_eq!(t.token_address[..12], [0u8; 12], "and a left-padded 20-byte token");
+            }
+        }
+
+        // And the `to` half of rule 3 is a refusal, not only a property of well-formed burns: an
+        // address with a dirty upper half never reaches a body at all.
+        let mut dirty = EVM_TO;
+        dirty[0] = 1;
+        assert_eq!(st.check_burn(&tk, zusd, 100, 2, &eth_usdt, &dirty, 0).unwrap_err(), BridgeError::BadRecipient);
+        assert_eq!(st.burn_sequence, 2, "and the two well-formed burns are all that were recorded");
     }
 
     /// Golden vector for the spec 6.3 commitment. Changing this hash changes
