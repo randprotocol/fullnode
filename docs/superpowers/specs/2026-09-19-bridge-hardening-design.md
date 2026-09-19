@@ -37,7 +37,7 @@ redeem it against real custody. Three layers close that, each independent of the
     (not permanent). **Burns stay open** — a pause must never trap redemption. Rotations (payload 2)
     stay admissible too.
   - The pause key must be held somewhere other than the machine that holds the guardian keys.
-- **RPC.** `rand_getBridgeState` gains `paused`, `pause_nonce`, `pause_key` (hex); asset rows gain
+- **RPC.** `rand_getBridgeState` gains `mint_paused: bool`, `pause_nonce`, `list_nonce`, `pause_key` (hex); asset rows gain
   `mint_cap_per_day`, `minted_today`, `mint_day`.
 
 ## 3. B2 — a forward bound on block timestamps
@@ -90,16 +90,18 @@ operators' hosts by the bridge session) and `pause_key`; `tokens` = zUSD with it
 
 ## 7. B4 — listing after genesis by the PQ guardian quorum (user, 2026-09-19)
 
-A new bundle-less action `ListBacking { token_index, chain, token: [u8; 32], decimals, nonce,
-pq_signatures }` adds a backing to an existing bridged token — or, with `token_index` = the next
-index plus `name`/`symbol`/`salt`, registers a new bridged token with its first backing (one action,
-two shapes; pick the simpler encoding in the plan). Authorised by a **PQ guardian quorum** (B3's set
-and five rules) over the Rand-only message
-`b"rand-bridge-pq-list-1" ‖ chain_id (u64 BE) ‖ nonce (u64 BE) ‖ bincode(the action minus signatures)`,
-with its own ledger counter `list_nonce`. The same checks as a genesis listing apply (chain has a
-registered emitter; `(chain, token)` backs nothing yet; 1..=32 backings; decimals ≤ 18); the new
-backing starts with `locked = 0` and the token's `mint_cap_per_day`. No codec, wire or endpoint change —
-this replaces the deferred guardian payload id 3 (RPL plan Task 10). The source endpoint must still
+Two new bundle-less actions, each authorised by a **PQ guardian quorum** (B3's set and five rules):
+- `ListBacking { token_index: u32, chain: u16, token: [u8; 32], decimals: u8, nonce: u64, pq_signatures }`
+  adds a backing to an existing bridged token.
+- `RegisterBridgedToken { name, symbol, salt: [u8; 32], chain: u16, token: [u8; 32], decimals: u8,
+  nonce: u64, pq_signatures }` registers a new bridged token (8 decimals on Rand, the genesis token's
+  `mint_cap_per_day`) with its first backing, at the next index.
+Both share the ledger counter `list_nonce` (a message's nonce must equal it; incremented on acceptance).
+The same checks as a genesis listing apply (the chain has a registered emitter; `(chain, token)` backs
+nothing yet; 1..=32 backings; source decimals ≤ 18; name/symbol rules); a new backing starts with
+`locked = 0`. **Operational order: list on Rand FIRST, `setToken` on the endpoint SECOND** — the other
+order lets a lock succeed on the endpoint whose attestation Rand refuses `UnlistedToken` (funds safe in
+custody but stuck until listed). No codec, wire or endpoint change — this replaces the deferred guardian payload id 3 (RPL plan Task 10). The source endpoint must still
 `setToken` the coin separately; an attestation for a coin listed on one side only is refused on
 Rand (`UnlistedToken`) or reverts on the endpoint (`TokenDisabled`).
 
@@ -110,3 +112,29 @@ A token's asset id gets a checksummed text form: **bech32m** with HRP `rpl` over
 index, 64 hex, or `rpl1…`; returns `id_text`), `rand_getTokens` rows, the `rand token` CLI, randscan's
 token pages, genesis docs. Parsing refuses a bad checksum, a wrong HRP, a wrong length and mixed case.
 Hex stays accepted as input. Test vectors: a fixed asset id ↔ its `rpl1…` string, and each refusal.
+
+## 9. Governance message layouts — FIXED bytes, never bincode (agreed with the bridge session)
+
+All integers big-endian, no length prefixes except where stated; these are what an auditor or a
+hardware signer reproduces by hand, so they are pinned byte for byte and each gets test vectors in the
+bridge repo's vector file format:
+
+```
+M_pause    = b"rand-bridge-pause-1"         ‖ chain_id u64 ‖ nonce u64                     (the ONE genesis pause key)
+M_unpause  = b"rand-bridge-pq-unpause-1"    ‖ chain_id u64 ‖ nonce u64                     (PQ guardian quorum)
+M_list     = b"rand-bridge-pq-list-1"       ‖ chain_id u64 ‖ nonce u64 ‖ token_index u32 ‖ chain u16 ‖ token [32] ‖ decimals u8
+M_register = b"rand-bridge-pq-register-1"   ‖ chain_id u64 ‖ nonce u64 ‖ u8 len ‖ name ‖ u8 len ‖ symbol ‖ salt [32] ‖ chain u16 ‖ token [32] ‖ decimals u8
+```
+`M_pause`/`M_unpause` use `pause_nonce`; `M_list`/`M_register` use `list_nonce`. This supersedes the
+bincode tail written in §7's first draft.
+
+## 10. The mint co-signature, as the bridge repo ships it (bridge `80459a3`)
+
+`vectors/pq-cosignatures.json` (rand_chain_id 99, quorum 5, six test guardians with
+`seed_i = keccak256("rand-bridge-pq-test-guardian" ‖ u8(i))`): nine attestation bodies with all six
+co-signatures, and cases with expected verdicts. **The refusal order the cases assume, and B3 must
+implement: count (PqNoQuorum) → index order (PqIndexOrder) → index range (PqIndexOutOfRange) → every
+length (PqBadSignatureLength) → every verification (PqBadSignature).** Guardians co-sign only bodies
+with `to_chain == 1`; the relayer files each co-signature under its guardian's ECDSA index, keeps the
+lowest quorum and runs `rand bridge-mint @att.hex --pq @pq.json --to <addr>` with
+`pq.json = [{"index":0,"signature":"<4840 hex>"},…]`.
