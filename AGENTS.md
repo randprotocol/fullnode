@@ -153,7 +153,13 @@ live on chain 12, **both also live on chain 13** (faucet on, chain 12's validato
   blocking pool; at most `MAX_CONCURRENT_WITNESS_BUILDS` (2) run at once per process, and a
   request that waits more than 10 s is refused `-32000` busy. PRIV-1 (the operator learns which
   leaves a wallet spends) stays open: the fix is wallet-side witnesses.
-Still open from the audit's work order: AGG-2 (bind the aggregator before the production batch
+**Re-verified against code 2026-09-20; the remediation plan is
+`docs/superpowers/plans/2026-09-20-audit-v3-v0.6.md` (branch `feat/audit-v3-fixes`, tag v0.6
+after the full suite).** It adds one finding the audit does not list: AGG-6, the genesis
+`aggregate_program_digest` pin is only checked non-zero and never compared with the build. VK-1
+is worse than reported: the scan holds the viewing registry's write lock while `publish_status`
+takes a blocking read on the node loop, so a long scan stalls consensus.
+Still open from the audit's work order (as of the audit): AGG-2 (bind the aggregator before the production batch
 pins the digest), AGG-4/AGG-3, CON-1a/1b + SYNC-1 (the commit rule on the sync path), VK-1/2/3,
 BRG-7's forward timestamp bound, and decisions D1–D13.
 
