@@ -10,9 +10,10 @@
 //!   claim — the ledger recomputes that digest with `bad = 0` and refuses the bundle. Where the
 //!   check is a taint, the published digest is asserted to be exactly the claimed plaintext's
 //!   `bad = 1` digest (the taint and nothing else moved it). One honest proof is the control.
-//! - **A mutation fuzz** (`mutation_fuzz_*`, emulator only, seconds): random honest witnesses of
+//! - **A mutation fuzz** (`mutation_fuzz_*`, emulator only, ~60 s): random honest witnesses of
 //!   every shape, each mutated — one word anywhere in the 1 204-word private input, two words, an
-//!   amount moved between fields, a whole slot copied over another, two output-side terms of one
+//!   amount moved between fields, a whole slot copied over another, two input slots swapped (a real
+//!   note moved into the other asset group, membership intact), two output-side terms of one
 //!   group pushed into `[2^62, 2^63)` — optionally rebalanced so the conservation sums do not
 //!   mask the other checks. Every run is compared with an independent
 //!   host model of spec §3.3 (`model`): the guest must publish exactly the honest digest of the
@@ -24,14 +25,15 @@
 //! Node-local, not vendored (`deploy/sync-zkvm.sh` excludes it, like `tests/hidden_bundle.rs`).
 //!
 //! Running: the real proofs are told apart by name. Fast only (the fuzz and the emulator
-//! companions, seconds):
+//! companions, ~60 s in `--release`):
 //!
 //! ```text
 //! cargo test --release -p randprotocol-zkvm --test hidden_cheating -- --skip real_proof_
 //! ```
 //!
-//! The real proofs only (nine, ~15 min; they take this file's `PROVING` lock, so they run one at a
-//! time even without `--test-threads=1`):
+//! The real proofs only (thirteen, ~22 min). Each takes the workspace proving slot — the file
+//! lock `<target-dir>/tmp/rand-proving-slot.lock` the node and client test binaries take — so they
+//! run one at a time, within this binary and against every other session's proofs:
 //!
 //! ```text
 //! cargo test --release -p randprotocol-zkvm --test hidden_cheating real_proof_
@@ -57,8 +59,39 @@ const MAX_CYCLES: usize = 1 << 20;
 const BIG: u64 = 1 << 63;
 
 /// One real proof at a time in this binary (~5.7 GB each): the default `cargo test` runs tests
-/// on parallel threads, and nine concurrent Production proofs would not fit a shared machine.
+/// on parallel threads, and thirteen concurrent Production proofs would not fit a shared machine.
+/// Taken before the file lock below, so this binary's own tests queue here rather than each
+/// holding a descriptor on the lock file.
 static PROVING: Mutex<()> = Mutex::new(());
+
+/// The workspace's proving slot: the same lock file `crates/randprotocol-node/tests/proving_slot/`
+/// and its client twin take (`CARGO_TARGET_TMPDIR` is `<target-dir>/tmp`, one directory for every
+/// crate), so a proof here never runs beside another session's bundle proofs. The only thing
+/// this copy must agree on with those two is the path. The kernel drops the lock when the process
+/// exits, so a killed run frees the slot.
+struct ProvingSlot(std::fs::File);
+
+impl Drop for ProvingSlot {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn proving_slot() -> ProvingSlot {
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("rand-proving-slot.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("opening the proving slot at {}: {e}", path.display()));
+    let started = std::time::Instant::now();
+    file.lock().expect("taking the proving slot");
+    if started.elapsed() > std::time::Duration::from_secs(1) {
+        println!("waited {:.1?} for the proving slot", started.elapsed());
+    }
+    ProvingSlot(file)
+}
 
 // ───────────────────────────── a seeded RNG ─────────────────────────────
 
@@ -172,7 +205,15 @@ impl Case {
 }
 
 fn emulate(inputs: &[u32]) -> Word8 {
-    execute(ZkExecutor::hidden_bundle_program(), inputs, &BINDING_A, MAX_CYCLES).unwrap().outputs
+    emulate_or(inputs, || "emulating a fixed witness".into())
+}
+
+/// `emulate`, naming the run in the panic if the guest traps (a fuzz run: seed, base, mutation).
+fn emulate_or(inputs: &[u32], ctx: impl FnOnce() -> String) -> Word8 {
+    match execute(ZkExecutor::hidden_bundle_program(), inputs, &BINDING_A, MAX_CYCLES) {
+        Ok(exec) => exec.outputs,
+        Err(e) => panic!("{}: the guest trapped instead of tainting: {e:?}", ctx()),
+    }
 }
 
 /// The claimed plaintext's digest with the guest's `bad` word set — what a tainted run publishes.
@@ -248,7 +289,7 @@ fn model(v: &[u32]) -> Model {
                 fails.push("membership: root != anchor");
             }
             if note.asset != slot_asset(k, a) {
-                fails.push("input asset != slot asset");
+                fails.push(if k < 2 { "input asset != slot asset (A slot)" } else { "input asset != slot asset (R slot)" });
             }
         }
         nullifiers[k] = vk.nullifier(&cm);
@@ -302,7 +343,8 @@ fn model(v: &[u32]) -> Model {
 /// binding, the verifier reads back the digest the prover reported, and that digest is the
 /// emulator's. Returns the published digest.
 fn prove_and_verify(inputs: &[u32], what: &str) -> Word8 {
-    let _slot = PROVING.lock().unwrap_or_else(|e| e.into_inner());
+    let _in_binary = PROVING.lock().unwrap_or_else(|e| e.into_inner());
+    let _slot = proving_slot();
     let started = std::time::Instant::now();
     let (proof, digest, tier) = prove_hidden_bundle(FriProfile::Production, inputs, &BINDING_A, Backend::Cpu)
         .unwrap_or_else(|e| panic!("{what}: the guest must taint, not trap — no proof: {e}"));
@@ -363,8 +405,45 @@ fn real_proof_value_moved_from_an_a_slot_into_an_r_slot() {
 #[test]
 fn real_proof_an_a_slot_input_of_another_asset() {
     let c = Case::new(3, [In::Real(500, TOKEN + 1), In::Real(300, TOKEN), In::Real(1_000, 0), In::Real(50, 0)], [600, 200, 900, 140], 10, 0, 0, TOKEN);
-    assert_eq!(model(&c.inputs()).fails, ["input asset != slot asset"]);
+    assert_eq!(model(&c.inputs()).fails, ["input asset != slot asset (A slot)"]);
     assert_real_proof_taints(&c.inputs(), &c.claimed(), "A-slot input of another asset");
+}
+
+/// A real token note (TOKEN, the bundle's own `A`) spent in R slot 2 and counted as RAND: the note
+/// is in the tree, its nullifier is unique and both sums balance, so the R-slot asset check (the
+/// note's asset against the guest-zeroed word) alone fires — spec §6's "an R-slot input whose
+/// asset is not 0".
+#[test]
+fn real_proof_an_r_slot_input_whose_asset_is_not_0() {
+    let c = Case::new(13, [In::Real(500, TOKEN), In::Real(300, TOKEN), In::Real(1_000, TOKEN), In::Real(50, 0)], [600, 200, 900, 140], 10, 0, 0, TOKEN);
+    assert_eq!(model(&c.inputs()).fails, ["input asset != slot asset (R slot)"]);
+    assert_real_proof_taints(&c.inputs(), &c.claimed(), "R-slot input of the token");
+}
+
+/// The reverse of the A -> R case: RAND in, token out — 100 RAND disappear from group R and
+/// reappear as 100 of the token. Both groups' comparisons fail.
+#[test]
+fn real_proof_value_moved_from_an_r_slot_into_an_a_slot() {
+    let c = Case::new(14, [In::Real(500, TOKEN), In::Real(300, TOKEN), In::Real(1_000, 0), In::Real(50, 0)], [700, 200, 800, 140], 10, 0, 0, TOKEN);
+    assert_eq!(model(&c.inputs()).fails, ["asset-A conservation", "RAND conservation"]);
+    assert_real_proof_taints(&c.inputs(), &c.claimed(), "value R -> A");
+}
+
+/// Group A mints one unit of the token and group R balances: only the asset-A comparison fires, so
+/// this proof is what stands if that comparison alone were removed (a cross-group move trips both).
+#[test]
+fn real_proof_group_a_alone_mints_one() {
+    let c = Case::new(15, [In::Real(500, TOKEN), In::Real(300, TOKEN), In::Real(1_000, 0), In::Real(50, 0)], [601, 200, 900, 140], 10, 0, 0, TOKEN);
+    assert_eq!(model(&c.inputs()).fails, ["asset-A conservation"]);
+    assert_real_proof_taints(&c.inputs(), &c.claimed(), "group A mints one");
+}
+
+/// Group R mints one RAND and group A balances: only the RAND comparison fires.
+#[test]
+fn real_proof_group_r_alone_mints_one() {
+    let c = Case::new(16, [In::Real(500, TOKEN), In::Real(300, TOKEN), In::Real(1_000, 0), In::Real(50, 0)], [600, 200, 900, 141], 10, 0, 0, TOKEN);
+    assert_eq!(model(&c.inputs()).fails, ["RAND conservation"]);
+    assert_real_proof_taints(&c.inputs(), &c.claimed(), "group R mints one");
 }
 
 /// A dummy slot (a note never in the tree) claiming value that its group's first output absorbs,
@@ -458,6 +537,10 @@ fn real_proof_a_burn_claiming_another_asset() {
     let digest = prove_and_verify(&c.inputs(), "burn naming another asset");
     assert_eq!(c.claimed().burn_asset, TOKEN);
     assert_eq!(digest, hidden::hidden_bundle_digest(&c.claimed()), "the true plaintext");
+    // What pins the mask is the equality just above (the published digest is the honest digest of
+    // the plaintext with burn_asset = A) together with the control: the loop below holds for any
+    // guest whatsoever — two different preimages hash apart — so it only states what a forged
+    // claim meets on the ledger, it is not the evidence.
     for forged in [0, TOKEN + 1] {
         let claim = HiddenDigestInput { burn_asset: forged, ..c.claimed() };
         let recomputed = hidden::hidden_bundle_digest(&claim);
@@ -470,7 +553,7 @@ fn real_proof_a_burn_claiming_another_asset() {
     let mut v = c.inputs();
     v[hi::ASSET_A] = TOKEN + 1;
     let m = model(&v);
-    assert_eq!(m.fails, ["input asset != slot asset"]);
+    assert_eq!(m.fails, ["input asset != slot asset (A slot)"]);
     assert_eq!(m.claimed.burn_asset, TOKEN + 1);
     assert_eq!(emulate(&v), tainted(&m.claimed));
 }
@@ -600,7 +683,7 @@ fn rebalance(v: &mut [u32]) {
 
 /// One mutation of an honest vector, described for a failure message.
 fn mutate(rng: &mut Rng, v: &mut [u32], non_path: &[usize]) -> String {
-    let what = match rng.below(12) {
+    let what = match rng.below(13) {
         // One word anywhere in the whole private input.
         0..=2 => {
             let i = rng.below(hi::COUNT as u64) as usize;
@@ -611,7 +694,7 @@ fn mutate(rng: &mut Rng, v: &mut [u32], non_path: &[usize]) -> String {
             let i = non_path[rng.below(non_path.len() as u64) as usize];
             mutate_word(rng, v, i)
         }
-        // Two words anywhere.
+        // Two words: one anywhere, one that is not a path word.
         6 => {
             let (i, j) = (rng.below(hi::COUNT as u64) as usize, non_path[rng.below(non_path.len() as u64) as usize]);
             format!("{}; {}", mutate_word(rng, v, i), mutate_word(rng, v, j))
@@ -653,7 +736,7 @@ fn mutate(rng: &mut Rng, v: &mut [u32], non_path: &[usize]) -> String {
         // Two output-side terms of one group set in `[2^62, 2^63)`, then the group's first
         // output rebalanced (wrapping): every term stays below 2^63, the sum wraps past 2^64 to
         // exactly the inputs' total — the carry check alone stands in the way.
-        _ => {
+        10 => {
             let f = amount_fields();
             let (first, others): (usize, &[usize]) = if rng.chance(50) { (4, &[5, 9]) } else { (6, &[7, 8, 10]) };
             let mut picked = others.to_vec();
@@ -666,6 +749,38 @@ fn mutate(rng: &mut Rng, v: &mut [u32], non_path: &[usize]) -> String {
             rebalance(v);
             return format!("fields {picked:?} set in [2^62, 2^63), field {first} rebalanced");
         }
+        // Two input slots swapped, whole (note, path, index): every real note keeps its
+        // membership and every nullifier stays distinct, but a note that crosses between slots
+        // 0–1 and 2–3 now sits in the other asset group — with `A != 0`, a token note in an R
+        // slot or a RAND note in an A slot, which only the per-slot asset check stops. Usually
+        // then re-split so both groups balance with every term small (each group's whole input
+        // to its first output, the fee kept when it fits), so no other check fires.
+        _ => {
+            let i = rng.below(4) as usize;
+            let j = (i + 1 + rng.below(3) as usize) % 4;
+            let (bi, bj) = (hi::in_slot(i), hi::in_slot(j));
+            let (si, sj): (Vec<u32>, Vec<u32>) = (v[bi..bi + hi::IN_SLOT_WORDS].to_vec(), v[bj..bj + hi::IN_SLOT_WORDS].to_vec());
+            v[bi..bi + hi::IN_SLOT_WORDS].copy_from_slice(&sj);
+            v[bj..bj + hi::IN_SLOT_WORDS].copy_from_slice(&si);
+            let what = format!("input slots {i} and {j} swapped");
+            match rng.below(4) {
+                0 => return what,
+                1 => {
+                    rebalance(v);
+                    return format!("{what}, then rebalanced");
+                }
+                _ => {
+                    let f = amount_fields();
+                    let get = |v: &[u32], n: usize| u64_at(v, f[n].0, f[n].1);
+                    let (a_in, r_in) = (get(v, 0).wrapping_add(get(v, 1)), get(v, 2).wrapping_add(get(v, 3)));
+                    let fee = if get(v, 8) <= r_in { get(v, 8) } else { 0 };
+                    for (n, x) in [(4, a_in), (5, 0), (9, 0), (6, r_in - fee), (7, 0), (8, fee), (10, 0)] {
+                        set_u64(v, f[n], x);
+                    }
+                    return format!("{what}, then re-split (each group's input to its first output)");
+                }
+            }
+        }
     };
     if rng.chance(50) {
         rebalance(v);
@@ -675,24 +790,30 @@ fn mutate(rng: &mut Rng, v: &mut [u32], non_path: &[usize]) -> String {
     }
 }
 
-/// The fuzz itself; returns (valid runs, tainted runs, how many runs failed each check).
-fn run_fuzz(seed: u64, bases: usize, per_base: usize) -> (usize, usize, std::collections::BTreeMap<&'static str, usize>) {
+/// Per-check run counts, keyed by the model's label.
+type Counts = std::collections::BTreeMap<&'static str, usize>;
+
+/// The fuzz itself; returns (valid runs, tainted runs, how many runs failed each check, how many
+/// failed that check *and no other* — the runs where it alone stood between the witness and an
+/// honest digest).
+fn run_fuzz(seed: u64, bases: usize, per_base: usize) -> (usize, usize, Counts, Counts) {
     let mut rng = Rng(seed);
     let non_path = non_path_words();
     let (mut valid, mut tainted_runs) = (0, 0);
-    let mut by_check = std::collections::BTreeMap::new();
+    let mut by_check = Counts::new();
+    let mut alone = Counts::new();
     for base in 0..bases {
         let c = random_honest(&mut rng);
         let honest = c.inputs();
         let m = model(&honest);
         assert!(m.fails.is_empty(), "seed {seed:#x}, base {base}: the generator built a dishonest witness: {:?}", m.fails);
         assert_eq!(m.claimed, c.claimed(), "seed {seed:#x}, base {base}: the model reads another plaintext than the builder wrote");
-        assert_eq!(emulate(&honest), hidden::hidden_bundle_digest(&m.claimed), "seed {seed:#x}, base {base}: an honest witness did not publish its honest digest");
+        assert_eq!(emulate_or(&honest, || format!("seed {seed:#x}, base {base}, honest")), hidden::hidden_bundle_digest(&m.claimed), "seed {seed:#x}, base {base}: an honest witness did not publish its honest digest");
         for n in 0..per_base {
             let mut v = honest.clone();
             let what = mutate(&mut rng, &mut v, &non_path);
             let m = model(&v);
-            let out = emulate(&v);
+            let out = emulate_or(&v, || format!("seed {seed:#x} (HIDDEN_FUZZ_SEED), base {base}, mutation {n}: {what}"));
             let expected = m.expected();
             assert_eq!(
                 out, expected,
@@ -709,15 +830,17 @@ fn run_fuzz(seed: u64, bases: usize, per_base: usize) -> (usize, usize, std::col
                 // publishes the honest digest of the plaintext it would claim.
                 assert_ne!(out, hidden::hidden_bundle_digest(&m.claimed), "seed {seed:#x}, base {base}, mutation {n}: {what}");
                 tainted_runs += 1;
-                let mut seen = m.fails.clone();
-                seen.dedup();
+                let seen: std::collections::BTreeSet<&'static str> = m.fails.iter().copied().collect();
+                if seen.len() == 1 {
+                    *alone.entry(*seen.first().unwrap()).or_insert(0) += 1;
+                }
                 for f in seen {
                     *by_check.entry(f).or_insert(0) += 1;
                 }
             }
         }
     }
-    (valid, tainted_runs, by_check)
+    (valid, tainted_runs, by_check, alone)
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -737,19 +860,21 @@ fn mutation_fuzz_every_mutated_witness_publishes_the_honest_digest_only_when_val
     let seed = env_u64("HIDDEN_FUZZ_SEED", 0x4832_6675_7a7a_0001);
     let iters = env_u64("HIDDEN_FUZZ_ITERS", 25_000) as usize;
     let started = std::time::Instant::now();
-    let (valid, tainted_runs, by_check) = run_fuzz(seed, iters.div_ceil(PER_BASE), PER_BASE);
+    let (valid, tainted_runs, by_check, alone) = run_fuzz(seed, iters.div_ceil(PER_BASE), PER_BASE);
     println!(
         "mutation fuzz, seed {seed:#x}: {} runs over {} bases in {:.1?} — {valid} valid (a different legitimate transaction), \
-         {tainted_runs} tainted; runs failing each check: {by_check:?}",
+         {tainted_runs} tainted; runs failing each check: {by_check:?}; failing it and nothing else: {alone:?}",
         valid + tainted_runs,
         iters.div_ceil(PER_BASE),
         started.elapsed()
     );
-    // Every §3.3 check was exercised as a failure at least once, and some mutations were
-    // legitimate — the fuzz is neither all-taint nor all-valid.
+    // Every §3.3 check was exercised as the ONLY failure of some run — so removing any one of them
+    // from the guest makes some run publish an honest digest the model rejects — and some
+    // mutations were legitimate: the fuzz is neither all-taint nor all-valid.
     for check in [
         "membership: root != anchor",
-        "input asset != slot asset",
+        "input asset != slot asset (A slot)",
+        "input asset != slot asset (R slot)",
         "duplicate nullifier",
         "duplicate output commitment",
         "amount >= 2^63",
@@ -758,7 +883,7 @@ fn mutation_fuzz_every_mutated_witness_publishes_the_honest_digest_only_when_val
         "asset-A sum passes 2^64",
         "RAND sum passes 2^64",
     ] {
-        assert!(by_check.get(check).copied().unwrap_or(0) > 0, "no mutation exercised {check:?}");
+        assert!(alone.get(check).copied().unwrap_or(0) > 0, "no mutation failed {check:?} alone (in any company: {:?})", by_check.get(check));
     }
     assert!(valid > 0);
 }
