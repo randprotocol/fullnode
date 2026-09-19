@@ -18,7 +18,8 @@ Conventions:
 - Shielded addresses are `rand1` + base58, about 1668 characters. A parameter longer than 2000
   characters is refused on its length before it is parsed.
 - Amounts are strings of smallest units (`"1500000000"` = 1.5 RAND); 1 RAND = 10^9 units.
-  Amounts *inside a decoded transaction* are JSON integers instead — a bundle's `fee` and `burn`, a
+  Amounts *inside a decoded transaction* are JSON integers instead — a bundle's `fee` and its
+  `burn_a`/`burn_r`, a
   mint's amount, a staking action's amount — because they are being reported as the transaction's own
   fields rather than as chain state.
 - Heights, leaf indices and views are JSON integers.
@@ -97,15 +98,18 @@ in the mempool, and gossips it. Errors come back as code `-32000` with the reaso
 `unknown program …`, `already in mempool`, `conflicts with a pending transaction over <nullifier>`,
 `faucet is disabled on this chain`, and for the bridge actions `bridge: attestation already
 consumed`, `the attestation names a different recipient`, `the attestation deposits under asset 2,
-and the transaction names 1`, `the burn's asset bundle burns 399, not the 400 the action sends`.
+and the transaction names 1`, `the bundle burns 399, not the 400 the action declares`, and for a
+bundle carrying a burn its action may not carry, `the bundle burns asset 2 on an action that burns
+no token` or `a burn of 5 is not allowed on this action`.
 
 Acceptance is not commitment: poll `rand_getTransaction` until it returns a block.
 
 A transaction larger than the chain's block cap (`max_block_bytes` from `rand_getLimits`; 4 MiB by
 default) is refused here with `-32000`, naming both sizes, before it reaches the mempool. The
-request body itself is capped at `2 × (2 × max_proof_bytes + 2 × 2048 + max_call_envelope_bytes +
-16 384 + 64 KiB) + 256 KiB` — 8 859 648 bytes on a default chain — computed from the genesis at
-startup; a body over it is `-32600` naming the limit.
+request body itself is capped at `2 × (2 × max_proof_bytes + 4 × 2048 + max_call_envelope_bytes +
+16 384 + 64 KiB) + 256 KiB` — 8 867 840 bytes on a default chain, 34 127 872 on a chain-13-sized
+genesis (8 MiB proofs, 64 KiB call envelopes) — computed from the genesis at startup; a body over
+it is `-32600` naming the limit. (`4 × 2048` is the bundle's four envelopes at the envelope cap.)
 
 ### `rand_mint` (testnet faucet)
 Params: `[address]` or `[address, amount]`, where `address` is a `rand1…` shielded address and
@@ -155,8 +159,12 @@ else: no proofs, no actions, no receipts.
       { "hash": "4f2c…e7",
         "commitments": [ { "index": 40, "cm": "2a9f…07",
           "envelope": { "kem_ct": "…", "to_receiver": "…", "to_sender": "…", "body": "…" } } ],
-        "nullifiers": ["8c04…d1", "5e77…20"] } ] } ]
+        "nullifiers": ["8c04…d1", "5e77…20", "03aa…6f", "e19b…42"] } ] } ]
 ```
+
+Every bundle-carrying transaction owns four notes and four nullifiers here — its four slots, the
+dummy slots included, which no reader can tell from real ones (only the example's first
+commitment row is shown).
 
 One call covers at most **128 blocks** (half the 256-block anchor window), counted from
 `from_height`; a wider range is clamped, not refused. Past the first block the reply also stops
@@ -365,10 +373,10 @@ Params: `[hash]`. Result: `null` until committed, then:
     "hash": "4f2c…e7", "chain_id": 7,
     "bundle": {
       "anchor": "6b1d…c4",
-      "nullifiers": ["8c04…d1", "5e77…20"],
-      "commitments": ["2a9f…07", "b310…88"],
-      "fee": 1000000, "burn": 0, "asset": 0, "time": 5,
-      "proof_len": 302857, "envelope_len": [1348, 1348]
+      "nullifiers": ["8c04…d1", "5e77…20", "03aa…6f", "e19b…42"],
+      "commitments": ["2a9f…07", "b310…88", "77c1…0e", "5d20…b3"],
+      "fee": 1000000, "burn_a": 0, "burn_r": 0, "burn_asset": 0, "time": 5,
+      "proof_len": 1431562, "envelope_len": [1380, 1380, 1380, 1380]
     },
     "action": { "kind": "none" }
   }
@@ -376,7 +384,22 @@ Params: `[hash]`. Result: `null` until committed, then:
 ```
 
 `bundle` is `null` on a mint (a mint carries no bundle). The proof and the envelopes are reported
-by length only; anyone who wants the bytes can fetch the block. Other actions:
+by length only; anyone who wants the bytes can fetch the block.
+
+`bundle` is the hidden-asset bundle (chain 14): four input slots and four output slots, so always
+four `nullifiers`, four `commitments` and four `envelope_len`, dummies included. It has **no
+`asset` field**: slots 0–1 carry a private asset and slots 2–3 RAND, and nothing public says which
+asset slots 0–1 moved. A transfer of RAND and a transfer of any RPL token are both `"kind":
+"none"` with `burn_a`, `burn_r` and `burn_asset` all 0 — the same shape, field for field. The
+three burn fields are the bundle's only public statement about value leaving the pool:
+
+- `burn_a` / `burn_asset` — an amount of the private asset burned, and which asset. Non-zero only
+  on a `token_burn` or a `bridge_burn`, where they equal the action's `amount` and `asset`.
+- `burn_r` — RAND burned. Non-zero only on a `bond` (equal to its `amount`) and a
+  `register_aggregator` (the genesis bond).
+- `fee` — the RAND fee, always from slots 2–3.
+
+Other actions:
 
 - `{ "kind": "mint", "cm": "…", "amount": 100000000000, "minter": "<validator base58>" }`
 - `{ "kind": "deploy", "program": "<program id>", "words": 412, "public_words_len": 0 }`
@@ -415,9 +438,23 @@ The staking (phase S2) and bridge (phase S3) actions:
   rotation. Together they are the whole deposit note, which is what lets its recipient rebuild it
   without opening the submitter's envelope (`docs/bridge.md` §8); a transfer's or a withdrawal's
   blinding is *not* rendered, because those notes are not public.
-- `{ "kind": "bridge_burn", "asset": 2, "amount": 400, "relayer_fee": 100, "to_chain": 5, "to":
-  "abab…", "asset_bundle": { …same shape as `bundle`… } }` — `to` is the 32-byte destination
-  address, hex. The asset bundle renders exactly like the fee bundle: same public fields, no more.
+- `{ "kind": "bridge_burn", "asset": 2, "amount": 400, "relayer_fee": 100, "to_chain": 5, "token":
+  "cdcd…", "to": "abab…" }` — `token` is the backing being redeemed and `to` the 32-byte destination
+  address, hex. One bundle carries the whole burn: its `burn_asset` and `burn_a` are the action's
+  `asset` and `amount`, and its `fee` pays the bridge fee.
+
+The RPL token actions:
+
+- `{ "kind": "token_burn", "asset": 3, "amount": 400 }` — a holder burn. Its asset and amount are
+  public by design (they audit the token's `total_supply`), and the bundle's `burn_asset`/`burn_a`
+  repeat them.
+- `{ "kind": "token_mint", "asset": 3, "amount": 700, "recipient": "<shielded address>", "time": 41,
+  "nonce": 0 }`, `{ "kind": "register_token", "name": …, "symbol": …, "decimals": 6, "authority":
+  …, "index": 2, "initial_amount": 5000 }` and `{ "kind": "set_authority", "asset": 3, "nonce": 1,
+  "new_authority": "<base58>" | null }` — a token's registration and mints are public, as a bridge
+  deposit is.
+
+There is no `token_transfer`: a token transfer is `none`, indistinguishable from a RAND payment.
 
 No reply from this method carries the sender, recipient, nonce or amount of a *transfer*: no such
 field exists in a stored transfer. The staking and bridge actions above are the deliberate
@@ -441,11 +478,12 @@ it:
 Monero's `check_tx_proof` shape (`docs/rpc-comparison.md` §4): a sender who sealed an output with
 a fresh `TxKey` can hand `(hash, key)` to anyone — a recipient proving they were paid, an auditor
 checking a claim — and this call is the whole verification. Each entry of `disclosed` is one
-envelope the key opened: `output` names the envelope set (`bundle:0` / `bundle:1` for the
-transaction's own bundle — the fee bundle of a `BridgeBurn` — `asset_bundle:0` / `asset_bundle:1`
-for a burn's second bundle, `deposit` for a `BridgeAttest`'s deposit envelope, `mint:0` for a
-faucet mint's one envelope), `cm` the on-chain
-commitment the note commits to, and `index` its leaf. The binding is the proof: the AEAD
+envelope the key opened: `output` names the envelope set (`bundle:0` … `bundle:3` for the
+transaction's bundle, one per output slot — slots 0–1 the private-asset outputs, slots 2–3 the
+RAND outputs, dummies included — `deposit` for a `BridgeAttest`'s deposit envelope, `mint:0` for a
+faucet mint's one envelope), `cm` the on-chain commitment the note commits to, and `index` its
+leaf. The disclosed `note` carries its `asset`: this call — with the key the sender sealed under —
+is the one place the RPC reveals which asset a transfer moved. The binding is the proof: the AEAD
 authenticates the note *and* checks it against `cm`, so a key lifted onto another transaction —
 or a note that is not the commitment's preimage — yields an empty list, never a forged row. A
 withdraw's and a genesis alloc's envelopes are not tried: they are sealed inside the node under
@@ -924,10 +962,10 @@ only actions with `bundle: null`; every other action must carry one.
 ```
 Transaction { chain_id: u64, bundle: Option<Bundle>, action: Action }
 
-Bundle {
-  anchor: Word8, nullifiers: [Word8; 2], commitments: [Word8; 2],
-  fee: u64, burn: u64, asset: u32, time: u32,
-  envelopes: [Envelope; 2], proof: Vec<u8>,     // postcard(rand_zkvm::Proof) of the bundle guest
+Bundle {                                        // the hidden-asset bundle (chain 14)
+  anchor: Word8, nullifiers: [Word8; 4], commitments: [Word8; 4],
+  fee: u64, burn_a: u64, burn_r: u64, burn_asset: u32, time: u32,
+  envelopes: [Envelope; 4], proof: Vec<u8>,     // postcard(rand_zkvm::Proof) of the hidden-asset guest
 }
 Envelope { kem_ct: Vec<u8>, to_receiver: Vec<u8>, to_sender: Vec<u8>, body: Vec<u8> }
 
@@ -944,19 +982,22 @@ Action::Withdraw { validator: Address, amount: u64, nonce: u64, time: u32, r: Wo
                    envelope: Envelope, signature: Signature }
 Action::BridgeAttest { attestation: Vec<u8>, recipient: ShieldedAddress, r: Word8, time: u32,
                        asset: u32, envelope: Envelope }
-Action::BridgeBurn { asset_bundle: Bundle, asset: u32, amount: u64, relayer_fee: u64,
-                     to_chain: u16, to: [u8; 32] }
+Action::BridgeBurn { asset: u32, amount: u64, relayer_fee: u64, to_chain: u16,
+                     token: [u8; 32], to: [u8; 32] }
+Action::TokenBurn { asset: u32, amount: u64 }
 
 Registration { public_key: PublicKey, payout: ShieldedAddress, signature: Signature }
 ```
 
-A `Bond` must carry a bundle whose `burn` equals its `amount` — that is how the stake leaves the
-pool — and `registration` is present exactly when the validator is not in the register yet
+A `Bond` must carry a bundle whose `burn_r` equals its `amount` (and whose `burn_a` and
+`burn_asset` are 0) — that is how the stake leaves the pool — and `registration` is present exactly when the validator is not in the register yet
 (`docs/staking.md`).
 
-A `BridgeBurn` is the chain's one two-bundle transaction: the outer `bundle` pays the RAND fee
-(the bundle base twice, once per verified bundle) and `asset_bundle` burns exactly `amount`
-of the bridged asset. A `BridgeAttest`'s deposit note is the one commitment the wire does not
+Every transaction carries at most one bundle. A `BridgeBurn` or a `TokenBurn` burns through it:
+the bundle's `burn_asset` must be the action's `asset` (never 0), its `burn_a` the action's
+`amount`, and its `burn_r` 0, while its `fee` pays in RAND from slots 2–3. Every other action burns
+no token (`burn_asset` and `burn_a` 0), and RAND is only ever burned through `burn_r`: a bundle with
+`burn_asset` 0 and `burn_a` non-zero is refused everywhere. A `BridgeAttest`'s deposit note is the one commitment the wire does not
 carry — the chain computes it from the amount the guardians signed, the recipient the action
 names, its blinding `r`, its `time` and the registry index it names in `asset`, so a submitter
 cannot choose the amount or the owner. It *can* choose `time`, within the window a bundle's `time`
@@ -978,26 +1019,46 @@ Encoded sizes (bincode's default configuration: fixed-width integers, 8-byte len
 |---|---|
 | `Word8` | 32 |
 | one `Envelope` | 1380 (1088-byte ML-KEM-768 ciphertext, two 60-byte wrapped transaction keys, a 140-byte sealed note, four length prefixes) |
-| `Bundle` minus the proof | 2952 |
-| transfer transaction minus the proof | 2965 |
-| deploy transaction minus both proofs, 100-word program | 3377 |
-| call transaction minus both proofs | 3005 |
+| `Bundle` minus the proof | 5848 (four `Word8` nullifiers and commitments, four envelopes) |
+| transfer transaction minus the proof | 5861 |
+| deploy transaction minus both proofs, 100-word program | 6281 |
+| call transaction minus both proofs | 5902 |
 | mint transaction (no bundle) | 5181 (a 1312-byte Dilithium2 key and a 2420-byte signature) |
-| bundle proof | 302,857 measured at tier 14 under the `test` FRI profile |
+| bundle proof | 327,203 measured for the hidden-asset guest at tier 14 under the `test` FRI profile |
 
-So a shielded transfer on the wire is about 1.3 MB at constraint set 5's 80-query profile,
-essentially all proof (it was ~300 KB at 27 queries). The ledger caps a proof at 2 MiB, an envelope
+So a shielded transfer on the wire is about 1.43 MB at the 80-query production profile,
+essentially all proof. The ledger caps a proof at 2 MiB, an envelope
 at 2048 bytes, a program at 4096 words (or the genesis file's `max_program_words`, at most 65 535),
 and a block at 4 MiB of transaction bytes — three bundles
 per block (`docs/block-space.md`).
 
 A wallet builds all of this through `randprotocol_client::wallet::{send, submit}`, which selects the
-inputs, fetches the anchor and the witnesses, proves the bundle, seals both envelopes, and checks
+inputs, fetches the anchor and the witnesses, proves the bundle, seals all four envelopes, and checks
 the proof's published digest against the one it computed before it submits anything.
 
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-19 — the hidden-asset bundle (chain 14): a hard fork
+
+One bundle moves any asset and nobody without a key can tell which
+(`docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`). The bundle's wire format, the
+bundle guest (`hc_bundle`) and every transaction id change; chain 14 only.
+
+- **Four slots.** A bundle carries four nullifiers, four commitments and four envelopes, dummies
+  included. `rand_getTransaction`/`rand_getBlockByHeight`'s `bundle.nullifiers`, `commitments`
+  and `envelope_len` have four elements; `rand_getCompactBlocks` lists four notes and four
+  nullifiers per bundle; the tree and the nullifier set grow by four per bundle.
+- **No `asset`, three burn fields.** `bundle.burn` and `bundle.asset` are gone; `bundle.burn_a`,
+  `burn_r` and `burn_asset` replace them (see `rand_getTransaction`). A transfer of any asset is
+  `"kind": "none"`: the `token_transfer` kind and `Action::TokenTransfer` no longer exist.
+- **One bundle per transaction.** `bridge_burn` has no `asset_bundle`; `token_burn` burns through
+  the bundle's `burn_a`/`burn_asset`. New refusals: `the bundle burns asset {n} on an action that
+  burns no token`, `a burn of {n} is not allowed on this action`, `RAND burned through burn_a
+  ({n}); a RAND burn goes through burn_r`.
+- **`rand_checkTransaction`**: `output` is `bundle:0` … `bundle:3`; `asset_bundle:*` is gone.
+- **`rand_sendTransaction`'s body cap** counts four envelopes: 8 867 840 bytes on a default chain.
 
 ### 2026-09-19 — audit v3: the faucet mint's opening, a witness-build cap
 
