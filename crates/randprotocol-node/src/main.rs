@@ -25,10 +25,13 @@ use std::time::Duration;
 /// One genesis deposit note: `amount` units owned by the shielded address `addr`.
 ///
 /// The note carries fresh commitment randomness, so writing the same allocation twice produces
-/// two different notes with two different genesis hashes. That is the point of a commitment
-/// scheme rather than an oversight: a deterministic `r` would let anyone confirm a guess at who
-/// a genesis note pays and how much it holds, simply by recomputing the commitment. A genesis
-/// file is written once and its hash is fixed from then on.
+/// two different notes with two different genesis hashes. That used to be the whole privacy
+/// story: a deterministic `r` would let anyone confirm a guess at who a genesis note pays and how
+/// much it holds, simply by recomputing the commitment. It no longer is — core I-2 (chain 14)
+/// makes this command always write the note's opening (`pk`, `time`, `r`) beside `cm` and
+/// `amount`, required on any chain with a `tokens` section, so who a genesis note pays and its
+/// amount are public by design once the file is published; only *when* and into what it is later
+/// spent stays private. A genesis file is written once and its hash is fixed from then on.
 fn deposit_note(addr: &str, amount: u64) -> Result<GenesisNote> {
     let to = ShieldedAddress::parse(addr).with_context(|| format!("{addr} is not a shielded address"))?;
     seal_deposit(&to, &Note::new(to.pk, [0; 8], amount, 0, 0))
