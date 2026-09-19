@@ -2076,6 +2076,10 @@ pub(crate) mod fixtures {
             cm: word8_to_hex(&[seed as u32; 8]),
             envelope: EnvelopeHex::from_envelope(&env(seed)),
             amount,
+            // No opening: these fixtures' genesis carries no `tokens` section, which is the
+            // chain shape core I-2 requires one on, and the commitment here is a bare tag word
+            // rather than a real note.
+            opening: None,
         }
     }
 

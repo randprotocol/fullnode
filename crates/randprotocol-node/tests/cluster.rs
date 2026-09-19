@@ -24,7 +24,9 @@ use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::bridge::{
     Body, BridgeConfig, Payload,
 };
-use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisToken, GenesisValidator, TokensConfig};
+use randprotocol_core::genesis::{
+    EnvelopeHex, Genesis, GenesisNote, GenesisOpening, GenesisToken, GenesisValidator, TokensConfig,
+};
 use randprotocol_core::ledger::staking::{MIN_STAKE, UNBONDING_EPOCHS};
 use randprotocol_core::notes::{word8_to_hex, Bundle, Envelope, ShieldedAddress};
 use randprotocol_core::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
@@ -107,7 +109,14 @@ fn alloc_note(to: &ShieldedAddress, amount: u64) -> GenesisNote {
     let throwaway = SpendKey::random().viewing_key();
     let envelope =
         randprotocol_zkvm::address::seal_note(&throwaway, to, &note, &TxKey::random()).expect("sealing a deposit note");
-    GenesisNote { cm: word8_to_hex(&note.commitment()), envelope: EnvelopeHex::from_envelope(&envelope), amount }
+    GenesisNote {
+        cm: word8_to_hex(&note.commitment()),
+        envelope: EnvelopeHex::from_envelope(&envelope),
+        amount,
+        // Core I-2: what the commitment opens to, as `rand-node genesis` now writes it. Required
+        // on any chain with a `tokens` section, emitted always.
+        opening: Some(GenesisOpening { pk: word8_to_hex(&note.pk), time: note.time, r: word8_to_hex(&note.r) }),
+    }
 }
 
 /// A chain with no deposit notes: every note in these tests is minted by a validator at runtime.

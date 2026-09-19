@@ -58,15 +58,47 @@ impl EnvelopeHex {
     }
 }
 
+/// What an alloc note's commitment opens to, beside the `amount` the note already declares: the
+/// owner's `pk`, the note's `time` word and its blinding `r` (64 hex characters each for the two
+/// `Word8`s). `from` is the zero word and `asset` is 0, exactly as every other note the *chain*
+/// computes — the faucet mint (`ledger::mint_commitment`), a withdraw, an aggregate payout — so
+/// neither is written down here: a genesis note is a RAND note or it is not a genesis note.
+///
+/// Core I-2. Without it a `cm` is opaque: nothing ties it to `(asset = 0, amount)`, so a genesis
+/// author could put a note committing to `(amount, asset = 1)` in `alloc` and hand itself
+/// spendable zUSD that no backing ever locked — fungible with the real thing, `BridgeBurn`-able
+/// against any backing up to its real `locked`, and invisible to the supply audit, which counts
+/// `amount` as RAND. This is POOL-1's rule ("a validator's signature is not enough — the ledger
+/// derives the commitment itself") applied to the one note-creating path that had no derivation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenesisOpening {
+    /// The owner's `pk`, 64 hex characters.
+    pub pk: String,
+    /// The note's `time` word. Genesis notes are stamped 0 by `rand-node genesis`; any value
+    /// hashes fine, so this records what the file actually used.
+    pub time: u32,
+    /// The commitment randomness, 64 hex characters.
+    pub r: String,
+}
+
 /// A deposit note the chain starts with (spec §8): its commitment, the envelope that opens it,
 /// and the amount it carries. The amount is not chain state — the note's value lives inside the
 /// commitment — but it is part of the genesis binding so every node agrees on the initial supply.
+///
+/// `opening` is **required on any chain with a `tokens` section** (core I-2, see
+/// [`GenesisOpening`]) and optional otherwise, so every genesis file cut before it — chains ≤ 13
+/// and their pinned hashes — parses and builds byte-for-byte as before. It is deliberately *not*
+/// in the genesis commitment: the commitment already covers `cm` and `amount`, and an opening
+/// that does not reproduce `cm` never builds a chain at all.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenesisNote {
     /// 64 hex characters.
     pub cm: String,
     pub envelope: EnvelopeHex,
     pub amount: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening: Option<GenesisOpening>,
 }
 
 /// One source-chain coin behind a listed token: the chain id, the token address there (64 hex
@@ -317,6 +349,12 @@ pub enum GenesisError {
     BadNote(String),
     #[error("duplicate alloc note {0}")]
     DuplicateNote(String),
+    /// Core I-2: a chain that can hold bridged value must be able to show that every note it
+    /// starts with is a RAND note of the amount it declares.
+    #[error("alloc note {0} has no opening, which a chain with a tokens section requires")]
+    MissingNoteOpening(String),
+    #[error("alloc note {0}'s opening does not produce its commitment")]
+    NoteCommitmentMismatch(String),
     #[error("bad epoch_blocks {0} (1..={MAX_EPOCH_BLOCKS})")]
     BadEpochBlocks(u64),
     #[error("bad max_program_words {0} (1..={limit})", limit = gas::MAX_PROGRAM_WORDS_LIMIT)]
@@ -543,9 +581,30 @@ impl Genesis {
         // notes are the only value on the chain that no transaction ever minted, so this is the
         // one place the counter is set rather than accumulated.
         let mut deposited: u64 = 0;
+        // Core I-2: on a chain that can hold bridged value, an alloc `cm` is no longer taken on
+        // trust. Every note must carry the opening it commits to, and the ledger recomputes the
+        // commitment as a RAND note — asset 0, `from` the zero word — exactly as it recomputes a
+        // faucet mint's (`ledger::mint_commitment`, POOL-1). A note that opens to some other
+        // asset, or to another amount than the supply counter is told, never builds a chain.
+        // Gated on the `tokens` section so every genesis file cut before this parses and hashes
+        // as before.
+        let openings_required = self.tokens.is_some();
         for n in &self.alloc {
             let cm = word8_from_hex(&n.cm).ok_or_else(|| GenesisError::BadNote(n.cm.clone()))?;
             let envelope = n.envelope.to_envelope()?;
+            match &n.opening {
+                Some(o) => {
+                    let pk = word8_from_hex(&o.pk).ok_or_else(|| GenesisError::BadNote(o.pk.clone()))?;
+                    let r = word8_from_hex(&o.r).ok_or_else(|| GenesisError::BadNote(o.r.clone()))?;
+                    if crate::ledger::mint_commitment(executor, &pk, n.amount, o.time, &r) != cm {
+                        return Err(GenesisError::NoteCommitmentMismatch(n.cm.clone()));
+                    }
+                }
+                // An opening is checked whenever it is there — a chain ≤ 13 that carries one
+                // gets the same guarantee — and required only where it is load-bearing.
+                None if openings_required => return Err(GenesisError::MissingNoteOpening(n.cm.clone())),
+                None => {}
+            }
             ledger.deposit(cm, executor).map_err(|_| GenesisError::DuplicateNote(n.cm.clone()))?;
             deposited = deposited.checked_add(n.amount).ok_or(GenesisError::SupplyOverflow)?;
             notes.push((cm, envelope, n.amount));
@@ -850,7 +909,25 @@ mod tests {
                 body: vec![2; 8],
             }),
             amount,
+            opening: None,
         }
+    }
+
+    /// An alloc note whose commitment the ledger can recompute: a RAND note (asset 0, `from` the
+    /// zero word) owned by `[seed; 8]`, blinded with `[seed + 1; 8]`, stamped 0 — what
+    /// `rand-node genesis` writes since core I-2.
+    fn opened_note(seed: u32, amount: u64) -> GenesisNote {
+        let (pk, r) = ([seed; 8], [seed + 1; 8]);
+        let mut n = note(seed, amount);
+        n.cm = word8_to_hex(&crate::ledger::mint_commitment(&StubExecutor, &pk, amount, 0, &r));
+        n.opening = Some(GenesisOpening { pk: word8_to_hex(&pk), time: 0, r: word8_to_hex(&r) });
+        n
+    }
+
+    /// The alloc every chain *with* a `tokens` section needs since core I-2: the same two notes
+    /// [`genesis`] uses, each carrying the opening its commitment is derived from.
+    fn opened_alloc() -> Vec<GenesisNote> {
+        vec![opened_note(7, 1_000_000), opened_note(8, 2_000_000)]
     }
 
     /// A valid `rand1…` payout address, distinct per `i`.
@@ -899,6 +976,95 @@ mod tests {
 
     fn build(g: &Genesis) -> GenesisState {
         g.build(&StubExecutor).unwrap()
+    }
+
+    /// Core I-2. On a chain with a `tokens` section an alloc commitment is no longer opaque:
+    /// every note carries the opening it commits to, and `build` recomputes the commitment as a
+    /// RAND note — asset 0, `from` the zero word — exactly as `ledger::mint_commitment` does for
+    /// a faucet mint (POOL-1). Without it a genesis author could put a note committing to
+    /// `(amount, asset = 1)` in `alloc` and hand itself spendable zUSD that no backing ever
+    /// locked, fungible with the real thing and invisible to both the RAND audit and
+    /// `custody >= supply`.
+    #[test]
+    fn a_tokens_chains_alloc_notes_must_open_to_rand_notes_of_their_declared_amount() {
+        // The chain shape: a bridge, its tokens section, and alloc notes beside them.
+        let bridged = |alloc: Vec<GenesisNote>| {
+            let mut g = base_genesis();
+            g.alloc = alloc;
+            g.bridge = Some(bridge_cfg());
+            g.tokens = Some(TokensConfig {
+                registration_fee: MIN_REGISTRATION_FEE,
+                tokens: vec![GenesisToken {
+                    name: "Tether USD".into(),
+                    symbol: "zUSDT".into(),
+                    salt: [1; 32],
+                    backings: vec![GenesisBacking { chain: 2, token: [0x11; 32], decimals: BRIDGE_DECIMALS }],
+                }],
+                mint_cap_per_day: 100_000 * 100_000_000,
+            });
+            g
+        };
+
+        // The honest case: two openable notes, in the tree, counted as RAND.
+        let honest = bridged(vec![opened_note(7, 1_000_000), opened_note(8, 2_000_000)]);
+        let s = honest.build(&StubExecutor).expect("openings that reproduce their commitments");
+        assert_eq!(s.ledger.next_index(), 2);
+        assert_eq!(s.notes.iter().map(|(_, _, a)| *a).collect::<Vec<_>>(), vec![1_000_000, 2_000_000]);
+
+        // No opening at all — the shape every chain ≤ 13 was cut with.
+        let bare = bridged(vec![note(7, 1_000_000)]);
+        assert!(
+            matches!(bare.build(&StubExecutor), Err(GenesisError::MissingNoteOpening(cm)) if cm == word8_to_hex(&[7; 8]))
+        );
+
+        // An opening that does not reproduce the commitment: the amount is the field the supply
+        // counter reads, so a note worth more than it declares is the audit hole.
+        let mut lying = bridged(vec![opened_note(7, 1_000_000)]);
+        lying.alloc[0].amount = 1;
+        assert!(matches!(lying.build(&StubExecutor), Err(GenesisError::NoteCommitmentMismatch(_))));
+
+        // The attack itself: a commitment over `(pk, from = 0, amount, asset = 1, time, r)` —
+        // spendable zUSD at the chain-14 launch index — declared as `amount` RAND. It has no
+        // opening that this rule accepts, because the rule fixes `asset = 0`.
+        let (pk, r) = ([7u32; 8], [8u32; 8]);
+        let mut asset_one = bridged(vec![opened_note(7, 1_000_000)]);
+        asset_one.alloc[0].cm = word8_to_hex(&StubExecutor.note_commitment(&pk, &[0; 8], 1_000_000, 1, 0, &r));
+        asset_one.alloc[0].opening =
+            Some(GenesisOpening { pk: word8_to_hex(&pk), time: 0, r: word8_to_hex(&r) });
+        assert!(
+            matches!(asset_one.build(&StubExecutor), Err(GenesisError::NoteCommitmentMismatch(_))),
+            "an asset-1 commitment cannot be opened as a genesis note"
+        );
+
+        // And a token-less chain is untouched: the same opening-less notes still build, and the
+        // genesis hash is the one the section-less test pins.
+        let plain = base_genesis();
+        assert!(plain.alloc.iter().all(|n| n.opening.is_none()));
+        assert_eq!(
+            build(&plain).hash().to_hex(),
+            "c3f27a29bfdf8abcfd4aaa24fadb127e34c4098cdacc09941a7e7ad3fa6b0b2c",
+            "adding the field changes no existing chain's hash"
+        );
+        // An opening is verified wherever it appears, section or no section — it is only
+        // *required* where it is load-bearing.
+        let mut plain_wrong = base_genesis();
+        plain_wrong.alloc[0].opening = Some(GenesisOpening { pk: word8_to_hex(&pk), time: 0, r: word8_to_hex(&r) });
+        assert!(matches!(plain_wrong.build(&StubExecutor), Err(GenesisError::NoteCommitmentMismatch(_))));
+    }
+
+    /// The field is `#[serde(default)]`, so a genesis file written before core I-2 parses
+    /// unchanged — and one written since round-trips its opening.
+    #[test]
+    fn an_alloc_note_without_an_opening_still_parses() {
+        let old = r#"{"cm":"0707070707070707070707070707070707070707070707070707070707070707",
+            "envelope":{"kem_ct":"01","to_receiver":"","to_sender":"","body":"02"},"amount":5}"#;
+        let n: GenesisNote = serde_json::from_str(old).expect("a pre-I-2 alloc note parses");
+        assert_eq!((n.amount, n.opening.as_ref()), (5, None));
+        // And is written back without the key, so re-serializing an old file does not grow it.
+        assert!(!serde_json::to_string(&n).unwrap().contains("opening"));
+        let with = opened_note(7, 5);
+        let back: GenesisNote = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back, with);
     }
 
     #[test]
@@ -1025,6 +1191,9 @@ mod tests {
         let mut bridged = plain.clone();
         bridged.bridge = Some(bridge_cfg());
         bridged.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        // A chain with a `tokens` section needs openable alloc notes (core I-2); `plain` keeps
+        // the opening-less ones the pins above are computed from.
+        bridged.alloc = opened_alloc();
         let sb = build(&bridged);
         assert!(sb.ledger.bridge().is_some());
         assert_ne!(sb.ledger.state_root(), s.ledger.state_root(), "the bridge root is the fifth component");
@@ -1129,6 +1298,7 @@ mod tests {
         cfg.guardians = (0..368).map(key).collect();
         g.bridge = Some(cfg);
         g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        g.alloc = opened_alloc();
         match g.build(&StubExecutor) {
             Err(GenesisError::BadBridgeConfig(m)) => {
                 assert!(m.contains("too large"), "{m}");
@@ -1144,6 +1314,7 @@ mod tests {
         cfg.pq_guardians = (0..367).map(synthetic_pq_key).collect();
         g.bridge = Some(cfg);
         g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        g.alloc = opened_alloc();
         assert!(g.build(&StubExecutor).is_ok(), "367 guardians is the largest runnable set");
     }
 
@@ -1159,6 +1330,7 @@ mod tests {
         assert!(!plain.to_json().contains("tokens"));
         let mut tok = plain.clone();
         tok.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        tok.alloc = opened_alloc();
         let st = build(&tok);
         assert_ne!(st.ledger.state_root(), s.ledger.state_root());
         assert_ne!(st.hash(), s.hash(), "and so is the genesis hash");
@@ -1183,6 +1355,7 @@ mod tests {
             mint_cap_per_day: 100_000 * 100_000_000,
         };
         let mut g = base_genesis();
+        g.alloc = opened_alloc();
         g.bridge = Some(bridge_cfg());
         g.tokens = Some(listing([0x11; 32]));
         let base = build(&g).hash();
@@ -1265,6 +1438,7 @@ mod tests {
     #[test]
     fn a_bridge_needs_tokens_and_listed_tokens_need_a_bridge_entry() {
         let mut g = base_genesis();
+        g.alloc = opened_alloc();
         g.bridge = Some(bridge_cfg());
         assert!(matches!(g.validate(), Err(GenesisError::BridgeNeedsTokens)));
         g.tokens = Some(TokensConfig {
@@ -1329,6 +1503,7 @@ mod tests {
             GenesisBacking { chain: 5, token: hex32("c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2f6e0e47ca60203452f5d61"), decimals: 6 },
         ];
         let mut g = base_genesis();
+        g.alloc = opened_alloc();
         let mut bridge = bridge_cfg();
         bridge.emitters = (2u16..=5).map(|c| (c, [c as u8; 32])).collect();
         g.bridge = Some(bridge);

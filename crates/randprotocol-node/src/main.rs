@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use libp2p::Multiaddr;
 use randprotocol_client::wallet;
 use randprotocol_client::RpcClient;
-use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator, TokensConfig};
+use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisOpening, GenesisValidator, TokensConfig};
 use randprotocol_core::notes::{word8_to_hex, Envelope, ShieldedAddress};
 use randprotocol_core::types::actions::{
     aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message, aggregator_withdraw_message,
@@ -48,6 +48,16 @@ fn seal_deposit(to: &ShieldedAddress, note: &Note) -> Result<GenesisNote> {
         cm: word8_to_hex(&note.commitment()),
         envelope: EnvelopeHex::from_envelope(&envelope),
         amount: note.amount,
+        // Core I-2: what the commitment opens to. `from` and `asset` are not written down —
+        // `Genesis::build` recomputes the commitment as a RAND note (asset 0, `from` zero),
+        // which is what makes an alloc note auditable as RAND rather than an opaque leaf.
+        // Required on any chain with a `tokens` section; emitted always, so a file cut with this
+        // build is verifiable whatever section it ends up carrying.
+        opening: Some(GenesisOpening {
+            pk: word8_to_hex(&note.pk),
+            time: note.time,
+            r: word8_to_hex(&note.r),
+        }),
     })
 }
 
