@@ -153,6 +153,21 @@ fn claim_conflict_key(validator: &Address) -> Word8 {
 /// The claims map's key: the register the nonce belongs to, so one keypair's two roles — a
 /// validator's `Unbond` and an aggregator's `Aggregate` at the same nonce — never collide over
 /// a slot the two registers do not share (chain-9 runs both roles on the same ops keys).
+/// The four bridge governance actions (bridge hardening B1/B4): the emergency pause, its
+/// lifting, and the two listings. They are exempt from the pool's capacity refusal and ordered
+/// ahead of fee order among a block's candidates (node I4) — a brake that can be crowded out is
+/// not a brake. Both are safe only because [`claimed_nonce`]/[`claim_key`] already bound roles 2
+/// and 3 to one pooled transaction each, which a test asserts.
+fn is_governance(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::PauseMints { .. }
+            | Action::UnpauseMints { .. }
+            | Action::RegisterBridgedToken { .. }
+            | Action::ListBacking { .. }
+    )
+}
+
 fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
     let role = match action {
         Action::Aggregate { .. } | Action::UnbondAggregator { .. } | Action::WithdrawAggregator { .. } => 1u8,
@@ -316,7 +331,16 @@ impl Mempool {
                 return Err(MempoolError::AttestationConflict(mu));
             }
         }
-        if self.txs.len() >= self.max_size {
+        // The capacity check is last, and the four governance actions are outside it (node I4).
+        // `PauseMints` is the brake for a guardian-key compromise: bundle-less, fee-less, and
+        // the one transaction that must reach a block while an attacker is minting. It used to
+        // enter the pool like anything else — refused `Full` at 10 000 entries — and `rand_mint`
+        // hands out a free, fee-less pooled transaction per call, so filling every reachable
+        // validator's pool and keeping the pause out cost an attacker nothing. Exempting them is
+        // safe because their nonce claims, checked above, already bound each of the two roles to
+        // **one** pooled transaction at a time: the exemption can add at most two entries past
+        // the cap, not an unbounded flood.
+        if !is_governance(&tx.action) && self.txs.len() >= self.max_size {
             return Err(MempoolError::Full);
         }
         Ok(Claims { commitments, claim, token })
@@ -436,7 +460,16 @@ impl Mempool {
     pub fn candidates_within(&self, ledger: &Ledger, max: usize, max_bytes: usize) -> Vec<Transaction> {
         let mut ready: Vec<(&Hash, &Pooled)> =
             self.txs.iter().filter(|(_, p)| Self::still_applies(p, ledger)).collect();
-        ready.sort_by(|a, b| b.1.tx.fee().cmp(&a.1.tx.fee()).then_with(|| a.0.cmp(b.0)));
+        // Governance first, then fee-descending, then by hash (node I4). A `PauseMints` pays
+        // `fee() == 0` by design — it must work from a wallet holding no RAND at all — so fee
+        // order sorted the emergency brake behind every transaction that pays, which is the
+        // wrong end of a block while a compromised guardian set is minting.
+        ready.sort_by(|a, b| {
+            is_governance(&b.1.tx.action)
+                .cmp(&is_governance(&a.1.tx.action))
+                .then_with(|| b.1.tx.fee().cmp(&a.1.tx.fee()))
+                .then_with(|| a.0.cmp(b.0))
+        });
         let mut out = Vec::new();
         let mut bytes = 0usize;
         for (_, p) in ready.into_iter().take(max) {
@@ -1245,6 +1278,93 @@ mod tests {
         assert!(after.bridge().unwrap().mint_paused);
         m.prune(&after);
         assert!(m.is_empty());
+    }
+
+    /// Node I4: the emergency brake cannot be crowded out. A `PauseMints` is bundle-less and
+    /// `fee() == 0` by design — it must work from a wallet holding no RAND at all — so it used to
+    /// be refused `Full` at the pool's cap and sorted *last* among candidates, behind everything
+    /// that pays. With `rand_mint` handing out free, fee-less pooled transactions, an attacker
+    /// minting with stolen guardian keys could fill every reachable validator's pool and keep the
+    /// pause out for nothing.
+    ///
+    /// The exemption is bounded by the claim the pause already takes: role 2's one nonce, so at
+    /// most one pooled pause-or-unpause, and role 3's one, so at most one pooled
+    /// register-or-listing. Two entries past the cap, not a flood — asserted here.
+    #[test]
+    fn a_governance_message_is_exempt_from_a_full_pool_and_ordered_first() {
+        let (l, _) = bridged_ledger();
+        let pause_key = fixtures::key(0x7f);
+        let pause = |nonce: u64| Transaction {
+            chain_id: l.chain_id(),
+            bundle: None,
+            action: Action::PauseMints {
+                nonce,
+                signature: pause_key.sign(&randprotocol_core::bridge::gov::pause_message(l.chain_id(), nonce)),
+            },
+        };
+
+        // A pool at its cap, filled with fee-paying bundles.
+        let mut m = Mempool::new(2);
+        let paid: Vec<Transaction> = [(1u8, 3u64), (3, 2)]
+            .iter()
+            .map(|&(n, mult)| {
+                fixtures::bundle_tx(&l, [nf(n), nf(n + 1)], [cm(n), cm(n + 1)], fixtures::bundle_fee() * mult)
+            })
+            .collect();
+        for t in &paid {
+            m.insert(t.clone(), &l, &StubExecutor).unwrap();
+        }
+        let extra = fixtures::bundle_tx(&l, [nf(9), nf(10)], [cm(9), cm(10)], fixtures::bundle_fee());
+        assert_eq!(m.insert(extra, &l, &StubExecutor), Err(MempoolError::Full), "an ordinary transaction is refused");
+
+        // The pause is not.
+        let brake = pause(0);
+        m.insert(brake.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.len(), 3, "one past the cap, which is what the exemption is worth");
+        // And a second one is refused by its nonce claim, not by the cap — so the exemption
+        // cannot be turned into a flood.
+        // A second pause never lands, whatever nonce it names — the same one is a `Duplicate`,
+        // another nonce is the bridge's own (its `pause_nonce` is 0 and nothing else is
+        // admissible), and an *unpause* at the live nonce takes role 2's one claim. None of the
+        // three is `Full`, which is the point: the exemption is bounded by the claim, not by the
+        // cap it steps past.
+        assert_eq!(m.precheck(&pause(0), &l, &StubExecutor).map(|_| ()), Err(MempoolError::Duplicate));
+        assert_eq!(
+            m.precheck(&pause(1), &l, &StubExecutor).map(|_| ()),
+            Err(MempoolError::Invalid(TxError::Bridge(randprotocol_core::bridge::BridgeError::BadPauseNonce {
+                expected: 0,
+                got: 1
+            })))
+        );
+        let msg = randprotocol_core::bridge::gov::unpause_message(l.chain_id(), 0);
+        let keys = fixtures::pq_keys();
+        let unpause = Transaction {
+            chain_id: l.chain_id(),
+            bundle: None,
+            action: Action::UnpauseMints {
+                nonce: 0,
+                pq_signatures: (0..5u8)
+                    .map(|i| randprotocol_core::bridge::PqSignature {
+                        index: i,
+                        signature: keys[i as usize].sign(&msg).as_bytes().to_vec(),
+                    })
+                    .collect(),
+            },
+        };
+        assert_eq!(
+            m.precheck(&unpause, &l, &StubExecutor).map(|_| ()),
+            Err(MempoolError::Conflict(claim_conflict_key(&Address([0; 32])))),
+            "role 2 holds exactly one pooled slot"
+        );
+
+        // And it leads the block, ahead of both fee-payers — which are themselves still in fee
+        // order behind it.
+        let picked = m.candidates(&l, 10);
+        assert_eq!(picked[0], brake, "the fee-less brake is first");
+        assert_eq!(picked[1..].iter().map(|t| t.fee()).collect::<Vec<_>>(), vec![
+            fixtures::bundle_fee() * 3,
+            fixtures::bundle_fee() * 2
+        ]);
     }
 
     /// A ledger on a bridged chain, plus the guardian secrets that can attest to it.

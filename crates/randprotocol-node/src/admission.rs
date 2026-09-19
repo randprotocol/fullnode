@@ -25,6 +25,20 @@ pub const PEER_TX_BURST: u32 = 16;
 /// peer is far above any honest peer's share of it.
 pub const PEER_TX_PER_SEC: f64 = 4.0;
 
+/// Faucet mints (`rand_mint`, `NodeCommand::Mint`) this node will hand out back to back, and the
+/// rate it recovers them at (node I4).
+///
+/// A faucet mint is fee-less, unsigned by any payer, and costs one pooled transaction per call —
+/// so on chain 14, where the faucet is on and a bridge holds value behind it, an unthrottled
+/// `rand_mint` on any reachable validator RPC is free pool pressure (the same audit-v3 faucet
+/// exposure, now with something behind it). Eight back to back covers a demo or a test run
+/// starting cold; one a second is well past any human's use of a faucet and far below what it
+/// would take to crowd a 10 000-entry pool. The limit is **per process**, not per caller: the
+/// RPC port has no peer identity to meter, and the resource being protected is this node's pool.
+pub const FAUCET_MINT_BURST: u32 = 8;
+/// See [`FAUCET_MINT_BURST`].
+pub const FAUCET_MINT_PER_SEC: f64 = 1.0;
+
 /// Transaction hashes whose verification already failed for a reason that is a statement about
 /// the transaction's bytes, not about this node's state. Bounded and FIFO: a refused hash is
 /// looked up once, on arrival, so recency ordering buys nothing an insertion order does not.
@@ -742,6 +756,8 @@ mod tests {
     /// break a test rather than a fleet.
     #[test]
     fn the_shipped_policy_is_the_one_the_plan_sized() {
+        // The faucet's own allowance rides the same type (node I4).
+        assert_eq!((FAUCET_MINT_BURST, FAUCET_MINT_PER_SEC), (8, 1.0));
         assert_eq!(REFUSED_CACHE_ENTRIES, 8192);
         assert_eq!(PEER_TX_BURST, 16);
         assert_eq!(PEER_TX_PER_SEC, 4.0);
@@ -779,5 +795,30 @@ mod tests {
         let mut other = TokenBucket::default();
         assert!(l.allow(&mut other, t0 + Duration::from_secs(60)), "an untouched bucket starts full");
         assert!(l.allow(&mut TokenBucket::default(), t0), "and so does a fresh one at any time");
+    }
+
+    /// Node I4: the faucet's own allowance, the shipped numbers, over the same type. A mint is
+    /// fee-less and costs a pooled transaction, so an unthrottled `rand_mint` is free pool
+    /// pressure on a chain with the faucet on behind a live bridge. One bucket, not a map: the
+    /// RPC port has no peer identity to meter, and what is being protected is this node's pool.
+    #[test]
+    fn the_faucet_allows_its_burst_then_one_a_second() {
+        let l = PeerLimiter::new(FAUCET_MINT_BURST, FAUCET_MINT_PER_SEC);
+        let mut b = TokenBucket::default();
+        let t0 = Instant::now();
+        for i in 0..FAUCET_MINT_BURST {
+            assert!(l.allow(&mut b, t0), "mint {i} of the burst");
+        }
+        assert!(!l.allow(&mut b, t0), "the ninth in the same instant is refused");
+        // The e2e gate's shape — five faucet mints back to back — fits inside the burst with
+        // room to spare, which is why 8 was chosen rather than something tighter.
+        assert!(FAUCET_MINT_BURST >= 5);
+        assert!(l.allow(&mut b, t0 + Duration::from_secs(1)), "one a second");
+        assert!(!l.allow(&mut b, t0 + Duration::from_secs(1)));
+        // And it never refills past the burst, however long the faucet is left alone.
+        for i in 0..FAUCET_MINT_BURST {
+            assert!(l.allow(&mut b, t0 + Duration::from_secs(3600)), "refilled {i}");
+        }
+        assert!(!l.allow(&mut b, t0 + Duration::from_secs(3600)), "the burst is the ceiling");
     }
 }

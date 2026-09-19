@@ -431,6 +431,12 @@ struct Node {
     /// The live WebSocket connection count `ws::upgrade` maintains; reported as
     /// `NodeStatus::ws_clients`.
     ws_conns: Arc<AtomicUsize>,
+    /// The faucet's own allowance, per process (node I4): `rand_mint` is fee-less and pooled, so
+    /// an unthrottled one is free pool pressure on a chain that keeps the faucet on behind a live
+    /// bridge. The same token bucket the gossip limiter uses, over one bucket rather than a map —
+    /// the RPC port has no peer identity to meter.
+    faucet_limiter: admission::PeerLimiter,
+    faucet_bucket: admission::TokenBucket,
     peers: HashMap<PeerId, Peer>,
     /// This chain's sync and gossip byte limits, from its genesis `max_block_bytes`; the same
     /// value the swarm was started with.
@@ -823,6 +829,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         fetch_attempts: HashMap::new(),
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
+        faucet_limiter: admission::PeerLimiter::new(admission::FAUCET_MINT_BURST, admission::FAUCET_MINT_PER_SEC),
+        faucet_bucket: admission::TokenBucket::default(),
         snapshot: None,
         verify_in_flight: 0,
         verify_queue: VecDeque::new(),
@@ -1397,6 +1405,17 @@ impl Node {
         }
         if amount > FAUCET_MAX_UNITS {
             return Err(format!("mint of {amount} exceeds the faucet cap of {FAUCET_MAX_UNITS}"));
+        }
+        // Last of the cheap refusals, and the only one that is about this node rather than the
+        // request: a mint is fee-less and costs a pooled transaction, so the faucet is metered
+        // (node I4, `admission::FAUCET_MINT_BURST`/`FAUCET_MINT_PER_SEC` — 8 back to back,
+        // refilling at 1/s). Per process: the RPC port has no peer identity to key a bucket on.
+        if !self.faucet_limiter.allow(&mut self.faucet_bucket, Instant::now()) {
+            return Err(format!(
+                "faucet is rate limited on this node ({} mints back to back, refilling at {}/s); try again shortly",
+                admission::FAUCET_MINT_BURST,
+                admission::FAUCET_MINT_PER_SEC
+            ));
         }
         let key = Keypair::from_seed(self.cfg.seed).expect("seed validated at startup");
         let height = self.hs.tip_ledger().height();
