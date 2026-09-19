@@ -7,6 +7,11 @@
 
 #![allow(dead_code)]
 
+/// The multi-node harness (`cluster.rs`, `zusd_e2e.rs`).
+pub mod cluster;
+/// Test bridge guardians and what they sign (`cluster.rs`, `zusd_e2e.rs`).
+pub mod bridge;
+
 use randprotocol_core::confidential::StubExecutor;
 use randprotocol_core::genesis::{Genesis, GenesisValidator};
 use randprotocol_core::ledger::staking::MIN_STAKE;

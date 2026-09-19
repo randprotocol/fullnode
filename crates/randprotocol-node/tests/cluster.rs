@@ -22,14 +22,14 @@ use randprotocol_client::wallet::{self, Burn, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::bridge::{
-    digest, guardian_address, sign_digest, Attestation, Body, BridgeConfig, Payload, Transfer, CHAIN_RAND,
+    Body, BridgeConfig, Payload,
 };
 use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisToken, GenesisValidator, TokensConfig};
 use randprotocol_core::ledger::staking::{MIN_STAKE, UNBONDING_EPOCHS};
 use randprotocol_core::notes::{word8_to_hex, Bundle, Envelope, ShieldedAddress};
 use randprotocol_core::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
 use randprotocol_core::{gas, Action, Address, Hash, Keypair, Transaction, Word8, UNITS_PER_RAND};
-use randprotocol_node::node::{self, NodeConfig, NodeHandle};
+use randprotocol_node::node::{self, NodeConfig};
 use randprotocol_zkvm::executor::ZkExecutor;
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use randprotocol_zkvm::notes::{Note, SpendKey};
@@ -40,6 +40,9 @@ use std::time::{Duration, Instant};
 
 /// One proof at a time, for every test in this file and in `randprotocol-client`'s `wallet_flow.rs`.
 mod proving_slot;
+/// The node harness and the test bridge guardians, shared with `zusd_e2e.rs`.
+mod common;
+use common::cluster::*;
 use proving_slot::proving_slot;
 
 const CHAIN_ID: u64 = 7;
@@ -47,91 +50,53 @@ const CHAIN_ID: u64 = 7;
 /// What one funded wallet holds at genesis.
 const ALLOC: u64 = 1_000 * UNITS_PER_RAND;
 
-/// Block spacing for the structural tests: nothing in them proves anything, so the chain runs as
-/// fast as consensus will go.
-const FAST: Duration = Duration::from_millis(150);
-
-/// Block spacing for every test here that proves a bundle. `ANCHOR_WINDOW` and `TIME_WINDOW` are
-/// 256 *blocks*, so a bundle gets 256 blocks between reading its anchor and being committed under
-/// it — and its own `time` word gets the same window. Three-second blocks make that nearly thirteen
-/// minutes, which is the number `wallet_flow.rs` uses for the same reason.
-///
-/// Proving concurrency is what used to make this number load-bearing. `cargo test --workspace`
-/// schedules every proving test in this file concurrently and they compete for the same cores: a
-/// tier-14 bundle measures about 98 s alone and 255 s with six other proofs running, and
-/// `submit_burn` proves *twice* under one anchor (189 s for the pair, alone). At 1 s blocks — where
-/// this constant started — a 255 s proof put the committed bundle's own `time` outside the window by
-/// the time the test replayed it, and `two_validators_commit_and_shielded_transfer` failed on
-/// `bundle time 2 is outside [3, 259]` instead of on the double-spend it is about. A test must fail
-/// on its property, not on the clock. S2 raised this to 2 s and S3 to 3 s to buy room against that.
-///
-/// That room was a margin rather than a bound, and [`proving_slot`] is the bound. **What the bound
-/// actually is: a two-way contended proof, not an uncontended one.** The slot serialises *unrelated*
-/// proofs, and `two_bundles_spending_one_note_only_one_commits` deliberately proves two bundles at
-/// once under a single hold — that race is its subject — so the worst case any window has to
-/// outlive is two proofs under one anchor, ~190–255 s, against 3 s × 256 = 768 s. Measured in the
-/// serialised suite: a single bundle 94.6–97.9 s (~8× headroom), the race's two concurrent bundles
-/// 114 s each (~7×), and `submit_burn`'s two sequential bundles 190 s together under one anchor —
-/// the longest exposure any window here has, and still ~4×.
-///
-/// Three seconds stays, and what it buys is that headroom rather than protection from contention:
-///
-/// - the windows are counted in *blocks*, so slowing the chain is the one knob that costs nothing
-///   but a test's patience — and every `wait_*` bound here is already sized for it;
-/// - a queueing test's own cluster keeps making blocks while it waits for the slot, and at 1 s
-///   blocks up to seven idle clusters would burn three times the consensus CPU beside the one proof
-///   that actually matters — the slot's whole point is to leave that proof alone;
-/// - the S2 staking tests hold there too — their longest wait is two `EPOCH`-block epochs, 36 s,
-///   against a 180 s bound.
-///
-/// **The open knob is the slot's width, not the block interval.** Serialising costs wall time: the
-/// suite went from 6m28s with proofs overlapping to 19m59s with one at a time (measured
-/// 2026-09-13). A slot of N = 2 permits would run two proofs at once — which the race test already
-/// shows costs ~114 s each rather than ~96 s — and roughly halve the serialised time while keeping
-/// the bound at the two-way figure this comment states, i.e. inside 768 s with room to spare. It is
-/// the alternative to reach for if the suite's wall time becomes the problem; N = 1 is what is
-/// implemented, because it is the simplest thing that makes the bound a bound.
-///
-/// The view timeouts scale with the interval (`start_node_at`), and every `wait_*` bound in these
-/// tests is a wall-clock timeout with room to spare at 3 s blocks (`wallet::COMMIT_TIMEOUT` is
-/// 180 s, which is 60 blocks).
-const PROVING: Duration = Duration::from_millis(3000);
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,randprotocol_node=info".into()))
-        .with_test_writer()
-        .try_init();
-}
-
-fn keys(n: u8) -> Vec<Keypair> {
-    (1..=n).map(|i| Keypair::from_seed([i + 100; 32]).unwrap()).collect()
-}
-
-/// Test wallet `i`, from the spend key `SpendKey([i; 8])`. Deterministic so a note minted or
-/// allocated to `wallet(i)` in one part of a test can be opened by `wallet(i)` in another.
-fn wallet(i: u32) -> Wallet {
-    Wallet::from_spend_key(SpendKey([i; 8]))
-}
-
-/// The shielded address a mint pays, as its `rand1…` text.
-fn payee(seed: u8) -> String {
-    wallet(seed as u32).address.to_string()
-}
-
-/// What `wallet` can spend according to `node` — a fresh note store scanned against that node's
-/// RPC, which is the only way a balance exists at all on this chain.
-async fn balance(node: &TestNode, w: &Wallet) -> u64 {
-    asset_balance(node, w, 0).await
-}
-
-/// The same question about one bridged asset: the notes of that registry index this wallet's
-/// viewing key opens (`rand asset-balance`). Index 0 is RAND, which is what [`balance`] asks.
-async fn asset_balance(node: &TestNode, w: &Wallet, asset: u32) -> u64 {
-    let mut store = NoteStore::default();
-    wallet::scan(&node.rpc, w, &mut store).await.expect("scanning the tree");
-    store.balance_of(asset)
-}
+// `PROVING` — the block spacing for every test here that proves a bundle — lives in
+// `common::cluster` now, shared with `zusd_e2e.rs`. Why it is three seconds:
+//
+// Block spacing for every test here that proves a bundle. `ANCHOR_WINDOW` and `TIME_WINDOW` are
+// 256 *blocks*, so a bundle gets 256 blocks between reading its anchor and being committed under
+// it — and its own `time` word gets the same window. Three-second blocks make that nearly thirteen
+// minutes, which is the number `wallet_flow.rs` uses for the same reason.
+//
+// Proving concurrency is what used to make this number load-bearing. `cargo test --workspace`
+// schedules every proving test in this file concurrently and they compete for the same cores: a
+// tier-14 bundle measures about 98 s alone and 255 s with six other proofs running, and
+// `submit_burn` proves *twice* under one anchor (189 s for the pair, alone). At 1 s blocks — where
+// this constant started — a 255 s proof put the committed bundle's own `time` outside the window by
+// the time the test replayed it, and `two_validators_commit_and_shielded_transfer` failed on
+// `bundle time 2 is outside [3, 259]` instead of on the double-spend it is about. A test must fail
+// on its property, not on the clock. S2 raised this to 2 s and S3 to 3 s to buy room against that.
+//
+// That room was a margin rather than a bound, and [`proving_slot`] is the bound. **What the bound
+// actually is: a two-way contended proof, not an uncontended one.** The slot serialises *unrelated*
+// proofs, and `two_bundles_spending_one_note_only_one_commits` deliberately proves two bundles at
+// once under a single hold — that race is its subject — so the worst case any window has to
+// outlive is two proofs under one anchor, ~190–255 s, against 3 s × 256 = 768 s. Measured in the
+// serialised suite: a single bundle 94.6–97.9 s (~8× headroom), the race's two concurrent bundles
+// 114 s each (~7×), and `submit_burn`'s two sequential bundles 190 s together under one anchor —
+// the longest exposure any window here has, and still ~4×.
+//
+// Three seconds stays, and what it buys is that headroom rather than protection from contention:
+//
+// - the windows are counted in *blocks*, so slowing the chain is the one knob that costs nothing
+//   but a test's patience — and every `wait_*` bound here is already sized for it;
+// - a queueing test's own cluster keeps making blocks while it waits for the slot, and at 1 s
+//   blocks up to seven idle clusters would burn three times the consensus CPU beside the one proof
+//   that actually matters — the slot's whole point is to leave that proof alone;
+// - the S2 staking tests hold there too — their longest wait is two `EPOCH`-block epochs, 36 s,
+//   against a 180 s bound.
+//
+// **The open knob is the slot's width, not the block interval.** Serialising costs wall time: the
+// suite went from 6m28s with proofs overlapping to 19m59s with one at a time (measured
+// 2026-09-13). A slot of N = 2 permits would run two proofs at once — which the race test already
+// shows costs ~114 s each rather than ~96 s — and roughly halve the serialised time while keeping
+// the bound at the two-way figure this comment states, i.e. inside 768 s with room to spare. It is
+// the alternative to reach for if the suite's wall time becomes the problem; N = 1 is what is
+// implemented, because it is the simplest thing that makes the bound a bound.
+//
+// The view timeouts scale with the interval (`start_node_at`), and every `wait_*` bound in these
+// tests is a wall-clock timeout with room to spare at 3 s blocks (`wallet::COMMIT_TIMEOUT` is
+// 180 s, which is 60 blocks).
 
 /// One genesis deposit note, built exactly as `rand-node genesis` builds it (`main.rs`'s
 /// `deposit_note`/`seal_deposit`): a note owned by `to` with fresh commitment randomness, sealed
@@ -229,45 +194,19 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
 //
 // A bridged test chain, built the way `docs/bridge.md` describes one: six guardian secrets whose
 // addresses are the genesis guardian set, and chain 2 registered as a source emitter. These are
-// the same fixed secrets the core bridge tests sign with; they are built here out of the public
-// API (`guardian_address`, `sign_digest`, `Attestation`) rather than borrowed from those tests,
-// which are `#[cfg(test)]` inside `randprotocol-core` and unreachable from an integration test.
-
-/// The six guardian secrets of a bridged test chain. Five signatures is a quorum for six keys.
-fn guardian_secrets() -> Vec<[u8; 32]> {
-    (1u8..=6).map(|i| [i; 32]).collect()
-}
+// the same fixed secrets the core bridge tests sign with, built in `common::bridge` out of the
+// public API and shared with `zusd_e2e.rs`.
 
 /// The `bridge` section those guardians name, with chain 2 as the one registered source emitter.
 /// No asset is registered: a registry starts empty and the first attestation to name a token is
 /// what puts it in, under index 1.
 fn bridge_config() -> BridgeConfig {
-    BridgeConfig {
-        emitter: [1; 32],
-        guardians: guardian_secrets().iter().map(guardian_address).collect(),
-        emitters: std::collections::BTreeMap::from([(TOKEN_CHAIN, [TOKEN_CHAIN as u8; 32])]),
-        pq_guardians: pq_guardian_keys().iter().map(|k| k.public_key().clone()).collect(),
-        pause_key: Some(randprotocol_core::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
-    }
-}
-
-/// The six PQ guardians' Dilithium2 keys (bridge hardening B3), index-aligned with
-/// [`guardian_secrets`].
-fn pq_guardian_keys() -> Vec<Keypair> {
-    (0..6u8).map(|i| Keypair::from_seed([0x70 + i; 32]).unwrap()).collect()
+    common::bridge::bridge_config_for([1; 32], &[TOKEN_CHAIN])
 }
 
 /// The lowest-five PQ co-signature quorum over `attestation`'s `mu` on this cluster's chain.
 fn pq_quorum(attestation: &[u8]) -> Vec<randprotocol_core::bridge::PqSignature> {
-    let mu = randprotocol_core::bridge::Attestation::body_bytes(attestation)
-        .map(randprotocol_core::bridge::digest)
-        .expect("a decodable attestation");
-    pq_guardian_keys()
-        .iter()
-        .take(5)
-        .enumerate()
-        .map(|(i, k)| randprotocol_core::bridge::pq_cosign(k, i as u8, CHAIN_ID, &mu))
-        .collect()
+    common::bridge::pq_quorum(CHAIN_ID, attestation)
 }
 
 /// The bridged token these tests move: chain 2's `0xaa…`, the one coin backing the single token
@@ -294,175 +233,7 @@ const EVM_TO: [u8; 32] = {
 /// 1.2 KB and the wire format has room for a hash, so the source-chain depositor names the hash and
 /// the transaction carries the address for the ledger to check against it.
 fn attestation(to: &ShieldedAddress, amount: u128) -> Vec<u8> {
-    let secrets = guardian_secrets();
-    let body = Body {
-        timestamp: 1,
-        nonce: 0,
-        emitter_chain: TOKEN_CHAIN,
-        emitter_address: [TOKEN_CHAIN as u8; 32],
-        sequence: 0,
-        consistency_level: 0,
-        payload: Payload::Transfer(Transfer {
-            amount: Transfer::u256_from_u128(amount),
-            token_address: TOKEN,
-            token_chain: TOKEN_CHAIN,
-            to: to.recipient_hash(),
-            to_chain: CHAIN_RAND,
-            fee: Transfer::u256_from_u128(0),
-        })
-        .encode(),
-    };
-    let d = digest(&body.encode());
-    let signatures = (0..5).map(|i| sign_digest(&secrets[i], i as u8, &d)).collect();
-    Attestation { guardian_set_index: 0, signatures, body }.encode()
-}
-
-struct TestNode {
-    handle: NodeHandle,
-    dir: tempfile::TempDir,
-    rpc: RpcClient,
-}
-
-async fn start_node(key: &Keypair, gen: &Genesis, bootstrap: Vec<libp2p::Multiaddr>, validator: bool) -> TestNode {
-    start_node_at(key, gen, bootstrap, validator, FAST).await
-}
-
-async fn start_node_at(
-    key: &Keypair,
-    gen: &Genesis,
-    bootstrap: Vec<libp2p::Multiaddr>,
-    validator: bool,
-    block_interval: Duration,
-) -> TestNode {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("genesis.json"), gen.to_json()).unwrap();
-    start_in_at(dir, key, bootstrap, validator, block_interval).await
-}
-
-async fn start_in(dir: tempfile::TempDir, key: &Keypair, bootstrap: Vec<libp2p::Multiaddr>, validator: bool) -> TestNode {
-    start_in_at(dir, key, bootstrap, validator, FAST).await
-}
-
-async fn start_in_at(
-    dir: tempfile::TempDir,
-    key: &Keypair,
-    bootstrap: Vec<libp2p::Multiaddr>,
-    validator: bool,
-    block_interval: Duration,
-) -> TestNode {
-    let handle = node::start(NodeConfig {
-        datadir: dir.path().to_path_buf(),
-        seed: *key.seed(),
-        listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
-        bootstrap,
-        rpc_addr: "127.0.0.1:0".parse().unwrap(),
-        enable_mdns: false,
-        validator,
-        block_interval,
-        base_timeout: Duration::from_millis(1500).max(block_interval * 10),
-        max_timeout: Duration::from_secs(6).max(block_interval * 40),
-        verify: randprotocol_node::storage::VerifyMode::Full,
-        keep_raw_proofs: false,
-    })
-    .await
-    .expect("node starts");
-    let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
-    TestNode { handle, dir, rpc }
-}
-
-/// Stop a node (abort its loop, close its sockets) and keep its data directory.
-async fn stop(n: TestNode) -> tempfile::TempDir {
-    n.handle.shutdown().await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    n.dir
-}
-
-fn bootstrap_addr(n: &TestNode) -> libp2p::Multiaddr {
-    let mut a = n.handle.listen_addrs[0].clone();
-    a.push(libp2p::multiaddr::Protocol::P2p(n.handle.network.local_peer_id));
-    a
-}
-
-async fn wait_for<F: Fn() -> bool>(what: &str, timeout: Duration, f: F) {
-    let start = Instant::now();
-    while !f() {
-        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn wait_height(nodes: &[&TestNode], min: u64, timeout: Duration) {
-    wait_for(&format!("all nodes at height >= {min}"), timeout, || {
-        nodes.iter().all(|n| n.handle.status.read().unwrap().height >= min)
-    })
-    .await;
-}
-
-impl TestNode {
-    /// Mint `amount` units to `payee(seed)` through this node's RPC and wait for the commit.
-    /// Returns the transaction hash and the commitment of the note it created, which is the
-    /// thing every node must agree on afterwards.
-    async fn mint(&self, seed: u8, amount: u64) -> (Hash, Word8) {
-        let hash = self.rpc.mint_shielded(&payee(seed), Some(amount)).await.expect("mint accepted");
-        self.rpc.wait_for_transaction(&hash, Duration::from_secs(30)).await.expect("mint commits");
-        (hash, self.note_of(&hash).expect("a committed mint has a note"))
-    }
-
-    /// The commitment a committed mint created, read back from the block it landed in.
-    fn note_of(&self, hash: &Hash) -> Option<Word8> {
-        let (height, index) = self.handle.storage.tx_location(hash).unwrap()?;
-        let block = self.handle.storage.block_by_height(height).unwrap()?;
-        match &block.transactions.get(index as usize)?.action {
-            Action::Mint { cm, .. } => Some(*cm),
-            _ => None,
-        }
-    }
-
-    /// Whether this node's committed state holds `cm` — the redacted stand-in for "did the
-    /// value arrive": nobody, this test included, can say who owns the note.
-    ///
-    /// Scans the notes family rather than asking the tree: `CommitmentTree` is a frontier, so it
-    /// keeps a root and a rightmost path, never the leaf set.
-    fn holds(&self, cm: &Word8) -> bool {
-        self.handle.storage.notes_from(0, usize::MAX).map(|rows| rows.iter().any(|(_, r)| r.cm == *cm)).unwrap_or(false)
-    }
-
-    fn height(&self) -> u64 {
-        self.handle.status.read().unwrap().height
-    }
-}
-
-/// Every node's chain must be identical up to the lowest common height, and the shielded state
-/// (the commitment tree, the nullifier set, the anchors, the validator rewards) must agree
-/// there. `Ledger`'s own equality covers all of it, but comparing state roots localises a
-/// failure to a height instead of dumping two whole ledgers.
-fn assert_chains_equal(nodes: &[&TestNode]) {
-    let common = nodes.iter().map(|n| n.handle.storage.head().unwrap().height).min().unwrap();
-    let reference = &nodes[0].handle.storage;
-    for h in 0..=common {
-        let r = reference.block_by_height(h).unwrap().unwrap();
-        for (i, n) in nodes.iter().enumerate().skip(1) {
-            let b = n.handle.storage.block_by_height(h).unwrap().unwrap();
-            assert_eq!(b.hash(), r.hash(), "node {i} differs from node 0 at height {h}");
-            assert_eq!(b.header.state_root, r.header.state_root, "state root differs at height {h}");
-            assert_eq!(n.handle.storage.qc_by_height(h).unwrap().unwrap().block_hash, b.hash(), "qc mismatch at {h}");
-        }
-    }
-    // The tree is append-only, so a node that is a few blocks ahead has a superset of the
-    // leaves; what must match at the common height is the chain above, already checked. Here
-    // only the genesis-relative invariant is asserted: nobody has lost a leaf.
-    let least = nodes.iter().map(|n| n.handle.storage.notes_count().unwrap()).min().unwrap();
-    for (i, n) in nodes.iter().enumerate() {
-        assert!(n.handle.storage.notes_count().unwrap() >= least, "node {i} lost notes");
-    }
-}
-
-async fn wait_caught_up(node: &TestNode, others: &[&TestNode], timeout: Duration) {
-    wait_for("node catches up", timeout, || {
-        let target = others.iter().map(|n| n.height()).max().unwrap();
-        node.height() + 1 >= target
-    })
-    .await;
+    common::bridge::transfer_attestation(TOKEN_CHAIN, TOKEN, to.recipient_hash(), amount, 0)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
