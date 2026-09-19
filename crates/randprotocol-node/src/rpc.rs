@@ -13,7 +13,8 @@ use crate::storage::Storage;
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use randprotocol_core::bridge::{asset_id, AssetInfo, BridgeMeta};
+use randprotocol_core::bridge::asset_id;
+use randprotocol_core::ledger::tokens::{MintAuthority, TokenInfo, TokenRegistry};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::notes::{word8_to_hex, Envelope};
 use randprotocol_core::{Action, CallReceipt, Hash, ProgramId, ShieldedAddress, Transaction, TOKEN_DECIMALS, TOKEN_SYMBOL};
@@ -671,31 +672,37 @@ fn envelope_json(e: &Envelope) -> Value {
 }
 
 /// What a `BridgeAttest` deposits, as far as it is public: the note's asset index and the
-/// amount. `None` for a rotation, for an attestation this node cannot decode, and for an asset
-/// the registry does not hold — the last of which only a transaction that is not committed yet
+/// amount. `None` for a rotation, for an attestation this node cannot decode, and for a token
+/// this chain has not listed — the last of which only a transaction that is not committed yet
 /// can be.
-fn attest_deposit(attestation: &[u8], bridge: Option<&BridgeMeta>) -> Option<(u32, u64)> {
+fn attest_deposit(attestation: &[u8], tokens: Option<&TokenRegistry>) -> Option<(u32, u64)> {
     let (asset, amount) = randprotocol_core::ledger::bridge_notes::attested_transfer(attestation)?;
-    Some((bridge?.assets.get(&asset)?.index, amount))
+    Some((tokens?.get_by_id(&asset)?.index, amount))
 }
 
-/// One row of the bridge's asset registry: the note's `asset` word and the wire identity
-/// guardians sign about.
-fn asset_json(asset: &randprotocol_core::bridge::AssetId, info: &AssetInfo) -> Value {
+/// One bridged token as the asset registry serves it: the note's `asset` word and the wire
+/// identity guardians sign about, which is the token's `Bridge` mint authority. The row shape is
+/// the one `rand_getAssets` has always had — the registry behind it moved, the JSON did not.
+fn asset_json(info: &TokenInfo, chain: u16, token: &[u8; 32]) -> Value {
     json!({
         "index": info.index,
-        "chain": info.chain,
-        "token": hex::encode(info.token),
-        "asset_id": asset.to_hex(),
+        "chain": chain,
+        "token": hex::encode(token),
+        "asset_id": info.id.to_hex(),
     })
 }
 
-/// The registry as `rand_getAssets` serves it: one row per registered asset, ascending by
-/// index, which is registration order.
-fn assets_json(bridge: &BridgeMeta) -> Vec<Value> {
-    let mut rows: Vec<(&randprotocol_core::bridge::AssetId, &AssetInfo)> = bridge.assets.iter().collect();
-    rows.sort_by_key(|(_, info)| info.index);
-    rows.into_iter().map(|(asset, info)| asset_json(asset, info)).collect()
+/// The bridged half of the token registry as `rand_getAssets` serves it: one row per
+/// `Bridge`-authority token, ascending by index, which is listing order. A native RPL token is
+/// not a bridged asset and is not here (Task 7's `rand_getTokens` is the whole registry).
+fn assets_json(tokens: &TokenRegistry) -> Vec<Value> {
+    tokens
+        .iter()
+        .filter_map(|info| match &info.authority {
+            MintAuthority::Bridge { chain, token } => Some(asset_json(info, *chain, token)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One block as a light wallet reads it: the header fields it chains on, and per transaction
@@ -774,13 +781,13 @@ fn finality_json(f: &Finality) -> Value {
     }
 }
 
-fn block_json(b: &randprotocol_core::Block, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor, storage: &crate::storage::Storage) -> Value {
+fn block_json(b: &randprotocol_core::Block, tokens: Option<&TokenRegistry>, executor: &dyn ConfidentialExecutor, storage: &crate::storage::Storage) -> Value {
     let sealed = storage.block_sealed(&b.hash()).unwrap_or(false);
     let txs: Vec<Value> = b
         .transactions
         .iter()
         .map(|t| {
-            let mut j = tx_json(t, bridge, executor);
+            let mut j = tx_json(t, tokens, executor);
             // Per-bundle `sealed_by` (spec §8): the aggregate that covered it, `null` while it
             // is coverable — and for a bundle-less transaction, `null` by construction.
             let sealed_by = match &t.bundle {
@@ -868,10 +875,10 @@ fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
     })
 }
 
-/// `bridge` is the asset registry, which a `BridgeAttest` needs and nothing else does: the
+/// `tokens` is the asset registry, which a `BridgeAttest` needs and nothing else does: the
 /// deposit's asset index is state, not a field of the transaction. `executor` is what computes
 /// that deposit's commitment, the one note commitment the wire does not carry.
-fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>, executor: &dyn ConfidentialExecutor) -> Value {
+fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn ConfidentialExecutor) -> Value {
     let bundle = t.bundle.as_ref().map(bundle_json);
     let action = match &t.action {
         Action::None => json!({ "kind": "none" }),
@@ -911,7 +918,7 @@ fn tx_json(t: &Transaction, bridge: Option<&BridgeMeta>, executor: &dyn Confiden
         // registry does not name the asset yet. The recipient is public in this transaction
         // only — the note's later spend is not.
         Action::BridgeAttest { attestation, recipient, r, time, asset, .. } => {
-            let deposit = attest_deposit(attestation, bridge);
+            let deposit = attest_deposit(attestation, tokens);
             json!({
                 "kind": "bridge_attest",
                 "attestation_len": attestation.len(),
@@ -1396,7 +1403,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         }
         "rand_getTransaction" => {
             let h = parse_hash(p, 0)?;
-            let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
+            let tokens = st.storage.tokens().map_err(RpcError::internal)?;
             match st.storage.tx_location(&h).map_err(RpcError::internal)? {
                 None => Ok(Value::Null),
                 Some((height, index)) => {
@@ -1410,7 +1417,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                         "height": height,
                         "index": index,
                         "block_hash": b.hash().to_hex(),
-                        "tx": tx_json(tx, bridge.as_ref(), st.executor.as_ref()),
+                        "tx": tx_json(tx, tokens.as_ref(), st.executor.as_ref()),
                     }))
                 }
             }
@@ -1436,8 +1443,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             // — computed from the registry exactly as `tx_json` renders it.
             let deposit_cm = match &tx.action {
                 Action::BridgeAttest { attestation, recipient, r, time, .. } => {
-                    let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
-                    attest_deposit(attestation, bridge.as_ref()).map(|(index, amount)| {
+                    let tokens = st.storage.tokens().map_err(RpcError::internal)?;
+                    attest_deposit(attestation, tokens.as_ref()).map(|(index, amount)| {
                         randprotocol_core::ledger::bridge_notes::deposit_commitment(
                             recipient,
                             amount,
@@ -1478,15 +1485,15 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         }
         "rand_getBlockByHeight" => {
             let h: u64 = param(p, 0, "height")?;
-            let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
+            let tokens = st.storage.tokens().map_err(RpcError::internal)?;
             let block = st.storage.block_by_height(h).map_err(RpcError::internal)?;
-            Ok(block.map(|b| block_json(&b, bridge.as_ref(), st.executor.as_ref(), &st.storage)).unwrap_or(Value::Null))
+            Ok(block.map(|b| block_json(&b, tokens.as_ref(), st.executor.as_ref(), &st.storage)).unwrap_or(Value::Null))
         }
         "rand_getBlockByHash" => {
             let h = parse_hash(p, 0)?;
-            let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
+            let tokens = st.storage.tokens().map_err(RpcError::internal)?;
             let block = st.storage.block_by_hash(&h).map_err(RpcError::internal)?;
-            Ok(block.map(|b| block_json(&b, bridge.as_ref(), st.executor.as_ref(), &st.storage)).unwrap_or(Value::Null))
+            Ok(block.map(|b| block_json(&b, tokens.as_ref(), st.executor.as_ref(), &st.storage)).unwrap_or(Value::Null))
         }
         // Headers over a range, capped like `rand_getCompactBlocks`: the block list a client
         // pages through without paying for every transaction in it.
@@ -1589,6 +1596,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let Some(bridge) = st.storage.bridge_meta().map_err(RpcError::internal)? else {
                 return Ok(json!({ "enabled": false }));
             };
+            // The asset registry is the token registry now, so the `assets` array is read from
+            // there; a bridged chain always has one (`GenesisError::BridgeNeedsTokens`), and a
+            // store that somehow lacks it serves an empty registry rather than failing the call.
+            let tokens = st.storage.tokens().map_err(RpcError::internal)?;
             let guardians = bridge
                 .guardian_sets
                 .get(&bridge.current_set)
@@ -1605,15 +1616,19 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "guardian_set_index": bridge.current_set,
                 "guardians": guardians,
                 "burn_sequence": bridge.burn_sequence,
-                "next_index": bridge.next_index,
-                "assets": assets_json(&bridge),
+                // `next_index` is gone with the bridge's own registry: there is no index to
+                // predict any more, because a bridged token is listed before it can be deposited
+                // and its index is a fact a wallet reads off `assets` (`rand_getAssets`).
+                "assets": tokens.as_ref().map(assets_json).unwrap_or_default(),
             }))
         }
-        // The registry alone, which is what a wallet needs to read a note's `asset` word.
-        // Empty on a chain without a bridge, like every other bridge read here.
+        // The registry alone, which is what a wallet needs to read a note's `asset` word: the
+        // bridged (`Bridge`-authority) rows of the token registry. Empty on a chain without a
+        // bridge, like every other bridge read here.
         "rand_getAssets" => {
-            let bridge = st.storage.bridge_meta().map_err(RpcError::internal)?;
-            Ok(json!(bridge.as_ref().map(assets_json).unwrap_or_default()))
+            let tokens = st.storage.tokens().map_err(RpcError::internal)?;
+            let bridged = st.storage.bridge_meta().map_err(RpcError::internal)?.is_some();
+            Ok(json!(tokens.as_ref().filter(|_| bridged).map(assets_json).unwrap_or_default()))
         }
         // The outbound message with this sequence, verbatim, for guardians to sign.
         "rand_getBridgeBurn" => {
@@ -3252,9 +3267,9 @@ mod tests {
         assert!(!text.contains("body") && !text.contains("kem_ct"), "{text}");
     }
 
-    /// A bridged chain with one committed attestation (1000 units of the test token to the
-    /// fixture recipient, registering it as asset 1) and one committed burn of 400 with a
-    /// relayer fee of 100.
+    /// A bridged chain with one committed attestation (1000 units of the test token — asset 1,
+    /// the genesis listing's index — to the fixture recipient) and one committed burn of 400
+    /// with a relayer fee of 100.
     fn bridged_chain() -> (tempfile::TempDir, RpcState, GenesisState, randprotocol_core::Transaction) {
         let (gs, secrets) = fixtures::bridged_genesis(1);
         let (dir, st) = state_for(&gs);
@@ -3281,10 +3296,13 @@ mod tests {
         assert_eq!(v["guardian_set_index"], 0);
         assert_eq!(v["guardians"].as_array().unwrap().len(), 6);
         assert_eq!(v["burn_sequence"], 1);
-        assert_eq!(v["next_index"], 2, "one asset registered, so the next one gets index 2");
+        // `next_index` is gone with the bridge's own registry: there is no index left to predict,
+        // because a bridged token is listed before it can be deposited.
+        assert!(v.get("next_index").is_none(), "no index to predict any more");
         assert!(!serde_json::to_string(&v).unwrap().contains("balance"));
 
-        // The registry alone, which is what a wallet needs to read a note's `asset` word.
+        // The registry alone, which is what a wallet needs to read a note's `asset` word. Its
+        // rows are the token registry's bridged half now, in the shape they have always had.
         let asset = randprotocol_core::bridge::asset_id(2, &fixtures::TOKEN);
         let row = json!({
             "index": 1, "chain": 2, "token": hex::encode(fixtures::TOKEN), "asset_id": asset.to_hex(),
@@ -3709,7 +3727,7 @@ mod tests {
             storage.commit(&[b1, b2], &ledger, &[], &StubExecutor).unwrap();
             let expected_deposit = randprotocol_core::ledger::bridge_notes::deposit_note(
                 &att,
-                ledger.bridge().expect("bridged genesis"),
+                ledger.tokens().expect("a bridged genesis lists its tokens"),
                 &StubExecutor,
             )
             .expect("the attestation deposits into a registered asset");

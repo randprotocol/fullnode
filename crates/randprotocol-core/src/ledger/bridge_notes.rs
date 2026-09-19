@@ -277,6 +277,21 @@ pub fn attested_transfer(attestation: &[u8]) -> Option<(AssetId, u64)> {
     Some((asset_id(t.token_chain, &t.token_address), amount))
 }
 
+/// The `(chain, token)` pair an attestation's transfer names, from the wire bytes alone — the
+/// key the token registry lists a bridged token under, and the two fields
+/// [`crate::bridge::BridgeError::UnlistedToken`] reports.
+///
+/// [`attested_transfer`] answers the same question hashed into an [`AssetId`], which is what a
+/// registry lookup wants; this is for the caller that has to *name* the pair, such as the
+/// mempool reporting why a pooled attestation deposits nothing. `None` in exactly the same cases.
+pub fn attested_token(attestation: &[u8]) -> Option<(u16, [u8; 32])> {
+    let att = Attestation::decode(attestation).ok()?;
+    let Payload::Transfer(t) = Payload::decode(&att.body.payload).ok()? else {
+        return None;
+    };
+    Some((t.token_chain, t.token_address))
+}
+
 /// The deposit note a `BridgeAttest` appended — the commitment and the envelope sealed against
 /// it — recomputed from the transaction and the asset registry.
 ///

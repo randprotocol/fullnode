@@ -11,6 +11,7 @@ use randprotocol_core::bridge::{BridgeBurnRecord, BridgeMeta, BridgeState};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{CommittedBlock, EpochSets, SafetyState};
 use randprotocol_core::genesis::GenesisState;
+use randprotocol_core::ledger::tokens::TokenRegistry;
 use randprotocol_core::ledger::{Supply, ValidatorEntry};
 use randprotocol_core::notes::{word8_from_bytes, word8_to_bytes, CommitmentTree, Envelope, FullTree, Word8, DEPTH};
 use randprotocol_core::{
@@ -264,13 +265,14 @@ fn sync_opts() -> WriteOptions {
 /// leaf gets on disk is the index the ledger gave it.
 ///
 /// A `BridgeAttest`'s deposit is the one commitment the wire does not carry: the chain computes
-/// it from the amount the guardians signed, the `time` the action published and the asset the
-/// registry named, so this recomputes it the same way, through the ledger's own function.
-/// `bridge` is that registry — absent only on a chain without a bridge, where a `BridgeAttest`
-/// is inadmissible.
+/// it from the amount the guardians signed, the `time` the action published and the index the
+/// token registry holds for the asset, so this recomputes it the same way, through the ledger's
+/// own function. `tokens` is that registry (the RPL token standard — the bridge keeps none of
+/// its own) — absent only on a chain without a `tokens` section, which is a chain without a
+/// bridge, where a `BridgeAttest` is inadmissible.
 fn created_notes(
     tx: &randprotocol_core::Transaction,
-    bridge: Option<&BridgeState>,
+    tokens: Option<&TokenRegistry>,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<Vec<(Word8, Envelope)>> {
     let mut out = Vec::new();
@@ -282,15 +284,15 @@ fn created_notes(
     match &tx.action {
         Action::Mint { cm, envelope, .. } => out.push((*cm, envelope.clone())),
         Action::BridgeAttest { attestation, .. } => {
-            let bridge = bridge.ok_or_else(|| {
-                StorageError::Corrupt("committed block has a bridge attestation but no bridge state".into())
+            let tokens = tokens.ok_or_else(|| {
+                StorageError::Corrupt("committed block has a bridge attestation but no token registry".into())
             })?;
             // A guardian-set rotation is the one attestation that deposits nothing. Everything
-            // else was admitted, so it decodes and its asset is registered; failing to find the
+            // else was admitted, so it decodes and its token is listed; failing to find the
             // note here is a torn block, and leaving the leaf out would put the notes family one
             // short of the tree the ledger committed to.
             if randprotocol_core::ledger::bridge_notes::attested_transfer(attestation).is_some() {
-                let note = randprotocol_core::ledger::bridge_notes::deposit_note(tx, bridge, executor)
+                let note = randprotocol_core::ledger::bridge_notes::deposit_note(tx, tokens, executor)
                     .ok_or_else(|| {
                         StorageError::Corrupt(
                             "committed attestation deposits an asset the registry does not hold".into(),
@@ -1405,7 +1407,7 @@ impl Storage {
                 for nf in tx.nullifiers() {
                     batch.put_cf(self.cf(CF_NULLIFIERS), word8_to_bytes(&nf), hk);
                 }
-                for (cm, envelope) in created_notes(tx, ledger_after.bridge(), executor)? {
+                for (cm, envelope) in created_notes(tx, ledger_after.tokens(), executor)? {
                     let row = NoteRow { cm, envelope, height: block.height() };
                     batch.put_cf(self.cf(CF_NOTES), height_key(next_index), bincode::serialize(&row)?);
                     next_index += 1;
@@ -1974,7 +1976,7 @@ pub(crate) mod fixtures {
     use super::*;
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::bridge::{guardian_address, BridgeConfig};
-    use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisValidator, TokensConfig};
+    use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisToken, GenesisValidator, TokensConfig};
     use randprotocol_core::notes::{word8_to_hex, Bundle, ShieldedAddress};
     use randprotocol_core::{gas, BlockHeader, Keypair, Transaction};
 
@@ -2097,10 +2099,20 @@ pub(crate) mod fixtures {
             fri_profile: "test".into(),
             hc_bundle: word8_to_hex(&HC),
             bridge: Some(config),
-            // A bridge section now needs a tokens section (the RPL gate rides the same fork);
-            // no tokens are listed, so the registry it builds is empty and this fixture's state
-            // root moves only from `rand-state-3` to `rand-state-4`, not from anything it tests.
-            tokens: Some(TokensConfig { registration_fee: 1_000_000_000, tokens: vec![] }),
+            // A bridge section needs a tokens section (the RPL gate rides the same fork), and a
+            // bridged token is *listed* there before any attestation of it is admissible. The
+            // fixture lists [`TOKEN`] and nothing else, so it takes index 1 — the number every
+            // bridge fixture below deposits and burns under, which used to come from first
+            // sighting and now comes from this line.
+            tokens: Some(TokensConfig {
+                registration_fee: 1_000_000_000,
+                tokens: vec![GenesisToken {
+                    name: "Tether USD".into(),
+                    symbol: "zUSDT".into(),
+                    chain: 2,
+                    token: TOKEN,
+                }],
+            }),
             aggregation: None,
             epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
@@ -2180,11 +2192,12 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// The `asset` word an honest submitter fills in: the index `ledger`'s registry says this
-    /// attestation deposits under, or 0 for a rotation, which deposits nothing.
+    /// The `asset` word an honest submitter fills in: the index `ledger`'s token registry says
+    /// this attestation deposits under, or 0 for a rotation (which deposits nothing) and for a
+    /// token this chain has not listed (which is refused outright).
     pub(crate) fn deposit_index(ledger: &Ledger, attestation: &[u8]) -> u32 {
         randprotocol_core::ledger::bridge_notes::attested_transfer(attestation)
-            .and_then(|(asset, _)| ledger.bridge().and_then(|b| b.deposit_index(&asset)))
+            .and_then(|(asset, _)| ledger.tokens().and_then(|t| t.get_by_id(&asset)).map(|info| info.index))
             .unwrap_or(0)
     }
 
@@ -2477,7 +2490,11 @@ mod tests {
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 
         let live = ledger.bridge().unwrap();
-        assert_eq!(live.asset_index(&randprotocol_core::bridge::asset_id(2, &TOKEN)), Some(1));
+        assert_eq!(
+            ledger.tokens().unwrap().bridged(2, &TOKEN).map(|t| (t.index, t.total_supply)),
+            Some((1, 600)),
+            "the listed token's index, and the deposit less the burn"
+        );
         assert_eq!(live.spent.len(), 1);
         assert_eq!(live.burns.len(), 1);
 
@@ -2491,11 +2508,17 @@ mod tests {
         let back = reloaded.bridge().expect("the bridge reloaded");
         assert_eq!(back.spent, live.spent, "the consumed digests survive the restart");
         assert_eq!(back.burns, live.burns, "and so does the outbound log");
-        assert_eq!(back.next_index, 2, "and the index the next new asset will get");
+        assert_eq!(
+            reloaded.tokens().unwrap(),
+            ledger.tokens().unwrap(),
+            "and the token registry — indices and supplies — comes back whole"
+        );
 
         // The deposit note is leaf 2 — after the fee bundle's two — and is served like any
         // other, so a wallet scanning the tree finds its bridged deposit.
-        let deposit = randprotocol_core::ledger::bridge_notes::deposit_note(&att, back, &StubExecutor).unwrap();
+        let deposit =
+            randprotocol_core::ledger::bridge_notes::deposit_note(&att, reloaded.tokens().unwrap(), &StubExecutor)
+                .unwrap();
         let row = s.note(2).unwrap().expect("the deposit note is indexed");
         assert_eq!((row.cm, row.envelope), deposit);
         assert_eq!(row.height, 1);
@@ -2917,7 +2940,8 @@ mod tests {
             assert_eq!(withdraw_row.height, 2, "attest_first={attest_first}");
 
             let bridge = ledger.bridge().expect("bridged genesis");
-            let expected_deposit = randprotocol_core::ledger::bridge_notes::deposit_note(&att, bridge, &StubExecutor)
+            let expected_deposit =
+                randprotocol_core::ledger::bridge_notes::deposit_note(&att, ledger.tokens().unwrap(), &StubExecutor)
                 .expect("the attestation registered an asset and deposits into it");
             let deposit_leaf = (base..base + 4)
                 .find(|&i| s.note(i).unwrap().expect("leaf in range").cm == expected_deposit.0)

@@ -450,31 +450,39 @@ impl Mempool {
             if !ledger.time_in_window(*time) {
                 return Err(TxError::TimeOutOfWindow { time: *time, height: ledger.height() });
             }
-            // And its `asset` goes stale the same way: a pooled first sighting names the index it
-            // sealed an envelope for, and a *competing* first sighting committing in the meantime
-            // moves the index the registry would assign — which admission now refuses
-            // (`TxError::AttestAssetMismatch`). Decoding the attestation costs no signature work,
-            // and a rotation (which decodes to no transfer) binds no index.
+            // And its `asset` is screened against the registry the same way: the action names the
+            // index its envelope was sealed for, and admission holds it to the index the token
+            // registry gives that asset (`TxError::AttestAssetMismatch`). A listed token's index
+            // never moves — listing, not first sighting, is what hands one out — so this is a
+            // plain compare now rather than a race the pool had to watch; it stays because a
+            // transaction built against another chain's registry, or against a node that had not
+            // yet seen a listing, would otherwise sit in the pool until restart. Decoding the
+            // attestation costs no signature work, and a rotation (which decodes to no transfer)
+            // binds no index.
             if let Some((id, _)) = bridge_notes::attested_transfer(attestation) {
-                // No registry at all is no bridge, which is the bridge's own verdict rather than a
-                // mismatch — the error `Ledger::validate` gives it, so a caller that prechecks
-                // before validating hears the same thing either way. A pooled attest can only
-                // exist on a bridged chain, so this arm is unreachable from `still_applies`.
-                let Some(bridge) = ledger.bridge() else {
+                // No bridge is the bridge's own verdict rather than a mismatch — the error
+                // `Ledger::validate` gives it, so a caller that prechecks before validating hears
+                // the same thing either way. A pooled attest can only exist on a bridged chain, so
+                // this arm is unreachable from `still_applies`.
+                if ledger.bridge().is_none() {
                     return Err(TxError::Bridge(BridgeError::Disabled));
-                };
-                // A registry with no index left to give is `check_attest`'s refusal, not a
-                // mismatch — the index the action names is not wrong, there is simply nowhere to
-                // deposit — and it is the error `validate` answers with (`BridgeError::
-                // AssetRegistryFull`, via `BridgeState::asset_entry`). `validate`'s own pre-screen
-                // is silent here for that reason; this one cannot be, because a `false` from
-                // `still_applies` is what takes the transaction out of the pool.
-                match bridge.deposit_index(&id) {
+                }
+                // A token nobody listed deposits nothing at all, and `validate`'s answer for it is
+                // the bridge's `UnlistedToken` rather than a mismatched index — the index the
+                // action names is not wrong, there is simply nothing to deposit. `validate`'s own
+                // pre-screen is silent in that case for the same reason; this one cannot be,
+                // because a `false` from `still_applies` is what takes the transaction out of the
+                // pool.
+                match ledger.tokens().and_then(|t| t.get_by_id(&id)).map(|info| info.index) {
                     Some(index) if index == *asset => {}
                     Some(index) => {
                         return Err(TxError::AttestAssetMismatch { expected: index, actual: *asset })
                     }
-                    None => return Err(TxError::Bridge(BridgeError::AssetRegistryFull)),
+                    None => {
+                        let (chain, token) = bridge_notes::attested_token(attestation)
+                            .expect("a decoded transfer names its (chain, token) pair");
+                        return Err(TxError::Bridge(BridgeError::UnlistedToken { chain, token }));
+                    }
                 }
             }
         }
@@ -1221,48 +1229,47 @@ mod tests {
         assert!(m.insert(second, &l, &StubExecutor).is_ok());
     }
 
-    /// Two *different* tokens, both seen for the first time, both predicting the registry's next
-    /// index for their deposit note. They do not conflict in the pool — different digests,
-    /// different notes — but only one of them can have index 1, and the loser's `asset` word no
-    /// longer matches what the ledger would assign it. Admission refuses that
-    /// (`TxError::AttestAssetMismatch`), so the pool has to stop offering it: the alternative is a
-    /// proposer building a block that dies on its own candidate.
+    /// The race this test used to describe is gone. Two *different* tokens, both seen for the
+    /// first time, used to predict the same next index and one of them had to lose it — so a
+    /// pooled attest could go stale on an index that moved under it. Bridged tokens are listed
+    /// now (in genesis, or by a governance message), so an index is a fact before any attestation
+    /// of it exists and nothing can take it from a transaction being proved.
+    ///
+    /// What is left is the refusal that replaced the race — an attestation of a token nobody
+    /// listed never enters the pool — and the stability: a pooled attest of a listed token is
+    /// still a candidate after other transactions commit.
     #[test]
-    fn a_pooled_first_sighting_is_dropped_once_another_registers_its_index() {
+    fn an_attest_of_an_unlisted_token_is_refused_and_a_listed_ones_index_cannot_move() {
         let (l, secrets) = bridged_ledger();
-        let mine = attest_tx(&l, attestation_of(&secrets, [0xaa; 32], 0), 10);
-        let theirs = attest_tx(&l, attestation_of(&secrets, [0xbb; 32], 1), 20);
-        // Both name index 1 — the registry is empty, so that is what either would be given.
-        for tx in [&mine, &theirs] {
-            let Action::BridgeAttest { asset, .. } = &tx.action else { panic!("an attest") };
-            assert_eq!(*asset, 1);
-            assert_eq!(l.validate(tx, &StubExecutor), Ok(()));
-        }
+        // The fixture genesis lists chain 2's `[0xaa; 32]` at index 1, and nothing else.
+        let unlisted = attest_tx(&l, attestation_of(&secrets, [0xbb; 32], 1), 20);
+        assert_eq!(
+            l.validate(&unlisted, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::UnlistedToken { chain: 2, token: [0xbb; 32] })),
+            "no listing, no index, no deposit"
+        );
         let mut m = Mempool::new(100);
+        assert!(m.insert(unlisted, &l, &StubExecutor).is_err(), "and so it never reaches the pool");
+        assert_eq!(m.len(), 0);
+
+        let mine = attest_tx(&l, attestation_of(&secrets, [0xaa; 32], 0), 10);
+        let Action::BridgeAttest { asset, .. } = &mine.action else { panic!("an attest") };
+        assert_eq!(*asset, 1, "the index the genesis listing gave it");
+        assert_eq!(l.validate(&mine, &StubExecutor), Ok(()));
         m.insert(mine.clone(), &l, &StubExecutor).unwrap();
         assert_eq!(m.candidates(&l, 10), vec![mine.clone()]);
 
-        // The other one commits. Nothing mine spends is spent and its digest is untouched, so
-        // only the moved index can drop it.
+        // Another transaction commits while it waits. Nothing it spends is spent, its digest is
+        // untouched — and, unlike the old first sighting, its index cannot have moved, because
+        // no transaction of any kind hands one out.
         let mut after = l.clone();
-        after.apply_tx(&theirs, &fixtures::key(1).address(), &StubExecutor).unwrap();
-        assert!(!after.is_digest_spent(&mine.bridge_digests()[0]));
-        assert!(mine.nullifiers().iter().all(|nf| !after.is_spent(nf)));
-        assert!(matches!(
-            after.validate(&mine, &StubExecutor),
-            Err(TxError::AttestAssetMismatch { expected: 2, actual: 1 })
-        ));
-        assert!(m.candidates(&after, 10).is_empty(), "still offered to the proposer");
+        let other = fixtures::bundle_tx(&after, [nf(60), nf(61)], [cm(60), cm(61)], fixtures::bundle_fee());
+        after.apply_tx(&other, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        assert_eq!(after.tokens().unwrap().bridged(2, &[0xaa; 32]).unwrap().index, 1);
+        assert_eq!(after.validate(&mine, &StubExecutor), Ok(()));
+        assert_eq!(m.candidates(&after, 10), vec![mine.clone()], "still offered to the proposer");
         m.prune(&after);
-        assert_eq!(m.len(), 0);
-
-        // Re-sealed and re-proved against the registry as it now stands, the same deposit is
-        // admissible again — the wallet pays for a second bundle, not a lost note.
-        let again = attest_tx(&after, attestation_of(&secrets, [0xaa; 32], 0), 30);
-        let Action::BridgeAttest { asset, .. } = &again.action else { panic!("an attest") };
-        assert_eq!(*asset, 2);
-        m.insert(again.clone(), &after, &StubExecutor).unwrap();
-        assert_eq!(m.candidates(&after, 10), vec![again]);
+        assert_eq!(m.len(), 1);
     }
 
     /// Two attestations of one transfer, with two different digests — a different `sequence`, so
