@@ -2,8 +2,8 @@
 //!
 //! `randprotocol-core` deliberately knows no field arithmetic and no AEAD: its `ShieldedAddress`,
 //! `Envelope` and `BundleDigestInput` are plain serialisable records with the same shape as the
-//! research crate's `viewing::Address`, `viewing::Envelope` and `notes::bundle_digest`'s
-//! argument list. This module is the one place the two representations meet, so that the
+//! research crate's `viewing::Address`, `viewing::Envelope` and the hidden-asset digest's
+//! preimage (`hidden::HiddenDigestInput`). This module is the one place the two representations meet, so that the
 //! vendored files stay byte-identical to upstream across a `deploy/sync-zkvm.sh` resync and
 //! nothing node-specific has to be hand-patched into them.
 
@@ -59,19 +59,20 @@ pub fn seal_note(sender: &ViewingKey, to: &ShieldedAddress, note: &Note, tx_key:
     Ok(envelope_to_core(&viewing::Envelope::seal(sender, &to_research(to)?, note, tx_key)))
 }
 
-/// The public preimage of a bundle digest, in spec field order — the argument list
-/// `notes::bundle_digest` takes, packaged as the record `randprotocol-core` passes around.
+/// The public preimage of a hidden-asset bundle digest, in spec §3.4 field order, packaged as the
+/// record `randprotocol-core` passes around.
 #[allow(clippy::too_many_arguments)]
 pub fn digest_input_of(
     anchor: Word8,
-    nullifiers: [Word8; 2],
-    commitments: [Word8; 2],
+    nullifiers: [Word8; 4],
+    commitments: [Word8; 4],
     fee: u64,
-    burn: u64,
-    asset: u32,
+    burn_a: u64,
+    burn_r: u64,
+    burn_asset: u32,
     time: u32,
 ) -> BundleDigestInput {
-    BundleDigestInput { anchor, nullifiers, commitments, fee, burn, asset, time }
+    BundleDigestInput { anchor, nullifiers, commitments, fee, burn_a, burn_r, burn_asset, time }
 }
 
 #[cfg(test)]

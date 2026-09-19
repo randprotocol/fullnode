@@ -23,7 +23,7 @@ use randprotocol_core::{format_amount, gas, Action, Hash, Transaction};
 use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note};
 use randprotocol_zkvm::executor::prove_bundle;
 use randprotocol_zkvm::machine::{Backend, FriProfile};
-use randprotocol_zkvm::notes::{bundle_inputs, expected_bundle_outputs, Note, SpendKey, ViewingKey};
+use randprotocol_zkvm::notes::{Note, SpendKey, ViewingKey};
 use randprotocol_zkvm::viewing::TxKey;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -345,13 +345,6 @@ fn sealed_outputs(tx: &Transaction) -> Vec<(&'static str, u8, Word8, &Envelope)>
     }
     if let Action::Mint { cm, envelope, .. } = &tx.action {
         out.push(("mint", 0, *cm, envelope));
-    }
-    // Every two-bundle action's asset bundle — a `BridgeBurn`'s, a `TokenTransfer`'s or a
-    // `TokenBurn`'s — seals its outputs exactly as the fee bundle does.
-    if let Some(asset_bundle) = tx.action.asset_bundle() {
-        for (i, (cm, e)) in asset_bundle.commitments.iter().zip(&asset_bundle.envelopes).enumerate() {
-            out.push(("asset_bundle", i as u8, *cm, e));
-        }
     }
     out
 }
@@ -755,10 +748,8 @@ impl Burn {
 
 /// What a submitted transaction did, for the caller to print.
 ///
-/// A `BridgeBurn` carries two bundles, and its figures are the *asset* bundle's: `amount` is what
-/// left the pool (the burn), `change` what came back as a note, `asset` the index both are
-/// denominated in. `fee` is always the RAND the fee bundle paid. With two proofs, `tier` is the
-/// larger of the two and `proof_bytes`/`proving` are the totals.
+/// For a burn of a token, `amount` is what left the pool (the burn), `change` what came back as a
+/// note, `asset` the index both are denominated in. `fee` is always the RAND the bundle paid.
 #[derive(Clone, Debug)]
 pub struct Submission {
     pub hash: Hash,
@@ -808,8 +799,12 @@ impl Submission {
 /// spends, the payment its first output carries, and the three words that say what kind of bundle
 /// it is.
 ///
-/// Every transaction has exactly one of these except a `BridgeBurn`, which has two (spec §10): a
-/// RAND bundle that pays the fee and an asset bundle that burns.
+/// Still the two-slot, one-asset plan of the retired bundle: the hidden-asset bundle (four slots,
+/// a private asset in slots 0–1 and RAND in 2–3, one bundle per transaction) needs a plan across
+/// two assets, which is H5's (`docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`
+/// §7). Until then [`prepare_one`] refuses to build a bundle from it, and the payment fields are
+/// not read — H5's planner reads them again.
+#[allow(dead_code)]
 struct Plan {
     /// One or two notes, all of `asset`; a second slot the wallet does not need becomes a dummy.
     chosen: Vec<OwnedNote>,
@@ -859,7 +854,7 @@ impl Plan {
 struct Prepared {
     /// The bundle, `proof` empty.
     bundle: Bundle,
-    /// The guest's private inputs (`bundle_inputs`).
+    /// The guest's private inputs (`hidden::hidden_bundle_inputs`, from H5 on).
     words: Vec<u32>,
     /// The digest this wallet computed from its own plaintext, which the proof must publish.
     expected: Word8,
@@ -949,93 +944,44 @@ async fn prepare_bundles(rpc: &RpcClient, w: &Wallet, plans: &[Plan]) -> Result<
     Ok((prepared, time))
 }
 
-/// One planned bundle, everything but its proof: the slots, the two outputs, the expected digest
-/// and the two envelopes. The envelopes are sealed against the output notes, never the proof, so
-/// they exist before it — which is what lets the transaction binding cover them.
+/// One planned bundle, everything but its proof: the slots, the outputs, the expected digest and
+/// the envelopes. The envelopes are sealed against the output notes, never the proof, so they
+/// exist before it — which is what lets the transaction binding cover them.
+///
+/// **Not built yet for the hidden-asset bundle** (chain 14): the wallet's four-slot, two-asset
+/// witness and its four envelopes are H5's. Until then this refuses — clearly, before any proof
+/// is paid for — rather than build a two-slot witness the chain's guest would never accept.
 fn prepare_one(
-    w: &Wallet,
+    _w: &Wallet,
     plan: &Plan,
-    paths: &[[Word8; DEPTH]],
-    root: Word8,
-    time: u32,
-    which: String,
+    _paths: &[[Word8; DEPTH]],
+    _root: Word8,
+    _time: u32,
+    _which: String,
 ) -> Result<Prepared> {
-    // A dummy input is a zero-value note owned by this wallet with an all-zero path at index 0:
-    // the guest forces every input's owner to the derived `pk_self` and skips `MERKLE_VERIFY` (and
-    // the asset check) for a zero-amount slot, so the path is never dereferenced. `Note::new` is
-    // what gives it a fresh `r`, without which two dummies would share a commitment (and hence a
-    // nullifier).
-    let pk_self = w.vk.pk();
-    let dummy = || (Note::new(pk_self, [0; 8], 0, plan.asset, time), [[0u32; 8]; DEPTH], 0u32);
-    let mut slots: Vec<(Note, [Word8; DEPTH], u32)> = plan
-        .chosen
-        .iter()
-        .zip(paths)
-        .map(|(n, path)| (n.note, *path, u32::try_from(n.index).expect("a leaf index fits 32 bits at DEPTH = 32")))
-        .collect();
-    while slots.len() < 2 {
-        slots.push(dummy());
-    }
-    let inputs: [(Note, [Word8; DEPTH], u32); 2] = [slots[0], slots[1]];
-
-    // Both outputs are real notes, and both carry the bundle's own asset — the guest binds them to
-    // it structurally, so no other value could produce a matching digest. A zero-value change note
-    // is still published (and scanned back as an owned note the wallet then ignores): the bundle
-    // shape is fixed at two outputs, and a slot that looked different when change happened to be
-    // zero would leak it.
-    let out1 = Note::new(plan.dest.pk, pk_self, plan.amount, plan.asset, time);
-    let out2 = Note::new(pk_self, pk_self, plan.change(), plan.asset, time);
-    let outputs = [out1, out2];
-
-    let (fee, burn, asset) = (plan.fee, plan.burn, plan.asset);
-    let words = bundle_inputs(&w.sk, &inputs, &outputs, root, fee, burn, asset, time);
-    let expected = expected_bundle_outputs(&w.sk, &inputs, &outputs, root, fee, burn, asset, time);
-
-    // One fresh transaction key per envelope: two envelopes sealed under one key would both
-    // open under a single-transaction disclosure (see `viewing::TxKey`).
-    let envelopes = [
-        seal_note(&w.vk, &plan.dest, &out1, &TxKey::random()).map_err(|e| anyhow!("sealing the payment envelope: {e}"))?,
-        seal_note(&w.vk, &w.address, &out2, &TxKey::random()).map_err(|e| anyhow!("sealing the change envelope: {e}"))?,
-    ];
-    let bundle = Bundle {
-        anchor: root,
-        nullifiers: [w.vk.nullifier(&inputs[0].0.commitment()), w.vk.nullifier(&inputs[1].0.commitment())],
-        commitments: [out1.commitment(), out2.commitment()],
-        fee,
-        burn,
-        asset,
-        time,
-        envelopes,
-        proof: Vec::new(),
-    };
-    Ok(Prepared { bundle, words, expected, which })
+    Err(anyhow!(
+        "building a hidden-asset bundle (asset {}, burn {}) is rebuilt in H5: this wallet cannot \
+         send on the four-slot bundle yet",
+        plan.asset,
+        plan.burn
+    ))
 }
 
-/// Prove every bundle of `tx` against `tx`'s own binding, in place: `fee` is the transaction's own
-/// bundle, `asset` a two-bundle action's asset bundle. The binding is taken once, with every proof
-/// still empty; filling the proofs in cannot move it, because the binding blanks them.
+/// Prove `tx`'s one bundle against `tx`'s own binding, in place. The binding is taken with the
+/// proof still empty; filling the proof in cannot move it, because the binding blanks it.
 ///
 /// `prove` is [`Prepared::prove`] at the caller's profile and backend; a unit test hands in a stub
 /// prover, which is what lets the ordering be tested without a minute of proving.
 fn prove_transaction(
     tx: &mut Transaction,
-    fee: &Prepared,
-    asset: Option<&Prepared>,
+    prepared: &Prepared,
     prove: &dyn Fn(&Prepared, &[u32; TX_BINDING_WORDS]) -> Result<Proved>,
-) -> Result<Vec<Proved>> {
+) -> Result<Proved> {
     let binding = tx.binding();
-    let mut proved = Vec::with_capacity(2);
-    if let Some(asset) = asset {
-        let p = prove(asset, &binding)?;
-        tx.action.asset_bundle_mut().context("an asset bundle was prepared for an action without one")?.proof =
-            p.proof.clone();
-        proved.push(p);
-    }
-    let p = prove(fee, &binding)?;
+    let p = prove(prepared, &binding)?;
     tx.bundle.as_mut().context("a shielded transaction has a bundle")?.proof = p.proof.clone();
-    proved.push(p);
-    debug_assert_eq!(tx.binding(), binding, "filling the proofs in never moves the binding");
-    Ok(proved)
+    debug_assert_eq!(tx.binding(), binding, "filling the proof in never moves the binding");
+    Ok(p)
 }
 
 /// Wait for the commit, or hold the spent notes back: the tail of every submission.
@@ -1076,8 +1022,8 @@ async fn settle(
 ///
 /// `burn` is what the bundle takes out of the shielded pool, which a `Bond` must set to the staked
 /// amount (`Ledger::validate_inner` rejects a bond whose bundle burns anything else) and every
-/// other action leaves at [`Burn::None`]. A burn of a *bridged* asset is not this path — it needs
-/// a second bundle, so [`Burn::Asset`] is an error here and goes through [`submit_burn`].
+/// other action leaves at [`Burn::None`]. A burn of a *bridged* asset is not this path, so
+/// [`Burn::Asset`] is an error here and goes through [`submit_burn`].
 #[allow(clippy::too_many_arguments)]
 pub async fn submit(
     rpc: &RpcClient,
@@ -1099,9 +1045,7 @@ pub async fn submit(
         Burn::Rand(amount) => Burn::rand(amount),
         Burn::None => Burn::None,
         Burn::Asset { index, amount } => {
-            return Err(anyhow!(
-                "burning {amount} of asset {index} takes an asset bundle of its own: that is `submit_burn`, not `submit`"
-            ))
+            return Err(anyhow!("burning {amount} of asset {index} is a bridge burn: that is `submit_burn`, not `submit`"))
         }
     };
     scan(rpc, w, store).await?;
@@ -1112,9 +1056,7 @@ pub async fn submit(
 
     // The whole transaction first, its bundle's proof empty; then the proof, bound to it.
     let mut tx = Transaction::shielded(chain_id, one.bundle.clone(), action);
-    let [one] = <[Proved; 1]>::try_from(prove_transaction(&mut tx, &one, None, &|p, b| p.prove(b, profile, backend))?)
-        .ok()
-        .expect("one bundle, one proof");
+    let one = prove_transaction(&mut tx, &one, &|p, b| p.prove(b, profile, backend))?;
     let proof_bytes = one.proof.len();
     let hash = rpc.send_transaction(&tx).await?;
     settle(rpc, w, store, &hash, &plans, time, wait).await?;
@@ -1138,7 +1080,7 @@ pub async fn submit(
 /// numbers of that coin's release unit and within what it is holding.
 ///
 /// None of them is something a wallet can know locally — all four are state — and getting any of
-/// them wrong costs *two* bundle proofs (minutes of a laptop) for a transaction the ledger
+/// them wrong costs a bundle proof (minutes of a laptop) for a transaction the ledger
 /// refuses outright: `Bridge(Disabled)` for a chain with no bridge, `Bridge(UnknownAsset)` for an
 /// index nothing was ever registered under, `NotABacking` for a coin that does not back it,
 /// `NotReleasable` for an amount or fee that is not a whole unit and `InsufficientBacking` for a
@@ -1219,29 +1161,29 @@ fn burn_is_possible(
     Ok(())
 }
 
-/// The chain's one two-bundle transaction (spec §10): burn `amount` of a bridged asset to
-/// `to_chain`/`to`, paying the RAND fee from a second bundle.
+/// Burn `amount` of a bridged asset to `to_chain`/`to` (spec §10) — on the hidden-asset bundle a
+/// single bundle that spends the asset in its slots 0–1 (`burn_a == amount`,
+/// `burn_asset == asset`) and pays the RAND fee from slots 2–3.
 ///
-/// The asset bundle burns exactly `amount` and pays no fee — the fee is always RAND, and
-/// the guest's own rule is that a non-RAND bundle's fee is zero — so this wallet has to hold
-/// notes of *both*: the asset to burn and the RAND to pay with. Both bundles are proved before
-/// either is submitted, and both go through the same admission the fee bundle does.
+/// **The proving half is rebuilt in H5.** What runs today is everything that can refuse a burn
+/// before a proof is paid for — the definitional checks and one read of the chain
+/// ([`burn_is_possible`]) — and then a clear error: no transaction is built or submitted.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_burn(
     rpc: &RpcClient,
-    w: &Wallet,
-    store: &mut NoteStore,
+    _w: &Wallet,
+    _store: &mut NoteStore,
     asset: u32,
     amount: u64,
     relayer_fee: u64,
     to_chain: u16,
     token: [u8; 32],
-    to: [u8; 32],
-    fee: u64,
-    profile: FriProfile,
-    backend: Backend,
-    chain_id: u64,
-    wait: bool,
+    _to: [u8; 32],
+    _fee: u64,
+    _profile: FriProfile,
+    _backend: Backend,
+    _chain_id: u64,
+    _wait: bool,
 ) -> Result<Submission> {
     if asset == 0 {
         return Err(anyhow!("asset 0 is RAND, which is not a bridged asset and cannot be burned"));
@@ -1249,7 +1191,7 @@ pub async fn submit_burn(
     // The bridge owns the rest of a burn's rules (`BridgeState::check_burn`: the destination must be
     // the asset's own chain, the recipient must be shaped for it) and this wallet deliberately does
     // not restate them. These two are the exception, because they are definitional rather than
-    // policy and because the alternative is two bundle proofs — minutes of a laptop — thrown away
+    // policy and because the alternative is a bundle proof — minutes of a laptop — thrown away
     // on a typo.
     if amount == 0 {
         return Err(anyhow!("a burn of zero moves nothing"));
@@ -1260,55 +1202,9 @@ pub async fn submit_burn(
     // One read of the chain, before any proving, for the three facts only the chain knows —
     // the coin's locked amount among them, since one token's backings are held apart.
     burn_is_possible(&rpc.bridge_state().await?, asset, to_chain, &token, amount, relayer_fee)?;
-    scan(rpc, w, store).await?;
-    // `burn == amount`, not `amount + relayer_fee`: the wire format's fee is a *portion* of the
-    // amount (`fee <= amount`), carved out on the destination chain by the release contract. A
-    // bundle burning more than the far side releases would strand the difference there forever.
-    // The asset bundle first, so its notes and the fee bundle's are selected from the same store
-    // read; they can never collide, since they hold different assets.
-    let plans = [
-        Plan::select(store, asset, &w.address, 0, 0, amount)
-            .with_context(|| format!("selecting notes of asset {asset} to burn"))?,
-        Plan::select(store, 0, &w.address, 0, fee, 0).context("selecting RAND notes for the fee bundle")?,
-    ];
-    let (prepared, time) = prepare_bundles(rpc, w, &plans).await?;
-    let [asset_prep, fee_prep] = <[Prepared; 2]>::try_from(prepared).ok().expect("two plans, two bundles");
-
-    // The whole burn first — destination, relayer fee, both bundles' envelopes — with both proofs
-    // empty; then both proofs, each bound to it, so no field of it can be changed under them.
-    let action = Action::BridgeBurn {
-        asset_bundle: asset_prep.bundle.clone(),
-        asset,
-        amount,
-        relayer_fee,
-        to_chain,
-        token,
-        to,
-    };
-    let mut tx = Transaction::shielded(chain_id, fee_prep.bundle.clone(), action);
-    let [asset_proof, fee_proof] =
-        <[Proved; 2]>::try_from(prove_transaction(&mut tx, &fee_prep, Some(&asset_prep), &|p, b| {
-            p.prove(b, profile, backend)
-        })?)
-            .ok()
-            .expect("two bundles, two proofs");
-    let proof_bytes = asset_proof.proof.len() + fee_proof.proof.len();
-    let hash = rpc.send_transaction(&tx).await?;
-    settle(rpc, w, store, &hash, &plans, time, wait).await?;
-    Ok(Submission {
-        hash,
-        amount,
-        change: plans[0].change(),
-        fee,
-        // The asset bundle's own burn word, which for a bridge burn *is* `amount` — the reporter
-        // prints it as the `out` figure rather than twice (`Submission::summary`).
-        burn: Burn::Asset { index: asset, amount },
-        time,
-        asset,
-        tier: asset_proof.tier.max(fee_proof.tier),
-        proof_bytes,
-        proving: asset_proof.proving + fee_proof.proving,
-    })
+    Err(anyhow!(
+        "a bridge burn on the hidden-asset bundle is rebuilt in H5: this wallet cannot prove one yet"
+    ))
 }
 
 /// The facts a deploy needs from the chain before any proving: whether `words` code words fit this
@@ -1470,10 +1366,8 @@ pub fn call_fee_default(tier: u8, bytes: usize) -> u64 {
     gas::BUNDLE_BASE + gas::call_fee(tier, bytes)
 }
 
-/// What a `bridge-burn` pays by default: the bridge fee (0.01 RAND, covering the bundle base for
-/// each of its two bundles), which is `gas::fee_floor` for a `BridgeBurn`. Written as the constant rather than by calling
-/// `fee_floor` because the action does not exist yet — the asset bundle inside it is the thing
-/// this fee is being selected in order to prove.
+/// What a `bridge-burn` pays by default: the bridge fee (0.01 RAND, covering its bundle's base
+/// and the bridge's charge), which is `gas::fee_floor` for a `BridgeBurn`.
 pub fn burn_fee_default() -> u64 {
     gas::BRIDGE_BURN_FEE
 }
@@ -2223,21 +2117,8 @@ mod tests {
                 "the wallet pays the ledger's step-10 floor exactly"
             );
         }
-        // A burn pays the bundle base per verified bundle, and it has two. Checked against the
-        // schedule itself, since `burn_fee_default` cannot ask `fee_floor` — the action it would
-        // ask about contains the very bundle this fee is being selected to prove.
+        // A burn pays the bridge fee, the schedule's floor for it.
         let burn = Action::BridgeBurn {
-            asset_bundle: Bundle {
-                anchor: [0; 8],
-                nullifiers: [[0; 8], [1; 8]],
-                commitments: [[2; 8], [3; 8]],
-                fee: 0,
-                burn: 500,
-                asset: 3,
-                time: 0,
-                envelopes: [env(), env()],
-                proof: vec![],
-            },
             asset: 3,
             amount: 400,
             relayer_fee: 100,
@@ -2252,7 +2133,7 @@ mod tests {
     /// The three things a burn is refused for before it costs anything: RAND, which is not a
     /// bridged asset at all; a burn of nothing; and a relayer fee larger than the burn. Refused
     /// before the wallet so much as reads the chain, which is the point — everything after that
-    /// point is two bundle proofs.
+    /// point is a bundle proof.
     #[tokio::test]
     async fn a_burn_that_could_never_be_admitted_is_refused_before_any_proving() {
         // Pointed at a port nothing listens on: reaching the network at all is the failure this
@@ -2462,22 +2343,27 @@ mod tests {
         assert_ne!(hex, Wallet::from_spend_key(SpendKey([12; 8])).viewing_key_hex());
     }
 
-    /// A payment from `me` to `you` with change back to `me`, each output under its own key.
+    /// A payment from `me` to `you` with change back to `me`, each output under its own key, in
+    /// slots 0–1 of a four-slot bundle; slots 2–3 carry envelopes nobody can open (they stand for
+    /// the dummies, whose sealing is H5's).
     fn payment(me: &Wallet, you: &Wallet) -> (Transaction, TxKey, TxKey, Note, Note) {
         let pay = Note::new(you.vk.pk(), me.vk.pk(), 7, 0, 1);
         let change = Note::new(me.vk.pk(), me.vk.pk(), 3, 0, 1);
         let (k_pay, k_change) = (TxKey::random(), TxKey::random());
         let bundle = Bundle {
             anchor: [0; 8],
-            nullifiers: [[1; 8], [2; 8]],
-            commitments: [pay.commitment(), change.commitment()],
+            nullifiers: [[1; 8], [2; 8], [3; 8], [4; 8]],
+            commitments: [pay.commitment(), change.commitment(), [5; 8], [6; 8]],
             fee: 1,
-            burn: 0,
-            asset: 0,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
             time: 1,
             envelopes: [
                 seal_note(&me.vk, &you.address, &pay, &k_pay).unwrap(),
                 seal_note(&me.vk, &me.address, &change, &k_change).unwrap(),
+                env(),
+                env(),
             ],
             proof: vec![],
         };
@@ -2681,67 +2567,51 @@ mod tests {
         assert!(e.contains("4 words") && e.contains("3"), "{e}");
     }
 
-    /// Task 5b, the wallet's half: a burn is assembled whole — destination, relayer fee, both
-    /// bundles' envelopes — before either bundle is proved, both are proved with the finished
-    /// transaction's own binding, and each proof lands in its own slot. So the transaction the
-    /// wallet submits verifies against the binding the ledger will recompute from it, and a copy
-    /// with its destination changed does not. (A stub prover stands in for the minute of proving;
-    /// the real one's binding is `tests/shielded.rs`'s in the zkVM crate.)
+    /// Task 5b, the wallet's half: a burn is assembled whole — destination, relayer fee, the
+    /// bundle's envelopes — before its bundle is proved, the bundle is proved with the finished
+    /// transaction's own binding, and the proof lands in its slot. So the transaction the wallet
+    /// submits verifies against the binding the ledger will recompute from it, and a copy with its
+    /// destination changed does not. (A stub prover stands in for the minute of proving; the real
+    /// one's binding is `tests/shielded.rs`'s in the zkVM crate.)
     #[test]
-    fn a_submitted_transactions_proofs_verify_against_its_own_binding() {
+    fn a_submitted_transactions_proof_verifies_against_its_own_binding() {
         use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
         const HC: Word8 = [11; 8];
-        let prepared = |seed: u32, asset: u32, fee: u64, burn: u64| Prepared {
+        let prepared = Prepared {
             bundle: Bundle {
                 anchor: [1; 8],
-                nullifiers: [[seed; 8], [seed + 1; 8]],
-                commitments: [[seed + 2; 8], [seed + 3; 8]],
-                fee,
-                burn,
-                asset,
+                nullifiers: [[10; 8], [11; 8], [12; 8], [13; 8]],
+                commitments: [[14; 8], [15; 8], [16; 8], [17; 8]],
+                fee: gas::BRIDGE_BURN_FEE,
+                burn_a: 400,
+                burn_r: 0,
+                burn_asset: 3,
                 time: 9,
-                envelopes: [env(), env()],
+                envelopes: [env(), env(), env(), env()],
                 proof: Vec::new(),
             },
             words: Vec::new(),
             expected: [0; 8],
-            which: format!("bundle {seed}"),
+            which: "bundle".into(),
         };
-        let (asset_prep, fee_prep) = (prepared(10, 3, 0, 400), prepared(20, 0, 2 * gas::BUNDLE_BASE, 0));
-        let action = Action::BridgeBurn {
-            asset_bundle: asset_prep.bundle.clone(),
-            asset: 3,
-            amount: 400,
-            relayer_fee: 100,
-            to_chain: 2,
-            token: [7; 32],
-            to: [1; 32],
-        };
-        let mut tx = Transaction::shielded(13, fee_prep.bundle.clone(), action);
+        let action = Action::BridgeBurn { asset: 3, amount: 400, relayer_fee: 100, to_chain: 2, token: [7; 32], to: [1; 32] };
+        let mut tx = Transaction::shielded(13, prepared.bundle.clone(), action);
         let stub = |p: &Prepared, binding: &[u32; TX_BINDING_WORDS]| -> Result<Proved> {
             let d = StubExecutor.bundle_digest(&p.bundle.digest_input());
             Ok(Proved { proof: StubExecutor::make_bundle_proof(&HC, &d, binding), tier: 14, proving: Duration::ZERO })
         };
-        let proved = prove_transaction(&mut tx, &fee_prep, Some(&asset_prep), &stub).unwrap();
-        assert_eq!(proved.len(), 2);
+        prove_transaction(&mut tx, &prepared, &stub).unwrap();
         let binding = tx.binding();
-        let fee_bundle = tx.bundle.as_ref().unwrap();
-        let asset_bundle = tx.action.asset_bundle().unwrap();
-        for (what, b) in [("fee", fee_bundle), ("asset", asset_bundle)] {
-            assert_eq!(
-                StubExecutor.bundle_proof_digest(&b.proof).unwrap(),
-                StubExecutor.bundle_digest(&b.digest_input()),
-                "{what}: its own proof in its own slot"
-            );
-            assert_eq!(StubExecutor.verify_bundle(&HC, &b.proof, &binding), Ok(()), "{what}");
-        }
+        let b = tx.bundle.as_ref().unwrap();
+        assert_eq!(StubExecutor.bundle_proof_digest(&b.proof).unwrap(), StubExecutor.bundle_digest(&b.digest_input()));
+        assert_eq!(StubExecutor.verify_bundle(&HC, &b.proof, &binding), Ok(()));
         // The copied-proof attack against what the wallet built: the destination changed, the
-        // proofs kept. Neither bundle's proof verifies for the copy.
+        // proof kept. It does not verify for the copy.
         let mut copy = tx.clone();
         let Action::BridgeBurn { to, .. } = &mut copy.action else { panic!("a burn") };
         *to = [2; 32];
         let refused = Err(ConfidentialError::InvalidBundleProof("PublicValues".into()));
         assert_eq!(StubExecutor.verify_bundle(&HC, &copy.bundle.as_ref().unwrap().proof, &copy.binding()), refused);
-        assert_eq!(StubExecutor.verify_bundle(&HC, &copy.action.asset_bundle().unwrap().proof, &copy.binding()), refused);
     }
+
 }

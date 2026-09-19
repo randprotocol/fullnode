@@ -65,18 +65,19 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// amount, and the chain computes the commitment, so a validator cannot declare one amount
     /// and mint a note for another.
     fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8;
-    /// `notes::bundle_digest(..)` (in the vendored research note layer, `randprotocol_zkvm::notes`,
-    /// arriving in Task 2) over the public bundle fields with the taint word fixed to 0.
+    /// The hidden-asset bundle digest (`randprotocol_zkvm::hidden::hidden_bundle_digest`, spec
+    /// §3.4) over the public bundle fields with the taint word fixed to 0. No asset is among them.
     fn bundle_digest(&self, input: &BundleDigestInput) -> Word8;
     /// Cheap: decode `proof`, check its declared tier/heights/public-value canonicity, and return
     /// the digest it publishes in `OUT0..OUT7`. Verifies nothing cryptographic.
     fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError>;
-    /// Expensive: the STARK verification of a bundle proof against the pinned bundle guest, and
+    /// Expensive: the STARK verification of a bundle proof against the pinned bundle guest (the
+    /// hidden-asset guest since chain 14, `hc_bundle` in genesis), and
     /// against `binding` — the [`crate::types::Transaction::binding`] of the transaction the
     /// bundle rides in, which the proof must carry as its public input segment
     /// (`pv::PUB0..7 == H_PUB(binding)`). A proof made for any other transaction, or against the
     /// empty segment, is refused: that is what keeps a copied proof from riding a changed action,
-    /// changed envelopes or a different companion bundle.
+    /// or changed envelopes.
     fn verify_bundle(
         &self,
         hc_bundle: &Word8,
@@ -163,26 +164,19 @@ impl StubExecutor {
         v
     }
 
-    /// Re-bind every stub bundle proof `tx` carries — the fee bundle's and an asset bundle's — to
-    /// `tx.binding()`, leaving each proof's digest and guest commitment as they were, and leaving
-    /// anything that is not a well-formed stub bundle proof (a pruned marker, deliberately broken
-    /// bytes) untouched. What a test calls once it has finished assembling a transaction: the
-    /// stub's analogue of a wallet proving after it has built everything but the proofs.
+    /// Re-bind the stub bundle proof `tx` carries to `tx.binding()`, leaving the proof's digest
+    /// and guest commitment as they were, and leaving anything that is not a well-formed stub
+    /// bundle proof (a pruned marker, deliberately broken bytes) untouched. What a test calls once
+    /// it has finished assembling a transaction: the stub's analogue of a wallet proving after it
+    /// has built everything but the proof.
     ///
-    /// Binding blanks every bundle proof, so the order in which the two proofs are rewritten does not
-    /// matter: the binding is the same before and after.
+    /// The binding blanks the bundle proof, so rewriting it does not move the binding.
     pub fn bind(tx: &mut Transaction) {
         let binding = word8_to_bytes(&tx.binding());
-        let rebind = |b: &mut crate::notes::Bundle| {
+        if let Some(b) = tx.bundle.as_mut() {
             if b.proof.len() == STUB_BUNDLE_LEN && &b.proof[..4] == STUB_MARKER {
                 b.proof[STUB_BUNDLE_BINDING..].copy_from_slice(&binding);
             }
-        };
-        if let Some(b) = tx.bundle.as_mut() {
-            rebind(b);
-        }
-        if let Some(b) = tx.action.asset_bundle_mut() {
-            rebind(b);
         }
     }
 
@@ -258,21 +252,20 @@ impl ConfidentialExecutor for StubExecutor {
         )
     }
 
+    /// A blake3 stand-in over every public field of the hidden-asset digest (spec §3.4), in the
+    /// real one's order: anchor, the four nullifiers, the four commitments, `fee`, `burn_a`,
+    /// `burn_r`, `burn_asset`, `time`. Injective in exactly those fields, like the real one.
     fn bundle_digest(&self, i: &BundleDigestInput) -> Word8 {
-        Self::hash_words(
-            b"rand-stub-bundle-digest",
-            &[
-                &word8_to_bytes(&i.anchor),
-                &word8_to_bytes(&i.nullifiers[0]),
-                &word8_to_bytes(&i.nullifiers[1]),
-                &word8_to_bytes(&i.commitments[0]),
-                &word8_to_bytes(&i.commitments[1]),
-                &i.fee.to_le_bytes(),
-                &i.burn.to_le_bytes(),
-                &i.asset.to_le_bytes(),
-                &i.time.to_le_bytes(),
-            ],
-        )
+        let mut parts: Vec<Vec<u8>> = vec![word8_to_bytes(&i.anchor).to_vec()];
+        parts.extend(i.nullifiers.iter().map(|w| word8_to_bytes(w).to_vec()));
+        parts.extend(i.commitments.iter().map(|w| word8_to_bytes(w).to_vec()));
+        parts.push(i.fee.to_le_bytes().to_vec());
+        parts.push(i.burn_a.to_le_bytes().to_vec());
+        parts.push(i.burn_r.to_le_bytes().to_vec());
+        parts.push(i.burn_asset.to_le_bytes().to_vec());
+        parts.push(i.time.to_le_bytes().to_vec());
+        let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+        Self::hash_words(b"rand-stub-hidden-bundle-digest", &refs)
     }
 
     fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
@@ -390,6 +383,48 @@ mod tests {
         assert_eq!(StubExecutor.verify_bundle(&hc, &unbound, &binding), public_values);
         assert_eq!(StubExecutor.bundle_proof_digest(b"junk"), Err(ConfidentialError::MalformedProof));
         assert_ne!(StubExecutor.node_hash(&[1; 8], &[2; 8]), StubExecutor.node_hash(&[2; 8], &[1; 8]));
+    }
+
+    /// The stub bundle digest binds every public field of the hidden-asset bundle — each of the
+    /// four nullifiers and commitments and all three burn fields — so a ledger test that changes
+    /// one and keeps the proof sees `BadDigest`, as the real chain would.
+    #[test]
+    fn the_stub_bundle_digest_binds_every_hidden_field() {
+        let base = BundleDigestInput {
+            anchor: [1; 8],
+            nullifiers: [[2; 8], [3; 8], [4; 8], [5; 8]],
+            commitments: [[6; 8], [7; 8], [8; 8], [9; 8]],
+            fee: 10,
+            burn_a: 11,
+            burn_r: 12,
+            burn_asset: 13,
+            time: 14,
+        };
+        let d = StubExecutor.bundle_digest(&base);
+        let mut changes: Vec<BundleDigestInput> = Vec::new();
+        for k in 0..4 {
+            let mut c = base;
+            c.nullifiers[k][0] ^= 1;
+            changes.push(c);
+            let mut c = base;
+            c.commitments[k][0] ^= 1;
+            changes.push(c);
+        }
+        for f in [
+            |c: &mut BundleDigestInput| c.anchor[0] ^= 1,
+            |c: &mut BundleDigestInput| c.fee += 1,
+            |c: &mut BundleDigestInput| c.burn_a += 1,
+            |c: &mut BundleDigestInput| c.burn_r += 1,
+            |c: &mut BundleDigestInput| c.burn_asset += 1,
+            |c: &mut BundleDigestInput| c.time += 1,
+        ] {
+            let mut c = base;
+            f(&mut c);
+            changes.push(c);
+        }
+        for c in changes {
+            assert_ne!(StubExecutor.bundle_digest(&c), d, "{c:?}");
+        }
     }
 
     /// Every field the real commitment binds, the stand-in binds too — otherwise a ledger test

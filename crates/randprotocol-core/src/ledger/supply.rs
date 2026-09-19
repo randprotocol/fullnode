@@ -31,12 +31,13 @@ use std::collections::BTreeMap;
 /// Phase S3's bridge and the RPL token standard add no counter, and deliberately: asset index 0
 /// is reserved for RAND and the token registry never hands it out
 /// ([`crate::ledger::tokens::FIRST_TOKEN_INDEX`]), so a `BridgeAttest` always deposits a note of
-/// some *other* asset and every asset bundle — a `BridgeBurn`'s, a `TokenTransfer`'s, a
-/// `TokenBurn`'s — always moves or destroys one. None of them crosses the RAND boundary (a
-/// token's own supply is the registry's count, audited there), which is why `apply_tx` counts
-/// `fees_paid`/`burned` on the fee bundle's path only and not inside
-/// [`super::Ledger::apply_bundle_notes`], which both bundles share. Each bridged asset's own
-/// audit is the bridge state's business (`rand_getAssets`), not this one's.
+/// some *other* asset, and a bundle's `burn_a` — a `BridgeBurn`'s or a `TokenBurn`'s — always
+/// destroys one (a RAND `burn_a` is refused, `TxError::NonCanonicalRandBurn`). None of them
+/// crosses the RAND boundary (a token's own supply is the registry's count, audited there), so
+/// `apply_tx` counts `fees_paid` and `burned` from a bundle's `fee` and `burn_r` alone. A
+/// transfer of a token inside the pool moves no counter at all: its asset is not even public.
+/// Each bridged asset's own audit is the bridge state's business (`rand_getAssets`), not this
+/// one's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Supply {
     /// Σ of the genesis deposit notes (asset 0).
@@ -65,8 +66,9 @@ pub struct Supply {
     /// to the recorded proposer, and a covered one returns to the pool inside the aggregate's
     /// payout note (spec §5.4), where it needs no counter — it never left.
     pub fees_paid: u64,
-    /// Σ of every bundle `burn`. Today only a `Bond` may burn, and it burns into `stake` — and
-    /// a `RegisterAggregator`'s bundle, which burns into `aggregator_bonds` (spec §5.3).
+    /// Σ of every bundle's `burn_r`, its RAND burn. Only a `Bond` may set one, and it burns into
+    /// `stake` — and a `RegisterAggregator`'s bundle, which burns into `aggregator_bonds` (spec
+    /// §5.3).
     pub burned: u64,
     /// Σ of aggregator bonds burned in, minus bonds paid out or slashed (block aggregation,
     /// spec §5.3): the register-side twin of the aggregator register's outstanding bonds.

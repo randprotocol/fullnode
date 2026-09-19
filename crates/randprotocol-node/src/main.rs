@@ -1023,6 +1023,14 @@ mod tests {
         let state = gen.build(executor.as_ref()).unwrap();
         assert_eq!(state.hash().to_hex(), "8123ccac1883a45750e4df6964fb7cd3f0b321798cde4c0ef406a0293939ece3");
         assert!(state.ledger.tokens().is_none());
+        // Since the hidden-asset bundle (H3) the file still *builds* to chain 13's hash — the hash
+        // commits to the file's own `hc_bundle`, not to this build's guest — but it pins the
+        // retired 2-in-2-out guest, so this build refuses to run it: a chain-14 build is not a
+        // chain-13 node.
+        assert_eq!(state.hc_bundle, ZkExecutor::hc_legacy_bundle(), "chain 13 pins the retired guest");
+        assert_ne!(state.hc_bundle, ZkExecutor::hc_bundle());
+        let refused = node::check_build_runs_genesis(&state, &ZkExecutor::hc_bundle()).unwrap_err().to_string();
+        assert!(refused.contains("differs from the genesis hc_bundle"), "{refused}");
     }
 
     /// `rand-node genesis --max-program-words N` writes the field; without the flag the file has

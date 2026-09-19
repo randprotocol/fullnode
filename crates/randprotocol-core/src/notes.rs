@@ -67,34 +67,71 @@ impl Envelope {
     }
 }
 
-/// A shielded 2-in-2-out bundle (spec §3). Every field is public chain data.
+/// How many input and output slots a bundle has: four of each (the hidden-asset bundle,
+/// `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md` §3.1). Slots 0–1 carry a
+/// **private** asset `A`, slots 2–3 carry RAND; a dummy slot is a zero-amount note, so every
+/// bundle — a RAND payment, a token transfer, a burn — publishes exactly four nullifiers and four
+/// commitments and nothing on chain says which asset moved.
+pub const BUNDLE_SLOTS: usize = 4;
+
+/// A shielded 4-in-4-out hidden-asset bundle (spec §3.6). Every field is public chain data; the
+/// asset the bundle moves is not among them.
+///
+/// Two conservation sums hold inside the proof: `in0 + in1 = out0 + out1 + burn_a` in the private
+/// asset `A`, and `in2 + in3 = out2 + out3 + fee + burn_r` in RAND. `burn_asset` is the guest's
+/// `A` exactly when `burn_a != 0` and 0 otherwise — a burn names its asset because a burn is a
+/// public boundary (the chain must debit that token's supply); a transfer names none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bundle {
     pub anchor: Word8,
-    pub nullifiers: [Word8; 2],
-    pub commitments: [Word8; 2],
+    pub nullifiers: [Word8; BUNDLE_SLOTS],
+    pub commitments: [Word8; BUNDLE_SLOTS],
+    /// The RAND fee, paid from slots 2–3.
     pub fee: u64,
-    pub burn: u64,
-    pub asset: u32,
-    /// Block height the sender targeted; copied into both output notes by the guest.
+    /// What leaves the pool of the private asset `A` (slots 0–1): a `TokenBurn`'s or a
+    /// `BridgeBurn`'s amount, and 0 on every other action.
+    pub burn_a: u64,
+    /// What leaves the pool in RAND (slots 2–3) besides the fee: a `Bond`'s stake or a
+    /// `RegisterAggregator`'s bond, and 0 on every other action. The only RAND burn the chain
+    /// accepts — a RAND burn through `burn_a` (`burn_asset == 0 && burn_a > 0`) is refused.
+    pub burn_r: u64,
+    /// The asset `burn_a` destroys: `A` when `burn_a != 0`, else 0 (computed by the guest).
+    pub burn_asset: u32,
+    /// Block height the sender targeted; copied into every output note by the guest.
     pub time: u32,
     /// `envelopes[i]` is sealed against `commitments[i]`.
-    pub envelopes: [Envelope; 2],
-    /// `postcard(rand_zkvm::Proof)` of the `bundle` guest.
+    pub envelopes: [Envelope; BUNDLE_SLOTS],
+    /// `postcard(rand_zkvm::Proof)` of the hidden-asset bundle guest.
     #[serde(with = "crate::crypto::wire_bytes")]
     pub proof: Vec<u8>,
 }
 
-/// The public preimage of a bundle digest, minus the taint word the verifier fixes to zero.
+/// The public preimage of a bundle digest, minus the taint word the verifier fixes to zero —
+/// the hidden guest's published fields (spec §3.4), with no asset among them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BundleDigestInput {
     pub anchor: Word8,
-    pub nullifiers: [Word8; 2],
-    pub commitments: [Word8; 2],
+    pub nullifiers: [Word8; BUNDLE_SLOTS],
+    pub commitments: [Word8; BUNDLE_SLOTS],
     pub fee: u64,
-    pub burn: u64,
-    pub asset: u32,
+    pub burn_a: u64,
+    pub burn_r: u64,
+    pub burn_asset: u32,
     pub time: u32,
+}
+
+/// Test helper: widen a two-word note set to a bundle's four slots, deriving the two extra words
+/// from the given ones (their last word flipped by a slot tag) — so a test written for two
+/// distinct words gets four distinct words, and two distinct pairs get eight. The extra slots
+/// stand for the dummy notes an honest bundle carries.
+#[cfg(test)]
+pub(crate) fn pad4(w: [Word8; 2]) -> [Word8; BUNDLE_SLOTS] {
+    let tag = |x: Word8, k: u32| {
+        let mut y = x;
+        y[7] ^= 0xd0d0_0000 | k;
+        y
+    };
+    [w[0], w[1], tag(w[0], 2), tag(w[1], 3)]
 }
 
 /// What a pruned bundle's `proof` field carries (block aggregation, spec §6.2, the 2026-09-13
@@ -118,8 +155,9 @@ impl Bundle {
             nullifiers: self.nullifiers,
             commitments: self.commitments,
             fee: self.fee,
-            burn: self.burn,
-            asset: self.asset,
+            burn_a: self.burn_a,
+            burn_r: self.burn_r,
+            burn_asset: self.burn_asset,
             time: self.time,
         }
     }

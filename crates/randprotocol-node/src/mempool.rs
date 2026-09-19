@@ -295,13 +295,11 @@ impl Mempool {
     /// **The caller must have just run `Ledger::validate` on this transaction, against a snapshot of
     /// this same chain**, and must treat a failure of it as a refusal. This method re-checks only
     /// what can go *stale*; it does not re-check, and cannot, what `validate` alone looks at — the
-    /// bundle and call proofs, the attestation's guardian quorum, the fee floor, a
-    /// `BridgeAttest`'s derived deposit colliding with its own fee bundle's outputs, and a
-    /// two-bundle action's asset bundle's anchor and `time` — a `BridgeBurn`'s, a
-    /// `TokenTransfer`'s or a `TokenBurn`'s (`applies` sees only `tx.bundle`, the fee bundle; its
-    /// *nullifiers* and *commitments* are claimed, through `Transaction::nullifiers`
-    /// /`commitments`, so two transfers spending one token note do conflict in the pool). Pool a transaction here whose proof nobody verified and the pool will offer the
-    /// proposer a block that dies on its own candidate.
+    /// bundle and call proofs, the attestation's guardian quorum, the fee floor, the burn shape,
+    /// and a `BridgeAttest`'s derived deposit colliding with its own bundle's outputs. (All four
+    /// of a bundle's nullifiers and commitments are claimed, through `Transaction::nullifiers`
+    /// /`commitments`.) Pool a transaction here whose proof nobody verified and the pool will
+    /// offer the proposer a block that dies on its own candidate.
     pub fn insert_verified(
         &mut self,
         tx: Transaction,
@@ -1187,31 +1185,42 @@ mod tests {
         (l, secrets)
     }
 
-    /// A token transfer's notes are spent by its *asset* bundle, not by the RAND fee bundle, and
-    /// the pool's conflict index has to see them: `Transaction::nullifiers` reports both bundles'
-    /// words, so two transfers spending one token note collide on that word and only the first is
-    /// pooled. Without it the pool would offer the proposer a block whose second transfer dies on
-    /// `Spent` — and their fee bundles, which are entirely different notes, say nothing about it.
+    /// A transfer — of RAND or of any token, the same bundle since the hidden-asset bundle —
+    /// claims all four of its nullifiers and all four of its commitments in the pool's conflict
+    /// index, the dummy slots' included: two transfers sharing any one of them do not both enter
+    /// the pool. Without it the pool would offer the proposer a block whose second transfer dies
+    /// on `Spent` or `CommitmentExists`.
     #[test]
-    fn two_transfers_spending_one_token_note_do_not_both_enter_the_pool() {
+    fn two_transfers_sharing_any_slot_do_not_both_enter_the_pool() {
         let (l, _) = bridged_ledger();
-        let first = fixtures::transfer_tx_with(&l, 1, [nf(10), nf(11)], [cm(10), cm(11)], 60, None);
-        // A different fee bundle and a different second input, sharing only the first token note.
-        let second = fixtures::transfer_tx_with(&l, 1, [nf(10), nf(12)], [cm(12), cm(13)], 70, None);
-        assert!(
-            first.bundle.as_ref().unwrap().nullifiers.iter().all(|x| !second.nullifiers().contains(x)),
-            "their RAND bundles share nothing"
-        );
-        // Both are independently valid: the clash is a race, not a validation failure.
-        assert_eq!(l.validate(&first, &StubExecutor), Ok(()));
-        assert_eq!(l.validate(&second, &StubExecutor), Ok(()));
-
+        let first = fixtures::transfer_tx_with(&l, [nf(10), nf(11)], [cm(10), cm(11)]);
+        assert_eq!(first.nullifiers().len(), 4);
+        assert_eq!(first.commitments().len(), 4);
         let mut m = Mempool::new(100);
         m.insert(first.clone(), &l, &StubExecutor).unwrap();
-        assert_eq!(m.insert(second.clone(), &l, &StubExecutor), Err(MempoolError::Conflict(nf(10))));
-        // And so do their output slots: a commitment claimed by the asset bundle is claimed.
-        let third = fixtures::transfer_tx_with(&l, 1, [nf(14), nf(15)], [cm(10), cm(16)], 80, None);
-        assert_eq!(m.insert(third, &l, &StubExecutor), Err(MempoolError::Conflict(cm(10))));
+        // Sharing slot 0's nullifier, slot 3's (a dummy's) nullifier, slot 0's commitment and
+        // slot 3's commitment: each is refused on exactly that word.
+        let shared_nf0 = fixtures::transfer_tx_with(&l, [nf(10), nf(12)], [cm(12), cm(13)]);
+        assert_eq!(l.validate(&shared_nf0, &StubExecutor), Ok(()), "a race, not a validation failure");
+        assert_eq!(m.insert(shared_nf0, &l, &StubExecutor), Err(MempoolError::Conflict(nf(10))));
+        let mut shared_nf3 = fixtures::transfer_tx_with(&l, [nf(14), nf(15)], [cm(14), cm(15)]);
+        {
+            let b = shared_nf3.bundle.as_mut().unwrap();
+            b.nullifiers[3] = first.nullifiers()[3];
+            b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
+        }
+        StubExecutor::bind(&mut shared_nf3);
+        assert_eq!(m.insert(shared_nf3, &l, &StubExecutor), Err(MempoolError::Conflict(first.nullifiers()[3])));
+        let shared_cm0 = fixtures::transfer_tx_with(&l, [nf(16), nf(17)], [cm(10), cm(16)]);
+        assert_eq!(m.insert(shared_cm0, &l, &StubExecutor), Err(MempoolError::Conflict(cm(10))));
+        let mut shared_cm3 = fixtures::transfer_tx_with(&l, [nf(18), nf(19)], [cm(18), cm(19)]);
+        {
+            let b = shared_cm3.bundle.as_mut().unwrap();
+            b.commitments[3] = first.commitments()[3];
+            b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
+        }
+        StubExecutor::bind(&mut shared_cm3);
+        assert_eq!(m.insert(shared_cm3, &l, &StubExecutor), Err(MempoolError::Conflict(first.commitments()[3])));
         assert_eq!(m.len(), 1);
         assert_eq!(m.candidates(&l, 10), vec![first]);
     }
@@ -1434,13 +1443,14 @@ mod tests {
         // Register the aggregator, through a bond-burning bundle with a stub proof.
         let mut b = randprotocol_core::notes::Bundle {
             anchor: l.root(),
-            nullifiers: [nf(1), nf(2)],
-            commitments: [cm(1), cm(2)],
+            nullifiers: crate::storage::fixtures::pad4([nf(1), nf(2)]),
+            commitments: crate::storage::fixtures::pad4([cm(1), cm(2)]),
             fee: fixtures::bundle_fee(),
-            burn: bond,
-            asset: 0,
+            burn_a: 0,
+            burn_r: bond,
+            burn_asset: 0,
             time: l.height() as u32,
-            envelopes: [fixtures::env(1), fixtures::env(2)],
+            envelopes: [fixtures::env(1), fixtures::env(2), fixtures::env(1), fixtures::env(2)],
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());

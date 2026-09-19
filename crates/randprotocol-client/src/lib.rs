@@ -801,13 +801,14 @@ mod tests {
         let env = || Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![], body: vec![3; 16] };
         let bundle = Bundle {
             anchor: [1; 8],
-            nullifiers: [[2; 8], [3; 8]],
-            commitments: [[4; 8], [5; 8]],
+            nullifiers: [[2; 8], [3; 8], [6; 8], [7; 8]],
+            commitments: [[4; 8], [5; 8], [8; 8], [9; 8]],
             fee: 1,
-            burn: 0,
-            asset: 0,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
             time: 1,
-            envelopes: [env(), env()],
+            envelopes: [env(), env(), env(), env()],
             // A constraint-set-5 bundle proof, to the byte measured on chain 8.
             proof: vec![7u8; 1_321_773],
         };

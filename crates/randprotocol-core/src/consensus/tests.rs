@@ -568,13 +568,14 @@ fn a_ledger_resumed_at_height_h_accepts_a_bundle_timed_at_h() {
     // A freshly built bundle stamps `time` with the head height; it must be admissible.
     let mut b = Bundle {
         anchor: tip.root(),
-        nullifiers: [[9; 8], [10; 8]],
-        commitments: [[11; 8], [12; 8]],
+        nullifiers: [[9; 8], [10; 8], [19; 8], [20; 8]],
+        commitments: [[11; 8], [12; 8], [21; 8], [22; 8]],
         fee: gas::BUNDLE_BASE,
-        burn: 0,
-        asset: 0,
+        burn_a: 0,
+        burn_r: 0,
+        burn_asset: 0,
         time: h as u32,
-        envelopes: [env(), env()],
+        envelopes: [env(), env(), env(), env()],
         proof: vec![],
     };
     let d = StubExecutor.bundle_digest(&b.digest_input());
@@ -1026,13 +1027,14 @@ fn staking_tx(l: &Ledger, n: u32, burn: u64, action: crate::types::Action) -> Tr
     use crate::confidential::ConfidentialExecutor;
     let mut b = crate::Bundle {
         anchor: l.root(),
-        nullifiers: [[n; 8], [n + 1; 8]],
-        commitments: [[n + 2; 8], [n + 3; 8]],
+        nullifiers: crate::notes::pad4([[n; 8], [n + 1; 8]]),
+        commitments: crate::notes::pad4([[n + 2; 8], [n + 3; 8]]),
         fee: crate::gas::BUNDLE_BASE,
-        burn,
-        asset: 0,
+        burn_a: 0,
+        burn_r: burn,
+        burn_asset: 0,
         time: l.height() as u32,
-        envelopes: [env(), env()],
+        envelopes: [env(), env(), env(), env()],
         proof: vec![],
     };
     let d = StubExecutor.bundle_digest(&b.digest_input());
@@ -1375,15 +1377,18 @@ fn aggregation_node_with(
     };
     let mut b = crate::notes::Bundle {
         anchor: gs.ledger.root(),
-        nullifiers: [[11; 8], [12; 8]],
-        commitments: [[13; 8], [14; 8]],
+        nullifiers: crate::notes::pad4([[11; 8], [12; 8]]),
+        commitments: crate::notes::pad4([[13; 8], [14; 8]]),
         fee: crate::gas::BUNDLE_BASE,
-        burn: cfg.bond,
-        asset: 0,
+        burn_a: 0,
+        burn_r: cfg.bond,
+        burn_asset: 0,
         time: 0,
         envelopes: [
             crate::notes::Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] },
             crate::notes::Envelope { kem_ct: vec![5; 8], to_receiver: vec![6; 4], to_sender: vec![7; 4], body: vec![8; 16] },
+            crate::notes::Envelope { kem_ct: vec![9; 8], to_receiver: vec![1; 4], to_sender: vec![2; 4], body: vec![3; 16] },
+            crate::notes::Envelope { kem_ct: vec![4; 8], to_receiver: vec![5; 4], to_sender: vec![6; 4], body: vec![7; 16] },
         ],
         proof: vec![],
     };

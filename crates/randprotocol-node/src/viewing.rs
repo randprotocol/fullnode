@@ -173,10 +173,9 @@ pub fn advance(storage: &Storage, import: &mut Import, max_rows: u64) -> Result<
 /// One envelope of a transaction that `key` opened, with the commitment it is bound to.
 #[derive(Clone, Debug)]
 pub struct Opening {
-    /// Which of the transaction's envelope sets this came from: `"bundle"` (the transaction's
-    /// own, the fee bundle of a two-bundle action), `"asset_bundle"` (that action's second
-    /// bundle — a `BridgeBurn`'s, a `TokenTransfer`'s or a `TokenBurn`'s), `"deposit"` (a
-    /// `BridgeAttest`'s deposit envelope), or `"mint"` (a faucet mint's one envelope).
+    /// Which of the transaction's envelope sets this came from: `"bundle"` (its bundle's four
+    /// output slots), `"deposit"` (a `BridgeAttest`'s deposit envelope), or `"mint"` (a faucet
+    /// mint's one envelope).
     pub output: &'static str,
     /// The slot inside `output`; meaningless for `"deposit"`, which carries exactly one
     /// envelope.
@@ -211,13 +210,6 @@ pub fn disclosed(tx: &Transaction, deposit_cm: Option<Word8>, key: &TxKey) -> Ve
     if let Some(b) = &tx.bundle {
         for (i, (cm, e)) in b.commitments.iter().zip(&b.envelopes).enumerate() {
             try_env("bundle", i as u8, *cm, e);
-        }
-    }
-    // The asset bundle of any two-bundle action — a `BridgeBurn`, a `TokenTransfer` or a
-    // `TokenBurn` — carries envelopes exactly as the fee bundle does, sealed by the same sender.
-    if let Some(asset_bundle) = tx.action.asset_bundle() {
-        for (i, (cm, e)) in asset_bundle.commitments.iter().zip(&asset_bundle.envelopes).enumerate() {
-            try_env("asset_bundle", i as u8, *cm, e);
         }
     }
     match &tx.action {
@@ -343,17 +335,16 @@ mod tests {
             [alice_note_1.commitment(), bob_note.commitment()],
             bundle_fee(),
         );
-        b1_bundle.envelopes = [
-            sealed(&bob(), &alice(), &alice_note_1, &TxKey([11; 32])),
-            sealed(&alice(), &bob(), &bob_note, &TxKey([12; 32])),
-        ];
+        b1_bundle.envelopes[0] = sealed(&bob(), &alice(), &alice_note_1, &TxKey([11; 32]));
+        b1_bundle.envelopes[1] = sealed(&alice(), &bob(), &bob_note, &TxKey([12; 32]));
         let tx1 = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, b1_bundle, Action::None));
         let b1 = make_block(&gs.block, &mut ledger, vec![tx1], &key(1));
         storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
         let alice_note_2 = note_for(&alice(), &bob(), 900);
         let mut b2_bundle = fixtures::bundle(&ledger, [[33; 8], [34; 8]], [alice_note_2.commitment(), [44; 8]], bundle_fee());
-        b2_bundle.envelopes = [sealed(&bob(), &alice(), &alice_note_2, &TxKey([13; 32])), fixtures::env(9)];
+        b2_bundle.envelopes[0] = sealed(&bob(), &alice(), &alice_note_2, &TxKey([13; 32]));
+        b2_bundle.envelopes[1] = fixtures::env(9);
         let tx2 = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, b2_bundle, Action::None));
         let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &key(1));
         storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
@@ -373,7 +364,7 @@ mod tests {
         // Leaf 0 is the genesis alloc, whose placeholder envelope opens for nobody.
         assert_eq!(
             got,
-            vec![(1, Role::Received, alice_note_1), (2, Role::Sent, bob_note), (3, Role::Received, alice_note_2)]
+            vec![(1, Role::Received, alice_note_1), (2, Role::Sent, bob_note), (5, Role::Received, alice_note_2)]
         );
         // Heights came from the rows.
         assert_eq!(import.notes[0].height, 1);
@@ -383,7 +374,7 @@ mod tests {
         let mut bobs = Import { vk: bob(), rescan_from_height: 0, scanned_index: 0, notes: Vec::new() };
         advance(&storage, &mut bobs, MAX_SCAN_ROWS).unwrap();
         let got: Vec<(u64, Role, Note)> = bobs.notes.iter().map(|n| (n.index, n.role, n.note)).collect();
-        assert_eq!(got, vec![(1, Role::Sent, alice_note_1), (2, Role::Received, bob_note), (3, Role::Sent, alice_note_2)]);
+        assert_eq!(got, vec![(1, Role::Sent, alice_note_1), (2, Role::Received, bob_note), (5, Role::Sent, alice_note_2)]);
     }
 
     #[test]
@@ -393,16 +384,16 @@ mod tests {
         // From height 2 the block-1 notes are never tried: the cursor starts at the first leaf
         // of that height, and only the 900 shows.
         let start = storage.first_note_at_or_after(2).unwrap();
-        assert_eq!(start, 3);
+        assert_eq!(start, 5, "one genesis leaf, then block 1's four");
         let mut import = Import { vk: alice(), rescan_from_height: 2, scanned_index: start, notes: Vec::new() };
         advance(&storage, &mut import, MAX_SCAN_ROWS).unwrap();
         assert_eq!(import.notes.len(), 1);
-        assert_eq!((import.notes[0].index, import.notes[0].note), (3, alice_note_2));
+        assert_eq!((import.notes[0].index, import.notes[0].note), (5, alice_note_2));
 
         // A per-call bound stops mid-tree and picks up where it stopped: one leaf per call here,
-        // so the four leaves take four calls and the fifth finds nothing new.
+        // so the nine leaves take nine calls and the tenth finds nothing new.
         let mut slow = Import { vk: alice(), rescan_from_height: 0, scanned_index: 0, notes: Vec::new() };
-        for calls in 1..=4 {
+        for calls in 1..=9 {
             advance(&storage, &mut slow, 1).unwrap();
             assert_eq!(slow.scanned_index, calls, "one leaf per call");
         }
@@ -423,10 +414,8 @@ mod tests {
             [alice_note.commitment(), change.commitment()],
             bundle_fee(),
         );
-        bundle.envelopes = [
-            sealed(&bob(), &alice(), &alice_note, &payment_key),
-            seal_note(&bob(), &address_of(&bob()), &change, &change_key).unwrap(),
-        ];
+        bundle.envelopes[0] = sealed(&bob(), &alice(), &alice_note, &payment_key);
+        bundle.envelopes[1] = seal_note(&bob(), &address_of(&bob()), &change, &change_key).unwrap();
         let tx = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, bundle, Action::None));
 
         // The payment key discloses the payment and nothing else.

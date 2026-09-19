@@ -152,7 +152,6 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | T::AuthorityNotAllowed
                 | T::InitialMintRequired
                 | T::ZeroAmount
-                | T::MemoTooLarge(_)
         );
     }
     matches!(
@@ -187,11 +186,12 @@ pub fn is_permanent(e: &TxError) -> bool {
             // A transaction colliding with *itself* — no other transaction and no state involved.
             | TxError::DuplicateNullifierInBundle
             | TxError::DuplicateCommitmentInBundle
-            // A burn's asset-bundle arithmetic is entirely within the transaction, as is the
-            // recipient an attestation names against the one the action carries.
+            // A bundle's burn fields against its action's are entirely within the transaction
+            // (the hidden-asset bundle's burn shape), as is the recipient an attestation names
+            // against the one the action carries.
             | TxError::BurnAssetMismatch { .. }
-            | TxError::BurnAssetBundleFee(_)
             | TxError::BurnAmountMismatch { .. }
+            | TxError::NonCanonicalRandBurn(_)
             | TxError::BridgeRecipientMismatch
     )
 }
@@ -517,7 +517,6 @@ mod tests {
             tok(T::AuthorityNotAllowed),
             tok(T::InitialMintRequired),
             tok(T::ZeroAmount),
-            tok(T::MemoTooLarge(2_049)),
         ] {
             assert!(is_permanent(&e), "{e} is a statement about the bytes");
         }

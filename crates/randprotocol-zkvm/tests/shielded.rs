@@ -1,6 +1,7 @@
 //! The vendored note layer (`notes`/`viewing`/`ledger`, synced from the research crate by
 //! `deploy/sync-zkvm.sh`) against `randprotocol-core`'s own pure data types, and one end-to-end
-//! `bundle` proof.
+//! proof of the chain's bundle guest (the hidden-asset guest since chain 14) through the
+//! `ConfidentialExecutor` surface the ledger calls.
 //!
 //! Node-local, not vendored: upstream's `tests/bundle.rs` and `tests/viewing.rs` are the
 //! authority on the note layer's own behaviour and are deliberately left there (each proves
@@ -8,20 +9,23 @@
 //! file checks is the seam upstream cannot: that `randprotocol_core`'s hash-free `CommitmentTree`/
 //! `FullTree` reproduce `ledger::CommitmentTree` exactly, that the domain tags the sync script
 //! inlines into `hash.rs` still equal the vendored `notes::domain` ones, and that a bundle proof
-//! this crate produces is one `ZkExecutor` — the chain-side verifier — accepts.
+//! this crate produces is one `ZkExecutor` — the chain-side verifier, through the trait methods
+//! `Ledger::check_bundle_proof` calls — accepts.
 
 use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor};
 use randprotocol_core::notes::{CommitmentTree, FullTree, Word8, DEPTH};
 use randprotocol_zkvm::address::{address_of, digest_input_of, seal_note};
 use randprotocol_zkvm::executor::{prove_bundle, ZkExecutor};
+use randprotocol_zkvm::hidden::{self, HiddenOutput};
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use randprotocol_zkvm::notes::{self, Note, SpendKey};
 use randprotocol_zkvm::viewing::TxKey;
 
 /// `hc`, the in-circuit Poseidon2 program digest of the vendored `guests::bundle()`, as the
 /// research crate at commit `4086aa8` prints it — its own `guests::bundle().code_hash()`, over a
-/// 3811-word program. A genesis pins this value as `hc_bundle`, and every bundle proof
-/// on the chain is verified against it, so it must be the digest of *upstream's* guest and not
+/// 3811-word program. Chains up to 13 pinned this value as `hc_bundle`; since the hidden-asset
+/// bundle (chain 14) the guest is off the chain path and kept as
+/// `ZkExecutor::legacy_bundle_program`. It must still be the digest of *upstream's* guest and not
 /// merely of whatever this crate happens to assemble: `guests.rs` and `asm.rs` are excluded from
 /// `deploy/sync-zkvm.sh`'s rsync (they carry node-local additions) and so are the two files a
 /// resync can silently leave behind. An assertion against a program object built on this side
@@ -57,12 +61,17 @@ fn core_trees_agree_with_the_vendored_research_tree() {
 }
 
 #[test]
-fn hc_bundle_is_the_vendored_guest_digest_and_domains_agree() {
-    assert_eq!(ZkExecutor::hc_bundle(), ZkExecutor::bundle_program().digest());
+fn the_legacy_guest_is_upstreams_the_chain_pins_the_hidden_one_and_domains_agree() {
+    assert_eq!(ZkExecutor::hc_legacy_bundle(), ZkExecutor::legacy_bundle_program().digest());
     // The upstream cross-check: `Program::code_hash` is `digest()` rendered as eight `{:08x}`
-    // words, so this pins every word of `hc_bundle` to the research crate's own value.
-    assert_eq!(ZkExecutor::bundle_program().code_hash(), RESEARCH_HC_BUNDLE_HEX);
-    assert_eq!(ZkExecutor::bundle_program().words.len(), 3811);
+    // words, so this pins every word of the retired guest's `hc` to the research crate's own value.
+    assert_eq!(ZkExecutor::legacy_bundle_program().code_hash(), RESEARCH_HC_BUNDLE_HEX);
+    assert_eq!(ZkExecutor::legacy_bundle_program().words.len(), 3811);
+    // The chain's guest — what `hc_bundle` in a chain-14 genesis pins — is the hidden one.
+    assert_eq!(ZkExecutor::hc_bundle(), ZkExecutor::hc_hidden_bundle());
+    assert_eq!(ZkExecutor::bundle_program().digest(), ZkExecutor::hc_hidden_bundle());
+    assert_eq!(ZkExecutor::bundle_heights(), ZkExecutor::hidden_bundle_heights());
+    assert_ne!(ZkExecutor::hc_bundle(), ZkExecutor::hc_legacy_bundle());
     // `deploy/sync-zkvm.sh` rewrites `hash.rs`/`tables/cpu.rs`'s references to
     // `notes::domain::{HC, IN, PUB}` into local constants rather than reverting that patch now
     // that `notes.rs` is vendored; this is what keeps the two copies from drifting.
@@ -100,9 +109,11 @@ fn the_executors_note_commitment_is_the_vendored_notes_own() {
     );
 }
 
-/// A 1-in-1-out-with-dummies bundle's private inputs, and the digest input the ledger recomputes
-/// from its plaintext — emulated first, in milliseconds, so a tainted witness fails here and not
-/// after a minute of proving.
+/// A RAND payment on the hidden-asset bundle — one real RAND input in slot 2, three dummy
+/// inputs, two real RAND outputs in slots 2–3 and two dummy outputs in slots 0–1, `A = 0` — its
+/// private inputs, and the digest input the ledger recomputes from its plaintext through the core
+/// record. Emulated first, in milliseconds, so a tainted witness fails here and not after a minute
+/// of proving.
 fn bundle_witness(ex: &ZkExecutor) -> (Vec<u32>, randprotocol_core::notes::BundleDigestInput) {
     let sk = SpendKey::random();
     let vk = sk.viewing_key();
@@ -113,29 +124,40 @@ fn bundle_witness(ex: &ZkExecutor) -> (Vec<u32>, randprotocol_core::notes::Bundl
     tree.append(spent.commitment());
     let (path, index) = tree.path_for(&spent.commitment()).unwrap();
     let anchor = tree.root();
-    // A dummy input: amount 0, so the guest skips its `MERKLE_VERIFY`/anchor/asset checks and its
-    // path/index are never dereferenced. Its OWNER must still be `pk_self` — the guest always
-    // stages an input note with its own derived `pk_self` in the owner slot, never a witness word
-    // (that is what makes "you can only spend notes committed to your own key" structural), so a
-    // dummy owned by anyone else would have the guest commit to, and nullify, a different note
-    // than the one built here. `r` is fresh (`Note::new`): two zero-`r` dummies would collide to
-    // one nullifier and taint the proof.
-    let dummy = (Note::new(vk.pk(), [0; 8], 0, 0, time), [[0; 8]; DEPTH], 0u32);
+    // Dummy inputs: amount 0, so the guest skips their Merkle/anchor/asset checks and never
+    // dereferences their paths. Owned by `pk_self` (the guest stages every input under its own
+    // key) and each with a fresh `r` (`Note::new`): identical dummies would share a nullifier.
+    let dummy = || (Note::new(vk.pk(), [0; 8], 0, 0, time), [[0; 8]; DEPTH], 0u32);
+    let ins = [dummy(), dummy(), (spent, path, index), dummy()];
     let fee = 10u64;
-    let out1 = Note::new(vk.pk(), vk.pk(), 600, 0, time);
-    let out2 = Note::new(vk.pk(), vk.pk(), 390, 0, time);
-    let inputs = notes::bundle_inputs(&sk, &[(spent, path, index), dummy], &[out1, out2], anchor, fee, 0, 0, time);
-    let nf1 = vk.nullifier(&spent.commitment());
-    let nf2 = vk.nullifier(&dummy.0.commitment());
-    let di = digest_input_of(anchor, [nf1, nf2], [out1.commitment(), out2.commitment()], fee, 0, 0, time);
+    let fresh_r = || Note::new(vk.pk(), [0; 8], 0, 0, time).r;
+    let outs = [
+        HiddenOutput { pk: vk.pk(), amount: 0, r: fresh_r() },
+        HiddenOutput { pk: vk.pk(), amount: 0, r: fresh_r() },
+        HiddenOutput { pk: vk.pk(), amount: 600, r: fresh_r() },
+        HiddenOutput { pk: vk.pk(), amount: 390, r: fresh_r() },
+    ];
+    let inputs = hidden::hidden_bundle_inputs(&sk, &ins, &outs, anchor, fee, 0, 0, 0, time);
+    let nfs = std::array::from_fn(|k| vk.nullifier(&ins[k].0.commitment()));
+    let notes: [Note; 4] = std::array::from_fn(|k| outs[k].note(k, vk.pk(), 0, time));
+    let di = digest_input_of(anchor, nfs, notes.map(|n| n.commitment()), fee, 0, 0, 0, time);
     // Emulate first, in milliseconds, and check the witness against the core-side recompute before
     // paying for a proof: a witness the guest taints (`bad != 0`) publishes a digest no plaintext
     // can reproduce, and finding that out after the prover has run costs minutes.
-    let emulated = randprotocol_zkvm::emulator::execute(ZkExecutor::bundle_program(), &inputs, &[], 50_000_000).unwrap();
+    let emulated = randprotocol_zkvm::emulator::execute(ZkExecutor::bundle_program(), &inputs, &BINDING_A, 50_000_000).unwrap();
     assert_eq!(ex.bundle_digest(&di), emulated.outputs, "the witness is tainted or the digest preimage disagrees");
-    let e = seal_note(&vk, &me, &out1, &TxKey::random()).unwrap();
+    let e = seal_note(&vk, &me, &notes[2], &TxKey::random()).unwrap();
     assert!(e.len() <= randprotocol_core::notes::MAX_ENVELOPE_BYTES);
     (inputs, di)
+}
+
+/// The fast half of the seam, no proof: the trait's `bundle_digest` over the core record is the
+/// hidden guest's own digest function, field for field.
+#[test]
+fn the_executors_bundle_digest_is_the_hidden_guests() {
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let (_, di) = bundle_witness(&ex);
+    assert_eq!(ex.bundle_digest(&di), hidden::hidden_bundle_digest(&randprotocol_zkvm::executor::hidden_digest_input(&di)));
 }
 
 /// Two transactions' bindings (`Transaction::binding`): the words a bundle is proved with, and
@@ -166,6 +188,8 @@ fn a_bundle_proves_against_its_binding_and_verifies_only_against_it() {
         "a proof bound to one transaction is refused for any other"
     );
     assert!(ex.verify_bundle(&[1u32; 8], &proof, &BINDING_A).is_err());
+    // …and under the retired guest's `hc`: a chain-13 genesis cannot verify a chain-14 bundle.
+    assert!(ex.verify_bundle(&ZkExecutor::hc_legacy_bundle(), &proof, &BINDING_A).is_err());
     // The declared public height is pinned to the binding's (4, for eight words) and anything
     // else is refused before any verifier key is built — here the empty segment's height, 2.
     let decoded = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();

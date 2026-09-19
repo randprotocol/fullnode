@@ -1184,13 +1184,14 @@ mod register_tests {
     fn bundle(l: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64, burn: u64) -> Bundle {
         let mut b = Bundle {
             anchor: l.root(),
-            nullifiers: nfs,
-            commitments: cms,
+            nullifiers: crate::notes::pad4(nfs),
+            commitments: crate::notes::pad4(cms),
             fee,
-            burn,
-            asset: 0,
+            burn_a: 0,
+            burn_r: burn,
+            burn_asset: 0,
             time: l.height as u32,
-            envelopes: [env(), env()],
+            envelopes: [env(), env(), env(), env()],
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
@@ -1306,8 +1307,8 @@ mod register_tests {
         let tx2 = register_tx(&l, &kp, &payout, cfg().bond);
         // The second bundle spends the same nullifiers, so use fresh ones.
         let mut tx2 = tx2;
-        tx2.bundle.as_mut().unwrap().nullifiers = [[5; 8], [6; 8]];
-        tx2.bundle.as_mut().unwrap().commitments = [[7; 8], [8; 8]];
+        tx2.bundle.as_mut().unwrap().nullifiers = crate::notes::pad4([[5; 8], [6; 8]]);
+        tx2.bundle.as_mut().unwrap().commitments = crate::notes::pad4([[7; 8], [8; 8]]);
         let d = StubExecutor.bundle_digest(&tx2.bundle.as_ref().unwrap().digest_input());
         tx2.bundle.as_mut().unwrap().proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         assert!(l.apply_tx(&tx2, &proposer(&l), &StubExecutor).is_err());
@@ -1525,13 +1526,14 @@ mod admission_tests {
     fn bundle(l: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64, burn: u64) -> Bundle {
         let mut b = Bundle {
             anchor: l.root(),
-            nullifiers: nfs,
-            commitments: cms,
+            nullifiers: crate::notes::pad4(nfs),
+            commitments: crate::notes::pad4(cms),
             fee,
-            burn,
-            asset: 0,
+            burn_a: 0,
+            burn_r: burn,
+            burn_asset: 0,
             time: l.height() as u32,
-            envelopes: [env(), env()],
+            envelopes: [env(), env(), env(), env()],
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
@@ -1999,13 +2001,14 @@ mod payment_tests {
     fn bundle(l: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64, burn: u64) -> Bundle {
         let mut b = Bundle {
             anchor: l.root(),
-            nullifiers: nfs,
-            commitments: cms,
+            nullifiers: crate::notes::pad4(nfs),
+            commitments: crate::notes::pad4(cms),
             fee,
-            burn,
-            asset: 0,
+            burn_a: 0,
+            burn_r: burn,
+            burn_asset: 0,
             time: l.height() as u32,
-            envelopes: [env(), env()],
+            envelopes: [env(), env(), env(), env()],
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());

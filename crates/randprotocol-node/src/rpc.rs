@@ -402,13 +402,13 @@ impl ChainLimits {
 /// `rand_sendTransaction` carries `hex(bincode(tx))` inside a JSON envelope, so every byte of the
 /// transaction costs two here. The terms, all per single transaction:
 ///
-/// - `2 * max_proof_bytes` — a `Call` carries **two** proofs, the fee bundle's and the call's own,
-///   and a two-bundle action (`BridgeBurn`, `TokenTransfer`, `TokenBurn`) likewise carries two
-///   bundles. This is the term the retired limit missed: it
+/// - `2 * max_proof_bytes` — a `Call` carries **two** proofs, the bundle's and the call's own
+///   (since the hidden-asset bundle no other action carries more than one). This is the term the
+///   retired limit missed: it
 ///   allowed `2 * MAX_PROOF_BYTES + 256 KiB` *in total*, which is one hex-encoded proof, so a
 ///   constraint-set-5 `Call` — measured at 1 321 773 bytes for the fee bundle's proof plus ~1.2 MB
 ///   for the call's — was refused after about a hundred seconds of proving.
-/// - `2 * MAX_ENVELOPE_BYTES` — the bundle's two output envelopes.
+/// - `BUNDLE_SLOTS * MAX_ENVELOPE_BYTES` — the bundle's four output envelopes.
 /// - `max_call_envelope_bytes` — the call's input envelope.
 /// - `MAX_ATTESTATION_BYTES` — a `BridgeAttest`'s attestation.
 /// - 64 KiB for the rest: public keys, signatures, hashes, nullifiers and bincode framing.
@@ -416,7 +416,7 @@ impl ChainLimits {
 /// Then doubled for the hex encoding, plus 256 KiB for the JSON envelope and headers.
 pub const fn rpc_max_body_bytes(max_proof_bytes: usize, max_call_envelope_bytes: usize) -> usize {
     2 * (2 * max_proof_bytes
-        + 2 * randprotocol_core::notes::MAX_ENVELOPE_BYTES
+        + randprotocol_core::notes::BUNDLE_SLOTS * randprotocol_core::notes::MAX_ENVELOPE_BYTES
         + max_call_envelope_bytes
         + randprotocol_core::gas::MAX_ATTESTATION_BYTES
         + 64 * 1024)
@@ -888,20 +888,21 @@ pub(crate) fn unsealed_bundles(
 /// and proof are reported by length only; anyone who wants the bytes can fetch the block, and a
 /// call's public input commitment `H_IN` — the one thing a holder needs to open its input
 /// envelope — is served on the receipt (`rand_getReceipt`, `rand_getCallEnvelope`).
-/// A bundle's public fields — none of which names a party. Used for the transaction's own
-/// bundle and, since S3's `BridgeBurn`, for the asset bundle riding inside a two-bundle action
-/// (RPL's `TokenTransfer` and `TokenBurn` are the other two).
+/// A bundle's public fields — none of which names a party, and none of which names the asset a
+/// transfer moved (the hidden-asset bundle, spec §4): its four nullifiers and commitments, the
+/// RAND fee, the three burn fields and the time.
 fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
     json!({
         "anchor": word8_to_hex(&b.anchor),
-        "nullifiers": [word8_to_hex(&b.nullifiers[0]), word8_to_hex(&b.nullifiers[1])],
-        "commitments": [word8_to_hex(&b.commitments[0]), word8_to_hex(&b.commitments[1])],
+        "nullifiers": b.nullifiers.iter().map(word8_to_hex).collect::<Vec<_>>(),
+        "commitments": b.commitments.iter().map(word8_to_hex).collect::<Vec<_>>(),
         "fee": b.fee,
-        "burn": b.burn,
-        "asset": b.asset,
+        "burn_a": b.burn_a,
+        "burn_r": b.burn_r,
+        "burn_asset": b.burn_asset,
         "time": b.time,
         "proof_len": b.proof.len(),
-        "envelope_len": [b.envelopes[0].len(), b.envelopes[1].len()],
+        "envelope_len": b.envelopes.iter().map(|e| e.len()).collect::<Vec<_>>(),
     })
 }
 
@@ -981,12 +982,11 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
                 }),
             })
         }
-        Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain, token, to } => json!({
+        Action::BridgeBurn { asset, amount, relayer_fee, to_chain, token, to } => json!({
             "kind": "bridge_burn", "asset": asset, "amount": amount, "relayer_fee": relayer_fee,
             // The coin being redeemed, which is a field of the action since one bridged token has
             // many backings (spec §12) — the outbound message names this pair.
             "to_chain": to_chain, "token": hex::encode(token), "to": hex::encode(to),
-            "asset_bundle": bundle_json(asset_bundle),
         }),
         // Block aggregation: the register is public by design (spec §2), so its inputs are too —
         // the staking actions' rule, one register over. The aggregate itself reports the cover
@@ -1030,20 +1030,11 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
             // `null` is a renunciation: the token can never be minted again.
             "new_authority": new.as_ref().map(|pk| pk.address().to_base58()),
         }),
-        // The two shielded RPL actions. A transfer reveals its asset index and nothing else about
-        // the value moved — the asset bundle's four words are what every bundle publishes — and a
-        // holder burn reveals its amount, which is the point: it is what makes `total_supply`
-        // auditable. The memo is opaque to the chain, so only its **size** is rendered: it is
-        // arbitrary submitter bytes, and a JSON field a client might print is no place to put them
-        // (a client that wants the bytes reads them off the transaction's own encoding).
-        Action::TokenTransfer { asset_bundle, memo } => json!({
-            "kind": "token_transfer", "asset": asset_bundle.asset,
-            "memo_bytes": memo.as_ref().map(|m| m.len()),
-            "asset_bundle": bundle_json(asset_bundle),
-        }),
-        Action::TokenBurn { asset_bundle, asset, amount } => json!({
+        // A holder burn reveals its asset and amount, which is the point: it is what makes
+        // `total_supply` auditable. (A transfer of a token is a plain `none` bundle: its asset is
+        // private.)
+        Action::TokenBurn { asset, amount } => json!({
             "kind": "token_burn", "asset": asset, "amount": amount,
-            "asset_bundle": bundle_json(asset_bundle),
         }),
     };
     json!({
@@ -2113,13 +2104,14 @@ mod tests {
         };
         let mut b = randprotocol_core::notes::Bundle {
             anchor: gs.ledger.root(),
-            nullifiers: [nf(3), nf(4)],
-            commitments: [cm(3), cm(4)],
+            nullifiers: crate::storage::fixtures::pad4([nf(3), nf(4)]),
+            commitments: crate::storage::fixtures::pad4([cm(3), cm(4)]),
             fee: bundle_fee(),
-            burn: bond,
-            asset: 0,
+            burn_a: 0,
+            burn_r: bond,
+            burn_asset: 0,
             time: 1,
-            envelopes: [fixtures::env(1), fixtures::env(2)],
+            envelopes: [fixtures::env(1), fixtures::env(2), fixtures::env(1), fixtures::env(2)],
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
@@ -2340,14 +2332,14 @@ mod tests {
         let (_d, st, _gs) = chain();
         let all = ok(&st, "rand_getCommitments", json!([0, 100])).await;
         let all = all.as_array().unwrap();
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 6, "two genesis notes and the bundle's four slots");
         // Indexes are dense and ascending; the genesis notes are at height 0 and the bundle's
         // outputs at height 1.
         for (i, row) in all.iter().enumerate() {
             assert_eq!(row["index"], i as u64);
         }
         assert_eq!(all[0]["height"], 0);
-        assert_eq!(all[3]["height"], 1);
+        assert_eq!(all[5]["height"], 1);
         assert_eq!(all[2]["cm"], word8_to_hex(&cm(1)));
         assert_eq!(all[3]["cm"], word8_to_hex(&cm(2)));
         // An envelope comes back in its four hex parts.
@@ -2360,7 +2352,7 @@ mod tests {
         assert_eq!(ok(&st, "rand_getCommitments", json!([0, 2])).await.as_array().unwrap().len(), 2);
         assert_eq!(ok(&st, "rand_getCommitments", json!([9, 100])).await, json!([]));
         // An oversized limit is clamped, not refused.
-        assert_eq!(ok(&st, "rand_getCommitments", json!([0, 10_000])).await.as_array().unwrap().len(), 4);
+        assert_eq!(ok(&st, "rand_getCommitments", json!([0, 10_000])).await.as_array().unwrap().len(), 6);
     }
 
     #[tokio::test]
@@ -2368,7 +2360,7 @@ mod tests {
         let (_d, st, _gs) = chain();
         let nfs = ok(&st, "rand_getNullifiers", json!([0, 100])).await;
         let nfs = nfs.as_array().unwrap();
-        assert_eq!(nfs.len(), 2);
+        assert_eq!(nfs.len(), 4, "the bundle's four nullifiers, dummies included");
         for row in nfs {
             assert_eq!(row["height"], 1);
         }
@@ -2379,8 +2371,8 @@ mod tests {
         assert_eq!(ok(&st, "rand_getNullifiers", json!([2, 100])).await, json!([]));
 
         let info = ok(&st, "rand_getTreeInfo", json!([])).await;
-        assert_eq!(info["next_index"], 4);
-        assert_eq!(info["nullifiers"], 2);
+        assert_eq!(info["next_index"], 6);
+        assert_eq!(info["nullifiers"], 4);
         assert_eq!(info["root"], word8_to_hex(&st.storage.tree().unwrap().root()));
     }
 
@@ -2410,7 +2402,7 @@ mod tests {
             assert_eq!(got.len(), DEPTH);
         }
         // A leaf past the end is null, not an error.
-        assert_eq!(ok(&st, "rand_getWitness", json!([4])).await, Value::Null);
+        assert_eq!(ok(&st, "rand_getWitness", json!([6])).await, Value::Null);
     }
 
     #[tokio::test]
@@ -2539,13 +2531,13 @@ mod tests {
     #[tokio::test]
     async fn the_rpc_limits_follow_a_20_mib_ledger() {
         use randprotocol_core::gas::MAX_ATTESTATION_BYTES;
-        use randprotocol_core::notes::MAX_ENVELOPE_BYTES;
+        use randprotocol_core::notes::{BUNDLE_SLOTS, MAX_ENVELOPE_BYTES};
         let default = ChainLimits::of(&fixtures::genesis(1).ledger);
         assert_eq!(default.rpc_max_body_bytes(), RPC_MAX_BODY_BYTES, "a default chain keeps today's limit");
 
         let gs = raised_genesis();
         let (_d, st) = state_for(&gs);
-        let want = 2 * (2 * (8 << 20) + 2 * MAX_ENVELOPE_BYTES + (64 << 10) + MAX_ATTESTATION_BYTES + 64 * 1024) + 256 * 1024;
+        let want = 2 * (2 * (8 << 20) + BUNDLE_SLOTS * MAX_ENVELOPE_BYTES + (64 << 10) + MAX_ATTESTATION_BYTES + 64 * 1024) + 256 * 1024;
         assert_eq!(st.max_body_bytes, want);
         assert_eq!(ChainLimits::of(&gs.ledger).rpc_max_body_bytes(), want);
 
@@ -2727,8 +2719,8 @@ mod tests {
             s.hc_bundle = word8_to_hex(&st.storage.hc_bundle().unwrap());
         }
         let v = ok(&st, "rand_status", json!([])).await;
-        assert_eq!(v["notes"], 4);
-        assert_eq!(v["nullifiers"], 2);
+        assert_eq!(v["notes"], 6);
+        assert_eq!(v["nullifiers"], 4);
         assert_eq!(v["tree_root"], word8_to_hex(&st.storage.tree().unwrap().root()));
         assert_eq!(v["hc_bundle"], word8_to_hex(&fixtures::HC));
         // Written by the node loop's publish_status, which these tests don't run: zero here, and
@@ -3141,13 +3133,14 @@ mod tests {
         };
         let mut b = randprotocol_core::notes::Bundle {
             anchor: ledger.root(),
-            nullifiers: [nf(1), nf(2)],
-            commitments: [cm(1), cm(2)],
+            nullifiers: crate::storage::fixtures::pad4([nf(1), nf(2)]),
+            commitments: crate::storage::fixtures::pad4([cm(1), cm(2)]),
             fee: bundle_fee(),
-            burn: bond,
-            asset: 0,
+            burn_a: 0,
+            burn_r: bond,
+            burn_asset: 0,
             time: 1,
-            envelopes: [fixtures::env(1), fixtures::env(2)],
+            envelopes: [fixtures::env(1), fixtures::env(2), fixtures::env(1), fixtures::env(2)],
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
@@ -3296,9 +3289,7 @@ mod tests {
         assert!(at["asset_index"].is_null(), "and its asset index is in the registry, which there is none of");
         assert!(at["commitment"].is_null(), "with no registry there is no index to compute a leaf under");
 
-        let asset_bundle = b([nf(3), nf(4)], [cm(3), cm(4)]);
         let burn = j(Action::BridgeBurn {
-            asset_bundle,
             asset: 2,
             amount: 400,
             relayer_fee: 100,
@@ -3312,35 +3303,14 @@ mod tests {
             (&json!(2), &json!(400), &json!(100), &json!(5))
         );
         assert_eq!(burn["to"], "ab".repeat(32));
-        // The asset bundle renders exactly like the fee bundle: same public fields, no more.
-        assert_eq!(burn["asset_bundle"]["nullifiers"][0], word8_to_hex(&nf(3)));
-        assert_eq!(burn["asset_bundle"]["fee"], bundle_fee());
+        assert!(burn.get("asset_bundle").is_none(), "a burn is single-bundle: no second bundle to render");
 
-        // RPL's two shielded actions. A transfer publishes its asset index and its asset bundle's
-        // four words, and *only the size* of its memo: the bytes are opaque submitter data and no
-        // explorer field is the place for them.
-        let mut asset_bundle = b([nf(5), nf(6)], [cm(5), cm(6)]);
-        asset_bundle.asset = 3;
-        asset_bundle.fee = 0;
-        let t = j(Action::TokenTransfer { asset_bundle: asset_bundle.clone(), memo: Some(vec![0xab; 40]) });
-        assert_eq!(t["kind"], "token_transfer");
-        assert_eq!(t["asset"], 3, "the bundle's own word is the token a transfer moves");
-        assert_eq!(t["memo_bytes"], 40);
-        assert_eq!(t["asset_bundle"]["nullifiers"][0], word8_to_hex(&nf(5)));
-        assert_eq!(t["asset_bundle"]["commitments"][1], word8_to_hex(&cm(6)));
-        assert_eq!(t["asset_bundle"]["fee"], 0, "the RAND bundle pays the fee");
-        assert!(
-            !serde_json::to_string(&t).unwrap().contains("abab"),
-            "the memo's bytes are never rendered, only its length"
-        );
-        assert!(j(Action::TokenTransfer { asset_bundle: asset_bundle.clone(), memo: None })["memo_bytes"].is_null());
-
-        let mut burning = asset_bundle.clone();
-        burning.burn = 400;
-        let tb = j(Action::TokenBurn { asset_bundle: burning, asset: 3, amount: 400 });
+        // A holder burn publishes its asset and amount — what audits the supply — and nothing
+        // else of its own.
+        let tb = j(Action::TokenBurn { asset: 3, amount: 400 });
         assert_eq!(tb["kind"], "token_burn");
         assert_eq!((&tb["asset"], &tb["amount"]), (&json!(3), &json!(400)));
-        assert_eq!(tb["asset_bundle"]["burn"], 400, "a holder burn is public: that is what audits the supply");
+        assert!(tb.get("asset_bundle").is_none());
 
         // A call reports its envelope's size, or null when it carries none.
         let plain = j(Action::Call { program: Hash::ZERO, proof: vec![1; 40], input_envelope: None });
@@ -3515,13 +3485,14 @@ mod tests {
         };
         let bundle = Bundle {
             anchor: [1; 8],
-            nullifiers: [nf(1), nf(2)],
-            commitments: [cm(1), cm(2)],
+            nullifiers: crate::storage::fixtures::pad4([nf(1), nf(2)]),
+            commitments: crate::storage::fixtures::pad4([cm(1), cm(2)]),
             fee: randprotocol_core::gas::BUNDLE_BASE,
-            burn: 0,
-            asset: 0,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
             time: 1,
-            envelopes: [big_envelope(), big_envelope()],
+            envelopes: [big_envelope(), big_envelope(), big_envelope(), big_envelope()],
             proof: vec![9u8; randprotocol_core::gas::MAX_PROOF_BYTES],
         };
         let call = Action::Call {
@@ -3714,9 +3685,10 @@ mod tests {
         let txs = b1["transactions"].as_array().unwrap();
         assert_eq!(txs.len(), 1);
         assert_eq!(txs[0]["hash"], head.transactions[0].hash().to_hex());
-        assert_eq!(txs[0]["nullifiers"], json!([word8_to_hex(&nf(1)), word8_to_hex(&nf(2))]));
+        let nfs4 = crate::storage::fixtures::pad4([nf(1), nf(2)]);
+        assert_eq!(txs[0]["nullifiers"], json!(nfs4.iter().map(word8_to_hex).collect::<Vec<_>>()), "all four slots");
         let cms = txs[0]["commitments"].as_array().unwrap();
-        assert_eq!(cms.len(), 2);
+        assert_eq!(cms.len(), 4, "all four output slots, dummies included");
         assert_eq!((&cms[0]["index"], &cms[0]["cm"]), (&json!(2), &json!(word8_to_hex(&cm(1)))));
         assert_eq!((&cms[1]["index"], &cms[1]["cm"]), (&json!(3), &json!(word8_to_hex(&cm(2)))));
         // The envelope goes out in its four hex parts, exactly as getCommitments serves it.
@@ -3798,7 +3770,7 @@ mod tests {
         let txs = rows[0]["transactions"].as_array().unwrap();
         assert_eq!(txs.len(), 600);
         let notes: usize = txs.iter().map(|t| t["commitments"].as_array().unwrap().len()).sum();
-        assert_eq!(notes, 1200, "the block is served whole however far past the cap it is");
+        assert_eq!(notes, 2400, "the block is served whole however far past the cap it is: four leaves a bundle");
         assert_eq!(rows[0]["commitments"], json!([]), "and every leaf is attributed to its transaction");
         // The caller resumes at the last height it got plus one and gets the next block.
         let next = ok(&st, "rand_getCompactBlocks", json!([2, 2])).await;
@@ -3863,13 +3835,13 @@ mod tests {
             let w_notes = rendered[wi]["commitments"].as_array().unwrap();
             assert_eq!(w_notes.len(), 1, "attest_first={attest_first}");
             assert_eq!(w_notes[0]["index"], withdraw_leaf, "attest_first={attest_first}");
-            // ...and the attest's deposit rides with its fee bundle's two slots, last of the three.
+            // ...and the attest's deposit rides with its bundle's four slots, last of the five.
             let ai = block.transactions.iter().position(|t| matches!(t.action, Action::BridgeAttest { .. })).unwrap();
             let a_notes = rendered[ai]["commitments"].as_array().unwrap();
-            assert_eq!(a_notes.len(), 3, "attest_first={attest_first}: two bundle slots and the deposit");
-            assert_eq!(a_notes[2]["cm"], word8_to_hex(&expected_deposit.0), "attest_first={attest_first}");
+            assert_eq!(a_notes.len(), 5, "attest_first={attest_first}: four bundle slots and the deposit");
+            assert_eq!(a_notes[4]["cm"], word8_to_hex(&expected_deposit.0), "attest_first={attest_first}");
             assert_eq!(
-                a_notes[2]["envelope"],
+                a_notes[4]["envelope"],
                 envelope_json(&expected_deposit.1),
                 "attest_first={attest_first}: the envelope the chain sealed, not the action's"
             );
@@ -3926,17 +3898,16 @@ mod tests {
         let b700 = note_for(&bob, &alice, 700);
         let mut bundle =
             fixtures::bundle(&ledger, [[31; 8], [32; 8]], [a500.commitment(), b700.commitment()], bundle_fee());
-        bundle.envelopes = [
-            sealed_to(&bob, &alice, &a500, &TxKey([11; 32])),
-            sealed_to(&alice, &bob, &b700, &TxKey([12; 32])),
-        ];
+        bundle.envelopes[0] = sealed_to(&bob, &alice, &a500, &TxKey([11; 32]));
+        bundle.envelopes[1] = sealed_to(&alice, &bob, &b700, &TxKey([12; 32]));
         let tx1 = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, bundle, Action::None));
         let b1 = make_block(&gs.block, &mut ledger, vec![tx1], &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
         let a900 = note_for(&alice, &bob, 900);
         let mut bundle = fixtures::bundle(&ledger, [[33; 8], [34; 8]], [a900.commitment(), [44; 8]], bundle_fee());
-        bundle.envelopes = [sealed_to(&bob, &alice, &a900, &TxKey([13; 32])), fixtures::env(9)];
+        bundle.envelopes[0] = sealed_to(&bob, &alice, &a900, &TxKey([13; 32]));
+        bundle.envelopes[1] = fixtures::env(9);
         let tx2 = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, bundle, Action::None));
         let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &key(1));
         st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
@@ -3959,13 +3930,14 @@ mod tests {
         assert_eq!((&v["imported"], &v["viewing_keys"]), (&json!(false), &json!(1)));
 
         let v = ok(&st, "rand_getViewingNotes", json!([nk_hex(&alice)])).await;
-        assert_eq!((&v["scanned_index"], &v["next_index"], &v["complete"]), (&json!(5), &json!(5), &json!(true)));
+        assert_eq!((&v["scanned_index"], &v["next_index"], &v["complete"]), (&json!(9), &json!(9), &json!(true)));
         let rows = v["notes"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
-        // In tree order: received 500 at height 1, sent 700 at height 1, received 900 at 2.
+        // In tree order: received 500 at height 1, sent 700 at height 1, received 900 at 2 —
+        // each bundle four leaves, the two dummy slots opening to nobody.
         assert_eq!((&rows[0]["index"], &rows[0]["role"], &rows[0]["height"]), (&json!(1), &json!("received"), &json!(1)));
         assert_eq!((&rows[1]["index"], &rows[1]["role"]), (&json!(2), &json!("sent")));
-        assert_eq!((&rows[2]["index"], &rows[2]["role"], &rows[2]["height"]), (&json!(3), &json!("received"), &json!(2)));
+        assert_eq!((&rows[2]["index"], &rows[2]["role"], &rows[2]["height"]), (&json!(5), &json!("received"), &json!(2)));
         // Amounts are strings, like every amount this RPC reports as chain state.
         assert_eq!(rows[0]["note"]["amount"], "500");
         assert_eq!(rows[1]["note"]["amount"], "700");
@@ -4006,7 +3978,7 @@ mod tests {
         assert_eq!(v["complete"], true);
         let rows = v["notes"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!((&rows[0]["index"], &rows[0]["note"]["amount"]), (&json!(3), &json!("900".to_string())));
+        assert_eq!((&rows[0]["index"], &rows[0]["note"]["amount"]), (&json!(5), &json!("900".to_string())));
     }
 
     /// A spend shows up as soon as its nullifier is committed: the received note's `spent` flips
@@ -4025,9 +3997,9 @@ mod tests {
 
         let v = ok(&st, "rand_getViewingNotes", json!([nk_hex(&alice)])).await;
         let rows = v["notes"].as_array().unwrap();
-        // The scan also picked up the new block's two leaves (placeholder envelopes, no match),
+        // The scan also picked up the new block's four leaves (placeholder envelopes, no match),
         // and the 500 is now spent — by exactly the nullifier the row reports.
-        assert_eq!(v["scanned_index"], 7);
+        assert_eq!(v["scanned_index"], 13);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["nullifier"], word8_to_hex(&nf));
         assert_eq!(rows[0]["spent"], true);
@@ -4133,7 +4105,7 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!((&rows[0]["id"], &rows[0]["result"]), (&json!(1), &json!(st.chain_id)));
         assert_eq!(rows[1]["id"], json!("two"));
-        assert_eq!(rows[1]["result"]["next_index"], 4);
+        assert_eq!(rows[1]["result"]["next_index"], 6);
         assert_eq!((&rows[2]["id"], &rows[2]["error"]["code"]), (&json!(3), &json!(-32601)));
         // A single request object still answers with a single object, exactly as before.
         let (_, Json(one)) = handle(

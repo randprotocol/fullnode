@@ -1505,19 +1505,30 @@ async fn bridge_mint(
 /// `docs/shielded.md` §5), so everything before the action passes and the refusal that comes back
 /// is the *attestation's*. That is what makes this a probe worth a second of test time rather than
 /// a second bundle proof.
+/// Widen two note words to a bundle's four slots (the two extra derived from them).
+fn pad4(w: [[u32; 8]; 2]) -> [[u32; 8]; 4] {
+    let tag = |x: [u32; 8], k: u32| {
+        let mut y = x;
+        y[7] ^= 0xd0d0_0000 | k;
+        y
+    };
+    [w[0], w[1], tag(w[0], 2), tag(w[1], 3)]
+}
+
 async fn replayed_attest(node: &TestNode, to: &ShieldedAddress, attestation: Vec<u8>, asset: u32) -> Transaction {
     let (height, anchor) = node.rpc.anchor(None).await.expect("the head anchor");
     let time = u32::try_from(height).unwrap();
     let empty = Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] };
     let bundle = Bundle {
         anchor,
-        nullifiers: [[0x51; 8], [0x52; 8]],
-        commitments: [[0x53; 8], [0x54; 8]],
+        nullifiers: pad4([[0x51; 8], [0x52; 8]]),
+        commitments: pad4([[0x53; 8], [0x54; 8]]),
         fee: gas::BUNDLE_BASE,
-        burn: 0,
-        asset: 0,
+        burn_a: 0,
+        burn_r: 0,
+        burn_asset: 0,
         time,
-        envelopes: [empty.clone(), empty.clone()],
+        envelopes: [empty.clone(), empty.clone(), empty.clone(), empty.clone()],
         proof: vec![0xff; 32],
     };
     let action =

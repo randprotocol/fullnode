@@ -640,7 +640,7 @@ fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding
         Err(ConfidentialError::InvalidBundleProof("PublicValues".into())),
         "a proof bound to one transaction is refused for any other"
     );
-    assert!(ex.verify_hidden_bundle(&ZkExecutor::hc_bundle(), &proof, &BINDING_A).is_err(), "another guest's hc");
+    assert!(ex.verify_hidden_bundle(&ZkExecutor::hc_legacy_bundle(), &proof, &BINDING_A).is_err(), "another guest's hc");
     // Today's bundle entry point pins today's input height (612 words), so the new guest's proof
     // is refused there before any verifier key is built.
     use randprotocol_core::confidential::ConfidentialExecutor;

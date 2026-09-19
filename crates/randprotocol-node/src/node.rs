@@ -626,21 +626,41 @@ fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>, limi
     }
 }
 
-pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
-    let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
-    let (gs, executor) = load_genesis(&cfg.datadir)?;
-    // Every shielded-pool proof on this chain is against one guest, pinned by the genesis. A
-    // node built from a different commit would verify nothing and vote against every bundle,
-    // which looks like a consensus bug rather than the build mismatch it is — so say so here.
-    let built = ZkExecutor::hc_bundle();
-    if built != gs.hc_bundle {
+/// What this build can run, checked against the genesis before anything is opened.
+///
+/// - Every shielded-pool proof on the chain is against one guest, pinned by the genesis. A node
+///   built from a different commit would verify nothing and vote against every bundle, which
+///   looks like a consensus bug rather than the build mismatch it is — so say so here.
+/// - **Block aggregation is gated off on the hidden-asset bundle** (chain 14,
+///   `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md` §5): every admitted shape
+///   in an `aggregation` section, the rVM recursion fixtures and the `aggregate` daemon were
+///   measured for the retired 2-in-2-out guest, whose proof shape (program and input heights) the
+///   hidden guest does not share. Aggregation is inactive on every live chain; it has to be
+///   re-measured against the hidden guest before a genesis may carry it again. Refused with a
+///   clear error rather than started into a chain whose aggregates could never cover a bundle.
+pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundle: &randprotocol_core::notes::Word8) -> Result<()> {
+    if *built_hc_bundle != gs.hc_bundle {
         anyhow::bail!(
             "this build's bundle guest ({}) differs from the genesis hc_bundle ({}); \
              rebuild from the chain's pinned commit",
-            randprotocol_core::notes::word8_to_hex(&built),
+            randprotocol_core::notes::word8_to_hex(built_hc_bundle),
             randprotocol_core::notes::word8_to_hex(&gs.hc_bundle)
         );
     }
+    if gs.ledger.aggregation().is_some() {
+        anyhow::bail!(
+            "this genesis enables block aggregation, which is not supported on the hidden-asset \
+             bundle yet: its admitted shapes and the recursion fixtures were measured for the \
+             retired 2-in-2-out guest and must be re-measured before aggregation is activated"
+        );
+    }
+    Ok(())
+}
+
+pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
+    let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
+    let (gs, executor) = load_genesis(&cfg.datadir)?;
+    check_build_runs_genesis(&gs, &ZkExecutor::hc_bundle())?;
     let storage = Arc::new(Storage::open(&cfg.datadir)?);
     storage.init_genesis(&gs)?;
     check_and_repair_chain(&storage, &gs, cfg.verify, executor.as_ref())?;
@@ -2048,6 +2068,29 @@ mod tests {
         assert_eq!(blind.on_proposal(proposal, 3), Err(ConsensusError::UnknownEpochSet(1)));
     }
 
+    /// The startup check (H3): a genesis whose `hc_bundle` is not this build's guest is refused,
+    /// and so is any genesis with an `aggregation` section — aggregation's shapes were measured
+    /// for the retired bundle guest and are gated off until re-measured. A genesis without the
+    /// section and with this build's guest starts.
+    #[test]
+    fn startup_refuses_another_guest_and_an_aggregation_section() {
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        let hc = gs.hc_bundle;
+        assert!(check_build_runs_genesis(&gs, &hc).is_ok());
+        let other = check_build_runs_genesis(&gs, &[0xdead; 8]).unwrap_err().to_string();
+        assert!(other.contains("differs from the genesis hc_bundle"), "{other}");
+        gs.ledger.set_aggregation(Some(randprotocol_core::ledger::aggregation::AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![],
+        }));
+        let gated = check_build_runs_genesis(&gs, &hc).unwrap_err().to_string();
+        assert!(gated.contains("block aggregation") && gated.contains("re-measured"), "{gated}");
+    }
+
     /// The aggregation gate survives a restart: it lives in the genesis file, so a reloaded
     /// ledger must carry it — a node that resumed without it would compute state-2 roots and
     /// refuse every aggregation action by name, forking off a chain-9 fleet at its first restart.
@@ -2154,13 +2197,14 @@ mod tests {
             };
             let mut b = randprotocol_core::notes::Bundle {
                 anchor: ledger.root(),
-                nullifiers: [[45; 8], [46; 8]],
-                commitments: [[47; 8], [48; 8]],
+                nullifiers: crate::storage::fixtures::pad4([[45; 8], [46; 8]]),
+                commitments: crate::storage::fixtures::pad4([[47; 8], [48; 8]]),
                 fee: randprotocol_core::gas::BUNDLE_BASE,
-                burn: cfg.bond,
-                asset: 0,
+                burn_a: 0,
+                burn_r: cfg.bond,
+                burn_asset: 0,
                 time: 1,
-                envelopes: [env(1), env(2)],
+                envelopes: [env(1), env(2), env(1), env(2)],
                 proof: vec![],
             };
             let d = StubExecutor.bundle_digest(&b.digest_input());
@@ -2249,13 +2293,14 @@ mod tests {
     fn register_aggregator(l: &mut Ledger, kp: &Keypair, bond: u64) {
         let mut b = randprotocol_core::notes::Bundle {
             anchor: l.root(),
-            nullifiers: [[1; 8], [2; 8]],
-            commitments: [[3; 8], [4; 8]],
+            nullifiers: crate::storage::fixtures::pad4([[1; 8], [2; 8]]),
+            commitments: crate::storage::fixtures::pad4([[3; 8], [4; 8]]),
             fee: gas::BUNDLE_BASE,
-            burn: bond,
-            asset: 0,
+            burn_a: 0,
+            burn_r: bond,
+            burn_asset: 0,
             time: l.height() as u32,
-            envelopes: [env(1), env(2)],
+            envelopes: [env(1), env(2), env(1), env(2)],
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
@@ -2788,13 +2833,14 @@ mod tests {
         let proof: Vec<u8> = (0..proof_bytes.div_ceil(8)).flat_map(|_| next().to_le_bytes()).take(proof_bytes).collect();
         let bundle = randprotocol_core::notes::Bundle {
             anchor: [1; 8],
-            nullifiers: [[2; 8], [3; 8]],
-            commitments: [[4; 8], [5; 8]],
+            nullifiers: crate::storage::fixtures::pad4([[2; 8], [3; 8]]),
+            commitments: crate::storage::fixtures::pad4([[4; 8], [5; 8]]),
             fee: 1,
-            burn: 0,
-            asset: 0,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
             time: 1,
-            envelopes: [crate::storage::fixtures::env(1), crate::storage::fixtures::env(2)],
+            envelopes: [crate::storage::fixtures::env(1), crate::storage::fixtures::env(2), crate::storage::fixtures::env(1), crate::storage::fixtures::env(2)],
             proof,
         };
         randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, bundle, randprotocol_core::Action::None))
@@ -3192,13 +3238,14 @@ mod tests {
         let n = tag as u32;
         let bundle = randprotocol_core::notes::Bundle {
             anchor: [n; 8],
-            nullifiers: [[n + 10; 8], [n + 20; 8]],
-            commitments: [[n + 30; 8], [n + 40; 8]],
+            nullifiers: crate::storage::fixtures::pad4([[n + 10; 8], [n + 20; 8]]),
+            commitments: crate::storage::fixtures::pad4([[n + 30; 8], [n + 40; 8]]),
             fee: 1,
-            burn: 0,
-            asset: 0,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
             time: 1,
-            envelopes: [crate::storage::fixtures::env(tag), crate::storage::fixtures::env(tag.wrapping_add(1))],
+            envelopes: [crate::storage::fixtures::env(tag), crate::storage::fixtures::env(tag.wrapping_add(1)), crate::storage::fixtures::env(tag), crate::storage::fixtures::env(tag.wrapping_add(1))],
             proof: vec![tag; 32],
         };
         randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, bundle, randprotocol_core::Action::None))

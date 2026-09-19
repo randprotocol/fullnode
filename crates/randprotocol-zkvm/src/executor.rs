@@ -216,47 +216,63 @@ impl ZkExecutor {
         Ok(proof)
     }
 
-    /// The bundle guest (`guests::bundle`), the one program every shielded-pool proof on this
-    /// chain is against. Vendored verbatim from the research crate — see
-    /// `tests/shielded.rs`'s `RESEARCH_HC_BUNDLE_HEX`, which pins its digest to upstream's.
-    ///
-    /// Assembled once per process: `bundle_heights` below calls this on every bundle admission
-    /// (twice, in fact — `bundle_proof_digest` then `verify_bundle`), and re-running the
-    /// assembler for a 3811-word guest on each gossiped transaction is pure waste. The guest is
-    /// a compile-time constant, so a `OnceLock` is the whole of the cache invalidation story.
+    /// The chain's bundle guest: since chain 14 the hidden-asset guest
+    /// ([`Self::hidden_bundle_program`], spec
+    /// `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md` §3.10). Every
+    /// shielded-pool proof on the chain is against it, and [`Self::hc_bundle`] is what a genesis
+    /// pins.
     pub fn bundle_program() -> &'static Program {
+        Self::hidden_bundle_program()
+    }
+
+    /// Digest of the chain's bundle guest (the hidden-asset guest) — the value a genesis pins as
+    /// `hc_bundle`.
+    pub fn hc_bundle() -> Word8 {
+        Self::hc_hidden_bundle()
+    }
+
+    /// The `(program_log_height, input_log_height, public_log_height)` a bundle proof must
+    /// declare: the hidden guest's ([`Self::hidden_bundle_heights`]). All three are fixed: the
+    /// guest is one pinned program, its private-input vector is always
+    /// `hidden::hidden_input::COUNT` words wide (a dummy slot is a zero-amount note, not a shorter
+    /// witness — that is the whole point of the fixed 4-in-4-out shape), and its public segment
+    /// is always the transaction binding, [`TX_BINDING_WORDS`] words (Task 5b) — whose height,
+    /// `public_log_height(8) == 4`, is not the empty segment's `MIN_LOG_HEIGHT == 2`, so a
+    /// pre-fork bundle proof is refused on the declared height alone.
+    pub fn bundle_heights() -> (u8, u8, u8) {
+        Self::hidden_bundle_heights()
+    }
+
+    /// The retired 2-in-2-out bundle guest (`guests::bundle`), vendored verbatim from the research
+    /// crate. **Off the chain path since the hidden-asset bundle** (chain 14): no executor method
+    /// verifies against it. Kept only for the tests that still need it — `tests/shielded.rs` pins
+    /// its digest to upstream's (`RESEARCH_HC_BUNDLE_HEX`), and `tests/hidden_bundle.rs` checks a
+    /// hidden proof is refused under it. Assembled once per process.
+    pub fn legacy_bundle_program() -> &'static Program {
         static BUNDLE: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
         BUNDLE.get_or_init(crate::guests::bundle)
     }
 
-    /// Digest of the vendored `bundle` guest — the value a genesis pins as `hc_bundle`.
-    pub fn hc_bundle() -> Word8 {
-        Self::bundle_program().digest()
-    }
-
-    /// The `(program_log_height, input_log_height, public_log_height)` a bundle proof must
-    /// declare. All three are fixed: the guest is one pinned program, its private-input vector is
-    /// always `notes::bundle_input::COUNT` words wide (a dummy input is a zero-amount note, not a
-    /// shorter witness — that is the whole point of the fixed 2-in-2-out shape), and its public
-    /// segment is always the transaction binding, [`TX_BINDING_WORDS`] words (Task 5b) — whose
-    /// height, `public_log_height(8) == 4`, is not the empty segment's `MIN_LOG_HEIGHT == 2`, so a
-    /// pre-fork bundle proof is refused on the declared height alone.
-    pub fn bundle_heights() -> (u8, u8, u8) {
-        pinned_heights(Self::bundle_program(), crate::notes::bundle_input::COUNT)
+    /// Digest of the retired `bundle` guest ([`Self::legacy_bundle_program`]). No chain pins it.
+    pub fn hc_legacy_bundle() -> Word8 {
+        Self::legacy_bundle_program().digest()
     }
 
     /// The hidden-asset bundle guest (`guests::bundle_hidden`, spec
     /// `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`): four slots, the asset
-    /// private. Node-local — unlike `bundle`, there is no upstream copy to pin it against — and,
-    /// until the chain moves to it (spec §7, H3–H5), called by nothing on the chain path.
-    /// Assembled once per process, for the same reason as `bundle_program`.
+    /// private. Node-local — there is no upstream copy to pin it against — and, since chain 14,
+    /// the chain's one bundle guest ([`Self::bundle_program`]).
+    ///
+    /// Assembled once per process: `bundle_heights` calls this on every bundle admission (twice,
+    /// in fact — `bundle_proof_digest` then `verify_bundle`), and re-running the assembler on
+    /// each gossiped transaction is pure waste. The guest is a compile-time constant, so a
+    /// `OnceLock` is the whole of the cache invalidation story.
     pub fn hidden_bundle_program() -> &'static Program {
         static HIDDEN: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
         HIDDEN.get_or_init(crate::guests::bundle_hidden)
     }
 
-    /// Digest of the hidden bundle guest — what a genesis will pin as `hc_bundle` once the chain
-    /// moves to it.
+    /// Digest of the hidden bundle guest — what a chain-14 genesis pins as `hc_bundle`.
     pub fn hc_hidden_bundle() -> Word8 {
         Self::hidden_bundle_program().digest()
     }
@@ -305,6 +321,13 @@ impl ZkExecutor {
             .verify_public(hc, binding, &p)
             .map_err(|e| ConfidentialError::InvalidBundleProof(format!("{e:?}")))
     }
+}
+
+/// The core crate's digest record as the hidden guest's (the two are field-for-field the same;
+/// core cannot name a zkvm type, so the copy happens on this side).
+pub fn hidden_digest_input(i: &BundleDigestInput) -> crate::hidden::HiddenDigestInput {
+    let BundleDigestInput { anchor, nullifiers, commitments, fee, burn_a, burn_r, burn_asset, time } = *i;
+    crate::hidden::HiddenDigestInput { anchor, nullifiers, commitments, fee, burn_a, burn_r, burn_asset, time }
 }
 
 /// The `(program_log_height, input_log_height, public_log_height)` every proof of a pinned bundle
@@ -480,22 +503,14 @@ impl ConfidentialExecutor for ZkExecutor {
         crate::notes::Note { pk: *pk, from: *from, amount, asset, time, r: *r }.commitment()
     }
 
+    /// The hidden-asset bundle digest (spec §3.4, `hidden::hidden_bundle_digest`) over the core
+    /// record's fields — the same eight fields, the same order, and no asset.
     fn bundle_digest(&self, i: &BundleDigestInput) -> Word8 {
-        crate::notes::bundle_digest(
-            &i.anchor,
-            &i.nullifiers[0],
-            &i.nullifiers[1],
-            &i.commitments[0],
-            &i.commitments[1],
-            i.fee,
-            i.burn,
-            i.asset,
-            i.time,
-        )
+        crate::hidden::hidden_bundle_digest(&hidden_digest_input(i))
     }
 
     fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-        self.pinned_proof_digest(Self::bundle_heights(), proof)
+        self.hidden_bundle_proof_digest(proof)
     }
 
     fn verify_bundle(
@@ -504,15 +519,16 @@ impl ConfidentialExecutor for ZkExecutor {
         proof: &[u8],
         binding: &[u32; TX_BINDING_WORDS],
     ) -> Result<(), ConfidentialError> {
-        self.verify_pinned_bundle(Self::bundle_heights(), hc_bundle, proof, binding)
+        self.verify_hidden_bundle(hc_bundle, proof, binding)
     }
 
     /// The bundle guest's verifier key. Unlike `warm`, this needs no guessing: the guest is
     /// pinned, so its `(tier, program_log_height, input_log_height, keccak_log_height,
     /// sha256_log_height, public_log_height)` is a single known sextuple — tier 14, which is
-    /// where the 3811-word guest's trace lands (`tests/shielded.rs` asserts it), `NO_KECCAK`
-    /// and `NO_SHA256` since the guest issues neither hash syscall, and the transaction
-    /// binding's public height (`bundle_heights`), since every bundle proof commits to it.
+    /// where every witness of the hidden guest lands (`tests/hidden_bundle.rs` measures the worst
+    /// case), `NO_KECCAK` and `NO_SHA256` since the guest issues neither hash syscall, and the
+    /// transaction binding's public height (`bundle_heights`), since every bundle proof commits
+    /// to it.
     fn warm_bundle(&self) {
         let (plh, ilh, pubh) = Self::bundle_heights();
         let _ = self.machine.verifier_key(Tier(14), plh, ilh, NO_KECCAK, NO_SHA256, pubh);
@@ -636,15 +652,15 @@ pub fn prove_call(
     }
 }
 
-/// Wallet-side prover for a shielded bundle: proves `guests::bundle()` on `inputs` (built by
-/// `notes::bundle_inputs`) with `binding` as its public input segment, and returns (postcard proof
-/// bytes, the published bundle digest, tier).
+/// Wallet-side prover for a shielded bundle: proves the chain's bundle guest (the hidden-asset
+/// guest, [`ZkExecutor::bundle_program`]) on `inputs` (built by `hidden::hidden_bundle_inputs`)
+/// with `binding` as its public input segment, and returns (postcard proof bytes, the published
+/// bundle digest, tier). The same as [`prove_hidden_bundle`].
 ///
 /// `binding` is `Transaction::binding` of the transaction this bundle will ride in (Task 5b), so
-/// the caller builds that transaction — every field but the proofs — *before* proving, and
-/// proves every bundle of it with the same words. The chain verifies against the binding it
-/// recomputes (`ZkExecutor::verify_bundle`), so a proof made for any other transaction, or
-/// against the empty segment, is refused.
+/// the caller builds that transaction — every field but the proof — *before* proving. The chain
+/// verifies against the binding it recomputes (`ZkExecutor::verify_bundle`), so a proof made for
+/// any other transaction, or against the empty segment, is refused.
 ///
 /// The tier is not chosen here — `Machine::prove_with` picks the smallest one the trace fits, and
 /// the caller asserts what it got rather than pinning it, so a guest that grows past its tier is
@@ -662,7 +678,7 @@ pub fn prove_bundle(
     binding: &[u32; TX_BINDING_WORDS],
     backend: Backend,
 ) -> Result<(Vec<u8>, Word8, u8), String> {
-    prove_pinned_bundle(profile, ZkExecutor::bundle_program(), crate::notes::bundle_input::COUNT, "bundle", inputs, binding, backend)
+    prove_hidden_bundle(profile, inputs, binding, backend)
 }
 
 /// `prove_bundle` for the hidden-asset bundle guest (`guests::bundle_hidden`): `inputs` built by

@@ -259,11 +259,10 @@ fn sync_opts() -> WriteOptions {
     w
 }
 
-/// Every note a transaction creates, paired with the envelope that opens it: the bundle's two
-/// output slots in that order, then a mint's single note or a bridge deposit, then — for a
-/// two-bundle action ([`Action::asset_bundle`]: a `BridgeBurn`, a `TokenTransfer` or a
-/// `TokenBurn`) — its asset bundle's two slots. Exactly the order the ledger appends them in, so
-/// the index a leaf gets on disk is the index the ledger gave it.
+/// Every note a transaction creates, paired with the envelope that opens it: the bundle's four
+/// output slots in slot order — dummies included, every one of them is a leaf — then a mint's
+/// single note or a bridge deposit. Exactly the order the ledger appends them in, so the index a
+/// leaf gets on disk is the index the ledger gave it.
 ///
 /// A `BridgeAttest`'s deposit is the one commitment the wire does not carry: the chain computes
 /// it from the amount the guardians signed, the `time` the action published and the index the
@@ -278,8 +277,8 @@ fn created_notes(
 ) -> Result<Vec<(Word8, Envelope)>> {
     let mut out = Vec::new();
     if let Some(b) = &tx.bundle {
-        for i in 0..2 {
-            out.push((b.commitments[i], b.envelopes[i].clone()));
+        for (cm, e) in b.commitments.iter().zip(&b.envelopes) {
+            out.push((*cm, e.clone()));
         }
     }
     match &tx.action {
@@ -323,17 +322,6 @@ fn created_notes(
             out.push((cm, m.envelope.clone()));
         }
         _ => {}
-    }
-    // The asset bundle of a two-bundle action — a `BridgeBurn`, a `TokenTransfer` or a
-    // `TokenBurn` — appends its two notes after the fee bundle's, which is the order
-    // `Ledger::apply_tx` writes them in: the fee bundle on the common path, the asset bundle in
-    // the action step. One list of those actions ([`Action::asset_bundle`]), so a fourth cannot
-    // silently leave two leaves out of the notes family and slide every wallet's leaf indices
-    // after it.
-    if let Some(asset_bundle) = tx.action.asset_bundle() {
-        for i in 0..2 {
-            out.push((asset_bundle.commitments[i], asset_bundle.envelopes[i].clone()));
-        }
     }
     Ok(out)
 }
@@ -2037,6 +2025,18 @@ pub(crate) mod fixtures {
         Envelope { kem_ct: vec![tag; 8], to_receiver: vec![tag; 4], to_sender: vec![], body: vec![tag; 16] }
     }
 
+    /// Widen a two-word note set to a bundle's four slots, deriving the two extra words from the
+    /// given ones (their last word flipped by a slot tag): a fixture written for two distinct
+    /// words gets four distinct words. The extra slots stand for an honest bundle's dummies.
+    pub(crate) fn pad4(w: [Word8; 2]) -> [Word8; 4] {
+        let tag = |x: Word8, k: u32| {
+            let mut y = x;
+            y[7] ^= 0xd0d0_0000 | k;
+            y
+        };
+        [w[0], w[1], tag(w[0], 2), tag(w[1], 3)]
+    }
+
     pub(crate) fn alloc_note(seed: u8, amount: u64) -> GenesisNote {
         GenesisNote {
             cm: word8_to_hex(&[seed as u32; 8]),
@@ -2249,53 +2249,32 @@ pub(crate) mod fixtures {
             .unwrap_or(0)
     }
 
-    /// A burn of `amount` of asset index `asset` to chain 2, paying the bundle base for each of
-    /// its two bundles. The asset bundle's words are `seed..seed + 3` and the fee bundle's
-    /// `seed + 4..seed + 7`.
+    /// A burn of `amount` of asset index `asset` to chain 2 on one hidden-asset bundle
+    /// (`burn_asset == asset`, `burn_a == amount`), paying the bridge fee. Its first two
+    /// nullifiers and commitments are `seed..seed + 3`.
     pub(crate) fn burn_tx(ledger: &Ledger, asset: u32, amount: u64, relayer_fee: u64, seed: u32) -> Transaction {
-        let mut asset_bundle =
-            bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], 0);
-        asset_bundle.asset = asset;
-        asset_bundle.burn = amount;
-        let d = StubExecutor.bundle_digest(&asset_bundle.digest_input());
-        asset_bundle.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+        let mut b = bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], gas::BRIDGE_BURN_FEE);
+        b.burn_asset = asset;
+        b.burn_a = amount;
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(
             ledger.chain_id(),
-            bundle(ledger, [[seed + 4; 8], [seed + 5; 8]], [[seed + 6; 8], [seed + 7; 8]], gas::BRIDGE_BURN_FEE),
-            Action::BridgeBurn { asset_bundle, asset, amount, relayer_fee, to_chain: 2, token: TOKEN, to: EVM_TO },
+            b,
+            Action::BridgeBurn { asset, amount, relayer_fee, to_chain: 2, token: TOKEN, to: EVM_TO },
         ))
     }
 
-    /// A `TokenTransfer` of asset index `asset` whose asset bundle spends `nfs` and creates `cms`,
-    /// with a RAND fee bundle at `fee_seed..fee_seed + 3` paying for both bundles.
-    pub(crate) fn transfer_tx_with(
-        ledger: &Ledger,
-        asset: u32,
-        nfs: [Word8; 2],
-        cms: [Word8; 2],
-        fee_seed: u32,
-        memo: Option<Vec<u8>>,
-    ) -> Transaction {
-        let mut asset_bundle = bundle(ledger, nfs, cms, 0);
-        asset_bundle.asset = asset;
-        let d = StubExecutor.bundle_digest(&asset_bundle.digest_input());
-        asset_bundle.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
-        randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(
-            ledger.chain_id(),
-            bundle(
-                ledger,
-                [[fee_seed; 8], [fee_seed + 1; 8]],
-                [[fee_seed + 2; 8], [fee_seed + 3; 8]],
-                2 * gas::BUNDLE_BASE,
-            ),
-            Action::TokenTransfer { asset_bundle, memo },
-        ))
+    /// A token transfer as the chain sees it on the hidden-asset bundle: a plain `Action::None`
+    /// bundle spending `nfs` and creating `cms` (its first two slots; the other two derived), the
+    /// token nowhere on the wire.
+    pub(crate) fn transfer_tx_with(ledger: &Ledger, nfs: [Word8; 2], cms: [Word8; 2]) -> Transaction {
+        bundle_tx(ledger, nfs, cms, gas::BUNDLE_BASE)
     }
 
-    /// [`transfer_tx_with`] laid out like [`burn_tx`]: the asset bundle's words are
-    /// `seed..seed + 3` and the fee bundle's `seed + 4..seed + 7`.
-    pub(crate) fn transfer_tx(ledger: &Ledger, asset: u32, seed: u32, memo: Option<Vec<u8>>) -> Transaction {
-        transfer_tx_with(ledger, asset, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], seed + 4, memo)
+    /// [`transfer_tx_with`] keyed at `seed..seed + 3`, like [`burn_tx`].
+    pub(crate) fn transfer_tx(ledger: &Ledger, seed: u32) -> Transaction {
+        transfer_tx_with(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]])
     }
 
     /// A bridged chain funded for a withdraw (one bundle fee, one validator staked) — the shared
@@ -2346,13 +2325,14 @@ pub(crate) mod fixtures {
     pub(crate) fn bundle(ledger: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64) -> Bundle {
         let mut b = Bundle {
             anchor: ledger.anchors().back().expect("a ledger always has an anchor").1,
-            nullifiers: nfs,
-            commitments: cms,
+            nullifiers: crate::storage::fixtures::pad4(nfs),
+            commitments: crate::storage::fixtures::pad4(cms),
             fee,
-            burn: 0,
-            asset: 0,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
             time: ledger.height() as u32,
-            envelopes: [env(cms[0][0] as u8), env(cms[1][0] as u8)],
+            envelopes: [env(cms[0][0] as u8), env(cms[1][0] as u8), env(cms[0][0] as u8), env(cms[1][0] as u8)],
             proof: Vec::new(),
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
@@ -2594,12 +2574,12 @@ mod tests {
             "and the token registry — indices and supplies — comes back whole"
         );
 
-        // The deposit note is leaf 2 — after the fee bundle's two — and is served like any
+        // The deposit note is leaf 4 — after the bundle's four — and is served like any
         // other, so a wallet scanning the tree finds its bridged deposit.
         let deposit =
             randprotocol_core::ledger::bridge_notes::deposit_note(&att, reloaded.tokens().unwrap(), &StubExecutor)
                 .unwrap();
-        let row = s.note(2).unwrap().expect("the deposit note is indexed");
+        let row = s.note(4).unwrap().expect("the deposit note is indexed");
         assert_eq!((row.cm, row.envelope), deposit);
         assert_eq!(row.height, 1);
 
@@ -2643,12 +2623,13 @@ mod tests {
         assert_eq!(check.ledger.bridge(), ledger.bridge(), "the replay rebuilt the bridge");
     }
 
-    /// A `TokenTransfer` creates **four** notes — its fee bundle's two and its asset bundle's two
-    /// — and the note index has to agree with the ledger leaf for leaf: a count one short would
-    /// slide every wallet's leaf index after it, and every merkle path with them. All four are on
-    /// the wire, so the ledger derives none of them.
+    /// Every bundle creates **four** notes — its four output slots, dummies included — and the
+    /// note index has to agree with the ledger leaf for leaf: a count short would slide every
+    /// wallet's leaf index after it, and every merkle path with them. A plain transfer (a token
+    /// transfer is one, since the hidden-asset bundle) and a bridge burn alike: all four are on the
+    /// wire, `created_notes == tx.commitments()`, and the ledger derives none of them.
     #[test]
-    fn a_token_transfer_indexes_four_notes_in_the_ledgers_order() {
+    fn every_bundle_indexes_four_notes_in_the_ledgers_order() {
         let dir = tempfile::tempdir().unwrap();
         let s = Storage::open(dir.path()).unwrap();
         let (gs, secrets) = bridged_genesis(12);
@@ -2658,28 +2639,31 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![att], &key(1));
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
-        let before = ledger.next_index();
-        let t = transfer_tx(&ledger, 1, 30, Some(vec![9; 32]));
-        let b2 = make_block(&b1.block, &mut ledger, vec![t.clone()], &key(1));
-        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
-
-        assert_eq!(ledger.next_index(), before + 4, "two bundles, four leaves");
-        assert_eq!(t.commitments().len(), 4, "and the wire carries all four");
-        assert_eq!(derived_note_count(&t), 0, "so the ledger derives none of them");
-        let notes = created_notes(&t, ledger.tokens(), &StubExecutor).unwrap();
-        assert_eq!(
-            notes.iter().map(|(cm, _)| *cm).collect::<Vec<_>>(),
-            t.commitments(),
-            "the fee bundle's two slots, then the asset bundle's — the order the ledger appends"
-        );
-        let rows = s.notes_in_heights(2, 2, 100).unwrap();
-        assert_eq!(
-            rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
-            (before..before + 4).collect::<Vec<_>>(),
-            "and the four rows on disk carry the indices the ledger gave them"
-        );
-        // A transfer moves notes and nothing else: the token's public count is the deposit's.
-        assert_eq!(ledger.tokens().unwrap().get(1).unwrap().total_supply, 1_000);
+        let mut parent = b1;
+        for (height, t) in [(2u64, transfer_tx(&ledger, 30)), (3, burn_tx(&ledger, 1, 400, 100, 40))] {
+            let before = ledger.next_index();
+            let b = make_block(&parent.block, &mut ledger, vec![t.clone()], &key(1));
+            s.commit(std::slice::from_ref(&b), &ledger, &[], &StubExecutor).unwrap();
+            assert_eq!(ledger.next_index(), before + 4, "one bundle, four leaves: {:?}", t.action);
+            assert_eq!(t.commitments().len(), 4, "and the wire carries all four");
+            assert_eq!(derived_note_count(&t), 0, "so the ledger derives none of them");
+            let notes = created_notes(&t, ledger.tokens(), &StubExecutor).unwrap();
+            assert_eq!(
+                notes.iter().map(|(cm, _)| *cm).collect::<Vec<_>>(),
+                t.commitments(),
+                "the four slots in slot order — the order the ledger appends"
+            );
+            let rows = s.notes_in_heights(height, height, 100).unwrap();
+            assert_eq!(
+                rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                (before..before + 4).collect::<Vec<_>>(),
+                "and the four rows on disk carry the indices the ledger gave them"
+            );
+            parent = b;
+        }
+        // The transfer moved nothing public; the burn took its 400 out of the deposit's 1 000.
+        assert_eq!(ledger.tokens().unwrap().get(1).unwrap().total_supply, 600);
+        assert_eq!(s.notes_count().unwrap(), ledger.next_index());
     }
 
     /// A chain whose genesis has no `bridge` section stores no bridge state at all, and
@@ -2810,14 +2794,18 @@ mod tests {
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
         assert_eq!(s.head().unwrap(), Head { height: 1, hash: b1.block.hash() });
-        assert_eq!(s.notes_count().unwrap(), 4);
+        assert_eq!(s.notes_count().unwrap(), 6, "two genesis notes and the bundle's four slots");
         assert_eq!(s.note(2).unwrap().unwrap().cm, [3; 8]);
         assert_eq!(s.note(3).unwrap().unwrap(), NoteRow { cm: [4; 8], envelope: env(4), height: 1 });
         assert_eq!(s.nullifier_height(&[1; 8]).unwrap(), Some(1));
         assert_eq!(s.nullifier_height(&[2; 8]).unwrap(), Some(1));
         assert_eq!(s.nullifier_height(&[9; 8]).unwrap(), None);
-        assert_eq!(s.nullifiers_count().unwrap(), 2);
-        assert_eq!(s.nullifiers_from(0, 10).unwrap(), vec![(1, [1; 8]), (1, [2; 8])]);
+        assert_eq!(s.nullifiers_count().unwrap(), 4, "the bundle's four, dummies included");
+        let mut got = s.nullifiers_from(0, 10).unwrap();
+        got.sort();
+        let mut want: Vec<(u64, Word8)> = pad4([[1; 8], [2; 8]]).into_iter().map(|nf| (1, nf)).collect();
+        want.sort();
+        assert_eq!(got, want);
         assert_eq!(s.anchor(1).unwrap(), Some(ledger.root()));
         assert_eq!(s.validator(&proposer.address()).unwrap().unwrap().rewards, bundle_fee());
         assert_eq!(s.tx_location(&tx.hash()).unwrap(), Some((1, 0)));
@@ -3028,10 +3016,10 @@ mod tests {
     fn a_committed_withdraw_writes_its_deposit_at_the_leaf_the_ledger_named() {
         let (_d, s, gs, blocks, ledger) = chain_with_a_withdraw();
         let deposit = blocks[1].deposits[0].clone();
-        // The bundle ahead of the deposit carries two note slots and the withdraw carries none,
+        // The bundle ahead of the deposit carries four note slots and the withdraw carries none,
         // so the ledger gave the deposit the last leaf of the block.
         let on_the_wire: usize = blocks[1].block.transactions.iter().map(|t| t.commitments().len()).sum();
-        assert_eq!(on_the_wire, 2, "one bundle's two slots, and nothing from the withdraw");
+        assert_eq!(on_the_wire, 4, "one bundle's four slots, and nothing from the withdraw");
         s.commit(&blocks, &ledger, &[], &StubExecutor).unwrap();
         assert_eq!(deposit.index, ledger.next_index() - 1);
         let row = s.note(deposit.index).unwrap().expect("the deposit is a note row like any other");
@@ -3087,9 +3075,9 @@ mod tests {
                  attest's goes through created_notes, not cb.deposits"
             );
             let withdraw_leaf = b2.deposits[0].index;
-            // Four new leaves either way: the withdraw's deposit, the attest's fee bundle's two
+            // Six new leaves either way: the withdraw's deposit, the attest's bundle's four
             // output slots, and the attest's own deposit note — just in a different order.
-            assert_eq!(ledger.next_index(), base + 4, "attest_first={attest_first}");
+            assert_eq!(ledger.next_index(), base + 6, "attest_first={attest_first}");
 
             s.commit(&[b1, b2], &ledger, &[], &StubExecutor).unwrap();
 
@@ -3108,7 +3096,7 @@ mod tests {
             let expected_deposit =
                 randprotocol_core::ledger::bridge_notes::deposit_note(&att, ledger.tokens().unwrap(), &StubExecutor)
                 .expect("the attestation registered an asset and deposits into it");
-            let deposit_leaf = (base..base + 4)
+            let deposit_leaf = (base..base + 6)
                 .find(|&i| s.note(i).unwrap().expect("leaf in range").cm == expected_deposit.0)
                 .unwrap_or_else(|| panic!("attest_first={attest_first}: the attest's deposit note is not on disk"));
             assert_ne!(
@@ -3309,13 +3297,13 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![tx], &proposer);
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
-        for index in 0..4 {
+        for index in 0..6 {
             let (root, path) = s.witness(index, &StubExecutor).unwrap().expect("leaf exists");
             assert_eq!(root, ledger.root(), "witness root at {index}");
             let leaf = s.note(index).unwrap().unwrap().cm;
             assert_eq!(fold(leaf, index, &path), root, "path at {index}");
         }
-        assert_eq!(s.witness(4, &StubExecutor).unwrap(), None);
+        assert_eq!(s.witness(6, &StubExecutor).unwrap(), None);
     }
 
     #[test]
@@ -3345,14 +3333,14 @@ mod tests {
         let tx2 = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
         let b2 = certify(make_block(&b1.block, &mut ledger, vec![tx2.clone()], &proposer));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
-        assert_eq!(s.notes_count().unwrap(), 6);
+        assert_eq!(s.notes_count().unwrap(), 10);
         assert_eq!(s.nullifier_height(&[5; 8]).unwrap(), Some(2));
 
         s.truncate_to(&gs, 1, &ledger_at_1).unwrap();
         assert_eq!(s.head().unwrap().height, 1);
         assert_eq!(s.notes_count().unwrap(), ledger_at_1.next_index());
-        assert_eq!(s.notes_count().unwrap(), 4);
-        assert_eq!(s.note(4).unwrap(), None);
+        assert_eq!(s.notes_count().unwrap(), 6);
+        assert_eq!(s.note(6).unwrap(), None);
         assert_eq!(s.nullifier_height(&[5; 8]).unwrap(), None);
         assert_eq!(s.nullifier_height(&[1; 8]).unwrap(), Some(1));
         assert_eq!(s.anchor(2).unwrap(), None);
@@ -3414,12 +3402,13 @@ mod tests {
         assert_eq!(s.anchor(2).unwrap(), Some(root_at_2));
         assert_eq!(s.anchor(3).unwrap(), None);
 
-        // Two genesis notes, then the bundle's two outputs, then the mint's note — dense, in
+        // Two genesis notes, then the bundle's four outputs, then the mint's note — dense, in
         // order, each stamped with the height that created it.
-        assert_eq!(s.notes_count().unwrap(), 5);
+        assert_eq!(s.notes_count().unwrap(), 7);
         assert_eq!(s.notes_count().unwrap(), ledger.next_index());
+        let [c0, c1, c2, c3] = pad4([[43; 8], [44; 8]]);
         for (index, (cm, height)) in
-            [([20; 8], 0), ([21; 8], 0), ([43; 8], 1), ([44; 8], 1), (b2.block.transactions[0].commitments()[0], 2)]
+            [([20; 8], 0), ([21; 8], 0), (c0, 1), (c1, 1), (c2, 1), (c3, 1), (b2.block.transactions[0].commitments()[0], 2)]
                 .into_iter()
                 .enumerate()
         {
@@ -3427,12 +3416,12 @@ mod tests {
             assert_eq!(row.cm, cm, "note {index} commitment");
             assert_eq!(row.height, height, "note {index} height");
         }
-        assert_eq!(s.note(5).unwrap(), None);
+        assert_eq!(s.note(7).unwrap(), None);
 
         // Nullifiers carry the height that spent them.
         assert_eq!(s.nullifier_height(&[41; 8]).unwrap(), Some(1));
         assert_eq!(s.nullifier_height(&[42; 8]).unwrap(), Some(1));
-        assert_eq!(s.nullifiers_count().unwrap(), 2);
+        assert_eq!(s.nullifiers_count().unwrap(), 4, "the bundle's four, dummies included");
 
         // And the whole snapshot reloads to exactly the ledger the batch was committed against.
         let reloaded = s.load_ledger(&StubExecutor).unwrap();
@@ -3465,7 +3454,7 @@ mod tests {
             assert!(c.is_ok(), "{:?}", c.problem);
             assert_eq!(c.last_good, 6);
             assert_eq!(c.ledger.state_root(), st.load_ledger(&StubExecutor).unwrap().state_root());
-            assert_eq!(c.ledger.next_index(), 14, "2 alloc notes + 2 per block");
+            assert_eq!(c.ledger.next_index(), 26, "2 alloc notes + 4 per block");
         }
     }
 
@@ -3483,9 +3472,9 @@ mod tests {
         assert!(st.block_by_hash(&blocks[4].block.hash()).unwrap().is_none());
         assert!(st.tx_location(&blocks[5].block.transactions[0].hash()).unwrap().is_none());
         assert!(st.tx_location(&blocks[2].block.transactions[0].hash()).unwrap().is_some());
-        // The pool rewound with the chain: 2 alloc notes plus 2 per surviving block.
-        assert_eq!(st.notes_count().unwrap(), 8);
-        assert_eq!(st.nullifiers_count().unwrap(), 6);
+        // The pool rewound with the chain: 2 alloc notes plus 4 per surviving block.
+        assert_eq!(st.notes_count().unwrap(), 14);
+        assert_eq!(st.nullifiers_count().unwrap(), 12);
         let again = st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap();
         assert!(again.is_ok(), "{:?}", again.problem);
         assert_eq!(again.last_good, 3);
@@ -3898,9 +3887,9 @@ mod tests {
         storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 
         let all = storage.notes_in_heights(0, 2, 1000).unwrap();
-        assert_eq!(all.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(all.iter().map(|(i, _)| *i).collect::<Vec<_>>(), (0..10).collect::<Vec<_>>());
         let one = storage.notes_in_heights(1, 1, 1000).unwrap();
-        assert_eq!(one.iter().map(|(i, r)| (*i, r.height)).collect::<Vec<_>>(), vec![(2, 1), (3, 1)]);
+        assert_eq!(one.iter().map(|(i, r)| (*i, r.height)).collect::<Vec<_>>(), vec![(2, 1), (3, 1), (4, 1), (5, 1)]);
         // A height past the head, and an empty height, are empty rather than errors.
         assert!(storage.notes_in_heights(9, 9, 1000).unwrap().is_empty());
         // max_rows truncates rather than failing.
@@ -3920,18 +3909,18 @@ mod tests {
         };
         assert_eq!(derived_note_count(&w), 1, "the ledger derives a withdraw's deposit note");
         assert_eq!(w.commitments().len(), 0, "and the wire does not carry it");
-        // A plain transfer carries both its notes itself.
+        // A plain transfer carries all four of its notes itself.
         let gs = fixtures::genesis_with(1, vec![]);
         let t = fixtures::bundle_tx(&gs.ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
         assert_eq!(derived_note_count(&t), 0);
-        assert_eq!(t.commitments().len(), 2);
+        assert_eq!(t.commitments().len(), 4);
 
         // An attestation that decodes to a transfer deposits one note the wire does not carry,
-        // on top of the two its fee bundle does.
+        // on top of the four its bundle does.
         let (bgs, secrets) = bridged_genesis(3);
         let att = attest_tx(&bgs.ledger, attestation(&secrets, &recipient(), 1_000, 0), 20);
         assert_eq!(derived_note_count(&att), 1, "the ledger derives the attestation's deposit note");
-        assert_eq!(att.commitments().len(), 2, "and the wire carries only the fee bundle's slots");
+        assert_eq!(att.commitments().len(), 4, "and the wire carries only the bundle's four slots");
         let with_attestation = |bytes: Vec<u8>| {
             let mut t = att.clone();
             if let Action::BridgeAttest { attestation, .. } = &mut t.action {
@@ -4037,13 +4026,14 @@ mod seal_tests {
         };
         let mut b = randprotocol_core::notes::Bundle {
             anchor: l.root(),
-            nullifiers: [[11; 8], [12; 8]],
-            commitments: [[13; 8], [14; 8]],
+            nullifiers: crate::storage::fixtures::pad4([[11; 8], [12; 8]]),
+            commitments: crate::storage::fixtures::pad4([[13; 8], [14; 8]]),
             fee: randprotocol_core::gas::BUNDLE_BASE,
-            burn: bond,
-            asset: 0,
+            burn_a: 0,
+            burn_r: bond,
+            burn_asset: 0,
             time: 1,
-            envelopes: [env(1), env(2)],
+            envelopes: [env(1), env(2), env(1), env(2)],
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());

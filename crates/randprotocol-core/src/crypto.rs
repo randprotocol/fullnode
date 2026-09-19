@@ -381,9 +381,10 @@ pub mod wire_bytes {
 /// The `Option`'s own tag is serde's — bincode writes the usual `0`/`1` byte — and a `Some`'s
 /// payload is encoded byte for byte as [`wire_bytes`] would encode the bare vector, so a field
 /// that gains an `Option` wrapper and a field that has one always agree on the bytes inside it.
-/// The one caller today is a `TokenTransfer`'s memo, which is opaque to the chain and up to
-/// [`crate::ledger::tokens::MAX_MEMO_BYTES`] bytes long — exactly the size where the byte-string
-/// form is worth having over a sequence of integers.
+/// It has no caller since the hidden-asset bundle removed `TokenTransfer` and its memo
+/// (`docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md` §3.7); it is kept for the
+/// memo that returns with allowances, an opaque byte string where the byte-string form is worth
+/// having over a sequence of integers.
 pub mod wire_bytes_opt {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 

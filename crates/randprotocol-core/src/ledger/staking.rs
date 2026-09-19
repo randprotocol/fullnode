@@ -585,17 +585,19 @@ mod tests {
         l
     }
 
-    /// A bundle whose stub proof publishes exactly the digest the ledger recomputes.
+    /// A bundle whose stub proof publishes exactly the digest the ledger recomputes. `burn` is
+    /// its RAND burn, `burn_r` — the only field a bond may burn through (spec §3.7).
     fn bundle(l: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], burn: u64) -> Bundle {
         let mut b = Bundle {
             anchor: l.root(),
-            nullifiers: nfs,
-            commitments: cms,
+            nullifiers: crate::notes::pad4(nfs),
+            commitments: crate::notes::pad4(cms),
             fee: gas::BUNDLE_BASE,
-            burn,
-            asset: 0,
+            burn_a: 0,
+            burn_r: burn,
+            burn_asset: 0,
             time: l.height() as u32,
-            envelopes: [env(), env()],
+            envelopes: [env(), env(), env(), env()],
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
@@ -889,7 +891,7 @@ mod tests {
         let mut transfer = tx(&l, 40, 0, Action::None);
         {
             let b = transfer.bundle.as_mut().unwrap();
-            b.commitments = [collide, [43; 8]];
+            b.commitments = crate::notes::pad4([collide, [43; 8]]);
             b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
         }
         StubExecutor::bind(&mut transfer);
@@ -1145,6 +1147,41 @@ mod tests {
         assert_eq!(after_transfer.supply.fees_paid, 2 * fee);
         assert_eq!(after_transfer.supply.burned, MIN_STAKE, "only a bond burns");
         assert_eq!(after_transfer.register_total, after_withdraw.register_total + fee);
+    }
+
+    /// A `Bond` burns its stake through the bundle's RAND burn, `burn_r` (the hidden-asset
+    /// bundle, spec §3.7): exactly the bonded amount, and nothing through `burn_a` or
+    /// `burn_asset` — the audit's `burned` counter moves by `burn_r`.
+    #[test]
+    fn a_bond_burns_through_burn_r_and_nothing_else() {
+        let l = ledger(vec![entry(&key(1), MIN_STAKE, payout(1)), entry(&key(2), MIN_STAKE, payout(2))]);
+        let ok = bond_tx(&l, 10, &key(2), 500, None);
+        assert_eq!(ok.bundle.as_ref().unwrap().burn_r, 500);
+        assert_eq!(l.validate(&ok, &StubExecutor), Ok(()));
+        let altered = |f: fn(&mut Bundle)| {
+            let mut t = bond_tx(&l, 10, &key(2), 500, None);
+            let b = t.bundle.as_mut().unwrap();
+            f(b);
+            b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
+            StubExecutor::bind(&mut t);
+            t
+        };
+        assert_eq!(
+            l.validate(&altered(|b| b.burn_r = 499), &StubExecutor),
+            Err(StakingError::BurnMismatch { burn: 499, amount: 500 }.into())
+        );
+        // The stake burned through the token slots instead: refused, however it is labelled.
+        assert_eq!(
+            l.validate(&altered(|b| { b.burn_r = 0; b.burn_a = 500 }), &StubExecutor),
+            Err(TxError::NonCanonicalRandBurn(500))
+        );
+        assert_eq!(
+            l.validate(&altered(|b| { b.burn_a = 500; b.burn_asset = 1 }), &StubExecutor),
+            Err(TxError::UnsupportedAsset(1))
+        );
+        let mut applied = l.clone();
+        applied.apply_tx(&ok, &key(1).address(), &StubExecutor).unwrap();
+        assert_eq!(applied.supply().burned, 500, "the audit counts burn_r");
     }
 
     /// Task 5b: a `Bond`'s bundle burns the stake, and before the binding a copier could keep the

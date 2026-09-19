@@ -28,16 +28,12 @@ use crate::bridge::AssetId;
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{merkle_root, Hash, PublicKey};
 use crate::gas;
-use crate::notes::{Bundle, ShieldedAddress, Word8};
+use crate::notes::{ShieldedAddress, Word8};
 use crate::program::ProgramId;
 use crate::types::actions::{set_authority_message, token_mint_message, InitialMint};
 use crate::types::{Action, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-
-/// Longest a [`Action::TokenTransfer`]'s memo may be, in bytes (spec §4, SPL's memo). The chain
-/// checks the size and nothing else: the bytes are opaque to it.
-pub const MAX_MEMO_BYTES: usize = 2048;
 
 /// The first index [`TokenRegistry::new`] hands out. 0 is RAND and is never registered here,
 /// the same reservation the bridge's own registry used to make before this one replaced it.
@@ -216,8 +212,6 @@ pub enum TokenError {
     ZeroAmount,
     #[error("token {0} is bridged and cannot be minted directly")]
     BridgedToken(u32),
-    #[error("memo of {0} bytes is too large")]
-    MemoTooLarge(usize),
     #[error("registration fee {fee} is below the minimum {min}")]
     RegistrationFeeTooLow { min: u64, fee: u64 },
     #[error("wrong token index: expected {expected}, got {got}")]
@@ -737,7 +731,8 @@ pub fn bridged_asset_id(name: &str, symbol: &str, salt: &[u8; 32]) -> AssetId {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// The five RPL actions: RegisterToken, TokenMint, SetAuthority, TokenTransfer, TokenBurn (§4)
+// The four RPL actions: RegisterToken, TokenMint, SetAuthority, TokenBurn (§4). A transfer of a
+// token is a plain `Action::None` bundle since the hidden-asset bundle: the asset is private.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 /// The `from` word of a minted note: an RPL mint has no sender inside the pool, exactly as a
@@ -781,60 +776,41 @@ pub fn mint_commitment(
 /// would let a mis-routed action skip the rules of the module that does own it.
 const NOT_TOKENS: TxError = TxError::UnsupportedAction("tokens");
 
-/// The two-bundle rule, in one function for all three actions that carry an *asset* bundle
-/// ([`Action::asset_bundle`]): `BridgeBurn`, [`Action::TokenTransfer`] and [`Action::TokenBurn`].
-/// It is `BridgeBurn`'s rule, factored out of [`super::bridge_notes::validate`] unchanged — the
-/// error variants are still named for the burn it was written for, because the three refusals are
-/// the same three mistakes whichever action makes them.
+/// The burn rule of the two token-burning actions, `TokenBurn` and `BridgeBurn`, on the
+/// transaction's one bundle (the hidden-asset bundle, spec §3.7). In order, and every one a
+/// comparison:
 ///
-/// In order, and every one of them a comparison or a set lookup:
+/// 1. `asset != 0` — RAND is never a token, and a RAND burn goes through `burn_r`
+///    ([`TokenError::UnknownToken`]`(0)`, the registry's own answer for index 0);
+/// 2. `burn_asset == asset` ([`TxError::BurnAssetMismatch`]): the guest publishes the asset of
+///    its private slots 0–1 here exactly when `burn_a != 0`;
+/// 3. `burn_a == amount` ([`TxError::BurnAmountMismatch`]);
+/// 4. `burn_r == 0` ([`TxError::UnsupportedBurn`]): a token burn burns no RAND.
 ///
-/// 1. the bundle is in the asset the action declares ([`TxError::BurnAssetMismatch`]) — trivially
-///    true for a transfer, whose declared asset *is* `asset_bundle.asset`, and a real check for
-///    the two actions that name one separately;
-/// 2. it pays no fee ([`TxError::BurnAssetBundleFee`]): the fee is RAND and the other bundle pays
-///    it, which is also why `gas::fee_floor` charges these actions two bundle bases;
-/// 3. it burns exactly what the action says (`0` for a transfer, which destroys nothing);
-/// 4. it shares no nullifier and no commitment with the fee bundle — [`Ledger::check_bundle`]
-///    sees each bundle alone and the fee bundle's notes are not in the ledger yet, so the pairs
-///    *between* the two are checked here;
-/// 5. [`Ledger::check_bundle`] itself: the anchor, the window, and the four words against the
-///    ledger.
-///
-/// The asset bundle's proof is verified by `Ledger::validate_inner`'s steps 8-9, after every
-/// cheap check of the transaction and against the same transaction binding as the fee bundle's
-/// ([`Ledger::check_bundle_proof`]), so a transaction that gets any of this wrong costs no
-/// verification (spec §7).
-pub(super) fn check_asset_bundle(
-    ledger: &Ledger,
-    tx: &Transaction,
-    asset_bundle: &Bundle,
-    asset: u32,
-    burn: u64,
-) -> Result<(), TxError> {
-    if asset_bundle.asset != asset {
-        return Err(TxError::BurnAssetMismatch { expected: asset, actual: asset_bundle.asset });
+/// Whether `asset` is a registered token (and its supply or backing covers `amount`) is each
+/// caller's own rule, against its own registry. The bundle's proof is verified after every cheap
+/// check, by `Ledger::validate_inner`'s steps 8-9, so a transaction that gets any of this wrong
+/// costs no verification (spec §7).
+pub(super) fn check_asset_burn(tx: &Transaction, asset: u32, amount: u64) -> Result<(), TxError> {
+    let b = tx.bundle.as_ref().ok_or(TxError::MissingBundle)?;
+    if asset == 0 {
+        return Err(TokenError::UnknownToken(0).into());
     }
-    if asset_bundle.fee != 0 {
-        return Err(TxError::BurnAssetBundleFee(asset_bundle.fee));
+    if b.burn_asset != asset {
+        return Err(TxError::BurnAssetMismatch { expected: asset, actual: b.burn_asset });
     }
-    if asset_bundle.burn != burn {
-        return Err(TxError::BurnAmountMismatch { expected: burn, actual: asset_bundle.burn });
+    if b.burn_a != amount {
+        return Err(TxError::BurnAmountMismatch { expected: amount, actual: b.burn_a });
     }
-    if let Some(fee_bundle) = &tx.bundle {
-        if fee_bundle.nullifiers.iter().any(|nf| asset_bundle.nullifiers.contains(nf)) {
-            return Err(TxError::DuplicateNullifierInBundle);
-        }
-        if fee_bundle.commitments.iter().any(|cm| asset_bundle.commitments.contains(cm)) {
-            return Err(TxError::DuplicateCommitmentInBundle);
-        }
+    if b.burn_r != 0 {
+        return Err(TxError::UnsupportedBurn(b.burn_r));
     }
-    ledger.check_bundle(asset_bundle)
+    Ok(())
 }
 
-/// The action step of admission (spec §7 step 7) for the five RPL actions.
+/// The action step of admission (spec §7 step 7) for the four RPL actions.
 ///
-/// Cheap before expensive throughout, and in one order for all five: **the gate** (a chain with
+/// Cheap before expensive throughout, and in one order for all four: **the gate** (a chain with
 /// no `tokens` section has no RPL at all, and says so before any other token check), then the
 /// action's own byte-level rules, then the state lookups, then the fee, then the time window and
 /// the tree, and the Dilithium2 signature **last** — it is by far the most expensive thing here,
@@ -858,7 +834,6 @@ pub(super) fn validate(
         Action::RegisterToken { .. }
             | Action::TokenMint { .. }
             | Action::SetAuthority { .. }
-            | Action::TokenTransfer { .. }
             | Action::TokenBurn { .. }
     ) {
         return Err(NOT_TOKENS);
@@ -971,28 +946,7 @@ pub(super) fn validate(
                 return Err(TokenError::BadSignature.into());
             }
         }
-        Action::TokenTransfer { asset_bundle, memo } => {
-            // The bytes first, before the registry is consulted at all: the memo is opaque and its
-            // size is the only thing about it the chain knows, so an oversized one is a statement
-            // about the transaction alone — which is also what lets admission cache the refusal
-            // (`is_permanent`).
-            if let Some(memo) = memo {
-                if memo.len() > MAX_MEMO_BYTES {
-                    return Err(TokenError::MemoTooLarge(memo.len()).into());
-                }
-            }
-            // A transfer has no `asset` field: the bundle's own word is the token. It must be a
-            // registered index, which rules out 0 in the same breath — 0 is RAND, never a row here,
-            // so a "transfer" of it is a plain bundle wearing a token action's clothes.
-            let asset = asset_bundle.asset;
-            if registry.get(asset).is_none() {
-                return Err(TokenError::UnknownToken(asset).into());
-            }
-            // Any registered token, bridged ones included: a transfer moves notes and no public
-            // counter, so neither a supply nor a backing is involved.
-            check_asset_bundle(ledger, tx, asset_bundle, asset, 0)?;
-        }
-        Action::TokenBurn { asset_bundle, asset, amount } => {
+        Action::TokenBurn { asset, amount } => {
             let info = registry.get(*asset).ok_or(TokenError::UnknownToken(*asset))?;
             // A bridged token's supply moves only with one of its backings
             // (`TokenRegistry::release`), so it leaves this chain through a `BridgeBurn`, which
@@ -1012,7 +966,8 @@ pub(super) fn validate(
             // transaction against the ledger the ones before it left, so the second of two burns
             // that do not both fit is refused where it sits.
             info.total_supply.checked_sub(*amount).ok_or(TokenError::SupplyUnderflow)?;
-            check_asset_bundle(ledger, tx, asset_bundle, *asset, *amount)?;
+            // The bundle's burn fields, against what the action declares.
+            check_asset_burn(tx, *asset, *amount)?;
         }
         _ => return Err(NOT_TOKENS),
     }
@@ -1051,7 +1006,6 @@ pub(super) fn apply(
         Action::RegisterToken { .. }
             | Action::TokenMint { .. }
             | Action::SetAuthority { .. }
-            | Action::TokenTransfer { .. }
             | Action::TokenBurn { .. }
     ) {
         return Err(NOT_TOKENS);
@@ -1094,17 +1048,9 @@ pub(super) fn apply(
             // the other.
             registry.bump_nonce(*asset);
         }
-        // The fee bundle's notes were written by `apply_tx`'s common path; the asset bundle's are
-        // written here, through that same path, so a transfer spends four nullifiers and appends
-        // four commitments in total — `BridgeBurn`'s arrangement exactly. The asset bundle's fee
-        // is zero, so no proposer reward follows from it, and no counter moves: a transfer creates
-        // no value and destroys none.
-        Action::TokenTransfer { asset_bundle, .. } => {
-            ledger.apply_bundle_notes(asset_bundle, executor);
-        }
-        Action::TokenBurn { asset_bundle, asset, amount } => {
-            ledger.apply_bundle_notes(asset_bundle, executor);
-            // What the asset bundle destroyed leaves the token's public count, so `total_supply`
+        // The bundle's notes were written by `apply_tx`'s common path, like every bundle's.
+        Action::TokenBurn { asset, amount } => {
+            // What the bundle's `burn_a` destroyed leaves the token's public count, so `total_supply`
             // keeps saying what exists. `validate` ruled out every refusal `sub_supply` has — the
             // index, the bridged authority and the underflow — so this cannot fail on a
             // transaction that was admitted.
@@ -1154,7 +1100,7 @@ fn gate(ledger: &Ledger) -> Result<(), TxError> {
 }
 
 /// A note the chain is about to create must be one nobody has created yet — in the tree, and in
-/// this transaction's own fee bundle, whose two notes `apply_tx` appends before the action runs.
+/// this transaction's own bundle, whose four notes `apply_tx` appends before the action runs.
 /// The bridge deposit's check, one action over.
 fn check_new_note(ledger: &Ledger, tx: &Transaction, cm: &Word8) -> Result<(), TxError> {
     let in_fee_bundle = tx.bundle.as_ref().is_some_and(|b| b.commitments.contains(cm));
@@ -1893,17 +1839,19 @@ mod action_tests {
     }
 
     /// A bundle whose stub proof publishes exactly the digest the ledger recomputes, with its
-    /// four words at `seed..seed + 3`.
-    fn bundle(l: &Ledger, seed: u32, fee: u64, asset: u32, burn: u64) -> Bundle {
+    /// first two nullifiers and commitments at `seed..seed + 3` (the other two slots derived from
+    /// them, `notes::pad4`), burning `burn_a` of `burn_asset` (`0, 0` for no burn).
+    fn bundle(l: &Ledger, seed: u32, fee: u64, burn_asset: u32, burn_a: u64) -> Bundle {
         let mut b = Bundle {
             anchor: l.anchors().back().expect("the genesis anchor").1,
-            nullifiers: [[seed; 8], [seed + 1; 8]],
-            commitments: [[seed + 2; 8], [seed + 3; 8]],
+            nullifiers: crate::notes::pad4([[seed; 8], [seed + 1; 8]]),
+            commitments: crate::notes::pad4([[seed + 2; 8], [seed + 3; 8]]),
             fee,
-            burn,
-            asset,
+            burn_a,
+            burn_r: 0,
+            burn_asset,
             time: l.height() as u32,
-            envelopes: [env(), env()],
+            envelopes: [env(), env(), env(), env()],
             proof: vec![],
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
@@ -1911,15 +1859,9 @@ mod action_tests {
         b
     }
 
-    /// A RAND fee bundle paying `fee`, whose four words are `seed..seed + 3`.
+    /// A bundle burning nothing, paying `fee`, keyed at `seed`.
     fn fee_bundle(l: &Ledger, seed: u32, fee: u64) -> Bundle {
         bundle(l, seed, fee, 0, 0)
-    }
-
-    /// The *asset* bundle of a transfer or a holder burn: no fee — the RAND bundle pays it — the
-    /// token's index as its `asset`, and `burn` destroyed.
-    fn asset_bundle(l: &Ledger, seed: u32, asset: u32, burn: u64) -> Bundle {
-        bundle(l, seed, 0, asset, burn)
     }
 
     /// The initial mint a registration carries: `amount` to [`recipient`], stamped at the
@@ -2040,38 +1982,23 @@ mod action_tests {
         TxError::Token(e)
     }
 
-    /// What a two-bundle action's RAND bundle pays: the bundle base for each of its two bundles
-    /// ([`gas::fee_floor`]).
-    const TWO_BUNDLES: u64 = 2 * gas::BUNDLE_BASE;
+    /// What a `TokenBurn` pays: one bundle's base (the hidden-asset bundle, spec §3.7 — no
+    /// longer two).
+    const BURN_FEE: u64 = gas::BUNDLE_BASE;
 
-    /// A `TokenTransfer` of the notes in an asset bundle at `seed..seed + 3`, its RAND fee bundle
-    /// at `seed + 4..seed + 7`. `mutate` breaks the asset bundle after its proof was made, which
-    /// is what makes "refused before any proof work" observable.
-    fn transfer_tx(
-        l: &Ledger,
-        asset: u32,
-        memo: Option<Vec<u8>>,
-        seed: u32,
-        mutate: impl FnOnce(&mut Bundle),
-    ) -> Transaction {
-        let mut asset_bundle = asset_bundle(l, seed, asset, 0);
-        mutate(&mut asset_bundle);
-        StubExecutor::bound(Transaction::shielded(
-            CHAIN,
-            fee_bundle(l, seed + 4, TWO_BUNDLES),
-            Action::TokenTransfer { asset_bundle, memo },
-        ))
+    /// A token transfer as the chain sees it since the hidden-asset bundle: a plain
+    /// `Action::None` bundle, burning nothing, the token's index nowhere in it.
+    fn transfer_tx(l: &Ledger, seed: u32) -> Transaction {
+        StubExecutor::bound(Transaction::shielded(CHAIN, fee_bundle(l, seed, gas::BUNDLE_BASE), Action::None))
     }
 
-    /// A `TokenBurn` of `amount` of `asset`, laid out like [`transfer_tx`].
+    /// A `TokenBurn` of `amount` of `asset` on one bundle keyed at `seed`, publishing
+    /// `burn_asset == asset` and `burn_a == amount`. `mutate` edits the bundle after its proof
+    /// was made, which is what makes "refused before any proof work" observable.
     fn burn_tx(l: &Ledger, asset: u32, amount: u64, seed: u32, mutate: impl FnOnce(&mut Bundle)) -> Transaction {
-        let mut asset_bundle = asset_bundle(l, seed, asset, amount);
-        mutate(&mut asset_bundle);
-        StubExecutor::bound(Transaction::shielded(
-            CHAIN,
-            fee_bundle(l, seed + 4, TWO_BUNDLES),
-            Action::TokenBurn { asset_bundle, asset, amount },
-        ))
+        let mut b = bundle(l, seed, BURN_FEE, asset, amount);
+        mutate(&mut b);
+        StubExecutor::bound(Transaction::shielded(CHAIN, b, Action::TokenBurn { asset, amount }))
     }
 
     /// USDT on chain 2, the one coin behind the bridged token the tests below list.
@@ -2117,8 +2044,8 @@ mod action_tests {
         assert_eq!((info.total_supply, info.mint_nonce, info.registered_at), (1_000, 0, 1));
         assert_eq!(l.tokens().unwrap().next_index(), 2, "and the index is spent");
 
-        // The fee bundle's two notes plus exactly one mint note.
-        assert_eq!(l.next_index(), 3);
+        // The bundle's four notes plus exactly one mint note.
+        assert_eq!(l.next_index(), 5);
         let cm = mint_commitment(&recipient(), 1_000, 1, 1, &[7; 8], &StubExecutor);
         assert!(l.has_commitment(&cm), "the note the creator sealed its envelope against");
         assert_ne!(l.state_root(), before);
@@ -2366,7 +2293,7 @@ mod action_tests {
         l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
         let cm = mint_commitment(&recipient(), 250, asset, 1, &[9; 8], &StubExecutor);
         assert!(l.has_commitment(&cm));
-        assert_eq!(l.next_index(), leaves + 3, "the fee bundle's two notes and exactly one mint");
+        assert_eq!(l.next_index(), leaves + 5, "the bundle's four notes and exactly one mint");
         let info = l.tokens().unwrap().get(asset).unwrap();
         assert_eq!((info.total_supply, info.mint_nonce), (1_250, 1));
         assert_ne!(l.state_root(), before);
@@ -2563,179 +2490,111 @@ mod action_tests {
         );
     }
 
-    // ── TokenTransfer and TokenBurn: the two-bundle shape ────────────────────────────────────
+    // ── Transfers and TokenBurn on the hidden-asset bundle (spec §3.7) ───────────────────────
 
-    /// The whole transfer path: two bundles, four nullifiers spent and four commitments appended,
-    /// and nothing public moved — a transfer creates no value and destroys none, so the token's
-    /// `total_supply` is exactly what it was.
+    /// A transfer of any token — keyed or bridged — is a plain `Action::None` bundle: four
+    /// nullifiers spent, four commitments appended, and nothing public moved. Neither a token's
+    /// `total_supply` nor a backing's `locked` is involved, and the chain never learns which
+    /// token it was.
     #[test]
-    fn a_token_transfer_moves_notes_and_touches_no_supply() {
+    fn a_token_transfer_is_a_plain_bundle_and_touches_no_supply() {
         let mut l = ledger();
-        let asset = register_keyed(&mut l, 20);
-        let supply = l.tokens().unwrap().get(asset).unwrap().total_supply;
+        let keyed = register_keyed(&mut l, 20);
+        let bridged = list_bridged(&mut l, 1_000);
+        let supply = |l: &Ledger| {
+            let t = l.tokens().unwrap();
+            (t.get(keyed).unwrap().total_supply, t.get(bridged).unwrap().total_supply)
+        };
+        let before = supply(&l);
         let leaves = l.next_index();
-        let tx = transfer_tx(&l, asset, None, 40, |_| {});
+        let tx = transfer_tx(&l, 40);
         assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
         l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
-
-        for nf in [[40; 8], [41; 8], [44; 8], [45; 8]] {
-            assert!(l.is_spent(&nf), "{nf:?} is spent");
-        }
-        for cm in [[42; 8], [43; 8], [46; 8], [47; 8]] {
-            assert!(l.has_commitment(&cm), "{cm:?} is in the tree");
-        }
-        assert_eq!(l.next_index(), leaves + 4, "two bundles, four leaves");
-        assert_eq!(l.tokens().unwrap().get(asset).unwrap().total_supply, supply, "a transfer mints nothing");
-        // Replayed, the fee bundle's nullifiers are spent — the first refusal the second copy meets.
-        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::Spent([44; 8])));
-    }
-
-    /// A transfer moves **any** registered token, a bridged one included: its notes are notes like
-    /// any other, and neither the token's supply nor the source contract's locked amount is
-    /// involved — only a `BridgeBurn` moves those.
-    #[test]
-    fn a_transfer_moves_a_bridged_token_and_leaves_its_backing_alone() {
-        let mut l = ledger();
-        let asset = list_bridged(&mut l, 1_000);
-        let tx = transfer_tx(&l, asset, None, 40, |_| {});
-        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
-        l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
+        assert!(tx.nullifiers().iter().all(|nf| l.is_spent(nf)));
+        assert!(tx.commitments().iter().all(|cm| l.has_commitment(cm)));
+        assert_eq!(l.next_index(), leaves + 4, "one bundle, four leaves");
+        assert_eq!(supply(&l), before, "a transfer mints nothing and burns nothing");
         let t = l.tokens().unwrap();
-        assert_eq!(t.get(asset).unwrap().total_supply, 1_000);
-        assert_eq!(t.backing(asset, 2, &USDT).unwrap().locked, 1_000);
+        assert_eq!(t.backing(bridged, 2, &USDT).unwrap().locked, 1_000);
         assert!(t.backing_invariant_holds());
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::Spent([40; 8])));
     }
 
-    /// Asset 0 is RAND, which is never a registry row: a transfer naming it is a RAND transfer
-    /// wearing a token action's clothes, and it gets the same refusal an index nobody registered
-    /// gets. The fee bundle's own `asset != 0` rule (`TxError::UnsupportedAsset`) is untouched —
-    /// that bundle is always RAND.
+    /// A burn must name a registered token: an index nobody registered is `UnknownToken`, and
+    /// "burning" RAND (asset 0) through the token slots is the non-canonical RAND burn, refused at
+    /// step 3 before the token module is reached.
     #[test]
-    fn a_transfer_of_asset_zero_is_refused() {
+    fn a_burn_of_an_unregistered_index_or_of_rand_is_refused() {
         let mut l = ledger();
         register_keyed(&mut l, 20);
-        let tx = transfer_tx(&l, 0, None, 40, |_| {});
-        assert_eq!(l.validate(&tx, &StubExecutor), Err(tok(TokenError::UnknownToken(0))));
-    }
-
-    #[test]
-    fn a_transfer_of_an_unregistered_index_is_refused() {
-        let mut l = ledger();
-        register_keyed(&mut l, 20);
-        let tx = transfer_tx(&l, 9, None, 40, |_| {});
-        assert_eq!(l.validate(&tx, &StubExecutor), Err(tok(TokenError::UnknownToken(9))));
-        // And a burn of one likewise.
         let burn = burn_tx(&l, 9, 100, 50, |_| {});
         assert_eq!(l.validate(&burn, &StubExecutor), Err(tok(TokenError::UnknownToken(9))));
+        let rand = burn_tx(&l, 0, 100, 60, |_| {});
+        assert_eq!(l.validate(&rand, &StubExecutor), Err(TxError::NonCanonicalRandBurn(100)));
     }
 
-    /// A `TokenBurn`'s asset bundle must be in the asset the action itself declares: the two-
-    /// bundle rule's first check ([`TxError::BurnAssetMismatch`]), shared with `TokenTransfer` and
-    /// `BridgeBurn` — this is `TokenBurn`'s own case of it. Refused on a comparison, before any
-    /// proof work: the bundle carries an unverifiable proof, so reaching verification would be
-    /// visible.
+    /// A `TokenBurn`'s bundle must burn the asset the action itself declares
+    /// ([`TxError::BurnAssetMismatch`]). Refused on a comparison, before any proof work: the
+    /// bundle carries an unverifiable proof, so reaching verification would be visible.
     #[test]
-    fn a_token_burns_asset_bundle_must_match_the_actions_own_asset() {
+    fn a_token_burns_burn_asset_must_match_the_actions_own_asset() {
         let mut l = ledger();
         let asset = register_keyed(&mut l, 20);
-        // A second, genuinely different token beside it — `register_keyed` registers one identity
-        // (the id binds the declaration, not the seed), so the other index is a listed one.
         let other = list_bridged(&mut l, 1_000);
         assert_ne!(asset, other);
         let tx = burn_tx(&l, asset, 100, 50, |b| {
-            b.asset = other;
+            b.burn_asset = other;
             b.proof = vec![0xff; 16];
         });
-        assert_eq!(
-            l.validate(&tx, &StubExecutor),
-            Err(TxError::BurnAssetMismatch { expected: asset, actual: other })
-        );
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::BurnAssetMismatch { expected: asset, actual: other }));
     }
 
-    /// The fee is RAND and it is the *other* bundle's to pay: an asset bundle that also charged a
-    /// fee would be paying the proposer in a token. Refused on a comparison, before any proof work
-    /// — each case hands the asset bundle a proof that could never verify, so reaching the
-    /// verification step would be visible.
+    /// A token burn burns no RAND (`burn_r == 0`), and it burns exactly the declared amount of
+    /// the token (`burn_a == amount`), neither more nor less. Refused on comparisons, before any
+    /// proof work — each case hands the bundle a proof that could never verify.
     #[test]
-    fn an_asset_bundle_paying_a_fee_is_refused() {
+    fn a_token_burn_burns_exactly_its_amount_and_no_rand() {
         let mut l = ledger();
         let asset = register_keyed(&mut l, 20);
         let break_proof = |b: &mut Bundle| b.proof = vec![0xff; 16];
-        let tx = transfer_tx(&l, asset, None, 40, |b| {
-            b.fee = 7;
-            break_proof(b);
-        });
-        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::BurnAssetBundleFee(7)));
         let burn = burn_tx(&l, asset, 100, 50, |b| {
-            b.fee = 7;
+            b.burn_r = 7;
             break_proof(b);
         });
-        assert_eq!(l.validate(&burn, &StubExecutor), Err(TxError::BurnAssetBundleFee(7)));
-        // With nothing else wrong, the broken proof is what is left to refuse the transfer —
-        // which is what makes the two answers above an ordering statement.
-        let last = transfer_tx(&l, asset, None, 60, break_proof);
+        assert_eq!(l.validate(&burn, &StubExecutor), Err(TxError::UnsupportedBurn(7)));
+        for burn_a in [99, 101] {
+            let burn = burn_tx(&l, asset, 100, 50, |b| {
+                b.burn_a = burn_a;
+                break_proof(b);
+            });
+            assert_eq!(l.validate(&burn, &StubExecutor), Err(TxError::BurnAmountMismatch { expected: 100, actual: burn_a }));
+        }
+        // With nothing else wrong, the broken proof is what is left to refuse the burn — which
+        // is what makes the answers above an ordering statement.
+        let last = burn_tx(&l, asset, 100, 60, break_proof);
         assert!(matches!(l.validate(&last, &StubExecutor), Err(TxError::InvalidBundleProof(_))));
     }
 
     /// A transfer destroys nothing: value leaves a token's supply through `TokenBurn`, which says
-    /// so publicly, or through `BridgeBurn`, which names a backing. A transfer whose bundle burned
-    /// would take supply out of the count without either.
+    /// so publicly, or through `BridgeBurn`, which names a backing. A plain bundle that burned a
+    /// token would take supply out of the count without either.
     #[test]
-    fn an_asset_bundle_that_burns_inside_a_transfer_is_refused() {
+    fn a_plain_bundle_that_burns_a_token_is_refused() {
         let mut l = ledger();
         let asset = register_keyed(&mut l, 20);
-        let tx = transfer_tx(&l, asset, None, 40, |b| {
-            b.burn = 5;
+        let mut tx = transfer_tx(&l, 40);
+        {
+            let b = tx.bundle.as_mut().unwrap();
+            b.burn_a = 5;
+            b.burn_asset = asset;
             b.proof = vec![0xff; 16];
-        });
-        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::BurnAmountMismatch { expected: 0, actual: 5 }));
-        // And a burn's bundle must destroy exactly what the action declares, neither more nor less.
-        let over = burn_tx(&l, asset, 100, 50, |b| {
-            b.burn = 101;
-            b.proof = vec![0xff; 16];
-        });
-        assert_eq!(l.validate(&over, &StubExecutor), Err(TxError::BurnAmountMismatch { expected: 100, actual: 101 }));
-    }
-
-    /// `check_bundle` sees each bundle alone, so the pairs *between* the two are checked by the
-    /// shared two-bundle rule: all four nullifiers and all four commitments of a transfer must
-    /// differ, or one note would be spent twice — or appended twice — inside one transaction.
-    #[test]
-    fn a_nullifier_shared_between_the_two_bundles_is_refused() {
-        let mut l = ledger();
-        let asset = register_keyed(&mut l, 20);
-        let tx = transfer_tx(&l, asset, None, 40, |_| {});
-        let Action::TokenTransfer { asset_bundle, .. } = &tx.action else { panic!("a transfer") };
-        let (shared_nf, shared_cm) = (asset_bundle.nullifiers[0], asset_bundle.commitments[1]);
-        let mut clash = tx.clone();
-        clash.bundle.as_mut().unwrap().nullifiers[0] = shared_nf;
-        assert_eq!(l.validate(&clash, &StubExecutor), Err(TxError::DuplicateNullifierInBundle));
-        let mut clash = tx.clone();
-        clash.bundle.as_mut().unwrap().commitments[1] = shared_cm;
-        assert_eq!(l.validate(&clash, &StubExecutor), Err(TxError::DuplicateCommitmentInBundle));
-    }
-
-    /// The memo is opaque and the chain checks only its size (spec §4): [`MAX_MEMO_BYTES`] bytes
-    /// pass, one more does not, and no memo at all is the ordinary transfer.
-    #[test]
-    fn a_memo_over_2048_bytes_is_refused_and_one_at_the_cap_is_not() {
-        let mut l = ledger();
-        let asset = register_keyed(&mut l, 20);
-        assert_eq!(MAX_MEMO_BYTES, 2_048);
-        let over = transfer_tx(&l, asset, Some(vec![7; MAX_MEMO_BYTES + 1]), 40, |_| {});
-        assert_eq!(l.validate(&over, &StubExecutor), Err(tok(TokenError::MemoTooLarge(MAX_MEMO_BYTES + 1))));
-        for memo in [None, Some(Vec::new()), Some(vec![7; MAX_MEMO_BYTES])] {
-            let tx = transfer_tx(&l, asset, memo.clone(), 50, |_| {});
-            assert_eq!(l.validate(&tx, &StubExecutor), Ok(()), "{:?} bytes", memo.map(|m| m.len()));
         }
-        // A byte-level rule, so it is decided before the registry is consulted at all: an
-        // oversized memo on a transfer of a token nobody registered still reports the memo.
-        let unknown = transfer_tx(&l, 9, Some(vec![7; MAX_MEMO_BYTES + 1]), 60, |_| {});
-        assert_eq!(l.validate(&unknown, &StubExecutor), Err(tok(TokenError::MemoTooLarge(MAX_MEMO_BYTES + 1))));
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::UnsupportedAsset(asset)));
     }
 
-    /// The holder burn: the asset bundle destroys `amount`, the token's public supply falls by
-    /// exactly that, and the four words of both bundles are spent and appended as in a transfer.
+    /// The holder burn: the asset bundle destroys `amount`    /// The holder burn: the bundle's `burn_a` destroys `amount`, the token's public supply falls
+    /// by exactly that, and the bundle's four nullifiers and four commitments are spent and
+    /// appended as in a transfer. The RAND audit's `burned` does not move: a token is not RAND.
     #[test]
     fn a_token_burn_lowers_supply_by_exactly_the_burn() {
         let mut l = ledger();
@@ -2745,13 +2604,11 @@ mod action_tests {
         assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
         l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
         assert_eq!(l.tokens().unwrap().get(asset).unwrap().total_supply, 600);
-        for nf in [[40; 8], [41; 8], [44; 8], [45; 8]] {
-            assert!(l.is_spent(&nf), "{nf:?} is spent");
-        }
-        for cm in [[42; 8], [43; 8], [46; 8], [47; 8]] {
-            assert!(l.has_commitment(&cm), "{cm:?} is in the tree");
-        }
-        // A zero burn would spend two notes to destroy nothing, and a burn past the supply would
+        assert_eq!(tx.nullifiers().len(), 4);
+        assert!(tx.nullifiers().iter().all(|nf| l.is_spent(nf)));
+        assert!(tx.commitments().iter().all(|cm| l.has_commitment(cm)));
+        assert_eq!(l.supply().burned, 0, "a token burn is not a RAND burn");
+        // A zero burn would spend notes to destroy nothing, and a burn past the supply would
         // leave a count no longer describing what exists — both refused before any proof work.
         let zero = burn_tx(&l, asset, 0, 60, |b| b.proof = vec![0xff; 16]);
         assert_eq!(l.validate(&zero, &StubExecutor), Err(tok(TokenError::ZeroAmount)));
@@ -2801,54 +2658,40 @@ mod action_tests {
         );
     }
 
-    /// The asset bundle is a bundle, so it gets the size caps every bundle gets — at step 1, before
-    /// the chain id, the fee floor or anything the action itself owns, and long before either
-    /// proof is verified.
+    /// A burn's bundle gets the size caps every bundle gets — at step 1, before the chain id,
+    /// the fee floor or anything the action itself owns, and long before the proof is verified.
     #[test]
-    fn an_oversized_asset_bundle_proof_is_refused_before_verification() {
+    fn an_oversized_burn_proof_or_envelope_is_refused_before_verification() {
         let mut l = ledger();
         let asset = register_keyed(&mut l, 20);
         let fat = l.max_proof_bytes() + 1;
-        for tx in [
-            transfer_tx(&l, asset, None, 40, |b| b.proof = vec![0; fat]),
-            burn_tx(&l, asset, 400, 50, |b| b.proof = vec![0; fat]),
-        ] {
-            assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::ProofTooLarge), "{:?}", tx.action);
-        }
-        // And the envelope cap, the other half of what a bundle's size rules are.
-        let fat_env = transfer_tx(&l, asset, None, 60, |b| {
-            b.envelopes[1].body = vec![0; crate::notes::MAX_ENVELOPE_BYTES + 1]
-        });
+        let tx = burn_tx(&l, asset, 400, 50, |b| b.proof = vec![0; fat]);
+        assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::ProofTooLarge));
+        let fat_env = burn_tx(&l, asset, 400, 60, |b| b.envelopes[3].body = vec![0; crate::notes::MAX_ENVELOPE_BYTES + 1]);
         assert_eq!(l.validate(&fat_env, &StubExecutor), Err(TxError::EnvelopeTooLarge));
     }
 
-    /// Both two-bundle actions pay for both of their bundles, and the floor is checked at step 3 —
-    /// before the asset bundle's shape or any proof.
+    /// A token burn is single-bundle and pays one bundle base (spec §3.7), checked at step 3 —
+    /// before the burn fields or any proof.
     #[test]
-    fn a_transfer_and_a_burn_pay_for_both_of_their_bundles() {
+    fn a_token_burn_pays_one_bundle_base() {
         let mut l = ledger();
         let asset = register_keyed(&mut l, 20);
-        let short = |mut tx: Transaction| {
-            tx.bundle.as_mut().unwrap().fee = TWO_BUNDLES - 1;
-            let b = tx.bundle.as_mut().unwrap();
-            let d = StubExecutor.bundle_digest(&b.digest_input());
-            b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
-            tx
-        };
-        for tx in [transfer_tx(&l, asset, None, 40, |_| {}), burn_tx(&l, asset, 400, 50, |_| {})] {
-            assert_eq!(
-                l.validate(&short(tx.clone()), &StubExecutor),
-                Err(TxError::FeeTooLow { min: TWO_BUNDLES, fee: TWO_BUNDLES - 1 }),
-                "{:?}",
-                tx.action
-            );
-            assert_eq!(l.validate(&tx, &StubExecutor), Ok(()), "exactly the floor is admitted");
+        let tx = burn_tx(&l, asset, 400, 50, |_| {});
+        let mut short = tx.clone();
+        {
+            let b = short.bundle.as_mut().unwrap();
+            b.fee = BURN_FEE - 1;
+            b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
         }
+        StubExecutor::bind(&mut short);
+        assert_eq!(l.validate(&short, &StubExecutor), Err(TxError::FeeTooLow { min: BURN_FEE, fee: BURN_FEE - 1 }));
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()), "exactly the floor is admitted");
     }
 
     // ── the gate, the block, and fail-closed routing ─────────────────────────────────────────
 
-    /// The gate is absolute: with no `tokens` section every one of the five is refused before
+    /// The gate is absolute: with no `tokens` section every one of the four is refused before
     /// any other check of its own, whatever else is wrong with it.
     #[test]
     fn every_token_action_is_disabled_without_the_gate() {
@@ -2862,9 +2705,8 @@ mod action_tests {
             // A rotation of a token that really is registered, so its verdict with the gate on
             // comes from the token's own rules rather than from the index being unknown.
             rotate_tx(&l, asset, None, 7, 50, &Keypair::from_seed([98; 32]).unwrap()),
-            // The two-bundle pair, each with a defect of its own (an unregistered index, an
-            // oversized memo) so that `Disabled` below is the gate speaking and not those.
-            transfer_tx(&l, 99, Some(vec![7; MAX_MEMO_BYTES + 1]), 60, |_| {}),
+            // A burn with a defect of its own (an unregistered index) so that `Disabled` below
+            // is the gate speaking and not that.
             burn_tx(&l, 99, 400, 70, |_| {}),
         ];
         // With the gate on, each of the three is refused for a reason of its own and *never*
@@ -2883,9 +2725,8 @@ mod action_tests {
                 scratch.apply_tx(tx, &proposer().address(), &StubExecutor).map(|_| ()),
                 Err(tok(TokenError::Disabled))
             );
-            // And the apply half on its own, which only a routing mistake reaches: the two
-            // two-bundle actions write notes before they would otherwise read the registry, so
-            // they read the gate first and leave the tree exactly as they found it.
+            // And the apply half on its own, which only a routing mistake reaches: it reads the
+            // gate before any write and leaves the tree exactly as it found it.
             let mut scratch = l.clone();
             let leaves = scratch.next_index();
             assert_eq!(apply(&mut scratch, tx, &tx.action, &StubExecutor), Err(tok(TokenError::Disabled)));
@@ -2968,63 +2809,41 @@ mod action_tests {
         }
     }
 
-    /// Task 5b: a transfer's memo is opaque to the chain, which is exactly why nothing but the
-    /// binding keeps a copier from stripping it or replacing it (it can carry a wallet's
-    /// allowance grant, spec §6). Both copies are refused; the original still validates.
+    /// Task 5b on the burn fields themselves: a copy of an honest `TokenBurn` that names another
+    /// token — `asset` *and* the bundle's `burn_asset` changed together, so the burn rule holds —
+    /// or another amount (`amount` and `burn_a`), with the proof re-issued for the new digest
+    /// but still bound to the original transaction, is refused on the binding. And the burn's
+    /// bundle lifted whole onto a new burn of another token is refused. The original validates.
     #[test]
-    fn a_transfers_proofs_cannot_ride_a_changed_memo() {
+    fn a_burns_proof_cannot_ride_a_changed_burn_asset_or_burn_a() {
         let mut l = ledger();
-        let asset = list_bridged(&mut l, 1_000);
-        let original = transfer_tx(&l, asset, Some(vec![0xab; 16]), 40, |_| {});
+        let keyed = register_keyed(&mut l, 20);
+        let fixed = {
+            let tx = register_tx(&l, MintAuthority::None, Some(initial(&l, 500)), 30);
+            l.apply_tx(&tx, &proposer().address(), &StubExecutor).expect("a second token");
+            l.tokens().unwrap().next_index() - 1
+        };
+        l.record_anchor(l.height());
+        let original = burn_tx(&l, keyed, 100, 60, |_| {});
         assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
-        let accepted: Vec<String> = [("stripped", None), ("replaced", Some(vec![0xcd; 16]))]
-            .into_iter()
-            .map(|(what, memo)| {
-                let mut copy = original.clone();
-                let Action::TokenTransfer { memo: m, .. } = &mut copy.action else { panic!("a transfer") };
-                *m = memo;
-                (what, l.validate(&copy, &StubExecutor))
-            })
-            .filter(|(_, got)| !matches!(got, Err(TxError::InvalidBundleProof(_))))
-            .map(|(what, got)| format!("memo {what}: {got:?}"))
-            .collect();
-        assert!(accepted.is_empty(), "{accepted:#?}");
+        let binding = original.binding();
+        let rewired = |asset: u32, amount: u64| {
+            let mut t = original.clone();
+            t.action = Action::TokenBurn { asset, amount };
+            let b = t.bundle.as_mut().unwrap();
+            b.burn_asset = asset;
+            b.burn_a = amount;
+            b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()), &binding);
+            t
+        };
+        let public_values = Err(TxError::InvalidBundleProof(crate::confidential::ConfidentialError::InvalidBundleProof("PublicValues".into())));
+        assert_eq!(l.validate(&rewired(fixed, 100), &StubExecutor), public_values, "burn_asset rewired");
+        assert_eq!(l.validate(&rewired(keyed, 50), &StubExecutor), public_values, "burn_a rewired");
+        // Lifted whole — proof untouched — under a burn of the other token: the burn rule sees
+        // `burn_asset != asset` first; either way it is refused.
+        let lifted = Transaction::shielded(CHAIN, original.bundle.clone().unwrap(), Action::TokenBurn { asset: fixed, amount: 100 });
+        assert!(l.validate(&lifted, &StubExecutor).is_err());
         assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
     }
 
-    /// Fix round 1, item 4: the lifted-asset-bundle row for RPL's two two-bundle actions — an
-    /// asset bundle lifted whole out of an honest `TokenTransfer` / `TokenBurn` into a new
-    /// transaction whose fee bundle the thief honestly proves for it. The lifted proof was bound to
-    /// the original transaction and is refused; both originals still validate.
-    #[test]
-    fn an_asset_bundle_lifted_out_of_a_token_transfer_or_burn_is_refused() {
-        let mut l = ledger();
-        let keyed = register_keyed(&mut l, 20);
-        l.record_anchor(l.height());
-        let transfer = transfer_tx(&l, keyed, Some(vec![1; 4]), 40, |_| {});
-        let burn = burn_tx(&l, keyed, 100, 60, |_| {});
-        assert_eq!(l.validate(&transfer, &StubExecutor), Ok(()));
-        assert_eq!(l.validate(&burn, &StubExecutor), Ok(()));
-        // The thief's fee bundle, proved for the new transaction: only the asset bundle is stolen.
-        let rebuilt = |action: Action| {
-            let mut t = Transaction::shielded(CHAIN, fee_bundle(&l, 80, TWO_BUNDLES), action);
-            let binding = t.binding();
-            let fee = t.bundle.as_mut().unwrap();
-            fee.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&fee.digest_input()), &binding);
-            t
-        };
-        let Action::TokenTransfer { asset_bundle, .. } = &transfer.action else { panic!("a transfer") };
-        let lifted_transfer = rebuilt(Action::TokenTransfer { asset_bundle: asset_bundle.clone(), memo: Some(vec![2; 4]) });
-        let Action::TokenBurn { asset_bundle, asset, amount } = &burn.action else { panic!("a burn") };
-        let lifted_burn = rebuilt(Action::TokenBurn { asset_bundle: asset_bundle.clone(), asset: *asset, amount: *amount });
-        let accepted: Vec<String> = [("transfer", &lifted_transfer), ("burn", &lifted_burn)]
-            .into_iter()
-            .map(|(what, t)| (what, l.validate(t, &StubExecutor)))
-            .filter(|(_, got)| !matches!(got, Err(TxError::InvalidBundleProof(_))))
-            .map(|(what, got)| format!("asset bundle lifted out of a token {what}: {got:?}"))
-            .collect();
-        assert!(accepted.is_empty(), "{accepted:#?}");
-        assert_eq!(l.validate(&transfer, &StubExecutor), Ok(()));
-        assert_eq!(l.validate(&burn, &StubExecutor), Ok(()));
-    }
 }
