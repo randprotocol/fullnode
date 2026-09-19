@@ -2,6 +2,7 @@
 name = "randprotocol-rvm"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Rand recursion VM (rVM): a field-native machine whose programs verify Rand zkVM proofs"
 
 [lib]

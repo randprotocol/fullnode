@@ -331,4 +331,4 @@ in `docs/deploy.md` ("Deferred proof runs and hardware tasks"); both were accept
 
 ## License
 
-Apache-2.0.
+GNU General Public License v3.0 (`GPL-3.0-only`) — see [LICENSE](LICENSE).
