@@ -1889,3 +1889,87 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
     n0.handle.shutdown().await;
     n1.handle.shutdown().await;
 }
+
+/// Audit v3, CON-1a: a peer serving a *certified* chain cannot make a syncing node finalise it.
+///
+/// Blocks are certified and then abandoned at every view change, so a QC per block — all the sync
+/// path used to check — is not evidence of a commit. Here a peer's database is seeded by hand with
+/// a chain whose views are 1, 3 and 5: every block carries a real quorum certificate signed by the
+/// chain's only validator, and no three of them sit in consecutive views, so the three-chain rule
+/// commits none of them. The syncing node must stay at genesis rather than take the peer's word.
+///
+/// Before the fix it committed all three and served them as final.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_synced_certified_but_uncommitted_chain_is_not_committed() {
+    use randprotocol_core::consensus::CommittedBlock;
+    use randprotocol_core::{Block, BlockHeader, QuorumCertificate, Vote};
+    use randprotocol_node::storage::Storage;
+
+    let v = Keypair::from_seed([61; 32]).unwrap();
+    let gen = genesis(std::slice::from_ref(&v));
+    let gs = gen.build(&ZkExecutor::new(FriProfile::Test)).expect("genesis builds");
+
+    // The peer's database: genesis, then three certified blocks at views 1, 3 and 5.
+    let liar_dir = tempfile::tempdir().unwrap();
+    std::fs::write(liar_dir.path().join("genesis.json"), gen.to_json()).unwrap();
+    {
+        let s = Storage::open(liar_dir.path()).unwrap();
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let mut parent = gs.block.clone();
+        let mut parent_view = 0u64;
+        let mut chain: Vec<CommittedBlock> = Vec::new();
+        for view in [1u64, 3, 5] {
+            let height = parent.height() + 1;
+            ledger.set_height(height);
+            ledger.set_timestamp_ms(height);
+            ledger.record_anchor(height);
+            let header = BlockHeader {
+                height,
+                view,
+                parent: parent.hash(),
+                proposer: v.public_key().clone(),
+                timestamp_ms: height,
+                tx_root: Block::tx_root(&[]),
+                state_root: ledger.state_root(),
+                justify: QuorumCertificate {
+                    view: parent_view,
+                    block_hash: parent.hash(),
+                    votes: if parent_view == 0 {
+                        vec![]
+                    } else {
+                        vec![Vote::sign(parent_view, parent.hash(), &v)]
+                    },
+                },
+            };
+            let block = Block::sign(header, vec![], &v);
+            let qc = QuorumCertificate {
+                view,
+                block_hash: block.hash(),
+                votes: vec![Vote::sign(view, block.hash(), &v)],
+            };
+            parent = block.clone();
+            parent_view = view;
+            chain.push(CommittedBlock { block, pruned: vec![], qc, receipts: vec![], deposits: vec![] });
+        }
+        s.commit(&chain, &ledger, &[], &ZkExecutor::new(FriProfile::Test)).unwrap();
+        assert_eq!(s.head().unwrap().height, 3, "the peer serves a chain of three certified blocks");
+    }
+
+    // The peer is an observer: it serves its stored chain and proposes nothing.
+    let liar = start_in(liar_dir, &Keypair::from_seed([62; 32]).unwrap(), vec![], false).await;
+    let target = liar.handle.listen_addrs[0]
+        .clone()
+        .with(libp2p::multiaddr::Protocol::P2p(liar.handle.network.local_peer_id));
+    // A fresh node that knows only this peer, and is not a validator, so nothing but the sync can
+    // move its committed head.
+    let victim = start_node(&Keypair::from_seed([63; 32]).unwrap(), &gen, vec![target], false).await;
+
+    // Long enough for several sync rounds against a peer claiming height 3.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let height = victim.handle.status.read().unwrap().height;
+    assert_eq!(height, 0, "a certified but uncommitted chain was committed by sync");
+
+    victim.handle.shutdown().await;
+    liar.handle.shutdown().await;
+}
