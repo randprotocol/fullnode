@@ -878,8 +878,20 @@ never move them.
   of their own backing's numbers; `/tokens/1` renders `deploy_tx` as `null`;
   `/bridge` serves `registration_fee` as a JSON number where this node's RPC
   sends a decimal string.
-- Wallet uses committed nonce (stale-nonce race on fast double-send); the
-  clean fix is a mempool-aware `next_nonce` RPC.
+- Nonces: **re-checked 2026-09-20 and narrower than this line said.** The shielded wallet carries
+  no nonces at all — the only `nonce` fields in `wallet.rs` are bridge test fixtures. The race is
+  in `rand-node`'s operator commands (`unbond`, `withdraw`, `unbond-aggregator`,
+  `withdraw-aggregator`, `aggregate`), which read the *committed* nonce from the register. Both
+  submit paths already wait for the commit before returning (`submit_staking`, and the aggregate
+  arm), so back-to-back commands are safe; `--no-wait` opts out of that and re-introduces the
+  race by choice. What is still open is a programmatic RPC client: a mempool-aware `next_nonce`
+  would need admission to accept `current ≤ nonce ≤ current + pooled_run` as well, because the
+  ledger requires the nonce to equal the current one exactly (`staking.rs`, `aggregation.rs`).
+  Returning N+1 alone would be refused at the tip.
+- **The lock is released in exactly one place** (`fallback_high_qc`), after every fetch for that
+  block has failed. To be sound against a Byzantine peer that answers "I do not have it", that
+  should require f+1 failed fetches; it does not yet (audit v3 review, I5 — strictly narrower
+  than the behaviour before the CON-1b fix, not a regression).
 
 ### Repo workflow traps
 
