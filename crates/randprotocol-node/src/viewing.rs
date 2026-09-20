@@ -69,7 +69,11 @@ pub struct ViewingNote {
 }
 
 /// One imported viewing key and its scan state.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is written by hand and prints no key material: the registry ends up in node logs and in
+/// panic output, and an `nk` there is the key itself (audit v3, VK-2). `Drop` zeroises it for the
+/// same reason — a freed import should not leave the key lying in the heap.
+#[derive(Clone)]
 pub struct Import {
     pub vk: ViewingKey,
     /// Leaves appended below this height are never tried: the cursor starts at
@@ -81,12 +85,46 @@ pub struct Import {
     pub notes: Vec<ViewingNote>,
 }
 
+impl std::fmt::Debug for Import {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Import")
+            .field("vk", &"<redacted>")
+            .field("rescan_from_height", &self.rescan_from_height)
+            .field("scanned_index", &self.scanned_index)
+            .field("notes", &self.notes.len())
+            .finish()
+    }
+}
+
+impl Drop for Import {
+    fn drop(&mut self) {
+        // Overwrite through a volatile write so the compiler cannot elide the store on a value
+        // that is about to die (audit v3, VK-2).
+        for w in self.vk.nk.iter_mut() {
+            unsafe { std::ptr::write_volatile(w, 0) };
+        }
+    }
+}
+
 /// Every key this node holds, keyed by the viewing key's `nk` words. In memory only, by design:
 /// a viewing key on disk would be a new secret-at-rest this node has never had, and the
 /// operator's orchestration already knows which keys to re-import after a restart.
-#[derive(Default, Debug)]
+///
+/// Each import sits behind its own lock, and the registry's lock is held only long enough to look
+/// one up (audit v3, VK-1). A scan trial-decrypts up to [`MAX_SCAN_ROWS`] leaves, and while it ran
+/// under the registry's write lock it also blocked `publish_status` — which the node loop calls on
+/// every pass — so one scan stalled consensus for its whole duration. `count` is published beside
+/// the map for exactly that reader.
+#[derive(Default)]
 pub struct Registry {
-    keys: BTreeMap<Word8, Import>,
+    keys: BTreeMap<Word8, std::sync::Arc<std::sync::Mutex<Import>>>,
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::fmt::Debug for Registry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registry").field("keys", &self.keys.len()).finish()
+    }
 }
 
 /// The registry is at [`MAX_VIEWING_KEYS`] and the key is not already in it.
@@ -112,13 +150,37 @@ impl Registry {
         }
         self.keys.insert(
             nk,
-            Import { vk: ViewingKey { nk }, rescan_from_height, scanned_index: start_index, notes: Vec::new() },
+            std::sync::Arc::new(std::sync::Mutex::new(Import {
+                vk: ViewingKey { nk },
+                rescan_from_height,
+                scanned_index: start_index,
+                notes: Vec::new(),
+            })),
         );
+        self.count.store(self.keys.len(), std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 
-    pub fn get_mut(&mut self, nk: &Word8) -> Option<&mut Import> {
-        self.keys.get_mut(nk)
+    /// The import's own lock. Take the registry's lock to get this, drop it, then scan under the
+    /// import's lock alone (audit v3, VK-1).
+    pub fn handle(&self, nk: &Word8) -> Option<std::sync::Arc<std::sync::Mutex<Import>>> {
+        self.keys.get(nk).cloned()
+    }
+
+    /// Forget a key: it stops being scanned, its slot is freed, and its `nk` is zeroised when the
+    /// last holder of the import drops it (audit v3, VK-2). `false` when the key was not held.
+    pub fn remove(&mut self, nk: &Word8) -> bool {
+        let gone = self.keys.remove(nk).is_some();
+        if gone {
+            self.count.store(self.keys.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        gone
+    }
+
+    /// The live key count, readable without taking the registry's lock — what the node loop's
+    /// `publish_status` reads (audit v3, VK-1).
+    pub fn count(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.count.clone()
     }
 }
 
@@ -322,11 +384,57 @@ mod tests {
         assert_eq!(reg.import([0xbeef; 8], 0, 0), Err(RegistryFull));
         // ...but a key already held is a no-op, even at the cap — and it does not reset the
         // cursor or the rescan floor.
-        reg.get_mut(&[1; 8]).unwrap().scanned_index = 42;
+        reg.handle(&[1; 8]).unwrap().lock().unwrap().scanned_index = 42;
         assert_eq!(reg.import([1; 8], 99, 7), Ok(false));
-        let held = reg.get_mut(&[1; 8]).unwrap();
-        assert_eq!((held.scanned_index, held.rescan_from_height), (42, 0));
+        {
+            let held = reg.handle(&[1; 8]).unwrap();
+            let held = held.lock().unwrap();
+            assert_eq!((held.scanned_index, held.rescan_from_height), (42, 0));
+        }
         assert_eq!(reg.len(), MAX_VIEWING_KEYS);
+    }
+
+    /// Audit v3, VK-1: a scan holds its own key's lock, not the registry's. While one key is being
+    /// scanned another can be imported, the count reads, and a different key scans — none of which
+    /// was true while the scan held the registry's write lock, which also blocked the node loop's
+    /// `publish_status` and so stalled consensus for the scan's whole duration.
+    #[test]
+    fn a_scan_does_not_hold_the_registry_lock() {
+        let mut reg = Registry::default();
+        reg.import([1; 8], 0, 0).unwrap();
+        let count = reg.count();
+        let scanning = reg.handle(&[1; 8]).unwrap();
+        let _held = scanning.lock().unwrap();
+        assert_eq!(reg.import([2; 8], 0, 0), Ok(true), "another key imports while key 1 scans");
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2, "the count reads without the lock");
+        let other = reg.handle(&[2; 8]).unwrap();
+        assert!(other.try_lock().is_ok(), "a second key scans while the first is scanning");
+    }
+
+    /// Audit v3, VK-2: a key can be given back, which frees its slot at the cap.
+    #[test]
+    fn remove_frees_a_slot_at_the_cap() {
+        let mut reg = Registry::default();
+        for i in 0..MAX_VIEWING_KEYS as u32 {
+            reg.import([i; 8], 0, 0).unwrap();
+        }
+        assert_eq!(reg.import([0xbeef; 8], 0, 0), Err(RegistryFull));
+        assert!(reg.remove(&[0; 8]), "the key was held");
+        assert!(!reg.remove(&[0; 8]), "and is not held twice");
+        assert_eq!(reg.count().load(std::sync::atomic::Ordering::Relaxed), MAX_VIEWING_KEYS - 1);
+        assert_eq!(reg.import([0xbeef; 8], 0, 0), Ok(true), "the freed slot takes a new key");
+    }
+
+    /// Audit v3, VK-2: neither the registry nor an import prints key material. Both end up in node
+    /// logs and in panic output.
+    #[test]
+    fn neither_the_registry_nor_an_import_prints_a_key() {
+        let mut reg = Registry::default();
+        reg.import([0xdead; 8], 0, 0).unwrap();
+        assert!(!format!("{reg:?}").contains("57005"), "registry Debug printed nk: {reg:?}");
+        let held = reg.handle(&[0xdead; 8]).unwrap();
+        let printed = format!("{:?}", held.lock().unwrap());
+        assert!(!printed.contains("57005"), "import Debug printed nk: {printed}");
     }
 
     /// A chain with two blocks: block 1 pays Alice 500 and Bob 700 (one bundle each, sealed by

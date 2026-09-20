@@ -344,6 +344,14 @@ enum Cmd {
         /// form (34 public values + the declared shape) once the window passes.
         #[arg(long)]
         keep_raw_proofs: bool,
+        /// Let the viewing-key methods answer callers that are not on loopback.
+        ///
+        /// Off by default (audit v3, VK-3): nothing in the RPC authenticates anyone, and the
+        /// facility exists for this node's own explorer. Open it only behind something that does
+        /// authenticate — otherwise a stranger can fill every viewing-key slot and keep scans
+        /// running against this node.
+        #[arg(long)]
+        rpc_viewing_open: bool,
     },
     /// Verify the chain in a data directory without running the node.
     Verify {
@@ -639,9 +647,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Run { datadir, key, listen, bootstrap, rpc, validator, no_mdns, block_interval_ms, view_timeout_ms, verify_chain, keep_raw_proofs } => {
+        Cmd::Run { datadir, key, listen, bootstrap, rpc, validator, no_mdns, block_interval_ms, view_timeout_ms, verify_chain, keep_raw_proofs, rpc_viewing_open } => {
             let kp = load_keypair(&key)?;
             let handle = node::start(NodeConfig {
+                viewing_open: rpc_viewing_open,
                 datadir,
                 seed: *kp.seed(),
                 listen,

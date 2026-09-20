@@ -254,8 +254,19 @@ Imports are bounded and idempotent:
 - A `rescan_from_height` in the future is accepted and simply matches nothing until the chain
   reaches it.
 - Import itself never scans: the scan is lazy, driven by `rand_getViewingNotes`.
+- **Loopback only.** `rand_importViewingKey`, `rand_getViewingNotes` and `rand_removeViewingKey`
+  answer a caller on the loopback interface and refuse anyone else with `-32000`. Nothing in this
+  RPC authenticates anyone, and the facility is for the node operator's own explorer: without the
+  rule a stranger could fill all 64 slots and lock the operator out until a restart. `rand-node run
+  --rpc-viewing-open` lifts it, for an operator who has put something that *does* authenticate in
+  front of the port.
 
-Errors: `-32602` for a malformed key.
+Errors: `-32602` for a malformed key, `-32000` from a caller that is not on loopback.
+
+### `rand_removeViewingKey`
+Params: `[viewing_key]`. Reply: `{"removed": bool, "viewing_keys": n}` — `removed` is false when
+the node was not holding that key. The import's scan state goes with it, its slot is freed, and
+the key is zeroised in memory. Loopback only, like the other two.
 
 ### `rand_getViewingNotes`
 Params: `[viewing_key]` or `[viewing_key, from_index, limit]` — `from_index` pages the matched
@@ -1182,6 +1193,18 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-20 — the viewing-key methods are loopback-only, and a key can be removed
+
+Node-side only; no consensus, ledger or wire change (audit v3, VK-1/2/3).
+
+- **`rand_importViewingKey`, `rand_getViewingNotes`** now answer a loopback caller only, and
+  refuse anyone else with `-32000` *"… answers loopback callers only on this node"*. Run the node
+  with `--rpc-viewing-open` to restore the old behaviour, behind something that authenticates.
+- **`rand_removeViewingKey(viewing_key)`**, new: gives a key back. Frees its slot at the 64-key
+  cap and zeroises the key in memory.
+- A scan no longer blocks the node's other work: each imported key has its own lock, so one key's
+  scan does not hold up another's, an import, or the status the node publishes each round.
 
 ### 2026-09-20 — every amount is a decimal string, legacy fields included (breaking)
 
