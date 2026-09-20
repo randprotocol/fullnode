@@ -1936,7 +1936,7 @@ mod tests {
             subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
             halving_blocks: 210_000,
             window: 256,
-            admitted_shapes: vec![AdmittedShape { shape, hc: Hash::digest(b"guest"), aggregate_program_digest: [1; 4] }],
+            admitted_shapes: vec![AdmittedShape { shape, hc: Hash::digest(b"guest"), aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap() }],
         }));
         // Register the aggregator, through a bond-burning bundle with a stub proof.
         let mut b = randprotocol_core::notes::Bundle {

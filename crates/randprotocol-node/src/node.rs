@@ -2449,7 +2449,7 @@ mod tests {
             admitted_shapes: vec![randprotocol_core::ledger::aggregation::AdmittedShape {
                 shape,
                 hc,
-                aggregate_program_digest: [1; 4],
+                aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap(),
             }],
         }
     }
@@ -2603,7 +2603,7 @@ mod tests {
             admitted_shapes: vec![randprotocol_core::ledger::aggregation::AdmittedShape {
                 shape: fixture_shape(&proof),
                 hc: fixture_hc(&proof),
-                aggregate_program_digest: [1; 4],
+                aggregate_program_digest: StubExecutor.aggregate_program_digest(&fixture_shape(&proof)).unwrap(),
             }],
         };
         // The gated ledger, with the aggregator registered at height 1 (the block-1 state the

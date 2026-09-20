@@ -2611,7 +2611,7 @@ mod tests {
             subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
             halving_blocks: 210_000,
             window: 256,
-            admitted_shapes: vec![AdmittedShape { shape, hc, aggregate_program_digest: [1; 4] }],
+            admitted_shapes: vec![AdmittedShape { shape, hc, aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap() }],
         }));
         let (dir, st) = state_for(&gs);
 
