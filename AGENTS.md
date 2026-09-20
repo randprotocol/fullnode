@@ -134,12 +134,12 @@ https://bscscan.com/tx/0xc329ea06440bf4a84383da39b9c67e2484ac96e168558b1a8690524
 https://tronscan.org/#/transaction/b0fc155a2264b9dbf5b7cbeac899ae918b3a976aa7af21e003f37435eb9f3269 ;
 SOL
 https://solscan.io/tx/2iAUL44wjhE7pcYeznAwGix5RMb28eTgXVwSRy7qixGASUcwqXx7EhVsrZATyNAjzAKXw2sRNXhQiaLF6ps6w6K3
-— **the four mints are in progress at the time of writing**; the `BridgeAttest` tx hashes on
-randscan will follow.
+— **all four mints committed** (`BridgeAttest`, 9.00000000 zUSD each; relayer order BSC, SOL, TRX, ETH): BSC block 4686 `f74d8ba08c1621337e58b57fe94bba93f893fec674e37c199553728cde5e8376`, SOL block 4798 `1c7cc5b4dcf50639ad7fd041f6064793287091709f320945d558f4db6c55b6e3`, TRX block 4907 `c2a26eec92756946241b5e6c59c46a3a6645e5c92472f3e221e06d9d9fc74aaa`, ETH block 5432 `329cce2a1818a3cc3f4b60b5e2f13c52bb077fce7ffb34c5a6317b01db095fcd`. End state, audited on mainnet by `rand-bridge-audit`: `total_supply` 3600000000 == Σ `locked` (900000000 on each of chains 2/3/4/5 USDT), custody − locked = 0.
 
 **The guardian-set rotation is on hold by the user's decision (2026-09-20): the bridge stays on
-guardian set 0 until the user says otherwise.** The set-1 ECDSA and PQ keys already generated
-(`~/.rand-bridge/mainnet-guardian-set1/`, `~/.rand-bridge/mainnet-pq-set1/`) exist but are unused;
+guardian set 0 until the user says otherwise.** The set-1 ECDSA keys already generated
+(`~/.rand-bridge/mainnet-guardian-set1/`) exist but are unused; the PQ keys of
+`~/.rand-bridge/mainnet-pq-set1/` ARE in use — they are chain 14's `pq_guardians` and co-sign every mint;
 `bridge.pq_guardians` in the chain-14 genesis remains index-aligned with set 1 while the chain runs
 on set 0's signatures, per the ordering note in the cut runbook's Open Questions §1.
 
