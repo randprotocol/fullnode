@@ -1194,6 +1194,19 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
+### 2026-09-20 — requests are metered per client address
+
+Node-side only (audit v3, RPC-2 / decision D13). A client address gets **120 requests in a burst**,
+refilling at **30 a second**; a batch spends one token per request object it carries, because a
+batch is a request amplifier and the batch cap bounds one batch rather than the rate. Over the
+allowance the node answers **HTTP 429** whose body is an ordinary JSON-RPC error object
+(`-32000`, *"rate limited: …"*), so a client that speaks only JSON-RPC can read it. **Loopback is
+exempt**, so a node's own explorer and the operator's tooling are unaffected.
+
+This is a meter, not an authentication boundary: it bounds what one address can queue in front of
+the node's other work. The expensive reads keep their own bound on top — at most two witness tree
+rebuilds run at a time per node.
+
 ### 2026-09-20 — the viewing-key methods are loopback-only, and a key can be removed
 
 Node-side only; no consensus, ledger or wire change (audit v3, VK-1/2/3).
