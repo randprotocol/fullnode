@@ -453,6 +453,12 @@ struct Node {
     /// blocks we hold above the head turn out not to be the ancestors of what peers are serving
     /// (review C2).
     sync_from_committed: bool,
+    /// The height the outstanding sync request asked from. A batch is judged against *this*, not
+    /// against whatever the tree looks like when the answer lands (review round 2, N1): the two
+    /// disagree exactly when the fallback above fired, so judging by the tree threw away the very
+    /// answer the fallback asked for and left the node alternating between two useless requests
+    /// forever.
+    sync_asked_from: Option<u64>,
     /// Sync batch requests that *failed*: a wire or codec error, a give-up past the wire timeout,
     /// or a batch we asked for and could not apply. Surfaced in `rand status`, because the
     /// failure mode this counts was invisible on chain 8.
@@ -841,6 +847,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         sync_inflight: None,
         sync_batch: SYNC_BATCH,
         sync_from_committed: false,
+        sync_asked_from: None,
         sync_failures: 0,
         sync_late_batches: 0,
         fetch_inflight: HashMap::new(),
@@ -1683,6 +1690,7 @@ impl Node {
             );
             self.sync_failures += 1;
             self.sync_inflight = None;
+            self.sync_asked_from = None;
         }
         // Ask above what we *hold*, not above what we have committed (review C2). A batch whose
         // blocks the three-chain rule cannot commit — three blocks over the byte budget is enough,
@@ -1707,6 +1715,7 @@ impl Node {
             let req = SyncRequest::Blocks { from_height: my_height + 1, max: self.sync_batch };
             if let Some(id) = self.net.send_sync_request(peer, req).await {
                 self.sync_inflight = Some((peer, id, Instant::now()));
+                self.sync_asked_from = Some(my_height);
                 return;
             }
             tracing::warn!(%peer, "sync request could not be sent; trying another peer");
@@ -1743,9 +1752,13 @@ impl Node {
             SyncResponse::Blocks(blocks) => {
                 let current = self.sync_inflight.map(|s| s.1) == Some(request_id);
                 let elapsed = self.sync_inflight.map(|(_, _, at)| at.elapsed().as_millis() as u64);
-                // The height this node asked from: the pending tip when its tree is ahead of its
-                // commits (review C2), the committed head otherwise.
-                let my_height = self.hs.pending_tip_height().max(self.hs.committed_height());
+                // The height this node actually asked from (review round 2, N1). Falling back to
+                // the tree's current shape is only right when no request is outstanding: after the
+                // committed-head fallback fired they differ, and judging by the tree ignored the
+                // answer to the request we had just sent.
+                let my_height = self
+                    .sync_asked_from
+                    .unwrap_or_else(|| self.hs.pending_tip_height().max(self.hs.committed_height()));
                 let d = batch_decision(blocks.first().map(|b| b.block.height()), my_height, current);
                 if d.clear_inflight {
                     self.sync_inflight = None;
@@ -1861,6 +1874,7 @@ impl Node {
         // below keeps verifying past it (see the prefix comment above).
         let mut committed_ledger: Option<Ledger> = None;
         let mut committed_recorded: Vec<(u64, ValidatorSet)> = Vec::new();
+        let mut committed_sets: Option<randprotocol_core::consensus::EpochSets> = None;
         let profile = core_profile(&self.gs.fri_profile);
         // The sealed form's coverage map (spec §7): every cover every aggregate in this batch
         // names — checked before each pruned bundle's skip, and the batch is atomic if one
@@ -1991,6 +2005,13 @@ impl Node {
             if accepted.len() == prefix {
                 committed_ledger = Some(ledger.clone());
                 committed_recorded = recorded.clone();
+                // The epoch sets too (review round 2, N2). A set derived while verifying the
+                // *tail* must not reach `resume`: the replica would then already hold it, so when
+                // that epoch's first block later commits through the live path it emits no
+                // `RecordEpochSet` and the set is never written to RocksDB. Silent until the next
+                // restart, where `verify_chain` finds no stored set for that epoch, truncates to
+                // before the boundary and resyncs.
+                committed_sets = Some(sets.clone());
             }
         }
         // Everything verified. Now split: the prefix commits, the rest goes to the live path.
@@ -2010,6 +2031,7 @@ impl Node {
         }
         let ledger = committed_ledger.expect("the prefix is non-empty, so its ledger was taken");
         let recorded = committed_recorded;
+        let sets = committed_sets.expect("the prefix is non-empty, so its epoch sets were taken");
         self.storage.commit(&accepted, &ledger, &recorded, self.executor.as_ref())?;
         for cb in &accepted {
             tracing::info!("synced block {} ({} txs)", cb.block.height(), cb.block.transactions.len());
@@ -2069,9 +2091,11 @@ impl Node {
                     // change). Asking above that branch would fetch blocks we can never link, so
                     // the next request goes back to the committed head (review C2).
                     tracing::debug!(
-                        "synced block {height} has unknown parent {parent:?}; syncing from the committed head again"
+                        "synced block {height} has unknown parent {parent:?}; fetching it and syncing from the committed head again"
                     );
                     self.sync_from_committed = true;
+                    let acts = self.fetch_block(parent).await;
+                    self.handle_actions(acts).await?;
                     break;
                 }
                 Err(e) => {

@@ -75,7 +75,9 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         alloc: Vec::new(),
         faucet: true,
         confidential: true,
-        fri_profile: "production".into(),
+        // The admitted shape below is a Test-profile one, so the chain must say so too: a
+        // mismatch is refused at genesis (audit v3, CHAIN9-1).
+        fri_profile: "test".into(),
         hc_bundle: word8_to_hex(&[3; 8]),
         epoch_blocks,
         max_program_words: None,
@@ -849,32 +851,54 @@ fn a_resumed_validator_keeps_its_lock() {
     );
     assert_eq!(sim.nodes[victim].locked_qc().block_hash, locked_before.block_hash);
 
-    // The field is not the point; the withheld vote is (review M5). A proposal on a branch that
-    // does not extend the locked block, justified by a QC older than the lock, must get no vote
-    // from the restarted replica — which is exactly the vote a conflicting QC would need.
-    let parent = sim.nodes[victim].block(&sim.nodes[victim].committed_hash()).cloned().expect("head in tree");
+    // The field is not the point; the withheld vote is (review M5, and round 2's T1 — the first
+    // version of this assertion could not fail, because its hand-built block justified with a
+    // genesis QC that `on_proposal` refuses as BadJustify long before `try_vote` runs, and an
+    // `unwrap_or_default` hid the refusal).
+    //
+    // So: a real, valid proposal on the committed head, justified by the head's own certificate —
+    // which is *older* than this replica's lock. The replica holds the locked block no longer (a
+    // restart drops the tree above the head), so it cannot check that this branch extends what it
+    // promised, and it must withhold the vote and fetch the locked block instead.
+    let head = sim.committed[victim].last().expect("the chain committed above").clone();
+    let parent = head.block.clone();
+    let height = parent.height() + 1;
     let view = sim.nodes[victim].view();
-    let leader = sim.nodes[victim].leader(view);
-    let li = sim.addr_to_idx[&leader];
+    let li = sim.addr_to_idx[&sim.nodes[victim].leader(view)];
+    let proposer = sim.keys[li].public_key().clone();
+    let proposer_addr = proposer.address();
+    // The state the block must publish, built the way a proposer builds it.
+    let mut after = sim.nodes[victim].committed_ledger().clone();
+    after.set_height(height);
+    after.set_timestamp_ms(sim.now);
+    after.apply_transactions(&[], &proposer_addr, &StubExecutor).expect("an empty block applies");
+    after.close_block(height, &proposer_addr);
     let header = crate::types::BlockHeader {
-        height: parent.height() + 1,
+        height,
         view,
         parent: parent.hash(),
-        proposer: sim.keys[li].public_key().clone(),
+        proposer,
         timestamp_ms: sim.now,
-        tx_root: Hash::ZERO,
-        state_root: parent.header.state_root,
-        // Older than the lock: the replica may only vote if the block extends what it is locked on.
-        justify: QuorumCertificate::genesis(sim.nodes[victim].committed_hash()),
+        tx_root: Block::tx_root(&[]),
+        state_root: after.state_root(),
+        justify: head.qc.clone(),
     };
     let conflicting = Block::sign(header, vec![], &sim.keys[li]);
-    let acts = sim.nodes[victim].on_proposal(conflicting, sim.now).unwrap_or_default();
+    let locked_hash = sim.nodes[victim].locked_qc().block_hash;
+    assert!(!sim.nodes[victim].has_block(&locked_hash), "the restart dropped the locked block");
+    let acts = sim.nodes[victim]
+        .on_proposal(conflicting, sim.now)
+        .expect("a well-formed proposal on the committed head is accepted");
     assert!(
         !acts.iter().any(|a| matches!(
             a,
             Action::Broadcast(ConsensusMessage::Vote(_)) | Action::SendTo(_, ConsensusMessage::Vote(_))
         )),
-        "a restarted replica voted against its own lock"
+        "a restarted replica voted on a branch it cannot check against its own lock"
+    );
+    assert!(
+        acts.iter().any(|a| matches!(a, Action::FetchBlock(h) if *h == locked_hash)),
+        "the replica withheld the vote without asking for the block that would release it: {acts:?}"
     );
 }
 
@@ -1165,7 +1189,9 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         alloc: Vec::new(),
         faucet: true,
         confidential: true,
-        fri_profile: "production".into(),
+        // The admitted shape below is a Test-profile one, so the chain must say so too: a
+        // mismatch is refused at genesis (audit v3, CHAIN9-1).
+        fri_profile: "test".into(),
         hc_bundle: word8_to_hex(&[3; 8]),
         epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words: None,
@@ -1606,7 +1632,7 @@ fn aggregation_node_with(
         subsidy_base: 100 * crate::types::UNITS_PER_RAND,
         halving_blocks: 210_000,
         window: 256,
-        admitted_shapes: vec![AdmittedShape { shape, hc: Hash::digest(b"the bundle guest"), aggregate_program_digest: [1; 4] }],
+        admitted_shapes: vec![AdmittedShape { shape, hc: Hash::digest(b"the bundle guest"), aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap() }],
     };
     let genesis = Genesis {
         chain_id: 1,
@@ -1619,7 +1645,9 @@ fn aggregation_node_with(
         alloc: Vec::new(),
         faucet: true,
         confidential: true,
-        fri_profile: "production".into(),
+        // The admitted shape below is a Test-profile one, so the chain must say so too: a
+        // mismatch is refused at genesis (audit v3, CHAIN9-1).
+        fri_profile: "test".into(),
         hc_bundle: word8_to_hex(&[3; 8]),
         epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words: None,

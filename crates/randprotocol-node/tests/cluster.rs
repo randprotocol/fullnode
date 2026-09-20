@@ -2001,6 +2001,188 @@ fn certified_chain(
     out
 }
 
+/// Review round 2, N2: an epoch set derived while verifying a batch's uncommitted tail is still
+/// written to storage when that block commits.
+///
+/// `apply_synced` verifies the whole batch, which derives the set for any epoch starting inside it
+/// — tail included. Handing that map to `resume` made the replica already hold the set, so when the
+/// epoch's first block later committed through the live path it emitted no `RecordEpochSet` and the
+/// set never reached RocksDB. Silent until the next restart, where `verify_chain` finds no stored
+/// set for that epoch, truncates to before the boundary and resyncs.
+///
+/// The shape that triggers it: four-block epochs and a peer serving four blocks at a time, so the
+/// first batch is [1, 2, 3, 4] — the rule commits 1 and 2, and the boundary block 4 sits in the
+/// tail, verified but uncommitted. Blocks 5 and 6 then commit 3 and 4 through the live path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_epoch_set_from_a_batchs_tail_is_recorded_when_its_block_commits() {
+    use randprotocol_node::network::{self, GossipMessage, NetworkEvent, Status, SyncRequest, SyncResponse};
+
+    let v = Keypair::from_seed([95; 32]).unwrap();
+    let mut gen = genesis(std::slice::from_ref(&v));
+    gen.epoch_blocks = 4;
+    let gs = gen.build(&ZkExecutor::new(FriProfile::Test)).expect("genesis builds");
+    // Eight blocks: the rule commits a block once its great-grandchild lands, so block 4 needs
+    // block 7 before it is final.
+    let chain = certified_chain(&gs, &[1, 2, 3, 4, 5, 6, 7, 8], &v, &[&v]);
+    let head_hash = chain.last().unwrap().block.hash();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("genesis.json"), gen.to_json()).unwrap();
+    let victim = start_in(dir, &Keypair::from_seed([96; 32]).unwrap(), vec![], false).await;
+    let victim_addr = victim.handle.listen_addrs[0]
+        .clone()
+        .with(libp2p::multiaddr::Protocol::P2p(victim.handle.network.local_peer_id));
+
+    let (peer, mut rx) = network::start(
+        network::NetworkConfig {
+            chain_id: gen.chain_id,
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            bootstrap: vec![victim_addr],
+            enable_mdns: false,
+            limits: Default::default(),
+        },
+        [97u8; 32],
+    )
+    .await
+    .unwrap();
+    let handle = peer.clone();
+    tokio::spawn(async move {
+        let status = Status { height: 8, head_hash, view: 8 };
+        let mut ticker = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => peer.broadcast(GossipMessage::Status(status.clone())).await,
+                ev = rx.recv() => match ev {
+                    Some(NetworkEvent::SyncRequest { channel, request, .. }) => {
+                        // Four at a time: the byte budget's shape, and what puts an epoch boundary
+                        // in a batch's tail.
+                        let response = match request {
+                            SyncRequest::Blocks { from_height, .. } => SyncResponse::Blocks(
+                                chain.iter().filter(|cb| cb.block.height() >= from_height).take(4).cloned().collect(),
+                            ),
+                            SyncRequest::BlockByHash(h) => SyncResponse::Block(
+                                chain.iter().find(|cb| cb.block.hash() == h).map(|cb| cb.block.clone()),
+                            ),
+                        };
+                        peer.send_sync_response(channel, response).await;
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+            }
+        }
+    });
+
+    // Block 4 starts epoch 1, and it commits through the live path after 5 and 6 arrive.
+    wait_for("the victim to commit past the epoch boundary", Duration::from_secs(60), || {
+        victim.handle.status.read().unwrap().height >= 4
+    })
+    .await;
+    let stored = victim.handle.storage.clone();
+    assert!(
+        stored.epoch_set(1).unwrap().is_some(),
+        "epoch 1's set was never written: a restart would find it missing, truncate and resync"
+    );
+    // And what the next startup actually runs must be happy with the store.
+    let check = stored
+        .verify_chain(&gs, randprotocol_node::storage::VerifyMode::Full, &ZkExecutor::new(FriProfile::Test))
+        .unwrap();
+    assert_eq!(check.problem, None, "verify_chain would truncate this store at the next restart");
+
+    handle.shutdown().await;
+    victim.handle.shutdown().await;
+}
+
+/// Review round 2, N1: a node whose tree holds a dead-end block still rejoins.
+///
+/// The C2 fallback asks from the committed head when a served block's parent is unknown — the case
+/// where the branch this node holds above its head is one the fleet abandoned. That fallback was
+/// inert: the request went out from the committed head while the answer was judged against the
+/// pending tip, so the batch was ignored, the flag was already spent, and the node alternated
+/// between two useless requests forever. No attacker needed: a node cut off right after taking a
+/// proposal the fleet later abandoned never rejoined until it was restarted.
+///
+/// Here the victim is fed an abandoned block first, then offered the real chain by a peer that
+/// serves from whatever height it is asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_holding_an_abandoned_block_rejoins_the_real_chain() {
+    use randprotocol_node::network::{self, GossipMessage, NetworkEvent, Status, SyncRequest, SyncResponse};
+
+    let v = Keypair::from_seed([91; 32]).unwrap();
+    let gen = genesis(std::slice::from_ref(&v));
+    let gs = gen.build(&ZkExecutor::new(FriProfile::Test)).expect("genesis builds");
+    // The chain the fleet committed, and a block at the same height on a branch it abandoned: both
+    // are real, certified and signed by the leader — that is what a view change leaves behind.
+    let real = certified_chain(&gs, &[1, 2, 3, 4, 5, 6], &v, &[&v]);
+    let abandoned = certified_chain(&gs, &[9], &v, &[&v]);
+    let head_hash = real.last().unwrap().block.hash();
+
+    let victim = start_node(&Keypair::from_seed([92; 32]).unwrap(), &gen, vec![], false).await;
+    let victim_addr = victim.handle.listen_addrs[0]
+        .clone()
+        .with(libp2p::multiaddr::Protocol::P2p(victim.handle.network.local_peer_id));
+
+    // The first peer hands over only the abandoned block, which the victim keeps as a pending
+    // block — its tree is now one block above its committed head, on a branch going nowhere.
+    let (stale, stale_served) =
+        lying_peer(gen.chain_id, vec![victim_addr.clone()], 1, abandoned[0].block.hash(), abandoned).await;
+    wait_for("the victim to take the abandoned block", Duration::from_secs(30), || {
+        stale_served.load(std::sync::atomic::Ordering::Relaxed) > 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    stale.shutdown().await;
+
+    // Now the real chain, from a peer that answers whatever height it is asked for.
+    let (peer, mut rx) = network::start(
+        network::NetworkConfig {
+            chain_id: gen.chain_id,
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            bootstrap: vec![victim_addr],
+            enable_mdns: false,
+            limits: Default::default(),
+        },
+        [93u8; 32],
+    )
+    .await
+    .unwrap();
+    let handle = peer.clone();
+    tokio::spawn(async move {
+        let status = Status { height: 6, head_hash, view: 6 };
+        let mut ticker = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => peer.broadcast(GossipMessage::Status(status.clone())).await,
+                ev = rx.recv() => match ev {
+                    Some(NetworkEvent::SyncRequest { channel, request, .. }) => {
+                        let response = match request {
+                            SyncRequest::Blocks { from_height, .. } => SyncResponse::Blocks(
+                                real.iter().filter(|cb| cb.block.height() >= from_height).cloned().collect(),
+                            ),
+                            // A by-hash fetch: the victim asking for a parent it does not hold.
+                            SyncRequest::BlockByHash(h) => SyncResponse::Block(
+                                real.iter().find(|cb| cb.block.hash() == h).map(|cb| cb.block.clone()),
+                            ),
+                        };
+                        peer.send_sync_response(channel, response).await;
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+            }
+        }
+    });
+
+    // Before the fix the victim asks from the abandoned block's height forever and never commits.
+    wait_for("the victim to rejoin the real chain", Duration::from_secs(60), || {
+        victim.handle.status.read().unwrap().height >= 3
+    })
+    .await;
+
+    handle.shutdown().await;
+    victim.handle.shutdown().await;
+}
+
 /// Review C2: a node served batches too short to prove a commit still reaches the tip.
 ///
 /// Three blocks over the byte budget is ordinary load on chain 14 — about eighteen bundle proofs —
