@@ -184,11 +184,16 @@ pub enum Action {
     FetchBlock(Hash),
     /// Persist before executing any later action in the same batch.
     PersistSafety(SafetyState),
-    /// A three-chain committed a block that does not descend from this replica's committed head:
-    /// either the set finalized a branch conflicting with what this node already treats as final,
-    /// or this node's own committed history is wrong. Either way its answers about finality cannot
-    /// be trusted from here on, so the node layer stops rather than serving them (audit v3, the
-    /// CON-3 candidate: this used to be a log line and a `return`).
+    /// A three-chain committed a block that does not descend from this replica's committed head.
+    /// Its answers about finality cannot be trusted from here on, so the node layer stops rather
+    /// than serving them (audit v3, the CON-3 candidate: this used to be a log line and a
+    /// `return`).
+    ///
+    /// What it does **not** do is detect conflicting finality in general (review M1). The tree
+    /// holds only descendants of the committed head, so a genuinely conflicting branch shows up
+    /// earlier and elsewhere — as an unknown parent, an orphan, or a refused sync batch — and this
+    /// arm is reached only when the replica's own committed head is not where its tree says it is.
+    /// It is the last check on an invariant, not a detector for a forked chain.
     SafetyViolation { committed: Hash, attempted: Hash },
 }
 
