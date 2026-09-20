@@ -921,12 +921,63 @@ mod tests {
         }
         if with_aggregators {
             buf.extend_from_slice(aggregators_root(l.aggregators()).as_bytes());
+            // The proving-share bucket, committed beside the register (audit v3, AGG-4): written
+            // out here the documented way, so drift in the implementation's construction fails
+            // against this rather than against a hash pasted from it.
+            let unsealed: Vec<Hash> = l
+                .unsealed_fees()
+                .iter()
+                .map(|(tx, (excess, proposer, until))| {
+                    let mut leaf = Vec::new();
+                    leaf.extend_from_slice(tx.as_bytes());
+                    leaf.extend_from_slice(&excess.to_le_bytes());
+                    leaf.extend_from_slice(&proposer.0);
+                    leaf.extend_from_slice(&until.to_le_bytes());
+                    Hash::digest_domain(b"rand-unsealed-leaf-1", &leaf)
+                })
+                .collect();
+            buf.extend_from_slice(merkle_root(&unsealed).as_bytes());
         }
         Hash::digest_domain(domain, &buf)
     }
 
     /// The absolute gate: an aggregation-less chain's root is today's, computed exactly the way
     /// it is computed now — and a gated chain's is a different domain's, with the component in.
+    /// Audit v3, AGG-4: the proving-share bucket decides who is paid and which bundles an
+    /// aggregate may cover, so it is consensus state and belongs under the root. It used to be
+    /// "derived state like supply", outside both the root and `Ledger`'s equality — so two
+    /// replicas that disagreed about it, one having lost an entry or kept an expired one,
+    /// computed the *same* state root, stayed in consensus, and paid different aggregators.
+    #[test]
+    fn two_ledgers_differing_only_in_the_unsealed_bucket_are_not_equal() {
+        let mut a = ledger();
+        a.set_aggregation(Some(cfg()));
+        let mut b = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a.state_root(), b.state_root());
+
+        // One entry, on one side only: the fee excess of an included bundle.
+        b.bucket_excess(Hash::digest(b"a bundle"), 7, Address([3; 32]), 99);
+        assert_ne!(a, b, "the bucket is outside equality");
+        assert_ne!(a.state_root(), b.state_root(), "the bucket is outside the state root");
+
+        // The same entry on both sides agrees again; a different value in it does not.
+        a.bucket_excess(Hash::digest(b"a bundle"), 7, Address([3; 32]), 99);
+        assert_eq!(a, b);
+        assert_eq!(a.state_root(), b.state_root());
+        a.bucket_excess(Hash::digest(b"a bundle"), 8, Address([3; 32]), 99);
+        assert_ne!(a.state_root(), b.state_root(), "the excess itself is bound");
+        a.bucket_excess(Hash::digest(b"a bundle"), 7, Address([4; 32]), 99);
+        assert_ne!(a.state_root(), b.state_root(), "the proposer is bound");
+        a.bucket_excess(Hash::digest(b"a bundle"), 7, Address([3; 32]), 100);
+        assert_ne!(a.state_root(), b.state_root(), "the expiry is bound");
+
+        // And a chain without the section hashes exactly as it did: the bucket is empty there and
+        // the component is not appended at all.
+        let plain = ledger();
+        assert_eq!(plain.state_root(), manual_state_root(&plain, b"rand-state-2", false));
+    }
+
     #[test]
     fn a_chain_without_the_section_keeps_todays_state_root_byte_for_byte() {
         let l = ledger();
