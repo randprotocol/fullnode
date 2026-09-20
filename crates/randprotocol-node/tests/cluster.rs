@@ -2001,6 +2001,82 @@ fn certified_chain(
     out
 }
 
+/// Review C2: a node served batches too short to prove a commit still reaches the tip.
+///
+/// Three blocks over the byte budget is ordinary load on chain 14 — about eighteen bundle proofs —
+/// and it leaves every batch one or two blocks long. Those blocks cannot commit on their own
+/// evidence, so a node that keeps asking from its committed head would be served the same one or
+/// two blocks forever and never rejoin. Here the peer serves one block per request, always the one
+/// above what the victim already holds, and the victim must still commit the chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_served_one_block_at_a_time_still_reaches_the_tip() {
+    use randprotocol_node::network::{self, GossipMessage, NetworkEvent, Status, SyncRequest, SyncResponse};
+
+    let v = Keypair::from_seed([81; 32]).unwrap();
+    let gen = genesis(std::slice::from_ref(&v));
+    let gs = gen.build(&ZkExecutor::new(FriProfile::Test)).expect("genesis builds");
+    // A real chain of six blocks in consecutive views: the three-chain rule commits four of them.
+    let chain = certified_chain(&gs, &[1, 2, 3, 4, 5, 6], &v, &[&v]);
+    let head_hash = chain.last().unwrap().block.hash();
+
+    let victim = start_node(&Keypair::from_seed([82; 32]).unwrap(), &gen, vec![], false).await;
+    let victim_addr = victim.handle.listen_addrs[0]
+        .clone()
+        .with(libp2p::multiaddr::Protocol::P2p(victim.handle.network.local_peer_id));
+
+    let (peer, mut rx) = network::start(
+        network::NetworkConfig {
+            chain_id: gen.chain_id,
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            bootstrap: vec![victim_addr],
+            enable_mdns: false,
+            limits: Default::default(),
+        },
+        [83u8; 32],
+    )
+    .await
+    .unwrap();
+    let handle = peer.clone();
+    tokio::spawn(async move {
+        let status = Status { height: 6, head_hash, view: 6 };
+        let mut ticker = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => peer.broadcast(GossipMessage::Status(status.clone())).await,
+                ev = rx.recv() => match ev {
+                    Some(NetworkEvent::SyncRequest { channel, request, .. }) => {
+                        // One block per request, whatever was asked for: the byte-budget shape.
+                        let response = match request {
+                            SyncRequest::Blocks { from_height, .. } => SyncResponse::Blocks(
+                                chain
+                                    .iter()
+                                    .find(|cb| cb.block.height() == from_height)
+                                    .cloned()
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                            _ => SyncResponse::Blocks(vec![]),
+                        };
+                        peer.send_sync_response(channel, response).await;
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+            }
+        }
+    });
+
+    // Six blocks in consecutive views commit three: the rule finalises a block's
+    // great-grandparent, so blocks 4, 5 and 6 are the evidence rather than the subject.
+    wait_for("the victim to commit the chain one block at a time", Duration::from_secs(60), || {
+        victim.handle.status.read().unwrap().height >= 3
+    })
+    .await;
+
+    handle.shutdown().await;
+    victim.handle.shutdown().await;
+}
+
 /// Audit v3, CON-1a: a peer serving a *certified* chain cannot make a syncing node finalise it.
 ///
 /// Blocks are certified and then abandoned at every view change, so a quorum certificate per block

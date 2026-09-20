@@ -449,6 +449,10 @@ struct Node {
     /// reset to [`SYNC_BATCH`] after a batch applies, so a batch size the wire cannot carry is
     /// backed away from instead of retried forever.
     sync_batch: u32,
+    /// Ask the next sync from the committed head rather than from the tree's tip: set when the
+    /// blocks we hold above the head turn out not to be the ancestors of what peers are serving
+    /// (review C2).
+    sync_from_committed: bool,
     /// Sync batch requests that *failed*: a wire or codec error, a give-up past the wire timeout,
     /// or a batch we asked for and could not apply. Surfaced in `rand status`, because the
     /// failure mode this counts was invisible on chain 8.
@@ -541,6 +545,9 @@ struct BatchDecision {
 /// in the log to say why. A batch whose first block is exactly our next height continues our chain
 /// whoever asked for it and however late; applying it twice is impossible, because the second copy
 /// no longer starts there. `None` is an empty batch: the peer has nothing past our height.
+/// `my_height` is the highest block this node *holds* — its pending tip, not its committed head —
+/// because a node whose tree is ahead of its commits asks for blocks above the tree (review C2),
+/// and a batch that starts there is the continuation it asked for.
 fn batch_decision(first_height: Option<u64>, my_height: u64, is_current: bool) -> BatchDecision {
     let apply = first_height == Some(my_height + 1);
     BatchDecision { apply, late: apply && !is_current, clear_inflight: is_current }
@@ -823,6 +830,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         last_block_at: Instant::now(),
         sync_inflight: None,
         sync_batch: SYNC_BATCH,
+        sync_from_committed: false,
         sync_failures: 0,
         sync_late_batches: 0,
         fetch_inflight: HashMap::new(),
@@ -1664,7 +1672,18 @@ impl Node {
             self.sync_failures += 1;
             self.sync_inflight = None;
         }
-        let my_height = self.hs.committed_height();
+        // Ask above what we *hold*, not above what we have committed (review C2). A batch whose
+        // blocks the three-chain rule cannot commit — three blocks over the byte budget is enough,
+        // about eighteen bundle proofs on chain 14 — leaves those blocks in the tree as pending.
+        // Asking from the committed head again would fetch the same blocks forever: the node would
+        // hot-loop and never rejoin, and a rolling update that restarts nodes a few hundred blocks
+        // back would take the chain down one node at a time. The blocks above are the proof the
+        // pending ones are waiting for, so that is what to ask for.
+        let my_height = if std::mem::take(&mut self.sync_from_committed) {
+            self.hs.committed_height()
+        } else {
+            self.hs.pending_tip_height().max(self.hs.committed_height())
+        };
         let mut skipped: Vec<PeerId> = skip.into_iter().collect();
         // The starvation shape the sealed-sync stall showed under load: the chain is known to
         // be ahead (some peer's status says so) and nothing is outstanding, yet the obvious
@@ -1712,7 +1731,9 @@ impl Node {
             SyncResponse::Blocks(blocks) => {
                 let current = self.sync_inflight.map(|s| s.1) == Some(request_id);
                 let elapsed = self.sync_inflight.map(|(_, _, at)| at.elapsed().as_millis() as u64);
-                let my_height = self.hs.committed_height();
+                // The height this node asked from: the pending tip when its tree is ahead of its
+                // commits (review C2), the committed head otherwise.
+                let my_height = self.hs.pending_tip_height().max(self.hs.committed_height());
                 let d = batch_decision(blocks.first().map(|b| b.block.height()), my_height, current);
                 if d.clear_inflight {
                     self.sync_inflight = None;
@@ -1797,6 +1818,12 @@ impl Node {
         // them are the ones the server has not committed yet — so they are handed to the live path
         // below as ordinary pending blocks instead, and commit when the chain's next blocks
         // arrive.
+        // A batch that starts above our committed head extends blocks we hold but have not
+        // committed — what `sync_from` asks for once the tree is ahead (review C2). Those parents
+        // live in the replica's tree, not in storage, so the whole batch goes to the live path.
+        if blocks[0].block.height() != self.hs.committed_height() + 1 {
+            return self.offer_pending(blocks).await;
+        }
         // The views that are the *evidence* must themselves be verified, or the evidence is the
         // attacker's (review C1): a peer serving one real certified block followed by two blocks
         // it invented at view+1 and view+2 would otherwise have the real one finalised, because
@@ -2020,6 +2047,17 @@ impl Node {
             let height = cb.block.height();
             match self.hs.on_proposal(cb.block, now_ms()) {
                 Ok(acts) => self.handle_actions(acts).await?,
+                Err(randprotocol_core::consensus::ConsensusError::UnknownParent(parent)) => {
+                    // The blocks we hold above the committed head are not this block's ancestors:
+                    // the branch in our tree is a dead end (its leader was replaced at a view
+                    // change). Asking above that branch would fetch blocks we can never link, so
+                    // the next request goes back to the committed head (review C2).
+                    tracing::debug!(
+                        "synced block {height} has unknown parent {parent:?}; syncing from the committed head again"
+                    );
+                    self.sync_from_committed = true;
+                    break;
+                }
                 Err(e) => {
                     tracing::debug!("synced block {height} not taken by the replica: {e}");
                     break;
