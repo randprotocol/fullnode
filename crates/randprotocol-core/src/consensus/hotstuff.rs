@@ -334,6 +334,13 @@ impl HotStuff {
 
     /// The set of `epoch(high_qc height + 1)`: the one that leads, votes and counts NewView
     /// quorums for the block this replica would build next.
+    /// Which epoch [`current_set`](Self::current_set) is the set for. A replica whose head has
+    /// moved past a boundary and whose `current_epoch` has not is judging votes, new views and
+    /// leaders against a set the chain has left behind (review I3).
+    pub fn current_epoch(&self) -> u64 {
+        self.current_epoch
+    }
+
     pub fn current_set(&self) -> &ValidatorSet {
         &self.current
     }
@@ -360,12 +367,20 @@ impl HotStuff {
     /// `high_qc` whose block this replica cannot obtain leaves the previous set in place; the
     /// fallback in [`fallback_high_qc`](Self::fallback_high_qc) is what resolves that.
     fn refresh_current_set(&mut self) {
-        // A `high_qc` certifying a block we cannot obtain says nothing about the epoch; the
-        // fallback resolves it, and `current_set_epoch_gap` reports nothing in the meantime.
-        let Some(entry) = self.tree.get(&self.high_qc.block_hash) else { return };
-        let next = entry.block.height() + 1;
+        // A `high_qc` certifying a block we do not hold says nothing about the epoch *its* block
+        // sits in — but the committed head does, and it is always in the tree. Before review I3
+        // this returned here, and since `resume` now restores a `high_qc` that is often ahead of
+        // the head and whose block a fresh replica does not have, `current` stayed at the epoch-0
+        // set after every restart and after every sync batch. Harmless while the set never changes,
+        // wrong from the first bond or unbond: votes, new views and leaders would all be judged
+        // against a set the chain has left behind.
+        let anchor = match self.tree.get(&self.high_qc.block_hash) {
+            Some(entry) => (entry.block.height(), self.high_qc.block_hash),
+            None => (self.committed_height, self.committed_hash),
+        };
+        let next = anchor.0 + 1;
         let epoch = self.epoch(next);
-        match self.shared_set_for_height(next, &self.high_qc.block_hash) {
+        match self.shared_set_for_height(next, &anchor.1) {
             Some(set) => {
                 self.current = set;
                 self.current_epoch = epoch;
@@ -383,8 +398,12 @@ impl HotStuff {
     /// resumed past a boundary without the recorded sets. `None` when the two agree, or when the
     /// `high_qc` block is missing and the epoch is simply unknown.
     fn current_set_epoch_gap(&self) -> Option<u64> {
-        let entry = self.tree.get(&self.high_qc.block_hash)?;
-        let want = self.epoch(entry.block.height() + 1);
+        // The same anchor `refresh_current_set` uses, for the same reason (review I3).
+        let height = match self.tree.get(&self.high_qc.block_hash) {
+            Some(entry) => entry.block.height(),
+            None => self.committed_height,
+        };
+        let want = self.epoch(height + 1);
         (want != self.current_epoch).then_some(want)
     }
 

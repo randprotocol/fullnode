@@ -786,6 +786,41 @@ fn a_commit_that_skips_the_committed_head_is_reported_as_a_safety_violation() {
     );
 }
 
+/// Review I3: a resumed replica derives its current validator set from a block it holds.
+///
+/// `resume` restores a `high_qc` that is usually ahead of the committed head, and a fresh replica
+/// holds only the head — so `refresh_current_set`'s old early return left `current` at the epoch-0
+/// set after every restart and every sync batch. On a chain whose set never changes that is
+/// invisible; after the first bond or unbond it means votes, new views and leaders are all judged
+/// against a set the chain has left behind. The set a restarted node holds must be the one for the
+/// epoch its head sits in.
+#[test]
+fn a_resumed_replica_holds_the_set_for_its_heads_epoch() {
+    // Two-block epochs, so a handful of steps carries the chain past several boundaries.
+    let mut sim = setup_epochs(4, 4, 2);
+    for _ in 0..8 {
+        sim.step(vec![]);
+    }
+    let victim = 0;
+    let height = sim.nodes[victim].committed_height();
+    assert!(height >= 4, "the chain crossed at least two epoch boundaries: height {height}");
+    let want_epoch = (height + 1) / 2;
+    assert!(want_epoch > 0, "the head is past epoch 0");
+
+    sim.restart(victim);
+
+    // The epoch, not the set: every epoch of this simulated chain derives the same four
+    // validators, so comparing sets would pass whatever the replica believes. What goes stale is
+    // which epoch it thinks it is in, and on a chain where a bond has changed the register that is
+    // the difference between the right set and a retired one.
+    assert_eq!(
+        sim.nodes[victim].current_epoch(),
+        want_epoch,
+        "a resumed replica still holds epoch {}'s set at height {height}",
+        sim.nodes[victim].current_epoch()
+    );
+}
+
 /// Audit v3 CON-1b: the lock is a promise, and a restart must not break it. A validator locked on
 /// a branch at view v, restarted, must still refuse a proposal on a conflicting branch whose
 /// justify is older than its lock. Before the fix `resume` threw the persisted `locked_qc` away
