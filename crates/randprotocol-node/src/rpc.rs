@@ -335,6 +335,20 @@ pub struct RpcState {
     /// a restart clears them. Nothing else in the process reads it — the scan is lazy, driven by
     /// `rand_getViewingNotes` calls.
     pub viewing: Arc<RwLock<crate::viewing::Registry>>,
+    /// Whether the viewing-key methods answer a caller that is not on loopback. False by default
+    /// (`--rpc-viewing-open` turns it on): the facility exists for this node's own explorer, and
+    /// nothing in the RPC authenticates anyone, so an open port otherwise lets a stranger fill all
+    /// [`crate::viewing::MAX_VIEWING_KEYS`] slots and lock the operator out until a restart, or
+    /// keep scans running against the node (audit v3, VK-3).
+    pub viewing_open: bool,
+}
+
+impl RpcState {
+    /// Whether the caller this task is serving is on loopback. An in-process caller — no address
+    /// set — counts as loopback.
+    fn peer_is_loopback(&self) -> bool {
+        PEER_ADDR.try_with(|addr| addr.ip().is_loopback()).unwrap_or(true)
+    }
 }
 
 #[derive(Deserialize)]
@@ -463,6 +477,9 @@ pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketA
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     let task = tokio::spawn(async move {
+        // `into_make_service_with_connect_info` is what makes the caller's address available to
+        // the handler, which the viewing-key methods' loopback rule needs (audit v3, VK-3).
+        let app = app.into_make_service_with_connect_info::<SocketAddr>();
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("rpc server exited: {e}");
         }
@@ -472,6 +489,30 @@ pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketA
 
 /// One error response object. Built from an `RpcError` so every `-32600` in this file comes from
 /// `RpcError::invalid_request` — including the oversized-body one `rejection_error` already makes.
+tokio::task_local! {
+    /// The address of the caller whose request this task is serving. Set by the HTTP handler and
+    /// by the WebSocket upgrade; unset means an in-process caller (the tests, and anything this
+    /// binary dispatches to itself), which counts as loopback.
+    static PEER_ADDR: SocketAddr;
+}
+
+/// Run `f` as the request from `peer`, so [`RpcState::peer_is_loopback`] can see who is asking
+/// without threading an address through every arm of `dispatch`.
+pub async fn with_peer<F: std::future::Future>(peer: SocketAddr, f: F) -> F::Output {
+    PEER_ADDR.scope(peer, f).await
+}
+
+/// The viewing-key methods answer loopback callers only, unless the operator opened them
+/// (audit v3, VK-3 — decision D5: the facility is for this node's own explorer).
+fn require_loopback(st: &RpcState, method: &str) -> Result<(), RpcError> {
+    if st.viewing_open || st.peer_is_loopback() {
+        return Ok(());
+    }
+    Err(RpcError::rejected(format!(
+        "{method} answers loopback callers only on this node; start it with --rpc-viewing-open to change that"
+    )))
+}
+
 fn error_value(id: Value, e: RpcError) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": e.code, "message": e.message } })
 }
@@ -505,6 +546,7 @@ async fn dispatch_one(st: &RpcState, v: Value) -> Value {
 
 async fn handle(
     State(st): State<RpcState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     // `Result<Json<_>, _>` rather than `Json<_>`: a body axum refuses — over the limit, or not
     // JSON at all — otherwise comes back as a *plain-text* 413 or 400, which no JSON-RPC client can
     // read. `rand send` reported a body over the limit as
@@ -525,7 +567,10 @@ async fn handle(
         }
     };
     // Everything past here parsed, so the HTTP status is 200 and the errors are in the body.
-    let out = match body {
+    // Served inside `with_peer`, so the arms that care who is asking — the viewing-key methods —
+    // can tell a loopback caller from a stranger (audit v3, VK-3).
+    let out = with_peer(peer, async move {
+    match body {
         Value::Array(items) if items.is_empty() => {
             error_value(Value::Null, RpcError::invalid_request("invalid request: empty batch"))
         }
@@ -544,7 +589,9 @@ async fn handle(
         }
         obj @ Value::Object(_) => dispatch_one(&st, obj).await,
         _ => error_value(Value::Null, RpcError::invalid_request("invalid request: expected an object or an array")),
-    };
+    }
+    })
+    .await;
     (StatusCode::OK, Json(out))
 }
 
@@ -1473,6 +1520,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // RPC layer has no type for a *spend* key, so nothing here can move value. Imports are
         // in memory only; a restart clears them.
         "rand_importViewingKey" => {
+            require_loopback(st, "rand_importViewingKey")?;
             let nk = parse_word8(p, 0, "viewing_key")?;
             let rescan_from_height: u64 = match p.get(1) {
                 None | Some(Value::Null) => 0,
@@ -1493,6 +1541,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // the cursor by at most `viewing::MAX_SCAN_ROWS` leaves (the rescan-range cap), so one
         // request can never make the node re-walk unbounded history.
         "rand_getViewingNotes" => {
+            require_loopback(st, "rand_getViewingNotes")?;
             let nk = parse_word8(p, 0, "viewing_key")?;
             let from_index: u64 = match p.get(1) {
                 None | Some(Value::Null) => 0,
@@ -1501,8 +1550,16 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let limit = parse_limit(p, 2)?;
             let (viewing, storage) = (st.viewing.clone(), st.storage.clone());
             blocking_viewing(move || {
-                let mut reg = viewing.write().unwrap_or_else(|e| e.into_inner());
-                let import = reg.get_mut(&nk).ok_or(ViewingError::NotImported)?;
+                // The registry's lock is held for the lookup alone; the scan below runs under this
+                // key's own lock (audit v3, VK-1). Holding the registry across the scan blocked
+                // every other viewing call *and* the node loop's `publish_status`, so one scan
+                // stalled consensus for as long as it ran.
+                let handle = {
+                    let reg = viewing.read().unwrap_or_else(|e| e.into_inner());
+                    reg.handle(&nk).ok_or(ViewingError::NotImported)?
+                };
+                let mut guard = handle.lock().unwrap_or_else(|e| e.into_inner());
+                let import = &mut *guard;
                 crate::viewing::advance(&storage, import, crate::viewing::MAX_SCAN_ROWS)?;
                 let next_index = storage.notes_count()?;
                 let mut notes = Vec::new();
@@ -1531,6 +1588,16 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 }))
             })
             .await
+        }
+        // The other half of holding a key: giving it back. Without this an operator could not stop
+        // a scan or free a slot short of restarting the node, and the key stayed in memory for the
+        // process's life (audit v3, VK-2).
+        "rand_removeViewingKey" => {
+            require_loopback(st, "rand_removeViewingKey")?;
+            let nk = parse_word8(p, 0, "viewing_key")?;
+            let mut reg = st.viewing.write().unwrap_or_else(|e| e.into_inner());
+            let removed = reg.remove(&nk);
+            Ok(json!({ "removed": removed, "viewing_keys": reg.len() }))
         }
         // ---- confidential computation ----
         "rand_getProgram" => {
@@ -2309,6 +2376,7 @@ mod tests {
             }
         });
         RpcState {
+            viewing_open: false,
             storage,
             status: Arc::new(RwLock::new(NodeStatus::default())),
             node: tx,
@@ -2330,6 +2398,11 @@ mod tests {
 
     async fn ok(st: &RpcState, method: &str, params: Value) -> Value {
         call(st, method, params).await.unwrap_or_else(|e| panic!("{method}: {}", e.message))
+    }
+
+    /// `call`, as a request from `peer` — what the viewing-key methods' loopback rule reads.
+    async fn call_from(st: &RpcState, peer: &str, method: &str, params: Value) -> Result<Value, RpcError> {
+        with_peer(peer.parse().unwrap(), call(st, method, params)).await
     }
 
     fn nf(n: u8) -> Word8 {
@@ -4705,6 +4778,27 @@ mod tests {
 
     // --------------------------------------------------------- viewing keys
     //
+    /// Audit v3, VK-3 (decision D5: the facility is for this node's own explorer). Nothing in the
+    /// RPC authenticates anyone, so a stranger who could import would fill all 64 slots and lock
+    /// the operator out until a restart, or keep scans running against the node. The methods
+    /// answer loopback only unless the operator opened them.
+    #[tokio::test]
+    async fn viewing_methods_answer_loopback_only_unless_opened() {
+        use crate::viewing::testkit::{key_vk, nk_hex};
+        let (_d, st, _gs) = chain();
+        let nk = nk_hex(&key_vk(1));
+        for method in ["rand_importViewingKey", "rand_getViewingNotes", "rand_removeViewingKey"] {
+            let e = call_from(&st, "203.0.113.9:4000", method, json!([nk])).await.unwrap_err();
+            assert_eq!(e.code, -32000, "{method}");
+            assert!(e.message.contains("loopback"), "{method}: {}", e.message);
+        }
+        // The same call from loopback is served.
+        assert!(call_from(&st, "127.0.0.1:4000", "rand_importViewingKey", json!([nk])).await.is_ok());
+        // And an operator who opened the facility is served from anywhere.
+        let open = RpcState { viewing_open: true, ..st.clone() };
+        assert!(call_from(&open, "203.0.113.9:4000", "rand_importViewingKey", json!([nk])).await.is_ok());
+    }
+
     // Node-side import (`rand_importViewingKey` + `rand_getViewingNotes`, the Zcash
     // `z_importviewingkey` analogue) and the per-transaction disclosure check
     // (`rand_checkTransaction`, Monero's `check_tx_proof`). The fixture chain every case here
@@ -4902,6 +4996,7 @@ mod tests {
         let tx1 = st.storage.block_by_height(1).unwrap().unwrap().transactions[0].clone();
         let (_, Json(v)) = handle(
             State(st.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:9000".parse().unwrap()),
             Ok(Json(json!([
                 { "jsonrpc": "2.0", "id": 1, "method": "rand_importViewingKey", "params": [nk_hex(&key_vk(1))] },
                 { "jsonrpc": "2.0", "id": 2, "method": "rand_getViewingNotes", "params": [nk_hex(&key_vk(1))] },
@@ -4929,6 +5024,7 @@ mod tests {
         let (_d, st, _gs) = chain();
         let (code, Json(v)) = handle(
             State(st.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:9000".parse().unwrap()),
             Ok(Json(json!([
                 { "jsonrpc": "2.0", "id": 1, "method": "rand_chainId", "params": [] },
                 { "jsonrpc": "2.0", "id": "two", "method": "rand_getTreeInfo", "params": [] },
@@ -4946,6 +5042,7 @@ mod tests {
         // A single request object still answers with a single object, exactly as before.
         let (_, Json(one)) = handle(
             State(st.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:9000".parse().unwrap()),
             Ok(Json(json!({ "jsonrpc": "2.0", "id": 9, "method": "rand_chainId", "params": [] }))),
         )
         .await;
@@ -4959,7 +5056,7 @@ mod tests {
     async fn a_malformed_batch_is_one_invalid_request_error() {
         let (_d, st, _gs) = chain();
         let err = |v: Value| async {
-            let (_, Json(r)) = handle(State(st.clone()), Ok(Json(v))).await;
+            let (_, Json(r)) = handle(State(st.clone()), axum::extract::ConnectInfo("127.0.0.1:9000".parse().unwrap()), Ok(Json(v))).await;
             r
         };
 
@@ -4986,6 +5083,7 @@ mod tests {
         let (_d, st, _gs) = chain();
         let (_, Json(v)) = handle(
             State(st.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:9000".parse().unwrap()),
             Ok(Json(json!([
                 { "jsonrpc": "2.0", "method": "rand_chainId", "params": [] },
                 { "jsonrpc": "2.0", "id": null, "method": "rand_chainId", "params": [] }
@@ -5008,6 +5106,7 @@ mod tests {
         let (_d, st, _gs) = chain();
         let (_, Json(v)) = handle(
             State(st.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:9000".parse().unwrap()),
             Ok(Json(json!([
                 { "jsonrpc": "2.0", "id": 4 },                      // no method
                 { "jsonrpc": "2.0", "id": 5, "method": 7 }          // method is not a string
@@ -5032,6 +5131,7 @@ mod tests {
         let (_d, st, _gs) = chain();
         let (code, Json(v)) = handle(
             State(st.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:9000".parse().unwrap()),
             Ok(Json(json!([
                 { "jsonrpc": "2.0", "id": 1, "method": "rand_chainId", "params": [] },
                 7,

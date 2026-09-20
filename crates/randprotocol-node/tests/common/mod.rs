@@ -118,6 +118,7 @@ async fn start_one_validator_with(
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("genesis.json"), genesis_with_aggregation(&key, aggregation).to_json()).unwrap();
     let handle = node::start(NodeConfig {
+        viewing_open: false,
         datadir: dir.path().to_path_buf(),
         seed: *key.seed(),
         listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
@@ -153,6 +154,7 @@ pub async fn serve_heads(capacity: usize) -> (SocketAddr, broadcast::Sender<Head
     // Nothing here sends a `NodeCommand`; the receiver is kept only so the sender stays open.
     let (node_tx, node_rx) = tokio::sync::mpsc::channel(1);
     let state = RpcState {
+        viewing_open: false,
         storage,
         status: Arc::new(RwLock::new(NodeStatus::default())),
         node: node_tx,

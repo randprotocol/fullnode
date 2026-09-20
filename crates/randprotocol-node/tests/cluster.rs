@@ -569,6 +569,7 @@ async fn a_build_whose_bundle_guest_differs_from_genesis_refuses_to_start() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("genesis.json"), gen.to_json()).unwrap();
     let started = node::start(NodeConfig {
+        viewing_open: false,
         datadir: dir.path().to_path_buf(),
         seed: *ks[0].seed(),
         listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],

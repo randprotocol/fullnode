@@ -105,6 +105,7 @@ pub async fn start_in_at(
     block_interval: Duration,
 ) -> TestNode {
     let handle = node::start(NodeConfig {
+        viewing_open: false,
         datadir: dir.path().to_path_buf(),
         seed: *key.seed(),
         listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
