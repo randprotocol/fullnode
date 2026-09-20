@@ -1797,23 +1797,16 @@ impl Node {
         // them are the ones the server has not committed yet — so they are handed to the live path
         // below as ordinary pending blocks instead, and commit when the chain's next blocks
         // arrive.
-        let views: Vec<u64> = blocks.iter().map(|cb| cb.block.view()).collect();
-        let prefix = randprotocol_core::consensus::commit_rule::committed_prefix(&views);
-        let mut blocks = blocks;
-        let pending = blocks.split_off(prefix);
-        if !pending.is_empty() {
-            tracing::debug!(
-                "sync batch: {} block(s) commit by the three-chain rule, {} held for the live path",
-                blocks.len(),
-                pending.len()
-            );
-        }
-        if blocks.is_empty() {
-            // Nothing in this batch proves a commit. Offer what we were served to the replica: a
-            // block whose parent we hold enters the tree and commits through the live rule, which
-            // is also what stops this turning into a re-request loop.
-            return self.offer_pending(pending).await;
-        }
+        // The views that are the *evidence* must themselves be verified, or the evidence is the
+        // attacker's (review C1): a peer serving one real certified block followed by two blocks
+        // it invented at view+1 and view+2 would otherwise have the real one finalised, because
+        // the invented pair sits in the tail this function never checks. So the whole batch is
+        // verified below — every QC, leader, epoch set and execution — and the prefix is computed
+        // over that verified run. A batch with a junk tail fails verification whole and commits
+        // nothing.
+        let prefix = randprotocol_core::consensus::commit_rule::committed_prefix(
+            &blocks.iter().map(|cb| cb.block.view()).collect::<Vec<_>>(),
+        );
         let mut ledger: Ledger = self.hs.committed_ledger().clone();
         let mut head_hash = self.hs.committed_hash();
         let mut head_height = self.hs.committed_height();
@@ -1821,6 +1814,10 @@ impl Node {
         let mut sets = self.hs.epoch_sets().clone();
         let mut recorded: Vec<(u64, ValidatorSet)> = Vec::new();
         let mut accepted = Vec::new();
+        // The ledger and the epoch sets as they stood at the end of the committed prefix; the loop
+        // below keeps verifying past it (see the prefix comment above).
+        let mut committed_ledger: Option<Ledger> = None;
+        let mut committed_recorded: Vec<(u64, ValidatorSet)> = Vec::new();
         let profile = core_profile(&self.gs.fri_profile);
         // The sealed form's coverage map (spec §7): every cover every aggregate in this batch
         // names — checked before each pruned bundle's skip, and the batch is atomic if one
@@ -1945,7 +1942,31 @@ impl Node {
             // from the peer's copy (which the wire does not carry).
             let deposits = ledger.take_deposits();
             accepted.push(CommittedBlock { receipts, deposits, ..cb });
+            // The state that belongs with the committed prefix. Verification runs past it — the
+            // blocks above are this prefix's own proof — but only what the three-chain rule
+            // commits is written, so the ledger written beside it is the one that describes it.
+            if accepted.len() == prefix {
+                committed_ledger = Some(ledger.clone());
+                committed_recorded = recorded.clone();
+            }
         }
+        // Everything verified. Now split: the prefix commits, the rest goes to the live path.
+        let pending = accepted.split_off(prefix);
+        if !pending.is_empty() {
+            tracing::debug!(
+                "sync batch: {} block(s) commit by the three-chain rule, {} verified and held for the live path",
+                accepted.len(),
+                pending.len()
+            );
+        }
+        if accepted.is_empty() {
+            // Nothing in this batch proves a commit. The blocks are verified, so hand them to the
+            // replica: each enters the tree and commits through the live rule once a three-chain
+            // forms over it.
+            return self.offer_pending(pending).await;
+        }
+        let ledger = committed_ledger.expect("the prefix is non-empty, so its ledger was taken");
+        let recorded = committed_recorded;
         self.storage.commit(&accepted, &ledger, &recorded, self.executor.as_ref())?;
         for cb in &accepted {
             tracing::info!("synced block {} ({} txs)", cb.block.height(), cb.block.transactions.len());

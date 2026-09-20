@@ -1890,86 +1890,218 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
     n1.handle.shutdown().await;
 }
 
-/// Audit v3, CON-1a: a peer serving a *certified* chain cannot make a syncing node finalise it.
+/// A peer that answers sync requests with whatever batch it is given, without holding a chain of
+/// its own: the only way to serve blocks a real node would refuse to store (review C1).
 ///
-/// Blocks are certified and then abandoned at every view change, so a QC per block — all the sync
-/// path used to check — is not evidence of a commit. Here a peer's database is seeded by hand with
-/// a chain whose views are 1, 3 and 5: every block carries a real quorum certificate signed by the
-/// chain's only validator, and no three of them sit in consecutive views, so the three-chain rule
-/// commits none of them. The syncing node must stay at genesis rather than take the peer's word.
-///
-/// Before the fix it committed all three and served them as final.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_synced_certified_but_uncommitted_chain_is_not_committed() {
+/// It gossips a Status claiming `height`, which is unsigned — that is the point: choosing who
+/// serves a sync costs an attacker nothing.
+async fn lying_peer(
+    chain_id: u64,
+    bootstrap: Vec<libp2p::Multiaddr>,
+    height: u64,
+    head_hash: Hash,
+    batch: Vec<randprotocol_core::consensus::CommittedBlock>,
+) -> (randprotocol_node::network::NetworkHandle, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let served = std::sync::Arc::new(AtomicUsize::new(0));
+    let served_task = served.clone();
+    use randprotocol_node::network::{self, GossipMessage, NetworkEvent, Status, SyncRequest, SyncResponse};
+    let (peer, mut rx) = network::start(
+        network::NetworkConfig {
+            chain_id,
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            bootstrap,
+            enable_mdns: false,
+            limits: Default::default(),
+        },
+        [91u8; 32],
+    )
+    .await
+    .unwrap();
+    let handle = peer.clone();
+    tokio::spawn(async move {
+        let status = Status { height, head_hash, view: height };
+        let mut ticker = tokio::time::interval(Duration::from_millis(300));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    peer.broadcast(GossipMessage::Status(status.clone())).await;
+                }
+                ev = rx.recv() => match ev {
+                    Some(NetworkEvent::SyncRequest { channel, request, .. }) => {
+                        // Serve the crafted batch for a blocks request; anything else gets nothing.
+                        // Only a *batch* request counts as served: a by-hash fetch gets an empty
+                        // answer, and counting those would let a test assert against a victim that
+                        // never asked for the chain at all.
+                        let response = match request {
+                            SyncRequest::Blocks { .. } => {
+                                served_task.fetch_add(1, Ordering::Relaxed);
+                                SyncResponse::Blocks(batch.clone())
+                            }
+                            _ => SyncResponse::Blocks(vec![]),
+                        };
+                        peer.send_sync_response(channel, response).await;
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+            }
+        }
+    });
+    (handle, served)
+}
+
+/// A chain of `views.len()` blocks on top of `gs`, each certified by a real quorum of `voters`,
+/// each signed by `proposer` — which is the set's leader only when the test wants it to be.
+fn certified_chain(
+    gs: &randprotocol_core::genesis::GenesisState,
+    views: &[u64],
+    proposer: &Keypair,
+    voters: &[&Keypair],
+) -> Vec<randprotocol_core::consensus::CommittedBlock> {
     use randprotocol_core::consensus::CommittedBlock;
     use randprotocol_core::{Block, BlockHeader, QuorumCertificate, Vote};
-    use randprotocol_node::storage::Storage;
+    let mut ledger = gs.ledger.clone();
+    let mut parent = gs.block.clone();
+    let mut parent_view = 0u64;
+    let mut out = Vec::new();
+    for (i, view) in views.iter().copied().enumerate() {
+        let height = i as u64 + 1;
+        ledger.set_height(height);
+        ledger.set_timestamp_ms(height);
+        ledger.record_anchor(height);
+        let header = BlockHeader {
+            height,
+            view,
+            parent: parent.hash(),
+            proposer: proposer.public_key().clone(),
+            timestamp_ms: height,
+            tx_root: Block::tx_root(&[]),
+            state_root: ledger.state_root(),
+            justify: QuorumCertificate {
+                view: parent_view,
+                block_hash: parent.hash(),
+                votes: if parent_view == 0 {
+                    vec![]
+                } else {
+                    voters.iter().map(|k| Vote::sign(parent_view, parent.hash(), k)).collect()
+                },
+            },
+        };
+        let block = Block::sign(header, vec![], proposer);
+        let qc = QuorumCertificate {
+            view,
+            block_hash: block.hash(),
+            votes: voters.iter().map(|k| Vote::sign(view, block.hash(), k)).collect(),
+        };
+        parent = block.clone();
+        parent_view = view;
+        out.push(CommittedBlock { block, pruned: vec![], qc, receipts: vec![], deposits: vec![] });
+    }
+    out
+}
 
+/// Audit v3, CON-1a: a peer serving a *certified* chain cannot make a syncing node finalise it.
+///
+/// Blocks are certified and then abandoned at every view change, so a quorum certificate per block
+/// — all the sync path used to check — is not evidence of a commit. The batch here is real in every
+/// other way: genuine quorum certificates, the right leader, blocks that execute. Only its views
+/// are 1, 3 and 5, so no three of them sit in consecutive views and the three-chain rule commits
+/// none of them.
+///
+/// Before the fix the victim committed all three and served them as final.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_synced_certified_but_uncommitted_chain_is_not_committed() {
     let v = Keypair::from_seed([61; 32]).unwrap();
     let gen = genesis(std::slice::from_ref(&v));
     let gs = gen.build(&ZkExecutor::new(FriProfile::Test)).expect("genesis builds");
+    // Views 1, 3, 5: the leader of each is this one-validator chain's only member.
+    let batch = certified_chain(&gs, &[1, 3, 5], &v, &[&v]);
+    let head_hash = batch.last().unwrap().block.hash();
 
-    // The peer's database: genesis, then three certified blocks at views 1, 3 and 5.
-    let liar_dir = tempfile::tempdir().unwrap();
-    std::fs::write(liar_dir.path().join("genesis.json"), gen.to_json()).unwrap();
-    {
-        let s = Storage::open(liar_dir.path()).unwrap();
-        s.init_genesis(&gs).unwrap();
-        let mut ledger = gs.ledger.clone();
-        let mut parent = gs.block.clone();
-        let mut parent_view = 0u64;
-        let mut chain: Vec<CommittedBlock> = Vec::new();
-        for view in [1u64, 3, 5] {
-            let height = parent.height() + 1;
-            ledger.set_height(height);
-            ledger.set_timestamp_ms(height);
-            ledger.record_anchor(height);
-            let header = BlockHeader {
-                height,
-                view,
-                parent: parent.hash(),
-                proposer: v.public_key().clone(),
-                timestamp_ms: height,
-                tx_root: Block::tx_root(&[]),
-                state_root: ledger.state_root(),
-                justify: QuorumCertificate {
-                    view: parent_view,
-                    block_hash: parent.hash(),
-                    votes: if parent_view == 0 {
-                        vec![]
-                    } else {
-                        vec![Vote::sign(parent_view, parent.hash(), &v)]
-                    },
-                },
-            };
-            let block = Block::sign(header, vec![], &v);
-            let qc = QuorumCertificate {
-                view,
-                block_hash: block.hash(),
-                votes: vec![Vote::sign(view, block.hash(), &v)],
-            };
-            parent = block.clone();
-            parent_view = view;
-            chain.push(CommittedBlock { block, pruned: vec![], qc, receipts: vec![], deposits: vec![] });
-        }
-        s.commit(&chain, &ledger, &[], &ZkExecutor::new(FriProfile::Test)).unwrap();
-        assert_eq!(s.head().unwrap().height, 3, "the peer serves a chain of three certified blocks");
-    }
-
-    // The peer is an observer: it serves its stored chain and proposes nothing.
-    let liar = start_in(liar_dir, &Keypair::from_seed([62; 32]).unwrap(), vec![], false).await;
-    let target = liar.handle.listen_addrs[0]
+    // The control, run first: the very same peer, blocks and plumbing, with views 1, 2, 3 — a
+    // real three-chain. That batch must commit its first block, or this test proves nothing about
+    // the one below (an eclipsed or idle victim would "pass" it for free).
+    let control = certified_chain(&gs, &[1, 2, 3], &v, &[&v]);
+    let control_head = control.last().unwrap().block.hash();
+    let reference = start_node(&Keypair::from_seed([62; 32]).unwrap(), &gen, vec![], false).await;
+    let reference_addr = reference.handle.listen_addrs[0]
         .clone()
-        .with(libp2p::multiaddr::Protocol::P2p(liar.handle.network.local_peer_id));
-    // A fresh node that knows only this peer, and is not a validator, so nothing but the sync can
-    // move its committed head.
-    let victim = start_node(&Keypair::from_seed([63; 32]).unwrap(), &gen, vec![target], false).await;
+        .with(libp2p::multiaddr::Protocol::P2p(reference.handle.network.local_peer_id));
+    let (control_peer, control_served) =
+        lying_peer(gen.chain_id, vec![reference_addr], 3, control_head, control).await;
+    wait_for("the reference node to be served a batch", Duration::from_secs(30), || {
+        control_served.load(std::sync::atomic::Ordering::Relaxed) > 0
+    })
+    .await;
+    wait_for("the reference node to commit the three-chain's first block", Duration::from_secs(30), || {
+        reference.handle.status.read().unwrap().height == 1
+    })
+    .await;
+    control_peer.shutdown().await;
+    reference.handle.shutdown().await;
 
-    // Long enough for several sync rounds against a peer claiming height 3.
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // A victim that is not a validator, so only the sync can move its committed head.
+    let victim = start_node(&Keypair::from_seed([63; 32]).unwrap(), &gen, vec![], false).await;
+    let victim_addr = victim.handle.listen_addrs[0]
+        .clone()
+        .with(libp2p::multiaddr::Protocol::P2p(victim.handle.network.local_peer_id));
+    let (liar, served) = lying_peer(gen.chain_id, vec![victim_addr], 3, head_hash, batch).await;
+
+    // The assertion is only worth anything once the victim has actually been served the batch.
+    wait_for("the victim to ask the lying peer for blocks", Duration::from_secs(30), || {
+        served.load(std::sync::atomic::Ordering::Relaxed) > 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     let height = victim.handle.status.read().unwrap().height;
     assert_eq!(height, 0, "a certified but uncommitted chain was committed by sync");
 
+    liar.shutdown().await;
     victim.handle.shutdown().await;
-    liar.handle.shutdown().await;
+}
+
+/// Review C1: the blocks whose views are the *evidence* for a commit must be verified too.
+///
+/// The batch is one real, certified block followed by two the peer invented at the next two views.
+/// The invented pair names the set's leader but is signed by a key outside the set, and its quorum
+/// certificates carry that key's votes. The three-chain rule reads views 1, 2, 3 and would commit
+/// the real block on the strength of them.
+///
+/// Before the fix only the prefix was verified, so the invented pair was never checked and the
+/// real block was finalised on evidence the peer made up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_whose_evidence_blocks_are_junk_commits_nothing() {
+    let v = Keypair::from_seed([71; 32]).unwrap();
+    let forger = Keypair::from_seed([72; 32]).unwrap();
+    let gen = genesis(std::slice::from_ref(&v));
+    let gs = gen.build(&ZkExecutor::new(FriProfile::Test)).expect("genesis builds");
+
+    // Block 1 at view 1: real, certified by the validator. Blocks 2 and 3 at views 2 and 3: the
+    // same shape, signed and voted by a key the set does not contain.
+    let real = certified_chain(&gs, &[1], &v, &[&v]);
+    let forged = certified_chain(&gs, &[1, 2, 3], &v, &[&forger]);
+    let mut batch = real;
+    batch.extend(forged.into_iter().skip(1));
+    let head_hash = batch.last().unwrap().block.hash();
+
+    let victim = start_node(&Keypair::from_seed([74; 32]).unwrap(), &gen, vec![], false).await;
+    let victim_addr = victim.handle.listen_addrs[0]
+        .clone()
+        .with(libp2p::multiaddr::Protocol::P2p(victim.handle.network.local_peer_id));
+    let (liar, served) = lying_peer(gen.chain_id, vec![victim_addr], 3, head_hash, batch).await;
+
+    wait_for("the victim to ask the lying peer for blocks", Duration::from_secs(30), || {
+        served.load(std::sync::atomic::Ordering::Relaxed) > 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        victim.handle.status.read().unwrap().height,
+        0,
+        "a block was finalised on evidence the peer invented"
+    );
+
+    liar.shutdown().await;
+    victim.handle.shutdown().await;
 }
