@@ -217,6 +217,21 @@ pub struct NoteRow {
 
 pub struct Storage {
     db: DB,
+    /// The commitment tree as last built, with the leaf count it was built from (audit v3, RPC-1).
+    ///
+    /// Every witness used to rebuild the whole tree from every leaf — the most expensive read this
+    /// node serves, and unbounded in the chain's size — so a wallet proving a two-input bundle paid
+    /// for two full rebuilds, and a hundred callers paid for a hundred. The tree only changes when
+    /// a block commits, so it is built once per change and shared: the leaf count is the version,
+    /// and `truncate_to` lowering it invalidates the cache exactly as a commit raising it does.
+    ///
+    /// One tree, a few tens of MB at a million notes. `MAX_CONCURRENT_WITNESS_BUILDS` still caps
+    /// how many rebuilds can be in flight, and this mutex means two callers that arrive together
+    /// on a stale cache do one rebuild between them rather than one each.
+    tree_cache: std::sync::Mutex<Option<(u64, std::sync::Arc<FullTree>)>>,
+    /// How many times the tree has actually been rebuilt, for the tests that assert the cache is
+    /// doing its job.
+    tree_builds: std::sync::atomic::AtomicUsize,
 }
 
 /// What [`Storage::drop_receipts_index`] found and removed: whether the `receipts_by_program`
@@ -375,7 +390,11 @@ impl Storage {
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()));
         let db = DB::open_cf_descriptors(&opts, &db_path, cfs)?;
-        let storage = Storage { db };
+        let storage = Storage {
+            db,
+            tree_cache: std::sync::Mutex::new(None),
+            tree_builds: std::sync::atomic::AtomicUsize::new(0),
+        };
         storage.backfill_receipts_index()?;
         Ok(storage)
     }
@@ -805,20 +824,40 @@ impl Storage {
     /// leaf level first, the layout the bundle guest's `MERKLE_VERIFY` reads. `None` past the
     /// end of the tree. Rebuilds a `FullTree` from `notes`, so it is `O(leaves)`.
     pub fn witness(&self, index: u64, executor: &dyn ConfidentialExecutor) -> Result<Option<(Word8, [Word8; DEPTH])>> {
-        let leaves = self.leaves()?;
-        if index >= leaves.len() as u64 {
+        let tree = self.cached_tree(executor)?;
+        if index >= tree.len() as u64 {
             return Ok(None);
         }
-        let tree = FullTree::new(leaves, executor);
         Ok(tree.path(index).map(|p| (tree.root(), p)))
+    }
+
+    /// The commitment tree, built from every leaf only when the leaf count has moved since the
+    /// last build (audit v3, RPC-1). See [`Storage::tree_cache`].
+    fn cached_tree(&self, executor: &dyn ConfidentialExecutor) -> Result<std::sync::Arc<FullTree>> {
+        let len = self.notes_count()?;
+        let mut cache = self.tree_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((built_at, tree)) = cache.as_ref() {
+            if *built_at == len {
+                return Ok(tree.clone());
+            }
+        }
+        let tree = std::sync::Arc::new(FullTree::new(self.leaves()?, executor));
+        self.tree_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *cache = Some((len, tree.clone()));
+        Ok(tree)
+    }
+
+    /// How many full tree builds this `Storage` has done. Tests only: it is the instrument for
+    /// "the cache is doing its job", which is otherwise invisible from the outside.
+    pub fn tree_builds(&self) -> usize {
+        self.tree_builds.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Paths for many leaves from one tree build (`rand_getWitnesses`); `None` for an index past
     /// the tree. The root is the same for every path, so it is returned once.
     pub fn witnesses(&self, indices: &[u64], executor: &dyn ConfidentialExecutor) -> Result<(Word8, Vec<Option<[Word8; DEPTH]>>)> {
-        let leaves = self.leaves()?;
-        let len = leaves.len() as u64;
-        let tree = FullTree::new(leaves, executor);
+        let tree = self.cached_tree(executor)?;
+        let len = tree.len() as u64;
         let paths = indices.iter().map(|&i| if i < len { tree.path(i) } else { None }).collect();
         Ok((tree.root(), paths))
     }
@@ -3881,6 +3920,60 @@ mod tests {
         assert_eq!(s.witness(6, &StubExecutor).unwrap(), None);
     }
 
+    /// Audit v3, RPC-1: the tree is built once per change, not once per read.
+    ///
+    /// Every witness used to rebuild the whole tree from every leaf, so a wallet proving a
+    /// two-input bundle paid for two full rebuilds and a hundred callers paid for a hundred — the
+    /// amplification the concurrency cap bounds but does not remove. The cache is keyed on the
+    /// leaf count, so every path that moves the tree invalidates it: a commit that appends, and a
+    /// truncate that rewinds.
+    #[test]
+    fn the_tree_is_built_once_per_change_and_its_paths_stay_correct() {
+        let (_d, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        let proposer = key(1);
+        let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+        let tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &proposer);
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let ledger_at_1 = ledger.clone();
+
+        let check_all = |s: &Storage, root: Word8, n: u64| {
+            for index in 0..n {
+                let (r, path) = s.witness(index, &StubExecutor).unwrap().expect("leaf exists");
+                assert_eq!(r, root, "witness root at {index}");
+                let leaf = s.note(index).unwrap().unwrap().cm;
+                assert_eq!(fold(leaf, index, &path), r, "path at {index}");
+            }
+        };
+
+        let n1 = ledger_at_1.next_index();
+        let before = s.tree_builds();
+        check_all(&s, ledger_at_1.root(), n1);
+        // Several single-leaf reads and a batch: one build between them all, not one each.
+        let (root, paths) = s.witnesses(&(0..n1).collect::<Vec<_>>(), &StubExecutor).unwrap();
+        assert_eq!(root, ledger_at_1.root());
+        assert!(paths.iter().all(|p| p.is_some()));
+        assert_eq!(s.tree_builds(), before + 1, "the tree was rebuilt per read");
+
+        // A commit moves the tree, so the next read rebuilds — once.
+        ledger.set_height(2);
+        let tx2 = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
+        let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &proposer);
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        let after_commit = s.tree_builds();
+        check_all(&s, ledger.root(), ledger.next_index());
+        assert_eq!(s.tree_builds(), after_commit + 1, "a commit must invalidate the cache exactly once");
+
+        // And a truncate rewinds it: the cache must not serve the longer tree it just built.
+        s.truncate_to(&gs, 1, &ledger_at_1).unwrap();
+        let (root, _) = s.witness(0, &StubExecutor).unwrap().expect("leaf 0 survives");
+        assert_eq!(root, ledger_at_1.root(), "the cache served a tree the truncate removed");
+        assert_eq!(s.witness(n1, &StubExecutor).unwrap(), None, "the truncated leaves are gone");
+        check_all(&s, ledger_at_1.root(), n1);
+    }
+
     #[test]
     fn truncate_rewinds_notes_nullifiers_anchors_and_the_tree() {
         let (_d, s, gs) = genesis_with_two_notes();
@@ -4376,7 +4469,7 @@ mod tests {
         {
             // `init_genesis` touches no family the old build lacks, so it runs over the raw
             // fifteen-family handle exactly as the old build's own did.
-            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap() };
+            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap(), tree_cache: Default::default(), tree_builds: Default::default() };
             old.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);
             old.db.put_cf(old.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(&r).unwrap()).unwrap();
@@ -4412,7 +4505,7 @@ mod tests {
                 .iter()
                 .filter(|c| **c != CF_PROGRAM_PUBLIC)
                 .map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
-            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap() };
+            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap(), tree_cache: Default::default(), tree_builds: Default::default() };
             st.backfill_receipts_index().unwrap();
             st.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);
