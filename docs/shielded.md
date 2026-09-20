@@ -98,7 +98,7 @@ transaction that looked different when there was no change would leak that there
 | **transfer** (`Action::None`) | anchor, all four nullifiers, all four commitments, fee, `burn_a = burn_r = burn_asset = 0`, `time`, four envelope ciphertexts, the bundle proof | who sent it, who is paid, the amount, which asset (RAND or any RPL token), the change, which leaves were spent, which slots were dummies |
 | **Deploy** | everything above, plus `base_pc` and the program's words (so the program id and its code) | who deployed it, and what the paying notes were worth |
 | **Call** | everything a transfer publishes, plus the program id, the call proof, and the receipt's tier and eight output words | the private inputs, registers, memory, branches taken, the real cycle count (only the padded tier shows), who called it |
-| **Mint** (faucet) | the new note's commitment, its envelope, the **amount in the clear**, and the minting validator's public key (shown as its address) and signature | who the note is for — only the address holder can open the envelope; the address itself is never published |
+| **Mint** (faucet) | the new note's commitment, its envelope, the **amount in the clear**, the recipient's `pk` and the note's `time`/`r` (POOL-1: the commitment opening, checked by the ledger, not merely declared), and the minting validator's public key (shown as its address) and signature | which notes the recipient later spends and to whom — the address that received a mint is now public, but nothing about its later use is |
 | **BridgeAttest** | the attestation (so the source chain, the token, the **amount**, the recipient's address hash and the guardian signatures), the recipient's shielded address, the deposit note's `asset` index, `r` and `time`, and the fee bundle | which notes paid the fee, and everything about the deposit note's later spend |
 | **BridgeBurn** / **TokenBurn** | the asset index, the **amount**, the relayer fee and the destination chain and address (`BridgeBurn` only), and the one bundle's public fields (`burn_a`, `burn_asset` equal the amount and asset) | which notes were burned, and who burned them |
 
@@ -107,9 +107,14 @@ sealed so that the caller, a per-call key, or a named auditor can open them late
 (`docs/confidential.md` §call input envelopes). The chain checks only its size.
 
 A mint is how value enters the pool at all, and its amount is public by design (spec §6: the same
-one-hop visibility Zcash's t→z has). Genesis deposit notes are the same trade: `alloc` in
-`genesis.json` carries `{ cm, envelope, amount }`, so everyone can add up the initial supply and
-nobody can say whose it is.
+one-hop visibility Zcash's t→z has), and since chain 14 (POOL-1) so is its recipient: the ledger
+recomputes the note's commitment from the action's own `pk`, `time` and `r` rather than trusting a
+declared `cm`. Genesis deposit notes on a `tokens`-genesis chain carry the same opening, for the
+same reason (core review I-2): `alloc` in `genesis.json` carries `{ cm, envelope, amount, opening? }`
+where `opening` is `{ pk, time, r }`, **required** when the genesis has a `tokens` section (optional,
+and usually absent, otherwise) — `rand-node init` recomputes the commitment at asset 0 from it, so
+everyone can add up the initial supply and see who it belongs to. A pre-chain-14 genesis with no
+`tokens` section keeps the older, opaque `{ cm, envelope, amount }` form.
 
 The fee is public too, and paid to the block proposer's `rewards` field in the validator register
 — the one place on this chain where an amount is stored in the clear.

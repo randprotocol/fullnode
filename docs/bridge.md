@@ -688,7 +688,7 @@ contract, and not something the bridge owns alone.
 **One bridged token, many backings.** A `Bridge`-authority token (`MintAuthority::Bridge {
 backings: Vec<Backing> }`) no longer corresponds to a single `(chain, token)` pair. Its first
 bridged registration, **zUSD**, is backed by USDT and USDC locked on four chains — Ethereum,
-BNB Chain and Solana carry both coins, Tron only USDT (Circle discontinued Tron USDC):
+BSC and Solana carry both coins, Tron only USDT (Circle discontinued Tron USDC):
 
 ```
 chain  token (32-byte wire form)                                                  coin  decimals
@@ -944,20 +944,42 @@ so the bytes an operator's hardware signer sees are exactly what gets verified.
 
 ## 20. Chain-14 launch order
 
-1. Cut chain 14 with the fixed `bridge` genesis section (§6 of the handoff, `pq_guardians` and
-   `pause_key` added) and a `tokens` section with `registration_fee` and `mint_cap_per_day` set,
-   listing no token.
-2. Enable the chain-14 faucet so a deployer wallet can obtain RAND with no prior balance.
-3. The deployer registers zUSD (`RegisterBridgedToken`, its first backing) under the PQ guardian
-   quorum's signature over `M_register` at `list_nonce = 0` — a deploy transaction, a height and an
-   `rpl1…` id, exactly as any RPL token's registration is.
-4. The guardians read back the assigned index and sign the six remaining `ListBacking` messages
-   naming it, submitted one at a time as `list_nonce` advances.
-5. For each of the seven backings: list on Rand (steps 3–4) **before** `setToken` on the source
-   endpoint (§18).
-6. Only after that: the guardian-set rotation (set 0 → set 1, payload 2, signed 5-of-6 by the
-   *current* set) on the four source endpoints, then the same attestation submitted to Rand, whose
-   genesis starts at set 0 (§3).
-7. A live round trip per source chain, small amounts: bridge in, mint zUSD, transfer, burn back,
-   reconcile `rand_getTokenSupply`'s per-backing `locked` against each endpoint's custody
-   (`rand-bridge-audit`).
+Steps 1–5 and round 1 of step 7 are **done**, on mainnet, 2026-09-20. Round 2 of step 7 is **in
+progress**; step 6 (the guardian-set rotation) is **on hold by the user's decision**, not merely
+pending — the bridge stays on guardian set 0 until the user says otherwise, independent of the
+genesis or the cut. Full evidence table: `AGENTS.md`'s v0.5 entry.
+
+1. **Done.** Chain 14 was cut with the fixed `bridge` genesis section (§6 of the handoff,
+   `pq_guardians` and `pause_key` added) and a `tokens` section with `registration_fee` (1 RAND) and
+   `mint_cap_per_day` (100 000 × 10⁸ per backing per day) set, listing no token. Genesis
+   `1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff`, build `b3c594c`.
+2. **Done.** The chain-14 faucet is on; the deployer wallet obtained RAND with no prior balance.
+3. **Done.** The deployer registered zUSD (`RegisterBridgedToken`, first backing Ethereum USDT)
+   under the PQ guardian quorum's signature over `M_register` at `list_nonce = 0`: transaction
+   `7fa28fe6277a82401dcc440ff32da13c5e5763f79826fb17cc508f4c15abdd13`, block 256, index 1, id
+   `rpl1xtj6k2x8strx8c2d5fjs50ltztck5ykms4ve7nmzmstf6fhn0v0spelqtx`.
+4. **Done.** The guardians read back index 1 and signed the six remaining `ListBacking` messages
+   naming it, submitted one at a time as `list_nonce` advanced 1→7; all seven backings are live.
+5. **Done**, for all seven backings: listed on Rand (steps 3–4) before `setToken` on each source
+   endpoint (§18); the endpoints were enabled with small caps first (100/transfer, 1000/day).
+6. **On hold, by the user's decision (2026-09-20).** The guardian-set rotation (set 0 → set 1,
+   payload 2, signed 5-of-6 by the *current* set) on the four source endpoints, then the same
+   attestation submitted to Rand, whose genesis starts at set 0 (§3), is deliberately not run: the
+   bridge stays on guardian set 0 until the user says otherwise. The set-1 ECDSA and PQ keys are
+   already generated (`~/.rand-bridge/mainnet-guardian-set1/`, `~/.rand-bridge/mainnet-pq-set1/`)
+   but unused; `bridge.pq_guardians` in the genesis is index-aligned with set 1 while every mint so
+   far verifies under set 0's ECDSA signatures (Open Questions §1 of the cut runbook). bridge-06
+   starts the rotation only on a go the user types in its own session.
+7. **Round 1 done** (2026-09-20, 1 USDT/coin per source chain): bridge in, mint zUSD, transfer
+   between two wallets, burn back, release. `rand-bridge-audit` on mainnet: custody 0 everywhere,
+   fees accrued in-contract at exactly 10 bps per release, admin-only `withdrawFees`, Rand supply 0
+   == Σ locked 0. **Round 2 confirmed by the user and in progress** (2026-09-20): 9 USDT per chain
+   (36 total), mints only, left locked — expected end state 36.00000000 zUSD against 36 USDT in
+   custody, no round-2 burns. Locks (endpoint sequence 1): ETH
+   https://etherscan.io/tx/0xf9bb33bdc89fec2ee82b4dd02226ec9d0b63d27ae50fb341af6e8b95ec937d0a, BSC
+   https://bscscan.com/tx/0xc329ea06440bf4a84383da39b9c67e2484ac96e168558b1a86905242c165c1ff, TRX
+   https://tronscan.org/#/transaction/b0fc155a2264b9dbf5b7cbeac899ae918b3a976aa7af21e003f37435eb9f3269,
+   SOL
+   https://solscan.io/tx/2iAUL44wjhE7pcYeznAwGix5RMb28eTgXVwSRy7qixGASUcwqXx7EhVsrZATyNAjzAKXw2sRNXhQiaLF6ps6w6K3
+   — the four mints are in progress at the time of writing; the `BridgeAttest` tx hashes on
+   randscan will follow.

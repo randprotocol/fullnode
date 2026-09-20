@@ -20,9 +20,10 @@ chain with a proof instead of their inputs.
 | Storage | one RocksDB per node with column families for blocks, certificates, indexes, notes, nullifiers, anchors, validators, programs and receipts; fsynced commits; startup integrity check with truncate-and-resync |
 | Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` / `receipts` / `transaction` subscription on the same port (`rand-node`), `rand` wallet CLI with a local prover, Rust client library |
 
-Status: an experimental testnet runs **chain 13** (v0.4, live since 2026-09-19; genesis
-`8123ccac…`, pinned build `86af6eb`) on 16 DigitalOcean droplets and a laptop validator, with 18
-validators in the register (see `deploy/README.md`). Not audited; not for real value.
+Status: an experimental testnet runs **chain 14** (v0.5, live since 2026-09-20; genesis
+`1cff3b7d…`, pinned build `b3c594c`) on 16 DigitalOcean droplets and a laptop validator, with 18
+validators in the register — RPL tokens and a hardened, zUSD-backed guardian bridge (see
+`deploy/README.md`). Not audited; not for real value.
 
 ## Contents
 
@@ -285,9 +286,10 @@ Full detail in `docs/architecture.md`.
 ## v0.5: RPL, zUSD and bridge hardening
 
 v0.5 adds **RPL**, RandProtocol's own token standard, and hardens the bridge for its first real
-asset, **zUSD** (backed by USDT and USDC bridged from Ethereum, BSC, Tron and Solana). Built and
-reviewed on `feat/bridge-hardening`; not yet merged to `main` or cut as a chain (see `AGENTS.md`
-for the current state). Highlights, all hard forks together as chain 14:
+asset, **zUSD** (backed by USDT and USDC bridged from Ethereum, BSC, Tron and Solana). Merged to
+`main` and **live on chain 14** since 2026-09-20, pinned build `b3c594c` (see `AGENTS.md` for the
+full launch record, the mainnet round-trip evidence table, and what is still pending). Highlights,
+all hard forks together as chain 14:
 
 - **A token is a registry entry, not a contract** — a shielded native asset with an id, an index,
   and a checksummed `rpl1…` text form; creation is permissionless, under a mint authority fixed at
@@ -339,8 +341,9 @@ The shielded pool lands in three phases, each a hard fork (`docs/shielded.md` §
 pool itself: notes, bundles, the wallet, the redacted RPC. **S2** adds staking on top of it — Bond,
 Unbond and Withdraw, epochs that re-derive the validator set from the register, and the validator
 rewards S1 accrued but could not pay out (`docs/staking.md`). **S3** brings the bridge back as
-notes — a deposit is one note the chain computes from the amount the guardians signed, a burn is two
-bundles in one transaction (`docs/bridge.md`) — and gives call inputs their own envelopes, so a
+notes — a deposit is one note the chain computes from the amount the guardians signed, a burn is
+one hidden-asset bundle since chain 14 (`docs/bridge.md`) — and gives call inputs their own
+envelopes, so a
 caller can disclose what a program ran on to an auditor, or to itself later, without publishing it.
 Both are here, in this release. Still outstanding from S2's own plan: the local wallet commitment
 tree, so a wallet stops telling its node which leaf it is about to spend.

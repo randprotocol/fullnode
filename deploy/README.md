@@ -1,47 +1,54 @@
-# Testnet: chain id 13 (the call limits and a program's public input, v0.4)
+# Testnet: chain id 14 (RPL tokens, zUSD and the hardened bridge, v0.5)
 
 > **No key in this repository is tracked any more** (audit v3, OPS-1). `deploy/node-a..f.key.json`
 > and `deploy/payout/*.key.json` were committed on purpose for chains 8–13 so any machine could
-> pull and run the fleet; they are untracked as of the chain-14 preparation and `.gitignore` has no
-> `!deploy/*.key.json` exception left. The working copies are still on disk and still run chains
-> 8–13, but they are **published seeds**. Chain 14 runs on eighteen validator keys and eighteen
-> payout wallets generated off-repo by `deploy/gen-chain14-keys.sh` into `$KEYDIR`
-> (default `~/.rand-chain14`) — see `deploy/cut-chain14-genesis.sh` and
-> `deploy/cutover-droplet-chain14.sh`. Peer ids change with those keys, so `deploy/nodes.env` is
-> replaced by the generated `$KEYDIR/public/nodes-chain14.env` at the cut.
+> pull and run the fleet; they were untracked in the chain-14 preparation (`66cd6b1`) and
+> `.gitignore` has no `!deploy/*.key.json` exception left. The working copies are still on disk and
+> still run chains 8–13, but they are **published seeds**. Chain 14 runs on eighteen fresh
+> validator keys and eighteen fresh payout wallets, generated off-repo by
+> `deploy/gen-chain14-keys.sh` into `$KEYDIR` (default `~/.rand-chain14`, backed up by the user off
+> the laptop) — see `deploy/cut-chain14-genesis.sh` and `deploy/cutover-droplet-chain14.sh`. Peer
+> ids changed with those keys, so `deploy/nodes.env` was replaced by the generated
+> `$KEYDIR/public/nodes-chain14.env` at the cut; a droplet's key now lives at
+> `/root/keys/node-<name>.key.json`, outside `/root/fullnode` so `rebuild-vps.sh`'s
+> `rsync --delete` can never remove it.
 
-> **Chain 13 (cut 2026-09-19) is chain 12 plus five call limits in its genesis.** The genesis
-> sets `max_program_words`, `max_proof_bytes`, `max_block_bytes`, `max_call_envelope_bytes` and
-> `max_program_public_words`, so the translated ERC-20 and SPL Token images deploy and a
-> production ERC-20 call proof (3 412 405 bytes) fits. A program's public input is fixed at
-> deploy (`rand program deploy --public`). The same 18 validators at 1000 RAND each, the same
-> five 1000 RAND deposit notes, the same peer ids and bootstraps (`nodes.env` is untouched).
-> **The build is chain-13-only**: the `Deploy`, `ProgramRecord` and `CallReceipt` encodings
-> changed, so never same-chain-update it onto chain 12. Like chains 9–12 it is **cut without the
-> `aggregation` section** (`deploy/cut-chain13-genesis.sh` defaults to `AGGREGATION=off`). The
-> chain-12 and earlier records are under "History" and "What the … rollout actually did".
+> **Chain 14 (cut 2026-09-20) is v0.5: RPL tokens and a hardened, zUSD-backed guardian bridge.**
+> The genesis carries a `tokens` section (`registration_fee`, `mint_cap_per_day`, no listed token —
+> zUSD is registered by transaction after the cut) and a `bridge` section at guardian **set 0** with
+> six `pq_guardians` (index-aligned with set **1** until the guardian-set rotation) and one
+> `pause_key`. The wire and consensus changes underneath: one 4-in/4-out **hidden-asset** bundle
+> replaces the two-bundle token transfer (the `TokenTransfer` action is gone); every bundle proof is
+> bound to its whole transaction (`docs/confidential.md`, "Transaction binding"); a `Mint`'s
+> commitment opening (`pk`, `time`, `r`) is checked, not merely declared (POOL-1); a block's
+> timestamp is bounded going forward as well as back (B2, `docs/bridge.md` §16) — **every validator
+> on this chain needs NTP**. The full launch record — chain-14 facts, the zUSD deploy, the mainnet
+> round-trip evidence table and what remains pending — is `AGENTS.md`'s v0.5 entry and the cut
+> runbook, `docs/superpowers/handoffs/2026-09-20-chain14-cut-runbook.md`. **The build is
+> chain-14-only**: a chain-13 binary cannot open this genesis and this binary cannot run chain 13.
+> Like chains 9–13 it is **cut without the `aggregation` section** (the hidden-asset bundle's
+> declared shape needs re-measurement first; `node::check_build_runs_genesis` now refuses to start
+> any genesis carrying one at all). The chain-13 and earlier records are under "History" and "What
+> the … rollout actually did".
 
 | | |
 |---|---|
-| chain id | **13** |
-| genesis hash | **`8123ccac1883a45750e4df6964fb7cd3f0b321798cde4c0ef406a0293939ece3`** |
-| genesis file | `deploy/genesis-chain13.json` (cut 2026-09-19 with `deploy/cut-chain13-genesis.sh`; chain 12's stays at `deploy/genesis-chain12.json`, chain 11's at `deploy/genesis-chain11.json`, chain 10's at `deploy/genesis-chain10.json`) |
-| pinned build | **`86af6eb`** (Linux `rand-node` sha256 `cc20bf84…`); binaries `rand-node` and `rand` in `bin-86af6eb/` (macOS) and E's `/root/fullnode/target/release` (Linux); `.update-pin` content is `86af6eb`; `deploy/run-a.sh` and `run-b.sh` point at `bin-86af6eb` and `data-*-8123ccac`. **Chain-13-only**: never same-chain-update it onto chain 12 |
-| `max_program_words` | **65 535** |
-| `max_proof_bytes` | **8 388 608** (8 MiB) |
-| `max_block_bytes` | **20 971 520** (20 MiB) |
-| `max_call_envelope_bytes` | **65 536** |
-| `max_program_public_words` | **32 768** |
-| aggregation | **off** (no `aggregation` section, as chains 9–12) |
-| zkVM | **constraint set 6** (the public input segment; M4.3 EVM and M4.4 sBPF/sha256 guests ride along) — unchanged |
-| `hc_bundle` | `4a27356f379571036025a4a8661c294b0edec2b7cf7fbfd60b472b186cbd4afb` |
-| validators | **18, every one staked at exactly 1000 RAND** (the staking minimum) |
+| chain id | **14** |
+| genesis hash | **`1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff`** |
+| genesis file | `deploy/genesis-chain14.json` (cut 2026-09-20 with `deploy/cut-chain14-genesis.sh`; chain 13's stays at `deploy/genesis-chain13.json`, chain 12's at `deploy/genesis-chain12.json`, chain 11's at `deploy/genesis-chain11.json`, chain 10's at `deploy/genesis-chain10.json`) |
+| pinned build | **`b3c594c`**; binaries `rand-node` and `rand` in `bin-b3c594c/` (macOS, node A now runs from `~/rand-node-a` via `deploy/run-a.sh`) and E's `/root/fullnode/target/release` (Linux); `.update-pin` content is `b3c594c`. `main` (docs and the genesis file itself, no code) moved on to `ed88241` after the cut. **Chain-14-only**: never same-chain-update it onto chain 13 |
+| `max_program_words` / `max_proof_bytes` / `max_block_bytes` / `max_call_envelope_bytes` / `max_program_public_words` | unchanged from chain 13: **65 535** / **8 388 608** (8 MiB) / **20 971 520** (20 MiB) / **65 536** / **32 768** |
+| aggregation | **off, and not optional** (no `aggregation` section; the node refuses to start one) |
+| zkVM | **constraint set 6** (the public input segment) unchanged; the **hidden-asset bundle guest** (`bundle_hidden`, tier 14, ~100 s/proof) replaces the two-slot `bundle()` guest for every transfer, bond, burn and bridge action |
+| `hc_bundle` | `83d3a370…` (chain 13's was `4a27356f…` — read it off the build that cuts the next genesis, do not copy this value forward) |
+| validators | **18, every one staked at exactly 1000 RAND** (the staking minimum), on **fresh keys held off-repo** — see the note above |
 | quorum | **13 of 18** (strictly more than two thirds of 18 000 RAND of stake) |
 | epochs | `--epoch-blocks 1000`; `UNBONDING_EPOCHS = 2`, so unbonded stake releases ~2000 blocks later |
-| genesis value | 18 000 RAND staked in the register + 5 × 1000 RAND as deposit notes = 23 000 RAND |
-| faucet | **on** (`rand faucet [address]`, up to 100 RAND per call on any node) |
+| genesis value | 18 000 RAND staked in the register + 5 × 1000 RAND as deposit notes (with openings, core I-2) = 23 000 RAND |
+| faucet | **on** (`rand faucet [address]`, up to 100 RAND per call on any node, now rate-limited: burst 8, 1/s per node) |
 | confidential computation | **on**, production FRI profile (80 queries; the proof cap is the genesis `max_proof_bytes`, 8 MiB) |
-| bridge | **no bridge section** — and one cannot be added to this chain later, see below |
+| tokens (RPL) | `registration_fee` 1 RAND, `mint_cap_per_day` 100 000 × 10⁸ per backing per day, no token listed at genesis (`docs/tokens.md`) |
+| bridge | **guardian set 0**, six `pq_guardians` (B3), one `pause_key` (B1), emitters for chains 2/3/4/5, no bridged token listed at genesis — zUSD registered by transaction (`docs/bridge.md` §§13–20) |
 
 Chain 8 is a fresh genesis because **constraint set 5 cannot replay chain 7**: a chain-7 proof and a
 constraint-set-5 verifier do not round-trip in either direction, so a `03c9fb9` node can neither join
@@ -57,6 +64,14 @@ S3-only) understands.
 > apart. Check the build, not the bundle digest: `bin-03c9fb9/`, `.update-pin` = `03c9fb9`.
 
 ## The 18 validators
+
+> **This table is chains 8–13 history.** Those chains shared one set of validator and payout keys
+> (peer ids unchanged cut to cut), tracked in this repository until OPS-1 untracked them for the
+> chain-14 preparation. **Chain 14 runs on eighteen entirely fresh validator and payout keys, held
+> off-repo in `$KEYDIR`** (default `~/.rand-chain14`); its own address/pubkey/payout table is
+> `$KEYDIR/public/validators.tsv` on the controller's machine, not in this repository. Node A's row
+> below (laptop, LAN address, chain-7-era validator address) is likewise chain ≤13 only — chain 14's
+> node A key and address live in the same off-repo `$KEYDIR`.
 
 Every validator holds exactly **1000 RAND**, which is `MIN_STAKE` — one unit less and genesis
 refuses the file outright (a validator below the minimum would sit in the register but in no epoch's
@@ -103,8 +118,12 @@ droplets have public IPs and act as bootstrap nodes; A and B are behind NAT and 
 A shielded chain has no per-validator allocation: value exists only as a note someone holds the
 spend key for, so `--alloc` takes a shielded address (the long form: `pk` and the ML-KEM
 encapsulation key the deposit envelope is sealed to) and creates one deposit note for it. As on
-chains 7–12, 1000 RAND goes to each of the five wallets in `wallets/` (gitignored — those keys live
-on the machine that cut this genesis and nowhere else):
+chains 7–13, 1000 RAND goes to each of the five wallets in `wallets/` (gitignored — those keys live
+on the machine that cut this genesis and nowhere else); **chain 14 kept the same five wallets**
+rather than rotating them (the cut script's `ALLOC_WALLETS` default), so the addresses below are
+unchanged, though the note commitments themselves are fresh (`r` is never reused across a cut). On
+a `tokens`-genesis chain each note also carries its opening (`pk`, `time`, `r`) so `rand-node init`
+can recompute the commitment at asset 0 (core review I-2):
 
 | wallet | address | amount |
 |---|---|---|
@@ -175,6 +194,52 @@ owner was a receiver id that had to resolve to a note key and an ML-KEM key. Cha
 records: a payout and an alloc owner are the long address again, which carries both keys itself.
 The record files and `deploy/cut-chain11-genesis.sh` stay in the tree as the record of that cut;
 a `17db41d` node neither reads nor writes them.
+
+## What the chain-14 rollout actually did (2026-09-20)
+
+Full step-by-step is `docs/superpowers/handoffs/2026-09-20-chain14-cut-runbook.md`; this is the
+outcome. **The `deploy/gen-chain14-keys.sh` / `cut-chain14-genesis.sh` / `cutover-droplet-chain14.sh`
+scripts are the current cut-over tooling** — the numbered checklist and the `sed`-based unit edit
+below are chain-8-through-13 history, kept for the pattern they established, not for chain 14's own
+commands.
+
+1. Eighteen fresh validator keys and eighteen fresh payout wallets were generated off-repo into
+   `~/.rand-chain14` (`deploy/gen-chain14-keys.sh`), producing new peer ids and a fresh
+   `nodes-chain14.env`.
+2. The genesis was cut with `deploy/cut-chain14-genesis.sh`, spliced with the fixed `bridge` section
+   (guardian set 0, `pq_guardians` index-aligned with set 1, `pause_key`) and the `tokens` section
+   (`registration_fee` 1 RAND, `mint_cap_per_day` 100 000 × 10⁸, no listed token); `rand-node init`
+   on the finished file — not `rand-node genesis`'s own printout of the unbridged file — gave the
+   real hash, `1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff`.
+3. **Fleet disk survey first.** Seven droplets (c, f, lon1, sfo3, blr1, ams3, tor1) were at or near
+   0 bytes free: chain-11 (`79123fa7`, 7 GB) and chain-12 (`605eb783`, 21 GB) data dirs had never
+   been deleted after their cuts, and chain 13 itself was growing ~16 GB/day. Both retired data
+   dirs were removed on the affected droplets (guarded to only the unit's own current datadir) and
+   the journal vacuumed, before touching anything else.
+4. E was rebuilt at `b3c594c` (`deploy/rebuild-vps.sh`), then all seventeen droplets were rolled
+   with `deploy/cutover-droplet-chain14.sh` — C and D (the bootstraps) first, then the rest one at a
+   time, each waited to `rand_getHealth: ok` before the next, B and E last of the droplets (E serves
+   the explorer), node A (the laptop) last of all, restarted from `~/rand-node-a` via
+   `deploy/run-a.sh`. All 18 came up on chain 14, state root and block hash identical at height 90
+   across A/C/E/mem1, `hc_bundle 83d3a370…` fleet-wide, faucet working.
+5. randscan was deployed from its `feat/rpl-tokens` branch (merged to its own `main`, `adfe129`) in
+   the same window. Its indexer stuck at height 255 on first deploy: the database's migration
+   version 8 had been burned by the reverted chain-11 receivers migration, so the new migration,
+   originally numbered `008`, was silently skipped. Renumbered to `009`; re-deployed; the indexer
+   passed 256 and token pages render.
+6. `main` moved from `a2c9896` (the merged `feat/rpl` + `feat/bridge-hardening`) through three
+   deploy-only commits (`66cd6b1`, `971ca75`, `b3c594c` — the pinned build) to `ed88241` (the
+   committed genesis file, `nodes.env`, `run-a.sh`), pushed.
+7. zUSD was then registered and listed by transaction (index 1, six `ListBacking`s), and bridge-06
+   ran the mainnet round trip — see `AGENTS.md`'s v0.5 entry for the full evidence table.
+
+## Public RPC
+
+**`https://rpc.randprotocol.org`** — Cloudflare in front, proxied to Caddy on droplet **F**
+(`nyc3`), which forwards to that node's `127.0.0.1:8545`. Deliberately **not** put on E: E's node
+holds randscan's 64 `rand_importViewingKey` slots (in-memory, cleared at restart), and a public RPC
+there would let anyone else's import calls evict them. Every other droplet's RPC stays bound to
+`127.0.0.1` and unreachable from outside, per the topology rule in `docs/deploy.md`.
 
 ## Cut-over checklist, per node
 
@@ -559,3 +624,29 @@ attestation bound (`544926c`), and like chains 9–11 cut without the `aggregati
 none of the call limits, so its program cap was 4 096 words and its proof cap 2 MiB. It ran until
 2026-09-19, when the fleet moved to chain 13 ("What the chain-13 rollout actually did", above).
 The v0.3 builds cannot run chain 13, and the chain-13 build cannot run chain 12.
+
+**Chain 13** (cut and rolled out 2026-09-19, build `86af6eb`, v0.4; genesis
+`8123ccac1883a45750e4df6964fb7cd3f0b321798cde4c0ef406a0293939ece3`, `deploy/genesis-chain13.json`)
+added five call-limit fields to chain 12's genesis (`max_program_words`, `max_proof_bytes`,
+`max_block_bytes`, `max_call_envelope_bytes`, `max_program_public_words`) so the translated ERC-20
+and SPL Token programs could deploy and call ("What the chain-13 rollout actually did", above). Same
+18 validators, five alloc notes, peer ids and bootstraps as chain 12; cut without the `aggregation`
+section. It ran until 2026-09-20, when the fleet moved to chain 14. The v0.4 build cannot run chain
+14, and the chain-14 build cannot run chain 13 — the `Action` set, the `Mint`/bundle wire format and
+the genesis format all changed underneath it.
+
+**Chain 14** (cut and rolled out 2026-09-20, pinned build `b3c594c`, `main` at `ed88241`, v0.5;
+genesis `1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff`,
+`deploy/genesis-chain14.json`) is **RPL, RandProtocol's own token standard, and a hardened,
+zUSD-backed guardian bridge** ("What the chain-14 rollout actually did", above; the full launch
+record is `AGENTS.md`'s v0.5 entry). Eighteen entirely fresh validator and payout keys, generated
+off-repo (OPS-1) — new peer ids, `nodes.env` regenerated. The wire and consensus changes: one
+4-in/4-out hidden-asset bundle for every transfer, bond, burn and bridge action (`TokenTransfer` is
+gone); every bundle proof bound to its whole transaction; a `Mint`'s commitment opening checked, not
+declared (POOL-1); a forward bound on block timestamps (B2) — every validator needs NTP. Genesis
+carries a `tokens` section (no token listed) and a `bridge` section at guardian set 0 with a PQ
+co-signature quorum (B3) and a pause key (B1); zUSD (one token, seven backings across four chains)
+was registered and listed by transaction after the cut, under that PQ quorum (B4), and a live
+mainnet round trip (lock → mint → transfer → burn → release) has since run once per chain. Cut
+without the `aggregation` section, and not optional this time: the node refuses to start any
+genesis carrying one, pending re-measurement of the hidden-asset bundle's declared shape.

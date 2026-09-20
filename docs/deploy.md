@@ -17,6 +17,10 @@
   peers without configuration. Open TCP 30303 inbound on public nodes.
 - Bind RPC to `127.0.0.1` unless it is firewalled; it accepts transactions from anyone who can reach it.
 - Observers run the same binary without `--validator`; they sync, verify and serve RPC.
+- **The one public RPC endpoint is `https://rpc.randprotocol.org`** — Cloudflare, proxied to Caddy
+  on droplet F, forwarding to that node's own `127.0.0.1:8545`; every other droplet keeps RPC
+  loopback-only. It is not on E on purpose: E's node holds randscan's 64 `rand_importViewingKey`
+  slots, and a public RPC there would let anyone else's import calls evict them.
 
 ## Provisioning a Linux server (DigitalOcean example)
 
@@ -85,6 +89,45 @@ lines in their test files.
    build + hardware bring-up (`circuits` `PTX_BUILD.md`'s checklist, param-ABI audit first), then
    the production N re-measurement (runbook rows 7–8, production N=2/N=3, the ≥ 160 GB host
    classes), and later the self-verifier's end-to-end (row 11, est. tier 22 / ≥ 128 GB).
+
+## The chain-14 cut (v0.5, 2026-09-20)
+
+Full step-by-step order of operations: `docs/superpowers/handoffs/2026-09-20-chain14-cut-runbook.md`.
+Outcome and the launch record: `AGENTS.md`'s v0.5 entry; the live facts table: `deploy/README.md`.
+This section is the reusable checklist for a hard fork that changes genesis format, wire format and
+key custody all at once — worth re-reading before chain 15.
+
+1. **Merge first, linearly, no merge commits** — a rollback story depends on it (user: "so rollback
+   is easier").
+2. **NTP on every validator before the cut, not after.** Chain 14 is the first bridged chain with a
+   forward timestamp bound (B2, `docs/bridge.md` §16): a validator whose clock is more than 15 s off
+   silently stops voting.
+3. **Fleet disk survey before touching anything.** Chain 13 stalled at `ENOSPC` on seven droplets
+   because chain-11 and chain-12's retired data dirs were never deleted, and chain 13 itself grew
+   ~16 GB/day — delete every retired chain's data dir (guarded to the unit's own current datadir
+   only) and re-check free space on the 48 GB droplets specifically before rolling the next cut.
+4. **Generate fresh keys off-repo, back them up, and never commit them.** A public repository that
+   tracks validator seeds on a chain with a live bridge lets anyone finalize conflicting blocks
+   (OPS-1). `deploy/gen-chain14-keys.sh` → `$KEYDIR` (default `~/.rand-chain14`); back the whole
+   directory up somewhere off the laptop before going further — there is no second copy.
+5. **Cut the genesis close to the actual launch time**, not the evening before: the chain's clock
+   zero is the genesis `timestamp_ms`, and on a bridged chain that also starts the guardian-set
+   grace window and the mint-cap day. `rand-node init` on the *finished*, bridge-spliced file is the
+   real hash — not what `rand-node genesis` printed on the unbridged one.
+6. **Roll bootstraps first (C, D), then the rest one at a time waited to `rand_getHealth: ok`, node A
+   last.** Nothing commits until 13 of 18 are up; that is quorum, not a fault.
+7. **Redeploy the explorer in the same window**, not after — a node's RPC amount encoding is a
+   breaking change too (every `u64` amount became a decimal string in this cut) and an explorer
+   built for the old shape renders nothing on the new chain. Check its migration numbering against
+   what the database has already *tried*: a version number consumed by a reverted feature (chain 14
+   hit this — receivers migration 8, reverted, silently skipped the next migration numbered 008)
+   stalls the indexer at whatever height that skip happened.
+8. **List a bridged token on Rand before enabling it on the source endpoint**, never the other way:
+   a deposit into an endpoint with nothing to credit it against on Rand is refused but safe in
+   custody; the reverse has no symmetric failure.
+9. **A guardian-set rotation is independent of the chain cut and can follow it at any time** — Rand's
+   genesis starts at the guardian set already in use and takes the rotation attestation later, so
+   there is no reason to gate the cut on it.
 
 ## Chain 9 activation (block aggregation)
 

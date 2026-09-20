@@ -6,125 +6,205 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-20)
 
-### v0.5 — RPL, zUSD and bridge hardening — BUILT AND REVIEWED (2026-09-20), integration branch `feat/bridge-hardening`, linear on `origin/main` at `cba5fef`
+### v0.5 — RPL tokens, zUSD and the hardened bridge — LIVE on chain 14 (2026-09-20), pinned build `b3c594c`
 
-**Take-over document: `docs/superpowers/handoffs/2026-09-19-zusd-v0.5.md`** (its §§4–5 now current) —
-the goal, every user decision, the invariant, task state, the remaining path, the fixed chain-14
-inputs and the traps. Spec `docs/superpowers/specs/2026-09-19-rpl-token-standard-design.md` (§12 =
-one zUSD, §13 = per-backing source decimals), `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`
-(the 4-slot guest that replaced the two-bundle transfer), `docs/superpowers/specs/2026-09-19-bridge-hardening-design.md`
-(B1–B4) and `docs/superpowers/specs/2026-09-19-pq-cosignature-bridge.md` (B3, verbatim from the
-bridge repo); plans `docs/superpowers/plans/2026-09-19-rpl-token-standard.md`; live ledger
-(git-ignored) in `.superpowers/sdd/2026-09-19-rpl-token-standard/progress.md` in the `feat/rpl`
-worktree (`/tmp/fullnode-rpl`) — the full task-by-task history (H1–H5 the hidden-asset guest, B1–B4
-the bridge hardening, R1 the token RPC + `rpl1…`, T8b the `rand token` CLI, S1 the randscan side in
-`../randscan`). **Everything through T8b is DONE, reviewed clean** (see git log for the branch's
-current tip — it moves; do not pin a sha here). **The local 9-phase E2E gate
-(`crates/randprotocol-node/tests/zusd_e2e.rs`: a real four-validator cluster, real proofs, test
-guardians, the full faucet→register→deposit→transfer→burn→audit path) has passed 9/9 twice** — once
-after `e2205f7`'s persistence fix and again after F1's deposit-blinding fix, 1671 s each run. Docs
-(this pass) is what is left before the final whole-branch review, the rebase onto `origin/main` and
-the chain-14 cut (handoff §5, steps 5–10).
+RPL (RandProtocol's own token standard) and zUSD (one bridged token, seven backings) are live.
+Spec `docs/superpowers/specs/2026-09-19-rpl-token-standard-design.md` (§12 = one zUSD, §13 =
+per-backing source decimals), `.../2026-09-19-hidden-asset-bundle-design.md` (the 4-slot guest),
+`.../2026-09-19-bridge-hardening-design.md` (B1–B4), `.../2026-09-19-pq-cosignature-bridge.md`
+(B3, verbatim from the bridge repo); plan `docs/superpowers/plans/2026-09-19-rpl-token-standard.md`;
+live task-by-task ledger (git-ignored) `.superpowers/sdd/2026-09-19-rpl-token-standard/progress.md`
+in the `feat/rpl` worktree (`/tmp/fullnode-rpl`); cut runbook
+`docs/superpowers/handoffs/2026-09-20-chain14-cut-runbook.md`; take-over handoff
+`docs/superpowers/handoffs/2026-09-19-zusd-v0.5.md` (its closing "State 2026-09-20" section is
+current). `feat/rpl` + `feat/bridge-hardening` merged linearly (98 commits, 0 merge commits) onto
+`main` at `a2c9896`, then three deploy-only commits — `66cd6b1` (untrack the 24 chain-13 validator
++ payout key files, OPS-1), `971ca75` (the cut/gen/cutover scripts), `b3c594c` (this runbook) —
+**`b3c594c` is the pinned fleet build**; `main` now sits at `ed88241` (adds the committed genesis
+file, the regenerated `nodes.env`, `run-a.sh`). `docs/tokens.md` is the RPL user guide;
+`docs/bridge.md` §§13–20 is the bridge-hardening + launch reference; `docs/confidential.md`'s
+soundness table and `docs/shielded.md` cover the hidden-asset bundle. The RPL deploy tutorial is
+live at `randprotocol.org/docs/deploy-rpl-token` (concept page `.../docs/concepts/tokens`, website
+commit `d79855a`), synced to chain 14.
 
-- **Goal**: zUSD mint/transfer/burn backed by USDT + USDC bridged from Tron, Solana, BNB Chain and
-  Ethereum, and bridging back; custody on the four chains always >= zUSD supply, checked before every
-  unbridge; then a live round trip on the deployed mainnet endpoints with the `RAND_BRIDGE_TESTER`
-  accounts; then tag **v0.5** with a GitHub release.
-- **RPL**: a ledger-level registry of shielded native tokens (`ledger/tokens.rs`), genesis-gated by
-  a `tokens` section (`rand-state-4`), permissionless creation, fees in RAND, symbols not unique, a
-  checksummed `rpl1…` text form (bech32m, 62 chars). `docs/tokens.md` is the full user-facing guide.
-- **The transaction-binding fix landed** (Task 5b): every bundle proof is made over, and verified
-  against, `H("rand-tx-bind-1", chain_id ‖ tx with proofs blanked)` via the public input segment —
-  closing the redirect attack that let a copied `BridgeBurn` or `Bond` proof be resubmitted with a
-  changed destination or validator (`docs/confidential.md`, "Transaction binding").
-- **The asset is hidden on a spend** (H1–H5): the two-bundle token transfer is gone, replaced by one
-  4-in/4-out hidden-asset bundle (`guests::bundle_hidden`, tier 14, ~100 s, the old `bundle()` guest
-  kept only as `ZkExecutor::legacy_bundle_program`, pinned by no chain). A transfer of RAND and a
-  transfer of any RPL token publish the identical shape. `docs/confidential.md`'s soundness table
-  and `docs/shielded.md` are current for it.
-- **zUSD** has seven backings (USDT+USDC on chains 2, 3, 5; USDT on 4), each with `decimals` and a
-  consensus `locked`; `total_supply == Σ locked` by construction; a `BridgeBurn` names its coin and
-  is refused `NotABacking` / `InsufficientBacking` / `NotReleasable`. Not listed in genesis: it is
-  registered by transaction after the cut, by a faucet-funded deployer, under a PQ guardian quorum
-  (B4). `docs/bridge.md` §§13–20 is the reference.
-- **Bridge hardening (B1–B4) landed**: a per-backing daily mint cap and a Dilithium2 pause key that
-  can only pause (unpause needs the PQ quorum; burns and rotations stay open while paused); a
-  forward bound on block timestamps (`BlockError::TimestampLeap`, 60 s/block) plus a 15 s
-  clock-drift vote rule — **every validator on a bridged chain needs NTP**; a Dilithium2
-  co-signature quorum, independent of the ECDSA one, required on every mint and rotation; and
-  `RegisterBridgedToken`/`ListBacking` to list a token or a backing after genesis under the PQ
-  quorum, no chain cut, no wire change.
-- The source endpoints are live on mainnet and immutable: chain 14's `bridge` genesis section is
-  fixed (handoff §6). The Rand-only governance payload (plan Task 10) stays deferred past chain 14
-  — `bridge-codec` is compiled into the live Solana program and must stay byte-stable; B4 is what
-  replaced it for listing.
-- **Traps learned this round**:
-  - **A silent `rpc.rs` mis-merge** (fixed `561346c`): two independent renderers for a backing row
-    (`rand_getAssets`/`rand_getBridgeState` vs. the token RPC) had drifted into existence across
-    parallel branches; neither compile nor tests caught it because both were valid Rust — only a
-    close review noticed the two shapes disagreed. One renderer now serves both call sites. Re-check
-    for this class of bug whenever two branches touch the same RPC method's JSON shape in parallel.
-  - **Number-vs-string amount encoding was inconsistent across the node.** `rand_getBridgeState`'s
-    `assets` rows and the token RPC's rows disagreed on whether a `u64` amount is a JSON number or a
-    decimal string — masked in randscan by hand-written, already-quoted mock fixtures (S1's review
-    found it: a live chain's numeric amounts silently failed to render). **The rule, settled**: every
-    `u64` amount this RPC serves — RAND units or token units, chain state or a decoded transaction's
-    own field — is a decimal string, no exception, because a 9-decimal token passes 2^53 at a few
-    tens of millions of units — `docs/rpc.md`'s conventions section states it once. This is *not*
-    "every consumer already tolerates both": the wallet and other RAND-side readers of these
-    specific fields had to be fixed alongside the node in the same change, or they silently misread
-    a number as a string or vice versa. **The pre-chain-14 exception is gone, 2026-09-20 (breaking):**
-    a bundle's `fee`, `burn_a`/`burn_r`, and a mint's/staking action's/`bridge_attest`'s/
-    `bridge_burn`'s `amount` (and `bridge_burn`'s `relayer_fee`) inside a decoded transaction, plus
-    `rand_getAssets`'s and `rand_getBridgeState.assets[]`'s `locked`, used to stay JSON integers on
-    purpose; they are now decimal strings like everything else, and `rand_getStatus`'s
-    `aggregation.subsidy_base` (the one field this left as a number) moved with them. See
-    `docs/rpc.md`'s changelog for the exact field list.
-  - **The `.pending` key file.** `rand token create --authority-key-out FILE` writes the fresh
-    authority key to `FILE.pending` immediately before the one call that can lose an index race
-    (`IndexMismatch`), not before — promoted to `FILE` only once the chain accepts the registration,
-    and otherwise **kept at `.pending` unless the send itself was refused**: only a synchronous
-    `rand_sendTransaction` refusal (nothing was ever admitted) discards it, and any later-stage
-    failure — waiting for the commit, the post-commit scan — leaves `.pending` in place, because by
-    then the registration may already be live on chain under that key. Any command that must write a
-    secret before an outcome it cannot yet know should follow this shape, not write the final file
-    first, and should discard only on the one verdict that proves nothing was submitted.
-  - **Bridge and token registry state must be persisted on every commit, not only on a block that
-    carries a bridge/token action** (`e2205f7`). Keying a state write on which actions a block
-    happens to carry is the restart-fork class: a node that restarts between such blocks loses
-    `BridgeMeta` or the token registry's in-flight counters and either forks at the next state root
-    or serves stale RPC nonces to a client that then builds a transaction the chain refuses.
-    `Storage::commit` now writes the whole `META_BRIDGE_STATE` and `META_TOKENS` blobs, fsynced,
-    every commit of a chain that has them — not conditionally.
-  - **The validator register is written by difference, not whole, on every commit** — and an
-    undecodable stored row fails the commit outright rather than being skipped, so a register-format
-    change needs a real migration, not a silent partial write.
-  - **A `BridgeAttest`'s deposit blinding `r` is derived, not submitter-chosen** (F1):
-    `blake3("rand-deposit-r-1" ‖ mu)` over the guardians' own signed digest, enforced by
-    `BridgeError::WrongDepositBlinding`, a permanent refusal. `docs/rpc.md`'s changelog and wire
-    section carry the detail.
-  - **The index front-run, and list-after-register.** `ListBacking` signs a `token_index`, and
-    registering a *native* token is permissionless, so a `ListBacking` pre-signed against a
-    predicted index could be invalidated by an unrelated registration taking that index first (a
-    refusal, not a fund-loss risk). Procedure: the PQ guardians sign `RegisterBridgedToken` first,
-    wait for it to commit, read the index back from the chain, and only then sign the listings that
-    name it — never sign a listing ahead of the registration it depends on (`docs/bridge.md` §18).
-  - **`RECURSION_FIXTURES` is still missing on this laptop.** The ~21 node `--lib` aggregation tests
-    that need it remain a known, pre-existing failure set; unrelated to this round's work, not fixed
-    by it.
-  - **Aggregation stays gated off until re-measured.** Block aggregation's admitted shape assumed
-    today's bundle declares `public 2` (the empty segment); the transaction-bound bundle declares
-    `public 4`, so no bundle proved on this branch matches the old admitted shape. `node::
-    check_build_runs_genesis` now refuses to start any genesis carrying an `aggregation` section at
-    all, so chain 14 is cut without one; re-measure the shape (and consider checking a covered
-    bundle's `PUB0..7` against its transaction's binding) before any future chain activates it. Two
-    integration tests whose subject is aggregation itself — `tests/submit.rs`'s gossiped-aggregate
-    test and `tests/cluster.rs`'s sync-with-aggregation capstone — are `#[ignore]`d against this
-    startup refusal, with a shared reason string pointing back at it; un-ignore both together with
-    the re-measurement work, not separately.
-  - **Fleet-wide key rotation is a chain-14 precondition, not a nice-to-have.** This repository is
-    public and tracks chain 13's six validator seeds and 18 payout spend keys — see the security
-    review entry below and the handoff's §5 step 7.
+**What v0.5 is:**
+
+- **RPL**: a ledger-level registry of shielded native tokens (`ledger/tokens.rs`, genesis-gated by
+  a `tokens` section, `rand-state-4`), permissionless creation, fees in RAND, symbols not unique, a
+  checksummed `rpl1…` text form (bech32m, 62 characters).
+- **One hidden-asset bundle for every transfer.** The two-bundle `TokenTransfer` is gone (H3):
+  a single fixed 4-in/4-out proof (`guests::bundle_hidden`, tier 14, ~100 s) moves RAND, a bridged
+  coin or an RPL token identically — nobody without a key can tell which asset moved at all.
+- **Transaction binding.** Every bundle proof is now made over, and verified against,
+  `H("rand-tx-bind-1", chain_id ‖ tx with proofs blanked)` via the public input segment, closing a
+  redirect attack that let a copied, unmodified proof be resubmitted under a changed destination,
+  validator or memo.
+- **zUSD**: ONE token, seven backings (USDT+USDC on chains 2, 3, 5; USDT only on chain 4, Tron —
+  Circle discontinued Tron USDC), `total_supply == Σ backings.locked` held by construction (`lock`/
+  `release` are the only writers); a `BridgeBurn` is refused `NotABacking` / `InsufficientBacking` /
+  `NotReleasable` before its digest or proof are even touched.
+- **B1** — a per-backing daily mint cap (`mint_cap_per_day`, genesis, applies per backing not per
+  token) and a Dilithium2 pause key that can only pause (`PauseMints`, bundle-less, fee-less);
+  unpausing needs the PQ guardian quorum (`UnpauseMints`); burns and rotations stay open while paused.
+- **B2** — a forward bound on block timestamps: `BlockError::TimestampLeap` (`MAX_TIMESTAMP_STEP_MS`
+  = 60 000, a validity rule replayed too) and a 15 s clock-drift vote rule (`MAX_CLOCK_DRIFT_MS`,
+  vote-only) — every validator on a bridged chain now needs NTP.
+- **B3** — a second, post-quantum (Dilithium2) co-signature quorum, independent of the ECDSA one,
+  required on every mint and every guardian-set rotation (`Action::BridgeAttest`'s last field,
+  `pq_signatures`, inside the transaction binding).
+- **B4** — `RegisterBridgedToken` / `ListBacking`: list a new bridged token or a further backing
+  after genesis under the same PQ quorum, no chain cut, no wire or `bridge-codec` change.
+- **F1** — a `BridgeAttest`'s deposit blinding `r` is derived, not submitter-chosen:
+  `blake3("rand-deposit-r-1" ‖ mu)` over the guardians' own signed digest
+  (`BridgeError::WrongDepositBlinding`, permanent), closing issue #3's deposit-commitment
+  front-running.
+- **Genesis alloc openings** (core review I-2): a `GenesisNote` gains optional `{pk, time, r}`; when
+  a genesis carries a `tokens` section every alloc note must carry one, and `rand-node init`
+  recomputes its commitment at asset 0 — closes the "opaque alloc note could hide an unbacked
+  asset-1 note" hole.
+- **Key-length bounds** (core review I-1): `RegisterToken`/`SetAuthority`'s `MintAuthority::Key` and
+  `InitialMint`/`TokenMint`'s recipient `kem_ek` are now length-checked (`== PUBLIC_KEY_LEN` /
+  `== KEM_EK_BYTES`, permanent verdicts) — closes an unbounded-length state-bloat-at-flat-fee hole.
+- **Bundle proofs pinned to tier 14** (zkvm review I1): `decode_and_check`'s bundle branch now
+  requires `tier == 14, keccak_log_height == 0, sha256_log_height == 0` instead of trusting the
+  prover's declared header — an unpinned header could grow the verifier-key cache and FIFO-evict it
+  (a DoS), since every real hidden-asset bundle shape is measured at tier 14 anyway.
+- **Every `u64` RPC amount is a decimal string, no exception (breaking).** The pre-chain-14
+  exception — a bundle's `fee`, `burn_a`/`burn_r`, a mint's/staking action's/`bridge_attest`'s/
+  `bridge_burn`'s `amount` (and `bridge_burn`'s `relayer_fee`), `rand_getAssets`'s and
+  `rand_getBridgeState.assets[]`'s `locked` — is gone; only `rand_getStatus.aggregation.
+  subsidy_base` moved the other way, to a number, for consistency. `docs/rpc.md`'s conventions
+  section and changelog carry the exact field list.
+- **Governance actions bypass a full mempool** (node review I4): `PauseMints`/`UnpauseMints`/
+  `RegisterBridgedToken`/`ListBacking` are exempt from `MempoolFull` and ordered first, so a
+  congested pool can never crowd out a pause; `rand_mint` (the faucet) is now rate-limited too.
+- **Faucet rate limit**: burst 8, 1 request/s per node (was unthrottled).
+
+**Chain 14 facts:** genesis
+`1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff`, chain id **14**, pinned build
+**`b3c594c`** (`main` at `ed88241`), `hc_bundle 83d3a370…` (chain 13's was `4a27356f…` — the
+hidden-asset guest replaced the bundle guest). Eighteen validators, **fresh keys generated off-repo
+into `~/.rand-chain14`** (backed up by the user off the laptop) — new peer ids, `deploy/nodes.env`
+regenerated as `$KEYDIR/public/nodes-chain14.env`; on a droplet the key lives at
+`/root/keys/node-<name>.key.json`, outside `/root/fullnode` so `rebuild-vps.sh`'s `rsync --delete`
+can never remove it. Node A runs from `~/rand-node-a` via `deploy/run-a.sh`; the fleet was rolled
+with `deploy/cutover-droplet-chain14.sh` (C and D first as bootstraps, then the rest one at a time
+waited to `rand_getHealth: ok`, A last). The 24 chain-13 validator+payout key files are untracked
+from the repository (OPS-1; working copies remain on disk, still serving chains 8–13). Genesis
+names guardian **set 0**, with `pq_guardians` ordered for **set 1** — the relayer files PQ
+co-signatures by PQ-list position, not by ECDSA signer index, until the rotation. `registration_fee`
+1 RAND, `mint_cap_per_day` 100 000 × 10⁸ per backing per day, **no aggregation section** (`node::
+check_build_runs_genesis` refuses to start any genesis carrying one — the hidden-asset bundle's
+declared shape needs re-measurement first).
+
+**zUSD facts:** index **1**, asset id
+`32e5ab28c782c663e14da2650a3feb12f16a12db85599f4f62dc169d26f37b1f`, id
+`rpl1xtj6k2x8strx8c2d5fjs50ltztck5ykms4ve7nmzmstf6fhn0v0spelqtx`. Registered by transaction
+`7fa28fe6277a82401dcc440ff32da13c5e5763f79826fb17cc508f4c15abdd13` at block **256** (first backing:
+Ethereum USDT), by the faucet-funded deployer wallet, under the PQ guardian quorum's signature. The
+six remaining `ListBacking` transactions (`e52eba8d…`, `360e136b…`, `5a800fd6…`, `f3bf7f72…`,
+`101bc09b…`, `a73a626f…`) brought `list_nonce` to 7 and all seven backings live. Deployer, relayer,
+tester and demo wallets live under `~/.rand-chain14/wallets/` (paths only — never a key file's
+contents in this repository).
+
+**The mainnet round trip, round 1 (2026-09-20, 1 USDT per chain), one table:**
+
+| chain | lock (source explorer) | mint (`BridgeAttest`, randscan) | burn (`BridgeBurn`, randscan) | release (source explorer) |
+|---|---|---|---|---|
+| Ethereum | https://etherscan.io/tx/0xd3a28422a53f455d2c5b9bfeb490aae4cfc1c7386fbfec567e462d3c5b6ceb76 | https://randscan.org/transactions/8ac6c497f8af870982936d29588121a1c0f2be0996af2d394781a1be26a31ec9 (block 3430) | https://randscan.org/transactions/7da01f410cf2726b79c7626cb6d9f2a3fa1cd9362487de216f266764c3f88840 (seq 3) | https://etherscan.io/tx/0x88f9d430f933aa2fe1ea708e40ba9890e04889b5c4b08a8960fe250ee83e7429 |
+| BNB Chain | https://bscscan.com/tx/0xd1706d0f752374ccb5ce64b6d246897a0018101cf043a5b3835c651ac9e3f945 | https://randscan.org/transactions/f2f24d75bc0e7d84dff1f4e4518a9d4bef115392492a39befca1528a2404851d (block 2572) | https://randscan.org/transactions/f9f365ca170a5fb51ff9381d7b5cc39538c1a621e5f6e8c1bd74d8751c7bbc49 (seq 0) | https://bscscan.com/tx/0xbe38fd0592def630d4f7fecdd6a354530307a6296b0b8d96ca9729afeef22fc8 |
+| Tron | https://tronscan.org/#/transaction/4bba90b365bd6c3ae64557f4774640075066cc3d06afcff88f39f1269fdeaa12 | https://randscan.org/transactions/16ea7cbdacb5261829b43b223f3d486ab0fc43cc7b8d85755de6987ddaeecd90 (block 2793) | https://randscan.org/transactions/013ac7b74c02842ea9516c81570fbc9e0edac4c201a560baedb3d70c7020a038 (seq 1) | https://tronscan.org/#/transaction/9c07d3f2626046316cc52a1678eec3f701cb1cefb5f43bad71bf5c3fbd2b6262 |
+| Solana | https://solscan.io/tx/63mjiakBorqYg6oMBwtSJn3KGdh6AhLLxMMvwKKWmg7EWL3A3qYctB9VmbhdkVxMxBKcSBBE8Bt1Lhk9ftZmhRbu | https://randscan.org/transactions/1bb5a046f2faf1cff48830c4ea8e51c6e36db05c5c8ee38d4dbc5cd1cba6c85e (block 2684) | https://randscan.org/transactions/7548f330e0f26dbb0011e66096ae9e1859930103b91259883c7e757612a19285 (seq 2) | https://solscan.io/tx/5Fy65G7KiZZzadqRV8sdNissR2th8Yr1hyBXw8PhKe4ADGTZnmi6sbWrxyaJkFTvbJQKGrc34jv68a6wBSnZyUTz |
+
+The zUSD transfer (tester → a FRESH demo wallet, 1.00000000 zUSD): randscan
+https://randscan.org/transactions/e6ddaca3c852e6c861524a55d00a0fbdcaff6867544b9f19b9bf60ce263c32ed,
+transaction key `7f68f57c4f33a3f0fe419f4d1a5df2875461339dbc454af8ced50cbd7f40e4ef` (discloses amount
+100000000, asset 1), demo wallet viewing key
+`a93c673ffeff7204447161347828d8e549b7070460813ae1b7e664694e1dcd5d`.
+
+`rand-bridge-audit` on mainnet after round 1: **custody 0 everywhere**, fees accrue in-contract at
+**exactly 10 bps per release** (`accruedFees`, admin-only `withdrawFees(token, to, amount)`, no
+fixed treasury), endpoint balance == custody + fees, **Rand supply 0 == Σ locked 0**.
+
+**Round 2 (2026-09-20), confirmed by the user: 9 USDT per chain (36 total), mints only, left
+locked** — no round-2 burns; expected end state **36.00000000 zUSD against 36 USDT in custody**.
+Locks (endpoint sequence 1): ETH
+https://etherscan.io/tx/0xf9bb33bdc89fec2ee82b4dd02226ec9d0b63d27ae50fb341af6e8b95ec937d0a ; BSC
+https://bscscan.com/tx/0xc329ea06440bf4a84383da39b9c67e2484ac96e168558b1a86905242c165c1ff ; TRX
+https://tronscan.org/#/transaction/b0fc155a2264b9dbf5b7cbeac899ae918b3a976aa7af21e003f37435eb9f3269 ;
+SOL
+https://solscan.io/tx/2iAUL44wjhE7pcYeznAwGix5RMb28eTgXVwSRy7qixGASUcwqXx7EhVsrZATyNAjzAKXw2sRNXhQiaLF6ps6w6K3
+— **the four mints are in progress at the time of writing**; the `BridgeAttest` tx hashes on
+randscan will follow.
+
+**The guardian-set rotation is on hold by the user's decision (2026-09-20): the bridge stays on
+guardian set 0 until the user says otherwise.** The set-1 ECDSA and PQ keys already generated
+(`~/.rand-bridge/mainnet-guardian-set1/`, `~/.rand-bridge/mainnet-pq-set1/`) exist but are unused;
+`bridge.pq_guardians` in the chain-14 genesis remains index-aligned with set 1 while the chain runs
+on set 0's signatures, per the ordering note in the cut runbook's Open Questions §1.
+
+A public RPC endpoint now exists: **`https://rpc.randprotocol.org`** — Cloudflare, proxied to Caddy
+on droplet F, forwarding to `127.0.0.1:8545`. Not bound on E (E's node holds randscan's 64
+viewing-key import slots; a public RPC there would let anyone else's `rand_importViewingKey` calls
+evict them).
+
+**Traps learned:**
+- **The fleet's disks filled because retired chains' data dirs were never deleted.** Chain 13
+  stalled at ENOSPC on 7 droplets (c, f, lon1, sfo3, blr1, ams3, tor1) whose chain-11 (`79123fa7`,
+  7 GB) and chain-12 (`605eb783`, 21 GB) data dirs were still on disk from earlier cuts; chain 13
+  itself grew **~16 GB/day**. Delete every retired chain's data dir at each cut (guarded: only when
+  the unit's own datadir suffix is current), and watch disk on the 48 GB droplets specifically —
+  they fill first.
+- **randscan migration numbering can silently skip a version.** Version 8 was burned on the live DB
+  by the reverted chain-11 receivers migration, so the new migration numbered `008` was silently
+  skipped and the indexer stuck at the first 4-nullifier transaction (height 255). Fixed by
+  renumbering to `009` (randscan `adfe129`). Check a migration's number against what a chain has
+  already *tried*, not just what is in the tree today.
+- **`rand-node genesis` writes `bridge: None`**; the cut script splices the `bridge` section in
+  afterward, so the genesis hash that matters is what `rand-node init` prints on the *finished*
+  file, never the hash `rand-node genesis` printed on the unbridged one.
+- **Peer ids derive from the validator key**, so fresh keys mean new bootstrap multiaddrs —
+  `deploy/nodes.env` has to be regenerated with the fleet, not hand-edited.
+- **`rebuild-vps.sh`'s `rsync --delete` removes E's in-tree keys.** Keys live in `/root/keys` now,
+  outside `/root/fullnode`, specifically so a rebuild can never delete them.
+- A `BridgeAttest`'s `tx_json` does not render its source chain (follow-up, not fixed); no CLI
+  prints a wallet's `recipient_hash` (follow-up — a scratch crate had to compute one for the round
+  trip's burn destinations).
+- **Rebase-map lesson**: a local `main` ref goes stale inside a worktree; compare a branch's rebase
+  target against `origin/main`, not a cached local ref (a rebase onto a stale local `main` can be a
+  silent no-op).
+- **A detached long run needs `nohup`**; a tool-level timeout kills a bare backgrounded process when
+  the invoking call itself times out.
+
+**The HELD consensus work** (not on chain 14's build): fullnode-df's audit-v3 fixes, on
+`origin/feat/audit-v3-fixes` and consolidated onto `feat/security-concerns-1` (CON-1b lock
+durability, the safety-stop fix, CON-1a/SYNC-1, plus C1/C2/I3/I4 from the liveness-focused review)
+— reviewed as **HOLD** for the cut itself (`review-auditv3-consensus-result.md`: 405217a held on
+C1 unverified-tail evidence and C2 a sync hot-loop; 9c4be1c held on I1 a weak quorum, 7 ≠ f+1 = 6,
+and I2 a pacemaker stall) and ruled to cut chain 14 without them, landing instead as a **same-chain
+update after re-review**. CH-1 (an f+1-NewViews view-change rule) is **dropped** in favour of a
+timeout-certificate pacemaker, deferred to **v0.6**, per the review's I1/I2 findings.
+
+**Deferred minors** (from the final whole-branch review, none blocking the cut): node M1 (whether
+`META_TOKENS` should be a whole rewrite/read or a diff, like the validator register), M3 and M8
+(unspecified beyond "parked" in the ledger); core M-6/M-7 (likewise unspecified beyond "parked");
+zkvm M2 (two more weakened-guest mutation-fuzz variants for the hidden-asset bundle's cheating
+suite); client N-6 (a pre-send failure leaves a token's `.pending` authority-key file with a "fate
+unknown" wording that could be clearer). Already documented rather than fixed: core M-1 (the PQ
+guardian quorum alone can `UnpauseMints`; the effective post-pause bound is up to 32× one backing's
+cap once new backings are listed — `docs/bridge.md` §15) and M-2 (a catch-up day is ≈76 minutes of
+real time at 3 s blocks; `genesis.timestamp_ms` must never be set more than 15 s ahead of launch —
+`docs/deploy.md`, `docs/bridge.md` §16). Out of scope for v0.5 entirely: RPL spec §7's allowance
+accounts (`approve`/`transferFrom` — redesigned whenever picked back up, since `TokenTransfer`'s
+memo field that would have carried the grant no longer exists); the Rand-only governance payload
+for adding a backing (plan Task 10, replaced for launch by B4); short shielded addresses
+(`feat/harm-addresses` stays a separate PR for discussion, not in chain 14).
+
+**randscan issues found post-launch** (explorer repo, not this one — recorded here for whoever picks
+them up): `/bridge/assets` keys deposited/burned/outstanding per token **index**, so all seven zUSD
+backing rows repeat the token's total instead of showing their own backing's numbers; `/tokens/1`
+renders `deploy_tx` as `null`; `/bridge` serves `registration_fee` as a JSON number where this node's
+RPC sends a decimal string (the v0.5 amount-encoding rule, above).
 
 ### Final audit v3 (2026-09-19): POOL-1 and RPC-1 fixed in code; OPS-1 rotation rides chain 14
 
@@ -660,6 +740,12 @@ never move them.
 
 - `deploy/*.key.json` holds the live testnet validator seeds, whitelisted in
   `.gitignore`. Decide: rotate + scrub, or document as throwaway-public.
+  **Resolved for chain 14 (2026-09-20, OPS-1)**: the 24 chain-13 validator and
+  payout key files are untracked and the `.gitignore` exceptions are dropped;
+  chain 14 runs on 18 fresh validator + payout keys generated off-repo into
+  `$KEYDIR` (default `~/.rand-chain14`) by `deploy/gen-chain14-keys.sh`. The
+  working copies of the old chain-13 keys are still on disk and still
+  published seeds — this bullet stands for any chain that still runs on them.
 - Block-application proof verification (`Ledger::apply_block`, synchronous
   inside `on_proposal`) still runs on the consensus event loop; moving it
   changes when a vote is emitted, so it needs a consensus decision. Admission
@@ -667,6 +753,16 @@ never move them.
 - Lock promises are not durable across restarts (`resume` discards persisted
   `locked_qc`; `extends_locked` relaxes when the locked block is unknown) —
   deliberate liveness choice, needs a protocol-level decision.
+- No CLI prints a wallet's `recipient_hash` (a `rand address --recipient-hash`
+  would have saved a scratch crate during the v0.5 round trip's burn-destination
+  setup). A `BridgeAttest`'s `tx_json` does not render its source chain, token
+  or sequence — both v0.5 follow-ups, not fixed.
+- randscan (explorer repo) issues found against the live chain-14 fleet, not
+  fixed here: `/bridge/assets` keys deposited/burned/outstanding per token
+  **index**, so zUSD's seven backing rows all repeat the token's total instead
+  of their own backing's numbers; `/tokens/1` renders `deploy_tx` as `null`;
+  `/bridge` serves `registration_fee` as a JSON number where this node's RPC
+  sends a decimal string.
 - Wallet uses committed nonce (stale-nonce race on fast double-send); the
   clean fix is a mempool-aware `next_nonce` RPC.
 

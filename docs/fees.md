@@ -11,7 +11,7 @@ Fees are flat floors, in units of 10⁻⁹ RAND (`crates/randprotocol-core/src/g
 | transaction | floor | today |
 |---|---|---|
 | any bundle: a transfer, a bond, a bridge deposit (`BridgeAttest`, paid by its relayer) | `BUNDLE_BASE` = 1,000,000 | 0.001 RAND |
-| BridgeBurn | `BRIDGE_BURN_FEE` = 10 × `BUNDLE_BASE`: the bridge fee, covering the base for both of its bundles | 0.01 RAND |
+| BridgeBurn | `BRIDGE_BURN_FEE` = 10 × `BUNDLE_BASE`: the base plus the bridge's own charge, on the one hidden-asset bundle every action carries since chain 14 | 0.01 RAND |
 | Deploy | `BUNDLE_BASE` + `DEPLOY_PER_WORD` (100,000) × program words | a 4,096-word program: 0.4106 RAND |
 | Call | `BUNDLE_BASE` + `call_fee(tier)`, `call_fee` = `CALL_BASE` (1,000,000) + 100,000 per two tiers above 10 | tier 10: 0.002; tier 14: 0.0022; tier 20: 0.0025 RAND |
 | Mint (testnet faucet) | 0 (no bundle; validator-signed) | — |

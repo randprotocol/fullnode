@@ -109,10 +109,10 @@ rand bond <validator base58> <amount in RAND> \
     [--registration <hex>] [--fee <RAND>] [--no-wait] [--cuda]
 ```
 
-A bond is an ordinary shielded transaction: the wallet proves a 2-in-2-out bundle whose `burn` is the
-staked amount, so the stake leaves the pool instead of becoming anyone's note, and the ledger admits
-a bond only when `burn == amount`. It takes about a minute and a half of local proving, like any
-transfer.
+A bond is an ordinary shielded transaction: the wallet proves the one 4-in/4-out hidden-asset bundle
+(since chain 14) whose RAND burn, `burn_r`, is the staked amount — `burn_a` and `burn_asset` stay
+zero, so a bond can only ever burn RAND — and the ledger admits a bond only when `burn_r == amount`.
+It takes about a minute and a half of local proving, like any transfer.
 
 - `--registration` is required exactly when the validator is not in the register yet, and refused
   when it is. The wallet asks the register first, so the wrong shape is an answer rather than a
@@ -239,7 +239,7 @@ epoch's set, and a chain seeded entirely from those would have nobody to pick a 
 | | public | hidden |
 |---|---|---|
 | the register | every row: address, stake, unbonding queue with its release epochs, unpaid rewards, payout address, nonce | nothing |
-| `Bond` | the validator, the amount, whether a registration was attached, and the bundle's `burn` | which notes paid, who owns them, the bonder's change |
+| `Bond` | the validator, the amount, whether a registration was attached, and the bundle's `burn_r` | which notes paid, who owns them, the bonder's change |
 | `Unbond` | the validator, the amount, the nonce | nothing — there is nothing else in it |
 | `Withdraw` | the validator, the amount, the nonce, the note's `time` | who can open the note, and every later spend of it |
 
