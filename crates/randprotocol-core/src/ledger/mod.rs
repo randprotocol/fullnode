@@ -410,6 +410,10 @@ impl PartialEq for Ledger {
             && self.bridge == o.bridge
             && self.tokens == o.tokens
             && self.aggregators == o.aggregators
+            // The proving-share bucket is consensus state on an aggregating chain: what it holds
+            // decides who is paid and which bundles an aggregate may cover (audit v3, AGG-4). On a
+            // chain without aggregation it is empty on both sides and this compares nothing.
+            && self.unsealed_fees == o.unsealed_fees
     }
 }
 impl Eq for Ledger {}
@@ -1663,6 +1667,29 @@ impl Ledger {
     /// re-domained `rand-state-4` — whether or not aggregation is also on, since a tokens-off
     /// chain must still fall through to today's `rand-state-2`/`rand-state-3` paths unchanged.
     /// The aggregators root, when present, is still the last component appended.
+    /// The proving-share bucket as one root: a leaf per entry, in the map's own (transaction-hash)
+    /// order, each binding the whole entry.
+    ///
+    /// Committed because the bucket decides payment and coverability (audit v3, AGG-4). Before
+    /// this it was "derived state like supply" and sat outside the root, so two replicas that
+    /// disagreed about it — one that lost an entry, one that kept an expired one — computed the
+    /// same state root and stayed in consensus while paying different aggregators.
+    pub fn unsealed_root(&self) -> Hash {
+        let leaves: Vec<Hash> = self
+            .unsealed_fees
+            .iter()
+            .map(|(tx, (excess, proposer, until))| {
+                let mut buf = Vec::with_capacity(32 + 8 + 32 + 8);
+                buf.extend_from_slice(tx.as_bytes());
+                buf.extend_from_slice(&excess.to_le_bytes());
+                buf.extend_from_slice(&proposer.0);
+                buf.extend_from_slice(&until.to_le_bytes());
+                Hash::digest_domain(b"rand-unsealed-leaf-1", &buf)
+            })
+            .collect();
+        crate::crypto::merkle_root(&leaves)
+    }
+
     pub fn state_root(&self) -> Hash {
         let (nf_root, val_root, prog_root) = self.state_root_leaves();
         let mut buf = Vec::with_capacity(128);
@@ -1677,11 +1704,13 @@ impl Ledger {
             buf.extend_from_slice(tokens.root().as_bytes());
             if self.aggregation.is_some() {
                 buf.extend_from_slice(aggregation::aggregators_root(&self.aggregators).as_bytes());
+                buf.extend_from_slice(self.unsealed_root().as_bytes());
             }
             return Hash::digest_domain(b"rand-state-4", &buf);
         }
         if self.aggregation.is_some() {
             buf.extend_from_slice(aggregation::aggregators_root(&self.aggregators).as_bytes());
+            buf.extend_from_slice(self.unsealed_root().as_bytes());
             return Hash::digest_domain(b"rand-state-3", &buf);
         }
         Hash::digest_domain(b"rand-state-2", &buf)
