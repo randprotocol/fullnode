@@ -64,6 +64,10 @@ pub struct NodeConfig {
     pub max_timeout: Duration,
     /// Chain integrity check at startup; damaged tail is truncated and resynced from peers.
     pub verify: VerifyMode,
+    /// Let the viewing-key RPC methods answer callers that are not on loopback. Off by default:
+    /// nothing in the RPC authenticates anyone, and the facility is meant for this node's own
+    /// explorer (audit v3, VK-3).
+    pub viewing_open: bool,
     /// Keep the raw proofs of sealed bundles (spec §6.2's archive flag): the pruning pass
     /// never runs when set.
     pub keep_raw_proofs: bool,
@@ -420,6 +424,8 @@ struct Node {
     /// Viewing keys imported over RPC, shared with the `RpcState`; read here only so
     /// `publish_status` can report the count (`NodeStatus::viewing_keys`).
     viewing: Arc<RwLock<crate::viewing::Registry>>,
+    /// The registry's live key count, for `publish_status` (audit v3, VK-1).
+    viewing_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Committed heads, for whatever WebSocket clients are subscribed. Held here rather than read
     /// back out of the `RpcState` because this is the only place that writes it.
     heads: broadcast::Sender<rpc::HeadSummary>,
@@ -758,11 +764,13 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // Viewing keys imported over RPC (`rand_importViewingKey`), in memory only. Shared with the
     // node loop purely so `rand_status` can say how many keys this process is holding.
     let viewing = Arc::new(RwLock::new(crate::viewing::Registry::default()));
+    let viewing_count = viewing.read().unwrap_or_else(|e| e.into_inner()).count();
     // The RPC's limits, computed once from the genesis ledger.
     let rpc_limits = rpc::ChainLimits::of(&gs.ledger);
     let (rpc_addr, rpc_task) = rpc::serve(
         cfg.rpc_addr,
         RpcState {
+            viewing_open: cfg.viewing_open,
             storage: storage.clone(),
             status: status.clone(),
             node: cmd_tx,
@@ -829,6 +837,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         net: net.clone(),
         status: status.clone(),
         viewing,
+        viewing_count,
         heads,
         commits,
         refusals,
@@ -993,7 +1002,9 @@ impl Node {
         // questions for an operator.
         s.refused_cache = self.refused.len();
         s.verify_queue = self.verify_queue.len();
-        s.viewing_keys = self.viewing.read().unwrap_or_else(|e| e.into_inner()).len();
+        // Read without touching the registry's lock: this runs on the node loop every pass, and a
+        // scan holds its own key's lock for as long as it takes (audit v3, VK-1).
+        s.viewing_keys = self.viewing_count.load(std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The tip ledger the pending verifications run against, cloned at most once per tip change.
