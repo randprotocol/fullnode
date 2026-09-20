@@ -437,7 +437,7 @@ impl Genesis {
             check_bridge(bridge)?;
         }
         if let Some(aggregation) = &self.aggregation {
-            check_aggregation(aggregation)?;
+            check_aggregation(aggregation, &self.fri_profile)?;
         }
         // S2 divides by `epoch_blocks` to get the epoch of a height; a genesis file that says
         // zero would panic every node on the first block rather than at the one place that
@@ -812,7 +812,10 @@ fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
 /// halving interval or window (each would make a rule the section exists to create
 /// meaningless), or an admitted shape whose aggregate-program digest is all zero — the
 /// activation placeholder, which must never reach a fleet (spec §10's `FILL-AT-ACTIVATION`).
-fn check_aggregation(cfg: &crate::ledger::aggregation::AggregationConfig) -> Result<(), GenesisError> {
+fn check_aggregation(
+    cfg: &crate::ledger::aggregation::AggregationConfig,
+    fri_profile: &str,
+) -> Result<(), GenesisError> {
     let bad = |m: String| Err(GenesisError::BadAggregationConfig(m));
     if cfg.bond == 0 {
         return bad("zero bond".into());
@@ -828,6 +831,20 @@ fn check_aggregation(cfg: &crate::ledger::aggregation::AggregationConfig) -> Res
     }
     if cfg.admitted_shapes.iter().any(|s| s.aggregate_program_digest == [0; 4]) {
         return bad("an admitted shape has no aggregate-program digest (the activation placeholder)".into());
+    }
+    // An admitted shape declares a FRI profile of its own, and it has to be the chain's (audit v3,
+    // CHAIN9-1). A mismatch is not unsafe — every aggregate would be refused as an unregistered
+    // shape — but it leaves aggregation dead on a chain that believes it has it, and the first
+    // aggregator to bond is what discovers that. Cheap to catch here, expensive to find later.
+    let want = match fri_profile {
+        "test" => crate::types::FriProfile::Test,
+        _ => crate::types::FriProfile::Production,
+    };
+    if let Some(s) = cfg.admitted_shapes.iter().find(|s| s.shape.profile != want) {
+        return bad(format!(
+            "an admitted shape declares the {:?} profile on a {fri_profile} chain",
+            s.shape.profile
+        ));
     }
     Ok(())
 }
@@ -983,6 +1000,53 @@ mod tests {
 
     fn build(g: &Genesis) -> GenesisState {
         g.build(&StubExecutor).unwrap()
+    }
+
+    /// Audit v3, CHAIN9-1: the admitted shapes are declared with a FRI profile of their own, and
+    /// nothing checked it against the chain's. A production chain admitting a Test-profile shape
+    /// is not unsafe — every aggregate is refused as an unregistered shape — but aggregation is
+    /// then dead on a chain that believes it has it, discovered only when the first aggregator
+    /// bonds. The genesis is where that is cheap to catch.
+    #[test]
+    fn an_admitted_shape_must_carry_the_chains_own_fri_profile() {
+        use crate::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use crate::types::{DeclaredShape, FriProfile};
+        let with = |profile: FriProfile, chain: &str| {
+            let mut g = base_genesis();
+            g.fri_profile = chain.into();
+            let shape = DeclaredShape {
+                profile,
+                tier: 21,
+                program_log_height: 12,
+                input_log_height: 10,
+                keccak_log_height: 0,
+                sha256_log_height: 0,
+                public_log_height: 2,
+                mem_log_height: 16,
+            };
+            g.aggregation = Some(AggregationConfig {
+                bond: 1_000,
+                max_covers: 3,
+                subsidy_base: 100,
+                halving_blocks: 210_000,
+                window: 256,
+                admitted_shapes: vec![AdmittedShape {
+                    shape,
+                    hc: Hash::digest(b"the bundle guest"),
+                    aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap(),
+                }],
+            });
+            g.validate()
+        };
+        assert!(with(FriProfile::Production, "production").is_ok(), "the chain's own profile is fine");
+        assert!(with(FriProfile::Test, "test").is_ok());
+        let e = with(FriProfile::Test, "production").unwrap_err();
+        assert!(
+            matches!(&e, GenesisError::BadAggregationConfig(m) if m.contains("profile")),
+            "a Test shape on a production chain was accepted: {e}"
+        );
+        let e = with(FriProfile::Production, "test").unwrap_err();
+        assert!(matches!(&e, GenesisError::BadAggregationConfig(m) if m.contains("profile")), "{e}");
     }
 
     /// Core I-2. On a chain with a `tokens` section an alloc commitment is no longer opaque:

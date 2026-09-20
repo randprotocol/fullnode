@@ -130,6 +130,10 @@ pub enum AggregationError {
     CoveredShapeMismatch { cover: Hash, field: &'static str, expected: u8, actual: u8 },
     #[error("covered bundle {0} is a proof of another guest")]
     CoveredGuestMismatch(Hash),
+    /// The genesis pinned an aggregate-program digest this build does not produce (audit v3,
+    /// AGG-6): the chain and the binary disagree about what an aggregate proof even is.
+    #[error("the genesis pins aggregate program {pinned:?}; this build emits {built:?}")]
+    AggregateProgramMismatch { pinned: [u64; 4], built: [u64; 4] },
     /// The cover set's node-side half (spec §3.2): the hash names no committed transaction.
     #[error("cover {0} names no committed transaction")]
     UnknownCover(Hash),
@@ -473,6 +477,26 @@ pub(super) fn validate_aggregate(
         if (0..8).any(|k| c.public_values[pv::HC0 + k] != hc_words[k] as u64) {
             return Err(AggregationError::CoveredGuestMismatch(*cover).into());
         }
+    }
+    // 7b. The genesis pin, enforced (audit v3, AGG-6). `admitted_shapes[i].aggregate_program_digest`
+    //     is measured at activation and bound into the genesis hash, but nothing ever compared it
+    //     with the program this build emits: `verify_aggregate` verifies against whatever
+    //     `aggregate_program` produces here and now, so the pin decided nothing and upstream drift
+    //     — or the AGG-2 program change — would go unnoticed until two nodes disagreed on a block.
+    //     Cheap (a DSL emission, no proof) and before the rVM verify, in this function's
+    //     cheap-before-expensive order.
+    match executor.aggregate_program_digest(&first.shape) {
+        Ok(built) if built == admitted.aggregate_program_digest => {}
+        Ok(built) => {
+            return Err(AggregationError::AggregateProgramMismatch {
+                pinned: admitted.aggregate_program_digest,
+                built,
+            }
+            .into())
+        }
+        // An executor that cannot build the program at all (the stub, and any build without the
+        // rVM) says so through the proof step below, where it also says what it cannot do.
+        Err(_) => {}
     }
     // 8. The proof: the interface-list recompute and digest compare, then the rVM
     //    `Machine::verify` — the executor's pair, the one expensive step, last.
@@ -1504,7 +1528,7 @@ mod admission_tests {
             subsidy_base: 100 * crate::types::UNITS_PER_RAND,
             halving_blocks: 210_000,
             window: 256,
-            admitted_shapes: vec![AdmittedShape { shape: shape(), hc: guest_hc(), aggregate_program_digest: [1; 4] }],
+            admitted_shapes: vec![AdmittedShape { shape: shape(), hc: guest_hc(), aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape()).unwrap() }],
         }
     }
 
@@ -1619,6 +1643,36 @@ mod admission_tests {
             l.bucket_excess(c, 0, p, u64::MAX);
         }
         (l, kp)
+    }
+
+    /// Audit v3, AGG-6: the genesis pins an aggregate-program digest, and until now nothing ever
+    /// compared it with the program the running build emits — `verify_aggregate` verifies against
+    /// whatever `aggregate_program` produces here and now, so the pin decided nothing. A build
+    /// whose rVM drifted (or one carrying AGG-2's program change against a chain cut before it)
+    /// would have gone on accepting aggregates until two nodes disagreed about a block.
+    #[test]
+    fn an_aggregate_program_the_genesis_did_not_pin_is_refused() {
+        let (mut l, kp) = setup();
+        // The chain pins a digest that is not this executor's.
+        let mut cfg = l.aggregation().expect("an aggregating chain").clone();
+        cfg.admitted_shapes[0].aggregate_program_digest = [0xdeadbeef; 4];
+        l.set_aggregation(Some(cfg));
+
+        let tx = aggregate_tx(&kp, 0, 100, covers(2), b"ok".to_vec());
+        let covered = covered_records(&shape(), &[1, 2]);
+        match l.validate_aggregate(&tx, &covered, &StubExecutor) {
+            Err(TxError::Aggregation(AggregationError::AggregateProgramMismatch { pinned, built })) => {
+                assert_eq!(pinned, [0xdeadbeef; 4]);
+                assert_eq!(built, StubExecutor.aggregate_program_digest(&shape()).unwrap());
+            }
+            other => panic!("a pin this build cannot produce must be refused, got {other:?}"),
+        }
+        // The check is cheap and comes before the rVM verify: the same chain with the pin the
+        // build does produce validates as before.
+        let mut cfg = l.aggregation().expect("an aggregating chain").clone();
+        cfg.admitted_shapes[0].aggregate_program_digest = StubExecutor.aggregate_program_digest(&shape()).unwrap();
+        l.set_aggregation(Some(cfg));
+        assert!(l.validate_aggregate(&tx, &covered, &StubExecutor).is_ok());
     }
 
     /// The happy path, end to end through the covered-carrying entry: steps 1–8 pass, the
@@ -1969,7 +2023,7 @@ mod payment_tests {
             subsidy_base: 100 * crate::types::UNITS_PER_RAND,
             halving_blocks: 210_000,
             window,
-            admitted_shapes: vec![AdmittedShape { shape: shape(), hc: Hash::digest(b"the bundle guest"), aggregate_program_digest: [1; 4] }],
+            admitted_shapes: vec![AdmittedShape { shape: shape(), hc: Hash::digest(b"the bundle guest"), aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape()).unwrap() }],
         }
     }
 

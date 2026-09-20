@@ -3056,7 +3056,7 @@ mod tests {
             subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
             halving_blocks: 210_000,
             window: 1,
-            admitted_shapes: vec![AdmittedShape { shape, hc: Hash([3; 32]), aggregate_program_digest: [1; 4] }],
+            admitted_shapes: vec![AdmittedShape { shape, hc: Hash([3; 32]), aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap() }],
         };
         let mut gs = genesis_of(7, &[&key(1), &key(2)], vec![], 1_000);
         gs.ledger.set_aggregation(Some(cfg));
@@ -4626,7 +4626,7 @@ mod seal_tests {
             subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
             halving_blocks: 210_000,
             window,
-            admitted_shapes: vec![AdmittedShape { shape, hc, aggregate_program_digest: [1; 4] }],
+            admitted_shapes: vec![AdmittedShape { shape, hc, aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap() }],
         }
     }
 
