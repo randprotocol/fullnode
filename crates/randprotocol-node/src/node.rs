@@ -537,6 +537,16 @@ struct BatchDecision {
     clear_inflight: bool,
 }
 
+/// The node's committed history and the set's disagree. Carried as a typed error so the sync
+/// path, which reports most failures as "sync batch rejected" and moves to another peer, lets this
+/// one through and stops the node (review M2).
+#[derive(Debug, thiserror::Error)]
+#[error("consensus safety violation: committed {committed:?}, attempted {attempted:?}")]
+pub struct FatalSafety {
+    pub committed: Hash,
+    pub attempted: Hash,
+}
+
 /// A batch is judged by what it holds, not by which request asked for it.
 ///
 /// The node used to drop any response whose id was not the current one, which threw away good
@@ -1183,7 +1193,9 @@ impl Node {
                 // store (audit v3).
                 Action::SafetyViolation { committed, attempted } => {
                     tracing::error!(?committed, ?attempted, "conflicting finality: stopping this node");
-                    anyhow::bail!("consensus safety violation: committed {committed:?}, attempted {attempted:?}");
+                    // Tagged, because the sync path turns an ordinary error into "sync batch
+                    // rejected" and carries on (review M2): this one must not be swallowed there.
+                    return Err(anyhow::Error::new(FatalSafety { committed, attempted }));
                 }
                 Action::Broadcast(m) | Action::SendTo(_, m) => {
                     self.net.broadcast(GossipMessage::Consensus(m)).await;
@@ -1764,6 +1776,10 @@ impl Node {
                         tracing::info!(%peer, "{e}; asking another peer for the raw form");
                         self.sync_from(Some(peer)).await;
                         return Ok(());
+                    }
+                    // Conflicting finality stops this node; it is not a bad peer (review M2).
+                    if e.downcast_ref::<FatalSafety>().is_some() {
+                        return Err(e);
                     }
                     // Blocks we asked for and could not use: a peer on a different chain, or a
                     // damaged batch. It cost us a round trip either way.

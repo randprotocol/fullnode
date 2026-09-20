@@ -848,6 +848,34 @@ fn a_resumed_validator_keeps_its_lock() {
         "the lock must survive a restart"
     );
     assert_eq!(sim.nodes[victim].locked_qc().block_hash, locked_before.block_hash);
+
+    // The field is not the point; the withheld vote is (review M5). A proposal on a branch that
+    // does not extend the locked block, justified by a QC older than the lock, must get no vote
+    // from the restarted replica — which is exactly the vote a conflicting QC would need.
+    let parent = sim.nodes[victim].block(&sim.nodes[victim].committed_hash()).cloned().expect("head in tree");
+    let view = sim.nodes[victim].view();
+    let leader = sim.nodes[victim].leader(view);
+    let li = sim.addr_to_idx[&leader];
+    let header = crate::types::BlockHeader {
+        height: parent.height() + 1,
+        view,
+        parent: parent.hash(),
+        proposer: sim.keys[li].public_key().clone(),
+        timestamp_ms: sim.now,
+        tx_root: Hash::ZERO,
+        state_root: parent.header.state_root,
+        // Older than the lock: the replica may only vote if the block extends what it is locked on.
+        justify: QuorumCertificate::genesis(sim.nodes[victim].committed_hash()),
+    };
+    let conflicting = Block::sign(header, vec![], &sim.keys[li]);
+    let acts = sim.nodes[victim].on_proposal(conflicting, sim.now).unwrap_or_default();
+    assert!(
+        !acts.iter().any(|a| matches!(
+            a,
+            Action::Broadcast(ConsensusMessage::Vote(_)) | Action::SendTo(_, ConsensusMessage::Vote(_))
+        )),
+        "a restarted replica voted against its own lock"
+    );
 }
 
 /// The same promise on the sync path: `apply_synced` rebuilds the replica through `resume` after
