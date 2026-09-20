@@ -444,7 +444,11 @@ struct Node {
     timeout: Option<(u64, Instant)>,
     propose_at: Option<(u64, Instant)>,
     last_block_at: Instant,
-    sync_inflight: Option<(PeerId, libp2p::request_response::OutboundRequestId, Instant)>,
+    /// The outstanding batch request: peer, request id, when it went out, and **the height it
+    /// asked from**. The height rides here rather than in a field of its own (review round 3, R1)
+    /// so it cannot outlive the request — every path that drops the request drops it too, and a
+    /// late answer is judged against the height its own request asked for.
+    sync_inflight: Option<(PeerId, libp2p::request_response::OutboundRequestId, Instant, u64)>,
     /// Blocks to ask for in the next batch. Halved toward [`SYNC_BATCH_MIN`] after a failure and
     /// reset to [`SYNC_BATCH`] after a batch applies, so a batch size the wire cannot carry is
     /// backed away from instead of retried forever.
@@ -453,12 +457,6 @@ struct Node {
     /// blocks we hold above the head turn out not to be the ancestors of what peers are serving
     /// (review C2).
     sync_from_committed: bool,
-    /// The height the outstanding sync request asked from. A batch is judged against *this*, not
-    /// against whatever the tree looks like when the answer lands (review round 2, N1): the two
-    /// disagree exactly when the fallback above fired, so judging by the tree threw away the very
-    /// answer the fallback asked for and left the node alternating between two useless requests
-    /// forever.
-    sync_asked_from: Option<u64>,
     /// Sync batch requests that *failed*: a wire or codec error, a give-up past the wire timeout,
     /// or a batch we asked for and could not apply. Surfaced in `rand status`, because the
     /// failure mode this counts was invisible on chain 8.
@@ -847,7 +845,6 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         sync_inflight: None,
         sync_batch: SYNC_BATCH,
         sync_from_committed: false,
-        sync_asked_from: None,
         sync_failures: 0,
         sync_late_batches: 0,
         fetch_inflight: HashMap::new(),
@@ -991,7 +988,7 @@ impl Node {
         // Without these, a node that is `syncing: true` with a rising target and no warning in the
         // log looks healthy while making no progress at all — which is exactly how chain 8's
         // catch-up stall presented.
-        s.sync_inflight_age_ms = self.sync_inflight.map(|(_, _, at)| at.elapsed().as_millis() as u64);
+        s.sync_inflight_age_ms = self.sync_inflight.map(|(_, _, at, _)| at.elapsed().as_millis() as u64);
         s.sync_failures = self.sync_failures;
         s.sync_late_batches = self.sync_late_batches;
         s.ws_clients = self.ws_conns.load(SeqCst);
@@ -1516,7 +1513,7 @@ impl Node {
             NetworkEvent::SyncFailed { peer, request_id, error } => {
                 let was_batch = self.sync_inflight.map(|s| s.1) == Some(request_id);
                 if was_batch {
-                    let elapsed = self.sync_inflight.map(|(_, _, at)| at.elapsed().as_millis() as u64).unwrap_or(0);
+                    let elapsed = self.sync_inflight.map(|(_, _, at, _)| at.elapsed().as_millis() as u64).unwrap_or(0);
                     self.sync_failures += 1;
                     self.sync_inflight = None;
                     // Halve the batch, down to a single block. A batch too big for the wire fails
@@ -1679,7 +1676,7 @@ impl Node {
     ///
     /// Only *connected* peers are candidates; see [`Peer`].
     async fn sync_from(&mut self, skip: Option<PeerId>) {
-        if let Some((peer, id, started)) = self.sync_inflight {
+        if let Some((peer, id, started, _asked)) = self.sync_inflight {
             if started.elapsed() < self.wire.sync_request_timeout {
                 return;
             }
@@ -1690,7 +1687,6 @@ impl Node {
             );
             self.sync_failures += 1;
             self.sync_inflight = None;
-            self.sync_asked_from = None;
         }
         // Ask above what we *hold*, not above what we have committed (review C2). A batch whose
         // blocks the three-chain rule cannot commit — three blocks over the byte budget is enough,
@@ -1714,8 +1710,7 @@ impl Node {
             let Some(peer) = pick_sync_peer(&self.peers, my_height, self.best_peer_height(), &skipped) else { return };
             let req = SyncRequest::Blocks { from_height: my_height + 1, max: self.sync_batch };
             if let Some(id) = self.net.send_sync_request(peer, req).await {
-                self.sync_inflight = Some((peer, id, Instant::now()));
-                self.sync_asked_from = Some(my_height);
+                self.sync_inflight = Some((peer, id, Instant::now(), my_height));
                 return;
             }
             tracing::warn!(%peer, "sync request could not be sent; trying another peer");
@@ -1751,13 +1746,14 @@ impl Node {
             }
             SyncResponse::Blocks(blocks) => {
                 let current = self.sync_inflight.map(|s| s.1) == Some(request_id);
-                let elapsed = self.sync_inflight.map(|(_, _, at)| at.elapsed().as_millis() as u64);
+                let elapsed = self.sync_inflight.map(|(_, _, at, _)| at.elapsed().as_millis() as u64);
                 // The height this node actually asked from (review round 2, N1). Falling back to
                 // the tree's current shape is only right when no request is outstanding: after the
                 // committed-head fallback fired they differ, and judging by the tree ignored the
                 // answer to the request we had just sent.
                 let my_height = self
-                    .sync_asked_from
+                    .sync_inflight
+                    .map(|(_, _, _, asked)| asked)
                     .unwrap_or_else(|| self.hs.pending_tip_height().max(self.hs.committed_height()));
                 let d = batch_decision(blocks.first().map(|b| b.block.height()), my_height, current);
                 if d.clear_inflight {
@@ -2098,6 +2094,10 @@ impl Node {
                     self.handle_actions(acts).await?;
                     break;
                 }
+                // A block at or below the committed head is one we already have: the rest of the
+                // batch may still be new, so keep going (review round 3, R2). Any other refusal is
+                // about this branch, and the blocks above it descend from the block just refused.
+                Err(randprotocol_core::consensus::ConsensusError::Stale(_)) => continue,
                 Err(e) => {
                     tracing::debug!("synced block {height} not taken by the replica: {e}");
                     break;
