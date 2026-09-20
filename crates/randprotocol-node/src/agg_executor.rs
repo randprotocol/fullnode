@@ -70,6 +70,36 @@ fn zkvm_profile(profile: randprotocol_core::types::FriProfile) -> FriProfile {
     }
 }
 
+/// The rVM tiers an aggregate proof may land at, per FRI profile (spec §3.3: "the register
+/// admits the rVM tiers {21, 22, 23} for the one registered inner shape; a proof at any other
+/// tier is invalid").
+///
+/// Nothing enforced this before (audit v3, AGG-3). `Machine::verify` accepts any tier on the
+/// ladder and builds the verifier key for whatever the proof declares *before* verifying it — so
+/// a proposer could put an invalid aggregate at an unwarmed tier in a block and every replica
+/// would pay a 30–70 s key build, on the consensus loop at block apply, before refusing it.
+///
+/// Production is the spec's three; test is the one the fixtures and the warm path use, plus its
+/// two neighbours for the same N=2/N=3 reason.
+pub fn admitted_tiers(profile: FriProfile) -> &'static [u8] {
+    match profile {
+        FriProfile::Test => &[19, 20, 21],
+        FriProfile::Production => &[21, 22, 23],
+    }
+}
+
+/// The gate itself, split out so it can be tested without a proof: building one costs a fixture
+/// cache and minutes of proving, and what matters here is the rule and where it runs.
+pub fn check_tier(profile: FriProfile, tier: u8) -> Result<(), ConfidentialError> {
+    if admitted_tiers(profile).contains(&tier) {
+        return Ok(());
+    }
+    Err(ConfidentialError::InvalidAggregateProof(format!(
+        "aggregate proof at tier {tier}; this chain admits {:?}",
+        admitted_tiers(profile)
+    )))
+}
+
 impl ConfidentialExecutor for AggExecutor {
     fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
         self.inner.check_program(base_pc, words)
@@ -124,7 +154,7 @@ impl ConfidentialExecutor for AggExecutor {
         Ok(randprotocol_rvm::programs::aggregate_program_digest(&vk.shape, &vk.key).map(|f| f.as_canonical_u64()))
     }
 
-    /// spec §4 steps 7–8: the §4.4 interface list is recomputed from the covered bundles' public
+/// spec §4 steps 7–8: the §4.4 interface list is recomputed from the covered bundles' public
     /// values (auxiliary data, the `verify_public` pattern — the proof carries only its digest),
     /// then the rVM's own `verify_aggregate` does the digest compare and the `Machine::verify`.
     /// Cheap refusals come first: the empty set and the undecodable proof never reach a program
@@ -148,6 +178,11 @@ impl ConfidentialExecutor for AggExecutor {
         if rvm_proof.to_bytes() != proof {
             return Err(ConfidentialError::MalformedProof);
         }
+        // The tier, before any key work (audit v3, AGG-3). Everything below — `inner_key`, the
+        // program build, `verify_aggregate`'s `verifier_key` — is seconds to a minute of work that
+        // an *invalid* proof could otherwise buy at an unwarmed tier, on the consensus loop at
+        // block apply. The admitted set is the spec's, per profile.
+        check_tier(self.rvm.profile, rvm_proof.tier.0 as u8)?;
         let vk = Self::inner_key(shape)?;
         let pvs: Vec<Vec<u64>> = covered.iter().map(|c| c.public_values.to_vec()).collect();
         let public = randprotocol_rvm::public_values::interface_words(&vk.shape, &vk.key, &pvs);
@@ -176,17 +211,20 @@ impl ConfidentialExecutor for AggExecutor {
             }
         };
         let program = aggregate_program(&vk);
-        let tier = match self.rvm.profile {
-            FriProfile::Test => 19,
-            FriProfile::Production => 21,
-        };
         // The reduce flag tracks the program, not a guess: `Precompiles::On` emits a REDUCE
         // instruction per query opening, so the batch carries the reduce instance exactly when
         // the program has such an instruction (`machine::verifier_key`'s third key component).
         let reduce = program.instrs.iter().any(|i| matches!(i.op, randprotocol_rvm::isa::Op::Reduce));
-        let _ = self.rvm.verifier_key(&program, randprotocol_rvm::machine::Tier(tier), reduce);
+        // *Every* admitted tier, not just the N=1 landing tier (audit v3, AGG-3): an aggregate
+        // covering two or three bundles lands higher, and paying its key build inside admission —
+        // on the consensus loop — is what this warm exists to avoid. The tiers above N=1 are rarer,
+        // not cheaper.
+        for tier in admitted_tiers(self.rvm.profile) {
+            let _ = self.rvm.verifier_key(&program, randprotocol_rvm::machine::Tier(*tier as usize), reduce);
+        }
         tracing::info!(
-            "aggregation: aggregate program built and the tier-{tier} verifier key warmed ({:.1?})",
+            "aggregation: aggregate program built and the verifier keys for tiers {:?} warmed ({:.1?})",
+            admitted_tiers(self.rvm.profile),
             t0.elapsed()
         );
     }
@@ -279,6 +317,30 @@ mod tests {
             w.aggregate_program_digest(&shape).unwrap(),
             "the build is deterministic — the genesis-pinned value is reproducible"
         );
+    }
+
+    /// Audit v3, AGG-3: the spec admits rVM tiers {21, 22, 23} (production) and nothing checked
+    /// it. `Machine::verify` builds the verifier key for whatever tier the proof declares *before*
+    /// verifying the proof, so a proposer could put an invalid aggregate at an unwarmed tier in a
+    /// block and every replica would pay a 30–70 s key build — on the consensus loop, at block
+    /// apply — before refusing it.
+    #[test]
+    fn a_proof_at_an_unadmitted_tier_is_refused() {
+        for t in admitted_tiers(FriProfile::Production) {
+            assert!(check_tier(FriProfile::Production, *t).is_ok(), "tier {t} is admitted");
+        }
+        for t in [8u8, 18, 20, 24, 255] {
+            match check_tier(FriProfile::Production, t) {
+                Err(ConfidentialError::InvalidAggregateProof(m)) => {
+                    assert!(m.contains(&t.to_string()), "the refusal names the tier: {m}")
+                }
+                other => panic!("tier {t} must be refused on a production chain, got {other:?}"),
+            }
+        }
+        // The profiles admit different sets: a test-profile proof's tier is not a production one.
+        assert!(check_tier(FriProfile::Test, 19).is_ok());
+        assert!(check_tier(FriProfile::Production, 19).is_err());
+        assert!(check_tier(FriProfile::Test, 23).is_err());
     }
 
     /// Cheap refusals, before any program build: the empty cover set and the undecodable proof.
