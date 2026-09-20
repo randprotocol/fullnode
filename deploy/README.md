@@ -63,6 +63,12 @@ S3-only) understands.
 > and only diverge later, on proof verification. The chain id is what actually keeps the two fleets
 > apart. Check the build, not the bundle digest: `bin-03c9fb9/`, `.update-pin` = `03c9fb9`.
 
+**Every tag bumps the workspace version.** `Cargo.toml`'s `[workspace.package] version` is what
+`rand_getVersion` reports, and it read `0.1.0` through v0.2, v0.3 and v0.4 because nothing bumped
+it and the test compared the crate with itself (audit v3, PROC-3). The RPC test now pins the
+expected string, so it fails until the bump is made.
+
+
 ## The 18 validators
 
 > **This table is chains 8–13 history.** Those chains shared one set of validator and payout keys
