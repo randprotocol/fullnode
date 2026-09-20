@@ -1,0 +1,131 @@
+# The audit's PROC-1: three regression tests that fail on v0.1 existed and nothing ran them on
+# push; an 87-minute release suite was run by hand; a hard fork reached sixteen droplets and came
+# back within a day. CI from a clean checkout is the cheapest thing that would have caught any of
+# it.
+#
+# Two jobs, because the suites are two different animals:
+#
+#   check-and-test  every push and pull request, minutes. `cargo check --workspace --tests`
+#                   (a `--lib`-only gate has silently broken `main.rs` and `tests/` here before)
+#                   and every library suite. The proving suites and the fixture-backed aggregation
+#                   tests are skipped by name — see below.
+#   nightly         the long ones: the wallet flow and the cluster suite really prove bundles
+#                   (~90 minutes together on this project's own machines).
+#
+# `randprotocol-zkvm` has *path* dependencies on `../../../circuits/guests-compiled/{evm-core,
+# sbpf-core}`, so the circuits repository must be checked out as a sibling directory named
+# `circuits/` or nothing in this workspace builds. It is public: randprotocol/zkp-circuits.
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # 18:00 UTC daily, for the proving suites.
+    - cron: "0 18 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  # The circuits commit this tree's vendored crates were synced from (deploy/sync-zkvm.sh). Bump it
+  # in the same commit as a re-vendor, or CI builds this workspace against a tree it did not vendor.
+  CIRCUITS_PIN: 7ef3220a2fe46345c7335647cb2ef949a6c8199c
+
+jobs:
+  check-and-test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fullnode
+      - uses: actions/checkout@v4
+        with:
+          repository: randprotocol/zkp-circuits
+          ref: ${{ env.CIRCUITS_PIN }}
+          path: circuits
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fullnode
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      # The gate that has actually caught things here: `--lib` compiles neither `src/main.rs` nor
+      # `tests/`, so a change to a shared type can pass a library test run and break both.
+      - name: Check every target
+        working-directory: fullnode
+        run: cargo check --workspace --tests
+      - name: Library suites
+        working-directory: fullnode
+        # The skips, and why each one is here (checked by running them, not by reading names):
+        #   agg_executor::, and the aggregation tests scattered through node::, rpc:: and
+        #     storage::seal_tests, need a RECURSION_FIXTURES cache. A fixture is minutes of real
+        #     proving, and `fixture_proof` panics loudly rather than skipping when the cache is
+        #     absent — deliberately, so a fleet build cannot quietly not test aggregation. On a
+        #     clean runner there is no cache, so they are named here and covered by the nightly job.
+        #   round_trips / two_test_profile are the rVM's own long proving tests.
+        run: |
+          cargo test --workspace --lib --bins --release -- \
+            --skip agg_executor:: \
+            --skip round_trips --skip two_test_profile \
+            --skip node::tests::a_batch_cut \
+            --skip node::tests::a_proposal_carrying_an_aggregate \
+            --skip node::tests::assembly_ \
+            --skip node::tests::the_covered_source_answers_replayed_history_past_the_window \
+            --skip node::tests::the_extension_stops_at_the_reader_limit_and_serves_what_it_can \
+            --skip node::tests::the_sealed_coverage_rule_accepts_marks_and_batch_and_falls_back_otherwise \
+            --skip node::tests::the_serve_form_carries_the_marker_and_the_table_once_pruned \
+            --skip node::tests::validate_for_pool_ \
+            --skip rpc::tests::get_emission_is_zero_inflation_and_the_subsidy_schedule \
+            --skip rpc::tests::the_aggregation_rpc_surface_reports \
+            --skip storage::seal_tests::
+      - name: Integration suites that do not prove
+        working-directory: fullnode
+        # Named one by one rather than filtered by a `--skip` pattern: the cluster suite's proving
+        # tests are not distinguishable by name (a bond is a bundle proof; the sealed-sync capstone
+        # reads as a sync test), and a pattern that looks right silently lets 90 minutes of proving
+        # into the fast job. A new cheap test has to be added here on purpose — that is the trade.
+        run: |
+          cargo test -p randprotocol-node --release --test submit --test ws
+          cargo test -p randprotocol-node --release --test cluster -- --exact \
+            a_synced_certified_but_uncommitted_chain_is_not_committed \
+            a_batch_whose_evidence_blocks_are_junk_commits_nothing \
+            a_node_served_one_block_at_a_time_still_reaches_the_tip \
+            four_validators_plus_late_observer_syncs \
+            validator_restarts_from_disk_and_resumes \
+            restart_cycles_keep_all_nodes_in_sync \
+            two_of_four_down_halts_and_recovers_without_fork \
+            node_behind_by_more_than_one_sync_batch_catches_up \
+            corrupted_rocksdb_is_detected_truncated_and_resynced \
+            faucet_mint_via_rpc_reaches_every_node \
+            faucet_is_rejected_when_genesis_disables_it \
+            a_refused_transaction_is_not_verified_twice
+
+  nightly-proving:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fullnode
+      - uses: actions/checkout@v4
+        with:
+          repository: randprotocol/zkp-circuits
+          ref: ${{ env.CIRCUITS_PIN }}
+          path: circuits
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fullnode
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      # The wallet flow and the cluster suite prove real bundles in the test FRI profile. They take
+      # the workspace proving slot, so they run one after another whatever the runner's core count.
+      # If a hosted runner cannot carry them (memory, or wall time), point this job at a
+      # self-hosted runner on a fleet machine rather than deleting it.
+      - name: The proving suites
+        working-directory: fullnode
+        run: |
+          cargo test --workspace --release \
+            -- --skip agg_executor:: --skip round_trips --skip two_test_profile
