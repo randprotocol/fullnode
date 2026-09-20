@@ -1196,6 +1196,14 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
+### 2026-09-20 — witnesses are served from a cached tree
+
+Node-side only, no client-visible change (audit v3, RPC-1). `rand_getWitness` and
+`rand_getWitnesses` used to rebuild the whole commitment tree from every leaf on **every call**:
+a wallet proving a two-input bundle paid for two full rebuilds, a hundred callers for a hundred.
+The node now builds the tree once per change — a commit or a truncate — and serves every witness
+in between from it. The concurrency cap of two rebuilds still applies, and answers are unchanged.
+
 ### 2026-09-20 — requests are metered per client address
 
 Node-side only (audit v3, RPC-2 / decision D13). A client address gets **120 requests in a burst**,
