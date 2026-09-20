@@ -511,6 +511,26 @@ impl Mempool {
         if matches!(tx.action, Action::Aggregate { .. }) {
             ledger.preflight_aggregate(tx)?;
         }
+        // A pooled attestation whose guardian set the chain has retired can never be admitted
+        // again, and nothing else in this function looks at the bridge's sets — so before this it
+        // sat in the pool until a restart, taking a slot and being offered to every block
+        // (fullnode issue #4). Checked at every tip change through `prune`, which is where a
+        // rotation becomes visible. The size cap runs first, as everywhere: an oversized blob must
+        // not buy a decode.
+        if let Action::BridgeAttest { attestation, .. } = &tx.action {
+            if attestation.len() > randprotocol_core::gas::MAX_ATTESTATION_BYTES {
+                return Err(TxError::AttestationTooLarge);
+            }
+            if let Some(bridge) = ledger.bridge() {
+                if let Ok(att) = randprotocol_core::bridge::Attestation::decode(attestation) {
+                    if !bridge.guardian_sets.contains_key(&att.guardian_set_index) {
+                        return Err(TxError::Bridge(randprotocol_core::bridge::BridgeError::Verify(
+                            randprotocol_core::bridge::VerifyError::UnknownGuardianSet(att.guardian_set_index),
+                        )));
+                    }
+                }
+            }
+        }
         if let Some(b) = &tx.bundle {
             if !ledger.is_anchor(&b.anchor) {
                 return Err(TxError::UnknownAnchor);
@@ -1805,6 +1825,37 @@ mod tests {
         assert_ne!(other_relayer.hash(), first.hash());
         assert_eq!(l.derived_commitment(&other_relayer.action, &StubExecutor), Some(derived));
         m.insert(other_relayer, &l, &StubExecutor).unwrap();
+    }
+
+    /// Fullnode issue #4: a pooled attestation whose guardian set the chain has retired is
+    /// dropped at the next tip change. Nothing else in the pool's rules reads the bridge's sets,
+    /// so before this the transaction sat there until a restart — holding a slot and being offered
+    /// to every block, for a verdict that can now only be a refusal.
+    #[test]
+    fn a_pooled_attest_leaves_when_its_guardian_set_is_retired() {
+        let (mut l, secrets) = bridged_ledger();
+        let tx = attest_tx(&l, attestation(&secrets), 10);
+        let mut m = Mempool::new(100);
+        m.insert(tx.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.len(), 1);
+        // A tip where nothing about the bridge changed keeps it.
+        m.prune(&l);
+        assert_eq!(m.len(), 1, "an attestation on a live set stays pooled");
+
+        // Retire the set it names. (On chain this is a guardian-set rotation past its grace
+        // window; here the state is edited directly, which is what the pool sees either way.)
+        let index = randprotocol_core::bridge::Attestation::decode(match &tx.action {
+            Action::BridgeAttest { attestation, .. } => attestation,
+            _ => panic!("an attest"),
+        })
+        .unwrap()
+        .guardian_set_index;
+        let mut bridge = l.bridge().expect("a bridged chain").clone();
+        bridge.guardian_sets.remove(&index);
+        l.set_bridge(Some(bridge));
+
+        m.prune(&l);
+        assert_eq!(m.len(), 0, "the attestation outlived the set that signed it");
     }
 
     /// An oversized attestation must not buy a decode from the pre-screen.
