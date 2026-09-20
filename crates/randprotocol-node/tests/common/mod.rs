@@ -154,6 +154,7 @@ pub async fn serve_heads(capacity: usize) -> (SocketAddr, broadcast::Sender<Head
     // Nothing here sends a `NodeCommand`; the receiver is kept only so the sender stays open.
     let (node_tx, node_rx) = tokio::sync::mpsc::channel(1);
     let state = RpcState {
+            limiter: std::sync::Arc::new(randprotocol_node::rpc::RpcLimiter::default()),
         viewing_open: false,
         storage,
         status: Arc::new(RwLock::new(NodeStatus::default())),

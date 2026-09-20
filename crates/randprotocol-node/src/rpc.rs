@@ -18,8 +18,10 @@ use randprotocol_core::ledger::tokens::{Backing, MintAuthority, TokenInfo, Token
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::notes::{word8_to_hex, Envelope};
 use randprotocol_core::{Action, CallReceipt, Hash, ProgramId, ShieldedAddress, Transaction, TOKEN_DECIMALS, TOKEN_SYMBOL};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 /// The most rows one paged read may return. A wallet scanning from zero pages through the tree;
@@ -341,6 +343,8 @@ pub struct RpcState {
     /// [`crate::viewing::MAX_VIEWING_KEYS`] slots and lock the operator out until a restart, or
     /// keep scans running against the node (audit v3, VK-3).
     pub viewing_open: bool,
+    /// Per-client-address metering for this port (audit v3, RPC-2 / D13).
+    pub limiter: Arc<RpcLimiter>,
 }
 
 impl RpcState {
@@ -489,6 +493,70 @@ pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketA
 
 /// One error response object. Built from an `RpcError` so every `-32600` in this file comes from
 /// `RpcError::invalid_request` — including the oversized-body one `rejection_error` already makes.
+/// The most requests one client address may make in a burst, and the rate it refills at
+/// (audit v3, RPC-2 / decision D13). Sized for a busy wallet or explorer — a scan pages
+/// `rand_getCommitments` as fast as it can — while still bounding what one address can queue in
+/// front of the node's other work. The expensive reads have their own bound on top: witness tree
+/// rebuilds are capped process-wide by [`MAX_CONCURRENT_WITNESS_BUILDS`].
+pub const RPC_BURST: u32 = 120;
+pub const RPC_REFILL_PER_SEC: f64 = 30.0;
+
+/// The most client addresses metered at once. Past this the table keeps the addresses seen most
+/// recently: a limiter that grows without bound is itself the amplifier it exists to stop.
+pub const MAX_RPC_CLIENTS: usize = 4096;
+
+/// How long an untouched client's bucket is kept. A bucket refills on elapsed time, so an entry
+/// dropped after this is indistinguishable from a full one.
+const RPC_CLIENT_IDLE: Duration = Duration::from_secs(120);
+
+/// Per-client-address metering for the JSON-RPC port, the audit's D13 answer to RPC-2.
+///
+/// A batch spends one token per request object it carries: a batch is a request amplifier, and
+/// `MAX_BATCH` bounds one batch, not the rate. Loopback is exempt — the node's own explorer and
+/// operator tooling share the host, and the facility is not an authentication boundary.
+pub struct RpcLimiter {
+    limiter: crate::admission::PeerLimiter,
+    clients: std::sync::Mutex<HashMap<std::net::IpAddr, (crate::admission::TokenBucket, Instant)>>,
+}
+
+impl Default for RpcLimiter {
+    fn default() -> RpcLimiter {
+        RpcLimiter {
+            limiter: crate::admission::PeerLimiter::new(RPC_BURST, RPC_REFILL_PER_SEC),
+            clients: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl RpcLimiter {
+    /// Spend `cost` tokens for `ip`. `false` means this client is over its allowance right now.
+    pub fn allow_at(&self, ip: std::net::IpAddr, cost: usize, now: Instant) -> bool {
+        if ip.is_loopback() {
+            return true;
+        }
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        if clients.len() >= MAX_RPC_CLIENTS && !clients.contains_key(&ip) {
+            clients.retain(|_, (_, seen)| now.saturating_duration_since(*seen) < RPC_CLIENT_IDLE);
+            // Still full of live clients: this one is not metered rather than evicting someone
+            // else's allowance, which is the safer direction — the witness cap and the body limit
+            // still apply, and a table this size is already an operational problem to report.
+            if clients.len() >= MAX_RPC_CLIENTS {
+                tracing::warn!(clients = clients.len(), "rpc client table full; {ip} is not metered");
+                return true;
+            }
+        }
+        let entry = clients.entry(ip).or_insert_with(|| (crate::admission::TokenBucket::default(), now));
+        entry.1 = now;
+        // One token per request object: a batch of twenty costs twenty.
+        (0..cost.max(1)).all(|_| self.limiter.allow(&mut entry.0, now))
+    }
+
+    /// [`allow_at`](Self::allow_at) at this instant.
+    pub fn allow(&self, ip: std::net::IpAddr, cost: usize) -> bool {
+        self.allow_at(ip, cost, Instant::now())
+    }
+}
+
 tokio::task_local! {
     /// The address of the caller whose request this task is serving. Set by the HTTP handler and
     /// by the WebSocket upgrade; unset means an in-process caller (the tests, and anything this
@@ -566,6 +634,24 @@ async fn handle(
             return (rejection.status(), Json(error_value(Value::Null, rejection_error(&rejection, st.max_body_bytes))));
         }
     };
+    // Metered per client address, one token per request object (audit v3, RPC-2 / D13). The
+    // refusal is a 429 whose body is a JSON-RPC error, so a client that speaks only JSON-RPC can
+    // read it; loopback is exempt, so the node's own explorer and tooling are unaffected.
+    let cost = match &body {
+        Value::Array(items) => items.len(),
+        _ => 1,
+    };
+    if !st.limiter.allow(peer.ip(), cost) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(error_value(
+                Value::Null,
+                RpcError::rejected(format!(
+                    "rate limited: this node serves {RPC_BURST} requests in a burst and {RPC_REFILL_PER_SEC} a second per client"
+                )),
+            )),
+        );
+    }
     // Everything past here parsed, so the HTTP status is 200 and the errors are in the body.
     // Served inside `with_peer`, so the arms that care who is asking — the viewing-key methods —
     // can tell a loopback caller from a stranger (audit v3, VK-3).
@@ -2377,6 +2463,7 @@ mod tests {
         });
         RpcState {
             viewing_open: false,
+            limiter: Arc::new(RpcLimiter::default()),
             storage,
             status: Arc::new(RwLock::new(NodeStatus::default())),
             node: tx,
@@ -2398,6 +2485,89 @@ mod tests {
 
     async fn ok(st: &RpcState, method: &str, params: Value) -> Value {
         call(st, method, params).await.unwrap_or_else(|e| panic!("{method}: {}", e.message))
+    }
+
+    /// The handler's own answer when a client is over its allowance: HTTP 429, and a body a
+    /// JSON-RPC client can read rather than a plain-text page.
+    #[tokio::test]
+    async fn a_client_over_its_allowance_gets_a_readable_429() {
+        let (_d, st, _gs) = chain();
+        let stranger = axum::extract::ConnectInfo("203.0.113.44:5000".parse().unwrap());
+        let req = || Ok(Json(json!({ "jsonrpc": "2.0", "id": 1, "method": "rand_chainId", "params": [] })));
+        for i in 0..RPC_BURST {
+            let (code, _) = handle(State(st.clone()), stranger, req()).await;
+            assert_eq!(code, StatusCode::OK, "request {i} of the burst");
+        }
+        let (code, Json(v)) = handle(State(st.clone()), stranger, req()).await;
+        assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(v["error"]["code"], json!(-32000));
+        assert!(v["error"]["message"].as_str().unwrap().contains("rate limited"), "{v}");
+        // The same node still serves its own explorer.
+        let (code, _) = handle(
+            State(st.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:5000".parse().unwrap()),
+            req(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    /// Audit v3, RPC-2 / D13: one client address gets a burst and a refill rate, and a batch
+    /// costs what it carries. Nothing in this RPC authenticates anyone, so without this a single
+    /// address can queue work in front of everything else the node does.
+    #[test]
+    fn a_client_gets_a_burst_then_waits() {
+        let l = RpcLimiter::default();
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let t0 = Instant::now();
+        for i in 0..RPC_BURST {
+            assert!(l.allow_at(ip, 1, t0), "request {i} of the burst was refused");
+        }
+        assert!(!l.allow_at(ip, 1, t0), "the burst is not a limit if it never ends");
+        // Another address has its own allowance.
+        assert!(l.allow_at("203.0.113.8".parse().unwrap(), 1, t0));
+        // And the bucket refills on elapsed time, with no timer anywhere.
+        let later = t0 + Duration::from_secs(1);
+        for i in 0..RPC_REFILL_PER_SEC as u32 {
+            assert!(l.allow_at(ip, 1, later), "refilled request {i} was refused");
+        }
+        assert!(!l.allow_at(ip, 1, later));
+    }
+
+    /// A batch is a request amplifier: `MAX_BATCH` bounds one batch, not the rate.
+    #[test]
+    fn a_batch_costs_what_it_carries() {
+        let l = RpcLimiter::default();
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let t0 = Instant::now();
+        let batches = RPC_BURST as usize / MAX_BATCH;
+        for i in 0..batches {
+            assert!(l.allow_at(ip, MAX_BATCH, t0), "batch {i} was refused");
+        }
+        assert!(!l.allow_at(ip, MAX_BATCH, t0), "batches did not spend their contents");
+    }
+
+    /// Loopback is exempt: the node's own explorer and the operator's tooling share the host, and
+    /// this is a meter, not an authentication boundary.
+    #[test]
+    fn loopback_is_not_metered() {
+        let l = RpcLimiter::default();
+        let t0 = Instant::now();
+        for _ in 0..RPC_BURST * 3 {
+            assert!(l.allow_at("127.0.0.1".parse().unwrap(), 1, t0));
+        }
+    }
+
+    /// The table that meters clients must not itself grow without bound.
+    #[test]
+    fn the_client_table_is_bounded() {
+        let l = RpcLimiter::default();
+        let t0 = Instant::now();
+        for i in 0..MAX_RPC_CLIENTS as u32 + 500 {
+            let ip = std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+            l.allow_at(ip, 1, t0);
+        }
+        assert!(l.clients.lock().unwrap().len() <= MAX_RPC_CLIENTS, "the client table grew past its cap");
     }
 
     /// `call`, as a request from `peer` — what the viewing-key methods' loopback rule reads.

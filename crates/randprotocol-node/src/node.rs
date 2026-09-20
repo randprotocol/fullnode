@@ -774,6 +774,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     let (rpc_addr, rpc_task) = rpc::serve(
         cfg.rpc_addr,
         RpcState {
+            limiter: Arc::new(crate::rpc::RpcLimiter::default()),
             viewing_open: cfg.viewing_open,
             storage: storage.clone(),
             status: status.clone(),
