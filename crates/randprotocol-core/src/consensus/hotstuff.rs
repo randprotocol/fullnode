@@ -413,6 +413,15 @@ impl HotStuff {
     pub fn is_leader(&self, view: u64) -> bool {
         self.address() == Some(self.leader(view))
     }
+    /// The highest block this replica holds, committed or pending. A syncing node asks its peers
+    /// for blocks above this rather than above its committed head: the blocks it already holds
+    /// but has not committed are exactly the ones whose own proof it is still waiting for, and
+    /// re-fetching them forever is how a node that cannot commit a short batch stops making
+    /// progress altogether (review C2).
+    pub fn pending_tip_height(&self) -> u64 {
+        self.tree.values().map(|e| e.block.height()).max().unwrap_or(self.committed_height)
+    }
+
     pub fn has_block(&self, hash: &Hash) -> bool {
         self.tree.contains_key(hash)
     }
@@ -450,6 +459,26 @@ impl HotStuff {
     /// Returns actions (possibly `ReadyToPropose`); an empty vec means nothing changed.
     pub fn fallback_high_qc(&mut self, unobtainable: &Hash) -> Vec<Action> {
         let mut out = Vec::new();
+        // The same escape hatch for the *lock* (review I4). After a whole-fleet restart the block
+        // a validator is locked on is gone everywhere, and only the node that happens to be the
+        // next leader asks about its high QC — so a non-leader's fetch for its locked block landed
+        // here, matched nothing, and the lock was held until that validator's own leader turn came
+        // round: about thirteen turns, five minutes, before the first QC. Releasing it needs the
+        // same evidence as below — every fetch for this exact block has failed — and the same
+        // argument makes it safe: nothing above the committed head is committed.
+        if self.locked_qc.block_hash == *unobtainable
+            && self.locked_qc.view > self.head_qc.view
+            && !self.tree.contains_key(unobtainable)
+        {
+            tracing::warn!(
+                "locked block {:?} (view {}) is unobtainable; releasing the lock to the committed head QC (view {})",
+                unobtainable,
+                self.locked_qc.view,
+                self.head_qc.view
+            );
+            self.locked_qc = self.head_qc.clone();
+            self.maybe_ready_to_propose(&mut out);
+        }
         if self.high_qc.block_hash != *unobtainable || self.tree.contains_key(unobtainable) {
             return out;
         }
