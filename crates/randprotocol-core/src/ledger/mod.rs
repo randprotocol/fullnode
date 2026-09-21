@@ -299,6 +299,54 @@ struct Verified {
     attestation: Option<CheckedAttestation>,
 }
 
+/// The set of transactions whose proofs this node has already verified (audit v3, B5).
+///
+/// The key is the transaction hash, which binds the proof: `rand-txid-2` hashes the bundle
+/// proof by digest, and the transaction binding the proof itself is verified against covers the
+/// rest of the transaction. So "this hash verified" is a stateless fact — a hit vouches for
+/// these exact bytes, never for some other transaction, however the entry came to be held. The
+/// ledger consults the set at block application ([`Ledger::apply_block_with`]) and skips exactly
+/// one thing on a hit: the STARK verification (`verify_bundle` / `verify_call`). Everything else
+/// `validate_inner` does still runs — the digest compares, the bundle's structural checks, and
+/// the whole state-dependent half (anchors, nullifiers, nonces, fee floors) — so two validators
+/// holding different sets still reach byte-identical verdicts, and an entry whose transaction
+/// was evicted from the pool (or never pooled: a proof verified, then lost to a conflict) costs
+/// nothing but the re-verification it was meant to save.
+pub trait VerifiedProofs: Send + Sync {
+    fn contains(&self, tx: &Hash) -> bool;
+    /// `true` when the set holds nothing and a caller can skip computing hashes to query it
+    /// with. Provided, so an implementor that does not care about the hashing cost changes
+    /// nothing; [`NoVerified`] takes it.
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+/// The empty [`VerifiedProofs`]: what every path without an admission cache behind it passes —
+/// sync, replay, `verify_chain`, tests. On those paths every proof is verified at apply, exactly
+/// as before.
+pub struct NoVerified;
+
+impl VerifiedProofs for NoVerified {
+    fn contains(&self, _: &Hash) -> bool {
+        false
+    }
+    fn is_empty(&self) -> bool {
+        true
+    }
+}
+
+/// A locked set answers through the lock, and a poisoned one answers `false`: the cost of a
+/// wrong `false` is a re-verification, where a wrong `true` does not exist (see the trait).
+impl<T: VerifiedProofs + ?Sized> VerifiedProofs for std::sync::RwLock<T> {
+    fn contains(&self, tx: &Hash) -> bool {
+        self.read().map(|g| g.contains(tx)).unwrap_or(false)
+    }
+    fn is_empty(&self) -> bool {
+        self.read().map(|g| g.is_empty()).unwrap_or(true)
+    }
+}
+
 /// The commitment of the note a faucet mint creates: owner `pk`, no sender, `amount` of the
 /// native asset, the action's `time` and blinding `r`. Admission refuses a `Mint` whose `cm` is
 /// anything else; the wallet-side builder ([`Transaction::mint`]) computes it the same way.
@@ -1000,11 +1048,17 @@ impl Ledger {
     /// envelopes, the chain id. Without it a copier could keep a transaction's
     /// proofs byte for byte and change the rest (a burn's destination, a bond's validator, an
     /// envelope), and whichever copy committed first would spend the notes.
+    ///
+    /// `admitted` is the [`VerifiedProofs`] verdict for the transaction the bundle rides in
+    /// (audit v3, B5): on a hit the STARK verification is skipped — admission already ran it over
+    /// these exact bytes — and the digest compare above still stands, so what is left of this
+    /// function is the cheap, deterministic half of it.
     fn check_bundle_proof(
         &self,
         b: &Bundle,
         binding: &[u32; crate::types::TX_BINDING_WORDS],
         executor: &dyn ConfidentialExecutor,
+        admitted: bool,
     ) -> Result<(), TxError> {
         // A pruned bundle (spec §6.2's marker form) carries no proof to check: the covering
         // aggregate — verified when its own block applied — is what this bundle's validity
@@ -1030,17 +1084,34 @@ impl Ledger {
         if published != executor.bundle_digest(&b.digest_input()) {
             return Err(TxError::BadDigest);
         }
-        executor.verify_bundle(&self.hc_bundle, &b.proof, binding).map_err(TxError::InvalidBundleProof)
+        // B5: the one step a hit on the verified set skips. Everything else about this bundle —
+        // the digest just compared, and every structural and stateful check `validate_inner` ran
+        // before this function — is checked at apply exactly as at admission.
+        if !admitted {
+            executor.verify_bundle(&self.hc_bundle, &b.proof, binding).map_err(TxError::InvalidBundleProof)?;
+        }
+        Ok(())
     }
 
-    /// Check a transaction against the current state without applying it.
+    /// Check a transaction against the current state without applying it. This is admission's
+    /// full check — every proof verifies — so it passes [`NoVerified`]: the cache an admission
+    /// verification feeds is never what admission itself reads.
     pub fn validate(&self, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Result<(), TxError> {
-        self.validate_inner(tx, executor).map(|_| ())
+        self.validate_inner(tx, executor, &NoVerified).map(|_| ())
     }
 
     /// Spec §7, in order: cheap before expensive. Returns what it verified so `apply_tx`
     /// verifies each proof and each guardian quorum exactly once.
-    fn validate_inner(&self, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Result<Verified, TxError> {
+    ///
+    /// `verified_proofs` is the [`VerifiedProofs`] set block application carries (audit v3, B5): a
+    /// transaction whose hash it holds skips the STARK verifications — nothing else. `validate`
+    /// passes [`NoVerified`]; the apply paths pass what their caller was handed.
+    fn validate_inner(
+        &self,
+        tx: &Transaction,
+        executor: &dyn ConfidentialExecutor,
+        verified_proofs: &dyn VerifiedProofs,
+    ) -> Result<Verified, TxError> {
         // 1. size caps
         //
         // The whole transaction first: a transaction bigger than a block can never be mined, and
@@ -1226,15 +1297,25 @@ impl Ledger {
             }
         }
         // 8-9. the bundle's digest, then its proof, against this transaction's binding. Every
-        // cheap check (a burn's in step 7's arm for its action) has run by now.
+        // cheap check (a burn's in step 7's arm for its action) has run by now. B5: one query of
+        // the verified set covers both this and the call's proof below, and is skipped entirely
+        // on the `NoVerified` paths — an empty set is not worth hashing the transaction for.
+        let admitted = !verified_proofs.is_empty() && verified_proofs.contains(&tx.hash());
         if let Some(b) = bundle {
             let binding = tx.binding();
-            self.check_bundle_proof(b, &binding, executor)?;
+            self.check_bundle_proof(b, &binding, executor, admitted)?;
         }
         // 10. the call's own proof, then its fee: the tier's, and the byte term for proof and
         // envelope bytes past the free allowance (spec §7)
         if let (Some(record), Action::Call { proof, input_envelope, .. }) = (call_record, &tx.action) {
-            let outcome = executor.verify_call(record, proof).map_err(TxError::InvalidProof)?;
+            // B5: on a verified-set hit the proof is decoded, not verified — admission's
+            // `verify_call` over these same bytes already ran, and the outcome the tier's fee
+            // floor and the receipt are read from is the one it computed.
+            let outcome = if admitted {
+                executor.decode_call(record, proof).map_err(TxError::InvalidProof)?
+            } else {
+                executor.verify_call(record, proof).map_err(TxError::InvalidProof)?
+            };
             let bytes = gas::call_bytes(proof, input_envelope.as_ref());
             let min = gas::BUNDLE_BASE + gas::call_fee(outcome.tier, bytes);
             let fee = tx.fee();
@@ -1254,7 +1335,20 @@ impl Ledger {
         proposer: &Address,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Option<CallReceiptData>, TxError> {
-        let verified = self.validate_inner(tx, executor)?;
+        self.apply_tx_with(tx, proposer, executor, &NoVerified)
+    }
+
+    /// `apply_tx` against a [`VerifiedProofs`] set (audit v3, B5): the proposer's trial apply
+    /// and the consensus apply path carry the node's admission cache; everything else takes
+    /// `apply_tx` and verifies every proof, exactly as before.
+    pub fn apply_tx_with(
+        &mut self,
+        tx: &Transaction,
+        proposer: &Address,
+        executor: &dyn ConfidentialExecutor,
+        verified_proofs: &dyn VerifiedProofs,
+    ) -> Result<Option<CallReceiptData>, TxError> {
+        let verified = self.validate_inner(tx, executor, verified_proofs)?;
         if let Some(b) = &tx.bundle {
             // This method is not atomic on its own: the action step below runs after these
             // writes and can still fail (S2's `staking::apply`, S3's `bridge_notes::apply`),
@@ -1382,7 +1476,7 @@ impl Ledger {
         proposer: &Address,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
-        self.apply_transactions_with_covered(txs, proposer, &BTreeMap::new(), executor)
+        self.apply_transactions_for_sync(txs, proposer, &BTreeMap::new(), &[], executor, &NoVerified)
     }
 
     /// `apply_transactions` with the covered-bundle records any `Aggregate` among the
@@ -1396,13 +1490,14 @@ impl Ledger {
         covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
-        self.apply_transactions_for_sync(txs, proposer, covered, &[], executor)
+        self.apply_transactions_for_sync(txs, proposer, covered, &[], executor, &NoVerified)
     }
 
     /// `apply_transactions_with_covered` with the sealed form's side table (spec §7): the
     /// pruned bundles the block carries in marker form, keyed by proof hash for
     /// `check_bundle_proof`'s membership and binding checks. Empty on every path but
-    /// sealed-form sync.
+    /// sealed-form sync. `verified_proofs` is the [`VerifiedProofs`] set the apply paths carry
+    /// (audit v3, B5) — [`NoVerified`] everywhere but the consensus loop's.
     pub fn apply_transactions_for_sync(
         &mut self,
         txs: &[Transaction],
@@ -1410,6 +1505,7 @@ impl Ledger {
         covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
         pruned: &[crate::consensus::PrunedBundle],
         executor: &dyn ConfidentialExecutor,
+        verified_proofs: &dyn VerifiedProofs,
     ) -> Result<Vec<(usize, CallReceiptData)>, BlockError> {
         let mut scratch = self.clone();
         // The deposits reported after a block are exactly that block's (see `Deposit`).
@@ -1430,7 +1526,7 @@ impl Ledger {
                     .ok_or(BlockError::InvalidTx { index, error: TxError::AggregateNeedsCovered })?;
                 scratch.apply_aggregate(tx, c, executor).map_err(|error| BlockError::InvalidTx { index, error })?;
             } else if let Some(r) =
-                scratch.apply_tx(tx, proposer, executor).map_err(|error| BlockError::InvalidTx { index, error })?
+                scratch.apply_tx_with(tx, proposer, executor, verified_proofs).map_err(|error| BlockError::InvalidTx { index, error })?
             {
                 receipts.push((index, r));
             }
@@ -1447,7 +1543,21 @@ impl Ledger {
     /// the resulting state root must match the header. Ledger unchanged on error. Returns the
     /// receipts of the block's calls.
     pub fn apply_block(&mut self, block: &Block, executor: &dyn ConfidentialExecutor) -> Result<Vec<CallReceipt>, BlockError> {
-        self.apply_block_with_covered(block, &BTreeMap::new(), executor)
+        self.apply_block_for_sync(block, &BTreeMap::new(), &[], executor, &NoVerified)
+    }
+
+    /// `apply_block` against a [`VerifiedProofs`] set (audit v3, B5): a transaction whose hash
+    /// the set holds has its proofs decoded rather than re-verified — admission already verified
+    /// them over these exact bytes — while every other check runs as usual. The consensus
+    /// loop's apply path carries the node's admission cache; sync, replay and `verify_chain`
+    /// take `apply_block` and verify everything.
+    pub fn apply_block_with(
+        &mut self,
+        block: &Block,
+        executor: &dyn ConfidentialExecutor,
+        verified: &dyn VerifiedProofs,
+    ) -> Result<Vec<CallReceipt>, BlockError> {
+        self.apply_block_for_sync(block, &BTreeMap::new(), &[], executor, verified)
     }
 
     /// `apply_block` with the covered-bundle records any `Aggregate` in the block needs (spec
@@ -1461,7 +1571,7 @@ impl Ledger {
         covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Vec<CallReceipt>, BlockError> {
-        self.apply_block_for_sync(block, covered, &[], executor)
+        self.apply_block_for_sync(block, covered, &[], executor, &NoVerified)
     }
 
     /// `apply_block_with_covered` with the sealed form's side table (spec §7): the tx root is
@@ -1469,12 +1579,15 @@ impl Ledger {
     /// hash (`Transaction::hash` takes the proof by digest), so the certified root binds every
     /// byte of it but the proof — the table's attested raw hash must agree with that, and
     /// `check_bundle_proof` runs its membership and digest-binding checks against the table.
+    /// `verified_proofs` is the [`VerifiedProofs`] set the consensus loop's apply path carries
+    /// (audit v3, B5); sync and replay pass [`NoVerified`].
     pub fn apply_block_for_sync(
         &mut self,
         block: &Block,
         covered: &BTreeMap<usize, Vec<crate::types::CoveredBundle>>,
         pruned: &[crate::consensus::PrunedBundle],
         executor: &dyn ConfidentialExecutor,
+        verified_proofs: &dyn VerifiedProofs,
     ) -> Result<Vec<CallReceipt>, BlockError> {
         // Size limits are a consensus rule, not only proposer policy: without them a Byzantine
         // leader can stuff a block up to the gossip transport cap and force every replica to
@@ -1538,7 +1651,7 @@ impl Ledger {
         let mut scratch = self.clone();
         scratch.set_height(block.height());
         scratch.set_timestamp_ms(block.header.timestamp_ms);
-        let data = scratch.apply_transactions_for_sync(&block.transactions, &proposer, covered, pruned, executor)?;
+        let data = scratch.apply_transactions_for_sync(&block.transactions, &proposer, covered, pruned, executor, verified_proofs)?;
         scratch.close_block(block.height(), &proposer);
         let computed = scratch.state_root();
         if computed != block.header.state_root {
@@ -2104,6 +2217,127 @@ mod tests {
             Err(TxError::UnknownProposer(stranger.address()))
         );
         assert_eq!(l, before, "unchanged on error");
+    }
+
+    /// A `StubExecutor` that counts its two expensive calls, so a test can see whether a proof
+    /// was verified or only decoded.
+    #[derive(Default)]
+    struct CountingExecutor {
+        bundles: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingExecutor {
+        fn bundles(&self) -> usize {
+            self.bundles.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ConfidentialExecutor for CountingExecutor {
+        fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
+            StubExecutor.check_program(base_pc, words)
+        }
+        fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            StubExecutor.verify_call(program, proof)
+        }
+        // The whole point of the test: the decode path the ledger takes on a verified-set hit
+        // is not the verify path. Delegated to the stub's own, uncounted.
+        fn decode_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.decode_call(program, proof)
+        }
+        fn public_digest(&self, words: &[u32]) -> Word8 {
+            StubExecutor.public_digest(words)
+        }
+        fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
+            StubExecutor.node_hash(left, right)
+        }
+        fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+            StubExecutor.note_commitment(pk, from, amount, asset, time, r)
+        }
+        fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest(input)
+        }
+        fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.bundle_proof_digest(proof)
+        }
+        fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
+            self.bundles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            StubExecutor.verify_bundle(hc_bundle, proof, binding)
+        }
+        fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+            StubExecutor.aggregate_program_digest(shape)
+        }
+        fn verify_aggregate(
+            &self,
+            shape: &crate::types::DeclaredShape,
+            covered: &[crate::types::CoveredBundle],
+            proof: &[u8],
+        ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+            StubExecutor.verify_aggregate(shape, covered, proof)
+        }
+    }
+
+    /// The set a node hands the ledger at apply, in miniature: the transaction hashes whose
+    /// proofs admission verified.
+    struct Admitted(std::collections::BTreeSet<Hash>);
+
+    impl Admitted {
+        fn of(txs: &[&Transaction]) -> Admitted {
+            Admitted(txs.iter().map(|t| t.hash()).collect())
+        }
+    }
+
+    impl VerifiedProofs for Admitted {
+        fn contains(&self, tx: &Hash) -> bool {
+            self.0.contains(tx)
+        }
+        fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
+
+    /// Audit v3, B5: a proof verified at admission is not verified again when the transaction's
+    /// block applies. Admission's verdict is keyed on the transaction hash, which binds the
+    /// proof; everything stateful — anchors, nullifiers, nonces, digests — is re-checked either
+    /// way. A transaction admission never saw is verified at apply as it always was.
+    #[test]
+    fn apply_skips_the_proof_of_an_admitted_transaction() {
+        let mut l = ledger();
+        let (a, _) = keys();
+        let exec = CountingExecutor::default();
+        // Admission verifies the bundle's proof once.
+        let t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        l.validate(&t, &exec).unwrap();
+        assert_eq!(exec.bundles(), 1, "admission verified the proof");
+        let root = root_after(&l, std::slice::from_ref(&t), &a.address(), 1);
+        let block = signed_block(vec![t.clone()], &a, 1, root);
+        l.apply_block_with(&block, &exec, &Admitted::of(&[&t])).unwrap();
+        assert_eq!(exec.bundles(), 1, "an admitted transaction's proof is not verified again at apply");
+        // A transaction that was never admitted is still verified at apply.
+        let t = tx(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]]);
+        let root = root_after(&l, std::slice::from_ref(&t), &a.address(), 2);
+        let block = signed_block(vec![t], &a, 2, root);
+        l.apply_block_with(&block, &exec, &Admitted::of(&[])).unwrap();
+        assert_eq!(exec.bundles(), 2, "a transaction admission never saw is verified at apply");
+
+        // The same for a call's proof: decoded for its outcome at apply, not verified.
+        let (mut l, id) = ledger_with_program(|_| {});
+        let t = call_tx(&l, 20, id, StubExecutor::make_proof(&id, 12, [9; 8]), fee_for(0));
+        l.validate(&t, &exec).unwrap();
+        assert_eq!(exec.calls(), 1, "admission verified the call's proof");
+        let root = root_after(&l, std::slice::from_ref(&t), &a.address(), 1);
+        let block = signed_block(vec![t.clone()], &a, 1, root);
+        l.apply_block_with(&block, &exec, &Admitted::of(&[&t])).unwrap();
+        assert_eq!(exec.calls(), 1, "an admitted call's proof is decoded, not verified, at apply");
+        let t = call_tx(&l, 30, id, StubExecutor::make_proof(&id, 12, [9; 8]), fee_for(0));
+        let root = root_after(&l, std::slice::from_ref(&t), &a.address(), 2);
+        let block = signed_block(vec![t], &a, 2, root);
+        l.apply_block_with(&block, &exec, &Admitted::of(&[])).unwrap();
+        assert_eq!(exec.calls(), 2, "a call admission never saw is verified at apply");
     }
 
     #[test]
@@ -2864,10 +3098,10 @@ mod tests {
 
         let (mut default, _) = ledger_with_program(|_| {});
         assert_eq!(
-            default.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub),
+            default.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub, &NoVerified),
             Err(BlockError::TooLarge)
         );
-        let receipts = raised.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub).unwrap();
+        let receipts = raised.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub, &NoVerified).unwrap();
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].tx, t.hash());
         assert_eq!(receipts[0].outputs, [9; 8]);
@@ -2877,13 +3111,13 @@ mod tests {
             limits(l);
             l.set_max_block_bytes(t.encoded_len() - 1);
         });
-        assert_eq!(tight.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub), Err(BlockError::TooLarge));
+        assert_eq!(tight.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub, &NoVerified), Err(BlockError::TooLarge));
         // Exactly at the block's size, it is applied: the block cap is `bytes > max`, not `>=`.
         let (mut exact, _) = ledger_with_program(|l| {
             limits(l);
             l.set_max_block_bytes(t.encoded_len());
         });
-        let receipts = exact.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub).unwrap();
+        let receipts = exact.apply_block_for_sync(&block, &BTreeMap::new(), &[], &PaddedStub, &NoVerified).unwrap();
         assert_eq!(receipts.len(), 1, "a block exactly at the cap");
     }
 

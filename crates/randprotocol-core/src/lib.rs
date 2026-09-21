@@ -14,7 +14,7 @@ pub mod token_id;
 pub mod types;
 
 pub use crypto::{Address, Hash, Keypair, PublicKey, Signature};
-pub use ledger::{BlockError, Ledger, TxError};
+pub use ledger::{BlockError, Ledger, NoVerified, TxError, VerifiedProofs};
 pub use notes::{Bundle, Envelope, ShieldedAddress, Word8};
 pub use program::{CallOutcome, CallReceipt, ProgramId, ProgramRecord};
 pub use types::*;

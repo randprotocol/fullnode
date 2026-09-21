@@ -1,7 +1,7 @@
 use super::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, EpochSets, NewView, SafetyState};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, Keypair};
-use crate::ledger::{BlockError, Ledger, TxError};
+use crate::ledger::{BlockError, Ledger, NoVerified, TxError, VerifiedProofs};
 use crate::types::{Block, BlockHeader, CoveredBundle, QuorumCertificate, Transaction, ValidatorSet, Vote};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -50,6 +50,11 @@ pub struct HotStuff {
     /// sets one (tests, and any chain that never aggregates): an `Aggregate` then takes the T4
     /// signpost error, exactly as before.
     covered: Option<Arc<dyn CoveredSource>>,
+    /// The node's admission cache of already-verified proofs (audit v3, B5): consulted at
+    /// propose (the trial apply) and at a proposal's apply, where a hit skips only the STARK
+    /// verification. [`NoVerified`] until the node sets its shared set — tests, and any replay
+    /// path, verify every proof, exactly as before.
+    verified: Arc<dyn VerifiedProofs>,
 
     view: u64,
     high_qc: QuorumCertificate,
@@ -161,6 +166,7 @@ impl HotStuff {
             signer,
             executor,
             covered: None,
+            verified: Arc::new(NoVerified),
             view,
             high_qc,
             locked_qc,
@@ -244,6 +250,13 @@ impl HotStuff {
     /// `Aggregate`. Called once at startup; everything before it keeps the T4 behavior.
     pub fn set_covered_source(&mut self, source: Arc<dyn CoveredSource>) {
         self.covered = Some(source);
+    }
+
+    /// Register the node's admission cache of verified proofs (audit v3, B5). Like
+    /// [`Self::set_covered_source`], it does not ride a `resume`: the node re-sets it on every
+    /// replica it builds. Called once at startup; everything before it verifies every proof.
+    pub fn set_verified_proofs(&mut self, verified: Arc<dyn VerifiedProofs>) {
+        self.verified = verified;
     }
 
     /// The covered-bundle records a block's `Aggregate` transactions need, keyed by their
@@ -586,7 +599,9 @@ impl HotStuff {
         }
         let mut ledger = parent.ledger_after.clone();
         let sidecar = self.covered_sidecar(&block)?;
-        let receipts = ledger.apply_block_with_covered(&block, &sidecar, self.executor.as_ref())?;
+        // B5: the admission cache comes along — a transaction this node verified at the pool is
+        // decoded here, not re-verified. Everything stateful is re-checked either way.
+        let receipts = ledger.apply_block_for_sync(&block, &sidecar, &[], self.executor.as_ref(), self.verified.as_ref())?;
         self.tree.insert(hash, Entry { block: block.clone(), ledger_after: ledger, receipts });
         self.refresh_current_set();
 
@@ -600,7 +615,8 @@ impl HotStuff {
         // B2's vote rule (bridge hardening spec §3): on a bridged chain, no vote for a block
         // more than `MAX_CLOCK_DRIFT_MS` ahead of this replica's clock. The block stays in the
         // tree — it is valid, and a quorum of validators whose clocks agree with it may still
-        // certify it. Replay (`apply_block_for_sync`) never comes through here.
+        // certify it. Sync's replay calls the ledger's `apply_block_for_sync` itself and never
+        // comes through here.
         if !(bridged && block.header.timestamp_ms > now_ms.saturating_add(super::MAX_CLOCK_DRIFT_MS)) {
             self.try_vote(&block, &mut out);
         }
@@ -806,9 +822,10 @@ impl HotStuff {
         for tx in ordinary {
             // Apply on a trial clone: a transaction that fails part-way through
             // must not leave the cumulative ledger dirty for the next candidate
-            // or for the state root committed to the header.
+            // or for the state root committed to the header. B5: with the admission
+            // cache along, a candidate's proofs are not verified a second time here.
             let mut trial = ledger.clone();
-            if trial.apply_tx(&tx, &me, self.executor.as_ref()).is_ok() {
+            if trial.apply_tx_with(&tx, &me, self.executor.as_ref(), self.verified.as_ref()).is_ok() {
                 ledger = trial;
                 txs.push(tx);
             }

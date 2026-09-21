@@ -14,7 +14,7 @@ use libp2p::{Multiaddr, PeerId};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
 use randprotocol_core::genesis::{Genesis, GenesisState};
-use randprotocol_core::{Hash, Keypair, Ledger, ShieldedAddress, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
+use randprotocol_core::{Hash, Keypair, Ledger, NoVerified, ShieldedAddress, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
 use randprotocol_zkvm::executor::ZkExecutor;
 use randprotocol_zkvm::notes::{Note, SpendKey};
 use randprotocol_zkvm::viewing::TxKey;
@@ -480,6 +480,11 @@ struct Node {
     /// Transaction hashes this node has already refused for a reason about their bytes, so a
     /// re-gossiped copy costs a hash lookup instead of a proof verification.
     refused: admission::RefusedCache,
+    /// Transaction hashes whose proofs this node already verified (audit v3, B5), shared with
+    /// the consensus replica: the admission workers fill it, and at propose and at a proposal's
+    /// apply the ledger decodes a hit's proofs instead of re-verifying them. Behind the lock
+    /// because the workers write from blocking threads; never held across an await.
+    verified: Arc<RwLock<admission::VerifiedSet>>,
     /// Policy only — every bucket lives on its [`Peer`], so nothing here has to track the peer set.
     limiter: admission::PeerLimiter,
     /// The tip the pending verifications are running against, refreshed lazily: a full ledger clone
@@ -714,6 +719,11 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             profile: core_profile(&gs.fri_profile),
         }));
     }
+    // The admission cache (audit v3, B5): one set, shared with the replica — the verification
+    // workers fill it, and propose/apply read it through the ledger. Like the covered source it
+    // is re-registered on every replica this process builds (`apply_synced` resumes).
+    let verified = Arc::new(RwLock::new(admission::VerifiedSet::new(admission::VERIFIED_SET_ENTRIES)));
+    hs.set_verified_proofs(verified.clone());
 
     // Network. The sync and gossip byte limits follow the genesis block cap (call limits
     // spec §8), computed once here and handed to the swarm and the serve path.
@@ -860,6 +870,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
+        verified,
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
         faucet_limiter: admission::PeerLimiter::new(admission::FAUCET_MINT_BURST, admission::FAUCET_MINT_PER_SEC),
         faucet_bucket: admission::TokenBucket::default(),
@@ -1039,10 +1050,18 @@ impl Node {
             let storage = self.storage.clone();
             let profile = core_profile(&self.gs.fri_profile);
             let executor = self.executor.clone();
+            let verified = self.verified.clone();
             let out = self.verdicts_tx.clone();
             self.verify_in_flight += 1;
             tokio::task::spawn_blocking(move || {
                 let result = validate_for_pool(&tx, &ledger, &storage, profile, executor.as_ref());
+                if result.is_ok() {
+                    // B5: remember that these exact bytes verified — the hash binds the proofs —
+                    // so the consensus path decodes them instead of verifying again. The pool's
+                    // own answer (`insert_verified`) is irrelevant here: a proof that verified is
+                    // verified, whatever the state-dependent half later says.
+                    verified.write().unwrap_or_else(|e| e.into_inner()).insert(tx.hash());
+                }
                 // The loop is the only receiver and outlives every task it spawned, so a send
                 // failure means the node is already shutting down.
                 let _ = out.blocking_send(Verdict { tx, result, source });
@@ -1963,7 +1982,7 @@ impl Node {
                     sidecar.insert(index, records);
                 }
             }
-            let receipts = ledger.apply_block_for_sync(b, &sidecar, &cb.pruned, self.executor.as_ref())?;
+            let receipts = ledger.apply_block_for_sync(b, &sidecar, &cb.pruned, self.executor.as_ref(), &NoVerified)?;
             if receipts != cb.receipts {
                 anyhow::bail!("receipts for block {} do not match our execution", b.height());
             }
@@ -2073,6 +2092,10 @@ impl Node {
                 profile: core_profile(&self.gs.fri_profile),
             }));
         }
+        // The admission cache (audit v3, B5) does not ride the resume either: re-register the
+        // set this process already holds — its entries are as valid for the resumed replica as
+        // they were for the one it replaces.
+        self.hs.set_verified_proofs(self.verified.clone());
         self.timeout = None;
         self.propose_at = None;
         let acts = self.hs.start();
@@ -2788,7 +2811,7 @@ mod tests {
         storage.mark_sealed(raw.hash(), Hash::digest(b"the covering aggregate"), 2).unwrap();
         check_sealed_coverage(&storage, &BTreeSet::new(), &served).unwrap();
         let mut replica = gs.ledger.clone();
-        replica.apply_block_for_sync(&served.block, &BTreeMap::new(), &served.pruned, &StubExecutor).unwrap();
+        replica.apply_block_for_sync(&served.block, &BTreeMap::new(), &served.pruned, &StubExecutor, &NoVerified).unwrap();
         assert_eq!(replica.state_root(), ledger.state_root());
         assert_eq!(replica.next_index(), gs.ledger.next_index() + 4, "four leaves, dummies included");
 
@@ -2796,7 +2819,7 @@ mod tests {
         let substitute = |f: &dyn Fn(&mut randprotocol_core::Bundle)| {
             let mut bad = served.clone();
             f(bad.block.transactions[0].bundle.as_mut().unwrap());
-            gs.ledger.clone().apply_block_for_sync(&bad.block, &BTreeMap::new(), &bad.pruned, &StubExecutor)
+            gs.ledger.clone().apply_block_for_sync(&bad.block, &BTreeMap::new(), &bad.pruned, &StubExecutor, &NoVerified)
         };
         for slot in 0..4 {
             assert_eq!(substitute(&|b| b.nullifiers[slot][0] ^= 1), Err(BlockError::TxRootMismatch), "nf {slot}");
@@ -2808,7 +2831,7 @@ mod tests {
         let mut lying = served.clone();
         lying.pruned[0].public_values[pv::OUT0] ^= 1;
         assert!(matches!(
-            gs.ledger.clone().apply_block_for_sync(&lying.block, &BTreeMap::new(), &lying.pruned, &StubExecutor),
+            gs.ledger.clone().apply_block_for_sync(&lying.block, &BTreeMap::new(), &lying.pruned, &StubExecutor, &NoVerified),
             Err(BlockError::InvalidTx { index: 0, error: randprotocol_core::TxError::BadDigest })
         ));
     }

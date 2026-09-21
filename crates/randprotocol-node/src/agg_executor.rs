@@ -109,6 +109,47 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.verify_call(program, proof)
     }
 
+    /// Audit v3, B5: a call proof admission already verified is decoded, not verified again.
+    /// Mirrors `ZkExecutor::verify_call`'s pre-`Machine::verify` half exactly, out of the
+    /// vendored crate's public API (the executor's own `decode_and_check` is private): the
+    /// canonical decode, the declared-height ranges, the public-table height against the
+    /// record, the public-value count and `u32` ranges, and the `PUB0..7` compare. Absent are
+    /// the degree-bits check and the STARK verification itself — both ran at admission over
+    /// these same bytes. Re-mirror against `verify_call` at every re-vendor.
+    fn decode_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+        use randprotocol_zkvm::tables::cpu::pv;
+        let proof = randprotocol_zkvm::executor::decode_canonical(proof)?;
+        randprotocol_zkvm::machine::check_declared_heights(
+            proof.tier,
+            proof.program_log_height,
+            proof.input_log_height,
+            proof.keccak_log_height,
+            proof.sha256_log_height,
+            proof.public_log_height,
+            proof.mem_log_height,
+        )
+        .map_err(|e| ConfidentialError::InvalidProof(format!("declared shape: {e:?}")))?;
+        if proof.public_log_height != randprotocol_zkvm::tables::public::public_log_height(record.public_len as usize) {
+            return Err(ConfidentialError::InvalidProof(format!("{:?}", randprotocol_zkvm::machine::VerifyError::PublicValues)));
+        }
+        if proof.public_values.len() != pv::NUM {
+            return Err(ConfidentialError::MalformedProof);
+        }
+        if proof.public_values[pv::OUT0..pv::OUT0 + 8].iter().any(|v| *v > u32::MAX as u64) {
+            return Err(ConfidentialError::InvalidProof("output not a u32".into()));
+        }
+        if proof.public_values[pv::IN0..pv::IN0 + 8].iter().any(|v| *v > u32::MAX as u64) {
+            return Err(ConfidentialError::InvalidProof("H_IN word not a u32".into()));
+        }
+        let want = record.public_digest.unwrap_or_else(|| randprotocol_zkvm::hash::public_digest(&[]));
+        if (0..8).any(|i| proof.public_values[pv::PUB0 + i] != want[i] as u64) {
+            return Err(ConfidentialError::InvalidProof(format!("{:?}", randprotocol_zkvm::machine::VerifyError::PublicValues)));
+        }
+        let outputs = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
+        let h_in = std::array::from_fn(|i| proof.public_values[pv::IN0 + i] as u32);
+        Ok(CallOutcome { tier: proof.tier.0 as u8, outputs, h_in })
+    }
+
     fn warm(&self, program: &ProgramRecord) {
         self.inner.warm(program)
     }

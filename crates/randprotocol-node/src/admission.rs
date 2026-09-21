@@ -85,6 +85,70 @@ impl RefusedCache {
     }
 }
 
+/// How many verified transaction hashes to remember. Same size as the refused cache and for the
+/// same reason: the pool holds 10 000, so nothing the pool can still do — flood it with good
+/// transactions or bad — evicts the entries that are saving work before their blocks arrive.
+/// An entry evicted early costs one re-verification at apply and nothing else (audit v3, B5).
+pub const VERIFIED_SET_ENTRIES: usize = 8192;
+
+/// Transaction hashes whose proofs this node already verified, filled by the admission workers
+/// when a verification succeeds (audit v3, B5). What the consensus loop reads at propose and at
+/// a proposal's apply through [`randprotocol_core::VerifiedProofs`]: on a hit the ledger decodes
+/// the proofs instead of re-verifying them.
+///
+/// Bounded and FIFO like the refused cache, and keyed on the transaction hash for the same
+/// reason the whole scheme is sound: the hash binds the proof (`rand-txid-2` takes it by
+/// digest, and the transaction binding covers the rest), so a stale entry can only ever say
+/// "these exact bytes verified" — never vouch for a different transaction. An entry whose
+/// transaction was then refused by the pool for a *state* reason (a lost conflict, a stale
+/// anchor) is kept deliberately: the proof did verify, and the stateful half is re-checked at
+/// apply either way.
+pub struct VerifiedSet {
+    seen: std::collections::HashSet<Hash>,
+    order: VecDeque<Hash>,
+    cap: usize,
+}
+
+impl VerifiedSet {
+    pub fn new(cap: usize) -> VerifiedSet {
+        VerifiedSet { seen: std::collections::HashSet::new(), order: VecDeque::new(), cap }
+    }
+
+    pub fn insert(&mut self, h: Hash) {
+        if self.cap == 0 {
+            return;
+        }
+        // A hash already held keeps its place in the queue: re-verifying one transaction must
+        // not push the queue around (see `RefusedCache::insert`).
+        if !self.seen.insert(h) {
+            return;
+        }
+        self.order.push_back(h);
+        while self.order.len() > self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+    }
+
+    pub fn contains(&self, h: &Hash) -> bool {
+        self.seen.contains(h)
+    }
+
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+impl randprotocol_core::VerifiedProofs for VerifiedSet {
+    fn contains(&self, tx: &Hash) -> bool {
+        self.contains(tx)
+    }
+    fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+}
+
 /// Is this verdict a function of the transaction's bytes alone?
 ///
 /// `UnknownAnchor`, `TimeOutOfWindow`, `Spent`, `CommitmentExists`, `UnknownProgram`,
@@ -512,6 +576,23 @@ mod tests {
         // Re-inserting a hash already held does not grow the queue.
         c.insert(h(3), TxError::BadDigest);
         assert_eq!(c.len(), 3);
+    }
+
+    #[test]
+    fn the_verified_set_is_bounded_and_evicts_oldest_first() {
+        let mut s = VerifiedSet::new(3);
+        for n in 0..3 {
+            s.insert(h(n));
+        }
+        assert_eq!(s.len(), 3);
+        assert!(s.contains(&h(0)));
+        s.insert(h(3));
+        assert_eq!(s.len(), 3, "the cap holds");
+        assert!(!s.contains(&h(0)), "the oldest went first");
+        assert!(s.contains(&h(3)));
+        // Re-inserting a hash already held keeps its place and does not grow the queue.
+        s.insert(h(3));
+        assert_eq!(s.len(), 3);
     }
 
     #[test]

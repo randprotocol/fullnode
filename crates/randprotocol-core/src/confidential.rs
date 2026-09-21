@@ -48,6 +48,19 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// `InvalidProof("PublicValues")`. The public words are never re-hashed here: the digest was
     /// computed once, at deploy.
     fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError>;
+    /// Decode `proof` against `program` and return exactly what [`Self::verify_call`] would
+    /// return, but without the STARK verification. Called only for a transaction whose hash a
+    /// [`crate::ledger::VerifiedProofs`] set vouches for — one this node already ran `verify_call`
+    /// on, against this same record (a program's record is immutable once deployed) and this same
+    /// proof (bound by the transaction hash) — so the answer is the one admission computed, and
+    /// every check a validator that re-verifies would apply to the outcome (the tier's fee floor,
+    /// the receipt's words) still runs here.
+    ///
+    /// The default is `verify_call` itself: an executor that cannot decode without verifying
+    /// simply pays the full cost again, which is always correct.
+    fn decode_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+        self.verify_call(program, proof)
+    }
     /// Precompute whatever makes `verify_call` fast for `program` (the zkVM verifier key,
     /// ~2 s). Called from a background task after a deploy commits and at startup; may be a no-op.
     fn warm(&self, _program: &ProgramRecord) {}
