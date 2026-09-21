@@ -154,7 +154,20 @@ evict them).
   7 GB) and chain-12 (`605eb783`, 21 GB) data dirs were still on disk from earlier cuts; chain 13
   itself grew **~16 GB/day**. Delete every retired chain's data dir at each cut (guarded: only when
   the unit's own datadir suffix is current), and watch disk on the 48 GB droplets specifically —
-  they fill first.
+  they fill first. **E hit the same wall on chain 14 (2026-09-21):** chains 11+12 were still on its
+  77 GB disk, rand-node crash-looped on ENOSPC ~50×/hour with the RPC never opening (randscan
+  degraded, the sale service's upstream down), fixed by deleting the two retired dirs — and tor1,
+  nyc1, atl1, nyc2, sfo2, syd1 were all ≥85 % at the same moment.
+- **The sale service's RPC upstream is a Caddy route on E, and it lives in randscan's repo.**
+  `SALE_RPC_UPSTREAM = https://randscan.org/rpc` (web droplet `/etc/randprotocol/sale.env`) is a
+  route in randscan's `deploy/Caddyfile` (since randscan `412a55d`) that `remote_ip`-allowlists the
+  web droplet `159.65.138.161` to E's `127.0.0.1:8545` and 403s the rest. It was first hand-added
+  on E and wiped hours later by a randscan redeploy (`vps-setup.sh` re-renders
+  `/etc/caddy/Caddyfile` from the template) — randprotocol.org's `/account` then showed zUSD as
+  "asset #1" ("the node could not name every token") until the route was restored. This is safe for
+  E's viewing-key slots: the sale service's method allowlist (`server/sale/src/rpc.rs`,
+  `RPC_ALLOWED`) never forwards `rand_importViewingKey`/`rand_getViewingNotes`, so the only client
+  the route admits cannot touch them.
 - **randscan migration numbering can silently skip a version.** Version 8 was burned on the live DB
   by the reverted chain-11 receivers migration, so the new migration numbered `008` was silently
   skipped and the indexer stuck at the first 4-nullifier transaction (height 255). Fixed by
