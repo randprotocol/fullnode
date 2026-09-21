@@ -323,6 +323,13 @@ fact about this machine's key file, not about the chain. That holds for a bridge
 `asset-balance` reads this wallet's own notes, and the `bridge-*` commands read only the bridge's
 *public* state (spec §10).
 
+The note store beside the key file also holds the wallet's own copy of the commitment tree and a
+Merkle witness per owned note, built by the scan from the same `rand_getCommitments` pages it
+already reads. Every bundle this wallet proves takes its witnesses from that copy — a send never
+calls `rand_getWitness`, so the node cannot learn which leaves it spends; the only tree question
+left is `rand_getAnchor`, which names no leaf. A store written before that copy existed (any
+pre-v0.5.1 build) is detected on load and rescanned from leaf 0 once to build it.
+
 A `call`'s input transcript is sealed to three keys and no more (spec §6.1): this wallet's outgoing
 viewing key, which opens every call it made; the per-call key `--print-call-key` shows, which opens
 exactly one; and the `--auditor` address, if one was named. `--no-envelope` publishes nothing, and

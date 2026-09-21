@@ -8,16 +8,24 @@
 //! everyone, and only a viewing key tells the two apart — so scanning is a local trial decryption
 //! of the whole tree, and a balance is a fact about this file, not about the node.
 //!
+//! The scan also grows the wallet's own copy of the commitment tree ([`crate::tree`], audit v3
+//! PRIV-1), and every bundle takes its Merkle witnesses from that copy. Before it, the wallet
+//! asked the node for the witnesses of exactly the notes it was about to spend — the one request
+//! that told the operator which leaves were its own. Now the only tree question that leaves the
+//! process is `rand_getAnchor`, which names no leaf.
+//!
 //! Nothing here ever sends a spend key, a viewing key or a note plaintext anywhere. What leaves
 //! the process is exactly what a bundle publishes: an anchor, four nullifiers, four commitments,
 //! the fee, the burn fields, and four envelopes nobody but their recipients can open — the
 //! dummies' envelopes open to nobody at all.
 
+use crate::tree::LocalTree;
 use crate::{AssetRow, ChainLimits, CommitmentRow, RpcClient};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use randprotocol_core::bridge::{AssetId, Attestation, Payload};
+use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::ledger::tokens::{MintAuthority, MINT_FROM};
 use randprotocol_core::ledger::{bridge_notes, TIME_WINDOW};
 use randprotocol_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, DEPTH};
@@ -25,7 +33,7 @@ use randprotocol_core::types::TX_BINDING_WORDS;
 use randprotocol_core::{format_amount, gas, Action, Hash, InitialMint, Keypair, PublicKey, Transaction};
 use randprotocol_core::{set_authority_message, token_mint_message};
 use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note};
-use randprotocol_zkvm::executor::prove_hidden_bundle;
+use randprotocol_zkvm::executor::{prove_hidden_bundle, ZkExecutor};
 use randprotocol_zkvm::hidden::{self, HiddenDigestInput, HiddenOutput, A_SLOTS, SLOTS};
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use randprotocol_zkvm::notes::{Note, SpendKey, ViewingKey};
@@ -330,7 +338,7 @@ pub struct SentRow {
 /// Purely a cache of chain data: every row in it is recoverable by rescanning from leaf 0 with
 /// the spend key, which is why [`NoteStore::load`] starts from empty rather than failing when
 /// the file is missing or unreadable.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct NoteStore {
     /// The chain every row and cursor here was read from: the node's `rand_getGenesisHash` at the
     /// first scan. A store is a cache of one chain's tree, and its cursors mean nothing on
@@ -349,11 +357,45 @@ pub struct NoteStore {
     /// `token_mint`, `register_token`), for the public-rebuild path in [`scan`]. Zero on a store
     /// written before that path existed, which is what makes an older store re-read its blocks
     /// once and recover anything it missed. (The name is the first of those kinds'.)
-    #[serde(default)]
     pub scanned_attest_height: u64,
     pub notes: Vec<OwnedNote>,
-    #[serde(default)]
     pub sent: Vec<SentRow>,
+    /// The wallet's own copy of the commitment tree and a witness per owned note (audit v3
+    /// PRIV-1): what every send takes its Merkle paths from, instead of asking the node for the
+    /// witnesses of exactly the notes it spends.
+    pub tree: LocalTree,
+}
+
+impl<'de> Deserialize<'de> for NoteStore {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<NoteStore, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            scanned_index: u64,
+            scanned_height: u64,
+            #[serde(default)]
+            scanned_attest_height: u64,
+            notes: Vec<OwnedNote>,
+            #[serde(default)]
+            sent: Vec<SentRow>,
+            #[serde(default)]
+            tree: Option<LocalTree>,
+        }
+        let w = Wire::deserialize(d)?;
+        // A store written before the tree existed: its cursor says the leaves below
+        // `scanned_index` were read, but no tree was kept for them, so beside a nonzero
+        // cursor a default-empty tree would silently miss every leaf below the cursor and
+        // produce wrong witnesses. Rescan from 0 once instead: re-offering is idempotent
+        // (every record is keyed by its index) and the tree is rebuilt whole.
+        let scanned_index = if w.tree.is_some() { w.scanned_index } else { 0 };
+        Ok(NoteStore {
+            scanned_index,
+            scanned_height: w.scanned_height,
+            scanned_attest_height: w.scanned_attest_height,
+            notes: w.notes,
+            sent: w.sent,
+            tree: w.tree.unwrap_or_default(),
+        })
+    }
 }
 
 /// What [`NoteStore::bind`] did.
@@ -550,6 +592,16 @@ pub fn output_keys(w: &Wallet, tx: &Transaction) -> Vec<OutputKey> {
 
 // ---------------------------------------------------------------- scanning
 
+/// The hash the wallet's local commitment tree is folded with: the executor's own `node_hash`, so
+/// a path computed here is exactly what the hidden guest's `MERKLE_VERIFY` checks against the
+/// anchor and what the ledger's tree records. A bare Poseidon2 evaluation has no FRI in it, so
+/// the profile is irrelevant; the closure just hands `tree.rs` the function without the executor
+/// type leaking into it.
+fn tree_hash() -> impl Fn(&Word8, &Word8) -> Word8 {
+    let ex = ZkExecutor::new(FriProfile::Test);
+    move |left: &Word8, right: &Word8| ex.node_hash(left, right)
+}
+
 /// What one leaf turned out to be for this wallet.
 ///
 /// The distinction the `Skipped` arm exists for: an envelope opening is *not* proof of
@@ -708,10 +760,23 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &NoteStore) -> Re
 /// asking for the larger page costs nothing against one.
 const BLOCK_PAGE: u64 = 1024;
 
-/// Record what one leaf is for this wallet. `rebuilt` is what [`rebuildable_notes`] found: a
-/// leaf whose commitment is in it is this wallet's deposit or mint whatever its envelope says, so
-/// it is tried first and the envelope is never consulted for it.
-fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, rebuilt: &mut BTreeMap<Word8, Note>) {
+/// What one leaf turned out to be for the store, for the tree half of [`offer_row`].
+enum Placement {
+    /// Not this wallet's to spend (a note it sent, a stranger's, a dummy).
+    NotMine,
+    /// An owned note the store already had: the tree owes it nothing new (it was appended as
+    /// this wallet's, or its witness was deliberately forgotten when it was spent).
+    MineKnown,
+    /// An owned note, newly recorded. If the tree already holds this leaf it was appended as
+    /// not-mine — a scan placed it before the wallet knew it was ours, which no completed scan
+    /// leaves behind — and owes it a witness it does not have: [`Offered::RebuildTree`].
+    MineNew,
+}
+
+/// Record what one leaf is for this wallet, returning its [`Placement`]. `rebuilt` is what
+/// [`rebuildable_notes`] found: a leaf whose commitment is in it is this wallet's deposit or mint
+/// whatever its envelope says, so it is tried first and the envelope is never consulted for it.
+fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, rebuilt: &mut BTreeMap<Word8, Note>) -> Placement {
     let found = match rebuilt.remove(&row.cm) {
         Some(note) => Found::Received(note),
         None => classify(w, row.cm, &row.envelope),
@@ -719,7 +784,9 @@ fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, rebuilt: &
     match found {
         // A note can be re-offered by a rescan; the index is the leaf, so it is unique.
         Found::Received(note) => {
-            if !store.notes.iter().any(|n| n.index == row.index) {
+            if store.notes.iter().any(|n| n.index == row.index) {
+                Placement::MineKnown
+            } else {
                 store.notes.push(OwnedNote {
                     index: row.index,
                     cm: row.cm,
@@ -729,24 +796,73 @@ fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, rebuilt: &
                     pending: None,
                     height: row.height,
                 });
+                Placement::MineNew
             }
         }
         Found::Sent(note) => {
             if !store.sent.iter().any(|s| s.index == row.index) {
                 store.sent.push(SentRow { index: row.index, to_pk: note.pk, amount: note.amount, height: row.height });
             }
+            Placement::NotMine
         }
         Found::Skipped(why) => {
             if why != NOT_OURS && why != DUMMY {
                 eprintln!("warning: ignoring leaf {}: {why}", row.index);
             }
+            Placement::NotMine
         }
     }
 }
 
-/// Trial-decrypt every commitment this wallet has not seen yet, then mark as spent every note
-/// whose nullifier the chain has published. Advances the store and saves nothing — the caller
-/// owns the file.
+/// What [`offer_row`] did with a leaf.
+enum Offered {
+    /// The tree took it.
+    Appended,
+    /// The tree already had it (a re-offer); nothing moved.
+    Skipped,
+    /// The tree already had it, but as not-mine, and the leaf just turned out to be this
+    /// wallet's own note — a deposit recovered from public fields at a leaf an earlier, torn
+    /// scan placed without the wallet knowing. The tree owes it a witness and cannot grow one
+    /// backwards, so the scan restarts from 0 and rebuilds it.
+    RebuildTree,
+}
+
+/// Offer one leaf to the store: record what it is to this wallet, and append it to the wallet's
+/// own commitment tree — the tree every send now takes its witnesses from, rather than asking the
+/// node for the witnesses of exactly the notes it spends (audit v3 PRIV-1).
+///
+/// The tree half is keyed on the leaf's index, so a re-offer is idempotent: a row the tree
+/// already holds — the recovery pass re-reads leaves from 0, and a rescan re-reads everything —
+/// is skipped, never double-appended; a row *past* the end means the node skipped a leaf, which
+/// no correct node does. Before a row of height `h` is appended, every block below `h` is
+/// provably complete — rows arrive in index order, which is height order — so the tree's root is
+/// recorded as that block end's root first ([`LocalTree::checkpoint`]). Those checkpoints are the
+/// block-end roots a send anchors against.
+fn offer_row(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, rebuilt: &mut BTreeMap<Word8, Note>, h: &dyn Fn(&Word8, &Word8) -> Word8) -> Result<Offered> {
+    let placement = place_leaf(w, store, row, rebuilt);
+    if row.index < store.tree.next_index() {
+        return Ok(match placement {
+            Placement::MineNew if store.tree.path(row.index).is_none() => Offered::RebuildTree,
+            _ => Offered::Skipped,
+        });
+    }
+    if row.index > store.tree.next_index() {
+        return Err(anyhow!(
+            "getCommitments served leaf {} where leaf {} comes next; the node's leaves and this wallet's tree disagree",
+            row.index,
+            store.tree.next_index()
+        ));
+    }
+    if let Some(complete) = row.height.checked_sub(1) {
+        store.tree.checkpoint(complete, h);
+    }
+    store.tree.append(row.cm, !matches!(placement, Placement::NotMine), h);
+    Ok(Offered::Appended)
+}
+
+/// Trial-decrypt every commitment this wallet has not seen yet, growing the wallet's own
+/// commitment tree with every leaf read, then mark as spent every note whose nullifier the chain
+/// has published. Advances the store and saves nothing — the caller owns the file.
 pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<()> {
     // Which chain this node serves, before any cursor of the store is trusted: a store carried
     // across a chain cut is started over here, not scanned past the end of the new tree.
@@ -766,10 +882,60 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
         Bound::Reset { previous: None } => {}
     }
 
+    // The tree and the leaf cursor advance together (every append is a row the cursor then
+    // passes), so the tree is never behind the cursor — a store that says otherwise is torn or
+    // hand-edited, and would serve wrong witnesses. Rebuild both from 0, the same repair
+    // `NoteStore::load` makes of an unreadable store. (The tree being *ahead* is fine: it means
+    // a recovery pass ran ahead of the cursor, and the forward pass skips what it already has.)
+    if store.tree.next_index() < store.scanned_index {
+        eprintln!(
+            "warning: the note store's tree ({} leaves) is behind its scan cursor ({}); rescanning from the start",
+            store.tree.next_index(),
+            store.scanned_index
+        );
+        store.tree = LocalTree::default();
+        store.scanned_index = 0;
+    }
+
+    // One pass in every ordinary scan. The second is the repair for the torn corner
+    // [`Offered::RebuildTree`] names: the pass restarts with a fresh tree and cursor, so the
+    // recovered note is re-offered — already in `notes`, so this time appended as this wallet's —
+    // and gets its witness. Twice is a bound, never an expectation.
+    for rebuilds in 0..2 {
+        match scan_pass(rpc, w, store).await? {
+            ScanPass::Done => return Ok(()),
+            ScanPass::RebuildTree if rebuilds == 0 => {
+                eprintln!("warning: a recovered note has no witness in the store's tree; rebuilding the tree from the start");
+                store.tree = LocalTree::default();
+                store.scanned_index = 0;
+            }
+            ScanPass::RebuildTree => {
+                return Err(anyhow!("the note store's tree cannot be repaired; move it away and rescan from the start"));
+            }
+        }
+    }
+    unreachable!("the loop returns on the second rebuild at the latest")
+}
+
+/// The outcome of one [`scan_pass`]: the scan is complete, or the tree must be rebuilt from 0
+/// and the pass restarted.
+enum ScanPass {
+    Done,
+    RebuildTree,
+}
+
+/// One scan pass: page every commitment this wallet has not seen yet, growing the wallet's own
+/// commitment tree with every leaf read, then mark as spent every note whose nullifier the chain
+/// has published. Advances the store and saves nothing — the caller owns the file.
+async fn scan_pass(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<ScanPass> {
     // What the envelope layer cannot be trusted to deliver, read off the wire instead. Done
     // before the leaves are paged, so a deposit or a mint is placed by the same pass that first sees its
     // leaf rather than a scan later.
     let (mut rebuilt, rebuilt_through) = rebuildable_notes(rpc, w, store).await?;
+    let h = tree_hash();
+    // The height of the last leaf the tree took this scan — the tip its freshest checkpoint is
+    // recorded at below.
+    let mut tip: Option<u64> = None;
 
     loop {
         let rows = rpc.commitments(store.scanned_index, PAGE).await?;
@@ -778,7 +944,11 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
         }
         let before = store.scanned_index;
         for row in &rows {
-            place_leaf(w, store, row, &mut rebuilt);
+            match offer_row(w, store, row, &mut rebuilt, &h)? {
+                Offered::Appended => tip = Some(row.height),
+                Offered::Skipped => {}
+                Offered::RebuildTree => return Ok(ScanPass::RebuildTree),
+            }
             store.scanned_index = store.scanned_index.max(row.index + 1);
         }
         // A non-empty page that leaves the cursor where it was would loop forever.
@@ -808,7 +978,11 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
         }
         let before = from;
         for row in &rows {
-            place_leaf(w, store, row, &mut rebuilt);
+            match offer_row(w, store, row, &mut rebuilt, &h)? {
+                Offered::Appended => tip = Some(row.height),
+                Offered::Skipped => {}
+                Offered::RebuildTree => return Ok(ScanPass::RebuildTree),
+            }
             from = from.max(row.index + 1);
         }
         // Same guard the forward pass has: a non-empty page that does not move the cursor would
@@ -827,6 +1001,14 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
     debug_assert!(rebuilt.is_empty());
     store.scanned_attest_height = rebuilt_through;
 
+    // The leaf pass paged to empty, so the tree holds every committed leaf the node had — the
+    // last leaf's own block is provably complete, and the root at its end is the freshest anchor
+    // a send can use. (The tip block still accepting leaves is never checkpointed; only block
+    // ends the node's replies prove complete are.)
+    if let Some(tip) = tip {
+        store.tree.checkpoint(tip, &h);
+    }
+
     // The head as it stands *before* the nullifier pages below. The pages read every nullifier
     // that exists at read time from `scanned_height` upward, so once the loop has finished, every
     // block at or below this height has been read — whether or not it published a nullifier.
@@ -844,6 +1026,9 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
         for (_, nf) in &rows {
             if let Some(n) = store.notes.iter_mut().find(|n| n.nf == *nf) {
                 n.spent = true;
+                // A spent note can never be an input again, so its witness is dead weight: the
+                // tree keeps only what unspent owned notes still need.
+                store.tree.forget(n.index);
             }
         }
         if rows.len() < PAGE {
@@ -862,7 +1047,7 @@ pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<
 
     // Resolve anything a `--no-wait` submission left pending, now that the chain has answered.
     clear_pending(store, store.scanned_height.saturating_sub(1));
-    Ok(())
+    Ok(ScanPass::Done)
 }
 
 /// Where a scan has read through after paging nullifiers, keeping the store's invariant that
@@ -1395,34 +1580,71 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
     Ok(Prepared { bundle, words, expected })
 }
 
-/// Fetches the anchor and a witness for every spent note, then builds the bundle
-/// ([`build_bundle`]), returning it with the `time` it carries.
+/// Builds the bundle's witness from the wallet's own tree and picks its anchor, then builds the
+/// bundle ([`build_bundle`]), returning it with the `time` it carries.
 ///
-/// One anchor, and every witness folded against it. A witness is folded against the tree's
-/// *current* root, so a leaf appended between the calls makes the witness prove membership in a
-/// tree the anchor does not name — and the bundle would be rejected as `UnknownAnchor` or taint.
-/// Refetching all of it together is the fix; three attempts is enough unless the chain is
-/// committing notes faster than this wallet can read them.
-async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, plan: &Plan) -> Result<(Prepared, u32)> {
-    let mut attempt = 0;
-    let (height, root, paths) = 'fetch: loop {
-        attempt += 1;
-        let (height, root) = rpc.anchor(None).await?;
-        let mut paths = Vec::with_capacity(SLOTS);
-        for n in plan.inputs() {
-            let (witness_root, path) = rpc.witness(n.index).await?;
-            if witness_root != root {
-                if attempt >= 3 {
-                    return Err(anyhow!("tree moved; retry"));
+/// The tree is the wallet's local copy, grown by every [`scan`] (audit v3 PRIV-1): no
+/// `rand_getWitness` call leaves the process, so the node never learns which leaves a spend
+/// touches. The anchor is the freshest block-end root the chain confirms equals the local root —
+/// and the witnesses are against the local root, so the anchor must equal it. The head's anchor
+/// is tried first: a current tree is the head's root (a quiet chain's head root is the same root
+/// however long ago the last leaf landed, which is the case a checkpoint alone cannot cover).
+/// Failing that, the newest checkpoint the node still serves — the local tree is frozen at its
+/// checkpoints, so where the old code looped on "tree moved; retry" this one rescans once.
+async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan: &Plan) -> Result<(Prepared, u32)> {
+    let h = tree_hash();
+    for attempt in 0..2 {
+        let live = store.tree.root(&h);
+        let (head_height, head_root) = rpc.anchor(None).await?;
+        let mut anchor = (head_root == live).then_some((head_height, head_root));
+        if anchor.is_none() {
+            // The chain moved since the scan. Only a checkpoint holding the *current* local root
+            // can anchor the bundle; ask the node for each in turn, newest first. A height the
+            // node no longer serves — pruned out of its window, or a sync gap in its anchor
+            // table — is a miss, not a failure.
+            for (height, root) in store.tree.checkpoints_newest() {
+                if root != live {
+                    continue;
                 }
-                continue 'fetch;
+                match rpc.anchor(Some(height)).await {
+                    Ok((_, node_root)) if node_root == live => {
+                        anchor = Some((height, live));
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) if is_anchor_miss(&e) => {}
+                    Err(e) => return Err(e),
+                }
             }
-            paths.push(path);
         }
-        break (height, root, paths);
-    };
-    let time = u32::try_from(height).map_err(|_| anyhow!("chain height {height} does not fit a bundle's time field"))?;
-    Ok((build_bundle(w, plan, root, &paths, time)?, time))
+        if let Some((height, root)) = anchor {
+            let time = u32::try_from(height).map_err(|_| anyhow!("chain height {height} does not fit a bundle's time field"))?;
+            let mut paths = Vec::with_capacity(SLOTS);
+            for n in plan.inputs() {
+                let path = store
+                    .tree
+                    .path(n.index)
+                    .with_context(|| format!("no local witness for note {}; the store's tree is incomplete", n.index))?;
+                paths.push(path);
+            }
+            return Ok((build_bundle(w, plan, root, &paths, time)?, time));
+        }
+        if attempt == 1 {
+            return Err(anyhow!(
+                "the wallet's tree matches none of the node's anchors, even after a rescan; the store's tree and the node's leaves disagree"
+            ));
+        }
+        // No recorded block-end root matches the local root: the picture is stale. Rescan once
+        // and retry.
+        scan(rpc, w, store).await?;
+    }
+    unreachable!("the attempt loop returns the bundle or an error")
+}
+
+/// `-32001`, the node's "no anchor at height h" (`rand_getAnchor`): a miss for the checkpoint
+/// walk in [`prepare_bundle`], not a failure.
+fn is_anchor_miss(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::RpcError>().is_some_and(|r| r.code == -32001)
 }
 
 /// Prove `tx`'s one bundle against `tx`'s own binding, in place. The binding is taken with the
@@ -1473,11 +1695,11 @@ async fn settle(
     Ok(())
 }
 
-/// Every bundle-carrying submission goes through here: scan, plan both groups, fetch the anchor
-/// and the witnesses, build the bundle, assemble the transaction with the proof empty, take its
-/// binding, prove against it, fill the proof in, submit. One code path, so the fee, the anchor,
-/// the witnesses and the digest check cannot drift apart between a transfer, a bond, a deploy, a
-/// call, an attestation and a burn.
+/// Every bundle-carrying submission goes through here: scan, plan both groups, take the anchor
+/// and the witnesses from the wallet's own tree, build the bundle, assemble the transaction with
+/// the proof empty, take its binding, prove against it, fill the proof in, submit. One code path,
+/// so the fee, the anchor, the witnesses and the digest check cannot drift apart between a
+/// transfer, a bond, a deploy, a call, an attestation and a burn.
 #[allow(clippy::too_many_arguments)]
 async fn submit_spend(
     rpc: &RpcClient,
@@ -1492,7 +1714,7 @@ async fn submit_spend(
 ) -> Result<Submission> {
     scan(rpc, w, store).await?;
     let plan = Plan::select(store, spend)?;
-    let (prepared, time) = prepare_bundle(rpc, w, &plan).await?;
+    let (prepared, time) = prepare_bundle(rpc, w, store, &plan).await?;
     // The whole transaction first, its bundle's proof empty; then the proof, bound to it. Nothing
     // is set on the transaction after the proof but the proof itself.
     let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), action);
@@ -2939,6 +3161,7 @@ mod tests {
             scanned_attest_height: 3,
             notes: vec![owned(0, 5, false), owned(1, 3, true), owned(2, 0, false), owned(3, 2, false)],
             sent: vec![],
+            ..NoteStore::default()
         };
         assert_eq!(store.balance(), 7);
         let spendable: Vec<u64> = store.spendable().iter().map(|n| n.note.amount).collect();
@@ -3460,8 +3683,13 @@ mod tests {
     struct FakeChain {
         tree: randprotocol_zkvm::ledger::CommitmentTree,
         leaves: Vec<(Word8, Envelope, u64)>,
+        /// `roots[h]` is the tree root at the end of block `h` — what `rand_getAnchor(h)` answers,
+        /// mirroring the real node's anchor table.
+        roots: Vec<Word8>,
         /// `blocks[h]` is block `h`'s transactions; block 0 is genesis.
         blocks: Vec<Vec<Transaction>>,
+        /// `(height, nullifier)` in chain order, as `rand_getNullifiers` pages them.
+        nullifiers: Vec<(u64, Word8)>,
         sent: Vec<Transaction>,
         bridge: serde_json::Value,
         assets: serde_json::Value,
@@ -3477,6 +3705,9 @@ mod tests {
         fail_code: i64,
         /// What `rand_getGenesisHash` answers: the chain this fake is.
         genesis: Hash,
+        /// How many `rand_getWitness` calls this node has answered. A wallet that keeps its own
+        /// tree (audit v3 PRIV-1) never makes one, so every send asserts this stays at zero.
+        witness_calls: usize,
     }
 
     fn kind(a: &Action) -> &'static str {
@@ -3498,10 +3729,13 @@ mod tests {
 
     impl FakeChain {
         fn new() -> FakeChain {
+            let tree = randprotocol_zkvm::ledger::CommitmentTree::new();
             FakeChain {
-                tree: randprotocol_zkvm::ledger::CommitmentTree::new(),
+                roots: vec![tree.root()],
+                tree,
                 leaves: Vec::new(),
                 blocks: vec![Vec::new()],
+                nullifiers: Vec::new(),
                 sent: Vec::new(),
                 bridge: serde_json::json!({ "enabled": false }),
                 assets: serde_json::json!([]),
@@ -3509,6 +3743,7 @@ mod tests {
                 fail: None,
                 fail_code: -32000,
                 genesis: Hash([9; 32]),
+                witness_calls: 0,
             }
         }
 
@@ -3523,6 +3758,7 @@ mod tests {
                 self.tree.append(cm);
                 self.leaves.push((cm, e, height));
             }
+            self.roots.push(self.tree.root());
             self.blocks.push(txs);
         }
 
@@ -3569,12 +3805,30 @@ mod tests {
                     .take(n(1) as usize)
                     .map(|(i, (cm, e, h))| json!({ "index": i, "cm": word8_to_hex(cm), "envelope": envelope_json(e), "height": h }))
                     .collect::<Vec<_>>()),
-                "rand_getNullifiers" => json!([]),
-                "rand_getAnchor" => json!({ "height": head, "root": word8_to_hex(&self.tree.root()) }),
-                "rand_getWitness" => json!({
-                    "root": word8_to_hex(&self.tree.root()),
-                    "path": self.tree.path(n(0) as usize).iter().map(word8_to_hex).collect::<Vec<_>>(),
-                }),
+                "rand_getNullifiers" => json!(self
+                    .nullifiers
+                    .iter()
+                    .filter(|(h, _)| *h >= n(0))
+                    .take(n(1) as usize)
+                    .map(|(h, nf)| json!({ "height": h, "nullifier": word8_to_hex(nf) }))
+                    .collect::<Vec<_>>()),
+                "rand_getAnchor" => match p.get(0).and_then(|h| h.as_u64()) {
+                    // The head's anchor.
+                    None => json!({ "height": head, "root": word8_to_hex(&self.tree.root()) }),
+                    // A named height, as the real node's anchor table answers it (`-32001` when
+                    // the chain has not reached it or has pruned it).
+                    Some(h) => match self.roots.get(h as usize) {
+                        Some(root) => json!({ "height": h, "root": word8_to_hex(root) }),
+                        None => return Reply::Err(-32001, "no anchor at height"),
+                    },
+                },
+                "rand_getWitness" => {
+                    self.witness_calls += 1;
+                    json!({
+                        "root": word8_to_hex(&self.tree.root()),
+                        "path": self.tree.path(n(0) as usize).iter().map(word8_to_hex).collect::<Vec<_>>(),
+                    })
+                }
                 "rand_sendTransaction" => {
                     let tx = Transaction::decode(&hex::decode(p[0].as_str().unwrap_or_default()).unwrap()).unwrap();
                     let hash = tx.hash().to_hex();
@@ -3829,10 +4083,13 @@ mod tests {
         assert_eq!(store.scanned_attest_height, chain.lock().unwrap().head() + 1);
     }
 
-    /// The recovery pass: a store whose leaf cursor is already past a deposit's leaf (an older
+    /// The recovery pass, for a store whose leaf cursor is already past a deposit's leaf (an older
     /// build scanned it, and its garbage envelope opened nothing) but whose block cursor is 0 —
-    /// what a store written before the public-rebuild path looks like. The rescan reads the blocks,
-    /// rebuilds the note, and places it by re-reading the leaves from the start.
+    /// what a store written before the public-rebuild path looks like. It is also a store with no
+    /// tree (every store written before PRIV-1), so the scan's torn-store repair resets the leaf
+    /// cursor to 0 and the *forward* pass re-reads every leaf, placing the deposit and its witness
+    /// on the way. (The same recovery against a store whose tree *is* current is
+    /// `a_recovered_note_at_a_leaf_the_tree_misfiled_gets_its_witness_back`.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_rebuilt_note_below_the_leaf_cursor_is_placed_by_the_recovery_pass() {
         let me = Wallet::from_spend_key(SpendKey([56; 8]));
@@ -3848,9 +4105,11 @@ mod tests {
         let mut store = NoteStore { scanned_index: 2, scanned_height: 0, scanned_attest_height: 0, ..NoteStore::default() };
         scan(&rpc, &me, &mut store).await.unwrap();
         let deposit: Vec<(u64, u64, u32)> = store.notes.iter().map(|n| (n.index, n.note.amount, n.note.asset)).collect();
-        // The deposit at leaf 0, below the cursor; the recovery pass re-offers every leaf, so the
+        // The deposit at leaf 0, below the old cursor; the rescan re-offers every leaf, so the
         // RAND note at leaf 1 is recorded on the way (once — a leaf is keyed by its index).
         assert_eq!(deposit, vec![(0, 1_000, 3), (1, 5, 0)]);
+        assert_eq!(store.tree.next_index(), 2, "the tree was rebuilt too");
+        assert!(store.tree.path(0).is_some(), "the recovered deposit has its witness");
         scan(&rpc, &me, &mut store).await.unwrap();
         assert_eq!(store.notes.len(), 2, "a second scan adds nothing");
         assert_eq!(store.scanned_index, 2);
@@ -3987,6 +4246,202 @@ mod tests {
         assert_eq!(store.notes.len(), 3, "two funding notes and the change");
         assert_eq!(store.sent.len(), 1, "one payment in the history");
         assert_eq!(output_keys(&me, &tx).len(), 2, "the payment and the change, never a dummy");
+    }
+
+    /// Audit v3 PRIV-1: a wallet that asks the node for the witnesses of exactly the notes it
+    /// spends tells the operator which leaves are its own. The wallet keeps the commitment tree
+    /// itself (built during `scan` from the `rand_getCommitments` pages it already reads) and
+    /// computes its own witnesses, so a send makes **no** `rand_getWitness` call at all — the
+    /// only tree question it still asks is `rand_getAnchor`, which names no leaf.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_makes_no_witness_call() {
+        let me = Wallet::from_spend_key(SpendKey([61; 8]));
+        let you = Wallet::from_spend_key(SpendKey([62; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        chain.lock().unwrap().fund(&me, 7_000_000, 0);
+        chain.lock().unwrap().fund(&me, 3_000_000, 0);
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        // Two inputs, the shape that asked for two witnesses before this change.
+        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap();
+        assert_eq!(chain.lock().unwrap().witness_calls, 0, "the wallet computes its own witnesses (PRIV-1)");
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        // The scan grew the tree over both leaves and checkpointed the last block's end: the
+        // freshest anchor, and the one this send used.
+        assert_eq!(store.tree.next_index(), 2);
+        assert!(store.tree.path(0).is_some() && store.tree.path(1).is_some(), "a witness per owned note");
+        let root = store.tree.root(&tree_hash());
+        assert_eq!(root, tx.bundle.as_ref().unwrap().anchor, "the send anchored at the local root");
+        assert_eq!(store.tree.checkpoints_newest().next(), Some((2, root)), "the scan's last block end");
+    }
+
+    /// A store written before the tree existed (every store a pre-PRIV-1 build saved) has no
+    /// `tree` key; loading it must reset the leaf cursor to 0 so the next scan rebuilds the whole
+    /// tree — a default-empty tree beside the old cursor would silently miss every leaf below it
+    /// and produce wrong witnesses.
+    #[test]
+    fn a_store_written_before_the_tree_rescans_from_zero() {
+        let old = serde_json::json!({
+            "scanned_index": 9,
+            "scanned_height": 4,
+            "scanned_attest_height": 5,
+            "notes": [serde_json::to_value(owned(3, 5, false)).unwrap()],
+            "sent": [],
+        });
+        let store: NoteStore = serde_json::from_value(old).unwrap();
+        assert_eq!(store.scanned_index, 0, "the leaf cursor resets so the tree is rebuilt");
+        assert_eq!(store.scanned_height, 4, "the nullifier cursor survives");
+        assert_eq!(store.scanned_attest_height, 5, "the deposit-rebuild cursor survives");
+        assert_eq!(store.notes.len(), 1, "the notes survive — they are re-offered, not lost");
+        assert_eq!(store.tree.next_index(), 0, "and the tree is rebuilt from the start");
+        // A store written *with* a tree keeps its cursor: no rescan tax on every later build.
+        let current = NoteStore { scanned_index: 9, scanned_height: 4, notes: vec![owned(3, 5, false)], ..NoteStore::default() };
+        let back: NoteStore = serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(back.scanned_index, 9);
+    }
+
+    /// The migration end to end: a store saved by a pre-tree build still scans (rebuilding the
+    /// tree once, without duplicating a note) and then sends without a witness call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pre_tree_store_scans_and_sends_without_a_witness_call() {
+        let me = Wallet::from_spend_key(SpendKey([63; 8]));
+        let you = Wallet::from_spend_key(SpendKey([64; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        chain.lock().unwrap().fund(&me, 7_000_000, 0);
+        chain.lock().unwrap().fund(&me, 3_000_000, 0);
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.unwrap();
+        // Strip the `tree` key: exactly the store a build before this change wrote.
+        let mut json = serde_json::to_value(&store).unwrap();
+        json.as_object_mut().unwrap().remove("tree");
+        let mut store: NoteStore = serde_json::from_value(json).unwrap();
+        assert_eq!(store.scanned_index, 0, "the migration reset the leaf cursor");
+        assert_eq!(store.notes.len(), 2, "the notes themselves survive");
+
+        // The next scan rebuilds the tree once; re-offering the leaves is idempotent.
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!((store.scanned_index, store.tree.next_index()), (2, 2));
+        assert_eq!(store.notes.len(), 2, "no note was duplicated");
+        assert!(store.tree.path(0).is_some() && store.tree.path(1).is_some());
+        // And a send takes its witnesses from the rebuilt tree, never from the node.
+        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap();
+        assert_eq!(chain.lock().unwrap().witness_calls, 0);
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+    }
+
+    /// A leaf the wallet has not scanned lands between the scan and the send: the head root no
+    /// longer matches the local tree, so the bundle anchors at the freshest checkpoint the node
+    /// confirms — a block-end root, good for the chain's whole anchor window — with no rescan and
+    /// still no witness call. A full send rescans first, so it anchors at the moved head instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_send_after_the_chain_moved_anchors_at_a_checkpoint() {
+        let me = Wallet::from_spend_key(SpendKey([65; 8]));
+        let you = Wallet::from_spend_key(SpendKey([66; 8]));
+        let stranger = Wallet::from_spend_key(SpendKey([67; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        chain.lock().unwrap().fund(&me, 7_000_000, 0);
+        chain.lock().unwrap().fund(&me, 3_000_000, 0);
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.unwrap();
+        let scanned_root = store.tree.root(&tree_hash());
+        // Block 3 brings a leaf the wallet has not seen: the head's root moves off the local one.
+        chain.lock().unwrap().fund(&stranger, 5, 0);
+
+        // Preparing against the stale store anchors at the freshest checkpoint the node confirms.
+        let spend = Spend { asset: 0, to: Some((&you.address, 8_000_000)), fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0 };
+        let plan = Plan::select(&store, spend).unwrap();
+        let (prepared, time) = prepare_bundle(&rpc, &me, &mut store, &plan).await.unwrap();
+        assert_eq!(time, 2, "the checkpoint's height, not the moved head's");
+        assert_eq!(prepared.bundle.anchor, scanned_root, "frozen at the checkpoint");
+        assert_eq!(chain.lock().unwrap().witness_calls, 0);
+
+        // A full send rescans first and anchors at the moved head: the (emulated) guest still
+        // accepts every witness, because the appends advanced them.
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap();
+        assert_eq!(s.time, 3);
+        assert_eq!(chain.lock().unwrap().witness_calls, 0);
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        assert_eq!(tx.bundle.as_ref().unwrap().anchor, store.tree.root(&tree_hash()));
+    }
+
+    /// The torn corner: a store whose leaf cursor is past a garbage-envelope deposit's leaf,
+    /// whose tree already holds that leaf as a stranger's, and whose block cursor is 0 — what an
+    /// interrupted scan can leave behind. The recovery pass finds the deposit from its public
+    /// fields, the tree owes it a witness it cannot grow backwards, so the scan rebuilds the
+    /// tree once and the note is spendable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recovered_note_at_a_leaf_the_tree_misfiled_gets_its_witness_back() {
+        let me = Wallet::from_spend_key(SpendKey([69; 8]));
+        let you = Wallet::from_spend_key(SpendKey([70; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let (txs, notes) = public_notes_for(&me);
+        {
+            let mut c = chain.lock().unwrap();
+            let (tx, note) = (txs.into_iter().next().unwrap(), notes[0]);
+            c.commit(vec![tx], vec![(note.commitment(), garbage())]); // the deposit, block 1
+            c.fund(&me, 7_000_000, 0);
+            c.fund(&me, 3_000_000, 0);
+        }
+        let rpc = serve(&chain).await;
+        // A scan that cannot know about the deposit (its block cursor starts past block 1) files
+        // its leaf as a stranger's garbage envelope.
+        let mut store = NoteStore { scanned_attest_height: 2, ..NoteStore::default() };
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.notes.len(), 2, "the two RAND notes only");
+        assert!(store.tree.path(0).is_none(), "the deposit's leaf went in as not-mine");
+        // The torn store: the leaf cursor and the tree are at the tip, the block cursor is at 0.
+        store.scanned_attest_height = 0;
+
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.asset_balances(), vec![(0, 10_000_000), (3, 1_000)], "the deposit recovered");
+        assert!(store.tree.path(0).is_some(), "and it has a witness after the rebuild");
+        // Spendable, and its witness comes from the rebuilt tree — never from the node.
+        send_asset_with(&rpc, &me, &mut store, &you.address, 3, 400, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .expect("the recovered deposit is spendable");
+        assert_eq!(chain.lock().unwrap().witness_calls, 0);
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+    }
+
+    /// When the chain publishes a note's nullifier the note stops being spendable-owned, and its
+    /// witness leaves the store (`LocalTree::forget`) — the tree itself, root included, does not
+    /// move, and every other note's witness stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spent_notes_witness_is_forgotten() {
+        let me = Wallet::from_spend_key(SpendKey([68; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        chain.lock().unwrap().fund(&me, 7_000_000, 0);
+        chain.lock().unwrap().fund(&me, 3_000_000, 0);
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert!(store.tree.path(0).is_some() && store.tree.path(1).is_some());
+        let root_before = store.tree.root(&tree_hash());
+
+        let nf = store.notes.iter().find(|n| n.index == 0).unwrap().nf;
+        {
+            let mut c = chain.lock().unwrap();
+            c.commit(Vec::new(), Vec::new()); // block 3, no leaves
+            c.nullifiers.push((3, nf));
+        }
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert!(store.notes.iter().find(|n| n.index == 0).unwrap().spent);
+        assert_eq!(store.tree.path(0), None, "the spent note's witness is dropped");
+        assert!(store.tree.path(1).is_some(), "the unspent one keeps its witness");
+        assert_eq!(store.tree.root(&tree_hash()), root_before, "forgetting moves no leaf");
+        assert_eq!(store.balance(), 3_000_000);
     }
 
     /// A token transfer pays its fee in RAND, so a wallet holding only the token is refused before
@@ -4914,6 +5369,7 @@ mod tests {
             scanned_attest_height: 5,
             notes: vec![owned(0, 5, false), owned(1, 3, true)],
             sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2 }],
+            ..NoteStore::default()
         };
         store.save(&path).unwrap();
         #[cfg(unix)]

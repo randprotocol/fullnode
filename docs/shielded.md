@@ -264,7 +264,9 @@ exception to "the node never holds a key"; see §6.
 ```
 
 **`rand_getWitness(index)`** — the Merkle path of one leaf, leaf-first, 32 levels. `null` past
-the end of the tree. See §6: this is the one request that says something about the caller.
+the end of the tree. See §6: this is the one request that says something about the caller, which
+is why a current wallet never makes it — the method stays for wallets built before the local
+tree.
 
 ```json
 → {"method":"rand_getWitness","params":[40]}
@@ -382,10 +384,12 @@ run the new `rand` at the fork.
 The pool hides amounts, senders and recipients. It does not hide everything, and the gaps are
 worth naming.
 
-- **Witness requests.** `rand_getWitness(index)` tells the node exactly which leaf a wallet is
-  about to spend — the single largest leak in S1. A wallet that keeps its own copy of the tree
-  never asks, and that (a local wallet tree) is the first follow-up. Until then: run your own
-  node, or ask for witnesses you do not need alongside the ones you do.
+- **Witness requests — closed.** `rand_getWitness(index)` used to tell the node exactly which
+  leaf a wallet was about to spend — the single largest leak in S1. The wallet now keeps its own
+  copy of the commitment tree, built during the scan from the same `rand_getCommitments` pages it
+  already reads, and computes every witness itself: a send never calls `rand_getWitness`, and the
+  only tree question left is `rand_getAnchor`, which names no leaf (audit v3 PRIV-1). The method
+  stays on the node for wallets built before this change.
 - **Scanning.** `rand_getCommitments` hands out everything to everyone, so scanning itself
   reveals nothing about which leaves are yours — but it does tell the node that *somebody* at
   your IP is scanning, and how far. Trial decryption is local and, on that path, the node never
@@ -451,7 +455,8 @@ accumulated `rewards` (which S1 already credited on every bundle fee) are withdr
 its payout address. Epochs re-derive the validator set from the register, `rand-node genesis` seeds
 it, and `rand_getSupply` audits the pool against it. The whole of it is `docs/staking.md` and
 `docs/supply.md`. What S2 did **not** bring is the wallet's local commitment tree — the answer to the
-witness leak in §6 — which is still the first follow-up.
+witness leak in §6; that has since landed on its own (audit v3 PRIV-1), and every current wallet
+computes its witnesses itself.
 
 **S3 — the bridge, and private call inputs — has landed.** A bridged asset is a note whose `asset`
 word is the registry's index for it; `BridgeAttest` deposits one note that the *chain* computes from

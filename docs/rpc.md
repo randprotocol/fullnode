@@ -1196,6 +1196,17 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
+### 2026-09-21 — wallets compute their own witnesses
+
+Wallet-side only, no wire or node change (audit v3, PRIV-1). A wallet built from this tree no
+longer calls `rand_getWitness` at all: it keeps its own copy of the commitment tree in the note
+store, built during the scan from the same `rand_getCommitments` pages it already reads, and
+computes every Merkle witness itself, so a node no longer learns which leaves a spend touches.
+The only tree question a send still asks is `rand_getAnchor`, which names no leaf.
+`rand_getWitness` / `rand_getWitnesses` stay on the node unchanged for wallets built before this
+change. A note store written by an older wallet is detected on load and rescanned from leaf 0
+once to build the tree.
+
 ### 2026-09-20 — witnesses are served from a cached tree
 
 Node-side only, no client-visible change (audit v3, RPC-1). `rand_getWitness` and

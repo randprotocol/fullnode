@@ -320,7 +320,12 @@ live on chain 12, **both also live on chain 13** (faucet on, chain 12's validato
 - **RPC-1 (medium) — fixed.** `rand_getWitness(es)` rebuilds the whole tree per call on the
   blocking pool; at most `MAX_CONCURRENT_WITNESS_BUILDS` (2) run at once per process, and a
   request that waits more than 10 s is refused `-32000` busy. PRIV-1 (the operator learns which
-  leaves a wallet spends) stays open: the fix is wallet-side witnesses.
+  leaves a wallet spends) is **fixed on `feat/security-concerns-2` (task A4)**: the wallet keeps
+  its own commitment tree in the note store (built during `scan` from the
+  `rand_getCommitments` pages it already reads, `crates/randprotocol-client/src/tree.rs`) and
+  computes its own witnesses; a send never calls `rand_getWitness`, which stays on the node for
+  older wallets. A store written before the tree existed is detected on load and rescanned from
+  leaf 0 once.
 **Re-verified against code 2026-09-20; the remediation plan is
 `docs/superpowers/plans/2026-09-20-audit-v3-v0.6.md` (branch `feat/audit-v3-fixes`, tag v0.6
 after the full suite).** It adds one finding the audit does not list: AGG-6, the genesis
