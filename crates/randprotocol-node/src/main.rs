@@ -981,7 +981,6 @@ mod tests {
             [0x33a94ec690bb7cbe, 0x5a3d456496746099, 0x6277ac61b539f652, 0x5b5fe7f92992a1c8],
             "the digest words, in the docs' own order"
         );
-        cfg.admitted_shapes = vec![shape];
         // The placeholder: all-zero digest words, refused by name.
         let mut placeholder = parse_aggregation_config("100,3,100,210000,256").unwrap();
         let mut bad = parse_admitted_shape(&format!("production,21,12,10,0,0,2,16,{hc_hex},{digest_hex}")).unwrap();
@@ -995,7 +994,22 @@ mod tests {
             }
             other => panic!("the placeholder must be refused, got {other:?}"),
         }
-        // And the real thing builds, with the register empty and the gated root.
+        // CHAIN9-1: a Production shape on this test-profile genesis is refused by name — the
+        // admitted profile must be the chain's own (audit v3).
+        let mut g_bad_profile = pinned_genesis();
+        let mut bad_profile = cfg.clone();
+        bad_profile.admitted_shapes = vec![shape.clone()];
+        g_bad_profile.aggregation = Some(bad_profile);
+        match g_bad_profile.build(&ZkExecutor::new(FriProfile::Test)) {
+            Err(randprotocol_core::genesis::GenesisError::BadAggregationConfig(m)) => {
+                assert!(m.contains("Production"), "{m}");
+            }
+            other => panic!("a Production shape on a test chain must be refused, got {other:?}"),
+        }
+        // And the real thing builds, with the register empty and the gated root — at the chain's
+        // own profile (tier 19 is the test profile's admitted tier).
+        let test_shape = parse_admitted_shape(&format!("test,19,12,10,0,0,2,16,{hc_hex},{digest_hex}")).unwrap();
+        cfg.admitted_shapes = vec![test_shape];
         let mut g2 = pinned_genesis();
         g2.aggregation = Some(cfg);
         let built = g2.build(&ZkExecutor::new(FriProfile::Test)).unwrap();
@@ -1173,11 +1187,12 @@ mod tests {
     /// intended alarm, not a nuisance. Regenerate it deliberately (print `state.hash()`), and
     /// only together with a chain restart.
     ///
-    /// **KNOWN FAILING — do not re-pin casually.** It fails on `main` and on this branch: the
-    /// hidden-asset bundle guest (chain 14) moved the hash again, and an older drift (the hash
-    /// computed as `78390828…` against the pinned `fb5881c8…`, seen on `main` before and after
-    /// v0.3) was never investigated. Re-pinning without explaining that drift would silence the
-    /// alarm this test exists to raise.
+    /// Re-pinned 2026-09-22, with the drift explained: the v0.3-era hash computed as `78390828…`
+    /// against the old pin `fb5881c8…`, and the v0.5 chain-14 build computed `69010a43…`. Between
+    /// those pins all three alarm categories fired deliberately: the transaction binding
+    /// (`rand-tx-bind-1`, v0.5), the hidden-asset bundle guest replacing the two-bundle guest
+    /// (`hc_bundle` moves, v0.5 chain 14), and the new genesis sections (tokens, bridge, the call
+    /// limits, v0.4/v0.5). Chain 14 was the restart this re-pin rides.
     #[test]
     fn the_genesis_hash_is_pinned() {
         let ex = ZkExecutor::new(FriProfile::Test);
@@ -1188,7 +1203,7 @@ mod tests {
         // validator leaf is `rand-validator-leaf-2` over the v2 entry (a length-prefixed
         // unbonding queue, the payout address, the nonce), and this genesis's stakes are the
         // staking minimum, which genesis now requires.
-        assert_eq!(state.hash().to_hex(), "fb5881c8d5bb5dcf634a1f036caa4cbfb49d0f3407f0d87419fbfa57686ceb4a");
+        assert_eq!(state.hash().to_hex(), "69010a43a7275d1ff2c25d8b774728f4a31148968dcd186f89da16550e87ffb5");
         // The envelope is resealed on every call and must not move the hash: only the
         // commitment and the amount are bound.
         let again = pinned_genesis().build(&ex).unwrap();
