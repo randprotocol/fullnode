@@ -193,14 +193,25 @@ evict them).
 - **A detached long run needs `nohup`**; a tool-level timeout kills a bare backgrounded process when
   the invoking call itself times out.
 
-**The HELD consensus work** (not on chain 14's build): fullnode-df's audit-v3 fixes, on
-`origin/feat/audit-v3-fixes` and consolidated onto `feat/security-concerns-1` (CON-1b lock
-durability, the safety-stop fix, CON-1a/SYNC-1, plus C1/C2/I3/I4 from the liveness-focused review)
-— reviewed as **HOLD** for the cut itself (`review-auditv3-consensus-result.md`: 405217a held on
-C1 unverified-tail evidence and C2 a sync hot-loop; 9c4be1c held on I1 a weak quorum, 7 ≠ f+1 = 6,
-and I2 a pacemaker stall) and ruled to cut chain 14 without them, landing instead as a **same-chain
-update after re-review**. CH-1 (an f+1-NewViews view-change rule) is **dropped** in favour of a
-timeout-certificate pacemaker, deferred to **v0.6**, per the review's I1/I2 findings.
+**The audit-v3 consensus work — LANDED on `main` as v0.5.1 (`9c142c1`), rolled to all 18
+validators on 2026-09-20; re-reviewed clean 2026-09-22.** fullnode-df's fixes (CON-1b lock
+durability, the safety-stop fix, CON-1a/SYNC-1, plus C1/C2/I3/I4 from the liveness-focused
+review) were held from the chain-14 cut itself (405217a on C1 unverified-tail evidence and C2 a
+sync hot-loop; 9c4be1c on I1 a weak quorum and I2 a pacemaker stall), re-worked through three
+review rounds, and landed as the same-chain update the ruling ordered. The independent re-review
+(`../security/fullnode-review-auditv3-consensus-rereview-2026-09-22.md`) verified every held item
+against the running build: the sync path commits only through `committed_prefix` over a
+whole-batch-verified run (the plan's `CommitProof` serving was deliberately superseded — the
+tail commits via the live path instead), the lock survives restart/sync/fallback, conflicting
+finality stops the node as `FatalSafety`, and B5's verified-proof cache skips only the STARK
+verify. **B3 — the timeout-certificate pacemaker — is the one open consensus item**: CH-1's
+f+1-NewViews rule was dropped (`has_weak_quorum` is not in the tree), so `on_new_view` still
+advances on one signed NewView bounded by `MAX_VIEW_AHEAD`; that needs a validator key (all 18
+are the operator's) and buys no safety break, only view inflation. Do not patch it
+incrementally; the redesign needs the `av3review/pm.py` model (currently lost — rewrite it) and
+18-validator tests. Residual note: `PersistSafety` is persist-on-vote (`hotstuff.rs`'s
+`try_vote`), so a lock never voted under before a crash is lost — bounded, standard, recorded
+in the re-review.
 
 **Deferred minors** (from the final whole-branch review, none blocking the cut): node M1 (whether
 `META_TOKENS` should be a whole rewrite/read or a diff, like the validator register), M3 and M8
@@ -755,6 +766,20 @@ never move them.
   (old collectors still eat QCs).
 - **Views are bounded** (`MAX_VIEW_AHEAD = 1e6`) and all `view + 1` math is
   saturating. A signed NewView for `u64::MAX` used to halt every node.
+- **Sync commits only through the three-chain rule.** `apply_synced` verifies
+  the whole batch (every QC, epoch set, leader, execution) and commits only
+  `commit_rule::committed_prefix` of it; the tail enters through the live
+  path (`offer_pending`), never on a peer's word (regression test:
+  `a_synced_certified_but_uncommitted_chain_is_not_committed`).
+- **The lock is durable.** `resume` restores a persisted `locked_qc` ahead of
+  the head's QC and never lowers one below it; `fallback_high_qc` is the only
+  place the lock is lowered, and only after every fetch for the block failed
+  (regression tests: `a_resumed_validator_keeps_its_lock`,
+  `a_stale_safety_state_never_lowers_the_lock`).
+- **Conflicting finality is fatal, not a log line.** A three-chain whose
+  commit path does not reach the committed head stops the node
+  (`Action::SafetyViolation` → `FatalSafety`); startup's `verify_chain`
+  decides what the restart makes of the store.
 - **Speculative state is capped**: `max_tree_blocks` (512), vote map (4096
   keys), NewView map (2048 views), orphans (256). Each tree entry clones the
   full ledger — revisit the clone-per-block design when state grows.
@@ -773,9 +798,16 @@ never move them.
   inside `on_proposal`) still runs on the consensus event loop; moving it
   changes when a vote is emitted, so it needs a consensus decision. Admission
   verification left the loop on 2026-09-14 — see the RPC-hardening note above.
-- Lock promises are not durable across restarts (`resume` discards persisted
-  `locked_qc`; `extends_locked` relaxes when the locked block is unknown) —
-  deliberate liveness choice, needs a protocol-level decision.
+  **Softened on `feat/security-concerns-2` (B5)**: a proof verified at admission
+  is not re-verified at propose/apply (the cache key binds the proof via
+  `rand-txid-2`); the loop still pays it for blocks full of never-admitted
+  transactions.
+- Lock promises **are durable across restarts as of v0.5.1** (`resume` restores
+  a persisted `locked_qc` ahead of the head's, `extends_locked` withholds the
+  vote and fetches an unknown locked block, only `fallback_high_qc` lowers the
+  lock and only after every fetch failed). Residual, recorded in the 2026-09-22
+  re-review: `PersistSafety` is persist-on-vote, so a lock never voted under
+  before a crash is lost — bounded by quorum intersection.
 - No CLI prints a wallet's `recipient_hash` (a `rand address --recipient-hash`
   would have saved a scratch crate during the v0.5 round trip's burn-destination
   setup). A `BridgeAttest`'s `tx_json` does not render its source chain, token
