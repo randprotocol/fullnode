@@ -31,7 +31,7 @@
 //! cargo test --release -p randprotocol-zkvm --test hidden_cheating -- --skip real_proof_
 //! ```
 //!
-//! The real proofs only (thirteen, ~22 min). Each takes the workspace proving slot — the file
+//! The real proofs only (nineteen, ~32 min). Each takes the workspace proving slot — the file
 //! lock `<target-dir>/tmp/rand-proving-slot.lock` the node and client test binaries take — so they
 //! run one at a time, within this binary and against every other session's proofs:
 //!
@@ -59,7 +59,7 @@ const MAX_CYCLES: usize = 1 << 20;
 const BIG: u64 = 1 << 63;
 
 /// One real proof at a time in this binary (~5.7 GB each): the default `cargo test` runs tests
-/// on parallel threads, and thirteen concurrent Production proofs would not fit a shared machine.
+/// on parallel threads, and nineteen concurrent Production proofs would not fit a shared machine.
 /// Taken before the file lock below, so this binary's own tests queue here rather than each
 /// holding a descriptor on the lock file.
 static PROVING: Mutex<()> = Mutex::new(());
@@ -576,6 +576,167 @@ fn real_proof_an_r_sum_that_wraps_with_only_the_carry_check_to_stop_it() {
     assert_eq!(model(&c.inputs()).fails, ["RAND sum passes 2^64"]);
     assert_eq!(c.outs[2].amount.wrapping_add(c.outs[3].amount).wrapping_add(7), 5, "the sum wraps to exactly the input");
     assert_real_proof_taints(&c.inputs(), &c.claimed(), "RAND sum wrapping");
+}
+
+/// The A side of the 2^63 barrier: a token output of exactly 2^63 paid for by 2^63 of real
+/// token inputs (2^63 − 1 and 1) — no sum carries and both balance, so the range check on
+/// `out0` is the only barrier to a private-asset note at or above 2^63, the twin of the RAND
+/// output case above.
+#[test]
+fn real_proof_an_a_output_at_2_63_with_only_the_range_check_to_stop_it() {
+    let c = Case::new(17, [In::Real(BIG - 1, TOKEN), In::Real(1, TOKEN), In::Dummy, In::Dummy], [BIG, 0, 0, 0], 0, 0, 0, TOKEN);
+    assert_eq!(model(&c.inputs()).fails, ["amount >= 2^63"]);
+    assert_real_proof_taints(&c.inputs(), &c.claimed(), "token output of 2^63");
+}
+
+/// Two real inputs whose paths are each genuine — but against different roots of the one
+/// growing tree: slot 0's witness was taken against an EARLIER root (the tree grew after: the
+/// stale-anchor race a wallet hits when it builds a witness per note), slot 1's against the
+/// published anchor. `real_proof_a_path_to_a_root_other_than_the_anchor` moves one input to a
+/// foreign tree; here every spent note sits in the one real tree and both paths verify, each
+/// against its own root — and the guest admits exactly one anchor.
+#[test]
+fn real_proof_two_real_inputs_whose_paths_reach_different_roots() {
+    let mut rng = Rng(18);
+    let sk = SpendKey(rng.word8());
+    let me = sk.viewing_key().pk();
+    let note = |rng: &mut Rng, amount: u64, asset: u32| Note { pk: me, from: rng.word8(), amount, asset, time: rng.upto(TIME as u64) as u32, r: rng.word8() };
+    let mut tree = CommitmentTree::new();
+    for _ in 0..3 {
+        tree.append(Note { pk: rng.word8(), from: rng.word8(), amount: rng.upto(1 << 40), asset: rng.next_u32(), time: 1, r: rng.word8() }.commitment());
+    }
+    let n0 = note(&mut rng, 500, TOKEN);
+    tree.append(n0.commitment());
+    // Slot 0's witness, against the root of the tree as it then was.
+    let (p0, i0) = tree.path_for(&n0.commitment()).unwrap();
+    let root_old = tree.root();
+    // The tree grows: two unrelated leaves, then the bundle's other three notes.
+    for _ in 0..2 {
+        tree.append(Note { pk: rng.word8(), from: rng.word8(), amount: rng.upto(1 << 40), asset: rng.next_u32(), time: 1, r: rng.word8() }.commitment());
+    }
+    let n1 = note(&mut rng, 300, TOKEN);
+    let n2 = note(&mut rng, 1_000, 0);
+    let n3 = note(&mut rng, 50, 0);
+    for n in [&n1, &n2, &n3] {
+        tree.append(n.commitment());
+    }
+    let anchor = tree.root();
+    assert_ne!(root_old, anchor);
+    let (p1, i1) = tree.path_for(&n1.commitment()).unwrap();
+    let (p2, i2) = tree.path_for(&n2.commitment()).unwrap();
+    let (p3, i3) = tree.path_for(&n3.commitment()).unwrap();
+    let o = [600, 200, 900, 140];
+    let outs = std::array::from_fn(|k| Note { pk: rng.word8(), from: me, amount: o[k], asset: slot_asset(k, TOKEN), time: TIME, r: rng.word8() });
+    let c = Case { sk, ins: [(n0, p0, i0), (n1, p1, i1), (n2, p2, i2), (n3, p3, i3)], outs, anchor, fee: 10, burn_a: 0, burn_r: 0, asset_a: TOKEN, time: TIME };
+    let v = c.inputs();
+    // Each path is genuine — against its own root.
+    assert_eq!(merkle_root(n0.commitment(), &v, hi::in_slot(0) + hi::S_PATH, i0), root_old, "slot 0's path must reach the older root");
+    assert_eq!(merkle_root(n1.commitment(), &v, hi::in_slot(1) + hi::S_PATH, i1), anchor, "slot 1's path must reach the anchor");
+    assert_eq!(model(&v).fails, ["membership: root != anchor"]);
+    assert_real_proof_taints(&v, &c.claimed(), "two inputs, two roots");
+}
+
+/// A note owned by another key, spent under the key that does not own it. The victim's note is
+/// a genuine leaf of the one real tree; the cheater stages its fields in slot 0 with the victim
+/// leaf's genuine path — but the guest derives every input's owner from the proven spend key
+/// (structural binding: the witness carries no owner word), so the commitment it recomputes is
+/// not the victim's leaf and the membership check taints, and the nullifier it publishes never
+/// names the victim's note.
+#[test]
+fn real_proof_spending_a_note_owned_by_another_key() {
+    let mut rng = Rng(19);
+    let cheater = SpendKey(rng.word8());
+    let victim = SpendKey(rng.word8());
+    let me = cheater.viewing_key().pk();
+    let note = |rng: &mut Rng, amount: u64, asset: u32| Note { pk: me, from: rng.word8(), amount, asset, time: rng.upto(TIME as u64) as u32, r: rng.word8() };
+    let mut tree = CommitmentTree::new();
+    for _ in 0..3 {
+        tree.append(Note { pk: rng.word8(), from: rng.word8(), amount: rng.upto(1 << 40), asset: rng.next_u32(), time: 1, r: rng.word8() }.commitment());
+    }
+    // The victim's note, genuinely in the tree: 10 000 of the token.
+    let victim_note = Note { pk: victim.viewing_key().pk(), from: rng.word8(), amount: 10_000, asset: TOKEN, time: rng.upto(TIME as u64) as u32, r: rng.word8() };
+    tree.append(victim_note.commitment());
+    let n1 = note(&mut rng, 300, TOKEN);
+    let n2 = note(&mut rng, 1_000, 0);
+    let n3 = note(&mut rng, 50, 0);
+    for n in [&n1, &n2, &n3] {
+        tree.append(n.commitment());
+    }
+    let anchor = tree.root();
+    let (pv, iv) = tree.path_for(&victim_note.commitment()).unwrap();
+    let (p1, i1) = tree.path_for(&n1.commitment()).unwrap();
+    let (p2, i2) = tree.path_for(&n2.commitment()).unwrap();
+    let (p3, i3) = tree.path_for(&n3.commitment()).unwrap();
+    // What the cheater writes into slot 0: the victim note's fields, staged under the cheater's
+    // own key (the input words carry no owner — the guest supplies pk_self).
+    let stolen = Note { pk: me, ..victim_note };
+    assert_ne!(stolen.commitment(), victim_note.commitment(), "ownership is structural: staging under another key commits to another leaf");
+    let o = [10_300, 0, 1_040, 0];
+    let outs = std::array::from_fn(|k| Note { pk: rng.word8(), from: me, amount: o[k], asset: slot_asset(k, TOKEN), time: TIME, r: rng.word8() });
+    let c = Case { sk: cheater, ins: [(stolen, pv, iv), (n1, p1, i1), (n2, p2, i2), (n3, p3, i3)], outs, anchor, fee: 10, burn_a: 0, burn_r: 0, asset_a: TOKEN, time: TIME };
+    let v = c.inputs();
+    // The path genuinely proves the VICTIM's leaf under the anchor — membership of the attacked
+    // note is fine; only the ownership substitution defeats the spend.
+    assert_eq!(merkle_root(victim_note.commitment(), &v, hi::in_slot(0) + hi::S_PATH, iv), anchor);
+    // And the nullifier the guest derives for slot 0 is not the victim note's: the spend would
+    // not even nullify what it attacks.
+    assert_ne!(c.claimed().nullifiers[0], victim.viewing_key().nullifier(&victim_note.commitment()));
+    assert_eq!(model(&v).fails, ["membership: root != anchor"]);
+    assert_real_proof_taints(&v, &c.claimed(), "spending another key's note");
+}
+
+/// An output note whose asset or time differs from the bundle's fields — a commitment the
+/// guest never produces. An output's `from`, asset and time are not witness words
+/// (`hidden_input` has no field for them): the guest commits every output with `from = pk_self`,
+/// its slot's asset and the bundle's (published) time, so the published digest is the honest
+/// digest of the true plaintext and no forged plaintext naming a mislabelled output reproduces
+/// it. Structural, like `real_proof_a_burn_claiming_another_asset` — which covers the burn
+/// claim; this is the output-note side.
+#[test]
+fn real_proof_an_output_naming_another_asset_or_time() {
+    let c = mixed(20);
+    let digest = prove_and_verify(&c.inputs(), "output naming another asset or time");
+    assert_eq!(digest, hidden::hidden_bundle_digest(&c.claimed()), "the true plaintext");
+    // As with the burn: the equality above is the pin; the loop states what a forged claim
+    // meets on the ledger (two different preimages hash apart for any guest).
+    let me = c.sk.viewing_key().pk();
+    for (k, asset, time, label) in [
+        (0, TOKEN + 1, TIME, "A-slot output of another asset"),
+        (2, TOKEN, TIME, "R-slot output of the token"),
+        (1, TOKEN, TIME + 1, "A-slot output at another time"),
+        (3, 0, TIME + 1, "R-slot output at another time"),
+    ] {
+        let o = &c.outs[k];
+        let forged = Note { pk: o.pk, from: me, amount: o.amount, asset, time, r: o.r }.commitment();
+        assert_ne!(forged, c.claimed().commitments[k], "{label}");
+        let mut claim = c.claimed();
+        claim.commitments[k] = forged;
+        let recomputed = hidden::hidden_bundle_digest(&claim);
+        println!("{label}: published {:08x?}…, the ledger recomputes {:08x?}…", &digest[..2], &recomputed[..2]);
+        assert_ne!(digest, recomputed, "{label}");
+        assert_ne!(digest, tainted(&claim), "{label}");
+    }
+    // The only lever over the outputs' time is the bundle's TIME word — and moving it moves the
+    // published `time` field with it (emulated: the same guest the proof above ran), so an
+    // output and the public field cannot disagree.
+    let mut v = c.inputs();
+    v[hi::TIME] = TIME + 1;
+    let m = model(&v);
+    assert!(m.fails.is_empty());
+    assert_eq!(m.claimed.time, TIME + 1);
+    assert_eq!(emulate(&v), hidden::hidden_bundle_digest(&m.claimed));
+}
+
+/// Monotone taint: the guest ORs each check's failure bit into `BAD` and nothing clears it
+/// (`emit_or_into` is monotone), so a violation at the program's FIRST taint point — slot 0's
+/// root-vs-anchor comparison — followed by a pass at every later check (slot 0's asset, slots
+/// 1–3 whole, duplicates, range, both sums) must still publish `bad = 1`. If any later pass
+/// could wash the taint out, this proof would publish the honest digest.
+#[test]
+fn real_proof_a_taint_at_the_first_check_survives_every_later_pass() {
+    let c = dummy_carrying(21, 0, 700);
+    assert_eq!(model(&c.inputs()).fails, ["membership: root != anchor"]);
+    assert_real_proof_taints(&c.inputs(), &c.claimed(), "an early taint, all later checks passing");
 }
 
 // ───────────────────────────── the mutation fuzz ─────────────────────────────
