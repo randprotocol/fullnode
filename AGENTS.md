@@ -157,7 +157,11 @@ evict them).
   they fill first. **E hit the same wall on chain 14 (2026-09-21):** chains 11+12 were still on its
   77 GB disk, rand-node crash-looped on ENOSPC ~50×/hour with the RPC never opening (randscan
   degraded, the sale service's upstream down), fixed by deleting the two retired dirs — and tor1,
-  nyc1, atl1, nyc2, sfo2, syd1 were all ≥85 % at the same moment.
+  nyc1, atl1, nyc2, sfo2, syd1 were all ≥85 % at the same moment. **Later the same day the user
+  authorised dropping every retired dir fleet-wide: chains 11–13 (and 12 on mkc1/mem1) deleted on
+  all 17 droplets + A, guarded per host by `ExecStart` datadir = `*1cff3b7d` + `rand_getHealth:
+  ok`; every droplet ended at 28–59 % used. The chain-13 rollback path (runbook §8) no longer
+  exists anywhere — chain 14 is the only chain on any disk.**
 - **The sale service's RPC upstream is a Caddy route on E, and it lives in randscan's repo.**
   `SALE_RPC_UPSTREAM = https://randscan.org/rpc` (web droplet `/etc/randprotocol/sale.env`) is a
   route in randscan's `deploy/Caddyfile` (since randscan `412a55d`) that `remote_ip`-allowlists the
