@@ -231,3 +231,199 @@ fn a_call_with_the_wrong_public_height_is_refused_before_verify() {
     );
     assert_eq!(ex.cached_keys(), before, "no verifier key was built for the refused call");
 }
+
+/// The program-height pin (deep scan 2026-09-24, zkvm): a call proof's `program_log_height` is
+/// exactly what the prover derives from the deployed program's word count
+/// (`program_log_height(record.words.len())`, `Machine::prove`), so any other declared height
+/// is a proof over a different program table — refused before `Machine::verify`, which would
+/// otherwise build (and cache, evicting an honest one) a verifier key for the junk height and
+/// only then fail on the batch.
+#[test]
+fn a_call_with_the_wrong_program_height_is_refused_before_verify() {
+    use randprotocol_zkvm::machine::Machine;
+    use randprotocol_zkvm::tables::program::program_log_height;
+    let f = guests::fib(10);
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let rec = record(&f);
+    let (mut proof, _) = Machine::new(FriProfile::Test).prove(&f, &[], &[], None).unwrap();
+    assert_eq!(proof.program_log_height, program_log_height(rec.words.len()), "the prover's own rule");
+    ex.verify_call(&rec, &proof.to_bytes()).expect("the honest header verifies");
+    let before = ex.cached_keys();
+    // One class up, with `degree_bits` edited to match (the program instance is first in
+    // `chips()` order; `+ 1` is the hiding config's `is_zk`, already folded into the entry).
+    proof.program_log_height += 1;
+    proof.batch.degree_bits[0] += 1;
+    let err = ex.verify_call(&rec, &proof.to_bytes()).expect_err("a different program table");
+    assert!(matches!(err, ConfidentialError::InvalidProof(_)), "{err}");
+    assert_eq!(ex.cached_keys(), before, "no verifier key was built for the refused call ({err})");
+}
+
+/// The input-height bound (same scan): a call's private-input width is unknown to the chain,
+/// but it is bounded by the tier — every input word costs a quarter of a digest cycle, so at
+/// tier `t` the input table never honestly exceeds `2^(t+2)` rows (`executor::
+/// max_input_log_height`). A declaration past that is refused before any key is built.
+#[test]
+fn a_call_with_an_input_height_past_the_tiers_bound_is_refused_before_verify() {
+    use randprotocol_zkvm::executor::max_input_log_height;
+    use randprotocol_zkvm::machine::{Machine, Tier};
+    let f = guests::fib(10);
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let rec = record(&f);
+    let (mut proof, _) = Machine::new(FriProfile::Test).prove(&f, &[], &[], Some(Tier(10))).unwrap();
+    let bound = max_input_log_height(Tier(10));
+    assert!(bound < randprotocol_zkvm::tables::input::MAX_LOG_HEIGHT, "the flat range alone would admit it");
+    ex.verify_call(&rec, &proof.to_bytes()).expect("the honest header verifies");
+    let before = ex.cached_keys();
+    // The input instance is eighth in `chips()` order (program, cpu, memory, alu, range,
+    // nibble, poseidon2, input, …).
+    let delta = bound + 1 - proof.input_log_height;
+    proof.input_log_height = bound + 1;
+    proof.batch.degree_bits[7] += delta as usize;
+    let err = ex.verify_call(&rec, &proof.to_bytes()).expect_err("past what tier 10 can read");
+    assert!(matches!(err, ConfidentialError::InvalidProof(_)), "{err}");
+    assert_eq!(ex.cached_keys(), before, "no verifier key was built for the refused call ({err})");
+}
+
+/// The tier cap (same scan, the load-bearing half): a legal tier-20 header — every range check
+/// satisfiable from public data, `degree_bits` consistent — used to reach `Machine::verify`,
+/// which built the tier-20 verifier key (216 s and 6.5 GB at the production profile) before
+/// looking at a single byte of STARK data. A call above `MAX_CALL_TIER` is refused as
+/// `CallTierTooHigh` before any key is built, in well under a second.
+#[test]
+fn a_call_declaring_a_tier_above_the_cap_is_refused_before_any_key_is_built() {
+    use randprotocol_zkvm::executor::MAX_CALL_TIER;
+    use randprotocol_zkvm::machine::{Machine, Tier};
+    use randprotocol_zkvm::tables::cpu::pv;
+    let f = guests::fib(10);
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let rec = record(&f);
+    let m = Machine::new(FriProfile::Test);
+    let (mut proof, _) = m.prove(&f, &[], &[], None).unwrap();
+    assert!(proof.tier.0 as u8 <= MAX_CALL_TIER, "fib(10) lands under the cap");
+    let before = ex.cached_keys();
+    // The header an attacker submits: tier 20, everything else honest and self-consistent —
+    // the public value the tier check reads, the memory floor the range check demands, and the
+    // degree bits `verify` compares.
+    proof.tier = Tier(20);
+    proof.public_values[pv::TIER] = 20;
+    proof.mem_log_height = Tier(20).min_mem_log_height();
+    proof.batch.degree_bits = m.log_ext_degrees_pub(
+        proof.tier,
+        proof.program_log_height,
+        proof.input_log_height,
+        proof.keccak_log_height,
+        proof.sha256_log_height,
+        proof.public_log_height,
+        proof.mem_log_height,
+    );
+    let t = std::time::Instant::now();
+    let err = ex.verify_call(&rec, &proof.to_bytes()).expect_err("tier 20 is above the cap");
+    assert_eq!(err, ConfidentialError::CallTierTooHigh { tier: 20, max: MAX_CALL_TIER });
+    assert_eq!(ex.cached_keys(), before, "no verifier key was built for the refused call");
+    assert!(t.elapsed().as_secs() < 1, "refused in {:?}, not after a key build", t.elapsed());
+}
+
+/// And the honest side of the three pins: a real proof at its own tier, program height and
+/// input height still verifies, building exactly its one key.
+#[test]
+fn an_honest_call_proof_still_verifies_under_the_header_pins() {
+    use randprotocol_zkvm::machine::Machine;
+    let f = guests::fib(10);
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let rec = record(&f);
+    let (proof, exec) = Machine::new(FriProfile::Test).prove(&f, &[], &[], None).unwrap();
+    let out = ex.verify_call(&rec, &proof.to_bytes()).expect("honest");
+    assert_eq!(out.outputs, exec.outputs);
+    assert_eq!(out.tier, proof.tier.0 as u8);
+    assert_eq!(ex.cached_keys(), 1, "the honest key, and only it");
+}
+
+/// The keccak cap (same scan, second half): the tier cap alone still admitted a tier-14 header
+/// declaring `keccak_log_height = 19` (the tier's own honest bound), whose key is 2^19 rows of
+/// 99 preprocessed columns — measured with the harness below at 209 s and 10 GB together with
+/// the sha256 table's 2^20, worse than the tier-20 header the finding started from. A call's
+/// keccak height is capped at `MAX_CALL_KECCAK_LOG_HEIGHT`, refused before any key is built.
+#[test]
+fn a_call_with_a_keccak_height_past_the_call_cap_is_refused_before_verify() {
+    use randprotocol_zkvm::executor::MAX_CALL_KECCAK_LOG_HEIGHT;
+    use randprotocol_zkvm::machine::{Machine, Tier};
+    let p = guests::keccak_demo(b"hi");
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let rec = record(&p);
+    let m = Machine::new(FriProfile::Test);
+    // Tier 12, so the tier's own bound (`klh <= t + 5`) admits the height the cap refuses.
+    let (mut proof, _) = m.prove(&p, &[], &[], Some(Tier(12))).unwrap();
+    assert_eq!(proof.keccak_log_height, 5, "one permutation fits the minimum block");
+    let over = MAX_CALL_KECCAK_LOG_HEIGHT + 1;
+    assert!(
+        over <= Tier(12).max_keccak_log_height().min(randprotocol_zkvm::tables::keccak::MAX_LOG_HEIGHT),
+        "the test needs a height only the call cap refuses"
+    );
+    ex.verify_call(&rec, &proof.to_bytes()).expect("the honest header verifies");
+    let before = ex.cached_keys();
+    proof.keccak_log_height = over;
+    proof.batch.degree_bits = m.log_ext_degrees_pub(
+        proof.tier,
+        proof.program_log_height,
+        proof.input_log_height,
+        proof.keccak_log_height,
+        proof.sha256_log_height,
+        proof.public_log_height,
+        proof.mem_log_height,
+    );
+    let err = ex.verify_call(&rec, &proof.to_bytes()).expect_err("past the call cap");
+    assert!(matches!(err, ConfidentialError::InvalidProof(_)), "{err}");
+    assert_eq!(ex.cached_keys(), before, "no verifier key was built for the refused call ({err})");
+}
+
+/// And the sha256 table's cap, `MAX_CALL_SHA256_LOG_HEIGHT`, on identical terms.
+#[test]
+fn a_call_with_a_sha256_height_past_the_call_cap_is_refused_before_verify() {
+    use randprotocol_zkvm::executor::MAX_CALL_SHA256_LOG_HEIGHT;
+    use randprotocol_zkvm::machine::{Machine, Tier};
+    let p = guests::sha256_demo();
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let rec = record(&p);
+    let m = Machine::new(FriProfile::Test);
+    let (mut proof, _) = m.prove(&p, &[], &[], Some(Tier(12))).unwrap();
+    assert_eq!(proof.sha256_log_height, 6, "one compression fills the minimum block");
+    let over = MAX_CALL_SHA256_LOG_HEIGHT + 1;
+    assert!(over <= Tier(12).max_sha256_log_height(), "the test needs a height only the call cap refuses");
+    ex.verify_call(&rec, &proof.to_bytes()).expect("the honest header verifies");
+    let before = ex.cached_keys();
+    proof.sha256_log_height = over;
+    proof.batch.degree_bits = m.log_ext_degrees_pub(
+        proof.tier,
+        proof.program_log_height,
+        proof.input_log_height,
+        proof.keccak_log_height,
+        proof.sha256_log_height,
+        proof.public_log_height,
+        proof.mem_log_height,
+    );
+    let err = ex.verify_call(&rec, &proof.to_bytes()).expect_err("past the call cap");
+    assert!(matches!(err, ConfidentialError::InvalidProof(_)), "{err}");
+    assert_eq!(ex.cached_keys(), before, "no verifier key was built for the refused call ({err})");
+}
+
+/// Measurement, not a check (`#[ignore]`d): builds one call verifier key at the *production*
+/// profile and prints its wall time — run under `/usr/bin/time -l` for the peak RSS. The shape
+/// comes from `RAND_KEY_SHAPE="tier,plh,ilh,klh,slh,pubh"`, so the worst admissible header under
+/// `MAX_CALL_TIER` can be costed without proving anything (the deep scan's tier-20 number,
+/// 216 s / 6.5 GB, was measured this way).
+#[test]
+#[ignore]
+fn measure_a_call_verifier_key_build_at_the_production_profile() {
+    use randprotocol_zkvm::machine::{Machine, Tier};
+    let shapes = std::env::var("RAND_KEY_SHAPE").unwrap_or_else(|_| "14,14,3,0,0,2".into());
+    let m = Machine::new(FriProfile::Production);
+    // Several shapes separated by `;` are built in order in the one process, so the process's
+    // peak RSS then also shows what the key cache *retains* per key, not only a build's peak.
+    for shape in shapes.split(';') {
+        let v: Vec<u8> = shape.split(',').map(|x| x.trim().parse().unwrap()).collect();
+        assert_eq!(v.len(), 6, "tier,plh,ilh,klh,slh,pubh");
+        let t = std::time::Instant::now();
+        let _ = m.verifier_key(Tier(v[0] as usize), v[1], v[2], v[3], v[4], v[5]);
+        println!("verifier key {shape}: {:.1?} ({} cached)", t.elapsed(), m.cached_keys());
+    }
+}

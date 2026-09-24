@@ -676,6 +676,8 @@ mod tests {
         for e in [
             TxError::BadDigest,
             TxError::InvalidProof(ConfidentialError::MalformedProof),
+            // The call tier cap reads the proof header alone (deep scan 2026-09-24, zkvm).
+            TxError::InvalidProof(ConfidentialError::CallTierTooHigh { tier: 20, max: 14 }),
             TxError::InvalidBundleProof(ConfidentialError::MalformedProof),
             TxError::BadMintSignature,
             TxError::MintCommitmentMismatch,

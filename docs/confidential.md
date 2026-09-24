@@ -508,10 +508,43 @@ is no `effect` field.
 - Call: program exists; `proof.len() <= max_proof_bytes` (genesis; 2 MiB, `gas::MAX_PROOF_BYTES`,
   when the file does not set it: raised for constraint set 5's proof sizes, re-measured and kept at
   constraint set 6's); the input envelope within `max_call_envelope_bytes` (18 432 by default); the
+  proof's header is pinned before any verifier key is built (next paragraph); the
   proof verifies against the stored program's `hc` for the tier it declares, and its `H_PUB`
   equals the program's recorded public digest (the empty input's for a program without one), or
   the call fails with `PublicValues`; `fee >= BUNDLE_BASE + call_fee(tier, bytes)`, checked last,
   once a verified proof has revealed the tier.
+- **A call proof's header is pinned against the deployed program before any verifier key is
+  built** (deep scan 2026-09-24, zkvm; `ZkExecutor::verify_call`). The declared tier is at most
+  `executor::MAX_CALL_TIER` (**14** — the highest tier `warm` pre-builds, and the two are one
+  expression), or the call is refused as `CallTierTooHigh` naming the cap and the remedy; the
+  declared `program_log_height` equals `program_log_height(words.len())` of the deployed record,
+  exactly as the prover derives it; the declared `input_log_height` is at most
+  `min(tier + 2, 16)` (`executor::max_input_log_height` — four input words a digest cycle, and
+  the 16-bit `HASH_LEFT` cap); the declared `keccak_log_height` is at most
+  `executor::MAX_CALL_KECCAK_LOG_HEIGHT` (**12**, 128 permutations) and `sha256_log_height` at
+  most `executor::MAX_CALL_SHA256_LOG_HEIGHT` (**13**, 128 compressions), `0` — no table —
+  always admitted; the public height equals the record's `public_len` class (the earlier pin).
+  Why: `Machine::verify` builds the verifier key for whatever shape a header declares before it
+  reads a byte of STARK data, every check in front of that build is satisfiable from public
+  data, and the key is priced by the tier and by the two hash tables' preprocessed columns —
+  measured at the production profile (`tests/executor.rs`'s
+  `measure_a_call_verifier_key_build_at_the_production_profile`): tier 14 ≈ 3.6 s and 227 MB,
+  tier 20 ≈ 216 s and 6.5 GB; at tier 14 a keccak table at the tier's own honest bound of 2^19
+  rows is 128 s and 8.7 GB on its own, a sha256 table at 2^20 is 48.7 s and 3.3 GB, and the
+  program, input and public tables at their maxima cost nothing extra. The validators are 2–4 GB
+  droplets, so one legal such header (its transaction never mined, its fee bundle's note never
+  spent, so resubmittable forever) was an out-of-memory kill of the admitting node. Under all
+  four pins the worst admissible header — tier 14, program and input tables at 2^16, public at
+  2^15, both hash tables at their caps — builds in 4.7 s at 312 MB peak (the bundle key's own
+  order), and eight such keys retained by the cache together peak at 711 MB. `gas::MAX_TIER` (20)
+  remains the prover's ceiling; a call that needs more is refused, and raising a cap means
+  raising what `warm` covers with it and re-measuring the worst admissible shape on a fleet
+  droplet. Every chain-14 call to date is a tier-10 call against a 42- or 43-word program with
+  no hash syscall (fee 2 000 000 on all 340 of them); chain 13's ERC-20 `approve` was a tier-16
+  call, which this rule would refuse. What the pins do not bound is `Machine`'s 64-entry key
+  cache, which retains every key it builds (upstream code, vendored): distinct admissible
+  shapes, each paid for with its own fee-bundle proof, can fill it with 64 keys of the capped
+  size.
 - Any transaction: its encoding at most `max_block_bytes` (4 MiB by default), and a block's
   transactions within the same cap.
 - A block with an invalid call is invalid, like any other invalid transaction.

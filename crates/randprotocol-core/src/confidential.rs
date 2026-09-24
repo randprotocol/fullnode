@@ -17,6 +17,14 @@ pub enum ConfidentialError {
     InvalidProof(String),
     #[error("proof is for another program")]
     WrongProgram,
+    /// A call proof's declared tier is above the highest one the chain admits for a call
+    /// (`randprotocol_zkvm::executor::MAX_CALL_TIER`). Decided on the proof's header bytes alone,
+    /// before any verifier key is built (deep scan 2026-09-24, zkvm): the key for a tier-20 header
+    /// costs minutes and gigabytes to build, so an unbounded tier was an out-of-memory kill of
+    /// the admitting node for the price of one fee bundle. A permanent admission verdict, like
+    /// every other `InvalidProof`-class refusal — the tier is in the bytes.
+    #[error("call proof declares tier {tier}, above the {max} this chain admits for a call: prove the call at tier {max} or below (a smaller input, a shorter program, or the work split across calls)")]
+    CallTierTooHigh { tier: u8, max: u8 },
     #[error("bundle proof: {0}")]
     InvalidBundleProof(String),
     /// Block aggregation: the aggregate proof's interface digest does not match the covered

@@ -78,6 +78,63 @@ const NO_SHA256: u8 = 0;
 /// other, which is what keeps a junk header from making a node build one.
 const BUNDLE_TIER: usize = 14;
 
+/// The highest tier a *call* proof may declare (deep scan 2026-09-24, zkvm), enforced by
+/// `verify_call` before any verifier key is built, so it is a validity rule (admission and block
+/// apply both run `verify_call`). It is the highest tier `warm` pre-builds, and that is the
+/// point: `Machine::verify` builds the key for whatever tier a header declares, the build grows
+/// ~4× per tier step (production profile, `tests/executor.rs`'s
+/// `measure_a_call_verifier_key_build_at_the_production_profile`: tier 14 ≈ 3.6 s / 227 MB,
+/// tier 16 ≈ 13.7 s / 893 MB, tier 20 ≈ 216 s / 6.5 GB), and the validators are 2–4 GB droplets — so every tier past what is
+/// warmed is a header an attacker submits for the price of one fee bundle and a node builds
+/// synchronously, and the largest is an out-of-memory kill. `gas::MAX_TIER` (20) stays the
+/// prover-side ceiling; a call that needs more than this tier is refused as
+/// `ConfidentialError::CallTierTooHigh` with the remedy in the message. Raising it means
+/// raising what `warm` covers with it (`TIERS[..N]` below) and re-measuring the worst
+/// admissible shape at the new tier on a fleet droplet.
+pub const MAX_CALL_TIER: u8 = 14;
+
+/// The highest `keccak_log_height` a call proof may declare — 2^12 rows, 128 permutations
+/// (deep scan 2026-09-24, zkvm: the second half of the finding, found by costing the worst
+/// header `MAX_CALL_TIER` alone still admits). `check_declared_heights` bounds the keccak table
+/// by the tier's honest need, `klh ≤ t + 5`, and the flat `tables::keccak::MAX_LOG_HEIGHT` of
+/// 20 was chosen upstream as "unreachable-but-finite" — but the key's cost is the table's 99
+/// *preprocessed* columns, FRI-expanded, and at the production profile a tier-14 key with
+/// `klh = 19` (the tier's own bound) measures 128 s and 8.7 GB, worse than the tier-20 header
+/// the finding started from; with the sha256 table at its 2^20 as well, 209 s and 10 GB
+/// (`tests/executor.rs`'s `measure_a_call_verifier_key_build_at_the_production_profile`). The
+/// program, input and public heights cost nothing by comparison (2^16/2^16/2^15 is the same
+/// 3.9 s / 227 MB as the base), so the two hash tables are the whole of what is capped here.
+///
+/// 12 is a policy bound, not an honest-shape one: a tier-14 guest could honestly make 16 383
+/// keccak calls. What real calls need is far smaller — the translated ERC-20's harness hashes
+/// a handful of storage slots and ABI words, the EVM interpreter additionally binds its code
+/// (136 bytes a permutation, so 128 covers a 17 KB contract), and the suite's largest is 40
+/// permutations (`tests/e2e.rs`). A call past it is refused as `InvalidProof` naming the cap.
+///
+/// With every pin in place the worst header a call may still declare — tier 14, program and
+/// input tables at 2^16, public at 2^15, both hash tables at their caps — builds in 4.7 s at
+/// 312 MB peak, and eight such keys retained by `Machine`'s cache together peak at 711 MB
+/// (~60 MB retained a key; the same harness, `;`-separated shapes).
+pub const MAX_CALL_KECCAK_LOG_HEIGHT: u8 = 12;
+/// The sha256 table's twin — 2^13 rows, 128 compressions (8 KB hashed). Its preprocessed trace
+/// is ten columns to keccak's 99, so it is the cheaper of the two at equal height (2^16 costs
+/// 5.1 s / 366 MB against keccak's 2^15 at 14 s / 702 MB), but 2^20 is still 48.7 s and 3.3 GB.
+/// No guest this chain deploys calls `SYS_SHA256`; the sBPF interpreter's PDA derivations are
+/// the intended user.
+pub const MAX_CALL_SHA256_LOG_HEIGHT: u8 = 13;
+
+/// The largest `input_log_height` a call at `tier` can honestly declare — the input table's
+/// analogue of `Tier::max_keccak_log_height` (deep scan 2026-09-24, zkvm). Every private-input
+/// word is absorbed by an `IS_INDIGEST` cpu row, four words a row plus the salt row
+/// (`hash::input_digest_row_count`), and each of those rows is a cycle inside the tier's
+/// `2^t − 1` budget, so `n_in ≤ 4·(2^t − 2)` and `input_log_height(n_in) ≤ t + 2`. The flat
+/// 16-bit `HASH_LEFT` cap (65 535 words, `tables::input::MAX_LOG_HEIGHT`'s doc comment) is the
+/// other ceiling; the bound is the smaller of the two. `verify_call` refuses a declaration past
+/// it before any verifier key is built.
+pub fn max_input_log_height(tier: Tier) -> u8 {
+    ((tier.0 + 2) as u8).min(input::input_log_height(u16::MAX as usize))
+}
+
 pub struct ZkExecutor {
     machine: Machine,
 }
@@ -140,10 +197,11 @@ impl ZkExecutor {
     /// syscall.
     ///
     /// `exact` is what separates the two callers, and it still applies only to the program and
-    /// input heights. A *call* proof is against a program the chain only knows the `hc` of, and
-    /// whose private-input vector the chain never sees, so the two heights are merely
-    /// range-checked (`Machine::verify` then binds them cryptographically via the program and
-    /// input digests). A *bundle* proof is against one pinned guest with one fixed input width,
+    /// input heights. A *call* proof's are merely range-checked here; `verify_call` then pins
+    /// the program height to the deployed record's word count, bounds the input height by the
+    /// tier and caps the tier itself (`MAX_CALL_TIER`), all before `Machine::verify` — which
+    /// binds the heights cryptographically via the program and input digests, but only after
+    /// building a key for them. A *bundle* proof is against one pinned guest with one fixed input width,
     /// so both heights are known up front and anything else is a proof for a different shape —
     /// rejected here rather than paying for a verifier key that could never match. Since zkvm I1
     /// the exact case also pins `tier` ([`BUNDLE_TIER`]) and both optional hash-table heights
@@ -435,8 +493,10 @@ impl ConfidentialExecutor for ZkExecutor {
     /// first honest call at any other tier paying the uncached key cost inline; warming every
     /// tier would build the Poseidon2 chip's preprocessed round-constant table at `2^22` rows on
     /// a 2-vCPU validator, so this warms the tiers real guests land on today (10, 12, 14 — the
-    /// transfer guest proves at 14). A call at a larger tier still verifies; it pays the
-    /// first-verify cost once per (tier, height).
+    /// transfer guest proves at 14). Since the deep scan of 2026-09-24 those are also the *only*
+    /// tiers a call may declare (`MAX_CALL_TIER`, enforced by `verify_call` before any key is
+    /// built), so the set warmed here is exactly the set admissible, and the two are written as
+    /// one expression so they cannot drift.
     ///
     /// M4.1 (ruling): the key also carries `input_log_height`, but `warm` only knows the
     /// program's word count — it has no visibility into what any future call's private-input
@@ -474,7 +534,9 @@ impl ConfidentialExecutor for ZkExecutor {
         let typical = input::input_log_height(4);
         let input_heights: &[u8] = if typical == smallest { &[smallest] } else { &[smallest, typical] };
         let public_height = public::public_log_height(record.public_len as usize);
-        for t in &TIERS[..3] {
+        // Every tier a call may declare (`MAX_CALL_TIER` and below) — the cap and this loop
+        // move together, so no admissible tier is ever an unwarmed key build at admission.
+        for t in TIERS.iter().filter(|t| **t as u8 <= MAX_CALL_TIER) {
             for &in_h in input_heights {
                 self.machine.verifier_key(Tier(*t), log_height, in_h, NO_KECCAK, NO_SHA256, public_height);
             }
@@ -486,10 +548,53 @@ impl ConfidentialExecutor for ZkExecutor {
         // table heights before using any of them to size anything — but the degree-bits pre-check
         // inside `decode_and_check` shifts by them too, so it runs that same function in front of
         // it, to avoid panicking on an attacker-chosen out-of-range value before ever reaching
-        // `verify`. A call's program and input heights are ranged, not exact: the chain knows
-        // neither the program's word count (only its `hc`) nor its private-input width. (Its
-        // public height is checked just below, against the record.)
+        // `verify`. `decode_and_check` only *ranges* a call's tier, program and input heights;
+        // the three checks below pin them against what the chain does know, and every one of
+        // them runs before `Machine::verify` builds a verifier key for the declared shape.
         let proof = self.decode_and_check(proof, 0, 0, 0, false)?;
+        // The tier cap (deep scan 2026-09-24, zkvm). `check_declared_heights` admits every tier
+        // in `TIERS`, and `Machine::verify` builds the verifier key for the declared tier
+        // *before* it looks at a byte of STARK data — every pre-check in front of that build is
+        // satisfiable from public data alone (a consistent `degree_bits`, the tier's memory
+        // floor, the tier public value). The tier-20 key costs 216 s and 6.5 GB at the
+        // production profile, on validators that are 2–4 GB droplets, so one legal tier-20
+        // header — its transaction never mined, its fee bundle's note never spent, so it can be
+        // resubmitted forever — was an out-of-memory kill of the admitting node. Refused as its
+        // own verdict, with the remedy in the message, so an honest prover above the cap is
+        // told what to do rather than handed a `Batch(…)` failure.
+        let tier = proof.tier.0 as u8;
+        if tier > MAX_CALL_TIER {
+            return Err(ConfidentialError::CallTierTooHigh { tier, max: MAX_CALL_TIER });
+        }
+        // The two optional hash tables, whose preprocessed columns are the key's real cost
+        // (`MAX_CALL_KECCAK_LOG_HEIGHT`'s doc comment has the numbers): `check_declared_heights`
+        // bounds them by the tier's honest need, which at tier 14 is still a 2^19-row keccak
+        // table — 128 s and 8.7 GB of key. `0` declares no table and is always admitted.
+        if proof.keccak_log_height > MAX_CALL_KECCAK_LOG_HEIGHT {
+            return Err(ConfidentialError::InvalidProof(format!(
+                "keccak height {} past the {} a call may declare",
+                proof.keccak_log_height, MAX_CALL_KECCAK_LOG_HEIGHT
+            )));
+        }
+        if proof.sha256_log_height > MAX_CALL_SHA256_LOG_HEIGHT {
+            return Err(ConfidentialError::InvalidProof(format!(
+                "sha256 height {} past the {} a call may declare",
+                proof.sha256_log_height, MAX_CALL_SHA256_LOG_HEIGHT
+            )));
+        }
+        // The program height is not a guess: the record holds the deployed words, and
+        // `Machine::prove` declares exactly `program_log_height(program.len())` (`Program::len`
+        // is `words.len()`), so any other declared height is a proof over a different program
+        // table — one the `hc` compare inside `verify` would refuse, but only after a key was
+        // built and cached (evicting a warmed one) for the junk height.
+        if proof.program_log_height != program::program_log_height(record.words.len()) {
+            return Err(ConfidentialError::InvalidProof("program height not the deployed program's".into()));
+        }
+        // The input height is unknown but bounded by the tier, exactly as the keccak height is
+        // bounded by it inside `check_declared_heights` (`max_input_log_height`).
+        if proof.input_log_height > max_input_log_height(proof.tier) {
+            return Err(ConfidentialError::InvalidProof("input height past what the tier can read".into()));
+        }
         // A deterministic early reject, before `hc_of` and `Machine::verify`: a call against a
         // program deployed with a public input must declare exactly the public-table height the
         // prover derives from that input's length (`Machine::prove` uses
