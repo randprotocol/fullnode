@@ -51,6 +51,11 @@ rand-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop t
 
 1. `cargo test` locally, commit, push.
 2. Restart local validators from the new binary (`cargo build --release`, point `run-a.sh`'s `BINDIR` at it, then `launchctl kill TERM gui/$(id -u)/org.randprotocol.node-a` — launchd restarts A from the script).
+**Release rule (audit v4 PROC-3).** A version tag is made only from a commit whose CI run
+(`.github/workflows/ci.yml`) is green and whose full `cargo test --workspace --release` passed on
+the release machine, `the_genesis_hash_is_pinned` included; the tag annotation names the run. A
+known-failing test is a reason not to tag, never a note to tag over.
+
 3. `deploy/rebuild-vps.sh <ip>` per server, staggered so that more than 2/3 of stake stays up. A
    restart costs a node a few seconds; it resumes from its persisted head, verifies the chain, and
    batch-syncs what it missed. Do not leave nodes on different builds for long: a node still on the

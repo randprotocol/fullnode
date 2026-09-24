@@ -1197,13 +1197,14 @@ mod tests {
     fn the_genesis_hash_is_pinned() {
         let ex = ZkExecutor::new(FriProfile::Test);
         let state = pinned_genesis().build(&ex).unwrap();
-        // S2 Task 1: the register. This moved from 19df87d5… (itself moved from 700f28e8… by
-        // the scaffold's `epoch_blocks` binding) for deliberate, consensus-breaking reasons: the
-        // genesis binding now covers every validator's payout address, the state root's
-        // validator leaf is `rand-validator-leaf-2` over the v2 entry (a length-prefixed
-        // unbonding queue, the payout address, the nonce), and this genesis's stakes are the
-        // staking minimum, which genesis now requires.
-        assert_eq!(state.hash().to_hex(), "69010a43a7275d1ff2c25d8b774728f4a31148968dcd186f89da16550e87ffb5");
+    // Pinned to the chain-14 genesis shape (v0.5.3 re-pin, audit v3 PROC-3). Every move of this
+    // hash was deliberate and consensus-breaking: the transaction binding (`rand-tx-bind-1`), the
+    // hidden-asset guest replacing the bundle guest (`hc_bundle`), and the v0.4/v0.5 genesis
+    // sections (call limits, `tokens`, `bridge`) — before those, S2's register (the validator
+    // leaf `rand-validator-leaf-2`, every payout address in the binding, stakes at the minimum).
+    // A drift here with no such change in the log is a bug, and a tag is never cut over a red run
+    // of this test (docs/deploy.md, "Release rule", audit v4 PROC-3).
+    assert_eq!(state.hash().to_hex(), "69010a43a7275d1ff2c25d8b774728f4a31148968dcd186f89da16550e87ffb5");
         // The envelope is resealed on every call and must not move the hash: only the
         // commitment and the amount are bound.
         let again = pinned_genesis().build(&ex).unwrap();
