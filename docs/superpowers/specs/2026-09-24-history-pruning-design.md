@@ -40,8 +40,9 @@ reads as floor 0: an archive node. The floor only ever rises.
 
 ## 1. The retention pass
 
-**Flag.** `rand-node run --prune-history <duration>` (`humantime` syntax: `24h`, `36h`). Absent
-means never prune. It flows through the three usual edits: the clap field, the `Cmd::Run`
+**Flag.** `rand-node run --prune-history <duration>`, where `<duration>` is `<n>m`, `<n>h` or `<n>d`
+(`24h`, `36h`, `2d`), parsed by `parse_prune_history` in `main.rs`; no dependency is added for it.
+Absent means never prune. It flows through the three usual edits: the clap field, the `Cmd::Run`
 destructure in `main.rs`, and `NodeConfig.prune_history: Option<Duration>` in `node.rs`, beside
 `keep_raw_proofs` and `min_free_disk_bytes`.
 
@@ -106,9 +107,11 @@ the mixed window is minutes per node.
   no ledger replay: `load_ledger` is trusted and the node logs
   `pruned node: history verified from {floor} to {head}; ledger snapshot trusted`. `Off` keeps
   requiring block 0 and `load_ledger`.
-- **Repair on a structural failure** (`check_and_repair_chain`) truncates only down to the floor;
-  a gap at or below the floor is reported as `history missing below the floor` and is fatal
-  (the operator re-syncs from the archive).
+- **A structural failure on a pruned node is fatal.** The node holds one ledger, the head's;
+  truncating to an earlier height would pair the remaining blocks with a state they did not
+  produce. `check_and_repair_chain` exits with
+  `pruned node: {problem}; history cannot be repaired locally — re-sync from the archive`, and
+  `verify --repair` prints the same and exits 2.
 
 `verify --mode full --repair` (the offline command) follows the same rule.
 
