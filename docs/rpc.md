@@ -720,7 +720,10 @@ token units for the rest); `next_index`, `mint_day` and `max_tokens` are numbers
 registration is refused `RegistryFull` at it — or `null` on a chain whose genesis has none
 (chain 14). `burn_registration_fee` (v0.5.5, audit v5 TOK-2) is a boolean: whether a
 registration's `registration_fee` is burned rather than paid to the block's proposer
-(`docs/tokens.md` §15) — `false` on chain 14. A page shorter than `limit` is the last.
+(`docs/tokens.md` §15) — `false` on chain 14. `bound_note_value` (v0.5.6, deep scan) is a
+boolean: whether a mint or deposit is held below 2^63 as a validity rule (`docs/tokens.md` §16;
+the admission screen refuses such an amount on every chain regardless) — `false` on chain 14.
+A page shorter than `limit` is the last.
 
 A wallet resolves a token id **through this listing** (`wallet::resolve_asset`), never through
 `rand_getToken`: a transfer's asset is private on chain, and reading the whole registry costs the

@@ -2131,6 +2131,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // TOK-2 (audit v5): whether a registration's fee is burned rather than paid to
                 // the proposer; `false` on chain 14.
                 "burn_registration_fee": tokens.ext().burn_registration_fee,
+                // Deep scan 2026-09-24: whether a mint or deposit is held below 2^63 as a
+                // validity rule (`docs/tokens.md` §16); `false` on chain 14.
+                "bound_note_value": tokens.ext().bound_note_value,
                 "tokens": rows,
             }))
         }
@@ -4391,12 +4394,20 @@ mod tests {
     #[tokio::test]
     async fn the_token_listing_serves_the_genesis_cap() {
         let (mut gs, _) = fixtures::bridged_genesis(1);
-        let capped = gs.ledger.tokens().unwrap().clone().with_max_tokens(3).with_burn_registration_fee(true);
+        let capped = gs
+            .ledger
+            .tokens()
+            .unwrap()
+            .clone()
+            .with_max_tokens(3)
+            .with_burn_registration_fee(true)
+            .with_bound_note_value(true);
         gs.ledger.set_tokens(Some(capped));
         let (_d, st) = state_for(&gs);
         let v = ok(&st, "rand_getTokens", json!([])).await;
         assert_eq!(v["max_tokens"], 3);
         assert_eq!(v["burn_registration_fee"], true, "TOK-2");
+        assert_eq!(v["bound_note_value"], true, "deep scan 2026-09-24: the note-value bound is served beside the other flags");
         assert!(st.storage.tokens().unwrap().unwrap().burns_registration_fee(), "the flag rides the store");
         assert_eq!(v["tokens"].as_array().unwrap().len(), 1);
         assert_eq!(ok(&st, "rand_getTokens", json!([2, 10])).await["tokens"], json!([]));
