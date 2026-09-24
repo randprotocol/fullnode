@@ -61,8 +61,10 @@ impl NewView {
 /// CON-4): the evidence a lock is released on. Over `rand-not-held-1 ‖ genesis ‖ hash`, so an
 /// attestation is bound to one chain and one block; the asker verifies it against its current
 /// validator set and counts the signer's stake, and lowers its lock only once the signers hold
-/// strictly more than a third of the set's stake — so at least one honest validator is among
-/// them. Timeouts and unsigned `Block(None)` answers are fetch attempts, never evidence.
+/// a quorum — strictly more than two thirds of the set's stake (audit v5; v0.5.4 released on a
+/// third, which a Byzantine minority can supply alone) — so honest validators holding a third
+/// of the stake are among them. Timeouts and unsigned `Block(None)` answers are fetch attempts,
+/// never evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotHeld {
     pub hash: Hash,

@@ -62,8 +62,8 @@ known-failing test is a reason not to tag, never a note to tag over.
    previous build cannot answer block fetches for the new one.
 
 **Roll note for v0.5.4's lock rule (audit v4 CON-4).** A validator's lock is now released only on
-signed `NotHeld` answers from validators holding more than a third of the stake — a quorum,
-strictly more than two thirds, since v0.5.5 (audit v5) — (`docs/consensus.md`, "The lock"), and
+signed `NotHeld` answers from validators holding a quorum of the stake — strictly more than two
+thirds since v0.5.5 (audit v5; v0.5.4 released on a third) — (`docs/consensus.md`, "The lock"), and
 a node on an older build never sends one: in a mixed fleet a lock on a block no peer holds simply
 holds, and that validator withholds its vote until a newer QC forms without it. Roll all
 validators, one at a time waited to `rand_getHealth: ok`, before relying on the rule; the v0.5.4

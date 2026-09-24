@@ -1921,14 +1921,14 @@ impl Node {
             SyncResponse::NotHeld(n) => {
                 // Signed evidence (audit v4, CON-4), counted only for the hash this request asked
                 // for; the replica verifies the signer against its current set and releases the
-                // lock once more than a third of the stake has attested. Then on to the next
-                // peer, as for `Block(None)`.
+                // lock once a quorum of the stake — strictly more than two thirds (audit v5) —
+                // has attested. Then on to the next peer, as for `Block(None)`.
                 match self.fetch_inflight.get(&request_id).map(|(h, _)| *h) {
                     Some(h) if n.hash == h => {
                         if self.hs.record_not_held(&n) {
                             tracing::warn!(
-                                "lock on {h:?} released: validators holding more than a third of the stake attest \
-                                 they do not hold it (audit v4 CON-4)"
+                                "lock on {h:?} released: validators holding a quorum of the stake attest \
+                                 they do not hold it (audit v4 CON-4, audit v5)"
                             );
                         }
                     }
