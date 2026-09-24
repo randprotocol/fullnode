@@ -120,14 +120,14 @@ the mixed window is minutes per node.
 - `rand_status` gains `prune_floor` (u64) and `prune_history_secs` (null when unset).
 - A lookup **below the floor** answers a distinct JSON-RPC error, code `-32010`,
   message `pruned: height {h} is below this node's retention floor {floor}`, with
-  `data: {"floor": floor}`. Only height-addressed lookups can be classified: this covers
-  `rand_getBlockByHeight`, `rand_getFinality` by height, and `rand_getTransaction`,
-  `rand_checkTransaction`, `rand_getReceipt`, `rand_getCallEnvelope`, `rand_getAggregate` and
-  `rand_getRawTransaction` when the `txs` row still names a height below the floor (a row that
-  was itself deleted answers today's not-found, plus `data.floor`). Hash-addressed lookups
-  (`rand_getBlockByHash`, `rand_getFinality` by hash) keep answering null for an unknown hash
-  and add `data.floor`; a caller can tell "pruned" from "never existed" only by asking an
-  archive, and `docs/rpc.md` says so. An unknown height **above** the floor keeps today's answer.
+  `data: {"floor": floor}`. Only height-addressed lookups answer it: `rand_getBlockByHeight`,
+  `rand_getFinality` by height, `rand_getBlocks`/`rand_getCompactBlocks` when the range reaches
+  a non-genesis height below the floor, and `rand_getTransaction`/`rand_checkTransaction` when
+  the `txs` row names a height below the floor. `rand_getReceipt`, `rand_getCallEnvelope`,
+  `rand_getAggregate`, `rand_getRawTransaction` and `rand_getBlockByHash` keep answering null
+  for a hash the node does not hold; a caller can tell "pruned" from "never existed" only by
+  asking an archive, and `docs/rpc.md` says so. An unknown height **above** the floor keeps
+  today's answer.
 - `rand_getBlocks(from, to)` and `rand_getCompactBlocks(from, …)` with `from < floor` answer
   the same error instead of an empty page. A wallet that scans with `rand_getCommitments`,
   `rand_getNullifiers` and `rand_getWitness` (the `randprotocol-client` path) is unaffected:

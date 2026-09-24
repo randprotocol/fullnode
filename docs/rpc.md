@@ -1270,6 +1270,17 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
+### 2026-09-25 — history pruning: `--prune-history`, `rand_status.prune_floor`, error `-32010`
+
+A node started with `--prune-history 24h` keeps the ledger and only the last day of blocks.
+`rand_status` carries `prune_floor` (0 on an archive) and `prune_history_secs` (`null` when the
+node keeps everything). Height-addressed lookups below the floor answer `-32010` with the floor
+in `data`; hash-addressed lookups still answer `null` for a hash the node does not hold, and only
+an archive can say whether it was pruned or never existed. `rand_getTransactionStatus` adds
+`floor` to an `unknown` entry on a pruned node. Wallet scanning (`rand_getCommitments`,
+`rand_getNullifiers`, `rand_getWitness`) is unaffected: the notes and nullifiers families are
+never pruned.
+
 ### 2026-09-25 — v0.5.6, the deep-scan release
 
 Node-only; no wire or genesis change on chain 14 (`../security/fullnode-deep-scan-2026-09-24.md`).
@@ -1678,13 +1689,3 @@ upgrades by ordinary restart. What a client can see:
   answered after its proof has verified on a worker rather than on the consensus loop, so the reply
   can take a few hundred milliseconds longer under load. The error messages are unchanged.
 
-### 2026-09-24 — history pruning: `--prune-history`, `rand_status.prune_floor`, error `-32010`
-
-A node started with `--prune-history 24h` keeps the ledger and only the last day of blocks.
-`rand_status` carries `prune_floor` (0 on an archive) and `prune_history_secs` (`null` when the
-node keeps everything). Height-addressed lookups below the floor answer `-32010` with the floor
-in `data`; hash-addressed lookups still answer `null` for a hash the node does not hold, and only
-an archive can say whether it was pruned or never existed. `rand_getTransactionStatus` adds
-`floor` to an `unknown` entry on a pruned node. Wallet scanning (`rand_getCommitments`,
-`rand_getNullifiers`, `rand_getWitness`) is unaffected: the notes and nullifiers families are
-never pruned.

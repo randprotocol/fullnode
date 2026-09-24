@@ -16,4 +16,5 @@ DATA=data-a-1cff3b7d   # keyed on the genesis hash so a regenerated genesis gets
 exec $BIN run --datadir $DATA --key "$KEYDIR/node-a.key.json" --validator \
     --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 \
     --bootstrap /ip4/164.90.239.200/tcp/30303/p2p/12D3KooWEQEbUwZRgqhDPXhW7vNBmcRcnhUDGUADe81VFdv3ALYe \
-    --bootstrap /ip4/165.245.173.74/tcp/30303/p2p/12D3KooWJyc5oDHggAr89e9QrRFBy9Tg8TxXh18yzrb1SM6KKLYw
+    --bootstrap /ip4/165.245.173.74/tcp/30303/p2p/12D3KooWJyc5oDHggAr89e9QrRFBy9Tg8TxXh18yzrb1SM6KKLYw \
+    ${PRUNE_ARGS:-}

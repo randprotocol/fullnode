@@ -5514,7 +5514,7 @@ mod tests {
         // passed happily through v0.2, v0.3 and v0.4 while the field reported 0.1.0 (audit v3,
         // PROC-3). The workspace version is bumped with each tag, and this is what notices when it
         // is not.
-        assert_eq!(v["version"], "0.5.6", "bump the workspace version in Cargo.toml with the tag");
+        assert_eq!(v["version"], "0.5.7", "bump the workspace version in Cargo.toml with the tag");
         // The full 40-hex commit, `-dirty` when tracked files differed at build time, or
         // "unknown" when neither git nor a `.git-rev` could say — never a short or stale form.
         let sha = v["git_sha"].as_str().unwrap();
