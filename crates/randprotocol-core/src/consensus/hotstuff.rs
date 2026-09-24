@@ -19,6 +19,10 @@ const MAX_VIEW_AHEAD: u64 = 1_000_000;
 const MAX_PENDING_VOTE_KEYS: usize = 4096;
 /// Cap on distinct views with buffered NewView messages.
 const MAX_NEW_VIEW_KEYS: usize = 2048;
+/// The equivocation record (`proposed`) is bounded on its own, not by the tree: entries above
+/// the committed head's view are kept whether or not their block still is (deep scan
+/// 2026-09-24), oldest views dropped past this many.
+const MAX_PROPOSED_KEYS: usize = 4096;
 /// Cap on cached epoch-set derivations. Every key is a block in the tree, so this only bites if
 /// the tree cap is raised far past it.
 const MAX_DERIVED_SETS: usize = 1024;
@@ -82,8 +86,10 @@ pub struct HotStuff {
     orphan_count: usize,
     /// The one block this replica holds per (view, proposer) (audit v4, CON-3): a second,
     /// different block from the same leader for the same view is an equivocation and is refused.
-    /// Entries follow the tree — `prune` and `evict_for_room` drop them with their blocks — so
-    /// the map is bounded by `max_tree_blocks`.
+    /// Entries outlive their blocks: `prune` drops those at or under the committed head's view
+    /// (decided), `evict_for_room` drops none (an evicted first block must not open the view to
+    /// a second — deep scan 2026-09-24), and the map is capped at `MAX_PROPOSED_KEYS`, oldest
+    /// views first.
     proposed: BTreeMap<(u64, Address), Hash>,
     /// Validators of the current set that have signed that they do not hold the locked block
     /// (audit v4, CON-4), keyed by that block's hash. Kept for the locked block alone — the one
@@ -851,6 +857,9 @@ impl HotStuff {
         let receipts = ledger.apply_block_for_sync(block, &sidecar, &[], self.executor.as_ref(), self.verified.as_ref())?;
         self.tree.insert(hash, Entry { block: block.clone(), ledger_after: ledger, receipts, qc: None });
         self.proposed.insert((block.view(), block.proposer()), hash);
+        while self.proposed.len() > MAX_PROPOSED_KEYS {
+            self.proposed.pop_first();
+        }
         // The child's `justify` is the parent's certificate.
         self.remember_qc(&block.header.justify);
         // The block arrived: whatever was attested about not holding it is moot.
@@ -1279,11 +1288,10 @@ impl HotStuff {
             !v.is_empty()
         });
         self.orphan_count = self.orphans.values().map(|v| v.len()).sum();
-        // The equivocation record follows the tree: entries at or under the committed head's
-        // view are decided, and a pruned dead branch's entries go with its blocks.
+        // The equivocation record: entries at or under the committed head's view are decided;
+        // a pruned dead branch's entries stay — its leader proposed in those views all the same.
         let head_view = self.tree.get(&keep).map(|e| e.block.view()).unwrap_or(0);
-        let tree = &self.tree;
-        self.proposed.retain(|(view, _), hash| *view > head_view && tree.contains_key(hash));
+        self.proposed.retain(|(view, _), _| *view > head_view);
     }
 
     /// Drop every tree entry that no longer descends from the committed head, and the derived
@@ -1329,7 +1337,7 @@ impl HotStuff {
 
     /// Make room in a full tree: evict blocks off the certified chain, oldest view first, until
     /// the tree is under `max_tree_blocks` — then whatever descended from an evicted block, since
-    /// it no longer reaches the head. Their `proposed` entries go with them. A tree that is all
+    /// it no longer reaches the head (their `proposed` entries stay). A tree that is all
     /// certified chain evicts nothing, and the caller refuses with `TreeFull` as before.
     fn evict_for_room(&mut self) {
         let keep = self.certified_chain();
@@ -1348,8 +1356,6 @@ impl HotStuff {
             return;
         }
         self.drop_unreachable();
-        let tree = &self.tree;
-        self.proposed.retain(|_, hash| tree.contains_key(hash));
         tracing::warn!(
             evicted,
             held = self.tree.len(),

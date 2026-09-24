@@ -2128,6 +2128,32 @@ fn six_hundred_siblings_do_not_stop_the_honest_leaders_proposal() {
 }
 
 #[test]
+fn equivocation_memory_outlives_the_trees_eviction() {
+    // Deep scan 2026-09-24 (consensus): `evict_for_room` dropped the `proposed` entries of the
+    // blocks it evicted, so a leader whose junk filled the tree could propose a *second* block
+    // for any view whose first one had been evicted — the one-block-per-(view, leader) rule
+    // (CON-3) was only as long as the tree's memory. The record must outlive the block.
+    let mut sim = setup(4, 4);
+    let (victim, attacker) = (1, 3);
+    let attacker_addr = sim.keys[attacker].address();
+    let first_view = (sim.nodes[victim].view() + 1..).find(|v| sim.nodes[victim].leader(*v) == attacker_addr).unwrap();
+    let accepted = fill_with_siblings(&mut sim, victim, attacker, 600);
+    assert!(accepted >= 500, "{accepted}");
+    // The first sibling (view `first_view`, timestamp 1_000 + view) has been evicted, oldest first.
+    let first = block_on_head(&sim, victim, first_view, 1_000 + first_view);
+    assert!(!sim.nodes[victim].has_block(&first.hash()), "the oldest sibling was evicted");
+    // A different block by the same leader for that same view: an equivocation, evicted or not.
+    let second = block_on_head(&sim, victim, first_view, 1_000 + first_view + 1);
+    assert_ne!(first.hash(), second.hash());
+    let e = sim.nodes[victim].on_proposal(second.clone(), 1_000 + first_view + 1).unwrap_err();
+    assert!(
+        matches!(e, ConsensusError::Equivocation { view, first: f, .. } if view == first_view && f == first.hash()),
+        "{e:?}"
+    );
+    assert!(!sim.nodes[victim].has_block(&second.hash()));
+}
+
+#[test]
 fn a_leaders_second_block_for_one_view_is_refused_as_equivocation() {
     let mut sim = setup(4, 4);
     let (leader, view) = pending_leader(&sim);
