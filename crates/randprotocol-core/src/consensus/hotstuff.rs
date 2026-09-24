@@ -671,7 +671,7 @@ impl HotStuff {
     /// timeout from a peer chosen by an unsigned status — which let eight sybils take back any
     /// honest validator's promise. `high_qc` is liveness state and keeps this fallback; the lock
     /// is released only by [`record_not_held`](Self::record_not_held), on signed not-held from
-    /// validators holding more than a third of the stake. The whole-fleet-restart case that
+    /// validators holding a quorum — more than two thirds of the stake. The whole-fleet-restart case that
     /// motivated the old release is covered by the persisted locked block (`resume`).
     pub fn fallback_high_qc(&mut self, unobtainable: &Hash) -> Vec<Action> {
         let mut out = Vec::new();

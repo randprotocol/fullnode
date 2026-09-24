@@ -88,21 +88,6 @@ block is ~60 KB of `blocks` (the 18-signature Dilithium2 QC inside the header) a
 where it was ~49 KB more — about 3.6 GB/day at the fleet's measured 1.4 s blocks, 1.7 GB/day at
 3 s (the D19 numbers; the release notes carry the figure measured after the roll).
 
-**Roll note for v0.5.5's storage layout (audit v5 OPS-4).** A committed block's certificate is
-stored once: it lives in its child's `justify`, and `CF_QCS` keeps only genesis' row and the
-head's. The first open on v0.5.5 deletes the row v0.5.4 wrote for every other height (~250 000
-rows, ~12 GB on a chain-14 validator) in one batch, sets `META_QCS_PRUNED`, and compacts the
-family; a node killed mid-pass finishes it on its next open. Startup verification reads each
-block once (the child is carried into the next height), so it is no slower than before. **Rollback
-below v0.5.5 needs a resync**: a v0.5.4 binary reading a pruned database finds no row for a
-non-head height and fails `committed_block` with `Corrupt` — it cannot serve sync and its own
-startup verify refuses the chain — so the old binary must start from an empty data directory.
-No wire, consensus or genesis change: v0.5.5 and v0.5.4 nodes interoperate, and the roll is one
-node at a time waited to `rand_getHealth: ok` as usual. The slope this halves: an idle chain-14
-block is ~60 KB of `blocks` (the 18-signature Dilithium2 QC inside the header) and ~0 of `qcs`
-where it was ~49 KB more — about 3.6 GB/day at the fleet's measured 1.4 s blocks, 1.7 GB/day at
-3 s (the D19 numbers; the release notes carry the figure measured after the roll).
-
 **Disk guard (audit v4 OPS-3).** A node refuses to start under 1 GB free on its data directory's
 filesystem (`--min-free-disk-mb`, default 1024, names the directory and the flag), and
 `rand_getHealth` answers `disk_low` with the free byte count under 4 GB, re-measured every status
