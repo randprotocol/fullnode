@@ -2735,7 +2735,7 @@ mod tests {
         l2.set_timestamp_ms(2);
         l2.apply_transactions_with_covered(&[aggregate.clone()], &key(1).address(), &sidecar, &StubExecutor).unwrap();
         l2.record_anchor(2);
-        let b2 = make_block_unchecked(&b1.block, &l2, vec![aggregate.clone()], &key(1));
+        let b2 = make_block_unchecked(&b1, &l2, vec![aggregate.clone()], &key(1));
         st.storage.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
         (dir, st, gs, covered_tx, aggregate)
     }
@@ -4139,7 +4139,7 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![att.clone()], &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         let burn = fixtures::burn_tx(&ledger, 1, 400, 100, 30);
-        let b2 = make_block(&b1.block, &mut ledger, vec![burn], &key(1));
+        let b2 = make_block(&b1, &mut ledger, vec![burn], &key(1));
         st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
         (dir, st, gs, att)
     }
@@ -4312,7 +4312,7 @@ mod tests {
         let b3 = make_block(&parent, &mut ledger, vec![register.clone()], &key(1));
         st.storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
         let mint = fixtures::token_mint_tx(&ledger, 2, 700, 0, 50);
-        let b4 = make_block(&b3.block, &mut ledger, vec![mint.clone()], &key(1));
+        let b4 = make_block(&b3, &mut ledger, vec![mint.clone()], &key(1));
         st.storage.commit(std::slice::from_ref(&b4), &ledger, &[], &StubExecutor).unwrap();
         (dir, st, gs, register, mint)
     }
@@ -4961,7 +4961,7 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, fat, &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         let tx = bundle_tx(&ledger, [[9001; 8], [9002; 8]], [[9003; 8], [9004; 8]], bundle_fee());
-        let b2 = make_block(&b1.block, &mut ledger, vec![tx], &key(1));
+        let b2 = make_block(&b1, &mut ledger, vec![tx], &key(1));
         st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 
         let v = ok(&st, "rand_getCompactBlocks", json!([1, 2])).await;
@@ -4994,7 +4994,7 @@ mod tests {
             let att =
                 fixtures::attest_tx(&ledger, fixtures::attestation(&secrets, &fixtures::recipient(), 1_000, 0), 20);
             let txs = if attest_first { vec![att.clone(), withdraw] } else { vec![withdraw, att.clone()] };
-            let b2 = fixtures::make_block_voted(&b1.block, &mut ledger, txs, &v, &[&v]);
+            let b2 = fixtures::make_block_voted(&b1, &mut ledger, txs, &v, &[&v]);
             let withdraw_leaf = b2.deposits[0].index;
             storage.commit(&[b1, b2], &ledger, &[], &StubExecutor).unwrap();
             let expected_deposit = randprotocol_core::ledger::bridge_notes::deposit_note(
@@ -5131,7 +5131,7 @@ mod tests {
         bundle.envelopes[0] = sealed_to(&bob, &alice, &a900, &TxKey([13; 32]));
         bundle.envelopes[1] = fixtures::env(9);
         let tx2 = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, bundle, Action::None));
-        let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &key(1));
+        let b2 = make_block(&b1, &mut ledger, vec![tx2], &key(1));
         st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 
         (dir, st, ledger, b2.block, a500, b700, a900)

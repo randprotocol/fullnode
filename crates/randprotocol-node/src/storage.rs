@@ -149,6 +149,9 @@ const META_SAFETY: &str = "safety";
 /// CON-4): written by the `PersistSafety` arm beside the safety state, deleted once the lock is
 /// back at the head, read by `resume_consensus`. An older build never reads the key.
 const META_LOCKED_BLOCK: &str = "locked_block";
+/// Set once the `CF_QCS` rows strictly between genesis and the head have been deleted (audit
+/// v5, OPS-4): a database written by v0.5.4 holds one per height, and `open` prunes them once.
+const META_QCS_PRUNED: &str = "qcs_pruned";
 /// `bincode(CommitmentTree)`: the depth-32 frontier, the only form of the note tree consensus
 /// state keeps. The leaves themselves live in `notes` and rebuild a `FullTree` for witnesses.
 const META_TREE: &str = "tree";
@@ -529,7 +532,44 @@ impl Storage {
             tree_builds: std::sync::atomic::AtomicUsize::new(0),
         };
         storage.backfill_receipts_index()?;
+        storage.prune_committed_qcs()?;
         Ok(storage)
+    }
+
+    /// Delete the `CF_QCS` rows strictly between genesis and the head, once (audit v5, OPS-4).
+    ///
+    /// Until v0.5.5 `commit` wrote every committed block's certificate to `CF_QCS` — an
+    /// 18-signature Dilithium2 QC, ~44 KB, already inside the next block's `justify`: the same
+    /// bytes twice per block, half of chain 14's disk slope. A committed block's certificate
+    /// is now read off its child (`qc_by_height`), so a database written by v0.5.4 carries one
+    /// redundant row per height (~250 000 rows, ~12 GB on chain 14) that this pass drops in
+    /// one batch, marks done under `META_QCS_PRUNED`, and compacts away. The marker, not the
+    /// family's shape, is the guard — a rerun costs one meta read — and a node killed
+    /// mid-pass simply does it again on its next open (the deletes are idempotent). Genesis'
+    /// row and the head's are the two `qc_by_height` still serves from this family.
+    fn prune_committed_qcs(&self) -> Result<()> {
+        if self.get_meta_raw(META_QCS_PRUNED)?.is_some() {
+            return Ok(());
+        }
+        let head = self.head_height()?;
+        let mut batch = WriteBatch::default();
+        let mut n = 0u64;
+        for item in self.db.iterator_cf(self.cf(CF_QCS), IteratorMode::Start) {
+            let (k, _) = item?;
+            let height = be_u64(&k, "qc key")?;
+            if height == 0 || Some(height) == head {
+                continue;
+            }
+            batch.delete_cf(self.cf(CF_QCS), k);
+            n += 1;
+        }
+        batch.put_cf(self.cf(CF_META), META_QCS_PRUNED.as_bytes(), [1u8]);
+        self.db.write_opt(batch, &sync_opts())?;
+        if n > 0 {
+            self.db.compact_range_cf(self.cf(CF_QCS), None::<&[u8]>, None::<&[u8]>);
+            tracing::info!("pruned {n} committed certificates below the head (each lives in its child's justify)");
+        }
+        Ok(())
     }
 
     /// Undo v0.3's one on-disk addition so a pre-v0.3 build can open the database again (the
@@ -1088,6 +1128,14 @@ impl Storage {
         be_u64(&bytes, "chain_id meta")
     }
 
+    /// The head height alone, without decoding the head block; `None` before `init_genesis`.
+    fn head_height(&self) -> Result<Option<u64>> {
+        match self.get_meta_raw(META_HEAD_HEIGHT)? {
+            Some(bytes) => Ok(Some(be_u64(&bytes, "head_height meta")?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn head(&self) -> Result<Head> {
         let bytes = self.get_meta_raw(META_HEAD_HEIGHT)?.ok_or(StorageError::NotInitialized)?;
         let height = be_u64(&bytes, "head_height meta")?;
@@ -1116,8 +1164,19 @@ impl Storage {
         }
     }
 
+    /// The certificate of the committed block at `h` (audit v5, OPS-4). Genesis' and the
+    /// head's are `CF_QCS` rows — the head is the one committed block with no committed child
+    /// — and every other block's is its child's `header.justify`, which is the same QC: the
+    /// commit rule hands `Action::Commit` exactly the certificate the next block carries.
     pub fn qc_by_height(&self, h: u64) -> Result<Option<QuorumCertificate>> {
-        self.get(CF_QCS, &height_key(h))
+        let head = self.head_height()?;
+        if h == 0 || Some(h) == head {
+            return self.get(CF_QCS, &height_key(h));
+        }
+        if head.is_none_or(|head| h > head) {
+            return Ok(None);
+        }
+        Ok(self.block_by_height(h + 1)?.map(|child| child.header.justify))
     }
 
     pub fn committed_block(&self, h: u64) -> Result<Option<CommittedBlock>> {
@@ -1599,6 +1658,7 @@ impl Storage {
         let mut expected_height = first_height;
         let mut expected_parent = head.hash;
         let mut next_index = self.notes_count()?;
+
         // The validators this commit's blocks name — their proposers, and every validator an
         // action names. Not the set of rows to write (that is the diff below), only the set that
         // *must* be in the register at all: a block naming a validator the register does not hold
@@ -1611,6 +1671,14 @@ impl Storage {
         let mut spent_digests: BTreeSet<Hash> = BTreeSet::new();
         let first_burn_sequence = self.bridge_meta()?.map(|m| m.burn_sequence).unwrap_or(0);
         let mut batch = WriteBatch::default();
+        // The certificate is stored once (audit v5, OPS-4): the new head's goes to `CF_QCS`,
+        // and the old head's row goes — its certificate is now the first new block's `justify`.
+        // Blocks inside the batch but the last never get a row: their child is in the batch.
+        let last = blocks.last().expect("non-empty");
+        if head.height > 0 {
+            batch.delete_cf(self.cf(CF_QCS), height_key(head.height));
+        }
+        batch.put_cf(self.cf(CF_QCS), height_key(last.block.height()), bincode::serialize(&last.qc)?);
 
         for cb in blocks {
             let block = &cb.block;
@@ -1637,7 +1705,6 @@ impl Storage {
             }
             let hk = height_key(block.height());
             batch.put_cf(self.cf(CF_BLOCKS), hk, block.encode());
-            batch.put_cf(self.cf(CF_QCS), hk, bincode::serialize(&cb.qc)?);
             batch.put_cf(self.cf(CF_BLOCK_INDEX), hash.as_bytes(), hk);
             // The notes the ledger created itself, in append order (see `CommittedBlock`). They
             // are interleaved with the transactions' own: a `Withdraw` carries no bundle, so its
@@ -2027,6 +2094,9 @@ impl Storage {
         }
         let mut sets: BTreeMap<u64, ValidatorSet> = BTreeMap::new();
         sets.insert(0, gs.validators.clone());
+        // A block's certificate is its child's `justify` (audit v5, OPS-4), so the child is read
+        // one height early and carried into the next iteration: one decode per block, not two.
+        let mut carried: Option<Block> = None;
         for h in 1..=head {
             let problem = (|| -> std::result::Result<(), String> {
                 // A block at the first height of an epoch fixes that epoch's set, from the
@@ -2057,10 +2127,13 @@ impl Storage {
                 let set = sets
                     .get(&epoch)
                     .ok_or_else(|| format!("no validator set for epoch {epoch} at block {h}"))?;
-                let block = self
-                    .block_by_height(h)
-                    .map_err(|e| format!("block {h} unreadable: {e}"))?
-                    .ok_or_else(|| format!("block {h} missing"))?;
+                let block = match carried.take() {
+                    Some(b) => b,
+                    None => self
+                        .block_by_height(h)
+                        .map_err(|e| format!("block {h} unreadable: {e}"))?
+                        .ok_or_else(|| format!("block {h} missing"))?,
+                };
                 if block.height() != h {
                     return Err(format!("block at height {h} claims height {}", block.height()));
                 }
@@ -2073,10 +2146,29 @@ impl Storage {
                     Ok(other) => return Err(format!("block {h} index points to {other:?}")),
                     Err(e) => return Err(format!("block {h} index unreadable: {e}")),
                 }
-                let qc = self
-                    .qc_by_height(h)
-                    .map_err(|e| format!("qc {h} unreadable: {e}"))?
-                    .ok_or_else(|| format!("qc {h} missing"))?;
+                // The head's certificate is its own row; every other block's is the `justify`
+                // its committed child carries, which the check below then also proves is the
+                // child's parent link (`qc.block_hash == hash`).
+                let qc = if h == head {
+                    self.get::<QuorumCertificate>(CF_QCS, &height_key(h))
+                        .map_err(|e| format!("qc {h} unreadable: {e}"))?
+                        .ok_or_else(|| format!("qc {h} missing"))?
+                } else {
+                    // A child that is unreadable, missing or not a block of height `h + 1` takes
+                    // `h`'s certificate with it, so the problem is reported at `h`: block `h`
+                    // cannot become the head — a head needs a certificate row — and the repair
+                    // truncates to `h - 1`.
+                    let child = self
+                        .block_by_height(h + 1)
+                        .map_err(|e| format!("block {h}'s certificate is lost: block {} unreadable: {e}", h + 1))?
+                        .ok_or_else(|| format!("block {h}'s certificate is lost: block {} missing", h + 1))?;
+                    if child.height() != h + 1 {
+                        return Err(format!("block at height {} claims height {}", h + 1, child.height()));
+                    }
+                    let qc = child.header.justify.clone();
+                    carried = Some(child);
+                    qc
+                };
                 if qc.block_hash != hash || qc.view != block.view() {
                     return Err(format!("qc {h} does not certify block {h}"));
                 }
@@ -2201,6 +2293,13 @@ impl Storage {
             _ => 0,
         };
         let mut batch = WriteBatch::default();
+        // The new head's certificate is the `justify` of the child about to be deleted (audit
+        // v5, OPS-4); it becomes the head's `CF_QCS` row, or the next `head_qc()` is `Corrupt`.
+        if height > 0 && height < head {
+            if let Some(child) = self.block_by_height(height + 1)? {
+                batch.put_cf(self.cf(CF_QCS), height_key(height), bincode::serialize(&child.header.justify)?);
+            }
+        }
         for h in (height + 1)..=head.max(height + 1) {
             let hk = height_key(h);
             if let Ok(Some(block)) = self.block_by_height(h) {
@@ -2336,7 +2435,9 @@ impl Storage {
     }
 
     /// Test hook: overwrite the certificate stored for a block height, so a chain can be given a
-    /// QC that was signed by the wrong epoch's validators.
+    /// QC that was signed by the wrong epoch's validators. Only genesis' row and the head's are
+    /// ever read (audit v5, OPS-4: the others are served from the child's `justify`), so a
+    /// test that plants one elsewhere is planting what a v0.5.4 database left behind.
     pub fn overwrite_qc_for_testing(&self, height: u64, qc: &QuorumCertificate) -> Result<()> {
         self.db.put_cf(self.cf(CF_QCS), height_key(height), bincode::serialize(qc)?)?;
         Ok(())
@@ -2920,8 +3021,35 @@ pub(crate) mod fixtures {
 
     /// Apply `txs` to `ledger` as block `parent.height() + 1` and build the committed block that
     /// results, exactly as `Ledger::apply_block` would accept it.
-    pub(crate) fn make_block(parent: &Block, ledger: &mut Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
-        let height = parent.height() + 1;
+    /// What a fixture block is built on: a bare `Block` (genesis, or a block whose certificate
+    /// the test does not care about) or a `CommittedBlock`, whose certificate becomes the
+    /// child's `justify` — the way a chain that consensus committed reads, and the way storage
+    /// serves a committed block's certificate (audit v5, OPS-4: from its child's `justify`).
+    pub(crate) trait FixtureParent {
+        fn parent_block(&self) -> &Block;
+        fn parent_qc(&self) -> QuorumCertificate;
+    }
+
+    impl FixtureParent for Block {
+        fn parent_block(&self) -> &Block {
+            self
+        }
+        fn parent_qc(&self) -> QuorumCertificate {
+            QuorumCertificate { view: self.view(), block_hash: self.hash(), votes: vec![] }
+        }
+    }
+
+    impl FixtureParent for CommittedBlock {
+        fn parent_block(&self) -> &Block {
+            &self.block
+        }
+        fn parent_qc(&self) -> QuorumCertificate {
+            self.qc.clone()
+        }
+    }
+
+    pub(crate) fn make_block(parent: &impl FixtureParent, ledger: &mut Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
+        let height = parent.parent_block().height() + 1;
         ledger.set_height(height);
         ledger.set_timestamp_ms(height);
         ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
@@ -2941,7 +3069,7 @@ pub(crate) mod fixtures {
     /// verified in `VerifyMode::Full` needs, and what makes a QC's validity depend on which
     /// epoch's set it is checked against.
     pub(crate) fn make_block_voted(
-        parent: &Block,
+        parent: &impl FixtureParent,
         ledger: &mut Ledger,
         txs: Vec<Transaction>,
         k: &Keypair,
@@ -2954,14 +3082,14 @@ pub(crate) mod fixtures {
 
     /// `make_block` without executing the transactions: the only way to build a block carrying a
     /// transaction the ledger would have rejected, which is what a torn block on disk looks like.
-    pub(crate) fn make_block_unchecked(parent: &Block, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
-        make_block_unchecked_at(parent, ledger, txs, k, parent.height() + 1)
+    pub(crate) fn make_block_unchecked(parent: &impl FixtureParent, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair) -> CommittedBlock {
+        make_block_unchecked_at(parent, ledger, txs, k, parent.parent_block().height() + 1)
     }
 
     /// `make_block`, stamped `timestamp_ms` rather than its height — for a test that needs the
     /// block time to cross a day (B1's mint-cap day).
-    pub(crate) fn make_block_at(parent: &Block, ledger: &mut Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
-        let height = parent.height() + 1;
+    pub(crate) fn make_block_at(parent: &impl FixtureParent, ledger: &mut Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
+        let height = parent.parent_block().height() + 1;
         ledger.set_height(height);
         ledger.set_timestamp_ms(timestamp_ms);
         ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
@@ -2969,7 +3097,9 @@ pub(crate) mod fixtures {
         make_block_unchecked_at(parent, ledger, txs, k, timestamp_ms)
     }
 
-    fn make_block_unchecked_at(parent: &Block, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
+    fn make_block_unchecked_at(parent: &impl FixtureParent, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
+        let justify = parent.parent_qc();
+        let parent = parent.parent_block();
         let height = parent.height() + 1;
         let header = BlockHeader {
             height,
@@ -2979,7 +3109,7 @@ pub(crate) mod fixtures {
             timestamp_ms,
             tx_root: Block::tx_root(&txs),
             state_root: ledger.state_root(),
-            justify: QuorumCertificate { view: parent.view(), block_hash: parent.hash(), votes: vec![] },
+            justify,
         };
         let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, k);
         let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![] };
@@ -2993,8 +3123,7 @@ pub(crate) mod fixtures {
         st.init_genesis(&gs).unwrap();
         let k = key(1);
         let mut ledger = gs.ledger.clone();
-        let mut parent = gs.block.clone();
-        let mut out = Vec::new();
+        let mut out: Vec<CommittedBlock> = Vec::new();
         for h in 1..=n {
             let seed = (h * 4) as u32;
             ledger.set_height(h);
@@ -3004,13 +3133,17 @@ pub(crate) mod fixtures {
                 [[seed + 2; 8], [seed + 3; 8]],
                 bundle_fee(),
             )];
-            let cb = make_block(&parent, &mut ledger, txs, &k);
+            // Each block is built on the committed one before it, so its `justify` is that
+            // block's certificate — what storage serves the parent's certificate from.
+            let cb = match out.last() {
+                None => make_block(&gs.block, &mut ledger, txs, &k),
+                Some(parent) => make_block(parent, &mut ledger, txs, &k),
+            };
             let block = cb.block.clone();
             let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), block.view(), block.hash(), &k)] };
             let cb = CommittedBlock { qc, ..cb };
             st.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
             out.push(cb);
-            parent = block;
         }
         (dir, st, gs, out)
     }
@@ -3185,7 +3318,7 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![att.clone()], &key(1));
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         let burn = burn_tx(&ledger, 1, 400, 100, 30);
-        let b2 = make_block(&b1.block, &mut ledger, vec![burn], &key(1));
+        let b2 = make_block(&b1, &mut ledger, vec![burn], &key(1));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 
         let live = ledger.bridge().unwrap();
@@ -3251,7 +3384,7 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![att], &key(1));
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         let burn = burn_tx(&ledger, 1, 400, 100, 30);
-        let b2 = make_block(&b1.block, &mut ledger, vec![burn], &key(1));
+        let b2 = make_block(&b1, &mut ledger, vec![burn], &key(1));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 
         // Quick, not Full: `make_block` leaves the certificates unsigned, which is a vote
@@ -3379,7 +3512,7 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![rotate], &key(1));
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         let att = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000, 1), 20);
-        let b2 = make_block(&b1.block, &mut ledger, vec![att], &key(1));
+        let b2 = make_block(&b1, &mut ledger, vec![att], &key(1));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
         let b = ledger.bridge().unwrap();
         assert_eq!((b.rotation_nonce, b.pause_key.as_ref()), (1, Some(new_pause.public_key())));
@@ -3436,13 +3569,13 @@ mod tests {
         assert_restart_round_trips(&s, &gs, &ledger, "an empty block on the genesis bridge");
 
         let pause = pause_tx(&ledger, 0);
-        let b2 = make_block(&b1.block, &mut ledger, vec![pause], &key(1));
+        let b2 = make_block(&b1, &mut ledger, vec![pause], &key(1));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
-        let b3 = make_block(&b2.block, &mut ledger, vec![], &key(1));
+        let b3 = make_block(&b2, &mut ledger, vec![], &key(1));
         s.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
         assert_restart_round_trips(&s, &gs, &ledger, "an empty block after a pause");
         let transfer = transfer_tx(&ledger, 60);
-        let b4 = make_block(&b3.block, &mut ledger, vec![transfer], &key(1));
+        let b4 = make_block(&b3, &mut ledger, vec![transfer], &key(1));
         s.commit(std::slice::from_ref(&b4), &ledger, &[], &StubExecutor).unwrap();
         assert_restart_round_trips(&s, &gs, &ledger, "a plain transfer after a pause");
         assert!(s.bridge_meta().unwrap().unwrap().mint_paused, "still paused on disk");
@@ -3500,7 +3633,7 @@ mod tests {
         ledger.apply_transactions(&[], &key(2).address(), &StubExecutor).unwrap();
         ledger.close_block(2, &key(2).address());
         assert_eq!(ledger.validators()[&key(1).address()].rewards, before + 60, "the sweep credited key 1");
-        let b2 = make_block_unchecked(&b1.block, &ledger, vec![], &key(2));
+        let b2 = make_block_unchecked(&b1, &ledger, vec![], &key(2));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 
         assert_eq!(s.validator(&key(1).address()).unwrap().as_ref(), ledger.validators().get(&key(1).address()));
@@ -3552,7 +3685,7 @@ mod tests {
         // An empty block by another validator: its proposer collects nothing, so no row moves at
         // all and the commit writes none.
         let before = written();
-        let b2 = make_block(&b1.block, &mut ledger, vec![], &key(2));
+        let b2 = make_block(&b1, &mut ledger, vec![], &key(2));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
         assert_eq!(moved(written(), before), 0, "nothing moved, nothing written");
         assert_eq!(s.register().unwrap(), *ledger.validators());
@@ -3563,7 +3696,7 @@ mod tests {
         let mut batch = WriteBatch::default();
         batch.put_cf(s.cf(CF_VALIDATORS), key(3).address().as_bytes(), bincode::serialize(&stale).unwrap());
         s.db.write_opt(batch, &sync_opts()).unwrap();
-        let b3 = make_block(&b2.block, &mut ledger, vec![], &key(3));
+        let b3 = make_block(&b2, &mut ledger, vec![], &key(3));
         s.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
         assert_eq!(s.register().unwrap(), *ledger.validators(), "the stale row is back in step");
     }
@@ -4045,7 +4178,7 @@ mod tests {
             bundle_tx(&ledger, [[9; 8], [10; 8]], [[11; 8], [12; 8]], bundle_fee()),
             withdraw_tx(gs.chain_id, &v, amount, 0, time, [13; 8]),
         ];
-        let b2 = make_block_voted(&b1.block, &mut ledger, txs, &v, &[&v]);
+        let b2 = make_block_voted(&b1, &mut ledger, txs, &v, &[&v]);
         assert_eq!(b2.deposits.len(), 1, "the withdraw's note is the block's one ledger-made deposit");
         (dir, s, gs, [b1, b2], ledger)
     }
@@ -4109,7 +4242,7 @@ mod tests {
             let withdraw = withdraw_tx(gs.chain_id, &v, amount, 0, time, [13; 8]);
             let att = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000, 0), 20);
             let txs = if attest_first { vec![att.clone(), withdraw] } else { vec![withdraw, att.clone()] };
-            let b2 = make_block_voted(&b1.block, &mut ledger, txs, &v, &[&v]);
+            let b2 = make_block_voted(&b1, &mut ledger, txs, &v, &[&v]);
             assert_eq!(
                 b2.deposits.len(),
                 1,
@@ -4172,7 +4305,7 @@ mod tests {
         // `burn_tx` only needs `ledger` for its anchor/height/chain_id, so the asset index (1,
         // this chain's first registered asset) can be hardcoded ahead of applying `att`.
         let burn = burn_tx(&ledger, 1, 400, 100, 30);
-        let b2 = make_block_voted(&b1.block, &mut ledger, vec![att, withdraw, burn], &v, &[&v]);
+        let b2 = make_block_voted(&b1, &mut ledger, vec![att, withdraw, burn], &v, &[&v]);
         assert_eq!(b2.deposits.len(), 1, "still only the withdraw's note is ledger-made");
 
         s.commit(&[b1, b2], &ledger, &[], &StubExecutor).unwrap();
@@ -4217,7 +4350,7 @@ mod tests {
         assert_eq!(epoch1.leader(2), key(1).address());
         ledger.set_height(2);
         let tx = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
-        let b2 = make_block_voted(&b1.block, &mut ledger, vec![tx], &key(1), &[&key(1)]);
+        let b2 = make_block_voted(&b1, &mut ledger, vec![tx], &key(1), &[&key(1)]);
         s.commit(std::slice::from_ref(&b2), &ledger, &[(1, epoch1.clone())], &StubExecutor).unwrap();
         (dir, s, gs, epoch1, ledger)
     }
@@ -4287,7 +4420,7 @@ mod tests {
         // Nobody unbonded, so epoch 1's set is still both validators.
         let epoch1 = ledger.derive_next_set(1);
         ledger.set_height(2);
-        let b2 = make_block(&b1.block, &mut ledger, vec![], leader_among(&epoch1, 2, &both));
+        let b2 = make_block(&b1, &mut ledger, vec![], leader_among(&epoch1, 2, &both));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 
         let missing = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
@@ -4388,7 +4521,7 @@ mod tests {
         // A commit moves the tree, so the next read rebuilds — once.
         ledger.set_height(2);
         let tx2 = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
-        let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &proposer);
+        let b2 = make_block(&b1, &mut ledger, vec![tx2], &proposer);
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
         let after_commit = s.tree_builds();
         check_all(&s, ledger.root(), ledger.next_index());
@@ -4427,7 +4560,7 @@ mod tests {
 
         ledger.set_height(2);
         let tx2 = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
-        let b2 = certify(make_block(&b1.block, &mut ledger, vec![tx2.clone()], &proposer));
+        let b2 = certify(make_block(&b1, &mut ledger, vec![tx2.clone()], &proposer));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
         assert_eq!(s.notes_count().unwrap(), 10);
         assert_eq!(s.nullifier_height(&[5; 8]).unwrap(), Some(2));
@@ -4447,6 +4580,120 @@ mod tests {
         assert_eq!(s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().problem, None);
     }
 
+    /// The heights `CF_QCS` holds a row for, in order.
+    fn qc_rows(s: &Storage) -> Vec<u64> {
+        s.db
+            .iterator_cf(s.cf(CF_QCS), IteratorMode::Start)
+            .map(|item| be_u64(&item.unwrap().0, "qc key").unwrap())
+            .collect()
+    }
+
+    /// Three committed blocks on the two-note genesis, each certified by a real vote (so
+    /// `VerifyMode::Full` checks something) and each carrying its parent's certificate as its
+    /// `justify`, the way a chain that consensus committed does. Returns the ledger after each.
+    fn three_certified_blocks() -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>, Vec<Ledger>) {
+        let (d, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        let proposer = key(1);
+        let mut ledger = gs.ledger.clone();
+        let certify = |cb: CommittedBlock| {
+            let qc = QuorumCertificate {
+                view: cb.block.view(),
+                block_hash: cb.block.hash(),
+                votes: vec![randprotocol_core::Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), cb.block.view(), cb.block.hash(), &key(1))],
+            };
+            CommittedBlock { qc, ..cb }
+        };
+        let mut blocks: Vec<CommittedBlock> = Vec::new();
+        let mut ledgers = Vec::new();
+        for h in 1..=3u64 {
+            let seed = (h * 4) as u32;
+            ledger.set_height(h);
+            let tx = bundle_tx(&ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], bundle_fee());
+            let cb = match blocks.last() {
+                None => certify(make_block(&gs.block, &mut ledger, vec![tx], &proposer)),
+                Some(parent) => certify(make_block(parent, &mut ledger, vec![tx], &proposer)),
+            };
+            s.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
+            blocks.push(cb);
+            ledgers.push(ledger.clone());
+        }
+        (d, s, gs, blocks, ledgers)
+    }
+
+    /// Audit v5, OPS-4: a committed block's certificate is stored once. Every block but the head
+    /// has a committed child whose `justify` *is* its certificate, so `CF_QCS` keeps only
+    /// genesis' row and the head's, and `committed_block(h)` reads the rest off the child.
+    #[test]
+    fn the_qc_of_a_committed_block_lives_in_its_childs_justify() {
+        let (_d, s, gs, blocks, _) = three_certified_blocks();
+        assert_eq!(qc_rows(&s), vec![0, 3], "genesis' row and the head's, nothing between");
+        let b2 = s.block_by_height(2).unwrap().unwrap();
+        assert_eq!(s.committed_block(1).unwrap().unwrap().qc, b2.header.justify);
+        for (h, cb) in (1..=3u64).zip(&blocks) {
+            assert_eq!(s.committed_block(h).unwrap().as_ref(), Some(cb), "block {h} comes back as committed");
+            assert_eq!(s.qc_by_height(h).unwrap().as_ref(), Some(&cb.qc));
+        }
+        assert_eq!(s.qc_by_height(0).unwrap(), Some(QuorumCertificate::genesis(gs.hash())));
+        assert_eq!(s.qc_by_height(4).unwrap(), None, "nothing above the head");
+        assert_eq!(s.head_qc().unwrap(), blocks[2].qc);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().problem, None);
+        assert!(s.get_meta_raw(META_QCS_PRUNED).unwrap().is_some(), "a fresh database is marked pruned at open");
+    }
+
+    /// A truncation makes a new head, and the head is the one block whose certificate no child
+    /// carries: `truncate_to` writes it from the child it is about to delete, or the next
+    /// `head_qc()` is `Corrupt` (review focus 2).
+    #[test]
+    fn truncate_leaves_the_new_head_a_qc_row() {
+        let (_d, s, gs, blocks, ledgers) = three_certified_blocks();
+        s.truncate_to(&gs, 2, &ledgers[1]).unwrap();
+        assert_eq!(qc_rows(&s), vec![0, 2]);
+        assert_eq!(s.head_qc().unwrap().block_hash, blocks[1].block.hash());
+        assert_eq!(s.head_qc().unwrap(), blocks[1].qc, "the certificate block 3 carried for it");
+        assert_eq!(s.committed_block(2).unwrap().as_ref(), Some(&blocks[1]));
+        assert_eq!(s.committed_block(1).unwrap().as_ref(), Some(&blocks[0]));
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().problem, None);
+        // Truncating to genesis rewrites genesis' own row, as before.
+        s.truncate_to(&gs, 0, &gs.ledger).unwrap();
+        assert_eq!(qc_rows(&s), vec![0]);
+        assert_eq!(s.head_qc().unwrap(), QuorumCertificate::genesis(gs.hash()));
+    }
+
+    /// A database written by v0.5.4 holds a `CF_QCS` row for every height (chain 14's). The
+    /// first open on this build deletes every row strictly between genesis and the head, once,
+    /// and answers `committed_block(h)` exactly as before; the marker skips the pass next time.
+    #[test]
+    fn a_database_with_a_row_per_height_is_pruned_once_at_open() {
+        let (dir, s, gs, blocks, _) = three_certified_blocks();
+        let before: Vec<CommittedBlock> = (1..=3).map(|h| s.committed_block(h).unwrap().unwrap()).collect();
+        assert_eq!(before, blocks);
+        // What v0.5.4 left behind: the row for every height, and no marker.
+        for cb in &blocks {
+            s.overwrite_qc_for_testing(cb.block.height(), &cb.qc).unwrap();
+        }
+        s.db.delete_cf(s.cf(CF_META), META_QCS_PRUNED.as_bytes()).unwrap();
+        assert_eq!(qc_rows(&s), vec![0, 1, 2, 3]);
+        drop(s);
+
+        let s = Storage::open(dir.path()).unwrap();
+        assert_eq!(qc_rows(&s), vec![0, 3], "pruned at open");
+        assert!(s.get_meta_raw(META_QCS_PRUNED).unwrap().is_some(), "and marked");
+        let after: Vec<CommittedBlock> = (1..=3).map(|h| s.committed_block(h).unwrap().unwrap()).collect();
+        assert_eq!(after, before, "the same answers as before the prune");
+        assert_eq!(s.head_qc().unwrap(), blocks[2].qc);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().problem, None);
+
+        // A second open writes nothing: a stray row planted after the marker survives it, which
+        // is how the test tells "skipped" from "pruned again to the same result".
+        s.overwrite_qc_for_testing(2, &blocks[1].qc).unwrap();
+        drop(s);
+        let s = Storage::open(dir.path()).unwrap();
+        assert_eq!(qc_rows(&s), vec![0, 2, 3], "the marker skips the pass");
+        assert_eq!(s.committed_block(1).unwrap().unwrap(), blocks[0]);
+        assert_eq!(s.committed_block(2).unwrap().unwrap(), blocks[1], "a row below the head is not read");
+    }
+
     #[test]
     fn non_contiguous_commit_rejected() {
         let (_d, s, gs) = genesis_with_two_notes();
@@ -4454,7 +4701,7 @@ mod tests {
         let k = key(1);
         let mut ledger = gs.ledger.clone();
         let b1 = make_block(&gs.block, &mut ledger, vec![], &k);
-        let b2 = make_block(&b1.block, &mut ledger, vec![], &k);
+        let b2 = make_block(&b1, &mut ledger, vec![], &k);
         assert!(matches!(s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor), Err(StorageError::Corrupt(_))));
         assert_eq!(s.head().unwrap().height, 0);
         let mut bad = b1.clone();
@@ -4484,7 +4731,7 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![tx1], &k);
         let root_at_1 = ledger.root();
         let tx2 = mint_tx(gs.chain_id, [45; 8], 7, &k);
-        let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &k);
+        let b2 = make_block(&b1, &mut ledger, vec![tx2], &k);
         let root_at_2 = ledger.root();
         assert_ne!(root_at_1, root_at_2, "each block moved the tree");
 
@@ -4570,42 +4817,51 @@ mod tests {
         }
     }
 
+    /// Block 4's bytes are garbage. Block 3 is intact, but its certificate lived in block 4's
+    /// `justify` (audit v5, OPS-4) and is lost with it, so the last block that can be a head
+    /// — a head needs a certificate row — is 2, and the repair truncates there.
     #[test]
     fn corrupted_block_is_detected_and_truncated() {
         let (_d, st, gs, blocks) = chain_fixture(6);
         st.overwrite_block_bytes_for_testing(4, b"garbage").unwrap();
         let c = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
         assert!(!c.is_ok());
-        assert_eq!(c.last_good, 3);
+        assert_eq!(c.last_good, 2);
+        assert!(c.problem.as_deref().unwrap_or_default().starts_with("block 3's certificate is lost: block 4 unreadable"), "{:?}", c.problem);
         assert!(c.genesis_ok);
         st.truncate_to(&gs, c.last_good, &c.ledger).unwrap();
-        assert_eq!(st.head().unwrap().height, 3);
-        assert!(st.block_by_height(4).unwrap().is_none());
+        assert_eq!(st.head().unwrap().height, 2);
+        assert_eq!(st.head_qc().unwrap(), blocks[1].qc, "the new head's certificate, from block 3's justify");
+        assert!(st.block_by_height(3).unwrap().is_none());
+        assert!(st.block_by_hash(&blocks[2].block.hash()).unwrap().is_none());
         assert!(st.block_by_hash(&blocks[4].block.hash()).unwrap().is_none());
         assert!(st.tx_location(&blocks[5].block.transactions[0].hash()).unwrap().is_none());
-        assert!(st.tx_location(&blocks[2].block.transactions[0].hash()).unwrap().is_some());
+        assert!(st.tx_location(&blocks[1].block.transactions[0].hash()).unwrap().is_some());
         // The pool rewound with the chain: 2 alloc notes plus 4 per surviving block.
-        assert_eq!(st.notes_count().unwrap(), 14);
-        assert_eq!(st.nullifiers_count().unwrap(), 12);
+        assert_eq!(st.notes_count().unwrap(), 10);
+        assert_eq!(st.nullifiers_count().unwrap(), 8);
         let again = st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap();
         assert!(again.is_ok(), "{:?}", again.problem);
-        assert_eq!(again.last_good, 3);
+        assert_eq!(again.last_good, 2);
         // Chain can be re-extended from the truncated head.
         let mut ledger = again.ledger.clone();
-        let cb = &blocks[3]; // height 4 again
+        let cb = &blocks[2]; // height 3 again
         ledger.apply_block(&cb.block, &StubExecutor).unwrap();
         st.commit(std::slice::from_ref(cb), &ledger, &[], &StubExecutor).unwrap();
-        assert_eq!(st.head().unwrap().height, 4);
+        assert_eq!(st.head().unwrap().height, 3);
+        assert_eq!(qc_rows(&st), vec![0, 3]);
         assert!(st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap().is_ok());
     }
 
     #[test]
     fn swapped_block_with_wrong_parent_is_detected() {
         let (_d, st, gs, blocks) = chain_fixture(5);
-        // Put block 2's bytes at height 3: decodes fine, but height/parent are wrong.
+        // Put block 2's bytes at height 3: decodes fine, but height/parent are wrong. It is
+        // caught while block 2 looks for its certificate in it (audit v5, OPS-4), which block 2
+        // has therefore lost: the last good block is 1.
         st.overwrite_block_bytes_for_testing(3, &blocks[1].block.encode()).unwrap();
         let c = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
-        assert_eq!(c.last_good, 2);
+        assert_eq!(c.last_good, 1);
         assert!(c.problem.unwrap().contains("block at height 3"));
     }
 
@@ -4995,7 +5251,7 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![t1], &key(1));
         storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         let t2 = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
-        let b2 = make_block(&b1.block, &mut ledger, vec![t2], &key(1));
+        let b2 = make_block(&b1, &mut ledger, vec![t2], &key(1));
         storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 
         let all = storage.notes_in_heights(0, 2, 1000).unwrap();
@@ -5147,7 +5403,7 @@ mod tests {
         assert_eq!(ledger.faucet_epoch_counters(), (0, 60 * rand));
         assert_eq!(s.faucet_epoch_counters().unwrap(), (0, 60 * rand), "committed with the state");
         let epoch1 = ledger.derive_next_set(1);
-        let b2 = make_block(&b1.block, &mut ledger, vec![mint_tx(7, [22; 8], 70 * rand, &key(1))], &key(1));
+        let b2 = make_block(&b1, &mut ledger, vec![mint_tx(7, [22; 8], 70 * rand, &key(1))], &key(1));
         s.commit(std::slice::from_ref(&b2), &ledger, &[(1, epoch1)], &StubExecutor).unwrap();
         assert_eq!(ledger.faucet_epoch_counters(), (1, 70 * rand));
         assert_eq!(s.faucet_epoch_counters().unwrap(), (1, 70 * rand));
@@ -5348,7 +5604,7 @@ mod seal_tests {
         l2.set_timestamp_ms(2);
         l2.apply_transactions_with_covered(&[aggregate.clone()], &key(1).address(), &sidecar, &StubExecutor).unwrap();
         l2.record_anchor(2);
-        let b2 = make_block_unchecked(&b1.block, &l2, vec![aggregate.clone()], &key(1));
+        let b2 = make_block_unchecked(&b1, &l2, vec![aggregate.clone()], &key(1));
         storage.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
         (dir, storage, gs, covered_tx, aggregate)
     }
@@ -5503,7 +5759,7 @@ mod seal_tests {
         l2.set_timestamp_ms(2);
         l2.apply_transactions_with_covered(&[aggregate.clone()], &key(1).address(), &sidecar, &StubExecutor).unwrap();
         l2.record_anchor(2);
-        let b2 = make_block_unchecked(&b1.block, &l2, vec![aggregate.clone()], &key(1));
+        let b2 = make_block_unchecked(&b1, &l2, vec![aggregate.clone()], &key(1));
         storage.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
 
         // Without the record, the replay refuses the aggregate's block: it is load-bearing.

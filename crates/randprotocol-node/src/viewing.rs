@@ -466,7 +466,7 @@ mod tests {
         b2_bundle.envelopes[0] = sealed(&bob(), &alice(), &alice_note_2, &TxKey([13; 32]));
         b2_bundle.envelopes[1] = fixtures::env(9);
         let tx2 = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, b2_bundle, Action::None));
-        let b2 = make_block(&b1.block, &mut ledger, vec![tx2], &key(1));
+        let b2 = make_block(&b1, &mut ledger, vec![tx2], &key(1));
         storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
 
         (dir, storage, alice_note_1, bob_note, alice_note_2)

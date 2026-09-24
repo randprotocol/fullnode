@@ -1238,6 +1238,11 @@ What changed for clients, in one place. Newest first.
   `rand_getTokens` gains `burn_registration_fee` (a boolean, `false` on chain 14) and
   `rand_getSupply` gains `registration_fees_burned` (a decimal string, `"0"` on chain 14), which
   `invariant_holds` now subtracts on the right of the identity beside `slashed`. No wire change.
+- **A committed block's certificate is stored once (node-only, audit v5 OPS-4).** No method, field or wire change. A committed block's QC now lives only in its child's `justify`
+(`CF_QCS` keeps genesis' row and the head's; a v0.5.4 database is pruned once at open — audit v5
+OPS-4). Every answer that carries a certificate (`rand_getBlockByHeight`/`ByHash`'s `justify_view`,
+sync's `committed_block`) reads the same QC as before. What a client operator should know: **a
+node rolled back below v0.5.5 needs a resync** (`docs/deploy.md`, "Roll note for v0.5.5").
 
 ### 2026-09-24 — v0.5.4
 

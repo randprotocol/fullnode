@@ -2290,7 +2290,7 @@ mod tests {
         let epoch1 = ledger.derive_next_set(1);
         ledger.set_height(2);
         let tx = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
-        let b2 = make_block_voted(&b1.block, &mut ledger, vec![tx], &key(1), &[&key(1)]);
+        let b2 = make_block_voted(&b1, &mut ledger, vec![tx], &key(1), &[&key(1)]);
         storage.commit(std::slice::from_ref(&b2), &ledger, &[(1, epoch1)], &StubExecutor).unwrap();
         (dir, storage, gs, ledger)
     }

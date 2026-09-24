@@ -444,12 +444,15 @@ async fn corrupted_rocksdb_is_detected_truncated_and_resynced() {
         let gs_ = gen.build(executor.as_ref()).unwrap();
         let check = st.verify_chain(&gs_, randprotocol_node::storage::VerifyMode::Full, executor.as_ref()).unwrap();
         assert!(!check.is_ok());
-        assert_eq!(check.last_good, bad_height - 1);
+        // The block before the corrupt one is intact, but its certificate lived in the corrupt
+        // block's `justify` (audit v5, OPS-4: a certificate is stored once) and is lost with it,
+        // so the last block that can be a head is the one before that.
+        assert_eq!(check.last_good, bad_height - 2);
     }
-    // Restart: startup verification must truncate to bad_height-1, then sync catches up.
+    // Restart: startup verification must truncate to bad_height-2, then sync catches up.
     let n2 = start_in(dir, &ks[2], boot.clone(), true).await;
     let resumed = n2.handle.storage.head().unwrap().height;
-    assert!(resumed >= bad_height - 1 && resumed < head, "expected truncation below {head}, got {resumed}");
+    assert!(resumed >= bad_height - 2 && resumed < head, "expected truncation below {head}, got {resumed}");
     wait_caught_up(&n2, &[&n0, &n1], Duration::from_secs(90)).await;
     assert!(n2.holds(&cm), "the repaired ledger lost the minted note");
     assert_chains_equal(&[&n0, &n1, &n2]);
