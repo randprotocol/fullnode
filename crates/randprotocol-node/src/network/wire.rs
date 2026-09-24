@@ -54,11 +54,11 @@ mod tests {
 
     #[test]
     fn a_new_node_cannot_decode_an_old_status_and_an_old_node_reads_the_new_ones_prefix() {
-        let old = bincode::serialize(&GossipMessage::Status(Status { height: 7, head_hash: Hash::ZERO, view: 9, floor: 0 })).unwrap();
+        let new_payload = bincode::serialize(&GossipMessage::Status(Status { height: 7, head_hash: Hash::ZERO, view: 9, floor: 0 })).unwrap();
         // Old shape from a new payload: bincode reads the prefix and ignores the tail.
-        let as_old: (u32, OldStatus) = bincode::deserialize(&old).unwrap();
+        let as_old: (u32, OldStatus) = bincode::deserialize(&new_payload).unwrap();
         assert_eq!(as_old.1.height, 7);
-        // New shape from an old payload: four bytes short — refused, never misread.
+        // New shape from an old payload: eight bytes short — refused, never misread.
         let short = bincode::serialize(&OldStatus { height: 7, head_hash: Hash::ZERO, view: 9 }).unwrap();
         let mut framed = bincode::serialize(&2u32).unwrap();
         framed.extend_from_slice(&short);

@@ -972,6 +972,9 @@ pub const MIN_PRUNE_HISTORY: Duration = Duration::from_secs(3600);
 /// `<n>m`, `<n>h` or `<n>d`.
 pub fn parse_prune_history(s: &str) -> Result<Duration, String> {
     let usage = "prune-history takes <n>m, <n>h or <n>d";
+    if !s.is_ascii() {
+        return Err(usage.to_string());
+    }
     let (num, unit) = s.split_at(s.len().checked_sub(1).ok_or(usage)?);
     let n: u64 = num.parse().map_err(|_| usage.to_string())?;
     let secs = match unit {
@@ -1332,5 +1335,6 @@ mod prune_flag_tests {
         assert!(parse_prune_history("24").unwrap_err().contains("<n>m, <n>h or <n>d"));
         assert!(parse_prune_history("h").unwrap_err().contains("<n>m, <n>h or <n>d"));
         assert!(parse_prune_history("0h").unwrap_err().contains("at least 1h"));
+        assert!(parse_prune_history("24ｈ").unwrap_err().contains("<n>m, <n>h or <n>d"));
     }
 }

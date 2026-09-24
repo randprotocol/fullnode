@@ -1171,12 +1171,22 @@ impl Node {
         }
     }
 
+    /// `Storage::prune_floor`, defaulting to 0 (an archive's floor) and logging when the meta
+    /// row is actually unreadable rather than merely absent, so a status advertising 0 for that
+    /// reason is not silently confused with an honest archive.
+    fn prune_floor_or_zero(&self) -> u64 {
+        self.storage.prune_floor().unwrap_or_else(|e| {
+            tracing::warn!("prune floor unreadable: {e}; advertising 0");
+            0
+        })
+    }
+
     fn publish_status(&self) {
         let mut s = self.status.write().unwrap_or_else(|e| e.into_inner());
         s.height = self.hs.committed_height();
         s.disk_free_bytes = self.disk_free_bytes;
         s.disk_low = self.disk_low();
-        s.prune_floor = self.storage.prune_floor().unwrap_or(0);
+        s.prune_floor = self.prune_floor_or_zero();
         s.prune_history_secs = self.cfg.prune_history.map(|d| d.as_secs());
         s.head_hash = self.hs.committed_hash().to_hex();
         s.view = self.hs.view();
@@ -1406,7 +1416,7 @@ impl Node {
                 height: self.hs.committed_height(),
                 head_hash: self.hs.committed_hash(),
                 view: self.hs.view(),
-                floor: self.storage.prune_floor().unwrap_or(0),
+                floor: self.prune_floor_or_zero(),
             }))
             .await;
     }
@@ -1549,7 +1559,7 @@ impl Node {
         if let Some(keep) = self.cfg.prune_history {
             if head % 16 == 0 {
                 let head_ms = self.storage.head_block()?.header.timestamp_ms;
-                let cutoff_ms = head_ms.saturating_sub(keep.as_millis() as u64);
+                let cutoff_ms = head_ms.saturating_sub(u64::try_from(keep.as_millis()).unwrap_or(u64::MAX));
                 let window = self.hs.committed_ledger().aggregation().map(|a| a.window).unwrap_or(0);
                 let keep_from = head.saturating_sub(window.max(2));
                 let storage = self.storage.clone();
@@ -2739,6 +2749,7 @@ mod tests {
         assert!(prune_window_check(Some(Duration::from_secs(300)), Some(256), Duration::from_secs(1)).is_ok());
         assert!(prune_window_check(None, Some(256), Duration::from_secs(1)).is_ok());
         assert!(prune_window_check(Some(Duration::from_secs(10)), None, Duration::from_secs(1)).is_ok());
+        assert!(prune_window_check(Some(Duration::from_secs(256)), Some(256), Duration::from_secs(1)).is_ok());
     }
 
     #[test]

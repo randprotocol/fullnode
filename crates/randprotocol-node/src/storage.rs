@@ -1492,11 +1492,17 @@ impl Storage {
     /// deleted. The deletes and the new floor land in one synced batch. Returns the number of
     /// blocks deleted; the ledger families are never touched.
     pub fn prune_history(&self, cutoff_ms: u64, keep_from: u64, max_blocks: u64) -> Result<u64> {
-        let mut h = self.prune_floor()?.max(1);
+        let floor = self.prune_floor()?.max(1);
+        let mut h = floor;
         let mut batch = WriteBatch::default();
         let mut deleted = 0u64;
         while h < keep_from && deleted < max_blocks {
-            let Some(block) = self.block_by_height(h)? else { break };
+            let Some(block) = self.block_by_height(h)? else {
+                if h == floor {
+                    tracing::warn!("history pruning: block {h} missing at the floor; the store is torn, nothing pruned");
+                }
+                break;
+            };
             if block.header.timestamp_ms >= cutoff_ms {
                 break;
             }
@@ -1552,8 +1558,8 @@ impl Storage {
                     .unwrap_or_else(|| Hash::digest(&bundle.proof));
                 batch.delete_cf(self.cf(CF_SEALS), [b"p".as_slice(), ph.as_bytes()].concat());
             }
-            batch.delete_cf(self.cf(CF_SEALS), [b"t".as_slice(), tx.hash().as_bytes()].concat());
-            batch.delete_cf(self.cf(CF_SEALS), [b"a".as_slice(), tx.hash().as_bytes()].concat());
+            batch.delete_cf(self.cf(CF_SEALS), [b"t".as_slice(), key.as_bytes()].concat());
+            batch.delete_cf(self.cf(CF_SEALS), [b"a".as_slice(), key.as_bytes()].concat());
             if let randprotocol_core::types::Action::Aggregate { covers, .. } = &tx.action {
                 for cover in covers {
                     batch.delete_cf(self.cf(CF_SEALS), [b"t".as_slice(), cover.as_bytes()].concat());
