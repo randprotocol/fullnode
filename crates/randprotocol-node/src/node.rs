@@ -2154,7 +2154,11 @@ impl Node {
                 match tx.bundle.as_ref().and_then(|bd| randprotocol_core::notes::pruned_proof_hash(&bd.proof)) {
                     Some(proof_hash) => {
                         let p = cb.pruned.iter().find(|p| p.proof_hash == proof_hash).expect("checked above");
-                        let pv: [u64; 34] = p.public_values.clone().try_into().expect("a side table's list is 34 words");
+                        // The ledger refused any other length above (`MalformedPrunedRecord`);
+                        // a peer's list is still never unwrapped on trust.
+                        let Some(pv) = p.public_values_array() else {
+                            return Err(anyhow!("pruned record for tx {} carries {} public values", p.tx_hash, p.public_values.len()));
+                        };
                         recent.insert(p.tx_hash, randprotocol_core::types::CoveredBundle { public_values: pv, shape: p.shape });
                     }
                     None => {

@@ -253,6 +253,11 @@ pub enum BlockError {
     UnknownProposer(Address),
     #[error("too many transactions in block")]
     TooManyTransactions,
+    /// A sealed-form batch's side table carries a pruned record whose public-value list is not
+    /// the 34 words a covering aggregate reads (deep scan 2026-09-24): refused before any
+    /// transaction of the block is applied — a peer's wire input is never indexed on trust.
+    #[error("pruned record for tx {tx} carries {words} public values, not {expected}")]
+    MalformedPrunedRecord { tx: Hash, words: usize, expected: usize },
     /// At most one `Aggregate` per block (spec §3.4) is a block-validity rule, not proposer
     /// selection alone (the pre-v0.1 review's H1): the second is refused by index.
     #[error("a block carries at most one aggregate; a second is at tx {index}")]
@@ -1173,9 +1178,16 @@ impl Ledger {
                 return Err(TxError::InvalidBundleProof(crate::confidential::ConfidentialError::MalformedProof));
             };
             let want = executor.bundle_digest(&b.digest_input());
-            let got: Word8 = std::array::from_fn(|k| {
-                u32::try_from(pv[crate::types::pv::OUT0 + k]).expect("a pruned record's OUT words are u32-range")
-            });
+            // A short or non-u32 record is a mismatch, never an index past the end: the
+            // sync path refuses such a table before it gets here (`MalformedPrunedRecord`),
+            // and a store written by an older build gets the same verdict.
+            let mut got: Word8 = [0; 8];
+            for (k, slot) in got.iter_mut().enumerate() {
+                match pv.get(crate::types::pv::OUT0 + k).and_then(|w| u32::try_from(*w).ok()) {
+                    Some(w) => *slot = w,
+                    None => return Err(TxError::BadDigest),
+                }
+            }
             return if want == got { Ok(()) } else { Err(TxError::BadDigest) };
         }
         let published = executor.bundle_proof_digest(&b.proof).map_err(TxError::InvalidBundleProof)?;
@@ -1660,6 +1672,18 @@ impl Ledger {
         let mut scratch = self.clone();
         // The deposits reported after a block are exactly that block's (see `Deposit`).
         scratch.deposits.clear();
+        // A side table is a peer's wire input: every record must be the 34-word list the
+        // covering aggregate's admission and the digest check below index into, checked here
+        // once, before any transaction is read.
+        for p in pruned {
+            if p.public_values_array().is_none() {
+                return Err(BlockError::MalformedPrunedRecord {
+                    tx: p.tx_hash,
+                    words: p.public_values.len(),
+                    expected: crate::types::pv::NUM,
+                });
+            }
+        }
         scratch.pruned_side =
             pruned.iter().map(|p| (p.proof_hash, (p.tx_hash, p.public_values.clone()))).collect();
         let mut receipts = Vec::new();
@@ -3629,6 +3653,42 @@ mod tests {
             l.validate(&swapped, &StubExecutor)
         );
         assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+    }
+
+    /// Deep scan 2026-09-24 (consensus reviewer, critical): a sync peer serves the sealed form's
+    /// side table, and its `public_values` is a wire `Vec` — `check_bundle_proof` indexed it and
+    /// `apply_synced` `expect`ed 34 words, so a peer could crash any node that synced from it
+    /// with a record of the wrong length. A malformed record is refused when the block is applied,
+    /// before any transaction is read, and the digest check never indexes past what it holds.
+    #[test]
+    fn a_pruned_record_of_the_wrong_length_is_refused_not_a_panic() {
+        let mut l = ledger();
+        let proposer = l.validators.keys().next().copied().unwrap();
+        let bad = crate::consensus::PrunedBundle {
+            tx_hash: Hash([1; 32]),
+            proof_hash: Hash([2; 32]),
+            public_values: vec![7; 33],
+            shape: crate::types::DeclaredShape { profile: crate::types::FriProfile::Test, tier: 14, program_log_height: 12, input_log_height: 10, keccak_log_height: 0, sha256_log_height: 0, public_log_height: 2, mem_log_height: 16 },
+        };
+        let err = l
+            .apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[bad], &StubExecutor, &NoVerified)
+            .expect_err("a 33-word side table is refused");
+        assert!(matches!(err, BlockError::MalformedPrunedRecord { words: 33, .. }), "{err:?}");
+        // The digest check itself, fed a short record (a store written by a build that let one in):
+        // a refusal, never an index past the end.
+        let raw = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let mut marker = raw.clone();
+        let b = marker.bundle.as_mut().unwrap();
+        let ph = Hash::digest(&b.proof);
+        let mut m = crate::notes::PRUNED_PROOF_MARKER.to_vec();
+        m.extend_from_slice(ph.as_bytes());
+        b.proof = m;
+        l.pruned_side.insert(ph, (raw.hash(), Vec::new()));
+        let binding = [0u32; crate::types::TX_BINDING_WORDS];
+        assert_eq!(
+            l.check_bundle_proof(marker.bundle.as_ref().unwrap(), &binding, &StubExecutor, false),
+            Err(TxError::BadDigest)
+        );
     }
 
     /// Fix round 1, item 2: a marker-form copy of a raw transaction — `bundle.proof` replaced by

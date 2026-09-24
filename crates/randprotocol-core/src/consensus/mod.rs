@@ -119,6 +119,15 @@ pub struct PrunedBundle {
     pub shape: crate::types::DeclaredShape,
 }
 
+impl PrunedBundle {
+    /// The public values as the fixed array admission reads, or `None` when the wire list is
+    /// not exactly `pv::NUM` words — the check every consumer of a peer's side table must make
+    /// before indexing (deep scan 2026-09-24).
+    pub fn public_values_array(&self) -> Option<[u64; crate::types::pv::NUM]> {
+        self.public_values.as_slice().try_into().ok()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedBlock {
     pub block: Block,
