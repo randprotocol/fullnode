@@ -510,16 +510,21 @@ fn pick_sync_peer(
     best_peer_height: u64,
     skipped: &[PeerId],
 ) -> Option<PeerId> {
+    let serves = |s: &Status| s.floor <= my_height.saturating_add(1);
     let best = peers
         .iter()
         .filter(|(p, peer)| peer.connected && !skipped.contains(p))
-        .filter_map(|(p, peer)| peer.status.as_ref().map(|s| (*p, s.height)))
+        .filter_map(|(p, peer)| peer.status.as_ref().filter(|s| serves(s)).map(|s| (*p, s.height)))
         .filter(|(_, h)| *h > my_height)
         .max_by_key(|(_, h)| *h)
         .map(|(p, _)| p);
     best.or_else(|| {
         if best_peer_height > my_height + 1 {
-            peers.iter().find(|(p, peer)| peer.connected && !skipped.contains(p)).map(|(p, _)| *p)
+            peers
+                .iter()
+                .filter(|(p, peer)| peer.connected && !skipped.contains(p))
+                .find(|(_, peer)| peer.status.as_ref().map_or(true, serves))
+                .map(|(p, _)| *p)
         } else {
             None
         }
@@ -936,6 +941,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         fri_profile: gs.fri_profile.clone(),
         address: Some(key.address().to_base58()),
         peer_id: net.local_peer_id.to_string(),
+        prune_floor: 0,
+        prune_history_secs: cfg.prune_history.map(|d| d.as_secs()),
         ..Default::default()
     }));
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -1155,6 +1162,8 @@ impl Node {
         s.height = self.hs.committed_height();
         s.disk_free_bytes = self.disk_free_bytes;
         s.disk_low = self.disk_low();
+        s.prune_floor = self.storage.prune_floor().unwrap_or(0);
+        s.prune_history_secs = self.cfg.prune_history.map(|d| d.as_secs());
         s.head_hash = self.hs.committed_hash().to_hex();
         s.view = self.hs.view();
         s.high_qc_view = self.hs.high_qc().view;
@@ -1383,6 +1392,7 @@ impl Node {
                 height: self.hs.committed_height(),
                 head_hash: self.hs.committed_hash(),
                 view: self.hs.view(),
+                floor: self.storage.prune_floor().unwrap_or(0),
             }))
             .await;
     }
@@ -2014,7 +2024,8 @@ impl Node {
                 height = my_height,
                 target = self.best_peer_height(),
                 peers = ?self.peers.iter().map(|(p, peer)| format!("{p} connected={} status={:?}", peer.connected, peer.status.as_ref().map(|s| s.height))).collect::<Vec<_>>(),
-                "sync wanted but every candidate refused the request"
+                floors = ?self.peers.values().filter_map(|p| p.status.as_ref().map(|s| s.floor)).collect::<Vec<_>>(),
+                "sync wanted but no candidate can serve our next height (a peer that pruned it, or none connected) — a node behind every peer's retention must sync from the archive"
             );
         }
     }
@@ -2581,7 +2592,7 @@ mod tests {
             let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
             PeerId::from(kp.public())
         };
-        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height };
+        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height, floor: 0 };
         let forwarder = pid(1);
         let author = pid(2);
         let mut peers: HashMap<PeerId, Peer> =
@@ -2602,7 +2613,7 @@ mod tests {
             let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
             PeerId::from(kp.public())
         };
-        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height };
+        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height, floor: 0 };
         let forwarder = pid(1);
         let mut peers: HashMap<PeerId, Peer> =
             [(forwarder, Peer { connected: true, ..Default::default() })].into_iter().collect();
@@ -2623,7 +2634,7 @@ mod tests {
             let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
             PeerId::from(kp.public())
         };
-        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height };
+        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height, floor: 0 };
         let limiter = PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC);
         let (f1, f2) = (pid(1), pid(2));
         let mut peers: HashMap<PeerId, Peer> = [f1, f2]
@@ -2663,7 +2674,7 @@ mod tests {
             (
                 pid(seed),
                 Peer {
-                    status: height.map(|height| Status { height, head_hash: Hash::ZERO, view: height }),
+                    status: height.map(|height| Status { height, head_hash: Hash::ZERO, view: height, floor: 0 }),
                     connected,
                     ..Default::default()
                 },
@@ -2683,6 +2694,27 @@ mod tests {
         let skipped = [pid(2)];
         let peers: HashMap<PeerId, Peer> = [p(1, false, Some(163)), p(2, true, None), p(3, true, Some(50))].into_iter().collect();
         assert_eq!(pick_sync_peer(&peers, 43, 163, &skipped), Some(pid(3)));
+    }
+
+    #[test]
+    fn pick_sync_peer_never_picks_a_peer_that_pruned_our_next_height() {
+        let pid = |seed: u8| {
+            let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+            PeerId::from(kp.public())
+        };
+        let p = |seed: u8, height: u64, floor: u64| {
+            (pid(seed), Peer { status: Some(Status { height, head_hash: Hash::ZERO, view: height, floor }), connected: true, ..Default::default() })
+        };
+        // We are at 43 and need 44. Peer 1 is far ahead but pruned everything below 100;
+        // peer 2 is lower but still holds 44.
+        let peers: HashMap<PeerId, Peer> = [p(1, 500, 100), p(2, 120, 0)].into_iter().collect();
+        assert_eq!(pick_sync_peer(&peers, 43, 500, &[]), Some(pid(2)));
+        // A floor exactly at our next height is fine.
+        let peers: HashMap<PeerId, Peer> = [p(1, 500, 44)].into_iter().collect();
+        assert_eq!(pick_sync_peer(&peers, 43, 500, &[]), Some(pid(1)));
+        // Every candidate pruned it: no pick, even though the chain is ahead.
+        let peers: HashMap<PeerId, Peer> = [p(1, 500, 100), p(2, 300, 60)].into_iter().collect();
+        assert_eq!(pick_sync_peer(&peers, 43, 500, &[]), None);
     }
 
     #[test]

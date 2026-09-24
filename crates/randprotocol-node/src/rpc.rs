@@ -108,6 +108,11 @@ pub struct NodeStatus {
     /// Free space is under four times the startup minimum (`--min-free-disk-mb`): the node still
     /// runs, and `rand_getHealth` says `disk_low` ahead of everything else.
     pub disk_low: bool,
+    /// The lowest height this node still serves besides genesis (history pruning spec §4); 0
+    /// on an archive.
+    pub prune_floor: u64,
+    /// The configured retention window in seconds, `null` when this node keeps everything.
+    pub prune_history_secs: Option<u64>,
     /// Every peer this node knows of, including those seen only as the author of relayed gossip.
     pub peer_count: usize,
     /// Peers this node holds an open connection to — the ones sync can actually ask for blocks. A
@@ -5490,7 +5495,7 @@ mod tests {
 
     #[test]
     fn health_reads_ok_syncing_and_behind() {
-        let mut s = NodeStatus { height: 100, sync_target: 101, ..NodeStatus::default() };
+        let mut s = NodeStatus { height: 100, sync_target: 101, prune_floor: 0, prune_history_secs: None, ..NodeStatus::default() };
         assert_eq!(health_json(&s), json!({ "status": "ok" }));
         s.sync_target = 140;
         s.sync_inflight_age_ms = Some(20);

@@ -1928,7 +1928,7 @@ async fn lying_peer(
     .unwrap();
     let handle = peer.clone();
     tokio::spawn(async move {
-        let status = Status { height, head_hash, view: height };
+        let status = Status { height, head_hash, view: height, floor: 0 };
         let mut ticker = tokio::time::interval(Duration::from_millis(300));
         loop {
             tokio::select! {
@@ -2055,7 +2055,7 @@ async fn an_epoch_set_from_a_batchs_tail_is_recorded_when_its_block_commits() {
     .unwrap();
     let handle = peer.clone();
     tokio::spawn(async move {
-        let status = Status { height: 8, head_hash, view: 8 };
+        let status = Status { height: 8, head_hash, view: 8, floor: 0 };
         let mut ticker = tokio::time::interval(Duration::from_millis(200));
         loop {
             tokio::select! {
@@ -2156,7 +2156,7 @@ async fn a_node_holding_an_abandoned_block_rejoins_the_real_chain() {
     .unwrap();
     let handle = peer.clone();
     tokio::spawn(async move {
-        let status = Status { height: 6, head_hash, view: 6 };
+        let status = Status { height: 6, head_hash, view: 6, floor: 0 };
         let mut ticker = tokio::time::interval(Duration::from_millis(200));
         loop {
             tokio::select! {
@@ -2228,7 +2228,7 @@ async fn a_node_served_one_block_at_a_time_still_reaches_the_tip() {
     .unwrap();
     let handle = peer.clone();
     tokio::spawn(async move {
-        let status = Status { height: 6, head_hash, view: 6 };
+        let status = Status { height: 6, head_hash, view: 6, floor: 0 };
         let mut ticker = tokio::time::interval(Duration::from_millis(200));
         loop {
             tokio::select! {
