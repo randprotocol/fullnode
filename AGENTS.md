@@ -4,7 +4,59 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-24)
+## Project memory (state as of 2026-09-24, evening)
+
+### v0.5.5 — the audit-v5 fixes and the chain-14 recovery (2026-09-24)
+
+Audit v5 (`Rand_Final_Audit_v5_Key_Findings.pdf`, closed against `919a7a4`, i.e. before
+v0.5.4) — spec `docs/superpowers/specs/2026-09-24-audit-v5-v0.5.5-design.md` (§1 maps each
+finding), plan `docs/superpowers/plans/2026-09-24-audit-v5-v0.5.5.md`. Everything node-only or
+genesis-gated; chain 14's rules unchanged. **What it is:**
+
+- **OPS-4 (high): a committed block's QC is stored once.** `CF_QCS` keeps genesis' row and the
+  head's; every other height's QC is its child's `header.justify` (`qc_by_height`); a v0.5.4
+  database is pruned once at open (`prune_committed_qcs`, marker `META_QCS_PRUNED`, then a
+  compaction — ~12 GB back per validator). **A node rolled back below v0.5.5 needs a resync.**
+  Slope after: ~60 KB a block (the justify inside the header) ≈ 3.6 GB/day at 1.4 s blocks.
+- **CON-4 per v5:** the lock releases only on a not-held **quorum** (`has_quorum`, strictly more
+  than two thirds; v0.5.4's third was the v4 wording); **durable pending blocks** — every certified
+  block above the head is persisted (`META_PENDING_BLOCKS`, replaced whole, emptied on commit) and
+  restored by `resume` through `execute_and_insert`; `META_LOCKED_BLOCK` is read once and retired.
+- **The three recovery rules, from the stall:** `resume` drops a persisted high QC whose block is
+  not among the restored pending blocks (a ghost by construction); `fallback_high_qc` and that
+  drop land on the highest QC certifying a block the replica holds (`highest_held_qc`, not blindly
+  `head_qc` — F and lon1 had fallen back to their committed 248947 and proposed useless siblings);
+  by-hash fetches expire after `sync_request_timeout` (an inflight request libp2p never answered
+  nor timed out blocked every later attempt, so no leader reached the eight failures the fallback
+  needs — node A managed two attempts per leader turn).
+- **TOK-2 (gated):** `tokens.burn_registration_fee` — the registration fee is burned, the proposer
+  keeps `fee − registration_fee`; `Ledger::registration_fees_burned` is derived state beside
+  `META_SUPPLY`, audited in replay, served by `rand_getSupply`, subtracted in the supply identity.
+- `tokens_v2` is JSON through a storage-side mirror (`RegistryExtDisk`; the windows' tuple keys
+  as a list) so an appended `RegistryExt` field reads as its default; a v0.5.4 positional blob is
+  still read. The WAL-cap test polls (the v0.5.4 tag's CI failure was a mid-flush read).
+- `deploy/retire-chain-dirs.sh <ip> [--dry-run]`: the 2026-09-21 cleanup as a guarded script.
+- **Website (separate repo, deployed):** WEB-2/3 — the balance page takes a viewing key only, both
+  WASM modules are hashed against a pinned digest before they run (`public/*/SHA256`, `BUILT_FROM`);
+  WEB-5 — a sale deposit is credited only when two independent sources report it (EVM: two RPCs;
+  Tron: TronGrid plus a second operator's receipts). **TronGrid answers 429 without
+  `SALE_TRONGRID_KEY`** — Tron deposits were not being scanned before either; a free key fixes it.
+
+**The chain-14 stall, second half (afternoon):** v0.5.4 did not unstick it. The ghost QC (view
+261719, block `c82058995dbb9526…` at height 248954, lost from every tree) was restored from every
+node's persisted safety state at each restart and re-announced by every NewView; the only path
+that discarded it was a leader's eight failed by-hash fetches, and that chain died at the first
+request libp2p never answered (see the recovery rules above). Restarting the twelve tip nodes
+together at 12:44 UTC only reset their attempt counters; d reached the fallback at 13:13 on its
+own. **v0.5.5 is rolled to all 18 at once (stop all, start all)** — with the resume rule, no node
+comes back believing the ghost. Six nodes (A, F, lon1, sfo2, nyc1, syd1) sit at 248947 holding
+248948–248953 pending; they commit those the moment a QC forms on a child of 248953.
+
+**Not in v0.5.5** (spec §1 and the v0.5.4 §12 list): B3 pacemaker, AGG-2/C4, TOK-3/D17, ZKV-2,
+BR-4/BRG-14 custody (the set-1 guardian private keys are still in the laptop's shell profile),
+BR-3 multisig/timelock, DOC-4/PA-7, D19 (idle interval — the numbers are above). **Next:** the
+deep security-and-math scan, `docs/superpowers/specs/2026-09-24-deep-scan-design.md`.
+
 
 ### v0.5.4 — the audit-v4 fixes (2026-09-24), on `main`; roll status in the tag and the memory
 
