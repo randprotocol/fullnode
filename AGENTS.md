@@ -6,6 +6,58 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-24)
 
+### v0.5.4 — the audit-v4 fixes (2026-09-24), on `main`; roll status in the tag and the memory
+
+Audit v4 (`Rand_Audit_v4_Summary_for_Dendi.pdf`, 2026-09-21, six slides against v0.5.1; the
+67-page report is not in this repo) — spec `docs/superpowers/specs/2026-09-24-audit-v4-v0.5.4-design.md`
+(the finding → fix table is §1), plan `docs/superpowers/plans/2026-09-24-audit-v4-v0.5.4.md`. Built
+as `main` + the 18 `feat/security-concerns-2` commits (VK-1/2/3, RPC-2 metering, issue #4, RPC-1
+tree-once-per-change, PRIV-1 wallet-side witnesses, B5, CS6-3, AGG-3/4/6, CHAIN9-1, CI, the
+`69010a43…` genesis re-pin) + three parallel waves, each reviewed clean by an independent pass.
+**Three classes of change, and the class decides how it ships:**
+
+- **Node-only** (same-chain, rolls like v0.5.1): OPS-3 disk guard (`--min-free-disk-mb`, default
+  1024; `rand_getHealth` says `disk_low` under 4×); CON-3 sibling bound (one block per (view,
+  leader), `PROPOSAL_VIEW_WINDOW` = 8 views, off-branch eviction when the tree is full — the
+  2026-09-24 stall's "propose failed: too many speculative blocks in memory" can no longer
+  happen); the **ghost-QC memory** (`HotStuff::unobtainable`: a QC on a block every fetch failed
+  for is not raised again until the block arrives — the livelock that held chain 14 for hours
+  after a whole-fleet restart, found and fixed during this release); the 256 MB WAL cap
+  (`d187df4`); PROC-3's comment and the release rule (`docs/deploy.md`).
+- **Wire-coordinated**: CON-4 — the lock is lowered ONLY on signed `NotHeld` attestations from
+  strictly more than a third of the current set's stake (`SyncResponse::NotHeld`, domain
+  `rand-not-held-1 ‖ genesis ‖ hash`); `fallback_high_qc` no longer touches `locked_qc`; the locked
+  block is persisted beside the lock (`META_LOCKED_BLOCK`) and restored by `resume` when it sits
+  on the head. Old peers never answer `NotHeld`, so in a mixed fleet a lock on a lost block holds
+  until every validator runs v0.5.4 (D15: accepted).
+- **Genesis-gated** (chain 14 byte-for-byte unchanged; the next cut switches them on, see
+  `docs/deploy.md` "The next cut"): STAKE-2 `staking` section (faucet ⊕ bridge refused at
+  `validate`; `faucet_budget_per_epoch` as state under `rand-state-5`; `bond_activation_epochs`
+  with `activation_epoch = e+1+N` on the entry, leaf `rand-validator-leaf-4`); `consensus_domain: 1`
+  (every vote/new-view/proposal signs the genesis hash under the `-2` tags); bridge `rules_v2`
+  (`RotatePqGuardians` = `Action` 22, `RotatePauseKey` = 23, messages in `docs/bridge.md` §21;
+  rolling per-backing and global mint caps in a `RegistryExt` side table under `tokens_v2`;
+  listing refused while paused; `rotation_nonce` under `bridge_state_v2`, root
+  `rand-bridge-state-5`); `tokens.max_tokens` (+ `rand_getTokens` by range).
+
+**Not in v0.5.4** (spec §12, each with an owner): B3 pacemaker redesign; AGG-2/C4 (circuits,
+before the proof batch); TOK-3/D17 (paper); ZKV-2 (research repo); BRG-14 key custody (ops: the
+laptop's shell profile holds the set-1 guardian private keys in plain text — move them; never
+quote them); `CF_TXS` pruning and the QC-per-block disk slope. **Website** (separate repo, all
+deployed 2026-09-24): WEB-1 (bulk `rand_getNullifiers`, intersect in the browser), WEB-4 (nginx
+strips `CF-Connecting-IP`; `client_ip` reads `X-Real-IP` only), a CSP on `/account` and
+`/address` generated from the built pages (`server/csp-keypages.sh`; deploy with
+`server/deploy-site.sh`, not the old `randdeploy` alias).
+
+**Traps from this release:** three parallel waves each re-fixed the same rebase seam (the PRIV-1
+`NoteStore` deserializer lacking `main`'s `genesis` field) — when a base branch does not build,
+fix it on the base BEFORE forking waves. `git rebase --skip` on a conflict skips the commit
+being applied, not a dropped duplicate; check `rebase-merge/message` first. Astro's
+`security.csp` cannot serve a site with Shiki-rendered docs (its style hashes make
+`'unsafe-inline'` dead). The recursion-fixture tests (`agg_executor::`, `seal_tests`, 21 in the
+node lib) cannot run on this laptop; the release suite skips them by name.
+
+
 ### 2026-09-24 — chain 14 stalled on full disks: 13 GB of unpurged RocksDB WAL per validator, ~110 KB of Dilithium2 QC per 1 s block
 
 Found while verifying a CLI fix against the public RPC. **Every chain-14 validator's data dir was
