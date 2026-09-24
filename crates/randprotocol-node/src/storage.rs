@@ -362,15 +362,32 @@ pub fn derived_note_count(tx: &randprotocol_core::Transaction) -> usize {
     }
 }
 
+/// The most write-ahead log RocksDB keeps before it flushes the column family pinning the
+/// oldest file and deletes it. A log file lives while *any* family still holds unflushed rows
+/// from it, and the per-block families that get a few bytes a block (`anchors`, `epoch_sets`,
+/// `notes` on a quiet chain) never fill a memtable on their own; under RocksDB's default — four
+/// times every family's write buffers, gigabytes across seventeen families — they pinned every
+/// log since their last flush. On 2026-09-24 that was 13 GB of `.log` beside 27 GB of tables on
+/// each chain-14 validator, and seven 48 GB droplets full at once. 256 MB is ~2 300 chain-14
+/// blocks: a forced flush of a few kilobytes about once an hour.
+const MAX_TOTAL_WAL_BYTES: u64 = 256 * 1024 * 1024;
+
 impl Storage {
     /// Open (creating if needed) the database at `<path>/db`.
     pub fn open(path: &Path) -> Result<Storage> {
+        Self::open_with_wal_cap(path, MAX_TOTAL_WAL_BYTES)
+    }
+
+    /// [`Storage::open`] with the write-ahead log capped at `wal_cap` bytes
+    /// ([`MAX_TOTAL_WAL_BYTES`] in production; a test uses a smaller one to see the cap bite).
+    fn open_with_wal_cap(path: &Path, wal_cap: u64) -> Result<Storage> {
         let db_path = path.join("db");
         std::fs::create_dir_all(&db_path)
             .map_err(|e| StorageError::Corrupt(format!("create {}: {e}", db_path.display())))?;
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
+        opts.set_max_total_wal_size(wal_cap);
         let cfs = ALL_CFS
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()));
@@ -2698,6 +2715,38 @@ mod tests {
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::ledger::ANCHOR_WINDOW;
     use randprotocol_core::Transaction;
+
+    /// RocksDB keeps a write-ahead log file alive while any column family still holds unflushed
+    /// rows from it. `anchors` and the other per-block families get a few bytes a block and never
+    /// fill a memtable on their own, so under the default cap (four times every family's write
+    /// buffers — gigabytes across seventeen families) they pinned every log since their last
+    /// flush: 13 GB of `.log` beside 27 GB of tables on a chain-14 validator, and a 48 GB droplet
+    /// full (2026-09-24). A cap makes RocksDB flush the pinning family and delete the logs.
+    #[test]
+    fn the_write_ahead_log_is_capped_not_pinned_by_a_quiet_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let cap: u64 = 8 * 1024 * 1024;
+        let s = Storage::open_with_wal_cap(dir.path(), cap).unwrap();
+        // 256 MB of block bytes with a few bytes of anchor per block — what a quiet chain
+        // writes. `blocks` flushes every write buffer (64 MB, the default); under the default cap
+        // `anchors` never does, so every log since the first stays: ~256 MB. Under the cap the
+        // logs are the live one, at most a write buffer long, plus the cap's worth.
+        let big = vec![7u8; 64 * 1024];
+        for i in 0u64..4096 {
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.put_cf(s.cf(CF_BLOCKS), i.to_be_bytes(), &big);
+            batch.put_cf(s.cf(CF_ANCHORS), i.to_be_bytes(), [1u8; 8]);
+            s.db.write(batch).unwrap();
+        }
+        let wal: u64 = std::fs::read_dir(dir.path().join("db"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        let write_buffer: u64 = 64 * 1024 * 1024;
+        assert!(wal <= cap + write_buffer, "{wal} bytes of write-ahead log against a {cap}-byte cap");
+    }
 
     /// Fold a witness back to the root, the way the bundle guest's `MERKLE_VERIFY` does.
     fn fold(leaf: Word8, index: u64, path: &[Word8; DEPTH]) -> Word8 {
