@@ -802,10 +802,14 @@ is wasted on the wrong chain.
 ### `rand_getHealth`
 Params: `[]`. Result, one of:
 ```json
+{ "status": "disk_low", "free_bytes": "3221225472" }
 { "status": "ok" }
 { "status": "syncing", "behind": 412 }
 { "status": "behind", "behind": 30 }
 ```
+`disk_low`, ahead of everything else, when free space on the data directory's filesystem is
+under four times the node's startup minimum (`--min-free-disk-mb`, default 1024 → under 4 GB);
+`free_bytes` is the measurement, as a decimal string, re-taken every status tick (audit v4 OPS-3).
 `ok` when `sync_target - height` is at most 2 and no sync batch request is outstanding. `syncing`
 while one is. `behind` when the node is not syncing and the lag is still above 2 — the chain-8
 stall shape. A load balancer reads `status` alone; an operator reads `behind` too.
@@ -1227,6 +1231,17 @@ exempt**, so a node's own explorer and the operator's tooling are unaffected.
 This is a meter, not an authentication boundary: it bounds what one address can queue in front of
 the node's other work. The expensive reads keep their own bound on top — at most two witness tree
 rebuilds run at a time per node.
+
+### 2026-09-24 — a disk guard: `rand_getHealth` says `disk_low`, `rand_status` carries the free bytes
+
+Node-side only; no consensus, ledger or wire change (audit v4, OPS-3). Seven validators stalled
+on a full disk on 2026-09-24 with nothing in their health to say so.
+
+- **`rand_getHealth`** answers `{"status":"disk_low","free_bytes":"<bytes>"}` ahead of `ok` /
+  `syncing` / `behind` while free space is under four times the startup minimum (4 GB at the
+  default `--min-free-disk-mb 1024`).
+- **`rand_status`** gains `disk_free_bytes` (a number, not an amount) and `disk_low`.
+- The node refuses to start under the minimum itself, naming the directory and the flag.
 
 ### 2026-09-20 — the viewing-key methods are loopback-only, and a key can be removed
 

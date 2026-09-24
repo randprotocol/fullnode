@@ -50,6 +50,9 @@ axum = { version = "0.7", features = ["ws"] }
 # URL before connecting ("scheme is not http"), which is how the public RPC was once unreachable.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# The disk guard's `statvfs` (audit v4 OPS-3); already in the lock file through rocksdb.
+libc = "0.2"
+
 # storage
 rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
 

@@ -61,6 +61,13 @@ known-failing test is a reason not to tag, never a note to tag over.
    batch-syncs what it missed. Do not leave nodes on different builds for long: a node still on the
    previous build cannot answer block fetches for the new one.
 
+**Disk guard (audit v4 OPS-3).** A node refuses to start under 1 GB free on its data directory's
+filesystem (`--min-free-disk-mb`, default 1024, names the directory and the flag), and
+`rand_getHealth` answers `disk_low` with the free byte count under 4 GB, re-measured every status
+tick with a warning in the log — the 2026-09-24 stall was seven full disks and a health check that
+said `ok` right up to the crash loop. A roll waits on `ok`, so a droplet near full now stops the
+roll at that node instead of at the next one that fills.
+
 ## Fault tests that have been run on the live testnet
 
 - Stop one of four validators: the chain keeps committing, with a timeout on the absent leader's

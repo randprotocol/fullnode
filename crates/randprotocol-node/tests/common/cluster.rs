@@ -118,6 +118,7 @@ pub async fn start_in_at(
         max_timeout: Duration::from_secs(6).max(block_interval * 40),
         verify: randprotocol_node::storage::VerifyMode::Full,
         keep_raw_proofs: false,
+        min_free_disk_bytes: 0,
     })
     .await
     .expect("node starts");

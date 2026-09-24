@@ -230,6 +230,7 @@ one the cut announced; a mismatch on one node is almost always an old binary.
 | `--block-interval-ms <MS>` | `1000` | minimum spacing between proposals |
 | `--view-timeout-ms <MS>` | `3000` | base view timeout; doubles per consecutive timeout up to 8x |
 | `--verify-chain <MODE>` | `quick` | startup integrity check: `off`, `quick` (structure + ledger replay), `full` (also proposer signatures and every QC's votes) |
+| `--min-free-disk-mb <MB>` | `1024` | refuse to start with less free on the data directory's filesystem; `rand_getHealth` says `disk_low` under four times it (audit v4 OPS-3). `0` disables the guard |
 
 Environment: `RUST_LOG` (default `info,libp2p=warn,libp2p_mdns=off`). Ctrl-C shuts down cleanly.
 

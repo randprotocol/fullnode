@@ -102,6 +102,12 @@ pub struct NodeStatus {
     /// Batches applied after their request had been given up on. Progress rather than failure, but
     /// a rising count means the give-up is firing on requests that were still alive.
     pub sync_late_batches: u64,
+    /// Free bytes on the data directory's filesystem, measured at startup and every status tick
+    /// (audit v4 OPS-3).
+    pub disk_free_bytes: u64,
+    /// Free space is under four times the startup minimum (`--min-free-disk-mb`): the node still
+    /// runs, and `rand_getHealth` says `disk_low` ahead of everything else.
+    pub disk_low: bool,
     /// Every peer this node knows of, including those seen only as the author of relayed gossip.
     pub peer_count: usize,
     /// Peers this node holds an open connection to — the ones sync can actually ask for blocks. A
@@ -268,6 +274,11 @@ pub const GIT_SHA: &str = env!("RAND_GIT_SHA");
 
 /// `rand_getHealth`: one word a load balancer can read, and the lag an operator can.
 pub fn health_json(s: &NodeStatus) -> Value {
+    // Disk first (audit v4 OPS-3): a node about to run out of space is the one thing an operator
+    // must hear about before whether it is caught up.
+    if s.disk_low {
+        return json!({ "status": "disk_low", "free_bytes": s.disk_free_bytes.to_string() });
+    }
     let behind = s.sync_target.saturating_sub(s.height);
     if s.sync_inflight_age_ms.is_some() {
         json!({ "status": "syncing", "behind": behind })
@@ -5364,5 +5375,16 @@ mod tests {
         assert_eq!(health_json(&s), json!({ "status": "syncing", "behind": 40 }));
         s.sync_inflight_age_ms = None;
         assert_eq!(health_json(&s), json!({ "status": "behind", "behind": 40 }));
+    }
+
+    #[test]
+    fn health_reports_disk_low_ahead_of_everything_else() {
+        let mut s = NodeStatus::default();
+        s.disk_low = true;
+        s.disk_free_bytes = 123;
+        s.sync_inflight_age_ms = Some(5);
+        let v = health_json(&s);
+        assert_eq!(v["status"], "disk_low");
+        assert_eq!(v["free_bytes"], "123");
     }
 }

@@ -36,6 +36,7 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 rocksdb = { workspace = true }
+libc = { workspace = true }
 clap = { workspace = true }
 
 [dev-dependencies]

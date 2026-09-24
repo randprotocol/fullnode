@@ -5241,6 +5241,7 @@ dependencies = [
  "clap",
  "futures",
  "hex",
+ "libc",
  "libp2p",
  "p3-field",
  "postcard",

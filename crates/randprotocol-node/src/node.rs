@@ -9,7 +9,7 @@ use crate::network::{
 };
 use crate::rpc::{self, NodeCommand, NodeStatus, RpcState};
 use crate::storage::{Storage, VerifyMode};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use libp2p::{Multiaddr, PeerId};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
@@ -71,6 +71,10 @@ pub struct NodeConfig {
     /// Keep the raw proofs of sealed bundles (spec §6.2's archive flag): the pruning pass
     /// never runs when set.
     pub keep_raw_proofs: bool,
+    /// Refuse to start with less than this free on the data directory's filesystem, and report
+    /// `disk_low` in `rand_getHealth` under [`disk::DISK_LOW_FACTOR`] times it (audit v4 OPS-3).
+    /// `--min-free-disk-mb`, default 1 GB; zero disables the guard.
+    pub min_free_disk_bytes: u64,
 }
 
 /// Handles returned by `Node::start` so tests and the CLI can observe the node.
@@ -477,6 +481,9 @@ struct Node {
     fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, Hash>,
     /// Block hash -> (attempts so far, peers already asked) for by-hash fetches.
     fetch_attempts: HashMap<Hash, (usize, Vec<PeerId>)>,
+    /// Free space on the data directory's filesystem, measured at startup and on every status
+    /// tick; what `NodeStatus::disk_free_bytes` and `disk_low` publish (audit v4 OPS-3).
+    disk_free_bytes: u64,
     /// Transaction hashes this node has already refused for a reason about their bytes, so a
     /// re-gossiped copy costs a hash lookup instead of a proof verification.
     refused: admission::RefusedCache,
@@ -699,6 +706,18 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
     let (gs, executor) = load_genesis(&cfg.datadir)?;
     check_build_runs_genesis(&gs, &ZkExecutor::hc_bundle())?;
+    // The disk guard (audit v4 OPS-3): a node that opens RocksDB on a full disk crash-loops
+    // with the RPC never up; refusing here names the directory and the flag instead.
+    let disk_free_bytes =
+        crate::disk::free_bytes(&cfg.datadir).map_err(|e| anyhow!("free space of {}: {e}", cfg.datadir.display()))?;
+    if disk_free_bytes < cfg.min_free_disk_bytes {
+        return Err(anyhow!(
+            "{} has {} MB free, under the {} MB minimum; free space or pass --min-free-disk-mb (audit v4 OPS-3)",
+            cfg.datadir.display(),
+            disk_free_bytes / (1 << 20),
+            cfg.min_free_disk_bytes / (1 << 20)
+        ));
+    }
     let storage = Arc::new(Storage::open(&cfg.datadir)?);
     storage.init_genesis(&gs)?;
     check_and_repair_chain(&storage, &gs, cfg.verify, executor.as_ref())?;
@@ -869,6 +888,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         sync_late_batches: 0,
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
+        disk_free_bytes,
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         verified,
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -946,15 +966,42 @@ impl Node {
                         self.propose(view).await?;
                     }
                 },
-                _ = status_tick.tick() => self.broadcast_status().await,
+                _ = status_tick.tick() => {
+                    self.check_disk();
+                    self.broadcast_status().await
+                }
                 _ = sync_tick.tick() => self.maybe_sync().await,
             }
+        }
+    }
+
+    /// Free space under `DISK_LOW_FACTOR` times the startup minimum (audit v4 OPS-3).
+    fn disk_low(&self) -> bool {
+        self.disk_free_bytes < self.cfg.min_free_disk_bytes.saturating_mul(crate::disk::DISK_LOW_FACTOR)
+    }
+
+    /// Re-measure the data directory's free space; once per status tick, and warned about once
+    /// per tick while low. A measurement that fails keeps the last one rather than reading zero.
+    fn check_disk(&mut self) {
+        match crate::disk::free_bytes(&self.cfg.datadir) {
+            Ok(free) => self.disk_free_bytes = free,
+            Err(e) => tracing::warn!("free space of {}: {e}", self.cfg.datadir.display()),
+        }
+        if self.disk_low() {
+            tracing::warn!(
+                "{} has {} MB free, under {} MB: disk_low (audit v4 OPS-3)",
+                self.cfg.datadir.display(),
+                self.disk_free_bytes / (1 << 20),
+                self.cfg.min_free_disk_bytes.saturating_mul(crate::disk::DISK_LOW_FACTOR) / (1 << 20)
+            );
         }
     }
 
     fn publish_status(&self) {
         let mut s = self.status.write().unwrap_or_else(|e| e.into_inner());
         s.height = self.hs.committed_height();
+        s.disk_free_bytes = self.disk_free_bytes;
+        s.disk_low = self.disk_low();
         s.head_hash = self.hs.committed_hash().to_hex();
         s.view = self.hs.view();
         s.high_qc_view = self.hs.high_qc().view;

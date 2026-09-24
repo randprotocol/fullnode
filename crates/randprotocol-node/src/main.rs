@@ -352,6 +352,11 @@ enum Cmd {
         /// running against this node.
         #[arg(long)]
         rpc_viewing_open: bool,
+        /// Refuse to start with less than this many MB free on the data directory's filesystem,
+        /// and report `disk_low` in `rand_getHealth` under four times it (audit v4 OPS-3). Zero
+        /// disables the guard.
+        #[arg(long, default_value_t = 1024)]
+        min_free_disk_mb: u64,
     },
     /// Verify the chain in a data directory without running the node.
     Verify {
@@ -647,7 +652,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Run { datadir, key, listen, bootstrap, rpc, validator, no_mdns, block_interval_ms, view_timeout_ms, verify_chain, keep_raw_proofs, rpc_viewing_open } => {
+        Cmd::Run { datadir, key, listen, bootstrap, rpc, validator, no_mdns, block_interval_ms, view_timeout_ms, verify_chain, keep_raw_proofs, rpc_viewing_open, min_free_disk_mb } => {
             let kp = load_keypair(&key)?;
             let handle = node::start(NodeConfig {
                 viewing_open: rpc_viewing_open,
@@ -663,6 +668,7 @@ async fn main() -> Result<()> {
                 max_timeout: Duration::from_millis(view_timeout_ms * 8),
                 verify: verify_chain.parse().map_err(|e: String| anyhow::anyhow!(e))?,
                 keep_raw_proofs,
+                min_free_disk_bytes: min_free_disk_mb << 20,
             })
             .await?;
             let mut handle = handle;
