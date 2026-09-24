@@ -56,6 +56,10 @@ findings `../security/fullnode-deep-scan-2026-09-24.md` — read it before re-re
 binaries, `rand-node` sha256 `8edb8dbb…`; suite on the laptop: core 437, client 90, executor 17,
 node lib 282 (+21 fixture-gap), cluster 24 (1268 s), submit 2, ws 9, zusd_e2e 2 (2392 s),
 genesis_cli 2; whitepapers `360dbb3` pushed; the fixes PDF in `~/Downloads` regenerated.**
+**ROLLED 2026-09-25 18:36–19:14 UTC** with `deploy/roll-all.sh` (install with sha check on all 17 at
+18:36, stop all 18:43:37, start all 18:43:42, node A via launchd): the chain paused at 258 973 and
+committed again once 13 were back at ~19:09; every node `ok` on `a2d4021` at 19:14 (the 48 GB
+droplets' startup verify took up to 30 min at 259k blocks — plan the pause for that, not 15 min).
 **Roll: all-stop, all-start** (`deploy/roll-all.sh`, the v0.5.5 procedure) — DS-3 is a validity
 rule and the public RPC admits anyone's submissions, so a mixed fleet is a fork window; the
 independent review's one finding, `docs/deploy.md` "Roll note for v0.5.6". Rollback = re-pin
