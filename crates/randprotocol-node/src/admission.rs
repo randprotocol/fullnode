@@ -251,6 +251,11 @@ pub fn is_permanent(e: &TxError) -> bool {
                 // and nothing else (core I-1). No state can make a wrong-length key right.
                 | T::BadAuthorityKey { .. }
                 | T::BadRecipientKey { .. }
+                // A note at or above 2^63 (deep scan 2026-09-24): the amount as written against
+                // a constant, and the gate that makes the ledger say it is a genesis constant,
+                // like `WrongChain`'s chain id. `SupplyTooLarge` — the token's supply would reach
+                // the bound — is state: a burn makes room, so it stays out.
+                | T::AmountTooLarge { .. }
         );
     }
     // The Dilithium2 co-signature's verdicts (bridge hardening B3). Every other bridge verdict
@@ -295,6 +300,10 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | B::PqBadSignatureLength { .. }
                 | B::BadPauseSignature
                 | B::WrongDepositBlinding
+                // A transfer amount that fits no note — past `u64`, or at or above 2^63 under
+                // `tokens.bound_note_value` (deep scan 2026-09-24): the wire bytes against a
+                // constant, decided before any signature is looked at.
+                | B::AmountTooLarge
                 // Bridge rules v2: the gate is a genesis constant, and a key's length or a
                 // duplicate inside the action's own key list is about the bytes. The nonce, the
                 // set-length rule (the current ECDSA set's size), the membership rules and the
@@ -314,6 +323,10 @@ pub fn is_permanent(e: &TxError) -> bool {
             | TxError::BadMintSignature
             // A mint's commitment is a function of its own bytes (`ledger::mint_commitment`).
             | TxError::MintCommitmentMismatch
+            // A faucet mint at or above 2^63 (deep scan 2026-09-24): the node's own byte verdict
+            // for a note no proof could spend (`oversized_note`), against a constant — unlike
+            // `MintTooLarge`, which stays out (see the doc comment).
+            | TxError::AmountTooLarge { .. }
             | TxError::BadProgram(_)
             // The chain id is a per-chain constant, and the shape of an action — bundle or no
             // bundle — is on the wire.
@@ -486,8 +499,8 @@ impl GossipOutcome {
     ///
     /// The order is the point. The refused cache first, because it is a hash lookup and because a
     /// peer flooding one known-bad transaction must not spend an allowance it could have used on a
-    /// good one. Then the bucket, so a burst is shed before anything reads the ledger. Then the
-    /// queue depth. Everything more expensive than this — `Mempool::precheck`, which hashes a
+    /// good one; then [`oversized_note`], a byte verdict decided the same way. Then the bucket, so
+    /// a burst is shed before anything reads the ledger. Then the queue depth. Everything more expensive than this — `Mempool::precheck`, which hashes a
     /// bridge attestation, and the proof itself — happens only after a `Verify`.
     pub fn for_transaction(
         tx: &Transaction,
@@ -500,6 +513,13 @@ impl GossipOutcome {
         if refused.get(&tx.hash()).is_some() {
             return GossipOutcome::Report(Acceptance::Reject);
         }
+        // Then the note-value screen, a field compare (a payload decode for a deposit) and a
+        // byte verdict like a cache hit — cached like one too, so the RPC answer names it and a
+        // repeat is the lookup above; before the bucket, for the cache's reason.
+        if let Some(e) = oversized_note(tx) {
+            refused.insert(tx.hash(), e);
+            return GossipOutcome::Report(Acceptance::Reject);
+        }
         if let Some(b) = bucket {
             if !limiter.allow(b, now) {
                 return GossipOutcome::Report(Acceptance::Ignore);
@@ -509,6 +529,53 @@ impl GossipOutcome {
             return GossipOutcome::Report(Acceptance::Ignore);
         }
         GossipOutcome::Verify
+    }
+}
+
+/// A transaction that would create a note worth `MAX_NOTE_VALUE` (2^63) or more, from its bytes
+/// alone — a faucet `Mint`, a `TokenMint`, a `RegisterToken`'s initial mint or a `BridgeAttest`
+/// whose transfer amount is at or above it (a decode of the attestation's payload, no signature
+/// work). The hidden-asset guest range-checks every value to u63, so such a note could never be
+/// spent: its value would sit in a token's `total_supply` or a backing's `locked` for ever, and
+/// for zUSD `total_supply == Σ locked` could never be closed by a burn (deep scan 2026-09-24,
+/// ledger arithmetic). `None` for everything else, including bytes that do not decode — those
+/// are the ledger's to refuse.
+///
+/// **Unconditional**, on every chain: it is node policy, not a validity rule. On chain 14, whose
+/// genesis has no `tokens.bound_note_value`, the ledger admits such a mint and a block carrying
+/// one is valid — this node simply never pools or forwards it, and answers the same bytes from
+/// the refused cache thereafter. Under the gate the ledger's own verdict is the same variant
+/// (`Token(AmountTooLarge)`, `Bridge(AmountTooLarge)`); a faucet `Mint` is refused by
+/// `FAUCET_MAX_UNITS` everywhere and gets `TxError::AmountTooLarge` here, since `MintTooLarge`
+/// is deliberately never cached.
+pub fn oversized_note(tx: &Transaction) -> Option<TxError> {
+    use randprotocol_core::bridge::{Attestation, BridgeError, Payload};
+    use randprotocol_core::ledger::tokens::TokenError;
+    use randprotocol_core::notes::MAX_NOTE_VALUE;
+    use randprotocol_core::Action;
+    match &tx.action {
+        Action::Mint { amount, .. } if *amount >= MAX_NOTE_VALUE => Some(TxError::AmountTooLarge { amount: *amount }),
+        Action::TokenMint { amount, .. } if *amount >= MAX_NOTE_VALUE => {
+            Some(TxError::Token(TokenError::AmountTooLarge { amount: *amount }))
+        }
+        Action::RegisterToken { initial: Some(m), .. } if m.amount >= MAX_NOTE_VALUE => {
+            Some(TxError::Token(TokenError::AmountTooLarge { amount: m.amount }))
+        }
+        Action::BridgeAttest { attestation, .. } => {
+            // The transfer's amount as the wire carries it (a u256): past `u64` or at or above
+            // the bound, the bridge's own verdict for "fits no note" — what `check_attest`
+            // answers for the same bytes, under the gate. A rotation moves no value.
+            let att = Attestation::decode(attestation).ok()?;
+            let Payload::Transfer(t) = Payload::decode(&att.body.payload).ok()? else {
+                return None;
+            };
+            let too_large = match t.amount_u128() {
+                Some(amount) => amount >= MAX_NOTE_VALUE as u128,
+                None => true,
+            };
+            too_large.then_some(TxError::Bridge(BridgeError::AmountTooLarge))
+        }
+        _ => None,
     }
 }
 
@@ -864,6 +931,77 @@ mod tests {
             let t = tx(l, Action::TokenBurn { asset: 0, amount: 300 }, 0, 0, 0);
             assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::Token(T::UnknownToken(0))));
         }
+    }
+
+    /// Deep scan 2026-09-24 (ledger arithmetic): a mint or deposit at or above 2^63 creates a
+    /// note the hidden-asset guest can never spend. Chain 14's ledger admits one (its genesis has
+    /// no `tokens.bound_note_value`), so the door is this node's only refusal there: the screen
+    /// names each such transaction from its bytes, `for_transaction` rejects it before the
+    /// bucket or the queue, and the verdict is cached as a byte verdict so the RPC answer names
+    /// it and a repeat costs a lookup. One below the bound goes on to verify.
+    #[test]
+    fn a_note_at_or_above_the_bound_is_refused_at_the_door_on_every_chain() {
+        use crate::storage::fixtures;
+        use randprotocol_core::bridge::BridgeError as B;
+        use randprotocol_core::confidential::StubExecutor;
+        use randprotocol_core::ledger::tokens::TokenError as T;
+        use randprotocol_core::notes::MAX_NOTE_VALUE;
+        use randprotocol_core::Transaction;
+
+        let (gs, secrets) = fixtures::bridged_genesis(1);
+        let mut l = gs.ledger.clone();
+        let register = fixtures::register_token_tx(&l, 5_000, 210);
+        l.apply_tx(&register, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        l.record_anchor(0);
+        let asset = l.tokens().unwrap().next_index() - 1;
+
+        let mint = fixtures::token_mint_tx(&l, asset, MAX_NOTE_VALUE, 0, 220);
+        assert_eq!(oversized_note(&mint), Some(TxError::Token(T::AmountTooLarge { amount: MAX_NOTE_VALUE })));
+        assert_eq!(l.validate(&mint, &StubExecutor), Ok(()), "chain 14's ledger admits it: the door is the only refusal");
+        let fits = fixtures::token_mint_tx(&l, asset, MAX_NOTE_VALUE - 1, 0, 220);
+        assert_eq!(oversized_note(&fits), None);
+        let initial = fixtures::register_token_tx(&l, MAX_NOTE_VALUE, 230);
+        assert_eq!(oversized_note(&initial), Some(TxError::Token(T::AmountTooLarge { amount: MAX_NOTE_VALUE })));
+        assert_eq!(oversized_note(&fixtures::register_token_tx(&l, MAX_NOTE_VALUE - 1, 230)), None);
+        let deposit = |amount: u128, seq: u64| {
+            fixtures::attest_tx(&l, fixtures::attestation(&secrets, &fixtures::recipient(), amount, seq), 240)
+        };
+        assert_eq!(oversized_note(&deposit(MAX_NOTE_VALUE as u128, 1)), Some(TxError::Bridge(B::AmountTooLarge)));
+        assert_eq!(oversized_note(&deposit(u64::MAX as u128 + 1, 2)), Some(TxError::Bridge(B::AmountTooLarge)), "past u64 too");
+        assert_eq!(oversized_note(&deposit(MAX_NOTE_VALUE as u128 - 1, 3)), None);
+        let faucet = |amount: u64| Transaction::mint(1, [31; 8], 0, [31; 8], fixtures::env(3), amount, &fixtures::key(1), &StubExecutor);
+        assert_eq!(oversized_note(&faucet(MAX_NOTE_VALUE)), Some(TxError::AmountTooLarge { amount: MAX_NOTE_VALUE }));
+        assert_eq!(oversized_note(&faucet(MAX_NOTE_VALUE - 1)), None);
+
+        // Each verdict is about the bytes and is cached; the supply's is state and is not.
+        for e in [
+            TxError::AmountTooLarge { amount: MAX_NOTE_VALUE },
+            TxError::Token(T::AmountTooLarge { amount: MAX_NOTE_VALUE }),
+            TxError::Bridge(B::AmountTooLarge),
+        ] {
+            assert!(is_permanent(&e), "{e} is a statement about the bytes");
+        }
+        assert!(!is_permanent(&TxError::Token(T::SupplyTooLarge { supply: 1, amount: 1 })), "a burn can make room");
+
+        // The door: rejected before the bucket, cached, and the RPC answer names the verdict.
+        let mut refused = RefusedCache::new(4);
+        let limiter = PeerLimiter::new(16, 4.0);
+        let now = Instant::now();
+        assert_eq!(
+            GossipOutcome::for_transaction(&mint, None, &mut refused, &limiter, 0, now),
+            GossipOutcome::Report(Acceptance::Reject)
+        );
+        assert_eq!(
+            rpc_refusal(Acceptance::Reject, &mint.hash(), &refused),
+            MempoolError::Invalid(TxError::Token(T::AmountTooLarge { amount: MAX_NOTE_VALUE }))
+        );
+        let mut bucket = TokenBucket::default();
+        assert_eq!(
+            GossipOutcome::for_transaction(&deposit(MAX_NOTE_VALUE as u128, 4), Some(&mut bucket), &mut refused, &limiter, 0, now),
+            GossipOutcome::Report(Acceptance::Reject)
+        );
+        assert_eq!(bucket.tokens, None, "a refused deposit spends none of the peer's allowance");
+        assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
     }
 
     /// The shipped policy, pinned: 8192 entries against a 10 000-transaction pool, and a burst of 16

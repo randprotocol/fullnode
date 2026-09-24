@@ -137,6 +137,15 @@ pub enum TxError {
     FaucetDisabled,
     #[error("mint of {amount} exceeds faucet cap {cap}")]
     MintTooLarge { amount: u64, cap: u64 },
+    /// A faucet `Mint` of a note worth [`crate::notes::MAX_NOTE_VALUE`] (2^63) or more — a note
+    /// the hidden-asset guest's u63 range check could never spend. The ledger itself never
+    /// answers it: `FAUCET_MAX_UNITS` refuses such a mint as `MintTooLarge` on every chain, a
+    /// policy verdict that is deliberately not cached. This is the node's byte-level verdict for
+    /// the same bytes (`admission::oversized_note`), decided before any signature work and cached
+    /// for good, like a `TokenMint`'s `Token(AmountTooLarge)` and a deposit's
+    /// `Bridge(AmountTooLarge)` are (deep scan 2026-09-24, ledger arithmetic).
+    #[error("mint of {amount} is at or above 2^63, which no bundle proof can spend")]
+    AmountTooLarge { amount: u64 },
     #[error("minter {0} is not a validator")]
     MinterNotValidator(Address),
     #[error("bad mint signature")]
