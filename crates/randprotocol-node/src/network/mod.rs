@@ -136,7 +136,27 @@ pub struct WireLimits {
     /// The request-response timeout on a sync request, and the node's own give-up
     /// (`Node::sync_from` abandons an in-flight request after it): `max(30 s, ⌈sync_response_wire_limit / 1 MiB⌉ s)`.
     pub sync_request_timeout: Duration,
+    /// How many established *inbound* connections the swarm carries at once
+    /// ([`MAX_ESTABLISHED_INCOMING`]); the next one is refused at the handshake (deep scan
+    /// 2026-09-24: without it 200 fresh identities were all accepted). Outbound dials — this node's
+    /// own bootstraps and redials — are never counted against it, so a validator is never locked
+    /// out of the peers it dials.
+    pub max_established_incoming: u32,
+    /// Established connections per remote peer, in either direction ([`MAX_ESTABLISHED_PER_PEER`]):
+    /// two, because two nodes dialing each other at once legitimately hold one each way.
+    pub max_established_per_peer: u32,
+    /// Inbound connections still in their handshake at once ([`MAX_PENDING_INCOMING`]).
+    pub max_pending_incoming: u32,
 }
+
+/// The default inbound connection cap: eighteen validators plus every explorer and observer fit
+/// many times over, and a fresh identity is free to mint, so the number is a bound on what one
+/// host can be made to hold, not a topology.
+pub const MAX_ESTABLISHED_INCOMING: u32 = 256;
+/// The default per-peer connection cap (see [`WireLimits::max_established_per_peer`]).
+pub const MAX_ESTABLISHED_PER_PEER: u32 = 2;
+/// The default cap on inbound connections mid-handshake.
+pub const MAX_PENDING_INCOMING: u32 = 64;
 
 impl WireLimits {
     pub const fn for_block_bytes(max_block_bytes: usize) -> WireLimits {
@@ -147,6 +167,9 @@ impl WireLimits {
             sync_response_wire_limit: limit,
             gossip_max_transmit_size: gossip_transmit_for(max_block_bytes),
             sync_request_timeout: request_timeout_for(limit),
+            max_established_incoming: MAX_ESTABLISHED_INCOMING,
+            max_established_per_peer: MAX_ESTABLISHED_PER_PEER,
+            max_pending_incoming: MAX_PENDING_INCOMING,
         }
     }
 
@@ -410,7 +433,15 @@ pub async fn start(
     );
 
     let ping = libp2p::ping::Behaviour::new(libp2p::ping::Config::new().with_interval(Duration::from_secs(15)).with_timeout(Duration::from_secs(20)));
-    let behaviour = RandBehaviour { gossipsub, identify, kademlia, mdns: Toggle::from(mdns), sync, ping };
+    // Inbound only, plus the per-peer bound: this node's own dials are never refused by its own
+    // caps, so a validator always reaches the peers it bootstraps to (`WireLimits`'s field docs).
+    let limits = libp2p::connection_limits::Behaviour::new(
+        libp2p::connection_limits::ConnectionLimits::default()
+            .with_max_established_incoming(Some(cfg.limits.max_established_incoming))
+            .with_max_established_per_peer(Some(cfg.limits.max_established_per_peer))
+            .with_max_pending_incoming(Some(cfg.limits.max_pending_incoming)),
+    );
+    let behaviour = RandBehaviour { limits, gossipsub, identify, kademlia, mdns: Toggle::from(mdns), sync, ping };
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -951,6 +982,55 @@ mod tests {
 
         a.shutdown().await;
         b.shutdown().await;
+    }
+
+    /// A node with no connection limit accepts every inbound connection, and a fresh libp2p
+    /// identity costs nothing to mint (deep scan 2026-09-24: 200 of them were all accepted). With
+    /// the inbound cap at 3, eight dialers must leave the target holding at most three peers,
+    /// however long they keep at it — and the first three do get in, so it is a cap and not a
+    /// closed door.
+    #[tokio::test]
+    async fn inbound_connections_past_the_cap_are_refused() {
+        const CAP: u32 = 3;
+        let cfg = |bootstrap, limits| NetworkConfig {
+            chain_id: 7,
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            bootstrap,
+            enable_mdns: false,
+            limits,
+        };
+        let capped = WireLimits { max_established_incoming: CAP, ..WireLimits::default() };
+        let (target, mut target_rx) = start(cfg(vec![], capped), [40u8; 32]).await.unwrap();
+        let addr = wait_for(&mut target_rx, Duration::from_secs(5), |e| match e {
+            NetworkEvent::Listening(addr) => Some(addr),
+            _ => None,
+        })
+        .await
+        .expect("target listening");
+        let full = addr.with(libp2p::multiaddr::Protocol::P2p(target.local_peer_id));
+
+        let mut dialers = Vec::new();
+        for i in 0..(CAP + 5) as u8 {
+            let (d, rx) = start(cfg(vec![full.clone()], WireLimits::default()), [41 + i; 32]).await.unwrap();
+            dialers.push((d, rx));
+        }
+        // Drain the target's events (a dropped receiver would silently discard them) and watch the
+        // peer count over a window generous enough for every dial to land.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut max_seen = 0usize;
+        while tokio::time::Instant::now() < deadline {
+            while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(10), target_rx.recv()).await {}
+            let n = target.peers().await.len();
+            max_seen = max_seen.max(n);
+            assert!(n <= CAP as usize, "the target holds {n} peers, over the cap of {CAP}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(max_seen, CAP as usize, "the first {CAP} dialers get in");
+
+        target.shutdown().await;
+        for (d, _) in &dialers {
+            d.shutdown().await;
+        }
     }
 
     #[tokio::test]

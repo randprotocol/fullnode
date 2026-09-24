@@ -16,6 +16,16 @@
 - Nodes behind NAT dial out to nodes with public addresses (`--bootstrap`). On one LAN, mDNS finds
   peers without configuration. Open TCP 30303 inbound on public nodes.
 - Bind RPC to `127.0.0.1` unless it is firewalled; it accepts transactions from anyone who can reach it.
+- **The swarm caps what it will hold** (deep scan 2026-09-24): at most 256 established *inbound*
+  connections, 64 inbound handshakes in flight and 2 connections per remote peer
+  (`network::WireLimits`); the next inbound connection is refused at the handshake and the dialer
+  sees a `ConnectionDenied`. A node's own dials — its bootstraps and redials — are never counted
+  against its own caps, so a validator always reaches the peers it dials, and 18 validators plus
+  every explorer and observer sit far under 256; the cap is a bound on what one host can be made
+  to hold, since a fresh libp2p identity costs nothing to mint. The node's peer map is held to
+  the same bound: a new connection evicts the entries that are not connected before it is
+  recorded, and a gossiped `Status` from an author this node holds no connection to no longer
+  creates an entry at all.
 - Observers run the same binary without `--validator`; they sync, verify and serve RPC.
 - **The one public RPC endpoint is `https://rpc.randprotocol.org`** — Cloudflare, proxied to Caddy
   on droplet F, forwarding to that node's own `127.0.0.1:8545`; every other droplet keeps RPC

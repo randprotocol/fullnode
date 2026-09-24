@@ -439,6 +439,20 @@ fn orphan_wants_batch_sync(best_peer_height: u64, committed_height: u64, pending
     best_peer_height > pending_tip_height.max(committed_height) + 2
 }
 
+/// Record `id` as connected. Belt and braces under the swarm's own inbound cap
+/// (`WireLimits::max_established_incoming`, the same `max`): a connected peer is always recorded —
+/// the swarm already bounds how many there are, and a validator must never be refused — but the
+/// map never grows past `max` on the strength of entries that are *not* connected: at the bound
+/// those are dropped first.
+fn connect_peer(peers: &mut HashMap<PeerId, Peer>, id: PeerId, max: usize) -> &mut Peer {
+    if !peers.contains_key(&id) && peers.len() >= max {
+        peers.retain(|_, p| p.connected);
+    }
+    let p = peers.entry(id).or_default();
+    p.connected = true;
+    p
+}
+
 fn pick_sync_peer(
     peers: &HashMap<PeerId, Peer>,
     my_height: u64,
@@ -1628,7 +1642,7 @@ impl Node {
         match ev {
             NetworkEvent::Listening(a) => tracing::info!("listening on {a}"),
             NetworkEvent::PeerConnected(p) => {
-                self.peers.entry(p).or_default().connected = true;
+                connect_peer(&mut self.peers, p, self.wire.max_established_incoming as usize);
                 self.broadcast_status().await;
             }
             NetworkEvent::PeerDisconnected(p) => {
@@ -2418,6 +2432,39 @@ mod tests {
         // A gap of two is a fetch, three is a batch (the rule's existing margin).
         assert!(!orphan_wants_batch_sync(10, 8, 8));
         assert!(orphan_wants_batch_sync(11, 8, 8));
+    }
+
+    /// The peer map is bounded by the swarm's inbound cap as belt and braces (deep scan
+    /// 2026-09-24): at the bound a new connection evicts the entries that are not connected
+    /// before it is recorded, so hearsay entries can never hold the map above it — while a
+    /// connected peer is always recorded, because the swarm is what bounds those and a
+    /// validator must never be refused.
+    #[test]
+    fn the_peer_map_never_grows_past_the_cap_on_disconnected_entries() {
+        let pid = |seed: u8| {
+            let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+            PeerId::from(kp.public())
+        };
+        let entry = |connected: bool| Peer { status: None, connected, tx_bucket: Default::default() };
+        const CAP: usize = 3;
+        let mut peers: HashMap<PeerId, Peer> = [(pid(1), entry(false)), (pid(2), entry(false)), (pid(3), entry(false))].into_iter().collect();
+        connect_peer(&mut peers, pid(4), CAP);
+        assert!(peers.len() <= CAP, "{} entries, over the cap of {CAP}", peers.len());
+        assert!(peers[&pid(4)].connected, "the new peer is recorded");
+        // Connected entries are never evicted, and a connected peer is never refused: at the
+        // bound with every entry connected the map grows, as the swarm's cap is what holds it.
+        let mut peers: HashMap<PeerId, Peer> = [(pid(1), entry(true)), (pid(2), entry(true)), (pid(3), entry(true))].into_iter().collect();
+        connect_peer(&mut peers, pid(4), CAP);
+        assert_eq!(peers.len(), 4);
+        assert!(peers.values().all(|p| p.connected));
+        // Under the bound nothing is evicted, whatever its state.
+        let mut peers: HashMap<PeerId, Peer> = [(pid(1), entry(false))].into_iter().collect();
+        connect_peer(&mut peers, pid(2), CAP);
+        assert_eq!(peers.len(), 2);
+        // A known peer reconnecting is an update, not growth.
+        connect_peer(&mut peers, pid(1), CAP);
+        assert_eq!(peers.len(), 2);
+        assert!(peers[&pid(1)].connected);
     }
 
     #[test]

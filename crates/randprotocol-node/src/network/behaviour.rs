@@ -2,11 +2,17 @@ use super::codec::Codec;
 use super::wire::{SyncRequest, SyncResponse};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{gossipsub, identify, kad, mdns, ping, request_response};
+use libp2p::{connection_limits, gossipsub, identify, kad, mdns, ping, request_response};
+use std::convert::Infallible;
 
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "RandEvent")]
 pub struct RandBehaviour {
+    /// First, so its verdict is the first thing an inbound connection meets: over the caps in
+    /// [`super::WireLimits`] the handshake is refused before any other behaviour holds state for
+    /// the peer (deep scan 2026-09-24 — without it a swarm accepted every fresh identity thrown at
+    /// it). It emits nothing.
+    pub limits: connection_limits::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub identify: identify::Behaviour,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
@@ -28,6 +34,13 @@ pub enum RandEvent {
     Ping(ping::Event),
 }
 
+/// `connection_limits::Behaviour`'s `ToSwarm` is uninhabited: this arm exists for the derive and
+/// can never run.
+impl From<Infallible> for RandEvent {
+    fn from(e: Infallible) -> Self {
+        match e {}
+    }
+}
 impl From<gossipsub::Event> for RandEvent {
     fn from(e: gossipsub::Event) -> Self {
         RandEvent::Gossipsub(e)
