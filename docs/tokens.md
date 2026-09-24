@@ -347,3 +347,32 @@ an aggregating chain the proposer keeps the floor as before and the proving-shar
 `fee − registration_fee − BUNDLE_BASE`. A `ListBacking` registers no token and is unaffected, and
 the floor a registration must pay (§3) is unchanged: the gate decides where the fee goes, not how
 much it is.
+
+## 16. The note-value bound (deep scan 2026-09-24, ledger arithmetic)
+
+The hidden-asset guest range-checks every input, output, fee and burn amount to **u63**
+(`emit_range_check_u63`), so a note worth 2^63 or more can be committed to the tree but never
+spent — and until this bound nothing at the ledger stopped one being created: a `TokenMint` or a
+registration's initial mint took any `u64`, and a bridge deposit only had to fit one. Such a note's
+value would sit in the token's `total_supply` (and, for a bridged token, a backing's `locked`) for
+ever; for zUSD that is a `total_supply == Σ locked` no burn could ever close. A genesis may bound it:
+
+```json
+"tokens": { "registration_fee": 1000000000, "mint_cap_per_day": 10000000000000, "bound_note_value": true }
+```
+
+`bound_note_value` is optional and **absent on chain 14**, where the ledger behaves byte-for-byte
+as before; `false` is the same rule spelled out and commits nothing either. When `true` it is
+committed to the genesis hash (`b"bound_note_value"` ‖ `1`, tagged, only then), carried on the
+registry's extension (so in the token root, `rand-token-registry-3`, and the `tokens_v2` store),
+and makes three validity rules: a `TokenMint`, an initial mint or a `BridgeAttest` deposit of
+`MAX_NOTE_VALUE` (2^63) or more is refused — `Token(AmountTooLarge)`, or the bridge's own
+`AmountTooLarge` for a deposit, the verdict an amount past `u64` already got — and one that fits
+a note but would take the token's `total_supply` to 2^63 or past it is refused
+`Token(SupplyTooLarge)`, so the sum of an asset's notes always stays inside the guest's domain
+(exactly 2^63 − 1 is admitted). The faucet's `Mint` was already bounded (`FAUCET_MAX_UNITS`, 100
+RAND). Independently of the gate, every node refuses the same bytes at admission on every chain —
+a byte verdict, cached like a bad proof (`admission::oversized_note`; a faucet mint gets
+`TxError::AmountTooLarge` there) — so on chain 14 such a transaction is never pooled or forwarded
+by a node carrying the screen, while a block carrying one would still be valid until the next cut switches the
+rule on.

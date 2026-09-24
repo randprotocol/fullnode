@@ -244,7 +244,10 @@ pub enum BridgeError {
     /// A note's amount is a `u64`; the wire format's is a u256. A transfer
     /// the bridge could carry but the pool could not hold is refused rather
     /// than truncated into a note.
-    #[error("amount does not fit in u64")]
+    /// The transfer's amount fits no note: past `u64`, or — under `tokens.bound_note_value` —
+    /// at or above `MAX_NOTE_VALUE` (2^63), which the hidden-asset guest could never spend. A
+    /// verdict on the wire bytes alone.
+    #[error("amount does not fit in a note (u64, and below 2^63 under the note-value bound)")]
     AmountTooLarge,
     #[error("amount is zero")]
     ZeroAmount,
@@ -662,6 +665,13 @@ impl BridgeState {
                 // A note holds a `u64`. Checked after the amount relations
                 // above so a malformed transfer is still reported as malformed.
                 let amount = u64::try_from(amount).map_err(|_| BridgeError::AmountTooLarge)?;
+                // And under `tokens.bound_note_value` a note holds less than 2^63 — the
+                // hidden-asset guest's u63 range check — so a deposit at or above it is the same
+                // refusal: a note that fits no proof (deep scan 2026-09-24). The registry's
+                // `check_lock` below holds the token's *supply* to the bound as well.
+                if tokens.bounds_note_value() && amount >= crate::notes::MAX_NOTE_VALUE {
+                    return Err(BridgeError::AmountTooLarge);
+                }
                 let relayer_fee = fee as u64; // fee <= amount, which fits
                 // The one registry: a bridged token is listed there before it
                 // can be deposited, and its index is what a note carries. An
@@ -1713,6 +1723,41 @@ mod tests {
 
     /// Symmetry with `check_burn`: a zero-value mint would consume a digest
     /// and move nothing.
+    /// Deep scan 2026-09-24 (ledger arithmetic): a deposit of 2^63 fits a `u64` and was admitted,
+    /// creating a note the guest's u63 range check can never spend — `locked` and `total_supply`
+    /// up by it for ever, `total_supply == Σ locked` unclosable by any burn. Under
+    /// `tokens.bound_note_value` it is `AmountTooLarge`, like an amount past `u64`; one below
+    /// the bound is admitted, and a second deposit that would take the supply to 2^63 is the
+    /// registry's `SupplyTooLarge`. Without the flag (chain 14) the same bytes are admitted.
+    #[test]
+    fn a_deposit_at_or_above_the_note_bound_is_refused_only_under_the_gate() {
+        use crate::notes::MAX_NOTE_VALUE;
+        let (config, secrets) = cfg();
+        let st = BridgeState::from_config(&config);
+        let huge = attest(&secrets, 0, transfer_body(2, MAX_NOTE_VALUE as u128, 0, CHAIN_RAND));
+
+        let mut plain = tokens();
+        list(&mut plain, 2, TOKEN);
+        assert!(check(&st, &plain, &huge, 0).is_ok(), "chain 14 admits a deposit of 2^63");
+
+        let mut gated = tokens().with_bound_note_value(true);
+        list(&mut gated, 2, TOKEN);
+        assert_eq!(check(&st, &gated, &huge, 0).unwrap_err(), BridgeError::AmountTooLarge);
+        let fits = attest(&secrets, 0, transfer_body(2, (MAX_NOTE_VALUE - 1) as u128, 0, CHAIN_RAND));
+        let checked = check(&st, &gated, &fits, 0).expect("one below the bound is admitted");
+        let AttestPlan::Transfer(t) = &checked.plan else { panic!("a transfer") };
+        gated.lock(1, 2, &TOKEN, t.amount, 0).unwrap();
+        assert_eq!(gated.get(1).unwrap().total_supply, MAX_NOTE_VALUE - 1);
+        let mut body = transfer_body(2, 1, 0, CHAIN_RAND);
+        body.sequence = 1;
+        let one_more = attest(&secrets, 0, body);
+        assert_eq!(
+            check(&st, &gated, &one_more, 0).unwrap_err(),
+            BridgeError::Token(TokenError::SupplyTooLarge { supply: MAX_NOTE_VALUE - 1, amount: 1 }),
+            "the supply is full to the bound"
+        );
+    }
+
     #[test]
     fn zero_amount_transfer_is_rejected() {
         let (c, s) = cfg();

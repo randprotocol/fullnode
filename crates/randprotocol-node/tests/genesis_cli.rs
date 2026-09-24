@@ -57,7 +57,7 @@ fn the_genesis_command_pins_the_hidden_asset_guest() {
 #[test]
 fn the_genesis_command_round_trips_a_tokens_section() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = TokensConfig { registration_fee: 1_000_000_000, tokens: Vec::new(), mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None };
+    let cfg = TokensConfig { registration_fee: 1_000_000_000, tokens: Vec::new(), mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None };
     let cfg_path = dir.path().join("tokens.json");
     std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
 

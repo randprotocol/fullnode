@@ -13,6 +13,15 @@ pub const MAX_ENVELOPE_BYTES: usize = 2048;
 /// ML-KEM-768 encapsulation key length (FIPS 203).
 pub const KEM_EK_BYTES: usize = 1184;
 pub const ADDRESS_PREFIX: &str = "rand1";
+/// The exclusive bound on a note's value: the hidden-asset guest range-checks every input, output,
+/// fee and burn amount to **u63** (`emit_range_check_u63`, `randprotocol-zkvm`'s `asm.rs`, applied
+/// to all eleven amounts in `guests.rs`'s bundle), so a note worth `MAX_NOTE_VALUE` or more can be
+/// committed to the tree but never spent — its value would be counted in a token's `total_supply`
+/// (or a backing's `locked`) for ever. Under `tokens.bound_note_value` the ledger refuses to create
+/// one, and holds every token's supply below it too, so the sum of an asset's notes is always
+/// representable in the guest's domain; the node refuses the same bytes at admission on every
+/// chain (`admission::oversized_note`). `1 << 63`, so `value < MAX_NOTE_VALUE` is the rule.
+pub const MAX_NOTE_VALUE: u64 = 1 << 63;
 
 /// The 32 little-endian bytes of a word octet.
 pub fn word8_to_bytes(w: &Word8) -> [u8; 32] {

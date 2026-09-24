@@ -28,7 +28,7 @@ use crate::bridge::AssetId;
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{merkle_root, Hash, PublicKey};
 use crate::gas;
-use crate::notes::{ShieldedAddress, Word8, KEM_EK_BYTES};
+use crate::notes::{ShieldedAddress, Word8, KEM_EK_BYTES, MAX_NOTE_VALUE};
 use crate::program::ProgramId;
 use crate::types::actions::{set_authority_message, token_mint_message, InitialMint};
 use crate::types::{Action, Transaction};
@@ -235,6 +235,13 @@ pub struct RegistryExt {
     /// layout: a `tokens_v2` blob written before this field existed no longer decodes, which no
     /// chain has — chain 14's store never writes the key at all.
     pub burn_registration_fee: bool,
+    /// Deep scan 2026-09-24 (ledger arithmetic): the genesis `tokens.bound_note_value` — `true`
+    /// exactly when the ledger refuses to create a note worth [`MAX_NOTE_VALUE`] or more, or to
+    /// let a token's `total_supply` reach it ([`TokenError::AmountTooLarge`],
+    /// [`TokenError::SupplyTooLarge`], and [`crate::bridge::BridgeError::AmountTooLarge`] for a
+    /// deposit). `false` is chain 14's rule, where a `TokenMint`, an initial mint or a deposit of
+    /// any `u64` is admissible and one at or above 2^63 is a note no bundle proof can spend.
+    pub bound_note_value: bool,
 }
 
 /// Bridge rules v2 (audit v4): the rolling-window mint accounting — one window per backing and
@@ -433,6 +440,16 @@ pub enum TokenError {
     /// the window rolls on.
     #[error("global mint cap {cap} per window: {minted} minted inside it, {amount} more would pass it")]
     GlobalMintCapExceeded { cap: u64, minted: u64, amount: u64 },
+    /// Under `tokens.bound_note_value`: a mint or deposit that would create one note worth
+    /// [`MAX_NOTE_VALUE`] or more — a note the hidden-asset guest's u63 range check refuses to
+    /// spend for ever. A verdict on the amount alone (a byte verdict under the gate).
+    #[error("a note of {amount} is at or above 2^63, which no bundle proof can spend")]
+    AmountTooLarge { amount: u64 },
+    /// Under `tokens.bound_note_value`: a mint or deposit whose `amount` fits a note but would
+    /// take the token's `total_supply` to [`MAX_NOTE_VALUE`] or past it, so the sum of the
+    /// asset's notes would leave the guest's domain. State, not bytes: a burn can make room.
+    #[error("a mint of {amount} on a supply of {supply} would put the token's supply at or above 2^63")]
+    SupplyTooLarge { supply: u64, amount: u64 },
 }
 
 impl TokenRegistry {
@@ -483,6 +500,40 @@ impl TokenRegistry {
     /// of paying it to the proposer. `false` without the genesis flag (chain 14).
     pub fn burns_registration_fee(&self) -> bool {
         self.ext.burn_registration_fee
+    }
+
+    /// This registry with the note-value bound on — what genesis builds from
+    /// `tokens.bound_note_value: true`: no mint or deposit may create a note worth
+    /// [`MAX_NOTE_VALUE`] or more, and no token's supply may reach it.
+    pub fn with_bound_note_value(mut self, bound: bool) -> TokenRegistry {
+        self.ext.bound_note_value = bound;
+        self
+    }
+
+    /// Whether the note-value bound is on (see [`Self::with_bound_note_value`]). `false` without
+    /// the genesis flag (chain 14).
+    pub fn bounds_note_value(&self) -> bool {
+        self.ext.bound_note_value
+    }
+
+    /// What crediting `amount` to a token whose supply is `supply` would leave, or why it is
+    /// refused: a sum past `u64` is [`TokenError::SupplyOverflow`] on every chain; under the
+    /// note-value bound an `amount` at or above [`MAX_NOTE_VALUE`] is
+    /// [`TokenError::AmountTooLarge`] (a note the guest could never spend) and a sum that reaches
+    /// it is [`TokenError::SupplyTooLarge`] (the asset's notes would no longer sum inside the
+    /// guest's u63 domain). The one place the rule lives: `check_lock` (a deposit), a
+    /// `TokenMint` and a registration's initial mint all decide through it.
+    pub fn check_note_bound(&self, supply: u64, amount: u64) -> Result<u64, TokenError> {
+        let next = supply.checked_add(amount).ok_or(TokenError::SupplyOverflow)?;
+        if self.ext.bound_note_value {
+            if amount >= MAX_NOTE_VALUE {
+                return Err(TokenError::AmountTooLarge { amount });
+            }
+            if next >= MAX_NOTE_VALUE {
+                return Err(TokenError::SupplyTooLarge { supply, amount });
+            }
+        }
+        Ok(next)
     }
 
     /// The rolling windows (bridge rules v2), `None` on a chain without the section.
@@ -772,7 +823,10 @@ impl TokenRegistry {
         // the two answers whenever both are true.
         let backing = self.backing(index, chain, token).ok_or(TokenError::NotABacking { index, chain })?;
         backing.locked.checked_add(amount).ok_or(TokenError::SupplyOverflow)?;
-        info.total_supply.checked_add(amount).ok_or(TokenError::SupplyOverflow)?;
+        // The supply's own overflow and, under `tokens.bound_note_value`, the note bound: a
+        // deposit no bundle proof could ever spend, or one that would take the token's supply
+        // past what the guest can sum.
+        self.check_note_bound(info.total_supply, amount)?;
         // B1, after the arithmetic that could not hold the deposit at all: the counter plus this
         // deposit against the cap. A sum past `u64::MAX` is past any cap too.
         let minted_today = match &self.ext.windows {
@@ -1253,6 +1307,9 @@ pub(super) fn validate(
                 if m.amount == 0 {
                     return Err(TokenError::ZeroAmount.into());
                 }
+                // And under `tokens.bound_note_value` the initial note is held to the same bound
+                // a mint is, on the supply a fresh token starts from: zero.
+                registry.check_note_bound(0, m.amount)?;
                 // A recipient nobody can seal a note to is not an address — the payout rule of
                 // `staking::check_bond` and `aggregation::check_register`, here for the note this
                 // registration is about to append.
@@ -1310,8 +1367,9 @@ pub(super) fn validate(
             let (info, pk) = key_authority(registry, *asset, *nonce)?;
             ledger.check_time(*time)?;
             // A checked add, decided here so `apply`'s `add_supply` cannot fail: a supply that
-            // wrapped would stop counting what exists.
-            info.total_supply.checked_add(*amount).ok_or(TokenError::SupplyOverflow)?;
+            // wrapped would stop counting what exists — and, under `tokens.bound_note_value`, a
+            // note at or above 2^63 (unspendable by construction) or a supply that would reach it.
+            registry.check_note_bound(info.total_supply, *amount)?;
             let cm = mint_commitment(recipient, *amount, *asset, *time, r, executor);
             check_new_note(ledger, tx, &cm)?;
             // Last, and the most expensive check in this module by a wide margin. The message
@@ -2896,6 +2954,58 @@ mod action_tests {
             l.validate(&under_base, &StubExecutor),
             Err(TxError::FeeTooLow { min: gas::BUNDLE_BASE, fee: gas::BUNDLE_BASE - 1 })
         );
+    }
+
+    /// Deep scan 2026-09-24 (ledger arithmetic): the hidden-asset guest range-checks every note
+    /// value to u63, so a note worth 2^63 or more can never be spent, and nothing bounded what
+    /// the ledger itself would mint. Under `tokens.bound_note_value` a `TokenMint` or an initial
+    /// mint of `MAX_NOTE_VALUE` is refused `AmountTooLarge`, and one that fits a note but would
+    /// take the token's supply to 2^63 is refused `SupplyTooLarge` — exactly one below is
+    /// accepted. Without the flag (chain 14) both are accepted as today: the same bytes, the
+    /// same `Ok`, and a supply the guest could never spend down.
+    #[test]
+    fn a_mint_at_or_above_the_note_bound_is_refused_only_under_the_gate() {
+        let p = proposer().address();
+        assert_eq!(MAX_NOTE_VALUE, 1 << 63);
+
+        // Chain 14's rule: a mint of 2^63 on a supply of 1 000 is admitted, and the supply says so.
+        let mut plain = ledger();
+        let asset = register_keyed(&mut plain, 10);
+        let huge = mint_tx(&plain, asset, MAX_NOTE_VALUE, 0, 20);
+        plain.apply_tx(&huge, &p, &StubExecutor).expect("chain 14 admits any u64 mint");
+        assert_eq!(plain.tokens().unwrap().get(asset).unwrap().total_supply, 1_000 + MAX_NOTE_VALUE);
+        let initial_huge = register_tx(&plain, MintAuthority::None, Some(initial(&plain, MAX_NOTE_VALUE)), 30);
+        assert_eq!(plain.validate(&initial_huge, &StubExecutor), Ok(()), "and so is an initial mint of 2^63");
+
+        // Under the gate: the amount alone is refused, and so is a sum that reaches 2^63.
+        let mut gated = ledger();
+        gated.set_tokens(Some(TokenRegistry::new(REG_FEE).with_bound_note_value(true)));
+        assert!(gated.tokens().unwrap().bounds_note_value());
+        assert_ne!(gated.tokens().unwrap().root(), plain.tokens().unwrap().root(), "the flag is in the token root");
+        let asset = register_keyed(&mut gated, 10);
+        assert_eq!(gated.tokens().unwrap().get(asset).unwrap().total_supply, 1_000);
+        let huge = mint_tx(&gated, asset, MAX_NOTE_VALUE, 0, 20);
+        assert_eq!(gated.validate(&huge, &StubExecutor), Err(tok(TokenError::AmountTooLarge { amount: MAX_NOTE_VALUE })));
+        let over = mint_tx(&gated, asset, MAX_NOTE_VALUE - 1_000, 0, 20);
+        assert_eq!(
+            gated.validate(&over, &StubExecutor),
+            Err(tok(TokenError::SupplyTooLarge { supply: 1_000, amount: MAX_NOTE_VALUE - 1_000 })),
+            "the supply would reach 2^63 exactly"
+        );
+        let fits = mint_tx(&gated, asset, MAX_NOTE_VALUE - 1_001, 0, 20);
+        gated.apply_tx(&fits, &p, &StubExecutor).expect("one below the bound is admitted");
+        assert_eq!(gated.tokens().unwrap().get(asset).unwrap().total_supply, MAX_NOTE_VALUE - 1);
+        let one_more = mint_tx(&gated, asset, 1, 1, 40);
+        assert_eq!(
+            gated.validate(&one_more, &StubExecutor),
+            Err(tok(TokenError::SupplyTooLarge { supply: MAX_NOTE_VALUE - 1, amount: 1 })),
+            "the supply is full to the bound"
+        );
+        // An initial mint is a note too, on a supply of zero.
+        let initial_huge = register_tx(&gated, MintAuthority::None, Some(initial(&gated, MAX_NOTE_VALUE)), 30);
+        assert_eq!(gated.validate(&initial_huge, &StubExecutor), Err(tok(TokenError::AmountTooLarge { amount: MAX_NOTE_VALUE })));
+        let initial_fits = register_tx(&gated, MintAuthority::None, Some(initial(&gated, MAX_NOTE_VALUE - 1)), 30);
+        assert_eq!(gated.validate(&initial_fits, &StubExecutor), Ok(()));
     }
 
     /// Audit v5 (TOK-2): under `tokens.burn_registration_fee` a registration's `registration_fee`

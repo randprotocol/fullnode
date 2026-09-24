@@ -470,6 +470,7 @@ struct RegistryExtDisk {
     max_tokens: Option<u32>,
     windows: Option<MintWindowsDisk>,
     burn_registration_fee: bool,
+    bound_note_value: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -491,6 +492,7 @@ impl From<&randprotocol_core::ledger::tokens::RegistryExt> for RegistryExtDisk {
                 backings: w.backings.iter().map(|(k, v)| (*k, v.clone())).collect(),
             }),
             burn_registration_fee: e.burn_registration_fee,
+            bound_note_value: e.bound_note_value,
         }
     }
 }
@@ -506,6 +508,7 @@ impl From<RegistryExtDisk> for randprotocol_core::ledger::tokens::RegistryExt {
                 backings: w.backings.into_iter().collect(),
             }),
             burn_registration_fee: d.burn_registration_fee,
+            bound_note_value: d.bound_note_value,
         }
     }
 }
@@ -2669,7 +2672,7 @@ pub(crate) mod fixtures {
                     // `randprotocol-core`'s to test.
                     backings: vec![randprotocol_core::genesis::GenesisBacking { chain: 2, token: TOKEN, decimals: 8 }],
                 }],
-                mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None,
+                mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None,
             }),
             aggregation: None,
             consensus_domain: None,
@@ -3212,6 +3215,14 @@ mod tests {
         let back = s.tokens().unwrap().unwrap();
         assert_eq!(back.ext().max_tokens, Some(7));
         assert!(!back.ext().burn_registration_fee, "an absent field is its default");
+        assert!(!back.ext().bound_note_value, "and so is the note-value bound (deep scan 2026-09-24)");
+        // A flag that is set rides the store: a restarted node that lost it would admit a mint its
+        // peers refuse and fork at the token root.
+        reg.set_ext(RegistryExt { bound_note_value: true, ..RegistryExt::default() });
+        let mut batch = WriteBatch::default();
+        batch.put_cf(s.cf(CF_META), META_TOKENS_V2, serde_json::to_vec(&RegistryExtDisk::from(reg.ext())).unwrap());
+        s.db.write(batch).unwrap();
+        assert!(s.tokens().unwrap().unwrap().bounds_note_value(), "the note-value bound rides the store");
         // And a v0.5.4 positional blob is still understood.
         let old = RegistryExt { max_tokens: Some(9), ..RegistryExt::default() };
         let mut batch = WriteBatch::default();
