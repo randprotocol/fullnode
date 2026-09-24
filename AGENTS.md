@@ -52,6 +52,10 @@ findings `../security/fullnode-deep-scan-2026-09-24.md` — read it before re-re
   deserialize (`33b048c` reverts it: the four downstream length checks and their tests became
   unreachable). Bridge and consensus-liveness dimensions: no new finding (B3 stays v0.6).
 
+**Released 2026-09-25: tag `v0.5.6` = `a2d4021` (main), GitHub release published with the E-built
+binaries, `rand-node` sha256 `8edb8dbb…`; suite on the laptop: core 437, client 90, executor 17,
+node lib 282 (+21 fixture-gap), cluster 24 (1268 s), submit 2, ws 9, zusd_e2e 2 (2392 s),
+genesis_cli 2; whitepapers `360dbb3` pushed; the fixes PDF in `~/Downloads` regenerated.**
 **Roll: all-stop, all-start** (`deploy/roll-all.sh`, the v0.5.5 procedure) — DS-3 is a validity
 rule and the public RPC admits anyone's submissions, so a mixed fleet is a fork window; the
 independent review's one finding, `docs/deploy.md` "Roll note for v0.5.6". Rollback = re-pin
