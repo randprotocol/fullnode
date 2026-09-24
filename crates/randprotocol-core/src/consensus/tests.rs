@@ -1419,6 +1419,18 @@ fn one_validator_down_keeps_committing() {
 }
 
 #[test]
+fn consecutive_views_do_not_wrap_at_the_top_of_u64() {
+    // Deep scan 2026-09-24: the live commit rule compared with `saturating_add`, so
+    // (MAX-1, MAX, MAX) — two certificates for the same view — read as three consecutive views;
+    // `commit_rule::committed_prefix` (the sync path) already uses `checked_add`.
+    use super::hotstuff::consecutive_views;
+    assert!(consecutive_views(5, 6, 7));
+    assert!(!consecutive_views(5, 6, 8));
+    assert!(!consecutive_views(u64::MAX - 1, u64::MAX, u64::MAX));
+    assert!(!consecutive_views(u64::MAX, u64::MAX, u64::MAX));
+}
+
+#[test]
 fn speculative_tree_is_capped() {
     let (mut cfg, gs, key) = one_node_parts();
     // Cap at genesis + two speculative blocks.

@@ -26,6 +26,14 @@ const MAX_PROPOSED_KEYS: usize = 4096;
 /// Cap on cached epoch-set derivations. Every key is a block in the tree, so this only bites if
 /// the tree cap is raised far past it.
 const MAX_DERIVED_SETS: usize = 1024;
+
+/// Three certificate views are consecutive — the three-chain's commit condition — only when
+/// each is exactly one more than the last; the same arithmetic as `commit_rule` (checked, so
+/// the top of `u64` never reads as consecutive). Saturating here is what the deep scan
+/// (2026-09-24) found; the sync path was already exact.
+pub(super) fn consecutive_views(a: u64, b: u64, c: u64) -> bool {
+    a.checked_add(1) == Some(b) && b.checked_add(1) == Some(c)
+}
 /// How many epochs back a replica keeps validator sets for. Blocks below the committed head are
 /// refused as stale, so nothing consensus verifies reaches further back than the committed
 /// height's own epoch; the node keeps the durable copy for replay and sync.
@@ -1191,7 +1199,7 @@ impl HotStuff {
         let qc_b = b1_justify.view;
         let qc_b1 = b2_justify.view;
         let qc_b2 = b_star.header.justify.view;
-        if qc_b1 != qc_b.saturating_add(1) || qc_b2 != qc_b1.saturating_add(1) {
+        if !consecutive_views(qc_b, qc_b1, qc_b2) {
             return;
         }
         let target_height = b.block.height();
