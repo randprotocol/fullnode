@@ -1235,9 +1235,23 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
-### 2026-09-24 — connection caps, and a `Status` from a stranger is not remembered
+### 2026-09-25 — v0.5.6, the deep-scan release
 
-Node-only, no method or wire change (deep scan 2026-09-24). The swarm now refuses inbound
+Node-only; no wire or genesis change on chain 14 (`../security/fullnode-deep-scan-2026-09-24.md`).
+
+- **A call proof's header is pinned before any verifier key is built** (DS-3). `Call` proofs
+  above tier 14 (`MAX_CALL_TIER`), with a keccak table above 2^12 or a sha256 table above 2^13,
+  with a `program_log_height` other than the deployed program's, or an `input_log_height` above
+  the tier's bound are refused `invalid proof` with the reason in the message
+  (`CallTierTooHigh { tier, max }` names the cap) — a permanent verdict, cached like any bad
+  proof. Every call committed on chain 14 is tier 10; a tier-16 call (chain 13's ERC-20
+  `approve`) is no longer admissible anywhere (`docs/confidential.md`, the call validity rules).
+- **A mint or deposit at or above 2^63 is refused at admission on every chain** (DS-6):
+  `TokenMint`, a `RegisterToken` initial mint and a `BridgeAttest` with such an `amount` answer
+  `Token(AmountTooLarge)` / `Bridge(AmountTooLarge)` / `AmountTooLarge` before any proof is
+  read, permanently. `rand_getTokens` serves `bound_note_value` (`false` on chain 14) beside
+  `max_tokens` and `burn_registration_fee`.
+- **Connection caps, and a `Status` from a stranger is not remembered** (DS-2, DS-5). The swarm now refuses inbound
 connections past 256 established, 64 in handshake and 2 per remote peer (`docs/deploy.md`,
 "Topology rules"). A gossiped `Status` is recorded only against a peer this node holds an entry
 for — one it is, or was, connected to — and is metered per forwarding peer (16 back to back,

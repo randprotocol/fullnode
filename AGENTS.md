@@ -4,7 +4,59 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-24, evening)
+## Project memory (state as of 2026-09-25)
+
+### v0.5.6 — the deep security-and-math scan (2026-09-25)
+
+The scan the user ordered after the audit fixes ("issue another scan for deep security and math
+issues and fix them too"): nine reviewer dimensions, every candidate re-traced by an adversarial
+verifier with a reproduction (design `docs/superpowers/specs/2026-09-24-deep-scan-design.md`,
+findings `../security/fullnode-deep-scan-2026-09-24.md` — read it before re-reporting). Branch
+`feat/deep-scan`, every fix red-first with the red quoted in its commit. Node-only, same chain.
+**What it is (DS-1 … DS-9):**
+
+- **DS-1 (critical)** `6f4e50e`: a sealed-form side table's pruned record is length-checked
+  before any block applies (`BlockError::MalformedPrunedRecord`, `PrunedBundle::
+  public_values_array`); the digest check reads with `get` → `BadDigest`; `apply_synced` never
+  unwraps a peer's list. Was a panic on a 33-word record (unreachable on chain 14: no
+  aggregation section).
+- **DS-2 (critical)** `a76bc8f`: `connection_limits` on the swarm — 256 established inbound,
+  64 pending, 2 per peer (`WireLimits`, inbound only); `Node::peers` held to the same bound for
+  disconnected entries. **DS-5** `8fa0a75`: a gossiped `Status` updates only an existing entry
+  and is metered per forwarder (a never-connected author bypassed DS-2 through `or_default`).
+- **DS-3 (high)** `1588be9`: `ZkExecutor::verify_call` pins a call proof's header before
+  `Machine::verify` builds a key — `MAX_CALL_TIER` 14 (a tier-20 header measured 216 s / 6.5 GB,
+  an OOM kill of a 2–4 GB validator), keccak ≤ 2^12 and sha256 ≤ 2^13 (the hash tables'
+  preprocessed columns dominate: both at the tier's honest bound = 209 s / 10 GB), program
+  height = the deployed record's, input height ≤ the tier's. `warm` and the cap share one list;
+  worst admissible header 4.7 s / 312 MB. **A validity rule at apply too** — every chain-14 call
+  is tier 10, chain 13's tier-16 ERC-20 `approve` would now be refused. Residual: the vendored
+  64-entry key cache retains every key it builds (~60 MB each at the cap) — upstream.
+- **DS-4 (medium)** `65f7361`: the equivocation record (`proposed`) outlives the tree's eviction
+  and a dead branch's pruning, bounded by `MAX_PROPOSED_KEYS` 4096 (oldest views first) — 600
+  siblings evicted the first ~90 and re-opened their views to a second block.
+- **DS-6 (medium)** `5a5a026` + `61eb5f8`: `notes::MAX_NOTE_VALUE = 2^63` — the guest's u63
+  range check made a larger mint or deposit unspendable for ever while counted in the supply.
+  Admission refuses it on every chain (`admission::oversized_note`, permanent); under the genesis
+  flag `tokens.bound_note_value` it is a validity rule on `TokenMint`, the initial mint, a
+  deposit and the running supply (`AmountTooLarge`/`SupplyTooLarge`; `RegistryExtDisk` carries
+  the flag; `rand_getTokens` serves it, `b4dcde7`). The saturation audit found no site that
+  creates or destroys value.
+- **DS-7 (low)** `59e43a9`: one `consecutive_views` helper (checked arithmetic) for the live
+  commit rule and the sync path. **DS-8** `a18f9f1`: "more than a third" → quorum in three
+  comments, a log line and deploy.md. **DS-9 (ops)** `944163a` + live: `deploy/fleet-watch.sh`
+  + LaunchAgent (5 min), `update-droplet.sh WANT_SHA`, F's Caddy attribution, the web droplet's
+  backup plist path.
+- **Rejected, recorded:** a justify-certifies-parent check in `execute_and_insert` (the proposer
+  signature covers the justify; the test could not go red) and key/signature length at
+  deserialize (`33b048c` reverts it: the four downstream length checks and their tests became
+  unreachable). Bridge and consensus-liveness dimensions: no new finding (B3 stays v0.6).
+
+**Roll:** one at a time (the chain is live), `docs/deploy.md` "Roll note for v0.5.6" — submit no
+call proofs while the fleet is mixed. Rollback = re-pin `0154fe2`. **Open for the operator:**
+guardian keys in the shell profile (BRG-14), the 48 GB resize vs D19, the TronGrid key, node A
+on a laptop, all 18 validator keys one party's. The whitepaper's fifth reconciliation pass
+(`rem:bridgeimpl`, the table, a taint proposition) lands in `../whitepapers`.
 
 ### v0.5.5 — the audit-v5 fixes and the chain-14 recovery (2026-09-24)
 
