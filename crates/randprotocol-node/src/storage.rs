@@ -2445,7 +2445,7 @@ pub(crate) mod fixtures {
                     // `randprotocol-core`'s to test.
                     backings: vec![randprotocol_core::genesis::GenesisBacking { chain: 2, token: TOKEN, decimals: 8 }],
                 }],
-                mint_cap_per_day: 100_000 * 100_000_000,
+                mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None,
             }),
             aggregation: None,
             consensus_domain: None,

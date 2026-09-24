@@ -2117,16 +2117,17 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             };
             let day = head_mint_day(&st.storage)?;
             let cap = tokens.mint_cap_per_day();
-            let rows: Vec<Value> = tokens
-                .iter()
-                .filter(|t| u64::from(t.index) >= from)
-                .take(limit)
+            // By range from `from`, never a scan of the rows below it (audit v4 TOK-1).
+            let rows: Vec<Value> = randprotocol_core::ledger::tokens::page_tokens(&tokens, from, limit)
+                .into_iter()
                 .map(|info| token_json(info, cap, day))
                 .collect();
             Ok(json!({
                 "enabled": true,
                 "registration_fee": tokens.registration_fee.to_string(),
                 "next_index": tokens.next_index(),
+                // TOK-1: the genesis cap on the registry, `null` without one (chain 14).
+                "max_tokens": tokens.ext().max_tokens,
                 "tokens": rows,
             }))
         }
@@ -4320,6 +4321,7 @@ mod tests {
         assert_eq!(v["enabled"], true);
         assert_eq!(v["registration_fee"], json!(tokens.registration_fee.to_string()));
         assert_eq!(v["next_index"], 3);
+        assert_eq!(v["max_tokens"], Value::Null, "TOK-1: no cap on a chain-14-shaped genesis");
         let rows = v["tokens"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1], native_row(&st));
@@ -4350,6 +4352,21 @@ mod tests {
         // No parameters is the first page; an oversized limit is clamped, not refused.
         assert_eq!(ok(&st, "rand_getTokens", json!([])).await["tokens"].as_array().unwrap().len(), 2);
         assert_eq!(ok(&st, "rand_getTokens", json!([0, 1_000_000])).await["tokens"].as_array().unwrap().len(), 2);
+    }
+
+    /// Audit v4 (TOK-1): a genesis cap on the registry is served as `max_tokens`, survives the
+    /// store, and the listing pages by range — a page from an index past the last row is empty.
+    #[tokio::test]
+    async fn the_token_listing_serves_the_genesis_cap() {
+        let (mut gs, _) = fixtures::bridged_genesis(1);
+        let capped = gs.ledger.tokens().unwrap().clone().with_max_tokens(3);
+        gs.ledger.set_tokens(Some(capped));
+        let (_d, st) = state_for(&gs);
+        let v = ok(&st, "rand_getTokens", json!([])).await;
+        assert_eq!(v["max_tokens"], 3);
+        assert_eq!(v["tokens"].as_array().unwrap().len(), 1);
+        assert_eq!(ok(&st, "rand_getTokens", json!([2, 10])).await["tokens"], json!([]));
+        assert_eq!(st.storage.tokens().unwrap().unwrap().max_tokens(), 3, "the cap rides the store");
     }
 
     /// One token by index, by 64 hex (any case, `0x` or not) or by its `rpl1…` text form; the

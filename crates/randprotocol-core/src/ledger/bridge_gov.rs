@@ -590,6 +590,28 @@ mod tests {
         assert_eq!(err(&plain, &paid(&plain, 50, gas::BUNDLE_BASE, list(1, 1, coins[1]))), TxError::Bridge(BridgeError::Disabled));
     }
 
+    /// Audit v4 (TOK-1): a `RegisterBridgedToken` at a registry that holds `max_tokens` tokens is
+    /// refused `RegistryFull` before its quorum is verified; a `ListBacking` adds no token and is
+    /// still admitted at the cap.
+    #[test]
+    fn a_bridged_registration_at_max_tokens_is_refused_registry_full() {
+        let mut l = ledger();
+        l.set_tokens(Some(l.tokens().unwrap().clone().with_max_tokens(1)));
+        let p = proposer().address();
+        let coins = coins();
+        let full = gas::BUNDLE_BASE + FEE;
+        l.apply_tx(&paid(&l, 10, full, register(0, coins[0], salt())), &p, &StubExecutor).unwrap();
+        assert!(l.tokens().unwrap().is_full());
+        let mut garbage = register(1, coins[1], [2; 32]);
+        let Action::RegisterBridgedToken { pq_signatures, .. } = &mut garbage else { panic!() };
+        for s in pq_signatures.iter_mut() {
+            s.signature = vec![0x5a; crate::bridge::PQ_SIGNATURE_LEN];
+        }
+        assert_eq!(l.validate(&paid(&l, 20, full, garbage), &StubExecutor), Err(token(TokenError::RegistryFull)));
+        l.apply_tx(&paid(&l, 30, gas::BUNDLE_BASE, list(1, 1, coins[1])), &p, &StubExecutor).unwrap();
+        assert_eq!(l.bridge().unwrap().list_nonce, 2);
+    }
+
     // ---- audit v4, bridge rules v2: rotation, the gate, no listing while paused -----------------
 
     /// [`ledger`] with `rules_v2` on: the bridge carries the section and the registry its windows.

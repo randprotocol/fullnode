@@ -298,3 +298,27 @@ instead of a signed mint. `docs/bridge.md` §§13–20 covers the bridge-specifi
 many backings (zUSD's seven), the `total_supply == Σ locked` invariant, the release-unit rule, the
 per-backing daily mint cap and pause, the post-quantum co-signature every mint needs, and listing a
 new bridged token or backing after genesis under a PQ guardian quorum.
+
+## 14. The registry cap (v0.5.4, audit v4 TOK-1)
+
+The registry root is a merkle root over every token's leaf, recomputed at every state root, and
+`rand_getTokens` used to walk the whole registry to serve a page. Both are O(tokens), and nothing
+bounded the count but the registration fee. A genesis may now say how many tokens the chain will
+ever hold:
+
+```json
+"tokens": { "registration_fee": 1000000000, "mint_cap_per_day": 10000000000000, "max_tokens": 4096 }
+```
+
+`max_tokens` is optional and **absent on chain 14**, where the bound stays `u32::MAX` and nothing
+about the genesis hash, the token root or the stored registry changes. When present it is
+committed to the genesis hash (`b"max_tokens"` ‖ value, tagged, only then), folded into the token
+root (the registry then hashes under `rand-token-registry-3`, with the cap in its extension), and
+held to at least one and at least the number of tokens the section lists. At the cap a
+`RegisterToken` and a `RegisterBridgedToken` are refused `RegistryFull` — the same verdict the
+last index has always given — after the identity check and before any index is spent; a
+`ListBacking` adds no token and is unaffected. `rand_getTokens` serves the cap as `max_tokens`
+(`null` without one) and pages **by range** (`BTreeMap::range(from..)`), so a page from a high
+index no longer reads the rows below it. The O(tokens) root stays: under a cap of a few thousand
+it is bounded work per block, and an incremental root would move the token root domain for every
+chain — deferred to the cut that needs it.

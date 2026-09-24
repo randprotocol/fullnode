@@ -186,7 +186,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
                     decimals: 8,
                 }],
             }],
-            mint_cap_per_day: 100_000 * 100_000_000,
+            mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None,
         }),
         bridge,
         aggregation: None,

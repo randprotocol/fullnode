@@ -543,6 +543,12 @@ impl TokenRegistry {
         self.by_index.values()
     }
 
+    /// Every registered token at index `from` and above, ascending — `BTreeMap::range`, so a
+    /// page from a high index never walks the rows below it (audit v4 TOK-1).
+    pub fn range_from(&self, from: u32) -> impl Iterator<Item = &TokenInfo> {
+        self.by_index.range(from..).map(|(_, info)| info)
+    }
+
     pub fn len(&self) -> usize {
         self.by_index.len()
     }
@@ -951,6 +957,16 @@ impl TokenRegistry {
             return Hash::digest_domain(b"rand-token-registry-3", &buf);
         }
         Hash::digest_domain(b"rand-token-registry-2", &buf)
+    }
+}
+
+/// One page of the registry for `rand_getTokens` (audit v4 TOK-1): at most `limit` tokens at index
+/// `from` and above, ascending, read with [`TokenRegistry::range_from`] — never a scan from the
+/// first row. A `from` past `u32::MAX` is past every index and yields nothing.
+pub fn page_tokens(registry: &TokenRegistry, from: u64, limit: usize) -> Vec<&TokenInfo> {
+    match u32::try_from(from) {
+        Ok(from) => registry.range_from(from).take(limit).collect(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -2224,6 +2240,46 @@ mod tests {
         assert_eq!(r.set_key(keyed, Some(pk)), Err(TokenError::NotKeyAuthority(keyed)), "renouncing is final");
     }
 
+    // ---- audit v4, TOK-1: the cap on the registry and range paging ---------------------------------
+
+    /// A registry with `max_tokens = 2` registers two and refuses the third `RegistryFull` without
+    /// spending an index; without a cap the bound is `u32::MAX` as before; the cap is in the root.
+    #[test]
+    fn a_registry_at_max_tokens_refuses_the_next_registration() {
+        let mut r = reg().with_max_tokens(2);
+        assert_eq!(r.max_tokens(), 2);
+        assert!(!r.is_full());
+        r.register(id(1), "A".into(), "A".into(), 6, MintAuthority::None, 1).unwrap();
+        assert!(!r.is_full());
+        r.register(id(2), "B".into(), "B".into(), 6, MintAuthority::None, 2).unwrap();
+        assert!(r.is_full());
+        assert_eq!(r.register(id(3), "C".into(), "C".into(), 6, MintAuthority::None, 3), Err(TokenError::RegistryFull));
+        assert_eq!((r.next_index(), r.len()), (3, 2), "no index was spent on the refusal");
+        assert_eq!(reg().max_tokens(), u32::MAX);
+        assert!(!reg().is_full());
+        assert_ne!(reg().with_max_tokens(2).root(), reg().root(), "the cap is in the root");
+        assert_eq!(r.ext().max_tokens, Some(2));
+    }
+
+    /// `page_tokens` reads `range(from..)` — never the rows below `from` — and returns at most
+    /// `limit` rows ascending; `range_from` is the structural half it is built on.
+    #[test]
+    fn page_tokens_pages_by_range_from_an_index() {
+        let mut r = reg();
+        for i in 1..=10u8 {
+            r.register(id(i), format!("T{i}"), "T".into(), 0, MintAuthority::None, 0).unwrap();
+        }
+        let indices = |rows: Vec<&TokenInfo>| rows.into_iter().map(|t| t.index).collect::<Vec<u32>>();
+        assert_eq!(indices(page_tokens(&r, 5, 3)), vec![5, 6, 7]);
+        assert_eq!(indices(page_tokens(&r, 0, 100)), (1..=10).collect::<Vec<_>>());
+        assert_eq!(indices(page_tokens(&r, 10, 5)), vec![10]);
+        assert_eq!(indices(page_tokens(&r, 11, 5)), Vec::<u32>::new());
+        assert_eq!(indices(page_tokens(&r, u64::from(u32::MAX) + 7, 5)), Vec::<u32>::new(), "past u32 is past every index");
+        assert_eq!(indices(page_tokens(&r, 5, 0)), Vec::<u32>::new());
+        assert_eq!(r.range_from(5).map(|t| t.index).collect::<Vec<_>>(), (5..=10).collect::<Vec<_>>());
+        assert_eq!(r.range_from(0).count(), 10);
+    }
+
     // ---- audit v4, bridge rules v2: the rolling window ------------------------------------------
 
     /// A `MintWindow` is a ring of `⌈window/24⌉`-second slots. A deposit stays counted while the
@@ -2912,6 +2968,27 @@ mod action_tests {
                 assert!(!l.has_commitment(&mint_commitment(&attacker, 1_000, 2, 1, &[7; 8], &StubExecutor)));
             }
         }
+    }
+
+    /// Audit v4 (TOK-1): a `RegisterToken` at a registry that holds `max_tokens` tokens is refused
+    /// `RegistryFull` — after the identity check, before the index compare — and admitted one
+    /// below the cap.
+    #[test]
+    fn a_register_token_at_max_tokens_is_refused_registry_full() {
+        let mut l = ledger();
+        l.set_tokens(Some(TokenRegistry::new(REG_FEE).with_max_tokens(1)));
+        let p = proposer().address();
+        let first = register_tx(&l, MintAuthority::Key(issuer().public_key().clone()), None, 10);
+        l.apply_tx(&first, &p, &StubExecutor).unwrap();
+        assert!(l.tokens().unwrap().is_full());
+        let mut second = register_tx(&l, MintAuthority::Key(issuer().public_key().clone()), None, 20);
+        let Action::RegisterToken { salt, .. } = &mut second.action else { panic!() };
+        *salt = [4; 32];
+        let second = StubExecutor::bound(second);
+        assert_eq!(l.validate(&second, &StubExecutor), Err(tok(TokenError::RegistryFull)));
+        // The same registration is admitted under a cap of two.
+        l.set_tokens(Some(l.tokens().unwrap().clone().with_max_tokens(2)));
+        assert_eq!(l.validate(&second, &StubExecutor), Ok(()));
     }
 
     /// The registry's last index, through the action: `RegistryFull` before the index compare,

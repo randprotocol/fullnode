@@ -164,6 +164,13 @@ pub struct TokensConfig {
     pub mint_cap_per_day: u64,
     #[serde(default)]
     pub tokens: Vec<GenesisToken>,
+    /// Audit v4 (TOK-1): the most tokens the registry may ever hold — `RegisterToken` and
+    /// `RegisterBridgedToken` are refused `RegistryFull` at it. Absent (chain 14) is today's
+    /// `u32::MAX`; when present it is committed under its own tag (`b"max_tokens"` ‖ value, only
+    /// then) and folded into the token root, and must be at least one and at least the number of
+    /// tokens this section lists. The registry root stays O(tokens); the cap is what bounds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 /// The plain-bytes twin of [`TokensConfig`], used for the genesis commitment — exactly what
@@ -194,8 +201,12 @@ impl From<&TokensConfig> for TokensCommit {
     /// Destructured on purpose, like [`BridgeCommit::from`]: a new [`TokensConfig`],
     /// [`GenesisToken`] or [`GenesisBacking`] field must not silently fall out of the genesis
     /// commitment — it has to break this conversion.
+    ///
+    /// `max_tokens` is destructured and deliberately *not* here, for `BridgeCommit`'s reason: an
+    /// `Option` field in bincode would put a byte into chain 14's commitment. `Genesis::build`
+    /// commits it under its own tag, only when present.
     fn from(cfg: &TokensConfig) -> TokensCommit {
-        let TokensConfig { registration_fee, mint_cap_per_day, tokens } = cfg;
+        let TokensConfig { registration_fee, mint_cap_per_day, tokens, max_tokens: _ } = cfg;
         TokensCommit {
             registration_fee: *registration_fee,
             mint_cap_per_day: *mint_cap_per_day,
@@ -624,6 +635,10 @@ impl Genesis {
             if let Some(rules) = self.bridge.as_ref().and_then(|b| b.rules_v2.as_ref()) {
                 registry = registry.with_rules_v2(rules.cap_window_secs, rules.global_mint_cap_per_window);
             }
+            // TOK-1: the cap, after the listing (`check_tokens` held it to the listing's size).
+            if let Some(n) = tconf.max_tokens {
+                registry = registry.with_max_tokens(n);
+            }
             ledger.set_tokens(Some(registry));
         }
         ledger.set_aggregation(self.aggregation.clone());
@@ -728,6 +743,13 @@ impl Genesis {
         // exactly as `BridgeCommit` exists for `BridgeConfig`.
         if let Some(tokens) = &self.tokens {
             commit.extend_from_slice(&bincode::serialize(&TokensCommit::from(tokens)).expect("serializes"));
+            // TOK-1 (audit v4): the registry cap, tagged and appended only when the file sets it,
+            // right after the section it belongs to — not inside `TokensCommit`, for
+            // `BridgeCommit`'s reason.
+            if let Some(n) = tokens.max_tokens {
+                commit.extend_from_slice(b"max_tokens");
+                commit.extend_from_slice(&n.to_be_bytes());
+            }
         }
         // Block aggregation, likewise: appended only when the section is configured, so an
         // aggregation-less chain's genesis hash is byte-for-byte today's.
@@ -975,6 +997,13 @@ fn check_tokens(cfg: &TokensConfig, bridge: Option<&BridgeConfig>) -> Result<(),
     if bridge.is_some() && cfg.mint_cap_per_day == 0 {
         return bad("mint_cap_per_day is zero: a bridged chain could never mint".into());
     }
+    // TOK-1: a cap of zero refuses every registration for ever, and one below the file's own
+    // listing would build a registry that is already over it.
+    if let Some(n) = cfg.max_tokens {
+        if n == 0 || (n as usize) < cfg.tokens.len() {
+            return bad(format!("max_tokens {n} is below the {} tokens the section lists (and must be at least 1)", cfg.tokens.len()));
+        }
+    }
     let Some(bridge) = bridge else {
         return if cfg.tokens.is_empty() {
             Ok(())
@@ -1198,7 +1227,7 @@ mod tests {
                     salt: [1; 32],
                     backings: vec![GenesisBacking { chain: 2, token: [0x11; 32], decimals: BRIDGE_DECIMALS }],
                 }],
-                mint_cap_per_day: 100_000 * 100_000_000,
+                mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None,
             });
             g
         };
@@ -1389,7 +1418,7 @@ mod tests {
 
         let mut bridged = plain.clone();
         bridged.bridge = Some(bridge_cfg());
-        bridged.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        bridged.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None });
         // A chain with a `tokens` section needs openable alloc notes (core I-2); `plain` keeps
         // the opening-less ones the pins above are computed from.
         bridged.alloc = opened_alloc();
@@ -1409,6 +1438,56 @@ mod tests {
         assert_ne!(build(&other_guardians).hash(), sb.hash());
     }
 
+    /// Audit v4 (TOK-1): `tokens.max_tokens` caps how many tokens the registry may hold. Committed
+    /// to the genesis hash as `b"max_tokens"` ‖ value only when present — a chain-14-shaped file
+    /// (no field) hashes and roots exactly as before — held to at least one and at least the number
+    /// of tokens the file lists, and reaches the registry, whose root moves with it.
+    #[test]
+    fn max_tokens_is_committed_only_when_present_and_caps_the_registry() {
+        let token = |salt: u8, coin: u8| GenesisToken {
+            name: "Shielded USD".into(),
+            symbol: "zUSD".into(),
+            salt: [salt; 32],
+            backings: vec![GenesisBacking { chain: 2, token: [coin; 32], decimals: 6 }],
+        };
+        let mut g = genesis(1);
+        g.bridge = Some(bridge_cfg());
+        g.tokens = Some(TokensConfig {
+            registration_fee: MIN_REGISTRATION_FEE,
+            tokens: vec![token(1, 0x11), token(2, 0x22)],
+            mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None,
+        });
+        g.alloc = opened_alloc();
+        let base = build(&g);
+        assert_eq!(base.ledger.tokens().unwrap().max_tokens(), u32::MAX);
+        assert!(!g.to_json().contains("max_tokens"), "absent from the file when absent");
+
+        let mut capped = g.clone();
+        capped.tokens.as_mut().unwrap().max_tokens = Some(2);
+        let sc = build(&capped);
+        assert_ne!(sc.hash(), base.hash(), "the cap is in the genesis binding");
+        assert_ne!(sc.ledger.state_root(), base.ledger.state_root(), "and in the token root");
+        assert_eq!(sc.ledger.tokens().unwrap().max_tokens(), 2);
+        assert!(sc.ledger.tokens().unwrap().is_full(), "two listed under a cap of two");
+        let back: Genesis = serde_json::from_str(&capped.to_json()).unwrap();
+        assert_eq!(back, capped);
+        let mut three = capped.clone();
+        three.tokens.as_mut().unwrap().max_tokens = Some(3);
+        assert_ne!(build(&three).hash(), sc.hash(), "two files that differ only in the cap build different chains");
+        assert!(!build(&three).ledger.tokens().unwrap().is_full());
+
+        let bad = |n: u32| {
+            let mut g = capped.clone();
+            g.tokens.as_mut().unwrap().max_tokens = Some(n);
+            match g.validate() {
+                Err(GenesisError::BadTokens(m)) => m,
+                other => panic!("expected BadTokens, got {other:?}"),
+            }
+        };
+        assert!(bad(0).contains("max_tokens"));
+        assert!(bad(1).contains("max_tokens"), "below the number of tokens the file lists");
+    }
+
     /// Audit v4 (bridge rules v2): a `rules_v2` group inside the bridge section is committed to
     /// the genesis hash under its own tag only when present — a chain-14-shaped file (no group)
     /// hashes and roots exactly as before — reaches the bridge state and the registry's windows,
@@ -1417,7 +1496,7 @@ mod tests {
     fn bridge_rules_v2_are_committed_only_when_present_and_bounded() {
         let mut bridged = genesis(1);
         bridged.bridge = Some(bridge_cfg());
-        bridged.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        bridged.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None });
         bridged.alloc = opened_alloc();
         let base = build(&bridged);
         assert_eq!(base.ledger.bridge().unwrap().rules_v2, None);
@@ -1467,7 +1546,7 @@ mod tests {
             let mut cfg = bridge_cfg();
             f(&mut cfg);
             g.bridge = Some(cfg);
-            g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+            g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None });
             match g.build(&StubExecutor) {
                 Err(GenesisError::BadBridgeConfig(m)) => m,
                 other => panic!("expected BadBridgeConfig, got {other:?}"),
@@ -1545,7 +1624,7 @@ mod tests {
         let mut cfg = bridge_cfg();
         cfg.guardians = (0..368).map(key).collect();
         g.bridge = Some(cfg);
-        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None });
         g.alloc = opened_alloc();
         match g.build(&StubExecutor) {
             Err(GenesisError::BadBridgeConfig(m)) => {
@@ -1561,7 +1640,7 @@ mod tests {
         cfg.guardians = (0..367).map(key).collect();
         cfg.pq_guardians = (0..367).map(synthetic_pq_key).collect();
         g.bridge = Some(cfg);
-        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None });
         g.alloc = opened_alloc();
         assert!(g.build(&StubExecutor).is_ok(), "367 guardians is the largest runnable set");
     }
@@ -1577,7 +1656,7 @@ mod tests {
         assert!(s.ledger.tokens().is_none());
         assert!(!plain.to_json().contains("tokens"));
         let mut tok = plain.clone();
-        tok.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        tok.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None });
         tok.alloc = opened_alloc();
         let st = build(&tok);
         assert_ne!(st.ledger.state_root(), s.ledger.state_root());
@@ -1600,7 +1679,7 @@ mod tests {
                 salt: [0x55; 32],
                 backings: vec![GenesisBacking { chain: 2, token, decimals: BRIDGE_DECIMALS }],
             }],
-            mint_cap_per_day: 100_000 * 100_000_000,
+            mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None,
         };
         let mut g = base_genesis();
         g.alloc = opened_alloc();
@@ -1705,7 +1784,7 @@ mod tests {
                     backings: vec![GenesisBacking { chain: 2, token: [0x22; 32], decimals: BRIDGE_DECIMALS }],
                 },
             ],
-            mint_cap_per_day: 100_000 * 100_000_000,
+            mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None,
         });
         assert!(g.validate().is_ok());
         let s = build(&g);
@@ -1763,7 +1842,7 @@ mod tests {
                 salt: [0x5a; 32],
                 backings: backings.clone(),
             }],
-            mint_cap_per_day: 100_000 * 100_000_000,
+            mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None,
         });
         assert!(g.validate().is_ok());
         let s = build(&g);
@@ -1857,7 +1936,7 @@ mod tests {
                 salt: [1; 32],
                 backings: vec![GenesisBacking { chain: 2, token: [0x11; 32], decimals: 6 }],
             }],
-            mint_cap_per_day: 100_000 * 100_000_000,
+            mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None,
         });
         assert!(g.validate().is_ok(), "the well-formed file parses and validates");
         let mut v = serde_json::to_value(&g).unwrap();
@@ -1875,11 +1954,11 @@ mod tests {
     fn registration_fee_bounds_and_duplicate_listings_are_refused() {
         let mut g = base_genesis();
         g.bridge = Some(bridge_cfg());
-        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE - 1, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE - 1, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None });
         assert!(matches!(g.validate(), Err(GenesisError::BadTokens(_))));
-        g.tokens = Some(TokensConfig { registration_fee: MAX_REGISTRATION_FEE + 1, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        g.tokens = Some(TokensConfig { registration_fee: MAX_REGISTRATION_FEE + 1, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None });
         assert!(matches!(g.validate(), Err(GenesisError::BadTokens(_))));
-        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None });
         assert!(g.validate().is_ok());
 
         let dup = GenesisToken {
@@ -1888,7 +1967,7 @@ mod tests {
             salt: [3; 32],
             backings: vec![GenesisBacking { chain: 2, token: [1; 32], decimals: BRIDGE_DECIMALS }],
         };
-        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![dup.clone(), dup], mint_cap_per_day: 100_000 * 100_000_000 });
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![dup.clone(), dup], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None });
         assert!(matches!(g.validate(), Err(GenesisError::BadTokens(_))));
     }
 

@@ -692,9 +692,10 @@ hash stands in for the sender identity the message has no room for.
 
 ### `rand_getTokens`
 Params: `[from_index, limit]`, both optional (`0` and `1000`; `limit` is clamped to 1000). Result:
-the RPL token registry — every token, bridged and native — ascending by index from `from_index`:
+the RPL token registry — every token, bridged and native — ascending by index from `from_index`,
+read by range from that index (never a scan of the rows below it, v0.5.4):
 ```json
-{ "enabled": true, "registration_fee": "1000000000", "next_index": 3,
+{ "enabled": true, "registration_fee": "1000000000", "next_index": 3, "max_tokens": null,
   "tokens": [
     { "index": 2, "id": "<64 hex>", "id_text": "rpl1…", "name": "Test Coin", "symbol": "TST",
       "decimals": 6,
@@ -712,8 +713,10 @@ characters. `authority` is `{ "kind": "none" }` (fixed supply, or renounced), `{
 this chain, and bridge hardening B1's mint-cap figures — `rand_getAssets`'s fields, one row per
 backing) or `{ "kind": "program", "program": "<hex>" }`. Supplies, `locked`, `mint_cap_per_day`,
 `minted_today` and `registration_fee` are decimal strings (RAND units for `registration_fee`,
-token units for the rest); `next_index` and `mint_day` are numbers. A page shorter than `limit`
-is the last.
+token units for the rest); `next_index`, `mint_day` and `max_tokens` are numbers. `max_tokens`
+(v0.5.4, audit v4 TOK-1) is the genesis cap on how many tokens the registry may hold —
+registration is refused `RegistryFull` at it — or `null` on a chain whose genesis has none
+(chain 14). A page shorter than `limit` is the last.
 
 A wallet resolves a token id **through this listing** (`wallet::resolve_asset`), never through
 `rand_getToken`: a transfer's asset is private on chain, and reading the whole registry costs the
@@ -1235,6 +1238,11 @@ What changed for clients, in one place. Newest first.
   rolling window instead of a calendar day, a global cap bounds every backing together, and a
   listing is refused while minting is paused. The pool treats a rotation as governance (exempt
   from the capacity refusal, ordered first, one pooled per `rotation_nonce`).
+- **`rand_getTokens` gains `max_tokens`** (audit v4 TOK-1): the genesis `tokens.max_tokens` cap
+  on the registry, a number, or `null` without one (chain 14). At the cap `RegisterToken` and
+  `RegisterBridgedToken` are refused `RegistryFull`. The listing now pages by range from
+  `from_index` instead of scanning the registry from its first row; the reply's shape is
+  otherwise unchanged.
 
 ### 2026-09-21 — wallets compute their own witnesses
 
