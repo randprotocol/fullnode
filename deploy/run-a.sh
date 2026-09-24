@@ -8,7 +8,7 @@ set -euo pipefail
 HOME_A=${NODE_A_HOME:-$HOME/rand-node-a}
 KEYDIR=${KEYDIR:-$HOME/.rand-chain14}
 cd "$HOME_A"
-BINDIR=${BINDIR:-bin-0154fe2}
+BINDIR=${BINDIR:-bin-a2d4021}
 BIN=$BINDIR/rand-node
 [ -x $BIN ] || { echo "$HOME_A/$BIN missing — build it at the chain-14 commit or set BINDIR" >&2; exit 1; }
 DATA=data-a-1cff3b7d   # keyed on the genesis hash so a regenerated genesis gets a fresh db
