@@ -765,8 +765,10 @@ git commit -m "node: a peer advertises its retention floor; sync never asks for 
         st.prune_history(u64::MAX, 10, PRUNE_PASS_MAX).unwrap();
         st.db.delete_cf(st.cf(CF_BLOCKS), height_key(11)).unwrap();
         let check = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
-        assert_eq!(check.problem.as_deref(), Some("block 11 missing"));
-        assert_eq!(check.last_good, 10);
+        // The replay path's convention: a missing child takes its parent's certificate with
+        // it, so the loss is reported at 10 (the structural loop reads 10's QC off 11 first).
+        assert_eq!(check.problem.as_deref(), Some("block 10's certificate is lost: block 11 missing"));
+        assert_eq!(check.last_good, 9);
         assert_eq!(check.floor, 10);
     }
 
@@ -878,10 +880,20 @@ and add the method:
                     Ok(other) => return Err(format!("block {h} index points to {other:?}")),
                     Err(e) => return Err(format!("block {h} index unreadable: {e}")),
                 }
-                let qc = self
-                    .qc_by_height(h)
-                    .map_err(|e| format!("qc {h} unreadable: {e}"))?
-                    .ok_or_else(|| format!("qc {h} missing"))?;
+                // Same convention as the replay path: the head's certificate is its own row;
+                // every other block's is its child's `justify`, and a missing child takes the
+                // parent's certificate with it.
+                let qc = if h == head {
+                    self.qc_by_height(h)
+                        .map_err(|e| format!("qc {h} unreadable: {e}"))?
+                        .ok_or_else(|| format!("qc {h} missing"))?
+                } else {
+                    self.block_by_height(h + 1)
+                        .map_err(|e| format!("block {h}'s certificate is lost: block {} unreadable: {e}", h + 1))?
+                        .ok_or_else(|| format!("block {h}'s certificate is lost: block {} missing", h + 1))?
+                        .header
+                        .justify
+                };
                 if qc.block_hash != hash || qc.view != block.view() {
                     return Err(format!("qc {h} does not certify block {h}"));
                 }
