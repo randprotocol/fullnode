@@ -322,3 +322,28 @@ last index has always given — after the identity check and before any index is
 index no longer reads the rows below it. The O(tokens) root stays: under a cap of a few thousand
 it is bounded work per block, and an incremental root would move the token root domain for every
 chain — deferred to the cut that needs it.
+
+## 15. The burned registration fee (v0.5.5, audit v5 TOK-2)
+
+The registration fee is paid on the registering bundle, on top of `BUNDLE_BASE` (§3), and the
+whole bundle fee goes to the block's proposer — so a validator registering its own token pays the
+fee to itself. A genesis may say the fee is burned instead:
+
+```json
+"tokens": { "registration_fee": 1000000000, "mint_cap_per_day": 10000000000000, "burn_registration_fee": true }
+```
+
+`burn_registration_fee` is optional and **absent on chain 14**, where the proposer keeps the whole
+fee and nothing about the genesis hash, the token root, the stored registry or any block reward
+changes; `false` is the same rule spelled out and commits nothing either. When `true` it is
+committed to the genesis hash (`b"burn_registration_fee"` ‖ `1`, tagged, only then), folded into
+the token root beside the registry cap (`rand-token-registry-3`), and served by `rand_getTokens`
+as `burn_registration_fee`. Under it a `RegisterToken` or `RegisterBridgedToken` leaves the
+proposer `fee − registration_fee` and destroys `registration_fee`: no note is created for it, and
+`rand_getSupply` counts it in `burned` and, separately, in `registration_fees_burned`, which the
+supply identity subtracts on its right (`total_supply == issued − slashed −
+registration_fees_burned`) — the fee left the pool into no register entry, like a slashed bond. On
+an aggregating chain the proposer keeps the floor as before and the proving-share bucket gets
+`fee − registration_fee − BUNDLE_BASE`. A `ListBacking` registers no token and is unaffected, and
+the floor a registration must pay (§3) is unchanged: the gate decides where the fee goes, not how
+much it is.

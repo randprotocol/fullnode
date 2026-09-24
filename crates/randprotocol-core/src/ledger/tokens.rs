@@ -228,6 +228,12 @@ pub struct RegistryExt {
     /// Bridge rules v2: the rolling windows, `Some` exactly when the genesis carries
     /// `bridge.rules_v2`.
     pub windows: Option<MintWindows>,
+    /// Audit v5 (TOK-2): the genesis `tokens.burn_registration_fee` — `true` exactly when the
+    /// ledger burns a registration's `registration_fee` instead of paying it to the proposer
+    /// (`Ledger::apply_tx_with`'s fee split). `false` is chain 14's rule. Appended to the v0.5.4
+    /// layout: a `tokens_v2` blob written before this field existed no longer decodes, which no
+    /// chain has — chain 14's store never writes the key at all.
+    pub burn_registration_fee: bool,
 }
 
 /// Bridge rules v2 (audit v4): the rolling-window mint accounting — one window per backing and
@@ -463,6 +469,19 @@ impl TokenRegistry {
     pub fn with_max_tokens(mut self, max_tokens: u32) -> TokenRegistry {
         self.ext.max_tokens = Some(max_tokens);
         self
+    }
+
+    /// This registry with TOK-2's rule that a registration's fee is burned rather than paid to
+    /// the proposer — what genesis builds from `tokens.burn_registration_fee: true`.
+    pub fn with_burn_registration_fee(mut self, burn: bool) -> TokenRegistry {
+        self.ext.burn_registration_fee = burn;
+        self
+    }
+
+    /// TOK-2: whether `Ledger::apply_tx_with` burns a registration's `registration_fee` instead
+    /// of paying it to the proposer. `false` without the genesis flag (chain 14).
+    pub fn burns_registration_fee(&self) -> bool {
+        self.ext.burn_registration_fee
     }
 
     /// The rolling windows (bridge rules v2), `None` on a chain without the section.
@@ -2876,6 +2895,71 @@ mod action_tests {
             l.validate(&under_base, &StubExecutor),
             Err(TxError::FeeTooLow { min: gas::BUNDLE_BASE, fee: gas::BUNDLE_BASE - 1 })
         );
+    }
+
+    /// Audit v5 (TOK-2): under `tokens.burn_registration_fee` a registration's `registration_fee`
+    /// is burned — `supply.burned` up by it, the proposer keeping `fee − registration_fee` — where
+    /// today's rule (chain 14) pays the whole fee to the proposer. On an aggregating chain the
+    /// proposer keeps the floor and the excess bucket gets `fee − registration_fee − BUNDLE_BASE`.
+    /// A bundle that registers nothing is untouched by the gate.
+    #[test]
+    fn the_registration_fee_is_burned_under_the_gate() {
+        let p = proposer().address();
+        let fee = gas::BUNDLE_BASE + REG_FEE + 5;
+        let register = |l: &Ledger| {
+            register_tx_at(l, MintAuthority::None, Some(initial(l, 5)), 10, l.tokens().unwrap().next_index(), fee)
+        };
+        // A ledger whose supply audit can hold: [`ledger`] seeds a register of 10 and no pool,
+        // so it is told what genesis issued (ten fees' worth of notes, the 10 staked).
+        let seeded = |mut l: Ledger| {
+            l.set_genesis_supply(10 * fee, 10);
+            l
+        };
+
+        // Chain 14's rule: the whole fee to the proposer, nothing burned.
+        let mut plain = seeded(ledger());
+        plain.apply_tx(&register(&plain), &p, &StubExecutor).unwrap();
+        assert_eq!(plain.validators()[&p].rewards, fee);
+        assert_eq!((plain.supply().fees_paid, plain.supply().burned), (fee, 0));
+        assert!(plain.audit().invariant_holds(), "{:?}", plain.audit());
+        assert_eq!(plain.registration_fees_burned(), 0);
+
+        // Under the gate: `fee − registration_fee` to the proposer, the registration fee burned.
+        let mut gated = seeded(ledger());
+        gated.set_tokens(Some(TokenRegistry::new(REG_FEE).with_burn_registration_fee(true)));
+        gated.apply_tx(&register(&gated), &p, &StubExecutor).unwrap();
+        assert_eq!(gated.validators()[&p].rewards, gas::BUNDLE_BASE + 5, "the proposer keeps fee − registration_fee");
+        assert_eq!((gated.supply().fees_paid, gated.supply().burned), (gas::BUNDLE_BASE + 5, REG_FEE));
+        // The fee left the pool and entered no register entry: destroyed issuance, which the
+        // audit's identity has to see on its right-hand side or it reads false.
+        assert!(gated.audit().invariant_holds(), "{:?}", gated.audit());
+        assert_eq!(gated.registration_fees_burned(), REG_FEE);
+        assert_ne!(gated.tokens().unwrap().root(), plain.tokens().unwrap().root(), "the flag is in the token root");
+
+        // A bundle that registers nothing pays its whole fee to the proposer, gate or not.
+        let none = StubExecutor::bound(Transaction::shielded(CHAIN, fee_bundle(&gated, 30, gas::BUNDLE_BASE + 7), Action::None));
+        gated.apply_tx(&none, &p, &StubExecutor).unwrap();
+        assert_eq!(gated.validators()[&p].rewards, 2 * gas::BUNDLE_BASE + 12);
+        assert_eq!(gated.supply().burned, REG_FEE);
+
+        // On an aggregating chain the proposer keeps the floor and the bucket gets the rest.
+        let mut agg = seeded(ledger());
+        agg.set_tokens(Some(TokenRegistry::new(REG_FEE).with_burn_registration_fee(true)));
+        agg.set_aggregation(Some(crate::ledger::aggregation::AggregationConfig {
+            bond: 100,
+            max_covers: 3,
+            subsidy_base: 100,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![],
+        }));
+        let tx = register(&agg);
+        agg.apply_tx(&tx, &p, &StubExecutor).unwrap();
+        assert_eq!(agg.validators()[&p].rewards, gas::BUNDLE_BASE);
+        assert_eq!((agg.supply().fees_paid, agg.supply().burned), (gas::BUNDLE_BASE, REG_FEE));
+        assert_eq!(agg.unsealed_fees()[&tx.hash()].0, 5, "the bucket gets fee − registration_fee − BUNDLE_BASE");
+        assert_eq!(agg.registration_fees_burned(), REG_FEE);
+        assert!(agg.audit().invariant_holds(), "{:?}", agg.audit());
     }
 
     /// The initial note's `time` is the creator's, sealed against before the transaction was

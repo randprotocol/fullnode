@@ -716,7 +716,9 @@ backing) or `{ "kind": "program", "program": "<hex>" }`. Supplies, `locked`, `mi
 token units for the rest); `next_index`, `mint_day` and `max_tokens` are numbers. `max_tokens`
 (v0.5.4, audit v4 TOK-1) is the genesis cap on how many tokens the registry may hold —
 registration is refused `RegistryFull` at it — or `null` on a chain whose genesis has none
-(chain 14). A page shorter than `limit` is the last.
+(chain 14). `burn_registration_fee` (v0.5.5, audit v5 TOK-2) is a boolean: whether a
+registration's `registration_fee` is burned rather than paid to the block's proposer
+(`docs/tokens.md` §15) — `false` on chain 14. A page shorter than `limit` is the last.
 
 A wallet resolves a token id **through this listing** (`wallet::resolve_asset`), never through
 `rand_getToken`: a transfer's asset is private on chain, and reading the whole registry costs the
@@ -775,8 +777,15 @@ Params: `[]`. Result:
   "genesis_deposited": "…", "genesis_staked": "…", "faucet_minted": "…",
   "faucet_epoch": "…", "faucet_minted_in_epoch": "…",
   "withdraw_deposited": "…", "fees_paid": "…", "burned": "…",
+  "subsidised": "…", "sealed_blocks": "…", "aggregator_bonds": "…", "slashed": "…",
+  "registration_fees_burned": "…",
   "pool_value": "…", "register_total": "…", "total_supply": "…", "invariant_holds": true }
 ```
+
+`registration_fees_burned` (v0.5.5, audit v5 TOK-2) is Σ of the registration fees burned under
+the genesis `tokens.burn_registration_fee` (`docs/tokens.md` §15): inside `burned` on the pool
+side and in no register entry, so the identity below subtracts it on its right beside `slashed`.
+A decimal string; `"0"` on chain 14, which has no gate.
 
 `faucet_epoch` and `faucet_minted_in_epoch` (v0.5.4, audit v4 STAKE-2) are the faucet's per-epoch
 pair: the epoch the counter is for and what the faucet minted in it, against the genesis
@@ -793,8 +802,8 @@ created (`amount` less the base), and the base moves from one register entry to 
 `pool_value = genesis_deposited + faucet_minted + withdraw_deposited − fees_paid −
 burned`; `register_total` is Σ `stake + pending + rewards` over the register; `total_supply` is the
 two together, and `invariant_holds` is whether it still equals everything the chain issued
-(`genesis_deposited + genesis_staked + faucet_minted`). A false there is a bug, never a legitimate
-chain state. The counters are not in the state root — `rand-node verify --mode quick` recomputes
+(`genesis_deposited + genesis_staked + faucet_minted`) less what was destroyed (`slashed` and
+`registration_fees_burned`). A false there is a bug, never a legitimate chain state. The counters are not in the state root — `rand-node verify --mode quick` recomputes
 every one of them by replaying the chain, which is what makes them auditable. `docs/supply.md`
 works the identity through a bond and a withdraw and says where it rests on a claim (the genesis
 file's own amounts) rather than on a check.
@@ -1220,6 +1229,15 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-24 — v0.5.5
+
+- **`tokens.burn_registration_fee` (genesis-gated, audit v5 TOK-2; not on chain 14).** Under it a
+  `RegisterToken`'s or `RegisterBridgedToken`'s `registration_fee` is burned instead of paid to
+  the block's proposer, who keeps `fee − registration_fee` (`docs/tokens.md` §15).
+  `rand_getTokens` gains `burn_registration_fee` (a boolean, `false` on chain 14) and
+  `rand_getSupply` gains `registration_fees_burned` (a decimal string, `"0"` on chain 14), which
+  `invariant_holds` now subtracts on the right of the identity beside `slashed`. No wire change.
 
 ### 2026-09-24 — v0.5.4
 

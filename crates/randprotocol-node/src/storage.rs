@@ -173,6 +173,15 @@ const META_UNSEALED_FEES: &str = "unsealed_fees";
 /// next mint. Absent on a database written before the key existed and on every chain without
 /// the section, where it reads `(0, 0)` — which is what the ledger holds there too.
 const META_FAUCET_EPOCH: &str = "faucet_epoch";
+/// `bincode(u64)`: Σ of the registration fees burned under `tokens.burn_registration_fee` as of
+/// the head (audit v5, TOK-2, `Ledger::registration_fees_burned`). `META_SUPPLY`'s twin in every
+/// respect — derived, outside the root and `Ledger`'s equality, written at the same three sites,
+/// replayed by `verify_chain` — and kept beside it rather than inside, so chain 14's supply blob
+/// keeps its layout. Absent on a database written before the key existed and on every chain
+/// without the gate, where it reads 0 — which is what the ledger holds there too. The supply
+/// audit subtracts it on the right of its identity: the fee left the pool into no register
+/// entry.
+const META_REGISTRATION_FEES_BURNED: &str = "registration_fees_burned";
 /// `bincode(BTreeMap<Address, AggregatorEntry>)`: the aggregator register as of the head.
 /// `META_SUPPLY`'s twin in kind — derived, replay-audited — but unlike the bucket this one is
 /// hashed into the state root, so a restarted node that lost it would fork at the next block.
@@ -558,6 +567,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_EPOCH_SETS), height_key(0), bincode::serialize(&gs.validators)?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&gs.ledger.supply())?);
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&gs.ledger.faucet_epoch_counters())?);
+        batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&gs.ledger.registration_fees_burned())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
@@ -896,6 +906,13 @@ impl Storage {
     /// on a chain without a `staking` section is also the only value it ever holds.
     pub fn faucet_epoch_counters(&self) -> Result<(u64, u64)> {
         Ok(self.get_meta_raw(META_FAUCET_EPOCH)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    /// Σ of the registration fees burned under `tokens.burn_registration_fee` as of the head
+    /// (audit v5, TOK-2) — `supply()`'s twin, with the same rule for a database written before
+    /// the key existed: 0, which on a chain without the gate is also the only value it holds.
+    pub fn registration_fees_burned(&self) -> Result<u64> {
+        Ok(self.get_meta_raw(META_REGISTRATION_FEES_BURNED)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
     }
 
     /// The proving-share bucket as of the head — `supply()`'s twin, with the same rule for a
@@ -1475,6 +1492,7 @@ impl Storage {
         ledger.set_supply(self.supply()?);
         let (faucet_epoch, faucet_minted) = self.faucet_epoch_counters()?;
         ledger.set_faucet_epoch_counters(faucet_epoch, faucet_minted);
+        ledger.set_registration_fees_burned(self.registration_fees_burned()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
         ledger.set_aggregation(self.aggregation_config()?);
@@ -1785,6 +1803,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger_after.tree())?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger_after.supply())?);
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger_after.faucet_epoch_counters())?);
+        batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger_after.registration_fees_burned())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger_after.tokens().cloned())?);
@@ -2081,6 +2100,16 @@ impl Storage {
                     ledger.supply()
                 ))
             }
+            // The burned registration fees (audit v5, TOK-2) are a supply counter kept beside
+            // the blob, outside the equality like it, and audited the same way: the supply
+            // identity `rand_getSupply` reports is computed with them on its right.
+            Ok(stored) if stored == ledger && stored.registration_fees_burned() != ledger.registration_fees_burned() => {
+                check.problem = Some(format!(
+                    "stored registration fees burned {} do not match the replayed chain's {}",
+                    stored.registration_fees_burned(),
+                    ledger.registration_fees_burned()
+                ))
+            }
             // The bucket is outside `Ledger`'s equality for the same reason, so it is audited
             // beside the counters: the next aggregate's payout is computed from it.
             Ok(stored) if stored == ledger && stored.unsealed_fees() != ledger.unsealed_fees() => {
@@ -2210,6 +2239,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger.tree())?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger.supply())?);
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger.faucet_epoch_counters())?);
+        batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger.registration_fees_burned())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger.tokens().cloned())?);
@@ -2445,7 +2475,7 @@ pub(crate) mod fixtures {
                     // `randprotocol-core`'s to test.
                     backings: vec![randprotocol_core::genesis::GenesisBacking { chain: 2, token: TOKEN, decimals: 8 }],
                 }],
-                mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None,
+                mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None,
             }),
             aggregation: None,
             consensus_domain: None,
@@ -4952,6 +4982,49 @@ mod tests {
         let mut g = genesis_file_of(7, &[&key(1)], vec![], 2);
         g.staking = Some(randprotocol_core::genesis::StakingConfig { faucet_budget_per_epoch: budget, bond_activation_epochs: 1 });
         g.build(&StubExecutor).unwrap()
+    }
+
+    /// Audit v5, TOK-2: the burned registration fees are a supply counter beside `META_SUPPLY`
+    /// — committed with the state, restored by `load_ledger`, audited by `verify_chain`'s replay
+    /// and rewritten by the repair — and the supply identity holds with them on its right.
+    #[test]
+    fn the_burned_registration_fees_are_persisted_beside_the_supply_restored_and_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (mut gs, _) = bridged_genesis(1);
+        let fee = gs.ledger.tokens().unwrap().registration_fee;
+        gs.ledger.set_tokens(Some(gs.ledger.tokens().unwrap().clone().with_burn_registration_fee(true)));
+        // The fixture allocates nothing, so the audit is told what genesis issued (ten fees'
+        // worth of notes) for its identity to be checkable at all.
+        gs.ledger.set_genesis_supply(10 * fee, gs.ledger.supply().genesis_staked);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.registration_fees_burned().unwrap(), 0);
+        assert!(gs.ledger.audit().invariant_holds(), "{:?}", gs.ledger.audit());
+
+        let mut ledger = gs.ledger.clone();
+        let register = register_token_tx(&ledger, 5_000, 40);
+        let b1 = make_block(&gs.block, &mut ledger, vec![register], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!((ledger.registration_fees_burned(), ledger.supply().burned), (fee, fee));
+        assert_eq!(ledger.supply().fees_paid, randprotocol_core::gas::BUNDLE_BASE, "the proposer got the base only");
+        assert!(ledger.audit().invariant_holds(), "{:?}", ledger.audit());
+        assert_eq!(s.registration_fees_burned().unwrap(), fee, "committed with the state");
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap().registration_fees_burned(), fee, "restored");
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A stale counter is named by the audit, not folded into a generic snapshot mismatch.
+        s.db.put_cf(s.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&0u64).unwrap()).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("a stale counter is a problem");
+        assert!(problem.contains("registration fees burned"), "{problem}");
+        assert_eq!(check.last_good, 1, "the block itself is fine");
+        // The repair rewrites it from the replay (`truncate_to` at the head).
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.registration_fees_burned().unwrap(), fee);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+        // A database written before the key existed reads 0, like the supply.
+        s.db.delete_cf(s.cf(CF_META), META_REGISTRATION_FEES_BURNED).unwrap();
+        assert_eq!(s.registration_fees_burned().unwrap(), 0);
     }
 
     /// Audit v4, STAKE-2 rule 2: the faucet's two epoch counters are consensus state on a

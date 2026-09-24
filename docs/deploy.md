@@ -160,6 +160,16 @@ The audit-v4 release (v0.5.4) added consensus rules that are switched on by gene
   other. Absent or `0` is chain 14's behaviour; `2` and up are refused by `rand-node init`. The
   field is a top-level genesis key beside `epoch_blocks`; the cut script splices it in the way it
   splices the `bridge` section, since `rand-node genesis` writes today's shape.
+## The next cut: genesis fields v0.5.5 introduces
+
+- **`"tokens": { …, "burn_registration_fee": true }`** — a `RegisterToken`'s or
+  `RegisterBridgedToken`'s `registration_fee` is burned instead of paid to the block's proposer
+  (audit v5 TOK-2, `docs/tokens.md` §15): the proposer keeps `fee − registration_fee`, the fee
+  joins `rand_getSupply`'s `burned` and `registration_fees_burned`. Absent or `false` is chain
+  14's rule and commits nothing; `true` is committed to the genesis hash under its own tag and
+  folded into the token root, so it ships with a chain cut, never as a same-chain update. Optional
+  inside the `tokens` section the cut script already splices in.
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and

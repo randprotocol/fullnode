@@ -65,10 +65,16 @@ pub struct Supply {
     /// of two ways, each counted here at that moment and not before: an expired excess is swept
     /// to the recorded proposer, and a covered one returns to the pool inside the aggregate's
     /// payout note (spec §5.4), where it needs no counter — it never left.
+    ///
+    /// Under `tokens.burn_registration_fee` (audit v5 TOK-2) a `RegisterToken`'s or
+    /// `RegisterBridgedToken`'s fee is split first: the `registration_fee` part is destroyed
+    /// (`burned`, below) and only the remainder is the fee this counter and the proposer see.
     pub fees_paid: u64,
     /// Σ of every bundle's `burn_r`, its RAND burn. Only a `Bond` may set one, and it burns into
     /// `stake` — and a `RegisterAggregator`'s bundle, which burns into `aggregator_bonds` (spec
-    /// §5.3).
+    /// §5.3). Under `tokens.burn_registration_fee` (audit v5 TOK-2) every registration's
+    /// `registration_fee` is added here too: it goes nowhere — not to the proposer, not to any
+    /// register entry — so it sits on the right of the audit's identity like a slashed bond.
     pub burned: u64,
     /// Σ of aggregator bonds burned in, minus bonds paid out or slashed (block aggregation,
     /// spec §5.3): the register-side twin of the aggregator register's outstanding bonds.
@@ -143,21 +149,27 @@ pub struct Audit {
     pub supply: Supply,
     pub pool_value: u64,
     pub register_total: u64,
+    /// Σ of the registration fees burned under `tokens.burn_registration_fee` (audit v5,
+    /// TOK-2; `Ledger::registration_fees_burned`). Inside `burned` on the pool side and in no
+    /// register entry: destroyed issuance, on the right of the identity beside `slashed`. Kept
+    /// off [`Supply`] so chain 14's stored blob keeps its layout; 0 without the gate.
+    pub registration_fees_burned: u64,
 }
 
 impl Audit {
-    pub fn new(supply: Supply, register_total: u64) -> Audit {
-        Audit { supply, pool_value: supply.pool_value(), register_total }
+    pub fn new(supply: Supply, register_total: u64, registration_fees_burned: u64) -> Audit {
+        Audit { supply, pool_value: supply.pool_value(), register_total, registration_fees_burned }
     }
 
     pub fn total_supply(&self) -> u64 {
         self.pool_value.saturating_add(self.register_total)
     }
 
-    /// Everything the chain issued is either in the pool or in the register. A false here is a
+    /// Everything the chain issued is either in the pool or in the register, less what was
+    /// destroyed: a slashed bond, or a registration fee burned under the gate. A false here is a
     /// consensus bug or a damaged counter, never a legitimate chain state.
     pub fn invariant_holds(&self) -> bool {
-        self.total_supply() == self.supply.issued().saturating_sub(self.supply.slashed)
+        self.total_supply() == self.supply.issued().saturating_sub(self.supply.slashed).saturating_sub(self.registration_fees_burned)
     }
 }
 
@@ -201,11 +213,16 @@ mod tests {
         let register: BTreeMap<Address, ValidatorEntry> =
             [(Address([1; 32]), entry(230, vec![(3, 50)], 20))].into_iter().collect();
         assert_eq!(register_total(&register), 300);
-        let audit = Audit::new(s, register_total(&register));
+        let audit = Audit::new(s, register_total(&register), 0);
         assert_eq!(audit.total_supply(), 1_550);
         assert!(!audit.invariant_holds(), "230 + 50 + 20 does not account for the 70 withdrawn");
-        let audit = Audit::new(s, 250);
+        let audit = Audit::new(s, 250, 0);
         assert!(audit.invariant_holds());
+        // A registration fee burned under the gate (audit v5, TOK-2) is inside `burned` and in
+        // no register entry: it balances only on the right, beside a slashed bond.
+        let destroyed = Supply { burned: 300 + 40, ..s };
+        assert!(!Audit::new(destroyed, 250, 0).invariant_holds(), "40 left the pool and went nowhere");
+        assert!(Audit::new(destroyed, 250, 40).invariant_holds());
     }
 
     #[test]
@@ -215,6 +232,6 @@ mod tests {
         // as empty rather than as `u64::MAX`.
         let s = Supply { fees_paid: 5, ..Default::default() };
         assert_eq!(s.pool_value(), 0);
-        assert_eq!(Audit::new(s, 0).total_supply(), 0);
+        assert_eq!(Audit::new(s, 0, 0).total_supply(), 0);
     }
 }

@@ -118,7 +118,7 @@ fn zusd_genesis(validators: &[randprotocol_core::Keypair]) -> Genesis {
         fri_profile: "test".into(),
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
         bridge: Some(bridge_config_for(RAND_EMITTER, &[2, 5])),
-        tokens: Some(TokensConfig { registration_fee: REGISTRATION_FEE, mint_cap_per_day: MINT_CAP, max_tokens: None, tokens: vec![] }),
+        tokens: Some(TokensConfig { registration_fee: REGISTRATION_FEE, mint_cap_per_day: MINT_CAP, max_tokens: None, burn_registration_fee: None, tokens: vec![] }),
         aggregation: None,
         consensus_domain: None,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,

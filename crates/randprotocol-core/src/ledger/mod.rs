@@ -410,6 +410,13 @@ pub struct Ledger {
     /// reset lazily: a mint in a later epoch than `faucet_epoch` starts it from zero.
     faucet_epoch: u64,
     faucet_minted_in_epoch: u64,
+    /// Σ of every registration fee burned under `tokens.burn_registration_fee` (audit v5,
+    /// TOK-2). A supply counter in kind — derived, outside the state root and this ledger's
+    /// equality, persisted beside `META_SUPPLY` and replay-audited — kept off [`Supply`] so
+    /// chain 14's stored blob keeps its layout. Always 0 without the gate. The audit needs it
+    /// on the right of its identity: the fee left the pool (`supply.burned`) and entered no
+    /// register entry, so it is destroyed issuance like a slashed bond.
+    registration_fees_burned: u64,
     /// The largest program a `Deploy` may carry, in words: genesis's `max_program_words`, or
     /// [`gas::MAX_PROGRAM_WORDS`] on a chain whose file does not set it. A genesis parameter like
     /// `epoch_blocks` — not state, outside the state root and `Ledger`'s equality — so a
@@ -522,6 +529,7 @@ impl Ledger {
             staking: None,
             faucet_epoch: 0,
             faucet_minted_in_epoch: 0,
+            registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
             max_block_bytes: gas::MAX_BLOCK_BYTES,
@@ -570,6 +578,7 @@ impl Ledger {
             staking: None,
             faucet_epoch: 0,
             faucet_minted_in_epoch: 0,
+            registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
             max_block_bytes: gas::MAX_BLOCK_BYTES,
@@ -704,11 +713,24 @@ impl Ledger {
         self.supply.genesis_staked = staked;
     }
 
+    /// Σ of the registration fees burned under `tokens.burn_registration_fee` (audit v5, TOK-2):
+    /// for the node's persistence beside `META_SUPPLY`, the replay audit and `rand_getSupply`.
+    /// 0 without the gate.
+    pub fn registration_fees_burned(&self) -> u64 {
+        self.registration_fees_burned
+    }
+
+    /// Restore the counter a node persisted beside the state — `set_supply`'s twin.
+    pub fn set_registration_fees_burned(&mut self, n: u64) {
+        self.registration_fees_burned = n;
+    }
+
     /// The supply audit against this ledger's own register.
     pub fn audit(&self) -> Audit {
         Audit::new(
             self.supply,
             register_total(&self.validators).saturating_add(supply::aggregators_total(&self.aggregators)),
+            self.registration_fees_burned,
         )
     }
 
@@ -1447,22 +1469,47 @@ impl Ledger {
             // block whose proposer is not, and `HotStuff::propose` runs only when this node
             // is the leader.
             let entry = self.validators.get(proposer).ok_or(TxError::UnknownProposer(*proposer))?;
+            // TOK-2 (audit v5): under `tokens.burn_registration_fee` a registration's
+            // `registration_fee` is burned rather than paid, so the proposer pays it like anyone
+            // else — the fee the split below divides is what is left after it. Zero without the
+            // gate (chain 14) and for every action that registers no token. The floor
+            // (`tokens::validate`'s `RegistrationFeeTooLow`) already held `fee` to at least
+            // `BUNDLE_BASE + registration_fee`, so the subtraction cannot fail after
+            // `validate_inner`; refused by name rather than as an overflow if it ever did.
+            let registration_burn = match &tx.action {
+                Action::RegisterToken { .. } | Action::RegisterBridgedToken { .. } => {
+                    self.tokens.as_ref().filter(|r| r.burns_registration_fee()).map_or(0, |r| r.registration_fee)
+                }
+                _ => 0,
+            };
+            let fee = b.fee.checked_sub(registration_burn).ok_or_else(|| {
+                tokens::TokenError::RegistrationFeeTooLow { min: gas::BUNDLE_BASE.saturating_add(registration_burn), fee: b.fee }
+            })?;
             // The fee split (block aggregation, spec §5.2): on an aggregating chain the
             // proposer keeps exactly the floor and the excess is bucketed against this
             // transaction's hash — an `Aggregate` may still cover it — where an ungated chain
             // keeps the whole fee to the proposer, byte-for-byte today's accounting. The
             // counter moves with what the proposer actually keeps: the floor now, an expired
             // excess at the sweep (`sweep_expired_excesses`), never the bucketed part.
-            let kept = if self.aggregation.is_some() { gas::BUNDLE_BASE.min(b.fee) } else { b.fee };
+            let kept = if self.aggregation.is_some() { gas::BUNDLE_BASE.min(fee) } else { fee };
             let rewards = entry.rewards.checked_add(kept).ok_or(TxError::Overflow)?;
             // Both RAND halves of what this bundle takes out of the pool (see [`supply`]): the
             // fee becomes the proposer's `rewards` below, and `burn_r` becomes `stake` in the
             // `Bond` arm (or an aggregator's bond) — which is why they are counted here, where
             // every bundle passes, rather than in the arms that receive them. `burn_a` is never
             // RAND (`check_burn_shape` refuses a RAND `burn_a`): it leaves a token's own
-            // `total_supply` in the burn's arm and has no place in the RAND audit.
+            // `total_supply` in the burn's arm and has no place in the RAND audit. The burned
+            // registration fee (TOK-2) is the one other RAND exit: destroyed, so it joins
+            // `burned` beside `burn_r`.
             self.supply.fees_paid = self.supply.fees_paid.checked_add(kept).ok_or(TxError::Overflow)?;
-            self.supply.burned = self.supply.burned.checked_add(b.burn_r).ok_or(TxError::Overflow)?;
+            self.supply.burned = self
+                .supply
+                .burned
+                .checked_add(b.burn_r)
+                .and_then(|n| n.checked_add(registration_burn))
+                .ok_or(TxError::Overflow)?;
+            self.registration_fees_burned =
+                self.registration_fees_burned.checked_add(registration_burn).ok_or(TxError::Overflow)?;
             self.apply_bundle_notes(b, executor);
             self.validators.get_mut(proposer).expect("looked up above").rewards = rewards;
             if self.aggregation.is_some() {
@@ -1474,7 +1521,9 @@ impl Ledger {
                 // covers name; a pruned bundle's marker form hashes to the same value
                 // (`Transaction::hash` takes the proof by digest), so the sealed-sync replay
                 // keys byte-identically without consulting the side table.
-                self.bucket_excess(tx.hash(), b.fee - gas::BUNDLE_BASE, *proposer, until);
+                // The excess is over what is left after the burned registration fee (TOK-2) —
+                // `fee − registration_fee − BUNDLE_BASE`, never below zero.
+                self.bucket_excess(tx.hash(), fee.saturating_sub(gas::BUNDLE_BASE), *proposer, until);
             }
         }
         let mut receipt = None;

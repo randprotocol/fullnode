@@ -492,6 +492,23 @@ mod tests {
         assert_eq!(l.tokens().unwrap().bridged(5, &hex32(&v["token"])).unwrap().index, 1);
     }
 
+    /// Audit v5 (TOK-2): a `RegisterBridgedToken` pays the registration fee the way a
+    /// `RegisterToken` does — burned under the gate, the proposer keeping `fee − registration_fee`
+    /// — where a `ListBacking`, which registers no token, pays its whole fee to the proposer.
+    #[test]
+    fn a_bridged_registration_burns_the_fee_under_the_gate() {
+        let mut l = ledger();
+        l.set_tokens(Some(l.tokens().unwrap().clone().with_burn_registration_fee(true)));
+        let p = proposer().address();
+        let coins = coins();
+        l.apply_tx(&paid(&l, 10, gas::BUNDLE_BASE + FEE + 3, register(0, coins[0], salt())), &p, &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&p].rewards, gas::BUNDLE_BASE + 3, "the proposer keeps fee − registration_fee");
+        assert_eq!((l.supply().fees_paid, l.supply().burned), (gas::BUNDLE_BASE + 3, FEE));
+        l.apply_tx(&paid(&l, 20, gas::BUNDLE_BASE + 1, list(1, 1, coins[1])), &p, &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&p].rewards, 2 * gas::BUNDLE_BASE + 4);
+        assert_eq!(l.supply().burned, FEE, "a listing registers no token and burns nothing");
+    }
+
     /// Every refusal a listing can meet, each reached before the Dilithium2 verification (the
     /// quorums below are garbage of the right shape unless the point is the quorum): the gate, the
     /// nonce, the chain's emitter, a pair that already backs a token, an asset id already

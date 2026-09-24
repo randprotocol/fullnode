@@ -51,7 +51,11 @@ invariant:       total_supply == issued
 
 `pool_value` is value the pool holds; it is not the sum of the notes in it, which nobody can compute
 — it is what entered minus what left, which comes to the same number. `invariant_holds` being false
-is a consensus bug or a damaged database, never a legitimate chain state.
+is a consensus bug or a damaged database, never a legitimate chain state. Two things destroy
+issuance and sit on the right of the identity as `issued − slashed − registration_fees_burned`:
+a slashed aggregator bond (block aggregation) and, under the genesis `tokens.burn_registration_fee`
+(v0.5.5, audit v5 TOK-2, `docs/tokens.md` §15), a registration's fee — it leaves the pool through
+`burned` and enters no register entry. Both read 0 on chain 14.
 
 Follow one bond and one withdraw of 1000 RAND through it, on a chain that deposited 2000 at genesis
 and staked 4000:

@@ -2128,6 +2128,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "next_index": tokens.next_index(),
                 // TOK-1: the genesis cap on the registry, `null` without one (chain 14).
                 "max_tokens": tokens.ext().max_tokens,
+                // TOK-2 (audit v5): whether a registration's fee is burned rather than paid to
+                // the proposer; `false` on chain 14.
+                "burn_registration_fee": tokens.ext().burn_registration_fee,
                 "tokens": rows,
             }))
         }
@@ -2353,6 +2356,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let height = st.storage.head().map_err(RpcError::internal)?.height;
             let supply = st.storage.supply().map_err(RpcError::internal)?;
             let (faucet_epoch, faucet_minted_in_epoch) = st.storage.faucet_epoch_counters().map_err(RpcError::internal)?;
+            let registration_fees_burned = st.storage.registration_fees_burned().map_err(RpcError::internal)?;
             let register = st.storage.register().map_err(RpcError::internal)?;
             let aggregators = st.storage.aggregators().map_err(RpcError::internal)?;
             // The register's two halves, exactly `Ledger::audit`'s: the aggregator register's
@@ -2360,7 +2364,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             // read false on any chain with a live registration.
             let register_total = randprotocol_core::ledger::register_total(&register)
                 .saturating_add(randprotocol_core::ledger::supply::aggregators_total(&aggregators));
-            let audit = randprotocol_core::ledger::Audit::new(supply, register_total);
+            let audit = randprotocol_core::ledger::Audit::new(supply, register_total, registration_fees_burned);
             Ok(json!({
                 "height": height,
                 "genesis_deposited": supply.genesis_deposited.to_string(),
@@ -2382,6 +2386,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "sealed_blocks": supply.sealed_blocks.to_string(),
                 "aggregator_bonds": supply.aggregator_bonds.to_string(),
                 "slashed": supply.slashed.to_string(),
+                // Audit v5 (TOK-2): the registration fees burned under the genesis gate — inside
+                // `burned`, in no register entry, so on the right of the identity like `slashed`.
+                // `"0"` on chain 14.
+                "registration_fees_burned": registration_fees_burned.to_string(),
                 "pool_value": audit.pool_value.to_string(),
                 "register_total": audit.register_total.to_string(),
                 "total_supply": audit.total_supply().to_string(),
@@ -3674,6 +3682,28 @@ mod tests {
         assert_eq!(v["invariant_holds"], true);
     }
 
+    /// Audit v5 (TOK-2): under `tokens.burn_registration_fee` a registration's fee is destroyed —
+    /// `burned` and `registration_fees_burned` up by it, the proposer's `rewards` (so
+    /// `register_total`) without it — and the identity still holds, the burned fee on its right.
+    #[tokio::test]
+    async fn get_supply_reports_the_burned_registration_fees() {
+        let (mut gs, _) = fixtures::bridged_genesis(1);
+        let fee = gs.ledger.tokens().unwrap().registration_fee;
+        gs.ledger.set_tokens(Some(gs.ledger.tokens().unwrap().clone().with_burn_registration_fee(true)));
+        // The fixture allocates nothing: tell the audit what genesis issued so it can hold.
+        gs.ledger.set_genesis_supply(10 * fee, gs.ledger.supply().genesis_staked);
+        let (_d, st) = state_for(&gs);
+        let mut ledger = st.storage.load_ledger(&StubExecutor).unwrap();
+        let register = fixtures::register_token_tx(&ledger, 5_000, 40);
+        let b1 = make_block(&gs.block, &mut ledger, vec![register], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let v = ok(&st, "rand_getSupply", json!([])).await;
+        assert_eq!(v["burned"], Value::String(fee.to_string()));
+        assert_eq!(v["registration_fees_burned"], Value::String(fee.to_string()));
+        assert_eq!(v["fees_paid"], Value::String(randprotocol_core::gas::BUNDLE_BASE.to_string()), "the proposer got the base only");
+        assert_eq!(v["invariant_holds"], true, "{v}");
+    }
+
     /// The aggregation counters (spec §5.3): reported separately, and the invariant holds on a
     /// chain with a live registration — which needs the aggregator register's bonds counted in
     /// the register half, `Ledger::audit()`'s own rule.
@@ -4322,6 +4352,7 @@ mod tests {
         assert_eq!(v["registration_fee"], json!(tokens.registration_fee.to_string()));
         assert_eq!(v["next_index"], 3);
         assert_eq!(v["max_tokens"], Value::Null, "TOK-1: no cap on a chain-14-shaped genesis");
+        assert_eq!(v["burn_registration_fee"], false, "TOK-2: the fee goes to the proposer on a chain-14-shaped genesis");
         let rows = v["tokens"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1], native_row(&st));
@@ -4356,14 +4387,17 @@ mod tests {
 
     /// Audit v4 (TOK-1): a genesis cap on the registry is served as `max_tokens`, survives the
     /// store, and the listing pages by range — a page from an index past the last row is empty.
+    /// Audit v5 (TOK-2): the burn flag rides the same extension, served as `burn_registration_fee`.
     #[tokio::test]
     async fn the_token_listing_serves_the_genesis_cap() {
         let (mut gs, _) = fixtures::bridged_genesis(1);
-        let capped = gs.ledger.tokens().unwrap().clone().with_max_tokens(3);
+        let capped = gs.ledger.tokens().unwrap().clone().with_max_tokens(3).with_burn_registration_fee(true);
         gs.ledger.set_tokens(Some(capped));
         let (_d, st) = state_for(&gs);
         let v = ok(&st, "rand_getTokens", json!([])).await;
         assert_eq!(v["max_tokens"], 3);
+        assert_eq!(v["burn_registration_fee"], true, "TOK-2");
+        assert!(st.storage.tokens().unwrap().unwrap().burns_registration_fee(), "the flag rides the store");
         assert_eq!(v["tokens"].as_array().unwrap().len(), 1);
         assert_eq!(ok(&st, "rand_getTokens", json!([2, 10])).await["tokens"], json!([]));
         assert_eq!(st.storage.tokens().unwrap().unwrap().max_tokens(), 3, "the cap rides the store");
