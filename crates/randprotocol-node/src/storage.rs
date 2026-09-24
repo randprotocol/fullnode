@@ -2952,13 +2952,25 @@ mod tests {
             batch.put_cf(s.cf(CF_ANCHORS), i.to_be_bytes(), [1u8; 8]);
             s.db.write(batch).unwrap();
         }
-        let wal: u64 = std::fs::read_dir(dir.path().join("db"))
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
-            .map(|e| e.metadata().unwrap().len())
-            .sum();
+        // The cap's forced flushes and the log deletions they earn run on RocksDB's background
+        // threads, so a slow runner measured mid-flush (the v0.5.4 tag's CI run did) and saw the
+        // pile still there. Poll instead of reading once: under the cap the pile shrinks within
+        // seconds; without it `anchors` pins every log and it never does (the probe stays red).
+        let wal_bytes = || -> u64 {
+            std::fs::read_dir(dir.path().join("db"))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
+                .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                .sum()
+        };
         let write_buffer: u64 = 64 * 1024 * 1024;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut wal = wal_bytes();
+        while wal > cap + write_buffer && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            wal = wal_bytes();
+        }
         assert!(wal <= cap + write_buffer, "{wal} bytes of write-ahead log against a {cap}-byte cap");
     }
 
