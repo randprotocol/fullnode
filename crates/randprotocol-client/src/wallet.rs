@@ -4399,8 +4399,10 @@ mod tests {
         }
         let rpc = serve(&chain).await;
         // A scan that cannot know about the deposit (its block cursor starts past block 1) files
-        // its leaf as a stranger's garbage envelope.
-        let mut store = NoteStore { scanned_attest_height: 2, ..NoteStore::default() };
+        // its leaf as a stranger's garbage envelope. The store names this chain: an unbound one
+        // is started over by the chain binding, which would read block 1 after all.
+        let genesis = Some(chain.lock().unwrap().genesis);
+        let mut store = NoteStore { genesis, scanned_attest_height: 2, ..NoteStore::default() };
         scan(&rpc, &me, &mut store).await.unwrap();
         assert_eq!(store.notes.len(), 2, "the two RAND notes only");
         assert!(store.tree.path(0).is_none(), "the deposit's leaf went in as not-mine");

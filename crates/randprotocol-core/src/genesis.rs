@@ -2318,7 +2318,7 @@ mod tests {
     fn a_genesis_with_faucet_and_bridge_is_refused_once_staking_rules_are_on() {
         let mut g = genesis(1);
         g.bridge = Some(bridge_cfg());
-        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], max_tokens: None, mint_cap_per_day: 100_000 * 100_000_000 });
         g.alloc = opened_alloc();
         g.faucet = true;
         assert!(g.validate().is_ok(), "chain 14's shape still loads");
