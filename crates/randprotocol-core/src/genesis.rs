@@ -219,6 +219,9 @@ impl From<&TokensConfig> for TokensCommit {
 
 /// The `staking` genesis section (audit v4, STAKE-2), defined beside the rules it switches on.
 pub use crate::ledger::staking::StakingConfig;
+/// Shortest `bridge.rules_v2.cap_window_secs` (one hour) and longest (seven days) a genesis may set.
+pub const MIN_CAP_WINDOW_SECS: u32 = 3_600;
+pub const MAX_CAP_WINDOW_SECS: u32 = 7 * 86_400;
 
 /// Smallest `registration_fee` a `tokens` section may set, in RAND's base unit.
 pub const MIN_REGISTRATION_FEE: u64 = 1_000_000_000;
@@ -616,6 +619,11 @@ impl Genesis {
                     )
                     .map_err(|e| GenesisError::BadTokens(e.to_string()))?;
             }
+            // Bridge rules v2: the registry keeps the rolling windows the bridge section asks
+            // for (`check_bridge` bounded the parameters).
+            if let Some(rules) = self.bridge.as_ref().and_then(|b| b.rules_v2.as_ref()) {
+                registry = registry.with_rules_v2(rules.cap_window_secs, rules.global_mint_cap_per_window);
+            }
             ledger.set_tokens(Some(registry));
         }
         ledger.set_aggregation(self.aggregation.clone());
@@ -703,6 +711,15 @@ impl Genesis {
         // *strings*.
         if let Some(bridge) = &self.bridge {
             commit.extend_from_slice(&bincode::serialize(&BridgeCommit::from(bridge)).expect("serializes"));
+        }
+        // Bridge rules v2 (audit v4), right after the bridge bytes and tagged like the call
+        // limits: appended only when the group is present, so chain 14's file hashes
+        // byte-for-byte as before. Not inside `BridgeCommit`, whose bincode would put an
+        // `Option` byte into every bridged chain's commitment.
+        if let Some(rules) = self.bridge.as_ref().and_then(|b| b.rules_v2.as_ref()) {
+            commit.extend_from_slice(b"bridge_rules_v2");
+            commit.extend_from_slice(&rules.global_mint_cap_per_window.to_be_bytes());
+            commit.extend_from_slice(&rules.cap_window_secs.to_be_bytes());
         }
         // RPL tokens, after the bridge bytes: appended only when the section is configured, so a
         // chain without one hashes byte-for-byte as before. `TokensCommit` is the plain-bytes
@@ -854,6 +871,20 @@ fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
     }
     if cfg.pq_guardians.contains(pause_key) {
         return bad("pause_key is one of the pq_guardians: it must be held apart from the guardian keys".into());
+    }
+    // Bridge rules v2 (audit v4): a window shorter than an hour is finer than the slot the
+    // accounting keeps, one past a week is more custody exposure than a cap is for; a zero
+    // global cap could never mint a thing.
+    if let Some(rules) = &cfg.rules_v2 {
+        if !(MIN_CAP_WINDOW_SECS..=MAX_CAP_WINDOW_SECS).contains(&rules.cap_window_secs) {
+            return bad(format!(
+                "rules_v2.cap_window_secs {} is out of bounds ({MIN_CAP_WINDOW_SECS}..={MAX_CAP_WINDOW_SECS})",
+                rules.cap_window_secs
+            ));
+        }
+        if rules.global_mint_cap_per_window == 0 {
+            return bad("rules_v2.global_mint_cap_per_window is zero: the bridge could never mint".into());
+        }
     }
     if cfg.emitter == [0u8; 32] {
         return bad("zero emitter address".into());
@@ -1330,6 +1361,7 @@ mod tests {
             emitters: BTreeMap::from([(2u16, [9u8; 32])]),
             pq_guardians: vec![pq_key(0)],
             pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
+            rules_v2: None,
         }
     }
 
@@ -1375,6 +1407,55 @@ mod tests {
         let mut other_guardians = bridged.clone();
         other_guardians.bridge.as_mut().unwrap().guardians = vec![[3; 20]];
         assert_ne!(build(&other_guardians).hash(), sb.hash());
+    }
+
+    /// Audit v4 (bridge rules v2): a `rules_v2` group inside the bridge section is committed to
+    /// the genesis hash under its own tag only when present — a chain-14-shaped file (no group)
+    /// hashes and roots exactly as before — reaches the bridge state and the registry's windows,
+    /// and is held to its bounds: the window in `3600..=7*86400`, the global cap above zero.
+    #[test]
+    fn bridge_rules_v2_are_committed_only_when_present_and_bounded() {
+        let mut bridged = genesis(1);
+        bridged.bridge = Some(bridge_cfg());
+        bridged.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        bridged.alloc = opened_alloc();
+        let base = build(&bridged);
+        assert_eq!(base.ledger.bridge().unwrap().rules_v2, None);
+        assert_eq!(base.ledger.tokens().unwrap().windows(), None);
+        assert!(!bridged.to_json().contains("rules_v2"), "absent from the file when absent");
+
+        let mut v2 = bridged.clone();
+        let rules = crate::bridge::BridgeRulesV2 { global_mint_cap_per_window: 500_000 * 100_000_000, cap_window_secs: 86_400 };
+        v2.bridge.as_mut().unwrap().rules_v2 = Some(rules.clone());
+        let sv2 = build(&v2);
+        assert_ne!(sv2.hash(), base.hash(), "the group is in the genesis binding");
+        assert_ne!(sv2.ledger.state_root(), base.ledger.state_root(), "and in the bridge and token roots");
+        assert_eq!(sv2.ledger.bridge().unwrap().rules_v2, Some(rules.clone()));
+        let w = sv2.ledger.tokens().unwrap().windows().unwrap();
+        assert_eq!((w.window_secs, w.global_cap), (rules.cap_window_secs, rules.global_mint_cap_per_window));
+        // Round trip through the file: what is written is what is read.
+        let back: Genesis = serde_json::from_str(&v2.to_json()).unwrap();
+        assert_eq!(back, v2);
+        assert!(v2.to_json().contains("\"rules_v2\""));
+        // Two files that differ only in a cap parameter build different chains.
+        let mut other = v2.clone();
+        other.bridge.as_mut().unwrap().rules_v2.as_mut().unwrap().cap_window_secs = 7_200;
+        assert_ne!(build(&other).hash(), sv2.hash());
+
+        let bad = |f: fn(&mut crate::bridge::BridgeRulesV2)| {
+            let mut g = v2.clone();
+            f(g.bridge.as_mut().unwrap().rules_v2.as_mut().unwrap());
+            match g.validate() {
+                Err(GenesisError::BadBridgeConfig(m)) => m,
+                other => panic!("expected BadBridgeConfig, got {other:?}"),
+            }
+        };
+        assert!(bad(|r| r.cap_window_secs = 3_599).contains("cap_window_secs"));
+        assert!(bad(|r| r.cap_window_secs = 7 * 86_400 + 1).contains("cap_window_secs"));
+        assert!(bad(|r| r.global_mint_cap_per_window = 0).contains("global_mint_cap_per_window"));
+        let mut edge = v2.clone();
+        edge.bridge.as_mut().unwrap().rules_v2 = Some(crate::bridge::BridgeRulesV2 { global_mint_cap_per_window: 1, cap_window_secs: 7 * 86_400 });
+        assert!(edge.validate().is_ok());
     }
 
     /// A `bridge` section a chain could not safely run is refused at build time rather than at

@@ -139,6 +139,8 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         Action::PauseMints { nonce, .. } | Action::UnpauseMints { nonce, .. } => Some((Address([0; 32]), *nonce)),
         // B4: the bridge's `list_nonce`, shared the same way by a registration and a listing.
         Action::RegisterBridgedToken { nonce, .. } | Action::ListBacking { nonce, .. } => Some((Address([0; 32]), *nonce)),
+        // Bridge rules v2: the bridge's `rotation_nonce`, shared by the two rotations.
+        Action::RotatePqGuardians { nonce, .. } | Action::RotatePauseKey { nonce, .. } => Some((Address([0; 32]), *nonce)),
         _ => None,
     }
 }
@@ -153,11 +155,12 @@ fn claim_conflict_key(validator: &Address) -> Word8 {
 /// The claims map's key: the register the nonce belongs to, so one keypair's two roles — a
 /// validator's `Unbond` and an aggregator's `Aggregate` at the same nonce — never collide over
 /// a slot the two registers do not share (chain-9 runs both roles on the same ops keys).
-/// The four bridge governance actions (bridge hardening B1/B4): the emergency pause, its
-/// lifting, and the two listings. They are exempt from the pool's capacity refusal and ordered
-/// ahead of fee order among a block's candidates (node I4) — a brake that can be crowded out is
-/// not a brake. Both are safe only because [`claimed_nonce`]/[`claim_key`] already bound roles 2
-/// and 3 to one pooled transaction each, which a test asserts.
+/// The six bridge governance actions (bridge hardening B1/B4, bridge rules v2): the emergency
+/// pause, its lifting, the two listings and the two rotations. They are exempt from the pool's
+/// capacity refusal and ordered ahead of fee order among a block's candidates (node I4) — a
+/// brake that can be crowded out is not a brake, and a key rotation after a compromise is the
+/// same kind of thing. All are safe only because [`claimed_nonce`]/[`claim_key`] already bound
+/// roles 2, 3 and 4 to one pooled transaction each, which tests assert.
 fn is_governance(action: &Action) -> bool {
     matches!(
         action,
@@ -165,6 +168,8 @@ fn is_governance(action: &Action) -> bool {
             | Action::UnpauseMints { .. }
             | Action::RegisterBridgedToken { .. }
             | Action::ListBacking { .. }
+            | Action::RotatePqGuardians { .. }
+            | Action::RotatePauseKey { .. }
     )
 }
 
@@ -173,6 +178,7 @@ fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
         Action::Aggregate { .. } | Action::UnbondAggregator { .. } | Action::WithdrawAggregator { .. } => 1u8,
         Action::PauseMints { .. } | Action::UnpauseMints { .. } => 2,
         Action::RegisterBridgedToken { .. } | Action::ListBacking { .. } => 3,
+        Action::RotatePqGuardians { .. } | Action::RotatePauseKey { .. } => 4,
         _ => 0,
     };
     (role, claim.0, claim.1)
@@ -617,6 +623,12 @@ impl Mempool {
                 let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
                 if bridge.pause_nonce != nonce {
                     return Err(TxError::Bridge(BridgeError::BadPauseNonce { expected: bridge.pause_nonce, got: nonce }));
+                }
+            } else if matches!(tx.action, Action::RotatePqGuardians { .. } | Action::RotatePauseKey { .. }) {
+                // Bridge rules v2: the bridge's `rotation_nonce`, the same rule a counter over.
+                let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
+                if bridge.rotation_nonce != nonce {
+                    return Err(TxError::Bridge(BridgeError::BadRotationNonce { expected: bridge.rotation_nonce, got: nonce }));
                 }
             } else if matches!(tx.action, Action::RegisterBridgedToken { .. } | Action::ListBacking { .. }) {
                 // B4: the bridge's `list_nonce`, the same rule one counter over.
@@ -1385,6 +1397,58 @@ mod tests {
             fixtures::bundle_fee() * 3,
             fixtures::bundle_fee() * 2
         ]);
+    }
+
+    /// Bridge rules v2 (audit v4): a rotation is pooled bundle-less, is governance (exempt from
+    /// the cap, first among the candidates), claims the bridge's one `rotation_nonce` — a PQ
+    /// rotation and a pause-key rotation at the same nonce conflict — and is dropped once the
+    /// nonce moves past it. On a chain-14-shaped ledger it is refused `RulesV2Disabled`.
+    #[test]
+    fn a_rotation_is_governance_and_claims_the_rotation_nonce() {
+        let (gs, _) = fixtures::bridged_genesis_v2(1);
+        let l = gs.ledger.clone();
+        let mut m = Mempool::new(1);
+        let pay = fixtures::bundle_tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fixtures::bundle_fee() * 2);
+        m.insert(pay.clone(), &l, &StubExecutor).unwrap();
+        let rotate = fixtures::rotate_pause_tx(&l, &fixtures::key(0x99), 0);
+        assert_eq!(rotate.bundle, None);
+        m.insert(rotate.clone(), &l, &StubExecutor).unwrap_or_else(|e| panic!("governance is exempt from the cap: {e:?}"));
+        assert_eq!(m.candidates(&l, 10), vec![rotate.clone(), pay.clone()], "the rotation leads");
+        // A PQ rotation at the same nonce claims the same slot.
+        let keys = fixtures::pq_keys();
+        let new: Vec<randprotocol_core::PublicKey> = (0..6u8).map(|i| fixtures::key(0xa0 + i).public_key().clone()).collect();
+        let msg = randprotocol_core::bridge::gov::rotate_pq_message(l.chain_id(), 0, &new);
+        let rotate_pq = Transaction {
+            chain_id: l.chain_id(),
+            bundle: None,
+            action: Action::RotatePqGuardians {
+                new_pq_guardians: new,
+                nonce: 0,
+                pq_signatures: (0..5u8)
+                    .map(|i| randprotocol_core::bridge::PqSignature { index: i, signature: keys[i as usize].sign(&msg).as_bytes().to_vec() })
+                    .collect(),
+            },
+        };
+        assert_eq!(m.precheck(&rotate_pq, &l, &StubExecutor).map(|_| ()), Err(MempoolError::Conflict(claim_conflict_key(&Address([0; 32])))));
+        // A rotation signed for a nonce the bridge has passed is refused on the nonce.
+        assert_eq!(
+            m.precheck(&fixtures::rotate_pause_tx(&l, &fixtures::key(0x98), 1), &l, &StubExecutor).map(|_| ()),
+            Err(MempoolError::Invalid(TxError::Bridge(randprotocol_core::bridge::BridgeError::BadRotationNonce { expected: 0, got: 1 })))
+        );
+        // Once it commits, the nonce is 1 and the pooled rotation is dropped.
+        let mut after = l.clone();
+        after.apply_tx(&rotate, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        assert_eq!(after.bridge().unwrap().rotation_nonce, 1);
+        m.prune(&after);
+        assert_eq!(m.candidates(&after, 10), vec![pay]);
+        // Chain 14's shape: the ledger's gate refuses it before anything is pooled.
+        let (v1, _) = bridged_ledger();
+        let mut m1 = Mempool::new(100);
+        assert_eq!(
+            m1.insert(fixtures::rotate_pause_tx(&v1, &fixtures::key(0x99), 0), &v1, &StubExecutor).map(|_| ()),
+            Err(MempoolError::Invalid(TxError::Bridge(randprotocol_core::bridge::BridgeError::RulesV2Disabled)))
+        );
+        assert!(m1.is_empty());
     }
 
     /// A ledger on a bridged chain, plus the guardian secrets that can attest to it.

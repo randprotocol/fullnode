@@ -182,6 +182,9 @@ pub fn fee_floor(action: &Action) -> u64 {
         // `registration_fee` — a ledger fact, charged by `ledger::bridge_gov::validate`
         // (`TokenError::RegistrationFeeTooLow`) the way `RegisterToken`'s is.
         Action::RegisterBridgedToken { .. } | Action::ListBacking { .. } => BUNDLE_BASE,
+        // Bridge rules v2: bundle-less like the pause, and unspammable for the same reason — each
+        // needs a PQ guardian quorum over the current `rotation_nonce`, and each spends it.
+        Action::RotatePqGuardians { .. } | Action::RotatePauseKey { .. } => 0,
     }
 }
 

@@ -55,6 +55,13 @@ use crate::ledger::tokens::{MintAuthority, TokenError, TokenRegistry};
 /// guardian quorum. Genesis validation requires it on every bridged chain, as a Dilithium2 key
 /// that is none of the `pq_guardians` (it must be held away from the guardian keys); parsing
 /// defaults it to absent for the same reason `pq_guardians` defaults to empty.
+///
+/// `rules_v2` (audit v4, bridge rules v2 — `docs/bridge.md` §21) switches on, for the chain's
+/// life, the PQ and pause-key rotations, the rolling-window mint caps and the no-listing-while-
+/// paused rule. Absent on chain 14, and then **absent from the genesis commitment, the bridge
+/// root and the storage blob alike** — it is committed by `genesis.rs` under its own tag, folded
+/// into `rand-bridge-state-5` and stored under its own key only when present, so a chain-14
+/// file, root and database are byte-for-byte what they were.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeConfig {
@@ -68,6 +75,27 @@ pub struct BridgeConfig {
     pub pq_guardians: Vec<PublicKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_key: Option<PublicKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_v2: Option<BridgeRulesV2>,
+}
+
+/// Bridge rules v2 (audit v4 BRG-14 / BR-4): the parameters the second rule set adds. Genesis
+/// holds `cap_window_secs` to `3600..=7 × 86 400` and `global_mint_cap_per_window` above zero.
+///
+/// - `global_mint_cap_per_window`: the most **every backing of every token together** may mint
+///   inside one window, in eight-decimal token units (a plain number in the genesis file, like
+///   `tokens.mint_cap_per_day`).
+/// - `cap_window_secs`: the rolling window, of the block timestamp, that both this cap and the
+///   per-backing `mint_cap_per_day` are measured over instead of the calendar day.
+///
+/// Part of the genesis hash (`b"bridge_rules_v2"` ‖ cap ‖ window, tagged, only when present), of
+/// the bridge root (`rand-bridge-state-5`) and of the token root (the windows themselves, under
+/// `rand-token-registry-3`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeRulesV2 {
+    pub global_mint_cap_per_window: u64,
+    pub cap_window_secs: u32,
 }
 
 /// The plain-bytes twin of [`BridgeConfig`], used for the genesis
@@ -89,8 +117,13 @@ pub struct BridgeCommit {
 impl From<&BridgeConfig> for BridgeCommit {
     /// Destructured on purpose: a new `BridgeConfig` field must not silently
     /// fall out of the genesis commitment — it has to break this conversion.
+    ///
+    /// `rules_v2` is destructured and deliberately *not* here: `BridgeCommit` is bincode, and an
+    /// `Option` field would put a byte into every chain's commitment, chain 14's included. The
+    /// genesis builder commits it under its own tag, only when present (`Genesis::build`), the
+    /// way the call limits are committed.
     fn from(cfg: &BridgeConfig) -> BridgeCommit {
-        let BridgeConfig { emitter, guardians, emitters, pq_guardians, pause_key } = cfg;
+        let BridgeConfig { emitter, guardians, emitters, pq_guardians, pause_key, rules_v2: _ } = cfg;
         BridgeCommit {
             emitter: *emitter,
             guardians: guardians.clone(),
@@ -149,6 +182,13 @@ pub struct BridgeState {
     /// B4: the nonce `M_list` and `M_register` must carry; each accepted `ListBacking` or
     /// `RegisterBridgedToken` bumps it.
     pub list_nonce: u64,
+    /// Bridge rules v2: the nonce `M_rotate_pq` and `M_rotate_pause` must carry; each accepted
+    /// `RotatePqGuardians` or `RotatePauseKey` bumps it. Always zero without `rules_v2`, and
+    /// then in no root and no blob.
+    pub rotation_nonce: u64,
+    /// Bridge rules v2: the genesis `bridge.rules_v2`, `None` on chain 14. The gate every v2
+    /// rule reads first (`BridgeError::RulesV2Disabled`).
+    pub rules_v2: Option<BridgeRulesV2>,
 }
 
 /// The small, whole-state half of a [`BridgeState`]: everything except the
@@ -172,6 +212,16 @@ pub struct BridgeMeta {
     pub mint_paused: bool,
     pub pause_nonce: u64,
     pub list_nonce: u64,
+}
+
+/// The v2 half of the storage blob (bridge rules v2): what [`BridgeMeta`] cannot carry without
+/// changing its layout. Stored under its own key, and only on a chain whose genesis has
+/// `rules_v2` — so a chain-14 database keeps decoding its v1 blob strictly, and a v0.5.4 node
+/// on chain 14 never writes a key an older build would trip over.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeMetaV2 {
+    pub rotation_nonce: u64,
+    pub rules: BridgeRulesV2,
 }
 
 /// Why a bridge transaction was rejected.
@@ -282,6 +332,34 @@ pub enum BridgeError {
     /// ever be admitted, so the listing is refused rather than left unusable.
     #[error("chain {chain} has no registered emitter on this bridge")]
     NoEmitter { chain: u16 },
+    /// Bridge rules v2: a `RotatePqGuardians` or `RotatePauseKey` on a chain whose genesis has no
+    /// `bridge.rules_v2` — chain 14. A genesis constant, so a permanent verdict.
+    #[error("bridge rules v2 are not enabled on this chain")]
+    RulesV2Disabled,
+    /// Bridge rules v2: `M_rotate_pq`/`M_rotate_pause` must carry the bridge's `rotation_nonce`.
+    #[error("wrong rotation nonce: expected {expected}, got {got}")]
+    BadRotationNonce { expected: u64, got: u64 },
+    /// Bridge rules v2: the new PQ set must be index-aligned with the current ECDSA set — one PQ
+    /// key per guardian, the genesis rule.
+    #[error("the new PQ set has {got} keys, the current guardian set {expected}: the two are index-aligned")]
+    PqSetLengthMismatch { expected: usize, got: usize },
+    /// Bridge rules v2: a new PQ guardian key that is not exactly a Dilithium2 public key's 1 312
+    /// bytes. A byte length, so a permanent verdict.
+    #[error("new PQ guardian {index} is {len} bytes, not a Dilithium2 public key's 1312")]
+    BadPqGuardianKey { index: usize, len: usize },
+    /// Bridge rules v2: the same key twice in the new PQ set (one operator would count twice).
+    #[error("duplicate key in the new PQ guardian set")]
+    DuplicatePqGuardian,
+    /// Bridge rules v2: the new PQ set contains the pause key, which must be held apart from the
+    /// guardian keys (the genesis rule).
+    #[error("the new PQ guardian set contains the pause key")]
+    GuardianIsPauseKey,
+    /// Bridge rules v2: a new pause key that is not exactly a Dilithium2 public key's 1 312 bytes.
+    #[error("the new pause key is {len} bytes, not a Dilithium2 public key's 1312")]
+    BadPauseKeyLength { len: usize },
+    /// Bridge rules v2: the new pause key is one of the PQ guardians'.
+    #[error("the new pause key is a PQ guardian's key")]
+    PauseKeyIsGuardian,
 }
 
 /// A transfer attestation as the pool needs it: which asset, under which note
@@ -318,10 +396,10 @@ pub struct BridgeTransfer {
     /// Carried for the record — the figure the source chain meant for whoever
     /// relayed this attestation. The pool pays no relayer.
     pub relayer_fee: u64,
-    /// B1: the UTC day this deposit counts against its backing's daily mint cap —
-    /// [`mint_day`] of the block time `check_attest` judged it at — carried so apply moves the
-    /// very counter check compared.
-    pub day: u32,
+    /// The block time, unix seconds, `check_attest` judged this deposit at — carried so apply
+    /// moves the very counters check compared: B1's day counter ([`mint_day`] of it) and, under
+    /// bridge rules v2, the rolling windows.
+    pub now: u64,
 }
 
 /// B1: seconds in a mint-cap day. A day is a UTC calendar day of the block timestamp
@@ -403,6 +481,7 @@ impl BridgeState {
             current_set: 0,
             pq_guardians: cfg.pq_guardians.clone(),
             pause_key: cfg.pause_key.clone(),
+            rules_v2: cfg.rules_v2.clone(),
             ..Default::default()
         }
     }
@@ -425,6 +504,9 @@ impl BridgeState {
             mint_paused,
             pause_nonce,
             list_nonce,
+            // The v2 half: `meta_v2`'s, never this blob's (its layout is chain 14's).
+            rotation_nonce: _,
+            rules_v2: _,
         } = self;
         BridgeMeta {
             emitter: *emitter,
@@ -440,10 +522,18 @@ impl BridgeState {
         }
     }
 
-    /// Rebuilds a bridge from the two halves storage keeps apart. The inverse
-    /// of [`BridgeState::meta`] plus the two row-wise collections.
+    /// The v2 half of the storage blob (bridge rules v2): `Some` exactly when the genesis carries
+    /// `rules_v2`, `None` on chain 14 — where there is nothing to store and no key to write.
+    pub fn meta_v2(&self) -> Option<BridgeMetaV2> {
+        self.rules_v2.clone().map(|rules| BridgeMetaV2 { rotation_nonce: self.rotation_nonce, rules })
+    }
+
+    /// Rebuilds a bridge from the halves storage keeps apart: the v1 blob, the v2 blob when the
+    /// chain has one, and the two row-wise collections. The inverse of [`BridgeState::meta`] and
+    /// [`BridgeState::meta_v2`].
     pub fn from_parts(
         meta: BridgeMeta,
+        v2: Option<BridgeMetaV2>,
         spent: BTreeSet<Hash>,
         burns: BTreeMap<u64, BridgeBurnRecord>,
     ) -> BridgeState {
@@ -459,6 +549,10 @@ impl BridgeState {
             pause_nonce,
             list_nonce,
         } = meta;
+        let (rotation_nonce, rules_v2) = match v2 {
+            Some(BridgeMetaV2 { rotation_nonce, rules }) => (rotation_nonce, Some(rules)),
+            None => (0, None),
+        };
         BridgeState {
             emitter,
             emitters,
@@ -472,6 +566,8 @@ impl BridgeState {
             mint_paused,
             pause_nonce,
             list_nonce,
+            rotation_nonce,
+            rules_v2,
         }
     }
 
@@ -587,8 +683,9 @@ impl BridgeState {
                 // backing's `locked` overflowing, then the token's supply. The ledger applies the
                 // deposit note *before* it locks, so a refusal there would be a half-applied
                 // transaction.
-                let day = mint_day(now);
-                tokens.check_lock(index, t.token_chain, &t.token_address, amount, day)?;
+                // (Under bridge rules v2 the registry judges the rolling windows here too, the
+                // global one included.)
+                tokens.check_lock(index, t.token_chain, &t.token_address, amount, now)?;
                 AttestPlan::Transfer(BridgeTransfer {
                     asset,
                     index,
@@ -597,7 +694,7 @@ impl BridgeState {
                     amount,
                     to_hash: t.to,
                     relayer_fee,
-                    day,
+                    now,
                 })
             }
             Payload::GuardianSetUpgrade(g) => {
@@ -828,6 +925,13 @@ impl BridgeState {
     ///     || bincode(pause_key, mint_paused, pause_nonce, list_nonce))
     /// ```
     ///
+    /// Under bridge rules v2 (audit v4) — and only then — the same bytes continue with
+    /// `|| bincode(rotation_nonce, rules_v2)` and the domain is `rand-bridge-state-5`: the
+    /// rotation nonce decides which rotation is admissible next and the two cap parameters decide
+    /// which mints are, so two nodes disagreeing about either must disagree at the state root. A
+    /// chain without the section — chain 14 — hashes byte-for-byte as above, whatever
+    /// `rotation_nonce` reads (nothing can move it there).
+    ///
     /// B1/B4 appended the pause key, the pause flag and the two governance
     /// nonces and bumped the domain to `rand-bridge-state-4`: each decides
     /// what the next governance message or attestation may do, so two nodes
@@ -871,6 +975,12 @@ impl BridgeState {
             &bincode::serialize(&(&self.pause_key, self.mint_paused, self.pause_nonce, self.list_nonce))
                 .expect("the pause and listing state serializes"),
         );
+        if let Some(rules) = &self.rules_v2 {
+            buf.extend_from_slice(
+                &bincode::serialize(&(self.rotation_nonce, rules)).expect("the rotation nonce and the rules serialize"),
+            );
+            return Hash::digest_domain(b"rand-bridge-state-5", &buf);
+        }
         Hash::digest_domain(b"rand-bridge-state-4", &buf)
     }
 }
@@ -1033,6 +1143,7 @@ mod tests {
             emitters: (2u16..=5).map(|c| (c, [c as u8; 32])).collect(),
             pq_guardians: pq_keys().iter().map(|k| k.public_key().clone()).collect(),
             pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
+            rules_v2: None,
         };
         (config, secrets)
     }
@@ -1177,7 +1288,7 @@ mod tests {
         // the token, plus the coin the attestation deposits against — the ledger needs the first
         // to compute the deposit note's commitment and the second to lock the right backing.
         let plan = check(&st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap().plan().clone();
-        let want = BridgeTransfer { asset, index: 1, chain: 2, token: TOKEN, amount: 1_000, to_hash: to_hash(), relayer_fee: 10, day: 0 };
+        let want = BridgeTransfer { asset, index: 1, chain: 2, token: TOKEN, amount: 1_000, to_hash: to_hash(), relayer_fee: 10, now: 1 };
         assert_eq!(plan, AttestPlan::Transfer(want.clone()));
         let out = apply(&mut st, &tk, &attest(&s, 0, transfer_body(2, 1_000, 10, 1)), 1).unwrap();
         assert_eq!(out, AttestOutcome::Minted(want));
@@ -1280,7 +1391,7 @@ mod tests {
                 amount: u64::MAX,
                 to_hash: to_hash(),
                 relayer_fee: 7,
-                day: 0,
+                now: 1,
             })
         );
         // And once that coin is holding anything at all, the same transfer is refused before a
@@ -1384,7 +1495,7 @@ mod tests {
         let meta: BridgeMeta = bincode::deserialize(&blob).unwrap();
         assert_eq!(meta, st.meta());
         assert_eq!(meta.current_set, 1, "the rotation is part of the blob, not derived");
-        let rebuilt = BridgeState::from_parts(meta, st.spent.clone(), st.burns.clone());
+        let rebuilt = BridgeState::from_parts(meta, None, st.spent.clone(), st.burns.clone());
         assert_eq!(rebuilt, st);
         assert_eq!(rebuilt.root(), st.root());
     }
@@ -1749,6 +1860,7 @@ mod tests {
                 PublicKey::from_bytes(&[0x44; crate::crypto::PUBLIC_KEY_LEN]).unwrap(),
             ],
             pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
+            rules_v2: None,
         });
         st.spent.insert(Hash([0x44; 32]));
         st.burn_sequence = 7;
@@ -1993,7 +2105,7 @@ mod tests {
         other.pq_guardians.swap(0, 1);
         assert_ne!(other.root(), st.root());
         let meta: BridgeMeta = bincode::deserialize(&bincode::serialize(&st.meta()).unwrap()).unwrap();
-        assert_eq!(BridgeState::from_parts(meta, BTreeSet::new(), BTreeMap::new()), st);
+        assert_eq!(BridgeState::from_parts(meta, None, BTreeSet::new(), BTreeMap::new()), st);
     }
 
     /// Every case of the bridge repo's `pq-cosignatures.json`, end to end through `check_attest`:
@@ -2024,6 +2136,7 @@ mod tests {
             emitters,
             pq_guardians: vector_keys(&pq),
             pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
+            rules_v2: None,
         });
         let now = att["now"].as_u64().unwrap();
         let by_name = |name: &str| {
@@ -2104,9 +2217,9 @@ mod tests {
             let bytes = attest(&s, 0, token_body(2, token, amount, fee, CHAIN_RAND));
             let checked = check(st, tk, &bytes, now)?;
             let AttestPlan::Transfer(t) = checked.plan().clone() else { panic!("a transfer") };
-            assert_eq!(t.day, mint_day(now));
+            assert_eq!(t.now, now);
             st.apply_attest(checked);
-            tk.lock(t.index, t.chain, &t.token, t.amount, t.day).map_err(BridgeError::Token)?;
+            tk.lock(t.index, t.chain, &t.token, t.amount, t.now).map_err(BridgeError::Token)?;
             Ok::<_, BridgeError>(())
         };
         deposit(&mut st, &mut tk, TOKEN, 600, 0, day0).unwrap();
@@ -2143,6 +2256,46 @@ mod tests {
         assert_eq!(mint_day(u64::MAX), u32::MAX, "saturates, never wraps");
     }
 
+    /// Audit v4 (bridge rules v2), the gating guard: a bridge built from a chain-14-shaped config
+    /// — no `rules_v2` — commits under `rand-bridge-state-4` to exactly the bytes it did before
+    /// v0.5.4, whatever the rotation counter reads, and its storage blob is the v1 `BridgeMeta`
+    /// with no v2 half. The pin is the root this fixture had at v0.5.3.
+    #[test]
+    fn a_bridge_without_rules_v2_has_the_pinned_v4_root_and_no_v2_meta() {
+        let (c, _) = cfg();
+        let mut st = BridgeState::from_config(&c);
+        (st.mint_paused, st.pause_nonce, st.list_nonce, st.burn_sequence) = (true, 3, 9, 2);
+        assert_eq!(st.root().to_hex(), "5df59d6ada206d29301125c469d8e61beee05d4ee6568a09f0bf63083eb18014");
+        assert_eq!(st.rules_v2, None);
+        assert_eq!(st.meta_v2(), None, "no v2 half to store");
+        // The rotation counter is not in the v4 root: without `rules_v2` nothing can move it,
+        // and a chain-14 node must not fork on a field it never had.
+        st.rotation_nonce = 7;
+        assert_eq!(st.root().to_hex(), "5df59d6ada206d29301125c469d8e61beee05d4ee6568a09f0bf63083eb18014");
+        let meta = st.meta();
+        assert_eq!(BridgeState::from_parts(meta, None, BTreeSet::new(), BTreeMap::new()).rotation_nonce, 0);
+    }
+
+    /// Bridge rules v2: a `rules_v2` section moves the bridge root to `rand-bridge-state-5`
+    /// (the rotation nonce and the two cap parameters are in it), the v2 half of the meta is
+    /// `Some` and round-trips beside the unchanged v1 blob, and `from_config` carries the rules.
+    #[test]
+    fn rules_v2_move_the_root_to_the_v5_domain_and_ride_a_second_meta_blob() {
+        let (mut c, _) = cfg();
+        let v1 = BridgeState::from_config(&c);
+        c.rules_v2 = Some(BridgeRulesV2 { global_mint_cap_per_window: 5_000, cap_window_secs: 86_400 });
+        let mut st = BridgeState::from_config(&c);
+        assert_eq!(st.rules_v2, c.rules_v2);
+        assert_eq!(st.meta(), v1.meta(), "the v1 blob is byte-for-byte the v1 bridge's");
+        assert_ne!(st.root(), v1.root(), "the rules are in the root");
+        let r0 = st.root();
+        st.rotation_nonce = 1;
+        assert_ne!(st.root(), r0, "and so is the rotation nonce");
+        let v2: BridgeMetaV2 = bincode::deserialize(&bincode::serialize(&st.meta_v2().unwrap()).unwrap()).unwrap();
+        assert_eq!(v2, BridgeMetaV2 { rotation_nonce: 1, rules: c.rules_v2.clone().unwrap() });
+        assert_eq!(BridgeState::from_parts(st.meta(), Some(v2), BTreeSet::new(), BTreeMap::new()), st);
+    }
+
     /// The pause state, both nonces and the pause key ride the storage blob.
     #[test]
     fn the_pause_state_is_in_the_meta_blob() {
@@ -2152,6 +2305,6 @@ mod tests {
         assert!(!st.mint_paused);
         (st.mint_paused, st.pause_nonce, st.list_nonce) = (true, 3, 9);
         let meta: BridgeMeta = bincode::deserialize(&bincode::serialize(&st.meta()).unwrap()).unwrap();
-        assert_eq!(BridgeState::from_parts(meta, BTreeSet::new(), BTreeMap::new()), st);
+        assert_eq!(BridgeState::from_parts(meta, None, BTreeSet::new(), BTreeMap::new()), st);
     }
 }

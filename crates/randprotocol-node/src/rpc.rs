@@ -1405,6 +1405,19 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
             "decimals": decimals, "nonce": nonce,
             "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
         }),
+        // Bridge rules v2 (audit v4): the two rotations. The new keys are public (hex, 1 312
+        // bytes each); the nonce is the bridge's `rotation_nonce` they spent; the signers are
+        // indices into the PQ set *before* the rotation.
+        Action::RotatePqGuardians { new_pq_guardians, nonce, pq_signatures } => json!({
+            "kind": "rotate_pq_guardians",
+            "new_pq_guardians": new_pq_guardians.iter().map(|k| k.to_hex()).collect::<Vec<_>>(),
+            "nonce": nonce,
+            "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
+        }),
+        Action::RotatePauseKey { new_pause_key, nonce, pq_signatures } => json!({
+            "kind": "rotate_pause_key", "new_pause_key": new_pause_key.to_hex(), "nonce": nonce,
+            "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -2039,6 +2052,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             // there; a bridged chain always has one (`GenesisError::BridgeNeedsTokens`), and a
             // store that somehow lacks it serves an empty registry rather than failing the call.
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
+            let v2 = st.storage.bridge_meta_v2().map_err(RpcError::internal)?;
             let day = head_mint_day(&st.storage)?;
             let guardians = bridge
                 .guardian_sets
@@ -2070,6 +2084,14 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // the registry's registration fee, read here so the wallet can pay it exactly.
                 "registration_fee": tokens.as_ref().map(|t| t.registration_fee.to_string()),
                 "burn_sequence": bridge.burn_sequence,
+                // Bridge rules v2 (audit v4): what the next `M_rotate_pq`/`M_rotate_pause` must
+                // carry, and the two cap parameters (`null` on a chain without the section —
+                // chain 14 — where the nonce reads 0 and nothing can move it).
+                "rotation_nonce": v2.as_ref().map_or(0, |m| m.rotation_nonce),
+                "rules_v2": v2.as_ref().map(|m| json!({
+                    "global_mint_cap_per_window": m.rules.global_mint_cap_per_window.to_string(),
+                    "cap_window_secs": m.rules.cap_window_secs,
+                })),
                 // `next_index` is gone with the bridge's own registry: there is no index to
                 // predict any more, because a bridged token is listed before it can be deposited
                 // and its index is a fact a wallet reads off `assets` (`rand_getAssets`).
@@ -3806,6 +3828,15 @@ mod tests {
             list,
             json!({ "kind": "list_backing", "token_index": 1, "chain": 5, "token": hex::encode([0xc6; 32]), "decimals": 6, "nonce": 6, "pq_signers": [3] })
         );
+        // Bridge rules v2: the two rotations, bundle-less; the new keys hex, the signers by index.
+        let keys: Vec<randprotocol_core::PublicKey> = (0..2u8).map(|i| key(0x40 + i).public_key().clone()).collect();
+        let rotate = bundle_less(Action::RotatePqGuardians { new_pq_guardians: keys.clone(), nonce: 7, pq_signatures: vec![pq(1), pq(4)] });
+        assert_eq!(
+            rotate,
+            json!({ "kind": "rotate_pq_guardians", "new_pq_guardians": [keys[0].to_hex(), keys[1].to_hex()], "nonce": 7, "pq_signers": [1, 4] })
+        );
+        let pause_key = bundle_less(Action::RotatePauseKey { new_pause_key: keys[1].clone(), nonce: 8, pq_signatures: vec![pq(0)] });
+        assert_eq!(pause_key, json!({ "kind": "rotate_pause_key", "new_pause_key": keys[1].to_hex(), "nonce": 8, "pq_signers": [0] }));
     }
 
     #[test]
@@ -4082,6 +4113,25 @@ mod tests {
         (dir, st, gs, att)
     }
 
+    /// Bridge rules v2 (audit v4): `rand_getBridgeState` serves the rotation nonce a signer reads
+    /// before it signs `M_rotate_pq`/`M_rotate_pause`, and the two cap parameters — the global cap
+    /// as a decimal string, like every amount.
+    #[tokio::test]
+    async fn bridge_state_reports_the_rotation_nonce_and_the_v2_rules() {
+        let (gs, _) = fixtures::bridged_genesis_v2(1);
+        let (_d, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let rotate = fixtures::rotate_pause_tx(&ledger, &key(0x99), 0);
+        let b1 = make_block(&gs.block, &mut ledger, vec![rotate.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let v = ok(&st, "rand_getBridgeState", json!([])).await;
+        assert_eq!(v["rotation_nonce"], 1);
+        assert_eq!(v["rules_v2"], json!({ "global_mint_cap_per_window": "1000000", "cap_window_secs": 86_400 }));
+        assert_eq!(v["pause_key"], key(0x99).public_key().to_hex(), "the rotated key");
+        let t = ok(&st, "rand_getTransaction", json!([rotate.hash().to_hex()])).await;
+        assert_eq!(t["tx"]["action"]["kind"], "rotate_pause_key");
+    }
+
     /// The bridge's public state, as a relayer and a guardian read it: who signs, who may
     /// emit, what is registered and how many messages have gone out. No balance anywhere —
     /// bridged value is notes.
@@ -4103,6 +4153,9 @@ mod tests {
         assert_eq!(v["pause_key"], fixtures::key(0x7f).public_key().to_hex());
         assert_eq!(v["registration_fee"], "1000000000", "B4: what a registration owes past the base");
         assert_eq!(v["burn_sequence"], 1);
+        // Bridge rules v2 (audit v4): chain 14's shape has the nonce at zero and no rules.
+        assert_eq!(v["rotation_nonce"], 0);
+        assert_eq!(v["rules_v2"], Value::Null);
         // `next_index` is gone with the bridge's own registry: there is no index left to predict,
         // because a bridged token is listed before it can be deposited.
         assert!(v.get("next_index").is_none(), "no index to predict any more");

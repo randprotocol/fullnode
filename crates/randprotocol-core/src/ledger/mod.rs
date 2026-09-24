@@ -1365,11 +1365,13 @@ impl Ledger {
                 tokens::validate(self, tx, a, executor)?;
             }
             // Bridge hardening B1/B4: the pause and its lifting, and listing after genesis — gated
-            // on the `bridge` section.
+            // on the `bridge` section. Bridge rules v2: the two rotations, gated on `rules_v2`.
             a @ (Action::PauseMints { .. }
             | Action::UnpauseMints { .. }
             | Action::RegisterBridgedToken { .. }
-            | Action::ListBacking { .. }) => {
+            | Action::ListBacking { .. }
+            | Action::RotatePqGuardians { .. }
+            | Action::RotatePauseKey { .. }) => {
                 bridge_gov::validate(self, tx, a)?;
             }
             Action::Aggregate { .. } => {
@@ -1552,7 +1554,9 @@ impl Ledger {
             a @ (Action::PauseMints { .. }
             | Action::UnpauseMints { .. }
             | Action::RegisterBridgedToken { .. }
-            | Action::ListBacking { .. }) => {
+            | Action::ListBacking { .. }
+            | Action::RotatePqGuardians { .. }
+            | Action::RotatePauseKey { .. }) => {
                 bridge_gov::apply(self, tx, a)?;
             }
             Action::Aggregate { .. } => {
@@ -3351,6 +3355,7 @@ mod tests {
                 emitters: BTreeMap::from([(2u16, [9u8; 32])]),
                 pq_guardians: vec![],
                 pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
+                rules_v2: None,
             };
         let mut bridged = plain.clone();
         bridged.set_bridge(Some(BridgeState::from_config(&config)));
@@ -3403,6 +3408,7 @@ mod tests {
                 emitters: BTreeMap::from([(2u16, [9u8; 32])]),
                 pq_guardians: vec![],
                 pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
+                rules_v2: None,
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));
@@ -3461,6 +3467,7 @@ mod tests {
                 emitters: BTreeMap::from([(2u16, [9u8; 32])]),
                 pq_guardians: vec![],
                 pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
+                rules_v2: None,
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));

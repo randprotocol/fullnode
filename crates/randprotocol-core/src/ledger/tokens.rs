@@ -205,8 +205,121 @@ pub struct TokenRegistry {
     /// Bridge hardening B1: the most one backing of any bridged token may mint in one UTC day, in
     /// the token's own (8-decimal) units — the genesis `tokens.mint_cap_per_day`, applied **per
     /// backing** ([`TokenError::MintCapExceeded`]). [`TokenRegistry::new`] starts it uncapped
-    /// (`u64::MAX`); genesis sets it with [`TokenRegistry::with_mint_cap`].
+    /// (`u64::MAX`); genesis sets it with [`TokenRegistry::with_mint_cap`]. Under bridge rules v2
+    /// the same figure is measured over the rolling window instead of the day.
     mint_cap_per_day: u64,
+    /// Audit v4 (TOK-1, bridge rules v2): everything v0.5.4 adds to the registry, kept **out of
+    /// the v1 bincode layout** — `#[serde(skip)]`, so `META_TOKENS` on chain 14 is byte-for-byte
+    /// what it was and a chain-14 blob still decodes — and persisted by storage under its own key
+    /// only when it is not the default. Folded into the root under `rand-token-registry-3` when
+    /// not the default; a chain without it hashes under `rand-token-registry-2` as before.
+    #[serde(skip)]
+    ext: RegistryExt,
+}
+
+/// The v0.5.4 half of a [`TokenRegistry`] (audit v4): genesis-derived limits and the rolling
+/// mint-window state, outside the v1 blob so chain 14's on-disk registry and root are untouched.
+/// [`Default`] is "none of it" — chain 14's shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryExt {
+    /// TOK-1: the genesis `tokens.max_tokens`, the most tokens the registry may hold
+    /// ([`TokenError::RegistryFull`] at it). `None` is today's `u32::MAX` bound.
+    pub max_tokens: Option<u32>,
+    /// Bridge rules v2: the rolling windows, `Some` exactly when the genesis carries
+    /// `bridge.rules_v2`.
+    pub windows: Option<MintWindows>,
+}
+
+/// Bridge rules v2 (audit v4): the rolling-window mint accounting — one window per backing and
+/// one for the whole registry — and the two parameters the genesis fixed for them.
+///
+/// Consensus state: every slot decides which deposits are admissible, so the whole struct is in
+/// the token root (`rand-token-registry-3`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintWindows {
+    /// The genesis `bridge.rules_v2.cap_window_secs`.
+    pub window_secs: u32,
+    /// The genesis `bridge.rules_v2.global_mint_cap_per_window`.
+    pub global_cap: u64,
+    /// Every backing of every token together, against `global_cap`.
+    pub global: MintWindow,
+    /// One window per backing, keyed `(token index, chain, token address)`, each against
+    /// `mint_cap_per_day`. A backing that has never minted inside the window has no entry.
+    pub backings: BTreeMap<(u32, u16, [u8; 32]), MintWindow>,
+}
+
+impl MintWindows {
+    /// What `(index, chain, token)` has minted inside the window ending at `now`.
+    pub fn backing_minted(&self, index: u32, chain: u16, token: &[u8; 32], now: u64) -> u64 {
+        self.backings.get(&(index, chain, *token)).map_or(0, |w| w.minted_within(now, self.window_secs as u64))
+    }
+
+    /// What everything together has minted inside the window ending at `now`.
+    pub fn global_minted(&self, now: u64) -> u64 {
+        self.global.minted_within(now, self.window_secs as u64)
+    }
+
+    fn add(&mut self, index: u32, chain: u16, token: &[u8; 32], now: u64, amount: u64) {
+        let window = self.window_secs as u64;
+        self.backings.entry((index, chain, *token)).or_default().add(now, window, amount);
+        self.global.add(now, window, amount);
+    }
+}
+
+/// One rolling window of mints (bridge rules v2): a ring of slots of `⌈window_secs / 24⌉` seconds
+/// each, keyed by `now / slot_secs`, each holding what was minted inside it. **A slot counts
+/// while its last second is less than `window_secs` before `now`** (`now − (start + slot − 1) <
+/// window`, strictly): the count is never below the exact rolling sum — it is counted too strictly
+/// by up to one slot, never twice — and a deposit made in the last second of its slot leaves the
+/// window exactly `window_secs` later. Slots that have left the window are dropped on the next
+/// [`MintWindow::add`], so a window holds at most 26 slots whatever its length (a 24 h window's
+/// slots are hours; a 7-day window's are 7 hours).
+///
+/// The slot width is derived from `window_secs` on every call rather than stored, so the two can
+/// never disagree; the genesis fixes the window for the chain's life.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintWindow {
+    slots: BTreeMap<u64, u64>,
+}
+
+/// How many slots a [`MintWindow`] divides its window into.
+pub const MINT_WINDOW_SLOTS: u64 = 24;
+
+impl MintWindow {
+    fn slot_secs(window_secs: u64) -> u64 {
+        window_secs.div_ceil(MINT_WINDOW_SLOTS).max(1)
+    }
+
+    /// Whether the slot keyed `slot` (of `slot_secs` seconds) is still inside the window that
+    /// ends at `now`: its last second is less than `window_secs` before `now`.
+    fn inside(slot: u64, slot_secs: u64, now: u64, window_secs: u64) -> bool {
+        let last_second = slot.saturating_mul(slot_secs).saturating_add(slot_secs - 1);
+        now.saturating_sub(last_second) < window_secs
+    }
+
+    /// Counts `amount` at `now` (unix seconds) and drops every slot that has left the window.
+    /// Saturating: a window can never wrap back to a small count.
+    pub fn add(&mut self, now: u64, window_secs: u64, amount: u64) {
+        let slot_secs = Self::slot_secs(window_secs);
+        self.slots.retain(|slot, _| Self::inside(*slot, slot_secs, now, window_secs));
+        let minted = self.slots.entry(now / slot_secs).or_insert(0);
+        *minted = minted.saturating_add(amount);
+    }
+
+    /// What was minted inside the window ending at `now` — the slots still inside it, summed
+    /// (saturating).
+    pub fn minted_within(&self, now: u64, window_secs: u64) -> u64 {
+        let slot_secs = Self::slot_secs(window_secs);
+        self.slots
+            .iter()
+            .filter(|(slot, _)| Self::inside(**slot, slot_secs, now, window_secs))
+            .fold(0u64, |acc, (_, minted)| acc.saturating_add(*minted))
+    }
+
+    /// The slots as they are: `slot key -> minted`, for tests and the RPC.
+    pub fn slots(&self) -> &BTreeMap<u64, u64> {
+        &self.slots
+    }
 }
 
 /// Why a registry operation was refused. A later task's `validate`/`apply` for the RPL actions
@@ -308,6 +421,11 @@ pub enum TokenError {
     /// the next UTC day of the block timestamp.
     #[error("mint cap {cap} per backing per day: {minted_today} minted today, {amount} more would pass it")]
     MintCapExceeded { cap: u64, minted_today: u64, amount: u64 },
+    /// Bridge rules v2: a deposit that would take the registry-wide rolling window past
+    /// `global_mint_cap_per_window`. Not a verdict on the attestation — it becomes admissible as
+    /// the window rolls on.
+    #[error("global mint cap {cap} per window: {minted} minted inside it, {amount} more would pass it")]
+    GlobalMintCapExceeded { cap: u64, minted: u64, amount: u64 },
 }
 
 impl TokenRegistry {
@@ -321,6 +439,7 @@ impl TokenRegistry {
             backing_of: BTreeMap::new(),
             next_index: FIRST_TOKEN_INDEX,
             mint_cap_per_day: u64::MAX,
+            ext: RegistryExt::default(),
         }
     }
 
@@ -329,6 +448,47 @@ impl TokenRegistry {
     pub fn with_mint_cap(mut self, mint_cap_per_day: u64) -> TokenRegistry {
         self.mint_cap_per_day = mint_cap_per_day;
         self
+    }
+
+    /// This registry with bridge rules v2's rolling windows on — what genesis builds from
+    /// `bridge.rules_v2`: the per-backing cap is then measured over `window_secs` of the block
+    /// time instead of the calendar day, and `global_cap` bounds every backing together.
+    pub fn with_rules_v2(mut self, window_secs: u32, global_cap: u64) -> TokenRegistry {
+        self.ext.windows = Some(MintWindows { window_secs, global_cap, global: MintWindow::default(), backings: BTreeMap::new() });
+        self
+    }
+
+    /// This registry with TOK-1's cap on how many tokens it may hold — what genesis builds from
+    /// `tokens.max_tokens`.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> TokenRegistry {
+        self.ext.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// The rolling windows (bridge rules v2), `None` on a chain without the section.
+    pub fn windows(&self) -> Option<&MintWindows> {
+        self.ext.windows.as_ref()
+    }
+
+    /// TOK-1: the most tokens this registry may hold — `u32::MAX` without a genesis cap.
+    pub fn max_tokens(&self) -> u32 {
+        self.ext.max_tokens.unwrap_or(u32::MAX)
+    }
+
+    /// Whether a registration would be refused [`TokenError::RegistryFull`]: no index left, or
+    /// TOK-1's cap reached. The one place that decides it, for `register` and every validate arm.
+    pub fn is_full(&self) -> bool {
+        self.next_index == u32::MAX || self.by_index.len() as u64 >= self.max_tokens() as u64
+    }
+
+    /// The v0.5.4 half (audit v4), for storage to persist beside — never inside — the v1 blob.
+    pub fn ext(&self) -> &RegistryExt {
+        &self.ext
+    }
+
+    /// Re-attaches the v0.5.4 half a store kept under its own key.
+    pub fn set_ext(&mut self, ext: RegistryExt) {
+        self.ext = ext;
     }
 
     /// B1's per-backing daily mint cap, in the token's own units.
@@ -444,7 +604,7 @@ impl TokenRegistry {
             }
             other => other,
         };
-        if self.next_index == u32::MAX {
+        if self.is_full() {
             return Err(TokenError::RegistryFull);
         }
         let index = self.next_index;
@@ -511,24 +671,32 @@ impl TokenRegistry {
         Ok(())
     }
 
-    /// A deposit on UTC day `day`: `locked += amount` on the named backing and `total_supply +=
-    /// amount` on the token, both checked and applied together, so `total_supply == Σ locked`
-    /// survives every refusal as well as every success — and the backing's daily mint counter
-    /// (B1) moves by the same `amount`, reset first if its day is over.
+    /// A deposit at block time `now` (unix seconds): `locked += amount` on the named backing and
+    /// `total_supply += amount` on the token, both checked and applied together, so
+    /// `total_supply == Σ locked` survives every refusal as well as every success — and the
+    /// backing's daily mint counter (B1) moves by the same `amount`, reset first if its day
+    /// ([`crate::bridge::mint_day`] of `now`) is over. Under bridge rules v2 the backing's and
+    /// the registry's rolling windows take the same `amount` at `now`.
     ///
     /// [`TokenError::NotABacking`] when `(chain, token)` is not one of `index`'s backings — a
     /// non-bridged token has none at all, so this is also what it answers.
-    pub fn lock(&mut self, index: u32, chain: u16, token: &[u8; 32], amount: u64, day: u32) -> Result<(), TokenError> {
+    pub fn lock(&mut self, index: u32, chain: u16, token: &[u8; 32], amount: u64, now: u64) -> Result<(), TokenError> {
         // Every refusal first, in one place a validate step can call on its own
         // (`check_lock`), so what admission pre-checks is by construction what this would
         // refuse — and so the writes below cannot half-apply.
-        self.check_lock(index, chain, token, amount, day)?;
+        self.check_lock(index, chain, token, amount, now)?;
         self.move_backing(index, chain, token, amount, true);
+        let day = crate::bridge::mint_day(now);
         let backing = self.backing_mut(index, chain, token).expect("the checked half resolved the backing");
-        // `check_lock` bounded `minted_on(day) + amount` by the cap, so this cannot wrap.
-        backing.minted_today = backing.minted_on(day) + amount;
+        // The day counters move under both rule sets (they are in the leaf either way). Without
+        // the windows `check_lock` bounded `minted_on(day) + amount` by the cap; with them the
+        // day counter is uncapped, so the add saturates rather than wraps.
+        backing.minted_today = backing.minted_on(day).saturating_add(amount);
         // Never moves back (see `Backing::minted_on`): an older day added to the newer counter.
         backing.mint_day = backing.mint_day.max(day);
+        if let Some(w) = &mut self.ext.windows {
+            w.add(index, chain, token, now, amount);
+        }
         Ok(())
     }
 
@@ -560,14 +728,18 @@ impl TokenRegistry {
     }
 
     /// Exactly what [`Self::lock`] would refuse, without touching anything: the pair being a
-    /// backing of this token at all, the backing's own overflow and the supply's, then B1's daily
-    /// mint cap for that backing on `day`. The validate step of a `BridgeAttest` calls this so its
-    /// apply step cannot fail.
+    /// backing of this token at all, the backing's own overflow and the supply's, then B1's
+    /// per-backing mint cap at block time `now` (unix seconds) and, under bridge rules v2, the
+    /// registry-wide cap. The validate step of a `BridgeAttest` calls this so its apply step
+    /// cannot fail.
     ///
-    /// The cap is per backing: `minted_on(day) + amount <= mint_cap_per_day`, where a counter left
-    /// from an earlier day reads as zero. Exactly the cap is accepted, one unit over is
-    /// [`TokenError::MintCapExceeded`].
-    pub fn check_lock(&self, index: u32, chain: u16, token: &[u8; 32], amount: u64, day: u32) -> Result<(), TokenError> {
+    /// The per-backing cap is `minted + amount <= mint_cap_per_day`, where `minted` is the
+    /// backing's counter for the UTC day of `now` (a counter left from an earlier day reads as
+    /// zero) — or, under `rules_v2`, what the backing's rolling window holds at `now`
+    /// ([`MintWindow`]). Exactly the cap is accepted, one unit over is
+    /// [`TokenError::MintCapExceeded`]. The global cap is judged after it, the same way
+    /// ([`TokenError::GlobalMintCapExceeded`]).
+    pub fn check_lock(&self, index: u32, chain: u16, token: &[u8; 32], amount: u64, now: u64) -> Result<(), TokenError> {
         let info = self.by_index.get(&index).ok_or(TokenError::UnknownToken(index))?;
         // The coin before the arithmetic: a pair that does not back this token is a different
         // mistake from an amount that does not fit, and naming the coin is the more useful of
@@ -575,11 +747,21 @@ impl TokenRegistry {
         let backing = self.backing(index, chain, token).ok_or(TokenError::NotABacking { index, chain })?;
         backing.locked.checked_add(amount).ok_or(TokenError::SupplyOverflow)?;
         info.total_supply.checked_add(amount).ok_or(TokenError::SupplyOverflow)?;
-        // B1, after the arithmetic that could not hold the deposit at all: today's counter plus
-        // this deposit against the cap. A sum past `u64::MAX` is past any cap too.
-        let minted_today = backing.minted_on(day);
+        // B1, after the arithmetic that could not hold the deposit at all: the counter plus this
+        // deposit against the cap. A sum past `u64::MAX` is past any cap too.
+        let minted_today = match &self.ext.windows {
+            Some(w) => w.backing_minted(index, chain, token, now),
+            None => backing.minted_on(crate::bridge::mint_day(now)),
+        };
         if minted_today.checked_add(amount).is_none_or(|total| total > self.mint_cap_per_day) {
             return Err(TokenError::MintCapExceeded { cap: self.mint_cap_per_day, minted_today, amount });
+        }
+        // Bridge rules v2: the whole registry's window, last.
+        if let Some(w) = &self.ext.windows {
+            let minted = w.global_minted(now);
+            if minted.checked_add(amount).is_none_or(|total| total > w.global_cap) {
+                return Err(TokenError::GlobalMintCapExceeded { cap: w.global_cap, minted, amount });
+            }
         }
         Ok(())
     }
@@ -761,6 +943,13 @@ impl TokenRegistry {
         // B1: the cap decides which deposits are admissible, so it is committed like the fee.
         // (Each backing's own counters are in its token's leaf, above.)
         buf.extend_from_slice(&self.mint_cap_per_day.to_be_bytes());
+        // Audit v4: the v0.5.4 half — TOK-1's cap and bridge rules v2's windows, slot by slot —
+        // appended, and the domain bumped, only on a chain that has any of it; chain 14's
+        // registry hashes exactly as before.
+        if self.ext != RegistryExt::default() {
+            buf.extend_from_slice(&bincode::serialize(&self.ext).expect("the registry extension serializes"));
+            return Hash::digest_domain(b"rand-token-registry-3", &buf);
+        }
         Hash::digest_domain(b"rand-token-registry-2", &buf)
     }
 }
@@ -1041,7 +1230,7 @@ pub(super) fn validate(
             if registry.get_by_id(&id).is_some() {
                 return Err(TokenError::AlreadyRegistered(id).into());
             }
-            if registry.next_index() == u32::MAX {
+            if registry.is_full() {
                 return Err(TokenError::RegistryFull.into());
             }
             // The index the creator sealed its initial note for. Checked with or without an
@@ -1433,7 +1622,7 @@ mod tests {
         let (c2, t2) = (2u16, [0xaa; 32]);
         let (c3, t3) = (3u16, [0xbb; 32]);
         r.register(id(2), "Rand USD".into(), "zUSD".into(), BRIDGE_DECIMALS, bridge(&[(c2, t2), (c3, t3)]), 12).unwrap();
-        r.lock(2, c2, &t2, 500_000, 20_231).unwrap();
+        r.lock(2, c2, &t2, 500_000, 20_231 * crate::bridge::MINT_DAY_SECS).unwrap();
 
         let leaf = |index: u32| {
             let bytes = bincode::serialize(r.get(index).expect("registered")).expect("TokenInfo serializes");
@@ -1568,16 +1757,17 @@ mod tests {
 
         let mut r = reg().with_mint_cap(1_000);
         let i = list_zusd(&mut r, &[USDT2]);
-        r.lock(i, USDT2.0, &USDT2.1, 800, 10).unwrap();
+        let day = |d: u64| d * crate::bridge::MINT_DAY_SECS;
+        r.lock(i, USDT2.0, &USDT2.1, 800, day(10)).unwrap();
         assert_eq!(
-            r.lock(i, USDT2.0, &USDT2.1, 800, 9),
+            r.lock(i, USDT2.0, &USDT2.1, 800, day(9)),
             Err(TokenError::MintCapExceeded { cap: 1_000, minted_today: 800, amount: 800 }),
             "a day going backwards does not re-open the cap"
         );
-        r.lock(i, USDT2.0, &USDT2.1, 200, 9).unwrap();
+        r.lock(i, USDT2.0, &USDT2.1, 200, day(9)).unwrap();
         let b = r.backing(i, USDT2.0, &USDT2.1).unwrap();
         assert_eq!((b.minted_today, b.mint_day), (1_000, 10), "the counter's day never moves back");
-        r.lock(i, USDT2.0, &USDT2.1, 1_000, 11).unwrap();
+        r.lock(i, USDT2.0, &USDT2.1, 1_000, day(11)).unwrap();
         let b = r.backing(i, USDT2.0, &USDT2.1).unwrap();
         assert_eq!((b.minted_today, b.mint_day), (1_000, 11), "day 11 counts from zero");
     }
@@ -2032,6 +2222,135 @@ mod tests {
         r.set_key(keyed, None).unwrap();
         assert!(matches!(r.get(keyed).unwrap().authority, MintAuthority::None));
         assert_eq!(r.set_key(keyed, Some(pk)), Err(TokenError::NotKeyAuthority(keyed)), "renouncing is final");
+    }
+
+    // ---- audit v4, bridge rules v2: the rolling window ------------------------------------------
+
+    /// A `MintWindow` is a ring of `⌈window/24⌉`-second slots. A deposit stays counted while the
+    /// *last second of its slot* is less than `window_secs` before `now` (strictly), so the count
+    /// is never lower than the exact rolling sum and a deposit made at the end of a slot leaves
+    /// the window exactly `window_secs` later. Slots that have left the window are dropped on the
+    /// next `add`, so a window holds at most 26 of them whatever the window's length.
+    #[test]
+    fn a_mint_window_counts_the_last_window_secs_and_drops_what_left_it() {
+        let mut w = MintWindow::default();
+        let day = 86_400u64;
+        w.add(86_399, day, 100); // the last second of hour slot 23
+        assert_eq!(w.minted_within(86_399, day), 100);
+        assert_eq!(w.minted_within(86_401, day), 100, "across the calendar boundary it still counts");
+        assert_eq!(w.minted_within(86_399 + day - 1, day), 100, "one second short of a window: counted");
+        assert_eq!(w.minted_within(86_399 + day, day), 0, "exactly a window later: out (strict)");
+        // A deposit at the *start* of a slot is counted until its slot's last second leaves.
+        let mut early = MintWindow::default();
+        early.add(82_800, day, 7);
+        assert_eq!(early.minted_within(82_800 + day, day), 7, "conservative: the slot's last second is still inside");
+        assert_eq!(early.minted_within(86_399 + day, day), 0);
+        // Slots accumulate within one slot key and are pruned on add.
+        w.add(86_400, day, 1);
+        w.add(86_500, day, 2);
+        assert_eq!(w.slots().len(), 2);
+        assert_eq!(w.minted_within(86_500, day), 103);
+        w.add(86_399 + 2 * day, day, 5);
+        assert_eq!(w.slots().len(), 1, "everything older than a window is dropped on add");
+        assert_eq!(w.minted_within(86_399 + 2 * day, day), 5);
+        // A seven-day window uses 7-hour slots: never more than 26 of them.
+        let week = 7 * day;
+        let mut long = MintWindow::default();
+        for i in 0..2_000u64 {
+            long.add(i * 3_600, week, 1);
+        }
+        assert!(long.slots().len() <= 26, "{}", long.slots().len());
+        assert_eq!(long.minted_within(1_999 * 3_600, week), long.slots().values().sum::<u64>());
+        assert!(long.minted_within(1_999 * 3_600, week) >= 168, "at least the exact rolling count");
+        // Saturating, never wrapping.
+        let mut big = MintWindow::default();
+        big.add(0, day, u64::MAX);
+        big.add(1, day, 1);
+        assert_eq!(big.minted_within(1, day), u64::MAX);
+    }
+
+    /// Under `rules_v2` the per-backing cap is a rolling window of the block time, not a
+    /// calendar day: twice the cap across midnight is refused where the day rule admitted it,
+    /// one window after the earlier deposit it is admitted again, and the day counters keep
+    /// moving as before. Without the rules the registry behaves exactly as chain 14's.
+    #[test]
+    fn the_rolling_window_refuses_twice_the_cap_across_midnight() {
+        let day = 86_400u64;
+        let v1 = {
+            let mut r = reg().with_mint_cap(100);
+            let i = list_zusd(&mut r, &[USDT2]);
+            r.lock(i, USDT2.0, &USDT2.1, 100, 86_399).unwrap();
+            r.lock(i, USDT2.0, &USDT2.1, 100, 86_401).unwrap();
+            r
+        };
+        assert_eq!(v1.get(1).unwrap().total_supply, 200, "chain 14's day rule admits 2× across midnight");
+        assert_eq!(v1.windows(), None);
+
+        let mut r = reg().with_mint_cap(100).with_rules_v2(day as u32, 1_000);
+        let i = list_zusd(&mut r, &[USDT2]);
+        r.lock(i, USDT2.0, &USDT2.1, 100, 86_399).unwrap();
+        assert_eq!(
+            r.check_lock(i, USDT2.0, &USDT2.1, 1, 86_401),
+            Err(TokenError::MintCapExceeded { cap: 100, minted_today: 100, amount: 1 })
+        );
+        assert_eq!(r.lock(i, USDT2.0, &USDT2.1, 1, 86_401), Err(TokenError::MintCapExceeded { cap: 100, minted_today: 100, amount: 1 }));
+        // Exactly a window after the earlier deposit it has left the window.
+        r.lock(i, USDT2.0, &USDT2.1, 100, 86_399 + day).unwrap();
+        let b = r.backing(i, USDT2.0, &USDT2.1).unwrap();
+        assert_eq!((b.locked, b.minted_today, b.mint_day), (200, 100, 1), "the day counters still move");
+        let w = r.windows().unwrap();
+        assert_eq!(w.window_secs, day as u32);
+        assert_eq!(w.global_cap, 1_000);
+        assert_eq!(w.backing_minted(i, USDT2.0, &USDT2.1, 86_399 + day), 100);
+        assert_eq!(w.global.minted_within(86_399 + day, day), 100);
+    }
+
+    /// The global cap is over every backing of every token: two backings that each fit their own
+    /// cap do not both fit the registry's, and the refusal names the global figures.
+    #[test]
+    fn the_global_cap_refuses_what_the_per_backing_caps_admit() {
+        let mut r = reg().with_mint_cap(60).with_rules_v2(3_600, 100);
+        let a = list_zusd(&mut r, &[USDT2]);
+        let b = r.register(bridged_asset_id("Rand EUR", "zEUR", &[10; 32]), "Rand EUR".into(), "zEUR".into(), BRIDGE_DECIMALS, bridge(&[USDC2]), 0).unwrap();
+        r.lock(a, USDT2.0, &USDT2.1, 60, 10).unwrap();
+        assert_eq!(
+            r.check_lock(b, USDC2.0, &USDC2.1, 60, 20),
+            Err(TokenError::GlobalMintCapExceeded { cap: 100, minted: 60, amount: 60 })
+        );
+        assert_eq!(r.lock(b, USDC2.0, &USDC2.1, 60, 20), Err(TokenError::GlobalMintCapExceeded { cap: 100, minted: 60, amount: 60 }));
+        r.lock(b, USDC2.0, &USDC2.1, 40, 20).unwrap();
+        assert_eq!(r.check_lock(b, USDC2.0, &USDC2.1, 1, 30), Err(TokenError::GlobalMintCapExceeded { cap: 100, minted: 100, amount: 1 }));
+        // The per-backing cap is judged first: a deposit over its own cap is its own refusal.
+        assert_eq!(r.check_lock(a, USDT2.0, &USDT2.1, 1, 30), Err(TokenError::MintCapExceeded { cap: 60, minted_today: 60, amount: 1 }));
+        // An hour on, both windows are clear.
+        r.lock(b, USDC2.0, &USDC2.1, 60, 3_600 + 3_599 + 20).unwrap();
+        assert!(r.backing_invariant_holds());
+    }
+
+    /// The gate on the root: a registry without the v2 extras hashes under `rand-token-registry-2`
+    /// to the bytes it always did; the windows (and their state) move it to `rand-token-registry-3`
+    /// and round-trip through the `ext` half storage keeps apart from the v1 blob.
+    #[test]
+    fn the_window_state_is_in_the_v3_root_and_outside_the_v1_blob() {
+        let mut r = reg().with_mint_cap(100);
+        let i = list_zusd(&mut r, &[USDT2]);
+        r.lock(i, USDT2.0, &USDT2.1, 5, 86_399).unwrap();
+        let v1_root = r.root();
+        let v1_blob = bincode::serialize(&r).unwrap();
+        assert_eq!(r.ext(), &RegistryExt::default());
+        let mut v2 = r.clone().with_rules_v2(86_400, 1_000);
+        assert_ne!(v2.root(), v1_root, "the rules are in the root");
+        assert_eq!(bincode::serialize(&v2).unwrap(), v1_blob, "and outside the v1 blob");
+        let before = v2.root();
+        v2.lock(i, USDT2.0, &USDT2.1, 5, 90_000).unwrap();
+        let after_lock = v2.root();
+        assert_ne!(after_lock, before, "a window slot is state");
+        assert_eq!(bincode::deserialize::<TokenRegistry>(&bincode::serialize(&v2).unwrap()).unwrap().windows(), None, "the v1 blob carries no window");
+        let ext: RegistryExt = bincode::deserialize(&bincode::serialize(v2.ext()).unwrap()).unwrap();
+        let mut rebuilt: TokenRegistry = bincode::deserialize(&bincode::serialize(&v2).unwrap()).unwrap();
+        rebuilt.set_ext(ext);
+        assert_eq!(rebuilt, v2);
+        assert_eq!(rebuilt.root(), after_lock);
     }
 }
 

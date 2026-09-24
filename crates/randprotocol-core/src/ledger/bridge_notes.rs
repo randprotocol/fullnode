@@ -215,7 +215,7 @@ pub(super) fn apply(
                     ledger
                         .tokens_mut()
                         .ok_or(TxError::Token(TokenError::Disabled))?
-                        .lock(t.index, t.chain, &t.token, t.amount, t.day)
+                        .lock(t.index, t.chain, &t.token, t.amount, t.now)
                         .map_err(|e| TxError::Bridge(BridgeError::Token(e)))?;
                 }
                 // Governance only: a rotation moves guardian keys and no value.
@@ -372,8 +372,8 @@ pub fn deposit_note(
 mod tests {
     use super::*;
     use crate::bridge::{
-        asset_id, digest, guardian_address, pq_cosign, sign_digest, Attestation, Body, BridgeConfig, BridgeState,
-        Payload, PqSignature, Transfer, CHAIN_RAND,
+        asset_id, digest, guardian_address, pq_cosign, sign_digest, Attestation, Body, BridgeConfig, BridgeRulesV2,
+        BridgeState, Payload, PqSignature, Transfer, CHAIN_RAND,
     };
     use crate::confidential::StubExecutor;
     use crate::crypto::{Address, Keypair};
@@ -418,6 +418,7 @@ mod tests {
             emitters: (2u16..=5).map(|c| (c, [c as u8; 32])).collect(),
             pq_guardians: pq_keys().iter().map(|k| k.public_key().clone()).collect(),
             pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
+            rules_v2: None,
         };
         (config, secrets)
     }
@@ -481,6 +482,30 @@ mod tests {
         l.set_height(1);
         l.set_timestamp_ms(1_000_000);
         (l, secrets)
+    }
+
+    /// The guardian secrets [`ledger`] was built from — the same six, whichever ledger.
+    fn secrets_of(_l: &Ledger) -> Vec<[u8; 32]> {
+        cfg().1
+    }
+
+    /// Turns bridge rules v2 on: the section on the bridge, the caps on the registry.
+    fn install_rules_v2(l: &mut Ledger, per_backing: u64, global: u64, window_secs: u32) {
+        l.bridge_mut().unwrap().rules_v2 = Some(BridgeRulesV2 { global_mint_cap_per_window: global, cap_window_secs: window_secs });
+        let tokens = l.tokens().unwrap().clone().with_mint_cap(per_backing).with_rules_v2(window_secs, global);
+        l.set_tokens(Some(tokens));
+    }
+
+    /// A deposit of `amount` of [`OTHER_TOKEN`] (index 2) at `seq`, expected to end as `want`.
+    fn deposit_other(l: &mut Ledger, amount: u64, seq: u64, want: Result<(), BridgeError>) {
+        let proposer = proposer().address();
+        let body = transfer_of(OTHER_TOKEN, amount as u128, 0, recipient().recipient_hash(), seq);
+        let tx = attest_tx(l, attest(&secrets_of(l), body), recipient(), 300 + 10 * seq as u32);
+        let got = l.apply_tx(&tx, &proposer, &StubExecutor).map(|_| ()).map_err(|e| match e {
+            TxError::Bridge(b) => b,
+            other => panic!("{other:?}"),
+        });
+        assert_eq!(got, want);
     }
 
     /// A bundle whose stub proof publishes exactly the digest the ledger recomputes. It anchors
@@ -1955,6 +1980,58 @@ mod tests {
         plain.set_bridge(None);
         assert_eq!(plain.validate(&pause_tx(&pause_key(), 0), &StubExecutor), Err(TxError::Bridge(BridgeError::Disabled)));
         assert_eq!(plain.validate(&unpause_tx(&[0, 1, 2, 3, 4], 0), &StubExecutor), Err(TxError::Bridge(BridgeError::Disabled)));
+    }
+
+    /// Audit v4 (bridge rules v2), through the ledger on the block's own timestamp: with a
+    /// per-backing cap of 100 over a 24 h window, the cap at 23:59:59 followed by one unit at
+    /// 00:00:01 is refused — the calendar-day rule admitted 2× the cap in two seconds — and the
+    /// same deposit is admitted again exactly one window after the earlier one (strict `>`).
+    /// Under the same block times, a chain-14-shaped ledger admits both, as it does today.
+    #[test]
+    fn twice_the_cap_across_midnight_is_refused_under_the_rolling_window() {
+        let proposer = proposer().address();
+        let attest_of = |l: &Ledger, amount: u128, seq: u64, seed: u32| {
+            let body = transfer_of(TOKEN, amount, 0, recipient().recipient_hash(), seq);
+            attest_tx(l, attest(&secrets_of(l), body), recipient(), seed)
+        };
+        let at_secs = |l: &mut Ledger, secs: u64| l.set_timestamp_ms(secs * 1000);
+        let deposit = |l: &mut Ledger, amount: u64, seq: u64| {
+            let tx = attest_of(l, amount as u128, seq, 100 + 10 * seq as u32);
+            l.apply_tx(&tx, &proposer, &StubExecutor).map(|_| ()).map_err(|e| match e {
+                TxError::Bridge(b) => b,
+                other => panic!("{other:?}"),
+            })
+        };
+
+        let (mut l, _) = ledger();
+        install_rules_v2(&mut l, 100, 150, 86_400);
+        at_secs(&mut l, 86_399);
+        deposit(&mut l, 100, 1).unwrap();
+        at_secs(&mut l, 86_401);
+        assert_eq!(
+            deposit(&mut l, 1, 2),
+            Err(BridgeError::Token(TokenError::MintCapExceeded { cap: 100, minted_today: 100, amount: 1 }))
+        );
+        at_secs(&mut l, 86_399 + 86_400 - 1);
+        assert!(matches!(deposit(&mut l, 100, 3), Err(BridgeError::Token(TokenError::MintCapExceeded { .. }))), "one second short");
+        at_secs(&mut l, 86_399 + 86_400);
+        deposit(&mut l, 100, 4).unwrap();
+        assert_eq!(l.tokens().unwrap().get(1).unwrap().total_supply, 200);
+        assert!(l.tokens().unwrap().backing_invariant_holds());
+        // The global window across both listed tokens, at this block time: the first 100 has left
+        // it and the last 100 is in it, so 150 − 100 = 50 is what the other token's coin may add.
+        deposit_other(&mut l, 100, 5, Err(BridgeError::Token(TokenError::GlobalMintCapExceeded { cap: 150, minted: 100, amount: 100 })));
+        deposit_other(&mut l, 50, 6, Ok(()));
+        deposit_other(&mut l, 1, 7, Err(BridgeError::Token(TokenError::GlobalMintCapExceeded { cap: 150, minted: 150, amount: 1 })));
+        assert_eq!(l.tokens().unwrap().get(2).unwrap().total_supply, 50);
+
+        let (mut v1, _) = ledger();
+        v1.set_tokens(Some(v1.tokens().unwrap().clone().with_mint_cap(100)));
+        at_secs(&mut v1, 86_399);
+        deposit(&mut v1, 100, 1).unwrap();
+        at_secs(&mut v1, 86_401);
+        deposit(&mut v1, 100, 2).unwrap();
+        assert_eq!(v1.tokens().unwrap().get(1).unwrap().total_supply, 200, "chain 14's day rule");
     }
 
     /// The daily cap through the ledger, on the block's own timestamp: exactly the cap in one

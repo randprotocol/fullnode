@@ -110,6 +110,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
             emitters: BTreeMap::from([(2u16, [9u8; 32])]),
             pq_guardians: vec![Keypair::from_seed([0x70; 32]).unwrap().public_key().clone()],
             pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
+            rules_v2: None,
         }),
         tokens: bridged.then(|| crate::genesis::TokensConfig {
             registration_fee: crate::genesis::MIN_REGISTRATION_FEE,

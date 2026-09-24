@@ -295,6 +295,14 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | B::PqBadSignatureLength { .. }
                 | B::BadPauseSignature
                 | B::WrongDepositBlinding
+                // Bridge rules v2: the gate is a genesis constant, and a key's length or a
+                // duplicate inside the action's own key list is about the bytes. The nonce, the
+                // set-length rule (the current ECDSA set's size), the membership rules and the
+                // caps are state and stay out.
+                | B::RulesV2Disabled
+                | B::BadPqGuardianKey { .. }
+                | B::BadPauseKeyLength { .. }
+                | B::DuplicatePqGuardian
         );
     }
     matches!(
@@ -683,6 +691,30 @@ mod tests {
         use randprotocol_core::bridge::BridgeError as B;
         let e = TxError::Bridge(B::WrongDepositBlinding);
         assert!(is_permanent(&e), "{e} depends on the transaction's bytes alone");
+    }
+
+    /// Bridge rules v2 (audit v4): the gate is a genesis constant and three verdicts are byte
+    /// lengths or duplicates in the transaction's own key list, so they are cached; the nonce,
+    /// the set-length rule (the current ECDSA set's size), the pause-key and guardian membership
+    /// rules and the global cap are state and are not.
+    #[test]
+    fn the_rotation_verdicts_are_cached_only_when_they_are_about_the_bytes_or_the_genesis() {
+        use randprotocol_core::bridge::BridgeError as B;
+        use randprotocol_core::ledger::tokens::TokenError as T;
+        for b in [B::RulesV2Disabled, B::BadPqGuardianKey { index: 1, len: 3 }, B::BadPauseKeyLength { len: 3 }, B::DuplicatePqGuardian] {
+            let e = TxError::Bridge(b);
+            assert!(is_permanent(&e), "{e} is about the bytes or the genesis");
+        }
+        for b in [
+            B::BadRotationNonce { expected: 1, got: 0 },
+            B::PqSetLengthMismatch { expected: 6, got: 5 },
+            B::GuardianIsPauseKey,
+            B::PauseKeyIsGuardian,
+            B::Token(T::GlobalMintCapExceeded { cap: 10, minted: 10, amount: 1 }),
+        ] {
+            let e = TxError::Bridge(b);
+            assert!(!is_permanent(&e), "{e} is state, not bytes");
+        }
     }
 
     #[test]

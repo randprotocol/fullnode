@@ -935,12 +935,16 @@ M_pause    = b"rand-bridge-pause-1"         ‖ chain_id u64 ‖ nonce u64
 M_unpause  = b"rand-bridge-pq-unpause-1"    ‖ chain_id u64 ‖ nonce u64
 M_list     = b"rand-bridge-pq-list-1"       ‖ chain_id u64 ‖ nonce u64 ‖ token_index u32 ‖ chain u16 ‖ token [32] ‖ decimals u8
 M_register = b"rand-bridge-pq-register-1"   ‖ chain_id u64 ‖ nonce u64 ‖ u8 len ‖ name ‖ u8 len ‖ symbol ‖ salt [32] ‖ chain u16 ‖ token [32] ‖ decimals u8
+M_rotate_pq    = b"rand-bridge-pq-rotate-pq-1"    ‖ chain_id u64 ‖ nonce u64 ‖ u32 count ‖ key [1312] … (v0.5.4, §21)
+M_rotate_pause = b"rand-bridge-pq-rotate-pause-1" ‖ chain_id u64 ‖ nonce u64 ‖ key [1312]           (v0.5.4, §21)
 ```
 
-`M_pause`/`M_unpause` carry `pause_nonce`; `M_list`/`M_register` carry `list_nonce`. Each is what
-`bridge/gov.rs`'s `pause_message`/`unpause_message`/`list_message`/`register_message` builds and
-what the corresponding validate function re-derives to check a signature against — never bincode,
-so the bytes an operator's hardware signer sees are exactly what gets verified.
+`M_pause`/`M_unpause` carry `pause_nonce`; `M_list`/`M_register` carry `list_nonce`;
+`M_rotate_pq`/`M_rotate_pause` carry `rotation_nonce` (§21). Each is what `bridge/gov.rs`'s
+`pause_message`/`unpause_message`/`list_message`/`register_message`/`rotate_pq_message`/
+`rotate_pause_message` builds and what the corresponding validate function re-derives to check a
+signature against — never bincode, so the bytes an operator's hardware signer sees are exactly
+what gets verified.
 
 ## 20. Chain-14 launch order
 
@@ -982,3 +986,108 @@ genesis or the cut. Full evidence table: `AGENTS.md`'s v0.5 entry.
    SOL
    https://solscan.io/tx/2iAUL44wjhE7pcYeznAwGix5RMb28eTgXVwSRy7qixGASUcwqXx7EhVsrZATyNAjzAKXw2sRNXhQiaLF6ps6w6K3
    — **all four mints committed** (`BridgeAttest`, 9.00000000 zUSD each; relayer order BSC, SOL, TRX, ETH): BSC block 4686 `f74d8ba08c1621337e58b57fe94bba93f893fec674e37c199553728cde5e8376`, SOL block 4798 `1c7cc5b4dcf50639ad7fd041f6064793287091709f320945d558f4db6c55b6e3`, TRX block 4907 `c2a26eec92756946241b5e6c59c46a3a6645e5c92472f3e221e06d9d9fc74aaa`, ETH block 5432 `329cce2a1818a3cc3f4b60b5e2f13c52bb077fce7ffb34c5a6317b01db095fcd`. End state, audited on mainnet by `rand-bridge-audit`: `total_supply` 3600000000 == Σ `locked` (900000000 on each of chains 2/3/4/5 USDT), custody − locked = 0.
+
+## 21. Rules v2 (v0.5.4, audit v4 BRG-14 / BR-4)
+
+Everything in this section is switched on by one optional group inside the genesis `bridge`
+section and is **absent from chain 14**: without it a node behaves byte-for-byte as before — the
+genesis hash, the bridge root (`rand-bridge-state-4`), the token root (`rand-token-registry-2`),
+the storage blobs and every admission verdict are unchanged. Chain 15's genesis carries it:
+
+```json
+"bridge": { …, "rules_v2": { "global_mint_cap_per_window": 50000000000000, "cap_window_secs": 86400 } }
+```
+
+`cap_window_secs` must be in `3600..=604800` (an hour to a week); `global_mint_cap_per_window` is in
+eight-decimal token units, a plain number like `tokens.mint_cap_per_day`, and must be above zero.
+The group is committed to the genesis hash as `b"bridge_rules_v2" ‖ global_mint_cap_per_window
+u64 BE ‖ cap_window_secs u32 BE`, appended right after the `BridgeCommit` bytes and only when the
+group is present (`crates/randprotocol-core/src/genesis.rs`). What it turns on:
+
+### 21.1 Two rotations under the PQ quorum
+
+`Action::RotatePqGuardians { new_pq_guardians, nonce, pq_signatures }` (wire variant 22) replaces
+the whole PQ guardian set; `Action::RotatePauseKey { new_pause_key, nonce, pq_signatures }`
+(variant 23) replaces the pause key. Both are bundle-less and fee-less like `PauseMints`, both are
+governance in the pool (exempt from `MempoolFull`, ordered first, one pooled per nonce), and both
+carry the bridge's new **`rotation_nonce`** (`rand_getBridgeState.rotation_nonce`), which each
+accepted rotation bumps — so a quorum signed for one nonce authorises exactly one rotation of
+either kind. The quorum is the co-signature's five rules (§17) by the **current** PQ set over one
+of these two messages, all integers big-endian, no terminators, never bincode:
+
+```
+M_rotate_pq    = b"rand-bridge-pq-rotate-pq-1"    ‖ chain_id u64 ‖ rotation_nonce u64 ‖ count u32 ‖ key₀ [1312] ‖ key₁ [1312] ‖ …
+                 26 bytes                            8              8                    4            1312 each, in index order
+M_rotate_pause = b"rand-bridge-pq-rotate-pause-1" ‖ chain_id u64 ‖ rotation_nonce u64 ‖ key [1312]
+                 29 bytes                            8              8                    1312
+```
+
+- `chain_id` is this Rand chain's id (14 on chain 14, whatever the next cut names); a rotation
+  signed for another chain never verifies.
+- `count` is the **number of keys**, not a byte length; every key is a Dilithium2 public key's
+  raw 1 312 bytes (`PublicKey::as_bytes`, the same bytes `rand_getBridgeState.pq_guardians` shows
+  in hex), concatenated in the order the new set will have — index `i` of the new set is the PQ
+  key of the operator of guardian `i` of the current ECDSA set.
+- `M_rotate_pq` is `46 + 1312 × count` bytes long; `M_rotate_pause` is `45 + 1312 = 1357` bytes.
+  `rand-bridge-gov pq-rotate-pq` / `pq-rotate-pause` (bridge repo) build exactly these from the
+  chain id, the nonce read off `rand_getBridgeState` and the key file(s); the node rebuilds them
+  in `bridge/gov.rs`'s `rotate_pq_message`/`rotate_pause_message` and verifies with the same
+  `verify_pq_message` every other governance quorum goes through.
+
+Admission order for `RotatePqGuardians`, cheapest first: the `bridge` gate (`Disabled`), the
+`rules_v2` gate (`RulesV2Disabled` — a genesis constant, cached as permanent), the quorum's
+structure (rules 1–3), the nonce (`BadRotationNonce { expected, got }`), then the new set's shape
+— exactly the genesis rules: its length equals the **current ECDSA set's** (`PqSetLengthMismatch`),
+every key is exactly 1 312 bytes (`BadPqGuardianKey { index, len }`, permanent), no key repeats
+(`DuplicatePqGuardian`, permanent), and none is the pause key (`GuardianIsPauseKey`) — and the
+Dilithium2 verifications last. Apply replaces `pq_guardians` whole and bumps `rotation_nonce`;
+the superseded set signs nothing further (its quorum over the next nonce fails at the signature).
+`RotatePauseKey`: the same gates, structure and nonce, then the key's length
+(`BadPauseKeyLength { len }`, permanent) and that it is no PQ guardian's (`PauseKeyIsGuardian`),
+then the quorum. Apply replaces `pause_key` and bumps the nonce; the old pause key's `M_pause`
+signature no longer pauses. There is no grace window on either: the rotation is what a compromise
+response needs to be immediate.
+
+`tx_json` renders them as `rotate_pq_guardians` (`new_pq_guardians` hex, `nonce`, `pq_signers`)
+and `rotate_pause_key` (`new_pause_key` hex, `nonce`, `pq_signers`) — `docs/rpc.md`.
+
+### 21.2 Rolling-window mint caps
+
+B1's per-backing cap (`tokens.mint_cap_per_day`) is measured over a **rolling window of
+`cap_window_secs`** of the block timestamp instead of the UTC calendar day, and a second,
+registry-wide cap — `global_mint_cap_per_window` over every backing of every token together — is
+judged after it (`TokenError::GlobalMintCapExceeded { cap, minted, amount }`). Under the day
+rule, the cap at 23:59:59 and the cap again at 00:00:01 was 2× the cap in two seconds; under the
+window the second is refused and admitted again exactly `cap_window_secs` after the first.
+
+The accounting (`ledger/tokens.rs`'s `MintWindow`): a window is a ring of slots of
+`⌈cap_window_secs / 24⌉` seconds (an hour for a day's window, seven hours for a week's), keyed by
+`block_secs / slot_secs`; a deposit adds to its slot; **a slot counts while its last second is
+less than `cap_window_secs` before the block time** (strictly), so the count is never below the
+exact rolling sum — it is counted too strictly by up to one slot, never twice — and a deposit
+made in the last second of its slot leaves the window exactly `cap_window_secs` later. Slots that
+have left the window are dropped on the next deposit, so a window holds at most 26 slots. There
+is one window per backing (keyed by token index, chain and token address) and one global window;
+all of them are consensus state, folded into the token root, which becomes
+`rand-token-registry-3 ‖ … ‖ bincode(RegistryExt)`. The day counters (`minted_today`,
+`mint_day`) keep moving under rules v2 and `rand_getAssets` keeps showing them, but nothing reads
+them for admission any more. The refusal shape is unchanged — `MintCapExceeded { cap,
+minted_today, amount }`, where `minted_today` now reads the window's count.
+
+### 21.3 No listing while paused
+
+`RegisterBridgedToken` and `ListBacking` are refused `MintsPaused` while `mint_paused` — judged
+after the `list_nonce`, before the quorum — under rules v2 only: chain 14's ledger keeps accepting
+what it accepts today. Burns and both rotations stay open while paused, as before.
+
+### 21.4 State, storage, RPC
+
+`BridgeState` gains `rotation_nonce` and `rules_v2`; with the group present the bridge root is
+`rand-bridge-state-5` over the v4 bytes followed by `bincode(rotation_nonce, rules_v2)`. Storage
+keeps the v1 `BridgeMeta` blob exactly as it was under `bridge_state` and writes the v2 half
+(`BridgeMetaV2 { rotation_nonce, rules }`) under a second key, `bridge_state_v2`, only on a chain
+that has the group; the registry's v2 half (`RegistryExt`: TOK-1's `max_tokens` and the windows)
+likewise rides `tokens_v2` beside the unchanged `tokens` blob. A chain-14 database therefore never
+gains a key and keeps its strict v1 decode; a v0.5.4 node rolls onto chain 14 like any node-only
+build. `rand_getBridgeState` gains `rotation_nonce` (0 on chain 14) and `rules_v2`
+(`{ "global_mint_cap_per_window": "<decimal string>", "cap_window_secs": 86400 }`, or `null`).

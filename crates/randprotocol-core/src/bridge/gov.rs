@@ -10,7 +10,15 @@
 //!              ‖ token [32] ‖ decimals u8
 //! M_register = b"rand-bridge-pq-register-1" ‖ chain_id u64 ‖ nonce u64 ‖ u8 len ‖ name ‖ u8 len
 //!              ‖ symbol ‖ salt [32] ‖ chain u16 ‖ token [32] ‖ decimals u8
+//! M_rotate_pq    = b"rand-bridge-pq-rotate-pq-1"    ‖ chain_id u64 ‖ nonce u64 ‖ u32 count ‖ key [1312] …
+//! M_rotate_pause = b"rand-bridge-pq-rotate-pause-1" ‖ chain_id u64 ‖ nonce u64 ‖ key [1312]
 //! ```
+//!
+//! `M_rotate_pq` and `M_rotate_pause` (audit v4, bridge rules v2 — `docs/bridge.md` §21) carry the
+//! bridge's `rotation_nonce` and are signed by a PQ guardian quorum of the *current* set; the keys
+//! are Dilithium2 public keys, exactly 1 312 raw bytes each, in index order (the count is the
+//! number of keys, not a byte length — admission holds every key to that length before the
+//! message is built).
 //!
 //! `M_list` and `M_register` (B4) carry the bridge's `list_nonce` and are signed by a PQ guardian
 //! quorum; `decimals` is always the **backing's source** decimals (the bridged token itself is
@@ -30,6 +38,10 @@ pub const UNPAUSE_DOMAIN: &[u8] = b"rand-bridge-pq-unpause-1";
 pub const LIST_DOMAIN: &[u8] = b"rand-bridge-pq-list-1";
 /// `M_register`'s domain tag: 25 ASCII bytes, no terminator.
 pub const REGISTER_DOMAIN: &[u8] = b"rand-bridge-pq-register-1";
+/// `M_rotate_pq`'s domain tag: 26 ASCII bytes, no terminator.
+pub const ROTATE_PQ_DOMAIN: &[u8] = b"rand-bridge-pq-rotate-pq-1";
+/// `M_rotate_pause`'s domain tag: 29 ASCII bytes, no terminator.
+pub const ROTATE_PAUSE_DOMAIN: &[u8] = b"rand-bridge-pq-rotate-pause-1";
 
 /// `domain ‖ chain_id (u64 BE) ‖ nonce (u64 BE)` — the head every governance message starts with.
 fn head(domain: &[u8], chain_id: u64, nonce: u64) -> Vec<u8> {
@@ -93,6 +105,28 @@ pub fn register_message(
     m.extend_from_slice(salt);
     backing_tail(&mut m, chain, token, decimals);
     Some(m)
+}
+
+/// `M_rotate_pq`: what a PQ guardian quorum of the current set signs to replace the whole PQ set
+/// with `new_pq_guardians` at `rotation_nonce` (bridge rules v2). A `u32` count of keys, then each
+/// key's raw bytes in index order — `PublicKey::as_bytes`, which admission has held to exactly
+/// [`crate::bridge::PQ_PUBLIC_KEY_LEN`] (1 312) each before this is built.
+pub fn rotate_pq_message(chain_id: u64, rotation_nonce: u64, new_pq_guardians: &[crate::crypto::PublicKey]) -> Vec<u8> {
+    let mut m = head(ROTATE_PQ_DOMAIN, chain_id, rotation_nonce);
+    m.extend_from_slice(&(new_pq_guardians.len() as u32).to_be_bytes());
+    for k in new_pq_guardians {
+        m.extend_from_slice(k.as_bytes());
+    }
+    m
+}
+
+/// `M_rotate_pause`: what a PQ guardian quorum signs to replace the pause key with
+/// `new_pause_key` at `rotation_nonce` (bridge rules v2). The key's raw bytes, held to 1 312 by
+/// admission before this is built.
+pub fn rotate_pause_message(chain_id: u64, rotation_nonce: u64, new_pause_key: &crate::crypto::PublicKey) -> Vec<u8> {
+    let mut m = head(ROTATE_PAUSE_DOMAIN, chain_id, rotation_nonce);
+    m.extend_from_slice(new_pause_key.as_bytes());
+    m
 }
 
 #[cfg(test)]
@@ -270,6 +304,38 @@ pub(crate) mod tests {
             "PqBadSignature"
         );
         assert_eq!(bad(&register_sigs, unpause_message(chain_id, nonce)), "PqBadSignature");
+    }
+
+    /// Audit v4 (bridge rules v2): the two rotation messages, byte for byte. `M_rotate_pq` is the
+    /// domain, the chain id, the bridge's `rotation_nonce`, a `u32` count and every new PQ key's
+    /// 1 312 raw bytes in index order; `M_rotate_pause` is the domain, the chain id, the nonce and
+    /// the new pause key's 1 312 bytes. What `rand-bridge-gov pq-rotate-pq`/`pq-rotate-pause` must
+    /// reproduce (`docs/bridge.md` §21).
+    #[test]
+    fn the_rotation_messages_are_fixed_bytes_over_the_nonce_and_the_raw_keys() {
+        let keys: Vec<PublicKey> = (0..2u8).map(|i| Keypair::from_seed([0x40 + i; 32]).unwrap().public_key().clone()).collect();
+        let m = rotate_pq_message(0x0102_0304_0506_0708, 5, &keys);
+        assert_eq!(&m[..26], b"rand-bridge-pq-rotate-pq-1");
+        assert_eq!(&m[26..34], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&m[34..42], &5u64.to_be_bytes());
+        assert_eq!(&m[42..46], &2u32.to_be_bytes());
+        assert_eq!(&m[46..46 + 1312], keys[0].as_bytes());
+        assert_eq!(&m[46 + 1312..46 + 2 * 1312], keys[1].as_bytes());
+        assert_eq!(m.len(), 46 + 2 * 1312);
+        assert_eq!(ROTATE_PQ_DOMAIN.len(), 26);
+        // An empty set is still a well-formed message (validate refuses it on the length rule).
+        assert_eq!(rotate_pq_message(7, 0, &[]).len(), 46);
+
+        let p = rotate_pause_message(0x0102_0304_0506_0708, 5, &keys[1]);
+        assert_eq!(&p[..29], b"rand-bridge-pq-rotate-pause-1");
+        assert_eq!(&p[29..37], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&p[37..45], &5u64.to_be_bytes());
+        assert_eq!(&p[45..], keys[1].as_bytes());
+        assert_eq!(p.len(), 45 + 1312);
+        assert_eq!(ROTATE_PAUSE_DOMAIN.len(), 29);
+        // Neither is the other, nor a message of another kind at the same nonce.
+        assert_ne!(rotate_pq_message(7, 1, &keys[1..]), rotate_pause_message(7, 1, &keys[1]));
+        assert_ne!(&rotate_pq_message(7, 1, &keys)[..24], &unpause_message(7, 1)[..24]);
     }
 
     /// Every vector of the `governance` section, counted: the four kinds the bridge repo ships

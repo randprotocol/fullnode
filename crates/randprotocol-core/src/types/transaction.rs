@@ -329,6 +329,19 @@ pub enum Action {
         nonce: u64,
         pq_signatures: Vec<crate::bridge::PqSignature>,
     },
+    /// Bridge rules v2 (audit v4 BRG-14): replace the whole PQ guardian set with
+    /// `new_pq_guardians` — index-aligned with the current ECDSA set, every key a Dilithium2 key,
+    /// no duplicates, not containing the pause key. `pq_signatures` is a PQ guardian quorum of the
+    /// **current** set over [`crate::bridge::gov::rotate_pq_message`]`(chain_id, nonce, keys)`,
+    /// `nonce` the bridge's `rotation_nonce` (shared with `RotatePauseKey`). Bundle-less and
+    /// fee-less, like the pause. Refused `RulesV2Disabled` on a chain without `bridge.rules_v2`
+    /// (chain 14), before anything else is read.
+    RotatePqGuardians { new_pq_guardians: Vec<PublicKey>, nonce: u64, pq_signatures: Vec<crate::bridge::PqSignature> },
+    /// Bridge rules v2: replace the pause key with `new_pause_key` — a Dilithium2 key that is no
+    /// PQ guardian's. A PQ guardian quorum over
+    /// [`crate::bridge::gov::rotate_pause_message`]`(chain_id, nonce, key)`, `nonce` the bridge's
+    /// `rotation_nonce`. Bundle-less and fee-less; gated like `RotatePqGuardians`.
+    RotatePauseKey { new_pause_key: PublicKey, nonce: u64, pq_signatures: Vec<crate::bridge::PqSignature> },
 }
 
 impl Action {
@@ -351,6 +364,8 @@ impl Action {
             Action::Aggregate { .. } => Some("aggregate"),
             Action::PauseMints { .. } => Some("pause_mints"),
             Action::UnpauseMints { .. } => Some("unpause_mints"),
+            Action::RotatePqGuardians { .. } => Some("rotate_pq_guardians"),
+            Action::RotatePauseKey { .. } => Some("rotate_pause_key"),
             _ => None,
         }
     }
@@ -518,6 +533,18 @@ impl Action {
                 chain: *chain,
                 token: *token,
                 decimals: *decimals,
+                nonce: *nonce,
+                pq_signatures: pq_signatures.clone(),
+            },
+            // Bridge rules v2: bundle-less, every field kept — the keys and the quorum are what
+            // the transaction is.
+            Action::RotatePqGuardians { new_pq_guardians, nonce, pq_signatures } => Action::RotatePqGuardians {
+                new_pq_guardians: new_pq_guardians.clone(),
+                nonce: *nonce,
+                pq_signatures: pq_signatures.clone(),
+            },
+            Action::RotatePauseKey { new_pause_key, nonce, pq_signatures } => Action::RotatePauseKey {
+                new_pause_key: new_pause_key.clone(),
                 nonce: *nonce,
                 pq_signatures: pq_signatures.clone(),
             },
@@ -915,7 +942,7 @@ mod tests {
                     r: [1; 8],
                     envelope: env(),
                     amount: 1,
-                    minter,
+                    minter: minter.clone(),
                     signature: Signature::empty(),
                 },
                 "mint",
@@ -935,6 +962,8 @@ mod tests {
             ),
             (Action::PauseMints { nonce: 0, signature: Signature::empty() }, "pause_mints"),
             (Action::UnpauseMints { nonce: 0, pq_signatures: Vec::new() }, "unpause_mints"),
+            (Action::RotatePqGuardians { new_pq_guardians: Vec::new(), nonce: 0, pq_signatures: Vec::new() }, "rotate_pq_guardians"),
+            (Action::RotatePauseKey { new_pause_key: minter.clone(), nonce: 0, pq_signatures: Vec::new() }, "rotate_pause_key"),
         ];
         for (a, name) in &bundle_less {
             assert_eq!(a.bundle_less(), Some(*name), "{a:?}");
@@ -1152,7 +1181,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 22;
+    const VARIANTS: usize = 24;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -1177,6 +1206,8 @@ mod tests {
             Action::UnpauseMints { .. } => 19,
             Action::RegisterBridgedToken { .. } => 20,
             Action::ListBacking { .. } => 21,
+            Action::RotatePqGuardians { .. } => 22,
+            Action::RotatePauseKey { .. } => 23,
         }
     }
 
@@ -1322,6 +1353,22 @@ mod tests {
                 pq_signatures: vec![
                     crate::bridge::PqSignature { index: 1, signature: vec![0x8c; 8] },
                     crate::bridge::PqSignature { index: 2, signature: vec![0x8d; 8] },
+                ],
+            },
+            22 => Action::RotatePqGuardians {
+                new_pq_guardians: vec![pk(), PublicKey::from_bytes(&[0x42; crate::crypto::PUBLIC_KEY_LEN]).unwrap()],
+                nonce: 2,
+                pq_signatures: vec![
+                    crate::bridge::PqSignature { index: 0, signature: vec![0x9c; 8] },
+                    crate::bridge::PqSignature { index: 3, signature: vec![0x9d; 8] },
+                ],
+            },
+            23 => Action::RotatePauseKey {
+                new_pause_key: PublicKey::from_bytes(&[0x43; crate::crypto::PUBLIC_KEY_LEN]).unwrap(),
+                nonce: 3,
+                pq_signatures: vec![
+                    crate::bridge::PqSignature { index: 2, signature: vec![0xac; 8] },
+                    crate::bridge::PqSignature { index: 5, signature: vec![0xad; 8] },
                 ],
             },
             _ => panic!("no variant {i}"),
@@ -1590,6 +1637,31 @@ mod tests {
             (21, "list pq signature byte", |t| {
                 let Action::ListBacking { pq_signatures, .. } = &mut t.action else { panic!() };
                 pq_signatures[1].signature[0] ^= 1;
+            }),
+            // Bridge rules v2: the two rotations, every field, the quorum included.
+            (22, "rotate pq set key", |t| {
+                let Action::RotatePqGuardians { new_pq_guardians, .. } = &mut t.action else { panic!() };
+                new_pq_guardians.pop();
+            }),
+            (22, "rotate pq nonce", |t| {
+                let Action::RotatePqGuardians { nonce, .. } = &mut t.action else { panic!() };
+                *nonce += 1;
+            }),
+            (22, "rotate pq signature byte", |t| {
+                let Action::RotatePqGuardians { pq_signatures, .. } = &mut t.action else { panic!() };
+                pq_signatures[0].signature[0] ^= 1;
+            }),
+            (23, "rotate pause key", |t| {
+                let Action::RotatePauseKey { new_pause_key, .. } = &mut t.action else { panic!() };
+                *new_pause_key = pk();
+            }),
+            (23, "rotate pause nonce", |t| {
+                let Action::RotatePauseKey { nonce, .. } = &mut t.action else { panic!() };
+                *nonce += 1;
+            }),
+            (23, "rotate pause pq signature index", |t| {
+                let Action::RotatePauseKey { pq_signatures, .. } = &mut t.action else { panic!() };
+                pq_signatures[1].index = 4;
             }),
         ];
         for (i, what, change) in action_cases {

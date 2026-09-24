@@ -7,7 +7,7 @@
 //! and the head.
 
 use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB};
-use randprotocol_core::bridge::{BridgeBurnRecord, BridgeMeta, BridgeState};
+use randprotocol_core::bridge::{BridgeBurnRecord, BridgeMeta, BridgeState, BridgeMetaV2};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{CommittedBlock, EpochSets, SafetyState};
 use randprotocol_core::genesis::GenesisState;
@@ -187,6 +187,10 @@ const META_AGGREGATION: &str = "aggregation";
 /// Its presence is what makes a chain "bridged" on disk; the two collections it leaves out live
 /// in [`CF_BRIDGE_SPENT`] and [`CF_BRIDGE_BURNS`].
 const META_BRIDGE_STATE: &str = "bridge_state";
+/// Bridge rules v2 (audit v4): the v2 half of the bridge blob — `BridgeMetaV2`, the rotation
+/// nonce and the rules — written only on a chain whose genesis carries `bridge.rules_v2`, so a
+/// chain-14 database never gains a key and its v1 blob keeps its strict decode.
+const META_BRIDGE_STATE_V2: &str = "bridge_state_v2";
 /// `bincode(Option<TokenRegistry>)`: the RPL token registry as of the head, whole — `by_index`,
 /// `index_of`, `next_index` and `registration_fee` all together, the same shape `Ledger::tokens`
 /// holds and `TokenRegistry::root` hashes into the state root. `META_AGGREGATORS`'s twin, not
@@ -194,6 +198,10 @@ const META_BRIDGE_STATE: &str = "bridge_state";
 /// separate immutable half — the whole registry is state, and `load_ledger` restores it from
 /// here so a restarted node does not fork at its own first block.
 const META_TOKENS: &str = "tokens";
+/// Audit v4: the registry's v0.5.4 half (`RegistryExt` — TOK-1's cap and bridge rules v2's
+/// windows), beside — never inside — `META_TOKENS`'s v1 layout; written only when it is not the
+/// default, so chain 14's registry blob and key set are what they were.
+const META_TOKENS_V2: &str = "tokens_v2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -554,6 +562,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
         batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&gs.ledger.tokens().cloned())?);
+        self.put_tokens_ext(&mut batch, gs.ledger.tokens())?;
         batch.put_cf(self.cf(CF_ANCHORS), height_key(0), word8_to_bytes(&gs.ledger.root()));
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(gs.ledger.tree())?);
         batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
@@ -576,7 +585,7 @@ impl Storage {
     /// `batch`. Used where the state is installed wholesale (genesis, truncation); `commit`
     /// writes the meta on every commit and adds the digest and burn rows its blocks produced.
     fn put_bridge(&self, batch: &mut WriteBatch, bridge: &BridgeState) -> Result<()> {
-        batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE, bincode::serialize(&bridge.meta())?);
+        self.put_bridge_meta(batch, bridge)?;
         for digest in &bridge.spent {
             batch.put_cf(self.cf(CF_BRIDGE_SPENT), digest.as_bytes(), []);
         }
@@ -586,7 +595,30 @@ impl Storage {
         Ok(())
     }
 
-    /// Delete every bridge row and the `meta` blob into `batch`.
+    /// The bridge's `meta` blob(s) into `batch`: the v1 blob always, the v2 blob exactly when the
+    /// bridge has a v2 half (bridge rules v2) — and the v2 key deleted otherwise, so a truncation
+    /// or a rewrite can never leave a stale one behind.
+    fn put_bridge_meta(&self, batch: &mut WriteBatch, bridge: &BridgeState) -> Result<()> {
+        batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE, bincode::serialize(&bridge.meta())?);
+        match bridge.meta_v2() {
+            Some(v2) => batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE_V2, bincode::serialize(&v2)?),
+            None => batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE_V2),
+        }
+        Ok(())
+    }
+
+    /// The registry's v0.5.4 half into `batch` (audit v4): written exactly when it is not the
+    /// default, deleted otherwise — the v1 blob `META_TOKENS` is written by every caller as it
+    /// always was.
+    fn put_tokens_ext(&self, batch: &mut WriteBatch, tokens: Option<&randprotocol_core::ledger::tokens::TokenRegistry>) -> Result<()> {
+        match tokens.map(|t| t.ext()).filter(|e| **e != randprotocol_core::ledger::tokens::RegistryExt::default()) {
+            Some(ext) => batch.put_cf(self.cf(CF_META), META_TOKENS_V2, bincode::serialize(ext)?),
+            None => batch.delete_cf(self.cf(CF_META), META_TOKENS_V2),
+        }
+        Ok(())
+    }
+
+    /// Delete every bridge row and the `meta` blobs into `batch`.
     fn clear_bridge(&self, batch: &mut WriteBatch) -> Result<()> {
         for name in BRIDGE_CFS {
             for item in self.db.iterator_cf(self.cf(name), IteratorMode::Start) {
@@ -595,6 +627,7 @@ impl Storage {
             }
         }
         batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE);
+        batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE_V2);
         Ok(())
     }
 
@@ -613,6 +646,19 @@ impl Storage {
         match self.get_meta_raw(META_BRIDGE_STATE)? {
             // `with_fixint_encoding` is what plain `bincode::serialize` writes (`put_bridge`);
             // `DefaultOptions` rejects trailing bytes, which is the whole point here.
+            Some(bytes) => Ok(Some(
+                bincode::DefaultOptions::new().with_fixint_encoding().deserialize(&bytes)?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// The v2 half of the bridge blob (bridge rules v2): the rotation nonce and the rules, `None`
+    /// on a chain whose genesis has no `rules_v2` — chain 14 — where the key is never written.
+    /// Decoded strictly like [`Self::bridge_meta`], for the same reason.
+    pub fn bridge_meta_v2(&self) -> Result<Option<BridgeMetaV2>> {
+        use bincode::Options as _;
+        match self.get_meta_raw(META_BRIDGE_STATE_V2)? {
             Some(bytes) => Ok(Some(
                 bincode::DefaultOptions::new().with_fixint_encoding().deserialize(&bytes)?,
             )),
@@ -645,7 +691,7 @@ impl Storage {
             let rec: BridgeBurnRecord = bincode::deserialize(&v)?;
             burns.insert(rec.sequence, rec);
         }
-        Ok(Some(BridgeState::from_parts(meta, spent, burns)))
+        Ok(Some(BridgeState::from_parts(meta, self.bridge_meta_v2()?, spent, burns)))
     }
 
     // ---- the shielded pool ----------------------------------------------
@@ -875,8 +921,18 @@ impl Storage {
     /// The RPL token registry as of the head, `None` on a chain without a `tokens` section — and
     /// equally for a database written before the key existed, which is what `Ledger::from_parts`
     /// would have left it.
+    ///
+    /// The v1 blob is what it always was; the v0.5.4 half (`META_TOKENS_V2`, audit v4) is
+    /// re-attached when the store has one — a chain-14 store never does.
     pub fn tokens(&self) -> Result<Option<randprotocol_core::ledger::tokens::TokenRegistry>> {
-        Ok(self.get_meta_raw(META_TOKENS)?.map(|b| bincode::deserialize(&b)).transpose()?.flatten())
+        let mut tokens: Option<randprotocol_core::ledger::tokens::TokenRegistry> =
+            self.get_meta_raw(META_TOKENS)?.map(|b| bincode::deserialize(&b)).transpose()?.flatten();
+        if let Some(t) = tokens.as_mut() {
+            if let Some(bytes) = self.get_meta_raw(META_TOKENS_V2)? {
+                t.set_ext(bincode::deserialize(&bytes)?);
+            }
+        }
+        Ok(tokens)
     }
 
     /// Every leaf in tree order. The witness source, and the check `load_ledger` runs the
@@ -1724,7 +1780,7 @@ impl Storage {
             for (sequence, rec) in bridge.burns.range(first_burn_sequence..) {
                 batch.put_cf(self.cf(CF_BRIDGE_BURNS), height_key(*sequence), bincode::serialize(rec)?);
             }
-            batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE, bincode::serialize(&bridge.meta())?);
+            self.put_bridge_meta(&mut batch, bridge)?;
         }
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger_after.tree())?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger_after.supply())?);
@@ -1732,6 +1788,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger_after.tokens().cloned())?);
+        self.put_tokens_ext(&mut batch, ledger_after.tokens())?;
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
         self.db.write_opt(batch, &sync_opts())?;
         // The sealing marks' per-block half (spec §6.1): the bundle marks went in with the
@@ -2156,6 +2213,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger.tokens().cloned())?);
+        self.put_tokens_ext(&mut batch, ledger.tokens())?;
         if height == 0 {
             let hk = height_key(0);
             batch.put_cf(self.cf(CF_BLOCKS), hk, gs.block.encode());
@@ -2317,6 +2375,7 @@ pub(crate) mod fixtures {
             emitters: std::collections::BTreeMap::from([(2u16, [2u8; 32])]),
             pq_guardians: pq_keys().iter().map(|k| k.public_key().clone()).collect(),
             pause_key: Some(randprotocol_core::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
+            rules_v2: None,
         };
         (config, secrets)
     }
@@ -2338,7 +2397,21 @@ pub(crate) mod fixtures {
     /// [`genesis`] with a `bridge` section, and the guardian secrets that can attest to it.
     /// Its state root has the fifth component, which is what makes it useful for the reload test.
     pub(crate) fn bridged_genesis(chain_id: u64) -> (GenesisState, Vec<[u8; 32]>) {
-        let (config, secrets) = bridge_config();
+        bridged_genesis_with(chain_id, None)
+    }
+
+    /// [`bridged_genesis`] with bridge rules v2 on (audit v4): the section on the bridge, a cap
+    /// window of a day and a global cap of 1 000 000 units.
+    pub(crate) fn bridged_genesis_v2(chain_id: u64) -> (GenesisState, Vec<[u8; 32]>) {
+        bridged_genesis_with(
+            chain_id,
+            Some(randprotocol_core::bridge::BridgeRulesV2 { global_mint_cap_per_window: 1_000_000, cap_window_secs: 86_400 }),
+        )
+    }
+
+    fn bridged_genesis_with(chain_id: u64, rules_v2: Option<randprotocol_core::bridge::BridgeRulesV2>) -> (GenesisState, Vec<[u8; 32]>) {
+        let (mut config, secrets) = bridge_config();
+        config.rules_v2 = rules_v2;
         let k = key(1);
         let gs = Genesis {
             chain_id,
@@ -2512,6 +2585,17 @@ pub(crate) mod fixtures {
             chain_id: ledger.chain_id(),
             bundle: None,
             action: Action::UnpauseMints { nonce, pq_signatures: pq_quorum_message(&m) },
+        }
+    }
+
+    /// Bridge rules v2: a bundle-less `RotatePauseKey` to `new` at `nonce`, co-signed by a PQ
+    /// quorum of the fixture's guardians.
+    pub(crate) fn rotate_pause_tx(ledger: &Ledger, new: &Keypair, nonce: u64) -> Transaction {
+        let m = randprotocol_core::bridge::gov::rotate_pause_message(ledger.chain_id(), nonce, new.public_key());
+        Transaction {
+            chain_id: ledger.chain_id(),
+            bundle: None,
+            action: Action::RotatePauseKey { new_pause_key: new.public_key().clone(), nonce, pq_signatures: pq_quorum_message(&m) },
         }
     }
 
@@ -3109,6 +3193,70 @@ mod tests {
         let b = ledger.bridge().unwrap();
         assert_eq!((b.mint_paused, b.pause_nonce), (false, 2));
         assert_restart_round_trips(&s, &gs, &ledger, "UnpauseMints");
+    }
+
+    /// Audit v4, the gating guard on disk: a chain-14-shaped chain (no `rules_v2`) writes neither
+    /// v2 key at genesis nor at any commit, its v1 blobs are what they were, and a database with
+    /// only the v1 blobs — one an older build wrote — reloads to a bridge at rotation nonce 0 with
+    /// no rules and a registry with no windows.
+    #[test]
+    fn a_chain_without_rules_v2_writes_no_v2_key_and_an_old_layout_store_still_reloads() {
+        let (_d, s, gs, ledger) = governance_chain(4);
+        assert_eq!(s.get_meta_raw(META_BRIDGE_STATE_V2).unwrap(), None, "no v2 bridge key");
+        assert_eq!(s.get_meta_raw(META_TOKENS_V2).unwrap(), None, "no v2 tokens key");
+        assert_eq!(s.bridge_meta_v2().unwrap(), None);
+        assert_restart_round_trips(&s, &gs, &ledger, "four governance blocks, no rules_v2");
+        // The stored registry is the v1 layout byte for byte: `TokenRegistry`'s own serde.
+        let live = ledger.tokens().unwrap();
+        assert_eq!(s.get_meta_raw(META_TOKENS).unwrap(), Some(bincode::serialize(&Some(live.clone())).unwrap()));
+        assert_eq!(s.tokens().unwrap().as_ref(), Some(live));
+        // An old-layout store: exactly the two v1 blobs, nothing else about v2 — what a v0.5.3
+        // build left on every chain-14 disk. It reloads to the v1 bridge and registry.
+        let loaded = s.load_ledger(&StubExecutor).unwrap();
+        let b = loaded.bridge().unwrap();
+        assert_eq!((b.rotation_nonce, b.rules_v2.clone()), (0, None));
+        assert_eq!(loaded.tokens().unwrap().windows(), None);
+        assert_eq!(loaded.tokens().unwrap().ext(), &randprotocol_core::ledger::tokens::RegistryExt::default());
+        assert_eq!(loaded.state_root(), ledger.state_root());
+    }
+
+    /// Bridge rules v2 on disk: the rotation nonce and the rules ride `META_BRIDGE_STATE_V2`
+    /// (strictly decoded), the windows `META_TOKENS_V2`, both beside — never inside — the v1
+    /// blobs; a committed pause-key rotation and a committed deposit (a window slot) both survive
+    /// a restart at the same state root.
+    #[test]
+    fn a_rules_v2_chain_persists_its_rotation_nonce_and_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, secrets) = bridged_genesis_v2(9);
+        s.init_genesis(&gs).unwrap();
+        let rules = gs.ledger.bridge().unwrap().rules_v2.clone().unwrap();
+        assert_eq!(s.bridge_meta_v2().unwrap(), Some(BridgeMetaV2 { rotation_nonce: 0, rules: rules.clone() }));
+        assert_eq!(s.tokens().unwrap().unwrap().windows().unwrap().window_secs, 86_400);
+        let mut ledger = gs.ledger.clone();
+        let new_pause = key(0x99);
+        let rotate = rotate_pause_tx(&ledger, &new_pause, 0);
+        let b1 = make_block(&gs.block, &mut ledger, vec![rotate], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let att = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000, 1), 20);
+        let b2 = make_block(&b1.block, &mut ledger, vec![att], &key(1));
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        let b = ledger.bridge().unwrap();
+        assert_eq!((b.rotation_nonce, b.pause_key.as_ref()), (1, Some(new_pause.public_key())));
+        assert_restart_round_trips(&s, &gs, &ledger, "a pause-key rotation and a deposit under rules_v2");
+        assert_eq!(s.bridge_meta_v2().unwrap(), Some(BridgeMetaV2 { rotation_nonce: 1, rules }));
+        let now = ledger.now_secs();
+        let windows = s.tokens().unwrap().unwrap();
+        assert_eq!(windows.windows().unwrap().backing_minted(1, 2, &TOKEN, now), 1_000);
+        assert_eq!(windows.windows().unwrap().global_minted(now), 1_000);
+        // The v1 blob is still the v1 layout: `TokenRegistry`'s serde, windows excluded.
+        assert_eq!(s.get_meta_raw(META_TOKENS).unwrap(), Some(bincode::serialize(&Some(ledger.tokens().unwrap().clone())).unwrap()));
+        assert_eq!(s.get_meta_raw(META_BRIDGE_STATE).unwrap(), Some(bincode::serialize(&ledger.bridge().unwrap().meta()).unwrap()));
+        // The replay audit rebuilds the same bridge and registry.
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(check.problem, None);
+        assert_eq!(check.ledger.bridge(), ledger.bridge());
+        assert_eq!(check.ledger.tokens(), ledger.tokens());
     }
 
     #[test]

@@ -480,6 +480,12 @@ The staking (phase S2) and bridge (phase S3) actions:
   "token": "cdcd…", "to": "abab…" }` — `token` is the backing being redeemed and `to` the 32-byte
   destination address, hex. One bundle carries the whole burn: its `burn_asset` and `burn_a` are
   the action's `asset` and `amount`, and its `fee` pays the bridge fee.
+- `{ "kind": "rotate_pq_guardians", "new_pq_guardians": ["<1312 bytes hex>", …], "nonce": 0,
+  "pq_signers": [0, 1, 2, 3, 4] }` and `{ "kind": "rotate_pause_key", "new_pause_key": "<1312 bytes
+  hex>", "nonce": 1, "pq_signers": [1, 2, 3, 4, 5] }` (v0.5.4, bridge rules v2 — `docs/bridge.md`
+  §21): the two key rotations, rendered with `"bundle": null` like a pause. `nonce` is the
+  bridge's `rotation_nonce` the rotation spent; `pq_signers` are indices into the PQ set *before*
+  the rotation. Refused `RulesV2Disabled` on a chain without `bridge.rules_v2`.
 
 The RPL token actions. **Every amount here is a decimal string** — a token's own units, not
 RAND's — because a 9-decimal token's supply already passes 2^53 at a few tens of millions of
@@ -639,6 +645,10 @@ Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false 
   "pause_key": "…",                      // B1: the one Dilithium2 key that may pause minting, hex
   "registration_fee": "1000000000",      // B4: what a RegisterBridgedToken owes past the bundle base, RAND units
   "burn_sequence": 1,                    // outbound messages emitted so far
+  "rotation_nonce": 0,                   // v0.5.4, bridge rules v2: what the next M_rotate_pq / M_rotate_pause
+                                         // must carry (always 0 on a chain without rules_v2 — chain 14)
+  "rules_v2": null,                      // v0.5.4: { "global_mint_cap_per_window": "<decimal string>",
+                                         // "cap_window_secs": 86400 } on a chain whose genesis has the group
   "assets": [ …the rows of `rand_getAssets`… ]
 }
 ```
@@ -1215,6 +1225,16 @@ What changed for clients, in one place. Newest first.
   `docs/staking.md` §2). `"0"` and `"0"` on chain 14, which has no section. A `Mint` over the
   epoch's budget is refused `FaucetBudgetExhausted` — a state verdict, never cached as permanent,
   so `rand_getTransactionStatus` reads `unknown`, not `rejected`, once it leaves the pool.
+- **Bridge rules v2 (genesis-gated, audit v4 BRG-14 / BR-4; not on chain 14).** Two new
+  bundle-less, fee-less governance actions, `rotate_pq_guardians` and `rotate_pause_key`
+  (`rand_getTransaction` kinds above; wire variants 22 and 23, appended, so every existing
+  encoding is unchanged), under a PQ quorum of the current set over `M_rotate_pq` /
+  `M_rotate_pause` (`docs/bridge.md` §21, byte for byte). `rand_getBridgeState` gains
+  `rotation_nonce` (what the next rotation message must carry; 0 on chain 14) and `rules_v2`
+  (the group's two parameters, `null` without it). Under the group the per-backing mint cap is a
+  rolling window instead of a calendar day, a global cap bounds every backing together, and a
+  listing is refused while minting is paused. The pool treats a rotation as governance (exempt
+  from the capacity refusal, ordered first, one pooled per `rotation_nonce`).
 
 ### 2026-09-21 — wallets compute their own witnesses
 
