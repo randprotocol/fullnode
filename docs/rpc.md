@@ -602,9 +602,11 @@ otherwise looks identical to a node that is behind and working:
   failure, but a rising count means the give-up is firing on requests that were still alive, so the
   peers being asked are slower than the timeout.
 - `connected_peers` — peers with an open connection, which are the only ones sync can ask for
-  blocks. `peer_count` counts every peer this node knows of, including those seen only as the author
-  of relayed gossip, so `peer_count` far above `connected_peers` means most of what this node knows
-  about the network is hearsay.
+  blocks. `peer_count` counts every entry in this node's peer map. Since 2026-09-24 a gossiped
+  `Status` from an author this node holds no connection to no longer creates one (an entry
+  nothing ever removed, and a peer id is free to mint), so the two numbers now differ only by
+  peers that disconnected since the map was last pruned — `peer_count` far above
+  `connected_peers` was hearsay before that date and is a bug after it.
 - `ws_clients` — WebSocket clients connected right now, against the 64 this node will carry (see
   [Subscriptions](#subscriptions-websocket)). At 64 the next upgrade is refused with a `503`, which
   otherwise shows up only as clients that cannot connect for no visible reason.
@@ -1229,6 +1231,15 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-24 — connection caps, and a `Status` from a stranger is not remembered
+
+Node-only, no method or wire change (deep scan 2026-09-24). The swarm now refuses inbound
+connections past 256 established, 64 in handshake and 2 per remote peer (`docs/deploy.md`,
+"Topology rules"). A gossiped `Status` is recorded only against a peer this node holds an entry
+for — one it is, or was, connected to — and is metered per forwarding peer (16 back to back,
+refilling at 4/s, `Ignore` over that, exactly the transaction bucket's shape), so
+`rand_status.peer_count` no longer grows with the authors of relayed gossip.
 
 ### 2026-09-24 — v0.5.5
 

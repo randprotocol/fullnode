@@ -453,6 +453,42 @@ fn connect_peer(peers: &mut HashMap<PeerId, Peer>, id: PeerId, max: usize) -> &m
     p
 }
 
+/// Record a gossiped `Status` against its *author* `from` (deep scan 2026-09-24, medium): only an
+/// existing entry — a peer this node holds, or held, a connection to — is updated. The author of
+/// relayed gossip may be several hops away and a peer id is free to mint, so an entry created here
+/// would be one nothing ever removes (`PeerDisconnected` is the only removal), a way around the
+/// swarm's connection cap. Nothing is lost: sync asks only `connected` peers (`pick_sync_peer`).
+fn record_status(peers: &mut HashMap<PeerId, Peer>, from: PeerId, s: Status) {
+    if let Some(p) = peers.get_mut(&from) {
+        p.status = Some(s);
+    }
+}
+
+/// The `Status` gossip arm's decision: metered against the peer that *forwarded* the message
+/// (`GossipId.propagation_source`, the only one with a connection to spend from — the author may be
+/// hops away), then recorded against the author through [`record_status`]. `Ignore`, never
+/// `Reject`, over the limit: the message is not wrong, this node is merely not reading it now.
+fn on_status_gossip(
+    peers: &mut HashMap<PeerId, Peer>,
+    limiter: &admission::PeerLimiter,
+    from: PeerId,
+    forwarder: PeerId,
+    s: Status,
+    now: Instant,
+) -> GossipOutcome {
+    // Spent in place on the forwarder's own entry — `TokenBucket` is `Copy`, so a local copy
+    // would see a full bucket every time. No entry (a forwarder this node holds no connection
+    // to, which gossipsub does not produce) is nothing to meter against: ignored.
+    let Some(f) = peers.get_mut(&forwarder) else {
+        return GossipOutcome::Report(admission::Acceptance::Ignore);
+    };
+    if !limiter.allow(&mut f.status_bucket, now) {
+        return GossipOutcome::Report(admission::Acceptance::Ignore);
+    }
+    record_status(peers, from, s);
+    GossipOutcome::for_consensus()
+}
+
 fn pick_sync_peer(
     peers: &HashMap<PeerId, Peer>,
     my_height: u64,
@@ -558,6 +594,8 @@ struct Node {
     verified: Arc<RwLock<admission::VerifiedSet>>,
     /// Policy only — every bucket lives on its [`Peer`], so nothing here has to track the peer set.
     limiter: admission::PeerLimiter,
+    /// The policy over every peer's `status_bucket` (see [`on_status_gossip`]).
+    status_limiter: admission::PeerLimiter,
     /// The tip the pending verifications are running against, refreshed lazily: a full ledger clone
     /// per consensus message would cost one per vote, so it is taken only when a transaction is
     /// waiting and the tip's `(height, root)` has moved since the last one.
@@ -593,7 +631,18 @@ struct Peer {
     /// gossip never spends from it. Dropped with the entry on `PeerDisconnected`, which is why
     /// `PeerLimiter` keeps no map.
     tx_bucket: admission::TokenBucket,
+    /// The same, for the `Status` messages this peer forwards (`on_status_gossip`): a status is
+    /// three fields and costs nothing to check, so the bucket is generous ([`STATUS_GOSSIP_BURST`],
+    /// [`STATUS_GOSSIP_PER_SEC`]), but a forwarder cannot make this loop record one for every id
+    /// it can mint at wire speed.
+    status_bucket: admission::TokenBucket,
 }
+
+/// `Status` messages one forwarding peer may deliver back to back, and the rate it recovers them
+/// at. A node publishes one status per connection it makes and per commit it sees, so sixteen and
+/// four a second is far above any honest peer's share (the transaction bucket's numbers).
+pub const STATUS_GOSSIP_BURST: u32 = 16;
+pub const STATUS_GOSSIP_PER_SEC: f64 = 4.0;
 
 /// Drop the by-hash fetches sent more than `timeout` ago (audit v5): a request libp2p neither
 /// answered nor reported by then is gone, and left in place it would block every further
@@ -974,6 +1023,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         verified,
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
+        status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
         faucet_limiter: admission::PeerLimiter::new(admission::FAUCET_MINT_BURST, admission::FAUCET_MINT_PER_SEC),
         faucet_bucket: admission::TokenBucket::default(),
         snapshot: None,
@@ -1087,10 +1137,10 @@ impl Node {
         s.head_hash = self.hs.committed_hash().to_hex();
         s.view = self.hs.view();
         s.high_qc_view = self.hs.high_qc().view;
-        // `peer_count` keeps the meaning it has always had — every peer we know of, including
-        // those seen only as the author of relayed gossip — because dashboards threshold on it.
-        // `connected_peers` is the new number, and the one that matters for sync: only a peer we
-        // hold an open connection to can be asked for blocks.
+        // `peer_count` is every entry in the map, because dashboards threshold on it; since
+        // `record_status` stopped creating entries for the authors of relayed gossip, the map
+        // holds only peers this node is or was connected to. `connected_peers` is the number that
+        // matters for sync: only a peer we hold an open connection to can be asked for blocks.
         s.peer_count = self.peers.len();
         s.connected_peers = self.peers.values().filter(|p| p.connected).count();
         s.mempool_size = self.mempool.len();
@@ -1667,10 +1717,18 @@ impl Node {
                 }
                 GossipMessage::Transaction(tx) => self.on_gossiped_tx(tx, id).await?,
                 GossipMessage::Status(s) => {
-                    self.report(id, GossipOutcome::for_consensus()).await;
                     let ahead = s.height > self.hs.committed_height() + 1;
-                    self.peers.entry(from).or_default().status = Some(s);
-                    if ahead && self.sync_inflight.is_none() {
+                    let outcome = on_status_gossip(
+                        &mut self.peers,
+                        &self.status_limiter,
+                        from,
+                        id.propagation_source,
+                        s,
+                        Instant::now(),
+                    );
+                    let recorded = outcome == GossipOutcome::for_consensus();
+                    self.report(id, outcome).await;
+                    if recorded && ahead && self.sync_inflight.is_none() {
                         self.maybe_sync().await;
                     }
                 }
@@ -2445,7 +2503,7 @@ mod tests {
             let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
             PeerId::from(kp.public())
         };
-        let entry = |connected: bool| Peer { status: None, connected, tx_bucket: Default::default() };
+        let entry = |connected: bool| Peer { connected, ..Default::default() };
         const CAP: usize = 3;
         let mut peers: HashMap<PeerId, Peer> = [(pid(1), entry(false)), (pid(2), entry(false)), (pid(3), entry(false))].into_iter().collect();
         connect_peer(&mut peers, pid(4), CAP);
@@ -2467,6 +2525,88 @@ mod tests {
         assert!(peers[&pid(1)].connected);
     }
 
+    /// A gossiped `Status` is keyed by its *author*, which gossipsub delivers multi-hop, and a
+    /// peer id is free to mint: recording one for an author this node is not connected to made
+    /// an entry nothing ever removes — a way past the swarm's connection cap (deep scan
+    /// 2026-09-24, medium). Only an existing entry is updated.
+    #[test]
+    fn a_status_from_an_author_this_node_is_not_connected_to_creates_no_peer_entry() {
+        let pid = |seed: u8| {
+            let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+            PeerId::from(kp.public())
+        };
+        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height };
+        let forwarder = pid(1);
+        let author = pid(2);
+        let mut peers: HashMap<PeerId, Peer> =
+            [(forwarder, Peer { connected: true, ..Default::default() })].into_iter().collect();
+        for i in 0..64u8 {
+            record_status(&mut peers, pid(10 + i), status(9));
+        }
+        record_status(&mut peers, author, status(9));
+        assert_eq!(peers.len(), 1, "an author this node is not connected to must not get an entry ({} entries)", peers.len());
+        assert!(!peers.contains_key(&author));
+    }
+
+    /// The other half: a connected forwarder's own status (one hop, `from == propagation_source`)
+    /// still lands, and keeps landing, on its entry — that is what `pick_sync_peer` reads.
+    #[test]
+    fn a_connected_forwarders_own_status_still_updates() {
+        let pid = |seed: u8| {
+            let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+            PeerId::from(kp.public())
+        };
+        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height };
+        let forwarder = pid(1);
+        let mut peers: HashMap<PeerId, Peer> =
+            [(forwarder, Peer { connected: true, ..Default::default() })].into_iter().collect();
+        record_status(&mut peers, forwarder, status(9));
+        assert_eq!(peers[&forwarder].status.as_ref().map(|s| s.height), Some(9));
+        record_status(&mut peers, forwarder, status(10));
+        assert_eq!(peers[&forwarder].status.as_ref().map(|s| s.height), Some(10));
+        assert_eq!(peers.len(), 1);
+    }
+
+    /// A `Status` is metered against its *forwarder*, the way a transaction is (deep scan
+    /// 2026-09-24): the burst is admitted, the next one within the window is `Ignore`d and not
+    /// recorded, a second's refill re-admits four, and another forwarder spends its own bucket.
+    #[test]
+    fn status_gossip_is_metered_per_forwarder() {
+        use crate::admission::{Acceptance, PeerLimiter};
+        let pid = |seed: u8| {
+            let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+            PeerId::from(kp.public())
+        };
+        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height };
+        let limiter = PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC);
+        let (f1, f2) = (pid(1), pid(2));
+        let mut peers: HashMap<PeerId, Peer> = [f1, f2]
+            .into_iter()
+            .map(|p| (p, Peer { connected: true, ..Default::default() }))
+            .collect();
+        let now = Instant::now();
+        for i in 0..STATUS_GOSSIP_BURST as u64 {
+            let o = on_status_gossip(&mut peers, &limiter, f1, f1, status(i), now);
+            assert_eq!(o, GossipOutcome::for_consensus(), "status {i} of the burst: {o:?}");
+        }
+        let over = on_status_gossip(&mut peers, &limiter, f1, f1, status(99), now);
+        assert_eq!(over, GossipOutcome::Report(Acceptance::Ignore), "the {}th status within the window: {over:?}", STATUS_GOSSIP_BURST + 1);
+        assert_eq!(peers[&f1].status.as_ref().map(|s| s.height), Some(15), "an ignored status is not recorded");
+        // One second on: four more, then over again.
+        let later = now + Duration::from_secs(1);
+        for i in 0..4 {
+            assert_eq!(on_status_gossip(&mut peers, &limiter, f1, f1, status(20 + i), later), GossipOutcome::for_consensus(), "refilled {i}");
+        }
+        assert_eq!(on_status_gossip(&mut peers, &limiter, f1, f1, status(30), later), GossipOutcome::Report(Acceptance::Ignore));
+        // The other forwarder's bucket is its own — relaying f1's status spends f2's allowance,
+        // and records against the author.
+        assert_eq!(on_status_gossip(&mut peers, &limiter, f1, f2, status(40), later), GossipOutcome::for_consensus());
+        assert_eq!(peers[&f1].status.as_ref().map(|s| s.height), Some(40));
+        // A forwarder this node holds no entry for cannot be metered, and is ignored.
+        assert_eq!(on_status_gossip(&mut peers, &limiter, f1, pid(3), status(50), later), GossipOutcome::Report(Acceptance::Ignore));
+        assert_eq!(peers.len(), 2);
+    }
+
     #[test]
     fn pick_sync_peer_prefers_fresh_and_falls_back_to_any_connected() {
         let pid = |seed: u8| {
@@ -2479,7 +2619,7 @@ mod tests {
                 Peer {
                     status: height.map(|height| Status { height, head_hash: Hash::ZERO, view: height }),
                     connected,
-                    tx_bucket: Default::default(),
+                    ..Default::default()
                 },
             )
         };
