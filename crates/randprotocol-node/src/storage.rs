@@ -451,6 +451,58 @@ pub fn derived_note_count(tx: &randprotocol_core::Transaction) -> usize {
 /// blocks: a forced flush of a few kilobytes about once an hour.
 const MAX_TOTAL_WAL_BYTES: u64 = 256 * 1024 * 1024;
 
+/// `RegistryExt` as the `tokens_v2` key stores it: JSON, so a field this build knows but the
+/// writer did not reads as its default (audit v5 review note — the struct grew a field in v0.5.4
+/// and again in v0.5.5, and a positional blob stops decoding the moment one is appended). A
+/// storage-side mirror rather than JSON of the core type itself, because the windows are keyed
+/// by a tuple, which JSON maps cannot carry; here they are a list of pairs. The core type's own
+/// serde stays what the token root hashes.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct RegistryExtDisk {
+    max_tokens: Option<u32>,
+    windows: Option<MintWindowsDisk>,
+    burn_registration_fee: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MintWindowsDisk {
+    window_secs: u32,
+    global_cap: u64,
+    global: randprotocol_core::ledger::tokens::MintWindow,
+    backings: Vec<((u32, u16, [u8; 32]), randprotocol_core::ledger::tokens::MintWindow)>,
+}
+
+impl From<&randprotocol_core::ledger::tokens::RegistryExt> for RegistryExtDisk {
+    fn from(e: &randprotocol_core::ledger::tokens::RegistryExt) -> Self {
+        RegistryExtDisk {
+            max_tokens: e.max_tokens,
+            windows: e.windows.as_ref().map(|w| MintWindowsDisk {
+                window_secs: w.window_secs,
+                global_cap: w.global_cap,
+                global: w.global.clone(),
+                backings: w.backings.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            }),
+            burn_registration_fee: e.burn_registration_fee,
+        }
+    }
+}
+
+impl From<RegistryExtDisk> for randprotocol_core::ledger::tokens::RegistryExt {
+    fn from(d: RegistryExtDisk) -> Self {
+        randprotocol_core::ledger::tokens::RegistryExt {
+            max_tokens: d.max_tokens,
+            windows: d.windows.map(|w| randprotocol_core::ledger::tokens::MintWindows {
+                window_secs: w.window_secs,
+                global_cap: w.global_cap,
+                global: w.global,
+                backings: w.backings.into_iter().collect(),
+            }),
+            burn_registration_fee: d.burn_registration_fee,
+        }
+    }
+}
+
 impl Storage {
     /// Open (creating if needed) the database at `<path>/db`.
     pub fn open(path: &Path) -> Result<Storage> {
@@ -622,7 +674,14 @@ impl Storage {
     /// always was.
     fn put_tokens_ext(&self, batch: &mut WriteBatch, tokens: Option<&randprotocol_core::ledger::tokens::TokenRegistry>) -> Result<()> {
         match tokens.map(|t| t.ext()).filter(|e| **e != randprotocol_core::ledger::tokens::RegistryExt::default()) {
-            Some(ext) => batch.put_cf(self.cf(CF_META), META_TOKENS_V2, bincode::serialize(ext)?),
+            // JSON, not bincode (audit v5 review note): the struct has grown a field per release
+            // and a positional blob stops decoding the moment a field is appended; a
+            // self-describing one reads an absent field as its default.
+            Some(ext) => batch.put_cf(
+                self.cf(CF_META),
+                META_TOKENS_V2,
+                serde_json::to_vec(&RegistryExtDisk::from(ext)).map_err(|e| StorageError::Corrupt(format!("tokens_v2: {e}")))?,
+            ),
             None => batch.delete_cf(self.cf(CF_META), META_TOKENS_V2),
         }
         Ok(())
@@ -946,7 +1005,12 @@ impl Storage {
             self.get_meta_raw(META_TOKENS)?.map(|b| bincode::deserialize(&b)).transpose()?.flatten();
         if let Some(t) = tokens.as_mut() {
             if let Some(bytes) = self.get_meta_raw(META_TOKENS_V2)? {
-                t.set_ext(bincode::deserialize(&bytes)?);
+                // JSON since v0.5.5; a positional blob is what v0.5.4 wrote (no chain has one).
+                let ext = match serde_json::from_slice::<RegistryExtDisk>(&bytes) {
+                    Ok(disk) => disk.into(),
+                    Err(_) => bincode::deserialize(&bytes)?,
+                };
+                t.set_ext(ext);
             }
         }
         Ok(tokens)
@@ -2966,6 +3030,40 @@ mod tests {
     /// buffers — gigabytes across seventeen families) they pinned every log since their last
     /// flush: 13 GB of `.log` beside 27 GB of tables on a chain-14 validator, and a 48 GB droplet
     /// full (2026-09-24). A cap makes RocksDB flush the pinning family and delete the logs.
+    /// `tokens_v2` is self-describing (audit v5 review note): `RegistryExt` grew a field in v0.5.4
+    /// and again in v0.5.5, and a positional blob written by the older build would stop decoding
+    /// the day a chain that actually set `max_tokens` or `rules_v2` took a same-chain update. A
+    /// JSON blob lacking a field the reader knows decodes with that field's default, and a blob
+    /// written positionally by v0.5.4 is still read.
+    #[test]
+    fn a_tokens_v2_blob_missing_a_newer_field_still_decodes() {
+        use randprotocol_core::ledger::tokens::{RegistryExt, TokenRegistry};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let mut reg = TokenRegistry::new(1_000_000_000);
+        reg.set_ext(RegistryExt { max_tokens: Some(7), ..RegistryExt::default() });
+        let mut batch = WriteBatch::default();
+        batch.put_cf(s.cf(CF_META), META_TOKENS, bincode::serialize(&Some(reg.clone())).unwrap());
+        // What an older build would have written: the fields it knew, and no more.
+        batch.put_cf(s.cf(CF_META), META_TOKENS_V2, br#"{"max_tokens":7,"windows":null}"#.to_vec());
+        s.db.write(batch).unwrap();
+        let back = s.tokens().unwrap().unwrap();
+        assert_eq!(back.ext().max_tokens, Some(7));
+        assert!(!back.ext().burn_registration_fee, "an absent field is its default");
+        // And a v0.5.4 positional blob is still understood.
+        let old = RegistryExt { max_tokens: Some(9), ..RegistryExt::default() };
+        let mut batch = WriteBatch::default();
+        batch.put_cf(s.cf(CF_META), META_TOKENS_V2, bincode::serialize(&old).unwrap());
+        s.db.write(batch).unwrap();
+        assert_eq!(s.tokens().unwrap().unwrap().ext().max_tokens, Some(9));
+        // What this build writes is JSON.
+        let mut batch = WriteBatch::default();
+        s.put_tokens_ext(&mut batch, Some(&reg)).unwrap();
+        s.db.write(batch).unwrap();
+        let raw = s.get_meta_raw(META_TOKENS_V2).unwrap().unwrap();
+        assert!(raw.starts_with(b"{"), "self-describing on disk: {}", String::from_utf8_lossy(&raw));
+    }
+
     #[test]
     fn the_write_ahead_log_is_capped_not_pinned_by_a_quiet_family() {
         let dir = tempfile::tempdir().unwrap();

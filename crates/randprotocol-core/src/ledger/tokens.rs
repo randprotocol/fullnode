@@ -221,6 +221,7 @@ pub struct TokenRegistry {
 /// mint-window state, outside the v1 blob so chain 14's on-disk registry and root are untouched.
 /// [`Default`] is "none of it" — chain 14's shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RegistryExt {
     /// TOK-1: the genesis `tokens.max_tokens`, the most tokens the registry may hold
     /// ([`TokenError::RegistryFull`] at it). `None` is today's `u32::MAX` bound.
