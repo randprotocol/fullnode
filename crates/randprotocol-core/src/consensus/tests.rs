@@ -18,6 +18,9 @@ struct Sim {
     committed: Vec<Vec<CommittedBlock>>,
     /// `Action::RecordEpochSet`s each replica emitted, in order (the node persists these).
     recorded: Vec<Vec<(u64, crate::types::ValidatorSet)>>,
+    /// The last `Action::PersistPending` each replica emitted — what storage holds under
+    /// `META_PENDING_BLOCKS` (audit v5, CON-4) — and what `restart_durable` hands back.
+    pending: Vec<Vec<Block>>,
     timers: Vec<Option<u64>>,
     pending_propose: Vec<Option<u64>>,
     fetches: Vec<(usize, Hash)>,
@@ -139,6 +142,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
     let mut sim = Sim {
         committed: vec![Vec::new(); n as usize],
         recorded: vec![Vec::new(); n as usize],
+        pending: vec![Vec::new(); n as usize],
         timers: vec![None; n as usize],
         pending_propose: vec![None; n as usize],
         fetches: Vec::new(),
@@ -178,6 +182,7 @@ impl Sim {
                 Action::ReadyToPropose { view } => self.pending_propose[i] = Some(view),
                 Action::FetchBlock(h) => self.fetches.push((i, h)),
                 Action::PersistSafety(..) => {}
+                Action::PersistPending(blocks) => self.pending[i] = blocks,
                 // A real node stops here; the simulator records it so a test can assert it, and
                 // `assert_consistent` fails loudly if one ever appears unexpectedly.
                 Action::SafetyViolation { committed, attempted } => {
@@ -640,7 +645,7 @@ fn resume_from_persisted_head_continues_chain() {
         head.qc.clone(),
         ledger,
         Some(safety.clone()),
-        None,
+        Vec::new(),
         sim.nodes[0].epoch_sets().clone(),
         std::sync::Arc::new(StubExecutor),
     );
@@ -695,7 +700,7 @@ fn a_ledger_resumed_at_height_h_accepts_a_bundle_timed_at_h() {
         head.qc.clone(),
         reloaded,
         Some(sim.nodes[0].safety_state()),
-        None,
+        Vec::new(),
         sim.nodes[0].epoch_sets().clone(),
         std::sync::Arc::new(StubExecutor),
     );
@@ -766,11 +771,37 @@ impl Sim {
         let cfg = config_of(self);
         let epoch_sets = old.epoch_sets().clone();
         let signer = if old.is_validator() { Some(Keypair::from_seed(*self.keys[i].seed()).unwrap()) } else { None };
-        // No locked block: the restart this models is the one where the lock advanced and the
-        // process died before the block beside it was written (audit v4, review focus 1) — the
-        // tests that hand `resume` the persisted block do so themselves.
+        // No pending set: the restart this models is the one where a QC formed and the process
+        // died before the certified blocks were written (audit v4, review focus 1; audit v5
+        // CON-4) — `restart_durable` is the restart with what storage holds.
         self.nodes[i] =
-            HotStuff::resume(cfg, signer, head, qc, ledger, Some(safety), None, epoch_sets, std::sync::Arc::new(StubExecutor));
+            HotStuff::resume(cfg, signer, head, qc, ledger, Some(safety), Vec::new(), epoch_sets, std::sync::Arc::new(StubExecutor));
+        self.timers[i] = None;
+        self.pending_propose[i] = None;
+        let acts = self.nodes[i].start();
+        self.handle(i, acts);
+    }
+
+    /// `restart`, with the pending set the replica last persisted (`Action::PersistPending`)
+    /// handed back to `resume` — the restart a real node makes (audit v5, CON-4).
+    fn restart_durable(&mut self, i: usize) {
+        let old = &self.nodes[i];
+        let safety = old.safety_state();
+        let ledger = old.committed_ledger().clone();
+        let (head, qc) = match self.committed[i].last() {
+            Some(cb) => (cb.block.clone(), cb.qc.clone()),
+            None => {
+                let g = old.block(&old.committed_hash()).unwrap().clone();
+                let gh = g.hash();
+                (g, QuorumCertificate::genesis(gh))
+            }
+        };
+        let cfg = config_of(self);
+        let epoch_sets = old.epoch_sets().clone();
+        let signer = if old.is_validator() { Some(Keypair::from_seed(*self.keys[i].seed()).unwrap()) } else { None };
+        let pending = self.pending[i].clone();
+        self.nodes[i] =
+            HotStuff::resume(cfg, signer, head, qc, ledger, Some(safety), pending, epoch_sets, std::sync::Arc::new(StubExecutor));
         self.timers[i] = None;
         self.pending_propose[i] = None;
         let acts = self.nodes[i].start();
@@ -973,7 +1004,7 @@ fn a_stale_safety_state_never_lowers_the_lock() {
         qc,
         ledger,
         Some(safety),
-        None,
+        Vec::new(),
         epoch_sets,
         std::sync::Arc::new(StubExecutor),
     );
@@ -1631,7 +1662,7 @@ fn qcs_across_a_boundary_verify_against_their_own_epoch() {
         head.qc.clone(),
         ledger,
         None,
-        None,
+        Vec::new(),
         epoch_sets,
         std::sync::Arc::new(StubExecutor),
     );
@@ -2174,8 +2205,11 @@ fn eight_unsigned_not_found_replies_no_longer_release_the_lock() {
 }
 
 #[test]
-fn not_held_from_more_than_a_third_of_the_stake_releases_the_lock_and_less_does_not() {
-    // Six equal stakes: a third is 2, "strictly more than" is 3 signers.
+fn not_held_releases_the_lock_only_on_a_quorum() {
+    // Six equal stakes: a quorum is strictly more than two thirds (`ValidatorSet::has_quorum`,
+    // `3·stake > 2·total`), so 5 signers; 4 is exactly two thirds and is not one. Audit v5,
+    // CON-4: v0.5.4 released on more than a third (3 of 6), which is not sound — a third can be
+    // exactly the Byzantine validators, so nobody honest need be among them.
     let mut sim = setup(6, 6);
     let victim = lock_on_unobtainable(&mut sim);
     let h = sim.nodes[victim].locked_qc().block_hash;
@@ -2184,10 +2218,13 @@ fn not_held_from_more_than_a_third_of_the_stake_releases_the_lock_and_less_does_
     let sign = |i: usize| NotHeld::sign(&sim.keys[i], &g, &h);
     assert!(!sim.nodes[victim].record_not_held(&sign(others[0])));
     assert!(!sim.nodes[victim].record_not_held(&sign(others[1])));
-    assert!(!sim.nodes[victim].record_not_held(&sign(others[1])), "a repeat signer counts once");
-    assert_eq!(sim.nodes[victim].not_held_stake(&h), 2 * MIN_STAKE as u128);
-    assert!(sim.nodes[victim].locked_qc().block_hash == h, "two of six is not more than a third");
-    assert!(sim.nodes[victim].record_not_held(&sign(others[2])));
+    assert!(!sim.nodes[victim].record_not_held(&sign(others[2])), "three of six is not a quorum");
+    assert!(!sim.nodes[victim].record_not_held(&sign(others[2])), "a repeat signer counts once");
+    assert_eq!(sim.nodes[victim].not_held_stake(&h), 3 * MIN_STAKE as u128);
+    assert_eq!(sim.nodes[victim].locked_qc().block_hash, h, "three of six is not more than two thirds");
+    assert!(!sim.nodes[victim].record_not_held(&sign(others[3])), "four of six is exactly two thirds, not more");
+    assert_eq!(sim.nodes[victim].locked_qc().block_hash, h);
+    assert!(sim.nodes[victim].record_not_held(&sign(others[4])), "five of six is a quorum");
     assert_eq!(sim.nodes[victim].locked_qc().view, sim.nodes[victim].committed_qc_view());
     assert_eq!(sim.nodes[victim].not_held_stake(&h), 0, "the evidence is cleared with the release");
 }
@@ -2235,7 +2272,7 @@ fn a_resumed_validator_finds_its_locked_block_without_a_fetch() {
         qc.clone(),
         ledger.clone(),
         Some(safety.clone()),
-        Some(block.clone()),
+        vec![block.clone()],
         epoch_sets.clone(),
         std::sync::Arc::new(StubExecutor),
     );
@@ -2270,13 +2307,249 @@ fn a_resumed_validator_finds_its_locked_block_without_a_fetch() {
         qc,
         ledger,
         Some(safety),
-        None,
+        Vec::new(),
         epoch_sets,
         std::sync::Arc::new(StubExecutor),
     );
     again.start();
     let acts = again.on_proposal(sibling, sim.now + 1).expect("accepted");
     assert!(acts.iter().any(|a| matches!(a, Action::FetchBlock(h) if *h == locked_hash)), "{acts:?}");
+}
+
+/// Drive `sim` until some replica's high QC certifies a block above its head that it holds
+/// with `depth` certified blocks between the head and it (inclusive); returns that replica.
+fn certified_chain_of(sim: &mut Sim, depth: u64) -> usize {
+    for _ in 0..32 {
+        sim.step(vec![]);
+        let found = (0..sim.nodes.len()).find(|&i| {
+            let hs = &sim.nodes[i];
+            let tip = hs.high_qc().block_hash;
+            hs.high_qc().view > hs.committed_qc_view()
+                && hs.block(&tip).is_some_and(|b| b.height() == hs.committed_height() + depth)
+        });
+        if let Some(i) = found {
+            return i;
+        }
+    }
+    panic!("no replica holds a certified chain of {depth} above its head");
+}
+
+/// The blocks from `hs`'s committed head (exclusive) up to its high QC's block, in height order.
+fn certified_blocks(hs: &HotStuff) -> Vec<Block> {
+    let mut out = Vec::new();
+    let mut cur = hs.high_qc().block_hash;
+    while cur != hs.committed_hash() {
+        let b = hs.block(&cur).expect("the certified chain is held").clone();
+        cur = b.parent();
+        out.push(b);
+    }
+    out.reverse();
+    out
+}
+
+/// Audit v5, CON-4: the blocks a QC certified are durable. A replica restarted with what it
+/// persisted holds the block its high QC names — no fetch — and the chain goes on. Fails on
+/// v0.5.4: the pending set is not persisted, so the restart drops the block, exactly the
+/// whole-fleet-restart position that stalled chain 14 on 2026-09-24.
+#[test]
+fn a_restart_keeps_the_blocks_a_qc_certified() {
+    let mut sim = setup(4, 4);
+    let victim = certified_chain_of(&mut sim, 1);
+    let high = sim.nodes[victim].high_qc().clone();
+    let chain = certified_blocks(&sim.nodes[victim]);
+    assert!(!chain.is_empty());
+    assert_eq!(chain.last().unwrap().hash(), high.block_hash);
+    assert_eq!(
+        sim.pending[victim].iter().map(|b| b.hash()).collect::<Vec<_>>(),
+        chain.iter().map(|b| b.hash()).collect::<Vec<_>>(),
+        "what the replica last persisted is its certified chain, in order"
+    );
+    sim.fetches.clear();
+    sim.restart_durable(victim);
+    let hs = &sim.nodes[victim];
+    assert_eq!(hs.high_qc(), &high, "the high QC survives the restart");
+    assert!(hs.has_block(&high.block_hash), "the block the persisted high QC certifies is back in the tree");
+    for b in &chain {
+        assert!(hs.has_block(&b.hash()), "block {} of the certified chain is back", b.height());
+    }
+    assert!(!sim.fetches.iter().any(|(i, _)| *i == victim), "no FetchBlock at start: {:?}", sim.fetches);
+    let before = sim.committed[victim].len();
+    for _ in 0..8 {
+        sim.step(vec![]);
+    }
+    sim.assert_consistent();
+    assert!(sim.committed[victim].len() > before, "the restarted replica keeps committing");
+}
+
+/// The pending set is our own persisted data, but it can be stale: a crash between a commit and
+/// the rewrite that follows it leaves a set that starts at (or below) the new head, and a set
+/// that does not reach the head at all must not be inserted (review focus 3). `resume` skips
+/// what is at or under the head, inserts what extends what it holds, in order, and drops the
+/// rest silently.
+#[test]
+fn a_stale_pending_set_is_dropped() {
+    let mut sim = setup(4, 4);
+    let victim = certified_chain_of(&mut sim, 2);
+    let old = &sim.nodes[victim];
+    let chain = certified_blocks(old);
+    assert_eq!(chain.len(), 2, "two certified blocks above the head");
+    let (mid, tip) = (chain[0].clone(), chain[1].clone());
+    let head_hash = old.committed_hash();
+    assert_eq!(mid.parent(), head_hash);
+    let safety = old.safety_state();
+    let ledger = old.committed_ledger().clone();
+    let (head, qc) = match sim.committed[victim].last() {
+        Some(cb) => (cb.block.clone(), cb.qc.clone()),
+        None => (old.block(&head_hash).unwrap().clone(), QuorumCertificate::genesis(head_hash)),
+    };
+    let epoch_sets = old.epoch_sets().clone();
+    let resume = |pending: Vec<Block>| {
+        HotStuff::resume(
+            config_of(&sim),
+            Some(Keypair::from_seed(*sim.keys[victim].seed()).unwrap()),
+            head.clone(),
+            qc.clone(),
+            ledger.clone(),
+            Some(safety.clone()),
+            pending,
+            epoch_sets.clone(),
+            std::sync::Arc::new(StubExecutor),
+        )
+    };
+    // A set that does not extend the head: nothing is inserted.
+    let stale = resume(vec![tip.clone()]);
+    assert!(!stale.has_block(&tip.hash()), "a block whose parent is not held is dropped");
+    assert_eq!(stale.pending_tip_height(), stale.committed_height(), "the tree holds only the head");
+    // The whole certified chain, in order: both blocks are back.
+    let whole = resume(vec![mid.clone(), tip.clone()]);
+    assert!(whole.has_block(&mid.hash()) && whole.has_block(&tip.hash()), "two pending blocks restored in order");
+    assert_eq!(whole.pending_tip_height(), whole.committed_height() + 2);
+    // A set that starts at the head — the crash between the commit and the rewrite: the head is
+    // skipped, not re-inserted, and what is above it is restored.
+    let overlapping = resume(vec![head.clone(), mid.clone(), tip.clone()]);
+    assert!(overlapping.has_block(&mid.hash()) && overlapping.has_block(&tip.hash()));
+    assert_eq!(overlapping.pending_tip_height(), overlapping.committed_height() + 2);
+    // Out of order, the child comes first and has no parent yet: it is dropped, the parent kept.
+    let reversed = resume(vec![tip.clone(), mid.clone()]);
+    assert!(reversed.has_block(&mid.hash()));
+    assert!(!reversed.has_block(&tip.hash()), "order is the writer's promise, not something resume repairs");
+}
+
+/// A QC every validator of `sim` signed for `hash` at `view`: what a NewView can carry for a
+/// block this replica never held — the ghost of the 2026-09-24 stall.
+fn quorum_qc_for(sim: &Sim, view: u64, hash: Hash) -> QuorumCertificate {
+    let votes = sim.keys.iter().map(|k| Vote::sign(&sim.domain(), view, hash, k)).collect();
+    QuorumCertificate { view, block_hash: hash, votes }
+}
+
+/// With every certified block persisted, a persisted high QC whose block is not in the pending
+/// set (and not the head) is a ghost by construction — every legitimately certified block above
+/// the head is in the set — so `resume` drops it to the highest QC certifying a block it holds
+/// instead of restoring it. The fleet on v0.5.4 had exactly this state on every node: a high
+/// QC on a block nobody held, restored at every restart and re-announced by every NewView. The
+/// lock is not touched: only the not-held quorum releases it.
+#[test]
+fn a_persisted_high_qc_on_a_block_the_pending_set_lacks_is_dropped_at_resume() {
+    let mut sim = setup(4, 4);
+    let victim = certified_chain_of(&mut sim, 2);
+    let old = &sim.nodes[victim];
+    let chain = certified_blocks(old);
+    let (mid, tip) = (chain[0].clone(), chain[1].clone());
+    let high = old.high_qc().clone();
+    assert_eq!(high.block_hash, tip.hash());
+    let safety = old.safety_state();
+    let ledger = old.committed_ledger().clone();
+    let head_hash = old.committed_hash();
+    let (head, head_qc) = match sim.committed[victim].last() {
+        Some(cb) => (cb.block.clone(), cb.qc.clone()),
+        None => (old.block(&head_hash).unwrap().clone(), QuorumCertificate::genesis(head_hash)),
+    };
+    let epoch_sets = old.epoch_sets().clone();
+    let resume = |pending: Vec<Block>| {
+        let mut hs = HotStuff::resume(
+            config_of(&sim),
+            Some(Keypair::from_seed(*sim.keys[victim].seed()).unwrap()),
+            head.clone(),
+            head_qc.clone(),
+            ledger.clone(),
+            Some(safety.clone()),
+            pending,
+            epoch_sets.clone(),
+            std::sync::Arc::new(StubExecutor),
+        );
+        let acts = hs.start();
+        (hs, acts)
+    };
+    // The set holds the block: the QC is restored, as before.
+    let (whole, acts) = resume(vec![mid.clone(), tip.clone()]);
+    assert_eq!(whole.high_qc(), &high, "the high QC is restored when its block is held");
+    assert!(!acts.iter().any(|a| matches!(a, Action::FetchBlock(_))), "{acts:?}");
+    // The set lacks the block: the QC is a ghost, dropped to the highest held one — here the
+    // head's — and nothing is fetched. The lock stays exactly as persisted.
+    let (ghost, acts) = resume(Vec::new());
+    assert_eq!(ghost.high_qc(), &head_qc, "a high QC on a block the pending set lacks is dropped to the head's");
+    assert_eq!(ghost.high_qc().view, ghost.committed_qc_view());
+    assert!(!acts.iter().any(|a| matches!(a, Action::FetchBlock(_))), "no fetch for a ghost: {acts:?}");
+    let kept_lock = if safety.locked_qc.view > head_qc.view { safety.locked_qc.clone() } else { head_qc.clone() };
+    assert_eq!(ghost.locked_qc(), &kept_lock, "the lock is kept");
+    // The set holds the lower block only — not a state the node writes (the set is written
+    // before the safety state that names the QC), but the rule is the same: the ghost is
+    // dropped to the highest held certificate, and nothing is fetched.
+    let (partial, acts) = resume(vec![mid.clone()]);
+    assert!(partial.has_block(&mid.hash()));
+    assert_ne!(partial.high_qc(), &high, "a ghost");
+    assert!(partial.has_block(&partial.high_qc().block_hash), "the high QC names a held block");
+    assert!(!acts.iter().any(|a| matches!(a, Action::FetchBlock(_))), "{acts:?}");
+    // The reachable crash: the set is written, the safety state that names the tip's QC is
+    // not. The older high QC's block is held, so it is restored — and the tip is in the tree
+    // for the next NewView to certify.
+    let mut older = safety.clone();
+    older.high_qc = tip.header.justify.clone();
+    let mut hs = HotStuff::resume(
+        config_of(&sim),
+        Some(Keypair::from_seed(*sim.keys[victim].seed()).unwrap()),
+        head.clone(),
+        head_qc.clone(),
+        ledger.clone(),
+        Some(older),
+        vec![mid.clone(), tip.clone()],
+        epoch_sets.clone(),
+        std::sync::Arc::new(StubExecutor),
+    );
+    hs.start();
+    assert_eq!(hs.high_qc(), &tip.header.justify);
+    assert!(hs.has_block(&mid.hash()) && hs.has_block(&tip.hash()));
+}
+
+/// `fallback_high_qc` lands on the highest QC certifying a block the replica holds, not blindly
+/// on the head's: a replica holding certified pending blocks above its head that fell back to
+/// the head's QC proposed a sibling of the first pending block, which nobody could vote for
+/// (chain 14, 2026-09-24: pending 248948..248952 above head 248947, fallback to view 261708).
+#[test]
+fn a_fallback_lands_on_the_highest_certified_block_held() {
+    let mut sim = setup(4, 4);
+    let victim = certified_chain_of(&mut sim, 2);
+    let chain = certified_blocks(&sim.nodes[victim]);
+    let tip = chain[1].clone();
+    let high = sim.nodes[victim].high_qc().clone();
+    assert_eq!(high.block_hash, tip.hash());
+    // A quorum-signed QC on a block this replica never held, at a higher view, announced by a
+    // peer's NewView: believed, as it must be.
+    let ghost = Hash::digest(b"a block nobody holds");
+    let ghost_qc = quorum_qc_for(&sim, high.view + 1, ghost);
+    let view = sim.nodes[victim].view().max(high.view + 2);
+    let announcer = (0..4).find(|&i| i != victim).unwrap();
+    let nv = NewView::sign(&sim.domain(), view, ghost_qc.clone(), &sim.keys[announcer]);
+    let acts = sim.nodes[victim].on_new_view(nv).expect("a well-formed new-view");
+    sim.handle(victim, acts);
+    assert_eq!(sim.nodes[victim].high_qc(), &ghost_qc);
+    // Every fetch failed: the fallback lands on the QC certifying the higher pending block —
+    // the certificate the replica holds — not on the head's.
+    let acts = sim.nodes[victim].fallback_high_qc(&ghost);
+    sim.handle(victim, acts);
+    assert_eq!(sim.nodes[victim].high_qc(), &high, "back to the highest QC certifying a held block");
+    assert!(sim.nodes[victim].has_block(&sim.nodes[victim].high_qc().block_hash));
+    assert!(sim.nodes[victim].high_qc().view > sim.nodes[victim].committed_qc_view());
 }
 
 // ---------------------------------------------------------------------------
@@ -2317,7 +2590,8 @@ fn the_consensus_suite_holds_under_signing_domain_v1() {
         a_resumed_validator_keeps_its_lock();
         a_resumed_validator_finds_its_locked_block_without_a_fetch();
         eight_unsigned_not_found_replies_no_longer_release_the_lock();
-        not_held_from_more_than_a_third_of_the_stake_releases_the_lock_and_less_does_not();
+        not_held_releases_the_lock_only_on_a_quorum();
+        a_restart_keeps_the_blocks_a_qc_certified();
         commit_rule_requires_three_consecutive_views();
         a_leaders_second_block_for_one_view_is_refused_as_equivocation();
         epoch_rollover_uses_the_register_after_the_last_block_of_the_previous_epoch();

@@ -191,15 +191,27 @@ pub fn resume_consensus(
     let head_qc = storage.head_qc()?;
     let ledger = reload_ledger(storage, gs, executor.as_ref())?;
     let safety = storage.load_safety()?;
-    // The locked block kept beside the lock (audit v4, CON-4); `resume` puts it back in the tree.
-    let locked_block = storage.locked_block()?;
+    // The certified chain above the head (audit v5, CON-4), which `resume` puts back in the
+    // tree. A database v0.5.4 wrote holds instead the one locked block it kept beside the lock
+    // (audit v4): that is read once more, folded into the pending set below, and its key retired.
+    let mut pending = storage.pending_blocks()?;
+    let legacy = storage.locked_block()?;
+    if pending.is_empty() {
+        pending.extend(legacy.clone());
+    }
     let mut ccfg = ConsensusConfig::new(gs.chain_id, gs.validators.clone(), gs.hash());
     ccfg.epoch_blocks = gs.epoch_blocks;
     ccfg.domain = gs.signing_domain();
     ccfg.base_timeout = base_timeout;
     ccfg.max_timeout = max_timeout;
     let epoch_sets = storage.load_epoch_sets()?;
-    Ok(HotStuff::resume(ccfg, signer, head_block, head_qc, ledger, safety, locked_block, epoch_sets, executor))
+    let hs = HotStuff::resume(ccfg, signer, head_block, head_qc, ledger, safety, pending, epoch_sets, executor);
+    if legacy.is_some() {
+        storage.save_pending_blocks(&hs.certified_chain_blocks())?;
+        storage.clear_locked_block()?;
+        tracing::info!("the v0.5.4 locked block was folded into the pending set; its key is retired");
+    }
+    Ok(hs)
 }
 
 /// The answer to a by-hash fetch: the block from the tree or the committed chain; failing that,
@@ -503,15 +515,14 @@ struct Node {
     /// Batches that arrived after their request had been given up on and were applied anyway.
     /// Progress, not failure — but a rising count means the give-up is firing on live requests.
     sync_late_batches: u64,
-    fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, Hash>,
+    /// By-hash fetches outstanding, with when each was sent: one older than the wire timeout is
+    /// abandoned by `fetch_block` (audit v5) — libp2p neither answered nor reported it.
+    fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, (Hash, Instant)>,
     /// Block hash -> (attempts so far, peers already asked) for by-hash fetches.
     fetch_attempts: HashMap<Hash, (usize, Vec<PeerId>)>,
     /// Free space on the data directory's filesystem, measured at startup and on every status
     /// tick; what `NodeStatus::disk_free_bytes` and `disk_low` publish (audit v4 OPS-3).
     disk_free_bytes: u64,
-    /// The hash of the locked block storage currently holds beside the lock (audit v4, CON-4),
-    /// so a vote whose lock did not move costs one fsync, not a rewrite of the block too.
-    locked_persisted: Option<Hash>,
     /// Transaction hashes this node has already refused for a reason about their bytes, so a
     /// re-gossiped copy costs a hash lookup instead of a proof verification.
     refused: admission::RefusedCache,
@@ -557,6 +568,24 @@ struct Peer {
     /// gossip never spends from it. Dropped with the entry on `PeerDisconnected`, which is why
     /// `PeerLimiter` keeps no map.
     tx_bucket: admission::TokenBucket,
+}
+
+/// Drop the by-hash fetches sent more than `timeout` ago (audit v5): a request libp2p neither
+/// answered nor reported by then is gone, and left in place it would block every further
+/// attempt for its hash. Returns the hashes dropped. Each was counted as an attempt when sent.
+fn expire_stale_fetches<K: std::hash::Hash + Eq + Clone>(
+    inflight: &mut HashMap<K, (Hash, Instant)>,
+    timeout: Duration,
+    now: Instant,
+) -> Vec<Hash> {
+    let stale: Vec<K> =
+        inflight.iter().filter(|(_, (_, sent))| now.duration_since(*sent) > timeout).map(|(k, _)| k.clone()).collect();
+    stale.iter().filter_map(|k| inflight.remove(k)).map(|(h, _)| h).collect()
+}
+
+/// Whether a by-hash fetch for `h` is still outstanding, after [`expire_stale_fetches`].
+fn fetch_blocked<K>(inflight: &HashMap<K, (Hash, Instant)>, h: &Hash) -> bool {
+    inflight.values().any(|(x, _)| x == h)
 }
 
 /// The wire cost of one committed block in a sync batch.
@@ -757,7 +786,6 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // reports as *in the current set* is `active_validator`.
     let signer = if cfg.validator { Some(Keypair::from_seed(cfg.seed)?) } else { None };
     let mut hs = resume_consensus(&storage, &gs, signer, cfg.base_timeout, cfg.max_timeout, executor.clone())?;
-    let locked_persisted = storage.locked_block()?.map(|b| b.hash());
     // The covered source (spec §3.2): on a chain that aggregates, proposals and candidates
     // carrying an `Aggregate` apply through the covered-carrying path, answered from the store.
     // Set once, before the loop's first proposal; a chain without the section never consults it.
@@ -918,7 +946,6 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
         disk_free_bytes,
-        locked_persisted,
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         verified,
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -1025,19 +1052,6 @@ impl Node {
                 self.cfg.min_free_disk_bytes.saturating_mul(crate::disk::DISK_LOW_FACTOR) / (1 << 20)
             );
         }
-    }
-
-    /// The locked block beside the lock (audit v4, CON-4): written when the lock moves to a block
-    /// this node holds above its head, cleared when the lock is back at the head, skipped when
-    /// storage already holds exactly this one.
-    fn persist_locked_block(&mut self, locked: Option<Block>) -> Result<()> {
-        let hash = locked.as_ref().map(|b| b.hash());
-        if hash == self.locked_persisted {
-            return Ok(());
-        }
-        self.storage.save_locked_block(locked.as_ref())?;
-        self.locked_persisted = hash;
-        Ok(())
     }
 
     fn publish_status(&self) {
@@ -1309,12 +1323,18 @@ impl Node {
         // in the same batch as it: a set persisted separately could be lost to a crash between
         // the two writes, and that epoch's QCs would be unverifiable on the next replay.
         let mut to_record: Vec<(u64, ValidatorSet)> = Vec::new();
+        // The certified chain above the head (audit v5, CON-4), written in order — before the
+        // safety state that follows it in the batch, so the set on disk always holds the block
+        // the persisted high QC names — except after a `Commit`: the replica emits the post-
+        // commit set after `Commit`, and written before the commit lands it would, on a crash
+        // between the two, lose the block just committed. That one is deferred to after the
+        // commit below; a later set in the batch replaces an earlier one whole.
+        let mut pending: Option<Vec<Block>> = None;
         while let Some(a) = queue.pop_front() {
             match a {
-                Action::PersistSafety(s, locked) => {
-                    self.storage.save_safety(&s)?;
-                    self.persist_locked_block(locked)?;
-                }
+                Action::PersistSafety(s) => self.storage.save_safety(&s)?,
+                Action::PersistPending(blocks) if to_commit.is_empty() => self.storage.save_pending_blocks(&blocks)?,
+                Action::PersistPending(blocks) => pending = Some(blocks),
                 // Nothing is persisted and nothing else in the batch runs: this node's committed
                 // history and the set's disagree, so every finality answer it could give from here
                 // is suspect. Stop; startup's `verify_chain` decides what the restart does with the
@@ -1343,7 +1363,11 @@ impl Node {
                 Action::FetchBlock(h) => queue.extend(self.fetch_block(h).await),
             }
         }
-        self.commit(to_commit, to_record).await
+        self.commit(to_commit, to_record).await?;
+        if let Some(blocks) = pending {
+            self.storage.save_pending_blocks(&blocks)?;
+        }
+        Ok(())
     }
 
     async fn commit(&mut self, blocks: Vec<CommittedBlock>, epoch_sets: Vec<(u64, ValidatorSet)>) -> Result<()> {
@@ -1724,7 +1748,16 @@ impl Node {
     /// then any other; a peer that answers "not found" or fails is not asked again for
     /// the same hash. Gives up after `MAX_FETCH_ATTEMPTS`.
     async fn fetch_block(&mut self, h: Hash) -> Vec<Action> {
-        if self.hs.has_block(&h) || self.fetch_inflight.values().any(|x| *x == h) {
+        // A request libp2p neither answers nor reports would otherwise block the hash for
+        // good: on node A (2026-09-24) one `NotHeld` and one timeout were followed by no third
+        // attempt for thirty minutes, so no leader ever reached the eight failures the fallback
+        // needs. Past the wire's own timeout the request is gone rather than merely slow — the
+        // same rule `sync_from` applies to a batch request. It was counted as an attempt when
+        // it was sent, and its peer stays on the asked list.
+        for stale in expire_stale_fetches(&mut self.fetch_inflight, self.wire.sync_request_timeout, Instant::now()) {
+            tracing::debug!("by-hash fetch of {stale:?} got no answer within the wire timeout; abandoned");
+        }
+        if self.hs.has_block(&h) || fetch_blocked(&self.fetch_inflight, &h) {
             return Vec::new();
         }
         let entry = self.fetch_attempts.entry(h).or_insert((0, Vec::new()));
@@ -1759,7 +1792,7 @@ impl Node {
             return self.unobtainable(h);
         };
         if let Some(id) = self.net.send_sync_request(peer, SyncRequest::BlockByHash(h)).await {
-            self.fetch_inflight.insert(id, h);
+            self.fetch_inflight.insert(id, (h, Instant::now()));
             let e = self.fetch_attempts.get_mut(&h).expect("inserted above");
             e.0 += 1;
             e.1.push(peer);
@@ -1777,7 +1810,7 @@ impl Node {
 
     /// A by-hash fetch came back empty or failed: try the next peer.
     async fn retry_fetch(&mut self, request_id: libp2p::request_response::OutboundRequestId) -> Result<()> {
-        if let Some(h) = self.fetch_inflight.remove(&request_id) {
+        if let Some((h, _)) = self.fetch_inflight.remove(&request_id) {
             if !self.hs.has_block(&h) {
                 let acts = self.fetch_block(h).await;
                 self.handle_actions(acts).await?;
@@ -1861,7 +1894,7 @@ impl Node {
     ) -> Result<()> {
         match response {
             SyncResponse::Block(Some(b)) => {
-                if let Some(h) = self.fetch_inflight.remove(&request_id) {
+                if let Some((h, _)) = self.fetch_inflight.remove(&request_id) {
                     self.fetch_attempts.remove(&h);
                 }
                 self.on_consensus(ConsensusMessage::Proposal(b)).await?;
@@ -1875,7 +1908,7 @@ impl Node {
                 // for; the replica verifies the signer against its current set and releases the
                 // lock once more than a third of the stake has attested. Then on to the next
                 // peer, as for `Block(None)`.
-                match self.fetch_inflight.get(&request_id).copied() {
+                match self.fetch_inflight.get(&request_id).map(|(h, _)| *h) {
                     Some(h) if n.hash == h => {
                         if self.hs.record_not_held(&n) {
                             tracing::warn!(
@@ -2188,10 +2221,10 @@ impl Node {
         ccfg.max_timeout = self.cfg.max_timeout;
         let signer = if self.hs.is_validator() { Some(Keypair::from_seed(self.cfg.seed)?) } else { None };
         let safety = self.hs.safety_state();
-        // The locked block rides the resume too (audit v4, CON-4): from the replica being
-        // replaced when it holds it, else from storage.
-        let locked_block =
-            self.hs.block(&safety.locked_qc.block_hash).cloned().or_else(|| self.storage.locked_block().ok().flatten());
+        // The certified chain the replica being replaced holds (audit v5, CON-4): what extends
+        // the new head is put back, the rest — at or under it, or off the synced branch — is
+        // dropped by `resume`; the set on disk is then rewritten to what the new replica holds.
+        let held = self.hs.certified_chain_blocks();
         self.hs = HotStuff::resume(
             ccfg,
             signer,
@@ -2199,10 +2232,11 @@ impl Node {
             head.qc.clone(),
             ledger,
             Some(safety),
-            locked_block,
+            held,
             sets,
             self.executor.clone(),
         );
+        self.storage.save_pending_blocks(&self.hs.certified_chain_blocks())?;
         // The covered source does not ride the resume: `HotStuff::resume` is a fresh replica,
         // and without this a synced node would refuse every aggregate-carrying block at the
         // sidecar forever (the capstone's AggregateNeedsCovered).
@@ -2321,6 +2355,30 @@ mod tests {
         Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, Vec::new(), k)
     }
 
+    /// A by-hash fetch that libp2p neither answers nor reports (audit v5, node A on 2026-09-24:
+    /// after one `NotHeld` and one timeout, no third attempt for thirty minutes) must not hold
+    /// the hash un-fetchable forever: an inflight entry older than the wire timeout is dropped
+    /// — it was counted as an attempt when it was sent — and no longer blocks a new attempt; a
+    /// fresh one still does.
+    #[test]
+    fn an_inflight_fetch_older_than_the_timeout_does_not_block_a_new_attempt() {
+        let timeout = Duration::from_secs(20);
+        let now = Instant::now();
+        let stale = Hash::digest(b"asked long ago");
+        let fresh = Hash::digest(b"asked just now");
+        let mut inflight: HashMap<u64, (Hash, Instant)> = HashMap::new();
+        inflight.insert(1, (stale, now - timeout - Duration::from_secs(1)));
+        inflight.insert(2, (fresh, now - Duration::from_secs(1)));
+        assert_eq!(expire_stale_fetches(&mut inflight, timeout, now), vec![stale]);
+        assert!(!fetch_blocked(&inflight, &stale), "a stale fetch no longer blocks a new attempt");
+        assert!(fetch_blocked(&inflight, &fresh), "a fresh one still does");
+        assert_eq!(inflight.len(), 1);
+        // Exactly at the timeout the request is still the wire's to answer.
+        inflight.insert(3, (stale, now - timeout));
+        assert_eq!(expire_stale_fetches(&mut inflight, timeout, now), Vec::<Hash>::new());
+        assert!(fetch_blocked(&inflight, &stale));
+    }
+
     /// The sync peer selection (the stall shape's unit test): the freshest connected peer
     /// ahead wins; the fallback asks any connected peer when the chain is known ahead but no
     /// connected-and-fresh pair exists; and a statusless connected peer is still askable.
@@ -2392,11 +2450,54 @@ mod tests {
             storage.head_qc().unwrap(),
             reload_ledger(&storage, &gs, executor.as_ref()).unwrap(),
             None,
-            None,
+            Vec::new(),
             EpochSets::new(gs.validators.clone()),
             executor,
         );
         assert_eq!(blind.on_proposal(proposal, 3), Err(ConsensusError::UnknownEpochSet(1)));
+    }
+
+    /// The upgrade from v0.5.4 (audit v5, CON-4): a database holding the locked block under the
+    /// old key and no pending set resumes with that block in the tree exactly as v0.5.4 did —
+    /// once. The first startup folds it into the pending set and retires the old key, and the
+    /// next startup reads the pending set alone.
+    #[test]
+    fn a_v054_locked_block_is_read_once_then_superseded_by_the_pending_set() {
+        let (_d, storage, gs, ledger) = chain_past_a_boundary();
+        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
+        let head = storage.head_block().unwrap();
+        let locked = next_block(&head, &ledger, &key(1));
+        let qc = QuorumCertificate {
+            view: locked.view(),
+            block_hash: locked.hash(),
+            votes: vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), locked.view(), locked.hash(), &key(1))],
+        };
+        // What v0.5.4 left behind: a lock above the head, the locked block under the old key,
+        // and no pending set.
+        storage
+            .save_safety(&randprotocol_core::consensus::SafetyState {
+                view: locked.view() + 1,
+                high_qc: qc.clone(),
+                locked_qc: qc.clone(),
+                last_voted_view: locked.view(),
+            })
+            .unwrap();
+        storage.put_locked_block_v054_for_testing(&locked).unwrap();
+        assert!(storage.pending_blocks().unwrap().is_empty());
+
+        let resume = || {
+            resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), executor.clone()).unwrap()
+        };
+        let hs = resume();
+        assert!(hs.has_block(&locked.hash()), "the v0.5.4 locked block is back in the tree");
+        assert_eq!(hs.high_qc(), &qc);
+        assert_eq!(hs.locked_qc(), &qc);
+        assert_eq!(storage.pending_blocks().unwrap(), vec![locked.clone()], "folded into the pending set");
+        assert_eq!(storage.locked_block().unwrap(), None, "and the old key is retired");
+
+        let again = resume();
+        assert!(again.has_block(&locked.hash()), "the second startup reads the pending set alone");
+        assert_eq!(storage.pending_blocks().unwrap(), vec![locked.clone()]);
     }
 
     /// A by-hash fetch for a block this node does not hold (audit v4, CON-4): a validator answers

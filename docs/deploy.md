@@ -62,13 +62,31 @@ known-failing test is a reason not to tag, never a note to tag over.
    previous build cannot answer block fetches for the new one.
 
 **Roll note for v0.5.4's lock rule (audit v4 CON-4).** A validator's lock is now released only on
-signed `NotHeld` answers from validators holding more than a third of the stake
-(`docs/consensus.md`, "The lock"), and a node on an older build never sends one: in a mixed fleet
-a lock on a block no peer holds simply holds, and that validator withholds its vote until a newer
-QC forms without it. Roll all validators, one at a time waited to `rand_getHealth: ok`, before
-relying on the rule; the database stays forward-compatible (no new column family —
-`META_LOCKED_BLOCK` is a CF_META key an old build never reads), so the rollback is the re-pin
-of the previous binary.
+signed `NotHeld` answers from validators holding more than a third of the stake — a quorum,
+strictly more than two thirds, since v0.5.5 (audit v5) — (`docs/consensus.md`, "The lock"), and
+a node on an older build never sends one: in a mixed fleet a lock on a block no peer holds simply
+holds, and that validator withholds its vote until a newer QC forms without it. Roll all
+validators, one at a time waited to `rand_getHealth: ok`, before relying on the rule; the v0.5.4
+database stays forward-compatible (no new column family — `META_LOCKED_BLOCK` is a CF_META key an
+old build never reads), so the rollback from v0.5.4 is the re-pin of the previous binary. Since
+v0.5.5 every certified block above the head is persisted too (`META_PENDING_BLOCKS`, another
+CF_META key an old build never reads) and restored at startup, so a whole-fleet restart no longer
+leaves every validator's high QC naming a block nobody holds — the 2026-09-24 stall.
+
+**Roll note for v0.5.5's storage layout (audit v5 OPS-4).** A committed block's certificate is
+stored once: it lives in its child's `justify`, and `CF_QCS` keeps only genesis' row and the
+head's. The first open on v0.5.5 deletes the row v0.5.4 wrote for every other height (~250 000
+rows, ~12 GB on a chain-14 validator) in one batch, sets `META_QCS_PRUNED`, and compacts the
+family; a node killed mid-pass finishes it on its next open. Startup verification reads each
+block once (the child is carried into the next height), so it is no slower than before. **Rollback
+below v0.5.5 needs a resync**: a v0.5.4 binary reading a pruned database finds no row for a
+non-head height and fails `committed_block` with `Corrupt` — it cannot serve sync and its own
+startup verify refuses the chain — so the old binary must start from an empty data directory.
+No wire, consensus or genesis change: v0.5.5 and v0.5.4 nodes interoperate, and the roll is one
+node at a time waited to `rand_getHealth: ok` as usual. The slope this halves: an idle chain-14
+block is ~60 KB of `blocks` (the 18-signature Dilithium2 QC inside the header) and ~0 of `qcs`
+where it was ~49 KB more — about 3.6 GB/day at the fleet's measured 1.4 s blocks, 1.7 GB/day at
+3 s (the D19 numbers; the release notes carry the figure measured after the roll).
 
 **Roll note for v0.5.5's storage layout (audit v5 OPS-4).** A committed block's certificate is
 stored once: it lives in its child's `justify`, and `CF_QCS` keeps only genesis' row and the

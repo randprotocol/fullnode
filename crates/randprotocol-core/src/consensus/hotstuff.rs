@@ -31,6 +31,10 @@ struct Entry {
     block: Block,
     ledger_after: Ledger,
     receipts: Vec<crate::program::CallReceipt>,
+    /// The certificate this replica has seen for the block, if any (audit v5, CON-4): a child's
+    /// `justify`, or a QC that was the high QC. What `highest_held_qc` falls back to — a QC only
+    /// ever held as `high_qc` was lost the moment a QC on a block nobody held replaced it.
+    qc: Option<QuorumCertificate>,
 }
 
 /// Chained HotStuff replica. Validators hold a `signer`; observing full nodes do not.
@@ -130,7 +134,7 @@ impl HotStuff {
         assert_eq!(genesis_hash, cfg.genesis_hash, "genesis mismatch");
         let qc = QuorumCertificate::genesis(genesis_hash);
         let epoch_sets = EpochSets::new(cfg.genesis_set.clone());
-        Self::resume(cfg, signer, genesis_block, qc, genesis_ledger, None, None, epoch_sets, executor)
+        Self::resume(cfg, signer, genesis_block, qc, genesis_ledger, None, Vec::new(), epoch_sets, executor)
     }
 
     /// Resume from a committed head plus persisted safety state and the epoch sets storage holds.
@@ -139,10 +143,15 @@ impl HotStuff {
     /// — until an epoch's register admits it again (spec §8), which is how a validator that
     /// unbonded below the minimum, or one that bonded mid-epoch, rejoins.
     ///
-    /// `locked_block` is the block storage kept beside the lock (audit v4, CON-4): when it is
-    /// the one the restored `locked_qc` certifies and it sits on the head, it is re-executed
-    /// and put back in the tree, so the replica can check the next proposal against its own
-    /// promise instead of fetching a block that, after a whole-fleet restart, no peer holds.
+    /// `pending` is the certified chain storage kept above the head (audit v5, CON-4: the last
+    /// `Action::PersistPending`), in height order. Each block is re-executed on its parent and
+    /// put back in the tree — skipping what is at or under the head (a set written before the
+    /// commit that moved the head), dropping silently what does not extend a block this replica
+    /// holds — so the block the restored `high_qc` or `locked_qc` names is one it holds, and
+    /// the next proposal is checked against its own promise instead of a fetch that, after a
+    /// whole-fleet restart, no peer can answer. The lock is then restored from the safety state
+    /// exactly as before; the high QC too, unless its block is not among the restored blocks —
+    /// a ghost by construction, which falls to the highest QC certifying a held block.
     #[allow(clippy::too_many_arguments)]
     pub fn resume(
         cfg: ConsensusConfig,
@@ -151,7 +160,7 @@ impl HotStuff {
         head_qc: QuorumCertificate,
         head_ledger: Ledger,
         safety: Option<SafetyState>,
-        locked_block: Option<Block>,
+        pending: Vec<Block>,
         epoch_sets: EpochSets,
         executor: Arc<dyn ConfidentialExecutor>,
     ) -> HotStuff {
@@ -171,7 +180,7 @@ impl HotStuff {
         head_ledger.set_height(head_height);
         head_ledger.set_timestamp_ms(head.header.timestamp_ms);
         let mut tree = HashMap::new();
-        tree.insert(head_hash, Entry { block: head, ledger_after: head_ledger.clone(), receipts: Vec::new() });
+        tree.insert(head_hash, Entry { block: head, ledger_after: head_ledger.clone(), receipts: Vec::new(), qc: Some(head_qc.clone()) });
         // The lock is a promise this replica made to the rest of the set, and it outlives the
         // process (audit v3, CON-1b): a restart that reset the lock to the committed head's QC let
         // this node vote for a branch conflicting with one it was locked on, which is exactly the
@@ -217,8 +226,25 @@ impl HotStuff {
             current_epoch: 0,
         };
         hs.refresh_current_set();
-        if let Some(block) = locked_block {
-            hs.restore_locked_block(block);
+        hs.restore_pending(pending);
+        // With every certified block persisted, a persisted high QC whose block is not among
+        // them (and not the head) is a ghost by construction — every legitimately certified
+        // block above the head is in the set — so it is not restored: the high QC falls to the
+        // highest QC certifying a block this replica holds. Restoring it re-created the
+        // 2026-09-24 stall at every restart: a high QC on a block nobody held, fetched, failed,
+        // fallen back from, and re-announced by every NewView. The lock is not touched — only
+        // the not-held quorum releases it.
+        if hs.high_qc.view > hs.head_qc.view && !hs.tree.contains_key(&hs.high_qc.block_hash) {
+            let held = hs.highest_held_qc();
+            tracing::warn!(
+                "persisted high QC (view {}) names block {:?}, which is not in the persisted certified chain: \
+                 a ghost; resuming on the highest held QC (view {})",
+                hs.high_qc.view,
+                hs.high_qc.block_hash,
+                held.view
+            );
+            hs.high_qc = held;
+            hs.refresh_current_set();
         }
         if let Some(s) = &hs.signer {
             if !hs.current.contains(&s.address()) {
@@ -228,26 +254,36 @@ impl HotStuff {
         hs
     }
 
-    /// Put the persisted locked block back in the tree (audit v4, CON-4), re-executed on the
-    /// head the way `on_proposal` executes a block. Only the block the lock certifies, only
-    /// while the lock is above the head, and only when the block sits on the head — the lock
-    /// can advance without a commit, and a locked block further up has no parent to execute on
-    /// here; that case is left to the fetch path exactly as before.
-    fn restore_locked_block(&mut self, block: Block) {
-        let hash = block.hash();
-        if hash != self.locked_qc.block_hash || self.locked_qc.view <= self.head_qc.view || self.tree.contains_key(&hash) {
-            return;
-        }
-        if block.parent() != self.committed_hash {
-            tracing::info!("persisted locked block {hash:?} does not sit on the head; its branch is fetched instead");
-            return;
-        }
-        match self.execute_and_insert(&block) {
-            Ok(()) => {
-                self.refresh_current_set();
-                tracing::info!("locked block {hash:?} (view {}) restored beside the lock", self.locked_qc.view);
+    /// Put the persisted certified chain back in the tree (audit v5, CON-4), each block
+    /// re-executed on its parent the way `on_proposal` executes a proposal. The set is this
+    /// replica's own write, but it can be stale — a crash between a commit and the rewrite that
+    /// follows it leaves one that starts at or under the new head — so a block at or under the
+    /// head is skipped, a block whose parent is not held is dropped (never inserted, review
+    /// focus 3), and a block that does not re-execute is dropped with a warning: the fetch path
+    /// answers for whatever is missing, exactly as before there was a set.
+    fn restore_pending(&mut self, pending: Vec<Block>) {
+        let mut restored = 0usize;
+        for block in pending {
+            let hash = block.hash();
+            if block.height() <= self.committed_height || self.tree.contains_key(&hash) {
+                continue;
             }
-            Err(e) => tracing::warn!("persisted locked block {hash:?} did not re-execute on the head: {e}; fetching instead"),
+            if !self.tree.contains_key(&block.parent()) {
+                tracing::info!("pending block {hash:?} (height {}) does not extend a block this replica holds; dropped", block.height());
+                continue;
+            }
+            match self.execute_and_insert(&block) {
+                Ok(()) => restored += 1,
+                Err(e) => tracing::warn!("pending block {hash:?} (height {}) did not re-execute: {e}; dropped", block.height()),
+            }
+        }
+        if restored > 0 {
+            self.refresh_current_set();
+            tracing::info!(
+                "{restored} certified block(s) restored above the head (high QC view {}, lock view {})",
+                self.high_qc.view,
+                self.locked_qc.view
+            );
         }
     }
 
@@ -516,13 +552,47 @@ impl HotStuff {
         }
     }
 
-    /// The block `PersistSafety` carries (audit v4, CON-4): the locked block while the lock is
-    /// above the head and this replica holds it, else `None` — which storage reads as "clear".
-    fn locked_block_to_persist(&self) -> Option<Block> {
-        if self.locked_qc.view > self.head_qc.view {
-            self.tree.get(&self.locked_qc.block_hash).map(|e| e.block.clone())
-        } else {
-            None
+    /// The blocks `Action::PersistPending` carries (audit v5, CON-4): every block this replica
+    /// holds on the chain from the committed head (exclusive) up to the high QC's block, and up
+    /// to the locked block when the lock is not on that chain — the same set `evict_for_room`
+    /// keeps — in height order, so `resume` can re-execute each on its parent. Empty when
+    /// neither certified block is held (the fetch case), which storage writes as "nothing".
+    pub fn certified_chain_blocks(&self) -> Vec<Block> {
+        let keep = self.certified_chain();
+        let mut blocks: Vec<Block> = keep
+            .iter()
+            .filter(|h| **h != self.committed_hash)
+            .filter_map(|h| self.tree.get(h).map(|e| e.block.clone()))
+            .collect();
+        blocks.sort_by(|a, b| a.height().cmp(&b.height()).then_with(|| a.hash().cmp(&b.hash())));
+        blocks
+    }
+
+    /// The highest QC this replica holds that certifies a block it holds (audit v5, CON-4): the
+    /// head's, the lock's when the locked block is held, and every certificate a tree entry
+    /// remembers for its block (a child's `justify`, or a QC that was the high QC). What
+    /// `high_qc` falls to when its own block is unobtainable — never blindly the head's: a
+    /// replica holding certified pending blocks above its head that fell back to the head's QC
+    /// proposed a sibling of the first pending block, which nobody could vote for (chain 14,
+    /// 2026-09-24).
+    fn highest_held_qc(&self) -> QuorumCertificate {
+        let mut best = self.head_qc.clone();
+        let candidates = std::iter::once(&self.locked_qc).chain(self.tree.values().filter_map(|e| e.qc.as_ref()));
+        for qc in candidates {
+            if qc.view > best.view && self.tree.contains_key(&qc.block_hash) {
+                best = qc.clone();
+            }
+        }
+        best
+    }
+
+    /// Remember `qc` as the certificate of its block, when this replica holds the block. A block
+    /// is certified in one view only, so the first one seen is the one.
+    fn remember_qc(&mut self, qc: &QuorumCertificate) {
+        if let Some(entry) = self.tree.get_mut(&qc.block_hash) {
+            if entry.qc.is_none() {
+                entry.qc = Some(qc.clone());
+            }
         }
     }
 
@@ -544,11 +614,13 @@ impl HotStuff {
     /// Record a peer's signed not-held for the locked block (audit v4, CON-4). Counts only an
     /// attestation for the block this replica is locked on above its head and does not hold,
     /// from a validator of the *current* set (a member of an earlier epoch's set counts
-    /// nothing), with a signature over this chain's genesis. Once the signers hold strictly more
-    /// than a third of the set's stake — so an honest validator is among them and the block is
-    /// genuinely unobtainable — the lock is lowered to the committed head's QC, which is safe for
-    /// the same reason the old unsigned fallback was: nothing above the head is committed.
-    /// Returns whether the lock was released by this attestation.
+    /// nothing), with a signature over this chain's genesis. Once the signers hold a quorum —
+    /// strictly more than two thirds of the set's stake (audit v5: a third is exactly what the
+    /// Byzantine validators may hold, so "more than a third" need not include anyone honest) —
+    /// the block is attested unobtainable by a majority of the honest stake, and the lock is
+    /// lowered to the committed head's QC, which is safe for the same reason the old unsigned
+    /// fallback was: nothing above the head is committed. Returns whether the lock was released
+    /// by this attestation.
     pub fn record_not_held(&mut self, n: &NotHeld) -> bool {
         let locked = self.locked_qc.block_hash;
         // Evidence for any other hash is stale — the lock moved on — or never mattered.
@@ -562,11 +634,11 @@ impl HotStuff {
         }
         self.not_held.entry(locked).or_default().insert(signer);
         let stake = self.not_held_stake(&locked);
-        if !self.current.has_third(stake) {
+        if !self.current.has_quorum(stake) {
             return false;
         }
         tracing::warn!(
-            "locked block {:?} (view {}) is attested unheld by validators holding more than a third of the stake; \
+            "locked block {:?} (view {}) is attested unheld by a quorum of the stake; \
              releasing the lock to the committed head QC (view {})",
             locked,
             self.locked_qc.view,
@@ -587,9 +659,11 @@ impl HotStuff {
 
     /// Liveness escape hatch. If `high_qc` certifies a block this replica cannot obtain
     /// (every peer that had it is gone or unreachable), drop back to the highest QC whose
-    /// block is known: the committed head. Safe: nothing past the head is committed, so no
-    /// committed block can be contradicted; replicas locked on the abandoned branch simply
-    /// withhold their vote until a newer QC releases their lock.
+    /// block is known — the highest certified pending block it holds, else the committed head
+    /// (audit v5: it used to be the head unconditionally, which made a leader holding certified
+    /// pending blocks propose a sibling of the first of them). Safe: nothing past the head is
+    /// committed, so no committed block can be contradicted; replicas locked on the abandoned
+    /// branch simply withhold their vote until a newer QC releases their lock.
     /// Returns actions (possibly `ReadyToPropose`); an empty vec means nothing changed.
     ///
     /// The *lock* is not touched here any more (audit v4, CON-4). It used to be lowered on the
@@ -604,14 +678,16 @@ impl HotStuff {
         if self.high_qc.block_hash != *unobtainable || self.tree.contains_key(unobtainable) {
             return out;
         }
+        let held = self.highest_held_qc();
         tracing::warn!(
-            "high QC (view {}) certifies an unobtainable block {:?}; falling back to the committed head QC (view {})",
+            "high QC (view {}) certifies an unobtainable block {:?}; falling back to the highest held QC (view {}, head view {})",
             self.high_qc.view,
             unobtainable,
+            held.view,
             self.head_qc.view
         );
         self.unobtainable.insert(*unobtainable);
-        self.high_qc = self.head_qc.clone();
+        self.high_qc = held;
         self.refresh_current_set();
         self.maybe_ready_to_propose(&mut out);
         out
@@ -730,6 +806,12 @@ impl HotStuff {
         // A valid proposal for view v moves us into view v.
         let justify = block.header.justify.clone();
         self.update_high_qc(&justify, &mut out);
+        // The block the high QC already named arrived (a fetch, or an orphan's parent): the
+        // certified chain is whole again, so persist it (audit v5, CON-4). `update_high_qc`
+        // persists on the other order — the QC arriving after the block.
+        if self.high_qc.block_hash == hash {
+            out.push(Action::PersistPending(self.certified_chain_blocks()));
+        }
         if block.view() > self.view {
             self.enter_view(block.view(), &mut out);
         }
@@ -767,8 +849,10 @@ impl HotStuff {
         // B5: the admission cache comes along — a transaction this node verified at the pool is
         // decoded here, not re-verified. Everything stateful is re-checked either way.
         let receipts = ledger.apply_block_for_sync(block, &sidecar, &[], self.executor.as_ref(), self.verified.as_ref())?;
-        self.tree.insert(hash, Entry { block: block.clone(), ledger_after: ledger, receipts });
+        self.tree.insert(hash, Entry { block: block.clone(), ledger_after: ledger, receipts, qc: None });
         self.proposed.insert((block.view(), block.proposer()), hash);
+        // The child's `justify` is the parent's certificate.
+        self.remember_qc(&block.header.justify);
         // The block arrived: whatever was attested about not holding it is moot.
         self.not_held.remove(&hash);
         self.unobtainable.remove(&hash);
@@ -1029,7 +1113,8 @@ impl HotStuff {
         out.push(self.schedule_timeout());
     }
 
-    fn update_high_qc(&mut self, qc: &QuorumCertificate, _out: &mut Vec<Action>) {
+    fn update_high_qc(&mut self, qc: &QuorumCertificate, out: &mut Vec<Action>) {
+        self.remember_qc(qc);
         // A QC on a block that proved unobtainable is not believed again until the block turns
         // up: raising the high QC to it would only send this replica back to the fetch that
         // already failed everywhere, and — re-announced by every NewView — keep it there.
@@ -1039,6 +1124,12 @@ impl HotStuff {
         if qc.view > self.high_qc.view {
             self.high_qc = qc.clone();
             self.refresh_current_set();
+            // The certified chain grew by a block this replica holds: persist it (audit v5,
+            // CON-4). A QC on a block not held persists nothing new — the block arrives through
+            // `on_proposal`, which persists then.
+            if self.tree.contains_key(&qc.block_hash) {
+                out.push(Action::PersistPending(self.certified_chain_blocks()));
+            }
         }
     }
 
@@ -1173,6 +1264,9 @@ impl HotStuff {
         self.refresh_current_set();
         out.extend(recorded);
         out.push(Action::Commit(committed));
+        // What is certified above the new head, after the prune (audit v5, CON-4) — written
+        // after the commit, so a crash between the two leaves a set that starts at the new head.
+        out.push(Action::PersistPending(self.certified_chain_blocks()));
     }
 
     fn prune(&mut self) {
@@ -1314,7 +1408,7 @@ impl HotStuff {
             return;
         }
         self.last_voted_view = block.view();
-        out.push(Action::PersistSafety(self.safety_state(), self.locked_block_to_persist()));
+        out.push(Action::PersistSafety(self.safety_state()));
         let vote = Vote::sign(&self.cfg.domain, block.view(), block.hash(), signer);
         // Votes are broadcast and every validator assembles the QC locally
         // (see `on_vote`). Relaying only to the next leader would strand the

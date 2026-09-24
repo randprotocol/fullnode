@@ -214,11 +214,19 @@ pub enum Action {
     /// and feed it to `on_proposal`. Unknown parents of incoming proposals are
     /// reported through `ConsensusError::UnknownParent` instead.
     FetchBlock(Hash),
-    /// Persist before executing any later action in the same batch. The block is the one the
-    /// new `locked_qc` certifies when the lock is above the committed head (audit v4, CON-4),
-    /// `None` when it is not: storage keeps it beside the lock so a restarted validator finds
-    /// its locked block without a fetch, and clears it when the lock is back at the head.
-    PersistSafety(SafetyState, Option<Block>),
+    /// Persist before executing any later action in the same batch. (Until v0.5.5 this also
+    /// carried the locked block for storage to keep beside the lock — audit v4, CON-4; the
+    /// certified chain `PersistPending` carries always holds the locked block, so that key is
+    /// read once more for a database v0.5.4 wrote and then retired.)
+    PersistSafety(SafetyState),
+    /// The certified blocks above the committed head, in height order — every block a QC this
+    /// replica holds certifies, from the head's child up to the high QC's block (audit v5,
+    /// CON-4). Storage writes the whole set under one key, replacing the previous; a restart
+    /// hands it back to `resume`, which puts the blocks back in the tree, so the block a persisted
+    /// high QC or lock names is never one this replica has to fetch after a whole-fleet restart.
+    /// Emitted after the `Commit` it follows, so a crash between the two leaves a set that starts
+    /// at the new head, which `resume` skips over.
+    PersistPending(Vec<Block>),
     /// A three-chain committed a block that does not descend from this replica's committed head.
     /// Its answers about finality cannot be trusted from here on, so the node layer stops rather
     /// than serving them (audit v3, the CON-3 candidate: this used to be a log line and a

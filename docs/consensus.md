@@ -38,7 +38,7 @@ Regression tests (`consensus/tests.rs`): `a_leaders_second_block_for_one_view_is
 `a_proposal_past_the_view_window_is_refused_not_stored`,
 `six_hundred_siblings_do_not_stop_the_honest_leaders_proposal` (fails on v0.5.3 with `TreeFull`).
 
-## The lock (CON-4) — wire-coordinated
+## The lock (CON-4) — wire-coordinated; durable pending blocks (audit v5)
 
 A validator's `locked_qc` is a promise to the rest of the set: it will not vote for a branch that
 does not extend the locked block unless a newer QC releases it. Since v0.5.1 the lock survives a
@@ -46,45 +46,82 @@ restart (audit v3, CON-1b), but until v0.5.4 it was taken back on evidence anyon
 manufacture: once `MAX_FETCH_ATTEMPTS` = 8 fetches for the locked block had failed — each a
 `Block(None)` or a timeout from a peer picked by an unsigned status — `fallback_high_qc` lowered
 the lock to the committed head's QC. Eight sybils released any honest validator's lock. Two
-changes close that:
+changes close that, and v0.5.5 (audit v5) tightens both:
 
-- **The locked block is persisted beside the lock.** `Action::PersistSafety(SafetyState,
-  Option<Block>)` carries the block the new `locked_qc` certifies while the lock is above the
-  head; the node writes it under `META_LOCKED_BLOCK` (CF_META, fsynced like the safety state,
-  replaced when it changes, deleted when the lock is back at the head — an older build never
-  reads the key). `HotStuff::resume` re-executes it on the head and puts it back in the tree, so
-  a restarted validator checks the next proposal against its own promise without a fetch. That
-  alone removes the whole-fleet-restart case the old fallback existed for. (A lock that advanced
-  past a block not on the head — the lock can move without a commit — keeps the fetch path: the
-  block's parent is not there to execute on.)
-- **Release only on signed not-held.** A validator asked `BlockByHash(h)` for a block it holds
-  neither in its tree nor in its committed chain answers `SyncResponse::NotHeld` — a Dilithium2
-  signature over `rand-not-held-1 ‖ genesis_hash ‖ h`, bound to one chain and one block; an
-  observer answers `Block(None)` as before, its word carrying no stake. The asker verifies the
-  signer against its *current* validator set (a member of an earlier epoch's set counts nothing),
-  records the signer's stake against the hash, and lowers the lock only once the signers hold
-  **strictly more than a third of the set's stake** (`ValidatorSet::has_third`) — so at least one
-  honest validator is among them and the block is genuinely unobtainable. Timeouts and
-  `Block(None)` still count as fetch attempts, bounding the fetch loop, but never as evidence.
-  `high_qc` keeps the old fallback: it is liveness state, not a promise. Evidence is kept for the
-  locked block alone and cleared when the block arrives, when the lock is released, and on commit.
+- **Every certified block is persisted** (v0.5.5; until then only the locked block was, beside
+  the lock under `META_LOCKED_BLOCK`). Whenever the high QC rises to a block the replica holds —
+  and whenever the block a high QC already named arrives — the replica emits
+  `Action::PersistPending(Vec<Block>)`: the certified chain from the committed head's child up
+  to the high QC's block (and the locked block's, when the lock is off that chain), in height
+  order, a few blocks in steady state. The node writes the whole set under `META_PENDING_BLOCKS`
+  (CF_META, one bincode `Vec<Block>`, fsynced like the safety state, replaced on every write,
+  deleted when empty), *after* the `Commit` in the same batch — the replica emits the set after
+  the commit's prune, so a crash between the two leaves a set that starts at the new head, which
+  `resume` skips over. `HotStuff::resume` takes the set and re-executes each block on its parent
+  in order: a block at or under the head is skipped, a block whose parent is not held is dropped
+  silently (never inserted), and the high QC and the lock are then restored from the safety
+  state exactly as before. So after a restart — a whole-fleet one included — the block the
+  persisted high QC or lock names is one the replica holds: no fetch, no not-held round, no ghost
+  QC. Those paths stay for the genuine cases (a set lost with the disk, a lock advanced past a
+  block that never arrived). The v0.5.4 key is read once more by the first v0.5.5 startup on
+  such a database, folded into the pending set, and retired (`Storage::clear_locked_block`).
+- **Release only on a signed not-held quorum.** A validator asked `BlockByHash(h)` for a block it
+  holds neither in its tree nor in its committed chain answers `SyncResponse::NotHeld` — a
+  Dilithium2 signature over `rand-not-held-1 ‖ genesis_hash ‖ h`, bound to one chain and one
+  block; an observer answers `Block(None)` as before, its word carrying no stake. The asker
+  verifies the signer against its *current* validator set (a member of an earlier epoch's set
+  counts nothing), records the signer's stake against the hash, and lowers the lock only once the
+  signers hold **a quorum — strictly more than two thirds of the set's stake**
+  (`ValidatorSet::has_quorum`, since v0.5.5; v0.5.4 released on more than a third, which is not
+  sound: a third is exactly what the Byzantine validators may hold, so nobody honest need be
+  among them). Timeouts and `Block(None)` still count as fetch attempts, bounding the fetch
+  loop, but never as evidence. `high_qc` keeps the old fallback: it is liveness state, not a
+  promise. Evidence is kept for the locked block alone and cleared when the block arrives, when
+  the lock is released, and on commit.
 
-What this costs: with fewer than a third of the stake attesting — an old peer never answers
+Three more rules from watching chain 14 stall on the v0.5.4 build (2026-09-24), all node-only:
+
+- **A persisted high QC on a block the pending set lacks is a ghost.** With every certified
+  block persisted, every legitimately certified block above the head is in the set, so `resume`
+  does not restore such a QC: `high_qc` falls to the highest QC certifying a block the replica
+  holds (the lock is untouched). Every node of the fleet had exactly that state — a high QC on a
+  block nobody held, restored at every restart and re-announced by every NewView.
+- **The fallback lands on the highest certified block held.** `fallback_high_qc` (and the rule
+  above) falls to `max` by view over the head's QC, the lock's when its block is held, and every
+  certificate a tree entry remembers for its block (a child's `justify`, or a QC that was the
+  high QC — `Entry::qc`), never blindly to the head's: a replica holding certified pending blocks
+  248948..248952 above head 248947 fell back to the head's QC and proposed a sibling of 248948
+  that nobody could vote for.
+- **By-hash fetches expire.** `fetch_block` first drops an inflight request older than the wire's
+  `sync_request_timeout` — the abandon rule `sync_from` applies to batch requests — so a request
+  libp2p neither answers nor reports (node A: one `NotHeld`, one timeout, then no third attempt
+  for thirty minutes) no longer blocks the hash for good; it was counted as an attempt when sent.
+
+Regression tests: `a_persisted_high_qc_on_a_block_the_pending_set_lacks_is_dropped_at_resume`,
+`a_fallback_lands_on_the_highest_certified_block_held` (both fail on v0.5.4: the head's view-0
+QC), the node's `an_inflight_fetch_older_than_the_timeout_does_not_block_a_new_attempt`.
+
+What this costs: with less than a quorum of the stake attesting — an old peer never answers
 `NotHeld`, a partition, or genuinely fewer than that many validators missing the block — a lock
 on an unobtainable block holds, and that validator withholds its vote until a newer QC forms
 without it (spec D15: a rare stall is accepted; a lock is never released on unsigned evidence
-again). **Roll note:** the rule gathers evidence only from peers running v0.5.4, so in a mixed
-fleet a lock on an unobtainable block holds until the fleet has rolled whole — roll every
-validator, one at a time, before relying on it (`docs/deploy.md`).
+again). With every certified block persisted, that position is reached only when the block was
+never on this node's disk at all. **Roll note:** the rule gathers evidence only from peers running
+v0.5.4 or later, so in a mixed fleet a lock on an unobtainable block holds until the fleet has
+rolled whole — roll every validator, one at a time, before relying on it (`docs/deploy.md`).
 
 Regression tests: `eight_unsigned_not_found_replies_no_longer_release_the_lock` (fails on
-v0.5.3: the first fallback lowered the lock),
-`not_held_from_more_than_a_third_of_the_stake_releases_the_lock_and_less_does_not`,
+v0.5.3: the first fallback lowered the lock), `not_held_releases_the_lock_only_on_a_quorum`
+(fails on v0.5.4: three of six released),
 `a_not_held_from_outside_the_current_set_or_for_another_chain_counts_nothing`,
+`a_restart_keeps_the_blocks_a_qc_certified` (fails on v0.5.4: the restart drops the block the
+persisted high QC names), `a_stale_pending_set_is_dropped`,
 `a_resumed_validator_finds_its_locked_block_without_a_fetch`; `leader_falls_back_when_high_qc_block_is_unobtainable`
 keeps the high-QC half and resumes the chain on signed evidence; the node's
-`a_validator_answers_an_unknown_hash_with_a_signed_not_held_and_an_observer_does_not` and the
-storage round trip `locked_block_roundtrip_and_clear`.
+`a_validator_answers_an_unknown_hash_with_a_signed_not_held_and_an_observer_does_not` and
+`a_v054_locked_block_is_read_once_then_superseded_by_the_pending_set`; the storage round trips
+`pending_blocks_round_trip_and_an_empty_set_deletes_the_key` and
+`the_v054_locked_block_is_read_once_then_cleared`.
 
 ## Signing domains (consensus domain v1) — genesis-gated
 

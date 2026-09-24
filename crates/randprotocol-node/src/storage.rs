@@ -145,10 +145,14 @@ const META_HEAD_HEIGHT: &str = "head_height";
 const META_GENESIS_HASH: &str = "genesis_hash";
 const META_CHAIN_ID: &str = "chain_id";
 const META_SAFETY: &str = "safety";
-/// The block the persisted `locked_qc` certifies while the lock is above the head (audit v4,
-/// CON-4): written by the `PersistSafety` arm beside the safety state, deleted once the lock is
-/// back at the head, read by `resume_consensus`. An older build never reads the key.
+/// v0.5.4's locked block (audit v4, CON-4): the block the persisted `locked_qc` certified,
+/// written beside the safety state by that build. Never written by this one — `resume_consensus`
+/// reads it once, folds it into [`META_PENDING_BLOCKS`], and retires the key.
 const META_LOCKED_BLOCK: &str = "locked_block";
+/// The certified blocks above the committed head (audit v5, CON-4): one bincode `Vec<Block>`,
+/// the last `Action::PersistPending`, replaced whole on every write and deleted when empty.
+/// Supersedes `META_LOCKED_BLOCK`: the locked block is always in the certified chain.
+const META_PENDING_BLOCKS: &str = "pending_blocks";
 /// Set once the `CF_QCS` rows strictly between genesis and the head have been deleted (audit
 /// v5, OPS-4): a database written by v0.5.4 holds one per height, and `open` prunes them once.
 const META_QCS_PRUNED: &str = "qcs_pruned";
@@ -1966,18 +1970,43 @@ impl Storage {
         self.get(CF_META, META_SAFETY.as_bytes())
     }
 
-    /// Persist the locked block beside the lock (audit v4, CON-4), or clear it with `None`.
-    /// Fsynced like the safety state: it is part of the same promise.
-    pub fn save_locked_block(&self, block: Option<&Block>) -> Result<()> {
-        match block {
-            Some(b) => self.db.put_cf_opt(self.cf(CF_META), META_LOCKED_BLOCK, b.encode(), &sync_opts())?,
-            None => self.db.delete_cf_opt(self.cf(CF_META), META_LOCKED_BLOCK, &sync_opts())?,
+    /// Persist the certified blocks above the head (audit v5, CON-4: `Action::PersistPending`),
+    /// replacing the previous set; an empty set deletes the key. Fsynced like the safety state:
+    /// the block a persisted high QC or lock names must be there after a crash, or the restart
+    /// is back to fetching it from peers that, after a whole-fleet restart, do not hold it.
+    pub fn save_pending_blocks(&self, blocks: &[Block]) -> Result<()> {
+        if blocks.is_empty() {
+            self.db.delete_cf_opt(self.cf(CF_META), META_PENDING_BLOCKS, &sync_opts())?;
+        } else {
+            self.db.put_cf_opt(self.cf(CF_META), META_PENDING_BLOCKS, bincode::serialize(blocks)?, &sync_opts())?;
         }
         Ok(())
     }
 
+    /// The persisted certified chain, in the order it was written; empty when there is none.
+    pub fn pending_blocks(&self) -> Result<Vec<Block>> {
+        Ok(self.get::<Vec<Block>>(CF_META, META_PENDING_BLOCKS.as_bytes())?.unwrap_or_default())
+    }
+
+    /// The locked block a v0.5.4 node kept beside its lock (audit v4, CON-4). Read once by the
+    /// first v0.5.5 startup on such a database, which folds it into the pending set and then
+    /// retires the key with [`Storage::clear_locked_block`]; never written by this build.
     pub fn locked_block(&self) -> Result<Option<Block>> {
         Ok(self.get_meta_raw(META_LOCKED_BLOCK)?.map(|bytes| Block::decode(&bytes)).transpose()?)
+    }
+
+    /// Retire the v0.5.4 locked-block key (fsynced), once its block is in the pending set.
+    pub fn clear_locked_block(&self) -> Result<()> {
+        self.db.delete_cf_opt(self.cf(CF_META), META_LOCKED_BLOCK, &sync_opts())?;
+        Ok(())
+    }
+
+    /// Test hook: plant the locked block the way v0.5.4 wrote it, so the upgrade path — read
+    /// once, folded into the pending set, key retired — can be exercised.
+    #[cfg(test)]
+    pub(crate) fn put_locked_block_v054_for_testing(&self, block: &Block) -> Result<()> {
+        self.db.put_cf_opt(self.cf(CF_META), META_LOCKED_BLOCK, block.encode(), &sync_opts())?;
+        Ok(())
     }
 }
 
@@ -4789,20 +4818,39 @@ mod tests {
         assert_eq!(s.load_safety().unwrap(), Some(state));
     }
 
-    /// The locked block rides beside the lock (audit v4, CON-4): written when the lock is above
-    /// the head, cleared when it is not, and read back by `resume_consensus`.
+    /// The certified chain above the head (audit v5, CON-4) round-trips in order, replaces the
+    /// previous set whole, and an empty set deletes the key — what `resume_consensus` reads back.
     #[test]
-    fn locked_block_roundtrip_and_clear() {
+    fn pending_blocks_round_trip_and_an_empty_set_deletes_the_key() {
+        let (_d, s, _gs, blocks, _) = three_certified_blocks();
+        assert_eq!(s.pending_blocks().unwrap(), Vec::<Block>::new(), "nothing until a QC forms above the head");
+        let two: Vec<Block> = blocks[..2].iter().map(|cb| cb.block.clone()).collect();
+        s.save_pending_blocks(&two).unwrap();
+        assert_eq!(s.pending_blocks().unwrap(), two, "in the order written");
+        let one = vec![blocks[2].block.clone()];
+        s.save_pending_blocks(&one).unwrap();
+        assert_eq!(s.pending_blocks().unwrap(), one, "replaced whole, never appended");
+        s.save_pending_blocks(&[]).unwrap();
+        assert_eq!(s.pending_blocks().unwrap(), Vec::<Block>::new());
+        assert_eq!(s.get_meta_raw(META_PENDING_BLOCKS).unwrap(), None, "an empty set is no key at all");
+    }
+
+    /// The v0.5.4 locked-block key (audit v4, CON-4) is read once and retired: this build never
+    /// writes it, and `clear_locked_block` is what the first startup does after folding it in.
+    #[test]
+    fn the_v054_locked_block_is_read_once_then_cleared() {
         let dir = tempfile::tempdir().unwrap();
         let s = Storage::open(dir.path()).unwrap();
         let gs = genesis(1);
         s.init_genesis(&gs).unwrap();
         assert_eq!(s.locked_block().unwrap(), None);
         let b = gs.block.clone();
-        s.save_locked_block(Some(&b)).unwrap();
+        s.put_locked_block_v054_for_testing(&b).unwrap();
         assert_eq!(s.locked_block().unwrap(), Some(b));
-        s.save_locked_block(None).unwrap();
+        s.clear_locked_block().unwrap();
         assert_eq!(s.locked_block().unwrap(), None);
+        s.clear_locked_block().unwrap();
+        assert_eq!(s.locked_block().unwrap(), None, "clearing twice is harmless");
     }
 
     #[test]
