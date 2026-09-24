@@ -52,8 +52,10 @@ findings `../security/fullnode-deep-scan-2026-09-24.md` — read it before re-re
   deserialize (`33b048c` reverts it: the four downstream length checks and their tests became
   unreachable). Bridge and consensus-liveness dimensions: no new finding (B3 stays v0.6).
 
-**Roll:** one at a time (the chain is live), `docs/deploy.md` "Roll note for v0.5.6" — submit no
-call proofs while the fleet is mixed. Rollback = re-pin `0154fe2`. **Open for the operator:**
+**Roll: all-stop, all-start** (`deploy/roll-all.sh`, the v0.5.5 procedure) — DS-3 is a validity
+rule and the public RPC admits anyone's submissions, so a mixed fleet is a fork window; the
+independent review's one finding, `docs/deploy.md` "Roll note for v0.5.6". Rollback = re-pin
+`0154fe2`. **Open for the operator:**
 guardian keys in the shell profile (BRG-14), the 48 GB resize vs D19, the TronGrid key, node A
 on a laptop, all 18 validator keys one party's. The whitepaper's fifth reconciliation pass
 (`rem:bridgeimpl`, the table, a taint proposition) lands in `../whitepapers`.

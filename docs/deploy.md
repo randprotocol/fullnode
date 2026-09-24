@@ -98,14 +98,17 @@ block is ~60 KB of `blocks` (the 18-signature Dilithium2 QC inside the header) a
 where it was ~49 KB more — about 3.6 GB/day at the fleet's measured 1.4 s blocks, 1.7 GB/day at
 3 s (the D19 numbers; the release notes carry the figure measured after the roll).
 
-**Roll note for v0.5.6 (the deep scan, 2026-09-25).** Node-only, same chain, one node at a time
-waited to `rand_getHealth: ok`, rollback = re-pin `0154fe2`. Two of its rules are block-validity
-rules as well as admission ones, so a mixed-build fleet must not be handed the input that splits
-it: a `Call` proof above tier 14 (or with an oversized hash table — `docs/confidential.md`) is
-refused by v0.5.6 and accepted by v0.5.5, and no such call has ever been committed on chain 14
-(all 340 are tier 10); a sealed-form side table of the wrong length is refused instead of
-crashing the node (no aggregation section on chain 14, so unreachable). Roll promptly and submit
-no call proofs while the fleet is mixed. The swarm now refuses inbound connections past 256
+**Roll note for v0.5.6 (the deep scan, 2026-09-25): all-stop, all-start, like v0.5.5.**
+Node-only, same chain, rollback = re-pin `0154fe2`. One of its rules is a block-validity rule as
+well as an admission one: a `Call` proof above tier 14 (or with an oversized hash table —
+`docs/confidential.md`) is refused by v0.5.6 and accepted by v0.5.5. No such call has ever been
+committed on chain 14 (all 340 are tier 10), but the public RPC admits submissions from anyone,
+so a one-at-a-time roll has a window in which an old-build leader could commit such a call and
+split the fleet (the independent review's one finding). The roll therefore installs the binary
+everywhere first, then stops all eighteen and starts all eighteen (`deploy/roll-all.sh`, ~15 min
+of no commits, the v0.5.5 procedure) — no mixed fleet ever runs. A sealed-form side table of the
+wrong length is refused instead of crashing the node (no aggregation section on chain 14, so
+unreachable). The swarm now refuses inbound connections past 256
 established, 64 in handshake and 2 per remote peer ("Topology rules"); a validator's own dials
 are never refused. `deploy/fleet-watch.sh` (every five minutes from the laptop via
 `deploy/launchd/org.randprotocol.fleet-watch.plist`) alerts on a stall, a node behind, `disk_low`,
