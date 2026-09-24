@@ -15,6 +15,8 @@
 
 ## Global Constraints
 
+- The branch is rebased on main at v0.5.6 (`7976e45`). Since v0.5.5 (audit v5, OPS-4) a committed block's QC lives in its child's `header.justify`; `CF_QCS` holds only genesis' and the head's rows, and `qc_by_height(h)` reads the child. The retention pass therefore deletes blocks, and a QC "goes" with the block above it. Certified pending blocks above the head are persisted (`META_PENDING_BLOCKS`) and are never below the floor.
+
 - The flag is absent by default; a store that never pruned has no `prune_floor` meta key and reads as floor 0. Nothing is keyed on `chain_id`.
 - Block 0 and its QC are never deleted. No block at or above `keep_from = head - max(aggregation.window, 2)` is deleted.
 - Every delete of a pass and the new floor land in one `WriteBatch` written with `sync_opts()`.
@@ -129,14 +131,20 @@ Append inside `mod tests` in `storage.rs`:
         assert_eq!(st.prune_floor().unwrap(), 6);
         for h in 1..=5 {
             assert!(st.block_by_height(h).unwrap().is_none(), "block {h} should be gone");
-            assert!(st.qc_by_height(h).unwrap().is_none(), "qc {h} should be gone");
+            // QCs are stored once (v0.5.5, OPS-4): a height's certificate is its child's
+            // `justify`, so 1..=4 have none and 5's still reads off the retained block 6.
+            if h < 5 {
+                assert!(st.qc_by_height(h).unwrap().is_none(), "qc {h} should be gone");
+            }
             let b = &blocks[(h - 1) as usize].block;
             assert!(st.height_by_hash(&b.hash()).unwrap().is_none(), "index {h} should be gone");
             assert!(st.tx_location(&b.transactions[0].hash()).unwrap().is_none(), "tx of {h} should be gone");
         }
+        for h in 5..=10 {
+            assert!(st.qc_by_height(h).unwrap().is_some(), "qc {h} must still resolve (child's justify, or the head row)");
+        }
         for h in 6..=10 {
             assert!(st.block_by_height(h).unwrap().is_some(), "block {h} must stay");
-            assert!(st.qc_by_height(h).unwrap().is_some(), "qc {h} must stay");
         }
         // Genesis never goes.
         assert!(st.block_by_height(0).unwrap().is_some());
@@ -273,6 +281,8 @@ After `prune_sealed` / `put_pruned` in `impl Storage`:
         let hk = height_key(block.height());
         let hash = block.hash();
         batch.delete_cf(self.cf(CF_BLOCKS), hk);
+        // Since v0.5.5 (OPS-4) only genesis and the head have a `qcs` row; deleting an absent
+        // key is free and covers a v0.5.4-era database whose one-time QC prune did not run.
         batch.delete_cf(self.cf(CF_QCS), hk);
         batch.delete_cf(self.cf(CF_BLOCK_INDEX), hash.as_bytes());
         batch.delete_cf(self.cf(CF_SEALS), [b"b".as_slice(), hash.as_bytes()].concat());
@@ -311,15 +321,14 @@ After `prune_sealed` / `put_pruned` in `impl Storage`:
     }
 
     /// Give the disk back: RocksDB only frees a deleted range at compaction. Compacts `blocks`
-    /// and `qcs` over `[1, floor)`. A no-op on an archive.
+    /// over `[1, floor)` (`qcs` holds only genesis' and the head's rows since v0.5.5, OPS-4).
+    /// A no-op on an archive.
     pub fn compact_pruned_history(&self) -> Result<()> {
         let floor = self.prune_floor()?;
         if floor <= 1 {
             return Ok(());
         }
-        for cf in [CF_BLOCKS, CF_QCS] {
-            self.db.compact_range_cf(self.cf(cf), Some(height_key(1)), Some(height_key(floor)));
-        }
+        self.db.compact_range_cf(self.cf(CF_BLOCKS), Some(height_key(1)), Some(height_key(floor)));
         Ok(())
     }
 
@@ -754,9 +763,9 @@ git commit -m "node: a peer advertises its retention floor; sync never asks for 
     fn a_gap_above_the_floor_is_reported_at_its_height() {
         let (_dir, st, gs, _blocks) = timed_chain(12);
         st.prune_history(u64::MAX, 10, PRUNE_PASS_MAX).unwrap();
-        st.db.delete_cf(st.cf(CF_QCS), height_key(11)).unwrap();
+        st.db.delete_cf(st.cf(CF_BLOCKS), height_key(11)).unwrap();
         let check = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
-        assert_eq!(check.problem.as_deref(), Some("qc 11 missing"));
+        assert_eq!(check.problem.as_deref(), Some("block 11 missing"));
         assert_eq!(check.last_good, 10);
         assert_eq!(check.floor, 10);
     }
