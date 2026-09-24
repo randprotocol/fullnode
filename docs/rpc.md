@@ -203,9 +203,10 @@ that transaction's own notes, which is the order served here.
 
 Errors: `-32602` for a backwards range (`to_height` below `from_height`) or a missing bound.
 
-On a node started with `--prune-history`, a height below `rand_status.prune_floor` (genesis
-excepted) answers error `-32010` `pruned: height h is below this node's retention floor f`
-with `data: {"floor": f}` — ask the archive for it.
+On a node started with `--prune-history`, a range that reaches a height below the floor (genesis
+excepted) answers error `-32010` naming the first such height —
+`pruned: height h is below this node's retention floor f` with `data: {"floor": f}` — ask the
+archive for it. `[0, to]` still serves genesis alone when `to` is 0.
 
 ### `rand_getAnchor`
 Params: `[]` for the head, or `[height]`. Result: `{ "height": 192, "root": "6b1d…c4" }`, or error
@@ -956,10 +957,11 @@ correct against an older node's 128.
 
 Errors: `-32602` for `to_height` below `from_height`.
 
-On a node started with `--prune-history`, a `from_height` below `rand_status.prune_floor` (genesis
-excepted) answers error `-32010` `pruned: height h is below this node's retention floor f` with
-`data: {"floor": f}` — ask the archive for it, rather than serving the range from the floor
-instead.
+On a node started with `--prune-history`, a range that reaches a height below the floor (genesis
+excepted) answers error `-32010` naming the first such height —
+`pruned: height h is below this node's retention floor f` with `data: {"floor": f}` — ask the
+archive for it, rather than serving the range from the floor instead. `[0, to]` still serves
+genesis alone when `to` is 0.
 
 ### `rand_getFinality`
 Params: `[height]` or `[hash]`. Result, one of:

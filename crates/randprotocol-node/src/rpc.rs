@@ -1569,7 +1569,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             if to < from {
                 return Err(RpcError::invalid_params(format!("to_height {to} is below from_height {from}")));
             }
-            refuse_pruned(st, from)?;
+            let first = from.max(1);
+            if to >= first {
+                refuse_pruned(st, first)?;
+            }
             let to = to.min(from.saturating_add(MAX_COMPACT_BLOCKS - 1));
             let storage = st.storage.clone();
             // Reads every block in the range and scans a slice of the notes family: linear in the
@@ -1991,7 +1994,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             if to < from {
                 return Err(RpcError::invalid_params(format!("to_height {to} is below from_height {from}")));
             }
-            refuse_pruned(st, from)?;
+            let first = from.max(1);
+            if to >= first {
+                refuse_pruned(st, first)?;
+            }
             let head = st.storage.head().map_err(RpcError::internal)?.height;
             let to = to.min(head).min(from.saturating_add(MAX_BLOCK_HEADERS - 1));
             let storage = st.storage.clone();
@@ -5581,6 +5587,13 @@ mod tests {
         assert_eq!(e.unwrap(), Value::Null);
         // Genesis is never pruned.
         assert!(ok(&st, "rand_getBlockByHeight", json!([0])).await.is_object());
+        // A range that starts at genesis but reaches pruned heights is refused, keyed on height 1.
+        let e = call(&st, "rand_getBlocks", json!([0, 20])).await.unwrap_err();
+        assert_eq!(e.code, -32010);
+        assert_eq!(e.message, "pruned: height 1 is below this node's retention floor 10");
+        assert_eq!(call(&st, "rand_getCompactBlocks", json!([0, 20])).await.unwrap_err().code, -32010);
+        // Genesis alone is still served.
+        assert_eq!(ok(&st, "rand_getBlocks", json!([0, 0])).await.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
