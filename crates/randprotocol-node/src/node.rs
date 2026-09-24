@@ -235,6 +235,20 @@ pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: Verify
     }
     let t = Instant::now();
     let check = storage.verify_chain(gs, mode, executor)?;
+    if check.floor > 0 {
+        return match &check.problem {
+            None => {
+                tracing::info!(
+                    "pruned node: history verified from {} to {} ({:?}, {:.1?}); ledger snapshot trusted",
+                    check.floor, check.head, mode, t.elapsed()
+                );
+                Ok(check.head)
+            }
+            Some(problem) => anyhow::bail!(
+                "pruned node: {problem}; history cannot be repaired locally — re-sync from the archive"
+            ),
+        };
+    }
     match &check.problem {
         None => {
             tracing::info!("chain verified: {} blocks ok ({:?}, {:.1?})", check.head + 1, mode, t.elapsed());
@@ -2725,6 +2739,16 @@ mod tests {
         assert!(prune_window_check(Some(Duration::from_secs(300)), Some(256), Duration::from_secs(1)).is_ok());
         assert!(prune_window_check(None, Some(256), Duration::from_secs(1)).is_ok());
         assert!(prune_window_check(Some(Duration::from_secs(10)), None, Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn a_pruned_store_missing_its_floor_block_is_fatal_not_truncated() {
+        let (_dir, st, gs, _blocks) = crate::storage::fixtures::timed_chain(12);
+        st.prune_history(u64::MAX, 10, crate::storage::PRUNE_PASS_MAX).unwrap();
+        st.db_for_test().delete_cf(st.cf_for_test("blocks"), crate::storage::height_key_for_test(10)).unwrap();
+        let err = check_and_repair_chain(&st, &gs, VerifyMode::Quick, &StubExecutor).unwrap_err().to_string();
+        assert!(err.contains("re-sync from the archive"), "{err}");
+        assert_eq!(st.head().unwrap().height, 12, "nothing was truncated");
     }
 
     /// The restart this task exists to fix: a node whose head is past an epoch boundary comes

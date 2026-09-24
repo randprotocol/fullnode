@@ -656,6 +656,10 @@ async fn main() -> Result<()> {
                 None => println!("ok: {} blocks verified ({mode:?})", check.head + 1),
                 Some(p) => {
                     println!("CORRUPT: {p}\nhead {} last good {} genesis_ok {}", check.head, check.last_good, check.genesis_ok);
+                    if check.floor > 0 {
+                        println!("pruned node (floor {}): history cannot be repaired locally — re-sync from the archive", check.floor);
+                        std::process::exit(2);
+                    }
                     if repair {
                         node::check_and_repair_chain(&storage, &gs, mode, executor.as_ref())?;
                         println!("repaired: head is now {}", storage.head()?.height);

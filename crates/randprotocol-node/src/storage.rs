@@ -2177,6 +2177,9 @@ pub struct ChainCheck {
     pub ledger: Ledger,
     /// False if even the genesis block is damaged.
     pub genesis_ok: bool,
+    /// The store's retention floor (history pruning spec §3): 0 on an archive. Above 0 the
+    /// check was structural from this height and `ledger` is the trusted snapshot.
+    pub floor: u64,
 }
 
 impl ChainCheck {
@@ -2203,7 +2206,9 @@ impl Storage {
             _ => 0,
         };
         let mut ledger = gs.ledger.clone();
-        let mut check = ChainCheck { head, last_good: 0, problem: None, ledger: ledger.clone(), genesis_ok: true };
+        let mut check = ChainCheck { head, last_good: 0, problem: None, ledger: ledger.clone(), genesis_ok: true, floor: 0 };
+        let floor = self.prune_floor()?;
+        check.floor = floor;
 
         // Genesis block must be byte-for-byte what the genesis file derives.
         match self.block_by_height(0) {
@@ -2228,6 +2233,10 @@ impl Storage {
             check.last_good = head;
             check.ledger = self.load_ledger(executor)?;
             return Ok(check);
+        }
+
+        if floor > 0 {
+            return self.verify_pruned(gs, mode, executor, check, floor, head);
         }
 
         let mut prev_hash = gs.hash();
@@ -2438,6 +2447,84 @@ impl Storage {
             Err(e) => check.problem = Some(format!("state snapshot unreadable: {e}")),
         }
         check.ledger = ledger;
+        Ok(check)
+    }
+
+    /// Structural verification from the floor (history pruning spec §3): every retained block
+    /// exists with its index, QC and leader, and the QC verifies in `Full`; the epoch sets are
+    /// the stored rows (there is no replay to derive them from) and the ledger is the snapshot.
+    fn verify_pruned(
+        &self,
+        gs: &GenesisState,
+        mode: VerifyMode,
+        executor: &dyn ConfidentialExecutor,
+        mut check: ChainCheck,
+        floor: u64,
+        head: u64,
+    ) -> Result<ChainCheck> {
+        let epoch_blocks = gs.epoch_blocks.max(1);
+        let mut prev_hash: Option<Hash> = None;
+        for h in floor..=head {
+            let problem = (|| -> std::result::Result<(), String> {
+                let epoch = h / epoch_blocks;
+                let set = match self.epoch_set(epoch) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => return Err(format!("no stored validator set for epoch {epoch}")),
+                    Err(e) => return Err(format!("epoch {epoch} set unreadable: {e}")),
+                };
+                let block = self
+                    .block_by_height(h)
+                    .map_err(|e| format!("block {h} unreadable: {e}"))?
+                    .ok_or_else(|| format!("block {h} missing"))?;
+                if block.height() != h {
+                    return Err(format!("block at height {h} claims height {}", block.height()));
+                }
+                if let Some(prev) = prev_hash {
+                    if block.parent() != prev {
+                        return Err(format!("block {h} parent {} != previous hash {}", block.parent(), prev));
+                    }
+                }
+                let hash = block.hash();
+                match self.height_by_hash(&hash) {
+                    Ok(Some(idx)) if idx == h => {}
+                    Ok(other) => return Err(format!("block {h} index points to {other:?}")),
+                    Err(e) => return Err(format!("block {h} index unreadable: {e}")),
+                }
+                // Same convention as the replay path: the head's certificate is its own row;
+                // every other block's is its child's `justify`, and a missing child takes the
+                // parent's certificate with it.
+                let qc = if h == head {
+                    self.qc_by_height(h)
+                        .map_err(|e| format!("qc {h} unreadable: {e}"))?
+                        .ok_or_else(|| format!("qc {h} missing"))?
+                } else {
+                    self.block_by_height(h + 1)
+                        .map_err(|e| format!("block {h}'s certificate is lost: block {} unreadable: {e}", h + 1))?
+                        .ok_or_else(|| format!("block {h}'s certificate is lost: block {} missing", h + 1))?
+                        .header
+                        .justify
+                };
+                if qc.block_hash != hash || qc.view != block.view() {
+                    return Err(format!("qc {h} does not certify block {h}"));
+                }
+                if block.proposer() != set.leader(block.view()) {
+                    return Err(format!("block {h} proposer is not the leader of view {}", block.view()));
+                }
+                if mode == VerifyMode::Full && !qc.verify(&gs.signing_domain(), &set) {
+                    return Err(format!("qc {h} has invalid or insufficient votes for epoch {epoch}"));
+                }
+                prev_hash = Some(hash);
+                Ok(())
+            })();
+            if let Err(p) = problem {
+                check.problem = Some(p);
+                check.last_good = h.saturating_sub(1);
+                check.ledger = self.load_ledger(executor)?;
+                return Ok(check);
+            }
+        }
+        check.last_good = head;
+        check.ledger = self.load_ledger(executor)?;
         Ok(check)
     }
 
@@ -3307,25 +3394,58 @@ pub(crate) mod fixtures {
     }
 
     /// A chain of `n` bundle blocks whose timestamps are `h * 1000` ms, so a cutoff in
-    /// milliseconds names a height directly.
+    /// milliseconds names a height directly. Each block's QC carries a real vote from the
+    /// genesis validator (as `chain_fixture` does), so a chain built here also replays under
+    /// `VerifyMode::Full`, whose QC-vote check `make_block_at`'s own empty-vote `justify` would
+    /// otherwise always fail.
     pub(crate) fn timed_chain(n: u64) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
+        use randprotocol_core::Vote;
         let (dir, st, gs) = genesis_with_two_notes();
         st.init_genesis(&gs).unwrap();
         let k = key(1);
         let mut ledger = gs.ledger.clone();
-        let mut parent = gs.block.clone();
-        let mut out = Vec::new();
+        let mut out: Vec<CommittedBlock> = Vec::new();
         for h in 1..=n {
             let seed = (h * 4) as u32;
             let txs = vec![bundle_tx(&ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], bundle_fee())];
-            let cb = make_block_at(&parent, &mut ledger, txs, &k, h * 1000);
+            let cb = match out.last() {
+                None => make_block_at(&gs.block, &mut ledger, txs, &k, h * 1000),
+                Some(parent) => make_block_at(parent, &mut ledger, txs, &k, h * 1000),
+            };
+            let block = cb.block.clone();
+            let qc = QuorumCertificate {
+                view: block.view(),
+                block_hash: block.hash(),
+                votes: vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), block.view(), block.hash(), &k)],
+            };
+            let cb = CommittedBlock { qc, ..cb };
             st.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
-            parent = cb.block.clone();
             out.push(cb);
         }
         (dir, st, gs, out)
     }
+
+    /// Test hooks for `node.rs`'s tests, which need to tear a specific row out of a live store
+    /// without a public API for it.
+    impl Storage {
+        pub(crate) fn db_for_test(&self) -> &DB {
+            &self.db
+        }
+
+        pub(crate) fn cf_for_test(&self, name: &str) -> &rocksdb::ColumnFamily {
+            self.cf(name)
+        }
+    }
+
+    pub(crate) fn height_key_for_test(h: u64) -> [u8; 8] {
+        height_key(h)
+    }
 }
+// Re-exported so `node.rs`'s test can spell it `crate::storage::height_key_for_test`, the way it
+// already spells `crate::storage::PRUNE_PASS_MAX` (a storage-module item), without a second
+// `fixtures::` path segment for the one hook that isn't a `Storage` method.
+#[cfg(test)]
+pub(crate) use fixtures::height_key_for_test;
 
 #[cfg(test)]
 mod tests {
@@ -3520,6 +3640,53 @@ mod tests {
         assert_eq!(st.prune_history(u64::MAX, 3, PRUNE_PASS_MAX).unwrap(), 2);
         st.compact_pruned_history().unwrap();
         assert!(st.block_by_height(3).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_pruned_store_verifies_structurally_and_reports_its_floor() {
+        let (_dir, st, gs, _blocks) = timed_chain(12);
+        assert_eq!(st.prune_history(u64::MAX, 10, PRUNE_PASS_MAX).unwrap(), 9);
+        for mode in [VerifyMode::Quick, VerifyMode::Full] {
+            let check = st.verify_chain(&gs, mode, &StubExecutor).unwrap();
+            assert_eq!(check.problem, None, "{mode:?}");
+            assert_eq!(check.floor, 10);
+            assert_eq!(check.last_good, 12);
+            assert_eq!(check.ledger, st.load_ledger(&StubExecutor).unwrap());
+        }
+        // Off still needs genesis and the snapshot, nothing else.
+        let check = st.verify_chain(&gs, VerifyMode::Off, &StubExecutor).unwrap();
+        assert_eq!(check.problem, None);
+    }
+
+    #[test]
+    fn a_gap_above_the_floor_is_reported_at_its_height() {
+        let (_dir, st, gs, _blocks) = timed_chain(12);
+        st.prune_history(u64::MAX, 10, PRUNE_PASS_MAX).unwrap();
+        st.db.delete_cf(st.cf(CF_BLOCKS), height_key(11)).unwrap();
+        let check = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        // The replay path's convention: a missing child takes its parent's certificate with
+        // it, so the loss is reported at 10 (the structural loop reads 10's QC off 11 first).
+        assert_eq!(check.problem.as_deref(), Some("block 10's certificate is lost: block 11 missing"));
+        assert_eq!(check.last_good, 9);
+        assert_eq!(check.floor, 10);
+    }
+
+    #[test]
+    fn a_pruned_store_missing_its_floor_block_is_reported_below_the_floor() {
+        let (_dir, st, gs, _blocks) = timed_chain(12);
+        st.prune_history(u64::MAX, 10, PRUNE_PASS_MAX).unwrap();
+        st.db.delete_cf(st.cf(CF_BLOCKS), height_key(10)).unwrap();
+        let check = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(check.problem.as_deref(), Some("block 10 missing"));
+        assert!(check.last_good < check.floor);
+    }
+
+    #[test]
+    fn an_archive_still_replays_from_genesis() {
+        let (_dir, st, gs, _blocks) = timed_chain(4);
+        let check = st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap();
+        assert_eq!(check.problem, None);
+        assert_eq!(check.floor, 0);
     }
 
     /// Fold a witness back to the root, the way the bundle guest's `MERKLE_VERIFY` does.
