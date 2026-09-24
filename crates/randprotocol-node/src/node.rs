@@ -428,6 +428,17 @@ impl std::error::Error for RawFallback {}
 /// once but the chain is known to be ahead (`best_peer_height` says so), any connected peer
 /// whose stale answer costs one round trip — the fallback that keeps the cycle alive where a
 /// silent stall costs the chain (the sealed-sync stall's shape, shown under load).
+/// Whether a proposal with an unknown parent means this replica is far behind (batch-sync the
+/// committed blocks) or merely lacks one uncommitted block (fetch it by hash). "Behind" is
+/// measured on what the replica *holds* — its pending tip, never below its committed head — the
+/// way `sync_from` asks above what it holds (review C2): a replica whose committed head trails
+/// but which already holds the committed tail as pending can only be missing an uncommitted
+/// parent, and no batch serves one. Six validators sat exactly there on 2026-09-24, batch-syncing
+/// blocks they held while the chain waited for their votes.
+fn orphan_wants_batch_sync(best_peer_height: u64, committed_height: u64, pending_tip_height: u64) -> bool {
+    best_peer_height > pending_tip_height.max(committed_height) + 2
+}
+
 fn pick_sync_peer(
     peers: &HashMap<PeerId, Peer>,
     my_height: u64,
@@ -1702,7 +1713,11 @@ impl Node {
             Err(ConsensusError::NotLeader) | Err(ConsensusError::Stale(_)) => Ok(()),
             Err(ConsensusError::UnknownParent(h)) => {
                 // Far behind: batch-sync committed blocks instead of walking parents one by one.
-                let behind = self.best_peer_height() > self.hs.committed_height() + 2;
+                let behind = orphan_wants_batch_sync(
+                    self.best_peer_height(),
+                    self.hs.committed_height(),
+                    self.hs.pending_tip_height(),
+                );
                 if behind {
                     tracing::debug!("proposal with unknown parent {h:?}; batch syncing");
                     self.maybe_sync().await;
@@ -2382,6 +2397,25 @@ mod tests {
     /// The sync peer selection (the stall shape's unit test): the freshest connected peer
     /// ahead wins; the fallback asks any connected peer when the chain is known ahead but no
     /// connected-and-fresh pair exists; and a statusless connected peer is still askable.
+    /// The 2026-09-24 stall's last piece: six validators sat at committed 248947 holding
+    /// 248948–248953 pending, and every proposal they saw extended an uncommitted 248954. With
+    /// "behind" measured on the committed height they batch-synced for blocks they already held
+    /// instead of fetching the one they lacked by hash, so they could never vote and the
+    /// twelve at the tip were one short of a quorum. "Behind" is measured on what the replica
+    /// holds, exactly as `sync_from` asks above what it holds (review C2).
+    #[test]
+    fn an_orphan_is_fetched_by_hash_once_the_replica_holds_every_committed_block() {
+        // Holds nothing above its head and the chain is far ahead: batch-sync.
+        assert!(orphan_wants_batch_sync(248_953, 248_947, 248_947));
+        // Holds the committed tail as pending: the missing parent is uncommitted, fetch it.
+        assert!(!orphan_wants_batch_sync(248_953, 248_947, 248_953));
+        // At the tip either way: fetch.
+        assert!(!orphan_wants_batch_sync(248_953, 248_953, 248_953));
+        // A gap of two is a fetch, three is a batch (the rule's existing margin).
+        assert!(!orphan_wants_batch_sync(10, 8, 8));
+        assert!(orphan_wants_batch_sync(11, 8, 8));
+    }
+
     #[test]
     fn pick_sync_peer_prefers_fresh_and_falls_back_to_any_connected() {
         let pid = |seed: u8| {
