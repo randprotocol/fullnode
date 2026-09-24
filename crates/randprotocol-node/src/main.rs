@@ -357,6 +357,12 @@ enum Cmd {
         /// disables the guard.
         #[arg(long, default_value_t = 1024)]
         min_free_disk_mb: u64,
+        /// Keep only this much block history (history pruning spec §1): `<n>m`, `<n>h` or
+        /// `<n>d`, at least `1h`. Blocks whose timestamp is older than the head's minus this
+        /// window lose their block, QC, transactions and receipts; the ledger stays. Never set
+        /// on a mainnet node or on the testnet's archive.
+        #[arg(long, value_parser = parse_prune_history)]
+        prune_history: Option<Duration>,
     },
     /// Verify the chain in a data directory without running the node.
     Verify {
@@ -659,7 +665,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Run { datadir, key, listen, bootstrap, rpc, validator, no_mdns, block_interval_ms, view_timeout_ms, verify_chain, keep_raw_proofs, rpc_viewing_open, min_free_disk_mb } => {
+        Cmd::Run { datadir, key, listen, bootstrap, rpc, validator, no_mdns, block_interval_ms, view_timeout_ms, verify_chain, keep_raw_proofs, rpc_viewing_open, min_free_disk_mb, prune_history } => {
             let kp = load_keypair(&key)?;
             let handle = node::start(NodeConfig {
                 viewing_open: rpc_viewing_open,
@@ -676,6 +682,7 @@ async fn main() -> Result<()> {
                 verify: verify_chain.parse().map_err(|e: String| anyhow::anyhow!(e))?,
                 keep_raw_proofs,
                 min_free_disk_bytes: min_free_disk_mb << 20,
+                prune_history,
             })
             .await?;
             let mut handle = handle;
@@ -952,6 +959,29 @@ async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, int
         }
         tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
     }
+}
+
+/// The shortest history a node may keep: shorter than an hour and a node that restarts on the
+/// hour has nothing for a peer to sync from.
+pub const MIN_PRUNE_HISTORY: Duration = Duration::from_secs(3600);
+
+/// `<n>m`, `<n>h` or `<n>d`.
+pub fn parse_prune_history(s: &str) -> Result<Duration, String> {
+    let usage = "prune-history takes <n>m, <n>h or <n>d";
+    let (num, unit) = s.split_at(s.len().checked_sub(1).ok_or(usage)?);
+    let n: u64 = num.parse().map_err(|_| usage.to_string())?;
+    let secs = match unit {
+        "m" => n.checked_mul(60),
+        "h" => n.checked_mul(3600),
+        "d" => n.checked_mul(86_400),
+        _ => return Err(usage.to_string()),
+    }
+    .ok_or(usage)?;
+    let d = Duration::from_secs(secs);
+    if d < MIN_PRUNE_HISTORY {
+        return Err("prune-history must be at least 1h".to_string());
+    }
+    Ok(d)
 }
 
 #[cfg(test)]
@@ -1278,5 +1308,25 @@ mod tests {
         // Anything that is not a shielded address is refused, with the address in the message.
         let err = deposit_note("not-an-address", 1).unwrap_err().to_string();
         assert!(err.contains("not-an-address"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod prune_flag_tests {
+    use super::*;
+
+    #[test]
+    fn the_flag_takes_minutes_hours_and_days() {
+        assert_eq!(parse_prune_history("24h").unwrap(), Duration::from_secs(24 * 3600));
+        assert_eq!(parse_prune_history("2d").unwrap(), Duration::from_secs(2 * 86_400));
+        assert_eq!(parse_prune_history("90m").unwrap(), Duration::from_secs(90 * 60));
+    }
+
+    #[test]
+    fn the_flag_refuses_under_an_hour_and_bad_syntax() {
+        assert_eq!(parse_prune_history("59m").unwrap_err(), "prune-history must be at least 1h");
+        assert!(parse_prune_history("24").unwrap_err().contains("<n>m, <n>h or <n>d"));
+        assert!(parse_prune_history("h").unwrap_err().contains("<n>m, <n>h or <n>d"));
+        assert!(parse_prune_history("0h").unwrap_err().contains("at least 1h"));
     }
 }

@@ -76,6 +76,8 @@ pub struct NodeConfig {
     /// `disk_low` in `rand_getHealth` under [`disk::DISK_LOW_FACTOR`] times it (audit v4 OPS-3).
     /// `--min-free-disk-mb`, default 1 GB; zero disables the guard.
     pub min_free_disk_bytes: u64,
+    /// Keep only this much block history (history pruning spec §1); `None` keeps everything.
+    pub prune_history: Option<Duration>,
 }
 
 /// Handles returned by `Node::start` so tests and the CLI can observe the node.
@@ -255,6 +257,19 @@ pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: Verify
             Ok(resume)
         }
     }
+}
+
+/// The retention window must hold the aggregation window (history pruning spec §5): a cover's
+/// aggregate is read within it, and pruning it would make sealed blocks unservable.
+fn prune_window_check(prune_history: Option<Duration>, window: Option<u64>, block_interval: Duration) -> std::result::Result<(), String> {
+    let (Some(keep), Some(window)) = (prune_history, window) else { return Ok(()) };
+    let needed = block_interval.saturating_mul(u32::try_from(window).unwrap_or(u32::MAX));
+    if keep < needed {
+        return Err(format!(
+            "prune-history {keep:?} is shorter than the aggregation window ({window} blocks at {block_interval:?} = {needed:?})"
+        ));
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -581,6 +596,9 @@ struct Node {
     fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, (Hash, Instant)>,
     /// Block hash -> (attempts so far, peers already asked) for by-hash fetches.
     fetch_attempts: HashMap<Hash, (usize, Vec<PeerId>)>,
+    /// History-retention passes that deleted at least one block (history pruning spec §1),
+    /// counted to space out the compaction pass.
+    prune_passes: u64,
     /// Free space on the data directory's filesystem, measured at startup and on every status
     /// tick; what `NodeStatus::disk_free_bytes` and `disk_low` publish (audit v4 OPS-3).
     disk_free_bytes: u64,
@@ -849,6 +867,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             cfg.min_free_disk_bytes / (1 << 20)
         ));
     }
+    prune_window_check(cfg.prune_history, gs.ledger.aggregation().map(|a| a.window), cfg.block_interval)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let storage = Arc::new(Storage::open(&cfg.datadir)?);
     storage.init_genesis(&gs)?;
     check_and_repair_chain(&storage, &gs, cfg.verify, executor.as_ref())?;
@@ -1019,6 +1039,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         sync_late_batches: 0,
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
+        prune_passes: 0,
         disk_free_bytes,
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         verified,
@@ -1495,6 +1516,31 @@ impl Node {
                     .map_err(|e| anyhow::anyhow!("pruning task: {e}"))??;
                 if pruned > 0 {
                     tracing::info!("pruned {pruned} sealed bundle records at head {head}");
+                }
+            }
+        }
+        // The history-retention pass (history pruning spec §1): every 16 blocks, the blocks
+        // older than the window measured on the chain's own clock lose their history. Never
+        // inside the aggregation window, never the head or its parent, never genesis.
+        if let Some(keep) = self.cfg.prune_history {
+            if head % 16 == 0 {
+                let head_ms = self.storage.head_block()?.header.timestamp_ms;
+                let cutoff_ms = head_ms.saturating_sub(keep.as_millis() as u64);
+                let window = self.hs.committed_ledger().aggregation().map(|a| a.window).unwrap_or(0);
+                let keep_from = head.saturating_sub(window.max(2));
+                let storage = self.storage.clone();
+                let pruned = tokio::task::spawn_blocking(move || storage.prune_history(cutoff_ms, keep_from, crate::storage::PRUNE_PASS_MAX))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("history pruning task: {e}"))??;
+                if pruned > 0 {
+                    self.prune_passes += 1;
+                    tracing::info!("pruned {pruned} blocks below height {} at head {head}", self.storage.prune_floor()?);
+                    if self.prune_passes % 64 == 0 {
+                        let storage = self.storage.clone();
+                        tokio::task::spawn_blocking(move || storage.compact_pruned_history())
+                            .await
+                            .map_err(|e| anyhow::anyhow!("history compaction task: {e}"))??;
+                    }
                 }
             }
         }
@@ -2637,6 +2683,16 @@ mod tests {
         let skipped = [pid(2)];
         let peers: HashMap<PeerId, Peer> = [p(1, false, Some(163)), p(2, true, None), p(3, true, Some(50))].into_iter().collect();
         assert_eq!(pick_sync_peer(&peers, 43, 163, &skipped), Some(pid(3)));
+    }
+
+    #[test]
+    fn a_window_shorter_than_the_aggregation_window_refuses_to_start() {
+        // 256-block window at 1 s blocks is 256 s; a 100 s history cannot hold it.
+        let err = prune_window_check(Some(Duration::from_secs(100)), Some(256), Duration::from_secs(1)).unwrap_err();
+        assert!(err.contains("shorter than the aggregation window"), "{err}");
+        assert!(prune_window_check(Some(Duration::from_secs(300)), Some(256), Duration::from_secs(1)).is_ok());
+        assert!(prune_window_check(None, Some(256), Duration::from_secs(1)).is_ok());
+        assert!(prune_window_check(Some(Duration::from_secs(10)), None, Duration::from_secs(1)).is_ok());
     }
 
     /// The restart this task exists to fix: a node whose head is past an epoch boundary comes

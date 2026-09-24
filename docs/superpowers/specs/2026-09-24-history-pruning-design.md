@@ -48,7 +48,7 @@ destructure in `main.rs`, and `NodeConfig.prune_history: Option<Duration>` in `n
 
 **Cadence.** In the post-commit handler, next to the proof-pruning pass, when
 `prune_history` is set and `head % 16 == 0`, the node runs
-`storage.prune_history(head, cutoff_ms, keep_from, PRUNE_PASS_MAX)` in `spawn_blocking`, where:
+`storage.prune_history(cutoff_ms, keep_from, PRUNE_PASS_MAX)` in `spawn_blocking`, where:
 
 - `cutoff_ms = head_block.header.timestamp_ms - prune_history`. Block time is the chain's own
   clock (monotonic, bounded by `MAX_TIMESTAMP_STEP_MS` on a bridged chain), so the pass never
