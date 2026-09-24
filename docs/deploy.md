@@ -31,7 +31,7 @@ The repository ships scripts used for the live testnet (`deploy/`):
 | `deploy/push-to-vps.sh <ip> <letter> "<bootstraps>" [validator\|observer]` | your machine | rsync the source to `/root/fullnode`, build, install `/usr/local/bin/{rand-node,rand}`, init a datadir keyed on the genesis hash, install and start a `rand-node` systemd service |
 | `deploy/rebuild-vps.sh <ip>` | your machine | rsync new source, incremental build, reinstall binaries, restart the service (data kept) |
 | `deploy/vps-setup.sh` | the server | what `push-to-vps.sh` executes remotely |
-| `deploy/run-a.sh`, `deploy/run-b.sh` | laptops behind NAT | run a validator bootstrapping to the public nodes |
+| `deploy/run-a.sh`, `deploy/run-b.sh` | laptops behind NAT | run a validator bootstrapping to the public nodes. On A the script is run by launchd (`deploy/launchd/org.randprotocol.node-a.plist`, installed under `~/Library/LaunchAgents`): it starts at login and restarts on exit, so a reboot no longer takes A down until someone notices — restart it with `launchctl kill TERM gui/$(id -u)/org.randprotocol.node-a`, never by running the script in a shell beside it |
 
 The server needs `build-essential clang cmake pkg-config libssl-dev` and a Rust toolchain; the
 cloud-init used for the droplets installs them and opens ports 22 and 30303 with `ufw`. Set `SSH_KEY`
@@ -50,7 +50,7 @@ rand-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop t
 ## Rolling out a new commit
 
 1. `cargo test` locally, commit, push.
-2. Restart local validators from the new binary (`deploy/run-a.sh` after `cargo build --release`).
+2. Restart local validators from the new binary (`cargo build --release`, point `run-a.sh`'s `BINDIR` at it, then `launchctl kill TERM gui/$(id -u)/org.randprotocol.node-a` — launchd restarts A from the script).
 3. `deploy/rebuild-vps.sh <ip>` per server, staggered so that more than 2/3 of stake stays up. A
    restart costs a node a few seconds; it resumes from its persisted head, verifies the chain, and
    batch-syncs what it missed. Do not leave nodes on different builds for long: a node still on the

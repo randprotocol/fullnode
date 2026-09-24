@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Validator A (the laptop). Before this job existed, node A ran from a shell and every
+         laptop reboot took it down until someone noticed (2026-09-21: two days). launchd
+         starts it at login and restarts it if it exits.
+
+         Install (once, as the login user):
+           cp deploy/launchd/org.randprotocol.node-a.plist ~/Library/LaunchAgents/
+           launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.randprotocol.node-a.plist
+         Stop / start by hand:
+           launchctl kill TERM gui/$(id -u)/org.randprotocol.node-a   (KeepAlive restarts it)
+           launchctl bootout gui/$(id -u)/org.randprotocol.node-a     (stops it for good)
+         The script `exec`s rand-node, so the pid launchd tracks is the node's own. -->
+    <key>Label</key>
+    <string>org.randprotocol.node-a</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/dendisuhubdy/Github/randprotocol/fullnode/deploy/run-a.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on any exit; a crash loop is held to one start per 30 s. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- The node writes its database from here; the script cds to ~/rand-node-a itself. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/dendisuhubdy/rand-node-a</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dendisuhubdy/rand-node-a/node-a.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dendisuhubdy/rand-node-a/node-a.log</string>
+
+    <!-- launchd starts with a bare PATH and no HOME-derived env; the script needs both. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/dendisuhubdy</string>
+    </dict>
+
+    <!-- launchd's default is 256 descriptors; RocksDB opens every .sst it reads and the node died
+         at startup with "Too many open files" under it (the shell it used to run from had a
+         raised limit). -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
+    <!-- A validator that is asleep misses its views; keep the job out of App Nap. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

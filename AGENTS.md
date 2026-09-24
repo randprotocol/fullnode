@@ -4,7 +4,67 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-20)
+## Project memory (state as of 2026-09-24)
+
+### 2026-09-24 — chain 14 stalled on full disks: 13 GB of unpurged RocksDB WAL per validator, ~110 KB of Dilithium2 QC per 1 s block
+
+Found while verifying a CLI fix against the public RPC. **Every chain-14 validator's data dir was
+~40 GB after four days: 27 GB of SST plus 13 GB of write-ahead log (`db/*.log`, 216 × 133 MB)
+that RocksDB never purged.** A log file lives while *any* column family still holds unflushed
+rows from it; the per-block families that get a few bytes a block (`anchors`, `epoch_sets`,
+`notes` on a quiet chain) never fill a 64 MB memtable on their own, so under the default
+`max_total_wal_size` (zero = four times every family's write buffers, gigabytes across seventeen
+families) they pinned every log since their last flush. The twelve 48 GB droplets were at
+93–100 %; f, lon1, sfo2, nyc1, syd1 crash-looped (F: restart counter 7 828, each attempt dying at
+the recovery flush with ENOSPC), blr1 and c sat at 100 % still running; **quorum was lost and
+the chain stalled at height 248 953 from ~02:00 UTC** (views kept advancing, E's mempool held 140
+transactions with the oldest 75 h old). Node A had died at 02:04 UTC too and the laptop rebooted
+at 06:06 UTC.
+
+- **Growth model** (F's RocksDB LOG, flushed bytes per family): `blocks` 14.9 GB and `qcs`
+  12.1 GB over ~249k blocks — ~60 KB + ~49 KB a block, i.e. an 18-signature Dilithium2 QC
+  (18 × 2 420 B) stored twice, in the block's `justify` and in the `qcs` row. The fleet runs the
+  default `--block-interval-ms 1000` (measured ~1.4 s a block), so an **idle chain grows
+  ~6.6 GB/day of SST** before WAL retention. A 48 GB droplet lasts ~3 days from a cut. Only a
+  storage redesign changes the slope (store the QC once; prune or aggregate committed QCs; slower
+  idle blocks) — the previous entries' "chain 13 grew ~16 GB/day" was this same cost.
+- **Recovery that worked:** `journalctl --vacuum-size=50M` and `apt-get clean` freed ~600 MB on
+  each of the twelve; that let a crash-looping node complete RocksDB recovery, whose flush makes
+  every old log obsolete and deletes it (f, lon1, sfo2, nyc1, syd1 went from 0 to 12–15 GB free).
+  **Never delete `.log` files by hand** — they hold the unflushed rows of the pinning families.
+  A node still running with its 13 GB of live WAL (blr1, c, ams3, nyc2, tor1, atl1, sfo3 at the
+  time of writing) gives it back on a controlled restart, ~15 min of startup verify each.
+- **Code fix:** `Storage::open` sets `max_total_wal_size` to 256 MB (`MAX_TOTAL_WAL_BYTES`,
+  `d187df4` on `feat/cli-scan-fixes`; test
+  `the_write_ahead_log_is_capped_not_pinned_by_a_quiet_family`, 268 MB of log under the old
+  options, 22 MB under an 8 MB cap). Node-only, same chain, rolls like v0.5.1. The floor is one
+  write buffer above the cap (the live log rolls only when a memtable flushes).
+- **Ops facts:** `doctl` is configured on the laptop (account active, 30-droplet limit); a disk
+  resize needs a power-off and is permanent. `du -sh <datadir>` hides the split — read
+  `du -ch db/*.sst` and `du -ch db/*.log` separately, and `df` on the 48 GB droplets first
+  whenever anything "cannot start".
+- **Node A is a LaunchAgent now** (`deploy/launchd/org.randprotocol.node-a.plist`, installed
+  under `~/Library/LaunchAgents`, `KeepAlive`, `RunAtLoad`): before it, every laptop reboot took
+  A down until someone noticed (two days on 2026-09-21). launchd's default of 256 file
+  descriptors kills RocksDB at open ("Too many open files") — the plist raises `NumberOfFiles`
+  to 65536. Restart A with `launchctl kill TERM gui/$(id -u)/org.randprotocol.node-a`, never by
+  running `run-a.sh` in a shell beside it.
+
+### 2026-09-24 — the CLI scan fixes from the non-receipt investigation (`feat/cli-scan-fixes`, `74c9dd8`)
+
+The 2026-09-23 investigation of a "nothing received" report proved the payment sound and left
+three CLI weaknesses; all three are fixed with red-first tests: **the note store is bound to the
+chain it was scanned against** (`NoteStore.genesis`, hex in `<key>.notes.json`; `scan` calls
+`rand_getGenesisHash` first and `bind` empties a foreign or pre-binding store with a warning
+naming both chains — the reproduced failure was a chain-13-sized `scanned_index` against chain 14
+reporting `0 RAND, 0 notes` in 1.9 s); **the wallet speaks TLS** (workspace `reqwest` gains
+`rustls-tls`; it refused every `https://` URL before, so `https://rpc.randprotocol.org` was
+unusable from the CLI); **`rand_getBlocks` pages 1024 headers** (`rpc::MAX_BLOCK_HEADERS`, was
+`MAX_COMPACT_BLOCKS`'s 128; older nodes clamp and the walk advances from the last header it got).
+Trap kept: the first sync still reads every block header (a warm 128-page is ~0.4 s on F, ~1 900
+round trips over 245k blocks; the server reads the whole block to render a header) — a header
+index on the node is the real fix, not a bigger page.
+
 
 ### v0.5 — RPL tokens, zUSD and the hardened bridge — LIVE on chain 14 (2026-09-20), pinned build `b3c594c`
 
