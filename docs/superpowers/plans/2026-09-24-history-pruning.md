@@ -21,7 +21,7 @@
 - Block 0 and its QC are never deleted. No block at or above `keep_from = head - max(aggregation.window, 2)` is deleted.
 - Every delete of a pass and the new floor land in one `WriteBatch` written with `sync_opts()`.
 - `PRUNE_PASS_MAX = 512` blocks per pass; the pass runs when `head % 16 == 0`, in `spawn_blocking`, after the proof-pruning pass.
-- Range compaction of `blocks` and `qcs` every 64th pass that deleted something.
+- Compaction of `blocks` over `[1, floor)` in a background task (never overlapping itself) every 64th pass that deleted something.
 - `Status` gains exactly one trailing field `floor: u64`.
 - RPC error for a pruned height: code `-32010`, message `pruned: height {h} is below this node's retention floor {floor}`, `data: {"floor": floor}`.
 - `rand_status` gains `prune_floor: u64` and `prune_history_secs: Option<u64>`.

@@ -18,7 +18,7 @@ lost quorum at height 248 953): a testnet-only node keeps one day of blocks and 
   below `1h` at startup. Absent means never prune — an archive node.
 - **The pass.** Every 16th committed block, `Storage::prune_history` deletes `blocks`, `qcs`,
   `block_index`, `txs`, `receipts`/`receipts_by_program` and `seals` for everything below
-  `head_timestamp - prune_history`, up to `PRUNE_PASS_MAX = 4096` blocks per pass in one synced
+  `head_timestamp - prune_history`, up to `PRUNE_PASS_MAX = 512` blocks per pass in one synced
   `WriteBatch`. It never touches the ledger (`notes`, `nullifiers`, `anchors`, `validators`,
   `programs`, …), never deletes genesis, the head, the head's parent, or anything inside an
   aggregation window. The floor (`META_PRUNE_FLOOR`) only rises; disk comes back after
@@ -65,7 +65,7 @@ lost quorum at height 248 953): a testnet-only node keeps one day of blocks and 
    `rand_status.height` to reach the head and one more block to commit before the next. **Measure
    the first rolled validator's pass duration in its log before continuing**: a first pass over a
    backlog is awaited synchronously in the node's post-commit loop up to
-   `PRUNE_PASS_MAX = 4096` blocks, so a validator holding much more than a day of history could
+   `PRUNE_PASS_MAX = 512` blocks, so a validator holding much more than a day of history could
    stall its own commits for the pass's duration on that first activation. **Gate each step**:
    roll the next droplet only after the previous one's `rand_status.prune_floor` is within a day
    of the head (its drain finished, ~2–3 h at 512 blocks a pass); never have more than one
