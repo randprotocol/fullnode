@@ -87,7 +87,7 @@ batch is empty, and the client already ignores an empty batch (`batch_decision(N
 `BlockByHash` for a pruned block returns `Block(None)` as it does for an unknown hash.
 
 This changes the `Status` wire shape. The codec is not self-describing, so the working
-assumption is that a v0.5.4 node and a v0.5.5 node cannot decode each other's `Status` and
+assumption is that a v0.5.6 node and a v0.5.7 node cannot decode each other's `Status` and
 therefore cannot choose each other for batch sync during the roll; the plan pins the actual
 behaviour with a decode test either way, and the roll is planned for the worse case. Consensus
 messages are untouched and blocks keep committing. The roll is done in one pass (see §7) and
@@ -176,7 +176,7 @@ RPC (`rpc.rs`):
 
 ## 7. Rollout (the operator's runbook, not code)
 
-The fleet is already on v0.5.4 with the WAL cap. Pruning ships as the next node patch release
+The fleet is already on v0.5.6 with the WAL cap. Pruning ships as the next node patch release
 under the release rule (`docs/deploy.md`, audit v4 PROC-3): green CI, full release test on the
 release machine, tagged.
 

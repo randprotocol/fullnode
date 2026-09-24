@@ -583,7 +583,7 @@ In `wire.rs` (a new `#[cfg(test)] mod tests` at the bottom if none exists):
 mod tests {
     use super::*;
 
-    /// The roll caveat, pinned (history pruning spec §2): a v0.5.4 `Status` has three fields.
+    /// The roll caveat, pinned (history pruning spec §2): a v0.5.6 `Status` has three fields.
     #[derive(Serialize, Deserialize)]
     struct OldStatus {
         height: u64,
@@ -1246,7 +1246,7 @@ Under the observer sentence at line 19 add:
 
 - [ ] **Step 3: Changelog, version, memory**
 
-`CHANGELOG.md`: a `## 0.5.5` entry in the file's style: the flag, the floor in `Status` (wire-coordinated: roll in one pass), `rand_status` fields, error `-32010`, structural verify, the archive rule. `Cargo.toml` workspace `version = "0.5.5"` and the pin in `main.rs` (`git show d0778d8` shows the two lines). `AGENTS.md`: under "Project memory", a 6-line entry: what pruning keeps, the archive, the roll caveat, mainnet never passes the flag.
+`CHANGELOG.md`: a `## 0.5.7` entry in the file's style: the flag, the floor in `Status` (wire-coordinated: roll in one pass), `rand_status` fields, error `-32010`, structural verify, the archive rule. `Cargo.toml` workspace `version = "0.5.7"` and the pin in `main.rs` (`git show d0778d8` shows the two lines). `AGENTS.md`: under "Project memory", a 6-line entry: what pruning keeps, the archive, the roll caveat, mainnet never passes the flag.
 
 - [ ] **Step 4: Build and test everything**
 
@@ -1257,7 +1257,7 @@ Expected: build ok, all tests pass, clippy clean.
 
 ```bash
 git add docs/deploy.md deploy/cutover-droplet-chain14.sh deploy/update-droplet.sh deploy/run-a.sh deploy/nodes.env CHANGELOG.md Cargo.toml Cargo.lock crates/randprotocol-node/src/main.rs AGENTS.md
-git commit -m "docs, deploy: history pruning — the flag in the unit templates, obs1 as the archive, the roll caveat; version 0.5.5"
+git commit -m "docs, deploy: history pruning — the flag in the unit templates, obs1 as the archive, the roll caveat; version 0.5.7"
 ```
 
 ---
@@ -1266,7 +1266,7 @@ git commit -m "docs, deploy: history pruning — the flag in the unit templates,
 
 Follows the spec's §7 and the release rule in `docs/deploy.md`.
 
-1. Merge `feat/history-pruning` to `main` after review; CI green; `cargo test --workspace --release` on the release machine; tag `v0.5.5`.
+1. Merge `feat/history-pruning` to `main` after review; CI green; `cargo test --workspace --release` on the release machine; tag `v0.5.7`.
 2. Archive first: on the randbridge-web droplet, create and attach a 500 GB volume in sgp1, `systemctl stop rand-node`, move `/root/data-obs1-1cff3b7d` onto the volume, symlink or edit the unit's `--datadir`, start, confirm `rand_status.prune_floor == 0` and the head follows the fleet.
 3. Wait for the chain to commit again.
 4. Build on E (`deploy/rebuild-vps.sh 188.166.235.187` from the tagged commit). Then, one droplet at a time, `PRUNE_ARGS="--prune-history 24h" deploy/update-droplet.sh <ip>`; wait for `rand_status.height` to reach the head and one more block before the next.
