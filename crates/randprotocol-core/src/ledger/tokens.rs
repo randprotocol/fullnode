@@ -2087,6 +2087,7 @@ mod action_tests {
             rewards: 0,
             payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
             nonce: 0,
+            activation_epoch: 0,
         };
         let mut l = Ledger::new(CHAIN, HC, [(k.address(), entry)].into_iter().collect(), &StubExecutor);
         l.set_tokens(Some(TokenRegistry::new(REG_FEE)));

@@ -596,6 +596,9 @@ async fn main() -> Result<()> {
                 max_block_bytes,
                 max_call_envelope_bytes,
                 max_program_public_words,
+                // The audit-v4 `staking` section (STAKE-2) is spliced in by hand like the
+                // `bridge` section: a chain without it hashes byte-for-byte as before.
+                staking: None,
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -1190,6 +1193,7 @@ mod tests {
             max_block_bytes: None,
             max_call_envelope_bytes: None,
             max_program_public_words: None,
+            staking: None,
         }
     }
 

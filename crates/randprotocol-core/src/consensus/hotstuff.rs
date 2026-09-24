@@ -371,7 +371,7 @@ impl HotStuff {
         }
         // `epoch_start_parent` only returns hashes it found in the tree.
         let entry = &self.tree[&start];
-        let register = entry.ledger_after.derive_next_set();
+        let register = entry.ledger_after.derive_next_set(epoch);
         let set = if register.is_empty() {
             // Every validator unbonded below the minimum. Carrying the previous epoch's set
             // forward keeps a block in which they can bond back in; an epoch with no leader is a

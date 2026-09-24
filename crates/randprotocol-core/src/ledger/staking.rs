@@ -59,6 +59,52 @@ pub struct ValidatorEntry {
     /// Incremented on every accepted `Unbond` and `Withdraw`. There are no accounts on this
     /// chain, so this is the whole of the replay protection for validator-signed actions.
     pub nonce: u64,
+    /// The first epoch this entry may be in the set of (audit v4, STAKE-2 rule 3). Genesis
+    /// validators and every bond on a chain without a [`StakingConfig`] carry 0 — weight at the
+    /// very next boundary, as always — and under the section a registering bond in epoch `e`
+    /// carries `e + 1 + bond_activation_epochs`. Last, so a row stored before the field
+    /// existed decodes with a fallback (`Storage::register`); hashed into the leaf only under
+    /// the section (`rand-validator-leaf-4`), so a chain without one commits the v2 leaf.
+    pub activation_epoch: u64,
+}
+
+/// The `staking` genesis section (audit v4, STAKE-2): a per-epoch budget for the testnet faucet
+/// and an activation delay for bonds. Present only on a chain whose genesis carries it — the
+/// three rules it switches on are gated on `Ledger::staking()` being `Some`, so chain 14, which
+/// has no section, behaves and hashes byte-for-byte as before.
+///
+/// `faucet_budget_per_epoch` is in RAND's base unit, and rides in the genesis file as a decimal
+/// string like every amount an RPC serves; `bond_activation_epochs` is the number of whole
+/// epochs a new bond waits *beyond* the boundary it would have joined at.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StakingConfig {
+    #[serde(with = "amount_string")]
+    pub faucet_budget_per_epoch: u64,
+    pub bond_activation_epochs: u32,
+}
+
+/// A `u64` amount as a decimal string in the genesis file (the RPC's amount convention). A
+/// plain JSON number is accepted on the way in, so a hand-edited file is not refused for it.
+mod amount_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Text(String),
+            Number(u64),
+        }
+        match Repr::deserialize(d)? {
+            Repr::Number(n) => Ok(n),
+            Repr::Text(t) => t.parse().map_err(|_| serde::de::Error::custom(format!("not a decimal amount: {t:?}"))),
+        }
+    }
 }
 
 /// Why a staking action was refused. Carried inside [`TxError::Staking`] so admission reports
@@ -107,9 +153,13 @@ pub enum StakingError {
 /// the previous epoch's set forward, so there is still a block in which to bond back in. Deriving
 /// the set is not the place to decide that — this function says what the register contains, not
 /// what consensus does about it.
-pub fn derive_set(register: &BTreeMap<Address, ValidatorEntry>) -> ValidatorSet {
+///
+/// `epoch` is the epoch the set is derived *for*: an entry whose `activation_epoch` is past it
+/// is not in the set, whatever its stake (audit v4, STAKE-2 rule 3). On a chain without a
+/// `staking` section every entry's activation epoch is 0 and the argument changes nothing.
+pub fn derive_set(register: &BTreeMap<Address, ValidatorEntry>, epoch: u64) -> ValidatorSet {
     let mut eligible: Vec<(&Address, &ValidatorEntry)> =
-        register.iter().filter(|(_, e)| e.stake >= MIN_STAKE).collect();
+        register.iter().filter(|(_, e)| e.stake >= MIN_STAKE && e.activation_epoch <= epoch).collect();
     // Descending stake, then ascending address: the cap must not depend on map order.
     eligible.sort_by(|(a_addr, a), (b_addr, b)| b.stake.cmp(&a.stake).then_with(|| a_addr.cmp(b_addr)));
     eligible.truncate(MAX_VALIDATORS);
@@ -228,6 +278,13 @@ impl Ledger {
         check_bond(self, &validator, amount, registration, chain_id)?;
         match registration {
             Some(r) => {
+                // STAKE-2 rule 3: under the section a new entry waits `bond_activation_epochs`
+                // whole epochs past the boundary it would otherwise have joined at (`epoch() +
+                // 1`). Without the section the field stays 0 — today's rule, and today's leaf.
+                let activation_epoch = match self.staking() {
+                    Some(cfg) => self.epoch().saturating_add(1).saturating_add(u64::from(cfg.bond_activation_epochs)),
+                    None => 0,
+                };
                 self.validators.insert(
                     validator,
                     ValidatorEntry {
@@ -237,6 +294,7 @@ impl Ledger {
                         rewards: 0,
                         payout: r.payout.clone(),
                         nonce: 0,
+                        activation_epoch,
                     },
                 );
             }
@@ -569,7 +627,15 @@ mod tests {
     }
 
     fn entry(k: &Keypair, stake: u64, payout: ShieldedAddress) -> ValidatorEntry {
-        ValidatorEntry { public_key: k.public_key().clone(), stake, pending: Vec::new(), rewards: 0, payout, nonce: 0 }
+        ValidatorEntry {
+            public_key: k.public_key().clone(),
+            stake,
+            pending: Vec::new(),
+            rewards: 0,
+            payout,
+            nonce: 0,
+            activation_epoch: 0,
+        }
     }
 
     fn register(entries: Vec<ValidatorEntry>) -> BTreeMap<Address, ValidatorEntry> {
@@ -658,7 +724,7 @@ mod tests {
                 entry(&key(i), stake, payout(i))
             })
             .collect();
-        let set = derive_set(&register(entries));
+        let set = derive_set(&register(entries), 1);
         assert_eq!(set.len(), 9, "the two below-minimum entries are filtered out");
         for i in 1..=2u8 {
             assert!(!set.contains(&key(i).address()), "validator {i} is below the minimum stake");
@@ -673,7 +739,7 @@ mod tests {
         // 101 eligible entries: the cap keeps the top 100 by stake, so the smallest drops.
         let many: Vec<ValidatorEntry> =
             (1..=101u8).map(|i| entry(&key(i), MIN_STAKE + i as u64, payout(i))).collect();
-        let capped = derive_set(&register(many));
+        let capped = derive_set(&register(many), 1);
         assert_eq!(capped.len(), MAX_VALIDATORS);
         assert!(!capped.contains(&key(1).address()), "the lowest stake is the one dropped");
         assert!(capped.contains(&key(2).address()));
@@ -681,7 +747,7 @@ mod tests {
         // 101 entries of equal stake: the tie is broken by address, ascending, so the largest
         // address is the one left out.
         let tied: Vec<ValidatorEntry> = (1..=101u8).map(|i| entry(&key(i), MIN_STAKE, payout(i))).collect();
-        let by_addr = derive_set(&register(tied));
+        let by_addr = derive_set(&register(tied), 1);
         assert_eq!(by_addr.len(), MAX_VALIDATORS);
         let last = (1..=101u8).map(|i| key(i).address()).max().unwrap();
         assert!(!by_addr.contains(&last), "the highest address loses the tie");
@@ -1201,5 +1267,63 @@ mod tests {
             l.validate(&copy, &StubExecutor)
         );
         assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
+    }
+
+    /// Audit v4, STAKE-2 rule 3: under the `staking` section a bond in epoch `e` is in no set
+    /// for epochs `e + 1 ..= e + N` and is in the set derived for `e + N + 1`; genesis
+    /// validators activate at 0. Without the section a bond is weight at the very next
+    /// boundary, as it always was.
+    #[test]
+    fn a_bond_waits_its_activation_epochs_before_it_is_in_the_set() {
+        let genesis = key(1);
+        let newcomer = key(9);
+        let bond_new = |l: &mut Ledger| {
+            let t = bond_tx(l, 40, &newcomer, MIN_STAKE, Some(registration(&newcomer, payout(9))));
+            l.apply_tx(&t, &genesis.address(), &StubExecutor).unwrap();
+        };
+        // Bonded at epoch 0 (height 1 of ten-block epochs), two epochs of delay.
+        let mut l = Ledger::new(CHAIN, HC, register(vec![entry(&genesis, MIN_STAKE, payout(1))]), &StubExecutor);
+        l.set_epoch_blocks(10);
+        l.set_height(1);
+        l.set_staking(Some(StakingConfig { faucet_budget_per_epoch: 0, bond_activation_epochs: 2 }));
+        assert_eq!(l.epoch(), 0);
+        bond_new(&mut l);
+        assert_eq!(l.validators()[&newcomer.address()].activation_epoch, 3, "epoch 0 + 1 + 2");
+        assert_eq!(l.validators()[&genesis.address()].activation_epoch, 0, "genesis validators activate at 0");
+        assert!(!l.derive_next_set(1).contains(&newcomer.address()));
+        assert!(!l.derive_next_set(2).contains(&newcomer.address()));
+        assert!(l.derive_next_set(3).contains(&newcomer.address()));
+        assert!(l.derive_next_set(1).contains(&genesis.address()), "genesis validators activate at 0");
+        // A top-up of an activated-later entry does not move its activation epoch. (The first
+        // bond's notes moved the tree: record the block-end anchor the next bundle spends at.)
+        l.record_anchor(1);
+        let top_up = bond_tx(&l, 50, &newcomer, MIN_STAKE, None);
+        l.apply_tx(&top_up, &genesis.address(), &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&newcomer.address()].activation_epoch, 3);
+        assert_eq!(l.validators()[&newcomer.address()].stake, 2 * MIN_STAKE);
+        // The same bond bonded in epoch 4 activates at 7.
+        l.set_height(41);
+        l.record_anchor(41);
+        let later = key(10);
+        let t = bond_tx(&l, 60, &later, MIN_STAKE, Some(registration(&later, payout(10))));
+        l.apply_tx(&t, &genesis.address(), &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&later.address()].activation_epoch, 7);
+        assert!(!l.derive_next_set(6).contains(&later.address()));
+        assert!(l.derive_next_set(7).contains(&later.address()));
+        // Without the section: weight at the next boundary, the activation epoch left at 0.
+        let mut l = Ledger::new(CHAIN, HC, register(vec![entry(&genesis, MIN_STAKE, payout(1))]), &StubExecutor);
+        l.set_epoch_blocks(10);
+        l.set_height(1);
+        bond_new(&mut l);
+        assert_eq!(l.validators()[&newcomer.address()].activation_epoch, 0);
+        assert!(l.derive_next_set(1).contains(&newcomer.address()));
+        // `derive_set` itself: an entry whose activation epoch is ahead of the epoch derived for
+        // is skipped, whatever its stake.
+        let mut ahead = entry(&key(2), 10 * MIN_STAKE, payout(2));
+        ahead.activation_epoch = 5;
+        let reg = register(vec![entry(&genesis, MIN_STAKE, payout(1)), ahead]);
+        assert!(!derive_set(&reg, 4).contains(&key(2).address()));
+        assert!(derive_set(&reg, 5).contains(&key(2).address()));
+        assert_eq!(derive_set(&reg, 4).len(), 1);
     }
 }

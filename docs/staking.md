@@ -24,12 +24,14 @@ ValidatorEntry {
     rewards:  u64,               // fees earned as a block proposer, unpaid
     payout:   ShieldedAddress,   // rand1… — where a withdraw pays
     nonce:    u64,               // the replay protection for its signed actions
+    activation_epoch: u64,       // v0.5.4: the first epoch this row may be in the set of (§2)
 }
 ```
 
 Every field of every row is public, and the register is hashed into every block's state root
-(leaf domain `rand-validator-leaf-2`), so a node that disagrees about one of them disagrees about
-the chain. A row is created by genesis or by the bond that registers the validator, and is never
+(leaf domain `rand-validator-leaf-2`; `rand-validator-leaf-4`, with `activation_epoch` appended,
+on a chain whose genesis has the `staking` section of §2), so a node that disagrees about one of
+them disagrees about the chain. A row is created by genesis or by the bond that registers the validator, and is never
 deleted: a validator that unbonds everything keeps a row with `stake = 0`, which is simply in no
 epoch's set.
 
@@ -68,6 +70,41 @@ Two consequences worth knowing:
 
 If an epoch's derivation is empty — every validator below the minimum — the previous epoch's set is
 carried forward, because an epoch with no leader is a halt nothing could end.
+
+### The `staking` genesis section (v0.5.4, audit v4 STAKE-2)
+
+Audit v4 pointed out that on a faucet chain the register was free to buy: `Mint` hands any
+validator key 100 RAND per transaction with no counter, so ~91 mints and one `Bond` reached a
+third of chain 14's genesis stake, active at the next boundary. Three rules close that. All three
+are **switched on by one optional genesis section** and are off — behaviour and hashes
+byte-for-byte unchanged — on any chain whose genesis lacks it, chain 14 included:
+
+```json
+"staking": { "faucet_budget_per_epoch": "100000000000", "bond_activation_epochs": 2 }
+```
+
+- **Activation delay.** A row created by a `Bond` in epoch `e` records
+  `activation_epoch = e + 1 + bond_activation_epochs`, and `derive_set` skips a row whose
+  activation epoch is past the epoch it is deriving *for*: the bond is in no set for epochs
+  `e + 1 ..= e + N` and joins at `e + N + 1`. Genesis validators carry 0 and are in every set from
+  epoch 0; a top-up of an existing row never moves its activation epoch. With
+  `bond_activation_epochs: 0` the rule is exactly today's ("weight at the next boundary"). The
+  field is hashed into the validator leaf (`rand-validator-leaf-4`) only under the section.
+- **The faucet budget.** The ledger keeps `(faucet_epoch, faucet_minted_in_epoch)`; a `Mint` that
+  would push the epoch's total over `faucet_budget_per_epoch` is refused
+  (`FaucetBudgetExhausted`), and the counter starts from zero in the first block of the next
+  epoch — the epoch is the ledger's own, `height / epoch_blocks`, never wall time. The refusal is
+  state, not bytes: the node never caches it as permanent, and the same transaction is admitted
+  again an epoch later. Both counters are consensus state under the section: the state root is
+  re-domained `rand-state-5` with them appended, they are persisted beside the supply counters
+  (`META_FAUCET_EPOCH`) and `rand-node verify` replays them. `rand_getSupply` reports them as
+  `faucet_epoch` / `faucet_minted_in_epoch`.
+- **A bridged chain has no faucet.** `faucet: true` beside a `bridge` section is refused at
+  genesis (`GenesisError::FaucetWithBridge`) once the section is present: free RAND against a
+  chain holding bridged custody is what the finding is about. Chain 14's genesis has both and no
+  section, so it still loads.
+
+Not in v0.5.4: slashing (audit decision D8 — "it means nothing while stake is free").
 
 A node runs with `--validator` when it holds a validator key at all; being in the current set is a
 separate thing, and `rand_status` reports the two separately as `is_validator` and

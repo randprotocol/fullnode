@@ -217,6 +217,9 @@ impl From<&TokensConfig> for TokensCommit {
     }
 }
 
+/// The `staking` genesis section (audit v4, STAKE-2), defined beside the rules it switches on.
+pub use crate::ledger::staking::StakingConfig;
+
 /// Smallest `registration_fee` a `tokens` section may set, in RAND's base unit.
 pub const MIN_REGISTRATION_FEE: u64 = 1_000_000_000;
 /// Largest `registration_fee` a `tokens` section may set.
@@ -269,6 +272,12 @@ pub struct Genesis {
     /// a file without it hashes byte-for-byte as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consensus_domain: Option<u32>,
+    /// Audit v4, STAKE-2: the faucet's per-epoch budget and the bond activation delay, and the
+    /// rule that a faucet and a bridge exclude each other. Part of the genesis hash (by name)
+    /// and of the state root when present; omitted entirely when absent, so a chain without
+    /// one — chain 14 — keeps its genesis file, hash and state roots byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staking: Option<StakingConfig>,
     /// Phase S2: blocks per epoch — the validator set for epoch `e` is derived from the
     /// register as of the last block of epoch `e - 1`. Configurable so a cluster test does not
     /// have to run 1000 blocks to cross a boundary. Part of the genesis hash: two chains that
@@ -359,6 +368,10 @@ pub enum GenesisError {
     BadTokens(String),
     #[error("unknown consensus_domain {0} (0 or 1)")]
     BadConsensusDomain(u32),
+    /// Audit v4, STAKE-2 rule 1: under a `staking` section a chain that holds bridged custody
+    /// cannot also hand out free RAND.
+    #[error("a staking section refuses a faucet on a bridged chain (faucet: true with a bridge section)")]
+    FaucetWithBridge,
     #[error("bad hc_bundle {0} (64 hex characters)")]
     BadHcBundle(String),
     #[error("bad alloc note {0}")]
@@ -409,6 +422,9 @@ pub struct GenesisState {
     pub epoch_blocks: u64,
     /// The consensus signing domain's version (audit v4): 0 when the file has none.
     pub consensus_domain: u32,
+    /// Audit v4, STAKE-2: the `staking` section, as the genesis file set it (also on the
+    /// ledger, `Ledger::staking`, which is what a reloading node restores from).
+    pub staking: Option<StakingConfig>,
     pub ledger: Ledger,
     pub block: Block,
     /// The alloc notes in file order: commitment, envelope, amount.
@@ -516,6 +532,11 @@ impl Genesis {
                 return Err(GenesisError::BadConsensusDomain(v));
             }
         }
+        // Audit v4, STAKE-2 rule 1, only under the section: a faucet and a bridge exclude each
+        // other. Chain 14's genesis has both and no section, so it still loads.
+        if self.staking.is_some() && self.faucet && self.bridge.is_some() {
+            return Err(GenesisError::FaucetWithBridge);
+        }
         Ok(())
     }
 
@@ -553,6 +574,8 @@ impl Genesis {
                     rewards: 0,
                     payout,
                     nonce: 0,
+                    // Genesis validators activate at epoch 0, section or no section.
+                    activation_epoch: 0,
                 },
             );
         }
@@ -596,6 +619,7 @@ impl Genesis {
             ledger.set_tokens(Some(registry));
         }
         ledger.set_aggregation(self.aggregation.clone());
+        ledger.set_staking(self.staking.clone());
         ledger.set_max_program_words(self.max_program_words.map_or(gas::MAX_PROGRAM_WORDS, |n| n as usize));
         ledger.set_max_proof_bytes(self.max_proof_bytes.map_or(gas::MAX_PROOF_BYTES, |n| n as usize));
         ledger.set_max_block_bytes(self.max_block_bytes.map_or(gas::MAX_BLOCK_BYTES, |n| n as usize));
@@ -720,6 +744,14 @@ impl Genesis {
             commit.extend_from_slice(b"consensus_domain");
             commit.extend_from_slice(&v.to_be_bytes());
         }
+        // The staking section (audit v4, STAKE-2), tagged like the caps and appended only when
+        // the file sets it, so chain 14's genesis hashes byte-for-byte as before. Its two fields
+        // are fixed-width, so they follow the tag directly.
+        if let Some(s) = &self.staking {
+            commit.extend_from_slice(b"staking");
+            commit.extend_from_slice(&s.faucet_budget_per_epoch.to_be_bytes());
+            commit.extend_from_slice(&s.bond_activation_epochs.to_be_bytes());
+        }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -745,6 +777,7 @@ impl Genesis {
             validators,
             epoch_blocks: self.epoch_blocks,
             consensus_domain,
+            staking: self.staking.clone(),
             ledger,
             block,
             notes,
@@ -956,6 +989,7 @@ mod tests {
     use crate::confidential::StubExecutor;
     use crate::crypto::Keypair;
     use crate::notes::word8_to_hex;
+    use crate::types::UNITS_PER_RAND;
     use std::collections::BTreeMap;
 
     fn note(seed: u32, amount: u64) -> GenesisNote {
@@ -1019,6 +1053,7 @@ mod tests {
             tokens: None,
             aggregation: None,
             consensus_domain: None,
+            staking: None,
             epoch_blocks: EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
             max_proof_bytes: None,
@@ -2113,5 +2148,58 @@ mod tests {
         let mut g = genesis(1);
         g.validators[0].stake = u64::MAX as u128 + 1;
         assert!(matches!(g.build(&StubExecutor), Err(GenesisError::StakeTooLarge(_))));
+    }
+
+    /// Audit v4, STAKE-2 rule 1: with the `staking` section on, a faucet and a bridge exclude
+    /// each other — a free mint against a chain holding bridged custody is what the finding is
+    /// about. Chain 14's genesis has both and no section, so it still loads, hashes and builds
+    /// exactly as before; the section itself is bound into the genesis hash by name.
+    #[test]
+    fn a_genesis_with_faucet_and_bridge_is_refused_once_staking_rules_are_on() {
+        let mut g = genesis(1);
+        g.bridge = Some(bridge_cfg());
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000 });
+        g.alloc = opened_alloc();
+        g.faucet = true;
+        assert!(g.validate().is_ok(), "chain 14's shape still loads");
+        let unsectioned = build(&g);
+        assert!(unsectioned.ledger.staking().is_none());
+        assert!(!g.to_json().contains("staking"), "and its file never mentions the section");
+        let cfg = StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2 };
+        g.staking = Some(cfg.clone());
+        assert!(matches!(g.validate(), Err(GenesisError::FaucetWithBridge)), "{:?}", g.validate());
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::FaucetWithBridge)));
+        // Either half alone is fine under the section.
+        let mut faucet_only = genesis(1);
+        faucet_only.faucet = true;
+        faucet_only.staking = Some(cfg.clone());
+        let s = build(&faucet_only);
+        assert_eq!(s.ledger.staking(), Some(&cfg), "the ledger runs with the section");
+        assert_eq!(s.staking, Some(cfg.clone()));
+        g.faucet = false;
+        assert!(g.validate().is_ok(), "a bridged chain without a faucet");
+        assert!(build(&g).ledger.staking().is_some());
+        // The section is part of the genesis binding, by name, and the file round-trips it
+        // with the budget as a decimal string (every amount in a genesis file is).
+        let plain = genesis(1);
+        let mut sectioned = plain.clone();
+        sectioned.staking = Some(cfg.clone());
+        assert_ne!(build(&sectioned).hash(), build(&plain).hash());
+        let mut other_budget = sectioned.clone();
+        other_budget.staking.as_mut().unwrap().faucet_budget_per_epoch += 1;
+        assert_ne!(build(&other_budget).hash(), build(&sectioned).hash());
+        let mut other_delay = sectioned.clone();
+        other_delay.staking.as_mut().unwrap().bond_activation_epochs += 1;
+        assert_ne!(build(&other_delay).hash(), build(&sectioned).hash());
+        let json = sectioned.to_json();
+        assert!(json.contains("\"faucet_budget_per_epoch\": \"100000000000\""), "{json}");
+        assert_eq!(Genesis::from_json(&json).unwrap(), sectioned);
+        // And the state root domain moved with the section (`rand-state-5`), not without it.
+        assert_ne!(build(&sectioned).ledger.state_root(), build(&plain).ledger.state_root());
+        assert_eq!(
+            build(&plain).ledger.state_root().to_hex(),
+            "e845c110b5e366acf87806cb7f09cc212ad47008cac7cafbd141c30da4c738d4",
+            "the pin `a_bridge_section_is_accepted_and_only_a_bridged_chain_changes` guards, unchanged"
+        );
     }
 }

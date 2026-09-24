@@ -23,6 +23,7 @@ use crate::gas;
 use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Envelope, Word8, MAX_ENVELOPE_BYTES};
 use crate::program::{program_id_with_public, CallOutcome, CallReceipt, ProgramId, ProgramRecord};
 use crate::types::{Action, Block, Transaction, ValidatorSet, FAUCET_MAX_UNITS};
+pub use staking::StakingConfig;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// How many block-end roots a bundle may anchor to (spec §7 item 4).
@@ -142,6 +143,10 @@ pub enum TxError {
     BadMintSignature,
     #[error("the mint's commitment does not open to its published note and amount")]
     MintCommitmentMismatch,
+    /// Audit v4, STAKE-2 rule 2: the epoch's faucet budget would be exceeded. State, not bytes —
+    /// the next epoch admits the same transaction — so never a permanent admission verdict.
+    #[error("the faucet budget of {budget} for this epoch is exhausted ({minted} minted)")]
+    FaucetBudgetExhausted { budget: u64, minted: u64 },
     #[error("confidential computation is disabled on this chain")]
     ConfidentialDisabled,
     #[error("bad program: {0}")]
@@ -393,6 +398,18 @@ pub struct Ledger {
     /// `epoch_blocks` — a genesis parameter, not consensus state. `None` makes the five
     /// aggregation actions inadmissible and keeps the state root byte-for-byte today's.
     aggregation: Option<aggregation::AggregationConfig>,
+    /// The `staking` section of genesis (audit v4, STAKE-2), a genesis parameter like
+    /// `aggregation`: restored from the genesis file by `reload_ledger`, never from storage.
+    /// `None` keeps the faucet unbudgeted, bonds active at the next boundary and the state root
+    /// byte-for-byte today's; `Some` switches on the per-epoch budget, the activation delay,
+    /// the `rand-state-5` domain and the v4 validator leaf.
+    staking: Option<StakingConfig>,
+    /// The epoch the faucet counter below is for, and what the faucet minted in it (STAKE-2
+    /// rule 2). Consensus state on a chain with a `staking` section — folded into the state
+    /// root and persisted beside `META_SUPPLY` — and always `(0, 0)` without one. The counter is
+    /// reset lazily: a mint in a later epoch than `faucet_epoch` starts it from zero.
+    faucet_epoch: u64,
+    faucet_minted_in_epoch: u64,
     /// The largest program a `Deploy` may carry, in words: genesis's `max_program_words`, or
     /// [`gas::MAX_PROGRAM_WORDS`] on a chain whose file does not set it. A genesis parameter like
     /// `epoch_blocks` — not state, outside the state root and `Ledger`'s equality — so a
@@ -466,6 +483,10 @@ impl PartialEq for Ledger {
             // decides who is paid and which bundles an aggregate may cover (audit v3, AGG-4). On a
             // chain without aggregation it is empty on both sides and this compares nothing.
             && self.unsealed_fees == o.unsealed_fees
+            // The faucet epoch counters are consensus state on a chain with a `staking` section
+            // (audit v4, STAKE-2) and `(0, 0)` on both sides without one.
+            && self.faucet_epoch == o.faucet_epoch
+            && self.faucet_minted_in_epoch == o.faucet_minted_in_epoch
     }
 }
 impl Eq for Ledger {}
@@ -498,6 +519,9 @@ impl Ledger {
             bridge: None,
             tokens: None,
             aggregation: None,
+            staking: None,
+            faucet_epoch: 0,
+            faucet_minted_in_epoch: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
             max_block_bytes: gas::MAX_BLOCK_BYTES,
@@ -543,6 +567,9 @@ impl Ledger {
             bridge: None,
             tokens: None,
             aggregation: None,
+            staking: None,
+            faucet_epoch: 0,
+            faucet_minted_in_epoch: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
             max_block_bytes: gas::MAX_BLOCK_BYTES,
@@ -599,10 +626,43 @@ impl Ledger {
         self.height / self.epoch_blocks.max(1)
     }
 
-    /// The validator set the next epoch would use if this ledger were the last block of one
-    /// (spec §8). The rule itself lives in [`staking::derive_set`].
-    pub fn derive_next_set(&self) -> ValidatorSet {
-        staking::derive_set(&self.validators)
+    /// The validator set of `epoch`, derived from this register as if this ledger were the last
+    /// block of the epoch before it (spec §8). The rule itself lives in [`staking::derive_set`];
+    /// the epoch is named by the caller because, under a `staking` section, an entry's
+    /// activation epoch decides whether it is in the set derived *for* that epoch (audit v4,
+    /// STAKE-2 rule 3). A caller asking what the next boundary would derive passes
+    /// `epoch() + 1`.
+    pub fn derive_next_set(&self, epoch: u64) -> ValidatorSet {
+        staking::derive_set(&self.validators, epoch)
+    }
+
+    /// The `staking` section, or `None` on a chain without one — where the faucet has no
+    /// per-epoch budget, a bond is weight at the next boundary and the state root is
+    /// byte-for-byte today's.
+    pub fn staking(&self) -> Option<&StakingConfig> {
+        self.staking.as_ref()
+    }
+
+    /// Install (or clear) the `staking` section. Genesis calls this once; a reloading node calls
+    /// it with what its genesis file holds (`reload_ledger`), never with what storage held —
+    /// a restarted node that lost the gate would compute `rand-state-2` roots against peers on
+    /// `rand-state-5` and fork at its first block.
+    pub fn set_staking(&mut self, staking: Option<StakingConfig>) {
+        self.staking = staking;
+    }
+
+    /// The faucet's epoch counters, `(epoch, minted_in_epoch)` (audit v4, STAKE-2 rule 2): for
+    /// the node's persistence beside `META_SUPPLY`, the replay audit and `rand_getSupply`.
+    pub fn faucet_epoch_counters(&self) -> (u64, u64) {
+        (self.faucet_epoch, self.faucet_minted_in_epoch)
+    }
+
+    /// Restore the counters a node persisted beside the state — `set_supply`'s twin, with the
+    /// difference that these are hashed into the root on a chain with a `staking` section, so
+    /// a restarted node that lost them would disagree with its peers from its next block.
+    pub fn set_faucet_epoch_counters(&mut self, epoch: u64, minted: u64) {
+        self.faucet_epoch = epoch;
+        self.faucet_minted_in_epoch = minted;
     }
 
     /// The public supply counters as of this ledger (see [`supply`]).
@@ -1244,6 +1304,15 @@ impl Ledger {
                 if *amount > FAUCET_MAX_UNITS {
                     return Err(TxError::MintTooLarge { amount: *amount, cap: FAUCET_MAX_UNITS });
                 }
+                // STAKE-2 rule 2: the epoch's budget, after the per-mint cap and before any
+                // signature work. The counter is read as of the ledger's own epoch — a counter
+                // left from an earlier epoch reads as zero.
+                if let Some(s) = &self.staking {
+                    let minted = if self.faucet_epoch == self.epoch() { self.faucet_minted_in_epoch } else { 0 };
+                    if minted.saturating_add(*amount) > s.faucet_budget_per_epoch {
+                        return Err(TxError::FaucetBudgetExhausted { budget: s.faucet_budget_per_epoch, minted });
+                    }
+                }
                 let addr = minter.address();
                 if !self.validators.contains_key(&addr) {
                     return Err(TxError::MinterNotValidator(addr));
@@ -1412,6 +1481,18 @@ impl Ledger {
             Action::Mint { cm, amount, .. } => {
                 self.supply.faucet_minted =
                     self.supply.faucet_minted.checked_add(*amount).ok_or(TxError::Overflow)?;
+                // The epoch counter, only under a `staking` section (STAKE-2 rule 2): reset on
+                // the ledger's epoch boundary, then added to. `validate_inner` has already held
+                // the sum under the budget, and the budget is a `u64`, so this cannot overflow.
+                if self.staking.is_some() {
+                    let epoch = self.epoch();
+                    if self.faucet_epoch != epoch {
+                        self.faucet_epoch = epoch;
+                        self.faucet_minted_in_epoch = 0;
+                    }
+                    self.faucet_minted_in_epoch =
+                        self.faucet_minted_in_epoch.checked_add(*amount).ok_or(TxError::Overflow)?;
+                }
                 self.commitments.insert(*cm);
                 self.tree.append(*cm, executor);
             }
@@ -1762,7 +1843,15 @@ impl Ledger {
                 }
                 buf.extend_from_slice(&word8_to_bytes(&v.payout.pk));
                 buf.extend_from_slice(&v.payout.kem_ek);
-                Hash::digest_domain(b"rand-validator-leaf-2", &buf)
+                // Under a `staking` section the activation epoch is state the set derivation
+                // reads, so the leaf binds it (v4); without one it is 0 everywhere and the v2
+                // leaf is committed unchanged (audit v4, STAKE-2).
+                if self.staking.is_some() {
+                    buf.extend_from_slice(&v.activation_epoch.to_be_bytes());
+                    Hash::digest_domain(b"rand-validator-leaf-4", &buf)
+                } else {
+                    Hash::digest_domain(b"rand-validator-leaf-2", &buf)
+                }
             })
             .collect();
         let prog_leaves: Vec<Hash> =
@@ -1819,6 +1908,11 @@ impl Ledger {
         crate::crypto::merkle_root(&leaves)
     }
 
+    ///
+    /// On a chain whose genesis has a `staking` section (audit v4, STAKE-2) the faucet's two
+    /// epoch counters are appended last and the whole thing is re-domained `rand-state-5`,
+    /// whatever else is on — the section is gated exactly like the three before it, so a chain
+    /// without one falls through to the domains above unchanged.
     pub fn state_root(&self) -> Hash {
         let (nf_root, val_root, prog_root) = self.state_root_leaves();
         let mut buf = Vec::with_capacity(128);
@@ -1831,15 +1925,20 @@ impl Ledger {
         }
         if let Some(tokens) = &self.tokens {
             buf.extend_from_slice(tokens.root().as_bytes());
-            if self.aggregation.is_some() {
-                buf.extend_from_slice(aggregation::aggregators_root(&self.aggregators).as_bytes());
-                buf.extend_from_slice(self.unsealed_root().as_bytes());
-            }
-            return Hash::digest_domain(b"rand-state-4", &buf);
         }
         if self.aggregation.is_some() {
             buf.extend_from_slice(aggregation::aggregators_root(&self.aggregators).as_bytes());
             buf.extend_from_slice(self.unsealed_root().as_bytes());
+        }
+        if self.staking.is_some() {
+            buf.extend_from_slice(&self.faucet_epoch.to_be_bytes());
+            buf.extend_from_slice(&self.faucet_minted_in_epoch.to_be_bytes());
+            return Hash::digest_domain(b"rand-state-5", &buf);
+        }
+        if self.tokens.is_some() {
+            return Hash::digest_domain(b"rand-state-4", &buf);
+        }
+        if self.aggregation.is_some() {
             return Hash::digest_domain(b"rand-state-3", &buf);
         }
         Hash::digest_domain(b"rand-state-2", &buf)
@@ -1858,7 +1957,7 @@ mod tests {
     use crate::program::program_id;
     use crate::crypto::Keypair;
     use crate::notes::{Envelope, ShieldedAddress};
-    use crate::types::{BlockHeader, QuorumCertificate};
+    use crate::types::{BlockHeader, QuorumCertificate, UNITS_PER_RAND};
 
     const HC: Word8 = [11; 8];
 
@@ -1881,6 +1980,7 @@ mod tests {
                 rewards: 0,
                 payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
                 nonce: 0,
+                activation_epoch: 0,
             },
         )
     }
@@ -3201,6 +3301,7 @@ mod tests {
             rewards: 0,
             payout: crate::notes::ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
             nonce: 0,
+            activation_epoch: 0,
         };
         let root_of = |e: &ValidatorEntry| {
             let register: BTreeMap<Address, ValidatorEntry> = [(k.address(), e.clone())].into_iter().collect();
@@ -3492,5 +3593,105 @@ mod tests {
         assert_eq!(marker.hash(), raw.hash(), "the marker form is the raw id by design");
         assert_eq!(l.validate(&marker, &StubExecutor), Err(TxError::PrunedFormOutsideSync));
         assert_eq!(l.validate(&raw, &StubExecutor), Ok(()));
+    }
+
+    /// Audit v4, STAKE-2: the staking section is gated exactly like the bridge, tokens and
+    /// aggregation sections. Without it a ledger commits today's domain over today's leaves —
+    /// the faucet counters and the activation epoch reach nothing — so chain 14's state roots
+    /// do not move by a byte. The pin is this fixture's root as computed before the section
+    /// existed.
+    #[test]
+    fn without_the_section_the_state_root_domain_and_counters_are_untouched() {
+        let l = ledger();
+        assert!(l.staking().is_none());
+        assert_eq!(l.faucet_epoch_counters(), (0, 0));
+        assert_eq!(
+            l.state_root().to_hex(),
+            "8442e5f9a8b33426212ff172c8e11c87b047a3da726238411056885357d731d7",
+            "the chain-14 shape's root, as computed before the staking section existed"
+        );
+        // And a mint on such a chain moves the supply counter, never the epoch counters.
+        let mut l = l;
+        let (a, _) = keys();
+        let t = Transaction::mint(7, [5; 8], 1, [6; 8], env(), FAUCET_MAX_UNITS, &a, &StubExecutor);
+        l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
+        assert_eq!(l.faucet_epoch_counters(), (0, 0), "no section, no counter");
+        assert_eq!(l.supply().faucet_minted, FAUCET_MAX_UNITS);
+    }
+
+    /// Audit v4, STAKE-2 rule 2: the faucet budget is per epoch, and the epoch is the ledger's
+    /// own (`height / epoch_blocks`), never wall time. A mint that would push the epoch's total
+    /// over the budget is refused; the first block of the next epoch starts from zero. The
+    /// refusal is state, not bytes: the same transaction is admitted again an epoch later.
+    #[test]
+    fn the_faucet_budget_is_per_epoch_and_resets_on_the_ledgers_epoch_boundary() {
+        let budget = 100 * UNITS_PER_RAND;
+        let mut l = ledger();
+        l.set_epoch_blocks(10);
+        l.set_staking(Some(StakingConfig { faucet_budget_per_epoch: budget, bond_activation_epochs: 0 }));
+        let (a, _) = keys();
+        let mint = |l: &Ledger, seed: u32, amount: u64| {
+            Transaction::mint(7, [seed; 8], l.height() as u32, [seed + 1; 8], env(), amount, &a, &StubExecutor)
+        };
+        let t = mint(&l, 10, 60 * UNITS_PER_RAND);
+        l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
+        assert_eq!(l.faucet_epoch_counters(), (0, 60 * UNITS_PER_RAND));
+        let over = mint(&l, 20, 50 * UNITS_PER_RAND);
+        let e = l.validate(&over, &StubExecutor).unwrap_err();
+        assert!(matches!(e, TxError::FaucetBudgetExhausted { budget: b, minted } if b == budget && minted == 60 * UNITS_PER_RAND), "{e:?}");
+        let before = l.clone();
+        assert_eq!(l.apply_tx(&over, &a.address(), &StubExecutor), Err(e));
+        assert_eq!(l, before, "a refused mint leaves the ledger untouched");
+        // Exactly the budget is admitted (the bound is `>`), one unit more is not — still epoch 0
+        // in its last block.
+        l.set_height(9);
+        let exact = mint(&l, 30, 40 * UNITS_PER_RAND);
+        l.apply_tx(&exact, &a.address(), &StubExecutor).unwrap();
+        assert_eq!(l.faucet_epoch_counters(), (0, budget));
+        let one = mint(&l, 40, 1);
+        assert!(matches!(l.validate(&one, &StubExecutor), Err(TxError::FaucetBudgetExhausted { minted, .. }) if minted == budget));
+        // Height 10 is epoch 1: the counter resets on the ledger's boundary and the refused
+        // transaction is admitted again.
+        l.set_height(10);
+        assert_eq!(l.epoch(), 1);
+        assert_eq!(l.validate(&over, &StubExecutor), Ok(()), "the same bytes, admitted an epoch later");
+        l.apply_tx(&over, &a.address(), &StubExecutor).unwrap();
+        assert_eq!(l.faucet_epoch_counters(), (1, 50 * UNITS_PER_RAND));
+        assert_eq!(l.supply().faucet_minted, 150 * UNITS_PER_RAND, "the supply counter is the running total");
+    }
+
+    /// The two epoch counters and the validator's activation epoch are consensus state on a
+    /// chain with the section — folded into the state root under `rand-state-5` and the
+    /// `rand-validator-leaf-4` leaf — and reach nothing without it.
+    #[test]
+    fn the_counters_and_the_activation_epoch_reach_the_root_only_under_the_staking_section() {
+        let cfg = StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2 };
+        // The counters.
+        let plain = ledger();
+        let mut counted = plain.clone();
+        counted.set_faucet_epoch_counters(3, 7);
+        assert_eq!(counted.state_root(), plain.state_root(), "without the section the counters are outside the root");
+        assert_ne!(counted, plain, "but they are still compared: a reloaded node must restore them");
+        let mut gated = plain.clone();
+        gated.set_staking(Some(cfg.clone()));
+        assert_ne!(gated.state_root(), plain.state_root(), "the section re-domains the root");
+        let mut gated_counted = gated.clone();
+        gated_counted.set_faucet_epoch_counters(3, 7);
+        assert_ne!(gated_counted.state_root(), gated.state_root(), "under it the counters are in the root");
+        let mut other_epoch = gated.clone();
+        other_epoch.set_faucet_epoch_counters(4, 7);
+        assert_ne!(other_epoch.state_root(), gated_counted.state_root());
+        // The activation epoch.
+        let (a, b) = keys();
+        let root_of = |activation: u64, staking: Option<StakingConfig>| {
+            let mut register: BTreeMap<Address, ValidatorEntry> = [entry(&a, 10), entry(&b, 10)].into_iter().collect();
+            register.get_mut(&a.address()).unwrap().activation_epoch = activation;
+            let mut l = Ledger::new(7, HC, register, &StubExecutor);
+            l.set_staking(staking);
+            l.state_root()
+        };
+        assert_eq!(root_of(0, None), root_of(5, None), "without the section the activation epoch is outside the leaf");
+        assert_ne!(root_of(0, Some(cfg.clone())), root_of(5, Some(cfg.clone())), "under it the leaf binds it");
+        assert_ne!(root_of(0, Some(cfg)), root_of(0, None));
     }
 }

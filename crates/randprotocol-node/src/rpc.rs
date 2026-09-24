@@ -2329,6 +2329,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "rand_getSupply" => {
             let height = st.storage.head().map_err(RpcError::internal)?.height;
             let supply = st.storage.supply().map_err(RpcError::internal)?;
+            let (faucet_epoch, faucet_minted_in_epoch) = st.storage.faucet_epoch_counters().map_err(RpcError::internal)?;
             let register = st.storage.register().map_err(RpcError::internal)?;
             let aggregators = st.storage.aggregators().map_err(RpcError::internal)?;
             // The register's two halves, exactly `Ledger::audit`'s: the aggregator register's
@@ -2342,6 +2343,11 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "genesis_deposited": supply.genesis_deposited.to_string(),
                 "genesis_staked": supply.genesis_staked.to_string(),
                 "faucet_minted": supply.faucet_minted.to_string(),
+                // Audit v4, STAKE-2: the faucet's per-epoch pair — the epoch the counter is for
+                // and what the faucet minted in it. `(0, 0)` on a chain without a `staking`
+                // section, where no budget applies. Decimal strings like the rest of this object.
+                "faucet_epoch": faucet_epoch.to_string(),
+                "faucet_minted_in_epoch": faucet_minted_in_epoch.to_string(),
                 "withdraw_deposited": supply.withdraw_deposited.to_string(),
                 "fees_paid": supply.fees_paid.to_string(),
                 "burned": supply.burned.to_string(),
@@ -2424,7 +2430,7 @@ mod tests {
             epoch: 0,
             epoch_blocks: gs.epoch_blocks,
             current: gs.validators.iter().map(|v| v.address()).collect(),
-            next: gs.ledger.derive_next_set().iter().map(|v| v.address()).collect(),
+            next: gs.ledger.derive_next_set(1).iter().map(|v| v.address()).collect(),
         };
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
@@ -3463,6 +3469,7 @@ mod tests {
                     rewards: 11,
                     payout: payout.clone(),
                     nonce: 3,
+                    activation_epoch: 0,
                 },
             )
             .unwrap();

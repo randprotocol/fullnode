@@ -118,6 +118,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         }),
         aggregation: None,
         consensus_domain: fixture_domain(),
+        staking: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -1266,6 +1267,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         tokens: None,
         aggregation: None,
         consensus_domain: fixture_domain(),
+        staking: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -1627,7 +1629,7 @@ fn an_epoch_whose_register_empties_carries_the_previous_set_forward() {
     for k in 0..3 {
         ledger.apply_block(&sim.committed[0][k].block, &StubExecutor).expect("replay");
     }
-    assert!(ledger.derive_next_set().is_empty(), "the register after block 3 has nobody above the minimum");
+    assert!(ledger.derive_next_set(1).is_empty(), "the register after block 3 has nobody above the minimum");
 
     let b3 = sim.block_at(0, 3);
     let epoch1 = sim.nodes[0].set_for_height(4, &b3.hash()).expect("epoch 1 falls back to epoch 0");
@@ -1725,6 +1727,7 @@ fn aggregation_node_with(
         tokens: None,
         aggregation: Some(cfg.clone()),
         consensus_domain: None,
+        staking: None,
     };
     let mut gs = genesis.build(&StubExecutor).unwrap();
     // Register the aggregator directly on the genesis ledger the node builds on (the register

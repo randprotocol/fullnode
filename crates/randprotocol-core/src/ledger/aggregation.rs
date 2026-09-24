@@ -850,6 +850,7 @@ mod tests {
                 rewards: 0,
                 payout: crate::notes::ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
                 nonce: 0,
+                activation_epoch: 0,
             },
         )
     }
@@ -1125,6 +1126,7 @@ mod tests {
             tokens: None,
             aggregation: None,
             consensus_domain: None,
+            staking: None,
             epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
             max_proof_bytes: None,
@@ -1227,6 +1229,7 @@ mod register_tests {
                 rewards: 0,
                 payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
                 nonce: 0,
+                activation_epoch: 0,
             },
         )
     }
@@ -1551,6 +1554,7 @@ mod admission_tests {
                 rewards: 0,
                 payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
                 nonce: 0,
+                activation_epoch: 0,
             },
         )
     }
@@ -2051,6 +2055,7 @@ mod payment_tests {
                 rewards: 0,
                 payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
                 nonce: 0,
+                activation_epoch: 0,
             },
         )
     }

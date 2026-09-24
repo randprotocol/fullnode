@@ -166,6 +166,13 @@ const META_SUPPLY: &str = "supply";
 /// is computed from it: a restarted node that lost it would disagree with its peers about the
 /// very next aggregate's state root.
 const META_UNSEALED_FEES: &str = "unsealed_fees";
+/// `bincode((u64, u64))`: the faucet's `(epoch, minted_in_epoch)` as of the head (audit v4,
+/// STAKE-2 rule 2, `Ledger::faucet_epoch_counters`). `META_SUPPLY`'s twin in where it is written
+/// — the same three sites — and `META_AGGREGATORS`'s in kind: on a chain with a `staking`
+/// section it is hashed into the state root, so a restarted node that lost it would fork at its
+/// next mint. Absent on a database written before the key existed and on every chain without
+/// the section, where it reads `(0, 0)` — which is what the ledger holds there too.
+const META_FAUCET_EPOCH: &str = "faucet_epoch";
 /// `bincode(BTreeMap<Address, AggregatorEntry>)`: the aggregator register as of the head.
 /// `META_SUPPLY`'s twin in kind — derived, replay-audited — but unlike the bucket this one is
 /// hashed into the state root, so a restarted node that lost it would fork at the next block.
@@ -244,6 +251,42 @@ pub struct Storage {
 pub struct DroppedReceiptsIndex {
     pub family: bool,
     pub marker: bool,
+}
+
+/// A stored validator row, in either of its two shapes. Audit v4 (STAKE-2 rule 3) appended
+/// `activation_epoch` as the last field of `ValidatorEntry`; every row chain 14's fleet wrote
+/// before that lacks it, and bincode is not self-describing, so the current shape fails on such a
+/// row with an early end. The fallback reads the previous shape and fills the field with 0 —
+/// exactly what a genesis validator or a pre-section bond holds, and what the v2 leaf hashed. The
+/// other direction needs no code: a row the current build writes is the old row plus eight
+/// trailing bytes, which the old build's `bincode::deserialize` ignores, so re-pinning the
+/// previous build still opens the database (the same-chain roll's rollback path). A row that is
+/// neither shape is the corruption it always was.
+fn decode_validator(bytes: &[u8]) -> Result<ValidatorEntry> {
+    #[derive(serde::Deserialize)]
+    struct PreActivationEntry {
+        public_key: randprotocol_core::crypto::PublicKey,
+        stake: u64,
+        pending: Vec<(u64, u64)>,
+        rewards: u64,
+        payout: randprotocol_core::notes::ShieldedAddress,
+        nonce: u64,
+    }
+    match bincode::deserialize::<ValidatorEntry>(bytes) {
+        Ok(entry) => Ok(entry),
+        Err(current) => match bincode::deserialize::<PreActivationEntry>(bytes) {
+            Ok(e) => Ok(ValidatorEntry {
+                public_key: e.public_key,
+                stake: e.stake,
+                pending: e.pending,
+                rewards: e.rewards,
+                payout: e.payout,
+                nonce: e.nonce,
+                activation_epoch: 0,
+            }),
+            Err(_) => Err(current.into()),
+        },
+    }
 }
 
 fn height_key(h: u64) -> [u8; 8] {
@@ -506,6 +549,7 @@ impl Storage {
         // derived and written when its first block commits.
         batch.put_cf(self.cf(CF_EPOCH_SETS), height_key(0), bincode::serialize(&gs.validators)?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&gs.ledger.supply())?);
+        batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&gs.ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
@@ -744,7 +788,10 @@ impl Storage {
     }
 
     pub fn validator(&self, a: &Address) -> Result<Option<ValidatorEntry>> {
-        self.get(CF_VALIDATORS, a.as_bytes())
+        match self.db.get_cf(self.cf(CF_VALIDATORS), a.as_bytes())? {
+            Some(bytes) => Ok(Some(decode_validator(&bytes)?)),
+            None => Ok(None),
+        }
     }
 
     /// The whole register, in address order.
@@ -771,7 +818,7 @@ impl Storage {
                 .as_ref()
                 .try_into()
                 .map_err(|_| StorageError::Corrupt("validator key has wrong length".into()))?;
-            out.insert(Address(arr), bincode::deserialize::<ValidatorEntry>(&v)?);
+            out.insert(Address(arr), decode_validator(&v)?);
         }
         Ok(out)
     }
@@ -796,6 +843,13 @@ impl Storage {
     /// rewrites them from the replay.
     pub fn supply(&self) -> Result<Supply> {
         Ok(self.get_meta_raw(META_SUPPLY)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    /// The faucet's `(epoch, minted_in_epoch)` as of the head (audit v4, STAKE-2) — `supply()`'s
+    /// twin, with the same rule for a database written before the key existed: `(0, 0)`, which
+    /// on a chain without a `staking` section is also the only value it ever holds.
+    pub fn faucet_epoch_counters(&self) -> Result<(u64, u64)> {
+        Ok(self.get_meta_raw(META_FAUCET_EPOCH)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
     }
 
     /// The proving-share bucket as of the head — `supply()`'s twin, with the same rule for a
@@ -1363,6 +1417,8 @@ impl Storage {
         let mut ledger =
             Ledger::from_parts(chain_id, hc_bundle, tree, commitments, nullifiers, anchors, validators, programs);
         ledger.set_supply(self.supply()?);
+        let (faucet_epoch, faucet_minted) = self.faucet_epoch_counters()?;
+        ledger.set_faucet_epoch_counters(faucet_epoch, faucet_minted);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
         ledger.set_aggregation(self.aggregation_config()?);
@@ -1672,6 +1728,7 @@ impl Storage {
         }
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger_after.tree())?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger_after.supply())?);
+        batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger_after.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger_after.tokens().cloned())?);
@@ -1838,7 +1895,7 @@ impl Storage {
                 // when the register derives nothing.
                 let epoch = h / epoch_blocks;
                 if h % epoch_blocks == 0 {
-                    let mut derived = ledger.derive_next_set();
+                    let mut derived = ledger.derive_next_set(epoch);
                     if derived.is_empty() {
                         derived = sets
                             .get(&(epoch - 1))
@@ -1947,6 +2004,17 @@ impl Storage {
         // tree, the commitment and nullifier sets, the anchors, the validators and the programs
         // — everything these families hold.
         match self.load_ledger(executor) {
+            // The faucet's epoch counters (audit v4, STAKE-2) are inside `Ledger`'s equality —
+            // hashed into the root on a chain with a `staking` section — so a stale pair would
+            // otherwise surface as the generic snapshot mismatch below. Named first, so the
+            // repair knows which key to rewrite from the replay.
+            Ok(stored) if stored.faucet_epoch_counters() != ledger.faucet_epoch_counters() => {
+                check.problem = Some(format!(
+                    "stored faucet epoch counters {:?} do not match the replayed chain's {:?}",
+                    stored.faucet_epoch_counters(),
+                    ledger.faucet_epoch_counters()
+                ))
+            }
             // The supply counters are outside `Ledger`'s equality (nothing hashes them), so they
             // are audited here explicitly: this is the replay the RPC's numbers are worth.
             Ok(stored) if stored == ledger && stored.supply() != ledger.supply() => {
@@ -2084,6 +2152,7 @@ impl Storage {
         }
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger.tree())?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger.supply())?);
+        batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger.tokens().cloned())?);
@@ -2223,6 +2292,7 @@ pub(crate) mod fixtures {
             tokens: None,
             aggregation: None,
             consensus_domain: None,
+            staking: None,
             epoch_blocks,
             max_program_words: None,
             max_proof_bytes: None,
@@ -2306,6 +2376,7 @@ pub(crate) mod fixtures {
             }),
             aggregation: None,
             consensus_domain: None,
+            staking: None,
             epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
             max_proof_bytes: None,
@@ -3853,7 +3924,7 @@ mod tests {
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
         // Block 2 opens epoch 1, whose set the register now derives as validator 1 alone.
-        let epoch1 = ledger.derive_next_set();
+        let epoch1 = ledger.derive_next_set(1);
         assert_eq!(epoch1.len(), 1, "validator 2 unbonded out of the set");
         assert_eq!(epoch1.leader(2), key(1).address());
         ledger.set_height(2);
@@ -3926,7 +3997,7 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![], leader_among(&gs.validators, 1, &both));
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         // Nobody unbonded, so epoch 1's set is still both validators.
-        let epoch1 = ledger.derive_next_set();
+        let epoch1 = ledger.derive_next_set(1);
         ledger.set_height(2);
         let b2 = make_block(&b1.block, &mut ledger, vec![], leader_among(&epoch1, 2, &both));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
@@ -4715,6 +4786,118 @@ mod tests {
         oversized.resize(randprotocol_core::gas::MAX_ATTESTATION_BYTES + 1, 0);
         assert_eq!(derived_note_count(&with_attestation(oversized)), 0);
     }
+
+    /// A genesis with the audit-v4 `staking` section (STAKE-2) on a faucet chain.
+    fn staking_genesis(budget: u64) -> GenesisState {
+        let mut g = genesis_file_of(7, &[&key(1)], vec![], 2);
+        g.staking = Some(randprotocol_core::genesis::StakingConfig { faucet_budget_per_epoch: budget, bond_activation_epochs: 1 });
+        g.build(&StubExecutor).unwrap()
+    }
+
+    /// Audit v4, STAKE-2 rule 2: the faucet's two epoch counters are consensus state on a
+    /// chain with the section, so they are persisted beside `META_SUPPLY` on every commit,
+    /// restored by `load_ledger`, and audited by `verify_chain`'s replay — a node that came
+    /// back with a stale pair would compute a different `rand-state-5` root from its next mint.
+    #[test]
+    fn the_faucet_epoch_counters_are_persisted_beside_the_supply_restored_and_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let rand = randprotocol_core::UNITS_PER_RAND;
+        let gs = staking_genesis(100 * rand);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.faucet_epoch_counters().unwrap(), (0, 0));
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap().faucet_epoch_counters(), (0, 0));
+
+        // Block 1 (epoch 0) mints 60; block 2 opens epoch 1 and mints 70 — over the budget
+        // had the counter not reset on the ledger's boundary.
+        let mut ledger = gs.ledger.clone();
+        let b1 = make_block(&gs.block, &mut ledger, vec![mint_tx(7, [21; 8], 60 * rand, &key(1))], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(ledger.faucet_epoch_counters(), (0, 60 * rand));
+        assert_eq!(s.faucet_epoch_counters().unwrap(), (0, 60 * rand), "committed with the state");
+        let epoch1 = ledger.derive_next_set(1);
+        let b2 = make_block(&b1.block, &mut ledger, vec![mint_tx(7, [22; 8], 70 * rand, &key(1))], &key(1));
+        s.commit(std::slice::from_ref(&b2), &ledger, &[(1, epoch1)], &StubExecutor).unwrap();
+        assert_eq!(ledger.faucet_epoch_counters(), (1, 70 * rand));
+        assert_eq!(s.faucet_epoch_counters().unwrap(), (1, 70 * rand));
+
+        // Restored, and the reloaded ledger (the gate re-set from genesis) hashes the same root.
+        let loaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(loaded.faucet_epoch_counters(), (1, 70 * rand));
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.staking(), gs.ledger.staking());
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A stale pair is named by the audit, not folded into a generic snapshot mismatch.
+        s.db.put_cf(s.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&(1u64, 60 * rand)).unwrap()).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("a stale counter is a problem");
+        assert!(problem.contains("faucet epoch counters"), "{problem}");
+        assert_eq!(check.last_good, 2, "the blocks themselves are fine");
+        // The repair rewrites them from the replay (`truncate_to` at the head).
+        s.truncate_to(&gs, 2, &check.ledger).unwrap();
+        assert_eq!(s.faucet_epoch_counters().unwrap(), (1, 70 * rand));
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+        // A database written before the key existed reads as `(0, 0)`, like the supply.
+        s.db.delete_cf(s.cf(CF_META), META_FAUCET_EPOCH).unwrap();
+        assert_eq!(s.faucet_epoch_counters().unwrap(), (0, 0));
+    }
+
+    /// STAKE-2 rule 3 added `activation_epoch` as the last field of the stored validator row.
+    /// Every row on chain 14's fleet was written without it: the new build must read those
+    /// (as 0 — a genesis validator's or an old bond's value), and the row it writes back is
+    /// readable by the old build, whose `bincode::deserialize` ignores trailing bytes — the
+    /// same-chain roll's rollback path.
+    #[test]
+    fn a_validator_row_stored_before_the_activation_epoch_decodes_as_zero() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct LegacyEntry {
+            public_key: randprotocol_core::crypto::PublicKey,
+            stake: u64,
+            pending: Vec<(u64, u64)>,
+            rewards: u64,
+            payout: randprotocol_core::notes::ShieldedAddress,
+            nonce: u64,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![], 2);
+        s.init_genesis(&gs).unwrap();
+        let old = key(2);
+        let legacy = LegacyEntry {
+            public_key: old.public_key().clone(),
+            stake: 700,
+            pending: vec![(4, 250)],
+            rewards: 11,
+            payout: payout(2),
+            nonce: 3,
+        };
+        s.db.put_cf(s.cf(CF_VALIDATORS), old.address().as_bytes(), bincode::serialize(&legacy).unwrap()).unwrap();
+        let expected = ValidatorEntry {
+            public_key: old.public_key().clone(),
+            stake: 700,
+            pending: vec![(4, 250)],
+            rewards: 11,
+            payout: payout(2),
+            nonce: 3,
+            activation_epoch: 0,
+        };
+        assert_eq!(s.validator(&old.address()).unwrap(), Some(expected.clone()), "the single-row read");
+        assert_eq!(s.register().unwrap()[&old.address()], expected, "and the whole-register read");
+        assert_eq!(s.register().unwrap().len(), 2);
+        // The new shape is what the current build writes, and the old build reads it back: the
+        // trailing eight bytes are ignored by `bincode::deserialize`.
+        let new_bytes = bincode::serialize(&expected).unwrap();
+        assert_eq!(new_bytes.len(), bincode::serialize(&legacy).unwrap().len() + 8);
+        assert_eq!(bincode::deserialize::<LegacyEntry>(&new_bytes).unwrap(), legacy);
+        // A row that is neither shape is still corrupt, not silently zeroed.
+        s.db.put_cf(s.cf(CF_VALIDATORS), old.address().as_bytes(), &new_bytes[..new_bytes.len() - 12]).unwrap();
+        assert!(s.validator(&old.address()).is_err());
+        assert!(s.register().is_err());
+    }
+
 }
 
 // ── sealing and pruning (block aggregation, spec §6) ─────────────────────────────────────────

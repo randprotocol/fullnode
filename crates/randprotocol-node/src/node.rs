@@ -151,6 +151,10 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // The aggregation gate lives in the genesis file too: without this a restarted chain-9 node
     // would compute state-2 roots and refuse every aggregation action by name.
     ledger.set_aggregation(gs.ledger.aggregation().cloned());
+    // The staking gate (audit v4, STAKE-2) lives there too: without this a restarted node would
+    // compute `rand-state-2` roots against peers on `rand-state-5`, refuse nothing the faucet
+    // budget refuses and seat a bond an epoch early — a fork at its first restart.
+    ledger.set_staking(gs.ledger.staking().cloned());
     // The program cap too (v0.4 `max_program_words`): `load_ledger` comes back at the 4 096-word
     // default, and a node that kept it would refuse deploys its peers admit — a fork at the
     // first large program after its first restart.
@@ -1489,7 +1493,7 @@ impl Node {
                     // What the register would produce if this epoch ended now; an empty
                     // derivation is reported as empty rather than as the carry-forward
                     // consensus would apply, because that is what the register says.
-                    next: tip.derive_next_set().iter().map(|v| v.address()).collect(),
+                    next: tip.derive_next_set(tip.epoch() + 1).iter().map(|v| v.address()).collect(),
                 });
             }
             NodeCommand::MempoolInfo { reply } => {
@@ -2037,7 +2041,7 @@ impl Node {
             if b.height() % epoch_blocks == 0 && b.height() > 0 {
                 // `ledger` is the state after this block's parent, which is the last block of
                 // the previous epoch: exactly what the set is derived from.
-                let mut derived = ledger.derive_next_set();
+                let mut derived = ledger.derive_next_set(epoch);
                 if derived.is_empty() {
                     // The same carry-forward consensus does when every validator has unbonded
                     // below the minimum: an epoch with no leader is a halt nothing can end.
@@ -2283,7 +2287,7 @@ mod tests {
         let b1 = make_block_voted(&gs.block, &mut ledger, vec![tx], &key(1), &[&key(1)]);
         storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
-        let epoch1 = ledger.derive_next_set();
+        let epoch1 = ledger.derive_next_set(1);
         ledger.set_height(2);
         let tx = bundle_tx(&ledger, [[5; 8], [6; 8]], [[7; 8], [8; 8]], bundle_fee());
         let b2 = make_block_voted(&b1.block, &mut ledger, vec![tx], &key(1), &[&key(1)]);
@@ -2474,6 +2478,29 @@ mod tests {
             gs.ledger.state_root(),
             "the reloaded ledger hashes the gated state-3 root, not state-2"
         );
+    }
+
+    /// The staking gate (audit v4, STAKE-2) survives a restart the same way: it lives in the
+    /// genesis file, `load_ledger` comes back without it, and a node that kept running without
+    /// it would compute `rand-state-2` roots against peers on `rand-state-5`, refuse nothing the
+    /// budget refuses and seat bonds an epoch early — a fork at its first restart.
+    #[test]
+    fn a_restart_restores_the_staking_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut g = crate::storage::fixtures::genesis_file_of(7, &[&key(1)], vec![], 2);
+        let cfg = randprotocol_core::genesis::StakingConfig {
+            faucet_budget_per_epoch: 100 * randprotocol_core::UNITS_PER_RAND,
+            bond_activation_epochs: 2,
+        };
+        g.staking = Some(cfg.clone());
+        let gs = g.build(&StubExecutor).unwrap();
+        storage.init_genesis(&gs).unwrap();
+        assert!(storage.load_ledger(&StubExecutor).unwrap().staking().is_none(), "storage does not hold the gate");
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.staking(), Some(&cfg));
+        assert_eq!(reloaded.state_root(), gs.ledger.state_root(), "the reloaded ledger hashes the gated state-5 root");
+        assert_eq!(reloaded, gs.ledger);
     }
 
     /// The program cap survives a restart the same way: it lives in the genesis file, and

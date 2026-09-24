@@ -258,6 +258,7 @@ mod tests {
             rewards: 0,
             payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
             nonce: 0,
+            activation_epoch: 0,
         };
         let mut l = Ledger::new(chain_id, HC, [(k.address(), entry)].into_iter().collect(), &StubExecutor);
         let secrets: Vec<[u8; 32]> = (1u8..=6).map(|i| [i; 32]).collect();

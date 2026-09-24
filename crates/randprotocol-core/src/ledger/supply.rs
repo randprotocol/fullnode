@@ -175,6 +175,7 @@ mod tests {
             rewards,
             payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
             nonce: 0,
+            activation_epoch: 0,
         }
     }
 

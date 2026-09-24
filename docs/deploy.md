@@ -160,6 +160,25 @@ The audit-v4 release (v0.5.4) added consensus rules that are switched on by gene
   other. Absent or `0` is chain 14's behaviour; `2` and up are refused by `rand-node init`. The
   field is a top-level genesis key beside `epoch_blocks`; the cut script splices it in the way it
   splices the `bridge` section, since `rand-node genesis` writes today's shape.
+## The `staking` genesis section (v0.5.4)
+
+Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and
+the rule that a faucet and a bridge exclude each other. Genesis-gated — `rand-node genesis` never
+writes it, so a file without it (chain 14's) hashes byte-for-byte as before; the cut script splices
+it in beside the `bridge` section, and `rand-node init` on the finished file prints the hash that
+matters:
+
+```json
+"staking": { "faucet_budget_per_epoch": "100000000000", "bond_activation_epochs": 2 }
+```
+
+`faucet_budget_per_epoch` is in RAND's base unit as a decimal string (100 RAND above — one `Mint`'s
+worth per 1000-block epoch); `bond_activation_epochs` is how many whole epochs a new bond waits
+past the boundary it would have joined at (0 = today's rule). On a bridged chain set
+`faucet: false` — a faucet beside a bridge is refused at `init` once the section is present. The
+section moves the state root domain to `rand-state-5` and the validator leaf to
+`rand-validator-leaf-4`, so it ships with a chain cut, never as a same-chain update; a node
+restores it from the genesis file on every restart (`reload_ledger`), never from the database.
 
 ## Chain 9 activation (block aggregation)
 

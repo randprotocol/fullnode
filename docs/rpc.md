@@ -760,9 +760,17 @@ Params: `[]`. Result:
 ```json
 { "height": 1998,
   "genesis_deposited": "…", "genesis_staked": "…", "faucet_minted": "…",
+  "faucet_epoch": "…", "faucet_minted_in_epoch": "…",
   "withdraw_deposited": "…", "fees_paid": "…", "burned": "…",
   "pool_value": "…", "register_total": "…", "total_supply": "…", "invariant_holds": true }
 ```
+
+`faucet_epoch` and `faucet_minted_in_epoch` (v0.5.4, audit v4 STAKE-2) are the faucet's per-epoch
+pair: the epoch the counter is for and what the faucet minted in it, against the genesis
+`staking.faucet_budget_per_epoch`. Both are decimal strings like the rest of this object, and both
+read `"0"` on a chain without a `staking` section (chain 14), where no budget applies. On a chain
+with one they are consensus state — in the state root and replayed by `rand-node verify` — not a
+derived count like the rest.
 
 The supply audit. Note values are hidden, but every crossing of the pool's boundary is public, so
 these are exact: value enters the pool as a genesis deposit, a faucet mint or a validator's
@@ -1199,6 +1207,14 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-24 — v0.5.4
+
+- **`rand_getSupply` gains `faucet_epoch` and `faucet_minted_in_epoch`** (decimal strings): the
+  faucet's per-epoch counter under the genesis `staking` section (audit v4 STAKE-2,
+  `docs/staking.md` §2). `"0"` and `"0"` on chain 14, which has no section. A `Mint` over the
+  epoch's budget is refused `FaucetBudgetExhausted` — a state verdict, never cached as permanent,
+  so `rand_getTransactionStatus` reads `unknown`, not `rejected`, once it leaves the pool.
 
 ### 2026-09-21 — wallets compute their own witnesses
 

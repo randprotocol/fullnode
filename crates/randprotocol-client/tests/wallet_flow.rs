@@ -94,6 +94,7 @@ fn genesis_full(
         tokens,
         aggregation: None,
         consensus_domain: None,
+        staking: None,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words,
         max_proof_bytes: None,

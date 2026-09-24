@@ -622,6 +622,9 @@ mod tests {
             TxError::CommitmentExists([2; 8]),
             TxError::UnknownProgram(Hash::ZERO),
             TxError::MinterNotValidator(Address([3; 32])),
+            // Audit v4, STAKE-2: the faucet budget is per epoch, and the next epoch admits the
+            // very same bytes again — a cached refusal would censor the faucet for good.
+            TxError::FaucetBudgetExhausted { budget: 100, minted: 100 },
         ] {
             assert!(!is_permanent(&e), "{e} depends on state and must not be cached");
         }
