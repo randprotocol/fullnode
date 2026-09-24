@@ -48,13 +48,24 @@ lost quorum at height 248 953): a testnet-only node keeps one day of blocks and 
   doesn't hold — only an archive can say "pruned" from "never existed". `rand_status` gains
   `prune_floor` (u64) and `prune_history_secs` (`null` when unset).
 
-**Roll (operator, not yet run):** archive first — move obs1's datadir to a volume before
-anything else touches the flag. Then one validator at a time, `PRUNE_ARGS="--prune-history 24h"`
-through `update-droplet.sh`/`run-a.sh`, waiting for `rand_status.height` to reach the head and
-one more block before the next. **Measure the first rolled validator's pass duration before
-continuing**: a first pass over a backlog is awaited synchronously in the node's post-commit
-loop up to `PRUNE_PASS_MAX = 4096` blocks, so a validator holding much more than a day of
-history could stall its own commits for the pass's duration on the very first activation.
+**Roll (operator, not yet run), in order:**
+
+1. **Archive first.** Move obs1's (randbridge-web) datadir onto a volume, no flag, before
+   anything else touches the flag; confirm `rand_status.prune_floor == 0` and the head still
+   follows the fleet.
+2. **Wait until the chain is committing again.** Never roll a wire change onto a halted chain.
+3. **The seventeen droplets, one at a time**, built on E from the tagged commit:
+   `PRUNE_ARGS="--prune-history 24h" deploy/update-droplet.sh <ip>`, waiting for
+   `rand_status.height` to reach the head and one more block to commit before the next. **Measure
+   the first rolled validator's pass duration in its log before continuing**: a first pass over a
+   backlog is awaited synchronously in the node's post-commit loop up to
+   `PRUNE_PASS_MAX = 4096` blocks, so a validator holding much more than a day of history could
+   stall its own commits for the pass's duration on that first activation.
+4. **Node A last**, separately: `BINDIR`/`PRUNE_ARGS="--prune-history 24h"` in `run-a.sh`'s
+   environment, then `launchctl kill TERM gui/$(id -u)/org.randprotocol.node-a`.
+5. **Verify:** every validator's `prune_floor` rising, `du -ch db/*.sst` falling and flat, obs1
+   answers `rand_getBlockByHeight(1000)` while a validator answers `-32010`, a fresh observer
+   synced from obs1 reaches the head.
 
 ### v0.5.6 — the deep security-and-math scan (2026-09-25)
 
