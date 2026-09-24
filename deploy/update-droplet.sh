@@ -19,7 +19,18 @@ BIN_WALLET=${BIN_WALLET:-rand}
 BUILD_DIR=${BUILD_DIR:-/root/fullnode/target/release}
 SSH="ssh -A -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$IP"
 
-WANT=$(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$BUILD_HOST "sha256sum $BUILD_DIR/$BIN_NODE | cut -d' ' -f1")
+# The sha the copy must match. Pass WANT_SHA (the sha256 the release tag's annotation names) so the
+# check is against the release, not against whatever the build host currently holds: a compromised
+# build host would otherwise pass its own binary through "sha matches the build host" every time
+# (deep scan 2026-09-24). Without WANT_SHA the old behaviour stands, with a warning.
+if [ -n "${WANT_SHA:-}" ]; then
+  WANT=$WANT_SHA
+  HOST_HAS=$(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$BUILD_HOST "sha256sum $BUILD_DIR/$BIN_NODE | cut -d' ' -f1")
+  [ "$HOST_HAS" = "$WANT" ] || { echo "$BUILD_HOST holds ${HOST_HAS:0:12}, not the release's ${WANT:0:12} — not rolling" >&2; exit 1; }
+else
+  echo "warning: no WANT_SHA — trusting $BUILD_HOST's own sha; pass the tag's sha256 for a release roll" >&2
+  WANT=$(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$BUILD_HOST "sha256sum $BUILD_DIR/$BIN_NODE | cut -d' ' -f1")
+fi
 HAVE=$($SSH "sha256sum /usr/local/bin/$BIN_NODE | cut -d' ' -f1")
 if [ "$WANT" = "$HAVE" ]; then echo "$IP: already on ${WANT:0:8}"; exit 0; fi
 
