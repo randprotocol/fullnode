@@ -3441,6 +3441,15 @@ pub(crate) mod fixtures {
         pub(crate) fn cf_for_test(&self, name: &str) -> &rocksdb::ColumnFamily {
             self.cf(name)
         }
+
+        /// Re-insert a `CF_TXS` location row by hand — the shape of a row `prune_history` could
+        /// not resolve (e.g. its block was pruned around it), for RPC's pruned-height tests.
+        #[cfg(test)]
+        pub(crate) fn put_tx_location_for_test(&self, tx: &Hash, height: u64, index: u32) -> Result<()> {
+            let record = TxRecord::Raw { height, index, tx: self.block_by_height(self.head()?.height)?.unwrap().transactions[0].clone() };
+            self.db.put_cf_opt(self.cf(CF_TXS), tx.as_bytes(), bincode::serialize(&record)?, &sync_opts())?;
+            Ok(())
+        }
     }
 
     pub(crate) fn height_key_for_test(h: u64) -> [u8; 8] {

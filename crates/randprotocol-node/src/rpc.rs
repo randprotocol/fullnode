@@ -394,27 +394,38 @@ fn id_member<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D:
     Value::deserialize(d).map(Some)
 }
 
+#[derive(Debug)]
 struct RpcError {
     code: i64,
     message: String,
+    /// JSON-RPC `error.data`; today only the pruned error carries one (history pruning spec §4).
+    data: Option<Value>,
 }
 
 impl RpcError {
     fn invalid_params(m: impl Into<String>) -> RpcError {
-        RpcError { code: -32602, message: m.into() }
+        RpcError { code: -32602, message: m.into(), data: None }
     }
     /// A request we could not read as a request at all — an oversized or malformed body.
     fn invalid_request(m: impl Into<String>) -> RpcError {
-        RpcError { code: -32600, message: m.into() }
+        RpcError { code: -32600, message: m.into(), data: None }
     }
     fn not_found(m: impl Into<String>) -> RpcError {
-        RpcError { code: -32001, message: m.into() }
+        RpcError { code: -32001, message: m.into(), data: None }
     }
     fn rejected(m: impl Into<String>) -> RpcError {
-        RpcError { code: -32000, message: m.into() }
+        RpcError { code: -32000, message: m.into(), data: None }
     }
     fn internal(m: impl std::fmt::Display) -> RpcError {
-        RpcError { code: -32603, message: m.to_string() }
+        RpcError { code: -32603, message: m.to_string(), data: None }
+    }
+    /// Code `-32010`: the height is below this node's retention floor (history pruning spec §4).
+    fn pruned(h: u64, floor: u64) -> RpcError {
+        RpcError {
+            code: -32010,
+            message: format!("pruned: height {h} is below this node's retention floor {floor}"),
+            data: Some(json!({ "floor": floor })),
+        }
     }
 }
 
@@ -598,7 +609,11 @@ fn require_loopback(st: &RpcState, method: &str) -> Result<(), RpcError> {
 }
 
 fn error_value(id: Value, e: RpcError) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": e.code, "message": e.message } })
+    let mut err = json!({ "code": e.code, "message": e.message });
+    if let Some(d) = &e.data {
+        err["data"] = d.clone();
+    }
+    json!({ "jsonrpc": "2.0", "id": id, "error": err })
 }
 
 /// One request object in, one response object out. Every failure mode — an object that does not
@@ -706,6 +721,20 @@ fn rejection_error(rejection: &axum::extract::rejection::JsonRejection, max_body
         ));
     }
     RpcError::invalid_request(rejection.body_text())
+}
+
+/// The store's retention floor, for the pruned answer (history pruning spec §4).
+fn floor_of(st: &RpcState) -> Result<u64, RpcError> {
+    st.storage.prune_floor().map_err(RpcError::internal)
+}
+
+/// `Err(pruned)` when `h` is below the floor and not genesis.
+fn refuse_pruned(st: &RpcState, h: u64) -> Result<(), RpcError> {
+    let floor = floor_of(st)?;
+    if h != 0 && h < floor {
+        return Err(RpcError::pruned(h, floor));
+    }
+    Ok(())
 }
 
 /// Run a storage read that is not O(1) on the blocking pool, so it cannot stall the tokio
@@ -1540,6 +1569,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             if to < from {
                 return Err(RpcError::invalid_params(format!("to_height {to} is below from_height {from}")));
             }
+            refuse_pruned(st, from)?;
             let to = to.min(from.saturating_add(MAX_COMPACT_BLOCKS - 1));
             let storage = st.storage.clone();
             // Reads every block in the range and scans a slice of the notes family: linear in the
@@ -1873,11 +1903,12 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             match st.storage.tx_location(&h).map_err(RpcError::internal)? {
                 None => Ok(Value::Null),
                 Some((height, index)) => {
-                    let b = st
-                        .storage
-                        .block_by_height(height)
-                        .map_err(RpcError::internal)?
-                        .ok_or_else(|| RpcError::not_found("block missing"))?;
+                    let b = st.storage.block_by_height(height).map_err(RpcError::internal)?.ok_or_else(|| {
+                        match floor_of(st) {
+                            Ok(floor) if height < floor => RpcError::pruned(height, floor),
+                            _ => RpcError::not_found("block missing"),
+                        }
+                    })?;
                     let tx = b.transactions.get(index as usize).ok_or_else(|| RpcError::not_found("tx index"))?;
                     Ok(json!({
                         "height": height,
@@ -1899,11 +1930,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let Some((height, index)) = st.storage.tx_location(&h).map_err(RpcError::internal)? else {
                 return Ok(Value::Null);
             };
-            let b = st
-                .storage
-                .block_by_height(height)
-                .map_err(RpcError::internal)?
-                .ok_or_else(|| RpcError::not_found("block missing"))?;
+            let b = st.storage.block_by_height(height).map_err(RpcError::internal)?.ok_or_else(|| match floor_of(st) {
+                Ok(floor) if height < floor => RpcError::pruned(height, floor),
+                _ => RpcError::not_found("block missing"),
+            })?;
             let tx = b.transactions.get(index as usize).ok_or_else(|| RpcError::not_found("tx index"))?;
             // The action's chain-computed note — a deposit, a token mint or a registration's
             // initial mint, the commitments the wire does not carry — as the notes index
@@ -1942,6 +1972,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         }
         "rand_getBlockByHeight" => {
             let h: u64 = param(p, 0, "height")?;
+            refuse_pruned(st, h)?;
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
             let block = st.storage.block_by_height(h).map_err(RpcError::internal)?;
             Ok(block.map(|b| block_json(&b, tokens.as_ref(), st.executor.as_ref(), &st.storage)).unwrap_or(Value::Null))
@@ -1960,6 +1991,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             if to < from {
                 return Err(RpcError::invalid_params(format!("to_height {to} is below from_height {from}")));
             }
+            refuse_pruned(st, from)?;
             let head = st.storage.head().map_err(RpcError::internal)?.height;
             let to = to.min(head).min(from.saturating_add(MAX_BLOCK_HEADERS - 1));
             let storage = st.storage.clone();
@@ -2269,6 +2301,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 hashes.into_iter().map(|h| Ok((h, storage.tx_location(&h)?))).collect::<crate::storage::Result<Vec<_>>>()
             })
             .await?;
+            let floor = floor_of(st)?;
             let mut out = Vec::with_capacity(located.len());
             for ((h, loc), ps) in located.into_iter().zip(pool) {
                 let h = h.to_hex();
@@ -2280,6 +2313,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                         PoolStatus::Pending => json!({ "hash": h, "status": "pending" }),
                         PoolStatus::Rejected(reason) => {
                             json!({ "hash": h, "status": "rejected", "reason": reason })
+                        }
+                        PoolStatus::Unknown if floor > 0 => {
+                            json!({ "hash": h, "status": "unknown", "floor": floor })
                         }
                         PoolStatus::Unknown => json!({ "hash": h, "status": "unknown" }),
                     },
@@ -2295,6 +2331,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "rand_getFinality" => {
             let v = p.get(0).ok_or_else(|| RpcError::invalid_params("missing param 0"))?;
             if let Some(h) = v.as_u64() {
+                refuse_pruned(st, h)?;
                 return Ok(match st.storage.block_by_height(h).map_err(RpcError::internal)? {
                     Some(b) => json!({ "status": "committed", "height": h, "hash": b.hash().to_hex() }),
                     None => json!({ "status": "unknown" }),
@@ -2434,7 +2471,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             });
             Ok(json!({ "inflation": "0", "subsidy": subsidy, "faucet": faucet }))
         }
-        other => Err(RpcError { code: -32601, message: format!("unknown method {other}") }),
+        other => Err(RpcError { code: -32601, message: format!("unknown method {other}"), data: None }),
     }
 }
 
@@ -5513,5 +5550,62 @@ mod tests {
         let v = health_json(&s);
         assert_eq!(v["status"], "disk_low");
         assert_eq!(v["free_bytes"], "123");
+    }
+
+    /// Twelve timed blocks, pruned to a floor of 10, behind the RPC.
+    fn pruned_state() -> (tempfile::TempDir, RpcState, GenesisState, Vec<randprotocol_core::consensus::CommittedBlock>) {
+        let (dir, st, gs, blocks) = crate::storage::fixtures::timed_chain(12);
+        assert_eq!(st.prune_history(u64::MAX, 10, crate::storage::PRUNE_PASS_MAX).unwrap(), 9);
+        let st = Arc::new(st);
+        let state = state_over(st, &gs);
+        (dir, state, gs, blocks)
+    }
+
+    #[tokio::test]
+    async fn a_pruned_height_answers_32010_with_the_floor_and_an_unknown_height_above_it_does_not() {
+        let (_dir, st, _gs, blocks) = pruned_state();
+        let e = call(&st, "rand_getBlockByHeight", json!([3])).await.unwrap_err();
+        assert_eq!(e.code, -32010);
+        assert_eq!(e.message, "pruned: height 3 is below this node's retention floor 10");
+        assert_eq!(e.data, Some(json!({ "floor": 10 })));
+        assert_eq!(ok(&st, "rand_getBlockByHeight", json!([99])).await, Value::Null);
+        assert!(ok(&st, "rand_getBlockByHeight", json!([11])).await.is_object());
+        // Ranges starting below the floor are refused rather than served empty.
+        assert_eq!(call(&st, "rand_getBlocks", json!([3, 11])).await.unwrap_err().code, -32010);
+        assert_eq!(call(&st, "rand_getCompactBlocks", json!([3, 11])).await.unwrap_err().code, -32010);
+        assert_eq!(ok(&st, "rand_getBlocks", json!([10, 12])).await.as_array().unwrap().len(), 3);
+        // Finality by height, and by a pruned hash (null + floor).
+        assert_eq!(call(&st, "rand_getFinality", json!([3])).await.unwrap_err().code, -32010);
+        let pruned_hash = blocks[2].block.hash().to_hex();
+        let e = call(&st, "rand_getBlockByHash", json!([pruned_hash])).await;
+        assert_eq!(e.unwrap(), Value::Null);
+        // Genesis is never pruned.
+        assert!(ok(&st, "rand_getBlockByHeight", json!([0])).await.is_object());
+    }
+
+    #[tokio::test]
+    async fn a_transaction_whose_block_is_pruned_answers_32010_not_block_missing() {
+        let (_dir, st, _gs, blocks) = pruned_state();
+        let tx = blocks[2].block.transactions[0].hash();
+        // Re-insert the location row by hand: the shape of a row the pass could not resolve.
+        st.storage.put_tx_location_for_test(&tx, 3, 0).unwrap();
+        let e = call(&st, "rand_getTransaction", json!([tx.to_hex()])).await.unwrap_err();
+        assert_eq!(e.code, -32010);
+        assert_eq!(e.data, Some(json!({ "floor": 10 })));
+        let e = call(&st, "rand_checkTransaction", json!([tx.to_hex(), hex::encode([1u8; 32])])).await.unwrap_err();
+        assert_eq!(e.code, -32010);
+        // A hash with no row at all keeps today's null, and status keeps `unknown` with the floor.
+        assert_eq!(ok(&st, "rand_getTransaction", json!([Hash::ZERO.to_hex()])).await, Value::Null);
+        let v = ok(&st, "rand_getTransactionStatus", json!([[Hash::ZERO.to_hex()]])).await;
+        assert_eq!(v[0]["status"], "unknown");
+        assert_eq!(v[0]["floor"], 10);
+    }
+
+    #[tokio::test]
+    async fn rand_status_reports_the_floor_and_the_window() {
+        let (_dir, st, _gs, _blocks) = pruned_state();
+        let v = ok(&st, "rand_status", json!([])).await;
+        assert_eq!(v["prune_floor"], 0, "the status struct is filled by the node loop, absent here");
+        assert!(v.get("prune_history_secs").is_some());
     }
 }
