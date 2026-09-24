@@ -270,8 +270,8 @@ Global options, accepted before or after the subcommand:
 
 | option | env | default | meaning |
 |---|---|---|---|
-| `--rpc <RPC>` | `RAND_RPC` | `http://127.0.0.1:8545` | node JSON-RPC endpoint |
-| `--key <KEY>` | `RAND_KEY` | `wallet.key.json` | spend-key file; the note store lives beside it at `<key>.notes.json` |
+| `--rpc <RPC>` | `RAND_RPC` | `http://127.0.0.1:8545` | node JSON-RPC endpoint, `http` or `https` (the public one is `https://rpc.randprotocol.org`) |
+| `--key <KEY>` | `RAND_KEY` | `wallet.key.json` | spend-key file; the note store lives beside it at `<key>.notes.json`. The store is bound to the chain it was scanned against (its `genesis` field, the node's `rand_getGenesisHash`): pointed at a node on another chain — a wallet file kept across a chain cut — it is emptied and rescanned from leaf 0 with a warning, never scanned from a cursor past the new chain's tree. A store written before the binding existed is rescanned once, the same way |
 
 | command | arguments | behaviour |
 |---|---|---|
@@ -279,7 +279,7 @@ Global options, accepted before or after the subcommand:
 | `address` | | print this wallet's `rand1…` shielded address |
 | `viewing-key` | | print this wallet's viewing key `nk`, 64 hex — the parameter `rand_importViewingKey` takes. It reads every note the wallet has sent or received and spends none; derived from the spend key on each run, never stored |
 | `balance` | | scan the tree, save the store, print spendable value and the unspent note count |
-| `sync` | | scan without printing a balance; prints how far it got |
+| `sync` | | scan without printing a balance; prints how far it got. A first sync reads every block header (1024 a call) before the leaves |
 | `notes` | | every note this wallet has opened: index, `asset`, amount, height, `spent`, `pending` |
 | `asset-balance [INDEX]` | | scan, then print what this wallet holds in one bridged asset, or a row per asset held; amounts are in the asset's own smallest unit |
 | `history` | | every note this wallet created for someone else, opened through its own outgoing viewing key |

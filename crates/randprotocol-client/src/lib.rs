@@ -483,6 +483,13 @@ impl RpcClient {
     pub async fn head(&self) -> Result<Value> {
         self.call("rand_getHead", json!([])).await
     }
+    /// `rand_getGenesisHash`: which chain this node serves. A wallet's note store is bound to it,
+    /// so a store carried across a chain cut is started over rather than scanned past the end of
+    /// the new chain's tree.
+    pub async fn genesis_hash(&self) -> Result<Hash> {
+        let v = self.call("rand_getGenesisHash", json!([])).await?;
+        Hash::from_hex(v.as_str().unwrap_or("")).map_err(|e| anyhow!("bad genesis hash in reply: {e}"))
+    }
     pub async fn status(&self) -> Result<Value> {
         self.call("rand_status", json!([])).await
     }
@@ -822,6 +829,19 @@ mod tests {
         // What a read actually posts, so reads keep the flat 15 s.
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "rand_getAnchor", "params": [] });
         assert!(serde_json::to_vec(&body).unwrap().len() < UPLOAD_THRESHOLD);
+    }
+
+    /// `--rpc https://…` must reach the wire. The client was once built without a TLS backend,
+    /// and reqwest then refused every https URL before connecting ("URL scheme is not allowed"),
+    /// which made the public endpoint (`https://rpc.randprotocol.org`) unusable from the CLI.
+    /// Nothing listens on this port, so a TLS-capable client fails at the connection, never at
+    /// the scheme.
+    #[tokio::test]
+    async fn an_https_url_is_attempted_not_refused_for_its_scheme() {
+        let rpc = RpcClient::new("https://127.0.0.1:1/");
+        let err = format!("{:#}", rpc.head().await.expect_err("nothing listens on port 1"));
+        assert!(!err.to_lowercase().contains("scheme"), "{err}");
+        assert!(err.contains("connecting to https://127.0.0.1:1/"), "{err}");
     }
 
     /// A hand-rolled HTTP server: reads the whole request, waits `delay`, then answers `body`.

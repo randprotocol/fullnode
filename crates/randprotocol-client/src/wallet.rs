@@ -255,6 +255,23 @@ mod hex_word8 {
     }
 }
 
+/// An optional genesis hash as hex, like every other word in the store file.
+mod hex_hash_opt {
+    use super::*;
+    pub fn serialize<S: Serializer>(h: &Option<Hash>, s: S) -> Result<S::Ok, S::Error> {
+        match h {
+            Some(h) => s.serialize_some(&h.to_hex()),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Hash>, D::Error> {
+        match Option::<String>::deserialize(d)? {
+            Some(text) => Hash::from_hex(&text).map(Some).map_err(|e| serde::de::Error::custom(format!("genesis: {e}"))),
+            None => Ok(None),
+        }
+    }
+}
+
 mod hex_note {
     use super::*;
     pub fn serialize<S: Serializer>(n: &Note, s: S) -> Result<S::Ok, S::Error> {
@@ -315,6 +332,15 @@ pub struct SentRow {
 /// the file is missing or unreadable.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NoteStore {
+    /// The chain every row and cursor here was read from: the node's `rand_getGenesisHash` at the
+    /// first scan. A store is a cache of one chain's tree, and its cursors mean nothing on
+    /// another — carried across a chain cut, a store's leaf cursor sat past every leaf of the
+    /// new chain, every page came back empty, and the wallet reported `0 RAND, 0 notes` with no
+    /// warning while its notes sat on chain. [`NoteStore::bind`] starts the store over when the
+    /// node's chain is not this one. `None` on a store written before the binding existed, which
+    /// is started over once, the same way.
+    #[serde(default, with = "hex_hash_opt")]
+    pub genesis: Option<Hash>,
     /// The next leaf index to scan; every leaf below it has been tried against the viewing key.
     pub scanned_index: u64,
     /// The next block height to read nullifiers from.
@@ -330,7 +356,29 @@ pub struct NoteStore {
     pub sent: Vec<SentRow>,
 }
 
+/// What [`NoteStore::bind`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bound {
+    /// The store was already this chain's.
+    Same,
+    /// The store was another chain's (`previous`), or from before stores named their chain
+    /// (`None`), and has been emptied: every cursor at zero, no notes, bound to this chain now.
+    Reset { previous: Option<Hash> },
+}
+
 impl NoteStore {
+    /// Make this store `chain`'s. A store bound to `chain` already is untouched; any other is
+    /// started over, because nothing in it can be trusted to be `chain`'s: its rows are
+    /// recoverable by rescanning, and its cursors are what hides the new chain's notes.
+    pub fn bind(&mut self, chain: Hash) -> Bound {
+        if self.genesis == Some(chain) {
+            return Bound::Same;
+        }
+        let previous = self.genesis;
+        *self = NoteStore { genesis: Some(chain), ..NoteStore::default() };
+        Bound::Reset { previous }
+    }
+
     pub fn load(path: &Path) -> NoteStore {
         let Ok(text) = std::fs::read_to_string(path) else { return NoteStore::default() };
         match serde_json::from_str(&text) {
@@ -611,9 +659,10 @@ pub fn rebuilt_notes(w: &Wallet, tx: &Transaction) -> Vec<Note> {
 /// whether or not they held a note for this wallet — but only once [`scan`] has placed every note
 /// found here at its leaf. The cursor lives in a store that is saved even when a scan fails, so
 /// moving it here, before the notes are placed, would let a failed scan persist a cursor past a
-/// garbage-envelope deposit that was never recorded — and nothing would ever read it again. The pass reads headers 128 at a time (`rand_getBlocks`), a block only when it
-/// carries a transaction, and a raw transaction only for the three kinds that append a public
-/// note — so an idle chain costs a header page per 128 blocks.
+/// garbage-envelope deposit that was never recorded — and nothing would ever read it again. The
+/// pass reads headers [`BLOCK_PAGE`] at a time (`rand_getBlocks`), a block only when it carries
+/// a transaction, and a raw transaction only for the three kinds that append a public note — so
+/// an idle chain costs a header page per `BLOCK_PAGE` blocks.
 async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &NoteStore) -> Result<(BTreeMap<Word8, Note>, u64)> {
     let head = rpc.head().await?["height"].as_u64().context("getHead did not return a height")?;
     let mut out = BTreeMap::new();
@@ -654,8 +703,10 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &NoteStore) -> Re
     Ok((out, store.scanned_attest_height.max(head + 1)))
 }
 
-/// Headers per `rand_getBlocks` page: the node's own cap.
-const BLOCK_PAGE: u64 = 128;
+/// Headers per `rand_getBlocks` page: the node's own cap (`rpc::MAX_BLOCK_HEADERS`). An older
+/// node clamps a page to its 128 and the walk above advances from the last header it got, so
+/// asking for the larger page costs nothing against one.
+const BLOCK_PAGE: u64 = 1024;
 
 /// Record what one leaf is for this wallet. `rebuilt` is what [`rebuildable_notes`] found: a
 /// leaf whose commitment is in it is this wallet's deposit or mint whatever its envelope says, so
@@ -697,6 +748,24 @@ fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, rebuilt: &
 /// whose nullifier the chain has published. Advances the store and saves nothing — the caller
 /// owns the file.
 pub async fn scan(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<()> {
+    // Which chain this node serves, before any cursor of the store is trusted: a store carried
+    // across a chain cut is started over here, not scanned past the end of the new tree.
+    let chain = rpc.genesis_hash().await?;
+    let had_rows = store.scanned_index > 0 || !store.notes.is_empty();
+    match store.bind(chain) {
+        Bound::Same => {}
+        Bound::Reset { previous: Some(previous) } => eprintln!(
+            "warning: the note store was scanned against chain {}, but this node serves chain {}; rescanning from the start",
+            previous.to_hex(),
+            chain.to_hex()
+        ),
+        Bound::Reset { previous: None } if had_rows => eprintln!(
+            "warning: the note store does not say which chain it was scanned against; rescanning from the start to bind it to chain {}",
+            chain.to_hex()
+        ),
+        Bound::Reset { previous: None } => {}
+    }
+
     // What the envelope layer cannot be trusted to deliver, read off the wire instead. Done
     // before the leaves are paged, so a deposit or a mint is placed by the same pass that first sees its
     // leaf rather than a scan later.
@@ -2864,6 +2933,7 @@ mod tests {
     #[test]
     fn note_store_balance_ignores_spent_and_zero_notes() {
         let store = NoteStore {
+            genesis: None,
             scanned_index: 4,
             scanned_height: 2,
             scanned_attest_height: 3,
@@ -3405,6 +3475,8 @@ mod tests {
         /// replies are), overridden to exercise `-32603` (node N-2: not a verdict, so not
         /// `SubmitRefused`).
         fail_code: i64,
+        /// What `rand_getGenesisHash` answers: the chain this fake is.
+        genesis: Hash,
     }
 
     fn kind(a: &Action) -> &'static str {
@@ -3436,6 +3508,7 @@ mod tests {
                 tokens: serde_json::json!({ "enabled": false, "tokens": [] }),
                 fail: None,
                 fail_code: -32000,
+                genesis: Hash([9; 32]),
             }
         }
 
@@ -3469,6 +3542,7 @@ mod tests {
             let head = self.head();
             Reply::Ok(match method {
                 "rand_getHead" => json!({ "height": head }),
+                "rand_getGenesisHash" => json!(self.genesis.to_hex()),
                 "rand_getBlocks" => json!((n(0)..=n(1).min(head).min(n(0) + 127))
                     .map(|h| json!({ "height": h, "tx_count": self.blocks[h as usize].len() }))
                     .collect::<Vec<_>>()),
@@ -3780,6 +3854,82 @@ mod tests {
         scan(&rpc, &me, &mut store).await.unwrap();
         assert_eq!(store.notes.len(), 2, "a second scan adds nothing");
         assert_eq!(store.scanned_index, 2);
+    }
+
+    /// A store scanned against one chain is a cache of that chain alone. Carried to a node on
+    /// another (a wallet file kept across a chain cut), its cursors point past leaves the new
+    /// chain has not appended yet, every page comes back empty, and the wallet reports nothing
+    /// without a word — a real note on the new chain stays invisible for as long as the file
+    /// lives. Binding the store to the genesis it was scanned against, and starting over when
+    /// the node's differs, is what makes a carried-over store find its notes.
+    #[test]
+    fn binding_a_store_to_another_chain_starts_it_over() {
+        let this = Hash([1; 32]);
+        let other = Hash([2; 32]);
+        let mut store = NoteStore {
+            genesis: Some(other),
+            scanned_index: 60_000,
+            scanned_height: 240_000,
+            scanned_attest_height: 240_000,
+            notes: vec![owned(0, 5, false)],
+            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2 }],
+        };
+        assert_eq!(store.bind(this), Bound::Reset { previous: Some(other) });
+        assert_eq!(store.genesis, Some(this));
+        assert_eq!((store.scanned_index, store.scanned_height, store.scanned_attest_height), (0, 0, 0));
+        assert!(store.notes.is_empty() && store.sent.is_empty(), "nothing from the other chain survives");
+        // Bound to this chain already: untouched.
+        store.scanned_index = 9;
+        assert_eq!(store.bind(this), Bound::Same);
+        assert_eq!(store.scanned_index, 9);
+        // A store from before the binding existed says nothing about its chain, so it is started
+        // over once — the only way to know its rows are this chain's.
+        let mut unbound = NoteStore { scanned_index: 60_000, ..NoteStore::default() };
+        assert_eq!(unbound.bind(this), Bound::Reset { previous: None });
+        assert_eq!((unbound.genesis, unbound.scanned_index), (Some(this), 0));
+    }
+
+    /// The reproduction from 2026-09-23: a store whose leaf cursor sat past every leaf of the
+    /// node's chain scanned to `0 RAND, 0 notes` in under two seconds, no warning. A scan now
+    /// asks the node its genesis first, and a foreign store is rescanned from leaf 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_store_carried_from_another_chain_finds_its_notes_on_this_one() {
+        let me = Wallet::from_spend_key(SpendKey([58; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        chain.lock().unwrap().fund(&me, 5, 0);
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore {
+            genesis: Some(Hash([2; 32])),
+            scanned_index: 60_000,
+            scanned_height: 240_000,
+            scanned_attest_height: 240_000,
+            ..NoteStore::default()
+        };
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.balance(), 5, "the note on this chain, below the carried-over cursor");
+        assert_eq!(store.genesis, Some(chain.lock().unwrap().genesis), "bound to the node's chain now");
+        assert_eq!(store.scanned_index, 1);
+        // And a second scan against the same chain keeps what it has.
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.notes.len(), 1);
+    }
+
+    #[test]
+    fn the_chain_binding_survives_the_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = store_path(&dir.path().join("w.key.json"));
+        let store = NoteStore { genesis: Some(Hash([3; 32])), ..NoteStore::default() };
+        store.save(&path).unwrap();
+        assert_eq!(NoteStore::load(&path).genesis, Some(Hash([3; 32])));
+        // As hex in the file, like every other word in it.
+        assert!(std::fs::read_to_string(&path).unwrap().contains(&Hash([3; 32]).to_hex()));
+    }
+
+    /// The wallet's block walk asks for the node's whole header page; a smaller ask is a
+    /// round trip wasted per page, a larger one is clamped by the node anyway.
+    #[test]
+    fn the_header_page_is_the_nodes_cap() {
+        assert_eq!(BLOCK_PAGE, randprotocol_node::rpc::MAX_BLOCK_HEADERS);
     }
 
     /// RAND held by a `--no-wait` submission is not spendable, but it is not missing: the refusal
@@ -4758,6 +4908,7 @@ mod tests {
         // A missing store is an empty one: every row in it is recoverable by rescanning.
         assert_eq!(NoteStore::load(&path).scanned_index, 0);
         let store = NoteStore {
+            genesis: None,
             scanned_index: 9,
             scanned_height: 4,
             scanned_attest_height: 5,

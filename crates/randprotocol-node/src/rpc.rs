@@ -31,6 +31,13 @@ const MAX_PAGE: usize = 1000;
 /// window per request.
 const MAX_COMPACT_BLOCKS: u64 = 128;
 
+/// The most headers one `rand_getBlocks` call may return. A header is ~100 bytes and carries
+/// no transaction, so the anchor-window reasoning behind `MAX_COMPACT_BLOCKS` does not apply;
+/// what does is the wallet's block walk, which pays a round trip per page — at 128 a 240 000-
+/// block chain over a remote RPC was ~1 900 round trips, a quarter of an hour, before a wallet
+/// saw its first leaf. A page of 1024 is ~100 KB and ~1024 point reads.
+pub const MAX_BLOCK_HEADERS: u64 = 1024;
+
 /// The most request objects one batch may carry. A batch is a request amplifier and
 /// `rand_getWitness` rebuilds the whole commitment tree per call, so this is deliberately
 /// small: the realistic batch is a head, a tree info and two pages, which is four.
@@ -1763,8 +1770,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let block = st.storage.block_by_hash(&h).map_err(RpcError::internal)?;
             Ok(block.map(|b| block_json(&b, tokens.as_ref(), st.executor.as_ref(), &st.storage)).unwrap_or(Value::Null))
         }
-        // Headers over a range, capped like `rand_getCompactBlocks`: the block list a client
-        // pages through without paying for every transaction in it.
+        // Headers over a range, capped at `MAX_BLOCK_HEADERS`: the block list a client pages
+        // through without paying for every transaction in it.
         "rand_getBlocks" => {
             let from: u64 = param(p, 0, "from_height")?;
             let to: u64 = param(p, 1, "to_height")?;
@@ -1772,7 +1779,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 return Err(RpcError::invalid_params(format!("to_height {to} is below from_height {from}")));
             }
             let head = st.storage.head().map_err(RpcError::internal)?.height;
-            let to = to.min(head).min(from.saturating_add(MAX_COMPACT_BLOCKS - 1));
+            let to = to.min(head).min(from.saturating_add(MAX_BLOCK_HEADERS - 1));
             let storage = st.storage.clone();
             let headers = blocking(move || {
                 let mut out = Vec::new();
@@ -4545,6 +4552,31 @@ mod tests {
         // Resuming from the last height plus one picks up exactly where it stopped.
         let next = ok(&st, "rand_getCompactBlocks", json!([MAX_COMPACT_BLOCKS, blocks])).await;
         assert_eq!(next.as_array().unwrap()[0]["height"], MAX_COMPACT_BLOCKS);
+    }
+
+    /// Headers are a hundred bytes each and a wallet's block walk pays one round trip per page,
+    /// so `rand_getBlocks` pages far more of them than `rand_getCompactBlocks` pages blocks: at
+    /// 128 a 240 000-block chain over a remote RPC was ~1 900 round trips, a quarter of an hour.
+    #[tokio::test]
+    async fn get_blocks_pages_more_headers_than_compact_blocks_page_blocks() {
+        let gs = genesis_with(1, vec![alloc_note(20, 1_000)]);
+        let (_d, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let mut parent = gs.block.clone();
+        let blocks = MAX_BLOCK_HEADERS + 5;
+        for _ in 0..blocks {
+            let b = make_block(&parent, &mut ledger, vec![], &key(1));
+            st.storage.commit(std::slice::from_ref(&b), &ledger, &[], &StubExecutor).unwrap();
+            parent = b.block.clone();
+        }
+        assert!(MAX_BLOCK_HEADERS >= 8 * MAX_COMPACT_BLOCKS, "a header page is many block pages");
+        let v = ok(&st, "rand_getBlocks", json!([0, blocks])).await;
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), MAX_BLOCK_HEADERS as usize);
+        assert_eq!(rows[MAX_BLOCK_HEADERS as usize - 1]["height"], MAX_BLOCK_HEADERS - 1);
+        // Resuming from the last height plus one picks up exactly where it stopped.
+        let next = ok(&st, "rand_getBlocks", json!([MAX_BLOCK_HEADERS, blocks])).await;
+        assert_eq!(next.as_array().unwrap()[0]["height"], MAX_BLOCK_HEADERS);
     }
 
     /// The row cap ends a reply early, but never before one whole block: a block holding more

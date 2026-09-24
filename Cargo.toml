@@ -45,7 +45,10 @@ libp2p = { version = "0.57", features = ["tokio", "tcp", "noise", "yamux", "goss
 cbor4ii = { version = "0.3.2", features = ["serde1", "use_std"] }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# `rustls-tls`, not the platform TLS: the CLI talks to `https://rpc.randprotocol.org` and a droplet
+# build must not depend on the host's OpenSSL. Without a TLS backend reqwest refuses every https
+# URL before connecting ("scheme is not http"), which is how the public RPC was once unreachable.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # storage
 rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }

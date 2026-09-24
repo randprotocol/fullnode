@@ -868,8 +868,8 @@ is not implemented through this call: it keeps its own arm and its own one-leaf 
 Errors: `-32602` for an empty list or more than 32 indices.
 
 ### `rand_getBlocks`
-Params: `[from_height, to_height]`. Result: a list of headers, oldest first, at most 128 (the
-compact-block cap) starting at `from_height`:
+Params: `[from_height, to_height]`. Result: a list of headers, oldest first, at most 1024
+(`MAX_BLOCK_HEADERS`; 128 on a node before 2026-09-24) starting at `from_height`:
 ```json
 [ { "hash": "647b…", "height": 50, "view": 92, "parent": "2d41…", "proposer": "3v3VBJ…",
     "timestamp_ms": 1788000123456, "tx_root": "0000…", "state_root": "a1b2…",
@@ -877,7 +877,9 @@ compact-block cap) starting at `from_height`:
 ```
 The same header fields as `rand_getBlockByHeight` / `rand_getBlockByHash`, minus `transactions` —
 the block list a client pages through without paying for every transaction in it; those two serve
-the transactions. A range wider than 128, or past the head, is truncated, not refused.
+the transactions. A range wider than the cap, or past the head, is truncated, not refused — a
+client advances from the last height it got back, which is also what makes a 1024-header ask
+correct against an older node's 128.
 
 Errors: `-32602` for `to_height` below `from_height`.
 
@@ -1206,6 +1208,23 @@ string. Every other amount this RPC serves was already a string before this chan
 `aggregation.subsidy_base` is now a string too, for the same reason (it was the one amount this
 RPC still served as a number).
 
+### 2026-09-24 — `rand_getBlocks` pages 1024 headers; the wallet binds its store to `rand_getGenesisHash`
+
+- **`rand_getBlocks`'s cap is 1024 headers** (`MAX_BLOCK_HEADERS`), up from the 128 it shared
+  with `rand_getCompactBlocks`. A header carries no transaction, so the anchor-window reasoning
+  behind the compact-block cap never applied to it; what did apply was the wallet's block walk,
+  which pays a round trip per page — over a remote RPC a 240 000-block chain was ~1 900 round
+  trips (about a quarter of an hour) before a first sync saw a leaf. Node-only, no wire or
+  genesis change; a client asking for 1024 against an older node gets 128 and advances from the
+  last height it got, as it always did.
+- **The `rand` wallet now calls `rand_getGenesisHash` at the start of every scan** and binds its
+  note store (`<key>.notes.json`, new `genesis` field) to the answer. A store scanned against
+  another chain — a wallet file kept across a chain cut — is emptied and rescanned from leaf 0
+  with a warning, instead of paging from a cursor past the new chain's tree and reporting
+  `0 RAND, 0 notes`. A node without the method (before v0.3) can no longer be scanned against.
+- **The `rand` wallet speaks TLS**: `--rpc https://rpc.randprotocol.org` works. It was built
+  without a TLS backend and refused every https URL before connecting.
+
 ### 2026-09-20 — the token RPC and `rpl1…` token ids
 
 - **New methods:** `rand_getTokens` (the whole registry, paged), `rand_getToken` (one token by
@@ -1348,8 +1367,8 @@ forward-only, though, unless `rand-node db drop-receipts-index` is run before do
   height range, paged with a soft-floor `limit` (default and cap 256) that never splits a height.
 - **`rand_getWitnesses(indices)`** — `rand_getWitness` folded over up to 32 leaves in one tree
   build.
-- **`rand_getBlocks(from_height, to_height)`** — up to 128 headers, `rand_getBlockByHeight`'s
-  fields minus `transactions`.
+- **`rand_getBlocks(from_height, to_height)`** — up to 128 headers (1024 since 2026-09-24),
+  `rand_getBlockByHeight`'s fields minus `transactions`.
 - **`rand_getFinality(height_or_hash)`** — `committed` / `certified` / `proposed` / `unknown`
   from the replica's own HotStuff tree and quorum certificates.
 - **`rand_getProposer(view)` or `(from_view, to_view)`** — the leader per view under the
