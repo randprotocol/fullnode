@@ -225,7 +225,12 @@ impl Sim {
                     Ok(acts) => self.handle(j, acts),
                     // Like the real node: an unknown parent triggers a fetch.
                     Err(ConsensusError::UnknownParent(h)) => self.fetches.push((j, h)),
-                    Err(ConsensusError::Stale(_)) | Err(ConsensusError::NotLeader) => {}
+                    // Like the real node: a stale message, a vote we are not collecting, and a
+                    // proposal past the view window (audit v4, CON-3) are dropped; the replica
+                    // catches up through the QCs it assembles from gossiped votes.
+                    Err(ConsensusError::Stale(_))
+                    | Err(ConsensusError::NotLeader)
+                    | Err(ConsensusError::ViewTooFarAhead { .. }) => {}
                     Err(e) => panic!("node {j} rejected message from {from}: {e}"),
                 }
                 n += 1;
@@ -1900,4 +1905,129 @@ fn a_proposal_skips_an_aggregate_whose_covers_are_unavailable() {
         block.transactions.iter().all(|tx| !matches!(tx.action, crate::types::Action::Aggregate { .. })),
         "an uncoverable aggregate never enters the block"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sibling proposals (audit v4, CON-3)
+// ---------------------------------------------------------------------------
+
+/// A valid block at `view` extending `node`'s committed head, signed by that view's leader and
+/// stamped `timestamp_ms`: what the leader would propose — or, with a second timestamp beside
+/// one it already proposed, the sibling a Byzantine leader proposes for the same view.
+fn block_on_head(sim: &Sim, node: usize, view: u64, timestamp_ms: u64) -> Block {
+    let hs = &sim.nodes[node];
+    let parent_hash = hs.committed_hash();
+    let parent = hs.block(&parent_hash).expect("the head is in the tree").clone();
+    let height = parent.height() + 1;
+    let li = sim.addr_to_idx[&hs.leader(view)];
+    let proposer = sim.keys[li].public_key().clone();
+    let proposer_addr = proposer.address();
+    // The state the block must publish, built the way a proposer builds it.
+    let mut after = hs.committed_ledger().clone();
+    after.set_height(height);
+    after.set_timestamp_ms(timestamp_ms);
+    after.apply_transactions(&[], &proposer_addr, &StubExecutor).expect("an empty block applies");
+    after.close_block(height, &proposer_addr);
+    let justify = match sim.committed[node].last() {
+        Some(cb) => cb.qc.clone(),
+        None => QuorumCertificate::genesis(parent_hash),
+    };
+    let header = crate::types::BlockHeader {
+        height,
+        view,
+        parent: parent_hash,
+        proposer,
+        timestamp_ms,
+        tx_root: Block::tx_root(&[]),
+        state_root: after.state_root(),
+        justify,
+    };
+    Block::sign(header, vec![], &sim.keys[li])
+}
+
+/// A Byzantine validator (`attacker`) feeds `victim` `count` distinct blocks, one per view it
+/// leads, every one a child of the committed head: it pulls the victim into each such view with
+/// one signed NewView (all a validator needs today) and proposes there. Returns how many the
+/// victim accepted into its tree.
+fn fill_with_siblings(sim: &mut Sim, victim: usize, attacker: usize, count: usize) -> usize {
+    let key = Keypair::from_seed(*sim.keys[attacker].seed()).unwrap();
+    let attacker_addr = sim.keys[attacker].address();
+    let mut accepted = 0;
+    let mut sent = 0;
+    let mut view = sim.nodes[victim].view();
+    while sent < count {
+        view += 1;
+        if sim.nodes[victim].leader(view) != attacker_addr {
+            continue;
+        }
+        let nv = NewView::sign(view, sim.nodes[victim].high_qc().clone(), &key);
+        sim.nodes[victim].on_new_view(nv).expect("a validator's NewView is admitted");
+        assert_eq!(sim.nodes[victim].view(), view);
+        let now = 1_000 + view;
+        let b = block_on_head(sim, victim, view, now);
+        sent += 1;
+        if sim.nodes[victim].on_proposal(b, now).is_ok() {
+            accepted += 1;
+        }
+    }
+    accepted
+}
+
+/// The next view above `victim`'s current one that a validator other than `attacker` leads.
+fn next_honest_view(sim: &Sim, victim: usize, attacker: usize) -> u64 {
+    let attacker_addr = sim.keys[attacker].address();
+    (sim.nodes[victim].view() + 1..).find(|v| sim.nodes[victim].leader(*v) != attacker_addr).unwrap()
+}
+
+#[test]
+fn six_hundred_siblings_do_not_stop_the_honest_leaders_proposal() {
+    // Fails today with TreeFull: a Byzantine leader's junk fills the 512-block tree, and the
+    // honest leader's proposal on the certified head is refused behind it.
+    let mut sim = setup(4, 4);
+    let (victim, attacker) = (1, 3);
+    let accepted = fill_with_siblings(&mut sim, victim, attacker, 600);
+    assert!(accepted >= 500, "the attacker's blocks are valid and were accepted: {accepted}");
+    let view = next_honest_view(&sim, victim, attacker);
+    let honest = block_on_head(&sim, victim, view, 10_000);
+    let r = sim.nodes[victim].on_proposal(honest.clone(), 10_000);
+    assert!(r.is_ok(), "the certified-branch proposal must always fit: {r:?}");
+    assert!(sim.nodes[victim].has_block(&honest.hash()));
+}
+
+#[test]
+fn a_leaders_second_block_for_one_view_is_refused_as_equivocation() {
+    let mut sim = setup(4, 4);
+    let (leader, view) = pending_leader(&sim);
+    assert_eq!(view, 1);
+    sim.now += 1;
+    let acts = sim.nodes[leader].propose(view, vec![], sim.now).expect("the leader proposes");
+    let a = proposal_of(&acts); // the block the leader really proposed
+    // Same view, same parent, a different timestamp: a sibling the same leader signed.
+    let b = block_on_head(&sim, 1, view, a.header.timestamp_ms + 1);
+    assert_eq!(b.proposer(), a.proposer());
+    assert_ne!(a.hash(), b.hash());
+    assert!(sim.nodes[1].on_proposal(a.clone(), sim.now).is_ok());
+    let e = sim.nodes[1].on_proposal(b.clone(), sim.now).unwrap_err();
+    assert!(
+        matches!(e, ConsensusError::Equivocation { view: 1, first, second } if first == a.hash() && second == b.hash()),
+        "{e:?}"
+    );
+    assert!(sim.nodes[1].has_block(&a.hash()) && !sim.nodes[1].has_block(&b.hash()));
+    // The same block again is not an equivocation: it is already held.
+    assert!(sim.nodes[1].on_proposal(a, sim.now).is_ok());
+}
+
+#[test]
+fn a_proposal_past_the_view_window_is_refused_not_stored() {
+    let sim = setup(4, 4);
+    let mut sim = sim;
+    let current = sim.nodes[1].view();
+    let far = block_on_head(&sim, 1, current + PROPOSAL_VIEW_WINDOW + 1, 5);
+    let e = sim.nodes[1].on_proposal(far.clone(), 5).unwrap_err();
+    assert!(matches!(e, ConsensusError::ViewTooFarAhead { view, current: c } if view == current + PROPOSAL_VIEW_WINDOW + 1 && c == current), "{e:?}");
+    assert!(!sim.nodes[1].has_block(&far.hash()));
+    assert_eq!(sim.nodes[1].view(), current, "a far-future proposal does not move the view");
+    let edge = block_on_head(&sim, 1, current + PROPOSAL_VIEW_WINDOW, 5);
+    let r = sim.nodes[1].on_proposal(edge, 5);
+    assert!(!matches!(r, Err(ConsensusError::ViewTooFarAhead { .. })), "{r:?}");
 }

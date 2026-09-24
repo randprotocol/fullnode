@@ -18,6 +18,12 @@ pub use hotstuff::{CoveredSource, HotStuff};
 /// ([`crate::ledger::MAX_TIMESTAMP_STEP_MS`]).
 pub const MAX_CLOCK_DRIFT_MS: u64 = 15_000;
 
+/// Audit v4 (CON-3): a proposal whose view is more than this many views ahead of the replica's
+/// current view is refused (`ConsensusError::ViewTooFarAhead`) and never stored — views advance
+/// on QCs and NewViews, not on far-future proposals. Local acceptance policy, not a validity
+/// rule: a block refused here is still valid to a replica whose view has caught up.
+pub const PROPOSAL_VIEW_WINDOW: u64 = 8;
+
 use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
 use crate::types::{Block, QuorumCertificate, ValidatorSet, Vote};
 use serde::{Deserialize, Serialize};
@@ -268,4 +274,11 @@ pub enum ConsensusError {
     ViewOutOfRange { view: u64 },
     #[error("too many speculative blocks in memory")]
     TreeFull,
+    /// The leader of `view` already proposed `first` for it and now signs a different block
+    /// (audit v4, CON-3): the first block stays, the second is refused, both hashes are logged.
+    #[error("leader equivocated in view {view}: already holds {first:?}, refused {second:?}")]
+    Equivocation { view: u64, first: Hash, second: Hash },
+    /// The proposal's view is more than [`PROPOSAL_VIEW_WINDOW`] views past this replica's.
+    #[error("proposal for view {view} is more than {PROPOSAL_VIEW_WINDOW} views ahead of the current view {current}")]
+    ViewTooFarAhead { view: u64, current: u64 },
 }

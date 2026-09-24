@@ -1,4 +1,7 @@
-use super::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, EpochSets, NewView, SafetyState};
+use super::{
+    Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, EpochSets, NewView, SafetyState,
+    PROPOSAL_VIEW_WINDOW,
+};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, Keypair};
 use crate::ledger::{BlockError, Ledger, NoVerified, TxError, VerifiedProofs};
@@ -73,6 +76,11 @@ pub struct HotStuff {
     /// Blocks waiting for a parent, keyed by parent hash.
     orphans: HashMap<Hash, Vec<Block>>,
     orphan_count: usize,
+    /// The one block this replica holds per (view, proposer) (audit v4, CON-3): a second,
+    /// different block from the same leader for the same view is an equivocation and is refused.
+    /// Entries follow the tree — `prune` and `evict_for_room` drop them with their blocks — so
+    /// the map is bounded by `max_tree_blocks`.
+    proposed: BTreeMap<(u64, Address), Hash>,
 
     /// Votes collected while acting as the next leader: (view, block) -> voter -> vote.
     pending_votes: BTreeMap<(u64, Hash), BTreeMap<Address, Vote>>,
@@ -180,6 +188,7 @@ impl HotStuff {
             tree,
             orphans: HashMap::new(),
             orphan_count: 0,
+            proposed: BTreeMap::new(),
             pending_votes: BTreeMap::new(),
             new_views: BTreeMap::new(),
             epoch_sets,
@@ -539,6 +548,12 @@ impl HotStuff {
         if block.view() > self.view.saturating_add(MAX_VIEW_AHEAD) {
             return Err(ConsensusError::ViewOutOfRange { view: block.view() });
         }
+        // The proposal window (audit v4, CON-3): a block for a view far past this replica's is
+        // refused before its signature is even checked, and is not kept as an orphan either —
+        // the view moves on QCs and NewViews, and a far-behind replica catches up through sync.
+        if block.view() > self.view.saturating_add(PROPOSAL_VIEW_WINDOW) {
+            return Err(ConsensusError::ViewTooFarAhead { view: block.view(), current: self.view });
+        }
         if block.height() <= self.committed_height {
             return Err(ConsensusError::Stale(block.height()));
         }
@@ -569,6 +584,22 @@ impl HotStuff {
         if block.proposer() != set.leader(block.view()) {
             return Err(ConsensusError::WrongLeader(block.view()));
         }
+        // One block per (view, leader) (audit v4, CON-3). Checked once the signature and the
+        // leader are known, so the first block is the leader's own evidence: a second, different
+        // one for the same view is an equivocation, refused and logged with both hashes.
+        let proposed_key = (block.view(), block.proposer());
+        if let Some(first) = self.proposed.get(&proposed_key) {
+            if *first != hash {
+                tracing::warn!(
+                    view = block.view(),
+                    proposer = %block.proposer(),
+                    first = ?first,
+                    second = ?hash,
+                    "leader equivocated: a second block for a view it already proposed in"
+                );
+                return Err(ConsensusError::Equivocation { view: block.view(), first: *first, second: hash });
+            }
+        }
         if block.header.justify.block_hash != parent_hash {
             return Err(ConsensusError::JustifyParentMismatch);
         }
@@ -593,16 +624,25 @@ impl HotStuff {
         // drift rule is a vote rule, applied at `try_vote` below: never a validity rule.
         let bridged = parent.ledger_after.bridge().is_some();
 
-        // Execute on top of the parent's state.
+        // Execute on top of the parent's state. A full tree first sheds what is not on the
+        // certified chain (audit v4, CON-3), so a leader's siblings can never crowd out the
+        // proposal that extends the high QC.
+        if self.tree.len() >= self.cfg.max_tree_blocks {
+            self.evict_for_room();
+        }
         if self.tree.len() >= self.cfg.max_tree_blocks {
             return Err(ConsensusError::TreeFull);
         }
+        // `evict_for_room` never removes the certified chain, and the parent is on it or was
+        // just accepted below the cap; re-borrowed because the eviction took `&mut self`.
+        let parent = &self.tree[&parent_hash];
         let mut ledger = parent.ledger_after.clone();
         let sidecar = self.covered_sidecar(&block)?;
         // B5: the admission cache comes along — a transaction this node verified at the pool is
         // decoded here, not re-verified. Everything stateful is re-checked either way.
         let receipts = ledger.apply_block_for_sync(&block, &sidecar, &[], self.executor.as_ref(), self.verified.as_ref())?;
         self.tree.insert(hash, Entry { block: block.clone(), ledger_after: ledger, receipts });
+        self.proposed.insert(proposed_key, hash);
         self.refresh_current_set();
 
         // A valid proposal for view v moves us into view v.
@@ -1030,7 +1070,24 @@ impl HotStuff {
         let h = self.committed_height;
         let keep = self.committed_hash;
         self.tree.retain(|hash, e| *hash == keep || e.block.height() > h);
-        // Anything not descending from the committed head is dead.
+        self.drop_unreachable();
+        self.orphans.retain(|_, v| {
+            v.retain(|b| b.height() > h);
+            !v.is_empty()
+        });
+        self.orphan_count = self.orphans.values().map(|v| v.len()).sum();
+        // The equivocation record follows the tree: entries at or under the committed head's
+        // view are decided, and a pruned dead branch's entries go with its blocks.
+        let head_view = self.tree.get(&keep).map(|e| e.block.view()).unwrap_or(0);
+        let tree = &self.tree;
+        self.proposed.retain(|(view, _), hash| *view > head_view && tree.contains_key(hash));
+    }
+
+    /// Drop every tree entry that no longer descends from the committed head, and the derived
+    /// sets whose epoch-start parent went with them (an epoch whose first block has committed,
+    /// so `epoch_sets` answers for it).
+    fn drop_unreachable(&mut self) {
+        let keep = self.committed_hash;
         let mut alive: std::collections::HashSet<Hash> = std::collections::HashSet::new();
         alive.insert(keep);
         let mut changed = true;
@@ -1044,15 +1101,57 @@ impl HotStuff {
             }
         }
         self.tree.retain(|hash, _| alive.contains(hash));
-        self.orphans.retain(|_, v| {
-            v.retain(|b| b.height() > h);
-            !v.is_empty()
-        });
-        self.orphan_count = self.orphans.values().map(|v| v.len()).sum();
-        // A derived set whose epoch-start parent is gone is an epoch whose first block has
-        // committed, so `epoch_sets` now answers for it.
         let tree = &self.tree;
         self.derived().retain(|(_, start), _| tree.contains_key(start));
+    }
+
+    /// The blocks a full tree must keep (audit v4, CON-3): the committed head, and the chains
+    /// from the high QC's block and the locked block down to it — what the next honest proposal
+    /// extends, and what the vote rule checks against. Everything else is uncertified
+    /// speculation a peer can re-send.
+    fn certified_chain(&self) -> std::collections::HashSet<Hash> {
+        let mut keep = std::collections::HashSet::new();
+        keep.insert(self.committed_hash);
+        for start in [self.high_qc.block_hash, self.locked_qc.block_hash] {
+            let mut cur = start;
+            while let Some(e) = self.tree.get(&cur) {
+                if !keep.insert(cur) {
+                    break;
+                }
+                cur = e.block.parent();
+            }
+        }
+        keep
+    }
+
+    /// Make room in a full tree: evict blocks off the certified chain, oldest view first, until
+    /// the tree is under `max_tree_blocks` — then whatever descended from an evicted block, since
+    /// it no longer reaches the head. Their `proposed` entries go with them. A tree that is all
+    /// certified chain evicts nothing, and the caller refuses with `TreeFull` as before.
+    fn evict_for_room(&mut self) {
+        let keep = self.certified_chain();
+        let mut candidates: Vec<(u64, Hash)> =
+            self.tree.iter().filter(|(h, _)| !keep.contains(*h)).map(|(h, e)| (e.block.view(), *h)).collect();
+        candidates.sort();
+        let mut evicted = 0usize;
+        for (_, h) in candidates {
+            if self.tree.len() < self.cfg.max_tree_blocks {
+                break;
+            }
+            self.tree.remove(&h);
+            evicted += 1;
+        }
+        if evicted == 0 {
+            return;
+        }
+        self.drop_unreachable();
+        let tree = &self.tree;
+        self.proposed.retain(|_, hash| tree.contains_key(hash));
+        tracing::warn!(
+            evicted,
+            held = self.tree.len(),
+            "speculative tree full: evicted off-chain blocks, oldest view first (audit v4 CON-3)"
+        );
     }
 
     fn extends_locked(&self, block: &Block) -> bool {
