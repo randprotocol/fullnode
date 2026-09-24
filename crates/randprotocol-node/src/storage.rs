@@ -219,6 +219,13 @@ const META_TOKENS: &str = "tokens";
 /// default, so chain 14's registry blob and key set are what they were.
 const META_TOKENS_V2: &str = "tokens_v2";
 
+/// The history-retention floor (history pruning spec §1): the lowest height, other than genesis,
+/// whose block this store still holds. Absent on a store that never pruned — an archive.
+const META_PRUNE_FLOOR: &str = "prune_floor";
+/// Blocks one `prune_history` pass deletes at most, so enabling the flag on a node holding days
+/// of history drains it over minutes of passes rather than one long stall.
+pub const PRUNE_PASS_MAX: u64 = 4096;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("rocksdb: {0}")]
@@ -1466,6 +1473,125 @@ impl Storage {
         let mut batch = rocksdb::WriteBatch::default();
         batch.put_cf(self.cf(CF_TXS), tx_hash.as_bytes(), bincode::serialize(record)?);
         batch.put_cf(self.cf(CF_SEALS), [b"p".as_slice(), proof_hash.as_bytes()].concat(), bincode::serialize(tx_hash)?);
+        self.db.write_opt(batch, &sync_opts())?;
+        Ok(())
+    }
+
+    /// The retention floor: 0 on a store that never pruned.
+    pub fn prune_floor(&self) -> Result<u64> {
+        match self.get_meta_raw(META_PRUNE_FLOOR)? {
+            Some(b) => be_u64(&b, "prune_floor meta"),
+            None => Ok(0),
+        }
+    }
+
+    /// The history-retention pass (history pruning spec §1 — policy, never consensus). Walks up
+    /// from the floor and deletes the per-block rows of every block whose timestamp is older
+    /// than `cutoff_ms`, stopping at `keep_from`, after `max_blocks`, at the first block at or
+    /// past the cutoff, or at a hole (a torn store is not pruned over). Block 0 is never
+    /// deleted. The deletes and the new floor land in one synced batch. Returns the number of
+    /// blocks deleted; the ledger families are never touched.
+    pub fn prune_history(&self, cutoff_ms: u64, keep_from: u64, max_blocks: u64) -> Result<u64> {
+        let mut h = self.prune_floor()?.max(1);
+        let mut batch = WriteBatch::default();
+        let mut deleted = 0u64;
+        while h < keep_from && deleted < max_blocks {
+            let Some(block) = self.block_by_height(h)? else { break };
+            if block.header.timestamp_ms >= cutoff_ms {
+                break;
+            }
+            self.stage_block_delete(&mut batch, &block)?;
+            deleted += 1;
+            h += 1;
+        }
+        if deleted == 0 {
+            return Ok(0);
+        }
+        batch.put_cf(self.cf(CF_META), META_PRUNE_FLOOR, height_key(h));
+        self.db.write_opt(batch, &sync_opts())?;
+        Ok(deleted)
+    }
+
+    /// Every row a committed block owns, staged for deletion: the block, its QC, its hash
+    /// index, its sealed flag, and per transaction the record, the receipt and its program
+    /// index row, the aggregate's cover marks and payment facts, and the pruned form's
+    /// proof-hash row. Ledger families are not the block's to delete.
+    fn stage_block_delete(&self, batch: &mut WriteBatch, block: &Block) -> Result<()> {
+        let hk = height_key(block.height());
+        let hash = block.hash();
+        batch.delete_cf(self.cf(CF_BLOCKS), hk);
+        // Since v0.5.5 (OPS-4) only genesis and the head have a `qcs` row; deleting an absent
+        // key is free and covers a v0.5.4-era database whose one-time QC prune did not run.
+        batch.delete_cf(self.cf(CF_QCS), hk);
+        batch.delete_cf(self.cf(CF_BLOCK_INDEX), hash.as_bytes());
+        batch.delete_cf(self.cf(CF_SEALS), [b"b".as_slice(), hash.as_bytes()].concat());
+        for tx in &block.transactions {
+            // A block served in sealed form carries a marker-form bundle whose record is keyed by
+            // the raw hash the 'p' row names; everything else is keyed by its own hash.
+            let key = match tx.bundle.as_ref().and_then(|b| randprotocol_core::notes::pruned_proof_hash(&b.proof)) {
+                Some(ph) => {
+                    let pkey = [b"p".as_slice(), ph.as_bytes()].concat();
+                    match self.db.get_cf(self.cf(CF_SEALS), &pkey)? {
+                        Some(v) => bincode::deserialize::<Hash>(&v)?,
+                        None => tx.hash(),
+                    }
+                }
+                None => tx.hash(),
+            };
+            batch.delete_cf(self.cf(CF_TXS), key.as_bytes());
+            if let Some(r) = self.receipt(&key)? {
+                batch.delete_cf(self.cf(CF_RECEIPTS), key.as_bytes());
+                batch.delete_cf(self.cf(CF_RECEIPTS_BY_PROGRAM), receipt_index_key(&r.program, r.height, r.index));
+            }
+            // The seal rows this transaction owns: the pruned form's proof-hash index (the
+            // marker's hash, else the raw proof's — exactly what `prune_sealed` computes), the
+            // `sealed_by` mark keyed by its own hash, and its aggregate-payment facts. An
+            // `Aggregate` additionally owns its covers' `sealed_by` marks.
+            if let Some(bundle) = &tx.bundle {
+                let ph = randprotocol_core::notes::pruned_proof_hash(&bundle.proof)
+                    .unwrap_or_else(|| Hash::digest(&bundle.proof));
+                batch.delete_cf(self.cf(CF_SEALS), [b"p".as_slice(), ph.as_bytes()].concat());
+            }
+            batch.delete_cf(self.cf(CF_SEALS), [b"t".as_slice(), tx.hash().as_bytes()].concat());
+            batch.delete_cf(self.cf(CF_SEALS), [b"a".as_slice(), tx.hash().as_bytes()].concat());
+            if let randprotocol_core::types::Action::Aggregate { covers, .. } = &tx.action {
+                for cover in covers {
+                    batch.delete_cf(self.cf(CF_SEALS), [b"t".as_slice(), cover.as_bytes()].concat());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Give the disk back: RocksDB only frees a deleted range at compaction. Compacts `blocks`
+    /// over `[1, floor)` (`qcs` holds only genesis' and the head's rows since v0.5.5, OPS-4).
+    /// A no-op on an archive.
+    pub fn compact_pruned_history(&self) -> Result<()> {
+        let floor = self.prune_floor()?;
+        if floor <= 1 {
+            return Ok(());
+        }
+        self.db.compact_range_cf(self.cf(CF_BLOCKS), Some(height_key(1)), Some(height_key(floor)));
+        Ok(())
+    }
+
+    /// Test hook: the seal and receipt rows a block would own after sealing and a call, written
+    /// by hand so the retention pass can be seen removing them without an aggregate fixture.
+    #[cfg(test)]
+    pub(crate) fn put_history_rows_for_test(
+        &self,
+        block_hash: &Hash,
+        tx: &Hash,
+        proof_hash: &Hash,
+        receipt: &randprotocol_core::program::CallReceipt,
+    ) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.cf(CF_SEALS), [b"b".as_slice(), block_hash.as_bytes()].concat(), bincode::serialize(&true)?);
+        batch.put_cf(self.cf(CF_SEALS), [b"p".as_slice(), proof_hash.as_bytes()].concat(), bincode::serialize(tx)?);
+        batch.put_cf(self.cf(CF_SEALS), [b"t".as_slice(), tx.as_bytes()].concat(), bincode::serialize(&(*tx, 1u64))?);
+        batch.put_cf(self.cf(CF_SEALS), [b"a".as_slice(), tx.as_bytes()].concat(), bincode::serialize(&(0u64, 0u64, 0u64))?);
+        batch.put_cf(self.cf(CF_RECEIPTS), tx.as_bytes(), bincode::serialize(receipt)?);
+        batch.put_cf(self.cf(CF_RECEIPTS_BY_PROGRAM), receipt_index_key(&receipt.program, receipt.height, receipt.index), tx.as_bytes());
         self.db.write_opt(batch, &sync_opts())?;
         Ok(())
     }
@@ -3179,6 +3305,26 @@ pub(crate) mod fixtures {
         }
         (dir, st, gs, out)
     }
+
+    /// A chain of `n` bundle blocks whose timestamps are `h * 1000` ms, so a cutoff in
+    /// milliseconds names a height directly.
+    pub(crate) fn timed_chain(n: u64) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
+        let (dir, st, gs) = genesis_with_two_notes();
+        st.init_genesis(&gs).unwrap();
+        let k = key(1);
+        let mut ledger = gs.ledger.clone();
+        let mut parent = gs.block.clone();
+        let mut out = Vec::new();
+        for h in 1..=n {
+            let seed = (h * 4) as u32;
+            let txs = vec![bundle_tx(&ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], bundle_fee())];
+            let cb = make_block_at(&parent, &mut ledger, txs, &k, h * 1000);
+            st.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
+            parent = cb.block.clone();
+            out.push(cb);
+        }
+        (dir, st, gs, out)
+    }
 }
 
 #[cfg(test)]
@@ -3273,6 +3419,107 @@ mod tests {
             wal = wal_bytes();
         }
         assert!(wal <= cap + write_buffer, "{wal} bytes of write-ahead log against a {cap}-byte cap");
+    }
+
+    #[test]
+    fn a_store_that_never_pruned_reads_floor_zero() {
+        let (_dir, st, _gs, _blocks) = timed_chain(3);
+        assert_eq!(st.prune_floor().unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_history_deletes_exactly_the_per_block_rows_and_keeps_the_ledger() {
+        let (_dir, st, _gs, blocks) = timed_chain(10);
+        let before = st.load_ledger(&StubExecutor).unwrap();
+        let notes_before = st.notes_count().unwrap();
+        // Cutoff 6 000 ms: blocks 1..=5 are older; keep_from 9 lets them all go; cap generous.
+        assert_eq!(st.prune_history(6_000, 9, PRUNE_PASS_MAX).unwrap(), 5);
+        assert_eq!(st.prune_floor().unwrap(), 6);
+        for h in 1..=5 {
+            assert!(st.block_by_height(h).unwrap().is_none(), "block {h} should be gone");
+            // QCs are stored once (v0.5.5, OPS-4): a height's certificate is its child's
+            // `justify`, so 1..=4 have none and 5's still reads off the retained block 6.
+            if h < 5 {
+                assert!(st.qc_by_height(h).unwrap().is_none(), "qc {h} should be gone");
+            }
+            let b = &blocks[(h - 1) as usize].block;
+            assert!(st.height_by_hash(&b.hash()).unwrap().is_none(), "index {h} should be gone");
+            assert!(st.tx_location(&b.transactions[0].hash()).unwrap().is_none(), "tx of {h} should be gone");
+        }
+        for h in 5..=10 {
+            assert!(st.qc_by_height(h).unwrap().is_some(), "qc {h} must still resolve (child's justify, or the head row)");
+        }
+        for h in 6..=10 {
+            assert!(st.block_by_height(h).unwrap().is_some(), "block {h} must stay");
+        }
+        // Genesis never goes.
+        assert!(st.block_by_height(0).unwrap().is_some());
+        assert!(st.qc_by_height(0).unwrap().is_some());
+        // The ledger families are untouched: same snapshot, same leaves, nullifiers still known.
+        assert_eq!(st.load_ledger(&StubExecutor).unwrap(), before);
+        assert_eq!(st.notes_count().unwrap(), notes_before);
+        assert_eq!(st.head().unwrap().height, 10);
+        assert!(st.witness(0, &StubExecutor).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_history_honours_keep_from_the_cap_and_is_idempotent() {
+        let (_dir, st, _gs, _blocks) = timed_chain(10);
+        // Everything is older than the cutoff, but keep_from 4 protects 4..=10.
+        assert_eq!(st.prune_history(u64::MAX, 4, PRUNE_PASS_MAX).unwrap(), 3);
+        assert_eq!(st.prune_floor().unwrap(), 4);
+        // The cap: two more would be allowed by keep_from 8, only one is taken.
+        assert_eq!(st.prune_history(u64::MAX, 8, 1).unwrap(), 1);
+        assert_eq!(st.prune_floor().unwrap(), 5);
+        // Nothing older than the cutoff: no change, floor stays, no error.
+        assert_eq!(st.prune_history(5_000, 8, PRUNE_PASS_MAX).unwrap(), 0);
+        assert_eq!(st.prune_floor().unwrap(), 5);
+        // keep_from at or below the floor: nothing to do.
+        assert_eq!(st.prune_history(u64::MAX, 5, PRUNE_PASS_MAX).unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_history_stops_at_a_gap_and_leaves_the_floor_below_it() {
+        let (_dir, st, _gs, _blocks) = timed_chain(6);
+        // Tear block 3 out by hand: a torn store, not a pruned one.
+        st.db.delete_cf(st.cf(CF_BLOCKS), height_key(3)).unwrap();
+        assert_eq!(st.prune_history(u64::MAX, 6, PRUNE_PASS_MAX).unwrap(), 2);
+        assert_eq!(st.prune_floor().unwrap(), 3, "the floor must not jump the hole");
+        assert!(st.block_by_height(4).unwrap().is_some(), "nothing past the hole is touched");
+    }
+
+    #[test]
+    fn prune_history_removes_the_seal_and_receipt_rows_a_block_owns() {
+        let (_dir, st, _gs, blocks) = timed_chain(3);
+        let b1 = &blocks[0].block;
+        let tx = b1.transactions[0].hash();
+        // The hash `stage_block_delete` derives for a real (unmarked) bundle is the digest of
+        // its own stored proof — exactly what `prune_sealed` would have keyed the row on had it
+        // already run; a disconnected constant here would leave this specific row behind.
+        let proof_hash = Hash::digest(&b1.transactions[0].bundle.as_ref().unwrap().proof);
+        let receipt = randprotocol_core::program::CallReceipt {
+            tx, program: Hash([0x33; 32]), tier: 1, outputs: [0; 8], height: 1, index: 0, h_in: [0; 8], h_pub: None, input_envelope: None,
+        };
+        st.put_history_rows_for_test(&b1.hash(), &tx, &proof_hash, &receipt).unwrap();
+        assert!(st.block_sealed(&b1.hash()).unwrap());
+        assert!(st.receipt(&tx).unwrap().is_some());
+        assert!(st.sealed_by(&tx).unwrap().is_some());
+        assert_eq!(st.prune_history(2_500, 3, PRUNE_PASS_MAX).unwrap(), 2);
+        assert!(!st.block_sealed(&b1.hash()).unwrap(), "the 'b' row goes with the block");
+        assert!(st.receipt(&tx).unwrap().is_none(), "the receipt goes with the tx");
+        assert!(st.sealed_by(&tx).unwrap().is_none(), "the 't' row goes with the aggregate");
+        assert!(st.aggregate_payment(&tx).unwrap().is_none(), "the 'a' row goes with the aggregate");
+        assert!(st.db.get_cf(st.cf(CF_SEALS), [b"p".as_slice(), proof_hash.as_bytes()].concat()).unwrap().is_none());
+        assert!(st.receipts_for_program(&receipt.program, 0, 10, 10).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn compacting_pruned_history_is_a_no_op_on_an_archive_and_succeeds_after_a_pass() {
+        let (_dir, st, _gs, _blocks) = timed_chain(4);
+        st.compact_pruned_history().unwrap();
+        assert_eq!(st.prune_history(u64::MAX, 3, PRUNE_PASS_MAX).unwrap(), 2);
+        st.compact_pruned_history().unwrap();
+        assert!(st.block_by_height(3).unwrap().is_some());
     }
 
     /// Fold a witness back to the root, the way the bundle guest's `MERKLE_VERIFY` does.
