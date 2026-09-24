@@ -370,6 +370,8 @@ impl<'de> Deserialize<'de> for NoteStore {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<NoteStore, D::Error> {
         #[derive(Deserialize)]
         struct Wire {
+            #[serde(default, with = "hex_hash_opt")]
+            genesis: Option<Hash>,
             scanned_index: u64,
             scanned_height: u64,
             #[serde(default)]
@@ -388,6 +390,7 @@ impl<'de> Deserialize<'de> for NoteStore {
         // (every record is keyed by its index) and the tree is rebuilt whole.
         let scanned_index = if w.tree.is_some() { w.scanned_index } else { 0 };
         Ok(NoteStore {
+            genesis: w.genesis,
             scanned_index,
             scanned_height: w.scanned_height,
             scanned_attest_height: w.scanned_attest_height,
@@ -4132,6 +4135,7 @@ mod tests {
             scanned_attest_height: 240_000,
             notes: vec![owned(0, 5, false)],
             sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2 }],
+            ..NoteStore::default()
         };
         assert_eq!(store.bind(this), Bound::Reset { previous: Some(other) });
         assert_eq!(store.genesis, Some(this));
