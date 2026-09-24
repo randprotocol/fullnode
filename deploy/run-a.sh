@@ -2,13 +2,13 @@
 # Run validator A (the laptop, behind NAT) on chain 14. Bootstraps to the public nodes C and D.
 # Chain 14 runs from NODE_A_HOME (default ~/rand-node-a), not from a checkout: the validator key
 # lives off-repo in ~/.rand-chain14 (audit v3 OPS-1) and the checkout is shared between sessions.
-# The whole fleet runs one build (9c142c1, v0.5.1): a genesis-format change is a fork and a mixed
+# The whole fleet runs one build (d0778d8, v0.5.4): a genesis-format change is a fork and a mixed
 # fleet stalls. NEVER run node B here too — B is the sgp1 droplet.
 set -euo pipefail
 HOME_A=${NODE_A_HOME:-$HOME/rand-node-a}
 KEYDIR=${KEYDIR:-$HOME/.rand-chain14}
 cd "$HOME_A"
-BINDIR=${BINDIR:-bin-9c142c1}
+BINDIR=${BINDIR:-bin-d0778d8}
 BIN=$BINDIR/rand-node
 [ -x $BIN ] || { echo "$HOME_A/$BIN missing — build it at the chain-14 commit or set BINDIR" >&2; exit 1; }
 DATA=data-a-1cff3b7d   # keyed on the genesis hash so a regenerated genesis gets a fresh db
