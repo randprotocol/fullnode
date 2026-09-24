@@ -169,9 +169,31 @@ impl std::str::FromStr for Address {
 // Public key
 // ---------------------------------------------------------------------------
 
-/// Dilithium2 public key (1312 bytes).
+/// Dilithium2 public key (1312 bytes). Deserializing checks the length (deep scan 2026-09-24):
+/// a value of this type is always well-formed, on any wire or store.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "RawBytes")]
 pub struct PublicKey(#[serde(with = "serde_bytes_vec")] Vec<u8>);
+
+/// The serialized form of a key or signature before its length is checked: the same encoding
+/// as the field it stands in for (hex when human-readable, bytes otherwise).
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct RawBytes(#[serde(with = "serde_bytes_vec")] Vec<u8>);
+
+impl TryFrom<RawBytes> for PublicKey {
+    type Error = CryptoError;
+    fn try_from(raw: RawBytes) -> Result<PublicKey, CryptoError> {
+        PublicKey::from_bytes(&raw.0)
+    }
+}
+
+impl TryFrom<RawBytes> for Signature {
+    type Error = CryptoError;
+    fn try_from(raw: RawBytes) -> Result<Signature, CryptoError> {
+        Signature::from_bytes(&raw.0)
+    }
+}
 
 impl PublicKey {
     pub fn from_bytes(bytes: &[u8]) -> Result<PublicKey, CryptoError> {
@@ -225,8 +247,9 @@ impl fmt::Debug for PublicKey {
 // Signature
 // ---------------------------------------------------------------------------
 
-/// Dilithium2 signature (2420 bytes).
+/// Dilithium2 signature (2420 bytes). Deserializing checks the length, as for [`PublicKey`].
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "RawBytes")]
 pub struct Signature(#[serde(with = "serde_bytes_vec")] Vec<u8>);
 
 impl Signature {
@@ -500,6 +523,20 @@ mod tests {
         assert!(PublicKey::from_bytes(&[0u8; 10]).is_err());
         assert!(Signature::from_bytes(&[0u8; 10]).is_err());
         assert!(PublicKey::from_bytes(&[0u8; PUBLIC_KEY_LEN]).is_ok());
+    }
+
+    /// Deep scan 2026-09-24 (crypto): a key or signature of the wrong length is refused where
+    /// the bytes are read, not first at `verify` — no `PublicKey` or `Signature` value of the
+    /// wrong length exists, on any wire or store, binary or JSON.
+    #[test]
+    fn a_wrong_length_key_or_signature_does_not_deserialize() {
+        let short_pk = bincode::serialize(&(10u64, [0u8; 10])).unwrap();
+        // bincode writes a Vec<u8> as len ‖ bytes; the tuple above encodes the same bytes.
+        assert!(bincode::deserialize::<PublicKey>(&short_pk[..8 + 10]).is_err(), "a 10-byte public key decoded");
+        let short_sig = bincode::serialize(&(10u64, [0u8; 10])).unwrap();
+        assert!(bincode::deserialize::<Signature>(&short_sig[..8 + 10]).is_err(), "a 10-byte signature decoded");
+        assert!(serde_json::from_str::<PublicKey>("\"00ff\"").is_err(), "a 2-byte JSON public key decoded");
+        assert!(serde_json::from_str::<Signature>("\"00ff\"").is_err(), "a 2-byte JSON signature decoded");
     }
 
     #[test]
