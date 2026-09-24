@@ -86,6 +86,13 @@ pub struct HotStuff {
     /// hash the evidence can act on — so it holds at most one entry; cleared when the block
     /// arrives, when the lock is released, and on commit.
     not_held: HashMap<Hash, std::collections::BTreeSet<Address>>,
+    /// Blocks every fetch failed for — the hash `fallback_high_qc` moved away from. A QC on one
+    /// of them is not raised again until the block itself arrives (`execute_and_insert` removes
+    /// it; a commit clears the set): after a whole-fleet restart every replica's persisted high
+    /// QC named a block nobody held, each fell back, and every peer's NewView re-announced the
+    /// ghost and raised it straight back, so no leader ever proposed on the head — the livelock
+    /// that held chain 14 for hours on 2026-09-24.
+    unobtainable: std::collections::HashSet<Hash>,
 
     /// Votes collected while acting as the next leader: (view, block) -> voter -> vote.
     pending_votes: BTreeMap<(u64, Hash), BTreeMap<Address, Vote>>,
@@ -201,6 +208,7 @@ impl HotStuff {
             orphan_count: 0,
             proposed: BTreeMap::new(),
             not_held: HashMap::new(),
+            unobtainable: std::collections::HashSet::new(),
             pending_votes: BTreeMap::new(),
             new_views: BTreeMap::new(),
             epoch_sets,
@@ -566,6 +574,7 @@ impl HotStuff {
         );
         self.locked_qc = self.head_qc.clone();
         self.not_held.clear();
+        self.unobtainable.clear();
         true
     }
 
@@ -601,6 +610,7 @@ impl HotStuff {
             unobtainable,
             self.head_qc.view
         );
+        self.unobtainable.insert(*unobtainable);
         self.high_qc = self.head_qc.clone();
         self.refresh_current_set();
         self.maybe_ready_to_propose(&mut out);
@@ -761,6 +771,7 @@ impl HotStuff {
         self.proposed.insert((block.view(), block.proposer()), hash);
         // The block arrived: whatever was attested about not holding it is moot.
         self.not_held.remove(&hash);
+        self.unobtainable.remove(&hash);
         Ok(())
     }
 
@@ -1019,6 +1030,12 @@ impl HotStuff {
     }
 
     fn update_high_qc(&mut self, qc: &QuorumCertificate, _out: &mut Vec<Action>) {
+        // A QC on a block that proved unobtainable is not believed again until the block turns
+        // up: raising the high QC to it would only send this replica back to the fetch that
+        // already failed everywhere, and — re-announced by every NewView — keep it there.
+        if self.unobtainable.contains(&qc.block_hash) && !self.tree.contains_key(&qc.block_hash) {
+            return;
+        }
         if qc.view > self.high_qc.view {
             self.high_qc = qc.clone();
             self.refresh_current_set();
@@ -1152,6 +1169,7 @@ impl HotStuff {
         self.epoch_sets.forget_before(self.epoch(self.committed_height).saturating_sub(EPOCH_SETS_KEPT));
         self.prune();
         self.not_held.clear();
+        self.unobtainable.clear();
         self.refresh_current_set();
         out.extend(recorded);
         out.push(Action::Commit(committed));

@@ -1159,6 +1159,42 @@ fn two_of_four_down_halts_then_recovers_without_fork() {
 }
 
 #[test]
+fn a_ghost_high_qc_is_not_re_raised_by_a_new_view_once_it_proved_unobtainable() {
+    // The 2026-09-24 mainnet stall, reduced: after a whole-fleet restart every replica's
+    // persisted high QC certified a block above the head that no node held any more. Each fell
+    // back to the head QC once its fetches failed — and every NewView from a peer re-announced
+    // the ghost, raising the high QC again, so no leader ever proposed on the head: a livelock
+    // that held chain 14 for hours. A QC on a block that proved unobtainable stays ignored until
+    // the block itself arrives.
+    let mut sim = setup(4, 4);
+    for _ in 0..4 {
+        sim.step(vec![]);
+    }
+    let ghost_qc = sim.nodes[0].high_qc().clone();
+    let ghost = ghost_qc.block_hash;
+    for i in 0..4 {
+        sim.restart(i);
+    }
+    let key1 = Keypair::from_seed(*sim.keys[1].seed()).unwrap();
+    let view = sim.nodes[0].view() + 1;
+    let nv = NewView::sign(&sim.domain(), view, ghost_qc.clone(), &key1);
+    let acts = sim.nodes[0].on_new_view(nv).unwrap();
+    sim.handle(0, acts);
+    assert_eq!(sim.nodes[0].high_qc().block_hash, ghost, "the first announcement is believed");
+    let acts = sim.nodes[0].fallback_high_qc(&ghost);
+    sim.handle(0, acts);
+    let head_view = sim.nodes[0].committed_qc_view();
+    assert_eq!(sim.nodes[0].high_qc().view, head_view, "fell back to the head");
+    // The re-announcement, from another peer at a later view: what every NewView carried.
+    let key2 = Keypair::from_seed(*sim.keys[2].seed()).unwrap();
+    let nv2 = NewView::sign(&sim.domain(), view + 1, ghost_qc, &key2);
+    let acts = sim.nodes[0].on_new_view(nv2).unwrap();
+    sim.handle(0, acts);
+    assert_eq!(sim.nodes[0].high_qc().view, head_view, "a QC on a block proven unobtainable is not raised again");
+    assert_eq!(sim.nodes[0].high_qc().block_hash, sim.nodes[0].committed_hash(), "the head is what the next proposal extends");
+}
+
+#[test]
 fn leader_falls_back_when_high_qc_block_is_unobtainable() {
     // A restarted validator learns (via NewView) of a QC for a block that no reachable peer
     // holds. Without the fallback it could never propose; with it, the chain continues.
