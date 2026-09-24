@@ -61,6 +61,15 @@ known-failing test is a reason not to tag, never a note to tag over.
    batch-syncs what it missed. Do not leave nodes on different builds for long: a node still on the
    previous build cannot answer block fetches for the new one.
 
+**Roll note for v0.5.4's lock rule (audit v4 CON-4).** A validator's lock is now released only on
+signed `NotHeld` answers from validators holding more than a third of the stake
+(`docs/consensus.md`, "The lock"), and a node on an older build never sends one: in a mixed fleet
+a lock on a block no peer holds simply holds, and that validator withholds its vote until a newer
+QC forms without it. Roll all validators, one at a time waited to `rand_getHealth: ok`, before
+relying on the rule; the database stays forward-compatible (no new column family —
+`META_LOCKED_BLOCK` is a CF_META key an old build never reads), so the rollback is the re-pin
+of the previous binary.
+
 **Disk guard (audit v4 OPS-3).** A node refuses to start under 1 GB free on its data directory's
 filesystem (`--min-free-disk-mb`, default 1024, names the directory and the flag), and
 `rand_getHealth` answers `disk_low` with the free byte count under 4 GB, re-measured every status

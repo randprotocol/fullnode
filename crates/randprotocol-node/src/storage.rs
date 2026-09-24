@@ -145,6 +145,10 @@ const META_HEAD_HEIGHT: &str = "head_height";
 const META_GENESIS_HASH: &str = "genesis_hash";
 const META_CHAIN_ID: &str = "chain_id";
 const META_SAFETY: &str = "safety";
+/// The block the persisted `locked_qc` certifies while the lock is above the head (audit v4,
+/// CON-4): written by the `PersistSafety` arm beside the safety state, deleted once the lock is
+/// back at the head, read by `resume_consensus`. An older build never reads the key.
+const META_LOCKED_BLOCK: &str = "locked_block";
 /// `bincode(CommitmentTree)`: the depth-32 frontier, the only form of the note tree consensus
 /// state keeps. The leaves themselves live in `notes` and rebuild a `FullTree` for witnesses.
 const META_TREE: &str = "tree";
@@ -1696,6 +1700,20 @@ impl Storage {
 
     pub fn load_safety(&self) -> Result<Option<SafetyState>> {
         self.get(CF_META, META_SAFETY.as_bytes())
+    }
+
+    /// Persist the locked block beside the lock (audit v4, CON-4), or clear it with `None`.
+    /// Fsynced like the safety state: it is part of the same promise.
+    pub fn save_locked_block(&self, block: Option<&Block>) -> Result<()> {
+        match block {
+            Some(b) => self.db.put_cf_opt(self.cf(CF_META), META_LOCKED_BLOCK, b.encode(), &sync_opts())?,
+            None => self.db.delete_cf_opt(self.cf(CF_META), META_LOCKED_BLOCK, &sync_opts())?,
+        }
+        Ok(())
+    }
+
+    pub fn locked_block(&self) -> Result<Option<Block>> {
+        Ok(self.get_meta_raw(META_LOCKED_BLOCK)?.map(|bytes| Block::decode(&bytes)).transpose()?)
     }
 }
 
@@ -4161,6 +4179,22 @@ mod tests {
         };
         s.save_safety(&state).unwrap();
         assert_eq!(s.load_safety().unwrap(), Some(state));
+    }
+
+    /// The locked block rides beside the lock (audit v4, CON-4): written when the lock is above
+    /// the head, cleared when it is not, and read back by `resume_consensus`.
+    #[test]
+    fn locked_block_roundtrip_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis(1);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.locked_block().unwrap(), None);
+        let b = gs.block.clone();
+        s.save_locked_block(Some(&b)).unwrap();
+        assert_eq!(s.locked_block().unwrap(), Some(b));
+        s.save_locked_block(None).unwrap();
+        assert_eq!(s.locked_block().unwrap(), None);
     }
 
     #[test]

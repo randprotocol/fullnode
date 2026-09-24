@@ -13,6 +13,7 @@ use anyhow::{anyhow, Context, Result};
 use libp2p::{Multiaddr, PeerId};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
+use randprotocol_core::Block;
 use randprotocol_core::genesis::{Genesis, GenesisState};
 use randprotocol_core::{Hash, Keypair, Ledger, NoVerified, ShieldedAddress, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
 use randprotocol_zkvm::executor::ZkExecutor;
@@ -182,12 +183,27 @@ pub fn resume_consensus(
     let head_qc = storage.head_qc()?;
     let ledger = reload_ledger(storage, gs, executor.as_ref())?;
     let safety = storage.load_safety()?;
+    // The locked block kept beside the lock (audit v4, CON-4); `resume` puts it back in the tree.
+    let locked_block = storage.locked_block()?;
     let mut ccfg = ConsensusConfig::new(gs.chain_id, gs.validators.clone(), gs.hash());
     ccfg.epoch_blocks = gs.epoch_blocks;
     ccfg.base_timeout = base_timeout;
     ccfg.max_timeout = max_timeout;
     let epoch_sets = storage.load_epoch_sets()?;
-    Ok(HotStuff::resume(ccfg, signer, head_block, head_qc, ledger, safety, epoch_sets, executor))
+    Ok(HotStuff::resume(ccfg, signer, head_block, head_qc, ledger, safety, locked_block, epoch_sets, executor))
+}
+
+/// The answer to a by-hash fetch: the block from the tree or the committed chain; failing that,
+/// a validator's signed not-held (audit v4, CON-4) so the asker can count its stake toward
+/// releasing a lock, and an observer's `Block(None)` — its word carries no stake.
+fn block_by_hash_response(hs: &HotStuff, storage: &Storage, h: &Hash) -> SyncResponse {
+    match hs.block(h).cloned().or_else(|| storage.block_by_hash(h).ok().flatten()) {
+        Some(b) => SyncResponse::Block(Some(b)),
+        None => match hs.not_held(h) {
+            Some(n) => SyncResponse::NotHeld(n),
+            None => SyncResponse::Block(None),
+        },
+    }
 }
 
 pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: VerifyMode, executor: &dyn ConfidentialExecutor) -> Result<u64> {
@@ -484,6 +500,9 @@ struct Node {
     /// Free space on the data directory's filesystem, measured at startup and on every status
     /// tick; what `NodeStatus::disk_free_bytes` and `disk_low` publish (audit v4 OPS-3).
     disk_free_bytes: u64,
+    /// The hash of the locked block storage currently holds beside the lock (audit v4, CON-4),
+    /// so a vote whose lock did not move costs one fsync, not a rewrite of the block too.
+    locked_persisted: Option<Hash>,
     /// Transaction hashes this node has already refused for a reason about their bytes, so a
     /// re-gossiped copy costs a hash lookup instead of a proof verification.
     refused: admission::RefusedCache,
@@ -729,6 +748,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // reports as *in the current set* is `active_validator`.
     let signer = if cfg.validator { Some(Keypair::from_seed(cfg.seed)?) } else { None };
     let mut hs = resume_consensus(&storage, &gs, signer, cfg.base_timeout, cfg.max_timeout, executor.clone())?;
+    let locked_persisted = storage.locked_block()?.map(|b| b.hash());
     // The covered source (spec §3.2): on a chain that aggregates, proposals and candidates
     // carrying an `Aggregate` apply through the covered-carrying path, answered from the store.
     // Set once, before the loop's first proposal; a chain without the section never consults it.
@@ -889,6 +909,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
         disk_free_bytes,
+        locked_persisted,
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         verified,
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
@@ -995,6 +1016,19 @@ impl Node {
                 self.cfg.min_free_disk_bytes.saturating_mul(crate::disk::DISK_LOW_FACTOR) / (1 << 20)
             );
         }
+    }
+
+    /// The locked block beside the lock (audit v4, CON-4): written when the lock moves to a block
+    /// this node holds above its head, cleared when the lock is back at the head, skipped when
+    /// storage already holds exactly this one.
+    fn persist_locked_block(&mut self, locked: Option<Block>) -> Result<()> {
+        let hash = locked.as_ref().map(|b| b.hash());
+        if hash == self.locked_persisted {
+            return Ok(());
+        }
+        self.storage.save_locked_block(locked.as_ref())?;
+        self.locked_persisted = hash;
+        Ok(())
     }
 
     fn publish_status(&self) {
@@ -1268,7 +1302,10 @@ impl Node {
         let mut to_record: Vec<(u64, ValidatorSet)> = Vec::new();
         while let Some(a) = queue.pop_front() {
             match a {
-                Action::PersistSafety(s) => self.storage.save_safety(&s)?,
+                Action::PersistSafety(s, locked) => {
+                    self.storage.save_safety(&s)?;
+                    self.persist_locked_block(locked)?;
+                }
                 // Nothing is persisted and nothing else in the batch runs: this node's committed
                 // history and the set's disagree, so every finality answer it could give from here
                 // is suspect. Stop; startup's `verify_chain` decides what the restart does with the
@@ -1664,11 +1701,11 @@ impl Node {
                 SyncResponse::Blocks(batch)
             }
             SyncRequest::BlockByHash(h) => {
-                let b = self.hs.block(&h).cloned().or_else(|| self.storage.block_by_hash(&h).ok().flatten());
                 // A by-hash fetch is a single block with no aggregate context beside it: serve
                 // the stored block untouched, marker forms and all, and let the fetcher's
-                // acceptance decide (the batch path's sealed form is built in `Blocks`).
-                SyncResponse::Block(b)
+                // acceptance decide (the batch path's sealed form is built in `Blocks`). A block
+                // this node does not hold gets a validator's signed not-held (audit v4, CON-4).
+                block_by_hash_response(&self.hs, &self.storage, &h)
             }
         }
     }
@@ -1722,7 +1759,9 @@ impl Node {
     }
 
     /// No peer can supply block `h`. If consensus is waiting on it as the high QC's block,
-    /// let the replica fall back to the committed head so it can propose again.
+    /// let the replica fall back to the committed head so it can propose again. The lock is not
+    /// released here (audit v4, CON-4): failed fetches are attempts, not evidence — that comes
+    /// only from the signed `NotHeld` answers counted in `on_sync_response`.
     fn unobtainable(&mut self, h: Hash) -> Vec<Action> {
         self.hs.fallback_high_qc(&h)
     }
@@ -1820,6 +1859,25 @@ impl Node {
             }
             SyncResponse::Block(None) => {
                 tracing::debug!("peer {peer} does not have a requested block; trying another");
+                self.retry_fetch(request_id).await?;
+            }
+            SyncResponse::NotHeld(n) => {
+                // Signed evidence (audit v4, CON-4), counted only for the hash this request asked
+                // for; the replica verifies the signer against its current set and releases the
+                // lock once more than a third of the stake has attested. Then on to the next
+                // peer, as for `Block(None)`.
+                match self.fetch_inflight.get(&request_id).copied() {
+                    Some(h) if n.hash == h => {
+                        if self.hs.record_not_held(&n) {
+                            tracing::warn!(
+                                "lock on {h:?} released: validators holding more than a third of the stake attest \
+                                 they do not hold it (audit v4 CON-4)"
+                            );
+                        }
+                    }
+                    _ => tracing::debug!("peer {peer} attested not-held for a hash this node did not ask it for; ignored"),
+                }
+                tracing::debug!("peer {peer} attests it does not hold a requested block; trying another");
                 self.retry_fetch(request_id).await?;
             }
             SyncResponse::Blocks(blocks) => {
@@ -2120,6 +2178,10 @@ impl Node {
         ccfg.max_timeout = self.cfg.max_timeout;
         let signer = if self.hs.is_validator() { Some(Keypair::from_seed(self.cfg.seed)?) } else { None };
         let safety = self.hs.safety_state();
+        // The locked block rides the resume too (audit v4, CON-4): from the replica being
+        // replaced when it holds it, else from storage.
+        let locked_block =
+            self.hs.block(&safety.locked_qc.block_hash).cloned().or_else(|| self.storage.locked_block().ok().flatten());
         self.hs = HotStuff::resume(
             ccfg,
             signer,
@@ -2127,6 +2189,7 @@ impl Node {
             head.qc.clone(),
             ledger,
             Some(safety),
+            locked_block,
             sets,
             self.executor.clone(),
         );
@@ -2319,10 +2382,42 @@ mod tests {
             storage.head_qc().unwrap(),
             reload_ledger(&storage, &gs, executor.as_ref()).unwrap(),
             None,
+            None,
             EpochSets::new(gs.validators.clone()),
             executor,
         );
         assert_eq!(blind.on_proposal(proposal, 3), Err(ConsensusError::UnknownEpochSet(1)));
+    }
+
+    /// A by-hash fetch for a block this node does not hold (audit v4, CON-4): a validator answers
+    /// with a signed not-held over the genesis hash and the block hash, so the asker can count its
+    /// stake toward releasing a lock; an observer, whose word carries no stake, answers
+    /// `Block(None)` as before. A block it holds is served as before.
+    #[test]
+    fn a_validator_answers_an_unknown_hash_with_a_signed_not_held_and_an_observer_does_not() {
+        let (_d, storage, gs, _ledger) = chain_past_a_boundary();
+        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
+        let resume = |signer: Option<Keypair>| {
+            resume_consensus(&storage, &gs, signer, Duration::from_secs(1), Duration::from_secs(8), executor.clone()).unwrap()
+        };
+        let validator = resume(Some(key(1)));
+        let unknown = Hash::digest(b"nobody has this");
+        match block_by_hash_response(&validator, &storage, &unknown) {
+            SyncResponse::NotHeld(n) => {
+                assert_eq!(n.hash, unknown);
+                assert_eq!(n.signer, *key(1).public_key());
+                assert!(n.verify(&gs.hash()));
+                assert!(!n.verify(&Hash::ZERO), "bound to this chain");
+            }
+            other => panic!("a validator answers a signed not-held: {other:?}"),
+        }
+        let head = storage.head_block().unwrap();
+        assert!(matches!(
+            block_by_hash_response(&validator, &storage, &head.hash()),
+            SyncResponse::Block(Some(b)) if b.hash() == head.hash()
+        ));
+        let observer = resume(None);
+        assert!(matches!(block_by_hash_response(&observer, &storage, &unknown), SyncResponse::Block(None)));
     }
 
     /// The startup check (H3): a genesis whose `hc_bundle` is not this build's guest is refused,

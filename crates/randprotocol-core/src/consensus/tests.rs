@@ -149,7 +149,7 @@ impl Sim {
                 Action::ScheduleTimeout { view, .. } => self.timers[i] = Some(view),
                 Action::ReadyToPropose { view } => self.pending_propose[i] = Some(view),
                 Action::FetchBlock(h) => self.fetches.push((i, h)),
-                Action::PersistSafety(_) => {}
+                Action::PersistSafety(..) => {}
                 // A real node stops here; the simulator records it so a test can assert it, and
                 // `assert_consistent` fails loudly if one ever appears unexpectedly.
                 Action::SafetyViolation { committed, attempted } => {
@@ -612,6 +612,7 @@ fn resume_from_persisted_head_continues_chain() {
         head.qc.clone(),
         ledger,
         Some(safety.clone()),
+        None,
         sim.nodes[0].epoch_sets().clone(),
         std::sync::Arc::new(StubExecutor),
     );
@@ -663,6 +664,7 @@ fn a_ledger_resumed_at_height_h_accepts_a_bundle_timed_at_h() {
         head.qc.clone(),
         reloaded,
         Some(sim.nodes[0].safety_state()),
+        None,
         sim.nodes[0].epoch_sets().clone(),
         std::sync::Arc::new(StubExecutor),
     );
@@ -733,8 +735,11 @@ impl Sim {
         let cfg = config_of(self);
         let epoch_sets = old.epoch_sets().clone();
         let signer = if old.is_validator() { Some(Keypair::from_seed(*self.keys[i].seed()).unwrap()) } else { None };
+        // No locked block: the restart this models is the one where the lock advanced and the
+        // process died before the block beside it was written (audit v4, review focus 1) — the
+        // tests that hand `resume` the persisted block do so themselves.
         self.nodes[i] =
-            HotStuff::resume(cfg, signer, head, qc, ledger, Some(safety), epoch_sets, std::sync::Arc::new(StubExecutor));
+            HotStuff::resume(cfg, signer, head, qc, ledger, Some(safety), None, epoch_sets, std::sync::Arc::new(StubExecutor));
         self.timers[i] = None;
         self.pending_propose[i] = None;
         let acts = self.nodes[i].start();
@@ -937,6 +942,7 @@ fn a_stale_safety_state_never_lowers_the_lock() {
         qc,
         ledger,
         Some(safety),
+        None,
         epoch_sets,
         std::sync::Arc::new(StubExecutor),
     );
@@ -975,7 +981,7 @@ fn restart_does_not_double_vote_for_same_view() {
     let acts = sim.nodes[victim].on_proposal(proposal.clone(), sim.now).unwrap();
     let voted = has_vote(&acts, view);
     assert!(voted, "victim should vote the first time");
-    assert!(acts.iter().any(|a| matches!(a, Action::PersistSafety(_))), "safety must be persisted before voting");
+    assert!(acts.iter().any(|a| matches!(a, Action::PersistSafety(..))), "safety must be persisted before voting");
     assert_eq!(sim.nodes[victim].safety_state().last_voted_view, view);
 
     sim.restart(victim);
@@ -1147,17 +1153,40 @@ fn leader_falls_back_when_high_qc_block_is_unobtainable() {
         sim.handle(i, acts);
     }
     assert!(sim.nodes.iter().all(|n| n.high_qc().block_hash == ghost));
-    // Fetches fail (no one has it); the node layer then calls the fallback on every replica.
-    sim.fetches.clear();
-    let before = sim.committed[0].len();
-    for _ in 0..12 {
+    // Fetches fail (no one has it); the node layer then calls the fallback on every replica, and
+    // again on every later fetch of the ghost — the NewViews still queued re-announce it. The
+    // fallback moves the high QC only (audit v4, CON-4): the lock waits for signed evidence.
+    fn fallback_all(sim: &mut Sim) {
         for i in 0..4 {
             let h = sim.nodes[i].high_qc().block_hash;
-            if !sim.nodes[i].has_block(&h) {
-                let acts = sim.nodes[i].fallback_high_qc(&h);
-                sim.handle(i, acts);
+            if sim.nodes[i].has_block(&h) {
+                continue;
             }
+            let locked_before = sim.nodes[i].locked_qc().clone();
+            let acts = sim.nodes[i].fallback_high_qc(&h);
+            sim.handle(i, acts);
+            assert_eq!(sim.nodes[i].high_qc().view, sim.nodes[i].committed_qc_view(), "the high QC fell back to the head");
+            assert_eq!(*sim.nodes[i].locked_qc(), locked_before, "an unsigned failure never touches the lock");
         }
+    }
+    sim.fetches.clear();
+    fallback_all(&mut sim);
+    // The signed evidence the node layer gathers: every other validator attests it does not hold
+    // the block a replica is locked on — more than a third of the stake, so the lock releases.
+    for i in 0..4 {
+        let locked = sim.nodes[i].locked_qc().clone();
+        if locked.view <= sim.nodes[i].committed_qc_view() || sim.nodes[i].has_block(&locked.block_hash) {
+            continue;
+        }
+        for j in (0..4).filter(|&j| j != i) {
+            let n = NotHeld::sign(&sim.keys[j], &sim.gs.hash(), &locked.block_hash);
+            sim.nodes[i].record_not_held(&n);
+        }
+        assert_eq!(sim.nodes[i].locked_qc().view, sim.nodes[i].committed_qc_view(), "released on more than a third");
+    }
+    let before = sim.committed[0].len();
+    for _ in 0..12 {
+        fallback_all(&mut sim);
         sim.step(vec![]);
         sim.fetches.clear();
     }
@@ -1531,6 +1560,7 @@ fn qcs_across_a_boundary_verify_against_their_own_epoch() {
         head.block.clone(),
         head.qc.clone(),
         ledger,
+        None,
         None,
         epoch_sets,
         std::sync::Arc::new(StubExecutor),
@@ -2030,4 +2060,149 @@ fn a_proposal_past_the_view_window_is_refused_not_stored() {
     let edge = block_on_head(&sim, 1, current + PROPOSAL_VIEW_WINDOW, 5);
     let r = sim.nodes[1].on_proposal(edge, 5);
     assert!(!matches!(r, Err(ConsensusError::ViewTooFarAhead { .. })), "{r:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The lock is released only on signed evidence (audit v4, CON-4)
+// ---------------------------------------------------------------------------
+
+/// Run the simulation until some replica is locked above its committed head, and return it.
+fn locked_above_head(sim: &mut Sim) -> usize {
+    for _ in 0..24 {
+        sim.step(vec![]);
+        if let Some(i) = (0..sim.nodes.len()).find(|&i| sim.nodes[i].locked_qc().view > sim.nodes[i].committed_qc_view()) {
+            return i;
+        }
+    }
+    panic!("no replica locked past its committed head");
+}
+
+/// Drive `sim` to a replica locked on a block above its head that it no longer holds — the
+/// position a restart leaves a validator in when the locked block was never persisted.
+fn lock_on_unobtainable(sim: &mut Sim) -> usize {
+    let victim = locked_above_head(sim);
+    sim.restart(victim);
+    let hs = &sim.nodes[victim];
+    assert!(hs.locked_qc().view > hs.committed_qc_view(), "the lock survives the restart");
+    assert!(!hs.has_block(&hs.locked_qc().block_hash), "the restart dropped the locked block");
+    victim
+}
+
+#[test]
+fn eight_unsigned_not_found_replies_no_longer_release_the_lock() {
+    let mut sim = setup(4, 4);
+    let victim = lock_on_unobtainable(&mut sim);
+    let locked = sim.nodes[victim].locked_qc().clone();
+    // Eight `Block(None)`s and timeouts are eight failed fetches: the node layer's give-up, which
+    // used to take the lock back on nothing but unsigned answers from whoever it asked.
+    for _ in 0..8 {
+        sim.nodes[victim].fallback_high_qc(&locked.block_hash);
+    }
+    assert_eq!(*sim.nodes[victim].locked_qc(), locked, "no signed evidence, no release");
+}
+
+#[test]
+fn not_held_from_more_than_a_third_of_the_stake_releases_the_lock_and_less_does_not() {
+    // Six equal stakes: a third is 2, "strictly more than" is 3 signers.
+    let mut sim = setup(6, 6);
+    let victim = lock_on_unobtainable(&mut sim);
+    let h = sim.nodes[victim].locked_qc().block_hash;
+    let g = sim.gs.hash();
+    let others: Vec<usize> = (0..6).filter(|&i| i != victim).collect();
+    let sign = |i: usize| NotHeld::sign(&sim.keys[i], &g, &h);
+    assert!(!sim.nodes[victim].record_not_held(&sign(others[0])));
+    assert!(!sim.nodes[victim].record_not_held(&sign(others[1])));
+    assert!(!sim.nodes[victim].record_not_held(&sign(others[1])), "a repeat signer counts once");
+    assert_eq!(sim.nodes[victim].not_held_stake(&h), 2 * MIN_STAKE as u128);
+    assert!(sim.nodes[victim].locked_qc().block_hash == h, "two of six is not more than a third");
+    assert!(sim.nodes[victim].record_not_held(&sign(others[2])));
+    assert_eq!(sim.nodes[victim].locked_qc().view, sim.nodes[victim].committed_qc_view());
+    assert_eq!(sim.nodes[victim].not_held_stake(&h), 0, "the evidence is cleared with the release");
+}
+
+#[test]
+fn a_not_held_from_outside_the_current_set_or_for_another_chain_counts_nothing() {
+    let mut sim = setup(4, 4);
+    let victim = lock_on_unobtainable(&mut sim);
+    let h = sim.nodes[victim].locked_qc().block_hash;
+    let g = sim.gs.hash();
+    let stranger = Keypair::from_seed([9; 32]).unwrap(); // a key in no set
+    assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&stranger, &g, &h)));
+    let other = (0..4).find(|&i| i != victim).unwrap();
+    assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[other], &Hash([7; 32]), &h)));
+    // A tampered attestation: a real signer's signature moved onto another hash.
+    let mut moved = NotHeld::sign(&sim.keys[other], &g, &Hash([8; 32]));
+    moved.hash = h;
+    assert!(!sim.nodes[victim].record_not_held(&moved));
+    assert_eq!(sim.nodes[victim].not_held_stake(&h), 0);
+    assert_eq!(sim.nodes[victim].locked_qc().block_hash, h);
+}
+
+#[test]
+fn a_resumed_validator_finds_its_locked_block_without_a_fetch() {
+    let mut sim = setup(4, 4);
+    let victim = locked_above_head(&mut sim);
+    let old = &sim.nodes[victim];
+    let locked_hash = old.locked_qc().block_hash;
+    let block = old.block(&locked_hash).expect("the running replica holds its locked block").clone();
+    assert_eq!(block.parent(), old.committed_hash(), "the locked block sits on the head");
+    let safety = old.safety_state();
+    let ledger = old.committed_ledger().clone();
+    // The head and its QC as storage holds them (`Sim::restart`'s recipe): the last commit, or
+    // genesis when the lock got ahead of the head before anything committed.
+    let (head, qc) = match sim.committed[victim].last() {
+        Some(cb) => (cb.block.clone(), cb.qc.clone()),
+        None => (old.block(&old.committed_hash()).unwrap().clone(), QuorumCertificate::genesis(old.committed_hash())),
+    };
+    let epoch_sets = old.epoch_sets().clone();
+    let signer = || Some(Keypair::from_seed(*sim.keys[victim].seed()).unwrap());
+    let mut resumed = HotStuff::resume(
+        config_of(&sim),
+        signer(),
+        head.clone(),
+        qc.clone(),
+        ledger.clone(),
+        Some(safety.clone()),
+        Some(block.clone()),
+        epoch_sets.clone(),
+        std::sync::Arc::new(StubExecutor),
+    );
+    assert!(resumed.has_block(&block.hash()), "the persisted locked block is back in the tree");
+    assert_eq!(resumed.locked_qc().block_hash, locked_hash);
+    // A valid proposal on the head, justified by the head's own (older) certificate — the branch
+    // `a_resumed_validator_keeps_its_lock` shows a blind replica must fetch on. Holding the
+    // locked block, this one can check the branch itself: no fetch.
+    resumed.start();
+    let view = resumed.view();
+    let li = sim.addr_to_idx[&resumed.leader(view)];
+    let mut header = block.header.clone();
+    header.view = view;
+    header.proposer = sim.keys[li].public_key().clone();
+    header.timestamp_ms += 1;
+    let mut after = ledger.clone();
+    after.set_height(header.height);
+    after.set_timestamp_ms(header.timestamp_ms);
+    after.apply_transactions(&[], &header.proposer.address(), &StubExecutor).unwrap();
+    after.close_block(header.height, &header.proposer.address());
+    header.state_root = after.state_root();
+    header.tx_root = Block::tx_root(&[]);
+    header.justify = qc.clone();
+    let sibling = Block::sign(header, vec![], &sim.keys[li]);
+    let acts = resumed.on_proposal(sibling.clone(), sim.now + 1).expect("a well-formed proposal on the head");
+    assert!(!acts.iter().any(|a| matches!(a, Action::FetchBlock(_))), "no FetchBlock: {acts:?}");
+    // Without the block it fetches, as before.
+    let mut again = HotStuff::resume(
+        config_of(&sim),
+        signer(),
+        head,
+        qc,
+        ledger,
+        Some(safety),
+        None,
+        epoch_sets,
+        std::sync::Arc::new(StubExecutor),
+    );
+    again.start();
+    let acts = again.on_proposal(sibling, sim.now + 1).expect("accepted");
+    assert!(acts.iter().any(|a| matches!(a, Action::FetchBlock(h) if *h == locked_hash)), "{acts:?}");
 }

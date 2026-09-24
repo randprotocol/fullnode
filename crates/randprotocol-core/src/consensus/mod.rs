@@ -62,6 +62,37 @@ impl NewView {
     }
 }
 
+/// A validator's signed word that it holds no block of a hash it was asked for (audit v4,
+/// CON-4): the evidence a lock is released on. Over `rand-not-held-1 ‖ genesis ‖ hash`, so an
+/// attestation is bound to one chain and one block; the asker verifies it against its current
+/// validator set and counts the signer's stake, and lowers its lock only once the signers hold
+/// strictly more than a third of the set's stake — so at least one honest validator is among
+/// them. Timeouts and unsigned `Block(None)` answers are fetch attempts, never evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotHeld {
+    pub hash: Hash,
+    pub signer: PublicKey,
+    pub signature: Signature,
+}
+
+impl NotHeld {
+    fn message(genesis: &Hash, hash: &Hash) -> Vec<u8> {
+        let mut m = Vec::with_capacity(64);
+        m.extend_from_slice(genesis.as_bytes());
+        m.extend_from_slice(hash.as_bytes());
+        Hash::digest_domain(b"rand-not-held-1", &m).0.to_vec()
+    }
+
+    pub fn sign(key: &Keypair, genesis: &Hash, hash: &Hash) -> NotHeld {
+        let signature = key.sign(&Self::message(genesis, hash));
+        NotHeld { hash: *hash, signer: key.public_key().clone(), signature }
+    }
+
+    pub fn verify(&self, genesis: &Hash) -> bool {
+        self.signer.verify(&Self::message(genesis, &self.hash), &self.signature)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsensusMessage {
     Proposal(Block),
@@ -188,8 +219,11 @@ pub enum Action {
     /// and feed it to `on_proposal`. Unknown parents of incoming proposals are
     /// reported through `ConsensusError::UnknownParent` instead.
     FetchBlock(Hash),
-    /// Persist before executing any later action in the same batch.
-    PersistSafety(SafetyState),
+    /// Persist before executing any later action in the same batch. The block is the one the
+    /// new `locked_qc` certifies when the lock is above the committed head (audit v4, CON-4),
+    /// `None` when it is not: storage keeps it beside the lock so a restarted validator finds
+    /// its locked block without a fetch, and clears it when the lock is back at the head.
+    PersistSafety(SafetyState, Option<Block>),
     /// A three-chain committed a block that does not descend from this replica's committed head.
     /// Its answers about finality cannot be trusted from here on, so the node layer stops rather
     /// than serving them (audit v3, the CON-3 candidate: this used to be a log line and a

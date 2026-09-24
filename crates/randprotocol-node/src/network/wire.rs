@@ -1,6 +1,6 @@
 //! Wire types exchanged between RAND nodes.
 
-use randprotocol_core::consensus::{CommittedBlock, ConsensusMessage};
+use randprotocol_core::consensus::{CommittedBlock, ConsensusMessage, NotHeld};
 use randprotocol_core::{Block, Hash, Transaction};
 use serde::{Deserialize, Serialize};
 
@@ -31,4 +31,8 @@ pub enum SyncRequest {
 pub enum SyncResponse {
     Blocks(Vec<CommittedBlock>),
     Block(Option<Block>),
+    /// A validator's signed word that it holds no block of the requested hash (audit v4, CON-4):
+    /// the evidence a lock is released on. Appended last, so an older node's encodings are
+    /// unchanged; one that cannot decode it counts the fetch as failed, as it would a timeout.
+    NotHeld(NotHeld),
 }

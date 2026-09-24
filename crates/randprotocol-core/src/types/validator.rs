@@ -71,6 +71,13 @@ impl ValidatorSet {
         stake.saturating_mul(3) > self.total_stake().saturating_mul(2)
     }
 
+    /// `stake * 3 > total`, i.e. strictly more than a third: with fewer than a third of the stake
+    /// Byzantine, any such set holds at least one honest validator (audit v4, CON-4's release
+    /// rule).
+    pub fn has_third(&self, stake: u128) -> bool {
+        stake.saturating_mul(3) > self.total_stake()
+    }
+
     /// Round-robin leader. Hook for a future sortition beacon.
     ///
     /// Panic backstop for an empty set, which has no leader. Consensus never asks: an epoch whose
@@ -117,6 +124,21 @@ mod tests {
         let weighted = vset(&[10, 1, 1]);
         assert!(weighted.has_quorum(10));
         assert!(!weighted.has_quorum(2));
+    }
+
+    #[test]
+    fn a_third_is_strictly_more_than_a_third() {
+        let six = vset(&[1, 1, 1, 1, 1, 1]);
+        assert!(!six.has_third(2));
+        assert!(six.has_third(3));
+        let four = vset(&[1, 1, 1, 1]);
+        assert!(!four.has_third(1));
+        assert!(four.has_third(2));
+        let weighted = vset(&[10, 1, 1]);
+        assert!(weighted.has_third(10));
+        assert!(!weighted.has_third(4));
+        assert!(weighted.has_third(5));
+        assert!(!weighted.has_third(0));
     }
 
     #[test]
