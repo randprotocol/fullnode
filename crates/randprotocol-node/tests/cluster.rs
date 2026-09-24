@@ -286,6 +286,56 @@ async fn four_validators_plus_late_observer_syncs() {
     assert!(!peers.as_array().unwrap().is_empty());
 }
 
+/// A pruned validator (n2, 2 s of retained history at 150 ms blocks) stays in consensus after its
+/// floor rises, and a late observer that bootstraps through it alone still gets the whole chain:
+/// the sync picker must route the heights n2 pruned to an archive (n0 or n1), never to n2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pruned_validator_keeps_committing_and_a_late_joiner_syncs_from_the_archives() {
+    init_tracing();
+    let ks = keys(4);
+    let gen = genesis(&ks[..3]);
+    // n0 and n1 keep everything; n2 keeps two seconds of blocks (FAST is 150 ms a block).
+    let n0 = start_node(&ks[0], &gen, vec![], true).await;
+    let boot = vec![bootstrap_addr(&n0)];
+    let n1 = start_node(&ks[1], &gen, boot.clone(), true).await;
+    let dir2 = tempfile::tempdir().unwrap();
+    std::fs::write(dir2.path().join("genesis.json"), gen.to_json()).unwrap();
+    let n2 = start_in_pruned(dir2, &ks[2], boot.clone(), true, FAST, Some(Duration::from_secs(2))).await;
+    wait_height(&[&n0, &n1, &n2], 80, Duration::from_secs(90)).await;
+
+    // The pruned node's floor rose and block 1 is gone there, while the archives hold it.
+    let floor = n2.handle.storage.prune_floor().unwrap();
+    assert!(floor > 1, "floor {floor} never rose");
+    assert!(n2.handle.storage.block_by_height(1).unwrap().is_none());
+    assert!(n0.handle.storage.block_by_height(1).unwrap().is_some());
+    assert!(n2.handle.storage.block_by_height(0).unwrap().is_some(), "genesis stays");
+    // Its status advertises the floor.
+    let s = n2.rpc.call("rand_status", serde_json::json!([])).await.unwrap();
+    assert_eq!(s["prune_floor"].as_u64().unwrap(), floor);
+    assert_eq!(s["prune_history_secs"].as_u64().unwrap(), 2);
+    // And it still takes part: the chain keeps moving with it as a validator.
+    wait_height(&[&n2], n2.height() + 10, Duration::from_secs(30)).await;
+
+    // A late observer joins through the pruned node's address only, and still ends up with
+    // the whole chain: the picker must route it to an archive for the heights n2 pruned.
+    let obs = start_node(&ks[3], &gen, vec![bootstrap_addr(&n2)], false).await;
+    let target = n0.height();
+    wait_height(&[&obs], target, Duration::from_secs(90)).await;
+    assert!(obs.handle.storage.block_by_height(1).unwrap().is_some(), "the observer got block 1 from an archive");
+    for h in [1, floor, target] {
+        assert_eq!(
+            obs.handle.storage.block_by_height(h).unwrap().unwrap().hash(),
+            n0.handle.storage.block_by_height(h).unwrap().unwrap().hash(),
+            "height {h}"
+        );
+    }
+    // A pruned node restarts and verifies structurally.
+    let dir2 = stop(n2).await;
+    let n2 = start_in_pruned(dir2, &ks[2], boot, true, FAST, Some(Duration::from_secs(2))).await;
+    wait_height(&[&n2], target, Duration::from_secs(60)).await;
+    assert!(n2.handle.storage.prune_floor().unwrap() >= floor);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn validator_restarts_from_disk_and_resumes() {
     init_tracing();
