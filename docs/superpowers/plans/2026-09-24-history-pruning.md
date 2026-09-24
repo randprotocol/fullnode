@@ -20,7 +20,7 @@
 - The flag is absent by default; a store that never pruned has no `prune_floor` meta key and reads as floor 0. Nothing is keyed on `chain_id`.
 - Block 0 and its QC are never deleted. No block at or above `keep_from = head - max(aggregation.window, 2)` is deleted.
 - Every delete of a pass and the new floor land in one `WriteBatch` written with `sync_opts()`.
-- `PRUNE_PASS_MAX = 4096` blocks per pass; the pass runs when `head % 16 == 0`, in `spawn_blocking`, after the proof-pruning pass.
+- `PRUNE_PASS_MAX = 512` blocks per pass; the pass runs when `head % 16 == 0`, in `spawn_blocking`, after the proof-pruning pass.
 - Range compaction of `blocks` and `qcs` every 64th pass that deleted something.
 - `Status` gains exactly one trailing field `floor: u64`.
 - RPC error for a pruned height: code `-32010`, message `pruned: height {h} is below this node's retention floor {floor}`, `data: {"floor": floor}`.

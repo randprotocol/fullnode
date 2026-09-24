@@ -223,8 +223,10 @@ const META_TOKENS_V2: &str = "tokens_v2";
 /// whose block this store still holds. Absent on a store that never pruned — an archive.
 const META_PRUNE_FLOOR: &str = "prune_floor";
 /// Blocks one `prune_history` pass deletes at most, so enabling the flag on a node holding days
-/// of history drains it over minutes of passes rather than one long stall.
-pub const PRUNE_PASS_MAX: u64 = 4096;
+/// of history drains it over minutes of passes rather than one long stall. ~30–40 MB of block
+/// reads per pass on chain 14; a node holding four days of history drains in a few hours of
+/// passes.
+pub const PRUNE_PASS_MAX: u64 = 512;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -274,6 +276,11 @@ pub struct Storage {
     /// How many times the tree has actually been rebuilt, for the tests that assert the cache is
     /// doing its job.
     tree_builds: std::sync::atomic::AtomicUsize,
+    /// The floor `prune_history` last warned about hitting a torn store at, `u64::MAX` until
+    /// the first such warning. A torn floor does not move, and every pass below `keep_from`
+    /// re-tries it, so without this the warning would fire once per pass forever instead of
+    /// once per floor value (final-review fix #1).
+    torn_floor_warned: std::sync::atomic::AtomicU64,
 }
 
 /// What [`Storage::drop_receipts_index`] found and removed: whether the `receipts_by_program`
@@ -544,6 +551,7 @@ impl Storage {
             db,
             tree_cache: std::sync::Mutex::new(None),
             tree_builds: std::sync::atomic::AtomicUsize::new(0),
+            torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX),
         };
         storage.backfill_receipts_index()?;
         storage.prune_committed_qcs()?;
@@ -1498,7 +1506,7 @@ impl Storage {
         let mut deleted = 0u64;
         while h < keep_from && deleted < max_blocks {
             let Some(block) = self.block_by_height(h)? else {
-                if h == floor {
+                if h == floor && self.torn_floor_warned.swap(h, std::sync::atomic::Ordering::Relaxed) != h {
                     tracing::warn!("history pruning: block {h} missing at the floor; the store is torn, nothing pruned");
                 }
                 break;
@@ -2504,11 +2512,14 @@ impl Storage {
                         .map_err(|e| format!("qc {h} unreadable: {e}"))?
                         .ok_or_else(|| format!("qc {h} missing"))?
                 } else {
-                    self.block_by_height(h + 1)
+                    let child = self
+                        .block_by_height(h + 1)
                         .map_err(|e| format!("block {h}'s certificate is lost: block {} unreadable: {e}", h + 1))?
-                        .ok_or_else(|| format!("block {h}'s certificate is lost: block {} missing", h + 1))?
-                        .header
-                        .justify
+                        .ok_or_else(|| format!("block {h}'s certificate is lost: block {} missing", h + 1))?;
+                    if child.height() != h + 1 {
+                        return Err(format!("block {h}'s certificate is lost: block {} claims height {}", h + 1, child.height()));
+                    }
+                    child.header.justify
                 };
                 if qc.block_hash != hash || qc.view != block.view() {
                     return Err(format!("qc {h} does not certify block {h}"));
@@ -5657,7 +5668,7 @@ mod tests {
         {
             // `init_genesis` touches no family the old build lacks, so it runs over the raw
             // fifteen-family handle exactly as the old build's own did.
-            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap(), tree_cache: Default::default(), tree_builds: Default::default() };
+            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX) };
             old.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);
             old.db.put_cf(old.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(&r).unwrap()).unwrap();
@@ -5693,7 +5704,7 @@ mod tests {
                 .iter()
                 .filter(|c| **c != CF_PROGRAM_PUBLIC)
                 .map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
-            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap(), tree_cache: Default::default(), tree_builds: Default::default() };
+            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX) };
             st.backfill_receipts_index().unwrap();
             st.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);

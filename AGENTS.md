@@ -47,12 +47,18 @@ lost quorum at height 248 953): a testnet-only node keeps one day of blocks and 
   `rand_getRawTransaction`, `rand_getBlockByHash`) keep answering `null` for a hash this node
   doesn't hold — only an archive can say "pruned" from "never existed". `rand_status` gains
   `prune_floor` (u64) and `prune_history_secs` (`null` when unset).
+- **Rollback:** a pruned data directory opened by a build ≤ v0.5.6 with the default
+  `--verify-chain quick` replays from genesis, finds block 1 missing and truncates the whole
+  ledger to genesis; run an older build on a pruned data directory only with `--verify-chain
+  off`, or re-sync from the archive.
 
 **Roll (operator, not yet run), in order:**
 
 1. **Archive first.** Move obs1's (randbridge-web) datadir onto a volume, no flag, before
    anything else touches the flag; confirm `rand_status.prune_floor == 0` and the head still
-   follows the fleet.
+   follows the fleet. `rpc.randprotocol.org` is served by droplet F, which will prune: repoint
+   the public RPC at obs1 before the roll, or accept `-32010` for heights older than a day there
+   — the operator's choice.
 2. **Wait until the chain is committing again.** Never roll a wire change onto a halted chain.
 3. **The seventeen droplets, one at a time**, built on E from the tagged commit:
    `PRUNE_ARGS="--prune-history 24h" deploy/update-droplet.sh <ip>`, waiting for
@@ -60,7 +66,10 @@ lost quorum at height 248 953): a testnet-only node keeps one day of blocks and 
    the first rolled validator's pass duration in its log before continuing**: a first pass over a
    backlog is awaited synchronously in the node's post-commit loop up to
    `PRUNE_PASS_MAX = 4096` blocks, so a validator holding much more than a day of history could
-   stall its own commits for the pass's duration on that first activation.
+   stall its own commits for the pass's duration on that first activation. **Gate each step**:
+   roll the next droplet only after the previous one's `rand_status.prune_floor` is within a day
+   of the head (its drain finished, ~2–3 h at 512 blocks a pass); never have more than one
+   validator draining at once.
 4. **Node A last**, separately: `BINDIR`/`PRUNE_ARGS="--prune-history 24h"` in `run-a.sh`'s
    environment, then `launchctl kill TERM gui/$(id -u)/org.randprotocol.node-a`.
 5. **Verify:** every validator's `prune_floor` rising, `du -ch db/*.sst` falling and flat, obs1

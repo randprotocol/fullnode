@@ -518,9 +518,10 @@ exception — a validator address, an amount and a replay nonce are public in th
 way a mint's amount is, because the validator register and the bridge's accounting are public
 (spec §8). A shielded note's later spend stays private in every case.
 
-On a node started with `--prune-history`, a height below `rand_status.prune_floor` (genesis
-excepted) answers error `-32010` `pruned: height h is below this node's retention floor f`
-with `data: {"floor": f}` — ask the archive for it.
+On a node started with `--prune-history`, a transaction whose block was pruned normally
+answers `null` (its location row went with the block); `-32010` `pruned: height h is below this
+node's retention floor f` with `data: {"floor": f}` is answered only when a location row survived
+and names a height below the floor.
 
 ### `rand_checkTransaction`
 Params: `[hash, key]`, where `key` is a per-transaction `TxKey` as 64 hex characters. Result:
@@ -560,9 +561,10 @@ by design. Amounts are strings, as everywhere chain state is served.
 
 Errors: `-32602` for a malformed hash or key (both are parsed before any storage read).
 
-On a node started with `--prune-history`, a height below `rand_status.prune_floor` (genesis
-excepted) answers error `-32010` `pruned: height h is below this node's retention floor f`
-with `data: {"floor": f}` — ask the archive for it.
+On a node started with `--prune-history`, a transaction whose block was pruned normally
+answers `null` (its location row went with the block); `-32010` `pruned: height h is below this
+node's retention floor f` with `data: {"floor": f}` is answered only when a location row survived
+and names a height below the floor.
 
 ### `rand_getBlockByHeight` / `rand_getBlockByHash`
 Params: `[height]` (integer) or `[hash]`. Result: `null` if unknown, else:
@@ -904,10 +906,11 @@ loop.
 
 Errors: `-32602` for an empty list or more than 64 hashes.
 
-On a node started with `--prune-history`, an `unknown` entry for a hash below the node's
-retention floor carries `floor` beside `status`: `{ "hash": "…", "status": "unknown", "floor": 10
-}`. It is still `unknown`, not an error — this method answers a page of hashes, not one lookup —
-and only an archive can say whether that hash was ever committed.
+On a pruned node (`rand_status.prune_floor > 0`), every `unknown` entry carries `floor` beside
+`status`: `{ "hash": "…", "status": "unknown", "floor": 10 }` — whether or not that particular
+hash's height is below it, since an archive is the only place that could say which. It is still
+`unknown`, not an error — this method answers a page of hashes, not one lookup — and only an
+archive can say whether that hash was ever committed.
 
 ### `rand_getReceipts`
 Params: `[program_id, from_height, to_height, limit?]`. Result:
@@ -927,6 +930,13 @@ is never split across two pages and a caller never has to de-duplicate one acros
 own `to_height` ended the page rather than `limit`.
 
 Errors: `-32602` for `to_height` below `from_height`.
+
+On a node started with `--prune-history`, a range that reaches a height below the floor (genesis
+excepted) answers error `-32010` naming the first such height —
+`pruned: height h is below this node's retention floor f` with `data: {"floor": f}` — ask the
+archive for it, rather than serving the range from the floor's receipts alone (the pruned heights'
+receipt rows go with their blocks — see the retention pass). `[0, to]` still serves genesis alone
+when `to` is 0.
 
 ### `rand_getWitnesses`
 Params: `[[index, …]]`, 1 to 32 leaf indices. Result:

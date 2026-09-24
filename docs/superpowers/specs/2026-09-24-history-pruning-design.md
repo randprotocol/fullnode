@@ -55,8 +55,9 @@ destructure in `main.rs`, and `NodeConfig.prune_history: Option<Duration>` in `n
   reads the wall clock and every node prunes the same heights for the same head.
 - `keep_from = head.saturating_sub(max(aggregation.window, 2))` when the chain has an
   aggregation section, else `head - 2`. No block at or above `keep_from` is deleted.
-- `PRUNE_PASS_MAX = 4096` blocks per pass, so enabling the flag on a node holding four days of
-  history drains it over ~60 passes (~16 minutes at 1 s blocks) without stalling commits.
+- `PRUNE_PASS_MAX = 512` blocks per pass (~30–40 MB of block reads per pass on chain 14), so
+  enabling the flag on a node holding four days of history drains in a few hours of passes
+  without stalling commits.
 
 **The pass** (`Storage::prune_history`) walks `h` from `max(floor, 1)` upward while
 `h < keep_from` and `block_by_height(h).timestamp_ms < cutoff_ms`, up to `PRUNE_PASS_MAX`
@@ -66,11 +67,11 @@ blocks. For each block it collects the keys to delete (the block's hash for `blo
 `Call`'s `receipts_by_program` key). All deletes for the pass and the new floor
 (`META_PRUNE_FLOOR = last deleted height + 1`) go in **one synced `WriteBatch`**, so a crash
 mid-pass leaves either the old floor with its blocks or the new floor without them, never a gap.
-Height-keyed families (`blocks`, `qcs`) use `delete_range_cf`. It returns the number of blocks
-pruned and logs `pruned {n} blocks below height {floor} at head {head}` when `n > 0`.
+Height-keyed families (`blocks`, `qcs`) take point deletes in one batch. It returns the number of
+blocks pruned and logs `pruned {n} blocks below height {floor} at head {head}` when `n > 0`.
 
-**Disk comes back only after compaction.** Every 64th pass that deleted anything calls
-`compact_range_cf` on `blocks` and `qcs` over `[genesis+1, floor)`. Between compactions
+**Disk comes back only after compaction.** Every 64th pass that deleted anything compacts
+`blocks` over `[1, floor)` in a background task, never overlapping itself. Between compactions
 `df` lags the floor; `rand_status` reports the floor, not free space.
 
 **Idempotence.** A pass at the same head deletes nothing the second time. A pass on an archive

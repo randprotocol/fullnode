@@ -1799,6 +1799,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             if to < from {
                 return Err(RpcError::invalid_params(format!("to_height {to} is below from_height {from}")));
             }
+            let first = from.max(1);
+            if to >= first {
+                refuse_pruned(st, first)?;
+            }
             let limit = match p.get(3) {
                 Some(Value::Null) | None => MAX_RECEIPTS_PAGE,
                 Some(_) => param::<usize>(p, 3, "limit")?.clamp(1, MAX_RECEIPTS_PAGE),
@@ -5594,6 +5598,11 @@ mod tests {
         assert_eq!(call(&st, "rand_getCompactBlocks", json!([0, 20])).await.unwrap_err().code, -32010);
         // Genesis alone is still served.
         assert_eq!(ok(&st, "rand_getBlocks", json!([0, 0])).await.as_array().unwrap().len(), 1);
+        // `rand_getReceipts` is a range method too: a range reaching below the floor is refused
+        // rather than silently answering an empty page (final-review fix #4).
+        let pid = Hash::ZERO.to_hex();
+        assert_eq!(call(&st, "rand_getReceipts", json!([pid, 0, 20])).await.unwrap_err().code, -32010);
+        assert!(ok(&st, "rand_getReceipts", json!([pid, 10, 12])).await.is_object());
     }
 
     #[tokio::test]
