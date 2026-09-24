@@ -11,7 +11,7 @@ use crate::ledger::tokens::{
 };
 use crate::ledger::{Ledger, ValidatorEntry};
 use crate::notes::{word8_from_hex, word8_to_bytes, Envelope, ShieldedAddress, Word8};
-use crate::types::{Block, BlockHeader, QuorumCertificate, ValidatorSet};
+use crate::types::{Block, BlockHeader, QuorumCertificate, ValidatorSet, SigningDomain};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -262,6 +262,13 @@ pub struct Genesis {
     /// and state root are byte-for-byte today's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregation: Option<crate::ledger::aggregation::AggregationConfig>,
+    /// Audit v4: the consensus signing domain (`SigningDomain`). Absent — chain 14 — or `0`:
+    /// votes, new-views and proposals sign exactly what they always signed. `1`: every one
+    /// carries the genesis hash under a fresh tag, so a signature for this chain verifies under
+    /// no other. Part of the genesis hash only when present; omitted entirely when absent, so
+    /// a file without it hashes byte-for-byte as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consensus_domain: Option<u32>,
     /// Phase S2: blocks per epoch — the validator set for epoch `e` is derived from the
     /// register as of the last block of epoch `e - 1`. Configurable so a cluster test does not
     /// have to run 1000 blocks to cross a boundary. Part of the genesis hash: two chains that
@@ -350,6 +357,8 @@ pub enum GenesisError {
     BridgeNeedsTokens,
     #[error("bad tokens config: {0}")]
     BadTokens(String),
+    #[error("unknown consensus_domain {0} (0 or 1)")]
+    BadConsensusDomain(u32),
     #[error("bad hc_bundle {0} (64 hex characters)")]
     BadHcBundle(String),
     #[error("bad alloc note {0}")]
@@ -398,6 +407,8 @@ pub struct GenesisState {
     pub validators: ValidatorSet,
     /// Phase S2: blocks per epoch, as the genesis file set it.
     pub epoch_blocks: u64,
+    /// The consensus signing domain's version (audit v4): 0 when the file has none.
+    pub consensus_domain: u32,
     pub ledger: Ledger,
     pub block: Block,
     /// The alloc notes in file order: commitment, envelope, amount.
@@ -407,6 +418,12 @@ pub struct GenesisState {
 impl GenesisState {
     pub fn hash(&self) -> Hash {
         self.block.hash()
+    }
+
+    /// What every consensus signature on this chain is under: the file's version over this
+    /// genesis hash.
+    pub fn signing_domain(&self) -> SigningDomain {
+        SigningDomain { version: self.consensus_domain, genesis: self.hash() }
     }
 }
 
@@ -491,6 +508,13 @@ impl Genesis {
         }
         if let Some(tokens) = &self.tokens {
             check_tokens(tokens, self.bridge.as_ref())?;
+        }
+        // The consensus domain (audit v4): a version this build cannot sign is refused here,
+        // not at the first vote.
+        if let Some(v) = self.consensus_domain {
+            if v > SigningDomain::MAX_VERSION {
+                return Err(GenesisError::BadConsensusDomain(v));
+            }
         }
         Ok(())
     }
@@ -690,6 +714,12 @@ impl Genesis {
                 commit.extend_from_slice(&n.to_be_bytes());
             }
         }
+        // The consensus domain (audit v4), tagged the same way and only when the file sets it:
+        // two chains that disagree about what a vote signs are two chains.
+        if let Some(v) = self.consensus_domain {
+            commit.extend_from_slice(b"consensus_domain");
+            commit.extend_from_slice(&v.to_be_bytes());
+        }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -702,6 +732,10 @@ impl Genesis {
             justify: QuorumCertificate { view: 0, block_hash: Hash::ZERO, votes: Vec::new() },
         };
         let block = Block { header, transactions: Vec::new(), signature: Signature::empty() };
+        // The signing domain carries the genesis hash, so it can only be set once the block
+        // exists; it is not state, so the root above is unaffected.
+        let consensus_domain = self.consensus_domain.unwrap_or(0);
+        ledger.set_signing_domain(SigningDomain { version: consensus_domain, genesis: block.hash() });
         Ok(GenesisState {
             chain_id: self.chain_id,
             faucet: self.faucet,
@@ -710,6 +744,7 @@ impl Genesis {
             hc_bundle,
             validators,
             epoch_blocks: self.epoch_blocks,
+            consensus_domain,
             ledger,
             block,
             notes,
@@ -983,6 +1018,7 @@ mod tests {
             bridge: None,
             tokens: None,
             aggregation: None,
+            consensus_domain: None,
             epoch_blocks: EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
             max_proof_bytes: None,
@@ -1000,6 +1036,31 @@ mod tests {
 
     fn build(g: &Genesis) -> GenesisState {
         g.build(&StubExecutor).unwrap()
+    }
+
+    /// Consensus domain v1 (audit v4) is genesis-gated: the field is committed only when present,
+    /// so chain 14's file — which has none — builds to the same hash; validation refuses a
+    /// version this build does not sign.
+    #[test]
+    fn a_genesis_with_consensus_domain_1_commits_it_and_one_without_is_unchanged() {
+        let base = genesis(1);
+        assert_eq!(base.consensus_domain, None, "chain 14's shape has no field");
+        let plain = build(&base);
+        let mut g = base.clone();
+        g.consensus_domain = Some(1);
+        let v1 = build(&g);
+        assert_ne!(v1.hash(), plain.hash(), "the version is part of the genesis binding");
+        assert_eq!((plain.consensus_domain, v1.consensus_domain), (0, 1));
+        assert_eq!(plain.signing_domain(), SigningDomain::v0(plain.hash()));
+        assert_eq!(v1.signing_domain(), SigningDomain::v1(v1.hash()));
+        assert_eq!(v1.ledger.signing_domain(), &v1.signing_domain(), "the ledger's replay check reads the same domain");
+        let mut bad = base.clone();
+        bad.consensus_domain = Some(2);
+        assert!(matches!(bad.validate(), Err(GenesisError::BadConsensusDomain(2))));
+        // The field round-trips through the file, and an absent one stays absent.
+        assert_eq!(Genesis::from_json(&g.to_json()).unwrap().consensus_domain, Some(1));
+        assert!(!base.to_json().contains("consensus_domain"));
+        assert_eq!(build(&Genesis::from_json(&base.to_json()).unwrap()).hash(), plain.hash());
     }
 
     /// Audit v3, CHAIN9-1: the admitted shapes are declared with a FRI profile of their own, and

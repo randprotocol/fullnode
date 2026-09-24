@@ -10,6 +10,7 @@ mod hotstuff;
 #[cfg(test)]
 mod tests;
 
+pub use crate::types::SigningDomain;
 pub use hotstuff::{CoveredSource, HotStuff};
 
 /// B2 (bridge hardening spec §3): on a chain with a bridge, a validator does not vote for a block
@@ -42,19 +43,13 @@ pub struct NewView {
 }
 
 impl NewView {
-    fn message(view: u64, high_qc: &QuorumCertificate) -> Vec<u8> {
-        let mut m = view.to_be_bytes().to_vec();
-        m.extend_from_slice(&bincode::serialize(high_qc).expect("qc serializes"));
-        Hash::digest_domain(b"rand-newview", &m).0.to_vec()
-    }
-
-    pub fn sign(view: u64, high_qc: QuorumCertificate, key: &Keypair) -> NewView {
-        let signature = key.sign(&Self::message(view, &high_qc));
+    pub fn sign(domain: &SigningDomain, view: u64, high_qc: QuorumCertificate, key: &Keypair) -> NewView {
+        let signature = key.sign(&domain.new_view_message(view, &high_qc).0);
         NewView { view, high_qc, sender: key.public_key().clone(), signature }
     }
 
-    pub fn verify(&self) -> bool {
-        self.sender.verify(&Self::message(self.view, &self.high_qc), &self.signature)
+    pub fn verify(&self, domain: &SigningDomain) -> bool {
+        self.sender.verify(&domain.new_view_message(self.view, &self.high_qc).0, &self.signature)
     }
 
     pub fn sender_address(&self) -> Address {
@@ -243,6 +238,9 @@ pub struct ConsensusConfig {
     /// The set of epoch 0. Every later epoch's set is derived from the register (spec §8).
     pub genesis_set: ValidatorSet,
     pub genesis_hash: Hash,
+    /// What every vote, new-view and proposal is signed under (audit v4, consensus domain v1):
+    /// from the genesis file's `consensus_domain`, v0 of `genesis_hash` when absent.
+    pub domain: SigningDomain,
     /// Blocks per epoch, from genesis: `epoch(h) = h / epoch_blocks`.
     pub epoch_blocks: u64,
     pub base_timeout: Duration,
@@ -262,6 +260,7 @@ impl ConsensusConfig {
         ConsensusConfig {
             chain_id,
             genesis_set,
+            domain: SigningDomain::v0(genesis_hash),
             genesis_hash,
             epoch_blocks: crate::ledger::staking::EPOCH_BLOCKS_DEFAULT,
             base_timeout: Duration::from_secs(1),

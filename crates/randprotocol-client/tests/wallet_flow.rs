@@ -93,6 +93,7 @@ fn genesis_full(
         bridge: None,
         tokens,
         aggregation: None,
+        consensus_domain: None,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words,
         max_proof_bytes: None,
@@ -124,6 +125,7 @@ async fn start_with(dir: &tempfile::TempDir, key: &Keypair, genesis: Genesis) ->
         max_timeout: Duration::from_secs(30),
         verify: randprotocol_node::storage::VerifyMode::Full,
         keep_raw_proofs: false,
+        min_free_disk_bytes: 0,
     })
     .await
     .expect("node starts")

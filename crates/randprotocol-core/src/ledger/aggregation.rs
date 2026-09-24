@@ -1124,6 +1124,7 @@ mod tests {
             bridge: None,
             tokens: None,
             aggregation: None,
+            consensus_domain: None,
             epoch_blocks: crate::genesis::EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
             max_proof_bytes: None,
@@ -2193,7 +2194,7 @@ mod payment_tests {
             state_root: after.state_root(),
             justify: QuorumCertificate::genesis(Hash::ZERO),
         };
-        Block::sign(header, txs, key)
+        Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), header, txs, key)
     }
 
     /// The fee split at bundle inclusion (spec §5.2): the proposer keeps exactly the floor, the
@@ -2450,7 +2451,7 @@ mod payment_tests {
             state_root: l.state_root(),
             justify: QuorumCertificate::genesis(Hash::ZERO),
         };
-        Block::sign(header, txs, key)
+        Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), header, txs, key)
     }
 
     /// Two covered bundles in block 1, on a chain of `window`; the aggregator registered.
@@ -2580,7 +2581,7 @@ mod payment_tests {
         let mut forged = pruned_tx.clone();
         forged.bundle.as_mut().unwrap().envelopes[0].body = vec![0xEE; 16];
         assert_ne!(forged.hash(), tx.hash(), "a substituted envelope changes the hash");
-        let block = Block::sign(
+        let block = Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), 
             BlockHeader {
                 height: 1,
                 view: 1,
@@ -2633,7 +2634,7 @@ mod payment_tests {
         // The block carries the marker form; its root is over the *raw* hashes, as the table
         // attests.
         let root = crate::crypto::merkle_root(&[tx.hash()]);
-        let block = Block::sign(
+        let block = Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), 
             BlockHeader {
                 height: 1,
                 view: 1,
@@ -2660,7 +2661,7 @@ mod payment_tests {
         };
         let mut header = block.header.clone();
         header.state_root = root_after;
-        let block = Block::sign(header, vec![pruned_tx.clone()], &a);
+        let block = Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), header, vec![pruned_tx.clone()], &a);
 
         let mut m = l.clone();
         m.apply_block_for_sync(&block, &BTreeMap::new(), std::slice::from_ref(&side), &StubExecutor, &NoVerified)

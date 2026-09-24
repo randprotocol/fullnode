@@ -162,6 +162,10 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     ledger.set_max_block_bytes(gs.ledger.max_block_bytes());
     ledger.set_max_call_envelope_bytes(gs.ledger.max_call_envelope_bytes());
     ledger.set_max_program_public_words(gs.ledger.max_program_public_words());
+    // And the consensus signing domain (audit v4): `load_ledger` comes back at v0, and a node
+    // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
+    // signature check.
+    ledger.set_signing_domain(gs.signing_domain());
     Ok(ledger)
 }
 
@@ -187,6 +191,7 @@ pub fn resume_consensus(
     let locked_block = storage.locked_block()?;
     let mut ccfg = ConsensusConfig::new(gs.chain_id, gs.validators.clone(), gs.hash());
     ccfg.epoch_blocks = gs.epoch_blocks;
+    ccfg.domain = gs.signing_domain();
     ccfg.base_timeout = base_timeout;
     ccfg.max_timeout = max_timeout;
     let epoch_sets = storage.load_epoch_sets()?;
@@ -2053,7 +2058,7 @@ impl Node {
             let Some(set) = sets.get(epoch) else {
                 anyhow::bail!("no validator set for epoch {epoch} (block {})", b.height());
             };
-            if !cb.qc.verify(set, &self.gs.hash()) {
+            if !cb.qc.verify(&self.gs.signing_domain(), set) {
                 anyhow::bail!("invalid qc for block {} in epoch {epoch}", b.height());
             }
             if b.proposer() != set.leader(b.view()) {
@@ -2174,6 +2179,7 @@ impl Node {
         let head = accepted.last().expect("non-empty");
         let mut ccfg = ConsensusConfig::new(self.gs.chain_id, self.gs.validators.clone(), self.gs.hash());
         ccfg.epoch_blocks = self.gs.epoch_blocks;
+        ccfg.domain = self.gs.signing_domain();
         ccfg.base_timeout = self.cfg.base_timeout;
         ccfg.max_timeout = self.cfg.max_timeout;
         let signer = if self.hs.is_validator() { Some(Keypair::from_seed(self.cfg.seed)?) } else { None };
@@ -2305,10 +2311,10 @@ mod tests {
             justify: QuorumCertificate {
                 view: head.view(),
                 block_hash: head.hash(),
-                votes: vec![Vote::sign(head.view(), head.hash(), k)],
+                votes: vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), head.view(), head.hash(), k)],
             },
         };
-        Block::sign(header, Vec::new(), k)
+        Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, Vec::new(), k)
     }
 
     /// The sync peer selection (the stall shape's unit test): the freshest connected peer
@@ -3251,7 +3257,7 @@ mod tests {
 
     /// `n` votes over `hash`, by the first `n` of `ks`.
     fn votes_of(view: u64, hash: Hash, ks: &[Keypair], n: usize) -> QuorumCertificate {
-        QuorumCertificate { view, block_hash: hash, votes: ks[..n].iter().map(|k| Vote::sign(view, hash, k)).collect() }
+        QuorumCertificate { view, block_hash: hash, votes: ks[..n].iter().map(|k| Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), view, hash, k)).collect() }
     }
 
     /// A committed block shaped like chain 8's: `votes` votes in both the header's `justify` QC and
@@ -3268,7 +3274,7 @@ mod tests {
             state_root: parent,
             justify: votes_of(height.saturating_sub(1), parent, ks, votes),
         };
-        let block = Block::sign(header, txs, &ks[0]);
+        let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, &ks[0]);
         let hash = block.hash();
         CommittedBlock { block, pruned: Vec::new(), qc: votes_of(height, hash, ks, votes), receipts: Vec::new(), deposits: Vec::new() }
     }

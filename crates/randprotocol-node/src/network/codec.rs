@@ -161,7 +161,7 @@ mod tests {
         let qc = |view: u64, hash: Hash| QuorumCertificate {
             view,
             block_hash: hash,
-            votes: ks[..votes].iter().map(|k| Vote::sign(view, hash, k)).collect(),
+            votes: ks[..votes].iter().map(|k| Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), view, hash, k)).collect(),
         };
         let header = BlockHeader {
             height,
@@ -173,7 +173,7 @@ mod tests {
             state_root: parent,
             justify: qc(height.saturating_sub(1), parent),
         };
-        let block = Block::sign(header, vec![], &ks[0]);
+        let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, vec![], &ks[0]);
         let hash = block.hash();
         CommittedBlock { block, pruned: Vec::new(), qc: qc(height, hash), receipts: Vec::new(), deposits: Vec::new() }
     }

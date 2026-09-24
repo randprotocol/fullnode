@@ -85,3 +85,45 @@ v0.5.3: the first fallback lowered the lock),
 keeps the high-QC half and resumes the chain on signed evidence; the node's
 `a_validator_answers_an_unknown_hash_with_a_signed_not_held_and_an_observer_does_not` and the
 storage round trip `locked_block_roundtrip_and_clear`.
+
+## Signing domains (consensus domain v1) — genesis-gated
+
+Until v0.5.4 no signed consensus message named the chain: a vote signed `rand-vote ‖ view ‖
+hash`, a new-view `rand-newview ‖ view ‖ bincode(high_qc)`, and a proposer signed its block's
+`rand-block` header hash. A validator key reused across chains — every chain since 8 ran on the
+same keys until chain 14 — could have its signatures replayed from one chain to another wherever
+views and hashes lined up. The genesis file's `consensus_domain` field switches every one of them
+(`crates/randprotocol-core/src/types/block.rs`, `SigningDomain`):
+
+| | version 0 (absent — chain 14) | version 1 (the next cut) |
+|---|---|---|
+| vote | `rand-vote ‖ view ‖ hash` | `rand-vote-2 ‖ genesis ‖ view ‖ hash` |
+| new-view | `rand-newview ‖ view ‖ bincode(high_qc)` | `rand-newview-2 ‖ genesis ‖ view ‖ bincode(high_qc)` |
+| proposal | the `rand-block` header hash | `rand-block-2 ‖ genesis ‖ bincode(header)` |
+
+Every message is a 32-byte BLAKE3 digest under its tag, signed with Dilithium2. The not-held
+attestation (above) is new and binds the genesis hash under every version. A block's *identity*
+— `Block::hash`, the `rand-block` header hash, which is also what a QC certifies and what the
+genesis hash itself is — is the same under both versions: the genesis hash is that hash of the
+genesis block, so it cannot prefix itself.
+
+The domain travels three ways, all from the genesis file: `ConsensusConfig.domain`
+(`GenesisState::signing_domain()` — the version over the genesis hash) is what the replica signs
+and verifies with; the `Ledger` carries the same domain as non-state data for its own proposer
+signature check on replay and sync (`reload_ledger` restores it, like `epoch_blocks`); and the
+storage integrity check and the sync path verify certificates under it. A replica that forgot it
+would sign under v0 on a v1 chain and be refused by every peer — which is what the simulator's
+`config_of` showed when it did.
+
+Gated: the field is committed to the genesis binding only when present (`b"consensus_domain" ‖
+version`), so chain 14's file, which has none, builds to the pinned hash and its validators sign
+exactly what they always signed (`domain_v0_signs_exactly_what_it_signed_before`). A version this
+build does not know is refused by `Genesis::validate` (`GenesisError::BadConsensusDomain`). The
+next cut sets `"consensus_domain": 1` (`docs/deploy.md`).
+
+Regression tests: `a_v1_vote_for_one_chain_does_not_verify_under_another`,
+`a_v1_new_view_for_one_chain_does_not_verify_under_another`,
+`domain_v0_signs_exactly_what_it_signed_before`,
+`a_genesis_with_consensus_domain_1_commits_it_and_one_without_is_unchanged`, and
+`the_consensus_suite_holds_under_signing_domain_v1`, which runs the simulator's commit, restart,
+timeout, lock and epoch test bodies again under version 1 and refuses a v0 vote there.

@@ -561,6 +561,10 @@ async fn main() -> Result<()> {
                     ),
                     None => None,
                 },
+                // The consensus signing domain (audit v4) is set in the file by the cut script,
+                // like the bridge section: `"consensus_domain": 1` from the next cut on. This
+                // command writes today's shape, which is chain 14's.
+                consensus_domain: None,
                 // An aggregating chain is cut with the section spelled out on the command
                 // line (chain 9, spec §2.3): the bond, the subsidy schedule and the registered
                 // shapes with their measured program digests.
@@ -1179,6 +1183,7 @@ mod tests {
             bridge: None,
             tokens: None,
             aggregation: None,
+            consensus_domain: None,
             epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
             max_proof_bytes: None,

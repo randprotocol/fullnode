@@ -150,6 +150,17 @@ key custody all at once — worth re-reading before chain 15.
    genesis starts at the guardian set already in use and takes the rotation attestation later, so
    there is no reason to gate the cut on it.
 
+## The next cut: genesis fields v0.5.4 introduces
+
+The audit-v4 release (v0.5.4) added consensus rules that are switched on by genesis fields chain
+14 does not carry, so that chain 14 runs byte-for-byte as before. The next cut's genesis sets:
+
+- **`"consensus_domain": 1`** — every vote, new-view and proposal then carries the genesis hash
+  (`docs/consensus.md`, "Signing domains"), so a validator signature for this chain verifies on no
+  other. Absent or `0` is chain 14's behaviour; `2` and up are refused by `rand-node init`. The
+  field is a top-level genesis key beside `epoch_blocks`; the cut script splices it in the way it
+  splices the `bridge` section, since `rand-node genesis` writes today's shape.
+
 ## Chain 9 activation (block aggregation)
 
 Cutting and bringing up the chain-9 fleet, in order. Everything here is the hard fork it is:

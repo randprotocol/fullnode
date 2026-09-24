@@ -433,6 +433,10 @@ pub struct Ledger {
     /// information the chain already holds (the fee is in the bundle, the heights are the
     /// chain's), and `Ledger::from_parts` cannot know it.
     unsealed_fees: BTreeMap<Hash, (u64, Address, u64)>,
+    /// What a block's proposer signature is verified under at replay (audit v4, consensus domain
+    /// v1): a genesis parameter like `epoch_blocks`, set by `Genesis::build` and restored by a
+    /// reloading node from its genesis file; never state, so outside equality and the root.
+    signing_domain: crate::types::SigningDomain,
 }
 
 /// Equality is over consensus state only. `height` and `timestamp_ms` are the position of the
@@ -506,6 +510,7 @@ impl Ledger {
             pruned_side: BTreeMap::new(),
             supply: Supply::default(),
             unsealed_fees: BTreeMap::new(),
+            signing_domain: crate::types::SigningDomain::v0(Hash::ZERO),
         }
     }
 
@@ -550,6 +555,7 @@ impl Ledger {
             pruned_side: BTreeMap::new(),
             supply: Supply::default(),
             unsealed_fees: BTreeMap::new(),
+            signing_domain: crate::types::SigningDomain::v0(Hash::ZERO),
         }
     }
 
@@ -748,6 +754,16 @@ impl Ledger {
             (None, _) => Err(TxError::Bridge(BridgeError::Disabled)),
             (_, None) => Err(TxError::Token(tokens::TokenError::Disabled)),
         }
+    }
+
+    /// The consensus signing domain (audit v4): genesis sets it once the genesis block — whose
+    /// hash it carries — exists; a reloading node sets it from its genesis file.
+    pub fn set_signing_domain(&mut self, domain: crate::types::SigningDomain) {
+        self.signing_domain = domain;
+    }
+
+    pub fn signing_domain(&self) -> &crate::types::SigningDomain {
+        &self.signing_domain
     }
 
     /// Install (or clear) the aggregation section. Genesis calls this once from its
@@ -1602,7 +1618,7 @@ impl Ledger {
                 return Err(BlockError::TooLarge);
             }
         }
-        if !block.verify_signature() {
+        if !block.verify_signature(&self.signing_domain) {
             return Err(BlockError::BadProposerSignature);
         }
         // The tx root, over the transactions as served: the same check for the raw and the
@@ -1927,7 +1943,7 @@ mod tests {
             state_root,
             justify: QuorumCertificate::genesis(Hash::ZERO),
         };
-        Block::sign(header, txs, key)
+        Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), header, txs, key)
     }
 
     /// The state root `txs` leave behind when `proposer` applies them as block `height`.
@@ -3276,7 +3292,7 @@ mod tests {
                 state_root: root_after(l, &[], &a.address(), height),
                 justify: QuorumCertificate::genesis(Hash::ZERO),
             };
-            Block::sign(header, Vec::new(), &a)
+            Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), header, Vec::new(), &a)
         };
 
         let config =
@@ -3333,7 +3349,7 @@ mod tests {
                 state_root: root_after(l, &[], &a.address(), height),
                 justify: QuorumCertificate::genesis(Hash::ZERO),
             };
-            Block::sign(header, Vec::new(), &a)
+            Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), header, Vec::new(), &a)
         };
         assert_eq!(MAX_TIMESTAMP_STEP_MS, 60_000);
 

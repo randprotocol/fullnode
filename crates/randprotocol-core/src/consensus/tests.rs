@@ -57,6 +57,25 @@ fn build(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool) -> Sim {
     build_with(n, validators, epoch_blocks, all_signers, false)
 }
 
+thread_local! {
+    /// The consensus domain version the fixtures below build their genesis with: 0 (chain 14's,
+    /// the default) or 1. Set by [`with_domain`], so the same test bodies run under both.
+    static DOMAIN_VERSION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The genesis field for the fixture's domain version: absent for 0, `Some(1)` for 1.
+fn fixture_domain() -> Option<u32> {
+    let v = DOMAIN_VERSION.with(|d| d.get());
+    (v != 0).then_some(v)
+}
+
+fn with_domain<R>(version: u32, f: impl FnOnce() -> R) -> R {
+    DOMAIN_VERSION.with(|d| d.set(version));
+    let r = f();
+    DOMAIN_VERSION.with(|d| d.set(0));
+    r
+}
+
 fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridged: bool) -> Sim {
     let keys: Vec<Keypair> = (1..=n).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
     let genesis = Genesis {
@@ -98,10 +117,12 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
             mint_cap_per_day: 100_000 * 100_000_000,
         }),
         aggregation: None,
+        consensus_domain: fixture_domain(),
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
     cfg.epoch_blocks = gs.epoch_blocks;
+    cfg.domain = gs.signing_domain();
     let mut nodes = Vec::new();
     let mut addr_to_idx = BTreeMap::new();
     for (i, k) in keys.iter().enumerate() {
@@ -136,6 +157,11 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
 }
 
 impl Sim {
+    /// What every replica in this simulation signs under: the fixture genesis's domain.
+    fn domain(&self) -> SigningDomain {
+        self.gs.signing_domain()
+    }
+
     fn handle(&mut self, i: usize, actions: Vec<Action>) {
         for a in actions {
             match a {
@@ -568,7 +594,7 @@ fn rejects_proposal_from_wrong_leader_and_bad_signature() {
         state_root: parent.header.state_root,
         justify: tip,
     };
-    let block = Block::sign(header, vec![], &sim.keys[wrong]);
+    let block = Block::sign(&sim.domain(), header, vec![], &sim.keys[wrong]);
     let target = (0..4).find(|&i| i != wrong).unwrap();
     assert_eq!(sim.nodes[target].on_proposal(block.clone(), sim.now).unwrap_err(), ConsensusError::WrongLeader(view));
 
@@ -628,6 +654,9 @@ fn resume_from_persisted_head_continues_chain() {
 fn config_of(sim: &Sim) -> ConsensusConfig {
     let mut cfg = ConsensusConfig::new(sim.gs.chain_id, sim.gs.validators.clone(), sim.gs.hash());
     cfg.epoch_blocks = sim.gs.epoch_blocks;
+    // The signing domain comes from the genesis file too (audit v4): a restarted replica that
+    // forgot it would sign under v0 on a v1 chain and every peer would refuse its proposals.
+    cfg.domain = sim.gs.signing_domain();
     cfg
 }
 
@@ -893,7 +922,7 @@ fn a_resumed_validator_keeps_its_lock() {
         state_root: after.state_root(),
         justify: head.qc.clone(),
     };
-    let conflicting = Block::sign(header, vec![], &sim.keys[li]);
+    let conflicting = Block::sign(&sim.domain(), header, vec![], &sim.keys[li]);
     let locked_hash = sim.nodes[victim].locked_qc().block_hash;
     assert!(!sim.nodes[victim].has_block(&locked_hash), "the restart dropped the locked block");
     let acts = sim.nodes[victim]
@@ -1002,7 +1031,7 @@ fn restart_does_not_double_vote_for_same_view() {
             state_root: parent.header.state_root,
             justify: sim.nodes[li].high_qc().clone(),
         };
-        let b = Block::sign(header, vec![], &sim.keys[li]);
+        let b = Block::sign(&sim.domain(), header, vec![], &sim.keys[li]);
         let acts = sim.nodes[victim].on_proposal(b, sim.now).unwrap_or_default();
         assert!(!acts.iter().any(|a| match a {
             Action::Broadcast(ConsensusMessage::Vote(_)) | Action::SendTo(_, ConsensusMessage::Vote(_)) => true,
@@ -1147,7 +1176,7 @@ fn leader_falls_back_when_high_qc_block_is_unobtainable() {
     // Node 1 re-announces the ghost QC, as a lagging peer would.
     let key1 = Keypair::from_seed(*sim.keys[1].seed()).unwrap();
     let view = sim.nodes[0].view() + 1;
-    let nv = NewView::sign(view, ghost_qc.clone(), &key1);
+    let nv = NewView::sign(&sim.domain(), view, ghost_qc.clone(), &key1);
     for i in 0..4 {
         let acts = sim.nodes[i].on_new_view(nv.clone()).unwrap();
         sim.handle(i, acts);
@@ -1236,9 +1265,11 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         bridge: None,
         tokens: None,
         aggregation: None,
+        consensus_domain: fixture_domain(),
     };
     let gs = genesis.build(&StubExecutor).unwrap();
-    let cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
+    let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
+    cfg.domain = gs.signing_domain();
     (cfg, gs, key)
 }
 
@@ -1282,14 +1313,14 @@ fn messages_from_absurd_views_are_rejected() {
     let view_before = sim.nodes[0].view();
     // A NewView for u64::MAX carries a real signature and a real QC: it used to
     // drag the replica to u64::MAX, where the next `view + 1` overflowed.
-    let nv = NewView::sign(u64::MAX, sim.nodes[0].high_qc().clone(), &sim.keys[1]);
+    let nv = NewView::sign(&sim.domain(), u64::MAX, sim.nodes[0].high_qc().clone(), &sim.keys[1]);
     assert!(matches!(sim.nodes[0].on_new_view(nv), Err(ConsensusError::ViewOutOfRange { .. })));
     assert_eq!(sim.nodes[0].view(), view_before);
     // A vote for u64::MAX must be rejected before any `vote.view + 1` arithmetic.
-    let v = Vote::sign(u64::MAX, Hash::digest(b"x"), &sim.keys[1]);
+    let v = Vote::sign(&sim.domain(), u64::MAX, Hash::digest(b"x"), &sim.keys[1]);
     assert!(matches!(sim.nodes[0].on_vote(v), Err(ConsensusError::ViewOutOfRange { .. })));
     // A sane NewView one view ahead is still accepted.
-    let ok = NewView::sign(view_before + 1, sim.nodes[0].high_qc().clone(), &sim.keys[1]);
+    let ok = NewView::sign(&sim.domain(), view_before + 1, sim.nodes[0].high_qc().clone(), &sim.keys[1]);
     assert!(sim.nodes[0].on_new_view(ok).is_ok());
 }
 
@@ -1434,7 +1465,7 @@ fn epoch_rollover_uses_the_register_after_the_last_block_of_the_previous_epoch()
     // Epoch 0 does not know the fifth validator, whatever the register now says.
     let b2 = sim.block_at(0, 2);
     assert!(b2.transactions.iter().any(|t| t.hash() == bond.hash()), "the bond landed in block 2");
-    let stray = Vote::sign(b2.view(), b2.hash(), &newcomer);
+    let stray = Vote::sign(&sim.domain(), b2.view(), b2.hash(), &newcomer);
     assert_eq!(sim.nodes[0].on_vote(stray).unwrap_err(), ConsensusError::NotValidator);
 
     sim.run_to_height(9, 40);
@@ -1510,7 +1541,7 @@ fn an_unbond_below_min_stake_drops_a_validator_next_epoch_and_the_chain_keeps_qu
     // And its vote on an epoch-1 block is refused outright.
     let tip = sim.block_at(0, sim.committed[0].len() as u64);
     assert!(tip.height() >= 4);
-    let stray = Vote::sign(tip.view(), tip.hash(), &leaver);
+    let stray = Vote::sign(&sim.domain(), tip.view(), tip.hash(), &leaver);
     assert_eq!(sim.nodes[0].on_vote(stray).unwrap_err(), ConsensusError::NotValidator);
 }
 
@@ -1537,13 +1568,13 @@ fn qcs_across_a_boundary_verify_against_their_own_epoch() {
 
     // Block 4's justify certifies block 3, the last block of epoch 0.
     assert_eq!(b4.header.justify.block_hash, b3.hash());
-    assert!(b4.header.justify.verify(&epoch0, &gh), "an epoch-0 QC verifies against epoch 0's set");
-    assert!(!b4.header.justify.verify(&epoch1, &gh), "epoch 0's voters are a minority of epoch 1's stake");
+    assert!(b4.header.justify.verify(&sim.domain(), &epoch0), "an epoch-0 QC verifies against epoch 0's set");
+    assert!(!b4.header.justify.verify(&sim.domain(), &epoch1), "epoch 0's voters are a minority of epoch 1's stake");
 
     // Block 5's justify certifies block 4, the first block of epoch 1.
     assert_eq!(b5.header.justify.block_hash, b4.hash());
-    assert!(b5.header.justify.verify(&epoch1, &gh), "an epoch-1 QC verifies against epoch 1's set");
-    assert!(!b5.header.justify.verify(&epoch0, &gh), "epoch 0 does not know the fifth validator");
+    assert!(b5.header.justify.verify(&sim.domain(), &epoch1), "an epoch-1 QC verifies against epoch 1's set");
+    assert!(!b5.header.justify.verify(&sim.domain(), &epoch0), "epoch 0 does not know the fifth validator");
 
     // A replica resumed at committed height 3, with the sets storage kept, verifies each in turn.
     let head = sim.committed[0][2].clone();
@@ -1627,7 +1658,7 @@ fn a_block_whose_height_skips_its_parent_is_refused_before_its_epoch_is_derived(
         state_root: parent.header.state_root,
         justify: sim.nodes[0].high_qc().clone(),
     };
-    let block = Block::sign(header, vec![], &sim.keys[liar]);
+    let block = Block::sign(&sim.domain(), header, vec![], &sim.keys[liar]);
     assert_eq!(
         sim.nodes[0].on_proposal(block, sim.now).unwrap_err(),
         ConsensusError::BadHeight { block: parent.height() + 1 + 4_000_000, parent: parent.height() }
@@ -1693,6 +1724,7 @@ fn aggregation_node_with(
         bridge: None,
         tokens: None,
         aggregation: Some(cfg.clone()),
+        consensus_domain: None,
     };
     let mut gs = genesis.build(&StubExecutor).unwrap();
     // Register the aggregator directly on the genesis ledger the node builds on (the register
@@ -1972,7 +2004,7 @@ fn block_on_head(sim: &Sim, node: usize, view: u64, timestamp_ms: u64) -> Block 
         state_root: after.state_root(),
         justify,
     };
-    Block::sign(header, vec![], &sim.keys[li])
+    Block::sign(&sim.domain(), header, vec![], &sim.keys[li])
 }
 
 /// A Byzantine validator (`attacker`) feeds `victim` `count` distinct blocks, one per view it
@@ -1990,7 +2022,7 @@ fn fill_with_siblings(sim: &mut Sim, victim: usize, attacker: usize, count: usiz
         if sim.nodes[victim].leader(view) != attacker_addr {
             continue;
         }
-        let nv = NewView::sign(view, sim.nodes[victim].high_qc().clone(), &key);
+        let nv = NewView::sign(&sim.domain(), view, sim.nodes[victim].high_qc().clone(), &key);
         sim.nodes[victim].on_new_view(nv).expect("a validator's NewView is admitted");
         assert_eq!(sim.nodes[victim].view(), view);
         let now = 1_000 + view;
@@ -2187,7 +2219,7 @@ fn a_resumed_validator_finds_its_locked_block_without_a_fetch() {
     header.state_root = after.state_root();
     header.tx_root = Block::tx_root(&[]);
     header.justify = qc.clone();
-    let sibling = Block::sign(header, vec![], &sim.keys[li]);
+    let sibling = Block::sign(&sim.domain(), header, vec![], &sim.keys[li]);
     let acts = resumed.on_proposal(sibling.clone(), sim.now + 1).expect("a well-formed proposal on the head");
     assert!(!acts.iter().any(|a| matches!(a, Action::FetchBlock(_))), "no FetchBlock: {acts:?}");
     // Without the block it fetches, as before.
@@ -2205,4 +2237,49 @@ fn a_resumed_validator_finds_its_locked_block_without_a_fetch() {
     again.start();
     let acts = again.on_proposal(sibling, sim.now + 1).expect("accepted");
     assert!(acts.iter().any(|a| matches!(a, Action::FetchBlock(h) if *h == locked_hash)), "{acts:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Consensus domain v1 (audit v4): the genesis hash in every signed message
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_v1_new_view_for_one_chain_does_not_verify_under_another() {
+    let k = Keypair::from_seed([1; 32]).unwrap();
+    let a = SigningDomain::v1(Hash([1; 32]));
+    let b = SigningDomain::v1(Hash([2; 32]));
+    let nv = NewView::sign(&a, 5, QuorumCertificate::genesis(Hash([1; 32])), &k);
+    assert!(nv.verify(&a));
+    assert!(!nv.verify(&b));
+    assert!(!nv.verify(&SigningDomain::v0(Hash([1; 32]))), "a v1 new-view is not a v0 one");
+}
+
+/// The same simulation, the same test bodies, under `consensus_domain: 1`: every replica signs
+/// and verifies with the genesis hash in the message, and nothing else about consensus changes.
+/// A v0 vote from a set member is refused on a v1 chain.
+#[test]
+fn the_consensus_suite_holds_under_signing_domain_v1() {
+    with_domain(1, || {
+        let mut sim = setup(4, 4);
+        assert_eq!(sim.gs.consensus_domain, 1);
+        assert_eq!(sim.nodes[0].domain(), &SigningDomain::v1(sim.gs.hash()));
+        sim.step(vec![]);
+        let stale_domain = SigningDomain::v0(sim.gs.hash());
+        let v = Vote::sign(&stale_domain, sim.nodes[0].view(), sim.nodes[0].high_qc().block_hash, &sim.keys[1]);
+        assert_eq!(sim.nodes[0].on_vote(v), Err(ConsensusError::BadVote), "a v0 signature is not a v1 vote");
+        drop(sim);
+
+        four_validators_commit_empty_blocks_in_lockstep();
+        two_validators_need_both_signatures_and_commit();
+        liveness_recovers_after_leader_timeout();
+        rejects_proposal_from_wrong_leader_and_bad_signature();
+        restart_mid_run_rejoins_and_stays_consistent();
+        a_resumed_validator_keeps_its_lock();
+        a_resumed_validator_finds_its_locked_block_without_a_fetch();
+        eight_unsigned_not_found_replies_no_longer_release_the_lock();
+        not_held_from_more_than_a_third_of_the_stake_releases_the_lock_and_less_does_not();
+        commit_rule_requires_three_consecutive_views();
+        a_leaders_second_block_for_one_view_is_refused_as_equivocation();
+        epoch_rollover_uses_the_register_after_the_last_block_of_the_previous_epoch();
+    });
 }

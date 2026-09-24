@@ -1888,7 +1888,7 @@ impl Storage {
                 }
                 // A QC certifies the block it is stored with, so it is verified against the set
                 // of *that block's* epoch — not the current one, and not genesis's.
-                if mode == VerifyMode::Full && !qc.verify(set, &gs.hash()) {
+                if mode == VerifyMode::Full && !qc.verify(&gs.signing_domain(), set) {
                     return Err(format!("qc {h} has invalid or insufficient votes for epoch {epoch}"));
                 }
                 for (i, tx) in block.transactions.iter().enumerate() {
@@ -2222,6 +2222,7 @@ pub(crate) mod fixtures {
             bridge: None,
             tokens: None,
             aggregation: None,
+            consensus_domain: None,
             epoch_blocks,
             max_program_words: None,
             max_proof_bytes: None,
@@ -2304,6 +2305,7 @@ pub(crate) mod fixtures {
                 mint_cap_per_day: 100_000 * 100_000_000,
             }),
             aggregation: None,
+            consensus_domain: None,
             epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
             max_program_words: None,
             max_proof_bytes: None,
@@ -2697,7 +2699,7 @@ pub(crate) mod fixtures {
         voters: &[&Keypair],
     ) -> CommittedBlock {
         let mut cb = make_block(parent, ledger, txs, k);
-        cb.qc.votes = voters.iter().map(|v| randprotocol_core::Vote::sign(cb.qc.view, cb.qc.block_hash, v)).collect();
+        cb.qc.votes = voters.iter().map(|v| randprotocol_core::Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), cb.qc.view, cb.qc.block_hash, v)).collect();
         cb
     }
 
@@ -2730,7 +2732,7 @@ pub(crate) mod fixtures {
             state_root: ledger.state_root(),
             justify: QuorumCertificate { view: parent.view(), block_hash: parent.hash(), votes: vec![] },
         };
-        let block = Block::sign(header, txs, k);
+        let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, k);
         let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![] };
         CommittedBlock { block, pruned: Vec::new(), qc, receipts: Vec::new(), deposits: ledger.deposits().to_vec() }
     }
@@ -2755,7 +2757,7 @@ pub(crate) mod fixtures {
             )];
             let cb = make_block(&parent, &mut ledger, txs, &k);
             let block = cb.block.clone();
-            let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(block.view(), block.hash(), &k)] };
+            let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), block.view(), block.hash(), &k)] };
             let cb = CommittedBlock { qc, ..cb };
             st.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
             out.push(cb);
@@ -3898,11 +3900,11 @@ mod tests {
         let wrong = QuorumCertificate {
             view: b2.view(),
             block_hash: b2.hash(),
-            votes: [&key(1), &key(2)].iter().map(|k| randprotocol_core::Vote::sign(b2.view(), b2.hash(), k)).collect(),
+            votes: [&key(1), &key(2)].iter().map(|k| randprotocol_core::Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), b2.view(), b2.hash(), k)).collect(),
         };
         // Under the set that ran epoch 0 it is a perfectly good certificate.
-        assert!(wrong.verify(&gs.validators, &gs.hash()));
-        assert!(!wrong.verify(&epoch1, &gs.hash()), "validator 2 is not in epoch 1's set");
+        assert!(wrong.verify(&gs.signing_domain(), &gs.validators));
+        assert!(!wrong.verify(&gs.signing_domain(), &epoch1), "validator 2 is not in epoch 1's set");
         s.overwrite_qc_for_testing(2, &wrong).unwrap();
 
         let c = s.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap();
@@ -4054,7 +4056,7 @@ mod tests {
             let qc = QuorumCertificate {
                 view: cb.block.view(),
                 block_hash: cb.block.hash(),
-                votes: vec![randprotocol_core::Vote::sign(cb.block.view(), cb.block.hash(), &key(1))],
+                votes: vec![randprotocol_core::Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), cb.block.view(), cb.block.hash(), &key(1))],
             };
             CommittedBlock { qc, ..cb }
         };

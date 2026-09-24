@@ -190,6 +190,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         }),
         bridge,
         aggregation: None,
+        consensus_domain: None,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words: None,
         max_proof_bytes: None,
@@ -1986,15 +1987,15 @@ fn certified_chain(
                 votes: if parent_view == 0 {
                     vec![]
                 } else {
-                    voters.iter().map(|k| Vote::sign(parent_view, parent.hash(), k)).collect()
+                    voters.iter().map(|k| Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), parent_view, parent.hash(), k)).collect()
                 },
             },
         };
-        let block = Block::sign(header, vec![], proposer);
+        let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, vec![], proposer);
         let qc = QuorumCertificate {
             view,
             block_hash: block.hash(),
-            votes: voters.iter().map(|k| Vote::sign(view, block.hash(), k)).collect(),
+            votes: voters.iter().map(|k| Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), view, block.hash(), k)).collect(),
         };
         parent = block.clone();
         parent_view = view;

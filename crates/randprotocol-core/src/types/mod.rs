@@ -7,7 +7,7 @@ pub use actions::{
     registration_message, set_authority_message, token_mint_message, unbond_message, withdraw_message,
     AggregatorRegistration, CallEnvelope, InitialMint, Registration, SignedAggregateHeader, MAX_CALL_ENVELOPE_BYTES,
 };
-pub use block::{Block, BlockHeader, QuorumCertificate, Vote};
+pub use block::{Block, BlockHeader, QuorumCertificate, Vote, SigningDomain};
 pub use transaction::{
     format_amount, parse_amount, Action, AmountError, Transaction, FAUCET_MAX_UNITS, TOKEN_DECIMALS, TOKEN_SYMBOL,
     TX_BINDING_DOMAIN, TX_BINDING_WORDS, UNITS_PER_RAND,

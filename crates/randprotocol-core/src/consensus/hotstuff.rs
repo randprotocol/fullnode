@@ -1,6 +1,6 @@
 use super::{
     Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, EpochSets, NewView, NotHeld, SafetyState,
-    PROPOSAL_VIEW_WINDOW,
+    SigningDomain, PROPOSAL_VIEW_WINDOW,
 };
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, Keypair};
@@ -281,6 +281,10 @@ impl HotStuff {
 
     pub fn committed_hash(&self) -> Hash {
         self.committed_hash
+    }
+    /// What this replica signs and verifies consensus messages under (audit v4).
+    pub fn domain(&self) -> &SigningDomain {
+        &self.cfg.domain
     }
     pub fn committed_ledger(&self) -> &Ledger {
         &self.committed_ledger
@@ -633,7 +637,7 @@ impl HotStuff {
         if block.height() <= self.committed_height {
             return Err(ConsensusError::Stale(block.height()));
         }
-        if !block.verify_signature() {
+        if !block.verify_signature(&self.cfg.domain) {
             return Err(ConsensusError::BadSignature);
         }
         // The set of a block's epoch is derived from its branch, so the parent comes first.
@@ -683,7 +687,7 @@ impl HotStuff {
         let Some(parent_set) = self.shared_set_for_height(parent_height, &grandparent) else {
             return Err(ConsensusError::UnknownEpochSet(self.epoch(parent_height)));
         };
-        if !block.header.justify.verify(&parent_set, &self.cfg.genesis_hash) {
+        if !block.header.justify.verify(&self.cfg.domain, &parent_set) {
             return Err(ConsensusError::BadJustify);
         }
         if block.header.justify.view != parent_view && !block.header.justify.is_genesis() {
@@ -776,7 +780,7 @@ impl HotStuff {
         if vote.view < self.high_qc.view || vote.view.saturating_add(1) < self.view {
             return Ok(out); // stale
         }
-        if !vote.verify() {
+        if !vote.verify(&self.cfg.domain) {
             return Err(ConsensusError::BadVote);
         }
         let key = (vote.view, vote.block_hash);
@@ -817,10 +821,10 @@ impl HotStuff {
         if nv.view > self.view.saturating_add(MAX_VIEW_AHEAD) {
             return Err(ConsensusError::ViewOutOfRange { view: nv.view });
         }
-        if !nv.verify() {
+        if !nv.verify(&self.cfg.domain) {
             return Err(ConsensusError::BadNewView);
         }
-        if !nv.high_qc.verify(&self.set_for_qc(&nv.high_qc), &self.cfg.genesis_hash) {
+        if !nv.high_qc.verify(&self.cfg.domain, &self.set_for_qc(&nv.high_qc)) {
             return Err(ConsensusError::BadJustify);
         }
         self.update_high_qc(&nv.high_qc.clone(), &mut out);
@@ -832,7 +836,7 @@ impl HotStuff {
         if view > self.view {
             self.enter_view(view, &mut out);
             if let Some(key) = &self.signer {
-                let mine = NewView::sign(view, self.high_qc.clone(), key);
+                let mine = NewView::sign(&self.cfg.domain, view, self.high_qc.clone(), key);
                 out.push(Action::Broadcast(ConsensusMessage::NewView(mine.clone())));
                 if self.is_leader(view) {
                     self.record_new_view(view, mine);
@@ -874,7 +878,7 @@ impl HotStuff {
         let next = self.view.saturating_add(1);
         self.enter_view(next, &mut out);
         if let Some(key) = &self.signer {
-            let nv = NewView::sign(next, self.high_qc.clone(), key);
+            let nv = NewView::sign(&self.cfg.domain, next, self.high_qc.clone(), key);
             out.push(Action::Broadcast(ConsensusMessage::NewView(nv.clone())));
             if self.is_leader(next) {
                 if let Ok(more) = self.on_new_view(nv) {
@@ -981,7 +985,7 @@ impl HotStuff {
             state_root: ledger.state_root(),
             justify: self.high_qc.clone(),
         };
-        let block = Block::sign(header, txs, signer);
+        let block = Block::sign(&self.cfg.domain, header, txs, signer);
         self.proposed_in_view = true;
         let mut out = vec![Action::Broadcast(ConsensusMessage::Proposal(block.clone()))];
         // The leader's own clock is "now": its vote on its own block follows B2's drift rule
@@ -1293,7 +1297,7 @@ impl HotStuff {
         }
         self.last_voted_view = block.view();
         out.push(Action::PersistSafety(self.safety_state(), self.locked_block_to_persist()));
-        let vote = Vote::sign(block.view(), block.hash(), signer);
+        let vote = Vote::sign(&self.cfg.domain, block.view(), block.hash(), signer);
         // Votes are broadcast and every validator assembles the QC locally
         // (see `on_vote`). Relaying only to the next leader would strand the
         // QC — and the finality pipeline behind it — whenever that leader is
