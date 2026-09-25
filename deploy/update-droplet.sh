@@ -40,6 +40,10 @@ $SSH "set -e
   [ \"\$(sha256sum /root/$BIN_NODE | cut -d' ' -f1)\" = \"$WANT\" ] || { echo 'copied $BIN_NODE does not match the build host — not touching this node' >&2; exit 1; }
   systemctl stop $SERVICE
   install -m 755 /root/$BIN_NODE /root/$BIN_WALLET /usr/local/bin/
+  if [ -n \"${PRUNE_ARGS:-}\" ] && ! grep -q -- '--prune-history' /etc/systemd/system/$SERVICE.service; then
+    sed -i \"s|^ExecStart=\(.*\)\$|ExecStart=\1 ${PRUNE_ARGS}|\" /etc/systemd/system/$SERVICE.service
+    systemctl daemon-reload
+  fi
   systemctl restart $SERVICE
   sleep 4
   systemctl is-active $SERVICE

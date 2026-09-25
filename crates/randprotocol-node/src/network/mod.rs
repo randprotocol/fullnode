@@ -960,7 +960,7 @@ mod tests {
     async fn a_gossiped_message_carries_the_id_its_validation_is_reported_with() {
         let (a, mut a_rx, b, _b_rx) = two_connected_nodes().await;
         let (from, id) =
-            gossip_status_to(&b, &mut a_rx, Status { height: 9, head_hash: Hash::digest(b"h"), view: 3 }).await;
+            gossip_status_to(&b, &mut a_rx, Status { height: 9, head_hash: Hash::digest(b"h"), view: 3, floor: 0 }).await;
         assert_eq!(from, b.local_peer_id);
         assert_eq!(id.propagation_source, b.local_peer_id, "one hop, so the forwarder is the author");
         assert!(!id.message_id.0.is_empty());
@@ -976,7 +976,7 @@ mod tests {
         // The mesh still works afterwards: a second, different message arrives the same way, with
         // its own content-addressed id.
         let (_, next) =
-            gossip_status_to(&b, &mut a_rx, Status { height: 11, head_hash: Hash::digest(b"h2"), view: 4 }).await;
+            gossip_status_to(&b, &mut a_rx, Status { height: 11, head_hash: Hash::digest(b"h2"), view: 4, floor: 0 }).await;
         assert_ne!(next.message_id, first_id, "a different message is a different id");
         a.report_validation(next, MessageAcceptance::Accept).await;
 
@@ -1078,7 +1078,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let mut received = None;
         while received.is_none() && tokio::time::Instant::now() < deadline {
-            b.broadcast(GossipMessage::Status(Status { height: 9, head_hash: Hash::digest(b"h"), view: 3 })).await;
+            b.broadcast(GossipMessage::Status(Status { height: 9, head_hash: Hash::digest(b"h"), view: 3, floor: 0 })).await;
             received = wait_for(&mut a_rx, Duration::from_millis(300), |e| match e {
                 NetworkEvent::Gossip { from, msg: GossipMessage::Status(s), .. } => Some((from, s)),
                 _ => None,

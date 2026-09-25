@@ -127,6 +127,7 @@ async fn start_with(dir: &tempfile::TempDir, key: &Keypair, genesis: Genesis) ->
         verify: randprotocol_node::storage::VerifyMode::Full,
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
+        prune_history: None,
     })
     .await
     .expect("node starts")

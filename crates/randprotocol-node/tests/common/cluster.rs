@@ -104,6 +104,17 @@ pub async fn start_in_at(
     validator: bool,
     block_interval: Duration,
 ) -> TestNode {
+    start_in_pruned(dir, key, bootstrap, validator, block_interval, None).await
+}
+
+pub async fn start_in_pruned(
+    dir: tempfile::TempDir,
+    key: &Keypair,
+    bootstrap: Vec<libp2p::Multiaddr>,
+    validator: bool,
+    block_interval: Duration,
+    prune_history: Option<Duration>,
+) -> TestNode {
     let handle = node::start(NodeConfig {
         viewing_open: false,
         datadir: dir.path().to_path_buf(),
@@ -119,6 +130,7 @@ pub async fn start_in_at(
         verify: randprotocol_node::storage::VerifyMode::Full,
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
+        prune_history,
     })
     .await
     .expect("node starts");

@@ -22,7 +22,7 @@ use randprotocol_zkvm::viewing::TxKey;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, Ordering::SeqCst};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -76,6 +76,8 @@ pub struct NodeConfig {
     /// `disk_low` in `rand_getHealth` under [`disk::DISK_LOW_FACTOR`] times it (audit v4 OPS-3).
     /// `--min-free-disk-mb`, default 1 GB; zero disables the guard.
     pub min_free_disk_bytes: u64,
+    /// Keep only this much block history (history pruning spec §1); `None` keeps everything.
+    pub prune_history: Option<Duration>,
 }
 
 /// Handles returned by `Node::start` so tests and the CLI can observe the node.
@@ -233,6 +235,20 @@ pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: Verify
     }
     let t = Instant::now();
     let check = storage.verify_chain(gs, mode, executor)?;
+    if check.floor > 0 {
+        return match &check.problem {
+            None => {
+                tracing::info!(
+                    "pruned node: history verified from {} to {} ({:?}, {:.1?}); ledger snapshot trusted",
+                    check.floor, check.head, mode, t.elapsed()
+                );
+                Ok(check.head)
+            }
+            Some(problem) => anyhow::bail!(
+                "pruned node: {problem}; history cannot be repaired locally — re-sync from the archive"
+            ),
+        };
+    }
     match &check.problem {
         None => {
             tracing::info!("chain verified: {} blocks ok ({:?}, {:.1?})", check.head + 1, mode, t.elapsed());
@@ -255,6 +271,19 @@ pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: Verify
             Ok(resume)
         }
     }
+}
+
+/// The retention window must hold the aggregation window (history pruning spec §5): a cover's
+/// aggregate is read within it, and pruning it would make sealed blocks unservable.
+fn prune_window_check(prune_history: Option<Duration>, window: Option<u64>, block_interval: Duration) -> std::result::Result<(), String> {
+    let (Some(keep), Some(window)) = (prune_history, window) else { return Ok(()) };
+    let needed = block_interval.saturating_mul(u32::try_from(window).unwrap_or(u32::MAX));
+    if keep < needed {
+        return Err(format!(
+            "prune-history {keep:?} is shorter than the aggregation window ({window} blocks at {block_interval:?} = {needed:?})"
+        ));
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -495,20 +524,40 @@ fn pick_sync_peer(
     best_peer_height: u64,
     skipped: &[PeerId],
 ) -> Option<PeerId> {
+    let serves = |s: &Status| s.floor <= my_height.saturating_add(1);
     let best = peers
         .iter()
         .filter(|(p, peer)| peer.connected && !skipped.contains(p))
-        .filter_map(|(p, peer)| peer.status.as_ref().map(|s| (*p, s.height)))
+        .filter_map(|(p, peer)| peer.status.as_ref().filter(|s| serves(s)).map(|s| (*p, s.height)))
         .filter(|(_, h)| *h > my_height)
         .max_by_key(|(_, h)| *h)
         .map(|(p, _)| p);
     best.or_else(|| {
         if best_peer_height > my_height + 1 {
-            peers.iter().find(|(p, peer)| peer.connected && !skipped.contains(p)).map(|(p, _)| *p)
+            peers
+                .iter()
+                .filter(|(p, peer)| peer.connected && !skipped.contains(p))
+                .find(|(_, peer)| peer.status.as_ref().map_or(true, serves))
+                .map(|(p, _)| *p)
         } else {
             None
         }
     })
+}
+
+/// Every connected peer with a known status, as `"{peer_id} floor={floor} height={height}"` —
+/// the operator-readable form of [`Node::sync_from`]'s "no candidate can serve our next height"
+/// warning (final-review fix #2). A disconnected peer, or one whose status we have never seen,
+/// is omitted: `pick_sync_peer` would never have chosen either as a candidate anyway. Sorted for
+/// a stable log line and a deterministic test.
+fn no_peer_summary(peers: &HashMap<PeerId, Peer>) -> Vec<String> {
+    let mut out: Vec<String> = peers
+        .iter()
+        .filter(|(_, peer)| peer.connected)
+        .filter_map(|(p, peer)| peer.status.as_ref().map(|s| format!("{p} floor={} height={}", s.floor, s.height)))
+        .collect();
+    out.sort();
+    out
 }
 
 struct Node {
@@ -581,6 +630,19 @@ struct Node {
     fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, (Hash, Instant)>,
     /// Block hash -> (attempts so far, peers already asked) for by-hash fetches.
     fetch_attempts: HashMap<Hash, (usize, Vec<PeerId>)>,
+    /// History-retention passes that deleted at least one block (history pruning spec §1),
+    /// counted to space out the compaction pass.
+    prune_passes: u64,
+    /// Set for the duration of a background `compact_pruned_history` call (final-review fix
+    /// #1): compaction is a RocksDB range compaction, potentially the slowest single operation
+    /// this node ever runs, and it must never overlap itself or block the node loop, so the
+    /// every-64th-pass check spawns it without awaiting and this flag is how the next check
+    /// tells "still running" from "safe to start another".
+    compacting: Arc<AtomicBool>,
+    /// The last time [`Node::sync_from`] logged the "no peer holds our next height" warning,
+    /// rate-limited to once per minute so a node stuck behind every peer's retention floor does
+    /// not spam its log once per sync attempt.
+    no_peer_warned_at: Option<Instant>,
     /// Free space on the data directory's filesystem, measured at startup and on every status
     /// tick; what `NodeStatus::disk_free_bytes` and `disk_low` publish (audit v4 OPS-3).
     disk_free_bytes: u64,
@@ -660,6 +722,16 @@ fn expire_stale_fetches<K: std::hash::Hash + Eq + Clone>(
 /// Whether a by-hash fetch for `h` is still outstanding, after [`expire_stale_fetches`].
 fn fetch_blocked<K>(inflight: &HashMap<K, (Hash, Instant)>, h: &Hash) -> bool {
     inflight.values().any(|(x, _)| x == h)
+}
+
+/// Whether this history-pruning pass should kick off a background compaction (final-review fix
+/// #1): every 64th pass that deleted anything, and only when the previous compaction (if any)
+/// has finished. Flips `compacting` to `true` itself, atomically with the check, so two callers
+/// racing on the same 64th pass cannot both start one — there is only ever one caller in
+/// practice (the node loop is single-threaded here), but the compare-exchange is what makes the
+/// flag's meaning exact rather than advisory.
+fn should_compact(prune_passes: u64, compacting: &AtomicBool) -> bool {
+    prune_passes % 64 == 0 && compacting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
 }
 
 /// The wire cost of one committed block in a sync batch.
@@ -849,6 +921,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             cfg.min_free_disk_bytes / (1 << 20)
         ));
     }
+    prune_window_check(cfg.prune_history, gs.ledger.aggregation().map(|a| a.window), cfg.block_interval)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let storage = Arc::new(Storage::open(&cfg.datadir)?);
     storage.init_genesis(&gs)?;
     check_and_repair_chain(&storage, &gs, cfg.verify, executor.as_ref())?;
@@ -916,6 +990,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         fri_profile: gs.fri_profile.clone(),
         address: Some(key.address().to_base58()),
         peer_id: net.local_peer_id.to_string(),
+        prune_floor: 0,
+        prune_history_secs: cfg.prune_history.map(|d| d.as_secs()),
         ..Default::default()
     }));
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -1019,6 +1095,9 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         sync_late_batches: 0,
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
+        prune_passes: 0,
+        compacting: Arc::new(AtomicBool::new(false)),
+        no_peer_warned_at: None,
         disk_free_bytes,
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         verified,
@@ -1129,11 +1208,23 @@ impl Node {
         }
     }
 
+    /// `Storage::prune_floor`, defaulting to 0 (an archive's floor) and logging when the meta
+    /// row is actually unreadable rather than merely absent, so a status advertising 0 for that
+    /// reason is not silently confused with an honest archive.
+    fn prune_floor_or_zero(&self) -> u64 {
+        self.storage.prune_floor().unwrap_or_else(|e| {
+            tracing::warn!("prune floor unreadable: {e}; advertising 0");
+            0
+        })
+    }
+
     fn publish_status(&self) {
         let mut s = self.status.write().unwrap_or_else(|e| e.into_inner());
         s.height = self.hs.committed_height();
         s.disk_free_bytes = self.disk_free_bytes;
         s.disk_low = self.disk_low();
+        s.prune_floor = self.prune_floor_or_zero();
+        s.prune_history_secs = self.cfg.prune_history.map(|d| d.as_secs());
         s.head_hash = self.hs.committed_hash().to_hex();
         s.view = self.hs.view();
         s.high_qc_view = self.hs.high_qc().view;
@@ -1362,6 +1453,7 @@ impl Node {
                 height: self.hs.committed_height(),
                 head_hash: self.hs.committed_hash(),
                 view: self.hs.view(),
+                floor: self.prune_floor_or_zero(),
             }))
             .await;
     }
@@ -1495,6 +1587,40 @@ impl Node {
                     .map_err(|e| anyhow::anyhow!("pruning task: {e}"))??;
                 if pruned > 0 {
                     tracing::info!("pruned {pruned} sealed bundle records at head {head}");
+                }
+            }
+        }
+        // The history-retention pass (history pruning spec §1): every 16 blocks, the blocks
+        // older than the window measured on the chain's own clock lose their history. Never
+        // inside the aggregation window, never the head or its parent, never genesis.
+        if let Some(keep) = self.cfg.prune_history {
+            if head % 16 == 0 {
+                let head_ms = self.storage.head_block()?.header.timestamp_ms;
+                let cutoff_ms = head_ms.saturating_sub(u64::try_from(keep.as_millis()).unwrap_or(u64::MAX));
+                let window = self.hs.committed_ledger().aggregation().map(|a| a.window).unwrap_or(0);
+                let keep_from = head.saturating_sub(window.max(2));
+                let storage = self.storage.clone();
+                let pruned = tokio::task::spawn_blocking(move || storage.prune_history(cutoff_ms, keep_from, crate::storage::PRUNE_PASS_MAX))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("history pruning task: {e}"))??;
+                if pruned > 0 {
+                    self.prune_passes += 1;
+                    tracing::info!("pruned {pruned} blocks below height {} at head {head}", self.storage.prune_floor()?);
+                    if should_compact(self.prune_passes, &self.compacting) {
+                        // Off the node loop entirely (final-review fix #1): a range compaction
+                        // over days of blocks can run far longer than the delete pass above, and
+                        // this call is fire-and-forget, not awaited, so it cannot stall a commit.
+                        let storage = self.storage.clone();
+                        let compacting = self.compacting.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = storage.compact_pruned_history() {
+                                tracing::warn!("history compaction failed: {e}");
+                            }
+                            compacting.store(false, Ordering::Release);
+                        });
+                    } else if self.prune_passes % 64 == 0 {
+                        tracing::debug!("history compaction already running; skipping this pass");
+                    }
                 }
             }
         }
@@ -1953,7 +2079,26 @@ impl Node {
         // are give-ups, never stalls: fall to the next candidate — a possibly-stale answer
         // costs one round trip, and it keeps the cycle alive where a silent stall costs the chain.
         for _ in 0..3 {
-            let Some(peer) = pick_sync_peer(&self.peers, my_height, self.best_peer_height(), &skipped) else { return };
+            let Some(peer) = pick_sync_peer(&self.peers, my_height, self.best_peer_height(), &skipped) else {
+                // No candidate at all — not merely a send failure — is the silent case: every
+                // peer that could serve our next height has pruned past it (final-review fix
+                // #2). Rate-limited to once a minute so a node stuck here does not spam its log
+                // on every sync tick.
+                if self.best_peer_height() > my_height + 1 {
+                    let now = Instant::now();
+                    if self.no_peer_warned_at.map_or(true, |at| now.duration_since(at) >= Duration::from_secs(60)) {
+                        self.no_peer_warned_at = Some(now);
+                        tracing::warn!(
+                            height = my_height,
+                            target = self.best_peer_height(),
+                            peers = ?no_peer_summary(&self.peers),
+                            "no peer holds height {}: every candidate has pruned it — a node behind every peer's retention must sync from the archive",
+                            my_height + 1
+                        );
+                    }
+                }
+                return;
+            };
             let req = SyncRequest::Blocks { from_height: my_height + 1, max: self.sync_batch };
             if let Some(id) = self.net.send_sync_request(peer, req).await {
                 self.sync_inflight = Some((peer, id, Instant::now(), my_height));
@@ -1968,7 +2113,8 @@ impl Node {
                 height = my_height,
                 target = self.best_peer_height(),
                 peers = ?self.peers.iter().map(|(p, peer)| format!("{p} connected={} status={:?}", peer.connected, peer.status.as_ref().map(|s| s.height))).collect::<Vec<_>>(),
-                "sync wanted but every candidate refused the request"
+                floors = ?self.peers.values().filter_map(|p| p.status.as_ref().map(|s| s.floor)).collect::<Vec<_>>(),
+                "sync wanted but no candidate can serve our next height (a peer that pruned it, or none connected) — a node behind every peer's retention must sync from the archive"
             );
         }
     }
@@ -2535,7 +2681,7 @@ mod tests {
             let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
             PeerId::from(kp.public())
         };
-        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height };
+        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height, floor: 0 };
         let forwarder = pid(1);
         let author = pid(2);
         let mut peers: HashMap<PeerId, Peer> =
@@ -2556,7 +2702,7 @@ mod tests {
             let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
             PeerId::from(kp.public())
         };
-        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height };
+        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height, floor: 0 };
         let forwarder = pid(1);
         let mut peers: HashMap<PeerId, Peer> =
             [(forwarder, Peer { connected: true, ..Default::default() })].into_iter().collect();
@@ -2577,7 +2723,7 @@ mod tests {
             let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
             PeerId::from(kp.public())
         };
-        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height };
+        let status = |height: u64| Status { height, head_hash: Hash::ZERO, view: height, floor: 0 };
         let limiter = PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC);
         let (f1, f2) = (pid(1), pid(2));
         let mut peers: HashMap<PeerId, Peer> = [f1, f2]
@@ -2617,7 +2763,7 @@ mod tests {
             (
                 pid(seed),
                 Peer {
-                    status: height.map(|height| Status { height, head_hash: Hash::ZERO, view: height }),
+                    status: height.map(|height| Status { height, head_hash: Hash::ZERO, view: height, floor: 0 }),
                     connected,
                     ..Default::default()
                 },
@@ -2637,6 +2783,88 @@ mod tests {
         let skipped = [pid(2)];
         let peers: HashMap<PeerId, Peer> = [p(1, false, Some(163)), p(2, true, None), p(3, true, Some(50))].into_iter().collect();
         assert_eq!(pick_sync_peer(&peers, 43, 163, &skipped), Some(pid(3)));
+    }
+
+    #[test]
+    fn pick_sync_peer_never_picks_a_peer_that_pruned_our_next_height() {
+        let pid = |seed: u8| {
+            let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+            PeerId::from(kp.public())
+        };
+        let p = |seed: u8, height: u64, floor: u64| {
+            (pid(seed), Peer { status: Some(Status { height, head_hash: Hash::ZERO, view: height, floor }), connected: true, ..Default::default() })
+        };
+        // We are at 43 and need 44. Peer 1 is far ahead but pruned everything below 100;
+        // peer 2 is lower but still holds 44.
+        let peers: HashMap<PeerId, Peer> = [p(1, 500, 100), p(2, 120, 0)].into_iter().collect();
+        assert_eq!(pick_sync_peer(&peers, 43, 500, &[]), Some(pid(2)));
+        // A floor exactly at our next height is fine.
+        let peers: HashMap<PeerId, Peer> = [p(1, 500, 44)].into_iter().collect();
+        assert_eq!(pick_sync_peer(&peers, 43, 500, &[]), Some(pid(1)));
+        // Every candidate pruned it: no pick, even though the chain is ahead.
+        let peers: HashMap<PeerId, Peer> = [p(1, 500, 100), p(2, 300, 60)].into_iter().collect();
+        assert_eq!(pick_sync_peer(&peers, 43, 500, &[]), None);
+    }
+
+    #[test]
+    fn no_peer_summary_lists_connected_peers_with_their_floor_and_height_and_omits_disconnected() {
+        let pid = |seed: u8| {
+            let kp = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+            PeerId::from(kp.public())
+        };
+        let mut peers: HashMap<PeerId, Peer> = HashMap::new();
+        peers.insert(pid(1), Peer { status: Some(Status { height: 500, head_hash: Hash::ZERO, view: 500, floor: 100 }), connected: true, ..Default::default() });
+        peers.insert(pid(2), Peer { status: Some(Status { height: 300, head_hash: Hash::ZERO, view: 300, floor: 60 }), connected: true, ..Default::default() });
+        // Connected but no status yet: omitted, nothing to report.
+        peers.insert(pid(3), Peer { status: None, connected: true, ..Default::default() });
+        // A fresh status from a peer we are not connected to: omitted too.
+        peers.insert(pid(4), Peer { status: Some(Status { height: 900, head_hash: Hash::ZERO, view: 900, floor: 0 }), connected: false, ..Default::default() });
+        let summary = no_peer_summary(&peers);
+        assert_eq!(summary.len(), 2);
+        assert!(summary.contains(&format!("{} floor=100 height=500", pid(1))));
+        assert!(summary.contains(&format!("{} floor=60 height=300", pid(2))));
+        assert!(!summary.iter().any(|s| s.contains(&pid(3).to_string())));
+        assert!(!summary.iter().any(|s| s.contains(&pid(4).to_string())));
+    }
+
+    #[test]
+    fn should_compact_fires_on_the_64th_pass_when_idle_and_flips_the_flag() {
+        let compacting = AtomicBool::new(false);
+        // Not the 64th pass: never fires, and the flag is left alone.
+        for passes in [1, 63, 65, 128 - 1] {
+            assert!(!should_compact(passes, &compacting));
+            assert!(!compacting.load(Ordering::SeqCst));
+        }
+        // The 64th pass, idle: fires, and flips the flag to busy.
+        assert!(should_compact(64, &compacting));
+        assert!(compacting.load(Ordering::SeqCst));
+        // The 128th pass, still busy from the previous one: does not fire, flag unchanged.
+        assert!(!should_compact(128, &compacting));
+        assert!(compacting.load(Ordering::SeqCst));
+        // Once the background task clears it, the next 64th pass fires again.
+        compacting.store(false, Ordering::SeqCst);
+        assert!(should_compact(192, &compacting));
+    }
+
+    #[test]
+    fn a_window_shorter_than_the_aggregation_window_refuses_to_start() {
+        // 256-block window at 1 s blocks is 256 s; a 100 s history cannot hold it.
+        let err = prune_window_check(Some(Duration::from_secs(100)), Some(256), Duration::from_secs(1)).unwrap_err();
+        assert!(err.contains("shorter than the aggregation window"), "{err}");
+        assert!(prune_window_check(Some(Duration::from_secs(300)), Some(256), Duration::from_secs(1)).is_ok());
+        assert!(prune_window_check(None, Some(256), Duration::from_secs(1)).is_ok());
+        assert!(prune_window_check(Some(Duration::from_secs(10)), None, Duration::from_secs(1)).is_ok());
+        assert!(prune_window_check(Some(Duration::from_secs(256)), Some(256), Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn a_pruned_store_missing_its_floor_block_is_fatal_not_truncated() {
+        let (_dir, st, gs, _blocks) = crate::storage::fixtures::timed_chain(12);
+        st.prune_history(u64::MAX, 10, crate::storage::PRUNE_PASS_MAX).unwrap();
+        st.db_for_test().delete_cf(st.cf_for_test("blocks"), crate::storage::height_key_for_test(10)).unwrap();
+        let err = check_and_repair_chain(&st, &gs, VerifyMode::Quick, &StubExecutor).unwrap_err().to_string();
+        assert!(err.contains("re-sync from the archive"), "{err}");
+        assert_eq!(st.head().unwrap().height, 12, "nothing was truncated");
     }
 
     /// The restart this task exists to fix: a node whose head is past an epoch boundary comes

@@ -27,6 +27,16 @@
   recorded, and a gossiped `Status` from an author this node holds no connection to no longer
   creates an entry at all.
 - Observers run the same binary without `--validator`; they sync, verify and serve RPC.
+- **History pruning (testnet only).** `--prune-history <n>m|<n>h|<n>d`, at least `1h` (`24h`
+  keeps the ledger and one day of blocks); the rest is deleted every 16 blocks
+  (`docs/superpowers/specs/2026-09-24-history-pruning-design.md`).
+  Exactly one node keeps everything — the archive, `ARCHIVE` in `deploy/nodes.env` (obs1 on
+  randbridge-web, data dir on a volume) — and a node that falls more than a day behind must sync
+  from it. **Mainnet units never pass the flag.** A pruned node that fails its startup check does
+  not repair itself: re-sync it from the archive. **Rollback:** a pruned data directory opened by
+  a build ≤ v0.5.6 with the default `--verify-chain quick` replays from genesis, finds block 1
+  missing and truncates the whole ledger to genesis; run an older build on a pruned data
+  directory only with `--verify-chain off`, or re-sync from the archive.
 - **The one public RPC endpoint is `https://rpc.randprotocol.org`** — Cloudflare, proxied to Caddy
   on droplet F, forwarding to that node's own `127.0.0.1:8545`; every other droplet keeps RPC
   loopback-only. It is not on E on purpose: E's node holds randscan's 64 `rand_importViewingKey`

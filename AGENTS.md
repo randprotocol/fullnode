@@ -6,6 +6,76 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-25)
 
+### v0.5.7 — history pruning (2026-09-25)
+
+The 2026-09-24 disk incident's fix (five of twelve droplets crash-looping on ENOSPC, the fleet
+lost quorum at height 248 953): a testnet-only node keeps one day of blocks and prunes the rest
+(design `docs/superpowers/specs/2026-09-24-history-pruning-design.md`). Branch
+`feat/history-pruning`, node-only, no genesis or consensus change.
+**What it is:**
+
+- **The flag.** `rand-node run --prune-history <n>m|<n>h|<n>d` (`24h`, `36h`, `2d`); refused
+  below `1h` at startup. Absent means never prune — an archive node.
+- **The pass.** Every 16th committed block, `Storage::prune_history` deletes `blocks`, `qcs`,
+  `block_index`, `txs`, `receipts`/`receipts_by_program` and `seals` for everything below
+  `head_timestamp - prune_history`, up to `PRUNE_PASS_MAX = 512` blocks per pass in one synced
+  `WriteBatch`. It never touches the ledger (`notes`, `nullifiers`, `anchors`, `validators`,
+  `programs`, …), never deletes genesis, the head, the head's parent, or anything inside an
+  aggregation window. The floor (`META_PRUNE_FLOOR`) only rises; disk comes back after
+  compaction, every 64th pass.
+- **The archive rule.** Exactly one node, obs1 (`ARCHIVE` in `deploy/nodes.env`, data dir on a
+  volume), runs without the flag and keeps every block forever. **Mainnet units never pass the
+  flag** — `docs/deploy.md` says so in the unit template.
+- **`Status.floor` is a wire-coordinated change, rolled in one pass, not gradually.** bincode is
+  not self-describing, and the incompatibility is one-directional (pinned by a decode test,
+  `network::wire`): a v0.5.7 node cannot decode a v0.5.6 peer's `Status` at all (eight bytes
+  short — refused, never misread), so that peer is invisible to `pick_sync_peer`. A v0.5.6 node
+  still decodes a v0.5.7 peer's `Status` fine, reading only its own known prefix and never
+  seeing the floor — so an old node can still pick a peer that has in fact pruned the height it
+  needs, and that batch just comes back empty. Either way there is no reliable batch sync
+  between mixed versions for the roll window; consensus (votes, new-views, proposals) is
+  untouched and blocks keep committing throughout.
+- **Startup verification on a pruned node is structural, not a replay**: block 0 and the head
+  range's blocks, QCs, parent links and leaders are checked; `load_ledger`'s snapshot is
+  trusted. **A structural failure there is fatal** — the node holds one ledger and truncating
+  would pair the remaining blocks with state they didn't produce — `check_and_repair_chain` and
+  `verify --repair` both exit rather than truncate: re-sync from the archive.
+- **RPC.** Error `-32010` (`data.floor`) answers a height-addressed lookup below the floor
+  (`rand_getBlockByHeight`, `rand_getFinality` by height, `rand_getBlocks`/`rand_getCompactBlocks`
+  reaching a pruned height, `rand_getTransaction`/`rand_checkTransaction` naming one). Hash-only
+  lookups (`rand_getReceipt`, `rand_getCallEnvelope`, `rand_getAggregate`,
+  `rand_getRawTransaction`, `rand_getBlockByHash`) keep answering `null` for a hash this node
+  doesn't hold — only an archive can say "pruned" from "never existed". `rand_status` gains
+  `prune_floor` (u64) and `prune_history_secs` (`null` when unset).
+- **Rollback:** a pruned data directory opened by a build ≤ v0.5.6 with the default
+  `--verify-chain quick` replays from genesis, finds block 1 missing and truncates the whole
+  ledger to genesis; run an older build on a pruned data directory only with `--verify-chain
+  off`, or re-sync from the archive.
+
+**Roll (operator, not yet run), in order:**
+
+1. **Archive first.** Move obs1's (randbridge-web) datadir onto a volume, no flag, before
+   anything else touches the flag; confirm `rand_status.prune_floor == 0` and the head still
+   follows the fleet. `rpc.randprotocol.org` is served by droplet F, which will prune: repoint
+   the public RPC at obs1 before the roll, or accept `-32010` for heights older than a day there
+   — the operator's choice.
+2. **Wait until the chain is committing again.** Never roll a wire change onto a halted chain.
+3. **The seventeen droplets, one at a time**, built on E from the tagged commit:
+   `PRUNE_ARGS="--prune-history 24h" deploy/update-droplet.sh <ip>`, waiting for
+   `rand_status.height` to reach the head and one more block to commit before the next. **Measure
+   the first rolled validator's pass duration in its log before continuing**: a first pass over a
+   backlog is awaited synchronously in the node's post-commit loop up to
+   `PRUNE_PASS_MAX = 512` blocks, so a validator holding much more than a day of history could
+   stall its own commits for the pass's duration on that first activation. **Gate each step**:
+   roll the next droplet only after the previous one's `rand_status.prune_floor` is within a day
+   of the head (its drain finished, ~2–3 h at 512 blocks a pass); never have more than one
+   validator draining at once.
+4. **Node A last**, separately: `BINDIR`/`PRUNE_ARGS="--prune-history 24h"` in `run-a.sh`'s
+   environment, then `launchctl kill TERM gui/$(id -u)/org.randprotocol.node-a`.
+5. **Verify:** every validator's `prune_floor` rising, `du -ch db/*.sst` falling and flat, obs1
+   answers `rand_getBlockByHeight(1000)` while a validator answers `-32010`, a fresh observer
+   synced from obs1 reaches the head.
+
 ### v0.5.6 — the deep security-and-math scan (2026-09-25)
 
 The scan the user ordered after the audit fixes ("issue another scan for deep security and math

@@ -40,6 +40,7 @@ RPC=${RPC:-127.0.0.1:8545}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-900}
 BOOTSTRAPS=${BOOTSTRAPS:-}
 PIN=${PIN:-}
+PRUNE_ARGS=${PRUNE_ARGS:-}
 SSH="ssh -A -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$IP"
 
 KEY="$KEYDIR/node-$NAME.key.json"
@@ -101,7 +102,7 @@ Description=RAND full node ($NAME, chain 14)
 After=network-online.target
 [Service]
 Environment=RUST_LOG=info,libp2p=warn,libp2p_mdns=off
-ExecStart=/usr/local/bin/$BIN_NODE run --datadir \$DATA --key $REMOTE_KEYDIR/node-$NAME.key.json --validator --listen /ip4/0.0.0.0/tcp/30303 --rpc $RPC --no-mdns$BOOT_ARGS
+ExecStart=/usr/local/bin/$BIN_NODE run --datadir \$DATA --key $REMOTE_KEYDIR/node-$NAME.key.json --validator --listen /ip4/0.0.0.0/tcp/30303 --rpc $RPC --no-mdns$BOOT_ARGS $PRUNE_ARGS
 Restart=always
 RestartSec=3
 [Install]

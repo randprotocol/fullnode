@@ -203,6 +203,11 @@ that transaction's own notes, which is the order served here.
 
 Errors: `-32602` for a backwards range (`to_height` below `from_height`) or a missing bound.
 
+On a node started with `--prune-history`, a range that reaches a height below the floor (genesis
+excepted) answers error `-32010` naming the first such height —
+`pruned: height h is below this node's retention floor f` with `data: {"floor": f}` — ask the
+archive for it. `[0, to]` still serves genesis alone when `to` is 0.
+
 ### `rand_getAnchor`
 Params: `[]` for the head, or `[height]`. Result: `{ "height": 192, "root": "6b1d…c4" }`, or error
 `-32001` for a height with no recorded anchor.
@@ -513,6 +518,11 @@ exception — a validator address, an amount and a replay nonce are public in th
 way a mint's amount is, because the validator register and the bridge's accounting are public
 (spec §8). A shielded note's later spend stays private in every case.
 
+On a node started with `--prune-history`, a transaction whose block was pruned normally
+answers `null` (its location row went with the block); `-32010` `pruned: height h is below this
+node's retention floor f` with `data: {"floor": f}` is answered only when a location row survived
+and names a height below the floor.
+
 ### `rand_checkTransaction`
 Params: `[hash, key]`, where `key` is a per-transaction `TxKey` as 64 hex characters. Result:
 `null` for a hash this node has no committed transaction for, else what the key discloses about
@@ -551,6 +561,11 @@ by design. Amounts are strings, as everywhere chain state is served.
 
 Errors: `-32602` for a malformed hash or key (both are parsed before any storage read).
 
+On a node started with `--prune-history`, a transaction whose block was pruned normally
+answers `null` (its location row went with the block); `-32010` `pruned: height h is below this
+node's retention floor f` with `data: {"floor": f}` is answered only when a location row survived
+and names a height below the floor.
+
 ### `rand_getBlockByHeight` / `rand_getBlockByHash`
 Params: `[height]` (integer) or `[hash]`. Result: `null` if unknown, else:
 ```json
@@ -563,6 +578,12 @@ Params: `[height]` (integer) or `[hash]`. Result: `null` if unknown, else:
 ```
 Only committed blocks are served. `justify_view` is the view of the quorum certificate for the
 parent that this block carries.
+
+On a node started with `--prune-history`, a height below `rand_status.prune_floor` (genesis
+excepted) answers error `-32010` `pruned: height h is below this node's retention floor f`
+with `data: {"floor": f}` — ask the archive for it. A pruned block asked for **by hash** still
+answers `null`, as an unknown hash does: only an archive can say whether it was pruned or never
+existed.
 
 ### `rand_getHead`
 Params: `[]`. Result: `{ "height": 1998, "hash": "…", "view": 2251 }` (`view` is the node's current
@@ -885,6 +906,12 @@ loop.
 
 Errors: `-32602` for an empty list or more than 64 hashes.
 
+On a pruned node (`rand_status.prune_floor > 0`), every `unknown` entry carries `floor` beside
+`status`: `{ "hash": "…", "status": "unknown", "floor": 10 }` — whether or not that particular
+hash's height is below it, since an archive is the only place that could say which. It is still
+`unknown`, not an error — this method answers a page of hashes, not one lookup — and only an
+archive can say whether that hash was ever committed.
+
 ### `rand_getReceipts`
 Params: `[program_id, from_height, to_height, limit?]`. Result:
 ```json
@@ -903,6 +930,13 @@ is never split across two pages and a caller never has to de-duplicate one acros
 own `to_height` ended the page rather than `limit`.
 
 Errors: `-32602` for `to_height` below `from_height`.
+
+On a node started with `--prune-history`, a range that reaches a height below the floor (genesis
+excepted) answers error `-32010` naming the first such height —
+`pruned: height h is below this node's retention floor f` with `data: {"floor": f}` — ask the
+archive for it, rather than serving the range from the floor's receipts alone (the pruned heights'
+receipt rows go with their blocks — see the retention pass). `[0, to]` still serves genesis alone
+when `to` is 0.
 
 ### `rand_getWitnesses`
 Params: `[[index, …]]`, 1 to 32 leaf indices. Result:
@@ -933,6 +967,12 @@ correct against an older node's 128.
 
 Errors: `-32602` for `to_height` below `from_height`.
 
+On a node started with `--prune-history`, a range that reaches a height below the floor (genesis
+excepted) answers error `-32010` naming the first such height —
+`pruned: height h is below this node's retention floor f` with `data: {"floor": f}` — ask the
+archive for it, rather than serving the range from the floor instead. `[0, to]` still serves
+genesis alone when `to` is 0.
+
 ### `rand_getFinality`
 Params: `[height]` or `[hash]`. Result, one of:
 ```json
@@ -949,6 +989,11 @@ certificate for it — `high_qc`, `locked_qc`, the committed head's `head_qc`, o
 never held.
 
 Errors: `-32602` for a missing param 0, or one that is neither a height nor a block hash.
+
+On a node started with `--prune-history`, a height below `rand_status.prune_floor` (genesis
+excepted) answers error `-32010` `pruned: height h is below this node's retention floor f` with
+`data: {"floor": f}` — ask the archive for it. A hash is unaffected: it still answers `committed`,
+`certified`, `proposed` or `unknown` as above.
 
 ### `rand_getProposer`
 Params: `[view]` or `[from_view, to_view]`, at most 64 views. Result:
@@ -1234,6 +1279,17 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-25 — history pruning: `--prune-history`, `rand_status.prune_floor`, error `-32010`
+
+A node started with `--prune-history 24h` keeps the ledger and only the last day of blocks.
+`rand_status` carries `prune_floor` (0 on an archive) and `prune_history_secs` (`null` when the
+node keeps everything). Height-addressed lookups below the floor answer `-32010` with the floor
+in `data`; hash-addressed lookups still answer `null` for a hash the node does not hold, and only
+an archive can say whether it was pruned or never existed. `rand_getTransactionStatus` adds
+`floor` to an `unknown` entry on a pruned node. Wallet scanning (`rand_getCommitments`,
+`rand_getNullifiers`, `rand_getWitness`) is unaffected: the notes and nullifiers families are
+never pruned.
 
 ### 2026-09-25 — v0.5.6, the deep-scan release
 
@@ -1642,3 +1698,4 @@ upgrades by ordinary restart. What a client can see:
 - **The one behaviour change an existing client can notice**: a transaction submitted over RPC is
   answered after its proof has verified on a worker rather than on the consensus loop, so the reply
   can take a few hundred milliseconds longer under load. The error messages are unchanged.
+
