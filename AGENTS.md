@@ -8,6 +8,33 @@ invariants, and known traps.
 
 ### v0.5.7 — history pruning (2026-09-25)
 
+**Released and ROLLED 2026-09-25.** Tag `v0.5.7` = `089bdd6`, GitHub release with the E-built binaries
+(`rand-node` sha256 `c8b3539b…2bbe`). Suite on the laptop: core 437, client 90 + wallet_flow 5,
+node lib 301 (+21 recursion-fixture gap), node bin 10, cluster 25 (1261 s), genesis_cli 2, submit 2,
+ws 9, zusd_e2e 2 (1683 s), bridge-codec 4; CI green; rvm suites not completed on the laptop
+(aggregate.rs OOM-killed; no rvm file changed since v0.5.6).
+**Roll: all-stop, all-start, NOT one at a time** — found while planning it: a v0.5.7 node cannot
+decode a v0.5.6 `Status`, so among v0.5.6 peers `best_peer_height()` is 0 and a restarted node never
+batch-syncs (it would sit ~700 blocks behind fetching parents one by one). Staged sha-checked
+binaries as `/root/rand-node.new` on 17 droplets + obs1; stop all 04:23:27, install, start all
+04:23:40 UTC; node A on `bin-089bdd6` (run-a.sh default). The chain paused at 287 354 and committed
+again ~04:55 (13 back); all 17 at head by 04:58. obs1's data moved during the stop onto the
+DigitalOcean volume `randbridge-archive` (250 GiB, sgp1, mounted `/mnt/archive`, the datadir is a
+symlink to it); obs1 went v0.5.1 → v0.5.7 (the at-open QC prune dropped 287 354 certificates in
+6 min, then a full verify of 287 356 blocks, done 05:03). obs1 = the archive, no flag.
+**Pruning switched on after the roll, per node:** `--prune-history 24h` appended to each unit's
+ExecStart, restarted once through a drop-in adding `--verify-chain off` (the same binary had
+verified that data 35 min earlier; the drop-in is removed right after, so the next restart
+verifies normally). Canary MEM1 04:58: passes of 512 blocks take 0.55–0.70 s (1-vCPU 48 GB
+droplets 0.3–0.6 s), the node stays within two blocks of the head, so waves of four followed
+(05:01 SYD1 NYC1 SFO2 BLR1; 05:10 F LON1 AMS3 ATL1; 05:11 C NYC2 SFO3 TOR1; 05:12 B D E MKC1).
+The chain kept committing throughout. A full drain is ~2.5 h (≈220k blocks at 512 per 16 blocks).
+Node A keeps full history (laptop disk is ample): a second archive beside obs1. Verified: obs1
+answers `rand_getBlockByHeight(1000)`, a validator answers `-32010` naming its floor.
+Rollback: re-pin `a2d4021` only on an unpruned datadir (obs1, A); a pruned one needs
+`--verify-chain off` or a re-sync from obs1.
+
+
 The 2026-09-24 disk incident's fix (five of twelve droplets crash-looping on ENOSPC, the fleet
 lost quorum at height 248 953): a testnet-only node keeps one day of blocks and prunes the rest
 (design `docs/superpowers/specs/2026-09-24-history-pruning-design.md`). Branch
