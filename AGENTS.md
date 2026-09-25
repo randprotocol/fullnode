@@ -45,6 +45,7 @@ droplets 0.3–0.6 s), the node stays within two blocks of the head, so waves of
 The chain kept committing throughout. A full drain is ~2.5 h (≈220k blocks at 512 per 16 blocks).
 Node A keeps full history (laptop disk is ample): a second archive beside obs1. Verified: obs1
 answers `rand_getBlockByHeight(1000)`, a validator answers `-32010` naming its floor.
+**Drained by 07:33 UTC:** every validator keeps ≤ 65.5k blocks (one day), block tables 3.3–4.4 GB (were 19 GB), disks 18–37% used; obs1 19 GB of tables, full history.
 Rollback: re-pin `a2d4021` only on an unpruned datadir (obs1, A); a pruned one needs
 `--verify-chain off` or a re-sync from obs1.
 
