@@ -205,6 +205,7 @@ impl ConfidentialExecutor for AggExecutor {
         shape: &DeclaredShape,
         covered: &[CoveredBundle],
         proof: &[u8],
+        binding: &[u32; 8],
     ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
         if covered.is_empty() {
             return Err(ConfidentialError::InvalidAggregateProof(
@@ -226,10 +227,17 @@ impl ConfidentialExecutor for AggExecutor {
         check_tier(self.rvm.profile, rvm_proof.tier.0 as u8)?;
         let vk = Self::inner_key(shape)?;
         let pvs: Vec<Vec<u64>> = covered.iter().map(|c| c.public_values.to_vec()).collect();
-        let public = randprotocol_rvm::public_values::interface_words(&vk.shape, &vk.key, &pvs);
+        // The list carries the transaction's own binding (audit v3, AGG-2), recomputed by the
+        // ledger from `(chain, aggregator, nonce)`: a proof made under another triple digests
+        // differently and is refused.
+        let public = randprotocol_rvm::public_values::interface_words_bound(&vk.shape, &vk.key, binding, &pvs);
         let program = aggregate_program(&vk);
-        let out =
-            randprotocol_rvm::aggregate::verify_aggregate(&self.rvm, &program, &AggregateProof { proof: rvm_proof, public })
+        let out = randprotocol_rvm::aggregate::verify_aggregate(
+            &self.rvm,
+            &program,
+            &AggregateProof { proof: rvm_proof, public },
+            binding,
+        )
                 .map_err(|e| ConfidentialError::InvalidAggregateProof(format!("{e:?}")))?;
         AGGREGATE_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(out)
@@ -327,7 +335,7 @@ mod tests {
             Err(ConfidentialError::AggregationUnsupported)
         );
         assert_eq!(
-            zk.verify_aggregate(&shape, &[cov], b"proof"),
+            zk.verify_aggregate(&shape, &[cov], b"proof", &[0; 8]),
             Err(ConfidentialError::AggregationUnsupported)
         );
     }
@@ -389,12 +397,12 @@ mod tests {
     fn verify_aggregate_refuses_the_empty_set_and_malformed_bytes_cheaply() {
         let (shape, cov) = covered(0);
         let w = AggExecutor::new(FriProfile::Test);
-        match w.verify_aggregate(&shape, &[], b"whatever") {
+        match w.verify_aggregate(&shape, &[], b"whatever", &[0; 8]) {
             Err(ConfidentialError::InvalidAggregateProof(_)) => {}
             other => panic!("an empty cover set must be a named refusal, got {other:?}"),
         }
         assert_eq!(
-            w.verify_aggregate(&shape, &[cov], b"not a postcard proof"),
+            w.verify_aggregate(&shape, &[cov], b"not a postcard proof", &[0; 8]),
             Err(ConfidentialError::MalformedProof)
         );
     }
@@ -402,7 +410,8 @@ mod tests {
     /// The conformance suite (spec §4, and the plan's gate): the admission stub is not trusted
     /// until the fullnode's recompute reproduces `circuits/recursion/docs/02-aggregate.md`'s
     /// pinned vectors byte-for-byte — the `inner_vk_digest` (a constant of the fixture shape),
-    /// the 107-word interface list for the 3-proof test-profile fixture set, and its digest.
+    /// the 115-word bound interface list `[vk ‖ 3 ‖ B(8) ‖ 34·3]` for the 3-proof test-profile
+    /// fixture set under the doc's stand-in binding (AGG-2), and its digest.
     /// The list rides on the fixtures' random notes, so this pins against *this* fixture
     /// cache, the same one the doc's worked example measured (regenerated 2026-09-21 after the
     /// original cache was lost with a `/tmp` worktree; the vk digest — the data-independent
@@ -425,24 +434,32 @@ mod tests {
             "33a94ec690bb7cbe5a3d4564967460996277ac61b539f6525b5fe7f92992a1c8",
             "the pinned inner_vk_digest"
         );
-        // The 107-word interface list, built the way admission builds it: from the covered
-        // bundles' 34 public values, in cover order.
+        // The 115-word interface list, built the way admission builds it: from the covered
+        // bundles' 34 public values, in cover order, with the binding after the count.
         let pvs: Vec<Vec<u64>> = (0..3).map(|k| covered(k).1.public_values.to_vec()).collect();
-        let list = randprotocol_rvm::public_values::interface_words(&vk.shape, &vk.key, &pvs);
-        assert_eq!(list.len(), 4 + 1 + 34 * 3);
-        assert_eq!(hex_words(&list), INTERFACE_LIST_HEX, "the pinned 107-word interface list");
+        let list = randprotocol_rvm::public_values::interface_words_bound(&vk.shape, &vk.key, &DOC_BINDING, &pvs);
+        assert_eq!(list.len(), 4 + 1 + 8 + 34 * 3);
+        assert_eq!(hex_words(&list), INTERFACE_LIST_HEX, "the pinned 115-word interface list");
         assert_eq!(
             hex_words(&randprotocol_rvm::public_values::public_digest(&list)),
-            "3e61770b2386fd4bd98507e25a15af59ac700af4289c8e2372aacd00b7a299b1",
+            "9833ac5b15e54b7229ed77e1db98919d86f660d06937b980d55c83df6fdc868e",
             "the pinned interface digest"
         );
     }
 
-    /// `docs/02-aggregate.md`'s worked example: the 107-word interface list for the 3-proof
+    /// `docs/02-aggregate.md`'s stand-in binding (its tests' `common::TEST_BINDING`): on a chain
+    /// the words are `aggregate_binding(chain_id, aggregator, nonce)`.
+    const DOC_BINDING: [u32; 8] =
+        [0xA662_0000, 0xA662_0001, 0xA662_0002, 0xA662_0003, 0xA662_0004, 0xA662_0005, 0xA662_0006, 0xA662_0007];
+
+    /// `docs/02-aggregate.md`'s worked example: the 115-word interface list for the 3-proof
     /// test-profile fixture set, each word the canonical `u64` as 16 lowercase hex chars.
     const INTERFACE_LIST_HEX: &str = concat!(
         "33a94ec690bb7cbe5a3d4564967460996277ac61b539f6525b5fe7f92992a1c8",
-        "00000000000000030000000000000000000000000000000e000000000a37f920",
+        "0000000000000003",
+        "00000000a662000000000000a662000100000000a662000200000000a6620003",
+        "00000000a662000400000000a662000500000000a662000600000000a6620007",
+        "0000000000000000000000000000000e000000000a37f920",
         "00000000ac819f8e00000000f82f671d00000000354a3037000000003153f3de",
         "000000009a2dcd060000000046a46766000000009d44a4ad000000006f35274a",
         "000000000371953700000000a8a42560000000004b291c6600000000b7c2de0e",
@@ -477,7 +494,7 @@ mod tests {
         let (shape, cov) = covered(0);
         let bundle_proof = fixture_proof(0);
         let w = AggExecutor::new(FriProfile::Test);
-        match w.verify_aggregate(&shape, &[cov], &bundle_proof.to_bytes()) {
+        match w.verify_aggregate(&shape, &[cov], &bundle_proof.to_bytes(), &[0; 8]) {
             Err(ConfidentialError::MalformedProof | ConfidentialError::InvalidAggregateProof(_)) => {}
             other => panic!("a bundle proof fed as an aggregate must be a named refusal, got {other:?}"),
         }
@@ -504,12 +521,19 @@ mod tests {
         let inner = fixture_proof(0);
         let vk = AggExecutor::inner_key(&shape).unwrap();
         let m = randprotocol_rvm::machine::Machine::new(FriProfile::Test);
-        let a = randprotocol_rvm::aggregate::aggregate(&m, &vk, std::slice::from_ref(&inner), None)
+        let binding = randprotocol_core::types::actions::aggregate_binding(7, &randprotocol_core::Address([1; 32]), 0);
+        let a = randprotocol_rvm::aggregate::aggregate(&m, &vk, std::slice::from_ref(&inner), &binding, None)
             .expect("one real bundle proof aggregates");
         let w = AggExecutor::new(FriProfile::Test);
         let outs = w
-            .verify_aggregate(&shape, std::slice::from_ref(&cov), &a.proof.to_bytes())
+            .verify_aggregate(&shape, std::slice::from_ref(&cov), &a.proof.to_bytes(), &binding)
             .expect("the wrapper verifies the aggregate");
+        // AGG-2: the same bytes under another aggregator's binding are refused.
+        let other = randprotocol_core::types::actions::aggregate_binding(7, &randprotocol_core::Address([2; 32]), 0);
+        match w.verify_aggregate(&shape, std::slice::from_ref(&cov), &a.proof.to_bytes(), &other) {
+            Err(ConfidentialError::InvalidAggregateProof(_)) => {}
+            other => panic!("an aggregate re-signed by another aggregator must be refused, got {other:?}"),
+        }
         let want: [u32; 8] = std::array::from_fn(|k| {
             u32::try_from(cov.public_values[randprotocol_zkvm::tables::cpu::pv::OUT0 + k]).unwrap()
         });

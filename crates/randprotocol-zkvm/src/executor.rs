@@ -690,6 +690,7 @@ impl ConfidentialExecutor for ZkExecutor {
         _shape: &randprotocol_core::types::DeclaredShape,
         _covered: &[randprotocol_core::types::CoveredBundle],
         _proof: &[u8],
+        _binding: &[u32; 8],
     ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
         Err(ConfidentialError::AggregationUnsupported)
     }

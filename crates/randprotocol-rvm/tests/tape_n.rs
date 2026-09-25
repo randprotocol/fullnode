@@ -27,8 +27,8 @@ fn shape_and_key(p: &Proof) -> (InnerShape, InnerKey) {
     (shape, key)
 }
 
-/// An N=1 tape is exactly `[1]` followed by the single-proof tape, and its
-/// refs are the single-proof segment ranges shifted by one word.
+/// An N=1 tape is exactly `[1] ‖ binding(8)` followed by the single-proof tape, and its
+/// refs are the single-proof segment ranges shifted by nine words.
 #[test]
 fn n1_tape_is_single_proof_tape_with_count_prefix() {
     let p = common::bundle_proofs(FriProfile::Test, 1).pop().unwrap();
@@ -39,14 +39,18 @@ fn n1_tape_is_single_proof_tape_with_count_prefix() {
         &shape,
         &key,
         std::slice::from_ref(&p.proof),
+        &common::TEST_BINDING,
     )
     .unwrap();
 
     assert_eq!(multi.words[0], F::from_usize(1), "the tape opens with N");
+    for (k, word) in common::TEST_BINDING.iter().enumerate() {
+        assert_eq!(multi.words[1 + k], F::from_usize(*word as usize), "binding word {k} follows the count");
+    }
     assert_eq!(
-        &multi.words[1..],
+        &multi.words[9..],
         single.words.as_slice(),
-        "an N=1 tape past the count word is the single-proof tape, word for word"
+        "an N=1 tape past the count and binding words is the single-proof tape, word for word"
     );
 
     let refs = multi.segment_refs();
@@ -56,13 +60,13 @@ fn n1_tape_is_single_proof_tape_with_count_prefix() {
         assert_eq!(r.segment, single.segments[s].0);
         assert_eq!(
             (r.start, r.len),
-            (single.segments[s].1 + 1, single.segments[s].2),
-            "segment {s} shifts by the count word"
+            (single.segments[s].1 + 9, single.segments[s].2),
+            "segment {s} shifts by the count and binding words"
         );
     }
 }
 
-/// Three fixtures tile as `[N=3]` plus three region layouts; every proof's
+/// Three fixtures tile as `[N=3] ‖ binding(8)` plus three region layouts; every proof's
 /// header pins that proof's declared heights, and the regions are
 /// byte-identical to the individually built single-proof tapes.
 #[test]
@@ -79,14 +83,17 @@ fn n3_layout_tiles_and_pins_declared_heights() {
             "every fixture proof must share one shape"
         );
     }
-    let tape = WitnessTape::build_n(FriProfile::Test, &shape, &key, &proofs).unwrap();
+    let tape = WitnessTape::build_n(FriProfile::Test, &shape, &key, &proofs, &common::TEST_BINDING).unwrap();
 
     assert_eq!(tape.words[0], F::from_usize(3));
+    for (k, word) in common::TEST_BINDING.iter().enumerate() {
+        assert_eq!(tape.words[1 + k], F::from_usize(*word as usize), "binding word {k} follows the count");
+    }
     let refs = tape.segment_refs();
     assert_eq!(refs.len(), 3 * 14);
 
-    // The refs tile the tape exactly, in proof-then-segment order, starting past the count word.
-    let mut cursor = 1;
+    // The refs tile the tape exactly, in proof-then-segment order, starting past the preamble.
+    let mut cursor = 9;
     for (j, p) in proofs.iter().enumerate() {
         let single = WitnessTape::build(FriProfile::Test, &shape, &key, p).unwrap();
         for s in 0..14usize {
@@ -150,6 +157,7 @@ fn wrong_shape_proof_is_refused() {
         &wrong_shape,
         &wrong_key,
         std::slice::from_ref(&p.proof),
+        &common::TEST_BINDING,
     )
     .expect_err("a proof of another shape must be refused");
     assert_eq!(err, TapeError::Replay(ReplayError::Shape));

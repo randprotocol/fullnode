@@ -69,20 +69,24 @@ fn fixture() -> (Arc<Program>, randprotocol_rvm::machine::Proof, RvmShape, RvmKe
 }
 
 /// The acceptance half of the differential: the self-verifier consumes a real rVM proof and
-/// publishes exactly the host's interface digest over `[rvm_vk_digest ‖ 1 ‖ 4]`.
+/// publishes exactly the host's interface digest over `[rvm_vk_digest ‖ 1 ‖ B(8) ‖ 4]`.
 #[test]
 fn the_self_verifier_accepts_a_real_rvm_proof() {
     let (_program, proof, shape, key) = fixture();
     let vp = verify_rv32r(&shape, &key, Checkpoints::Off);
-    let tape = WitnessTape::build_for(FriProfile::Test, &shape, &key, &proof).unwrap();
+    let tape = WitnessTape::build_for_with_binding(FriProfile::Test, &shape, &key, &proof, &common::TEST_BINDING).unwrap();
     let exec = execute(&vp.program, &tape.words, MAX_CYCLES)
         .expect("the self-verifier accepts a real rVM proof");
-    let words =
-        randprotocol_rvm::public_values::interface_words(&shape, &key, &[proof.public_values.clone()]);
+    let words = randprotocol_rvm::public_values::interface_words_bound(
+        &shape,
+        &key,
+        &common::TEST_BINDING,
+        &[proof.public_values.clone()],
+    );
     assert_eq!(
         exec.public,
         randprotocol_rvm::public_values::public_digest(&words).to_vec(),
-        "the interface digest over [rvm_vk_digest ‖ 1 ‖ the proof's four public values], exactly"
+        "the interface digest over [rvm_vk_digest ‖ 1 ‖ the binding ‖ the proof's four public values], exactly"
     );
 }
 
@@ -188,7 +192,7 @@ fn thirteen_tampered_rvm_proofs_are_refused_at_the_named_steps() {
     let (_program, proof, shape, key) = fixture();
     let vp = verify_rv32r(&shape, &key, Checkpoints::Off);
     for (k, (seg, _)) in tamper_table().iter().enumerate() {
-        let mut tape = WitnessTape::build_for(FriProfile::Test, &shape, &key, &proof).unwrap();
+        let mut tape = WitnessTape::build_for_with_binding(FriProfile::Test, &shape, &key, &proof, &common::TEST_BINDING).unwrap();
         let r = *tape
             .segment_refs()
             .iter()
@@ -221,7 +225,7 @@ fn the_self_verifier_is_straight_line_in_the_proofs_data() {
     let rows: Vec<usize> = [proof1, proof2]
         .iter()
         .map(|proof| {
-            let tape = WitnessTape::build_for(FriProfile::Test, &shape, &key, proof).unwrap();
+            let tape = WitnessTape::build_for_with_binding(FriProfile::Test, &shape, &key, proof, &common::TEST_BINDING).unwrap();
             execute(&vp.program, &tape.words, MAX_CYCLES).unwrap().cpu_rows()
         })
         .collect();
@@ -286,7 +290,7 @@ fn busy_fixture() -> (Arc<Program>, randprotocol_rvm::machine::Proof, RvmShape, 
 fn the_self_verifiers_measured_cost_at_two_fixture_shapes() {
     let (_p, proof, shape, key) = fixture();
     let vp = verify_rv32r(&shape, &key, Checkpoints::Off);
-    let tape = WitnessTape::build_for(FriProfile::Test, &shape, &key, &proof).unwrap();
+    let tape = WitnessTape::build_for_with_binding(FriProfile::Test, &shape, &key, &proof, &common::TEST_BINDING).unwrap();
     let exec = execute(&vp.program, &tape.words, MAX_CYCLES).unwrap();
     let r = randprotocol_rvm::programs::cycle_report(&vp, &exec);
     eprintln!("TOY_TIER8 {r:?}");
@@ -294,7 +298,7 @@ fn the_self_verifiers_measured_cost_at_two_fixture_shapes() {
 
     let (_pb, proof_b, shape_b, key_b) = busy_fixture();
     let vp_b = verify_rv32r(&shape_b, &key_b, Checkpoints::Off);
-    let tape_b = WitnessTape::build_for(FriProfile::Test, &shape_b, &key_b, &proof_b).unwrap();
+    let tape_b = WitnessTape::build_for_with_binding(FriProfile::Test, &shape_b, &key_b, &proof_b, &common::TEST_BINDING).unwrap();
     let exec_b = execute(&vp_b.program, &tape_b.words, MAX_CYCLES).unwrap();
     let rb = randprotocol_rvm::programs::cycle_report(&vp_b, &exec_b);
     eprintln!("BUSY {rb:?}");
@@ -304,12 +308,12 @@ fn the_self_verifiers_measured_cost_at_two_fixture_shapes() {
     // deterministic — a code change that moves any number is a deliberate re-measurement):
     assert_eq!(
         (r.cpu_rows, r.permutations, r.mem_accesses, r.program_instrs, r.witness_words),
-        (275135, 7438, 402810, 276978, 29367),
+        (275215, 7440, 402909, 277058, 29375),
         "the tier-8 toy fixture's CycleReport, pinned"
     );
     assert_eq!(
         (rb.cpu_rows, rb.permutations, rb.mem_accesses, rb.program_instrs, rb.witness_words),
-        (367260, 9088, 478728, 369363, 35199),
+        (367340, 9090, 478827, 369443, 35207),
         "the busy fixture's CycleReport, pinned"
     );
 

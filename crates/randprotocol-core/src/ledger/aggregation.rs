@@ -499,9 +499,13 @@ pub(super) fn validate_aggregate(
         Err(_) => {}
     }
     // 8. The proof: the interface-list recompute and digest compare, then the rVM
-    //    `Machine::verify` — the executor's pair, the one expensive step, last.
+    //    `Machine::verify` — the executor's pair, the one expensive step, last. The binding is
+    //    this transaction's own `(chain, aggregator, nonce)` (audit v3, AGG-2), recomputed here
+    //    and never read from the proof: the proof committed to its prover's triple, so a copy
+    //    re-signed by another aggregator, or replayed at another nonce, does not verify.
+    let binding = crate::types::actions::aggregate_binding(tx.chain_id, aggregator, nonce);
     let outs = executor
-        .verify_aggregate(&first.shape, covered, proof)
+        .verify_aggregate(&first.shape, covered, proof, &binding)
         .map_err(TxError::InvalidAggregateProof)?;
     Ok(ValidatedAggregate { covered: covered.to_vec(), payout_cm, outs })
 }
@@ -1534,7 +1538,7 @@ mod admission_tests {
     use crate::ledger::staking::ValidatorEntry;
     use crate::ledger::{Ledger, TxError};
     use crate::notes::{word8_from_bytes, Bundle, Envelope, ShieldedAddress, Word8};
-    use crate::types::actions::{aggregator_register_message, aggregate_signing_hash, AggregatorRegistration};
+    use crate::types::actions::{aggregate_binding, aggregator_register_message, aggregate_signing_hash, AggregatorRegistration};
     use crate::types::{pv, Action, CoveredBundle, DeclaredShape, FriProfile, Transaction};
     use std::collections::BTreeMap;
 
@@ -1729,6 +1733,47 @@ mod admission_tests {
         cfg.admitted_shapes[0].aggregate_program_digest = StubExecutor.aggregate_program_digest(&shape()).unwrap();
         l.set_aggregation(Some(cfg));
         assert!(l.validate_aggregate(&tx, &covered, &StubExecutor).is_ok());
+    }
+
+    /// Audit v3, AGG-2: the aggregate proof binds `(chain, aggregator, nonce)`. Aggregator A's
+    /// valid aggregate, re-signed by registered aggregator B at B's own nonce with the same proof
+    /// bytes, is refused at the proof step — before the fix the proof said nothing about who made
+    /// it, and B was paid for A's work.
+    #[test]
+    fn a_resigned_aggregate_is_refused() {
+        // Both registered, B's registration anchored at the genesis root (the root after A's is
+        // not yet a known anchor): `setup`, with B's registration ahead of the covers.
+        let mut l = gated();
+        let genesis_root = l.root();
+        let (a, b) = keys();
+        register(&mut l, &a);
+        let payout = payout_addr();
+        let registration = AggregatorRegistration {
+            public_key: b.public_key().clone(),
+            payout: payout.clone(),
+            signature: b.sign(aggregator_register_message(7, &payout).as_bytes()),
+        };
+        let mut bb = bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE, cfg().bond);
+        bb.anchor = genesis_root;
+        let d = StubExecutor.bundle_digest(&bb.digest_input());
+        bb.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+        let reg = StubExecutor::bound(Transaction::shielded(7, bb, Action::RegisterAggregator { registration }));
+        l.apply_tx(&reg, &proposer(&l), &StubExecutor).unwrap();
+        let p = proposer(&l);
+        for c in covers(4) {
+            l.bucket_excess(c, 0, p, u64::MAX);
+        }
+
+        let proof = StubExecutor::make_aggregate_proof(&aggregate_binding(7, &a.public_key().address(), 0));
+        let covered = covered_records(&shape(), &[1, 2]);
+        let honest = aggregate_tx(&a, 0, 100, covers(2), proof.clone());
+        assert!(l.validate_aggregate(&honest, &covered, &StubExecutor).is_ok(), "A's own aggregate validates");
+
+        let resigned = aggregate_tx(&b, 0, 100, covers(2), proof);
+        match l.validate_aggregate(&resigned, &covered, &StubExecutor) {
+            Err(TxError::InvalidAggregateProof(_)) => {}
+            other => panic!("A's proof re-signed by B must be refused, got {other:?}"),
+        }
     }
 
     /// The happy path, end to end through the covered-carrying entry: steps 1–8 pass, the

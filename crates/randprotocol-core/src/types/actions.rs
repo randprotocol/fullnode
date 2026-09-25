@@ -384,6 +384,18 @@ pub fn aggregator_withdraw_message(
     crate::crypto::Hash::digest_domain(b"rand-aggregator-withdraw", &bytes)
 }
 
+/// The aggregate binding (audit v3, AGG-2): `H("rand-aggregate-bind-1", chain_id ‖ aggregator ‖
+/// nonce)` as eight little-endian `u32` words — [`crate::Transaction::binding`]'s word layout. The
+/// rVM's aggregate program absorbs these words into its interface digest, so a proof made under
+/// one `(chain, aggregator, nonce)` verifies under no other: an aggregate re-signed by another
+/// registered aggregator, or replayed at a later nonce, is refused. The prover passes its own
+/// triple; admission recomputes it from the transaction, never from the proof.
+pub fn aggregate_binding(chain_id: u64, aggregator: &crate::crypto::Address, nonce: u64) -> [u32; 8] {
+    let bytes = bincode::serialize(&(chain_id, aggregator, nonce)).expect("serializes");
+    let digest = crate::crypto::Hash::digest_domain(b"rand-aggregate-bind-1", &bytes);
+    std::array::from_fn(|i| u32::from_le_bytes(digest.0[4 * i..4 * i + 4].try_into().expect("four bytes")))
+}
+
 /// What an aggregator signs over an `Aggregate` submission (spec §3.1): the chain, the register
 /// nonce, the payout note's `time` and blinding `r`, the cover set, and the proof's hash — the
 /// full content an equivocating pair of `SignedAggregateHeader`s is evidence of.

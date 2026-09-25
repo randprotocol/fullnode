@@ -99,6 +99,27 @@ supply = genesis notes + faucet mints + Σ subsidies − burns
 `rand_getSupply` reports issuance separately from faucet mints so an auditor can check the
 schedule against the sealed-block count.
 
+### 3.5 Who made the proof: the aggregate binding (audit v3, AGG-2)
+
+The payout goes to the aggregator that signed the `Aggregate` transaction. The proof itself
+must therefore say who made it; otherwise a registered aggregator could copy another's valid
+aggregate from the pool, re-sign it under its own identity and nonce, and be paid for the work.
+The rVM's aggregate program absorbs eight binding words into its interface digest:
+
+```
+interface = [inner_vk_digest(4) ‖ N ‖ B(8) ‖ 34·N public values]
+B = aggregate_binding(chain_id, aggregator, nonce)   // H("rand-aggregate-bind-1", …), 8 LE u32
+```
+
+The prover (`aggregate --watch`) reads its register nonce **before** proving and binds its
+own `(chain, address, nonce)`. Admission step 8 recomputes `B` from the transaction, never
+from the proof, and a copy of the proof under any other triple fails: re-signed by another
+aggregator, or replayed at another nonce. `aggregate_binding` is in
+`randprotocol-core/src/types/actions.rs`, and the program change is circuits `573ef2e`.
+Because the program digest changed, a chain's `admitted_shapes[].aggregate_program_digest`
+must be measured on a build that carries it, **and the production proof batch must use this
+program**.
+
 ## 4. Fallback
 
 A block whose bundles no aggregate ever covers stays valid: its raw bundle proofs are kept and
@@ -137,7 +158,7 @@ filled at activation.
 | sealed resync, a fresh joiner | **1 rVM verification per sealed window** (the covering aggregate's; a raw sync re-verifies each bundle); the 7-block sealed batch applied in under a second | capstone's verification counter |
 | the capstone end to end | **1873.2 s** (register 97 s → prove 1568 s → seal → prune → resync) | `tests/cluster.rs` |
 | rVM aggregate proof size, test profile | 325–327 KB measured here (the circuits M5.3 record is 328 121 bytes; production est. ~0.5–0.6 MB, far under the 2 MiB cap) | `circuits/recursion/docs/02-aggregate.md` |
-| the interface conformance vectors | `inner_vk_digest` `33a94ec6…92a1c8`, the 107-word list, digest `9f11f1ae…88dcd` — reproduced byte-for-byte by the fullnode's recompute | the conformance suite (`agg_executor.rs`) |
+| the interface conformance vectors | `inner_vk_digest` `33a94ec6…92a1c8`, the 115-word bound list (AGG-2; the stand-in binding of `circuits/recursion/docs/02-aggregate.md`), digest `9833ac5b…fdc868e` — reproduced byte-for-byte by the fullnode's recompute | the conformance suite (`agg_executor.rs`) |
 
 ### The one capstone walk-through
 

@@ -286,7 +286,10 @@ echo "synced zkVM from $SRC at $REV into $DST"
 echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../../circuits/rand-zkvm-cuda (i.e. circuits/ beside fullnode/)"
 
 # ── the recursion VM (rVM) → crates/randprotocol-rvm ────────────────────────────────────────────────
-# M5.3/M5.4's recursion VM, vendored at circuits main `271679d` ("Merge zkvm-m5-4"). What the
+# M5.3/M5.4's recursion VM, vendored at circuits main `271679d` ("Merge zkvm-m5-4") and re-vendored
+# at `573ef2e` (audit v3 AGG-2, the aggregate binding). Two vendored files carry hand fixes this
+# section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
+# line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
 # rename has to achieve (the block-aggregation plan's R1): recursion's own
 # `rand_zkvm = { path = "../research" }` dependency must land on the *vendored*
 # `crates/randprotocol-zkvm`, not on `circuits/research` — a path dependency on this repo from
@@ -357,4 +360,4 @@ open(p, 'w').write(s)
 PY
 grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/randprotocol_rvm::/g' {} 2>/dev/null || true
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 271679d) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 573ef2e) into $RVM_DST"

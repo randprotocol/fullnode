@@ -190,9 +190,12 @@ impl WitnessTape {
     }
 
     /// The tape of N proofs of one shape: one count word — the aggregate program's loop trip
-    /// count — then each proof's fourteen segments in [`build`](WitnessTape::build)'s pinned
+    /// count — then the eight aggregate-binding words (audit v3, AGG-2: the chain's
+    /// `H("rand-aggregate-bind-1", …)`, absorbed into the interface digest right after `N`),
+    /// then each proof's fourteen segments in [`build`](WitnessTape::build)'s pinned
     /// order, consumed sequentially by the looped program (M5.3 ruling R2). A region is
-    /// byte-identical to that proof's single-proof tape, so an N=1 tape is `[1] ‖ build(proof)`.
+    /// byte-identical to that proof's single-proof tape, so an N=1 tape is
+    /// `[1] ‖ binding(8) ‖ build(proof)`.
     ///
     /// Every proof must match the shape: the shape checks run over the whole set up front —
     /// cheapest refusal first, mirroring `InnerShape::matches`'s own order — so a wrong-shape
@@ -202,8 +205,9 @@ impl WitnessTape {
         shape: &InnerShape,
         key: &InnerKey,
         proofs: &[Proof],
+        binding: &[u32; 8],
     ) -> Result<Self, TapeError> {
-        Self::build_n_for(profile, shape, key, proofs)
+        Self::build_n_for(profile, shape, key, proofs, binding)
     }
 
     /// [`WitnessTape::build`], generic over [`VerifierShape`] (M5.4, T5): the same fourteen
@@ -223,13 +227,35 @@ impl WitnessTape {
         Ok(WitnessTape { words: w.words, segments: w.segments })
     }
 
-    /// [`WitnessTape::build_n`], generic over [`VerifierShape`]: the count word, then each
-    /// proof's region in the pinned order.
+    /// [`WitnessTape::build_for`] with the eight aggregate-binding words prepended: the
+    /// self-verifier's tape (`verify_rv32r`) carries the outer transaction's binding ahead of
+    /// the proof's region (audit v3, AGG-2).
+    pub fn build_for_with_binding<S: VerifierShape>(
+        profile: FriProfile,
+        shape: &S,
+        key: &S::Key,
+        proof: &S::Proof,
+        binding: &[u32; 8],
+    ) -> Result<Self, TapeError>
+    where
+        S::Air: BaseAir<Val> + for<'a> p3_air::Air<p3_lookup::folder::VerifierConstraintFolderWithLookups<'a, Config>>,
+    {
+        let mut w = Writer::new();
+        for word in binding {
+            w.usize(*word as usize);
+        }
+        write_proof(&mut w, profile, shape, key, proof)?;
+        Ok(WitnessTape { words: w.words, segments: w.segments })
+    }
+
+    /// [`WitnessTape::build_n`], generic over [`VerifierShape`]: the count word, the eight
+    /// binding words, then each proof's region in the pinned order.
     pub fn build_n_for<S: VerifierShape>(
         profile: FriProfile,
         shape: &S,
         key: &S::Key,
         proofs: &[S::Proof],
+        binding: &[u32; 8],
     ) -> Result<Self, TapeError>
     where
         S::Air: BaseAir<Val> + for<'a> p3_air::Air<p3_lookup::folder::VerifierConstraintFolderWithLookups<'a, Config>>,
@@ -241,14 +267,18 @@ impl WitnessTape {
         }
         let mut w = Writer::new();
         w.usize(proofs.len());
+        for word in binding {
+            w.usize(*word as usize);
+        }
         for proof in proofs {
             write_proof(&mut w, profile, shape, key, proof)?;
         }
         Ok(WitnessTape { words: w.words, segments: w.segments })
     }
 
-    /// The flat segment table as `(proof, segment, start, len)` per proof in order — every
-    /// word of the tape past the count word covered exactly once. A single-proof tape is proof
+    /// The flat segment table as `(proof, segment, start, len)` per proof in order — every word
+    /// of a proof's region covered exactly once (the count word and the eight binding words are
+    /// the preamble before the regions, and belong to no segment). A single-proof tape is proof
     /// 0's fourteen; `segments` keeps its per-proof layout, so the single-proof call sites that
     /// `find` a segment by name are untouched.
     pub fn segment_refs(&self) -> Vec<SegmentRef> {

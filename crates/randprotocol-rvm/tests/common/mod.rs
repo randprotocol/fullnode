@@ -34,6 +34,12 @@ pub struct BundleProof {
     pub hc: Word8,
 }
 
+/// The aggregate-binding words the aggregate family's tests use (audit v3, AGG-2): on a chain
+/// this is `H("rand-aggregate-bind-1", chain_id ‖ aggregator ‖ nonce)`, derived in
+/// `randprotocol_core`; here it is a fixed stand-in — the rVM absorbs the eight words like any
+/// other, and the tests are about position, not derivation.
+pub const TEST_BINDING: [u32; 8] = [0xA662_0000, 0xA662_0001, 0xA662_0002, 0xA662_0003, 0xA662_0004, 0xA662_0005, 0xA662_0006, 0xA662_0007];
+
 /// `$RECURSION_FIXTURES`, or `target/recursion-fixtures` under this crate.
 pub fn cache_dir() -> std::path::PathBuf {
     match std::env::var_os("RECURSION_FIXTURES") {
@@ -194,7 +200,7 @@ pub fn measure_aggregate(n: usize, profile: FriProfile) -> randprotocol_rvm::pro
     );
     let key = InnerKey::of(profile, &shape);
     let vp = verify_rv32n(&shape, &key, Checkpoints::Off);
-    let tape = WitnessTape::build_n(profile, &shape, &key, &proofs).unwrap();
+    let tape = WitnessTape::build_n(profile, &shape, &key, &proofs, &TEST_BINDING).unwrap();
     let exec = randprotocol_rvm::emulator::execute(&vp.program, &tape.words, 1 << 24).unwrap();
     randprotocol_rvm::programs::cycle_report(&vp, &exec)
 }

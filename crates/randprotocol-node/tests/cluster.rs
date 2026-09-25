@@ -1822,7 +1822,9 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
         let vk = randprotocol_rvm::aggregate::InnerVerifierKey { shape: shape_inner, key: key_inner };
         let m = randprotocol_rvm::machine::Machine::new(FriProfile::Test);
         let t0 = Instant::now();
-        let a = randprotocol_rvm::aggregate::aggregate(&m, &vk, std::slice::from_ref(&proof), None)
+        // Bound to the aggregate transaction below: chain, this aggregator, register nonce 0 (AGG-2).
+        let binding = randprotocol_core::types::actions::aggregate_binding(CHAIN_ID, &aggregator.public_key().address(), 0);
+        let a = randprotocol_rvm::aggregate::aggregate(&m, &vk, std::slice::from_ref(&proof), &binding, None)
             .expect("one real bundle proof aggregates");
         eprintln!(
             "aggregate: tier {}, {} proof bytes, proved in {:.1?} ({:.1?} in)",

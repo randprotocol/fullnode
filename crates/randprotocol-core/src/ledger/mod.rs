@@ -2478,8 +2478,9 @@ mod tests {
             shape: &crate::types::DeclaredShape,
             covered: &[crate::types::CoveredBundle],
             proof: &[u8],
+            binding: &[u32; 8],
         ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
-            StubExecutor.verify_aggregate(shape, covered, proof)
+            StubExecutor.verify_aggregate(shape, covered, proof, binding)
         }
     }
 
@@ -3127,8 +3128,9 @@ mod tests {
             shape: &crate::types::DeclaredShape,
             covered: &[crate::types::CoveredBundle],
             proof: &[u8],
+            binding: &[u32; 8],
         ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
-            StubExecutor.verify_aggregate(shape, covered, proof)
+            StubExecutor.verify_aggregate(shape, covered, proof, binding)
         }
     }
 

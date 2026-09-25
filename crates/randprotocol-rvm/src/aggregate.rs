@@ -1,16 +1,17 @@
 //! The chain-facing aggregate API (spec §6, amended by M5.2's R5/R6 and M5.3's R6): `aggregate`
 //! turns N same-shape RV32-machine proofs into one rVM proof whose four batch public values are
-//! the interface digest of `[inner_vk_digest ‖ N ‖ 34·N]`, and `verify_aggregate` checks the
-//! digest the node recomputes from the covered bundles before the ordinary rVM `Machine::verify`
-//! — the cs6 `verify_public` pattern: the §4.4 list travels with the transaction as auxiliary
-//! data, the proof carries only its commitment.
+//! the interface digest of `[inner_vk_digest ‖ N ‖ B(8) ‖ 34·N]` — B the chain's
+//! `H("rand-aggregate-bind-1", chain_id ‖ aggregator ‖ nonce)` (audit v3, AGG-2) — and
+//! `verify_aggregate` checks the digest the node recomputes from the covered bundles before the
+//! ordinary rVM `Machine::verify` — the cs6 `verify_public` pattern: the §4.4 list travels with
+//! the transaction as auxiliary data, the proof carries only its commitment.
 //!
 //! The registered artifact is [`aggregate_program`]'s digest: one N-generic program per inner
 //! shape, built once at startup and pinned (R6).
 
 use crate::isa::{Program, F};
 use crate::machine::{Machine, ProveError, Tier, VerifyError};
-use crate::public_values::{interface_words, public_digest};
+use crate::public_values::{interface_words_bound, public_digest};
 use crate::shape::{InnerKey, InnerShape};
 use crate::witness::{TapeError, WitnessTape};
 use p3_field::PrimeField64;
@@ -64,6 +65,10 @@ pub enum AggregateError {
 /// Why an aggregate proof did not verify.
 #[derive(Debug)]
 pub enum VerifyAggregateError {
+    /// `public`'s eight binding words are not the binding the chain recomputed from the
+    /// transaction's own `(chain, aggregator, nonce)` (audit v3, AGG-2): a proof made under
+    /// another aggregator's identity, re-signed.
+    BindingMismatch,
     /// `public`'s digest does not equal the proof's batch public values — the list the node
     /// recomputed from the covered bundles is not the list the proof binds.
     DigestMismatch,
@@ -71,12 +76,17 @@ pub enum VerifyAggregateError {
     Verify(VerifyError),
 }
 
-/// spec §6's `aggregate`: shape-checks every inner proof (cheapest first), builds the N-tape,
-/// proves, returns the proof and its §4.4 list.
+/// spec §6's `aggregate`, amended: shape-checks every inner proof (cheapest first), builds the
+/// N-tape with the binding words behind the count, proves, returns the proof and its §4.4 list.
+///
+/// `binding` is the chain's `H("rand-aggregate-bind-1", chain_id ‖ aggregator ‖ nonce)` (audit
+/// v3, AGG-2): the caller passes its own identity — the aggregate daemon's `(chain, aggregator,
+/// nonce)` — and the proof then verifies under exactly that triple.
 pub fn aggregate(
     m: &Machine,
     vk: &InnerVerifierKey,
     proofs: &[InnerProof],
+    binding: &[u32; 8],
     tier: Option<Tier>,
 ) -> Result<AggregateProof, AggregateError> {
     if proofs.is_empty() {
@@ -87,7 +97,7 @@ pub fn aggregate(
             return Err(AggregateError::WrongShape { index });
         }
     }
-    let tape = WitnessTape::build_n(m.profile, &vk.shape, &vk.key, proofs)
+    let tape = WitnessTape::build_n(m.profile, &vk.shape, &vk.key, proofs, binding)
         .map_err(AggregateError::Tape)?;
     let program = aggregate_program(vk);
     let (proof, _exec) = m.prove(&program, &tape.words, tier).map_err(AggregateError::Prove)?;
@@ -95,7 +105,7 @@ pub fn aggregate(
     // batch public values; it must equal the host-computed one, here, at prove time — not at the
     // chain's admission check.
     let pvs: Vec<Vec<u64>> = proofs.iter().map(|p| p.public_values.clone()).collect();
-    let public = interface_words(&vk.shape, &vk.key, &pvs);
+    let public = interface_words_bound(&vk.shape, &vk.key, binding, &pvs);
     let want: Vec<u64> = public_digest(&public).iter().map(|f| f.as_canonical_u64()).collect();
     if proof.public_values != want {
         return Err(AggregateError::DigestMismatch);
@@ -103,29 +113,39 @@ pub fn aggregate(
     Ok(AggregateProof { proof, public })
 }
 
-/// spec §6's `verify_aggregate`: digest check, then `Machine::verify`, returning each covered
-/// bundle's `OUT0..7` as `[u32; 8]`, in proof order.
+/// spec §6's `verify_aggregate`, amended: binding check, digest check, then `Machine::verify`,
+/// returning each covered bundle's `OUT0..7` as `[u32; 8]`, in proof order.
+///
+/// `binding` is the chain's own recompute of `H("rand-aggregate-bind-1", chain_id ‖ aggregator
+/// ‖ nonce)` from the transaction carrying the proof (audit v3, AGG-2) — never the words the
+/// proof's list carries. The proof binds its list's words through the digest; this check binds
+/// those words to the transaction, so a copy of the proof re-signed by another aggregator fails.
 pub fn verify_aggregate(
     m: &Machine,
     program: &Program,
     a: &AggregateProof,
+    binding: &[u32; 8],
 ) -> Result<Vec<[u32; 8]>, VerifyAggregateError> {
+    let carried = a.public.get(5..5 + 8).ok_or(VerifyAggregateError::BindingMismatch)?;
+    if !carried.iter().zip(binding).all(|(c, b)| c.as_canonical_u64() == *b as u64) {
+        return Err(VerifyAggregateError::BindingMismatch);
+    }
     let want: Vec<u64> = public_digest(&a.public).iter().map(|f| f.as_canonical_u64()).collect();
     if a.proof.public_values != want {
         return Err(VerifyAggregateError::DigestMismatch);
     }
     m.verify(program, &a.proof).map_err(VerifyAggregateError::Verify)?;
     // The digest committed to the list's length, so a list that passes the check is well-formed:
-    // `[vk(4) ‖ N ‖ pv::NUM·N]`, and each proof's run is `pv`'s own layout.
+    // `[vk(4) ‖ N ‖ B(8) ‖ pv::NUM·N]`, and each proof's run is `pv`'s own layout.
     let n = a.public[4].as_canonical_u64() as usize;
     assert_eq!(
         a.public.len(),
-        5 + pv::NUM * n,
+        5 + 8 + pv::NUM * n,
         "a public list whose digest the proof carries is well-formed"
     );
     Ok((0..n)
         .map(|j| {
-            let base = 5 + pv::NUM * j + pv::OUT0;
+            let base = 5 + 8 + pv::NUM * j + pv::OUT0;
             std::array::from_fn(|k| {
                 u32::try_from(a.public[base + k].as_canonical_u64())
                     .expect("OUT words are u32-range by the inner machine's construction")

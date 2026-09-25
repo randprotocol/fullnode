@@ -913,8 +913,13 @@ async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, int
             let key_inner = randprotocol_rvm::shape::InnerKey::of(profile, &shape);
             let vk = randprotocol_rvm::aggregate::InnerVerifierKey { shape, key: key_inner };
             let m = randprotocol_rvm::machine::Machine::new(profile);
+            // The proof binds this aggregator's own `(chain, address, nonce)` (audit v3, AGG-2):
+            // the register nonce is read before proving, and the submission below signs the same
+            // nonce — a proof made for one nonce verifies at no other.
+            let nonce = aggregator_row(&rpc, &kp.address()).await?.0;
+            let binding = randprotocol_core::types::actions::aggregate_binding(chain_id, &kp.address(), nonce);
             let t0 = std::time::Instant::now();
-            let a = randprotocol_rvm::aggregate::aggregate(&m, &vk, &proofs, None)
+            let a = randprotocol_rvm::aggregate::aggregate(&m, &vk, &proofs, &binding, None)
                 .map_err(|e| anyhow::anyhow!("aggregating {} bundles: {e:?}", proofs.len()))?;
             let proof_bytes = a.proof.to_bytes();
             tracing::info!(
@@ -929,7 +934,6 @@ async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, int
             let (_, payout, _) = aggregator_row(&rpc, &kp.address()).await?;
             let time = height as u32 + 1;
             let (note, envelope) = sealed_withdraw_note(&payout, subsidy + shares, time)?;
-            let nonce = aggregator_row(&rpc, &kp.address()).await?.0;
             let signature = kp.sign(
                 aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes))
                     .as_bytes(),

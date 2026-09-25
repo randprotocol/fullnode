@@ -6,6 +6,20 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-25)
 
+### AGG-2 — the aggregate proof binds its aggregator (2026-09-25, on `main`, in no tag yet)
+
+Audit v3's AGG-2 (plan task C4). The rVM interface is now `[vk ‖ N ‖ B(8) ‖ 34·N]` with
+`B = aggregate_binding(chain_id, aggregator, nonce)` (`types/actions.rs`), vendored from circuits
+`573ef2e`. `ConfidentialExecutor::verify_aggregate` takes the binding. Admission step 8
+recomputes it from the transaction, and the `aggregate --watch` daemon reads its nonce before
+proving. A re-signed aggregate is refused (`a_resigned_aggregate_is_refused`; the stub checks
+the binding of proofs made with `StubExecutor::make_aggregate_proof`). The aggregate program
+digest changed, so **the production proof batch must use this program**, and any chain's
+`aggregate_program_digest` is measured on a build that carries it. No live chain carries an
+`aggregation` section, so nothing live moves. The capstone (`tests/cluster.rs`) is still
+`#[ignore]`d for the unrelated b053a76 shape re-measurement, so the end-to-end prove of this
+change is the rVM's own tier-19 round trip (circuits, 1897 s).
+
 ### v0.5.7 — history pruning (2026-09-25)
 
 **Released and ROLLED 2026-09-25.** Tag `v0.5.7` = `089bdd6`, GitHub release with the E-built binaries
@@ -596,7 +610,7 @@ after the full suite).** It adds one finding the audit does not list: AGG-6, the
 is worse than reported: the scan holds the viewing registry's write lock while `publish_status`
 takes a blocking read on the node loop, so a long scan stalls consensus.
 Still open from the audit's work order (as of the audit): AGG-2 (bind the aggregator before the production batch
-pins the digest), AGG-4/AGG-3, CON-1a/1b + SYNC-1 (the commit rule on the sync path), VK-1/2/3,
+pins the digest — **fixed 2026-09-25**, see "AGG-2" under the state as of 2026-09-25), AGG-4/AGG-3, CON-1a/1b + SYNC-1 (the commit rule on the sync path), VK-1/2/3,
 BRG-7's forward timestamp bound, and decisions D1–D13.
 
 ### v0.3 — the RPC release — LIVE on chain 12 (2026-09-18), pinned build `4504a03`

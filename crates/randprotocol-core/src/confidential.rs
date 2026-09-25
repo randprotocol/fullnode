@@ -115,6 +115,9 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// spec §4 steps 7–8: the interface-list recompute and digest compare against the proof's
     /// batch public values, then the rVM `Machine::verify` of the aggregate proof against the
     /// registered aggregate program. Returns each covered bundle's `OUT0..7` in cover order.
+    /// `binding` is [`crate::types::actions::aggregate_binding`] of the transaction's own
+    /// `(chain, aggregator, nonce)` (audit v3, AGG-2): the interface list carries it between the
+    /// count and the public values, so a proof made under any other triple is refused.
     /// Expensive: the rVM verify (~1–2 s warm at production; the first call at a shape pays the
     /// startup key-build).
     fn verify_aggregate(
@@ -122,6 +125,7 @@ pub trait ConfidentialExecutor: Send + Sync {
         shape: &crate::types::DeclaredShape,
         covered: &[crate::types::CoveredBundle],
         proof: &[u8],
+        binding: &[u32; 8],
     ) -> Result<Vec<[u32; 8]>, ConfidentialError>;
     /// Precompute the aggregate program and the rVM verifier key for an admitted shape (the
     /// startup key-build, ~30–70 s at production). Called once at node startup on a chain whose
@@ -141,6 +145,10 @@ const STUB_LEN: usize = 4 + 1 + 32 + 32 + 32 + 8;
 /// || the 8 binding words (32 bytes, little-endian) — the stand-in for a real proof's public
 /// input segment, compared word for word by `verify_bundle` exactly as the zkVM compares `H_PUB`.
 const STUB_BUNDLE_LEN: usize = 4 + 32 + 8 + 32;
+/// The tag of a stub aggregate proof that carries its binding (AGG-2), followed by the eight
+/// binding words (32 bytes, little-endian).
+const STUB_AGGREGATE_TAG: &[u8] = b"rand-stub-aggregate-bound";
+
 /// Where the binding words start inside a stub bundle proof.
 const STUB_BUNDLE_BINDING: usize = 4 + 32 + 8;
 
@@ -172,6 +180,16 @@ impl StubExecutor {
         v.extend_from_slice(&word8_to_bytes(&h_in));
         v.extend_from_slice(&word8_to_bytes(&StubExecutor.public_digest(public)));
         v.extend_from_slice(&Hash::digest_domain(b"rand-stub-binding", program.as_bytes()).0[..8]);
+        v
+    }
+
+    /// Build a stub aggregate proof made under `binding` — the
+    /// [`crate::types::actions::aggregate_binding`] of the `(chain, aggregator, nonce)` it was
+    /// proved for (audit v3, AGG-2). The stub refuses it under any other binding, as the rVM
+    /// does; stub aggregate proofs without this tag carry no binding and are accepted as before.
+    pub fn make_aggregate_proof(binding: &[u32; 8]) -> Vec<u8> {
+        let mut v = STUB_AGGREGATE_TAG.to_vec();
+        v.extend_from_slice(&word8_to_bytes(binding));
         v
     }
 
@@ -326,9 +344,16 @@ impl ConfidentialExecutor for StubExecutor {
         _shape: &crate::types::DeclaredShape,
         covered: &[crate::types::CoveredBundle],
         proof: &[u8],
+        binding: &[u32; 8],
     ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
         if proof == b"reject" {
             return Err(ConfidentialError::InvalidAggregateProof("stub rejection".into()));
+        }
+        // A bound stub proof (AGG-2) verifies under its own binding only, as the rVM's does.
+        if let Some(carried) = proof.strip_prefix(STUB_AGGREGATE_TAG) {
+            if carried != word8_to_bytes(binding) {
+                return Err(ConfidentialError::InvalidAggregateProof("BindingMismatch".into()));
+            }
         }
         // The stub answers what the real one would for an honest aggregate: each covered
         // bundle's `OUT0..7` — pv words `pv::OUT0..OUT0+8` in cover order — so ledger tests
