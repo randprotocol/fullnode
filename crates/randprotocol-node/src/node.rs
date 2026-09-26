@@ -743,6 +743,20 @@ fn should_compact(prune_passes: u64, compacting: &AtomicBool) -> bool {
     prune_passes % 64 == 0 && compacting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
 }
 
+/// The background compaction's body: run `compact`, then mark the compaction finished — on a
+/// panic too (PR-3), through a drop guard, since a flag left set would make `should_compact`
+/// refuse every later compaction until a restart.
+fn run_compaction(compacting: &AtomicBool, compact: impl FnOnce()) {
+    struct Done<'a>(&'a AtomicBool);
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _done = Done(compacting);
+    compact();
+}
+
 /// The wire cost of one committed block in a sync batch.
 ///
 /// Measured with the codec's own CBOR serializer ([`network::codec::cbor_size`]) rather than with
@@ -1622,10 +1636,11 @@ impl Node {
                         let storage = self.storage.clone();
                         let compacting = self.compacting.clone();
                         tokio::task::spawn_blocking(move || {
-                            if let Err(e) = storage.compact_pruned_history() {
-                                tracing::warn!("history compaction failed: {e}");
-                            }
-                            compacting.store(false, Ordering::Release);
+                            run_compaction(&compacting, || {
+                                if let Err(e) = storage.compact_pruned_history() {
+                                    tracing::warn!("history compaction failed: {e}");
+                                }
+                            })
                         });
                     } else if self.prune_passes % 64 == 0 {
                         tracing::debug!("history compaction already running; skipping this pass");
@@ -2871,6 +2886,20 @@ mod tests {
         // Early in a chain's life nothing is old enough: saturates at zero.
         assert_eq!(prune_cutoff_ms(1_000, now, day), 0);
         assert_eq!(prune_cutoff_ms(u64::MAX, 1_000, day), 0);
+    }
+
+    /// PR-3: a compaction that panics still clears the busy flag. Before, the flag was cleared
+    /// by the statement after the compaction, which a panic skips — and `should_compact` then
+    /// refused every later compaction until a restart, so pruned space never came back.
+    #[test]
+    fn a_panicking_compaction_still_clears_the_busy_flag() {
+        let compacting = Arc::new(AtomicBool::new(false));
+        assert!(should_compact(64, &compacting));
+        let flag = compacting.clone();
+        let joined = std::thread::spawn(move || run_compaction(&flag, || panic!("compaction blew up"))).join();
+        assert!(joined.is_err(), "the compaction was meant to panic");
+        assert!(!compacting.load(Ordering::SeqCst), "a panicked compaction left the flag set");
+        assert!(should_compact(128, &compacting));
     }
 
     #[test]
