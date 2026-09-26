@@ -66,6 +66,9 @@ pub struct ViewingNote {
     pub height: u64,
     pub role: Role,
     pub note: Note,
+    /// The memo sealed with this note, on a chain whose genesis carries `envelope_bytes`
+    /// (spec 2026-09-26 §2.4); `None` on the legacy shape and whenever no memo was written.
+    pub memo: Option<String>,
 }
 
 /// One imported viewing key and its scan state.
@@ -193,17 +196,17 @@ impl Registry {
 /// by some other `pk` — a shielded address is public by design — and such a row is garbage, not
 /// a receipt: the bundle guest forces every input's owner to the derived `pk_self`, so no proof
 /// can ever spend it.
-pub fn classify(vk: &ViewingKey, cm: Word8, envelope: &Envelope) -> Option<(Role, Note)> {
+pub fn classify(vk: &ViewingKey, cm: Word8, envelope: &Envelope) -> Option<(Role, Note, Option<String>)> {
     let env = envelope_from_core(envelope);
-    if let Some((_, note)) = env.open_as_receiver(cm, vk) {
+    if let Some((key, note)) = env.open_as_receiver(cm, vk) {
         if note.pk == vk.pk() {
-            return Some((Role::Received, note));
+            return Some((Role::Received, note, env.memo(cm, &key)));
         }
     }
     // Still worth the sender path: an envelope this party sealed for someone else opens through
     // `ovk`, not through the KEM, so the two openings are independent.
-    if let Some((_, note)) = env.open_as_sender(cm, vk) {
-        return Some((Role::Sent, note));
+    if let Some((key, note)) = env.open_as_sender(cm, vk) {
+        return Some((Role::Sent, note, env.memo(cm, &key)));
     }
     None
 }
@@ -224,8 +227,8 @@ pub fn advance(storage: &Storage, import: &mut Import, max_rows: u64) -> Result<
         return Ok(());
     }
     for (index, row) in storage.notes_from(import.scanned_index, want as usize)? {
-        if let Some((role, note)) = classify(&import.vk, row.cm, &row.envelope) {
-            import.notes.push(ViewingNote { index, cm: row.cm, height: row.height, role, note });
+        if let Some((role, note, memo)) = classify(&import.vk, row.cm, &row.envelope) {
+            import.notes.push(ViewingNote { index, cm: row.cm, height: row.height, role, note, memo });
         }
         import.scanned_index = index + 1;
     }
@@ -249,6 +252,9 @@ pub struct Opening {
     /// nothing.
     pub cm: Word8,
     pub note: Note,
+    /// The memo sealed with this output, on a chain whose genesis carries `envelope_bytes`;
+    /// `None` on the legacy shape and whenever no memo was written.
+    pub memo: Option<String>,
 }
 
 /// Every envelope of `tx` that `key` opens — the whole of `rand_checkTransaction`'s
@@ -267,8 +273,10 @@ pub struct Opening {
 pub fn disclosed(tx: &Transaction, derived_cm: Option<Word8>, key: &TxKey) -> Vec<Opening> {
     let mut out = Vec::new();
     let mut try_env = |output: &'static str, slot: u8, cm: Word8, e: &Envelope| {
-        if let Some(note) = envelope_from_core(e).open_with_tx_key(cm, key) {
-            out.push(Opening { output, slot, cm, note });
+        let env = envelope_from_core(e);
+        if let Some(note) = env.open_with_tx_key(cm, key) {
+            let memo = env.memo(cm, key);
+            out.push(Opening { output, slot, cm, note, memo });
         }
     };
     if let Some(b) = &tx.bundle {
@@ -351,11 +359,11 @@ mod tests {
         let note = note_for(&alice(), &bob(), 500);
         let cm = note.commitment();
 
-        // Alice receives it: sealed to her, naming her pk.
+        // Alice receives it: sealed to her, naming her pk. The legacy format carries no memo.
         let env = sealed(&bob(), &alice(), &note, &TxKey([7; 32]));
-        assert_eq!(classify(&alice(), cm, &env), Some((Role::Received, note)));
+        assert_eq!(classify(&alice(), cm, &env), Some((Role::Received, note, None)));
         // Bob sent it: his `ovk` opens the sender wrap even though it names Alice.
-        assert_eq!(classify(&bob(), cm, &env), Some((Role::Sent, note)));
+        assert_eq!(classify(&bob(), cm, &env), Some((Role::Sent, note, None)));
         // Carol has no key in it at all.
         assert_eq!(classify(&carol, cm, &env), None);
         // And the same envelope against a different commitment opens for nobody: the AEAD binds

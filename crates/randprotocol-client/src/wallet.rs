@@ -5802,6 +5802,7 @@ mod tests {
             max_block_bytes: 4 << 20,
             max_call_envelope_bytes,
             max_program_public_words: 64,
+            envelope_bytes: None,
         }
     }
 

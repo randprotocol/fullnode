@@ -2392,12 +2392,8 @@ impl Node {
         }
         let key = Keypair::from_seed(self.cfg.seed).expect("seed validated at startup");
         let height = self.hs.tip_ledger().height();
-        let note = Note::new(to.pk, [0; 8], amount, 0, height as u32);
-        let throwaway = SpendKey::random().viewing_key();
-        let envelope = randprotocol_zkvm::address::seal_note(&throwaway, &to, &note, &TxKey::random())?;
-        let tx =
-            Transaction::mint(self.gs.chain_id, note.pk, note.time, note.r, envelope, amount, &key, self.executor.as_ref());
-        debug_assert_eq!(tx.commitments(), vec![note.commitment()], "the sealed note is the one admission derives");
+        let envelope_bytes = self.hs.tip_ledger().envelope_bytes();
+        let tx = faucet_mint_tx(self.gs.chain_id, envelope_bytes, &to, amount, height, &key, self.executor.as_ref())?;
         let hash = self
             .mempool
             .insert(tx.clone(), self.hs.tip_ledger(), self.executor.as_ref())
@@ -3191,6 +3187,30 @@ impl Node {
         }
         Ok(())
     }
+}
+
+/// The faucet mint's transaction: a note for `to` sealed in the chain's own envelope format
+/// (`EnvelopeFormat::for_chain(envelope_bytes)`, spec 2026-09-26 §2.4), signed by `minter`.
+///
+/// Factored out of [`Node::mint`] as the pure half — no network, no mempool, no rate limiter —
+/// so it is unit-testable against a bare ledger rather than the whole running node. No memo: a
+/// faucet has no sender's intent to write one for.
+fn faucet_mint_tx(
+    chain_id: u64,
+    envelope_bytes: Option<usize>,
+    to: &ShieldedAddress,
+    amount: u64,
+    height: u64,
+    minter: &Keypair,
+    executor: &dyn ConfidentialExecutor,
+) -> std::result::Result<Transaction, String> {
+    let format = randprotocol_core::notes::EnvelopeFormat::for_chain(envelope_bytes.map(|n| n as u32));
+    let note = Note::new(to.pk, [0; 8], amount, 0, height as u32);
+    let throwaway = SpendKey::random().viewing_key();
+    let envelope = randprotocol_zkvm::address::seal_note_as(format, &throwaway, to, &note, &TxKey::random(), "")?;
+    let tx = Transaction::mint(chain_id, note.pk, note.time, note.r, envelope, amount, minter, executor);
+    debug_assert_eq!(tx.commitments(), vec![note.commitment()], "the sealed note is the one admission derives");
+    Ok(tx)
 }
 
 #[cfg(test)]
@@ -4253,6 +4273,43 @@ mod tests {
         assert_eq!(storage.load_ledger(&StubExecutor).unwrap().envelope_bytes(), None);
         let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
         assert_eq!(reloaded.envelope_bytes(), Some(randprotocol_core::notes::MEMO_ENVELOPE_BYTES));
+    }
+
+    /// Task 6 (spec 2026-09-26 §2.4): the faucet's mint follows the chain's own declared
+    /// envelope format, not always the legacy shape. On a plain genesis it seals the legacy way
+    /// and the ledger admits it; on a genesis declaring `envelope_bytes: 1860` the same call
+    /// produces a 1 860-byte envelope, and *that* is what the ledger admits — sealing the old,
+    /// shorter way here is exactly what a validator running yesterday's binary would do, and the
+    /// ledger refuses it (`EnvelopeSize`), which is the red this test starts from.
+    #[test]
+    fn a_faucet_mint_is_sealed_in_the_chains_declared_envelope_format() {
+        let to = crate::storage::fixtures::payout(9);
+
+        // The plain chain: legacy format, and the ledger admits it.
+        let gs = crate::storage::fixtures::genesis(1);
+        let tx = faucet_mint_tx(gs.ledger.chain_id(), gs.ledger.envelope_bytes(), &to, 1_000, gs.ledger.height(), &key(1), &StubExecutor)
+            .unwrap();
+        let randprotocol_core::types::Action::Mint { envelope, .. } = &tx.action else { panic!("not a mint") };
+        assert_ne!(envelope.len(), randprotocol_core::notes::MEMO_ENVELOPE_BYTES, "the legacy shape is shorter");
+        assert_eq!(gs.ledger.validate(&tx, &StubExecutor), Ok(()));
+
+        // The memo chain: the mint's envelope is exactly `envelope_bytes` long, and the ledger
+        // admits it too.
+        let mut memo_gs = crate::storage::fixtures::genesis(1);
+        memo_gs.ledger.set_envelope_bytes(Some(randprotocol_core::notes::MEMO_ENVELOPE_BYTES));
+        let tx = faucet_mint_tx(
+            memo_gs.ledger.chain_id(),
+            memo_gs.ledger.envelope_bytes(),
+            &to,
+            1_000,
+            memo_gs.ledger.height(),
+            &key(1),
+            &StubExecutor,
+        )
+        .unwrap();
+        let randprotocol_core::types::Action::Mint { envelope, .. } = &tx.action else { panic!("not a mint") };
+        assert_eq!(memo_gs.ledger.validate(&tx, &StubExecutor), Ok(()));
+        assert_eq!(envelope.len(), randprotocol_core::notes::MEMO_ENVELOPE_BYTES);
     }
 
     /// The register and the bucket survive the same restart, hashed into and computed into the

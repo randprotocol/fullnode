@@ -4,7 +4,7 @@ use libp2p::Multiaddr;
 use randprotocol_client::wallet;
 use randprotocol_client::RpcClient;
 use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisOpening, GenesisValidator, TokensConfig};
-use randprotocol_core::notes::{word8_to_hex, Envelope, ShieldedAddress};
+use randprotocol_core::notes::{word8_to_hex, Envelope, EnvelopeFormat, ShieldedAddress};
 use randprotocol_core::types::actions::{
     aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message, aggregator_withdraw_message,
     registration_message, registration_message_v2, unbond_message, withdraw_message, AggregatorRegistration,
@@ -33,8 +33,8 @@ use std::time::Duration;
 /// `amount`, required on any chain with a `tokens` section, so who a genesis note pays and its
 /// amount are public by design once the file is published; only *when* and into what it is later
 /// spent stays private. A genesis file is written once and its hash is fixed from then on.
-fn deposit_note(addr: &str, amount: u64) -> Result<GenesisNote> {
-    alloc_note(addr, amount, 0)
+fn deposit_note(addr: &str, amount: u64, format: EnvelopeFormat) -> Result<GenesisNote> {
+    alloc_note(addr, amount, 0, format)
 }
 
 /// [`deposit_note`] at any asset: 0 is RAND, a non-zero `asset` the registry index of a bridged
@@ -53,20 +53,22 @@ fn alloc_note_units(amount: &str, asset: u32) -> Result<u64> {
     Ok(rand_units / shift)
 }
 
-fn alloc_note(addr: &str, amount: u64, asset: u32) -> Result<GenesisNote> {
+fn alloc_note(addr: &str, amount: u64, asset: u32, format: EnvelopeFormat) -> Result<GenesisNote> {
     let to = ShieldedAddress::parse(addr).with_context(|| format!("{addr} is not a shielded address"))?;
-    seal_deposit(&to, &Note::new(to.pk, [0; 8], amount, asset, 0))
+    seal_deposit(&to, &Note::new(to.pk, [0; 8], amount, asset, 0), format)
 }
 
-/// Seal an already-built deposit note to its owner.
+/// Seal an already-built deposit note to its owner, in the chain's envelope `format`
+/// (`EnvelopeFormat::for_chain(genesis.envelope_bytes)`, spec 2026-09-26 §2.4).
 ///
 /// Sealed under a throwaway sender key, exactly as a faucet mint is — a genesis has no identity
 /// to keep an outgoing-viewing record for, and the key is dropped before this returns, so only
 /// the holder of the owner's spend key can ever open the note. The envelope does not enter the
-/// genesis hash (which binds the commitment and the amount), so its randomness is free.
-fn seal_deposit(to: &ShieldedAddress, note: &Note) -> Result<GenesisNote> {
+/// genesis hash (which binds the commitment and the amount), so its randomness is free. No
+/// memo: a genesis alloc has no sender to write one for.
+fn seal_deposit(to: &ShieldedAddress, note: &Note, format: EnvelopeFormat) -> Result<GenesisNote> {
     let throwaway = SpendKey::random().viewing_key();
-    let envelope = randprotocol_zkvm::address::seal_note(&throwaway, to, note, &TxKey::random())
+    let envelope = randprotocol_zkvm::address::seal_note_as(format, &throwaway, to, note, &TxKey::random(), "")
         .map_err(|e| anyhow::anyhow!("sealing a note to {}: {e}", to.to_string()))?;
     Ok(GenesisNote {
         cm: word8_to_hex(&note.commitment()),
@@ -88,19 +90,36 @@ fn seal_deposit(to: &ShieldedAddress, note: &Note) -> Result<GenesisNote> {
 }
 
 /// The note a `withdraw` pays and the envelope that opens it, sealed to `payout` under a
-/// throwaway sender key — the same shape a genesis deposit uses (see [`seal_deposit`]).
+/// throwaway sender key — the same shape a genesis deposit uses (see [`seal_deposit`]), in the
+/// chain's envelope `format` (its caller reads `rand_getLimits`' `envelope_bytes`; absent on an
+/// older node, `EnvelopeFormat::for_chain` falls back to `Legacy`).
 ///
 /// `amount` is what the note is worth, i.e. the withdrawal less the bundle base. The chain never
 /// sees this note: it recomputes the commitment from the action's public fields
 /// (`ledger::staking::withdraw_note`), so these five fields have to be exactly the five the ledger
 /// hashes, or the withdraw pays a note whose envelope opens to nothing the payee can use. That
-/// agreement is what `the_cli_withdraw_note_is_the_note_the_ledger_derives` pins.
-fn sealed_withdraw_note(payout: &ShieldedAddress, amount: u64, time: u32) -> Result<(Note, Envelope)> {
+/// agreement is what `the_cli_withdraw_note_is_the_note_the_ledger_derives` pins. No memo: none of
+/// `withdraw`, `withdraw-aggregator` or `aggregate` has a memo to write.
+fn sealed_withdraw_note(payout: &ShieldedAddress, amount: u64, time: u32, format: EnvelopeFormat) -> Result<(Note, Envelope)> {
     let note = Note::new(payout.pk, [0; 8], amount, 0, time);
     let throwaway = SpendKey::random().viewing_key();
-    let envelope = randprotocol_zkvm::address::seal_note(&throwaway, payout, &note, &TxKey::random())
+    let envelope = randprotocol_zkvm::address::seal_note_as(format, &throwaway, payout, &note, &TxKey::random(), "")
         .map_err(|e| anyhow::anyhow!("sealing the payout note: {e}"))?;
     Ok((note, envelope))
+}
+
+/// `sealed_withdraw_note`'s format, read off the live chain: one `rand_getLimits` call for its
+/// `envelope_bytes` field. A node old enough to have no such method, or whose reply carries no
+/// such field (it predates the genesis field), leaves `envelope_bytes` at `None` — the same
+/// input that makes `EnvelopeFormat::for_chain` answer `Legacy` for a chain that never declared
+/// one at all, so `withdraw`, `aggregator withdraw` and `aggregate` all fall back the same way.
+async fn envelope_format(rpc: &RpcClient) -> Result<EnvelopeFormat> {
+    let envelope_bytes = match rpc.call("rand_getLimits", serde_json::json!([])).await {
+        Ok(v) => v.get("envelope_bytes").and_then(serde_json::Value::as_u64).map(|n| n as u32),
+        Err(e) if randprotocol_client::is_method_not_found(&e) => None,
+        Err(e) => return Err(e),
+    };
+    Ok(EnvelopeFormat::for_chain(envelope_bytes))
 }
 
 /// The `--aggregation` flag: `<bond RAND>,<max_covers>,<subsidy_base RAND>,<halving_blocks>,<window>`.
@@ -326,6 +345,15 @@ enum Cmd {
         /// (`Genesis::build` validates both).
         #[arg(long, value_name = "TOKENS.JSON")]
         tokens: Option<PathBuf>,
+        /// The exact note-envelope size (spec 2026-09-26 §2.4): every note envelope — a bundle
+        /// output, a faucet mint, a withdraw, a bridge deposit, a genesis alloc — must be exactly
+        /// this many bytes, which lets every one of them carry a memo. Only `notes::
+        /// MEMO_ENVELOPE_BYTES` (1860) is accepted today. Omitted entirely when absent, so a
+        /// chain without the flag hashes byte-for-byte as before; given, it is part of the
+        /// genesis hash and is set before this command's own `--alloc` notes are sealed, so they
+        /// come out the declared length too.
+        #[arg(long)]
+        envelope_bytes: Option<u32>,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -345,6 +373,12 @@ enum Cmd {
         /// The note's asset: 0 (RAND, the default) or a listed token's registry index.
         #[arg(long, default_value_t = 0)]
         asset: u32,
+        /// The genesis's `envelope_bytes` (spec 2026-09-26 §2.4), when it sets one: the note is
+        /// sealed in that envelope format, as `genesis --envelope-bytes` seals its own `--alloc`
+        /// notes. Omitted, the legacy format — a genesis carrying `envelope_bytes` refuses such a
+        /// note (`AllocEnvelopeSize`).
+        #[arg(long)]
+        envelope_bytes: Option<u32>,
     },
     /// Initialise a data directory from a genesis file.
     Init {
@@ -584,6 +618,7 @@ async fn main() -> Result<()> {
             aggregation,
             admitted_shapes,
             tokens,
+            envelope_bytes,
         } => {
             let mut gen = Genesis {
                 chain_id,
@@ -650,9 +685,11 @@ async fn main() -> Result<()> {
                 max_block_bytes,
                 max_call_envelope_bytes,
                 max_program_public_words,
-                // The exact envelope size (spec 2026-09-26 §2.4) is set in the file by the cut
-                // script; this command writes today's shape, whose hash it leaves unchanged.
-                envelope_bytes: None,
+                // The exact envelope size (spec 2026-09-26 §2.4): given, part of the genesis
+                // hash and set here — before the `--alloc` loop below seals a single note — so
+                // every alloc note comes out the declared length; omitted, `None`, byte-for-byte
+                // today's shape.
+                envelope_bytes,
                 // The audit-v4 `staking` section (STAKE-2) is spliced in by hand like the
                 // `bridge` section: a chain without it hashes byte-for-byte as before.
                 staking: None,
@@ -660,10 +697,13 @@ async fn main() -> Result<()> {
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
             }
+            // The format every `--alloc` note is sealed in: read off the field just set above, so
+            // it is the chain's own declared envelope shape, not this command's default.
+            let envelope_format = EnvelopeFormat::for_chain(gen.envelope_bytes);
             for a in &allocs {
                 let (addr, amt) = a.split_once('=').context("--alloc must be rand1address=amount")?;
                 let amount = parse_amount(amt)?;
-                gen.alloc.push(deposit_note(addr, amount)?);
+                gen.alloc.push(deposit_note(addr, amount, envelope_format)?);
                 println!("  alloc {} RAND to {addr}", format_amount(amount));
             }
             let executor = node::executor_for_profile(&gen.fri_profile)?;
@@ -687,9 +727,10 @@ async fn main() -> Result<()> {
                 gen.hc_bundle,
             );
         }
-        Cmd::AllocNote { to, amount, asset } => {
+        Cmd::AllocNote { to, amount, asset, envelope_bytes } => {
             let amount = alloc_note_units(&amount, asset)?;
-            println!("{}", serde_json::to_string_pretty(&alloc_note(&to, amount, asset)?)?);
+            let format = EnvelopeFormat::for_chain(envelope_bytes);
+            println!("{}", serde_json::to_string_pretty(&alloc_note(&to, amount, asset, format)?)?);
         }
         Cmd::Init { datadir, genesis } => {
             std::fs::create_dir_all(&datadir)?;
@@ -820,7 +861,7 @@ async fn main() -> Result<()> {
             // applying the transaction: that height does not exist yet. Admission takes any
             // `time` within the window (256 blocks), so the head is simply the freshest one.
             let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
-            let (note, envelope) = sealed_withdraw_note(&payout, amount - base, time)?;
+            let (note, envelope) = sealed_withdraw_note(&payout, amount - base, time, envelope_format(&rpc).await?)?;
             let signature = kp
                 .sign(withdraw_message(chain_id, &kp.address(), amount, nonce, time, &note.r, &envelope).as_bytes());
             let action = randprotocol_core::Action::Withdraw {
@@ -877,7 +918,7 @@ async fn main() -> Result<()> {
                 let base = randprotocol_core::gas::BUNDLE_BASE;
                 anyhow::ensure!(bond > base, "the bond does not cover the bundle base");
                 let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
-                let (note, envelope) = sealed_withdraw_note(&payout, bond - base, time)?;
+                let (note, envelope) = sealed_withdraw_note(&payout, bond - base, time, envelope_format(&rpc).await?)?;
                 let signature = kp.sign(
                     aggregator_withdraw_message(chain_id, &kp.address(), nonce, time, &note.r, &envelope).as_bytes(),
                 );
@@ -993,7 +1034,7 @@ async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, int
             let subsidy = subsidy_base.checked_shr((n / halving) as u32).unwrap_or(0);
             let (_, payout, _) = aggregator_row(&rpc, &kp.address()).await?;
             let time = height as u32 + 1;
-            let (note, envelope) = sealed_withdraw_note(&payout, subsidy + shares, time)?;
+            let (note, envelope) = sealed_withdraw_note(&payout, subsidy + shares, time, envelope_format(&rpc).await?)?;
             let signature = kp.sign(
                 aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes))
                     .as_bytes(),
@@ -1257,7 +1298,7 @@ mod tests {
         assert_eq!(units, 1_000_000_000, "10 zUSD is 10^9 units at eight decimals");
         assert_eq!(alloc_note_units("10", 0).unwrap(), 10 * UNITS_PER_RAND);
         assert!(alloc_note_units("0.000000001", 1).is_err(), "a ninth decimal does not exist on zUSD");
-        let note = alloc_note(&to.to_string(), units, 1).unwrap();
+        let note = alloc_note(&to.to_string(), units, 1, EnvelopeFormat::Legacy).unwrap();
         assert_eq!(note.opening.as_ref().unwrap().asset, 1);
 
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain14.json");
@@ -1358,6 +1399,41 @@ mod tests {
         assert_ne!(built.hash(), pinned_genesis().build(&ZkExecutor::new(FriProfile::Test)).unwrap().hash());
     }
 
+    /// `rand-node genesis --envelope-bytes 1860` writes the field, and reaches the `--alloc`
+    /// loop before it seals a single note (task 6): every alloc note comes out exactly that
+    /// long, or `Genesis::build` refuses it (`AllocEnvelopeSize`) rather than cut a file whose
+    /// own notes disagree with its declared shape.
+    #[test]
+    fn the_genesis_command_takes_envelope_bytes_and_seals_allocs_at_it() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["rand-node", "genesis", "--validator", "k,1000,p"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().cmd {
+                Cmd::Genesis { envelope_bytes, .. } => envelope_bytes,
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&["--envelope-bytes", "1860"]), Some(randprotocol_core::notes::MEMO_ENVELOPE_BYTES as u32));
+
+        let mut g = pinned_genesis();
+        g.envelope_bytes = Some(randprotocol_core::notes::MEMO_ENVELOPE_BYTES as u32);
+        let addr = pinned_payee().to_string();
+        g.alloc = vec![deposit_note(&addr, 5, EnvelopeFormat::for_chain(g.envelope_bytes)).unwrap()];
+        let built = g.build(&ZkExecutor::new(FriProfile::Test)).unwrap();
+        assert_eq!(built.ledger.envelope_bytes(), Some(randprotocol_core::notes::MEMO_ENVELOPE_BYTES));
+        assert_eq!(built.notes[0].1.len(), randprotocol_core::notes::MEMO_ENVELOPE_BYTES);
+        assert!(g.to_json().contains("\"envelope_bytes\": 1860"));
+
+        // Sealing the alloc note in the wrong format (this command's default, before the flag
+        // sets the field) is exactly what a stale caller would do, and `Genesis::build` refuses
+        // it rather than cut a file whose own note disagrees with its declared shape.
+        let mut bad = pinned_genesis();
+        bad.envelope_bytes = Some(randprotocol_core::notes::MEMO_ENVELOPE_BYTES as u32);
+        bad.alloc = vec![deposit_note(&addr, 5, EnvelopeFormat::Legacy).unwrap()];
+        assert!(bad.build(&ZkExecutor::new(FriProfile::Test)).is_err());
+    }
+
     /// The owner of the pinned genesis's one deposit note.
     fn pinned_payee() -> ShieldedAddress {
         randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key())
@@ -1388,7 +1464,7 @@ mod tests {
                     payout: pinned_payee().to_string(),
                 },
             ],
-            alloc: vec![seal_deposit(&to, &note).unwrap()],
+            alloc: vec![seal_deposit(&to, &note, EnvelopeFormat::Legacy).unwrap()],
             faucet: true,
             confidential: true,
             fri_profile: "test".into(),
@@ -1454,7 +1530,7 @@ mod tests {
         let base = randprotocol_core::gas::BUNDLE_BASE;
         let amount = 5 * UNITS_PER_RAND;
         let time = 1994;
-        let (note, envelope) = sealed_withdraw_note(&payout, amount - base, time).unwrap();
+        let (note, envelope) = sealed_withdraw_note(&payout, amount - base, time, EnvelopeFormat::Legacy).unwrap();
 
         // Exactly what `ledger::staking::withdraw_note` hashes: the payout key, no sender, the
         // amount less the base, asset 0, the action's `time`, and the blinding the action carries.
@@ -1481,13 +1557,13 @@ mod tests {
     #[test]
     fn deposit_notes_are_never_the_same_note_twice() {
         let addr = pinned_payee().to_string();
-        let a = deposit_note(&addr, 5).unwrap();
-        let b = deposit_note(&addr, 5).unwrap();
+        let a = deposit_note(&addr, 5, EnvelopeFormat::Legacy).unwrap();
+        let b = deposit_note(&addr, 5, EnvelopeFormat::Legacy).unwrap();
         assert_eq!(a.amount, b.amount);
         assert_ne!(a.cm, b.cm, "genesis notes must carry fresh commitment randomness");
         assert_ne!(a.envelope.kem_ct, b.envelope.kem_ct, "a fresh KEM ciphertext per note");
         // Anything that is not a shielded address is refused, with the address in the message.
-        let err = deposit_note("not-an-address", 1).unwrap_err().to_string();
+        let err = deposit_note("not-an-address", 1, EnvelopeFormat::Legacy).unwrap_err().to_string();
         assert!(err.contains("not-an-address"), "{err}");
     }
 }

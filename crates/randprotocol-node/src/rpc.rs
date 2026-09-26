@@ -868,13 +868,18 @@ fn parse_word8(params: &Value, idx: usize, name: &str) -> Result<randprotocol_co
 /// A note as the viewing-key methods report it. The amount is a **string**, like every amount
 /// this RPC serves as chain state (`getValidators`, `getSupply`): a note's amount is a u64 a
 /// JSON number cannot hold past 2^53, and these rows exist to be summed.
-fn note_json(n: &randprotocol_zkvm::notes::Note) -> Value {
+///
+/// `memo` is the sender's note (spec 2026-09-26 §2.4): `null` on the legacy envelope shape and
+/// whenever no memo was written, a string otherwise — never anything the disclosure did not
+/// itself authenticate (it is read off the same opening that produced `n`, never re-derived).
+fn note_json(n: &randprotocol_zkvm::notes::Note, memo: Option<&str>) -> Value {
     json!({
         "pk": word8_to_hex(&n.pk),
         "from": word8_to_hex(&n.from),
         "amount": n.amount.to_string(),
         "asset": n.asset,
         "time": n.time,
+        "memo": memo,
     })
 }
 
@@ -1754,7 +1759,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     };
                     notes.push(json!({
                         "index": n.index, "cm": word8_to_hex(&n.cm), "height": n.height,
-                        "role": n.role.as_str(), "note": note_json(&n.note),
+                        "role": n.role.as_str(), "note": note_json(&n.note, n.memo.as_deref()),
                         "nullifier": nullifier, "spent": spent,
                     }));
                 }
@@ -2002,7 +2007,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     },
                     "cm": word8_to_hex(&o.cm),
                     "index": leaf,
-                    "note": note_json(&o.note),
+                    "note": note_json(&o.note, o.memo.as_deref()),
                 }));
             }
             Ok(json!({ "tx": h.to_hex(), "height": height, "disclosed": out }))
@@ -5397,6 +5402,9 @@ mod tests {
         assert_eq!(d[0]["output"], "bundle:0");
         assert_eq!((&d[0]["cm"], &d[0]["index"]), (&json!(word8_to_hex(&a500.commitment())), &json!(1)));
         assert_eq!((&d[0]["note"]["amount"], &d[0]["note"]["pk"]), (&json!("500".to_string()), &json!(word8_to_hex(&a500.pk))));
+        // This chain's genesis carries no `envelope_bytes`, so the sealed shape is legacy and
+        // carries no memo at all.
+        assert_eq!(d[0]["note"]["memo"], Value::Null);
 
         // The other slot's key discloses the 700; a key that sealed nothing in this transaction
         // discloses nothing — the negative case is an empty list, never an error.
@@ -5414,6 +5422,54 @@ mod tests {
             assert_eq!(call(&st, "rand_checkTransaction", json!([Hash::ZERO.to_hex(), bad])).await.unwrap_err().code, -32602, "{bad}");
         }
         assert_eq!(call(&st, "rand_checkTransaction", json!(["zz", hex::encode([11u8; 32])])).await.unwrap_err().code, -32602);
+    }
+
+    /// Task 6 (spec 2026-09-26 §2.4): on a chain whose genesis declares `envelope_bytes`, a
+    /// disclosure carries the memo the sender sealed — and `None` (never an empty string) for a
+    /// slot sealed with no memo at all, even in the memo-carrying format.
+    #[tokio::test]
+    async fn check_transaction_discloses_the_memo_on_a_memo_chain() {
+        use crate::viewing::testkit::key_vk;
+        use randprotocol_core::notes::{EnvelopeFormat, MEMO_ENVELOPE_BYTES};
+        use randprotocol_zkvm::address::{address_of, seal_note_as};
+        use randprotocol_zkvm::viewing::TxKey;
+
+        // No alloc: an alloc note's own envelope would have to be exactly `envelope_bytes` too
+        // (`Genesis::build`'s `AllocEnvelopeSize` check), and this test cares only about the
+        // bundle's own envelopes below.
+        let mut g = crate::storage::fixtures::genesis_file_of(7, &[&key(1)], vec![], randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT);
+        g.envelope_bytes = Some(MEMO_ENVELOPE_BYTES as u32);
+        let gs = g.build(&StubExecutor).unwrap();
+        let (_d, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let (alice, bob) = (key_vk(1), key_vk(2));
+
+        let a500 = crate::viewing::testkit::note_for(&alice, &bob, 500);
+        let b700 = crate::viewing::testkit::note_for(&bob, &alice, 700);
+        let mut bundle = fixtures::bundle(&ledger, [[31; 8], [32; 8]], [a500.commitment(), b700.commitment()], bundle_fee());
+        // Under `envelope_bytes` every one of the four slots must be exactly that long (spec
+        // §2.4), not just the two this test opens — pad the dummy slots to the declared length.
+        for e in bundle.envelopes.iter_mut() {
+            *e = Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![9; MEMO_ENVELOPE_BYTES] };
+        }
+        bundle.envelopes[0] =
+            seal_note_as(EnvelopeFormat::Memo, &bob, &address_of(&alice), &a500, &TxKey([11; 32]), "invoice 7").unwrap();
+        bundle.envelopes[1] = seal_note_as(EnvelopeFormat::Memo, &alice, &address_of(&bob), &b700, &TxKey([12; 32]), "").unwrap();
+        let tx1 = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(gs.chain_id, bundle, Action::None));
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx1.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+
+        let v = ok(&st, "rand_checkTransaction", json!([tx1.hash().to_hex(), hex::encode([11u8; 32])])).await;
+        let d = v["disclosed"].as_array().unwrap();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0]["note"]["memo"], json!("invoice 7"));
+
+        // The other slot was sealed in the same memo-carrying format, but with an empty memo —
+        // it discloses no memo at all, not an empty string.
+        let v = ok(&st, "rand_checkTransaction", json!([tx1.hash().to_hex(), hex::encode([12u8; 32])])).await;
+        let d = v["disclosed"].as_array().unwrap();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0]["note"]["memo"], Value::Null);
     }
 
     /// The new methods sit inside the same sequential batch as every other: the import lands

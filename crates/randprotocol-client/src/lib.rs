@@ -136,6 +136,12 @@ pub struct ChainLimits {
     pub max_block_bytes: usize,
     pub max_call_envelope_bytes: usize,
     pub max_program_public_words: usize,
+    /// Spec 2026-09-26 §2.4: the exact note-envelope size this chain's genesis sets, `null`
+    /// (the legacy shape) where it keeps today's at-most rule. `#[serde(default)]` so a reply
+    /// from a node that predates this field — task 5's genesis field, not just the method —
+    /// still decodes, at `None`.
+    #[serde(default)]
+    pub envelope_bytes: Option<usize>,
 }
 
 /// Words from `rand_getProgramPublic`'s one hex string: each word as its four little-endian bytes,
@@ -1077,6 +1083,9 @@ mod tests {
                 max_block_bytes: 4_194_304,
                 max_call_envelope_bytes: 18_432,
                 max_program_public_words: 64,
+                // The scripted reply above carries no `envelope_bytes` key at all — exactly a
+                // node that predates the field — and it still decodes, at `None`.
+                envelope_bytes: None,
             })
         );
         let older = RpcClient::new(scripted_rpc(vec![]).await);
