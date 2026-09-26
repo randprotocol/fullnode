@@ -794,11 +794,11 @@ mod poseidon2_tests {
     }
 
     /// Step 1 — the M3-correctness anchor: `permute_scalar` (built only from `mds_light`/
-    /// `internal_matmul`/`cube` plus the RNG-reproduced `round_constants`) must equal
-    /// `Poseidon2Goldilocks::<8>::permute` from `machine::permutation()` (which is seeded from
-    /// the exact same `PERM_SEED`), on 10^4 random states. This is what proves the round-
-    /// constant reproduction (`round_constants`'s RNG replay) is correct, not just that the
-    /// linear-layer arithmetic happens to match in isolation.
+    /// `internal_matmul`/`cube` plus `round_constants`) must equal
+    /// `Poseidon2Goldilocks::<8>::permute` from `machine::permutation()` (built from the same
+    /// committed `poseidon2_constants` table), on 10^4 random states. This is what proves the
+    /// chip's round-constant layout is correct, not just that the linear-layer arithmetic
+    /// happens to match in isolation.
     #[test]
     fn poseidon2_scalar_helpers_match_plonky3() {
         let perm = permutation();

@@ -134,6 +134,19 @@
 # ledger refuses, and a seeded mutation fuzz over every private-input word against a host model of
 # spec §3.3. Upstream has no such file; without the exclusion `--delete` would remove it.
 #
+# Audit finding ZKV-2 (circuits 224960c): the Poseidon2 round constants are a committed literal
+# table, `src/poseidon2_constants.rs`, instead of a seeded `StdRng` draw (`rand` does not promise
+# `StdRng` is stable across releases, so a dependency bump could have moved every hash). The file
+# rides along with the src rsync; `src/lib.rs` is hand-maintained, so `pub mod poseidon2_constants;`
+# went in by hand. The numbers are the old draw's, so no hash moves (the `hc` pins in
+# `tests/shielded.rs` and `rand-node`'s `the_genesis_hash_is_pinned` are what show it).
+# `rand-zkvm-cuda` compiles the *circuits* checkout's copy of the same file by `#[path]` (it
+# cannot depend on the research crate); the two are one file as long as this crate is synced from
+# the checkout it builds against. That sync took the ZKV-2 hunks only: research's older drift
+# (`notes.rs`/`viewing.rs`'s `KEM_SEED_VERSION`, `ledger.rs`'s comments, `tests/{evm,sbpf}_abi.rs`
+# and the new `tests/{evm,sbpf}_rt.rs`) and recursion's two hand-fixed files were restored after
+# it, as before.
+#
 # The CUDA backend is *not* vendored either: crates/randprotocol-zkvm depends on it by path, as
 # ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building
 # with --features cuda or --features mock-cuda.
@@ -304,7 +317,8 @@ echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../.
 
 # ── the recursion VM (rVM) → crates/randprotocol-rvm ────────────────────────────────────────────────
 # M5.3/M5.4's recursion VM, vendored at circuits main `271679d` ("Merge zkvm-m5-4") and re-vendored
-# at `573ef2e` (audit v3 AGG-2, the aggregate binding). Two vendored files carry hand fixes this
+# at `573ef2e` (audit v3 AGG-2, the aggregate binding), then at `224960c` (ZKV-2: the backends' seed
+# names research's `poseidon2_constants::PERM_SEED`; comments). Two vendored files carry hand fixes this
 # section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
 # line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
 # rename has to achieve (the block-aggregation plan's R1): recursion's own
@@ -377,4 +391,4 @@ open(p, 'w').write(s)
 PY
 grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/randprotocol_rvm::/g' {} 2>/dev/null || true
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 573ef2e) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 224960c) into $RVM_DST"

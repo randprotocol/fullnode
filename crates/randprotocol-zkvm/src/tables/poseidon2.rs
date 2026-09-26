@@ -49,10 +49,6 @@ use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
 use p3_goldilocks::MATRIX_DIAG_8_GOLDILOCKS;
 use p3_lookup::InteractionBuilder;
 use p3_matrix::dense::RowMajorMatrix;
-use p3_poseidon2::ExternalLayerConstants;
-use rand::distr::StandardUniform;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 use std::sync::OnceLock;
 
 pub const STATE_WIDTH: usize = 8;
@@ -159,10 +155,10 @@ pub fn cube<E: Clone + core::ops::Mul<Output = E>>(x: E) -> E {
 
 /// A plain-`F` replay of the permutation, built only from the `pub` helpers above plus
 /// [`round_constants`] — no trace columns, no AIR. This is the M3-correctness anchor: compared
-/// against `Poseidon2Goldilocks::<8>::permute` (which derives its own round constants from the
-/// same `machine::PERM_SEED`-seeded RNG) in `tests/tables.rs::
-/// poseidon2_scalar_helpers_match_plonky3`, it proves both that `round_constants` reproduces
-/// the exact same constants and that `mds_light`/`internal_matmul`/`cube` compute the exact
+/// against `Poseidon2Goldilocks::<8>::permute` (`machine::permutation()`, which hands the same
+/// `poseidon2_constants` table to p3's own constructor) in `tests/tables.rs::
+/// poseidon2_scalar_helpers_match_plonky3`, it proves both that `round_constants` lays the
+/// table out the way p3 does and that `mds_light`/`internal_matmul`/`cube` compute the exact
 /// same permutation p3_poseidon2 does.
 pub fn permute_scalar(state: [F; 8]) -> [F; 8] {
     let rc = round_constants();
@@ -199,34 +195,21 @@ pub struct RoundConstants {
     pub terminal: [[F; 8]; HALF_FULL_ROUNDS],
 }
 
-/// Reproduces the exact RNG draw `Poseidon2Goldilocks::<8>::new_from_rng_128` makes from
-/// `StdRng::seed_from_u64(machine::PERM_SEED)` — the same seed `machine::permutation()`
-/// uses — so this table's round constants are byte-identical to the machine's own hashing
-/// permutation, with "no new constants" (per the M3.1 design ruling).
-///
-/// `p3_poseidon2::Poseidon2::new_from_rng_128` computes `(rounds_f, rounds_p) = (8, 22)` for
-/// Goldilocks width 8 (a pure function of the field/width, consumes no RNG output), then
-/// calls `new_from_rng(8, 22, rng)`, which draws, *in this order*: `ExternalLayerConstants::
-/// new_from_rng(8, rng)` (4 initial `[Goldilocks; 8]` rows, then 4 terminal `[Goldilocks; 8]`
-/// rows — `ExternalLayerConstants::new_from_rng`'s own draw order), then
-/// `rng.sample_iter(StandardUniform).take(22)` for the internal (partial-round) scalars.
-/// `ExternalLayerConstants` is public API (`get_initial_constants`/`get_terminal_constants`),
-/// so this reproduces the stream by calling exactly the same public constructors — not by
-/// reaching into `Poseidon2`'s opaque `external_layer`/`internal_layer` fields, which have no
-/// accessor once built.
+/// The committed table (`crate::poseidon2_constants`, audit finding ZKV-2) — the same constants
+/// `machine::permutation()` is built from, so this chip's round constants are byte-identical to
+/// the machine's own hashing permutation, with "no new constants" (per the M3.1 design ruling).
+/// Before the table this function re-ran `new_from_rng_128`'s seeded `StdRng` draw; that recipe
+/// is now `poseidon2_constants::tests::the_table_is_the_seeded_draw`.
 fn compute_round_constants() -> RoundConstants {
-    let mut rng = StdRng::seed_from_u64(crate::machine::PERM_SEED);
-    let external = ExternalLayerConstants::<F, 8>::new_from_rng(2 * HALF_FULL_ROUNDS, &mut rng);
-    let initial: [[F; 8]; HALF_FULL_ROUNDS] =
-        external.get_initial_constants().try_into().expect("4 initial rounds");
-    let terminal: [[F; 8]; HALF_FULL_ROUNDS] =
-        external.get_terminal_constants().try_into().expect("4 terminal rounds");
-    let internal: Vec<F> = rng.sample_iter(StandardUniform).take(PARTIAL_ROUNDS).collect();
-    let internal: [F; PARTIAL_ROUNDS] = internal.try_into().expect("22 internal rounds");
-    RoundConstants { initial, internal, terminal }
+    use crate::poseidon2_constants as table;
+    RoundConstants {
+        initial: table::INITIAL.map(F::new_array),
+        internal: F::new_array(table::INTERNAL),
+        terminal: table::TERMINAL.map(F::new_array),
+    }
 }
 
-/// Cached: pure and deterministic, but redrawing an RNG stream on every call is needless
+/// Cached: pure and deterministic, but rebuilding the field arrays on every call is needless
 /// work when the preprocessed trace and the witness builder both call this per block.
 pub fn round_constants() -> &'static RoundConstants {
     static RC: OnceLock<RoundConstants> = OnceLock::new();

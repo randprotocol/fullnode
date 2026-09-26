@@ -4,16 +4,16 @@
 //! `Config` — same Poseidon2 permutation, same salt stream, same FRI parameters — so its
 //! proofs decode as CPU proofs (see [`super::Machine::prove_on`]).
 //!
-//! The seed is `research`'s `pub(crate) `PERM_SEED`` ("RandZK"), duplicated here by value
-//! because it is not public upstream: the engines' permutation is built from it
-//! (`rand_zkvm_cuda::constants::permutation`), and it must be the same seed the rVM's own
-//! `randprotocol_zkvm::machine::permutation()` draws or the wire encodings would diverge. The
-//! equivalence suite (`tests/backend.rs`) is what proves they match.
+//! The seed is `research`'s `poseidon2_constants::PERM_SEED` ("RandZK"): the engines key their
+//! permutation on it (`rand_zkvm_cuda::constants::permutation`), which for this seed reads the
+//! same committed round-constant table `randprotocol_zkvm::machine::permutation()` is built from — any
+//! other seed would diverge the wire encodings. The equivalence suite (`tests/backend.rs`) is
+//! what proves they match.
 
 use super::*;
 
-/// `research`'s `machine::PERM_SEED` ("RandZK"), by value — see the module comment.
-pub const PERM_SEED: u64 = 0x5261_6e64_5a4b;
+/// `research`'s `poseidon2_constants::PERM_SEED` ("RandZK") — see the module comment.
+pub const PERM_SEED: u64 = randprotocol_zkvm::poseidon2_constants::PERM_SEED;
 
 /// The reference (CPU-twin) backend: `rand-zkvm-cuda`'s own Merkle tree and NTT, running on
 /// the host.

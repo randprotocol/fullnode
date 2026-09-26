@@ -4,6 +4,8 @@ pub mod guests;
 pub mod emulator;
 pub mod tables;
 pub mod machine;
+/// Vendored: the committed Poseidon2 round-constant table (audit finding ZKV-2).
+pub mod poseidon2_constants;
 pub mod hash;
 pub mod keccak;
 pub mod sha256;

@@ -55,7 +55,7 @@ fn the_chips_output_equals_the_reference_on_one_thousand_random_states() {
 #[test]
 fn the_round_constants_are_the_machines_own_draw() {
     // The AIR bakes the constants into its expressions (R9); the draw it uses must be the
-    // machine's own (`machine::PERM_SEED`-seeded, reproduced by research's `round_constants()`).
+    // machine's own (research's committed `poseidon2_constants` table, via `round_constants()`).
     // This is pinned structurally: the chip's `ROUNDS_F`/`ROUNDS_P` and the reference helpers it
     // shares all come from `randprotocol_zkvm::tables::poseidon2`.
     let rc = randprotocol_zkvm::tables::poseidon2::round_constants();

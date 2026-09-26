@@ -33,17 +33,12 @@ type Dft = Radix2DitParallel<Val>;
 pub type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, StdRng>;
 pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
 
-/// Fixed seed for the Poseidon2 round constants. Prover and verifier derive the
-/// same permutation from it. Production swaps this for the published
-/// `GOLDILOCKS_POSEIDON2_RC_8_*` constants; the circuit does not change.
-///
-/// `pub(crate)`, not private: `tables::poseidon2::round_constants` reproduces the exact same
-/// `ExternalLayerConstants::new_from_rng`/internal-constants RNG draw that `permutation()`
-/// below makes, so the M3 Poseidon2 *chip*'s round constants are byte-identical to this
-/// machine's own hashing permutation — see that module's doc comment for why (`p3_poseidon2`
-/// consumes its constants into opaque `external_layer`/`internal_layer` fields with no
-/// accessor, so the only way to recover them is to redraw them from the same seed).
-pub(crate) const PERM_SEED: u64 = 0x5261_6e64_5a4b; // "RandZK"
+/// The seed the Poseidon2 round constants were once drawn from. The constants themselves are a
+/// committed table now (`poseidon2_constants`, audit finding ZKV-2 — a seeded `StdRng` is not
+/// stable across `rand` releases); this name remains the key `rand-zkvm-cuda`'s engines take
+/// (`constants::permutation(PERM_SEED)` reads the same table) and the salt seed of
+/// `val_mmcs_for_tests`.
+pub(crate) const PERM_SEED: u64 = crate::poseidon2_constants::PERM_SEED; // "RandZK"
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FriProfile {
@@ -77,8 +72,10 @@ impl FriProfile {
     }
 }
 
+/// The width-8 Poseidon2 permutation, built from the committed round-constant table
+/// (`poseidon2_constants`) — the same constants the in-circuit chip and the GPU engines read.
 pub fn permutation() -> Perm {
-    Perm::new_from_rng_128(&mut StdRng::seed_from_u64(PERM_SEED))
+    crate::poseidon2_constants::permutation()
 }
 
 /// This machine's own `ValMmcs`, deterministically seeded — a test accessor, not a proving path.
