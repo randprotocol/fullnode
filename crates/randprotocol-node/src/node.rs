@@ -540,11 +540,17 @@ fn pick_sync_peer(
     my_height: u64,
     best_peer_height: u64,
     skipped: &[PeerId],
+    now: Instant,
 ) -> Option<PeerId> {
     let serves = |s: &Status| s.floor <= my_height.saturating_add(1);
+    // A peer backed off after answering a live request with nothing (SYNC-2) is no candidate on
+    // either branch until its back-off expires.
+    let askable = |p: &PeerId, peer: &Peer| {
+        peer.connected && !skipped.contains(p) && peer.sync_backoff_until.map_or(true, |until| now >= until)
+    };
     let best = peers
         .iter()
-        .filter(|(p, peer)| peer.connected && !skipped.contains(p))
+        .filter(|(p, peer)| askable(p, peer))
         .filter_map(|(p, peer)| peer.status.as_ref().filter(|s| serves(s)).map(|s| (*p, s.height)))
         .filter(|(_, h)| *h > my_height)
         .max_by_key(|(_, h)| *h)
@@ -553,7 +559,7 @@ fn pick_sync_peer(
         if best_peer_height > my_height + 1 {
             peers
                 .iter()
-                .filter(|(p, peer)| peer.connected && !skipped.contains(p))
+                .filter(|(p, peer)| askable(p, peer))
                 .find(|(_, peer)| peer.status.as_ref().map_or(true, serves))
                 .map(|(p, _)| *p)
         } else {
@@ -715,6 +721,12 @@ struct Peer {
     /// [`STATUS_GOSSIP_PER_SEC`]), but a forwarder cannot make this loop record one for every id
     /// it can mint at wire speed.
     status_bucket: admission::TokenBucket,
+    /// Not asked for a batch before this instant (SYNC-2): set by [`back_off_sync_peer`] when the
+    /// peer answered our live batch request with nothing we could use.
+    sync_backoff_until: Option<Instant>,
+    /// The length of the last back-off, doubled per consecutive miss up to [`SYNC_BACKOFF_MAX`];
+    /// zero after a batch from this peer applied.
+    sync_backoff: Duration,
 }
 
 /// `Status` messages one forwarding peer may deliver back to back, and the rate it recovers them
@@ -722,6 +734,29 @@ struct Peer {
 /// four a second is far above any honest peer's share (the transaction bucket's numbers).
 pub const STATUS_GOSSIP_BURST: u32 = 16;
 pub const STATUS_GOSSIP_PER_SEC: f64 = 4.0;
+
+/// The first back-off of a peer that answered a batch request with nothing usable, and the cap
+/// its doubling stops at (SYNC-2).
+pub const SYNC_BACKOFF_BASE: Duration = Duration::from_secs(5);
+pub const SYNC_BACKOFF_MAX: Duration = Duration::from_secs(120);
+
+/// A peer answered our live batch request with nothing we could apply (SYNC-2): not asked again
+/// for [`SYNC_BACKOFF_BASE`], doubling per consecutive miss to [`SYNC_BACKOFF_MAX`]. Its claimed
+/// height is what made `pick_sync_peer` choose it, and nothing else would stop the same claim
+/// winning the next tick's `max_by_key` — an honest peer that pruned the height, or one briefly
+/// refusing (a metered sync request, SW-2), costs a few seconds of preference and nothing more.
+/// Held on the peer's entry, so a reconnect starts it over (a reconnect is what DS-2 meters).
+fn back_off_sync_peer(peer: &mut Peer, now: Instant) {
+    peer.sync_backoff =
+        if peer.sync_backoff.is_zero() { SYNC_BACKOFF_BASE } else { (peer.sync_backoff * 2).min(SYNC_BACKOFF_MAX) };
+    peer.sync_backoff_until = Some(now + peer.sync_backoff);
+}
+
+/// A batch from this peer applied: it is asked again at once, and a later miss starts at the base.
+fn clear_sync_backoff(peer: &mut Peer) {
+    peer.sync_backoff = Duration::ZERO;
+    peer.sync_backoff_until = None;
+}
 
 /// Drop the by-hash fetches sent more than `timeout` ago (audit v5): a request libp2p neither
 /// answered nor reported by then is gone, and left in place it would block every further
@@ -800,6 +835,9 @@ struct BatchDecision {
     /// late path the slot holds the replacement we sent when we gave up, and that one is still on
     /// the wire.
     clear_inflight: bool,
+    /// The live request's own answer, and nothing we can apply (SYNC-2): an empty batch or one
+    /// that starts elsewhere, from a peer `pick_sync_peer` chose because it claimed to be ahead.
+    miss: bool,
 }
 
 /// The node's committed history and the set's disagree. Carried as a typed error so the sync
@@ -825,7 +863,7 @@ pub struct FatalSafety {
 /// and a batch that starts there is the continuation it asked for.
 fn batch_decision(first_height: Option<u64>, my_height: u64, is_current: bool) -> BatchDecision {
     let apply = first_height == Some(my_height + 1);
-    BatchDecision { apply, late: apply && !is_current, clear_inflight: is_current }
+    BatchDecision { apply, late: apply && !is_current, clear_inflight: is_current, miss: is_current && !apply }
 }
 
 /// Take committed blocks from `blocks` while they fit in `budget` bytes of wire.
@@ -2120,7 +2158,7 @@ impl Node {
         // are give-ups, never stalls: fall to the next candidate — a possibly-stale answer
         // costs one round trip, and it keeps the cycle alive where a silent stall costs the chain.
         for _ in 0..3 {
-            let Some(peer) = pick_sync_peer(&self.peers, my_height, self.best_peer_height(), &skipped) else {
+            let Some(peer) = pick_sync_peer(&self.peers, my_height, self.best_peer_height(), &skipped, Instant::now()) else {
                 // No candidate at all — not merely a send failure — is the silent case: every
                 // peer that could serve our next height has pruned past it (final-review fix
                 // #2). Rate-limited to once a minute so a node stuck here does not spam its log
@@ -2218,6 +2256,16 @@ impl Node {
                         my_height, blocks = blocks.len(),
                         "ignoring a sync batch that does not start at our next height"
                     );
+                    if d.miss {
+                        // The peer we chose for its claimed height had nothing to give (SYNC-2):
+                        // back it off, or the next tick re-picks it on the same claim, and ask the
+                        // next candidate now.
+                        if let Some(p) = self.peers.get_mut(&peer) {
+                            back_off_sync_peer(p, Instant::now());
+                            tracing::info!(%peer, backoff_s = p.sync_backoff.as_secs(), "sync peer backed off after an unusable answer");
+                        }
+                        self.sync_from(Some(peer)).await;
+                    }
                     return Ok(());
                 }
                 if d.late {
@@ -2261,6 +2309,9 @@ impl Node {
                 // without meaning the chain has run out — follow up on any batch that moved us
                 // while a peer is still ahead.
                 self.sync_batch = (self.sync_batch * 2).min(SYNC_BATCH);
+                if let Some(p) = self.peers.get_mut(&peer) {
+                    clear_sync_backoff(p);
+                }
                 if n > 0 && self.best_peer_height() > self.hs.committed_height() {
                     self.maybe_sync().await;
                 }
@@ -2820,7 +2871,7 @@ mod tests {
             let out = on_status_gossip(&mut peers, &limiter, pid(i), attacker, forged.clone(), now + Duration::from_secs(i as u64));
             assert_eq!(out, GossipOutcome::Report(Acceptance::Ignore), "a status relayed under peer {i}'s name is neither read nor forwarded");
         }
-        let pick = pick_sync_peer(&peers, 43, 500, &[]);
+        let pick = pick_sync_peer(&peers, 43, 500, &[], Instant::now());
         assert!(pick.is_some() && pick != Some(attacker), "an honest peer still serves 44: {pick:?}");
         // The attacker's own status with an impossible floor is malformed, not merely unread.
         let out = on_status_gossip(&mut peers, &limiter, attacker, attacker, forged, now + Duration::from_secs(60));
@@ -2850,18 +2901,18 @@ mod tests {
         };
         let peers: HashMap<PeerId, Peer> = [p(1, true, Some(163)), p(2, true, Some(120)), p(3, false, Some(200))].into_iter().collect();
         // The freshest connected-and-ahead peer wins — never a disconnected one, however fresh.
-        assert_eq!(pick_sync_peer(&peers, 43, 200, &[]), Some(pid(1)));
+        assert_eq!(pick_sync_peer(&peers, 43, 200, &[], Instant::now()), Some(pid(1)));
         // The stall shape: the fresh peer is disconnected and the connected one is statusless,
         // but the chain is known ahead — the fallback asks the connected peer anyway.
         let peers: HashMap<PeerId, Peer> = [p(1, false, Some(163)), p(2, true, None)].into_iter().collect();
-        assert_eq!(pick_sync_peer(&peers, 43, 163, &[]), Some(pid(2)));
+        assert_eq!(pick_sync_peer(&peers, 43, 163, &[], Instant::now()), Some(pid(2)));
         // Nothing ahead at all: no fallback (a peer at our height is not worth asking).
         let peers: HashMap<PeerId, Peer> = [p(1, true, None)].into_iter().collect();
-        assert_eq!(pick_sync_peer(&peers, 43, 43, &[]), None);
+        assert_eq!(pick_sync_peer(&peers, 43, 43, &[], Instant::now()), None);
         // The skip list (a give-up) is honored before the fallback too.
         let skipped = [pid(2)];
         let peers: HashMap<PeerId, Peer> = [p(1, false, Some(163)), p(2, true, None), p(3, true, Some(50))].into_iter().collect();
-        assert_eq!(pick_sync_peer(&peers, 43, 163, &skipped), Some(pid(3)));
+        assert_eq!(pick_sync_peer(&peers, 43, 163, &skipped, Instant::now()), Some(pid(3)));
     }
 
     #[test]
@@ -2876,13 +2927,13 @@ mod tests {
         // We are at 43 and need 44. Peer 1 is far ahead but pruned everything below 100;
         // peer 2 is lower but still holds 44.
         let peers: HashMap<PeerId, Peer> = [p(1, 500, 100), p(2, 120, 0)].into_iter().collect();
-        assert_eq!(pick_sync_peer(&peers, 43, 500, &[]), Some(pid(2)));
+        assert_eq!(pick_sync_peer(&peers, 43, 500, &[], Instant::now()), Some(pid(2)));
         // A floor exactly at our next height is fine.
         let peers: HashMap<PeerId, Peer> = [p(1, 500, 44)].into_iter().collect();
-        assert_eq!(pick_sync_peer(&peers, 43, 500, &[]), Some(pid(1)));
+        assert_eq!(pick_sync_peer(&peers, 43, 500, &[], Instant::now()), Some(pid(1)));
         // Every candidate pruned it: no pick, even though the chain is ahead.
         let peers: HashMap<PeerId, Peer> = [p(1, 500, 100), p(2, 300, 60)].into_iter().collect();
-        assert_eq!(pick_sync_peer(&peers, 43, 500, &[]), None);
+        assert_eq!(pick_sync_peer(&peers, 43, 500, &[], Instant::now()), None);
     }
 
     #[test]
@@ -4311,6 +4362,51 @@ mod tests {
         assert!(d.apply, "the blocks continue our chain, whoever asked for them");
         assert!(d.late, "counted as late, not as a failure");
         assert!(!d.clear_inflight, "the replacement request is still on the wire");
+    }
+
+    /// SYNC-2 (network scan 2026-09-26, medium): a peer that claims a huge height and answers our
+    /// live batch request empty (or starting elsewhere) was re-picked on every tick by
+    /// `pick_sync_peer`'s `max_by_key` on the claimed height, so the node never asked anyone
+    /// else. Such an answer is now a miss: the peer is backed off — five seconds, doubling to a
+    /// two-minute cap — and the next candidate is asked meanwhile; a batch that applies clears it.
+    #[test]
+    fn a_peer_that_answers_our_batch_empty_is_backed_off_and_another_is_asked() {
+        let pid = |seed: u8| PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public());
+        let at = |h: u64| Peer { status: Some(Status { height: h, head_hash: Hash::ZERO, view: h, floor: 0 }), connected: true, ..Default::default() };
+        let (liar, honest) = (pid(1), pid(2));
+        let mut peers: HashMap<PeerId, Peer> = [(liar, at(1_000_000)), (honest, at(500))].into_iter().collect();
+        let t0 = Instant::now();
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t0), Some(liar), "the highest claim is asked first");
+        // The live request's own answer, empty or mis-started, is a miss; a stale one is not.
+        for first in [None, Some(40u64), Some(45)] {
+            assert!(batch_decision(first, 43, true).miss, "{first:?}");
+            assert!(!batch_decision(first, 43, false).miss, "a stale answer is no one's miss: {first:?}");
+        }
+        assert!(!batch_decision(Some(44), 43, true).miss);
+        back_off_sync_peer(peers.get_mut(&liar).unwrap(), t0);
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t0), Some(honest), "the next candidate is asked");
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t0 + SYNC_BACKOFF_BASE - Duration::from_millis(1)), Some(honest));
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t0 + SYNC_BACKOFF_BASE), Some(liar), "back once the back-off expires");
+        // A second miss in a row doubles it.
+        let t1 = t0 + SYNC_BACKOFF_BASE;
+        back_off_sync_peer(peers.get_mut(&liar).unwrap(), t1);
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t1 + SYNC_BACKOFF_BASE), Some(honest));
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t1 + 2 * SYNC_BACKOFF_BASE), Some(liar));
+        // The fallback branch (no fresh candidate) honours it too: alone and backed off, no pick.
+        let mut alone: HashMap<PeerId, Peer> = [(liar, at(1_000_000))].into_iter().collect();
+        back_off_sync_peer(alone.get_mut(&liar).unwrap(), t0);
+        assert_eq!(pick_sync_peer(&alone, 43, 1_000_000, &[], t0), None);
+        // Capped.
+        let p = peers.get_mut(&liar).unwrap();
+        for _ in 0..20 {
+            back_off_sync_peer(p, t0);
+        }
+        assert_eq!(p.sync_backoff, SYNC_BACKOFF_MAX);
+        // A batch that applied clears it: asked again at once, and the next miss starts over.
+        clear_sync_backoff(p);
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t0), Some(liar));
+        back_off_sync_peer(peers.get_mut(&liar).unwrap(), t0);
+        assert_eq!(peers[&liar].sync_backoff, SYNC_BACKOFF_BASE);
     }
 
     /// Answering the request the slot holds frees it, and is not late.
