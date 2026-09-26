@@ -92,6 +92,14 @@ pub struct ValidatorEntry {
 /// - `registration_v2`: a `Bond`'s registration is signed over [`registration_message_v2`] —
 ///   the genesis hash and the validator's address beside the chain id and the payout — instead
 ///   of the v1 message. Only `true` switches it on.
+///
+/// And one for a testnet that keeps a bridge *and* a faucet (chain 15):
+///
+/// - `faucet_recipients`: a `Mint` may create a note only for one of these spend keys
+///   (`TxError::FaucetRecipientNotAllowed`), so the faucet feeds the named testers and cannot buy
+///   the register for anyone else. It is what lets `faucet: true` sit beside a `bridge` section
+///   (`GenesisError::FaucetWithBridge` otherwise); an empty list is refused. The budget above
+///   still applies on top.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StakingConfig {
@@ -104,6 +112,40 @@ pub struct StakingConfig {
     pub max_stake_entry_per_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_v2: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faucet_recipients: Option<Vec<FaucetRecipient>>,
+}
+
+/// One entry of `staking.faucet_recipients`: the spend public key `pk` a faucet `Mint` may pay.
+/// Since POOL-1 a mint publishes its note's opening, `pk` included, and the ledger recomputes the
+/// commitment from it — so the recipient is on the wire and a list of keys can be enforced.
+///
+/// The genesis file may name one either way: 64 hex characters (the `pk` of a `GenesisOpening`,
+/// `word8_to_hex`), or a whole `rand1…` shielded address (what `rand address` prints), whose `pk`
+/// is taken and whose ML-KEM key is dropped — a faucet note is sealed to whatever envelope the
+/// minter builds, and only `pk` is bound. It is always written back as hex, and only the 32 `pk`
+/// bytes are committed to the genesis hash, so both spellings of one key are one chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaucetRecipient(pub Word8);
+
+impl Serialize for FaucetRecipient {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&crate::notes::word8_to_hex(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for FaucetRecipient {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let t = String::deserialize(d)?;
+        if t.starts_with(crate::notes::ADDRESS_PREFIX) {
+            return ShieldedAddress::parse(&t)
+                .map(|a| FaucetRecipient(a.pk))
+                .map_err(|e| serde::de::Error::custom(format!("faucet recipient {t:?}: {e}")));
+        }
+        crate::notes::word8_from_hex(&t).map(FaucetRecipient).ok_or_else(|| {
+            serde::de::Error::custom(format!("faucet recipient {t:?} is neither 64 hex characters nor a rand1 address"))
+        })
+    }
 }
 
 /// The largest `max_weight_bps` means anything: 10 000 is the whole set, i.e. no cap.

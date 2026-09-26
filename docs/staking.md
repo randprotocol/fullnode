@@ -116,7 +116,8 @@ byte-for-byte unchanged — on any chain whose genesis lacks it, chain 14 includ
 - **A bridged chain has no faucet.** `faucet: true` beside a `bridge` section is refused at
   genesis (`GenesisError::FaucetWithBridge`) once the section is present: free RAND against a
   chain holding bridged custody is what the finding is about. Chain 14's genesis has both and no
-  section, so it still loads.
+  section, so it still loads — and a testnet that wants both names its testers instead
+  (`faucet_recipients`, below).
 
 Three further fields close what the v4 re-review still found open in the gated rules
 ("admission, weight cap, proof of possession"). Each is optional *inside* the section, omitted
@@ -161,6 +162,28 @@ section without them hashes exactly as v0.5.4's did:
   domain's v1 tags use — and a v1 registration is refused (`BadSignature`). `rand-node register
   --v2` signs it (the genesis hash is read from `--rpc`). Absent or `false` is the v1 rule and
   commits nothing.
+
+One more optional field lets a testnet keep a faucet beside a bridge (chain 15):
+
+```json
+"staking": {
+  "faucet_budget_per_epoch": "100000000000", "bond_activation_epochs": 2,
+  "faucet_recipients": ["rand1…the operator's address…", "rand1…a second tester's…"]
+}
+```
+
+- **`faucet_recipients` — the faucet allowlist.** A `Mint` publishes its note's opening, and the
+  ledger recomputes `cm` from it (POOL-1), so the note's owner `pk` is on the wire; under this list
+  a `Mint` whose `pk` is not on it is refused (`FaucetRecipientNotAllowed`) at admission and at
+  apply, before any signature work. The faucet then feeds the named wallets and cannot buy the
+  register for anyone else, which is why the list — and only the list — lets `faucet: true` sit
+  beside a `bridge` section. The budget still applies on top. An entry is either a whole `rand1…`
+  address, exactly what `rand --key <wallet.key.json> address` prints (its `pk` is taken, its
+  ML-KEM key dropped), or that `pk`'s 64 hex characters; the file is written back as hex, and only
+  the 32 `pk` bytes are committed to the genesis hash, key by key in file order, so both spellings
+  are the same chain. An empty or duplicated list is refused at `init` (`BadStaking`). The refusal
+  is about the transaction's own bytes against a genesis constant, so the node caches it as
+  permanent. A tester outside the list is sent coins by a listed wallet, like anyone else.
 
 Not in v0.5.4: slashing (audit decision D8 — "it means nothing while stake is free").
 

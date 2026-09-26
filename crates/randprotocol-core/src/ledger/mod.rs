@@ -23,7 +23,7 @@ use crate::gas;
 use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Envelope, Word8, MAX_ENVELOPE_BYTES};
 use crate::program::{program_id_with_public, CallOutcome, CallReceipt, ProgramId, ProgramRecord};
 use crate::types::{Action, Block, Transaction, ValidatorSet, FAUCET_MAX_UNITS};
-pub use staking::StakingConfig;
+pub use staking::{FaucetRecipient, StakingConfig};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// How many block-end roots a bundle may anchor to (spec §7 item 4).
@@ -156,6 +156,11 @@ pub enum TxError {
     /// the next epoch admits the same transaction — so never a permanent admission verdict.
     #[error("the faucet budget of {budget} for this epoch is exhausted ({minted} minted)")]
     FaucetBudgetExhausted { budget: u64, minted: u64 },
+    /// Chain 15's faucet allowlist (`staking.faucet_recipients`): the mint's note is for a spend
+    /// key the genesis does not list. The list is a genesis constant and `pk` is the mint's own
+    /// bytes, so this one is permanent.
+    #[error("the faucet may not mint to this recipient (not in staking.faucet_recipients)")]
+    FaucetRecipientNotAllowed,
     #[error("confidential computation is disabled on this chain")]
     ConfidentialDisabled,
     #[error("bad program: {0}")]
@@ -1380,6 +1385,13 @@ impl Ledger {
                     let minted = if self.faucet_epoch == self.epoch() { self.faucet_minted_in_epoch } else { 0 };
                     if minted.saturating_add(*amount) > s.faucet_budget_per_epoch {
                         return Err(TxError::FaucetBudgetExhausted { budget: s.faucet_budget_per_epoch, minted });
+                    }
+                    // The allowlist (chain 15): the published opening's `pk` is the note's owner —
+                    // the value rule below ties `cm` to it — so a key off the list gets nothing.
+                    if let Some(list) = &s.faucet_recipients {
+                        if !list.iter().any(|r| r.0 == *pk) {
+                            return Err(TxError::FaucetRecipientNotAllowed);
+                        }
                     }
                 }
                 let addr = minter.address();
@@ -3834,6 +3846,43 @@ mod tests {
         l.apply_tx(&over, &a.address(), &StubExecutor).unwrap();
         assert_eq!(l.faucet_epoch_counters(), (1, 50 * UNITS_PER_RAND));
         assert_eq!(l.supply().faucet_minted, 150 * UNITS_PER_RAND, "the supply counter is the running total");
+    }
+
+    /// Chain 15's faucet allowlist: under `staking.faucet_recipients` a `Mint` pays only a listed
+    /// spend key — the `pk` its published opening names, which the value rule ties to `cm` — at
+    /// admission and at apply alike, and the epoch budget still applies on top. Refused before
+    /// any signature work, and a refused mint leaves the ledger untouched.
+    #[test]
+    fn the_faucet_allowlist_refuses_a_mint_to_an_unlisted_key() {
+        let budget = 100 * UNITS_PER_RAND;
+        let mut l = ledger();
+        l.set_staking(Some(StakingConfig {
+            faucet_budget_per_epoch: budget,
+            bond_activation_epochs: 0,
+            faucet_recipients: Some(vec![FaucetRecipient([5; 8]), FaucetRecipient([6; 8])]),
+            ..Default::default()
+        }));
+        let (a, _) = keys();
+        let mint = |l: &Ledger, pk: u32, r: u32, amount: u64| {
+            Transaction::mint(7, [pk; 8], l.height() as u32, [r; 8], env(), amount, &a, &StubExecutor)
+        };
+        let stranger = mint(&l, 9, 10, UNITS_PER_RAND);
+        assert_eq!(l.validate(&stranger, &StubExecutor), Err(TxError::FaucetRecipientNotAllowed));
+        let before = l.clone();
+        assert_eq!(l.apply_tx(&stranger, &a.address(), &StubExecutor), Err(TxError::FaucetRecipientNotAllowed));
+        assert_eq!(l, before, "a refused mint leaves the ledger untouched");
+        // Both listed keys are paid.
+        for (pk, r) in [(5, 11), (6, 12)] {
+            let t = mint(&l, pk, r, 40 * UNITS_PER_RAND);
+            l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
+        }
+        assert_eq!(l.faucet_epoch_counters(), (0, 80 * UNITS_PER_RAND));
+        // And the budget binds a listed key too.
+        let over = mint(&l, 5, 13, 21 * UNITS_PER_RAND);
+        assert!(matches!(l.validate(&over, &StubExecutor), Err(TxError::FaucetBudgetExhausted { .. })));
+        // Without the list the same stranger's mint is only budget-bound.
+        l.set_staking(Some(StakingConfig { faucet_budget_per_epoch: budget, bond_activation_epochs: 0, ..Default::default() }));
+        assert_eq!(l.validate(&stranger, &StubExecutor), Ok(()));
     }
 
     /// The two epoch counters and the validator's activation epoch are consensus state on a

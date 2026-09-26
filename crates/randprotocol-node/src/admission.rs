@@ -323,6 +323,8 @@ pub fn is_permanent(e: &TxError) -> bool {
             | TxError::BadMintSignature
             // A mint's commitment is a function of its own bytes (`ledger::mint_commitment`).
             | TxError::MintCommitmentMismatch
+            // A mint's recipient `pk` is its own bytes, against a genesis list (chain 15).
+            | TxError::FaucetRecipientNotAllowed
             // A faucet mint at or above 2^63 (deep scan 2026-09-24): the node's own byte verdict
             // for a note no proof could spend (`oversized_note`), against a constant — unlike
             // `MintTooLarge`, which stays out (see the doc comment).
@@ -681,6 +683,7 @@ mod tests {
             TxError::InvalidBundleProof(ConfidentialError::MalformedProof),
             TxError::BadMintSignature,
             TxError::MintCommitmentMismatch,
+            TxError::FaucetRecipientNotAllowed,
             TxError::ProofTooLarge,
             TxError::EnvelopeTooLarge,
             TxError::TransactionTooLarge { size: 9_000_000, max: 4 << 20 },

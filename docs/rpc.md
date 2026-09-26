@@ -139,6 +139,10 @@ the normal mempool, so the mint goes through consensus and every node applies it
 no validator key and answers `faucet mints are signed by validators; ask a validator node`. Poll
 `rand_getTransaction` for the commit.
 
+On a chain whose genesis sets `staking.faucet_recipients` (chain 15) only the listed wallets can be
+paid: a mint to any other address is refused at admission with `the faucet may not mint to this
+recipient (not in staking.faucet_recipients)` (`docs/staking.md` §2).
+
 The faucet is rate limited per node process: eight mints back to back, refilling at one a
 second. Past that the call answers `faucet is rate limited on this node (8 mints back to back,
 refilling at 1/s); try again shortly`, so a faucet flood cannot fill the pool ahead of a bridge

@@ -264,6 +264,27 @@ delays top-ups is on whenever the section is:
   hash and the validator's address: every validator that registers after the cut uses
   `rand-node register --v2`, and a v1 registration is refused.
 
+A testnet cut that keeps its faucet beside the bridge (chain 15) adds the faucet allowlist to the
+same section, and sets `"faucet": true` at the top level:
+
+```json
+"staking": {
+  "faucet_budget_per_epoch": "100000000000", "bond_activation_epochs": 2,
+  "max_weight_bps": 3333, "max_stake_entry_per_epoch": "10000000000000", "registration_v2": true,
+  "faucet_recipients": [
+    "rand1…the output of `rand --key ~/.rand-chain15/wallets/dendi.key.json address`…",
+    "rand1…anish's address, as he sends it…"
+  ]
+}
+```
+
+- **`faucet_recipients`** (non-empty, no key twice): a `Mint` pays only these wallets
+  (`FaucetRecipientNotAllowed` otherwise, cached as permanent). Without it `faucet: true` beside a
+  `bridge` section is refused (`FaucetWithBridge`). Each entry is a full `rand1…` address — what
+  `rand address` prints — or its `pk` as 64 hex characters; only the `pk` is committed, so an
+  address can be pasted as it is. `rand_mint` to any other
+  address is refused at admission. **Mainnet never carries a faucet**, allowlisted or not.
+
 Like the rest of the section: `rand-node genesis` never writes them, the cut script splices them
 in, and `rand-node init` on the finished file prints the hash that matters. Chain 14 has no
 section, and `rand-node`'s `chain_14s_genesis_file_still_builds_chain_14` pins its hash
@@ -284,7 +305,8 @@ matters:
 `faucet_budget_per_epoch` is in RAND's base unit as a decimal string (100 RAND above — one `Mint`'s
 worth per 1000-block epoch); `bond_activation_epochs` is how many whole epochs a new bond waits
 past the boundary it would have joined at (0 = today's rule). On a bridged chain set
-`faucet: false` — a faucet beside a bridge is refused at `init` once the section is present. The
+`faucet: false` — a faucet beside a bridge is refused at `init` once the section is present —
+unless `faucet_recipients` limits the faucet to named wallets (the STAKE-2 fields above). The
 section moves the state root domain to `rand-state-5` and the validator leaf to
 `rand-validator-leaf-4` and appends the bond queue's root to the state root, so it ships with a
 chain cut, never as a same-chain update; a node restores it from the genesis file on every restart

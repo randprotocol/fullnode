@@ -255,7 +255,7 @@ impl From<&TokensConfig> for TokensCommit {
 }
 
 /// The `staking` genesis section (audit v4, STAKE-2), defined beside the rules it switches on.
-pub use crate::ledger::staking::StakingConfig;
+pub use crate::ledger::staking::{FaucetRecipient, StakingConfig};
 /// Shortest `bridge.rules_v2.cap_window_secs` (one hour) and longest (seven days) a genesis may set.
 pub const MIN_CAP_WINDOW_SECS: u32 = 3_600;
 pub const MAX_CAP_WINDOW_SECS: u32 = 7 * 86_400;
@@ -409,11 +409,13 @@ pub enum GenesisError {
     #[error("unknown consensus_domain {0} (0 or 1)")]
     BadConsensusDomain(u32),
     /// Audit v4, STAKE-2 rule 1: under a `staking` section a chain that holds bridged custody
-    /// cannot also hand out free RAND.
-    #[error("a staking section refuses a faucet on a bridged chain (faucet: true with a bridge section)")]
+    /// cannot also hand out free RAND — unless `staking.faucet_recipients` limits the faucet to
+    /// named spend keys.
+    #[error("a staking section refuses a faucet on a bridged chain (faucet: true with a bridge section) unless staking.faucet_recipients limits it")]
     FaucetWithBridge,
     /// A `staking` section field no chain could run: a weight cap outside `1..=10000` basis
-    /// points, or a zero entry budget (nothing would ever become weight).
+    /// points, a zero entry budget (nothing would ever become weight), or an empty or duplicated
+    /// faucet allowlist.
     #[error("bad staking config: {0}")]
     BadStaking(String),
     #[error("bad hc_bundle {0} (64 hex characters)")]
@@ -578,10 +580,22 @@ impl Genesis {
         }
         // Audit v4, STAKE-2 rule 1, only under the section: a faucet and a bridge exclude each
         // other. Chain 14's genesis has both and no section, so it still loads.
-        if self.staking.is_some() && self.faucet && self.bridge.is_some() {
+        // A faucet limited to named spend keys (`faucet_recipients`, chain 15) cannot buy the
+        // register for anyone else, so it may sit beside a bridge.
+        let allowlisted = self.staking.as_ref().is_some_and(|s| s.faucet_recipients.is_some());
+        if self.staking.is_some() && self.faucet && self.bridge.is_some() && !allowlisted {
             return Err(GenesisError::FaucetWithBridge);
         }
         if let Some(s) = &self.staking {
+            if let Some(list) = &s.faucet_recipients {
+                if list.is_empty() {
+                    return Err(GenesisError::BadStaking("faucet_recipients is empty: the faucet could pay no one".into()));
+                }
+                let distinct: std::collections::BTreeSet<_> = list.iter().map(|r| r.0).collect();
+                if distinct.len() != list.len() {
+                    return Err(GenesisError::BadStaking("faucet_recipients names a key twice".into()));
+                }
+            }
             if let Some(bps) = s.max_weight_bps {
                 if bps == 0 || bps > crate::ledger::staking::MAX_WEIGHT_BPS {
                     return Err(GenesisError::BadStaking(format!("max_weight_bps {bps} is outside 1..=10000")));
@@ -871,6 +885,14 @@ impl Genesis {
             if s.registration_v2 == Some(true) {
                 commit.extend_from_slice(b"registration_v2");
                 commit.push(1);
+            }
+            // The faucet allowlist: its length, then each key's 32 bytes in file order.
+            if let Some(list) = &s.faucet_recipients {
+                commit.extend_from_slice(b"faucet_recipients");
+                commit.extend_from_slice(&(list.len() as u32).to_be_bytes());
+                for r in list {
+                    commit.extend_from_slice(&crate::notes::word8_to_bytes(&r.0));
+                }
             }
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
@@ -2516,6 +2538,54 @@ mod tests {
             "e845c110b5e366acf87806cb7f09cc212ad47008cac7cafbd141c30da4c738d4",
             "the pin `a_bridge_section_is_accepted_and_only_a_bridged_chain_changes` guards, unchanged"
         );
+    }
+
+    /// Chain 15: `staking.faucet_recipients` limits the faucet to named spend keys, and that is
+    /// what lets `faucet: true` sit beside a `bridge` section. An empty or duplicated list is
+    /// refused; the list is committed to the genesis hash only when present, key by key, and a
+    /// `rand1…` address and the hex of its `pk` name the same key — the same chain.
+    #[test]
+    fn a_faucet_allowlist_lets_a_bridged_chain_keep_its_faucet() {
+        use crate::notes::{ShieldedAddress, KEM_EK_BYTES};
+        let mut g = genesis(1);
+        g.bridge = Some(bridge_cfg());
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], max_tokens: None, burn_registration_fee: None, bound_note_value: None, mint_cap_per_day: 100_000 * 100_000_000 });
+        g.alloc = opened_alloc();
+        g.faucet = true;
+        g.staking = Some(StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2, ..Default::default() });
+        let plain = g.clone();
+        assert!(matches!(plain.validate(), Err(GenesisError::FaucetWithBridge)), "no list, no faucet beside a bridge");
+        let with = |list: Vec<FaucetRecipient>| {
+            let mut g = plain.clone();
+            g.staking.as_mut().unwrap().faucet_recipients = Some(list);
+            g
+        };
+        let (me, anish) = (FaucetRecipient([5; 8]), FaucetRecipient([6; 8]));
+        let listed = with(vec![me, anish]);
+        let s = build(&listed);
+        assert_eq!(s.ledger.staking().unwrap().faucet_recipients, Some(vec![me, anish]), "the ledger runs with the list");
+        assert!(matches!(with(vec![]).validate(), Err(GenesisError::BadStaking(_))), "an empty list pays no one");
+        assert!(matches!(with(vec![me, me]).validate(), Err(GenesisError::BadStaking(_))));
+        // Committed, key by key; absent from the file and the hash when unset.
+        let unlisted = { let mut u = plain.clone(); u.bridge = None; u };
+        assert!(!unlisted.to_json().contains("faucet_recipients"));
+        let unlisted_hash = build(&unlisted).hash();
+        let mut listed_unbridged = unlisted.clone();
+        listed_unbridged.staking.as_mut().unwrap().faucet_recipients = Some(vec![me]);
+        assert_ne!(build(&listed_unbridged).hash(), unlisted_hash);
+        assert_ne!(build(&with(vec![me])).hash(), build(&with(vec![anish])).hash());
+        assert_ne!(s.hash(), build(&with(vec![me])).hash());
+        // The file writes hex and reads either spelling back to the same chain.
+        let json = listed.to_json();
+        let me_hex = crate::notes::word8_to_hex(&me.0);
+        assert!(json.contains(&me_hex), "{json}");
+        assert_eq!(Genesis::from_json(&json).unwrap(), listed);
+        let address = ShieldedAddress { pk: me.0, kem_ek: vec![7; KEM_EK_BYTES] }.to_string();
+        let by_address = Genesis::from_json(&json.replace(&me_hex, &address)).unwrap();
+        assert_eq!(by_address, listed);
+        assert_eq!(build(&by_address).hash(), s.hash());
+        assert!(Genesis::from_json(&json.replace(&me_hex, "rand1notanaddress")).is_err());
+        assert!(Genesis::from_json(&json.replace(&me_hex, "abcd")).is_err());
     }
 
     /// The v4 re-review's three `staking` fields ride the section's own gate one level down:
