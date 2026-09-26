@@ -705,8 +705,6 @@ fn memo_column(memo: &Option<String>, whole: bool) -> String {
     }
 }
 
-/// The saved contact whose address's `pk` matches `pk`, if any — what `rand history`'s `to`
-/// column shows instead of a bare hex `pk` when this wallet has a name for the recipient.
 /// The bare `randpay:` link naming just an address — no amount, asset or memo. Every QR this
 /// wallet renders is a `randpay:` link, level M, never a bare address (`rand address --qr`'s own
 /// link, built with whatever `--amount`/`--asset`/`--memo` were given, is the other case of the
@@ -716,6 +714,8 @@ fn pay_link(a: &ShieldedAddress) -> String {
     PaymentUri { address: a.clone(), amount: None, asset: None, memo: None }.format()
 }
 
+/// The saved contact whose address's `pk` matches `pk`, if any — what `rand history`'s `to`
+/// column shows instead of a bare hex `pk` when this wallet has a name for the recipient.
 fn contact_name_for(contacts: &Contacts, pk: &Word8) -> Option<String> {
     contacts.entries.iter().find_map(|(name, addr)| {
         let a = ShieldedAddress::parse(addr).ok()?;
