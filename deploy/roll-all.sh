@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # All-stop, all-start roll of a same-chain node-only build (v0.5.5's procedure, kept for v0.5.6):
 #
-#   deploy/roll-all.sh <rand-node binary> <rand binary> <expected sha256 of rand-node>
+#   deploy/roll-all.sh <rand-node binary> <rand binary> <expected sha256 of rand-node> [<expected sha256 of rand>]
 #
-# 1. copies both binaries to every droplet in deploy/nodes.env and installs them only when the
+#   The wallet's sha is the fourth argument or WANT_SHA_WALLET; without one the roll is refused —
+#   `rand` is installed as root and run as root, so it is checked exactly like rand-node (OPS-2).
+#
+# 1. copies both binaries to every droplet in deploy/nodes.env and installs them only when each
 #    copy's sha256 equals the expected one (the release tag's), keeping the previous rand-node
 #    beside it as /root/rand-node.prev; nothing restarts yet;
 # 2. stops node A (launchd) and every droplet's rand-node together;
@@ -15,13 +18,15 @@
 # deploy/update-droplet.sh.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-NODE_BIN=$1; WALLET_BIN=$2; WANT=$3
+NODE_BIN=$1; WALLET_BIN=$2; WANT=$3; WANT_WALLET=${4:-${WANT_SHA_WALLET:-}}
+[ -n "$WANT_WALLET" ] || { echo "no expected sha256 for $WALLET_BIN (fourth argument or WANT_SHA_WALLET) — the wallet binary is installed as root too"; exit 1; }
 [ "$(shasum -a 256 "$NODE_BIN" | cut -d' ' -f1)" = "$WANT" ] || { echo "local $NODE_BIN does not match $WANT"; exit 1; }
+[ "$(shasum -a 256 "$WALLET_BIN" | cut -d' ' -f1)" = "$WANT_WALLET" ] || { echo "local $WALLET_BIN does not match $WANT_WALLET"; exit 1; }
 IPS=$(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u)
 echo "== install (no restart) $(date -u +%H:%M:%S)"
 for ip in $IPS; do
   scp -q -o ConnectTimeout=15 -o BatchMode=yes "$NODE_BIN" root@$ip:/root/rand-node.new && scp -q -o ConnectTimeout=15 -o BatchMode=yes "$WALLET_BIN" root@$ip:/root/rand.new || { echo "   $ip: copy failed"; continue; }
-  ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip "set -e; [ \"\$(sha256sum /root/rand-node.new | cut -d' ' -f1)\" = \"$WANT\" ] || { echo '   sha mismatch, skipping'; rm -f /root/rand-node.new /root/rand.new; exit 1; }; cp -f /usr/local/bin/rand-node /root/rand-node.prev; install -m 755 /root/rand-node.new /usr/local/bin/rand-node; install -m 755 /root/rand.new /usr/local/bin/rand; rm -f /root/rand-node.new /root/rand.new; echo \"   \$(hostname): installed \$(/usr/local/bin/rand-node --version)\"" 2>&1 | tail -1
+  ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip "set -e; [ \"\$(sha256sum /root/rand-node.new | cut -d' ' -f1)\" = \"$WANT\" ] && [ \"\$(sha256sum /root/rand.new | cut -d' ' -f1)\" = \"$WANT_WALLET\" ] || { echo '   sha mismatch, skipping'; rm -f /root/rand-node.new /root/rand.new; exit 1; }; cp -f /usr/local/bin/rand-node /root/rand-node.prev; install -m 755 /root/rand-node.new /usr/local/bin/rand-node; install -m 755 /root/rand.new /usr/local/bin/rand; rm -f /root/rand-node.new /root/rand.new; echo \"   \$(hostname): installed \$(/usr/local/bin/rand-node --version)\"" 2>&1 | tail -1
 done
 echo "== stop all $(date -u +%H:%M:%S)"
 launchctl bootout gui/$(id -u)/org.randprotocol.node-a 2>/dev/null && echo "   A stopped"

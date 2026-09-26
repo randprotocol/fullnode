@@ -21,6 +21,10 @@
 #                   $KEYDIR/public/nodes-chain14.env). Required: with stale bootstraps a droplet
 #                   dials peer ids that no longer exist.
 #     PIN           the build sha written to /root/.update-pin (node B's auto-updater reads it)
+#     WANT_SHA, WANT_SHA_WALLET
+#                   the release's sha256 of rand-node and of rand; both or neither (WANT_SHA alone
+#                   is refused — rand is installed and run as root too). Without them the build
+#                   host's own shas are trusted, with a warning.
 #
 # The old chain-13 data dir is left in place — it is keyed on its own genesis hash, so it never
 # collides — and the previous unit is kept at /root/<service>.service.chain13.bak. That pair is
@@ -59,13 +63,25 @@ $SSH "install -d -m 700 $REMOTE_KEYDIR"
 scp -o StrictHostKeyChecking=accept-new "$KEY" "root@$IP:$REMOTE_KEYDIR/node-$NAME.key.json"
 $SSH "chmod 600 $REMOTE_KEYDIR/node-$NAME.key.json"
 
-# The chain-14 binaries, fanned out droplet-to-droplet over the forwarded agent, and checked
-# against the build host's sha256 before anything is installed.
-WANT=$(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$BUILD_HOST "sha256sum $BUILD_DIR/$BIN_NODE | cut -d' ' -f1")
+# The chain-14 binaries, fanned out droplet-to-droplet over the forwarded agent, and BOTH checked
+# (rand-node and the rand wallet, which runs as root below — OPS-2) before anything is installed:
+# against WANT_SHA / WANT_SHA_WALLET when given, else against the build host's own sha256.
+host_sha() { ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$BUILD_HOST "sha256sum $BUILD_DIR/$1 | cut -d' ' -f1"; }
+if [ -n "${WANT_SHA:-}" ]; then
+  [ -n "${WANT_SHA_WALLET:-}" ] || { echo "cutover14: WANT_SHA is set but WANT_SHA_WALLET is not — pass the release's sha256 of $BIN_WALLET too" >&2; exit 1; }
+  WANT=$WANT_SHA; WANT_WALLET=$WANT_SHA_WALLET
+  [ "$(host_sha "$BIN_NODE")" = "$WANT" ] || { echo "cutover14: $BUILD_HOST's $BIN_NODE is not the release's ${WANT:0:12}" >&2; exit 1; }
+  [ "$(host_sha "$BIN_WALLET")" = "$WANT_WALLET" ] || { echo "cutover14: $BUILD_HOST's $BIN_WALLET is not the release's ${WANT_WALLET:0:12}" >&2; exit 1; }
+else
+  [ -z "${WANT_SHA_WALLET:-}" ] || { echo "cutover14: WANT_SHA_WALLET is set but WANT_SHA is not — pass both" >&2; exit 1; }
+  echo "cutover14: warning: no WANT_SHA/WANT_SHA_WALLET — trusting $BUILD_HOST's own shas" >&2
+  WANT=$(host_sha "$BIN_NODE"); WANT_WALLET=$(host_sha "$BIN_WALLET")
+fi
 $SSH "set -e
   scp -o StrictHostKeyChecking=accept-new root@$BUILD_HOST:$BUILD_DIR/$BIN_NODE root@$BUILD_HOST:$BUILD_DIR/$BIN_WALLET /root/
   chmod 755 /root/$BIN_NODE /root/$BIN_WALLET
-  [ \"\$(sha256sum /root/$BIN_NODE | cut -d' ' -f1)\" = \"$WANT\" ] || { echo 'copied $BIN_NODE does not match the build host — not touching this node' >&2; exit 1; }"
+  [ \"\$(sha256sum /root/$BIN_NODE | cut -d' ' -f1)\" = \"$WANT\" ] || { echo 'copied $BIN_NODE does not match the expected sha — not touching this node' >&2; exit 1; }
+  [ \"\$(sha256sum /root/$BIN_WALLET | cut -d' ' -f1)\" = \"$WANT_WALLET\" ] || { echo 'copied $BIN_WALLET does not match the expected sha — not touching this node' >&2; exit 1; }"
 
 # The genesis hash, computed on the droplet by the NEW binary, before any stop. A mismatch here
 # is a wrong file or a wrong build and costs nothing.

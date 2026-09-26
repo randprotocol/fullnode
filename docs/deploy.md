@@ -125,6 +125,14 @@ are never refused. `deploy/fleet-watch.sh` (every five minutes from the laptop v
 mixed builds or an unreachable droplet; `update-droplet.sh` takes `WANT_SHA=<release sha>` and
 verifies the binary against that rather than the build host's own.
 
+**Both binaries are checked (ops review OPS-2).** The `rand` wallet binary is installed beside
+`rand-node` and run as root by the roll scripts, so it is verified exactly like the node:
+`update-droplet.sh` and `cutover-droplet-chain14.sh` take `WANT_SHA_WALLET=<release sha of rand>`
+beside `WANT_SHA`, check the build host's copy and the droplet's copy of each before anything is
+installed, and refuse `WANT_SHA` without `WANT_SHA_WALLET`; `roll-all.sh` takes the wallet's sha
+as its fourth argument (or `WANT_SHA_WALLET`) and refuses a roll without it. A release's
+annotation therefore names two sha256s: `rand-node` and `rand`.
+
 **Disk guard (audit v4 OPS-3).** A node refuses to start under 1 GB free on its data directory's
 filesystem (`--min-free-disk-mb`, default 1024, names the directory and the flag), and
 `rand_getHealth` answers `disk_low` with the free byte count under 4 GB, re-measured every status
