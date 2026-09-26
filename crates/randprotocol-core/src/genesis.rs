@@ -412,6 +412,10 @@ pub enum GenesisError {
     /// cannot also hand out free RAND.
     #[error("a staking section refuses a faucet on a bridged chain (faucet: true with a bridge section)")]
     FaucetWithBridge,
+    /// A `staking` section field no chain could run: a weight cap outside `1..=10000` basis
+    /// points, or a zero entry budget (nothing would ever become weight).
+    #[error("bad staking config: {0}")]
+    BadStaking(String),
     #[error("bad hc_bundle {0} (64 hex characters)")]
     BadHcBundle(String),
     #[error("bad alloc note {0}")]
@@ -577,6 +581,16 @@ impl Genesis {
         if self.staking.is_some() && self.faucet && self.bridge.is_some() {
             return Err(GenesisError::FaucetWithBridge);
         }
+        if let Some(s) = &self.staking {
+            if let Some(bps) = s.max_weight_bps {
+                if bps == 0 || bps > crate::ledger::staking::MAX_WEIGHT_BPS {
+                    return Err(GenesisError::BadStaking(format!("max_weight_bps {bps} is outside 1..=10000")));
+                }
+            }
+            if s.max_stake_entry_per_epoch == Some(0) {
+                return Err(GenesisError::BadStaking("max_stake_entry_per_epoch 0 would admit no stake ever".into()));
+            }
+        }
         Ok(())
     }
 
@@ -620,6 +634,12 @@ impl Genesis {
             );
         }
         let validators = ValidatorSet::from_entries(register.values().map(|e| (&e.public_key, e.stake)));
+        // The weight cap (`staking.max_weight_bps`) holds from epoch 0: the genesis set is the
+        // one set not derived by `derive_set_with`, so it is capped here by the same function.
+        let validators = match self.staking.as_ref().and_then(|s| s.max_weight_bps) {
+            Some(bps) => crate::ledger::staking::cap_weights(validators, bps),
+            None => validators,
+        };
 
         let hc_bundle = word8_from_hex(&self.hc_bundle).ok_or_else(|| GenesisError::BadHcBundle(self.hc_bundle.clone()))?;
         let mut ledger = Ledger::new(self.chain_id, hc_bundle, register.clone(), executor);
@@ -837,6 +857,21 @@ impl Genesis {
             commit.extend_from_slice(b"staking");
             commit.extend_from_slice(&s.faucet_budget_per_epoch.to_be_bytes());
             commit.extend_from_slice(&s.bond_activation_epochs.to_be_bytes());
+            // The v4 re-review's three fields, each tagged and appended only when set, in this
+            // fixed order, so a section without them hashes exactly as v0.5.4's did.
+            if let Some(bps) = s.max_weight_bps {
+                commit.extend_from_slice(b"max_weight_bps");
+                commit.extend_from_slice(&bps.to_be_bytes());
+            }
+            if let Some(n) = s.max_stake_entry_per_epoch {
+                commit.extend_from_slice(b"max_stake_entry_per_epoch");
+                commit.extend_from_slice(&n.to_be_bytes());
+            }
+            // Like `bound_note_value`: `false` is today's rule and commits nothing.
+            if s.registration_v2 == Some(true) {
+                commit.extend_from_slice(b"registration_v2");
+                commit.push(1);
+            }
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -2445,7 +2480,7 @@ mod tests {
         let unsectioned = build(&g);
         assert!(unsectioned.ledger.staking().is_none());
         assert!(!g.to_json().contains("staking"), "and its file never mentions the section");
-        let cfg = StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2 };
+        let cfg = StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2, ..Default::default() };
         g.staking = Some(cfg.clone());
         assert!(matches!(g.validate(), Err(GenesisError::FaucetWithBridge)), "{:?}", g.validate());
         assert!(matches!(g.build(&StubExecutor), Err(GenesisError::FaucetWithBridge)));
@@ -2481,5 +2516,56 @@ mod tests {
             "e845c110b5e366acf87806cb7f09cc212ad47008cac7cafbd141c30da4c738d4",
             "the pin `a_bridge_section_is_accepted_and_only_a_bridged_chain_changes` guards, unchanged"
         );
+    }
+
+    /// The v4 re-review's three `staking` fields ride the section's own gate one level down:
+    /// each is omitted from the file and from the genesis binding when absent — a v0.5.4-shaped
+    /// section hashes exactly as it did — committed by name when present, bounded at
+    /// `validate`, and the weight cap holds from the genesis set itself.
+    #[test]
+    fn the_later_staking_fields_are_committed_only_when_present_and_bounded() {
+        // Four equal stakes: a 3333-bps cap does not bind on them, so only the field's own
+        // commitment can move the hash.
+        let mut base = genesis(4);
+        base.staking = Some(StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2, ..Default::default() });
+        let plain = build(&base);
+        let json = base.to_json();
+        for name in ["max_weight_bps", "max_stake_entry_per_epoch", "registration_v2"] {
+            assert!(!json.contains(name), "{name} is absent from a file that does not set it");
+        }
+        // Each field moves the hash, and a `false` flag commits exactly what an absent one does.
+        let with = |f: fn(&mut StakingConfig)| {
+            let mut g = base.clone();
+            f(g.staking.as_mut().unwrap());
+            g
+        };
+        let capped = with(|s| s.max_weight_bps = Some(3333));
+        let budgeted = with(|s| s.max_stake_entry_per_epoch = Some(5 * MIN_STAKE));
+        let bound = with(|s| s.registration_v2 = Some(true));
+        let unbound = with(|s| s.registration_v2 = Some(false));
+        for g in [&capped, &budgeted, &bound] {
+            assert_ne!(build(g).hash(), plain.hash(), "{:?}", g.staking);
+            assert_eq!(Genesis::from_json(&g.to_json()).unwrap(), *g, "the file round-trips it");
+        }
+        assert_eq!(build(&unbound).hash(), plain.hash(), "`false` is today's rule");
+        assert_ne!(build(&with(|s| s.max_weight_bps = Some(3334))).hash(), build(&capped).hash());
+        assert_ne!(build(&with(|s| s.max_stake_entry_per_epoch = Some(6 * MIN_STAKE))).hash(), build(&budgeted).hash());
+        assert!(budgeted.to_json().contains("\"max_stake_entry_per_epoch\": \"5000000000000\""), "an amount is a decimal string");
+        assert_eq!(build(&capped).validators, plain.validators, "a cap that does not bind changes no weight");
+        // The genesis set is capped from epoch 0: the whale holds 100 of 103 MIN_STAKE unclamped.
+        let mut whaled = base.clone();
+        whaled.validators[0].stake = 100 * MIN_STAKE as u128;
+        let whale = whaled.validators[0].public_key.address();
+        assert_eq!(build(&whaled).validators.get(&whale).unwrap().stake, 100 * MIN_STAKE as u128);
+        whaled.staking.as_mut().unwrap().max_weight_bps = Some(3333);
+        let set = build(&whaled).validators;
+        let w = set.get(&whale).unwrap().stake;
+        assert!(w * 10_000 <= 3333 * set.total_stake() && !set.has_third(w), "{w} of {}", set.total_stake());
+        // Bounds.
+        for g in [with(|s| s.max_weight_bps = Some(0)), with(|s| s.max_weight_bps = Some(10_001))] {
+            assert!(matches!(g.validate(), Err(GenesisError::BadStaking(_))), "{:?}", g.staking);
+        }
+        assert!(with(|s| s.max_weight_bps = Some(10_000)).validate().is_ok());
+        assert!(matches!(with(|s| s.max_stake_entry_per_epoch = Some(0)).validate(), Err(GenesisError::BadStaking(_))));
     }
 }

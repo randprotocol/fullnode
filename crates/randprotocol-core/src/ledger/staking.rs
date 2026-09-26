@@ -23,7 +23,9 @@ use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, PublicKey, Signature};
 use crate::gas;
 use crate::notes::{ShieldedAddress, Word8, KEM_EK_BYTES};
-use crate::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
+use crate::types::actions::{
+    registration_message, registration_message_v2, unbond_message, withdraw_message, Registration,
+};
 use crate::types::{Action, Transaction, ValidatorSet, UNITS_PER_RAND};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -76,12 +78,55 @@ pub struct ValidatorEntry {
 /// `faucet_budget_per_epoch` is in RAND's base unit, and rides in the genesis file as a decimal
 /// string like every amount an RPC serves; `bond_activation_epochs` is the number of whole
 /// epochs a new bond waits *beyond* the boundary it would have joined at.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Three later fields close the gaps the v4 re-review listed (admission, weight cap, proof of
+/// possession). Each is optional inside the optional section, omitted from the file when
+/// absent and committed to the genesis hash only when present, so a v0.5.4-shaped section
+/// hashes byte-for-byte as it did:
+///
+/// - `max_weight_bps`: no validator's voting weight exceeds this fraction of its set's total,
+///   in basis points (3333 = one third) — [`cap_weights`];
+/// - `max_stake_entry_per_epoch`: the most stake, new entries and top-ups together, that may
+///   become voting weight at one epoch boundary; the rest waits its turn in the bond queue
+///   ([`QueuedStake`], `Ledger::admit_queued_stake`);
+/// - `registration_v2`: a `Bond`'s registration is signed over [`registration_message_v2`] —
+///   the genesis hash and the validator's address beside the chain id and the payout — instead
+///   of the v1 message. Only `true` switches it on.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StakingConfig {
     #[serde(with = "amount_string")]
     pub faucet_budget_per_epoch: u64,
     pub bond_activation_epochs: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_weight_bps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_amount_string")]
+    pub max_stake_entry_per_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_v2: Option<bool>,
+}
+
+/// The largest `max_weight_bps` means anything: 10 000 is the whole set, i.e. no cap.
+pub const MAX_WEIGHT_BPS: u32 = 10_000;
+
+/// Stake bonded under a `staking` section that is not voting weight yet (the v4 re-review's
+/// "admission" and "delay" gaps). Every `Bond` under the section — a registration and a top-up
+/// alike — adds its amount to the entry's `stake` at once (so the supply audit, the register's
+/// RPC rows and the overflow bound see bonded value where it is) *and* queues it here, and
+/// [`derive_set_with`] subtracts what is still queued from the entry's weight.
+///
+/// `epoch` is the first epoch the amount may be weight in: `e + 1 + bond_activation_epochs` for a
+/// bond in epoch `e`, the registration's `activation_epoch` and a top-up's alike. The queue is in
+/// the order the bonds were applied, and that order is the admission order: at each epoch
+/// boundary `Ledger::admit_queued_stake` walks it front to back, admits what is due up to
+/// `max_stake_entry_per_epoch` and moves the rest of what was due to the next epoch, in place.
+/// Consensus state under the section: hashed into the state root and persisted beside
+/// `META_SUPPLY`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedStake {
+    pub validator: Address,
+    pub amount: u64,
+    pub epoch: u64,
 }
 
 /// A `u64` amount as a decimal string in the genesis file (the RPC's amount convention). A
@@ -104,6 +149,24 @@ mod amount_string {
             Repr::Number(n) => Ok(n),
             Repr::Text(t) => t.parse().map_err(|_| serde::de::Error::custom(format!("not a decimal amount: {t:?}"))),
         }
+    }
+}
+
+/// `Option<u64>` as [`amount_string`] writes a `u64`: a decimal string when present.
+mod opt_amount_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(n) => super::amount_string::serialize(n, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        #[derive(Deserialize)]
+        struct Wrap(#[serde(with = "super::amount_string")] u64);
+        Ok(Option::<Wrap>::deserialize(d)?.map(|w| w.0))
     }
 }
 
@@ -158,13 +221,85 @@ pub enum StakingError {
 /// is not in the set, whatever its stake (audit v4, STAKE-2 rule 3). On a chain without a
 /// `staking` section every entry's activation epoch is 0 and the argument changes nothing.
 pub fn derive_set(register: &BTreeMap<Address, ValidatorEntry>, epoch: u64) -> ValidatorSet {
-    let mut eligible: Vec<(&Address, &ValidatorEntry)> =
-        register.iter().filter(|(_, e)| e.stake >= MIN_STAKE && e.activation_epoch <= epoch).collect();
-    // Descending stake, then ascending address: the cap must not depend on map order.
-    eligible.sort_by(|(a_addr, a), (b_addr, b)| b.stake.cmp(&a.stake).then_with(|| a_addr.cmp(b_addr)));
+    derive_set_with(register, &[], epoch, None)
+}
+
+/// [`derive_set`] under a `staking` section's later fields: an entry's weight is its stake less
+/// what of it is still queued for an epoch past `epoch` (the bond queue, [`QueuedStake`]), the
+/// minimum, the activation epoch and the [`MAX_VALIDATORS`] cut are applied to that weight, and
+/// the survivors' weights are then capped by [`cap_weights`] when `max_weight_bps` is set.
+///
+/// This is the only place a `ValidatorSet`'s weights come from after genesis, so every reader
+/// of them — the quorum and third checks, QC verification, the leader schedule's set — reads
+/// the capped weights and nothing else. With an empty queue and no cap it is [`derive_set`].
+pub fn derive_set_with(
+    register: &BTreeMap<Address, ValidatorEntry>,
+    queue: &[QueuedStake],
+    epoch: u64,
+    max_weight_bps: Option<u32>,
+) -> ValidatorSet {
+    let mut waiting: BTreeMap<&Address, u64> = BTreeMap::new();
+    for q in queue.iter().filter(|q| q.epoch > epoch) {
+        let w = waiting.entry(&q.validator).or_default();
+        *w = w.saturating_add(q.amount);
+    }
+    let mut eligible: Vec<(&Address, &ValidatorEntry, u64)> = register
+        .iter()
+        .map(|(a, e)| (a, e, e.stake.saturating_sub(waiting.get(a).copied().unwrap_or(0))))
+        .filter(|(_, e, weight)| *weight >= MIN_STAKE && e.activation_epoch <= epoch)
+        .collect();
+    // Descending weight, then ascending address: the cut must not depend on map order.
+    eligible.sort_by(|(a_addr, _, a), (b_addr, _, b)| b.cmp(a).then_with(|| a_addr.cmp(b_addr)));
     eligible.truncate(MAX_VALIDATORS);
     // `ValidatorSet::new` puts the survivors back in address order.
-    ValidatorSet::from_entries(eligible.into_iter().map(|(_, e)| (&e.public_key, e.stake)))
+    let set = ValidatorSet::from_entries(eligible.into_iter().map(|(_, e, weight)| (&e.public_key, weight)));
+    match max_weight_bps {
+        Some(bps) => cap_weights(set, bps),
+        None => set,
+    }
+}
+
+/// Clamp every weight in `set` so that no validator holds more than `max_weight_bps` / 10 000 of
+/// the set's (clamped) total — the v4 re-review's weight cap. One level `C` is found and every
+/// weight above it is lowered to it; weights below it are untouched, and the result is a pure
+/// function of the multiset of weights (ties cannot matter: equal weights clamp equally).
+///
+/// Clamping lowers the total, so a cap computed once from the unclamped total is not enough.
+/// With the weights sorted descending `w_0 ≥ w_1 ≥ … ≥ w_{n-1}`, `b = max_weight_bps` and
+/// `R_k = w_k + … + w_{n-1}`, clamping exactly the top `k` to `C` needs `C ≤ b·(k·C + R_k)/10⁴`,
+/// whose largest integer solution is `C_k = ⌊b·R_k / (10⁴ − b·k)⌋`. The smallest `k` with
+/// `C_k ≥ w_k` is taken: then every clamped weight exceeds `C_k` (the `k − 1` case failed, which is
+/// `C_k < w_{k−1}` exactly), no unclamped one does, and `C_k ≤ b·total/10⁴` by construction.
+/// `k = 0` is a set already under the cap, returned unchanged.
+///
+/// A set with fewer than ⌈10⁴ / b⌉ members cannot meet the cap at all (three equal validators
+/// hold a third each, above 3 333 basis points); no `k` qualifies, and every weight is levelled
+/// to the smallest — the closest to the cap such a set can come. `b ≥ 10 000` changes nothing;
+/// genesis refuses 0 (`Genesis::validate`).
+pub fn cap_weights(set: ValidatorSet, max_weight_bps: u32) -> ValidatorSet {
+    const DENOM: u128 = MAX_WEIGHT_BPS as u128;
+    let b = u128::from(max_weight_bps);
+    if b >= DENOM || set.is_empty() {
+        return set;
+    }
+    let mut w: Vec<u128> = set.iter().map(|v| v.stake).collect();
+    w.sort_unstable_by(|x, y| y.cmp(x));
+    let mut suffix = vec![0u128; w.len() + 1];
+    for k in (0..w.len()).rev() {
+        suffix[k] = suffix[k + 1].saturating_add(w[k]);
+    }
+    let mut level = w[w.len() - 1];
+    for k in 0..w.len() {
+        let Some(den) = DENOM.checked_sub(b * k as u128).filter(|d| *d > 0) else { break };
+        let c = b.saturating_mul(suffix[k]) / den;
+        if c >= w[k] {
+            level = c;
+            break;
+        }
+    }
+    ValidatorSet::new(
+        set.iter().map(|v| crate::types::Validator { public_key: v.public_key.clone(), stake: v.stake.min(level) }).collect(),
+    )
 }
 
 impl Ledger {
@@ -282,7 +417,7 @@ impl Ledger {
                 // whole epochs past the boundary it would otherwise have joined at (`epoch() +
                 // 1`). Without the section the field stays 0 — today's rule, and today's leaf.
                 let activation_epoch = match self.staking() {
-                    Some(cfg) => self.epoch().saturating_add(1).saturating_add(u64::from(cfg.bond_activation_epochs)),
+                    Some(_) => self.bond_activation_epoch(),
                     None => 0,
                 };
                 self.validators.insert(
@@ -303,7 +438,75 @@ impl Ledger {
                 e.stake = e.stake.checked_add(amount).ok_or(StakingError::Overflow)?;
             }
         }
+        // Under the section every bonded amount, a top-up of an active entry included, waits
+        // in the bond queue for its activation epoch and its turn (the v4 re-review's "delay"
+        // and "admission" gaps). Before this a top-up was weight at the very next boundary
+        // whatever `bond_activation_epochs` said, so an active validator could skip the delay
+        // a fresh key served.
+        if self.staking().is_some() {
+            let epoch = self.bond_activation_epoch();
+            self.queue_stake(validator, amount, epoch);
+        }
         Ok(())
+    }
+
+    /// The first epoch a bond applied now may be weight in, under a `staking` section:
+    /// `epoch() + 1 + bond_activation_epochs` (STAKE-2 rule 3).
+    fn bond_activation_epoch(&self) -> u64 {
+        let delay = self.staking().map_or(0, |cfg| u64::from(cfg.bond_activation_epochs));
+        self.epoch().saturating_add(1).saturating_add(delay)
+    }
+
+    /// Append to the bond queue, merged into the last row when it is the same validator's for
+    /// the same epoch — the queue is hashed into the state root, so a hundred top-ups in a row
+    /// are one row, as `unbond` keeps one `pending` row per release epoch. A zero amount queues
+    /// nothing.
+    fn queue_stake(&mut self, validator: Address, amount: u64, epoch: u64) {
+        if amount == 0 {
+            return;
+        }
+        match self.bond_queue.last_mut() {
+            // `stake` already holds this amount and did not overflow, so neither can a row of it.
+            Some(q) if q.validator == validator && q.epoch == epoch => q.amount = q.amount.saturating_add(amount),
+            _ => self.bond_queue.push(QueuedStake { validator, amount, epoch }),
+        }
+    }
+
+    /// What of `validator`'s stake is still in the bond queue, whatever its epoch: bonded, but
+    /// not yet weight, and not yet unbondable either.
+    pub fn queued_stake(&self, validator: &Address) -> u64 {
+        self.bond_queue
+            .iter()
+            .filter(|q| q.validator == *validator)
+            .fold(0u64, |acc, q| acc.saturating_add(q.amount))
+    }
+
+    /// The epoch boundary's half of the bond queue, run by `close_block` on the last block of
+    /// every epoch under a `staking` section, for `next_epoch`, the epoch the next block opens.
+    /// Front to back, in the order the bonds were applied: a row due by `next_epoch` is admitted
+    /// in full while the epoch's `max_stake_entry_per_epoch` lasts, in part when it runs out mid
+    /// row, and whatever of it is left keeps its place with its epoch moved to `next_epoch + 1`,
+    /// so [`derive_set_with`] — which reads this very ledger for `next_epoch`'s set — counts it
+    /// as waiting. Rows not yet due are passed over untouched. Without a budget every due row is
+    /// admitted, which is the delay rule alone.
+    pub(crate) fn admit_queued_stake(&mut self, next_epoch: u64) {
+        let Some(cfg) = self.staking() else { return };
+        let mut budget = cfg.max_stake_entry_per_epoch.unwrap_or(u64::MAX);
+        let mut kept = Vec::with_capacity(self.bond_queue.len());
+        for mut q in std::mem::take(&mut self.bond_queue) {
+            if q.epoch > next_epoch {
+                kept.push(q);
+                continue;
+            }
+            let admitted = q.amount.min(budget);
+            budget -= admitted;
+            if admitted < q.amount {
+                q.amount -= admitted;
+                q.epoch = next_epoch.saturating_add(1);
+                kept.push(q);
+            }
+        }
+        self.bond_queue = kept;
     }
 
     /// Move `amount` of `validator`'s stake into unbonding, released two epochs from now.
@@ -407,7 +610,16 @@ fn check_bond(
             if r.payout.kem_ek.len() != KEM_EK_BYTES {
                 return Err(StakingError::BadRegistration);
             }
-            if !r.public_key.verify(registration_message(chain_id, &r.payout).as_bytes(), &r.signature) {
+            // Under `staking.registration_v2` the registration is bound to this chain's genesis
+            // and to the validator's address as well (the v4 re-review's "proof of
+            // possession"): a v1 registration signed for another chain that shares the chain id
+            // bonds nothing here.
+            let v2 = ledger.staking().and_then(|s| s.registration_v2) == Some(true);
+            let message = match v2 {
+                true => registration_message_v2(&ledger.signing_domain().genesis, chain_id, validator, &r.payout),
+                false => registration_message(chain_id, &r.payout),
+            };
+            if !r.public_key.verify(message.as_bytes(), &r.signature) {
                 return Err(StakingError::BadSignature);
             }
             if amount < MIN_STAKE {
@@ -451,8 +663,12 @@ fn check_unbond(
     if amount == 0 {
         return Err(StakingError::ZeroAmount);
     }
-    if amount > e.stake {
-        return Err(StakingError::InsufficientStake { have: e.stake, want: amount });
+    // Only active stake unbonds: what is still in the bond queue is not weight yet, and letting
+    // it leave would let a bond skip the queue's order on its way back out. Without a section
+    // the queue is empty and this is the whole stake.
+    let have = e.stake.saturating_sub(ledger.queued_stake(validator));
+    if amount > have {
+        return Err(StakingError::InsufficientStake { have, want: amount });
     }
     Ok(())
 }
@@ -604,7 +820,9 @@ mod tests {
     use crate::crypto::{Address, Keypair, Signature};
     use crate::ledger::TIME_WINDOW;
     use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8};
-    use crate::types::actions::{registration_message, unbond_message, withdraw_message, Registration};
+    use crate::types::actions::{
+        registration_message, registration_message_v2, unbond_message, withdraw_message, Registration,
+    };
     use crate::types::Transaction;
     use std::collections::BTreeMap;
 
@@ -1285,7 +1503,7 @@ mod tests {
         let mut l = Ledger::new(CHAIN, HC, register(vec![entry(&genesis, MIN_STAKE, payout(1))]), &StubExecutor);
         l.set_epoch_blocks(10);
         l.set_height(1);
-        l.set_staking(Some(StakingConfig { faucet_budget_per_epoch: 0, bond_activation_epochs: 2 }));
+        l.set_staking(Some(StakingConfig { faucet_budget_per_epoch: 0, bond_activation_epochs: 2, ..Default::default() }));
         assert_eq!(l.epoch(), 0);
         bond_new(&mut l);
         assert_eq!(l.validators()[&newcomer.address()].activation_epoch, 3, "epoch 0 + 1 + 2");
@@ -1325,5 +1543,210 @@ mod tests {
         assert!(!derive_set(&reg, 4).contains(&key(2).address()));
         assert!(derive_set(&reg, 5).contains(&key(2).address()));
         assert_eq!(derive_set(&reg, 4).len(), 1);
+    }
+
+    /// A ledger at height 1 of ten-block epochs under a `staking` section, holding `entries`.
+    fn sectioned(entries: Vec<ValidatorEntry>, cfg: StakingConfig) -> Ledger {
+        let mut l = Ledger::new(CHAIN, HC, register(entries), &StubExecutor);
+        l.set_epoch_blocks(10);
+        l.set_height(1);
+        l.set_staking(Some(cfg));
+        l
+    }
+
+    /// Close the last block of the epoch `height` ends: what a replica does before the next
+    /// epoch's set is derived from this very ledger.
+    fn close_epoch(l: &mut Ledger, height: u64, proposer: &Address) {
+        l.set_height(height);
+        l.close_block(height, proposer);
+    }
+
+    fn weight(set: &ValidatorSet, k: &Keypair) -> Option<u128> {
+        set.get(&k.address()).map(|v| v.stake)
+    }
+
+    /// The v4 re-review's weight cap: under `max_weight_bps` no validator's weight exceeds that
+    /// fraction of its set's total — the total *after* clamping, which a one-pass cap at a third
+    /// of the unclamped total would miss. A faucet-bought whale holding 96% of the stake ends
+    /// with a third of the weight: no quorum alone, not even a blocking third.
+    #[test]
+    fn max_weight_bps_caps_every_weight_at_its_fraction_of_the_capped_total() {
+        let whale = key(1);
+        let small: Vec<Keypair> = (2..=5u8).map(key).collect();
+        let mut entries = vec![entry(&whale, 100 * MIN_STAKE, payout(1))];
+        entries.extend(small.iter().enumerate().map(|(i, k)| entry(k, MIN_STAKE, payout(i as u8 + 2))));
+        let cfg = StakingConfig { max_weight_bps: Some(3333), ..Default::default() };
+        let l = sectioned(entries.clone(), cfg);
+        let set = l.derive_next_set(1);
+        let w = weight(&set, &whale).unwrap();
+        let total = set.total_stake();
+        assert!(w * 10_000 <= 3333 * total, "the whale holds {w} of {total}: over 3333 bps");
+        assert!(!set.has_quorum(w) && !set.has_third(w), "one key can neither decide nor block");
+        for k in &small {
+            assert_eq!(weight(&set, k), Some(MIN_STAKE as u128), "a weight under the cap is untouched");
+        }
+        // Exactly the level the closed form names: k = 1 clamped, C = ⌊3333·4·MIN / (10⁴ − 3333)⌋.
+        assert_eq!(w, 3333 * 4 * MIN_STAKE as u128 / (10_000 - 3333));
+        // Without the field the set is the register, as it always was.
+        let uncapped = sectioned(entries, StakingConfig::default()).derive_next_set(1);
+        assert_eq!(weight(&uncapped, &whale), Some(100 * MIN_STAKE as u128));
+        assert!(uncapped.has_quorum(100 * MIN_STAKE as u128));
+    }
+
+    /// `cap_weights` over many sets: whenever the set is big enough to meet the cap
+    /// (`n · bps ≥ 10⁴`) the largest weight is within it, nothing below the level moves, and a
+    /// set too small to meet it is levelled to its smallest weight.
+    #[test]
+    fn cap_weights_meets_the_cap_whenever_the_set_can() {
+        let mut seed: u64 = 0x5eed;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        for round in 0..300 {
+            let n = 1 + (next() % 20) as usize;
+            let bps = [1000u32, 2500, 3333, 5000, 6667, 9999][(next() % 6) as usize];
+            let validators: Vec<crate::types::Validator> = (0..n)
+                .map(|i| crate::types::Validator {
+                    public_key: key(i as u8 + 1).public_key().clone(),
+                    stake: MIN_STAKE as u128 * (1 + (next() % 1000) as u128),
+                })
+                .collect();
+            let before = ValidatorSet::new(validators);
+            let after = cap_weights(before.clone(), bps);
+            let max = after.iter().map(|v| v.stake).max().unwrap();
+            let min_before = before.iter().map(|v| v.stake).min().unwrap();
+            if n as u128 * bps as u128 >= 10_000 {
+                assert!(max * 10_000 <= bps as u128 * after.total_stake(), "round {round}: n {n} bps {bps}");
+            } else {
+                assert!(after.iter().all(|v| v.stake == min_before), "round {round}: a small set is levelled");
+            }
+            for (b, a) in before.iter().zip(after.iter()) {
+                assert_eq!(b.address(), a.address());
+                assert!(a.stake <= b.stake);
+                assert!(a.stake == b.stake || a.stake == max, "round {round}: one level, nothing else moves");
+            }
+        }
+        // 10 000 basis points is no cap.
+        let set = ValidatorSet::from_entries([(key(1).public_key(), 50 * MIN_STAKE), (key(2).public_key(), MIN_STAKE)]);
+        assert_eq!(cap_weights(set.clone(), 10_000), set);
+    }
+
+    /// The v4 re-review's "delay" gap: before the bond queue a top-up of an *active* entry was
+    /// weight at the very next boundary, whatever `bond_activation_epochs` said — only a fresh
+    /// registration waited. Under the section a top-up now waits exactly as long, stays in the
+    /// entry's `stake` (the supply audit and the register rows see it) and cannot be unbonded
+    /// before it is weight.
+    #[test]
+    fn a_top_up_waits_its_activation_epochs_like_a_registration() {
+        let (a, b) = (key(1), key(2));
+        let cfg = StakingConfig { bond_activation_epochs: 2, ..Default::default() };
+        let mut l = sectioned(vec![entry(&a, MIN_STAKE, payout(1)), entry(&b, MIN_STAKE, payout(2))], cfg);
+        l.apply_tx(&bond_tx(&l, 10, &a, 5 * MIN_STAKE, None), &b.address(), &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&a.address()].stake, 6 * MIN_STAKE, "bonded at once");
+        assert_eq!(l.queued_stake(&a.address()), 5 * MIN_STAKE, "but queued");
+        assert_eq!(l.bond_queue(), &[QueuedStake { validator: a.address(), amount: 5 * MIN_STAKE, epoch: 3 }]);
+        close_epoch(&mut l, 9, &b.address());
+        assert_eq!(weight(&l.derive_next_set(1), &a), Some(MIN_STAKE as u128), "not weight at e + 1");
+        close_epoch(&mut l, 19, &b.address());
+        assert_eq!(weight(&l.derive_next_set(2), &a), Some(MIN_STAKE as u128), "nor at e + N");
+        // Queued stake is not unbondable: only the active MIN_STAKE is.
+        let greedy = unbond_tx(&a, 2 * MIN_STAKE, 0);
+        assert_eq!(
+            staking_err(l.validate(&greedy, &StubExecutor).unwrap_err()),
+            StakingError::InsufficientStake { have: MIN_STAKE, want: 2 * MIN_STAKE }
+        );
+        close_epoch(&mut l, 29, &b.address());
+        assert_eq!(weight(&l.derive_next_set(3), &a), Some(6 * MIN_STAKE as u128), "weight at e + N + 1");
+        assert!(l.bond_queue().is_empty(), "admitted rows leave the queue");
+        assert_eq!(l.validate(&unbond_tx(&a, 2 * MIN_STAKE, 0), &StubExecutor), Ok(()));
+        // Without the section nothing queues: a top-up is weight at the next boundary.
+        let mut plain = ledger(vec![entry(&a, MIN_STAKE, payout(1)), entry(&b, MIN_STAKE, payout(2))]);
+        plain.apply_tx(&bond_tx(&plain, 10, &a, 5 * MIN_STAKE, None), &b.address(), &StubExecutor).unwrap();
+        assert!(plain.bond_queue().is_empty());
+        assert_eq!(weight(&plain.derive_next_set(2), &a), Some(6 * MIN_STAKE as u128));
+    }
+
+    /// The v4 re-review's "admission" gap: `max_stake_entry_per_epoch` bounds the stake that
+    /// becomes weight at one boundary, registrations and top-ups together. What is due beyond it
+    /// waits for the next boundary in the order it was bonded, split mid-row if the budget runs
+    /// out there.
+    #[test]
+    fn stake_entering_one_epoch_is_capped_and_the_rest_waits_in_bond_order() {
+        let (g, x, y) = (key(1), key(2), key(3));
+        let cfg = StakingConfig { max_stake_entry_per_epoch: Some(2 * MIN_STAKE), ..Default::default() };
+        let mut l = sectioned(vec![entry(&g, 10 * MIN_STAKE, payout(1))], cfg);
+        let proposer = g.address();
+        l.apply_tx(&bond_tx(&l, 10, &x, 3 * MIN_STAKE, Some(registration(&x, payout(2)))), &proposer, &StubExecutor)
+            .unwrap();
+        l.record_anchor(1);
+        l.apply_tx(&bond_tx(&l, 20, &y, MIN_STAKE, Some(registration(&y, payout(3)))), &proposer, &StubExecutor)
+            .unwrap();
+        // Epoch 1's boundary admits 2·MIN of the 4·MIN due: two thirds of x's row, none of y's.
+        close_epoch(&mut l, 9, &proposer);
+        let set = l.derive_next_set(1);
+        assert_eq!(weight(&set, &x), Some(2 * MIN_STAKE as u128));
+        assert_eq!(weight(&set, &y), None, "y waits behind x");
+        assert_eq!(
+            l.bond_queue(),
+            &[
+                QueuedStake { validator: x.address(), amount: MIN_STAKE, epoch: 2 },
+                QueuedStake { validator: y.address(), amount: MIN_STAKE, epoch: 2 },
+            ]
+        );
+        // Epoch 2's admits the rest.
+        close_epoch(&mut l, 19, &proposer);
+        let set = l.derive_next_set(2);
+        assert_eq!((weight(&set, &x), weight(&set, &y)), (Some(3 * MIN_STAKE as u128), Some(MIN_STAKE as u128)));
+        assert!(l.bond_queue().is_empty());
+        // A block that is not an epoch's last admits nothing.
+        let mut mid = sectioned(vec![entry(&g, 10 * MIN_STAKE, payout(1))], StakingConfig::default());
+        mid.apply_tx(&bond_tx(&mid, 10, &x, MIN_STAKE, Some(registration(&x, payout(2)))), &proposer, &StubExecutor)
+            .unwrap();
+        close_epoch(&mut mid, 5, &proposer);
+        assert_eq!(mid.bond_queue().len(), 1);
+    }
+
+    /// The v4 re-review's "proof of possession" gap: the v1 registration binds the chain id and
+    /// the payout, not the chain's genesis nor the address it registers. Under
+    /// `registration_v2` only a `rand-register-2` signature over this genesis, this chain id,
+    /// this validator and this payout registers.
+    #[test]
+    fn registration_v2_binds_the_genesis_and_the_validator() {
+        let (g, x) = (key(1), key(2));
+        let genesis = crate::crypto::Hash::digest(b"this chain");
+        let cfg = StakingConfig { registration_v2: Some(true), ..Default::default() };
+        let mut l = sectioned(vec![entry(&g, MIN_STAKE, payout(1))], cfg);
+        l.set_signing_domain(crate::types::SigningDomain::v0(genesis));
+        let v2 = |over: &crate::crypto::Hash, validator: &Address| {
+            let msg = registration_message_v2(over, CHAIN, validator, &payout(2));
+            Registration { public_key: x.public_key().clone(), payout: payout(2), signature: x.sign(msg.as_bytes()) }
+        };
+        let bond = |r: Registration| bond_tx(&l, 10, &x, MIN_STAKE, Some(r));
+        assert_eq!(
+            staking_err(l.validate(&bond(registration(&x, payout(2))), &StubExecutor).unwrap_err()),
+            StakingError::BadSignature,
+            "a v1 registration"
+        );
+        let elsewhere = crate::crypto::Hash::digest(b"another chain, same id");
+        assert_eq!(
+            staking_err(l.validate(&bond(v2(&elsewhere, &x.address())), &StubExecutor).unwrap_err()),
+            StakingError::BadSignature,
+            "a v2 registration for another genesis"
+        );
+        assert_eq!(
+            staking_err(l.validate(&bond(v2(&genesis, &g.address())), &StubExecutor).unwrap_err()),
+            StakingError::BadSignature,
+            "a v2 registration naming another address"
+        );
+        assert_eq!(l.validate(&bond(v2(&genesis, &x.address())), &StubExecutor), Ok(()));
+        // Without the flag the v1 message is the rule, and a v2 signature is not it.
+        let mut plain = sectioned(vec![entry(&g, MIN_STAKE, payout(1))], StakingConfig::default());
+        plain.set_signing_domain(crate::types::SigningDomain::v0(genesis));
+        assert_eq!(plain.validate(&bond_tx(&plain, 10, &x, MIN_STAKE, Some(registration(&x, payout(2)))), &StubExecutor), Ok(()));
+        assert_eq!(
+            staking_err(plain.validate(&bond_tx(&plain, 10, &x, MIN_STAKE, Some(v2(&genesis, &x.address()))), &StubExecutor).unwrap_err()),
+            StakingError::BadSignature
+        );
     }
 }

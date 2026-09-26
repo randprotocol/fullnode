@@ -7,7 +7,8 @@ use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisOpeni
 use randprotocol_core::notes::{word8_to_hex, Envelope, ShieldedAddress};
 use randprotocol_core::types::actions::{
     aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message, aggregator_withdraw_message,
-    registration_message, unbond_message, withdraw_message, AggregatorRegistration, Registration,
+    registration_message, registration_message_v2, unbond_message, withdraw_message, AggregatorRegistration,
+    Registration,
 };
 use randprotocol_zkvm::machine::FriProfile;
 use randprotocol_core::{format_amount, parse_amount};
@@ -397,6 +398,12 @@ enum Cmd {
         /// id, so one written for the wrong chain is simply refused.
         #[arg(long, default_value = "http://127.0.0.1:8545")]
         rpc: String,
+        /// Sign the v2 registration (`rand-register-2`: the chain's genesis hash, read from
+        /// `--rpc`, and the validator's address beside the chain id and payout). Required on a
+        /// chain whose genesis sets `staking.registration_v2`; a v1 registration is refused
+        /// there, and a v2 one everywhere else.
+        #[arg(long)]
+        v2: bool,
     },
     /// Move bonded stake into unbonding. Withdrawable two epochs later; free.
     Unbond {
@@ -717,12 +724,17 @@ async fn main() -> Result<()> {
             let v = RpcClient::new(rpc).status().await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
-        Cmd::Register { key, payout, rpc } => {
+        Cmd::Register { key, payout, rpc, v2 } => {
             let kp = load_keypair(&key)?;
-            let chain_id = RpcClient::new(rpc).chain_id().await?;
+            let client = RpcClient::new(rpc);
+            let chain_id = client.chain_id().await?;
             let payout = ShieldedAddress::parse(&payout)
                 .map_err(|e| anyhow::anyhow!("{payout} is not a shielded address: {e}"))?;
-            let signature = kp.sign(registration_message(chain_id, &payout).as_bytes());
+            let message = match v2 {
+                true => registration_message_v2(&client.genesis_hash().await?, chain_id, &kp.address(), &payout),
+                false => registration_message(chain_id, &payout),
+            };
+            let signature = kp.sign(message.as_bytes());
             let registration = Registration { public_key: kp.public_key().clone(), payout, signature };
             println!(
                 "validator {} on chain {chain_id}\nregistration: {}",
@@ -1130,6 +1142,26 @@ mod tests {
         assert_ne!(state.hc_bundle, ZkExecutor::hc_bundle());
         let refused = node::check_build_runs_genesis(&state, &ZkExecutor::hc_bundle()).unwrap_err().to_string();
         assert!(refused.contains("differs from the genesis hc_bundle"), "{refused}");
+    }
+
+    /// Chain 14, the running chain, byte for byte, after the v4 re-review's `staking` fields
+    /// (weight cap, entry budget, registration v2) and the bond queue: the file has no
+    /// `staking` section, so none of it may move its hash, its state root domain or its epoch-0
+    /// set by one bit — and it still loads and builds on this build.
+    #[test]
+    fn chain_14s_genesis_file_still_builds_chain_14() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain14.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(gen.staking.is_none(), "chain 14 carries no staking section");
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), "1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff");
+        assert!(state.ledger.staking().is_none() && state.ledger.bond_queue().is_empty());
+        // Every genesis validator's weight is its stake: no cap reached the set.
+        for v in &gen.validators {
+            assert_eq!(state.validators.get(&v.public_key.address()).unwrap().stake, v.stake);
+        }
+        assert!(!gen.to_json().contains("staking"), "rewriting the file adds no section");
     }
 
     /// `rand-node genesis --max-program-words N` writes the field; without the flag the file has

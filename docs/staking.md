@@ -87,9 +87,23 @@ byte-for-byte unchanged — on any chain whose genesis lacks it, chain 14 includ
   `activation_epoch = e + 1 + bond_activation_epochs`, and `derive_set` skips a row whose
   activation epoch is past the epoch it is deriving *for*: the bond is in no set for epochs
   `e + 1 ..= e + N` and joins at `e + N + 1`. Genesis validators carry 0 and are in every set from
-  epoch 0; a top-up of an existing row never moves its activation epoch. With
+  epoch 0; a top-up of an existing row never moves its activation epoch — but since the bond
+  queue below, the top-up's own amount waits exactly as long as a registration does. With
   `bond_activation_epochs: 0` the rule is exactly today's ("weight at the next boundary"). The
   field is hashed into the validator leaf (`rand-validator-leaf-4`) only under the section.
+- **The bond queue** (the v4 re-review's "delay" gap). Under the section every `Bond` — a
+  registration and a top-up of an active row alike — adds its amount to the row's `stake` at once
+  (the supply audit, `rand_getValidators` and the overflow bound see bonded value where it is)
+  *and* appends `(validator, amount, epoch = e + 1 + bond_activation_epochs)` to a ledger-wide
+  queue, in the order the bonds are applied (a validator's consecutive rows for one epoch merge).
+  A row's set weight is its `stake` less what of it is still queued for a later epoch, so before
+  the queue an active validator could top up and be weight at the very next boundary while a fresh
+  key served the whole delay; now neither can. Queued stake cannot be unbonded
+  (`InsufficientStake` names the active part). The last block of every epoch admits the rows due
+  at the next one (below), and admitted rows leave the queue. The queue is consensus state: its
+  root (`rand-bond-queue-1`, length then every row in order) is appended to the `rand-state-5`
+  root, it is persisted beside the supply counters (`META_BOND_QUEUE`) and `rand-node verify`
+  replays it.
 - **The faucet budget.** The ledger keeps `(faucet_epoch, faucet_minted_in_epoch)`; a `Mint` that
   would push the epoch's total over `faucet_budget_per_epoch` is refused
   (`FaucetBudgetExhausted`), and the counter starts from zero in the first block of the next
@@ -103,6 +117,50 @@ byte-for-byte unchanged — on any chain whose genesis lacks it, chain 14 includ
   genesis (`GenesisError::FaucetWithBridge`) once the section is present: free RAND against a
   chain holding bridged custody is what the finding is about. Chain 14's genesis has both and no
   section, so it still loads.
+
+Three further fields close what the v4 re-review still found open in the gated rules
+("admission, weight cap, proof of possession"). Each is optional *inside* the section, omitted
+from the file when absent, and committed to the genesis hash by name only when present, so a
+section without them hashes exactly as v0.5.4's did:
+
+```json
+"staking": {
+  "faucet_budget_per_epoch": "100000000000", "bond_activation_epochs": 2,
+  "max_weight_bps": 3333, "max_stake_entry_per_epoch": "10000000000000", "registration_v2": true
+}
+```
+
+- **`max_weight_bps` — the weight cap.** No validator's voting weight exceeds this fraction of its
+  set's total, in basis points (3333 = a third; `1..=10000`, 10 000 = no cap). The cap is applied
+  once, in `staking::cap_weights`, to every set `derive_set_with` derives and to the genesis set,
+  so the quorum and third checks, QC verification and everything else that reads a
+  `ValidatorSet` see the capped weights and nothing else; the register's `stake` is unchanged.
+  Clamping lowers the total, so a one-pass cap at a third of the unclamped total would leave the
+  clamped validator above a third of the new one. Instead one level `C` is computed: with the
+  weights sorted descending `w_0 ≥ … ≥ w_{n−1}` and `R_k = w_k + … + w_{n−1}`, clamping exactly the
+  top `k` needs `C ≤ b·(k·C + R_k)/10⁴`, whose largest integer solution is
+  `C_k = ⌊b·R_k / (10⁴ − b·k)⌋`; the smallest `k` with `C_k ≥ w_k` is taken, every weight above
+  `C_k` is lowered to it and nothing else moves. A set of fewer than ⌈10⁴ / b⌉ validators cannot
+  meet the cap at all (three equal validators hold a third each) and is levelled to its smallest
+  weight. A faucet-bought whale with 96 % of the stake ends with a third of the weight — no quorum
+  alone, and not even a blocking third. The cap binds one key, not one operator: many keys are
+  what the entry budget and the delay are for.
+- **`max_stake_entry_per_epoch` — the admission (churn) limit.** The most stake, registrations and
+  top-ups together, that may become weight at one epoch boundary, in RAND's base unit as a
+  decimal string (`> 0`). The last block of epoch `e − 1` walks the bond queue front to back and
+  admits the rows due by `e` while the budget lasts — a row in part when it runs out mid-row —
+  and moves whatever of the due rows is left to epoch `e + 1`, keeping its place. The set for `e`
+  is derived from that very ledger, so it counts exactly what was admitted. Absent, every due row
+  is admitted (the delay rule alone). A large bond at the head of the queue holds everyone behind
+  it for as many epochs as it needs — the price of an order nobody can jump.
+- **`registration_v2` — proof of possession, bound to the chain.** The v1 registration a new row
+  carries is the key's signature over `(chain_id, payout)` under `rand-register`: it proves the
+  key, but binds neither the chain's genesis (any chain sharing the id accepts it) nor the address
+  it registers. With `true` the registration is `rand-register-2` over
+  `(genesis hash, chain_id, validator address, payout)` — the genesis-hash binding the consensus
+  domain's v1 tags use — and a v1 registration is refused (`BadSignature`). `rand-node register
+  --v2` signs it (the genesis hash is read from `--rpc`). Absent or `false` is the v1 rule and
+  commits nothing.
 
 Not in v0.5.4: slashing (audit decision D8 — "it means nothing while stake is free").
 

@@ -180,6 +180,12 @@ const META_UNSEALED_FEES: &str = "unsealed_fees";
 /// next mint. Absent on a database written before the key existed and on every chain without
 /// the section, where it reads `(0, 0)` — which is what the ledger holds there too.
 const META_FAUCET_EPOCH: &str = "faucet_epoch";
+/// `bincode(Vec<QueuedStake>)`: the bond queue as of the head (the v4 re-review's admission and
+/// delay rules, `Ledger::bond_queue`). `META_FAUCET_EPOCH`'s twin in every respect: written at
+/// the same three sites, hashed into the state root under a `staking` section, audited by
+/// replay, and absent — read as empty — on a database written before the key existed and on
+/// every chain without the section, where the ledger's queue is empty too.
+const META_BOND_QUEUE: &str = "bond_queue";
 /// `bincode(u64)`: Σ of the registration fees burned under `tokens.burn_registration_fee` as of
 /// the head (audit v5, TOK-2, `Ledger::registration_fees_burned`). `META_SUPPLY`'s twin in every
 /// respect — derived, outside the root and `Ledger`'s equality, written at the same three sites,
@@ -681,6 +687,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_EPOCH_SETS), height_key(0), bincode::serialize(&gs.validators)?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&gs.ledger.supply())?);
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&gs.ledger.faucet_epoch_counters())?);
+        batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(gs.ledger.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&gs.ledger.registration_fees_burned())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
@@ -1027,6 +1034,12 @@ impl Storage {
     /// on a chain without a `staking` section is also the only value it ever holds.
     pub fn faucet_epoch_counters(&self) -> Result<(u64, u64)> {
         Ok(self.get_meta_raw(META_FAUCET_EPOCH)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    /// The bond queue as of the head — `faucet_epoch_counters()`'s twin, with the same rule for
+    /// a database written before the key existed: empty.
+    pub fn bond_queue(&self) -> Result<Vec<randprotocol_core::ledger::QueuedStake>> {
+        Ok(self.get_meta_raw(META_BOND_QUEUE)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
     }
 
     /// Σ of the registration fees burned under `tokens.burn_registration_fee` as of the head
@@ -1762,6 +1775,7 @@ impl Storage {
         ledger.set_supply(self.supply()?);
         let (faucet_epoch, faucet_minted) = self.faucet_epoch_counters()?;
         ledger.set_faucet_epoch_counters(faucet_epoch, faucet_minted);
+        ledger.set_bond_queue(self.bond_queue()?);
         ledger.set_registration_fees_burned(self.registration_fees_burned()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
@@ -2081,6 +2095,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger_after.tree())?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger_after.supply())?);
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger_after.faucet_epoch_counters())?);
+        batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger_after.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger_after.registration_fees_burned())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
@@ -2428,6 +2443,15 @@ impl Storage {
                     ledger.faucet_epoch_counters()
                 ))
             }
+            // The bond queue likewise: inside the equality, hashed under the section, and named
+            // so the repair knows the key.
+            Ok(stored) if stored.bond_queue() != ledger.bond_queue() => {
+                check.problem = Some(format!(
+                    "stored bond queue {:?} does not match the replayed chain's {:?}",
+                    stored.bond_queue(),
+                    ledger.bond_queue()
+                ))
+            }
             // The supply counters are outside `Ledger`'s equality (nothing hashes them), so they
             // are audited here explicitly: this is the replay the RPC's numbers are worth.
             Ok(stored) if stored == ledger && stored.supply() != ledger.supply() => {
@@ -2664,6 +2688,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger.tree())?);
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger.supply())?);
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger.faucet_epoch_counters())?);
+        batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger.registration_fees_burned())?);
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
@@ -5833,7 +5858,7 @@ mod tests {
     /// A genesis with the audit-v4 `staking` section (STAKE-2) on a faucet chain.
     fn staking_genesis(budget: u64) -> GenesisState {
         let mut g = genesis_file_of(7, &[&key(1)], vec![], 2);
-        g.staking = Some(randprotocol_core::genesis::StakingConfig { faucet_budget_per_epoch: budget, bond_activation_epochs: 1 });
+        g.staking = Some(randprotocol_core::genesis::StakingConfig { faucet_budget_per_epoch: budget, bond_activation_epochs: 1, ..Default::default() });
         g.build(&StubExecutor).unwrap()
     }
 
@@ -5929,6 +5954,53 @@ mod tests {
         // A database written before the key existed reads as `(0, 0)`, like the supply.
         s.db.delete_cf(s.cf(CF_META), META_FAUCET_EPOCH).unwrap();
         assert_eq!(s.faucet_epoch_counters().unwrap(), (0, 0));
+    }
+
+    /// The v4 re-review's bond queue is consensus state under a `staking` section, so — like
+    /// the faucet's counters — it is persisted beside `META_SUPPLY` on every commit, restored by
+    /// `load_ledger`, audited by `verify_chain`'s replay and rewritten by the repair: a node that
+    /// came back without it would seat stake its peers still hold back.
+    #[test]
+    fn the_bond_queue_is_persisted_beside_the_supply_restored_and_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = staking_genesis(100 * randprotocol_core::UNITS_PER_RAND);
+        s.init_genesis(&gs).unwrap();
+        assert!(s.bond_queue().unwrap().is_empty());
+
+        // Block 1 tops up the genesis validator: bonded at once, queued until epoch 2.
+        let amount = 5 * randprotocol_core::ledger::staking::MIN_STAKE;
+        let mut ledger = gs.ledger.clone();
+        let mut b = bundle(&ledger, [[31; 8], [32; 8]], [[33; 8], [34; 8]], randprotocol_core::gas::BUNDLE_BASE);
+        b.burn_r = amount;
+        b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
+        let action = Action::Bond { validator: key(1).address(), amount, registration: None };
+        let top_up = StubExecutor::bound(Transaction::shielded(7, b, action));
+        let b1 = make_block(&gs.block, &mut ledger, vec![top_up], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let queued = vec![randprotocol_core::ledger::QueuedStake { validator: key(1).address(), amount, epoch: 2 }];
+        assert_eq!(ledger.bond_queue(), &queued[..]);
+        assert_eq!(s.bond_queue().unwrap(), queued, "committed with the state");
+
+        // Restored, and the reloaded ledger hashes the same root.
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.bond_queue(), &queued[..]);
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A stale queue is named by the audit, and the repair rewrites it from the replay.
+        s.db.put_cf(s.cf(CF_META), META_BOND_QUEUE, bincode::serialize(&Vec::<randprotocol_core::ledger::QueuedStake>::new()).unwrap()).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("a stale queue is a problem");
+        assert!(problem.contains("bond queue"), "{problem}");
+        assert_eq!(check.last_good, 1, "the block itself is fine");
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.bond_queue().unwrap(), queued);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+        // A database written before the key existed reads as empty.
+        s.db.delete_cf(s.cf(CF_META), META_BOND_QUEUE).unwrap();
+        assert!(s.bond_queue().unwrap().is_empty());
     }
 
     /// STAKE-2 rule 3 added `activation_epoch` as the last field of the stored validator row.

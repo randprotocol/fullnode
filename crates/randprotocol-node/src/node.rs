@@ -3046,6 +3046,7 @@ mod tests {
         let cfg = randprotocol_core::genesis::StakingConfig {
             faucet_budget_per_epoch: 100 * randprotocol_core::UNITS_PER_RAND,
             bond_activation_epochs: 2,
+            ..Default::default()
         };
         g.staking = Some(cfg.clone());
         let gs = g.build(&StubExecutor).unwrap();

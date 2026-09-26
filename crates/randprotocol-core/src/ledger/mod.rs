@@ -39,7 +39,7 @@ pub const ANCHOR_WINDOW: usize = 256;
 /// is still live.
 pub const TIME_WINDOW: u64 = 256;
 
-pub use staking::{StakingError, ValidatorEntry};
+pub use staking::{QueuedStake, StakingError, ValidatorEntry};
 pub use supply::{register_total, Audit, Supply};
 
 /// A deposit note the ledger created itself while applying a transaction, rather than accepting
@@ -424,6 +424,10 @@ pub struct Ledger {
     /// reset lazily: a mint in a later epoch than `faucet_epoch` starts it from zero.
     faucet_epoch: u64,
     faucet_minted_in_epoch: u64,
+    /// The bond queue (`staking::QueuedStake`): bonded stake that is not voting weight yet, in
+    /// the order it was bonded. Consensus state on a chain with a `staking` section — folded
+    /// into the state root and persisted beside `META_SUPPLY` — and always empty without one.
+    bond_queue: Vec<staking::QueuedStake>,
     /// Σ of every registration fee burned under `tokens.burn_registration_fee` (audit v5,
     /// TOK-2). A supply counter in kind — derived, outside the state root and this ledger's
     /// equality, persisted beside `META_SUPPLY` and replay-audited — kept off [`Supply`] so
@@ -508,6 +512,8 @@ impl PartialEq for Ledger {
             // (audit v4, STAKE-2) and `(0, 0)` on both sides without one.
             && self.faucet_epoch == o.faucet_epoch
             && self.faucet_minted_in_epoch == o.faucet_minted_in_epoch
+            // The bond queue likewise: consensus state under the section, empty without one.
+            && self.bond_queue == o.bond_queue
     }
 }
 impl Eq for Ledger {}
@@ -543,6 +549,7 @@ impl Ledger {
             staking: None,
             faucet_epoch: 0,
             faucet_minted_in_epoch: 0,
+            bond_queue: Vec::new(),
             registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
@@ -592,6 +599,7 @@ impl Ledger {
             staking: None,
             faucet_epoch: 0,
             faucet_minted_in_epoch: 0,
+            bond_queue: Vec::new(),
             registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
@@ -655,8 +663,26 @@ impl Ledger {
     /// activation epoch decides whether it is in the set derived *for* that epoch (audit v4,
     /// STAKE-2 rule 3). A caller asking what the next boundary would derive passes
     /// `epoch() + 1`.
+    ///
+    /// Under the section's later fields the bond queue's waiting stake is not weight and the
+    /// weights are capped at `max_weight_bps` (`staking::derive_set_with`); without a section
+    /// the queue is empty and there is no cap, which is `staking::derive_set` exactly.
     pub fn derive_next_set(&self, epoch: u64) -> ValidatorSet {
-        staking::derive_set(&self.validators, epoch)
+        let cap = self.staking.as_ref().and_then(|s| s.max_weight_bps);
+        staking::derive_set_with(&self.validators, &self.bond_queue, epoch, cap)
+    }
+
+    /// The bond queue (`staking::QueuedStake`), oldest bond first: for the node's persistence
+    /// beside `META_SUPPLY` and the replay audit.
+    pub fn bond_queue(&self) -> &[staking::QueuedStake] {
+        &self.bond_queue
+    }
+
+    /// Restore the bond queue a node persisted beside the state — `set_faucet_epoch_counters`'s
+    /// twin: hashed into the root under a `staking` section, so a restarted node that lost it
+    /// would seat stake its peers still hold back, and fork at the next boundary.
+    pub fn set_bond_queue(&mut self, queue: Vec<staking::QueuedStake>) {
+        self.bond_queue = queue;
     }
 
     /// The `staking` section, or `None` on a chain without one — where the faucet has no
@@ -1874,6 +1900,14 @@ impl Ledger {
     /// (the pre-v0.1 review's L1).
     pub fn close_block(&mut self, height: u64, proposer: &Address) {
         self.sweep_expired_excesses(height, proposer);
+        // The last block of an epoch admits the bond queue's due stake for the next one, before
+        // the root: the next epoch's set is derived from exactly this ledger
+        // (`HotStuff::shared_set_for_height`, the sync paths), so the admission and the
+        // derivation read one state. A no-op without a `staking` section.
+        let blocks = self.epoch_blocks.max(1);
+        if self.staking.is_some() && height.saturating_add(1) % blocks == 0 {
+            self.admit_queued_stake(height.saturating_add(1) / blocks);
+        }
         self.record_anchor(height);
         // Spec §12's invariant, checked once per block in a debug build: every bridged token's
         // supply is exactly the sum of what its source-chain coins are holding locked. It holds
@@ -1971,6 +2005,19 @@ impl Ledger {
     /// re-domained `rand-state-4` — whether or not aggregation is also on, since a tokens-off
     /// chain must still fall through to today's `rand-state-2`/`rand-state-3` paths unchanged.
     /// The aggregators root, when present, is still the last component appended.
+    /// The bond queue as one hash: its length, then every row's validator, amount and epoch in
+    /// queue order (every field fixed-width, so the count alone makes the encoding unambiguous).
+    pub fn bond_queue_root(&self) -> Hash {
+        let mut buf = Vec::with_capacity(8 + 48 * self.bond_queue.len());
+        buf.extend_from_slice(&(self.bond_queue.len() as u64).to_be_bytes());
+        for q in &self.bond_queue {
+            buf.extend_from_slice(q.validator.as_bytes());
+            buf.extend_from_slice(&q.amount.to_be_bytes());
+            buf.extend_from_slice(&q.epoch.to_be_bytes());
+        }
+        Hash::digest_domain(b"rand-bond-queue-1", &buf)
+    }
+
     /// The proving-share bucket as one root: a leaf per entry, in the map's own (transaction-hash)
     /// order, each binding the whole entry.
     ///
@@ -1996,7 +2043,7 @@ impl Ledger {
 
     ///
     /// On a chain whose genesis has a `staking` section (audit v4, STAKE-2) the faucet's two
-    /// epoch counters are appended last and the whole thing is re-domained `rand-state-5`,
+    /// epoch counters and the bond queue's root are appended last and the whole thing is re-domained `rand-state-5`,
     /// whatever else is on — the section is gated exactly like the three before it, so a chain
     /// without one falls through to the domains above unchanged.
     pub fn state_root(&self) -> Hash {
@@ -2019,6 +2066,8 @@ impl Ledger {
         if self.staking.is_some() {
             buf.extend_from_slice(&self.faucet_epoch.to_be_bytes());
             buf.extend_from_slice(&self.faucet_minted_in_epoch.to_be_bytes());
+            // And the bond queue, whole and in order: its order is the admission order.
+            buf.extend_from_slice(self.bond_queue_root().as_bytes());
             return Hash::digest_domain(b"rand-state-5", &buf);
         }
         if self.tokens.is_some() {
@@ -3755,7 +3804,7 @@ mod tests {
         let budget = 100 * UNITS_PER_RAND;
         let mut l = ledger();
         l.set_epoch_blocks(10);
-        l.set_staking(Some(StakingConfig { faucet_budget_per_epoch: budget, bond_activation_epochs: 0 }));
+        l.set_staking(Some(StakingConfig { faucet_budget_per_epoch: budget, bond_activation_epochs: 0, ..Default::default() }));
         let (a, _) = keys();
         let mint = |l: &Ledger, seed: u32, amount: u64| {
             Transaction::mint(7, [seed; 8], l.height() as u32, [seed + 1; 8], env(), amount, &a, &StubExecutor)
@@ -3792,7 +3841,7 @@ mod tests {
     /// `rand-validator-leaf-4` leaf — and reach nothing without it.
     #[test]
     fn the_counters_and_the_activation_epoch_reach_the_root_only_under_the_staking_section() {
-        let cfg = StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2 };
+        let cfg = StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2, ..Default::default() };
         // The counters.
         let plain = ledger();
         let mut counted = plain.clone();
@@ -3819,6 +3868,24 @@ mod tests {
         };
         assert_eq!(root_of(0, None), root_of(5, None), "without the section the activation epoch is outside the leaf");
         assert_ne!(root_of(0, Some(cfg.clone())), root_of(5, Some(cfg.clone())), "under it the leaf binds it");
-        assert_ne!(root_of(0, Some(cfg)), root_of(0, None));
+        assert_ne!(root_of(0, Some(cfg.clone())), root_of(0, None));
+        // The bond queue (the v4 re-review's admission and delay rules): in the root under the
+        // section, row by row and in order, and outside it without one.
+        let row = |v: &Keypair, amount: u64| staking::QueuedStake { validator: v.address(), amount, epoch: 3 };
+        let with_queue = |q: Vec<staking::QueuedStake>, staking: Option<StakingConfig>| {
+            let mut l = ledger();
+            l.set_staking(staking);
+            l.set_bond_queue(q);
+            l.state_root()
+        };
+        let s = Some(cfg);
+        assert_eq!(with_queue(vec![row(&a, 5)], None), with_queue(vec![], None));
+        assert_ne!(with_queue(vec![row(&a, 5)], s.clone()), with_queue(vec![], s.clone()));
+        assert_ne!(with_queue(vec![row(&a, 5)], s.clone()), with_queue(vec![row(&a, 6)], s.clone()));
+        assert_ne!(
+            with_queue(vec![row(&a, 5), row(&b, 5)], s.clone()),
+            with_queue(vec![row(&b, 5), row(&a, 5)], s),
+            "the order is the admission order, so the root binds it"
+        );
     }
 }

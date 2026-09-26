@@ -233,6 +233,34 @@ The audit-v4 release (v0.5.4) added consensus rules that are switched on by gene
   `false` is chain 14's rule and commits nothing; `true` is committed under its own tag and folded
   into the token root. The admission screen refuses such an amount on every chain regardless.
 
+## The next cut: the STAKE-2 re-review's `staking` fields
+
+The v4 re-review found the gated `staking` section still lacked admission, a weight cap, proof of
+possession and a delay for top-ups (`docs/staking.md` §2). Three optional fields inside the section
+close them, each omitted from the file and from the genesis hash when absent; the bond queue that
+delays top-ups is on whenever the section is:
+
+```json
+"staking": {
+  "faucet_budget_per_epoch": "100000000000", "bond_activation_epochs": 2,
+  "max_weight_bps": 3333, "max_stake_entry_per_epoch": "10000000000000", "registration_v2": true
+}
+```
+
+- **`max_weight_bps`** (`1..=10000`) caps every validator's weight at that fraction of its set's
+  total, genesis set included. 3333 keeps any one key below a blocking third on a set of four or
+  more; a set smaller than ⌈10⁴ / bps⌉ is levelled to equal weights.
+- **`max_stake_entry_per_epoch`** (decimal string, `> 0`) is the most stake that may become weight
+  at one boundary; the rest waits in bond order. 10 000 RAND above is ten minimum bonds an epoch.
+- **`registration_v2: true`** makes a `Bond`'s registration sign `rand-register-2` over the genesis
+  hash and the validator's address: every validator that registers after the cut uses
+  `rand-node register --v2`, and a v1 registration is refused.
+
+Like the rest of the section: `rand-node genesis` never writes them, the cut script splices them
+in, and `rand-node init` on the finished file prints the hash that matters. Chain 14 has no
+section, and `rand-node`'s `chain_14s_genesis_file_still_builds_chain_14` pins its hash
+(`1cff3b7d…`) against all of it.
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and
@@ -250,8 +278,10 @@ worth per 1000-block epoch); `bond_activation_epochs` is how many whole epochs a
 past the boundary it would have joined at (0 = today's rule). On a bridged chain set
 `faucet: false` — a faucet beside a bridge is refused at `init` once the section is present. The
 section moves the state root domain to `rand-state-5` and the validator leaf to
-`rand-validator-leaf-4`, so it ships with a chain cut, never as a same-chain update; a node
-restores it from the genesis file on every restart (`reload_ledger`), never from the database.
+`rand-validator-leaf-4` and appends the bond queue's root to the state root, so it ships with a
+chain cut, never as a same-chain update; a node restores it from the genesis file on every restart
+(`reload_ledger`), never from the database. The bond queue itself is state, persisted as
+`META_BOND_QUEUE` beside the supply counters.
 
 ## Chain 9 activation (block aggregation)
 

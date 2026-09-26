@@ -189,6 +189,18 @@ pub fn registration_message(chain_id: u64, payout: &ShieldedAddress) -> Hash {
     Hash::digest_domain(b"rand-register", &bytes)
 }
 
+/// The registration message under a `staking` section's `registration_v2` (the v4 re-review's
+/// "proof of possession"). The v1 message binds the chain id and the payout; the key's
+/// signature already proves possession of the key, but nothing tied that proof to *this* chain
+/// rather than any chain sharing its id, nor named the address the bond registers. This one
+/// binds the genesis hash (the pattern of the consensus domain's v1 tags, `SigningDomain`) and
+/// the validator's address beside them, under its own tag, so a v1 signature never verifies as
+/// a v2 one and a v2 one verifies on exactly one chain.
+pub fn registration_message_v2(genesis: &Hash, chain_id: u64, validator: &Address, payout: &ShieldedAddress) -> Hash {
+    let bytes = bincode::serialize(&(genesis, chain_id, validator, payout)).expect("serializes");
+    Hash::digest_domain(b"rand-register-2", &bytes)
+}
+
 /// What a validator signs to move stake into unbonding. The register's `nonce` is the replay
 /// protection: there are no accounts on this chain to carry one.
 pub fn unbond_message(chain_id: u64, validator: &Address, amount: u64, nonce: u64) -> Hash {

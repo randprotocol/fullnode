@@ -4,7 +4,7 @@ pub mod transaction;
 pub mod validator;
 
 pub use actions::{
-    registration_message, set_authority_message, token_mint_message, unbond_message, withdraw_message,
+    registration_message, registration_message_v2, set_authority_message, token_mint_message, unbond_message, withdraw_message,
     AggregatorRegistration, CallEnvelope, InitialMint, Registration, SignedAggregateHeader, MAX_CALL_ENVELOPE_BYTES,
 };
 pub use block::{Block, BlockHeader, QuorumCertificate, Vote, SigningDomain};
