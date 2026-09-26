@@ -10,6 +10,7 @@ pub mod gas;
 pub mod genesis;
 pub mod ledger;
 pub mod notes;
+pub mod payment_uri;
 pub mod program;
 pub mod token_id;
 pub mod types;

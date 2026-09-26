@@ -2,6 +2,20 @@
   "fingerprints": [
     { "address": "rand18pdYjYn3mQ32Hzc7kzf8cwVK3UyNJpiEEnjHm2zSpGYY2uyRskgaDmDd9LDuUHbLjqo7EfguCcudiPnXorA1B16Cfbt9y815cDMaDXLp7WjWnmdhBqeJS8PZF6fGa4TUsxqBRm5ihqaR1AknXm9p7zXBSziZdwJgsALuS4X4NVStM3bkANWScfpdhyKftjCx4QJo6GyY9UKhE3HKi7TZVYCQY73WZSkY7XpBjQ9GRYaHpnuGvg5Yro2nQqQVkFVABf1KsTAo18uM9UgxLxjaQzJiHpBpT9r4MeTGXhiqWFFeg7yPiL25sN3WmoRuYBJxfsAwfE52y4qEGzp5sDvjfE5gKJG7rzydwpcECWxD8Gi3FdEqXT9WgFf6g9vEtuARoewEi41zBWK6ScXbVDPpEEEFptFNd6LxaGXDq74rrLtfch6mARA1R6zpwXpxE4XZUDV4F1FTLZ31NgAbvBse2FJdDR5657WdoM9zCLuwH9hBhzCNiuNmt9eyspeWBAYNcU7n8JwQK1s3EgfJaeutUyyfV2A5nUng7v4mSwoYbmHc7u31TrwxqDaynXWZZF5EhcpxXJm98gkR19ybBmpnoeyH1eWkmeo6mPmfic55euA4VuhzMhjJ2SPjrQME54yuZsGmHvz2CrN9GJfQUXzdjxmYf9CRS8s634i1n7bPqx76NUN8dCp2WfspmfNdSSeCK8TCaKp71WYMzD7KFsCkxbSEPzLYWd17GYGgrWecP8caYC1My36w8Pbqyez1GDatW7hnMi4VznDNBaz3K6NS82djJVSXAv6J7qvFZ4zr2FpD4mvrELW9jaSdeH6KtZj1FS7uVmzcjKip2MYKnxrzj7ynkrtNbxQyDHt5bPoXSgoPfWqJBjijdTAPVwvmxofQoXZvhhJupcRB6Z9fpfCjHPoE4LCRM1tif7jhg3bnxhrefyfjtCQs1L9ZfC2pHqgZXdFxeZBWGZL7uEmzZ3d7A7d9mPNH6j4AwFXobNc6f6u912w8LtHemSLeNPVwiHZLdGY7ppxiJaao8Dr82ZSh9LGvF9f7p2CRYh9gdEyy86N3U3p1zQ8usSsrzE1nUVAwV5uUxFQBv7t2acdX6kLs4ZPe2k57szeCnQDv7iyQpbfMh79L61n6bMvrPLZ1njAZrD2uj6i4cUUdbhV82b6xKUpzB75iExZPoQGo9yqeD3kF8rRLLbs2rRZatvi7nACnY33ijPcmeUyjSvBPvkn5wHyfcfsX7rNWowA7EoJA8ik2NmkjumxRvpbZss9dMDJnVYMxHUSyDaKBna1Q3V64Q34n87c3PLAwzEfx8xJcfzdsvzCcWjyBEk1DcY7DQ18N5E4k97gou9rHuugrzddvRkyPzgTtBCuB2ZiAxsDNYF8H7QZN7ouDsqGT6u5XcV1w58pGUSm4GY2idEh53bXLyFrUFqb3H2gmswBw2mG4heNLVuJGmCSZ6m5nab9Apya9ruuSaYdBro9d9ra1PAMufm7de5vzwHiRJeEKTmm2YioywpqmiCKhxrDwhM1eFuE4ozMK39T1UJX8zTe1qU9vSQ6jdaoqrKPNvnCeVtMKHj9c8vG7J7Sm8m6bkXEyhCfoW7NeuKwVFwrwukk3pm7EpLCRrcKL3gyfZzch4jMdxFHUPJQsk6Qhv6T2Djprc", "fingerprint": "1WCV-YC8F-47BY-5RZY" }
   ],
-  "uris": [],
+  "uris": [
+    { "uri": "randpay:<A>", "ok": true, "amount": null, "asset": null, "memo": null },
+    { "uri": "randpay:<A>?amount=1.5&memo=Invoice%20%2342", "ok": true, "amount": "1.5", "asset": null, "memo": "Invoice #42" },
+    { "uri": "RANDPAY:<A>?asset=0", "ok": true, "amount": null, "asset": "0", "memo": null, "canonical": "randpay:<A>?asset=0" },
+    { "uri": "randpay:<A>?memo=%C3%A9", "ok": true, "amount": null, "asset": null, "memo": "é" },
+    { "uri": "bitcoin:<A>", "err": "Scheme" },
+    { "uri": "randpay:rand1abc", "err": "Address" },
+    { "uri": "randpay:<A>?fee=1", "err": "UnknownParam" },
+    { "uri": "randpay:<A>?amount=1&amount=2", "err": "Repeated" },
+    { "uri": "randpay:<A>?amount=-1", "err": "BadAmount" },
+    { "uri": "randpay:<A>?amount=0.0", "err": "BadAmount" },
+    { "uri": "randpay:<A>?asset=zusd", "err": "BadAsset" },
+    { "uri": "randpay:<A>?memo=%FF", "err": "BadEncoding" },
+    { "uri": "randpay:<A>?memo=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "err": "MemoTooLong" }
+  ],
   "memos": []
 }
