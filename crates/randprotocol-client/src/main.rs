@@ -707,6 +707,15 @@ fn memo_column(memo: &Option<String>, whole: bool) -> String {
 
 /// The saved contact whose address's `pk` matches `pk`, if any — what `rand history`'s `to`
 /// column shows instead of a bare hex `pk` when this wallet has a name for the recipient.
+/// The bare `randpay:` link naming just an address — no amount, asset or memo. Every QR this
+/// wallet renders is a `randpay:` link, level M, never a bare address (`rand address --qr`'s own
+/// link, built with whatever `--amount`/`--asset`/`--memo` were given, is the other case of the
+/// same rule); this is the shared bare form so `rand contacts show --qr` cannot drift back to
+/// encoding the address text directly.
+fn pay_link(a: &ShieldedAddress) -> String {
+    PaymentUri { address: a.clone(), amount: None, asset: None, memo: None }.format()
+}
+
 fn contact_name_for(contacts: &Contacts, pk: &Word8) -> Option<String> {
     contacts.entries.iter().find_map(|(name, addr)| {
         let a = ShieldedAddress::parse(addr).ok()?;
@@ -916,7 +925,7 @@ async fn main() -> Result<()> {
                     println!("{addr}");
                     println!("fingerprint {}", addr.fingerprint());
                     if qr {
-                        println!("{}", randprotocol_client::qr::terminal(&addr.to_string())?);
+                        println!("{}", randprotocol_client::qr::terminal(&pay_link(&addr))?);
                     }
                 }
                 ContactsOp::Remove { name } => {
@@ -2087,5 +2096,16 @@ mod tests {
         assert_eq!(merge_uri(None, Some("1".into()), "amount").unwrap(), Some("1".into()));
         assert_eq!(merge_uri(Some("1".into()), Some("1".into()), "amount").unwrap(), Some("1".into()));
         assert!(merge_uri(Some("1".into()), Some("2".into()), "amount").is_err());
+    }
+
+    /// Task review, fix round 1: every QR this wallet ever renders is a `randpay:` link, level M
+    /// — never a bare address — so `rand contacts show --qr` cannot drift back to encoding the
+    /// address text directly the way `rand address --qr` already never does.
+    #[test]
+    fn contacts_show_qrs_link_is_a_randpay_link_not_a_bare_address() {
+        let a = fresh_address();
+        let text = pay_link(&a);
+        assert!(text.starts_with("randpay:"), "{text}");
+        assert_eq!(PaymentUri::parse(&text).unwrap().address, a);
     }
 }
