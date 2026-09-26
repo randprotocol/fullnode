@@ -2422,25 +2422,107 @@ pub fn mint_note_for(
 /// Rows per `rand_getTokens` page when [`resolve_asset`] reads the registry.
 const TOKEN_PAGE: u64 = 1000;
 
-/// `--asset`: a registry index as a number (0 is RAND), or a token's id — its `rpl1…` text form or
-/// 64 hex — looked up in the **whole** token registry (`rand_getTokens`, paged from index 0).
+/// `--asset`: a registry index as a number (0 is RAND), `rand`, or a token's id — its `rpl1…` text
+/// form or 64 hex — looked up in the **whole** token registry (`rand_getTokens`, paged from index 0).
 ///
 /// Never a per-token lookup: a transfer's asset is private on chain, and asking the node about the
 /// one token a wallet is about to send (`rand_getToken <id>`) right before it submits would tell the
 /// node's operator exactly what the hidden-asset bundle hides. Reading every row costs the same
 /// whichever token is meant, so the reply carries nothing about the choice. A number never reaches
 /// the node at all. A node without `rand_getTokens` is told to take the index instead.
+///
+/// A token id never resolves to RAND (audit WAL-1): the matched row must name the typed id in
+/// every id field it carries, and sit at an index the registry can hand out (at least
+/// `FIRST_TOKEN_INDEX`). Before, a node answering a token's id with index 0 turned
+/// `send --asset rpl1… --amount 5` into five whole RAND — the amount parsed with RAND's decimals.
 pub async fn resolve_asset(rpc: &RpcClient, text: &str) -> Result<u32> {
-    if let Ok(index) = text.parse::<u32>() {
+    if let Ok(index) = text.trim().parse::<u32>() {
         return Ok(index);
     }
-    let want = text.trim().to_ascii_lowercase();
-    let want_hex = want.strip_prefix("0x").unwrap_or(&want).to_string();
+    if text.trim().eq_ignore_ascii_case("rand") {
+        return Ok(0);
+    }
+    let want = parse_token_id(text)?;
+    let row = find_row_by_id(rpc, text, &want, "pass the token's registry index instead").await?;
+    row_index(&row)
+}
+
+/// Whether `--asset`'s text names RAND itself — `0` (in any spelling a number parses to) or
+/// `rand` — rather than a token. What decides the unit `--amount` is read in: RAND's decimals for
+/// this, a token's whole units for anything else, whatever index the node's listing answered.
+pub fn names_rand(text: &str) -> bool {
+    let t = text.trim();
+    t.parse::<u32>() == Ok(0) || t.eq_ignore_ascii_case("rand")
+}
+
+/// A token id as typed: `rpl1…` (checksummed) or 64 hex, `0x` optional. A malformed id is refused
+/// here, before the node is asked anything, so a typo can never match some other row.
+fn parse_token_id(text: &str) -> Result<AssetId> {
+    let t = text.trim();
+    if t.len() >= 4 && t[..4].eq_ignore_ascii_case("rpl1") {
+        return randprotocol_core::token_id::decode(t).map_err(|e| anyhow!("{text} is not a token id: {e}"));
+    }
+    Hash::from_hex(t).map_err(|_| anyhow!("{text} is not an asset: pass a registry index, rand, an rpl1… id or 64 hex"))
+}
+
+/// A `rand_getTokens` row's index, held to the registry's range: at least `FIRST_TOKEN_INDEX`,
+/// because index 0 is RAND's and the registry never hands it out — a row claiming it is a node
+/// lying about what a token id pays in (WAL-1).
+fn row_index(row: &Value) -> Result<u32> {
+    use randprotocol_core::ledger::tokens::FIRST_TOKEN_INDEX;
+    let index = row["index"].as_u64().context("a rand_getTokens row without an index")?;
+    let index = u32::try_from(index).map_err(|_| anyhow!("rand_getTokens lists index {index}, which is not a u32"))?;
+    if index < FIRST_TOKEN_INDEX {
+        return Err(anyhow!(
+            "the node lists a token at index {index}, which is RAND's and never a token's (the registry starts at {FIRST_TOKEN_INDEX}); refusing its listing"
+        ));
+    }
+    Ok(index)
+}
+
+/// Every id a `rand_getTokens` row carries (`id`, `asset_id` as hex, `id_text` as `rpl1…`),
+/// decoded. `None` for a field that is present but does not decode.
+fn row_ids(row: &Value) -> Vec<Option<AssetId>> {
+    let mut ids = Vec::new();
+    for key in ["id", "asset_id"] {
+        if let Some(s) = row[key].as_str() {
+            ids.push(Hash::from_hex(s).ok());
+        }
+    }
+    if let Some(s) = row["id_text"].as_str() {
+        ids.push(randprotocol_core::token_id::decode(s).ok());
+    }
+    ids
+}
+
+/// The row's own id fields name one token, or the row is refused: a listing whose `id` and
+/// `id_text` disagree could match a typed id through one field and be some other token through
+/// the other.
+fn check_row_ids(row: &Value) -> Result<()> {
+    let ids = row_ids(row);
+    let first = ids.first().copied().flatten();
+    if ids.is_empty() || ids.iter().any(|i| i.is_none() || *i != first) {
+        return Err(anyhow!("rand_getTokens row {}: its id fields disagree (or do not decode); refusing its listing", row["index"]));
+    }
+    Ok(())
+}
+
+/// Page the whole registry for the row naming `want` (in any of its id fields), then hold that row
+/// to [`check_row_ids`] and [`row_index`]. `hint` finishes the no-`rand_getTokens` error.
+async fn find_row_by_id(rpc: &RpcClient, text: &str, want: &AssetId, hint: &str) -> Result<Value> {
+    find_row(rpc, text, hint, |row| row_ids(row).contains(&Some(*want))).await
+}
+
+/// The paging loop [`resolve_asset`] and [`find_token_row`] share: the first row `hit` accepts,
+/// checked (ids agree, index in the registry's range) before it is returned.
+async fn find_row(rpc: &RpcClient, text: &str, hint: &str, hit: impl Fn(&Value) -> bool) -> Result<Value> {
     let mut from = 0u64;
     loop {
         let reply = rpc.call("rand_getTokens", serde_json::json!([from, TOKEN_PAGE])).await.map_err(|e| {
-            if crate::is_method_not_found(&e) {
-                anyhow!("this node cannot list its token registry (it has no rand_getTokens); pass the token's registry index instead")
+            if crate::is_method_not_found(&e) && hint.is_empty() {
+                anyhow!("this node cannot list its token registry (it has no rand_getTokens)")
+            } else if crate::is_method_not_found(&e) {
+                anyhow!("this node cannot list its token registry (it has no rand_getTokens); {hint}")
             } else {
                 e
             }
@@ -2450,15 +2532,10 @@ pub async fn resolve_asset(rpc: &RpcClient, text: &str) -> Result<u32> {
             .as_array()
             .or_else(|| reply["tokens"].as_array())
             .context("rand_getTokens did not return a list of tokens")?;
-        for row in rows {
-            let names = [&row["id_text"], &row["id"], &row["asset_id"]];
-            if names.iter().filter_map(|v| v.as_str()).any(|n| {
-                let n = n.to_ascii_lowercase();
-                n == want || n == want_hex
-            }) {
-                let index = row["index"].as_u64().context("a rand_getTokens row without an index")?;
-                return u32::try_from(index).map_err(|_| anyhow!("rand_getTokens lists index {index}, which is not a u32"));
-            }
+        if let Some(row) = rows.iter().find(|r| hit(r)) {
+            check_row_ids(row)?;
+            row_index(row)?;
+            return Ok(row.clone());
         }
         let last = rows.iter().filter_map(|r| r["index"].as_u64()).max();
         match last {
@@ -2473,41 +2550,14 @@ pub async fn resolve_asset(rpc: &RpcClient, text: &str) -> Result<u32> {
 /// case-insensitive) — never `rand_getToken`, so a wallet reading one token's row after
 /// [`resolve_asset`] already read the same listing costs this node nothing more than asking after
 /// any other token. `rand token info`'s reader; `rand token mint` and `rand token set-authority`
-/// use it too, for the row's `mint_nonce`, id and authority key.
+/// use it too, for the row's `mint_nonce`, id and authority key. The row is held to the same
+/// checks as [`resolve_asset`]'s (WAL-1): its id fields agree and its index is a token's.
 pub async fn find_token_row(rpc: &RpcClient, text: &str) -> Result<Value> {
-    let want_index: Option<u64> = text.trim().parse::<u64>().ok();
-    let want = text.trim().to_ascii_lowercase();
-    let want_hex = want.strip_prefix("0x").unwrap_or(&want).to_string();
-    let mut from = 0u64;
-    loop {
-        let reply = rpc.call("rand_getTokens", serde_json::json!([from, TOKEN_PAGE])).await.map_err(|e| {
-            if crate::is_method_not_found(&e) {
-                anyhow!("this node cannot list its token registry (it has no rand_getTokens)")
-            } else {
-                e
-            }
-        })?;
-        let rows = reply
-            .as_array()
-            .or_else(|| reply["tokens"].as_array())
-            .context("rand_getTokens did not return a list of tokens")?;
-        for row in rows {
-            let idx_match = want_index.is_some() && row["index"].as_u64() == want_index;
-            let names = [&row["id_text"], &row["id"], &row["asset_id"]];
-            let name_match = names.iter().filter_map(|v| v.as_str()).any(|n| {
-                let n = n.to_ascii_lowercase();
-                n == want || n == want_hex
-            });
-            if idx_match || name_match {
-                return Ok(row.clone());
-            }
-        }
-        let last = rows.iter().filter_map(|r| r["index"].as_u64()).max();
-        match last {
-            Some(last) if (rows.len() as u64) >= TOKEN_PAGE && last >= from => from = last + 1,
-            _ => return Err(anyhow!("no token {text} in this chain's registry")),
-        }
+    if let Ok(index) = text.trim().parse::<u64>() {
+        return find_row(rpc, text, "", |row| row["index"].as_u64() == Some(index)).await;
     }
+    let want = parse_token_id(text)?;
+    find_row_by_id(rpc, text, &want, "").await
 }
 
 /// `rand token create`'s action, plus the two registry facts it was built from: `index` (which
@@ -5061,9 +5111,12 @@ mod tests {
     async fn an_asset_is_an_index_or_a_token_id_found_in_the_whole_registry() {
         let asked = Arc::new(Mutex::new(Vec::<(String, serde_json::Value)>::new()));
         let log = asked.clone();
+        let (first, fifth) = (Hash([0xaa; 32]), Hash([0xbb; 32]));
+        let (first_text, fifth_text) = (randprotocol_core::token_id::encode(&first), randprotocol_core::token_id::encode(&fifth));
+        let absent_text = randprotocol_core::token_id::encode(&Hash([0xcc; 32]));
         let rows = serde_json::json!([
-            { "index": 1, "id": "aa".repeat(32), "id_text": "rpl1first" },
-            { "index": 5, "id": "bb".repeat(32), "id_text": "rpl1fifth" },
+            { "index": 1, "id": first.to_hex(), "id_text": first_text },
+            { "index": 5, "id": fifth.to_hex(), "id_text": fifth_text.clone() },
         ]);
         let rpc = RpcClient::new(
             rpc_fn(move |m, p| {
@@ -5078,15 +5131,20 @@ mod tests {
         assert_eq!(resolve_asset(&rpc, "0").await.unwrap(), 0);
         assert_eq!(resolve_asset(&rpc, "7").await.unwrap(), 7);
         assert!(asked.lock().unwrap().is_empty(), "a number never reaches the node");
-        assert_eq!(resolve_asset(&rpc, "rpl1fifth").await.unwrap(), 5);
+        assert_eq!(resolve_asset(&rpc, "rand").await.unwrap(), 0);
+        assert!(asked.lock().unwrap().is_empty(), "nor does rand");
+        assert!(resolve_asset(&rpc, "rpl1typo").await.unwrap_err().to_string().contains("not a token id"));
+        assert!(asked.lock().unwrap().is_empty(), "a malformed id is refused before the node is asked");
+        assert_eq!(resolve_asset(&rpc, &fifth_text).await.unwrap(), 5);
         assert_eq!(resolve_asset(&rpc, &format!("0x{}", "AA".repeat(32))).await.unwrap(), 1);
-        assert!(resolve_asset(&rpc, "rpl1nothere").await.unwrap_err().to_string().contains("no token rpl1nothere"));
+        let e = resolve_asset(&rpc, &absent_text).await.unwrap_err().to_string();
+        assert!(e.contains(&format!("no token {absent_text}")), "{e}");
         // Every request was the same whole-registry page: nothing in any of them names a token.
         for (method, params) in asked.lock().unwrap().iter() {
             assert_eq!((method.as_str(), params), ("rand_getTokens", &serde_json::json!([0, TOKEN_PAGE])));
         }
         let older = RpcClient::new(crate::test_rpc::scripted_rpc(vec![]).await);
-        let e = resolve_asset(&older, "rpl1fifth").await.unwrap_err().to_string();
+        let e = resolve_asset(&older, &fifth_text).await.unwrap_err().to_string();
         assert!(e.contains("registry index instead"), "{e}");
     }
 
@@ -5097,11 +5155,12 @@ mod tests {
     async fn find_token_row_matches_index_hex_or_rpl1_over_the_whole_listing() {
         let asked = Arc::new(Mutex::new(Vec::<String>::new()));
         let log = asked.clone();
+        let fifth_text = randprotocol_core::token_id::encode(&Hash([0xbb; 32]));
         let rows = serde_json::json!({
             "enabled": true,
             "tokens": [
-                { "index": 1, "id": "aa".repeat(32), "id_text": "rpl1first", "authority": { "kind": "key", "key": "k1" }, "mint_nonce": 3 },
-                { "index": 5, "id": "bb".repeat(32), "id_text": "rpl1fifth", "authority": { "kind": "none" }, "mint_nonce": 0 },
+                { "index": 1, "id": "aa".repeat(32), "id_text": randprotocol_core::token_id::encode(&Hash([0xaa; 32])), "authority": { "kind": "key", "key": "k1" }, "mint_nonce": 3 },
+                { "index": 5, "id": "bb".repeat(32), "id_text": fifth_text.clone(), "authority": { "kind": "none" }, "mint_nonce": 0 },
             ],
         });
         let rpc = RpcClient::new(
@@ -5115,10 +5174,57 @@ mod tests {
             .await,
         );
         assert_eq!(find_token_row(&rpc, "1").await.unwrap()["mint_nonce"], 3);
-        assert_eq!(find_token_row(&rpc, "rpl1fifth").await.unwrap()["index"], 5);
+        assert_eq!(find_token_row(&rpc, &fifth_text).await.unwrap()["index"], 5);
         assert_eq!(find_token_row(&rpc, &format!("0x{}", "AA".repeat(32))).await.unwrap()["index"], 1);
         assert!(find_token_row(&rpc, "9").await.unwrap_err().to_string().contains("no token 9"));
         assert!(asked.lock().unwrap().iter().all(|m| m == "rand_getTokens"), "never a per-token lookup");
+    }
+
+    /// WAL-1: a token id the node's listing answers with index 0 — RAND's, which the registry never
+    /// hands out (`FIRST_TOKEN_INDEX`) — is refused, by `resolve_asset` and `find_token_row` alike.
+    /// Before, `send --asset rpl1… --amount 5` took the row's 0 at its word and `main.rs` parsed the
+    /// amount with RAND's nine decimals: a lying node turned "5 units of a token" into 5 whole RAND.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_id_the_node_maps_to_rand_is_refused() {
+        let id = Hash::digest_domain(b"test", b"victim token");
+        let text = randprotocol_core::token_id::encode(&id);
+        let rows = serde_json::json!([{ "index": 0, "id": id.to_hex(), "id_text": text.clone() }]);
+        let rpc = RpcClient::new(
+            rpc_fn(move |m, _p| match m {
+                "rand_getTokens" => Reply::Ok(rows.clone()),
+                _ => Reply::Err(-32601, "unknown method"),
+            })
+            .await,
+        );
+        let e = resolve_asset(&rpc, &text).await.expect_err("index 0 is RAND's, never a token's").to_string();
+        assert!(e.contains("index 0"), "{e}");
+        let e = resolve_asset(&rpc, &id.to_hex()).await.expect_err("the hex form too").to_string();
+        assert!(e.contains("index 0"), "{e}");
+        let e = find_token_row(&rpc, &text).await.expect_err("and the row reader").to_string();
+        assert!(e.contains("index 0"), "{e}");
+    }
+
+    /// WAL-1: a row whose own `id` and `id_text` name two different tokens is refused, whichever of
+    /// the two the user typed — the node's listing is not trusted to be self-consistent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_row_whose_id_and_id_text_disagree_is_refused() {
+        let wanted = Hash::digest_domain(b"test", b"wanted");
+        let other = Hash::digest_domain(b"test", b"other");
+        let text = randprotocol_core::token_id::encode(&wanted);
+        let rows = serde_json::json!([{ "index": 3, "id": other.to_hex(), "id_text": text.clone() }]);
+        let rpc = RpcClient::new(
+            rpc_fn(move |m, _p| match m {
+                "rand_getTokens" => Reply::Ok(rows.clone()),
+                _ => Reply::Err(-32601, "unknown method"),
+            })
+            .await,
+        );
+        for asked in [text.clone(), other.to_hex()] {
+            let e = resolve_asset(&rpc, &asked).await.expect_err("an inconsistent row is refused").to_string();
+            assert!(e.contains("disagree"), "{e}");
+            let e = find_token_row(&rpc, &asked).await.expect_err("by the row reader too").to_string();
+            assert!(e.contains("disagree"), "{e}");
+        }
     }
 
     /// Every dummy is fresh: two bundles built from the same plan share no nullifier and no

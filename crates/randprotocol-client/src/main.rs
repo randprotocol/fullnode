@@ -82,9 +82,10 @@ enum Cmd {
         to: String,
         /// Amount: in RAND for RAND (e.g. 1.5); in the token's own smallest unit for a token.
         amount: String,
-        /// The asset to send: a registry index (0, the default, is RAND), or a token id — `rpl1…`
-        /// or 64 hex — found in the node's whole token listing (never a lookup of that one token,
-        /// which would tell the node what is about to move).
+        /// The asset to send: a registry index (0, the default, is RAND; `rand` says the same), or
+        /// a token id — `rpl1…` or 64 hex — found in the node's whole token listing (never a lookup
+        /// of that one token, which would tell the node what is about to move). Only `0`/`rand`
+        /// reads the amount in RAND; anything else reads it in the token's own units.
         #[arg(long, default_value = "0")]
         asset: String,
         /// Fee in RAND; the floor is 0.001.
@@ -849,15 +850,27 @@ async fn main() -> Result<()> {
         Cmd::Send { to, amount, asset, fee, no_wait, cuda } => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let to = parse_address(&to)?;
-            let asset = wallet::resolve_asset(&rpc, &asset).await?;
-            // RAND has this chain's nine decimals; a token's unit is its own, so its amount is a
-            // whole number of that unit.
-            let amount = if asset == 0 {
+            // The unit is decided by what was typed, never by the index the node's listing
+            // answered (WAL-1): `0`/`rand` is RAND with this chain's nine decimals; anything else
+            // names a token, whose amount is a whole number of its own unit.
+            let is_rand = wallet::names_rand(&asset);
+            let asset_text = asset;
+            let asset = wallet::resolve_asset(&rpc, &asset_text).await?;
+            anyhow::ensure!(
+                is_rand == (asset == 0),
+                "--asset {asset_text} resolved to index {asset}: only 0 or rand names RAND, and a token never sits at index 0"
+            );
+            let amount = if is_rand {
                 parse_amount(&amount)?
             } else {
                 amount.parse::<u64>().with_context(|| format!("{amount} is not a whole number of asset {asset}'s units"))?
             };
             let fee = match fee { Some(f) => parse_amount(&f)?, None => gas::BUNDLE_BASE };
+            if is_rand {
+                eprintln!("sending {} RAND (asset 0), fee {} RAND", format_amount(amount), format_amount(fee));
+            } else {
+                eprintln!("sending {amount} units of asset {asset} ({asset_text}), fee {} RAND", format_amount(fee));
+            }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
             let s = wallet::send_asset(&rpc, &w, &mut store, &to, asset, amount, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
