@@ -1339,6 +1339,7 @@ impl Ledger {
         match &tx.action {
             Action::Mint { envelope, .. }
             | Action::Withdraw { envelope, .. }
+            | Action::WithdrawAggregator { envelope, .. }
             | Action::BridgeAttest { envelope, .. }
             | Action::Aggregate { envelope, .. }
             | Action::TokenMint { envelope, .. } => self.check_note_envelope(envelope)?,
@@ -2919,6 +2920,79 @@ mod tests {
         };
         assert_eq!(l.validate(&attest(W - 1), &StubExecutor), Err(TxError::EnvelopeSize { expected: W, got: W - 1 }));
         assert!(!matches!(l.validate(&attest(W), &StubExecutor), Err(TxError::EnvelopeSize { .. } | TxError::EnvelopeTooLarge)));
+
+        // The RPL actions ride on a fee bundle (itself at the exact size), and their minted
+        // note's envelope — `TokenMint`'s, and `RegisterToken`'s initial mint's — is held to
+        // the same rule.
+        let bundled = |n: u32, action: Action| {
+            let mut b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::fee_floor(&action));
+            for e in b.envelopes.iter_mut() {
+                *e = fat(W);
+            }
+            StubExecutor::bound(Transaction::shielded(7, b, action))
+        };
+        let token_mint = |len: usize| Action::TokenMint {
+            asset: 1,
+            amount: 5,
+            recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+            r: [7; 8],
+            time: 0,
+            envelope: fat(len),
+            nonce: 0,
+            signature: sig.clone(),
+        };
+        assert_eq!(l.validate(&bundled(60, token_mint(W - 1)), &StubExecutor), Err(TxError::EnvelopeSize { expected: W, got: W - 1 }));
+        assert!(!matches!(
+            l.validate(&bundled(70, token_mint(W)), &StubExecutor),
+            Err(TxError::EnvelopeSize { .. } | TxError::EnvelopeTooLarge)
+        ));
+        let register = |len: usize| Action::RegisterToken {
+            name: "Test".into(),
+            symbol: "TST".into(),
+            decimals: 6,
+            authority: tokens::MintAuthority::None,
+            initial: Some(crate::types::actions::InitialMint {
+                amount: 5,
+                recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                r: [7; 8],
+                time: 0,
+                envelope: fat(len),
+            }),
+            salt: [9; 32],
+            index: 1,
+        };
+        assert_eq!(l.validate(&bundled(80, register(W + 1)), &StubExecutor), Err(TxError::EnvelopeSize { expected: W, got: W + 1 }));
+        assert!(!matches!(
+            l.validate(&bundled(90, register(W)), &StubExecutor),
+            Err(TxError::EnvelopeSize { .. } | TxError::EnvelopeTooLarge)
+        ));
+    }
+
+    /// An aggregator's bond withdrawal appends a note (`append_deposit`) like a validator's
+    /// `Withdraw`, so its envelope is a note envelope: exact under `envelope_bytes`, at most
+    /// `MAX_ENVELOPE_BYTES` without it (fix round 1 — it escaped every size check before).
+    #[test]
+    fn a_withdraw_aggregator_envelope_is_a_note_envelope() {
+        use crate::notes::MEMO_ENVELOPE_BYTES as W;
+        let fat = |body: usize| Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![3; body] };
+        let withdraw = |len: usize| Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::WithdrawAggregator {
+                aggregator: Address([1; 32]),
+                nonce: 0,
+                time: 0,
+                r: [7; 8],
+                envelope: fat(len),
+                signature: crate::crypto::Signature::empty(),
+            },
+        };
+        let mut l = ledger();
+        assert_eq!(l.validate(&withdraw(MAX_ENVELOPE_BYTES + 1), &StubExecutor), Err(TxError::EnvelopeTooLarge));
+        assert!(!matches!(l.validate(&withdraw(1348), &StubExecutor), Err(TxError::EnvelopeSize { .. } | TxError::EnvelopeTooLarge)));
+        l.set_envelope_bytes(Some(W));
+        assert_eq!(l.validate(&withdraw(W - 1), &StubExecutor), Err(TxError::EnvelopeSize { expected: W, got: W - 1 }));
+        assert!(!matches!(l.validate(&withdraw(W), &StubExecutor), Err(TxError::EnvelopeSize { .. } | TxError::EnvelopeTooLarge)));
     }
 
     /// Chain 14 unchanged: without the genesis field a 1 348-byte (legacy) and a 1 860-byte

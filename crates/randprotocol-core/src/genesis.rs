@@ -497,8 +497,8 @@ pub enum GenesisError {
     BadMaxProgramPublicWords(u32),
     #[error("bad envelope_bytes {0} (only {only} is supported)", only = crate::notes::MEMO_ENVELOPE_BYTES)]
     BadEnvelopeBytes(u32),
-    #[error("alloc note {cm}'s envelope is {got} bytes, the genesis requires envelope_bytes")]
-    AllocEnvelopeSize { cm: String, got: usize },
+    #[error("alloc note {cm}'s envelope is {got} bytes, the genesis requires exactly {want} (envelope_bytes)")]
+    AllocEnvelopeSize { cm: String, got: usize, want: usize },
     #[error("the genesis supply (alloc notes plus validator stakes) sums past u64::MAX")]
     SupplyOverflow,
 }
@@ -821,7 +821,11 @@ impl Genesis {
             // same exact length as every envelope a transaction carries.
             if let Some(want) = self.envelope_bytes {
                 if envelope.len() != want as usize {
-                    return Err(GenesisError::AllocEnvelopeSize { cm: n.cm.clone(), got: envelope.len() });
+                    return Err(GenesisError::AllocEnvelopeSize {
+                        cm: n.cm.clone(),
+                        got: envelope.len(),
+                        want: want as usize,
+                    });
                 }
             }
             match &n.opening {
@@ -2741,7 +2745,7 @@ mod tests {
         assert!(
             matches!(
                 g.build(&StubExecutor).err(),
-                Some(GenesisError::AllocEnvelopeSize { ref cm, got: 16 }) if *cm == g.alloc[0].cm
+                Some(GenesisError::AllocEnvelopeSize { ref cm, got: 16, want: crate::notes::MEMO_ENVELOPE_BYTES }) if *cm == g.alloc[0].cm
             ),
             "{:?}",
             g.build(&StubExecutor).err()
@@ -2758,7 +2762,7 @@ mod tests {
         assert!(
             matches!(
                 g.build(&StubExecutor).err(),
-                Some(GenesisError::AllocEnvelopeSize { ref cm, got }) if *cm == opened[1].cm && got == crate::notes::MEMO_ENVELOPE_BYTES - 1
+                Some(GenesisError::AllocEnvelopeSize { ref cm, got, want: crate::notes::MEMO_ENVELOPE_BYTES }) if *cm == opened[1].cm && got == crate::notes::MEMO_ENVELOPE_BYTES - 1
             ),
             "{:?}",
             g.build(&StubExecutor).err()

@@ -3167,10 +3167,10 @@ mod tests {
         gs
     }
 
-    /// `rand_getLimits`: the chain's five limits, so a wallet derives its caps instead of
+    /// `rand_getLimits`: the chain's limits (five caps and `envelope_bytes`), so a wallet derives its caps instead of
     /// hard-coding them. A default chain reports today's constants.
     #[tokio::test]
-    async fn get_limits_reports_the_chains_five_limits() {
+    async fn get_limits_reports_the_chains_limits() {
         let gs = fixtures::genesis(1);
         let (_d, st) = state_for(&gs);
         assert_eq!(
