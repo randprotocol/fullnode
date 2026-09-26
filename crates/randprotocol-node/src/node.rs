@@ -724,6 +724,15 @@ fn fetch_blocked<K>(inflight: &HashMap<K, (Hash, Instant)>, h: &Hash) -> bool {
     inflight.values().any(|(x, _)| x == h)
 }
 
+/// The history-pruning cutoff: blocks stamped before it lose their history. Measured from the
+/// earlier of the head's timestamp and this node's clock (PR-2): block timestamps are only
+/// bounded per step (`MAX_TIMESTAMP_STEP_MS`), so faulty leaders can ratchet the chain's clock
+/// ahead of real time, and measured from the head alone that would over-prune. A node whose own
+/// clock is behind prunes less, never more — the safe direction for retention.
+fn prune_cutoff_ms(head_ms: u64, now_ms: u64, keep: Duration) -> u64 {
+    head_ms.min(now_ms).saturating_sub(u64::try_from(keep.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Whether this history-pruning pass should kick off a background compaction (final-review fix
 /// #1): every 64th pass that deleted anything, and only when the previous compaction (if any)
 /// has finished. Flips `compacting` to `true` itself, atomically with the check, so two callers
@@ -1596,7 +1605,7 @@ impl Node {
         if let Some(keep) = self.cfg.prune_history {
             if head % 16 == 0 {
                 let head_ms = self.storage.head_block()?.header.timestamp_ms;
-                let cutoff_ms = head_ms.saturating_sub(u64::try_from(keep.as_millis()).unwrap_or(u64::MAX));
+                let cutoff_ms = prune_cutoff_ms(head_ms, now_ms(), keep);
                 let window = self.hs.committed_ledger().aggregation().map(|a| a.window).unwrap_or(0);
                 let keep_from = head.saturating_sub(window.max(2));
                 let storage = self.storage.clone();
@@ -2844,6 +2853,24 @@ mod tests {
         // Once the background task clears it, the next 64th pass fires again.
         compacting.store(false, Ordering::SeqCst);
         assert!(should_compact(192, &compacting));
+    }
+
+    /// PR-2: the cutoff is measured from the earlier of the head's timestamp and this node's
+    /// clock. A run of faulty leaders can ratchet block timestamps forward (up to
+    /// `MAX_TIMESTAMP_STEP_MS` a block); measured from the head alone, a day of retention would
+    /// then delete blocks that are, by the wall clock, minutes old.
+    #[test]
+    fn the_prune_cutoff_never_runs_ahead_of_the_local_clock() {
+        let day = Duration::from_secs(86_400);
+        let day_ms = 86_400_000u64;
+        let now = 10 * day_ms;
+        // An honest head, a little behind the clock: measured from the head.
+        assert_eq!(prune_cutoff_ms(now - 1_500, now, day), now - 1_500 - day_ms);
+        // A head ratcheted a whole day ahead of the clock: measured from the clock instead.
+        assert_eq!(prune_cutoff_ms(now + day_ms, now, day), now - day_ms);
+        // Early in a chain's life nothing is old enough: saturates at zero.
+        assert_eq!(prune_cutoff_ms(1_000, now, day), 0);
+        assert_eq!(prune_cutoff_ms(u64::MAX, 1_000, day), 0);
     }
 
     #[test]
