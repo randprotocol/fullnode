@@ -9,18 +9,23 @@
 //! leaves, nullifiers, anchors, witnesses — and handed a finished bundle; it is never told who
 //! anyone is.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use randprotocol_client::governance;
 use randprotocol_client::wallet::{self, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
 use randprotocol_client::wallet::{Burn, Submission};
+#[cfg(test)]
+use randprotocol_client::contacts;
+use randprotocol_client::contacts::Contacts;
 use randprotocol_core::ledger::staking::MIN_STAKE;
-use randprotocol_core::notes::ShieldedAddress;
+use randprotocol_core::notes::{ShieldedAddress, Word8};
+use randprotocol_core::payment_uri::PaymentUri;
 use randprotocol_core::types::actions::Registration;
 use randprotocol_core::{format_amount, gas, parse_amount, Action, Address, Hash, Keypair};
 use randprotocol_zkvm::machine::{Backend, FriProfile, Tier, TIERS};
 use randprotocol_zkvm::{call_envelope, codec, emulator, executor, guests, hash, isa::Program};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -41,8 +46,32 @@ struct Cli {
 enum Cmd {
     /// Create a new spend-key file (refuses to overwrite).
     Keygen,
-    /// Show this wallet's shielded address.
-    Address,
+    /// Show this wallet's shielded address, and optionally a `randpay:` link or QR of it.
+    Address {
+        /// Print the address as a `randpay:` link (spec §2.2).
+        #[arg(long)]
+        uri: bool,
+        /// Include an amount in the link (display units: RAND for asset 0).
+        #[arg(long)]
+        amount: Option<String>,
+        /// Include an asset in the link: a registry index, or a token id (`rpl1…` or 64 hex).
+        #[arg(long)]
+        asset: Option<String>,
+        /// Include a memo in the link.
+        #[arg(long)]
+        memo: Option<String>,
+        /// Print the link as a QR code, in the terminal.
+        #[arg(long)]
+        qr: bool,
+        /// Write the link as a QR code PNG to this path.
+        #[arg(long = "qr-png")]
+        qr_png: Option<PathBuf>,
+    },
+    /// Named addresses this wallet can send to by name instead of a `rand1…` address.
+    Contacts {
+        #[command(subcommand)]
+        op: ContactsOp,
+    },
     /// Print this wallet's viewing key: 64 hex, the form `rand_importViewingKey` takes.
     ///
     /// It reads every note this wallet has sent or received and can spend none of them. Anyone
@@ -77,30 +106,48 @@ enum Cmd {
         rescan: bool,
     },
     /// List every note this wallet has ever been able to open.
-    Notes,
+    Notes {
+        /// Print each note's whole memo instead of the first 24 characters.
+        #[arg(long)]
+        memo: bool,
+    },
     /// List every note this wallet created for someone else.
-    History,
-    /// Send RAND or a token to a shielded address: scan, select, prove and submit.
+    History {
+        /// Print each note's whole memo instead of the first 24 characters.
+        #[arg(long)]
+        memo: bool,
+    },
+    /// Send RAND or a token to a shielded address, a `randpay:` link or a saved contact name:
+    /// scan, select, prove and submit.
     ///
     /// Either way the transaction is a plain four-slot bundle that does not say which asset moved,
-    /// and the fee is RAND — a token transfer needs RAND in the wallet for it.
+    /// and the fee is RAND — a token transfer needs RAND in the wallet for it. Amounts (here and
+    /// in a link) are always the asset's own display units: RAND at nine decimals, a token at its
+    /// registry row's own `decimals`.
     Send {
-        /// A `rand1…` shielded address.
+        /// A `rand1…` shielded address, a `randpay:` link, or a saved contact's name.
         to: String,
-        /// Amount: in RAND for RAND (e.g. 1.5); in the token's own smallest unit for a token.
-        amount: String,
-        /// The asset to send: a registry index (0, the default, is RAND; `rand` says the same), or
-        /// a token id — `rpl1…` or 64 hex — found in the node's whole token listing (never a lookup
-        /// of that one token, which would tell the node what is about to move). Only `0`/`rand`
-        /// reads the amount in RAND; anything else reads it in the token's own units.
-        #[arg(long, default_value = "0")]
-        asset: String,
+        /// Amount, in the asset's display units; omit it when TO is a link that carries one.
+        amount: Option<String>,
+        /// The asset to send: a registry index (0, the default, is RAND), or a token id — `rpl1…`
+        /// or 64 hex — found in the node's whole token listing (never a lookup of that one token,
+        /// which would tell the node what is about to move). A link's own `asset` is used when
+        /// this is not given; the two must agree if both are.
+        #[arg(long)]
+        asset: Option<String>,
+        /// A memo to seal with the payment. A link's own `memo` is used when this is not given;
+        /// the two must agree if both are.
+        #[arg(long)]
+        memo: Option<String>,
         /// Fee in RAND; the floor is 0.001.
         #[arg(long)]
         fee: Option<String>,
         /// Return once the node accepts the bundle instead of waiting for it to commit.
         #[arg(long)]
         no_wait: bool,
+        /// Send without asking for confirmation first.
+        #[arg(long)]
+        yes: bool,
         /// Prove on an attached NVIDIA GPU (requires a build with `--features cuda`).
         #[arg(long)]
         cuda: bool,
@@ -320,6 +367,31 @@ enum Cmd {
     Peers,
     /// Validator set.
     Validators,
+}
+
+#[derive(Subcommand)]
+enum ContactsOp {
+    /// Save a shielded address (or a `randpay:` link's address) under a name.
+    Add {
+        /// The contact's name: 1-64 characters, never starting with `rand1` or `randpay:`.
+        name: String,
+        /// A `rand1…` shielded address, or a `randpay:` link.
+        to: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List every saved contact.
+    List,
+    /// Show one contact's address and fingerprint.
+    Show {
+        name: String,
+        /// Print the address as a QR code, in the terminal.
+        #[arg(long)]
+        qr: bool,
+    },
+    /// Remove a saved contact.
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -587,6 +659,61 @@ fn parse_address(s: &str) -> Result<ShieldedAddress> {
     ShieldedAddress::parse(s).map_err(|e| anyhow::anyhow!("{e}")).context("invalid shielded address")
 }
 
+/// `rand send`'s TO argument, and `rand contacts add`'s TO: a `rand1…` address first, then a
+/// `randpay:` link, then a saved contact's name — in that order, so a name that happens to
+/// collide with neither shape is still refused with one clear error rather than three swallowed
+/// ones. Returns the address, the link if TO was one (so its `amount`/`asset`/`memo` can be
+/// merged with any flags), and the contact name if TO was one (so a print or a history row can
+/// show it instead of a bare `rand1…`).
+fn resolve_recipient(to: &str, contacts: &Contacts) -> Result<(ShieldedAddress, Option<PaymentUri>, Option<String>)> {
+    if let Ok(a) = ShieldedAddress::parse(to) {
+        return Ok((a, None, None));
+    }
+    if let Ok(u) = PaymentUri::parse(to) {
+        let a = u.address.clone();
+        return Ok((a, Some(u), None));
+    }
+    if let Some(a) = contacts.get(to) {
+        return Ok((a, None, Some(to.to_string())));
+    }
+    Err(anyhow!("{to} is not a shielded address, a randpay: link, or a saved contact"))
+}
+
+/// A value that can come from a `--flag` or from a `randpay:` link's own field: agree if both are
+/// given, either alone if only one is, `None` if neither. A silent flag/link disagreement would
+/// mean the amount or asset a person confirmed on screen is not the one that gets sealed —
+/// refused instead.
+fn merge_uri(flag: Option<String>, uri: Option<String>, what: &str) -> Result<Option<String>> {
+    match (flag, uri) {
+        (Some(f), Some(u)) if f != u => Err(anyhow!("--{what} {f} does not match the link's {what} {u}")),
+        (Some(f), _) => Ok(Some(f)),
+        (None, u) => Ok(u),
+    }
+}
+
+/// The first 24 characters of a memo, `…`-suffixed if longer, for a column that must not blow up
+/// a terminal's width; `--memo` on `rand notes`/`rand history` asks for the whole thing instead.
+/// `None` (no memo, or a note from before the memo existed) prints as `-`.
+fn memo_column(memo: &Option<String>, whole: bool) -> String {
+    match memo {
+        None => "-".to_string(),
+        Some(m) if whole => m.clone(),
+        Some(m) => {
+            let truncated: String = m.chars().take(24).collect();
+            if m.chars().count() > 24 { format!("{truncated}…") } else { truncated }
+        }
+    }
+}
+
+/// The saved contact whose address's `pk` matches `pk`, if any — what `rand history`'s `to`
+/// column shows instead of a bare hex `pk` when this wallet has a name for the recipient.
+fn contact_name_for(contacts: &Contacts, pk: &Word8) -> Option<String> {
+    contacts.entries.iter().find_map(|(name, addr)| {
+        let a = ShieldedAddress::parse(addr).ok()?;
+        (&a.pk == pk).then(|| name.clone())
+    })
+}
+
 /// The wallet, where its note store lives, and the store itself.
 fn open_wallet(key: &Path) -> Result<(Wallet, PathBuf, NoteStore)> {
     let w = Wallet::load(key)?;
@@ -731,7 +858,74 @@ async fn main() -> Result<()> {
             w.save_new(&cli.key)?;
             println!("wrote {}\naddress: {}", cli.key.display(), w.address);
         }
-        Cmd::Address => println!("{}", Wallet::load(&cli.key)?.address),
+        Cmd::Address { uri, amount, asset, memo, qr, qr_png } => {
+            let a = Wallet::load(&cli.key)?.address;
+            println!("{a}");
+            println!("fingerprint {}", a.fingerprint());
+            let u = PaymentUri { address: a, amount, asset, memo };
+            let text = u.format();
+            // Round-trips through the same parser a payee's wallet uses, so a bad `--amount` or
+            // `--asset` is refused here rather than printed as a link nobody can pay.
+            PaymentUri::parse(&text).map_err(|e| anyhow!("{e}"))?;
+            if uri {
+                println!("{text}");
+            }
+            if qr {
+                println!("{}", randprotocol_client::qr::terminal(&text)?);
+            }
+            if let Some(path) = qr_png {
+                randprotocol_client::qr::png(&text, &path)?;
+                println!("wrote {}", path.display());
+            }
+        }
+        Cmd::Contacts { op } => {
+            let mut c = Contacts::load(&cli.key)?;
+            match op {
+                ContactsOp::Add { name, to, yes } => {
+                    let addr = match ShieldedAddress::parse(&to) {
+                        Ok(a) => a,
+                        Err(_) => PaymentUri::parse(&to)
+                            .map(|u| u.address)
+                            .map_err(|_| anyhow!("{to} is neither a shielded address nor a randpay: link"))?,
+                    };
+                    println!("fingerprint {}", addr.fingerprint());
+                    if !yes {
+                        print!("add {name}? [y/N] ");
+                        std::io::stdout().flush()?;
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line)?;
+                        if !line.trim().eq_ignore_ascii_case("y") {
+                            anyhow::bail!("not added");
+                        }
+                    }
+                    c.add(&name, &addr)?;
+                    c.save(&cli.key)?;
+                    println!("saved {name}");
+                }
+                ContactsOp::List => {
+                    if c.entries.is_empty() {
+                        println!("no contacts");
+                    } else {
+                        for (name, addr) in &c.entries {
+                            println!("{name}  {addr}");
+                        }
+                    }
+                }
+                ContactsOp::Show { name, qr } => {
+                    let addr = c.get(&name).ok_or_else(|| anyhow!("no contact named {name}"))?;
+                    println!("{addr}");
+                    println!("fingerprint {}", addr.fingerprint());
+                    if qr {
+                        println!("{}", randprotocol_client::qr::terminal(&addr.to_string())?);
+                    }
+                }
+                ContactsOp::Remove { name } => {
+                    c.remove(&name)?;
+                    c.save(&cli.key)?;
+                    println!("removed {name}");
+                }
+            }
+        }
         Cmd::ViewingKey => {
             println!("{}", Wallet::load(&cli.key)?.viewing_key_hex());
             eprintln!("reads every note this wallet sent or received; spends nothing. A node imports it with rand_importViewingKey.");
@@ -747,14 +941,18 @@ async fn main() -> Result<()> {
             if rows.is_empty() {
                 anyhow::bail!("this wallet neither sent nor received an output of {}", h.to_hex());
             }
-            println!("{:<15} {:<9} {:>22}  tx key", "output", "role", "amount");
+            println!("{:<15} {:<9} {:>22}  {:<24}  tx key", "output", "role", "amount", "memo");
             for r in &rows {
                 let amount = if r.note.asset == 0 {
                     format!("{} RAND", format_amount(r.note.amount))
                 } else {
                     format!("{} (asset {})", r.note.amount, r.note.asset)
                 };
-                println!("{:<15} {:<9} {:>22}  {}", format!("{}:{}", r.output, r.slot), r.role.as_str(), amount, hex::encode(r.key.0));
+                let memo = r.memo.as_deref().unwrap_or("-");
+                println!(
+                    "{:<15} {:<9} {:>22}  {:<24}  {}",
+                    format!("{}:{}", r.output, r.slot), r.role.as_str(), amount, memo, hex::encode(r.key.0)
+                );
             }
             eprintln!("each key discloses exactly its own output: rand_checkTransaction <hash> <key> shows it to anyone holding it.");
         }
@@ -820,7 +1018,7 @@ async fn main() -> Result<()> {
             store.save(&path)?;
             println!("scanned {} leaves and {} blocks; {} notes, {} unspent", store.scanned_index, store.scanned_height, store.notes.len(), store.spendable().len());
         }
-        Cmd::Notes => {
+        Cmd::Notes { memo } => {
             let (_, _, store) = open_wallet(&cli.key)?;
             if store.notes.is_empty() {
                 println!("no notes (run `rand sync`)");
@@ -829,7 +1027,7 @@ async fn main() -> Result<()> {
                 // the commit: not spent, not spendable, and the next `sync` decides which.
                 // `amount` is in the asset's own smallest unit, so only asset 0 is a RAND figure;
                 // a bridged asset's decimals belong to its source chain, not to this one.
-                println!("{:>8}  {:>5}  {:>22}  {:>8}  {:>7}  {}", "index", "asset", "amount", "height", "spent", "pending");
+                println!("{:>8}  {:>5}  {:>22}  {:>8}  {:>7}  {:<9}  {}", "index", "asset", "amount", "height", "spent", "pending", "memo");
                 for n in &store.notes {
                     let pending = match n.pending {
                         Some(time) => format!("since {time}"),
@@ -841,41 +1039,62 @@ async fn main() -> Result<()> {
                         n.note.amount.to_string()
                     };
                     println!(
-                        "{:>8}  {:>5}  {:>22}  {:>8}  {:>7}  {}",
-                        n.index, n.note.asset, amount, n.height, n.spent, pending
+                        "{:>8}  {:>5}  {:>22}  {:>8}  {:>7}  {:<9}  {}",
+                        n.index, n.note.asset, amount, n.height, n.spent, pending, memo_column(&n.memo, memo)
                     );
                 }
             }
         }
-        Cmd::History => {
+        Cmd::History { memo } => {
             let (_, _, store) = open_wallet(&cli.key)?;
+            let contacts = Contacts::load(&cli.key)?;
             if store.sent.is_empty() {
                 println!("no notes sent from this wallet");
             } else {
-                println!("{:>8}  {:>18}  {:>8}  {}", "index", "amount", "height", "to (pk)");
+                println!("{:>8}  {:>18}  {:>8}  {:<9}  {}", "index", "amount", "height", "memo", "to");
                 for s in &store.sent {
-                    println!("{:>8}  {:>18}  {:>8}  {}", s.index, format_amount(s.amount), s.height, randprotocol_core::notes::word8_to_hex(&s.to_pk));
+                    let to = contact_name_for(&contacts, &s.to_pk)
+                        .unwrap_or_else(|| randprotocol_core::notes::word8_to_hex(&s.to_pk));
+                    println!(
+                        "{:>8}  {:>18}  {:>8}  {:<9}  {}",
+                        s.index, format_amount(s.amount), s.height, memo_column(&s.memo, memo), to
+                    );
                 }
             }
         }
-        Cmd::Send { to, amount, asset, fee, no_wait, cuda } => {
+        Cmd::Send { to, amount, asset, memo, fee, no_wait, yes, cuda } => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
-            let to = parse_address(&to)?;
+            let contacts = Contacts::load(&cli.key)?;
+            let (to, link, name) = resolve_recipient(&to, &contacts)?;
+            let amount_text = merge_uri(amount, link.as_ref().and_then(|u| u.amount.clone()), "amount")?
+                .ok_or_else(|| anyhow!("no amount: give one or use a link that carries it"))?;
+            let asset_text = merge_uri(asset, link.as_ref().and_then(|u| u.asset.clone()), "asset")?
+                .unwrap_or_else(|| "0".to_string());
+            let memo_text = merge_uri(memo, link.as_ref().and_then(|u| u.memo.clone()), "memo")?.unwrap_or_default();
             // The unit is decided by what was typed, never by the index the node's listing
-            // answered (WAL-1): `0`/`rand` is RAND with this chain's nine decimals; anything else
-            // names a token, whose amount is a whole number of its own unit.
-            let is_rand = wallet::names_rand(&asset);
-            let asset_text = asset;
+            // answered (WAL-1): `0`/`rand` is RAND; anything else names a token, and a token id
+            // the listing answers with RAND's index 0 is refused rather than read as RAND.
+            let is_rand = wallet::names_rand(&asset_text);
             let asset = wallet::resolve_asset(&rpc, &asset_text).await?;
             anyhow::ensure!(
                 is_rand == (asset == 0),
                 "--asset {asset_text} resolved to index {asset}: only 0 or rand names RAND, and a token never sits at index 0"
             );
-            let amount = if is_rand {
-                parse_amount(&amount)?
-            } else {
-                amount.parse::<u64>().with_context(|| format!("{amount} is not a whole number of asset {asset}'s units"))?
-            };
+            // Display units, whichever asset moves: RAND's nine decimals, or the token registry's
+            // own `decimals` for its own — the same units a `randpay:` link's `amount` carries.
+            let amount = wallet::parse_asset_amount(&rpc, asset, &amount_text).await?;
+            let asset_label = if asset == 0 { "RAND".to_string() } else { format!("asset {asset}") };
+            let name_part = name.as_ref().map(|n| format!("{n} · ")).unwrap_or_default();
+            println!("to {name_part}fingerprint {} · {amount_text} {asset_label} · memo \"{memo_text}\"", to.fingerprint());
+            if !yes {
+                print!("send? [y/N] ");
+                std::io::stdout().flush()?;
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                if !line.trim().eq_ignore_ascii_case("y") {
+                    anyhow::bail!("not sent");
+                }
+            }
             let fee = match fee { Some(f) => parse_amount(&f)?, None => gas::BUNDLE_BASE };
             if is_rand {
                 eprintln!("sending {} RAND (asset 0), fee {} RAND", format_amount(amount), format_amount(fee));
@@ -884,9 +1103,7 @@ async fn main() -> Result<()> {
             }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            // No `--memo` flag yet (task 7 is the wallet library; a CLI flag is a later task):
-            // every `rand send` seals its payment with no memo.
-            let s = wallet::send_asset(&rpc, &w, &mut store, &to, asset, amount, "", fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::send_asset(&rpc, &w, &mut store, &to, asset, amount, &memo_text, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             report(&s?, "transfer");
@@ -1839,5 +2056,36 @@ mod tests {
         // And it must differ from `Program::code_hash()`'s big-endian spelling of the same eight
         // words — that mismatch is exactly the bug this fixes.
         assert_ne!(rpc_hc_hex(&p), p.code_hash());
+    }
+
+    fn fresh_address() -> ShieldedAddress {
+        randprotocol_zkvm::address::address_of(&randprotocol_zkvm::notes::SpendKey::random().viewing_key())
+    }
+
+    /// `rand send`'s TO, and `rand contacts add`'s TO, resolve the same way: a bare address
+    /// first, a `randpay:` link second (carrying its own `amount`/`asset`/`memo` back for
+    /// [`merge_uri`] to reconcile with any flags), and a saved contact's name last. Anything
+    /// none of the three is refused.
+    #[test]
+    fn a_recipient_resolves_as_address_then_link_then_contact() {
+        let a = fresh_address();
+        let mut c = contacts::Contacts::default();
+        c.add("bob", &a).unwrap();
+        assert_eq!(resolve_recipient(&a.to_string(), &c).unwrap().0, a);
+        let (x, uri, _) = resolve_recipient(&format!("randpay:{a}?amount=2"), &c).unwrap();
+        assert_eq!((x, uri.unwrap().amount.as_deref()), (a.clone(), Some("2")));
+        let (x, _, name) = resolve_recipient("bob", &c).unwrap();
+        assert_eq!((x, name.as_deref()), (a, Some("bob")));
+        assert!(resolve_recipient("carol", &c).is_err());
+    }
+
+    /// [`merge_uri`]: a `--flag` and a link's own field agree if both are given, either alone if
+    /// only one is, and a differing pair is refused rather than silently preferring one.
+    #[test]
+    fn a_flag_and_a_link_that_disagree_are_refused() {
+        assert_eq!(merge_uri(Some("1".into()), None, "amount").unwrap(), Some("1".into()));
+        assert_eq!(merge_uri(None, Some("1".into()), "amount").unwrap(), Some("1".into()));
+        assert_eq!(merge_uri(Some("1".into()), Some("1".into()), "amount").unwrap(), Some("1".into()));
+        assert!(merge_uri(Some("1".into()), Some("2".into()), "amount").is_err());
     }
 }

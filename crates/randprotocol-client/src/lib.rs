@@ -20,7 +20,9 @@ use randprotocol_core::types::CallEnvelope;
 use randprotocol_core::{Hash, Transaction};
 use std::time::{Duration, Instant};
 
+pub mod contacts;
 pub mod governance;
+pub mod qr;
 pub mod tree;
 pub mod wallet;
 

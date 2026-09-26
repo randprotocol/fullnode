@@ -2549,8 +2549,9 @@ pub async fn resolve_asset(rpc: &RpcClient, text: &str) -> Result<u32> {
 }
 
 /// Whether `--asset`'s text names RAND itself — `0` (in any spelling a number parses to) or
-/// `rand` — rather than a token. What decides the unit `--amount` is read in: RAND's decimals for
-/// this, a token's whole units for anything else, whatever index the node's listing answered.
+/// `rand` — rather than a token. What decides whether `--amount` may be read as RAND at all:
+/// `send` refuses a typed token whose listing row answers RAND's index 0, whatever the node says,
+/// and reads a token's amount in its registry `decimals` ([`parse_asset_amount`]).
 pub fn names_rand(text: &str) -> bool {
     let t = text.trim();
     t.parse::<u32>() == Ok(0) || t.eq_ignore_ascii_case("rand")
@@ -2644,6 +2645,44 @@ async fn find_row(rpc: &RpcClient, text: &str, hint: &str, hit: impl Fn(&Value) 
             _ => return Err(anyhow!("no token {text} in this chain's registry")),
         }
     }
+}
+
+/// The pure core of [`parse_asset_amount`]: a decimal string (`"1.5"`, `"2"`) at `decimals`
+/// fractional digits, scaled to the smallest unit. No leading/trailing junk, no sign, no
+/// exponent — `int` and `frac` are each all-ASCII-digit or empty, and a literal `.` demands a
+/// non-empty fraction (`"2."` is refused, not read as `"2"`). More fraction digits than the asset
+/// carries is the one error message worth naming precisely, because it is the one a caller can
+/// fix by rounding; anything else just is not a decimal amount.
+pub fn parse_decimal(text: &str, decimals: u8) -> Result<u64> {
+    let (int, frac) = text.split_once('.').unwrap_or((text, ""));
+    if int.is_empty() || !int.bytes().all(|c| c.is_ascii_digit()) || !frac.bytes().all(|c| c.is_ascii_digit()) || (text.contains('.') && frac.is_empty()) {
+        return Err(anyhow!("{text} is not a decimal amount"));
+    }
+    if frac.len() > decimals as usize {
+        return Err(anyhow!("{text}: this asset has at most {decimals} decimals"));
+    }
+    let scaled = format!("{int}{frac:0<width$}", width = decimals as usize);
+    scaled.parse::<u64>().map_err(|_| anyhow!("{text} is too large"))
+}
+
+/// `--amount`/a `randpay:` link's `amount`, in the asset's own display units: RAND (asset 0) at
+/// this chain's nine decimals via [`parse_amount`](randprotocol_core::parse_amount)'s scale, and
+/// any other asset at its registry row's own `decimals` — the same whole-listing
+/// [`rand_getTokens`] page [`resolve_asset`] already reads, never a per-token lookup (the same
+/// privacy reason: asking the node about the one token this amount is about, right before a
+/// transfer of it, would tell the node's operator what [`resolve_asset`] already keeps from it).
+///
+/// **Behaviour change**: before this, a token amount on the command line was a whole number of
+/// the asset's smallest unit; it is now the same display-unit form a `randpay:` link's `amount`
+/// takes, matching every other amount this wallet prints or parses.
+pub async fn parse_asset_amount(rpc: &RpcClient, asset: u32, text: &str) -> Result<u64> {
+    if asset == 0 {
+        return parse_decimal(text, 9);
+    }
+    let row = find_token_row(rpc, &asset.to_string()).await?;
+    let decimals = row["decimals"].as_u64().context("a rand_getTokens row without decimals")?;
+    let decimals = u8::try_from(decimals).map_err(|_| anyhow!("token {asset} reports {decimals} decimals, which is not plausible"))?;
+    parse_decimal(text, decimals)
 }
 
 /// One `rand_getTokens` row, found the way [`resolve_asset`] finds an index: by paging the whole
@@ -4160,6 +4199,19 @@ mod tests {
         }
     }
 
+    /// Task 8 (T7 review round 1): a memo one byte over [`MEMO_TEXT_MAX_BYTES`] (510) is refused
+    /// while the bundle is still being sealed, before `rand_sendTransaction` is ever called —
+    /// nothing is admitted for a send that was going to fail anyway.
+    #[tokio::test]
+    async fn a_memo_over_the_limit_is_refused_before_anything_is_submitted() {
+        let chain = FakeChain::with_envelope_bytes(Some(1860));
+        let (alice, bob) = (chain.funded_wallet(10), chain.fresh_wallet());
+        let memo = "x".repeat(randprotocol_zkvm::viewing::MEMO_TEXT_MAX_BYTES + 1);
+        let err = chain.send(&alice, &bob.address, 1, &memo).await.unwrap_err();
+        assert!(err.to_string().contains("memo"), "{err}");
+        assert!(chain.inner.lock().unwrap().sent.is_empty(), "nothing was submitted");
+    }
+
     /// A note store written before the memo existed has no `memo` key at all; it still loads,
     /// at `None` — the same `#[serde(default)]` `pending` already relies on.
     #[test]
@@ -5600,6 +5652,49 @@ mod tests {
         }
     }
 
+    /// [`parse_decimal`]'s pure core: a decimal string at `decimals` fractional digits, scaled to
+    /// the smallest unit — RAND's nine, or a whole-number asset's zero.
+    #[test]
+    fn parse_decimal_scales_to_the_smallest_unit_and_refuses_too_many_digits() {
+        assert_eq!(parse_decimal("1.5", 9).unwrap(), 1_500_000_000);
+        let e = parse_decimal("1.1234567891", 9).unwrap_err().to_string();
+        assert!(e.contains("at most 9 decimals"), "{e}");
+        assert_eq!(parse_decimal("2", 0).unwrap(), 2);
+        assert!(parse_decimal("0.5", 0).is_err());
+    }
+
+    /// [`parse_asset_amount`]: RAND (asset 0) never touches the node; any other asset reads its
+    /// `decimals` off the same whole `rand_getTokens` listing [`resolve_asset`] pages, never a
+    /// per-token lookup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parse_asset_amount_reads_decimals_off_the_whole_token_listing() {
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = asked.clone();
+        let rows = serde_json::json!({
+            "enabled": true,
+            "tokens": [
+                { "index": 5, "id": "bb".repeat(32), "id_text": "rpl1fifth", "authority": { "kind": "none" }, "mint_nonce": 0, "decimals": 6 },
+            ],
+        });
+        let rpc = RpcClient::new(
+            rpc_fn(move |m, _p| {
+                log.lock().unwrap().push(m.to_string());
+                match m {
+                    "rand_getTokens" => Reply::Ok(rows.clone()),
+                    _ => Reply::Err(-32601, "unknown method"),
+                }
+            })
+            .await,
+        );
+        assert_eq!(parse_asset_amount(&rpc, 5, "1.5").await.unwrap(), 1_500_000);
+        assert!(asked.lock().unwrap().iter().all(|m| m == "rand_getTokens"), "never a per-token lookup");
+        let e = parse_asset_amount(&rpc, 5, "1.1234567").await.unwrap_err().to_string();
+        assert!(e.contains("at most 6 decimals"), "{e}");
+
+        let no_rpc = RpcClient::new(crate::test_rpc::scripted_rpc(vec![]).await);
+        assert_eq!(parse_asset_amount(&no_rpc, 0, "3.5").await.unwrap(), 3_500_000_000, "RAND never asks the node");
+    }
+
     /// Every dummy is fresh: two bundles built from the same plan share no nullifier and no
     /// commitment, and inside one bundle the four of each are distinct (the ledger's rule, and the
     /// guest's taint).
@@ -5955,6 +6050,39 @@ mod tests {
         assert_eq!((rows[0].output, rows[0].slot, rows[0].role, rows[0].key), ("mint", 0, KeyRole::Received, k));
     }
 
+    /// Task 8 (T7 review round 1): [`output_keys`] carries the memo through for whichever output
+    /// sealed one, and leaves it `None` for one that did not — the payee's row reads the memo the
+    /// sender sealed, the change row (sealed in the legacy, memo-less form here) reads `None`,
+    /// never the payee's memo leaking onto it. `rand tx-key` prints exactly this column.
+    #[test]
+    fn output_keys_carries_the_memo_for_the_output_that_has_one_and_none_for_the_one_that_does_not() {
+        let (me, you) = (Wallet::from_spend_key(SpendKey([11; 8])), Wallet::from_spend_key(SpendKey([12; 8])));
+        let pay = Note::new(you.vk.pk(), me.vk.pk(), 7, 0, 1);
+        let change = Note::new(me.vk.pk(), me.vk.pk(), 3, 0, 1);
+        let (k_pay, k_change) = (TxKey::random(), TxKey::random());
+        let bundle = Bundle {
+            anchor: [0; 8],
+            nullifiers: [[1; 8], [2; 8], [3; 8], [4; 8]],
+            commitments: [pay.commitment(), change.commitment(), [5; 8], [6; 8]],
+            fee: 1,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
+            time: 1,
+            envelopes: [
+                seal_note_as(EnvelopeFormat::Memo, &me.vk, &you.address, &pay, &k_pay, "coffee").unwrap(),
+                seal_note(&me.vk, &me.address, &change, &k_change).unwrap(),
+                env(),
+                env(),
+            ],
+            proof: vec![],
+        };
+        let tx = Transaction::shielded(7, bundle, Action::None);
+        let rows = output_keys(&me, &tx);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!((rows[0].role, rows[0].memo.as_deref()), (KeyRole::Sent, Some("coffee")));
+        assert_eq!((rows[1].role, rows[1].memo.as_deref()), (KeyRole::Change, None));
+    }
 
     // ---------------------------------------------------- the call limits (Task 5)
 
