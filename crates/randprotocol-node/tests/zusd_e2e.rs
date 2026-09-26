@@ -271,7 +271,8 @@ async fn bridge_mint(
     let index = wallet::deposit_index(&state, &assets, &asset_id).expect("the coin is a listed backing");
     let time = u32::try_from(n.rpc.head().await.unwrap()["height"].as_u64().unwrap()).unwrap();
     // The blinding is derived from the attestation digest (F1), inside `deposit_note_for`.
-    let (note, mut envelope) = wallet::deposit_note_for(relayer, to, &attestation, d.amount, index, time).unwrap();
+    let (note, mut envelope) =
+        wallet::deposit_note_for(relayer, to, &attestation, d.amount, index, time, n.rpc.envelope_format().await.unwrap()).unwrap();
     if garbage {
         // A hostile or careless relayer: bytes that decrypt under no key at all.
         envelope = Envelope {
@@ -304,6 +305,7 @@ async fn send_asset(n: &TestNode, from: &Wallet, store: &mut NoteStore, to: &Wal
         &to.address,
         asset,
         amount,
+        "",
         gas::fee_floor(&Action::None),
         FriProfile::Test,
         Backend::Cpu,

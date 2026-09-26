@@ -108,18 +108,14 @@ fn sealed_withdraw_note(payout: &ShieldedAddress, amount: u64, time: u32, format
     Ok((note, envelope))
 }
 
-/// `sealed_withdraw_note`'s format, read off the live chain: one `rand_getLimits` call for its
-/// `envelope_bytes` field. A node old enough to have no such method, or whose reply carries no
-/// such field (it predates the genesis field), leaves `envelope_bytes` at `None` — the same
-/// input that makes `EnvelopeFormat::for_chain` answer `Legacy` for a chain that never declared
-/// one at all, so `withdraw`, `aggregator withdraw` and `aggregate` all fall back the same way.
+/// `sealed_withdraw_note`'s format, read off the live chain: one `rand_getLimits` call (cached by
+/// `rpc` itself, task 7) for its `envelope_bytes` field. A node old enough to have no such
+/// method, or whose reply carries no such field (it predates the genesis field), leaves
+/// `envelope_bytes` at `None` — the same input that makes `EnvelopeFormat::for_chain` answer
+/// `Legacy` for a chain that never declared one at all, so `withdraw`, `aggregator withdraw` and
+/// `aggregate` all fall back the same way.
 async fn envelope_format(rpc: &RpcClient) -> Result<EnvelopeFormat> {
-    // `RpcClient::limits` already gives `rand_getLimits`'s one-call, old-node-tolerant read
-    // (`-32601` method-not-found -> `Ok(None)`, any other failure propagated); `envelope_bytes`
-    // is `#[serde(default)]` on `ChainLimits`, so a reply missing the field entirely (an old node
-    // that predates the genesis field, not just the method) decodes to `None` too.
-    let envelope_bytes = rpc.limits().await?.and_then(|l| l.envelope_bytes).and_then(|n| u32::try_from(n).ok());
-    Ok(EnvelopeFormat::for_chain(envelope_bytes))
+    rpc.envelope_format().await
 }
 
 /// The `--aggregation` flag: `<bond RAND>,<max_covers>,<subsidy_base RAND>,<halving_blocks>,<window>`.

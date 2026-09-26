@@ -686,7 +686,7 @@ async fn two_validators_commit_and_shielded_transfer() {
     let pay = UNITS_PER_RAND;
     let mut store = NoteStore::default();
     let slot = proving_slot().await;
-    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, "", fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -821,7 +821,7 @@ async fn a_node_that_was_down_syncs_past_a_block_carrying_a_real_proof() {
     let pay = UNITS_PER_RAND;
     let mut store = NoteStore::default();
     let slot = proving_slot().await;
-    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, "", fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -881,7 +881,7 @@ async fn two_bundles_spending_one_note_only_one_commits() {
             let (a, b) = (wallet(5), wallet(6));
             let mut store = NoteStore::default();
             let out =
-                wallet::send(&rpc, &a, &mut store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, false)
+                wallet::send(&rpc, &a, &mut store, &b.address, pay, "", fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, false)
                     .await;
             out.map(|s| (s.hash, s.amount))
         })
@@ -1286,7 +1286,7 @@ async fn unbond_below_min_stake_leaves_the_set_and_withdraw_pays_a_spendable_not
     let pay = UNITS_PER_RAND;
     let slot = proving_slot().await;
     let sent =
-        wallet::send(&n0.rpc, &payout, &mut store, &payee.address, pay, base, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::send(&n0.rpc, &payout, &mut store, &payee.address, pay, "", base, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
             .await
             .expect("the withdrawn note pays a real bundle");
     drop(slot);
@@ -1350,8 +1350,16 @@ async fn bridge_mint(
     let time = u32::try_from(node.rpc.head().await.expect("head")["height"].as_u64().expect("height")).unwrap();
     // The blinding is the attestation digest's (F1), derived inside `deposit_note_for`, so the
     // note this wallet seals against is the one the ledger will append whoever submits it.
-    let (note, envelope) =
-        wallet::deposit_note_for(relayer, to, &attestation, d.amount, index, time).expect("sealing the deposit");
+    let (note, envelope) = wallet::deposit_note_for(
+        relayer,
+        to,
+        &attestation,
+        d.amount,
+        index,
+        time,
+        node.rpc.envelope_format().await.expect("envelope format"),
+    )
+    .expect("sealing the deposit");
     let pq_signatures = pq_quorum(&attestation);
     let action = Action::BridgeAttest {
         attestation,

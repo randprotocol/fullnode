@@ -884,7 +884,9 @@ async fn main() -> Result<()> {
             }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::send_asset(&rpc, &w, &mut store, &to, asset, amount, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+            // No `--memo` flag yet (task 7 is the wallet library; a CLI flag is a later task):
+            // every `rand send` seals its payment with no memo.
+            let s = wallet::send_asset(&rpc, &w, &mut store, &to, asset, amount, "", fee, profile, backend_for(cuda)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             report(&s?, "transfer");
@@ -1214,7 +1216,7 @@ async fn main() -> Result<()> {
             // The blinding is the attestation digest's, not this wallet's (F1): the same note
             // whoever submits this attestation at this `time`, which is what makes a copier's
             // submission a conflict rather than a second, different note.
-            let (note, envelope) = wallet::deposit_note_for(&w, &recipient, &bytes, d.amount, index, time)?;
+            let (note, envelope) = wallet::deposit_note_for(&w, &recipient, &bytes, d.amount, index, time, rpc.envelope_format().await?)?;
             let owner = recipient.to_string();
             // The action names the index this envelope was sealed for, and admission refuses a
             // mismatch (`Action::BridgeAttest`) — which nothing on a listed token can now cause,

@@ -28,11 +28,15 @@ use randprotocol_core::bridge::{AssetId, Attestation, Payload};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::ledger::tokens::{MintAuthority, MINT_FROM};
 use randprotocol_core::ledger::{bridge_notes, TIME_WINDOW};
-use randprotocol_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, ShieldedAddress, Word8, DEPTH};
+use randprotocol_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, EnvelopeFormat, ShieldedAddress, Word8, DEPTH};
 use randprotocol_core::types::TX_BINDING_WORDS;
 use randprotocol_core::{format_amount, gas, Action, Hash, InitialMint, Keypair, PublicKey, Transaction};
 use randprotocol_core::{set_authority_message, token_mint_message};
-use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note};
+use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note_as};
+// `seal_note` (the format-less, always-`Legacy` sealer) is only used by test fixtures now that
+// every production sealing site goes through `seal_note_as` with the chain's format.
+#[cfg(test)]
+use randprotocol_zkvm::address::seal_note;
 use randprotocol_zkvm::executor::{prove_hidden_bundle, ZkExecutor};
 use randprotocol_zkvm::hidden::{self, HiddenDigestInput, HiddenOutput, A_SLOTS, SLOTS};
 use randprotocol_zkvm::machine::{Backend, FriProfile};
@@ -313,6 +317,11 @@ pub struct OwnedNote {
     #[serde(default)]
     pub pending: Option<u32>,
     pub height: u64,
+    /// The memo sealed with this note, on a chain whose genesis carries `envelope_bytes`
+    /// (spec 2026-09-26 §2.3). `#[serde(default)]` so a store written before the memo existed
+    /// still loads, at `None` — the same as a genuinely memo-less output.
+    #[serde(default)]
+    pub memo: Option<String>,
 }
 
 impl OwnedNote {
@@ -331,6 +340,11 @@ pub struct SentRow {
     pub to_pk: Word8,
     pub amount: u64,
     pub height: u64,
+    /// The memo this wallet sealed with the note, on a chain whose genesis carries
+    /// `envelope_bytes`. `#[serde(default)]` so a store written before the memo existed still
+    /// loads, at `None`.
+    #[serde(default)]
+    pub memo: Option<String>,
 }
 
 /// Everything scanning has learned, as JSON at `<key path>.notes.json`.
@@ -556,6 +570,9 @@ pub struct OutputKey {
     pub role: KeyRole,
     pub note: Note,
     pub key: TxKey,
+    /// The memo sealed with this output, if any (on a chain whose genesis carries
+    /// `envelope_bytes`).
+    pub memo: Option<String>,
 }
 
 /// Every output of `tx` that carries a commitment and its envelope together, in the order and
@@ -597,7 +614,8 @@ pub fn output_keys(w: &Wallet, tx: &Transaction) -> Vec<OutputKey> {
         if is_dummy(&note) {
             continue;
         }
-        rows.push(OutputKey { output, slot, cm, role, note, key });
+        let memo = env.memo(cm, &key);
+        rows.push(OutputKey { output, slot, cm, role, note, key, memo });
     }
     rows
 }
@@ -633,10 +651,10 @@ fn tree_hash() -> impl Fn(&Word8, &Word8) -> Word8 {
 /// `asset-balance` for the holder to make of what they will.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Found {
-    /// A note this wallet owns and can spend.
-    Received(Note),
-    /// A note this wallet created for someone else — history only.
-    Sent(Note),
+    /// A note this wallet owns and can spend, with its memo if the sender sealed one.
+    Received(Note, Option<String>),
+    /// A note this wallet created for someone else — history only — with the memo it carried.
+    Sent(Note, Option<String>),
     /// Not this wallet's, with the reason for the log.
     Skipped(&'static str),
 }
@@ -661,16 +679,16 @@ fn is_dummy(note: &Note) -> bool {
 pub fn classify(w: &Wallet, cm: Word8, envelope: &Envelope) -> Found {
     let env = envelope_from_core(envelope);
     let mut why = NOT_OURS;
-    if let Some((_, note)) = env.open_as_receiver(cm, &w.vk) {
+    if let Some((key, note)) = env.open_as_receiver(cm, &w.vk) {
         if note.pk == w.vk.pk() {
-            return if is_dummy(&note) { Found::Skipped(DUMMY) } else { Found::Received(note) };
+            return if is_dummy(&note) { Found::Skipped(DUMMY) } else { Found::Received(note, env.memo(cm, &key)) };
         }
         why = "sealed to this wallet but owned by another key";
     }
     // Still worth the sender path: an envelope this wallet sealed for someone else is opened
     // through `ovk`, not through the KEM, so the two openings are independent.
-    if let Some((_, note)) = env.open_as_sender(cm, &w.vk) {
-        return if is_dummy(&note) { Found::Skipped(DUMMY) } else { Found::Sent(note) };
+    if let Some((key, note)) = env.open_as_sender(cm, &w.vk) {
+        return if is_dummy(&note) { Found::Skipped(DUMMY) } else { Found::Sent(note, env.memo(cm, &key)) };
     }
     Found::Skipped(why)
 }
@@ -843,12 +861,14 @@ enum Placement {
 /// whatever its envelope says, so it is tried first and the envelope is never consulted for it.
 fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, rebuilt: &mut BTreeMap<Word8, Note>) -> Placement {
     let found = match rebuilt.remove(&row.cm) {
-        Some(note) => Found::Received(note),
+        // A rebuilt note (a deposit or a mint) is found from the transaction's public fields,
+        // never its envelope — there is nothing to open a memo out of.
+        Some(note) => Found::Received(note, None),
         None => classify(w, row.cm, &row.envelope),
     };
     match found {
         // A note can be re-offered by a rescan; the index is the leaf, so it is unique.
-        Found::Received(note) => {
+        Found::Received(note, memo) => {
             if store.notes.iter().any(|n| n.index == row.index) {
                 Placement::MineKnown
             } else {
@@ -860,13 +880,14 @@ fn place_leaf(w: &Wallet, store: &mut NoteStore, row: &CommitmentRow, rebuilt: &
                     spent: false,
                     pending: None,
                     height: row.height,
+                    memo,
                 });
                 Placement::MineNew
             }
         }
-        Found::Sent(note) => {
+        Found::Sent(note, memo) => {
             if !store.sent.iter().any(|s| s.index == row.index) {
-                store.sent.push(SentRow { index: row.index, to_pk: note.pk, amount: note.amount, height: row.height });
+                store.sent.push(SentRow { index: row.index, to_pk: note.pk, amount: note.amount, height: row.height, memo });
             }
             Placement::NotMine
         }
@@ -1334,6 +1355,9 @@ pub(crate) struct Plan {
     r_notes: Vec<OwnedNote>,
     /// The payment, if the bundle pays anyone: the recipient and the amount, in `asset`.
     to: Option<(ShieldedAddress, u64)>,
+    /// The memo sealed with the payment slot, `""` for none — never sealed with a change or
+    /// dummy slot, which is why this lives beside `to` rather than beside the whole plan.
+    memo: String,
     fee: u64,
     /// Burned from the asset's slots (`asset` must then be a token).
     burn_a: u64,
@@ -1348,6 +1372,9 @@ pub(crate) struct Spend<'a> {
     pub asset: u32,
     /// The payment, in `asset`; `None` for a bundle that pays nobody (a deploy, a bond, a burn).
     pub to: Option<(&'a ShieldedAddress, u64)>,
+    /// The memo to seal with the payment, `""` for none. A chain that predates `envelope_bytes`
+    /// refuses a non-empty one before anything is proved ([`seal_note_as`]).
+    pub memo: &'a str,
     pub fee: u64,
     pub burn_a: u64,
     pub burn_r: u64,
@@ -1360,7 +1387,7 @@ impl Plan {
     /// The fee is RAND, always (spec §3.9): a token bundle whose wallet holds no spendable RAND is
     /// refused here, with the reason, before anything is proved.
     pub(crate) fn select(store: &NoteStore, spend: Spend<'_>) -> Result<Plan> {
-        let Spend { asset, to, fee, burn_a, burn_r } = spend;
+        let Spend { asset, to, memo, fee, burn_a, burn_r } = spend;
         let amount = to.map_or(0, |(_, a)| a);
         let (a_notes, r_notes) = if asset == 0 {
             // RAND is burned through `burn_r` only; the ledger refuses a RAND `burn_a`
@@ -1398,7 +1425,7 @@ impl Plan {
             let r_notes = select_inputs(&rand, need_r).map_err(|e| anyhow!("the RAND fee: {e}"))?;
             (a_notes, r_notes)
         };
-        Ok(Plan { asset, a_notes, r_notes, to: to.map(|(d, a)| (d.clone(), a)), fee, burn_a, burn_r })
+        Ok(Plan { asset, a_notes, r_notes, to: to.map(|(d, a)| (d.clone(), a)), memo: memo.to_string(), fee, burn_a, burn_r })
     }
 
     fn amount(&self) -> u64 {
@@ -1552,8 +1579,11 @@ impl Proving {
 /// and a zero-value output to a throwaway key, **each with a fresh blinding** — two identical
 /// dummies would repeat a nullifier or a commitment and taint the proof (spec §3.3), and a
 /// repeated one across transactions would be refused as spent. Every output envelope is sealed
-/// under its own fresh transaction key.
-fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]], time: u32) -> Result<Prepared> {
+/// under its own fresh transaction key, in the chain's envelope `format`: only the payment slot
+/// (`Payee::To`) ever carries `plan.memo` — change (`Payee::Me`) and every dummy (`Payee::Nobody`)
+/// are sealed with `""`, so every slot is the same size whether or not this transaction pays
+/// anyone a memo (spec 2026-09-26 §2.4).
+fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]], time: u32, format: EnvelopeFormat) -> Result<Prepared> {
     let pk_self = w.vk.pk();
     let asset = plan.asset;
     if paths.len() != plan.inputs().count() {
@@ -1599,9 +1629,9 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
         commitments[k] = note.commitment();
         let key = TxKey::random();
         let sealed = match (&payee, &nobody) {
-            (Payee::To(dest), _) => seal_note(&w.vk, dest, &note, &key),
-            (Payee::Me, _) => seal_note(&w.vk, &w.address, &note, &key),
-            (Payee::Nobody, Some(t)) => seal_note(&t.vk, &t.address, &note, &key),
+            (Payee::To(dest), _) => seal_note_as(format, &w.vk, dest, &note, &key, &plan.memo),
+            (Payee::Me, _) => seal_note_as(format, &w.vk, &w.address, &note, &key, ""),
+            (Payee::Nobody, Some(t)) => seal_note_as(format, &t.vk, &t.address, &note, &key, ""),
             (Payee::Nobody, None) => unreachable!("a throwaway key for every dummy"),
         };
         envelopes.push(sealed.map_err(|e| anyhow!("sealing output {k}'s envelope: {e}"))?);
@@ -1656,7 +1686,7 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
 /// however long ago the last leaf landed, which is the case a checkpoint alone cannot cover).
 /// Failing that, the newest checkpoint the node still serves — the local tree is frozen at its
 /// checkpoints, so where the old code looped on "tree moved; retry" this one rescans once.
-async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan: &Plan) -> Result<(Prepared, u32)> {
+async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan: &Plan, format: EnvelopeFormat) -> Result<(Prepared, u32)> {
     let h = tree_hash();
     for attempt in 0..2 {
         let live = store.tree.root(&h);
@@ -1692,7 +1722,7 @@ async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan
                     .with_context(|| format!("no local witness for note {}; the store's tree is incomplete", n.index))?;
                 paths.push(path);
             }
-            return Ok((build_bundle(w, plan, root, &paths, time)?, time));
+            return Ok((build_bundle(w, plan, root, &paths, time, format)?, time));
         }
         if attempt == 1 {
             return Err(anyhow!(
@@ -1779,7 +1809,11 @@ async fn submit_spend(
 ) -> Result<Submission> {
     scan(rpc, w, store).await?;
     let plan = Plan::select(store, spend)?;
-    let (prepared, time) = prepare_bundle(rpc, w, store, &plan).await?;
+    // One `rand_getLimits` read (cached after the first) decides the envelope every slot of this
+    // bundle is sealed in — before any proof is paid for, a memo this chain cannot carry is
+    // refused inside `build_bundle`.
+    let format = rpc.envelope_format().await?;
+    let (prepared, time) = prepare_bundle(rpc, w, store, &plan, format).await?;
     // The whole transaction first, its bundle's proof empty; then the proof, bound to it. Nothing
     // is set on the transaction after the proof but the proof itself.
     let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), action);
@@ -1845,7 +1879,10 @@ async fn submit_with(
             ))
         }
     };
-    let spend = Spend { asset: 0, to, fee, burn_a: 0, burn_r: burn.units() };
+    // `submit`/`submit_with` carries no memo of its own: every caller in this workspace passes
+    // `to: None` (a deploy, a bond, a bridge action), and the one path that pays someone a memo
+    // is `send`/`send_asset`, below.
+    let spend = Spend { asset: 0, to, memo: "", fee, burn_a: 0, burn_r: burn.units() };
     submit_spend(rpc, w, store, spend, action, burn, proving, chain_id, wait).await
 }
 
@@ -2053,7 +2090,7 @@ async fn submit_burn_with(
     // release unit and its locked amount among them, since one token's backings are held apart.
     burn_is_possible(&rpc.bridge_state().await?, asset, to_chain, &token, amount, relayer_fee)?;
     let action = Action::BridgeBurn { asset, amount, relayer_fee, to_chain, token, to };
-    let spend = Spend { asset, to: None, fee, burn_a: amount, burn_r: 0 };
+    let spend = Spend { asset, to: None, memo: "", fee, burn_a: amount, burn_r: 0 };
     submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, proving, chain_id, wait).await
 }
 
@@ -2107,7 +2144,7 @@ async fn submit_token_burn_with(
         ));
     }
     let action = Action::TokenBurn { asset, amount };
-    let spend = Spend { asset, to: None, fee, burn_a: amount, burn_r: 0 };
+    let spend = Spend { asset, to: None, memo: "", fee, burn_a: amount, burn_r: 0 };
     submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, proving, chain_id, wait).await
 }
 
@@ -2454,11 +2491,12 @@ pub fn deposit_note_for(
     amount: u64,
     asset: u32,
     time: u32,
+    format: EnvelopeFormat,
 ) -> Result<(Note, Envelope)> {
     let r = bridge_notes::deposit_r(attestation).ok_or_else(|| anyhow!("the attestation has no body to derive the deposit blinding from"))?;
     let note = Note { pk: recipient.pk, from: [0; 8], amount, asset, time, r };
-    let envelope =
-        seal_note(&w.vk, recipient, &note, &TxKey::random()).map_err(|e| anyhow!("sealing the deposit envelope: {e}"))?;
+    let envelope = seal_note_as(format, &w.vk, recipient, &note, &TxKey::random(), "")
+        .map_err(|e| anyhow!("sealing the deposit envelope: {e}"))?;
     Ok((note, envelope))
 }
 
@@ -2474,10 +2512,11 @@ pub fn mint_note_for(
     amount: u64,
     asset: u32,
     time: u32,
+    format: EnvelopeFormat,
 ) -> Result<(Note, Envelope)> {
     let note = Note::new(recipient.pk, MINT_FROM, amount, asset, time);
-    let envelope =
-        seal_note(&w.vk, recipient, &note, &TxKey::random()).map_err(|e| anyhow!("sealing the mint envelope: {e}"))?;
+    let envelope = seal_note_as(format, &w.vk, recipient, &note, &TxKey::random(), "")
+        .map_err(|e| anyhow!("sealing the mint envelope: {e}"))?;
     Ok((note, envelope))
 }
 
@@ -2694,7 +2733,7 @@ pub async fn build_register_token(
             }
             let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
                 .context("chain height does not fit a note's time field")?;
-            let (note, envelope) = mint_note_for(w, &recipient, amount, index, time)?;
+            let (note, envelope) = mint_note_for(w, &recipient, amount, index, time, rpc.envelope_format().await?)?;
             Some(InitialMint { amount, recipient, r: note.r, time, envelope })
         }
         None => None,
@@ -2749,7 +2788,7 @@ pub async fn build_token_mint(
     let (asset_id, nonce) = row_id_and_nonce(row, asset)?;
     let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
         .context("chain height does not fit a note's time field")?;
-    let (note, envelope) = mint_note_for(w, recipient, amount, asset, time)?;
+    let (note, envelope) = mint_note_for(w, recipient, amount, asset, time, rpc.envelope_format().await?)?;
     let cm = note.commitment();
     let signature = authority.sign(token_mint_message(chain_id, &asset_id, nonce, amount, &cm, &envelope).as_bytes());
     Ok(Action::TokenMint { asset, amount, recipient: recipient.clone(), r: note.r, time, envelope, nonce, signature })
@@ -3064,13 +3103,14 @@ pub async fn send(
     store: &mut NoteStore,
     to: &ShieldedAddress,
     amount: u64,
+    memo: &str,
     fee: u64,
     profile: FriProfile,
     backend: Backend,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    send_asset(rpc, w, store, to, 0, amount, fee, profile, backend, chain_id, wait).await
+    send_asset(rpc, w, store, to, 0, amount, memo, fee, profile, backend, chain_id, wait).await
 }
 
 /// A shielded transfer of any asset — RAND (`asset` 0) or a token by its registry index — as a
@@ -3085,13 +3125,14 @@ pub async fn send_asset(
     to: &ShieldedAddress,
     asset: u32,
     amount: u64,
+    memo: &str,
     fee: u64,
     profile: FriProfile,
     backend: Backend,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    send_asset_with(rpc, w, store, to, asset, amount, fee, Proving::Real(profile, backend), chain_id, wait).await
+    send_asset_with(rpc, w, store, to, asset, amount, memo, fee, Proving::Real(profile, backend), chain_id, wait).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3102,6 +3143,7 @@ async fn send_asset_with(
     to: &ShieldedAddress,
     asset: u32,
     amount: u64,
+    memo: &str,
     fee: u64,
     proving: Proving,
     chain_id: u64,
@@ -3110,7 +3152,7 @@ async fn send_asset_with(
     if amount == 0 {
         return Err(anyhow!("a transfer of zero moves nothing"));
     }
-    let spend = Spend { asset, to: Some((to, amount)), fee, burn_a: 0, burn_r: 0 };
+    let spend = Spend { asset, to: Some((to, amount)), memo, fee, burn_a: 0, burn_r: 0 };
     submit_spend(rpc, w, store, spend, Action::None, Burn::None, proving, chain_id, wait).await
 }
 
@@ -3129,7 +3171,7 @@ mod tests {
 
     fn owned_asset(index: u64, amount: u64, spent: bool, asset: u32) -> OwnedNote {
         let note = Note::new([1; 8], [2; 8], amount, asset, 3);
-        OwnedNote { index, cm: note.commitment(), nf: [index as u32; 8], note, spent, pending: None, height: index }
+        OwnedNote { index, cm: note.commitment(), nf: [index as u32; 8], note, spent, pending: None, height: index, memo: None }
     }
 
     /// The test token these attestations are about: chain 2's `0xaa…`.
@@ -3633,7 +3675,7 @@ mod tests {
 
         // The genuine case: a note owned by me, sealed to me.
         let mine = Note::new(me.vk.pk(), stranger.vk.pk(), 5, 0, 1);
-        assert_eq!(classify(&me, mine.commitment(), &sealed(&stranger, &me, &mine)), Found::Received(mine));
+        assert_eq!(classify(&me, mine.commitment(), &sealed(&stranger, &me, &mine)), Found::Received(mine, None));
 
         // Sealed to my encapsulation key, which anyone can do, but owned by someone else. The
         // envelope opens and the commitment matches; the note is still not mine, and counting it
@@ -3647,11 +3689,11 @@ mod tests {
         // A bridged asset is recorded like any other note (S3): the `asset` word is the registry's
         // index for a token, and skipping it would make a bridge deposit invisible to its owner.
         let bridged = Note::new(me.vk.pk(), stranger.vk.pk(), 7, 3, 1);
-        assert_eq!(classify(&me, bridged.commitment(), &sealed(&stranger, &me, &bridged)), Found::Received(bridged));
+        assert_eq!(classify(&me, bridged.commitment(), &sealed(&stranger, &me, &bridged)), Found::Received(bridged, None));
 
         // A note I created for someone else is history, reached through `ovk`, not the KEM.
         let paid = Note::new(stranger.vk.pk(), me.vk.pk(), 3, 0, 1);
-        assert_eq!(classify(&me, paid.commitment(), &sealed(&me, &stranger, &paid)), Found::Sent(paid));
+        assert_eq!(classify(&me, paid.commitment(), &sealed(&me, &stranger, &paid)), Found::Sent(paid, None));
 
         // Someone else's transaction between two strangers opens with no key of mine.
         let elsewhere = Note::new(stranger.vk.pk(), stranger.vk.pk(), 9, 0, 1);
@@ -3771,7 +3813,7 @@ mod tests {
         use randprotocol_core::confidential::ConfidentialExecutor;
         let me = Wallet::from_spend_key(SpendKey([23; 8]));
         let a = transfer_attestation(1_000, me.address.recipient_hash());
-        let (note, envelope) = deposit_note_for(&me, &me.address, &a, 1_000, 3, 41).unwrap();
+        let (note, envelope) = deposit_note_for(&me, &me.address, &a, 1_000, 3, 41, EnvelopeFormat::Legacy).unwrap();
         // `ConfidentialExecutor::note_commitment` is the function `bridge_notes` computes the
         // deposit's commitment through, on the ledger's side of the same wire — over the action's
         // own `r`, which is this note's.
@@ -3779,24 +3821,24 @@ mod tests {
         assert_eq!(note.commitment(), ex.note_commitment(&me.address.pk, &[0; 8], 1_000, 3, 41, &note.r));
         assert_eq!((note.amount, note.asset, note.time, note.from), (1_000, 3, 41, [0; 8]));
         // And the envelope published with it opens back to that note, as the recipient.
-        assert_eq!(classify(&me, note.commitment(), &envelope), Found::Received(note));
+        assert_eq!(classify(&me, note.commitment(), &envelope), Found::Received(note, None));
         // A different `time` is a different note: this is why `time` is on the action.
-        let (later, _) = deposit_note_for(&me, &me.address, &a, 1_000, 3, 42).unwrap();
+        let (later, _) = deposit_note_for(&me, &me.address, &a, 1_000, 3, 42, EnvelopeFormat::Legacy).unwrap();
         assert_ne!(later.commitment(), note.commitment());
         // The blinding is not drawn, it is derived (F1): this attestation's digest fixes it, so
         // every submitter of it builds the very same note — and the ledger admits no other `r`
         // (`bridge_notes::deposit_r`, the rule `validate` enforces).
         assert_eq!(note.r, bridge_notes::deposit_r(&a).unwrap());
-        assert_eq!(deposit_note_for(&me, &me.address, &a, 1_000, 3, 41).unwrap().0.r, note.r);
+        assert_eq!(deposit_note_for(&me, &me.address, &a, 1_000, 3, 41, EnvelopeFormat::Legacy).unwrap().0.r, note.r);
         let other = transfer_attestation(999, me.address.recipient_hash());
         assert_ne!(bridge_notes::deposit_r(&other).unwrap(), note.r, "another attestation, another blinding");
-        assert!(deposit_note_for(&me, &me.address, &[0xff; 4], 1_000, 3, 41).is_err(), "no body, no note");
+        assert!(deposit_note_for(&me, &me.address, &[0xff; 4], 1_000, 3, 41, EnvelopeFormat::Legacy).is_err(), "no body, no note");
     }
 
     // ------------------------------------------------ the hidden-asset bundle, end to end
     //
     // Every test below drives the real submission path — scan, plan, anchor and witnesses, build,
-    // assemble, bind, prove, submit — against `FakeChain`, a node kept in memory behind a real
+    // assemble, bind, prove, submit — against `ChainState`, a node kept in memory behind a real
     // HTTP socket. "Proving" is the hidden guest run in the emulator on the witness the wallet
     // built, against the transaction's own binding: the digest it publishes is checked against
     // the wallet's exactly as a real proof's is, and it is what the stub proof then carries. So
@@ -3824,7 +3866,7 @@ mod tests {
 
     /// A node in memory: the commitment tree and its envelopes, the blocks, the nullifiers, what
     /// was submitted, and the bridge's two replies.
-    struct FakeChain {
+    struct ChainState {
         tree: randprotocol_zkvm::ledger::CommitmentTree,
         leaves: Vec<(Word8, Envelope, u64)>,
         /// `roots[h]` is the tree root at the end of block `h` — what `rand_getAnchor(h)` answers,
@@ -3855,6 +3897,10 @@ mod tests {
         /// How many `rand_getWitness` calls this node has answered. A wallet that keeps its own
         /// tree (audit v3 PRIV-1) never makes one, so every send asserts this stays at zero.
         witness_calls: usize,
+        /// `rand_getLimits`' `envelope_bytes` (task 7): `None` — this fake's default — is a chain
+        /// that predates the field, same as a genuinely absent one; `Some(MEMO_ENVELOPE_BYTES)`
+        /// is the memo format.
+        envelope_bytes: Option<u32>,
     }
 
     fn kind(a: &Action) -> &'static str {
@@ -3874,10 +3920,10 @@ mod tests {
         })
     }
 
-    impl FakeChain {
-        fn new() -> FakeChain {
+    impl ChainState {
+        fn new() -> ChainState {
             let tree = randprotocol_zkvm::ledger::CommitmentTree::new();
-            FakeChain {
+            ChainState {
                 roots: vec![tree.root()],
                 tree,
                 leaves: Vec::new(),
@@ -3892,6 +3938,7 @@ mod tests {
                 floor: 0,
                 genesis: Hash([9; 32]),
                 witness_calls: 0,
+                envelope_bytes: None,
             }
         }
 
@@ -4001,15 +4048,131 @@ mod tests {
                 "rand_getBridgeState" => self.bridge.clone(),
                 "rand_getAssets" => self.assets.clone(),
                 "rand_getTokens" => self.tokens.clone(),
+                "rand_getLimits" => json!({
+                    "max_program_words": 4096, "max_proof_bytes": 2_097_152, "max_block_bytes": 4_194_304,
+                    "max_call_envelope_bytes": 18_432, "max_program_public_words": 64,
+                    "envelope_bytes": self.envelope_bytes,
+                }),
                 _ => return Reply::Err(-32601, "unknown method"),
             })
         }
     }
 
     /// The chain behind a real socket, and a client for it.
-    async fn serve(chain: &Arc<Mutex<FakeChain>>) -> RpcClient {
+    async fn serve(chain: &Arc<Mutex<ChainState>>) -> RpcClient {
         let c = chain.clone();
         RpcClient::new(rpc_fn(move |m, p| c.lock().unwrap().answer(m, p)).await)
+    }
+
+    /// A whole [`ChainState`] plus a ready client for it, for the memo tests' one-call shape: fund
+    /// a wallet, send with a memo, and look at what went out and what the payee scanned — every
+    /// other test in this module drives `ChainState` and [`serve`] directly, because it wants to
+    /// reach in at some step no send hides (a stale root, a garbage envelope, a second submission
+    /// against the same plan); this is for the tests that just want a send to have happened.
+    ///
+    /// [`FakeChain::send`] uses a fee of 1, not [`gas::BUNDLE_BASE`]: this fake never checks a fee
+    /// floor (there is no ledger behind it, only `ChainState::answer`), and a real floor would
+    /// swallow whole the small `funded_wallet` amounts the memo tests fund with.
+    struct FakeChain {
+        inner: Arc<Mutex<ChainState>>,
+    }
+
+    impl FakeChain {
+        /// A fresh chain whose `rand_getLimits` answers `envelope_bytes` as given:
+        /// `Some(notes::MEMO_ENVELOPE_BYTES as u32)` is the memo format, `None` is the legacy one
+        /// (chain 14's shape, and every chain that predates the field).
+        fn with_envelope_bytes(bytes: Option<u32>) -> FakeChain {
+            let mut c = ChainState::new();
+            c.envelope_bytes = bytes;
+            FakeChain { inner: Arc::new(Mutex::new(c)) }
+        }
+
+        /// A fresh wallet funded with `amount` RAND (asset 0), in a block of its own.
+        fn funded_wallet(&self, amount: u64) -> Wallet {
+            let w = Wallet::generate();
+            self.inner.lock().unwrap().fund(&w, amount, 0);
+            w
+        }
+
+        /// A fresh wallet this chain has never funded — a payee with nothing to scan yet.
+        fn fresh_wallet(&self) -> Wallet {
+            Wallet::generate()
+        }
+
+        /// `wallet::send_asset` (the emulated prover, so this takes no proving slot), then commits
+        /// the sent transaction's own outputs as the next block — the real node's job, which this
+        /// fake otherwise leaves to the caller (see every other test's manual `commit`) — so a
+        /// scan of the payee finds it without a second, separate step.
+        async fn send(&self, from: &Wallet, to: &ShieldedAddress, amount: u64, memo: &str) -> Result<Submission> {
+            let rpc = serve(&self.inner).await;
+            let mut store = NoteStore::default();
+            let submission = send_asset_with(&rpc, from, &mut store, to, 0, amount, memo, 1, Proving::Emulated, 7, false).await?;
+            let tx = self.last_tx();
+            let b = tx.bundle.as_ref().expect("a plain transfer has a bundle");
+            let leaves: Vec<(Word8, Envelope)> = b.commitments.iter().zip(&b.envelopes).map(|(cm, e)| (*cm, e.clone())).collect();
+            self.inner.lock().unwrap().commit(vec![tx], leaves);
+            Ok(submission)
+        }
+
+        /// The last transaction this chain admitted (`rand_sendTransaction`).
+        fn last_tx(&self) -> Transaction {
+            self.inner.lock().unwrap().sent.last().expect("a transaction has been sent").clone()
+        }
+
+        /// A fresh scan of `w` against this chain, from an empty store.
+        async fn scan(&self, w: &Wallet) -> NoteStore {
+            let rpc = serve(&self.inner).await;
+            let mut store = NoteStore::default();
+            scan(&rpc, w, &mut store).await.expect("scan");
+            store
+        }
+    }
+
+    /// Task 7: a chain whose genesis carries `envelope_bytes` seals every output at exactly
+    /// `MEMO_ENVELOPE_BYTES` (spec 2026-09-26 §2.4) — the payment slot's memo included — and the
+    /// payee (from the envelope) and the sender (from their own `sent` row) both read it back.
+    #[tokio::test]
+    async fn on_a_memo_chain_every_output_is_1860_bytes_and_the_payee_reads_the_memo() {
+        let chain = FakeChain::with_envelope_bytes(Some(1860)); // add this constructor: sets rand_getLimits' field
+        let (alice, bob) = (chain.funded_wallet(10), chain.fresh_wallet());
+        chain.send(&alice, &bob.address, 1, "coffee").await.unwrap();
+        for e in chain.last_tx().bundle.unwrap().envelopes.iter() {
+            assert_eq!(e.len(), 1860);
+        }
+        let bob_store = chain.scan(&bob).await;
+        assert_eq!(bob_store.notes[0].memo.as_deref(), Some("coffee"));
+        let alice_store = chain.scan(&alice).await;
+        assert_eq!(alice_store.sent[0].memo.as_deref(), Some("coffee"));
+    }
+
+    /// Chain 14 (and every chain whose `rand_getLimits` carries no `envelope_bytes` at all) stays
+    /// on the 1 348-byte legacy shape, and a non-empty memo is refused before anything is proved
+    /// — never silently dropped.
+    #[tokio::test]
+    async fn on_chain_14_the_wallet_seals_the_old_format_and_refuses_a_memo() {
+        let chain = FakeChain::with_envelope_bytes(None);
+        let (alice, bob) = (chain.funded_wallet(10), chain.fresh_wallet());
+        let err = chain.send(&alice, &bob.address, 1, "coffee").await.unwrap_err();
+        assert!(err.to_string().contains("no memo"));
+        chain.send(&alice, &bob.address, 1, "").await.unwrap();
+        for e in chain.last_tx().bundle.unwrap().envelopes.iter() {
+            assert_eq!(e.len(), 1348, "an old wallet can open it");
+        }
+    }
+
+    /// A note store written before the memo existed has no `memo` key at all; it still loads,
+    /// at `None` — the same `#[serde(default)]` `pending` already relies on.
+    #[test]
+    fn a_store_written_before_the_memo_loads() {
+        let note = Note::new([1; 8], [2; 8], 5, 0, 3);
+        let json = format!(
+            r#"{{"index":1,"note":"{}","cm":"{}","nf":"{}","spent":false,"height":3}}"#,
+            hex::encode(note.to_bytes()),
+            word8_to_hex(&note.commitment()),
+            word8_to_hex(&[9; 8]),
+        );
+        let n: OwnedNote = serde_json::from_str(&json).unwrap();
+        assert_eq!(n.memo, None);
     }
 
     /// Everything the chain would check of a submitted bundle without its proof, plus the proof
@@ -4161,7 +4324,7 @@ mod tests {
     async fn a_garbage_envelope_deposit_is_still_found_and_spendable_by_its_recipient() {
         let me = Wallet::from_spend_key(SpendKey([41; 8]));
         let you = Wallet::from_spend_key(SpendKey([43; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         let (txs, notes) = public_notes_for(&me);
         {
             let mut c = chain.lock().unwrap();
@@ -4181,7 +4344,7 @@ mod tests {
         scan(&rpc, &me, &mut store).await.unwrap();
         assert_eq!(store.notes.len(), 4);
 
-        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 3, 400, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 3, 400, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
             .await
             .expect("the deposit is spendable");
         assert_eq!((s.amount, s.change, s.asset, s.rand_change), (400, 600, 3, gas::BUNDLE_BASE));
@@ -4194,13 +4357,13 @@ mod tests {
         // The payee finds 400 of asset 3 in slot 0; the sender's change is slot 1 (asset) and slot 2
         // (RAND); slot 3 is a dummy nobody opens.
         let theirs = slots_for(&you, &tx);
-        let Found::Received(paid) = theirs[0] else { panic!("slot 0 pays the payee: {theirs:?}") };
+        let Found::Received(paid, _) = theirs[0] else { panic!("slot 0 pays the payee: {theirs:?}") };
         assert_eq!((paid.amount, paid.asset, paid.from), (400, 3, me.vk.pk()));
         assert!(theirs[1..].iter().all(opens_to_nobody), "{theirs:?}");
         let mine = slots_for(&me, &tx);
-        assert!(matches!(mine[0], Found::Sent(n) if n.amount == 400));
-        assert!(matches!(mine[1], Found::Received(n) if n.amount == 600 && n.asset == 3));
-        assert!(matches!(mine[2], Found::Received(n) if n.amount == gas::BUNDLE_BASE && n.asset == 0));
+        assert!(matches!(mine[0], Found::Sent(n, _) if n.amount == 400));
+        assert!(matches!(mine[1], Found::Received(n, _) if n.amount == 600 && n.asset == 3));
+        assert!(matches!(mine[2], Found::Received(n, _) if n.amount == gas::BUNDLE_BASE && n.asset == 0));
         assert!(opens_to_nobody(&mine[3]), "{:?}", mine[3]);
         // `--no-wait`: the two spent notes are held back until the chain answers.
         assert_eq!(store.balance_of(3), 0);
@@ -4258,7 +4421,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_scan_never_saves_a_cursor_past_an_unplaced_deposit() {
         let me = Wallet::from_spend_key(SpendKey([55; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         let (txs, notes) = public_notes_for(&me);
         {
             let mut c = chain.lock().unwrap();
@@ -4296,7 +4459,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_rebuilt_note_below_the_leaf_cursor_is_placed_by_the_recovery_pass() {
         let me = Wallet::from_spend_key(SpendKey([56; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         let (txs, notes) = public_notes_for(&me);
         {
             let mut c = chain.lock().unwrap();
@@ -4334,7 +4497,7 @@ mod tests {
             scanned_height: 240_000,
             scanned_attest_height: 240_000,
             notes: vec![owned(0, 5, false)],
-            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2 }],
+            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2, memo: None }],
             ..NoteStore::default()
         };
         assert_eq!(store.bind(this), Bound::Reset { previous: Some(other) });
@@ -4385,7 +4548,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_store_carried_from_another_chain_finds_its_notes_on_this_one() {
         let me = Wallet::from_spend_key(SpendKey([58; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         chain.lock().unwrap().fund(&me, 5, 0);
         let rpc = serve(&chain).await;
         let mut store = NoteStore {
@@ -4429,7 +4592,7 @@ mod tests {
         let you = Wallet::from_spend_key(SpendKey([57; 8]));
         let mut store = NoteStore { notes: vec![owned_asset(0, 500, false, 4), owned_asset(1, 3_000_000, false, 0)], ..NoteStore::default() };
         store.notes[1].pending = Some(9);
-        let spend = Spend { asset: 4, to: Some((&you.address, 100)), fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0 };
+        let spend = Spend { asset: 4, to: Some((&you.address, 100)), memo: "", fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0 };
         let e = Plan::select(&store, spend).unwrap_err().to_string();
         assert!(e.contains("0.003 RAND is held by a pending submission") && e.contains("rand sync"), "{e}");
         store.notes[1].spent = true;
@@ -4443,22 +4606,22 @@ mod tests {
     async fn a_rand_payment_rides_slots_2_and_3_and_its_dummies_open_to_nobody() {
         let me = Wallet::from_spend_key(SpendKey([44; 8]));
         let you = Wallet::from_spend_key(SpendKey([45; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         chain.lock().unwrap().fund(&me, 7_000_000, 0);
         chain.lock().unwrap().fund(&me, 3_000_000, 0);
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
         // Needs both notes: neither alone covers 8 000 000 + the fee.
-        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
             .await
             .unwrap();
         assert_eq!((s.amount, s.change, s.asset, s.burn), (8_000_000, 2_000_000 - gas::BUNDLE_BASE, 0, Burn::None));
         let tx = chain.lock().unwrap().sent.pop().unwrap();
         assert_admissible_shape(&tx);
         let theirs = slots_for(&you, &tx);
-        assert!(matches!(theirs[2], Found::Received(n) if n.amount == 8_000_000 && n.asset == 0), "{theirs:?}");
+        assert!(matches!(theirs[2], Found::Received(n, _) if n.amount == 8_000_000 && n.asset == 0), "{theirs:?}");
         let mine = slots_for(&me, &tx);
-        assert!(matches!(mine[3], Found::Received(n) if n.amount == 2_000_000 - gas::BUNDLE_BASE));
+        assert!(matches!(mine[3], Found::Received(n, _) if n.amount == 2_000_000 - gas::BUNDLE_BASE));
         for k in [0, 1] {
             assert!(opens_to_nobody(&mine[k]) && opens_to_nobody(&theirs[k]), "slot {k}: {:?} {:?}", mine[k], theirs[k]);
         }
@@ -4488,13 +4651,13 @@ mod tests {
     async fn send_makes_no_witness_call() {
         let me = Wallet::from_spend_key(SpendKey([61; 8]));
         let you = Wallet::from_spend_key(SpendKey([62; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         chain.lock().unwrap().fund(&me, 7_000_000, 0);
         chain.lock().unwrap().fund(&me, 3_000_000, 0);
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
         // Two inputs, the shape that asked for two witnesses before this change.
-        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
             .await
             .unwrap();
         assert_eq!(chain.lock().unwrap().witness_calls, 0, "the wallet computes its own witnesses (PRIV-1)");
@@ -4540,7 +4703,7 @@ mod tests {
     async fn a_pre_tree_store_scans_and_sends_without_a_witness_call() {
         let me = Wallet::from_spend_key(SpendKey([63; 8]));
         let you = Wallet::from_spend_key(SpendKey([64; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         chain.lock().unwrap().fund(&me, 7_000_000, 0);
         chain.lock().unwrap().fund(&me, 3_000_000, 0);
         let rpc = serve(&chain).await;
@@ -4559,7 +4722,7 @@ mod tests {
         assert_eq!(store.notes.len(), 2, "no note was duplicated");
         assert!(store.tree.path(0).is_some() && store.tree.path(1).is_some());
         // And a send takes its witnesses from the rebuilt tree, never from the node.
-        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
             .await
             .unwrap();
         assert_eq!(chain.lock().unwrap().witness_calls, 0);
@@ -4576,7 +4739,7 @@ mod tests {
         let me = Wallet::from_spend_key(SpendKey([65; 8]));
         let you = Wallet::from_spend_key(SpendKey([66; 8]));
         let stranger = Wallet::from_spend_key(SpendKey([67; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         chain.lock().unwrap().fund(&me, 7_000_000, 0);
         chain.lock().unwrap().fund(&me, 3_000_000, 0);
         let rpc = serve(&chain).await;
@@ -4587,16 +4750,16 @@ mod tests {
         chain.lock().unwrap().fund(&stranger, 5, 0);
 
         // Preparing against the stale store anchors at the freshest checkpoint the node confirms.
-        let spend = Spend { asset: 0, to: Some((&you.address, 8_000_000)), fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0 };
+        let spend = Spend { asset: 0, to: Some((&you.address, 8_000_000)), memo: "", fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0 };
         let plan = Plan::select(&store, spend).unwrap();
-        let (prepared, time) = prepare_bundle(&rpc, &me, &mut store, &plan).await.unwrap();
+        let (prepared, time) = prepare_bundle(&rpc, &me, &mut store, &plan, EnvelopeFormat::Legacy).await.unwrap();
         assert_eq!(time, 2, "the checkpoint's height, not the moved head's");
         assert_eq!(prepared.bundle.anchor, scanned_root, "frozen at the checkpoint");
         assert_eq!(chain.lock().unwrap().witness_calls, 0);
 
         // A full send rescans first and anchors at the moved head: the (emulated) guest still
         // accepts every witness, because the appends advanced them.
-        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
             .await
             .unwrap();
         assert_eq!(s.time, 3);
@@ -4615,7 +4778,7 @@ mod tests {
     async fn a_recovered_note_at_a_leaf_the_tree_misfiled_gets_its_witness_back() {
         let me = Wallet::from_spend_key(SpendKey([69; 8]));
         let you = Wallet::from_spend_key(SpendKey([70; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         let (txs, notes) = public_notes_for(&me);
         {
             let mut c = chain.lock().unwrap();
@@ -4640,7 +4803,7 @@ mod tests {
         assert_eq!(store.asset_balances(), vec![(0, 10_000_000), (3, 1_000)], "the deposit recovered");
         assert!(store.tree.path(0).is_some(), "and it has a witness after the rebuild");
         // Spendable, and its witness comes from the rebuilt tree — never from the node.
-        send_asset_with(&rpc, &me, &mut store, &you.address, 3, 400, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        send_asset_with(&rpc, &me, &mut store, &you.address, 3, 400, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
             .await
             .expect("the recovered deposit is spendable");
         assert_eq!(chain.lock().unwrap().witness_calls, 0);
@@ -4654,7 +4817,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_spent_notes_witness_is_forgotten() {
         let me = Wallet::from_spend_key(SpendKey([68; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         chain.lock().unwrap().fund(&me, 7_000_000, 0);
         chain.lock().unwrap().fund(&me, 3_000_000, 0);
         let rpc = serve(&chain).await;
@@ -4683,22 +4846,22 @@ mod tests {
     async fn a_token_transfer_without_rand_for_the_fee_is_refused_before_proving() {
         let me = Wallet::from_spend_key(SpendKey([46; 8]));
         let you = Wallet::from_spend_key(SpendKey([47; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         chain.lock().unwrap().fund(&me, 500, 4);
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
-        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 100, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 100, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("a transfer pays its fee in RAND"), "{e}");
         chain.lock().unwrap().fund(&me, gas::BUNDLE_BASE, 0);
-        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 501, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 501, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("asset 4") && e.contains("insufficient"), "{e}");
-        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 0, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 0, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
@@ -4714,7 +4877,7 @@ mod tests {
     async fn a_bridge_burn_is_one_bundle_burning_the_asset_and_paying_rand() {
         let me = Wallet::from_spend_key(SpendKey([48; 8]));
         let token = [0xd7u8; 32];
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         {
             let mut c = chain.lock().unwrap();
             c.bridge = serde_json::json!({ "enabled": true, "assets": [asset_row(3, 2, token, 8, 700)] });
@@ -4745,7 +4908,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_token_burn_burns_through_burn_a_and_a_bridged_token_is_refused_before_proving() {
         let me = Wallet::from_spend_key(SpendKey([49; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         {
             let mut c = chain.lock().unwrap();
             c.assets = serde_json::json!([{ "index": 2, "chain": 2, "token": hex::encode([1u8; 32]), "asset_id": hex::encode([2u8; 32]) }]);
@@ -4807,7 +4970,7 @@ mod tests {
         let me = Wallet::from_spend_key(SpendKey([66; 8]));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("authority.key.json");
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         {
             let mut c = chain.lock().unwrap();
             c.tokens = serde_json::json!({ "enabled": true, "registration_fee": 0, "next_index": 1, "tokens": [] });
@@ -4916,7 +5079,7 @@ mod tests {
         let me = Wallet::from_spend_key(SpendKey([67; 8]));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("authority.key.json");
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         {
             let mut c = chain.lock().unwrap();
             c.tokens = serde_json::json!({ "enabled": true, "registration_fee": 0, "next_index": 1, "tokens": [] });
@@ -4985,7 +5148,7 @@ mod tests {
         let me = Wallet::from_spend_key(SpendKey([68; 8]));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("authority.key.json");
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         {
             let mut c = chain.lock().unwrap();
             c.tokens = serde_json::json!({ "enabled": true, "registration_fee": 0, "next_index": 1, "tokens": [] });
@@ -5034,7 +5197,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn register_token_fixed_supply_and_key_authority_ride_a_rand_fee_bundle() {
         let me = Wallet::from_spend_key(SpendKey([61; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         {
             let mut c = chain.lock().unwrap();
             c.tokens = serde_json::json!({ "enabled": true, "registration_fee": 1_000, "next_index": 1, "tokens": [] });
@@ -5106,7 +5269,7 @@ mod tests {
         let me = Wallet::from_spend_key(SpendKey([62; 8]));
         let authority_kp = Keypair::generate();
         let id = Hash([9; 32]);
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         {
             let mut c = chain.lock().unwrap();
             c.tokens = serde_json::json!({
@@ -5185,7 +5348,7 @@ mod tests {
     async fn every_bridge_action_rides_a_rand_fee_bundle_bound_to_its_pq_quorum() {
         use randprotocol_core::bridge::PqSignature;
         let me = Wallet::from_spend_key(SpendKey([54; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         for _ in 0..8 {
             chain.lock().unwrap().fund(&me, 3 * gas::BUNDLE_BASE, 0);
         }
@@ -5236,7 +5399,7 @@ mod tests {
             assert_eq!((b.fee, b.burn_a, b.burn_r, b.burn_asset), (gas::BUNDLE_BASE, 0, 0, 0), "{what}");
             let mine = slots_for(&me, &tx);
             assert!(opens_to_nobody(&mine[0]) && opens_to_nobody(&mine[1]), "{what}: slots 0-1 are dummies: {mine:?}");
-            assert!(matches!(mine[3], Found::Received(n) if n.asset == 0 && n.amount > 0), "{what}: RAND change in slot 3: {mine:?}");
+            assert!(matches!(mine[3], Found::Received(n, _) if n.asset == 0 && n.amount > 0), "{what}: RAND change in slot 3: {mine:?}");
             // The PQ quorum is inside the binding: a relayer cannot swap it after the proof.
             let mut swapped = tx.clone();
             match &mut swapped.action {
@@ -5259,7 +5422,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_bond_burns_rand_through_burn_r() {
         let me = Wallet::from_spend_key(SpendKey([51; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         chain.lock().unwrap().fund(&me, 10_000_000, 0);
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
@@ -5290,7 +5453,7 @@ mod tests {
             ],
             ..NoteStore::default()
         };
-        let spend = |asset, amount, fee| Spend { asset, to: Some((&you.address, amount)), fee, burn_a: 0, burn_r: 0 };
+        let spend = |asset, amount, fee| Spend { asset, to: Some((&you.address, amount)), memo: "", fee, burn_a: 0, burn_r: 0 };
         let plan = Plan::select(&store, spend(7, 60, 5)).unwrap();
         assert_eq!(plan.a_notes.iter().map(|n| n.index).collect::<Vec<_>>(), vec![0, 1]);
         assert_eq!(plan.r_notes.iter().map(|n| n.index).collect::<Vec<_>>(), vec![4]);
@@ -5309,7 +5472,7 @@ mod tests {
         // Three notes of the token would be needed: a group spends two at most.
         assert!(Plan::select(&store, spend(7, 85, 5)).unwrap_err().to_string().contains("consolidate"));
         // A RAND burn through `burn_a` is never planned.
-        let bad = Spend { asset: 0, to: None, fee: 1, burn_a: 1, burn_r: 0 };
+        let bad = Spend { asset: 0, to: None, memo: "", fee: 1, burn_a: 1, burn_r: 0 };
         assert!(Plan::select(&store, bad).is_err());
         let _ = me;
     }
@@ -5447,11 +5610,11 @@ mod tests {
         let note = Note::new(me.vk.pk(), [1; 8], 50, 0, 1);
         tree.append(note.commitment());
         let store = NoteStore {
-            notes: vec![OwnedNote { index: 0, cm: note.commitment(), nf: me.vk.nullifier(&note.commitment()), note, spent: false, pending: None, height: 1 }],
+            notes: vec![OwnedNote { index: 0, cm: note.commitment(), nf: me.vk.nullifier(&note.commitment()), note, spent: false, pending: None, height: 1, memo: None }],
             ..NoteStore::default()
         };
-        let plan = Plan::select(&store, Spend { asset: 0, to: None, fee: 50, burn_a: 0, burn_r: 0 }).unwrap();
-        let build = || build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2).unwrap();
+        let plan = Plan::select(&store, Spend { asset: 0, to: None, memo: "", fee: 50, burn_a: 0, burn_r: 0 }).unwrap();
+        let build = || build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy).unwrap();
         let (one, two) = (build(), build());
         for k in 0..SLOTS {
             if k != 2 {
@@ -5690,7 +5853,7 @@ mod tests {
             scanned_height: 4,
             scanned_attest_height: 5,
             notes: vec![owned(0, 5, false), owned(1, 3, true)],
-            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2 }],
+            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2, memo: None }],
             ..NoteStore::default()
         };
         store.save(&path).unwrap();

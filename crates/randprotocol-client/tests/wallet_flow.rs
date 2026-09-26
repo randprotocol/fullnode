@@ -169,7 +169,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     // read and released after the commit, so no other test's proof shares these cores (see
     // `proving_slot`).
     let slot = proving_slot().await;
-    let first = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let first = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, "", fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -195,7 +195,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
 
     // ---- the change note is spendable ----
     let slot = proving_slot().await;
-    let second = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let second = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, "", fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the change note pays a second bundle");
     drop(slot);
@@ -479,7 +479,7 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
     let pay = 400_000u64;
     let slot = proving_slot().await;
     let sent =
-        wallet::send_asset(&rpc, &a, &mut a_store, &b.address, resolved, pay, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::send_asset(&rpc, &a, &mut a_store, &b.address, resolved, pay, "", gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
             .await
             .expect("the token transfer commits");
     drop(slot);
@@ -497,7 +497,7 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
     assert_eq!(a_store.balance(), after_register_and_mint - gas::BUNDLE_BASE);
 
     // ---- B cannot pay it on without RAND for the fee: refused before any proof ----
-    let e = wallet::send_asset(&rpc, &b, &mut b_store, &a.address, 1, 1, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let e = wallet::send_asset(&rpc, &b, &mut b_store, &a.address, 1, 1, "", gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect_err("no RAND, no transfer")
         .to_string();

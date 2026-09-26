@@ -14,7 +14,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use randprotocol_core::notes::{word8_from_hex, Envelope, Word8, DEPTH};
+use randprotocol_core::notes::{word8_from_hex, Envelope, EnvelopeFormat, Word8, DEPTH};
 use randprotocol_core::program::ProgramId;
 use randprotocol_core::types::CallEnvelope;
 use randprotocol_core::{Hash, Transaction};
@@ -202,6 +202,10 @@ pub struct RpcClient {
     /// `rand_getTransaction` polling loop instead of paying for a round trip to a method the
     /// node does not have on every subsequent call.
     legacy_status: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// [`RpcClient::envelope_format`]'s cache: one `rand_getLimits` read for the life of this
+    /// client and everything cloned from it (the `Arc` is shared, like `legacy_status` above),
+    /// not one per bundle a wallet builds.
+    envelope_format: std::sync::Arc<tokio::sync::OnceCell<Option<u32>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -274,6 +278,7 @@ impl RpcClient {
             // this one; this is the read timeout.
             http: reqwest::Client::builder().timeout(READ_TIMEOUT).build().expect("client"),
             legacy_status: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            envelope_format: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -493,6 +498,27 @@ impl RpcClient {
             Err(e) if is_method_not_found(&e) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// This chain's note-envelope format (spec 2026-09-26 §2.4), read off [`limits`](Self::limits)'
+    /// `envelope_bytes` and cached for the life of this client: the first call pays one
+    /// `rand_getLimits` round trip and every later call — one per output a wallet ever seals —
+    /// reuses the answer instead of paying for it again. A node too old for `rand_getLimits`, or
+    /// whose reply predates the field, reads `envelope_bytes` as `None`, which
+    /// `EnvelopeFormat::for_chain` turns into [`EnvelopeFormat::Legacy`] — the same shape it gives
+    /// a chain that never declared one, so an old wallet can still open everything sent to it.
+    ///
+    /// A failed read is never cached (`get_or_try_init` only stores the `Ok` arm), so a transient
+    /// RPC failure does not wrongly pin this client to `Legacy` for the rest of its life.
+    pub async fn envelope_format(&self) -> Result<EnvelopeFormat> {
+        let envelope_bytes = self
+            .envelope_format
+            .get_or_try_init(|| async {
+                let bytes = self.limits().await?.and_then(|l| l.envelope_bytes).and_then(|n| u32::try_from(n).ok());
+                Ok::<_, anyhow::Error>(bytes)
+            })
+            .await?;
+        Ok(EnvelopeFormat::for_chain(*envelope_bytes))
     }
 
     pub async fn receipt(&self, tx: &Hash) -> Result<Option<Value>> {
@@ -1092,6 +1118,43 @@ mod tests {
         assert_eq!(older.limits().await.unwrap(), None);
         let broken = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Err(-32603, "db closed"))]).await);
         assert!(broken.limits().await.is_err());
+    }
+
+    /// [`RpcClient::envelope_format`] reads `rand_getLimits` at most once, however many times it
+    /// is asked (Task 7: it is asked once per output a wallet seals), and `Legacy` covers every
+    /// shape of "this chain has no memo": a node too old for the method, and one whose reply
+    /// carries no `envelope_bytes` at all.
+    #[tokio::test]
+    async fn envelope_format_is_read_once_and_cached() {
+        use randprotocol_core::notes::MEMO_ENVELOPE_BYTES;
+        use test_rpc::{rpc_fn, scripted_rpc, Reply};
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let rpc = RpcClient::new(
+            rpc_fn(move |m, _p| {
+                assert_eq!(m, "rand_getLimits", "envelope_format asks nothing else");
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Reply::Ok(json!({
+                    "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+                    "max_call_envelope_bytes": 18432, "max_program_public_words": 64,
+                    "envelope_bytes": MEMO_ENVELOPE_BYTES,
+                }))
+            })
+            .await,
+        );
+        assert_eq!(rpc.envelope_format().await.unwrap(), EnvelopeFormat::Memo);
+        assert_eq!(rpc.envelope_format().await.unwrap(), EnvelopeFormat::Memo);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the second call must not repeat the read");
+
+        let old = RpcClient::new(scripted_rpc(vec![]).await);
+        assert_eq!(old.envelope_format().await.unwrap(), EnvelopeFormat::Legacy, "a node with no rand_getLimits at all");
+
+        let reply = json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64
+        });
+        let no_field = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(reply))]).await);
+        assert_eq!(no_field.envelope_format().await.unwrap(), EnvelopeFormat::Legacy, "a reply that predates the field");
     }
 
     /// `rand_getProgramPublic`: words for a program with a public input, none for one without,
