@@ -41,6 +41,18 @@ fn deposit_note(addr: &str, amount: u64) -> Result<GenesisNote> {
 /// token the genesis lists (`rand-node alloc-note --asset`). `from` is the zero word at every
 /// asset — the note `Genesis::build` recomputes, and the deposit commitment a `BridgeAttest`
 /// would append for the same token.
+/// `alloc-note --amount` in base units: RAND's nine decimals at asset 0, a bridged token's
+/// `BRIDGE_DECIMALS` (eight) at any other index. One scale for both put 10 zUSD at 10^10 units.
+fn alloc_note_units(amount: &str, asset: u32) -> Result<u64> {
+    let rand_units = parse_amount(amount)?;
+    if asset == 0 {
+        return Ok(rand_units);
+    }
+    let shift = 10u64.pow(randprotocol_core::types::TOKEN_DECIMALS - u32::from(randprotocol_core::ledger::tokens::BRIDGE_DECIMALS));
+    anyhow::ensure!(rand_units % shift == 0, "{amount} has more than eight decimals, a bridged token's precision");
+    Ok(rand_units / shift)
+}
+
 fn alloc_note(addr: &str, amount: u64, asset: u32) -> Result<GenesisNote> {
     let to = ShieldedAddress::parse(addr).with_context(|| format!("{addr} is not a shielded address"))?;
     seal_deposit(&to, &Note::new(to.pk, [0; 8], amount, asset, 0))
@@ -326,8 +338,8 @@ enum Cmd {
         /// The owner, a `rand1…` shielded address.
         #[arg(long)]
         to: String,
-        /// The amount, in whole units with up to eight decimals (`10` is 10 zUSD at asset 1, or
-        /// 10 RAND at asset 0: both are eight-decimal).
+        /// The amount in whole units, scaled by the asset's own decimals: nine for RAND at asset 0
+        /// (`10` is 10 RAND), eight for a bridged token (`10` at asset 1 is 10 zUSD = 10^9 units).
         #[arg(long)]
         amount: String,
         /// The note's asset: 0 (RAND, the default) or a listed token's registry index.
@@ -673,7 +685,7 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::AllocNote { to, amount, asset } => {
-            let amount = parse_amount(&amount)?;
+            let amount = alloc_note_units(&amount, asset)?;
             println!("{}", serde_json::to_string_pretty(&alloc_note(&to, amount, asset)?)?);
         }
         Cmd::Init { datadir, genesis } => {
@@ -1209,7 +1221,12 @@ mod tests {
 
         let payee = SpendKey([0x15; 8]);
         let to = randprotocol_zkvm::address::address_of(&payee.viewing_key());
-        let note = alloc_note(&to.to_string(), 10 * UNITS_PER_RAND, 1).unwrap();
+        // `--amount 10 --asset 1` is ten zUSD at the token's eight decimals, not RAND's nine.
+        let units = alloc_note_units("10", 1).unwrap();
+        assert_eq!(units, 1_000_000_000, "10 zUSD is 10^9 units at eight decimals");
+        assert_eq!(alloc_note_units("10", 0).unwrap(), 10 * UNITS_PER_RAND);
+        assert!(alloc_note_units("0.000000001", 1).is_err(), "a ninth decimal does not exist on zUSD");
+        let note = alloc_note(&to.to_string(), units, 1).unwrap();
         assert_eq!(note.opening.as_ref().unwrap().asset, 1);
 
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain14.json");
@@ -1220,8 +1237,8 @@ mod tests {
             (2, "000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", 6, None),
             (3, "00000000000000000000000055d398326f99059ff775485246999027b3197955", 18, None),
             (3, "0000000000000000000000008ac76a51cc950d9822d68b83fe1ad97b32cd580d", 18, None),
-            (4, "000000000000000000000000a614f803b6fd780986a42c78ec9c7f77e6ded13c", 6, Some(9 * UNITS_PER_RAND)),
-            (5, "ce010e60afedb22717bd63192f54145a3f965a33bb82d2c7029eb2ce1e208264", 6, Some(UNITS_PER_RAND)),
+            (4, "000000000000000000000000a614f803b6fd780986a42c78ec9c7f77e6ded13c", 6, Some(900_000_000)),
+            (5, "ce010e60afedb22717bd63192f54145a3f965a33bb82d2c7029eb2ce1e208264", 6, Some(100_000_000)),
             (5, "c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2f6e0e47ca60203452f5d61", 6, None),
         ];
         gen.tokens.as_mut().unwrap().tokens = vec![GenesisToken {
@@ -1238,14 +1255,14 @@ mod tests {
         let state = gen.build(executor.as_ref()).unwrap();
         let z = state.ledger.tokens().unwrap().get(1).unwrap();
         assert_eq!(z.id.to_hex(), "32e5ab28c782c663e14da2650a3feb12f16a12db85599f4f62dc169d26f37b1f");
-        assert_eq!(z.total_supply, 10 * UNITS_PER_RAND);
+        assert_eq!(z.total_supply, 1_000_000_000);
         assert!(state.ledger.tokens().unwrap().backing_invariant_holds());
 
         let (cm, envelope, amount) = state.notes.last().unwrap();
         let (_, opened) = randprotocol_zkvm::address::envelope_from_core(envelope)
             .open_as_receiver(*cm, &payee.viewing_key())
             .expect("the owner opens its genesis zUSD note");
-        assert_eq!((opened.asset, opened.amount, *amount), (1, 10 * UNITS_PER_RAND, 10 * UNITS_PER_RAND));
+        assert_eq!((opened.asset, opened.amount, *amount), (1, 1_000_000_000, 1_000_000_000));
     }
 
     /// `rand-node genesis --max-program-words N` writes the field; without the flag the file has

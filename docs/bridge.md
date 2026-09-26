@@ -1114,8 +1114,9 @@ Genesis can now start a listed token holding exactly that, so `custody − locke
 - **The rule** (`Genesis::validate`): per listed token, Σ its notes == Σ its backings' `locked`
   (`TokenSupplyMismatch`); a note naming an index no listed token holds is `BadNoteAsset`.
 
-`rand-node alloc-note --to <rand1…> --amount <units> --asset <index>` prints one such `alloc`
-entry, sealed to the owner's KEM key like a `genesis --alloc` note, so the owner's wallet finds it
+`rand-node alloc-note --to <rand1…> --amount <whole units, e.g. 10> --asset <index>` prints one such `alloc`
+entry — `--amount` scaled by the asset's decimals (nine for RAND, eight for a bridged token: `10`
+at asset 1 is 10 zUSD, 10^9 units) — sealed to the owner's KEM key like a `genesis --alloc` note, so the owner's wallet finds it
 on its first scan. The token keeps its id across the cut when it is listed with the old chain's
 name, symbol and salt (zUSD: `"Shielded USD"`, `"zUSD"`, salt `27e77272…1d60` → `32e5ab28…7b1f`).
 
