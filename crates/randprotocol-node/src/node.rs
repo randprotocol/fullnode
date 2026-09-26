@@ -681,6 +681,8 @@ struct Node {
     limiter: admission::PeerLimiter,
     /// The policy over every peer's `status_bucket` (see [`on_status_gossip`]).
     status_limiter: admission::PeerLimiter,
+    /// The policy over every peer's `consensus_bucket` (see [`on_consensus_gossip`]).
+    consensus_limiter: admission::PeerLimiter,
     /// The tip the pending verifications are running against, refreshed lazily: a full ledger clone
     /// per consensus message would cost one per vote, so it is taken only when a transaction is
     /// waiting and the tip's `(height, root)` has moved since the last one.
@@ -721,6 +723,8 @@ struct Peer {
     /// [`STATUS_GOSSIP_PER_SEC`]), but a forwarder cannot make this loop record one for every id
     /// it can mint at wire speed.
     status_bucket: admission::TokenBucket,
+    /// The same, for the consensus messages this peer forwards ([`on_consensus_gossip`]).
+    consensus_bucket: admission::TokenBucket,
     /// Not asked for a batch before this instant (SYNC-2): set by [`back_off_sync_peer`] when the
     /// peer answered our live batch request with nothing we could use.
     sync_backoff_until: Option<Instant>,
@@ -734,6 +738,39 @@ struct Peer {
 /// four a second is far above any honest peer's share (the transaction bucket's numbers).
 pub const STATUS_GOSSIP_BURST: u32 = 16;
 pub const STATUS_GOSSIP_PER_SEC: f64 = 4.0;
+
+/// Consensus messages one forwarding peer may deliver back to back, and the rate it recovers them
+/// at (SW-1(d)/SW-3). Sized from the honest load, which all of it may reach this node through one
+/// forwarder (a node with a single connection): per view one proposal, up to one vote per
+/// validator and, on a timeout, up to one NewView per validator — 37 messages on an
+/// 18-validator set — and gossipsub delivers each message id at most once per forwarder. At the
+/// measured ~1.4 s a block that is ≤ ~26 a second; 64 a second is two and a half times it, and a
+/// burst of 256 is some seven whole views arriving at once (a leader's catch-up, a view-change
+/// storm after a stall). A validator set several times larger would need these raised.
+pub const CONSENSUS_GOSSIP_BURST: u32 = 256;
+pub const CONSENSUS_GOSSIP_PER_SEC: f64 = 64.0;
+
+/// The consensus gossip arm's decision (SW-1(d)/SW-3): metered against the forwarder
+/// (`GossipId.propagation_source`) and accepted — so forwarded — within its budget, exactly as
+/// before; over it, `Ignore`d, neither forwarded nor handled. Never `Reject`: an honest relay in a
+/// burst looks the same. A forwarder with no entry is metered on a fresh one, as a transaction's
+/// is (`on_gossiped_tx`), not refused: gossip can race its `PeerConnected`, a rejected sync batch
+/// drops a still-connected peer's entry, and a validator's votes must not be lost to bookkeeping.
+/// Only a connected peer is ever a `propagation_source`, so this cannot grow the map past the
+/// swarm's connection cap.
+fn on_consensus_gossip(
+    peers: &mut HashMap<PeerId, Peer>,
+    limiter: &admission::PeerLimiter,
+    forwarder: PeerId,
+    now: Instant,
+) -> GossipOutcome {
+    // Spent in place: `TokenBucket` is `Copy`.
+    let bucket = &mut peers.entry(forwarder).or_default().consensus_bucket;
+    if !limiter.allow(bucket, now) {
+        return GossipOutcome::Report(admission::Acceptance::Ignore);
+    }
+    GossipOutcome::for_consensus()
+}
 
 /// The first back-off of a peer that answered a batch request with nothing usable, and the cap
 /// its doubling stops at (SYNC-2).
@@ -1181,6 +1218,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         verified,
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
         status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
+        consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
         faucet_limiter: admission::PeerLimiter::new(admission::FAUCET_MINT_BURST, admission::FAUCET_MINT_PER_SEC),
         faucet_bucket: admission::TokenBucket::default(),
         snapshot: None,
@@ -1914,11 +1952,18 @@ impl Node {
             // undecodable message never gets this far — the network task reports that one itself.
             NetworkEvent::Gossip { from, msg, id } => match msg {
                 GossipMessage::Consensus(m) => {
-                    // Before handling, because a proposal's verification stays on this loop and the
-                    // report must not queue behind it. `GossipOutcome::for_consensus` is this
-                    // decision, spelled out and tested there.
-                    self.report(id, GossipOutcome::for_consensus()).await;
-                    self.on_consensus(m).await?
+                    // Metered per forwarder (SW-1(d)/SW-3): over its budget a message is ignored —
+                    // not forwarded and not handled. Within it, reported before handling as it
+                    // always was, because a proposal's verification stays on this loop and the
+                    // report must not queue behind it (moving the accept after handling would
+                    // change when votes and proposals reach the rest of the fleet).
+                    let outcome =
+                        on_consensus_gossip(&mut self.peers, &self.consensus_limiter, id.propagation_source, Instant::now());
+                    let handle = outcome == GossipOutcome::for_consensus();
+                    self.report(id, outcome).await;
+                    if handle {
+                        self.on_consensus(m).await?
+                    }
                 }
                 GossipMessage::Transaction(tx) => self.on_gossiped_tx(tx, id).await?,
                 GossipMessage::Status(s) => {
@@ -2846,6 +2891,37 @@ mod tests {
         // A forwarder this node holds no entry for cannot be metered, and is ignored.
         assert_eq!(on_status_gossip(&mut peers, &limiter, f1, pid(3), status(50), later), GossipOutcome::Report(Acceptance::Ignore));
         assert_eq!(peers.len(), 2);
+    }
+
+    /// SW-1(d)/SW-3 (network scan 2026-09-26): consensus gossip was accepted — and so forwarded
+    /// fleet-wide — before it was handled, with no per-peer limit, so one peer could push junk
+    /// proposals and votes through every node at wire speed. Metered now against the forwarder
+    /// like a transaction or a status: the burst passes, the next within the window is `Ignore`d
+    /// (not forwarded, not handled, not `Reject`ed — an honest relay in a burst looks the same),
+    /// the refill re-admits, and another forwarder spends its own bucket.
+    #[test]
+    fn consensus_gossip_is_metered_per_forwarder() {
+        use crate::admission::{Acceptance, PeerLimiter};
+        let pid = |seed: u8| PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public());
+        let limiter = PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC);
+        let (f1, f2) = (pid(1), pid(2));
+        let mut peers: HashMap<PeerId, Peer> =
+            [f1, f2].into_iter().map(|p| (p, Peer { connected: true, ..Default::default() })).collect();
+        let now = Instant::now();
+        for i in 0..CONSENSUS_GOSSIP_BURST {
+            assert_eq!(on_consensus_gossip(&mut peers, &limiter, f1, now), GossipOutcome::for_consensus(), "message {i} of the burst");
+        }
+        assert_eq!(on_consensus_gossip(&mut peers, &limiter, f1, now), GossipOutcome::Report(Acceptance::Ignore), "over the burst");
+        assert_eq!(on_consensus_gossip(&mut peers, &limiter, f2, now), GossipOutcome::for_consensus(), "f2's bucket is its own");
+        let later = now + Duration::from_secs(1);
+        for i in 0..CONSENSUS_GOSSIP_PER_SEC as u32 {
+            assert_eq!(on_consensus_gossip(&mut peers, &limiter, f1, later), GossipOutcome::for_consensus(), "refilled {i}");
+        }
+        assert_eq!(on_consensus_gossip(&mut peers, &limiter, f1, later), GossipOutcome::Report(Acceptance::Ignore));
+        // A forwarder with no entry yet (gossip racing its `PeerConnected`, or an entry dropped after
+        // a rejected sync batch) is metered on a fresh one, as a transaction's is — never refused
+        // outright: a validator's votes must not be lost to bookkeeping.
+        assert_eq!(on_consensus_gossip(&mut peers, &limiter, pid(3), now), GossipOutcome::for_consensus());
     }
 
     /// SYNC-1 (fullnode network scan 2026-09-26, high): gossipsub runs `Permissive`, so an
