@@ -4,7 +4,53 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-25)
+## Project memory (state as of 2026-09-26)
+
+### v0.5.8 — the pre-release scan fixes (2026-09-26)
+
+A ten-reviewer scan of `d56a97a` (v0.5.7 + AGG-2) plus `cargo audit`, every candidate re-traced and
+refuted where possible; the report is `~/Downloads/RandProtocol_PreRelease_Security_Scan_2026-09-26.pdf`
+(read it before re-reporting). Fixed on `feat/fix-{consensus,node-net,rpc-prune,wallet,deploy}`,
+stacked linear as `feat/v0.5.8`, every fix red-first with the red quoted in its commit. **Node-only:
+no genesis, wire-format or consensus-rule change for honest traffic — rolls one validator at a
+time**; a relayed Status is now ignored (one hop), which an older node's forwarding does not break.
+
+- **SW-1 (critical)** `hotstuff.rs::check_orphan`: an unknown-parent proposal is kept only if its
+  proposer leads its view in a set this replica knows, its height is within `max_tree_blocks` of the
+  committed head and its view above it, and its tx count, byte size and tx root hold; the pool is
+  capped at `max_orphan_bytes` (64 MiB) and evicts its highest blocks for a lower one. Before, any
+  self-made key pinned ~4 GiB on every node. `node.rs::on_consensus_gossip` meters consensus gossip
+  per forwarder (burst 256, 64/s; over budget = Ignore, not forwarded).
+- **SYNC-1 (high)** `on_status_gossip`: a Status is read only when `from == propagation_source`
+  (Permissive gossipsub lets an unsigned message claim any author); `floor > height` is Rejected.
+  `ValidationMode` deliberately unchanged (Strict needs a canary).
+- **CONS-1 (high)** `on_vote`: votes beyond `view + PROPOSAL_VIEW_WINDOW` are ignored and one vote
+  counts per (view, voter) (`vote_of`; a second is logged as equivocation) — one validator key could
+  fill the 4096-key vote map and stop every QC. A replica >8 views behind builds no QC from votes;
+  it catches up through proposals, NewViews and sync.
+- **WAL-1/WAL-2 (high)**, client: a token id never resolves to index 0 and must match the row it
+  resolves to; `send`'s unit follows what was typed; a node-reported registration fee above 10 RAND
+  needs `--fee`. **WAL-3**: `rand sync --rescan`; replies capped at 64 MiB. Residual: a lying node
+  can still map a real id to another token with index ≥ 1.
+- **Medium/low:** RPC blocking reads capped at 16 (`MAX_CONCURRENT_RPC_BLOCKING`, busy after 2 s) so
+  the awaited prune pass cannot starve; inbound sync requests metered per peer (burst 8, 2/s) and
+  signed not-helds cached (`NotHeldCache`); a peer answering a live batch with nothing is backed off
+  5 s → 120 s; prune cutoff `min(head, now) − keep`; the compaction flag cleared by a drop guard.
+  The scan's OPS-4 (`--prune-history` refused on a faucet-off genesis) was written and **reverted
+  before the tag**: chain 15 is a testnet with its faucet off (STAKE-2) and must prune; mainnet is
+  v1.0, and the archive rule stays a docs rule until a genesis carries an explicit network marker.
+- **Deploy:** `deploy/lib/clean-tree.sh` (rebuild/push ship `git archive HEAD`, never `wallets/`);
+  `WANT_SHA_WALLET` beside `WANT_SHA` (the `rand` binary is checked too); `deploy/lib/relay-
+  binaries.sh` replaces `ssh -A`; `deploy/install-launchd.sh` (launchd runs copies under
+  `~/rand-node-a`); `deploy/caddy/README.md`; rustls 0.23.45 (RUSTSEC-2026-0285).
+- **Deliberately NOT done:** a pruned node answering `Block(None)` instead of a signed NotHeld
+  (pruning L1) — every chain-14 validator prunes, so only node A could still attest and the
+  CON-4 lock release would lose its quorum (the 2026-09-24 ghost-lock stall). Needs a design.
+- **Operator, open:** delete old `wallets/` and log copies from E's `/root/fullnode`; commit F's live
+  Caddyfile under `deploy/caddy/`; turn the faucet off on F; the two chain 7–13 cutover scripts still
+  use `ssh -A` (do not reuse). Clean in the scan: AGG-2, pruning storage, bridge (123 tests +
+  probes), shielded pool/tokens, git history.
+
 
 ### AGG-2 — the aggregate proof binds its aggregator (2026-09-25, on `main`, in no tag yet)
 
