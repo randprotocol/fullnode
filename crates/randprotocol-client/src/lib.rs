@@ -196,6 +196,29 @@ pub struct TxReceipt {
 /// The flat allowance for a request that only *asks* for something. A read measured ~1.3 s against
 /// a droplet over an SSH tunnel, so 15 s is already generous and a read that takes longer is broken
 /// rather than slow.
+/// The most of a node's reply [`RpcClient::call`] reads before refusing it (wallet scan, minor):
+/// 64 MiB. `.json()` buffered whatever a node sent and parsed it whole. The largest honest replies
+/// are a few MiB — a full block with its proofs in hex, a commitments page, a 1024-header
+/// `rand_getBlocks` page — so this leaves them an order of magnitude and more.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read `resp`'s body, refusing it once it passes `limit` bytes — up front on a declared
+/// `Content-Length`, otherwise chunk by chunk as it arrives.
+async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    let too_big = || anyhow!("the node's reply is larger than {} MiB; refusing it", limit / (1024 * 1024));
+    if resp.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("reading rpc response")? {
+        if body.len() + chunk.len() > limit {
+            return Err(too_big());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A body at or above this gets [`upload_timeout`] instead of [`READ_TIMEOUT`]. Every read this
@@ -260,7 +283,7 @@ impl RpcClient {
         } else {
             READ_TIMEOUT
         };
-        let resp: Value = req
+        let resp = req
             .send()
             .await
             .map_err(|e| {
@@ -278,10 +301,8 @@ impl RpcClient {
                 } else {
                     anyhow!(e).context(format!("connecting to {}", self.url))
                 }
-            })?
-            .json()
-            .await
-            .context("decoding rpc response")?;
+            })?;
+        let resp: Value = serde_json::from_slice(&read_capped(resp, MAX_RESPONSE_BYTES).await?).context("decoding rpc response")?;
         if let Some(err) = resp.get("error") {
             let message = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown").to_string();
             let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
@@ -898,6 +919,21 @@ mod tests {
             let _ = sock.flush().await;
         });
         (format!("http://{addr}"), seen)
+    }
+
+    /// A node's reply is read with a bound: past 64 MiB (the whole JSON body) the call is refused
+    /// rather than buffered and parsed whole. The largest honest replies — a 1024-header
+    /// `rand_getBlocks` page, a commitments page, a full block — are a few MiB at most.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_reply_is_refused_not_buffered() {
+        let pad = "x".repeat(64 * 1024 * 1024);
+        let reply = format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{pad}"}}"#);
+        let (url, _seen) = slow_server(Duration::ZERO, Box::leak(reply.into_boxed_str())).await;
+        let e = match RpcClient::new(url).call("rand_getHead", json!([])).await {
+            Ok(v) => panic!("a reply past the cap is refused, got {} bytes of result", v.as_str().map_or(0, str::len)),
+            Err(e) => e,
+        };
+        assert!(format!("{e:#}").contains("larger than"), "{e:#}");
     }
 
     /// A 1.3 MB transaction against a server that takes 20 s to answer: the old flat 15 s lost the
