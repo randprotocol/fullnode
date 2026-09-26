@@ -232,6 +232,13 @@ impl ShieldedAddress {
         Hash::digest_domain(b"rand-shielded-recipient", &raw).0
     }
 
+    /// The 16-character fingerprint shown beside this address everywhere (spec §2.1).
+    pub fn fingerprint(&self) -> crate::fingerprint::Fingerprint {
+        let mut raw = word8_to_bytes(&self.pk).to_vec();
+        raw.extend_from_slice(&self.kem_ek);
+        crate::fingerprint::Fingerprint::of_raw(&raw)
+    }
+
     pub fn parse(s: &str) -> Result<ShieldedAddress, AddressError> {
         let rest = s.strip_prefix(ADDRESS_PREFIX).ok_or(AddressError::Prefix)?;
         let raw = bs58::decode(rest).into_vec().map_err(|_| AddressError::Base58)?;

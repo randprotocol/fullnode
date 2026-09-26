@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod confidential;
 pub mod consensus;
 pub mod crypto;
+pub mod fingerprint;
 pub mod gas;
 pub mod genesis;
 pub mod ledger;
