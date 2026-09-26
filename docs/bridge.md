@@ -1091,3 +1091,30 @@ likewise rides `tokens_v2` beside the unchanged `tokens` blob. A chain-14 databa
 gains a key and keeps its strict v1 decode; a v0.5.4 node rolls onto chain 14 like any node-only
 build. `rand_getBridgeState` gains `rotation_nonce` (0 on chain 14) and `rules_v2`
 (`{ "global_mint_cap_per_window": "<decimal string>", "cap_window_secs": 86400 }`, or `null`).
+
+## 22. Genesis custody — a chain cut from another one's bridge state (chain 15)
+
+A chain cut from a running bridged chain inherits custody the source contracts still hold: coins
+locked on the far side against notes somebody on the old chain still owns. Chain 15 is cut from
+chain 14 with ten zUSD in a third party's wallet, backed by 9 USDT on Tron and 1 USDT on Solana.
+Genesis can now start a listed token holding exactly that, so `custody − locked = 0` and
+`total_supply == Σ backings.locked` from block 0:
+
+- **`tokens.tokens[].backings[].locked`** (optional, eight-decimal token units, a plain number
+  like `mint_cap_per_day`): what the backing starts with. `Genesis::build` applies it through
+  `TokenRegistry::lock` itself at the genesis block's time — the one writer that moves `locked`
+  and `total_supply` together — so a genesis lock is judged like a deposit in the chain's first
+  second (the note bound, the per-backing daily cap, the rules-v2 windows) and counts toward that
+  first day's cap. Absent, nothing changes; it is bound to the genesis hash through the state
+  root (a backing's `locked` is in its token's leaf).
+- **`alloc[].opening.asset`** (optional, default 0 = RAND and then absent from the file): the
+  registry index of a token the same genesis lists (the first listed token is 1). The commitment
+  is recomputed at that index with `from` the zero word — the deposit commitment a `BridgeAttest`
+  would append — and the note never counts toward the RAND supply (`genesis_deposited`).
+- **The rule** (`Genesis::validate`): per listed token, Σ its notes == Σ its backings' `locked`
+  (`TokenSupplyMismatch`); a note naming an index no listed token holds is `BadNoteAsset`.
+
+`rand-node alloc-note --to <rand1…> --amount <units> --asset <index>` prints one such `alloc`
+entry, sealed to the owner's KEM key like a `genesis --alloc` note, so the owner's wallet finds it
+on its first scan. The token keeps its id across the cut when it is listed with the old chain's
+name, symbol and salt (zUSD: `"Shielded USD"`, `"zUSD"`, salt `27e77272…1d60` → `32e5ab28…7b1f`).

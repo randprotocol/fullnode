@@ -115,7 +115,7 @@ fn alloc_note(to: &ShieldedAddress, amount: u64) -> GenesisNote {
         amount,
         // Core I-2: what the commitment opens to, as `rand-node genesis` now writes it. Required
         // on any chain with a `tokens` section, emitted always.
-        opening: Some(GenesisOpening { pk: word8_to_hex(&note.pk), time: note.time, r: word8_to_hex(&note.r) }),
+        opening: Some(GenesisOpening { pk: word8_to_hex(&note.pk), time: note.time, r: word8_to_hex(&note.r), asset: 0 }),
     }
 }
 
@@ -184,6 +184,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
                     chain: TOKEN_CHAIN,
                     token: TOKEN,
                     decimals: 8,
+                    locked: None,
                 }],
             }],
             mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None,

@@ -34,8 +34,16 @@ use std::time::Duration;
 /// amount are public by design once the file is published; only *when* and into what it is later
 /// spent stays private. A genesis file is written once and its hash is fixed from then on.
 fn deposit_note(addr: &str, amount: u64) -> Result<GenesisNote> {
+    alloc_note(addr, amount, 0)
+}
+
+/// [`deposit_note`] at any asset: 0 is RAND, a non-zero `asset` the registry index of a bridged
+/// token the genesis lists (`rand-node alloc-note --asset`). `from` is the zero word at every
+/// asset — the note `Genesis::build` recomputes, and the deposit commitment a `BridgeAttest`
+/// would append for the same token.
+fn alloc_note(addr: &str, amount: u64, asset: u32) -> Result<GenesisNote> {
     let to = ShieldedAddress::parse(addr).with_context(|| format!("{addr} is not a shielded address"))?;
-    seal_deposit(&to, &Note::new(to.pk, [0; 8], amount, 0, 0))
+    seal_deposit(&to, &Note::new(to.pk, [0; 8], amount, asset, 0))
 }
 
 /// Seal an already-built deposit note to its owner.
@@ -52,15 +60,17 @@ fn seal_deposit(to: &ShieldedAddress, note: &Note) -> Result<GenesisNote> {
         cm: word8_to_hex(&note.commitment()),
         envelope: EnvelopeHex::from_envelope(&envelope),
         amount: note.amount,
-        // Core I-2: what the commitment opens to. `from` and `asset` are not written down —
-        // `Genesis::build` recomputes the commitment as a RAND note (asset 0, `from` zero),
-        // which is what makes an alloc note auditable as RAND rather than an opaque leaf.
+        // Core I-2: what the commitment opens to. `from` is not written down — `Genesis::build`
+        // recomputes the commitment with `from` zero at the note's `asset` (0, RAND, is left out
+        // of the file), which is what makes an alloc note auditable as the asset and amount it
+        // declares rather than an opaque leaf.
         // Required on any chain with a `tokens` section; emitted always, so a file cut with this
         // build is verifiable whatever section it ends up carrying.
         opening: Some(GenesisOpening {
             pk: word8_to_hex(&note.pk),
             time: note.time,
             r: word8_to_hex(&note.r),
+            asset: note.asset,
         }),
     })
 }
@@ -304,6 +314,25 @@ enum Cmd {
         /// (`Genesis::build` validates both).
         #[arg(long, value_name = "TOKENS.JSON")]
         tokens: Option<PathBuf>,
+    },
+    /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
+    /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
+    /// it on its first scan. With `--asset <index>` it is a note of the bridged token the genesis
+    /// lists at that index (the first listed token is 1): its opening carries the `asset`, and the
+    /// genesis must give that token's backings `locked` amounts summing to exactly its notes
+    /// (chain 15's genesis custody). A bridged genesis cannot be written by `genesis` itself —
+    /// its `bridge` section is spliced in afterwards — so a token note is spliced in the same way.
+    AllocNote {
+        /// The owner, a `rand1…` shielded address.
+        #[arg(long)]
+        to: String,
+        /// The amount, in whole units with up to eight decimals (`10` is 10 zUSD at asset 1, or
+        /// 10 RAND at asset 0: both are eight-decimal).
+        #[arg(long)]
+        amount: String,
+        /// The note's asset: 0 (RAND, the default) or a listed token's registry index.
+        #[arg(long, default_value_t = 0)]
+        asset: u32,
     },
     /// Initialise a data directory from a genesis file.
     Init {
@@ -642,6 +671,10 @@ async fn main() -> Result<()> {
                 state.fri_profile,
                 gen.hc_bundle,
             );
+        }
+        Cmd::AllocNote { to, amount, asset } => {
+            let amount = parse_amount(&amount)?;
+            println!("{}", serde_json::to_string_pretty(&alloc_note(&to, amount, asset)?)?);
         }
         Cmd::Init { datadir, genesis } => {
             std::fs::create_dir_all(&datadir)?;
@@ -1162,6 +1195,57 @@ mod tests {
             assert_eq!(state.validators.get(&v.public_key.address()).unwrap().stake, v.stake);
         }
         assert!(!gen.to_json().contains("staking"), "rewriting the file adds no section");
+    }
+
+    /// Chain 15's genesis custody, end to end on the real chain-14 file: chain 14's zUSD listed
+    /// at genesis (same name, symbol and salt, so the same asset id), 9 USDT locked on Tron and 1
+    /// on Solana, and one ten-zUSD note written by `rand-node alloc-note --asset 1` — which the
+    /// owner's wallet opens, at asset 1, from the envelope alone, exactly as a scan does.
+    #[test]
+    fn an_alloc_note_of_zusd_builds_on_chain_14s_file_and_its_owner_opens_it() {
+        use randprotocol_core::genesis::{GenesisBacking, GenesisToken};
+        let cli = Cli::try_parse_from(["rand-node", "alloc-note", "--to", "rand1x", "--amount", "10", "--asset", "1"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::AllocNote { asset: 1, .. }));
+
+        let payee = SpendKey([0x15; 8]);
+        let to = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let note = alloc_note(&to.to_string(), 10 * UNITS_PER_RAND, 1).unwrap();
+        assert_eq!(note.opening.as_ref().unwrap().asset, 1);
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain14.json");
+        let mut gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let hex32 = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
+        let coins: [(u16, &str, u8, Option<u64>); 7] = [
+            (2, "000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7", 6, None),
+            (2, "000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", 6, None),
+            (3, "00000000000000000000000055d398326f99059ff775485246999027b3197955", 18, None),
+            (3, "0000000000000000000000008ac76a51cc950d9822d68b83fe1ad97b32cd580d", 18, None),
+            (4, "000000000000000000000000a614f803b6fd780986a42c78ec9c7f77e6ded13c", 6, Some(9 * UNITS_PER_RAND)),
+            (5, "ce010e60afedb22717bd63192f54145a3f965a33bb82d2c7029eb2ce1e208264", 6, Some(UNITS_PER_RAND)),
+            (5, "c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2f6e0e47ca60203452f5d61", 6, None),
+        ];
+        gen.tokens.as_mut().unwrap().tokens = vec![GenesisToken {
+            name: "Shielded USD".into(),
+            symbol: "zUSD".into(),
+            salt: hex32("27e77272ee77a47a6b66a62f3452dac66e681c79be6750d5e236e99f0d1e1d60"),
+            backings: coins
+                .iter()
+                .map(|&(chain, token, decimals, locked)| GenesisBacking { chain, token: hex32(token), decimals, locked })
+                .collect(),
+        }];
+        gen.alloc.push(note);
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        let z = state.ledger.tokens().unwrap().get(1).unwrap();
+        assert_eq!(z.id.to_hex(), "32e5ab28c782c663e14da2650a3feb12f16a12db85599f4f62dc169d26f37b1f");
+        assert_eq!(z.total_supply, 10 * UNITS_PER_RAND);
+        assert!(state.ledger.tokens().unwrap().backing_invariant_holds());
+
+        let (cm, envelope, amount) = state.notes.last().unwrap();
+        let (_, opened) = randprotocol_zkvm::address::envelope_from_core(envelope)
+            .open_as_receiver(*cm, &payee.viewing_key())
+            .expect("the owner opens its genesis zUSD note");
+        assert_eq!((opened.asset, opened.amount, *amount), (1, 10 * UNITS_PER_RAND, 10 * UNITS_PER_RAND));
     }
 
     /// `rand-node genesis --max-program-words N` writes the field; without the flag the file has

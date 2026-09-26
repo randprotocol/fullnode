@@ -60,9 +60,18 @@ impl EnvelopeHex {
 
 /// What an alloc note's commitment opens to, beside the `amount` the note already declares: the
 /// owner's `pk`, the note's `time` word and its blinding `r` (64 hex characters each for the two
-/// `Word8`s). `from` is the zero word and `asset` is 0, exactly as every other note the *chain*
-/// computes — the faucet mint (`ledger::mint_commitment`), a withdraw, an aggregate payout — so
-/// neither is written down here: a genesis note is a RAND note or it is not a genesis note.
+/// `Word8`s), and its `asset` word. `from` is the zero word, exactly as every other note the
+/// *chain* computes — the faucet mint (`ledger::mint_commitment`), a bridge deposit
+/// (`bridge_notes::deposit_commitment`), a withdraw, an aggregate payout — so it is not written
+/// down here.
+///
+/// `asset` is 0 — RAND — unless the file says otherwise, and is then left out of the file, so
+/// every opening written before it existed means what it always meant. A non-zero `asset` is the
+/// registry index of a bridged token **this genesis lists** (the first listed token is index 1):
+/// the note is genesis supply of that token, and `Genesis::validate` holds each listed token's
+/// genesis notes to exactly the `locked` its backings start with, so custody and supply agree
+/// from block 0. Such a note is a deposit in all but the attestation — its commitment is the
+/// deposit commitment at that index — and it never counts toward the RAND supply.
 ///
 /// Core I-2. Without it a `cm` is opaque: nothing ties it to `(asset = 0, amount)`, so a genesis
 /// author could put a note committing to `(amount, asset = 1)` in `alloc` and hand itself
@@ -80,6 +89,14 @@ pub struct GenesisOpening {
     pub time: u32,
     /// The commitment randomness, 64 hex characters.
     pub r: String,
+    /// The note's `asset` word: 0 (RAND, and absent from the file) or the index of a token the
+    /// `tokens` section lists.
+    #[serde(default, skip_serializing_if = "is_rand_asset")]
+    pub asset: u32,
+}
+
+fn is_rand_asset(asset: &u32) -> bool {
+    *asset == 0
 }
 
 /// A deposit note the chain starts with (spec §8): its commitment, the envelope that opens it,
@@ -112,6 +129,18 @@ pub struct GenesisBacking {
     #[serde(with = "hex_bytes32")]
     pub token: [u8; 32],
     pub decimals: u8,
+    /// What this backing starts the chain holding locked, in the *token's* eight-decimal units
+    /// (like `mint_cap_per_day`) — the custody a source contract already holds when a chain is
+    /// cut from another one's state (chain 15 from chain 14). Applied by `Genesis::build` through
+    /// [`TokenRegistry::lock`] itself, so the token's `total_supply` moves with it and
+    /// `total_supply == Σ locked` holds by the same code path a deposit takes; the token's genesis
+    /// notes (a [`GenesisOpening::asset`] naming it) must sum to exactly its backings' `locked`.
+    /// Absent — every chain before 15 — is zero and changes nothing. It is bound to the genesis
+    /// hash through the state root (a backing's `locked` is in its token's leaf, and the genesis
+    /// header commits the root), so two files that differ only in it build different chains;
+    /// `TokensCommit` leaves it out so chain 14's commitment keeps its bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked: Option<u64>,
 }
 
 /// One token a `tokens` section lists at genesis: always a `Bridge`-authority token (a native
@@ -243,7 +272,9 @@ impl From<&TokensConfig> for TokensCommit {
                     let backings = backings
                         .iter()
                         .map(|b| {
-                            let GenesisBacking { chain, token, decimals } = b;
+                            // `locked` is bound through the state root instead (a backing's
+                            // locked is in its token's leaf), so chain 14's bytes stay put.
+                            let GenesisBacking { chain, token, decimals, locked: _ } = b;
                             (*chain, *token, *decimals)
                         })
                         .collect();
@@ -430,6 +461,14 @@ pub enum GenesisError {
     MissingNoteOpening(String),
     #[error("alloc note {0}'s opening does not produce its commitment")]
     NoteCommitmentMismatch(String),
+    /// A genesis note of a token must name one this genesis lists: there is no other registry
+    /// index at block 0.
+    #[error("alloc note {cm} names asset {asset}, which is not a token this genesis lists")]
+    BadNoteAsset { cm: String, asset: u32 },
+    /// A listed token's genesis notes and its backings' genesis `locked` must be the same
+    /// amount — `total_supply == Σ locked` from block 0, and every unit of it held by a note.
+    #[error("token {symbol} starts with {notes} in genesis notes but {locked} locked in its backings")]
+    TokenSupplyMismatch { symbol: String, notes: u128, locked: u128 },
     #[error("bad epoch_blocks {0} (1..={MAX_EPOCH_BLOCKS})")]
     BadEpochBlocks(u64),
     #[error("bad max_program_words {0} (1..={limit})", limit = gas::MAX_PROGRAM_WORDS_LIMIT)]
@@ -571,6 +610,7 @@ impl Genesis {
         if let Some(tokens) = &self.tokens {
             check_tokens(tokens, self.bridge.as_ref())?;
         }
+        check_genesis_token_supply(&self.alloc, self.tokens.as_ref())?;
         // The consensus domain (audit v4): a version this build cannot sign is refused here,
         // not at the first vote.
         if let Some(v) = self.consensus_domain {
@@ -707,6 +747,20 @@ impl Genesis {
             if tconf.bound_note_value == Some(true) {
                 registry = registry.with_bound_note_value(true);
             }
+            // Genesis custody (chain 15): each backing's starting `locked`, through `lock` itself
+            // — the one writer that moves `locked` and `total_supply` together — at the genesis
+            // block's time, after every rule above is in place, so a genesis lock is judged and
+            // counted exactly like a deposit in the chain's first second (the note bound, the
+            // per-backing daily cap and, under rules v2, the rolling windows). The matching notes
+            // are held to the same sum by `check_genesis_token_supply` in `validate`.
+            let first = crate::ledger::tokens::FIRST_TOKEN_INDEX;
+            for (i, t) in tconf.tokens.iter().enumerate() {
+                for b in t.backings.iter().filter(|b| b.locked.is_some_and(|l| l > 0)) {
+                    registry
+                        .lock(first + i as u32, b.chain, &b.token, b.locked.unwrap_or(0), self.timestamp_ms / 1000)
+                        .map_err(|e| GenesisError::BadTokens(format!("genesis locked on chain {}: {e}", b.chain)))?;
+                }
+            }
             ledger.set_tokens(Some(registry));
         }
         ledger.set_aggregation(self.aggregation.clone());
@@ -742,7 +796,11 @@ impl Genesis {
                 Some(o) => {
                     let pk = word8_from_hex(&o.pk).ok_or_else(|| GenesisError::BadNote(o.pk.clone()))?;
                     let r = word8_from_hex(&o.r).ok_or_else(|| GenesisError::BadNote(o.r.clone()))?;
-                    if crate::ledger::mint_commitment(executor, &pk, n.amount, o.time, &r) != cm {
+                    // At the note's own asset: 0 is `mint_commitment`'s RAND note, a listed
+                    // token's index is the deposit commitment a `BridgeAttest` would append for
+                    // it (`from` the zero word either way) — `validate` has already refused an
+                    // index no listed token holds.
+                    if executor.note_commitment(&pk, &[0; 8], n.amount, o.asset, o.time, &r) != cm {
                         return Err(GenesisError::NoteCommitmentMismatch(n.cm.clone()));
                     }
                 }
@@ -752,7 +810,11 @@ impl Genesis {
                 None => {}
             }
             ledger.deposit(cm, executor).map_err(|_| GenesisError::DuplicateNote(n.cm.clone()))?;
-            deposited = deposited.checked_add(n.amount).ok_or(GenesisError::SupplyOverflow)?;
+            // A token's genesis note is that token's supply (the registry's `total_supply`, set
+            // by the genesis `lock` above), never RAND's.
+            if n.opening.as_ref().is_none_or(|o| o.asset == 0) {
+                deposited = deposited.checked_add(n.amount).ok_or(GenesisError::SupplyOverflow)?;
+            }
             notes.push((cm, envelope, n.amount));
         }
         // The register's stakes are supply too (see `ledger::supply`): genesis is the one place
@@ -1147,6 +1209,39 @@ fn check_tokens(cfg: &TokensConfig, bridge: Option<&BridgeConfig>) -> Result<(),
     Ok(())
 }
 
+/// Genesis supply of a bridged token (chain 15): every alloc note whose opening names a non-zero
+/// `asset` must name a token the `tokens` section lists — index `FIRST_TOKEN_INDEX + position` —
+/// and, per listed token, its notes must sum to exactly its backings' genesis `locked`. Both
+/// sides are summed in `u128`, so neither can wrap into agreement; whether the sum fits the
+/// token's `u64` supply is `TokenRegistry::lock`'s own refusal, in `Genesis::build`.
+///
+/// Structural only: that a note's opening reproduces its commitment at that asset needs the
+/// executor and is checked by `build`.
+fn check_genesis_token_supply(alloc: &[GenesisNote], tokens: Option<&TokensConfig>) -> Result<(), GenesisError> {
+    let listed = tokens.map_or(&[][..], |t| &t.tokens[..]);
+    let first = crate::ledger::tokens::FIRST_TOKEN_INDEX;
+    let mut notes = vec![0u128; listed.len()];
+    for n in alloc {
+        let asset = n.opening.as_ref().map_or(0, |o| o.asset);
+        if asset == 0 {
+            continue;
+        }
+        let slot = asset
+            .checked_sub(first)
+            .map(|i| i as usize)
+            .filter(|&i| i < listed.len())
+            .ok_or_else(|| GenesisError::BadNoteAsset { cm: n.cm.clone(), asset })?;
+        notes[slot] += n.amount as u128;
+    }
+    for (t, notes) in listed.iter().zip(notes) {
+        let locked: u128 = t.backings.iter().map(|b| b.locked.unwrap_or(0) as u128).sum();
+        if notes != locked {
+            return Err(GenesisError::TokenSupplyMismatch { symbol: t.symbol.clone(), notes, locked });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1177,7 +1272,7 @@ mod tests {
         let (pk, r) = ([seed; 8], [seed + 1; 8]);
         let mut n = note(seed, amount);
         n.cm = word8_to_hex(&crate::ledger::mint_commitment(&StubExecutor, &pk, amount, 0, &r));
-        n.opening = Some(GenesisOpening { pk: word8_to_hex(&pk), time: 0, r: word8_to_hex(&r) });
+        n.opening = Some(GenesisOpening { pk: word8_to_hex(&pk), time: 0, r: word8_to_hex(&r), asset: 0 });
         n
     }
 
@@ -1329,7 +1424,7 @@ mod tests {
                     name: "Tether USD".into(),
                     symbol: "zUSDT".into(),
                     salt: [1; 32],
-                    backings: vec![GenesisBacking { chain: 2, token: [0x11; 32], decimals: BRIDGE_DECIMALS }],
+                    backings: vec![GenesisBacking { chain: 2, token: [0x11; 32], decimals: BRIDGE_DECIMALS, locked: None }],
                 }],
                 mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None,
             });
@@ -1361,7 +1456,7 @@ mod tests {
         let mut asset_one = bridged(vec![opened_note(7, 1_000_000)]);
         asset_one.alloc[0].cm = word8_to_hex(&StubExecutor.note_commitment(&pk, &[0; 8], 1_000_000, 1, 0, &r));
         asset_one.alloc[0].opening =
-            Some(GenesisOpening { pk: word8_to_hex(&pk), time: 0, r: word8_to_hex(&r) });
+            Some(GenesisOpening { pk: word8_to_hex(&pk), time: 0, r: word8_to_hex(&r), asset: 0 });
         assert!(
             matches!(asset_one.build(&StubExecutor), Err(GenesisError::NoteCommitmentMismatch(_))),
             "an asset-1 commitment cannot be opened as a genesis note"
@@ -1379,7 +1474,7 @@ mod tests {
         // An opening is verified wherever it appears, section or no section — it is only
         // *required* where it is load-bearing.
         let mut plain_wrong = base_genesis();
-        plain_wrong.alloc[0].opening = Some(GenesisOpening { pk: word8_to_hex(&pk), time: 0, r: word8_to_hex(&r) });
+        plain_wrong.alloc[0].opening = Some(GenesisOpening { pk: word8_to_hex(&pk), time: 0, r: word8_to_hex(&r), asset: 0 });
         assert!(matches!(plain_wrong.build(&StubExecutor), Err(GenesisError::NoteCommitmentMismatch(_))));
     }
 
@@ -1552,7 +1647,7 @@ mod tests {
             name: "Shielded USD".into(),
             symbol: "zUSD".into(),
             salt: [salt; 32],
-            backings: vec![GenesisBacking { chain: 2, token: [coin; 32], decimals: 6 }],
+            backings: vec![GenesisBacking { chain: 2, token: [coin; 32], decimals: 6, locked: None }],
         };
         let mut g = genesis(1);
         g.bridge = Some(bridge_cfg());
@@ -1854,7 +1949,7 @@ mod tests {
                 name: "Tether USD".into(),
                 symbol: "zUSDT".into(),
                 salt: [0x55; 32],
-                backings: vec![GenesisBacking { chain: 2, token, decimals: BRIDGE_DECIMALS }],
+                backings: vec![GenesisBacking { chain: 2, token, decimals: BRIDGE_DECIMALS, locked: None }],
             }],
             mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None,
         };
@@ -1907,7 +2002,7 @@ mod tests {
         // A second backing on the same token is a different chain too — the whole list is bound.
         let mut two = g.clone();
         two.bridge.as_mut().unwrap().emitters.insert(3, [3; 32]);
-        two.tokens.as_mut().unwrap().tokens[0].backings.push(GenesisBacking { chain: 3, token: [0x33; 32], decimals: BRIDGE_DECIMALS });
+        two.tokens.as_mut().unwrap().tokens[0].backings.push(GenesisBacking { chain: 3, token: [0x33; 32], decimals: BRIDGE_DECIMALS, locked: None });
         assert_ne!(build(&two).hash(), base, "a token's backing set is committed whole");
 
         // The twin is the bytes, not the text: the hex spelling is not what is hashed.
@@ -1952,13 +2047,13 @@ mod tests {
                     name: "Tether USD".into(),
                     symbol: "zUSDT".into(),
                     salt: [1; 32],
-                    backings: vec![GenesisBacking { chain: 2, token: [0x11; 32], decimals: BRIDGE_DECIMALS }],
+                    backings: vec![GenesisBacking { chain: 2, token: [0x11; 32], decimals: BRIDGE_DECIMALS, locked: None }],
                 },
                 GenesisToken {
                     name: "USD Coin".into(),
                     symbol: "zUSDC".into(),
                     salt: [2; 32],
-                    backings: vec![GenesisBacking { chain: 2, token: [0x22; 32], decimals: BRIDGE_DECIMALS }],
+                    backings: vec![GenesisBacking { chain: 2, token: [0x22; 32], decimals: BRIDGE_DECIMALS, locked: None }],
                 },
             ],
             mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None,
@@ -1988,6 +2083,157 @@ mod tests {
         hex::decode(s).unwrap().try_into().unwrap()
     }
 
+    /// Chain 14's live zUSD registration, as `rand_getTokens` and its `RegisterBridgedToken`
+    /// (transaction `7fa28fe6…`, block 256) show it: the name, symbol and salt that id it, and
+    /// its seven backings in the registry's order — Ethereum USDT (the registration's own), then
+    /// the six `ListBacking`s. Chain 15 lists exactly this at genesis.
+    fn live_zusd(locked: [Option<u64>; 7]) -> GenesisToken {
+        let coins: [(u16, &str, u8); 7] = [
+            (2, "000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7", 6),
+            (2, "000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", 6),
+            (3, "00000000000000000000000055d398326f99059ff775485246999027b3197955", 18),
+            (3, "0000000000000000000000008ac76a51cc950d9822d68b83fe1ad97b32cd580d", 18),
+            (4, "000000000000000000000000a614f803b6fd780986a42c78ec9c7f77e6ded13c", 6),
+            (5, "ce010e60afedb22717bd63192f54145a3f965a33bb82d2c7029eb2ce1e208264", 6),
+            (5, "c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2f6e0e47ca60203452f5d61", 6),
+        ];
+        GenesisToken {
+            name: "Shielded USD".into(),
+            symbol: "zUSD".into(),
+            salt: hex32("27e77272ee77a47a6b66a62f3452dac66e681c79be6750d5e236e99f0d1e1d60"),
+            backings: coins
+                .iter()
+                .zip(locked)
+                .map(|(&(chain, token, decimals), locked)| GenesisBacking { chain, token: hex32(token), decimals, locked })
+                .collect(),
+        }
+    }
+
+    /// A genesis note of token `asset`, opened: the deposit commitment at that index.
+    fn token_note(seed: u32, amount: u64, asset: u32) -> GenesisNote {
+        let (pk, r) = ([seed; 8], [seed + 1; 8]);
+        let mut n = note(seed, amount);
+        n.cm = word8_to_hex(&StubExecutor.note_commitment(&pk, &[0; 8], amount, asset, 0, &r));
+        n.opening = Some(GenesisOpening { pk: word8_to_hex(&pk), time: 0, r: word8_to_hex(&r), asset });
+        n
+    }
+
+    /// Chain 15's shape: chain 14's zUSD listed at genesis with the residue custody chain 14 left
+    /// behind — 9 USDT on Tron and 1 USDT on Solana, the ten zUSD a third party still holds —
+    /// and one ten-zUSD note for that holder.
+    fn chain15_shape() -> Genesis {
+        let mut g = base_genesis();
+        let mut bridge = bridge_cfg();
+        bridge.emitters = (2u16..=5).map(|c| (c, [c as u8; 32])).collect();
+        g.bridge = Some(bridge);
+        g.tokens = Some(TokensConfig {
+            registration_fee: MIN_REGISTRATION_FEE,
+            mint_cap_per_day: 100_000 * 100_000_000,
+            tokens: vec![live_zusd([None, None, None, None, Some(900_000_000), Some(100_000_000), None])],
+            max_tokens: None,
+            burn_registration_fee: None,
+            bound_note_value: None,
+        });
+        g.alloc = opened_alloc();
+        g.alloc.push(token_note(21, 1_000_000_000, 1));
+        g
+    }
+
+    /// Listed at genesis with chain 14's registration fields, zUSD keeps chain 14's asset id —
+    /// what a wallet, the explorer and the bridge's own tables know it by.
+    #[test]
+    fn zusd_listed_at_genesis_keeps_chain_14s_asset_id() {
+        let s = build(&chain15_shape());
+        let z = s.ledger.tokens().unwrap().get(1).unwrap();
+        assert_eq!(z.id.to_hex(), "32e5ab28c782c663e14da2650a3feb12f16a12db85599f4f62dc169d26f37b1f");
+        assert_eq!((z.symbol.as_str(), z.decimals), ("zUSD", 8));
+    }
+
+    /// Chain 15: a bridged token can start the chain holding supply. Each backing's genesis
+    /// `locked` goes through `lock`, so `total_supply == Σ locked` holds at block 0 and equals the
+    /// token's genesis notes; the notes' commitments are recomputed at the token's index; and none
+    /// of it is RAND supply.
+    #[test]
+    fn a_genesis_can_start_a_bridged_token_with_locked_custody_and_its_notes() {
+        let g = chain15_shape();
+        let s = build(&g);
+        let t = s.ledger.tokens().unwrap();
+        let z = t.get(1).unwrap();
+        assert_eq!(z.total_supply, 1_000_000_000, "ten zUSD from block 0");
+        let tron = &g.tokens.as_ref().unwrap().tokens[0].backings[4];
+        let sol_usdt = &g.tokens.as_ref().unwrap().tokens[0].backings[5];
+        assert_eq!(t.backing(1, 4, &tron.token).unwrap().locked, 900_000_000, "9 USDT on Tron");
+        assert_eq!(t.backing(1, 5, &sol_usdt.token).unwrap().locked, 100_000_000, "1 USDT on Solana");
+        assert!(t.backing_invariant_holds());
+        // The token note is a leaf like any other, and RAND's genesis supply is the RAND notes
+        // (and stakes) alone.
+        assert_eq!(s.notes.len(), 3);
+        assert_eq!(s.ledger.supply().genesis_deposited, 3_000_000);
+
+        // The commitment is recomputed at the asset the opening names: a RAND note's commitment
+        // declared as a zUSD note (or the reverse) never builds, so a file cannot pass a leaf of
+        // one asset off as supply of another.
+        let mut rand_as_zusd = g.clone();
+        let (pk, r) = ([21; 8], [22; 8]);
+        rand_as_zusd.alloc[2].cm = word8_to_hex(&crate::ledger::mint_commitment(&StubExecutor, &pk, 1_000_000_000, 0, &r));
+        assert!(matches!(rand_as_zusd.build(&StubExecutor), Err(GenesisError::NoteCommitmentMismatch(_))));
+
+        // A chain without any of it — chain 14's shape — is unchanged: no field in the file.
+        let json = g.to_json();
+        assert!(json.contains("\"locked\": 900000000") && json.contains("\"asset\": 1"), "{json}");
+        let back = Genesis::from_json(&json).unwrap();
+        assert_eq!(back, g);
+        let plain = serde_json::to_string(&GenesisBacking { chain: 2, token: [1; 32], decimals: 6, locked: None }).unwrap();
+        assert!(!plain.contains("locked"), "{plain}");
+        assert!(!serde_json::to_string(&opened_note(1, 1)).unwrap().contains("asset"));
+    }
+
+    /// Custody and notes must agree per token, and a note must be of a listed token.
+    #[test]
+    fn genesis_token_notes_must_match_their_backings_locked_exactly() {
+        // More notes than locked.
+        let mut over = chain15_shape();
+        over.alloc.push(token_note(22, 1, 1));
+        assert!(matches!(
+            over.validate(),
+            Err(GenesisError::TokenSupplyMismatch { notes: 1_000_000_001, locked: 1_000_000_000, .. })
+        ));
+        // Locked with no note at all.
+        let mut bare = chain15_shape();
+        bare.alloc.pop();
+        assert!(matches!(bare.validate(), Err(GenesisError::TokenSupplyMismatch { notes: 0, locked: 1_000_000_000, .. })));
+        // A note with no locked behind it.
+        let mut unbacked = chain15_shape();
+        for b in &mut unbacked.tokens.as_mut().unwrap().tokens[0].backings {
+            b.locked = None;
+        }
+        assert!(matches!(unbacked.validate(), Err(GenesisError::TokenSupplyMismatch { notes: 1_000_000_000, locked: 0, .. })));
+        // An asset no listed token holds, and a token note on a chain that lists none.
+        let mut unlisted = chain15_shape();
+        unlisted.alloc[2] = token_note(21, 1_000_000_000, 2);
+        assert!(matches!(unlisted.validate(), Err(GenesisError::BadNoteAsset { asset: 2, .. })));
+        let mut tokenless = base_genesis();
+        tokenless.alloc.push(token_note(21, 5, 1));
+        assert!(matches!(tokenless.validate(), Err(GenesisError::BadNoteAsset { asset: 1, .. })));
+        // A genesis lock is a lock: over the per-backing daily cap is refused, not written.
+        let mut capped = chain15_shape();
+        capped.tokens.as_mut().unwrap().mint_cap_per_day = 500_000_000;
+        assert!(matches!(capped.build(&StubExecutor), Err(GenesisError::BadTokens(m)) if m.contains("chain 4")));
+    }
+
+    /// The custody split is part of the genesis binding: the same notes over a different split
+    /// of `locked` across the backings are a different chain — through the state root, which
+    /// holds every backing's `locked` and which the genesis header commits.
+    #[test]
+    fn the_genesis_locked_split_is_committed() {
+        let g = chain15_shape();
+        let mut other = g.clone();
+        let b = &mut other.tokens.as_mut().unwrap().tokens[0].backings;
+        b[4].locked = Some(800_000_000);
+        b[5].locked = Some(200_000_000);
+        assert_ne!(build(&other).hash(), build(&g).hash());
+    }
+
     /// Chain 14's own listing (spec §12, bridge-06 2026-09-19's `chain14-zusd-backings.md`): one
     /// zUSD backed by USDT and USDC on Ethereum (2), BSC (3) and Solana (5), plus USDT on Tron
     /// (4) — Tron USDC is discontinued. Seven coins, one index, eight decimals for the *token*,
@@ -1998,13 +2244,13 @@ mod tests {
         // The exact addresses and source decimals bridge-06 will whitelist, verbatim from
         // `chain14-zusd-backings.md`.
         let backings = vec![
-            GenesisBacking { chain: 2, token: hex32("000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7"), decimals: 6 },
-            GenesisBacking { chain: 2, token: hex32("000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"), decimals: 6 },
-            GenesisBacking { chain: 3, token: hex32("00000000000000000000000055d398326f99059ff775485246999027b3197955"), decimals: 18 },
-            GenesisBacking { chain: 3, token: hex32("0000000000000000000000008ac76a51cc950d9822d68b83fe1ad97b32cd580d"), decimals: 18 },
-            GenesisBacking { chain: 4, token: hex32("000000000000000000000000a614f803b6fd780986a42c78ec9c7f77e6ded13c"), decimals: 6 },
-            GenesisBacking { chain: 5, token: hex32("ce010e60afedb22717bd63192f54145a3f965a33bb82d2c7029eb2ce1e208264"), decimals: 6 },
-            GenesisBacking { chain: 5, token: hex32("c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2f6e0e47ca60203452f5d61"), decimals: 6 },
+            GenesisBacking { chain: 2, token: hex32("000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7"), decimals: 6, locked: None },
+            GenesisBacking { chain: 2, token: hex32("000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"), decimals: 6, locked: None },
+            GenesisBacking { chain: 3, token: hex32("00000000000000000000000055d398326f99059ff775485246999027b3197955"), decimals: 18, locked: None },
+            GenesisBacking { chain: 3, token: hex32("0000000000000000000000008ac76a51cc950d9822d68b83fe1ad97b32cd580d"), decimals: 18, locked: None },
+            GenesisBacking { chain: 4, token: hex32("000000000000000000000000a614f803b6fd780986a42c78ec9c7f77e6ded13c"), decimals: 6, locked: None },
+            GenesisBacking { chain: 5, token: hex32("ce010e60afedb22717bd63192f54145a3f965a33bb82d2c7029eb2ce1e208264"), decimals: 6, locked: None },
+            GenesisBacking { chain: 5, token: hex32("c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2f6e0e47ca60203452f5d61"), decimals: 6, locked: None },
         ];
         let mut g = base_genesis();
         g.alloc = opened_alloc();
@@ -2043,7 +2289,7 @@ mod tests {
 
         // A backing on a chain with no registered emitter could never be attested.
         let mut orphan = g.clone();
-        orphan.tokens.as_mut().unwrap().tokens[0].backings.push(GenesisBacking { chain: 9, token: backings[0].token, decimals: 6 });
+        orphan.tokens.as_mut().unwrap().tokens[0].backings.push(GenesisBacking { chain: 9, token: backings[0].token, decimals: 6, locked: None });
         match orphan.validate() {
             Err(GenesisError::BadTokens(m)) => assert!(m.contains("chain 9"), "{m}"),
             other => panic!("expected BadTokens, got {other:?}"),
@@ -2054,7 +2300,7 @@ mod tests {
             name: "Copy USD".into(),
             symbol: "cUSD".into(),
             salt: [0x5b; 32],
-            backings: vec![GenesisBacking { chain: 2, token: backings[0].token, decimals: 6 }],
+            backings: vec![GenesisBacking { chain: 2, token: backings[0].token, decimals: 6, locked: None }],
         });
         match twice.validate() {
             Err(GenesisError::BadTokens(m)) => assert!(m.contains("duplicate backing"), "{m}"),
@@ -2071,7 +2317,7 @@ mod tests {
         bridge.emitters = (2u16..=64).map(|c| (c, [c as u8; 32])).collect();
         too_many.bridge = Some(bridge);
         too_many.tokens.as_mut().unwrap().tokens[0].backings =
-            (2..MAX_BACKINGS as u16 + 3).map(|i| GenesisBacking { chain: i, token: [i as u8; 32], decimals: BRIDGE_DECIMALS }).collect();
+            (2..MAX_BACKINGS as u16 + 3).map(|i| GenesisBacking { chain: i, token: [i as u8; 32], decimals: BRIDGE_DECIMALS, locked: None }).collect();
         match too_many.validate() {
             Err(GenesisError::BadTokens(m)) => assert!(m.contains("more than 32"), "{m}"),
             other => panic!("expected BadTokens, got {other:?}"),
@@ -2111,7 +2357,7 @@ mod tests {
                 name: "Tether USD".into(),
                 symbol: "zUSDT".into(),
                 salt: [1; 32],
-                backings: vec![GenesisBacking { chain: 2, token: [0x11; 32], decimals: 6 }],
+                backings: vec![GenesisBacking { chain: 2, token: [0x11; 32], decimals: 6, locked: None }],
             }],
             mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None,
         });
@@ -2142,7 +2388,7 @@ mod tests {
             name: "A".into(),
             symbol: "A".into(),
             salt: [3; 32],
-            backings: vec![GenesisBacking { chain: 2, token: [1; 32], decimals: BRIDGE_DECIMALS }],
+            backings: vec![GenesisBacking { chain: 2, token: [1; 32], decimals: BRIDGE_DECIMALS, locked: None }],
         };
         g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![dup.clone(), dup], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None });
         assert!(matches!(g.validate(), Err(GenesisError::BadTokens(_))));

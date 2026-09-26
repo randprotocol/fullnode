@@ -2925,7 +2925,7 @@ pub(crate) mod fixtures {
                     // Eight decimals — the attestation wire's own — so this coin's release unit is 1 and no
                     // fixture burn here is ever refused for it; the release-unit rule itself is
                     // `randprotocol-core`'s to test.
-                    backings: vec![randprotocol_core::genesis::GenesisBacking { chain: 2, token: TOKEN, decimals: 8 }],
+                    backings: vec![randprotocol_core::genesis::GenesisBacking { chain: 2, token: TOKEN, decimals: 8, locked: None }],
                 }],
                 mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None,
             }),
