@@ -5,13 +5,14 @@
     <!-- The fleet watcher (deep scan 2026-09-24, "no monitoring"): every five minutes, every
          validator's health, height, view, build and free disk; a macOS notification and a line
          in the log on a stall, a node behind or unreachable, disk_low, or mixed builds.
-         Install: cp deploy/launchd/org.randprotocol.fleet-watch.plist ~/Library/LaunchAgents/
-                  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.randprotocol.fleet-watch.plist -->
+         It runs a COPY of deploy/fleet-watch.sh (and the deploy/nodes.env it reads) under
+         ~/rand-node-a/deploy/, not the shared checkout (ops review OPS-5).
+         Install or refresh: deploy/install-launchd.sh fleet-watch -->
     <key>Label</key>
     <string>org.randprotocol.fleet-watch</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/dendisuhubdy/Github/randprotocol/fullnode/deploy/fleet-watch.sh</string>
+        <string>/Users/dendisuhubdy/rand-node-a/deploy/fleet-watch.sh</string>
     </array>
     <key>StartInterval</key>
     <integer>300</integer>

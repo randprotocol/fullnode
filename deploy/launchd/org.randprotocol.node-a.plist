@@ -6,9 +6,11 @@
          laptop reboot took it down until someone noticed (2026-09-21: two days). launchd
          starts it at login and restarts it if it exits.
 
-         Install (once, as the login user):
-           cp deploy/launchd/org.randprotocol.node-a.plist ~/Library/LaunchAgents/
-           launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.randprotocol.node-a.plist
+         It runs a COPY of deploy/run-a.sh under ~/rand-node-a/deploy/, not the shared checkout
+         (ops review OPS-5): the checkout is worked on by several sessions and any branch switch
+         or edit there would change what launchd runs as the validator at its next restart.
+         Install or refresh (copies the script, then reloads the job — A restarts):
+           deploy/install-launchd.sh node-a
          Stop / start by hand:
            launchctl kill TERM gui/$(id -u)/org.randprotocol.node-a   (KeepAlive restarts it)
            launchctl bootout gui/$(id -u)/org.randprotocol.node-a     (stops it for good)
@@ -18,7 +20,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/dendisuhubdy/Github/randprotocol/fullnode/deploy/run-a.sh</string>
+        <string>/Users/dendisuhubdy/rand-node-a/deploy/run-a.sh</string>
     </array>
 
     <key>RunAtLoad</key>
