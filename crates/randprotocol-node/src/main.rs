@@ -114,11 +114,11 @@ fn sealed_withdraw_note(payout: &ShieldedAddress, amount: u64, time: u32, format
 /// input that makes `EnvelopeFormat::for_chain` answer `Legacy` for a chain that never declared
 /// one at all, so `withdraw`, `aggregator withdraw` and `aggregate` all fall back the same way.
 async fn envelope_format(rpc: &RpcClient) -> Result<EnvelopeFormat> {
-    let envelope_bytes = match rpc.call("rand_getLimits", serde_json::json!([])).await {
-        Ok(v) => v.get("envelope_bytes").and_then(serde_json::Value::as_u64).map(|n| n as u32),
-        Err(e) if randprotocol_client::is_method_not_found(&e) => None,
-        Err(e) => return Err(e),
-    };
+    // `RpcClient::limits` already gives `rand_getLimits`'s one-call, old-node-tolerant read
+    // (`-32601` method-not-found -> `Ok(None)`, any other failure propagated); `envelope_bytes`
+    // is `#[serde(default)]` on `ChainLimits`, so a reply missing the field entirely (an old node
+    // that predates the genesis field, not just the method) decodes to `None` too.
+    let envelope_bytes = rpc.limits().await?.and_then(|l| l.envelope_bytes).and_then(|n| u32::try_from(n).ok());
     Ok(EnvelopeFormat::for_chain(envelope_bytes))
 }
 

@@ -371,6 +371,23 @@ mod tests {
         assert_eq!(classify(&alice(), [9; 8], &env), None);
     }
 
+    /// Task 6 review fix round 1, item 4: `classify` reports the memo for both roles a key can
+    /// classify, on an envelope sealed in the memo-carrying format.
+    #[test]
+    fn classify_reports_the_memo_for_both_received_and_sent() {
+        use randprotocol_core::notes::EnvelopeFormat;
+        use randprotocol_zkvm::address::seal_note_as;
+
+        let note = note_for(&alice(), &bob(), 500);
+        let cm = note.commitment();
+        let env = seal_note_as(EnvelopeFormat::Memo, &bob(), &address_of(&alice()), &note, &TxKey([7; 32]), "x").unwrap();
+
+        // Alice receives it: the memo opens for her through the KEM path.
+        assert_eq!(classify(&alice(), cm, &env), Some((Role::Received, note, Some("x".to_string()))));
+        // Bob sent it: the same memo opens for him too, through `ovk`.
+        assert_eq!(classify(&bob(), cm, &env), Some((Role::Sent, note, Some("x".to_string()))));
+    }
+
     #[test]
     fn classify_rejects_a_note_sealed_to_us_but_owned_by_another_key() {
         // Anyone can encapsulate to a published kem_ek; the note inside names someone else.

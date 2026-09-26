@@ -3204,7 +3204,8 @@ fn faucet_mint_tx(
     minter: &Keypair,
     executor: &dyn ConfidentialExecutor,
 ) -> std::result::Result<Transaction, String> {
-    let format = randprotocol_core::notes::EnvelopeFormat::for_chain(envelope_bytes.map(|n| n as u32));
+    let format =
+        randprotocol_core::notes::EnvelopeFormat::for_chain(envelope_bytes.and_then(|n| u32::try_from(n).ok()));
     let note = Note::new(to.pk, [0; 8], amount, 0, height as u32);
     let throwaway = SpendKey::random().viewing_key();
     let envelope = randprotocol_zkvm::address::seal_note_as(format, &throwaway, to, &note, &TxKey::random(), "")?;
@@ -4283,15 +4284,22 @@ mod tests {
     /// ledger refuses it (`EnvelopeSize`), which is the red this test starts from.
     #[test]
     fn a_faucet_mint_is_sealed_in_the_chains_declared_envelope_format() {
+        // The real executor, not `StubExecutor`: `faucet_mint_tx`'s `debug_assert_eq!` checks the
+        // sealed note's own commitment against `ConfidentialExecutor::note_commitment`, and those
+        // two agree only under a real `ZkExecutor` (`StubExecutor::note_commitment` hashes under
+        // a distinct `rand-stub-note` domain, so the assert would fire — in *every* debug build,
+        // not just `--release` — for a reason unrelated to what this test is about). Cheap here:
+        // a bundle-less mint proves nothing, so this costs no proving key or STARK verify.
+        let ex = ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
         let to = crate::storage::fixtures::payout(9);
 
         // The plain chain: legacy format, and the ledger admits it.
         let gs = crate::storage::fixtures::genesis(1);
-        let tx = faucet_mint_tx(gs.ledger.chain_id(), gs.ledger.envelope_bytes(), &to, 1_000, gs.ledger.height(), &key(1), &StubExecutor)
+        let tx = faucet_mint_tx(gs.ledger.chain_id(), gs.ledger.envelope_bytes(), &to, 1_000, gs.ledger.height(), &key(1), &ex)
             .unwrap();
         let randprotocol_core::types::Action::Mint { envelope, .. } = &tx.action else { panic!("not a mint") };
         assert_ne!(envelope.len(), randprotocol_core::notes::MEMO_ENVELOPE_BYTES, "the legacy shape is shorter");
-        assert_eq!(gs.ledger.validate(&tx, &StubExecutor), Ok(()));
+        assert_eq!(gs.ledger.validate(&tx, &ex), Ok(()));
 
         // The memo chain: the mint's envelope is exactly `envelope_bytes` long, and the ledger
         // admits it too.
@@ -4304,11 +4312,11 @@ mod tests {
             1_000,
             memo_gs.ledger.height(),
             &key(1),
-            &StubExecutor,
+            &ex,
         )
         .unwrap();
         let randprotocol_core::types::Action::Mint { envelope, .. } = &tx.action else { panic!("not a mint") };
-        assert_eq!(memo_gs.ledger.validate(&tx, &StubExecutor), Ok(()));
+        assert_eq!(memo_gs.ledger.validate(&tx, &ex), Ok(()));
         assert_eq!(envelope.len(), randprotocol_core::notes::MEMO_ENVELOPE_BYTES);
     }
 
