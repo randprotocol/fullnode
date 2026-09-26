@@ -8,11 +8,11 @@ set -euo pipefail
 HOME_A=${NODE_A_HOME:-$HOME/rand-node-a}
 KEYDIR=${KEYDIR:-$HOME/.rand-chain14}
 cd "$HOME_A"
-BINDIR=${BINDIR:-bin-089bdd6}
+BINDIR=${BINDIR:-bin-dd2ccbe}
 BIN=$BINDIR/rand-node
-[ -x $BIN ] || { echo "$HOME_A/$BIN missing — build it at the chain-14 commit or set BINDIR" >&2; exit 1; }
-DATA=data-a-1cff3b7d   # keyed on the genesis hash so a regenerated genesis gets a fresh db
-[ -d $DATA/db ] || $BIN init --datadir $DATA --genesis genesis-chain14.json
+[ -x $BIN ] || { echo "$HOME_A/$BIN missing — build it at the chain-15 commit or set BINDIR" >&2; exit 1; }
+DATA=data-a-cc30e085   # keyed on the genesis hash so a regenerated genesis gets a fresh db
+[ -d $DATA/db ] || $BIN init --datadir $DATA --genesis genesis-chain15.json
 exec $BIN run --datadir $DATA --key "$KEYDIR/node-a.key.json" --validator \
     --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 \
     --bootstrap /ip4/164.90.239.200/tcp/30303/p2p/12D3KooWEQEbUwZRgqhDPXhW7vNBmcRcnhUDGUADe81VFdv3ALYe \
