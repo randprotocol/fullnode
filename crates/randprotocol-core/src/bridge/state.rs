@@ -77,6 +77,22 @@ pub struct BridgeConfig {
     pub pause_key: Option<PublicKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules_v2: Option<BridgeRulesV2>,
+    /// The guardian-set index `guardians` start the chain as (chain 15, cut from chain 14 after
+    /// the source endpoints rotated to set 1). The genesis bridge then holds exactly one set, at
+    /// this index, as `current_set` — what a chain that rotated to it holds, less the sets it
+    /// rotated away from: an attestation under a lower index is `UnknownGuardianSet`, and the
+    /// next rotation must carry `index + 1`. Absent is 0, today's genesis. Committed to the
+    /// genesis hash under its own tag (`b"bridge_guardian_set_index"` ‖ u32 BE) only when
+    /// present, and in the bridge root through `current_set` and `guardian_sets` either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_set_index: Option<u32>,
+    /// The sequence the first outbound burn message carries (chain 15: chain 14's burns ended
+    /// at 6, so its successor starts at 7 and no source endpoint or daemon keyed by sequence
+    /// ever sees one twice). Absent is 0. Committed under its own tag
+    /// (`b"bridge_burn_sequence"` ‖ u64 BE) only when present, and in the bridge root through
+    /// `burn_sequence` either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burn_sequence: Option<u64>,
 }
 
 /// Bridge rules v2 (audit v4 BRG-14 / BR-4): the parameters the second rule set adds. Genesis
@@ -123,7 +139,18 @@ impl From<&BridgeConfig> for BridgeCommit {
     /// genesis builder commits it under its own tag, only when present (`Genesis::build`), the
     /// way the call limits are committed.
     fn from(cfg: &BridgeConfig) -> BridgeCommit {
-        let BridgeConfig { emitter, guardians, emitters, pq_guardians, pause_key, rules_v2: _ } = cfg;
+        // `guardian_set_index` and `burn_sequence` likewise (chain 15): tagged in
+        // `Genesis::build`, only when present.
+        let BridgeConfig {
+            emitter,
+            guardians,
+            emitters,
+            pq_guardians,
+            pause_key,
+            rules_v2: _,
+            guardian_set_index: _,
+            burn_sequence: _,
+        } = cfg;
         BridgeCommit {
             emitter: *emitter,
             guardians: guardians.clone(),
@@ -466,12 +493,15 @@ pub enum AttestOutcome {
 }
 
 impl BridgeState {
-    /// Builds the genesis bridge state: guardian set 0 is the config's
-    /// guardians and is current (`expires_at: 0`).
+    /// Builds the genesis bridge state: the config's guardians are guardian
+    /// set `guardian_set_index` (0 when absent) and are current
+    /// (`expires_at: 0`); no other set exists. The first burn message carries
+    /// `burn_sequence` (0 when absent).
     pub fn from_config(cfg: &BridgeConfig) -> BridgeState {
+        let index = cfg.guardian_set_index.unwrap_or(0);
         let mut guardian_sets = BTreeMap::new();
         guardian_sets.insert(
-            0,
+            index,
             GuardianSet {
                 keys: cfg.guardians.clone(),
                 expires_at: 0,
@@ -481,7 +511,8 @@ impl BridgeState {
             emitter: cfg.emitter,
             emitters: cfg.emitters.clone(),
             guardian_sets,
-            current_set: 0,
+            current_set: index,
+            burn_sequence: cfg.burn_sequence.unwrap_or(0),
             pq_guardians: cfg.pq_guardians.clone(),
             pause_key: cfg.pause_key.clone(),
             rules_v2: cfg.rules_v2.clone(),
@@ -1154,6 +1185,8 @@ mod tests {
             pq_guardians: pq_keys().iter().map(|k| k.public_key().clone()).collect(),
             pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
             rules_v2: None,
+            guardian_set_index: None,
+            burn_sequence: None,
         };
         (config, secrets)
     }
@@ -1438,6 +1471,61 @@ mod tests {
             check(&st, &tk, &attest(&s, 0, token_body(3, OTHER_TOKEN, 10, 0, 1)), 1),
             Err(BridgeError::UnlistedToken { chain: 3, .. })
         ));
+    }
+
+    /// Chain 15 is cut after the source endpoints rotated to guardian set 1: a genesis at
+    /// `guardian_set_index: 1` must behave exactly as a chain that rotated to 1. Set 1's own
+    /// attestation verifies (nothing looks the listed keys up at set 0), set 0 is unknown, and
+    /// the next rotation is 1 → 2 and nothing else.
+    #[test]
+    fn a_bridge_started_at_guardian_set_1_verifies_set_1_and_rotates_only_to_2() {
+        let (mut c, s) = cfg();
+        c.guardian_set_index = Some(1);
+        let mut st = BridgeState::from_config(&c);
+        let tk = tokens_with_the_test_token();
+        assert_eq!(st.current_set, 1);
+        assert_eq!(st.guardian_sets.keys().copied().collect::<Vec<_>>(), vec![1], "one set, at 1");
+        assert_eq!(st.guardian_sets[&1].expires_at, 0, "current, not in a grace window");
+        // A transfer signed by the listed set at index 1 verifies ...
+        assert!(check(&st, &tk, &attest(&s, 1, transfer_body(2, 10, 0, 1)), 100).is_ok());
+        // ... and the same keys at index 0 name a set this chain never had.
+        assert_eq!(
+            check(&st, &tk, &attest(&s, 0, transfer_body(2, 11, 0, 1)), 100).unwrap_err(),
+            BridgeError::Verify(VerifyError::UnknownGuardianSet(0))
+        );
+        let set2: Vec<GuardianKey> = (10u8..=15).map(|i| [i; 20]).collect();
+        for bad in [0, 1, 3] {
+            assert_eq!(
+                check(&st, &tk, &attest(&s, 1, upgrade_body(bad, set2.clone())), 100).unwrap_err(),
+                BridgeError::BadUpgradeIndex { expected: 2, got: bad },
+                "a rotation to {bad}"
+            );
+        }
+        assert_eq!(
+            apply(&mut st, &tk, &attest(&s, 1, upgrade_body(2, set2.clone())), 100).unwrap(),
+            AttestOutcome::GuardianSetUpgraded(2)
+        );
+        assert_eq!(st.current_set, 2);
+        assert_eq!(st.guardian_sets[&1].expires_at, 100 + GUARDIAN_GRACE_SECS, "set 1 enters its grace window");
+        assert_eq!(st.guardian_sets[&2].keys, set2);
+    }
+
+    /// Chain 14's burns ended at sequence 6; its successor's first burn carries 7, so no source
+    /// endpoint or daemon keyed by sequence ever sees a sequence twice.
+    #[test]
+    fn a_bridge_started_at_burn_sequence_7_emits_7_first() {
+        let (mut c, _) = cfg();
+        c.burn_sequence = Some(7);
+        let mut st = BridgeState::from_config(&c);
+        let tk = tokens_with_the_test_token();
+        let rec = st.apply_burn(&tk, Hash::digest(b"burn-tx"), 1, 400, 2, TOKEN, EVM_TO, 5, 12, 1_700).unwrap();
+        assert_eq!(rec.sequence, 7);
+        assert_eq!(Body::decode(&rec.body).unwrap().sequence, 7, "the signed message carries it too");
+        assert_eq!(st.burn_sequence, 8);
+        assert_eq!(st.burns.keys().copied().collect::<Vec<_>>(), vec![7]);
+        // Absent is today's 0.
+        let (plain, _) = cfg();
+        assert_eq!(BridgeState::from_config(&plain).burn_sequence, 0);
     }
 
     #[test]
@@ -1906,6 +1994,8 @@ mod tests {
             ],
             pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
             rules_v2: None,
+            guardian_set_index: None,
+            burn_sequence: None,
         });
         st.spent.insert(Hash([0x44; 32]));
         st.burn_sequence = 7;
@@ -2182,6 +2272,8 @@ mod tests {
             pq_guardians: vector_keys(&pq),
             pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
             rules_v2: None,
+            guardian_set_index: None,
+            burn_sequence: None,
         });
         let now = att["now"].as_u64().unwrap();
         let by_name = |name: &str| {

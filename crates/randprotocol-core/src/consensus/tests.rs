@@ -114,6 +114,8 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
             pq_guardians: vec![Keypair::from_seed([0x70; 32]).unwrap().public_key().clone()],
             pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
             rules_v2: None,
+            guardian_set_index: None,
+            burn_sequence: None,
         }),
         tokens: bridged.then(|| crate::genesis::TokensConfig {
             registration_fee: crate::genesis::MIN_REGISTRATION_FEE,

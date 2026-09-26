@@ -2858,6 +2858,8 @@ pub(crate) mod fixtures {
             pq_guardians: pq_keys().iter().map(|k| k.public_key().clone()).collect(),
             pause_key: Some(randprotocol_core::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
             rules_v2: None,
+            guardian_set_index: None,
+            burn_sequence: None,
         };
         (config, secrets)
     }

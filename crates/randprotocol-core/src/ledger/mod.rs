@@ -3501,6 +3501,8 @@ mod tests {
                 pq_guardians: vec![],
                 pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
                 rules_v2: None,
+                guardian_set_index: None,
+                burn_sequence: None,
             };
         let mut bridged = plain.clone();
         bridged.set_bridge(Some(BridgeState::from_config(&config)));
@@ -3554,6 +3556,8 @@ mod tests {
                 pq_guardians: vec![],
                 pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
                 rules_v2: None,
+                guardian_set_index: None,
+                burn_sequence: None,
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));
@@ -3613,6 +3617,8 @@ mod tests {
                 pq_guardians: vec![],
                 pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
                 rules_v2: None,
+                guardian_set_index: None,
+                burn_sequence: None,
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));

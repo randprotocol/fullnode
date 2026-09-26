@@ -866,6 +866,17 @@ impl Genesis {
             commit.extend_from_slice(&rules.global_mint_cap_per_window.to_be_bytes());
             commit.extend_from_slice(&rules.cap_window_secs.to_be_bytes());
         }
+        // A bridge carried over from another chain (chain 15): the guardian set it starts at and
+        // the sequence its first burn carries, each tagged and appended only when present, in
+        // this fixed order after the rules — so chain 14's file hashes byte-for-byte as before.
+        if let Some(index) = self.bridge.as_ref().and_then(|b| b.guardian_set_index) {
+            commit.extend_from_slice(b"bridge_guardian_set_index");
+            commit.extend_from_slice(&index.to_be_bytes());
+        }
+        if let Some(sequence) = self.bridge.as_ref().and_then(|b| b.burn_sequence) {
+            commit.extend_from_slice(b"bridge_burn_sequence");
+            commit.extend_from_slice(&sequence.to_be_bytes());
+        }
         // RPL tokens, after the bridge bytes: appended only when the section is configured, so a
         // chain without one hashes byte-for-byte as before. `TokensCommit` is the plain-bytes
         // twin of `TokensConfig`, whose own serde renders a token address as hex text — bincode
@@ -997,6 +1008,11 @@ fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
     let bad = |m: String| Err(GenesisError::BadBridgeConfig(m));
     if cfg.guardians.is_empty() {
         return bad("no guardians".into());
+    }
+    // A set at the last index could never be rotated away from: the next rotation must carry
+    // `index + 1`, which does not exist.
+    if cfg.guardian_set_index == Some(u32::MAX) {
+        return bad("guardian_set_index u32::MAX leaves no index to rotate to".into());
     }
     // A set whose own quorum attestation cannot fit the wire cap is a chain that could not
     // run: a transfer attestation is 6 envelope bytes + 66 per signature + a 51-byte body
@@ -1590,6 +1606,8 @@ mod tests {
             pq_guardians: vec![pq_key(0)],
             pause_key: Some(crate::crypto::Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
             rules_v2: None,
+            guardian_set_index: None,
+            burn_sequence: None,
         }
     }
 
@@ -2137,6 +2155,37 @@ mod tests {
         g.alloc = opened_alloc();
         g.alloc.push(token_note(21, 1_000_000_000, 1));
         g
+    }
+
+    /// The two carried-over bridge fields reach the genesis ledger's bridge and are committed
+    /// only when present: chain 14's shape (neither field) is untouched, each one moves the hash,
+    /// neither appears in a file that does not set it, and the last index is refused.
+    #[test]
+    fn a_bridge_can_start_at_a_guardian_set_and_burn_sequence_and_both_are_committed() {
+        let g = chain15_shape();
+        let plain = build(&g);
+        let mut carried = g.clone();
+        let b = carried.bridge.as_mut().unwrap();
+        (b.guardian_set_index, b.burn_sequence) = (Some(1), Some(7));
+        let s = build(&carried);
+        let bridge = s.ledger.bridge().unwrap();
+        assert_eq!((bridge.current_set, bridge.burn_sequence), (1, 7));
+        assert_eq!(bridge.guardian_sets.keys().copied().collect::<Vec<_>>(), vec![1]);
+        assert_ne!(s.hash(), plain.hash());
+        let json = carried.to_json();
+        assert!(json.contains("\"guardian_set_index\": 1") && json.contains("\"burn_sequence\": 7"), "{json}");
+        assert_eq!(Genesis::from_json(&json).unwrap(), carried);
+        assert!(!g.to_json().contains("guardian_set_index") && !g.to_json().contains("burn_sequence"));
+        // Each one alone is its own chain.
+        let mut index_only = g.clone();
+        index_only.bridge.as_mut().unwrap().guardian_set_index = Some(1);
+        let mut sequence_only = g.clone();
+        sequence_only.bridge.as_mut().unwrap().burn_sequence = Some(7);
+        let hashes = [plain.hash(), build(&index_only).hash(), build(&sequence_only).hash(), s.hash()];
+        assert_eq!(hashes.iter().collect::<BTreeSet<_>>().len(), 4, "{hashes:?}");
+        let mut last = g.clone();
+        last.bridge.as_mut().unwrap().guardian_set_index = Some(u32::MAX);
+        assert!(matches!(last.validate(), Err(GenesisError::BadBridgeConfig(m)) if m.contains("guardian_set_index")));
     }
 
     /// Listed at genesis with chain 14's registration fields, zUSD keeps chain 14's asset id —

@@ -363,6 +363,8 @@ mod tests {
             pq_guardians,
             pause_key: Some(Keypair::from_seed([0x7f; 32]).unwrap().public_key().clone()),
             rules_v2: None,
+            guardian_set_index: None,
+            burn_sequence: None,
         })));
         l.set_tokens(Some(TokenRegistry::new(FEE).with_mint_cap(100_000 * 100_000_000)));
         l.set_height(1);

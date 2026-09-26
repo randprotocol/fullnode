@@ -1118,3 +1118,19 @@ Genesis can now start a listed token holding exactly that, so `custody − locke
 entry, sealed to the owner's KEM key like a `genesis --alloc` note, so the owner's wallet finds it
 on its first scan. The token keeps its id across the cut when it is listed with the old chain's
 name, symbol and salt (zUSD: `"Shielded USD"`, `"zUSD"`, salt `27e77272…1d60` → `32e5ab28…7b1f`).
+
+The `bridge` section carries the rest of the old chain's bridge position, each field optional and
+committed to the genesis hash under its own tag only when present (`b"bridge_guardian_set_index"`
+‖ u32 BE, then `b"bridge_burn_sequence"` ‖ u64 BE, after the rules-v2 bytes), and in the bridge
+root either way:
+
+- **`guardian_set_index`**: the index the listed `guardians` start as. The genesis bridge holds
+  that one set as `current_set` — an attestation under any other index is `UnknownGuardianSet`,
+  and the next rotation must carry `index + 1` (`BadUpgradeIndex` otherwise). `u32::MAX` is
+  refused. Chain 15 starts at 1, where the source endpoints already are.
+- **`burn_sequence`**: the sequence the first outbound burn carries. Chain 14's burns ended at 6,
+  so chain 15 starts at 7 and no endpoint or daemon keyed by sequence sees one twice.
+
+`rand_getBridgeState` serves both as it always has (`guardian_set_index`, `burn_sequence`);
+`rand_getTokens`/`rand_getAssets` serve the genesis `locked` and `total_supply`, and
+`rand_getSupply`'s `genesis_deposited` stays RAND-only.

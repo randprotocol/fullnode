@@ -46,6 +46,8 @@ pub fn bridge_config_for(emitter: [u8; 32], source_chains: &[u16]) -> BridgeConf
         pq_guardians: pq_guardian_keys().iter().map(|k| k.public_key().clone()).collect(),
         pause_key: Some(pause_keypair().public_key().clone()),
         rules_v2: None,
+        guardian_set_index: None,
+        burn_sequence: None,
     }
 }
 
