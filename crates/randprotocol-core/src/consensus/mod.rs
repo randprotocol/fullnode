@@ -266,6 +266,10 @@ pub struct ConsensusConfig {
     pub max_timeout: Duration,
     /// Cap on buffered blocks whose parent is unknown.
     pub max_orphans: usize,
+    /// Cap on the encoded bytes of the buffered blocks whose parent is unknown (scan sweep
+    /// 2026-09-26, SW-1): the count cap alone let 256 blocks at the transport's size limit hold
+    /// gigabytes.
+    pub max_orphan_bytes: usize,
     /// Cap on blocks held in the speculative tree (committed head plus
     /// uncommitted blocks). Each entry carries a full ledger clone, so an
     /// uncapped tree is a memory-exhaustion vector.
@@ -285,6 +289,7 @@ impl ConsensusConfig {
             base_timeout: Duration::from_secs(1),
             max_timeout: Duration::from_secs(8),
             max_orphans: 256,
+            max_orphan_bytes: 64 << 20,
             max_tree_blocks: 512,
         }
     }
@@ -333,4 +338,10 @@ pub enum ConsensusError {
     /// The proposal's view is more than [`PROPOSAL_VIEW_WINDOW`] views past this replica's.
     #[error("proposal for view {view} is more than {PROPOSAL_VIEW_WINDOW} views ahead of the current view {current}")]
     ViewTooFarAhead { view: u64, current: u64 },
+    /// A block whose parent this replica does not hold, at a height the speculative tree could
+    /// never reach from the committed head or at a view no higher than the committed head's
+    /// (scan sweep 2026-09-26, SW-1): not kept as an orphan. A replica that far behind catches
+    /// up through block sync.
+    #[error("block at height {height}, view {view} with an unknown parent is outside the orphan range")]
+    OrphanOutOfRange { height: u64, view: u64 },
 }

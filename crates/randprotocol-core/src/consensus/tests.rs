@@ -2635,3 +2635,143 @@ fn the_consensus_suite_holds_under_signing_domain_v1() {
         epoch_rollover_uses_the_register_after_the_last_block_of_the_previous_epoch();
     });
 }
+
+// ---------------------------------------------------------------------------
+// Scan sweep 2026-09-26, SW-1: the orphan pool
+// ---------------------------------------------------------------------------
+
+/// The honest out-of-order pair every orphan test checks survives: B1 and B2 from the one
+/// validator, and a fresh observer on the same genesis.
+fn sw1_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair, Block, Block) {
+    let (cfg, gs, key) = one_node_parts();
+    let mut x = one_node_with(cfg.clone(), gs.block.clone(), gs.ledger.clone(), Keypair::from_seed(*key.seed()).unwrap());
+    x.node.start();
+    let b1 = proposal_of(&x.propose(1));
+    let b2 = proposal_of(&x.propose(2));
+    (cfg, gs, key, b1, b2)
+}
+
+fn sw1_observer(cfg: &ConsensusConfig, gs: &crate::genesis::GenesisState) -> HotStuff {
+    let mut z = HotStuff::new(cfg.clone(), None, gs.block.clone(), gs.ledger.clone(), std::sync::Arc::new(StubExecutor));
+    z.start();
+    z
+}
+
+/// A block on a parent nobody holds, signed by `key`, carrying `txs` under a correct tx root.
+fn sw1_orphan(cfg: &ConsensusConfig, key: &Keypair, height: u64, view: u64, salt: u64, txs: Vec<Transaction>) -> Block {
+    let header = crate::types::BlockHeader {
+        height,
+        view,
+        parent: Hash::digest(&salt.to_le_bytes()),
+        proposer: key.public_key().clone(),
+        timestamp_ms: 0,
+        tx_root: Block::tx_root(&txs),
+        state_root: Hash::ZERO,
+        justify: QuorumCertificate::genesis(cfg.genesis_hash),
+    };
+    Block::sign(&cfg.domain, header, txs, key)
+}
+
+/// A mint whose envelope body is `bytes` long: payload for the size tests.
+fn sw1_padded(key: &Keypair, bytes: usize) -> Transaction {
+    let mut tx = mint(key, 9);
+    if let crate::types::Action::Mint { envelope, .. } = &mut tx.action {
+        envelope.body = vec![0xab; bytes];
+    }
+    tx
+}
+
+/// B2 before B1 at a replica holding `z`'s pool: B2 must come back out when B1 arrives.
+fn sw1_honest_orphan_survives(z: &mut HotStuff, b1: &Block, b2: &Block) -> bool {
+    assert!(matches!(z.on_proposal(b2.clone(), 0), Err(ConsensusError::UnknownParent(_))));
+    let _ = z.on_proposal(b1.clone(), 0);
+    z.has_block(&b2.hash())
+}
+
+/// A proposal signed by a key in no validator set, on a parent nobody holds, was kept as an
+/// orphan after only its view and its own signature were checked; at a height past anything the
+/// chain will commit, `prune` never dropped it. 256 of them pinned the pool for good (and held
+/// 256 MiB here, ~4 GiB at the transport's 16 MiB): a legitimate out-of-order proposal was lost.
+#[test]
+fn an_outsiders_orphans_are_refused_and_never_pin_the_pool() {
+    let (cfg, gs, _key, b1, b2) = sw1_parts();
+    // Baseline: an observer that sees B2 before B1 recovers B2 from its orphan pool.
+    let mut y = sw1_observer(&cfg, &gs);
+    assert!(sw1_honest_orphan_survives(&mut y, &b1, &b2), "baseline: the orphan is replayed");
+
+    let outsider = Keypair::from_seed([0xee; 32]).unwrap();
+    let mut z = sw1_observer(&cfg, &gs);
+    let junk = sw1_padded(&outsider, 1 << 20);
+    for i in 0..256u64 {
+        let r = z.on_proposal(sw1_orphan(&cfg, &outsider, u64::MAX - i, 1, i, vec![junk.clone()]), 0);
+        assert!(r.is_err(), "an outsider's block with an unknown parent cannot apply: {r:?}");
+    }
+    assert!(
+        sw1_honest_orphan_survives(&mut z, &b1, &b2),
+        "the honest orphan was dropped: the pool is pinned by 256 outsider blocks"
+    );
+    assert_eq!(z.orphans_held().0, 0, "nothing of the outsider's is held");
+}
+
+/// Even the leader's own key cannot pin the pool: the count cap was first-come and never
+/// evicted above the committed height, so 256 blocks on made-up parents at far heights shut out
+/// the one out-of-order block that mattered. A full pool now gives way to a lower height.
+#[test]
+fn a_full_orphan_pool_gives_way_to_a_lower_height() {
+    let (cfg, gs, key, b1, b2) = sw1_parts();
+    let mut z = sw1_observer(&cfg, &gs);
+    for i in 0..cfg.max_orphans as u64 {
+        let r = z.on_proposal(sw1_orphan(&cfg, &key, 100 + i, 2, i, vec![]), 0);
+        assert!(r.is_err(), "{r:?}");
+    }
+    assert_eq!(z.orphans_held().0, cfg.max_orphans);
+    assert!(sw1_honest_orphan_survives(&mut z, &b1, &b2), "a full orphan pool refused the honest out-of-order block");
+    assert!(z.orphans_held().0 <= cfg.max_orphans);
+}
+
+/// The orphan pool is bounded by bytes, not only by count: sixteen 1 MiB orphans against a
+/// 4 MiB budget keep at most the budget, and the honest orphan still gets in.
+#[test]
+fn the_orphan_pool_is_bounded_in_bytes() {
+    let (mut cfg, gs, key, b1, b2) = sw1_parts();
+    cfg.max_orphan_bytes = 4 << 20;
+    let mut z = sw1_observer(&cfg, &gs);
+    let payload = sw1_padded(&key, 1 << 20);
+    for i in 0..16u64 {
+        let _ = z.on_proposal(sw1_orphan(&cfg, &key, 100 + i, 2, i, vec![payload.clone()]), 0);
+    }
+    let (_, bytes) = z.orphans_held();
+    assert!(bytes <= cfg.max_orphan_bytes as u64, "the orphan pool holds {bytes} bytes against a budget of {}", cfg.max_orphan_bytes);
+    assert!(sw1_honest_orphan_survives(&mut z, &b1, &b2));
+}
+
+/// What a block with an unknown parent must pass before it is kept: a height the tree could
+/// ever reach, a view above the committed head's, the block byte cap, and its own tx root.
+#[test]
+fn an_orphan_is_checked_before_it_is_kept() {
+    let (cfg, gs, key, b1, b2) = sw1_parts();
+    let mut z = sw1_observer(&cfg, &gs);
+    let too_high = cfg.max_tree_blocks as u64 + 1;
+    let r = z.on_proposal(sw1_orphan(&cfg, &key, too_high, 2, 1, vec![]), 0);
+    assert!(!matches!(r, Err(ConsensusError::UnknownParent(_))), "a height past the tree's reach was kept: {r:?}");
+    let r = z.on_proposal(sw1_orphan(&cfg, &key, 5, 0, 2, vec![]), 0);
+    assert!(!matches!(r, Err(ConsensusError::UnknownParent(_))), "a view at the committed head's was kept: {r:?}");
+    let over = sw1_padded(&key, gs.ledger.max_block_bytes() + 1);
+    let r = z.on_proposal(sw1_orphan(&cfg, &key, 5, 2, 3, vec![over]), 0);
+    assert_eq!(r, Err(ConsensusError::Execution(crate::ledger::BlockError::TooLarge)));
+    let mut bad_root = sw1_orphan(&cfg, &key, 5, 2, 4, vec![mint(&key, 4)]);
+    bad_root.transactions.push(mint(&key, 5));
+    let r = z.on_proposal(bad_root, 0);
+    assert_eq!(r, Err(ConsensusError::Execution(crate::ledger::BlockError::TxRootMismatch)));
+    // A justify carrying more votes than any set has validators is refused too.
+    let mut fat = sw1_orphan(&cfg, &key, 5, 2, 6, vec![]);
+    fat.header.justify = QuorumCertificate {
+        view: 1,
+        block_hash: fat.header.parent,
+        votes: (0..2).map(|_| Vote::sign(&cfg.domain, 1, fat.header.parent, &key)).collect(),
+    };
+    let fat = Block::sign(&cfg.domain, fat.header, fat.transactions, &key);
+    assert_eq!(z.on_proposal(fat, 0), Err(ConsensusError::BadJustify));
+    assert_eq!(z.orphans_held().0, 0);
+    assert!(sw1_honest_orphan_survives(&mut z, &b1, &b2));
+}

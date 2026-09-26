@@ -89,9 +89,12 @@ pub struct HotStuff {
     committed_ledger: Ledger,
     /// Uncommitted blocks plus the committed head (so children can find their parent).
     tree: HashMap<Hash, Entry>,
-    /// Blocks waiting for a parent, keyed by parent hash.
-    orphans: HashMap<Hash, Vec<Block>>,
+    /// Blocks waiting for a parent, keyed by parent hash, each with its encoded size. Only a
+    /// block that passed `check_orphan` is kept; the pool is capped by count and by bytes, and a
+    /// full pool gives way to a lower height (scan sweep 2026-09-26, SW-1).
+    orphans: HashMap<Hash, Vec<(Block, usize)>>,
     orphan_count: usize,
+    orphan_bytes: usize,
     /// The one block this replica holds per (view, proposer) (audit v4, CON-3): a second,
     /// different block from the same leader for the same view is an equivocation and is refused.
     /// Entries outlive their blocks: `prune` drops those at or under the committed head's view
@@ -229,6 +232,7 @@ impl HotStuff {
             tree,
             orphans: HashMap::new(),
             orphan_count: 0,
+            orphan_bytes: 0,
             proposed: BTreeMap::new(),
             not_held: HashMap::new(),
             unobtainable: std::collections::HashSet::new(),
@@ -323,6 +327,13 @@ impl HotStuff {
     }
     pub fn committed_height(&self) -> u64 {
         self.committed_height
+    }
+    /// Tests only: how many blocks the orphan pool holds, and their encoded bytes — measured
+    /// here, not read from the pool's own counter.
+    #[cfg(test)]
+    pub(super) fn orphans_held(&self) -> (usize, u64) {
+        let blocks = self.orphans.values().flatten().map(|(b, _)| b);
+        blocks.fold((0, 0), |(n, bytes), b| (n + 1, bytes + bincode::serialized_size(b).unwrap_or(0)))
     }
     /// The view of the QC that certifies the committed head — the floor under the lock: a
     /// persisted `locked_qc` older than this one is stale, and `resume` raises it to this.
@@ -743,7 +754,8 @@ impl HotStuff {
         // The set of a block's epoch is derived from its branch, so the parent comes first.
         let parent_hash = block.parent();
         let Some(parent) = self.tree.get(&parent_hash) else {
-            self.add_orphan(block);
+            let bytes = self.check_orphan(&block)?;
+            self.add_orphan(block, bytes);
             return Err(ConsensusError::UnknownParent(parent_hash));
         };
         let parent_height = parent.block.height();
@@ -843,7 +855,8 @@ impl HotStuff {
         // Children that were waiting for this block.
         if let Some(children) = self.orphans.remove(&hash) {
             self.orphan_count -= children.len();
-            for child in children {
+            self.orphan_bytes -= children.iter().map(|(_, bytes)| bytes).sum::<usize>();
+            for (child, _) in children {
                 if let Ok(more) = self.on_proposal(child, now_ms) {
                     out.extend(more);
                 }
@@ -1292,10 +1305,11 @@ impl HotStuff {
         self.tree.retain(|hash, e| *hash == keep || e.block.height() > h);
         self.drop_unreachable();
         self.orphans.retain(|_, v| {
-            v.retain(|b| b.height() > h);
+            v.retain(|(b, _)| b.height() > h);
             !v.is_empty()
         });
         self.orphan_count = self.orphans.values().map(|v| v.len()).sum();
+        self.orphan_bytes = self.orphans.values().flatten().map(|(_, bytes)| bytes).sum();
         // The equivocation record: entries at or under the committed head's view are decided;
         // a pruned dead branch's entries stay — its leader proposed in those views all the same.
         let head_view = self.tree.get(&keep).map(|e| e.block.view()).unwrap_or(0);
@@ -1434,15 +1448,102 @@ impl HotStuff {
         out.push(Action::Broadcast(ConsensusMessage::Vote(vote)));
     }
 
-    /// Buffer a block whose parent is unknown. The caller receives
-    /// `ConsensusError::UnknownParent(parent)` and is responsible for fetching it
+    /// What a block whose parent is unknown must pass before it is kept (scan sweep 2026-09-26,
+    /// SW-1), the cheap checks first; returns its encoded size. Its signature is already checked.
+    /// Before this, a proposal signed by *any* key — its own header names the key it is checked
+    /// against — was kept at any height past the committed head, and one far past it was never
+    /// pruned: 256 of them at the transport's size limit pinned the pool and gigabytes with it.
+    ///
+    /// - A height the speculative tree could reach from the committed head (`max_tree_blocks`),
+    ///   and a view above the committed head's: nothing else can ever link.
+    /// - A proposer that leads the block's view in a set this replica knows: the current set,
+    ///   the recorded epoch sets, and the sets derived for blocks in the tree. The set of an
+    ///   epoch derived from a block this replica does not hold is not knowable here, so an
+    ///   out-of-order block from a validator only that set admits is refused; it arrives again
+    ///   through sync, which is how a replica that far behind catches up anyway.
+    /// - The block rules `apply_block_for_sync` would refuse it on without state: the
+    ///   transaction count, the byte cap (the committed ledger's `max_block_bytes`) and the tx
+    ///   root, and a justify with no more votes than the largest known set has validators (the
+    ///   justify itself is verified once the parent, and so its epoch, is known).
+    fn check_orphan(&self, block: &Block) -> Result<usize, ConsensusError> {
+        let head_view = self.tree.get(&self.committed_hash).map_or(0, |e| e.block.view());
+        if block.height() > self.committed_height.saturating_add(self.cfg.max_tree_blocks as u64) || block.view() <= head_view {
+            return Err(ConsensusError::OrphanOutOfRange { height: block.height(), view: block.view() });
+        }
+        let proposer = block.proposer();
+        let mut leads = self.current.leader(block.view()) == proposer;
+        let mut largest = self.current.len();
+        for (_, set) in self.epoch_sets.known() {
+            leads |= set.leader(block.view()) == proposer;
+            largest = largest.max(set.len());
+        }
+        for set in self.derived().values() {
+            leads |= set.leader(block.view()) == proposer;
+            largest = largest.max(set.len());
+        }
+        if !leads {
+            return Err(ConsensusError::WrongLeader(block.view()));
+        }
+        if block.transactions.len() > crate::gas::MAX_BLOCK_TXS {
+            return Err(BlockError::TooManyTransactions.into());
+        }
+        let max_bytes = self.committed_ledger.max_block_bytes();
+        let mut tx_bytes = 0usize;
+        for tx in &block.transactions {
+            tx_bytes += tx.encoded_len();
+            if tx_bytes > max_bytes {
+                return Err(BlockError::TooLarge.into());
+            }
+        }
+        if block.header.justify.votes.len() > largest {
+            return Err(ConsensusError::BadJustify);
+        }
+        if !block.verify_tx_root() {
+            return Err(BlockError::TxRootMismatch.into());
+        }
+        // Bounded by the checks above: the transactions by the byte cap, the header by the vote
+        // count.
+        Ok(bincode::serialized_size(block).map_or(usize::MAX, |n| n as usize))
+    }
+
+    /// Buffer a block whose parent is unknown, already through `check_orphan`. The caller
+    /// receives `ConsensusError::UnknownParent(parent)` and is responsible for fetching it
     /// (or batch-syncing); once the parent arrives via `on_proposal` the orphan is replayed.
-    fn add_orphan(&mut self, block: Block) {
-        if self.orphan_count >= self.cfg.max_orphans {
+    ///
+    /// Bounded by `max_orphans` and `max_orphan_bytes` (scan sweep 2026-09-26, SW-1). A full pool
+    /// evicts its highest orphans for a strictly lower one, and otherwise refuses the newcomer:
+    /// the block an honest replica is missing sits just above its head, and a block far above
+    /// it can only be resolved by sync — so filling the pool at far heights, which the first-come
+    /// cap rewarded, now buys nothing.
+    fn add_orphan(&mut self, block: Block, bytes: usize) {
+        if bytes > self.cfg.max_orphan_bytes {
             return;
         }
         let parent = block.parent();
-        self.orphans.entry(parent).or_default().push(block);
+        let hash = block.hash();
+        if self.orphans.get(&parent).is_some_and(|v| v.iter().any(|(b, _)| b.hash() == hash)) {
+            return;
+        }
+        while self.orphan_count >= self.cfg.max_orphans || self.orphan_bytes + bytes > self.cfg.max_orphan_bytes {
+            let highest = self
+                .orphans
+                .iter()
+                .flat_map(|(p, v)| v.iter().enumerate().map(move |(i, (b, _))| ((b.height(), b.view(), b.hash()), *p, i)))
+                .max_by_key(|(key, _, _)| *key);
+            let Some(((height, _, _), p, i)) = highest else { return };
+            if height <= block.height() {
+                return;
+            }
+            let v = self.orphans.get_mut(&p).expect("found above");
+            let (_, freed) = v.swap_remove(i);
+            if v.is_empty() {
+                self.orphans.remove(&p);
+            }
+            self.orphan_count -= 1;
+            self.orphan_bytes -= freed;
+        }
+        self.orphans.entry(parent).or_default().push((block, bytes));
         self.orphan_count += 1;
+        self.orphan_bytes += bytes;
     }
 }
