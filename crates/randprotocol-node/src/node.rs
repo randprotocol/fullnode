@@ -12,7 +12,7 @@ use crate::storage::{Storage, VerifyMode};
 use anyhow::{anyhow, Context, Result};
 use libp2p::{Multiaddr, PeerId};
 use randprotocol_core::confidential::ConfidentialExecutor;
-use randprotocol_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff};
+use randprotocol_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff, NotHeld};
 use randprotocol_core::Block;
 use randprotocol_core::genesis::{Genesis, GenesisState};
 use randprotocol_core::{Hash, Keypair, Ledger, NoVerified, ShieldedAddress, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
@@ -218,14 +218,53 @@ pub fn resume_consensus(
 
 /// The answer to a by-hash fetch: the block from the tree or the committed chain; failing that,
 /// a validator's signed not-held (audit v4, CON-4) so the asker can count its stake toward
-/// releasing a lock, and an observer's `Block(None)` — its word carries no stake.
-fn block_by_hash_response(hs: &HotStuff, storage: &Storage, h: &Hash) -> SyncResponse {
+/// releasing a lock, and an observer's `Block(None)` — its word carries no stake. The signed
+/// answer comes from `signed` when this hash was answered before (SW-2): a not-held is over the
+/// genesis and the hash alone, so a kept one is as good as a fresh one, and a repeated request
+/// no longer buys a Dilithium2 signature. The block lookup runs first on every request, so a
+/// block that arrives after its not-held was kept is served, never denied.
+fn block_by_hash_response(hs: &HotStuff, storage: &Storage, h: &Hash, signed: &mut NotHeldCache) -> SyncResponse {
     match hs.block(h).cloned().or_else(|| storage.block_by_hash(h).ok().flatten()) {
         Some(b) => SyncResponse::Block(Some(b)),
-        None => match hs.not_held(h) {
+        None => match signed.get_or_sign(h, || hs.not_held(h)) {
             Some(n) => SyncResponse::NotHeld(n),
             None => SyncResponse::Block(None),
         },
+    }
+}
+
+/// Signed not-held answers kept for re-serving (SW-2). A lock-release round asks about one hash
+/// — the locked block — so a handful would do; 256 covers every hash a burst of fetches names,
+/// at ~3.8 KB each (a Dilithium2 key and signature), under a megabyte.
+pub const NOT_HELD_CACHE: usize = 256;
+
+/// This validator's signed not-held answers by hash, oldest evicted first ([`NOT_HELD_CACHE`]).
+#[derive(Default)]
+struct NotHeldCache {
+    by_hash: HashMap<Hash, NotHeld>,
+    order: VecDeque<Hash>,
+}
+
+impl NotHeldCache {
+    /// The kept answer for `h`, or `sign()`'s, kept when there is one (an observer's `None` is
+    /// not).
+    fn get_or_sign(&mut self, h: &Hash, sign: impl FnOnce() -> Option<NotHeld>) -> Option<NotHeld> {
+        if let Some(n) = self.by_hash.get(h) {
+            return Some(n.clone());
+        }
+        let n = sign()?;
+        if self.order.len() >= NOT_HELD_CACHE {
+            if let Some(old) = self.order.pop_front() {
+                self.by_hash.remove(&old);
+            }
+        }
+        self.order.push_back(*h);
+        self.by_hash.insert(*h, n.clone());
+        Some(n)
+    }
+
+    fn len(&self) -> usize {
+        self.by_hash.len()
     }
 }
 
@@ -683,6 +722,10 @@ struct Node {
     status_limiter: admission::PeerLimiter,
     /// The policy over every peer's `consensus_bucket` (see [`on_consensus_gossip`]).
     consensus_limiter: admission::PeerLimiter,
+    /// The policy over every peer's `sync_bucket` (see [`admit_sync_request`]).
+    sync_limiter: admission::PeerLimiter,
+    /// This validator's signed not-held answers, re-served to repeated by-hash requests (SW-2).
+    not_held_signed: NotHeldCache,
     /// The tip the pending verifications are running against, refreshed lazily: a full ledger clone
     /// per consensus message would cost one per vote, so it is taken only when a transaction is
     /// waiting and the tip's `(height, root)` has moved since the last one.
@@ -725,6 +768,8 @@ struct Peer {
     status_bucket: admission::TokenBucket,
     /// The same, for the consensus messages this peer forwards ([`on_consensus_gossip`]).
     consensus_bucket: admission::TokenBucket,
+    /// The same, for the sync requests this peer sends us ([`admit_sync_request`]).
+    sync_bucket: admission::TokenBucket,
     /// Not asked for a batch before this instant (SYNC-2): set by [`back_off_sync_peer`] when the
     /// peer answered our live batch request with nothing we could use.
     sync_backoff_until: Option<Instant>,
@@ -770,6 +815,34 @@ fn on_consensus_gossip(
         return GossipOutcome::Report(admission::Acceptance::Ignore);
     }
     GossipOutcome::for_consensus()
+}
+
+/// Inbound sync requests one peer may send back to back, and the rate it recovers them at (SW-2).
+/// A `Blocks` answer is up to ~6 MiB read and assembled on the consensus loop
+/// ([`serve_sync_budget`]) and a by-hash miss may cost a signature, for a request of a few dozen
+/// bytes. An honest syncer keeps one batch request in flight and applies it before the next, and
+/// fetches by hash only for a proposal's missing parent; eight at once and two a second after
+/// is a full batch every half second from each peer — past that it is told "nothing" and, under
+/// SYNC-2, moves on to another peer for a few seconds, spreading a catch-up across the fleet.
+pub const SYNC_REQUEST_BURST: u32 = 8;
+pub const SYNC_REQUEST_PER_SEC: f64 = 2.0;
+
+/// Whether to serve `peer`'s sync request now (SW-2): metered on its own `sync_bucket`. `peer` is
+/// the request's connection, never a claimed identity, and only a connected peer can send one,
+/// so an entry made here is bounded by the swarm's connection cap.
+fn admit_sync_request(peers: &mut HashMap<PeerId, Peer>, limiter: &admission::PeerLimiter, peer: PeerId, now: Instant) -> bool {
+    // Spent in place: `TokenBucket` is `Copy`.
+    limiter.allow(&mut peers.entry(peer).or_default().sync_bucket, now)
+}
+
+/// The answer to a request over its peer's limit: the protocol's own "nothing" — an empty batch,
+/// or an unsigned `Block(None)`, which is a fetch attempt and never lock-release evidence. Every
+/// request is still answered, so the asker is not left waiting out a wire timeout.
+fn refused_sync_response(req: &SyncRequest) -> SyncResponse {
+    match req {
+        SyncRequest::Blocks { .. } => SyncResponse::Blocks(vec![]),
+        SyncRequest::BlockByHash(_) => SyncResponse::Block(None),
+    }
 }
 
 /// The first back-off of a peer that answered a batch request with nothing usable, and the cap
@@ -1219,6 +1292,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
         status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
         consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
+        sync_limiter: admission::PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC),
+        not_held_signed: NotHeldCache::default(),
         faucet_limiter: admission::PeerLimiter::new(admission::FAUCET_MINT_BURST, admission::FAUCET_MINT_PER_SEC),
         faucet_bucket: admission::TokenBucket::default(),
         snapshot: None,
@@ -1984,8 +2059,13 @@ impl Node {
                 }
             },
             NetworkEvent::SyncRequest { peer, request, channel } => {
-                let response = self.serve_sync(request);
-                tracing::debug!("serving sync request from {peer}");
+                let response = if admit_sync_request(&mut self.peers, &self.sync_limiter, peer, Instant::now()) {
+                    tracing::debug!("serving sync request from {peer}");
+                    self.serve_sync(request)
+                } else {
+                    tracing::debug!(%peer, "sync request over the peer's limit; answered empty");
+                    refused_sync_response(&request)
+                };
                 self.net.send_sync_response(channel, response).await;
             }
             NetworkEvent::SyncResponse { peer, request_id, response } => {
@@ -2057,7 +2137,7 @@ impl Node {
         }
     }
 
-    fn serve_sync(&self, req: SyncRequest) -> SyncResponse {
+    fn serve_sync(&mut self, req: SyncRequest) -> SyncResponse {
         match req {
             SyncRequest::Blocks { from_height, max } => {
                 let max = max.min(SYNC_BATCH);
@@ -2075,7 +2155,7 @@ impl Node {
                 // the stored block untouched, marker forms and all, and let the fetcher's
                 // acceptance decide (the batch path's sealed form is built in `Blocks`). A block
                 // this node does not hold gets a validator's signed not-held (audit v4, CON-4).
-                block_by_hash_response(&self.hs, &self.storage, &h)
+                block_by_hash_response(&self.hs, &self.storage, &h, &mut self.not_held_signed)
             }
         }
     }
@@ -3203,8 +3283,9 @@ mod tests {
             resume_consensus(&storage, &gs, signer, Duration::from_secs(1), Duration::from_secs(8), executor.clone()).unwrap()
         };
         let validator = resume(Some(key(1)));
+        let mut signed = NotHeldCache::default();
         let unknown = Hash::digest(b"nobody has this");
-        match block_by_hash_response(&validator, &storage, &unknown) {
+        match block_by_hash_response(&validator, &storage, &unknown, &mut signed) {
             SyncResponse::NotHeld(n) => {
                 assert_eq!(n.hash, unknown);
                 assert_eq!(n.signer, *key(1).public_key());
@@ -3215,11 +3296,92 @@ mod tests {
         }
         let head = storage.head_block().unwrap();
         assert!(matches!(
-            block_by_hash_response(&validator, &storage, &head.hash()),
+            block_by_hash_response(&validator, &storage, &head.hash(), &mut signed),
             SyncResponse::Block(Some(b)) if b.hash() == head.hash()
         ));
         let observer = resume(None);
-        assert!(matches!(block_by_hash_response(&observer, &storage, &unknown), SyncResponse::Block(None)));
+        assert!(matches!(block_by_hash_response(&observer, &storage, &unknown, &mut NotHeldCache::default()), SyncResponse::Block(None)));
+    }
+
+    /// SW-2 (network scan 2026-09-26, medium), the signing half: a by-hash request for a block
+    /// this validator does not hold made it sign a fresh Dilithium2 not-held every time, so one
+    /// peer repeating one ~40-byte request bought a signature per message. The signed answer is
+    /// now kept per hash (FIFO, [`NOT_HELD_CACHE`] hashes) and re-served; an observer's `None` is
+    /// nothing to keep.
+    #[test]
+    fn a_repeated_not_held_is_served_from_the_cache_not_re_signed() {
+        let (_d, storage, gs, _ledger) = chain_past_a_boundary();
+        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
+        let validator =
+            resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), executor).unwrap();
+        let unknown = Hash::digest(b"nobody has this");
+        let mut cache = NotHeldCache::default();
+        let mut signs = 0;
+        let first = cache.get_or_sign(&unknown, || {
+            signs += 1;
+            validator.not_held(&unknown)
+        });
+        let again = cache.get_or_sign(&unknown, || {
+            signs += 1;
+            validator.not_held(&unknown)
+        });
+        assert_eq!(signs, 1, "the repeat is served from the cache");
+        assert!(first.is_some() && first == again);
+        // Wired into the by-hash answer: a repeat does not grow the cache or re-sign.
+        let mut signed = NotHeldCache::default();
+        let a = block_by_hash_response(&validator, &storage, &unknown, &mut signed);
+        let b = block_by_hash_response(&validator, &storage, &unknown, &mut signed);
+        assert_eq!(signed.len(), 1);
+        match (a, b) {
+            (SyncResponse::NotHeld(a), SyncResponse::NotHeld(b)) => assert_eq!(a, b, "the same signed answer, not a second signature"),
+            other => panic!("{other:?}"),
+        }
+        // An observer's `None` is not kept.
+        let mut none = NotHeldCache::default();
+        assert_eq!(none.get_or_sign(&unknown, || None), None);
+        assert_eq!(none.len(), 0);
+        // Bounded, oldest first.
+        let mut bounded = NotHeldCache::default();
+        for i in 0..NOT_HELD_CACHE as u64 + 10 {
+            let h = Hash::digest(&i.to_le_bytes());
+            bounded.get_or_sign(&h, || validator.not_held(&h));
+        }
+        assert_eq!(bounded.len(), NOT_HELD_CACHE);
+        let oldest = Hash::digest(&0u64.to_le_bytes());
+        let mut resigned = false;
+        bounded.get_or_sign(&oldest, || {
+            resigned = true;
+            validator.not_held(&oldest)
+        });
+        assert!(resigned, "the oldest entry was evicted");
+    }
+
+    /// SW-2, the metering half: a ~30-byte `Blocks` request makes this node read and assemble up
+    /// to a ~6 MiB batch on the consensus loop, and nothing limited how often one peer could ask.
+    /// Inbound sync requests are metered per requesting peer (the connection's own identity):
+    /// [`SYNC_REQUEST_BURST`] back to back, [`SYNC_REQUEST_PER_SEC`] after; over it the answer is
+    /// the protocol's own "nothing" — an empty batch or `Block(None)`, which an honest syncer
+    /// already treats as "ask someone else" (SYNC-2's back-off) — so no request goes unanswered.
+    #[test]
+    fn inbound_sync_requests_are_metered_per_peer_and_answered_empty_over_the_limit() {
+        use crate::admission::PeerLimiter;
+        let pid = |seed: u8| PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public());
+        let limiter = PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC);
+        let (p1, p2) = (pid(1), pid(2));
+        let mut peers: HashMap<PeerId, Peer> = HashMap::new();
+        let now = Instant::now();
+        for i in 0..SYNC_REQUEST_BURST {
+            assert!(admit_sync_request(&mut peers, &limiter, p1, now), "request {i} of the burst");
+        }
+        assert!(!admit_sync_request(&mut peers, &limiter, p1, now), "over the burst");
+        assert!(admit_sync_request(&mut peers, &limiter, p2, now), "p2's bucket is its own");
+        let later = now + Duration::from_secs(1);
+        for i in 0..SYNC_REQUEST_PER_SEC as u32 {
+            assert!(admit_sync_request(&mut peers, &limiter, p1, later), "refilled {i}");
+        }
+        assert!(!admit_sync_request(&mut peers, &limiter, p1, later));
+        assert!(matches!(refused_sync_response(&SyncRequest::Blocks { from_height: 1, max: 100 }), SyncResponse::Blocks(b) if b.is_empty()));
+        assert!(matches!(refused_sync_response(&SyncRequest::BlockByHash(Hash::ZERO)), SyncResponse::Block(None)));
     }
 
     /// The startup check (H3): a genesis whose `hc_bundle` is not this build's guest is refused,
