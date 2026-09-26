@@ -323,6 +323,13 @@ Two things worth knowing before the next cut-over:
 - **Distribute through E, not from the laptop.** 36 MB per node over a home uplink is minutes each;
   copying to E once and fanning out droplet-to-droplet (`ssh -A` from the laptop, so E uses the
   forwarded agent and never holds a private key) moves all 15 in well under a minute.
+  **Superseded (ops review OPS-3):** a forwarded agent lets root on every droplet it reaches use
+  every key the laptop's agent holds for the length of the session. `update-droplet.sh` and
+  `cutover-droplet-chain14.sh` no longer pass `-A`; they relay build host → laptop scratch →
+  droplet with the sha256 checked at each hop (`deploy/lib/relay-binaries.sh`, as `roll-all.sh`
+  already did) — slower over a home uplink, never an agent on a droplet. The older chain-7…13
+  cutover scripts (`cutover-droplet.sh`, `cutover-droplet-rand.sh`) still use `-A`; do not reuse
+  them.
 
 #### What the rollout actually did
 

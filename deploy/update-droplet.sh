@@ -3,9 +3,11 @@
 #
 #   deploy/update-droplet.sh <ip> [build-host]
 #
-# - the binaries come from BUILD_HOST (default: node E, 188.166.235.187), fanned out
-#   droplet-to-droplet over the forwarded agent (`ssh -A`), never from the laptop's uplink
-#   (build there first with `deploy/rebuild-vps.sh <build-host>` from a clean checkout);
+# - the binaries come from BUILD_HOST (default: node E, 188.166.235.187), relayed through a
+#   scratch directory on this machine with the sha256 checked at every hop (deploy/lib/
+#   relay-binaries.sh) — no agent is forwarded to any droplet (ops review OPS-3: `ssh -A` handed
+#   the laptop's agent to every droplet it touched); build there first with
+#   `deploy/rebuild-vps.sh <build-host>` from a clean checkout;
 # - both copies (rand-node and rand) are checked against WANT_SHA / WANT_SHA_WALLET (or, without
 #   them, the build host's sha256) before anything is installed or the service is stopped;
 # - a droplet already on that binary is left alone (idempotent, safe to re-run over the fleet).
@@ -18,7 +20,8 @@ SERVICE=${SERVICE:-rand-node}
 BIN_NODE=${BIN_NODE:-rand-node}
 BIN_WALLET=${BIN_WALLET:-rand}
 BUILD_DIR=${BUILD_DIR:-/root/fullnode/target/release}
-SSH="ssh -A -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$IP"
+. "$(dirname "$0")/lib/relay-binaries.sh"
+SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$IP"
 
 # The shas the copies must match — BOTH binaries: rand-node runs as the service, and `rand` (the
 # wallet) is installed beside it and run as root below, so an unchecked wallet binary is root code
@@ -46,11 +49,8 @@ HAVE=$($SSH "sha256sum /usr/local/bin/$BIN_NODE | cut -d' ' -f1")
 HAVE_WALLET=$($SSH "sha256sum /usr/local/bin/$BIN_WALLET 2>/dev/null | cut -d' ' -f1")
 if [ "$WANT" = "$HAVE" ] && [ "$WANT_WALLET" = "$HAVE_WALLET" ]; then echo "$IP: already on ${WANT:0:8}"; exit 0; fi
 
+relay_binaries "$IP"
 $SSH "set -e
-  scp -o StrictHostKeyChecking=accept-new root@$BUILD_HOST:$BUILD_DIR/$BIN_NODE root@$BUILD_HOST:$BUILD_DIR/$BIN_WALLET /root/
-  chmod 755 /root/$BIN_NODE /root/$BIN_WALLET
-  [ \"\$(sha256sum /root/$BIN_NODE | cut -d' ' -f1)\" = \"$WANT\" ] || { echo 'copied $BIN_NODE does not match the expected sha — not touching this node' >&2; exit 1; }
-  [ \"\$(sha256sum /root/$BIN_WALLET | cut -d' ' -f1)\" = \"$WANT_WALLET\" ] || { echo 'copied $BIN_WALLET does not match the expected sha — not touching this node' >&2; exit 1; }
   systemctl stop $SERVICE
   install -m 755 /root/$BIN_NODE /root/$BIN_WALLET /usr/local/bin/
   if [ -n \"${PRUNE_ARGS:-}\" ] && ! grep -q -- '--prune-history' /etc/systemd/system/$SERVICE.service; then

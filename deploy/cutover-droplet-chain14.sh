@@ -32,6 +32,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . deploy/lib/key-guard.sh
+. deploy/lib/relay-binaries.sh
 
 IP=$1; NAME=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-188.166.235.187}
 SERVICE=${SERVICE:-rand-node}
@@ -45,7 +46,7 @@ HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-900}
 BOOTSTRAPS=${BOOTSTRAPS:-}
 PIN=${PIN:-}
 PRUNE_ARGS=${PRUNE_ARGS:-}
-SSH="ssh -A -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$IP"
+SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$IP"
 
 KEY="$KEYDIR/node-$NAME.key.json"
 [ -f "$KEY" ] || { echo "cutover14: no $KEY — run deploy/gen-chain14-keys.sh first" >&2; exit 1; }
@@ -63,7 +64,8 @@ $SSH "install -d -m 700 $REMOTE_KEYDIR"
 scp -o StrictHostKeyChecking=accept-new "$KEY" "root@$IP:$REMOTE_KEYDIR/node-$NAME.key.json"
 $SSH "chmod 600 $REMOTE_KEYDIR/node-$NAME.key.json"
 
-# The chain-14 binaries, fanned out droplet-to-droplet over the forwarded agent, and BOTH checked
+# The chain-14 binaries, relayed build host → this machine → droplet with the sha256 checked at
+# every hop (deploy/lib/relay-binaries.sh; no agent is forwarded — OPS-3), and BOTH checked
 # (rand-node and the rand wallet, which runs as root below — OPS-2) before anything is installed:
 # against WANT_SHA / WANT_SHA_WALLET when given, else against the build host's own sha256.
 host_sha() { ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$BUILD_HOST "sha256sum $BUILD_DIR/$1 | cut -d' ' -f1"; }
@@ -77,11 +79,7 @@ else
   echo "cutover14: warning: no WANT_SHA/WANT_SHA_WALLET — trusting $BUILD_HOST's own shas" >&2
   WANT=$(host_sha "$BIN_NODE"); WANT_WALLET=$(host_sha "$BIN_WALLET")
 fi
-$SSH "set -e
-  scp -o StrictHostKeyChecking=accept-new root@$BUILD_HOST:$BUILD_DIR/$BIN_NODE root@$BUILD_HOST:$BUILD_DIR/$BIN_WALLET /root/
-  chmod 755 /root/$BIN_NODE /root/$BIN_WALLET
-  [ \"\$(sha256sum /root/$BIN_NODE | cut -d' ' -f1)\" = \"$WANT\" ] || { echo 'copied $BIN_NODE does not match the expected sha — not touching this node' >&2; exit 1; }
-  [ \"\$(sha256sum /root/$BIN_WALLET | cut -d' ' -f1)\" = \"$WANT_WALLET\" ] || { echo 'copied $BIN_WALLET does not match the expected sha — not touching this node' >&2; exit 1; }"
+relay_binaries "$IP"
 
 # The genesis hash, computed on the droplet by the NEW binary, before any stop. A mismatch here
 # is a wrong file or a wrong build and costs nothing.
