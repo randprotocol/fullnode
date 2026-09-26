@@ -230,3 +230,22 @@ fn a_bundle_proved_against_the_empty_segment_is_refused() {
         assert_eq!(ex.verify_bundle(&ZkExecutor::hc_bundle(), &bytes, &binding), Err(refused.clone()));
     }
 }
+
+#[test]
+fn seal_note_as_follows_the_format_and_keeps_the_memo() {
+    use randprotocol_core::notes::{EnvelopeFormat, MEMO_ENVELOPE_BYTES};
+    use randprotocol_zkvm::address::{open_memo, seal_note_as};
+    let (a, b) = (SpendKey::random().viewing_key(), SpendKey::random().viewing_key());
+    let to = randprotocol_zkvm::address::address_of(&b);
+    let note = Note::new(b.pk(), a.pk(), 9, 0, 1);
+    let key = TxKey::random();
+    let e = seal_note_as(EnvelopeFormat::Memo, &a, &to, &note, &key, "hi").unwrap();
+    assert_eq!(e.len(), MEMO_ENVELOPE_BYTES);
+    assert_eq!(open_memo(&e, note.commitment(), &key).as_deref(), Some("hi"));
+    let e = seal_note_as(EnvelopeFormat::Memo, &a, &to, &note, &key, "").unwrap();
+    assert_eq!(e.len(), MEMO_ENVELOPE_BYTES, "an empty memo pads to the same size");
+    let old = seal_note_as(EnvelopeFormat::Legacy, &a, &to, &note, &key, "").unwrap();
+    assert_eq!(old.len(), 1348);
+    assert!(seal_note_as(EnvelopeFormat::Legacy, &a, &to, &note, &key, "x").unwrap_err().contains("no memo"));
+    assert!(seal_note_as(EnvelopeFormat::Memo, &a, &to, &note, &key, &"x".repeat(511)).unwrap_err().contains("at most 510"));
+}

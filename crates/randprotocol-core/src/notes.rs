@@ -23,6 +23,26 @@ pub const ADDRESS_PREFIX: &str = "rand1";
 /// chain (`admission::oversized_note`). `1 << 63`, so `value < MAX_NOTE_VALUE` is the rule.
 pub const MAX_NOTE_VALUE: u64 = 1 << 63;
 
+/// The memo field sealed with every note on a chain whose genesis sets `envelope_bytes`
+/// (spec 2026-09-26 §2.3); mirrors `randprotocol-zkvm`'s `viewing::MEMO_FIELD_BYTES`.
+pub const MEMO_FIELD_BYTES: usize = 512;
+pub const MEMO_TEXT_MAX_BYTES: usize = MEMO_FIELD_BYTES - 2;
+/// Every envelope's exact size under `envelope_bytes`: ML-KEM ciphertext, two wrapped keys, and
+/// the sealed `note ‖ memo` body.
+pub const MEMO_ENVELOPE_BYTES: usize = 1088 + 60 + 60 + (12 + 112 + MEMO_FIELD_BYTES + 16);
+
+/// Which body a wallet seals: the chain decides, through its genesis `envelope_bytes`
+/// (`rand_getLimits`). Chain 14 and every chain without the field stay on `Legacy`, so a wallet
+/// that predates the memo can still open everything sent to it there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvelopeFormat { Legacy, Memo }
+
+impl EnvelopeFormat {
+    pub fn for_chain(envelope_bytes: Option<u32>) -> EnvelopeFormat {
+        if envelope_bytes == Some(MEMO_ENVELOPE_BYTES as u32) { EnvelopeFormat::Memo } else { EnvelopeFormat::Legacy }
+    }
+}
+
 /// The 32 little-endian bytes of a word octet.
 pub fn word8_to_bytes(w: &Word8) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -373,6 +393,14 @@ mod tests {
         let e = Envelope { kem_ct: vec![0; 1088], to_receiver: vec![0; 60], to_sender: vec![0; 60], body: vec![0; 140] };
         assert_eq!(e.len(), 1348);
         assert!(e.len() <= MAX_ENVELOPE_BYTES);
+    }
+
+    #[test]
+    fn the_memo_envelope_is_1860_bytes_and_the_format_follows_the_chain() {
+        assert_eq!(MEMO_ENVELOPE_BYTES, 1088 + 60 + 60 + (12 + 112 + MEMO_FIELD_BYTES + 16));
+        assert_eq!(EnvelopeFormat::for_chain(None), EnvelopeFormat::Legacy);
+        assert_eq!(EnvelopeFormat::for_chain(Some(1860)), EnvelopeFormat::Memo);
+        assert_eq!(EnvelopeFormat::for_chain(Some(2048)), EnvelopeFormat::Legacy);
     }
 
     #[test]

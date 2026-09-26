@@ -59,6 +59,33 @@ pub fn seal_note(sender: &ViewingKey, to: &ShieldedAddress, note: &Note, tx_key:
     Ok(envelope_to_core(&viewing::Envelope::seal(sender, &to_research(to)?, note, tx_key)))
 }
 
+/// Seals `note` to `to` in the chain's envelope `format`, with `memo` (empty for none).
+pub fn seal_note_as(
+    format: randprotocol_core::notes::EnvelopeFormat,
+    sender: &ViewingKey,
+    to: &ShieldedAddress,
+    note: &Note,
+    tx_key: &TxKey,
+    memo: &str,
+) -> Result<Envelope, String> {
+    use randprotocol_core::notes::EnvelopeFormat;
+    let to = to_research(to)?;
+    match format {
+        EnvelopeFormat::Legacy if !memo.is_empty() => Err("this chain carries no memo".into()),
+        EnvelopeFormat::Legacy => Ok(envelope_to_core(&viewing::Envelope::seal(sender, &to, note, tx_key))),
+        EnvelopeFormat::Memo => {
+            let field = viewing::memo_field(memo)
+                .ok_or_else(|| format!("memo is {} bytes, at most {}", memo.len(), viewing::MEMO_TEXT_MAX_BYTES))?;
+            Ok(envelope_to_core(&viewing::Envelope::seal_with_memo(sender, &to, note, tx_key, &field)))
+        }
+    }
+}
+
+/// The memo sealed in `e`'s body, opened with that output's transaction key.
+pub fn open_memo(e: &Envelope, cm: Word8, key: &TxKey) -> Option<String> {
+    envelope_from_core(e).memo(cm, key)
+}
+
 /// The public preimage of a hidden-asset bundle digest, in spec §3.4 field order, packaged as the
 /// record `randprotocol-core` passes around.
 #[allow(clippy::too_many_arguments)]
@@ -79,6 +106,11 @@ pub fn digest_input_of(
 mod tests {
     use super::*;
     use crate::notes::SpendKey;
+
+    #[test]
+    fn memo_field_bytes_agree_between_core_and_the_vendored_viewing_module() {
+        assert_eq!(randprotocol_core::notes::MEMO_FIELD_BYTES, viewing::MEMO_FIELD_BYTES);
+    }
 
     #[test]
     fn address_and_envelope_roundtrip_through_the_core_types() {
