@@ -677,7 +677,9 @@ async fn handle_swarm_event(
                 Ok(msg) => {
                     // `from` falls back to `propagation_source` for a message that carries no
                     // source, which is the only case where the two coincide by construction. The
-                    // rate limit still keys on `propagation_source`.
+                    // rate limit still keys on `propagation_source`. Under `Permissive` an unsigned
+                    // message's `source` is only claimed, never proven: the node reads a `Status`
+                    // only when the two agree (SYNC-1, `node::on_status_gossip`).
                     let from = message.source.unwrap_or(propagation_source);
                     let id = GossipId { message_id, propagation_source };
                     let _ = evt_tx.send(NetworkEvent::Gossip { from, msg, id }).await;
@@ -870,6 +872,75 @@ mod tests {
         let kept: Vec<&str> =
             advertised.iter().copied().filter(|a| is_dialable_advertised_addr(&addr(a), false)).collect();
         assert_eq!(kept, vec!["/ip4/107.170.49.234/tcp/30303"]);
+    }
+
+    /// The premise `node::on_status_gossip`'s author rule rests on (SYNC-1, network scan
+    /// 2026-09-26): under `ValidationMode::Permissive` an unsigned message carrying any `source`
+    /// is delivered, and `NetworkEvent::Gossip.from` is that claimed author — only
+    /// `GossipId.propagation_source` is the peer the bytes actually came from. If this ever stops
+    /// holding (a switch to `Strict`, which needs a fleet canary), the node-side rule is merely
+    /// redundant, never wrong.
+    #[tokio::test]
+    async fn a_forged_unsigned_status_reaches_the_node_under_the_claimed_author() {
+        use libp2p::futures::StreamExt;
+        let cfg_a = NetworkConfig {
+            chain_id: 7,
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            bootstrap: vec![],
+            enable_mdns: false,
+            limits: WireLimits::default(),
+        };
+        let (a, mut a_rx) = start(cfg_a, [3u8; 32]).await.unwrap();
+        let a_addr = wait_for(&mut a_rx, Duration::from_secs(5), |e| match e {
+            NetworkEvent::Listening(addr) => Some(addr),
+            _ => None,
+        })
+        .await
+        .unwrap();
+        // The identity being impersonated: some honest validator's peer id.
+        let victim_id = PeerId::from(identity::Keypair::ed25519_from_bytes([9u8; 32]).unwrap().public());
+        let attacker_kp = identity::Keypair::generate_ed25519();
+        let gcfg = gossipsub::ConfigBuilder::default()
+            .validation_mode(ValidationMode::Permissive)
+            .heartbeat_interval(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let gs: gossipsub::Behaviour = gossipsub::Behaviour::new(MessageAuthenticity::Author(victim_id), gcfg).unwrap();
+        let mut sw = libp2p::SwarmBuilder::with_existing_identity(attacker_kp)
+            .with_tokio()
+            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+            .unwrap()
+            .with_behaviour(|_| gs)
+            .unwrap()
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        let topic = IdentTopic::new("rand/7/status");
+        sw.behaviour_mut().subscribe(&topic).unwrap();
+        sw.dial(a_addr.with(libp2p::multiaddr::Protocol::P2p(a.local_peer_id))).unwrap();
+        let forged = Status { height: 5, head_hash: Hash::ZERO, view: 5, floor: u64::MAX };
+        let data = bincode::serialize(&GossipMessage::Status(forged)).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut got = None;
+        while got.is_none() && tokio::time::Instant::now() < deadline {
+            let _ = sw.behaviour_mut().publish(topic.clone(), data.clone());
+            let until = tokio::time::Instant::now() + Duration::from_millis(300);
+            loop {
+                tokio::select! {
+                    _ = sw.select_next_some() => {}
+                    ev = a_rx.recv() => {
+                        if let Some(NetworkEvent::Gossip { from, msg: GossipMessage::Status(s), id }) = ev {
+                            got = Some((from, s, id.propagation_source));
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep_until(until) => break,
+                }
+            }
+        }
+        let (from, s, prop) = got.expect("the forged status was delivered");
+        assert_eq!(from, victim_id, "attributed to the impersonated peer, not the sender");
+        assert_ne!(prop, victim_id);
+        assert_eq!(s.floor, u64::MAX);
     }
 
     async fn wait_for<T>(

@@ -497,6 +497,17 @@ fn record_status(peers: &mut HashMap<PeerId, Peer>, from: PeerId, s: Status) {
 /// (`GossipId.propagation_source`, the only one with a connection to spend from — the author may be
 /// hops away), then recorded against the author through [`record_status`]. `Ignore`, never
 /// `Reject`, over the limit: the message is not wrong, this node is merely not reading it now.
+///
+/// Read only from its own author (SYNC-1, network scan 2026-09-26): gossipsub runs `Permissive`,
+/// so an unsigned message's `source` is whatever its sender wrote, and a `Status` relayed "from"
+/// an honest validator with a floor past every height hid that validator from `pick_sync_peer`.
+/// `from == forwarder` is the one attribution a connection proves; anything else is `Ignore`d —
+/// neither recorded nor forwarded, and not the forwarder's fault, since an honest relay looks the
+/// same. Nothing sync needs is lost: only connected peers are asked for blocks, and a publisher
+/// floods its own status to every peer it is connected to (gossipsub's `flood_publish`). A peer's
+/// own status whose floor is above its own height describes a node holding no head at all:
+/// `Reject` — checked after the author, so a relay (an older build forwards without looking) is
+/// never blamed for it.
 fn on_status_gossip(
     peers: &mut HashMap<PeerId, Peer>,
     limiter: &admission::PeerLimiter,
@@ -513,6 +524,12 @@ fn on_status_gossip(
     };
     if !limiter.allow(&mut f.status_bucket, now) {
         return GossipOutcome::Report(admission::Acceptance::Ignore);
+    }
+    if from != forwarder {
+        return GossipOutcome::Report(admission::Acceptance::Ignore);
+    }
+    if s.floor > s.height {
+        return GossipOutcome::Report(admission::Acceptance::Reject);
     }
     record_status(peers, from, s);
     GossipOutcome::for_consensus()
@@ -2768,13 +2785,51 @@ mod tests {
             assert_eq!(on_status_gossip(&mut peers, &limiter, f1, f1, status(20 + i), later), GossipOutcome::for_consensus(), "refilled {i}");
         }
         assert_eq!(on_status_gossip(&mut peers, &limiter, f1, f1, status(30), later), GossipOutcome::Report(Acceptance::Ignore));
-        // The other forwarder's bucket is its own — relaying f1's status spends f2's allowance,
-        // and records against the author.
-        assert_eq!(on_status_gossip(&mut peers, &limiter, f1, f2, status(40), later), GossipOutcome::for_consensus());
-        assert_eq!(peers[&f1].status.as_ref().map(|s| s.height), Some(40));
+        // The other forwarder's bucket is its own: f2's own status lands while f1 is over. A
+        // relay of f1's status spends f2's allowance but is not read (SYNC-1: a status is read
+        // only from its author).
+        assert_eq!(on_status_gossip(&mut peers, &limiter, f2, f2, status(40), later), GossipOutcome::for_consensus());
+        assert_eq!(peers[&f2].status.as_ref().map(|s| s.height), Some(40));
+        assert_eq!(on_status_gossip(&mut peers, &limiter, f1, f2, status(41), later), GossipOutcome::Report(Acceptance::Ignore));
+        assert_eq!(peers[&f1].status.as_ref().map(|s| s.height), Some(23));
         // A forwarder this node holds no entry for cannot be metered, and is ignored.
         assert_eq!(on_status_gossip(&mut peers, &limiter, f1, pid(3), status(50), later), GossipOutcome::Report(Acceptance::Ignore));
         assert_eq!(peers.len(), 2);
+    }
+
+    /// SYNC-1 (fullnode network scan 2026-09-26, high): gossipsub runs `Permissive`, so an
+    /// unsigned message's author is whatever its sender wrote (`network`'s
+    /// `a_forged_unsigned_status_reaches_the_node_under_the_claimed_author` pins that). One
+    /// connected peer forwarding a `Status` "authored" by every honest peer, each with a floor
+    /// past any height, used to hide all seventeen from `pick_sync_peer`. A status is now read
+    /// only from its own author (`from == propagation_source`, the one identity a connection
+    /// proves) — anything relayed is `Ignore`d and not forwarded — and a floor above its own
+    /// height, which no node can hold, is `Reject`ed.
+    #[test]
+    fn a_forged_status_via_one_forwarder_hides_no_honest_peer_from_sync() {
+        use crate::admission::{Acceptance, PeerLimiter};
+        let pid = |seed: u8| PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public());
+        let honest = |h: u64| Peer { status: Some(Status { height: h, head_hash: Hash::ZERO, view: h, floor: 0 }), connected: true, ..Default::default() };
+        let forged = Status { height: 500, head_hash: Hash::ZERO, view: 500, floor: u64::MAX };
+        let attacker = pid(99);
+        let mut peers: HashMap<PeerId, Peer> = (1..=17).map(|i| (pid(i), honest(500))).collect();
+        peers.insert(attacker, Peer { connected: true, ..Default::default() });
+        let limiter = PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC);
+        let now = Instant::now();
+        for i in 1..=17u8 {
+            let out = on_status_gossip(&mut peers, &limiter, pid(i), attacker, forged.clone(), now + Duration::from_secs(i as u64));
+            assert_eq!(out, GossipOutcome::Report(Acceptance::Ignore), "a status relayed under peer {i}'s name is neither read nor forwarded");
+        }
+        let pick = pick_sync_peer(&peers, 43, 500, &[]);
+        assert!(pick.is_some() && pick != Some(attacker), "an honest peer still serves 44: {pick:?}");
+        // The attacker's own status with an impossible floor is malformed, not merely unread.
+        let out = on_status_gossip(&mut peers, &limiter, attacker, attacker, forged, now + Duration::from_secs(60));
+        assert_eq!(out, GossipOutcome::Report(Acceptance::Reject));
+        assert!(peers[&attacker].status.is_none(), "a malformed status is not recorded");
+        // An honest peer's own status still lands.
+        let own = Status { height: 501, head_hash: Hash::ZERO, view: 501, floor: 400 };
+        assert_eq!(on_status_gossip(&mut peers, &limiter, pid(1), pid(1), own, now + Duration::from_secs(61)), GossipOutcome::for_consensus());
+        assert_eq!(peers[&pid(1)].status.as_ref().map(|s| s.height), Some(501));
     }
 
     #[test]
