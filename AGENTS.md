@@ -6,6 +6,40 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-26)
 
+### Chain 15 — LIVE 2026-09-26 13:05 UTC (genesis `cc30e085…`, build `dd2ccbe` = v0.5.8 + the chain-15 genesis work)
+
+Cut on the user's go after the registry-v8 remediation (CS6-1 guest provenance, ZKV-2 Poseidon2
+constants as a table, STAKE-2 gated gaps, D1 in the papers). Genesis
+`cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8`, chain id **15**, file
+`deploy/genesis-chain15.json` (sha256 `bde329aa…3409`), cut by `deploy/cut-chain15-genesis.sh`,
+rolled all-stop/all-start by `deploy/cutover-fleet-chain15.sh` (stage → stop 13:04:20 → switch →
+start 13:05:24; C, D first). Chain 14 stopped at ~380 620; its data dirs and binaries
+(`/root/rand-node.c14`, unit backup `/root/rand-node.service.1cff3b7d.bak`) are kept on every host
+for rollback — retire them with `deploy/retire-chain-dirs.sh` once chain 15 has run a day.
+
+- **Same validator keys** as chain 14 (`~/.rand-chain14`), so peer ids and `deploy/nodes.env` are
+  unchanged; `consensus_domain: 1` binds every signature to this genesis.
+- **Faucet allowlisted** (`staking.faucet_recipients`, 16 wallets: Anish, demo-v05, tester,
+  zusd-deployer, relayer, randscan activity w1, and ten new demo wallets whose keys live in
+  `~/.rand-chain15/wallets/`); a mint to anyone else is refused. Faucet budget 10 000 RAND per
+  1000-block epoch; weight cap 3333 bps; entry budget 10 000 RAND/epoch; 2-epoch bond delay;
+  v2 registrations (`rand-node register --v2`). Testnet — mainnet is v1.0; validators prune 24 h,
+  obs1 and node A keep everything.
+- **Bridge**: guardian set 1 at index 1 (next rotation must carry 2), eight successor Dilithium2
+  keys (droplet-held seeds for positions 0–5), chain 14's pause key, `burn_sequence` 7,
+  `rules_v2` (global cap 4 000 zUSD / 24 h). Replay of a chain-14 mint is refused: the PQ
+  co-signature binds chain id 15.
+- **zUSD carried over at genesis**: before the cut the tester wallet burned 26 zUSD (seq 4 ETH 9,
+  5 BSC 9, 6 SOL 8; released by the relayer, audited custody == locked). The 10 zUSD left — all
+  Anish's — are listed at genesis: same asset id `32e5ab28…`, backings locked Tron USDT 9 /
+  Solana USDT 1, one genesis note to his address. `total_supply == Σ locked == custody` at block 0.
+- Relayer funded by 3 × 100 RAND faucet mints (blocks 32/36/40). The bridge session owns the
+  relayer, guardians and the six guardian observer droplets.
+- **Trap from the cut:** `rand-node alloc-note --amount` scaled zUSD by RAND's 10^9 (100 zUSD for
+  "10"); fixed in `d6f6425`, caught by the cut script's Σ notes == Σ locked check. Also:
+  `git merge --ff-only X && … ; git push` pushes the unchanged local ref when the merge fails —
+  never chain a push after a merge with `;`.
+
 ### v0.5.8 — the pre-release scan fixes (2026-09-26)
 
 A ten-reviewer scan of `d56a97a` (v0.5.7 + AGG-2) plus `cargo audit`, every candidate re-traced and
