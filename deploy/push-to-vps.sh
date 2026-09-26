@@ -5,8 +5,11 @@ IP=$1; NODE=$2; BOOT=${3:-}; ROLE=${4:-validator}
 cd "$(dirname "$0")/.."
 KEY=${SSH_KEY:-~/.ssh/id_ed25519}
 SSH="ssh -i $KEY -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 root@$IP"
+# Only the commit's tracked files go to the host (OPS-1): see deploy/lib/clean-tree.sh.
+. deploy/lib/clean-tree.sh
+stage_clean_tree
 rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" \
-    --exclude target --exclude 'data-*' --exclude testnet --exclude .git ./ root@$IP:/root/fullnode/
+    --exclude target --exclude 'data-*' --exclude testnet --exclude .git "$STAGE/" root@$IP:/root/fullnode/
 # The zkVM manifest has an optional path dependency on ../../../circuits/rand-zkvm-cuda; cargo needs the
 # manifest to exist even for default builds, so ship that crate's sources alongside (no GPU code is built).
 CUDA=$(cd "$(dirname "$0")/../../circuits/rand-zkvm-cuda" 2>/dev/null && pwd || true)

@@ -177,7 +177,10 @@ rule and the public RPC admits anyone's submissions, so a mixed fleet is a fork 
 independent review's one finding, `docs/deploy.md` "Roll note for v0.5.6". Rollback = re-pin
 `0154fe2`. **Open for the operator:**
 guardian keys in the shell profile (BRG-14), the 48 GB resize vs D19, the TronGrid key, node A
-on a laptop, all 18 validator keys one party's. The whitepaper's fifth reconciliation pass
+on a laptop, all 18 validator keys one party's; remove any `wallets/` (spend keys) and log copies
+earlier `rebuild-vps.sh`/`push-to-vps.sh` runs synced into E's `/root/fullnode` (OPS-1: they rsynced
+the working tree; they now ship `git archive HEAD` only, and the next run's `--delete` drops them —
+check backups and other hosts too). The whitepaper's fifth reconciliation pass
 (`rem:bridgeimpl`, the table, a taint proposition) lands in `../whitepapers`.
 
 ### v0.5.5 — the audit-v5 fixes and the chain-14 recovery (2026-09-24)
