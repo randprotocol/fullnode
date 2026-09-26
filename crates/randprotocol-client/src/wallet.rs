@@ -424,6 +424,15 @@ impl NoteStore {
         Bound::Reset { previous }
     }
 
+    /// Forget everything scanning has learned — notes, spent marks, pending holds, sent rows,
+    /// the tree and every cursor — and keep only the chain binding, so the next [`scan`] rebuilds
+    /// the store from leaf 0 (`rand sync --rescan`, audit WAL-3). A scan only ever marks a note
+    /// spent, from the nullifiers the node reports; a node that reported one of this wallet's own
+    /// wrongly leaves that note stranded until the store is started over, and this is how.
+    pub fn reset(&mut self) {
+        *self = NoteStore { genesis: self.genesis, ..NoteStore::default() };
+    }
+
     pub fn load(path: &Path) -> NoteStore {
         let Ok(text) = std::fs::read_to_string(path) else { return NoteStore::default() };
         match serde_json::from_str(&text) {
@@ -1095,7 +1104,7 @@ pub enum SelectError {
     /// amount of dust adds up to a third slot.
     #[error("need more than two notes; the largest two hold {largest_two} units — consolidate first")]
     NeedsMoreThanTwo { largest_two: u64 },
-    #[error("insufficient balance: {have} units")]
+    #[error("insufficient balance: {have} units (if notes this wallet holds show as spent, `rand sync --rescan` rebuilds the store from the chain)")]
     Insufficient { have: u64 },
 }
 
@@ -1634,7 +1643,7 @@ async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan
         }
         if attempt == 1 {
             return Err(anyhow!(
-                "the wallet's tree matches none of the node's anchors, even after a rescan; the store's tree and the node's leaves disagree"
+                "the wallet's tree matches none of the node's anchors, even after a rescan; the store's tree and the node's leaves disagree — `rand sync --rescan` rebuilds the store from leaf 0"
             ));
         }
         // No recorded block-end root matches the local root: the picture is stale. Rescan once
@@ -4229,6 +4238,33 @@ mod tests {
         let mut unbound = NoteStore { scanned_index: 60_000, ..NoteStore::default() };
         assert_eq!(unbound.bind(this), Bound::Reset { previous: None });
         assert_eq!((unbound.genesis, unbound.scanned_index), (Some(this), 0));
+    }
+
+    /// WAL-3: a node can report this wallet's own nullifiers as published, and the scan marks
+    /// those notes spent for good — nothing ever un-spends one. `rand sync --rescan` is the way
+    /// back short of deleting the file: `reset` empties everything learned (spent marks, pending
+    /// holds, cursors, the tree, sent rows) and keeps only the chain the store is bound to, so
+    /// the next scan rebuilds the whole picture from leaf 0 (ideally against another node).
+    #[test]
+    fn a_reset_store_forgets_its_spent_marks_and_cursors_but_keeps_its_chain() {
+        let this = Hash([1; 32]);
+        let mut pending = owned(1, 7, false);
+        pending.pending = Some(40);
+        let mut store = NoteStore {
+            genesis: Some(this),
+            scanned_index: 60_000,
+            scanned_height: 240_000,
+            scanned_attest_height: 240_000,
+            notes: vec![owned(0, 5, true), pending],
+            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2 }],
+            ..NoteStore::default()
+        };
+        store.reset();
+        assert_eq!(store.genesis, Some(this), "the chain binding survives");
+        assert_eq!((store.scanned_index, store.scanned_height, store.scanned_attest_height), (0, 0, 0));
+        assert!(store.notes.is_empty() && store.sent.is_empty(), "every spent mark and hold is gone");
+        assert_eq!(store.tree.next_index(), 0, "the tree is rebuilt from leaf 0 too");
+        assert_eq!(store.bind(this), Bound::Same, "and the next scan does not treat it as a foreign store");
     }
 
     /// The reproduction from 2026-09-23: a store whose leaf cursor sat past every leaf of the

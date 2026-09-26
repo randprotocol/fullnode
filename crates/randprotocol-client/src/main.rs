@@ -68,7 +68,14 @@ enum Cmd {
         index: Option<u32>,
     },
     /// Scan the chain for notes and spends without printing a balance.
-    Sync,
+    Sync {
+        /// Start the note store over first — every note, spent mark, pending hold and cursor
+        /// forgotten, the chain binding kept — and rescan from leaf 0. The way back when a node
+        /// reported this wallet's notes as spent wrongly (a scan never un-spends a note);
+        /// best run against a node you trust.
+        #[arg(long)]
+        rescan: bool,
+    },
     /// List every note this wallet has ever been able to open.
     Notes,
     /// List every note this wallet created for someone else.
@@ -803,8 +810,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Sync => {
+        Cmd::Sync { rescan } => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
+            if rescan {
+                store.reset();
+                eprintln!("rescanning from leaf 0: every note and spent mark is rebuilt from the chain");
+            }
             wallet::scan(&rpc, &w, &mut store).await?;
             store.save(&path)?;
             println!("scanned {} leaves and {} blocks; {} notes, {} unspent", store.scanned_index, store.scanned_height, store.notes.len(), store.spendable().len());
@@ -1703,6 +1714,15 @@ mod tests {
         assert_eq!((asset, chain, decimals), (1, 3, 18));
         assert!(matches!(parse(&["bridge-pause", "--sig", "@pause.sig"]), Ok(Cmd::BridgePause { .. })));
         assert!(matches!(parse(&["bridge-unpause", "--pq", "@unpause.json", "--no-wait"]), Ok(Cmd::BridgeUnpause { no_wait: true, .. })));
+    }
+
+    /// `rand sync` scans from where the store left off; `--rescan` starts the store over first
+    /// (WAL-3).
+    #[test]
+    fn sync_takes_rescan() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("rand").chain(args.iter().copied())).map(|c| c.cmd);
+        assert!(matches!(parse(&["sync"]), Ok(Cmd::Sync { rescan: false })));
+        assert!(matches!(parse(&["sync", "--rescan"]), Ok(Cmd::Sync { rescan: true })));
     }
 
     /// The five `rand token` commands (T8b): `create` (both authority branches), `mint`,
