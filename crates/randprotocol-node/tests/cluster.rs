@@ -2424,3 +2424,65 @@ async fn a_batch_whose_evidence_blocks_are_junk_commits_nothing() {
     liar.shutdown().await;
     victim.handle.shutdown().await;
 }
+
+/// Chain 15's genesis shape, live: every gated rule chain 15 switches on at once — consensus
+/// domain 1 (the genesis hash in every vote, new-view and proposal), the `staking` section with a
+/// weight cap, an entry budget, v2 registrations and a faucet allowlist beside a bridge, the bridge
+/// starting at guardian set 1 and burn sequence 7 with `rules_v2`, and the token switches. Four
+/// validators must commit, a mint to the listed wallet must land, one to anyone else must be
+/// refused, and a late observer must sync the whole chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_15_shaped_genesis_commits_mints_only_to_the_allowlist_and_syncs_an_observer() {
+    use randprotocol_core::bridge::BridgeRulesV2;
+    use randprotocol_core::ledger::staking::{FaucetRecipient, StakingConfig};
+    init_tracing();
+    let ks = keys(5);
+    let mut bridge = bridge_config();
+    bridge.rules_v2 = Some(BridgeRulesV2 { global_mint_cap_per_window: 400_000_000_000, cap_window_secs: 86_400 });
+    bridge.guardian_set_index = Some(1);
+    bridge.burn_sequence = Some(7);
+    let mut gen = genesis_bridge(&ks[..4], &[], Some(bridge));
+    gen.consensus_domain = Some(1);
+    let t = gen.tokens.as_mut().unwrap();
+    t.max_tokens = Some(4096);
+    t.burn_registration_fee = Some(true);
+    t.bound_note_value = Some(true);
+    gen.staking = Some(StakingConfig {
+        faucet_budget_per_epoch: 10_000 * UNITS_PER_RAND,
+        bond_activation_epochs: 2,
+        max_weight_bps: Some(3333),
+        max_stake_entry_per_epoch: Some(10_000 * UNITS_PER_RAND),
+        registration_v2: Some(true),
+        faucet_recipients: Some(vec![FaucetRecipient(wallet(1).address.pk)]),
+    });
+
+    let n0 = start_node(&ks[0], &gen, vec![], true).await;
+    let boot = vec![bootstrap_addr(&n0)];
+    let n1 = start_node(&ks[1], &gen, boot.clone(), true).await;
+    let n2 = start_node(&ks[2], &gen, boot.clone(), true).await;
+    let n3 = start_node(&ks[3], &gen, boot.clone(), true).await;
+    wait_height(&[&n0, &n1, &n2, &n3], 6, Duration::from_secs(60)).await;
+
+    let (hash, cm) = n2.mint(1, 5 * UNITS_PER_RAND).await;
+    wait_for("allowlisted mint committed on n0", Duration::from_secs(30), || {
+        n0.handle.storage.tx_location(&hash).unwrap().is_some()
+    })
+    .await;
+    let err = n2.rpc.mint_shielded(&payee(2), Some(UNITS_PER_RAND)).await.unwrap_err().to_string();
+    assert!(err.contains("faucet_recipients") || err.contains("not in"), "an unlisted mint was not refused: {err}");
+
+    let obs = start_node(&ks[4], &gen, boot.clone(), false).await;
+    let target = n0.height();
+    wait_height(&[&obs], target, Duration::from_secs(60)).await;
+    assert!(obs.holds(&cm), "the observer replayed the chain without the allowlisted mint");
+    for h in 0..=target {
+        assert_eq!(
+            obs.handle.storage.block_by_height(h).unwrap().unwrap().hash(),
+            n0.handle.storage.block_by_height(h).unwrap().unwrap().hash(),
+            "height {h}"
+        );
+    }
+    let s = n0.rpc.call("rand_getBridgeState", json!([])).await.unwrap();
+    assert_eq!(s["guardian_set_index"].as_u64(), Some(1), "{s}");
+    assert_eq!(s["burn_sequence"].as_u64(), Some(7), "{s}");
+}
