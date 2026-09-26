@@ -81,6 +81,10 @@ pub enum TxError {
     ActionCarriesBundle(&'static str),
     #[error("envelope exceeds {MAX_ENVELOPE_BYTES} bytes")]
     EnvelopeTooLarge,
+    /// Spec 2026-09-26 §2.4: on a chain whose genesis sets `envelope_bytes`, a note envelope of
+    /// any other length. Every envelope is the same size so none tells a memo from its absence.
+    #[error("envelope is {got} bytes, this chain requires exactly {expected}")]
+    EnvelopeSize { expected: usize, got: usize },
     #[error("proof too large")]
     ProofTooLarge,
     #[error("attestation exceeds {} bytes", gas::MAX_ATTESTATION_BYTES)]
@@ -465,6 +469,10 @@ pub struct Ledger {
     max_block_bytes: usize,
     max_call_envelope_bytes: usize,
     max_program_public_words: usize,
+    /// Spec 2026-09-26 §2.4: genesis `envelope_bytes` — every note envelope exactly this long;
+    /// `None` keeps today's at-most-`MAX_ENVELOPE_BYTES` rule. A genesis parameter like the call
+    /// limits: outside the state root and `Ledger`'s equality, restored by `reload_ledger`.
+    envelope_bytes: Option<usize>,
     /// The aggregator register, hashed into the state root (spec §2.1) when `aggregation` is
     /// set; empty otherwise and at chain-9 block 0.
     aggregators: BTreeMap<Address, aggregation::AggregatorEntry>,
@@ -570,6 +578,7 @@ impl Ledger {
             max_block_bytes: gas::MAX_BLOCK_BYTES,
             max_call_envelope_bytes: crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
+            envelope_bytes: None,
             aggregators: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
@@ -620,6 +629,7 @@ impl Ledger {
             max_block_bytes: gas::MAX_BLOCK_BYTES,
             max_call_envelope_bytes: crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
+            envelope_bytes: None,
             aggregators: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
@@ -981,6 +991,27 @@ impl Ledger {
         self.max_program_public_words = words;
     }
 
+    /// The exact note-envelope size genesis set (`envelope_bytes`, spec 2026-09-26 §2.4), or
+    /// `None` on a chain that keeps today's at-most rule.
+    pub fn envelope_bytes(&self) -> Option<usize> {
+        self.envelope_bytes
+    }
+
+    /// Set by genesis from `envelope_bytes`, and by `reload_ledger` on every restart.
+    pub fn set_envelope_bytes(&mut self, bytes: Option<usize>) {
+        self.envelope_bytes = bytes;
+    }
+
+    /// The note-envelope rule: exactly `envelope_bytes` when the genesis sets it, else at most
+    /// `MAX_ENVELOPE_BYTES` (today's rule, byte for byte).
+    fn check_note_envelope(&self, e: &Envelope) -> Result<(), TxError> {
+        match self.envelope_bytes {
+            Some(want) if e.len() != want => Err(TxError::EnvelopeSize { expected: want, got: e.len() }),
+            None if e.len() > MAX_ENVELOPE_BYTES => Err(TxError::EnvelopeTooLarge),
+            _ => Ok(()),
+        }
+    }
+
     /// The aggregator register (spec §2.1): every row that has ever registered, keyed by
     /// address. Empty on a chain without the section and at chain-9 block 0.
     pub fn aggregators(&self) -> &BTreeMap<Address, aggregation::AggregatorEntry> {
@@ -1282,8 +1313,8 @@ impl Ledger {
             return Err(TxError::TransactionTooLarge { size: encoded_len, max: self.max_block_bytes });
         }
         if let Some(b) = &tx.bundle {
-            if b.envelopes.iter().any(|e| e.len() > MAX_ENVELOPE_BYTES) {
-                return Err(TxError::EnvelopeTooLarge);
+            for e in &b.envelopes {
+                self.check_note_envelope(e)?;
             }
             if b.proof.len() > self.max_proof_bytes {
                 return Err(TxError::ProofTooLarge);
@@ -1299,10 +1330,22 @@ impl Ledger {
                 return Err(TxError::PrunedFormOutsideSync);
             }
         }
+        // Every note envelope an action carries outside the bundle, under the one rule
+        // (`check_note_envelope`), ahead of the action's other caps as it always was: each of
+        // these arms used to be the first envelope guard its action met. RPL: the envelope
+        // sealed against a minted note is a note envelope like any other. The rest of a token
+        // action's variable-length fields — name, symbol, salt — are bounded by
+        // `check_metadata` at step 7, which costs two length compares.
         match &tx.action {
-            Action::Mint { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
-                return Err(TxError::EnvelopeTooLarge)
-            }
+            Action::Mint { envelope, .. }
+            | Action::Withdraw { envelope, .. }
+            | Action::BridgeAttest { envelope, .. }
+            | Action::Aggregate { envelope, .. }
+            | Action::TokenMint { envelope, .. } => self.check_note_envelope(envelope)?,
+            Action::RegisterToken { initial: Some(m), .. } => self.check_note_envelope(&m.envelope)?,
+            _ => {}
+        }
+        match &tx.action {
             Action::Deploy { words, .. } if words.len() > self.max_program_words => {
                 return Err(TxError::ProgramTooLarge)
             }
@@ -1310,33 +1353,14 @@ impl Ledger {
                 return Err(TxError::ProgramPublicTooLarge)
             }
             Action::Call { proof, .. } if proof.len() > self.max_proof_bytes => return Err(TxError::ProofTooLarge),
-            Action::Withdraw { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
-                return Err(TxError::EnvelopeTooLarge)
-            }
-            Action::BridgeAttest { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
-                return Err(TxError::EnvelopeTooLarge)
-            }
             Action::BridgeAttest { attestation, .. } if attestation.len() > gas::MAX_ATTESTATION_BYTES => {
                 return Err(TxError::AttestationTooLarge)
             }
             // The `Aggregate` action's caps (spec §3.1): the per-field ones every action gets,
             // then the composite wire cap over the transaction's encoding.
-            Action::Aggregate { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
-                return Err(TxError::EnvelopeTooLarge)
-            }
             Action::Aggregate { proof, .. } if proof.len() > self.max_proof_bytes => return Err(TxError::ProofTooLarge),
             Action::Aggregate { .. } if encoded_len > self.max_aggregate_bytes() => {
                 return Err(TxError::AggregateTooLarge { size: encoded_len, max: self.max_aggregate_bytes() })
-            }
-            // RPL: the envelope sealed against a minted note is a note envelope like any other,
-            // and gets the cap every note envelope gets. The rest of a token action's
-            // variable-length fields — name, symbol, salt — are bounded by `check_metadata` at
-            // step 7, which costs two length compares.
-            Action::TokenMint { envelope, .. } if envelope.len() > MAX_ENVELOPE_BYTES => {
-                return Err(TxError::EnvelopeTooLarge)
-            }
-            Action::RegisterToken { initial: Some(m), .. } if m.envelope.len() > MAX_ENVELOPE_BYTES => {
-                return Err(TxError::EnvelopeTooLarge)
             }
             _ => {}
         }
@@ -2806,6 +2830,120 @@ mod tests {
                 "slot {slot} one byte over"
             );
         }
+    }
+
+    /// Spec 2026-09-26 §2.4: under a genesis `envelope_bytes`, every bundle envelope — each of
+    /// the four slots — is exactly that long; one byte either side is refused at step 1.
+    #[test]
+    fn under_envelope_bytes_a_bundle_envelope_must_be_exactly_that_long() {
+        use crate::notes::MEMO_ENVELOPE_BYTES as W;
+        let mut l = ledger();
+        l.set_envelope_bytes(Some(W));
+        assert_eq!(l.envelope_bytes(), Some(W));
+        let fat = |body: usize| Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![3; body] };
+        let slot_tx = |l: &Ledger, n: u32, slot: usize, len: usize| {
+            let mut b = bundle(l, [[n; 8], [n + 10; 8]], [[n + 20; 8], [n + 30; 8]], gas::BUNDLE_BASE);
+            for e in b.envelopes.iter_mut() {
+                *e = fat(W);
+            }
+            b.envelopes[slot] = fat(len);
+            StubExecutor::bound(Transaction::shielded(7, b, Action::None))
+        };
+        for slot in 0..4usize {
+            let n = 300 + slot as u32;
+            for (len, ok) in [(W - 1, false), (W, true), (W + 1, false)] {
+                let r = l.validate(&slot_tx(&l, n, slot, len), &StubExecutor);
+                if ok {
+                    assert_eq!(r, Ok(()), "slot {slot} len {len}");
+                } else {
+                    assert_eq!(r, Err(TxError::EnvelopeSize { expected: W, got: len }), "slot {slot} len {len}");
+                }
+            }
+        }
+        // The dummy slots' short envelopes a bundle carried before the memo are refused too.
+        let mut b = bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE);
+        b.envelopes[0] = fat(W);
+        b.envelopes[1] = fat(W);
+        b.envelopes[2] = fat(W);
+        b.envelopes[3] = fat(1348);
+        let t = StubExecutor::bound(Transaction::shielded(7, b, Action::None));
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::EnvelopeSize { expected: W, got: 1348 }));
+    }
+
+    /// The same rule on every action that carries a note envelope outside the bundle: a mint,
+    /// a withdraw and a bridge attestation one byte short are refused by size, exactly-long
+    /// ones never are.
+    #[test]
+    fn under_envelope_bytes_every_note_envelope_outside_the_bundle_is_exact_too() {
+        use crate::notes::MEMO_ENVELOPE_BYTES as W;
+        let mut l = ledger();
+        l.set_envelope_bytes(Some(W));
+        let (a, _) = keys();
+        let fat = |body: usize| Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![3; body] };
+        let mint = |len: usize| Transaction::mint(7, [5; 8], 0, [6; 8], fat(len), 1, &a, &StubExecutor);
+        assert_eq!(l.validate(&mint(W - 1), &StubExecutor), Err(TxError::EnvelopeSize { expected: W, got: W - 1 }));
+        assert_eq!(l.validate(&mint(W + 1), &StubExecutor), Err(TxError::EnvelopeSize { expected: W, got: W + 1 }));
+        assert!(!matches!(l.validate(&mint(W), &StubExecutor), Err(TxError::EnvelopeSize { .. } | TxError::EnvelopeTooLarge)));
+        let sig = crate::crypto::Signature::empty();
+        let withdraw = |len: usize| {
+            let action = Action::Withdraw {
+                validator: Address([1; 32]),
+                amount: 5,
+                nonce: 0,
+                time: 0,
+                r: [7; 8],
+                envelope: fat(len),
+                signature: sig.clone(),
+            };
+            let b = bundle(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]], gas::fee_floor(&action));
+            let mut b = b;
+            for e in b.envelopes.iter_mut() {
+                *e = fat(W);
+            }
+            StubExecutor::bound(Transaction::shielded(7, b, action))
+        };
+        assert_eq!(l.validate(&withdraw(W - 1), &StubExecutor), Err(TxError::EnvelopeSize { expected: W, got: W - 1 }));
+        assert!(!matches!(l.validate(&withdraw(W), &StubExecutor), Err(TxError::EnvelopeSize { .. } | TxError::EnvelopeTooLarge)));
+        let attest = |len: usize| Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::BridgeAttest {
+                attestation: vec![1; 32],
+                recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                r: [7; 8],
+                time: l.height() as u32,
+                asset: 1,
+                envelope: fat(len),
+                pq_signatures: Vec::new(),
+            },
+        };
+        assert_eq!(l.validate(&attest(W - 1), &StubExecutor), Err(TxError::EnvelopeSize { expected: W, got: W - 1 }));
+        assert!(!matches!(l.validate(&attest(W), &StubExecutor), Err(TxError::EnvelopeSize { .. } | TxError::EnvelopeTooLarge)));
+    }
+
+    /// Chain 14 unchanged: without the genesis field a 1 348-byte (legacy) and a 1 860-byte
+    /// (memo) envelope both pass, and the at-most rule is still `MAX_ENVELOPE_BYTES`.
+    #[test]
+    fn without_envelope_bytes_the_at_most_rule_is_unchanged() {
+        let l = ledger();
+        assert_eq!(l.envelope_bytes(), None);
+        let (a, _) = keys();
+        let fat = |body: usize| Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![3; body] };
+        for (n, len) in [(400u32, 1348usize), (410, crate::notes::MEMO_ENVELOPE_BYTES), (420, MAX_ENVELOPE_BYTES)] {
+            let mut b = bundle(&l, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::BUNDLE_BASE);
+            for e in b.envelopes.iter_mut() {
+                *e = fat(len);
+            }
+            assert_eq!(l.validate(&StubExecutor::bound(Transaction::shielded(7, b, Action::None)), &StubExecutor), Ok(()), "{len}");
+            let m = Transaction::mint(7, [5; 8], 0, [6; 8], fat(len), 1, &a, &StubExecutor);
+            assert!(!matches!(l.validate(&m, &StubExecutor), Err(TxError::EnvelopeSize { .. } | TxError::EnvelopeTooLarge)), "{len}");
+        }
+        let mut b = bundle(&l, [[430; 8], [431; 8]], [[432; 8], [433; 8]], gas::BUNDLE_BASE);
+        b.envelopes[0] = fat(MAX_ENVELOPE_BYTES + 1);
+        assert_eq!(
+            l.validate(&StubExecutor::bound(Transaction::shielded(7, b, Action::None)), &StubExecutor),
+            Err(TxError::EnvelopeTooLarge)
+        );
     }
 
     /// The one rule of the call-input envelope the chain does enforce, through a real ledger.

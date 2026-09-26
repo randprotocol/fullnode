@@ -101,6 +101,7 @@ fn genesis_full(
         max_block_bytes: None,
         max_call_envelope_bytes: None,
         max_program_public_words,
+        envelope_bytes: None,
     }
 }
 

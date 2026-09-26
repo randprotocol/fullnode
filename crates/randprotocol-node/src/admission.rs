@@ -340,6 +340,8 @@ pub fn is_permanent(e: &TxError) -> bool {
             | TxError::ActionCarriesBundle(_)
             // Byte lengths, every one of them.
             | TxError::EnvelopeTooLarge
+            // Spec 2026-09-26 §2.4: an envelope's length against the genesis constant.
+            | TxError::EnvelopeSize { .. }
             | TxError::ProofTooLarge
             | TxError::AttestationTooLarge
             // fix-sync-stall's: the whole transaction is bigger than a block. A byte length is a
@@ -737,6 +739,8 @@ mod tests {
             TxError::FaucetRecipientNotAllowed,
             TxError::ProofTooLarge,
             TxError::EnvelopeTooLarge,
+            // Spec 2026-09-26 §2.4: an envelope's length against the genesis constant.
+            TxError::EnvelopeSize { expected: 1860, got: 1348 },
             TxError::TransactionTooLarge { size: 9_000_000, max: 4 << 20 },
             TxError::DuplicateNullifierInBundle,
             TxError::WrongChain { expected: 7, actual: 8 },

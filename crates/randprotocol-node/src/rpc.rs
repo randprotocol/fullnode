@@ -461,6 +461,9 @@ pub struct ChainLimits {
     pub max_block_bytes: usize,
     pub max_call_envelope_bytes: usize,
     pub max_program_public_words: usize,
+    /// Spec 2026-09-26 §2.4: the exact note-envelope size the genesis sets, `null` where it
+    /// keeps today's at-most rule.
+    pub envelope_bytes: Option<usize>,
 }
 
 impl ChainLimits {
@@ -471,6 +474,7 @@ impl ChainLimits {
             max_block_bytes: ledger.max_block_bytes(),
             max_call_envelope_bytes: ledger.max_call_envelope_bytes(),
             max_program_public_words: ledger.max_program_public_words(),
+            envelope_bytes: ledger.envelope_bytes(),
         }
     }
 
@@ -3177,6 +3181,7 @@ mod tests {
                 "max_block_bytes": 4_194_304,
                 "max_call_envelope_bytes": 18_432,
                 "max_program_public_words": 0,
+                "envelope_bytes": null,
             })
         );
         let gs = raised_genesis();
@@ -3189,6 +3194,22 @@ mod tests {
                 "max_block_bytes": 20 << 20,
                 "max_call_envelope_bytes": 64 << 10,
                 "max_program_public_words": 64,
+                "envelope_bytes": null,
+            })
+        );
+        // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
+        let mut gs = raised_genesis();
+        gs.ledger.set_envelope_bytes(Some(randprotocol_core::notes::MEMO_ENVELOPE_BYTES));
+        let (_d, st) = state_for(&gs);
+        assert_eq!(
+            ok(&st, "rand_getLimits", json!([])).await,
+            json!({
+                "max_program_words": 8192,
+                "max_proof_bytes": 8 << 20,
+                "max_block_bytes": 20 << 20,
+                "max_call_envelope_bytes": 64 << 10,
+                "max_program_public_words": 64,
+                "envelope_bytes": 1860,
             })
         );
     }

@@ -385,6 +385,11 @@ pub struct Genesis {
     /// [`gas::MAX_PROGRAM_PUBLIC_WORDS`], no public input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_program_public_words: Option<u32>,
+    /// Spec 2026-09-26 §2.4: every note envelope is exactly this many bytes (only `1860`, the
+    /// memo layout, is accepted). Absent means today's rule — at most `MAX_ENVELOPE_BYTES` — and
+    /// a genesis hash unchanged byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_bytes: Option<u32>,
 }
 
 fn default_true() -> bool {
@@ -490,6 +495,10 @@ pub enum GenesisError {
     BadMaxCallEnvelopeBytes(u32),
     #[error("bad max_program_public_words {0} (0..={limit})", limit = gas::MAX_PROGRAM_PUBLIC_WORDS_LIMIT)]
     BadMaxProgramPublicWords(u32),
+    #[error("bad envelope_bytes {0} (only {only} is supported)", only = crate::notes::MEMO_ENVELOPE_BYTES)]
+    BadEnvelopeBytes(u32),
+    #[error("alloc note {cm}'s envelope is {got} bytes, the genesis requires envelope_bytes")]
+    AllocEnvelopeSize { cm: String, got: usize },
     #[error("the genesis supply (alloc notes plus validator stakes) sums past u64::MAX")]
     SupplyOverflow,
 }
@@ -600,6 +609,11 @@ impl Genesis {
         if let Some(n) = self.max_program_public_words {
             if n as usize > gas::MAX_PROGRAM_PUBLIC_WORDS_LIMIT {
                 return Err(GenesisError::BadMaxProgramPublicWords(n));
+            }
+        }
+        if let Some(n) = self.envelope_bytes {
+            if n as usize != crate::notes::MEMO_ENVELOPE_BYTES {
+                return Err(GenesisError::BadEnvelopeBytes(n));
             }
         }
         // RPL tokens: the gate. A bridge without tokens cannot register a bridged token; tokens
@@ -782,6 +796,7 @@ impl Genesis {
             self.max_call_envelope_bytes.map_or(crate::types::actions::MAX_CALL_ENVELOPE_BYTES, |n| n as usize),
         );
         ledger.set_max_program_public_words(self.max_program_public_words.map_or(gas::MAX_PROGRAM_PUBLIC_WORDS, |n| n as usize));
+        ledger.set_envelope_bytes(self.envelope_bytes.map(|n| n as usize));
         // The genesis ledger is positioned at the genesis block, so it carries that block's
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
@@ -802,6 +817,13 @@ impl Genesis {
         for n in &self.alloc {
             let cm = word8_from_hex(&n.cm).ok_or_else(|| GenesisError::BadNote(n.cm.clone()))?;
             let envelope = n.envelope.to_envelope()?;
+            // Spec 2026-09-26 §2.4: under `envelope_bytes` an alloc note's envelope is held to the
+            // same exact length as every envelope a transaction carries.
+            if let Some(want) = self.envelope_bytes {
+                if envelope.len() != want as usize {
+                    return Err(GenesisError::AllocEnvelopeSize { cm: n.cm.clone(), got: envelope.len() });
+                }
+            }
             match &n.opening {
                 Some(o) => {
                     let pk = word8_from_hex(&o.pk).ok_or_else(|| GenesisError::BadNote(o.pk.clone()))?;
@@ -998,6 +1020,12 @@ impl Genesis {
                     commit.extend_from_slice(&m.0 .0);
                 }
             }
+        }
+        // The exact envelope size (spec 2026-09-26 §2.4), last and only when the file sets it,
+        // so every genesis cut before it — chain 14's included — hashes byte-for-byte as before.
+        if let Some(n) = self.envelope_bytes {
+            commit.extend_from_slice(b"envelope_bytes");
+            commit.extend_from_slice(&n.to_be_bytes());
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -1382,6 +1410,7 @@ mod tests {
             max_block_bytes: None,
             max_call_envelope_bytes: None,
             max_program_public_words: None,
+            envelope_bytes: None,
         }
     }
 
@@ -2661,6 +2690,82 @@ mod tests {
             _ => unreachable!(),
         }
         g
+    }
+
+    /// Spec 2026-09-26 §2.4: `envelope_bytes` is opt-in like the call limits — absent, the file
+    /// and the hash are today's and the ledger keeps today's at-most rule; present, only
+    /// `MEMO_ENVELOPE_BYTES` is accepted, it is bound into the hash, and the state root never
+    /// sees it.
+    #[test]
+    fn envelope_bytes_is_optional_bound_into_the_hash_and_only_1860() {
+        let plain = genesis(2);
+        let json = plain.to_json();
+        assert!(!json.contains("envelope_bytes"));
+        assert_eq!(build(&plain).ledger.envelope_bytes(), None);
+        let mut g = plain.clone();
+        g.alloc = memo_alloc();
+        let unset = build(&g);
+        g.envelope_bytes = Some(crate::notes::MEMO_ENVELOPE_BYTES as u32);
+        let s = build(&g);
+        assert_eq!(s.ledger.envelope_bytes(), Some(crate::notes::MEMO_ENVELOPE_BYTES));
+        assert_ne!(s.hash(), unset.hash(), "a new chain");
+        assert_eq!(s.ledger.state_root(), unset.ledger.state_root(), "not state");
+        assert_eq!(Genesis::from_json(&g.to_json()).unwrap(), g, "and it round-trips");
+        assert!(g.to_json().contains("\"envelope_bytes\": 1860"));
+        for bad in [0u32, 1348, 1859, 1861, 2048] {
+            let mut g = plain.clone();
+            g.envelope_bytes = Some(bad);
+            assert!(
+                matches!(g.build(&StubExecutor).err(), Some(GenesisError::BadEnvelopeBytes(n)) if n == bad),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Two alloc notes like [`genesis`]'s, their envelopes exactly `MEMO_ENVELOPE_BYTES` long.
+    fn memo_alloc() -> Vec<GenesisNote> {
+        let mut alloc = vec![note(7, 1_000_000), note(8, 2_000_000)];
+        for n in &mut alloc {
+            let mut e = n.envelope.to_envelope().unwrap();
+            e.body = vec![2; crate::notes::MEMO_ENVELOPE_BYTES - e.kem_ct.len()];
+            n.envelope = EnvelopeHex::from_envelope(&e);
+        }
+        alloc
+    }
+
+    #[test]
+    fn under_envelope_bytes_every_alloc_envelope_is_exactly_that_long() {
+        let mut g = genesis(2);
+        g.envelope_bytes = Some(crate::notes::MEMO_ENVELOPE_BYTES as u32);
+        // `genesis(2)`'s alloc envelopes are the fixture's 16-byte ones.
+        assert!(
+            matches!(
+                g.build(&StubExecutor).err(),
+                Some(GenesisError::AllocEnvelopeSize { ref cm, got: 16 }) if *cm == g.alloc[0].cm
+            ),
+            "{:?}",
+            g.build(&StubExecutor).err()
+        );
+        // An opened alloc note one byte short is refused by name too.
+        let mut opened = opened_alloc();
+        let mut e = opened[1].envelope.to_envelope().unwrap();
+        e.body = vec![0; crate::notes::MEMO_ENVELOPE_BYTES - 1 - e.kem_ct.len()];
+        opened[1].envelope = EnvelopeHex::from_envelope(&e);
+        let mut first = opened[0].envelope.to_envelope().unwrap();
+        first.body = vec![0; crate::notes::MEMO_ENVELOPE_BYTES - first.kem_ct.len()];
+        opened[0].envelope = EnvelopeHex::from_envelope(&first);
+        g.alloc = opened.clone();
+        assert!(
+            matches!(
+                g.build(&StubExecutor).err(),
+                Some(GenesisError::AllocEnvelopeSize { ref cm, got }) if *cm == opened[1].cm && got == crate::notes::MEMO_ENVELOPE_BYTES - 1
+            ),
+            "{:?}",
+            g.build(&StubExecutor).err()
+        );
+        // Exactly the length builds.
+        g.alloc = memo_alloc();
+        assert!(g.build(&StubExecutor).is_ok());
     }
 
     /// The four call-limits parameters are opt-in per chain, like `max_program_words`: absent,

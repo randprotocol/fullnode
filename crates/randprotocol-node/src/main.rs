@@ -650,6 +650,9 @@ async fn main() -> Result<()> {
                 max_block_bytes,
                 max_call_envelope_bytes,
                 max_program_public_words,
+                // The exact envelope size (spec 2026-09-26 §2.4) is set in the file by the cut
+                // script; this command writes today's shape, whose hash it leaves unchanged.
+                envelope_bytes: None,
                 // The audit-v4 `staking` section (STAKE-2) is spliced in by hand like the
                 // `bridge` section: a chain without it hashes byte-for-byte as before.
                 staking: None,
@@ -1400,6 +1403,7 @@ mod tests {
             max_block_bytes: None,
             max_call_envelope_bytes: None,
             max_program_public_words: None,
+            envelope_bytes: None,
             staking: None,
         }
     }

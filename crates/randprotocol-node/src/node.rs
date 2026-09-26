@@ -168,6 +168,10 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     ledger.set_max_block_bytes(gs.ledger.max_block_bytes());
     ledger.set_max_call_envelope_bytes(gs.ledger.max_call_envelope_bytes());
     ledger.set_max_program_public_words(gs.ledger.max_program_public_words());
+    // And the exact envelope size (spec 2026-09-26 §2.4): `load_ledger` comes back at `None`,
+    // today's at-most rule, and a node that forgot it would admit short envelopes its peers
+    // refuse — a fork at its first restart.
+    ledger.set_envelope_bytes(gs.ledger.envelope_bytes());
     // And the consensus signing domain (audit v4): `load_ledger` comes back at v0, and a node
     // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
     // signature check.
@@ -4235,6 +4239,20 @@ mod tests {
         assert_eq!(reloaded.max_call_envelope_bytes(), 65_536);
         assert_eq!(reloaded.max_program_public_words(), 32_768);
         assert_eq!(reloaded, gs.ledger);
+    }
+
+    /// Spec 2026-09-26 §2.4: the exact envelope size survives a restart too — `load_ledger`
+    /// comes back at `None`, and a node that kept it would admit envelopes its peers refuse.
+    #[test]
+    fn a_restart_restores_envelope_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_envelope_bytes(Some(randprotocol_core::notes::MEMO_ENVELOPE_BYTES));
+        storage.init_genesis(&gs).unwrap();
+        assert_eq!(storage.load_ledger(&StubExecutor).unwrap().envelope_bytes(), None);
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.envelope_bytes(), Some(randprotocol_core::notes::MEMO_ENVELOPE_BYTES));
     }
 
     /// The register and the bucket survive the same restart, hashed into and computed into the

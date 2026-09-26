@@ -107,6 +107,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         max_block_bytes: None,
         max_call_envelope_bytes: None,
         max_program_public_words: None,
+        envelope_bytes: None,
         bridge: bridged.then(|| crate::bridge::BridgeConfig {
             emitter: [1; 32],
             guardians: vec![[2; 20]],
@@ -1334,6 +1335,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         max_block_bytes: None,
         max_call_envelope_bytes: None,
         max_program_public_words: None,
+        envelope_bytes: None,
         bridge: None,
         tokens: None,
         aggregation: None,
@@ -1806,6 +1808,7 @@ fn aggregation_node_with(
         max_block_bytes: None,
         max_call_envelope_bytes: None,
         max_program_public_words: None,
+        envelope_bytes: None,
         bridge: None,
         tokens: None,
         aggregation: Some(cfg.clone()),

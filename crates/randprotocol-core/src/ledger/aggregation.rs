@@ -400,9 +400,7 @@ pub(super) fn validate_aggregate(
     if proof.len() > ledger.max_proof_bytes() {
         return Err(TxError::ProofTooLarge);
     }
-    if envelope.len() > crate::notes::MAX_ENVELOPE_BYTES {
-        return Err(TxError::EnvelopeTooLarge);
-    }
+    ledger.check_note_envelope(envelope)?;
     if tx.encoded_len() > ledger.max_aggregate_bytes() {
         return Err(TxError::AggregateTooLarge { size: tx.encoded_len(), max: ledger.max_aggregate_bytes() });
     }
@@ -543,9 +541,7 @@ impl Ledger {
         if proof.len() > self.max_proof_bytes() {
             return Err(TxError::ProofTooLarge);
         }
-        if envelope.len() > crate::notes::MAX_ENVELOPE_BYTES {
-            return Err(TxError::EnvelopeTooLarge);
-        }
+        self.check_note_envelope(envelope)?;
         if tx.encoded_len() > self.max_aggregate_bytes() {
             return Err(TxError::AggregateTooLarge { size: tx.encoded_len(), max: self.max_aggregate_bytes() });
         }
@@ -1137,6 +1133,7 @@ mod tests {
             max_block_bytes: None,
             max_call_envelope_bytes: None,
             max_program_public_words: None,
+            envelope_bytes: None,
         }
     }
 
@@ -1855,6 +1852,26 @@ mod admission_tests {
             Err(TxError::WrongChain { expected: 7, actual: 99 }) => {}
             other => panic!("expected WrongChain, got {other:?}"),
         }
+    }
+
+    /// Spec 2026-09-26 §2.4: under a genesis `envelope_bytes` the aggregate's payout envelope is
+    /// held to the exact length at both entries — the pre-screen and the covered-carrying one.
+    #[test]
+    fn under_envelope_bytes_the_payout_envelope_is_exact() {
+        use crate::notes::MEMO_ENVELOPE_BYTES as W;
+        let (mut l, kp) = setup();
+        l.set_envelope_bytes(Some(W));
+        let sized = |len: usize| {
+            let mut t = aggregate_tx(&kp, 0, 100, covers(1), b"ok".to_vec());
+            if let Action::Aggregate { envelope, .. } = &mut t.action {
+                *envelope = crate::notes::Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![0; len] };
+            }
+            t
+        };
+        let want = Err(TxError::EnvelopeSize { expected: W, got: W - 1 });
+        assert_eq!(l.preflight_aggregate(&sized(W - 1)), want);
+        assert_eq!(l.validate_aggregate(&sized(W - 1), &covered_records(&shape(), &[1]), &StubExecutor).map(|_| ()), want);
+        assert!(!matches!(l.preflight_aggregate(&sized(W)), Err(TxError::EnvelopeSize { .. })));
     }
 
     /// The call limits (spec §4): an aggregate's proof cap is the ledger's `max_proof_bytes`, in
