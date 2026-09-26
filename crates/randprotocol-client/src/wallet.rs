@@ -2560,6 +2560,27 @@ pub async fn find_token_row(rpc: &RpcClient, text: &str) -> Result<Value> {
     find_row_by_id(rpc, text, &want, "").await
 }
 
+/// The most a default fee may pay as a node-reported registration fee (audit WAL-2): 10 RAND, ten
+/// times chain 14's. `registration_fee` is read from the node (`rand_getTokens`,
+/// `rand_getBridgeState`), and the default fee adds it on top of the floor with nothing to check it
+/// against; above this, [`default_registration_fee`] refuses and the caller passes `--fee` to pay
+/// it deliberately.
+pub const MAX_DEFAULT_REGISTRATION_FEE: u64 = 10 * randprotocol_core::UNITS_PER_RAND;
+
+/// The default fee of a registration: `floor` plus the node-reported `registration_fee`, refused
+/// when the latter is above [`MAX_DEFAULT_REGISTRATION_FEE`] — a lying or misconfigured node
+/// could otherwise set any fee the wallet can cover, and the wallet would prove and pay it.
+pub fn default_registration_fee(floor: u64, registration_fee: u64) -> Result<u64> {
+    if registration_fee > MAX_DEFAULT_REGISTRATION_FEE {
+        return Err(anyhow!(
+            "the node reports a registration fee of {} RAND, above the {} RAND this wallet pays by default; if that is really this chain's fee, pass it with --fee",
+            format_amount(registration_fee),
+            format_amount(MAX_DEFAULT_REGISTRATION_FEE)
+        ));
+    }
+    Ok(floor.saturating_add(registration_fee))
+}
+
 /// `rand token create`'s action, plus the two registry facts it was built from: `index` (which
 /// `IndexMismatch` on submission names, for the wallet's own "another token took index N first"
 /// hint) and `registration_fee` (the default fee's other half, on top of `gas::fee_floor`).
@@ -2786,7 +2807,15 @@ async fn create_token_with(
         }
         _ => unreachable!("build_register_token always returns a RegisterToken action"),
     };
-    let fee = fee.unwrap_or_else(|| gas::fee_floor(&plan.action).saturating_add(plan.registration_fee));
+    let fee = match fee {
+        Some(fee) => fee,
+        None => default_registration_fee(gas::fee_floor(&plan.action), plan.registration_fee)?,
+    };
+    eprintln!(
+        "registering {symbol} at index {index}: fee {} RAND (the node reports a registration fee of {} RAND)",
+        format_amount(fee),
+        format_amount(plan.registration_fee)
+    );
 
     // The only secret this command ever generates goes to disk before the one call that can
     // refuse the registration is even attempted — see `pending_authority_key_path`'s doc.
@@ -4692,6 +4721,39 @@ mod tests {
         assert!(!pending_authority_key_path(&out).exists());
         let saved = load_authority_key(&out).unwrap();
         assert_eq!(saved.public_key(), kp.public_key());
+    }
+
+    /// WAL-2: the default fee of `rand token create` is `fee_floor + registration_fee`, and the
+    /// registration fee is the node's word. A node reporting an absurd one (here 5 000 000 RAND,
+    /// against chain 14's 1) is refused above `MAX_DEFAULT_REGISTRATION_FEE` before anything is
+    /// written, proved or sent; an explicit `--fee` is the caller's own decision and goes through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_reported_registration_fee_above_the_ceiling_needs_an_explicit_fee() {
+        let me = Wallet::from_spend_key(SpendKey([67; 8]));
+        let absurd: u64 = 5_000_000_000_000_000;
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.tokens = serde_json::json!({ "enabled": true, "registration_fee": absurd.to_string(), "next_index": 1, "tokens": [] });
+            c.fund(&me, absurd + 10 * gas::BUNDLE_BASE, 0);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let initial = Some((1_000, me.address.clone()));
+        let e = create_token_with(&rpc, &me, &mut store, "Fixed", "FIX", 6, None, initial.clone(), [4; 32], None, Proving::Emulated, 7, false)
+            .await
+            .expect_err("an absurd node-reported registration fee is refused")
+            .to_string();
+        assert!(e.contains("--fee"), "{e}");
+        assert!(chain.lock().unwrap().sent.is_empty(), "nothing was sent");
+        let fee = 2 * gas::BUNDLE_BASE + absurd;
+        create_token_with(&rpc, &me, &mut store, "Fixed", "FIX", 6, None, initial, [4; 32], Some(fee), Proving::Emulated, 7, false)
+            .await
+            .expect("an explicit --fee is the caller's own decision");
+        assert_eq!(chain.lock().unwrap().sent.pop().unwrap().bundle.unwrap().fee, fee);
+        // The shared helper `token register-bridged` uses too: the ceiling itself is admitted.
+        assert_eq!(default_registration_fee(7, MAX_DEFAULT_REGISTRATION_FEE).unwrap(), 7 + MAX_DEFAULT_REGISTRATION_FEE);
+        assert!(default_registration_fee(7, MAX_DEFAULT_REGISTRATION_FEE + 1).is_err());
     }
 
     /// Node I1: the discard is decided by the **stage**, not by the error type. `RpcError` is

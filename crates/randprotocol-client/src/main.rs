@@ -1392,10 +1392,12 @@ async fn main() -> Result<()> {
             let action = governance::register_bridged_action(&state, chain_id, &name, &symbol, salt, chain, token, decimals, pq_signatures)?;
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action).saturating_add(
+                None => wallet::default_registration_fee(
+                    gas::fee_floor(&action),
                     state.registration_fee.context("the node serves no registration_fee: pass --fee")?,
-                ),
+                )?,
             };
+            eprintln!("registering {symbol} ({name}): fee {} RAND", format_amount(fee));
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let profile = profile_of(&rpc).await?;
             let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
