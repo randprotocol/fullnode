@@ -80,6 +80,29 @@ async fn witness_slot() -> Result<tokio::sync::SemaphorePermit<'static>, RpcErro
     }
 }
 
+/// The most blocking-pool tasks RPC runs at once, process-wide (security scan 2026-09-26,
+/// RPC-1). Every range read (`rand_getBlocks`, `rand_getCompactBlocks`, `rand_getNullifiers`,
+/// `rand_getReceipts`, the viewing scans, …) runs on tokio's blocking pool, the same pool the
+/// node loop awaits its history-pruning pass on; tokio caps that pool at 512 threads, so without
+/// a cap a flood of reads queues the prune pass behind it and freezes the loop that commits
+/// blocks. With it, RPC holds at most this many threads and the rest stay the node's.
+pub const MAX_CONCURRENT_RPC_BLOCKING: usize = 16;
+
+/// How long an RPC read waits for a blocking slot before it is refused busy. Short on purpose:
+/// a waiting request is a parked future, not a thread, but a client should hear "retry" soon.
+const BLOCKING_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+static RPC_BLOCKING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_RPC_BLOCKING);
+
+/// A blocking-pool slot for one RPC read, held until its blocking task has returned.
+async fn blocking_slot() -> Result<tokio::sync::SemaphorePermit<'static>, RpcError> {
+    match tokio::time::timeout(BLOCKING_SLOT_WAIT, RPC_BLOCKING.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(RpcError::internal("rpc blocking semaphore closed")),
+        Err(_) => Err(RpcError::rejected("this node's RPC is busy; retry shortly")),
+    }
+}
+
 /// Snapshot the node loop keeps up to date for RPC readers.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct NodeStatus {
@@ -738,13 +761,15 @@ fn refuse_pruned(st: &RpcState, h: u64) -> Result<(), RpcError> {
 }
 
 /// Run a storage read that is not O(1) on the blocking pool, so it cannot stall the tokio
-/// workers the node loop shares. The closure takes owned handles (`Arc` clones) because it
+/// workers the node loop shares, under one of [`MAX_CONCURRENT_RPC_BLOCKING`] slots (refused
+/// busy after [`BLOCKING_SLOT_WAIT`]) so RPC can never own that pool. The closure takes owned handles (`Arc` clones) because it
 /// outlives this call's borrow of the state.
 async fn blocking<T, F>(f: F) -> Result<T, RpcError>
 where
     T: Send + 'static,
     F: FnOnce() -> crate::storage::Result<T> + Send + 'static,
 {
+    let _slot = blocking_slot().await?;
     match tokio::task::spawn_blocking(f).await {
         Ok(r) => r.map_err(RpcError::internal),
         Err(e) => Err(RpcError::internal(format!("storage task failed: {e}"))),
@@ -779,6 +804,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ViewingError> + Send + 'static,
 {
+    let _slot = blocking_slot().await?;
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(t)) => Ok(t),
         Ok(Err(ViewingError::Full)) => Err(RpcError::rejected(crate::viewing::RegistryFull.to_string())),
@@ -3535,6 +3561,25 @@ mod tests {
         drop(held);
         let v = tokio::time::timeout(std::time::Duration::from_secs(5), pending).await.unwrap().unwrap();
         assert_eq!(v["witnesses"][0]["index"], 0);
+    }
+
+    /// RPC's range reads share tokio's blocking pool with the node loop's history-pruning pass,
+    /// which the loop awaits. With every RPC blocking slot taken, a further range read is refused
+    /// busy after a short wait instead of queuing another blocking thread — so a flood of
+    /// `rand_getBlocks` can never own the pool the prune pass needs.
+    #[tokio::test]
+    async fn a_range_read_is_refused_busy_when_every_rpc_blocking_slot_is_taken() {
+        let (_d, st, _gs) = chain();
+        let held = RPC_BLOCKING.acquire_many(MAX_CONCURRENT_RPC_BLOCKING as u32).await.unwrap();
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(BLOCKING_SLOT_WAIT * 4, call(&st, "rand_getBlocks", json!([0, 0]))).await;
+        drop(held);
+        let e = r.expect("a range read queued past the slot wait instead of being refused").unwrap_err();
+        assert_eq!(e.code, -32000);
+        assert!(e.message.contains("busy"), "{}", e.message);
+        assert!(started.elapsed() >= BLOCKING_SLOT_WAIT);
+        // A slot freed, the same read runs.
+        assert_eq!(ok(&st, "rand_getBlocks", json!([0, 0])).await.as_array().unwrap().len(), 1);
     }
 
     /// Phase S2: the register, not the genesis set. A validator that has bonded in but whose
