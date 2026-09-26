@@ -15,7 +15,8 @@ use std::time::Duration;
 /// `view + 1` arithmetic away from u64 overflow and to bound speculative state, not to
 /// police legitimate catch-up, which goes through block sync and `resume`.
 const MAX_VIEW_AHEAD: u64 = 1_000_000;
-/// Cap on distinct (view, block) vote collections kept while leading.
+/// Cap on distinct (view, block) vote collections kept. A backstop only since CONS-1: the view
+/// window and one vote per (view, voter) hold the map to validators × (window + 2) keys.
 const MAX_PENDING_VOTE_KEYS: usize = 4096;
 /// Cap on distinct views with buffered NewView messages.
 const MAX_NEW_VIEW_KEYS: usize = 2048;
@@ -117,6 +118,11 @@ pub struct HotStuff {
 
     /// Votes collected while acting as the next leader: (view, block) -> voter -> vote.
     pending_votes: BTreeMap<(u64, Hash), BTreeMap<Address, Vote>>,
+    /// The block each voter's counted vote names, per view (scan 2026-09-26, CONS-1): a second
+    /// vote from the same voter for the same view and another block is an equivocation and is
+    /// not counted, so one key opens at most one `pending_votes` entry per view. Pruned with
+    /// `pending_votes` in `enter_view`.
+    vote_of: BTreeMap<(u64, Address), Hash>,
     /// NewView messages per view: view -> sender -> message.
     new_views: BTreeMap<u64, BTreeMap<Address, NewView>>,
 
@@ -237,6 +243,7 @@ impl HotStuff {
             not_held: HashMap::new(),
             unobtainable: std::collections::HashSet::new(),
             pending_votes: BTreeMap::new(),
+            vote_of: BTreeMap::new(),
             new_views: BTreeMap::new(),
             epoch_sets,
             derived: Mutex::new(HashMap::new()),
@@ -327,6 +334,11 @@ impl HotStuff {
     }
     pub fn committed_height(&self) -> u64 {
         self.committed_height
+    }
+    /// Tests only: how many (view, block) vote collections are held.
+    #[cfg(test)]
+    pub(super) fn vote_keys(&self) -> usize {
+        self.pending_votes.len()
     }
     /// Tests only: how many blocks the orphan pool holds, and their encoded bytes — measured
     /// here, not read from the pool's own counter.
@@ -905,14 +917,38 @@ impl HotStuff {
         if vote.view < self.high_qc.view || vote.view.saturating_add(1) < self.view {
             return Ok(out); // stale
         }
+        // The proposal window bounds votes too (scan 2026-09-26, CONS-1): a vote is for a block
+        // proposed in its view, and this replica takes no proposal more than
+        // `PROPOSAL_VIEW_WINDOW` views ahead either. Before, one validator's key signed votes for
+        // views up to `MAX_VIEW_AHEAD` on junk hashes, which nothing pruned, until the map was
+        // full and every honest vote for a new block was dropped — no QC formed again. Ignored
+        // like a stale vote rather than refused: a replica a few views behind is not a fault.
+        if vote.view > self.view.saturating_add(PROPOSAL_VIEW_WINDOW) {
+            return Ok(out);
+        }
         if !vote.verify(&self.cfg.domain) {
             return Err(ConsensusError::BadVote);
+        }
+        // One counted vote per (view, voter): a second for another block is an equivocation,
+        // not a second key. The first stands, as for a leader's second block (CON-3).
+        if let Some(first) = self.vote_of.get(&(vote.view, voter)) {
+            if *first != vote.block_hash {
+                tracing::warn!(
+                    view = vote.view,
+                    voter = %voter,
+                    first = ?first,
+                    second = ?vote.block_hash,
+                    "validator equivocated: a second vote for a view it already voted in"
+                );
+                return Ok(out);
+            }
         }
         let key = (vote.view, vote.block_hash);
         if self.pending_votes.len() >= MAX_PENDING_VOTE_KEYS && !self.pending_votes.contains_key(&key) {
             tracing::warn!("vote-key bookkeeping full; dropping vote for view {}", vote.view);
             return Ok(out);
         }
+        self.vote_of.insert((vote.view, voter), vote.block_hash);
         let votes = self.pending_votes.entry(key).or_default();
         votes.insert(voter, vote);
         let stake: u128 = votes.keys().filter_map(|a| set.get(a)).map(|v| v.stake).sum();
@@ -1140,6 +1176,7 @@ impl HotStuff {
         self.new_views = self.new_views.split_off(&view);
         let keep = self.pending_votes.split_off(&(view.saturating_sub(1), Hash::ZERO));
         self.pending_votes = keep;
+        self.vote_of.retain(|(v, _), _| *v >= view.saturating_sub(1));
         out.push(self.schedule_timeout());
     }
 

@@ -2775,3 +2775,56 @@ fn an_orphan_is_checked_before_it_is_kept() {
     assert_eq!(z.orphans_held().0, 0);
     assert!(sw1_honest_orphan_survives(&mut z, &b1, &b2));
 }
+
+// ---------------------------------------------------------------------------
+// Scan 2026-09-26, CONS-1: the vote map
+// ---------------------------------------------------------------------------
+
+/// One validator's key filled `pending_votes`: `on_vote` took a signed vote from any set member
+/// for any view up to `MAX_VIEW_AHEAD` and any block hash, and a full map (4096 keys) dropped the
+/// votes for every new key — the honest ones included — so no QC formed again and the chain
+/// stopped committing. The flood here tops up whatever slot a completed QC frees, far-future and
+/// in-window views alike, from a validator that then goes silent: three of four is a quorum.
+#[test]
+fn one_validators_votes_cannot_fill_the_vote_map() {
+    let mut sim = setup(4, 4);
+    for _ in 0..6 {
+        sim.step(vec![]);
+    }
+    let before = sim.committed[0].len();
+    assert!(before >= 2);
+    let attacker = Keypair::from_seed(*sim.keys[3].seed()).unwrap();
+    sim.down[3] = true;
+    let domain = sim.domain();
+    let mut fresh = 0u32;
+    let mut flood = |node: &mut HotStuff, budget: usize| {
+        for _ in 0..budget.min(MAX_PENDING_VOTE_KEYS_FOR_TESTS.saturating_sub(node.vote_keys())) {
+            fresh += 1;
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&fresh.to_be_bytes());
+            // Mostly far-future views, which nothing prunes; one in eight inside the window.
+            let ahead = if fresh % 8 != 0 { 900_000 } else { u64::from(fresh / 8 % 9) };
+            let _ = node.on_vote(Vote::sign(&domain, node.view() + ahead, Hash(h), &attacker));
+        }
+    };
+    for j in 0..3 {
+        flood(&mut sim.nodes[j], MAX_PENDING_VOTE_KEYS_FOR_TESTS);
+    }
+    for _ in 0..40 {
+        for j in 0..3 {
+            flood(&mut sim.nodes[j], 512);
+        }
+        sim.step(vec![]);
+    }
+    sim.assert_consistent();
+    let after = sim.committed[0].len();
+    assert!(after > before + 5, "no QC formed once one validator's votes filled the vote map: committed {before} -> {after}");
+    // One vote per (view, voter), inside the window: 4 voters × (window + the view before).
+    let bound = 4 * (PROPOSAL_VIEW_WINDOW as usize + 2);
+    for j in 0..3 {
+        assert!(sim.nodes[j].vote_keys() <= bound, "node {j} holds {} vote keys", sim.nodes[j].vote_keys());
+    }
+}
+
+/// `hotstuff::MAX_PENDING_VOTE_KEYS`, which the flood above aims at.
+const MAX_PENDING_VOTE_KEYS_FOR_TESTS: usize = 4096;
