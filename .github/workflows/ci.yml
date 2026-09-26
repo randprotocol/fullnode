@@ -87,6 +87,7 @@ jobs:
         # into the fast job. A new cheap test has to be added here on purpose — that is the trade.
         run: |
           cargo test -p randprotocol-node --release --test submit --test ws
+          cargo test -p randprotocol-zkvm --release --test guest_provenance
           cargo test -p randprotocol-node --release --test cluster -- --exact \
             a_synced_certified_but_uncommitted_chain_is_not_committed \
             a_batch_whose_evidence_blocks_are_junk_commits_nothing \
@@ -100,6 +101,63 @@ jobs:
             faucet_mint_via_rpc_reaches_every_node \
             faucet_is_rejected_when_genesis_disables_it \
             a_refused_transaction_is_not_verified_twice
+
+  # Audit CS6-1: the compiled guests and the two test assets under
+  # `crates/randprotocol-zkvm/guests-compiled/` are copies of circuits' `guests-compiled/` at
+  # CIRCUITS_PIN (`guests-compiled/PROVENANCE.md`). This job checks the copies are those files,
+  # byte for byte, and that circuits' public source at the pin rebuilds them. Its own job, not a
+  # step of check-and-test: it installs the guest target and clears `$CARGO_HOME/config.toml`
+  # (`rand-guest` refuses to build under one), neither of which should touch the main suite.
+  guest-provenance:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # solc 0.8.37's static Linux build, the release `erc20.runtime.hex` was compiled with
+      # (PROVENANCE.md; the same digest binaries.soliditylang.org/linux-amd64/list.json publishes).
+      SOLC_URL: https://github.com/ethereum/solidity/releases/download/v0.8.37/solc-static-linux
+      SOLC_SHA256: 5de843c2c93563cc66425c99a4fb13fdbf32b4c4ae07469480faaf126e14404a
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fullnode
+      - uses: actions/checkout@v4
+        with:
+          repository: randprotocol/zkp-circuits
+          ref: ${{ env.CIRCUITS_PIN }}
+          path: circuits
+      - name: The vendored copies are circuits' files at the pin
+        run: |
+          cd fullnode/crates/randprotocol-zkvm/guests-compiled
+          sha256sum -c SHA256SUMS
+          while read -r _ f; do
+            cmp "$f" "$GITHUB_WORKSPACE/circuits/guests-compiled/$f"
+          done < SHA256SUMS
+          cd "$GITHUB_WORKSPACE/circuits/guests-compiled/sbpf/programs" && sha256sum -c spl_token.so.sha256
+      - name: The guest toolchain rand-guest pins
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target riscv32im-unknown-none-elf --component llvm-tools
+          rm -f "${CARGO_HOME:-$HOME/.cargo}/config" "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: circuits/rand-guest
+      # Builds fib, keccak256, evm and sbpf from source with `rand-guest build` and compares:
+      # evm/sbpf byte for byte, the two legacy flat pins by program (base_pc, words, hc).
+      - name: circuits rebuilds the four guests from source
+        working-directory: circuits/rand-guest
+        run: cargo test --release --test build -- --exact build_reproduces_every_committed_image_and_reports_hc
+      # Inline rather than circuits' `contracts/build.sh`: that script's `mktemp -t erc20.runtime.hex`
+      # is BSD syntax and GNU mktemp refuses a template without X's.
+      - name: solc 0.8.37 recompiles erc20.runtime.hex
+        working-directory: circuits/guests-compiled/evm
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/solc" "$SOLC_URL"
+          echo "$SOLC_SHA256  $RUNNER_TEMP/solc" | sha256sum -c
+          chmod +x "$RUNNER_TEMP/solc"
+          "$RUNNER_TEMP/solc" --version
+          "$RUNNER_TEMP/solc" --optimize --optimize-runs 200 --evm-version shanghai --bin-runtime contracts/ERC20.sol \
+            | tail -1 > "$RUNNER_TEMP/erc20.runtime.hex"
+          diff contracts/erc20.runtime.hex "$RUNNER_TEMP/erc20.runtime.hex"
 
   nightly-proving:
     if: github.event_name == 'schedule'

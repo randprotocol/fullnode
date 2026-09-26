@@ -745,6 +745,19 @@ Writing, building and deploying a guest step by step (Rust, C, or a hand-built i
 [`guests.md`](guests.md). Deploying translated Solana and Ethereum programs is in
 [`translators.md`](translators.md).
 
+**Where the vendored compiled guests come from** (audit CS6-1). This repository carries four
+compiled guests (`fib.bin`, `keccak256.bin`, `evm.bin`, `sbpf.bin`) and two test assets
+(`erc20.runtime.hex`, `spl_token.so`) under `crates/randprotocol-zkvm/guests-compiled/`. None of
+them is built here. [`PROVENANCE.md`](../crates/randprotocol-zkvm/guests-compiled/PROVENANCE.md)
+in that directory names, for each file, its sha256, the public circuits commit and source path it
+was copied from, and the command that rebuilds it: `rand-guest build` for the guests; solc 0.8.37
+over `ERC20.sol`; for the SPL Token ELF, a fetch of the immutable mainnet program account (its
+source release is not recorded). `SHA256SUMS` beside it is checked by
+`tests/guest_provenance.rs`. CI's `guest-provenance` job compares each copy with circuits at
+`CIRCUITS_PIN` and rebuilds all four guests and the ERC-20 bytecode from source there. The guest
+chain 14 actually runs, the hidden-asset bundle, is not among them. It is assembled from
+`guests::bundle_hidden()`'s source in this crate, and the same test pins its `hc` to the genesis.
+
 ## The hidden-asset bundle guest: soundness (v0.5, chain 14's bundle guest)
 
 `guests::bundle_hidden()` (spec `docs/superpowers/specs/2026-09-19-hidden-asset-bundle-design.md`)

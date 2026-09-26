@@ -147,7 +147,7 @@ rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude
       --exclude lib.rs --exclude main.rs "$SRC/src/" "$DST/src/"
 rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_envelope.rs \
       --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs \
-      --exclude hidden_cheating.rs "$SRC/tests/" "$DST/tests/"
+      --exclude hidden_cheating.rs --exclude guest_provenance.rs "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local
 # `guests::compiled::{fib,keccak256}()` (see the header comment) need — `fib.bin` since M4.1,
@@ -174,6 +174,23 @@ for ASSET in evm/contracts/erc20.runtime.hex sbpf/programs/spl_token.so; do
   fi
   cp "$SRC/../guests-compiled/$ASSET" "$DST/guests-compiled/$ASSET"
 done
+# Audit CS6-1: the manifest. `guests-compiled/SHA256SUMS` lists every file just copied and
+# `guests-compiled/PROVENANCE.md`'s `circuits: <commit>` line names the circuits commit they came
+# from; `tests/guest_provenance.rs` (excluded from the rsync above) holds the copies to both and
+# the commit to ci.yml's `CIRCUITS_PIN`, and CI byte-compares the copies with circuits at that pin
+# and rebuilds the guests there. A copy taken from uncommitted circuits files would be named after
+# a commit it is not from, so that is refused. The rest of PROVENANCE.md (per-file table, the two
+# third-party assets' origins) is prose: check it by hand when a guest or asset changes.
+CIRCUITS_ROOT="$SRC/.."
+if [ -n "$(git -C "$CIRCUITS_ROOT" status --porcelain -- guests-compiled/bin guests-compiled/evm/contracts guests-compiled/sbpf/programs 2>/dev/null)" ]; then
+  echo "sync-zkvm.sh: circuits' guests-compiled/ has uncommitted changes; PROVENANCE.md would name a commit these files are not from" >&2
+  exit 1
+fi
+CIRCUITS_COMMIT=$(git -C "$CIRCUITS_ROOT" rev-parse HEAD)
+( cd "$DST/guests-compiled" && find . -type f ! -name SHA256SUMS ! -name PROVENANCE.md | sed 's|^\./||' | LC_ALL=C sort \
+    | while read -r f; do shasum -a 256 "$f"; done > SHA256SUMS )
+sed -i '' "s|^circuits: .*|circuits: $CIRCUITS_COMMIT|" "$DST/guests-compiled/PROVENANCE.md"
+echo "guests-compiled/SHA256SUMS regenerated; PROVENANCE.md names circuits $CIRCUITS_COMMIT — set ci.yml's CIRCUITS_PIN to it in the same commit"
 # rand_zkvm -> randprotocol_zkvm, but the *dependency* rand_zkvm_cuda keeps its own name (it is an
 # unmodified external crate), so park it behind a placeholder while the rename runs.
 grep -rl "rand_zkvm" "$DST/src" "$DST/tests" | xargs -I{} sed -i '' \
