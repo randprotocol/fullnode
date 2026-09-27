@@ -1853,6 +1853,7 @@ impl Node {
             Some(cfg) => {
                 crate::rpc::unsealed_bundles(
                     &self.storage,
+                    ledger.unsealed_fees(),
                     self.hs.committed_height(),
                     cfg.window,
                     self.hs.committed_height().saturating_sub(cfg.window),

@@ -810,6 +810,31 @@ impl Ledger {
         self.aggregators = m;
     }
 
+    /// The part of a bundle's fee a registration burns under `tokens.burn_registration_fee`
+    /// (audit v5, TOK-2): the registry's `registration_fee` for a `RegisterToken` or
+    /// `RegisterBridgedToken` on a chain with the flag, 0 for every other action and chain. One
+    /// function for the fee split and for everything that reports its result — the proving
+    /// share a bundle is bucketed at is `fee − registration_burn − BUNDLE_BASE`, and a reporter
+    /// that recomputed it as `fee − BUNDLE_BASE` paid aggregators a note the ledger never
+    /// derives (the interface review's IFACE-7).
+    pub fn registration_burn(&self, action: &Action) -> u64 {
+        match action {
+            Action::RegisterToken { .. } | Action::RegisterBridgedToken { .. } => {
+                self.tokens.as_ref().filter(|r| r.burns_registration_fee()).map_or(0, |r| r.registration_fee)
+            }
+            _ => 0,
+        }
+    }
+
+    /// What an included bundle is bucketed at (block aggregation, spec §5.2): its fee less the
+    /// burned registration fee (TOK-2) less `BUNDLE_BASE`, never below zero — the fee split's
+    /// own arithmetic, for a caller that has the transaction but no longer the bucket entry.
+    pub fn bucketed_excess(&self, tx: &Transaction) -> u64 {
+        tx.bundle.as_ref().map_or(0, |b| {
+            b.fee.saturating_sub(self.registration_burn(&tx.action)).saturating_sub(gas::BUNDLE_BASE)
+        })
+    }
+
     /// Restore the withdrawn aggregators' nonce floors (IFACE-6) a node persisted beside the
     /// register: in the state root once non-empty, so the loader must set them too.
     pub fn set_retired_aggregator_nonces(&mut self, m: BTreeMap<Address, u64>) {
@@ -1681,12 +1706,7 @@ impl Ledger {
             // (`tokens::validate`'s `RegistrationFeeTooLow`) already held `fee` to at least
             // `BUNDLE_BASE + registration_fee`, so the subtraction cannot fail after
             // `validate_inner`; refused by name rather than as an overflow if it ever did.
-            let registration_burn = match &tx.action {
-                Action::RegisterToken { .. } | Action::RegisterBridgedToken { .. } => {
-                    self.tokens.as_ref().filter(|r| r.burns_registration_fee()).map_or(0, |r| r.registration_fee)
-                }
-                _ => 0,
-            };
+            let registration_burn = self.registration_burn(&tx.action);
             let fee = b.fee.checked_sub(registration_burn).ok_or_else(|| {
                 tokens::TokenError::RegistrationFeeTooLow { min: gas::BUNDLE_BASE.saturating_add(registration_burn), fee: b.fee }
             })?;

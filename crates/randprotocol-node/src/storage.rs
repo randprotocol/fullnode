@@ -2025,12 +2025,13 @@ impl Storage {
                     if let Some(cfg) = ledger_after.aggregation() {
                         let n = ledger_after.supply().sealed_blocks.saturating_sub(1);
                         let subsidy = randprotocol_core::gas::subsidy(n, cfg);
+                        // Each cover at the excess the ledger bucketed it at — net of a burned
+                        // registration fee (IFACE-7), not `fee − BUNDLE_BASE` — so
+                        // `rand_getAggregate`'s `proving_share` is what the payout note paid.
                         let mut shares = 0u64;
                         for cover in covers {
                             if let Some(covered_tx) = self.tx_by_hash(cover)? {
-                                if let Some(b) = &covered_tx.bundle {
-                                    shares = shares.saturating_add(b.fee.saturating_sub(randprotocol_core::gas::BUNDLE_BASE));
-                                }
+                                shares = shares.saturating_add(ledger_after.bucketed_excess(&covered_tx));
                             }
                         }
                         batch.put_cf(

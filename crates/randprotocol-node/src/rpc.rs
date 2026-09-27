@@ -1241,8 +1241,16 @@ fn block_json(b: &randprotocol_core::Block, tokens: Option<&TokenRegistry>, exec
 /// bundle-carrying transactions inside the window with no seal, paginated by block height as
 /// `(rows, next_from)` — each row the hash, its block height and its excess over the floor
 /// (what an aggregate would earn for covering it).
+///
+/// The excess is the ledger's own bucket entry (`bucket`, the head's `unsealed_fees`), never
+/// recomputed from the fee here (the interface review's IFACE-7): under
+/// `tokens.burn_registration_fee` the ledger buckets a token registration's
+/// `fee − registration_fee − BUNDLE_BASE`, and an aggregator paying itself `fee − BUNDLE_BASE`
+/// derived a payout note the ledger's commitment never opens to. A bundle with no bucket entry
+/// is not coverable in the ledger's eyes (swept, or covered), so it is not work either.
 pub(crate) fn unsealed_bundles(
     storage: &crate::storage::Storage,
+    bucket: &std::collections::BTreeMap<Hash, (u64, randprotocol_core::Address, u64)>,
     head: u64,
     window: u64,
     from: u64,
@@ -1271,10 +1279,11 @@ pub(crate) fn unsealed_bundles(
             if matches!(storage.sealed_by(&raw_hash), Ok(Some(_))) {
                 continue;
             }
+            let Some((excess, _, _)) = bucket.get(&raw_hash) else { continue };
             out.push(json!({
                 "hash": raw_hash.to_hex(),
                 "height": h,
-                "excess": b.fee.saturating_sub(randprotocol_core::gas::BUNDLE_BASE).to_string(),
+                "excess": excess.to_string(),
             }));
             if out.len() >= limit {
                 next_from = Some(h + 1);
@@ -2157,7 +2166,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let Some(cfg) = ledger.aggregation() else {
                 return Ok(json!({ "bundles": [], "next_from": Value::Null }));
             };
-            let (bundles, next_from) = unsealed_bundles(&st.storage, head, cfg.window, from, limit);
+            let (bundles, next_from) = unsealed_bundles(&st.storage, ledger.unsealed_fees(), head, cfg.window, from, limit);
             Ok(json!({ "bundles": bundles, "next_from": next_from }))
         }
         // The raw bytes a prover needs (the aggregate daemon's fetch): the full transaction,
@@ -3079,7 +3088,8 @@ mod tests {
         {
             let mut s = st.status.write().unwrap();
             s.aggregation.registered = st.storage.aggregators().unwrap().len();
-            s.aggregation.unsealed = crate::rpc::unsealed_bundles(&st.storage, 2, 256, 0, usize::MAX).0.len();
+            let bucket = st.storage.load_ledger(&StubExecutor).unwrap().unsealed_fees().clone();
+            s.aggregation.unsealed = crate::rpc::unsealed_bundles(&st.storage, &bucket, 2, 256, 0, usize::MAX).0.len();
             s.aggregation.verify_queue = 0;
         }
         let v = ok(&st, "rand_status", json!([])).await;
@@ -4095,6 +4105,49 @@ mod tests {
         assert_eq!(v["registration_fees_burned"], Value::String(fee.to_string()));
         assert_eq!(v["fees_paid"], Value::String(randprotocol_core::gas::BUNDLE_BASE.to_string()), "the proposer got the base only");
         assert_eq!(v["invariant_holds"], true, "{v}");
+    }
+
+    /// The interface review's IFACE-7: under `tokens.burn_registration_fee` the ledger buckets a
+    /// registration bundle's `fee − registration_fee − BUNDLE_BASE` (TOK-2), but the work list
+    /// served `fee − BUNDLE_BASE` — so an aggregator paying itself from the list derived a payout
+    /// note the ledger's commitment would never open to. The list now serves the ledger's own
+    /// bucket entry, the number the payout is actually computed from.
+    #[tokio::test]
+    async fn the_work_lists_excess_is_the_ledgers_bucket_under_a_burned_registration_fee() {
+        let (mut gs, _) = fixtures::bridged_genesis(1);
+        gs.ledger.set_tokens(Some(gs.ledger.tokens().unwrap().clone().with_burn_registration_fee(true)));
+        gs.ledger.set_aggregation(Some(randprotocol_core::ledger::aggregation::AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![],
+        }));
+        let (_d, st) = state_for(&gs);
+        let mut ledger = st.storage.load_ledger(&StubExecutor).unwrap();
+        let mut register = fixtures::register_token_tx(&ledger, 5_000, 40);
+        // Pay 25 over the floor, so the bucket holds a non-zero excess to compare.
+        {
+            let b = register.bundle.as_mut().unwrap();
+            b.fee += 25;
+            let d = StubExecutor.bundle_digest(&b.digest_input());
+            b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d, &[0; 8]);
+        }
+        let register = StubExecutor::bound(register);
+        let b1 = make_block(&gs.block, &mut ledger, vec![register.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let bucket = st.storage.load_ledger(&StubExecutor).unwrap().unsealed_fees()[&register.hash()].0;
+        assert_eq!(bucket, 25, "the ledger buckets the excess over the floor and the burned fee");
+        let v = ok(&st, "rand_getUnsealed", json!([0, 10])).await;
+        let row = v["bundles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["hash"] == register.hash().to_hex())
+            .cloned()
+            .unwrap_or_else(|| panic!("the registration is coverable work: {v}"));
+        assert_eq!(row["excess"], Value::String(bucket.to_string()), "{row}");
     }
 
     /// The aggregation counters (spec §5.3): reported separately, and the invariant holds on a

@@ -1740,7 +1740,10 @@ see:
   `payout`, `nonce`, `unbonding` per row.
 - **`rand_getUnsealed(from, limit)`** pages the bundles an aggregator may still cover —
   finalised, inside the window, unsealed — as `{ bundles: [{ hash, height, excess }], next_from }`,
-  `excess` in units over the floor: the daemon's work list.
+  `excess` in units over the floor: the daemon's work list. Since 2026-09-28 (IFACE-7) `excess`
+  is the ledger's own bucket entry — under `tokens.burn_registration_fee` a token registration's
+  is `fee − registration_fee − BUNDLE_BASE`, not `fee − BUNDLE_BASE` — and a bundle with no
+  bucket entry is not listed; `rand_getAggregate`'s `proving_share` is summed the same way.
 - **`rand_getRawTransaction(hash)`** returns the full transaction, bincode as hex — the proof
   bytes an aggregator needs and `tx_json` deliberately never renders.
 - **`rand_getSupply`** gains the four counters `subsidised`, `sealed_blocks`,

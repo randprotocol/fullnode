@@ -1235,7 +1235,11 @@ async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, int
                 let proof: randprotocol_zkvm::machine::Proof = postcard::from_bytes(&bundle.proof)
                     .map_err(|_| anyhow::anyhow!("a work row's proof does not decode"))?;
                 covers.push(hash);
-                shares = shares.saturating_add(bundle.fee.saturating_sub(randprotocol_core::gas::BUNDLE_BASE));
+                // The node's own bucketed excess (IFACE-7), never `fee − BUNDLE_BASE` recomputed
+                // here: a token registration under `tokens.burn_registration_fee` is bucketed net
+                // of the burned fee, and a note over any other amount is refused at step 5.
+                let excess = randprotocol_client::amount_field(&b["excess"]).context("work row has no excess")?;
+                shares = shares.saturating_add(excess);
                 proofs.push(proof);
             }
             // The shape is the first proof's; every proof in the set must share it (the
